@@ -65053,3 +65053,93 @@ Gates (box 1, final tree, TMPDIR on a tmpfs): `cargo fmt --all --check` and `car
   13 ignored. `+commit` sweeps over seeds 0..299: `delegated-holder-cut` (no knob / `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`), `long-delegated-backup` and
   `delegated-backup`: i1 = 0 and i2 = 0 in every config; i4 = 1 (seed 252) / 2 (seeds 73 and 252) in `delegated-holder-cut`, 0 in the other two, the same seeds
   as on 31928185.
+
+## L2: a deposed root's rebuild queued a gated copy of a delegate's row (2026-11-03; plan 46 M0.3 finding; ADR-41)
+
+The M0.3 findings listed an I2 (b) violation, "one copy of a rid at a time": a rid queued for replay on one node while its
+requester executes it on another. Its witness was `placement-hot` 8557 with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` on
+055de5f1, the tree before the settle fixes; it passes on main. The code is unchanged on main, and main reaches it:
+`delegated-no-backup-root-near` 1680 with the knob queues the same copy. Closed.
+
+### Mechanism
+
+1. Node 3 is generation 5's delegate. It executes node 4's `Rename` (4,1,17) as row 5 and streams it to the root, node 1, epoch 1.
+   The root appends it with `apply_delegate_tx` into its journal under its lease epoch: a `Local` row of gen 5, epoch 1, in the
+   root's class (here `Archive`; `root_ack_class`). The root acknowledges it and the delegate answers node 4 `Accepted { epoch: 1 }`.
+   The row is never shipped: node 1 stalls under the slow lease reads and node 2 takes epoch 2.
+2. Node 4 sees the log move past epoch 1 without its op (`reroute_ended_epoch_waits`) and asks the new holder again by rid. From
+   then on the ledger counts node 4's client entry as executing.
+3. Node 1 learns it lost the lease. The epoch strand leaves the generation's appended rows in the journal (`stranded_by` never
+   strands a `Local` row with `gen != 0`: the delegate re-streams to the successor), so recovery asks for a rebuild.
+   `reset_for_rebuilt_ns_tx` then runs every journal row through `strand_local_tx` with `member = true, recall = false`.
+4. A gen-5 row with epoch 1 misses both exits: the member branch needs `gen == 0`, and the recall drop needs `recall` and
+   `epoch == 0`. The row is queued for replay by rid and stamped with the root's gated class. Node 1 now holds an executable
+   copy of a rid whose requester holds another, and the log has neither row yet (the new root's gate refuses the delegate's
+   re-stream until its quarantine ends). The log still carries the rid once, so this breaks "one copy at a time", not
+   exactly-once; dedup by rid saves the log only when both copies reach a sequencer that holds the other's outcome.
+
+The design already says the row is not the deposed root's to replay: `LiveEntry::stranded_by` ("the delegate re-streams to the
+successor"), `stranded_local_deps` (the root's own replays carry deps on exactly these rows, "which the successor appends from the
+delegate's re-stream"), and C1-4's rule that a gated row is not this node's to re-execute. The rebuild path (plan 30 M3b: queue
+every one of this node's unshipped transactions) predates I2 (b) and was the one path that still queued them.
+
+### Fix (`crates/meta/src/store/spec.rs`; no rule change)
+
+`Strand` gets a `rebuild` flag, set only in `reset_for_rebuilt_ns_tx`. In `strand_local_tx`, after the recall drop:
+`if strand.rebuild && row.class.gated() && row.gen != 0 && row.epoch > 0 { return Ok(Stranding::Dropped) }`. The rollback steps above it
+still run (journal rows, `completed`, the generation's log index and the session's stream). A `Lone` append keeps today's rule
+(queued), as does the root's own gated row (`gen == 0`: the member copy). The recall pass and `strand_for_takeover_carrying` are
+untouched. Why dropping loses nothing (ADR-41): a gated root class is acknowledged to the delegate only once the append is
+committed. A committed one (shipped, or held by every backup) is in the successor's takeover tail and reaches the log. An
+uncommitted one was never counted for the requester, who retries by rid, and the delegate re-streams its generation's rows. The
+comment names the dependency: a change to `root_append_cap` that counted an uncommitted append would make the drop lose a row.
+
+### Tests
+
+- Meta `a_rebuild_queues_no_gated_append_of_a_delegates_row` (`crates/meta/tests/holder_capture.rs`): three appends of a delegate's
+  rows under `RootGroup`, `Archive` and `Lone`, the root's own gated row, then a rebuild. Before the fix it fails with
+  `left: [(2,1,1) RootGroup, (2,1,2) Archive, (2,1,3) Lone]`, `right: [(2,1,3) Lone]` ("only the lone append is queued"); with the
+  fix: only the lone append is queued, the dropped rows' `completed` entries and the generation's log index are rolled back, and
+  the own row is in the member copy of its epoch.
+- Sim pin `l2_a_deposed_roots_rebuild_queues_no_gated_copy_of_a_delegates_row` (`delegated-no-backup-root-near` 1680 with the knob,
+  plain `run_seed`, the sweep's trajectory). A new counted-only ledger field, `Report::identity_foreign_gated`, counts rids of
+  another node queued with a gated class (`IdentityLedger::foreign_gated`; in `SWEEP-C14-TOTALS` as "foreign gated queued"). Main:
+  the field is 1 and `identity_copies` is 1: the seed is judged under `+identity` (`rid (3,1,16) queued on 1 (queued) and 3 (executing)
+  at tick 117`), so main has a judged I2 witness, not only the counted one. Fix: 0 and 0.
+
+### Sweeps (box 1, release, seeds 0..2,000 unless noted; `main` is acd1e9bf with the counter only, `fix` adds the change; knob = `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`)
+
+| config | failing seeds main / fix | foreign gated queued main / fix | ungated I2 pairs main / fix |
+|---|---|---|---|
+| `placement-hot`, knob, 0..10,000 | 4418 (I5) / same | 0 / 0 | 0 / 0 |
+| `placement-hot`, no knob | none / none | 0 / 0 | 0 / 0 |
+| `delegated-no-backup-root-near`, knob | none / none (i2 = 1 at 1680 / 0) | **1 / 0** | 0 / 0 |
+| `delegated-no-backup-root-near+identity`, knob | **1680 (I2)** / none | (the failing seed is not totalled) | 0 / 0 |
+| `long-delegated-backup`, knob (no knob) | none / none | 1 / 1 (0 / 0) | 1 / 1 (1 / 1) |
+| `long-delegated-late-answers`, knob (no knob) | none / none | 2 / 2 (0 / 0) | 0 / 0 (3 / 3) |
+| `delegated-holder-cut`, knob (no knob) | none / none | 0 / 0 | 0 / 0 |
+| `delegated-holder-cut+commit` 0..299, knob (no knob) | none / none, i1 = i2 = 0 | 0 / 0 | 0 / 0 |
+| `delegated-backup+commit` 0..299, knob (no knob) | none / none, i1 = i2 = 0 | 0 / 0 | 0 / 0 |
+| `long-delegated`, `delegated-backup`, `delegated-root-crash`, knob and no knob | none / none | 0 / 0 | identical |
+| `delegated-group-switch`, knob (no knob) | 1525 (I4) / same (none / none) | 0 / 0 | 2 / 2 (1 / 1) |
+
+`+identity` (which judges I2 as a failure), knob: `long-delegated-backup`, `long-delegated-late-answers`, `delegated-holder-cut` 0..2,000 and
+`placement-hot` 0..10,000 fail the same seeds on both trees (4418 only). The failing seeds are identical on both trees in every configuration; the only change is the one witness above (1680: i2 1 to 0,
+foreign gated 1 to 0, and the `+identity` failure gone). The drop fires only on that seed.
+
+### Not closed: L2b
+
+Two other strands queue a gated copy of another node's rid. No sweep judges a pair from them, and this fix does not touch them;
+the new counter gives their numbers (above: `long-delegated-late-answers` knob 2, `long-delegated-backup` knob 1).
+- (a) `strand_for_takeover_carrying`'s own-generation strand: a delegate that takes the root lease queues its own rows of the
+  generation it held (`member = true, recall = false, epoch == 0`). Witness: `long-delegated-late-answers` 1977 with the knob
+  (rids (2,1,6) and (2,2,1) on node 3). Needs a design answer: should the new root append its former delegate rows as the
+  generation's rows rather than replay them by rid?
+- (b) The recall pass's root appends (`recall = true, epoch > 0`, the "keeps today's rule" branch). Witness: `long-delegated-backup`
+  956 with the knob ((2,2,1) on node 3). A root append past the recall's cut was not in the successor's tail, so it was not
+  committed, and the same rule looks safe, but it reverses a deliberate C2 choice.
+
+### Gates
+
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean; meta (all targets; lib 387, `holder_capture` 32),
+authority lib 1,004, engine 948, all 0 failed; sim suite (release) 359 passed, 0 failed, 13 ignored (358 on main plus the pin).

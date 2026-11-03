@@ -698,8 +698,8 @@ reach 0). The plain sweeps (2,000 seeds, both modes) add one failing seed on the
 knob, a latent replica divergence of a former delegate that main shows at 6183 and 7393 (PROGRESS, **L1**, closed: the cause is
 the root's pre-S3 stream install, see the paragraph after this one; 4125 with the knob is not L1 and stays a separate finding);
 stage 2 inherits the I2 class on a stranded replay
-against the requester's re-ask (**L2**, main's `placement-hot` 8557 with the knob), which the removal of the server-side replay
-closes; S4 takes **L3**, the lost `DelegRecall` that is never sent again. **L4**, a void on a generation number that a deposed root's unshipped end left and that the successor's grant reuses (the node's next write then names no dependency on its own row), is fixed in `meta/src/replay.rs` (a `Delegate` record lifts the void). The ratchet's ceilings were lowered to the counts on the rebased tree (`delegated-holder-cut` 48 to 14, `long-delegated-late-answers` 63 to 25, `long-delegated-backup` 52 to 23, `placement-hot` 10 to 0, among others).
+against the requester's re-ask (**L2**, main's `placement-hot` 8557 with the knob; closed in the meta store by a deposed root's rebuild
+no longer queueing a gated append of a delegate's row, PROGRESS, "L2"; two sources of the same shape are open as L2b); S4 takes **L3**, the lost `DelegRecall` that is never sent again. **L4**, a void on a generation number that a deposed root's unshipped end left and that the successor's grant reuses (the node's next write then names no dependency on its own row), is fixed in `meta/src/replay.rs` (a `Delegate` record lifts the void). The ratchet's ceilings were lowered to the counts on the rebased tree (`delegated-holder-cut` 48 to 14, `long-delegated-late-answers` 63 to 25, `long-delegated-backup` 52 to 23, `placement-hot` 10 to 0, among others).
 
 *L1 closed (2026-11-02; PROGRESS, "L1"):* the replica divergence on a former delegate was one integrity bug in the root's pre-S3
 stream install: the early return for the root's append of the delegate's own row recorded nothing, and the delegate's `Local`
