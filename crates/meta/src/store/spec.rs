@@ -716,12 +716,16 @@ struct Strand<'a> {
     /// before.
     recall: bool,
     /// L2: the pass is a deposed node's rebuild (`reset_for_rebuilt_ns_tx`).
-    /// A root's append of a delegate's row (`gen` != 0, journaled under the
-    /// root's lease epoch) of a gated class is dropped, not queued: it
-    /// belongs to its generation, whose delegate re-streams it to the
-    /// successor root, and a committed one (ADR-41: shipped or held by
-    /// every backup) is in the successor's tail. A queued copy would be a
-    /// second executable copy of a rid its requester still holds (I2).
+    /// A root's append of a delegate's row (`gen` != 0,
+    /// journaled under the root's lease epoch) of a gated class is dropped,
+    /// not queued. The class is not the append's ADR-41 commit: a root
+    /// journals such an append `Lone`, and it turns gated only when another
+    /// node re-asks the rid (the answer is journaled `Archive`) or a
+    /// predecessor's tail is adopted at a takeover (`RootGroup`). Either way
+    /// another copy exists: the asker retries the rid by itself, the
+    /// predecessor's members hold the tail, and the delegate re-streams the
+    /// row to the successor root. A queued copy would be a second
+    /// executable copy of a rid (I2). A `Lone` append is queued as before.
     rebuild: bool,
     /// Each stranded transaction's `deps` (by journal seq), taken from the
     /// intact journal before the pass strands anything: a pass that
@@ -1534,16 +1538,30 @@ fn strand_local_tx(
     if recall && row.class.gated() && row.gen != 0 && row.epoch == 0 {
         return Ok(Stranding::Dropped);
     }
-    // L2: a deposed root's rebuild strands its appends of a delegate's rows
-    // (`gen` != 0, `epoch` > 0): see `Strand::rebuild`. They are rolled back
-    // above (journal rows, `completed`, the generation's log index); a gated
-    // one is not queued. Safe by ADR-41: a gated root class is
-    // acknowledged to the delegate only once the append is committed
-    // (`root_ack_class`), and a committed one is in the successor's tail.
-    // An uncommitted one was never counted for the requester, who retries
-    // by rid, and the delegate re-streams its generation's rows. (A change
-    // to `root_append_cap` that counts an uncommitted append would make
-    // this drop lose a row.) A `Lone` append keeps today's rule.
+    // L2: a rebuild strands a root's appends of a delegate's rows (`gen`
+    // != 0, `epoch` > 0): see `Strand::rebuild`. They are rolled back above
+    // (journal rows, `completed`, the generation's log index); a gated one
+    // is not queued. The class does not say the append committed: a root
+    // journals a delegate's row `Lone` (`Meta::finish_local`; no class is
+    // set around `apply_delegate_tx` in `on_delegate_stream`), whatever
+    // ADR-41 counted for the delegate. Only two things make it gated, and
+    // both leave another copy:
+    // - another node's re-ask of the rid, answered from this journal
+    //   (`journaled_answer_class_for` re-tags it `Archive`, and the answer
+    //   waits for the archive): the asker holds an unanswered, executable
+    //   copy and retries it by rid at the successor (this would be a second
+    //   one, I2);
+    // - a predecessor's tail adopted at a takeover
+    //   (`apply_adopted_records_from`, `RootGroup` by default): its group
+    //   committed it, and its members keep it as a member copy until the log
+    //   carries it.
+    // In both the delegate also re-streams the row while it holds it. An
+    // append still `Lone` keeps today's rule (queued): for a lone tenure
+    // (ADR-41 counts its journal at once) it is the row's last copy once the
+    // delegate's is gone. Latent hazard: a change that journals a root's
+    // appends with a gated class (`journal_class_for`: a lone root classes
+    // another node's op `Archive`) would make ADR-41 count the append at
+    // once, and this drop would lose an answered row.
     if strand.rebuild && row.class.gated() && row.gen != 0 && row.epoch > 0 {
         return Ok(Stranding::Dropped);
     }
