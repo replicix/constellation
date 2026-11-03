@@ -5838,6 +5838,22 @@ fn sweep_config() {
         {
             c.rate_budget_ppm = b;
         }
+        // ADR-41: `AUTHORITY_SIM_DROP_PUSHES=<n>` makes every node, as a root,
+        // drop every nth of its unsolicited acknowledgements of a delegate's
+        // commit (`Config::delegation_push_drop_every`): the lost push the
+        // delegate's ask for the commit answers.
+        if let Some(n) = std::env::var("AUTHORITY_SIM_DROP_PUSHES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+        {
+            let inner = c.core.clone();
+            c.core = std::sync::Arc::new(move |id, inc| {
+                let mut core = inner(id, inc);
+                core.delegation_push_drop_every = n;
+                core
+            });
+        }
         // `AUTHORITY_SIM_READ_DELEGATIONS=0` turns the read delegations off
         // in every node of any configuration (the takeover floor's read part
         // is armed and persisted whatever that setting).
@@ -7463,8 +7479,9 @@ struct OracleTotals {
     /// Parked acknowledgements of a delegate's stream (ADR-41): [released,
     /// released by the log while the group's commit was not heard (not by the
     /// commit), waited a second or more, longest wait ms, empty batches that
-    /// asked the root for its commit].
-    parked: [u64; 5],
+    /// asked the root for its commit, of them answers that raised the root's
+    /// committed prefix, pushes dropped on purpose, waited 200 ms or more].
+    parked: [u64; 8],
     /// Plan 43 C1-3: attempts to fetch a group's tail, fetches completed (of
     /// them, of an inherited tail), claims that carried no tail (must be 0
     /// outside an abandon), groups abandoned, runs that ended waiting.
@@ -7544,6 +7561,9 @@ impl OracleTotals {
             self.parked[2] += st.deleg_stream_acks_slow;
             self.parked[3] = self.parked[3].max(st.deleg_stream_ack_wait_max_ms);
             self.parked[4] += st.deleg_root_pokes;
+            self.parked[5] += st.deleg_root_asks_raised;
+            self.parked[6] += st.deleg_stream_acks_push_dropped;
+            self.parked[7] += st.deleg_stream_acks_late;
         }
         for st in r.stats.values() {
             self.downgraded_lone += st.acks_downgraded_lone;
@@ -7789,13 +7809,17 @@ impl OracleTotals {
         eprintln!(
             "SWEEP-PARKED-TOTALS {label} seeds {}/{seeds}: parked delegate acks released {}, by the \
              log and not the group's commit {}, waited 1 s or more {}, longest wait {} ms; empty \
-             batches asking the root for its commit {}",
+             batches asking the root for its commit {} (answers that raised the commit {}), \
+             pushes dropped on purpose {}; waited 200 ms or more {}",
             self.seeds,
             self.parked[0],
             self.parked[1],
             self.parked[2],
             self.parked[3],
-            self.parked[4]
+            self.parked[4],
+            self.parked[5],
+            self.parked[6],
+            self.parked[7]
         );
         eprintln!(
             "SWEEP-CLAIM-TOTALS {label} seeds {}/{seeds}: class-claim-mismatch={} in {} seeds, \

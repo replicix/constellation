@@ -45114,18 +45114,53 @@ mod deleg_group {
         }
     }
 
+    /// One stream tick later, both nodes, the tick armed by the delegate's
+    /// own timer (not the fallback of [`stream_tick`]): an answer parked on the
+    /// root's word keeps it armed.
+    fn armed_tick(d: &mut Harness, r: &mut Harness) -> Vec<Action> {
+        let tick = d.core.cfg.delegation_stream_tick_ms;
+        d.advance(tick);
+        r.advance(tick);
+        let id = d
+            .core
+            .dl
+            .stream_timer
+            .expect("the stream tick is not armed while an answer waits on the root");
+        d.step(Event::Timer { id })
+    }
+
     /// The empty batch to the root in `out`: `(req, round)`.
     fn root_ask(out: &[Action]) -> Option<(OpId, u64)> {
+        root_ask_of(out, 7)
+    }
+
+    /// The empty batch of generation `gen` to the root in `out`.
+    fn root_ask_of(out: &[Action], gen: u64) -> Option<(OpId, u64)> {
         sends(out).into_iter().find_map(|(to, m)| match m {
             PeerMsg::DelegateStream {
                 req,
-                gen: 7,
+                gen: g,
                 round,
                 txs,
                 ..
-            } if to == 1 && txs.is_empty() => Some((*req, *round)),
+            } if to == 1 && *g == gen && txs.is_empty() => Some((*req, *round)),
             _ => None,
         })
+    }
+
+    /// The root's refusal of the batch or ask `req` of generation 7.
+    fn root_refuses(req: OpId, round: u64, through: u64) -> Event {
+        Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegateStreamAck {
+                req,
+                gen: 7,
+                round,
+                through,
+                committed: 0,
+                refused: true,
+            },
+        }
     }
 
     /// The commit rose at the root and its push never came (`how` names
@@ -45144,7 +45179,7 @@ mod deleg_group {
             None,
             "{how}: asked for the commit before the answer had waited a tick"
         );
-        let out = stream_tick(d, r);
+        let out = armed_tick(d, r);
         let (req, round) =
             root_ask(&out).unwrap_or_else(|| panic!("{how}: no ask for the commit: {out:?}"));
         assert_eq!(answer_to_2(&out, 500), None, "{how}");
@@ -45250,15 +45285,19 @@ mod deleg_group {
         assert_eq!(d.core.stats.deleg_root_pokes, 0);
     }
 
-    /// An ask that finds nothing committed is asked again on the next tick,
-    /// no more often, and holds back nothing: its answer is not a refusal
-    /// or a batch that took nothing, so no back-off delays the next row.
+    /// An ask that finds nothing committed is asked again one stream tick
+    /// after it was sent, no more often (`poke_after`, not per event), and
+    /// holds back nothing: its answer is not a refusal or a batch that took
+    /// nothing, so no back-off delays the asking or the next row.
     #[test]
-    fn an_ask_that_finds_nothing_committed_holds_back_no_row() {
+    fn an_ask_that_finds_nothing_committed_is_asked_again_a_tick_later_and_holds_back_no_row() {
         let (mut d, mut r, _, _, last, dir) = parked_pair();
-        let out = stream_tick(&mut d, &mut r);
+        let tick = d.core.cfg.delegation_stream_tick_ms;
+        let out = armed_tick(&mut d, &mut r);
         let (req, round) = root_ask(&out).expect("no ask for the commit");
-        // Asked again once per tick, never per event.
+        let sent = d.clk().wait;
+        assert_eq!(d.core.dl.mine[&7].poke_after, Some(sent.plus(tick)));
+        // Never per event.
         assert_eq!(root_ask(&poke(&mut d)), None);
         let rout = deliver(&mut r, 3, &out);
         assert_eq!(stream_acks_to_3(&rout), vec![(req, round, last, 0, false)]);
@@ -45269,12 +45308,319 @@ mod deleg_group {
             (s.stream_after, s.inflight, s.root_committed),
             (None, None, 0)
         );
+        // The answer is no back-off: the next ask is due one tick after the
+        // first, not four.
+        assert_eq!(s.poke_after, Some(sent.plus(tick)));
         assert_eq!(d.core.stats.deleg_stream_no_progress, 0);
-        // The next row goes at once.
+        // The ask is made again on the next tick.
+        let out = armed_tick(&mut d, &mut r);
+        assert!(root_ask(&out).is_some(), "{out:?}");
+        assert_eq!(d.core.stats.deleg_root_pokes, 2);
+        // And the next row goes at once.
         let out = forward_create(&mut d, dir, 2, 501);
         assert!(
             batch(&out).is_some_and(|(_, _, l)| l == last + 1),
             "the next row was held back: {out:?}"
+        );
+    }
+
+    /// A row executed while an ask is in flight streams at once: the ask
+    /// does not occupy the batch in flight, so the row does not wait for its
+    /// round trip. Fails before: the ask held the stream's one place and the
+    /// row waited for its answer.
+    #[test]
+    fn a_row_executed_while_an_ask_is_in_flight_streams_at_once() {
+        let (mut d, mut r, _, _, last, dir) = parked_pair();
+        let out = armed_tick(&mut d, &mut r);
+        let (ask, _) = root_ask(&out).expect("no ask for the commit");
+        // (The root's answer is on its way.)
+        let out = forward_create(&mut d, dir, 2, 501);
+        let (req, _, l) =
+            batch(&out).unwrap_or_else(|| panic!("the row waited for the ask's answer: {out:?}"));
+        assert_eq!(l, last + 1);
+        assert_ne!(req, ask);
+        assert_eq!(d.core.dl.mine[&7].inflight.map(|(r, _)| r), Some(req));
+        // The ask's late answer is counted (its commit is the root's word) and
+        // leaves the batch in flight alone.
+        let rout = Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegateStreamAck {
+                req: ask,
+                gen: 7,
+                round: round_of(&d, 7),
+                through: last,
+                committed: last,
+                refused: false,
+            },
+        };
+        let dout = d.step(rout);
+        assert!(answer_to_2(&dout, 500).is_some(), "{dout:?}");
+        assert_eq!(d.core.dl.mine[&7].inflight.map(|(r, _)| r), Some(req));
+        assert_eq!(d.core.stats.deleg_stream_no_progress, 0);
+    }
+
+    /// An ask whose answer is lost (a dropped message: no transport failure)
+    /// is given up with no stream timeout and no back-off of the rows'
+    /// stream, and the next row streams at once. Fails before: the ask was
+    /// the batch in flight, given up as a stream timeout with a back-off of
+    /// 200 ms to 2 s that held the next row.
+    #[test]
+    fn an_ask_that_is_never_answered_holds_back_no_row() {
+        let (mut d, mut r, _, _, last, dir) = parked_pair();
+        let out = armed_tick(&mut d, &mut r);
+        assert!(root_ask(&out).is_some(), "no ask for the commit");
+        let wait = d.core.deleg_request_timeout_ms();
+        d.advance(wait);
+        r.advance(wait);
+        poke(&mut d);
+        assert_eq!(d.core.stats.deleg_stream_timeouts, 0);
+        assert_eq!(d.core.dl.mine[&7].stream_after, None);
+        let out = forward_create(&mut d, dir, 2, 501);
+        assert!(
+            batch(&out).is_some_and(|(_, _, l)| l == last + 1),
+            "the row waited for the lost ask's back-off: {out:?}"
+        );
+    }
+
+    /// The transport failure of an ask that a batch of rows has overtaken
+    /// leaves the batch in flight, and backs off nothing of the rows'
+    /// stream. Fails before: the ask held the stream's place, so no batch of
+    /// rows was sent while it was in flight.
+    #[test]
+    fn the_failure_of_an_ask_leaves_a_batch_of_rows_in_flight() {
+        let (mut d, mut r, _, _, last, dir) = parked_pair();
+        let out = armed_tick(&mut d, &mut r);
+        let (ask, _) = root_ask(&out).expect("no ask for the commit");
+        let out = forward_create(&mut d, dir, 2, 501);
+        let (req, _, l) =
+            batch(&out).unwrap_or_else(|| panic!("the row waited for the ask's answer: {out:?}"));
+        assert_eq!(l, last + 1);
+        d.step(Event::PeerFailed {
+            req: ask,
+            to: 1,
+            outage: false,
+        });
+        let s = &d.core.dl.mine[&7];
+        assert_eq!(s.inflight.map(|(r, _)| r), Some(req));
+        assert_eq!(
+            s.stream_after, None,
+            "the ask's failure backed the rows off"
+        );
+    }
+
+    /// A refusal of an ask (a root inside its takeover gate) backs the asking
+    /// off as the stream's back-off does, 200 ms doubling to 2 s, and an
+    /// answer ends it: not an ask every tick (20 a second per generation).
+    /// Fails before: the refusal changed nothing and the next tick asked.
+    #[test]
+    fn a_refused_ask_backs_the_asking_off_and_an_answer_ends_it() {
+        let (mut d, mut r, _, _, last, _) = parked_pair();
+        let tick = d.core.cfg.delegation_stream_tick_ms;
+        let out = armed_tick(&mut d, &mut r);
+        let (req, round) = root_ask(&out).expect("no ask for the commit");
+        d.step(root_refuses(req, round, last));
+        // Four ticks (200 ms), not one.
+        for _ in 0..3 {
+            let out = armed_tick(&mut d, &mut r);
+            assert_eq!(root_ask(&out), None, "asked again inside the back-off");
+        }
+        let out = armed_tick(&mut d, &mut r);
+        let (req, round) = root_ask(&out).expect("not asked again after the back-off");
+        // Refused again: doubled, 400 ms.
+        d.step(root_refuses(req, round, last));
+        for _ in 0..7 {
+            let out = armed_tick(&mut d, &mut r);
+            assert_eq!(
+                root_ask(&out),
+                None,
+                "asked again inside the doubled back-off"
+            );
+        }
+        let out = armed_tick(&mut d, &mut r);
+        let (req, round) = root_ask(&out).expect("not asked again after the back-off");
+        // An answer ends the back-off: the next ask is a tick later.
+        d.step(stream_ack_committed(1, req, round, last, 0));
+        let out = armed_tick(&mut d, &mut r);
+        assert!(root_ask(&out).is_some(), "the back-off outlived the answer");
+        let _ = tick;
+    }
+
+    /// The transport failure of an ask backs the asking off the same way (a
+    /// partition: not an ask every tick), and the batch of rows in flight, if
+    /// any, is none of its. Fails before: the failure of the empty batch
+    /// backed off the rows' stream and the asking went on every tick.
+    #[test]
+    fn a_failed_ask_backs_the_asking_off() {
+        let (mut d, mut r, _, _, _, _) = parked_pair();
+        let out = armed_tick(&mut d, &mut r);
+        let (req, _) = root_ask(&out).expect("no ask for the commit");
+        d.step(Event::PeerFailed {
+            req,
+            to: 1,
+            outage: false,
+        });
+        for _ in 0..3 {
+            let out = armed_tick(&mut d, &mut r);
+            assert_eq!(root_ask(&out), None, "asked again inside the back-off");
+        }
+        let out = armed_tick(&mut d, &mut r);
+        assert!(
+            root_ask(&out).is_some(),
+            "not asked again after the back-off"
+        );
+        assert_eq!(d.core.dl.mine[&7].stream_after, None);
+    }
+
+    /// The tick is armed while an answer waits on the root, also on a tick that
+    /// finds the answer too young to ask about: the timer itself, not a poke,
+    /// brings the ask.
+    #[test]
+    fn the_stream_tick_stays_armed_while_an_answer_waits_on_the_roots_commit() {
+        let (mut d, mut r, _, _, _, _) = parked_pair();
+        // A tick well inside the park's first stream tick: too young to ask.
+        d.advance(10);
+        r.advance(10);
+        let id = d
+            .core
+            .dl
+            .stream_timer
+            .expect("the stream tick is not armed");
+        let out = d.step(Event::Timer { id });
+        assert_eq!(root_ask(&out), None, "{out:?}");
+        let id = d
+            .core
+            .dl
+            .stream_timer
+            .expect("the tick was not armed again for the parked answer");
+        assert!(d.core.timers.contains_key(&id));
+        let tick = d.core.cfg.delegation_stream_tick_ms;
+        d.advance(tick);
+        r.advance(tick);
+        let out = d.step(Event::Timer { id });
+        assert!(root_ask(&out).is_some(), "{out:?}");
+    }
+
+    /// Nothing is asked while no answer is parked, though the root's commit is
+    /// behind what it appended (`root_committed < streamed_through`): an answer
+    /// the log released, or a row nobody waits for (an unpushed `Lone` row).
+    /// Guards the park filter of `deleg_awaited_commits`.
+    #[test]
+    fn nothing_is_asked_when_no_answer_is_parked() {
+        let (mut d, mut r, _, _, _, _) = parked_pair();
+        let s = &d.core.dl.mine[&7];
+        assert!(s.root_committed < s.streamed_through);
+        // The answer's park goes (the log carried the row).
+        for id in d.core.stream_parks_of(7) {
+            let mut out = Vec::new();
+            let now = d.clk();
+            d.core.abort_park_busy(now, id, &d.meta, &mut out);
+        }
+        assert!(!d.core.has_stream_parks());
+        for _ in 0..8 {
+            let out = stream_tick(&mut d, &mut r);
+            assert_eq!(root_ask(&out), None, "asked with nothing parked: {out:?}");
+        }
+        assert_eq!(d.core.stats.deleg_root_pokes, 0);
+    }
+
+    /// A group with a recorded backup does not count the root's copy: an answer
+    /// waiting for the backup's acknowledgement does not ask the root.
+    /// Guards the group gate.
+    #[test]
+    fn nothing_is_asked_of_the_root_for_an_answer_waiting_on_a_recorded_backup() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.core.dl.mine.get_mut(&7).unwrap().backup = Some(4);
+        record_group(&mut h, dir, 2, 1, vec![4]);
+        let out = forward_create(&mut h, dir, 1, 500);
+        let (req, round, last) = batch(&out).expect("sent to the root");
+        h.step(stream_ack_committed(1, req, round, last, 0));
+        assert!(h.core.has_stream_parks());
+        for _ in 0..4 {
+            h.advance(h.core.cfg.delegation_stream_tick_ms);
+            let out = poke(&mut h);
+            assert_eq!(root_ask(&out), None, "{out:?}");
+            if let Some(id) = h.core.dl.stream_timer {
+                let out = h.step(Event::Timer { id });
+                assert_eq!(root_ask(&out), None, "{out:?}");
+            }
+        }
+        assert_eq!(h.core.stats.deleg_root_pokes, 0);
+    }
+
+    /// Once the recorded backup is gone, an answer waits for the group's
+    /// change, which `deleg_group_maintain` asks for only when the root's
+    /// commit covers what was answered: the root's commit is the word awaited,
+    /// and it is asked for. Fails before: the group still named the backup, so
+    /// nothing was asked and the answer waited on a push.
+    #[test]
+    fn a_delegate_asks_for_the_roots_commit_to_remove_a_gone_backup() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.core.dl.mine.get_mut(&7).unwrap().backup = Some(4);
+        record_group(&mut h, dir, 2, 1, vec![4]);
+        let out = forward_create(&mut h, dir, 1, 500);
+        let (breq, blast) = backup_append(&out).expect("appended to the backup");
+        let (req, round, last) = batch(&out).expect("sent to the root");
+        h.step(stream_ack_committed(1, req, round, last, 0));
+        let out = backup_acks(&mut h, breq, blast);
+        assert!(answer_to_2(&out, 500).is_some(), "{out:?}");
+        assert_eq!(h.core.dl.mine[&7].acked_max, 1);
+        // The backup is gone; an answer waits for the group's change.
+        h.core.dl.mine.get_mut(&7).unwrap().backup = None;
+        let now = h.clk();
+        h.core
+            .park_stream_need(now, 7, 1, crate::core::readindex::ParkedWhat::Release);
+        let out = poke(&mut h);
+        assert_eq!(h.core.dl.mine[&7].group_requested, None, "{out:?}");
+        assert!(h.core.has_stream_parks());
+        h.advance(h.core.cfg.delegation_stream_tick_ms);
+        let out = match h.core.dl.stream_timer {
+            Some(id) => h.step(Event::Timer { id }),
+            None => poke(&mut h),
+        };
+        let (req, round) = root_ask(&out)
+            .unwrap_or_else(|| panic!("the commit the removal waits for was not asked: {out:?}"));
+        // The root's commit covers the answer: the removal is asked for.
+        h.step(stream_ack_committed(1, req, round, last, last));
+        let mut out = Vec::new();
+        h.core.deleg_after_event(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.dl.mine[&7].group_requested, Some(vec![]), "{out:?}");
+    }
+
+    /// An answer of one generation held by a dependency on another
+    /// generation's row (`deleg_caps`) waits on that generation's commit: the
+    /// ask goes to the generation whose commit is awaited, not to the answer's.
+    /// Fails before: only the generation of the parked row was asked about.
+    #[test]
+    fn a_delegate_asks_for_the_commit_of_the_generation_an_answer_is_held_by() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let out = forward_create(&mut h, dir, 1, 500);
+        let (req, round, last) = batch(&out).expect("sent to the root");
+        // Generation 8 of this node: its root has appended its row 1 and not
+        // committed it. Generation 7's row 1 depends on it.
+        let mut b = h.core.dl.mine[&7].clone();
+        b.gen = 8;
+        b.streamed_through = 1;
+        b.root_committed = 0;
+        b.xrec = 1;
+        b.inflight = None;
+        let a = h.core.dl.mine.get_mut(&7).unwrap();
+        a.xdeps.entry(8).or_default().insert(1, 1);
+        h.core.dl.mine.insert(8, b);
+        // The root has committed generation 7's row: the answer is held by the
+        // dependency alone.
+        let out = h.step(stream_ack_committed(1, req, round, last, last));
+        assert_eq!(answer_to_2(&out, 500), None, "released past its dependency");
+        assert!(h.core.has_stream_parks());
+        h.advance(h.core.cfg.delegation_stream_tick_ms);
+        let mut out = Vec::new();
+        if let Some(id) = h.core.dl.stream_timer {
+            out.extend(h.step(Event::Timer { id }));
+        }
+        out.extend(poke(&mut h));
+        assert_eq!(root_ask_of(&out, 7), None, "{out:?}");
+        assert!(
+            root_ask_of(&out, 8).is_some(),
+            "the commit of the generation the answer is held by was not asked: {out:?}"
         );
     }
 

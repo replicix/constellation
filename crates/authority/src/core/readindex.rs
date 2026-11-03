@@ -88,6 +88,10 @@ use std::collections::{BTreeMap, BTreeSet};
 /// A parked acknowledgement of a delegate's stream that waited this long
 /// counts as slow (`Stats::deleg_stream_acks_slow`).
 const SLOW_ACK_MS: u64 = 1_000;
+/// ... and as late at this (`Stats::deleg_stream_acks_late`): the ask for the
+/// commit answers within a few ticks, the next batch's acknowledgement does
+/// not.
+const LATE_ACK_MS: u64 = 200;
 
 /// A strict read waiting for its answer.
 #[derive(Debug)]
@@ -743,25 +747,13 @@ impl Core {
             .collect()
     }
 
-    /// Plan 43 Q16 (ADR-41): since when the oldest park waiting on a row of
-    /// generation `gen` above `above` and at most `through` has waited: rows
-    /// the root holds (`through`) that its own tenure has not told this
-    /// delegate it committed (`above`).
-    pub(crate) fn oldest_stream_park_between(
-        &self,
-        gen: u64,
-        above: u64,
-        through: u64,
-    ) -> Option<WaitMs> {
+    /// The parks waiting on a row of a delegate's stream: `(generation, index,
+    /// since when it has waited)`.
+    pub(crate) fn stream_parks(&self) -> impl Iterator<Item = (u64, u64, WaitMs)> + '_ {
         self.rd
             .parked
             .values()
-            .filter(|p| {
-                p.stream_need
-                    .is_some_and(|(g, i)| g == gen && i > above && i <= through)
-            })
-            .map(|p| p.since)
-            .min()
+            .filter_map(|p| p.stream_need.map(|(g, i)| (g, i, p.since)))
     }
 
     pub(crate) fn has_stream_parks(&self) -> bool {
@@ -1980,6 +1972,7 @@ impl Core {
                 self.stats.deleg_stream_ack_wait_max_ms =
                     self.stats.deleg_stream_ack_wait_max_ms.max(waited);
                 self.stats.deleg_stream_acks_slow += u64::from(waited >= SLOW_ACK_MS);
+                self.stats.deleg_stream_acks_late += u64::from(waited >= LATE_ACK_MS);
                 // Released by the log, not by the group's commit: the row
                 // reached the log while the root's committed prefix (or the
                 // backup's acknowledgement) had not been heard (ADR-41).

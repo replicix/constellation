@@ -447,6 +447,10 @@ pub struct Config {
     pub delegation_lone_hysteresis: bool,
     /// The delegate's stream/renew retry tick.
     pub delegation_stream_tick_ms: u64,
+    /// Simulation only: the root drops every Nth of its unsolicited
+    /// acknowledgements of a delegate's commit (`root_stream_push`; 0: none),
+    /// the loss a lost push stands for (ADR-41).
+    pub delegation_push_drop_every: u64,
     /// The root reclaims a grant nobody renewed (a crashed delegate).
     /// Always on in production; the simulation turns it off to pin the
     /// liveness it provides.
@@ -747,6 +751,7 @@ impl Config {
             delegation_lone_lead: true,
             delegation_lone_hysteresis: true,
             delegation_stream_tick_ms: 50,
+            delegation_push_drop_every: 0,
             delegation_reclaim_expired: true,
             placement: true,
             placement_window_ms: 30_000,
@@ -1200,10 +1205,16 @@ pub struct Stats {
     /// the commit): what a lost push leaves (ADR-41).
     pub deleg_stream_ack_wait_max_ms: u64,
     pub deleg_stream_acks_slow: u64,
+    pub deleg_stream_acks_late: u64,
     pub deleg_stream_acks_by_log: u64,
     /// Delegate: empty batches sent to ask the root for its commit while an
     /// answer waited on it (`deleg_poke_root`, ADR-41).
     pub deleg_root_pokes: u64,
+    /// Delegate: of those asks, the answers that raised the root's committed
+    /// prefix (the push they stood in for had not).
+    pub deleg_root_asks_raised: u64,
+    /// Root: pushes dropped on purpose (`Config::delegation_push_drop_every`).
+    pub deleg_stream_acks_push_dropped: u64,
     /// Delegate: renewal answers dropped as another root's or round's, or
     /// for a generation no longer this node's.
     pub deleg_renewed_stale: u64,
