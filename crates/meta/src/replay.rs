@@ -319,18 +319,54 @@ impl TouchSet {
         let mut set = Self::from_op_in(op, lookup);
         // (the inode, the name leaving it, the name it takes instead)
         type Move = (u64, (u64, String), Option<(u64, String)>);
-        let mut moves: Vec<Move> = Vec::new();
-        let mut take = |p: u64, n: &str, to: Option<(u64, &str)>| {
-            if let Some(i) = lookup(p, n) {
-                moves.push((
-                    i,
-                    (p, n.to_string()),
-                    to.map(|(tp, tn)| (tp, tn.to_string())),
-                ));
+        // The names of the inodes as the records leave them: a record's
+        // lookups see what the earlier ones moved, removed or replaced
+        // (`overlay`: `None` is a name that is gone), not the state before
+        // the op.
+        struct Steps<'a> {
+            lookup: &'a dyn Fn(u64, &str) -> Option<u64>,
+            overlay: std::collections::HashMap<(u64, String), Option<u64>>,
+            moves: Vec<Move>,
+        }
+        impl Steps<'_> {
+            fn get(&self, p: u64, n: &str) -> Option<u64> {
+                match self.overlay.get(&(p, n.to_string())) {
+                    Some(i) => *i,
+                    None => (self.lookup)(p, n),
+                }
             }
+            fn take(&mut self, p: u64, n: &str, to: Option<(u64, &str)>) {
+                if let Some(i) = self.get(p, n) {
+                    self.moves.push((
+                        i,
+                        (p, n.to_string()),
+                        to.map(|(tp, tn)| (tp, tn.to_string())),
+                    ));
+                }
+            }
+            fn set(&mut self, p: u64, n: &str, i: Option<u64>) {
+                self.overlay.insert((p, n.to_string()), i);
+            }
+            fn rename(&mut self, from: (u64, &str), to: (u64, &str)) {
+                let moved = self.get(from.0, from.1);
+                self.set(from.0, from.1, None);
+                if moved.is_some() {
+                    self.set(to.0, to.1, moved);
+                }
+            }
+            fn exchange(&mut self, a: (u64, &str), b: (u64, &str)) {
+                let (ia, ib) = (self.get(a.0, a.1), self.get(b.0, b.1));
+                self.set(a.0, a.1, ib);
+                self.set(b.0, b.1, ia);
+            }
+        }
+        let mut steps = Steps {
+            lookup,
+            overlay: Default::default(),
+            moves: Vec::new(),
         };
         match op {
-            MutateOp::Unlink { parent, name } => take(*parent, name, None),
+            MutateOp::Unlink { parent, name } => steps.take(*parent, name, None),
             MutateOp::Rename {
                 parent,
                 name,
@@ -338,8 +374,8 @@ impl TouchSet {
                 new_name,
                 ..
             } => {
-                take(*parent, name, Some((*new_parent, new_name)));
-                take(*new_parent, new_name, None);
+                steps.take(*parent, name, Some((*new_parent, new_name)));
+                steps.take(*new_parent, new_name, None);
             }
             MutateOp::Exchange {
                 parent,
@@ -347,13 +383,17 @@ impl TouchSet {
                 new_parent,
                 new_name,
             } => {
-                take(*parent, name, Some((*new_parent, new_name)));
-                take(*new_parent, new_name, Some((*parent, name)));
+                steps.take(*parent, name, Some((*new_parent, new_name)));
+                steps.take(*new_parent, new_name, Some((*parent, name)));
             }
             MutateOp::Records { records } => {
                 for rec in records {
                     match rec {
-                        LogRecord::Unlink { parent, name, .. } => take(*parent, name, None),
+                        LogRecord::Unlink { parent, name, .. } => {
+                            steps.take(*parent, name, None);
+                            steps.set(*parent, name, None);
+                        }
+                        LogRecord::Rmdir { parent, name, .. } => steps.set(*parent, name, None),
                         LogRecord::Rename {
                             parent,
                             name,
@@ -361,8 +401,9 @@ impl TouchSet {
                             new_name,
                             ..
                         } => {
-                            take(*parent, name, Some((*new_parent, new_name)));
-                            take(*new_parent, new_name, None);
+                            steps.take(*parent, name, Some((*new_parent, new_name)));
+                            steps.take(*new_parent, new_name, None);
+                            steps.rename((*parent, name), (*new_parent, new_name));
                         }
                         LogRecord::Exchange {
                             parent,
@@ -371,8 +412,9 @@ impl TouchSet {
                             new_name,
                             ..
                         } => {
-                            take(*parent, name, Some((*new_parent, new_name)));
-                            take(*new_parent, new_name, Some((*parent, name)));
+                            steps.take(*parent, name, Some((*new_parent, new_name)));
+                            steps.take(*new_parent, new_name, Some((*parent, name)));
+                            steps.exchange((*parent, name), (*new_parent, new_name));
                         }
                         _ => {}
                     }
@@ -380,6 +422,7 @@ impl TouchSet {
             }
             _ => {}
         }
+        let moves = steps.moves;
         // One after another, as the op applies them: a `Records` op that
         // removes the primary name and then the next one of an inode hands
         // it to the third name, so each primary change is judged against the
@@ -2016,6 +2059,53 @@ mod tests {
         // One removal alone still holds only the next name.
         let k = keys(vec![unlink(2, "a")]);
         assert!(holds(&k, 5, "b") && !holds(&k, 9, "c"), "{k:?}");
+    }
+
+    /// Review of S5 (N1 residual): a record's lookups see what the earlier
+    /// records of the op moved. Inode 10 is named (2, "a") and (9, "c");
+    /// (4, "b") belongs to inode 20. `Rename (2,"a") -> (4,"b")` then
+    /// `Unlink (4,"b")` removes inode 10's primary name (the rename's
+    /// target is gone with the unlink), so `(9, "c")` becomes its primary
+    /// and is held; inode 20 lost its only name. Fails before: the unlink's
+    /// lookup of (4, "b") finds inode 20, and `(9, "c")` is not held.
+    #[test]
+    fn a_record_that_removes_a_name_an_earlier_one_moved_resolves_the_moved_inode() {
+        use crate::mutate::MutateOp;
+        use crate::replay::TouchSet;
+        let lookup = |p: u64, n: &str| match (p, n) {
+            (2, "a") | (9, "c") => Some(10),
+            (4, "b") => Some(20),
+            _ => None,
+        };
+        let names = |i: u64| match i {
+            10 => vec![(2, "a".to_string()), (9, "c".to_string())],
+            20 => vec![(4, "b".to_string())],
+            _ => Vec::new(),
+        };
+        let holds = |k: &TouchSet, p: u64, n: &str| {
+            k.dentries.contains(&(p, n.to_string())) && k.shared.contains(&p)
+        };
+        let k = TouchSet::from_op_in_names(
+            &MutateOp::Records {
+                records: vec![
+                    LogRecord::Rename {
+                        parent: 2,
+                        name: "a".into(),
+                        new_parent: 4,
+                        new_name: "b".into(),
+                        time_ns: 1,
+                    },
+                    LogRecord::Unlink {
+                        parent: 4,
+                        name: "b".into(),
+                        time_ns: 1,
+                    },
+                ],
+            },
+            &lookup,
+            &names,
+        );
+        assert!(holds(&k, 9, "c"), "the third name becomes primary: {k:?}");
     }
 
     #[test]
