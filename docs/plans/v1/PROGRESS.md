@@ -64943,12 +64943,15 @@ The first `+commit+unsettled` sweep of the change failed I1 in `delegated-holder
 on main. Both are the gate doing the usable root's work on a state it has not shipped:
 - `answer_awaiting_log` ran when a gated batch appended, and answered an inbox op of this node (`delegated-holder-cut` 553: node 2, root in its gate)
   from `completed`, which in a gate also holds the predecessor's tail the gate re-appended to its journal: not the log's yet. It skips an op whose
-  outcome is in the unshipped journal while gated. Fail-before: `s5_a_gated_root_does_not_answer_an_op_awaiting_the_log_from_its_unshipped_journal`.
+  outcome is in the unshipped journal while gated (the answer path after the review's S1: `ship_landed` calls `answer_awaiting_log` when rows shipped
+  while the gate is pending; before, only the next appended batch, applied segment, inbox recheck, `resolve_moot_waits` or the deadline answered it). Fail-before: `s5_a_gated_root_does_not_answer_an_op_awaiting_the_log_from_its_unshipped_journal`.
 - A node that is a generation's root and its recorded backup acknowledged a backup append through `log_stream_idx`, which counts the root's own
   unshipped appends of the stream: the ack of the backup append of row 5 said `acked 6`, the delegate answered row 6 before its backup's append of it
   arrived (`delegated-holder-cut` 802: node 3's create, 7,052 ms; the tail lacked index 6). `root_log_floor` stops the count below the root's own
-  unshipped appends. Fail-before: `s5_a_backup_that_is_the_root_does_not_count_its_unshipped_appends_as_its_tail` (`acked` 2, not 1). The same hole
-  exists for a usable root that is its generation's backup; the gate made it frequent. `long-delegated-late-answers` 1241 (plain, "node 3 saw
+  unshipped appends. Fail-before: `s5_a_backup_that_is_the_root_does_not_count_its_unshipped_appends_as_its_tail` (`acked` 2, not 1). The floor applies
+  to a usable root and to a deposed root as well as a gated one (the first version held only while the node had the generation's `GenState`, which left a
+  deposed root open; the usable root was never open, and the first report's "the same hole exists for a usable root" was wrong); the gate made the
+  case frequent. `long-delegated-late-answers` 1241 (plain, "node 3 saw
   marker d2/m2-1-marker without its data d1/m2-1-data") failed on the first build of the change too and passes after the first fix.
 
 ### Measured (box 1; main d0884c75 against the change; 1,000 seeds from 0, `+commit`; no knob / `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`)
@@ -64976,9 +64979,10 @@ Failing seeds under `+commit+unsettled` (all I4; no I1, I2, I5 or history failur
 keys across generations` 8 (base: 75, 10, 0); `delegated-holder-cut` `root/takeover gate+takeover floor+job` 91, `itself/...` 43, `no-sequencer-in-time/...keys
 across generations` 18 + `generation outwait` 7, `delegate/job` 7 (base 100, 149, 1 + 8); `placement-hot` 6, 2, 9 (23, 11, 1); `delegated-no-backup-root-near` 27, 3,
 7 (82, 9, 0); `long-delegated-backup` `itself/...` 55, `root/...` 50, `no-sequencer-in-time/...` 36 (149 + 75, 10). The totals fall (violations plus allowed:
-`delegated-backup` 85 to 40, `delegated-holder-cut` 261 to 169, `long-delegated-backup` 246 to 145), but the allowed label rises: the gate now knows
-the windows of the generations it must outwait, so an op that needs one recalled is classified as waiting for a sequencer that is outwaiting, not as one
-that could have answered. Counters (`SWEEP-S5-GATE`, change, no knob / knob): generations taken on 959 / 970 (`delegated-holder-cut`), 351 / 322
+`delegated-backup` 85 to 40, `delegated-holder-cut` 261 to 169, `long-delegated-backup` 246 to 145), but the allowed count rises. The classifier
+(`sim/reach.rs`) did not change; its input did: gated renewals publish later grant ends, so `gen_end_due`'s `by_grant` moves later, and an op on a
+generation whose delegate is not in force becomes "no sequencer in time". That is a real outwait of the product (not a relabelling that hides I4 cases)
+and a real availability cost when a delegate dies inside the gate. Counters (`SWEEP-S5-GATE`, change, no knob / knob): generations taken on 959 / 970 (`delegated-holder-cut`), 351 / 322
 (`delegated-backup`), 136 / 119, 353 / 315, 718 / 682; renewals granted 3,531 / 4,866, 1,396 / 1,130, 637 / 545, 1,755 / 1,405, 2,131 / 2,640; transactions
 appended 1,585 / 1,646, 463 / 292, 104 / 55, 495 / 325, 1,582 / 1,541; settles redirected 0 everywhere but `long-delegated-backup` (1): a requester's settle
 goes to a live delegate by itself (`settle_route`), so the gate's redirect serves only a stale table. `SWEEP-FAILOVER` p50 / p90 (ms to the first
@@ -65012,7 +65016,7 @@ by 60 to 80 percent. The classes that remain need a recall inside the gate, whic
   fail on main). Ratchet ceilings (violations, seeds 0..99, no knob, measured): `delegated-backup` 4 to 1, `delegated-holder-cut` 24 to 12,
   `delegated-no-backup-root-near` 4 to 0, `long-delegated-backup` 23 to 5, `long-delegated-late-answers` 25 to 9, `placement-hot` 4 to 0; the allowed ceilings are
   not raised although the measured allowed counts rose (`delegated-backup` 0 to 2, `delegated-holder-cut` 2 to 3, `delegated-no-backup-root-near` 0 to 1,
-  `long-delegated-late-answers` 1 to 4, `placement-hot` 0 to 1: the relabelling above; each is within its ceiling plus margin). `delegated-root-crash` (0 of 2,000
+  `long-delegated-late-answers` 1 to 4, `placement-hot` 0 to 1: the later windows above; each is within its ceiling plus margin). `delegated-root-crash` (0 of 2,000
   seeds `+unsettled`) moves to the strict list (16 strict, 16 ceilings); no other configuration is at 0 (`backup-strict` 7, `long-backup` 1, `long-delegated` 4,
   `delegated-no-backup-root-near` 53, `placement-hot` 16 of 2,000). `m03_a_reachable_sequencers_requester_is_not_isolated` is re-pinned to
   `long-delegated-late-answers` 2 (seed 1 is closed), and `c0_the_real_rebuild_recovers_a_deposed_root` to 270 and 2822 (9287 and 3036 no longer run a rebuild).
@@ -65020,3 +65024,29 @@ by 60 to 80 percent. The classes that remain need a recall inside the gate, whic
 Gates (box 1, final tree, TMPDIR on a tmpfs): `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean; authority lib 1,002 and
 `meta_repro` 4, engine 948 (plus its integration tests), meta 385, net 127, control 146, harness lib 164, all 0 failed; sim suite (release) 358 passed, 0 failed,
 13 ignored (357 on d0884c75 plus the S5 pin).
+
+### Opus review of S5 (SOUND WITH CHANGES): follow-ups applied
+- **M1, `root_log_floor` covers a deposed root.** The floor applied only while the node held the generation's `GenState`; a deposed root drops it
+  (`deleg_on_lease_gone`) but keeps its unshipped appends in the journal and in `log_stream_idx` until its recovery strands them, so the delegate's next
+  backup append to it was acknowledged through rows only the delegate then held. The `GenState` precondition is gone: the floor holds whenever the node has
+  unshipped holder appends of the generation, i.e. for a usable root and a deposed root as well as a gated one (the usable root was never open: the report's
+  "the same hole exists for a usable root" was wrong). Fail-before: `s5_a_deposed_root_that_is_the_backup_does_not_count_its_unshipped_appends` (`acked: 2`, the
+  backup's store holds row 1).
+- **N2, cost of `root_log_floor`: open.** It reads `holder_appends(gen)` from index 0, which walks the deleted `journal_origin` keys of the generation's shipped
+  history on every backup append while unshipped appends exist (the cost plan 43 G1 removed from `root_append_cap`). No lower bound for the scan could be
+  shown safe from the state the core keeps: the backup's last acknowledgement (`dl.backing`) counts rows from the backup's own tail, above this node's first
+  unshipped append, and `committed_sent` counts rows that are committed but still unshipped, which the floor must stay below. A bound needs new tracking of
+  the generation's first unshipped append (or a cache of the unshipped appends refreshed from the journal's rows past the previous tip). Not done.
+- **S1, the answer after the ship.** `ship_landed` called only `answer_shipped_barriers`, so an op skipped by the fix A guard was answered by the next
+  appended batch, applied segment, inbox recheck, `resolve_moot_waits` or its deadline, not by the ship. It now calls `answer_awaiting_log` when rows shipped
+  while the gate is pending. The test drives a real ship through the shipper's round (the gate still waiting for the quarantine) and checks that the step that
+  lands the segment answers the op; fail-before: it answers nothing in that step.
+- **N1, `from_op_in_names` with `Records`.** The moves apply one after another to a per-inode name list, so records that remove the primary and then the next
+  name of one inode hold the third name. Fail-before: `records_that_remove_two_names_of_an_inode_hold_the_third` (the third name was not held).
+- **N3** is the wording above (a real outwait, not a relabelling). **N4** (the `Held` / `Redirect` split leaves one bounce race when a delegate's grant lapses
+  while the root's window is open) is identical to S3's for a usable root and unchanged.
+- Gates (box 1, final tree, TMPDIR on a tmpfs): `cargo fmt --all --check` and clippy `-D warnings` clean; authority lib 1,003 (2 ignored) and `meta_repro` 4,
+  meta 566 (its lib 386, with `holder_capture`), engine 958, harness lib 165, net 137, control 146, all 0 failed; sim suite (release) 358 passed, 0 failed,
+  13 ignored. `+commit` sweeps over seeds 0..299: `delegated-holder-cut` (no knob / `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`), `long-delegated-backup` and
+  `delegated-backup`: i1 = 0 and i2 = 0 in every config; i4 = 1 (seed 252) / 2 (seeds 73 and 252) in `delegated-holder-cut`, 0 in the other two, the same seeds
+  as on 31928185.

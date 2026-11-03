@@ -2633,7 +2633,9 @@ or is releasing is unchanged. A settle of the gated root's own plans no recall
   root had made on it still live. `TouchSet::from_op_in_names` holds the name
   that becomes the primary one (for an unlink, the names a rename or an
   exchange moves, the name a rename overwrites, a stranded replay's records),
-  so the op is cross-subtree and the root recalls and re-delegates
+  applying the moves one after another to a per-inode name list, so an op that
+  removes the primary and then the next name of one inode (a stranded replay's
+  records) holds the third name too; the op is cross-subtree and the root recalls and re-delegates
   (`delegate_dir`'s read recalls then cover the file). It closes the same race
   for a usable root. Cost: one `RDentry` range seek per unlink, rename or
   exchange in `keys_of_op_in` and the FUSE fast paths, only while a delegation
@@ -2649,21 +2651,44 @@ or is releasing is unchanged. A settle of the gated root's own plans no recall
 - Settles on another node's live generation are answered by its delegate
   within the window, a delegate's grant runs through its root's takeover
   instead of lapsing, and the gated root's own clients waiting for a
-  delegate's row are answered once the row ships. Windows of inherited
+  delegate's row are answered once the row ships (`ship_landed` runs
+  `answer_awaiting_log` when rows shipped inside a gate; without that call the
+  op waited for the next appended batch, applied segment or inbox recheck). Windows of inherited
   generations start at `shippable`, not at the gate's opening (the bound is
   unchanged: any instant after the tenure began). The off-core lane stays off
   in the gate (a fenced root publishes no certificate).
 - `committed` inside the gate: a lone gated root (no backup listed) counts its
   journal at once (`u64::MAX`, as a lone usable root under ADR-41); a backed
   one raises it when the row ships (nothing is backed before the gate opens).
-- New interaction found by the sweeps, fixed here: inside the gate the
-  replica's `completed` also holds what the gate re-appended to its journal;
-  `answer_awaiting_log` no longer answers an op of this node from it before it
-  ships (I1: an inbox op answered from the re-shipped tail), and a node that is
-  a generation's root and its recorded backup acknowledges a backup append only
-  through what the log holds (`root_log_floor`), not through its own unshipped
-  appends of the stream (I1: a delegate answered a row its backup did not yet
-  hold).
+- New interaction found by the sweeps, fixed here (two I1 classes):
+  - *Fix A.* Inside the gate the replica's `completed` also holds what the gate
+    re-appended to its journal; `answer_awaiting_log` no longer answers an op of
+    this node from it before it ships (I1: an inbox op answered from the
+    re-shipped tail). The guard skips exactly the rids whose `Completed` or
+    `Refused` row is still in the unshipped journal; the node's own ship answers
+    the op: `ship_landed` calls `answer_awaiting_log` when rows shipped while the
+    gate is pending (the other answers are the next appended batch, applied
+    segment or sealed drain, the inbox recheck, `resolve_moot_waits` at the open
+    and the op's deadline).
+  - *Fix B.* A node that is a generation's root and its recorded backup
+    acknowledges a backup append only through what the log holds
+    (`root_log_floor`), not through its own unshipped appends of the stream
+    (I1: a delegate answered a row its backup did not yet hold). The floor
+    applies to a usable root and to a deposed root as well as a gated one: it
+    holds whenever the node has unshipped holder appends of the generation,
+    whether or not it still has the generation's `GenState` (a deposed root
+    drops it in `deleg_on_lease_gone` and keeps its unshipped appends in the
+    journal, and in `log_stream_idx`, until its recovery strands them). An
+    earlier version of this change applied it only while the node held the
+    `GenState`, which left the deposed root open; the usable root was never
+    open. Cost, open: the floor reads the generation's unshipped holder
+    appends from index 0 (`holder_appends`), which walks the deleted
+    `journal_origin` keys of the generation's shipped history on every backup
+    append while unshipped appends exist, the cost plan 43 G1 removed from
+    `root_append_cap`. No lower bound for the scan could be shown safe from the
+    state the core keeps (the backup's last acknowledgement and `committed_sent`
+    both count rows that are still unshipped), so a bound needs new tracking of
+    the generation's first unshipped append.
 - What the gate still cannot answer, as before and by this decision: an op that
   needs a generation recalled or ended (a cross-subtree op, a generation whose
   delegate rebooted and is stopped), and a delegate that restarted in the gate
@@ -2674,9 +2699,15 @@ or is releasing is unchanged. A settle of the gated root's own plans no recall
   35 / 42 to 8 / 30 (`placement-hot`), 91 / 133 to 30 / 57
   (`delegated-no-backup-root-near`), 236 / 413 to 109 / 199
   (`long-delegated-backup`); the residual sampled (PROGRESS, "S5") is these
-  classes, not the settle on a live delegate. The classifier's allowed label
-  "no sequencer in time, generation outwait, keys across generations" rises
-  (the gate now knows the windows it must outwait); the totals fall.
+  classes, not the settle on a live delegate. The allowed count of "no
+  sequencer in time, generation outwait, keys across generations" rises, and
+  the classifier (`sim/reach.rs`) did not change: its input did. A gated
+  renewal now publishes a later grant end, so `gen_end_due`'s `by_grant` moves
+  later, and an op on a generation whose delegate is not in force becomes "no
+  sequencer in time". That is a real outwait of the product, not a relabelling
+  that hides I4 cases, and a real availability cost when a delegate dies inside
+  the gate: the root cannot end its generation before the later window. The
+  totals fall.
 - No version bump, no shim.
 - Residual, not new: a root grant on a directory whose entry names a multi-link
   inode with its primary link inside the subtree (ADR-36's dentry copy of a
