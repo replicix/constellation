@@ -5,6 +5,9 @@ architecture fits together, and the decisions that shaped it.
 
 Included here are:
 
+- [Roles and terms](GLOSSARY.md) — root, backup, delegate, requester,
+  generation, commit, seal, takeover gate, settle, and the rules the
+  tests check, in plain words; read first
 - [Goals](GOALS.md) — goals, non-goals, motivating scenarios, prior art
 - [Design](DESIGN.md) — architecture: data/metadata planes, leases,
   pin/offline/epochs, caching, compression, security, failure matrix

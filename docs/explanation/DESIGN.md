@@ -590,6 +590,8 @@ The metadata plane is one ordered log in S3, one lease that decides who
 appends to it, and a full replica on every node. Everything else in this
 section exists to make that simple shape fast (forwarding, delegation,
 streaming) and safe to fail over (request ids, speculation, positions).
+For the roles (root, backup, delegate, requester) and the words below in
+plain language, see [Roles and terms](GLOSSARY.md).
 
 The sections below and the code use the vocabulary of Vertical Paxos and Delos
 (plan 43). The **configuration master** is the versioned register that decides
