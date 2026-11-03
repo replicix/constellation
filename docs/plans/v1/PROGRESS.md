@@ -65063,12 +65063,16 @@ requester executes it on another. Its witness was `placement-hot` 8557 with `AUT
 
 ### Mechanism
 
-1. Node 3 is generation 5's delegate. It executes node 4's `Rename` (4,1,17) as row 5 and streams it to the root, node 1, epoch 1.
-   The root appends it with `apply_delegate_tx` into its journal under its lease epoch: a `Local` row of gen 5, epoch 1, in the
-   root's class (here `Archive`; `root_ack_class`). The root acknowledges it and the delegate answers node 4 `Accepted { epoch: 1 }`.
-   The row is never shipped: node 1 stalls under the slow lease reads and node 2 takes epoch 2.
-2. Node 4 sees the log move past epoch 1 without its op (`reroute_ended_epoch_waits`) and asks the new holder again by rid. From
-   then on the ledger counts node 4's client entry as executing.
+1. Node 3 is generation 5's delegate. It executes an op as a row of its generation and streams it to the root, node 1, epoch 1.
+   The root appends it with `apply_delegate_tx` into its journal under its lease epoch: a `Local` row of gen 5, epoch 1, journaled
+   `Lone`. (A root's append of a delegate's row carries no class of its own: `on_delegate_stream` sets none, and `finish_local`
+   takes `Lone` under a delegation origin. The class says nothing about ADR-41's commit.) The root acknowledges it and the delegate
+   answers its requester. The row is never shipped: node 1 stalls under the slow lease reads and node 2 takes epoch 2.
+2. The rid is asked again by another node, at the old root or the new one. A dedup answer from node 1's journal re-tags the row
+   `Archive` (`journaled_answer_class_for`) and the answer waits for the archive. The asker's request superseded the delegate's
+   earlier answer, so from then on the asker is answered from the archive only. In 8557 the asker was node 4, the requester; in
+   1680 it is node 3, for its own rid (3,1,16). From then on the ledger counts that client entry as executing. (The other way to
+   a gated class is an adopted predecessor tail, `apply_adopted_records_from` with `gen` != 0: `RootGroup`, the default there.)
 3. Node 1 learns it lost the lease. The epoch strand leaves the generation's appended rows in the journal (`stranded_by` never
    strands a `Local` row with `gen != 0`: the delegate re-streams to the successor), so recovery asks for a rebuild.
    `reset_for_rebuilt_ns_tx` then runs every journal row through `strand_local_tx` with `member = true, recall = false`.
@@ -65081,7 +65085,8 @@ requester executes it on another. Its witness was `placement-hot` 8557 with `AUT
 The design already says the row is not the deposed root's to replay: `LiveEntry::stranded_by` ("the delegate re-streams to the
 successor"), `stranded_local_deps` (the root's own replays carry deps on exactly these rows, "which the successor appends from the
 delegate's re-stream"), and C1-4's rule that a gated row is not this node's to re-execute. The rebuild path (plan 30 M3b: queue
-every one of this node's unshipped transactions) predates I2 (b) and was the one path that still queued them.
+every one of this node's unshipped transactions) predates I2 (b) and was the one path that still queued them. (The rebuild also
+read no such deps: see "Ordering" below.)
 
 ### Fix (`crates/meta/src/store/spec.rs`; no rule change)
 
@@ -65089,18 +65094,44 @@ every one of this node's unshipped transactions) predates I2 (b) and was the one
 `if strand.rebuild && row.class.gated() && row.gen != 0 && row.epoch > 0 { return Ok(Stranding::Dropped) }`. The rollback steps above it
 still run (journal rows, `completed`, the generation's log index and the session's stream). A `Lone` append keeps today's rule
 (queued), as does the root's own gated row (`gen == 0`: the member copy). The recall pass and `strand_for_takeover_carrying` are
-untouched. Why dropping loses nothing (ADR-41): a gated root class is acknowledged to the delegate only once the append is
-committed. A committed one (shipped, or held by every backup) is in the successor's takeover tail and reaches the log. An
-uncommitted one was never counted for the requester, who retries by rid, and the delegate re-streams its generation's rows. The
-comment names the dependency: a change to `root_append_cap` that counted an uncommitted append would make the drop lose a row.
+untouched. The flag also reaches the retention rebuild (a replica the log was pruned past, `after_gap_check` to
+`replace_ns_from_rebuilt`): the drop is as safe there, since a replica behind the log's retained tail is no current root, and the
+argument below is the row's, not the cause of the rebuild.
+
+Why dropping loses nothing. The class does not say the append committed: a root's append of a delegate's row is `Lone` until
+something gates it, and only two things do, both leaving another copy: (a) another node's re-ask by rid, answered from this journal
+(the row is re-tagged `Archive`, and the answer waits for the archive): the asker holds an unanswered, executable copy, retries it by
+rid at the successor, and the delegate re-streams the row while it holds it; (b) an adopted predecessor tail (`RootGroup`): its
+group committed it and its members keep it as a member copy until the log carries it, and the delegate re-streams the row too. A
+row still `Lone` is queued as before: for a lone tenure (ADR-41 counts its journal at once) it is the last copy once the delegate's
+is gone. A backed root's committed append is in the sealed backup's tail. A latent hazard, recorded in the code comment: a change
+that journaled a root's appends with a gated class (`journal_class_for`: a lone root classes another node's op `Archive`) would
+have ADR-41 count the append at once, and the drop would lose an answered row.
+
+### Ordering (review M2)
+
+The rebuild strands every journal row oldest first and deletes each before it examines the next, so the deps of a row on the
+delegate rows ahead of it (`stranded_local_deps`) came out empty. Before the drop, a delegate row's queued replay ordered the root's
+later own replay on shared keys (the queue runs in order); with the row dropped nothing does. The shape: the root appends the
+delegate's data row, which moves an inode's keys to the root; the requester re-asks, so the row is `Archive`; the root journals its
+own marker on that inode; deposed and rebuilt, the row is dropped and the marker queued with no deps, and the successor could run it
+against a replica without the data row (`long-delegated-late-answers` 2945's shape). `reset_for_rebuilt_ns_tx` now reads every row's
+deps from the intact journal once (`stranded_deps_by_tx`) and passes them through `Strand::deps_of`. A dep is `(generation, index)`: the
+successor holds the replay until the delegate's re-stream brings the stream there (`reaches_streams`), or until the generation is void
+(a recalled one is satisfied). The root's own replays now also carry deps on the queued `Lone` rows, as the epoch strand's do.
 
 ### Tests
 
 - Meta `a_rebuild_queues_no_gated_append_of_a_delegates_row` (`crates/meta/tests/holder_capture.rs`): three appends of a delegate's
-  rows under `RootGroup`, `Archive` and `Lone`, the root's own gated row, then a rebuild. Before the fix it fails with
-  `left: [(2,1,1) RootGroup, (2,1,2) Archive, (2,1,3) Lone]`, `right: [(2,1,3) Lone]` ("only the lone append is queued"); with the
+  rows built through the real paths (appended with no class, so `Lone`, then one re-tagged `Archive` by `reclass_journal_tx`; one
+  adopted with `apply_adopted_records_from`, `gen` != 0, `RootGroup`; one left `Lone`), the root's own gated row, then a rebuild.
+  Before the fix it fails with
+  `left: [(2,1,1) Archive, (2,1,2) RootGroup, (2,1,3) Lone]`, `right: [(2,1,3) Lone]` ("only the lone append is queued"); with the
   fix: only the lone append is queued, the dropped rows' `completed` entries and the generation's log index are rolled back, and
   the own row is in the member copy of its epoch.
+- Meta `a_rebuild_keeps_the_stream_deps_of_the_roots_own_replays` (same file): a dropped `Archive` row, the root's own marker, a
+  `Lone` row, another marker, a rebuild. Before the ordering fix the queued replays carry no deps (`deps.get(5)` is `None`); with
+  it the first marker and the queued `Lone` row wait for index 1 and the second marker for index 2.
 - Sim pin `l2_a_deposed_roots_rebuild_queues_no_gated_copy_of_a_delegates_row` (`delegated-no-backup-root-near` 1680 with the knob,
   plain `run_seed`, the sweep's trajectory). A new counted-only ledger field, `Report::identity_foreign_gated`, counts rids of
   another node queued with a gated class (`IdentityLedger::foreign_gated`; in `SWEEP-C14-TOTALS` as "foreign gated queued"). Main:
@@ -65127,6 +65158,12 @@ comment names the dependency: a change to `root_append_cap` that counted an unco
 `placement-hot` 0..10,000 fail the same seeds on both trees (4418 only). The failing seeds are identical on both trees in every configuration; the only change is the one witness above (1680: i2 1 to 0,
 foreign gated 1 to 0, and the `+identity` failure gone). The drop fires only on that seed.
 
+After the review's follow-ups (the ordering fix and the corrected argument; the code otherwise unchanged) every row of the table was
+re-run on the final tree: the failing seeds, the oracle totals, the ungated pairs and the foreign-gated counts are identical to the
+`fix` column, `+identity` and `+commit` included (i1 = i2 = 0), and `placement-hot` knob 0..10,000 still fails 4418 (I5) only.
+`long-delegated-late-answers` 2000..2,999 (knob and no knob) and seed 2945, the shape of the ordering case, are clean and identical
+to main. (The sweeps do not exercise the ordering case; the meta test pins it.)
+
 ### Not closed: L2b
 
 Two other strands queue a gated copy of another node's rid. No sweep judges a pair from them, and this fix does not touch them;
@@ -65136,10 +65173,12 @@ the new counter gives their numbers (above: `long-delegated-late-answers` knob 2
   (rids (2,1,6) and (2,2,1) on node 3). Needs a design answer: should the new root append its former delegate rows as the
   generation's rows rather than replay them by rid?
 - (b) The recall pass's root appends (`recall = true, epoch > 0`, the "keeps today's rule" branch). Witness: `long-delegated-backup`
-  956 with the knob ((2,2,1) on node 3). A root append past the recall's cut was not in the successor's tail, so it was not
-  committed, and the same rule looks safe, but it reverses a deliberate C2 choice.
+  956 with the knob ((2,2,1) on node 3). Whether the same rule is safe there is not established: a root append past the recall's cut
+  is no member of the successor's tail, but a root append's class says nothing about whether it committed (see "Why dropping loses
+  nothing"), so "it was not committed" is not a premise. The same two sources of a gated class apply, and dropping reverses a
+  deliberate C2 choice. Needs its own analysis.
 
 ### Gates
 
 `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean; meta (all targets; lib 387, `holder_capture` 32),
-authority lib 1,004, engine 948, all 0 failed; sim suite (release) 359 passed, 0 failed, 13 ignored (358 on main plus the pin).
+authority lib 1,004, engine 948, all 0 failed; sim suite (release) 359 passed, 0 failed, 13 ignored (358 on main plus the pin). Re-run after the follow-ups: meta `holder_capture` 33 (two new L2 tests, both fail before), the rest unchanged.
