@@ -380,20 +380,28 @@ impl TouchSet {
             }
             _ => {}
         }
+        // One after another, as the op applies them: a `Records` op that
+        // removes the primary name and then the next one of an inode hands
+        // it to the third name, so each primary change is judged against the
+        // names the earlier steps left (`orig` is what the inode had before
+        // the op: a name the op adds is held as the op's own dentry).
+        let mut seen: std::collections::HashMap<u64, (Vec<(u64, String)>, Vec<(u64, String)>)> =
+            std::collections::HashMap::new();
         for (ino, gone, arrives) in moves {
-            let before = names(ino);
-            let Some(primary) = before.first() else {
-                continue;
-            };
-            let mut after: Vec<&(u64, String)> = before.iter().filter(|n| **n != gone).collect();
-            if let Some(a) = &arrives {
-                if !before.contains(a) {
-                    after.push(a);
+            let (orig, now) = seen.entry(ino).or_insert_with(|| {
+                let before = names(ino);
+                (before.clone(), before)
+            });
+            let primary = now.first().cloned();
+            now.retain(|n| *n != gone);
+            if let Some(a) = arrives {
+                if !now.contains(&a) {
+                    now.push(a);
                 }
             }
-            after.sort();
-            if let Some(next) = after.first() {
-                if *next != primary && before.contains(next) {
+            now.sort();
+            if let (Some(primary), Some(next)) = (primary, now.first()) {
+                if *next != primary && orig.contains(next) {
                     set.dentries.insert((next.0, next.1.clone()));
                     set.shared.insert(next.0);
                 }
@@ -1964,6 +1972,49 @@ mod tests {
             }],
         });
         assert!(holds(&k, 5, "b"), "{k:?}");
+    }
+
+    /// Review of S5 (N1): a `Records` op that removes the primary name and
+    /// then the next name of one inode makes the third name the primary
+    /// one: every intermediate primary is held, not only the one the first
+    /// removal leaves. Fails before: `(9, "c")` is not held (each move was
+    /// computed against the names before the op).
+    #[test]
+    fn records_that_remove_two_names_of_an_inode_hold_the_third() {
+        use crate::mutate::MutateOp;
+        use crate::replay::TouchSet;
+        let lookup = |p: u64, n: &str| match (p, n) {
+            (2, "a") | (5, "b") | (9, "c") => Some(10),
+            _ => None,
+        };
+        let names = |i: u64| match i {
+            10 => vec![
+                (2, "a".to_string()),
+                (5, "b".to_string()),
+                (9, "c".to_string()),
+            ],
+            _ => Vec::new(),
+        };
+        let keys = |records: Vec<LogRecord>| {
+            TouchSet::from_op_in_names(&MutateOp::Records { records }, &lookup, &names)
+        };
+        let holds = |k: &TouchSet, p: u64, n: &str| {
+            k.dentries.contains(&(p, n.to_string())) && k.shared.contains(&p)
+        };
+        let unlink = |p: u64, n: &str| LogRecord::Unlink {
+            parent: p,
+            name: n.into(),
+            time_ns: 1,
+        };
+        let k = keys(vec![unlink(2, "a"), unlink(5, "b")]);
+        assert!(holds(&k, 5, "b"), "{k:?}");
+        assert!(holds(&k, 9, "c"), "the third name becomes primary: {k:?}");
+        // The other order: the primary name goes last, to the third.
+        let k = keys(vec![unlink(5, "b"), unlink(2, "a")]);
+        assert!(holds(&k, 9, "c"), "{k:?}");
+        // One removal alone still holds only the next name.
+        let k = keys(vec![unlink(2, "a")]);
+        assert!(holds(&k, 5, "b") && !holds(&k, 9, "c"), "{k:?}");
     }
 
     #[test]
