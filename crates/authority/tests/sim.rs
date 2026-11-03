@@ -14990,7 +14990,11 @@ fn settle_before_eio_a_gate_a_renewal_and_a_redirect_loop_leave_no_unsettled_eio
             delegated_holder_cut_config(),
             vec![6, 17],
         ),
-        ("delegated-backup", delegated_backup_config(), vec![203, 129]),
+        (
+            "delegated-backup",
+            delegated_backup_config(),
+            vec![203, 129],
+        ),
         (
             "delegated-no-backup-root-near",
             delegated_no_backup_root_near_config(),
@@ -15943,7 +15947,11 @@ fn m03_the_settle_causes_s1_to_s3_leave_no_unsettled_eio_in_these_seeds() {
             delegated_holder_cut_config(),
             vec![6, 17],
         ),
-        ("delegated-backup", delegated_backup_config(), vec![203, 129]),
+        (
+            "delegated-backup",
+            delegated_backup_config(),
+            vec![203, 129],
+        ),
         (
             "delegated-no-backup-root-near",
             delegated_no_backup_root_near_config(),
