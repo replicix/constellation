@@ -64796,3 +64796,31 @@ create 464 / 611 to 711 / 847; write 3,462 / 3,801 to 3,829 / 4,055; rename 455 
 show); the fix meets it for create and write and is **over for rename (p50 by 207, p90 by 249), unlink (244, 322) and chmod (374, 476)**. The added
 latency is the root's backup round trip with its durable write, one pipelined hop, plus the push; it is the price of the rule, 0.25 to 0.7 ms on a
 metadata op, on a delegate that has no backup of its own. A delegate with a recorded backup, a lone root and an epoch hold are unchanged.
+
+### Item A's cost: the root's cap scan (plan 43 G1, ADR-41)
+
+The overrun above was mostly not the rule's round trip. A trace of topology 3's delegate chmod (µs from the FUSE wait, p50) put A's root ack at 443 against
+main's 167, and its push at 1,009 after the root's `BackupAck` step at 722. Both windows were `Core::root_append_cap`, which read the generation's `journal_origin`
+range from index 0 over the deleted keys of every row already shipped. The windows grew with the generation through the harness's phases: 68 / 24 at create, 322 / 287 at chmod.
+The same read reran in every root step while a push was due: the root's core was busy 773 µs per delegate chmod, against 100 on main, and the root's own
+forwards into the delegated directory went from about 1.0 to 1.8 ms. There was no fsync on the path (`PersistMode::Buffer`), no tick wait and no batching; the push already
+left in the step of the backup's acknowledgement.
+
+The cap now reads from past the committed prefix last sent for the generation (`holder_appends_from`, one seek). A row the root's tenure committed stays
+committed, `GenState` lives within one tenure, and a batch of a new round resets the prefix, so the read covers the whole range again. Measured
+(`g1-multi.sh`, release, rotated order, 6 rounds, 200 samples, the quiet timing box; delegate p50 / p90 in µs, A to the fix, holder from the same build):
+- create 755 / 915 to 697 / 847 (holder 365 / 473);
+- write 3,862 / 4,127 to 3,721 / 3,955;
+- rename 989 / 1,122 to 700 / 848 (holder 265 / 371);
+- unlink 1,072 / 1,273 to 682 / 825 (holder 264 / 355);
+- chmod 1,257 / 1,386 to 648 / 777 (holder 243 / 313).
+
+G1 is met on every op, with p90 margins of only 23 (rename), 30 (unlink) and 36 (chmod) µs. Forwards are back to 1.01 to 1.07 ms. What remains is the rule's
+own price, about 0.23 ms: two loopback hops and two core steps.
+
+Candidates not taken:
+- Deferring a backed root's S3 round per appended batch: a further 0.1 ms, but forwards regress to about 7 ms.
+- Reply-free p2p frames: they would cut every hop, but they need a profile first.
+- The backup telling the delegate directly: it needs a new proof.
+
+`holder_append_cap` has the same read from 0, off this path.

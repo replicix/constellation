@@ -2494,10 +2494,18 @@ the root's backups, and does not need to: it counts what the root says.
   1,124, chmod 397 / 532 to 1,110 / 1,286; G1 (the holder plus 500 us)
   is then over for rename, unlink and chmod (p50 by 207, 244 and 374 us).
   The maintainer accepted the overrun as temporary, against plan 43's rule
-  that a failing gate stops its milestone: it holds until M1.2's member
-  copy (below), and a follow-up cuts the cost meanwhile (the push on the
-  backup's acknowledgement rather than at the next event). PROGRESS,
-  "Oracle I1: class A".
+  that a failing gate stops its milestone, until M1.2's member copy
+  (below) or a cut of the cost. Most of it was not the rule's round trip
+  but the root's cap: `root_append_cap` read the generation's
+  `journal_origin` range from index 0, over the deleted keys of every row
+  it had shipped, twice on the delegate's path and in every root step
+  while a push was due. It now reads from past the committed prefix it
+  sent (a row the tenure committed stays committed; a new round reads the
+  whole range again), and G1 is met on every op: chmod 648 / 777 us,
+  rename 700 / 848, unlink 682 / 825, with a p90 margin of 23 to 36 us.
+  The rule's own price is about 0.23 ms (two hops and two steps); the
+  push already leaves in the step of the backup's acknowledgement.
+  PROGRESS, "Oracle I1: class A" and "Item A's cost".
 - Where the delegate's own backup is the root's backup too (topology 3),
   the commit takes one local round trip more.
 - The delegate depends on the root's push: a lost push, a root restart
