@@ -64838,39 +64838,59 @@ cases. (a) moves the release to the renewal period (ttl / 2, 2.5 s of the defaul
 (`DelegRenewed`, net `Payload`, the engine relay); (b) releases within one stream tick (50 ms) of the commit, changes no wire format (the root already answers
 an empty batch with its cursor and its commit, on the delegate's round, and records it as the generation's last batch, so its pushes resume) and sends
 nothing while nothing is parked.
-- `deleg_poke_root` (delegate.rs): when a generation's stream has nothing to send and an answer has waited a stream tick on `root_committed`
-  (`deleg_awaits_root_commit`: a park on a row above `root_committed` and at most `streamed_through`, in a group that counts the root's copy; not for a
-  stopped or lapsed delegate), the delegate sends an empty `DelegateStream` on its round, at most once per tick per generation (`poke_after`), and the tick
-  stays armed while the answer waits. It is in flight as a batch ending at what is acknowledged; its answer is counted like a push (`root_committed` rises,
-  `complete_ready`), and is not a no-progress answer, a refusal or a transport failure for the back-off, so it holds back no row.
+- `deleg_poke_root` (delegate.rs): when a generation's stream has nothing to send and an answer has waited a stream tick on a commit the root has not told this
+  delegate (`root_committed < streamed_through`), the delegate sends an empty `DelegateStream` on its round, at most once per tick per generation
+  (`poke_after`), and the tick stays armed while the answer waits. The commit awaited (`deleg_awaited_commits`, the parks scanned only while some generation
+  has appended rows uncommitted) is: the generation's own, a parked row above `root_committed` in a group that counts the root's copy; the generation an answer of
+  another generation is held by through a dependency (`deleg_caps`; the ask goes to the generation awaited); and, once the recorded backup is gone, the one the
+  removal of the backup from the record waits for (`deleg_group_maintain`: `acked_max <= root_committed`). A stopped or lapsed delegate asks nothing.
+- The ask is tracked apart from the batch of rows in flight (`DelegateState.ask`, `ReqKind::Poke`; review MUST): a row executed while it is out streams at
+  once, and its answer (counted like a push, `root_committed` rises, `complete_ready`), refusal, transport failure or timeout never touches the batch in flight
+  or the stream's back-off. The first version kept the ask as the batch in flight and so held the next row for the ask's round trip, or, when it was lost,
+  for a stream timeout and a 200 ms to 2 s back-off. A refusal, a failure or a timeout of the ask backs the asking off as the stream's does (200 ms doubling
+  to 2 s, `poke_backoff_ms`), so a root inside its takeover gate, or a partition, is not asked every tick; an answer ends it.
 - Nothing is sent on the healthy path: the push comes one round trip after the batch's ack, inside the first tick of the park. Under a slow backup the ask
-  repeats once per tick while the answer waits.
+  repeats once per tick while the answer waits (0.2 to 3.5 % of the parked acks, in the sweeps below).
 - Core tests (`mod deleg_group`, two cores that hand each other what they send): `a_delegate_asks_the_root_for_its_commit_when_the_push_is_lost`,
-  `a_delegate_asks_a_root_that_restarted_between_the_ack_and_the_commit`, `a_delegate_asks_the_root_again_in_its_new_round_after_a_round_change`: each
-  releases the parked answer within one tick of the commit; all three fail on the tree without the ask (no empty batch is sent, the answer stays parked).
-  `an_ask_that_finds_nothing_committed_holds_back_no_row` (fails before) and the guard `a_pushed_commit_is_not_asked_for` (passes before and after).
+  `a_delegate_asks_a_root_that_restarted_between_the_ack_and_the_commit`, `a_delegate_asks_the_root_again_in_its_new_round_after_a_round_change` (each
+  releases the parked answer within one tick of the commit; they fail on the tree without the ask); and the eight that fail on the first version of the ask
+  (the tree of 1fb1a4b0 with these tests) and pass now: `a_row_executed_while_an_ask_is_in_flight_streams_at_once`,
+  `an_ask_that_is_never_answered_holds_back_no_row`, `the_failure_of_an_ask_leaves_a_batch_of_rows_in_flight`,
+  `a_refused_ask_backs_the_asking_off_and_an_answer_ends_it`, `a_failed_ask_backs_the_asking_off`,
+  `an_ask_that_finds_nothing_committed_is_asked_again_a_tick_later_and_holds_back_no_row`,
+  `a_delegate_asks_for_the_roots_commit_to_remove_a_gone_backup`, `a_delegate_asks_for_the_commit_of_the_generation_an_answer_is_held_by`. Guards that pass on both: `a_pushed_commit_is_not_asked_for`,
+  `the_stream_tick_stays_armed_while_an_answer_waits_on_the_roots_commit`, `nothing_is_asked_when_no_answer_is_parked`,
+  `nothing_is_asked_of_the_root_for_an_answer_waiting_on_a_recorded_backup`. Mutations (each makes tests fail, the code restored after): the tick's arming
+  term removed (3 fail: the armed-tick guard and the two back-off tests), the park filter dropped (15), the `poke_after` check dropped (3), the back-off on a
+  refusal dropped (1).
 - Sim: `SWEEP-PARKED-TOTALS` (sim.rs) sums, per sweep, the parked delegate acks released, those released by the log while the group's commit was not heard
-  (`deleg_stream_acks_by_log`), those that waited a second or more, the longest wait and the asks sent. Sweeps below: `sweep_config`, `+commit`, 1,000 seeds
-  from 0, main (43dc55d2 plus these counters, the ask switched off) against the fix, no knob k0 / `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` k1.
+  (`deleg_stream_acks_by_log`), those that waited a second or more and 200 ms or more, the longest wait, the asks sent and the asks whose answer raised the
+  root's commit (`deleg_root_asks_raised`). `AUTHORITY_SIM_DROP_PUSHES=<n>` makes every node, as a root, drop every nth of its pushes
+  (`Config::delegation_push_drop_every`, sim only): the lost push as a fault. Base below is the tree with the ask switched off (main plus the counters).
 
-| config | knob | released | by the log | waited 1 s or more | longest ms | asks | failing seeds |
-|---|---|---|---|---|---|---|---|
-| delegated-backup | k0 | 26909 to 26935 | 1171 to 1172 | 7 to 7 | 12515 to 12515 | 56 | 0 to 0 |
-| delegated-backup | k1 | 26535 to 26542 | 1115 to 1115 | 27 to 27 | 16142 to 16182 | 105 | 0 to 0 |
-| placement-hot | k0 | 10733 to 10743 | 439 to 451 | 6 to 6 | 20671 to 20671 | 20 | 0 to 0 |
-| placement-hot | k1 | 10786 to 10882 | 496 to 506 | 18 to 18 | 12434 to 12434 | 22 | 0 to 0 |
-| long-delegated-backup | k0 | 29318 to 29276 | 3030 to 2972 | 86 to 84 | 19305 to 19305 | 181 | 0 to 0 |
-| long-delegated-backup | k1 | 30110 to 30140 | 3119 to 3098 | 107 to 99 | 18559 to 18559 | 171 | 0 to 0 |
-| delegated-no-backup-root-near | k0 | 26819 to 26860 | 5101 to 5067 | 247 to 248 | 23843 to 23959 | 545 | 0 to 0 |
-| delegated-no-backup-root-near | k1 | 26302 to 26270 | 4881 to 4847 | 322 to 321 | 19149 to 19149 | 938 | 0 to 0 |
+Sweeps: `sweep_config`, `+commit`, 1,000 seeds from 0. Every one has 0 failing seeds on both builds (none fails on the fix and passes on main). Parked delegate
+acks (released; by the log; waited 1 s or more; 200 ms or more; asks, of them raising the commit), base to fix.
 
-No seed fails on either build, so none fails on the fix and passes on main. The aggregates barely move: in these seeds the three cases are rare (the
-trajectories are identical until the first ask, and the slow waits are mostly other classes: a root gone, a takeover gate); the ask costs 0.2 to 3.5 % of
-the parked acks in empty batches, most of them under a backup that took longer than a tick, not a lost push. The pins are the core tests.
+Pushes dropped (every push, `AUTHORITY_SIM_DROP_PUSHES=1`):
+| config | released | by the log | 1 s or more | 200 ms or more | asks (raised) |
+|---|---|---|---|---|---|
+| delegated-backup | 26713 to 26728 | 1404 to 1385 | 24 to 18 | 46 to 39 | 238 (234) |
+| long-delegated-backup | 29037 to 28967 | 3091 to 3019 | 84 to 74 | 401 to 377 | 523 (390) |
+| delegated-no-backup-root-near | 26493 to 26646 | 24041 to 23033 | 269 to 272 | 409 to 429 | 4846 (4629) |
+| placement-hot | 10700 to 10602 | 610 to 605 | 7 to 9 | 23 to 24 | 179 (170) |
 
-Gates (box 1, rebased on 43dc55d2: the cap's scan from `committed_sent + 1` and the reset of `committed_sent` on a new round, which an ask on a new round
-or after a restart goes through): `cargo fmt --all --check` (it also reformats two pin tables of sim.rs that were not clean) and `cargo clippy --workspace
---all-targets -- -D warnings` clean; authority lib 973 and `meta_repro` 4, net 137, control 146 passed (meta 563 and engine 958 passed before the rebase, nothing of theirs
-moved); sim suite (release) 357 passed, 0 failed, 13 ignored, run in bounded chunks under a loaded box: the M0.3 ratchet
-`m03_the_configurations_at_zero_violations_stay_there` and the item-A pins pass (it prints no counts, so a change below its ceilings is not visible and nothing
-was raised); `streams_carry_the_log_and_save_tail_gets` is fsync-bound under the box's disk (it did not finish in 4 h on either build there, 33 s on a tmpfs, passed).
+Every second push dropped (`=2`): delegated-backup 19 to 21 waits of 1 s or more, long-delegated-backup 86 to 89, delegated-no-backup-root-near 286 to 289,
+placement-hot 7 to 7; asks 124 (97), 308 (193), 2625 (2266), 81 (68). The longest wait is the same on both builds in every sweep (13.8, 17.3 and 21.3 s,
+23.9 s, 17.3 s). The ask acts (it raises the commit 234 to 4,629 times per sweep, and moves 1,000 releases of delegated-no-backup-root-near from the log to the
+commit), but the tails of 1 s or more barely move: in these workloads a delegate is rarely quiet for long, the next batch's acknowledgement carries the
+commit, and the long waits are other classes (a root gone, a takeover gate). The tails fall where the push is the only word (delegated-backup and
+long-delegated-backup with every push dropped); the pins are the core tests.
+
+No knob (the 8 sweeps of the first version re-run on the final code, fix only; base's counts unchanged from before, failing 0): waits of 1 s or more
+delegated-backup 7 / 27 (k0 / k1; base 7 / 27), placement-hot 6 / 18 (6 / 18), long-delegated-backup 82 / 99 (86 / 107), delegated-no-backup-root-near 248 / 316
+(247 / 322); asks 39 / 105, 20 / 22, 118 / 161, 448 / 829.
+
+Gates (box 1, rebased on 43dc55d2, final tree; TMPDIR on a tmpfs, the disk made the suites fsync-bound): `cargo fmt --all --check` and `cargo clippy
+--workspace --all-targets -- -D warnings` clean; authority lib and `meta_repro` 987 passed, net 137, control 146, harness lib 165, meta 564, engine 958, all 0
+failed; sim suite (release) 357 passed, 0 failed, 13 ignored, including the M0.3 ratchet `m03_the_configurations_at_zero_violations_stay_there` and the item-A pins
+(the ratchet prints no counts, so a change under its ceilings is not visible; nothing was raised).

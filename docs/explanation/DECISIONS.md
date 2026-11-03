@@ -2470,8 +2470,9 @@ pushes: after every event (`Core::root_stream_push`), a generation whose
 committed prefix rose above the last one sent is sent an unsolicited
 acknowledgement, on the round and request of the delegate's last batch,
 while the root is usable; without it the delegate would wait for its own
-next batch. A push that does not come is asked for (Consequences). `holder_append_committed` and its use in C3 answers (`Lone`
-excludes a lone tenure's appends) are unchanged.
+next batch. A push that does not come is asked for (Consequences).
+`holder_append_committed` and its use in C3 answers (`Lone` excludes a
+lone tenure's appends) are unchanged.
 
 **Q16's recorded alternative** (the root's committed cursor: three copies
 on a LAN of three, about two round trips pipelined) was "recorded, not
@@ -2516,18 +2517,31 @@ the root's backups, and does not need to: it counts what the root says.
   change of the delegate's (the push carries the old round and is dropped
   as stale) each left a quiet delegate's parked answer until its deadline
   and the settle, 9 to 12 s; the outcome was still correct, through the
-  holder's committed row. Closed: an answer that has waited a stream tick
-  on `root_committed` makes the delegate send the root an empty batch
-  (`deleg_poke_root`), and again every tick while it waits. The root
-  already answers an empty batch with its cursor and its commit, on the
-  delegate's round, and keeps it as the generation's last batch, so its
-  pushes go on too; the delegate counts it like a push. Nothing is sent
-  while no answer waits on the root, nor while the push comes within the
-  tick (the healthy path: one round trip after the batch's
-  acknowledgement). An answer is released within a tick (50 ms) of the
-  commit, plus the round trip of the ask.
-  Carrying `committed` on `DelegRenewed` instead would have closed the
-  same three cases at the renewal period (a ttl / 2, 2.5 s of the 5 s
+  holder's committed row. Closed: a delegate whose stream has nothing to
+  send, and for which an answer has waited a stream tick on a commit the
+  root has not told it (`root_committed < streamed_through`), sends the
+  root an empty batch on its round (`deleg_poke_root`), once per tick per
+  generation while it waits. The commit awaited is the generation's own
+  (a parked row above `root_committed`, its group counting the root's
+  copy), or that of a generation an answer is held by through a
+  dependency (`deleg_caps`: the ask goes to the generation awaited), or,
+  once the recorded backup is gone, the one the removal of the backup
+  from the record waits for (`deleg_group_maintain`: `acked_max <=
+  root_committed`). The root already answers an empty batch with its
+  cursor and its commit, on the delegate's round, and keeps it as the
+  generation's last batch, so its pushes go on too; the delegate counts
+  the answer like a push. The ask is tracked apart from the batch of rows
+  in flight (`DelegateState.ask`): a row executed meanwhile streams at
+  once, and the ask's answer, failure or timeout never touches the batch
+  or the stream's back-off. A refusal, a failure or a timeout of the ask
+  backs the asking off as the stream's does (200 ms doubling to 2 s), and
+  an answer ends it. Nothing is sent while no answer waits on the root,
+  nor while the push comes within the tick (the healthy path: one round
+  trip after the batch's acknowledgement). An answer is released within a
+  tick (50 ms) of the commit, plus the round trip of the ask. A stopped
+  or lapsed delegate asks nothing (what it holds is the holder's to
+  settle). Carrying `committed` on `DelegRenewed` instead would have
+  closed the same cases at the renewal period (ttl / 2, 2.5 s of the 5 s
   default), through the off-core renewal lane, and on the wire.
 - No version bump, no shim: both ends change together (the project
   carries no compatibility for mixed versions).
