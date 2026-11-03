@@ -2470,7 +2470,7 @@ pushes: after every event (`Core::root_stream_push`), a generation whose
 committed prefix rose above the last one sent is sent an unsolicited
 acknowledgement, on the round and request of the delegate's last batch,
 while the root is usable; without it the delegate would wait for its own
-next batch. `holder_append_committed` and its use in C3 answers (`Lone`
+next batch. A push that does not come is asked for (Consequences). `holder_append_committed` and its use in C3 answers (`Lone`
 excludes a lone tenure's appends) are unchanged.
 
 **Q16's recorded alternative** (the root's committed cursor: three copies
@@ -2508,12 +2508,27 @@ the root's backups, and does not need to: it counts what the root says.
   PROGRESS, "Oracle I1: class A" and "Item A's cost".
 - Where the delegate's own backup is the root's backup too (topology 3),
   the commit takes one local round trip more.
-- The delegate depends on the root's push: a lost push, a root restart
-  between the acknowledgement and the commit, or a delegate round change
-  leaves a quiet delegate's parked answer until its deadline and settle
-  (the outcome is still correct, through the holder's committed row). A
-  re-poke (`committed` on `DelegRenewed`, or an empty batch on the stream
-  tick) is the first follow-up.
+- The root's push is one-way and sent once per rise of the commit, and the
+  delegate has no other word of it. A lost push, a root restarted or
+  re-adopted between the acknowledgement and the commit (the new
+  incarnation's generation has no last batch to push on, and the root is
+  the same node, so nothing changes the delegate's round), and a round
+  change of the delegate's (the push carries the old round and is dropped
+  as stale) each left a quiet delegate's parked answer until its deadline
+  and the settle, 9 to 12 s; the outcome was still correct, through the
+  holder's committed row. Closed: an answer that has waited a stream tick
+  on `root_committed` makes the delegate send the root an empty batch
+  (`deleg_poke_root`), and again every tick while it waits. The root
+  already answers an empty batch with its cursor and its commit, on the
+  delegate's round, and keeps it as the generation's last batch, so its
+  pushes go on too; the delegate counts it like a push. Nothing is sent
+  while no answer waits on the root, nor while the push comes within the
+  tick (the healthy path: one round trip after the batch's
+  acknowledgement). An answer is released within a tick (50 ms) of the
+  commit, plus the round trip of the ask.
+  Carrying `committed` on `DelegRenewed` instead would have closed the
+  same three cases at the renewal period (a ttl / 2, 2.5 s of the 5 s
+  default), through the off-core renewal lane, and on the wire.
 - No version bump, no shim: both ends change together (the project
   carries no compatibility for mixed versions).
 - The sim's `+commit` oracle holds on the seeds that failed
@@ -2529,5 +2544,5 @@ copy covers the window.
 See: [plan 43](../plans/v1/wip/43-commit-rule.md) (§4 the oracle, Q16),
 [plan 46](../plans/v1/wip/46-committed-or-final.md) M1.2;
 `crates/authority/src/core/delegate.rs` (`root_append_cap`,
-`root_stream_push`, `on_delegate_stream`, `on_delegate_stream_ack`,
-`deleg_group_through`).
+`root_stream_push`, `deleg_poke_root`, `on_delegate_stream`,
+`on_delegate_stream_ack`, `deleg_group_through`).
