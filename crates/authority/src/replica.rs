@@ -77,6 +77,11 @@ pub trait Replica {
     /// names): what the op changes beyond the names it carries
     /// (`Core::reply_base`).
     fn linked_victims(&self, op: &MutateOp) -> Vec<Ino>;
+    /// Every name of `ino`, in key order, while the delegation table is not
+    /// empty (`Meta::names_of_ino`): the keys of an op that removes an
+    /// inode's primary name include the next name's
+    /// (`TouchSet::from_op_in_names`).
+    fn names_of_ino(&self, ino: Ino) -> Vec<(Ino, String)>;
     /// Whether the unshipped journal (this tenure) touched any of `keys`
     /// (the stale-base rule on forward replies, `Meta::unshipped_overlaps`).
     fn unshipped_overlaps(&self, keys: &TouchSet) -> bool;
@@ -836,6 +841,10 @@ impl Replica for Meta {
             .ok()
             .flatten()
             .map(|a| a.ino)
+    }
+
+    fn names_of_ino(&self, ino: Ino) -> Vec<(Ino, String)> {
+        Meta::names_of_ino(self, ino)
     }
 
     fn linked_victims(&self, op: &MutateOp) -> Vec<Ino> {

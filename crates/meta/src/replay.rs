@@ -290,6 +290,118 @@ impl TouchSet {
         set
     }
 
+    /// [`Self::from_op_in`] plus, for each inode the op takes a name away
+    /// from (an unlink, the names a rename or an exchange moves, the name
+    /// a rename overwrites) whose *primary* name that is, the name that
+    /// becomes its primary one (plan 46 M0.3 S5, ADR-42). An inode's keys
+    /// belong to the delegation containing its primary name's parent (the
+    /// lowest `RDentry` key, plan 45), so removing the primary name of an
+    /// inode that has other names moves the inode, with its attributes and
+    /// the read delegations on it, to the owner of the next name: an
+    /// unlink in a root directory that leaves the file named in a
+    /// delegated one resolved to the root alone, recalled nothing, and the
+    /// delegate then owned a file whose read grants the root had made
+    /// (they are recalled when a subtree is delegated, not when a key
+    /// moves into it). The next name is held as the op's own dentries
+    /// are, so the op is cross-subtree and the root recalls the
+    /// delegation first.
+    ///
+    /// `names(ino)` lists every name of `ino` in key order, or nothing
+    /// when there is no table to consult (`Meta::names_of_ino`). A name
+    /// the op adds to the inode needs no hold here: its dentry is held
+    /// already.
+    pub fn from_op_in_names(
+        op: &crate::mutate::MutateOp,
+        lookup: &dyn Fn(u64, &str) -> Option<u64>,
+        names: &dyn Fn(u64) -> Vec<(u64, String)>,
+    ) -> Self {
+        use crate::mutate::MutateOp;
+        let mut set = Self::from_op_in(op, lookup);
+        // (the inode, the name leaving it, the name it takes instead)
+        type Move = (u64, (u64, String), Option<(u64, String)>);
+        let mut moves: Vec<Move> = Vec::new();
+        let mut take = |p: u64, n: &str, to: Option<(u64, &str)>| {
+            if let Some(i) = lookup(p, n) {
+                moves.push((
+                    i,
+                    (p, n.to_string()),
+                    to.map(|(tp, tn)| (tp, tn.to_string())),
+                ));
+            }
+        };
+        match op {
+            MutateOp::Unlink { parent, name } => take(*parent, name, None),
+            MutateOp::Rename {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                ..
+            } => {
+                take(*parent, name, Some((*new_parent, new_name)));
+                take(*new_parent, new_name, None);
+            }
+            MutateOp::Exchange {
+                parent,
+                name,
+                new_parent,
+                new_name,
+            } => {
+                take(*parent, name, Some((*new_parent, new_name)));
+                take(*new_parent, new_name, Some((*parent, name)));
+            }
+            MutateOp::Records { records } => {
+                for rec in records {
+                    match rec {
+                        LogRecord::Unlink { parent, name, .. } => take(*parent, name, None),
+                        LogRecord::Rename {
+                            parent,
+                            name,
+                            new_parent,
+                            new_name,
+                            ..
+                        } => {
+                            take(*parent, name, Some((*new_parent, new_name)));
+                            take(*new_parent, new_name, None);
+                        }
+                        LogRecord::Exchange {
+                            parent,
+                            name,
+                            new_parent,
+                            new_name,
+                            ..
+                        } => {
+                            take(*parent, name, Some((*new_parent, new_name)));
+                            take(*new_parent, new_name, Some((*parent, name)));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        for (ino, gone, arrives) in moves {
+            let before = names(ino);
+            let Some(primary) = before.first() else {
+                continue;
+            };
+            let mut after: Vec<&(u64, String)> = before.iter().filter(|n| **n != gone).collect();
+            if let Some(a) = &arrives {
+                if !before.contains(a) {
+                    after.push(a);
+                }
+            }
+            after.sort();
+            if let Some(next) = after.first() {
+                if *next != primary && before.contains(next) {
+                    set.dentries.insert((next.0, next.1.clone()));
+                    set.shared.insert(next.0);
+                }
+            }
+        }
+        set
+    }
+
     pub fn conflicts(&self, rec: &LogRecord) -> bool {
         let touched = TouchSet::from_records(std::iter::once(rec));
         self.overlaps(&touched)
@@ -1754,6 +1866,104 @@ mod tests {
             (mirrored.nlink, mirrored.ctime_ns),
             (written.nlink, written.ctime_ns)
         );
+    }
+
+    /// Plan 46 M0.3 S5 (ADR-42): an inode's keys belong to the owner of its
+    /// primary name's parent (the lowest `RDentry` key), so the op that
+    /// removes or moves away that name hands the inode to the owner of its
+    /// next name: the next name is a hold of the op, and the op is
+    /// cross-subtree when the two owners differ. Fails without
+    /// `from_op_in_names`: the keys are the op's own, `/y` alone.
+    #[test]
+    fn removing_the_primary_name_of_a_linked_inode_holds_the_next_name() {
+        use crate::mutate::MutateOp;
+        use crate::replay::TouchSet;
+        // Inode 10 is named (2, "a") (primary), (5, "b") and (9, "c");
+        // inode 11 has one name, (2, "s"). Directory 3 holds 12 at (3, "t").
+        let lookup = |p: u64, n: &str| match (p, n) {
+            (2, "a") | (5, "b") | (9, "c") => Some(10),
+            (2, "s") => Some(11),
+            (3, "t") => Some(12),
+            _ => None,
+        };
+        let names = |i: u64| match i {
+            10 => vec![
+                (2, "a".to_string()),
+                (5, "b".to_string()),
+                (9, "c".to_string()),
+            ],
+            11 => vec![(2, "s".to_string())],
+            12 => vec![(3, "t".to_string())],
+            _ => Vec::new(),
+        };
+        let keys = |op: &MutateOp| TouchSet::from_op_in_names(op, &lookup, &names);
+        let holds = |k: &TouchSet, p: u64, n: &str| {
+            k.dentries.contains(&(p, n.to_string())) && k.shared.contains(&p)
+        };
+        // The primary name leaves: the next one is held.
+        let k = keys(&MutateOp::Unlink {
+            parent: 2,
+            name: "a".into(),
+        });
+        assert!(holds(&k, 5, "b"), "{k:?}");
+        assert!(!holds(&k, 9, "c"), "only the next name: {k:?}");
+        // The plain `from_op_in` has the op's own keys only.
+        let plain = TouchSet::from_op_in(
+            &MutateOp::Unlink {
+                parent: 2,
+                name: "a".into(),
+            },
+            &lookup,
+        );
+        assert!(!holds(&plain, 5, "b"));
+        // A name that is not the primary one leaving, or the only name of
+        // an inode: no hold beyond the op's own.
+        for (p, n) in [(5u64, "b"), (9, "c"), (2, "s")] {
+            let k = keys(&MutateOp::Unlink {
+                parent: p,
+                name: n.into(),
+            });
+            assert_eq!(k.dentries.len(), 1, "{p} {n}: {k:?}");
+        }
+        // Moved away, to a name that sorts after the next one: the next one
+        // is the primary now. To one that sorts before it: the new name is
+        // (its dentry is held as the op's own).
+        for (np, nn, held) in [(7u64, "x", true), (4, "x", false)] {
+            let k = keys(&MutateOp::Rename {
+                parent: 2,
+                name: "a".into(),
+                new_parent: np,
+                new_name: nn.into(),
+                noreplace: false,
+            });
+            assert_eq!(holds(&k, 5, "b"), held, "to ({np}, {nn}): {k:?}");
+        }
+        // Overwritten by a rename: the victim loses its primary name.
+        let k = keys(&MutateOp::Rename {
+            parent: 3,
+            name: "t".into(),
+            new_parent: 2,
+            new_name: "a".into(),
+            noreplace: false,
+        });
+        assert!(holds(&k, 5, "b"), "{k:?}");
+        // Exchanged: the name moves to (8, "z"), the next name is primary.
+        let k = keys(&MutateOp::Exchange {
+            parent: 2,
+            name: "a".into(),
+            new_parent: 8,
+            new_name: "z".into(),
+        });
+        assert!(holds(&k, 5, "b"), "{k:?}");
+        // A stranded replay's records name the same moves.
+        let k = keys(&MutateOp::Records {
+            records: vec![LogRecord::Unlink {
+                parent: 2,
+                name: "a".into(),
+                time_ns: 1,
+            }],
+        });
+        assert!(holds(&k, 5, "b"), "{k:?}");
     }
 
     #[test]

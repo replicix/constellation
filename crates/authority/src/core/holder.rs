@@ -39,7 +39,9 @@ pub(crate) fn keys_of_op(op: &MutateOp) -> TouchSet {
 /// it removes or moves *exclusively* — against the creates inside it,
 /// and against a delegation of it).
 pub(crate) fn keys_of_op_in(op: &MutateOp, replica: &dyn Replica) -> TouchSet {
-    TouchSet::from_op_in(op, &|p, n| replica.lookup_ino(p, n))
+    TouchSet::from_op_in_names(op, &|p, n| replica.lookup_ino(p, n), &|i| {
+        replica.names_of_ino(i)
+    })
 }
 
 impl Core {

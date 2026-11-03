@@ -43424,20 +43424,23 @@ mod deleg_group {
         (rid, answer)
     }
 
-    /// Review follow-up of 5b6a6b1e (fail-before): the gated mark is the
-    /// generation's, and one node's generations can share keys without
-    /// either ending. Generation 7 journals a `setxattr` of the file past
-    /// the lead (gated, not committed) and the unlink of its primary link;
-    /// the file's own keys are generation 8's from then on, and its
-    /// `removexattr`, generation 8's first row, was answered `Lone`. At the
-    /// root's crash the end of both generations drops the open rows of 7 and
-    /// replays the `removexattr` alone, which fails on an attribute that was
-    /// never set, after its client was told it succeeded. Now an open gated
-    /// row of any generation of this node holds the `Lone` rows of the
-    /// others: the `removexattr` waits for the root, and is dropped with the
-    /// rows it rests on.
+    /// Review follow-up of 5b6a6b1e (fail-before), closed at the source by
+    /// plan 46 M0.3 S5 (ADR-42). The gated mark is the generation's, and one
+    /// node's generations could share keys without either ending: generation
+    /// 7 journaled a `setxattr` of the file past the lead (gated, not
+    /// committed) and the unlink of its primary link, which made the file's
+    /// keys generation 8's (the primary link is the lowest name: the next
+    /// one is in 8's range); 8's first row, a `removexattr` answered `Lone`,
+    /// was then dropped with 7's open rows at the root's crash and replayed
+    /// alone, after its client was told it succeeded. Now the unlink of the
+    /// primary name of an inode with another name holds that name too
+    /// (`TouchSet::from_op_in_names`), so it is cross-subtree: the delegate
+    /// does not execute it, no key moves between two generations of one node
+    /// while both live, and the state the original test built cannot arise.
+    /// The test keeps the rule's other half: the rows before it stay one
+    /// generation's, and the unlink is no row of either.
     #[test]
-    fn a_lone_row_does_not_follow_an_open_gated_row_of_another_generation() {
+    fn an_unlink_that_moves_a_files_keys_into_another_generation_is_not_the_delegates() {
         use constellation_meta::RowClass;
         let mut h = Harness::new(3);
         let (dir, file, low, _) = two_ranges_one_file(&mut h);
@@ -43472,71 +43475,10 @@ mod deleg_group {
         };
         assert_eq!(
             classes(&h, 7),
-            vec![
-                (1, RowClass::Lone),
-                (2, RowClass::DelegGroup),
-                (3, RowClass::DelegGroup)
-            ]
+            vec![(1, RowClass::Lone), (2, RowClass::DelegGroup)],
+            "the unlink is not generation 7's row"
         );
-        // The file's keys are generation 8's now.
-        let (remove, a) = own_op(
-            &mut h,
-            4,
-            MutateOp::RemoveXattr {
-                ino: file,
-                name: "user.k".into(),
-            },
-        );
-        let classes8 = classes(&h, 8);
-        // The core decided it so itself (the store's check at the journaling
-        // is the second line, for the fast path's rows).
-        assert_eq!(h.core.stats.deleg_lone_demoted, 0);
-        // The root crashes holding nothing of either: both end at its cursor.
-        let applied = Replica::apply_segment(
-            &h.meta,
-            2,
-            1,
-            0,
-            &[],
-            &[],
-            &[
-                LogRecord::RecallCut {
-                    dir,
-                    gen: 7,
-                    through: 0,
-                },
-                LogRecord::RecallCut {
-                    dir,
-                    gen: 8,
-                    through: 0,
-                },
-            ],
-        )
-        .unwrap();
-        let queued: Vec<Rid> = h
-            .meta
-            .pending_replays()
-            .unwrap()
-            .into_iter()
-            .map(|q| q.rid)
-            .collect();
-        // The removexattr is generation 8's, waits for the root, and is
-        // dropped with the rows it rests on.
-        assert_eq!(
-            (
-                classes8,
-                a,
-                queued.contains(&remove),
-                applied.stranded.deleg_dropped
-            ),
-            (vec![(1, RowClass::DelegGroup)], None, false, 3),
-            "(rows of generation 8, the removexattr's answer, replayed, dropped)"
-        );
-        // What a replay of it would have found: the attribute never set.
-        assert_eq!(
-            constellation_meta::MetaStore::get_xattr(&h.meta, file, "user.k").unwrap(),
-            None
-        );
+        assert!(classes(&h, 8).is_empty());
     }
 
     /// The fast path's write of `name` in `dir` as the delegate's FUSE
@@ -52602,6 +52544,147 @@ mod c2g_settle {
         let out = h.step_archived(request(7, 1, op, true));
         assert_eq!(reply_to_3(&out, 7), Some(MutateOutcome::Busy), "{out:?}");
         assert_eq!(h.meta.completed_outcome(rid3(1)).unwrap(), None);
+    }
+
+    /// S5 (fable review MUST 1, ADR-42): an inode's keys belong to the owner
+    /// of its primary name's parent, so the unlink of the primary name of a
+    /// file that has another name in a delegated directory moves the file
+    /// into that delegation. The root resolved the unlink to itself alone
+    /// and recalled nothing: the read delegations it had made on the file
+    /// then outlived the move, and the delegate's next write on it (which a
+    /// gated successor now appends) broke close-to-open. The next name is
+    /// held as the op's own dentries are, so the unlink is cross-subtree
+    /// and the root recalls the delegation first. Fails on the parent: the
+    /// unlink executes at once, with no `DelegRecall`.
+    #[test]
+    fn s5_unlinking_the_primary_name_of_a_file_named_in_a_delegation_recalls_it() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let dir = delegated_to_me(&h.meta, 4);
+        let x = h.meta.allocate_ino(ROOT_INO).unwrap();
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Create {
+                    parent: ROOT_INO,
+                    name: "a".into(),
+                    ino: x,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Link {
+                    ino: x,
+                    parent: dir,
+                    name: "b".into(),
+                    time_ns: 2,
+                },
+            ],
+        )
+        .unwrap();
+        h.step(Event::Peers {
+            links: (2..=4)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: node == 4,
+                    last_seen: None,
+                    rtt_ms: Some(5),
+                    since: Some(WaitMs(0)),
+                })
+                .collect(),
+            lapses: 0,
+        });
+        assert!(h.core.dl.gens.contains_key(&7), "generation 7 not learned");
+        // The name in the delegation leaving: X stays the root's.
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Unlink {
+                parent: dir,
+                name: "b".into(),
+            },
+            tag: Default::default(),
+        });
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 4 && matches!(m, PeerMsg::DelegRecall { .. })),
+            "an unlink in the delegation touches a file the root owns: {out:?}"
+        );
+        // The primary name leaving: X would belong to generation 7.
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let dir = delegated_to_me(&h.meta, 4);
+        let x = h.meta.allocate_ino(ROOT_INO).unwrap();
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Create {
+                    parent: ROOT_INO,
+                    name: "a".into(),
+                    ino: x,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Link {
+                    ino: x,
+                    parent: dir,
+                    name: "b".into(),
+                    time_ns: 2,
+                },
+            ],
+        )
+        .unwrap();
+        h.step(Event::Peers {
+            links: (2..=4)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: node == 4,
+                    last_seen: None,
+                    rtt_ms: Some(5),
+                    since: Some(WaitMs(0)),
+                })
+                .collect(),
+            lapses: 0,
+        });
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Unlink {
+                parent: ROOT_INO,
+                name: "a".into(),
+            },
+            tag: Default::default(),
+        });
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 4 && matches!(m, PeerMsg::DelegRecall { .. })),
+            "the file moves into the delegation, recalled first: {out:?}"
+        );
+        assert!(
+            h.meta.lookup(ROOT_INO, "a").unwrap().is_some(),
+            "unlinked before the recall"
+        );
     }
 
     /// S1: a generation delegated to this node itself — the predecessor

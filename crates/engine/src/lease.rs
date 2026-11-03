@@ -828,9 +828,11 @@ impl DelegateView {
         // The inodes the op takes away or moves count, as at the core
         // (`keys_of_op_in`): an unlink or a rename of a link in the
         // subtree to a file the root owns changes that file.
-        let keys = constellation_meta::TouchSet::from_op_in(op, &|p, n| {
-            meta.child_ino(p, n).ok().flatten()
-        });
+        let keys = constellation_meta::TouchSet::from_op_in_names(
+            op,
+            &|p, n| meta.child_ino(p, n).ok().flatten(),
+            &|i| meta.names_of_ino(i),
+        );
         let constellation_meta::delegation::Ownership::Delegated(d) = meta.resolve_ownership(&keys)
         else {
             return None;

@@ -570,12 +570,16 @@ impl Meta {
     pub fn root_fast_path(&self, op: &crate::mutate::MutateOp) -> Option<RootAdmission<'_>> {
         let guard = self.deleg_gate.read().unwrap_or_else(|e| e.into_inner());
         if self.delegations_any() {
-            let keys = TouchSet::from_op_in(op, &|p, n| {
-                crate::MetaStore::lookup(self, p, n)
-                    .ok()
-                    .flatten()
-                    .map(|a| a.ino)
-            });
+            let keys = TouchSet::from_op_in_names(
+                op,
+                &|p, n| {
+                    crate::MetaStore::lookup(self, p, n)
+                        .ok()
+                        .flatten()
+                        .map(|a| a.ino)
+                },
+                &|i| self.names_of_ino(i),
+            );
             if !matches!(self.resolve_ownership(&keys), Ownership::Root) {
                 return None;
             }
@@ -642,6 +646,34 @@ impl Meta {
 
 /// `local` kv: the root's next delegation generation.
 pub(crate) const KV_NEXT_DELEG_GEN: &str = "next_deleg_gen";
+
+impl Meta {
+    /// Every name of `ino` as `(parent, name)`, in key order (the first is
+    /// its primary one: [`Namespace::primary_dentry`]) — or nothing while
+    /// no delegation exists, when every key is the root's and a name that
+    /// leaves cannot move an inode between owners
+    /// ([`TouchSet::from_op_in_names`]).
+    pub fn names_of_ino(&self, ino: Ino) -> Vec<(Ino, String)> {
+        if ino == ROOT_INO || !self.delegations_any() {
+            return Vec::new();
+        }
+        let r = self.db.read_tx();
+        let range = keys::names_of(ino);
+        let mut out = Vec::new();
+        for guard in r.range(&self.ns, ns::key_range_bounds(&range)) {
+            let Ok((k, _)) = guard.into_inner() else {
+                break;
+            };
+            if let Ok(keys::Key::RDentry {
+                parent_ino, name, ..
+            }) = keys::Key::parse(&k)
+            {
+                out.push((parent_ino, String::from_utf8_lossy(name).into_owned()));
+            }
+        }
+        out
+    }
+}
 
 impl Namespace for Meta {
     fn parent_of(&self, dir: Ino) -> Option<Ino> {

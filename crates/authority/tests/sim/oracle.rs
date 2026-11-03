@@ -384,9 +384,11 @@ impl Oracles {
         let Some(meta) = self.store(node) else {
             return (root, BTreeMap::new());
         };
-        let keys = constellation_meta::TouchSet::from_op_in(&op, &|p, n| {
-            Replica::lookup_ino(&*meta, p, n)
-        });
+        let keys = constellation_meta::TouchSet::from_op_in_names(
+            &op,
+            &|p, n| Replica::lookup_ino(&*meta, p, n),
+            &|i| Replica::names_of_ino(&*meta, i),
+        );
         let tables = self.tables.lock().unwrap().clone();
         let mut born: BTreeMap<u64, u64> = BTreeMap::new();
         for (at, _, table) in &tables {
