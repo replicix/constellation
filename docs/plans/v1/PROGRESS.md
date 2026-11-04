@@ -65688,3 +65688,50 @@ After the review follow-ups and the rebase onto 7a19bb95 (final tree, release, 0
 --workspace --all-targets -- -D warnings` clean; meta all targets 578 passed, 20 ignored (lib 389; `generation_epochs` 7), authority lib 1,006,
 engine lib 948, net lib 127, control lib 146, harness lib 165, CLI crate all targets 128; sim suite 366 passed, 0 failed, 12 ignored (365 on
 main 7a19bb95 plus the pin); `lda_4125_slow_lease_reads_seed`, `session_guarantees_hold` and both `m03_` ratchet tests re-run and passing.
+
+## L2b: a committed delegate row lands with a new identity (known I2 gap; deferred to plan 46 M1.2, 2026-11-04; plan 46 M0.3)
+
+Recorded, not fixed: docs, comments and an ignored sim test only; no product logic changed. The user decided on
+2026-11-04 to defer the fix to plan 46 M1.2 (member copies).
+
+### Witnesses (release sim, `+identity`, `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, tree 11fd5f34)
+
+- `long-delegated-backup` 13016: I2 (a rid queued on two nodes at once, one copy gated) and I2c (six non-verbatim rows).
+- `long-delegated-late-answers` 13907 and 15996, `long-delegated-backup` 14284 and 15005: I2c.
+- Pinned by the ignored `l2b_findings_a_committed_delegate_row_lands_with_its_identity` (`crates/authority/tests/sim.rs`).
+- No double execution in any of them: the sequencer dedups the second copy, and each rid lands once.
+
+### Mechanism
+
+1. A row the delegate's group committed and answered ends up verbatim only in the journal of a delegate that sealed the
+   root and took a lone tenure: C3's re-append at its takeover gate (`reappend_own_delegate_rows` ->
+   `apply_adopted_records_from`) journals it `RootGroup`, and a lone tenure counts it at once (ADR-41).
+2. That tenure ends at lease expiry, after a simulated restart, without shipping the row.
+3. The next root ends the generation at a cut below the row.
+4. Every copy left is a rescue by rid: the requester's shadow replay, or the recall pass's queued copy. The row lands with
+   a new identity (I2c), and in 13016 two copies of the rid are queued at once (I2).
+
+### Why paths (a) and (b) are kept
+
+- (a) the takeover gate strands the delegate's own rows (`gen` != 0, `epoch` == 0). The gate's call restores the committed
+  ones from the tail, re-appends the ones that continue the stream, and replays the rest by rid. Not dropped: a `DelegGroup`
+  row committed by the delegate's backups is answered and in no root tail, and a halted one would be lost with the
+  generation. 0 of about 15,000 such enqueues reached the identity ledger.
+- (b) the recall pass queues the root appends past the cut with their class. Not dropped: a lone tenure's append counts at
+  once, so this copy can be the last server-side copy of an answered row (`long-delegated-late-answers` 1977 under the knob);
+  a requester restarted without its journal leaves it as the only one.
+- The comments in `crates/meta/src/store/spec.rs` (`strand_local_tx`) say so, and name C3's re-append as a third source of a
+  gated root append beside the two the L2 drop names.
+
+### Options
+
+- D1 (recommended): close the upstream exposure, by (i) answering nothing new and ending no lease voluntarily until the
+  re-appended rows are shipped or backed, (ii) keeping the delegate group's backups' member copies until the log carries
+  the rows (M1.2's direction), or (iii) a successor's cut that includes rows a delegate's group committed (ADR-43 territory).
+- D2: the oracle counts, without judging, a pair whose gated side is a non-owner's recall or rebuild copy. Hides the symptom;
+  the I2c seeds still fail.
+- D3: drop (b)'s copies when gated. Rejected: the last copy of an answered row would be lost.
+- D4: a timer-driven placeholder copy. Not justified.
+
+Decision: D1 (ii) in M1.2; plan 46's M1.2 carries the line "M1.2 must close L2b" with the pin's name. Until then the oracle
+stays strict and the five seeds are the open witnesses.

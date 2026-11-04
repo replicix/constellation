@@ -730,6 +730,8 @@ struct Strand<'a> {
     /// predecessor's members hold the tail, and the delegate re-streams the
     /// row to the successor root. A queued copy would be a second
     /// executable copy of a rid (I2). A `Lone` append is queued as before.
+    /// (A third source of a gated root append is C3's re-append at a
+    /// delegate's takeover gate, `RootGroup`; see L2b in `strand_local_tx`.)
     rebuild: bool,
     /// Each stranded transaction's `deps` (by journal seq), taken from the
     /// intact journal before the pass strands anything: a pass that
@@ -1538,7 +1540,32 @@ fn strand_local_tx(
     // client retries by rid at the generation's new owner; the park that
     // waited for the row was aborted at the end (`drop_delegate_state`).
     // (A row with a lease epoch is a root's append of a delegate's row, not
-    // this node's own execution as the delegate: it keeps today's rule.)
+    // this node's own execution as the delegate: it keeps today's rule. A
+    // root append past the recall's cut is queued whatever its class: the
+    // class is not the append's commit, and a lone tenure counts its appends
+    // at once, so the queued copy can be the row's last server-side copy
+    // (L2b, below).)
+    //
+    // L2b (known, deferred to plan 46 M1.2; PROGRESS, "L2b"). Two paths queue
+    // a copy of another node's rid that the class gates, and both are kept:
+    // (a) a delegate that takes the root strands its own rows (`gen` != 0,
+    // `epoch` == 0, `member`, neither `recall` nor `rebuild`) at its takeover
+    // gate: the gate's own call restores the committed ones from the tail
+    // (the replay finds them completed) and re-appends (C3) the ones that
+    // continue the stream, so what is left replays by rid through the
+    // sequencer, which dedups any other copy. It is not dropped as the
+    // recall drop above does: a `DelegGroup` row committed by the delegate's
+    // own backups is answered and in no root tail, and a halted one would be
+    // lost with the generation the gate ends. (b) the recall pass queues the
+    // root appends past the cut (`recall`, `!member`, `epoch` > 0) with their
+    // class, for the reason in the preceding parenthesis. Neither executes
+    // twice (the sequencer answers the second copy from `completed`), but (b)
+    // can sit beside the owner's own replay of the same rid, which the I2
+    // ledger judges (long-delegated-backup seed 13016 under slow lease reads).
+    // The defect is upstream: a committed delegate row that exists verbatim
+    // only in the journal of a delegate-turned-root's lone tenure, which ends
+    // unshipped below the next root's cut, so every copy left is a rescue by
+    // rid. M1.2's member copies close it, and with it the pair.
     if recall && row.class.gated() && row.gen != 0 && row.epoch == 0 {
         return Ok(Stranding::Dropped);
     }
@@ -1559,6 +1586,12 @@ fn strand_local_tx(
     //   (`apply_adopted_records_from`, `RootGroup` by default): its group
     //   committed it, and its members keep it as a member copy until the log
     //   carries it.
+    // A third source is C3's re-append at a delegate's own takeover gate
+    // (`reappend_own_delegate_rows` -> `apply_adopted_records_from`, class
+    // `RootGroup`): it is the source in every L2b witness. The drop is safe
+    // for it only while the requester holds the other copy (a persisted gated
+    // shadow, a live retry or an in-doubt op); a requester restarted without
+    // its journal leaves the recall pass's queued copy as the last one.
     // In both the delegate also re-streams the row while it holds it. An
     // append still `Lone` keeps today's rule (queued): for a lone tenure
     // (ADR-41 counts its journal at once) it is the row's last copy once the

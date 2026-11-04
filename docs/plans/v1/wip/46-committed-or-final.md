@@ -738,6 +738,12 @@ that record (it arrives between the own row and the later root row). The lost-re
 | **M1.4 The hold as a group** | §5.7: `StreamAheadAck`, the hold's answers wait for one member; a one-member epoch's hold is `Final`. | The hold's uncommitted `NonStealable` answers; variant 3(i)'s special case from M0.2. | `flex-crash` and the `flex*` configs under the strict flags D9 deferred (36–81 of 2,000 seeds fail today): zero after. | The flex model's property with the group; `strict_commit`, `strict_identity` on every flex config; harness `epoch-member-dies-with-chunk`, `flex-crash`'s scenario ×3. | The flex strict flags on; the C2h deferral closed. |
 | **M1.5 Docs and gates** | DESIGN §4 "Delegated sub-sequencers", §4 "Acknowledgement and durability", §5.2, §9 "Delegates" and the failover table rewritten for the new records; `delegations.md`, `durability-and-failover.md`, `configuration.md`, `lease-placement.md`; ADR-40 amended with what landed; TESTING.md. | — | — | Full CONVENTIONS gates (pjdfstest 8798/8798); the four-file-system perf gates of §8. | All green; the stage reviewed. |
 
+*L2b (known gap, deferred 2026-11-04; PROGRESS, "L2b"):* **M1.2 must close L2b.** A committed delegate row that a
+delegate-turned-root re-appends in a lone tenure, ending unshipped below the next root's cut, survives only as rescue copies
+by rid (I2 in `long-delegated-backup` 13016; I2c in 13907, 14284, 15005, 15996, all under slow lease reads). M1.2's member
+copy (C3 items 1–4) keeps the row's verbatim copy until the log carries it. The ignored sim test
+`l2b_findings_a_committed_delegate_row_lands_with_its_identity` is the pin: it passes, and loses its `#[ignore]`, in M1.2.
+
 *Pre-M1.2 fixes (oracle I1, 2026-11-02; PROGRESS, "Oracle I1: the delegate's
 lone test"):* three delegate-side defects were closed on the current code
 because M1.2 is weeks away, and M1.2 removes the code they touch. The
