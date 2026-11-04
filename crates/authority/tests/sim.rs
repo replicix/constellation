@@ -730,7 +730,7 @@ fn session_guarantees_hold() {
             ..SimConfig::default()
         };
         let mut totals = (0usize, 0usize, 0usize, 0usize);
-        let mut refusals = (0usize, 0usize);
+        let mut refusals = (0usize, 0usize, 0usize);
         for seed in 600..660 {
             let report =
                 run_seed(seed, cfg.clone()).unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
@@ -740,12 +740,13 @@ fn session_guarantees_hold() {
             totals.3 += report.sessions.degraded_violations;
             refusals.0 += report.sessions.refusals_placed;
             refusals.1 += report.sessions.refusals_windowed;
+            refusals.2 += report.sessions.refusals_row_disagrees;
         }
         eprintln!(
             "session_guarantees_hold ({label}): {} reads, {} degraded (timed out), {} \
              violations exempt as tentative, {} on degraded reads; refusals placed at \
-             their row {}, by the window {}",
-            totals.0, totals.1, totals.2, totals.3, refusals.0, refusals.1
+             their row {}, by the window {} (of which the row disagreed {})",
+            totals.0, totals.1, totals.2, totals.3, refusals.0, refusals.1, refusals.2
         );
         assert!(totals.0 > 500, "{label}: too few reads to mean anything");
     }

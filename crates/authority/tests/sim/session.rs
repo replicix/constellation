@@ -12,12 +12,16 @@
 //! - a refusal (`EEXIST` — present, `ENOENT` — absent; its op never
 //!   landed): at least the state its own `Refused` row follows, the number
 //!   of successes logged before that row (the sequencer evaluated it
-//!   there), capped by the successes invoked after it returned. That
-//!   holds in every scope, however late the row was appended. A refusal
-//!   with no row in an applied segment (answered without journaling) falls
-//!   back to a window: at least the earliest state, after the successes of
-//!   its scope and its own node's that returned before it was invoked,
-//!   that refuses the same way (`Scope`);
+//!   there, and its reply carries that position). That holds in every
+//!   scope and needs no real-time argument, however late the row was
+//!   appended, when the row is where the refusal was evaluated: the
+//!   refused name shows what the refusal says at that state. A refusal
+//!   with no such row (none in an applied segment, another code than the
+//!   client's return, or a state that does not show the refusal: an inbox
+//!   or local answer is evaluated against the requester's replica and
+//!   journaled later) falls back to a window: at least the earliest
+//!   state, after the successes of its scope and its own node's that
+//!   returned before it was invoked, that refuses the same way (`Scope`);
 //! - a read: at least the earliest state at or after its own floor that
 //!   shows what it returned (monotonic reads).
 //!
@@ -51,6 +55,9 @@ pub struct SessionReport {
     /// row in an applied segment, placed by the scoped window.
     pub refusals_placed: usize,
     pub refusals_windowed: usize,
+    /// Of the windowed, those whose row's state does not show what the
+    /// refusal says (the row is not where it was evaluated).
+    pub refusals_row_disagrees: usize,
     /// Real violations: (checker, description).
     pub violations: Vec<(String, String)>,
 }
@@ -112,7 +119,7 @@ pub fn check_sessions(
     reads: &[ReadEvt],
     tentative: &HashSet<Rid>,
     completed_at: &HashMap<Rid, (u64, usize)>,
-    refused_at: &HashMap<Rid, (u64, usize)>,
+    refused_at: &HashMap<Rid, ((u64, usize), NsRet)>,
     scope: Scope,
 ) -> SessionReport {
     let mut report = SessionReport {
@@ -338,21 +345,38 @@ pub fn check_sessions(
                     .min()
                     .unwrap_or(n_states)
                     .min(n_states);
-                let placed = match refused_at.get(rid) {
-                    // A journaled refusal: the sequencer evaluated it at
-                    // the state its `Refused` row follows, the number of
-                    // successes logged before that row, however late the
-                    // row was appended. That is exact in every scope: the
-                    // order the log fixes between this refusal and a
-                    // success needs no real-time argument. (`hi` still
-                    // caps it: the row of an answered refusal cannot be
-                    // evaluated after an op not yet invoked.)
-                    Some(row) => {
-                        report.refusals_placed += 1;
-                        Some(successes.partition_point(|(_, p)| p < row).min(hi))
+                // The row of this answer: its code is the client's return,
+                // and the refused name shows what the refusal says at the
+                // state the row follows. A row that fails either is not
+                // where the refusal was evaluated (an inbox or local
+                // answer is evaluated against the requester's replica and
+                // journaled later), and the window decides.
+                let row_k = refused_at
+                    .get(rid)
+                    .filter(|(_, code)| code == r)
+                    .map(|(row, _)| successes.partition_point(|(_, p)| p < row));
+                let row_k = match row_k {
+                    Some(k) if presence.get(name).is_some_and(|v| v[k] != want) => {
+                        report.refusals_row_disagrees += 1;
+                        None
                     }
-                    // No `Refused` row in an applied segment (answered
-                    // without journaling, or in a fenced segment): the
+                    k => k,
+                };
+                let placed = match row_k {
+                    // A refusal the sequencer journaled: it evaluated it at
+                    // the state its `Refused` row follows, the number of
+                    // successes logged before that row, and the reply
+                    // carries that position (cto-modes "Positions"). No
+                    // real-time cut applies, not even `hi`: a delegate's
+                    // row the root appended late can follow successes
+                    // invoked after the refusal returned.
+                    Some(k) => {
+                        report.refusals_placed += 1;
+                        Some((k, hi.max(k)))
+                    }
+                    // No usable `Refused` row (answered without
+                    // journaling, journaled in a fenced segment, another
+                    // code, or a state that does not show the refusal): the
                     // refusal's window, as the witnessed check places it,
                     // after the successes of its scope and its own node's
                     // that returned before it was invoked. Another owner's
@@ -377,10 +401,12 @@ pub fn check_sessions(
                             .map(|(_, ib)| ib + 1)
                             .max()
                             .unwrap_or(0);
-                        first_at_or_after(name, lo, want).filter(|k| *k <= hi)
+                        first_at_or_after(name, lo, want)
+                            .filter(|k| *k <= hi)
+                            .map(|k| (k, hi))
                     }
                 };
-                if let Some(k) = placed {
+                if let Some((k, hi)) = placed {
                     let causal = causal_floors(name, k, hi, want, session);
                     let list = obs.entry(session).or_default();
                     list.push((
@@ -793,8 +819,8 @@ mod tests {
         let none = HashSet::new();
         let reads = vec![read(2, "d1/f", true, 8, 9)];
         let (events, log) = another_owners_earlier_success("d2", 3);
-        let row = |at: (u64, usize)| -> HashMap<Rid, (u64, usize)> {
-            [(rid(2, 2), at)].into_iter().collect()
+        let row = |at: (u64, usize)| -> HashMap<Rid, ((u64, usize), NsRet)> {
+            [(rid(2, 2), (at, NsRet::Enoent))].into_iter().collect()
         };
         // (c) The 4125 shape: the row precedes the other owner's
         // late-appended success (and the create): state 0, then the read
@@ -815,7 +841,8 @@ mod tests {
         }
         // The row's rid is not the refusal's: the window decides, and
         // `Dir` accepts it (the documented leniency of the fallback).
-        let other: HashMap<Rid, (u64, usize)> = [(rid(9, 9), (3, 1))].into_iter().collect();
+        let other: HashMap<Rid, ((u64, usize), NsRet)> =
+            [(rid(9, 9), ((3, 1), NsRet::Enoent))].into_iter().collect();
         let r = check_sessions(&events, &ticks, &reads, &none, &log, &other, Scope::Dir);
         assert!(r.violations.is_empty(), "{r:?}");
         assert_eq!((r.refusals_placed, r.refusals_windowed), (0, 1));
@@ -852,7 +879,8 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let rows: HashMap<Rid, (u64, usize)> = [(rid(2, 1), (1, 3))].into_iter().collect();
+        let rows: HashMap<Rid, ((u64, usize), NsRet)> =
+            [(rid(2, 1), ((1, 3), NsRet::Enoent))].into_iter().collect();
         let none = HashSet::new();
         let reads = vec![read(2, "d1/f", true, 8, 9)];
         // Accepted on the window alone: the leniency the row closes.
@@ -875,5 +903,110 @@ mod tests {
         let reads = vec![read(2, "d1/f", false, 8, 9)];
         let r = check_sessions(&events, &ticks, &reads, &none, &log, &rows, Scope::Dir);
         assert!(r.violations.is_empty(), "{r:?}");
+    }
+
+    /// A delegate's refusal whose row the root appends late: node 4's
+    /// `create d2/f` and `unlink d2/f` are acknowledged by the delegate of
+    /// `d2` (ticks 0-3); node 2's `unlink d2/f` is refused `ENOENT` by it
+    /// (invoked at tick 4, returned at 5); node 1's `create d1/a`, invoked
+    /// at tick 6 and sequenced by the root, is appended first. Log: the
+    /// create `d1/a`, the two `d2` ops, the refusal's row (state 3). The
+    /// reply carries that position, so node 2 reading `d2/f` present is
+    /// stale although a success was invoked after the refusal returned
+    /// (`hi` is 0): the row is not cut by real time.
+    #[test]
+    fn a_late_row_is_not_cut_by_a_success_invoked_after_the_refusal_returned() {
+        let ev = |thread: u64, rid: Rid, op: Option<NsOp>, ret: NsRet| match op {
+            Some(op) => HistEvt::Invoke { thread, rid, op },
+            None => HistEvt::Return { thread, rid, ret },
+        };
+        let events = vec![
+            ev(64, rid(4, 1), Some(NsOp::Create("d2/f".into())), NsRet::Ok),
+            ev(64, rid(4, 1), None, NsRet::Ok),
+            ev(64, rid(4, 2), Some(NsOp::Unlink("d2/f".into())), NsRet::Ok),
+            ev(64, rid(4, 2), None, NsRet::Ok),
+            ev(32, rid(2, 1), Some(NsOp::Unlink("d2/f".into())), NsRet::Ok),
+            ev(32, rid(2, 1), None, NsRet::Enoent),
+            ev(16, rid(1, 1), Some(NsOp::Create("d1/a".into())), NsRet::Ok),
+            ev(16, rid(1, 1), None, NsRet::Ok),
+        ];
+        let ticks: Vec<u64> = (0..8).collect();
+        let log: HashMap<Rid, (u64, usize)> = [
+            (rid(1, 1), (1, 0)),
+            (rid(4, 1), (2, 0)),
+            (rid(4, 2), (2, 1)),
+        ]
+        .into_iter()
+        .collect();
+        let rows = |at: (u64, usize)| -> HashMap<Rid, ((u64, usize), NsRet)> {
+            [(rid(2, 1), (at, NsRet::Enoent))].into_iter().collect()
+        };
+        let none = HashSet::new();
+        let present = vec![read(2, "d2/f", true, 8, 9)];
+        let absent = vec![read(2, "d2/f", false, 8, 9)];
+        for scope in [Scope::Global, Scope::Dir, Scope::Range(1)] {
+            let r = check_sessions(&events, &ticks, &present, &none, &log, &rows((2, 2)), scope);
+            let kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(kinds, vec!["monotonic_reads"], "{scope:?}: {r:?}");
+            let r = check_sessions(&events, &ticks, &absent, &none, &log, &rows((2, 2)), scope);
+            assert!(r.violations.is_empty(), "{scope:?}: {r:?}");
+            // A row before the delegate's ops (state 1: absent) is placed
+            // there, and the read of `present` (state 2) is monotonic.
+            let r = check_sessions(&events, &ticks, &present, &none, &log, &rows((1, 5)), scope);
+            assert!(r.violations.is_empty(), "{scope:?}: {r:?}");
+        }
+    }
+
+    /// The row must agree with the refusal to place it: an `ENOENT` row at
+    /// a state where the name is present is not where the refusal was
+    /// evaluated (an inbox answer journaled late), so the window decides
+    /// and the disagreement is counted; a row whose code is not the
+    /// client's return is not used either.
+    #[test]
+    fn a_row_that_disagrees_with_its_refusal_falls_back_to_the_window() {
+        let ev = |thread: u64, rid: Rid, op: Option<NsOp>, ret: NsRet| match op {
+            Some(op) => HistEvt::Invoke { thread, rid, op },
+            None => HistEvt::Return { thread, rid, ret },
+        };
+        let events = vec![
+            ev(64, rid(4, 1), Some(NsOp::Create("d2/f".into())), NsRet::Ok),
+            ev(32, rid(2, 1), Some(NsOp::Unlink("d2/f".into())), NsRet::Ok),
+            ev(64, rid(4, 1), None, NsRet::Ok),
+            ev(32, rid(2, 1), None, NsRet::Enoent),
+        ];
+        let ticks: Vec<u64> = (0..4).collect();
+        let log: HashMap<Rid, (u64, usize)> = [(rid(4, 1), (1, 0))].into_iter().collect();
+        let none = HashSet::new();
+        // The refusal was evaluated before the create (state 0), the row
+        // landed after it (state 1: present), the create overlapping it.
+        // With the row it would bind a read of `d2/f` absent to state 1
+        // or later (a false violation); the window places it at state 0.
+        let reads = vec![read(2, "d2/f", false, 4, 5)];
+        let rows: HashMap<Rid, ((u64, usize), NsRet)> =
+            [(rid(2, 1), ((1, 1), NsRet::Enoent))].into_iter().collect();
+        let r = check_sessions(&events, &ticks, &reads, &none, &log, &rows, Scope::Dir);
+        assert!(r.violations.is_empty(), "{r:?}");
+        assert_eq!(
+            (
+                r.refusals_placed,
+                r.refusals_windowed,
+                r.refusals_row_disagrees
+            ),
+            (0, 1, 1)
+        );
+        let reads: Vec<ReadEvt> = Vec::new();
+        // At the state before the create the row agrees.
+        let rows: HashMap<Rid, ((u64, usize), NsRet)> =
+            [(rid(2, 1), ((0, 0), NsRet::Enoent))].into_iter().collect();
+        let r = check_sessions(&events, &ticks, &reads, &none, &log, &rows, Scope::Dir);
+        assert!(r.violations.is_empty(), "{r:?}");
+        assert_eq!((r.refusals_placed, r.refusals_windowed), (1, 0));
+        // An `EEXIST` row for a refusal the client saw as `ENOENT` is not
+        // this answer's outcome: the window places it.
+        let rows: HashMap<Rid, ((u64, usize), NsRet)> =
+            [(rid(2, 1), ((1, 1), NsRet::Eexist))].into_iter().collect();
+        let r = check_sessions(&events, &ticks, &reads, &none, &log, &rows, Scope::Dir);
+        assert!(r.violations.is_empty(), "{r:?}");
+        assert_eq!((r.refusals_placed, r.refusals_windowed), (0, 1));
     }
 }

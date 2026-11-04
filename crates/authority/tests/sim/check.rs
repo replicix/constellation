@@ -30,10 +30,11 @@ pub struct Oracle {
     /// Where in the log each rid completed (segment, record index): the
     /// linearization order of every op that took effect.
     pub completed_at: HashMap<Rid, (u64, usize)>,
-    /// Where in the log each refusal was journaled (segment, record
-    /// index of its first `Refused` row), in the same coordinates as
-    /// `completed_at`: the state the sequencer evaluated the op at.
-    pub refused_at: HashMap<Rid, (u64, usize)>,
+    /// Where in the log each refusal a namespace op can get (`ENOENT`,
+    /// `EEXIST`) was journaled (segment, record index of its first such
+    /// `Refused` row), in the same coordinates as `completed_at`, with the
+    /// row's code: the state the sequencer evaluated the op at.
+    pub refused_at: HashMap<Rid, ((u64, usize), NsRet)>,
     pub segments: usize,
     pub fenced: usize,
     /// Plan 43 C0: the applied (unfenced) segments, by seq: where each
@@ -53,7 +54,7 @@ pub async fn replay_log(raw: Arc<dyn ObjectStore>, snapshots_at: &BTreeSet<Seq>)
     let mut max_epoch = 0u64;
     let mut completed: HashMap<Rid, usize> = HashMap::new();
     let mut completed_at: HashMap<Rid, (u64, usize)> = HashMap::new();
-    let mut refused_at: HashMap<Rid, (u64, usize)> = HashMap::new();
+    let mut refused_at: HashMap<Rid, ((u64, usize), NsRet)> = HashMap::new();
     let mut at = BTreeMap::new();
     let mut fenced = 0;
     let mut head = 0;
@@ -116,13 +117,19 @@ pub async fn replay_log(raw: Arc<dyn ObjectStore>, snapshots_at: &BTreeSet<Seq>)
                         *completed.entry(*rid).or_default() += 1;
                         completed_at.entry(*rid).or_insert((*seq, i));
                     }
-                    // Only the rows a namespace refusal answers with: a
-                    // frozen epoch's `EROFS` or an abandoned rid's row is
-                    // not the outcome of the op the client then retried.
-                    LogRecord::Refused { rid, code }
-                        if matches!(code.posix_name(), "ENOENT" | "EEXIST") =>
-                    {
-                        refused_at.entry(*rid).or_insert((*seq, i));
+                    // Only the rows the session check judges: `ENOENT` and
+                    // `EEXIST`. A frozen epoch's `EROFS` and an abandoned
+                    // rid's row are final outcomes too, but no namespace
+                    // state explains them, so no return of theirs is placed.
+                    LogRecord::Refused { rid, code } => {
+                        let ret = match code.posix_name() {
+                            "ENOENT" => Some(NsRet::Enoent),
+                            "EEXIST" => Some(NsRet::Eexist),
+                            _ => None,
+                        };
+                        if let Some(ret) = ret {
+                            refused_at.entry(*rid).or_insert(((*seq, i), ret));
+                        }
                     }
                     _ => {}
                 }
