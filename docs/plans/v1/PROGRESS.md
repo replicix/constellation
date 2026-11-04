@@ -66099,7 +66099,7 @@ the data's keys, so the session wait did not hold a read of them: a reader on th
   namespace from the log; not the successor's own copy of rows it applied, not a seal snapshot), emptied where a row leaves the
   copy (coverage, drop rules, abandon, hole, settled, epoch drop). One atomic load per read when nothing is held, and no
   member copy decode.
-- Bound: an entry lapses after `HELD_COPY_MAX_AGE` (5 s, well above the 35-350 ms re-ship latency measured under slow S3), and
+- Bound: an entry lapses after `HELD_COPY_MAX_AGE_MS` (5 s, well above the 35-350 ms re-ship latency measured under slow S3), and
   the session wait (2 s) degrades a read before that. A row that never leaves the copy (the `backup-crash-slow` seed 840 leak)
   therefore cannot stall reads for good. Not persisted: a crash inside the re-ship window reopens the gap until the re-ship
   lands (the same 50-125 ms), a bounded, rare case.

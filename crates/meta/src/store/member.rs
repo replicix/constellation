@@ -61,7 +61,7 @@ pub(super) const MEMBER_COPY_BASE: u64 = 2 << 48;
 /// which never leaves the copy (a leak) costs a read one wait for at most
 /// this long, not for good. After the cap the read is answered from the
 /// replica as it is when the session wait times out.
-pub const HELD_COPY_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+pub const HELD_COPY_MAX_AGE_MS: i64 = 5_000;
 
 /// A member copy row a segment's strand rolled back
 /// ([`Meta::member_copy_touches`]). In memory, not persisted: after a
@@ -79,7 +79,8 @@ pub(crate) struct HeldCopy {
     pub(crate) epoch: u64,
     pub(crate) first: u64,
     pub(crate) keys: crate::KeySet,
-    pub(crate) since: std::time::Instant,
+    /// [`Meta::held_copy_now_ms`] when it was rolled back.
+    pub(crate) since_ms: i64,
 }
 
 fn member_epoch(epoch: u64) -> u64 {
@@ -493,16 +494,27 @@ impl Meta {
     /// copy: only a row this process rolled back is missing from the
     /// namespace (the successor's copy of a re-shipped row, a claimant's
     /// seal snapshot and a backup's copy are applied or never were), and no
-    /// row is held longer than [`HELD_COPY_MAX_AGE`], so a row that never
+    /// row is held longer than [`HELD_COPY_MAX_AGE_MS`], so a row that never
     /// leaves the copy (a leak, `backup-crash-slow` seed 840) cannot stall
     /// reads for good. One atomic load when nothing is held.
     pub fn member_copy_touches(&self, keys: &[crate::ReadKey]) -> bool {
-        self.member_copy_touches_at(keys, std::time::Instant::now())
+        self.member_copy_touches_at(keys, self.held_copy_now_ms())
+    }
+
+    /// The clock the hold's age is read on, ms: the node's wait clock (the
+    /// lock table's, the simulation's virtual one there), or a monotonic host
+    /// clock where none is set (unit tests).
+    pub fn held_copy_now_ms(&self) -> i64 {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        match self.locks().clock_now() {
+            Some(now) => now.wait.0,
+            None => START.get_or_init(std::time::Instant::now).elapsed().as_millis() as i64,
+        }
     }
 
     /// [`Self::member_copy_touches`] at `now` (a test steps past the cap
     /// without sleeping).
-    pub fn member_copy_touches_at(&self, keys: &[crate::ReadKey], now: std::time::Instant) -> bool {
+    pub fn member_copy_touches_at(&self, keys: &[crate::ReadKey], now_ms: i64) -> bool {
         if !self
             .any_held_copy
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -510,7 +522,7 @@ impl Meta {
             return false;
         }
         let mut held = self.held_copies.lock().unwrap();
-        held.retain(|h| now.saturating_duration_since(h.since) < HELD_COPY_MAX_AGE);
+        held.retain(|h| now_ms.saturating_sub(h.since_ms) < HELD_COPY_MAX_AGE_MS);
         self.any_held_copy
             .store(!held.is_empty(), std::sync::atomic::Ordering::Relaxed);
         held.iter().any(|h| keys.iter().any(|k| h.keys.touches(k)))
@@ -520,11 +532,12 @@ impl Meta {
     pub(crate) fn hold_copy_row(&self, epoch: u64, first: u64, keys: crate::KeySet) {
         let mut held = self.held_copies.lock().unwrap();
         held.retain(|h| (h.epoch, h.first) != (epoch, first));
+        let since_ms = self.held_copy_now_ms();
         held.push(HeldCopy {
             epoch,
             first,
             keys,
-            since: std::time::Instant::now(),
+            since_ms,
         });
         self.any_held_copy
             .store(true, std::sync::atomic::Ordering::Relaxed);

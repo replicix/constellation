@@ -2132,7 +2132,7 @@ impl crate::store::Meta {
     /// rolled back until the successor's re-ship lands:
     /// [`Meta::member_copy_touches`]; bounded by the session wait, after which
     /// the read degrades and shows the gap, and by the entry's own cap,
-    /// `HELD_COPY_MAX_AGE`). One counter read and one atomic load when
+    /// `HELD_COPY_MAX_AGE_MS`). One counter read and one atomic load when
     /// neither is held.
     pub fn replay_touches(&self, keys: &[ReadKey]) -> bool {
         if self.member_copy_touches(keys) {

@@ -199,7 +199,7 @@ fn a_committed_row_moved_to_the_member_copy_holds_its_readers() {
 
 /// A row that never leaves the member copy (a leak: `backup-crash-slow`
 /// seed 840 left 20 on a node for good) holds reads of its keys for
-/// `HELD_COPY_MAX_AGE` at most, not for ever.
+/// `HELD_COPY_MAX_AGE_MS` at most, not for ever.
 #[test]
 fn a_row_that_never_leaves_the_copy_stops_holding_after_the_cap() {
     let meta = Meta::open_in_memory().unwrap();
@@ -217,14 +217,13 @@ fn a_row_that_never_leaves_the_copy_stops_holding_after_the_cap() {
         &[create("b", ino(2), 11), completed(rid(2))],
     );
     assert!(meta.member_copy_carries(rid(1)).unwrap());
-    let t0 = std::time::Instant::now();
+    let t0 = meta.held_copy_now_ms();
     assert!(meta.member_copy_touches_at(&key, t0));
     assert!(
         meta.member_copy_touches_at(&dir, t0),
         "its parent's listing too"
     );
-    let cap = constellation_meta::HELD_COPY_MAX_AGE;
-    let late = std::time::Instant::now() + cap + std::time::Duration::from_millis(1);
+    let late = t0 + constellation_meta::HELD_COPY_MAX_AGE_MS + 1;
     assert!(!meta.member_copy_touches_at(&key, late), "capped");
     assert!(!meta.member_copy_touches_at(&dir, late));
     // The row is still in the copy (the leak), and stays unheld.
