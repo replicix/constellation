@@ -1570,6 +1570,7 @@
           "type": "integer"
         },
         "deps_refused": {
+          "description": "Batches the root refused for lacking their deps: legitimate only\nat a root that was deposed without knowing it.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
