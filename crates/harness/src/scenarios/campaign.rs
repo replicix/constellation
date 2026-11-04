@@ -510,7 +510,12 @@ fn load_probe_with(seed: u64, names: &[&str], takeover: bool) -> Result<()> {
                     .map(move |v| format!("{}: {v}", c.name))
             })
             .collect();
-        anyhow::ensure!(bad.is_empty(), "acknowledged writes: {}", bad.join("; "));
+        anyhow::ensure!(
+            bad.is_empty(),
+            "acknowledged writes: {} ({})",
+            bad.join("; "),
+            crate::verify::unsettled_eio_summary(&clients)
+        );
         // A profile that pauses the node mounted first (the root) must
         // have deposed it: the other node sealed its epoch and took the
         // root over through its backup. Without a takeover the cell
@@ -550,8 +555,9 @@ fn load_probe_with(seed: u64, names: &[&str], takeover: bool) -> Result<()> {
         let again = ledger.check(&clients[0].mnt);
         anyhow::ensure!(
             again.violations(refused).is_empty(),
-            "acknowledged writes after a's remount: {}",
-            again.violations(refused).join("; ")
+            "acknowledged writes after a's remount: {} ({})",
+            again.violations(refused).join("; "),
+            crate::verify::unsettled_eio_summary(&clients)
         );
         let fsck = clients[0].fsck(false)?;
         anyhow::ensure!(

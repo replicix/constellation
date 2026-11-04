@@ -386,11 +386,6 @@ struct LedgerInner {
     /// Per path, the last op the application was certainly told
     /// succeeded (what [`Ledger::ownership`] reports a refusal against).
     last: BTreeMap<String, Certain>,
-    /// Paths a rename or an unlink failed on, ever: a stranded execution
-    /// of it (answered in doubt, replayed by rid on a drain) may still
-    /// land, move or remove the path after later acknowledged ops on it,
-    /// so no refusal of the path is certain to be a wrong one.
-    tainted: HashSet<String>,
 }
 
 /// The last certain (acknowledged) op on a path.
@@ -523,7 +518,6 @@ impl Ledger {
         let mut l = self.inner();
         for r in rels {
             l.doubtful.insert(r.to_string());
-            l.tainted.insert(r.to_string());
             // What it held may now be anywhere among them.
             if let Some(Some(id)) = l.files.get(*r).cloned() {
                 l.attempted.insert(id);
@@ -570,11 +564,6 @@ impl Ledger {
         let l = self.inner();
         if l.doubtful.contains(rel) {
             return Ownership::Uncertain("the name's last write, rename or unlink failed");
-        }
-        if l.tainted.contains(rel) {
-            return Ownership::Uncertain(
-                "a rename or unlink on the name failed once: it may still land",
-            );
         }
         match l.files.get(rel) {
             Some(Some(_)) => Ownership::Owned {
@@ -797,6 +786,26 @@ pub fn wait_quiescent(clients: &[&crate::client::Client], within: Duration) -> R
 /// What the protocol counted on `c` that the ledger's outcome depends on
 /// (F9: stranded ops, replays, refused replays and conflict copies,
 /// depositions, outwaited grants).
+/// Each node's `ack.client_unsettled_eio` (the unsettled `EIO`s its core
+/// told its clients: no sequencer answered the settle in time), for a
+/// failure message that reports a late landing (`resurrected`): it names
+/// whether the product admitted an unsettled `EIO`, the case I4 does not
+/// yet exclude (plan 46 M0.3). Never an excuse: a late landing fails either
+/// way.
+pub fn unsettled_eio_summary(clients: &[crate::client::Client]) -> String {
+    let each: Vec<String> = clients
+        .iter()
+        .map(|c| {
+            let n = c
+                .control_status()
+                .ok()
+                .and_then(|s| s["ack"]["client_unsettled_eio"].as_u64());
+            format!("{}={}", c.name, n.map_or("?".to_string(), |n| n.to_string()))
+        })
+        .collect();
+    format!("client_unsettled_eio: {}", each.join(" "))
+}
+
 pub fn counters(c: &crate::client::Client) -> serde_json::Value {
     let Ok(s) = c.control_status() else {
         return serde_json::Value::Null;
@@ -2793,18 +2802,20 @@ mod tests {
         assert!(!notfound("w/f2", "rename"));
         l.write(root, "w/f2", id(3), 100).unwrap();
         assert!(matches!(l.ownership("w/f2"), Ownership::Owned { .. }));
-        // A failed rename or unlink may still land, once, later: both
-        // names stay uncertain for good, whatever was acknowledged since.
+        // A failed rename or unlink never lands later (an op answered in
+        // doubt does not, plan 46 M0.1): both names are open until
+        // acknowledged again, and once acknowledged they are owned.
         l.write(root, "w/f4", id(4), 100).unwrap();
         l.failed_op(&["w/f4", "w/g4"]);
-        l.write(root, "w/f4", id(5), 100).unwrap();
         assert!(matches!(l.ownership("w/f4"), Ownership::Uncertain(_)));
         assert!(matches!(l.ownership("w/g4"), Ownership::Uncertain(_)));
-        assert!(!notfound("w/f4", "rename"));
+        l.write(root, "w/f4", id(5), 100).unwrap();
+        assert!(matches!(l.ownership("w/f4"), Ownership::Owned { .. }));
+        assert!(matches!(l.ownership("w/g4"), Ownership::Uncertain(_)));
         l.write(root, "w/f6", id(6), 100).unwrap();
         l.failed_op(&["w/f6"]);
         l.write(root, "w/f6", id(7), 100).unwrap();
-        assert!(!notfound("w/f6", "unlink"));
+        assert!(notfound("w/f6", "unlink"));
         // The verdict names the op, the path and the last certain op,
         // counted under its own class.
         let rep = log.judge(&ev);

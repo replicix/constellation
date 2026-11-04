@@ -680,7 +680,11 @@ pub(super) fn ledger_converges(name: &str, clients: &[Client], ledger: &Ledger) 
             return Ok(());
         }
         if Instant::now() >= deadline {
-            bail!("acknowledged writes: {}", bad.join("; "));
+            bail!(
+                "acknowledged writes: {} ({})",
+                bad.join("; "),
+                crate::verify::unsettled_eio_summary(clients)
+            );
         }
         std::thread::sleep(Duration::from_millis(500));
     }
