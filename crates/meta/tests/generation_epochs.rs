@@ -620,3 +620,181 @@ fn a_read_does_not_void_an_end_only_a_streamed_entry_carries() {
     let _ = meta.session_wait(&[]);
     assert!(!meta.session().is_voided(h), "only the stream ended it");
 }
+
+/// The `persist_void_cut` crash window (ADR-43 round 4, open item 2): the
+/// segment that carries a `RecallCut` the root's stream installed here first
+/// confirms that entry and skips its row, so nothing applies the record
+/// again; the cut it carries must be kept in the segment's own transaction.
+/// Written after the commit (the replica's `persist_void_cut`, which a
+/// meta-only apply does not run: the crash between the two), the restart
+/// voids at the log's index of the generation (7 here: rows of it the
+/// replica took from a checkpoint have no index), and a dependency on a row
+/// the log holds (8, 9) is refused as lost on every re-send.
+#[test]
+fn a_crash_after_a_segment_confirms_a_streamed_end_keeps_the_record_s_cut() {
+    let h = gen(5, 3);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.db");
+    store_with_a_streamed_ahead_end(&path, h, true);
+    {
+        let meta = Meta::open(&path).unwrap();
+        meta.apply_segment_rows(
+            2,
+            1,
+            1,
+            &[1],
+            &[(0, 0)],
+            &[LogRecord::RecallCut {
+                dir: ROOT_INO,
+                gen: h,
+                through: 9,
+            }],
+            &TouchSet::default(),
+        )
+        .unwrap();
+        meta.close().unwrap();
+    }
+    let meta = Meta::open(&path).unwrap();
+    assert_eq!(
+        meta.void_cut(h).unwrap(),
+        Some(9),
+        "the record's cut, kept with the segment"
+    );
+    assert!(meta.session().is_voided(h));
+    assert!(!meta.deps_lost_deps(&at(h, 9)), "a row the log holds");
+    assert!(meta.deps_lost_deps(&at(h, 10)));
+}
+
+fn delegate_create(meta: &Meta, g: u64, rid: Rid, name: &str, ino: u64) {
+    let op = MutateOp::Create {
+        parent: ROOT_INO,
+        name: name.into(),
+        ino,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    meta.delegate_execute(
+        &op,
+        Some(rid),
+        g,
+        Default::default(),
+        &Default::default(),
+        constellation_types::clock::Now::same(0),
+    )
+    .unwrap();
+}
+
+/// ADR-43's orphan-liveness item (`deleg_gens_awaiting_end`): the root of
+/// epoch 1 streams its grant of `g` (held by its group) to this node, which
+/// installs it and executes as the delegate. The operator then abandons that
+/// group (epoch 2's marker): the grant strands with the speculation no
+/// successor re-ships, and the log never carries it, nor any row of `g`, nor
+/// an end of it. The delegate's own rows of `g` stayed in its journal with no
+/// end applied, so `deleg_gens_awaiting_end` named `g` for good (across
+/// restarts) and `delegation_sync` installed no later grant here; the rows'
+/// effects stayed in this replica, which the log never carries. The abandon
+/// ends `g` as the log's `Recall` would, at what the log holds of it (0): the
+/// rows are rolled back and queued for replay by rid, and the cut is kept.
+#[test]
+fn an_abandon_ends_a_generation_whose_grant_never_reached_the_log() {
+    let g = gen(1, 1);
+    let rid = Rid {
+        node: 9,
+        incarnation: 1,
+        seq: 1,
+    };
+    let ino = (2u64 << 40) | 20;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.db");
+    {
+        let meta = Meta::open(&path).unwrap();
+        meta.install_streamed_committed(1, 1, 1, 1, &[delegate(g)], true, (0, 0))
+            .unwrap();
+        assert!(meta.delegation_table().iter().any(|d| d.gen == g));
+        delegate_create(&meta, g, rid, "x", ino);
+        let live = std::collections::BTreeSet::from([g]);
+        assert!(meta.deleg_gens_awaiting_end(&live).unwrap().is_empty());
+        meta.apply_segment_rows(
+            1,
+            2,
+            0,
+            &[],
+            &[],
+            &[LogRecord::GroupAbandoned {
+                epoch: 1,
+                gen: 0,
+                through_known: 0,
+            }],
+            &TouchSet::default(),
+        )
+        .unwrap();
+        assert!(
+            meta.delegation_table().iter().all(|d| d.gen != g),
+            "the grant stranded"
+        );
+        let awaiting = meta.deleg_gens_awaiting_end(&Default::default()).unwrap();
+        assert!(
+            awaiting.is_empty(),
+            "the orphan's rows block this node's installs: {awaiting:?}"
+        );
+        assert!(
+            meta.lookup(ROOT_INO, "x").unwrap().is_none(),
+            "the orphan's row is rolled back"
+        );
+        assert!(
+            meta.pending_replays()
+                .unwrap()
+                .iter()
+                .any(|op| op.rid == rid),
+            "and queued for replay by rid"
+        );
+        assert!(meta.session().is_voided(g));
+        assert!(meta.deps_lost_deps(&at(g, 1)));
+        meta.close().unwrap();
+    }
+    let meta = Meta::open(&path).unwrap();
+    assert!(meta
+        .deleg_gens_awaiting_end(&Default::default())
+        .unwrap()
+        .is_empty());
+    assert_eq!(meta.void_cut(g).unwrap(), Some(0));
+    assert!(meta.deps_lost_deps(&at(g, 1)));
+}
+
+/// The integrity side of the same rule: a grant the log carries is not an
+/// orphan, whatever the abandon strands. The generation stays live and
+/// unvoided, and the delegate's rows stay (they leave by the log's rows or
+/// its recall).
+#[test]
+fn an_abandon_leaves_a_generation_the_log_granted_alone() {
+    let g = gen(1, 1);
+    let rid = Rid {
+        node: 9,
+        incarnation: 1,
+        seq: 1,
+    };
+    let meta = Meta::open_in_memory().unwrap();
+    meta.apply_segment(1, 1, &[delegate(g)], &TouchSet::default())
+        .unwrap();
+    delegate_create(&meta, g, rid, "x", (2u64 << 40) | 20);
+    meta.apply_segment_rows(
+        2,
+        2,
+        0,
+        &[],
+        &[],
+        &[LogRecord::GroupAbandoned {
+            epoch: 1,
+            gen: 0,
+            through_known: 0,
+        }],
+        &TouchSet::default(),
+    )
+    .unwrap();
+    assert!(meta.delegation_table().iter().any(|d| d.gen == g));
+    assert!(meta.lookup(ROOT_INO, "x").unwrap().is_some());
+    assert!(!meta.session().is_voided(g));
+    assert_eq!(meta.void_cut(g).unwrap(), None);
+    assert!(!meta.deps_lost_deps(&at(g, 1)));
+}
