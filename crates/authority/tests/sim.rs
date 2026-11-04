@@ -8746,6 +8746,59 @@ fn delegated_group_switch_findings_seeds_234_and_615() {
     );
 }
 
+/// Plan 46 M0.3: L2b, a known I2 gap, pinned. `long-delegated-backup` seed
+/// 13016 (I2, and I2c) and `long-delegated-late-answers` seeds 13907 and 15996
+/// plus `long-delegated-backup` seeds 14284 and 15005 (I2c) fail `+identity`
+/// under slow lease reads (`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`): a row the
+/// delegate's group committed and answered lands with a new identity, and in
+/// 13016 two copies of its rid are queued at once (one gated).
+///
+/// Upstream mechanism: a delegate that seals the root and takes a lone tenure
+/// re-appends its committed row (C3) as a root append that a lone tenure
+/// counts at once; the tenure ends at lease expiry, unshipped, and the next
+/// root ends the generation below the row. Every copy left is then a rescue by
+/// rid (the requester's shadow replay, or the recall pass's queued copy),
+/// which lands with a new identity.
+///
+/// Deferred to plan 46 M1.2 (member copies), which must close it; the ignore
+/// goes then. See PROGRESS, "L2b".
+#[test]
+#[ignore = "L2b, deferred to plan 46 M1.2: seeds 13016 (I2), 13907, 14284, 15005 and 15996 (I2c) fail +identity under slow lease reads"]
+fn l2b_findings_a_committed_delegate_row_lands_with_its_identity() {
+    let slow = |cfg: SimConfig| SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..cfg
+    };
+    let witnesses: [(&str, SimConfig, &[u64]); 2] = [
+        (
+            "long-delegated-backup",
+            long_delegated_backup_config(),
+            &[13_016, 14_284, 15_005],
+        ),
+        (
+            "long-delegated-late-answers",
+            long_delegated_late_answers_config(),
+            &[13_907, 15_996],
+        ),
+    ];
+    // Every seed runs, and every failure is reported.
+    let mut failures = Vec::new();
+    for (label, cfg, seeds) in witnesses {
+        for &seed in seeds {
+            if let Err(e) = run_seed(seed, strict(slow(cfg.clone()), "identity")) {
+                failures.push(format!("{label} seed {seed}: {e}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "L2b: {} of 5 witnesses fail (replay with AUTHORITY_SIM_CONFIG=<label> \
+         AUTHORITY_SIM_LEASE_READS=0:0:800:1000 and the identity variant):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
 /// Plan 43 C2e (Q1, strict): the delegate and its backup die for good; the
 /// root does not end their generations without a member's tail. The runs end
 /// `waiting_for_group` and every acknowledged row is still held somewhere
