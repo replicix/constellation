@@ -210,6 +210,14 @@ pub fn project_dir(events: &[HistEvt], dir: &str) -> Vec<HistEvt> {
     out
 }
 
+/// The hash range, of `bits` bits, that a name's leaf falls in: the test
+/// `project_range` selects by, and the session checker's `Scope::Range`
+/// binds by (`session.rs`), so the two cannot differ.
+pub fn range_idx_of(bits: u8, name: &str) -> u32 {
+    use constellation_meta::delegation::Range;
+    Range::of(bits, name.rsplit('/').next().unwrap_or(name)).idx
+}
+
 /// Plan 30 §M12: the history projected to one hash range of `dir`'s
 /// names (`bits` bits, range `idx`): a split directory is sequenced per
 /// range, so linearizability holds per range (and a whole directory's
@@ -217,10 +225,8 @@ pub fn project_dir(events: &[HistEvt], dir: &str) -> Vec<HistEvt> {
 /// between two ranges appears in both as its halves, like a rename
 /// between two directories in `project_dir`.
 pub fn project_range(events: &[HistEvt], dir: &str, bits: u8, idx: u32) -> Vec<HistEvt> {
-    use constellation_meta::delegation::Range;
     use std::collections::HashMap;
-    let leaf = |n: &str| n.rsplit('/').next().unwrap_or(n).to_string();
-    let in_range = |n: &str| dir_of(n) == dir && Range::of(bits, &leaf(n)).idx == idx;
+    let in_range = |n: &str| dir_of(n) == dir && range_idx_of(bits, n) == idx;
     let mut returns: HashMap<Rid, NsRet> = HashMap::new();
     for e in events {
         if let HistEvt::Return { rid, ret, .. } = e {

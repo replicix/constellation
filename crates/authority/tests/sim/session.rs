@@ -10,8 +10,9 @@
 //! - its own write that returned `Ok` (not tentative) at log index `p`:
 //!   at least `p + 1` (read-your-writes);
 //! - a refusal (`EEXIST` — present, `ENOENT` — absent; its op never
-//!   landed): at least the earliest state in its real-time window that
-//!   refuses the same way (the holder evaluated it there);
+//!   landed): at least the earliest state in its real-time window, among
+//!   the successes of its scope and its own node's, that refuses the same
+//!   way (the holder evaluated it there; `Scope`);
 //! - a read: at least the earliest state at or after its own floor that
 //!   shows what it returned (monotonic reads).
 //!
@@ -24,7 +25,7 @@
 //! an effect, or to keep seeing it. A read whose session wait timed out
 //! answered degraded by design; its violations are counted separately.
 
-use super::history::{HistEvt, NsOp, NsRet, ReadEvt};
+use super::history::{dir_of, range_idx_of, HistEvt, NsOp, NsRet, ReadEvt};
 use constellation_meta::Rid;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -52,6 +53,32 @@ fn names_of(op: &NsOp) -> Vec<&str> {
     }
 }
 
+/// Which successes the log orders in real time against an op on a name
+/// (plan 30 §M11, the scope `check_linearizable_witnessed` projects to):
+/// the whole namespace with one sequencer; under delegation, keys of
+/// different owners are ordered independently, so only successes on a name
+/// of the same directory (of the same hash range, when ranges are checked).
+/// A node's own successes order before its later ops in any directory
+/// (`check_session_order`), whatever the scope.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scope {
+    Global,
+    Dir,
+    Range(u8),
+}
+
+impl Scope {
+    fn shares(self, a: &str, b: &str) -> bool {
+        match self {
+            Scope::Global => true,
+            Scope::Dir => dir_of(a) == dir_of(b),
+            Scope::Range(bits) => {
+                dir_of(a) == dir_of(b) && range_idx_of(bits, a) == range_idx_of(bits, b)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
     Own,
@@ -68,6 +95,7 @@ pub fn check_sessions(
     reads: &[ReadEvt],
     tentative: &HashSet<Rid>,
     completed_at: &HashMap<Rid, (u64, usize)>,
+    scope: Scope,
 ) -> SessionReport {
     let mut report = SessionReport {
         reads: reads.len(),
@@ -283,11 +311,22 @@ pub fn check_sessions(
                     (NsOp::Rename(_, _), NsRet::Eexist) => continue,
                     _ => continue,
                 };
-                // The refusal's window, as the witnessed check places it.
+                // The refusal's window, as the witnessed check places it:
+                // after the successes of its scope, and its own node's,
+                // that returned before it was invoked. Another owner's
+                // success that returned earlier may follow it in the log
+                // (`long-delegated-late-answers` 4125: a delegate's
+                // acknowledged `d2` rows appended after the root's refusal
+                // on `d1`).
                 let lo = index_of
                     .iter()
                     .filter(|(b, _)| {
-                        !tentative.contains(*b) && ret.get(*b).is_some_and(|(t, _)| t < it)
+                        !tentative.contains(*b)
+                            && ret.get(*b).is_some_and(|(t, _)| t < it)
+                            && ((b.node, b.incarnation) == session
+                                || names_of(&invoke[*b].1)
+                                    .into_iter()
+                                    .any(|m| scope.shares(m, name)))
                     })
                     .map(|(_, ib)| ib + 1)
                     .max()
@@ -475,18 +514,25 @@ mod tests {
         let log: HashMap<Rid, (u64, usize)> = [(rid(1, 1), (1, 0))].into_iter().collect();
         let none = HashSet::new();
         let bad = vec![read(2, "a", false, 4, 5), read(1, "a", false, 6, 7)];
-        let r = check_sessions(&events, &ticks, &bad, &none, &log);
+        let r = check_sessions(&events, &ticks, &bad, &none, &log, Scope::Global);
         let mut kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
         kinds.sort();
         assert_eq!(kinds, vec!["monotonic_reads", "read_your_writes"], "{r:?}");
         // Reading `a` absent *before* the refusal is fine (cross-node
         // staleness), and present afterwards.
         let good = vec![read(2, "a", false, 2, 2), read(2, "a", true, 4, 5)];
-        let r = check_sessions(&events, &ticks, &good, &none, &log);
+        let r = check_sessions(&events, &ticks, &good, &none, &log, Scope::Global);
         assert!(r.violations.is_empty(), "{r:?}");
         // A tentative create exempts the name.
         let tentative: HashSet<Rid> = [rid(1, 1)].into_iter().collect();
-        let r = check_sessions(&events, &ticks, &bad, &tentative, &HashMap::new());
+        let r = check_sessions(
+            &events,
+            &ticks,
+            &bad,
+            &tentative,
+            &HashMap::new(),
+            Scope::Global,
+        );
         assert!(r.violations.is_empty(), "{r:?}");
     }
 
@@ -525,7 +571,7 @@ mod tests {
             .collect();
         let none = HashSet::new();
         let bad = vec![read(2, "d2/b", true, 4, 5), read(2, "d1/a", false, 6, 7)];
-        let r = check_sessions(&events, &ticks, &bad, &none, &log);
+        let r = check_sessions(&events, &ticks, &bad, &none, &log, Scope::Dir);
         let kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(kinds, vec!["causal_order"], "{r:?}");
         let good = vec![
@@ -533,7 +579,7 @@ mod tests {
             read(2, "d2/b", true, 4, 5),
             read(2, "d1/a", true, 6, 7),
         ];
-        let r = check_sessions(&events, &ticks, &good, &none, &log);
+        let r = check_sessions(&events, &ticks, &good, &none, &log, Scope::Dir);
         assert!(r.violations.is_empty(), "{r:?}");
         // The two creates in flight together: `d2/b` carries nothing.
         let overlapping = vec![
@@ -542,11 +588,74 @@ mod tests {
             events[1].clone(),
             events[3].clone(),
         ];
-        let r = check_sessions(&overlapping, &ticks, &bad, &none, &log);
+        let r = check_sessions(&overlapping, &ticks, &bad, &none, &log, Scope::Dir);
         assert!(r.violations.is_empty(), "{r:?}");
         // A tentative `d1/a` carries nothing either.
         let tentative: HashSet<Rid> = [rid(1, 1)].into_iter().collect();
-        let r = check_sessions(&events, &ticks, &bad, &tentative, &log);
+        let r = check_sessions(&events, &ticks, &bad, &tentative, &log, Scope::Dir);
         assert!(r.violations.is_empty(), "{r:?}");
+    }
+
+    /// `long-delegated-late-answers` 4125 (slow lease reads): node 3's
+    /// `create d2/x`, acknowledged by d2's delegate, returns before node 2
+    /// unlinks `d1/f`; the root appends it after its own `create d1/f`
+    /// (log 0, 1), and node 4's `unlink d1/f` lands last (log 2). Node 2's
+    /// unlink is refused `ENOENT` at the root before the create (state 0),
+    /// and its next read sees `d1/f` present (state 1): monotonic. Under
+    /// delegation the log orders `d1` and `d2` independently, so `d2/x`
+    /// does not place the refusal after it; with one sequencer it would
+    /// (state 3 at the earliest), and the read is then a violation.
+    fn another_owners_earlier_success(
+        dir_of_x: &str,
+        by: u64,
+    ) -> (Vec<HistEvt>, HashMap<Rid, (u64, usize)>) {
+        let ev = |thread: u64, rid: Rid, op: Option<NsOp>, ret: NsRet| match op {
+            Some(op) => HistEvt::Invoke { thread, rid, op },
+            None => HistEvt::Return { thread, rid, ret },
+        };
+        let x = format!("{dir_of_x}/x");
+        let events = vec![
+            ev(by * 16, rid(by, 1), Some(NsOp::Create(x)), NsRet::Ok),
+            ev(by * 16, rid(by, 1), None, NsRet::Ok),
+            ev(32, rid(2, 2), Some(NsOp::Unlink("d1/f".into())), NsRet::Ok),
+            ev(16, rid(1, 1), Some(NsOp::Create("d1/f".into())), NsRet::Ok),
+            ev(64, rid(4, 1), Some(NsOp::Unlink("d1/f".into())), NsRet::Ok),
+            ev(16, rid(1, 1), None, NsRet::Ok),
+            ev(32, rid(2, 2), None, NsRet::Enoent),
+            ev(64, rid(4, 1), None, NsRet::Ok),
+        ];
+        let log: HashMap<Rid, (u64, usize)> = [
+            (rid(1, 1), (1, 0)),
+            (rid(by, 1), (2, 0)),
+            (rid(4, 1), (3, 0)),
+        ]
+        .into_iter()
+        .collect();
+        (events, log)
+    }
+
+    #[test]
+    fn a_refusal_is_not_placed_after_another_owners_earlier_success() {
+        let ticks: Vec<u64> = (0..8).collect();
+        let none = HashSet::new();
+        // Node 2 reads `d1/f` present after its refusal returned (tick 6).
+        let reads = vec![read(2, "d1/f", true, 8, 9)];
+        let (events, log) = another_owners_earlier_success("d2", 3);
+        let r = check_sessions(&events, &ticks, &reads, &none, &log, Scope::Dir);
+        assert!(r.violations.is_empty(), "{r:?}");
+        // One sequencer orders everything in real time: a violation.
+        let r = check_sessions(&events, &ticks, &reads, &none, &log, Scope::Global);
+        let kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, vec!["monotonic_reads"], "{r:?}");
+        // The earlier success in the refusal's own directory binds it.
+        let (events, log) = another_owners_earlier_success("d1", 3);
+        let r = check_sessions(&events, &ticks, &reads, &none, &log, Scope::Dir);
+        let kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, vec!["monotonic_reads"], "{r:?}");
+        // So does the refusing node's own earlier success, in any directory.
+        let (events, log) = another_owners_earlier_success("d2", 2);
+        let r = check_sessions(&events, &ticks, &reads, &none, &log, Scope::Dir);
+        let kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, vec!["monotonic_reads"], "{r:?}");
     }
 }
