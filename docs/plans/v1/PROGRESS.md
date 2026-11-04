@@ -66061,7 +66061,27 @@ between the same `=== ... ===` markers. Trade-offs: frames are not the
 symbolized `std::backtrace` output; on glibc older than 2.35 the unwinder takes
 the loader lock, so a thread interrupted inside `dlopen` could deadlock;
 bursts beyond 16 pending captures are counted and reported as dropped.
-Test: `backtrace_signal_survives_a_busy_allocator` signals a thread in a tight
-alloc/free loop for 3 s and requires survival and logged dumps. The old
-handler's failure here is a heap race, so a fail-before is not guaranteed.
+Tests: `backtrace_signal_survives_a_busy_allocator` signals a thread in a
+tight alloc/free loop for 3 s and requires survival, a dump of that thread's
+own tid (the writer records `(tid, frames)` per dump under `cfg(test)`) with at
+least 4 frames (the walk crossed the signal frame), and zero allocations made
+inside the handler: a test-only counting `#[global_allocator]` counts
+allocations on a thread flagged as in the handler. That last check is a
+deterministic fail-before: with the old handler body restored the test aborts
+at once (`FAIL: the backtrace handler allocated`, SIGABRT); it aborts rather
+than panics because the stuck worker can hold the allocator lock. The parked
+thread test also requires a dump of its own tid with at least 4 frames.
+Writer thread: EOF ends it (no busy loop), EINTR/EAGAIN and partial `write(2)`s
+to stderr are retried, an error is logged before it exits.
+Output notes: addresses are return addresses (give `addr2line` the address
+minus 1); the release profile is `strip = true`, so a shipped binary names
+nothing via `dladdr` and `addr2line` needs an unstripped build of the same
+commit.
+Static musl (the shipped `x86_64-unknown-linux-musl` artifact): measured by
+running the lib tests on that target, the unwinder (LLVM libunwind) stops at
+the signal trampoline: a dump has two raw frames (handler, trampoline), no
+names. So on the shipped binary a dump shows that a thread stalled but not
+where. Not a regression (the old `std::backtrace` used the same unwinder);
+the tests accept 2 frames on musl. Fixing it (a libunwind sigreturn CFI, or
+frame-pointer walking) is left for a later round.
 The harness's per-scenario opt-out for freeze scenarios is left in place.

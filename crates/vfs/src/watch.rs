@@ -28,8 +28,10 @@
 //!
 //! With `CONSTELLATION_FUSE_STALL_BACKTRACE=1` the monitor also asks the
 //! stalled thread for its backtrace (a `SIGUSR2`, handled by capturing
-//! raw frames without allocating; a writer thread logs them): a diagnostic for a build with symbols,
-//! off by default. Naming the thread and delivering the signal are host
+//! raw frames without allocating; a writer thread logs them): a diagnostic,
+//! off by default. The frames are addresses (return addresses: resolve
+//! with `addr2line` on the address minus 1); a stripped release binary
+//! names nothing, so keep an unstripped build of the same commit. Naming the thread and delivering the signal are host
 //! services (`constellation_platform`'s `Process::current_thread`/
 //! `enable_backtraces`/`request_backtrace`).
 //!

@@ -145,9 +145,12 @@ pub trait Process: Send + Sync {
     fn enable_backtraces(&self, label: &'static str) -> io::Result<()>;
 
     /// Ask `thread` (of this process) to write its backtrace to stderr
-    /// (after [`Process::enable_backtraces`]). A diagnostic: the handler is
-    /// async-signal-safe (raw frames into a preallocated ring, a writer
-    /// thread formats them), so any thread state is fine.
+    /// (after [`Process::enable_backtraces`]). A diagnostic: the handler
+    /// allocates nothing and takes no lock of its own (raw frames into a
+    /// preallocated ring, a writer thread formats them), so the thread may
+    /// be anywhere, even inside `malloc`. Limits: the unwinder takes the
+    /// loader lock where libgcc is built against glibc older than 2.35, and
+    /// a static musl build may not unwind past the signal frame.
     fn request_backtrace(&self, thread: ThreadRef) -> io::Result<()>;
 
     /// Arrange for the child `cmd` spawns to be sent `SIGTERM` when its

@@ -255,6 +255,52 @@ static BT_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Dumps the writer thread has logged (read by tests).
 #[cfg(test)]
 pub(crate) static BT_EMITTED: AtomicU64 = AtomicU64::new(0);
+/// `(tid, frame count)` of every dump the writer logged (read by tests).
+#[cfg(test)]
+pub(crate) static BT_DUMPS: std::sync::Mutex<Vec<(u64, usize)>> = std::sync::Mutex::new(Vec::new());
+/// Allocations made on a thread while it ran the handler (tests assert 0).
+#[cfg(test)]
+pub(crate) static BT_HANDLER_ALLOCS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    /// Set while this thread is inside the handler. Const-initialised and
+    /// needing no destructor, so the test allocator can read it safely.
+    pub(crate) static BT_IN_HANDLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Test allocator: counts allocations made while the calling thread is
+/// inside the backtrace handler.
+#[cfg(test)]
+struct CountingAlloc;
+#[cfg(test)]
+impl CountingAlloc {
+    fn note() {
+        if BT_IN_HANDLER.try_with(|c| c.get()).unwrap_or(false) {
+            BT_HANDLER_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+// SAFETY: every method defers to the system allocator unchanged.
+#[cfg(test)]
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        Self::note();
+        std::alloc::System.alloc(l)
+    }
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        Self::note();
+        std::alloc::System.alloc_zeroed(l)
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
+        Self::note();
+        std::alloc::System.realloc(p, l, n)
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        std::alloc::System.dealloc(p, l)
+    }
+}
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOC: CountingAlloc = CountingAlloc;
 static BT_TID: OnceLock<fn() -> u64> = OnceLock::new();
 
 extern "C" {
@@ -290,6 +336,16 @@ extern "C" fn walk_frame(ctx: *mut libc::c_void, arg: *mut libc::c_void) -> libc
 extern "C" fn on_sigusr2(_: libc::c_int) {
     // SAFETY: errno location is thread-local and always valid.
     let saved = unsafe { *errno_location() };
+    #[cfg(test)]
+    BT_IN_HANDLER.with(|c| c.set(true));
+    on_sigusr2_body();
+    #[cfg(test)]
+    BT_IN_HANDLER.with(|c| c.set(false));
+    // SAFETY: as above.
+    unsafe { *errno_location() = saved };
+}
+
+fn on_sigusr2_body() {
     for slot in BT_RING.iter() {
         if slot
             .state
@@ -316,13 +372,9 @@ extern "C" fn on_sigusr2(_: libc::c_int) {
             // SAFETY: write(2) of one byte from a valid buffer.
             unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
         }
-        // SAFETY: as above.
-        unsafe { *errno_location() = saved };
         return;
     }
     BT_DROPPED.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: as above.
-    unsafe { *errno_location() = saved };
 }
 
 #[cfg(target_os = "linux")]
@@ -334,10 +386,31 @@ unsafe fn errno_location() -> *mut libc::c_int {
     libc::__error()
 }
 
+/// Write all of `bytes` to `fd`, retrying on `EINTR`, `EAGAIN` and partial
+/// writes; gives up silently on any other error (the log is a diagnostic).
+fn write_all_fd(fd: libc::c_int, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        // SAFETY: write(2) from a valid buffer.
+        let r = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if r > 0 {
+            bytes = &bytes[r as usize..];
+            continue;
+        }
+        match io::Error::last_os_error().kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(1)),
+            _ => return,
+        }
+    }
+}
+
 /// Format one captured slot (on the writer thread, where allocating is fine)
-/// and write it to stderr. Frames show the module-relative address, which
-/// `addr2line -e <binary>` resolves, and the dynamic symbol when `dladdr`
-/// knows one.
+/// and write it to stderr. Frames show the module-relative address and the
+/// dynamic symbol when `dladdr` knows one. The addresses are *return*
+/// addresses (except the frame the signal interrupted): give `addr2line -e
+/// <binary>` the address minus 1 to get the call's own line. A stripped
+/// release binary (`strip = true`) has no symbols for `dladdr` to name and
+/// `addr2line` needs an unstripped build of the same commit.
 fn emit_slot(label: &str, slot: &BtSlot) -> String {
     use std::fmt::Write as _;
     let tid = slot.tid.load(Ordering::Relaxed);
@@ -379,7 +452,12 @@ fn emit_slot(label: &str, slot: &BtSlot) -> String {
 /// names (resolve with `addr2line`), not a symbolized `std::backtrace`; the
 /// unwinder takes the loader lock on glibc older than 2.35, so a thread
 /// interrupted inside `dlopen` could deadlock; bursts beyond 16 pending
-/// captures are dropped. `SIGUSR2` is used by nothing else in the daemon.
+/// captures are dropped. Static musl builds use LLVM libunwind, which does not
+/// step past the signal trampoline: measured on the static musl target, a dump
+/// holds only the handler and the trampoline (two raw frames, no names), so
+/// there the dump says a thread stalled but not where (not a regression:
+/// the old `std::backtrace` used the same unwinder). `SIGUSR2` is used by
+/// nothing else in the daemon.
 pub(crate) fn enable_backtraces(label: &'static str, tid: fn() -> u64) -> io::Result<()> {
     static INSTALLED: OnceLock<io::Result<()>> = OnceLock::new();
     BT_TID.get_or_init(|| tid);
@@ -417,25 +495,45 @@ pub(crate) fn enable_backtraces(label: &'static str, tid: fn() -> u64) -> io::Re
                 loop {
                     // SAFETY: read(2) into a valid buffer.
                     let r = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
-                    if r < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    if r == 0 {
+                        // EOF: every write end is closed, nothing more comes.
+                        write_all_fd(
+                            2,
+                            format!("=== {label}: backtrace pipe closed ===\n").as_bytes(),
+                        );
+                        return;
+                    }
+                    if r < 0 {
+                        if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        let e = io::Error::last_os_error();
+                        write_all_fd(
+                            2,
+                            format!("=== {label}: backtrace writer stops: {e} ===\n").as_bytes(),
+                        );
                         return;
                     }
                     for slot in BT_RING.iter() {
                         if slot.state.load(Ordering::Acquire) == SLOT_READY {
                             let text = emit_slot(label, slot);
+                            #[cfg(test)]
+                            {
+                                let tid = slot.tid.load(Ordering::Relaxed);
+                                let n = slot.len.load(Ordering::Relaxed);
+                                BT_DUMPS.lock().unwrap().push((tid, n));
+                            }
                             slot.state.store(SLOT_FREE, Ordering::Release);
                             #[cfg(test)]
                             BT_EMITTED.fetch_add(1, Ordering::Relaxed);
-                            // SAFETY: write(2) on stderr with a valid buffer.
-                            unsafe { libc::write(2, text.as_ptr().cast(), text.len()) };
+                            write_all_fd(2, text.as_bytes());
                         }
                     }
                     let dropped = BT_DROPPED.swap(0, Ordering::Relaxed);
                     if dropped > 0 {
                         let t =
                             format!("=== {label}: {dropped} backtrace request(s) dropped ===\n");
-                        // SAFETY: write(2) on stderr with a valid buffer.
-                        unsafe { libc::write(2, t.as_ptr().cast(), t.len()) };
+                        write_all_fd(2, t.as_bytes());
                     }
                 }
             });

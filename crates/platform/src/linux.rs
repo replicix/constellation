@@ -1057,6 +1057,14 @@ garbage line without the separator
     }
 
     /// A thread asked for its backtrace gets the signal and survives it.
+    /// Frames a dump must hold to show the walk crossed the signal frame
+    /// into the thread's code. Static musl builds (LLVM libunwind) stop at
+    /// the signal trampoline: measured, two frames (handler, trampoline).
+    #[cfg(not(target_env = "musl"))]
+    const MIN_FRAMES: usize = 4;
+    #[cfg(target_env = "musl")]
+    const MIN_FRAMES: usize = 2;
+
     #[test]
     fn a_thread_can_be_asked_for_its_backtrace() {
         let p = LinuxProcess;
@@ -1092,7 +1100,24 @@ garbage line without the separator
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        let first = crate::unix::BT_DUMPS.lock().unwrap().len();
         p.request_backtrace(thread).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let depth = loop {
+            let found = crate::unix::BT_DUMPS.lock().unwrap()[first..]
+                .iter()
+                .find(|(tid, _)| *tid == thread.tid)
+                .map(|&(_, n)| n);
+            if let Some(n) = found {
+                break n;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no dump of the parked thread"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(depth >= MIN_FRAMES, "the dump has only {depth} frames");
         done_tx.send(()).unwrap();
         // A regression that wedges the worker fails the test, not the run.
         let (joined_tx, joined_rx) = std::sync::mpsc::channel();
@@ -1114,7 +1139,9 @@ garbage line without the separator
 
     /// The handler is async-signal-safe: signalled over and over while the
     /// target thread hammers the allocator, the process survives (the old
-    /// allocating handler corrupted the heap here) and dumps are produced.
+    /// allocating handler corrupted the heap here), the handler itself
+    /// allocates nothing, and dumps of the worker's own thread reach past
+    /// the handler into its code.
     #[test]
     fn backtrace_signal_survives_a_busy_allocator() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1135,7 +1162,7 @@ garbage line without the separator
             }
         });
         let thread = rx.recv().unwrap();
-        let before = crate::unix::BT_EMITTED.load(Ordering::Relaxed);
+        let first = crate::unix::BT_DUMPS.lock().unwrap().len();
         let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut sent = 0u32;
         while std::time::Instant::now() < end {
@@ -1145,21 +1172,42 @@ garbage line without the separator
             })
             .unwrap();
             sent += 1;
+            // Fail fast: an allocating handler can deadlock the worker in
+            // `malloc`, which would hang the join below.
+            if crate::unix::BT_HANDLER_ALLOCS.load(Ordering::Relaxed) > 0 {
+                // No panic machinery: it allocates, and the worker may hold
+                // the allocator lock inside the stuck handler.
+                let msg = b"FAIL: the backtrace handler allocated\n";
+                // SAFETY: write(2) of a static buffer, then abort.
+                unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
+                std::process::abort();
+            }
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
         stop.store(true, Ordering::Relaxed);
         worker.join().unwrap();
-        // The writer thread logs asynchronously: wait for it to drain.
+        assert_eq!(
+            crate::unix::BT_HANDLER_ALLOCS.load(Ordering::Relaxed),
+            0,
+            "the handler allocated"
+        );
+        // The writer thread logs asynchronously: wait for a dump of the worker.
+        let deepest = || {
+            crate::unix::BT_DUMPS.lock().unwrap()[first..]
+                .iter()
+                .filter(|(tid, _)| *tid == thread.tid)
+                .map(|&(_, n)| n)
+                .max()
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while crate::unix::BT_EMITTED.load(Ordering::Relaxed) == before
-            && std::time::Instant::now() < deadline
-        {
+        while deepest().is_none() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(sent > 100, "only {sent} signals sent");
+        let n = deepest().expect("no dump of the worker's own thread");
         assert!(
-            crate::unix::BT_EMITTED.load(Ordering::Relaxed) > before,
-            "no dump was produced"
+            n >= MIN_FRAMES,
+            "the dump has only {n} frames: the walk stopped early"
         );
     }
 
