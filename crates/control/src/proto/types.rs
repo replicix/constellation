@@ -398,7 +398,9 @@ pub struct DelegationReport {
     pub delegated: u64,
     pub appended_txs: u64,
     pub stream_refusals: u64,
-    pub deps_unsatisfied_at_append: u64,
+    /// Batches the root refused for lacking their deps: legitimate only
+    /// at a root that was deposed without knowing it.
+    pub deps_refused: u64,
     pub cross_subtree: u64,
     pub recalls_sent: u64,
     pub recalls_drained: u64,

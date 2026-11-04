@@ -43012,9 +43012,8 @@ mod recall_cut {
     }
 
     /// A root that lacks a batch's deps refuses it and appends nothing: a
-    /// refusal (`deleg_deps_refused`), not a causal cut
-    /// (`deleg_deps_unsatisfied_at_append`, a row appended ahead of its
-    /// cause). `long-delegated-late-answers` seed 4947: the oracle counted
+    /// refusal (`deleg_deps_refused`), never a row appended ahead of its
+    /// cause. `long-delegated-late-answers` seed 4947: the oracle counted
     /// the refusal of a deposed root as a violation.
     #[test]
     fn a_batch_whose_deps_the_root_lacks_is_refused_not_appended_ahead() {
@@ -43088,13 +43087,9 @@ mod recall_cut {
             },
         });
         assert_eq!(
-            (
-                h.core.dl.gens[&8].cursor,
-                h.core.stats.deleg_deps_refused,
-                h.core.stats.deleg_deps_unsatisfied_at_append
-            ),
-            (0, 1, 0),
-            "(cursor of generation 8, refused, appended ahead of deps)"
+            (h.core.dl.gens[&8].cursor, h.core.stats.deleg_deps_refused),
+            (0, 1),
+            "(cursor of generation 8, refused)"
         );
     }
 }

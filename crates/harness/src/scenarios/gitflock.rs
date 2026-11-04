@@ -2853,7 +2853,7 @@ fn workload(
                     n(d, "streamed_txs"),
                     n(d, "deps_waits"),
                     n(d, "appended_txs"),
-                    n(d, "deps_unsatisfied_at_append"),
+                    n(d, "deps_refused"),
                     n(d, "exec_parked"),
                     n(se, "reads"),
                     n(se, "waited"),

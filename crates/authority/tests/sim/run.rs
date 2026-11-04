@@ -732,6 +732,10 @@ pub struct SimConfig {
     /// fast path ignores `Core::ack_gated`, so a holder answers its own op
     /// from its local disk while a backup is committed.
     pub plant_ungated_fast_path: bool,
+    /// Negative control for the causal-cut oracle: delegates do not wait for
+    /// an op's deps (`Config::skip_deleg_dep_wait`), so one executes ahead
+    /// of its cause and the root that is current refuses its batch.
+    pub skip_deleg_dep_wait: bool,
     /// Plan 43 C1-3 (§5.8, Q1): the operator abandons the group a claim has
     /// waited for this long (simulated ms), as `constellation repair
     /// abandon-group --epoch E` does (`Control::AbandonGroup` on the node
@@ -1054,6 +1058,7 @@ impl Default for SimConfig {
             strict_lease_claims: true,
             rebuild_stub: false,
             plant_ungated_fast_path: false,
+            skip_deleg_dep_wait: false,
             plant_claim_root_group_on_lone: false,
             abandon_after_ms: None,
             await_dead_delegates: false,
@@ -4162,6 +4167,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         oracles: oracles.clone(),
         rebuild_stub: cfg.rebuild_stub,
         plant_ungated_fast_path: cfg.plant_ungated_fast_path,
+        skip_deleg_dep_wait: cfg.skip_deleg_dep_wait,
         plant_claim_root_group_on_lone: cfg.plant_claim_root_group_on_lone,
     };
     env.world
@@ -5397,9 +5403,12 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 stats.deleg_lost_after_ack, report.stats
             ));
         }
-        if let Some(why) = causal_cut_violation(*id, stats) {
-            return Err(format!("{why}\n  stats: {:#?}", report.stats));
-        }
+    }
+    // The causal cut: a refusal for lacking deps at the current root (see
+    // `Oracles::note_deps_refused`; a deposed root's refusal is no
+    // violation, `long-delegated-late-answers` seed 4947).
+    if let Some(why) = oracles.causal_cut.lock().unwrap().first() {
+        return Err(format!("causal cut: {why}\n  stats: {:#?}", report.stats));
     }
     if report.marker_violations > 0 {
         return Err(format!(
@@ -6334,23 +6343,6 @@ impl tracing_subscriber::fmt::time::FormatTime for SimTime {
     }
 }
 
-/// The causal cut, judged on what a root appended: a delegate's row that
-/// landed in its log ahead of a dependency it lacked. A batch the root
-/// *refused* for lacking its deps (`deleg_deps_refused`: a root deposed
-/// without knowing it, to which the delegate re-streamed) appended nothing
-/// and is no violation (`long-delegated-late-answers` seed 4947).
-fn causal_cut_violation(
-    id: NodeId,
-    stats: &constellation_authority::core::Stats,
-) -> Option<String> {
-    (stats.deleg_deps_unsatisfied_at_append > 0).then(|| {
-        format!(
-            "node {id} appended {} delegate batches whose deps it lacked (causal cut)",
-            stats.deleg_deps_unsatisfied_at_append
-        )
-    })
-}
-
 #[cfg(test)]
 mod exec_identity_tests {
     use super::*;
@@ -6506,18 +6498,5 @@ mod exec_identity_tests {
             &[],
         );
         assert!(exec_identity(&norow).is_empty());
-    }
-
-    /// A refusal is not a violation; a row appended ahead of its cause is.
-    #[test]
-    fn a_refused_batch_is_no_causal_cut_but_a_row_ahead_of_its_cause_is() {
-        let mut stats = constellation_authority::core::Stats {
-            deleg_deps_refused: 3,
-            ..Default::default()
-        };
-        assert_eq!(causal_cut_violation(1, &stats), None);
-        stats.deleg_deps_unsatisfied_at_append = 1;
-        let why = causal_cut_violation(1, &stats).expect("a violation");
-        assert!(why.contains("causal cut"), "{why}");
     }
 }

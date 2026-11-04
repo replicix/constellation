@@ -65,7 +65,7 @@ pub(super) fn print_deleg(scenario: &str, who: &str, d: &serde_json::Value) {
         n(d, "delegated"),
         n(d, "appended_txs"),
         n(d, "stream_refusals"),
-        n(d, "deps_unsatisfied_at_append"),
+        n(d, "deps_refused"),
         n(d, "cross_subtree"),
         n(d, "recalls_sent"),
         n(d, "recalls_drained"),
@@ -630,8 +630,9 @@ pub fn delegated_subtrees(_seed: u64) -> Result<()> {
             "the root appended too few stream transactions: {da}"
         );
         anyhow::ensure!(
-            n(&da, "deps_unsatisfied_at_append") == 0,
-            "the root appended a batch whose deps it lacked: {da}"
+            n(&da, "deps_refused") == 0,
+            "the root (never deposed here) refused a delegate batch for lacking its deps, \
+             a row executed ahead of its cause: {da}"
         );
         anyhow::ensure!(
             n(&da, "recalls_sent") == 0 && n(&da, "ended") == 0,
@@ -810,8 +811,9 @@ pub fn cross_subtree_rename(_seed: u64) -> Result<()> {
         );
         anyhow::ensure!(n(&da, "ended") >= 2, "both generations must end: {da}");
         anyhow::ensure!(
-            n(&da, "deps_unsatisfied_at_append") == 0,
-            "the root appended a batch whose deps it lacked: {da}"
+            n(&da, "deps_refused") == 0,
+            "the root (never deposed here) refused a delegate batch for lacking its deps, \
+             a row executed ahead of its cause: {da}"
         );
         let mut all: Vec<String> = names_b
             .iter()
@@ -1137,8 +1139,9 @@ pub fn marker_order(_seed: u64) -> Result<()> {
             "too little traffic: {pairs} pairs, {checks} checks"
         );
         anyhow::ensure!(
-            n(&da, "deps_unsatisfied_at_append") == 0,
-            "the root appended a batch whose deps it lacked: {da}"
+            n(&da, "deps_refused") == 0,
+            "the root (never deposed here) refused a delegate batch for lacking its deps, \
+             a row executed ahead of its cause: {da}"
         );
         ensure_no_conflicts(&[a, b, c])?;
         Ok(())

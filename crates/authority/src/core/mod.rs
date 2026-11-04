@@ -125,6 +125,11 @@ pub struct Config {
     /// left nobody who could hold it, and every write waited out its
     /// deadline (`InDoubt`, `EIO`).
     pub single_writer: bool,
+    /// Fault injection for the simulation's negative control (never set by
+    /// the engine): a delegate does not wait for an op's `deps` before it
+    /// executes (`delegate.rs`, the model's rule 1), so it can answer ahead
+    /// of its cause. The causal-cut oracle must then fail the run.
+    pub skip_deleg_dep_wait: bool,
     pub ttl_ms: u64,
     /// `lease::EXPIRY_MARGIN_MS`: a lease is usable only with this much
     /// left.
@@ -648,6 +653,7 @@ impl Config {
             clock_rate_budget_ppm: 1_000,
             partition: constellation_store_s3::log::PARTITION.to_string(),
             single_writer: false,
+            skip_deleg_dep_wait: false,
             ttl_ms,
             expiry_margin_ms: 1_000,
             idle_release_ms: 30_000,
@@ -1109,15 +1115,19 @@ pub struct Stats {
     pub deleg_grants_lost: u64,
     pub deleg_recalls_received: u64,
     /// Root: delegations written, transactions appended, batches
-    /// refused, appends whose `deps` were not here (the causal-cut
-    /// assertion), cross-subtree ops, recalls sent / drained / expired,
+    /// refused, batches refused for lacking their `deps` (the causal-cut
+    /// assertion, below), cross-subtree ops, recalls sent / drained / expired,
     /// unrenewed grants reclaimed, generations ended.
     pub deleg_delegated: u64,
     pub deleg_appended_txs: u64,
     pub deleg_stream_refusals: u64,
-    pub deleg_deps_unsatisfied_at_append: u64,
     /// Batches the root refused because its replica lacks their deps:
-    /// nothing was appended (a deposed root the delegate re-streamed to).
+    /// nothing was appended. A delegate waited for them before executing, so
+    /// this is legitimate only at a root that was deposed without knowing it
+    /// (the delegate re-streamed to the new root): at the current root it is
+    /// a row executed ahead of its cause. Core cannot tell the two; the
+    /// simulation judges it against the lease history (`sim/oracle.rs`), a
+    /// harness scenario with no deposition asserts it zero.
     pub deleg_deps_refused: u64,
     pub deleg_cross_subtree: u64,
     pub deleg_recalls_sent: u64,

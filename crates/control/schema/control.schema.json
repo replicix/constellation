@@ -1569,7 +1569,7 @@
           "minimum": 0,
           "type": "integer"
         },
-        "deps_unsatisfied_at_append": {
+        "deps_refused": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -2132,7 +2132,7 @@
         "delegated",
         "appended_txs",
         "stream_refusals",
-        "deps_unsatisfied_at_append",
+        "deps_refused",
         "cross_subtree",
         "recalls_sent",
         "recalls_drained",

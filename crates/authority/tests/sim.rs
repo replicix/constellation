@@ -8768,6 +8768,32 @@ fn regression_a_deposed_roots_refusal_is_no_causal_cut_seed_4947() {
     });
 }
 
+/// Checker strength for the causal cut: with the delegate's dependency wait
+/// skipped (`SimConfig::skip_deleg_dep_wait`, the deleted mechanism back) a
+/// delegate executes ahead of its cause and the current root refuses its
+/// batch, which the oracle must fail; the same seeds pass without the knob.
+#[test]
+fn the_causal_cut_oracle_catches_a_delegate_that_skips_its_dependency_wait() {
+    let mut caught = 0usize;
+    for seed in 0..CAUSAL_CUT_SEEDS {
+        let knob = SimConfig {
+            skip_deleg_dep_wait: true,
+            ..long_delegated_late_answers_config()
+        };
+        if let Err(e) = run_seed(seed, knob) {
+            if e.contains("causal cut:") {
+                caught += 1;
+            }
+        }
+    }
+    assert!(
+        caught >= 1,
+        "no seed of {CAUSAL_CUT_SEEDS} failed the causal cut with the dependency wait skipped"
+    );
+}
+
+const CAUSAL_CUT_SEEDS: u64 = 40;
+
 /// Oracle false positive, pinned: seed 1525 of `delegated-group-switch` with
 /// slow lease reads (`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`). The sim's own
 /// resubmission of an in-doubt rid that never ran landed after a later op,

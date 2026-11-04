@@ -436,6 +436,8 @@ pub struct NodeEnv {
     pub rebuild_stub: bool,
     /// See `SimConfig::plant_ungated_fast_path`.
     pub plant_ungated_fast_path: bool,
+    /// See `SimConfig::skip_deleg_dep_wait`.
+    pub skip_deleg_dep_wait: bool,
     /// See `SimConfig::plant_claim_root_group_on_lone`.
     pub plant_claim_root_group_on_lone: bool,
 }
@@ -709,6 +711,7 @@ impl NodeHandle {
         }
         env.world.register(id, meta.clone());
         let mut cfg = (env.config)(id, incarnation);
+        cfg.skip_deleg_dep_wait = env.skip_deleg_dep_wait;
         // Plan 43 C2g: the simulation's settle window scales with its lease
         // TTL as production's does (half a TTL: 30 s of 60 s), unless a
         // configuration sets one (`sim_core_config` leaves it unset), and is
@@ -779,6 +782,7 @@ impl NodeHandle {
             freeze_handed: (0, 0),
             own_lapse: None,
             unsettled_seen: 0,
+            deps_refused_seen: 0,
             deleg_sig: Mutex::new(Vec::new()),
             deadline_armed: HashMap::new(),
             step_timer: None,
@@ -1075,6 +1079,8 @@ struct Driver {
     /// Plan 46 M0.3: the unsettled `EIO`s of this incarnation's core
     /// (`Stats::client_unsettled_eio`) already classified.
     unsettled_seen: u64,
+    /// `Stats::deleg_deps_refused` already judged (the causal-cut oracle).
+    deps_refused_seen: u64,
     /// The generations the last delegation table kept was taken at.
     deleg_sig: Mutex<GensSig>,
     /// Plan 46 M0.3: when each client-deadline timer was armed (true ms),
@@ -2115,6 +2121,18 @@ impl Driver {
                 _ => None,
             };
             let actions = self.core.handle(now, event, &*self.meta);
+            {
+                let refused = self.core.stats.deleg_deps_refused;
+                if refused > self.deps_refused_seen {
+                    self.oracles.note_deps_refused(
+                        self.id,
+                        self.core.lease().epoch(),
+                        refused - self.deps_refused_seen,
+                        now.wall.0,
+                    );
+                    self.deps_refused_seen = refused;
+                }
+            }
             if debug && (debug_event.contains("Lock") || lock_timer.is_some()) {
                 let debug_event = match &lock_timer {
                     Some(k) => format!("{debug_event} ({k})"),

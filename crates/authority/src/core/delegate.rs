@@ -1745,7 +1745,7 @@ impl Core {
             .get(&gen)
             .is_some_and(|d| now.honour < d.until || d.designated);
         // The model's rule 1: the delegate waits for `deps` too.
-        let reaches = settle || replica.reaches(&deps);
+        let reaches = settle || self.cfg.skip_deleg_dep_wait || replica.reaches(&deps);
         // Phase 2b (M8): the read delegations this delegate granted on
         // what the op touches are recalled first.
         let recalling = !settle
@@ -7786,12 +7786,10 @@ impl Core {
             }
             match replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps) {
                 Ok(_) => {
-                    // The causal cut, judged on the log: the row is in it,
-                    // and a replica that does not reach its deps now
-                    // appended it ahead of its cause.
-                    if !replica.reaches_streams(&tx.deps) {
-                        self.stats.deleg_deps_unsatisfied_at_append += 1;
-                    }
+                    // (No causal-cut check here: `reaches_streams` held
+                    // above and only rises, so a check after the append
+                    // could never fire. The cut is judged on the refusals:
+                    // see `deleg_deps_refused`.)
                     replica.note_foreign_executed(&tx.records);
                     cursor = tx.idx;
                     appended += 1;

@@ -83,6 +83,12 @@ pub struct Oracles {
     pub reach: Arc<super::reach::Reach>,
     pub ops: Mutex<HashMap<Rid, constellation_meta::MutateOp>>,
     pub unsettled: Mutex<Vec<Unsettled>>,
+    /// The causal cut (plan 30 M11): a delegate waited for an op's deps
+    /// before executing, so a root refuses a stream batch for lacking them
+    /// only when it was deposed without knowing it. Each refusal at the
+    /// *current* root (the one holding the highest lease epoch written) is
+    /// a delegate that executed ahead of its cause.
+    pub causal_cut: Mutex<Vec<String>>,
     /// The delegation table as the lease holder had it, each time it changed
     /// (`(at_ms, holder, table)`): the generation history (install, recall,
     /// end) that decides who owns an op's keys at each instant.
@@ -273,6 +279,20 @@ impl LoneLead {
 }
 
 impl Oracles {
+    /// `node` refused delegate batches for lacking their deps (the rise of
+    /// `Stats::deleg_deps_refused` over one step), holding lease epoch
+    /// `epoch` (`None`: no lease). A violation when that is the highest
+    /// epoch written; a deposed root's refusal is not.
+    pub fn note_deps_refused(&self, node: NodeId, epoch: Option<u64>, refused: u64, now_ms: i64) {
+        let highest = self.leases.max_epoch.load(Ordering::SeqCst);
+        if refused > 0 && epoch.is_some_and(|e| e == highest) {
+            self.causal_cut.lock().unwrap().push(format!(
+                "node {node}, the current root (lease epoch {highest}), refused {refused} delegate \
+                 batch(es) for lacking their deps at {now_ms} ms: a delegate executed ahead of its cause"
+            ));
+        }
+    }
+
     pub fn new(bucket: Arc<Bucket>) -> Arc<Self> {
         let leases = Arc::new(LeaseClaims::default());
         let reach = bucket.reach();
@@ -297,6 +317,7 @@ impl Oracles {
             reach,
             ops: Mutex::new(HashMap::new()),
             unsettled: Mutex::new(Vec::new()),
+            causal_cut: Mutex::new(Vec::new()),
             tables: Mutex::new(Vec::new()),
             bucket,
             stores: Mutex::new(BTreeMap::new()),
@@ -1976,6 +1997,10 @@ pub struct LeaseClaims {
     /// All permitted claims of an unreleased foreign lease.
     pub permitted_claims: AtomicU64,
     pub violations: Mutex<Vec<String>>,
+    /// The highest lease epoch any CAS has written so far: a node whose
+    /// core holds this epoch is the current root, any other one is deposed
+    /// (or never was).
+    pub max_epoch: AtomicU64,
 }
 
 impl LeaseClaims {
@@ -2012,6 +2037,7 @@ impl LeaseClaims {
 
     /// A lease CAS landed in the bucket (called with the body it replaced).
     pub fn landed(&self, node: NodeId, prev: Option<Lease>, new: Lease) {
+        self.max_epoch.fetch_max(new.epoch, Ordering::SeqCst);
         let Some(prev) = prev else { return };
         // A claim: another node, the next epoch, on a lease that was held
         // and neither released nor fenced.
@@ -2097,6 +2123,22 @@ mod tests {
             incarnation: 1,
             seq,
         }
+    }
+
+    /// A refusal for lacking deps is a violation at the root that holds the
+    /// highest lease epoch written, and none at a deposed one (seed 4947).
+    #[test]
+    fn a_deps_refusal_is_judged_only_at_the_current_root() {
+        let o = Oracles::new(Bucket::new(1, (0, 0)));
+        o.leases.max_epoch.store(5, Ordering::SeqCst);
+        // Deposed (epoch 4 of 5), no lease, no refusal: not judged.
+        o.note_deps_refused(1, Some(4), 2, 100);
+        o.note_deps_refused(2, None, 2, 100);
+        o.note_deps_refused(3, Some(5), 0, 100);
+        assert!(o.causal_cut.lock().unwrap().is_empty());
+        // The current root: judged.
+        o.note_deps_refused(3, Some(5), 1, 200);
+        assert_eq!(o.causal_cut.lock().unwrap().len(), 1);
     }
 
     fn seg(epoch: u64, rids: &[Rid]) -> Segment {

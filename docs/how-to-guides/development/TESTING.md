@@ -2353,8 +2353,8 @@ relay of its own so requests can be attributed per role):
     delegated to `b` and `d2` to `c` (`delegate` on the root's control
     socket). Each node's writes into its subtree are executed by the
     delegate and appended by the root; everything converges on every
-    node; the root never appends a stream batch whose deps it lacks
-    (`deps_unsatisfied_at_append` is 0); same-subtree writes recall
+    node; the root, never deposed here, refuses no stream batch for
+    lacking its deps (`deps_refused` is 0); same-subtree writes recall
     nothing; the delegates make no S3 request for their writes; the
     root's segment PUTs do not grow. Prints each node's write latency on
     its delegated subtree against the same node's forwarded writes

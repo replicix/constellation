@@ -559,7 +559,7 @@ impl EngineControl {
                     delegated: stats.deleg_delegated,
                     appended_txs: stats.deleg_appended_txs,
                     stream_refusals: stats.deleg_stream_refusals,
-                    deps_unsatisfied_at_append: stats.deleg_deps_unsatisfied_at_append,
+                    deps_refused: stats.deleg_deps_refused,
                     cross_subtree: stats.deleg_cross_subtree,
                     recalls_sent: stats.deleg_recalls_sent,
                     recalls_drained: stats.deleg_recalls_drained,
