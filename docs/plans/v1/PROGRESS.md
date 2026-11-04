@@ -64458,9 +64458,9 @@ kept a name the log removed and it then served, executed against and committed t
 at 25"; main's 6183, 7393, 5718 and 9955 the same class, `[directory]` or the log prefix). It is closed (superseded: PROGRESS
 "L1"; the cause is the stream install, not the segment apply). The first measurement's seeds, `long-delegated-late-answers` 952,
 1324 and 1495, are the same class seen through the history checker, and they pass on the fix's tree. 3228 and 7393 (no knob)
-pass with L1 fixed, and 4125 (knob, a monotonic-reads violation on the stale `d1/f1`) is not L1: it stays a separate finding,
-pinned by the ignored `delegated_settle_findings_4125_monotonic_reads_on_a_stale_name` (its own start: whether the root's
-`Create d1/f1` is among the oracle's successes).
+pass with L1 fixed, and 4125 (knob, a monotonic-reads violation on the stale `d1/f1`) is not L1: it was an oracle gap in the
+session checker's refusal window, closed (PROGRESS, "Oracle: a refusal's window binds only its scope and its own node's"), and
+is pinned by `lda_4125_a_refusal_is_ordered_only_within_its_owner`.
 
 The other class the first measurement showed is **L2**, I2 on a stranded replay against the requester's re-ask (`placement-hot`
 655 with the knob; main's 8557 with the knob, `one_identity_per_op`): a delegate or the root accepted an op in one epoch, a
@@ -64611,15 +64611,17 @@ on the fix, 3.84 / 3.87 / 3.88 s on main. No existing bench covers it; the cost 
 
 ### Not L1
 
-`long-delegated-late-answers` 4125 on the settle-fix tree (monotonic reads): its recall segments carry own rows *below* the
-confirmed streamed rows and the fix does not change it. Tracked on its own. 4947 and 9610 above stay open as before.
+`long-delegated-late-answers` 4125 on the settle-fix tree (monotonic reads): the fix does not change it. It is not a replica
+ordering bug either (the first reading, that its recall segments carry own rows *below* the confirmed streamed rows, was not it):
+it was an oracle gap in the session checker's refusal window, closed in `session.rs` (PROGRESS, "Oracle: a refusal's window binds
+only its scope and its own node's"). 4947 and 9610 above stay open as before.
 
 ### Gates
 
 On the rebased tree (5adad3a4 plus the fix): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`
 clean. meta (all suites) ok, lib 381 passed, 9 ignored; authority lib 956 passed, 2 ignored; release sim suite 353 passed, 0 failed,
 13 ignored (the M0.3 ratchet `m03_the_configurations_without_an_unsettled_eio_run_strict` unchanged, no ceiling touched).
-`--ignored delegated_settle_findings_4125` still fails (not L1). On 055de5f1, before the rebase: meta 561 passed (lib 383),
+`--ignored delegated_settle_findings_4125` still fails (not L1; an oracle gap, closed later). On 055de5f1, before the rebase: meta 561 passed (lib 383),
 authority lib 938, engine 947, control 146, harness lib 165, sim suite 351 passed, 12 ignored.
 
 ## Oracle I1: the delegate's lone test, the root's answer from its own append, a delegate's batch to a restarted root (classes B, C, D; 2026-11-02; plan 43 section 4)
@@ -65186,3 +65188,67 @@ the new counter gives their numbers (above: `long-delegated-late-answers` knob 2
 
 `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean; meta (all targets; lib 387, `holder_capture` 32),
 authority lib 1,004, engine 948, all 0 failed; sim suite (release) 359 passed, 0 failed, 13 ignored (358 on main plus the pin). Re-run after the follow-ups: meta `holder_capture` 33 (two new L2 tests, both fail before), the rest unchanged.
+
+## Oracle: a refusal's window binds only its scope and its own node's (2026-11-04; plan 46 M0.3 finding 4125)
+
+`long-delegated-late-answers` 4125 with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` failed the session checker on 3d716e12 and earlier
+(`monotonic_reads`: node 2 read `d1/f1` present at tick 140 after observing a later state). It was an oracle gap, not a product bug,
+and no DESIGN, ADR or cto-modes text changes: the read is allowed by DESIGN §6 (a node never answers from a state older than one its
+clients saw) and by the order across owners that ADR-23 gives (causal, through `deps`, not real time).
+
+### Mechanism
+
+Node 3, the delegate of `d2`, acknowledged `create d2/f2` (tick 104) and `unlink d2/f2` (tick 126) once its group held the rows; the
+root, answering delegate batches late in this configuration, appended them afterwards (log seq 26). Node 2's `unlink d1/f1`, invoked at
+tick 132, was refused `ENOENT` by the root at log state 30. The root then ran its own `create d1/f1` (state 31) and appended node 3's
+`d2` rows. Node 2's next read answered from a replica at state 31 or later: present. Absent at state 30, then present at state 31 is
+monotonic. `check_sessions` had placed the refusal after every success that returned before the refusal was invoked, in any directory
+and from any node, and node 3's `unlink d2/f2` (log index 32) returned at tick 126: the window began at index 33, the first state
+refusing `ENOENT` was 34, and no later state had `d1/f1` present. That treats the log as a real-time order across owners. Under
+delegation it orders keys of different owners only causally; the linearizability check already projects per directory (per hash range
+with `check_range_bits`, `run.rs`), and across directories the checks only keep one node's program order (`check_session_order`).
+
+### Rule
+
+`session::Scope { Global, Dir, Range(bits) }`, passed from `run.rs` to match the linearizability projection (`Global` without `dirs`,
+`Dir` with `dirs`, `Range(bits)` with `check_range_bits`; the range test is `history::range_idx_of`, which `project_range` uses too). A
+refusal's lower bound binds only the successes (not tentative, returned before the refusal was invoked) that are on a name of the
+refused name's scope (a rename or exchange binds in every scope it touches, as `project_dir` projects it), and the refusing node's own
+successes in any directory (its program order, which a forward's `deps` make the sequencer wait for). The refusal's upper bound, the
+causal floors and the state order are unchanged. The unit test `a_refusal_is_not_placed_after_another_owners_earlier_success` runs the
+shape under `Dir` (accepted: this is what fails on the old window), under `Global` (still `monotonic_reads`), with the earlier success
+in the refusal's own directory and with the refusing node's own earlier success in another directory (both still `monotonic_reads`).
+
+### Why main no longer shows it
+
+02260859 (a root does not answer its own forwarded op from its unshipped append of a delegate's row) moved the schedule: 4125 passes on
+main with and without this change, and no seed of `long-delegated-late-answers` 0..10,000 fails the session checker on main, so the sim
+cannot show the gap on main. The unit test is the fail-before. The seed stays as a regression seed
+(`lda_4125_a_refusal_is_ordered_only_within_its_owner`, no longer ignored). On 3d716e12 it fails on the old window and passes with
+this change (re-checked here: `--ignored --exact delegated_settle_findings_4125_monotonic_reads_on_a_stale_name`, which has the old name
+there; the investigation's 10,000-seed pair on that tree: no knob 4947 / 4947, knob 4125 / none).
+
+### Sweeps (box 1, release; main f188c707 against main plus this change; seeds 0..10,000 for the first two configurations, 0..2,000 for the rest; no knob / knob)
+
+Failing seeds, identical on both trees in every cell (none of them a session-checker failure; no seed is newly accepted by the scope on
+main):
+
+| config | no knob | knob |
+|---|---|---|
+| `long-delegated-late-answers` | 4947 (causal cut), 5343 (no quiescence) | 5839 (marker without its data) |
+| `delegated-group-switch` | none | 1525 (I4 late landing) |
+| `long-delegated`, `placement-hot`, `long-delegated-backup`, `delegated-backup`, `delegated-holder-cut`, `shared-dir-ranges`, `delegated-two-gens-root-crash`, `delegated-no-backup-root-near` | none | none |
+
+### Open: two lenient leftovers
+
+- **Cross-owner `hi`.** The refusal's upper bound (`session.rs`) and the read's upper bound still bind by every success invoked after the
+  return, across owners. A cross-owner success at a log index below the true evaluation point makes `hi` too low, and the observation
+  is then dropped or a causal range cut. That is lenient (it adds no false violation, but can hide a real one). Scoping `hi` the same
+  way makes the checker stricter: its own commit and sweep, with every new failing seed triaged first.
+- **Raw log order.** `check_sessions` orders successes by raw log position, where the linearizability and session-order checks use
+  `witness_order` (a tenure's run in journal order). In 4125 the two agree. Aligning them is a separate consistency item.
+
+### Gates
+
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean; sim suite (release) 361 passed, 0 failed,
+12 ignored (359 passed and 13 ignored on main, plus the unit test, plus the un-ignored seed); the three session unit tests pass.
