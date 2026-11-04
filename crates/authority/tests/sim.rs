@@ -8783,9 +8783,17 @@ fn the_causal_cut_oracle_catches_a_delegate_that_skips_its_dependency_wait() {
         if let Err(e) = run_seed(seed, knob) {
             if e.contains("causal cut:") {
                 caught += 1;
+                // The same seed without the knob is clean of it.
+                if let Err(e) = run_seed(seed, long_delegated_late_answers_config()) {
+                    assert!(
+                        !e.contains("causal cut:"),
+                        "seed {seed} fails the causal cut without the knob: {e}"
+                    );
+                }
             }
         }
     }
+    eprintln!("causal cut caught on {caught} of {CAUSAL_CUT_SEEDS} seeds");
     assert!(
         caught >= 1,
         "no seed of {CAUSAL_CUT_SEEDS} failed the causal cut with the dependency wait skipped"
