@@ -482,6 +482,19 @@ impl Meta {
         // this store holds after the commit (the reset's kept streamed
         // entries are on it).
         let side_table = crate::delegation::read_table_tx(&side_snap, side)?;
+        // The table row above was copied without `write_table_tx`: raise the
+        // fast path's flag before the commit (a reader that sees it clear is
+        // one the commit has not reached) when the rebuilt table, with the
+        // kept entries on it, names a delegation. Raised only: a stale
+        // `true` costs the slow path, and lowering it needs the grant's
+        // gate, taken before a write transaction (`local.rs`), which this
+        // one holds. (A rebuilt-onto table with live delegations on a node
+        // whose old table was empty left it false: the root's fast path and
+        // `read_delegated` then skipped the ownership check.)
+        if !crate::delegation::read_table_tx(&tx, self)?.is_empty() {
+            self.deleg_any
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         tx.commit()?;
         let _ = self.refresh_member_copy_flag();
         self.usage_tracker()
