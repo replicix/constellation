@@ -65209,15 +65209,26 @@ real-time order across owners; under delegation the log orders keys of different
 
 ### Rule
 
-A refusal the sequencer journaled is evaluated at the state its `Refused` row follows. `check.rs` records the first `ENOENT`/`EEXIST`
-`Refused` row of every rid in an applied (unfenced) segment (`Oracle::refused_at`, the coordinates of `completed_at`), and
-`check_sessions` places the refusal at state k = the number of successes logged before that row, capped by the successes invoked after
-the refusal returned (an answered refusal was not evaluated after an op that did not exist yet). That binds in every scope, however late
-the row was appended, and replaces the window for every journaled refusal; in 4125 the row gives state 30 and the seed is accepted.
-Rows with another code (a frozen epoch's `EROFS`, an abandoned rid) are not recorded: the client retried those ops, so they are not the
-outcome it saw.
+A refusal the sequencer journaled is evaluated at the state its `Refused` row follows, and its reply carries that position (cto-modes
+"Positions"). `check.rs` records the first `ENOENT`/`EEXIST` `Refused` row of every rid in an applied (unfenced) segment, with its code
+(`Oracle::refused_at`, the coordinates of `completed_at`). `check_sessions` places the refusal at state k = the number of successes
+logged before that row, uncapped: no real-time cut applies, not even the first success invoked after the refusal returned, because a
+delegate's row that the root appends late can follow root ops invoked after the refusal returned (a cap there moved k below the row and
+hid a stale read: unit test `a_late_row_is_not_cut_by_a_success_invoked_after_the_refusal_returned`, which fails with the cap). The causal
+floors take `hi.max(k)`. The row is used only when its code is the client's return and the refused name shows what the refusal says at
+the state the row follows; otherwise the window decides. Rows with other codes (a frozen epoch's `EROFS`, an abandoned rid) are final
+outcomes too, but the session check does not judge those returns and no namespace state explains them, so they are not recorded.
 
-A refusal with no applied `Refused` row (answered without journaling, or journaled in a fenced segment) keeps the scoped window of the
+That is exact when the row is where the refusal was evaluated, which holds for a refusal the sequencer answers. It does not for an inbox
+or local answer (plan 30 M13), which is evaluated against the requester's replica and journaled later: its row can follow successes it
+did not see, and the name can be in the opposite state there (`drop-held-chain-backed` 132, `flex-backup` 1208, `metered-shared` 1210,
+`flex-crash` 61: a `Rename` refused `ENOENT` on a name that the log shows present at its row). The first cut of this change reported
+that as a violation; the linearizability check accepts these histories (it runs first), so the row is simply not their evaluation point,
+and the window decides. If such a row agrees with the refusal by accident the row path still places it there, which can be later than
+the evaluation; no false violation has shown in the suite or the sweeps, and the unit test for the disagreement shows what the check
+would have said with the row alone.
+
+A refusal with no usable row (answered without journaling, journaled in a fenced segment, another code, or a state that does not show it) keeps the scoped window of the
 first version of this fix: `session::Scope { Global, Dir, Range(bits) }` (`Global` without `dirs`, `Dir` with `dirs`, `Range(bits)` with
 `check_range_bits`; the range test is `history::range_idx_of`, which `project_range` uses too). The lower bound binds the successes (not
 tentative, returned before the refusal was invoked) on a name of the refused name's scope, and the refusing node's own successes in
@@ -65236,9 +65247,144 @@ but not returned, node 5's `create d3/y` (log 2) returned, node 2's `unlink d1/f
 
 Unit tests (`session.rs`): `a_journaled_refusal_is_placed_at_its_row` (the 4125 shape with the row before the other owner's late
 success is accepted in every scope; the row after it is `monotonic_reads` in every scope; a row for another rid leaves the window,
-which accepts), `a_refusal_row_after_another_directorys_success_binds_the_read` (the case above: accepted on the window alone,
-`monotonic_reads` with the row), and `an_unjournaled_refusal_is_not_placed_after_another_owners_earlier_success` (the window per scope,
-as in the first version). The first two fail with the row path disabled (the window alone).
+which accepts), `a_refusal_row_after_another_directorys_success_binds_the_read` (the review's case: accepted on the window alone,
+`monotonic_reads` with the row), `a_late_row_is_not_cut_by_a_success_invoked_after_the_refusal_returned` (a delegate's `unlink d2/f`
+refused `ENOENT`, its row appended behind a root op invoked after the refusal returned: `monotonic_reads` in every scope, accepted with
+the row before the delegate's ops), `a_row_that_disagrees_with_its_refusal_falls_back_to_the_window` (a row at a state showing the
+name present, or with another code, is not used and the disagreement is counted) and
+`an_unjournaled_refusal_is_not_placed_after_another_owners_earlier_success` (the window per scope, as in the first version). The first
+two fail with the row path disabled (the window alone); the late-row one fails with the row capped at `hi` (its refusal and the
+delegate's ops share a directory, so the window finds it too).
+
+### Why main no longer shows it
+
+02260859 (a root does not answer its own forwarded op from its unshipped append of a delegate's row) moved the schedule: 4125 passes on
+main with and without this change, and no seed of `long-delegated-late-answers` 0..10,000 fails the session checker on main, so the sim
+cannot show the gap on main. The unit tests are the fail-before. The seed stays as a regression seed (`lda_4125_slow_lease_reads_seed`,
+no longer ignored; it guards nothing about the oracle by itself). On 3d716e12 it fails on the old window and passes with the final
+oracle (re-checked here: `--ignored --exact delegated_settle_findings_4125_monotonic_reads_on_a_stale_name`, which has the old name
+there; the investigation's 10,000-seed pair on that tree: no knob 4947 / 4947, knob 4125 / none).
+
+### How many refusals take which path
+
+In the delegated configurations every refusal the checker places took the row path, none the window, and the row never disagreed. Over
+300 seeds each, no knob / knob: `long-delegated-late-answers` 10,479 / 10,447 placed at their row, `long-delegated` 10,700 / 10,735,
+`placement-hot` 28,866 / 28,656, `shared-dir-ranges` 12,201 / 12,159, `delegated-backup` 7,125 / 7,142; `session_guarantees_hold` (60 seeds
+each): 1,092 p2p, 1,062 inbox, none by the window. The flat `drop-held-chain-backed` is the exception: 7,814 placed and 1,007 by the
+window because the row disagreed (11%) with no knob, 8,820 and 135 with it. `session_guarantees_hold` prints the counts, so a change
+that starts producing windowed refusals shows.
+
+### Sweeps (box 1, release, seeds 0..2,000 unless noted; `main` is acd1e9bf with the counter only, `fix` adds the change; knob = `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`)
+
+| config | failing seeds main / fix | foreign gated queued main / fix | ungated I2 pairs main / fix |
+|---|---|---|---|
+| `placement-hot`, knob, 0..10,000 | 4418 (I5) / same | 0 / 0 | 0 / 0 |
+| `placement-hot`, no knob | none / none | 0 / 0 | 0 / 0 |
+| `delegated-no-backup-root-near`, knob | none / none (i2 = 1 at 1680 / 0) | **1 / 0** | 0 / 0 |
+| `delegated-no-backup-root-near+identity`, knob | **1680 (I2)** / none | (the failing seed is not totalled) | 0 / 0 |
+| `long-delegated-backup`, knob (no knob) | none / none | 1 / 1 (0 / 0) | 1 / 1 (1 / 1) |
+| `long-delegated-late-answers`, knob (no knob) | none / none | 2 / 2 (0 / 0) | 0 / 0 (3 / 3) |
+| `delegated-holder-cut`, knob (no knob) | none / none | 0 / 0 | 0 / 0 |
+| `delegated-holder-cut+commit` 0..299, knob (no knob) | none / none, i1 = i2 = 0 | 0 / 0 | 0 / 0 |
+| `delegated-backup+commit` 0..299, knob (no knob) | none / none, i1 = i2 = 0 | 0 / 0 | 0 / 0 |
+| `long-delegated`, `delegated-backup`, `delegated-root-crash`, knob and no knob | none / none | 0 / 0 | identical |
+| `delegated-group-switch`, knob (no knob) | 1525 (I4) / same (none / none) | 0 / 0 | 2 / 2 (1 / 1) |
+
+`+identity` (which judges I2 as a failure), knob: `long-delegated-backup`, `long-delegated-late-answers`, `delegated-holder-cut` 0..2,000 and
+`placement-hot` 0..10,000 fail the same seeds on both trees (4418 only). The failing seeds are identical on both trees in every configuration; the only change is the one witness above (1680: i2 1 to 0,
+foreign gated 1 to 0, and the `+identity` failure gone). The drop fires only on that seed.
+
+After the review's follow-ups (the ordering fix and the corrected argument; the code otherwise unchanged) every row of the table was
+re-run on the final tree: the failing seeds, the oracle totals, the ungated pairs and the foreign-gated counts are identical to the
+`fix` column, `+identity` and `+commit` included (i1 = i2 = 0), and `placement-hot` knob 0..10,000 still fails 4418 (I5) only.
+`long-delegated-late-answers` 2000..2,999 (knob and no knob) and seed 2945, the shape of the ordering case, are clean and identical
+to main. (The sweeps do not exercise the ordering case; the meta test pins it.)
+
+### Not closed: L2b
+
+Two other strands queue a gated copy of another node's rid. No sweep judges a pair from them, and this fix does not touch them;
+the new counter gives their numbers (above: `long-delegated-late-answers` knob 2, `long-delegated-backup` knob 1).
+- (a) `strand_for_takeover_carrying`'s own-generation strand: a delegate that takes the root lease queues its own rows of the
+  generation it held (`member = true, recall = false, epoch == 0`). Witness: `long-delegated-late-answers` 1977 with the knob
+  (rids (2,1,6) and (2,2,1) on node 3). Needs a design answer: should the new root append its former delegate rows as the
+  generation's rows rather than replay them by rid?
+- (b) The recall pass's root appends (`recall = true, epoch > 0`, the "keeps today's rule" branch). Witness: `long-delegated-backup`
+  956 with the knob ((2,2,1) on node 3). Whether the same rule is safe there is not established: a root append past the recall's cut
+  is no member of the successor's tail, but a root append's class says nothing about whether it committed (see "Why dropping loses
+  nothing"), so "it was not committed" is not a premise. The same two sources of a gated class apply, and dropping reverses a
+  deliberate C2 choice. Needs its own analysis.
+
+### Gates
+
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean; meta (all targets; lib 387, `holder_capture` 32),
+authority lib 1,004, engine 948, all 0 failed; sim suite (release) 359 passed, 0 failed, 13 ignored (358 on main plus the pin). Re-run after the follow-ups: meta `holder_capture` 33 (two new L2 tests, both fail before), the rest unchanged.
+
+## Oracle: a journaled refusal is placed at its own `Refused` row (2026-11-04; plan 46 M0.3 finding 4125)
+
+`long-delegated-late-answers` 4125 with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` failed the session checker on 3d716e12 and earlier
+(`monotonic_reads`: node 2 read `d1/f1` present at tick 140 after observing a later state). It was an oracle gap, not a product bug,
+and no DESIGN, ADR or cto-modes text changes: the read is allowed by DESIGN §6 (a node never answers from a state older than one its
+clients saw) and by the order across owners that ADR-23 gives (causal, through `deps`, not real time).
+
+### Mechanism
+
+Node 3, the delegate of `d2`, acknowledged `create d2/f2` (tick 104) and `unlink d2/f2` (tick 126) once its group held the rows; the
+root, answering delegate batches late in this configuration, appended them afterwards (log seq 26). Node 2's `unlink d1/f1`, invoked at
+tick 132, was refused `ENOENT` by the root at log state 30 (its `Refused` row is record 91). The root then ran its own `create d1/f1`
+(state 31) and appended node 3's `d2` rows. Node 2's next read answered from a replica at state 31 or later: present. Absent at state
+30, then present at state 31 is monotonic. `check_sessions` had placed the refusal after every success that returned before the
+refusal was invoked, in any directory and from any node, and node 3's `unlink d2/f2` (log index 32) returned at tick 126: the window
+began at index 33, the first state refusing `ENOENT` was 34, and no later state had `d1/f1` present. That treats the log as a
+real-time order across owners; under delegation the log orders keys of different owners only causally.
+
+### Rule
+
+A refusal the sequencer journaled is evaluated at the state its `Refused` row follows, and its reply carries that position (cto-modes
+"Positions"). `check.rs` records the first `ENOENT`/`EEXIST` `Refused` row of every rid in an applied (unfenced) segment, with its code
+(`Oracle::refused_at`, the coordinates of `completed_at`). `check_sessions` places the refusal at state k = the number of successes
+logged before that row, uncapped: no real-time cut applies, not even the first success invoked after the refusal returned, because a
+delegate's row that the root appends late can follow root ops invoked after the refusal returned (a cap there moved k below the row and
+hid a stale read: unit test `a_late_row_is_not_cut_by_a_success_invoked_after_the_refusal_returned`, which fails with the cap). The causal
+floors take `hi.max(k)`. The row is used only when its code is the client's return and the refused name shows what the refusal says at
+the state the row follows; otherwise the window decides. Rows with other codes (a frozen epoch's `EROFS`, an abandoned rid) are final
+outcomes too, but the session check does not judge those returns and no namespace state explains them, so they are not recorded.
+
+That is exact when the row is where the refusal was evaluated, which holds for a refusal the sequencer answers. It does not for an inbox
+or local answer (plan 30 M13), which is evaluated against the requester's replica and journaled later: its row can follow successes it
+did not see, and the name can be in the opposite state there (`drop-held-chain-backed` 132, `flex-backup` 1208, `metered-shared` 1210,
+`flex-crash` 61: a `Rename` refused `ENOENT` on a name that the log shows present at its row). The first cut of this change reported
+that as a violation; the linearizability check accepts these histories (it runs first), so the row is simply not their evaluation point,
+and the window decides. If such a row agrees with the refusal by accident the row path still places it there, which can be later than
+the evaluation; no false violation has shown in the suite or the sweeps, and the unit test for the disagreement shows what the check
+would have said with the row alone.
+
+A refusal with no usable row (answered without journaling, journaled in a fenced segment, another code, or a state that does not show it) keeps the scoped window of the
+first version of this fix: `session::Scope { Global, Dir, Range(bits) }` (`Global` without `dirs`, `Dir` with `dirs`, `Range(bits)` with
+`check_range_bits`; the range test is `history::range_idx_of`, which `project_range` uses too). The lower bound binds the successes (not
+tentative, returned before the refusal was invoked) on a name of the refused name's scope, and the refusing node's own successes in
+any directory (its program order, which a forward's `deps` make the sequencer wait for). A rename binds in both scopes (its two halves
+project into each), a link only in its destination's. A cross-directory `Exchange`/`Same` is dropped by `project_dir`/`project_range`
+(kept whole or not at all) but `names_of` binds it in both, so there the window is stricter than the linearizability projection; that
+is the strict direction (it can only add false positives).
+
+The first version used the scope alone and justified it as matching the linearizability projection. That reasoning was wrong for a
+refusal: projecting linearizability per directory loses nothing because linearizability is local, but the window uses other keys to work
+out which state the refusal was evaluated at, and real-time order across directories does hold whenever one sequencer owns both (the
+root's own directories, a delegate's subtree, every range of an unsplit directory), where the read also waits for the refusal's
+position (DESIGN §6, cto-modes "Positions"). The review's case: node 4's `create d1/f` (log 0) and `unlink d1/f` (log 1) sequenced
+but not returned, node 5's `create d3/y` (log 2) returned, node 2's `unlink d1/f` refused `ENOENT` at state 3, then node 2 reads
+`d1/f` present: a stale read, accepted by the window under `Dir` (state 0, explained by state 1) and found by the row.
+
+Unit tests (`session.rs`): `a_journaled_refusal_is_placed_at_its_row` (the 4125 shape with the row before the other owner's late
+success is accepted in every scope; the row after it is `monotonic_reads` in every scope; a row for another rid leaves the window,
+which accepts), `a_refusal_row_after_another_directorys_success_binds_the_read` (the review's case: accepted on the window alone,
+`monotonic_reads` with the row), `a_late_row_is_not_cut_by_a_success_invoked_after_the_refusal_returned` (a delegate's `unlink d2/f`
+refused `ENOENT`, its row appended behind a root op invoked after the refusal returned: `monotonic_reads` in every scope, accepted with
+the row before the delegate's ops), `a_row_that_disagrees_with_its_refusal_falls_back_to_the_window` (a row at a state showing the
+name present, or with another code, is not used and the disagreement is counted) and
+`an_unjournaled_refusal_is_not_placed_after_another_owners_earlier_success` (the window per scope, as in the first version). The first
+two fail with the row path disabled (the window alone); the late-row one fails with the row capped at `hi` (its refusal and the
+delegate's ops share a directory, so the window finds it too).
 
 ### Why main no longer shows it
 
@@ -65260,7 +65406,7 @@ starts producing them shows.
 ### Sweeps (box 1, release; main f188c707 (the previous oracle) against main plus this change; seeds 0..10,000 for the first two configurations, 0..2,000 for the rest; no knob / knob)
 
 Failing seeds and their failure messages, byte-identical on both trees in every cell (none of them a session-checker failure; the row path
-newly rejects no seed and newly accepts none):
+newly rejects no seed and newly accepts none; the sweep matrix is the delegated configurations, where no row disagrees):
 
 | config | no knob | knob |
 |---|---|---|
@@ -65277,11 +65423,12 @@ newly rejects no seed and newly accepts none):
 - **Raw log order.** `check_sessions` orders successes by raw log position, where the linearizability and session-order checks use
   `witness_order` (a tenure's run in journal order). In 4125 the two agree. Aligning them is a separate consistency item.
 
-The window fallback is lenient too (a success of another scope that precedes the refusal in one sequencer's order does not bind it), but
-no sim configuration reaches it, see above.
+The window fallback is lenient too (a success of another scope that precedes the refusal in one sequencer's order does not bind it). The
+delegated configurations never reach it; the flat inbox ones do, for refusals whose row is not their evaluation point, so an M1-shaped
+stale read after such a refusal is not caught there.
 
 ### Gates
 
-`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean; sim suite (release) 363 passed, 0 failed,
-12 ignored (359 passed and 13 ignored on main; the first version added a unit test and un-ignored the seed, 361; this change adds two
-unit tests); the five session unit tests and `session_guarantees_hold` pass.
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean; sim suite (release) 365 passed, 0 failed,
+12 ignored (359 passed and 13 ignored on main; the first version added a unit test and un-ignored the seed, 361; the row path adds
+four unit tests); `session_guarantees_hold` passes.
