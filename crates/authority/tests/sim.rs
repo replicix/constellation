@@ -16085,7 +16085,8 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         ("tloss-two-node", tloss_two_node_config),
     ];
     // (label, config, violations, allowed unsettled EIOs in seeds 0..100 when
-    // the list was set)
+    // the list was set; lowered where seeds 0..99 of the 2,000-seed sweeps of
+    // 2026-11-04, the re-trace of cause 6, measured less; never raised)
     let ceilings: [(&str, Config, usize, usize); 16] = [
         ("backup-crash", backup_crash_config, 1, 0),
         ("backup-strict", backup_strict_config, 0, 0),
@@ -16106,15 +16107,15 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         (
             "delegated-group-switch",
             delegated_group_switch_config,
-            3,
-            2,
+            0,
+            0,
         ),
         ("delegated-holder-cut", delegated_holder_cut_config, 12, 2),
         (
             "delegated-long-delegation",
             delegated_long_delegation_config,
             65,
-            187,
+            160,
         ),
         (
             "delegated-no-backup-root-near",
@@ -16125,11 +16126,11 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         ("flex-crash", flex_crash_config, 125, 9),
         ("long-backup", long_backup_config, 0, 0),
         ("long-delegated", long_delegated_config, 0, 0),
-        ("long-delegated-backup", long_delegated_backup_config, 5, 6),
+        ("long-delegated-backup", long_delegated_backup_config, 5, 1),
         (
             "long-delegated-late-answers",
             long_delegated_late_answers_config,
-            9,
+            6,
             4,
         ),
         ("placement-hot", placement_hot_config, 0, 0),
