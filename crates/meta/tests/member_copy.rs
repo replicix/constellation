@@ -114,6 +114,9 @@ fn strand_below_epoch_moves_gated_rows_to_the_member_copy() {
     assert_eq!(rows[0].class, RowClass::RootGroup);
     assert_eq!(rows[0].rid, Some(rid(1)));
     assert!(rows[0].op.is_some());
+    // (A recovery's or a takeover gate's strand holds no reads: only a
+    // segment's strand does.)
+    assert!(!meta.member_copy_touches(&[ReadKey::Dentry(ROOT_INO, "a".into())]));
     assert_eq!(info.through, rows[0].tx.last);
     assert!(meta.member_copy_carries(rid(1)).unwrap());
     assert!(!meta.member_copy_carries(rid(2)).unwrap());

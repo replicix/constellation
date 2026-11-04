@@ -63,15 +63,17 @@ pub(super) const MEMBER_COPY_BASE: u64 = 2 << 48;
 /// replica as it is when the session wait times out.
 pub const HELD_COPY_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// A member copy row this process's strand rolled back
+/// A member copy row a segment's strand rolled back
 /// ([`Meta::member_copy_touches`]). In memory, not persisted: after a
-/// restart nothing is held. The restart's own rolled-back rows come from the
-/// namespace rebuild (`Strand::rebuild`), which derives the namespace from
-/// the log, so no row that depends on a rolled-back one stays; and a row
-/// rolled back by a segment before the crash is covered by the re-ship
-/// latency only. If the process crashes inside that window (50-125 ms) the
-/// restarted node serves the gap again until the re-ship lands; the
-/// window is not closed after a crash.
+/// restart nothing is held. Only a segment's apply sets one, on a node that
+/// serves reads while the rows after the rolled-back one stay; the strand of
+/// a restart's recovery (a deposed holder starting up), a takeover gate and a
+/// namespace rebuild do not (the rebuild derives the namespace from the log,
+/// so no row that depends on a rolled-back one stays). The cost of not
+/// persisting: a process that crashes inside the re-ship window (the 50-125 ms
+/// measured) comes back without the hold and may serve the gap until the
+/// re-ship lands; the window is bounded by the re-ship latency, not closed
+/// after a crash.
 #[derive(Clone, Debug)]
 pub(crate) struct HeldCopy {
     pub(crate) epoch: u64,

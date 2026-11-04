@@ -792,6 +792,12 @@ struct Strand<'a> {
     /// (A third source of a gated root append is C3's re-append at a
     /// delegate's takeover gate, `RootGroup`; see L2b in `strand_local_tx`.)
     rebuild: bool,
+    /// The pass is a segment's apply: a committed row it moves to the member
+    /// copy holds reads of its keys until the re-ship lands
+    /// (`Meta::member_copy_touches`). Not a restart's recovery or a
+    /// takeover's strand (nothing serves reads on the namespace they
+    /// leave behind before the re-ship, or they derive it from the log).
+    hold: bool,
     /// Each stranded transaction's `deps` (by journal seq), taken from the
     /// intact journal before the pass strands anything: a pass that
     /// strands every row, oldest first, has deleted the rows ahead of a
@@ -808,6 +814,7 @@ impl Strand<'static> {
         quiet: None,
         recall: false,
         rebuild: false,
+        hold: false,
         deps_of: None,
     };
 }
@@ -1574,11 +1581,10 @@ fn strand_local_tx(
     // client's retry by rid dedups against the re-ship, or executes once
     // if the row turns out not to have been held (an unanswered row).
     if member && row.class.gated() && row.gen == 0 && row.epoch > 0 {
-        // A segment's strand (not a namespace rebuild, which derives the
-        // namespace from the log) leaves the row's effect out of the
-        // namespace while rows after it may stay: reads of its keys wait
-        // for the re-ship (`Meta::member_copy_touches`).
-        let hold = (!strand.rebuild).then(|| crate::KeySet::from_records(&records));
+        // A segment's strand leaves the row's effect out of the namespace
+        // while rows after it may stay: reads of its keys wait for the
+        // re-ship (`Meta::member_copy_touches`).
+        let hold = strand.hold.then(|| crate::KeySet::from_records(&records));
         let kept = super::member::put_row_tx(
             tx,
             meta,
@@ -2982,6 +2988,7 @@ fn strand_tx(
     strands: impl Fn(&LiveEntry) -> bool,
     member: bool,
     recall: bool,
+    hold: bool,
     quiet: impl Fn(&LiveEntry) -> bool,
 ) -> Result<Stranded, MetaError> {
     let live: HashMap<u64, LiveEntry> = read_live(tx, meta)?.into_iter().collect();
@@ -3003,6 +3010,7 @@ fn strand_tx(
         quiet: Some(&quiet),
         recall,
         rebuild: false,
+        hold,
         deps_of: None,
     };
     Ok(rewind_tx(tx, meta, staged, &live, &stranded, cutoff, strand, None)?.0)
@@ -3509,6 +3517,7 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
                 quiet: None,
                 recall: false,
                 rebuild: true,
+                hold: false,
                 deps_of: Some(&deps_of),
             },
         )?;
@@ -4495,6 +4504,7 @@ impl Meta {
             |entry| matches!(entry, LiveEntry::Streamed { ident, .. } if idents.contains(ident)),
             false,
             false,
+            false,
             |_| true,
         )?;
         super::member::hole_rolled_back_tx(tx, meta, idents)?;
@@ -4732,6 +4742,7 @@ impl Meta {
                 strands,
                 true,
                 false,
+                true,
                 |entry| matches!(entry, LiveEntry::Streamed { ident, .. } if rolled.contains(ident)),
             )?
         } else {
@@ -5206,6 +5217,7 @@ impl Meta {
                 |entry| entry.stranded_by_recall(&recalled),
                 false,
                 true,
+                false,
                 |_| false,
             )?;
             stranded.shadows += more.shadows;
@@ -5317,6 +5329,7 @@ impl Meta {
             &staged,
             |entry| entry.stranded_by_takeover(epoch),
             true,
+            false,
             false,
             |_| false,
         )?;
@@ -5444,6 +5457,7 @@ impl Meta {
                     || abandons(entry)
             },
             true,
+            false,
             false,
             |entry| entry.superseded_by_takeover(epoch, carried) && !abandons(entry),
         )?;
@@ -5686,6 +5700,7 @@ impl Meta {
             },
             false,
             false,
+            false,
             |_| false,
         )?;
         if !stranded.any() {
@@ -5729,6 +5744,7 @@ impl Meta {
                 self,
                 &staged,
                 |entry| matches!(entry, LiveEntry::Shadow { rid: r, .. } if *r == rid),
+                false,
                 false,
                 false,
                 |_| false,
@@ -5841,7 +5857,7 @@ impl Meta {
         }
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
-        let stranded = strand_tx(&mut tx, self, &staged, stale, true, false, |_| false)?;
+        let stranded = strand_tx(&mut tx, self, &staged, stale, true, false, false, |_| false)?;
         if !stranded.any() {
             return Ok(stranded);
         }
