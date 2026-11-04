@@ -439,7 +439,7 @@ impl Core {
             epoch = ch.epoch,
             "every member of the lease's group holds nothing of its tail: the claim goes on"
         );
-        self.tail_fetch_complete(now, ch, replica, out);
+        self.tail_fetch_complete(now, ch, true, replica, out);
     }
 
     /// A member answered a `SealTail` of this claim.
@@ -560,7 +560,7 @@ impl Core {
                 let Some(ch) = self.bk.tf.as_mut().and_then(|t| t.chosen.take()) else {
                     return;
                 };
-                self.tail_fetch_complete(now, ch, replica, out);
+                self.tail_fetch_complete(now, ch, false, replica, out);
             }
         }
     }
@@ -646,11 +646,16 @@ impl Core {
     }
 
     /// Every batch is in: write the tail as a sealed backup's, and go on
-    /// with the claim as a takeover that carries it.
+    /// with the claim as a takeover that carries it. `proved_empty` (plan 46
+    /// M0.3 G): no member sealed anything, so this node does not seal the
+    /// epoch either: the holder may still win its own re-adoption CAS at the
+    /// same epoch, and a seal here would refuse its backup stream for that
+    /// whole tenure (the role is still written: the marker names the epoch).
     fn tail_fetch_complete(
         &mut self,
         now: Now,
         ch: Chosen,
+        proved_empty: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -672,11 +677,13 @@ impl Core {
             config_version: ch.config_version,
         };
         replica.set_backup_role(role);
-        if !replica.backup_seal(ch.epoch) {
-            self.end_acquire_attempt(now, replica, out);
-            return;
+        if !proved_empty {
+            if !replica.backup_seal(ch.epoch) {
+                self.end_acquire_attempt(now, replica, out);
+                return;
+            }
+            self.bk.sealed = self.bk.sealed.max(ch.epoch);
         }
-        self.bk.sealed = self.bk.sealed.max(ch.epoch);
         self.bk.role = Some(role);
         // (Unreadable: what it holds counts from 0, which only ever
         // acknowledges less; the holder sends again.)
