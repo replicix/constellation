@@ -184,6 +184,7 @@ impl Meta {
         // lock on every ship.
         let empty = crate::store::journal::is_empty(&tx, &self.journal_ks, &self.local)?;
         tx.commit()?;
+        self.flush_held_releases();
         // The re-ship this node's own rows carried may have retired the last
         // member copy row.
         if self.has_member_copies() {

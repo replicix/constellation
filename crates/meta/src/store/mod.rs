@@ -743,6 +743,10 @@ pub struct Meta {
     /// rolled back), per thread, until its transaction committed
     /// ([`Meta::stage_unvoid`], [`Meta::report_rolled_back`]).
     staged_unvoids: std::sync::Mutex<Vec<(std::thread::ThreadId, u64)>>,
+    /// Member copy rows a transaction took out, per thread, until it
+    /// committed ([`Meta::flush_held_releases`]).
+    pub(crate) staged_releases:
+        std::sync::Mutex<Vec<(std::thread::ThreadId, member::StagedRelease)>>,
     /// Plan 45: `0x01` point reads made on behalf of a dentry — the read a
     /// hard-linked name's `Remote` entry costs, where a single-name entry
     /// answers from its copy ([`Meta::inode_reads`]).
@@ -884,6 +888,9 @@ impl Meta {
     }
 
     pub(crate) fn report_rolled_back(&self) {
+        // The holds of the copy rows this thread's transaction took out,
+        // now that it committed.
+        self.flush_held_releases();
         let me = std::thread::current().id();
         let gens: Vec<u64> = {
             let mut all = self.staged_unvoids.lock().unwrap();
@@ -1255,6 +1262,7 @@ impl Meta {
             rollback_hook: std::sync::OnceLock::new(),
             rolled_back: std::sync::Mutex::new(Vec::new()),
             staged_unvoids: std::sync::Mutex::new(Vec::new()),
+            staged_releases: std::sync::Mutex::new(Vec::new()),
             inode_reads: AtomicU64::new(0),
             local_rows_read: AtomicU64::new(0),
             dirty_probes: AtomicU64::new(0),

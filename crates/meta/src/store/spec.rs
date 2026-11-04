@@ -4320,6 +4320,7 @@ impl Meta {
         if streamed_tip_tx(&tx, self, epoch)?.is_some_and(|tip| first <= tip) {
             if marked {
                 tx.commit()?;
+                self.flush_held_releases();
             }
             return Ok(());
         }
@@ -4360,6 +4361,7 @@ impl Meta {
                 if tx.get(&self.completed, rid.to_key())?.is_some() {
                     if marked {
                         tx.commit()?;
+                        self.flush_held_releases();
                     }
                     return Ok(());
                 }
@@ -4434,6 +4436,7 @@ impl Meta {
             let (bytes, files) = staged.raw_delta();
             adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
             tx.commit()?;
+            self.flush_held_releases();
             staged.drain_into(self.usage_tracker());
             return Ok(());
         }
@@ -4543,6 +4546,7 @@ impl Meta {
         adjust_usage_tx(&mut tx, &self.local, usage.0, usage.1)?;
         record_tx(&mut tx, self, kind, applied, capture.into_before(), usage)?;
         tx.commit()?;
+        self.flush_held_releases();
         staged.drain_into(self.usage_tracker());
         Ok(())
     }

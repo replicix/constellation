@@ -84,6 +84,13 @@ pub(crate) struct HeldCopy {
     pub(crate) since_ms: i64,
 }
 
+/// A release a transaction staged ([`Meta::flush_held_releases`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StagedRelease {
+    Row(u64, u64),
+    Epoch(u64),
+}
+
 fn member_epoch(epoch: u64) -> u64 {
     MEMBER_COPY_BASE + epoch
 }
@@ -554,8 +561,11 @@ impl Meta {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// The row `(epoch, first)` left the member copy (re-shipped, dropped,
-    /// holed, settled): its keys are not held any more.
+    /// The row `(epoch, first)` leaves the member copy in the caller's
+    /// transaction: its keys are released once that transaction committed
+    /// ([`Self::flush_held_releases`]), not now. Released inside the
+    /// transaction, a reader polling before the commit would be let go and
+    /// read the pre-commit namespace (the marker without its data).
     pub(crate) fn release_copy_row(&self, epoch: u64, first: u64) {
         if !self
             .any_held_copy
@@ -563,13 +573,11 @@ impl Meta {
         {
             return;
         }
-        let mut held = self.held_copies.lock().unwrap();
-        held.retain(|h| (h.epoch, h.first) != (epoch, first));
-        self.any_held_copy
-            .store(!held.is_empty(), std::sync::atomic::Ordering::Relaxed);
+        self.stage_release(StagedRelease::Row(epoch, first));
     }
 
-    /// The whole member copy of `epoch` left.
+    /// The whole member copy of `epoch` leaves in the caller's transaction
+    /// (released after its commit, like [`Self::release_copy_row`]).
     pub(crate) fn release_copy_epoch(&self, epoch: u64) {
         if !self
             .any_held_copy
@@ -577,8 +585,51 @@ impl Meta {
         {
             return;
         }
+        self.stage_release(StagedRelease::Epoch(epoch));
+    }
+
+    fn stage_release(&self, r: StagedRelease) {
+        let me = std::thread::current().id();
+        self.staged_releases.lock().unwrap().push((me, r));
+    }
+
+    /// Apply this thread's staged releases after its transaction committed.
+    /// Each is checked against the committed member copy: a hold whose row
+    /// is still there stays (the transaction aborted, or the row came back),
+    /// so an abort releases nothing, and a stale staging left by a failed
+    /// pass is harmless.
+    pub(crate) fn flush_held_releases(&self) {
+        let me = std::thread::current().id();
+        let mine: Vec<StagedRelease> = {
+            let mut all = self.staged_releases.lock().unwrap();
+            if all.is_empty() {
+                return;
+            }
+            let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *all)
+                .into_iter()
+                .partition(|(t, _)| *t == me);
+            *all = others;
+            mine.into_iter().map(|(_, r)| r).collect()
+        };
+        if mine.is_empty() {
+            return;
+        }
+        let snap = self.db.read_tx();
         let mut held = self.held_copies.lock().unwrap();
-        held.retain(|h| h.epoch != epoch);
+        held.retain(|h| {
+            let named = mine.iter().any(|r| match r {
+                StagedRelease::Row(e, f) => (h.epoch, h.first) == (*e, *f),
+                StagedRelease::Epoch(e) => h.epoch == *e,
+            });
+            if !named {
+                return true;
+            }
+            // Gone from the committed copy? (A read error keeps the hold.)
+            !matches!(
+                snap.get(&self.backup_tail, tail_key(member_epoch(h.epoch), h.first)),
+                Ok(None)
+            )
+        });
         self.any_held_copy
             .store(!held.is_empty(), std::sync::atomic::Ordering::Relaxed);
     }
@@ -589,6 +640,7 @@ impl Meta {
         let mut tx = self.db.write_tx();
         drop_epoch_tx(&mut tx, self, epoch)?;
         tx.commit()?;
+        self.flush_held_releases();
         self.refresh_member_copy_flag()
     }
 }
@@ -928,5 +980,73 @@ impl Meta {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+    use crate::ReadKey;
+
+    fn row(first: u64) -> MemberTx {
+        MemberTx {
+            tx: BackupTx {
+                first,
+                last: first,
+                records: vec![],
+                origin: (0, 0),
+            },
+            class: RowClass::RootGroup,
+            rid: None,
+            op: None,
+            lock_tag: Default::default(),
+        }
+    }
+
+    /// A row's hold ends with the commit that took the row out, not with the
+    /// release inside the transaction; a transaction that aborts after the
+    /// release leaves the hold, since the row is still in the copy.
+    #[test]
+    fn a_release_takes_effect_after_the_commit_only() {
+        let meta = Meta::open_in_memory().unwrap();
+        let key = [ReadKey::Dentry(1, "x".into())];
+        let keys = || crate::KeySet::from_records(&[crate::LogRecord::Create {
+            parent: 1,
+            name: "x".into(),
+            ino: 7,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        }]);
+        let mut tx = meta.db.write_tx();
+        assert!(put_row_tx(&mut tx, &meta, 3, &row(5)).unwrap());
+        tx.commit().unwrap();
+        meta.hold_copy_row(3, 5, keys());
+        assert!(meta.member_copy_touches(&key));
+
+        // Aborted: released inside, never committed.
+        {
+            let mut tx = meta.db.write_tx();
+            tx.remove(&meta.backup_tail, tail_key(member_epoch(3), 5));
+            meta.release_copy_row(3, 5);
+            assert!(
+                meta.member_copy_touches(&key),
+                "still held inside the transaction, before its commit"
+            );
+            drop(tx);
+        }
+        meta.flush_held_releases();
+        assert!(meta.member_copy_touches(&key), "an abort releases nothing");
+
+        // Committed: released once it has.
+        let mut tx = meta.db.write_tx();
+        tx.remove(&meta.backup_tail, tail_key(member_epoch(3), 5));
+        meta.release_copy_row(3, 5);
+        assert!(meta.member_copy_touches(&key));
+        tx.commit().unwrap();
+        assert!(meta.member_copy_touches(&key), "not before the flush");
+        meta.flush_held_releases();
+        assert!(!meta.member_copy_touches(&key));
     }
 }
