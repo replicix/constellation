@@ -65414,7 +65414,7 @@ newly rejects no seed and newly accepts none; the sweep matrix is the delegated 
 | `delegated-group-switch` | none | 1525 (I4 late landing) |
 | `long-delegated`, `placement-hot`, `long-delegated-backup`, `delegated-backup`, `delegated-holder-cut`, `shared-dir-ranges`, `delegated-two-gens-root-crash`, `delegated-no-backup-root-near` | none | none |
 
-### Closed: the two lenient leftovers (plan 46 M0.3); open: the flat-inbox window fallback
+### Closed: the two lenient leftovers and the flat-inbox window fallback (plan 46 M0.3)
 
 Both leftovers are closed in `check_sessions`; each was a real miss, not only a theoretical one.
 
@@ -65456,11 +65456,28 @@ Both leftovers are closed in `check_sessions`; each was a real miss, not only a 
   (against a cut at `c` itself), `a_read_is_not_cut_by_another_directorys_later_success`,
   `an_unjournaled_refusal_is_not_dropped_by_another_directorys_later_success`, `a_held_row_is_ordered_as_its_tenure_journaled_it`,
   `a_refusal_row_is_ordered_as_its_tenure_journaled_it`.
-- **Open: the flat-inbox window fallback.** An inbox or local refusal is evaluated against the requester's replica and journaled later; its
-  row disagrees, and the window places it at the earliest state after the real-time `lo` that refuses the same way. If the name flipped
-  back in between (absent at 0, present at 1, absent at 2, evaluated at 2), a later read of `present` (state 1) is accepted. Closing it
-  needs the sim to record, for each inbox/local refusal, the requester replica's applied position at evaluation and place the refusal
-  there. `Global` M1-shaped cases are caught by the window's real-time `lo`.
+- **Closed: the flat-inbox window fallback.** The premise was wrong: a refusal is never evaluated on the requester. Every client op goes
+  through the core, and the lease holder (own op, forwarded op or inbox batch) decides every `EEXIST`/`ENOENT` and journals the `Refused`
+  row in the same step; the requester only reads the outcome from the log. So there is no requester position to record: the row's own
+  `(epoch, jseq)` is the evaluation point. A row disagrees with its state for two reasons only. (A) A takeover re-ships its predecessor's
+  held tail as `TailOf { epoch, jseq }, Refused`, after rows the predecessor shipped ahead of it; in `witness_order` the row sits in the
+  successor's run, after rows it preceded. (B) The log lost or replayed an effect the holder had seen (a takeover rollback, `repair
+  drop-held`'s requeue, a replay by rid): no order of log rows reproduces the evaluation state, and the ops are tentative.
+  In a flat configuration (`Scope::Global`) the successes and the refusal rows are now taken in execution order (`execution_order` in
+  `session.rs`): sorted by the identity `exec_identity` (`run.rs`) gives each, the `(epoch, jseq)` of the journal that first held the
+  transaction (the `TailOf` directly before its `Completed` or `Refused`, else its own tenure's row), which places an (A) row where its
+  holder evaluated it. Identities need one shipping node per epoch, no delegation origin and a row for every rid; otherwise the map is
+  empty and the checker keeps `witness_order`. The window now remains only for (B): a disagreeing row on a name a tentative op touched
+  (invoked before the refusal returned). A disagreeing row on any other name is a new violation, `refusal_row` (no order of the
+  sequencers' executions gives that answer).
+  Sweeps (box 1, release, seeds 0..2,000, with and without the lease-read knob, main e935e99d against the change): the failing seeds and
+  messages of `drop-held-chain-backed`, `flex-backup`, `flex-crash`, `metered-shared`, `placement-hot` and `long-delegated-late-answers`
+  are identical; `refusal_row` fired in none of them. The first version of `exec_identity` took the `TailOf` by `records[idx - 1]`
+  alone and fired `refusal_row` in 26 fixed-seed tests: a re-shipped `Completed` follows its transaction's first record, so its `TailOf`
+  is two records back (`TailOf`, first record, `Completed`), a refusal's one.
+- **Unit tests** (`session.rs`, `run.rs`): `a_reshipped_refusal_row_is_placed_where_its_holder_evaluated_it` (a stale read after such a
+  refusal is caught; main accepts it), `a_flat_row_that_disagrees_is_a_violation_unless_a_tentative_op_explains_it`,
+  `identity_is_the_transactions_own_tail_only`, `no_identities_when_the_assumptions_fail`.
 
 ### Gates
 
