@@ -2813,20 +2813,47 @@ block.
   `Streams` entry and `Gen` are `u64`, the model crate's bitmask generations are
   its own abstract ones.
 - The session's restart seeding walks the generations the store keeps a key of
-  (`deleg_log_idx`, `deleg_void_cut`) and the live ones, not `1..=max_gen`. A
-  generation the table ended before the open with no key left here (a root rebuilt
-  from a side replica replaces `ns` and keeps `local`: a generation ended inside
-  the rebuild window has none) is voided lazily, at the cut 0 the eager seeding gave
-  it, when a root's check of a dependency on it says no (`Meta::reaches_deps`,
-  `reaches_streams_deps`; one table read, on that path only). Only a generation
-  that ended before the open qualifies (`SessionState::ended_before_open`): the
-  end of one this incarnation saw may be a streamed-ahead install the successor
-  strands, and only the durable log voids those. (The first version voided any
-  unlisted generation below `max_gen`; the sweep moved four seeds of
-  `long-delegated-late-answers` 0..100 and the unsettled ceiling test failed.)
+  (`deleg_log_idx`, `deleg_void_cut`) and the live ones, not `1..=max_gen`, and
+  voids a keyed generation the table does not list only at or below the table's
+  highest (`seed_generations`): a key above it, which a deposed root's stranded
+  appends leave behind (`retract_log_idx_tx` keeps the key while the strand rolls
+  the table back below it), names a grant the log may yet carry, and is held, not
+  voided. A generation the table ended before the open with no key left here (the
+  rebuild window of a side replica that began after the end) is voided lazily, at
+  the cut 0 the eager seeding gave it, when a root's check of a dependency on it
+  says no (`Meta::reaches_deps`, `reaches_streams_deps`, and `deps_lost_deps`,
+  which the executors ask first: `holder.rs` `mutate_request`, the delegate
+  stream's append and drain; were only the reaches check to void, the first
+  arrival of an op whose dependency is past the generation's real cut would pass
+  `deps_lost`, be reached by the void and execute ahead of its cause; one table
+  read, on that path only). Only a generation that ended before the open qualifies
+  (`SessionState::ended_before_open`): the end of one this incarnation saw may be
+  a streamed-ahead install the successor strands, and only the durable log voids
+  those. (The first version voided any unlisted generation below `max_gen`; the
+  sweep moved four seeds of `long-delegated-late-answers` 0..100 and the
+  unsettled ceiling test failed.)
+- The in-process rebuild (`replace_ns_from_rebuilt`: the driver's and the sim's
+  retention and deposition rebuilds, nothing reopened) replaces `ns` wholesale, so
+  a generation that ended inside its window would have no key here and the session
+  would not be seeded again: a dependency on it would wait for the rest of the
+  process, and after a restart the lazy void would meet it at cut 0 and report
+  dependencies at or below its real cut as lost. The rebuild copies the side
+  replica's `deleg_log_idx:*` and `deleg_void_cut:*` keys (raise-only, after the
+  reset's strand), seeds the session from the store as an open does and takes the
+  rebuilt table (the durable log's) as the open-table snapshot.
+- What the sweeps do not witness. The sim's nodes open one in-memory `Meta` and a
+  simulated restart keeps it (`session().reset()` keeps the open-table snapshot,
+  the empty one of the creation), so at a restart `ended_before_open` is false and
+  the seeding runs on an empty store: the sim never exercises the restart's
+  lazy void, and "the sweeps match main" says nothing about it; only the meta
+  tests (`generation_epochs.rs`, the session unit tests) cover it. The sim does
+  run the in-process rebuild, which refreshes the snapshot, so the restricted
+  lazy void and the rebuild's key copy are reached there, after a rebuild only.
 - What an orphan number leaves behind keeps its own identity. An orphan number is
-  below the successor's block and never listed, so it is voided for good once the
-  table passes it. The one liveness item left, tracked separately and not part of
+  below the successor's block and never listed. It is voided for good once the
+  table passes it: on the root's forward path only after a restart or an
+  in-process rebuild (the seeding, or the lazy void, meets it then); within an
+  incarnation, only a read voids it (`void_ended_generations`). The one liveness item left, tracked separately and not part of
   this change: rows of a grant the log never carried (never witnessed: a delegate
   never executed one) would still make `deleg_gens_awaiting_end` block that node's
   installs, for the log never ends them; the fix is to strand a delegate's own rows
@@ -2867,8 +2894,16 @@ protected only by `at_least` from the log: the same class as a lost journal.
   segments grow by 2.0% stored (2.5% decompressed) in `placement-hot+commit` and by
   7 to 12% stored in the delegated configurations (PROGRESS "ADR-43").
 - One `fsync` per grant (grants are rare: placement windows are 30 s).
-- The CLI shows a number as `epoch.n (number)` where it names a generation for a
-  person; `--gen` takes the number.
+- A latent bug on the base the branch moves from (f188c707): the rolled-back
+  hole pass (`hole_tail_rolled_back_tx`) scanned the backup tail's keyspace up to
+  `MEMBER_COPY_BASE`, which took in a delegate's rows at `1 << 48` to `2 << 48`,
+  and decoded them as `BackupTx`; a `DelegateTx` with a `rid` misparses, which
+  either errors (aborting the `backup_append` or strand transaction) or yields
+  garbage that matches no identity. Moving the delegate's slots to `1 << 62` and
+  stopping the pass and `backup_clear` at the member copies' base fixes it.
+- The CLI's abandon-group wait line shows a number as `epoch.n (number)`; `--gen`
+  takes the number, and the daemon's control replies and logs print the number
+  alone.
 
 **May revert**: never as a whole; under plan 46 M1.2's one stream per node the minting
 site moves to the `DelegateNode` record, the rule does not.

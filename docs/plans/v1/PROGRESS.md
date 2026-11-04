@@ -65486,13 +65486,65 @@ grant leaves; a number outside the block, from any source, is refused. No backwa
      void on a reopened store, `max_gen = (6 << 32) | 1`, live `{}`, no keys, `reaches_streams({(5 << 32 | 3): 2})` false before the
      check, true after it, `deps_lost` true) and session tests (`a_reopened_session_seeds_sparse_generations`,
      `only_a_generation_that_ended_before_the_open_is_voided_lazily`).
-   - Comments: the `replay.rs` lift of a void at a grant stays as a guard (a grant never meets another grant's void now); `spec.rs`
+   - Comments: the `replay.rs` lift of a void at a grant stays as a guard (a grant never meets another grant's void now, bar the
+     in-incarnation one a journaled end left); `spec.rs`
      cites ADR-43; the CLI shows a generation in the abandon-group line as `epoch.n (number)` (`--gen` takes the number).
 3. `test(sim)`: the oracle "no generation number is minted twice" (a thread-local `mint_hook`, as the write-check hook; checked first),
    pins `regression_no_generation_number_is_minted_twice` (placement-hot with the knob: 16871 real first, 1659 and 2958 orphan first),
    and, for the sweeps below, `SWEEP-SEGMENTS` and a `SWEEP-SIG` line per seed. On f188c707 with the oracle all three pins fail
    ("generation N minted twice", 1 for 16871 and 16 for 1659), and pass with the fix.
 4. `docs`: DESIGN section 4, ADR-43, the GLOSSARY entry, `delegations.md`, plan 46 section 5.2, this section.
+
+### Review follow-ups (Opus code review of the four commits: sound with changes; three more commits and a rebase onto the sim session-oracle change)
+
+- **M-1** (`fix(meta)`): the executors ask `deps_lost` before `reaches_streams` (`holder.rs` `mutate_request`, the delegate stream's append and
+  drain), and only the reaches path voided lazily. A forwarded op whose dependency named a key-less generation that ended before the open,
+  above its real cut, passed `deps_lost` (not voided yet), was reached by the void at cut 0 and executed ahead of its cause, where main's
+  eager seeding refused it. `Meta::deps_lost_deps` runs the lazy void, then the session's `deps_lost`; `Replica::deps_lost` for `Meta` calls it.
+  Tests: `a_lost_dependency_on_a_keyless_ended_generation_is_lost_at_the_first_check` (meta) and
+  `the_replicas_deps_lost_voids_a_generation_that_ended_before_the_open` (authority lib) fail without the void in `deps_lost_deps` and with the
+  trait method still calling the session's `deps_lost`.
+- **S-3** (`fix(meta)`): the eager seeding voided keyed generations above the table's highest, against `ended_before_open`'s rule: a deposed
+  root's stranded appends leave `deleg_log_idx:g` (`retract_log_idx_tx` keeps the key) while the strand rolls the table back below `g`, and
+  recovery then depended on the L4 unvoid. `seed_generations` takes the table's highest and voids only at or below it (main seeded
+  `1..=max_gen`). Tests: `a_restart_does_not_void_a_generation_above_the_tables_highest` (meta) and
+  `a_key_above_the_tables_highest_generation_is_held_not_voided` (session) fail with the old condition. The `replay.rs` comment on the unvoid
+  says what it still covers (the in-incarnation void a journaled end left).
+- **S-1** (`fix(meta)`): the rebuild is in-process (`replace_ns_from_rebuilt`: `authority_driver.rs`, sim `node.rs`; nothing reopens), so a
+  generation that ended inside its window had no key and the session was not seeded again: a dependency on it waited for the rest of the
+  process (as on main), and after a restart the lazy void met it at cut 0 and reported dependencies at or below the real cut as lost. The
+  rebuild now copies the side replica's `deleg_log_idx:*` and `deleg_void_cut:*` keys raise-only (after the reset's strand, which retracts
+  only this node's own counts and cuts), seeds the session as an open does (`Meta::seed_session_generations`, shared with the open) and takes
+  the rebuilt table (the durable log's) as the open-table snapshot. Test `an_in_process_rebuild_carries_the_ends_its_window_holds` fails
+  without the copy and the seeding (in-process: the ended generation is not voided; after a restart, with only the in-process half disabled:
+  a dependency at the real cut reported lost).
+- **What the sweeps do not cover (S-2).** The sim's nodes open one in-memory `Meta` and a simulated restart keeps it (`session().reset()`
+  keeps the open-table snapshot, the empty one of the creation): at a restart `ended_before_open` is false and the seeding runs on an empty
+  store, so the sim never exercises the restart's restricted lazy void, and "the sweeps match main" (the rows below) does not validate it.
+  Only the meta tests cover it. The sim does run the in-process rebuild, which since S-1 refreshes the snapshot: the lazy void and the key
+  copy are reached there, after a rebuild only. The sweep rows further below were measured before the follow-ups; the follow-ups' own sweeps are
+  in the paragraph "Sweeps after the follow-ups" of this section.
+- **A latent bug on the base** (f188c707): the rolled-back hole pass (`hole_tail_rolled_back_tx`) scanned the backup tail's keys up to
+  `MEMBER_COPY_BASE`, which included a delegate's rows at `1 << 48` to `2 << 48`, and decoded them as `BackupTx`; a `DelegateTx` with a
+  `rid` misparses, which either errors (aborting the `backup_append` or strand transaction) or yields garbage that matches no identity.
+  The move of the delegate's slots to `1 << 62`, with the pass and `backup_clear` stopping at the member copies' base, fixes it.
+- **Sweeps after the follow-ups and the rebase** (box 1, release; main 7a19bb95 against the final tree; with and without
+  `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`): `placement-hot` 0..10,000, `long-delegated`, `long-delegated-backup`,
+  `long-delegated-late-answers`, `delegated-backup`, `delegated-holder-cut`, `delegated-no-backup-root-near`, `delegated-group-switch` and
+  `delegated-root-crash` 0..2,000, `delegated-holder-cut+commit` and `delegated-backup+commit` 0..299. The failing sets are the same on both
+  trees in every row (`placement-hot` knob 4418, `delegated-group-switch` knob 1525, none elsewhere; i1 = i2 = 0 in both `+commit` rows), the
+  unsettled seed sets (`SWEEP-UNSETTLED`) are identical in every row, and so are the oracle's I1, I2, I2c, I4 and I5 counts and the failover
+  p50 / p90. Differences, all of the sim's own noise: in the `SWEEP-ORACLE-TOTALS` "acks by class" and class-mismatch counters of
+  `placement-hot` (both knobs), `long-delegated-backup` (both), `long-delegated-late-answers` (both), `delegated-holder-cut` (no knob) and
+  `delegated-group-switch` (no knob), by a few acknowledgements in hundreds of thousands (for example `placement-hot` no knob: archive
+  430,861 / 430,862, deleg-group 98,972 / 98,967, class-mismatch 82,819 / 82,829; `long-delegated-backup` no knob: one seed's
+  "keys across generations" cause 68 / 67), and in "answered from the stream" (94,881 / 94,885 `placement-hot` no knob; 99,904 / 99,912 with
+  it; one in `long-delegated-late-answers` no knob; three in `delegated-group-switch` no knob). A second run of main alone (the three 2,000-seed
+  rows with the largest differences, no knob) differs from the first run of main by the same few units (class-mismatch 15,629 / 15,628,
+  archive 46,924 / 46,922 in `long-delegated-backup`), so none of them is the branch's.
+- Also (NITs): ADR-43's "voided for good" sentence says on the root's forward path only after a restart or a rebuild, within an incarnation
+  only a read voids it; the CLI's abandon-group wait line is the only text that prints `gen_label` (the daemon's control replies and logs
+  print the raw number; unifying them is not trivial and is left).
 
 ### Sweeps (box 1, release; `main` is f188c707 with the oracle's counter only (it reports, it does not fail), `fix` is the branch; knob = `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`)
 
@@ -65560,3 +65612,8 @@ grant leaves; a number outside the block, from any source, is refused. No backwa
 passed, 20 ignored; lib 388, `generation_epochs` 4), authority lib 1,005, engine lib 948, net lib 127, control lib 146, harness lib
 165, CLI crate all targets 128; sim suite 360 passed, 0 failed, 13 ignored (359 on main plus the pin). One grant is one `fsync` (grants
 are rare), neutral on every file system.
+
+After the review follow-ups and the rebase onto 7a19bb95 (final tree, release, 0 failed): `cargo fmt --all --check` and `cargo clippy
+--workspace --all-targets -- -D warnings` clean; meta all targets 578 passed, 20 ignored (lib 389; `generation_epochs` 7), authority lib 1,006,
+engine lib 948, net lib 127, control lib 146, harness lib 165, CLI crate all targets 128; sim suite 366 passed, 0 failed, 12 ignored (365 on
+main 7a19bb95 plus the pin); `lda_4125_slow_lease_reads_seed`, `session_guarantees_hold` and both `m03_` ratchet tests re-run and passing.
