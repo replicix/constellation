@@ -866,6 +866,12 @@ fn an_abandon_leaves_a_generation_a_later_stream_ends_alone() {
 /// the recall strand then takes the shadow and queues its rid for replay.
 #[test]
 fn an_abandon_ends_a_generation_only_a_requester_s_shadow_names() {
+    for committed in [false, true] {
+        a_requester_s_shadow_alone_names(committed);
+    }
+}
+
+fn a_requester_s_shadow_alone_names(committed: bool) {
     let g = gen(1, 1);
     let rid = Rid {
         node: 9,
@@ -891,7 +897,7 @@ fn an_abandon_ends_a_generation_only_a_requester_s_shadow_names() {
         time_ns: 10,
     }];
     assert!(meta
-        .install_shadow_from(rid, 1, g, &op, &Default::default(), &records)
+        .install_shadow_committed(rid, 1, g, &op, &Default::default(), &records, committed)
         .unwrap());
     assert!(meta.delegation_table().iter().all(|d| d.gen != g));
     assert!(meta.lookup(ROOT_INO, "x").unwrap().is_some());
