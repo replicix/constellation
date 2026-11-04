@@ -4530,6 +4530,16 @@ impl Meta {
                 _ => None,
             })
             .collect();
+        // The same records' cuts (`None`: an older `Recall`), all of them
+        // also: kept below, in this transaction.
+        let ends: Vec<(u64, Option<u64>)> = records
+            .iter()
+            .filter_map(|rec| match rec {
+                LogRecord::Recall { gen, .. } => Some((*gen, None)),
+                LogRecord::RecallCut { gen, through, .. } => Some((*gen, Some(*through))),
+                _ => None,
+            })
+            .collect();
         let completes: HashSet<Rid> = records
             .iter()
             .filter_map(|rec| match rec {
@@ -4583,6 +4593,17 @@ impl Meta {
         let first_of_epoch = prev_applied.is_none_or(|pos| pos.epoch < epoch);
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
+        // ADR-43 (orphan grants): what the table lists before an operator's
+        // abandon strands the speculation no successor re-ships (read only
+        // then; see `orphaned_by_abandon_tx`).
+        let listed_before: std::collections::BTreeSet<u64> = if abandoned.is_empty() {
+            Default::default()
+        } else {
+            crate::delegation::read_table_tx(&tx, self)?
+                .iter()
+                .map(|d| d.gen)
+                .collect()
+        };
         let strands = |entry: &LiveEntry| {
             (entry.stranded_by(epoch)
                 && !matches!(entry, LiveEntry::Shadow { rid, .. } if completes.contains(rid)))
@@ -5059,6 +5080,37 @@ impl Meta {
             self.ack_rows_tx(&mut tx, &own_seqs, seq)?;
             retired += own_txs.len();
         }
+        // The cut of every generation this segment ends, kept for a restart
+        // and for an install that waits for the end
+        // (`Meta::deleg_gens_awaiting_end`), in this transaction: a record
+        // the root's stream installed first is among the rows skipped above
+        // and is not applied again, and a cut written after the commit is
+        // lost to a crash in between (the restart then voided at the log's
+        // index of the generation, or not at all, below the record's cut).
+        // Only raised, as the durable apply of the record does. (From every
+        // record of the segment: `records` here is what was not skipped.)
+        for (gen, cut) in &ends {
+            match cut {
+                Some(through) => local::bump_void_cut_tx(&mut tx, &self.local, *gen, *through)?,
+                None => {
+                    local::bump_void_cut_at_log_idx_tx(&mut tx, &self.local, *gen)?;
+                }
+            }
+        }
+        // ADR-43: a generation whose grant an abandon proves will never be
+        // in the log is ended here as the log's `Recall` would end it, at
+        // what the log holds of it (`orphaned_by_abandon_tx`).
+        let orphaned = if abandoned.is_empty() {
+            Vec::new()
+        } else {
+            self.orphaned_by_abandon_tx(&tx, &abandoned, &listed_before, &recalled)?
+        };
+        let mut orphan_cuts: Vec<(u64, u64)> = Vec::new();
+        for gen in &orphaned {
+            let cut = local::bump_void_cut_at_log_idx_tx(&mut tx, &self.local, *gen)?;
+            orphan_cuts.push((*gen, cut));
+        }
+        let recalled: HashSet<u64> = recalled.iter().chain(orphaned.iter()).copied().collect();
         // Plan 30 §M11: a generation the log recalls strands whatever of
         // it this node still holds unappended (past the cut: everything
         // appended is before the `Recall` record, hence retired above).
@@ -5133,6 +5185,15 @@ impl Meta {
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;
+        for (gen, cut) in orphan_cuts {
+            tracing::info!(
+                gen,
+                cut,
+                "an abandon ended a delegation generation whose grant never reached the log"
+            );
+            self.session.void_stream(gen, cut);
+            self.session.note_void_cut(gen, cut);
+        }
         self.report_rolled_back();
         staged.drain_into(self.usage_tracker());
         if !own_seqs.is_empty() {
@@ -5328,6 +5389,66 @@ impl Meta {
         &self,
     ) -> Result<std::collections::BTreeSet<u64>, MetaError> {
         self.speculatively_ended_generations_at(&self.db.read_tx())
+    }
+
+    /// ADR-43 (orphan grants): the generations an operator's abandon of the
+    /// root group of an epoch at or below the highest of `abandoned`
+    /// (`GroupAbandoned { gen: 0 }`, in the segment being applied, after its
+    /// strands) proves the log will never grant. A number is minted, and its
+    /// `Delegate` journaled, by the tenure of its epoch only
+    /// (`gen_epoch`), and a row of a generation is appended only after its
+    /// grant; the abandon says that nothing of that tenure, or of an older one,
+    /// that the log does not carry yet ever will be (the strand above
+    /// already rolls back every outstanding entry of those epochs on that
+    /// premise, `LiveEntry::stranded_by_abandon`). So a generation of such an
+    /// epoch that the table no longer lists, that this replica holds no
+    /// trace of in the log (no `deleg_void_cut`, no `deleg_log_idx`), that no
+    /// outstanding speculation ends and that this segment does not recall
+    /// was granted only by speculation the abandon stranded: the log holds
+    /// nothing of it and never will. The candidates are the ones the table
+    /// listed before the strand (`listed_before`) and the ones this node
+    /// holds its own delegate rows of (`deleg_gens_awaiting_end`: a delegate
+    /// that executed under the stranded grant; they would block its installs
+    /// for good, `delegation_sync`). Numbers of the old mint (epoch 0) are
+    /// left alone: their minting tenure is unknown.
+    fn orphaned_by_abandon_tx(
+        &self,
+        tx: &SingleWriterWriteTx,
+        abandoned: &[u64],
+        listed_before: &std::collections::BTreeSet<u64>,
+        recalled: &HashSet<u64>,
+    ) -> Result<Vec<u64>, MetaError> {
+        let Some(&upto) = abandoned.iter().max() else {
+            return Ok(Vec::new());
+        };
+        let listed: std::collections::BTreeSet<u64> = crate::delegation::read_table_tx(tx, self)?
+            .iter()
+            .map(|d| d.gen)
+            .collect();
+        let mut candidates = listed_before.clone();
+        candidates.extend(local::deleg_gens_awaiting_end_tx(tx, self, &listed)?);
+        let candidates: Vec<u64> = candidates
+            .into_iter()
+            .filter(|g| {
+                let e = crate::delegation::gen_epoch(*g);
+                e != 0 && e <= upto && !listed.contains(g) && !recalled.contains(g)
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Ok(candidates);
+        }
+        let speculative = self.speculatively_ended_generations_at(tx)?;
+        let mut out = Vec::new();
+        for g in candidates {
+            if speculative.contains(&g)
+                || kv_get_tx(tx, &self.local, &local::deleg_void_cut_key(g))?.is_some()
+                || kv_get_tx(tx, &self.local, &local::deleg_log_idx_key(g))?.is_some()
+            {
+                continue;
+            }
+            out.push(g);
+        }
+        Ok(out)
     }
 
     /// [`Self::speculatively_ended_generations`] under `r` (the read path

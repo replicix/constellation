@@ -1246,8 +1246,14 @@ impl SessionState {
             // rolls the table back below it) names a grant the log may yet
             // carry, whose rows must not meet a void
             // (`ended_before_open`'s rule).
-            if gen <= max_gen && !live.contains(&gen) {
-                let cut = void_cut(gen).unwrap_or(idx);
+            // A kept cut is an end the log applied (or, ADR-43, an abandon
+            // proved the grant never reaches it: `orphaned_by_abandon_tx`,
+            // a number the table never listed), so it voids above the
+            // highest too; a deposed root's own stranded end leaves no cut
+            // (`retract_void_cut_tx`).
+            let kept = void_cut(gen);
+            if (gen <= max_gen || kept.is_some()) && !live.contains(&gen) {
+                let cut = kept.unwrap_or(idx);
                 g.voided.insert(gen);
                 g.observed.streams.lower(gen, cut);
                 // Set, not raised: the store's cut is the log's. After an

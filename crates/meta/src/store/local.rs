@@ -1006,55 +1006,7 @@ impl Meta {
         live: &std::collections::BTreeSet<u64>,
     ) -> Result<Vec<u64>, MetaError> {
         let r = self.db.read_tx();
-        let floor = journal::acked_watermark(&r, &self.local)?;
-        let mut out = Vec::new();
-        // One seek per generation the keyspace holds (it is ordered by
-        // generation), not a walk of every outstanding row.
-        let mut gen = 1u64;
-        loop {
-            let lo = journal_origin_key(gen, 0, 0);
-            let mut next = None;
-            for guard in r.range(&self.journal_origin, lo..) {
-                let (g, _, first) = decode_journal_origin_key(&guard.key()?)?;
-                if g != next.map_or(g, |(n, _)| n) {
-                    break;
-                }
-                let held = first > floor;
-                next = Some((g, held));
-                if held {
-                    break;
-                }
-            }
-            let Some((g, held)) = next else {
-                break;
-            };
-            if held
-                && !live.contains(&g)
-                && kv_get_tx(&r, &self.local, &deleg_void_cut_key(g))?.is_none()
-            {
-                out.push(g);
-            }
-            let Some(after) = g.checked_add(1) else {
-                break;
-            };
-            gen = after;
-        }
-        Ok(out)
-    }
-
-    /// Keep the cut of ended generation `gen` (`None`: an older `Recall`
-    /// with no cut, kept at the log's index of the generation), as the
-    /// durable apply of the record does (`bump_void_cut_tx`): only raised.
-    pub fn persist_void_cut(&self, gen: u64, cut: Option<u64>) -> Result<(), MetaError> {
-        let mut tx = self.db.write_tx();
-        match cut {
-            Some(cut) => bump_void_cut_tx(&mut tx, &self.local, gen, cut)?,
-            None => {
-                bump_void_cut_at_log_idx_tx(&mut tx, &self.local, gen)?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
+        deleg_gens_awaiting_end_tx(&r, self, live)
     }
 
     fn note_log_idx(&self, gen: u64, idx: u64) -> Result<(), MetaError> {
@@ -3025,6 +2977,49 @@ pub(crate) fn bump_void_cut_at_log_idx_tx(
         .unwrap_or(0);
     bump_void_cut_tx(tx, local, gen, log)?;
     Ok(log)
+}
+
+/// [`Meta::deleg_gens_awaiting_end`] in the caller's snapshot or
+/// transaction.
+pub(crate) fn deleg_gens_awaiting_end_tx(
+    r: &impl Readable,
+    meta: &Meta,
+    live: &std::collections::BTreeSet<u64>,
+) -> Result<Vec<u64>, MetaError> {
+    let floor = journal::acked_watermark(r, &meta.local)?;
+    let mut out = Vec::new();
+    // One seek per generation the keyspace holds (it is ordered by
+    // generation), not a walk of every outstanding row.
+    let mut gen = 1u64;
+    loop {
+        let lo = journal_origin_key(gen, 0, 0);
+        let mut next = None;
+        for guard in r.range(&meta.journal_origin, lo..) {
+            let (g, _, first) = decode_journal_origin_key(&guard.key()?)?;
+            if g != next.map_or(g, |(n, _)| n) {
+                break;
+            }
+            let held = first > floor;
+            next = Some((g, held));
+            if held {
+                break;
+            }
+        }
+        let Some((g, held)) = next else {
+            break;
+        };
+        if held
+            && !live.contains(&g)
+            && kv_get_tx(r, &meta.local, &deleg_void_cut_key(g))?.is_none()
+        {
+            out.push(g);
+        }
+        let Some(after) = g.checked_add(1) else {
+            break;
+        };
+        gen = after;
+    }
+    Ok(out)
 }
 
 /// Forget the persisted cut of `gen` set by a `RecallCut { through }` that
