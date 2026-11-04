@@ -78,7 +78,9 @@ pub struct BackupTx {
 /// identity is its `TailOf` if it begins with one, else its place
 /// `(epoch, first)` in the tail. The member copies are in the same
 /// keyspace, past [`super::member::MEMBER_COPY_BASE`], and are dealt with
-/// by `member::hole_rolled_back_tx`. Returns how many became holes.
+/// by `member::hole_rolled_back_tx`; so are the delegates' streams, past
+/// them (`DELEG_BACKUP_BASE`), whose rows are not `BackupTx`. Returns how
+/// many became holes.
 pub(crate) fn hole_tail_rolled_back_tx(
     tx: &mut fjall::SingleWriterWriteTx,
     meta: &Meta,
@@ -386,9 +388,10 @@ impl Meta {
     pub fn backup_clear(&self) -> Result<(), MetaError> {
         *self.backup_tail_floor.lock().unwrap() = None;
         let mut tx = self.db.write_tx();
-        // The holder's tail only: the keys from `DELEG_BACKUP_BASE` up
-        // are the delegates' streams this node backs, which outlive any
-        // holder tenure (long-delegated-backup seed 70232: a node that
+        // The holder's tail only: the keys from `MEMBER_COPY_BASE` up are
+        // the member copies and, past them, the delegates' streams this
+        // node backs (`DELEG_BACKUP_BASE`), which outlive any holder
+        // tenure (long-delegated-backup seed 70232: a node that
         // stopped being the holder's backup wiped a delegate's rows too;
         // its acknowledgement fell to 0 for good, the delegate re-sent
         // and was answered short in a loop, and its client's op waited
@@ -396,7 +399,7 @@ impl Meta {
         let keys: Vec<Vec<u8>> = tx
             .range(
                 &self.backup_tail,
-                tail_key(0, 0)..tail_key(DELEG_BACKUP_BASE, 0),
+                tail_key(0, 0)..tail_key(super::member::MEMBER_COPY_BASE, 0),
             )
             .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
             .collect::<Result<_, _>>()?;
@@ -472,8 +475,13 @@ impl Meta {
 
 /// The `backup_tail` key space of a delegate's stream: `epoch` slots
 /// above this base hold generation `epoch - base` (the M9 tail keys are
-/// lease epochs, far below).
-const DELEG_BACKUP_BASE: u64 = 1 << 48;
+/// lease epochs, far below, and the member copies sit at
+/// [`super::member::MEMBER_COPY_BASE`]). A generation number carries the
+/// epoch of the tenure that minted it (`gen = epoch << 32 | n`, ADR-43), so
+/// the slots reach `base + (GEN_MAX_EPOCH << 32 | u32::MAX)`: past the
+/// member copies' and below `u64::MAX`, for every epoch that can mint
+/// (`deleg_backup_slot_never_meets_a_member_copy_slot`).
+const DELEG_BACKUP_BASE: u64 = 1 << 62;
 
 fn deleg_epoch(gen: u64) -> u64 {
     DELEG_BACKUP_BASE + gen
@@ -681,6 +689,52 @@ mod tests {
             }),
         )
         .unwrap();
+    }
+
+    /// ADR-43: a generation number is `epoch << 32 | n`, so a delegate's tail
+    /// slot `DELEG_BACKUP_BASE + gen` runs far past `2^48`: it must never
+    /// land on a member copy's slot (`MEMBER_COPY_BASE + epoch`), whichever
+    /// epoch minted it, and neither space's clear may reach the other's rows.
+    #[test]
+    fn deleg_backup_slot_never_meets_a_member_copy_slot() {
+        use crate::delegation::{GEN_EPOCH_SHIFT, GEN_MAX_EPOCH};
+        // The bounds: the delegates' slots start past every member copy and
+        // the highest mintable number still fits.
+        let top = (GEN_MAX_EPOCH << GEN_EPOCH_SHIFT) | u64::from(u32::MAX);
+        const {
+            assert!(DELEG_BACKUP_BASE > 3 << 48, "past every member copy slot");
+        }
+        assert!(DELEG_BACKUP_BASE
+            .checked_add(top)
+            .is_some_and(|s| s < u64::MAX));
+        // The epoch that, in the old `1 << 48` layout, put its first number on
+        // the member copy of epoch 1.
+        let gen = (1u64 << 16 << GEN_EPOCH_SHIFT) | 1;
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_holder_epoch(1);
+        create(&meta, "a", 1);
+        let txs = meta.journal_txs_from(1, 1000).unwrap();
+        meta.member_copy_put(1, 2, &txs).unwrap();
+        let dtx = |idx| crate::store::DelegateTx {
+            idx,
+            rid: None,
+            records: Vec::new(),
+            deps: Default::default(),
+        };
+        meta.deleg_backup_append(gen, 0, &[dtx(1), dtx(2)]).unwrap();
+        meta.deleg_backup_append(gen + 1, 0, &[dtx(1)]).unwrap();
+        // Ending the generation drops its rows only; the member copy stays.
+        meta.deleg_backup_clear(gen).unwrap();
+        assert!(!meta.deleg_backup_holds_any(gen).unwrap());
+        assert!(meta.deleg_backup_holds_any(gen + 1).unwrap());
+        assert_eq!(meta.member_copy(1).unwrap().unwrap().1, txs);
+        // The holder's tail clear reaches neither.
+        meta.backup_clear().unwrap();
+        assert!(meta.deleg_backup_holds_any(gen + 1).unwrap());
+        assert_eq!(meta.member_copy(1).unwrap().unwrap().1, txs);
+        // Dropping the member copy leaves the delegate's rows.
+        meta.member_copy_drop(1).unwrap();
+        assert!(meta.deleg_backup_holds_any(gen + 1).unwrap());
     }
 
     /// Plan 43 C1-3: the member copy (a sealed holder's rows) lives apart

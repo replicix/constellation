@@ -644,6 +644,23 @@ impl Meta {
     }
 }
 
+/// A generation number's epoch block (ADR-43): `gen = epoch << GEN_EPOCH_SHIFT | n`,
+/// `n` the minting node's counter within the tenure.
+pub const GEN_EPOCH_SHIFT: u32 = 32;
+
+/// The highest lease epoch that can mint a generation number. The number
+/// then stays below `2^61`, so every id space built on `BASE + gen` stays
+/// inside its own range and below `2^63`: the delegate backup tail's
+/// `1 << 62` (`store::backup`, past the member copies' `2 << 48`), the
+/// parked-wait ids' `1 << 62` and the delegates' read-delegation epochs'
+/// `1 << 48`. Lease epochs grow by one per acquisition: unreachable.
+pub const GEN_MAX_EPOCH: u64 = (1 << 29) - 1;
+
+/// The epoch of the tenure that minted generation number `gen`.
+pub fn gen_epoch(gen: Gen) -> u64 {
+    gen >> GEN_EPOCH_SHIFT
+}
+
 /// `local` kv: the root's next delegation generation.
 pub(crate) const KV_NEXT_DELEG_GEN: &str = "next_deleg_gen";
 
