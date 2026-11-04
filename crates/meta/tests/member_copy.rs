@@ -167,7 +167,10 @@ fn a_committed_row_moved_to_the_member_copy_holds_its_readers() {
     // The successor's first segment (epoch 2, an unrelated row).
     let other = vec![create("b", ino(2), 11), completed(rid(2))];
     apply_rows(&meta, 1, 2, 2, &[1, 2], &other);
-    assert!(meta.lookup(ROOT_INO, "data").unwrap().is_none(), "rolled back");
+    assert!(
+        meta.lookup(ROOT_INO, "data").unwrap().is_none(),
+        "rolled back"
+    );
     assert!(meta.member_copy_carries(rid(1)).unwrap());
     assert!(meta.pending_replays().unwrap().is_empty(), "not queued");
     assert!(
@@ -184,7 +187,10 @@ fn a_committed_row_moved_to_the_member_copy_holds_its_readers() {
     ];
     apply_rows(&meta, 2, 2, 5, &[3, 4, 5], &reship);
     assert!(meta.lookup(ROOT_INO, "data").unwrap().is_some());
-    assert!(!meta.member_copy_carries(rid(1)).unwrap(), "retired by the re-ship");
+    assert!(
+        !meta.member_copy_carries(rid(1)).unwrap(),
+        "retired by the re-ship"
+    );
     assert!(!meta.replay_touches(&key));
 }
 
