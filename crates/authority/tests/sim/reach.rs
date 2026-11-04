@@ -1059,26 +1059,41 @@ fn claim_done(
         Some(l) if l.holder == 0 || l.released => since_of(l.at_ms).max(run_from),
         Some(l) => since_of(l.at_ms) + g.lease_ttl_ms + claim_grace_for(g, l, me),
     };
-    // The claim itself starts with a fresh read: the product claims by TTL
-    // only on a read it *handles* at or after its observation's TTL has run
+    // A claim by TTL starts with a fresh read: the product claims by TTL only
+    // on a read it *handles* at or after its observation's TTL has run
     // (`LeaseState::classify`, the observation rule: a read at `t1 >= t0 +
-    // ttl`), and every acquisition attempt begins with that read; the promise
-    // check and the CAS follow its answer. Its cost is taken from the
-    // history: the claimant's first lease read answered from the claim's
-    // start on, less any delay of the product's before it was issued (only
-    // the read's own transit is excused, as a read issued at the start would
-    // have taken). With no such read, the fastest read the configuration
-    // allows (plan 46 M0.3, the review of cause 6: with slow lease reads,
-    // 0.8 to 1 s each, that read was the residual the model left out).
+    // ttl`; `Plan::Busy::retry_at` issues that read), and the promise check and
+    // the CAS follow its answer. Only that arm waits: no lease, a lease nobody
+    // holds, a released one (and a fenced one, which the model does not tell
+    // apart) go to the CAS after the FIRST read, which `ready` already counts,
+    // and a lease of `me`'s own is claimed at once too when untracked (the
+    // model cannot tell a tracked one, and charges nothing extra either way).
+    // The fresh read's cost is taken from the history: the earliest lease read
+    // of the claimant issued at or after the claim's start (the retry's read;
+    // the history cannot tell it from another lease GET of the node, such as a
+    // registration read, so the earliest answered one stands, and a read
+    // issued before the start is not taken for it), less any delay of the
+    // product's before it was issued (only the read's own transit is excused,
+    // as a read issued at the start would have taken). With no such read, the
+    // fastest read the configuration allows (plan 46 M0.3, the review of cause
+    // 6: with slow lease reads, 0.8 to 1 s each, that read was the residual
+    // the model left out). A claim made on a takeover permit (older behaviour:
+    // the model charges the TTL and grace for it anyway) is not made worse.
     let start = ready.max(run_from);
-    let read_done = g
-        .lease_reads
-        .iter()
-        .filter(|(n, _, _, observed)| *n == me && *observed >= start)
-        .min_by_key(|(_, _, _, observed)| *observed)
-        .map_or(start + g.min_lease_read_ms, |(_, sent, _, observed)| {
-            observed - sent.saturating_sub(start).min(observed - start)
-        });
+    let waits_ttl = lease
+        .as_ref()
+        .is_some_and(|l| l.holder != 0 && !l.released && l.holder != me);
+    let read_done = if waits_ttl {
+        g.lease_reads
+            .iter()
+            .filter(|(n, sent, _, observed)| *n == me && *sent >= start && *observed >= start)
+            .min_by_key(|(_, _, _, observed)| *observed)
+            .map_or(start + g.min_lease_read_ms, |(_, sent, _, observed)| {
+                *observed - (*sent - start).min(*observed - start)
+            })
+    } else {
+        start
+    };
     let done = read_done + g.claim_tail_ms;
     if done > until {
         return Err(format!(
@@ -2605,26 +2620,113 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_slow_lease_read_does_not_excuse_a_reachable_root() {
-        // The root is up, holds its lease and is reachable over the whole
-        // window: the requester's slow lease reads change nothing, it is a
-        // violation (a product cause), not "no sequencer in time".
-        let r = world();
-        r.lease_landed_at(3_500, 1, 8_000, false);
-        r.lease_read_sent(3, 4_000, 4_010, 6_950);
-        let v = r.classify(q(3));
+    /// The claim of node 3 in the window [4 000, 5 000] is possible, done at
+    /// `to_ms`, by the lease path.
+    fn assert_claim_done_at(r: &Reach, to_ms: u64) {
+        let v = r.classify(Question::new(3, 4_000, 5_000));
         assert!(
             matches!(
                 v,
                 Verdict::Reachable {
-                    via: Via::Root(1),
+                    via: Via::LeasePath,
+                    to_ms: t,
                     ..
-                }
+                } if t == to_ms
             ),
             "{v:?}"
         );
-        assert!(!v.allowed(), "{v:?}");
+    }
+
+    #[test]
+    fn a_claim_without_a_ttl_wait_adds_no_fresh_read() {
+        // Plan 46 M0.3, the review of cause 6: only a claim by TTL waits for a
+        // second read. A released lease, a lease nobody holds and no lease at
+        // all go to the CAS after the first read (counted in `ready`), so a
+        // slow lease read answered at 4 950 must not excuse them: they stay
+        // a violation (a reachable lease path), done a claim's tail
+        // (100 ms) after the start.
+        let slow = |r: &Reach| r.lease_read_sent(3, 4_000, 4_010, 4_950);
+        // Released: ready from the window's start.
+        let r = world();
+        r.lease_landed_at(2_500, 1, 3_500, true);
+        r.attached_at(3_000, 1, false);
+        r.lease_read(3, 2_600, 2_650);
+        slow(&r);
+        assert_claim_done_at(&r, 4_100);
+        // Held by nobody (holder 0).
+        let r = world();
+        r.lease_landed_at(2_500, 0, 3_500, false);
+        r.lease_read(3, 2_600, 2_650);
+        slow(&r);
+        assert_claim_done_at(&r, 4_100);
+        // No lease at all: the first read is estimated (80 ms, two S3 hops
+        // at the hi bound) from the run's start; the slow read after it is
+        // not a second one.
+        let r = Reach::default();
+        r.configure(cfg(0, 0));
+        for n in 1..=3 {
+            r.attached_at(0, n, true);
+        }
+        slow(&r);
+        assert_claim_done_at(&r, 4_180);
+        // The same with a first read that was recorded before that estimate
+        // (it was answered at 4 050, earlier than the hi bound): the recorded
+        // read is not mistaken for a second one either.
+        let r = Reach::default();
+        r.configure(cfg(0, 0));
+        for n in 1..=3 {
+            r.attached_at(0, n, true);
+        }
+        r.lease_read_sent(3, 4_000, 4_010, 4_050);
+        slow(&r);
+        assert_claim_done_at(&r, 4_180);
+    }
+
+    #[test]
+    fn a_claim_by_ttl_counts_only_a_read_issued_from_its_start() {
+        let dead_root = || {
+            let r = world();
+            r.lease_landed_at(2_500, 1, 3_500, false);
+            r.attached_at(3_000, 1, false);
+            r.lease_read(3, 2_600, 2_650);
+            r
+        };
+        // A read issued before the claim's start (3 900 < 4 000) and slow
+        // enough to be answered at 4 500 is not the claim's fresh read: the
+        // fallback (no extra delay here) stands.
+        let r = dead_root();
+        r.lease_read_sent(3, 3_900, 3_910, 4_500);
+        assert_claim_done_at(&r, 4_100);
+        // A later one, issued at 4 200, is: answered at 4 600 it was 400 ms
+        // in flight after its issue 200 ms past the start, so it counts as answered at 4 400 and the claim is done at 4 500.
+        let r = dead_root();
+        r.lease_read_sent(3, 4_200, 4_210, 4_600);
+        assert_claim_done_at(&r, 4_500);
+    }
+
+    #[test]
+    fn a_fresh_read_without_history_costs_the_fastest_read_the_configuration_allows() {
+        // 100 ms of S3 at least and slow reads that add 600 ms at least: the
+        // claim's fresh read is done 700 ms after its start (4 000), the claim
+        // at 4 800: inside a window ending at 5 000, past one ending at 4 750.
+        let dead_root = || {
+            let r = world();
+            r.configure(ReachConfig {
+                s3_latency_lo_ms: 100,
+                lease_read_extra_lo_ms: 600,
+                ..cfg(0, 0)
+            });
+            r.lease_landed_at(2_500, 1, 3_500, false);
+            r.attached_at(3_000, 1, false);
+            r.lease_read(3, 2_600, 2_650);
+            r
+        };
+        assert_claim_done_at(&dead_root(), 4_800);
+        let v = dead_root().classify(Question::new(3, 4_000, 4_750));
+        let Verdict::NoSequencerInTime { why } = v else {
+            panic!("{v:?}")
+        };
+        assert!(why.contains("a fresh read answered at 4700"), "{why}");
     }
 
     #[test]
