@@ -1389,7 +1389,7 @@ impl Core {
             node = self.cfg.node_id,
             ?rid,
             from,
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             ?base,
             ?position,
             applied,

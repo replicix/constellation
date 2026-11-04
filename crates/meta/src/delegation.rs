@@ -729,6 +729,30 @@ pub fn gen_epoch(gen: Gen) -> u64 {
     gen >> GEN_EPOCH_SHIFT
 }
 
+/// A generation number for a log line (ADR-43): `epoch:n`, the minting
+/// tenure's epoch and its counter within the tenure, where the raw `u64`
+/// (`epoch << 32 | n`) reads as noise. `GenLabel::of` takes the number or a
+/// reference to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenLabel(pub Gen);
+
+impl GenLabel {
+    pub fn of(gen: impl std::borrow::Borrow<Gen>) -> Self {
+        GenLabel(*gen.borrow())
+    }
+}
+
+impl std::fmt::Display for GenLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}",
+            gen_epoch(self.0),
+            self.0 & ((1 << GEN_EPOCH_SHIFT) - 1)
+        )
+    }
+}
+
 /// `local` kv: the root's next delegation generation.
 pub(crate) const KV_NEXT_DELEG_GEN: &str = "next_deleg_gen";
 

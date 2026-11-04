@@ -4558,7 +4558,7 @@ impl Driver {
                         let ok = match meta.sync() {
                             Ok(()) => true,
                             Err(error) => {
-                                tracing::warn!(%error, gen, "syncing a designee's journal failed");
+                                tracing::warn!(%error, gen = %constellation_meta::delegation::GenLabel::of(gen), "syncing a designee's journal failed");
                                 false
                             }
                         };

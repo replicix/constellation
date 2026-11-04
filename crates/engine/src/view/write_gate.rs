@@ -512,7 +512,7 @@ impl View {
                     if self.meta.delegate_stranded(gen).unwrap_or(false) {
                         tracing::info!(
                             ?rid,
-                            gen,
+                            gen = %constellation_meta::delegation::GenLabel::of(gen),
                             ?op,
                             "delegate fast path refused at the write: its generation ended at the takeover gate; through the core"
                         );
@@ -520,7 +520,7 @@ impl View {
                     } else {
                         tracing::debug!(
                             ?rid,
-                            gen,
+                            gen = %constellation_meta::delegation::GenLabel::of(gen),
                             "delegate fast path refused at the write: its delegation lapsed; through the core"
                         );
                     }

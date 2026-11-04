@@ -2935,9 +2935,9 @@ protected only by `at_least` from the log: the same class as a lost journal.
   either errors (aborting the `backup_append` or strand transaction) or yields
   garbage that matches no identity. Moving the delegate's slots to `1 << 62` and
   stopping the pass and `backup_clear` at the member copies' base fixes it.
-- The CLI's abandon-group wait line shows a number as `epoch.n (number)`; `--gen`
-  takes the number, and the daemon's control replies and logs print the number
-  alone.
+- The CLI's abandon-group wait line shows a number as `epoch:n (number)` and the
+  daemon's log lines as `epoch:n` (`GenLabel`); `--gen` takes the number, and the
+  daemon's control replies print the number alone.
 
 **May revert**: never as a whole; under plan 46 M1.2's one stream per node the minting
 site moves to the `DelegateNode` record, the rule does not.

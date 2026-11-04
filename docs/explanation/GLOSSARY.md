@@ -36,7 +36,7 @@ network splits, is what most of the machinery is for.
   authority over that directory (and what is under it), so the delegate
   answers operations there itself, without a round trip to the root. One
   hand-over is a **generation**, numbered by the tenure that grants it
-  (`epoch.n`: the lease epoch and that tenure's counter, so no two tenures
+  (`epoch:n`: the lease epoch and that tenure's counter, so no two tenures
   mint the same number,
   [ADR-43](DECISIONS.md#adr-43-a-generation-number-carries-the-epoch-of-the-tenure-that-minted-it)).
   The delegate:

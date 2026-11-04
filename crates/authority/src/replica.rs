@@ -1232,7 +1232,7 @@ impl Replica for Meta {
         gen: u64,
     ) -> Result<Option<constellation_meta::delegation::DelegGroupRow>, MetaError> {
         Meta::deleg_group(self, gen).inspect_err(|error| {
-            tracing::warn!(%error, gen, "reading a delegation's group failed");
+            tracing::warn!(%error, gen = %constellation_meta::delegation::GenLabel::of(gen), "reading a delegation's group failed");
         })
     }
 
@@ -1343,7 +1343,7 @@ impl Replica for Meta {
         match Meta::deleg_backup_append(self, gen, in_log, txs) {
             Ok(acked) => Some(acked),
             Err(error) => {
-                tracing::warn!(%error, gen, "persisting a delegate backup's append failed; not answering");
+                tracing::warn!(%error, gen = %constellation_meta::delegation::GenLabel::of(gen), "persisting a delegate backup's append failed; not answering");
                 None
             }
         }
@@ -1353,7 +1353,7 @@ impl Replica for Meta {
         match Meta::deleg_backup_tail(self, gen) {
             Ok(tail) => Some(tail),
             Err(error) => {
-                tracing::warn!(%error, gen, "reading a delegate backup's tail failed");
+                tracing::warn!(%error, gen = %constellation_meta::delegation::GenLabel::of(gen), "reading a delegate backup's tail failed");
                 None
             }
         }
@@ -1363,7 +1363,7 @@ impl Replica for Meta {
         match Meta::deleg_backup_seal(self, gen) {
             Ok(()) => true,
             Err(error) => {
-                tracing::warn!(%error, gen, "persisting a delegate backup's seal failed");
+                tracing::warn!(%error, gen = %constellation_meta::delegation::GenLabel::of(gen), "persisting a delegate backup's seal failed");
                 false
             }
         }
@@ -1373,7 +1373,7 @@ impl Replica for Meta {
         match Meta::deleg_backup_holds_any(self, gen) {
             Ok(held) => Some(held),
             Err(error) => {
-                tracing::warn!(%error, gen, "reading what a delegate backup holds failed");
+                tracing::warn!(%error, gen = %constellation_meta::delegation::GenLabel::of(gen), "reading what a delegate backup holds failed");
                 None
             }
         }
@@ -1383,7 +1383,7 @@ impl Replica for Meta {
         match Meta::deleg_backup_sealed(self, gen) {
             Ok(sealed) => Some(sealed),
             Err(error) => {
-                tracing::warn!(%error, gen, "reading a delegate backup's seal failed");
+                tracing::warn!(%error, gen = %constellation_meta::delegation::GenLabel::of(gen), "reading a delegate backup's seal failed");
                 None
             }
         }
@@ -1429,7 +1429,7 @@ impl Replica for Meta {
         // An unreadable mark is taken as set: the cost is a generation
         // ended early, not a stream that never drains.
         Meta::delegate_stranded(self, gen).unwrap_or_else(|e| {
-            tracing::warn!(gen, error = %e, "delegate-stranded mark unreadable; taking it as set");
+            tracing::warn!(gen = %constellation_meta::delegation::GenLabel::of(gen), error = %e, "delegate-stranded mark unreadable; taking it as set");
             true
         })
     }
@@ -1438,7 +1438,7 @@ impl Replica for Meta {
         match Meta::deleg_note_held(self, gen, boot) {
             Ok(()) => true,
             Err(error) => {
-                tracing::warn!(%error, gen, "recording a delegation's grant failed");
+                tracing::warn!(%error, gen = %constellation_meta::delegation::GenLabel::of(gen), "recording a delegation's grant failed");
                 false
             }
         }
@@ -1451,7 +1451,7 @@ impl Replica for Meta {
             // (`Now::wait_of_stamp`).
             Ok(held) => held.is_some_and(|b| b == 0 || boot == 0 || b != boot),
             Err(error) => {
-                tracing::warn!(%error, gen, "reading a delegation's grant record failed; taking it as another boot's");
+                tracing::warn!(%error, gen = %constellation_meta::delegation::GenLabel::of(gen), "reading a delegation's grant record failed; taking it as another boot's");
                 true
             }
         }
@@ -1459,7 +1459,7 @@ impl Replica for Meta {
 
     fn delegate_deps_from(&self, gen: u64, from: u64) -> Option<Vec<(u64, Position)>> {
         Meta::delegate_deps_from(self, gen, from)
-            .map_err(|error| tracing::warn!(%error, gen, "reading a stream's dependencies failed"))
+            .map_err(|error| tracing::warn!(%error, gen = %constellation_meta::delegation::GenLabel::of(gen), "reading a stream's dependencies failed"))
             .ok()
     }
 

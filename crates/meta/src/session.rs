@@ -2070,7 +2070,7 @@ impl crate::store::Meta {
         if voided > 0 {
             tracing::info!(
                 voided,
-                max_gen,
+                max_gen = %crate::delegation::GenLabel::of(max_gen),
                 "voided session dependencies on delegation generations that ended before this \
                  incarnation (the delegation table no longer lists them)"
             );

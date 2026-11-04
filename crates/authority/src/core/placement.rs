@@ -401,7 +401,7 @@ impl Core {
                     node = self.cfg.node_id,
                     dir,
                     delegate = node,
-                    gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
                     range = range.label(),
                     total,
                     "placement recalls a delegation (share or rate below the floor for the dwell)"
@@ -485,7 +485,7 @@ impl Core {
                         node = me,
                         dir,
                         delegate = node,
-                        gen,
+                        gen = %constellation_meta::delegation::GenLabel::of(gen),
                         total,
                         "placement delegated a dominated subtree"
                     );
@@ -598,7 +598,7 @@ impl Core {
                                 node = me,
                                 dir,
                                 delegate = node,
-                                gen,
+                                gen = %constellation_meta::delegation::GenLabel::of(gen),
                                 range = range.label(),
                                 total,
                                 "placement split a hot directory: range delegated"

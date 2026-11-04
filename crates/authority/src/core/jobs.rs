@@ -1496,7 +1496,7 @@ impl Core {
             let cursor = replica.log_stream_idx(gen);
             tracing::debug!(
                 node = self.cfg.node_id,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 idx,
                 first = t.first,
                 last = t.last,
@@ -1548,7 +1548,7 @@ impl Core {
             if let Err(e) = replica.apply_backup_tx_journaled(&t.records, completes, t.origin) {
                 tracing::warn!(
                     node = self.cfg.node_id,
-                    gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
                     idx,
                     error = %e,
                     "re-appending this node's own delegate row failed: it and the rows after it are replayed by rid"

@@ -1194,7 +1194,7 @@ impl Core {
                 continue;
             };
             let stream_round = self.deleg_new_round();
-            tracing::info!(node = me, dir = d.dir, gen = d.gen, "delegation installed");
+            tracing::info!(node = me, dir = d.dir, gen = %constellation_meta::delegation::GenLabel::of(d.gen), "delegation installed");
             self.stats.deleg_installed += 1;
             // Plan 43 C2e follow-up: a process that held this generation
             // before a reboot may have lost the unsynced end of its journal
@@ -1214,7 +1214,7 @@ impl Core {
                 tracing::warn!(
                     node = me,
                     dir = d.dir,
-                    gen = d.gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(d.gen),
                     "this node held the delegation before a reboot and may have lost rows it acknowledged: \
                      not taken up again; the root ends it by its group"
                 );
@@ -1355,7 +1355,7 @@ impl Core {
                 let cursor = replica.log_stream_idx(d.gen);
                 tracing::info!(
                     node = me,
-                    gen = d.gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(d.gen),
                     dir = d.dir,
                     delegate = d.node,
                     cursor,
@@ -1469,7 +1469,7 @@ impl Core {
             tracing::debug!(
                 node = me,
                 dir,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 ended = ?ended,
                 "delegation not installed yet: an ended generation's rows wait for its end in the log"
             );
@@ -1490,7 +1490,7 @@ impl Core {
             tracing::warn!(
                 node = me,
                 dir,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 waited_ms = waited,
                 ended = ?w.ended,
                 "a delegation still waits to be installed: an ended generation's rows wait for its end in the log \
@@ -1550,7 +1550,7 @@ impl Core {
         let Some(d) = self.dl.mine.remove(&gen) else {
             return;
         };
-        tracing::info!(node = self.me(), dir = d.dir, gen, "delegation ended here");
+        tracing::info!(node = self.me(), dir = d.dir, gen = %constellation_meta::delegation::GenLabel::of(gen), "delegation ended here");
         // Plan 43 C2 (D7): what waited for a row past the generation's cut
         // is never acknowledged (no cut known: every row of it).
         let through = replica.void_cut(gen).unwrap_or(0);
@@ -1603,7 +1603,7 @@ impl Core {
         if !dropped.is_empty() {
             tracing::info!(
                 node = self.me(),
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 n = dropped.len(),
                 "delegation ended by the log with lock grants still here; dropped"
             );
@@ -1763,7 +1763,7 @@ impl Core {
         if !honoured || !reaches || recalling || queued {
             tracing::debug!(
                 node = self.me(),
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 ?rid,
                 honoured,
                 reaches,
@@ -1996,7 +1996,7 @@ impl Core {
             // answered once its group holds it (below).
             tracing::debug!(
                 node = self.me(),
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 ?rid,
                 "settle: no outcome here; refused for good"
             );
@@ -3252,7 +3252,7 @@ impl Core {
             }
             tracing::info!(
                 node = self.cfg.node_id,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 ?want,
                 applied = ?self.dl.mine[&gen].group_backups,
                 "delegate asks the root to record a group change"
@@ -3311,7 +3311,7 @@ impl Core {
                 chosen.push(d.gen);
                 tracing::info!(
                     node = self.cfg.node_id,
-                    gen = d.gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(d.gen),
                     backup = b,
                     "delegate chose a backup"
                 );
@@ -3432,7 +3432,7 @@ impl Core {
             // waited retries by rid (the root has it, or refuses it).
             tracing::warn!(
                 node = self.cfg.node_id,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 backup = from,
                 "the backup sealed this delegation"
             );
@@ -3468,7 +3468,7 @@ impl Core {
                     paced = true;
                     tracing::debug!(
                         node = self.cfg.node_id,
-                        gen,
+                        gen = %constellation_meta::delegation::GenLabel::of(gen),
                         backup = from,
                         acked,
                         first,
@@ -3659,7 +3659,7 @@ impl Core {
         };
         tracing::info!(
             node = self.cfg.node_id,
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             root = from,
             backing,
             rows = txs.len(),
@@ -3809,7 +3809,7 @@ impl Core {
             if lost && drained_to < tail.end {
                 tracing::info!(
                     node = self.me(),
-                    gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
                     cursor = drained_to,
                     tail_end = tail.end,
                     "a sealed tail's row depends on one lost with its generation: \
@@ -3822,7 +3822,7 @@ impl Core {
                 }
                 tracing::debug!(
                     node = self.me(),
-                    gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
                     backup = from,
                     cursor = drained_to,
                     tail_end = tail.end,
@@ -3840,8 +3840,8 @@ impl Core {
                         node = self.me(),
                         dir,
                         delegate = from,
-                        gen,
-                        new_gen,
+                        gen = %constellation_meta::delegation::GenLabel::of(gen),
+                        new_gen = %constellation_meta::delegation::GenLabel::of(new_gen),
                         "re-delegated to the backup"
                     );
                 }
@@ -3913,7 +3913,7 @@ impl Core {
                     drained += 1;
                 }
                 Err(error) => {
-                    tracing::warn!(node = self.me(), gen, idx = tx.idx, %error, "could not append a sealed transaction");
+                    tracing::warn!(node = self.me(), gen = %constellation_meta::delegation::GenLabel::of(gen), idx = tx.idx, %error, "could not append a sealed transaction");
                     break;
                 }
             }
@@ -3930,7 +3930,7 @@ impl Core {
         self.nudge(now, out);
         tracing::info!(
             node = self.me(),
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             drained,
             cursor,
             "drained a sealed delegation"
@@ -4071,7 +4071,7 @@ impl Core {
                     self.stats.deleg_restreams += 1;
                     tracing::info!(
                         node = self.cfg.node_id,
-                        gen = d.gen,
+                        gen = %constellation_meta::delegation::GenLabel::of(d.gen),
                         ?root,
                         "re-streaming to a new root"
                     );
@@ -4360,7 +4360,7 @@ impl Core {
             self.stats.deleg_designee_sync_failures += 1;
             tracing::warn!(
                 node = self.cfg.node_id,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 through,
                 "a designee's journal sync failed: its stream waits and asks again"
             );
@@ -4392,7 +4392,7 @@ impl Core {
             self.stats.deleg_lost_after_ack += 1;
             tracing::error!(
                 node = self.cfg.node_id,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 idx,
                 acked_max = d.acked_max,
                 "a row answered under the group depends on one its generation ended without"
@@ -4403,7 +4403,7 @@ impl Core {
         self.stats.deleg_lost_deps_stopped += 1;
         tracing::warn!(
             node = self.cfg.node_id,
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             idx,
             "a row depends on one its generation ended without: \
              the generation stops before it, the row is replayed by rid"
@@ -4703,7 +4703,7 @@ impl Core {
             });
             tracing::debug!(
                 node = self.me(),
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 ?req,
                 from,
                 last,
@@ -4777,7 +4777,7 @@ impl Core {
         tracing::debug!(
             node = self.cfg.node_id,
             from,
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             ?req,
             through,
             committed,
@@ -4878,7 +4878,7 @@ impl Core {
         if progressed && !answers_inflight {
             tracing::debug!(
                 node = self.cfg.node_id,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 through,
                 was = d.streamed_through,
                 "a stream acknowledgement for an earlier batch counted"
@@ -4987,7 +4987,7 @@ impl Core {
                 if let Some(b) = dropped {
                     tracing::warn!(
                         node = self.cfg.node_id,
-                        gen,
+                        gen = %constellation_meta::delegation::GenLabel::of(gen),
                         backup = b,
                         "delegate dropped an unreachable backup"
                     );
@@ -5053,7 +5053,7 @@ impl Core {
                 if warn {
                     tracing::warn!(
                         node = self.cfg.node_id,
-                        gen,
+                        gen = %constellation_meta::delegation::GenLabel::of(gen),
                         "a delegation's recorded backup cannot be reached for its seal: the generation is not ended without its tail \
                          (`constellation repair abandon-group --gen {gen}` ends it at the root's cursor; rows only the group holds are lost)"
                     );
@@ -5117,7 +5117,7 @@ impl Core {
         let ungranted = d.until == HonourMs(0);
         tracing::debug!(
             node = self.cfg.node_id,
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             ?req,
             root,
             "delegation renewal sent"
@@ -5171,13 +5171,13 @@ impl Core {
             backups: backups.clone(),
         };
         if let Err(error) = replica.apply_records_journaled(&[rec], None) {
-            tracing::warn!(node = self.me(), gen, %error, "could not journal a delegation group record");
+            tracing::warn!(node = self.me(), gen = %constellation_meta::delegation::GenLabel::of(gen), %error, "could not journal a delegation group record");
             return;
         }
         self.stats.deleg_group_records += 1;
         tracing::info!(
             node = self.me(),
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             version,
             ?backups,
             "delegation group recorded"
@@ -5319,7 +5319,7 @@ impl Core {
             tracing::debug!(
                 node = self.me(),
                 from,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 ?req,
                 ttl_ms,
                 "delegation renewal"
@@ -5355,7 +5355,7 @@ impl Core {
             tracing::debug!(
                 node = self.me(),
                 from,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 ?req,
                 "delegation renewal left unanswered: this node may be the root again"
             );
@@ -5381,7 +5381,7 @@ impl Core {
             tracing::debug!(
                 node = self.me(),
                 from,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 ?req,
                 "delegation renewal left unanswered: the takeover gate is pending"
             );
@@ -5726,7 +5726,7 @@ impl Core {
         let (frozen, root_silent) = self.deleg_note_loss(gen, true);
         tracing::warn!(
             node = self.me(),
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             dir,
             root = self.root_node().unwrap_or(0),
             until_ms,
@@ -6068,7 +6068,7 @@ impl Core {
         tracing::debug!(
             node = self.cfg.node_id,
             from,
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             ?req,
             ttl_ms,
             in_flight = self.dl.by_req.contains_key(&req),
@@ -6201,7 +6201,7 @@ impl Core {
             // honoured again.
             tracing::info!(
                 node = self.cfg.node_id,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 "a lapsed delegation was renewed"
             );
             d.lapsed = false;
@@ -6250,7 +6250,7 @@ impl Core {
         d.stopped = true;
         tracing::warn!(
             node = self.cfg.node_id,
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             "could not record the delegation's grant: not used, the generation stops here"
         );
         false
@@ -6400,7 +6400,7 @@ impl Core {
         };
         tracing::debug!(
             node = self.cfg.node_id,
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             late_ms = now.honour.since(sent),
             "a late delegation renewal counted"
         );
@@ -6410,7 +6410,7 @@ impl Core {
         if d.lapsed && now.honour < d.until {
             tracing::info!(
                 node = self.cfg.node_id,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 "a lapsed delegation was renewed"
             );
             d.lapsed = false;
@@ -6791,8 +6791,8 @@ impl Core {
                         node = self.me(),
                         dir,
                         delegate = node,
-                        gen,
-                        new_gen,
+                        gen = %constellation_meta::delegation::GenLabel::of(gen),
+                        new_gen = %constellation_meta::delegation::GenLabel::of(new_gen),
                         "re-delegated after a cross-subtree op"
                     );
                 }
@@ -6881,7 +6881,7 @@ impl Core {
         }
         tracing::info!(
             node = self.me(),
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             dir,
             delegate = to,
             "recalling a delegation"
@@ -6919,7 +6919,7 @@ impl Core {
             self.stats.deleg_recalls_resent += 1;
             tracing::info!(
                 node = self.me(),
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 dir,
                 delegate = to,
                 "sending an unanswered recall again"
@@ -7155,7 +7155,7 @@ impl Core {
             for member in strict {
                 tracing::info!(
                     node = self.me(),
-                    gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
                     backup = member,
                     "delegate silent: sealing its backup"
                 );
@@ -7177,7 +7177,7 @@ impl Core {
                 self.stats.deleg_reclaimed += 1;
                 tracing::info!(
                     node = self.me(),
-                    gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
                     until = self.gen_until(gen).0,
                     now = now.wait.0,
                     "reclaiming an unrenewed delegation"
@@ -7216,7 +7216,7 @@ impl Core {
                 if warn {
                     tracing::warn!(
                         node = self.me(),
-                        gen,
+                        gen = %constellation_meta::delegation::GenLabel::of(gen),
                         "a delegation's recorded backup has not answered its seal: the generation is not ended without its tail \
                          (`constellation repair abandon-group --gen {gen}` ends it at the root's cursor; rows only the group holds are lost)"
                     );
@@ -7372,7 +7372,7 @@ impl Core {
                 let (heard_node, heard_role, heard_ms) = heard.unwrap_or((0, "", 0));
                 tracing::warn!(
                     node = self.me(),
-                    gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
                     cursor,
                     known,
                     forced,
@@ -7526,7 +7526,7 @@ impl Core {
             });
         }
         if let Err(error) = replica.apply_records_journaled(&records, None) {
-            tracing::warn!(node = self.me(), gen, %error, "could not journal the recall record");
+            tracing::warn!(node = self.me(), gen = %constellation_meta::delegation::GenLabel::of(gen), %error, "could not journal the recall record");
             self.arm_gen_expiry(now.plus(500), gen, out);
             return;
         }
@@ -7539,7 +7539,7 @@ impl Core {
             Ok(s) if s.any() => {
                 tracing::info!(
                     node = self.me(),
-                    gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
                     shadows = s.shadows,
                     hints = s.hints,
                     "the root's own speculation of an ended generation stranded; replaying"
@@ -7548,7 +7548,7 @@ impl Core {
             }
             Ok(_) => {}
             Err(error) => {
-                tracing::warn!(node = self.me(), gen, %error, "could not strand the root's speculation of an ended generation");
+                tracing::warn!(node = self.me(), gen = %constellation_meta::delegation::GenLabel::of(gen), %error, "could not strand the root's speculation of an ended generation");
             }
         }
         self.lock_note_replay_pins(now, replica);
@@ -7566,7 +7566,7 @@ impl Core {
         }
         tracing::info!(
             node = self.me(),
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             dir,
             cursor,
             "delegation generation ended"
@@ -7726,7 +7726,7 @@ impl Core {
         tracing::debug!(
             node = self.me(),
             from,
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             ?req,
             first = txs.first().map(|t| t.idx).unwrap_or(0),
             last = txs.last().map(|t| t.idx).unwrap_or(0),
@@ -7761,7 +7761,7 @@ impl Core {
                 self.stats.deleg_append_deps_lost += 1;
                 tracing::debug!(
                     node = self.me(),
-                    gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
                     idx = tx.idx,
                     deps = ?tx.deps,
                     "delegate batch refused: a dependency was lost with its generation"
@@ -7772,7 +7772,7 @@ impl Core {
                 self.stats.deleg_deps_unsatisfied_at_append += 1;
                 tracing::debug!(
                     node = self.me(),
-                    gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
                     idx = tx.idx,
                     deps = ?tx.deps,
                     applied = ?replica.applied_position(),
@@ -7795,7 +7795,7 @@ impl Core {
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(node = self.me(), gen, idx = tx.idx, %error, "could not append a delegate transaction");
+                    tracing::warn!(node = self.me(), gen = %constellation_meta::delegation::GenLabel::of(gen), idx = tx.idx, %error, "could not append a delegate transaction");
                     break;
                 }
             }
@@ -8115,7 +8115,7 @@ impl Core {
             node = self.me(),
             dir,
             delegate = node,
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             ?kind,
             "delegated"
         );
@@ -8229,7 +8229,7 @@ impl Core {
         tracing::debug!(
             node = self.cfg.node_id,
             from,
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             ?req,
             grants = g.read_recalls.len(),
             quarantine_ms = quarantine.map(|q| q.since(now.wait)),
@@ -8376,7 +8376,7 @@ impl Core {
             .collect();
         for gen in released {
             if self.dl.gens.get(&gen).is_some_and(|g| !g.ended) {
-                tracing::info!(node = self.me(), gen, "designation released: recalling");
+                tracing::info!(node = self.me(), gen = %constellation_meta::delegation::GenLabel::of(gen), "designation released: recalling");
                 self.start_recall(now, gen, out);
             }
         }

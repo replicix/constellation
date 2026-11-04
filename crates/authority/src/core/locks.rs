@@ -6356,7 +6356,7 @@ impl Core {
         if !gone.is_empty() {
             tracing::debug!(
                 node = self.cfg.node_id,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 n = gone.len(),
                 "lock grants on inodes that left the subtree are the root's now"
             );
@@ -6417,7 +6417,7 @@ impl Core {
             self.lk.mirror_dirty = true;
             tracing::info!(
                 node = self.cfg.node_id,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 n,
                 "installed a delegate's lock grants on inodes that left its subtree"
             );
@@ -6482,7 +6482,7 @@ impl Core {
             self.lk.mirror_dirty = true;
             tracing::info!(
                 node = self.cfg.node_id,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 n,
                 "grants moved to a delegation came back with their inodes, which left its subtree"
             );
@@ -6771,7 +6771,7 @@ impl Core {
             self.lk.mirror_dirty = true;
             tracing::info!(
                 node = self.cfg.node_id,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 n,
                 "a delegation ended without handing back grants this root handed it; reinstated"
             );
@@ -6828,7 +6828,7 @@ impl Core {
                 self.stats.lock_returned_after_end += grants.len() as u64;
                 tracing::debug!(
                     node = self.cfg.node_id,
-                    gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
                     n = grants.len(),
                     "a recall answer after its generation ended; its grants dropped"
                 );
@@ -6846,7 +6846,7 @@ impl Core {
             self.stats.lock_returned_duplicates += (before - grants.len()) as u64;
             tracing::debug!(
                 node = self.cfg.node_id,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 n = before - grants.len(),
                 "a duplicate recall answer; its grants dropped"
             );
@@ -6911,7 +6911,7 @@ impl Core {
             if !grants.is_empty() {
                 tracing::debug!(
                     node = self.cfg.node_id,
-                    gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
                     n = grants.len(),
                     "a lock handoff for a generation not served here; left to the root"
                 );
@@ -6979,7 +6979,7 @@ impl Core {
                 self.stats.lock_moved_carried += 1;
                 tracing::debug!(
                     node = self.cfg.node_id,
-                    gen,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
                     holder = g.node,
                     ino = g.ino,
                     left,
@@ -6991,7 +6991,7 @@ impl Core {
         if n > 0 {
             tracing::debug!(
                 node = self.cfg.node_id,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 n,
                 "installed moved lock grants"
             );
@@ -7018,7 +7018,7 @@ impl Core {
         if !taken.is_empty() {
             tracing::debug!(
                 node = self.cfg.node_id,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 by_tag,
                 by_table = taken.len() - by_tag,
                 "took a generation's lock grants"
@@ -7121,7 +7121,7 @@ impl Core {
         self.stats.lock_graces_inherited += 1;
         tracing::info!(
             node = self.cfg.node_id,
-            gen,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
             dir,
             grace_ms,
             "a delegation starts inside the root's lock grace; no new grants on the subtree until it passes"

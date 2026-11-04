@@ -36,13 +36,14 @@ inside the root's authority, maintained over P2P.
 - **Delegate**: a node that sequences one subtree (or one hash range of
   a directory) for the root.
 - **Generation (`gen`)**: one delegation's lifetime, numbered by the
-  tenure that grants it: `gen = epoch << 32 | n`, shown as `epoch.n` (the
+  tenure that grants it: `gen = epoch << 32 | n`, shown as `epoch:n` (the
   lease epoch of the root that minted it and that node's counter within the
   tenure), so two tenures never mint the same number
   ([ADR-43](../../explanation/DECISIONS.md#adr-43-a-generation-number-carries-the-epoch-of-the-tenure-that-minted-it)).
   A recall ends a generation; a re-delegation starts a new one. The
   numbers are large and sparse; the CLI's line for a generation that
-  cannot end shows one as `epoch.n (number)`, and `--gen` takes the number.
+  cannot end shows one as `epoch:n (number)`, the daemon's log lines as
+  `epoch:n`, and `--gen` takes the number.
 - **Owner**: the node that sequences a key: the delegate whose
   delegation contains it, else the root.
 - **Cross-subtree op**: an operation whose keys have two owners, such

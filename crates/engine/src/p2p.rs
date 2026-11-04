@@ -638,7 +638,7 @@ impl constellation_net::PeerService for P2pBridge {
         ) else {
             tracing::warn!(
                 from,
-                gen,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
                 "dropping a delegate stream batch that does not decode"
             );
             return;

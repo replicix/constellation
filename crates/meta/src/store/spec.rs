@@ -5187,7 +5187,7 @@ impl Meta {
         tx.commit()?;
         for (gen, cut) in orphan_cuts {
             tracing::info!(
-                gen,
+                gen = %crate::delegation::GenLabel::of(gen),
                 cut,
                 "an abandon ended a delegation generation whose grant never reached the log"
             );
