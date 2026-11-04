@@ -710,10 +710,7 @@ pub(super) fn acks3_under_load(seed: u64) -> Result<()> {
         let epoch = lease_of(&clients[0])?["epoch"].as_u64().unwrap_or(0);
         let ack = clients[0].control_status()?["ack"].clone();
         anyhow::ensure!(ack["policy"] == "s3", "a is not under ack=s3: {ack}");
-        let (ledger, errnos) = (
-            Ledger::new(),
-            ErrnoLog::new(),
-        );
+        let (ledger, errnos) = (Ledger::new(), ErrnoLog::new());
         let stop = Arc::new(AtomicBool::new(false));
         let writer = {
             let (mnt, l, e, stop) = (
@@ -822,10 +819,7 @@ pub(super) fn endpoint_wedge_probe(_seed: u64) -> Result<()> {
                     .unwrap_or(0)
             })
             .collect();
-        let (ledger, errnos) = (
-            Ledger::new(),
-            ErrnoLog::new(),
-        );
+        let (ledger, errnos) = (Ledger::new(), ErrnoLog::new());
         let stop = Arc::new(AtomicBool::new(false));
         let writers: Vec<_> = clients
             .iter()
@@ -1056,10 +1050,7 @@ pub(super) fn delegate_paused_across_ttl(_seed: u64) -> Result<()> {
                 .iter()
                 .map(|s| (s.to_string(), t.duration_of(s).expect("a boundary")))
                 .collect();
-        let (ledger, errnos) = (
-            Ledger::new(),
-            ErrnoLog::new(),
-        );
+        let (ledger, errnos) = (Ledger::new(), ErrnoLog::new());
         let stop = Arc::new(AtomicBool::new(false));
         let writer = {
             let (mnt, l, e, stop) = (b.mnt.clone(), ledger.clone(), errnos.clone(), stop.clone());

@@ -110,10 +110,7 @@ pub(super) fn lease_claimant_ahead(_seed: u64) -> Result<()> {
             "a does not hold the lease: {}",
             lease_of(&clients[0])?
         );
-        let (ledger, errnos) = (
-            Ledger::new(),
-            ErrnoLog::new(),
-        );
+        let (ledger, errnos) = (Ledger::new(), ErrnoLog::new());
         let stop_a = Arc::new(AtomicBool::new(false));
         let stop_b = Arc::new(AtomicBool::new(false));
         // The writers stop on every way out, or the mounts stay busy.

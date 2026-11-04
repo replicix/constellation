@@ -800,7 +800,11 @@ pub fn unsettled_eio_summary(clients: &[crate::client::Client]) -> String {
                 .control_status()
                 .ok()
                 .and_then(|s| s["ack"]["client_unsettled_eio"].as_u64());
-            format!("{}={}", c.name, n.map_or("?".to_string(), |n| n.to_string()))
+            format!(
+                "{}={}",
+                c.name,
+                n.map_or("?".to_string(), |n| n.to_string())
+            )
         })
         .collect();
     format!("client_unsettled_eio: {}", each.join(" "))

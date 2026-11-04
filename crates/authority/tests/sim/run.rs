@@ -2068,12 +2068,10 @@ async fn client_thread(
                     let fresh = handle.next_rid();
                     match (&op, &write) {
                         (Some(op), _) => history.invoke(thread, fresh, op.clone()),
-                        (None, Some(name)) => {
-                            match write_op(&cluster, node, fresh, name) {
-                                Some(m) => mop = m,
-                                None => break,
-                            }
-                        }
+                        (None, Some(name)) => match write_op(&cluster, node, fresh, name) {
+                            Some(m) => mop = m,
+                            None => break,
+                        },
                         (None, None) => unreachable!(),
                     }
                     rid = fresh;
