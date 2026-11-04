@@ -2044,11 +2044,18 @@ impl crate::store::Meta {
         // read in the snapshot the table is read in.
         let (table, speculative) = {
             let r = self.db.read_tx();
-            (
-                crate::delegation::read_table_tx(&r, self).unwrap_or_default(),
-                self.speculatively_ended_generations_at(&r)
-                    .unwrap_or_default(),
-            )
+            let table = crate::delegation::read_table_tx(&r, self).unwrap_or_default();
+            // An unreadable set is not an empty one: voiding on it would void
+            // the speculative ends it exists to keep live. Void nothing; the
+            // next read tries again.
+            let speculative = match self.speculatively_ended_generations_at(&r) {
+                Ok(set) => set,
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not read the speculatively ended generations; voiding nothing");
+                    return;
+                }
+            };
+            (table, speculative)
         };
         let max_gen = table.max_gen();
         let voided = self.session.void_ended_among(gens, |gen| {

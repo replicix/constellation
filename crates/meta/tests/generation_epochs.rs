@@ -568,23 +568,21 @@ fn a_restart_then_a_strand_leaves_the_generation_live_and_unvoided() {
     store_with_a_streamed_ahead_end(&path, h, false);
     let meta = Meta::open(&path).unwrap();
     let ino = (1u64 << 40) | 1;
-    let applied = meta
-        .apply_segment(
-            2,
-            2,
-            &[LogRecord::Create {
-                parent: ROOT_INO,
-                name: "a".into(),
-                ino,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                time_ns: 10,
-            }],
-            &TouchSet::default(),
-        )
-        .unwrap();
-    let _ = applied;
+    meta.apply_segment(
+        2,
+        2,
+        &[LogRecord::Create {
+            parent: ROOT_INO,
+            name: "a".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 10,
+        }],
+        &TouchSet::default(),
+    )
+    .unwrap();
     assert!(
         meta.delegation_table().iter().any(|d| d.gen == h),
         "the strand rolled the end back"
