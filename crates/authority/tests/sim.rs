@@ -8795,9 +8795,11 @@ fn the_causal_cut_oracle_catches_a_delegate_that_skips_its_dependency_wait() {
 const CAUSAL_CUT_SEEDS: u64 = 40;
 
 /// Oracle false positive, pinned: seed 1525 of `delegated-group-switch` with
-/// slow lease reads (`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`). The sim's own
-/// resubmission of an in-doubt rid that never ran landed after a later op,
-/// and I4 took it for a late landing of the original.
+/// slow lease reads (`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`). The sim's
+/// client resubmitted an in-doubt rid, as production never does (the
+/// application retries with a new operation, a fresh rid), and the
+/// resubmission's execution landed after a later op: I4 took it for a late
+/// landing of the original. The client now retries under a fresh rid.
 #[test]
 fn regression_the_sims_resubmission_is_no_late_landing_seed_1525() {
     let cfg = SimConfig {

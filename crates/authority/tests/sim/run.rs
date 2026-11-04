@@ -1715,7 +1715,7 @@ fn mutate_op(meta: &Meta, op: &NsOp) -> Option<MutateOp> {
     })
 }
 
-/// How many times a client resubmits an in-doubt op (same rid) before
+/// How many times a client retries an in-doubt op (under a fresh rid) before
 /// leaving it in flight.
 const MAX_RESUBMITS: u32 = 6;
 
@@ -1961,8 +1961,8 @@ async fn client_thread(
             }
         }
         let handle = cluster.get(node);
-        let rid = handle.next_rid();
-        let mop = match (&op, &write) {
+        let mut rid = handle.next_rid();
+        let mut mop = match (&op, &write) {
             (Some(op), _) => match mutate_op(&handle.meta, op) {
                 Some(mop) => mop,
                 None => continue,
@@ -2047,13 +2047,36 @@ async fn client_thread(
                     }
                     Err(e) => failures.lock().unwrap().push(e),
                 },
+                // Production answers `EIO` and the application retries with a
+                // new operation, a fresh rid (`mutate_op_rebasable`; only an
+                // `EROFS`-like refusal of a lapsed token is reissued, also
+                // under a fresh one). The in-doubt rid stays tentative (it
+                // may still land, anywhere after its invocation); the retry
+                // is an op of its own, so a landing of the old rid is the
+                // original's (I4) and the retry's is not.
                 Ok(ClientReply::InDoubt) | Err(_) => {
+                    abandoned.lock().unwrap().insert(rid);
                     attempts += 1;
                     if attempts > MAX_RESUBMITS {
-                        abandoned.lock().unwrap().insert(rid);
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
+                    let handle = cluster.get(node);
+                    if !handle.alive() {
+                        break;
+                    }
+                    let fresh = handle.next_rid();
+                    match (&op, &write) {
+                        (Some(op), _) => history.invoke(thread, fresh, op.clone()),
+                        (None, Some(name)) => {
+                            match write_op(&cluster, node, fresh, name) {
+                                Some(m) => mop = m,
+                                None => break,
+                            }
+                        }
+                        (None, None) => unreachable!(),
+                    }
+                    rid = fresh;
                     continue;
                 }
             }
