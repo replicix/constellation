@@ -114,9 +114,8 @@ fn strand_below_epoch_moves_gated_rows_to_the_member_copy() {
     assert_eq!(rows[0].class, RowClass::RootGroup);
     assert_eq!(rows[0].rid, Some(rid(1)));
     assert!(rows[0].op.is_some());
-    // (A recovery's or a takeover gate's strand holds no reads: only a
-    // segment's strand does.)
-    assert!(!meta.member_copy_touches(&[ReadKey::Dentry(ROOT_INO, "a".into())]));
+    // (A recovery's strand holds reads of it, as a segment's does.)
+    assert!(meta.member_copy_touches(&[ReadKey::Dentry(ROOT_INO, "a".into())]));
     assert_eq!(info.through, rows[0].tx.last);
     assert!(meta.member_copy_carries(rid(1)).unwrap());
     assert!(!meta.member_copy_carries(rid(2)).unwrap());
@@ -195,6 +194,41 @@ fn a_committed_row_moved_to_the_member_copy_holds_its_readers() {
         "retired by the re-ship"
     );
     assert!(!meta.replay_touches(&key));
+}
+
+/// A deposed root's recovery (`Core::recover_deposed`) strands before the
+/// successor's first segment arrives: its committed own row goes to the
+/// member copy by `strand_below_epoch`, and a delegate's row it appended
+/// after it stays applied (the journal is not empty), so the recovery
+/// rebuilds from the log, serving reads meanwhile. Reads of the row's keys
+/// wait for the re-ship, as after a segment's strand.
+#[test]
+fn a_recovery_strand_holds_its_readers_until_the_reship() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    holder_create(&meta, RowClass::RootGroup, "data", 1, 1);
+    meta.set_holder_epoch(0);
+    let key = [ReadKey::Dentry(ROOT_INO, "data".into())];
+    assert_eq!(meta.strand_below_epoch(2).unwrap().member_copied, 1);
+    assert!(meta.lookup(ROOT_INO, "data").unwrap().is_none());
+    assert!(meta.pending_replays().unwrap().is_empty(), "not queued");
+    assert!(
+        meta.replay_touches(&key),
+        "a read of the rolled-back committed row must wait for its re-ship"
+    );
+    // The successor's first segment strands nothing more; still held.
+    let other = vec![create("b", ino(2), 11), completed(rid(2))];
+    apply_rows(&meta, 1, 2, 2, &[1, 2], &other);
+    assert!(meta.replay_touches(&key));
+    let reship = vec![
+        LogRecord::TailOf { epoch: 1, jseq: 1 },
+        create("data", ino(1), 10),
+        completed(rid(1)),
+    ];
+    apply_rows(&meta, 2, 2, 5, &[3, 4, 5], &reship);
+    assert!(meta.lookup(ROOT_INO, "data").unwrap().is_some());
+    assert!(!meta.member_copy_carries(rid(1)).unwrap());
+    assert!(!meta.replay_touches(&key), "released by the re-ship");
 }
 
 /// A row that never leaves the member copy (a leak: `backup-crash-slow`

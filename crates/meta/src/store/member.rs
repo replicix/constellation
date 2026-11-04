@@ -65,11 +65,12 @@ pub const HELD_COPY_MAX_AGE_MS: i64 = 5_000;
 
 /// A member copy row a segment's strand rolled back
 /// ([`Meta::member_copy_touches`]). In memory, not persisted: after a
-/// restart nothing is held. Only a segment's apply sets one, on a node that
-/// serves reads while the rows after the rolled-back one stay; the strand of
-/// a restart's recovery (a deposed holder starting up), a takeover gate and a
-/// namespace rebuild do not (the rebuild derives the namespace from the log,
-/// so no row that depends on a rolled-back one stays). The cost of not
+/// restart nothing is held. A segment's apply and a deposition's recovery
+/// (`strand_below_epoch`) set one, on a node that serves reads while the
+/// rows after the rolled-back one stay (the recovery's until its rebuild
+/// lands); a takeover gate and a namespace rebuild do not (the gate
+/// re-applies the tail in the same step, the rebuild derives the namespace
+/// from the log, so no row that depends on a rolled-back one stays). The cost of not
 /// persisting: a process that crashes inside the re-ship window (the 50-125 ms
 /// measured) comes back without the hold and may serve the gap until the
 /// re-ship lands; the window is bounded by the re-ship latency, not closed
@@ -498,6 +499,13 @@ impl Meta {
     /// leaves the copy (a leak, `backup-crash-slow` seed 840) cannot stall
     /// reads for good. One atomic load when nothing is held.
     pub fn member_copy_touches(&self, keys: &[crate::ReadKey]) -> bool {
+        // (The clock reads the lock table's mutex: not on every read.)
+        if !self
+            .any_held_copy
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
         self.member_copy_touches_at(keys, self.held_copy_now_ms())
     }
 

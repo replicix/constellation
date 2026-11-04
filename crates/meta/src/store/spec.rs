@@ -792,11 +792,12 @@ struct Strand<'a> {
     /// (A third source of a gated root append is C3's re-append at a
     /// delegate's takeover gate, `RootGroup`; see L2b in `strand_local_tx`.)
     rebuild: bool,
-    /// The pass is a segment's apply: a committed row it moves to the member
-    /// copy holds reads of its keys until the re-ship lands
-    /// (`Meta::member_copy_touches`). Not a restart's recovery or a
-    /// takeover's strand (nothing serves reads on the namespace they
-    /// leave behind before the re-ship, or they derive it from the log).
+    /// A committed row the pass moves to the member copy holds reads of its
+    /// keys until the re-ship lands (`Meta::member_copy_touches`): a
+    /// segment's apply, and `strand_below_epoch` (a deposition's recovery
+    /// serves reads while its rebuild runs, with a delegate's row this root
+    /// appended after the rolled-back one still applied). Not the takeover
+    /// gate's strand: its tail re-applies the rows in the same step.
     hold: bool,
     /// Each stranded transaction's `deps` (by journal seq), taken from the
     /// intact journal before the pass strands anything: a pass that
@@ -5331,7 +5332,7 @@ impl Meta {
             |entry| entry.stranded_by_takeover(epoch),
             true,
             false,
-            false,
+            true,
             |_| false,
         )?;
         if !stranded.any() {
