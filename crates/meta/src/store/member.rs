@@ -508,7 +508,10 @@ impl Meta {
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         match self.locks().clock_now() {
             Some(now) => now.wait.0,
-            None => START.get_or_init(std::time::Instant::now).elapsed().as_millis() as i64,
+            None => START
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_millis() as i64,
         }
     }
 

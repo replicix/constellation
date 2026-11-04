@@ -2981,6 +2981,7 @@ fn streamed_tip_tx(r: &impl Readable, meta: &Meta, epoch: u64) -> Result<Option<
 
 /// Roll back and take out every outstanding entry `strands` selects (see
 /// [`rewind_tx`]).
+#[allow(clippy::too_many_arguments)]
 fn strand_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
