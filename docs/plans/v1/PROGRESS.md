@@ -66044,3 +66044,24 @@ cursor, and the member's acknowledged, unshipped rows were lost (I1). Pre-existi
 - **Still open**: a takeover that carries a tail (a replica cannot tell where in the predecessor's journal the grant sat); a
   rebuild window spanning the marker; a read failure of the persisted proof (read as none); and sticky grants (plan 46 M1.2), which void the no-tail rule's premise (a number is journaled only by
   its epoch's tenure) and need the rule revisited before they land.
+
+## Async-signal-safe stalled-request backtrace handler
+
+The `SIGUSR2` handler behind `CONSTELLATION_FUSE_STALL_BACKTRACE` captured a
+`std::backtrace::Backtrace` and formatted it in signal context: it allocated,
+so a thread stalled inside `malloc` (a frozen then thawed daemon) corrupted the
+heap (`double free`, 1 of 3 `takeover-loss-two-node` runs; commit 13752f74
+only documented it). Now (`crates/platform/src/unix.rs`) the handler claims a
+slot of a preallocated 16-slot ring by CAS, walks the stack into it with
+`_Unwind_Backtrace` (raw instruction pointers, no heap; the unwinder is warmed
+at install time), preserves `errno`, and writes one byte to a non-blocking
+self-pipe. A `backtrace-writer` thread reads the pipe, formats each slot
+(module-relative address for `addr2line`, plus the `dladdr` symbol) and logs it
+between the same `=== ... ===` markers. Trade-offs: frames are not the
+symbolized `std::backtrace` output; on glibc older than 2.35 the unwinder takes
+the loader lock, so a thread interrupted inside `dlopen` could deadlock;
+bursts beyond 16 pending captures are counted and reported as dropped.
+Test: `backtrace_signal_survives_a_busy_allocator` signals a thread in a tight
+alloc/free loop for 3 s and requires survival and logged dumps. The old
+handler's failure here is a heap race, so a fail-before is not guaranteed.
+The harness's per-scenario opt-out for freeze scenarios is left in place.

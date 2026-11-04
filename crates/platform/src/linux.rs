@@ -1069,10 +1069,8 @@ garbage line without the separator
             let _ = done_rx.recv();
         });
         let thread = rx.recv().unwrap();
-        // The handler allocates, so it is only safe on a thread that is
-        // parked: wait until the worker sleeps in its futex, not merely
-        // until it has sent its tid (it may still hold channel or
-        // allocator locks).
+        // Wait until the worker sleeps in its futex, not merely until it
+        // has sent its tid, so the dump shows a parked thread.
         let task = format!("/proc/self/task/{}", thread.tid);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -1112,6 +1110,57 @@ garbage line without the separator
                 handle: i32::MAX as u64
             })
             .is_err());
+    }
+
+    /// The handler is async-signal-safe: signalled over and over while the
+    /// target thread hammers the allocator, the process survives (the old
+    /// allocating handler corrupted the heap here) and dumps are produced.
+    #[test]
+    fn backtrace_signal_survives_a_busy_allocator() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let p = LinuxProcess;
+        p.enable_backtraces("platform-test").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s2 = stop.clone();
+        let worker = std::thread::spawn(move || {
+            tx.send(LinuxProcess.current_thread()).unwrap();
+            let mut keep: Vec<Vec<u8>> = Vec::new();
+            while !s2.load(Ordering::Relaxed) {
+                for i in 0..64usize {
+                    keep.push(vec![i as u8; 16 + i * 8]);
+                }
+                keep.clear();
+            }
+        });
+        let thread = rx.recv().unwrap();
+        let before = crate::unix::BT_EMITTED.load(Ordering::Relaxed);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut sent = 0u32;
+        while std::time::Instant::now() < end {
+            p.request_backtrace(ThreadRef {
+                tid: thread.tid,
+                handle: thread.handle,
+            })
+            .unwrap();
+            sent += 1;
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        // The writer thread logs asynchronously: wait for it to drain.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::unix::BT_EMITTED.load(Ordering::Relaxed) == before
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(sent > 100, "only {sent} signals sent");
+        assert!(
+            crate::unix::BT_EMITTED.load(Ordering::Relaxed) > before,
+            "no dump was produced"
+        );
     }
 
     #[test]

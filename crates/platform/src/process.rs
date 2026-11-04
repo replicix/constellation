@@ -138,17 +138,16 @@ pub trait Process: Send + Sync {
     fn current_thread(&self) -> ThreadRef;
 
     /// Arrange for [`Process::request_backtrace`] to work: a signal
-    /// handler that writes the receiving thread's backtrace to stderr
+    /// handler that has the receiving thread's backtrace written to stderr
     /// between `=== <label>: backtrace of stalled thread tid=<tid> ===`
     /// and `=== end ===`. Process-wide and idempotent; the first label
     /// wins.
     fn enable_backtraces(&self, label: &'static str) -> io::Result<()>;
 
     /// Ask `thread` (of this process) to write its backtrace to stderr
-    /// (after [`Process::enable_backtraces`]). A diagnostic: the capture
-    /// in the handler allocates, which is fine for a thread parked in a
-    /// futex wait, not for one inside the allocator (a process thawed after
-    /// a `SIGSTOP` has such threads: the heap is corrupted).
+    /// (after [`Process::enable_backtraces`]). A diagnostic: the handler is
+    /// async-signal-safe (raw frames into a preallocated ring, a writer
+    /// thread formats them), so any thread state is fine.
     fn request_backtrace(&self, thread: ThreadRef) -> io::Result<()>;
 
     /// Arrange for the child `cmd` spawns to be sent `SIGTERM` when its

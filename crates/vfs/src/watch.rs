@@ -28,7 +28,7 @@
 //!
 //! With `CONSTELLATION_FUSE_STALL_BACKTRACE=1` the monitor also asks the
 //! stalled thread for its backtrace (a `SIGUSR2`, handled by capturing
-//! one and writing it to stderr): a diagnostic for a build with symbols,
+//! raw frames without allocating; a writer thread logs them): a diagnostic for a build with symbols,
 //! off by default. Naming the thread and delivering the signal are host
 //! services (`constellation_platform`'s `Process::current_thread`/
 //! `enable_backtraces`/`request_backtrace`).

@@ -8,6 +8,7 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use crate::daemon::{Daemon, Detached};
@@ -221,39 +222,224 @@ pub(crate) fn signal_process(pid: u32, signal: libc::c_int) -> io::Result<()> {
     Ok(())
 }
 
-/// The label the backtrace handler prints; set once by
-/// [`enable_backtraces`].
-static BACKTRACE_LABEL: OnceLock<&'static str> = OnceLock::new();
+/// Frames kept per captured backtrace.
+const BT_FRAMES: usize = 64;
+/// Captures that can wait for the writer thread; a burst beyond this is dropped.
+const BT_SLOTS: usize = 16;
 
-/// Install the `SIGUSR2` handler that writes the receiving thread's
-/// backtrace to stderr (the daemon log). Not async-signal-safe in the
-/// strict sense (the capture allocates): it is safe only for a thread parked
-/// in a futex wait. A stalled thread is not always one: a process that was
-/// stopped (`SIGSTOP`) and thawed has threads stalled inside `malloc`, and the
-/// handler then corrupts the heap (`double free or corruption`, seen when a
-/// harness scenario thawed a frozen daemon). A diagnostic to leave off for
-/// anything that freezes a daemon. `SIGUSR2` is used by nothing else in the
-/// daemon.
-pub(crate) fn enable_backtraces(label: &'static str, tid: fn() -> u64) -> io::Result<()> {
-    static TID: OnceLock<fn() -> u64> = OnceLock::new();
-    static INSTALLED: OnceLock<io::Result<()>> = OnceLock::new();
-    BACKTRACE_LABEL.get_or_init(|| label);
-    TID.get_or_init(|| tid);
+const SLOT_FREE: u32 = 0;
+const SLOT_FILLING: u32 = 1;
+const SLOT_READY: u32 = 2;
 
-    extern "C" fn on_sigusr2(_: libc::c_int) {
-        let bt = std::backtrace::Backtrace::force_capture();
-        let label = BACKTRACE_LABEL.get().copied().unwrap_or("constellation");
-        let tid = TID.get().map(|f| f()).unwrap_or(0);
-        let text = format!(
-            "\n=== {label}: backtrace of stalled thread tid={tid} ===\n{bt}\n=== end ===\n"
-        );
-        // SAFETY: write(2) on stderr with a valid buffer.
-        unsafe {
-            libc::write(2, text.as_ptr().cast(), text.len());
-        }
+/// One preallocated capture: the handler fills it with raw instruction
+/// pointers, the writer thread formats it.
+struct BtSlot {
+    state: AtomicU32,
+    tid: AtomicU64,
+    len: AtomicUsize,
+    ips: [AtomicUsize; BT_FRAMES],
+}
+
+#[allow(clippy::declare_interior_mutable_const)]
+const BT_SLOT_INIT: BtSlot = BtSlot {
+    state: AtomicU32::new(SLOT_FREE),
+    tid: AtomicU64::new(0),
+    len: AtomicUsize::new(0),
+    ips: [const { AtomicUsize::new(0) }; BT_FRAMES],
+};
+static BT_RING: [BtSlot; BT_SLOTS] = [BT_SLOT_INIT; BT_SLOTS];
+/// Write end of the self-pipe the handler pokes (non-blocking); -1 until set.
+static BT_PIPE_W: AtomicI32 = AtomicI32::new(-1);
+/// Captures dropped because every slot was busy.
+static BT_DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Dumps the writer thread has logged (read by tests).
+#[cfg(test)]
+pub(crate) static BT_EMITTED: AtomicU64 = AtomicU64::new(0);
+static BT_TID: OnceLock<fn() -> u64> = OnceLock::new();
+
+extern "C" {
+    fn _Unwind_Backtrace(
+        trace: extern "C" fn(*mut libc::c_void, *mut libc::c_void) -> libc::c_int,
+        arg: *mut libc::c_void,
+    ) -> libc::c_int;
+    fn _Unwind_GetIP(ctx: *mut libc::c_void) -> usize;
+}
+
+struct Walk {
+    slot: &'static BtSlot,
+    n: usize,
+}
+
+extern "C" fn walk_frame(ctx: *mut libc::c_void, arg: *mut libc::c_void) -> libc::c_int {
+    // SAFETY: `arg` is the `Walk` on the handler's stack, passed below.
+    let w = unsafe { &mut *arg.cast::<Walk>() };
+    if w.n >= BT_FRAMES {
+        return 5; // _URC_END_OF_STACK: stop
     }
+    // SAFETY: `ctx` is the unwinder's live context for this callback.
+    w.slot.ips[w.n].store(unsafe { _Unwind_GetIP(ctx) }, Ordering::Relaxed);
+    w.n += 1;
+    0 // _URC_NO_REASON: continue
+}
+
+/// The `SIGUSR2` handler. Async-signal-safe by construction: no heap, no
+/// locks, no formatting. It claims a preallocated slot with a CAS, walks the
+/// stack into it with the unwinder (which allocates nothing; the first
+/// use, which loads the unwinder's lazy state, is done at install time), and
+/// pokes the self-pipe with `write(2)`. `errno` is preserved.
+extern "C" fn on_sigusr2(_: libc::c_int) {
+    // SAFETY: errno location is thread-local and always valid.
+    let saved = unsafe { *errno_location() };
+    for slot in BT_RING.iter() {
+        if slot
+            .state
+            .compare_exchange(
+                SLOT_FREE,
+                SLOT_FILLING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            continue;
+        }
+        let tid = BT_TID.get().map(|f| f()).unwrap_or(0);
+        slot.tid.store(tid, Ordering::Relaxed);
+        let mut w = Walk { slot, n: 0 };
+        // SAFETY: the callback only touches `w` and atomics.
+        unsafe { _Unwind_Backtrace(walk_frame, (&mut w as *mut Walk).cast()) };
+        slot.len.store(w.n, Ordering::Relaxed);
+        slot.state.store(SLOT_READY, Ordering::Release);
+        let fd = BT_PIPE_W.load(Ordering::Relaxed);
+        if fd >= 0 {
+            // A full pipe already holds a wake-up: ignore the result.
+            // SAFETY: write(2) of one byte from a valid buffer.
+            unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
+        }
+        // SAFETY: as above.
+        unsafe { *errno_location() = saved };
+        return;
+    }
+    BT_DROPPED.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: as above.
+    unsafe { *errno_location() = saved };
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__errno_location()
+}
+#[cfg(not(target_os = "linux"))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__error()
+}
+
+/// Format one captured slot (on the writer thread, where allocating is fine)
+/// and write it to stderr. Frames show the module-relative address, which
+/// `addr2line -e <binary>` resolves, and the dynamic symbol when `dladdr`
+/// knows one.
+fn emit_slot(label: &str, slot: &BtSlot) -> String {
+    use std::fmt::Write as _;
+    let tid = slot.tid.load(Ordering::Relaxed);
+    let n = slot.len.load(Ordering::Relaxed).min(BT_FRAMES);
+    let mut out = format!("\n=== {label}: backtrace of stalled thread tid={tid} ===\n");
+    for i in 0..n {
+        let ip = slot.ips[i].load(Ordering::Relaxed);
+        // SAFETY: a zeroed Dl_info is valid; dladdr fills it for any address.
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        // SAFETY: dladdr with a valid out-pointer.
+        let found = unsafe { libc::dladdr(ip as *const libc::c_void, &mut info) } != 0;
+        let _ = write!(out, "{i:3}: {ip:#018x}");
+        if found {
+            if !info.dli_fname.is_null() {
+                // SAFETY: dladdr's NUL-terminated module path.
+                let f = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
+                let _ = write!(out, " {f}+{:#x}", ip.wrapping_sub(info.dli_fbase as usize));
+            }
+            if !info.dli_sname.is_null() {
+                // SAFETY: dladdr's NUL-terminated symbol name.
+                let s = unsafe { std::ffi::CStr::from_ptr(info.dli_sname) }.to_string_lossy();
+                let _ = write!(out, " ({s})");
+            }
+        }
+        out.push('\n');
+    }
+    out.push_str("=== end ===\n");
+    out
+}
+
+/// Install the `SIGUSR2` handler that dumps the receiving thread's backtrace
+/// to stderr (the daemon log).
+///
+/// The handler is async-signal-safe (see [`on_sigusr2`]): a stalled thread
+/// can be anywhere, including inside `malloc` (a stopped and thawed process),
+/// where an allocating handler corrupted the heap. It records raw frames into
+/// a preallocated ring and wakes a writer thread through a self-pipe; the
+/// writer formats and logs. Trade-offs: frames are addresses plus `dladdr`
+/// names (resolve with `addr2line`), not a symbolized `std::backtrace`; the
+/// unwinder takes the loader lock on glibc older than 2.35, so a thread
+/// interrupted inside `dlopen` could deadlock; bursts beyond 16 pending
+/// captures are dropped. `SIGUSR2` is used by nothing else in the daemon.
+pub(crate) fn enable_backtraces(label: &'static str, tid: fn() -> u64) -> io::Result<()> {
+    static INSTALLED: OnceLock<io::Result<()>> = OnceLock::new();
+    BT_TID.get_or_init(|| tid);
 
     let installed = INSTALLED.get_or_init(|| {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe(2) into a two-element array.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for fd in fds {
+            // SAFETY: fcntl on descriptors just created. The write end is
+            // non-blocking so the handler never waits; both are close-on-exec.
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                if fd == fds[1] {
+                    libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+                }
+            }
+        }
+        let read_fd = fds[0];
+        BT_PIPE_W.store(fds[1], Ordering::Relaxed);
+        // Warm the unwinder (loads its lazy state) outside any handler.
+        let mut warm = Walk {
+            slot: &BT_RING[0],
+            n: 0,
+        };
+        // SAFETY: the callback only touches `warm` and atomics; slot 0 is
+        // unused until the handler is installed below.
+        unsafe { _Unwind_Backtrace(walk_frame, (&mut warm as *mut Walk).cast()) };
+        let spawned = std::thread::Builder::new()
+            .name("backtrace-writer".into())
+            .spawn(move || {
+                let mut buf = [0u8; 64];
+                loop {
+                    // SAFETY: read(2) into a valid buffer.
+                    let r = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+                    if r < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                        return;
+                    }
+                    for slot in BT_RING.iter() {
+                        if slot.state.load(Ordering::Acquire) == SLOT_READY {
+                            let text = emit_slot(label, slot);
+                            slot.state.store(SLOT_FREE, Ordering::Release);
+                            #[cfg(test)]
+                            BT_EMITTED.fetch_add(1, Ordering::Relaxed);
+                            // SAFETY: write(2) on stderr with a valid buffer.
+                            unsafe { libc::write(2, text.as_ptr().cast(), text.len()) };
+                        }
+                    }
+                    let dropped = BT_DROPPED.swap(0, Ordering::Relaxed);
+                    if dropped > 0 {
+                        let t =
+                            format!("=== {label}: {dropped} backtrace request(s) dropped ===\n");
+                        // SAFETY: write(2) on stderr with a valid buffer.
+                        unsafe { libc::write(2, t.as_ptr().cast(), t.len()) };
+                    }
+                }
+            });
+        spawned?;
         // SAFETY: a zeroed `sigaction` is a valid starting value; the
         // handler is an `extern "C" fn(c_int)`, as `sa_sigaction` expects
         // without `SA_SIGINFO`.
