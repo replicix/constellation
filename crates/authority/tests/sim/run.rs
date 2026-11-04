@@ -5464,7 +5464,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         &history.reads(),
         &tentative,
         &oracle.completed_at,
-        // The scope the linearizability check projects to (above).
+        &oracle.refused_at,
+        // The fallback window's scope (above).
         match (per_dir, cfg.check_range_bits) {
             (false, _) => super::session::Scope::Global,
             (true, 0) => super::session::Scope::Dir,

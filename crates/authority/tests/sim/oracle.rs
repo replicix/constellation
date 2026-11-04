@@ -2996,6 +2996,7 @@ mod tests {
             at: BTreeMap::new(),
             completed: completed.iter().map(|(r, _)| (*r, 1)).collect(),
             completed_at: completed.iter().copied().collect(),
+            refused_at: HashMap::new(),
             segments: 1,
             fenced: 0,
             unfenced,

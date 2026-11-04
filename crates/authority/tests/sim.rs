@@ -730,6 +730,7 @@ fn session_guarantees_hold() {
             ..SimConfig::default()
         };
         let mut totals = (0usize, 0usize, 0usize, 0usize);
+        let mut refusals = (0usize, 0usize);
         for seed in 600..660 {
             let report =
                 run_seed(seed, cfg.clone()).unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
@@ -737,11 +738,14 @@ fn session_guarantees_hold() {
             totals.1 += report.sessions.degraded;
             totals.2 += report.sessions.tentative;
             totals.3 += report.sessions.degraded_violations;
+            refusals.0 += report.sessions.refusals_placed;
+            refusals.1 += report.sessions.refusals_windowed;
         }
         eprintln!(
             "session_guarantees_hold ({label}): {} reads, {} degraded (timed out), {} \
-             violations exempt as tentative, {} on degraded reads",
-            totals.0, totals.1, totals.2, totals.3
+             violations exempt as tentative, {} on degraded reads; refusals placed at \
+             their row {}, by the window {}",
+            totals.0, totals.1, totals.2, totals.3, refusals.0, refusals.1
         );
         assert!(totals.0 > 500, "{label}: too few reads to mean anything");
     }
@@ -15134,18 +15138,18 @@ fn settle_before_eio_a_gate_a_renewal_and_a_redirect_loop_leave_no_unsettled_eio
 /// Node 2's `unlink d1/f1`, invoked after those returned, was refused
 /// `ENOENT` at the root before that create, and node 2's next read saw
 /// `d1/f1` present, which the oracle reported as `monotonic_reads`. The read
-/// is monotonic: absent at the refusal's state, present at a later one. Under
-/// delegation the log orders keys of different owners only causally, so the
-/// refusal's window now binds only the successes of its scope (`session::
-/// Scope`, the projection of the linearizability check) and its own node's.
+/// is monotonic: absent at the refusal's state, present at a later one. A
+/// journaled refusal is now placed at its own `Refused` row (state 30 here),
+/// the scoped window (`session::Scope`) only places one with no row.
 ///
 /// It failed on 3d716e12 and passes there with the oracle fix. It passes on
 /// main without it too, because 02260859 delays the root's answer to its own
-/// forwarded op and so moved the schedule away from this shape; the shape
-/// itself is pinned by the unit test `session::tests::a_refusal_is_not_
-/// placed_after_another_owners_earlier_success`.
+/// forwarded op and so moved the schedule away from this shape, so this seed
+/// guards nothing about the oracle; the unit tests in `session::tests`
+/// (`a_journaled_refusal_is_placed_at_its_row`, `a_refusal_row_after_another_
+/// directorys_success_binds_the_read`) are the real guard.
 #[test]
-fn lda_4125_a_refusal_is_ordered_only_within_its_owner() {
+fn lda_4125_slow_lease_reads_seed() {
     let cfg = SimConfig {
         lease_reads: SLOW_LEASE_READS,
         ..long_delegated_late_answers_config()
