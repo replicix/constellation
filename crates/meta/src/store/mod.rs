@@ -1272,7 +1272,7 @@ impl Meta {
             .store(!table.is_empty(), std::sync::atomic::Ordering::Release);
         // Plan 30 §M11: the session state's generations survive a
         // restart (see `SessionState::seed_generations`).
-        meta.seed_session_generations()?;
+        meta.seed_session_generations(&table)?;
         // The applied journal position is volatile too; what this
         // replica holds of the log is not. Without this a watermark
         // naming the holder's journal (a lock grant's floor) stays
@@ -1285,12 +1285,19 @@ impl Meta {
     }
 
     /// Seed the session's generations from the store (see
-    /// [`SessionState::seed_generations`]) and remember the delegation table
-    /// as it is now ([`SessionState::seed_ended_before_open`]): at the open,
-    /// and after an in-process rebuild replaced the namespace
-    /// ([`Meta::replace_ns_from_rebuilt`]), whose table is the durable log's.
-    pub(crate) fn seed_session_generations(&self) -> Result<(), MetaError> {
-        let table = self.delegation_table();
+    /// [`SessionState::seed_generations`]) and remember `table`
+    /// ([`SessionState::seed_ended_before_open`]): at the open, the table
+    /// the store holds; after an in-process rebuild replaced the namespace
+    /// ([`Meta::replace_ns_from_rebuilt`]), the side replica's, read before
+    /// the commit. Not the table this store holds then: the reset re-applies
+    /// kept committed entries onto the rebuilt namespace, and a
+    /// streamed-ahead `RecallCut` among them writes the table row without
+    /// the void (only the durable log voids), so reading it back would void
+    /// that end here and call it ended before the open.
+    pub(crate) fn seed_session_generations(
+        &self,
+        table: &crate::delegation::DelegationTable,
+    ) -> Result<(), MetaError> {
         let live: std::collections::BTreeSet<u64> = table.iter().map(|d| d.gen).collect();
         self.session.seed_ended_before_open(table.max_gen(), &live);
         let mut gens = self.persisted_generations()?;

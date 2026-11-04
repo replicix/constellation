@@ -1250,8 +1250,13 @@ impl SessionState {
                 let cut = void_cut(gen).unwrap_or(idx);
                 g.voided.insert(gen);
                 g.observed.streams.lower(gen, cut);
-                let e = g.void_cuts.entry(gen).or_insert(0);
-                *e = (*e).max(cut);
+                // Set, not raised: the store's cut is the log's. After an
+                // in-process rebuild a deposed root's own cut of the
+                // generation (its journaled `RecallCut`, stranded since) may
+                // sit above the log's, and keeping it would count a
+                // dependency between the two as not lost. At an open the
+                // map is empty, and set is raise.
+                g.void_cuts.insert(gen, cut);
             }
         }
         drop(g);

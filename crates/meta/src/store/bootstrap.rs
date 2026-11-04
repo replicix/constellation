@@ -477,6 +477,11 @@ impl Meta {
             KV_USAGE_FILES.as_bytes().to_vec(),
             usage_files.to_string().into_bytes(),
         );
+        // ADR-43 (review round 3): what the session is seeded with is the
+        // side replica's table (the durable log's), read here, not the one
+        // this store holds after the commit (the reset's kept streamed
+        // entries are on it).
+        let side_table = crate::delegation::read_table_tx(&side_snap, side)?;
         tx.commit()?;
         let _ = self.refresh_member_copy_flag();
         self.usage_tracker()
@@ -485,9 +490,10 @@ impl Meta {
         // session voids it lifted, the rows the hook invalidates).
         self.report_rolled_back();
         // ... and the session, as a restart would have seeded it from this
-        // store (ADR-43, review S-1): the rebuilt table is the durable
-        // log's, so a generation it lists as ended is ended for good, and
-        // the open-table snapshot the lazy void rests on is its own.
-        self.seed_session_generations()
+        // store (ADR-43, review S-1): the side replica's table is the
+        // durable log's, so a generation it lists as ended is ended for
+        // good, and the open-table snapshot the lazy void rests on is its
+        // own.
+        self.seed_session_generations(&side_table)
     }
 }

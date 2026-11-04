@@ -7,7 +7,7 @@
 
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::delegation::{gen_epoch, GEN_EPOCH_SHIFT, GEN_MAX_EPOCH};
-use constellation_meta::{LogRecord, Meta, Position, Streams, TouchSet};
+use constellation_meta::{LogRecord, Meta, MetaStore, MutateOp, Position, Rid, Streams, TouchSet};
 
 const fn gen(epoch: u64, n: u64) -> u64 {
     (epoch << GEN_EPOCH_SHIFT) | n
@@ -379,4 +379,125 @@ fn an_in_process_rebuild_carries_the_ends_its_window_holds() {
     // A restart finds the same cuts (not cut 0).
     let meta = Meta::open(&path).unwrap();
     check(&meta);
+}
+
+fn delegate(g: u64) -> LogRecord {
+    LogRecord::Delegate {
+        dir: ROOT_INO,
+        node: 4,
+        gen: g,
+        designated: false,
+        range: (0, 0),
+    }
+}
+
+/// ADR-43 (review, round 3): the session is seeded after an in-process
+/// rebuild from the side replica's table (the durable log's), not from the
+/// table this store holds once the reset has re-applied its kept committed
+/// entries: a streamed-ahead `RecallCut` among them writes the table row
+/// without the void (only the durable log voids), so reading the table back
+/// would void that end here and count it as ended before the open, which
+/// the lazy void's restriction keeps out; were the entry to strand, nothing
+/// would lift the void.
+#[test]
+fn a_rebuild_does_not_void_an_end_a_kept_streamed_entry_carries() {
+    let h = gen(5, 3);
+    let rid = Rid {
+        node: 2,
+        incarnation: 1,
+        seq: 1,
+    };
+    let side = Meta::open_in_memory().unwrap();
+    side.apply_segment(1, 1, &[delegate(h)], &TouchSet::default())
+        .unwrap();
+    side.kv_set(&format!("deleg_log_idx:{h}"), "7").unwrap();
+
+    let meta = Meta::open_in_memory().unwrap();
+    meta.apply_segment(1, 1, &[delegate(h)], &TouchSet::default())
+        .unwrap();
+    // A committed answer whose records carry the generation's end, installed
+    // ahead of the log (durable = false: the table row, no void).
+    let ino = (1u64 << 40) | 1;
+    let records = [
+        LogRecord::Create {
+            parent: ROOT_INO,
+            name: "a".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 10,
+        },
+        LogRecord::RecallCut {
+            dir: ROOT_INO,
+            gen: h,
+            through: 9,
+        },
+        LogRecord::Completed { rid },
+    ];
+    let op = MutateOp::Create {
+        parent: ROOT_INO,
+        name: "a".into(),
+        ino,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    assert!(meta
+        .install_shadow_committed(rid, 1, 0, &op, &Default::default(), &records, true)
+        .unwrap());
+    assert!(!meta.session().is_voided(h), "streamed-ahead: no void");
+    assert!(
+        meta.delegation_table().iter().next().is_none(),
+        "end applied"
+    );
+
+    meta.replace_ns_from_rebuilt(&side, &Default::default())
+        .unwrap();
+    // The kept entry is on the rebuilt namespace, with the end it carries.
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
+    assert!(
+        meta.delegation_table().iter().next().is_none(),
+        "the kept entry's end is on the table"
+    );
+    // The side's table lists `h` live: it is neither voided nor ended
+    // before the open.
+    assert!(!meta.session().is_voided(h));
+    assert!(!meta.session().ended_before_open(h));
+    assert!(!meta.deps_lost_deps(&at(h, 8)));
+}
+
+/// ADR-43 (review, round 3): the rebuild sets the cut of an ended
+/// generation from the store (the log's), not the larger of it and what the
+/// session holds: a deposed root's own cut of the generation (its journaled
+/// end, stranded since) above the log's would count a dependency between the
+/// two as not lost.
+#[test]
+fn a_rebuild_takes_the_log_s_cut_over_a_deposed_roots_own() {
+    let g = gen(5, 3);
+    let side = Meta::open_in_memory().unwrap();
+    side.apply_segment(
+        1,
+        1,
+        &[
+            delegate(g),
+            LogRecord::RecallCut {
+                dir: ROOT_INO,
+                gen: g,
+                through: 5,
+            },
+        ],
+        &TouchSet::default(),
+    )
+    .unwrap();
+    let meta = Meta::open_in_memory().unwrap();
+    // The deposed root's own end of the generation, at 9.
+    meta.session().void_stream(g, 9);
+    meta.session().note_void_cut(g, 9);
+    assert!(!meta.deps_lost_deps(&at(g, 9)));
+    meta.replace_ns_from_rebuilt(&side, &Default::default())
+        .unwrap();
+    assert_eq!(meta.session().void_cut(g), Some(5));
+    assert!(!meta.deps_lost_deps(&at(g, 5)));
+    assert!(meta.deps_lost_deps(&at(g, 6)));
 }
