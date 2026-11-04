@@ -697,8 +697,8 @@ cause 6, the maintainer's open decision. Not here: S4, the strict flags (`strict
 reach 0). The plain sweeps (2,000 seeds, both modes) add one failing seed on the fix, `long-delegated-late-answers` 1477 with the
 knob, a latent replica divergence of a former delegate that main shows at 6183 and 7393 (PROGRESS, **L1**, closed: the cause is
 the root's pre-S3 stream install, see the paragraph after this one; 4125 with the knob is not L1: an oracle gap in the session checker's refusal window, closed in
-`tests/sim/session.rs` (PROGRESS, "Oracle: a refusal's window binds only its scope and its own node's"), pinned by
-`lda_4125_a_refusal_is_ordered_only_within_its_owner`);
+`tests/sim/session.rs` (PROGRESS, "Oracle: a journaled refusal is placed at its own `Refused` row"), pinned by
+`lda_4125_slow_lease_reads_seed`);
 stage 2 inherits the I2 class on a stranded replay
 against the requester's re-ask (**L2**, main's `delegated-no-backup-root-near` 1680 with the knob; `placement-hot` 8557 fails only on 055de5f1, the tree before the settle fixes; closed in the meta store by a deposed root's rebuild
 no longer queueing a gated append of a delegate's row, PROGRESS, "L2"; two sources of the same shape are open as L2b); S4 takes **L3**, the lost `DelegRecall` that is never sent again. **L4**, a void on a generation number that a deposed root's unshipped end left and that the successor's grant reuses (the node's next write then names no dependency on its own row), is fixed in `meta/src/replay.rs` (a `Delegate` record lifts the void). The ratchet's ceilings were lowered to the counts on the rebased tree (`delegated-holder-cut` 48 to 14, `long-delegated-late-answers` 63 to 25, `long-delegated-backup` 52 to 23, `placement-hot` 10 to 0, among others).
