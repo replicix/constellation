@@ -2,10 +2,12 @@
 //! simulated run's history, with the log as the witness of the version
 //! order.
 //!
-//! The successes in witness order (`Completed { rid }` positions; a
-//! tenure's run in journal order, `witness_order`, as the linearizability
-//! and session-order checks take it) fix every name's version
-//! sequence: after `k` successes, name `x` is present or not. A session is one node incarnation (a restart is a new FUSE
+//! The successes (`Completed { rid }` positions) fix every name's version
+//! sequence: after `k` successes, name `x` is present or not. They are
+//! taken in execution order in a flat configuration (`execution_order`)
+//! and in witness order otherwise (`witness_order`: a tenure's run in
+//! journal order, as the linearizability and session-order checks take
+//! it). A session is one node incarnation (a restart is a new FUSE
 //! session). Each observation the session makes constrains, per name,
 //! how far along that sequence a later read of the name must be:
 //! - its own write that returned `Ok` (not tentative) at log index `p`:
@@ -18,9 +20,8 @@
 //!   appended, when the row is where the refusal was evaluated: the
 //!   refused name shows what the refusal says at that state. A refusal
 //!   with no such row (none in an applied segment, another code than the
-//!   client's return, or a state that does not show the refusal: an inbox
-//!   or local answer is evaluated against the requester's replica and
-//!   journaled later) falls back to a window: at least the earliest
+//!   client's return, or a state that does not show the refusal) falls
+//!   back to a window: at least the earliest
 //!   state, after the successes of its scope and its own node's that
 //!   returned before it was invoked, that refuses the same way (`Scope`);
 //! - a read: at least the earliest state at or after its own floor that
@@ -47,10 +48,21 @@
 //! The fallback window is lenient: a success of another scope that
 //! really precedes the refusal in the sequencer's order does not bind it,
 //! and it places the refusal at the earliest state that refuses the same
-//! way, so a name that flipped back in between hides a stale read. This
-//! is the one open item: closing it needs the sim to record an inbox or
-//! local refusal's evaluation position (the requester replica's applied
-//! position) and place the refusal there (the row path has no such gap).
+//! way, so a name that flipped back in between hides a stale read.
+//!
+//! Flat (`Global`, one sequencer at a time) the window is used only where
+//! a tentative op explains the row. Every refusal there, the inbox's and a
+//! node's own included, is evaluated by the sequencer in force, which
+//! journals its `Refused` row in the same step; a row is off its
+//! evaluation point only when the log moved what the sequencer had seen.
+//! A takeover re-ships its predecessor's held tail, rows that later rows of
+//! the predecessor shipped ahead of: the successes and rows are taken in
+//! execution order (`ExecIdentity`: a re-shipped transaction at its
+//! `TailOf`, `execution_order`), which puts such a row where its holder
+//! evaluated it. What is left is an effect the log lost or replayed later
+//! (a rollback, `repair drop-held`'s requeue, a replay by rid): the name is
+//! a tentative op's, and the window decides. A disagreeing row on a name
+//! no tentative op touched is a violation (`refusal_row`).
 //!
 //! A read invoked after an observation returned must be explained by a
 //! state at or after that floor; if no such state shows what it returned,
@@ -128,6 +140,27 @@ impl Scope {
     }
 }
 
+/// The execution identity of each success and each `Refused` row in a flat
+/// (one sequencer at a time) configuration: `(epoch, journal seq)` of the
+/// journal that first held it (a re-shipped transaction's `TailOf`). Empty:
+/// the witness order alone.
+pub type ExecIdentity = HashMap<Rid, (u64, u64)>;
+
+/// The flat execution order: the successes and refusal rows sorted by
+/// their execution identity (a tenure's journal order, the tenures in epoch
+/// order, a re-shipped transaction at its place in the journal that first
+/// held it), log position breaking ties. Every rid has an identity (the
+/// caller checks). With one sequencer at a time this is the order the
+/// sequencers executed (and answered) in: a takeover re-journals its
+/// predecessor's tail before it executes anything (the takeover gate), and
+/// inside a tenure the ship plan only sends rows ahead of a deferred one
+/// they commute with (`witness_order`).
+fn execution_order(at: &HashMap<Rid, (u64, usize)>, exec: &ExecIdentity) -> Vec<Rid> {
+    let mut order: Vec<(Rid, (u64, usize))> = at.iter().map(|(r, p)| (*r, *p)).collect();
+    order.sort_by_key(|(r, p)| (exec[r], *p));
+    order.into_iter().map(|(r, _)| r).collect()
+}
+
 /// The sequencer that ordered each success: (epoch, node, origin
 /// generation): the root's own rows are generation 0, a delegate's rows
 /// the root appends carry the delegation's.
@@ -154,6 +187,7 @@ pub fn check_sessions(
     journal: &JournalOrder,
     refused_journal: &JournalOrder,
     sequencer: &SequencerOf,
+    exec: &ExecIdentity,
     scope: Scope,
 ) -> SessionReport {
     let mut report = SessionReport {
@@ -173,11 +207,11 @@ pub fn check_sessions(
             }
         }
     }
-    // The successes in witness order (the log's, a tenure's run in
-    // journal order: `witness_order`, as the linearizability and
-    // session-order checks take it), and every name's presence after each.
-    // A journaled refusal's row is ordered with them, by the same rule
-    // (its journal seq inside its tenure's run): `row_k` is the number of
+    // The successes in execution order in a flat configuration, else in
+    // witness order (the log's, a tenure's run in journal order:
+    // `witness_order`, as the linearizability and session-order checks take
+    // it), and every name's presence after each. A journaled refusal's row
+    // is ordered with them, by the same rule: `row_k` is the number of
     // successes before it, the state it was evaluated at.
     let mut at: HashMap<Rid, (u64, usize)> = completed_at.clone();
     let mut merged: JournalOrder = journal.clone();
@@ -191,7 +225,17 @@ pub fn check_sessions(
     }
     let mut successes: Vec<Rid> = Vec::new();
     let mut row_k: HashMap<Rid, usize> = HashMap::new();
-    for rid in witness_order(&at, &merged) {
+    // Flat: the execution order (`execution_order`), which also places a
+    // `Refused` row a takeover re-shipped where its holder evaluated it.
+    // Only with an identity for every rid: none borrows a neighbour's.
+    let flat_exec =
+        scope == Scope::Global && !exec.is_empty() && at.keys().all(|r| exec.contains_key(r));
+    let order = if flat_exec {
+        execution_order(&at, exec)
+    } else {
+        witness_order(&at, &merged)
+    };
+    for rid in order {
         if completed_at.contains_key(&rid) {
             if invoke.contains_key(&rid) {
                 successes.push(rid);
@@ -440,9 +484,9 @@ pub fn check_sessions(
                 // The row of this answer: its code is the client's return,
                 // and the refused name shows what the refusal says at the
                 // state the row follows. A row that fails either is not
-                // where the refusal was evaluated (an inbox or local
-                // answer is evaluated against the requester's replica and
-                // journaled later), and the window decides.
+                // where the refusal was evaluated (flat: only when a
+                // tentative op on the name explains it, see the module
+                // doc), and the window decides.
                 let row_k = refused_at
                     .get(rid)
                     .filter(|(_, code)| code == r)
@@ -450,6 +494,25 @@ pub fn check_sessions(
                 let row_k = match row_k {
                     Some(k) if presence.get(name).is_some_and(|v| v[k] != want) => {
                         report.refusals_row_disagrees += 1;
+                        if flat_exec && !tentative_names.get(name).is_some_and(|t| *t < *rt) {
+                            // Flat: the sequencer journaled the row where it
+                            // evaluated the refusal, and the execution order
+                            // places it there (a re-shipped row by its
+                            // `TailOf`). A row whose state does not show the
+                            // refusal is explained only by an effect the log
+                            // lost or moved (a tentative op on the name: a
+                            // rollback, a drop, a replay by rid); without one
+                            // no order of the sequencers' executions gives
+                            // this answer.
+                            report.violations.push((
+                                "refusal_row".into(),
+                                format!(
+                                    "refusal {op:?} -> {r:?} rid {rid:?}: its row (execution identity {:?}) follows {k} successes, where {name} is {}",
+                                    exec.get(rid),
+                                    if want { "absent" } else { "present" }
+                                ),
+                            ));
+                        }
                         None
                     }
                     k => k,
@@ -686,6 +749,7 @@ mod tests {
             &none_j,
             &none_j,
             &HashMap::new(),
+            &HashMap::new(),
             Scope::Global,
         );
         let mut kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
@@ -704,6 +768,7 @@ mod tests {
             &none_j,
             &none_j,
             &HashMap::new(),
+            &HashMap::new(),
             Scope::Global,
         );
         assert!(r.violations.is_empty(), "{r:?}");
@@ -718,6 +783,7 @@ mod tests {
             &HashMap::new(),
             &none_j,
             &none_j,
+            &HashMap::new(),
             &HashMap::new(),
             Scope::Global,
         );
@@ -769,6 +835,7 @@ mod tests {
             &none_j,
             &none_j,
             &HashMap::new(),
+            &HashMap::new(),
             Scope::Dir,
         );
         let kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
@@ -787,6 +854,7 @@ mod tests {
             &HashMap::new(),
             &none_j,
             &none_j,
+            &HashMap::new(),
             &HashMap::new(),
             Scope::Dir,
         );
@@ -808,6 +876,7 @@ mod tests {
             &none_j,
             &none_j,
             &HashMap::new(),
+            &HashMap::new(),
             Scope::Dir,
         );
         assert!(r.violations.is_empty(), "{r:?}");
@@ -822,6 +891,7 @@ mod tests {
             &HashMap::new(),
             &none_j,
             &none_j,
+            &HashMap::new(),
             &HashMap::new(),
             Scope::Dir,
         );
@@ -886,6 +956,7 @@ mod tests {
             &none_j,
             &none_j,
             &HashMap::new(),
+            &HashMap::new(),
             Scope::Dir,
         );
         assert!(r.violations.is_empty(), "{r:?}");
@@ -899,6 +970,7 @@ mod tests {
             &HashMap::new(),
             &none_j,
             &none_j,
+            &HashMap::new(),
             &HashMap::new(),
             Scope::Global,
         );
@@ -916,6 +988,7 @@ mod tests {
             &none_j,
             &none_j,
             &HashMap::new(),
+            &HashMap::new(),
             Scope::Dir,
         );
         let kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
@@ -931,6 +1004,7 @@ mod tests {
             &HashMap::new(),
             &none_j,
             &none_j,
+            &HashMap::new(),
             &HashMap::new(),
             Scope::Dir,
         );
@@ -963,6 +1037,7 @@ mod tests {
                 &none_j,
                 &none_j,
                 &HashMap::new(),
+                &HashMap::new(),
                 scope,
             );
             assert!(r.violations.is_empty(), "{scope:?}: {r:?}");
@@ -983,6 +1058,7 @@ mod tests {
                 &none_j,
                 &none_j,
                 &HashMap::new(),
+                &HashMap::new(),
                 scope,
             );
             let kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
@@ -1001,6 +1077,7 @@ mod tests {
             &other,
             &none_j,
             &none_j,
+            &HashMap::new(),
             &HashMap::new(),
             Scope::Dir,
         );
@@ -1054,6 +1131,7 @@ mod tests {
             &none_j,
             &none_j,
             &HashMap::new(),
+            &HashMap::new(),
             Scope::Dir,
         );
         assert!(r.violations.is_empty(), "{r:?}");
@@ -1067,6 +1145,7 @@ mod tests {
                 &rows,
                 &none_j,
                 &none_j,
+                &HashMap::new(),
                 &HashMap::new(),
                 scope,
             );
@@ -1084,6 +1163,7 @@ mod tests {
             &rows,
             &none_j,
             &none_j,
+            &HashMap::new(),
             &HashMap::new(),
             Scope::Dir,
         );
@@ -1140,6 +1220,7 @@ mod tests {
                 &none_j,
                 &none_j,
                 &HashMap::new(),
+                &HashMap::new(),
                 scope,
             );
             let kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
@@ -1153,6 +1234,7 @@ mod tests {
                 &rows((2, 2)),
                 &none_j,
                 &none_j,
+                &HashMap::new(),
                 &HashMap::new(),
                 scope,
             );
@@ -1168,6 +1250,7 @@ mod tests {
                 &rows((1, 5)),
                 &none_j,
                 &none_j,
+                &HashMap::new(),
                 &HashMap::new(),
                 scope,
             );
@@ -1191,8 +1274,11 @@ mod tests {
             ev(32, rid(2, 1), Some(NsOp::Unlink("d2/f".into())), NsRet::Ok),
             ev(64, rid(4, 1), None, NsRet::Ok),
             ev(32, rid(2, 1), None, NsRet::Enoent),
+            // A later create of `f`, invoked after the refusal returned.
+            ev(80, rid(6, 1), Some(NsOp::Create("f".into())), NsRet::Ok),
+            ev(80, rid(6, 1), None, NsRet::Ok),
         ];
-        let ticks: Vec<u64> = (0..4).collect();
+        let ticks: Vec<u64> = (0..6).collect();
         let log: HashMap<Rid, (u64, usize)> = [(rid(4, 1), (1, 0))].into_iter().collect();
         let none = HashSet::new();
         // The refusal was evaluated before the create (state 0), the row
@@ -1211,6 +1297,7 @@ mod tests {
             &rows,
             &none_j,
             &none_j,
+            &HashMap::new(),
             &HashMap::new(),
             Scope::Dir,
         );
@@ -1237,6 +1324,7 @@ mod tests {
             &none_j,
             &none_j,
             &HashMap::new(),
+            &HashMap::new(),
             Scope::Dir,
         );
         assert!(r.violations.is_empty(), "{r:?}");
@@ -1254,6 +1342,7 @@ mod tests {
             &rows,
             &none_j,
             &none_j,
+            &HashMap::new(),
             &HashMap::new(),
             Scope::Dir,
         );
@@ -1314,6 +1403,7 @@ mod tests {
                 &none_j,
                 &none_j,
                 &HashMap::new(),
+                &HashMap::new(),
                 scope,
             );
             assert_eq!(kinds(&r), vec!["causal_order"], "{scope:?}: {r:?}");
@@ -1329,6 +1419,7 @@ mod tests {
             &no_rows,
             &none_j,
             &none_j,
+            &HashMap::new(),
             &HashMap::new(),
             Scope::Global,
         );
@@ -1349,6 +1440,7 @@ mod tests {
                 &no_rows,
                 &none_j,
                 &none_j,
+                &HashMap::new(),
                 &HashMap::new(),
                 scope,
             );
@@ -1374,6 +1466,7 @@ mod tests {
             &no_rows,
             &none_j,
             &none_j,
+            &HashMap::new(),
             &HashMap::new(),
             Scope::Dir,
         );
@@ -1412,6 +1505,7 @@ mod tests {
                 &none_j,
                 &none_j,
                 &HashMap::new(),
+                &HashMap::new(),
                 scope,
             );
             assert_eq!(kinds(&r), vec!["monotonic_reads"], "{scope:?}: {r:?}");
@@ -1425,6 +1519,7 @@ mod tests {
                 &no_rows,
                 &none_j,
                 &none_j,
+                &HashMap::new(),
                 &HashMap::new(),
                 scope,
             );
@@ -1485,6 +1580,7 @@ mod tests {
                 &journal,
                 &none_j,
                 &HashMap::new(),
+                &HashMap::new(),
                 scope,
             );
             assert_eq!(kinds(&r), vec!["causal_order"], "{scope:?}: {r:?}");
@@ -1499,6 +1595,7 @@ mod tests {
                     &no_rows,
                     &none_j,
                     &none_j,
+                    &HashMap::new(),
                     &HashMap::new(),
                     scope,
                 );
@@ -1515,6 +1612,7 @@ mod tests {
             &no_rows,
             &journal,
             &none_j,
+            &HashMap::new(),
             &HashMap::new(),
             Scope::Global,
         );
@@ -1560,6 +1658,7 @@ mod tests {
             &journal,
             &rjournal,
             &HashMap::new(),
+            &HashMap::new(),
             Scope::Dir,
         );
         assert_eq!(kinds(&r), vec!["monotonic_reads"], "{r:?}");
@@ -1575,6 +1674,7 @@ mod tests {
             &rows,
             &none_j,
             &none_j,
+            &HashMap::new(),
             &HashMap::new(),
             Scope::Dir,
         );
@@ -1625,7 +1725,17 @@ mod tests {
         let root: SequencerOf = log.keys().map(|r| (*r, (1, 1, 0))).collect();
         for scope in [Scope::Global, Scope::Dir, Scope::Range(1)] {
             let r = check_sessions(
-                &events, &ticks, &reads, &none, &log, &no_rows, &none_j, &none_j, &root, scope,
+                &events,
+                &ticks,
+                &reads,
+                &none,
+                &log,
+                &no_rows,
+                &none_j,
+                &none_j,
+                &root,
+                &HashMap::new(),
+                scope,
             );
             assert_eq!(kinds(&r), vec!["causal_order"], "{scope:?}: {r:?}");
         }
@@ -1635,7 +1745,17 @@ mod tests {
         other.insert(rid(1, 1), (1, 1, 7));
         for scope in [Scope::Dir, Scope::Range(1)] {
             let r = check_sessions(
-                &events, &ticks, &reads, &none, &log, &no_rows, &none_j, &none_j, &other, scope,
+                &events,
+                &ticks,
+                &reads,
+                &none,
+                &log,
+                &no_rows,
+                &none_j,
+                &none_j,
+                &other,
+                &HashMap::new(),
+                scope,
             );
             assert!(r.violations.is_empty(), "{scope:?}: {r:?}");
         }
@@ -1653,6 +1773,7 @@ mod tests {
             &none_j,
             &none_j,
             &unknown,
+            &HashMap::new(),
             Scope::Dir,
         );
         assert!(r.violations.is_empty(), "{r:?}");
@@ -1709,6 +1830,7 @@ mod tests {
             &none_j,
             &none_j,
             &seqs,
+            &HashMap::new(),
             Scope::Dir,
         );
         assert_eq!(kinds(&r), vec!["monotonic_reads"], "{r:?}");
@@ -1723,8 +1845,201 @@ mod tests {
             &none_j,
             &none_j,
             &seqs,
+            &HashMap::new(),
             Scope::Dir,
         );
         assert!(r.violations.is_empty(), "{r:?}");
+    }
+
+    /// The window fallback's leniency in a flat configuration, closed by the
+    /// execution order. Epoch 1's holder journals node 3's `create f` (j1)
+    /// and `unlink f` (j2), node 4's `create g` (j3) and `create f` (j4),
+    /// then refuses node 2's `create f` `EEXIST` (j5: `f` present, set by
+    /// node 4's create, whose node had been acknowledged `create g`). The
+    /// refusal's row is held; node 5's `unlink f` (j6) ships ahead of it.
+    /// A takeover re-ships the row from the tail (`TailOf (1, 5)`), after
+    /// the unlink. By its log position the row shows `f` absent: it
+    /// disagrees, and the window (no success returned before the refusal
+    /// was invoked) places it at state 1, where node 3's create set `f`:
+    /// two setters in the range, no causal floor, and node 2's later read
+    /// of `g` absent is accepted. At its execution identity (1, 5) the row
+    /// follows node 4's create: `causal_order`.
+    #[test]
+    fn a_reshipped_refusal_row_is_placed_where_its_holder_evaluated_it() {
+        let ev = |thread: u64, rid: Rid, op: Option<NsOp>, ret: NsRet| match op {
+            Some(op) => HistEvt::Invoke { thread, rid, op },
+            None => HistEvt::Return { thread, rid, ret },
+        };
+        let events = vec![
+            ev(32, rid(2, 1), Some(NsOp::Create("f".into())), NsRet::Ok),
+            ev(48, rid(3, 1), Some(NsOp::Create("f".into())), NsRet::Ok),
+            ev(48, rid(3, 1), None, NsRet::Ok),
+            ev(48, rid(3, 2), Some(NsOp::Unlink("f".into())), NsRet::Ok),
+            ev(48, rid(3, 2), None, NsRet::Ok),
+            ev(64, rid(4, 1), Some(NsOp::Create("g".into())), NsRet::Ok),
+            ev(64, rid(4, 1), None, NsRet::Ok),
+            ev(64, rid(4, 2), Some(NsOp::Create("f".into())), NsRet::Ok),
+            ev(64, rid(4, 2), None, NsRet::Ok),
+            ev(32, rid(2, 1), None, NsRet::Eexist),
+            ev(80, rid(5, 1), Some(NsOp::Unlink("f".into())), NsRet::Ok),
+            ev(80, rid(5, 1), None, NsRet::Ok),
+        ];
+        let ticks: Vec<u64> = (0..12).collect();
+        let reads = vec![read(2, "g", false, 12, 13)];
+        let none = HashSet::new();
+        // Epoch 1 shipped j1..j4 in seq 1 and j6 in seq 2; epoch 2
+        // re-shipped the refusal in seq 3 (`TailOf`, `Refused`).
+        let log: HashMap<Rid, (u64, usize)> = [
+            (rid(3, 1), (1, 0)),
+            (rid(3, 2), (1, 1)),
+            (rid(4, 1), (1, 2)),
+            (rid(4, 2), (1, 3)),
+            (rid(5, 1), (2, 0)),
+        ]
+        .into_iter()
+        .collect();
+        let rows: HashMap<Rid, ((u64, usize), NsRet)> =
+            [(rid(2, 1), ((3, 1), NsRet::Eexist))].into_iter().collect();
+        let journal: JournalOrder = [
+            (rid(3, 1), (1, 1, 1)),
+            (rid(3, 2), (1, 1, 2)),
+            (rid(4, 1), (1, 1, 3)),
+            (rid(4, 2), (1, 1, 4)),
+            (rid(5, 1), (1, 1, 6)),
+        ]
+        .into_iter()
+        .collect();
+        let refused_journal: JournalOrder = [(rid(2, 1), (2, 2, 1))].into_iter().collect();
+        let exec: ExecIdentity = [
+            (rid(3, 1), (1, 1)),
+            (rid(3, 2), (1, 2)),
+            (rid(4, 1), (1, 3)),
+            (rid(4, 2), (1, 4)),
+            (rid(5, 1), (1, 6)),
+            (rid(2, 1), (1, 5)),
+        ]
+        .into_iter()
+        .collect();
+        let run = |exec: &ExecIdentity| {
+            check_sessions(
+                &events,
+                &ticks,
+                &reads,
+                &none,
+                &log,
+                &rows,
+                &journal,
+                &refused_journal,
+                &HashMap::new(),
+                exec,
+                Scope::Global,
+            )
+        };
+        // Without execution identities (the witness order): the row
+        // disagrees, the window places it, the stale read is accepted.
+        let r = run(&HashMap::new());
+        assert!(r.violations.is_empty(), "{r:?}");
+        assert_eq!(
+            (
+                r.refusals_placed,
+                r.refusals_windowed,
+                r.refusals_row_disagrees
+            ),
+            (0, 1, 1)
+        );
+        // With them: placed at its row, after node 4's create.
+        let r = run(&exec);
+        let kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, vec!["causal_order"], "{r:?}");
+        assert_eq!((r.refusals_placed, r.refusals_windowed), (1, 0));
+        // An identity missing for one rid: no neighbour's key is lent, the
+        // witness order is used (as without identities).
+        let mut partial = exec.clone();
+        partial.remove(&rid(5, 1));
+        let r = run(&partial);
+        assert!(r.violations.is_empty(), "{r:?}");
+        assert_eq!((r.refusals_placed, r.refusals_windowed), (0, 1));
+        // A clean read (`g` present) is accepted.
+        let clean = vec![read(2, "g", true, 12, 13)];
+        let r = check_sessions(
+            &events,
+            &ticks,
+            &clean,
+            &none,
+            &log,
+            &rows,
+            &journal,
+            &refused_journal,
+            &HashMap::new(),
+            &exec,
+            Scope::Global,
+        );
+        assert!(r.violations.is_empty(), "{r:?}");
+    }
+
+    /// Flat, with execution identities: a row whose state does not show
+    /// its refusal is a `refusal_row` violation, unless a tentative op
+    /// (rolled back, dropped, replayed by rid) touched the name: then the
+    /// window places it, as before. Node 4's `create f` (j1) is logged;
+    /// node 2's `unlink f` refused `ENOENT` has its row after it (j2).
+    #[test]
+    fn a_flat_row_that_disagrees_is_a_violation_unless_a_tentative_op_explains_it() {
+        let ev = |thread: u64, rid: Rid, op: Option<NsOp>, ret: NsRet| match op {
+            Some(op) => HistEvt::Invoke { thread, rid, op },
+            None => HistEvt::Return { thread, rid, ret },
+        };
+        let events = vec![
+            ev(64, rid(4, 1), Some(NsOp::Create("f".into())), NsRet::Ok),
+            ev(64, rid(4, 1), None, NsRet::Ok),
+            ev(32, rid(2, 1), Some(NsOp::Unlink("f".into())), NsRet::Ok),
+            ev(32, rid(2, 1), None, NsRet::Enoent),
+            // A later create of `f`, invoked after the refusal returned.
+            ev(80, rid(6, 1), Some(NsOp::Create("f".into())), NsRet::Ok),
+            ev(80, rid(6, 1), None, NsRet::Ok),
+        ];
+        let ticks: Vec<u64> = (0..6).collect();
+        let log: HashMap<Rid, (u64, usize)> = [(rid(4, 1), (1, 0))].into_iter().collect();
+        let rows: HashMap<Rid, ((u64, usize), NsRet)> =
+            [(rid(2, 1), ((1, 1), NsRet::Enoent))].into_iter().collect();
+        let exec: ExecIdentity = [(rid(4, 1), (1, 1)), (rid(2, 1), (1, 2))]
+            .into_iter()
+            .collect();
+        let reads: Vec<ReadEvt> = Vec::new();
+        let run = |tentative: &HashSet<Rid>, exec: &ExecIdentity, scope: Scope| {
+            check_sessions(
+                &events,
+                &ticks,
+                &reads,
+                tentative,
+                &log,
+                &rows,
+                &none_j,
+                &none_j,
+                &HashMap::new(),
+                exec,
+                scope,
+            )
+        };
+        let none = HashSet::new();
+        let r = run(&none, &exec, Scope::Global);
+        let kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, vec!["refusal_row"], "{r:?}");
+        // The create was rolled back and replayed (tentative): windowed.
+        let tentative: HashSet<Rid> = [rid(4, 1)].into_iter().collect();
+        let r = run(&tentative, &exec, Scope::Global);
+        assert!(r.violations.is_empty(), "{r:?}");
+        assert_eq!((r.refusals_windowed, r.refusals_row_disagrees), (1, 1));
+        // A tentative op on the name invoked only after the refusal
+        // returned does not explain the row (the read exemption's rule).
+        let later: HashSet<Rid> = [rid(6, 1)].into_iter().collect();
+        let r = run(&later, &exec, Scope::Global);
+        let kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, vec!["refusal_row"], "{r:?}");
+        // Without identities, or under delegation (`Dir`): windowed.
+        for (exec, scope) in [(HashMap::new(), Scope::Global), (exec.clone(), Scope::Dir)] {
+            let r = run(&none, &exec, scope);
+            assert!(r.violations.is_empty(), "{scope:?}: {r:?}");
+            assert_eq!((r.refusals_windowed, r.refusals_row_disagrees), (1, 1));
+        }
     }
 }

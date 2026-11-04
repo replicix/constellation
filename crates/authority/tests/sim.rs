@@ -5643,6 +5643,7 @@ fn sweep_config() {
         "backup-hot" => backup_hot_config(),
         "flex" => flex_config(),
         "flex-crash" => flex_crash_config(),
+        "flex-backup" => flex_backup_config(),
         "drop-held-chain" => drop_held_chain_config(),
         "drop-held-chain-requester-dies" => drop_held_chain_requester_dies_config(),
         "drop-held-chain-backed" => drop_held_chain_backed_config(),

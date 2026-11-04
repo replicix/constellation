@@ -2417,6 +2417,61 @@ fn journal_rows<'a>(
     out
 }
 
+/// The execution identity of every completed rid and every `Refused` row
+/// (`session::ExecIdentity`): `(epoch, journal seq)` of the journal that
+/// first held its transaction. A transaction a takeover re-shipped from its
+/// predecessor's tail begins with `TailOf { epoch, jseq }` (kept through any
+/// number of re-ships), the transaction's first record: it is the record
+/// right before a `Refused` (`TailOf`, `Refused`), and one or two before a
+/// `Completed`, which sits right behind the transaction's first record
+/// (`append_tx`): `TailOf`, first record, `Completed`. Only those places
+/// count, never a scan back (a `TailOf` an earlier transaction without a rid
+/// began would lend its key to a successor's own transaction); every other
+/// row is its own tenure's `(seg.epoch, row)`.
+///
+/// The order by identity assumes one sequencer at a time and one shipping
+/// node per epoch. Empty (the caller then uses `witness_order`) when one
+/// epoch's segments come from two nodes, when any segment carries a
+/// delegation's origin, or when a rid has no identity.
+fn exec_identity(oracle: &check::Oracle) -> super::session::ExecIdentity {
+    let mut out = super::session::ExecIdentity::new();
+    let mut node_of: HashMap<u64, u64> = HashMap::new();
+    for seg in oracle.unfenced.values() {
+        if seg.origins.iter().any(|o| o.0 != 0)
+            || *node_of.entry(seg.epoch).or_insert(seg.node) != seg.node
+        {
+            return out;
+        }
+    }
+    let rows = oracle
+        .completed_at
+        .iter()
+        .chain(oracle.refused_at.iter().map(|(rid, (at, _))| (rid, at)));
+    for (rid, (seq, idx)) in rows {
+        let Some(seg) = oracle.unfenced.get(seq) else {
+            return super::session::ExecIdentity::new();
+        };
+        let j = seg.records[..*idx]
+            .iter()
+            .filter(|rec| !matches!(rec, LogRecord::Atime { .. }))
+            .count();
+        let Some(row) = seg.rows.get(j) else {
+            return super::session::ExecIdentity::new();
+        };
+        let tail = |back: usize| match idx.checked_sub(back).and_then(|i| seg.records.get(i)) {
+            Some(LogRecord::TailOf { epoch, jseq }) => Some((*epoch, *jseq)),
+            _ => None,
+        };
+        let id = match seg.records.get(*idx) {
+            Some(LogRecord::Refused { .. }) => tail(1),
+            _ => tail(1).or_else(|| tail(2)),
+        }
+        .unwrap_or((seg.epoch, *row));
+        out.entry(*rid).or_insert(id);
+    }
+    out
+}
+
 /// Plan 45 follow-up: a rename that completed in the log without its
 /// `Rename` record found both names on one inode (a hard link, POSIX's
 /// no-op): it becomes `NsOp::Same` for the checks, which cannot tell
@@ -5561,6 +5616,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         &journal,
         &refused_journal_order(&oracle),
         &sequencer_order(&oracle),
+        &exec_identity(&oracle),
         // The fallback window's scope (above).
         match (per_dir, cfg.check_range_bits) {
             (false, _) => super::session::Scope::Global,
@@ -6276,5 +6332,163 @@ impl tracing_subscriber::fmt::time::FormatTime for SimTime {
             }
             _ => write!(w, "t=?"),
         }
+    }
+}
+
+#[cfg(test)]
+mod exec_identity_tests {
+    use super::*;
+
+    fn rid(node: u64, seq: u64) -> Rid {
+        Rid {
+            node,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    fn create(name: &str) -> LogRecord {
+        LogRecord::Create {
+            parent: 1,
+            name: name.into(),
+            ino: 7,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 0,
+        }
+    }
+
+    fn seg(
+        node: u64,
+        epoch: u64,
+        records: Vec<LogRecord>,
+        rows: Vec<u64>,
+        origins: Vec<(u64, u64)>,
+    ) -> constellation_authority::segment::Segment {
+        constellation_authority::segment::Segment {
+            node,
+            epoch,
+            through: rows.last().copied().unwrap_or(0),
+            records,
+            rows,
+            origins,
+        }
+    }
+
+    fn oracle(
+        segs: Vec<constellation_authority::segment::Segment>,
+        completed: &[(Rid, (u64, usize))],
+        refused: &[(Rid, (u64, usize))],
+    ) -> check::Oracle {
+        check::Oracle {
+            head: segs.len() as u64,
+            final_dump: Vec::new(),
+            at: BTreeMap::new(),
+            completed: HashMap::new(),
+            completed_at: completed.iter().cloned().collect(),
+            refused_at: refused
+                .iter()
+                .map(|(r, p)| (*r, (*p, NsRet::Eexist)))
+                .collect(),
+            segments: segs.len(),
+            fenced: 0,
+            unfenced: segs
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| (i as u64 + 1, Arc::new(s)))
+                .collect(),
+            describe: Vec::new(),
+        }
+    }
+
+    /// A takeover's segment: a rid-less re-shipped tail (`TailOf (1, 5)`,
+    /// `create f`), the successor's own `create g` + `Completed(B)`, a
+    /// re-shipped completed transaction (`TailOf (1, 3)`, `create h`,
+    /// `Completed(A)`), one with the other layout (`TailOf (1, 9)`,
+    /// `Completed(C)`, `create i`), a re-shipped refusal (`TailOf (1, 7)`,
+    /// `Refused(R)`), and the successor's own refusal right behind a rid-less
+    /// tail (`TailOf (1, 11)`, `create k`, `Refused(S)`). Each rid has the
+    /// identity of its own transaction: B and S do not borrow a rid-less
+    /// tail's `TailOf`.
+    #[test]
+    fn identity_is_the_transactions_own_tail_only() {
+        let (a, b, c, r, sr) = (rid(3, 1), rid(4, 1), rid(6, 1), rid(2, 1), rid(5, 1));
+        let records = vec![
+            LogRecord::TailOf { epoch: 1, jseq: 5 },
+            create("f"),
+            create("g"),
+            LogRecord::Completed { rid: b },
+            LogRecord::TailOf { epoch: 1, jseq: 3 },
+            create("h"),
+            LogRecord::Completed { rid: a },
+            LogRecord::TailOf { epoch: 1, jseq: 9 },
+            LogRecord::Completed { rid: c },
+            create("i"),
+            LogRecord::TailOf { epoch: 1, jseq: 7 },
+            LogRecord::Refused {
+                rid: r,
+                code: Code::Exists,
+            },
+            LogRecord::TailOf { epoch: 1, jseq: 11 },
+            create("k"),
+            LogRecord::Refused {
+                rid: sr,
+                code: Code::Exists,
+            },
+        ];
+        let rows = (20..35).collect();
+        let o = oracle(
+            vec![seg(9, 2, records, rows, Vec::new())],
+            &[(b, (1, 3)), (a, (1, 6)), (c, (1, 8))],
+            &[(r, (1, 11)), (sr, (1, 14))],
+        );
+        let id = exec_identity(&o);
+        assert_eq!(id.get(&b), Some(&(2, 23)), "{id:?}");
+        assert_eq!(id.get(&a), Some(&(1, 3)), "{id:?}");
+        assert_eq!(id.get(&c), Some(&(1, 9)), "{id:?}");
+        assert_eq!(id.get(&r), Some(&(1, 7)), "{id:?}");
+        assert_eq!(id.get(&sr), Some(&(2, 34)), "{id:?}");
+    }
+
+    /// Identities assume one shipping node per epoch and no delegation:
+    /// otherwise none (the witness order), as when a rid has no row.
+    #[test]
+    fn no_identities_when_the_assumptions_fail() {
+        let a = rid(3, 1);
+        let one = |node: u64, epoch: u64, origins: Vec<(u64, u64)>| {
+            seg(
+                node,
+                epoch,
+                vec![create("f"), LogRecord::Completed { rid: a }],
+                vec![1, 2],
+                origins,
+            )
+        };
+        let ok = oracle(vec![one(9, 2, vec![(0, 0), (0, 0)])], &[(a, (1, 1))], &[]);
+        assert_eq!(exec_identity(&ok).get(&a), Some(&(2, 2)));
+        // Two nodes ship under one epoch.
+        let two = oracle(
+            vec![one(9, 2, Vec::new()), one(8, 2, Vec::new())],
+            &[(a, (1, 1))],
+            &[],
+        );
+        assert!(exec_identity(&two).is_empty());
+        // A delegation's origin.
+        let del = oracle(vec![one(9, 2, vec![(0, 0), (4, 1)])], &[(a, (1, 1))], &[]);
+        assert!(exec_identity(&del).is_empty());
+        // A completion without a row.
+        let norow = oracle(
+            vec![seg(
+                9,
+                2,
+                vec![create("f"), LogRecord::Completed { rid: a }],
+                vec![1],
+                Vec::new(),
+            )],
+            &[(a, (1, 1))],
+            &[],
+        );
+        assert!(exec_identity(&norow).is_empty());
     }
 }
