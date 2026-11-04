@@ -527,6 +527,9 @@ impl ObjectStore for NodeStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        // (When the node's handle issued the read: the claim's fresh read is
+        // judged by its own transit, plan 46 M0.3.)
+        let sent_at = self.bucket.reach.now_ms();
         let reads = if self.reads == SlowReads::default() && location.as_ref() == "leases/p0.json" {
             *self.bucket.lease_reads.lock().unwrap()
         } else {
@@ -547,9 +550,12 @@ impl ObjectStore for NodeStore {
                 }
                 // Plan 46 M0.3: the claimant's first sight of a lease body.
                 if served.is_ok() && location.as_ref() == "leases/p0.json" {
-                    self.bucket
-                        .reach
-                        .lease_read(self.node, served_at, self.bucket.reach.now_ms());
+                    self.bucket.reach.lease_read_sent(
+                        self.node,
+                        sent_at,
+                        served_at,
+                        self.bucket.reach.now_ms(),
+                    );
                 }
                 served
             }

@@ -55,9 +55,11 @@
 //! The lease path, as the product implements the claim: the claimant reads the
 //! lease (the sim bucket records every lease GET), waits one TTL (and a
 //! backup grace when the lease lists backups it is not among) of its own
-//! observation of the body, asks its peers for the promise check, writes the
-//! CAS, and, for a lease with a group, fetches the group's tail from a
-//! running member it can reach. If that claim cannot finish inside the window
+//! observation of the body, reads it again (the claim is made on a read
+//! handled after the TTL; that read's own transit, from the history, is part
+//! of the claim), asks its peers for the promise check, writes the CAS, and,
+//! for a lease with a group, fetches the group's tail from a running member it
+//! can reach. If that claim cannot finish inside the window
 //! by design and no root is in force, the requester had no sequencer *in time*.
 //!
 //! The allowed verdicts, each counted apart (`Report::unsettled_*`):
@@ -302,8 +304,14 @@ struct Inner {
     /// What a claim does after the TTL wait: the promise check (a P2P round
     /// trip) and the CAS (an S3 round trip).
     claim_tail_ms: u64,
-    /// `(node, served_ms, observed_ms)`: every lease GET the bucket served.
-    lease_reads: Vec<(NodeId, u64, u64)>,
+    /// `(node, sent_ms, served_ms, observed_ms)`: every lease GET the bucket
+    /// served (sent: when the node's handle issued it).
+    lease_reads: Vec<(NodeId, u64, u64, u64)>,
+    /// The fastest lease read the configuration allows (`s3_latency_lo_ms`,
+    /// all of which lies before the bucket serves it, plus the slow reads'
+    /// least delays): what the claim's fresh read costs when the history has
+    /// none.
+    min_lease_read_ms: u64,
     /// `(at, node)`: a node restarted with its journal (its rows survived).
     kept: Vec<(u64, NodeId)>,
     /// The slowest P2P one-way delay.
@@ -338,6 +346,10 @@ pub struct ReachConfig {
     pub claim_grace_ms: u64,
     /// What the slow lease reads add to an S3 request.
     pub lease_read_extra_ms: u64,
+    /// The fastest S3 request (`SimConfig::s3_latency.0`).
+    pub s3_latency_lo_ms: u64,
+    /// The least the slow lease reads add to an S3 request.
+    pub lease_read_extra_lo_ms: u64,
     /// The settle's retry interval (`Config::acquire_retry_min_ms`).
     pub settle_retry_ms: u64,
     /// A delegation grant's ttl (`Config::delegation_ttl_ms`).
@@ -386,6 +398,7 @@ impl Reach {
         let mut g = self.inner.lock().unwrap();
         g.min_p2p_ms = 2 * c.p2p_delay_hi_ms + c.settle_retry_ms;
         g.min_s3_ms = 2 * c.s3_latency_hi_ms + c.lease_read_extra_ms;
+        g.min_lease_read_ms = c.s3_latency_lo_ms + c.lease_read_extra_lo_ms;
         g.lease_ttl_ms = c.lease_ttl_ms;
         g.claim_grace_ms = c.claim_grace_ms;
         g.claim_tail_ms = 2 * c.p2p_delay_hi_ms + 2 * c.s3_latency_hi_ms;
@@ -397,13 +410,19 @@ impl Reach {
     }
 
     /// The bucket served `node` a lease GET at `served_ms`; the answer reached
-    /// it at `observed_ms`.
+    /// it at `observed_ms` (issued when it was served).
     pub fn lease_read(&self, node: NodeId, served_ms: u64, observed_ms: u64) {
+        self.lease_read_sent(node, served_ms, served_ms, observed_ms);
+    }
+
+    /// `node` issued a lease GET at `sent_ms`, the bucket served it at
+    /// `served_ms`, the answer reached it at `observed_ms`.
+    pub fn lease_read_sent(&self, node: NodeId, sent_ms: u64, served_ms: u64, observed_ms: u64) {
         self.inner
             .lock()
             .unwrap()
             .lease_reads
-            .push((node, served_ms, observed_ms));
+            .push((node, sent_ms, served_ms, observed_ms));
     }
 
     /// `node` was restarted now with its journal (its synced rows survived).
@@ -1030,8 +1049,8 @@ fn claim_done(
         let at_start = landed.max(window_from) + g.min_s3_ms;
         g.lease_reads
             .iter()
-            .filter(|(n, served, _)| *n == me && *served >= landed)
-            .map(|(_, _, observed)| *observed)
+            .filter(|(n, _, served, _)| *n == me && *served >= landed)
+            .map(|(_, _, _, observed)| *observed)
             .min()
             .map_or(at_start, |first| first.min(at_start))
     };
@@ -1040,11 +1059,32 @@ fn claim_done(
         Some(l) if l.holder == 0 || l.released => since_of(l.at_ms).max(run_from),
         Some(l) => since_of(l.at_ms) + g.lease_ttl_ms + claim_grace_for(g, l, me),
     };
-    let done = ready.max(run_from) + g.claim_tail_ms;
+    // The claim itself starts with a fresh read: the product claims by TTL
+    // only on a read it *handles* at or after its observation's TTL has run
+    // (`LeaseState::classify`, the observation rule: a read at `t1 >= t0 +
+    // ttl`), and every acquisition attempt begins with that read; the promise
+    // check and the CAS follow its answer. Its cost is taken from the
+    // history: the claimant's first lease read answered from the claim's
+    // start on, less any delay of the product's before it was issued (only
+    // the read's own transit is excused, as a read issued at the start would
+    // have taken). With no such read, the fastest read the configuration
+    // allows (plan 46 M0.3, the review of cause 6: with slow lease reads,
+    // 0.8 to 1 s each, that read was the residual the model left out).
+    let start = ready.max(run_from);
+    let read_done = g
+        .lease_reads
+        .iter()
+        .filter(|(n, _, _, observed)| *n == me && *observed >= start)
+        .min_by_key(|(_, _, _, observed)| *observed)
+        .map_or(start + g.min_lease_read_ms, |(_, sent, _, observed)| {
+            observed - sent.saturating_sub(start).min(observed - start)
+        });
+    let done = read_done + g.claim_tail_ms;
     if done > until {
         return Err(format!(
             "its claim of the lease needs until {done} ms (a lease read, a TTL of its own observation, \
-             the promise check and the CAS), after the window's end {until}"
+             a fresh read answered at {read_done} ms, the promise check and the CAS), after the window's \
+             end {until}"
         ));
     }
     // A lease with a group: the claim carries the tail of the tenure it takes
@@ -1067,10 +1107,7 @@ fn claim_done(
                     && (*m == me || (running(g, at, *m) && peer_up(g, at, me, *m)))
             })
         };
-        if !members.is_empty()
-            && !reachable(done.saturating_sub(1))
-            && !reachable(ready.max(run_from))
-        {
+        if !members.is_empty() && !reachable(done.saturating_sub(1)) && !reachable(start) {
             return Err(format!(
                 "no member of the tenure's group {members:?} had been running since the tenure began and was \
                  reachable for its tail when the claim was due ({done} ms)"
@@ -1316,6 +1353,8 @@ mod tests {
             lease_ttl_ms: 1_000,
             claim_grace_ms,
             lease_read_extra_ms,
+            s3_latency_lo_ms: 0,
+            lease_read_extra_lo_ms: 0,
             settle_retry_ms: 100,
             delegation_ttl_ms: 500,
             expiry_margin_ms: 100,
@@ -2501,6 +2540,91 @@ mod tests {
         r.lease_read(3, 2_600, 2_650);
         let v = r.classify(Question::new(3, 4_000, 5_000));
         assert!(matches!(v, Verdict::Reachable { .. }), "{v:?}");
+    }
+
+    #[test]
+    fn a_claims_fresh_read_slowed_past_the_window_is_no_sequencer_in_time() {
+        // Plan 46 M0.3, cause 6: the dead root's body ran out at 3 500 and
+        // the requester's own read at 2 650 started its TTL, so the claim is
+        // ready from 3 650; the window is [4 000, 5 000]. The product claims
+        // only on a read it handles after that: the requester issued it at
+        // the window's start and a slow lease read answered it at 4 950, so
+        // the promise check and the CAS end at 5 050, past the window.
+        let dead_root = || {
+            let r = world();
+            r.lease_landed_at(2_500, 1, 3_500, false);
+            r.attached_at(3_000, 1, false);
+            r.lease_read(3, 2_600, 2_650);
+            r
+        };
+        let r = dead_root();
+        r.lease_read_sent(3, 4_000, 4_010, 4_950);
+        let v = r.classify(Question::new(3, 4_000, 5_000));
+        let Verdict::NoSequencerInTime { why } = v else {
+            panic!("{v:?}")
+        };
+        assert!(why.contains("a fresh read answered at 4950"), "{why}");
+        // A fresh read that came back in time leaves the claim possible.
+        let r = dead_root();
+        r.lease_read_sent(3, 4_000, 4_010, 4_300);
+        assert!(
+            matches!(
+                r.classify(Question::new(3, 4_000, 5_000)),
+                Verdict::Reachable {
+                    via: Via::LeasePath,
+                    to_ms: 4_400,
+                    ..
+                }
+            ),
+            "{:?}",
+            r.classify(Question::new(3, 4_000, 5_000))
+        );
+        // A read the product issued late is excused only its own transit:
+        // issued at 4 700 and answered at 4 990, it counts as answered at
+        // 4 290, and the claim was possible by 4 390.
+        let r = dead_root();
+        r.lease_read_sent(3, 4_700, 4_710, 4_990);
+        assert!(
+            matches!(
+                r.classify(Question::new(3, 4_000, 5_000)),
+                Verdict::Reachable {
+                    via: Via::LeasePath,
+                    to_ms: 4_390,
+                    ..
+                }
+            ),
+            "{:?}",
+            r.classify(Question::new(3, 4_000, 5_000))
+        );
+        // Another node's slow read is not the requester's.
+        let r = dead_root();
+        r.lease_read_sent(2, 4_000, 4_010, 4_950);
+        assert!(matches!(
+            r.classify(Question::new(3, 4_000, 5_000)),
+            Verdict::Reachable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_slow_lease_read_does_not_excuse_a_reachable_root() {
+        // The root is up, holds its lease and is reachable over the whole
+        // window: the requester's slow lease reads change nothing, it is a
+        // violation (a product cause), not "no sequencer in time".
+        let r = world();
+        r.lease_landed_at(3_500, 1, 8_000, false);
+        r.lease_read_sent(3, 4_000, 4_010, 6_950);
+        let v = r.classify(q(3));
+        assert!(
+            matches!(
+                v,
+                Verdict::Reachable {
+                    via: Via::Root(1),
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+        assert!(!v.allowed(), "{v:?}");
     }
 
     #[test]
