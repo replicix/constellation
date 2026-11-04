@@ -1142,6 +1142,12 @@ pub struct Report {
     /// Plan 41 L2: what each node's lock lane did (`RenewLane::stats`).
     pub lane: BTreeMap<NodeId, constellation_authority::lane::LaneStats>,
     pub faults: Vec<String>,
+    /// ADR-43: how many generation numbers the run's roots minted (the
+    /// uniqueness oracle fails the seed when two are equal).
+    pub gens_minted: usize,
+    /// The log segments that landed in the run, their decompressed bytes and
+    /// their bytes as stored.
+    pub segments_landed: (u64, u64, u64),
     pub simulated_ms: u64,
     /// Plan 30 §M9: acknowledged ops that were rolled back at some point
     /// (exempted as tentative unless `strict_durability`).
@@ -3951,8 +3957,44 @@ pub fn run_seed(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     })
 }
 
+/// ADR-43's uniqueness oracle: every generation number a core mints in the
+/// run, in order, recorded by [`constellation_meta::delegation::mint_hook`]
+/// (the sim runs a seed on one thread). The hook is removed when the run
+/// ends, whichever way.
+struct MintLog {
+    minted: Arc<Mutex<Vec<u64>>>,
+}
+
+impl MintLog {
+    fn install() -> Self {
+        let minted = Arc::new(Mutex::new(Vec::new()));
+        let sink = minted.clone();
+        constellation_meta::delegation::mint_hook::set(Some(Box::new(move |gen| {
+            sink.lock().unwrap().push(gen)
+        })));
+        MintLog { minted }
+    }
+
+    /// The first number minted twice, if any, and how many were minted.
+    fn first_repeat(&self) -> (Option<u64>, usize) {
+        let minted = self.minted.lock().unwrap();
+        let mut seen = HashSet::new();
+        (
+            minted.iter().copied().find(|g| !seen.insert(*g)),
+            minted.len(),
+        )
+    }
+}
+
+impl Drop for MintLog {
+    fn drop(&mut self) {
+        constellation_meta::delegation::mint_hook::set(None);
+    }
+}
+
 async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let mut rng = StdRng::seed_from_u64(seed);
+    let mint_log = MintLog::install();
     let clock = Clock::start();
     SIM_START.with(|t| t.set(Some(tokio::time::Instant::now())));
     let bucket = Bucket::new(seed, cfg.s3_latency);
@@ -4704,6 +4746,21 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         seed,
         ..Default::default()
     };
+    // ADR-43: a generation number names one grant for good. Two tenures that
+    // minted the same one (a root deposed without knowing it, and its
+    // successor; or the real log's number and the deposed root's re-mint of
+    // it) read each other's per-generation state as their own. Checked first:
+    // it is a property of the schedule, not of what the run did with it.
+    let (repeat, minted) = mint_log.first_repeat();
+    report.gens_minted = minted;
+    report.segments_landed = bucket.archive.landed();
+    if let Some(gen) = repeat {
+        return Err(format!(
+            "generation {gen} minted twice (ADR-43: a number carries the epoch of the tenure that \
+             minted it, one holder per epoch)\n  faults: {:?}",
+            fault_log.lock().unwrap()
+        ));
+    }
     {
         let formed = cluster.epochs.lock().unwrap();
         report.epochs_formed = formed.len();

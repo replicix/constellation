@@ -4623,6 +4623,29 @@ fn l2_a_deposed_roots_rebuild_queues_no_gated_copy_of_a_delegates_row() {
     );
 }
 
+/// ADR-43: no generation number is minted twice. `placement-hot` with slow
+/// lease reads: a root deposed without knowing it keeps placing while its
+/// successor grants. Seeds 1659 and 2958 ("orphan first": the deposed root's
+/// unshipped grant, whose number the successor then minted again, two and
+/// three times over the run) and 16871 ("real first": the successor's grant
+/// was in the log when the deposed root, whose replica lagged, minted the
+/// same number for another directory, onto nodes holding the real grant's
+/// rows and marks). The old mint (`max_gen + 1` of the minting root's own
+/// view) fails all three with the oracle ("generation N minted twice"); a
+/// number carries the epoch of the tenure that minted it now.
+#[test]
+fn regression_no_generation_number_is_minted_twice() {
+    for seed in [16_871u64, 1_659, 2_958] {
+        let report = run_seed(seed, placement_hot_slow_lease_reads_config()).unwrap_or_else(|e| {
+            panic!(
+                "seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=placement-hot \
+                 AUTHORITY_SIM_LEASE_READS=0:0:800:1000"
+            )
+        });
+        assert!(report.gens_minted > 0, "seed {seed}: no generation minted");
+    }
+}
+
 /// The `backup-hot` sweep: `cargo test -p constellation-authority
 /// --release --test sim -- --ignored long_backup_hot`
 /// (`AUTHORITY_SIM_SEEDS`, `AUTHORITY_SIM_START`; replay one with
@@ -7508,6 +7531,10 @@ struct OracleTotals {
     /// counters (installs put off, generations stopped, rows the root
     /// refused, answers that took nothing).
     xgen: [u64; 18],
+    /// Segments landed, their decompressed bytes, the delegate-stream
+    /// dependency waits (`deleg_deps_waits`) and the segments' bytes as
+    /// stored, over the sweep's seeds.
+    seg: [u64; 4],
     /// Parked acknowledgements of a delegate's stream (ADR-41): [released,
     /// released by the log while the group's commit was not heard (not by the
     /// commit), waited a second or more, longest wait ms, empty batches that
@@ -7593,6 +7620,7 @@ impl OracleTotals {
             self.xgen[15] += st.deleg_caps_walked;
             self.xgen[16] += st.deleg_xdeps_log_reads;
             self.xgen[17] += st.deleg_xdeps_own_checks;
+            self.seg[2] += st.deleg_deps_waits;
             self.parked[0] += st.deleg_stream_acks_released;
             self.parked[1] += st.deleg_stream_acks_by_log;
             self.parked[2] += st.deleg_stream_acks_slow;
@@ -7630,6 +7658,16 @@ impl OracleTotals {
         self.c14[9] += r.identity_copies_ungated as u64;
         self.c14[10] += r.member_copy_rows_left as u64;
         self.c14[11] += r.identity_foreign_gated as u64;
+        self.seg[0] += r.segments_landed.0;
+        self.seg[1] += r.segments_landed.1;
+        self.seg[3] += r.segments_landed.2;
+        eprintln!(
+            "SWEEP-SIG {label} seed {seed}: segments {} bytes {} stored {} waits {}",
+            r.segments_landed.0,
+            r.segments_landed.1,
+            r.segments_landed.2,
+            r.stats.values().map(|s| s.deleg_deps_waits).sum::<u64>()
+        );
         self.unsourced += r.acks_unsourced;
         self.unjournaled_landed += r.unjournaled_landed;
         let mut unsettled = 0;
@@ -7853,6 +7891,11 @@ impl OracleTotals {
             self.xgen[15],
             self.xgen[16],
             self.xgen[17]
+        );
+        eprintln!(
+            "SWEEP-SEGMENTS {label} seeds {}/{seeds}: segments landed {}, decompressed bytes {}, \
+             delegate-stream dependency waits {}, bytes as stored {}",
+            self.seeds, self.seg[0], self.seg[1], self.seg[2], self.seg[3]
         );
         eprintln!(
             "SWEEP-S5-GATE {label} seeds {}/{seeds}: generations taken on by a shippable gate {}, \

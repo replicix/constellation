@@ -496,6 +496,10 @@ struct ArchiveInner {
     /// applied, unfenced segment: (seq, record index, the outcome's code:
     /// `None` for `Completed`, `Some(code)` for `Refused`).
     outcomes: HashMap<Rid, (Seq, usize, Option<Code>)>,
+    /// How many segments landed, their decompressed bytes and their bytes as
+    /// stored (each seq once): the size of the log the run wrote, for the
+    /// sweeps' comparison of two builds (`SWEEP-SEGMENTS`).
+    landed: (u64, u64, u64),
 }
 
 impl Default for ArchiveIndex {
@@ -516,7 +520,21 @@ impl ArchiveIndex {
         let Ok(seg) = segment::decode(&plain) else {
             return;
         };
+        {
+            let mut g = self.inner.lock().unwrap();
+            if !g.segments.contains_key(&seq) {
+                g.landed.0 += 1;
+                g.landed.1 += plain.len() as u64;
+                g.landed.2 += body.len() as u64;
+            }
+        }
         self.note_segment(seq, seg);
+    }
+
+    /// The segments that landed, their decompressed bytes and their bytes
+    /// as stored.
+    pub fn landed(&self) -> (u64, u64, u64) {
+        self.inner.lock().unwrap().landed
     }
 
     /// As [`Self::note`], for a decoded segment (the unit tests').

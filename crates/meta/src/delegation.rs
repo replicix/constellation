@@ -677,7 +677,38 @@ impl Meta {
         );
         tx.commit()?;
         self.sync()?;
+        #[cfg(any(test, feature = "test-util"))]
+        mint_hook::fire(gen);
         Ok(gen)
+    }
+}
+
+/// Tests only (`test-util`): a hook run on the calling thread with every
+/// generation number [`Meta::next_delegation_gen`] mints, after its counter
+/// is synced: the simulation's uniqueness oracle ("no generation number is
+/// minted twice", ADR-43) records them per run (the sim runs a seed on one
+/// thread).
+#[cfg(any(test, feature = "test-util"))]
+pub mod mint_hook {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut(u64)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Install (or, `None`, remove) this thread's hook.
+    pub fn set(hook: Option<Hook>) {
+        HOOK.with(|h| *h.borrow_mut() = hook);
+    }
+
+    pub(crate) fn fire(gen: u64) {
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(gen);
+            HOOK.with(|h| *h.borrow_mut() = Some(hook));
+        }
     }
 }
 
