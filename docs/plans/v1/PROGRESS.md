@@ -65762,6 +65762,13 @@ resend (`DelegCut`), and ADR-41's repoke is the delegate's ask for the commit, s
   table, so a second answer carried none, and the root, which ends the generation by that answer with no outwait grace, could
   grant a conflicting lock. `dl.recall_grants` keeps what the first answer took, as long as the `handed_back` entry lives; a
   repeated recall answers with it, `carry` measured again.
+- (d) Review follow-ups. The delegate's cached hand-back answers any later recall of the generation, so a root that inherited the
+  generation live (the first root served the subtree after its answer, was deposed before the end record committed) received
+  a dead grant, which `install_keeping_later` put beside a newer one. The root now installs a recall hand-back as
+  `lock_install_leaving` does: a grant id this table ended, or one beside a conflicting grant of another node, stays out
+  (`lock_install_moved`, root branch); a record of the same node on the same inode is still replaced, keeping the later end.
+  Answers to different tries of one recall were not deduplicated (the key was (grant id, request id)); `lk.returned` now keys
+  by grant id per generation.
 - (c), the late ttl-0 refusal, is not done: it stops a delegate that missed the recall from executing parked ops, but shortens
   nothing the root waits for.
 - The optional resend at a ttl-0 renewal and a shorter recall timeout in the driver are not done either (at most about five
@@ -65775,7 +65782,10 @@ resend (`DelegCut`), and ADR-41's repoke is the delegate's ask for the commit, s
 
 - `l3_a_lost_recall_is_sent_again_before_the_grant_runs_out` (fails with the resend off: "not re-sent: []"), the back-off and its
   cap and the stop at the answer, none inside a gate and one after it, an answer to the first try after a resend, and
-  `l3_a_repeated_recall_hands_back_the_same_lock_grants` (fails without the cache: an empty hand-back).
+  `l3_a_repeated_recall_hands_back_the_same_lock_grants` (fails without the cache: an empty hand-back; it now answers two tries
+  under distinct request ids and checks the table holds the grant once: fails with the (grant, request) key),
+  `l3_a_cached_hand_back_is_not_installed_beside_a_conflicting_grant` and `l3_a_cached_hand_back_does_not_revive_a_released_grant`
+  (both fail before the install check).
 - Sim pin `l3_a_lost_recall_is_sent_again_in_long_delegated_late_answers_seed_310`: every recall of the run ends under 2 s and at
   least one is sent again (8286 ms before, 479 ms after).
 - `locks_writer_hold_delegated_without_the_settle_is_caught` pinned seeds the resend moved off the unsettled signature: 556, 2027
@@ -65817,5 +65827,8 @@ resend (`DelegCut`), and ADR-41's repoke is the delegate's ask for the commit, s
 
 `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean. authority lib 1011 passed, engine 948,
 net 127, control 146, harness lib 164: 0 failed. Release sim suite 367 passed, 0 failed, 13 ignored (main 366 plus the pin).
+After the review fixes (d): authority lib 1013 passed, engine 0 failed, release sim suite 367 passed, 0 failed, 13 ignored; the
+sweeps of `locks-delegated`, `long-delegated`, `long-delegated-late-answers` and `placement-hot`, seeds 0..2000, with and without
+`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, and `locks-delegated` with `AUTHORITY_SIM_DROP_RECALLEDS=3`: 0 failing on main and on the fix.
 Sweeps of `long-delegated`, `-late-answers`, `-backup`, `locks-delegated`, `delegated-holder-cut` and `placement-hot`, seeds
 0..2000, with and without `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`: 0 failing on main (c5228764) and on the fix, in all 12.
