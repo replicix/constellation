@@ -1333,11 +1333,29 @@ impl Core {
                     _ => None,
                 })
                 .collect();
+            // ADR-43 (orphan grants): this node never applies its own marker
+            // as a segment, so the rule every other replica runs there runs
+            // in this strand (SHOULD-3: a claimant that was the delegate of a
+            // generation the log never granted kept its rows of it, and
+            // shipped them as its first rows).
+            let proof = match self.bk.gate_orphan_proof {
+                Some((e, proof)) if e == gate.epoch => proof,
+                _ => {
+                    let proof = constellation_meta::OrphanProof::of(&marker_records(
+                        &gate,
+                        self.bk.gate_abandoned,
+                        self.bk.tail_through,
+                    ));
+                    self.bk.gate_orphan_proof = Some((gate.epoch, proof));
+                    proof
+                }
+            };
             match replica.strand_for_takeover(
                 gate.epoch,
                 &own_gens,
                 self.bk.gate_abandoned,
                 &carried,
+                &proof,
             ) {
                 Ok(stranded) => {
                     self.lock_note_replay_pins(now, replica);
@@ -1362,11 +1380,13 @@ impl Core {
                     // again: ended by this node once its gate opens, or
                     // by the next root should this one crash or lose the
                     // lease first.
-                    for gen in own_gens {
-                        if replica.delegate_stranded(gen) {
-                            if let Some(d) = self.dl.mine.get_mut(&gen) {
-                                d.stopped = true;
-                            }
+                    // (With the generations the orphan rule ended, which
+                    // the strand marks the same way.)
+                    for (gen, d) in self.dl.mine.iter_mut() {
+                        if (own_gens.contains(gen) || !proof.is_empty())
+                            && replica.delegate_stranded(*gen)
+                        {
+                            d.stopped = true;
                         }
                     }
                 }
@@ -1421,6 +1441,7 @@ impl Core {
         }
         self.lease.gate = None;
         self.bk.gate_abandoned = None;
+        self.bk.gate_orphan_proof = None;
         self.bk.gate_own_rows = None;
         GateStep::Done
     }
@@ -1491,6 +1512,13 @@ impl Core {
         // (ADR-39), which the replay then re-executes after it.
         let mut halted = false;
         let mut appended: std::collections::HashSet<constellation_meta::Rid> = Default::default();
+        // ADR-43 (orphan grants): a generation the table does not list once
+        // the tail is re-applied has no grant in the log (one the tail or the
+        // log ended is in `ended`, or its rows were stranded by the log's
+        // recall): its rows are never appended, or the log would carry rows
+        // of a generation it never granted. They are replayed by rid.
+        let listed: std::collections::BTreeSet<u64> =
+            replica.delegation_table().iter().map(|d| d.gen).collect();
         for (t, deps) in &rows {
             let (gen, idx) = t.origin;
             let cursor = replica.log_stream_idx(gen);
@@ -1535,7 +1563,13 @@ impl Core {
                             g != gen && own_gens.contains(&g) && i > replica.log_stream_idx(g)
                         })
                 });
-            if halted || ended.contains(&gen) || idx != cursor + 1 || outcome.is_none() || lost {
+            if halted
+                || ended.contains(&gen)
+                || !listed.contains(&gen)
+                || idx != cursor + 1
+                || outcome.is_none()
+                || lost
+            {
                 halted = true;
                 continue;
             }

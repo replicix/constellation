@@ -834,6 +834,12 @@ pub(crate) struct BackupState {
     /// Plan 43 C1-4: the extent of the tail the open gate re-ships (its
     /// marker's `TailFollowsThrough.through`).
     pub(crate) tail_through: u64,
+    /// ADR-43 (orphan grants): what the open gate's marker proves the log
+    /// will never grant, with the gate's epoch: worked out at the gate's
+    /// first strand, from the marker's records as they were shipped (a later
+    /// pass of the gate has cleared the tail it re-applied, which would read
+    /// as a marker that carried none).
+    pub(crate) gate_orphan_proof: Option<(Epoch, constellation_meta::OrphanProof)>,
     /// Plan 43 C3 (a delegate that takes the root over): this node's own
     /// rows as the delegate of the generations the open gate strands, as
     /// its journal held them, until the gate re-appends them after the

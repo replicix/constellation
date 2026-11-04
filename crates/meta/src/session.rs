@@ -1246,8 +1246,8 @@ impl SessionState {
             // rolls the table back below it) names a grant the log may yet
             // carry, whose rows must not meet a void
             // (`ended_before_open`'s rule).
-            // A kept cut is an end the log applied (or, ADR-43, an abandon
-            // proved the grant never reaches it: `orphaned_by_abandon_tx`,
+            // A kept cut is an end the log applied (or, ADR-43, a marker
+            // proved the grant never reaches it: `orphaned_tx`,
             // a number the table never listed), so it voids above the
             // highest too; a deposed root's own stranded end leaves no cut
             // (`retract_void_cut_tx`).

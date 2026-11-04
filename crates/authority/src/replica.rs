@@ -184,13 +184,17 @@ pub trait Replica {
     /// operator gave up (this claim's marker says so): its committed
     /// entries strand and replay too (plan 43 C1-4). `carried`: the rids of
     /// the delegate rows the tail the gate re-applies carries
-    /// (`Meta::strand_for_takeover_carrying`).
+    /// (`Meta::strand_for_takeover_carrying`). `proof`: what this claim's
+    /// marker proves the log will never grant (ADR-43's orphan rule, which
+    /// the claimant runs here: it never applies its own marker as a
+    /// segment).
     fn strand_for_takeover(
         &self,
         epoch: Epoch,
         own_gens: &[u64],
         abandoned: Option<Epoch>,
         carried: &std::collections::HashSet<Rid>,
+        proof: &constellation_meta::OrphanProof,
     ) -> Result<Stranded, MetaError>;
     /// The pre-S3 stream installed the holder's journal through `pos`
     /// (`SessionState::note_streamed`).
@@ -992,8 +996,9 @@ impl Replica for Meta {
         own_gens: &[u64],
         abandoned: Option<Epoch>,
         carried: &std::collections::HashSet<Rid>,
+        proof: &constellation_meta::OrphanProof,
     ) -> Result<Stranded, MetaError> {
-        Meta::strand_for_takeover_carrying(self, epoch, own_gens, abandoned, carried)
+        Meta::strand_for_takeover_carrying(self, epoch, own_gens, abandoned, carried, proof)
     }
 
     fn strand_recalled_speculation(&self, gen: u64) -> Result<Stranded, MetaError> {

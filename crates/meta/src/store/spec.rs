@@ -681,6 +681,65 @@ impl Stranded {
     }
 }
 
+/// ADR-43 (orphan grants): what a takeover's epoch marker proves about the
+/// grants the log will never carry ([`Meta::orphaned_tx`]). `upto`: the
+/// operator abandoned the root group of that epoch (`GroupAbandoned { gen:
+/// 0 }`), so nothing of it or of an older epoch that the log does not carry
+/// yet will ever be shipped. `no_tail`: the claimant re-ships nothing of the
+/// epoch it took over (`TailFollowsThrough { prev_epoch, through: 0 }`, and
+/// no tail announced besides): that epoch's journal was held by no group
+/// member past what the log carries (a lone root's, or a sealed hold that
+/// reached nothing), its later segments are fenced, and no later tenure
+/// re-ships it (a successor re-ships its own predecessor's tail only). Only
+/// that epoch: an older one's committed rows may still ride a tail a later
+/// claim fetches (plan 43 D2), and its marker said what it carried then.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OrphanProof {
+    pub upto: Option<u64>,
+    pub no_tail: Option<u64>,
+}
+
+impl OrphanProof {
+    /// What the marker records `records` prove.
+    pub fn of(records: &[LogRecord]) -> Self {
+        let upto = records
+            .iter()
+            .filter_map(|rec| match rec {
+                LogRecord::GroupAbandoned { epoch, gen: 0, .. } => Some(*epoch),
+                _ => None,
+            })
+            .max();
+        let tail = records.iter().any(|rec| {
+            matches!(
+                rec,
+                LogRecord::TailFollows { .. } | LogRecord::TailFollowsThrough { through: 1.., .. }
+            )
+        });
+        let no_tail = if tail {
+            None
+        } else {
+            records.iter().find_map(|rec| match rec {
+                LogRecord::TailFollowsThrough {
+                    prev_epoch,
+                    through: 0,
+                } => Some(*prev_epoch),
+                _ => None,
+            })
+        };
+        OrphanProof { upto, no_tail }
+    }
+
+    /// Whether it proves nothing.
+    pub fn is_empty(&self) -> bool {
+        self.upto.is_none() && self.no_tail.is_none()
+    }
+
+    /// Whether it covers grants minted in epoch `e` (never the old mint's 0).
+    pub fn covers(&self, e: u64) -> bool {
+        e != 0 && (self.upto.is_some_and(|u| e <= u) || self.no_tail == Some(e))
+    }
+}
+
 /// What [`strand_local_tx`] did with a transaction.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stranding {
@@ -4594,29 +4653,19 @@ impl Meta {
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
         // ADR-43 (orphan grants): what the table lists before an operator's
-        // abandon strands the speculation no successor re-ships (read only
-        // then; see `orphaned_by_abandon_tx`).
+        // abandon, or a takeover that carries no tail, strands the
+        // speculation no successor re-ships (read only then; see
+        // `orphaned_tx`).
         // Also the generations of the live shadows and hints of delegate
         // replies (`gen != 0`): a requester that never listed the grant
         // holds them, and the strand below may take the entry (queuing its
         // rid for replay, held while the generation lives) without ending
         // the generation.
-        let listed_before: std::collections::BTreeSet<u64> = if abandoned.is_empty() {
+        let proof = OrphanProof::of(records);
+        let listed_before: std::collections::BTreeSet<u64> = if proof.is_empty() {
             Default::default()
         } else {
-            let mut named: std::collections::BTreeSet<u64> =
-                crate::delegation::read_table_tx(&tx, self)?
-                    .iter()
-                    .map(|d| d.gen)
-                    .collect();
-            for (_, entry) in live_non_local(&tx, self)? {
-                if let LiveEntry::Shadow { gen, .. } | LiveEntry::Hint { gen, .. } = entry {
-                    if gen != 0 {
-                        named.insert(gen);
-                    }
-                }
-            }
-            named
+            self.named_generations_tx(&tx)?
         };
         let strands = |entry: &LiveEntry| {
             (entry.stranded_by(epoch)
@@ -5111,16 +5160,17 @@ impl Meta {
                 }
             }
         }
-        // ADR-43: a generation whose grant an abandon proves will never be
-        // in the log is ended here as the log's `Recall` would end it, at
-        // what the log holds of it (`orphaned_by_abandon_tx`). The cut loop
+        // ADR-43: a generation whose grant the segment proves will never be
+        // in the log (an abandon, or a takeover that carries no tail) is
+        // ended here as the log's `Recall` would end it, at what the log
+        // holds of it (`orphaned_tx`). The cut loop
         // above must run first: a generation this segment ends (the
         // stream installed the end before the marker) then has its cut key,
         // which the rule's exclusions read, and is not ended again at cut 0.
-        let orphaned = if abandoned.is_empty() {
+        let orphaned = if proof.is_empty() {
             Vec::new()
         } else {
-            self.orphaned_by_abandon_tx(&tx, &abandoned, &listed_before, &recalled)?
+            self.orphaned_tx(&tx, &proof, &listed_before, &recalled)?
         };
         let mut orphan_cuts: Vec<(u64, u64)> = Vec::new();
         for gen in &orphaned {
@@ -5320,22 +5370,42 @@ impl Meta {
         own_gens: &[u64],
         abandoned: Option<u64>,
     ) -> Result<Stranded, MetaError> {
-        self.strand_for_takeover_carrying(epoch, own_gens, abandoned, &HashSet::new())
+        let proof = OrphanProof {
+            upto: abandoned,
+            no_tail: None,
+        };
+        self.strand_for_takeover_carrying(epoch, own_gens, abandoned, &HashSet::new(), &proof)
     }
 
     /// [`Self::strand_for_takeover`], with the rids of the delegate rows the
     /// tail the gate re-applies carries (`carried`): a committed shadow of
     /// a delegate's answer is taken out only if the tail carries its row
     /// ([`LiveEntry::superseded_by_takeover`]).
+    ///
+    /// ADR-43 (orphan grants): `proof` is what this claim's own marker proves
+    /// ([`OrphanProof::of`] its records). The claimant never applies its own
+    /// marker as a segment, so the rule `apply_segment_rows` runs on every
+    /// other replica runs here, in the strand's transaction: a generation the
+    /// log will never grant is ended at what the log holds of it (0), and this
+    /// node's own rows of it as its delegate are rolled back and replayed by
+    /// rid. Left in the journal, they shipped as this root's first rows,
+    /// rows of a generation with no `Delegate` in the log, ahead of the
+    /// stranded root rows they were executed on.
     pub fn strand_for_takeover_carrying(
         &self,
         epoch: u64,
         own_gens: &[u64],
         abandoned: Option<u64>,
         carried: &HashSet<Rid>,
+        proof: &OrphanProof,
     ) -> Result<Stranded, MetaError> {
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
+        let listed_before = if proof.is_empty() {
+            Default::default()
+        } else {
+            self.named_generations_tx(&tx)?
+        };
         let own = |entry: &LiveEntry| match entry {
             LiveEntry::Local { gen, .. } if *gen != 0 && own_gens.contains(gen) => Some(*gen),
             _ => None,
@@ -5361,7 +5431,35 @@ impl Meta {
             false,
             |entry| entry.superseded_by_takeover(epoch, carried) && !abandons(entry),
         )?;
-        if !stranded.any() && own_gens.is_empty() {
+        let orphaned = self.orphaned_tx(&tx, proof, &listed_before, &HashSet::new())?;
+        let mut stranded = stranded;
+        let mut orphan_cuts: Vec<(u64, u64)> = Vec::new();
+        if !orphaned.is_empty() {
+            for gen in &orphaned {
+                let cut = local::bump_void_cut_at_log_idx_tx(&mut tx, &self.local, *gen)?;
+                orphan_cuts.push((*gen, cut));
+                // Never executed in again (`Meta::begin_local`).
+                local::mark_deleg_stranded_tx(&mut tx, &self.local, *gen);
+            }
+            let ended: HashSet<u64> = orphaned.iter().copied().collect();
+            let more = strand_tx(
+                &mut tx,
+                self,
+                &staged,
+                |entry| entry.stranded_by_recall(&ended),
+                false,
+                true,
+                |_| false,
+            )?;
+            stranded.shadows += more.shadows;
+            stranded.hints += more.hints;
+            stranded.locals += more.locals;
+            stranded.deleg_dropped += more.deleg_dropped;
+            for gen in &orphaned {
+                local::clear_deleg_streamed_tx(&mut tx, &self.local, *gen);
+            }
+        }
+        if !stranded.any() && own_gens.is_empty() && orphan_cuts.is_empty() {
             return Ok(stranded);
         }
         // Every generation this node holds as the delegate ends here,
@@ -5387,6 +5485,15 @@ impl Meta {
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;
+        for (gen, cut) in orphan_cuts {
+            tracing::info!(
+                gen = %crate::delegation::GenLabel::of(gen),
+                cut,
+                "this claim ended a delegation generation whose grant never reached the log"
+            );
+            self.session.void_stream(gen, cut);
+            self.session.note_void_cut(gen, cut);
+        }
         self.report_rolled_back();
         staged.drain_into(self.usage_tracker());
         Ok(stranded)
@@ -5408,40 +5515,40 @@ impl Meta {
         self.speculatively_ended_generations_at(&self.db.read_tx())
     }
 
-    /// ADR-43 (orphan grants): the generations an operator's abandon of the
-    /// root group of an epoch at or below the highest of `abandoned`
-    /// (`GroupAbandoned { gen: 0 }`, in the segment being applied, after its
-    /// strands) proves the log will never grant. A number is minted, and its
-    /// `Delegate` journaled, by the tenure of its epoch only
-    /// (`gen_epoch`), and a row of a generation is appended only after its
-    /// grant; the abandon says that nothing of that tenure, or of an older one,
-    /// that the log does not carry yet ever will be (the strand above
-    /// already rolls back every outstanding entry of those epochs on that
-    /// premise, `LiveEntry::stranded_by_abandon`). So a generation of such an
-    /// epoch that the table no longer lists, that this replica holds no
-    /// trace of in the log (no `deleg_void_cut`, no `deleg_log_idx`), that no
-    /// outstanding speculation ends and that this segment does not recall
-    /// was granted only by speculation the abandon stranded: the log holds
-    /// nothing of it and never will. The candidates are the ones the table
-    /// listed before the strand (`listed_before`) and the ones this node
-    /// holds its own delegate rows of (`deleg_gens_awaiting_end`: a delegate
-    /// that executed under the stranded grant; they would block its installs
-    /// for good, `delegation_sync`) and the `gen != 0` generations of its
-    /// live shadows and hints before the strand (`listed_before` holds them
-    /// too: a requester that never listed the generation). The cut loop of the
-    /// segment runs before this rule: that ordering keeps a generation the
-    /// segment ends in the same transaction out, by its cut key. Numbers of the old mint (epoch 0) are
-    /// left alone: their minting tenure is unknown.
-    fn orphaned_by_abandon_tx(
+    /// ADR-43 (orphan grants): the generations a segment's proof
+    /// ([`OrphanProof`]: an operator's abandon of the root group of an epoch,
+    /// or a takeover marker that says no tail of the epoch it took over
+    /// follows) shows the log will never grant, after the segment's strands.
+    /// A number is minted, and its `Delegate` journaled, by the tenure of its
+    /// epoch only (`gen_epoch`), and a row of a generation is appended only
+    /// after its grant; the proof says that nothing of the epochs it covers
+    /// that the log does not carry yet ever will be (the strand above already
+    /// rolls back the outstanding entries of those epochs on that premise,
+    /// `LiveEntry::stranded_by_abandon`, `LiveEntry::stranded_by`). So a
+    /// generation of such an epoch that the table no longer lists, that this
+    /// replica holds no trace of in the log (no `deleg_void_cut`, no
+    /// `deleg_log_idx`), that no outstanding speculation ends and that this
+    /// segment does not recall was granted only by speculation the proof
+    /// stranded: the log holds nothing of it and never will. The candidates
+    /// are the ones named before the strand (`listed_before`,
+    /// [`Self::named_generations_tx`]) and the ones this node holds its own
+    /// delegate rows of (`deleg_gens_awaiting_end`: a delegate that executed
+    /// under the stranded grant; they would block its installs for good,
+    /// `delegation_sync`, and a claimant would ship them as root rows of a
+    /// generation the log never granted). The cut loop of the segment runs
+    /// before this rule: that ordering keeps a generation the segment ends
+    /// in the same transaction out, by its cut key. Numbers of the old mint
+    /// (epoch 0) are left alone: their minting tenure is unknown.
+    fn orphaned_tx(
         &self,
         tx: &SingleWriterWriteTx,
-        abandoned: &[u64],
+        proof: &OrphanProof,
         listed_before: &std::collections::BTreeSet<u64>,
         recalled: &HashSet<u64>,
     ) -> Result<Vec<u64>, MetaError> {
-        let Some(&upto) = abandoned.iter().max() else {
+        if proof.is_empty() {
             return Ok(Vec::new());
-        };
+        }
         let listed: std::collections::BTreeSet<u64> = crate::delegation::read_table_tx(tx, self)?
             .iter()
             .map(|d| d.gen)
@@ -5451,8 +5558,9 @@ impl Meta {
         let candidates: Vec<u64> = candidates
             .into_iter()
             .filter(|g| {
-                let e = crate::delegation::gen_epoch(*g);
-                e != 0 && e <= upto && !listed.contains(g) && !recalled.contains(g)
+                proof.covers(crate::delegation::gen_epoch(*g))
+                    && !listed.contains(g)
+                    && !recalled.contains(g)
             })
             .collect();
         if candidates.is_empty() {
@@ -5470,6 +5578,44 @@ impl Meta {
             out.push(g);
         }
         Ok(out)
+    }
+
+    /// ADR-43 (orphan grants): the generations this replica names before a
+    /// strand that may take their grant ([`Self::orphaned_tx`]'s candidates):
+    /// the table's (a streamed grant installs there), those of the live
+    /// shadows and hints of delegate replies (`gen != 0`: a requester that
+    /// never listed the grant holds them, and the strand may take the entry,
+    /// queuing its rid for replay, held while the generation lives, without
+    /// ending the generation), and those a live entry's records grant (a
+    /// streamed `Delegate` whose `RecallCut` streamed too: the install took
+    /// the generation out of the table again, and a dependency on it waited
+    /// for an end nothing applies, the N4 wait).
+    fn named_generations_tx(
+        &self,
+        tx: &SingleWriterWriteTx,
+    ) -> Result<std::collections::BTreeSet<u64>, MetaError> {
+        let mut named: std::collections::BTreeSet<u64> =
+            crate::delegation::read_table_tx(tx, self)?
+                .iter()
+                .map(|d| d.gen)
+                .collect();
+        for (seq, entry) in live_non_local(tx, self)? {
+            if let LiveEntry::Shadow { gen, .. } | LiveEntry::Hint { gen, .. } = entry {
+                if gen != 0 {
+                    named.insert(gen);
+                }
+            }
+            let Some(v) = tx.get(&self.spec, seq_key(seq))? else {
+                continue;
+            };
+            let row: SpecRow = postcard::from_bytes(&v)?;
+            for rec in &row.records {
+                if let LogRecord::Delegate { gen, .. } = rec {
+                    named.insert(*gen);
+                }
+            }
+        }
+        Ok(named)
     }
 
     /// [`Self::speculatively_ended_generations`] under `r` (the read path

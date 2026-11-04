@@ -480,7 +480,7 @@ fn the_takeover_gate_keeps_a_delegates_committed_shadow_its_tail_lacks() {
             Default::default()
         };
         let stranded = meta
-            .strand_for_takeover_carrying(2, &[], None, &tail)
+            .strand_for_takeover_carrying(2, &[], None, &tail, &Default::default())
             .unwrap();
         assert!(
             meta.pending_replays().unwrap().is_empty(),

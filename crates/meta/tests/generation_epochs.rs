@@ -927,6 +927,13 @@ fn a_requester_s_shadow_alone_names(committed: bool) {
         .any(|op| op.rid == rid));
 }
 
+fn no_tail(prev_epoch: u64, through: u64) -> LogRecord {
+    LogRecord::TailFollowsThrough {
+        prev_epoch,
+        through,
+    }
+}
+
 const RID: Rid = Rid {
     node: 9,
     incarnation: 1,
@@ -998,4 +1005,123 @@ fn an_abandoning_claimant_that_was_the_orphan_s_delegate_ships_none_of_its_rows(
         meta.delegate_stranded(g).unwrap(),
         "never executed in again"
     );
+}
+
+/// The lone-root takeover (no abandon): the lone root of epoch 1 (no group,
+/// its gate off) streamed its grant of `g` uncommitted, this node executed
+/// as the delegate, and the root died before shipping. The claimant of
+/// epoch 2 carries no tail (`TailFollowsThrough { 1, 0 }`): nothing of
+/// epoch 1 the log does not hold ever ships. Before, the strand took the
+/// grant and left the rows: `deleg_gens_awaiting_end` named `g` for good
+/// (no later grant installed here) and the rows' effects stayed in this
+/// replica only.
+#[test]
+fn a_takeover_without_a_tail_ends_a_lone_root_s_unshipped_grant() {
+    let g = gen(1, 1);
+    let meta = delegate_of_a_streamed_grant(g, false);
+    meta.apply_segment_rows(1, 2, 0, &[], &[], &[no_tail(1, 0)], &TouchSet::default())
+        .unwrap();
+    assert!(meta.delegation_table().iter().all(|d| d.gen != g));
+    ended_and_replayed(&meta, g);
+}
+
+/// The same on the claimant, which was the delegate: its strand ends `g`,
+/// and its row of it never ships.
+#[test]
+fn a_claimant_without_a_tail_ships_none_of_its_rows_of_an_unshipped_grant() {
+    let g = gen(1, 1);
+    let meta = delegate_of_a_streamed_grant(g, false);
+    let proof = constellation_meta::OrphanProof::of(&[no_tail(1, 0)]);
+    meta.strand_for_takeover_carrying(2, &[], None, &Default::default(), &proof)
+        .unwrap();
+    assert!(!ships_a_row_of(&meta, g), "its row would ship ungranted");
+    ended_and_replayed(&meta, g);
+}
+
+/// The integrity guards of the takeover rule: a marker that carries a tail
+/// (the grant may still ship with it), a marker of an older epoch's
+/// takeover (another epoch's rows may ride a tail a later claim fetches),
+/// and a grant the log carries are left alone: the generation stays live,
+/// its row stays.
+#[test]
+fn a_takeover_leaves_a_grant_that_may_still_ship_alone() {
+    let g = gen(1, 1);
+    let unended = |meta: &Meta| {
+        assert_eq!(meta.void_cut(g).unwrap(), None);
+        assert!(!meta.session().is_voided(g));
+        assert!(meta.lookup(ROOT_INO, "x").unwrap().is_some());
+    };
+    // A tail follows (through 5): `g` may be in it.
+    let meta = delegate_of_a_streamed_grant(g, true);
+    meta.apply_segment_rows(1, 2, 0, &[], &[], &[no_tail(1, 5)], &TouchSet::default())
+        .unwrap();
+    unended(&meta);
+    let proof = constellation_meta::OrphanProof::of(&[no_tail(1, 5)]);
+    assert!(proof.is_empty());
+    // The marker of epoch 3 says nothing of epoch 1.
+    let meta = delegate_of_a_streamed_grant(g, false);
+    meta.apply_segment_rows(1, 3, 0, &[], &[], &[no_tail(2, 0)], &TouchSet::default())
+        .unwrap();
+    unended(&meta);
+    // The log granted it.
+    let meta = Meta::open_in_memory().unwrap();
+    meta.apply_segment(1, 1, &[delegate(g)], &TouchSet::default())
+        .unwrap();
+    delegate_create(&meta, g, RID, "x", (2u64 << 40) | 20);
+    meta.apply_segment_rows(2, 2, 0, &[], &[], &[no_tail(1, 0)], &TouchSet::default())
+        .unwrap();
+    assert!(meta.delegation_table().iter().any(|d| d.gen == g));
+    unended(&meta);
+    // And on a claimant that holds it: its row stays to ship.
+    let meta = Meta::open_in_memory().unwrap();
+    meta.apply_segment(1, 1, &[delegate(g)], &TouchSet::default())
+        .unwrap();
+    delegate_create(&meta, g, RID, "x", (2u64 << 40) | 20);
+    let proof = constellation_meta::OrphanProof::of(&[no_tail(1, 0)]);
+    meta.strand_for_takeover_carrying(2, &[], None, &Default::default(), &proof)
+        .unwrap();
+    unended(&meta);
+    assert!(ships_a_row_of(&meta, g));
+}
+
+/// N4 (the restart dependency wait): the lone root of epoch 1 streamed its
+/// grant of `g` and its end, both uncommitted and both outstanding at this
+/// replica's restart, and died. The claimant carries no tail; its marker
+/// strands both. The end's install had taken `g` out of the table, so `g`
+/// was named nowhere and nothing ended it: a dependency on `g` waited for
+/// the rest of the process. The marker proves the grant never ships: `g`
+/// ends at 0 and the dependency is lost (refused, re-sent after its cause's
+/// replay) instead of waiting.
+#[test]
+fn a_takeover_without_a_tail_ends_a_streamed_grant_and_end_after_a_restart() {
+    let g = gen(1, 1);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.db");
+    {
+        let meta = Meta::open(&path).unwrap();
+        meta.install_streamed_committed(1, 1, 1, 1, &[delegate(g)], false, (0, 0))
+            .unwrap();
+        meta.install_streamed_committed(
+            1,
+            1,
+            2,
+            2,
+            &[LogRecord::RecallCut {
+                dir: ROOT_INO,
+                gen: g,
+                through: 1,
+            }],
+            false,
+            (0, 0),
+        )
+        .unwrap();
+        assert!(meta.delegation_table().iter().all(|d| d.gen != g));
+        meta.close().unwrap();
+    }
+    let meta = Meta::open(&path).unwrap();
+    assert!(!meta.deps_lost_deps(&at(g, 1)));
+    meta.apply_segment_rows(1, 2, 0, &[], &[], &[no_tail(1, 0)], &TouchSet::default())
+        .unwrap();
+    assert_eq!(meta.void_cut(g).unwrap(), Some(0));
+    assert!(meta.deps_lost_deps(&at(g, 1)), "lost, not waited for");
 }
