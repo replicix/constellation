@@ -5099,7 +5099,10 @@ impl Meta {
         }
         // ADR-43: a generation whose grant an abandon proves will never be
         // in the log is ended here as the log's `Recall` would end it, at
-        // what the log holds of it (`orphaned_by_abandon_tx`).
+        // what the log holds of it (`orphaned_by_abandon_tx`). The cut loop
+        // above must run first: a generation this segment ends (the
+        // stream installed the end before the marker) then has its cut key,
+        // which the rule's exclusions read, and is not ended again at cut 0.
         let orphaned = if abandoned.is_empty() {
             Vec::new()
         } else {
@@ -5409,7 +5412,10 @@ impl Meta {
     /// listed before the strand (`listed_before`) and the ones this node
     /// holds its own delegate rows of (`deleg_gens_awaiting_end`: a delegate
     /// that executed under the stranded grant; they would block its installs
-    /// for good, `delegation_sync`). Numbers of the old mint (epoch 0) are
+    /// for good, `delegation_sync`) and of its live shadows and hints (a
+    /// requester that never listed the generation). The cut loop of the
+    /// segment runs before this rule: that ordering keeps a generation the
+    /// segment ends in the same transaction out, by its cut key. Numbers of the old mint (epoch 0) are
     /// left alone: their minting tenure is unknown.
     fn orphaned_by_abandon_tx(
         &self,
@@ -5427,6 +5433,17 @@ impl Meta {
             .collect();
         let mut candidates = listed_before.clone();
         candidates.extend(local::deleg_gens_awaiting_end_tx(tx, self, &listed)?);
+        // A requester that installed a delegate's reply (a shadow or hint of
+        // `gen`) without ever listing the generation holds the entry for
+        // good unless the recall strand takes it: the same exclusions below
+        // keep this to generations the log never grants.
+        for (_, entry) in live_non_local(tx, self)? {
+            if let LiveEntry::Shadow { gen, .. } | LiveEntry::Hint { gen, .. } = entry {
+                if gen != 0 {
+                    candidates.insert(gen);
+                }
+            }
+        }
         let candidates: Vec<u64> = candidates
             .into_iter()
             .filter(|g| {

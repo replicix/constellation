@@ -798,3 +798,125 @@ fn an_abandon_leaves_a_generation_the_log_granted_alone() {
     assert_eq!(meta.void_cut(g).unwrap(), None);
     assert!(!meta.deps_lost_deps(&at(g, 1)));
 }
+
+/// The guard for an end only the successor's stream carries so far: the
+/// log granted `g` (epoch 1), this node executed as its delegate, and the
+/// claimant of epoch 2 (which abandoned epoch 1's group) streamed its
+/// `RecallCut` of `g` ahead of its marker. The table no longer lists `g`,
+/// no cut is kept, and the delegate's row is still held, yet the log WILL
+/// carry the end (and, below its cut, rows of `g`): the abandon must leave
+/// `g` alone, or the row would be replayed by rid while the log may carry
+/// it, and a dependency the log holds would be refused as lost.
+#[test]
+fn an_abandon_leaves_a_generation_a_later_stream_ends_alone() {
+    let g = gen(1, 1);
+    let rid = Rid {
+        node: 9,
+        incarnation: 1,
+        seq: 1,
+    };
+    let meta = Meta::open_in_memory().unwrap();
+    meta.apply_segment(1, 1, &[delegate(g)], &TouchSet::default())
+        .unwrap();
+    delegate_create(&meta, g, rid, "x", (2u64 << 40) | 20);
+    meta.install_streamed_committed(
+        2,
+        2,
+        1,
+        1,
+        &[LogRecord::RecallCut {
+            dir: ROOT_INO,
+            gen: g,
+            through: 1,
+        }],
+        true,
+        (0, 0),
+    )
+    .unwrap();
+    assert!(meta.delegation_table().iter().all(|d| d.gen != g));
+    meta.apply_segment_rows(
+        2,
+        2,
+        0,
+        &[],
+        &[],
+        &[LogRecord::GroupAbandoned {
+            epoch: 1,
+            gen: 0,
+            through_known: 0,
+        }],
+        &TouchSet::default(),
+    )
+    .unwrap();
+    assert_eq!(meta.void_cut(g).unwrap(), None, "not ended by the abandon");
+    assert!(!meta.session().is_voided(g));
+    assert!(
+        !meta
+            .pending_replays()
+            .unwrap()
+            .iter()
+            .any(|op| op.rid == rid),
+        "the delegate's row is not replayed"
+    );
+}
+
+/// A requester that installed a delegate's reply (a shadow of `g`) without
+/// ever listing `g` (it never saw the grant) holds that entry for good unless
+/// the abandon, which proves the log never grants `g`, ends the generation:
+/// the recall strand then takes the shadow and queues its rid for replay.
+#[test]
+fn an_abandon_ends_a_generation_only_a_requester_s_shadow_names() {
+    let g = gen(1, 1);
+    let rid = Rid {
+        node: 9,
+        incarnation: 1,
+        seq: 1,
+    };
+    let meta = Meta::open_in_memory().unwrap();
+    let op = MutateOp::Create {
+        parent: ROOT_INO,
+        name: "x".into(),
+        ino: (2u64 << 40) | 20,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    let records = [LogRecord::Create {
+        parent: ROOT_INO,
+        name: "x".into(),
+        ino: (2u64 << 40) | 20,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 10,
+    }];
+    assert!(meta
+        .install_shadow_from(rid, 1, g, &op, &Default::default(), &records)
+        .unwrap());
+    assert!(meta.delegation_table().iter().all(|d| d.gen != g));
+    assert!(meta.lookup(ROOT_INO, "x").unwrap().is_some());
+    meta.apply_segment_rows(
+        2,
+        2,
+        0,
+        &[],
+        &[],
+        &[LogRecord::GroupAbandoned {
+            epoch: 1,
+            gen: 0,
+            through_known: 0,
+        }],
+        &TouchSet::default(),
+    )
+    .unwrap();
+    assert_eq!(meta.void_cut(g).unwrap(), Some(0), "ended by the abandon");
+    assert!(
+        meta.lookup(ROOT_INO, "x").unwrap().is_none(),
+        "the shadow is rolled back"
+    );
+    assert!(meta
+        .pending_replays()
+        .unwrap()
+        .iter()
+        .any(|op| op.rid == rid));
+}

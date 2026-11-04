@@ -729,7 +729,8 @@ pub fn gen_epoch(gen: Gen) -> u64 {
     gen >> GEN_EPOCH_SHIFT
 }
 
-/// A generation number for a log line (ADR-43): `epoch:n`, the minting
+/// A generation number for a log line (ADR-43): `epoch:n` (a plain `n` for
+/// an old-mint number, epoch 0), the minting
 /// tenure's epoch and its counter within the tenure, where the raw `u64`
 /// (`epoch << 32 | n`) reads as noise. `GenLabel::of` takes the number or a
 /// reference to it.
@@ -744,6 +745,10 @@ impl GenLabel {
 
 impl std::fmt::Display for GenLabel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if gen_epoch(self.0) == 0 {
+            // An old-mint number is the plain counter, as the CLI shows it.
+            return write!(f, "{}", self.0);
+        }
         write!(
             f,
             "{}:{}",
