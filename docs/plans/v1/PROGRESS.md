@@ -65515,14 +65515,42 @@ grant leaves; a number outside the block, from any source, is refused. No backwa
   process (as on main), and after a restart the lazy void met it at cut 0 and reported dependencies at or below the real cut as lost. The
   rebuild now copies the side replica's `deleg_log_idx:*` and `deleg_void_cut:*` keys raise-only (after the reset's strand, which retracts
   only this node's own counts and cuts), seeds the session as an open does (`Meta::seed_session_generations`, shared with the open) and takes
-  the rebuilt table (the durable log's) as the open-table snapshot. Test `an_in_process_rebuild_carries_the_ends_its_window_holds` fails
+  the side replica's table as the open-table snapshot (round 3 below). Test `an_in_process_rebuild_carries_the_ends_its_window_holds` fails
   without the copy and the seeding (in-process: the ended generation is not voided; after a restart, with only the in-process half disabled:
   a dependency at the real cut reported lost).
+- **Round 3** (narrow re-review of S-1: one fix, and a bug on main in the same function; two more `fix(meta)` commits).
+  - The reseed read the table this store holds after the commit, but the reset re-applies the kept gated `Streamed` / `Shadow` entries
+    onto the rebuilt namespace in the same transaction (`durable = false`), and a streamed-ahead `RecallCut` writes the table row without the
+    void. The reseed voided such an end eagerly and put it in `ended_before_open`, which the lazy void's restriction keeps out; were the
+    entry to strand, nothing would lift the void (only a `Local` strand stages an unvoid: the seed-6239 class). The seeding and the
+    snapshot now take the side replica's table (`max_gen`, live), read before the commit. `seed_generations` also sets the cut of an
+    ended generation from the store instead of raising the session's: a deposed root's own cut above the log's counted a dependency between
+    the two as not lost (at an open the map is empty: set is raise). Tests `a_rebuild_does_not_void_an_end_a_kept_streamed_entry_carries`
+    and `a_rebuild_takes_the_log_s_cut_over_a_deposed_roots_own` fail on the previous commit.
+  - **`deleg_any`, a bug on main outside ADR-43**: `replace_ns_from_rebuilt` copies the table's row without `write_table_tx`, the only
+    place that sets `delegations_any`. A node whose old table was empty, rebuilt onto a table with a live delegation (a retention rebuild
+    whose retained tail has no `Delegate` or `Recall`), kept the flag false, and `root_fast_path` and `read_delegated` skipped the ownership
+    check: once root, it executed ops on keys the delegate owns and served strict reads the delegate answers. The rebuild raises the flag
+    before the commit from the table the transaction holds (raise only: a stale true costs the slow path; lowering it would need the
+    grant's `deleg_gate`, which is taken before a write transaction, so taking it after the rebuild's write transaction began could
+    deadlock against a grant). Test `a_rebuild_onto_a_table_with_a_live_delegation_turns_the_fast_path_check_on` (meta
+    `rebuild_delegations.rs`) fails without it.
+  - Gates after round 3 (final tree, release, 0 failed): `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`
+    clean; meta all targets 581 passed, 20 ignored; authority lib 1,006; engine lib 948; sim suite 366 passed, 0 failed, 12 ignored;
+    `lda_4125_slow_lease_reads_seed`, `session_guarantees_hold` and both `m03_` ratchet tests passing. Sweeps main 7a19bb95 against the final
+    tree, with and without `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`: `placement-hot` 0..10,000, the eight delegated configurations of the
+    earlier paragraph 0..2,000 and the two `+commit` rows 0..299: the failing sets are the same (knob: 4418 in `placement-hot`, 1525 in
+    `delegated-group-switch`; none elsewhere), and so are the unsettled seed sets, the I1, I2, I2c, I4 and I5 counts and the failover
+    p50 / p90 in every row; the only differences are the same few units in the "acks by class" counters of `placement-hot` (both knobs;
+    for example no knob: deleg-group 98,988 / 98,969, root-group 1,489,269 / 1,489,291) and `long-delegated-backup` (no knob: archive
+    46,922 / 46,925, one cause count), the sim's own noise as before.
+  - **Open item**: the restart path has the same exposure to a streamed-ahead end, on main and on the branch: the open seeds from the table
+    the store holds, which may carry a streamed-ahead `RecallCut` (table row, no void) whose entry then strands. Not changed here.
 - **What the sweeps do not cover (S-2).** The sim's nodes open one in-memory `Meta` and a simulated restart keeps it (`session().reset()`
   keeps the open-table snapshot, the empty one of the creation): at a restart `ended_before_open` is false and the seeding runs on an empty
   store, so the sim never exercises the restart's restricted lazy void, and "the sweeps match main" (the rows below) does not validate it.
   Only the meta tests cover it. The sim does run the in-process rebuild, which since S-1 refreshes the snapshot: the lazy void and the key
-  copy are reached there, after a rebuild only. The sweep rows further below were measured before the follow-ups; the follow-ups' own sweeps are
+  copy are reachable there, after a rebuild only. The sweep rows further below were measured before the follow-ups; the follow-ups' own sweeps are
   in the paragraph "Sweeps after the follow-ups" of this section.
 - **A latent bug on the base** (f188c707): the rolled-back hole pass (`hole_tail_rolled_back_tx`) scanned the backup tail's keys up to
   `MEMBER_COPY_BASE`, which included a delegate's rows at `1 << 48` to `2 << 48`, and decoded them as `BackupTx`; a `DelegateTx` with a

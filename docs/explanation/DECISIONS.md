@@ -2839,8 +2839,13 @@ block.
   process, and after a restart the lazy void would meet it at cut 0 and report
   dependencies at or below its real cut as lost. The rebuild copies the side
   replica's `deleg_log_idx:*` and `deleg_void_cut:*` keys (raise-only, after the
-  reset's strand), seeds the session from the store as an open does and takes the
-  rebuilt table (the durable log's) as the open-table snapshot.
+  reset's strand), seeds the session from the store as an open does (the cut of an
+  ended generation is set from the store, not raised over the session's: a deposed
+  root's own stranded cut may sit above the log's) and takes the side replica's
+  table, read before the commit, as the open-table snapshot. Not the table the
+  store holds after it: the reset re-applies kept committed entries onto the
+  rebuilt namespace, and a streamed-ahead `RecallCut` among them writes the table
+  row without the void, which the restriction keeps out of `ended_before_open`.
 - What the sweeps do not witness. The sim's nodes open one in-memory `Meta` and a
   simulated restart keeps it (`session().reset()` keeps the open-table snapshot,
   the empty one of the creation), so at a restart `ended_before_open` is false and
@@ -2848,7 +2853,7 @@ block.
   lazy void, and "the sweeps match main" says nothing about it; only the meta
   tests (`generation_epochs.rs`, the session unit tests) cover it. The sim does
   run the in-process rebuild, which refreshes the snapshot, so the restricted
-  lazy void and the rebuild's key copy are reached there, after a rebuild only.
+  lazy void and the rebuild's key copy are reachable there, after a rebuild only.
 - What an orphan number leaves behind keeps its own identity. An orphan number is
   below the successor's block and never listed. It is voided for good once the
   table passes it: on the root's forward path only after a restart or an
