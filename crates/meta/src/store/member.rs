@@ -500,11 +500,7 @@ impl Meta {
 
     /// [`Self::member_copy_touches`] at `now` (a test steps past the cap
     /// without sleeping).
-    pub fn member_copy_touches_at(
-        &self,
-        keys: &[crate::ReadKey],
-        now: std::time::Instant,
-    ) -> bool {
+    pub fn member_copy_touches_at(&self, keys: &[crate::ReadKey], now: std::time::Instant) -> bool {
         if !self
             .any_held_copy
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -515,8 +511,7 @@ impl Meta {
         held.retain(|h| now.saturating_duration_since(h.since) < HELD_COPY_MAX_AGE);
         self.any_held_copy
             .store(!held.is_empty(), std::sync::atomic::Ordering::Relaxed);
-        held.iter()
-            .any(|h| keys.iter().any(|k| h.keys.touches(k)))
+        held.iter().any(|h| keys.iter().any(|k| h.keys.touches(k)))
     }
 
     /// Note a row the strand rolled back into `epoch`'s member copy.

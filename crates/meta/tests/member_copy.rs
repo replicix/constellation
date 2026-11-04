@@ -205,11 +205,21 @@ fn a_row_that_never_leaves_the_copy_stops_holding_after_the_cap() {
     meta.set_holder_epoch(0);
     let key = [ReadKey::Dentry(ROOT_INO, "data".into())];
     let dir = [ReadKey::Dir(ROOT_INO)];
-    apply_rows(&meta, 1, 2, 2, &[1, 2], &[create("b", ino(2), 11), completed(rid(2))]);
+    apply_rows(
+        &meta,
+        1,
+        2,
+        2,
+        &[1, 2],
+        &[create("b", ino(2), 11), completed(rid(2))],
+    );
     assert!(meta.member_copy_carries(rid(1)).unwrap());
     let t0 = std::time::Instant::now();
     assert!(meta.member_copy_touches_at(&key, t0));
-    assert!(meta.member_copy_touches_at(&dir, t0), "its parent's listing too");
+    assert!(
+        meta.member_copy_touches_at(&dir, t0),
+        "its parent's listing too"
+    );
     let cap = constellation_meta::HELD_COPY_MAX_AGE;
     let late = std::time::Instant::now() + cap + std::time::Duration::from_millis(1);
     assert!(!meta.member_copy_touches_at(&key, late), "capped");
