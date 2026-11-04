@@ -15124,34 +15124,28 @@ fn settle_before_eio_a_gate_a_renewal_and_a_redirect_loop_leave_no_unsettled_eio
     );
 }
 
-/// Plan 46 M0.3: the findings the settle fixes (S1 to S3) leave open, pinned
-/// for the fix items that close them; ignored until they do
-/// (`cargo test -p constellation-authority --release --test sim -- --ignored
-/// delegated_settle_findings`). Every seed runs and every failure is
-/// reported.
+/// `long-delegated-late-answers` 4125 (slow lease reads,
+/// `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`), a regression seed of the
+/// session checker, not of the product. The oracle placed a refusal after
+/// every success that returned before the refusal was invoked, in any
+/// directory and from any node, as if the log were a real-time order across
+/// owners. Node 3, the delegate of `d2`, had acknowledged `create d2/f2` and
+/// `unlink d2/f2`; the root appended them late, after its own `create d1/f1`.
+/// Node 2's `unlink d1/f1`, invoked after those returned, was refused
+/// `ENOENT` at the root before that create, and node 2's next read saw
+/// `d1/f1` present, which the oracle reported as `monotonic_reads`. The read
+/// is monotonic: absent at the refusal's state, present at a later one. Under
+/// delegation the log orders keys of different owners only causally, so the
+/// refusal's window now binds only the successes of its scope (`session::
+/// Scope`, the projection of the linearizability check) and its own node's.
 ///
-/// **`long-delegated-late-answers` 4125 (knob), a monotonic-reads violation
-/// on a stale `d1/f1`.** Not L1 (a former delegate's replica ordering, fixed
-/// by `spec::row_is_ordered_at`, pinned by
-/// `l1_a_former_delegates_own_row_keeps_its_log_place`): the fix does not
-/// change this failure. Its recall segments carry own rows below the
-/// confirmed streamed rows, and a read at tick 140 sees `d1/f1` present after
-/// the node had observed index 34. Before tracing the replica, check whether
-/// rid (1,1,26), the root's `Create d1/f1` at log rows 92-93, is among the
-/// oracle's `successes`: an oracle gap is possible (spec section 1.4).
-///
-/// **L2, I2 on a stranded replay against the requester's re-ask**: a delegate
-/// or root accepted an op in one epoch, a takeover stranded it, the new root
-/// queues the stranded row for replay by rid, and the requester asks the new
-/// holder again (`placement-hot` 8557 with the knob on main, `one_identity_
-/// per_op`: queued on 1 and executing on 4). Plan 46 stage 2 removes the
-/// server-side replay and with it the class; no seed of `placement-hot` fails
-/// it on this tree (655 with the knob, the pin of the first measurement, and
-/// 8557 pass), so there is nothing to pin here.
+/// It failed on 3d716e12 and passes there with the oracle fix. It passes on
+/// main without it too, because 02260859 delays the root's answer to its own
+/// forwarded op and so moved the schedule away from this shape; the shape
+/// itself is pinned by the unit test `session::tests::a_refusal_is_not_
+/// placed_after_another_owners_earlier_success`.
 #[test]
-#[ignore = "finding of plan 46 M0.3: long-delegated-late-answers 4125 (knob), a monotonic-reads violation on a stale name, not L1, fails until it is traced"]
-fn delegated_settle_findings_4125_monotonic_reads_on_a_stale_name() {
-    // With the slow lease reads knob `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`.
+fn lda_4125_a_refusal_is_ordered_only_within_its_owner() {
     let cfg = SimConfig {
         lease_reads: SLOW_LEASE_READS,
         ..long_delegated_late_answers_config()
@@ -15160,6 +15154,15 @@ fn delegated_settle_findings_4125_monotonic_reads_on_a_stale_name() {
         panic!("long-delegated-late-answers seed 4125 (knob): {e}");
     }
 }
+
+// Plan 46 M0.3, **L2**, I2 on a stranded replay against the requester's
+// re-ask: a delegate or root accepted an op in one epoch, a takeover stranded
+// it, the new root queues the stranded row for replay by rid, and the
+// requester asks the new holder again (`placement-hot` 8557 with the knob on
+// main, `one_identity_per_op`: queued on 1 and executing on 4). Plan 46
+// stage 2 removes the server-side replay and with it the class; no seed of
+// `placement-hot` fails it on this tree (655 with the knob, the pin of the
+// first measurement, and 8557 pass), so there is nothing to pin here.
 
 /// I1 (delegate answers without a committed row), the delegate's lone test:
 /// it asked for a backup candidate, which needs a link up for
