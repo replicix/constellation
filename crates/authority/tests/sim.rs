@@ -8782,6 +8782,26 @@ fn delegated_group_switch_findings_seeds_234_and_615() {
     );
 }
 
+/// A deposed root's committed own row, stranded by its successor's first
+/// segment, moves to its member copy and leaves the namespace until the
+/// successor's re-ship lands, while a later row that depends on it stays:
+/// `long-delegated-late-answers` seed 31041 under slow lease reads (and
+/// 5839 before 9fe5531b moved its schedule) had a reader on the deposed
+/// root see a marker without its data. A read of a member copy row's keys
+/// waits for the re-ship, as for a queued replay (`Meta::replay_touches`).
+#[test]
+fn a_marker_is_never_seen_without_the_data_a_deposition_moved_to_the_member_copy() {
+    let cfg = SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..long_delegated_late_answers_config()
+    };
+    if let Err(e) = run_seed(31_041, cfg) {
+        panic!(
+            "long-delegated-late-answers seed 31041 (AUTHORITY_SIM_LEASE_READS=0:0:800:1000): {e}"
+        );
+    }
+}
+
 /// Plan 46 M0.3: L2b, a known I2 gap, pinned. `long-delegated-backup` seed
 /// 13016 (I2, and I2c) and `long-delegated-late-answers` seeds 13907 and 15996
 /// plus `long-delegated-backup` seeds 14284 and 15005 (I2c) fail `+identity`

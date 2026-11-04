@@ -450,6 +450,33 @@ impl Meta {
         Ok(false)
     }
 
+    /// Whether a member copy row touches any of `keys`. A deposed holder's
+    /// committed rows that a later epoch's segment strands are rolled back
+    /// into its member copy, not queued for replay: the successor re-ships
+    /// them, and until the log carries them (the drop rules retire the row)
+    /// the namespace lacks them while later rows that depend on them may
+    /// stay (a delegate's row this root appended after them). A read of
+    /// their keys waits for the re-ship as it waits for a queued replay
+    /// (`long-delegated-late-answers` seed 5839: a marker visible without
+    /// its data on the deposed root). One atomic load without a copy.
+    pub fn member_copy_touches(&self, keys: &[crate::ReadKey]) -> bool {
+        if !self.has_member_copies() {
+            return false;
+        }
+        let r = self.db.read_tx();
+        let Ok(epochs) = epochs_in(&r, self) else {
+            return false;
+        };
+        epochs.into_iter().any(|e| {
+            rows_in(&r, self, e).is_ok_and(|rows| {
+                rows.iter().any(|row| {
+                    let ks = crate::KeySet::from_records(&row.tx.records);
+                    keys.iter().any(|k| ks.touches(k))
+                })
+            })
+        })
+    }
+
     /// Forget the member copy of `epoch` (its rows are in the log, or the
     /// group was abandoned).
     pub fn member_copy_drop(&self, epoch: u64) -> Result<(), MetaError> {

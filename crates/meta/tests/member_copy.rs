@@ -5,7 +5,7 @@
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::{
     execute_mutate, BackupTx, LogRecord, MemberTx, Meta, MetaStore, MutateOp, PendingClass,
-    Position, Rid, RowClass, TouchSet,
+    Position, ReadKey, Rid, RowClass, TouchSet,
 };
 
 const HOLDER: u64 = 1;
@@ -145,6 +145,47 @@ fn an_ungated_row_is_still_queued() {
             .collect::<Vec<_>>(),
         vec![rid(2)]
     );
+}
+
+/// `long-delegated-late-answers` seed 5839 (lease-read knob, main before
+/// 9fe5531b): a deposed root's committed own row, stranded by the
+/// successor's first segment, moves to the member copy and leaves the
+/// namespace until the successor's re-ship lands. Meanwhile a delegate's
+/// row that this root appended after it (a marker written after the data)
+/// stays visible, and a reader of the data saw it vanish: no queued replay
+/// touched its keys, so the session wait did not hold the read. A member
+/// copy row the namespace lacks holds reads of its keys, as a queued
+/// replay does, until the log carries it.
+#[test]
+fn a_committed_row_moved_to_the_member_copy_holds_its_readers() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    holder_create(&meta, RowClass::RootGroup, "data", 1, 1);
+    meta.set_holder_epoch(0);
+    let key = [ReadKey::Dentry(ROOT_INO, "data".into())];
+    assert!(meta.lookup(ROOT_INO, "data").unwrap().is_some());
+    // The successor's first segment (epoch 2, an unrelated row).
+    let other = vec![create("b", ino(2), 11), completed(rid(2))];
+    apply_rows(&meta, 1, 2, 2, &[1, 2], &other);
+    assert!(meta.lookup(ROOT_INO, "data").unwrap().is_none(), "rolled back");
+    assert!(meta.member_copy_carries(rid(1)).unwrap());
+    assert!(meta.pending_replays().unwrap().is_empty(), "not queued");
+    assert!(
+        meta.replay_touches(&key),
+        "a read of the rolled-back committed row must wait for its re-ship"
+    );
+    assert!(!meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "unrelated".into())]));
+    // The successor re-ships the row with its identity: visible again, and
+    // nothing holds the read any more.
+    let reship = vec![
+        LogRecord::TailOf { epoch: 1, jseq: 1 },
+        create("data", ino(1), 10),
+        completed(rid(1)),
+    ];
+    apply_rows(&meta, 2, 2, 5, &[3, 4, 5], &reship);
+    assert!(meta.lookup(ROOT_INO, "data").unwrap().is_some());
+    assert!(!meta.member_copy_carries(rid(1)).unwrap(), "retired by the re-ship");
+    assert!(!meta.replay_touches(&key));
 }
 
 // ------------------------------------- committed requester/subscriber entries

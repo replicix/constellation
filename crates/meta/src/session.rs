@@ -2128,8 +2128,14 @@ impl crate::store::Meta {
     }
 
     /// Whether a queued replay (a stranded op rolled back until it lands)
-    /// touches any of `keys`. One counter read when the queue is empty.
+    /// touches any of `keys`, or a member copy row does (a committed row
+    /// rolled back until the successor's re-ship lands:
+    /// [`Meta::member_copy_touches`]). One counter read and one atomic load
+    /// when neither is held.
     pub fn replay_touches(&self, keys: &[ReadKey]) -> bool {
+        if self.member_copy_touches(keys) {
+            return true;
+        }
         if !self.has_pending_replays() {
             return false;
         }
