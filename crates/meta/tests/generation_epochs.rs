@@ -926,3 +926,76 @@ fn a_requester_s_shadow_alone_names(committed: bool) {
         .iter()
         .any(|op| op.rid == rid));
 }
+
+const RID: Rid = Rid {
+    node: 9,
+    incarnation: 1,
+    seq: 1,
+};
+
+/// A replica that installed epoch 1's streamed grant of `g` (`committed`:
+/// held by the root's group or not) and executed a row of `g` as its
+/// delegate (`x` created, its rid [`RID`]).
+fn delegate_of_a_streamed_grant(g: u64, committed: bool) -> Meta {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.install_streamed_committed(1, 1, 1, 1, &[delegate(g)], committed, (0, 0))
+        .unwrap();
+    assert!(meta.delegation_table().iter().any(|d| d.gen == g));
+    delegate_create(&meta, g, RID, "x", (2u64 << 40) | 20);
+    meta
+}
+
+/// The rows the journal would ship next, by their generation's rows: none
+/// may be a row of `g`.
+fn ships_a_row_of(meta: &Meta, g: u64) -> bool {
+    meta.journal_own_gens().unwrap().contains(&g)
+        || !meta.take_journal_grouped(1000).unwrap().is_empty()
+}
+
+fn ended_and_replayed(meta: &Meta, g: u64) {
+    assert_eq!(meta.void_cut(g).unwrap(), Some(0), "ended at 0");
+    assert!(meta.session().is_voided(g));
+    assert!(meta.deps_lost_deps(&at(g, 1)));
+    assert!(
+        meta.deleg_gens_awaiting_end(&Default::default())
+            .unwrap()
+            .is_empty(),
+        "nothing of g left to wait for"
+    );
+    assert!(
+        meta.lookup(ROOT_INO, "x").unwrap().is_none(),
+        "the row is rolled back"
+    );
+    assert!(
+        meta.pending_replays()
+            .unwrap()
+            .iter()
+            .any(|op| op.rid == RID),
+        "and queued for replay by rid"
+    );
+}
+
+/// ADR-43 review SHOULD-3: the claimant of epoch 2, which abandoned epoch
+/// 1's group, was the delegate of `g`, a grant of epoch 1 the log never
+/// carried. Its own marker never runs through the segment path, so the
+/// abandon's orphan rule did not run on it: its row of `g` stayed in its
+/// journal and was the first row it shipped as root, a row of a generation
+/// with no `Delegate` in the log. The claim's strand ends `g` as every other
+/// replica does: the row is rolled back and replayed by rid as a root row.
+#[test]
+fn an_abandoning_claimant_that_was_the_orphan_s_delegate_ships_none_of_its_rows() {
+    let g = gen(1, 1);
+    let meta = delegate_of_a_streamed_grant(g, true);
+    assert!(ships_a_row_of(&meta, g));
+    meta.strand_for_takeover(2, &[], Some(1)).unwrap();
+    assert!(
+        meta.delegation_table().iter().all(|d| d.gen != g),
+        "the grant stranded"
+    );
+    assert!(!ships_a_row_of(&meta, g), "its row would ship ungranted");
+    ended_and_replayed(&meta, g);
+    assert!(
+        meta.delegate_stranded(g).unwrap(),
+        "never executed in again"
+    );
+}
