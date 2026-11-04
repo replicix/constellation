@@ -1587,6 +1587,97 @@ fn beats_outstanding_max(every: Duration) -> usize {
     (BEAT_TIMEOUT.as_millis().div_ceil(every) as usize).clamp(1, 64)
 }
 
+/// Plan 43 C1-3: a member's `SealedTail` answer to a claimant, as the
+/// core's event. A tail batch that does not decode is no answer at all
+/// (`PeerFailed`: the member is not chosen, or the pull starts over), never
+/// a `held` answer with an empty tail: the claimant would claim past the
+/// rows that member acknowledged and has not shipped (I1). A refusal
+/// (`held: false`) carries no tail, so its bytes are not read.
+#[allow(clippy::too_many_arguments)]
+fn sealed_tail_event(
+    to: NodeId,
+    req: OpId,
+    epoch: u64,
+    held: bool,
+    empty: bool,
+    txs: &[u8],
+    through: u64,
+    next: Option<u64>,
+) -> Event {
+    let txs = match postcard::from_bytes(txs) {
+        Ok(txs) => txs,
+        // A refusal (`held: false`) carries no tail: its rows are never read,
+        // and a member whose sync is down answers with no bytes at all.
+        Err(_) if !held => Vec::new(),
+        Err(error) => {
+            tracing::error!(
+                member = to,
+                epoch,
+                held,
+                bytes = txs.len(),
+                %error,
+                "a member's sealed tail does not decode: counted as no answer, never as an empty tail"
+            );
+            return Event::PeerFailed {
+                req,
+                to,
+                outage: false,
+            };
+        }
+    };
+    Event::Peer {
+        from: to,
+        msg: PeerMsg::SealedTail {
+            req,
+            epoch,
+            held,
+            empty,
+            txs,
+            through,
+            next,
+        },
+    }
+}
+
+/// Plan 43 C2e: a delegation backup's `DelegSealed` answer to the root, as
+/// the core's event. A tail that does not decode is no answer at all
+/// (`PeerFailed`: the seal is asked again), never a `sealed` answer with an
+/// empty tail: the root would end the generation without the rows
+/// acknowledged through that backup (I1).
+fn deleg_sealed_event(to: NodeId, req: OpId, gen: u64, sealed: bool, txs: &[u8]) -> Event {
+    let txs = match postcard::from_bytes(txs) {
+        Ok(txs) => txs,
+        // An unsealed answer carries no tail (a backup whose sync is down
+        // answers with no bytes at all).
+        Err(_) if !sealed => Vec::new(),
+        Err(error) => {
+            tracing::error!(
+                member = to,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
+                sealed,
+                bytes = txs.len(),
+                %error,
+                "a delegation backup's sealed tail does not decode: counted as no answer, never as \
+                 an empty tail"
+            );
+            return Event::PeerFailed {
+                req,
+                to,
+                outage: false,
+            };
+        }
+    };
+    Event::Peer {
+        from: to,
+        msg: PeerMsg::DelegSealed {
+            req,
+            gen,
+            sealed,
+            txs,
+        },
+    }
+}
+
 /// Take a beat slot for `to` if fewer than `cap` are in flight.
 fn beat_slot(pending: &mut HashMap<NodeId, usize>, to: NodeId, cap: usize) -> bool {
     let n = pending.entry(to).or_default();
@@ -4962,19 +5053,9 @@ impl Driver {
                             through,
                             next,
                         })) if req_id == req.0 => {
-                            let txs = postcard::from_bytes(&txs).unwrap_or_default();
-                            let _ = tx.send(Internal::Event(Event::Peer {
-                                from: to,
-                                msg: PeerMsg::SealedTail {
-                                    req,
-                                    epoch,
-                                    held,
-                                    empty,
-                                    txs,
-                                    through,
-                                    next,
-                                },
-                            }));
+                            let _ = tx.send(Internal::Event(sealed_tail_event(
+                                to, req, epoch, held, empty, &txs, through, next,
+                            )));
                         }
                         _ => {
                             let outage =
@@ -5066,16 +5147,9 @@ impl Driver {
                             sealed,
                             txs,
                         })) if req_id == req.0 => {
-                            let txs = postcard::from_bytes(&txs).unwrap_or_default();
-                            let _ = tx.send(Internal::Event(Event::Peer {
-                                from: to,
-                                msg: PeerMsg::DelegSealed {
-                                    req,
-                                    gen,
-                                    sealed,
-                                    txs,
-                                },
-                            }));
+                            let _ = tx.send(Internal::Event(deleg_sealed_event(
+                                to, req, gen, sealed, &txs,
+                            )));
                         }
                         _ => {
                             let outage =
@@ -7713,6 +7787,78 @@ mod tests {
     use super::parse_u64_zero_ok;
     use super::{LeaseMode, LeaseStore, PARTITION};
     use std::sync::Arc;
+
+    /// Plan 43 C1-3 / C2e (I1): a member's sealed tail whose batch does not
+    /// decode is no answer at all, never "held, and empty". A claimant (or a
+    /// delegation root) that took it as empty would go on without the rows
+    /// that member acknowledged and has not shipped.
+    #[test]
+    fn an_undecodable_sealed_tail_is_no_answer_never_an_empty_one() {
+        use constellation_authority::{Event, OpId, PeerMsg};
+        let req = OpId(7);
+        // An empty batch that decodes: a real answer (the member holds no
+        // rows past the claimant's seq), kept as one.
+        let empty = postcard::to_allocvec(&Vec::<constellation_meta::BackupTx>::new()).unwrap();
+        match super::sealed_tail_event(3, req, 9, true, false, &empty, 0, None) {
+            Event::Peer {
+                from: 3,
+                msg: PeerMsg::SealedTail {
+                    held: true, txs, ..
+                },
+            } => assert!(txs.is_empty()),
+            other => panic!("a decodable empty tail: {other:?}"),
+        }
+        // Undecodable: a batch cut short, and no bytes at all (what an
+        // encoding that failed on the member's side sends).
+        for bad in [&[5u8][..], &[][..], &[0xff; 12][..]] {
+            match super::sealed_tail_event(3, req, 9, true, false, bad, 42, Some(43)) {
+                Event::PeerFailed { req: r, to: 3, .. } => assert_eq!(r, req),
+                other => panic!("an undecodable held tail {bad:?}: {other:?}"),
+            }
+            // A refusal carries no tail: its bytes are never read, and the
+            // flags of the member's answer stand.
+            match super::sealed_tail_event(3, req, 9, false, true, bad, 42, Some(43)) {
+                Event::Peer {
+                    from: 3,
+                    msg:
+                        PeerMsg::SealedTail {
+                            held: false,
+                            empty: true,
+                            txs,
+                            ..
+                        },
+                } => assert!(txs.is_empty()),
+                other => panic!("a refusal with undecodable bytes {bad:?}: {other:?}"),
+            }
+        }
+        let empty = postcard::to_allocvec(&Vec::<constellation_meta::DelegateTx>::new()).unwrap();
+        match super::deleg_sealed_event(4, req, 11, true, &empty) {
+            Event::Peer {
+                from: 4,
+                msg:
+                    PeerMsg::DelegSealed {
+                        sealed: true, txs, ..
+                    },
+            } => assert!(txs.is_empty()),
+            other => panic!("a decodable empty delegation tail: {other:?}"),
+        }
+        for bad in [&[5u8][..], &[][..], &[0xff; 12][..]] {
+            match super::deleg_sealed_event(4, req, 11, true, bad) {
+                Event::PeerFailed { req: r, to: 4, .. } => assert_eq!(r, req),
+                other => panic!("an undecodable delegation tail {bad:?}: {other:?}"),
+            }
+            match super::deleg_sealed_event(4, req, 11, false, bad) {
+                Event::Peer {
+                    from: 4,
+                    msg:
+                        PeerMsg::DelegSealed {
+                            sealed: false, txs, ..
+                        },
+                } => assert!(txs.is_empty()),
+                other => panic!("an unsealed answer with undecodable bytes {bad:?}: {other:?}"),
+            }
+        }
+    }
 
     /// Finding 14: a lone node's authority core waited 18 s for the
     /// metadata store's writer lock (a FUSE commit's journal write held up

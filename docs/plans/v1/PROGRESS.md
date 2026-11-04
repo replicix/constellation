@@ -65981,3 +65981,27 @@ ceiling raised.
 
 Gates: fmt, clippy `--workspace --all-targets -D warnings`, authority lib (1,017), net lib (127), engine lib (948), the
 release sim suite (382 passed, 0 failed).
+
+## A sealed tail that does not decode is no answer, never an empty tail (plan 43 C1-3 / C2e; I1)
+
+A review found the driver decoding a member's `SealedTail` batch with `unwrap_or_default`: an answer with `held: true` whose batch
+did not decode (or that the member could not encode, which sends no bytes) reached the core as "held, and empty". A first answer
+chose that member and, with no `next`, completed the claim with no tail: the claimant went on as if the member held nothing past its
+cursor, and the member's acknowledged, unshipped rows were lost (I1). Pre-existing on main.
+
+- **Siblings**: the delegation root's `DelegSealed` decode had the same shape (a strict backup's `sealed: true` with an undecodable
+  tail ended the generation at the root's cursor). The other decode sites already refuse or drop without crediting: a backup
+  append (`BackupAck` refused, sealed), a delegation backup append (refused), a delegate stream batch (dropped, no ack: resent),
+  stream-ahead (dropped, not credited).
+- **Fix** (`sealed_tail_event`, `deleg_sealed_event` in `authority_driver.rs`): a batch that does not decode is `PeerFailed`
+  (`outage: false`), logged at error. For a claim: the member is not chosen (the others are asked, or the attempt ends at its timer
+  and the claim waits), and a chosen member's pull starts over. For a delegation seal: the strict member's seal counts as unanswered
+  (the tail is never given up, C2e). A refusal (`held: false`, `sealed: false`) carries no tail and its bytes are not read: a
+  member whose sync is down answers with no bytes, and its answer (with the `empty` proof of the group-tail fix) stands. The core is
+  unchanged.
+- **Test**: `an_undecodable_sealed_tail_is_no_answer_never_an_empty_one` (engine lib; a cut-short batch, no bytes, an overlong
+  length; `held`/`sealed` answers fail, refusals keep their flags; a decodable empty batch stays an answer). Fails before the fix (`SealedTail { held: true, txs: [] }`).
+- **Not covered here**: the lock handback and mirror decoders (`grants_of`, `carry_of`, `floor_of`) still read an undecodable
+  wire value as none; a lock-safety follow-up, not a committed-row one.
+- **Gates**: `cargo fmt --all --check`, clippy `-D warnings` (engine, authority, all targets) clean; engine lib 949 passed,
+  authority lib 1013 passed, release sim suite 381 passed, 0 failed, 13 ignored.
