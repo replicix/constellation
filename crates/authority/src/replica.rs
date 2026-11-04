@@ -998,7 +998,7 @@ impl Replica for Meta {
     }
 
     fn deps_lost(&self, deps: &Position) -> bool {
-        self.session().deps_lost(deps)
+        self.deps_lost_deps(deps)
     }
 
     fn note_void_cut(&self, gen: u64, cut: u64) {
@@ -1984,5 +1984,66 @@ impl Replica for Meta {
             .map(|(e, x)| format!("{e}:{x}"))
             .unwrap_or_default();
         Meta::kv_set_durable(self, "lease_released", &v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use constellation_fs_core::types::ROOT_INO;
+    use constellation_meta::delegation::GEN_EPOCH_SHIFT;
+
+    /// ADR-43: the executors (`holder.rs` `mutate_request`, the delegate
+    /// stream's append and drain) ask the replica's `deps_lost` before
+    /// `reaches_streams`. A dependency past the cut of a key-less generation
+    /// that ended before the open must be lost at that first question, or
+    /// the op executes ahead of its cause once the second question voids it.
+    #[test]
+    fn the_replicas_deps_lost_voids_a_generation_that_ended_before_the_open() {
+        let g = (5u64 << GEN_EPOCH_SHIFT) | 3;
+        let rebuilt = Meta::open_in_memory().unwrap();
+        rebuilt
+            .apply_segment(
+                1,
+                1,
+                &[
+                    LogRecord::Delegate {
+                        dir: ROOT_INO,
+                        node: 4,
+                        gen: g,
+                        designated: false,
+                        range: (0, 0),
+                    },
+                    LogRecord::RecallCut {
+                        dir: ROOT_INO,
+                        gen: g,
+                        through: 0,
+                    },
+                ],
+                &TouchSet::default(),
+            )
+            .unwrap();
+        // The generation ended before the rebuilt replica's own window:
+        // it holds no key of it.
+        rebuilt.kv_del(&format!("deleg_void_cut:{g}")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        {
+            let meta = Meta::open(&path).unwrap();
+            meta.replace_ns_from_rebuilt(&rebuilt, &Default::default())
+                .unwrap();
+            meta.close().unwrap();
+        }
+        let meta = Meta::open(&path).unwrap();
+        let mut streams = constellation_meta::Streams::NONE;
+        assert!(streams.raise(g, 2));
+        let deps = Position {
+            seq: 0,
+            pending: None,
+            streams,
+        };
+        assert!(!meta.session().is_voided(g), "not voided yet");
+        assert!(Replica::deps_lost(&meta, &deps));
+        assert!(meta.session().is_voided(g));
     }
 }

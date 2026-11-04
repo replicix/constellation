@@ -2060,6 +2060,19 @@ impl crate::store::Meta {
         self.session.reaches_streams(deps)
     }
 
+    /// [`SessionState::deps_lost`] for `deps`, after the same lazy void
+    /// ([`Self::void_ended_deps`]). The executors ask `deps_lost` first and
+    /// `reaches_streams` after it (`holder.rs` `mutate_request`, the
+    /// delegate stream's append and drain): were only the second to void,
+    /// the first arrival of an op whose dependency is past the cut of a
+    /// generation that ended before the open would pass `deps_lost`, be
+    /// reached by the void, and execute ahead of its cause, where the
+    /// eager seeding refused it.
+    pub fn deps_lost_deps(&self, deps: &Position) -> bool {
+        self.void_ended_deps(deps);
+        self.session.deps_lost(deps)
+    }
+
     /// [`SessionState::ready`] against this store: whether a read of
     /// `keys` may run right now without waiting.
     pub fn session_ready(&self, keys: &[ReadKey]) -> bool {

@@ -160,3 +160,60 @@ fn a_dependency_on_a_generation_that_ended_without_a_key_is_voided_when_checked(
     assert!(!meta.reaches_streams_deps(&ahead));
     assert!(!meta.session().is_voided(gen(7, 1)));
 }
+
+/// The executors ask `deps_lost` before `reaches_streams` (`holder.rs`, the
+/// delegate stream's append and drain): the lazy void must be seen by
+/// whichever comes first, or the first arrival of an op whose dependency is
+/// past the cut of a key-less generation that ended before the open passes
+/// `deps_lost`, is reached by the void and executes ahead of its cause.
+#[test]
+fn a_lost_dependency_on_a_keyless_ended_generation_is_lost_at_the_first_check() {
+    let (g5, g6) = (gen(5, 3), gen(6, 1));
+    let rebuilt = Meta::open_in_memory().unwrap();
+    let records: Vec<LogRecord> = [g5, g6]
+        .into_iter()
+        .flat_map(|g| {
+            [
+                LogRecord::Delegate {
+                    dir: ROOT_INO,
+                    node: 4,
+                    gen: g,
+                    designated: false,
+                    range: (0, 0),
+                },
+                LogRecord::RecallCut {
+                    dir: ROOT_INO,
+                    gen: g,
+                    through: 0,
+                },
+            ]
+        })
+        .collect();
+    rebuilt
+        .apply_segment(1, 1, &records, &TouchSet::default())
+        .unwrap();
+    // Both ended before the rebuilt replica's own window: no key of them.
+    for g in [g5, g6] {
+        rebuilt.kv_del(&format!("deleg_void_cut:{g}")).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.db");
+    {
+        let meta = Meta::open(&path).unwrap();
+        meta.replace_ns_from_rebuilt(&rebuilt, &Default::default())
+            .unwrap();
+        meta.close().unwrap();
+    }
+    let meta = Meta::open(&path).unwrap();
+    let mut streams = Streams::NONE;
+    assert!(streams.raise(g5, 2));
+    let deps = Position {
+        seq: 0,
+        pending: None,
+        streams,
+    };
+    assert!(!meta.session().deps_lost(&deps), "not voided yet");
+    // The first check is `deps_lost`: it voids, and says lost.
+    assert!(meta.deps_lost_deps(&deps));
+    assert!(meta.session().is_voided(g5));
+}
