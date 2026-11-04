@@ -66085,3 +66085,23 @@ where. Not a regression (the old `std::backtrace` used the same unwinder);
 the tests accept 2 frames on musl. Fixing it (a libunwind sigreturn CFI, or
 frame-pointer walking) is left for a later round.
 The harness's per-scenario opt-out for freeze scenarios is left in place.
+
+## Plan 46 P46-05: a read of a rolled-back member copy row waits for the re-ship
+
+A deposed root's committed own row (`gen` 0, gated) is rolled back by the successor's first segment and moved to its member
+copy, while a later delegate row the root appended after it (`gen` != 0, never stranded) stays visible. No queued replay touched
+the data's keys, so the session wait did not hold a read of them: a reader on the deposed root saw a marker without its data
+(`long-delegated-late-answers` seeds 5839 and, with slow lease reads, 31041; no data is lost, the successor re-ships the row).
+
+- Fix: `Meta::member_copy_touches` (reached from `replay_touches`, so from every engine read path) answers true for the keys of a
+  row this node's strand rolled back into the member copy, until the re-ship retires it. The set is in memory
+  (`store::member::HeldCopy`), filled where the segment's strand puts the row (not a namespace rebuild, which derives the
+  namespace from the log; not the successor's own copy of rows it applied, not a seal snapshot), emptied where a row leaves the
+  copy (coverage, drop rules, abandon, hole, settled, epoch drop). One atomic load per read when nothing is held, and no
+  member copy decode.
+- Bound: an entry lapses after `HELD_COPY_MAX_AGE` (5 s, well above the 35-350 ms re-ship latency measured under slow S3), and
+  the session wait (2 s) degrades a read before that. A row that never leaves the copy (the `backup-crash-slow` seed 840 leak)
+  therefore cannot stall reads for good. Not persisted: a crash inside the re-ship window reopens the gap until the re-ship
+  lands (the same 50-125 ms), a bounded, rare case.
+- Pins: meta `member_copy` (a rolled-back committed row holds its readers; a row that never leaves the copy stops holding after
+  the cap; an applied row does not hold), sim `a_marker_is_never_seen_without_the_data_a_deposition_moved_to_the_member_copy`.
