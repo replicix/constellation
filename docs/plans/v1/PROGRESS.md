@@ -66099,9 +66099,14 @@ the data's keys, so the session wait did not hold a read of them: a reader on th
   namespace from the log; not the successor's own copy of rows it applied, not a seal snapshot), emptied where a row leaves the
   copy (coverage, drop rules, abandon, hole, settled, epoch drop). One atomic load per read when nothing is held, and no
   member copy decode.
-- Bound: an entry lapses after `HELD_COPY_MAX_AGE_MS` (5 s, well above the 35-350 ms re-ship latency measured under slow S3), and
+- Bound: an entry lapses after `HELD_COPY_MAX_AGE_MS` (5 s on the node's wait clock, well above the 35-350 ms re-ship latency measured under slow S3), and
   the session wait (2 s) degrades a read before that. A row that never leaves the copy (the `backup-crash-slow` seed 840 leak)
   therefore cannot stall reads for good. Not persisted: a crash inside the re-ship window reopens the gap until the re-ship
   lands (the same 50-125 ms), a bounded, rare case.
 - Pins: meta `member_copy` (a rolled-back committed row holds its readers; a row that never leaves the copy stops holding after
   the cap; an applied row does not hold), sim `a_marker_is_never_seen_without_the_data_a_deposition_moved_to_the_member_copy`.
+- Measured (instrumented sim client reads, seeds 0..1000): `long-delegated-late-answers` with and without
+  `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`: 0 reads held (the first predicate held 5 over 2000, 35-65 ms); `backup-crash-slow`:
+  1 read held, seed 840's leak, for 1845 ms once and then released by the cap (the first predicate: 50 reads, median 145 ms, and
+  seed 840 a full 2 s on every read, for good). Sweeps of both configs (2000 seeds each, both knob modes, and
+  `backup-crash-slow` 0..1000) fail the same seeds as main (only 840, the known leak). Release sim suite 378 passed, 0 failed.
