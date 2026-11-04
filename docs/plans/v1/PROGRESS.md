@@ -65577,11 +65577,10 @@ grant leaves; a number outside the block, from any source, is refused. No backwa
     and the segment count / dependency waits of 0 to 7 seeds per row). The sim never reopens a `Meta`, so the restart half is guarded by the
     meta tests alone; the read half is reachable in the sim, which shows no witness of a seed that waits where it voided before.
   - **Open items** (residuals, not changed here):
-    1. The read path's strand race: a strand that lands between `void_ended_among`'s snapshot and `session.void_stream` still leaves a stale
-       void (microseconds; the same race existed against the table). Closing it needs an unvoid staged in the `Shadow` and `Streamed` strand
-       arms (mirroring `strand_local_tx`), guarded by "no `deleg_void_cut` key at the commit", because a staged unvoid applies after the
-       commit, after a later durable redo in the same rewind may have re-voided the generation; the same ordering question applies to the
-       existing `Local` unvoid.
+    1. A `Local`-only read-path race, older than this fix: a read that took its generations before the root journaled a `Local` end, with its
+       snapshot between that commit and the strand, applies its void after the strand's staged unvoid. Under one snapshot a `Shadow` or
+       `Streamed` strand cannot relist a generation the read voids (the entry is live, so the generation is in the set, or not yet installed,
+       so the generation is still listed). Closing the `Local` race needs the unvoid ordered against a later durable redo of the same rewind.
     2. The `persist_void_cut` crash window: a streamed `RecallCut` confirmed by a segment is skipped by `apply_segment_rows`, and its
        `deleg_void_cut` key is written afterwards in a separate transaction (`Replica::apply_segment`'s `persist_void_cut`). A crash in
        between restarts with the end durable, no key and no outstanding entry: the open voids at the log index, not the record's cut, so
@@ -65589,6 +65588,10 @@ grant leaves; a number outside the block, from any source, is refused. No backwa
        the segment inside `apply_segment_rows`' transaction.
     3. A stored table's `max_gen` also counts a streamed-ahead `Delegate`, so the S-3 bound can sit above the log's; a keyed number below
        such a grant of a later tenure is an orphan of an earlier one, and voiding it matches the orphan rule (ADR-43 text).
+    4. Liveness (ADR-43's orphan-liveness item): a streamed-ahead `Delegate(g)` and `RecallCut(g)` both outstanding at a restart; the open keeps
+       g live, the strand removes the grant, g sits above `max_gen` and nothing voids it, so a dependency on g waits for the rest of the process.
+    5. Latency: the read path decodes each outstanding `Shadow`/`Streamed` row in full (before-images included) while a generation is
+       unreached; bounded by what is outstanding, watch it under load.
 - **What the sweeps do not cover (S-2).** The sim's nodes open one in-memory `Meta` and a simulated restart keeps it (`session().reset()`
   keeps the open-table snapshot, the empty one of the creation): at a restart `ended_before_open` is false and the seeding runs on an empty
   store, so the sim never exercises the restart's restricted lazy void, and "the sweeps match main" (the rows below) does not validate it.

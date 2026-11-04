@@ -2879,6 +2879,9 @@ block.
   never executed one) would still make `deleg_gens_awaiting_end` block that node's
   installs, for the log never ends them; the fix is to strand a delegate's own rows
   of a generation the table dropped after an epoch change.
+  A narrow case joins it: a streamed-ahead `Delegate(g)` and `RecallCut(g)` both outstanding at a restart. The open
+  keeps g live (the set holds it), the strand removes the grant, g sits above the rolled-back `max_gen` and nothing
+  voids it, so a dependency on g waits for the rest of the process.
 - Plan 46 M1.2: `DelegateNode.gen` is minted by the same rule; a sticky grant keeps
   its minting epoch across tenures (the number is the grant's identity, not the
   holder's ownership); `gen_epoch(gen) == my epoch` now says "granted by this
@@ -2918,9 +2921,11 @@ protected only by `at_least` from the log: the same class as a lost journal.
 - A generation whose end only outstanding `Shadow`/`Streamed` speculation carries is held live by the open
   and by the read path until the durable `RecallCut` arrives or the entry strands: a watermark or dependency on
   it waits for the log, where it was refused or passed early. Cost: one scan of the outstanding speculation at the
-  open, and on a read only when unreached generations exist. Open: a strand that lands between the read's
-  snapshot and its `void_stream` still leaves a stale void (microseconds; closing it needs an unvoid staged in the
-  `Shadow` and `Streamed` strand arms, guarded by "no `deleg_void_cut` key at the commit"), and a crash between
+  open, and on a read only when unreached generations exist. Open: a `Local`-only race, older than this
+  change: a read that took its generations before the root journaled a `Local` end and its snapshot between that
+  commit and the strand leaves a void applied after the strand's staged unvoid (under one snapshot a `Shadow` or
+  `Streamed` strand cannot relist a generation the read voids: the entry is live, so the generation is in the set,
+  or not yet installed, so the generation is still listed); and a crash between
   the skipped streamed `RecallCut`'s apply and `persist_void_cut` restarts with the end durable and no key, so the
   open voids at the log index, not the record's cut (over-refusal of dependencies between the two, no reordering).
 - A latent bug on the base the branch moves from (f188c707): the rolled-back
