@@ -31,16 +31,18 @@
 //! of a held one it followed in the journal is still evaluated after it.
 //! Every upper bound an observation takes from a later success (`hi`: the
 //! refusal's window, the read's causal range) counts the successes on a
-//! name in the observed name's scope, and those another sequencer did
-//! not order: another owner's success invoked later can be logged before
-//! rows the observation saw (a delegate's acknowledged rows the root
-//! appends late), and a cut there would drop the observation or its
-//! causal floors. A success the same sequencer ordered as a success in
-//! the scope (keyed by epoch, node and origin generation, `SequencerOf`)
-//! does cut: one sequencer owns several directories (or ranges of an
-//! unsplit one) and orders them in real time, so scoping by name alone
-//! would let two setters of the range hide a floor main found. A success
-//! without a journal entry has no known sequencer and cuts by scope only.
+//! name in the observed name's scope at their own state. A success `c`
+//! out of the scope cuts at the first in-scope success the same
+//! sequencer ordered after `c` (`min{ ib(s) : s in scope, seq(s) = seq(c),
+//! ib(s) > ib(c) }`; keyed by epoch, node and origin generation,
+//! `SequencerOf`), and not at all when there is none: one sequencer owns
+//! several directories (or ranges of an unsplit one) and orders them in
+//! real time, so scoping by name alone would let two setters of the range
+//! hide a floor main found, while another owner's success invoked later
+//! can be logged before rows the observation saw (a delegate's
+//! acknowledged rows the root appends late) and must not drop the
+//! observation or its causal floors. A success without a journal entry
+//! has no known sequencer and cuts by scope only.
 //!
 //! The fallback window is lenient: a success of another scope that
 //! really precedes the refusal in the sequencer's order does not bind it,
@@ -279,40 +281,49 @@ pub fn check_sessions(
     let n_states = successes.len();
     // The latest state an observation of `name` that returned at `after`
     // can show: before every success invoked after it returned that cuts
-    // the range. A success cuts it when it is on a name of the scope
-    // (`Scope::shares`), or when the sequencer that ordered it also
-    // ordered a success on a name of the scope at or after the state
-    // `from` (one sequencer owns several directories, or ranges of an
-    // unsplit one, and orders them in real time: `c` invoked after the
-    // read returned and logged before `s` means the read could not have
-    // seen `s`). Under delegation another sequencer's success invoked
-    // later can be logged before rows the observation saw (a delegate's
-    // acknowledged rows the root appends late), and a cut there drops the
-    // observation or its causal floors: it does not cut. A success
-    // without a journal entry has no known sequencer and cuts only by
-    // scope. `Global` shares every name: the plain cut.
-    let hi_after = |name: &str, after: u64, from: usize| -> usize {
-        let mut seqs: HashSet<(u64, u64, u64)> = HashSet::new();
+    // the range. A success `c` on a name of the scope (`Scope::shares`)
+    // cuts it at its own state. A success `c` out of the scope cuts it at
+    // the first success of the scope that the same sequencer ordered after
+    // `c` (`min{ ib(s) : s in scope, seq(s) = seq(c), ib(s) > ib(c) }`):
+    // one sequencer owns several directories (or ranges of an unsplit one)
+    // and orders them in real time, so `c` invoked after the read returned
+    // and logged before `s` means the read could not have seen `s`; with no
+    // such `s`, `c` does not cut. Under delegation another sequencer's
+    // success invoked later can be logged before rows the observation saw
+    // (a delegate's acknowledged rows the root appends late), and a cut
+    // there drops the observation or its causal floors: it does not cut.
+    // A success without a journal entry has no known sequencer and cuts
+    // only by scope. `Global` shares every name: the plain cut.
+    let hi_after = |name: &str, after: u64| -> usize {
+        let mut scoped: HashMap<(u64, u64, u64), Vec<usize>> = HashMap::new();
         for (b, ib) in &index_of {
-            if *ib >= from
-                && names_of(&invoke[b].1)
-                    .into_iter()
-                    .any(|m| scope.shares(m, name))
+            if names_of(&invoke[b].1)
+                .into_iter()
+                .any(|m| scope.shares(m, name))
             {
-                seqs.extend(sequencer.get(b).copied());
+                if let Some(q) = sequencer.get(b) {
+                    scoped.entry(*q).or_default().push(*ib);
+                }
             }
         }
-        index_of
-            .iter()
-            .filter(|(b, _)| {
-                let (t, op) = &invoke[*b];
-                *t > after
-                    && (names_of(op).into_iter().any(|m| scope.shares(m, name))
-                        || sequencer.get(*b).is_some_and(|q| seqs.contains(q)))
-            })
-            .map(|(_, ib)| *ib)
-            .min()
-            .unwrap_or(n_states)
+        for v in scoped.values_mut() {
+            v.sort_unstable();
+        }
+        let mut hi = n_states;
+        for (b, ib) in &index_of {
+            let (t, op) = &invoke[b];
+            if *t <= after {
+                continue;
+            }
+            if names_of(op).into_iter().any(|m| scope.shares(m, name)) {
+                hi = hi.min(*ib);
+            } else if let Some(v) = sequencer.get(b).and_then(|q| scoped.get(q)) {
+                if let Some(s) = v.get(v.partition_point(|x| x <= ib)) {
+                    hi = hi.min(*s);
+                }
+            }
+        }
+        hi
     };
     // Causal floors (EC2 campaign 7, finding B-1). A session that
     // observed `name` as `want` in some state of `lo..=hi` observed the
@@ -453,7 +464,7 @@ pub fn check_sessions(
                     // invoked after the refusal returned.
                     Some(k) => {
                         report.refusals_placed += 1;
-                        Some((k, hi_after(name, *rt, k.saturating_sub(1)).max(k)))
+                        Some((k, hi_after(name, *rt).max(k)))
                     }
                     // No usable `Refused` row (answered without
                     // journaling, journaled in a fenced segment, another
@@ -485,7 +496,7 @@ pub fn check_sessions(
                         // The latest state the refusal can have been
                         // evaluated at: before every success that cuts
                         // after it returned.
-                        let hi = hi_after(name, *rt, lo.saturating_sub(1));
+                        let hi = hi_after(name, *rt);
                         first_at_or_after(name, lo, want)
                             .filter(|k| *k <= hi)
                             .map(|k| (k, hi))
@@ -538,7 +549,7 @@ pub fn check_sessions(
                 Some(k) => {
                     // The latest state the read can have seen: before
                     // every success invoked after it returned.
-                    let hi = hi_after(&r.name, r.ret, k.saturating_sub(1));
+                    let hi = hi_after(&r.name, r.ret);
                     let causal = causal_floors(&r.name, k, hi, r.present, session);
                     list.push((
                         r.ret,
@@ -1628,7 +1639,10 @@ mod tests {
             );
             assert!(r.violations.is_empty(), "{scope:?}: {r:?}");
         }
-        // Without sequencer entries: the scope alone, as before.
+        // c without a sequencer entry (the others have one): it has no
+        // known sequencer and cuts by scope alone.
+        let mut unknown = root.clone();
+        unknown.remove(&rid(1, 1));
         let r = check_sessions(
             &events,
             &ticks,
@@ -1638,7 +1652,77 @@ mod tests {
             &no_rows,
             &none_j,
             &none_j,
-            &HashMap::new(),
+            &unknown,
+            Scope::Dir,
+        );
+        assert!(r.violations.is_empty(), "{r:?}");
+    }
+
+    /// The sequencer's cut needs an in-scope success it ordered *after*
+    /// `c`. The root orders node 3's `create d2/w` (log 0); `d2` is then
+    /// delegated (generation 7). Node 3's `create d2/x` goes through the
+    /// delegate; node 2's `create d2/x` is refused `EEXIST` with no usable
+    /// row (window lo 1) and returns at tick 4; node 1's `create d1/z`,
+    /// invoked at tick 6 and logged by the root at 1, is followed by no
+    /// root success in `d2`: the delegate's batch lands `d2/x` at 2, after
+    /// it. `c` = `d1/z` does not bound `hi` (the root ordered `d2/w` before
+    /// it, the delegate ordered `d2/x`), so the refusal is placed at state
+    /// 3 and node 2 reading `d2/x` absent is stale. Bounding by `c`'s own
+    /// state (any in-scope success the sequencer ordered at or before it)
+    /// drops the refusal and misses it.
+    #[test]
+    fn a_success_cuts_only_at_the_scope_success_its_sequencer_ordered_after_it() {
+        let events = vec![
+            ev(64, rid(3, 1), Some(NsOp::Create("d2/w".into())), NsRet::Ok),
+            ev(64, rid(3, 1), None, NsRet::Ok),
+            ev(64, rid(3, 2), Some(NsOp::Create("d2/x".into())), NsRet::Ok),
+            ev(32, rid(2, 1), Some(NsOp::Create("d2/x".into())), NsRet::Ok),
+            ev(32, rid(2, 1), None, NsRet::Eexist),
+            ev(64, rid(3, 2), None, NsRet::Ok),
+            ev(16, rid(1, 1), Some(NsOp::Create("d1/z".into())), NsRet::Ok),
+            ev(16, rid(1, 1), None, NsRet::Ok),
+        ];
+        let ticks: Vec<u64> = (0..8).collect();
+        let log: HashMap<Rid, (u64, usize)> = [
+            (rid(3, 1), (1, 0)),
+            (rid(1, 1), (1, 1)),
+            (rid(3, 2), (1, 2)),
+        ]
+        .into_iter()
+        .collect();
+        let seqs: SequencerOf = [
+            (rid(3, 1), (1, 1, 0)),
+            (rid(1, 1), (1, 1, 0)),
+            (rid(3, 2), (1, 1, 7)),
+        ]
+        .into_iter()
+        .collect();
+        let none = HashSet::new();
+        let no_rows = HashMap::new();
+        let r = check_sessions(
+            &events,
+            &ticks,
+            &[read(2, "d2/x", false, 8, 9)],
+            &none,
+            &log,
+            &no_rows,
+            &none_j,
+            &none_j,
+            &seqs,
+            Scope::Dir,
+        );
+        assert_eq!(kinds(&r), vec!["monotonic_reads"], "{r:?}");
+        assert_eq!(r.refusals_windowed, 1);
+        let r = check_sessions(
+            &events,
+            &ticks,
+            &[read(2, "d2/x", true, 8, 9)],
+            &none,
+            &log,
+            &no_rows,
+            &none_j,
+            &none_j,
+            &seqs,
             Scope::Dir,
         );
         assert!(r.violations.is_empty(), "{r:?}");
