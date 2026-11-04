@@ -65423,12 +65423,16 @@ Both leftovers are closed in `check_sessions`; each was a real miss, not only a 
   root appends delegate batches late), so `hi` fell below the state seen: a read of `d2/b` present (state 3), a later `create d1/z` logged
   first (`hi` 0), and a later read of `d2/a` absent was explained by state 0 (no causal floor). The replica that showed `d2/b` holds
   `d2/a` (DESIGN section 6, B-1), so this was a miss. The window shape is the same with a `EEXIST` refusal with no usable row: dropped by
-  `k > hi`. Now `hi_after(name, t, from)` counts the successes on a name of the observed name's scope (`Scope::shares`) and those the same
-  sequencer ordered as a success in that scope at or after the state the observation saw (keyed by epoch, node and origin generation
-  from `seg.origins`, `sequencer_order` in `run.rs`): one sequencer can own several directories (the root's `d1` and `d3`, or two ranges
-  of an unsplit directory) and orders them in real time, so a name-scoped cut alone lost a floor main found (root owns `d1` and `d3`:
-  read of `d1/x` present, a later `create d3/z` logged before a `create d1/x` invoked before the read returned, then a read of `d3/y`
-  absent). `Global` is unchanged.
+  `k > hi`. Now `hi_after(name, t)` bounds the range at each success invoked after the observation returned: a success `c` on a name of the
+  observed name's scope (`Scope::shares`) at its own state; a success `c` out of the scope at the first in-scope success the same
+  sequencer ordered after `c` (`min{ ib(s) : s in scope, seq(s) = seq(c), ib(s) > ib(c) }`; the sequencer is keyed by epoch, node and
+  origin generation from `seg.origins`, `sequencer_order` in `run.rs`), and not at all when there is none. One sequencer can own several
+  directories (the root's `d1` and `d3`, or two ranges of an unsplit directory) and orders them in real time, so a name-scoped cut alone
+  lost a floor main found (root owns `d1` and `d3`: read of `d1/x` present, a later `create d3/z` logged before a `create d1/x` invoked
+  before the read returned, then a read of `d3/y` absent); and a cut by `c` alone is too wide, since nothing makes the in-scope success
+  come after `c` (the root orders `d2/w`, `d2` is delegated, a later `create d1/z` is logged at 1 and the delegate's batch with `d2/x`
+  lands at 2: `z` must not cut the refusal of `d2/x`). A success without a journal entry has no known sequencer and cuts by scope only.
+  `Global` is unchanged.
   Residual, not closed: a stranded acknowledged row replayed by rid after a takeover can still land after a same-scope success invoked
   later (still lenient: a drop, or a misattribution as before in fewer cases).
 - **Raw log order.** Successes were ordered by raw log position; the linearizability and session-order checks use `witness_order`. Inside one
@@ -65448,7 +65452,8 @@ Both leftovers are closed in `check_sessions`; each was a real miss, not only a 
   a read of `f2` present is pushed to the state of the node's later `Rename(f1, f2)` and the following reads are flagged. Replayed
   deterministically: main fails, the fix passes, on the same history. It is a false positive of main like the other five.
 - **Unit tests** (`session.rs`; each fails on the previous checker): `a_success_the_same_sequencer_ordered_in_another_directory_cuts_the_range`
-  (against the name-scoped `hi` alone), `a_read_is_not_cut_by_another_directorys_later_success`,
+  (against the name-scoped `hi` alone), `a_success_cuts_only_at_the_scope_success_its_sequencer_ordered_after_it`
+  (against a cut at `c` itself), `a_read_is_not_cut_by_another_directorys_later_success`,
   `an_unjournaled_refusal_is_not_dropped_by_another_directorys_later_success`, `a_held_row_is_ordered_as_its_tenure_journaled_it`,
   `a_refusal_row_is_ordered_as_its_tenure_journaled_it`.
 - **Open: the flat-inbox window fallback.** An inbox or local refusal is evaluated against the requester's replica and journaled later; its
