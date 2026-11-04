@@ -66099,6 +66099,14 @@ the data's keys, so the session wait did not hold a read of them: a reader on th
   namespace from the log; not the successor's own copy of rows it applied, not a seal snapshot), emptied where a row leaves the
   copy (coverage, drop rules, abandon, hole, settled, epoch drop). One atomic load per read when nothing is held, and no
   member copy decode.
+- Which strands hold: a segment's strand and a deposition's recovery (`Core::recover_deposed` -> `strand_below_epoch`: a
+  deposed root whose successor has not shipped its marker yet moves the row to the copy, and a delegate row appended after it
+  stays visible until the namespace rebuild lands, so reads of its keys wait for the re-ship); the takeover gate, the
+  namespace rebuild and `strand_stale_shadows` do not (no later dependent row stays visible).
+- Commit ordering: adds are made inside the transaction (visible no later than the rollback becomes visible); releases are
+  staged per thread and applied after the transaction committed (`Meta::flush_held_releases`, called where the commit is, and from
+  `report_rolled_back`), each checked against the committed copy, so a reader polling between a release and its commit does not
+  see the marker without its data, and an aborted transaction releases nothing. Pin: `release_tests` in `store/member.rs`.
 - Bound: an entry lapses after `HELD_COPY_MAX_AGE_MS` (5 s on the node's wait clock, well above the 35-350 ms re-ship latency measured under slow S3), and
   the session wait (2 s) degrades a read before that. A row that never leaves the copy (the `backup-crash-slow` seed 840 leak)
   therefore cannot stall reads for good. Not persisted: a crash inside the re-ship window reopens the gap until the re-ship
