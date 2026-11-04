@@ -838,11 +838,14 @@ pub enum Payload {
     /// The member's answer: `txs` is postcard of `Vec<BackupTx>` (a batch
     /// of `backup_batch_rows`; `next`: ask again from there), `through`
     /// the last journal seq of its contiguous hold; `held: false`: it
-    /// holds no tail of the epoch.
+    /// holds no tail of the epoch; `empty` (with `held: false`): it holds
+    /// no row of the epoch at all, provably (plan 46 M0.3 G; never the
+    /// default answer of a node that cannot ask its core).
     SealedTail {
         req_id: u64,
         epoch: u64,
         held: bool,
+        empty: bool,
         txs: Vec<u8>,
         through: u64,
         next: Option<u64>,

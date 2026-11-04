@@ -1033,11 +1033,17 @@ pub enum PeerMsg {
     /// The answer, in batches of `backup_batch_rows` (`next`: ask again
     /// from there). `held: false`: this node holds no tail of `epoch` (it
     /// was not a member, or is not any more); `through`: the last journal
-    /// seq of the contiguous hold.
+    /// seq of the contiguous hold. `empty` (with `held: false` only, plan
+    /// 46 M0.3 G): the refusal is a fact, not a failure to answer — this
+    /// node holds no row of `epoch` anywhere (no unshipped journal row of
+    /// it, no backup role, tail or member copy of it) and holds no lease
+    /// it could acknowledge more under. A claim whose every source says so
+    /// has the whole tail: nothing.
     SealedTail {
         req: OpId,
         epoch: Epoch,
         held: bool,
+        empty: bool,
         txs: Vec<BackupTx>,
         through: u64,
         next: Option<u64>,

@@ -305,6 +305,7 @@ impl constellation_net::PeerService for P2pBridge {
                 req_id,
                 epoch,
                 held: false,
+                empty: false,
                 txs: Vec::new(),
                 through: 0,
                 next: None,
@@ -324,10 +325,11 @@ impl constellation_net::PeerService for P2pBridge {
                 return none;
             }
             match receive.await {
-                Ok((held, txs, through, next)) => constellation_net::Payload::SealedTail {
+                Ok((held, empty, txs, through, next)) => constellation_net::Payload::SealedTail {
                     req_id,
                     epoch,
                     held,
+                    empty,
                     txs: postcard::to_allocvec(&txs).unwrap_or_default(),
                     through,
                     next,

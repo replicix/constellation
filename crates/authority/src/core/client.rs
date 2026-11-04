@@ -111,6 +111,10 @@ pub(crate) struct ClientOp {
     /// `NotHolder` redirects followed (plan 30 §M11: two, since a
     /// delegate's names the root and the root's a delegate).
     pub redirected: u32,
+    /// Plan 46 M0.3 (B): the root that last answered this op `Held` (it is
+    /// alive and holds the op by design): the backoff retry goes back to
+    /// it when this node's cached holder was dropped meanwhile.
+    pub held_by: Option<NodeId>,
     /// Sent to a holder at least once (or into an inbox): it may have
     /// taken effect there, so every later local execution first checks
     /// `completed`.
@@ -612,6 +616,7 @@ impl Core {
                 keys,
                 attempts: 0,
                 redirected: 0,
+                held_by: None,
                 forwarded: in_doubt,
                 acquire_retries: 0,
                 deadline,
@@ -1564,6 +1569,9 @@ impl Core {
                 if let Some(c) = self.clients.get_mut(&rid) {
                     c.phase = Phase::Backoff;
                     c.timer = Some(timer);
+                    // (A delegate's `Held` names no root: `gen == 0` only,
+                    // as for the cached holder above.)
+                    c.held_by = (gen == 0).then_some(from);
                 }
                 // Only an acknowledgement waiting for durability that
                 // needs this node's chunks says `Upload`; a recall's, a
@@ -1794,6 +1802,7 @@ impl Core {
             return;
         }
         c.timer = None;
+        let held_by = c.held_by.take();
         // (A settle has no effect to order after this node's replays.)
         let settle = c.settle;
         if !settle && self.hold_for_lost_deps(now, rid, replica, out) {
@@ -1831,7 +1840,19 @@ impl Core {
                 }
             }
         }
-        let cached = self.lease.cached_holder.filter(|h| *h != self.cfg.node_id);
+        // Plan 46 M0.3 (B): an op the root answered `Held` is asked again
+        // there, also when this node dropped its cached holder meanwhile
+        // (another request's refusal, such as a read or lock request the
+        // re-adopting root answered naming no holder). The route instead read the lease (slow), sent
+        // the op to the lease path and its settle outlasted its window while
+        // the root, reachable all along, answered every other node's
+        // (`backup-strict` 1551 with slow lease reads). The rid is the same:
+        // the root answers it from its dedup, or holds it again.
+        let cached = self
+            .lease
+            .cached_holder
+            .or(held_by)
+            .filter(|h| *h != self.cfg.node_id);
         match cached {
             Some(holder) if self.reaches(now, holder) => {
                 self.send_forward(now, rid, holder, replica, out)

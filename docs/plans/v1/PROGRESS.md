@@ -65931,3 +65931,53 @@ The orphan-rows item of the ADR-43 section ("Not closed") is closed for the oper
   extension).
 - **Still open**: the lone-root takeover path; the N4 restart dependency wait; the claimant that was the orphan's delegate (its own
   rows of the generation survive its takeover, since its own marker does not run through the segment path).
+
+## G and B: a refused tail that proves nothing is held, a held settle asked again (fixed, 2026-11-04; plan 46 M0.3)
+
+The two product causes the re-trace of cause 6 reported (maintainer: fix both now), each confirmed on main 7a3122d9 with
+its seed and pinned under `+unsettled` (`m03_g_and_b_a_refused_tail_and_a_held_settle_leave_no_unsettled_eio`; fails with
+I4 on the parent).
+
+- **G, the group-tail wait** (`backup-crash` 24, `backup-strict` 115): the holder restarted with its journal and nothing of
+  its epoch unshipped; every member refused the claimant's `SealTail` (`held: false`), the claimant ignored refusals and
+  waited out the settle window. A refusal now says whether it is a fact: `SealedTail::empty` (wire `Payload::SealedTail`
+  too) is set only when the member holds no lease (held, lost, or in a continuation epoch), no role of the epoch, and its
+  journal, backup tail and member copies carry nothing of it, every read succeeding (`Core::holds_nothing_of`; a failed
+  read, a role at another version, a live holder of another epoch all say no). The claimant goes on only when *every*
+  source answered, about the epoch it was asked for, from the node asked, with `empty`; a source that said nothing,
+  failed, refused without proof or answered for another node or epoch keeps the wait (`TailFetch::unproven`). Write-all
+  puts every acknowledged row on each member, so the tail is then complete and empty; the claim goes on as with a member
+  that answered `held` with no rows (`tail_fetch_complete` with an empty tail: no inherited tail named, no
+  `ttl_claims_without_tail`). The member seals nothing for an empty answer; a holder that re-adopts afterwards moves the
+  lease's tag, and the claim's CAS, conditioned on the read that named the group, fails. A `SealedTail` from a node also
+  ends its P2P outage (`note_p2p_result`), so the requester forwards to the restarted holder again. Counters:
+  `seal_tail_empty`, `tail_fetch_proved_empty`.
+- **B, a held settle never asked again** (`backup-strict` 1551 with slow lease reads): node 3's settle was answered `Held`
+  by the re-adopting root 1; between that answer and the backoff another request's refusal dropped node 3's cached
+  holder (`cached_holder` was `None` at the retry), and the backoff retry went to the route: a slow lease read, the lease path, `Busy`, and `EIO` at 12.15 s while
+  root 1 answered node 2's settles at 10.08 s. The root's `Held` (`gen == 0`) is remembered on the op
+  (`ClientOp::held_by`) and the backoff retry goes back to it when the cache is empty. The same rid goes to the same root,
+  as any `Held` retry did: it answers from its dedup or holds it again (no second execution).
+
+Unit tests (fail on the parent: the claim waited, the retry read the lease): `a_claim_whose_every_member_holds_nothing_goes_on`,
+`an_op_held_by_the_root_is_asked_again_there`; the integrity side: `a_claim_waits_unless_every_member_proves_it_holds_nothing`,
+`a_member_says_it_holds_nothing_only_when_it_proves_it`.
+
+Sweeps, 2,000 seeds, base 7a3122d9 vs the fix, unsettled violations (failing seeds identical; no violation new on the fix,
+every change a removal):
+
+| Configuration | no knob | knob |
+|---|---|---|
+| backup-crash | 5 -> 0 | 7 -> 7 |
+| backup-strict | 11 -> 2 | 46 -> 45 |
+| long-backup | 2 -> 0 | 26 -> 25 |
+| delegated-group-switch | 7 -> 7 | 39 -> 39 (failing [1525] both, the known I4 late landing) |
+
+The knob's remaining lease-path violations in these configurations are not G or B (no tail wait in the replays sampled:
+`backup-crash` 57, 880, 1278 are C or O); `backup-strict`'s two left without the knob are seed 1259 ("Itself", the in-gate
+class). The ratchet: seeds 0..99 without the knob measured base and fix for every ceiling configuration; only
+`backup-crash` moved (1 to 0). `backup-crash` and `long-backup` (0 of 2,000 without the knob) move to the strict list; no
+ceiling raised.
+
+Gates: fmt, clippy `--workspace --all-targets -D warnings`, authority lib (1,017), net lib (127), engine lib (948), the
+release sim suite (382 passed, 0 failed).

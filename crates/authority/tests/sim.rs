@@ -16058,7 +16058,7 @@ fn m03_the_configurations_without_an_unsettled_eio_run_strict() {
 #[test]
 fn m03_the_configurations_at_zero_violations_stay_there() {
     type Config = fn() -> SimConfig;
-    let strict_configs: [(&str, Config); 16] = [
+    let strict_configs: [(&str, Config); 18] = [
         ("delegated-crash", delegated_crash_config),
         // (0 of 2,000 seeds `+unsettled` after S5, ADR-42; 1 violation in
         // seeds 0..100 before.)
@@ -16083,12 +16083,15 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         ("long-sessions", long_sessions_config),
         ("shared-dir-faults", shared_dir_faults_config),
         ("tloss-two-node", tloss_two_node_config),
+        // (Plan 46 M0.3 G and B: 0 of 2,000 seeds `+unsettled` without the
+        // knob, 5 and 2 violations before.)
+        ("backup-crash", backup_crash_config),
+        ("long-backup", long_backup_config),
     ];
     // (label, config, violations, allowed unsettled EIOs in seeds 0..100 when
     // the list was set; lowered where seeds 0..99 of the 2,000-seed sweeps of
     // 2026-11-04, the re-trace of cause 6, measured less; never raised)
-    let ceilings: [(&str, Config, usize, usize); 16] = [
-        ("backup-crash", backup_crash_config, 1, 0),
+    let ceilings: [(&str, Config, usize, usize); 14] = [
         ("backup-strict", backup_strict_config, 0, 0),
         ("backup-two", backup_two_config, 0, 0),
         (
@@ -16124,7 +16127,6 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             0,
         ),
         ("flex-crash", flex_crash_config, 125, 9),
-        ("long-backup", long_backup_config, 0, 0),
         ("long-delegated", long_delegated_config, 0, 0),
         ("long-delegated-backup", long_delegated_backup_config, 5, 1),
         (
@@ -16256,6 +16258,44 @@ fn m03_the_settle_causes_s1_to_s3_leave_no_unsettled_eio_in_these_seeds() {
             "long-delegated-late-answers",
             long_delegated_late_answers_config(),
             vec![13],
+        ),
+    ];
+    for (label, cfg, seeds) in cases {
+        for seed in seeds {
+            run_seed(seed, strict(cfg.clone(), "unsettled")).unwrap_or_else(|e| {
+                panic!(
+                    "{label}+unsettled seed {seed}: {e}\n  replay with \
+                     AUTHORITY_SIM_CONFIG={label}+unsettled"
+                )
+            });
+        }
+    }
+}
+
+/// Plan 46 M0.3, the re-trace of cause 6's buckets G and B, under the strict
+/// form (`+unsettled`). G: the holder restarted with its journal and nothing
+/// of its epoch unshipped, every member of the group refused the claimant's
+/// `SealTail`, and the claim ignored the refusals and waited out the settle
+/// window (`backup-crash` 24, `backup-strict` 115): a refusal now says
+/// whether the member holds nothing of the epoch, and a claim whose every
+/// source says so goes on. B: a settle the re-adopting root answered `Held`
+/// went to the lease path (slow reads) once another request's refusal dropped the
+/// cached holder, and was never sent to the root again (`backup-strict` 1551
+/// with slow lease reads): the backoff retry goes back to the root that held
+/// it. Each fails with I4 on the parent (7a3122d9) and passes now.
+#[test]
+fn m03_g_and_b_a_refused_tail_and_a_held_settle_leave_no_unsettled_eio() {
+    let slow = |cfg: SimConfig| SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..cfg
+    };
+    let cases: Vec<(&str, SimConfig, Vec<u64>)> = vec![
+        ("backup-crash", backup_crash_config(), vec![24]),
+        ("backup-strict", backup_strict_config(), vec![115]),
+        (
+            "backup-strict (slow lease reads)",
+            slow(backup_strict_config()),
+            vec![1551],
         ),
     ];
     for (label, cfg, seeds) in cases {

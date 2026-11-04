@@ -1247,6 +1247,7 @@ pub trait PeerService: Send + Sync + 'static {
                 req_id,
                 epoch,
                 held: false,
+                empty: false,
                 txs: Vec::new(),
                 through: 0,
                 next: None,

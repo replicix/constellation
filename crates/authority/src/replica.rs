@@ -669,6 +669,9 @@ pub trait Replica {
         from: u64,
     ) -> Option<Vec<BackupTx>>;
     fn member_copy(&self, epoch: Epoch) -> Option<(u64, Vec<BackupTx>)>;
+    /// Plan 46 M0.3 (G): whether a member copy of `epoch` is held; `None`:
+    /// the store could not be read (not "none held").
+    fn member_copy_held(&self, epoch: Epoch) -> Option<bool>;
     /// Plan 43 C1-4: whether a member copy carries a transaction of `rid`.
     fn member_copy_carries(&self, rid: Rid) -> bool;
     /// How many rows the member copies hold.
@@ -1806,6 +1809,10 @@ impl Replica for Meta {
             .ok()
             .flatten()
             .map(|(info, txs)| (info.config_version, txs))
+    }
+
+    fn member_copy_held(&self, epoch: Epoch) -> Option<bool> {
+        Meta::member_copy(self, epoch).ok().map(|c| c.is_some())
     }
 
     fn member_copy_epochs(&self) -> Vec<Epoch> {

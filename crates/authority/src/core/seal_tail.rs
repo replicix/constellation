@@ -62,6 +62,11 @@ pub(crate) struct TailFetch {
     pub chosen: Option<Chosen>,
     /// The timer that ends this attempt.
     pub timer: Option<TimerId>,
+    /// Plan 46 M0.3 (G): a source that did not prove it holds nothing of
+    /// its epoch (it said nothing, failed, or refused without `empty`).
+    /// While none did, a claim whose every source answered `empty` has the
+    /// whole tail (nothing) and goes on without waiting out its window.
+    pub unproven: bool,
 }
 
 /// The member a tail is being pulled from.
@@ -119,6 +124,23 @@ const WARN_EVERY_MS: u64 = 60_000;
 
 impl Core {
     // ------------------------------------------------ the member's side
+
+    /// Plan 46 M0.3 (G): whether this node holds no row of `epoch` a
+    /// claimant could need, and can acknowledge none: no lease held or lost
+    /// (a live holder of `epoch` may hold rows it has not journaled as
+    /// shipped, a deposed one has not stranded yet), no role of `epoch`, and
+    /// its journal, backup tail and member copies carry nothing of it. Any
+    /// read that fails says no. Only asked after [`Self::seal_tail_hold`]
+    /// refused (nothing to seal).
+    fn holds_nothing_of(&self, epoch: Epoch, replica: &dyn Replica) -> bool {
+        self.lease.held.is_none()
+            && !self.lease.lost
+            && !self.lease.epoch_held()
+            && self.bk.role.is_none_or(|r| r.epoch != epoch)
+            && replica.journal_has_epoch_rows(epoch) == Some(false)
+            && replica.backup_tail(epoch).is_some_and(|t| t.is_empty())
+            && replica.member_copy_held(epoch) == Some(false)
+    }
 
     /// The rows of `epoch` this node can hand a claimant that seals it, and
     /// the last journal seq of its contiguous hold; sealing first. `None`:
@@ -234,6 +256,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let reply = |held: bool,
+                     empty: bool,
                      txs: Vec<BackupTx>,
                      through: u64,
                      next: Option<u64>,
@@ -244,6 +267,7 @@ impl Core {
                     req,
                     epoch,
                     held,
+                    empty,
                     txs,
                     through,
                     next,
@@ -260,11 +284,15 @@ impl Core {
                 return;
             }
             self.stats.seal_tail_refused += 1;
-            reply(false, Vec::new(), 0, None, out);
+            let empty = self.holds_nothing_of(epoch, replica);
+            if empty {
+                self.stats.seal_tail_empty += 1;
+            }
+            reply(false, empty, Vec::new(), 0, None, out);
             return;
         };
         let (batch, next) = batch_of(&txs, from_seq, self.cfg.backup_batch_rows.max(1));
-        reply(true, batch, through, next, out);
+        reply(true, false, batch, through, next, out);
     }
 
     // ------------------------------------------------ the claimant's side
@@ -319,6 +347,7 @@ impl Core {
             asked: BTreeMap::new(),
             chosen: None,
             timer: None,
+            unproven: false,
         };
         let round = self.op_id();
         let at = now.wait.plus(self.cfg.backup_takeover_ms.max(1));
@@ -333,7 +362,12 @@ impl Core {
                 // epoch, a role of it): asked in place.
                 let own = self.seal_tail_hold(now, node, epoch, config_version, replica, out);
                 // (Unreadable: not chosen; the other members are asked.)
-                self.bk.seal_unreadable = false;
+                let unreadable = std::mem::take(&mut self.bk.seal_unreadable);
+                if own.is_none() && (unreadable || !self.holds_nothing_of(epoch, replica)) {
+                    if let Some(tf) = self.bk.tf.as_mut() {
+                        tf.unproven = true;
+                    }
+                }
                 if let Some((txs, through)) = own {
                     if let Some(tf) = self.bk.tf.as_mut() {
                         tf.asked.clear();
@@ -365,6 +399,47 @@ impl Core {
                 },
             });
         }
+        self.tail_fetch_if_proved_empty(now, replica, out);
+    }
+
+    /// Plan 46 M0.3 (G): every source of this attempt answered, none holds
+    /// a row of the epoch it was asked for, and each proved it (`empty`: no
+    /// journal row, role, tail or member copy of it, and no lease to
+    /// acknowledge more under). Write-all puts every row the group
+    /// acknowledged on each member, so the tail is complete, and empty: the
+    /// claim goes on at once, as with a member that answered `held` with no
+    /// rows, instead of waiting out its window for an answer no member can
+    /// give (`backup-crash` 24: the holder restarted with nothing of its
+    /// epoch unshipped, every member refused, and the claim waited the
+    /// whole settle window out). A source that said nothing, failed, or
+    /// refused without proof (`unproven`) keeps the wait.
+    fn tail_fetch_if_proved_empty(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(tf) = self.bk.tf.as_ref() else {
+            return;
+        };
+        if tf.chosen.is_some() || !tf.asked.is_empty() || tf.unproven {
+            return;
+        }
+        let ch = Chosen {
+            node: tf.prev.holder,
+            epoch: tf.prev.epoch,
+            config_version: tf.prev.config_version,
+            req: OpId(0),
+            txs: Vec::new(),
+            through: 0,
+        };
+        self.stats.tail_fetch_proved_empty += 1;
+        tracing::info!(
+            node = self.cfg.node_id,
+            epoch = ch.epoch,
+            "every member of the lease's group holds nothing of its tail: the claim goes on"
+        );
+        self.tail_fetch_complete(now, ch, replica, out);
     }
 
     /// A member answered a `SealTail` of this claim.
@@ -376,6 +451,7 @@ impl Core {
         req: OpId,
         epoch: Epoch,
         held: bool,
+        empty: bool,
         txs: Vec<BackupTx>,
         through: u64,
         next: Option<u64>,
@@ -409,7 +485,14 @@ impl Core {
                 };
                 if node != from || e != epoch || !held {
                     // Not a member that holds it: the others may; when
-                    // none does the attempt ends at its timer.
+                    // none does the attempt ends at its timer — unless
+                    // every source proved it holds nothing (plan 46 M0.3
+                    // G): the answer must be the asked member's, about the
+                    // epoch it was asked for.
+                    if node != from || e != epoch || !empty {
+                        tf.unproven = true;
+                    }
+                    self.tail_fetch_if_proved_empty(now, replica, out);
                     return;
                 }
                 tf.asked.clear();
@@ -495,6 +578,8 @@ impl Core {
             return false;
         };
         if tf.asked.remove(&req).is_some() {
+            // (Not an answer: the attempt waits for its timer.)
+            tf.unproven = true;
             return true;
         }
         if tf.chosen.as_ref().is_some_and(|c| c.req == req) {

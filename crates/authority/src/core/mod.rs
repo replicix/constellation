@@ -1621,10 +1621,16 @@ pub struct Stats {
     pub backup_seal_unread_reads: u64,
     pub seal_tail_backup: u64,
     pub seal_tail_refused: u64,
+    /// Plan 46 M0.3 (G): of those, refusals that proved this node holds
+    /// nothing of the epoch (`SealedTail::empty`).
+    pub seal_tail_empty: u64,
     /// A listed backup that claimed at the expiry and sealed its role first.
     pub claim_seals: u64,
     pub tail_fetch_attempts: u64,
     pub tail_fetches: u64,
+    /// Plan 46 M0.3 (G): of those, claims whose every source proved it
+    /// holds nothing of the tail (the claim went on with an empty one).
+    pub tail_fetch_proved_empty: u64,
     pub inherited_tail_fetches: u64,
     pub tail_fetch_wait_ms_total: u64,
     pub groups_abandoned: u64,
@@ -2923,12 +2929,19 @@ impl Core {
                 req,
                 epoch,
                 held,
+                empty,
                 txs,
                 through,
                 next,
-            } => self.on_sealed_tail(
-                now, from, req, epoch, held, txs, through, next, replica, out,
-            ),
+            } => {
+                // Plan 46 M0.3 (G): a member that answers is up. A restarted
+                // holder heard from here is reachable again for this node's
+                // forwards and settles (which make it re-adopt its lease).
+                self.note_p2p_result(now, from, true);
+                self.on_sealed_tail(
+                    now, from, req, epoch, held, empty, txs, through, next, replica, out,
+                )
+            }
             PeerMsg::DelegRecalled {
                 req,
                 gen,

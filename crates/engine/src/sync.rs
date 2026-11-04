@@ -105,9 +105,16 @@ impl From<SyncFailure> for String {
 }
 
 /// Plan 43 C1-3: what a member answers a `SealTail` with: whether it holds
-/// the tail, a batch of it, the last journal seq of its contiguous hold,
-/// and where the next batch starts.
-pub type SealTailAnswer = (bool, Vec<constellation_meta::BackupTx>, u64, Option<u64>);
+/// the tail, whether it proved it holds nothing of the epoch (plan 46 M0.3
+/// G), a batch of it, the last journal seq of its contiguous hold, and
+/// where the next batch starts.
+pub type SealTailAnswer = (
+    bool,
+    bool,
+    Vec<constellation_meta::BackupTx>,
+    u64,
+    Option<u64>,
+);
 
 /// A request to the daemon's sync task — the authority core's driver
 /// (`crate::authority_driver`), which turns each into a core event.

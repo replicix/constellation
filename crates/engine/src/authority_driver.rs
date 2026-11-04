@@ -4910,13 +4910,14 @@ impl Driver {
             PeerMsg::SealedTail {
                 req,
                 held,
+                empty,
                 txs,
                 through,
                 next,
                 ..
             } if self.seal_tail_replies.contains_key(&(to, req)) => {
                 if let Some(tx) = self.seal_tail_replies.remove(&(to, req)) {
-                    let _ = tx.send((held, txs, through, next));
+                    let _ = tx.send((held, empty, txs, through, next));
                 }
             }
             // Plan 43 C1-3: this node, a claimant, asks a member.
@@ -4956,6 +4957,7 @@ impl Driver {
                             req_id,
                             epoch,
                             held,
+                            empty,
                             txs,
                             through,
                             next,
@@ -4967,6 +4969,7 @@ impl Driver {
                                     req,
                                     epoch,
                                     held,
+                                    empty,
                                     txs,
                                     through,
                                     next,

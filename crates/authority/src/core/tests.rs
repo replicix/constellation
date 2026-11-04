@@ -13277,6 +13277,64 @@ fn a_held_forward_executes_locally_once_the_delegation_installs() {
     assert!(h.meta.child_ino(dir, "f").unwrap().is_some());
 }
 
+/// Plan 46 M0.3 (B): an op the root answered `Held` is asked again at that
+/// root when the backoff runs out, also when this node dropped its cached
+/// holder meanwhile (another request's refusal naming no holder).
+/// Fails on the parent: the retry read the lease instead (`LearnHolder`),
+/// slow, and a settle so held outlasted its window while the root, reachable
+/// all along, answered every other node's (`backup-strict` 1551 with slow
+/// lease reads).
+#[test]
+fn an_op_held_by_the_root_is_asked_again_there() {
+    let mut h = Harness::new(3);
+    h.core.cfg.p2p = true;
+    h.core.cfg.forwarding = true;
+    h.core.lease.cached_holder = Some(2);
+    let rid = h.rid(1);
+    let op = h.create("f");
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+        tag: Default::default(),
+    });
+    let Some((2, PeerMsg::MutateRequest { req, .. })) = sends(&out).first().copied() else {
+        panic!("no forward to the root: {out:?}");
+    };
+    let req = *req;
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::MutateReply {
+            req,
+            outcome: MutateOutcome::Held { retry_ms: 50 },
+            base: None,
+            position: constellation_meta::Position::ZERO,
+            gen: 0,
+            own_chunks: OwnChunks::None,
+            own_rows: None,
+            committed: false,
+        },
+    });
+    let backoff = timers(&out, TimerKind::ForwardBackoff);
+    assert_eq!(backoff.len(), 1, "{out:?}");
+    // Another request's refusal drops the cache meanwhile.
+    h.core.lease.cached_holder = None;
+    h.advance(100);
+    let out = h.step(Event::Timer { id: backoff[0] });
+    assert!(
+        sends(&out)
+            .iter()
+            .any(|(to, m)| *to == 2 && matches!(m, PeerMsg::MutateRequest { .. })),
+        "not asked again at the root: {out:?}"
+    );
+    assert!(
+        s3_ops(&out)
+            .iter()
+            .all(|(_, r)| !matches!(r, S3Op::LeaseGet)),
+        "{out:?}"
+    );
+}
+
 /// A lease object for the takeover tests below.
 fn lease_of(holder: NodeId, epoch: Epoch, expires_unix_ms: i64) -> Lease {
     Lease {
@@ -49143,6 +49201,7 @@ mod c1_tail_fetch {
                 req,
                 epoch,
                 held: true,
+                empty: false,
                 txs,
                 through,
                 next: None,
@@ -49819,6 +49878,7 @@ mod c1_tail_fetch {
                 req: req2,
                 epoch: 1,
                 held: true,
+                empty: false,
                 txs: first.to_vec(),
                 through: txs.last().unwrap().last,
                 next: Some(rest[0].first),
@@ -49838,6 +49898,7 @@ mod c1_tail_fetch {
                 req: more[0].1,
                 epoch: 1,
                 held: true,
+                empty: false,
                 txs: rest.to_vec(),
                 through: txs.last().unwrap().last,
                 next: None,
@@ -49870,6 +49931,7 @@ mod c1_tail_fetch {
                 req,
                 epoch: 1,
                 held: true,
+                empty: false,
                 txs: txs.to_vec(),
                 through,
                 next,
@@ -50395,6 +50457,176 @@ mod c1_tail_fetch {
             l.inherited_tail = None;
         }
         assert_eq!(h.core.backup_candidacies(), vec![(2, 9)]);
+    }
+
+    /// Plan 46 M0.3 (G): each `SealedTail` sent in `out`, as (to, held, empty).
+    fn sealed_empty(out: &[Action]) -> Vec<(NodeId, bool, bool)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::SealedTail { held, empty, .. } => Some((to, *held, *empty)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn refusal(from: NodeId, req: OpId, epoch: Epoch, empty: bool) -> Event {
+        Event::Peer {
+            from,
+            msg: PeerMsg::SealedTail {
+                req,
+                epoch,
+                held: false,
+                empty,
+                txs: Vec::new(),
+                through: 0,
+                next: None,
+            },
+        }
+    }
+
+    fn no_cas(out: &[Action]) -> bool {
+        s3_ops(out)
+            .iter()
+            .all(|(_, r)| !matches!(r, S3Op::LeaseSwap { .. }))
+    }
+
+    /// Plan 46 M0.3 (G), the member's side: a refusal says `empty` only when
+    /// the node holds nothing of the epoch and no lease. A node with nothing
+    /// (a holder restarted with nothing of its epoch unshipped, a member
+    /// whose copy is gone) says so, and so does a backup asked for an epoch
+    /// other than its role's; a backup with a role of the epoch at a newer
+    /// version than asked (it holds rows) and a live holder asked for
+    /// another epoch (it may acknowledge more) do not.
+    #[test]
+    fn a_member_says_it_holds_nothing_only_when_it_proves_it() {
+        // Nothing at all.
+        let mut h = Harness::new(2);
+        let out = seal_tail(&mut h, 3, 1, 2, 0);
+        assert_eq!(sealed_empty(&out), vec![(3, false, true)], "{out:?}");
+        assert_eq!(h.core.bk.sealed, 0, "an empty refusal seals nothing");
+        assert_eq!(h.core.stats.seal_tail_empty, 1);
+        // A backup of epoch 3 (version 4).
+        let mut b = Harness::new(2);
+        b.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(1),
+                epoch: 3,
+                holder: 1,
+                config_version: 4,
+                candidacy: 1,
+                from: 1,
+                txs: tail_of(1),
+                through: 0,
+                sent_ms: 0,
+                expires_ms: 0,
+                clock: 0,
+            },
+        });
+        // Asked at an older version: refused, but it holds the epoch's rows.
+        let out = seal_tail(&mut b, 3, 3, 3, 0);
+        assert_eq!(sealed_empty(&out), vec![(3, false, false)], "{out:?}");
+        // Asked for an epoch it holds nothing of: says so.
+        let out = seal_tail(&mut b, 3, 2, 4, 0);
+        assert_eq!(sealed_empty(&out), vec![(3, false, true)], "{out:?}");
+        // A live holder of epoch 1 asked for epoch 2: refused, not empty.
+        let (mut l, _) = listed_holder();
+        let out = seal_tail(&mut l, 3, 2, 2, 0);
+        assert_eq!(sealed_empty(&out), vec![(3, false, false)], "{out:?}");
+        assert!(l.core.lease.held.is_some(), "not deposed");
+    }
+
+    /// Plan 46 M0.3 (G): every member of the old group answers that it holds
+    /// nothing of the epoch (`empty`): the tail is complete (write-all) and
+    /// empty, and the claim goes on at once — tail to head, then its CAS —
+    /// as with a member that answered `held` with no rows, naming no tail in
+    /// the lease it writes. Fails on the parent: a refusal was ignored and
+    /// the claim waited out its window, attempt after attempt
+    /// (`backup-crash` 24, `backup-strict` 115).
+    #[test]
+    fn a_claim_whose_every_member_holds_nothing_goes_on() {
+        let h0 = Harness::new(3);
+        let lease = expired(&h0, vec![2]);
+        let (mut h, out) = claimant(3, &lease);
+        let asked = seal_tails(&out);
+        assert_eq!(asked.len(), 2);
+        let out = h.step(refusal(asked[0].0, asked[0].1, 1, true));
+        assert!(no_cas(&out), "one member is not the group: {out:?}");
+        assert!(
+            s3_ops(&out)
+                .iter()
+                .all(|(_, r)| !matches!(r, S3Op::SegmentRun { .. })),
+            "{out:?}"
+        );
+        let out = h.step(refusal(asked[1].0, asked[1].1, 1, true));
+        assert_eq!(h.core.stats.tail_fetch_proved_empty, 1);
+        let tail = find_s3(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        let out = at_head(&mut h, out);
+        let lease_written = s3_ops(&out)
+            .into_iter()
+            .find_map(|(_, r)| match r {
+                S3Op::LeaseSwap { lease, .. } => Some(lease.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no CAS in {out:?}"));
+        assert_eq!(lease_written.epoch, 2);
+        assert_eq!(lease_written.inherited_tail, None, "nothing to re-ship");
+        assert_eq!(h.core.stats.ttl_claims_without_tail, 0);
+    }
+
+    /// Plan 46 M0.3 (G), the integrity side: the claim goes on only when
+    /// *every* source proved it holds nothing of the epoch it was asked
+    /// for. A refusal without proof, a source that never answers, an answer
+    /// from another node than the one asked, or about another epoch, keeps
+    /// the wait: no CAS, and the attempt ends at its timer.
+    #[test]
+    fn a_claim_waits_unless_every_member_proves_it_holds_nothing() {
+        type Second = fn(&mut Harness, NodeId, OpId) -> Vec<Action>;
+        let cases: [(&str, Second); 4] = [
+            ("a refusal without proof", |h, to, req| {
+                h.step(refusal(to, req, 1, false))
+            }),
+            ("no answer", |h, to, req| {
+                h.step(Event::PeerFailed {
+                    req,
+                    to,
+                    outage: true,
+                })
+            }),
+            ("another node's answer", |h, _, req| {
+                h.step(refusal(4, req, 1, true))
+            }),
+            ("another epoch", |h, to, req| {
+                h.step(refusal(to, req, 2, true))
+            }),
+        ];
+        for (what, second) in cases {
+            let h0 = Harness::new(3);
+            let lease = expired(&h0, vec![2]);
+            let (mut h, out) = claimant(3, &lease);
+            let wake = timers(&out, TimerKind::JobRequestTimeout)[0];
+            let asked = seal_tails(&out);
+            let first = h.step(refusal(asked[0].0, asked[0].1, 1, true));
+            let then = second(&mut h, asked[1].0, asked[1].1);
+            assert!(no_cas(&first) && no_cas(&then), "{what}: {then:?}");
+            assert!(
+                s3_ops(&then)
+                    .iter()
+                    .all(|(_, r)| !matches!(r, S3Op::SegmentRun { .. })),
+                "{what}: {then:?}"
+            );
+            assert_eq!(h.core.stats.tail_fetch_proved_empty, 0, "{what}");
+            h.advance(h.core.cfg.backup_takeover_ms);
+            let out = h.step(Event::Timer { id: wake });
+            assert!(no_cas(&out), "{what}: {out:?}");
+            assert_eq!(h.core.stats.tail_fetches, 0, "{what}");
+            assert!(h.core.bk.tf.is_none(), "{what}: the attempt ended");
+        }
     }
 }
 
