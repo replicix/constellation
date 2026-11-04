@@ -930,6 +930,12 @@ lease and one log
   of a generation, which carries its cut (`through`: the rows the root
   appended), so every replica reads it from the log and none infers it.
   Delegations never overlap and never nest.
+  A generation number is minted by the root tenure that grants it and
+  carries its epoch (`gen = epoch << 32 | n`, `n` from the node's counter,
+  synced before the grant leaves), so two tenures (one of them deposed
+  without knowing it) never mint the same number, and nothing a node keeps
+  of a grant the log never carried is read as another grant's
+  ([ADR-43](DECISIONS.md#adr-43-a-generation-number-carries-the-epoch-of-the-tenure-that-minted-it)).
   A grant lasts `CONSTELLATION_DELEGATION_TTL_MS` (5 s), is renewed by the
   delegate, and is capped by the root lease. A core stuck in one step (a
   store write behind a slow disk) does not lapse it: the delegate's lane

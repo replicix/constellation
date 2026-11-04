@@ -65432,3 +65432,131 @@ stale read after such a refusal is not caught there.
 `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean; sim suite (release) 365 passed, 0 failed,
 12 ignored (359 passed and 13 ignored on main; the first version added a unit test and un-ignored the seed, 361; the row path adds
 four unit tests); `session_guarantees_hold` passes.
+
+## ADR-43: a generation number carries the epoch of the tenure that minted it (2026-11-04; plan 46 M0.3, L4 follow-up; ADR-43)
+
+L4 (`replay.rs`) lifted the void a deposed root's journaled end left on a number its successor then minted again. The follow-up
+investigation found the cause behind it: a root minted `max(counter, max_gen + 1)` from its own view of the log, so two roots of
+different epochs whose views agree on `max_gen` mint the same number. It happens whenever a root is deposed without knowing it and keeps
+granting, in two directions: the deposed root's grant never ships and the successor mints the same number ("orphan first": L4,
+placement-hot 1659 and 2958 here), or the real log already granted it and the deposed root's lagging replica mints it again ("real
+first": placement-hot 16871, where four nodes held the real grant's rows and marks of the number). Every per-generation key of the code
+(session void, journal origin, L1 mark, `deleg_idx`, `deleg_stranded`, `deleg_held_boot`, `deleg_log_idx`, void cut, the delegate
+backup's tail, seal and acknowledgement) assumes the number is one grant's identity. The maintainer decided on 2026-11-04 (ADR-43):
+`gen = epoch << 32 | n`, minted by the tenure that grants it in its own epoch's block, `n` from the node's counter, synced before the
+grant leaves; a number outside the block, from any source, is refused. No backward compatibility, no shim, no version bump.
+
+### What landed (four commits on the branch, in this order)
+
+1. `fix(meta)`: the delegate backup tail's slots move from `1 << 48` to `1 << 62` (review M1). The member copies sit at `2 << 48 + epoch`
+   in the same keyspace; a number of epoch 65,536 reached `2 << 48`, so a delegate's rows would have landed on member-copy slots and
+   each side's clear (`deleg_backup_clear`, `member_copy_drop`) would have deleted the other's. `backup_clear` and the rolled-back hole
+   pass stop at the member copies' base (the hole pass no longer decodes a delegate's rows as `BackupTx`, which the old range, from
+   `0` to `2 << 48`, included). `GEN_EPOCH_SHIFT`, `GEN_MAX_EPOCH = 2^29 - 1`, `gen_epoch`. The other `BASE + gen` spaces were
+   re-checked with the bound (highest number < 2^61): the parked-wait ids `1 << 62 + gen` and the read delegations' epochs
+   `1 << 48 + gen` stay below 2^63 and inside their own range; `tail_key` is fixed-width big-endian, `Streams` and `Gen` are `u64`.
+   Test `deleg_backup_slot_never_meets_a_member_copy_slot` (meta lib): with the old base the delegate's rows of epoch 65,536
+   overwrite the member copy of epoch 1 (`left: []`, `right: [BackupTx { first: 1, last: 2, .. }]`) and its clear drops it.
+2. `fix(meta)`: the mint rule, the counter, the session seeding.
+   - `Meta::next_delegation_gen(epoch, at_least)`: `gen = max(counter, at_least, epoch << 32 | 1)`, refused when `gen_epoch(gen) != epoch`
+     (there is no separate "later epoch" rule, review S3: a later block in `at_least` or in the counter is already outside the block),
+     when the block is exhausted (`n` reaches `u32::MAX`), or for an epoch 0 or above `GEN_MAX_EPOCH`; the counter (`gen + 1`) is
+     committed and `sync`ed before the number is returned.
+   - The epoch is the S3 lease's (review S4, first option): `delegate_dir` takes `self.lease.held_epoch()` (`held.epoch` of the lease
+     the node holds), which is `None` under a continuation-epoch hold (`epoch_hold`), instead of `ship_epoch`, which returns the hold's
+     epoch first. `delegate_dir` already refused under an open epoch; now the mint site cannot be reached with an epoch that is not a
+     lease some holder won. `Replica::next_delegation_gen` takes the epoch.
+   - `seed_generations` takes the set of generations the store keeps a key of (`Meta::persisted_generations`: `deleg_log_idx:` and
+     `deleg_void_cut:` keys) plus the live ones, not `1..=max_gen` (numbers are sparse). A generation the table ended before the open
+     with no key here (a root rebuilt from a side replica replaces `ns` and keeps `local`) is voided lazily, at the cut 0 the old
+     eager seeding gave it, when a root's check of a dependency on it says no: `Replica::reaches` / `reaches_streams` for `Meta` call
+     `reaches_deps` / `reaches_streams_deps` (review M2; `void_ended_generations` generalised to a generation set), on the slow path
+     only. **The first version of this voided any unlisted generation below `max_gen`, and the sweep caught it:** it voided a
+     generation whose end this incarnation had applied as a streamed-ahead install (`replay.rs`: "only from the durable log: a
+     streamed-ahead install of the record may strand"), at cut 0, so a root answered a dependency on rows it did not hold yet. The sim
+     moved four seeds of `long-delegated-late-answers` 0..100 (15, 27, 62, 82; a control build without the lazy void matched main on all
+     four) and `m03_the_configurations_at_zero_violations_stay_there` failed (8 allowed unsettled `EIO`s, ceiling 6). The lazy void now
+     applies only to generations that ended before the open (`SessionState::ended_before_open`: at or below the table's highest
+     generation at open and not listed then); the same four seeds are identical to main, the suite passes.
+   - Fail-before core test `two_tenures_never_mint_the_same_generation_number` (`core/tests.rs`: two harnesses with the same view of
+     the log, epochs 1 and 2, grant the same directory; then a segment of epoch 2 names the successor's number and a further grant is
+     refused with "outside epoch 1's block"). On f188c707 (the fail-before file of the investigation) it fails with
+     `left: 1`, `right: 1`: "two tenures minted the same generation number". Meta tests (`crates/meta/tests/generation_epochs.rs`:
+     the arithmetic, the refusals and their text, the counter across a restart and a lost counter floored by the log, and the lazy
+     void on a reopened store, `max_gen = (6 << 32) | 1`, live `{}`, no keys, `reaches_streams({(5 << 32 | 3): 2})` false before the
+     check, true after it, `deps_lost` true) and session tests (`a_reopened_session_seeds_sparse_generations`,
+     `only_a_generation_that_ended_before_the_open_is_voided_lazily`).
+   - Comments: the `replay.rs` lift of a void at a grant stays as a guard (a grant never meets another grant's void now); `spec.rs`
+     cites ADR-43; the CLI shows a generation in the abandon-group line as `epoch.n (number)` (`--gen` takes the number).
+3. `test(sim)`: the oracle "no generation number is minted twice" (a thread-local `mint_hook`, as the write-check hook; checked first),
+   pins `regression_no_generation_number_is_minted_twice` (placement-hot with the knob: 16871 real first, 1659 and 2958 orphan first),
+   and, for the sweeps below, `SWEEP-SEGMENTS` and a `SWEEP-SIG` line per seed. On f188c707 with the oracle all three pins fail
+   ("generation N minted twice", 1 for 16871 and 16 for 1659), and pass with the fix.
+4. `docs`: DESIGN section 4, ADR-43, the GLOSSARY entry, `delegations.md`, plan 46 section 5.2, this section.
+
+### Sweeps (box 1, release; `main` is f188c707 with the oracle's counter only (it reports, it does not fail), `fix` is the branch; knob = `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`)
+
+"Reuse seeds" are the seeds in which main mints a number twice (the oracle on the old mint); the branch has 0 in every row.
+
+| config | failing seeds main / fix | reuse seeds on main, no knob / knob | unsettled `EIO`s with a sequencer reachable, main / fix (no knob; knob) |
+|---|---|---|---|
+| `placement-hot` 0..20,000 | no knob: 15029 / 15029; knob: 4418 / 4418 | 55 / 133 | 192 / 192; 731 / 731 |
+| `long-delegated` 0..2,000 | none / none (both) | 0 / 3 | 4 / 4; 43 / 43 |
+| `long-delegated-backup` | none / none | 1 / 2 | 192 / 192; 424 / 424 |
+| `long-delegated-late-answers` | none / none | 4 / 2 | 276 / 276; 700 / 700 |
+| `delegated-backup` | none / none | 1 / 3 | 59 / 59; 121 / 121 |
+| `delegated-holder-cut` | none / none | 3 / 5 | 300 / 300; 526 / 526 |
+| `delegated-no-backup-root-near` | none / none | 1 / 2 | 60 / 60; 104 / 104 |
+| `delegated-group-switch` | no knob: none / none; knob: 1525 (I4) / 1525 | 0 / 0 | 21 / 21; 49 / 49 |
+| `delegated-root-crash` | none / none | 0 / 0 | 0 / 0; 23 / 23 |
+| `delegated-holder-cut+commit` 0..299 | none / none, i1 = i2 = 0 | 1 / 1 | 50 / 50; 80 / 80 |
+| `delegated-backup+commit` 0..299 | none / none, i1 = i2 = 0 | 1 / 1 | 8 / 8; 24 / 24 |
+| `placement-hot+commit` 0..2,000 | none / none | 2 / 13 | 21 / 21; 61 / 61 |
+
+- The failing seeds are the same set on both trees in every row (15029, 4418 and 1525 are main's, none of them with a reused number).
+  `SWEEP-ORACLE-TOTALS` (I1, I2, I2c, I4, I5 and the unsettled classes) and `SWEEP-UNSETTLED-CAUSES` totals are identical, and
+  failover p50 / p90 (`SWEEP-FAILOVER`) are identical in every configuration with failovers (for example `delegated-holder-cut` no knob
+  5,822 / 14,605 ms, `long-delegated-backup` 1,669 / 13,771 ms; `delegated-root-crash` 159 / 5,219 ms).
+- `deleg_deps_waits` over the sweep (M2): 23,415 / 23,416 and 25,552 / 25,548 in `placement-hot` (no knob; knob), 2,357 / 2,357 and
+  2,407 / 2,410 in `placement-hot+commit`, identical in every delegated row.
+- **Seeds whose trajectory differs** (segment count or dependency waits): `placement-hot` 28 seeds without the knob and 34 with it, out
+  of 20,000; none of them is a reuse seed bar one (1391), and 1 to 7 seeds in the 2,000-seed delegated rows (`long-delegated-backup`
+  1217, `long-delegated-late-answers` 761 and 1217, `delegated-holder-cut` 612, `placement-hot+commit` 279; 60, 865, 915, 1125, 1391,
+  1798 and 1955 with the knob). The sim is not bit-deterministic on a small share of its seeds (same binary, same seed, one thread:
+  seed 60 gives 110 or 112 segments on main and on the branch alike), and the same-binary rerun of `placement-hot` 0..20,000 on main
+  differs in 29 seeds without the knob and 34 with it: the branch's 28 and 34 are inside that noise (12 and 21 of them are not in the
+  rerun's set, as two reruns of one binary also disagree on which). No difference reaches a failing set, an oracle total or an
+  unsettled seed set (`SWEEP-UNSETTLED` seeds: identical sets in every row).
+- **Segment bytes** (S6; `SWEEP-SEGMENTS`, the log's segments as the sim's bucket received them): origins, dependencies, stream
+  batches and `Delegate` records carry a number of 5 varint bytes (epoch below 8) where they carried 1.
+
+| config | segments main / fix | decompressed bytes main / fix | stored bytes main / fix |
+|---|---|---|---|
+| `placement-hot+commit` 0..2,000, no knob | 241,993 / 241,991 | 11,157,593 / 11,432,986 (+2.5%) | 12,916,032 / 13,169,449 (+2.0%) |
+| `placement-hot+commit`, knob | 240,468 / 240,468 | 11,160,137 / 11,444,791 (+2.6%) | 12,871,065 / 13,131,646 (+2.0%) |
+| `placement-hot` 0..20,000, no knob | 2,418,775 / 2,418,776 | 111,613,944 / 114,430,469 (+2.5%) | 129,170,531 / 131,765,848 (+2.0%) |
+| `long-delegated` 0..2,000, no knob | 137,059 / 137,059 | 5,784,789 / 6,431,265 (+11.2%) | 6,748,107 / 7,242,562 (+7.3%) |
+| `delegated-holder-cut`, no knob | 80,122 / 80,122 | 3,380,005 / 3,839,965 (+13.6%) | 3,886,354 / 4,230,794 (+8.9%) |
+| `delegated-group-switch`, no knob | 220,295 / 220,295 | 7,534,685 / 8,764,441 (+16.3%) | 9,436,819 / 10,572,132 (+12.0%) |
+
+  The sim's rows are tiny (a create or a rename with short names), so the delegated configurations, where every row carries its
+  `(gen, idx)` origin, show the largest relative growth; a real segment carries more per row. `placement-hot`, where most rows are
+  the root's own, grows 2%. The `Streams` position entries are fixed-size `(u64, u64)` pairs and do not grow.
+
+### Not closed, tracked separately
+
+- `deleg_gens_awaiting_end` (`local.rs`): rows of a grant the log never carried (an orphan grant's delegate rows, if a delegate ever
+  executes one: no sweep witnessed it, probe `exec-orphan` 0) would still block that node's installs, because the log never ends the
+  number. With ADR-43 the number is not reused, so nothing else is read as the orphan's; the fix is to strand a delegate's own rows of a
+  generation the table dropped after an epoch change.
+- A state directory wiped and re-adopting its own epoch (`own` needs only `prev.holder == me`) restarts the counter at 0 and is
+  protected only by `at_least = max_gen + 1` from the log: the same class as a lost journal, outside the model (ADR-43).
+- The counter's sync cannot be witnessed by the sim (a simulated crash keeps the `Meta`); the meta test covers persistence across a
+  reopen only.
+
+### Gates
+
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean; release, 0 failed: meta all targets (574
+passed, 20 ignored; lib 388, `generation_epochs` 4), authority lib 1,005, engine lib 948, net lib 127, control lib 146, harness lib
+165, CLI crate all targets 128; sim suite 360 passed, 0 failed, 13 ignored (359 on main plus the pin). One grant is one `fsync` (grants
+are rare), neutral on every file system.

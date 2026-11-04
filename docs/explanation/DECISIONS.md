@@ -2739,3 +2739,145 @@ See: `crates/authority/src/core/delegate.rs` (`delegation_sync`,
 `deleg_recall_plan`, `root_log_floor`), `holder.rs` (`gate_settle`),
 `client.rs`, `crates/meta/src/replay.rs` (`TouchSet::from_op_in_names`);
 [plan 46](../plans/v1/wip/46-committed-or-final.md) M0.3 S5; PROGRESS "S5".
+
+## ADR-43: A generation number carries the epoch of the tenure that minted it
+
+**Status**: decided by the maintainer on 2026-11-04 (plan 46 M0.3, the L4
+follow-up). Amends the generation identity of
+[ADR-23](#adr-23-delegated-sub-sequencers-over-one-log); the rule of ADR-41
+and [ADR-42](#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)
+(a gate inherits other nodes' generations *by number*) is unchanged.
+
+**Context**: a root minted `max(its counter, table.max_gen() + 1)` from its own
+view of the log. Two roots of different epochs whose views agree on `max_gen`
+minted the same number. That happens whenever a root is deposed without
+knowing it (a seal-based takeover, a suspend) and keeps granting, in two
+directions: the deposed root's grant never ships and the successor then mints
+the same number ("orphan first": the void its journaled end left met the
+successor's grant, L4, placement-hot 6239, 15418), or the successor's grant is
+in the log and the deposed root's lagging replica mints the same number for
+another directory ("real first", placement-hot 16871: four nodes held the real
+grant's rows and marks of the number when it was minted again). A probe on the
+old mint counted it: 133 of 20,000 `placement-hot` seeds (knob
+`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`) and 0 to 5 of 2,000 in each delegated
+configuration. Every per-generation key assumes the rule that the code states
+("a generation number is a stream's identity, never reused across roots"): the
+session void, the journal origin and the L1 mark, `deleg_idx`,
+`deleg_stranded`, `deleg_held_boot`, `deleg_log_idx` and the void cut, the
+delegate backup's tail, seal and acknowledgement, the read delegations' epoch.
+With a reused number, state left by one grant is read as the other's: mostly
+liveness (a stream gap, a delegate stopped, a backup sealed for good), and three
+integrity paths (the origin-keyed retire, the L1 mark, the backup's tail and
+acknowledgement). No sweep witnessed an integrity failure (no delegate executed a
+row under a grant the log never carried), but the precondition of those paths
+is reached often, and plan 46 M1.2 keeps `(gen, idx)` as the stream identity.
+
+**Decision**: a generation number is minted by one tenure, in its own epoch's
+block.
+- `gen = epoch << 32 | n`, `epoch` the lease epoch of the S3 lease the minting
+  root holds (`LeaseState::held_epoch`: one holder per lease epoch, every
+  acquisition takes `epoch + 1`; a continuation-epoch hold has no such epoch and
+  mints nothing, and `delegate_dir` refuses under one anyway), `n >= 1` from the
+  node's persisted counter (`next_deleg_gen` in `local`, the value `gen + 1`).
+- The counter is committed and `sync`ed before the number is returned, so before
+  the grant leaves (the idiom of `kv_set_durable`). That sync is load-bearing: a
+  node re-claiming its own lease keeps its epoch (`own` implies the previous
+  epoch), so one epoch spans a crash and restart of its holder, and commits are
+  `PersistMode::Buffer`: without it a host crash after the grant left could mint
+  `n` again. The sim cannot witness this (a simulated crash keeps the `Meta`), so
+  the meta test of the counter across a reopen covers persistence only.
+- A root mints only in its own block; a number outside it, from any source, is
+  refused (`MetaError::Invalid`, "outside epoch E's block"): `gen =
+  max(counter, at_least, epoch << 32 | 1)`, and a `gen` whose epoch is not the
+  minter's, because the counter or the log's floor `at_least = max_gen + 1`
+  names a later tenure's number, is not minted (a legitimate holder of epoch `e`
+  cannot see a block above `e`: epochs only rise and a higher epoch in the log
+  deposes it; so the refusal is the deposed root's, and a rule of its own is not
+  needed). `at_least` stays as the floor for a lost counter. A block is exhausted
+  at `n = u32::MAX - 1`; an epoch above `GEN_MAX_EPOCH = 2^29 - 1` cannot mint
+  (lease epochs grow by one per acquisition: unreachable).
+- A re-adopted epoch continues its counter; a re-win after a loss is a new epoch
+  (`epoch + 1`) and a new block; a replica rebuilt from a side replica keeps
+  `local` and with it the counter. `max_gen` stays monotone in log order (`n`
+  rises within a tenure, blocks rise with the epoch), so "the log's highest number
+  floors the next mint" and `deps()`'s newest-first cap keep working.
+- Number space. The numbers are large and sparse. `GEN_MAX_EPOCH` keeps every
+  `BASE + gen` space of the code inside its own range: a delegate's backup tail
+  (`DELEG_BACKUP_BASE + gen`, in `backup_tail` beside the member copies at
+  `2 << 48 + epoch`) moves from `1 << 48` to `1 << 62`, because a number of epoch
+  65,536 reached `2 << 48`, so a delegate's rows would have landed on member-copy
+  slots and each side's clear would have deleted the other's (`backup_clear` now
+  stops at the member copies' base; `deleg_backup_slot_never_meets_a_member_copy_slot`);
+  the parked-wait ids (`1 << 62 + gen`) and the read delegations' epochs
+  (`1 << 48 + gen`) stay below `2^63`. `tail_key` is fixed-width big-endian, a
+  `Streams` entry and `Gen` are `u64`, the model crate's bitmask generations are
+  its own abstract ones.
+- The session's restart seeding walks the generations the store keeps a key of
+  (`deleg_log_idx`, `deleg_void_cut`) and the live ones, not `1..=max_gen`. A
+  generation the table ended before the open with no key left here (a root rebuilt
+  from a side replica replaces `ns` and keeps `local`: a generation ended inside
+  the rebuild window has none) is voided lazily, at the cut 0 the eager seeding gave
+  it, when a root's check of a dependency on it says no (`Meta::reaches_deps`,
+  `reaches_streams_deps`; one table read, on that path only). Only a generation
+  that ended before the open qualifies (`SessionState::ended_before_open`): the
+  end of one this incarnation saw may be a streamed-ahead install the successor
+  strands, and only the durable log voids those. (The first version voided any
+  unlisted generation below `max_gen`; the sweep moved four seeds of
+  `long-delegated-late-answers` 0..100 and the unsettled ceiling test failed.)
+- What an orphan number leaves behind keeps its own identity. An orphan number is
+  below the successor's block and never listed, so it is voided for good once the
+  table passes it. The one liveness item left, tracked separately and not part of
+  this change: rows of a grant the log never carried (never witnessed: a delegate
+  never executed one) would still make `deleg_gens_awaiting_end` block that node's
+  installs, for the log never ends them; the fix is to strand a delegate's own rows
+  of a generation the table dropped after an epoch change.
+- Plan 46 M1.2: `DelegateNode.gen` is minted by the same rule; a sticky grant keeps
+  its minting epoch across tenures (the number is the grant's identity, not the
+  holder's ownership); `gen_epoch(gen) == my epoch` now says "granted by this
+  tenure".
+- No backward compatibility: a store's old small counter and old numbers are
+  harmless (the block's start is the floor, an old number is below every block),
+  and no old on-disk state needs reading. No shim, no version bump.
+
+**Residual, outside the model**: a state directory wiped and then re-adopting its
+own epoch (`own` needs only `prev.holder == me`) starts the counter at 0 and is
+protected only by `at_least` from the log: the same class as a lost journal.
+
+**Rejected**:
+- (B) Identity at every consumer: key `journal_origin`, `deleg_idx`, `deleg_gated`,
+  `deleg_log_idx`, `deleg_void_cut`, `deleg_streamed`, `deleg_held_boot`,
+  `deleg_stranded`, the backup tail and seal, `dl.sealed` and `dl.backing` by
+  `(gen, grant epoch)`, and carry the grant epoch in every origin, stream batch,
+  backup append and dependency. It is this rule spread over ten key families and
+  four wire paths.
+- (B') Purge a number's state when its grant is applied: covers "orphan first"
+  only; in "real first" the orphan state is created after the real grant and
+  nothing tells the two apart by number.
+- (C) Nothing beyond L4's unvoid at a grant: a latent integrity hole whose
+  precondition is reached in about 0.7% of `placement-hot` seeds, moved unchanged
+  into M1.2.
+
+**Consequences**:
+- Two tenures never mint the same number, in either direction; the sim's oracle
+  ("no generation number is minted twice", `Report::gens_minted`) fails a seed that
+  does, and fails seeds 16871, 1659 and 2958 on the old mint.
+- Origins, dependencies, stream batches and backup appends carry a number of 5
+  varint bytes (epochs below 8; 6 below 1,024, 7 below 131,072, 8 below 16.7
+  million) where they carried 1. Measured in the sim, whose rows are tiny: the log's
+  segments grow by 2.0% stored (2.5% decompressed) in `placement-hot+commit` and by
+  7 to 12% stored in the delegated configurations (PROGRESS "ADR-43").
+- One `fsync` per grant (grants are rare: placement windows are 30 s).
+- The CLI shows a number as `epoch.n (number)` where it names a generation for a
+  person; `--gen` takes the number.
+
+**May revert**: never as a whole; under plan 46 M1.2's one stream per node the minting
+site moves to the `DelegateNode` record, the rule does not.
+
+See: `crates/meta/src/delegation.rs` (`next_delegation_gen`, `GEN_MAX_EPOCH`,
+`gen_epoch`), `crates/authority/src/core/delegate.rs` (`delegate_dir`),
+`crates/meta/src/session.rs` (`seed_generations`, `reaches_deps`),
+`crates/meta/src/store/backup.rs` (`DELEG_BACKUP_BASE`); tests
+`two_tenures_never_mint_the_same_generation_number`,
+`crates/meta/tests/generation_epochs.rs`, sim
+`regression_no_generation_number_is_minted_twice`;
+[plan 46](../plans/v1/wip/46-committed-or-final.md) M0.3, §5.2; PROGRESS "ADR-43".

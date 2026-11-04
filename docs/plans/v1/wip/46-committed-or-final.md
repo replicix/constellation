@@ -347,6 +347,16 @@ DelegateNodeEnded { node, gen, through }                   // root record: the g
   copies, holed generations and the deposed root's rebuild-replay go here,
   not in stage 2, because with no lone delegate nothing a delegate answers
   is ever replayed.
+- **Generation numbers (ADR-43, 2026-11-04).** `DelegateNode.gen` is minted
+  by the same rule as `Delegate.gen` today: `gen = epoch << 32 | n` by the
+  root tenure that grants it, in its own epoch's block, `n` from the node's
+  counter synced before the grant leaves, a number outside the block refused
+  (`Meta::next_delegation_gen`). `(gen, idx)` stays the stream identity, so
+  the per-generation state a node keeps (journal origins, the delegate
+  backup's tail and seal, `deleg_idx`, the L1 mark) is never read as
+  another grant's. A sticky grant (§5.4) keeps its minting epoch across
+  tenures: the number is the grant's identity, not the holder's
+  ownership; `gen_epoch(gen) == my epoch` says "granted by this tenure".
 
 The model decides the one open design point before code: whether a
 subtree-set stream keeps `recall_safety` with one cut per stream. If it

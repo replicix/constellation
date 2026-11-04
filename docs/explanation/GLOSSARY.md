@@ -35,7 +35,11 @@ network splits, is what most of the machinery is for.
 - **Delegate.** A node busy in one directory, to which the root hands the
   authority over that directory (and what is under it), so the delegate
   answers operations there itself, without a round trip to the root. One
-  hand-over is a **generation** (numbered). The delegate:
+  hand-over is a **generation**, numbered by the tenure that grants it
+  (`epoch.n`: the lease epoch and that tenure's counter, so no two tenures
+  mint the same number,
+  [ADR-43](DECISIONS.md#adr-43-a-generation-number-carries-the-epoch-of-the-tenure-that-minted-it)).
+  The delegate:
   - **streams** its changes back to the root, which appends them to the
     log in order;
   - **renews** the generation every few seconds; a generation not renewed
