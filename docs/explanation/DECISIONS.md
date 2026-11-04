@@ -2874,12 +2874,18 @@ block.
   table passes it: on the root's forward path only after a restart or an
   in-process rebuild (the seeding, or the lazy void, meets it then); within an
   incarnation, only a read voids it (`void_ended_generations`), and not an end only
-  outstanding speculation carries. The one liveness item left, tracked separately and not part of
-  this change: rows of a grant the log never carried (never witnessed: a delegate
-  never executed one) would still make `deleg_gens_awaiting_end` block that node's
-  installs, for the log never ends them; the fix is to strand a delegate's own rows
-  of a generation the table dropped after an epoch change.
-  A narrow case joins it: a streamed-ahead `Delegate(g)` and `RecallCut(g)` both outstanding at a restart. The open
+  outstanding speculation carries. The orphan-rows item is closed for the operator-abandon case: an abandon of the root
+  group of an epoch (`GroupAbandoned { gen: 0 }`) proves the log never grants a number of that epoch or an older one that the table
+  no longer lists, that this replica holds no trace of in the log (no cut key, no log index) and that no outstanding speculation
+  ends. The segment's transaction ends it as the log's `Recall` would, at what the log holds of it (0), after the cut loop (a
+  generation the segment itself ends stays out by its cut key): its rows roll back and replay by rid. Candidates are the table's
+  list before the strand, the generations this node holds delegate rows of (`deleg_gens_awaiting_end`) and those of its live shadows
+  and hints. Old-mint numbers are left alone. Restart seeding exception: a kept cut above `max_gen` voids at restart; cut keys
+  come only from a durable end the log applied, a root's own journaled end (retracted on strand), a rebuild's copy of the side
+  replica's keys, or this rule, so a streamed-ahead end (no key) stays live. Residuals, still open: the lone-root takeover path;
+  the N4 restart dependency wait; and the claimant that was the orphan's delegate (its own marker does not run through the
+  segment path, so its own rows of the generation survive its takeover).
+  A narrow case joins them: a streamed-ahead `Delegate(g)` and `RecallCut(g)` both outstanding at a restart. The open
   keeps g live (the set holds it), the strand removes the grant, g sits above the rolled-back `max_gen` and nothing
   voids it, so a dependency on g waits for the rest of the process.
 - Plan 46 M1.2: `DelegateNode.gen` is minted by the same rule; a sticky grant keeps

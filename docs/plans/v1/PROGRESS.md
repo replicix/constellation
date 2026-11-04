@@ -65540,7 +65540,7 @@ grant leaves; a number outside the block, from any source, is refused. No backwa
      `only_a_generation_that_ended_before_the_open_is_voided_lazily`).
    - Comments: the `replay.rs` lift of a void at a grant stays as a guard (a grant never meets another grant's void now, bar the
      in-incarnation one a journaled end left); `spec.rs`
-     cites ADR-43; the CLI shows a generation in the abandon-group line as `epoch.n (number)` (`--gen` takes the number).
+     cites ADR-43; the CLI shows a generation in the abandon-group line as `epoch:n (number)` (`--gen` takes the number).
 3. `test(sim)`: the oracle "no generation number is minted twice" (a thread-local `mint_hook`, as the write-check hook; checked first),
    pins `regression_no_generation_number_is_minted_twice` (placement-hot with the knob: 16871 real first, 1659 and 2958 orphan first),
    and, for the sweeps below, `SWEEP-SEGMENTS` and a `SWEEP-SIG` line per seed. On f188c707 with the oracle all three pins fail
@@ -65908,3 +65908,26 @@ The rest are product causes or deferred classes, kept as violations:
   re-adoption takes the ETag, then slow verify and retry reads. A follow-up.
 - **A** (29, the lease won but the own op still in its gate: the deferred in-gate class) and **O** (22, forwarded to a
   re-adopting holder instead of claiming).
+
+## ADR-43 follow-up: an operator's abandon ends the generations it orphans (plan 46 M0.3)
+
+The orphan-rows item of the ADR-43 section ("Not closed") is closed for the operator-abandon case.
+
+- **The rule** (`Meta::orphaned_by_abandon_tx`, run in the segment's transaction after the abandon's strands): a generation of an epoch
+  at or below the abandoned one, that the table no longer lists, that this replica holds no trace of in the log (no cut key, no log
+  index), that no outstanding speculation ends and that the segment does not recall, was granted only by speculation the abandon
+  stranded. It is ended as the log's `Recall` would end it, at what the log holds of it (0): its rows are rolled back and replayed by
+  rid, and the cut is kept. Candidates: the table's list before the strand, the generations this node holds delegate rows of, and the
+  `gen != 0` generations of live shadows and hints (a requester that never listed the grant). Old-mint numbers (epoch 0) are left alone.
+- **Order**: the segment's cut loop runs before the rule, so a generation the same segment ends (its end streamed in first) is kept
+  out by its cut key.
+- **The cut moved into the segment's transaction** (the crash window of `persist_void_cut`): a streamed-ahead `RecallCut` the segment
+  confirms keeps its cut with the segment.
+- **Restart seeding exception**: a kept cut above `max_gen` voids at restart (the cut keys come from a durable end the log applied, a
+  root's own journaled end, a rebuild's copy of the side replica's keys, or this rule).
+- **Log lines** show a generation as `epoch:n` (`GenLabel`; a plain number for the old mint, as the CLI shows it).
+- **Tests**: `generation_epochs.rs` pins the crash window, the abandoned grant's orphan rows, a grant the log carries, the
+  speculative-end guard (fails without it) and a requester's shadow that names the generation alone (fails before the candidate
+  extension).
+- **Still open**: the lone-root takeover path; the N4 restart dependency wait; the claimant that was the orphan's delegate (its own
+  rows of the generation survive its takeover, since its own marker does not run through the segment path).
