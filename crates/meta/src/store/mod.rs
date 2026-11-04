@@ -1267,12 +1267,20 @@ impl Meta {
         meta.refresh_holder_append_tip()?;
         meta.build_pending_by_ino()?;
         meta.verify_mark_counts()?;
-        let table = meta.delegation_table();
+        // The table and the speculatively ended generations, one snapshot
+        // (ADR-43, `Meta::speculatively_ended_generations`).
+        let (table, speculative) = {
+            let r = meta.db.read_tx();
+            (
+                crate::delegation::read_table_tx(&r, &meta).unwrap_or_default(),
+                meta.speculatively_ended_generations_at(&r)?,
+            )
+        };
         meta.deleg_any
             .store(!table.is_empty(), std::sync::atomic::Ordering::Release);
         // Plan 30 §M11: the session state's generations survive a
         // restart (see `SessionState::seed_generations`).
-        meta.seed_session_generations(&table)?;
+        meta.seed_session_generations(&table, speculative)?;
         // The applied journal position is volatile too; what this
         // replica holds of the log is not. Without this a watermark
         // naming the holder's journal (a lock grant's floor) stays
@@ -1297,8 +1305,14 @@ impl Meta {
     pub(crate) fn seed_session_generations(
         &self,
         table: &crate::delegation::DelegationTable,
+        speculative: std::collections::BTreeSet<u64>,
     ) -> Result<(), MetaError> {
-        let live: std::collections::BTreeSet<u64> = table.iter().map(|d| d.gen).collect();
+        let mut live: std::collections::BTreeSet<u64> = table.iter().map(|d| d.gen).collect();
+        // ADR-43 (the restart path): an end only outstanding speculation
+        // carries is not an end yet (see `speculatively_ended_generations`).
+        // `speculative` is read with `table` in one snapshot at the open;
+        // after a rebuild, from this store once the commit landed.
+        live.extend(speculative);
         self.session.seed_ended_before_open(table.max_gen(), &live);
         let mut gens = self.persisted_generations()?;
         gens.extend(live.iter().copied());

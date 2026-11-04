@@ -5281,6 +5281,48 @@ impl Meta {
         Ok(stranded)
     }
 
+    /// ADR-43 (the restart path): the generations whose end only
+    /// outstanding requester or subscriber speculation carries: a
+    /// `Recall`/`RecallCut` among the records of a live `Shadow` or
+    /// `Streamed` entry, of a generation this replica has no durable end of
+    /// (`deleg_void_cut`, written only by the log's apply of the record).
+    /// Such an install writes the table row without the void
+    /// (`replay::apply_one`, `durable = false`), and may strand, which
+    /// relists the generation and lifts no void: the session seeding treats
+    /// these as live. `Local` rows are not counted (this root's own
+    /// journaled end voids at once, and its strand stages the unvoid).
+    pub(crate) fn speculatively_ended_generations(
+        &self,
+    ) -> Result<std::collections::BTreeSet<u64>, MetaError> {
+        self.speculatively_ended_generations_at(&self.db.read_tx())
+    }
+
+    /// [`Self::speculatively_ended_generations`] under `r` (the read path
+    /// takes it in the snapshot it reads the table in).
+    pub(crate) fn speculatively_ended_generations_at(
+        &self,
+        r: &impl Readable,
+    ) -> Result<std::collections::BTreeSet<u64>, MetaError> {
+        let mut out = std::collections::BTreeSet::new();
+        for (seq, entry) in live_non_local(r, self)? {
+            if matches!(entry, LiveEntry::Hint { .. }) {
+                continue;
+            }
+            let Some(v) = r.get(&self.spec, seq_key(seq))? else {
+                continue;
+            };
+            let row: SpecRow = postcard::from_bytes(&v)?;
+            for rec in &row.records {
+                if let LogRecord::Recall { gen, .. } | LogRecord::RecallCut { gen, .. } = rec {
+                    if kv_get_tx(r, &self.local, &local::deleg_void_cut_key(*gen))?.is_none() {
+                        out.insert(*gen);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Plan 30 §M11 on the root: it ended generation `gen` itself (its
     /// own `Recall` journaled, never applied from a segment here), so the
     /// segment path's recall strand never runs on its replica. Its own

@@ -501,3 +501,124 @@ fn a_rebuild_takes_the_log_s_cut_over_a_deposed_roots_own() {
     assert!(!meta.deps_lost_deps(&at(g, 5)));
     assert!(meta.deps_lost_deps(&at(g, 6)));
 }
+
+/// A store holding the table row of `h` (granted in the log, `h`'s log
+/// index at 7) and an outstanding streamed-ahead `RecallCut { h, 9 }`
+/// (`committed`: gated or not), closed: the restart's input.
+fn store_with_a_streamed_ahead_end(path: &std::path::Path, h: u64, committed: bool) {
+    let meta = Meta::open(path).unwrap();
+    meta.apply_segment(1, 1, &[delegate(h)], &TouchSet::default())
+        .unwrap();
+    meta.kv_set(&format!("deleg_log_idx:{h}"), "7").unwrap();
+    meta.install_streamed_committed(
+        1,
+        2,
+        1,
+        1,
+        &[LogRecord::RecallCut {
+            dir: ROOT_INO,
+            gen: h,
+            through: 9,
+        }],
+        committed,
+        (0, 0),
+    )
+    .unwrap();
+    assert!(
+        meta.delegation_table().iter().next().is_none(),
+        "end applied"
+    );
+    assert!(!meta.session().is_voided(h), "streamed-ahead: no void");
+    meta.close().unwrap();
+}
+
+/// ADR-43 (the restart path's exposure, PROGRESS round 3's open item): the
+/// open seeds the session from the store's table plus the speculative set, and an
+/// outstanding streamed-ahead `RecallCut` wrote its row without the void
+/// (only the durable log voids). The open must not void that end nor count
+/// it as ended before the open.
+#[test]
+fn a_restart_does_not_void_an_end_only_a_streamed_entry_carries() {
+    let h = gen(5, 3);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.db");
+    store_with_a_streamed_ahead_end(&path, h, true);
+    let meta = Meta::open(&path).unwrap();
+    assert!(!meta.session().is_voided(h), "only the stream ended it");
+    assert!(!meta.session().ended_before_open(h));
+    assert_eq!(
+        meta.session().stream_applied(h),
+        7,
+        "held at the log's index"
+    );
+    assert!(!meta.deps_lost_deps(&at(h, 8)));
+    assert!(!meta.reaches_streams_deps(&at(h, 8)), "waits for the log");
+    assert!(!meta.session().is_voided(h));
+}
+
+/// The same, and the entry then strands (an uncommitted streamed entry,
+/// a segment of a later epoch): the table lists `h` again, and nothing
+/// lifts a void the open set (only a `Local` strand stages an unvoid), so a
+/// dependency on `h` past what the log holds must still wait.
+#[test]
+fn a_restart_then_a_strand_leaves_the_generation_live_and_unvoided() {
+    let h = gen(5, 3);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.db");
+    store_with_a_streamed_ahead_end(&path, h, false);
+    let meta = Meta::open(&path).unwrap();
+    let ino = (1u64 << 40) | 1;
+    let applied = meta
+        .apply_segment(
+            2,
+            2,
+            &[LogRecord::Create {
+                parent: ROOT_INO,
+                name: "a".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 10,
+            }],
+            &TouchSet::default(),
+        )
+        .unwrap();
+    let _ = applied;
+    assert!(
+        meta.delegation_table().iter().any(|d| d.gen == h),
+        "the strand rolled the end back"
+    );
+    assert!(!meta.session().is_voided(h), "live, not voided");
+    assert!(!meta.reaches_streams_deps(&at(h, 8)));
+    assert!(!meta.deps_lost_deps(&at(h, 8)));
+}
+
+/// The in-process twin (the read path's `void_ended_generations`, which
+/// any unreached watermark triggers): an end only an outstanding streamed
+/// entry carries is not voided by a read's wait either; were it, the
+/// entry's strand would leave the live generation voided for good.
+#[test]
+fn a_read_does_not_void_an_end_only_a_streamed_entry_carries() {
+    let h = gen(5, 3);
+    let meta = Meta::open_in_memory().unwrap();
+    meta.apply_segment(1, 1, &[delegate(h)], &TouchSet::default())
+        .unwrap();
+    meta.session().note_stream(h, 7);
+    meta.install_streamed(
+        1,
+        2,
+        1,
+        1,
+        &[LogRecord::RecallCut {
+            dir: ROOT_INO,
+            gen: h,
+            through: 9,
+        }],
+    )
+    .unwrap();
+    meta.session().set_budget_ms(1);
+    meta.session().raise_observed(at(h, 8));
+    let _ = meta.session_wait(&[]);
+    assert!(!meta.session().is_voided(h), "only the stream ended it");
+}

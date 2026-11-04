@@ -2039,10 +2039,20 @@ impl crate::store::Meta {
         if gens.is_empty() {
             return;
         }
-        let table = self.delegation_table();
+        // ADR-43: an end only outstanding speculation carries is the
+        // durable log's to void (`Meta::speculatively_ended_generations`),
+        // read in the snapshot the table is read in.
+        let (table, speculative) = {
+            let r = self.db.read_tx();
+            (
+                crate::delegation::read_table_tx(&r, self).unwrap_or_default(),
+                self.speculatively_ended_generations_at(&r)
+                    .unwrap_or_default(),
+            )
+        };
         let max_gen = table.max_gen();
         let voided = self.session.void_ended_among(gens, |gen| {
-            gen <= max_gen && !table.iter().any(|d| d.gen == gen)
+            gen <= max_gen && !table.iter().any(|d| d.gen == gen) && !speculative.contains(&gen)
         });
         if voided > 0 {
             tracing::info!(

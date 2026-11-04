@@ -507,6 +507,6 @@ impl Meta {
         // durable log's, so a generation it lists as ended is ended for
         // good, and the open-table snapshot the lazy void rests on is its
         // own.
-        self.seed_session_generations(&side_table)
+        self.seed_session_generations(&side_table, self.speculatively_ended_generations()?)
     }
 }
