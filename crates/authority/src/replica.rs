@@ -347,8 +347,10 @@ pub trait Replica {
     /// Whether the unshipped journal has rows that are not delegate
     /// stream rows.
     fn journal_has_undelegated(&self) -> bool;
-    /// The next delegation generation (at least `at_least`).
-    fn next_delegation_gen(&self, at_least: u64) -> Result<u64, MetaError>;
+    /// The next delegation generation number of the tenure holding lease
+    /// epoch `epoch`, in its block `epoch << 32 | n` and at least
+    /// `at_least` (ADR-43); refused for a number outside the block.
+    fn next_delegation_gen(&self, epoch: u64, at_least: u64) -> Result<u64, MetaError>;
     /// The replica's applied position, streams included.
     fn applied_position(&self) -> Position;
     /// A replica-level "has everything `deps` names" with the void rule.
@@ -1290,8 +1292,8 @@ impl Replica for Meta {
         Meta::journal_has_undelegated(self).unwrap_or(true)
     }
 
-    fn next_delegation_gen(&self, at_least: u64) -> Result<u64, MetaError> {
-        Meta::next_delegation_gen(self, at_least)
+    fn next_delegation_gen(&self, epoch: u64, at_least: u64) -> Result<u64, MetaError> {
+        Meta::next_delegation_gen(self, epoch, at_least)
     }
 
     fn applied_position(&self) -> Position {
@@ -1299,11 +1301,11 @@ impl Replica for Meta {
     }
 
     fn reaches(&self, deps: &Position) -> bool {
-        self.session().reaches(deps)
+        self.reaches_deps(deps)
     }
 
     fn reaches_streams(&self, deps: &Position) -> bool {
-        self.session().reaches_streams(deps)
+        self.reaches_streams_deps(deps)
     }
 
     fn note_stream(&self, gen: u64, idx: u64) {

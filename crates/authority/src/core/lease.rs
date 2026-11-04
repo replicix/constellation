@@ -211,6 +211,17 @@ impl LeaseState {
             .or_else(|| self.held.as_ref().map(|(l, _)| l.epoch))
     }
 
+    /// The epoch of the S3 lease this node holds, `None` without one or
+    /// under a continuation-epoch hold (whose epoch is adopted without a
+    /// CAS, not a lease some holder won): what a generation number is
+    /// minted in (ADR-43), one holder per lease epoch.
+    pub fn held_epoch(&self) -> Option<Epoch> {
+        if self.epoch_hold.is_some() {
+            return None;
+        }
+        self.held.as_ref().map(|(l, _)| l.epoch)
+    }
+
     /// The continuation-epoch hold's epoch, if one is in force.
     pub fn epoch_hold(&self) -> Option<Epoch> {
         self.epoch_hold

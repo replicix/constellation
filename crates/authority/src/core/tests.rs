@@ -3019,6 +3019,127 @@ fn the_root_forgets_ended_generations() {
     );
 }
 
+/// L4 follow-up (ADR-43): a root deposed without knowing it and its
+/// successor, with the same view of the log, minted the same generation
+/// number for their grants (`max_gen + 1` of the same table), and whatever
+/// a node kept of the one was read as the other's. A number now carries the
+/// epoch of the tenure that minted it, so the two never meet; and a root
+/// whose table already names a later tenure's number does not mint.
+#[test]
+fn two_tenures_never_mint_the_same_generation_number() {
+    use constellation_meta::delegation::{gen_epoch, GEN_EPOCH_SHIFT};
+    let mut gens = Vec::new();
+    let mut h1 = None;
+    for (node, epoch) in [(1u64, 1u64), (2, 2)] {
+        let mut h = Harness::new(node);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(epoch, None);
+        let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "d".into(),
+                ino: dir,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            }],
+        )
+        .unwrap();
+        let out = h.step(Event::Control {
+            op: OpId(1_000),
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                range: (0, 0),
+            },
+        });
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::ControlDone { result: Ok(_), .. })),
+            "not delegated: {out:?}"
+        );
+        gens.push(h.meta.delegation_table().get(dir).expect("delegated").gen);
+        h1.get_or_insert(h);
+    }
+    assert_ne!(
+        gens[0], gens[1],
+        "two tenures minted the same generation number"
+    );
+    assert_eq!(gen_epoch(gens[0]), 1);
+    assert_eq!(gen_epoch(gens[1]), 2);
+
+    // The deposed root learns of the successor's grant (a segment of epoch
+    // 2 names its number): it does not mint into the successor's block,
+    // whatever its own counter says.
+    let mut h = h1.unwrap();
+    let (other, next) = (
+        h.meta.allocate_ino(ROOT_INO).unwrap(),
+        h.meta.allocate_ino(ROOT_INO).unwrap(),
+    );
+    let mkdir = |ino, name: &str| LogRecord::Mkdir {
+        parent: ROOT_INO,
+        name: name.into(),
+        ino,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        time_ns: 2,
+    };
+    crate::replica::Replica::apply_segment(
+        &h.meta,
+        2,
+        2,
+        0,
+        &[],
+        &[],
+        &[
+            mkdir(other, "e"),
+            mkdir(next, "f"),
+            LogRecord::Delegate {
+                dir: other,
+                node: 4,
+                gen: gens[1],
+                designated: false,
+                range: (0, 0),
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(h.meta.delegation_table().max_gen(), gens[1]);
+    assert_eq!(gens[1] >> GEN_EPOCH_SHIFT, 2);
+    let out = h.step(Event::Control {
+        op: OpId(1_001),
+        req: Control::Delegate {
+            dir: next,
+            node: 5,
+            range: (0, 0),
+        },
+    });
+    let refusal = out.iter().find_map(|a| match a {
+        Action::ControlDone { result: Err(e), .. } => Some(e.clone()),
+        _ => None,
+    });
+    let refusal =
+        refusal.unwrap_or_else(|| panic!("a later tenure's number was minted past: {out:?}"));
+    assert!(
+        refusal.contains("outside epoch 1's block"),
+        "refused for another reason: {refusal}"
+    );
+    assert!(
+        h.meta.delegation_table().get(next).is_none(),
+        "a refused grant left a delegation"
+    );
+}
+
 /// An unmount's flush that finds a cadence publish still in flight waits
 /// for it and then publishes what shipped since, before it releases and
 /// stops (`e2e-basic` under load: the flush skipped its publish because

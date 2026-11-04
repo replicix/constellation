@@ -4185,7 +4185,7 @@ fn render_waiting_generations(delegation: &api::DelegationReport) -> Vec<String>
                 .collect();
             let head = format!(
                 "delegation generation {} (directory inode {}, delegate node {}, heard {}) cannot end ({} s): members {}",
-                w.gen,
+                gen_label(w.gen),
                 w.dir,
                 w.delegate,
                 ago(w.delegate_heard_ms),
@@ -4209,6 +4209,17 @@ fn render_waiting_generations(delegation: &api::DelegationReport) -> Vec<String>
             }
         })
         .collect()
+}
+
+/// A delegation generation number for a person: it is `epoch << 32 | n`
+/// (ADR-43), so past the first epoch it is shown as `epoch.n` with the
+/// number itself, which is what `--gen` takes.
+fn gen_label(gen: u64) -> String {
+    if gen >> 32 == 0 {
+        gen.to_string()
+    } else {
+        format!("{}.{} ({gen})", gen >> 32, gen & 0xffff_ffff)
+    }
 }
 
 fn print_ack(ack: api::Ack) -> Result<()> {
@@ -4903,6 +4914,12 @@ mod parse_byte_size_tests {
         // Exactly one of them: a lease claim's group or a delegation's.
         assert!(parse(&[]).is_err());
         assert!(parse(&["--epoch", "7", "--gen", "2"]).is_err());
+    }
+
+    #[test]
+    fn a_generation_is_shown_as_its_epoch_and_counter() {
+        assert_eq!(gen_label(10), "10");
+        assert_eq!(gen_label((3 << 32) | 7), "3.7 (12884901895)");
     }
 
     #[test]

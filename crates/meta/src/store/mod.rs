@@ -1273,8 +1273,11 @@ impl Meta {
         // Plan 30 §M11: the session state's generations survive a
         // restart (see `SessionState::seed_generations`).
         let live: std::collections::BTreeSet<u64> = table.iter().map(|d| d.gen).collect();
+        meta.session.seed_ended_before_open(table.max_gen(), &live);
+        let mut gens = meta.persisted_generations()?;
+        gens.extend(live.iter().copied());
         meta.session.seed_generations(
-            table.max_gen(),
+            &gens,
             &live,
             &|gen| meta.log_stream_idx(gen).unwrap_or(0),
             &|gen| meta.void_cut(gen).ok().flatten(),

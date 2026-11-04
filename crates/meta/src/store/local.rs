@@ -960,6 +960,30 @@ impl Meta {
             .and_then(|v| v.parse::<u64>().ok()))
     }
 
+    /// Every generation this replica keeps a log index
+    /// ([`deleg_log_idx_key`]) or a void cut ([`deleg_void_cut_key`]) of:
+    /// what the restart seeds the session from ([`Meta::open`]). Numbers
+    /// are sparse (ADR-43), so the keys are scanned, not a range walked.
+    pub(crate) fn persisted_generations(
+        &self,
+    ) -> Result<std::collections::BTreeSet<u64>, MetaError> {
+        let r = self.db.read_tx();
+        let mut out = std::collections::BTreeSet::new();
+        for prefix in ["deleg_log_idx:", "deleg_void_cut:"] {
+            for guard in r.prefix(&self.local, prefix.as_bytes()) {
+                let (k, _) = guard.into_inner()?;
+                if let Some(gen) = std::str::from_utf8(&k)
+                    .ok()
+                    .and_then(|k| k.strip_prefix(prefix))
+                    .and_then(|g| g.parse::<u64>().ok())
+                {
+                    out.insert(gen);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// L1: the `(epoch, idx)` of generation `gen`'s newest own row whose root
     /// append the pre-S3 stream delivered here ([`deleg_streamed_key`]);
     /// `None` when there is none, or after the log's `Recall`/`RecallCut`

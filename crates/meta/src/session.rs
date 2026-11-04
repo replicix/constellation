@@ -526,6 +526,14 @@ struct Inner {
     /// acknowledgement, stranded and replayed by rid (see
     /// [`SessionState::deps_lost`]).
     void_cuts: std::collections::BTreeMap<u64, u64>,
+    /// What the table said when the store was opened ([`SessionState::
+    /// seed_ended_before_open`]): its highest generation and the live ones.
+    /// A generation at or below the first and not among the second ended
+    /// before this incarnation began: the only ones [`SessionState::
+    /// ended_before_open`] lets a check void lazily (an end applied since,
+    /// from a streamed-ahead install, may still strand: only the durable
+    /// log voids those).
+    open_table: Option<(u64, std::collections::BTreeSet<u64>)>,
     /// Plan 30 §M11: the delegation stream positions this node's
     /// clients were answered with (a shadow or hint installed from a
     /// delegate's reply does not raise `observed`, M6's rule, but a
@@ -908,13 +916,31 @@ impl SessionState {
             .collect()
     }
 
+    /// The generations `deps` names (beyond index 0) that this replica
+    /// neither holds far enough nor knows as void.
+    pub fn unreached_deps(&self, deps: &Position) -> Vec<u64> {
+        let g = self.inner.lock().unwrap();
+        deps.streams
+            .iter()
+            .filter(|(gen, i)| {
+                *i > 0 && !g.voided.contains(gen) && !g.streams.get(gen).is_some_and(|m| *m >= *i)
+            })
+            .map(|(gen, _)| gen)
+            .collect()
+    }
+
     /// Void every unreached generation `observed` names for which
     /// `ended` says the generation is over (the persisted delegation
     /// table once delegated it and no longer lists it): the rule
     /// `void_stream` applies at a `Recall`, for a replica that applied
     /// the record in an earlier incarnation. Returns how many.
     pub fn void_ended(&self, ended: impl Fn(u64) -> bool) -> usize {
-        let gens = self.unreached_streams();
+        self.void_ended_among(self.unreached_streams(), ended)
+    }
+
+    /// [`Self::void_ended`] over `gens` (the unreached ones, as
+    /// [`Self::unreached_streams`] or [`Self::unreached_deps`] list them).
+    pub fn void_ended_among(&self, gens: Vec<u64>, ended: impl Fn(u64) -> bool) -> usize {
         let mut n = 0;
         for gen in gens {
             if !ended(gen) {
@@ -1183,9 +1209,16 @@ impl SessionState {
     /// floor: the releaser's frontier, which still names the stream it
     /// was answered from) is never reached: every read under it waits
     /// the whole session budget, for the rest of the process. Seed from
-    /// what the store persists: every generation up to the table's
-    /// `max_gen` is held through the log's index of it, and one the
-    /// table no longer lists is voided at that cut.
+    /// what the store persists: every generation in `gens` (the live ones
+    /// and every one the store keeps a log index or a void cut of;
+    /// numbers are sparse, ADR-43: `epoch << 32 | n`, so there is no
+    /// range to walk) is held through the log's index of it, and one the
+    /// table no longer lists is voided at that cut. A generation the
+    /// table named and ended before this replica applied any row or end
+    /// of it has no key and is not seeded: a check of a dependency that
+    /// names it voids it lazily ([`Self::ended_before_open`], with
+    /// [`Self::seed_ended_before_open`]; `Meta::reaches_deps`), at cut 0
+    /// (what the store holds of it), as the eager seeding gave it.
     ///
     /// Plan 43 C2: the cut of a generation the table no longer lists is
     /// the one its `RecallCut` record carried (`void_cut`, persisted when
@@ -1193,13 +1226,13 @@ impl SessionState {
     /// of an older log ended — what the log holds of it (`log_idx`).
     pub fn seed_generations(
         &self,
-        max_gen: u64,
+        gens: &std::collections::BTreeSet<u64>,
         live: &std::collections::BTreeSet<u64>,
         log_idx: &dyn Fn(u64) -> u64,
         void_cut: &dyn Fn(u64) -> Option<u64>,
     ) {
         let mut g = self.inner.lock().unwrap();
-        for gen in 1..=max_gen {
+        for &gen in gens {
             let idx = log_idx(gen);
             let cur = g.streams.entry(gen).or_insert(0);
             if idx > *cur {
@@ -1215,6 +1248,28 @@ impl SessionState {
         }
         drop(g);
         self.cv.notify_all();
+    }
+
+    /// Remember the table as the store was opened with it (`max_gen`, the
+    /// `live` generations): see [`Self::ended_before_open`].
+    pub fn seed_ended_before_open(&self, max_gen: u64, live: &std::collections::BTreeSet<u64>) {
+        self.inner.lock().unwrap().open_table = Some((max_gen, live.clone()));
+    }
+
+    /// Whether `gen` ended before this incarnation began: the table named
+    /// it (at or below its highest generation) and did not list it when
+    /// the store was opened. The seeding voids the ones it holds a key of;
+    /// this is the rest, which a check of a dependency may void lazily
+    /// (cut 0, what the store holds of it): a generation whose end this
+    /// incarnation applied, or only saw streamed ahead, is the log's to
+    /// void.
+    pub fn ended_before_open(&self, gen: u64) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .open_table
+            .as_ref()
+            .is_some_and(|(max, live)| gen <= *max && !live.contains(&gen))
     }
 
     /// The log's cut of voided generation `gen` (see `Inner::void_cuts`).
@@ -1940,14 +1995,41 @@ impl crate::store::Meta {
     /// the dependency is void, as a `Recall` applied in this incarnation
     /// would have made it.
     fn void_ended_generations(&self) {
-        if self.session.unreached_streams().is_empty() {
+        self.void_ended_among(self.session.unreached_streams());
+    }
+
+    /// The same for the generations `deps` names, called when a check of
+    /// `deps` against the session says no ([`Self::reaches_deps`],
+    /// [`Self::reaches_streams_deps`]): a generation the table ended
+    /// before this incarnation began and this replica held no row or end
+    /// of has no persisted key, so the restart's seeding left it alone
+    /// (ADR-43: numbers are sparse, there is no range to void eagerly), and
+    /// a client's dependency on it would wait for the rest of the process.
+    /// Slow path only, and only for those generations
+    /// ([`SessionState::ended_before_open`]): an end this incarnation saw
+    /// (a streamed-ahead install of a `RecallCut` the successor may strand)
+    /// is the durable log's to void, not a check's. The cut is what the
+    /// session holds of the generation (0 after a restart), as the seeding
+    /// gave it.
+    fn void_ended_deps(&self, deps: &Position) {
+        let gens: Vec<u64> = self
+            .session
+            .unreached_deps(deps)
+            .into_iter()
+            .filter(|gen| self.session.ended_before_open(*gen))
+            .collect();
+        self.void_ended_among(gens);
+    }
+
+    fn void_ended_among(&self, gens: Vec<u64>) {
+        if gens.is_empty() {
             return;
         }
         let table = self.delegation_table();
         let max_gen = table.max_gen();
-        let voided = self
-            .session
-            .void_ended(|gen| gen <= max_gen && !table.iter().any(|d| d.gen == gen));
+        let voided = self.session.void_ended_among(gens, |gen| {
+            gen <= max_gen && !table.iter().any(|d| d.gen == gen)
+        });
         if voided > 0 {
             tracing::info!(
                 voided,
@@ -1956,6 +2038,26 @@ impl crate::store::Meta {
                  incarnation (the delegation table no longer lists them)"
             );
         }
+    }
+
+    /// [`SessionState::reaches`] for `deps`, voiding the generations it
+    /// names that the table ended (see [`Self::void_ended_deps`]) when the
+    /// session says no.
+    pub fn reaches_deps(&self, deps: &Position) -> bool {
+        if self.session.reaches(deps) {
+            return true;
+        }
+        self.void_ended_deps(deps);
+        self.session.reaches(deps)
+    }
+
+    /// [`SessionState::reaches_streams`] for `deps`, as [`Self::reaches_deps`].
+    pub fn reaches_streams_deps(&self, deps: &Position) -> bool {
+        if self.session.reaches_streams(deps) {
+            return true;
+        }
+        self.void_ended_deps(deps);
+        self.session.reaches_streams(deps)
     }
 
     /// [`SessionState::ready`] against this store: whether a read of
@@ -2389,7 +2491,7 @@ mod tests {
             2 => 370,
             _ => 0,
         };
-        s.seed_generations(2, &live, &log_idx, &|_| None);
+        s.seed_generations(&[1, 2].into(), &live, &log_idx, &|_| None);
         assert!(s.reaches(&floor(1, 816)), "the ended generation is void");
         assert!(s.reaches(&floor(1, 900)), "void past its cut too");
         assert!(
@@ -2402,6 +2504,61 @@ mod tests {
             "the live generation is held through the log's index"
         );
         assert!(!s.reaches(&floor(2, 371)), "and no further");
+    }
+
+    /// ADR-43: generation numbers are sparse (`epoch << 32 | n`): the seeding
+    /// walks the numbers the store keeps, not a range up to the highest, and
+    /// a number of epoch 6 does not make five billion of epoch 5's.
+    #[test]
+    fn a_reopened_session_seeds_sparse_generations() {
+        let floor = |g: u64, i: u64| {
+            let mut streams = Streams::NONE;
+            assert!(streams.raise(g, i));
+            Position {
+                seq: 0,
+                pending: None,
+                streams,
+            }
+        };
+        let (old, new) = ((5u64 << 32) | 3, (6u64 << 32) | 1);
+        let live: std::collections::BTreeSet<u64> = [new].into_iter().collect();
+        let log_idx = |g: u64| match g {
+            g if g == old => 7,
+            g if g == new => 2,
+            _ => 0,
+        };
+        let s = SessionState::default();
+        s.seed_generations(&[old, new].into(), &live, &log_idx, &|g| {
+            (g == old).then_some(6)
+        });
+        // The ended one is void at the record's cut (6), not at the log's (7).
+        assert!(s.is_voided(old));
+        assert!(!s.deps_lost(&floor(old, 6)));
+        assert!(s.deps_lost(&floor(old, 7)));
+        assert!(s.reaches(&floor(old, 7)), "void: reached");
+        // The live one is held through the log's index of it, no further.
+        assert!(!s.is_voided(new));
+        assert!(s.reaches(&floor(new, 2)));
+        assert!(!s.reaches(&floor(new, 3)));
+        // A number nobody keeps is not touched.
+        assert!(!s.is_voided(old - 1));
+        assert!(!s.reaches(&floor(old - 1, 1)));
+    }
+
+    /// ADR-43 (review M2): only a generation that ended before this
+    /// incarnation began may be voided lazily by a check; one the table
+    /// lists at open, one above its highest, and one that ends later (a
+    /// streamed-ahead end may strand) may not.
+    #[test]
+    fn only_a_generation_that_ended_before_the_open_is_voided_lazily() {
+        let s = SessionState::default();
+        assert!(!s.ended_before_open(1), "nothing seeded: nothing ended");
+        let (ended, live, ahead) = ((5u64 << 32) | 3, (6u64 << 32) | 1, (6u64 << 32) | 2);
+        s.seed_ended_before_open(live, &[live].into());
+        assert!(s.ended_before_open(ended));
+        assert!(s.ended_before_open(1));
+        assert!(!s.ended_before_open(live));
+        assert!(!s.ended_before_open(ahead));
     }
 
     /// Plan 43 C2: the cut of a generation that ended before the restart is
@@ -2425,13 +2582,13 @@ mod tests {
         // (rows past the cut that were applied before the record's own
         // segment) — the record's cut wins.
         let s = SessionState::default();
-        s.seed_generations(1, &live, &log_idx, &|g| (g == 1).then_some(800));
+        s.seed_generations(&[1].into(), &live, &log_idx, &|g| (g == 1).then_some(800));
         assert_eq!(s.void_cut(1), Some(800));
         assert!(!s.deps_lost(&floor(1, 800)));
         assert!(s.deps_lost(&floor(1, 801)));
         // No record cut (an older log's `Recall`): the log's index, as before.
         let s = SessionState::default();
-        s.seed_generations(1, &live, &log_idx, &|_| None);
+        s.seed_generations(&[1].into(), &live, &log_idx, &|_| None);
         assert_eq!(s.void_cut(1), Some(816));
         assert!(s.deps_lost(&floor(1, 817)));
         assert_eq!(s.void_cut(2), None, "not voided here");

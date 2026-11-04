@@ -5185,7 +5185,9 @@ impl Meta {
     /// seeds 2477 and 2982: the delegate-turned-root crashed inside its
     /// takeover gate, restarted as the generation's delegate and
     /// streamed index 6 to a root waiting for 3, forever). The mark is
-    /// never cleared: generations are never reused.
+    /// never cleared: generations are never reused (ADR-43: a number
+    /// carries the epoch of the tenure that minted it, so no two tenures
+    /// mint the same one).
     ///
     /// The mark is also the gate's fence. The strand, the backup tail
     /// and the replay are separate store transactions, and nothing of

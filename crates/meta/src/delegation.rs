@@ -39,8 +39,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub type NodeId = u64;
-/// A delegation generation: minted by the root, never reused for a
-/// directory (a re-delegation is a new generation).
+/// A delegation generation: minted by the root tenure that grants it, in its
+/// epoch's block (`epoch << 32 | n`, ADR-43), never reused for a directory
+/// (a re-delegation is a new generation) and never minted twice by two
+/// tenures.
 pub type Gen = u64;
 
 /// The log records that maintain the table (phase 2 adds them to
@@ -150,9 +152,11 @@ pub enum DirOwner {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DelegationTable {
     by_dir: BTreeMap<Ino, Vec<Delegation>>,
-    /// The highest generation any `Delegate` record ever named (phase
-    /// 2b: a successor root allocates above it — a generation number is
-    /// a stream's identity, never reused across roots).
+    /// The highest generation any `Delegate` record ever named. A number
+    /// is minted by one tenure in its epoch's block (ADR-43), so no two
+    /// tenures mint the same one and a successor's numbers are above it
+    /// anyway; it floors the next mint (`Meta::next_delegation_gen`) and
+    /// seeds the restart's session (`SessionState::seed_generations`).
     max_gen: Gen,
 }
 
@@ -624,15 +628,47 @@ impl Meta {
         table.resolve(self, keys)
     }
 
-    /// Mint the next delegation generation (the root's persisted
-    /// counter; never reused, a successor root continues above the
-    /// highest generation in the log).
-    pub fn next_delegation_gen(&self, at_least: u64) -> Result<u64, MetaError> {
+    /// Mint the next delegation generation number (ADR-43): `epoch << 32 | n`,
+    /// `epoch` the lease epoch of the tenure that grants it (the caller's
+    /// held S3 lease, one holder per epoch), `n` this node's persisted
+    /// counter. Two tenures therefore never mint the same number, in either
+    /// direction, even when one of them was deposed without knowing it and
+    /// both see the same log: a number names its grant for good, whatever
+    /// a node kept of a grant the log never carried.
+    ///
+    /// A root mints only in its own epoch's block. `at_least` is the floor
+    /// the caller knows of (the log's highest number plus one): it covers a
+    /// counter this store lost (a wiped state directory re-adopting its
+    /// epoch), and a number it, or the persisted counter, names outside the
+    /// block — from any source — is refused rather than minted: this
+    /// replica's table already names a later tenure's grant, so the caller
+    /// is deposed. The counter is on stable storage before the number is
+    /// returned: one epoch spans a restart of its holder (a node
+    /// re-claiming its own lease keeps its epoch) and a number reached the
+    /// stream could otherwise be minted again.
+    pub fn next_delegation_gen(&self, epoch: u64, at_least: u64) -> Result<u64, MetaError> {
+        if epoch == 0 || epoch > GEN_MAX_EPOCH {
+            return Err(MetaError::Invalid(format!(
+                "epoch {epoch} cannot mint a generation number"
+            )));
+        }
+        let base = epoch << GEN_EPOCH_SHIFT;
+        let top = base | u64::from(u32::MAX);
         let mut tx = self.db.write_tx();
         let cur = crate::store::kv_get_tx(&tx, &self.local, KV_NEXT_DELEG_GEN)?
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1);
-        let gen = cur.max(at_least);
+            .unwrap_or(0);
+        let gen = cur.max(at_least).max(base + 1);
+        if gen_epoch(gen) != epoch {
+            return Err(MetaError::Invalid(format!(
+                "generation {gen} is outside epoch {epoch}'s block: not minting"
+            )));
+        }
+        if gen >= top {
+            return Err(MetaError::Invalid(format!(
+                "the generation numbers of epoch {epoch} are exhausted"
+            )));
+        }
         crate::store::kv_set_tx(
             &mut tx,
             &self.local,
@@ -640,6 +676,7 @@ impl Meta {
             &(gen + 1).to_string(),
         );
         tx.commit()?;
+        self.sync()?;
         Ok(gen)
     }
 }

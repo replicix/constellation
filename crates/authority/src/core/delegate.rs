@@ -7895,11 +7895,20 @@ impl Core {
             }
             self.dl.designating.remove(&dir);
         }
-        // Above every generation the log ever named (a predecessor's
-        // ended ones included): a generation is a stream's identity.
+        // ADR-43: a generation is a stream's identity, minted by one
+        // tenure in its own epoch's block (`epoch << 32 | n`), the epoch of
+        // the S3 lease this node holds (one holder per lease epoch, so two
+        // tenures never mint the same number, even when one of them was
+        // deposed without knowing it). Above every number the log named
+        // as the floor of a lost counter; a number outside the block, from
+        // any source, is refused.
+        let epoch = self
+            .lease
+            .held_epoch()
+            .ok_or("this node holds no S3 lease epoch to mint a generation in")?;
         let highest = table.max_gen();
         let gen = replica
-            .next_delegation_gen(highest + 1)
+            .next_delegation_gen(epoch, highest + 1)
             .map_err(|e| e.to_string())?;
         let designated = kind == DelegKind::Designated;
         let _class = self.journal_class();

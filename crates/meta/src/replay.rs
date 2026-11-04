@@ -1011,14 +1011,21 @@ fn apply_one(
             range,
         } => {
             // A generation number is unique in the log, so a grant of `gen`
-            // is preceded by no end of it there: a void on it here is one a
-            // deposed root's own journaled end left (`void_stream` when the
-            // `RecallCut` was journaled), whose row never reached the log
-            // with the grant before it. The successor reused the number the
-            // log never named. Left voided, the new generation's rows would
-            // drop out of this node's `deps` (placement-hot seed 6239: its
-            // own row, and the root executed its next write ahead of it).
-            // Lifting a void satisfies no wait; it can only make one.
+            // is preceded by no end of it there: a void on it here would be
+            // one a deposed root's own journaled end left (`void_stream`
+            // when the `RecallCut` was journaled) whose row never reached
+            // the log with the grant before it. Before ADR-43 a successor
+            // re-minted a number the log never named, so the new
+            // generation met that void and, left voided, its rows dropped
+            // out of this node's `deps` (placement-hot seed 6239: its own
+            // row, and the root executed its next write ahead of it). A
+            // number now carries its minting epoch (`epoch << 32 | n`), so
+            // two tenures never mint the same one and a grant never meets
+            // another grant's void: the lift stays as a guard that costs
+            // nothing (lifting a void satisfies no wait; it can only make
+            // one). The test
+            // `a_reused_generation_number_drops_the_void_a_deposed_roots_unshipped_end_left`
+            // keeps the guard honest.
             if meta.session().is_voided(*gen) {
                 meta.session().unvoid(*gen);
             }

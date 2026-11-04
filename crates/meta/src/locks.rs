@@ -7907,7 +7907,7 @@ mod window_tests {
         let meta = crate::Meta::open_in_memory().unwrap();
         mint(meta.locks(), 2, 1, X, 1_000);
         meta.locks().take_where(|_| {
-            let _ = meta.next_delegation_gen(1);
+            let _ = meta.next_delegation_gen(1, 1);
             true
         });
     }
