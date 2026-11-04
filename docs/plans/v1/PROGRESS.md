@@ -66029,5 +66029,14 @@ cursor, and the member's acknowledged, unshipped rows were lost (I1). Pre-existi
   the no-tail claimant, N4 after a restart, and the guards (a tail follows; a marker of a later epoch's takeover; a grant the
   log carries, on a replica and on a claimant). With the rule disabled, the four new rule pins and the two earlier abandon
   pins fail; the guards pass.
-- **Still open**: a takeover that carries a tail (a replica cannot tell where in the predecessor's journal the grant sat), and a
-  rebuild window spanning the marker.
+- **Review round (orph2)**: the no-tail proof is honoured on the first segment of an epoch only (a root re-adopting its own
+  lease ships a second marker of its epoch whose no-tail record would end a grant its tenure's tail still re-ships; the
+  claimant of a re-adoption gets no no-tail proof; pin `a_re_adoption_marker_proves_nothing_of_the_tail_its_tenure_re_ships`).
+  The claimant's proof is persisted per epoch before its marker ships and read by a same-epoch re-adoption's strand (a claimant
+  crash between marker and strand); never written on a re-adoption; a released takeover (no marker) keeps none. Pinned: the
+  crash, the epoch key, the released takeover, the gate's `stopped` marking of an orphan-ended generation, and the re-append
+  guard (each fails with its code disabled).
+- **Still open**: a takeover that carries a tail (a replica cannot tell where in the predecessor's journal the grant sat); a
+  rebuild window spanning the marker; a re-adoption whose crashed predecessor never landed its first marker; a failed write of
+  the persisted proof; and sticky grants (plan 46 M1.2), which void the no-tail rule's premise (a number is journaled only by
+  its epoch's tenure) and need the rule revisited before they land.

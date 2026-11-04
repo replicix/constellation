@@ -2877,9 +2877,14 @@ block.
   outstanding speculation carries. The orphan-rows item is closed for the operator-abandon and the no-tail takeover cases
   (`OrphanProof`): an abandon of the root group of an epoch (`GroupAbandoned { gen: 0 }`) proves the log never grants a
   number of that epoch or an older one that it does not carry yet; a takeover marker that carries no tail
-  (`TailFollowsThrough { prev_epoch, through: 0 }`, no other tail announced) proves it for numbers of `prev_epoch` only (that
-  journal was held past the log by no member, its later segments are fenced, and only a tenure's own successor re-ships its
-  tail; an older epoch's committed rows may still ride a tail a later claim fetches, D2). A covered number that the table no
+  (`TailFollowsThrough { prev_epoch, through: 0 }`, no other tail announced) proves it for numbers of `prev_epoch` only (its
+  later segments are fenced, none of it is re-shipped, and only a tenure's own successor re-ships a tenure's tail; an older epoch's
+  committed rows may still ride a tail a later claim fetches, D2; members may hold committed rows of that epoch, as after a
+  claim without a tail, and drop them under member rule 2, and a committed entry's grant is never stranded, so stays listed).
+  Only the first marker of an epoch carries the no-tail proof: a root that re-adopts its own lease after a restart keeps its
+  epoch and ships a second marker whose no-tail record says nothing of the tail its tenure's first marker announced and its
+  journal may still hold, so a replica honours the record on the first segment of an epoch only, and the claimant of a
+  re-adoption never gets one A covered number that the table no
   longer lists, that this replica holds no trace of in the log (no cut key, no log index) and that no outstanding speculation
   ends is ended as the log's `Recall` would, at what the log holds of it (0), after the cut loop (a generation the segment
   itself ends stays out by its cut key): its rows roll back and replay by rid. Candidates are the table's list before the
@@ -2893,9 +2898,16 @@ block.
   voids at restart; cut keys come only from a durable end the log applied, a root's own journaled end (retracted on strand),
   a rebuild's copy of the side replica's keys, or this rule, so a streamed-ahead end (no key) stays live. The N4 case (a
   streamed-ahead `Delegate(g)` and `RecallCut(g)` both outstanding at a restart, then stranded) is closed when the strand is a
-  covered marker's. Residuals, still open: a takeover that carries a tail (a grant past the sealed `through` never ships, but
-  a replica cannot tell where the grant sat without per-row tail facts), so the stall and the N4 wait remain there; and a
-  rebuild window spanning the marker.
+  covered marker's. The claimant's proof is persisted per epoch (`local["gate_orphan_proof"]`) before its marker can
+  ship, and the strand of a re-adoption of the same epoch reads it back (an other epoch's is ignored; a re-adoption writes none),
+  so a claimant that crashed between its marker and its strand still runs the rule; a takeover that ships no marker (a released
+  lease) computes and keeps no proof. Residuals, still open: a takeover that carries a tail (a grant past the sealed `through`
+  never ships, but a replica cannot tell where the grant sat without per-row tail facts), so the stall and the N4 wait remain
+  there; a rebuild window spanning the marker; a re-adoption whose crashed predecessor never landed its first marker (the
+  re-adoption's marker is then the first of the epoch and carries a no-tail record the persisted proof may contradict); the
+  persisted proof's write failing (logged; the crash window is then open); and a sticky grant (plan 46 M1.2: a later tenure
+  journals `Delegate` for an older number), which voids the no-tail rule's premise that a number is minted and journaled only by
+  its epoch's tenure: the rule must be revisited before sticky grants land.
 - Plan 46 M1.2: `DelegateNode.gen` is minted by the same rule; a sticky grant keeps
   its minting epoch across tenures (the number is the grant's identity, not the
   holder's ownership); `gen_epoch(gen) == my epoch` now says "granted by this
