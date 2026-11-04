@@ -43010,6 +43010,93 @@ mod recall_cut {
             "(cursor of generation 8, refused)"
         );
     }
+
+    /// A root that lacks a batch's deps refuses it and appends nothing: a
+    /// refusal (`deleg_deps_refused`), not a causal cut
+    /// (`deleg_deps_unsatisfied_at_append`, a row appended ahead of its
+    /// cause). `long-delegated-late-answers` seed 4947: the oracle counted
+    /// the refusal of a deposed root as a violation.
+    #[test]
+    fn a_batch_whose_deps_the_root_lacks_is_refused_not_appended_ahead() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let _ = locks::delegated_file(&h.meta);
+        let e = h.meta.allocate_ino(ROOT_INO).unwrap();
+        Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "e".into(),
+                    ino: e,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 3,
+                },
+                LogRecord::Delegate {
+                    dir: e,
+                    node: 4,
+                    gen: 8,
+                    designated: false,
+                    range: (0, 0),
+                },
+            ],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.gens.contains_key(&8));
+        let ino = h.meta.allocate_ino(e).unwrap();
+        let rid = Rid {
+            node: 4,
+            incarnation: 1,
+            seq: 1,
+        };
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegateStream {
+                req: OpId(5),
+                gen: 8,
+                round: 0,
+                txs: vec![constellation_meta::DelegateTx {
+                    idx: 1,
+                    rid: Some(rid),
+                    records: vec![
+                        LogRecord::Create {
+                            parent: e,
+                            name: "g".into(),
+                            ino,
+                            mode: 0o644,
+                            uid: 0,
+                            gid: 0,
+                            time_ns: 9,
+                        },
+                        LogRecord::Completed { rid },
+                    ],
+                    deps: constellation_meta::Position::ZERO.with_streams_wire(&[(7, 5)]),
+                }],
+                leaving: Vec::new(),
+                leaving_barriers: Vec::new(),
+            },
+        });
+        assert_eq!(
+            (
+                h.core.dl.gens[&8].cursor,
+                h.core.stats.deleg_deps_refused,
+                h.core.stats.deleg_deps_unsatisfied_at_append
+            ),
+            (0, 1, 0),
+            "(cursor of generation 8, refused, appended ahead of deps)"
+        );
+    }
 }
 
 /// Plan 43 C2 (§2.1, §3.1-3.5): a delegate acknowledges once its group holds

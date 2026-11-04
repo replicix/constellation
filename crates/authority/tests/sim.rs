@@ -8754,6 +8754,20 @@ fn delegated_group_switch_acknowledges_only_through_the_recorded_group() {
     );
 }
 
+/// Oracle false positive, pinned: seed 4947 of `long-delegated-late-answers`.
+/// A root deposed without knowing it refused a delegate's batch for lacking
+/// its deps (nothing was appended), which the causal-cut counter took for an
+/// append ahead of them.
+#[test]
+fn regression_a_deposed_roots_refusal_is_no_causal_cut_seed_4947() {
+    run_seed(4947, long_delegated_late_answers_config()).unwrap_or_else(|e| {
+        panic!(
+            "long-delegated-late-answers seed 4947: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=long-delegated-late-answers"
+        )
+    });
+}
+
 /// Plan 46 M0.3: the findings of `delegated-group-switch`, pinned for the
 /// follow-up fixes: seed 234 acknowledges a row (I1) while the group's version
 /// is changing, with no backup recorded and the root's journal lacking the

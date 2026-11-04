@@ -1116,6 +1116,9 @@ pub struct Stats {
     pub deleg_appended_txs: u64,
     pub deleg_stream_refusals: u64,
     pub deleg_deps_unsatisfied_at_append: u64,
+    /// Batches the root refused because its replica lacks their deps:
+    /// nothing was appended (a deposed root the delegate re-streamed to).
+    pub deleg_deps_refused: u64,
     pub deleg_cross_subtree: u64,
     pub deleg_recalls_sent: u64,
     pub deleg_recalls_drained: u64,

@@ -7769,7 +7769,11 @@ impl Core {
                 break;
             }
             if !replica.reaches_streams(&tx.deps) {
-                self.stats.deleg_deps_unsatisfied_at_append += 1;
+                // A refusal, not a causal cut: nothing was appended. A root
+                // that was deposed without knowing it (the delegate
+                // re-streams to the new root, whose segment it has not
+                // applied) lacks deps the delegate did wait for.
+                self.stats.deleg_deps_refused += 1;
                 tracing::debug!(
                     node = self.me(),
                     gen = %constellation_meta::delegation::GenLabel::of(gen),
@@ -7782,6 +7786,12 @@ impl Core {
             }
             match replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps) {
                 Ok(_) => {
+                    // The causal cut, judged on the log: the row is in it,
+                    // and a replica that does not reach its deps now
+                    // appended it ahead of its cause.
+                    if !replica.reaches_streams(&tx.deps) {
+                        self.stats.deleg_deps_unsatisfied_at_append += 1;
+                    }
                     replica.note_foreign_executed(&tx.records);
                     cursor = tx.idx;
                     appended += 1;

@@ -5397,11 +5397,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 stats.deleg_lost_after_ack, report.stats
             ));
         }
-        if stats.deleg_deps_unsatisfied_at_append > 0 {
-            return Err(format!(
-                "node {id} appended {} delegate batches whose deps it lacked (causal cut)\n  stats: {:#?}",
-                stats.deleg_deps_unsatisfied_at_append, report.stats
-            ));
+        if let Some(why) = causal_cut_violation(*id, stats) {
+            return Err(format!("{why}\n  stats: {:#?}", report.stats));
         }
     }
     if report.marker_violations > 0 {
@@ -6337,6 +6334,23 @@ impl tracing_subscriber::fmt::time::FormatTime for SimTime {
     }
 }
 
+/// The causal cut, judged on what a root appended: a delegate's row that
+/// landed in its log ahead of a dependency it lacked. A batch the root
+/// *refused* for lacking its deps (`deleg_deps_refused`: a root deposed
+/// without knowing it, to which the delegate re-streamed) appended nothing
+/// and is no violation (`long-delegated-late-answers` seed 4947).
+fn causal_cut_violation(
+    id: NodeId,
+    stats: &constellation_authority::core::Stats,
+) -> Option<String> {
+    (stats.deleg_deps_unsatisfied_at_append > 0).then(|| {
+        format!(
+            "node {id} appended {} delegate batches whose deps it lacked (causal cut)",
+            stats.deleg_deps_unsatisfied_at_append
+        )
+    })
+}
+
 #[cfg(test)]
 mod exec_identity_tests {
     use super::*;
@@ -6492,5 +6506,18 @@ mod exec_identity_tests {
             &[],
         );
         assert!(exec_identity(&norow).is_empty());
+    }
+
+    /// A refusal is not a violation; a row appended ahead of its cause is.
+    #[test]
+    fn a_refused_batch_is_no_causal_cut_but_a_row_ahead_of_its_cause_is() {
+        let mut stats = constellation_authority::core::Stats {
+            deleg_deps_refused: 3,
+            ..Default::default()
+        };
+        assert_eq!(causal_cut_violation(1, &stats), None);
+        stats.deleg_deps_unsatisfied_at_append = 1;
+        let why = causal_cut_violation(1, &stats).expect("a violation");
+        assert!(why.contains("causal cut"), "{why}");
     }
 }
