@@ -2365,8 +2365,24 @@ fn with_writes(rng: &mut StdRng, steps: Vec<Step>, ratio: f64) -> Vec<Step> {
 /// record was shipped from (`history::JournalOrder`): a segment's `rows`
 /// pair with its non-`Atime` records.
 fn journal_order(oracle: &check::Oracle) -> super::history::JournalOrder {
+    journal_rows(oracle.completed_at.iter(), oracle)
+}
+
+/// The journal rows of the `Refused` rows the session check places
+/// (`Oracle::refused_at`), as [`journal_order`] numbers completions.
+fn refused_journal_order(oracle: &check::Oracle) -> super::history::JournalOrder {
+    journal_rows(
+        oracle.refused_at.iter().map(|(rid, (at, _))| (rid, at)),
+        oracle,
+    )
+}
+
+fn journal_rows<'a>(
+    at: impl Iterator<Item = (&'a Rid, &'a (u64, usize))>,
+    oracle: &check::Oracle,
+) -> super::history::JournalOrder {
     let mut out = super::history::JournalOrder::new();
-    for (rid, (seq, idx)) in &oracle.completed_at {
+    for (rid, (seq, idx)) in at {
         let Some(seg) = oracle.unfenced.get(seq) else {
             continue;
         };
@@ -5522,6 +5538,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         &tentative,
         &oracle.completed_at,
         &oracle.refused_at,
+        &journal,
+        &refused_journal_order(&oracle),
         // The fallback window's scope (above).
         match (per_dir, cfg.check_range_bits) {
             (false, _) => super::session::Scope::Global,
