@@ -2936,7 +2936,7 @@ impl Core {
                 locks,
             } => {
                 // Back in the root's table (tag 0).
-                self.lock_install_returned(now, req, gen, locks, replica);
+                self.lock_install_returned(now, gen, locks, replica);
                 self.on_deleg_recalled(now, req, gen, through, replica, out)
             }
             PeerMsg::LockRequest {

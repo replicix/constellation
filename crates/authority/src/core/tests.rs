@@ -30331,17 +30331,77 @@ mod locks {
             first.carry[0].1,
             "measured again"
         );
-        // The root installs the grant once: the repeated answer to the
-        // recall's other try moves nothing.
+        // The root installs the grant once, whichever try's answer comes
+        // first: here the answer to a try that is no longer registered (a
+        // request id of its own, as each send has; it installs, and drains
+        // nothing), then the answer to the registered one: moves nothing.
         let (mut r, _, _, recall) = recalling_root(5_000);
         r.now = d.now;
-        recalled(&mut r, recall, second.clone());
+        let other_try = OpId(recall.0 + 1);
+        recalled(&mut r, other_try, second.clone());
         assert_eq!(r.core.stats.lock_moved, 1);
         recalled(&mut r, recall, first);
         assert_eq!(r.core.stats.lock_moved, 1);
+        assert_eq!(r.core.stats.lock_returned_duplicates, 1);
         assert_eq!(r.meta.locks().grants_len(), 1);
+        assert!(r.meta.locks().get(g).is_some());
         // The cache goes with the `handed_back` entry.
         assert!(d.core.dl.recall_grants.contains_key(&7));
+    }
+
+    /// L3 (review F1): a recall's hand-back is installed only where it is
+    /// still a grant: the delegate hands the cached grant back to a later
+    /// recall of the generation, even one by a root that inherited it after
+    /// the first root served the subtree (the holder released, another node
+    /// was granted exclusively). Installed there, it sat beside the new
+    /// grant. Fails before: both grants are in the table.
+    #[test]
+    fn l3_a_cached_hand_back_is_not_installed_beside_a_conflicting_grant() {
+        let (mut r, _, f, recall) = recalling_root(5_000);
+        let x = GrantId { node: 1, seq: 77 };
+        r.meta.locks().install(constellation_meta::locks::Grant {
+            id: x,
+            node: 2,
+            ino: f,
+            mode: X,
+            until: WaitMs(r.now.0 + 5_000),
+            recalled: false,
+            gen: 0,
+            confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
+            settled: false,
+        });
+        let g = GrantId { node: 3, seq: 9 };
+        let back = handback_of(g, f, r.now.0 + 500, Some(500));
+        recalled(&mut r, recall, back);
+        assert!(r.meta.locks().get(g).is_none(), "beside a live exclusive");
+        assert!(r.meta.locks().get(x).is_some());
+        assert_eq!(r.meta.locks().grants_len(), 1);
+    }
+
+    /// L3 (review F1): a grant this table ended (its holder released it
+    /// here) is not brought back by a recall's hand-back.
+    #[test]
+    fn l3_a_cached_hand_back_does_not_revive_a_released_grant() {
+        let (mut r, _, f, recall) = recalling_root(5_000);
+        let g = GrantId { node: 3, seq: 9 };
+        r.meta.locks().install(constellation_meta::locks::Grant {
+            id: g,
+            node: 4,
+            ino: f,
+            mode: X,
+            until: WaitMs(r.now.0 + 5_000),
+            recalled: false,
+            gen: 0,
+            confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
+            settled: false,
+        });
+        release_of(&mut r, 4, f, g);
+        assert!(r.meta.locks().was_ended(g));
+        assert!(r.meta.locks().get(g).is_none());
+        let back = handback_of(g, f, r.now.0 + 500, Some(500));
+        recalled(&mut r, recall, back);
+        assert!(r.meta.locks().get(g).is_none(), "revived");
+        assert_eq!(r.meta.locks().grants_len(), 0);
     }
 
     /// Core test 4: a grant its holder renewed is carried too (it may be

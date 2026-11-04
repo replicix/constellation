@@ -491,13 +491,15 @@ pub(crate) struct LockState {
     /// exclusive holders).
     handed: BTreeMap<u64, Vec<Grant>>,
     /// Root, plan 43 C7-F follow-up (the review's H1): the grants a
-    /// delegate's recall answer handed back, per generation, by `(grant,
-    /// recall)`. A duplicate of the answer (the peer layer re-sent it, a
-    /// retried stream) is the same message: installed again, a record the
-    /// root released or superseded since would come back, and one it kept
-    /// would be restamped (later), and F-c admits a late renewal from a
-    /// record. Each pair installs once; dropped with the generation.
-    returned: BTreeMap<u64, std::collections::BTreeSet<(GrantId, OpId)>>,
+    /// delegate's recall answer handed back, per generation, by grant id.
+    /// A duplicate of the answer (the peer layer re-sent it, a retried
+    /// stream, or the answer to another try of the same recall: L3 sends
+    /// the recall again and the delegate hands back the same grants) is
+    /// installed again: a record the root released or superseded since
+    /// would come back, and one it kept would be restamped (later), and
+    /// F-c admits a late renewal from a record. Each grant installs once
+    /// per generation; dropped with the generation.
+    returned: BTreeMap<u64, std::collections::BTreeSet<GrantId>>,
     /// Delegate: the moved grant ids a generation installed (a re-sent
     /// handoff installs each once: a grant released or replaced here
     /// since is not revived).
@@ -6783,7 +6785,6 @@ impl Core {
     pub(crate) fn lock_install_returned(
         &mut self,
         now: Now,
-        req: OpId,
         gen: u64,
         back: constellation_meta::locks::LockHandback,
         replica: &dyn Replica,
@@ -6834,15 +6835,13 @@ impl Core {
             }
             return;
         }
-        // Each (grant, recall) once: a duplicate of the answer brings back
-        // nothing the first did not (a record released or superseded since
-        // stays gone), and extends none (it would be restamped later).
+        // Each grant of the generation once, whichever try of the recall
+        // brought it: a duplicate of the answer brings back nothing the
+        // first did not (a record released or superseded since stays
+        // gone), and extends none (it would be restamped later).
         let seen = self.lk.returned.entry(gen).or_default();
         let before = grants.len();
-        let grants: Vec<GrantWire> = grants
-            .into_iter()
-            .filter(|g| seen.insert((g.id, req)))
-            .collect();
+        let grants: Vec<GrantWire> = grants.into_iter().filter(|g| seen.insert(g.id)).collect();
         if grants.len() < before {
             self.stats.lock_returned_duplicates += (before - grants.len()) as u64;
             tracing::debug!(
@@ -6943,6 +6942,21 @@ impl Core {
             };
             g.settled &= first;
             if gen == 0 {
+                // A recall's hand-back is a copy from the delegate: one this
+                // table ended since (released here after an earlier answer,
+                // `lock_install_leaving`) or one beside a conflicting grant
+                // of another node (a root that served the subtree after the
+                // first answer, then lost the lease to one that recalled
+                // the generation again: L3) is dead, and stays out.
+                if replica.locks().was_ended(g.id)
+                    || !replica
+                        .locks()
+                        .conflicting(g.ino, g.node, g.mode, now.wait)
+                        .is_empty()
+                {
+                    self.stats.lock_returned_after_end += 1;
+                    continue;
+                }
                 if left.is_some() {
                     replica.locks().install_keeping_later(g);
                 } else {
