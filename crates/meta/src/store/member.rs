@@ -1010,15 +1010,17 @@ mod release_tests {
     fn a_release_takes_effect_after_the_commit_only() {
         let meta = Meta::open_in_memory().unwrap();
         let key = [ReadKey::Dentry(1, "x".into())];
-        let keys = || crate::KeySet::from_records(&[crate::LogRecord::Create {
-            parent: 1,
-            name: "x".into(),
-            ino: 7,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            time_ns: 1,
-        }]);
+        let keys = || {
+            crate::KeySet::from_records(&[crate::LogRecord::Create {
+                parent: 1,
+                name: "x".into(),
+                ino: 7,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            }])
+        };
         let mut tx = meta.db.write_tx();
         assert!(put_row_tx(&mut tx, &meta, 3, &row(5)).unwrap());
         tx.commit().unwrap();

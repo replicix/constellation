@@ -5485,6 +5485,7 @@ impl Meta {
                 |entry| entry.stranded_by_recall(&ended),
                 false,
                 true,
+                false,
                 |_| false,
             )?;
             stranded.shadows += more.shadows;
