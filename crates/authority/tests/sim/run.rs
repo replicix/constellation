@@ -2377,6 +2377,26 @@ fn refused_journal_order(oracle: &check::Oracle) -> super::history::JournalOrder
     )
 }
 
+/// The sequencer of each completed rid (`session::SequencerOf`): its
+/// row's tenure and origin generation (`seg.origins`).
+fn sequencer_order(oracle: &check::Oracle) -> super::session::SequencerOf {
+    let mut out = super::session::SequencerOf::new();
+    for (rid, (seq, idx)) in &oracle.completed_at {
+        let Some(seg) = oracle.unfenced.get(seq) else {
+            continue;
+        };
+        let j = seg.records[..*idx]
+            .iter()
+            .filter(|rec| !matches!(rec, LogRecord::Atime { .. }))
+            .count();
+        if seg.rows.get(j).is_some() {
+            let gen = seg.origins.get(j).map_or(0, |o| o.0);
+            out.insert(*rid, (seg.epoch, seg.node, gen));
+        }
+    }
+    out
+}
+
 fn journal_rows<'a>(
     at: impl Iterator<Item = (&'a Rid, &'a (u64, usize))>,
     oracle: &check::Oracle,
@@ -5540,6 +5560,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         &oracle.refused_at,
         &journal,
         &refused_journal_order(&oracle),
+        &sequencer_order(&oracle),
         // The fallback window's scope (above).
         match (per_dir, cfg.check_range_bits) {
             (false, _) => super::session::Scope::Global,
