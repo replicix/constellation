@@ -15779,6 +15779,297 @@ mod locks {
         assert_eq!(own, 0, "re-appended without its deps");
     }
 
+    /// ADR-43 (orphan grants): a node that is the delegate of `g`, a grant
+    /// of epoch 1 only a streamed (committed) entry carried, and has
+    /// executed a row of it; its core holds the generation.
+    fn orphan_delegate_of(g: u64) -> Harness {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.meta
+            .install_streamed_committed(
+                1,
+                1,
+                1,
+                1,
+                &[LogRecord::Delegate {
+                    dir: ROOT_INO,
+                    node: 3,
+                    gen: g,
+                    designated: false,
+                    range: (0, 0),
+                }],
+                true,
+                (0, 0),
+            )
+            .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine.contains_key(&g), "the core holds it");
+        let op = MutateOp::Create {
+            parent: ROOT_INO,
+            name: "x".into(),
+            ino: h.meta.allocate_ino(ROOT_INO).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let rid = Rid {
+            node: 3,
+            incarnation: 1,
+            seq: 1,
+        };
+        h.meta
+            .delegate_execute(
+                &op,
+                Some(rid),
+                g,
+                Default::default(),
+                &constellation_meta::locks::LockTag::NONE,
+                Now::same(0),
+            )
+            .unwrap();
+        h
+    }
+
+    fn takeover_gate(shipped: bool) -> PendingGate {
+        PendingGate {
+            epoch: 2,
+            takeover: true,
+            marker_shipped: shipped,
+            drained: false,
+            fast_prev: false,
+            backup_tail_epoch: None,
+            shippable: false,
+        }
+    }
+
+    /// The lease this node holds after `Harness::hold`.
+    fn held_lease(h: &Harness) -> constellation_store_s3::Lease {
+        h.core.lease.held.as_ref().map(|(l, _)| l.clone()).unwrap()
+    }
+
+    /// ADR-43 (review SHOULD-2): a claimant that crashed between its marker
+    /// and the strand of its gate. The restart re-adopts the lease at the
+    /// same epoch, whose own marker proves nothing; the claim's proof was
+    /// written before its marker could ship, and the strand of the
+    /// re-adoption runs it: the generation the log never granted is ended,
+    /// its row not shipped ungranted. Fails without the persisted proof
+    /// (void_cut None).
+    #[test]
+    fn a_claimant_that_crashed_before_its_strand_still_runs_the_orphan_rule() {
+        let g = (1u64 << constellation_meta::delegation::GEN_EPOCH_SHIFT) | 1;
+        let mut h = orphan_delegate_of(g);
+        h.hold(2, Some(takeover_gate(false)));
+        let mut out = Vec::new();
+        h.core.issue_marker(0, &h.meta, &mut out);
+        let want = constellation_meta::OrphanProof {
+            upto: None,
+            no_tail: Some(1),
+        };
+        assert_eq!(
+            crate::replica::Replica::gate_orphan_proof_persisted(&h.meta),
+            Some((2, want)),
+            "written before the marker ships"
+        );
+        // The crash: the core's memory goes, the store stays. The restart
+        // re-adopts its own lease at epoch 2 and finishes the gate.
+        h.core = Core::new(h.core.cfg.clone());
+        let mut gate = takeover_gate(true);
+        gate.drained = true;
+        h.hold(2, Some(gate));
+        let prev = held_lease(&h);
+        h.core.bk.gate_orphan_proof = h.core.claim_orphan_proof(&h.meta, Some(&prev), 2, true);
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.meta.void_cut(g).unwrap(), Some(0), "the rule ran");
+        assert!(
+            !h.meta.journal_own_gens().unwrap().contains(&g),
+            "its row would ship ungranted"
+        );
+        assert_eq!(
+            crate::replica::Replica::gate_orphan_proof_persisted(&h.meta),
+            None,
+            "cleared with the gate"
+        );
+    }
+
+    /// The persisted proof is keyed by its epoch: a re-adoption at another
+    /// epoch ignores it; a re-adoption never writes one.
+    #[test]
+    fn a_persisted_orphan_proof_counts_for_its_epoch_only_and_a_re_adoption_writes_none() {
+        let mut h = Harness::new(3);
+        let proof = constellation_meta::OrphanProof {
+            upto: Some(1),
+            no_tail: Some(1),
+        };
+        crate::replica::Replica::persist_gate_orphan_proof(&h.meta, Some((2, proof))).unwrap();
+        h.hold(3, Some(takeover_gate(true)));
+        let prev = held_lease(&h);
+        let (e, p) = h
+            .core
+            .claim_orphan_proof(&h.meta, Some(&prev), 3, true)
+            .expect("a re-adoption");
+        assert_eq!(e, 3);
+        assert!(p.no_tail.is_none() && p.upto.is_none(), "another epoch's proof: {p:?}");
+        let (_, p) = h
+            .core
+            .claim_orphan_proof(&h.meta, Some(&prev), 3, true)
+            .unwrap();
+        assert!(p.is_empty());
+        // A fresh claim fixes nothing at the claim (its marker does).
+        let mut other = prev.clone();
+        other.holder = 1;
+        assert!(h
+            .core
+            .claim_orphan_proof(&h.meta, Some(&other), 4, true)
+            .is_none());
+        // A re-adoption at epoch 2 would read it (the epoch matches).
+        assert_eq!(
+            h.core
+                .claim_orphan_proof(&h.meta, Some(&{ let mut l = prev.clone(); l.epoch = 2; l }), 2, true)
+                .map(|(_, p)| p),
+            Some(proof)
+        );
+        // Its marker, issued on a re-adoption, writes nothing.
+        crate::replica::Replica::persist_gate_orphan_proof(&h.meta, None).unwrap();
+        h.hold(3, Some(takeover_gate(false)));
+        h.core.bk.gate_orphan_proof = h.core.claim_orphan_proof(&h.meta, Some(&prev), 3, true);
+        let mut out = Vec::new();
+        let mut gate = takeover_gate(false);
+        gate.epoch = 3;
+        h.hold(3, Some(gate));
+        h.core.issue_marker(0, &h.meta, &mut out);
+        assert_eq!(
+            crate::replica::Replica::gate_orphan_proof_persisted(&h.meta),
+            None
+        );
+    }
+
+    /// ADR-43 (review SHOULD-3): a takeover of a released lease ships no
+    /// marker, so no replica runs the no-tail rule; its claimant must not
+    /// run it either. Fails when the claim computes a proof for it (g ended).
+    #[test]
+    fn a_released_takeover_computes_no_orphan_proof() {
+        let g = (1u64 << constellation_meta::delegation::GEN_EPOCH_SHIFT) | 1;
+        let mut h = orphan_delegate_of(g);
+        h.hold(2, Some(takeover_gate(true)));
+        let prev = held_lease(&h);
+        let mut other = prev.clone();
+        other.holder = 1;
+        other.released = true;
+        other.epoch = 1;
+        h.core.bk.gate_orphan_proof = h.core.claim_orphan_proof(&h.meta, Some(&other), 2, false);
+        let mut out = Vec::new();
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.meta.void_cut(g).unwrap(), None, "nothing announced");
+        assert!(h.meta.journal_own_gens().unwrap().contains(&g));
+        assert_eq!(
+            crate::replica::Replica::gate_orphan_proof_persisted(&h.meta),
+            None
+        );
+    }
+
+    /// ADR-43 (review SHOULD-4): the generation the orphan rule ended at the
+    /// gate (the abandoned group's grant, no backup tail: `own_gens` empty)
+    /// is stopped in the core. Fails with the `stopped` loop on `own_gens`
+    /// alone.
+    #[test]
+    fn the_takeover_gate_stops_a_generation_the_orphan_rule_ended() {
+        let g = (1u64 << constellation_meta::delegation::GEN_EPOCH_SHIFT) | 1;
+        let mut h = orphan_delegate_of(g);
+        h.hold(2, Some(takeover_gate(true)));
+        h.core.bk.gate_abandoned = Some(1);
+        assert!(!h.core.dl.mine[&g].stopped);
+        let mut out = Vec::new();
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.meta.void_cut(g).unwrap(), Some(0));
+        assert!(h.meta.delegate_stranded(g).unwrap());
+        assert!(h.core.dl.mine[&g].stopped, "the gate left it running");
+    }
+
+    /// ADR-43 (review SHOULD-4, the re-append guard): the tail this claimant
+    /// re-applies does not carry the grant of a generation it holds own
+    /// rows of (the table does not list it): none is appended after the
+    /// tail, the log would carry rows of a generation it never granted; they
+    /// replay by rid. Fails without the `listed` check (both re-appended).
+    #[test]
+    fn the_takeover_gate_re_appends_no_row_of_a_generation_the_table_does_not_list() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "d".into(),
+                ino: dir,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            }],
+        )
+        .unwrap();
+        two_delegate_rows(&h, dir);
+        assert!(h.meta.delegation_table().iter().all(|d| d.gen != 7));
+        let tail = vec![
+            LogRecord::Create {
+                parent: ROOT_INO,
+                name: "t".into(),
+                ino: h.meta.allocate_ino(ROOT_INO).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 5,
+            },
+            LogRecord::Completed {
+                rid: Rid {
+                    node: 1,
+                    incarnation: 1,
+                    seq: 9,
+                },
+            },
+        ];
+        h.meta
+            .backup_append(
+                1,
+                &[constellation_meta::BackupTx {
+                    first: 1,
+                    last: 2,
+                    records: tail,
+                    origin: (0, 0),
+                }],
+            )
+            .unwrap();
+        h.core = Core::new(h.core.cfg.clone());
+        let mut gate = takeover_gate(true);
+        gate.backup_tail_epoch = Some(1);
+        gate.shippable = true;
+        h.hold(2, Some(gate));
+        h.core.bk.tail_through = 2;
+        let mut out = Vec::new();
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.stats.own_deleg_rows_reappended, 0);
+        let own = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+            .into_iter()
+            .filter(|tx| tx.origin.0 == 7)
+            .count();
+        assert_eq!(own, 0, "rows of an ungranted generation in the journal");
+        // (Replayed by rid by the gate: root rows of this tenure.)
+        for name in ["r1", "r2"] {
+            assert!(
+                h.meta.lookup(dir, name).unwrap().is_some(),
+                "{name} not replayed by rid"
+            );
+        }
+    }
+
     /// A row whose dependency is lost (another generation ended below it,
     /// ADR-39) is not re-appended, though this node, restarted, never read
     /// a batch of it (`lost_from` is in memory only): the gate judges each

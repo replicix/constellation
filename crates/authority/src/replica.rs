@@ -792,6 +792,15 @@ pub trait Replica {
     /// goes out; `PromiseState::released` after a restart).
     fn lease_released(&self) -> Option<(Epoch, i64)>;
     fn persist_lease_released(&self, released: Option<(Epoch, i64)>) -> Result<(), MetaError>;
+    /// ADR-43 (orphan grants): the proof of the takeover claim this node
+    /// made (`local["gate_orphan_proof"]`), written before its marker is
+    /// shipped and read by the strand of a re-adoption of the same epoch.
+    /// Only the epoch it names counts.
+    fn gate_orphan_proof_persisted(&self) -> Option<(Epoch, constellation_meta::OrphanProof)>;
+    fn persist_gate_orphan_proof(
+        &self,
+        proof: Option<(Epoch, constellation_meta::OrphanProof)>,
+    ) -> Result<(), MetaError>;
 }
 
 impl Replica for Meta {
@@ -1995,6 +2004,37 @@ impl Replica for Meta {
             .map(|(e, x)| format!("{e}:{x}"))
             .unwrap_or_default();
         Meta::kv_set_durable(self, "lease_released", &v)
+    }
+
+    fn gate_orphan_proof_persisted(&self) -> Option<(Epoch, constellation_meta::OrphanProof)> {
+        let v = Meta::kv_get(self, "gate_orphan_proof").ok().flatten()?;
+        let mut parts = v.split(':');
+        let epoch: Epoch = parts.next()?.parse().ok()?;
+        let upto: u64 = parts.next()?.parse().ok()?;
+        let no_tail: u64 = parts.next()?.parse().ok()?;
+        Some((
+            epoch,
+            constellation_meta::OrphanProof {
+                upto: (upto != 0).then_some(upto),
+                no_tail: (no_tail != 0).then_some(no_tail),
+            },
+        ))
+    }
+
+    fn persist_gate_orphan_proof(
+        &self,
+        proof: Option<(Epoch, constellation_meta::OrphanProof)>,
+    ) -> Result<(), MetaError> {
+        let v = proof
+            .map(|(e, p)| {
+                format!(
+                    "{e}:{}:{}",
+                    p.upto.unwrap_or(0),
+                    p.no_tail.unwrap_or(0)
+                )
+            })
+            .unwrap_or_default();
+        Meta::kv_set_durable(self, "gate_orphan_proof", &v)
     }
 }
 

@@ -1207,22 +1207,37 @@ impl Core {
         Ok(())
     }
 
-    fn issue_marker(&mut self, attempts: u32, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(super) fn issue_marker(&mut self, attempts: u32, replica: &dyn Replica, out: &mut Vec<Action>) {
         let Some(gate) = self.lease.gate else {
             return;
         };
         // Plan 30 §M6: the new tenure's journal position starts here, above
         // every position of the tenure it ends.
         let through = replica.journal_acked_seq().unwrap_or(0);
-        let payload = segment::encode(
-            self.cfg.node_id,
-            gate.epoch,
-            through,
-            &[],
-            &[],
-            &marker_records(&gate, self.bk.abandoned_claim, self.bk.tail_through),
-        )
-        .expect("marker segment");
+        let records = marker_records(&gate, self.bk.abandoned_claim, self.bk.tail_through);
+        // ADR-43 (orphan grants): the claim's proof is on disk before its
+        // marker can reach the log, keyed by the epoch, so a claimant that
+        // crashes between the two still runs the rule in the strand of the
+        // re-adoption that finishes the gate. Only a fresh claim writes it
+        // (a re-adoption or a released takeover preset `gate_orphan_proof`
+        // at `acquire_won`).
+        if gate.takeover && !matches!(self.bk.gate_orphan_proof, Some((e, _)) if e == gate.epoch)
+        {
+            let proof = constellation_meta::OrphanProof::of(&records);
+            self.bk.gate_orphan_proof = Some((gate.epoch, proof));
+            if !proof.is_empty() {
+                if let Err(error) = replica.persist_gate_orphan_proof(Some((gate.epoch, proof))) {
+                    tracing::error!(
+                        node = self.cfg.node_id,
+                        epoch = gate.epoch,
+                        %error,
+                        "the takeover's orphan proof could not be persisted: a crash before its strand loses the rule"
+                    );
+                }
+            }
+        }
+        let payload = segment::encode(self.cfg.node_id, gate.epoch, through, &[], &[], &records)
+            .expect("marker segment");
         let seq = self.ship.next_seq;
         let op = self.issue_s3(S3Op::SegmentPut { seq, payload }, S3For::Job, out);
         self.set_phase(Phase::Marker { attempts }, Some(op));
@@ -1443,6 +1458,11 @@ impl Core {
         self.bk.gate_abandoned = None;
         self.bk.gate_orphan_proof = None;
         self.bk.gate_own_rows = None;
+        if replica.gate_orphan_proof_persisted().is_some() {
+            if let Err(error) = replica.persist_gate_orphan_proof(None) {
+                tracing::warn!(node = self.cfg.node_id, %error, "the persisted orphan proof could not be cleared");
+            }
+        }
         GateStep::Done
     }
 
@@ -3572,6 +3592,40 @@ impl Core {
         );
     }
 
+    /// ADR-43 (orphan grants): the proof the claimant's own strand runs
+    /// when it is fixed at the claim, `None` for a fresh claim (its marker
+    /// is built at `issue_marker`, which persists it).
+    /// - A takeover that ships no marker (a released lease) has no proof:
+    ///   no replica sees a rule that was never announced.
+    /// - A re-adoption of this node's own lease keeps its epoch, and its
+    ///   marker proves nothing of the tail the tenure re-ships (replicas
+    ///   honour a no-tail record on the first marker of an epoch only). It
+    ///   runs the proof its crashed incarnation persisted for this epoch,
+    ///   if any, else the abandon alone.
+    pub(super) fn claim_orphan_proof(
+        &self,
+        replica: &dyn Replica,
+        prev: Option<&Lease>,
+        epoch: Epoch,
+        marker: bool,
+    ) -> Option<(Epoch, constellation_meta::OrphanProof)> {
+        if !marker {
+            return Some((epoch, constellation_meta::OrphanProof::default()));
+        }
+        prev.filter(|p| p.holder == self.cfg.node_id && p.epoch == epoch)
+            .map(|_| {
+                let proof = replica
+                    .gate_orphan_proof_persisted()
+                    .filter(|(e, _)| *e == epoch)
+                    .map(|(_, proof)| proof)
+                    .unwrap_or(constellation_meta::OrphanProof {
+                        upto: self.bk.gate_abandoned,
+                        no_tail: None,
+                    });
+                (epoch, proof)
+            })
+    }
+
     fn acquire_won(
         &mut self,
         now: Now,
@@ -3792,20 +3846,7 @@ impl Core {
         self.bk.tail_through =
             backup_tail_epoch.map_or(0, |e| replica.backup_acked(e).unwrap_or(self.bk.acked));
         self.bk.gate_abandoned = self.bk.abandoned_claim;
-        // ADR-43 (orphan grants): a re-adoption of this node's own lease
-        // keeps its epoch; its marker's no-tail record says nothing of the
-        // tail the tenure re-ships (its journal may still hold it), so its
-        // strand runs the rule with the abandon alone.
-        self.bk.gate_orphan_proof = prev
-            .as_ref()
-            .filter(|p| p.holder == self.cfg.node_id && p.epoch == epoch)
-            .map(|_| {
-                let proof = constellation_meta::OrphanProof {
-                    upto: self.bk.gate_abandoned,
-                    no_tail: None,
-                };
-                (epoch, proof)
-            });
+        self.bk.gate_orphan_proof = self.claim_orphan_proof(replica, prev.as_ref(), epoch, marker);
         // Plan 30 §M3 takeover gate; M13: every acquisition drains the
         // older epochs' inbox before its view opens.
         let gate = PendingGate {
