@@ -66005,3 +66005,29 @@ cursor, and the member's acknowledged, unshipped rows were lost (I1). Pre-existi
   wire value as none; a lock-safety follow-up, not a committed-row one.
 - **Gates**: `cargo fmt --all --check`, clippy `-D warnings` (engine, authority, all targets) clean; engine lib 949 passed,
   authority lib 1013 passed, release sim suite 381 passed, 0 failed, 13 ignored.
+
+## ADR-43 follow-up: the claimant's own orphan rows, and the no-tail takeover (plan 46 M0.3)
+
+- **SHOULD-3 was reachable, and an integrity hole, not only a stall.** A claimant that was the delegate of a generation the log
+  never granted ran no orphan rule (it never applies its own marker as a segment), and its takeover strand leaves a delegate's
+  `Local` rows (`gen != 0`) alone without a backup tail. As root it ships its journal from the head: its rows of the orphan went
+  out as its first rows, with their origin, and no `Delegate` in the log, ahead of the stranded root rows (replayed at the
+  journal's tail) they were executed on. Pinned at the meta level (`take_journal_grouped` holds the row after the claim's
+  strand; fails on main).
+- **The rule takes a proof** (`OrphanProof`, from a marker's records): an abandon of epoch `e` covers epochs `<= e`, as before; a
+  marker that carries no tail (`TailFollowsThrough { prev_epoch, through: 0 }`, no other tail announced) covers `prev_epoch`
+  only. That is the lone-root takeover: a grant the lone root streamed uncommitted and never shipped is ended at 0 on every
+  replica applying the successor's marker, and its rows replay by rid.
+- **The claimant runs it in its strand** (`strand_for_takeover_carrying(.., proof)`, the proof worked out once per gate from
+  its marker's records) and marks the ended numbers stranded (`begin_local` refuses its own execution under them; the core
+  stops them).
+- **Candidates** also take the numbers a live entry's records grant: a streamed `Delegate` whose `RecallCut` streamed too had
+  left the table already, which was the N4 wait. Closed when the strand is a covered marker's.
+- **Re-append guard**: the gate's re-append of its own delegate rows after a re-applied tail skips a generation the table does
+  not list (no grant in the log); those rows replay by rid.
+- **Tests** (`generation_epochs.rs`): the abandoning claimant (fails on main: its row ships), the no-tail marker on a delegate,
+  the no-tail claimant, N4 after a restart, and the guards (a tail follows; a marker of a later epoch's takeover; a grant the
+  log carries, on a replica and on a claimant). With the rule disabled, the four new rule pins and the two earlier abandon
+  pins fail; the guards pass.
+- **Still open**: a takeover that carries a tail (a replica cannot tell where in the predecessor's journal the grant sat), and a
+  rebuild window spanning the marker.

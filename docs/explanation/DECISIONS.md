@@ -2874,20 +2874,28 @@ block.
   table passes it: on the root's forward path only after a restart or an
   in-process rebuild (the seeding, or the lazy void, meets it then); within an
   incarnation, only a read voids it (`void_ended_generations`), and not an end only
-  outstanding speculation carries. The orphan-rows item is closed for the operator-abandon case: an abandon of the root
-  group of an epoch (`GroupAbandoned { gen: 0 }`) proves the log never grants a number of that epoch or an older one that the table
-  no longer lists, that this replica holds no trace of in the log (no cut key, no log index) and that no outstanding speculation
-  ends. The segment's transaction ends it as the log's `Recall` would, at what the log holds of it (0), after the cut loop (a
-  generation the segment itself ends stays out by its cut key): its rows roll back and replay by rid. Candidates are the table's
-  list before the strand, the generations this node holds delegate rows of (`deleg_gens_awaiting_end`) and those of its live shadows
-  and hints. Old-mint numbers are left alone. Restart seeding exception: a kept cut above `max_gen` voids at restart; cut keys
-  come only from a durable end the log applied, a root's own journaled end (retracted on strand), a rebuild's copy of the side
-  replica's keys, or this rule, so a streamed-ahead end (no key) stays live. Residuals, still open: the lone-root takeover path;
-  the N4 restart dependency wait; and the claimant that was the orphan's delegate (its own marker does not run through the
-  segment path, so its own rows of the generation survive its takeover).
-  A narrow case joins them: a streamed-ahead `Delegate(g)` and `RecallCut(g)` both outstanding at a restart. The open
-  keeps g live (the set holds it), the strand removes the grant, g sits above the rolled-back `max_gen` and nothing
-  voids it, so a dependency on g waits for the rest of the process.
+  outstanding speculation carries. The orphan-rows item is closed for the operator-abandon and the no-tail takeover cases
+  (`OrphanProof`): an abandon of the root group of an epoch (`GroupAbandoned { gen: 0 }`) proves the log never grants a
+  number of that epoch or an older one that it does not carry yet; a takeover marker that carries no tail
+  (`TailFollowsThrough { prev_epoch, through: 0 }`, no other tail announced) proves it for numbers of `prev_epoch` only (that
+  journal was held past the log by no member, its later segments are fenced, and only a tenure's own successor re-ships its
+  tail; an older epoch's committed rows may still ride a tail a later claim fetches, D2). A covered number that the table no
+  longer lists, that this replica holds no trace of in the log (no cut key, no log index) and that no outstanding speculation
+  ends is ended as the log's `Recall` would, at what the log holds of it (0), after the cut loop (a generation the segment
+  itself ends stays out by its cut key): its rows roll back and replay by rid. Candidates are the table's list before the
+  strand, the numbers a live entry's records grant (a streamed `Delegate` whose `RecallCut` streamed too), the generations
+  this node holds delegate rows of (`deleg_gens_awaiting_end`) and those of its live shadows and hints. Old-mint numbers are
+  left alone. The claimant never applies its own marker as a segment, so its takeover strand runs the same rule with its
+  marker's proof (`strand_for_takeover_carrying`), and marks the ended numbers stranded: a claimant that was the orphan's
+  delegate otherwise kept its rows of it and shipped them as its first root rows, rows of a generation the log never granted,
+  ahead of the stranded root rows they were executed on. For the same reason the gate's re-append of its own delegate rows
+  after a re-applied tail skips a generation the table does not list. Restart seeding exception: a kept cut above `max_gen`
+  voids at restart; cut keys come only from a durable end the log applied, a root's own journaled end (retracted on strand),
+  a rebuild's copy of the side replica's keys, or this rule, so a streamed-ahead end (no key) stays live. The N4 case (a
+  streamed-ahead `Delegate(g)` and `RecallCut(g)` both outstanding at a restart, then stranded) is closed when the strand is a
+  covered marker's. Residuals, still open: a takeover that carries a tail (a grant past the sealed `through` never ships, but
+  a replica cannot tell where the grant sat without per-row tail facts), so the stall and the N4 wait remain there; and a
+  rebuild window spanning the marker.
 - Plan 46 M1.2: `DelegateNode.gen` is minted by the same rule; a sticky grant keeps
   its minting epoch across tenures (the number is the grant's identity, not the
   holder's ownership); `gen_epoch(gen) == my epoch` now says "granted by this
