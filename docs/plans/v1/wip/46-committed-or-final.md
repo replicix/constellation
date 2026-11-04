@@ -744,6 +744,12 @@ by rid (I2 in `long-delegated-backup` 13016; I2c in 13907, 14284, 15005, 15996, 
 copy (C3 items 1–4) keeps the row's verbatim copy until the log carries it. The ignored sim test
 `l2b_findings_a_committed_delegate_row_lands_with_its_identity` is the pin: it passes, and loses its `#[ignore]`, in M1.2.
 
+*L3 (landed 2026-11-04; PROGRESS, "L3"):* the root sends an unanswered `DelegRecall` again, with a back-off from a request's
+timeout to 2 s, and a delegate answers a repeated recall with the same lock hand-back. No design rule changes (ADR-41's
+back-off pattern, ADR-42's gate recalls nothing). The recall's stall under a lost recall or answer went from the grant's
+whole window (5 to 11 s) to a few hundred ms. The late ttl-0 refusal (L3 item (c)) is left out: it shortens nothing the root
+waits for.
+
 *Pre-M1.2 fixes (oracle I1, 2026-11-02; PROGRESS, "Oracle I1: the delegate's
 lone test"):* three delegate-side defects were closed on the current code
 because M1.2 is weeks away, and M1.2 removes the code they touch. The

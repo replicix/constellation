@@ -627,8 +627,14 @@ node with a stale table, or from the S3 inbox).
 Before executing such an op, the root **recalls** the involved
 generations:
 
-1. it sends `DelegRecall`;
-2. the delegate answers `DelegRecalled { through }` and stops executing;
+1. it sends `DelegRecall`, and sends it again, under a new request id,
+   until an answer to any of the sends arrives or the grant expires: the
+   first resend after a request's timeout, each next one twice as long
+   after the one before, up to 2 s (`DelegRecallResend`; none inside a
+   takeover gate, ADR-42);
+2. the delegate answers `DelegRecalled { through }` and stops executing; a
+   recall it gets again is answered the same way, with the lock grants the
+   first answer handed back (a lost answer is not a lost hand-back);
 3. the root waits for the stream to catch up to `through`, or, if the
    delegate is unreachable, for the grant to expire (if the delegate
    recorded a backup in its `DelegGroup` record, the root first asks the

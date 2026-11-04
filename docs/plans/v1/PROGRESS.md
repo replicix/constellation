@@ -65738,3 +65738,84 @@ Recorded, not fixed: docs, comments and an ignored sim test only; no product log
 
 Decision: D1 (ii) in M1.2; plan 46's M1.2 carries the line "M1.2 must close L2b" with the pin's name. Until then the oracle
 stays strict and the five seeds are the open witnesses.
+
+## L3: a lost recall is never sent again (fixed; plan 46 M0.3)
+
+### Mechanism
+
+`start_recall` sent one `DelegRecall` and armed the generation's expiry. Nothing sent it again: a failed request only cleared
+`recall_req` ("outwaited by the expiry timer"), and the production driver gives the request a timeout of ttl plus a margin, so a
+lost request failed when the expiry was due anyway. A lost `DelegRecalled` is the same: the stopped delegate no longer renews,
+and nobody asks again. The root waited for the grant's whole window (about 5 s at the sims' 5 s ttl, up to 11 s with backup
+seals) where an answered recall takes tens to hundreds of ms. ADR-42 (a gated root recalls nothing) removed the old carrier for a
+resend (`DelegCut`), and ADR-41's repoke is the delegate's ask for the commit, so neither touched it.
+
+### Fix
+
+- (a) The root sends the recall again. `Timer::DelegRecallResend(gen)` is armed by `start_recall` at one request timeout; when it
+  fires with the generation not ended and `recall == Sent`, and the root outside a gate (ADR-42) and usable, a new `DelegRecall`
+  goes out under a new `OpId` (registered in `dl.by_req`), and the timer is armed again after twice the delay, from the request
+  timeout up to 2 s (the pattern of `deleg_poke_backoff`). In a gate or while unusable it is only armed again. An answer to any
+  attempt drains the recall (`GenState::recall_tries`; the others and the timer are dropped at the answer, at the generation's end
+  and at the lease's end). A failed attempt changes nothing but its own entry; the expiry stays the bound.
+- (b) A delegate answers a repeated recall with the same lock hand-back. `lock_hand_back` took the generation's grants out of the
+  table, so a second answer carried none, and the root, which ends the generation by that answer with no outwait grace, could
+  grant a conflicting lock. `dl.recall_grants` keeps what the first answer took, as long as the `handed_back` entry lives; a
+  repeated recall answers with it, `carry` measured again.
+- (c), the late ttl-0 refusal, is not done: it stops a delegate that missed the recall from executing parked ops, but shortens
+  nothing the root waits for.
+- The optional resend at a ttl-0 renewal and a shorter recall timeout in the driver are not done either (at most about five
+  small requests per recall to an unreachable delegate).
+- Simulation knobs (core `Config`, env in `sweep_config`): `AUTHORITY_SIM_DROP_RECALLS=n` loses the first send of every nth
+  recall; `AUTHORITY_SIM_DROP_RECALLEDS=n` loses the delegate's answer to the first recall of every nth generation.
+  `SWEEP-L3` lines print the recall stall of each seed (`Stats::deleg_recall_ms_*`, `deleg_recalls_resent`).
+- DESIGN.md and the ADRs do not change (the recall protocol and ADR-41/42 stay); `delegations.md` says the recall is sent again.
+
+### Tests
+
+- `l3_a_lost_recall_is_sent_again_before_the_grant_runs_out` (fails with the resend off: "not re-sent: []"), the back-off and its
+  cap and the stop at the answer, none inside a gate and one after it, an answer to the first try after a resend, and
+  `l3_a_repeated_recall_hands_back_the_same_lock_grants` (fails without the cache: an empty hand-back).
+- Sim pin `l3_a_lost_recall_is_sent_again_in_long_delegated_late_answers_seed_310`: every recall of the run ends under 2 s and at
+  least one is sent again (8286 ms before, 479 ms after).
+- `locks_writer_hold_delegated_without_the_settle_is_caught` pinned seeds the resend moved off the unsettled signature: 556, 2027
+  and 2570 became 5798, 5813 and 6110 (the first three of seeds 0 to 33 000 under `+unclocked`; the settle clean on 0 to 3 000).
+
+### Measured (release sim, seeds 0..2000, `before` = the same tree with the resend off)
+
+| config | variant | recalls | expired | mean ms | max ms | recalls >1 s |
+|---|---|---|---|---|---|---|
+| long-delegated | before | 6256 | 610 | 508 | 9719 | 654 |
+| | after | 6244 | 155 | 271 | 9719 | 455 |
+| | before, recall drop 1/3 | 5989 | 1790 | 1553 | 10515 | 1845 |
+| | after, recall drop 1/3 | 6416 | 173 | 394 | 9722 | 570 |
+| long-delegated-late-answers | before | 5732 | 150 | 493 | 13407 | 500 |
+| | after | 5780 | 42 | 277 | 7653 | 340 |
+| | before, recall drop 1/3 | 5488 | 700 | 1439 | 11233 | 1431 |
+| | after, recall drop 1/3 | 5917 | 56 | 377 | 7653 | 425 |
+| long-delegated-backup | before | 6073 | 68 | 363 | 12121 | 426 |
+| | after | 6156 | 22 | 174 | 10491 | 280 |
+| | before, recall drop 1/3 | 5137 | 371 | 1374 | 13045 | 1286 |
+| | after, recall drop 1/3 | 6129 | 41 | 297 | 9338 | 375 |
+| locks-delegated | before | 9027 | 354 | 196 | 5406 | 413 |
+| | after | 9013 | 18 | 109 | 4930 | 356 |
+| | before, recall drop 1/3 | 7784 | 2149 | 1304 | 7178 | 2168 |
+| | after, recall drop 1/3 | 8689 | 16 | 222 | 4930 | 408 |
+| placement-hot | before | 9675 | 12 | 51 | 5477 | 88 |
+| | after | 9650 | 2 | 39 | 4827 | 91 |
+| | before, recall drop 1/3 | 13691 | 1124 | 1428 | 8397 | 3711 |
+| | after, recall drop 1/3 | 9870 | 7 | 152 | 4834 | 121 |
+
+- The expiries that remain are delegates that are really unreachable (faults, partitions, crashes); the maxima are theirs.
+- Answer loss (`AUTHORITY_SIM_DROP_RECALLEDS=3`): `locks-delegated` fails 7 seeds (349, 453, 939, 1095, 1202, 1587, 1646) with the
+  resend but without (b), 0 with it; with both losses 2 (939, 976) against 0. That is the lock hole (b) closes.
+- On the tree before the resend, `long-delegated-late-answers` seed 1186 fails with the recall drop (a lost recall, outwaited);
+  with the resend nothing fails.
+- Seeds, no knob (before to after): `long-delegated-late-answers` 310 8286 to 479 ms, `long-delegated` 298 7592 to 420 ms.
+
+### Gates
+
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean. authority lib 1011 passed, engine 948,
+net 127, control 146, harness lib 164: 0 failed. Release sim suite 367 passed, 0 failed, 13 ignored (main 366 plus the pin).
+Sweeps of `long-delegated`, `-late-answers`, `-backup`, `locks-delegated`, `delegated-holder-cut` and `placement-hot`, seeds
+0..2000, with and without `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`: 0 failing on main (c5228764) and on the fix, in all 12.
