@@ -194,6 +194,47 @@ fn a_committed_row_moved_to_the_member_copy_holds_its_readers() {
     assert!(!meta.replay_touches(&key));
 }
 
+/// A row that never leaves the member copy (a leak: `backup-crash-slow`
+/// seed 840 left 20 on a node for good) holds reads of its keys for
+/// `HELD_COPY_MAX_AGE` at most, not for ever.
+#[test]
+fn a_row_that_never_leaves_the_copy_stops_holding_after_the_cap() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    holder_create(&meta, RowClass::RootGroup, "data", 1, 1);
+    meta.set_holder_epoch(0);
+    let key = [ReadKey::Dentry(ROOT_INO, "data".into())];
+    let dir = [ReadKey::Dir(ROOT_INO)];
+    apply_rows(&meta, 1, 2, 2, &[1, 2], &[create("b", ino(2), 11), completed(rid(2))]);
+    assert!(meta.member_copy_carries(rid(1)).unwrap());
+    let t0 = std::time::Instant::now();
+    assert!(meta.member_copy_touches_at(&key, t0));
+    assert!(meta.member_copy_touches_at(&dir, t0), "its parent's listing too");
+    let cap = constellation_meta::HELD_COPY_MAX_AGE;
+    let late = std::time::Instant::now() + cap + std::time::Duration::from_millis(1);
+    assert!(!meta.member_copy_touches_at(&key, late), "capped");
+    assert!(!meta.member_copy_touches_at(&dir, late));
+    // The row is still in the copy (the leak), and stays unheld.
+    assert!(meta.member_copy_carries(rid(1)).unwrap());
+    assert!(!meta.member_copy_touches(&key));
+}
+
+/// The successor's copy of the rows it re-ships (`member_copy_put`, after it
+/// applied them) and a claimant's seal snapshot are in its namespace: no
+/// read of their keys waits.
+#[test]
+fn a_row_the_namespace_already_has_does_not_hold_its_readers() {
+    let meta = Meta::open_in_memory().unwrap();
+    let r = create("data", ino(1), 10);
+    apply_rows(&meta, 1, 1, 2, &[1, 2], &[r.clone(), completed(rid(1))]);
+    assert!(meta.lookup(ROOT_INO, "data").unwrap().is_some());
+    let row = mtx(1, 2, RowClass::RootGroup, vec![r, completed(rid(1))]);
+    meta.member_copy_put_rows(1, 1, &[row]).unwrap();
+    assert!(meta.member_copy_carries(rid(1)).unwrap());
+    assert!(!meta.member_copy_touches(&[ReadKey::Dentry(ROOT_INO, "data".into())]));
+    assert!(!meta.replay_touches(&[ReadKey::Dir(ROOT_INO)]));
+}
+
 // ------------------------------------- committed requester/subscriber entries
 
 /// A committed shadow is not stranded by a later epoch's segment; the

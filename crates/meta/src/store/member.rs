@@ -54,6 +54,32 @@ use std::collections::BTreeSet;
 /// base hold the copy of lease epoch `epoch - base`.
 pub(super) const MEMBER_COPY_BASE: u64 = 2 << 48;
 
+/// How long a rolled-back member copy row holds reads of its keys at most.
+/// The hold waits for the successor's re-ship, which lands within one S3
+/// ship round (measured 35-350 ms under slow S3, 2 s at the worst of a
+/// stalled successor); 5 s is well above that, and short enough that a row
+/// which never leaves the copy (a leak) costs a read one wait for at most
+/// this long, not for good. After the cap the read is answered from the
+/// replica as it is when the session wait times out.
+pub const HELD_COPY_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A member copy row this process's strand rolled back
+/// ([`Meta::member_copy_touches`]). In memory, not persisted: after a
+/// restart nothing is held. The restart's own rolled-back rows come from the
+/// namespace rebuild (`Strand::rebuild`), which derives the namespace from
+/// the log, so no row that depends on a rolled-back one stays; and a row
+/// rolled back by a segment before the crash is covered by the re-ship
+/// latency only. If the process crashes inside that window (50-125 ms) the
+/// restarted node serves the gap again until the re-ship lands; the
+/// window is not closed after a crash.
+#[derive(Clone, Debug)]
+pub(crate) struct HeldCopy {
+    pub(crate) epoch: u64,
+    pub(crate) first: u64,
+    pub(crate) keys: crate::KeySet,
+    pub(crate) since: std::time::Instant,
+}
+
 fn member_epoch(epoch: u64) -> u64 {
     MEMBER_COPY_BASE + epoch
 }
@@ -190,6 +216,7 @@ pub(crate) fn drop_settled_rows_tx(
         for row in rows_in(&*tx, meta, e)? {
             if log_settled_tx(&*tx, meta, e, &row)? {
                 tx.remove(&meta.backup_tail, tail_key(member_epoch(e), row.tx.first));
+                meta.release_copy_row(e, row.tx.first);
                 dropped += 1;
             } else {
                 left += 1;
@@ -450,31 +477,89 @@ impl Meta {
         Ok(false)
     }
 
-    /// Whether a member copy row touches any of `keys`. A deposed holder's
-    /// committed rows that a later epoch's segment strands are rolled back
-    /// into its member copy, not queued for replay: the successor re-ships
-    /// them, and until the log carries them (the drop rules retire the row)
-    /// the namespace lacks them while later rows that depend on them may
-    /// stay (a delegate's row this root appended after them). A read of
-    /// their keys waits for the re-ship as it waits for a queued replay
-    /// (`long-delegated-late-answers` seed 5839: a marker visible without
-    /// its data on the deposed root). One atomic load without a copy.
+    /// Whether a member copy row this node's strand rolled back touches any
+    /// of `keys`. A deposed holder's committed rows that a later epoch's
+    /// segment strands are rolled back into its member copy, not queued for
+    /// replay: the successor re-ships them, and until the log carries them
+    /// (the drop rules retire the row) the namespace lacks them while later
+    /// rows that depend on them may stay (a delegate's row this root
+    /// appended after them). A read of their keys waits for the re-ship as
+    /// it waits for a queued replay (`long-delegated-late-answers` seed 5839:
+    /// a marker visible without its data on the deposed root).
+    ///
+    /// Answered from an in-memory set ([`HeldCopy`]), not from the member
+    /// copy: only a row this process rolled back is missing from the
+    /// namespace (the successor's copy of a re-shipped row, a claimant's
+    /// seal snapshot and a backup's copy are applied or never were), and no
+    /// row is held longer than [`HELD_COPY_MAX_AGE`], so a row that never
+    /// leaves the copy (a leak, `backup-crash-slow` seed 840) cannot stall
+    /// reads for good. One atomic load when nothing is held.
     pub fn member_copy_touches(&self, keys: &[crate::ReadKey]) -> bool {
-        if !self.has_member_copies() {
+        self.member_copy_touches_at(keys, std::time::Instant::now())
+    }
+
+    /// [`Self::member_copy_touches`] at `now` (a test steps past the cap
+    /// without sleeping).
+    pub fn member_copy_touches_at(
+        &self,
+        keys: &[crate::ReadKey],
+        now: std::time::Instant,
+    ) -> bool {
+        if !self
+            .any_held_copy
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return false;
         }
-        let r = self.db.read_tx();
-        let Ok(epochs) = epochs_in(&r, self) else {
-            return false;
-        };
-        epochs.into_iter().any(|e| {
-            rows_in(&r, self, e).is_ok_and(|rows| {
-                rows.iter().any(|row| {
-                    let ks = crate::KeySet::from_records(&row.tx.records);
-                    keys.iter().any(|k| ks.touches(k))
-                })
-            })
-        })
+        let mut held = self.held_copies.lock().unwrap();
+        held.retain(|h| now.saturating_duration_since(h.since) < HELD_COPY_MAX_AGE);
+        self.any_held_copy
+            .store(!held.is_empty(), std::sync::atomic::Ordering::Relaxed);
+        held.iter()
+            .any(|h| keys.iter().any(|k| h.keys.touches(k)))
+    }
+
+    /// Note a row the strand rolled back into `epoch`'s member copy.
+    pub(crate) fn hold_copy_row(&self, epoch: u64, first: u64, keys: crate::KeySet) {
+        let mut held = self.held_copies.lock().unwrap();
+        held.retain(|h| (h.epoch, h.first) != (epoch, first));
+        held.push(HeldCopy {
+            epoch,
+            first,
+            keys,
+            since: std::time::Instant::now(),
+        });
+        self.any_held_copy
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The row `(epoch, first)` left the member copy (re-shipped, dropped,
+    /// holed, settled): its keys are not held any more.
+    pub(crate) fn release_copy_row(&self, epoch: u64, first: u64) {
+        if !self
+            .any_held_copy
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let mut held = self.held_copies.lock().unwrap();
+        held.retain(|h| (h.epoch, h.first) != (epoch, first));
+        self.any_held_copy
+            .store(!held.is_empty(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The whole member copy of `epoch` left.
+    pub(crate) fn release_copy_epoch(&self, epoch: u64) {
+        if !self
+            .any_held_copy
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let mut held = self.held_copies.lock().unwrap();
+        held.retain(|h| h.epoch != epoch);
+        self.any_held_copy
+            .store(!held.is_empty(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Forget the member copy of `epoch` (its rows are in the log, or the
@@ -561,13 +646,14 @@ fn set_info_tx(
 /// Put one row of `epoch`'s member copy in the caller's transaction (a
 /// deposition's strand, a takeover moving the tail it re-journaled). A row
 /// held already keeps its class and op: a snapshot taken at a seal and the
-/// strand that follows it describe the same transaction.
+/// strand that follows it describe the same transaction. Whether the row
+/// was kept (the log does not settle it).
 pub(crate) fn put_row_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
     epoch: u64,
     row: &MemberTx,
-) -> Result<(), MetaError> {
+) -> Result<bool, MetaError> {
     if log_settled_tx(&*tx, meta, epoch, row)? {
         tracing::debug!(
             epoch,
@@ -575,7 +661,7 @@ pub(crate) fn put_row_tx(
             last = row.tx.last,
             "a member copy row the log settles already: not kept"
         );
-        return Ok(());
+        return Ok(false);
     }
     tracing::debug!(
         epoch,
@@ -600,7 +686,7 @@ pub(crate) fn put_row_tx(
     tx.insert(&meta.backup_tail, key, postcard::to_allocvec(&row)?);
     set_info_tx(tx, epoch, meta, None, row.tx.last)?;
     meta.note_member_copies(true);
-    Ok(())
+    Ok(true)
 }
 
 fn drop_epoch_tx(tx: &mut SingleWriterWriteTx, meta: &Meta, epoch: u64) -> Result<(), MetaError> {
@@ -613,6 +699,7 @@ fn drop_epoch_tx(tx: &mut SingleWriterWriteTx, meta: &Meta, epoch: u64) -> Resul
         tx.remove(&meta.backup_tail, k);
     }
     tx.remove(&meta.local, member_info_key(epoch).into_bytes());
+    meta.release_copy_epoch(epoch);
     Ok(())
 }
 
@@ -670,6 +757,7 @@ pub(crate) fn member_rules_tx(
                         || (f.through > 0 && last <= f.through)));
             if covered {
                 tx.remove(&meta.backup_tail, key);
+                meta.release_copy_row(e, first);
                 out.retired += 1;
                 continue;
             }
@@ -684,10 +772,12 @@ pub(crate) fn member_rules_tx(
                     out.abandoned += 1;
                 }
                 tx.remove(&meta.backup_tail, key);
+                meta.release_copy_row(e, first);
                 continue;
             }
             if through_of.get(&ident.0).is_some_and(|th| ident.1 > *th) {
                 tx.remove(&meta.backup_tail, key);
+                meta.release_copy_row(e, first);
                 out.dropped += 1;
                 continue;
             }
@@ -700,6 +790,7 @@ pub(crate) fn member_rules_tx(
                 )
             {
                 tx.remove(&meta.backup_tail, key);
+                meta.release_copy_row(e, first);
                 out.dropped += 1;
                 continue;
             }
@@ -765,6 +856,7 @@ pub(crate) fn hole_rolled_back_tx(
                 tail_key(member_epoch(e), row.tx.first),
                 postcard::to_allocvec(&hole)?,
             );
+            meta.release_copy_row(e, row.tx.first);
             holed += 1;
         }
     }

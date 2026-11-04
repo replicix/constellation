@@ -61,7 +61,9 @@ pub use store::journal::{
 #[cfg(any(test, feature = "test-util"))]
 pub use store::local::fail_reclass_on_this_thread_for_tests;
 pub use store::local::RowClass;
-pub use store::member::{tail_identity, MemberCopyInfo, MemberOutcome, MemberTx};
+pub use store::member::{
+    tail_identity, MemberCopyInfo, MemberOutcome, MemberTx, HELD_COPY_MAX_AGE,
+};
 pub use store::remote::RemoteBlockers;
 pub use store::spec::{
     created_ino_of, AwaitRetry, OrphanProof, QueueSnapshot, Refusal, SegmentApplied, SpecKind,

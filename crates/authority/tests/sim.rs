@@ -8788,7 +8788,9 @@ fn delegated_group_switch_findings_seeds_234_and_615() {
 /// `long-delegated-late-answers` seed 31041 under slow lease reads (and
 /// 5839 before 9fe5531b moved its schedule) had a reader on the deposed
 /// root see a marker without its data. A read of a member copy row's keys
-/// waits for the re-ship, as for a queued replay (`Meta::replay_touches`).
+/// waits for the re-ship, as for a queued replay (`Meta::replay_touches`);
+/// the hold is bounded (the session wait, then the read degrades and shows
+/// the gap; an entry also lapses after `HELD_COPY_MAX_AGE`).
 #[test]
 fn a_marker_is_never_seen_without_the_data_a_deposition_moved_to_the_member_copy() {
     let cfg = SimConfig {

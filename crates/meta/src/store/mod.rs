@@ -678,6 +678,12 @@ pub struct Meta {
     /// Plan 43 C1-4: this node holds a member copy (`store::member`); the
     /// segment path reads it before looking for one.
     pub(crate) any_member_copy: std::sync::atomic::AtomicBool,
+    /// The member copy rows this process's strand rolled back
+    /// (`store::member::HeldCopy`): what [`Meta::member_copy_touches`]
+    /// consults. In memory only.
+    pub(crate) held_copies: std::sync::Mutex<Vec<member::HeldCopy>>,
+    /// `held_copies` is not empty (one atomic load per read when it is).
+    pub(crate) any_held_copy: std::sync::atomic::AtomicBool,
     /// How many times a ship plan, a retirement or an ack took a held-set
     /// path (plan 30 §M4 round 2). Only ever moves while something is
     /// poisoned or held; the cost tests in `store::local` pin that it stays
@@ -1233,6 +1239,8 @@ impl Meta {
             deleg_rows: std::sync::Mutex::new(spec::DelegRows::default()),
             backup_tail_floor: std::sync::Mutex::new(None),
             any_member_copy: std::sync::atomic::AtomicBool::new(false),
+            held_copies: std::sync::Mutex::new(Vec::new()),
+            any_held_copy: std::sync::atomic::AtomicBool::new(false),
             held_work: AtomicU64::new(0),
             blame_cache: Default::default(),
             session: crate::session::SessionState::default(),

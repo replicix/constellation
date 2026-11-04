@@ -1574,7 +1574,12 @@ fn strand_local_tx(
     // client's retry by rid dedups against the re-ship, or executes once
     // if the row turns out not to have been held (an unanswered row).
     if member && row.class.gated() && row.gen == 0 && row.epoch > 0 {
-        super::member::put_row_tx(
+        // A segment's strand (not a namespace rebuild, which derives the
+        // namespace from the log) leaves the row's effect out of the
+        // namespace while rows after it may stay: reads of its keys wait
+        // for the re-ship (`Meta::member_copy_touches`).
+        let hold = (!strand.rebuild).then(|| crate::KeySet::from_records(&records));
+        let kept = super::member::put_row_tx(
             tx,
             meta,
             row.epoch,
@@ -1591,6 +1596,9 @@ fn strand_local_tx(
                 lock_tag: row.lock_tag.clone(),
             },
         )?;
+        if let (true, Some(keys)) = (kept, hold) {
+            meta.hold_copy_row(row.epoch, first, keys);
+        }
         return Ok(Stranding::Member);
     }
     // Plan 43 C2 (§3.8): a delegate's row whose client was told nothing
@@ -5276,7 +5284,7 @@ impl Meta {
                 let _ = self.prune_recent_shipped(upto);
             }
         }
-        if member != Default::default() {
+        if member != Default::default() || self.has_member_copies() {
             let _ = self.refresh_member_copy_flag();
         }
         Ok(SegmentApplied {

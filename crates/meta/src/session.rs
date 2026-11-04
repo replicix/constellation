@@ -2130,8 +2130,10 @@ impl crate::store::Meta {
     /// Whether a queued replay (a stranded op rolled back until it lands)
     /// touches any of `keys`, or a member copy row does (a committed row
     /// rolled back until the successor's re-ship lands:
-    /// [`Meta::member_copy_touches`]). One counter read and one atomic load
-    /// when neither is held.
+    /// [`Meta::member_copy_touches`]; bounded by the session wait, after which
+    /// the read degrades and shows the gap, and by the entry's own cap,
+    /// `HELD_COPY_MAX_AGE`). One counter read and one atomic load when
+    /// neither is held.
     pub fn replay_touches(&self, keys: &[ReadKey]) -> bool {
         if self.member_copy_touches(keys) {
             return true;
