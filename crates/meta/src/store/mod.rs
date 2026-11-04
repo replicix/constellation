@@ -1272,17 +1272,7 @@ impl Meta {
             .store(!table.is_empty(), std::sync::atomic::Ordering::Release);
         // Plan 30 §M11: the session state's generations survive a
         // restart (see `SessionState::seed_generations`).
-        let live: std::collections::BTreeSet<u64> = table.iter().map(|d| d.gen).collect();
-        meta.session.seed_ended_before_open(table.max_gen(), &live);
-        let mut gens = meta.persisted_generations()?;
-        gens.extend(live.iter().copied());
-        meta.session.seed_generations(
-            table.max_gen(),
-            &gens,
-            &live,
-            &|gen| meta.log_stream_idx(gen).unwrap_or(0),
-            &|gen| meta.void_cut(gen).ok().flatten(),
-        );
+        meta.seed_session_generations()?;
         // The applied journal position is volatile too; what this
         // replica holds of the log is not. Without this a watermark
         // naming the holder's journal (a lock grant's floor) stays
@@ -1292,6 +1282,27 @@ impl Meta {
         meta.session.seed_applied(applied_seq, meta.applied_pos());
         meta.closed.store(false, Ordering::Release);
         Ok(meta)
+    }
+
+    /// Seed the session's generations from the store (see
+    /// [`SessionState::seed_generations`]) and remember the delegation table
+    /// as it is now ([`SessionState::seed_ended_before_open`]): at the open,
+    /// and after an in-process rebuild replaced the namespace
+    /// ([`Meta::replace_ns_from_rebuilt`]), whose table is the durable log's.
+    pub(crate) fn seed_session_generations(&self) -> Result<(), MetaError> {
+        let table = self.delegation_table();
+        let live: std::collections::BTreeSet<u64> = table.iter().map(|d| d.gen).collect();
+        self.session.seed_ended_before_open(table.max_gen(), &live);
+        let mut gens = self.persisted_generations()?;
+        gens.extend(live.iter().copied());
+        self.session.seed_generations(
+            table.max_gen(),
+            &gens,
+            &live,
+            &|gen| self.log_stream_idx(gen).unwrap_or(0),
+            &|gen| self.void_cut(gen).ok().flatten(),
+        );
+        Ok(())
     }
 
     /// Refuse a store of another on-disk format ([`META_FORMAT`]) before

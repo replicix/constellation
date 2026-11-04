@@ -969,7 +969,7 @@ impl Meta {
     ) -> Result<std::collections::BTreeSet<u64>, MetaError> {
         let r = self.db.read_tx();
         let mut out = std::collections::BTreeSet::new();
-        for prefix in ["deleg_log_idx:", "deleg_void_cut:"] {
+        for prefix in [DELEG_LOG_IDX_PREFIX, DELEG_VOID_CUT_PREFIX] {
             for guard in r.prefix(&self.local, prefix.as_bytes()) {
                 let (k, _) = guard.into_inner()?;
                 if let Some(gen) = std::str::from_utf8(&k)
@@ -2829,6 +2829,12 @@ fn gated_open_elsewhere_tx(
     Ok(open)
 }
 
+/// The `local` key prefixes of [`deleg_log_idx_key`] and [`deleg_void_cut_key`]:
+/// scanned by the restart's seeding ([`Meta::persisted_generations`]) and
+/// copied by the in-process rebuild ([`Meta::replace_ns_from_rebuilt`]).
+pub(crate) const DELEG_LOG_IDX_PREFIX: &str = "deleg_log_idx:";
+pub(crate) const DELEG_VOID_CUT_PREFIX: &str = "deleg_void_cut:";
+
 /// `local` kv: the highest index of generation `gen` this replica holds
 /// *from the log* (appended in the root's journal here, or applied from
 /// a segment) — never a shadow's (phase 2b: a successor root's cursor,
@@ -2836,7 +2842,7 @@ fn gated_open_elsewhere_tx(
 /// it is in the journal: one that leaves it unshipped takes the index
 /// back below it ([`retract_log_idx_tx`], from `spec::strand_local_tx`).
 pub(crate) fn deleg_log_idx_key(gen: u64) -> String {
-    format!("deleg_log_idx:{gen}")
+    format!("{DELEG_LOG_IDX_PREFIX}{gen}")
 }
 
 /// `local` kv: the cut of generation `gen` the log's `RecallCut` record
@@ -2847,7 +2853,7 @@ pub(crate) fn deleg_log_idx_key(gen: u64) -> String {
 /// `Recall` (a log written before the cut was in the record): the cut is
 /// then what the replica holds of it from the log (`deleg_log_idx_key`).
 pub(crate) fn deleg_void_cut_key(gen: u64) -> String {
-    format!("deleg_void_cut:{gen}")
+    format!("{DELEG_VOID_CUT_PREFIX}{gen}")
 }
 
 /// `local` kv: `epoch:idx`, the newest index of generation `gen` whose

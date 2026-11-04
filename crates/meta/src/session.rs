@@ -1258,8 +1258,9 @@ impl SessionState {
         self.cv.notify_all();
     }
 
-    /// Remember the table as the store was opened with it (`max_gen`, the
-    /// `live` generations): see [`Self::ended_before_open`].
+    /// Remember the table as the store was opened with it, or as an in-process
+    /// rebuild replaced it (`max_gen`, the `live` generations): see
+    /// [`Self::ended_before_open`].
     pub fn seed_ended_before_open(&self, max_gen: u64, live: &std::collections::BTreeSet<u64>) {
         self.inner.lock().unwrap().open_table = Some((max_gen, live.clone()));
     }

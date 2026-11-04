@@ -88,9 +88,8 @@ fn the_counter_survives_a_restart_and_a_lost_counter_is_floored_by_the_log() {
 
 /// ADR-43 (review M2): a restart seeds the session from the generations the
 /// store keeps a key of. One the table named and ended before this replica
-/// applied anything of it (a root rebuilt from a side replica: the rebuild
-/// replaces `ns`, so a generation ended inside its window has no key here)
-/// is not seeded; a dependency on it is voided when the root's check of it
+/// applied anything of it (a root rebuilt from a side replica whose own
+/// window began after the end: no key of it anywhere) is not seeded; a dependency on it is voided when the root's check of it
 /// says no, at cut 0, and is then lost, not waited for.
 #[test]
 fn a_dependency_on_a_generation_that_ended_without_a_key_is_voided_when_checked() {
@@ -119,6 +118,10 @@ fn a_dependency_on_a_generation_that_ended_without_a_key_is_voided_when_checked(
         .apply_segment(1, 1, &records, &TouchSet::default())
         .unwrap();
     assert_eq!(rebuilt.delegation_table().max_gen(), g6);
+    // Both ended before the rebuilt replica's own window: no key of them.
+    for g in [g5, g6] {
+        rebuilt.kv_del(&format!("deleg_void_cut:{g}")).unwrap();
+    }
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.db");
@@ -275,4 +278,105 @@ fn a_restart_does_not_void_a_generation_above_the_tables_highest() {
     assert!(!meta.reaches_streams_deps(&at(stranded, 5)));
     assert!(!meta.session().is_voided(stranded));
     assert!(!meta.deps_lost_deps(&at(stranded, 5)));
+}
+
+fn at(g: u64, i: u64) -> Position {
+    let mut streams = Streams::NONE;
+    assert!(streams.raise(g, i));
+    Position {
+        seq: 0,
+        pending: None,
+        streams,
+    }
+}
+
+/// ADR-43 (review S-1): the rebuild runs in-process (nothing reopens), and
+/// the log's keys of a generation that ended inside its window are in the
+/// side replica only. `replace_ns_from_rebuilt` copies them (raise-only),
+/// seeds the session from them and remembers the rebuilt table as the open
+/// one: a dependency on that generation at its real cut is reached and not
+/// lost, one past it is lost, and one on a generation the side never held a
+/// key of is voided when checked, not waited for; and a restart afterwards
+/// finds the same cuts, not cut 0.
+#[test]
+fn an_in_process_rebuild_carries_the_ends_its_window_holds() {
+    let (keyless, ended, live) = (gen(4, 2), gen(5, 3), gen(6, 1));
+    let rebuilt = Meta::open_in_memory().unwrap();
+    let delegate = |g: u64| LogRecord::Delegate {
+        dir: ROOT_INO,
+        node: 4,
+        gen: g,
+        designated: false,
+        range: (0, 0),
+    };
+    rebuilt
+        .apply_segment(
+            1,
+            1,
+            &[
+                delegate(keyless),
+                LogRecord::RecallCut {
+                    dir: ROOT_INO,
+                    gen: keyless,
+                    through: 0,
+                },
+                delegate(ended),
+                LogRecord::RecallCut {
+                    dir: ROOT_INO,
+                    gen: ended,
+                    through: 3,
+                },
+                delegate(live),
+            ],
+            &TouchSet::default(),
+        )
+        .unwrap();
+    // The side's window began after `keyless` ended: it holds no key of it.
+    rebuilt
+        .kv_del(&format!("deleg_void_cut:{keyless}"))
+        .unwrap();
+    rebuilt
+        .kv_set(&format!("deleg_log_idx:{ended}"), "7")
+        .unwrap();
+    rebuilt
+        .kv_set(&format!("deleg_log_idx:{live}"), "4")
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.db");
+    let check = |meta: &Meta| {
+        assert!(meta.session().is_voided(ended));
+        // At the real cut: reached, not lost. Past it: lost.
+        assert!(meta.reaches_streams_deps(&at(ended, 3)));
+        assert!(!meta.deps_lost_deps(&at(ended, 3)));
+        assert!(meta.deps_lost_deps(&at(ended, 4)));
+        // The live one is held through the highest index it has here.
+        assert!(!meta.session().is_voided(live));
+        assert!(meta.reaches_streams_deps(&at(live, 9)));
+        assert!(!meta.reaches_streams_deps(&at(live, 10)));
+        // No key: voided when checked (cut 0), not waited for.
+        assert!(meta.deps_lost_deps(&at(keyless, 2)));
+        assert!(meta.reaches_streams_deps(&at(keyless, 2)));
+    };
+    {
+        let meta = Meta::open(&path).unwrap();
+        // Raise-only: what this store holds above the log's stays.
+        meta.kv_set(&format!("deleg_log_idx:{ended}"), "2").unwrap();
+        meta.kv_set(&format!("deleg_log_idx:{live}"), "9").unwrap();
+        meta.replace_ns_from_rebuilt(&rebuilt, &Default::default())
+            .unwrap();
+        // In-process: nothing reopened the store.
+        check(&meta);
+        for (key, want) in [
+            (format!("deleg_log_idx:{ended}"), "7"),
+            (format!("deleg_log_idx:{live}"), "9"),
+            (format!("deleg_void_cut:{ended}"), "3"),
+        ] {
+            assert_eq!(meta.kv_get(&key).unwrap().as_deref(), Some(want), "{key}");
+        }
+        meta.close().unwrap();
+    }
+    // A restart finds the same cuts (not cut 0).
+    let meta = Meta::open(&path).unwrap();
+    check(&meta);
 }

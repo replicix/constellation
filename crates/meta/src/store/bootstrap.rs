@@ -21,6 +21,7 @@
 //! alone, not a rebuild.
 
 use crate::error::MetaError;
+use crate::store::local::{DELEG_LOG_IDX_PREFIX, DELEG_VOID_CUT_PREFIX};
 use crate::store::{misc, ns, Meta, KV_APPLIED_SEQ, KV_USAGE_BYTES, KV_USAGE_FILES};
 use constellation_fs_core::{ChunkHash, Ino};
 use constellation_mtree::keys;
@@ -427,6 +428,35 @@ impl Meta {
         crate::store::member::drop_settled_rows_tx(&mut tx, self)?;
         let side_pos = crate::store::applied_pos_at(&side_snap, &side.local);
         crate::store::spec::reset_for_rebuilt_ns_tx(&mut tx, self, side_pos)?;
+        // ADR-43 (review S-1): what the rebuilt log holds of each
+        // generation's stream and the cut of each end it carries
+        // (`deleg_log_idx`, `deleg_void_cut`), raised over what is here, and
+        // after the reset (whose strand retracts only this node's own
+        // counts and cuts). A generation that ended inside the rebuild
+        // window leaves no key in a namespace replaced wholesale; without
+        // these, the session below meets the rebuilt table's end of it with
+        // a cut of 0 (a dependency at or below the real cut reported lost)
+        // or, an in-process rebuild reopening nothing, never meets it at
+        // all (a dependency on it waits for the rest of the process).
+        for prefix in [DELEG_LOG_IDX_PREFIX, DELEG_VOID_CUT_PREFIX] {
+            for guard in side_snap.prefix(&side.local, prefix.as_bytes()) {
+                let (k, v) = guard.into_inner()?;
+                let Some(new) = std::str::from_utf8(&v)
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                let cur = tx.get(&self.local, &k)?.and_then(|v| {
+                    std::str::from_utf8(&v)
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                });
+                if cur.is_none_or(|c| new > c) {
+                    tx.insert(&self.local, k.to_vec(), new.to_string().into_bytes());
+                }
+            }
+        }
         if let Some(v) = side_snap.get(&side.local, KV_APPLIED_SEQ.as_bytes())? {
             tx.insert(&self.local, KV_APPLIED_SEQ.as_bytes().to_vec(), v.to_vec());
         }
@@ -454,6 +484,10 @@ impl Meta {
         // What the reset's strand rolled back, after the commit (the
         // session voids it lifted, the rows the hook invalidates).
         self.report_rolled_back();
-        Ok(())
+        // ... and the session, as a restart would have seeded it from this
+        // store (ADR-43, review S-1): the rebuilt table is the durable
+        // log's, so a generation it lists as ended is ended for good, and
+        // the open-table snapshot the lazy void rests on is its own.
+        self.seed_session_generations()
     }
 }
