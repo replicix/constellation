@@ -3792,6 +3792,20 @@ impl Core {
         self.bk.tail_through =
             backup_tail_epoch.map_or(0, |e| replica.backup_acked(e).unwrap_or(self.bk.acked));
         self.bk.gate_abandoned = self.bk.abandoned_claim;
+        // ADR-43 (orphan grants): a re-adoption of this node's own lease
+        // keeps its epoch; its marker's no-tail record says nothing of the
+        // tail the tenure re-ships (its journal may still hold it), so its
+        // strand runs the rule with the abandon alone.
+        self.bk.gate_orphan_proof = prev
+            .as_ref()
+            .filter(|p| p.holder == self.cfg.node_id && p.epoch == epoch)
+            .map(|_| {
+                let proof = constellation_meta::OrphanProof {
+                    upto: self.bk.gate_abandoned,
+                    no_tail: None,
+                };
+                (epoch, proof)
+            });
         // Plan 30 §M3 takeover gate; M13: every acquisition drains the
         // older epochs' inbox before its view opens.
         let gate = PendingGate {

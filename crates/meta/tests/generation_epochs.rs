@@ -1125,3 +1125,30 @@ fn a_takeover_without_a_tail_ends_a_streamed_grant_and_end_after_a_restart() {
     assert_eq!(meta.void_cut(g).unwrap(), Some(0));
     assert!(meta.deps_lost_deps(&at(g, 1)), "lost, not waited for");
 }
+
+/// Review (orph): a root that re-adopts its own lease after a restart keeps
+/// its epoch and ships a second marker of it, which says no tail of the
+/// epoch before follows (`marker_records`: a takeover gate without a backup
+/// tail). But this tenure took epoch 1 over with its tail (the first marker,
+/// through 5) and its journal may still hold that tail, `Delegate(g)` among
+/// it, unshipped: it ships after the second marker. A replica that holds rows
+/// of `g` as its delegate, whose streamed grant the first marker stranded,
+/// must not end `g` at 0 on the second marker.
+#[test]
+fn a_re_adoption_marker_proves_nothing_of_the_tail_its_tenure_re_ships() {
+    let g = gen(1, 1);
+    let meta = delegate_of_a_streamed_grant(g, false);
+    // Epoch 2's claim re-ships epoch 1's tail through 5.
+    meta.apply_segment_rows(1, 2, 0, &[], &[], &[no_tail(1, 5)], &TouchSet::default())
+        .unwrap();
+    assert!(meta.delegation_table().iter().all(|d| d.gen != g));
+    // Its holder restarts and re-adopts epoch 2: a second marker of epoch 2.
+    meta.apply_segment_rows(2, 2, 0, &[], &[], &[no_tail(1, 0)], &TouchSet::default())
+        .unwrap();
+    assert_eq!(
+        meta.void_cut(g).unwrap(),
+        None,
+        "the re-shipped tail may still grant g"
+    );
+    assert!(meta.lookup(ROOT_INO, "x").unwrap().is_some());
+}

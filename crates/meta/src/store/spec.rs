@@ -4661,7 +4661,15 @@ impl Meta {
         // holds them, and the strand below may take the entry (queuing its
         // rid for replay, held while the generation lives) without ending
         // the generation.
-        let proof = OrphanProof::of(records);
+        // A no-tail record proves nothing on a later marker of an epoch
+        // (a root that re-adopts its own lease after a restart keeps its
+        // epoch and ships a second marker, while its journal may still hold
+        // the tail its first marker announced): only the first segment of
+        // the epoch, the claim's own marker, carries the proof.
+        let mut proof = OrphanProof::of(records);
+        if !first_of_epoch {
+            proof.no_tail = None;
+        }
         let listed_before: std::collections::BTreeSet<u64> = if proof.is_empty() {
             Default::default()
         } else {
