@@ -2884,7 +2884,7 @@ block.
   Only the first marker of an epoch carries the no-tail proof: a root that re-adopts its own lease after a restart keeps its
   epoch and ships a second marker whose no-tail record says nothing of the tail its tenure's first marker announced and its
   journal may still hold, so a replica honours the record on the first segment of an epoch only, and the claimant of a
-  re-adoption never gets one A covered number that the table no
+  re-adoption never gets one. A covered number that the table no
   longer lists, that this replica holds no trace of in the log (no cut key, no log index) and that no outstanding speculation
   ends is ended as the log's `Recall` would, at what the log holds of it (0), after the cut loop (a generation the segment
   itself ends stays out by its cut key): its rows roll back and replay by rid. Candidates are the table's list before the
@@ -2899,13 +2899,14 @@ block.
   a rebuild's copy of the side replica's keys, or this rule, so a streamed-ahead end (no key) stays live. The N4 case (a
   streamed-ahead `Delegate(g)` and `RecallCut(g)` both outstanding at a restart, then stranded) is closed when the strand is a
   covered marker's. The claimant's proof is persisted per epoch (`local["gate_orphan_proof"]`) before its marker can
-  ship, and the strand of a re-adoption of the same epoch reads it back (an other epoch's is ignored; a re-adoption writes none),
-  so a claimant that crashed between its marker and its strand still runs the rule; a takeover that ships no marker (a released
+  ship (a failed write withholds the marker: the gate stays pending and retries), and the strand of a re-adoption of the same epoch reads it back (an other epoch's is ignored; a re-adoption writes none),
+  so a claimant that crashed between its marker and its strand still runs the rule; a backup-role read or write failure fails the claim or acquisition (never "no role, no tail"), and a marker's abandon comes from the gate's `gate_abandoned`, not the in-memory claim; a takeover that ships no marker (a released
   lease) computes and keeps no proof. Residuals, still open: a takeover that carries a tail (a grant past the sealed `through`
   never ships, but a replica cannot tell where the grant sat without per-row tail facts), so the stall and the N4 wait remain
   there; a rebuild window spanning the marker; a re-adoption whose crashed predecessor never landed its first marker (the
-  re-adoption's marker is then the first of the epoch and carries a no-tail record the persisted proof may contradict); the
-  persisted proof's write failing (logged; the crash window is then open); and a sticky grant (plan 46 M1.2: a later tenure
+  re-adoption's marker is then the first of the epoch; its tail is re-shipped from the persisted backup role, and a
+  re-adopted lease that names an inherited tail never gets a no-tail record); the persisted proof's read failing (read as
+  none; the crash window is then open); and a sticky grant (plan 46 M1.2: a later tenure
   journals `Delegate` for an older number), which voids the no-tail rule's premise that a number is minted and journaled only by
   its epoch's tenure: the rule must be revisited before sticky grants land.
 - Plan 46 M1.2: `DelegateNode.gen` is minted by the same rule; a sticky grant keeps

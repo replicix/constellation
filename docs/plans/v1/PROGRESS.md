@@ -66036,7 +66036,11 @@ cursor, and the member's acknowledged, unshipped rows were lost (I1). Pre-existi
   crash between marker and strand); never written on a re-adoption; a released takeover (no marker) keeps none. Pinned: the
   crash, the epoch key, the released takeover, the gate's `stopped` marking of an orphan-ended generation, and the re-append
   guard (each fails with its code disabled).
+- **Review round (orph3)**: a failed write of the claimant's proof withholds its marker (`job_failed`, the gate stays pending)
+  and the in-memory proof is set only after the write; a backup-role read error is no longer "no role" (`role_unread`: nothing
+  is answered or claimed until it reads) and a role write error fails the claim or the append (never "no role, no tail"); a
+  re-adopted lease that names an inherited tail never gets a no-tail record; a marker's abandon is the gate's
+  (`gate_abandoned`), not the in-memory claim's.
 - **Still open**: a takeover that carries a tail (a replica cannot tell where in the predecessor's journal the grant sat); a
-  rebuild window spanning the marker; a re-adoption whose crashed predecessor never landed its first marker; a failed write of
-  the persisted proof; and sticky grants (plan 46 M1.2), which void the no-tail rule's premise (a number is journaled only by
+  rebuild window spanning the marker; a read failure of the persisted proof (read as none); and sticky grants (plan 46 M1.2), which void the no-tail rule's premise (a number is journaled only by
   its epoch's tenure) and need the rule revisited before they land.
