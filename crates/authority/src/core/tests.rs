@@ -15256,7 +15256,8 @@ mod backup_crash {
                     epoch: 1,
                     config_version: 2,
                 },
-            );
+            )
+            .unwrap();
             let mut cfg = Config::defaults(2, 1);
             cfg.ttl_ms = 10_000;
             let mut core = Core::new(cfg);
@@ -15849,6 +15850,64 @@ mod locks {
         h.core.lease.held.as_ref().map(|(l, _)| l.clone()).unwrap()
     }
 
+    /// ADR-43 (re-review SHOULD-1, guard): a re-adoption whose lease names an
+    /// inherited tail, but that lost the role it would re-ship it from, must
+    /// not emit the no-tail record (`TailFollowsThrough { p-1, 0 }`): replicas
+    /// would end the tail's generation. Fails without the guard in
+    /// `marker_records` (the proof then reads `no_tail: Some(1)`).
+    #[test]
+    fn a_re_adoption_naming_a_tail_emits_no_no_tail_proof() {
+        let g = (1u64 << constellation_meta::delegation::GEN_EPOCH_SHIFT) | 1;
+        let mut h = orphan_delegate_of(g);
+        h.hold(2, Some(takeover_gate(false)));
+        h.core.bk.gate_names_tail = true;
+        let mut out = Vec::new();
+        h.core.issue_marker(h.clk(), 0, &h.meta, &mut out);
+        assert_eq!(
+            crate::replica::Replica::gate_orphan_proof_persisted(&h.meta),
+            None,
+            "no no-tail record, so nothing to prove"
+        );
+        assert!(
+            matches!(h.core.bk.gate_orphan_proof, Some((2, p)) if p.is_empty()),
+            "{:?}",
+            h.core.bk.gate_orphan_proof
+        );
+    }
+
+    /// ADR-43 (re-review SHOULD-1): a backup role that cannot be read is not
+    /// "no role". The start notes it, and a claim is refused (it would
+    /// re-ship no tail) until a read succeeds, which restores the role.
+    /// Fails when the error maps to `None` (`role_unread` stays false and
+    /// the claim goes on).
+    #[test]
+    fn an_unreadable_backup_role_stops_a_claim_until_it_reads() {
+        let g = (1u64 << constellation_meta::delegation::GEN_EPOCH_SHIFT) | 1;
+        let mut h = orphan_delegate_of(g);
+        let role = constellation_meta::BackupRole {
+            holder: 1,
+            epoch: 1,
+            config_version: 2,
+        };
+        crate::replica::Replica::set_backup_role(&h.meta, role).unwrap();
+        h.core = Core::new(h.core.cfg.clone());
+        let mut out = Vec::new();
+        // (The seal's read goes first and passes.)
+        constellation_meta::fail_store_reads_after_on_this_thread_for_tests(1, 1);
+        h.core.backup_start(h.clk(), &h.meta, &mut out);
+        constellation_meta::fail_store_reads_after_on_this_thread_for_tests(0, 0);
+        assert!(h.core.bk.role_unread && !h.core.bk.sealed_unread);
+        assert!(h.core.bk.role.is_none());
+        h.hold(2, Some(takeover_gate(true)));
+        let prev = held_lease(&h);
+        constellation_meta::fail_store_reads_after_on_this_thread_for_tests(0, 1);
+        assert!(!h.core.prepare_tail_for_claim(&prev, &h.meta), "refused");
+        constellation_meta::fail_store_reads_after_on_this_thread_for_tests(0, 0);
+        assert!(h.core.backup_role_known(&h.meta));
+        assert_eq!(h.core.bk.role, Some(role));
+        assert!(!h.core.bk.role_unread);
+    }
+
     /// ADR-43 (review SHOULD-2): a claimant that crashed between its marker
     /// and the strand of its gate. The restart re-adopts the lease at the
     /// same epoch, whose own marker proves nothing; the claim's proof was
@@ -15862,7 +15921,7 @@ mod locks {
         let mut h = orphan_delegate_of(g);
         h.hold(2, Some(takeover_gate(false)));
         let mut out = Vec::new();
-        h.core.issue_marker(0, &h.meta, &mut out);
+        h.core.issue_marker(h.clk(), 0, &h.meta, &mut out);
         let want = constellation_meta::OrphanProof {
             upto: None,
             no_tail: Some(1),
@@ -15910,7 +15969,10 @@ mod locks {
             .claim_orphan_proof(&h.meta, Some(&prev), 3, true)
             .expect("a re-adoption");
         assert_eq!(e, 3);
-        assert!(p.no_tail.is_none() && p.upto.is_none(), "another epoch's proof: {p:?}");
+        assert!(
+            p.no_tail.is_none() && p.upto.is_none(),
+            "another epoch's proof: {p:?}"
+        );
         let (_, p) = h
             .core
             .claim_orphan_proof(&h.meta, Some(&prev), 3, true)
@@ -15926,7 +15988,16 @@ mod locks {
         // A re-adoption at epoch 2 would read it (the epoch matches).
         assert_eq!(
             h.core
-                .claim_orphan_proof(&h.meta, Some(&{ let mut l = prev.clone(); l.epoch = 2; l }), 2, true)
+                .claim_orphan_proof(
+                    &h.meta,
+                    Some(&{
+                        let mut l = prev.clone();
+                        l.epoch = 2;
+                        l
+                    }),
+                    2,
+                    true
+                )
                 .map(|(_, p)| p),
             Some(proof)
         );
@@ -15938,7 +16009,7 @@ mod locks {
         let mut gate = takeover_gate(false);
         gate.epoch = 3;
         h.hold(3, Some(gate));
-        h.core.issue_marker(0, &h.meta, &mut out);
+        h.core.issue_marker(h.clk(), 0, &h.meta, &mut out);
         assert_eq!(
             crate::replica::Replica::gate_orphan_proof_persisted(&h.meta),
             None
@@ -47475,7 +47546,8 @@ mod c1_counted {
                 epoch: 2,
                 config_version: 3,
             },
-        );
+        )
+        .unwrap();
         let mut cfg = Config::defaults(2, 1);
         cfg.ttl_ms = 10_000;
         let mut h = Harness {

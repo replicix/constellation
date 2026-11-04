@@ -650,8 +650,12 @@ pub trait Replica {
     /// `rows`: trim what it confirms (and every older epoch).
     fn backup_trim(&self, epoch: Epoch, through: u64, rows: &[u64]);
     fn backup_clear(&self);
-    fn backup_role(&self) -> Option<BackupRole>;
-    fn set_backup_role(&self, role: BackupRole);
+    /// The role this node holds; `Err`: the store could not be read (not
+    /// "no role": a claim built on that would re-ship no tail, ADR-43).
+    fn backup_role(&self) -> Result<Option<BackupRole>, MetaError>;
+    /// `Err`: the role is not durable; nothing may be acknowledged or
+    /// claimed on it.
+    fn set_backup_role(&self, role: BackupRole) -> Result<(), MetaError>;
     /// Persist the seal (`true` when durable — only then is a takeover
     /// attempted).
     fn backup_seal(&self, epoch: Epoch) -> bool;
@@ -1783,12 +1787,12 @@ impl Replica for Meta {
         let _ = Meta::backup_clear(self);
     }
 
-    fn backup_role(&self) -> Option<BackupRole> {
-        Meta::backup_role(self).ok().flatten()
+    fn backup_role(&self) -> Result<Option<BackupRole>, MetaError> {
+        Meta::backup_role(self)
     }
 
-    fn set_backup_role(&self, role: BackupRole) {
-        let _ = Meta::set_backup_role(self, role);
+    fn set_backup_role(&self, role: BackupRole) -> Result<(), MetaError> {
+        Meta::set_backup_role(self, role)
     }
 
     fn backup_seal(&self, epoch: Epoch) -> bool {
@@ -2026,13 +2030,7 @@ impl Replica for Meta {
         proof: Option<(Epoch, constellation_meta::OrphanProof)>,
     ) -> Result<(), MetaError> {
         let v = proof
-            .map(|(e, p)| {
-                format!(
-                    "{e}:{}:{}",
-                    p.upto.unwrap_or(0),
-                    p.no_tail.unwrap_or(0)
-                )
-            })
+            .map(|(e, p)| format!("{e}:{}:{}", p.upto.unwrap_or(0), p.no_tail.unwrap_or(0)))
             .unwrap_or_default();
         Meta::kv_set_durable(self, "gate_orphan_proof", &v)
     }

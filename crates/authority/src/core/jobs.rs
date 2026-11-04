@@ -1207,34 +1207,49 @@ impl Core {
         Ok(())
     }
 
-    pub(super) fn issue_marker(&mut self, attempts: u32, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(super) fn issue_marker(
+        &mut self,
+        now: Now,
+        attempts: u32,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         let Some(gate) = self.lease.gate else {
             return;
         };
         // Plan 30 §M6: the new tenure's journal position starts here, above
         // every position of the tenure it ends.
         let through = replica.journal_acked_seq().unwrap_or(0);
-        let records = marker_records(&gate, self.bk.abandoned_claim, self.bk.tail_through);
+        let records = marker_records(
+            &gate,
+            self.bk.gate_abandoned,
+            self.bk.tail_through,
+            self.bk.gate_names_tail,
+        );
         // ADR-43 (orphan grants): the claim's proof is on disk before its
         // marker can reach the log, keyed by the epoch, so a claimant that
         // crashes between the two still runs the rule in the strand of the
         // re-adoption that finishes the gate. Only a fresh claim writes it
         // (a re-adoption or a released takeover preset `gate_orphan_proof`
         // at `acquire_won`).
-        if gate.takeover && !matches!(self.bk.gate_orphan_proof, Some((e, _)) if e == gate.epoch)
-        {
+        if gate.takeover && !matches!(self.bk.gate_orphan_proof, Some((e, _)) if e == gate.epoch) {
             let proof = constellation_meta::OrphanProof::of(&records);
-            self.bk.gate_orphan_proof = Some((gate.epoch, proof));
             if !proof.is_empty() {
                 if let Err(error) = replica.persist_gate_orphan_proof(Some((gate.epoch, proof))) {
-                    tracing::error!(
-                        node = self.cfg.node_id,
-                        epoch = gate.epoch,
-                        %error,
-                        "the takeover's orphan proof could not be persisted: a crash before its strand loses the rule"
+                    // Withheld: a marker that ships before its proof is on
+                    // disk leaves a crash before the strand without the rule
+                    // every replica runs. The gate stays pending and the
+                    // next attempt writes it again.
+                    self.job_failed(
+                        now,
+                        format!("the takeover's orphan proof could not be persisted: {error}"),
+                        replica,
+                        out,
                     );
+                    return;
                 }
             }
+            self.bk.gate_orphan_proof = Some((gate.epoch, proof));
         }
         let payload = segment::encode(self.cfg.node_id, gate.epoch, through, &[], &[], &records)
             .expect("marker segment");
@@ -1360,6 +1375,7 @@ impl Core {
                         &gate,
                         self.bk.gate_abandoned,
                         self.bk.tail_through,
+                        self.bk.gate_names_tail,
                     ));
                     self.bk.gate_orphan_proof = Some((gate.epoch, proof));
                     proof
@@ -1456,6 +1472,7 @@ impl Core {
         }
         self.lease.gate = None;
         self.bk.gate_abandoned = None;
+        self.bk.gate_names_tail = false;
         self.bk.gate_orphan_proof = None;
         self.bk.gate_own_rows = None;
         if replica.gate_orphan_proof_persisted().is_some() {
@@ -1667,7 +1684,12 @@ impl Core {
         self.ship.head_seq = self.ship.head_seq.max(seq);
         self.ship.max_epoch = self.ship.max_epoch.max(epoch);
         self.stats.epoch_markers += 1;
-        let records = marker_records(gate, self.bk.abandoned_claim.take(), self.bk.tail_through);
+        let records = marker_records(
+            gate,
+            self.bk.gate_abandoned,
+            self.bk.tail_through,
+            self.bk.gate_names_tail,
+        );
         let payload = segment::encode(self.cfg.node_id, epoch, through, &[], &[], &records)
             .expect("marker segment");
         self.stream_passed(now, seq, epoch, &payload, out);
@@ -2260,7 +2282,7 @@ impl Core {
                     self.delegation_sync(now, replica, out);
                 }
                 GateStep::NeedMarker => {
-                    self.issue_marker(0, replica, out);
+                    self.issue_marker(now, 0, replica, out);
                     return;
                 }
                 GateStep::NeedDrain => {
@@ -3845,7 +3867,10 @@ impl Core {
         // epoch in memory, the same quantity.)
         self.bk.tail_through =
             backup_tail_epoch.map_or(0, |e| replica.backup_acked(e).unwrap_or(self.bk.acked));
-        self.bk.gate_abandoned = self.bk.abandoned_claim;
+        self.bk.gate_abandoned = self.bk.abandoned_claim.take();
+        self.bk.gate_names_tail = prev.as_ref().is_some_and(|p| {
+            p.holder == self.cfg.node_id && p.epoch == epoch && p.inherited_tail.is_some()
+        });
         self.bk.gate_orphan_proof = self.claim_orphan_proof(replica, prev.as_ref(), epoch, marker);
         // Plan 30 §M3 takeover gate; M13: every acquisition drains the
         // older epochs' inbox before its view opens.
@@ -3893,7 +3918,7 @@ impl Core {
         }
         match self.complete_gate(now, replica, out) {
             GateStep::Done => self.finish_acquire(now, true, replica, out),
-            GateStep::NeedMarker => self.issue_marker(0, replica, out),
+            GateStep::NeedMarker => self.issue_marker(now, 0, replica, out),
             GateStep::NeedDrain => self.issue_drain(out),
             GateStep::Failed(error) => {
                 tracing::error!(%error, node = self.cfg.node_id, "takeover gate failed; the view stays closed");
@@ -4984,7 +5009,7 @@ impl Core {
                     return;
                 }
                 let attempts = self.marker_attempts;
-                self.issue_marker(attempts, replica, out);
+                self.issue_marker(now, attempts, replica, out);
             }
             TailThen::Ship => {
                 let attempts = self.ship_attempts;
@@ -5432,15 +5457,24 @@ impl Core {
 /// fetches its tail or waits, C1-3). A node that holds rows of that epoch as
 /// a member copy — or comes to hold them later, a deposed holder back from a
 /// crash — drops them: they were never committed.
-fn marker_records(gate: &PendingGate, abandoned: Option<Epoch>, through: u64) -> Vec<LogRecord> {
+fn marker_records(
+    gate: &PendingGate,
+    abandoned: Option<Epoch>,
+    through: u64,
+    names_tail: bool,
+) -> Vec<LogRecord> {
+    // (`names_tail`: a re-adopted lease that still names a tail its tenure
+    // re-ships. A re-adoption that lost the role it would re-ship it from
+    // must not say "no tail": replicas would end the tail's generation.)
     let no_tail = (gate.takeover
         && gate.epoch >= 2
         && gate.backup_tail_epoch.is_none()
-        && abandoned.is_none())
-    .then(|| LogRecord::TailFollowsThrough {
-        prev_epoch: gate.epoch - 1,
-        through: 0,
-    });
+        && abandoned.is_none()
+        && !names_tail)
+        .then(|| LogRecord::TailFollowsThrough {
+            prev_epoch: gate.epoch - 1,
+            through: 0,
+        });
     gate.backup_tail_epoch
         .map(|prev_epoch| LogRecord::TailFollowsThrough {
             prev_epoch,

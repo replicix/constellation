@@ -412,6 +412,8 @@ impl Meta {
     }
 
     pub fn backup_role(&self) -> Result<Option<BackupRole>, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        read_fault::check()?;
         let r = self.db.read_tx();
         let Some(s) = kv_get_tx(&r, &self.local, KV_BACKUP_ROLE)? else {
             return Ok(None);
@@ -608,7 +610,7 @@ impl Meta {
 /// backup's holdings or seal (a delegation backup's: [`Meta::deleg_backup_holds_any`],
 /// [`Meta::deleg_backup_tail`], [`Meta::deleg_backup_sealed`],
 /// [`Meta::deleg_backup_append`]'s acknowledgement; the root's group:
-/// [`Meta::backup_acked`], [`Meta::backup_tail`], [`Meta::backup_sealed_epoch`],
+/// [`Meta::backup_role`], [`Meta::backup_acked`], [`Meta::backup_tail`], [`Meta::backup_sealed_epoch`],
 /// [`Meta::journal_has_epoch_rows`]; and [`Meta::deleg_group`]) with an I/O
 /// error.
 #[cfg(any(test, feature = "test-util"))]

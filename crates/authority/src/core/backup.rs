@@ -748,6 +748,10 @@ pub(crate) struct BackupState {
     /// known, and nothing is acknowledged or answered until a read succeeds
     /// ([`Core::backup_sealed_known`]; plan 43 C2e review).
     pub(crate) sealed_unread: bool,
+    /// The persisted role could not be read at start (ADR-43): not "no
+    /// role"; nothing is answered or claimed until a read succeeds
+    /// ([`Core::backup_role_known`]).
+    pub(crate) role_unread: bool,
     /// The last `seal_tail_hold` could not read the store: its answer is
     /// none at all, not a refusal.
     pub(crate) seal_unreadable: bool,
@@ -831,6 +835,9 @@ pub(crate) struct BackupState {
     /// Plan 43 C1-4: the abandoned epoch of the claim whose gate is open
     /// (its strand rolls back that group's committed entries too).
     pub(crate) gate_abandoned: Option<Epoch>,
+    /// ADR-43: the open gate re-adopts this node's own lease, which names
+    /// an inherited tail: its marker never carries the no-tail record.
+    pub(crate) gate_names_tail: bool,
     /// Plan 43 C1-4: the extent of the tail the open gate re-ships (its
     /// marker's `TailFollowsThrough.through`).
     pub(crate) tail_through: u64,
@@ -1292,6 +1299,28 @@ impl Core {
 
     // ------------------------------------------------------------ start
 
+    /// Whether the persisted backup role is known: read again if its read
+    /// failed at start (`false`: still unknown, no append is answered and no
+    /// claim is made on it).
+    pub(crate) fn backup_role_known(&mut self, replica: &dyn Replica) -> bool {
+        if !self.bk.role_unread {
+            return true;
+        }
+        match replica.backup_role() {
+            Ok(role) => {
+                self.bk.role_unread = false;
+                if let Some(role) = role {
+                    self.bk.role = Some(role);
+                    self.bk.acked = replica.backup_acked(role.epoch).unwrap_or(0);
+                    self.bk.restarted = true;
+                    self.lease.cached_holder = Some(role.holder);
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Whether the highest sealed epoch is known: read again if its read
     /// failed at start (`false`: still unknown, answer nothing).
     pub(crate) fn backup_sealed_known(&mut self, replica: &dyn Replica) -> bool {
@@ -1336,7 +1365,22 @@ impl Core {
             }
         }
         self.bk.member_epochs = replica.member_copy_epochs();
-        if let Some(role) = replica.backup_role() {
+        let role = match replica.backup_role() {
+            Ok(role) => role,
+            Err(error) => {
+                // Not "no role": a claim would re-ship no tail and its
+                // marker would say so (ADR-43). Nothing is answered or
+                // claimed until a read succeeds (`backup_role_known`).
+                self.bk.role_unread = true;
+                tracing::warn!(
+                    node = self.cfg.node_id,
+                    %error,
+                    "the persisted backup role could not be read: acknowledging and claiming nothing until it reads"
+                );
+                None
+            }
+        };
+        if let Some(role) = role {
             self.bk.role = Some(role);
             // (Unreadable: from 0, which only acknowledges less.)
             self.bk.acked = replica.backup_acked(role.epoch).unwrap_or(0);
@@ -4308,7 +4352,7 @@ impl Core {
         self.note_foreign(now, replica, out);
         // The seal unknown (its read failed at start): no answer, the holder
         // sends again (plan 43 C2e review).
-        if !self.backup_sealed_known(replica) {
+        if !self.backup_sealed_known(replica) || !self.backup_role_known(replica) {
             return;
         }
         let reply = |acked: u64, sealed: bool, fresh: bool, out: &mut Vec<Action>| {
@@ -4351,7 +4395,10 @@ impl Core {
                         config_version,
                         ..role
                     };
-                    replica.set_backup_role(role);
+                    if replica.set_backup_role(role).is_err() {
+                        // (Not durable: no answer, the holder sends again.)
+                        return;
+                    }
                     self.bk.role = Some(role);
                 }
                 self.bk.candidacy = self.bk.candidacy.max(candidacy);
@@ -4367,7 +4414,9 @@ impl Core {
                     epoch,
                     config_version,
                 };
-                replica.set_backup_role(role);
+                if replica.set_backup_role(role).is_err() {
+                    return;
+                }
                 self.bk.role = Some(role);
                 // (Unreadable: from 0, which only acknowledges less.)
                 self.bk.acked = replica.backup_acked(epoch).unwrap_or(0);

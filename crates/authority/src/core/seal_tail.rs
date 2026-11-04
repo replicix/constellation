@@ -676,7 +676,11 @@ impl Core {
             epoch: ch.epoch,
             config_version: ch.config_version,
         };
-        replica.set_backup_role(role);
+        if let Err(error) = replica.set_backup_role(role) {
+            tracing::error!(node = self.cfg.node_id, %error, "the fetched tail's role could not be persisted: the claim ends");
+            self.end_acquire_attempt(now, replica, out);
+            return;
+        }
         if !proved_empty {
             if !replica.backup_seal(ch.epoch) {
                 self.end_acquire_attempt(now, replica, out);
@@ -883,7 +887,7 @@ impl Core {
     /// re-claims with its own member copy as the tail (D7). `false`: could
     /// not (the seal or the copy did not persist): the claim ends.
     pub(crate) fn prepare_tail_for_claim(&mut self, prev: &Lease, replica: &dyn Replica) -> bool {
-        if !self.backup_sealed_known(replica) {
+        if !self.backup_sealed_known(replica) || !self.backup_role_known(replica) {
             return false;
         }
         let me = self.cfg.node_id;
@@ -909,7 +913,10 @@ impl Core {
                     epoch: prev.epoch,
                     config_version: cv,
                 };
-                replica.set_backup_role(role);
+                if let Err(error) = replica.set_backup_role(role) {
+                    tracing::error!(node = me, %error, "the member copy's role could not be persisted: the claim ends");
+                    return false;
+                }
                 self.bk.role = Some(role);
                 let Some(acked) = replica.backup_acked(prev.epoch) else {
                     return false;
