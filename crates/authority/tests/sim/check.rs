@@ -387,10 +387,15 @@ pub fn no_settled_landing(acks: &[super::oracle::AckEntry], oracle: &Oracle) -> 
 /// The sim's client resubmits an in-doubt rid up to `MAX_RESUBMITS` times;
 /// production answers `EIO` at once and the application moves on. The
 /// first `InDoubt` answer is the one the application sees, so it is the
-/// one judged.
+/// one judged. The resubmission is the sim's own: when no copy of the rid
+/// existed (`first_queued`: the first tick it sat in a replay queue) before
+/// the first resubmission after that answer, what lands is the
+/// resubmission's execution, not the original's, and is not judged.
 pub fn no_late_landing(
     in_doubt: &[(u64, Rid, Seq, u64)],
     invokes: &[(Rid, u64)],
+    resubmits: &[(Rid, u64)],
+    first_queued: &BTreeMap<Rid, u64>,
     oracle: &Oracle,
 ) -> (usize, Vec<String>) {
     // The first in-doubt answer of each rid.
@@ -406,6 +411,14 @@ pub fn no_late_landing(
         let Some(p) = oracle.completed_at.get(r) else {
             continue;
         };
+        let resubmitted = resubmits
+            .iter()
+            .filter(|(r2, t2)| r2 == r && t2 > t)
+            .map(|(_, t2)| *t2)
+            .min();
+        if resubmitted.is_some_and(|rs| first_queued.get(r).is_none_or(|q| *q > rs)) {
+            continue;
+        }
         let after = invokes
             .iter()
             .filter(|(r2, t2)| r2.node == *n && r2 != r && *t2 > *t)

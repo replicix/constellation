@@ -8768,14 +8768,30 @@ fn regression_a_deposed_roots_refusal_is_no_causal_cut_seed_4947() {
     });
 }
 
+/// Oracle false positive, pinned: seed 1525 of `delegated-group-switch` with
+/// slow lease reads (`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`). The sim's own
+/// resubmission of an in-doubt rid that never ran landed after a later op,
+/// and I4 took it for a late landing of the original.
+#[test]
+fn regression_the_sims_resubmission_is_no_late_landing_seed_1525() {
+    let cfg = SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..delegated_group_switch_config()
+    };
+    run_seed(1525, cfg).unwrap_or_else(|e| {
+        panic!(
+            "delegated-group-switch seed 1525: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=delegated-group-switch AUTHORITY_SIM_LEASE_READS=0:0:800:1000"
+        )
+    });
+}
+
 /// Plan 46 M0.3: the findings of `delegated-group-switch`, pinned for the
 /// follow-up fixes: seed 234 acknowledges a row (I1) while the group's version
 /// is changing, with no backup recorded and the root's journal lacking the
 /// appended row; seed 615 is a late landing (I4): an op answered in doubt that
-/// lands after a later one. Both fail today; the test is ignored until they are
-/// fixed (`cargo test --test sim -- --ignored delegated_group_switch_findings`).
+/// lands after a later one. Both failed when pinned; both pass now.
 #[test]
-#[ignore = "findings of plan 46 M0.3: delegated-group-switch seeds 234 (I1) and 615 (I4) fail until fixed"]
 fn delegated_group_switch_findings_seeds_234_and_615() {
     // Every seed runs, and every failure is reported (a first failure must not
     // hide the others).

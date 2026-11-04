@@ -52,6 +52,9 @@ pub struct Oracles {
     /// The first submission of each rid, with its tick.
     pub invokes: Mutex<Vec<(Rid, u64)>>,
     invoked: Mutex<HashSet<Rid>>,
+    /// Every later submission of a rid (the client's resubmissions of an
+    /// in-doubt op), with its tick.
+    pub resubmits: Mutex<Vec<(Rid, u64)>>,
     /// One global, strictly increasing event counter: every emission
     /// judged, every in-doubt answer and every client invocation takes the
     /// next value, so "after" is exact on the single-threaded runtime.
@@ -303,6 +306,7 @@ impl Oracles {
             identity: Mutex::new(IdentityLedger::default()),
             invokes: Mutex::new(Vec::new()),
             invoked: Mutex::new(HashSet::new()),
+            resubmits: Mutex::new(Vec::new()),
             tick: AtomicU64::new(1),
             acks_unmapped: AtomicU64::new(0),
             i1_violations: Mutex::new(Vec::new()),
@@ -316,11 +320,14 @@ impl Oracles {
         self.tick.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// A client's first submission of `rid` (a resubmission adds nothing).
+    /// A client's first submission of `rid` (a resubmission is noted apart,
+    /// in `resubmits`).
     pub fn note_invoke(&self, rid: Rid) {
+        let t = self.next_tick();
         if self.invoked.lock().unwrap().insert(rid) {
-            let t = self.next_tick();
             self.invokes.lock().unwrap().push((rid, t));
+        } else {
+            self.resubmits.lock().unwrap().push((rid, t));
         }
     }
 
@@ -1398,6 +1405,11 @@ pub struct IdentityLedger {
     /// of a delegate's row it had appended, which no oracle pair caught
     /// where no re-ask overlapped it.
     pub foreign_gated: BTreeMap<Rid, String>,
+    /// The first tick each rid sat in some node's replay queue (a journaled
+    /// copy that existed): I4 tells the sim's own resubmission of an
+    /// in-doubt rid, which never ran before it, from a late landing of the
+    /// original.
+    pub first_queued: BTreeMap<Rid, u64>,
 }
 
 impl IdentityLedger {
@@ -1417,6 +1429,10 @@ impl IdentityLedger {
         {
             return;
         }
+        for rid in &queued {
+            self.first_queued.entry(*rid).or_insert(tick);
+        }
+        let copies = self.per_node.entry(node).or_default();
         copies.queued = queued;
         copies.queued_gated = queued_gated;
         copies.executing = executing;
@@ -1743,7 +1759,9 @@ pub fn end_of_run(
     }
     // I4.
     let invokes = o.invokes.lock().unwrap().clone();
-    f.i4 = super::check::no_late_landing(in_doubt, &invokes, log).1;
+    let resubmits = o.resubmits.lock().unwrap().clone();
+    let first_queued = o.identity.lock().unwrap().first_queued.clone();
+    f.i4 = super::check::no_late_landing(in_doubt, &invokes, &resubmits, &first_queued, log).1;
     // Plan 43 C2 (§7.1 item 6): a settled answer promises the op never
     // takes effect: no completion of the rid in the log, wherever it lands.
     f.i4.extend(super::check::no_settled_landing(&acks, log));
@@ -3077,7 +3095,8 @@ mod tests {
         // r1 (answered in doubt at tick 10) lands at (5, 0); r2, invoked
         // afterwards by the same node, landed first at (3, 0): late.
         let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (r2, (3, 0))]);
-        let (n, why) = super::super::check::no_late_landing(&in_doubt, &invokes, &log);
+        let (n, why) =
+            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &BTreeMap::new(), &log);
         assert_eq!(n, 1, "{why:?}");
         assert!(
             why[0].contains("I4 unacked_fails_never_lands_late"),
@@ -3086,16 +3105,41 @@ mod tests {
         // r1 landing before the later op is clean.
         let log = log_with(seg(1, &[]), &[(r1, (2, 0)), (r2, (3, 0))]);
         assert_eq!(
-            super::super::check::no_late_landing(&in_doubt, &invokes, &log).0,
+            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &BTreeMap::new(), &log)
+                .0,
             0
         );
         // An op another node invoked is not this node's client's.
         let invokes = [(r1, 5u64), (rid(2, 1), 11)];
         let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (rid(2, 1), (3, 0))]);
         assert_eq!(
-            super::super::check::no_late_landing(&in_doubt, &invokes, &log).0,
+            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &BTreeMap::new(), &log)
+                .0,
             0
         );
+    }
+
+    /// The sim's client resubmits an in-doubt rid. When nothing ran before
+    /// the resubmission, what lands is the resubmission's execution (seed
+    /// 1525 of `delegated-group-switch` with slow lease reads); when a copy
+    /// of the original was queued before it, the landing is the original's
+    /// and is late as before.
+    #[test]
+    fn i4_a_landing_of_the_sims_own_resubmission_is_not_late() {
+        let (r1, r2) = (rid(1, 1), rid(1, 2));
+        let in_doubt = [(1u64, r1, 0u64, 10u64)];
+        let invokes = [(r1, 5u64), (r2, 11)];
+        let resubmits = [(r1, 20u64)];
+        let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (r2, (3, 0))]);
+        let check = |queued: &[(Rid, u64)]| {
+            let q: BTreeMap<Rid, u64> = queued.iter().copied().collect();
+            super::super::check::no_late_landing(&in_doubt, &invokes, &resubmits, &q, &log).0
+        };
+        // Never queued anywhere, or first queued after the resubmission.
+        assert_eq!(check(&[]), 0);
+        assert_eq!(check(&[(r1, 25)]), 0);
+        // A copy of the original existed before it: a genuine late landing.
+        assert_eq!(check(&[(r1, 12)]), 1);
     }
 
     /// Plan 43 C2 (§7.1 item 6): a settled answer (`Abandoned`, to a client)
