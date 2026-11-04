@@ -65884,3 +65884,27 @@ sweeps of `locks-delegated`, `long-delegated`, `long-delegated-late-answers` and
 `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, and `locks-delegated` with `AUTHORITY_SIM_DROP_RECALLEDS=3`: 0 failing on main and on the fix.
 Sweeps of `long-delegated`, `-late-answers`, `-backup`, `locks-delegated`, `delegated-holder-cut` and `placement-hot`, seeds
 0..2000, with and without `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`: 0 failing on main (c5228764) and on the fix, in all 12.
+
+## Cause 6 re-traced: a lease claim's fresh read is part of the claim (2026-11-04; plan 46 M0.3)
+
+The maintainer's decision for cause 6 ("the lease path's last stretch", 2026-11-04): re-trace it on main, label as allowed only
+what the sim's own history proves could not finish, report the rest. Of 130 replayed lease-path violations (15 non-flex ceiling
+configurations × 2,000 seeds, both modes) only 7, all with the lease-reads knob, were a claim by TTL whose fresh lease read could
+not answer inside the settle window. The I4 classifier (`tests/sim/reach.rs`, `claim_done`) now models that read, only in the
+arm where the product waits for another holder's TTL (`retry_at` in the lease job); a claim of an absent, released or holder-0
+lease goes to the CAS after its first read and gains nothing. Only a read the claimant issued from the claim's start counts, and a
+read issued late is excused its transit only. Counts (2,000 seeds, knob, violations): `long-backup` 28 to 26,
+`long-delegated-late-answers` 673 to 665; without the knob nothing moves. Ratchet ceilings lowered to the measured counts
+(`delegated-group-switch` 3/2 to 0/0, `delegated-long-delegation` allowed 187 to 160, `long-delegated-backup` allowed 6 to 1,
+`long-delegated-late-answers` violations 9 to 6); none raised.
+
+The rest are product causes or deferred classes, kept as violations:
+
+- **G, the group-tail wait** (36 with the knob, 24 without; `backup-crash` 24, `backup-strict` 115): the holder restarted with
+  its journal and every member answers `held=false`; the claimant ignores those answers (`seal_tail.rs`), and the requester still
+  counts the restarted holder as down (`reaches()` in the inbox), so it never forwards to it. Fixed next (maintainer, 2026-11-04).
+- **B, `Held` from a reachable root, never asked again** (11; `backup-strict` 1551 with the knob): fixed next with G.
+- **C, the claim's CAS lost to another write** (32, knob; `backup-crash` 57): a waiter's `wanted_by` registration or a
+  re-adoption takes the ETag, then slow verify and retry reads. A follow-up.
+- **A** (29, the lease won but the own op still in its gate: the deferred in-gate class) and **O** (22, forwarded to a
+  re-adopting holder instead of claiming).
