@@ -707,7 +707,7 @@ pub(super) fn acks3_under_load(seed: u64) -> Result<()> {
         let ack = clients[0].control_status()?["ack"].clone();
         anyhow::ensure!(ack["policy"] == "s3", "a is not under ack=s3: {ack}");
         let (ledger, errnos) = (
-            Ledger::with_client_deadline(super::m9::client_deadline()),
+            Ledger::new(),
             ErrnoLog::new(),
         );
         let stop = Arc::new(AtomicBool::new(false));
@@ -819,7 +819,7 @@ pub(super) fn endpoint_wedge_probe(_seed: u64) -> Result<()> {
             })
             .collect();
         let (ledger, errnos) = (
-            Ledger::with_client_deadline(super::m9::client_deadline()),
+            Ledger::new(),
             ErrnoLog::new(),
         );
         let stop = Arc::new(AtomicBool::new(false));
@@ -1053,7 +1053,7 @@ pub(super) fn delegate_paused_across_ttl(_seed: u64) -> Result<()> {
                 .map(|s| (s.to_string(), t.duration_of(s).expect("a boundary")))
                 .collect();
         let (ledger, errnos) = (
-            Ledger::with_client_deadline(t.client_deadline()),
+            Ledger::new(),
             ErrnoLog::new(),
         );
         let stop = Arc::new(AtomicBool::new(false));

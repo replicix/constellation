@@ -66118,3 +66118,26 @@ the data's keys, so the session wait did not hold a read of them: a reader on th
   1 read held, seed 840's leak, for 1845 ms once and then released by the cap (the first predicate: 50 reads, median 145 ms, and
   seed 840 a full 2 s on every read, for good). Sweeps of both configs (2000 seeds each, both knob modes, and
   `backup-crash-slow` 0..1000) fail the same seeds as main (only 840, the known leak). Release sim suite 378 passed, 0 failed.
+## Oracle false positives of the seed triage, and the harness ledger's late-landing allowance (plan 46 M0.1 exit)
+
+Three clean-ups; no protocol change.
+
+- **Causal-cut counter at a deposed root** (`long-delegated-late-answers` 4947, no knob): `deleg_deps_unsatisfied_at_append` counted
+  a batch the root *refused* for lacking its deps. The root was deposed without knowing it; the delegate had waited for its deps and
+  re-streamed to the new root, and nothing was appended. Refusals now count in `deleg_deps_refused` (not judged); the old counter
+  counts only a row that landed in the log with its deps still unreached (checked after the append), and the sim's check
+  (`causal_cut_violation`) fails on that alone. Tests: `a_batch_whose_deps_the_root_lacks_is_refused_not_appended_ahead` (core; fails
+  before: no refusal counter, the old one was 1), `a_refused_batch_is_no_causal_cut_but_a_row_ahead_of_its_cause_is` (a counted
+  append ahead of its cause still fails), pin `regression_a_deposed_roots_refusal_is_no_causal_cut_seed_4947`.
+- **I4 late landing from the sim's own resubmission** (`delegated-group-switch` 1525, lease-reads knob): the sim client resubmits an
+  in-doubt rid (`MAX_RESUBMITS`; production never does), and the resubmission's execution was judged as a late landing of the original.
+  `no_late_landing` now skips a rid when no copy of it sat in any node's replay queue before the first resubmission after its in-doubt
+  answer (the identity ledger's `first_queued`, the oracle's `resubmits`); a copy that existed before it keeps the judgement. Tests:
+  `i4_a_landing_of_the_sims_own_resubmission_is_not_late` (both ways), pin `regression_the_sims_resubmission_is_no_late_landing_seed_1525`.
+  Limit: an original that executed and shipped within one event, never seen in a queue, would be excused.
+- **Harness ledger**: the `late` set (an op answered in doubt may land once, late, on its own name) is removed, with
+  `Ledger::with_client_deadline`, `failed_create`/`failed_rename`, `answered_in_doubt` and `late_landed`; the code does not tell a
+  singleton topology (every user runs two or three nodes), so none keeps it. A name back after an acknowledged unlink or rename away is
+  `resurrected`, a violation. A failed op still leaves its path in doubt until acknowledged again. The scenarios that exercise it:
+  `lease-claimant-ahead` (`leaseclaim`), `acks3_under_load`, `endpoint_wedge_probe` and `delegate_paused_across_ttl`
+  (`campaign_load`), the load-probe and takeover scenarios (`campaign`). They need a long box run; not run here. Test: `an_op_answered_in_doubt_never_lands_late` (harness lib).

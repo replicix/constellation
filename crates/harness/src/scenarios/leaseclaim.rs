@@ -111,7 +111,7 @@ pub(super) fn lease_claimant_ahead(_seed: u64) -> Result<()> {
             lease_of(&clients[0])?
         );
         let (ledger, errnos) = (
-            Ledger::with_client_deadline(super::m9::client_deadline()),
+            Ledger::new(),
             ErrnoLog::new(),
         );
         let stop_a = Arc::new(AtomicBool::new(false));

@@ -10,9 +10,10 @@
 //!   and unlink the application was told succeeded; at the end each one
 //!   is in the tree or in a documented conflict copy, or it is a lost
 //!   write; corrupt bytes at a path are corruption whatever copy exists.
-//!   An op answered in doubt may still land once, late, on its own name
-//!   ([`Ledger::failed_create`], [`Ledger::failed_rename`]); the check
-//!   runs after quiescence ([`wait_quiescent`]). Acknowledged means `fsync` returned; the `close` is checked too (an
+//!   An op answered in doubt leaves its path in doubt until acknowledged
+//!   again, but it never lands later, after the application's later ops
+//!   on that name: such a landing is a resurrected name (plan 46 M0.1);
+//!   the check runs after quiescence ([`wait_quiescent`]). Acknowledged means `fsync` returned; the `close` is checked too (an
 //!   error there is an error to the application). What the protocol
 //!   counts on the way (stranded and replayed ops, refused replays,
 //!   conflict copies, outwaited grants) is reported beside it
@@ -381,15 +382,6 @@ struct LedgerInner {
     /// Paths whose last op failed: any state of them is possible (a failed
     /// write may leave part of its content, a failed rename either name).
     doubtful: HashSet<String>,
-    /// Ops answered in doubt ([`answered_in_doubt`]) that make a name:
-    /// each may still land once, later, after the application's later
-    /// ops on that name were acknowledged (a stranded execution replayed
-    /// by rid on a node's drain: plan 30 §M9's unacknowledged ops; the
-    /// rid executes once). Per path, what each leaves there: `None` an
-    /// empty file (a create), `Some(id)` that content (a rename).
-    late: BTreeMap<String, Vec<Option<FileId>>>,
-    /// The daemons' client deadline (zero: no op is in doubt).
-    client_deadline: Duration,
     ops: u64,
     /// Per path, the last op the application was certainly told
     /// succeeded (what [`Ledger::ownership`] reports a refusal against).
@@ -435,14 +427,6 @@ pub enum Ownership {
     Absent,
 }
 
-/// Whether an op that failed with `e` after `took` was answered in doubt:
-/// `EIO` at the client deadline (`acquire_deadline_ms`), where the node
-/// stops waiting for an outcome it does not have. The op may or may not
-/// have happened, and may still happen (once). Zero `deadline`: never.
-pub fn answered_in_doubt(e: &std::io::Error, took: Duration, deadline: Duration) -> bool {
-    e.raw_os_error() == Some(libc::EIO) && !deadline.is_zero() && took >= deadline
-}
-
 /// The acknowledged-write ledger: a workload records each op the
 /// application was told succeeded (and each that failed, which may have
 /// landed all the same), and [`Ledger::check`] compares the tree with it.
@@ -470,10 +454,6 @@ pub struct LedgerReport {
     pub wrong: Vec<String>,
     /// Acknowledged unlinks (or renames away) whose path is back.
     pub resurrected: Vec<String>,
-    /// Names back after an acknowledged unlink or rename away, holding
-    /// what an op answered in doubt on that name would leave there: its
-    /// late landing (allowed, counted).
-    pub late_landed: Vec<String>,
     /// Files nobody acknowledged (nor tried to write) under the ledger's
     /// directories.
     pub phantoms: Vec<String>,
@@ -508,18 +488,11 @@ impl LedgerReport {
 }
 
 impl Ledger {
-    /// A ledger for which no failed op is in doubt: every op answered
-    /// had its outcome.
+    /// An empty ledger. An op that failed leaves its path in doubt until
+    /// it is acknowledged again; it never lands after the application's
+    /// later ops (no late-landing allowance).
     pub fn new() -> Ledger {
         Ledger::default()
-    }
-
-    /// A ledger of a workload on daemons with client deadline `d`: an op
-    /// failing with `EIO` at `d` is in doubt ([`answered_in_doubt`]).
-    pub fn with_client_deadline(d: Duration) -> Ledger {
-        let l = Ledger::default();
-        l.inner().client_deadline = d;
-        l
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, LedgerInner> {
@@ -542,40 +515,6 @@ impl Ledger {
         let mut l = self.inner();
         l.attempted.insert(id);
         l.doubtful.insert(rel.to_string());
-    }
-
-    /// Creating `rel` for `id` failed with `e` after `took`: as
-    /// [`Ledger::failed_write`]; and when it was answered in doubt and
-    /// `rel` was not a file the ledger knows (so the op would make the
-    /// name, not truncate a file), `rel` may come back once, empty, after
-    /// a later acknowledged unlink or rename of it.
-    pub fn failed_create(&self, rel: &str, id: FileId, e: &std::io::Error, took: Duration) {
-        let mut l = self.inner();
-        let present = matches!(l.files.get(rel), Some(Some(_))) && !l.doubtful.contains(rel);
-        if !present && answered_in_doubt(e, took, l.client_deadline) {
-            l.late.entry(rel.to_string()).or_default().push(None);
-        }
-        drop(l);
-        self.failed_write(rel, id);
-    }
-
-    /// A rename of `from` to `to` failed with `e` after `took`: as
-    /// [`Ledger::failed_op`] on both; and when it was answered in doubt
-    /// and `from` held acknowledged content, `to` may come back once with
-    /// that content after a later acknowledged unlink or rename of it.
-    pub fn failed_rename(&self, from: &str, to: &str, e: &std::io::Error, took: Duration) {
-        let mut l = self.inner();
-        let held = match l.files.get(from) {
-            Some(Some(id)) if !l.doubtful.contains(from) => Some(id.clone()),
-            _ => None,
-        };
-        if let Some(id) = held {
-            if answered_in_doubt(e, took, l.client_deadline) {
-                l.late.entry(to.to_string()).or_default().push(Some(id));
-            }
-        }
-        drop(l);
-        self.failed_op(&[from, to]);
     }
 
     /// An op on `rels` failed (a rename, an unlink): their state is
@@ -667,11 +606,10 @@ impl Ledger {
     ) -> Result<(), (&'static str, std::io::Error)> {
         use std::io::Write;
         use std::os::fd::IntoRawFd;
-        let t = Instant::now();
         let mut f = match std::fs::File::create(root.join(rel)) {
             Ok(f) => f,
             Err(e) => {
-                self.failed_create(rel, id, &e, t.elapsed());
+                self.failed_write(rel, id);
                 return Err(("create", e));
             }
         };
@@ -757,20 +695,7 @@ impl Ledger {
                     rep.in_conflict_copy.push(format!("{rel}: {id:?}"))
                 }
                 (Some(id), Err(e)) => rep.lost.push(format!("{rel}: {id:?} ({e})")),
-                (None, Ok(bytes)) => match l.late.get(rel).and_then(|late| {
-                    late.iter().find(|left| match left {
-                        None => bytes.is_empty(),
-                        Some(id) => check_payload(&bytes).as_ref() == Ok(id),
-                    })
-                }) {
-                    Some(None) => rep
-                        .late_landed
-                        .push(format!("{rel}: empty (a create in doubt)")),
-                    Some(Some(id)) => rep
-                        .late_landed
-                        .push(format!("{rel}: {id:?} (a rename in doubt)")),
-                    None => rep.resurrected.push(rel.clone()),
-                },
+                (None, Ok(_)) => rep.resurrected.push(rel.clone()),
                 (None, Err(_)) => {}
             }
         }
@@ -2453,94 +2378,41 @@ mod tests {
         assert_eq!(rep.resurrected, vec!["w/g0".to_string()], "{rep:?}");
     }
 
+    /// Plan 46 M0.1: no late-landing allowance. An op that failed (answered
+    /// in doubt or not) leaves its path in doubt only until the path is
+    /// acknowledged again; a name that comes back after an acknowledged
+    /// unlink or rename away is resurrected, whatever failed before.
     #[test]
-    fn an_op_answered_in_doubt_may_land_once_late() {
+    fn an_op_answered_in_doubt_never_lands_late() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir(root.join("w")).unwrap();
-        let deadline = Duration::from_secs(40);
-        let l = Ledger::with_client_deadline(deadline);
+        let l = Ledger::new();
         let id = |seq| FileId {
             path: format!("w/f{seq}"),
             writer: "a".into(),
             seq,
         };
-        let eio = std::io::Error::from_raw_os_error(libc::EIO);
-        let enospc = std::io::Error::from_raw_os_error(libc::ENOSPC);
-        assert!(answered_in_doubt(&eio, deadline, deadline));
-        assert!(!answered_in_doubt(&eio, deadline / 2, deadline));
-        assert!(!answered_in_doubt(&enospc, deadline, deadline));
-        assert!(!answered_in_doubt(&eio, deadline, Duration::ZERO));
-        // The drain's interleaving: create f0 answered in doubt; the
-        // retry lands and is renamed away (both acknowledged); the stranded
-        // create is replayed by rid after them: f0 is back, empty.
-        l.failed_create("w/f0", id(0), &eio, deadline);
+        // A create in doubt; the retry lands and is renamed away
+        // (acknowledged); the stranded create is replayed after them: f0
+        // is back, empty.
+        l.failed_write("w/f0", id(0));
         l.write(root, "w/f0", id(1), 1000).unwrap();
         std::fs::rename(root.join("w/f0"), root.join("w/g0")).unwrap();
         l.acked_rename("w/f0", "w/g0");
         std::fs::write(root.join("w/f0"), b"").unwrap();
         let rep = l.check(root);
-        assert!(rep.violations(0).is_empty(), "{rep:?}");
-        assert_eq!(rep.late_landed.len(), 1, "{rep:?}");
-        assert_eq!(rep.intact, 1, "{rep:?}");
-        // What the create could not have left there is resurrection: a
-        // create writes no content.
-        std::fs::write(root.join("w/f0"), payload(&id(0), 1000)).unwrap();
-        assert_eq!(l.check(root).resurrected, vec!["w/f0".to_string()]);
+        assert_eq!(rep.resurrected, vec!["w/f0".to_string()], "{rep:?}");
+        assert!(!rep.violations(0).is_empty(), "{rep:?}");
         std::fs::remove_file(root.join("w/f0")).unwrap();
-        // Failed before the deadline, or with another errno: an outcome,
-        // not doubt; the name stays gone.
-        l.failed_create("w/f1", id(2), &eio, deadline / 2);
-        l.failed_create("w/f2", id(3), &enospc, deadline);
-        for f in ["w/f1", "w/f2"] {
-            l.acked_unlink(f);
-            std::fs::write(root.join(f), b"").unwrap();
-        }
-        let rep = l.check(root);
-        assert_eq!(
-            rep.resurrected,
-            vec!["w/f1".to_string(), "w/f2".to_string()]
-        );
-        assert!(rep.late_landed.is_empty(), "{rep:?}");
-        for f in ["w/f1", "w/f2"] {
-            std::fs::remove_file(root.join(f)).unwrap();
-        }
-        // A create in doubt of a file that existed truncates it, makes no
-        // name: unlinked later, it stays gone.
-        l.write(root, "w/f3", id(4), 1000).unwrap();
-        l.failed_create("w/f3", id(5), &eio, deadline);
-        l.write(root, "w/f3", id(6), 1000).unwrap();
-        std::fs::remove_file(root.join("w/f3")).unwrap();
-        l.acked_unlink("w/f3");
-        std::fs::write(root.join("w/f3"), b"").unwrap();
-        assert_eq!(l.check(root).resurrected, vec!["w/f3".to_string()]);
-        std::fs::remove_file(root.join("w/f3")).unwrap();
-        // Only the name the op was on: another name back is resurrected.
-        l.failed_create("w/f4", id(7), &eio, deadline);
-        l.write(root, "w/f5", id(8), 1000).unwrap();
-        std::fs::remove_file(root.join("w/f5")).unwrap();
-        l.acked_unlink("w/f5");
-        std::fs::write(root.join("w/f5"), b"").unwrap();
-        assert_eq!(l.check(root).resurrected, vec!["w/f5".to_string()]);
-        std::fs::remove_file(root.join("w/f5")).unwrap();
-        // A rename in doubt may leave its source's content at its target
-        // once, after the target was acknowledged gone; nothing else.
+        // A rename in doubt leaves its source's content at its target
+        // after the target was acknowledged gone: resurrected too.
         l.write(root, "w/f6", id(9), 1000).unwrap();
-        l.failed_rename("w/f6", "w/g6", &eio, deadline);
+        l.failed_op(&["w/f6", "w/g6"]);
         l.acked_unlink("w/g6");
         std::fs::rename(root.join("w/f6"), root.join("w/g6")).unwrap();
         let rep = l.check(root);
-        assert!(rep.violations(0).is_empty(), "{rep:?}");
-        assert_eq!(rep.late_landed.len(), 1, "{rep:?}");
-        assert!(rep.late_landed[0].starts_with("w/g6"), "{rep:?}");
-        std::fs::write(root.join("w/g6"), payload(&id(10), 1000)).unwrap();
-        assert_eq!(l.check(root).resurrected, vec!["w/g6".to_string()]);
-        // A ledger without a deadline has no op in doubt.
-        let strict = Ledger::new();
-        strict.failed_create("w/h", id(11), &eio, deadline);
-        strict.acked_unlink("w/h");
-        std::fs::write(root.join("w/h"), b"").unwrap();
-        assert_eq!(strict.check(root).resurrected, vec!["w/h".to_string()]);
+        assert!(rep.resurrected.contains(&"w/g6".to_string()), "{rep:?}");
     }
 
     #[test]
@@ -2924,12 +2796,7 @@ mod tests {
         // A failed rename or unlink may still land, once, later: both
         // names stay uncertain for good, whatever was acknowledged since.
         l.write(root, "w/f4", id(4), 100).unwrap();
-        l.failed_rename(
-            "w/f4",
-            "w/g4",
-            &std::io::Error::from_raw_os_error(libc::EIO),
-            Duration::ZERO,
-        );
+        l.failed_op(&["w/f4", "w/g4"]);
         l.write(root, "w/f4", id(5), 100).unwrap();
         assert!(matches!(l.ownership("w/f4"), Ownership::Uncertain(_)));
         assert!(matches!(l.ownership("w/g4"), Ownership::Uncertain(_)));

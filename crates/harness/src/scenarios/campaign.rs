@@ -163,7 +163,7 @@ fn writer(
                     errnos.record_notfound(ledger, node, "rename", &rel, &e, t);
                 }
                 Err(e) => {
-                    ledger.failed_rename(&rel, &to, &e, t.elapsed());
+                    ledger.failed_op(&[&rel, &to]);
                     errnos.record(node, "rename", &e, t, OpCtx::default())
                 }
             }
@@ -296,7 +296,7 @@ fn load_probe_with(seed: u64, names: &[&str], takeover: bool) -> Result<()> {
     let extra_refs: Vec<(&str, &str)> = extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let (env, _root, mut clients, _) = cluster(NAME, names, &extra_refs, 0)?;
     let result = (|| -> Result<()> {
-        let ledger = Ledger::with_client_deadline(super::m9::client_deadline());
+        let ledger = Ledger::new();
         let errnos = ErrnoLog::new();
         let epoch0 = lease_of(&clients[0])?["epoch"].as_u64().unwrap_or(0);
         eprintln!(
@@ -491,14 +491,13 @@ fn load_probe_with(seed: u64, names: &[&str], takeover: bool) -> Result<()> {
         for (c, r) in clients.iter().zip(&reports) {
             eprintln!(
                 "    {NAME}: ledger on {}: {} ops, {} files, {} intact, {} in conflict copies, \
-                 {} undone unlinks, {} late landings of ops in doubt; counters {}",
+                 {} undone unlinks (late landings included); counters {}",
                 c.name,
                 r.acked_ops,
                 r.files,
                 r.intact,
                 r.in_conflict_copy.len(),
                 r.resurrected.len(),
-                r.late_landed.len(),
                 crate::verify::counters(c)
             );
         }
