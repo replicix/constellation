@@ -5256,7 +5256,7 @@ impl Meta {
             tracing::info!(
                 gen = %crate::delegation::GenLabel::of(gen),
                 cut,
-                "an abandon ended a delegation generation whose grant never reached the log"
+                "a takeover marker ended a delegation generation whose grant never reached the log"
             );
             self.session.void_stream(gen, cut);
             self.session.note_void_cut(gen, cut);
