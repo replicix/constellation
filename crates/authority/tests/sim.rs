@@ -5909,6 +5909,40 @@ fn sweep_config() {
                 core
             });
         }
+        // L3: `AUTHORITY_SIM_DROP_RECALLS=<n>` makes every node, as a root,
+        // lose the first send of every nth recall it starts
+        // (`Config::delegation_recall_drop_every`), and
+        // `AUTHORITY_SIM_DROP_RECALLEDS=<n>` makes every delegate lose the
+        // answer to the first recall of every nth generation
+        // (`Config::delegation_recalled_drop_every`): the losses the
+        // root's resend of a recall answers.
+        for (var, set) in [
+            (
+                "AUTHORITY_SIM_DROP_RECALLS",
+                (|core: &mut constellation_authority::core::Config, n| {
+                    core.delegation_recall_drop_every = n
+                }) as fn(&mut constellation_authority::core::Config, u64),
+            ),
+            (
+                "AUTHORITY_SIM_DROP_RECALLEDS",
+                |core: &mut constellation_authority::core::Config, n| {
+                    core.delegation_recalled_drop_every = n
+                },
+            ),
+        ] {
+            if let Some(n) = std::env::var(var)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|n| *n > 0)
+            {
+                let inner = c.core.clone();
+                c.core = std::sync::Arc::new(move |id, inc| {
+                    let mut core = inner(id, inc);
+                    set(&mut core, n);
+                    core
+                });
+            }
+        }
         // `AUTHORITY_SIM_READ_DELEGATIONS=0` turns the read delegations off
         // in every node of any configuration (the takeover floor's read part
         // is armed and persisted whatever that setting).
@@ -6084,6 +6118,7 @@ fn sweep_config() {
                     failures.lock().unwrap().push(seed);
                 }
                 Ok(report) => {
+                    eprintln!("SWEEP-L3 {label} seed {seed}: {}", recall_stall(&report));
                     let ord = std::sync::atomic::Ordering::Relaxed;
                     if report.lone_held_by_gate + report.lone_demoted_at_journal > 0 {
                         eprintln!(
@@ -9086,6 +9121,56 @@ fn no_delegation_without_a_delegate_record() {
                 assert_eq!(s.deleg_deps_waits, 0, "{label} node {id} waited for deps");
             }
         }
+    }
+}
+
+/// L3: how long the root's recalls took, summed over the nodes: sent, lost
+/// on purpose, sent again, outwaited, drained, ended (timed) with their
+/// total and longest ms and those past a second.
+fn recall_stall(report: &Report) -> String {
+    let sum = |f: fn(&constellation_authority::core::Stats) -> u64| {
+        report.stats.values().map(f).sum::<u64>()
+    };
+    let longest = report
+        .stats
+        .values()
+        .map(|s| s.deleg_recall_ms_max)
+        .max()
+        .unwrap_or(0);
+    format!(
+        "sent {} dropped {} answers_dropped {} resent {} expired {} drained {} timed {} \
+         sum_ms {} max_ms {longest} over1s {}",
+        sum(|s| s.deleg_recalls_sent),
+        sum(|s| s.deleg_recalls_dropped),
+        sum(|s| s.deleg_recalleds_dropped),
+        sum(|s| s.deleg_recalls_resent),
+        sum(|s| s.deleg_recalls_expired),
+        sum(|s| s.deleg_recalls_drained),
+        sum(|s| s.deleg_recalls_timed),
+        sum(|s| s.deleg_recall_ms_sum),
+        sum(|s| s.deleg_recall_over_1s),
+    )
+}
+
+/// L3 (plan 46 M0.3): a recall sent once and lost left the root waiting
+/// for the grant to run out (5 to 11 s) — `long-delegated-late-answers`
+/// seed 310 stalled one for 8.3 s. The root sends it again until the
+/// delegate answers, so no recall of the run takes 2 s.
+#[test]
+fn l3_a_lost_recall_is_sent_again_in_long_delegated_late_answers_seed_310() {
+    let report = run_seed(310, long_delegated_late_answers_config())
+        .unwrap_or_else(|e| panic!("long-delegated-late-answers seed 310: {e}"));
+    let stall = recall_stall(&report);
+    let sum = |f: fn(&constellation_authority::core::Stats) -> u64| {
+        report.stats.values().map(f).sum::<u64>()
+    };
+    assert!(sum(|s| s.deleg_recalls_resent) >= 1, "{stall}");
+    for (node, s) in &report.stats {
+        assert!(
+            s.deleg_recall_ms_max < 2_000,
+            "node {node}: a recall took {} ms: {stall}",
+            s.deleg_recall_ms_max
+        );
     }
 }
 
@@ -13291,7 +13376,10 @@ fn locks_writer_hold_delegated_without_the_settle_is_caught() {
     // (Plan 43 C2c: 767, 2369 and 2741 shifted to none; 556, 2027 and 2570 are
     // the three of seeds 0 to 3 000 that show it now, unclocked, the settle
     // clean on all 3 000.)
-    let seeds = [556, 2027, 2570];
+    // (Plan 46 L3: a recall sent again moved the schedule once more; 556,
+    // 2027 and 2570 show none, and 5798, 5813 and 6110 are the first three of
+    // seeds 0 to 33 000 that do, the settle clean on all of them.)
+    let seeds = [5798, 5813, 6110];
     let mut caught = 0;
     for seed in seeds {
         if let Err(e) = run_seed(seed, locks_writer_hold_delegated_unsettled_config()) {
