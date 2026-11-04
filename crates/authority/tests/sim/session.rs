@@ -2,9 +2,10 @@
 //! simulated run's history, with the log as the witness of the version
 //! order.
 //!
-//! The successes in log order (`Completed { rid }` positions) fix every
-//! name's version sequence: after `k` successes, name `x` is present or
-//! not. A session is one node incarnation (a restart is a new FUSE
+//! The successes in witness order (`Completed { rid }` positions; a
+//! tenure's run in journal order, `witness_order`, as the linearizability
+//! and session-order checks take it) fix every name's version
+//! sequence: after `k` successes, name `x` is present or not. A session is one node incarnation (a restart is a new FUSE
 //! session). Each observation the session makes constrains, per name,
 //! how far along that sequence a later read of the name must be:
 //! - its own write that returned `Ok` (not tentative) at log index `p`:
@@ -25,9 +26,23 @@
 //! - a read: at least the earliest state at or after its own floor that
 //!   shows what it returned (monotonic reads).
 //!
+//! A refusal's row is a journal row too and is placed in the same witness
+//! order (its journal seq inside its tenure's run), so a row shipped ahead
+//! of a held one it followed in the journal is still evaluated after it.
+//! Every upper bound an observation takes from a later success (`hi`: the
+//! refusal's window, the read's causal range) counts only successes on a
+//! name in the observed name's scope: another owner's success invoked
+//! later can be logged before rows the observation saw (a delegate's
+//! acknowledged rows the root appends late), and a cut there would drop
+//! the observation or its causal floors.
+//!
 //! The fallback window is lenient: a success of another scope that
 //! really precedes the refusal in the sequencer's order does not bind it,
-//! so a stale read can pass there (the row path has no such gap).
+//! and it places the refusal at the earliest state that refuses the same
+//! way, so a name that flipped back in between hides a stale read. This
+//! is the one open item: closing it needs the sim to record an inbox or
+//! local refusal's evaluation position (the requester replica's applied
+//! position) and place the refusal there (the row path has no such gap).
 //!
 //! A read invoked after an observation returned must be explained by a
 //! state at or after that floor; if no such state shows what it returned,

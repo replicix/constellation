@@ -65414,18 +65414,40 @@ newly rejects no seed and newly accepts none; the sweep matrix is the delegated 
 | `delegated-group-switch` | none | 1525 (I4 late landing) |
 | `long-delegated`, `placement-hot`, `long-delegated-backup`, `delegated-backup`, `delegated-holder-cut`, `shared-dir-ranges`, `delegated-two-gens-root-crash`, `delegated-no-backup-root-near` | none | none |
 
-### Open: two lenient leftovers
+### Closed: the two lenient leftovers (plan 46 M0.3); open: the flat-inbox window fallback
 
-- **Cross-owner `hi`.** The refusal's upper bound (`session.rs`) and the read's upper bound still bind by every success invoked after the
-  return, across owners. A cross-owner success at a log index below the true evaluation point makes `hi` too low, and the observation
-  is then dropped or a causal range cut. That is lenient (it adds no false violation, but can hide a real one). Scoping `hi` the same
-  way makes the checker stricter: its own commit and sweep, with every new failing seed triaged first.
-- **Raw log order.** `check_sessions` orders successes by raw log position, where the linearizability and session-order checks use
-  `witness_order` (a tenure's run in journal order). In 4125 the two agree. Aligning them is a separate consistency item.
+Both leftovers are closed in `check_sessions`; each was a real miss, not only a theoretical one.
 
-The window fallback is lenient too (a success of another scope that precedes the refusal in one sequencer's order does not bind it). The
-delegated configurations never reach it; the flat inbox ones do, for refusals whose row is not their evaluation point, so an M1-shaped
-stale read after such a refusal is not caught there.
+- **Cross-owner `hi`.** `hi` (the refusal's upper bound and the read's causal range) bound by every success invoked after the return, across
+  owners. Under delegation a root op invoked after a read returned can be logged before a delegate's acknowledged rows the read saw (the
+  root appends delegate batches late), so `hi` fell below the state seen: a read of `d2/b` present (state 3), a later `create d1/z` logged
+  first (`hi` 0), and a later read of `d2/a` absent was explained by state 0 (no causal floor). The replica that showed `d2/b` holds
+  `d2/a` (DESIGN section 6, B-1), so this was a miss. The window shape is the same with a `EEXIST` refusal with no usable row: dropped by
+  `k > hi`. Now `hi_after(name, t)` counts only successes on a name of the observed name's scope (`Scope::shares`); `Global` is unchanged.
+  Residual, not closed: a stranded acknowledged row replayed by rid after a takeover can still land after a same-scope success invoked
+  later (still lenient: a drop, or a misattribution as before in fewer cases).
+- **Raw log order.** Successes were ordered by raw log position; the linearizability and session-order checks use `witness_order`. Inside one
+  tenure's run M4/M7 ships transactions out of journal order around a held one, so a later row that shipped first put `hi` below the state
+  a read saw (flat shape: `create d1/a`, a held `link d0/s d2/x`, a read of `d2/x` present, `create d3/y` shipped ahead, then a read of
+  `d1/a` absent was accepted; write-back lets a later op show first, never lets a reader that saw the held op lose the earlier create).
+  Now the successes are in `witness_order`, and each `Refused` row is placed by its journal row within its tenure's run
+  (`refused_journal_order` in `run.rs`, kept apart from `journal_order` so a refused rid never shadows a completed one).
+- **Main false positives removed.** Sweeps (box 1, release, seeds 0..2,000, main c5228764 against the fix) found no new failure and five
+  fewer: all are `monotonic_reads` bound by a refusal whose `Refused` row was held and shipped late, placed by its raw position after
+  rows it preceded in the journal (it "agrees by accident"). `drop-held-chain-backed` 1943 (no knob), 108, 275 and 603 (knob), and
+  `flex-crash` 1322. In 1943 node 3's `Rename(f1, f3)` refused `ENOENT` is journal row 24, shipped after `Create f1` (row 27) and
+  `Unlink f1` (row 37); by raw position the row follows both and places at a state with `f1` absent, so node 3's read of `f1` present
+  looked stale. These flat held-row configurations were not swept on main.
+  A sixth difference, `metered-shared` 1417 (knob; a `monotonic_reads` on main that the new checker accepts, no knob-free difference),
+  involves a read placed by raw order rather than a refusal row; it was not triaged beyond the same flat raw-order family.
+- **Unit tests** (`session.rs`; each fails on the previous checker): `a_read_is_not_cut_by_another_directorys_later_success`,
+  `an_unjournaled_refusal_is_not_dropped_by_another_directorys_later_success`, `a_held_row_is_ordered_as_its_tenure_journaled_it`,
+  `a_refusal_row_is_ordered_as_its_tenure_journaled_it`.
+- **Open: the flat-inbox window fallback.** An inbox or local refusal is evaluated against the requester's replica and journaled later; its
+  row disagrees, and the window places it at the earliest state after the real-time `lo` that refuses the same way. If the name flipped
+  back in between (absent at 0, present at 1, absent at 2, evaluated at 2), a later read of `present` (state 1) is accepted. Closing it
+  needs the sim to record, for each inbox/local refusal, the requester replica's applied position at evaluation and place the refusal
+  there. `Global` M1-shaped cases are caught by the window's real-time `lo`.
 
 ### Gates
 
