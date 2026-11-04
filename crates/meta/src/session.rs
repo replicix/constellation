@@ -1213,7 +1213,8 @@ impl SessionState {
     /// and every one the store keeps a log index or a void cut of;
     /// numbers are sparse, ADR-43: `epoch << 32 | n`, so there is no
     /// range to walk) is held through the log's index of it, and one the
-    /// table no longer lists is voided at that cut. A generation the
+    /// table no longer lists is voided at that cut, if the table has
+    /// reached it (`gen <= max_gen`, the table's highest). A generation the
     /// table named and ended before this replica applied any row or end
     /// of it has no key and is not seeded: a check of a dependency that
     /// names it voids it lazily ([`Self::ended_before_open`], with
@@ -1226,6 +1227,7 @@ impl SessionState {
     /// of an older log ended — what the log holds of it (`log_idx`).
     pub fn seed_generations(
         &self,
+        max_gen: u64,
         gens: &std::collections::BTreeSet<u64>,
         live: &std::collections::BTreeSet<u64>,
         log_idx: &dyn Fn(u64) -> u64,
@@ -1238,7 +1240,13 @@ impl SessionState {
             if idx > *cur {
                 *cur = idx;
             }
-            if !live.contains(&gen) {
+            // Only a number the table has reached can have ended: a key
+            // above its highest (a deposed root's stranded appends leave
+            // `deleg_log_idx` behind, `retract_log_idx_tx`, while the strand
+            // rolls the table back below it) names a grant the log may yet
+            // carry, whose rows must not meet a void
+            // (`ended_before_open`'s rule).
+            if gen <= max_gen && !live.contains(&gen) {
                 let cut = void_cut(gen).unwrap_or(idx);
                 g.voided.insert(gen);
                 g.observed.streams.lower(gen, cut);
@@ -2504,7 +2512,7 @@ mod tests {
             2 => 370,
             _ => 0,
         };
-        s.seed_generations(&[1, 2].into(), &live, &log_idx, &|_| None);
+        s.seed_generations(2, &[1, 2].into(), &live, &log_idx, &|_| None);
         assert!(s.reaches(&floor(1, 816)), "the ended generation is void");
         assert!(s.reaches(&floor(1, 900)), "void past its cut too");
         assert!(
@@ -2541,7 +2549,7 @@ mod tests {
             _ => 0,
         };
         let s = SessionState::default();
-        s.seed_generations(&[old, new].into(), &live, &log_idx, &|g| {
+        s.seed_generations(new, &[old, new].into(), &live, &log_idx, &|g| {
             (g == old).then_some(6)
         });
         // The ended one is void at the record's cut (6), not at the log's (7).
@@ -2556,6 +2564,39 @@ mod tests {
         // A number nobody keeps is not touched.
         assert!(!s.is_voided(old - 1));
         assert!(!s.reaches(&floor(old - 1, 1)));
+    }
+
+    /// ADR-43 (review S-3): a key above the table's highest generation (a
+    /// deposed root's stranded appends leave `deleg_log_idx` behind while
+    /// the strand rolls the table back below it) is held, not voided: the
+    /// table has not reached the number, so it has not ended, and the log
+    /// may yet carry its grant and rows.
+    #[test]
+    fn a_key_above_the_tables_highest_generation_is_held_not_voided() {
+        let floor = |g: u64, i: u64| {
+            let mut streams = Streams::NONE;
+            assert!(streams.raise(g, i));
+            Position {
+                seq: 0,
+                pending: None,
+                streams,
+            }
+        };
+        let (ended, stranded) = ((5u64 << 32) | 3, (7u64 << 32) | 1);
+        let log_idx = |g: u64| if g == stranded { 4 } else { 0 };
+        let s = SessionState::default();
+        s.seed_generations(
+            ended,
+            &[ended, stranded].into(),
+            &Default::default(),
+            &log_idx,
+            &|_| None,
+        );
+        assert!(s.is_voided(ended));
+        assert!(!s.is_voided(stranded), "above the table's highest");
+        assert!(s.reaches(&floor(stranded, 4)), "held through its key");
+        assert!(!s.reaches(&floor(stranded, 5)), "and no further");
+        assert!(!s.deps_lost(&floor(stranded, 5)));
     }
 
     /// ADR-43 (review M2): only a generation that ended before this
@@ -2595,13 +2636,15 @@ mod tests {
         // (rows past the cut that were applied before the record's own
         // segment) — the record's cut wins.
         let s = SessionState::default();
-        s.seed_generations(&[1].into(), &live, &log_idx, &|g| (g == 1).then_some(800));
+        s.seed_generations(1, &[1].into(), &live, &log_idx, &|g| {
+            (g == 1).then_some(800)
+        });
         assert_eq!(s.void_cut(1), Some(800));
         assert!(!s.deps_lost(&floor(1, 800)));
         assert!(s.deps_lost(&floor(1, 801)));
         // No record cut (an older log's `Recall`): the log's index, as before.
         let s = SessionState::default();
-        s.seed_generations(&[1].into(), &live, &log_idx, &|_| None);
+        s.seed_generations(1, &[1].into(), &live, &log_idx, &|_| None);
         assert_eq!(s.void_cut(1), Some(816));
         assert!(s.deps_lost(&floor(1, 817)));
         assert_eq!(s.void_cut(2), None, "not voided here");

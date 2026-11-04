@@ -1021,9 +1021,14 @@ fn apply_one(
             // row, and the root executed its next write ahead of it). A
             // number now carries its minting epoch (`epoch << 32 | n`), so
             // two tenures never mint the same one and a grant never meets
-            // another grant's void: the lift stays as a guard that costs
-            // nothing (lifting a void satisfies no wait; it can only make
-            // one). The test
+            // another grant's void. The restart's seeding does not void a
+            // key above the table's highest either (`seed_generations`:
+            // a deposed root's stranded appends leave one), so the void
+            // this lifts is only the in-incarnation one a journaled end
+            // left (the strand's staged unvoid covers an end it reverts;
+            // this lift is the guard for a grant that reaches the log
+            // first). Lifting a void satisfies no wait; it can only make
+            // one. The test
             // `a_reused_generation_number_drops_the_void_a_deposed_roots_unshipped_end_left`
             // keeps the guard honest.
             if meta.session().is_voided(*gen) {

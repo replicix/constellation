@@ -217,3 +217,62 @@ fn a_lost_dependency_on_a_keyless_ended_generation_is_lost_at_the_first_check() 
     assert!(meta.deps_lost_deps(&deps));
     assert!(meta.session().is_voided(g5));
 }
+
+/// ADR-43 (review S-3): a deposed root's stranded appends leave
+/// `deleg_log_idx:g` behind (`retract_log_idx_tx` keeps the key) while the
+/// strand rolls the table back below `g`. The restart holds `g` through that
+/// key and does not void it: the table has not reached it, so it has not
+/// ended, and a successor may re-ship the grant. A key at or below the
+/// table's highest that the table does not list is still voided.
+#[test]
+fn a_restart_does_not_void_a_generation_above_the_tables_highest() {
+    let (ended, stranded) = (gen(5, 3), gen(7, 1));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.db");
+    {
+        let meta = Meta::open(&path).unwrap();
+        meta.apply_segment(
+            1,
+            1,
+            &[
+                LogRecord::Delegate {
+                    dir: ROOT_INO,
+                    node: 4,
+                    gen: ended,
+                    designated: false,
+                    range: (0, 0),
+                },
+                LogRecord::RecallCut {
+                    dir: ROOT_INO,
+                    gen: ended,
+                    through: 3,
+                },
+            ],
+            &TouchSet::default(),
+        )
+        .unwrap();
+        meta.kv_set(&format!("deleg_log_idx:{stranded}"), "4")
+            .unwrap();
+        assert_eq!(meta.delegation_table().max_gen(), ended);
+        meta.close().unwrap();
+    }
+    let meta = Meta::open(&path).unwrap();
+    assert!(meta.session().is_voided(ended));
+    assert!(
+        !meta.session().is_voided(stranded),
+        "above the table's highest"
+    );
+    let at = |g: u64, i: u64| {
+        let mut streams = Streams::NONE;
+        assert!(streams.raise(g, i));
+        Position {
+            seq: 0,
+            pending: None,
+            streams,
+        }
+    };
+    assert!(meta.reaches_streams_deps(&at(stranded, 4)), "held");
+    assert!(!meta.reaches_streams_deps(&at(stranded, 5)));
+    assert!(!meta.session().is_voided(stranded));
+    assert!(!meta.deps_lost_deps(&at(stranded, 5)));
+}

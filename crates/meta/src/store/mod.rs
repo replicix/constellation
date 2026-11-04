@@ -1277,6 +1277,7 @@ impl Meta {
         let mut gens = meta.persisted_generations()?;
         gens.extend(live.iter().copied());
         meta.session.seed_generations(
+            table.max_gen(),
             &gens,
             &live,
             &|gen| meta.log_stream_idx(gen).unwrap_or(0),
