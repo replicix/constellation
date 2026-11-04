@@ -65544,8 +65544,51 @@ grant leaves; a number outside the block, from any source, is refused. No backwa
     p50 / p90 in every row; the only differences are the same few units in the "acks by class" counters of `placement-hot` (both knobs;
     for example no knob: deleg-group 98,988 / 98,969, root-group 1,489,269 / 1,489,291) and `long-delegated-backup` (no knob: archive
     46,922 / 46,925, one cause count), the sim's own noise as before.
-  - **Open item**: the restart path has the same exposure to a streamed-ahead end, on main and on the branch: the open seeds from the table
-    the store holds, which may carry a streamed-ahead `RecallCut` (table row, no void) whose entry then strands. Not changed here.
+  - **Open item** (closed in round 4 below): the restart path has the same exposure to a streamed-ahead end, on main and on the branch: the
+    open seeds from the table the store holds, which may carry a streamed-ahead `RecallCut` (table row, no void) whose entry then strands.
+- **Round 4** (`fix(meta)`): a streamed-ahead end is not voided by the open or by a read. Same class as round 3's open item, in two paths.
+  - **Mechanism.** A subscriber or requester installs a committed entry ahead of the log (`install_streamed_committed`,
+    `install_shadow_committed`); its records apply with `durable = false`, so a `RecallCut` writes the table row (`h` no longer listed) but
+    neither the void nor `deleg_void_cut:h`. The `spec` row and the `ns` effect commit in one transaction, so both survive a restart and
+    nothing at the open strands outstanding speculation. (1) The open seeds from the table the store holds: `h` is unlisted and at or below
+    `max_gen`, so `seed_generations` voids it at its log index (or `ended_before_open` voids it lazily at cut 0). (2) The read path
+    (`session_wait_at` -> `void_ended_among`) voids every unreached generation the current table does not list, with no `ended_before_open`
+    restriction, so a read whose watermark names `h` above what the replica holds voids it at `stream_applied(h)`, within one incarnation.
+    If the entry then strands (a segment of a later epoch, or an operator's abandon) the rewind lists `h` again and nothing lifts the void
+    (only a `Local` strand stages an unvoid): `h` is live and voided, `reaches_streams` passes a dependency on rows of `h` the replica does
+    not hold, and an op executes ahead of its cause (the seed-6239 class).
+  - **Fix.** `Meta::speculatively_ended_generations[_at]` lists the generations a live `Shadow` or `Streamed` entry ends with a `Recall` or
+    `RecallCut` and of which this replica holds no `deleg_void_cut` key (`Local` rows are not counted: this root's own journaled end voids
+    at once and its strand stages the unvoid). The seeding treats them as live (`seed_session_generations` takes the set; held through the
+    log index, not voided, not `ended_before_open`) and `void_ended_among` skips them; the durable `RecallCut` voids at the record's cut, and
+    a strand relists with no void to lift. The open and `void_ended_among` read the table and the set in one snapshot; the in-process
+    rebuild takes the side replica's table and the set from this store after its commit. Cost: one scan of the outstanding speculation at
+    the open (normally empty), and on a read only when unreached generations exist.
+  - **Tests** (`generation_epochs.rs`; each fails on 11fd5f34 and passes with the fix):
+    `a_restart_does_not_void_an_end_only_a_streamed_entry_carries` (gated entry; voided at the open),
+    `a_restart_then_a_strand_leaves_the_generation_live_and_unvoided` (the strand relists `h`, which stays voided),
+    `a_read_does_not_void_an_end_only_a_streamed_entry_carries` (the read path, in memory).
+  - **Gates** (final tree, release, 0 failed): `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean;
+    meta all targets 584 passed, 20 ignored; authority lib 1,006; engine lib 948; sim suite 366 passed, 0 failed, 12 ignored. Sweeps main
+    11fd5f34 against the fix, with and without `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, 0..2,000 in `placement-hot`,
+    `long-delegated-late-answers`, `long-delegated-backup`, `delegated-holder-cut` and `delegated-no-backup-root-near`: no failing seed on
+    either tree in any row, the same `SWEEP-UNSETTLED` seed sets and the same I1, I2, I2c, I4 and I5 counts and failover p50 / p90; the
+    differences are the sim's own noise (a few units in the "acks by class" and class-mismatch counters, the stored-byte count of a few seeds,
+    and the segment count / dependency waits of 0 to 7 seeds per row). The sim never reopens a `Meta`, so the restart half is guarded by the
+    meta tests alone; the read half is reachable in the sim, which shows no witness of a seed that waits where it voided before.
+  - **Open items** (residuals, not changed here):
+    1. The read path's strand race: a strand that lands between `void_ended_among`'s snapshot and `session.void_stream` still leaves a stale
+       void (microseconds; the same race existed against the table). Closing it needs an unvoid staged in the `Shadow` and `Streamed` strand
+       arms (mirroring `strand_local_tx`), guarded by "no `deleg_void_cut` key at the commit", because a staged unvoid applies after the
+       commit, after a later durable redo in the same rewind may have re-voided the generation; the same ordering question applies to the
+       existing `Local` unvoid.
+    2. The `persist_void_cut` crash window: a streamed `RecallCut` confirmed by a segment is skipped by `apply_segment_rows`, and its
+       `deleg_void_cut` key is written afterwards in a separate transaction (`Replica::apply_segment`'s `persist_void_cut`). A crash in
+       between restarts with the end durable, no key and no outstanding entry: the open voids at the log index, not the record's cut, so
+       dependencies between the two are refused as lost (over-refusal, not reordering). The fix is to write the cut for every `RecallCut` of
+       the segment inside `apply_segment_rows`' transaction.
+    3. A stored table's `max_gen` also counts a streamed-ahead `Delegate`, so the S-3 bound can sit above the log's; a keyed number below
+       such a grant of a later tenure is an orphan of an earlier one, and voiding it matches the orphan rule (ADR-43 text).
 - **What the sweeps do not cover (S-2).** The sim's nodes open one in-memory `Meta` and a simulated restart keeps it (`session().reset()`
   keeps the open-table snapshot, the empty one of the creation): at a restart `ended_before_open` is false and the seeding runs on an empty
   store, so the sim never exercises the restart's restricted lazy void, and "the sweeps match main" (the rows below) does not validate it.

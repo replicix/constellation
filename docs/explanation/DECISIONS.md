@@ -2829,7 +2829,22 @@ block.
   read, on that path only). Only a generation that ended before the open qualifies
   (`SessionState::ended_before_open`): the end of one this incarnation saw may be
   a streamed-ahead install the successor strands, and only the durable log voids
-  those. (The first version voided any unlisted generation below `max_gen`; the
+  those. The same rule holds for an end that only outstanding speculation carries,
+  at the open and on the read path: a `Recall`/`RecallCut` among the records of a
+  live `Shadow` or `Streamed` entry, for a generation with no `deleg_void_cut` key
+  (`Meta::speculatively_ended_generations`), is not an end yet. Such an install
+  wrote the table row without the void, and both the open's seeding (from the
+  table the store holds) and a read's `void_ended_among` (from the current table)
+  would otherwise void it, and the entry's strand relists the generation with
+  nothing to lift the void (only a `Local` strand stages an unvoid): a dependency
+  on rows of it the replica does not hold would pass `reaches_streams`, an op
+  executing ahead of its cause (the seed-6239 class). The seeding treats such a
+  generation as live, held through its log index, and `void_ended_among` skips it
+  (the table and the set read in one snapshot); the durable `RecallCut` voids it at
+  the record's cut. A stored table's `max_gen` also counts a streamed-ahead
+  `Delegate`, so the bound `gen <= max_gen` can sit above the log's: a keyed number
+  below such a grant of a later tenure is an orphan of an earlier one, and voiding
+  it matches the orphan rule. (The first version voided any unlisted generation below `max_gen`; the
   sweep moved four seeds of `long-delegated-late-answers` 0..100 and the
   unsettled ceiling test failed.)
 - The in-process rebuild (`replace_ns_from_rebuilt`: the driver's and the sim's
@@ -2858,7 +2873,8 @@ block.
   below the successor's block and never listed. It is voided for good once the
   table passes it: on the root's forward path only after a restart or an
   in-process rebuild (the seeding, or the lazy void, meets it then); within an
-  incarnation, only a read voids it (`void_ended_generations`). The one liveness item left, tracked separately and not part of
+  incarnation, only a read voids it (`void_ended_generations`), and not an end only
+  outstanding speculation carries. The one liveness item left, tracked separately and not part of
   this change: rows of a grant the log never carried (never witnessed: a delegate
   never executed one) would still make `deleg_gens_awaiting_end` block that node's
   installs, for the log never ends them; the fix is to strand a delegate's own rows
@@ -2899,6 +2915,14 @@ protected only by `at_least` from the log: the same class as a lost journal.
   segments grow by 2.0% stored (2.5% decompressed) in `placement-hot+commit` and by
   7 to 12% stored in the delegated configurations (PROGRESS "ADR-43").
 - One `fsync` per grant (grants are rare: placement windows are 30 s).
+- A generation whose end only outstanding `Shadow`/`Streamed` speculation carries is held live by the open
+  and by the read path until the durable `RecallCut` arrives or the entry strands: a watermark or dependency on
+  it waits for the log, where it was refused or passed early. Cost: one scan of the outstanding speculation at the
+  open, and on a read only when unreached generations exist. Open: a strand that lands between the read's
+  snapshot and its `void_stream` still leaves a stale void (microseconds; closing it needs an unvoid staged in the
+  `Shadow` and `Streamed` strand arms, guarded by "no `deleg_void_cut` key at the commit"), and a crash between
+  the skipped streamed `RecallCut`'s apply and `persist_void_cut` restarts with the end durable and no key, so the
+  open voids at the log index, not the record's cut (over-refusal of dependencies between the two, no reordering).
 - A latent bug on the base the branch moves from (f188c707): the rolled-back
   hole pass (`hole_tail_rolled_back_tx`) scanned the backup tail's keyspace up to
   `MEMBER_COPY_BASE`, which took in a delegate's rows at `1 << 48` to `2 << 48`,
