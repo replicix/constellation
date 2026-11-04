@@ -6659,7 +6659,18 @@ impl Core {
         replica: &dyn Replica,
     ) -> constellation_meta::locks::LockHandback {
         let dir = self.dl.mine.get(&gen).map(|d| d.dir);
-        let grants = self.lock_take_generation(gen, replica);
+        // What a first recall took out of the table a repeated one hands back
+        // again (L3: the root sends a recall again when its answer is lost;
+        // it would otherwise end the generation by drain with no grants,
+        // and could grant a conflicting lock).
+        let mut grants = self.lock_take_generation(gen, replica);
+        let handed = self.dl.recall_grants.entry(gen).or_default();
+        for g in grants.drain(..) {
+            if !handed.iter().any(|h| h.id == g.id) {
+                handed.push(g);
+            }
+        }
+        let grants = handed.clone();
         // What is left of each record is a duration on this node's wait
         // clock (plan 43 C7-H1): the wire carries no absolute.
         let carry: Vec<(GrantId, u64)> = grants

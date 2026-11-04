@@ -30303,6 +30303,47 @@ mod locks {
         assert_eq!(r.core.stats.lock_returned_duplicates, 2);
     }
 
+    /// L3 (b): a recall sent again (its answer was lost) is answered with
+    /// the same lock hand-back: the grants the first answer took out of the
+    /// table come back with it, with what is left of them at the second
+    /// answer. Fails before: the second hand-back is empty, and the root,
+    /// which ended the generation by that answer, could grant a lock that
+    /// conflicts with a grant that moved.
+    #[test]
+    fn l3_a_repeated_recall_hands_back_the_same_lock_grants() {
+        let (mut d, dir, f, _) = carry_delegate(5_000);
+        delegation_left(&mut d, 60_000);
+        let g = unused_grant(&mut d, f);
+        d.advance(1_000);
+        let first = recall_answer(&mut d, dir, OpId(5));
+        assert_eq!(first.grants.len(), 1, "{first:?}");
+        assert_eq!(d.meta.locks().grants_len(), 0, "left the delegate's table");
+        d.advance(1_500);
+        let second = recall_answer(&mut d, dir, OpId(6));
+        let ids = |b: &constellation_meta::locks::LockHandback| {
+            b.grants.iter().map(|w| w.id).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&second), ids(&first), "{second:?}");
+        assert_eq!(second.carry.len(), 1);
+        assert_eq!(second.carry[0].0, g);
+        assert_eq!(
+            second.carry[0].1 + 1_500,
+            first.carry[0].1,
+            "measured again"
+        );
+        // The root installs the grant once: the repeated answer to the
+        // recall's other try moves nothing.
+        let (mut r, _, _, recall) = recalling_root(5_000);
+        r.now = d.now;
+        recalled(&mut r, recall, second.clone());
+        assert_eq!(r.core.stats.lock_moved, 1);
+        recalled(&mut r, recall, first);
+        assert_eq!(r.core.stats.lock_moved, 1);
+        assert_eq!(r.meta.locks().grants_len(), 1);
+        // The cache goes with the `handed_back` entry.
+        assert!(d.core.dl.recall_grants.contains_key(&7));
+    }
+
     /// Core test 4: a grant its holder renewed is carried too (it may be
     /// gone since, or have released at the old owner after the move): the
     /// receiver records what was left of it, not a restamp.
@@ -31882,6 +31923,158 @@ mod s3_no_loops {
         let out = forward(&mut h, 3, 8, dir, true);
         assert_eq!(reply_to(&out, 3, 8), None, "{out:?}");
         assert_eq!(recalls_sent(&out, 3), 0, "a second recall: {out:?}");
+    }
+
+    fn timer_of(out: &[Action], kind: TimerKind) -> TimerId {
+        let t = timers(out, kind);
+        assert_eq!(t.len(), 1, "expected one {kind:?} timer: {out:?}");
+        t[0]
+    }
+
+    /// The root's recall of `gen` as sent: the request id.
+    fn recall_req_of(out: &[Action], to: NodeId) -> Option<OpId> {
+        sends(out).into_iter().find_map(|(n, m)| match m {
+            PeerMsg::DelegRecall { req, .. } if n == to => Some(*req),
+            _ => None,
+        })
+    }
+
+    /// Start the recall of `gen` (its send lost on the way) and take its
+    /// resend timer.
+    fn lost_recall(h: &mut Harness, gen: u64) -> (OpId, TimerId) {
+        h.core.dl.gens.get_mut(&gen).unwrap().delegate_heard = Some(w(h.now));
+        let mut lost = Vec::new();
+        h.core.start_recall(h.clk(), gen, &mut lost);
+        assert_eq!(recalls_sent(&lost, 3), 1);
+        let req = recall_req_of(&lost, 3).unwrap();
+        (req, timer_of(&lost, TimerKind::DelegRecallResend))
+    }
+
+    /// L3: a recall whose `DelegRecall` was lost is sent again once its
+    /// back-off runs out, long before the grant's expiry would outwait it.
+    /// Fails on the parent: no second `DelegRecall`, the root waits for
+    /// `DelegExpiry`.
+    #[test]
+    fn l3_a_lost_recall_is_sent_again_before_the_grant_runs_out() {
+        let (mut h, _dir, gen) = delegated_root();
+        let (first, timer) = lost_recall(&mut h, gen);
+        let back_off = h.core.deleg_request_timeout_ms();
+        assert!(back_off < h.core.cfg.delegation_ttl_ms / 2);
+        h.advance(back_off + 1);
+        let out = h.step(Event::Timer { id: timer });
+        assert_eq!(recalls_sent(&out, 3), 1, "not re-sent: {out:?}");
+        assert_ne!(recall_req_of(&out, 3), Some(first), "the same request id");
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::Sent);
+        assert_eq!(h.core.stats.deleg_recalls_resent, 1);
+    }
+
+    /// L3: each try waits twice as long as the one before, up to 2 s, and
+    /// none follows an answer.
+    #[test]
+    fn l3_the_resend_backs_off_to_a_cap_and_stops_at_the_answer() {
+        let (mut h, _dir, gen) = delegated_root();
+        let (first, mut timer) = lost_recall(&mut h, gen);
+        let floor = h.core.deleg_request_timeout_ms();
+        let mut want = floor;
+        let mut sent = Vec::new();
+        for _ in 0..4 {
+            h.advance(want + 1);
+            let out = h.step(Event::Timer { id: timer });
+            assert_eq!(recalls_sent(&out, 3), 1, "{out:?}");
+            sent.push(recall_req_of(&out, 3).unwrap());
+            want = (want * 2).min(2_000).max(floor);
+            assert_eq!(h.core.dl.gens[&gen].recall_backoff_ms, want);
+            timer = timer_of(&out, TimerKind::DelegRecallResend);
+            assert!(
+                out.iter().any(|a| matches!(
+                    a,
+                    Action::SetTimer { id, after_ms, .. } if *id == timer && *after_ms == want
+                )),
+                "the next try is not armed after {want} ms: {out:?}"
+            );
+        }
+        assert!(want <= 2_000.max(floor));
+        // The answer of the newest try drains it; the timer is cancelled
+        // and the other tries are forgotten.
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRecalled {
+                req: *sent.last().unwrap(),
+                gen,
+                through: 0,
+                locks: Default::default(),
+            },
+        });
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::CancelTimer { id } if *id == timer)),
+            "{out:?}"
+        );
+        assert!(h.core.dl.gens[&gen].ended);
+        assert!(
+            h.core
+                .dl
+                .by_req
+                .values()
+                .all(|(g, k)| !(*g == gen && *k == crate::core::delegate::ReqKind::Recall)),
+            "a try is still registered"
+        );
+        h.advance(5_000);
+        let out = h.step(Event::Timer { id: timer });
+        assert_eq!(recalls_sent(&out, 3), 0, "sent after the end: {out:?}");
+        let _ = first;
+    }
+
+    /// L3 (ADR-42): a gated root sends nothing; the timer is armed again
+    /// and the recall goes out once the gate has opened.
+    #[test]
+    fn l3_no_resend_inside_a_gate_and_one_after_it_opens() {
+        let (mut h, _dir, gen) = delegated_root();
+        let (_, timer) = lost_recall(&mut h, gen);
+        h.core.lease.gate = Some(crate::core::lease::PendingGate {
+            epoch: 1,
+            takeover: true,
+            marker_shipped: false,
+            drained: false,
+            fast_prev: false,
+            backup_tail_epoch: None,
+            shippable: false,
+        });
+        h.advance(h.core.deleg_request_timeout_ms() + 1);
+        let out = h.step(Event::Timer { id: timer });
+        assert_eq!(recalls_sent(&out, 3), 0, "sent inside a gate: {out:?}");
+        let timer = timer_of(&out, TimerKind::DelegRecallResend);
+        assert_eq!(h.core.stats.deleg_recalls_resent, 0);
+        h.core.lease.gate = None;
+        h.advance(h.core.deleg_request_timeout_ms() + 1);
+        let out = h.step(Event::Timer { id: timer });
+        assert_eq!(recalls_sent(&out, 3), 1, "not sent after the gate: {out:?}");
+    }
+
+    /// L3: the answer to the first try still drains the recall after a
+    /// resend (the answer to the second try was lost, or the first was only
+    /// slow).
+    #[test]
+    fn l3_an_answer_to_the_first_try_drains_the_recall_after_a_resend() {
+        let (mut h, _dir, gen) = delegated_root();
+        let (first, timer) = lost_recall(&mut h, gen);
+        h.advance(h.core.deleg_request_timeout_ms() + 1);
+        let out = h.step(Event::Timer { id: timer });
+        assert_eq!(recalls_sent(&out, 3), 1);
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRecalled {
+                req: first,
+                gen,
+                through: 0,
+                locks: Default::default(),
+            },
+        });
+        assert!(
+            h.core.dl.gens[&gen].ended,
+            "not ended by the first try's answer"
+        );
+        assert_eq!(h.core.stats.deleg_recalls_drained, 1);
     }
 
     /// A *settle* of an op on a generation the root recalls already is not

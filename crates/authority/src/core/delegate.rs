@@ -179,6 +179,15 @@ pub(crate) struct GenState {
     pub ended: bool,
     pub expiry: Option<TimerId>,
     pub recall_req: Option<OpId>,
+    /// Every attempt of the recall still registered in `dl.by_req` (an answer
+    /// to any of them counts; `recall_req` is the newest).
+    pub recall_tries: Vec<OpId>,
+    /// When the recall started (the stall `deleg_recall_ms_*` measures).
+    pub recall_started: Option<WaitMs>,
+    /// The timer that sends the recall again while it is unanswered
+    /// (`Core::on_deleg_recall_resend`), and its current back-off.
+    pub recall_resend: Option<TimerId>,
+    pub recall_backoff_ms: u64,
     /// `Undelegate` controls answered when the generation ends.
     pub controls: Vec<OpId>,
     /// The read delegations (M8) this root granted on the subtree before
@@ -719,6 +728,11 @@ pub(crate) struct DelegationState {
     /// never seen (the recall overtook the record naming this node) —
     /// after [`HANDED_BACK_UNSEEN_MS`].
     pub handed_back: BTreeMap<u64, (NodeId, WaitMs, bool)>,
+    /// The lock grants a recall's answer handed back, by generation: a
+    /// repeated recall (the root sends it again when the answer is lost)
+    /// answers with them again, the table having given them up. Kept as long
+    /// as the `handed_back` entry.
+    pub recall_grants: BTreeMap<u64, Vec<constellation_meta::locks::Grant>>,
     /// A lease release waiting for the generations whose recall was in
     /// flight when it was issued (`Core::release_recall_waits`).
     pub(crate) release_wait: Option<ReleaseWait>,
@@ -1138,6 +1152,10 @@ impl Core {
             }
             !*seen && now.wait.since(*at) < HANDED_BACK_UNSEEN_MS
         });
+        let kept = &self.dl.handed_back;
+        self.dl
+            .recall_grants
+            .retain(|gen, _| kept.contains_key(gen));
         // Path B: the table here can be ahead of the log (the root's stream
         // installs its records speculatively), and say that a generation of
         // this node ended and a new one began before the segment that ends
@@ -1385,6 +1403,10 @@ impl Core {
                         ended: false,
                         expiry: None,
                         recall_req: None,
+                        recall_tries: Vec::new(),
+                        recall_started: None,
+                        recall_resend: None,
+                        recall_backoff_ms: 0,
                         controls: Vec::new(),
                         read_recalls: BTreeSet::new(),
                         renew_waiting: None,
@@ -4940,9 +4962,13 @@ impl Core {
                 }
             }
             ReqKind::Recall => {
-                // Outwaited by the expiry timer.
+                // One attempt failed: the resend timer sends the next one,
+                // and the expiry outwaits them all.
                 if let Some(g) = self.dl.gens.get_mut(&gen) {
-                    g.recall_req = None;
+                    g.recall_tries.retain(|r| *r != req);
+                    if g.recall_req == Some(req) {
+                        g.recall_req = None;
+                    }
                 }
             }
             ReqKind::BackupAppend => {
@@ -6424,6 +6450,19 @@ impl Core {
             .delegation_table()
             .iter()
             .any(|d| d.gen == gen && d.node == self.me());
+        // Simulation (L3): the answer to the first recall of every Nth
+        // generation is lost on the way; the root's repeated recall is
+        // answered again from what this one handed back.
+        let first = !self.dl.handed_back.contains_key(&gen);
+        let mut lose_answer = false;
+        if first {
+            self.stats.deleg_recalls_first += 1;
+            let every = self.cfg.delegation_recalled_drop_every;
+            lose_answer = every > 0 && self.stats.deleg_recalls_first.is_multiple_of(every);
+            if lose_answer {
+                self.stats.deleg_recalleds_dropped += 1;
+            }
+        }
         self.dl.handed_back.insert(gen, (from, now.wait, seen));
         if let Some(d) = self.dl.mine.get_mut(&gen) {
             d.stopped = true;
@@ -6452,6 +6491,10 @@ impl Core {
         if self.cfg.read_delegations {
             let need = replica.read_delegations().all_live(now.wait);
             if let Some(wait) = self.start_recalls(now, need, out) {
+                if lose_answer {
+                    self.lock_reserve_all(now, replica, out);
+                    return;
+                }
                 self.park(
                     now,
                     wait,
@@ -6468,15 +6511,17 @@ impl Core {
                 return;
             }
         }
-        out.push(Action::Send {
-            to: from,
-            msg: PeerMsg::DelegRecalled {
-                req,
-                gen,
-                through,
-                locks,
-            },
-        });
+        if !lose_answer {
+            out.push(Action::Send {
+                to: from,
+                msg: PeerMsg::DelegRecalled {
+                    req,
+                    gen,
+                    through,
+                    locks,
+                },
+            });
+        }
         self.lock_reserve_all(now, replica, out);
     }
 
@@ -6815,9 +6860,25 @@ impl Core {
         self.dw.close_for_recall(gen);
         let (to, dir) = (g.node, g.dir);
         let req = self.op_id();
-        self.dl.gens.get_mut(&gen).expect("present").recall_req = Some(req);
+        let back_off = self.deleg_request_timeout_ms();
+        let timer =
+            self.set_timer_wait(now.wait.plus(back_off), Timer::DelegRecallResend(gen), out);
+        let gs = self.dl.gens.get_mut(&gen).expect("present");
+        gs.recall_req = Some(req);
+        gs.recall_tries.push(req);
+        gs.recall_started = Some(now.wait);
+        gs.recall_backoff_ms = back_off;
+        gs.recall_resend = Some(timer);
         self.dl.by_req.insert(req, (gen, ReqKind::Recall));
         self.stats.deleg_recalls_sent += 1;
+        let every = self.cfg.delegation_recall_drop_every;
+        if every > 0 && self.stats.deleg_recalls_sent.is_multiple_of(every) {
+            // Simulation: the recall is lost on the way (the loss a
+            // request's timeout stands for in production).
+            self.stats.deleg_recalls_dropped += 1;
+            self.arm_gen_expiry(now, gen, out);
+            return;
+        }
         tracing::info!(
             node = self.me(),
             gen,
@@ -6830,6 +6891,48 @@ impl Core {
             msg: PeerMsg::DelegRecall { req, dir, gen },
         });
         self.arm_gen_expiry(now, gen, out);
+    }
+
+    /// The recall's resend timer: a recall nobody answered is sent again
+    /// (L3), each time under a new request id, with the delay doubling from
+    /// a request's timeout to 2 s, until the delegate answers (any attempt
+    /// counts) or the expiry outwaits the generation. Nothing goes out in
+    /// a takeover gate (ADR-42) or while this root is unusable; the timer
+    /// is armed again and the next firing tries once more.
+    pub(crate) fn on_deleg_recall_resend(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
+        let Some(g) = self.dl.gens.get_mut(&gen) else {
+            return;
+        };
+        g.recall_resend = None;
+        if g.ended || g.recall != RecallPhase::Sent {
+            return;
+        }
+        let (to, dir, mut back_off) = (g.node, g.dir, g.recall_backoff_ms);
+        let floor = self.deleg_request_timeout_ms();
+        if self.lease.gate.is_none() && self.root_usable(now) {
+            back_off = (back_off * 2).min(2_000).max(floor);
+            let req = self.op_id();
+            let g = self.dl.gens.get_mut(&gen).expect("present");
+            g.recall_req = Some(req);
+            g.recall_tries.push(req);
+            self.dl.by_req.insert(req, (gen, ReqKind::Recall));
+            self.stats.deleg_recalls_resent += 1;
+            tracing::info!(
+                node = self.me(),
+                gen,
+                dir,
+                delegate = to,
+                "sending an unanswered recall again"
+            );
+            out.push(Action::Send {
+                to,
+                msg: PeerMsg::DelegRecall { req, dir, gen },
+            });
+        }
+        let t = self.set_timer_wait(now.wait.plus(back_off), Timer::DelegRecallResend(gen), out);
+        let g = self.dl.gens.get_mut(&gen).expect("present");
+        g.recall_backoff_ms = back_off;
+        g.recall_resend = Some(t);
     }
 
     /// A release lets another node take the lease over at once. A
@@ -7155,7 +7258,18 @@ impl Core {
             return;
         };
         gs.recall_req = None;
+        // The answer to any attempt counts; the others, and the timer that
+        // would send one more, are not needed.
+        let tries = std::mem::take(&mut gs.recall_tries);
+        let timer = gs.recall_resend.take();
         gs.delegate_heard = Some(now.wait);
+        for r in tries {
+            self.dl.by_req.remove(&r);
+        }
+        if let Some(t) = timer {
+            self.cancel_timer(t, out);
+        }
+        let gs = self.dl.gens.get_mut(&gen).expect("present");
         if gs.recall == RecallPhase::Sent {
             gs.recall = RecallPhase::Drained(through);
         }
@@ -7368,6 +7482,15 @@ impl Core {
         if g.ended {
             return;
         }
+        if let Some(at) = g.recall_started {
+            let ms = now.wait.since(at).max(0) as u64;
+            self.stats.deleg_recalls_timed += 1;
+            self.stats.deleg_recall_ms_sum += ms;
+            self.stats.deleg_recall_ms_max = self.stats.deleg_recall_ms_max.max(ms);
+            if ms > 1_000 {
+                self.stats.deleg_recall_over_1s += 1;
+            }
+        }
         // Whatever ends a generation passed a closed slot (an expiry, a
         // recall); closed here too, for every other way in.
         self.dw.close(gen);
@@ -7476,12 +7599,17 @@ impl Core {
         self.dl.floor_sent.remove(&gen);
         let g = self.dl.gens.get_mut(&gen).expect("present");
         let expiry = g.expiry.take();
-        let recall_req = g.recall_req.take();
+        let recall_tries = std::mem::take(&mut g.recall_tries);
+        g.recall_req = None;
+        let resend = g.recall_resend.take();
         let controls = std::mem::take(&mut g.controls);
         if let Some(t) = expiry {
             self.cancel_timer(t, out);
         }
-        if let Some(req) = recall_req {
+        if let Some(t) = resend {
+            self.cancel_timer(t, out);
+        }
+        for req in recall_tries {
             self.dl.by_req.remove(&req);
         }
         self.stats.deleg_ended += 1;
@@ -7962,6 +8090,10 @@ impl Core {
                 ended: false,
                 expiry: None,
                 recall_req: None,
+                recall_tries: Vec::new(),
+                recall_started: None,
+                recall_resend: None,
+                recall_backoff_ms: 0,
                 controls: Vec::new(),
                 read_recalls,
                 renew_waiting: None,
@@ -8397,7 +8529,10 @@ impl Core {
             if let Some(t) = g.expiry {
                 self.cancel_timer(t, out);
             }
-            if let Some(req) = g.recall_req {
+            if let Some(t) = g.recall_resend {
+                self.cancel_timer(t, out);
+            }
+            for req in g.recall_tries {
                 self.dl.by_req.remove(&req);
             }
             for c in g.controls {

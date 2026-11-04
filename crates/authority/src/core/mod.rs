@@ -451,6 +451,13 @@ pub struct Config {
     /// acknowledgements of a delegate's commit (`root_stream_push`; 0: none),
     /// the loss a lost push stands for (ADR-41).
     pub delegation_push_drop_every: u64,
+    /// Simulation only: the root loses the first send of every Nth recall it
+    /// starts (`Core::start_recall`; 0: none), the loss a request's timeout
+    /// stands for in production (L3).
+    pub delegation_recall_drop_every: u64,
+    /// Simulation only: the delegate loses the answer to the first recall of
+    /// every Nth generation (`Core::on_deleg_recall`; 0: none) (L3).
+    pub delegation_recalled_drop_every: u64,
     /// The root reclaims a grant nobody renewed (a crashed delegate).
     /// Always on in production; the simulation turns it off to pin the
     /// liveness it provides.
@@ -752,6 +759,8 @@ impl Config {
             delegation_lone_hysteresis: true,
             delegation_stream_tick_ms: 50,
             delegation_push_drop_every: 0,
+            delegation_recall_drop_every: 0,
+            delegation_recalled_drop_every: 0,
             delegation_reclaim_expired: true,
             placement: true,
             placement_window_ms: 30_000,
@@ -1111,6 +1120,18 @@ pub struct Stats {
     pub deleg_recalls_sent: u64,
     pub deleg_recalls_drained: u64,
     pub deleg_recalls_expired: u64,
+    /// L3: recalls sent again, recalls ended (start to end) with their
+    /// total and longest time in ms and those past a second, and the sends
+    /// and answers the simulation dropped on purpose.
+    pub deleg_recalls_resent: u64,
+    pub deleg_recalls_timed: u64,
+    pub deleg_recall_ms_sum: u64,
+    pub deleg_recall_ms_max: u64,
+    pub deleg_recall_over_1s: u64,
+    pub deleg_recalls_dropped: u64,
+    pub deleg_recalleds_dropped: u64,
+    /// Recalls received for a generation not handed back yet.
+    pub deleg_recalls_first: u64,
     pub deleg_reclaimed: u64,
     pub deleg_ended: u64,
     /// Root: ended generations forgotten (`Core::deleg_forget_ended`).
@@ -1864,6 +1885,8 @@ enum Timer {
     PromiseWait,
     PromiseWatch,
     DelegExpiry(u64),
+    /// L3: an unanswered recall is sent again (`Core::on_deleg_recall_resend`).
+    DelegRecallResend(u64),
     DelegRenew(u64),
     DelegLapse(u64),
     /// M14.
@@ -1929,6 +1952,7 @@ impl Timer {
             Timer::PromiseWait => TimerKind::PromiseWait,
             Timer::PromiseWatch => TimerKind::PromiseWatch,
             Timer::DelegExpiry(_) => TimerKind::DelegExpiry,
+            Timer::DelegRecallResend(_) => TimerKind::DelegRecallResend,
             Timer::LockRequestTimeout(_) => TimerKind::LockRequestTimeout,
             Timer::LockRetry(_) => TimerKind::LockRetry,
             Timer::LockHeldReply(_) => TimerKind::LockHeldReply,
@@ -3159,6 +3183,7 @@ impl Core {
                 self.on_promise_watch(now, out);
             }
             Timer::DelegExpiry(gen) => self.on_deleg_expiry(now, gen, replica, out),
+            Timer::DelegRecallResend(gen) => self.on_deleg_recall_resend(now, gen, out),
             Timer::DelegRenew(gen) => self.on_deleg_renew_timer(now, gen, out),
             Timer::DelegLapse(gen) => self.on_deleg_lapse(now, gen, replica, out),
             Timer::LockRequestTimeout(req) => self.on_lock_request_timeout(now, req, replica, out),
