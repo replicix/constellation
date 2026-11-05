@@ -2388,10 +2388,17 @@ impl Core {
                     pending: replica.journal_position(epoch),
                     streams: Default::default(),
                 };
-                if let Some(need) = self.ack_need(&position) {
+                let durable = self.ack_need(&position);
+                // Plan 41 P41-01: an acceptance found completed waits for the
+                // read-delegation quarantine as a fresh execution's does
+                // (`dedup_acceptance_wait`).
+                let wait = matches!(outcome, MutateOutcome::Accepted { .. })
+                    .then(|| self.dedup_acceptance_wait(now, replica, out))
+                    .flatten();
+                if wait.is_some() || durable.is_some() {
                     self.rd
                         .parked_local
-                        .insert(rid, (Default::default(), Some(need)));
+                        .insert(rid, (wait.unwrap_or_default(), durable));
                 }
                 let (outcome, source) = Self::eio_unless_recorded(
                     outcome,

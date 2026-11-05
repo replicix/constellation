@@ -548,8 +548,13 @@ impl Core {
         // position it was evaluated at is durable under the lease's
         // acknowledgement policy.
         let executed = fresh.is_some();
+        // Plan 41 P41-01: an acceptance from the dedup waits for the
+        // read-delegation quarantine (`dedup_acceptance_wait`).
         let wait = match fresh {
             Some(inos) => self.recall_needed(now, &inos, Some(from), replica, out),
+            None if matches!(outcome, MutateOutcome::Accepted { .. }) => {
+                self.dedup_acceptance_wait(now, replica, out)
+            }
             None => None,
         };
         // Plan 43 C2a: what this answer waits for, whether it parks or not;

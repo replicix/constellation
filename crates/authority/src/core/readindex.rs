@@ -608,6 +608,31 @@ impl Core {
         self.start_recalls(now, need, out)
     }
 
+    /// Plan 41 P41-01: what an acceptance answered from the dedup (an op
+    /// that took effect before, found completed) waits for: the
+    /// read-delegation quarantine, as a fresh execution's acknowledgement
+    /// does (`recall_needed`). A successor applies its predecessor's
+    /// backup tail with the ops whose replies the predecessor held for a
+    /// recall that never came back; their requesters' retries find them
+    /// completed here, and the grants they were held for are what the
+    /// quarantine (the takeover floor) stands for. With the inbox off the
+    /// gate opens before the quarantine ends, so nothing else holds such
+    /// an answer (`strict-isolated-reader-holder-step-forward` seed
+    /// 217254: the successor answered its own client's create 0.4 s after
+    /// the takeover, and the isolated reader served the name as absent
+    /// for more than a second after that under its grant). Within one
+    /// tenure a dedup hit is an op this tenure executed, whose own answer
+    /// waited for the quarantine already; waiting again costs nothing once
+    /// it is over.
+    pub(crate) fn dedup_acceptance_wait(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> Option<RecallWait> {
+        self.recall_needed(now, &[], None, replica, out)
+    }
+
     pub(crate) fn start_recalls(
         &mut self,
         now: Now,

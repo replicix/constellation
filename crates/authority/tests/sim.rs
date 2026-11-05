@@ -12841,6 +12841,22 @@ fn a_cut_holder_stepped_forward_does_not_cap_its_successors_floor_early() {
     }
 }
 
+/// Plan 41 P41-01: a successor does not acknowledge, inside its takeover
+/// floor, an op it found completed in its predecessor's backup tail. The
+/// predecessor executed the op and held its reply for a recall of the
+/// isolated reader's grant; the successor applied the tail, its view opened
+/// at once (the inbox off) and the requester's retry hit the dedup, which
+/// answered without the read-delegation quarantine a fresh execution waits
+/// for: close-to-open (`strict-isolated-reader-holder-step-forward` seed
+/// 217254, where `long_locks` stopped; 1 of 2 000 seeds before).
+#[test]
+fn a_successor_does_not_acknowledge_its_predecessors_held_op_inside_the_floor() {
+    for seed in [217_253u64, 217_254, 217_255] {
+        run_seed(seed, strict_isolated_reader_holder_step_forward_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
 /// Plan 43 C7a (2/6): a lock owner whose oscillator runs 8 % fast, under a
 /// rate budget of 80 000 ppm, outwaits a cut locker on its wait clock, which
 /// counts `1/1.08` of the raw clock: not before the locker's grant ended.

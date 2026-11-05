@@ -66143,3 +66143,35 @@ Three clean-ups; no protocol change.
   `ack.client_unsettled_eio` (`verify::unsettled_eio_summary`): a late landing next to a nonzero count is an unsettled `EIO` the
   product admitted (plan 46 M0.3 cause 4-6), still a violation. Tests: `an_op_answered_in_doubt_never_lands_late`,
   `enoent_of_an_owned_name_is_an_error` (harness lib).
+
+## Plan 41 P41-01: a successor's dedup answer waits for its read quarantine (2026-11-05)
+
+`long_locks` stopped at `strict-isolated-reader-holder-step-forward` seed
+217254 (close-to-open; 1 of 2 000 seeds on main, 217254 only). Not the clock
+step: the holder, cut from S3 and stepped forward, executed node 2's forwarded
+`Create` and held the reply for a recall of the isolated reader's grant that
+never came back; the transaction was in its backup's tail. The backup sealed,
+applied the tail and, the inbox off, opened its view at once (the gate checks
+the read quarantine only before the drain). Its own client's retry of the rid
+found it completed (`resolve_in_doubt_then_execute`) and was acknowledged on
+durability alone, 0.4 s into a 3.4 s floor, while the reader still served the
+name as absent under its grant. The forward path's dedup (`holder.rs`, an
+`Accepted` that was not a fresh execution) had the same gap.
+
+Fix: an `Accepted` answered from the dedup waits for the read-delegation
+quarantine as a fresh execution does (`Core::dedup_acceptance_wait`, the
+quarantine part of `recall_needed`), in both paths. Within one tenure the
+first answer already waited for it, so nothing changes once it is over.
+
+Fail-before: `a_successor_does_not_acknowledge_its_predecessors_held_op_inside_the_floor`
+(seeds 217253..217255) fails on main at 217254 and passes with the fix.
+Authority lib and sim tests pass; `long_locks` at 1 000 seeds is clean (34
+configurations, 28 min).
+
+Open: a non-holder answering an in-doubt op from the applied log
+(`settled_outcome`) does not know a successor's quarantine (not reached).
+Separately, `strict-isolated-reader-beats` fails 5 of 2 000 seeds
+(218011, 218233, 218388, 218613, 218848) on main and with this fix: each has
+the mix's reboot of the isolated reader with a backward wall step, after which
+it serves reads for about 4.7 s while still isolated; not in `long_locks`, to
+be triaged on its own.
