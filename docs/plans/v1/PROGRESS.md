@@ -66503,3 +66503,31 @@ before, "none in time". Left failing with the ratchet for the same decision.
 
 **Gates**: `cargo fmt --all --check` clean; clippy `-D warnings` on authority, all targets, clean; the `reach::` unit tests
 37 passed; the release sim suite 396 passed, 2 failed (the ratchet and the S5 pin above), 12 ignored.
+
+## Plan 46 M0.4 follow-up: ADR-44, a shippable takeover gate recalls on demand (2026-11-05)
+
+The in-gate class of the stricter I4 classifier (an op that needs a generation recalled or ended inside the takeover gate: its
+settle was `Busy`, the `EIO` unsettled, the op later took effect) is closed by [ADR-44](../../explanation/DECISIONS.md#adr-44-a-takeover-gate-whose-journal-work-is-done-recalls-on-demand),
+which amends ADR-42: the gate recalls, drains and journals the cut of exactly the generations a pending op or settle needs, never on
+its own initiative. Review (fable) changes landed: the takeover drain's halt of an inbox op now recalls on demand (the `Gated` arm
+was unreachable); the gated root's own held settle is no longer forwarded to the stopped delegate on each hold; a recall drained
+while the gate was not shippable is ended at the next event once it is shippable again (seed 1796, no longer a violation);
+`deleg_gate_redelegated` counts the subtrees re-granted at the open after an on-demand recall; the gate-only widening of
+"disowned" is recorded in the ADR. New unit tests (`c2g_settle`): the inbox entry point, seed 1796's class, the deposition
+mid-recall (the cut retracted, the void lifted, the new state dropped), the held own settle.
+
+**Measurements** (2,000 seeds, knob none / slow lease reads): unsettled-`EIO` violations (seeds) long-delegated-late-answers 6 (5) / 149
+(104), placement-hot 2 (1) / 32 (19), delegated-holder-cut 35 (30) / 98 (84), long-delegated-backup 3 (3) / 68 (49); before ADR-44
+281 / 676, 29 / 65, 325 / 627, 174 / 406. No failing seed in the 8 runs; I1 and I2 0; I2c and I5 not above the "before" runs (the same
+seeds' counts: delegated-holder-cut none i2c 1, i5 1; long-delegated-backup slow i2c 1, i5 2); I4 late landings fall (long-delegated-late-answers
+slow 21 to 6, delegated-holder-cut slow 3 to 1, none 1 to 0). Seed 1796 is no longer an unsettled `EIO`; it stays recorded as a liveness case
+(the recall's end after a non-shippable gate). Residual classes: the delegate restarted in the gate, a rid that took effect (held
+until the quarantine), an unreachable delegate, a refusal not shipped by the window's end, the gated root's own op whose live delegate
+waits for its first renewal (m03 witness seed 904).
+
+**Ratchet** (`m03_the_configurations_at_zero_violations_stay_there`, seeds 0..99, no knob): lowered to the measured 0 and 0 for
+delegated-backup (was 1, 0), delegated-holder-cut (12, 2), long-delegated-backup (5, 1) and long-delegated-late-answers (6, 4);
+none raised. The witness of `m03_a_reachable_sequencers_requester_is_not_isolated` moved from seed 449 (closed by ADR-44) to 904.
+
+**Gates**: fmt (workspace), clippy `-D warnings` (authority, meta, all targets), authority lib 1039 passed, meta all targets, the release
+sim suite 398 passed, 0 failed, 12 ignored.

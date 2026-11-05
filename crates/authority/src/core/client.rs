@@ -3604,7 +3604,17 @@ impl Core {
                 if let Ownership::Delegated(d) =
                     replica.resolve_ownership(&super::holder::keys_of_op_in(&op, replica))
                 {
-                    if d.node != self.cfg.node_id && self.reaches(now, d.node) {
+                    // A generation this root is recalling has a stopped
+                    // delegate: it answers `NotHolder` naming this node, one
+                    // bounced round trip per hold (ADR-44: the gated root's
+                    // own held settle). `on_forward` applies the same rule
+                    // to a forwarded settle.
+                    let recalling = self
+                        .dl
+                        .gens
+                        .get(&d.gen)
+                        .is_some_and(|g| g.recall != super::delegate::RecallPhase::None);
+                    if d.node != self.cfg.node_id && self.reaches(now, d.node) && !recalling {
                         self.send_forward(now, rid, d.node, replica, out);
                         return;
                     }

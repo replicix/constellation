@@ -54867,6 +54867,206 @@ mod c2g_settle {
         assert_eq!(recalls_to_4(&out).len(), 1, "own op: {out:?}");
     }
 
+    /// ADR-44 (review SHOULD-2, seed 1796): a recall the gate drained while
+    /// it was not shippable (a gate paused past its lease) is ended once it
+    /// is shippable again, on the next event: nothing else would end it (the
+    /// delegate had no more to stream). Fails without the scan in
+    /// `deleg_after_event`: not ended until the open.
+    #[test]
+    fn igr_a_recall_drained_while_not_shippable_ends_when_shippable_again() {
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        let op = rename_into(&h, dir);
+        let out = h.step(request(20, 1, op, false));
+        let reqs = recalls_to_4(&out);
+        assert_eq!(reqs.len(), 1, "{out:?}");
+        h.core.lease.gate.as_mut().unwrap().shippable = false;
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegRecalled {
+                req: reqs[0],
+                gen: 7,
+                through: 0,
+                locks: Default::default(),
+            },
+        });
+        assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::Drained(0));
+        assert!(!h.core.dl.gens[&7].ended, "ended in a gate not shippable");
+        poke(&mut h);
+        assert!(!h.core.dl.gens[&7].ended, "still not shippable");
+        h.core.lease.gate.as_mut().unwrap().shippable = true;
+        poke(&mut h);
+        assert!(h.core.dl.gens[&7].ended, "not ended once shippable again");
+        assert!(h.core.lease.gate.is_some(), "still gated");
+    }
+
+    /// ADR-44 (review SHOULD-5): the gate deposed after it journaled the cut
+    /// of a generation it recalled on demand, before the cut shipped: the
+    /// strand retracts the cut and lifts the void (the table lists the
+    /// generation again), the new state of the generation (recall, resend
+    /// timer) is dropped with the lease, and the requester's settle is not
+    /// answered `Abandoned`.
+    #[test]
+    fn igr_a_deposition_mid_recall_in_the_gate_retracts_the_cut() {
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        let op = rename_into(&h, dir);
+        let out = h.step(request(20, 1, op.clone(), false));
+        let reqs = recalls_to_4(&out);
+        assert_eq!(reqs.len(), 1, "{out:?}");
+        // A non-settle forward after the cut is still `Busy` (R3).
+        let out = h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegRecalled {
+                req: reqs[0],
+                gen: 7,
+                through: 0,
+                locks: Default::default(),
+            },
+        });
+        assert!(h.core.dl.gens[&7].ended, "{out:?}");
+        assert!(h.meta.delegation_table().iter().all(|d| d.gen != 7));
+        let out = h.step(request(21, 2, op.clone(), false));
+        assert_eq!(reply_to_3(&out, 21), Some(MutateOutcome::Busy), "{out:?}");
+        assert!(
+            h.meta.lookup(dir, "b").unwrap().is_none(),
+            "executed in the gate"
+        );
+        // The deposition: the lease is lost, the delegation state dropped,
+        // the tenure's unshipped rows stranded.
+        h.core.lease.force_lost();
+        let mut out = Vec::new();
+        h.core.deleg_on_lease_gone(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.gens.is_empty(), "the generation state is dropped");
+        assert!(
+            h.core
+                .timers
+                .values()
+                .all(|(t, _)| !matches!(t, Timer::DelegRecallResend(7))),
+            "a resend timer is left"
+        );
+        h.meta.strand_below_epoch(3).unwrap();
+        assert!(
+            h.meta.delegation_table().iter().any(|d| d.gen == 7),
+            "the cut is not retracted: the table lacks generation 7"
+        );
+        // Another settle of rid 1 at this node: not answered `Abandoned`.
+        let out = h.step_archived(request(22, 1, op, true));
+        assert_ne!(
+            answer(&out, 22).map(|a| a.0),
+            Some(MutateOutcome::Abandoned),
+            "{out:?}"
+        );
+    }
+
+    /// ADR-44 (review SHOULD-1): the gated root's own settle, held while its
+    /// recall is in flight, is not forwarded to the stopped delegate on each
+    /// hold (it would answer `NotHolder` naming this node).
+    #[test]
+    fn igr_a_gated_roots_held_settle_is_not_forwarded_to_the_stopped_delegate() {
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        // An op under the live generation (forwarded to its delegate at
+        // submit), whose generation the gate then recalls for another
+        // requester's op.
+        let op = create_in(&h, dir, "o");
+        let rid = h.rid(1);
+        let submitted = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        assert!(
+            sends(&submitted)
+                .iter()
+                .any(|(to, m)| *to == 4 && matches!(m, PeerMsg::MutateRequest { .. })),
+            "{submitted:?}"
+        );
+        let cross = rename_into(&h, dir);
+        let out = h.step(request(20, 1, cross, false));
+        assert_eq!(recalls_to_4(&out).len(), 1, "{out:?}");
+        let to_4 = |out: &[Action]| {
+            sends(out)
+                .iter()
+                .any(|(to, m)| *to == 4 && matches!(m, PeerMsg::MutateRequest { .. }))
+        };
+        // The first deadline turns the op into a settle; the holds that
+        // follow (recall in flight) are not forwarded to the delegate.
+        let cfg = h.core.config().clone();
+        // (The lease outlasts the whole wait.)
+        if let Some((l, _)) = h.core.lease.held.as_mut() {
+            l.expires_unix_ms += 1_000_000;
+            l.holder_expires_ms += 1_000_000;
+            l.holder_wait_ms += 1_000_000;
+        }
+        h.advance(cfg.acquire_deadline_ms - cfg.settle_window());
+        connect_4(&mut h);
+        let id = timers(&submitted, TimerKind::ClientDeadline)[0];
+        let out = h.step(Event::Timer { id });
+        assert!(!to_4(&out), "forwarded to the stopped delegate: {out:?}");
+        let mut holds = 0;
+        for _ in 0..5 {
+            let ids: Vec<TimerId> = h
+                .core
+                .timers
+                .iter()
+                .filter(|(_, (t, _))| matches!(t, Timer::ForwardBackoff(r) if *r == rid))
+                .map(|(id, _)| *id)
+                .collect();
+            let Some(id) = ids.first().copied() else {
+                break;
+            };
+            h.advance(cfg.recall_hold_ms);
+            connect_4(&mut h);
+            let out = h.step(Event::Timer { id });
+            assert!(!to_4(&out), "forwarded to the stopped delegate: {out:?}");
+            holds += 1;
+        }
+        assert!(holds >= 2, "the settle was not held in the gate: {holds}");
+        assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::Sent);
+    }
+
+    /// ADR-44 (review MUST-1): the takeover drain's halt of an inbox op
+    /// that does not resolve to the root recalls, on demand, the
+    /// generations the op needs (a rename across the root and another
+    /// node's generation), in a shippable gate; the op stays in the inbox
+    /// for the poll after the open. A gate that is not shippable recalls
+    /// nothing. Fails without the call in the halt: no `DelegRecall`.
+    #[test]
+    fn igr_an_inbox_op_the_takeover_drain_halts_recalls_on_demand() {
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        h.core.cfg.inbox = true;
+        poke(&mut h);
+        let op = rename_into(&h, dir);
+        let mut out = Vec::new();
+        h.core
+            .inbox_drain(
+                h.clk(),
+                vec![super::inbox_batch(3, 0, 1, &op)],
+                &h.meta,
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(recalls_to_4(&out).len(), 1, "{out:?}");
+        assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::Sent);
+        assert!(h.core.dl.gens[&7].gate_recalled);
+        assert_eq!(h.core.inbox.leftover.len(), 1, "the op waits for the poll");
+        assert!(h.meta.lookup(ROOT_INO, "a").unwrap().is_some());
+        // Not shippable: nothing.
+        let (mut g, dir) = gated_root_with_gen_at_4(false);
+        g.core.cfg.inbox = true;
+        poke(&mut g);
+        let op = rename_into(&g, dir);
+        let mut out = Vec::new();
+        g.core
+            .inbox_drain(
+                g.clk(),
+                vec![super::inbox_batch(3, 0, 1, &op)],
+                &g.meta,
+                &mut out,
+            )
+            .unwrap();
+        assert!(recalls_to_4(&out).is_empty(), "{out:?}");
+    }
+
     /// ADR-44: a shippable gate recalls nothing on its own initiative. Its
     /// batches, renewals, the generation's expiry, a sync, an op and a
     /// settle on the live generation's keys from another node (redirected or

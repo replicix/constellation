@@ -787,7 +787,10 @@ to it. A successor answers a settle on the keys it owns as soon as its gate's
 journal work is done, without waiting out the read quarantine behind it (a rid
 that took effect is held, never accepted before the quarantine); a settle on a
 live generation of another node is redirected to its delegate, which the gate
-keeps renewed ([ADR-42](DECISIONS.md#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)).
+keeps renewed ([ADR-42](DECISIONS.md#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits));
+a settle on keys whose generation the gate recalled on demand is held until the
+cut is journaled and then answered as the gate's own
+([ADR-44](DECISIONS.md#adr-44-a-takeover-gate-whose-journal-work-is-done-recalls-on-demand)).
 Only when no
 sequencer answers within the rest of the deadline (twice
 the lease TTL: an isolated requester) does the client hear the *unsettled*
@@ -1885,9 +1888,13 @@ dependency goes with the replay. This text changes with the code.*
   its takeover gate's journal work is done (`shippable`), not when the gate
   opens: it appends and acknowledges their streams, answers their renewals (a
   first renewal still waits out the read quarantine) and redirects a settle on
-  their keys to the delegate, but recalls, seals, reclaims and ends none of
-  them until the gate opens
-  ([ADR-42](DECISIONS.md#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)).
+  their keys to the delegate, and recalls only on demand: a generation
+  an op or a settle it is asked for needs ended, as an open root would, whose
+  drain it takes and whose cut it journals before it opens; it seals, reclaims
+  and outwaits none of them and recalls none on its own initiative until the
+  gate opens
+  ([ADR-44](DECISIONS.md#adr-44-a-takeover-gate-whose-journal-work-is-done-recalls-on-demand);
+  [ADR-42](DECISIONS.md#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)).
   The grants were capped by the old lease. After a TTL takeover they are
   already dead; after a fast takeover the delegates re-stream from what
   the log has, and a backup that was itself a delegate rolls back its own

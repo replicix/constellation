@@ -4091,6 +4091,20 @@ impl Core {
                 self.deleg_redelegate_after_cross(now, replica, out);
             }
         }
+        // ADR-44: a recall the gate drained while it was not shippable (a
+        // gate paused past its lease: no further batch or answer comes to
+        // end it) is ended now that it is shippable again. One scan per
+        // event, in a gate only.
+        if self.lease.gate.is_some()
+            && self.dl.gens.values().any(|g| {
+                g.gate_recalled
+                    && g.inherited
+                    && !g.ended
+                    && matches!(g.recall, RecallPhase::Drained(th) if g.cursor >= th)
+            })
+        {
+            self.root_progress(now, replica, out);
+        }
         self.deleg_forget_ended(now, replica);
         // Plan 43 C2e (D8): a strict member's sealed tail that the drain
         // stopped short of (a dependency the log brings, a root that could
@@ -6874,6 +6888,7 @@ impl Core {
             .map(|(gen, g)| (*gen, g.dir, g.node, g.kind, g.range))
             .collect();
         for (gen, dir, node, kind, range) in again {
+            let gate_recalled = self.dl.gens.get(&gen).is_some_and(|g| g.gate_recalled);
             if let Some(g) = self.dl.gens.get_mut(&gen) {
                 g.redelegate = false;
             }
@@ -6899,6 +6914,12 @@ impl Core {
             match self.delegate_dir(now, dir, node, kind, range, replica, out) {
                 Ok(new_gen) => {
                     self.stats.deleg_redelegated += 1;
+                    // ADR-44: the subtree of a generation the gate recalled on
+                    // demand, re-granted at the open (the op's retry may
+                    // recall it once more).
+                    if gate_recalled {
+                        self.stats.deleg_gate_redelegated += 1;
+                    }
                     tracing::info!(
                         node = self.me(),
                         dir,
@@ -7059,7 +7080,7 @@ impl Core {
                 gen = %constellation_meta::delegation::GenLabel::of(gen),
                 gate_recalled,
                 gated = self.lease.gate.is_some(),
-                "an unanswered recall is not sent again now (this root is not usable)"
+                "an unanswered recall is not sent again now (this root is not usable, or its gate is not shippable)"
             );
         }
         let t = self.set_timer_wait(now.wait.plus(back_off), Timer::DelegRecallResend(gen), out);

@@ -1567,6 +1567,10 @@ impl Core {
                         replica.resolve_ownership(&keys),
                         constellation_meta::delegation::Ownership::Root
                     ) {
+                        // ADR-44: once the gate's journal work is done it
+                        // recalls what the op needs, on demand, while the op
+                        // waits for the poll after the open.
+                        self.gate_recall_on_demand(now, None, &keys, replica, out);
                         return Err(Halt::Recall);
                     }
                 }
@@ -1586,13 +1590,10 @@ impl Core {
                             );
                             return Err(Halt::Recall);
                         }
-                        // The gate recalls nothing (ADR-42): left in the inbox
-                        // for the poll after it, as an op under a generation
-                        // the gate has not taken on is.
-                        // ADR-44: once the gate's journal work is done it
-                        // recalls what the op needs, on demand, meanwhile.
+                        // Unreachable in the takeover gate (the `!admitted`
+                        // halt above recalls on demand, ADR-44); kept for
+                        // the plan's exhaustiveness.
                         super::delegate::RecallPlan::Gated => {
-                            self.gate_recall_on_demand(now, None, &keys, replica, out);
                             return Err(Halt::Recall);
                         }
                         super::delegate::RecallPlan::Refuse(code) => {

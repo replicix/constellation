@@ -1137,6 +1137,8 @@ pub struct Stats {
     /// ADR-44: recalls a shippable takeover gate started on demand
     /// (`Core::gate_recall_on_demand`).
     pub deleg_gate_recalls: u64,
+    /// ADR-44: generations recalled in the gate that were re-granted.
+    pub deleg_gate_redelegated: u64,
     pub deleg_recalls_drained: u64,
     pub deleg_recalls_expired: u64,
     /// L3: recalls sent again, recalls ended (start to end) with their

@@ -16205,14 +16205,14 @@ fn c2_delegated_long_delegation_prod_settles_every_eio() {
 /// fixes, which landed after the classifier; seed 1, its replacement, by S5
 /// (ADR-42: the gate serves the live delegate's generation); seed 2, the
 /// next, by ADR-44 (the gate recalls the generation its own op needs, on
-/// demand), as is 260; seed 449 is one of the violations that stay: the gated
-/// root's own settle, held in its gate past the settle window after the
-/// recall it needed had ended.) Fails on any build before the
+/// demand), as are 260 and 449; seed 904 is one of the violations that stay:
+/// the gated root's own op settled in its gate while the generation's first
+/// renewal still waited for the quarantine.) Fails on any build before the
 /// classification: no counter.
 #[test]
 fn m03_a_reachable_sequencers_requester_is_not_isolated() {
     let cfg = long_delegated_late_answers_config;
-    let seed = 449;
+    let seed = 904;
     let r = run_seed(seed, cfg()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
     assert!(
         r.unsettled_violations > 0,
@@ -16316,7 +16316,10 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     ];
     // (label, config, violations, allowed unsettled EIOs in seeds 0..100 when
     // the list was set; lowered where seeds 0..99 of the 2,000-seed sweeps of
-    // 2026-11-04, the re-trace of cause 6, measured less; never raised)
+    // 2026-11-04, the re-trace of cause 6, measured less, and again after
+    // ADR-44 (2026-11-05: delegated-backup, delegated-holder-cut,
+    // long-delegated-backup and long-delegated-late-answers measure 0 and 0
+    // in seeds 0..99); never raised)
     let ceilings: [(&str, Config, usize, usize); 14] = [
         ("backup-strict", backup_strict_config, 0, 0),
         ("backup-two", backup_two_config, 0, 0),
@@ -16332,14 +16335,14 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             0,
             0,
         ),
-        ("delegated-backup", delegated_backup_config, 1, 0),
+        ("delegated-backup", delegated_backup_config, 0, 0),
         (
             "delegated-group-switch",
             delegated_group_switch_config,
             0,
             0,
         ),
-        ("delegated-holder-cut", delegated_holder_cut_config, 12, 2),
+        ("delegated-holder-cut", delegated_holder_cut_config, 0, 0),
         (
             "delegated-long-delegation",
             delegated_long_delegation_config,
@@ -16354,12 +16357,12 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         ),
         ("flex-crash", flex_crash_config, 125, 9),
         ("long-delegated", long_delegated_config, 0, 0),
-        ("long-delegated-backup", long_delegated_backup_config, 5, 1),
+        ("long-delegated-backup", long_delegated_backup_config, 0, 0),
         (
             "long-delegated-late-answers",
             long_delegated_late_answers_config,
-            6,
-            4,
+            0,
+            0,
         ),
         ("placement-hot", placement_hot_config, 0, 0),
     ];

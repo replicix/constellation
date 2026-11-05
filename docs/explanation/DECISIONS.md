@@ -2604,6 +2604,11 @@ See: [plan 43](../plans/v1/wip/43-commit-rule.md) (§4 the oracle, Q16),
 [ADR-41](#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16)'s
 push and plan 46 M0.3's S2.
 
+**Amended by [ADR-44](#adr-44-a-takeover-gate-whose-journal-work-is-done-recalls-on-demand)
+(2026-11-05)**: a shippable gate recalls on demand, drains and journals the cut
+of a generation a pending op or settle needs ended; it still seals, reclaims,
+outwaits and re-delegates nothing.
+
 **Context**: a successor's takeover gate keeps its view closed for the
 read-delegation quarantine (12.5 s in the sim) long after its journal work is
 done (`PendingGate::shippable`: the marker landed, the predecessor's tail is
@@ -2721,7 +2726,9 @@ or is releasing is unchanged. A settle of the gated root's own plans no recall
 - What the gate still cannot answer, as before and by this decision: an op that
   needs a generation recalled or ended (a cross-subtree op, a generation whose
   delegate rebooted and is stopped), and a delegate that restarted in the gate
-  (its first renewal waits for the quarantine). Over 1,000 seeds (`+commit`,
+  (its first renewal waits for the quarantine). (The first class is closed by
+  [ADR-44](#adr-44-a-takeover-gate-whose-journal-work-is-done-recalls-on-demand); the delegate
+  restarted in the gate remains.) Over 1,000 seeds (`+commit`,
   before and after, without and with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`)
   the unsettled `EIO`s with a sequencer reachable fall from 252 / 470 to
   144 / 251 (`delegated-holder-cut`), 85 / 131 to 32 / 74 (`delegated-backup`),
@@ -2751,6 +2758,8 @@ or is releasing is unchanged. A settle of the gated root's own plans no recall
 **Rejected**: (b) a shippable gate recalls the generations (`DelegCut`): it
 ends grants that plan 46's sticky grants are meant to keep, and it executes a
 recall inside a view that is closed.
+[ADR-44](#adr-44-a-takeover-gate-whose-journal-work-is-done-recalls-on-demand) takes the
+on-demand form instead.
 
 **May revert**: under plan 46 M1.2's one stream per node with a member copy and
 sticky grants, the gate's inheritance of a node stream and its handling of
@@ -2763,6 +2772,119 @@ See: `crates/authority/src/core/delegate.rs` (`delegation_sync`,
 `deleg_recall_plan`, `root_log_floor`), `holder.rs` (`gate_settle`),
 `client.rs`, `crates/meta/src/replay.rs` (`TouchSet::from_op_in_names`);
 [plan 46](../plans/v1/wip/46-committed-or-final.md) M0.3 S5; PROGRESS "S5".
+
+## ADR-44: A takeover gate whose journal work is done recalls on demand
+
+**Status**: decided by the maintainer on 2026-11-05 (plan 46 M0.4 follow-up;
+the spec reviewed before it landed); interim until plan 46 M1.3. Amends
+[ADR-42](#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)'s "recalls, seals, reclaims and ends nothing".
+
+**Context**: under ADR-42 an op that needs a generation of another node
+recalled (keys across generations; a generation its delegate disowned or whose
+delegate is unreachable or past its window) waited for the gate to open (the
+12.5 s read quarantine plus the drain) before the root sent the recall. Its
+requester's deadline and settle window (9 s + 3 s) ran out meanwhile: the
+settle was `Busy` (S1 answers only keys the gate owns), the `EIO` went
+unsettled, and the op took effect after the open. The stricter I4 classifier
+(SHOULD-2 of the M0.4 review) counts 432 such `EIO`s as violations over 2,000
+seeds of the delegated configurations.
+
+**Decision**: a shippable gate (lease held, not lost, not releasing,
+`PendingGate::shippable`, `journal_ship_epoch` in force) recalls, on demand,
+exactly the generations an open root would recall for a pending op or settle it
+is asked to execute or settle, and only among the generations of other nodes it
+took on from the table (`GenState::inherited`, not ended, not a designation):
+- what: every involved generation of a cross-subtree op (`redelegate` set, the
+  re-grant waits for the open); the one a single-generation forward or settle
+  falls under when the open root's S3 test would not redirect it (ended,
+  recalling, past its window, delegate unreachable, or the delegate's own op or
+  settle: for an inherited generation `grant_in_flight` is false, so a
+  delegate's own request counts as disowned also while its first renewal only
+  waits for the quarantine; M1.3's holder-initiated release replaces that
+  test); every involved generation of the gated root's own op or settle that
+  reaches `route` (as `execute_local_outcome` plans it for an open root). Entry
+  points: `on_forward`'s fenced branch, `route` and `on_forward_backoff` for the
+  gated root's own ops and settles and the takeover drain's halt for an inbox
+  op. One function decides, `Core::gate_recall_on_demand`;
+  `start_recall` refuses in a gate that is not shippable and, in one that is,
+  any generation not inherited or this node's.
+- when: at the first such request after `shippable`, and again on a later one
+  while no recall is in flight. Never at `shippable`, a sync, an expiry, a
+  renewal or a batch.
+- not: no seal, no reclaim or outwait (`on_deleg_expiry` re-arms), no end of a
+  generation it did not recall on demand (its own end at the open; a recall kept
+  from a usable phase ends at the open), no renewal of a generation it recalls
+  (left unanswered, S2), no re-delegation, no execution before the open (the
+  forward stays `Busy`).
+- the drain and the end: the gate takes the recalled generation's batches
+  (`gated_takes_stream`), resends the recall (L3) for `gate_recalled` only, and
+  once `cursor >= through` journals the end (`RecallCut { through: cursor }`,
+  `void_stream`, `note_void_cut`, its own speculation stranded, the returned
+  lock grants installed) inside the gate.
+- the settle: `Held` (`recall_hold_ms`, no attempt spent; before: `Busy`) while
+  the recall is in flight; once the cut is journaled the keys are the gate's and
+  S1 answers: a rid with no outcome gets the journaled `Refused { ABANDONED }`
+  once its row ships, a rid that took effect is `Held` until the open (M8). The
+  gated root's own settle waits in `Backoff` (`ClientOp::gate_recall_wait`) and
+  is routed as a settle again, not down the lease path.
+
+**Integrity**: the recall, the drain and the cut are the open root's code paths
+under the same lease; the cut is a journal row after the marker, the tail and
+the gate's own rows and after every appended row of the generation (tail rows
+are at or below `log_stream_idx`, the inherited cursor); a deposition strands it
+like an open root's (the cut retracted, the void lifted, the successor inherits
+the generation live and the stopped delegate answers again from
+`handed_back`); ADR-43's orphan rule sees a durable end of a listed number; the
+drained batches are acknowledged with `committed` per ADR-41 as ADR-42 already
+does, and inherit the lone gate's exposure (M0.4 STAGE-1, not new). No new
+acknowledgement class (I1); the op is never parked at the gate and a
+delegate-executed copy is in the log before the cut (I2, I2c); `Abandoned` only
+on the gate's own keys for a rid with no outcome here (I4); the cut is at the
+cursor and the gate's speculation of the generation strands and replays (I5).
+The read quarantine covers every key it covered: the ended generation's keys
+join it, and the gate's view stays closed until the open.
+
+**Consequences**: over 2,000 seeds the stricter classifier's unsettled-`EIO`
+violations fall from 281/676 (long-delegated-late-answers, without/with slow
+lease reads) to 15/152, 29/65 to 2/32 (placement-hot), 325/627 to 35/100
+(delegated-holder-cut), 174/406 to 2/70 (long-delegated-backup); no failing
+seed; I1, I2, I2c, I5 unchanged; I4 late landings fall. Residual: the gated
+root's own op whose live delegate waits for its first renewal, a rid that took
+effect (held until the quarantine), a gate that is not shippable while the recall drains (seed 1796: a
+gate paused past its lease with the recall in flight; the end is journaled at the
+next event once it is shippable again, else at the open; the seed stays open as a
+liveness case), an unreachable delegate (`Held` until the open; the
+lease path could not answer either), a refusal not shipped by the window's end.
+Cost: none on an open root; in the gate one recall per needed generation, 12 to
+20 s earlier than before; a cross-subtree op's subtree is re-granted at the open
+and may be recalled once more by the op's retry (`deleg_gate_redelegated` counts it); a forwarded settle is `Held`
+instead of `Busy`. Two S5 unit tests changed their expectation (a disowned and
+an outwaited generation: recalled and `Held`, were `Busy`); the m03 witness
+seed moved from 2 to 449 (2 and 260 are closed by this rule). No version bump,
+no shim.
+
+**Rejected**: wholesale recall in the gate (ADR-42 (b): ends grants sticky
+grants keep); a cut held until the open with the settle answered from the drain
+state (a root refusal journaled on a delegated key); `Held` until the open (no
+I4 fix); redirecting a cross-subtree settle to a delegate (it cannot settle
+keys outside its subtree).
+
+**May revert**: under plan 46 M1.2/M1.3 the recall is a request the holder
+answers with `SubtreeReleased`; the rule becomes "the subtrees the op needs
+released", the end the journaled release, and `GenState::gate_recalled` goes
+with `GenState`.
+
+See: `crates/authority/src/core/delegate.rs` (`gate_recall_on_demand`,
+`gated_takes_stream`, `start_recall`, `on_deleg_recall_resend`,
+`root_progress`), `holder.rs` (`on_forward`'s fenced branch, `gate_settle`),
+`client.rs` (`route`, `on_forward_backoff`, `settle_route`,
+`ClientOp::gate_recall_wait`), `inbox.rs`; tests
+`igr_a_shippable_gate_recalls_the_generation_a_cross_op_needs` (fail-before),
+`igr_a_gate_recalls_nothing_unprompted`, sim
+`s5_a_gated_root_serves_another_nodes_generation`,
+`m03_the_configurations_without_an_unsettled_eio_run_strict`; plan 46 M0.4
+follow-up; the M0.4 review STAGE-1 "ADR-42's in-gate class" (superseded by this
+decision).
 
 ## ADR-43: A generation number carries the epoch of the tenure that minted it
 
