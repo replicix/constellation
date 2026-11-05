@@ -66224,7 +66224,7 @@ after the usual rollback (`Strand::superseded`, set per row from the pass's quie
 segment's records apply in its place. A transaction with an outcome the segment does not carry stays whole: idx 7's refusal,
 carried only by node 1's journal, still ships at epoch 5. This is ADR-33 C3's rule for a subscriber's stream entry of a
 root's append (`completed_streams`) applied to the root's own journal copy. It extends the documented retirement of a root's
-append (origin or recall only; plan 30 §M11): an ADR-33 amendment and a fable review are due, not written here.
+append (origin or recall only; plan 30 §M11): this is an ADR-33 C3 amendment ("C3 follow-up (2026-11-05, seed 2560)" in DECISIONS.md; DESIGN.md's delegation paragraph carries the clause); fable review: OK TO LAND after the documentation.
 
 The meta test `a_segment_carrying_a_journaled_rid_makes_its_outcome_the_logs` (seed 9287) asserted that the journal still
 held such a row after the successor's segment; that is the 2560 hazard, and it now asserts the row is gone (the outcome stays

@@ -2471,6 +2471,117 @@ fn a_later_tenures_segment_landing_an_appended_rid_supersedes_the_append() {
     assert!(meta.pending_replays().unwrap().is_empty());
 }
 
+/// The deposed root's one append of a delegate's row `idx` (generation 5,
+/// created as `name`), at epoch 1, and the journal's rows of it afterwards.
+fn deposed_after_one_append(name: &str) -> Meta {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    root_appends(&meta, 5, 1, name);
+    meta.set_holder_epoch(0);
+    meta
+}
+
+/// Seed 2560, review SHOULD-3 (a): the later tenure's segment carries the
+/// rid as a `Refused` (a rescue by rid refused what the append completed).
+/// The log's first outcome is the rid's: the append is superseded, the
+/// refusal is what the log answers, and the append's effect is gone. Fails
+/// before: the journal keeps the append and its name stays.
+#[test]
+fn a_refusal_landed_by_rid_supersedes_a_completed_append() {
+    use constellation_types::Code;
+    let meta = deposed_after_one_append("a");
+    let records = [LogRecord::Refused {
+        rid: delegate_rid(1),
+        code: Code::Exists,
+    }];
+    meta.apply_segment_rows(1, 2, 1, &[1], &[(0, 0)], &records, &TouchSet::default())
+        .unwrap();
+    assert_eq!(meta.journal_len().unwrap(), 0, "the append is dropped");
+    assert!(meta.pending_replays().unwrap().is_empty());
+    assert_eq!(meta.completed_position(delegate_rid(1)).unwrap(), Some(0));
+    assert_eq!(
+        meta.refused_code(delegate_rid(1)).unwrap(),
+        Some(Code::Exists),
+        "the log's refusal is the rid's outcome"
+    );
+    assert!(
+        meta.lookup(ROOT_INO, "a").unwrap().is_none(),
+        "the append's effect is rolled back"
+    );
+}
+
+/// Seed 2560, review SHOULD-3 (b): the segment carries the rid's outcome
+/// and a `RecallCut` of the generation below the row. The first pass drops
+/// the append quietly, so the recall pass does not queue it (L2b (b)).
+/// Fails before: the recall pass queues the append for a replay by rid.
+#[test]
+fn an_outcome_and_a_recall_cut_in_one_segment_queue_nothing() {
+    let meta = deposed_after_one_append("a");
+    let records = [
+        create_rec("a", (2 << 40) | 1),
+        LogRecord::Completed {
+            rid: delegate_rid(1),
+        },
+        LogRecord::RecallCut {
+            dir: ROOT_INO,
+            gen: 5,
+            through: 0,
+        },
+    ];
+    meta.apply_segment_rows(
+        1,
+        2,
+        3,
+        &[1, 2, 3],
+        &[(0, 0); 3],
+        &records,
+        &TouchSet::default(),
+    )
+    .unwrap();
+    assert_eq!(meta.journal_len().unwrap(), 0, "the append is dropped");
+    assert!(
+        meta.pending_replays().unwrap().is_empty(),
+        "the log holds the rid: nothing to replay"
+    );
+    assert_eq!(meta.completed_position(delegate_rid(1)).unwrap(), Some(0));
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
+}
+
+/// Seed 2560, review SHOULD-3 (c): a segment of the append's own epoch
+/// (`head.epoch == epoch`) is not a later tenure's: it names the origin and
+/// retires the append, and without the origin it supersedes nothing.
+#[test]
+fn a_segment_of_the_appends_own_epoch_is_not_a_supersession() {
+    let records = [
+        create_rec("a", (2 << 40) | 1),
+        LogRecord::Completed {
+            rid: delegate_rid(1),
+        },
+    ];
+    let meta = deposed_after_one_append("a");
+    meta.apply_segment_rows(
+        1,
+        1,
+        2,
+        &[1, 2],
+        &[(5, 1), (5, 1)],
+        &records,
+        &TouchSet::default(),
+    )
+    .unwrap();
+    assert_eq!(meta.journal_len().unwrap(), 0, "retired by its origin");
+    assert!(meta.pending_replays().unwrap().is_empty());
+    // No origin named: the same-epoch segment leaves the append alone.
+    let meta = deposed_after_one_append("a");
+    meta.apply_segment_rows(1, 1, 2, &[1, 2], &[(0, 0); 2], &records, &TouchSet::default())
+        .unwrap();
+    assert_eq!(
+        meta.journal_len().unwrap(),
+        1,
+        "not superseded by its own epoch's segment"
+    );
+}
+
 /// L2 (M2): the rebuild takes each journal row out before it examines the
 /// next, so a row's `deps` on the delegates' rows ahead of it have to be
 /// read from the intact journal. The root's own replay still waits for the

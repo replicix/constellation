@@ -1017,7 +1017,9 @@ lease and one log
   row to the next root), a subscriber's stream entry of the root's append of
   it retires by the successor's re-ship, which names it (`TailOf`), and a
   delegate that takes the root over re-appends its own rows the tail lacks,
-  verbatim under their stream origin, before its generation ends
+  verbatim under their stream origin, before its generation ends, and a
+  deposed root's own journal copy of such an append retires once a later
+  tenure's segment lands every outcome it carries under another identity
   ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)).
 - **Cross-subtree ops** (renames and hard links across delegations,
   `rmdir` or rename of a delegated root) go to the root, which *recalls*

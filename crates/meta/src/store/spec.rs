@@ -1533,22 +1533,13 @@ fn strand_local_tx(
     // own replay of the same rid landed (plan 30 §M11 phase 2b,
     // long-delegated seeds 70039/70075/70078: the completion forgotten,
     // the replay's dedup reply installed a shadow nothing retired).
-    let log_carries = |tx: &SingleWriterWriteTx, rid: &Rid| -> Result<bool, MetaError> {
-        Ok(tx
-            .get(&meta.completed, rid.to_key())?
-            .and_then(|v| {
-                v.get(0..8)
-                    .map(|p| u64::from_be_bytes(p.try_into().expect("8 bytes")))
-            })
-            .is_some_and(|position| position == 0))
-    };
     let rid = match row.rid {
         Some(rid) => rid,
         None => replay_rid_for(&*tx, meta, first)?,
     };
     // (A rid-less transaction's replay rid carries a `completed` row too
     // when it journaled its own marker — the holder's manifest commit.)
-    if !log_carries(tx, &rid)? {
+    if !log_carries(&*tx, meta, &rid)? {
         tx.remove(&meta.completed, rid.to_key());
     }
     meta.forget_recent(rid);
@@ -1559,7 +1550,7 @@ fn strand_local_tx(
     // from a decision the log never carried.
     for rec in &records {
         if let LogRecord::Refused { rid, .. } = rec {
-            if !log_carries(tx, rid)? {
+            if !log_carries(&*tx, meta, rid)? {
                 tx.remove(&meta.completed, rid.to_key());
             }
         }
@@ -3004,6 +2995,17 @@ fn streamed_tip_tx(r: &impl Readable, meta: &Meta, epoch: u64) -> Result<Option<
         .max())
 }
 
+/// Whether the log carries `rid`'s outcome already: a row applied from a
+/// segment records position 0 in `completed`, a journaled one its journal seq.
+fn log_carries(r: &impl Readable, meta: &Meta, rid: &Rid) -> Result<bool, MetaError> {
+    Ok(r.get(&meta.completed, rid.to_key())?
+        .and_then(|v| {
+            v.get(0..8)
+                .map(|p| u64::from_be_bytes(p.try_into().expect("8 bytes")))
+        })
+        .is_some_and(|position| position == 0))
+}
+
 /// Roll back and take out every outstanding entry `strands` selects (see
 /// [`rewind_tx`]).
 /// Seed 2560 (long-delegated-late-answers): the journal transactions (by
@@ -3028,6 +3030,11 @@ fn streamed_tip_tx(r: &impl Readable, meta: &Meta, epoch: u64) -> Result<Option<
 /// the same transaction with an outcome the segment does not carry keeps
 /// the whole transaction (it may be the outcome's only carrier).
 ///
+/// A root's append of a delegate's row is one op with one outcome today
+/// (`apply_delegate_tx`), so "every outcome settled" is the one outcome; an
+/// outcome the log already carries counts as settled too, so a multi-outcome
+/// append whose outcomes land in different segments would still go.
+///
 /// Found through `completed`: a root's append records its journal seq there
 /// (position != 0; one applied from a segment records 0), so the cost is a
 /// point read per outcome the segment carries.
@@ -3045,7 +3052,9 @@ fn superseded_root_appends_tx(
     {
         return Ok(out);
     }
-    let settled = |rid: &Rid| completes.contains(rid) || refused.contains(rid);
+    let settled = |rid: &Rid| -> Result<bool, MetaError> {
+        Ok(completes.contains(rid) || refused.contains(rid) || log_carries(r, meta, rid)?)
+    };
     for rid in completes.iter().chain(refused.iter()) {
         let position = r
             .get(&meta.completed, rid.to_key())?
@@ -3083,12 +3092,27 @@ fn superseded_root_appends_tx(
                 _ => None,
             })
             .collect();
-        if !outcomes.is_empty() && outcomes.into_iter().all(settled) {
+        // A root appends one delegate row as one op with one outcome
+        // (`apply_delegate_tx`); a multi-outcome append would have to be
+        // settled across segments (`settled` counts the log's), so fail
+        // loudly in tests rather than ship twice.
+        debug_assert!(
+            outcomes.len() <= 1,
+            "a root's append of a delegate's row carries one outcome"
+        );
+        let mut all = !outcomes.is_empty();
+        for rid in &outcomes {
+            if !settled(rid)? {
+                all = false;
+                break;
+            }
+        }
+        if all {
             out.insert(first);
         }
     }
     if !out.is_empty() {
-        tracing::debug!(
+        tracing::info!(
             epoch,
             firsts = ?out,
             "a segment carries the outcomes of a past tenure's appends of delegate rows: superseded"

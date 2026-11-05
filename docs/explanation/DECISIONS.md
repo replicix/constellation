@@ -1769,7 +1769,29 @@ first, and a generation the tail ends keeps the replay); they were executed
 again by rid, and reached the log as root rows of the new tenure. (Found by
 the `placement-hot` sweeps: I2c, I5.) Not yet: a deposed root rebuilt from
 the log still queues the rows it appended for other generations as
-`Records` replays (C3 §5.4 item 4).
+`Records` replays (C3 §5.4 item 4). A deposed root's own journal copy of such
+an append also retires once a later tenure's segment lands its outcomes under
+another identity (the C3 follow-up of 2026-11-05 below).
+
+**C3 follow-up (2026-11-05, seed 2560 of long-delegated-late-answers)**: a
+root's journaled append of a delegate's row retires by its origin (a segment
+that names `(gen, idx)`), strands at the generation's recall, and now also
+retires when a segment of a later tenure carries every outcome the append
+records (`Completed`, `Refused`) under another identity, by rid and without
+the origin (`superseded_root_appends_tx`). It is rolled back, the segment's
+records apply in its place, and nothing is queued: the log already holds the
+rid's outcome and effect, so a replay could only be answered from the dedup,
+and shipping the copy with this node's next tenure would land the rid twice
+(I2) and apply its records over later state (log replay would diverge from
+the replicas). The rule is the one a subscriber's stream entry of the same
+append already had (`completed_streams`). An append with an outcome the log
+lacks stays whole: it may be that outcome's only carrier. The log's first
+outcome for a rid is the rid's, even where it disagrees with the append's (a
+rescue by rid that refused what the delegate completed): that divergence is
+L2b's, upstream, and plan 46 M1.2 D1(iii) (a cut that includes the group's
+rows, appended with their origin) would end the non-verbatim landing itself.
+Not changed: a delegate's own rows (epoch 0), member copies, backups' tails,
+ADR-41's committed prefix.
 
 **C2f (plan 43, 2026-10-31)**: a lone root answers other nodes from the
 archive, and the fast path answers on its disk only where it is lone. The

@@ -8849,7 +8849,9 @@ fn regression_an_abandoned_ops_effect_explains_a_read_seed_7211() {
 /// `Completed(2,1,6)`, `Refused(3,1,7)`, `Completed(2,1,8)`) to its journal
 /// (journal seqs 52..56) and was suspended, then rebooted, before shipping
 /// them. Node 3, the delegate, took the lease over (epoch 2) and replayed
-/// its own rows 6 and 8 by rid at its gate (`stranded op replayed
+/// its own rows 6 and 8 by rid at its gate (idx 6 halted at C3's
+/// re-append: ended/unlisted generation, ADR-43; 7 and 8 behind it, so the
+/// gate did not re-append under origin) (`stranded op replayed
 /// locally`): the log (seq 13) completes (2,1,6) and (2,1,8) under no
 /// origin, and never recalls gen 1:2. A root's append of a delegate's row
 /// retires by its origin or by the generation's recall only, so node 1's
