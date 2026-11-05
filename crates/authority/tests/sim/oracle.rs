@@ -33,6 +33,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// `(epoch, backups)` of every lease configuration that landed.
+pub type Tenures = Vec<(u64, Vec<NodeId>)>;
+
 /// Everything the oracles share in one run (`NodeEnv::oracles`).
 pub struct Oracles {
     pub bucket: Arc<Bucket>,
@@ -77,7 +80,7 @@ pub struct Oracles {
     /// Plan 46 M1.1: every lease configuration that landed, `(epoch,
     /// backups)` (the tenure's configuration history): the root's copy of a
     /// delegate's row counts when the tenure that appended it committed it.
-    pub tenures: Arc<Mutex<Vec<(u64, Vec<NodeId>)>>>,
+    pub tenures: Arc<Mutex<Tenures>>,
     /// Nodes whose core holds a continuation epoch right now: the core
     /// counts their journal as a copy until plan 46 M1.4.
     pub epoch_holds: Mutex<BTreeSet<NodeId>>,
@@ -300,7 +303,7 @@ impl Oracles {
     pub fn new(bucket: Arc<Bucket>) -> Arc<Self> {
         let leases = Arc::new(LeaseClaims::default());
         let reach = bucket.reach();
-        let tenures_cell: Arc<Mutex<Vec<(u64, Vec<NodeId>)>>> = Arc::default();
+        let tenures_cell: Arc<Mutex<Tenures>> = Arc::default();
         let tenures_hook = tenures_cell.clone();
         {
             let leases = leases.clone();
@@ -1369,7 +1372,7 @@ fn deleg_group(
                 ));
             }
         }
-        let mut tenures: Vec<(u64, Vec<NodeId>)> = o.tenures.lock().unwrap().clone();
+        let mut tenures: Tenures = o.tenures.lock().unwrap().clone();
         if let Some(l) = lease {
             tenures.push((l.epoch, l.backups.clone()));
         }
