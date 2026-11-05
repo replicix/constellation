@@ -799,6 +799,7 @@ impl NodeHandle {
             own_lapse: None,
             unsettled_seen: 0,
             deps_refused_seen: 0,
+            deleg_rows_from: 0,
             deleg_sig: Mutex::new(Vec::new()),
             deadline_armed: HashMap::new(),
             step_timer: None,
@@ -1105,6 +1106,9 @@ struct Driver {
     unsettled_seen: u64,
     /// `Stats::deleg_deps_refused` already judged (the causal-cut oracle).
     deps_refused_seen: u64,
+    /// The next journal seq to scan for a delegate's rows the root appended
+    /// (`Oracles::appended`).
+    deleg_rows_from: u64,
     /// The generations the last delegation table kept was taken at.
     deleg_sig: Mutex<GensSig>,
     /// Plan 46 M0.3: when each client-deadline timer was armed (true ms),
@@ -2181,7 +2185,11 @@ impl Driver {
                 Event::Timer { id } => Some(*id),
                 _ => None,
             };
+            let is_stream = EventKind::DelegateStream.matches(&event);
             let actions = self.core.handle(now, event, &*self.meta);
+            if self.core.lease().epoch().is_some() {
+                self.record_deleg_rows(is_stream);
+            }
             {
                 let mut holds = self.oracles.epoch_holds.lock().unwrap();
                 if self.core.lease().epoch_held() {
@@ -3820,6 +3828,35 @@ impl Driver {
     /// What the daemon does around the core for a forwarded manifest
     /// (`authority_driver.rs`, the `MutateRequest` arm): the chunks still
     /// pending on the sender are enrolled here, before the op executes.
+    /// Plan 46 M1.1: the root just appended delegates' rows to its journal:
+    /// record the tenure (epoch, backups, epoch hold) each was appended in,
+    /// for the oracle's judgement of the root's copy.
+    ///
+    /// A row the root took off a delegate's stream (`stream`) is this
+    /// tenure's append; a row that shows up otherwise is a successor's
+    /// re-journal of a row an earlier tenure appended, which keeps its
+    /// record.
+    fn record_deleg_rows(&mut self, stream: bool) {
+        let txs = Replica::journal_txs_from(&*self.meta, self.deleg_rows_from, usize::MAX);
+        let lease = self.core.lease();
+        let tenure = (
+            lease.epoch().unwrap_or(0),
+            lease.backups().to_vec(),
+            lease.epoch_held(),
+        );
+        let mut appended = self.oracles.appended.lock().unwrap();
+        for t in &txs {
+            if t.origin != (0, 0) {
+                if stream {
+                    appended.insert(t.origin, tenure.clone());
+                } else {
+                    appended.entry(t.origin).or_insert_with(|| tenure.clone());
+                }
+            }
+            self.deleg_rows_from = self.deleg_rows_from.max(t.last + 1);
+        }
+    }
+
     fn before_core(&self, event: &Event) {
         if let Event::Peer {
             from,

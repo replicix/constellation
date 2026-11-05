@@ -33,8 +33,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// `(epoch, backups)` of every lease configuration that landed.
-pub type Tenures = Vec<(u64, Vec<NodeId>)>;
+/// `(epoch, backups, epoch hold)` of the tenure that appended a delegate's row.
+pub type AppendTenure = (u64, Vec<NodeId>, bool);
 
 /// Everything the oracles share in one run (`NodeEnv::oracles`).
 pub struct Oracles {
@@ -77,10 +77,16 @@ pub struct Oracles {
     /// delegate past the lead, or behind an uncommitted gated row of its own
     /// (see [`LoneLead`]).
     pub lone_lead: Mutex<LoneLead>,
-    /// Plan 46 M1.1: every lease configuration that landed, `(epoch,
-    /// backups)` (the tenure's configuration history): the root's copy of a
-    /// delegate's row counts when the tenure that appended it committed it.
-    pub tenures: Arc<Mutex<Tenures>>,
+    /// Plan 46 M1.1: the tenure each delegate row `(gen, idx)` was appended
+    /// in at a root, `(epoch, backups, epoch hold in force)`, recorded when
+    /// the root appended it (the latest append wins: a successor's re-append
+    /// of an unretired row is its own tenure's).
+    pub appended: Mutex<HashMap<(u64, u64), AppendTenure>>,
+    /// The latest lease configuration landed in each epoch (`epoch ->
+    /// backups`): a lone root that adds a backup later in its epoch commits
+    /// the rows it appended by that backup's copy (the core counts the
+    /// configuration as it is, not as it was at the append).
+    pub epoch_backups: Arc<Mutex<BTreeMap<u64, Vec<NodeId>>>>,
     /// Nodes whose core holds a continuation epoch right now: the core
     /// counts their journal as a copy until plan 46 M1.4.
     pub epoch_holds: Mutex<BTreeSet<NodeId>>,
@@ -303,19 +309,16 @@ impl Oracles {
     pub fn new(bucket: Arc<Bucket>) -> Arc<Self> {
         let leases = Arc::new(LeaseClaims::default());
         let reach = bucket.reach();
-        let tenures_cell: Arc<Mutex<Tenures>> = Arc::default();
-        let tenures_hook = tenures_cell.clone();
+        let epoch_backups: Arc<Mutex<BTreeMap<u64, Vec<NodeId>>>> = Arc::default();
+        let epoch_backups_hook = epoch_backups.clone();
         {
             let leases = leases.clone();
             let reach = reach.clone();
             bucket.set_lease_hook(Arc::new(move |node, prev, new| {
-                {
-                    let mut t = tenures_hook.lock().unwrap();
-                    let entry = (new.epoch, new.backups.clone());
-                    if !t.contains(&entry) {
-                        t.push(entry);
-                    }
-                }
+                epoch_backups_hook
+                    .lock()
+                    .unwrap()
+                    .insert(new.epoch, new.backups.clone());
                 reach.lease_landed(
                     new.holder,
                     new.released,
@@ -350,7 +353,8 @@ impl Oracles {
             i1_violations: Mutex::new(Vec::new()),
             claim_violations: Mutex::new(Vec::new()),
             lone_lead: Mutex::new(LoneLead::default()),
-            tenures: tenures_cell,
+            appended: Mutex::new(HashMap::new()),
+            epoch_backups,
             epoch_holds: Mutex::new(BTreeSet::new()),
             acks_unsourced: AtomicU64::new(0),
         })
@@ -1363,43 +1367,53 @@ fn deleg_group(
             .iter()
             .find(|x| x.origin == (g, i) && carries_as(&x.records, rid, want))
             .expect("root_has");
+        // Judge the tenure that appended the row, as recorded then.
+        let Some((e, at_append, held)) = o.appended.lock().unwrap().get(&(g, i)).cloned() else {
+            return Err(format!(
+                "no backup recorded; the root journal holds ({g},{i}) but no append of it \
+                 was recorded"
+            ));
+        };
+        // The configuration the appending epoch ended with (or has now): a
+        // backup added later in the epoch commits the row by its copy.
+        let bs = o
+            .epoch_backups
+            .lock()
+            .unwrap()
+            .get(&e)
+            .cloned()
+            .unwrap_or(at_append);
         // An epoch hold's journal still counts until plan 46 M1.4
         // (`Core::config_committed_jseq`, Q6).
-        if let Some(l) = lease {
-            if o.epoch_holds.lock().unwrap().contains(&l.holder) {
-                return Ok(format!(
-                    "no backup recorded; the root journal holds ({g},{i}) and the root                      is an epoch hold: its journal counts until M1.4"
-                ));
-            }
+        // The core counts the journal while the hold is in force when it
+        // computes the ack, so a hold that began after the append counts too.
+        let hold_now = lease.is_some_and(|l| o.epoch_holds.lock().unwrap().contains(&l.holder));
+        if held || hold_now {
+            return Ok(format!(
+                "no backup recorded; the root journal holds ({g},{i}) and the root \
+                 is (or was when it appended it) an epoch hold: its journal counts until M1.4"
+            ));
         }
-        let mut tenures: Tenures = o.tenures.lock().unwrap().clone();
-        if let Some(l) = lease {
-            tenures.push((l.epoch, l.backups.clone()));
+        if bs.is_empty() {
+            return Err(format!(
+                "no backup recorded; the root journal holds ({g},{i}) but the tenure of \
+                 epoch {e} that appended it listed no backup (only the archive commits a lone \
+                 root's copy; a lone root's journal is no second copy)"
+            ));
         }
-        tenures.sort();
-        tenures.dedup();
-        let mut why: Vec<String> = Vec::new();
-        for (e, bs) in tenures.iter().rev().filter(|(_, bs)| !bs.is_empty()) {
-            match backups_hold(o, *e, bs, ht, lease.map(|l| (l.holder, holder_txs))) {
-                Ok(()) => {
-                    return Ok(format!(
-                        "no backup recorded; the root journal holds ({g},{i}) and the \
-                         tenure of epoch {e} committed it: every backup {bs:?} holds it"
-                    ))
-                }
-                Err(w) => why.push(format!("epoch {e}: {w}")),
-            }
+        // The holder's own journal stands in only for a listed backup that
+        // inherited the row by sealing; the appending tenure's backups must
+        // hold it.
+        match backups_hold(o, e, &bs, ht, lease.map(|l| (l.holder, holder_txs))) {
+            Ok(()) => Ok(format!(
+                "no backup recorded; the root journal holds ({g},{i}) and the tenure of \
+                 epoch {e} committed it: every backup {bs:?} holds it"
+            )),
+            Err(w) => Err(format!(
+                "no backup recorded; the root journal holds ({g},{i}) but the tenure of \
+                 epoch {e} did not commit it: {w}"
+            )),
         }
-        Err(format!(
-            "no backup recorded; the root journal holds ({g},{i}) but no tenure's \
-             configuration committed it (only the archive commits a lone root's \
-             copy; a lone root's journal is no second copy): {}",
-            if why.is_empty() {
-                "no tenure listed a backup".to_string()
-            } else {
-                why.join("; ")
-            }
-        ))
     } else {
         Err(format!(
             "no backup recorded and the root's journal lacks the appended row ({g},{i})"
@@ -3009,9 +3023,12 @@ mod tests {
         w.lease(1, 2, &[]);
         let j = w.judge(2, &st, r);
         assert_eq!(j.class, None, "{}", j.detail);
-        assert!(j.detail.contains("no tenure"), "{}", j.detail);
-        // Epoch 1 listed backup 3, which holds the row.
-        w.o.tenures.lock().unwrap().push((1, vec![3]));
+        assert!(j.detail.contains("no append"), "{}", j.detail);
+        // Appended in epoch 1, which listed backup 3 (it lacks the row).
+        w.o.appended
+            .lock()
+            .unwrap()
+            .insert((1, 1), (1, vec![3], false));
         let j = w.judge(2, &st, r);
         assert_eq!(j.class, None, "{}", j.detail);
         assert!(j.detail.contains("epoch 1"), "{}", j.detail);
@@ -3026,6 +3043,29 @@ mod tests {
         assert!(j.detail.contains("tenure of epoch 1"), "{}", j.detail);
     }
 
+    /// Plan 46 M1.1 review probe: node 1 was epoch 1's backup, sealed, and
+    /// holds epoch 2 alone (no backup). Delegate 2's row is appended in
+    /// epoch 2 to node 1's journal only: nothing but the archive commits
+    /// it, and node 1's old backup role does not.
+    #[test]
+    fn i1_deleg_group_lone_successor_row_is_not_committed_by_its_old_backup_role() {
+        let w = world();
+        let r = rid(3, 1);
+        let st = AnswererState {
+            holds_gens: vec![1],
+            ..Default::default()
+        };
+        root_appended_row(&w);
+        w.lease(1, 2, &[]);
+        w.o.appended
+            .lock()
+            .unwrap()
+            .insert((1, 1), (2, vec![], false));
+        let j = w.judge(2, &st, r);
+        assert_eq!(j.class, None, "{}", j.detail);
+        assert!(j.detail.contains("no backup"), "{}", j.detail);
+    }
+
     /// An epoch hold's journal counts as the root's copy until plan 46 M1.4
     /// (`Core::config_committed_jseq`); a lone root's does not.
     #[test]
@@ -3038,9 +3078,29 @@ mod tests {
         };
         root_appended_row(&w);
         w.lease(1, 1, &[]);
+        w.o.appended
+            .lock()
+            .unwrap()
+            .insert((1, 1), (1, vec![], false));
         let j = w.judge(2, &st, r);
         assert_eq!(j.class, None, "{}", j.detail);
         assert!(j.detail.contains("lone root's"), "{}", j.detail);
+        w.o.appended
+            .lock()
+            .unwrap()
+            .insert((1, 1), (1, vec![], true));
+        let j = w.judge(2, &st, r);
+        assert_eq!(
+            j.class,
+            Some(AckClass::DelegGroup { gen: 1 }),
+            "{}",
+            j.detail
+        );
+        // A hold that began after the append counts as well.
+        w.o.appended
+            .lock()
+            .unwrap()
+            .insert((1, 1), (1, vec![], false));
         w.o.epoch_holds.lock().unwrap().insert(1);
         let j = w.judge(2, &st, r);
         assert_eq!(
@@ -3093,9 +3153,13 @@ mod tests {
         w.metas[&1]
             .apply_delegate_tx(&records, Some(r), 1, 1, Position::ZERO)
             .unwrap();
+        w.o.appended
+            .lock()
+            .unwrap()
+            .insert((1, 1), (1, vec![], false));
         let j = w.judge(2, &st, r);
         assert_eq!(j.class, None, "{}", j.detail);
-        assert!(j.detail.contains("no tenure"), "{}", j.detail);
+        assert!(j.detail.contains("no backup"), "{}", j.detail);
         // With a recorded backup it is the backup's tail that must hold it.
         let st = AnswererState {
             holds_gens: vec![1],
