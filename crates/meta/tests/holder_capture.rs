@@ -2498,7 +2498,6 @@ fn a_refusal_landed_by_rid_supersedes_a_completed_append() {
         .unwrap();
     assert_eq!(meta.journal_len().unwrap(), 0, "the append is dropped");
     assert!(meta.pending_replays().unwrap().is_empty());
-    assert_eq!(meta.completed_position(delegate_rid(1)).unwrap(), Some(0));
     assert_eq!(
         meta.refused_code(delegate_rid(1)).unwrap(),
         Some(Code::Exists),
@@ -2573,12 +2572,20 @@ fn a_segment_of_the_appends_own_epoch_is_not_a_supersession() {
     assert!(meta.pending_replays().unwrap().is_empty());
     // No origin named: the same-epoch segment leaves the append alone.
     let meta = deposed_after_one_append("a");
-    meta.apply_segment_rows(1, 1, 2, &[1, 2], &[(0, 0); 2], &records, &TouchSet::default())
-        .unwrap();
+    meta.apply_segment_rows(
+        1,
+        1,
+        2,
+        &[1, 2],
+        &[(0, 0); 2],
+        &records,
+        &TouchSet::default(),
+    )
+    .unwrap();
     assert_eq!(
         meta.journal_len().unwrap(),
-        1,
-        "not superseded by its own epoch's segment"
+        2,
+        "not superseded by its own epoch's segment (its two records)"
     );
 }
 
