@@ -66447,3 +66447,59 @@ sweeps (seeds 0 to 999), without and with `AUTHORITY_SIM_LEASE_READS=0:0:800:100
 - Harness additions: `lock-lane-overhead` (phases, `CONSTELLATION_HARNESS_OVH_*`, `P41OVH` lines) and `lock-xcheckfs-cell`
   (`CONSTELLATION_HARNESS_XC_*`). The scenarios kill the daemons at the end of a 10,000-grant run: closing the descriptors did not finish
   within 10 minutes (`lock-wait` threads spinning at 15 % CPU each in B's daemon, lane off), itself worth a look.
+## Plan 46 M0.4 follow-up: the classifier's SHOULD-2, SHOULD-3 and SHOULD-4 (2026-11-05)
+
+The I4 classifier (`crates/authority/tests/sim/reach.rs`) tightened as the M0.4 review asked; each rule with unit tests (a
+case that is now a violation, a genuinely isolated or outwaited one still allowed).
+
+- **SHOULD-2** (`blocked_due`): keys across generations whose grants live and whose delegates a root in force reaches (and
+  can commit, and the requester reaches) are due one recall round trip plus the recall's resend back-off (2 s,
+  `on_deleg_recall_resend`) after the start of that stretch, never later than the generations' own windows; a delegate the
+  root cannot reach is still outwaited for its window. Test:
+  `keys_across_live_generations_the_root_reaches_are_due_after_one_recall`.
+- **SHOULD-3** (`readopts_own`): a holder restarted since its body landed, whose previous process still held the lease
+  (not deposed: no `BUSY_LOST`, which a seal also sets), re-adopts its own unexpired lease at once (`LeaseState::classify`'s
+  untracked-own arm): the lease path is open, the claim has no TTL wait, the tenure's group tail is still required.
+  Test: `a_restarted_holder_re_adopts_its_own_unexpired_lease`; `a_holder_restarted_since_its_lease_holds_nothing` now
+  expects the lease path for the holder's own op.
+- **SHOULD-4a** (`gen_members`): a generation's group is its latest version: the delegate's current view while it is up and
+  knows the generation, else the current views of the nodes up that know it, else the last view that knew it; never the
+  union of every view of the run. The sim's views now carry `(gen, 0)` for a generation a root's table names without a
+  group, so an empty latest version is known. Test: `a_member_the_group_dropped_holds_no_tail_the_root_waits_for`.
+- **SHOULD-4b** (`claim_done`): the tenure group's tail is looked for over the whole stretch from the claim's start to the
+  run's end (a member reached for a round trip serves it, delaying the claim's end to then), not at two instants. Test:
+  `a_member_reached_after_the_claims_start_serves_the_tail`.
+
+**Measurement.** 2,000 seeds (0 to 1,999) of each of the ratchet's 32 configurations, without and with
+`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, every unsettled `EIO` classified by both the old and the new rules in the same
+run (a measurement-only patch, not committed). Plain configurations, not `+unsettled`, so that no seed's counts are lost
+to a failure. Only SHOULD-2 moved anything: 432 `EIO`s went from "no sequencer in time" to violation, none the other way,
+none in any other bucket; SHOULD-3, 4a and 4b changed no verdict in these sweeps. Moved (no knob / knob):
+`long-delegated-late-answers` 49/28, `long-delegated-backup` 45/71, `delegated-holder-cut` 31/96,
+`delegated-backup` 20/34, `delegated-no-backup-root-near` 18/20, `placement-hot` 11/9. All but one have the root in
+its takeover gate (waiting out the read-delegation quarantine) through the stretch (the exception, `delegated-holder-cut`
+with the knob seed 939, shows the root busy with a job only; not triaged: the replay does not take the knob): the gate
+recalls nothing
+(`start_recall`, ADR-42), so the recall starts only when the gate opens (seeds 7, 20 and 42 of
+`long-delegated-late-answers` replayed: the recalls go out at the gate's end, after the `EIO`). That is ADR-42's in-gate
+class (M1.3 with S4), a product cause the classifier used to hide as "none in time". Full table: `cls-notes.md` of the
+round (not in the repository).
+
+**Ratchet** (`m03_the_configurations_at_zero_violations_stay_there`, seeds 0 to 99, no knob): **fails on this branch** for
+one configuration: `long-delegated-late-answers` 11 violations, ceiling 8 (6 plus the margin); its allowed count fell
+from 5 to 0. Every other configuration stays within its ceilings (`delegated-holder-cut` at 14 of 14,
+`long-delegated-backup` 6 of 7, `delegated-backup` 3 of 3, `delegated-no-backup-root-near` and `placement-hot` 1 of 2).
+The ceilings are left as they were (no ceiling raised, none lowered: the round stopped at the excess); the maintainer
+decides between raising `long-delegated-late-answers`' ceiling and fixing the in-gate recall first.
+
+Found on the way, not changed: a run that ends with a root waiting for a group's tail (`waiting_for_group`, run.rs's
+early `return Ok(report)`) never counts its unsettled `EIO`s: `delegated-backup-and-delegate-die` classifies 497 in 2,000
+seeds (469 "generation tail unreachable", 28 violations) and reports 12, so its ratchet ceiling (0, 0) does not see them.
+`long-backup` with the knob fails seed 728 (not an unsettled `EIO`; identical before and after; not triaged).
+
+The same class fails one pinned seed: `s5_a_gated_root_serves_another_nodes_generation`'s `placement-hot` seed 2
+(`+unsettled`): node 4's op on keys across the root's and its own generation, root 2 gated over [10 441, 14 837] ms;
+before, "none in time". Left failing with the ratchet for the same decision.
+
+**Gates**: `cargo fmt --all --check` clean; clippy `-D warnings` on authority, all targets, clean; the `reach::` unit tests
+37 passed; the release sim suite 396 passed, 2 failed (the ratchet and the S5 pin above), 12 ignored.

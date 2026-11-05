@@ -2533,19 +2533,15 @@ impl Driver {
                 busy |= super::reach::BUSY_JOB;
             }
             // The groups of the generations this node knows: the backup of
-            // each it is the delegate of, and of each its root table names.
+            // each it is the delegate of, and of each its root table names
+            // (`(gen, 0)`: a generation the table names without a group, so
+            // that the group's latest version is known to be empty).
             let mut members: Vec<(u64, NodeId)> = view
                 .delegation
                 .backups
                 .iter()
                 .map(|b| (b.0, b.1))
-                .chain(
-                    view.delegation
-                        .kinds
-                        .iter()
-                        .filter(|k| k.2 != 0)
-                        .map(|k| (k.0, k.2)),
-                )
+                .chain(view.delegation.kinds.iter().map(|k| (k.0, k.2)))
                 .collect();
             members.sort_unstable();
             members.dedup();

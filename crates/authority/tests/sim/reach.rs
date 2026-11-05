@@ -28,7 +28,8 @@
 //!   same way;
 //! - *the requester itself*, when it is such a root or delegate;
 //! - *the lease path*: the requester's path to S3 is up and the lease is
-//!   acquirable (none was ever written, it was released, or it ran out).
+//!   acquirable (none was ever written, it was released, or it ran out), or
+//!   it is the requester's own, held when it restarted (re-adopted at once).
 //!
 //! Who owns the op's keys is decided at each instant of the window from the
 //! generation history (the lease holder's delegation table as it changed:
@@ -47,7 +48,10 @@
 //! core's configuration) the root is the op's sequencer, if it is reachable,
 //! can commit, and can reach a holder of the generation's tail (the delegate,
 //! or a member of its group). That the generation outlives the allowance is the
-//! product's lack of progress, never the requester's isolation.
+//! product's lack of progress, never the requester's isolation. Keys across
+//! generations whose grants live are recalled, not outwaited, while the root
+//! reaches their delegates: the allowance is then one recall round trip plus
+//! the recall's resend back-off (2 s) from the stretch in which it does.
 //!
 //! A sequencer counts only if it can commit: a root with S3 cut and no
 //! backup reachable cannot commit a refusal.
@@ -59,7 +63,7 @@
 //! handled after the TTL; that read's own transit, from the history, is part
 //! of the claim), asks its peers for the promise check, writes the CAS, and,
 //! for a lease with a group, fetches the group's tail from a running member it
-//! can reach. If that claim cannot finish inside the window
+//! can reach at any time up to the window's end. If that claim cannot finish inside the window
 //! by design and no root is in force, the requester had no sequencer *in time*.
 //!
 //! The allowed verdicts, each counted apart (`Report::unsettled_*`):
@@ -741,29 +745,139 @@ fn gen_end_due(g: &Inner, q: &Question, node: NodeId, gen: u64, at: u64, since: 
     inherited.max((born + g.horizon_ms).max(by_grant)) + g.recall_ms
 }
 
+/// The longest the root's recall resend waits (`on_deleg_recall_resend`,
+/// delegate.rs: the delay doubles from a request's timeout up to 2 s).
+const RECALL_RESEND_CAP_MS: u64 = 2_000;
+
 /// When the root is due to have recalled keys across generations: it ends
 /// every involved generation, so the last of their allowances. Each is
 /// anchored on its own grant's end, birth or tenure, never on the window or
 /// the stretch (a stretch's start only says since when the keys span them).
+///
+/// A generation whose grant lives and whose delegate the root reaches is not
+/// outwaited: the root recalls it, and the delegate answers within a round
+/// trip (L3 resends an unanswered recall, the delay doubling up to 2 s). So
+/// its allowance is at most one recall round trip plus that back-off past
+/// the start of the stretch (from `since` on) in which a root was in force,
+/// could commit, was reached by the requester and reached every such
+/// delegate (plan 46 M0.4 review, SHOULD-2). Only a delegate the root cannot
+/// reach is outwaited for its grant's whole window.
 fn blocked_due(g: &Inner, q: &Question, gens: &[(NodeId, u64)], at: u64, since: u64) -> u64 {
-    gens.iter()
-        .map(|(node, gen)| gen_end_due(g, q, *node, *gen, at, since))
+    let outwait = |node: NodeId, gen: u64| gen_end_due(g, q, node, gen, at, since);
+    let plain = gens
+        .iter()
+        .map(|(node, gen)| outwait(*node, *gen))
         .max()
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let live: Vec<(NodeId, u64)> = gens
+        .iter()
+        .copied()
+        .filter(|(node, gen)| delegate_in_force(g, at, *node, *gen))
+        .collect();
+    if live.is_empty() {
+        return plain;
+    }
+    let me = q.requester;
+    let capped = g
+        .views
+        .keys()
+        .copied()
+        .filter(|r| root_in_force(g, at, *r))
+        .filter_map(|r| {
+            let recalls = |t: u64| {
+                root_in_force(g, t, r)
+                    && can_commit(g, t, r)
+                    && peer_up(g, t, me, r)
+                    && live.iter().all(|(node, _)| peer_up(g, t, r, *node))
+            };
+            let anchor = stable_since(g, since, at, recalls)?;
+            let recalled = anchor + g.recall_ms + RECALL_RESEND_CAP_MS;
+            gens.iter()
+                .map(|(node, gen)| {
+                    let due = outwait(*node, *gen);
+                    if live.contains(&(*node, *gen)) {
+                        due.min(recalled)
+                    } else {
+                        due
+                    }
+                })
+                .max()
+        })
+        .min();
+    capped.map_or(plain, |c| c.min(plain))
 }
 
-/// The members of generation `gen`'s group, as the nodes published them by
-/// `at`.
-fn gen_members(g: &Inner, at: u64, gen: u64) -> Vec<NodeId> {
-    let mut out: Vec<NodeId> = g
-        .views
-        .values()
-        .flatten()
-        .filter(|v| v.at <= at)
-        .flat_map(|v| v.members.iter())
-        .filter(|(gn, _)| *gn == gen)
-        .map(|(_, m)| *m)
-        .collect();
+/// Every instant in `(from, to]` at which the network, a node's liveness,
+/// S3 path, view or the lease changed.
+fn change_marks(g: &Inner, from: u64, to: u64) -> Vec<u64> {
+    let inside = |t: &u64| *t > from && *t <= to;
+    let mut marks: Vec<u64> = g.links.iter().map(|e| e.0).filter(inside).collect();
+    marks.extend(g.alive.iter().map(|e| e.0).filter(inside));
+    marks.extend(g.s3.iter().map(|e| e.0).filter(inside));
+    marks.extend(g.views.values().flatten().map(|v| v.at).filter(inside));
+    marks.extend(g.leases.iter().map(|l| l.at_ms).filter(inside));
+    for (_, a, b) in &g.stopped {
+        marks.extend([*a, *b].into_iter().filter(inside));
+    }
+    marks.sort_unstable();
+    marks.dedup();
+    marks
+}
+
+/// When the stretch ending at `at` in which `holds` held began, no earlier
+/// than `floor`; `None` when it does not hold at `at`.
+fn stable_since(g: &Inner, floor: u64, at: u64, holds: impl Fn(u64) -> bool) -> Option<u64> {
+    if !holds(at) {
+        return None;
+    }
+    for t in change_marks(g, floor, at).into_iter().rev() {
+        if !holds(t - 1) {
+            return Some(t);
+        }
+    }
+    Some(floor)
+}
+
+/// The members of generation `gen`'s group (delegate `node`) as of `at`: the
+/// latest version the views carry, never a union over the run (plan 46 M0.4
+/// review, SHOULD-4a: a member a later version dropped holds no tail the
+/// root waits for). The delegate's current view, when it still knows the
+/// generation and is up, is the latest version (it sets the group);
+/// otherwise the current views of the nodes up that know it (a root's
+/// table); otherwise the last view that knew it. A view knows a generation it has a grant of or
+/// names in its members (`(gen, 0)`: known, no group).
+fn gen_members(g: &Inner, at: u64, node: NodeId, gen: u64) -> Vec<NodeId> {
+    let knows = |v: &View| {
+        v.grants.iter().any(|(gn, _)| *gn == gen) || v.members.iter().any(|(gn, _)| *gn == gen)
+    };
+    let of = |v: &View| -> Vec<NodeId> {
+        v.members
+            .iter()
+            .filter(|(gn, m)| *gn == gen && *m != 0)
+            .map(|(_, m)| *m)
+            .collect()
+    };
+    let current = |n: NodeId| view_at(g, at, n).filter(|v| attached(g, at, n) && knows(v));
+    let mut out: Vec<NodeId> = if let Some(v) = current(node) {
+        of(v)
+    } else {
+        let current: Vec<&View> = g
+            .views
+            .keys()
+            .filter_map(|n| current(*n))
+            .filter(|v| knows(v))
+            .collect();
+        if !current.is_empty() {
+            current.into_iter().flat_map(of).collect()
+        } else {
+            g.views
+                .values()
+                .flatten()
+                .filter(|v| v.at <= at && knows(v))
+                .max_by_key(|v| v.at)
+                .map_or_else(Vec::new, of)
+        }
+    };
     out.sort_unstable();
     out.dedup();
     out
@@ -773,7 +887,7 @@ fn gen_members(g: &Inner, at: u64, gen: u64) -> Vec<NodeId> {
 /// delegate, or a member of its group. A generation without a group has no
 /// tail elsewhere: the root ends it without one, so nothing can be missing.
 fn tail_reachable(g: &Inner, at: u64, r: NodeId, node: NodeId, gen: u64) -> bool {
-    let members = gen_members(g, at, gen);
+    let members = gen_members(g, at, node, gen);
     members.is_empty()
         || [node]
             .into_iter()
@@ -839,7 +953,7 @@ fn root_path(g: &Inner, me: NodeId, at: u64, gens: &[(NodeId, u64)]) -> Seg {
             if !tail_reachable(g, at, r, *node, *gen) {
                 return Seg::TailUnreachable(format!(
                     "root {r} reaches no holder of generation {gen}'s tail (delegate {node}, members {:?})",
-                    gen_members(g, at, *gen)
+                    gen_members(g, at, *node, *gen)
                 ));
             }
         }
@@ -873,7 +987,7 @@ fn root_path(g: &Inner, me: NodeId, at: u64, gens: &[(NodeId, u64)]) -> Seg {
         None => true,
         Some(l) => {
             let grace = claim_grace_for(g, &l, me);
-            l.holder == 0 || l.released || l.ends_ms + grace <= at
+            l.holder == 0 || l.released || l.ends_ms + grace <= at || readopts_own(g, at, me, &l)
         }
     };
     if acquirable && s3_up(g, at, me) {
@@ -881,6 +995,28 @@ fn root_path(g: &Inner, me: NodeId, at: u64, gens: &[(NodeId, u64)]) -> Seg {
     } else {
         Seg::Nothing
     }
+}
+
+/// Whether `me` re-adopts its own unexpired lease `l` at once at `at`: the
+/// body names it, it restarted since the body landed, and the process that
+/// went down still held the lease (neither deposed nor sealed: a sealed epoch
+/// is persisted and never revived). The product claims its own untracked
+/// lease without the TTL wait (`LeaseState::classify`, lease.rs: "our own
+/// lease that we do not track: a restart"), gated like a takeover (plan 46
+/// M0.4 review, SHOULD-3).
+fn readopts_own(g: &Inner, at: u64, me: NodeId, l: &LeaseSpan) -> bool {
+    if l.holder != me || l.released {
+        return false;
+    }
+    let attach = attach_since(g, at, me);
+    attach > l.at_ms
+        && g.views
+            .get(&me)
+            .into_iter()
+            .flatten()
+            .rev()
+            .find(|v| v.at < attach)
+            .is_some_and(|v| v.held == Held::Lease && v.busy & BUSY_LOST == 0)
 }
 
 /// How long past its end `l` is not `me`'s to claim: the backups' claim grace
@@ -1057,6 +1193,10 @@ fn claim_done(
     let ready = match &lease {
         None => run_from + g.min_s3_ms,
         Some(l) if l.holder == 0 || l.released => since_of(l.at_ms).max(run_from),
+        // Its own lease, re-adopted on the first read of its new process.
+        Some(l) if readopts_own(g, run_from, me, l) => {
+            since_of(l.at_ms.max(attach_since(g, run_from, me))).max(run_from)
+        }
         Some(l) => since_of(l.at_ms) + g.lease_ttl_ms + claim_grace_for(g, l, me),
     };
     // A claim by TTL starts with a fresh read: the product claims by TTL only
@@ -1122,11 +1262,44 @@ fn claim_done(
                     && (*m == me || (running(g, at, *m) && peer_up(g, at, me, *m)))
             })
         };
-        if !members.is_empty() && !reachable(done.saturating_sub(1)) && !reachable(start) {
-            return Err(format!(
-                "no member of the tenure's group {members:?} had been running since the tenure began and was \
-                 reachable for its tail when the claim was due ({done} ms)"
-            ));
+        if !members.is_empty() {
+            // Any stretch from the claim's start to the window's end in which
+            // a member answers for a round trip serves the tail, not only the
+            // claim's start and end (plan 46 M0.4 review, SHOULD-4b); a
+            // member first reached after the claim was otherwise done
+            // delays it by that round trip.
+            let rtt = 2 * g.p2p_hi_ms;
+            let mut points = vec![start];
+            points.extend(change_marks(g, start, until));
+            let mut fetched: Option<u64> = None;
+            let mut run: Option<u64> = None;
+            for (i, t) in points.iter().copied().enumerate() {
+                if !reachable(t) {
+                    run = None;
+                    continue;
+                }
+                let begun = *run.get_or_insert(t);
+                if begun < done {
+                    // (Reached while the claim runs: fetched alongside it.)
+                    fetched = Some(done);
+                    break;
+                }
+                let end = points.get(i + 1).copied().unwrap_or(until);
+                if end >= begun + rtt {
+                    fetched = Some(begun + rtt);
+                    break;
+                }
+            }
+            match fetched {
+                Some(d) if d <= until => return Ok(d),
+                _ => {
+                    return Err(format!(
+                        "no member of the tenure's group {members:?} had been running since the tenure began and \
+                         was reachable for its tail between the claim's start ({start} ms) and the window's end \
+                         ({until} ms)"
+                    ))
+                }
+            }
         }
     }
     Ok(done)
@@ -1283,7 +1456,7 @@ fn dead_holders_lease(g: &Inner, q: &Question) -> Option<String> {
         }
     }
     let l = lease_at(g, at).filter(|l| l.holder != 0 && !l.released)?;
-    if attached(g, at, l.holder) && root_in_force(g, at, l.holder) {
+    if attached(g, at, l.holder) && root_in_force(g, at, l.holder) || readopts_own(g, at, me, &l) {
         return None;
     }
     Some(format!(
@@ -1864,13 +2037,25 @@ mod tests {
             panic!("{v:?}")
         };
         assert!(why.contains("node 1, which holds nothing"), "{why}");
-        // The restarted node, asked for its own op, is no sequencer either.
+        // The restarted node, asked for its own op, re-adopts its own lease at
+        // once (SHOULD-3): a lease read from the window's start, the promise
+        // check and the CAS, done by 4 180.
         let v = r.classify(q(1));
-        assert!(v.no_sequencer_in_time(), "{v:?}");
+        assert!(
+            matches!(
+                v,
+                Verdict::Reachable {
+                    via: Via::LeasePath,
+                    to_ms: 4_180,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
         // Once it holds a lease again (a new body, a new view), it is.
         r.lease_landed_at(5_000, 1, 11_000, false);
         r.note_view_at(5_000, 1, Held::Lease, vec![], vec![], 0);
-        let v = r.classify(q(1));
+        let v = r.classify(Question::new(1, 5_000, 7_000));
         assert!(
             matches!(
                 v,
@@ -2786,5 +2971,176 @@ mod tests {
         kept.attached_at(3_600, 2, false);
         kept.attached_at(3_700, 2, true);
         assert!(kept.classify(q(3)).no_sequencer_in_time());
+    }
+
+    /// Plan 46 M0.4 review, SHOULD-2: keys across live generations whose
+    /// delegates the root reaches are recalled within a round trip and the
+    /// resend back-off, not outwaited for the grants' windows.
+    #[test]
+    fn keys_across_live_generations_the_root_reaches_are_due_after_one_recall() {
+        let live = || {
+            let r = world();
+            r.attached_at(0, 4, true);
+            r.lease_landed_at(3_500, 1, 9_000, false);
+            r.note_view_at(1_000, 2, Held::No, vec![(7, 9_000)], vec![], 0);
+            r.note_view_at(1_000, 4, Held::No, vec![(8, 9_000)], vec![], 0);
+            r
+        };
+        // Both grants live past the window (their windows end at 9 310), the
+        // root reaches both delegates and the requester reaches the root: the
+        // recall is due at 4 000 + 100 + 2 000 = 6 100, and the root is the
+        // sequencer from then on (a violation; it was "none in time").
+        let v = live().classify(blocked());
+        assert!(
+            matches!(
+                v,
+                Verdict::Reachable {
+                    via: Via::Root(1),
+                    from_ms: 6_100,
+                    to_ms: 7_000,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+        // A delegate the root cannot reach is outwaited for its window: none
+        // in time, allowed.
+        let r = live();
+        r.partition_at(3_100, 1, 4, true);
+        let v = r.classify(blocked());
+        assert!(v.no_sequencer_in_time(), "{v:?}");
+        // Reached again from 5 000: the recall is due at 7 100, after the
+        // window.
+        r.partition_at(5_000, 1, 4, false);
+        let v = r.classify(blocked());
+        assert!(v.no_sequencer_in_time(), "{v:?}");
+        // A requester cut from the root is isolated, as before.
+        let r = live();
+        r.partition_at(3_100, 3, 1, true);
+        let v = r.classify(blocked());
+        assert!(v.isolated(), "{v:?}");
+    }
+
+    /// Plan 46 M0.4 review, SHOULD-3: a holder restarted inside its lease
+    /// re-adopts it at once; one that was deposed before it went down, or
+    /// that cannot reach S3, does not.
+    #[test]
+    fn a_restarted_holder_re_adopts_its_own_unexpired_lease() {
+        let restarted = |busy: u8| {
+            let r = Reach::default();
+            r.configure(cfg(0, 0));
+            for n in 1..=3 {
+                r.attached_at(0, n, true);
+            }
+            r.lease_landed_at(2_900, 1, 8_000, false);
+            r.note_view_at(0, 1, Held::Lease, vec![], vec![], busy);
+            r.attached_at(3_000, 1, false);
+            r.attached_at(3_100, 1, true);
+            r
+        };
+        // Its own op: the lease path, at once (it was "none in time": the
+        // body ran to 8 000).
+        let v = restarted(0).classify(q(1));
+        assert!(
+            matches!(
+                v,
+                Verdict::Reachable {
+                    via: Via::LeasePath,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+        // Another node still waits for the body to run out.
+        assert!(restarted(0).classify(q(3)).no_sequencer_in_time());
+        // Deposed before it went down: no re-adoption.
+        let v = restarted(BUSY_LOST).classify(q(1));
+        assert!(v.no_sequencer_in_time(), "{v:?}");
+        // Cut from S3 and from every node: isolated.
+        let r = restarted(0);
+        r.s3_cut_at(3_100, 1, true);
+        r.partition_at(3_100, 1, 2, true);
+        r.partition_at(3_100, 1, 3, true);
+        let v = r.classify(q(1));
+        assert!(v.isolated(), "{v:?}");
+    }
+
+    /// Plan 46 M0.4 review, SHOULD-4a: a generation's group is its latest
+    /// version, not every member any view ever named.
+    #[test]
+    fn a_member_the_group_dropped_holds_no_tail_the_root_waits_for() {
+        let r = world();
+        r.attached_at(0, 5, true);
+        r.lease_landed_at(3_500, 1, 9_000, false);
+        r.note_view_at(1_000, 2, Held::No, vec![(7, 3_000)], vec![(7, 5)], 0);
+        // The delegate dropped its backup.
+        r.note_view_at(2_000, 2, Held::No, vec![(7, 3_000)], vec![], 0);
+        r.attached_at(3_100, 5, false);
+        r.partition_at(3_100, 1, 2, true);
+        // The grant ended at 3 000 (due at 3 310): the root ends the
+        // generation without a tail (it was "generation tail unreachable").
+        let v = r.classify(q(3).delegated(2, 7));
+        assert!(
+            matches!(
+                v,
+                Verdict::Reachable {
+                    via: Via::Root(1),
+                    from_ms: 4_000,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+        // The latest version still names node 5 (down): the tail is
+        // unreachable, allowed.
+        r.note_view_at(2_500, 2, Held::No, vec![(7, 3_000)], vec![(7, 5)], 0);
+        let v = r.classify(q(3).delegated(2, 7));
+        assert!(v.generation_tail_unreachable(), "{v:?}");
+        // A root table that names the generation without a group is a
+        // version too, when the delegate is gone.
+        let r = world();
+        r.attached_at(0, 5, true);
+        r.lease_landed_at(3_500, 1, 9_000, false);
+        r.note_view_at(1_000, 2, Held::No, vec![(7, 3_000)], vec![(7, 5)], 0);
+        r.note_view_at(1_000, 1, Held::Lease, vec![], vec![(7, 5)], 0);
+        r.note_view_at(2_000, 1, Held::Lease, vec![], vec![(7, 0)], 0);
+        r.attached_at(3_100, 2, false);
+        r.attached_at(3_100, 5, false);
+        let v = r.classify(q(3).delegated(2, 7));
+        assert!(matches!(v, Verdict::Reachable { .. }), "{v:?}");
+    }
+
+    /// Plan 46 M0.4 review, SHOULD-4b: a member reached between the claim's
+    /// start and the window's end serves the group's tail.
+    #[test]
+    fn a_member_reached_after_the_claims_start_serves_the_tail() {
+        let r = world();
+        r.lease_landed_with(2_500, 1, 3_500, false, vec![2]);
+        r.attached_at(3_000, 1, false);
+        r.partition_at(3_000, 3, 2, true);
+        // Cut for the whole window: none in time.
+        assert!(r.classify(q(3)).no_sequencer_in_time());
+        // Healed at 5 500, after the claim's start (5 080) and its end
+        // (5 180): the tail is fetched by 5 520 (it was "none in time").
+        r.partition_at(5_500, 3, 2, false);
+        let v = r.classify(q(3));
+        assert!(
+            matches!(
+                v,
+                Verdict::Reachable {
+                    via: Via::LeasePath,
+                    to_ms: 5_520,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+        // Healed too late for a round trip inside the window: none in time.
+        let r = world();
+        r.lease_landed_with(2_500, 1, 3_500, false, vec![2]);
+        r.attached_at(3_000, 1, false);
+        r.partition_at(3_000, 3, 2, true);
+        r.partition_at(6_990, 3, 2, false);
+        assert!(r.classify(q(3)).no_sequencer_in_time());
     }
 }
