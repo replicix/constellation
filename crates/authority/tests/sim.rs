@@ -8872,6 +8872,24 @@ fn regression_a_deposed_roots_append_does_not_reship_a_landed_rid_seed_2560() {
     });
 }
 
+/// The same class in `strict-isolated-reader-long` (30 s read delegations,
+/// the reader isolated for 40 s): 12 of 2 000 seeds from 300000 failed
+/// close-to-open before `ReadDelegations::reset_for_restart`, each with the
+/// mix rebooting node 3 with a backward wall step (-6.5 to -8.4 s in these
+/// three); 0 of 2 000 after.
+#[test]
+fn regression_a_restart_keeps_no_long_read_delegation_seeds_300116_and_more() {
+    let failures: Vec<String> = [300116u64, 300339, 300512]
+        .into_iter()
+        .filter_map(|seed| {
+            run_seed(seed, strict_isolated_reader_long_config())
+                .err()
+                .map(|e| format!("strict-isolated-reader-long seed {seed}: {e}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 const CAUSAL_CUT_SEEDS: u64 = 40;
 
 /// Oracle false positive, pinned: seed 1525 of `delegated-group-switch` with
