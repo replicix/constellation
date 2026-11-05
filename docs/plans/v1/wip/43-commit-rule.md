@@ -15,6 +15,19 @@
 > re-measured after stage 1), C2h's strict flags on flex configurations
 > (plan 46 M1.4). The body below is unchanged; where it and plan 46
 > differ, plan 46 decides.
+>
+> **Status (2026-11-05, maintainer decisions D-4, D-5).** *D-4:* plan 43
+> closes into plan 46: C4, C7b-8 and the superseded items (C3 as specified,
+> C5, C6, the G1 p90 nudge, C2h's flex strict flags) are owned by plan 46
+> (stage 3 for C4 and C7b-8). *D-5:* the C0/C2 four-file-system baselines are
+> not run retroactively; they fold into plan 46's G1–G6 four-file-system
+> re-measure. C2g, C2g′ and C2h's scenarios landed (plan 46 M0.1–M0.3; the
+> gate-before-M1 fixes landed and the remaining I4 ceilings are carried to
+> stage 1, see its "As landed 2026-11-04/05"). **What still blocks moving
+> this plan to `done/`:** plan 46 M0.4 (the whole-C2 fable review and its
+> required changes); then the box ticks with evidence (interim Q7 fixes,
+> G1–G6 acceptance, C0/C1/C7a, the §6 documents), the README row, links and
+> a PROGRESS note.
 
 Read `docs/plans/v1/CONVENTIONS.md` first. This plan implements the
 recommendation of the arbiter study (`docs/explanation/ARBITER-STUDY.md`
@@ -4438,6 +4451,10 @@ Superseded by [plan 46](46-committed-or-final.md) — C3 as specified
 (folded into M1.2), C5, C6, the G1 p90 nudge, C2h's flex strict flags.
 The boxes below for the superseded items stay unticked and are closed by
 plan 46's exit criteria.
+*Closure (2026-11-05):* D-4 closes C3, C4, C5, C6 and C7b item 8 by plan
+46 (**closed by plan 46 (D-4)**); D-5 folds the C0 and C2 file-system
+baselines into plan 46's G1–G6 re-measure (**closed by plan 46 (D-5)**).
+No box is ticked here without evidence; the rest wait for M0.4.
 
 - [ ] Interim work landed or explicitly deferred by the maintainer (Q7):
       the F2 fix, the takeover-loss fix, the 9287 and 2945 fixes, C7-H2,
@@ -4450,7 +4467,8 @@ plan 46's exit criteria.
       `waiting_for_group` classification; the model properties and
       counterexamples; Q3's property checked; the baseline counts per
       config (including `backup-two`); the performance baselines on four
-      file systems.
+      file systems *(the baselines: closed by plan 46 (D-5), folded into
+      its G1–G6 re-measure)*.
 - [ ] C1: committed rows never re-executed after a deposition or a seal;
       the tail fetch on the TTL path; strict durability fails on non-lone
       rollbacks and passes on every backup config; Q1's rule in place.
@@ -4467,20 +4485,20 @@ plan 46's exit criteria.
       `abandon-group --gen`; and the lone root answering other nodes from the
       archive, `Ungated` only where lone); *C2g landed* (PROGRESS, "Plan 43
       C2g": the settle before `EIO`); C2h open.
-- [ ] C3: I2c (verbatim) strict on every config; the delegate-turned-root
+- [ ] *(closed by plan 46 (D-4): M1.2)* C3: I2c (verbatim) strict on every config; the delegate-turned-root
       rule (move, apply verbatim, re-append deduped by origin, end);
       the fold, `Records` copies, holed generations and the deposed-root
       rebuild-replay gone (each deleted function listed with the test
       that pinned it).
-- [ ] C4: no lock or delegation state in any message; reclaims and mode
+- [ ] *(closed by plan 46 (D-4): stage 3)* C4: no lock or delegation state in any message; reclaims and mode
       upgrades journal `LockGrant`; I3 strict on every lock config;
       `long_locks` ×1000 clean; the lock model's `lock_state_in_log`
       clean, its counterexamples violating.
-- [ ] C5: I5 strict on every config; the lone branch is the only replay
+- [ ] *(closed by plan 46 (D-4): stage 2)* C5: I5 strict on every config; the lone branch is the only replay
       producer; the docs' offline-first contract; the full CONVENTIONS
       gates (pjdfstest 8798/8798).
-- [ ] C6: the add-window rule with its fail-before; measured; the maintainer's default recorded.
-- [x] C7a (2026-10-21, six commits). [ ] C7b: every exit item of §7 C7.
+- [ ] *(closed by plan 46 (D-4): superseded)* C6: the add-window rule with its fail-before; measured; the maintainer's default recorded.
+- [x] C7a (2026-10-21, six commits). [ ] C7b: every exit item of §7 C7 *(item 8 closed by plan 46 (D-4): stage 3)*.
 - [ ] §9's gates met at every milestone, on the four file systems where
       §9 says so; `bench/commit-rule/RESULTS.md` complete.
 - [ ] Every §6 document change made in its milestone; ADR-33 and the

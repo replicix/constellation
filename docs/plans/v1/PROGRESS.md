@@ -66323,3 +66323,24 @@ no failure at that rate, so it is evidence, not proof). The maintainer decides w
   unexecuted when the window ran out): `long-strict` 169 to 209 of 300 seeds, `backup-strict+unsettled` 820 to 890 of
   1 000; unsettled `EIO` unchanged (0; `long-strict` 2 and 2). This is the simulation's deadline ratio (12 s deadline,
   5 s grant TTL); at the defaults (120 s) a 5.5 s park does not reach the settle window.
+
+## Plan status, 2026-11-05
+
+Maintainer decisions of 2026-11-04/05 and what remains per plan (evidence: the sections above; closure map of 2026-11-04).
+
+- **D-1** plan 46's stage-0 exit "I4 strict everywhere" is amended to "the gate-before-M1 fixes landed; the remaining I4 ceilings carried
+  to named stage-1 milestones": S4 and the in-gate class and cause-6 buckets A, C, O to M1.3, the flex strict flags to M1.4 (D9).
+- **D-2** cause 6 re-traced and classified ("Cause 6 re-traced"); G and B fixed ("G and B"); C, A, O carried.
+- **D-3** S4 (`DelegCut`) deferred to M1.3. The follow-up S1 (the root's local ops recall before they execute) is kept on branch
+  `rbe2`, not landed, and goes to plan 46 stage 1; the strict-read fix is option (c) ("Forwarded ops recall read delegations").
+- **D-4** plan 43 closes into plan 46 (C4, C7b-8 and the superseded items are plan 46 stage 3's). **D-5** plan 43's C0/C2
+  four-file-system baselines fold into plan 46's G1–G6 re-measure.
+- **D-6** plan 40 R8 accepts the 22–30 min xcheckfs runs of 2026-10-24. **D-7** plan 41 seed 300 is a known gap (follow-up "proof from
+  backup beats"). **D-8** plan 41 L5/L6 move to plan 46 stage 3.
+
+| Plan | Remains |
+|---|---|
+| 40 | The §8 acceptance on every host file system and kernel (R8's benchmark items); the other R8 boxes. |
+| 41 | xcheckfs with no lock-lapse findings, a clean `long_locks`, the maintainer's acceptance of the §9 tables (`bench/lock-lane/RESULTS.md`); the item-4 scenario and L5/L6 are plan 46's. |
+| 43 | Plan 46 M0.4, then the evidence ticks, the README row, `git mv` to `done/`. |
+| 46 | Stage 0: M0.4 (whole-C2 fable review). Stage 1 carries S4, S1, the in-gate class, buckets A, C, O (M1.3), the flex strict flags (M1.4), L2b and the C3 rule (M1.2). |

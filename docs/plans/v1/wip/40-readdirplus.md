@@ -1408,8 +1408,9 @@ Open, decided by measurement or later:
       about 26 min each, 46.6 M and 43.3 M operations) is also clean; its
       `READDIRPLUS` pages were 1.7 M and 1.3 M. Together with P9's first `auto` run, no xcheckfs
       run found anything from this plan; the runs were 22 to 30 minutes, not
-      the plan's hour, so the box stays unticked until a full-length repeat
-      or the maintainer accepts these. The two-node runs show a
+      the plan's hour; **the maintainer accepts these runs (D-6, 2026-11-04)**
+      instead of a full-length repeat; the box stays unticked until the
+      other R8 items close. The two-node runs show a
       problem that is not a finding of xcheckfs and is present with `off`
       too, so not from this plan: the second node's replica lags the first
       node's log by tens of thousands of entries under the 100,000-entry

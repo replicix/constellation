@@ -1321,6 +1321,15 @@ Overhead (no regression; ≤ 3 % or ≤ 1 IQR, whichever is larger):
 If 1–4 or the real-device acceptance fail, the plan is not done: report
 the numbers and hypotheses; do not loosen the bar.
 
+*Results (2026-11, quiet timing box; `bench/lock-lane/RESULTS.md`, "Plan 41
+section 9 acceptance"):* [item 1](../../../../bench/lock-lane/RESULTS.md#item-1-lone-node-own-grants-lock-stall-lone-node-5-runs-per-cell)
+(lane on: zero lapses and zero `EIO` in all 140 runs, four file systems),
+[item 2](../../../../bench/lock-lane/RESULTS.md#item-2-holder-at-a-healthy-owner-lock-store-stall-holder-3-runs-per-cell),
+[item 4](../../../../bench/lock-lane/RESULTS.md#item-4-not-run) (no scenario; L6 is plan 46's, D-8) and the
+[real-device reproduction](../../../../bench/lock-lane/RESULTS.md#real-device-reproduction-lock-device-stall-lone-node-10-runs-per-file-system)
+(PROGRESS, "Plan 41 acceptance runs"). The L8 and exit boxes stay unticked
+until the maintainer accepts them against these tables.
+
 ## 10. Risks
 
 - **Two writers of grant windows.** A missed read-decide-write in the
@@ -1446,6 +1455,8 @@ durability regression. Vendored fjall change number 10 stays unused.
       baselines recorded before L3.
 - [ ] L5/L6 only if chosen (§11): peers' answers with the in-`lock_answer`
       held set and the opt-in lead; the probe at ≤ 1 per round.
+      **Moved to plan 46 stage 3 (D-8, 2026-11-05).** Item 4 of §9 has no
+      scenario (L6).
       (D3, the probe, landed without L5 and without L6's routing to a
       successor; peers' answers at a stalled owner remain open.)
 - [x] D3: the root-side lanes' read of the lease object (`root_probe.rs`):
@@ -1453,6 +1464,10 @@ durability regression. Vendored fjall change number 10 stays unused.
       `locks-core-stall-backup-long-beats-unprobed`), the negative controls
       (`locks-core-stall-backup-long-blind`), unit
       tests, the harness's backed root-stalled arm without the known gap.
+      **Known gap (D-7, 2026-11-05):** seed 300 (`delegated-core-stall-root-backup`
+      with the lease-reads knob; it fails on main too: the lease `GET` is slower
+      than the takeover window) is accepted as a known gap for this plan's
+      closure; follow-up: "proof from backup beats".
 - [ ] L7: status/metrics/schema, configuration, cluster-locks,
       durability-and-failover, host guidance, TESTING docs, ADR-25
       amended, the proposed DESIGN text recorded.
