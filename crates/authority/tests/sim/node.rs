@@ -205,6 +205,9 @@ pub struct Shared {
     pub queued_seen: Mutex<BTreeSet<(Rid, u64)>>,
     /// `Stats::ungated_shadows` of this node's earlier incarnations.
     pub ungated_shadows_before: AtomicU64,
+    /// `Meta::unjustified_ships` of this node's earlier incarnations (a meta
+    /// that did not survive the restart; plan 46 M0.4).
+    pub unjustified_ships_before: AtomicU64,
     /// The rids whose `Refused` rows this node's unshipped journal held
     /// after its last event. A rollback drops a stranded refusal (its
     /// `completed` row goes with it; it is never replayed), so one that
@@ -560,6 +563,7 @@ impl NodeHandle {
             rolled_back_at: Mutex::new(BTreeMap::new()),
             queued_seen: Mutex::new(BTreeSet::new()),
             ungated_shadows_before: AtomicU64::new(0),
+            unjustified_ships_before: AtomicU64::new(0),
             journaled_refusals: Mutex::new(BTreeSet::new()),
             commits: env.commits.clone(),
             epoch: Mutex::new(epoch),

@@ -2334,6 +2334,11 @@ pub struct AckStatus {
     /// C2).
     #[serde(default)]
     pub ungated_unexpected: u64,
+    /// Journal rows about to ship whose origin is a delegate row this node
+    /// assigned under a generation the table does not list and that has no
+    /// void cut: the log never granted it (plan 46 M0.4; must stay 0).
+    #[serde(default)]
+    pub unjustified_ships: u64,
     /// Client mutations answered `EIO` as settled: refused for good by the
     /// sequencer in force at their deadline, never executed (plan 43 C2).
     #[serde(default)]

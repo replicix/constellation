@@ -864,6 +864,74 @@ impl Meta {
         Ok(own)
     }
 
+    /// Plan 46 M0.4: the shipper's guard. A journal row of origin `(gen, idx)`
+    /// that this node assigned (`idx` at most what it assigned under `gen`),
+    /// whose generation the table does not list and that has no void cut,
+    /// would reach the log under a generation the log never granted (an
+    /// unstranded row of a grant the takeover took out). Every claim with a
+    /// takeover strands such rows; this counts a path that missed one
+    /// ([`Meta::unjustified_ships`], `status.ack.unjustified_ships`; the
+    /// simulation fails a run that moved it) and trips a debug assertion. It
+    /// refuses nothing: a root's append of another delegate's rows (no index
+    /// assigned here) and rows after the node's own recall (a void cut) are
+    /// not caught, and a missed path must not block the journal head.
+    pub(crate) fn check_shippable_origins(
+        &self,
+        batch: &[(u64, LogRecord)],
+    ) -> Result<(), MetaError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let r = self.db.read_tx();
+        // (One seek when no delegate row is journaled: the common case.)
+        if r.is_empty(&self.journal_origin)? {
+            return Ok(());
+        }
+        drop(r);
+        let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+        let mut origins = self.journal_origins(&seqs)?;
+        origins.retain(|(g, _)| *g != 0);
+        origins.sort_unstable();
+        origins.dedup();
+        if origins.is_empty() {
+            return Ok(());
+        }
+        let r = self.db.read_tx();
+        let listed: std::collections::BTreeSet<u64> = crate::delegation::read_table_tx(&r, self)?
+            .iter()
+            .map(|d| d.gen)
+            .collect();
+        for (gen, idx) in origins {
+            if listed.contains(&gen) {
+                continue;
+            }
+            let assigned = kv_get_tx(&r, &self.local, &deleg_idx_key(gen))?
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            if assigned < idx || kv_get_tx(&r, &self.local, &deleg_void_cut_key(gen))?.is_some() {
+                continue;
+            }
+            self.ship_unjustified
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                gen,
+                idx,
+                "about to ship a delegate row of a generation the table does not list and that                  has no void cut: the log never granted it (a takeover missed its strand)"
+            );
+            debug_assert!(
+                false,
+                "shipping own delegate row ({gen}, {idx}) of an unlisted generation without a void cut"
+            );
+        }
+        Ok(())
+    }
+
+    /// Ships counted by [`Self::check_shippable_origins`] (must stay 0).
+    pub fn unjustified_ships(&self) -> u64 {
+        self.ship_unjustified
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The highest stream index this node assigned under `gen` (0: none).
     pub fn delegate_idx(&self, gen: u64) -> Result<u64, MetaError> {
         let r = self.db.read_tx();

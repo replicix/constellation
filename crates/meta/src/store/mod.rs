@@ -684,6 +684,10 @@ pub struct Meta {
     pub(crate) held_copies: std::sync::Mutex<Vec<member::HeldCopy>>,
     /// `held_copies` is not empty (one atomic load per read when it is).
     pub(crate) any_held_copy: std::sync::atomic::AtomicBool,
+    /// Plan 46 M0.4: ships of a `Local` row whose index this node assigned
+    /// under a generation the table does not list and that has no void cut
+    /// (`Meta::note_unjustified_ship`). Must stay 0.
+    pub(crate) ship_unjustified: AtomicU64,
     /// How many times a ship plan, a retirement or an ack took a held-set
     /// path (plan 30 §M4 round 2). Only ever moves while something is
     /// poisoned or held; the cost tests in `store::local` pin that it stays
@@ -1248,6 +1252,7 @@ impl Meta {
             any_member_copy: std::sync::atomic::AtomicBool::new(false),
             held_copies: std::sync::Mutex::new(Vec::new()),
             any_held_copy: std::sync::atomic::AtomicBool::new(false),
+            ship_unjustified: AtomicU64::new(0),
             held_work: AtomicU64::new(0),
             blame_cache: Default::default(),
             session: crate::session::SessionState::default(),

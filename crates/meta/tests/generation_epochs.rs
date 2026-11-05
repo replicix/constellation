@@ -1236,6 +1236,34 @@ fn a_claimant_without_a_tail_ships_none_of_its_rows_of_a_generation_the_log_neve
         .is_empty());
 }
 
+/// The shipper's guard (plan 46 M0.4): a delegate's own row of a generation
+/// the table does not list and that has no void cut is counted when the
+/// journal head is about to ship it (and trips a debug assertion); after the
+/// claim's strand took it out, nothing is counted.
+#[test]
+fn the_shipper_counts_an_own_row_of_an_unlisted_generation_without_a_void_cut() {
+    let g = gen(1, 1);
+    let meta = delegate_of_a_streamed_grant(g, false);
+    meta.apply_segment_rows(1, 2, 0, &[], &[], &[no_tail(1, 5)], &TouchSet::default())
+        .unwrap();
+    assert_eq!(meta.unjustified_ships(), 0);
+    // (Debug builds assert: the counter moves first.)
+    let shipped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        meta.take_journal_grouped(1000).unwrap()
+    }));
+    assert_eq!(
+        shipped.is_err(),
+        cfg!(debug_assertions),
+        "a debug build trips its assertion"
+    );
+    assert_eq!(meta.unjustified_ships(), 1);
+    let proof = constellation_meta::OrphanProof::of(&[no_tail(2, 0)]);
+    meta.strand_for_takeover_carrying(3, &[], None, &Default::default(), &proof)
+        .unwrap();
+    assert!(meta.take_journal_grouped(1000).unwrap().is_empty());
+    assert_eq!(meta.unjustified_ships(), 1, "nothing more once stranded");
+}
+
 /// The guard of the same rule: a claimant without a tail keeps its rows of a
 /// generation the log lists (they ship under the log's grant), and the
 /// generation stays live.

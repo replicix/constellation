@@ -469,6 +469,13 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "unjustified_ships": {
+          "default": 0,
+          "description": "Journal rows about to ship whose origin is a delegate row this node\nassigned under a generation the table does not list and that has no\nvoid cut: the log never granted it (plan 46 M0.4; must stay 0).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [

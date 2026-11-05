@@ -220,6 +220,7 @@ impl Meta {
         max_per_part: usize,
     ) -> Result<Vec<(String, crate::store::JournalBatch)>, MetaError> {
         let batch = self.take_shippable(max_per_part)?;
+        self.check_shippable_origins(&batch)?;
         if batch.is_empty() {
             Ok(Vec::new())
         } else {

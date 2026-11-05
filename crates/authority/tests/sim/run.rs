@@ -1283,6 +1283,8 @@ pub struct Report {
     /// (`Stats::ungated_shadows`, over every incarnation of every node).
     /// Fails the run under `strict_commit`.
     pub ungated_shadows: u64,
+    /// Plan 46 M0.4 (`Meta::unjustified_ships`, every incarnation); must be 0.
+    pub unjustified_ships: u64,
     /// Deposition rebuilds run, `(succeeded, failed)`, over every
     /// incarnation of every node.
     pub rebuilds: (u64, u64),
@@ -1546,7 +1548,7 @@ impl Cluster {
         // replay queue survives with the journal: an entry queued before the
         // crash keeps its date) and the shadows counted outside the commit
         // rule, over every incarnation.
-        let (rolled_back_at, queued_seen, ungated_before) = self
+        let (rolled_back_at, queued_seen, ungated_before, unjustified_before) = self
             .nodes
             .lock()
             .unwrap()
@@ -1559,6 +1561,15 @@ impl Cluster {
                         .ungated_shadows_before
                         .load(std::sync::atomic::Ordering::Relaxed)
                         + old.view().stats.ungated_shadows,
+                    // (A kept meta is the same object: counted once, at the end.)
+                    old.shared
+                        .unjustified_ships_before
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        + if meta.as_ref().is_some_and(|m| Arc::ptr_eq(m, &old.meta)) {
+                            0
+                        } else {
+                            old.meta.unjustified_ships()
+                        },
                 )
             })
             .unwrap_or_default();
@@ -1592,6 +1603,10 @@ impl Cluster {
             .shared
             .ungated_shadows_before
             .store(ungated_before, std::sync::atomic::Ordering::Relaxed);
+        handle
+            .shared
+            .unjustified_ships_before
+            .store(unjustified_before, std::sync::atomic::Ordering::Relaxed);
         // (Kept only with the journal: a fresh replica has none to drop.)
         if meta_kept {
             *handle.shared.journaled_refusals.lock().unwrap() = refusals;
@@ -5936,6 +5951,25 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     .load(std::sync::atomic::Ordering::Relaxed)
             })
             .sum::<u64>();
+    // Plan 46 M0.4: a delegate row of a generation the log never granted
+    // reached the shipper (a takeover that missed its strand).
+    report.unjustified_ships = cluster
+        .ids()
+        .into_iter()
+        .map(|id| {
+            let h = cluster.get(id);
+            h.shared
+                .unjustified_ships_before
+                .load(std::sync::atomic::Ordering::Relaxed)
+                + h.meta.unjustified_ships()
+        })
+        .sum();
+    if report.unjustified_ships > 0 {
+        return Err(format!(
+            "I2c unjustified_ships: {} journal row(s) of a generation the log never granted              reached the shipper\n  {counters}\n  faults: {:?}",
+            report.unjustified_ships, report.faults
+        ));
+    }
     if cfg.strict_commit && report.ungated_shadows > 0 {
         return Err(format!(
             "I1 acked_implies_committed: {} shadow(s) installed for an answer not said to be \

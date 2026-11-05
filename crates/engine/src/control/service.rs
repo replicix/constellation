@@ -407,6 +407,7 @@ impl EngineControl {
                     ungated_shadows: a.ungated_shadows,
                     ungated_shadows_non_stealable: a.ungated_shadows_non_stealable,
                     ungated_unexpected: s.ungated_unexpected,
+                    unjustified_ships: self.meta.unjustified_ships(),
                     settled_eio: s.settled_eio,
                     settles_sent: a.settles_sent,
                     settled_abandoned: a.settled_abandoned,
