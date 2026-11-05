@@ -356,6 +356,7 @@ fn replay_seed() {
         Ok("delegated-crash") => delegated_crash_config(),
         Ok("delegated-partition") => delegated_partition_config(),
         Ok("delegated-epoch") => delegated_epoch_config(),
+        Ok("delegated-lone-s3-cut") => delegated_lone_s3_cut_config(),
         Ok("delegated-faults") => delegated_faults_config(),
         Ok("delegated-root-crash") => delegated_root_crash_config(),
         Ok("delegated-root-gone") => delegated_root_gone_config(),
@@ -5622,6 +5623,7 @@ fn sweep_config() {
         "delegated-crash" => delegated_crash_config(),
         "delegated-partition" => delegated_partition_config(),
         "delegated-epoch" => delegated_epoch_config(),
+        "delegated-lone-s3-cut" => delegated_lone_s3_cut_config(),
         "delegated-root-crash" => delegated_root_crash_config(),
         "shared-dir" => shared_dir_config(),
         "shared-dir-split" => shared_dir_split_config(),
@@ -6460,6 +6462,28 @@ fn delegated_config() -> SimConfig {
         delegations: vec![("d1".into(), 2), ("d2".into(), 3)],
         cross_ratio: 0.3,
         ..SimConfig::default()
+    }
+}
+
+/// Plan 46 M1.1 step 1: a lone root (no backup), a delegate and an S3 cut
+/// together. The root's commit rises only when it ships (its journal is no
+/// second copy), so with the root cut from S3 the archive does not come
+/// for the cut's length: the delegate's `DelegGroup` answers wait, and must
+/// neither be answered early (`+commit`) nor end unsettled (`+unsettled`).
+fn delegated_lone_s3_cut_config() -> SimConfig {
+    SimConfig {
+        random_faults: 0,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_200,
+                kind: FaultKind::CutS3Holder { for_ms: 4_000 },
+            },
+            ScheduledFault {
+                at_ms: 8_000,
+                kind: FaultKind::CutS3Holder { for_ms: 2_500 },
+            },
+        ],
+        ..long_delegated_config()
     }
 }
 
