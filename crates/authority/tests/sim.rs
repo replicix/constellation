@@ -8843,23 +8843,25 @@ fn regression_an_abandoned_ops_effect_explains_a_read_seed_7211() {
     });
 }
 
-/// Known gap, pinned (fails on main): `long-delegated-late-answers` seed 2560
-/// (no knob; the default clock mix's reboot of node 1 sets it up). Node 1, the
-/// root, appended node 3's delegate rows of `d2` (gen 1:2, among them
-/// `Completed(2,1,6)`, `Refused(3,1,7)`, `Completed(2,1,8)`) to its epoch-1
-/// journal and was suspended, then rebooted, before shipping them. Node 3 took
-/// the lease over (epoch 2) and executed its own delegate rows again at the
-/// gate (`own delegate row at the gate`), without `TailOf` identities. Node 1,
-/// back, moved its unshipped rows to its member copy when the epoch-2 marker
-/// arrived; coverage retires a row only by `TailOf` identity or by its own
-/// epoch's segments, so those three rows stayed. When node 1 later took the
-/// lease (epoch 5) it re-shipped them (`seq 39`): the log completes rids
-/// (2,1,6) and (2,1,8) twice, and its second `Create d2/f0` replaces the
-/// entry a later rename had put there: the log no longer replays to the
-/// replicas' state (convergence at head 44).
+/// Regression, seed 2560 of `long-delegated-late-answers` (no knob; the
+/// default clock mix's reboot of node 1 sets it up). Node 1, the root of
+/// epoch 1, appended node 3's delegate rows of `d2` (gen 1:2, idx 6..8:
+/// `Completed(2,1,6)`, `Refused(3,1,7)`, `Completed(2,1,8)`) to its journal
+/// (journal seqs 52..56) and was suspended, then rebooted, before shipping
+/// them. Node 3, the delegate, took the lease over (epoch 2) and replayed
+/// its own rows 6 and 8 by rid at its gate (`stranded op replayed
+/// locally`): the log (seq 13) completes (2,1,6) and (2,1,8) under no
+/// origin, and never recalls gen 1:2. A root's append of a delegate's row
+/// retires by its origin or by the generation's recall only, so node 1's
+/// journal kept all three, and node 1 shipped them when it took the lease
+/// again (epoch 5, seq 39): the log completed two rids twice, and its second
+/// `Create d2/f0` replaced the entry a later rename had put there
+/// (convergence at head 44). Fixed: a segment of a later tenure that carries
+/// an append's outcomes under another identity supersedes it
+/// (`superseded_root_appends_tx`); the refusal (3,1,7), which only node 1's
+/// journal carries, still ships.
 #[test]
-#[ignore = "known gap: a member copy re-ships rows whose rids the log already completed (seed 2560)"]
-fn known_gap_a_member_copy_reships_a_completed_rid_seed_2560() {
+fn regression_a_deposed_roots_append_does_not_reship_a_landed_rid_seed_2560() {
     run_seed(2560, long_delegated_late_answers_config()).unwrap_or_else(|e| {
         panic!(
             "long-delegated-late-answers seed 2560: {e}\n  replay with \

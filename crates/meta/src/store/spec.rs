@@ -313,7 +313,9 @@ impl LiveEntry {
     /// epoch and only ever retires by shipping. Plan 30 §M11: a delegate
     /// stream's row is tied to its generation, not to any epoch — a root
     /// takeover strands nothing of it (the delegate re-streams to the
-    /// successor); only the log's `Recall` of the generation does.
+    /// successor); only the log's `Recall` of the generation does (or, for
+    /// a root's append, a later tenure's segment that lands the row's rids
+    /// by another copy: [`superseded_root_appends_tx`]).
     ///
     /// Plan 43 C1-4: not a committed entry (`gated`): a shadow, hint or
     /// streamed transaction the holder answered or streamed as held by its
@@ -806,6 +808,12 @@ struct Strand<'a> {
     /// [`stranded_local_deps`] would find none. `None`: read the journal
     /// as it stands.
     deps_of: Option<&'a HashMap<u64, Streams>>,
+    /// Seed 2560: this `Local` row is a root's append of a delegate's row
+    /// whose outcome a segment of a later tenure carries under another
+    /// identity ([`superseded_root_appends_tx`]): rolled back like any
+    /// stranded row, then dropped. Set per row by `redo_row_tx` for a
+    /// `Local` entry of the pass's `quiet` set.
+    superseded: bool,
 }
 
 impl Strand<'static> {
@@ -817,6 +825,7 @@ impl Strand<'static> {
         rebuild: false,
         hold: false,
         deps_of: None,
+        superseded: false,
     };
 }
 
@@ -1676,6 +1685,15 @@ fn strand_local_tx(
     if strand.rebuild && row.class.gated() && row.gen != 0 && row.epoch > 0 {
         return Ok(Stranding::Dropped);
     }
+    // Seed 2560: a root's append of a delegate's row (`gen` != 0, `epoch`
+    // > 0) whose every outcome a segment of a later tenure carries under
+    // another identity ([`superseded_root_appends_tx`]). Rolled back above
+    // (journal rows, `completed`, the generation's log index); the
+    // segment's own records apply in its place. Not queued: the log has the
+    // rid's outcome, so a replay could only be answered from the dedup.
+    if strand.superseded && row.gen != 0 && row.epoch > 0 {
+        return Ok(Stranding::Dropped);
+    }
     // (A gated row of this node's own tenure that a deposition queues for
     // replay is a bug: it would be re-executed by a node whose client was
     // told it is committed. Only an operator's drop of a held transaction
@@ -2055,6 +2073,12 @@ fn redo_row_tx(
                 }
             }
             SpecKind::Local { first, .. } => {
+                // (Seed 2560: a `Local` entry of the quiet set is a root's
+                // append the segment being applied supersedes.)
+                let strand = Strand {
+                    superseded: quiet,
+                    ..strand
+                };
                 match strand_local_tx(tx, meta, first, row.origin, &row.before, undone, strand)? {
                     Stranding::Member => out.member_copied += 1,
                     Stranding::Queued => out.locals += 1,
@@ -2982,6 +3006,97 @@ fn streamed_tip_tx(r: &impl Readable, meta: &Meta, epoch: u64) -> Result<Option<
 
 /// Roll back and take out every outstanding entry `strands` selects (see
 /// [`rewind_tx`]).
+/// Seed 2560 (long-delegated-late-answers): the journal transactions (by
+/// first journal seq) that are this node's appends, as the root of an
+/// earlier tenure, of a delegate's rows (`gen` != 0, `epoch` > 0 and below
+/// `epoch`, the tenure of the segment being applied) whose every outcome
+/// (`Completed`, `Refused`) the segment carries (`completes`, `refused`)
+/// under an identity other than the row's: not by its origin (`origins`;
+/// a segment that carries the origin carries the row, and retires it as
+/// its own delegate transaction).
+///
+/// Such a row stays in a deposed root's journal (`LiveEntry::stranded_by`:
+/// the delegate re-streams it to the successor, whose segment retires it
+/// here by origin, or the log's recall of the generation strands it). When
+/// the successor lands the rid by another copy instead (a delegate that
+/// took the root and replayed its own rows by rid at its gate, which ends
+/// the generation with no record of it in the log), neither happens, and
+/// the row would ship with this node's next tenure: the log would carry the
+/// rid's outcome twice, and its second copy would apply over later
+/// records. The log's outcome is the rid's (exactly once); the row goes
+/// (rolled back, the segment applied in its place, not queued). A row of
+/// the same transaction with an outcome the segment does not carry keeps
+/// the whole transaction (it may be the outcome's only carrier).
+///
+/// Found through `completed`: a root's append records its journal seq there
+/// (position != 0; one applied from a segment records 0), so the cost is a
+/// point read per outcome the segment carries.
+fn superseded_root_appends_tx(
+    r: &impl Readable,
+    meta: &Meta,
+    epoch: u64,
+    origins: &[(u64, u64)],
+    completes: &HashSet<Rid>,
+    refused: &HashSet<Rid>,
+) -> Result<HashSet<u64>, MetaError> {
+    let mut out = HashSet::new();
+    if (completes.is_empty() && refused.is_empty())
+        || counter_get(r, &meta.local, KV_DELEG_SPEC_COUNT)? == 0
+    {
+        return Ok(out);
+    }
+    let settled = |rid: &Rid| completes.contains(rid) || refused.contains(rid);
+    for rid in completes.iter().chain(refused.iter()) {
+        let position = r
+            .get(&meta.completed, rid.to_key())?
+            .and_then(|v| {
+                v.get(0..8)
+                    .map(|p| u64::from_be_bytes(p.try_into().expect("8 bytes")))
+            })
+            .unwrap_or(0);
+        if position == 0 {
+            continue;
+        }
+        let Some(guard) = r
+            .range(&meta.journal_tx, ..=local::tx_key(position))
+            .next_back()
+        else {
+            continue;
+        };
+        let (k, v) = guard.into_inner()?;
+        let first = local::decode_tx_key(&k)?;
+        let head: local::JournalTxHead = postcard::from_bytes(&v)?;
+        if head.last < position
+            || head.gen == 0
+            || head.epoch == 0
+            || head.epoch >= epoch
+            || head.spec_seq.is_none()
+            || origins.contains(&(head.gen, head.idx))
+        {
+            continue;
+        }
+        let records = local::journal_records(r, meta, first, head.last)?;
+        let outcomes: Vec<&Rid> = records
+            .iter()
+            .filter_map(|(_, rec)| match rec {
+                LogRecord::Completed { rid } | LogRecord::Refused { rid, .. } => Some(rid),
+                _ => None,
+            })
+            .collect();
+        if !outcomes.is_empty() && outcomes.into_iter().all(settled) {
+            out.insert(first);
+        }
+    }
+    if !out.is_empty() {
+        tracing::debug!(
+            epoch,
+            firsts = ?out,
+            "a segment carries the outcomes of a past tenure's appends of delegate rows: superseded"
+        );
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn strand_tx(
     tx: &mut SingleWriterWriteTx,
@@ -3014,6 +3129,7 @@ fn strand_tx(
         rebuild: false,
         hold,
         deps_of: None,
+        superseded: false,
     };
     Ok(rewind_tx(tx, meta, staged, &live, &stranded, cutoff, strand, None)?.0)
 }
@@ -3521,6 +3637,7 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
                 rebuild: true,
                 hold: false,
                 deps_of: Some(&deps_of),
+                superseded: false,
             },
         )?;
     }
@@ -4675,6 +4792,11 @@ impl Meta {
         let prev_applied = crate::store::applied_pos_at(&self.db.read_tx(), &self.local);
         let first_of_epoch = prev_applied.is_none_or(|pos| pos.epoch < epoch);
         let mut tx = self.db.write_tx();
+        // Seed 2560: this node's appends, as a root of an earlier tenure, of
+        // delegates' rows whose outcomes this segment carries under another
+        // identity (`superseded_root_appends_tx`): stranded below, quietly.
+        let superseded_appends =
+            superseded_root_appends_tx(&tx, self, epoch, origins, &completes, &refused)?;
         let staged = UsageTracker::staging();
         // ADR-43 (orphan grants): what the table lists before an operator's
         // abandon, or a takeover that carries no tail, strands the
@@ -4705,6 +4827,7 @@ impl Meta {
                 || abandoned.iter().any(|a| entry.stranded_by_abandon(*a))
                 || matches!(entry, LiveEntry::Shadow { rid, .. } if refused.contains(rid))
                 || matches!(entry, LiveEntry::Streamed { ident, .. } if rolled.contains(ident))
+                || matches!(entry, LiveEntry::Local { first, .. } if superseded_appends.contains(first))
                 // A streamed transaction of this tenure the segment ships
                 // *past* (`through` at or beyond its last row) without
                 // naming its rows is gone from the holder's journal: it
@@ -4735,6 +4858,7 @@ impl Meta {
         let holder_locals = counter_get(&tx, &self.local, KV_LOCAL_SPEC_COUNT)?
             > counter_get(&tx, &self.local, KV_DELEG_SPEC_COUNT)?;
         let stranded = if holder_locals
+            || !superseded_appends.is_empty()
             || live_non_local(&tx, self)?
                 .iter()
                 .any(|(_, entry)| strands(entry))
@@ -4749,7 +4873,10 @@ impl Meta {
                 true,
                 false,
                 true,
-                |entry| matches!(entry, LiveEntry::Streamed { ident, .. } if rolled.contains(ident)),
+                |entry| {
+                    matches!(entry, LiveEntry::Streamed { ident, .. } if rolled.contains(ident))
+                        || matches!(entry, LiveEntry::Local { first, .. } if superseded_appends.contains(first))
+                },
             )?
         } else {
             Stranded::default()

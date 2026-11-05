@@ -195,7 +195,9 @@ pub(crate) struct JournalTx {
     /// delegate, or appended here as the root from a delegate's stream.
     /// A delegate's rows retire when a segment carries their origin and
     /// strand when the log recalls their generation; a root's rows of a
-    /// delegate origin ship with it in the segment envelope.
+    /// delegate origin ship with it in the segment envelope (and, on a
+    /// deposed root, go when a later tenure's segment carries their outcomes
+    /// under another identity: `spec::superseded_root_appends_tx`).
     pub gen: u64,
     pub idx: u64,
     /// Plan 43 C1-2: the class the row was journaled under

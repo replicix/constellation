@@ -66188,3 +66188,64 @@ Separately, `strict-isolated-reader-beats` fails 5 of 2 000 seeds
 the mix's reboot of the isolated reader with a backward wall step, after which
 it serves reads for about 4.7 s while still isolated; not in `long_locks`, to
 be triaged on its own.
+
+## Seed 2560: a deposed root's journal append of a delegate's row ships after the log landed its rid (2026-11-05; plan 46 M0.3 triage, tri3 B2)
+
+`long-delegated-late-answers` 2560 (no knob; the default clock mix's reboot of node 1 sets it up) failed convergence: the log
+completed two rids twice, and log replay diverged from the replicas. Fixed; the pin is un-ignored and renamed
+`regression_a_deposed_roots_append_does_not_reship_a_landed_rid_seed_2560`.
+
+### Mechanism (corrects the triage's member-copy reading)
+
+1. Node 1, root of epoch 1, appends node 3's delegate rows of `d2` (gen 1:2, idx 6..8: `Create m2-1-marker / Completed(2,1,6)`,
+   `Refused(3,1,7)`, `Create d2/f0 / Completed(2,1,8)`) to its journal (seqs 52..56) and is suspended, then rebooted, before
+   shipping them (it shipped through 51).
+2. Node 3, the delegate, takes the root (epoch 2). Its gate replays idx 6 and 8 by rid (`stranded op replayed locally`): seq 13
+   completes (2,1,6) and (2,1,8) with no origin. No segment ever recalls gen 1:2 or carries its rows by origin.
+3. Node 1 comes back. A root's append of a delegate's row never strands by epoch (`LiveEntry::stranded_by`: the delegate
+   re-streams it to the successor); it retires when a segment carries its origin, or strands when the log recalls the
+   generation. Neither happens, so the journal keeps all three (a probe of node 1's live entries at every segment apply,
+   seq 12 to 37). The member copy (rows 57, 61..67, the root's own) is not involved.
+4. Node 1 takes the lease again (epoch 5) and ships its journal: seq 39 carries the three rows verbatim. The log completes
+   (2,1,6) and (2,1,8) twice; replicas skip the duplicates, a replay from the log does not.
+
+Not L2b: L2b is a committed delegate row losing its verbatim carrier, every copy left a rescue by rid that the sequencer
+dedups (no double execution). Here the verbatim carrier survives in the deposed root's journal and ships without dedup after
+a rescue landed. The rescue is L2b's path (a), so the trigger is shared; M1.2's member copies would not retire a root's
+journal append.
+
+### Fix (`crates/meta/src/store/spec.rs`)
+
+`superseded_root_appends_tx`: on a segment of epoch E, for each rid it completes or refuses, a nonzero `completed` position
+names this node's own journal row. If the journal transaction holding it is a root's append of a delegate's row (`gen` != 0,
+0 < `epoch` < E), the segment does not carry it by origin, and the segment settles every outcome the transaction records, the
+transaction is superseded. `apply_segment_rows` strands it in its first pass as a quiet entry, and `strand_local_tx` drops it
+after the usual rollback (`Strand::superseded`, set per row from the pass's quiet set; no `Local` entry was quiet before). The
+segment's records apply in its place. A transaction with an outcome the segment does not carry stays whole: idx 7's refusal,
+carried only by node 1's journal, still ships at epoch 5. This is ADR-33 C3's rule for a subscriber's stream entry of a
+root's append (`completed_streams`) applied to the root's own journal copy. It extends the documented retirement of a root's
+append (origin or recall only; plan 30 §M11): an ADR-33 amendment and a fable review are due, not written here.
+
+The meta test `a_segment_carrying_a_journaled_rid_makes_its_outcome_the_logs` (seed 9287) asserted that the journal still
+held such a row after the successor's segment; that is the 2560 hazard, and it now asserts the row is gone (the outcome stays
+the log's).
+
+### Tests
+
+- Meta `a_later_tenures_segment_landing_an_appended_rid_supersedes_the_append` (`crates/meta/tests/holder_capture.rs`): three
+  appends, a segment of epoch 2 landing idx 1 and 3 by rid; only the refusal is left to ship, nothing queued, the outcomes are
+  the log's; a segment naming the origin retires as before. Fails on main (the journal keeps all three).
+- Sim pin above: fails on main (convergence at head 44), passes.
+
+### Gates (box 2, release sim, debuginfo off)
+
+fmt, clippy `-p constellation-meta -p constellation-authority --all-targets -D warnings` clean; meta all targets 527 passed,
+0 failed; authority lib 1,029 passed; sim suite 392 passed, 0 failed, 12 ignored. Sweeps, failing seeds main / fix (knob =
+`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`):
+
+| config | main | fix |
+|---|---|---|
+| `long-delegated-late-answers` 0..2,000, no knob / knob | none / none | none / none |
+| `long-delegated-late-answers` 2,000..10,000, no knob | 2560 | none |
+| `backup-crash` 0..2,000, no knob / knob | none / none | none / none |
+| `delegated-root-crash` 0..2,000, no knob / knob | none / none | none / none |

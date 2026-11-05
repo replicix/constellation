@@ -1818,7 +1818,8 @@ fn a_tagged_row_stranded_past_its_lease_replays_with_its_token_and_is_refused() 
 /// appended row of a delegate's transaction is its generation's, so a
 /// deposition leaves it in the journal; a segment of the successor that
 /// carries the same rid's outcome makes the `completed` row the log's
-/// (`outcome_from_log`) although the journal still holds the record.
+/// (`outcome_from_log`). (Before seed 2560's fix the journal still held the
+/// record after that segment; now the segment supersedes it.)
 #[test]
 fn a_segment_carrying_a_journaled_rid_makes_its_outcome_the_logs() {
     let meta = Meta::open_in_memory().unwrap();
@@ -1855,7 +1856,10 @@ fn a_segment_carrying_a_journaled_rid_makes_its_outcome_the_logs() {
     let seg = [create("m", (2 << 40) | 1), LogRecord::Completed { rid: r }];
     meta.apply_segment(1, 2, &seg, &TouchSet::default())
         .unwrap();
-    assert!(meta.journal_len().unwrap() > 0);
+    // Seed 2560: the segment lands the rid under no origin, so the append
+    // is superseded (left, it would ship with this node's next tenure and
+    // complete the rid twice); the outcome is the log's either way.
+    assert_eq!(meta.journal_len().unwrap(), 0);
     assert!(meta.outcome_from_log(r).unwrap());
     assert!(!meta.outcome_from_log(rid(2)).unwrap(), "no row at all");
 }
@@ -2367,6 +2371,104 @@ fn a_rebuild_queues_no_gated_append_of_a_delegates_row() {
     assert_eq!(meta.session().stream_applied(gen), 0);
     // Unchanged: the root's own gated row is in its epoch's member copy.
     assert!(meta.member_copy_carries(rid(9)).unwrap());
+}
+
+/// Seed 2560 (long-delegated-late-answers): a deposed root's appends of a
+/// delegate's rows stay in its journal (the delegate re-streams them to the
+/// successor, whose segment retires them by origin). Here the successor
+/// lands two of the rids by another copy instead (the delegate took the
+/// root and replayed its rows by rid), with no origin and no recall of the
+/// generation. The appends whose outcomes the segment carries are
+/// superseded: rolled back, the segment applied in their place, and not
+/// left to ship with this node's next tenure (the log would complete the
+/// rids twice). The refusal the segment does not carry stays: it is its
+/// outcome's only carrier. Fails before: the journal keeps all three.
+#[test]
+fn a_later_tenures_segment_landing_an_appended_rid_supersedes_the_append() {
+    use constellation_types::Code;
+    let gen = 5;
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    root_appends(&meta, gen, 1, "a");
+    let refused = LogRecord::Refused {
+        rid: delegate_rid(2),
+        code: Code::Exists,
+    };
+    assert!(meta
+        .apply_delegate_tx(
+            std::slice::from_ref(&refused),
+            Some(delegate_rid(2)),
+            gen,
+            2,
+            constellation_meta::Position::ZERO
+        )
+        .unwrap());
+    meta.session().note_stream(gen, 2);
+    root_appends(&meta, gen, 3, "c");
+    // Deposed; the successor's segment (epoch 2) lands idx 1 and 3 by rid.
+    meta.set_holder_epoch(0);
+    let records = [
+        create_rec("a", (2 << 40) | 1),
+        LogRecord::Completed {
+            rid: delegate_rid(1),
+        },
+        create_rec("c", (2 << 40) | 3),
+        LogRecord::Completed {
+            rid: delegate_rid(3),
+        },
+    ];
+    meta.apply_segment_rows(
+        1,
+        2,
+        4,
+        &[1, 2, 3, 4],
+        &[(0, 0); 4],
+        &records,
+        &TouchSet::default(),
+    )
+    .unwrap();
+    let left: Vec<LogRecord> = meta
+        .take_journal(usize::MAX)
+        .unwrap()
+        .into_iter()
+        .map(|(_, rec)| rec)
+        .collect();
+    assert_eq!(
+        left,
+        vec![refused],
+        "only the refusal the log does not carry is left to ship"
+    );
+    assert!(
+        meta.pending_replays().unwrap().is_empty(),
+        "a superseded append is not queued"
+    );
+    for seq in [1, 3] {
+        assert_eq!(
+            meta.completed_position(delegate_rid(seq)).unwrap(),
+            Some(0),
+            "the rid's outcome is the log's"
+        );
+    }
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
+    assert!(meta.lookup(ROOT_INO, "c").unwrap().is_some());
+    // A segment of the same tenure, or one that names the origin, is not a
+    // supersession: the append ships (or retires) as its generation's row.
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    root_appends(&meta, gen, 1, "a");
+    meta.set_holder_epoch(0);
+    meta.apply_segment_rows(
+        1,
+        2,
+        2,
+        &[1, 2],
+        &[(gen, 1), (gen, 1)],
+        &records[..2],
+        &TouchSet::default(),
+    )
+    .unwrap();
+    assert_eq!(meta.journal_len().unwrap(), 0, "retired by its origin");
+    assert!(meta.pending_replays().unwrap().is_empty());
 }
 
 /// L2 (M2): the rebuild takes each journal row out before it examines the
