@@ -3931,10 +3931,33 @@ impl LockTables {
         if owners.is_empty() {
             return Ok(LockTag::NONE);
         }
+        // Sorted once, looked up by bisection: the owners of one process
+        // are all its lock owners, so a process holding 10,000 locks asked
+        // `contains` of 10,000 owners for each of its 10,000 locks, at
+        // every op it issued (plan 41 item 7: closing them spent 84 % of
+        // the node's samples here, under the tables' mutex, and the core's
+        // renewal steps waited for it until the grants lapsed). Sorted
+        // outside the mutex.
+        let mut sorted;
+        let owners = if owners.len() > 8 {
+            sorted = owners.to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+            &sorted[..]
+        } else {
+            owners
+        };
+        let mine = |o: &u64| {
+            if owners.len() > 8 {
+                owners.binary_search(o).is_ok()
+            } else {
+                owners.contains(o)
+            }
+        };
         let g = self.lock();
         let mut per_minter: BTreeMap<u64, LockToken> = BTreeMap::new();
         for (ino, v) in &g.local {
-            for l in v.iter().filter(|l| owners.contains(&l.owner)) {
+            for l in v.iter().filter(|l| mine(&l.owner)) {
                 let h = g
                     .held
                     .get(ino)
@@ -6244,6 +6267,68 @@ mod token_tests {
         let mut lockers = t.lockers();
         lockers.sort();
         assert_eq!(lockers, vec![(10, 1, 0)]);
+    }
+
+    /// Plan 41 item 7: the tag of a process holding 10,000 local locks under
+    /// 10,000 owners (every op it issues asks for all of them) is O(locks ×
+    /// log owners), not O(locks × owners): the same tag as asked one owner
+    /// at a time, at a cost near the one owner's.
+    #[test]
+    fn a_tag_over_ten_thousand_owners_stays_cheap() {
+        let t = LockTables::default();
+        let n = 10_000u64;
+        for ino in 0..n {
+            t.install_held(
+                ino,
+                HeldGrant {
+                    id: GrantId {
+                        node: 1 + ino % 3,
+                        seq: ino + 1,
+                    },
+                    ..held(LockMode::Exclusive, 900 + ino as i64)
+                },
+            );
+            assert_eq!(
+                t.local_set(ino, lk(1_000 + ino, true, 0, u64::MAX), Now::same(0)),
+                LocalOutcome::Done
+            );
+        }
+        let mut owners: Vec<u64> = (0..n).map(|i| 1_000 + (i * 7_919) % n).collect();
+        // An owner with no lock: matches nothing.
+        owners.push(5);
+        // The same walk of the 10,000 locks with one owner asked: what the
+        // many-owner tag must stay near. Measured: the scan 199 times the
+        // one-owner walk (release; 381 debug), the bisection 17 (10 debug:
+        // it mints a token per lock where one owner mints one).
+        let time = |owners: &[u64]| {
+            let s = std::time::Instant::now();
+            let mut tag = None;
+            for _ in 0..20 {
+                tag = Some(t.owner_tag(owners, Now::same(100), 7).unwrap());
+            }
+            (s.elapsed().as_secs_f64(), tag.unwrap())
+        };
+        let _warm = time(&owners);
+        let (one, _) = time(&[1_000]);
+        let (all, tag) = time(&owners);
+        // The earliest window per minter: inodes 0, 1 and 2.
+        assert_eq!(
+            tag.0.iter().map(|k| k.until_ms).collect::<Vec<_>>(),
+            vec![900, 901, 902]
+        );
+        assert_eq!(
+            t.owner_tag(&[1_000, 1_001, 1_002], Now::same(100), 7)
+                .unwrap(),
+            tag
+        );
+        assert!(
+            all < 60.0 * one.max(1e-4),
+            "a tag over 10,000 owners took {all} s against {one} s for one owner (ratio {})",
+            all / one.max(1e-4)
+        );
+        // Past one lock's window: fenced, with many owners as with one.
+        assert_eq!(t.owner_tag(&owners, Now::same(950), 7), Err(OwnerFenced));
+        assert_eq!(t.owner_tag(&[1_000], Now::same(950), 7), Err(OwnerFenced));
     }
 
     /// Release ordering's bookkeeping: a grant is held back while a tagged
