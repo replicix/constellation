@@ -110,6 +110,13 @@
 //! op never lost). `tests/delegation.rs` keeps the hand-built
 //! counterexample paths for the naive variants as the primary checks.
 //!
+//! Plan 46 M1.0 (module [`node_stream`]) is the stage-1 structure: a
+//! delegation is a grant to a node covering a set of subtrees, one stream
+//! per node, and the commit rule a property of the stream's configuration
+//! (`ack_implies_committed_by_config`). It is built in chunks; chunk 1 is
+//! the skeleton (static grants, no faults) with planted-bug knobs
+//! (`lone_delegate`, `root_journal_counts`). `tests/node_stream.rs`.
+//!
 //! # What is modeled
 //!
 //! - **Actors.** `N` `Node`s (2–3 across the tests) plus one implicit
@@ -344,6 +351,7 @@ pub mod hotdir;
 pub mod inbox;
 pub mod locks;
 pub mod namespace;
+pub mod node_stream;
 pub mod positions;
 pub mod protocol;
 
