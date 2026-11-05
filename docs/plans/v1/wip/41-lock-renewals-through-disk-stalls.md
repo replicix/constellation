@@ -1330,6 +1330,16 @@ section 9 acceptance"):* [item 1](../../../../bench/lock-lane/RESULTS.md#item-1-
 (PROGRESS, "Plan 41 acceptance runs"). The L8 and exit boxes stay unticked
 until the maintainer accepts them against these tables.
 
+*Items 6 and 7 after the lane's fixes (2026-11-05;
+[RESULTS](../../../../bench/lock-lane/RESULTS.md#plan-41-item-7-the-lanes-fixes-before-and-after-2026-11-05),
+PROGRESS "Plan 41 item 7: the lane at 10,000 grants"):* no wake-up with no grant
+held; 0.09 to 0.14 % of a core with 10,000 grants (own, remote, both); 9.0
+renewals per grant per minute lane on and off, no added message or S3 request;
+no lock lost or owner fenced with 10,000 grants at both nodes. A wake-up still
+walks the held grants once (at most four a second), not O(due) as item 7 words
+it. Open: closing 10,000 locked files of the sequencer's own grants fences most
+of their owners, lane on or off (the owner table's O(n) late admissions).
+
 ## 10. Risks
 
 - **Two writers of grant windows.** A missed read-decide-write in the

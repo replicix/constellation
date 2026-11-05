@@ -399,3 +399,150 @@ Mismatches, all unrelated to locks:
 - The `fio` `fsync` job (an `fsync` every 16 writes) timed out at 300 s
   in every cell with the delayed device (the mount still answered):
   latency only, no error.
+
+## Plan 41 item 7: the lane's fixes, before and after (2026-11-05)
+
+Same host, scenario and method as the section above (`lock-lane-overhead`,
+60 s windows after a 10 s settle, one run per cell, a fresh pair of nodes per
+run, release builds). "Before" is the section above (the base commit);
+"after" is this branch. New: `CONSTELLATION_HARNESS_OVH_CLOSE=1` closes the
+held descriptors at the end (16 threads, bounded at 300 s) and counts the
+`close` errors; the close counters are totals since the start.
+
+Causes found (details in PROGRESS, "Plan 41 item 7: the lane at 10,000 grants"):
+a single renewal recomputed the park and fence hints over every held grant
+and local lock (`LockTables::track`, O(n) per renewal, so a round was
+O(n^2)); a `LockRenew` of every due grant did not fit a 64 KiB P2P frame
+past about a thousand entries, failed, timed out (a lease read each) and the
+next round was larger; the core's renewal tick fired at every grant's own
+renewal point (about once a millisecond); the lane ticked every 250 ms
+whatever was held, looked up in-flight entries by scanning every request,
+re-sent whole rounds to a busy owner; and the core's per-step refresh waited
+for the lane's mutex through a round.
+
+| measurement | before | after |
+|---|---:|---:|
+| lane wake-ups per minute, no grant held | 957 | 0 |
+| lane thread CPU, idle | 0.010 % | 0.000 % |
+| lane wake-ups per minute, 1 / 100 / 10,000 held at B | 962 / 963 / n.a. | 69 / 87 / 105 |
+| lane thread CPU, 10,000 own grants (A) | 22.4 % | 0.136 % |
+| lane thread CPU, 10,000 remote grants (B) | 16.3 % | 0.093 % |
+| lane thread CPU, 10,000 at A and 10,000 at B | n.a. | 0.088 % (A) / 0.110 % (B) |
+| process CPU, 10,000 remote grants (B) | 76 % | 0.82 % |
+| renewals per grant per minute, 100 held (lane on / off) | 10.0 / 9.0 | 9.0 / 9.0 |
+| renewals per grant per minute, 10,000 remote (lane on / off) | 5.3 / 0.0 | 9.0 / 9.0 |
+| renewals per grant per minute, 10,000 own (lane on / off) | 10.5 / 8.5 | 9.0 / 9.0 |
+| lane renewal entries sent / answered, 10,000 remote, 10 min TTL | 143,180 / 20,581 | 86,634 / 86,634 |
+| lapse parks in the window, 10,000 own (lane on) | 20,000 | 0 |
+| lapse parks in the window, 10,000 remote, 10 min TTL (lane off) | 2,600 | 0 |
+| locks lost / owners fenced, 10,000 at A and at B (lane on) | 3,040 / 10,000 | 0 / 0 |
+| locks lost / owners fenced, 10,000 at A and at B (lane off) | 2,498 / 9,133 | 0 / 0 |
+| S3 GETs per minute on B, 10,000 remote (lane on / off) | n.a. | 7 / 7 |
+
+"Renewals per grant per minute" is the node's `locks.renewals` (the core's and
+the lane's together, one per extension) over held grants; 9 is the rate the
+lease's usable window sets at the default TTL. With the lane on most of them are
+now the lane's (it wakes at the renewal point; the core's tick is coalesced with
+64 or more grants held), with no extra message: a renewal is sent by whichever
+takes the grant's `renewing` mark first. The 0.5 % bound of item 7 is met with
+10,000 grants (own, remote, both); a round's work is O(due grants) plus one walk
+of the held grants per wake-up (at most four a second).
+
+Closing the descriptors at the end:
+
+| cell | lane | close time | `close` errors | owners fenced | locks lost |
+|---|---|---:|---:|---:|---:|
+| 9,900 remote at B, 10 min TTL | off, base commit | > 10 min (killed) | n.a. | n.a. | n.a. |
+| same | off / on, first fixes only (no chunking, no tick gap) | > 300 s / > 300 s | n.a. | 0 / 0 | 0 / 0 |
+| same | off, after | 60 s | 0 | 0 | 0 |
+| same | on, after | 60 s | 0 | 0 | 0 |
+| 10,000 own at A | off / on, first fixes only | 129 s / 129 s | n.a. | 9,428 / 9,216 | 473 / 0 |
+| same | off, after | 129 s | 9,427 | 9,445 | 1,466 |
+| same | on, after | 111 s | 7,285 | 7,285 | 0 |
+| 10,000 at A and at B, all 20,000 | off, after | 203 s | 3,350 | 3,350 (A) | 0 |
+| same | on, after | 211 s | 1,408 | 1,408 (A) | 0 |
+
+("First fixes only": this branch's first round, the `track` and lane fixes
+without the frame-sized rounds and the tick gap; the base commit's run closed
+nothing, the scenario killed the daemons.)
+
+The remote case no longer hangs and closes cleanly. **Closing 10,000 locked
+files of the sequencer's own grants still fences most of their owners (an `EIO`
+at `close`), lane on or off**: not fixed here. In a diagnostic run (another
+host, logs kept) the core's renewal steps took 1 to 58 s while the closes ran:
+the late renewals of the grants that lapsed are each admitted at O(n) cost on
+the owner table (`LockTables::admit_late`: a scan of every record for a
+conflicting one, a `retain` over all of them, lookups in the lapsed memory), one
+`info` line each (98,336 lines), and the renewal tick walks every held grant
+several times with one table lock per grant (`local_idle`). With the step
+refresh no longer waiting for the lane the same diagnostic closed 10,000 own
+grants in 59 s with no error, but the measurement host above did not: the
+cascade starts whenever a few seconds pass without a renewal. Spec in PROGRESS.
+
+### No regression on normal workloads (`lock-latency`, base commit against this branch)
+
+Three runs alternated per file system (base, then branch), lane on, medians of
+p50 / p90 in microseconds. The branch run here is this branch before its last
+two changes (the core no longer waits on the lane's mutex in its refresh; a
+resumed lapse counts down instead of a walk), neither of which is on these paths;
+tmpfs and ext4 were run again on the final branch (below).
+
+| file system | measurement | base p50 / p90 (us) | branch p50 / p90 (us) | p50 delta |
+|---|---|---:|---:|---:|
+| btrfs | A (the sequencer) LOCK_EX | 42 / 48 | 44 / 57 | +2 % |
+| btrfs | B (non-sequencer) first LOCK_EX on a file | 343 / 430 | 311 / 447 | -10 % |
+| btrfs | B cached fcntl F_SETLK+F_UNLCK | 23 / 27 | 23 / 27 | -1 % |
+| btrfs | B cached re-lock (LOCK_EX after LOCK_UN, same file) | 44 / 50 | 44 / 57 | -0 % |
+| btrfs | contended handoff (A unlock -> B granted) | 1640 / 1690 | 1611 / 1731 | -2 % |
+| btrfs | lone node `cluster` flock LOCK_EX+UN | 43 / 56 | 44 / 54 | +3 % |
+| ext4 | A (the sequencer) LOCK_EX | 49 / 56 | 42 / 49 | -16 % |
+| ext4 | B (non-sequencer) first LOCK_EX on a file | 318 / 404 | 333 / 488 | +5 % |
+| ext4 | B cached fcntl F_SETLK+F_UNLCK | 23 / 26 | 23 / 26 | -0 % |
+| ext4 | B cached re-lock (LOCK_EX after LOCK_UN, same file) | 43 / 50 | 44 / 50 | +2 % |
+| ext4 | contended handoff (A unlock -> B granted) | 1539 / 1640 | 1587 / 1653 | +3 % |
+| ext4 | lone node `cluster` flock LOCK_EX+UN | 42 / 54 | 45 / 54 | +7 % |
+| tmpfs | A (the sequencer) LOCK_EX | 43 / 49 | 46 / 59 | +6 % |
+| tmpfs | B (non-sequencer) first LOCK_EX on a file | 309 / 357 | 345 / 451 | +12 % |
+| tmpfs | B cached fcntl F_SETLK+F_UNLCK | 23 / 26 | 23 / 25 | -1 % |
+| tmpfs | B cached re-lock (LOCK_EX after LOCK_UN, same file) | 44 / 53 | 45 / 54 | +1 % |
+| tmpfs | contended handoff (A unlock -> B granted) | 1559 / 1691 | 1568 / 1631 | +1 % |
+| tmpfs | lone node `cluster` flock LOCK_EX+UN | 44 / 56 | 42 / 48 | -3 % |
+| xfs | A (the sequencer) LOCK_EX | 43 / 52 | 44 / 59 | +3 % |
+| xfs | B (non-sequencer) first LOCK_EX on a file | 354 / 452 | 304 / 401 | -14 % |
+| xfs | B cached fcntl F_SETLK+F_UNLCK | 23 / 27 | 23 / 28 | -0 % |
+| xfs | B cached re-lock (LOCK_EX after LOCK_UN, same file) | 43 / 48 | 46 / 56 | +7 % |
+| xfs | contended handoff (A unlock -> B granted) | 1624 / 1713 | 1618 / 1764 | -0 % |
+| xfs | lone node `cluster` flock LOCK_EX+UN | 42 / 49 | 42 / 53 | +0 % |
+
+The final branch, tmpfs and ext4 again (three runs alternated):
+
+| file system | measurement | base p50 / p90 (us) | branch p50 / p90 (us) | p50 delta |
+|---|---|---:|---:|---:|
+| ext4 | A (the sequencer) LOCK_EX | 43 / 56 | 44 / 59 | +2 % |
+| ext4 | B (non-sequencer) first LOCK_EX on a file | 306 / 494 | 344 / 451 | +13 % |
+| ext4 | B cached fcntl F_SETLK+F_UNLCK | 23 / 27 | 23 / 26 | +0 % |
+| ext4 | B cached re-lock (LOCK_EX after LOCK_UN, same file) | 43 / 49 | 43 / 49 | -0 % |
+| ext4 | contended handoff (A unlock -> B granted) | 1616 / 1656 | 1626 / 1699 | +1 % |
+| ext4 | lone node `cluster` flock LOCK_EX+UN | 42 / 47 | 43 / 52 | +1 % |
+| tmpfs | A (the sequencer) LOCK_EX | 50 / 55 | 43 / 49 | -15 % |
+| tmpfs | B (non-sequencer) first LOCK_EX on a file | 300 / 367 | 325 / 402 | +8 % |
+| tmpfs | B cached fcntl F_SETLK+F_UNLCK | 23 / 28 | 29 / 46 | +28 % |
+| tmpfs | B cached re-lock (LOCK_EX after LOCK_UN, same file) | 42 / 49 | 43 / 50 | +2 % |
+| tmpfs | contended handoff (A unlock -> B granted) | 1530 / 1667 | 1530 / 1714 | -0 % |
+| tmpfs | lone node `cluster` flock LOCK_EX+UN | 43 / 53 | 42 / 51 | -1 % |
+
+Every line is within one run-to-run IQR but one: B's first lock on a file (20
+samples a run) moves -14 to +13 % between file systems and rounds; over the 18
+runs per side it is 309 us (base) against 330 us (branch), median of the run
+medians, with the base's own IQR 47 us (298 to 345 us): within one IQR, but the
+pooled median is 7 % higher, which these runs cannot tell from noise (the base's
+runs alone spread 248 to 374 us). That request goes through the authority cores
+of both nodes and the lane is not on its path (below 64 held grants the core's tick
+is unchanged); a longer series of that one measurement is the next check. The
+tmpfs `fcntl` line in the second round (+28 %) is one bimodal run (the first round
+showed -1 % there).
+
+Stall tolerance on the branch (lane on): `lock-stall-lone-node` (stalls 5, 12 and
+20 s) passed 2 of 2 on every file system, and 2 of 2 again on tmpfs and ext4 on the
+final branch; `lock-store-stall-holder` passed on every file system and again on
+tmpfs and ext4 on the final branch.

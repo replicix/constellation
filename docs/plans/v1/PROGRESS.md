@@ -66617,3 +66617,81 @@ root's generations abandoned by the operator only at 26.1 s, after the `EIO` at 
 
 **Gates**: fmt, clippy `-D warnings` (authority, all targets) clean; authority lib 1,039 passed; the release sim suite 402 passed,
 0 failed, 12 ignored.
+
+
+
+## Plan 41 item 7: the lane at 10,000 grants
+
+The acceptance runs above found the lane awake 957 times a minute with nothing held, 14 to 22 % of a core with
+10,000 grants, and 10,000 grants at two nodes losing locks lane on and off. Causes and fixes (numbers in
+`bench/lock-lane/RESULTS.md`, "Plan 41 item 7: the lane's fixes, before and after"):
+
+- **A renewal walked the whole table.** `LockTables::renewed` and `renew_own` (`crates/meta/src/locks.rs`) called
+  `track` after every single renewal: a walk of every held grant (the earliest end, the lapsing count) and every local
+  lock (`refence` → `next_lapse`). A round of 10,000 renewals was 10^8 steps, in the lane's thread (its own renewals and
+  its answers) and on the core (each `LaneRenewed` result, 0.63 s steps; its own answers). A renewal only extends, so
+  the hints `track` keeps are lower bounds that stay valid (`next_end`, `lapse_from_ms`, `fence_from_ms`: recomputed when
+  passed, as `may_park` and `fenced_owners` already did); a renewal that ends a lapse counts one lapsing grant fewer
+  (`track_extended`). The park polls (`lapse_pending`, `parked_owners`, `fenced`, `tag_lapsing`, every 20 ms per parked
+  op) re-track only when a grant's state changed (`observe_changed`).
+- **Rounds too large for a frame.** A `LockRenew` carried every due grant of an owner; past about a thousand entries it
+  does not fit a P2P frame (`MAX_FRAME`, 64 KiB), so it never left: the request timed out (each timeout a lease read for
+  the owner), the grants were due again and the next round was larger. With 10,000 remote grants and the lane off every
+  grant lapsed (10,000 lapse parks, 4,324 lease GETs a minute in the first measurement of this round), and with 10,000 at
+  both nodes B lost or fenced them all. Rounds are now chunked at `LOCK_RENEW_MAX_ENTRIES` (512, `event.rs`), in the
+  core's tick and in the lane; `constellation_net::message::LOCK_RENEW_MAX_ENTRIES` is the wire's bound, tested at the
+  largest values (`maximum_lock_renewals_fit_a_frame`), and the engine asserts the two at compile time.
+- **The core's tick at every renewal point.** `lock_arm_renew_tick` armed the tick at the earliest renewal point, about
+  once a millisecond with 10,000 grants, each tick several walks of the held grants and one table lock per grant. With
+  `RENEW_COALESCE_FROM` (64) or more grants held the next tick comes no sooner than `lock_renew_gap_ms` after the last
+  (`(ttl − margin) / 64`, at most 250 ms: a 32nd of the half window a holder renews within). Below that nothing changes
+  (the simulation's seed-tuned controls depend on the schedule: applied always, one of them stopped finding its bug).
+- **The lane.** It ticked every 250 ms whatever was held; it now sleeps until the next grant may be due
+  (`LockTables::lane_next_due`, `RenewLane::next_wake`: a renewal point; a poll later while a renewal the core sent is
+  out; never sooner than a poll after its last look), at most 1 s while grants are held, and with none held until one is
+  installed. An install, a renewal that fails and a lapse that ends wake it when due before it would look
+  (`set_lane_waker`, `lane_sleeps_until`); a wake that could not bring its look forward is not made
+  (`RenewLane::sleep_mark`; without it the core's failed renewals woke it 185,000 times a minute). Its per-grant lookup of
+  entries in flight scanned every request (10^8 comparisons with the core stuck), now a counted index; an answer's
+  entries are matched through a set; one live request per owner (`owner_busy`): it re-sent whole rounds to an owner whose
+  core had not answered the last (143,180 entries a minute for 20,581 answers). The simulation's lane task keeps its
+  fixed tick (the sleeping loop changed the schedule six seed-tuned controls rely on; `long_locks` × 300 passed with
+  both loops).
+- **The core waited for the lane.** `Driver::refresh` copied the lane's stats into status under the lane's mutex, which
+  the lane holds through a round: while 10,000 locked files closed every step's refresh waited 0.5 to 3 s for it
+  (diagnostic logs), and the slow-step log line did the same. Both use `try_lock` now; status keeps the last copy.
+
+Status: `lane.owner_busy`, `lane.wakes`. Harness `lock-lane-overhead`: `lane_wakes` and `owner_busy` in `P41OVH`,
+`CONSTELLATION_HARNESS_OVH_CLOSE=1` (a timed close of the held descriptors, `close` errors counted),
+`CONSTELLATION_HARNESS_OVH_KEEP_LOGS=1` (node logs and each phase's lock status kept).
+
+Result: idle 0 wake-ups (957 before); 10,000 grants 0.09 to 0.14 % of a core for the lane (13.8 to 22.4 %), 0.8 to
+1.3 % for the whole process (59 to 76 %); 9.0 renewals per grant per minute lane on and off in every cell (no added
+message, no added S3 request); 10,000 at both nodes: no lock lost, no owner fenced, lane on and off (2,498 / 3,040 lost
+before); closing 9,900 locked remote grants takes 60 s with no error (it never finished before).
+
+Not fixed (spec):
+
+- **Closing 10,000 locked files of the sequencer's own grants still fences most owners** (`EIO` at `close`: 7,285 of
+  10,000 lane on, 9,427 off; with 20,000 grants 1,408 / 3,350). A diagnostic run with the logs kept showed core renewal
+  steps of 1 to 58 s while the closes ran, and 98,336 "admitted a late lock renewal" lines: once some own grants lapse,
+  their late renewals are admitted at O(n) each on the owner table — `LockTables::admit_late` scans every record for a
+  conflicting one (`beside`), drops the node's older record on the inode with a `retain` over all records, and looks the
+  id up in the lapsed memory by scanning it — so the tick that admits 10,000 is O(n^2), during which nothing is renewed,
+  and the next round lapses more. The owner table has no index by inode (`own_grant`, `conflicting`, `first_conflicting`
+  scan as well). Spec: an inode → ids index on `Inner::grants` (kept at every insert and removal) and an id → inode one
+  on `Inner::lapsed`, making `admit_late`, `conflicting` and `own_grant` O(grants on the inode); one summary `info` line
+  per tick for late admissions; the renewal tick's `local_idle` per held grant folded into one walk. Then measure the
+  own-grant close cell again (and ask why the closes make own grants lapse at all with the lane on: the lane's own
+  renewals need fresh S3 liveness while B is a listed backup, and the backup link flapped every 50 ms during the closes,
+  "removing a backup … link down").
+- The lane looks at every held grant once per wake-up (at most four a second): measured 0.09 to 0.14 % of a core at
+  10,000; an index by renewal point would make it O(due) but every writer of `renew_at` and `renewing` would keep it.
+
+**Gates** (box 1, release sim, debuginfo off): `cargo fmt --all --check` clean; clippy `-D warnings` on net, meta,
+authority, engine, control and harness, all targets, clean; meta lib 394 passed; authority lib 1,037 passed; engine lib
+950 passed; net lib 128 passed; control schema blessed (`lane.owner_busy`, `lane.wakes`); model `locks` 24 and
+`delegation` 89 passed; release sim suite 394 passed, 0 failed, 12 ignored; `long_locks` × 300 seeds (all configs)
+passed. Fail-before: the coalescing test (`renewal_ticks_are_a_gap_apart_and_renew_what_came_due_meanwhile`) fails
+with the coalescing off; the frame test fails at 2,048 entries; the closes' lock loss reproduced on the build before the
+refresh change (9,402 lost) and not after.
