@@ -2712,6 +2712,73 @@ pub fn lock_stall_lone_node(_seed: u64) -> Result<()> {
     Ok(())
 }
 
+/// Plan 41 §9, the real-device reproduction: `lock-stall-lone-node`'s
+/// workload with the state dir (`TMPDIR`) on a device the scenario freezes
+/// (`CONSTELLATION_HARNESS_STALL_DM`: the dm device's name, `dmsetup
+/// suspend`/`resume` through `sudo -n`) for `CONSTELLATION_HARNESS_STALL_MS`
+/// (15 000), 8 threads fsyncing on the mount. With the lane on: no lapse, no
+/// `EIO`, nothing fenced; `CONSTELLATION_HARNESS_LONE_LANE=off` only records.
+pub fn lock_device_stall_lone_node(_seed: u64) -> Result<()> {
+    const NAME: &str = "lock-device-stall-lone-node";
+    const LOCK_TTL_MS: u64 = 3_000;
+    let dm = std::env::var("CONSTELLATION_HARNESS_STALL_DM")
+        .context("CONSTELLATION_HARNESS_STALL_DM names the dm device to freeze")?;
+    let ms: u64 = std::env::var("CONSTELLATION_HARNESS_STALL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(15_000);
+    let lane_off = std::env::var("CONSTELLATION_HARNESS_LONE_LANE").as_deref() == Ok("off");
+    let (env, root) = setup(NAME)?;
+    let backend = format!("s3://{BUCKET}/{NAME}-{ms}-{}", ts());
+    let mut c = Client::new(root.path(), "lone", &env.direct_endpoint, &backend)?
+        .with_write_mode("back")
+        .with_env("CONSTELLATION_LOCKS", "cluster")
+        .with_env("CONSTELLATION_LOCK_TTL_MS", &LOCK_TTL_MS.to_string())
+        .with_env(
+            "CONSTELLATION_LOCK_LANE",
+            if lane_off { "off" } else { "on" },
+        )
+        .with_env(
+            "RUST_LOG",
+            "info,constellation_authority::core::locks=debug,constellation::locks=debug",
+        );
+    c.fs_create()?;
+    c.mount()?;
+    eprintln!("    {NAME}: a {ms} ms device freeze");
+    // The device is fast for the daemon's bootstrap (fsync-bound: minutes at a
+    // 1 s flush), slow while the workload runs and fast again for the remount
+    // (`CONSTELLATION_HARNESS_DEVICE_HOOK slow|fast`, the bench's dm-delay swap).
+    let hook = |mode: &str| -> Result<()> {
+        if let Ok(h) = std::env::var("CONSTELLATION_HARNESS_DEVICE_HOOK") {
+            let st = std::process::Command::new(&h).arg(mode).status()?;
+            anyhow::ensure!(st.success(), "{h} {mode}: {st}");
+        }
+        Ok(())
+    };
+    hook("slow")?;
+    let result = lock_lapse_lone_run(NAME, &c, LoneStall::Device { ms, dm, lane_off })
+        .and_then(|expected| {
+            hook("fast")?;
+            c.unmount()?;
+            c.mount()?;
+            lock_lapse_lone_check(NAME, &c, &expected, "after a remount")?;
+            let fsck = c.fsck(false)?;
+            anyhow::ensure!(
+                fsck.status.success(),
+                "fsck: {}{}",
+                String::from_utf8_lossy(&fsck.stdout),
+                String::from_utf8_lossy(&fsck.stderr)
+            );
+            Ok(())
+        });
+    let _ = hook("fast");
+    if result.is_err() {
+        keep_logs(NAME, std::slice::from_ref(&c));
+    }
+    let _ = c.unmount();
+    result
+}
+
 /// Plan 41 L3, the cap: a lone node, lease 12 s, lock TTL 3 s, one metadata
 /// write holds the store 20 s — past what is left of the root lease, which
 /// the stuck core cannot renew. The lane renews the node's own grant up to
@@ -2787,7 +2854,12 @@ pub fn lock_store_stall_past_lease(_seed: u64) -> Result<()> {
 pub fn lock_store_stall_holder(_seed: u64) -> Result<()> {
     const NAME: &str = "lock-store-stall-holder";
     const LOCK_TTL_MS: u64 = 3_000;
-    const STALL_MS: u64 = 10_000;
+    // `CONSTELLATION_HARNESS_HOLDER_STALL_MS`: the stall's length (bench/lock-lane).
+    #[allow(non_snake_case)]
+    let STALL_MS: u64 = std::env::var("CONSTELLATION_HARNESS_HOLDER_STALL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(10_000);
     const UNDER: &[u8] = b"B-UNDER-LOCK";
     const AFTER: &[u8] = b"B-AFTER-STALL";
     let lane_off = std::env::var("CONSTELLATION_HARNESS_HOLDER_LANE").as_deref() == Ok("off");
@@ -3142,6 +3214,31 @@ enum LoneStall {
         /// lapses there (`lock-store-stall-past-lease`).
         past_lease: bool,
     },
+    /// The state dir's block device frozen (`dmsetup suspend`, then `resume`)
+    /// this long, with 8 threads fsyncing on the mount (plan 41's real-device
+    /// reproduction, `lock-device-stall-lone-node`). The lane-on arm must not
+    /// lapse; the lane-off arm only records.
+    Device {
+        ms: u64,
+        dm: String,
+        lane_off: bool,
+    },
+}
+
+impl LoneStall {
+    /// `(stall ms, lane off, past the lease)` of the store-like stalls.
+    fn store_params(&self) -> Option<(u64, bool, bool)> {
+        match self {
+            LoneStall::Freeze(_) => None,
+            LoneStall::Store {
+                ms,
+                lane_off,
+                past_lease,
+                ..
+            } => Some((*ms, *lane_off, *past_lease)),
+            LoneStall::Device { ms, lane_off, .. } => Some((*ms, *lane_off, false)),
+        }
+    }
 }
 
 /// The locked file's content: what was `fsync`ed under the honoured grant.
@@ -3254,6 +3351,27 @@ fn lock_lapse_lone_run(name: &str, c: &Client, stall: LoneStall) -> Result<LoneE
         })
     };
 
+    // The device run: 8 threads fsyncing on the mount (the state dir's
+    // journal has a flush to wait for per fsync).
+    let fsyncers: Vec<_> = if matches!(stall, LoneStall::Device { .. }) {
+        (0..8)
+            .map(|n| {
+                let (path, stop) = (m.join(format!("fsync{n}")), stop.clone());
+                std::thread::spawn(move || {
+                    let Ok(f) = open_rw(&path) else { return };
+                    let mut i = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = f.write_all_at(&i.to_le_bytes(), (i % 64) * 8);
+                        let _ = f.sync_all();
+                        i += 1;
+                    }
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     std::thread::sleep(Duration::from_secs(1));
     {
         // Thawed whatever happens below: a frozen daemon would hang the
@@ -3272,6 +3390,22 @@ fn lock_lapse_lone_run(name: &str, c: &Client, stall: LoneStall) -> Result<LoneE
                 c.pause()?;
                 let _thaw = Thaw(c);
                 std::thread::sleep(*frozen);
+            }
+            LoneStall::Device { ms, dm, .. } => {
+                // One helper process does all of it, already running when the
+                // device freezes: an `exec` from this process would flush its
+                // close-on-exec descriptors on the mount (`fuse_flush`) and hang
+                // behind the frozen device, resume included.
+                let script = format!(
+                    "sudo -n dmsetup suspend {dm} && sleep {}.{:03}; sudo -n dmsetup resume {dm}",
+                    ms / 1000,
+                    ms % 1000
+                );
+                let st = std::process::Command::new("sh")
+                    .args(["-c", &script])
+                    .status()
+                    .context("dmsetup suspend/resume")?;
+                anyhow::ensure!(st.success(), "dmsetup suspend/resume of {dm}: {st}");
             }
             LoneStall::Store { ms, file, .. } => {
                 // Whole, by a rename (a prefix would stall for less).
@@ -3292,6 +3426,9 @@ fn lock_lapse_lone_run(name: &str, c: &Client, stall: LoneStall) -> Result<LoneE
     std::thread::sleep(Duration::from_secs(2));
     let after = write_at(&mut lf, 0, AFTER);
     stop.store(true, Ordering::Relaxed);
+    for h in fsyncers {
+        let _ = h.join();
+    }
     let mut outcomes = std::collections::BTreeMap::new();
     for (what, h) in [
         ("rename", ren),
@@ -3368,13 +3505,9 @@ fn lock_lapse_lone_run(name: &str, c: &Client, stall: LoneStall) -> Result<LoneE
                 bail!("{what} {n} answered {r:?} after a freeze: the I/O should have waited");
             }
         }
-    } else if let LoneStall::Store {
-        ms,
-        lane_off,
-        past_lease,
-        ..
-    } = &stall
-    {
+    } else if let Some((ms, lane_off, past_lease)) = stall.store_params() {
+        let (ms, lane_off, past_lease) = (&ms, &lane_off, &past_lease);
+        let device = matches!(stall, LoneStall::Device { .. });
         let eios: usize = outcomes
             .values()
             .map(|v| v.iter().filter(|(_, r)| *r == Err(Code::Io)).count())
@@ -3386,6 +3519,16 @@ fn lock_lapse_lone_run(name: &str, c: &Client, stall: LoneStall) -> Result<LoneE
              {eios} EIO, {owners_fenced} owners fenced, lane own renewals {own})",
             if after_eio { "lapsed" } else { "held" }
         );
+        eprintln!(
+            "P41RESULT scenario={name} stall_ms={ms} lane={} after_eio={after_eio} eios={eios} \
+             fenced_ops={fenced_ops} owners_fenced={owners_fenced} lost={} lapse_parks={} \
+             lapse_park_ms_max={} late_admitted={} own_renewals={own}",
+            if *lane_off { "off" } else { "on" },
+            fence["lost"],
+            fence["lapse_parks"],
+            fence["lapse_park_ms_max"],
+            fence["late_admitted"]
+        );
         if *lane_off {
             // The code before plan 41: the stuck core renews nothing, the
             // grant lapses under a stall past its window (the 3 s ttl). Plan
@@ -3395,7 +3538,7 @@ fn lock_lapse_lone_run(name: &str, c: &Client, stall: LoneStall) -> Result<LoneE
             let parks = fence["lapse_parks"].as_u64().unwrap_or(0);
             let parked_ms = fence["lapse_park_ms_max"].as_u64().unwrap_or(0);
             anyhow::ensure!(
-                after_eio || fenced_ops > 0 || eios > 0 || (parks > 0 && parked_ms >= ms / 3),
+                device || after_eio || fenced_ops > 0 || eios > 0 || (parks > 0 && parked_ms >= ms / 3),
                 "with CONSTELLATION_LOCK_LANE=off a {ms} ms store stall lapsed nothing (lapse \
                  parks {parks}, longest {parked_ms} ms): the fault point did not reach the core \
                  (or the scenario is vacuous); locks: {fence}"

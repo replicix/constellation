@@ -2348,6 +2348,13 @@ pub const CAMPAIGN: &[Scenario] = &[
         run: m14::lock_stall_lone_node,
     },
     Scenario {
+        name: "lock-device-stall-lone-node",
+        desc: "plan 41 section 9, real-device reproduction: lock-stall-lone-node's workload with the state dir on a dm device (CONSTELLATION_HARNESS_STALL_DM) frozen by dmsetup suspend/resume for CONSTELLATION_HARNESS_STALL_MS (15000) under 8 fsyncing threads: with the lane on no lapse, no EIO, nothing fenced; CONSTELLATION_HARNESS_LONE_LANE=off only records (bench/lock-lane)",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: m14::lock_device_stall_lone_node,
+    },
+    Scenario {
         name: "lock-store-stall-past-lease",
         desc: "plan 41 L3, the cap: a lone node with a 12 s lease and a 3 s lock TTL, one metadata write holding the store 20 s (past what is left of the lease): the lane renews the node's own grant up to the lease's usable end (lane.own_renewals > 0) and the grant lapses there, never later; the application sees EIO after it, the fence lifts with the lock, the tree holds what answered OK, fsck clean",
         requires: &[],
