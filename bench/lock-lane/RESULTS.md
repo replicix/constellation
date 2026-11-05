@@ -571,3 +571,91 @@ Stall tolerance on the branch (lane on): `lock-stall-lone-node` (stalls 5, 12 an
 20 s) passed 2 of 2 on every file system, and 2 of 2 again on tmpfs and ext4 on the
 final branch; `lock-store-stall-holder` passed on every file system and again on
 tmpfs and ext4 on the final branch.
+
+## Plan 41 item 7, last open item: closing 10,000 own locked fds (2026-11-05)
+
+Quiet timing box, release builds, `lock-lane-overhead` with `aN` only (10,000 locks
+taken at A, the sequencer, on its own grants; 20 s TTL; 60 s window), then
+`CONSTELLATION_HARNESS_OVH_CLOSE=1`: 16 threads close the 10,000 descriptors. One
+fresh cluster per run, 3 runs per cell, base and branch alternated. "Base" is main
+before this change; "index" is the owner table's index alone (first commit);
+"final" adds the owner-tag fix (second commit). Slow core steps are the node's
+`slow core step` lines over the whole run.
+
+| build | lane | close time (s), 3 runs | owners fenced (A), 3 runs | `close` errors | longest core step (s) |
+|---|---|---|---|---|---:|
+| base | on | 168.5 / 42.8 / 66.6 | 437 / 9,425 / 9,445 | 437 / 9,407 / 9,427 | 43.3 / 7.9 / 21.2 |
+| base | off | 130.2 / 130.4 / 129.5 | 9,483 / 9,462 / 9,452 | 9,466 / 9,445 / 9,436 | 63.1 / 48.8 / 65.1 |
+| index | on | 104.8 / 63.2 / 53.2 | 9,449 / 9,422 / 9,412 | 9,432 / 9,405 / 9,394 | 70.8 / 32.3 / 23.2 |
+| index | off | 70.4 / 129.5 / 129.8 | 9,411 / 9,415 / 9,407 | 9,394 / 9,398 / 9,390 | 18.0 / 26.1 / 24.2 |
+| **final** | on | **12.7 / 13.3 / 13.3** | **0 / 0 / 0** | **0 / 0 / 0** | 1.0 / 1.6 / 1.3 |
+| **final** | off | **13.4 / 12.8 / 12.9** | **0 / 0 / 0** | **0 / 0 / 0** | 2.8 / 2.5 / 2.4 |
+
+Locks lost and lapse parks in the final build: 0 in every run but one lane-off run
+(230 lapse parks; no lock lost, no owner fenced).
+
+The index (`OwnerTable`: by inode and by end; the lapsed memory by id) made the
+late admissions O(records on the inode), but changed nothing here: the late
+admissions were a symptom. A profile of the close (symbols build, 40 s) put 84 %
+of the node's samples in `LockTables::owner_tag` on the FUSE threads: every op of
+a process is tagged with the grants of all its lock owners, the harness process
+holds 10,000 owners, and the tag asked `owners.contains` (10,000 entries) for each
+of the 10,000 local locks, under the tables' mutex. Each close held the mutex for
+about 6 ms (the unit test's measure of one such tag); the core's renewal steps waited for it (`Timer` steps up to 70 s),
+the grants lapsed, and their owners were fenced. The owners are now sorted once
+outside the mutex and looked up by bisection (more than 8 of them).
+
+What is left per close is O(local locks) (`lockers`, the walk in `owner_tag`, the
+owner fence's `next_lapse`): 13 s for 10,000 closes, steps of at most 2.8 s.
+
+### No regression (`lock-latency`, base against final, lane on)
+
+Three runs alternated per file system, medians of p50 / p90 (us):
+
+| fs | measurement | base | final | p50 delta |
+|---|---|---:|---:|---:|
+| ext4 | A (the sequencer) LOCK_EX | 43 / 53 | 43 / 48 | -2 % |
+| ext4 | B first LOCK_EX on a file | 280 / 400 | 296 / 371 | +6 % |
+| ext4 | B cached re-lock | 44 / 52 | 43 / 53 | -2 % |
+| ext4 | B cached fcntl | 23 / 28 | 23 / 28 | -2 % |
+| ext4 | contended handoff | 1608 / 1658 | 1562 / 1657 | -3 % |
+| xfs | A (the sequencer) LOCK_EX | 44 / 49 | 43 / 52 | -1 % |
+| xfs | B first LOCK_EX on a file | 286 / 383 | 292 / 403 | +2 % |
+| xfs | B cached re-lock | 44 / 50 | 48 / 59 | +11 % |
+| xfs | B cached fcntl | 23 / 27 | 30 / 45 | +31 % |
+| xfs | contended handoff | 1529 / 1693 | 1610 / 1664 | +5 % |
+| btrfs | A (the sequencer) LOCK_EX | 43 / 51 | 53 / 58 | +22 % |
+| btrfs | B first LOCK_EX on a file | 305 / 413 | 300 / 353 | -2 % |
+| btrfs | B cached re-lock | 43 / 50 | 45 / 53 | +3 % |
+| btrfs | B cached fcntl | 23 / 27 | 23 / 26 | +2 % |
+| btrfs | contended handoff | 1600 / 1639 | 1635 / 1679 | +2 % |
+| tmpfs | A (the sequencer) LOCK_EX | 42 / 50 | 43 / 51 | +1 % |
+| tmpfs | B first LOCK_EX on a file | 311 / 345 | 309 / 377 | -1 % |
+| tmpfs | B cached re-lock | 43 / 50 | 42 / 48 | -2 % |
+| tmpfs | B cached fcntl | 23 / 28 | 23 / 28 | -1 % |
+| tmpfs | contended handoff | 1545 / 1631 | 1616 / 1643 | +5 % |
+
+The lone node's flock, fcntl and write under a lock are in the raw logs. On this host
+every small measurement is bimodal from run to run (about 15 / 24 / 34 us for the
+write, 22 / 43 us for fcntl and 43 / 52 us for flock), on both sides, so a 3-run
+median moves by a whole mode. The +11 to +31 % lines above are such flips (xfs
+fcntl runs 23 / 23 / 24 against 30 / 44 / 23; btrfs A's lock 43 / 43 / 42 against
+55 / 53 / 51; the index build, measured the same way an hour earlier, had btrfs A
+at -4 % and xfs fcntl at -0 %). Ten more alternated runs on ext4 and tmpfs (the two
+file systems with the most high-mode branch runs in the first rounds):
+
+| fs | measurement | base | final | p50 delta | high-mode runs, base / final |
+|---|---|---:|---:|---:|---|
+| ext4 | lone write under a lock | 15 / 17 | 15 / 16 | -1 % | 1 / 2 of 10 |
+| ext4 | lone fcntl | 23 / 24 | 23 / 24 | +0 % | 1 / 2 of 10 |
+| ext4 | A (the sequencer) LOCK_EX | 43 / 51 | 43 / 53 | +0 % | |
+| ext4 | B first LOCK_EX on a file | 275 / 361 | 279 / 366 | +1 % | |
+| tmpfs | lone write under a lock | 15 / 16 | 15 / 16 | -1 % | 3 / 2 of 10 |
+| tmpfs | lone fcntl | 23 / 25 | 22 / 25 | -1 % | 3 / 2 of 10 |
+| tmpfs | A (the sequencer) LOCK_EX | 44 / 56 | 44 / 57 | -1 % | |
+| tmpfs | B first LOCK_EX on a file | 293 / 352 | 314 / 433 | +7 % | |
+
+B's first lock on a file is the line the previous section already found noisy
+(base runs here 258 to 313 us); the lock paths changed here do not run on it with
+one grant per inode beyond an O(log n) index update. No regression the runs can
+tell from that noise.

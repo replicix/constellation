@@ -66867,3 +66867,39 @@ first 400 hold an own op back by the gated mark alone); the lead-off control 0 �
 
 **Gates** (box 2): fmt, clippy `-D warnings` (authority, all targets) clean; authority lib 1,045 passed; the release sim suite
 407 passed, 0 failed, 12 ignored.
+
+## Plan 41 item 7, last open item: closing 10,000 own locked fds fenced their owners (2026-11-05)
+
+Fixed. Closing 10,000 locked files of the sequencer's own grants fenced about 9,400 of their owners in 5 of 6 base
+runs on the quiet timing box (437 in the sixth); it now fences none and takes 13 s, in 6 of 6 runs, lane on and off
+(`bench/lock-lane/RESULTS.md`, "Plan 41 item 7, last open item").
+
+- **Owner table index** (spec of "Plan 41 item 7: the lane at 10,000 grants", and review question 3). The records
+  live in `OwnerTable` (`crates/meta/src/owner_table.rs`): private fields, an index by inode and one by end, kept by
+  every insert, removal and in-place `update` (which re-indexes a changed inode or end and refuses a changed id).
+  `conflicting`, `own_grant`, the installs, `grant`'s replacement and `admit_late`'s `beside` and replacement are
+  O(records on the inode); `drop_expired` is O(expired). The lapsed memory is `LapsedMemory`: id → inode index,
+  eviction order with stale entries skipped and compacted, so `forget_lapsed` is O(log n). Debug, test and
+  simulation (`test-util`) builds rebuild the indexes after every change and compare, and compare every lookup by
+  inode with a scan (in full up to 512 records; past that, the counts and each index change). Lookups by inode keep
+  the id order a scan gave, expired records come out in id order (no sim schedule changed: sim suite and
+  `long_locks` × 300 pass).
+- **It was not the cause.** With the index alone the cell was unchanged (about 9,400 fenced in 6 of 6 runs; core
+  `Timer` steps up to 70 s). A profile of the close put 84 % of the node's samples in `LockTables::owner_tag` on the
+  FUSE threads: a process's every op is tagged with the grants of all its lock owners, the harness process has
+  10,000, and `owners.contains` was asked for each of the 10,000 local locks under the tables' mutex. The core's
+  renewal steps waited for that mutex until the grants lapsed; the late admissions of the earlier diagnostic were
+  their consequence. More than 8 owners are now sorted once, outside the mutex, and looked up by bisection.
+- Tests: `owner_table` unit tests (insert/remove/move/expire, an id change refused, randomized runs against naive
+  models of both types); `late_admissions_over_ten_thousand_owners_stay_cheap` (per-admission cost at 10,000 records
+  against 1,000; the base is 14 times, fails); `a_tag_over_ten_thousand_owners_stays_cheap` (a 10,000-owner tag
+  against the one-owner walk: base 199 times, now 17, bound 60; fails on the base).
+- No regression in `lock-latency` on ext4, xfs, btrfs and tmpfs (3 alternated runs each, then 10 more on ext4 and
+  tmpfs; the host's small measurements flip between modes run to run, both sides).
+- Left: each close is still O(local locks) (`lockers` sorts them all, `owner_tag` walks them, the owner fence's
+  `next_lapse` walks them); 13 s for 10,000 and core steps up to 2.8 s. An index of local locks by owner would make
+  them O(own locks). The per-admission `info` line stays (no admissions in the fixed cell).
+
+Gates (release, debuginfo off): fmt clean; clippy `-D warnings` on meta, engine and authority, all targets, clean;
+meta lib 399, engine lib 951, authority lib 1,045 passed; sim suite 403 passed, 0 failed, 12 ignored; `long_locks`
+× 300 seeds passed.
