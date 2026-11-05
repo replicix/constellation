@@ -53978,8 +53978,10 @@ mod c2g_settle {
     /// its delegate only when the gate can reach it
     /// (`s5_a_shippable_gate_serves_another_nodes_generation`). The gate has
     /// taken the generation on here, but node 4 is not connected: the
-    /// settle is still not this node's to answer, `Busy`, and nothing is
-    /// journaled.
+    /// settle is still not this node's to answer and nothing is journaled.
+    /// Since ADR-44 the gate recalls the generation on demand, as an open
+    /// root does for a settle on an unreachable delegate's keys, and holds
+    /// the settle until the cut (it was `Busy`).
     #[test]
     fn a_gated_root_still_bounces_a_settle_on_another_nodes_generation() {
         let mut h = gated_root(true);
@@ -53991,7 +53993,13 @@ mod c2g_settle {
             h.core.dl.gens.contains_key(&7),
             "the gate took the generation on: only the link is missing"
         );
-        assert_eq!(reply_to_3(&out, 7), Some(MutateOutcome::Busy), "{out:?}");
+        assert!(
+            matches!(reply_to_3(&out, 7), Some(MutateOutcome::Held { .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::Sent);
+        assert!(h.core.dl.gens[&7].gate_recalled);
+        assert_eq!(h.core.stats.deleg_gate_recalls, 1);
         assert_eq!(h.meta.completed_outcome(rid3(1)).unwrap(), None);
         assert_eq!(h.core.stats.gate_settles_redirected, 0);
     }
@@ -54674,10 +54682,16 @@ mod c2g_settle {
         let mut out = Vec::new();
         let plan = h.core.deleg_recall_plan(h.clk(), &keys, &h.meta, &mut out);
         assert_eq!(plan, crate::core::delegate::RecallPlan::Gated, "{out:?}");
-        h.core.start_recall(h.clk(), 7, &mut out);
         assert!(out.is_empty(), "{out:?}");
         assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::None);
         assert_eq!(h.core.stats.deleg_recalls_sent, 0);
+        // (ADR-44: `start_recall` itself sends in a shippable gate, for
+        // `gate_recall_on_demand` alone; a gate not shippable sends nothing.)
+        let (mut g, _) = gated_root_with_gen_at_4(false);
+        if g.core.dl.gens.contains_key(&7) {
+            g.core.start_recall(g.clk(), 7, &mut out);
+            assert!(out.is_empty(), "{out:?}");
+        }
         // A rename across generations (cross-subtree) the same.
         h.core.lease.gate = None;
         let plan = h.core.deleg_recall_plan(h.clk(), &keys, &h.meta, &mut out);
@@ -54727,6 +54741,152 @@ mod c2g_settle {
         poke(&mut h);
         assert!(h.core.dl.gens[&7].ended, "not ended at the open");
         assert_eq!(h.core.stats.deleg_recalls_drained, 1);
+    }
+
+    /// The recall requests to node 4 in `out`.
+    fn recalls_to_4(out: &[Action]) -> Vec<OpId> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::DelegRecall { req, gen: 7, .. } if to == 4 => Some(*req),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A rename of the root's file `/a` into generation 7's `/d`: an op
+    /// whose keys span the root and the generation (cross-subtree).
+    fn rename_into(h: &Harness, dir: constellation_fs_core::Ino) -> MutateOp {
+        let x = h.meta.allocate_ino(ROOT_INO).unwrap();
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::Create {
+                parent: ROOT_INO,
+                name: "a".into(),
+                ino: x,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            }],
+        )
+        .unwrap();
+        MutateOp::Rename {
+            parent: ROOT_INO,
+            name: "a".into(),
+            new_parent: dir,
+            new_name: "b".into(),
+            noreplace: false,
+        }
+    }
+
+    /// ADR-44, the fail-before test: a takeover gate whose journal work is
+    /// done recalls, on demand, the generation an op needs ended (a rename
+    /// across the root and another node's generation), takes the drain,
+    /// journals the cut before it opens, and then answers the requester's
+    /// settle as its own (S1: `Abandoned`, the op never runs). Before, the
+    /// gated root sent the recall only after it opened (12 to 20 s), the
+    /// settle was `Busy` meanwhile and the `EIO` went unsettled
+    /// (long-delegated-late-answers seeds 7, 20, 42 under the stricter I4
+    /// classifier). Fails on the parent: no `DelegRecall` in the gate.
+    #[test]
+    fn igr_a_shippable_gate_recalls_the_generation_a_cross_op_needs() {
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        assert!(h.core.dl.gens.contains_key(&7));
+        let op = rename_into(&h, dir);
+        // The op itself: still `Busy` (the view is closed), and the recall
+        // goes out now.
+        let out = h.step(request(20, 1, op.clone(), false));
+        assert_eq!(reply_to_3(&out, 20), Some(MutateOutcome::Busy), "{out:?}");
+        let reqs = recalls_to_4(&out);
+        assert_eq!(reqs.len(), 1, "no on-demand recall in the gate: {out:?}");
+        assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::Sent);
+        assert!(h.core.dl.gens[&7].gate_recalled);
+        assert!(h.core.lease.gate.is_some());
+        // Its settle before the cut: held here (the gate will answer it).
+        let out = h.step(request(21, 1, op.clone(), true));
+        assert!(
+            matches!(reply_to_3(&out, 21), Some(MutateOutcome::Held { .. })),
+            "{out:?}"
+        );
+        assert!(recalls_to_4(&out).is_empty(), "recalled twice: {out:?}");
+        // A drained batch first (the gate takes a recalled generation's
+        // stream), then the delegate's answer: the cut is journaled inside
+        // the gate.
+        let out = h.step(batch_from_4(&h, dir, 30, 1));
+        assert_eq!(
+            acks_to_4(&out).first().map(|a| (a.0, a.2)),
+            Some((1, false)),
+            "{out:?}"
+        );
+        let out = h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegRecalled {
+                req: reqs[0],
+                gen: 7,
+                through: 1,
+                locks: Default::default(),
+            },
+        });
+        assert!(h.core.dl.gens[&7].ended, "not ended in the gate: {out:?}");
+        assert!(h.core.lease.gate.is_some());
+        assert!(
+            h.meta.delegation_table().iter().all(|d| d.gen != 7),
+            "the cut is not journaled"
+        );
+        assert!(
+            h.meta.lookup(dir, "f1").unwrap().is_some(),
+            "the drain lost a row"
+        );
+        // The settle is now the gate's own: refused for good, the op never
+        // runs (not before the gate opens, not after).
+        let out = h.step_archived(request(22, 1, op, true));
+        assert_eq!(
+            answer(&out, 22).map(|a| a.0),
+            Some(MutateOutcome::Abandoned),
+            "{out:?}"
+        );
+        assert!(abandoned_row(&h, rid3(1)));
+        assert!(h.meta.lookup(ROOT_INO, "a").unwrap().is_some());
+        assert!(h.meta.lookup(dir, "b").unwrap().is_none());
+    }
+
+    /// ADR-44: a shippable gate recalls nothing on its own initiative. Its
+    /// batches, renewals, the generation's expiry, a sync, an op and a
+    /// settle on the live generation's keys from another node (redirected or
+    /// served as before), and a cross-subtree op in a gate whose journal work
+    /// is not done send no recall and end nothing.
+    #[test]
+    fn igr_a_gate_recalls_nothing_unprompted() {
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        let mut all = Vec::new();
+        all.extend(h.step(batch_from_4(&h, dir, 10, 1)));
+        all.extend(h.step(renew_4(11, false)));
+        all.extend(poke(&mut h));
+        all.extend(h.step(request(12, 1, create_in(&h, dir, "o"), false)));
+        all.extend(h.step(request(13, 1, create_in(&h, dir, "o"), true)));
+        h.advance(10 * h.core.cfg.delegation_ttl_ms);
+        let mut out = Vec::new();
+        let now = h.clk();
+        h.core.on_deleg_expiry(now, 7, &h.meta, &mut out);
+        all.extend(out);
+        all.extend(poke(&mut h));
+        assert!(recalls_to_4(&all).is_empty(), "{all:?}");
+        assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::None);
+        assert!(!h.core.dl.gens[&7].ended);
+        assert_eq!(h.core.stats.deleg_recalls_sent, 0);
+        assert_eq!(h.core.stats.deleg_gate_recalls, 0);
+        // Not shippable: even an op that needs the generation recalls nothing.
+        let (mut h, dir) = gated_root_with_gen_at_4(false);
+        let op = rename_into(&h, dir);
+        let out = h.step(request(20, 1, op, false));
+        assert!(recalls_to_4(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.deleg_recalls_sent, 0);
     }
 
     /// S5 (fable review): the gate serves only generations it took on from
@@ -55067,7 +55227,9 @@ mod c2g_settle {
     /// delegate's own settle (its stopped copy sends it straight back), not
     /// an ended or recalled generation, not one whose window ran out (a
     /// silent delegate the open root recalls), not an unreachable delegate.
-    /// Each is `Busy`, as before.
+    /// Each is `Busy`, as before, except where an open root would recall
+    /// (ADR-44): the delegate's own settle (it disowned the generation) and
+    /// a window that ran out are recalled on demand and held.
     #[test]
     fn s5_the_gate_redirects_a_settle_only_to_a_live_reachable_delegate() {
         let (mut h, dir) = gated_root_with_gen_at_4(true);
@@ -55111,7 +55273,17 @@ mod c2g_settle {
                 )),
             "redirected to itself: {out:?}"
         );
-        // A recall in flight, an ended generation.
+        // ADR-44: the delegate disowned it; recalled on demand.
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 4 && matches!(m, PeerMsg::DelegRecall { .. })),
+            "{out:?}"
+        );
+        let g = h.core.dl.gens.get_mut(&7).unwrap();
+        assert!(g.gate_recalled && g.recall == RecallPhase::Sent);
+        g.gate_recalled = false;
+        // A recall in flight (not the gate's), an ended generation.
         h.core.dl.gens.get_mut(&7).unwrap().recall = RecallPhase::Sent;
         assert_eq!(settle(&mut h, 22, 2), Some(MutateOutcome::Busy));
         let g = h.core.dl.gens.get_mut(&7).unwrap();
@@ -55124,7 +55296,11 @@ mod c2g_settle {
         let until = h.core.gen_until(7);
         h.advance(until.since(h.clk().wait) as u64 + 1);
         h.set_lease_end(h.now.plus(120_000));
-        assert_eq!(settle(&mut h, 25, 5), Some(MutateOutcome::Busy));
+        assert!(matches!(
+            settle(&mut h, 25, 5),
+            Some(MutateOutcome::Held { .. })
+        ));
+        assert!(h.core.dl.gens[&7].gate_recalled);
         assert_eq!(h.core.stats.gate_settles_redirected, 2);
     }
 }

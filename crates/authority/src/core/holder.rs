@@ -301,7 +301,26 @@ impl Core {
                 }
             }
         } else if self.lease.fenced() {
-            if !self.lease.releasing && req != OpId(0) && self.readopting() {
+            // ADR-44 (amends ADR-42): a gate whose journal work is done
+            // recalls, on demand, the generations this op needs ended (as an
+            // open root would for it); the op still waits for the open, and
+            // a settle is held here until the cut is journaled and the gate
+            // answers it as its own (S1, `gate_settle`).
+            let recalling = req != OpId(0)
+                && !self.lease.releasing
+                && self.gate_recall_on_demand(
+                    now,
+                    Some(from),
+                    &keys_of_op_in(&op, replica),
+                    replica,
+                    out,
+                );
+            if recalling && settle {
+                self.stats.gate_settles_held += 1;
+                MutateOutcome::Held {
+                    retry_ms: self.cfg.recall_hold_ms.max(50),
+                }
+            } else if !self.lease.releasing && req != OpId(0) && self.readopting() {
                 // A-1: the gate of a re-adoption started for a forward;
                 // the requester keeps retrying (a `Busy` would spend its
                 // retries and send it to a lease path it may not have).

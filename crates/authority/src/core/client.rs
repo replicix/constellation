@@ -701,7 +701,29 @@ impl Core {
             self.clients.get_mut(&rid).expect("present").phase = Phase::Gated;
             return;
         }
+        self.gate_recall_for_own(now, rid, replica, out);
         self.route(now, rid, replica, out);
+    }
+
+    /// ADR-44: this node's own op or settle, the root in a shippable
+    /// takeover gate: the generations of other nodes it needs ended are
+    /// recalled now (`gate_recall_on_demand`), not when the gate opens.
+    fn gate_recall_for_own(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if !self.cfg.delegation || self.lease.gate.is_none() {
+            return;
+        }
+        let Some(op) = self.clients.get(&rid).map(|c| c.op.clone()) else {
+            return;
+        };
+        let keys = super::holder::keys_of_op_in(&op, replica);
+        let me = self.cfg.node_id;
+        self.gate_recall_on_demand(now, Some(me), &keys, replica, out);
     }
 
     /// Whether an earlier op of this node touching a common inode is
@@ -3558,6 +3580,7 @@ impl Core {
             }
             self.stats.gate_settles_held_executed += 1;
         }
+        self.gate_recall_for_own(now, rid, replica, out);
         if let Some(c) = self.clients.get_mut(&rid) {
             c.phase = Phase::Backoff;
         }

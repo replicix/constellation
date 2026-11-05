@@ -123,6 +123,11 @@ pub(crate) struct GenState {
     /// Plan 46 M0.3 (S3): inherited from a predecessor root, never granted
     /// by this tenure (`granted` is when it was learned).
     pub inherited: bool,
+    /// ADR-44: the recall was started inside a shippable takeover gate, on
+    /// demand (an op or a settle that needs this generation ended,
+    /// [`Core::gate_recall_on_demand`]). Only such a recall is resent, has
+    /// its drain taken and is ended (`RecallCut`) before the gate opens.
+    pub gate_recalled: bool,
     /// Placement: since when the delegate's share has been below the
     /// leave threshold (`None`: it is not).
     pub below_since: Option<WaitMs>,
@@ -1094,6 +1099,112 @@ impl Core {
                 .is_some_and(|g| g.inherited && !g.ended && g.recall == RecallPhase::None)
     }
 
+    /// ADR-44: a shippable gate takes `gen`'s stream batches: a generation
+    /// it serves ([`Self::gated_serves`]), or one it is recalling on demand
+    /// (`GenState::gate_recalled`): the drain to the recall's `through` is
+    /// what lets it end the generation before the gate opens.
+    pub(crate) fn gated_takes_stream(&self, now: Now, gen: u64) -> bool {
+        self.gated_serves(now, gen)
+            || (self.root_gated_shippable(now)
+                && self.dl.gens.get(&gen).is_some_and(|g| {
+                    g.inherited
+                        && g.gate_recalled
+                        && !g.ended
+                        && matches!(g.recall, RecallPhase::Sent | RecallPhase::Drained(_))
+                }))
+    }
+
+    /// ADR-44 (amends ADR-42): what a takeover gate whose journal work is
+    /// done recalls for an op on `keys` it cannot execute before it opens:
+    /// exactly the generations an open root would recall for that op, and
+    /// nothing else. An inherited generation of another node, not ended, not
+    /// a designation (never recalled), that the op needs ended: every one a
+    /// cross-subtree op involves, or the one a single-generation op falls
+    /// under when an open root would not redirect it there (`redirect_from`
+    /// names the requester of a forward or a settle, as `on_forward`'s S3
+    /// test: a live, reachable generation not being recalled, and not the
+    /// delegate's own op; `None`: the caller never redirects, the inbox).
+    /// The recall is the ordinary one (`start_recall`); the gate takes the
+    /// drain and ends the generation at its cut (`root_progress`), so a
+    /// settle on the keys becomes the gate's own (S1) once the cut is
+    /// journaled. It seals, reclaims and outwaits nothing, and starts no
+    /// recall on its own initiative. `true`: a recall the op needs is in
+    /// flight.
+    pub(crate) fn gate_recall_on_demand(
+        &mut self,
+        now: Now,
+        redirect_from: Option<NodeId>,
+        keys: &TouchSet,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        if !self.cfg.delegation
+            || !self.deleg_known()
+            || self.lease.gate.is_none()
+            || !self.root_gated_shippable(now)
+        {
+            return false;
+        }
+        let me = self.me();
+        let (involved, cross): (Vec<u64>, bool) = match replica.resolve_ownership(keys) {
+            Ownership::Root => return false,
+            Ownership::Delegated(d) => {
+                if d.node == me {
+                    return false;
+                }
+                if let Some(from) = redirect_from {
+                    let live = self.dl.gens.get(&d.gen).is_some_and(|g| {
+                        !g.ended
+                            && g.recall == RecallPhase::None
+                            && now.wait < self.gen_until(d.gen)
+                            && self.links.get(&d.node).is_some_and(|l| l.connected)
+                    });
+                    let disowned = from == d.node && !self.grant_in_flight(now, d.gen);
+                    if live && !disowned {
+                        return false;
+                    }
+                }
+                (vec![d.gen], false)
+            }
+            Ownership::CrossSubtree { involved, .. } => (
+                involved
+                    .iter()
+                    .filter(|d| d.node != me)
+                    .map(|d| d.gen)
+                    .collect(),
+                true,
+            ),
+        };
+        let mut pending = false;
+        for gen in involved {
+            let Some(g) = self.dl.gens.get_mut(&gen) else {
+                continue;
+            };
+            if g.ended || !g.inherited || g.node == me || g.kind == DelegKind::Designated {
+                continue;
+            }
+            if g.recall == RecallPhase::None {
+                if cross {
+                    // As `deleg_recall_plan`: delegated again once the op
+                    // ran (`deleg_redelegate_after_cross`, a usable root's).
+                    g.redelegate = true;
+                }
+                self.start_recall(now, gen, out);
+                if let Some(g) = self.dl.gens.get(&gen) {
+                    if g.recall != RecallPhase::None {
+                        self.stats.deleg_gate_recalls += 1;
+                    }
+                }
+            }
+            pending |= self
+                .dl
+                .gens
+                .get(&gen)
+                .is_some_and(|g| !g.ended && g.gate_recalled && g.recall != RecallPhase::None);
+        }
+        pending
+    }
+
     /// What this node does as a root now, for the table's generations.
     pub(crate) fn root_deleg_level(&self, now: Now) -> RootSync {
         if self.root_usable(now) {
@@ -1387,6 +1498,7 @@ impl Core {
                         redelegate: false,
                         granted: now.wait,
                         inherited: true,
+                        gate_recalled: false,
                         below_since: None,
                         seal_reqs: BTreeMap::new(),
                         sealed_tail: None,
@@ -6844,17 +6956,25 @@ impl Core {
     }
 
     pub(crate) fn start_recall(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
-        // Plan 46 M0.3 (S5, ADR-42): the takeover gate recalls nothing.
-        if self.lease.gate.is_some() {
+        // Plan 46 M0.3 (S5, ADR-42), amended by ADR-44: a takeover gate
+        // recalls only on demand (`gate_recall_on_demand`), once its journal
+        // work is done, and only a generation of another node it took on.
+        let gated = self.lease.gate.is_some();
+        if gated && !self.root_gated_shippable(now) {
             return;
         }
+        let me = self.me();
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return;
         };
         if g.ended || g.recall != RecallPhase::None {
             return;
         }
+        if gated && (!g.inherited || g.node == me) {
+            return;
+        }
         g.recall = RecallPhase::Sent;
+        g.gate_recalled = gated;
         // The slot closes at the transition, in this step (plan 41 R1,
         // rule 2): no renewal is granted from here, whoever answers it.
         self.dw.close_for_recall(gen);
@@ -6897,7 +7017,8 @@ impl Core {
     /// (L3), each time under a new request id, with the delay doubling from
     /// a request's timeout to 2 s, until the delegate answers (any attempt
     /// counts) or the expiry outwaits the generation. Nothing goes out in
-    /// a takeover gate (ADR-42) or while this root is unusable; the timer
+    /// a takeover gate (ADR-42) unless the gate started the recall on demand
+    /// (ADR-44), or while this root is unusable; the timer
     /// is armed again and the next firing tries once more.
     pub(crate) fn on_deleg_recall_resend(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
         let Some(g) = self.dl.gens.get_mut(&gen) else {
@@ -6907,9 +7028,13 @@ impl Core {
         if g.ended || g.recall != RecallPhase::Sent {
             return;
         }
-        let (to, dir, mut back_off) = (g.node, g.dir, g.recall_backoff_ms);
+        let (to, dir, mut back_off, gate_recalled) =
+            (g.node, g.dir, g.recall_backoff_ms, g.gate_recalled);
         let floor = self.deleg_request_timeout_ms();
-        if self.lease.gate.is_none() && self.root_usable(now) {
+        // ADR-44: a recall the gate started on demand is sent again inside
+        // the gate too (L3); any other waits for the open.
+        let gate_ok = gate_recalled && self.root_gated_shippable(now);
+        if (self.lease.gate.is_none() && self.root_usable(now)) || gate_ok {
             back_off = (back_off * 2).min(2_000).max(floor);
             let req = self.op_id();
             let g = self.dl.gens.get_mut(&gen).expect("present");
@@ -7280,8 +7405,11 @@ impl Core {
     fn root_progress(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         // Plan 46 M0.3 (S5, ADR-42): the takeover gate ends no generation (a
         // recall kept from a usable phase of this tenure is ended when the
-        // gate opens: `delegation_sync`).
-        if self.lease.gate.is_some() {
+        // gate opens: `delegation_sync`), except, under ADR-44, one it
+        // recalled on demand once the recall drained: its cut is journaled
+        // now, so a settle on its keys is the gate's own (S1).
+        let gated = self.lease.gate.is_some();
+        if gated && !self.root_gated_shippable(now) {
             return;
         }
         let done: Vec<u64> = self
@@ -7289,7 +7417,9 @@ impl Core {
             .gens
             .iter()
             .filter(|(_, g)| {
-                !g.ended && matches!(g.recall, RecallPhase::Drained(th) if g.cursor >= th)
+                !g.ended
+                    && (!gated || (g.gate_recalled && g.inherited))
+                    && matches!(g.recall, RecallPhase::Drained(th) if g.cursor >= th)
             })
             .map(|(g, _)| *g)
             .collect();
@@ -7680,8 +7810,8 @@ impl Core {
         // done takes its inherited delegates' batches. `root_ends_recall`
         // stays as it was: it also gates `on_deleg_expiry`, and the gate
         // reclaims and seals nothing.
-        let usable =
-            (self.root_ends_recall(now, gen) || self.gated_serves(now, gen)) && self.cfg.delegation;
+        let usable = (self.root_ends_recall(now, gen) || self.gated_takes_stream(now, gen))
+            && self.cfg.delegation;
         // A root back from a restart that the lease object still names, and
         // that holds nothing yet (a restart with nothing of its own to ship
         // does not acquire on its own), refuses its delegate's batches for as
@@ -8082,6 +8212,7 @@ impl Core {
                 redelegate: false,
                 granted: now.wait,
                 inherited: false,
+                gate_recalled: false,
                 below_since: None,
                 seal_reqs: BTreeMap::new(),
                 sealed_tail: None,

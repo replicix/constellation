@@ -1589,7 +1589,12 @@ impl Core {
                         // The gate recalls nothing (ADR-42): left in the inbox
                         // for the poll after it, as an op under a generation
                         // the gate has not taken on is.
-                        super::delegate::RecallPlan::Gated => return Err(Halt::Recall),
+                        // ADR-44: once the gate's journal work is done it
+                        // recalls what the op needs, on demand, meanwhile.
+                        super::delegate::RecallPlan::Gated => {
+                            self.gate_recall_on_demand(now, None, &keys, replica, out);
+                            return Err(Halt::Recall);
+                        }
                         super::delegate::RecallPlan::Refuse(code) => {
                             // Phase 2b: a designation is involved.
                             replica.journal_inbox_refusal(rid, code, ack, decoded.as_ref().ok())?;
