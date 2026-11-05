@@ -1621,7 +1621,7 @@ answered `EIO` only for a request that is settled (committed, or abandoned by
 the sequencer in force), and a committed row is re-shipped verbatim, under the
 identity it was committed with, never executed again by rid.
 
-**See**: [plan 43](../plans/v1/wip/43-commit-rule.md) §3-§5 (the terms, the
+**See**: [plan 43](../plans/v1/done/43-commit-rule.md) §3-§5 (the terms, the
 invariants I1-I5 and the acknowledgement classes); the simulation's oracles
 that check them ([TESTING.md](../how-to-guides/development/TESTING.md),
 "Commit-rule oracles"); PROGRESS, "Plan 43 C0 — The commit point, named and
@@ -1992,7 +1992,7 @@ sealed stop admitting local sections (the traced violations came from a TTL
 claim, not from the sealed holder).
 
 **See**: [DESIGN.md §5](DESIGN.md#5-write-authority-the-one-rule),
-[plan 43](../plans/v1/wip/43-commit-rule.md) (Appendix B, the clock
+[plan 43](../plans/v1/done/43-commit-rule.md) (Appendix B, the clock
 inventory), `crates/types/src/clock.rs`, `crates/authority/src/core/lease.rs`,
 `crates/store-s3/src/heartbeat.rs`, `crates/meta/src/locks.rs`.
 
@@ -2428,7 +2428,7 @@ part as marked on each.
 
 **See**: [plan 46](../plans/v1/wip/46-committed-or-final.md) (the
 diagnosis, the design, the milestones, the per-topology behaviour, the
-open questions); [plan 43](../plans/v1/wip/43-commit-rule.md) (the
+open questions); [plan 43](../plans/v1/done/43-commit-rule.md) (the
 rules, the invariants I1–I5, what continues); the arbiter study;
 [DESIGN §4](DESIGN.md#metadata-plane) and [§9](DESIGN.md#failure-handling),
 which change with the code in each stage. Public sources: CockroachDB's
@@ -2590,7 +2590,7 @@ delegate may count it; M1.2 deletes the delegate's lone class and
 `root_committed` with it, and M1.2 may return to the cursor if the member
 copy covers the window.
 
-See: [plan 43](../plans/v1/wip/43-commit-rule.md) (§4 the oracle, Q16),
+See: [plan 43](../plans/v1/done/43-commit-rule.md) (§4 the oracle, Q16),
 [plan 46](../plans/v1/wip/46-committed-or-final.md) M1.2;
 `crates/authority/src/core/delegate.rs` (`root_append_cap`,
 `root_stream_push`, `deleg_poke_root`, `on_delegate_stream`,

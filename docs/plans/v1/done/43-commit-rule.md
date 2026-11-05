@@ -1,7 +1,7 @@
 # Plan 43 — The commit rule: acknowledged means committed by the configured group
 
 > **Status note (2026-11-01, the maintainer's direction change;
-> [plan 46](46-committed-or-final.md),
+> [plan 46](../wip/46-committed-or-final.md),
 > [ADR-40](../../../explanation/DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)).**
 > The rules of this plan stand; the structure that enforces them changes.
 > *Done*: C0, C1-1..C1-4, C2a..C2f, C7a, C7-F, C7b commits 1–7 and 9.
@@ -23,11 +23,11 @@
 > not run retroactively; they fold into plan 46's G1–G6 four-file-system
 > re-measure. C2g, C2g′ and C2h's scenarios landed (plan 46 M0.1–M0.3; the
 > gate-before-M1 fixes landed and the remaining I4 ceilings are carried to
-> stage 1, see its "As landed 2026-11-04/05"). **What still blocks moving
-> this plan to `done/`:** plan 46 M0.4 (the whole-C2 fable review and its
-> required changes); then the box ticks with evidence (interim Q7 fixes,
-> G1–G6 acceptance, C0/C1/C7a, the §6 documents), the README row, links and
-> a PROGRESS note.
+> stage 1, see its "As landed 2026-11-04/05"). **Closed (2026-11-05).** Plan 46 stage 0 is complete (M0.4, the whole-C2
+> fable review, landed with its required changes), the boxes of §14 are ticked
+> where there is evidence and closed by plan 46 (D-4, D-5) where there is
+> none here, §11.2's open findings moved to plan 46 M3.2, and the plan moved
+> to `done/`. What is left of the commit rule's work is plan 46's.
 
 Read `docs/plans/v1/CONVENTIONS.md` first. This plan implements the
 recommendation of the arbiter study (`docs/explanation/ARBITER-STUDY.md`
@@ -4343,6 +4343,14 @@ to land before C0.
 
 ### 11.2 Open findings (measured, not yet triaged)
 
+*Closure (2026-11-05, D-4):* the three findings below that are still open (no
+sim configuration for C7b spec commit 6's honour bound; the cold backup's wall
+hint; plan 41's lock lane stamp rule) moved to
+[plan 46](../wip/46-committed-or-final.md) M3.2 (C7b-8: the barriers and cuts
+on the wait clock), where they are triaged with that milestone's clock sims.
+The two with a recorded fix (the lost dependency, ADR-39; `locks-released-
+takeover`) stay here as the record.
+
 - **A sealed tail can carry a row whose dependency was lost** (fixed
   2026-10-30, ADR-39: a `DelegGroup` acknowledgement waits for the row's
   dependencies on the node's other generations, and the drain ends the
@@ -4453,32 +4461,42 @@ to land before C0.
 *Status (2026-11-01, see the note at the top):* done — C0, C1, C2a–C2f,
 C7a, C7-F, C7b 1–7 and 9. Continuing under this plan — C2g, C2g′, C2h's
 scenarios (plan 46 stage 0), then C4 and C7b-8 (plan 46 stage 3).
-Superseded by [plan 46](46-committed-or-final.md) — C3 as specified
+Superseded by [plan 46](../wip/46-committed-or-final.md) — C3 as specified
 (folded into M1.2), C5, C6, the G1 p90 nudge, C2h's flex strict flags.
 The boxes below for the superseded items stay unticked and are closed by
 plan 46's exit criteria.
 *Closure (2026-11-05):* D-4 closes C3, C4, C5, C6 and C7b item 8 by plan
 46 (**closed by plan 46 (D-4)**); D-5 folds the C0 and C2 file-system
 baselines into plan 46's G1–G6 re-measure (**closed by plan 46 (D-5)**).
-No box is ticked here without evidence; the rest wait for M0.4.
+*Closed (2026-11-05):* plan 46 stage 0 is complete (M0.4 landed). A box is
+ticked below only with evidence (the PROGRESS section or the commits named);
+every other box says which plan 46 decision or milestone closes it. Plan 43 is
+done; what remains of the commit rule is plan 46's.
 
-- [ ] Interim work landed or explicitly deferred by the maintainer (Q7):
+- [x] Interim work landed or explicitly deferred by the maintainer (Q7):
       the F2 fix, the takeover-loss fix, the 9287 and 2945 fixes, C7-H2,
       C7-H1 (landed in four commits) — each with its fail-before evidence
-      in PROGRESS.
-- [ ] The maintainer's acceptance of each latency gate (§10, G1–G6)
-      recorded before its milestone started.
-- [ ] C0: oracles I1–I5 in the sim with their flags, evaluated at the
+      in PROGRESS. *(PROGRESS: "Fix: a delegation lost to a stuck authority
+      core" (F2); "Plan 31 closing" lists the takeover-loss and seed fixes;
+      "Fix: two deposed-root bugs of `long-delegated-late-answers` (seeds
+      9287 and 2945)"; "Fix: a fast successor whose clock is ahead got no
+      quarantine" (C7-H2); "Plan 43 C7-H1, commit 1 of 4" to "commit 4 of
+      4".)*
+- [x] The maintainer's acceptance of each latency gate (§10, G1–G6)
+      recorded before its milestone started. *(Q-answers of 2026-10-17, and
+      G5's full floor on 2026-10-18, §11 above.)*
+- [x] C0: oracles I1–I5 in the sim with their flags, evaluated at the
       answerer's emission; the sim rebuild; the operator escape and the
       `waiting_for_group` classification; the model properties and
       counterexamples; Q3's property checked; the baseline counts per
       config (including `backup-two`); the performance baselines on four
-      file systems *(the baselines: closed by plan 46 (D-5), folded into
-      its G1–G6 re-measure)*.
-- [ ] C1: committed rows never re-executed after a deposition or a seal;
+      file systems *(the baselines: **folded into plan 46 G1–G6 (D-5)**; the rest:
+      PROGRESS, "Plan 43 C0 — The commit point, named and checked")*.
+- [x] C1: committed rows never re-executed after a deposition or a seal;
       the tail fetch on the TTL path; strict durability fails on non-lone
       rollbacks and passes on every backup config; Q1's rule in place.
-- [ ] C2: I1 strict on every config except lone topologies; `gated` per
+      *(PROGRESS, "Plan 43 C1-1" to "C1-4".)*
+- [x] C2: I1 strict on every config except lone topologies; `gated` per
       class; `Ungated` only for lone or epoch-held nodes; `Recall.through`
       and the end-of-generation seal of every named backup; the
       delegate's write-then-wait fast path; `Abandon` and I4 strict; the
@@ -4490,7 +4508,15 @@ No box is ticked here without evidence; the rest wait for M0.4.
       for its group: the seal set, the strict wait, `waiting_for_group`,
       `abandon-group --gen`; and the lone root answering other nodes from the
       archive, `Ungated` only where lone); *C2g landed* (PROGRESS, "Plan 43
-      C2g": the settle before `EIO`); C2h open.
+      C2g": the settle before `EIO`); C2h's scenarios landed
+      (PROGRESS, "Plan 43 C2h"; plan 46 M0.3), the whole-C2 review's changes
+      landed (PROGRESS, "Plan 46 M0.4: what the whole-C2 review required, and
+      what landed"; plan 46 M0.4). Two parts of this box are not met as
+      worded and are carried by maintainer decision D-1 (2026-11-04): I4
+      strict on every configuration (the remaining ceilings: **closed by
+      plan 46 stage 1, M1.3**; the flex strict flags and `flex-crash`'s zero
+      I2(b) copies: **plan 46 M1.4**), and the C2 four-file-system G1 run
+      (**folded into plan 46 G1–G6 (D-5)**).
 - [ ] *(closed by plan 46 (D-4): M1.2)* C3: I2c (verbatim) strict on every config; the delegate-turned-root
       rule (move, apply verbatim, re-append deduped by origin, end);
       the fold, `Records` copies, holed generations and the deposed-root
@@ -4504,13 +4530,25 @@ No box is ticked here without evidence; the rest wait for M0.4.
       producer; the docs' offline-first contract; the full CONVENTIONS
       gates (pjdfstest 8798/8798).
 - [ ] *(closed by plan 46 (D-4): superseded)* C6: the add-window rule with its fail-before; measured; the maintainer's default recorded.
-- [x] C7a (2026-10-21, six commits). [ ] C7b: every exit item of §7 C7 *(item 8 closed by plan 46 (D-4): stage 3)*.
+- [x] C7a (2026-10-21, six commits). [x] C7b: every exit item of §7 C7
+      *(commits 1–7 and 9 landed, PROGRESS, "Plan 43 C7b, commit 1/N" to
+      "spec commit 9"; item 8 **closed by plan 46 (D-4): M3.2**)*.
 - [ ] §9's gates met at every milestone, on the four file systems where
-      §9 says so; `bench/commit-rule/RESULTS.md` complete.
-- [ ] Every §6 document change made in its milestone; ADR-33 and the
-      clock ADR written; the amended ADRs marked.
-- [ ] Every milestone reviewed (fable) before the next started; the
-      reviews' required changes done.
+      §9 says so; `bench/commit-rule/RESULTS.md` complete. *(The gates were
+      measured on one file system, box 1 with ext4 state, as each milestone
+      landed; the four-file-system runs and the C0 baseline **fold into plan
+      46's G1–G6 re-measure (D-5)**, and `RESULTS.md`'s pending rows are
+      filled there.)*
+- [x] Every §6 document change made in its milestone; ADR-33 and the
+      clock ADR written; the amended ADRs marked. *(ADR-33 and ADR-35 are in
+      `DECISIONS.md`; ADR-33's status line was updated with plan 46 M0.4,
+      DESIGN §4's `Local` bullet and §4's I4 text with it. The documents of
+      the superseded milestones (C3, C4, C5, C6) are plan 46's.)*
+- [x] Every milestone reviewed (fable) before the next started; the
+      reviews' required changes done. *(Reviews and their follow-ups in
+      PROGRESS: "Plan 43 C7b, review of spec commits 4-7", "Plan 43 C2d
+      review", "Plan 43 C2g′ review fixes", and the whole-C2 review, "Plan 46
+      M0.4: what the whole-C2 review required, and what landed".)*
 
 ## 15. PROGRESS.md
 

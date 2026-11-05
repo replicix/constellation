@@ -53812,7 +53812,7 @@ On the box (`/tmp` on tmpfs), every job under `timeout --kill-after=30s`,
 
 ## Plan 43 C0 — The commit point, named and checked
 
-The first milestone of plan 43 ([the commit rule](wip/43-commit-rule.md)): no
+The first milestone of plan 43 ([the commit rule](done/43-commit-rule.md)): no
 behaviour change, but the commit point of every acknowledgement gets a name
 (`AckClass`) and the simulation and the models get the oracles that check it,
 so that each later milestone starts from a table of what today's code does and
@@ -57127,7 +57127,7 @@ Sim: the two failures need a seal that fails and a group record in between; no c
 
 ## Plan 43 C1-1 — The root group's commit holds across a listing and a removal
 
-The first commit of plan 43 C1 ([the commit rule](wip/43-commit-rule.md), the coder
+The first commit of plan 43 C1 ([the commit rule](done/43-commit-rule.md), the coder
 spec's §3): a backup counts toward an acknowledgement only from the acknowledgements of
 appends that carried a configuration version listing it, and a removal CAS that is out
 or in doubt lands covered. It only makes acknowledgements wait longer, in two
@@ -66564,3 +66564,17 @@ time or event guard was added: the hang was after the run, and the client waits 
 **Sweeps** (2,000 seeds of the 34 ratchet and strict configurations, both modes): no hang, no failing seed but `long-backup`
 with the knob seed 728 (`member_copies_drained`, known, untriaged). **Gates**: fmt, clippy `-D warnings` (authority, all
 targets), authority lib 1,039 passed, the release sim suite 400 passed, 0 failed, 12 ignored.
+
+## Plan 46 stage 0 closed; plan 43 done (2026-11-05)
+
+Documentation only. Plan 46 M0.4 (the whole-C2 review: MUST-1, the shipper guard, the stricter I4 classifier with the lowered ceilings, ADR-44)
+landed, so stage 0 is complete under D-1's amended exit; plan 46's header, §6 ("As landed (M0.4, 2026-11-05)") and §12 say so, and stage 1
+(M1.0, the Stateright model) is next. Carried from M0.4 to stage 1: SHOULD-1 to M1.2 (with L2b); the in-gate class's residual classes, two
+classifier gaps of the lease-path arm, the `member_copies_drained` finding of `backup-crash-slow` 840's shape and `long-backup` seed 728 to M1.3;
+ADR-41's lone-journal commit and ADR-43's no-tail proof against sticky grants to M1.0's model.
+
+Plan 43 moved from `wip/` to `done/` (D-4, D-5): the boxes of its §14 with evidence are ticked (the interim Q7 fixes, the gates' acceptance, C0, C1, C2
+as amended by D-1, C7a, C7b without item 8, the documents, the reviews); C3, C4, C5, C6 and C7b-8 are closed by plan 46 (C3 in M1.2, C4 in M3.1, C5 in
+stage 2, C6 superseded, C7b-8 in M3.2); the C0 and C2 four-file-system baselines and `bench/commit-rule/RESULTS.md`'s pending rows fold into plan 46's
+G1–G6 re-measure; §11.2's open findings moved to plan 46 M3.2. Links to the plan (the README, plan 46, DECISIONS, the earlier PROGRESS sections, the
+harness's `commit.rs` comment) point at `done/`.

@@ -1,6 +1,6 @@
 //! Plan 43 C0's `ack-latency`: what an acknowledgement costs per topology,
 //! actor and op — the baseline the commit rule's milestones are measured
-//! against (`bench/commit-rule/run.sh`, `docs/plans/v1/wip/43-commit-rule.md`
+//! against (`bench/commit-rule/run.sh`, `docs/plans/v1/done/43-commit-rule.md`
 //! §7 C0 and §9). Measure-only: nothing is asserted about the numbers; the
 //! scenario fails only when a topology is not what it claims (the
 //! acknowledgement mode it is supposed to measure is not the one the node

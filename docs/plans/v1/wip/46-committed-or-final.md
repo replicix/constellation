@@ -1,5 +1,10 @@
 # Plan 46 — Committed or final: one stream per node, the commit rule per configuration, no server-side replay
 
+> **Status (2026-11-05): stage 0 complete** (M0.1–M0.4, under the exit
+> amended by D-1; see "As landed (M0.4, 2026-11-05)" in §6 and §12). Plan 43
+> is done and closed into this plan (D-4, D-5). **Stage 1 is next**, starting
+> with M1.0, the Stateright model.
+
 Read `docs/plans/v1/CONVENTIONS.md` first. This plan changes the
 *direction* of the acknowledgement and ordering-node work that plan 43
 carries, on the maintainer's decisions of 2026-11-01
@@ -602,7 +607,7 @@ arise), as plan 43 §15 prescribes.
 | **M0.1 C2g** | As plan 43 §5.3 item 5 and the C2 spec §6: `settle` on `MutateRequest` and `InboxOp`, the executor journals `Refused { rid, ABANDONED }`, the requester's split deadline. | — | I4 (zero hits today because the fix is unbuilt): `load-probe-takeover` seed 46's shape under `strict_settle`. | Model `eio_never_lands_late` (`protocol.rs`); sim `strict_settle` on every config; harness `takeover-loss-two-node`. | I4 strict everywhere; the ledger's late-landing allowance removed for non-singleton topologies. |
 | **M0.2 C2g′** | Drop-held option B (the drop-held proposal's R1–R8): `AwaitRetry` placeholders, the drain stops at one, overlapping forwards parked, the bound settles with C2g's record; variant 3(i) for `NonStealable` shadows. | — | `flex-crash` ×2,000 under `strict_identity`: 777 I2(b) copies today; seeds 502/839/1526/1845 (the drop variant), 807 and 39 (I5). | New sim config `drop-held-chain` (and its requester-dies variant); harness `drop-held-remote-dependents`; I2(b) excludes `AwaitRetry` by kind. | Zero I2(b) copies; row 52 closed. (The placeholder is deleted again in M2.2; it is correct meanwhile.) |
 | **M0.3 C2h scenarios** | `takeover-loss-two-node`, `tloss-two-node`, `delegated-group-switch`, the die/abandon pair; docs; `bench/commit-rule/RESULTS.md`'s C2 rows. **Not** the strict flags on flex configs (D9). | — | Each scenario fails against a build before its fix. | Harness catalogue; the campaign cell that found the loss ×20. | Scenarios green; the gate-before-M1 fixes landed; the flex strict flags and the other remaining I4 ceilings carried to named stage-1 milestones (D-1, 2026-11-04; see "As landed 2026-11-04/05"). |
-| **M0.4** | Whole-C2 fable review (plan 43's "C2 review"). | — | — | — | Required changes landed. |
+| **M0.4** | Whole-C2 fable review (plan 43's "C2 review"). | — | — | — | Required changes landed. **Done (2026-11-05).** |
 
 *As landed (M0.2, 2026-11-01; PROGRESS, "Plan 43 C2g′"):* the drop-held
 proposal's R1–R8 as plan 43's C2g′ note records them. `flex-crash` ×2,000
@@ -727,7 +732,7 @@ generation, set when the stream delivers the append of the node's own row, and c
 stream's `Local` rows (`DelegateNodeEnded`, and `SubtreeReleased` for what it releases), never by the streamed install of
 that record (it arrives between the own row and the later root row). The lost-recall liveness item (L3) stays a separate item.
 
-*As landed 2026-11-04/05 (maintainer decisions D-1 to D-3; PROGRESS, "Plan status, 2026-11-05"; M0.4 is the one stage-0 item left):*
+*As landed 2026-11-04/05 (maintainer decisions D-1 to D-3; PROGRESS, "Plan status, 2026-11-05"; M0.4, the one stage-0 item then left, landed the same day, below):*
 the stage-0 exit is amended: **"I4 strict everywhere" becomes "the gate-before-M1 fixes landed; the remaining I4 ceilings carried to
 named stage-1 milestones"** (D-1). What landed: **ADR-43** (generation numbers carry the epoch, `gen = epoch << 32 | n`) with its
 leftovers (restart and rebuild void of a streamed-ahead end, `deleg_any` raised on rebuild, an operator's abandon ends the
@@ -754,6 +759,35 @@ effect, a gate not shippable while the recall drains, an unreachable delegate). 
 journals the cut ([ADR-44](../../../explanation/DECISIONS.md#adr-44-a-takeover-gate-whose-journal-work-is-done-recalls-on-demand));
 the M0.4 review's STAGE-1 item "in-gate class, M1.3 with S4: do not add a gated recall now" is superseded by that decision. Under
 M1.2/M1.3 the on-demand recall becomes a request the holder answers with `SubtreeReleased`.
+
+*As landed (M0.4, 2026-11-05; PROGRESS, "MUST-1", "Plan 46 M0.4: what the whole-C2 review required, and what landed", "Plan 46 M0.4
+follow-up: the classifier's SHOULD-2, SHOULD-3 and SHOULD-4", "Plan 46 M0.4 follow-up: ADR-44"):* the fable review of the whole C2 (on main
+`39e85a17`) found one integrity hole and a set of SHOULDs. **MUST-1** (a claimant with no tail ships its rows of a generation the log never
+listed as root rows under origin `(g, i)`, completing rids the log had refused: I2a, I2c, I4 late landing): fixed in
+`Meta::strand_for_takeover_carrying` (the claimant's strand also takes its own delegate rows of every unlisted generation the log never ended,
+whatever the claim carries; the replay by rid meets the log's `Refused { ABANDONED }` and forgets the entry); fails on main before the fix, with a
+guard test for a listed generation and a core-level test of the gate wiring. **Landed SHOULDs:** a counting shipper guard (`status.ack.unjustified_ships`,
+a debug assertion, a sim failure when any node's counter is not 0; not a refusal, which would hold a root's own appends of a delegate's rows
+at the head of the journal); the member-copy read hold's cap counted and warned (`status.ack.held_copy_lapsed`); the documents (ADR-33's status,
+DESIGN §4's `Local` bullet, plan 43 §4's I4 as built); `cargo fmt`. **The stricter I4 classifier** (SHOULD-2: keys across live generations the root
+reaches are due after one recall round trip and its resend back-off; SHOULD-3: a restarted holder re-adopts its own unexpired lease at once;
+SHOULD-4: a generation's group is its latest version, and the tenure group's tail is looked for over the whole stretch of the claim) moved 432 unsettled
+`EIO`s from "no sequencer in time" to violations, all of them the in-gate class, which **ADR-44** closes (a shippable takeover gate recalls on demand,
+drains and journals the cut of exactly the generations a pending op or settle needs; fable review changes landed): violations over 2,000 seeds fell
+from 281 / 676 (no knob / slow lease reads) to 6 / 149 in `long-delegated-late-answers`, 325 / 627 to 35 / 98 in `delegated-holder-cut`, and similarly in
+`long-delegated-backup` and `placement-hot`, no failing seed, I1 and I2 at 0. The ratchet's ceilings were **lowered** to the measured 0 and 0 for
+`delegated-backup`, `delegated-holder-cut`, `long-delegated-backup` and `long-delegated-late-answers`; none was raised (the allowed ceiling of
+`delegated-backup-and-delegate-die` moved from 0 to 26 when the waiting runs' `EIO`s began to be counted, a count the ceiling never saw). **Carried to
+stage 1:** SHOULD-1 (the §3.8 drop of an answered gated row at an orphan cut of 0, with ADR-41's second copy; pin
+`an_orphan_end_queues_a_delegates_answered_gated_row` ignored) to **M1.2** with L2b; the in-gate class's residual classes (a delegate restarted in the
+gate, a rid that took effect, an unreachable delegate, a refusal not shipped by the window's end) to **M1.3** with S4, where the on-demand recall becomes
+a request the holder answers with `SubtreeReleased`; ADR-41's lone-journal commit and ADR-43's no-tail proof against sticky grants to the **M1.0**
+model, before M1.3; two classifier gaps in the lease-path arm (the generation-tail condition the root arm applies; the requester counted as a member holding
+the tail, seed 435) and the unmet `member_copies_drained` on `backup-crash-slow` 840's shape (`TailOf` retirement) to **M1.3**; `long-backup` with the knob,
+seed 728 (`member_copies_drained`), untriaged, to **M1.3**. **Side findings fixed:** the stateright linearizability search was exponential in overlap
+(seed 1498 of `far`, `backup`, `backup-two` ran past 20 minutes); it is the Wing and Gong search with Lowe's memoization now, cross-checked on 10,698
+histories. Gates at the last commit: fmt and clippy `-D warnings` clean, authority lib 1,039 passed, the release sim suite 400 passed, 0 failed, 12 ignored.
+**Stage 0 is complete** under D-1's amended exit; stage 1 (M1.0, the Stateright model) is next.
 
 ### Stage 1 — one stream per node, the rule per configuration (6–10 weeks)
 
@@ -811,7 +845,7 @@ deletes `root_committed` with the lone delegate and the per-row classes).
 | M | Scope | Deletions | Fail-before | Oracles / sims / scenarios / model | Exit |
 |---|---|---|---|---|---|
 | **M3.1 C4** | Plan 43 §5.5 and its coder spec on the new records (§5.8). | The lock mirror and handoff machinery, floors and barriers in messages. | Plan 43 C4's: rows 05, 06, 23, 30, 47's shapes under `strict_locks`. | I3 strict on every lock config; `long_locks` ×1,000; the lock model's `lock_state_in_log`. | Plan 43 C4's exit items. |
-| **M3.2 C7b-8** | Barriers and cuts on the wait clock, the root-anchored cut, the echo of the root's send stamp. | — | Rows 9/30's stale reads (row 54). | The clock sims; `strict_reads`. | Plan 43 C7b's exit items. |
+| **M3.2 C7b-8** | Barriers and cuts on the wait clock, the root-anchored cut, the echo of the root's send stamp. Also plan 43 §11.2's open findings (D-4, 2026-11-05): a sim configuration that shows what C7b spec commit 6's honour bound fixes (stamp a forwarded op's receipt at the bus's delivery, then an executor-behind configuration with a stalled executor); the cold backup's wall hint (a live holder sealed once per start when the backup's wall is ahead, sealed late when it is behind); plan 41's lock lane stamp rule (any later off-core owner path takes the renewal's `(clock, sent)`, never confirms from the owner's clock). | — | Rows 9/30's stale reads (row 54). | The clock sims; `strict_reads`. | Plan 43 C7b's exit items. |
 
 ## 7. Latency and outage behaviour per topology
 
@@ -906,13 +940,14 @@ All eight answered by the maintainer on 2026-11-01: each as recommended below.
 
 ## 12. Exit criteria
 
-- [ ] Stage 0: C2g, C2g′ and C2h's scenarios landed with their
+- [x] Stage 0 (complete 2026-11-05): C2g, C2g′ and C2h's scenarios landed with their
       fail-before evidence; the gate-before-M1 fixes landed and the remaining
       I4 ceilings carried to named stage-1 milestones (D-1, 2026-11-04,
       replacing "I4 strict everywhere": S4 to M1.3, the flex strict flags
       to M1.4, cause-6 buckets A, C, O to M1.3; the in-gate class is closed by ADR-44, 2026-11-05, except its residual classes);
       `flex-crash` zero I2(b) (M1.4); the C2 review's changes landed
-      (M0.4, open).
+      (M0.4, landed 2026-11-05: MUST-1, the shipper guard, the stricter
+      classifier, ADR-44).
 - [ ] Stage 1: the model's properties proven (or the fallback decided and
       recorded at the timebox); `RowCommit` with two states and no per-row
       class decision site left; one stream per node with the records of
@@ -949,7 +984,7 @@ zero on every configuration is the plan's evidence.
 
 ## Sources
 
-- Plan 43 (`docs/plans/v1/wip/43-commit-rule.md`), ADR-33, ADR-38,
+- Plan 43 (`docs/plans/v1/done/43-commit-rule.md`), ADR-33, ADR-38,
   ADR-39, the arbiter study (`docs/explanation/ARBITER-STUDY.md`).
 - CockroachDB parallel commits (the "never acknowledged before committed"
   TLA+ property): https://www.cockroachlabs.com/blog/parallel-commits/
