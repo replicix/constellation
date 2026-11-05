@@ -66281,3 +66281,38 @@ no failure at that rate, so it is evidence, not proof). The maintainer decides w
   lane on 30 of 30 clean; lane off lapsed in 14 of 30 (parked I/O, no `EIO`).
 - Harness additions: `lock-device-stall-lone-node`, `CONSTELLATION_HARNESS_HOLDER_STALL_MS`, a `P41RESULT` line per store/device
   stall run. Not yet measured: items 5-8 of section 9 (latency, renewal traffic, idle cost) and the xcheckfs cells.
+
+## Forwarded ops recall read delegations before they execute (strict-reader-ahead 260, 217244; 2026-11-05)
+
+- Bug (tri5): the root executed a directly forwarded op and shipped its row while its recall of a conflicting read
+  grant was outstanding; only the reply was parked. The root crashed, and the requester answered its retry Ok from the
+  `Completed` row it had applied (`inbox_enqueue` shortcut) while the grant still served the old state.
+- Fix (maintainer decision, option (c)): the root recalls (or outwaits) every conflicting read grant, and waits out the
+  grant quarantine, before it executes a forwarded op. This is the inbox path's mechanism, factored out as
+  `Core::recall_before_execute`. The op parks unexecuted as `ExecuteReply` (`Held` and re-attach; `Busy` on a lost
+  lease). New grants on its inodes are blocked until it runs. Settles and dedup hits do not wait; an op touching no
+  granted inode executes at once. Every non-root "answer from the log" site now answers rows that reached the log only
+  after the conflicting grants ended (the inbox and delegate paths already recalled first). The bab70fe8 waits
+  (`dedup_acceptance_wait`, `aborted_recalls`, `park_settled_acceptance`) stay; local ops still recall after executing.
+  New stat `forward_recalls_first`; debug assertion after a fresh forwarded execution.
+- Tests: `a_requester_answers_a_forwarded_op_from_the_log_inside_the_holders_recall` un-ignored (passes); core tests
+  `a_forwarded_write_on_a_granted_inode_executes_only_after_the_recall` and `..._only_once_the_grant_expired` (both fail
+  on main), and `a_forwarded_write_on_an_ungranted_inode_executes_at_once`. Gates: fmt, clippy -D warnings (authority,
+  all targets), authority lib 1032 passed, release sim suite 394 passed / 0 failed.
+- Sweeps, 300 seeds of 17 strict configs, main versus fix: failing sets identical, except `strict-reader-ahead` (main:
+  260; fix: none). `strict-isolated-reader-skewed-credited` (negative control): 31 seeds on both, same set.
+  `delegated-group-switch` and `long-delegated-late-answers`, 2 000 seeds: none failed on either.
+- Latency: the sim reports no per-op latency. The "first acknowledged mutation after a holder crash" (`SWEEP-FAILOVER`)
+  p50 rose where a successor or restarted holder sits in its grant quarantine:
+
+  | config | main p50 | fix p50 |
+  |---|---|---|
+  | `long-strict` | 991 ms | 4 509 ms |
+  | `strict-claimant-ahead` | 637 ms | 4 593 ms |
+  | `strict-holder-restart-step-forward` | 934 ms | 5 700 ms |
+  | `strict-skew-60s` | 555 ms | 4 235 ms |
+  | `strict-reader-ahead` | 4 231 ms | 5 129 ms |
+
+  p90 moved little, and the other strict configs are unchanged. Before the fix, a forwarded op executed during the
+  quarantine shipped at once, and its requester could take the answer from the log before the quarantine ended (the
+  same hole, with a predecessor's grants). Now the row waits for the quarantine.

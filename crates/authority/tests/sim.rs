@@ -12634,10 +12634,11 @@ fn regression_a_reader_ahead_of_the_holder_does_not_tail_past_its_writes() {
 /// then serves the root from its grant without the write. The holder's
 /// dedup answers wait for the quarantine (P41-01); a non-holder's answer
 /// from the log does not (`park_settled_acceptance`: "a non-holder knows no
-/// successor's quarantine"). Kept as a repro (`#[ignore]`): expected to
-/// FAIL until the gap is closed.
+/// successor's quarantine"). Closed by option (c) (maintainer decision
+/// 2026-11-05): the root recalls a forwarded op's conflicting grants before
+/// it executes it (`Core::recall_before_execute`), so the row reaches the log
+/// only once no grant that misses it can serve reads.
 #[test]
-#[ignore]
 fn a_requester_answers_a_forwarded_op_from_the_log_inside_the_holders_recall() {
     regress(
         "strict-reader-ahead",

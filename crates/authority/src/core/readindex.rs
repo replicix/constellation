@@ -965,7 +965,7 @@ impl Core {
     pub(crate) fn park_exec_reply(
         &mut self,
         now: Now,
-        wait: BTreeSet<u64>,
+        wait: RecallWait,
         deps: Option<Position>,
         from: NodeId,
         (req, rid, op, acked_through, tag, settle): (
@@ -979,10 +979,9 @@ impl Core {
         queue_gated: bool,
         out: &mut Vec<Action>,
     ) {
-        self.stats.deleg_exec_parked += 1;
         let id = self.park_with_deps(
             now,
-            (wait, None),
+            wait,
             None,
             deps,
             ParkedWhat::ExecuteReply {
@@ -1811,6 +1810,35 @@ impl Core {
         }
     }
 
+    /// An op of `requester` not executed yet would touch `inos`: recall
+    /// every live grant on them (the requester's own excepted) and block new
+    /// grants on them until it executes (`recall_unblock`). `Some`: what its
+    /// execution waits for (the grants and the table's quarantine).
+    ///
+    /// The root recalls before it executes — an inbox op, and a forwarded
+    /// one (maintainer decision 2026-11-05, option (c)) — so that no row of
+    /// it is journaled, let alone shipped, while a grant that misses it can
+    /// still serve reads: then whoever answers the requester from the
+    /// `Completed` row (a non-root's `inbox_enqueue` shortcut after the
+    /// root crashed, say) answers after every such grant ended.
+    pub(crate) fn recall_before_execute(
+        &mut self,
+        now: Now,
+        requester: NodeId,
+        inos: &[Ino],
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> Option<RecallWait> {
+        let wait = self.recall_needed(now, inos, Some(requester), replica, out)?;
+        let until = now
+            .wait
+            .plus(2 * (self.cfg.read_delegation_ttl_ms + self.cfg.expiry_margin_ms));
+        for ino in inos {
+            self.rd.blocked.insert(*ino, until);
+        }
+        Some(wait)
+    }
+
     /// An inbox op would touch delegated inodes: recall, block new grants
     /// on them, and have the requester polled again when done.
     pub(crate) fn inbox_recall_first(
@@ -1821,21 +1849,16 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> bool {
-        let Some(wait) = self.recall_needed(now, inos, Some(node), replica, out) else {
+        let Some(wait) = self.recall_before_execute(now, node, inos, replica, out) else {
             return false;
         };
-        let until = now
-            .wait
-            .plus(2 * (self.cfg.read_delegation_ttl_ms + self.cfg.expiry_margin_ms));
-        for ino in inos {
-            self.rd.blocked.insert(*ino, until);
-        }
         self.park(now, wait, None, ParkedWhat::InboxRepoll { node });
         true
     }
 
-    /// The inbox op executed: grants on its inodes may resume.
-    pub(crate) fn inbox_unblock(&mut self, now: Now, inos: &[Ino]) {
+    /// The op executed (an inbox op, a forwarded one): grants on its
+    /// inodes may resume.
+    pub(crate) fn recall_unblock(&mut self, now: Now, inos: &[Ino]) {
         for ino in inos {
             self.rd.blocked.remove(ino);
         }

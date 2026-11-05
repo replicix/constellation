@@ -793,6 +793,9 @@ pub struct Stats {
     pub conflicts: u64,
     pub own_recovered: u64,
     pub forward_dedup_hits: u64,
+    /// Forwarded ops the root parked unexecuted for the recall of read
+    /// delegations on what they touch (`Core::recall_before_execute`).
+    pub forward_recalls_first: u64,
     pub forward_retries: u64,
     pub forward_redirects: u64,
     pub forward_indoubt_resolved: u64,

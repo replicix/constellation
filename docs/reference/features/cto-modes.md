@@ -283,9 +283,13 @@ Before the acknowledgement of any mutation that touched a delegated
 inode leaves the sequencer, every delegation on it held by a node other
 than the writer is recalled (`ReadRecall`, answered `ReadRecalled`) or
 outwaited (it is live until `granted + ttl + margin` on the
-sequencer's clock). This covers a forwarded op's reply, a local op's
-reply, the FUSE fast path, an inbox op (recalled before it executes),
-and a release of the lease. A change to a dentry also recalls the
+sequencer's clock). This covers a forwarded op (recalled before it
+executes), a local op's reply, the FUSE fast path, an inbox op (recalled
+before it executes), and a release of the lease. An op recalled before it
+executes leaves no row in the log while a delegation that misses it is
+live, so no node can answer its requester from the log early (after the
+sequencer crashed, say); new delegations on what it touches wait until it
+has executed. A change to a dentry also recalls the
 parent directory's delegation, and an `unlink`, `rmdir` or `rename`
 also recalls the inodes it changes that its records do not name: the
 unlinked (or replaced) inode, whose `nlink` and `ctime` change or which
@@ -293,8 +297,8 @@ is gone, and a renamed inode. Otherwise a node holding a delegation on
 an unlinked file would keep answering a strict open of it by inode (a
 dentry its kernel still caches) from its stale replica after the
 unlink completed. The executed paths take these from the op's own
-transaction; an inbox op and a delegate's write, which recall before
-executing, look them up just before. Under a delegation those inodes also decide
+transaction; a forwarded op, an inbox op and a delegate's write, which
+recall before executing, look them up just before. Under a delegation those inodes also decide
 who executes: an unlink or a rename, in a delegated subtree, of a link
 to a file whose primary link is outside it is cross-subtree (the root
 recalls the delegation and executes it, recalling its own delegations

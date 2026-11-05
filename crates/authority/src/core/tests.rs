@@ -8054,7 +8054,7 @@ mod cto {
             panic!("expected one recall to node 2: {out:?}")
         };
         assert_eq!((*rino, *grant), (ino, g.id));
-        let out = h.step(Event::Peer {
+        let out = h.step_archived(Event::Peer {
             from: 2,
             msg: PeerMsg::DelegationRecalled { req: *recall },
         });
@@ -8179,7 +8179,7 @@ mod cto {
             panic!("expected one recall to node 2: {out:?}")
         };
         assert_eq!((*rino, *grant), (ino_of("b"), b_grant));
-        let out = h.step(Event::Peer {
+        let out = h.step_archived(Event::Peer {
             from: 2,
             msg: PeerMsg::DelegationRecalled { req: *recall },
         });
@@ -8629,13 +8629,102 @@ mod cto {
         let out = forward(&mut h, 3, 10, 1, setattr(ino));
         assert!(mutate_replies(&out).is_empty(), "{out:?}");
         h.now = granted_at.plus(6_000);
-        let out = h.step(Event::Timer { id: expiry });
+        let out = h.step_archived(Event::Timer { id: expiry });
         let [(3, OpId(10), MutateOutcome::Accepted { .. })] = mutate_replies(&out).as_slice()
         else {
             panic!("expected the reply to the retry: {out:?}")
         };
         assert_eq!(h.core.stats.recalls_expired, 1);
         assert_eq!(h.core.stats.held_replies, 1);
+    }
+
+    fn mode_of(h: &Harness, ino: Ino) -> u32 {
+        MetaStore::getattr(&h.meta, ino).unwrap().unwrap().mode & 0o7777
+    }
+
+    /// Option (c) (maintainer decision 2026-11-05; `strict-reader-ahead`
+    /// seeds 260, 217244): a forwarded write on an inode another node holds a
+    /// read delegation on is not *executed* (no row, no outcome) until the
+    /// recall is answered — only then is it executed and answered.
+    #[test]
+    fn a_forwarded_write_on_a_granted_inode_executes_only_after_the_recall() {
+        let (mut h, ino) = holder_with_file();
+        let before = mode_of(&h, ino);
+        assert_ne!(before, 0o600);
+        grant_of(&ask(&mut h, 2, 7, ino));
+        let rid = Rid {
+            node: 3,
+            incarnation: 1,
+            seq: 1,
+        };
+        let out = forward(&mut h, 3, 9, 1, setattr(ino));
+        assert!(mutate_replies(&out).is_empty(), "{out:?}");
+        let rs = recalls(&out);
+        let [(2, recall, _, _)] = rs.as_slice() else {
+            panic!("expected one recall to node 2: {out:?}")
+        };
+        let recall = *recall;
+        assert_eq!(
+            mode_of(&h, ino),
+            before,
+            "not executed while the grant is live"
+        );
+        assert!(h.meta.recent_outcome(rid).is_none());
+        assert!(h.meta.completed_outcome(rid).unwrap().is_none());
+        assert_eq!(h.core.parked_exec_ops().count(), 1);
+        assert_eq!(h.core.stats.forward_recalls_first, 1);
+        let out = h.step_archived(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: recall },
+        });
+        let [(3, OpId(9), MutateOutcome::Accepted { .. })] = mutate_replies(&out).as_slice() else {
+            panic!("expected the reply once executed: {out:?}")
+        };
+        assert_eq!(mode_of(&h, ino), 0o600);
+        assert_eq!(h.core.parked_exec_ops().count(), 0);
+    }
+
+    /// The same when the recall goes unanswered: the op executes only once
+    /// the grant is outwaited (TTL + margin).
+    #[test]
+    fn a_forwarded_write_on_a_granted_inode_executes_only_once_the_grant_expired() {
+        let (mut h, ino) = holder_with_file();
+        let before = mode_of(&h, ino);
+        let granted_at = h.now;
+        grant_of(&ask(&mut h, 2, 7, ino));
+        let out = forward(&mut h, 3, 9, 1, setattr(ino));
+        let expiry = timer_of(&out, TimerKind::GrantExpiry);
+        h.advance(3_000);
+        assert_eq!(mode_of(&h, ino), before);
+        h.now = granted_at.plus(6_000);
+        let out = h.step_archived(Event::Timer { id: expiry });
+        let [(3, OpId(9), MutateOutcome::Accepted { .. })] = mutate_replies(&out).as_slice() else {
+            panic!("expected the reply once executed: {out:?}")
+        };
+        assert_eq!(mode_of(&h, ino), 0o600);
+        assert_eq!(h.core.stats.recalls_expired, 1);
+    }
+
+    /// A forwarded write that touches no granted inode is executed and
+    /// answered at once: no recall, no park.
+    #[test]
+    fn a_forwarded_write_on_an_ungranted_inode_executes_at_once() {
+        let (mut h, ino) = holder_with_file();
+        let other = h.create("g");
+        let MutateOp::Create { ino: g, .. } = other else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &other, None).unwrap();
+        // Node 2 holds a grant on `f` only.
+        grant_of(&ask(&mut h, 2, 7, ino));
+        let out = forward(&mut h, 3, 9, 1, setattr(g));
+        let [(3, OpId(9), MutateOutcome::Accepted { .. })] = mutate_replies(&out).as_slice() else {
+            panic!("expected the reply at once: {out:?}")
+        };
+        assert!(recalls(&out).is_empty());
+        assert_eq!(mode_of(&h, g), 0o600);
+        assert_eq!(h.core.stats.forward_recalls_first, 0);
+        assert_eq!(h.core.parked_exec_ops().count(), 0);
     }
 
     /// The sequencer's own writes (the core's local execution) recall too.
@@ -8776,7 +8865,7 @@ mod cto {
         let out = forward(&mut h, 3, 9, 1, setattr(ino));
         assert!(mutate_replies(&out).is_empty(), "{out:?}");
         h.now = now.plus(4_000);
-        let out = h.step(Event::Timer { id: quarantine });
+        let out = h.step_archived(Event::Timer { id: quarantine });
         assert_eq!(mutate_replies(&out).len(), 1, "{out:?}");
     }
 
@@ -8795,7 +8884,7 @@ mod cto {
         let drain = timer_of(&out, TimerKind::GrantQuarantine);
         assert_eq!(h.core.timer_ms(drain), Some(flipped_at.plus(1_000)));
         h.advance(1_000);
-        let out = h.step(Event::Timer { id: drain });
+        let out = h.step_archived(Event::Timer { id: drain });
         assert_eq!(mutate_replies(&out).len(), 1, "{out:?}");
         let out = forward(&mut h, 3, 10, 2, setattr(ino));
         assert_eq!(mutate_replies(&out).len(), 1, "no second drain: {out:?}");

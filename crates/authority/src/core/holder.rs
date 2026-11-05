@@ -443,9 +443,10 @@ impl Core {
                         self.stats.deleg_deps_waits += 1;
                     }
                     if req != OpId(0) {
+                        self.stats.deleg_exec_parked += 1;
                         self.park_exec_reply(
                             now,
-                            wait,
+                            (wait, None),
                             deps_wait,
                             from,
                             (req, rid, op, acked_through, tag, settle),
@@ -458,6 +459,7 @@ impl Core {
             } else if self.cfg.delegation && !settle && !replica.reaches_streams(&deps) {
                 self.stats.deleg_deps_waits += 1;
                 if req != OpId(0) {
+                    self.stats.deleg_exec_parked += 1;
                     self.park_exec_reply(
                         now,
                         Default::default(),
@@ -479,6 +481,7 @@ impl Core {
                     "a forwarded op overlaps an entry of the replay queue ahead of it: parked"
                 );
                 if req != OpId(0) {
+                    self.stats.deleg_exec_parked += 1;
                     self.park_exec_reply(
                         now,
                         Default::default(),
@@ -491,6 +494,49 @@ impl Core {
                 }
                 return;
             }
+            // Plan 30 §M8, option (c) of the maintainer's decision
+            // (2026-11-05): an op about to take effect here recalls every
+            // read delegation that misses it (the requester's own excepted)
+            // *before* it executes, as an inbox op does
+            // (`recall_before_execute`): its row is not journaled, let alone
+            // shipped, while such a grant can still serve reads. Parking only
+            // the reply let the row reach the log first; the root then
+            // crashed, and the requester answered its retry from the
+            // `Completed` row it applied while the grant still served the old
+            // state (`strict-reader-ahead` seeds 260, 217244). Not for a
+            // settle (it executes nothing) nor a retry the dedup answers (its
+            // row is there already: `dedup_acceptance_wait`). Unexecuted, the
+            // op parks as a delegation recall's does (`ExecuteReply`): the
+            // requester is answered `Held` and re-attaches; a lost lease
+            // answers it `Busy`, the op never run.
+            let touched = if !settle
+                && self.cfg.recall_before_ack
+                && replica.recent_outcome(rid).is_none()
+                && replica.completed_outcome(rid).ok().flatten().is_none()
+            {
+                replica.recall_inos_of_op(&op)
+            } else {
+                Vec::new()
+            };
+            if !touched.is_empty() {
+                if let Some(wait) = self.recall_before_execute(now, from, &touched, replica, out) {
+                    self.stats.forward_recalls_first += 1;
+                    if req != OpId(0) {
+                        self.park_exec_reply(
+                            now,
+                            wait,
+                            None,
+                            from,
+                            (req, rid, op, acked_through, tag, settle),
+                            false,
+                            out,
+                        );
+                    }
+                    // (A parked execution whose requester was answered
+                    // `Held` that must wait again: its retry re-runs it.)
+                    return;
+                }
+            }
             base = self.reply_base(&op, replica);
             let (outcome, executed) = self.holder_execute(
                 now,
@@ -502,6 +548,9 @@ impl Core {
                 replica,
                 out,
             );
+            if !touched.is_empty() {
+                self.recall_unblock(now, &touched);
+            }
             fresh = executed;
             // Plan 30 §M6: the state the op was evaluated against, its
             // own rows included — everything shipped through `head_seq`,
@@ -548,6 +597,20 @@ impl Core {
         // position it was evaluated at is durable under the lease's
         // acknowledgement policy.
         let executed = fresh.is_some();
+        // Option (c): the recall ran before the execution, and new grants on
+        // what it touched were blocked: none that misses the op is live now
+        // (else `recall_inos_of_op` missed an inode the execution touched).
+        #[cfg(debug_assertions)]
+        if let (Some(inos), true) = (&fresh, self.cfg.recall_before_ack) {
+            let need = replica
+                .read_delegations()
+                .touching(inos, Some(from), now.wait);
+            debug_assert!(
+                need.grants.is_empty(),
+                "a forwarded op executed with a live grant on what it touched: {:?}",
+                need.grants
+            );
+        }
         // Plan 41 P41-01: an acceptance from the dedup waits for the
         // read-delegation quarantine (`dedup_acceptance_wait`).
         let wait = match fresh {

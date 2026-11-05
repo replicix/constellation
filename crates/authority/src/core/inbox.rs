@@ -1612,7 +1612,7 @@ impl Core {
                     ack,
                     decoded.as_ref().ok(),
                 )?;
-                self.inbox_unblock(now, &touched);
+                self.recall_unblock(now, &touched);
                 self.stats.settles_refused += 1;
                 self.stats.inbox_refused_ops += 1;
                 continue;
@@ -1629,7 +1629,7 @@ impl Core {
                 }),
                 Err(_) => Err(MetaError::Invalid("undecodable inbox op".into())),
             };
-            self.inbox_unblock(now, &touched);
+            self.recall_unblock(now, &touched);
             match executed {
                 Ok(records) => {
                     replica.remember_outcome(rid, &records);
