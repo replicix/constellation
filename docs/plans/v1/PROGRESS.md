@@ -66266,3 +66266,18 @@ Not reproduced. Caveat: the per-run logs were on the box's tmpfs and went with t
 transport census (ring negotiated or fallen back) was not kept; the host grants the ring, so they ran on it unless the
 ladder fell back. 120 000 rounds with 0 failures bounds the old rate (4 in 110 000) only loosely (about 0.01 chance of
 no failure at that rate, so it is evidence, not proof). The maintainer decides whether to tick the box.
+
+
+## Plan 41 acceptance runs (stall tolerance and real-device reproduction)
+
+- Ran plan 41 section 9 items 1, 2 and the real-device reproduction on the quiet timing box (results and method in
+  `bench/lock-lane/RESULTS.md`, "Plan 41 section 9 acceptance"). Nothing in the plan is ticked yet.
+- Item 1 (`lock-stall-lone-node`, D = 5..40 s, 5 runs, ext4/xfs/btrfs/tmpfs): lane on 0 lapses, 0 `EIO` in 140 of 140 runs;
+  lane off lapsed in every run from D = 5 s. The default lease outlasts 40 s, so the cap is shown by `lock-store-stall-past-lease`
+  (20 of 20 passed, parked about 11.1 s of a 20 s stall).
+- Item 2 (`lock-store-stall-holder`, D = 10/30/60 s, 3 runs per fs): lane on 0 lapses; lane off `EIO` in every run; the
+  max-stall bound at 30 s stops the lane (12 of 12, A granted 34 to 35 s after asking). Item 4 not run (L6 is plan 46's).
+- Real device (loop-backed `dm-delay`, 1 s flush delay, 8 fsync threads, 15 s `dmsetup suspend`; ext4/xfs/btrfs, 10 runs each):
+  lane on 30 of 30 clean; lane off lapsed in 14 of 30 (parked I/O, no `EIO`).
+- Harness additions: `lock-device-stall-lone-node`, `CONSTELLATION_HARNESS_HOLDER_STALL_MS`, a `P41RESULT` line per store/device
+  stall run. Not yet measured: items 5-8 of section 9 (latency, renewal traffic, idle cost) and the xcheckfs cells.

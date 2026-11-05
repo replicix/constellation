@@ -3576,7 +3576,9 @@ fn lock_lapse_lone_run(name: &str, c: &Client, stall: LoneStall) -> Result<LoneE
                  {fenced_ops} fenced ops, {owners_fenced} owners fenced; locks: {fence}"
             );
             anyhow::ensure!(
-                fence["lost"].as_u64().unwrap_or(0) == 0 && own > 0,
+                // A device freeze sticks the core only when a metadata write
+                // lands in it: the lane may have had nothing to renew.
+                fence["lost"].as_u64().unwrap_or(0) == 0 && (device || own > 0),
                 "the lane did not renew the node's own grant during a {ms} ms store stall \
                  (lane.own_renewals {own}, lost {}); locks: {fence}",
                 fence["lost"]
