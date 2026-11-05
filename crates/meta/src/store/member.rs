@@ -63,6 +63,9 @@ pub(super) const MEMBER_COPY_BASE: u64 = 2 << 48;
 /// replica as it is when the session wait times out.
 pub const HELD_COPY_MAX_AGE_MS: i64 = 5_000;
 
+/// The least time between two warnings that a hold lapsed.
+pub(crate) const HELD_COPY_WARN_EVERY_MS: i64 = 10_000;
+
 /// A member copy row a segment's strand rolled back
 /// ([`Meta::member_copy_touches`]). In memory, not persisted: after a
 /// restart nothing is held. A segment's apply and a deposition's recovery
@@ -540,10 +543,56 @@ impl Meta {
             return false;
         }
         let mut held = self.held_copies.lock().unwrap();
+        let before = held.len();
+        let mut oldest: Option<&HeldCopy> = None;
+        for h in held.iter() {
+            if now_ms.saturating_sub(h.since_ms) >= HELD_COPY_MAX_AGE_MS
+                && oldest.is_none_or(|o| h.since_ms < o.since_ms)
+            {
+                oldest = Some(h);
+            }
+        }
+        let lapsed_row = oldest.map(|h| (h.epoch, h.first));
         held.retain(|h| now_ms.saturating_sub(h.since_ms) < HELD_COPY_MAX_AGE_MS);
+        let lapsed = (before - held.len()) as u64;
+        if lapsed > 0 {
+            self.note_held_copy_lapsed(lapsed, lapsed_row, now_ms);
+        }
         self.any_held_copy
             .store(!held.is_empty(), std::sync::atomic::Ordering::Relaxed);
         held.iter().any(|h| keys.iter().any(|k| h.keys.touches(k)))
+    }
+
+    /// Plan 46 M0.4: `n` read holds ran out at their cap before the
+    /// successor's re-ship released them. A reader then saw the replica
+    /// without a committed row (a marker without its data), and the row may
+    /// never leave the copy (`backup-crash-slow` seed 840). Counted
+    /// (`status.ack.held_copy_lapsed`), and warned of at most once per
+    /// [`HELD_COPY_WARN_EVERY_MS`].
+    fn note_held_copy_lapsed(&self, n: u64, row: Option<(u64, u64)>, now_ms: i64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.held_copy_lapsed.fetch_add(n, Relaxed);
+        let last = self.held_copy_last_warn_ms.load(Relaxed);
+        if last != i64::MIN && now_ms.saturating_sub(last) < HELD_COPY_WARN_EVERY_MS {
+            return;
+        }
+        self.held_copy_last_warn_ms.store(now_ms, Relaxed);
+        tracing::warn!(
+            lapsed = n,
+            total = self.held_copy_lapsed.load(Relaxed),
+            oldest_epoch = row.map(|r| r.0),
+            oldest_first = row.map(|r| r.1),
+            cap_ms = HELD_COPY_MAX_AGE_MS,
+            "a member copy row's read hold lapsed at its cap before the successor's re-ship \
+             released it: reads of its keys are answered without it"
+        );
+    }
+
+    /// Read holds that lapsed at their cap since the start
+    /// ([`Self::note_held_copy_lapsed`]).
+    pub fn held_copy_lapsed(&self) -> u64 {
+        self.held_copy_lapsed
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Note a row the strand rolled back into `epoch`'s member copy.

@@ -257,9 +257,16 @@ fn a_row_that_never_leaves_the_copy_stops_holding_after_the_cap() {
         meta.member_copy_touches_at(&dir, t0),
         "its parent's listing too"
     );
+    assert_eq!(meta.held_copy_lapsed(), 0, "held, not lapsed");
     let late = t0 + constellation_meta::HELD_COPY_MAX_AGE_MS + 1;
     assert!(!meta.member_copy_touches_at(&key, late), "capped");
+    assert_eq!(
+        meta.held_copy_lapsed(),
+        1,
+        "the cap lapsing is counted (status.ack.held_copy_lapsed), not silent"
+    );
     assert!(!meta.member_copy_touches_at(&dir, late));
+    assert_eq!(meta.held_copy_lapsed(), 1, "once per row");
     // The row is still in the copy (the leak), and stays unheld.
     assert!(meta.member_copy_carries(rid(1)).unwrap());
     assert!(!meta.member_copy_touches(&key));

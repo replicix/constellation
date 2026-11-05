@@ -228,6 +228,13 @@
           "description": "The fast path is closed (local writes go through the core).",
           "type": "boolean"
         },
+        "held_copy_lapsed": {
+          "default": 0,
+          "description": "Member-copy read holds that lapsed at their cap before the successor's\nre-ship released them (a reader saw the replica without a committed\nrow; plan 46 M0.4).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "held_for_upload": {
           "description": "As sequencer: forwarded replies answered `Held` at once because\nthe acknowledgement waits for chunks only the requester can upload\n(it is asked to upload them).",
           "format": "uint64",

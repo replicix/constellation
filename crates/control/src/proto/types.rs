@@ -2339,6 +2339,11 @@ pub struct AckStatus {
     /// void cut: the log never granted it (plan 46 M0.4; must stay 0).
     #[serde(default)]
     pub unjustified_ships: u64,
+    /// Member-copy read holds that lapsed at their cap before the successor's
+    /// re-ship released them (a reader saw the replica without a committed
+    /// row; plan 46 M0.4).
+    #[serde(default)]
+    pub held_copy_lapsed: u64,
     /// Client mutations answered `EIO` as settled: refused for good by the
     /// sequencer in force at their deadline, never executed (plan 43 C2).
     #[serde(default)]

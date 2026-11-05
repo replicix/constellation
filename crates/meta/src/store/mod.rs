@@ -684,6 +684,12 @@ pub struct Meta {
     pub(crate) held_copies: std::sync::Mutex<Vec<member::HeldCopy>>,
     /// `held_copies` is not empty (one atomic load per read when it is).
     pub(crate) any_held_copy: std::sync::atomic::AtomicBool,
+    /// Held member copy rows whose read hold lapsed at the cap
+    /// ([`member::HELD_COPY_MAX_AGE_MS`]) before their release: a reader then
+    /// saw the replica without a committed row. Since the process start.
+    pub(crate) held_copy_lapsed: AtomicU64,
+    /// [`Meta::held_copy_now_ms`] of the last lapse warning (rate limit).
+    pub(crate) held_copy_last_warn_ms: std::sync::atomic::AtomicI64,
     /// Plan 46 M0.4: ships of a `Local` row whose index this node assigned
     /// under a generation the table does not list and that has no void cut
     /// (`Meta::note_unjustified_ship`). Must stay 0.
@@ -1252,6 +1258,8 @@ impl Meta {
             any_member_copy: std::sync::atomic::AtomicBool::new(false),
             held_copies: std::sync::Mutex::new(Vec::new()),
             any_held_copy: std::sync::atomic::AtomicBool::new(false),
+            held_copy_lapsed: AtomicU64::new(0),
+            held_copy_last_warn_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
             ship_unjustified: AtomicU64::new(0),
             held_work: AtomicU64::new(0),
             blame_cache: Default::default(),
