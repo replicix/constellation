@@ -1735,6 +1735,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: readdirplus::handover,
     },
     Scenario {
+        name: "readdirplus-strict-bench",
+        desc: "plan 40 section 9 (bench, not pass/fail): with --cto strict and a second node, time ls -f and ls -l of 1k and 10k entry directories kernel-cold with STRICT_BENCH_MODE=off|auto (STRICT_BENCH_REPS runs); prints STRICTBENCH lines",
+        requires: &[],
+        caps: &[],
+        run: readdirplus::strict_bench,
+    },
+    Scenario {
         name: "readdir-huge-delete",
         desc: "plan 40 P9: rm -rf of a READDIR_HUGE_ENTRIES (1000000) entry directory (fts reads 100,000 per round and deletes between rounds) under hint-cache pressure (CONSTELLATION_READDIR_HINT_BYTES=1MiB, a second process listing 20 filler directories in a loop) with find -ls of it in parallel: succeeds, nothing left behind, lost_cookies 0, cold_scans 0, pinned while it runs and not after",
         requires: &[],

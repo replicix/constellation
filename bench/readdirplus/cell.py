@@ -376,17 +376,101 @@ class Cell:
             self.umount()
         self.write_mode = None
 
+    def vm_rss_kb(self):
+        for line in open(f"/proc/{self.pid}/status"):
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1])
+        return 0
+
+    def phase_opendirs(self):
+        """Item 5: daemon RSS with 1,000 and 10,000 directories open mid-listing (OPEN_DIRS directories of
+        OPEN_DIR_ENTRIES names each, one stream per directory), and the releasedir latency of 1,000 releases."""
+        lt = os.path.join(HERE, "listtool.py")
+        nd = int(os.environ.get("OPEN_DIRS", "10000"))
+        per = int(os.environ.get("OPEN_DIR_ENTRIES", "100"))
+        self.gate("opendirs-populate")
+        self.write_mode = "back"
+        self.create_fs()
+        self.mount()
+        par = os.path.join(self.mnt, "od")
+        os.makedirs(par)
+        t0 = time.time()
+        names = [f"f{i:04d}-" + "x" * 20 for i in range(per)]
+        nxt = [0]
+        lock = threading.Lock()
+
+        def work():
+            while True:
+                with lock:
+                    i = nxt[0]
+                    nxt[0] += 1
+                if i >= nd:
+                    return
+                d = os.path.join(par, f"d{i:05d}")
+                os.mkdir(d)
+                for n in names:
+                    open(os.path.join(d, n), "wb").close()
+        ts = [threading.Thread(target=work) for _ in range(16)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.emit("result", name="populate", size=nd * per, wall=round(time.time() - t0, 1))
+        subprocess.run(["sync"])
+        self.umount()
+        self.write_mode = None
+        self.mount()
+        # a cold start: the daemon with nothing open
+        self.rss_reset()
+        base_rss = self.vm_rss_kb()
+        self.emit("result", name="opendirs_base", size=nd, rss_kb=base_rss, hwm_kb=self.rss_peak_kb())
+        h = subprocess.Popen([sys.executable, lt, "holdmany", par, str(nd), "1"], stdout=subprocess.PIPE,
+                             stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        while True:
+            line = h.stdout.readline().strip()
+            if line.startswith("OPEN ") or line == "READY":
+                st = self.snap()
+                self.emit("result", name="opendirs_open", size=int(line.split()[1]) if line != "READY" else nd,
+                          rss_kb=self.vm_rss_kb(), hwm_kb=self.rss_peak_kb(), readdir=st["readdir"],
+                          kernel_refs=st["mount"].get("kernel_refs"))
+            if line == "READY" or not line:
+                break
+        if line != "READY":
+            self.emit("result", name="opendirs_failed", err=h.stderr.read()[-500:])
+        else:
+            h.stdin.write("go\n")
+            h.stdin.flush()
+            self.emit("result", name="opendirs_release", line=h.stdout.readline().strip(), rss_kb=self.vm_rss_kb())
+            h.stdin.close()
+            h.wait()
+            time.sleep(2)
+            st = self.snap()
+            self.emit("result", name="opendirs_closed", rss_kb=self.vm_rss_kb(), readdir=st["readdir"])
+        self.umount()
+
     def phase_big(self):
         """Listing and memory of the very large directories; pins; cold resume; releasedir."""
         lt = os.path.join(HERE, "listtool.py")
         for n in [int(x) for x in os.environ.get("BIG_SIZES", "1000000").split()]:
             self.gate(f"big-{n}")
-            self.write_mode = "back"
+            self.write_mode = os.environ.get("BIG_WRITE_MODE", "back")
             self.create_fs()
             self.mount()
             d = os.path.join(self.mnt, f"b{n}")
             t0 = time.time()
+            # RSS of the daemon while the directory fills (a 10M populate in write-back mode grew it by ~3.3 KB per entry)
+            stop_s = threading.Event()
+
+            def sample():
+                while not stop_s.wait(30):
+                    try:
+                        self.emit("sample", name="populate_rss", size=n, elapsed=int(time.time() - t0),
+                                  rss_kb=self.vm_rss_kb(), load1=load1(),
+                                  mem_avail_kb=int([l for l in open("/proc/meminfo") if l.startswith("MemAvailable")][0].split()[1]))
+                    except Exception:
+                        pass
+            sm = threading.Thread(target=sample, daemon=True)
+            sm.start()
             self.fill(d, self.names(n))
+            stop_s.set()
             self.emit("result", name="populate", size=n, wall=round(time.time() - t0, 1))
             subprocess.run(["sync"])
             self.umount()
@@ -463,6 +547,8 @@ class Cell:
                 self.phase_trees()
             if "write" in phases:
                 self.phase_write()
+            if "opendirs" in phases:
+                self.phase_opendirs()
             if "big" in phases:
                 self.phase_big()
             if "handover" in phases and "big" not in phases:

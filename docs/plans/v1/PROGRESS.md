@@ -66710,3 +66710,25 @@ authority, engine, control and harness, all targets, clean; meta lib 394 passed;
 passed. Fail-before: the coalescing test (`renewal_ticks_are_a_gap_apart_and_renew_what_came_due_meanwhile`) fails
 with the coalescing off; the frame test fails at 2,048 entries; the closes' lock loss reproduced on the build before the
 refresh change (9,402 lost) and not after.
+
+
+## Plan 40 P40-01: the §8 rerun on the quiet box (2026-11-05)
+
+- Reran §8 items 2, 5 and 6, the 10M cell, `always`, §9's strict-mode and handoff-size questions, `base` at 1M on xfs,
+  btrfs and tmpfs, and the warm/cold tree cells (`off` against `auto`) on main `64409f78` (`base` = `73ea9987`). Results
+  and method: `bench/readdirplus/RESULTS.md`, "Rerun 2026-11-05". Nothing in the plan is ticked.
+- Item 2: the storm is unchanged by the listing change (`auto`/`off` median 1.03, 0.82-1.21 over 24 cells); `tar x` write-back
+  within 0.92-1.11 of `off`. Write-through `tar x` is 2.3-4.9 times faster on main than on `base`, with `off` as fast as
+  `auto`: not plan 40's doing.
+- Item 6: `readdir-huge-delete` (1M) passed on ext4, xfs, btrfs, tmpfs with zero `lost_cookies` and `cold_scans`;
+  `releasedir` p99 17-24 us (1M), 21 us (10M); handover with a pinned directory 0.49-0.60 s at 1M, 4.25 s at 10M (handoff
+  169 MiB, the pin 38 MiB at 8.05 B a name).
+- Item 5: `ls -l` peak RSS 343-347 MiB at 1M (R0 728-738), 1,703 MiB at 10M. 10,000 open directories: +212-267 MiB for `auto`,
+  +86-98 MiB for R0; the plan's formula allows about 150: the daemon holds roughly 120-170 B per kernel reference, not 32.
+- Strict mode with a second node: every plus entry is name-only; `auto` is within 0.5 ms of `off` for `ls -f` and equal for
+  `ls -l`: keep `auto`. `always` at 1M: `ls -f` 3.9 s against `auto`'s 0.5 s.
+- The 10M cell does not fit ext4 on the box (3.24M inodes); it ran on the system disk (btrfs), write-through. Populating 10M
+  entries drives the daemon to 17-22 GB RSS (write-back stalled at 5.5M entries with a 610 s `create`); noted, no
+  corruption. `base` and `off` were not run at 10M.
+- Added `cell.py` phase `opendirs`, `BIG_WRITE_MODE`, a populate RSS sampler and a `root` store, `listtool.py holdmany`,
+  `bench/readdirplus/report-rerun.py`, and the harness scenario `readdirplus-strict-bench`.

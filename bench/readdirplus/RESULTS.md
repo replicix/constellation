@@ -1,8 +1,237 @@
 # Plan 40 — READDIRPLUS and name-ordered listings: benchmark results
 
-Status: **measured, 2026-10-31**, on the quiet timing host, against main at `7538c07f` (the held-names change
+Status: **measured, 2026-10-31; the rerun of 2026-11-05 (items 2, 5, 6, 10M, `always`, strict, handoff, trees on main `64409f78`) follows this paragraph and supersedes the "not run" lists**; the paragraph below is the 10-31 run, on the quiet timing host, against main at `7538c07f` (the held-names change
 `8f5af546` is in it). The plan's §8 matrix was run in part; "What was not run" lists the rest. The raw cell files
 are not kept in the repository; every table below is `report.py`'s output on them.
+
+
+## Rerun 2026-11-05 (P40-01): items 2, 5, 6, the 10M cell, `always`, strict mode, handoff size, trees on current main
+
+Measured on the same quiet timing host (16 cores, 30 GB, Linux 7.3.0-rc4, ring transport), main `64409f78` (`auto`,
+`off`, `always`) against `base` = `73ea9987` as before, built on the host. One node. State dir and file store on the
+named file system; the harness runs (`readdir-huge-delete`, strict) keep their state there and use the harness's S3
+container. Scripts: this directory's; `cell.py` gained an `opendirs` phase, `BIG_WRITE_MODE`, a populate RSS sampler and a
+`root` store, `listtool.py` a `holdmany` mode, `report-rerun.py` prints the tables below, and the harness a
+`readdirplus-strict-bench` scenario. Every cell gated on the 1-minute load below 4 and none gave up. **No correctness
+failure appeared in any run**: all four `readdir-huge-delete` runs passed with zero `lost_cookies` and zero `cold_scans`,
+every handover returned 0 and every listing after the 10M populate was complete.
+
+What was cut or differs from the plan: **the 10M cell ran once, on the host's system disk (btrfs), in write-through
+mode, not on ext4** (see "The 10M cell"); `base` and `off` were not run at 10M (a `base` page costs 225-270 ms at 1M and
+grows with the directory: one `base` `ls -f` of 10M would take about three hours); the write-path cells ran once per
+version and file system and twice for `auto`, with one `tar x` per mode instead of three (one write-through `tar x` on
+`base` takes 5-16 minutes); the pins, handover and open-directory rows have no `base` baseline except the RSS with open
+directories, because `base` has no pins.
+
+### Item 2: write path (100,000-entry create/rename/unlink storm in one directory, `tar x` of the 50k-file tree; wall seconds)
+
+**write-through**
+
+| fs | workload | base | off | auto (run 1) | auto (run 2) | auto/off | auto/base |
+|---|---|---|---|---|---|---|---|
+| ext4 | storm_create | 21.9 | 15.5 | 18.1 | 16.5 | 1.12 | 0.79 |
+| ext4 | storm_rename | 19.1 | 19.0 | 18.0 | 17.1 | 0.92 | 0.92 |
+| ext4 | storm_unlink | 13.8 | 12.8 | 16.1 | 14.5 | 1.19 | 1.11 |
+| ext4 | untar | 764.5 | 322.3 | 340.4 | 331.5 | 1.04 | 0.44 |
+| xfs | storm_create | 10.9 | 10.9 | 12.1 | 11.7 | 1.09 | 1.10 |
+| xfs | storm_rename | 12.7 | 14.7 | 14.0 | 13.8 | 0.94 | 1.09 |
+| xfs | storm_unlink | 12.6 | 10.9 | 11.9 | 12.4 | 1.11 | 0.97 |
+| xfs | untar | 946.1 | 191.9 | 230.5 | 222.2 | 1.18 | 0.24 |
+| btrfs | storm_create | 20.5 | 20.6 | 19.0 | 15.2 | 0.83 | 0.84 |
+| btrfs | storm_rename | 14.9 | 22.3 | 24.1 | 14.6 | 0.87 | 1.30 |
+| btrfs | storm_unlink | 24.8 | 24.0 | 24.7 | 24.2 | 1.02 | 0.99 |
+| btrfs | untar | 908.7 | 253.2 | 254.0 | 280.3 | 1.06 | 0.29 |
+| tmpfs | storm_create | 9.9 | 11.2 | 9.5 | 10.6 | 0.89 | 1.01 |
+| tmpfs | storm_rename | 14.1 | 13.3 | 14.6 | 14.4 | 1.09 | 1.02 |
+| tmpfs | storm_unlink | 11.9 | 12.4 | 11.5 | 11.8 | 0.94 | 0.98 |
+| tmpfs | untar | 318.0 | 71.2 | 69.4 | 72.2 | 0.99 | 0.22 |
+
+**write-back**
+
+| fs | workload | base | off | auto (run 1) | auto (run 2) | auto/off | auto/base |
+|---|---|---|---|---|---|---|---|
+| ext4 | storm_create | 16.9 | 16.2 | 17.6 | 20.2 | 1.17 | 1.12 |
+| ext4 | storm_rename | 16.2 | 18.7 | 18.3 | 18.2 | 0.98 | 1.12 |
+| ext4 | storm_unlink | 16.9 | 14.2 | 15.9 | 13.5 | 1.03 | 0.87 |
+| ext4 | untar | 268.1 | 242.4 | 231.0 | 229.9 | 0.95 | 0.86 |
+| xfs | storm_create | 10.8 | 10.0 | 11.0 | 10.6 | 1.08 | 1.00 |
+| xfs | storm_rename | 13.1 | 15.1 | 14.9 | 15.2 | 1.00 | 1.15 |
+| xfs | storm_unlink | 13.1 | 12.4 | 13.0 | 11.7 | 1.00 | 0.94 |
+| xfs | untar | 148.8 | 139.6 | 146.7 | 148.9 | 1.06 | 0.99 |
+| btrfs | storm_create | 21.3 | 21.9 | 21.4 | 14.5 | 0.82 | 0.84 |
+| btrfs | storm_rename | 18.2 | 28.5 | 24.5 | 26.0 | 0.89 | 1.39 |
+| btrfs | storm_unlink | 28.2 | 20.3 | 23.6 | 25.6 | 1.21 | 0.87 |
+| btrfs | untar | 213.9 | 258.0 | 243.7 | 228.8 | 0.92 | 1.10 |
+| tmpfs | storm_create | 11.6 | 10.7 | 12.2 | 10.3 | 1.05 | 0.97 |
+| tmpfs | storm_rename | 14.8 | 13.3 | 13.2 | 15.0 | 1.06 | 0.96 |
+| tmpfs | storm_unlink | 13.8 | 11.5 | 12.7 | 12.2 | 1.08 | 0.90 |
+| tmpfs | untar | 30.5 | 26.8 | 30.4 | 29.1 | 1.11 | 0.97 |
+
+**The listing change costs nothing visible in the write path.** The storm is the same within the host's noise:
+`auto`/`off` over the 24 storm cells has a median of 1.03 (0.82-1.21), `auto`/`base` 0.99 (0.79-1.39); two `auto` runs
+of one cell differ by 7 % at the median and up to 65 % (btrfs). `tar x`, write-back: `auto`/`off` 0.92-1.11,
+`auto`/`base` 0.86-1.10. `tar x`, write-through: `auto`/`off` 0.99-1.18 (xfs 1.18, 192 s against 222-231 s), but **`base`
+is 2.3 to 4.9 times slower than both `off` and `auto`** (765-946 s against 190-340 s on ext4, xfs and btrfs; tmpfs 318
+against 70 s). That is not plan 40: `off` (the same build, the old listing) is as fast as `auto`, so something between
+`73ea9987` and main made small-file write-through creation faster. The comparison that isolates the listing change is
+`auto` against `off`, within the noise. One run per cell, so no IQRs; the spread of the two `auto` runs is the noise
+estimate.
+
+### Item 6: pins
+
+`readdir-huge-delete` (1,000,000-entry directory, `rm -rf` under the 1 MiB hint cap with 20 filler directories of 20,000
+names listed in a loop, `find -ls` beside it; the plan's fillers hold 200,000):
+
+| fs | created (s) | rm -rf (s) | lister rounds | pinned_dirs max | lost_cookies | cold_scans | result |
+|---|---|---|---|---|---|---|---|
+| ext4 | 244 | 159 | 522 | 2 | 0 -> 0 | 0 -> 0 | PASSED |
+| xfs | 193 | 157 | 505 | 2 | 0 -> 0 | 0 -> 0 | PASSED |
+| btrfs | 197 | 159 | 515 | 2 | 0 -> 0 | 0 -> 0 | PASSED |
+| tmpfs | 190 | 160 | 516 | 2 | 0 -> 0 | 0 -> 0 | PASSED |
+
+Zero `lost_cookies` and zero `cold_scans` on all four. `rm -rf` took 157-160 s on each, about 160 us per entry. The
+sampler (every 250 ms) saw `hint_bytes` at 0 whenever it looked, so the pressure on the hint cache was lighter than the
+cap suggests; the scenario's conditions held all the same.
+
+`releasedir` (`closedir` timed by the caller while a cold scan of the same directory runs, 2,000 opens):
+
+| directory | file system | p50 (us) | p99 (us) | max (us) |
+|---|---|---|---|---|
+| 1M | ext4 | 16 | 24 | 43 |
+| 1M | xfs | 10 | 17 | 25 |
+| 1M | btrfs | 16 | 23 | 30 |
+| 1M | tmpfs | 10 | 17 | 41 |
+| 10M | btrfs (system disk) | 15 | 21 | 892 |
+
+p99 is 17-24 us against the 1 ms bound. The 1,000 releases of the 10,000-directory cell below: p99 2-3 us, max 170-320 us.
+
+Handover (`daemon --upgrade` over a `/dev/fuse` session with one stream open at the middle of the directory, so one
+pinned directory; wall time of the whole command):
+
+| directory | pinned bytes (per listed name) | upgrade wall | largest memfd | RSS with the pin |
+|---|---|---|---|---|
+| 1M, ext4 | 4,026,215 (8.05 B) | 0.60 s | 30 MiB | 129 MiB |
+| 1M, xfs | 4,026,215 (8.05 B) | 0.52 s | 30 MiB | 124 MiB |
+| 1M, btrfs | 4,026,215 (8.05 B) | 0.51 s | 30 MiB | 129 MiB |
+| 1M, tmpfs | 4,026,215 (8.05 B) | 0.49 s | 30 MiB | 124 MiB |
+| **10M, btrfs (system disk)** | 40,250,515 (8.05 B) | **4.25 s** | 169 MiB | 592 MiB |
+
+At 1M the whole command is under 1 s on every file system, so the "at most 1 s added" bound holds with room. **At 10M
+it took 4.25 s**; the pin is 38 MiB of the 169 MiB handoff, the rest is the node's state for 10M entries. Reported, as
+the plan asks; there is no unpinned 10M handover to subtract.
+
+### 1M and 10M directories (median of the runs; kernel-cold)
+
+| cell | version | populate (s) | ls -f (s) | ls -f cpu (s) | ls -f RSS (MiB) | ls -l (s) | ls -l cpu (s) | ls -l RSS (MiB) | cold resume (ms) | cold-scan ref ls -f (s) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| btrfs 1M | auto | 323 | 0.52 | 0.3 | 322 | 20.8 | 15.3 | 347 | 1.5 | 0.55 |
+| ext4 1M | auto | 212 | 0.50 | 0.3 | 413 | 17.2 | 12.7 | 343 | 1.5 | 0.52 |
+| tmpfs 1M | auto | 149 | 0.48 | 0.3 | 226 | 13.9 | 9.7 | 346 | 1.4 | 0.50 |
+| xfs 1M | auto | 154 | 0.49 | 0.3 | 268 | 17.9 | 11.6 | 344 | 1.3 | 0.50 |
+| btrfs 1M | base | 384 | 117.11 | 117.0 | 1001 | 163.0 | 154.5 | 738 | 280.8 | 118.03 |
+| ext4 1M | always | 213 | 3.86 | 3.1 | 438 | 22.0 | 15.6 | 347 | 3.3 | 4.37 |
+| tmpfs 1M | base | 148 | 117.05 | 116.9 | 683 | 166.2 | 156.0 | 732 | 278.8 | 117.27 |
+| xfs 1M | base | 147 | 100.58 | 100.3 | 746 | 138.1 | 129.9 | 728 | 238.6 | 99.04 |
+| root 10M | auto | 4428 | 6.12 | 6.6 | 1138 | 231.8 | 177.9 | 1703 | 1.2 | 5.65 |
+
+At 1M `auto` lists in 0.48-0.52 s where `base` takes 100-117 s and `ls -l` takes 14-21 s against 138-166 s; `base`'s cold
+resume costs 239-281 ms where `auto`'s costs 1.3-1.5 ms; peak RSS of `ls -l` is 343-347 MiB against `base`'s 728-738 MiB.
+`always` (ext4): `ls -f` 3.9 s (7.7 times `auto`: every `getdents`-only walk pays plus pages), `ls -l` 22.0 s (1.28 times
+`auto`), cold resume 3.3 ms, RSS as `auto`'s. `base` on xfs, btrfs and tmpfs behaves as the ext4 `base` of 10-31 did
+(one page 225-270 ms at 1M; ext4 earlier 261 ms).
+
+### Item 5: resources at 10M and with 10,000 open directories
+
+10M, `auto`, btrfs system disk: peak RSS of `ls -f` 1,138 MiB (one plus page of 721 entries, 4,068 requests) and of `ls -l`
+**1,703 MiB** (10,000,001 `kernel_refs`, 13,838 plus pages, 10,014,289 requests, 232 s wall, 178 s daemon CPU); 592 MiB
+with the pinned stream alone. The bound R0 + hint cap + `kernel_refs` x 32 B + pinned bytes cannot be evaluated at 10M
+(no R0 number there). At 1M it can and holds for `ls -l`: R0 peaks at 728-738 MiB, `auto` at 343-347 MiB.
+
+10,000 directories open at once (10,000 directories of 100 names under one parent, one stream each with one name read;
+RSS taken when the 10,000th is open; "delta" = RSS at 10,000 open minus RSS before the first `opendir`):
+
+| fs | version | RSS idle (MiB) | +1,000 open | +10,000 open | delta at 10,000 (MiB) | kernel_refs at 10,000 | pinned bytes | pinned dirs | releasedir p50 / p99 / max of 1,000 (us) |
+|---|---|---|---|---|---|---|---|---|---|
+| ext4 | base | 76 | 85 | 173 | 98 | 10001 | - | - | 2/3/265 |
+| ext4 | auto | 80 | 108 | 308 | 228 | 1010001 | 8900000 | 10000 | 1/2/322 |
+| xfs | base | 442 | 451 | 528 | 86 | 10001 | - | - | 2/3/226 |
+| xfs | auto | 492 | 510 | 704 | 212 | 1010001 | 8900000 | 10000 | 1/3/201 |
+| btrfs | base | 479 | 488 | 575 | 96 | 10001 | - | - | 1/3/168 |
+| btrfs | auto | 87 | 113 | 354 | 267 | 1010001 | 8900000 | 10000 | 1/3/167 |
+| tmpfs | base | 361 | 374 | 453 | 92 | 10001 | - | - | 2/4/250 |
+| tmpfs | auto | 493 | 522 | 716 | 223 | 1010001 | 8900000 | 10000 | 1/2/251 |
+
+`auto` takes **212-267 MiB** for 10,000 open directories against `base`'s 86-98 MiB. The bound is R0 + hint cap (16 MiB) +
+`kernel_refs` x 32 B (1,010,001 refs, 31 MiB: the plus page of the first read of each directory instantiates all its 100
+names) + pinned bytes (8.5 MiB) = **about 140-155 MiB**; the measurement exceeds it by 60-110 MiB. Read the other way the
+daemon holds roughly **120-170 B per kernel reference** (hint cache included), not 32. At 1,000 open directories `auto`
+adds 18-29 MiB over idle against `base`'s 9. The idle RSS before the first `opendir` differs between cells (76-493 MiB,
+independent of the mode), which is why the delta is the figure to read. After all streams close, pinned bytes and
+pinned directories return to 0 and RSS stays at its peak.
+
+### The 10M cell
+
+**Not on ext4.** The test partition has 3.24M inodes and 49 GB and the file store spends one inode and about 5 KB per
+entry; the first attempt was stopped by me at 1.9M inodes and 10 GB used after 15 minutes (projected need 10M inodes,
+50 GB). It ran on the host's system disk (btrfs, no inode limit).
+
+**Populating 10M entries in one directory strains the daemon in both write modes** (16 threads creating empty files, 4-5k
+creates/s at first; not a plan 40 item, reported because it decides whether the cell is runnable). Write-back: the
+daemon's RSS grew about 3.3 KB per entry to 17-18 GB at 5.5M entries, `fjall` journal commits took up to 5 s under the
+journal lock, one `create` stalled for 610 s and the host went into reclaim (51 % I/O wait, load 19); I stopped it at
+5.52M entries. Write-through: the populate completed (4,428 s, 10M entries), the daemon at 12.7 GiB after 10 minutes, 17
+GiB at 6.6M entries, a peak of 21.5 GiB (host load 16-25 throughout). Latency and memory, not corruption: the listings,
+pin and handover after the populate were exact. The memory per created entry belongs to the create path, not the listing;
+noted for the maintainer.
+
+### §9: strict mode and the handoff size
+
+- **Handoff size**: the largest memfd the daemon held during the upgrade with the pinned directory: 30 MiB at 1M (all four
+  file systems), 169 MiB at 10M; the pin itself is 4.0 MB and 40 MB (8.05 B per listed name, as estimated). The plan's
+  "~80 MB for a pinned 10M directory" is twice what was measured.
+- **Strict mode** (`--cto strict` with a second node, harness S3 container; A remounted for each run so it is
+  kernel-cold, B idle; 10 runs per cell, `off` and `auto` in alternating scenario runs):
+
+| directory | listing | mode | wall (ms, median of 10) | plus pages | plus entries with attributes | name-only entries |
+|---|---|---|---|---|---|---|
+| 1,000 | `ls -f` | off | 4.5 | 0 | 0 | 0 |
+| 1,000 | `ls -f` | auto | 5.0 | 1 | 0 | 744 |
+| 1,000 | `ls -l` | off | 3,351 | 0 | 0 | 0 |
+| 1,000 | `ls -l` | auto | 3,349 | 3 | 0 | 1,002 |
+| 10,000 | `ls -f` | off | 8.9 | 0 | 0 | 0 |
+| 10,000 | `ls -f` | auto | 9.0 | 1 | 0 | 744 |
+| 10,000 | `ls -l` | off | 33,750 | 0 | 0 | 0 |
+| 10,000 | `ls -l` | auto | 33,579 | 15 | 0 | 10,002 |
+
+  With a second node every plus entry is name-only, so `auto` saves nothing for `ls -l` (the kernel looks each name up,
+  3.3 ms an entry through the S3 path) and its larger first page costs +0.5 ms at 1k and +0.1 ms at 10k for `ls -f`
+  against `off`. `auto` is not slower than `off` under strict beyond that; resolving the knob to `off` there would save
+  at most half a millisecond a listing. Keep `auto`.
+
+### Trees on current main, `auto` over `off`, cold and warm
+
+Three `pair` cells per file system (18 runs per mode and state), the replica warm as before:
+
+| workload | state | ext4 off | ext4 auto | ext4 ratio | xfs off | xfs auto | xfs ratio | btrfs off | btrfs auto | btrfs ratio | tmpfs off | tmpfs auto | tmpfs ratio |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| ls_lR | cold | 2633.1 (475.2) | 1355.4 (213.5) | 0.51 | 2646.5 (264.7) | 1346.1 (182.7) | 0.51 | 2209.4 (494.6) | 1117.0 (148.8) | 0.51 | 2540.8 (137.0) | 1165.0 (231.3) | 0.46 |
+| ls_lR | warm | 2590.1 (427.8) | 1321.0 (32.8) | 0.51 | 2585.6 (523.6) | 1303.3 (183.5) | 0.50 | 2112.1 (528.5) | 1071.8 (199.6) | 0.51 | 2462.8 (82.9) | 1120.2 (233.6) | 0.45 |
+| find_f | cold | 258.2 (43.3) | 422.7 (29.0) | 1.64 | 261.1 (39.9) | 427.9 (29.4) | 1.64 | 266.0 (22.2) | 411.9 (44.9) | 1.55 | 278.2 (32.0) | 413.0 (27.3) | 1.48 |
+| find_f | warm | 215.7 (9.98) | 360.9 (13.1) | 1.67 | 218.0 (30.7) | 359.4 (19.8) | 1.65 | 216.8 (35.0) | 347.6 (30.3) | 1.60 | 226.3 (22.4) | 337.0 (36.0) | 1.49 |
+| git_status | cold | 594.9 (36.6) | 606.0 (28.7) | 1.02 | 591.6 (36.6) | 595.8 (26.3) | 1.01 | 575.9 (41.0) | 601.5 (21.3) | 1.04 | 585.1 (41.0) | 608.0 (34.2) | 1.04 |
+| git_status | warm | 260.5 (19.7) | 257.9 (46.7) | 0.99 | 257.2 (20.2) | 269.8 (30.0) | 1.05 | 247.8 (26.1) | 271.8 (39.6) | 1.10 | 242.8 (15.4) | 272.3 (22.0) | 1.12 |
+| make_q | cold | 798.5 (44.9) | 816.8 (55.7) | 1.02 | 802.9 (87.4) | 834.8 (61.2) | 1.04 | 728.2 (54.5) | 836.4 (61.1) | 1.15 | 754.6 (52.4) | 838.9 (70.1) | 1.11 |
+| make_q | warm | 418.7 (45.3) | 594.6 (49.9) | 1.42 | 420.0 (54.1) | 588.9 (54.5) | 1.40 | 354.9 (52.6) | 574.0 (71.6) | 1.62 | 397.2 (40.6) | 581.5 (52.5) | 1.46 |
+| rsync_n | cold | 3441.7 (673.0) | 1098.1 (115.1) | 0.32 | 3348.4 (620.0) | 1094.8 (59.2) | 0.33 | 3511.1 (452.9) | 1086.7 (75.0) | 0.31 | 3624.2 (492.3) | 1058.7 (54.2) | 0.29 |
+| rsync_n | warm | 3244.2 (693.4) | 1014.2 (131.1) | 0.31 | 3587.8 (703.4) | 942.5 (76.4) | 0.26 | 3404.4 (692.0) | 941.1 (100.5) | 0.28 | 3503.5 (595.6) | 940.5 (93.3) | 0.27 |
+
+Current main matches 10-31: `find -type f` 1.48-1.67, `make -q` warm 1.40-1.62 (cold 1.02-1.15), `git status` 1.01-1.04
+cold and 0.99-1.12 warm (10-31: 1.10-1.23), `ls -lR` 0.45-0.51, `rsync -an` 0.26-0.33.
+
+Not run in this rerun: `base`/`off` at 10M; `always` on xfs, btrfs, tmpfs and at 10M; the replica-cold and two-node (idle
+second node) states except strict above; an LTS kernel without `dabb90391028`.
+
+---
 
 ## What was compared
 
@@ -423,6 +652,13 @@ PHASES=trees REPS=6 TREE_REPS=6 TREE2=$D/tree.tar D=$D bench/readdirplus/abba.sh
 PHASES=big BIG_SIZES=1000000 BIG_LISTS_ONLY=1 REPS=3 D=$D bench/readdirplus/abba.sh jobs.txt out-big/   # add 10000000 for the plan's 10M
 PHASES=write D=$D bench/readdirplus/abba.sh jobs.txt out-write/   # item 2: base, off, auto as separate cells
 python3 bench/readdirplus/report.py out-list/ out-base/ out-big/ out-trees/
+# the 2026-11-05 rerun (jobs lines may name the store `root`: $HOME/p40root on the system disk, for the 10M cells)
+PHASES=write REPS=2 TREE=$D/tree.tar D=$D bench/readdirplus/abba.sh jobs.txt out-write/   # one tar x per mode
+PHASES=opendirs D=$D bench/readdirplus/abba.sh jobs.txt out-od/   # RSS with 10,000 open directories
+PHASES=big BIG_SIZES=10000000 BIG_WRITE_MODE=through REPS=1 D=$D bench/readdirplus/abba.sh jobs-root.txt out-big10m/
+CONSTELLATION_BIN=$D/bin/main TMPDIR=/mnt/fs-ext4/h target/release/harness run readdir-huge-delete
+STRICT_BENCH_MODE=off|auto STRICT_BENCH_REPS=5 target/release/harness run readdirplus-strict-bench
+python3 bench/readdirplus/report-rerun.py OUTROOT   # tables of the rerun section
 ```
 
 `abba.sh` is resumable; each cell (`cell.py`) gates every phase on the host's 1-minute load (`LOAD_MAX`, default 4),
@@ -432,4 +668,5 @@ tables above; `summarize.py` prints the plan's acceptance verdicts per cell grou
 (`off`, `auto`, `always` against `base`), as before.
 
 What the scripts do not do: the "two nodes (the second idle)" and replica-cold states; the 10M-entry directory takes
-about an hour to create (`BIG_SIZES`); a strict-mode cell is a scenario (`readdirplus-strict`), not a benchmark.
+about 75 minutes to create in write-through mode and does not fit the test partitions (`BIG_SIZES`, store `root`); the
+strict-mode timing is the harness scenario `readdirplus-strict-bench`.

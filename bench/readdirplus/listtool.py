@@ -3,6 +3,9 @@
 
   listtool.py hold DIR N          opendir, read N entries, print READY, keep the stream open until stdin closes
   listtool.py openclose DIR N     N times opendir + one readdir + closedir; print the per-call latencies
+  listtool.py holdmany PARENT COUNT N   open PARENT/d00000.. (COUNT streams), read N entries of each, print READY, then
+                                  on each stdin line print "RELEASE_US p50 p99 max" after closing 1000 streams (once per line);
+                                  the rest close at EOF
   listtool.py coldresume DIR N    read N entries, remember the position, reopen (no hint), seekdir, time one page
 """
 import ctypes
@@ -43,6 +46,29 @@ def pct(v, p):
 
 
 mode, path = sys.argv[1], sys.argv[2]
+if mode == "holdmany":
+    import resource
+    resource.setrlimit(resource.RLIMIT_NOFILE, (resource.getrlimit(resource.RLIMIT_NOFILE)[1],) * 2)
+    count, per = int(sys.argv[3]), int(sys.argv[4])
+    ds = []
+    for i in range(count):
+        d = opendir(f"{path}/d{i:05d}")
+        take(d, per)
+        ds.append(d)
+        if (i + 1) in (1000, 10000):
+            print(f"OPEN {i + 1}", flush=True)
+    print("READY", flush=True)
+    lat = []
+    for _ in sys.stdin:
+        lat = []
+        for d in ds[-1000:]:
+            t = time.perf_counter()
+            libc.closedir(d)
+            lat.append(time.perf_counter() - t)
+        ds = ds[:-1000]
+        print(f"RELEASE_US p50={pct(lat, .5) * 1e6:.0f} p99={pct(lat, .99) * 1e6:.0f} max={max(lat) * 1e6:.0f} n={len(lat)}",
+              flush=True)
+    sys.exit(0)
 if mode == "hold":
     d = opendir(path)
     take(d, int(sys.argv[3]))

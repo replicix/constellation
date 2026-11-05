@@ -1733,3 +1733,61 @@ pub fn handover(_seed: u64) -> Result<()> {
     let _ = c.unmount();
     r
 }
+
+// ------------------------------------------------ readdirplus-strict-bench
+
+/// Plan 40 §9 (strict mode, measure): with `--cto strict` and a second node
+/// in the cluster every plus entry is name-only. Times `ls -f` and `ls -l`
+/// of 1k and 10k entry directories on node A, kernel-cold (A is remounted
+/// for every run; B stays), with the plus mode `STRICT_BENCH_MODE`
+/// (`off`|`auto`, default `auto`), `STRICT_BENCH_REPS` runs (default 7).
+/// Prints `STRICTBENCH` lines; not a pass/fail scenario.
+pub fn strict_bench(_seed: u64) -> Result<()> {
+    const NAME: &str = "readdirplus-strict-bench";
+    let mode = std::env::var("STRICT_BENCH_MODE").unwrap_or_else(|_| "auto".into());
+    let reps = env_usize("STRICT_BENCH_REPS", 7);
+    let envs = [
+        ("CONSTELLATION_CTO", "strict"),
+        ("CONSTELLATION_FUSE_READDIRPLUS", mode.as_str()),
+    ];
+    let mut fx = Fixture::new(NAME, &["a", "b"], &envs, None, &[])?;
+    let r = (|| -> Result<()> {
+        let sizes = [1000usize, 10000];
+        for n in sizes {
+            let d = fx.clients[0].mnt.join(format!("s{n}"));
+            std::fs::create_dir(&d)?;
+            fill(&d, 0..n, 16, entry_name)?;
+        }
+        std::thread::sleep(Duration::from_millis(1500));
+        for n in sizes {
+            let bdir = fx.clients[1].mnt.join(format!("s{n}"));
+            ensure!(names_of(&bdir)?.len() == n, "B lists fewer than {n}");
+        }
+        for rep in 0..reps {
+            fx.clients[0].unmount()?;
+            fx.clients[0].mount_view(None, &[])?;
+            wait_for_p2p(&[&fx.clients[0], &fx.clients[1]])?;
+            for n in sizes {
+                let d = fx.clients[0].mnt.join(format!("s{n}"));
+                for (what, flag) in [("ls_f", "-f"), ("ls_l", "-l")] {
+                    let m0 = mount_status(&fx.clients[0])?;
+                    let t = std::time::Instant::now();
+                    let out = Command::new("ls").arg(flag).arg(&d).output()?;
+                    let wall = t.elapsed();
+                    ensure!(out.status.success(), "ls {flag} failed");
+                    let m1 = mount_status(&fx.clients[0])?;
+                    eprintln!(
+                        "STRICTBENCH mode={mode} n={n} what={what} rep={rep} wall_ms={:.1} plus_pages={} plus_entries={} name_only={}",
+                        wall.as_secs_f64() * 1e3,
+                        num(&m1, "readdirplus_pages") - num(&m0, "readdirplus_pages"),
+                        num(&m1, "readdirplus_entries") - num(&m0, "readdirplus_entries"),
+                        num(&m1, "readdirplus_name_only") - num(&m0, "readdirplus_name_only"),
+                    );
+                }
+            }
+        }
+        Ok(())
+    })();
+    fx.unmount_all();
+    r
+}
