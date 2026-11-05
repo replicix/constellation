@@ -542,7 +542,8 @@ pub fn lifecycle_metered_uploads(seed: u64) -> Result<()> {
 enum CloseRace {
     /// No backup (`CONSTELLATION_BACKUPS=0`): `Local`, nothing streams
     /// ahead — the case chunk 39b met on real S3 (a holder's first
-    /// seconds, or no peer within the RTT budget).
+    /// seconds, or no peer within the RTT budget). A lone root: its
+    /// answers to A wait for the archive (plan 43 C2f).
     Unbacked,
     /// A backs B: the pre-S3 stream carries A's own record to it past its
     /// held chunks (B answers `OwnChunks::Streamed`), so the hold keeps
@@ -661,10 +662,12 @@ fn close_race(
         // on B, below every later segment's `through`. A's next refusal
         // (`rmdir` of the non-empty `d/`, refused on B) observes B's
         // position past them; they are A's own, and A carries the close.
-        // Unbacked, A uploaded the chunk for it (close-stall-followup);
-        // now it excuses its own rows: no upload, the chunk stays held,
-        // and the reads after it do not wait (checked with the session
-        // timeouts below). Backed, the stream needs no upload either.
+        // Backed, the stream needs no upload: the chunk stays held, and
+        // the reads after it do not wait (checked with the session
+        // timeouts below). Unbacked, B is a lone root, which since plan
+        // 43 C2f answers another node's op only from the archive: the
+        // close's answer waits for B's ship, which needs A's chunk, so A
+        // uploads it for the close itself and nothing is left to excuse.
         let mut files = Vec::new();
         {
             let file = "d/held";
@@ -714,15 +717,23 @@ fn close_race(
                  own-record uploads {uploads}, excused {excused}, chunk PUTs {puts}, \
                  pending {pending}, reads {reads:?} ({listed} entries)"
             );
-            if mode != CloseRace::AckS3 {
-                anyhow::ensure!(
+            match mode {
+                CloseRace::Backed => anyhow::ensure!(
                     uploads == 0 && puts == 0 && pending > 0,
                     "A uploaded its held close for a position only its own rows held back \
                      (uploads {uploads}, PUTs {puts}, pending {pending})"
-                );
-            }
-            if mode == CloseRace::Unbacked {
-                anyhow::ensure!(excused > 0, "A's own rows were not excused");
+                ),
+                // Plan 43 C2f: B, a lone root, answers A's close (another
+                // node's forward) only once the archive holds its row, and
+                // B ships that row only with A's chunk up: the close's own
+                // answer uploaded it, before the refusal. Nothing is held
+                // back by A's rows then, so nothing is excused.
+                CloseRace::Unbacked => anyhow::ensure!(
+                    pending == 0 && excused == 0,
+                    "A's close to a lone root was answered with its chunk still held \
+                     (pending {pending}, excused {excused})"
+                ),
+                CloseRace::AckS3 => {}
             }
             files.push(Acked {
                 name: file.to_string(),
