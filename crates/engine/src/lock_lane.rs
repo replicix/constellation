@@ -191,10 +191,15 @@ async fn lane_loop(
             break;
         }
         match next {
-            None => wake.notified().await,
-            Some(n) => {
+            // Nothing held: an install wakes it. With grants held but none
+            // the lane's now (all lapsed or lapsing), a late renewal can make
+            // one honoured again without waking anyone (`renewed` wakes only
+            // for a lapsing grant): look again within `MAX_SLEEP_MS`, or the
+            // lane sleeps through the next core stall.
+            None if meta.locks().held_count() == 0 => wake.notified().await,
+            next => {
                 let now = constellation_platform::clock::protocol().honour();
-                let ms = n.since(now).clamp(0, MAX_SLEEP_MS) as u64;
+                let ms = next.map_or(MAX_SLEEP_MS, |n| n.since(now).clamp(0, MAX_SLEEP_MS)) as u64;
                 tokio::select! {
                     _ = wake.notified() => {}
                     _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
@@ -601,6 +606,86 @@ mod tests {
             woke <= 4,
             "woke {woke} times for one grant due in 600 ms (a tick every 100 ms is 6)"
         );
+    }
+
+    /// A lane that looked while every held grant was lapsed (none its own
+    /// to renew: `next_wake` is `None`) must still look again after a late
+    /// renewal makes the grant honoured, which wakes no one (`renewed`
+    /// wakes only for a grant marked lapsing). Fails before: it slept until
+    /// the next install, and renewed nothing through the next core stall.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lane_that_found_only_lapsed_grants_looks_again_after_a_late_renewal() {
+        use constellation_authority::lane::LockLaneView;
+        use constellation_authority::HonourMs;
+        use constellation_meta::locks::{HeldGrant, LockMode};
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let off_core = Arc::new(OffCore::new(5_000));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *off_core.urgent.lock().unwrap() = Some(tx);
+        let _lane = LockLane::start(meta.clone(), Peers::disabled(), off_core.clone(), 1, 400)
+            .expect("the lane is on by default");
+        let clk = constellation_platform::clock::protocol().now();
+        off_core.lane_cell.publish(LockLaneView {
+            me: 1,
+            epoch: 1,
+            root_ok: true,
+            cap_until: HonourMs(clk.honour.0 + 60_000),
+            fast: false,
+            last_fresh: HonourMs(0),
+            window_ms: 1_500,
+            marked: true,
+            owner: 0,
+            clock: constellation_platform::clock::protocol().id(),
+            lock_ttl_ms: 4_000,
+            margin_ms: 500,
+            forward_timeout_ms: 400,
+        });
+        let id = meta
+            .locks()
+            .grant(1, 1, 7, LockMode::Exclusive, clk.wait.plus(60_000), 0);
+        // Held, lapsed a moment ago, not (yet) lapsing: the lane's look
+        // skips it and finds nothing to wake for.
+        meta.locks().install_held(
+            7,
+            HeldGrant {
+                id,
+                mode: LockMode::Exclusive,
+                until: HonourMs(clk.honour.0 - 10),
+                renew_at: HonourMs(clk.honour.0 - 1_000),
+                owner: 1,
+                recalled: false,
+                position: constellation_meta::Position::ZERO,
+                renewing: None,
+                releasing: false,
+                first_use: false,
+                idle_since: None,
+                installed: clk.honour,
+                lapsing: None,
+                written: false,
+                route: None,
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The core's late renewal: honoured again, next due in 600 ms.
+        let now = constellation_platform::clock::protocol().now();
+        meta.locks().renewed(
+            7,
+            id,
+            id,
+            LockMode::Exclusive,
+            HonourMs(now.honour.0 - 1_150),
+            4_000,
+            500,
+            false,
+            1,
+            now,
+        );
+        let h = meta.locks().held(7).unwrap();
+        assert!(h.until.0 > now.honour.0 && h.lapsing.is_none(), "{h:?}");
+        let told = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+            .await
+            .expect("the lane never looked again after the late renewal");
+        assert!(matches!(told, Some(SyncRequest::LaneOwn { renewed: 1 })));
     }
 
     #[test]
