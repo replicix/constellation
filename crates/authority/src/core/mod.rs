@@ -453,6 +453,14 @@ pub struct Config {
     /// simulation turns it off as the negative control of the oracle that
     /// counts own `Lone` rows behind an uncommitted gated one.
     pub delegation_lone_hysteresis: bool,
+    /// Plan 46 M1.1 step 3's negative control, never set in production: a
+    /// delegate stamps a row journaled while it assesses itself lone with
+    /// a version of its own (`RowCommit::PER_ROW_STAMP`) instead of its
+    /// configuration's — the journal-time class of the mutable "peer in
+    /// budget" assessment that rows no longer carry. The simulation's
+    /// `row_version_matches_config` oracle must fail with it
+    /// (`AUTHORITY_SIM_PER_ROW_CLASS=1`).
+    pub per_row_class: bool,
     /// The delegate's stream/renew retry tick.
     pub delegation_stream_tick_ms: u64,
     /// Simulation only: the root drops every Nth of its unsolicited
@@ -766,6 +774,7 @@ impl Config {
             delegation_stream_rows: 256,
             delegation_lone_lead: true,
             delegation_lone_hysteresis: true,
+            per_row_class: false,
             delegation_stream_tick_ms: 50,
             delegation_push_drop_every: 0,
             delegation_recall_drop_every: 0,

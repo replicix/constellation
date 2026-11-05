@@ -5928,6 +5928,18 @@ fn sweep_config() {
                 core
             });
         }
+        // Plan 46 M1.1 step 3: `AUTHORITY_SIM_PER_ROW_CLASS=1` is the negative
+        // control of the row-version oracle (`Config::per_row_class`): a lone
+        // delegate stamps its rows with a version of its own, not its
+        // configuration's; the oracle must fail the run.
+        if std::env::var("AUTHORITY_SIM_PER_ROW_CLASS").is_ok_and(|v| v == "1") {
+            let inner = c.core.clone();
+            c.core = std::sync::Arc::new(move |id, inc| {
+                let mut core = inner(id, inc);
+                core.per_row_class = true;
+                core
+            });
+        }
         // L3: `AUTHORITY_SIM_DROP_RECALLS=<n>` makes every node, as a root,
         // lose the first send of every nth recall it starts
         // (`Config::delegation_recall_drop_every`), and
@@ -7120,6 +7132,23 @@ fn long_delegated_hysteresis_off_config() -> SimConfig {
     }
 }
 
+/// `long-delegated` under `+commit` with a delegate that stamps each row
+/// from the mutable "peer in budget" assessment (`Config::per_row_class`):
+/// the negative control of the row-version oracle
+/// (`row_version_matches_config`). It fails by design
+/// (`the_row_version_oracle_catches_a_per_row_class`).
+fn long_delegated_per_row_class_config() -> SimConfig {
+    SimConfig {
+        strict_commit: true,
+        core: std::sync::Arc::new(|node, inc| {
+            let mut c = sim::run::sim_core_config(node, inc);
+            c.per_row_class = true;
+            c
+        }),
+        ..long_delegated_config()
+    }
+}
+
 /// `long-delegated` with backups in budget for the root and every
 /// delegate: the root streams its journal — its appends of the delegate
 /// streams included — ahead of S3, and a delegate's reply a requester
@@ -7598,6 +7627,10 @@ struct OracleTotals {
     /// (must be 0).
     class_claim: (usize, u64),
     class_claim_seeds: Vec<u64>,
+    /// Plan 46 M1.1 step 3: `row_version_matches_config` violations, the
+    /// seeds with one, and the rows judged.
+    row_version: (usize, u64, usize),
+    row_version_seeds: Vec<u64>,
     downgraded_lone: u64,
     class_from_session: u64,
     /// The cross-generation acknowledgement rule: acknowledgements that
@@ -7676,6 +7709,12 @@ impl OracleTotals {
         self.class_claim.1 += u64::from(r.class_claim_mismatch > 0);
         if r.class_claim_mismatch > 0 && self.class_claim_seeds.len() < 30 {
             self.class_claim_seeds.push(seed);
+        }
+        self.row_version.0 += r.row_version_mismatch;
+        self.row_version.1 += u64::from(r.row_version_mismatch > 0);
+        self.row_version.2 += r.row_versions_checked;
+        if r.row_version_mismatch > 0 && self.row_version_seeds.len() < 30 {
+            self.row_version_seeds.push(seed);
         }
         for st in r.stats.values() {
             self.xgen[0] += st.deleg_xgen_acks_delayed;
@@ -7995,6 +8034,15 @@ impl OracleTotals {
             self.parked[5],
             self.parked[6],
             self.parked[7]
+        );
+        eprintln!(
+            "SWEEP-ROWVERSION-TOTALS {label} seeds {}/{seeds}: row-version-mismatch={} in {} seeds, \
+             rows judged {}; mismatch in seeds {:?}",
+            self.seeds,
+            self.row_version.0,
+            self.row_version.1,
+            self.row_version.2,
+            self.row_version_seeds
         );
         eprintln!(
             "SWEEP-CLAIM-TOTALS {label} seeds {}/{seeds}: class-claim-mismatch={} in {} seeds, \
@@ -17059,6 +17107,29 @@ fn a_lone_delegates_own_lone_rows_stay_within_the_lead_and_behind_no_open_gated_
 /// 46 M1.1 moved the trajectories: 57 and 103 hold none since a lone root's
 /// journal stopped counting as the delegate's second copy.)
 const LONE_LEAD_SEEDS: [u64; 8] = [1, 2, 3, 4, 5, 6, 64, 118];
+
+/// Plan 46 M1.1 step 3: a delegate that stamps its rows from the mutable
+/// assessment instead of the configuration's version
+/// (`Config::per_row_class`, `AUTHORITY_SIM_PER_ROW_CLASS=1`) fails
+/// `row_version_matches_config`; the same seeds pass with the knob off.
+#[test]
+fn the_row_version_oracle_catches_a_per_row_class() {
+    for seed in [3, 4, 5] {
+        let err = run_seed(seed, long_delegated_per_row_class_config())
+            .expect_err("the knob must fail the oracle");
+        assert!(
+            err.contains("row_version_matches_config") && err.contains("row version"),
+            "seed {seed}: {err}"
+        );
+        let clean = SimConfig {
+            strict_commit: true,
+            ..long_delegated_config()
+        };
+        let report = run_seed(seed, clean).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        assert_eq!(report.row_version_mismatch, 0, "seed {seed}");
+        assert!(report.row_versions_checked > 0, "seed {seed}");
+    }
+}
 
 /// The oracle's negative controls: with the lead disabled
 /// (`Config::delegation_lone_lead`) a lone delegate journals `Lone` rows past

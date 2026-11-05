@@ -1946,7 +1946,7 @@ fn a_stale_deleg_group_record_is_ignored() {
 /// which queued all of them.
 #[test]
 fn a_recalled_delegates_gated_rows_are_dropped_and_its_lone_rows_replayed() {
-    use constellation_meta::{PendingClass, RowClass};
+    use constellation_meta::{PendingClass, RowCommit};
     let meta = Meta::open_in_memory().unwrap();
     let d = (2 << 40) | 1;
     meta.apply_segment(
@@ -1966,9 +1966,9 @@ fn a_recalled_delegates_gated_rows_are_dropped_and_its_lone_rows_replayed() {
     .unwrap();
     let gen = 7;
     for (seq, name, class) in [
-        (1, "a", RowClass::DelegGroup),
-        (2, "b", RowClass::Lone),
-        (3, "c", RowClass::DelegGroup),
+        (1, "a", RowCommit::DELEG_GROUP),
+        (2, "b", RowCommit::LONE),
+        (3, "c", RowCommit::DELEG_GROUP),
     ] {
         let _class = PendingClass::set(class);
         let op = MutateOp::Create {
@@ -2282,8 +2282,8 @@ fn last_seq(meta: &Meta) -> u64 {
 
 /// The root's own row (generation 0), journaled `Lone`: a lone root's op.
 fn root_own_lone(meta: &Meta, name: &str, ino: u64, seq: u64) {
-    use constellation_meta::{PendingClass, RowClass};
-    let _class = PendingClass::set(RowClass::Lone);
+    use constellation_meta::{PendingClass, RowCommit};
+    let _class = PendingClass::set(RowCommit::LONE);
     let op = MutateOp::Create {
         parent: ROOT_INO,
         name: name.into(),
@@ -2311,14 +2311,14 @@ fn root_own_lone(meta: &Meta, name: &str, ino: u64, seq: u64) {
 /// their gated class.
 #[test]
 fn a_rebuild_queues_no_gated_append_of_a_delegates_row() {
-    use constellation_meta::{PendingClass, RowClass};
+    use constellation_meta::{PendingClass, RowCommit};
     let gen = 5;
     let meta = Meta::open_in_memory().unwrap();
     meta.set_holder_epoch(1);
     // Idx 1: appended `Lone`, then re-tagged by a re-ask's answer.
     root_appends(&meta, gen, 1, "a");
     assert!(meta
-        .reclass_journal_tx(last_seq(&meta), RowClass::Archive)
+        .reclass_journal_tx(last_seq(&meta), RowCommit::ARCHIVE)
         .unwrap());
     // Idx 2: a predecessor's adopted tail (`RootGroup`).
     meta.apply_adopted_records_from(
@@ -2332,7 +2332,7 @@ fn a_rebuild_queues_no_gated_append_of_a_delegates_row() {
     root_appends(&meta, gen, 3, "l");
     // And the root's own committed row (generation 0).
     {
-        let _class = PendingClass::set(RowClass::RootGroup);
+        let _class = PendingClass::set(RowCommit::ROOT_GROUP);
         let op = MutateOp::Create {
             parent: ROOT_INO,
             name: "own".into(),
@@ -2348,7 +2348,7 @@ fn a_rebuild_queues_no_gated_append_of_a_delegates_row() {
     meta.replace_ns_from_rebuilt(&Meta::open_in_memory().unwrap(), &Default::default())
         .unwrap();
     assert_eq!(meta.journal_len().unwrap(), 0);
-    let queued: Vec<(Rid, RowClass)> = meta
+    let queued: Vec<(Rid, RowCommit)> = meta
         .pending_replays()
         .unwrap()
         .into_iter()
@@ -2356,7 +2356,7 @@ fn a_rebuild_queues_no_gated_append_of_a_delegates_row() {
         .collect();
     assert_eq!(
         queued,
-        vec![(delegate_rid(3), RowClass::Lone)],
+        vec![(delegate_rid(3), RowCommit::LONE)],
         "only the lone append is queued; the gated appends are their generation's"
     );
     for seq in [1, 2] {
@@ -2600,13 +2600,13 @@ fn a_segment_of_the_appends_own_epoch_is_not_a_supersession() {
 /// Fails before: the own replays carry no deps.
 #[test]
 fn a_rebuild_keeps_the_stream_deps_of_the_roots_own_replays() {
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
     let gen = 5;
     let meta = Meta::open_in_memory().unwrap();
     meta.set_holder_epoch(1);
     // Idx 1: re-asked, so gated: dropped by the rebuild.
     root_appends(&meta, gen, 1, "a");
-    meta.reclass_journal_tx(last_seq(&meta), RowClass::Archive)
+    meta.reclass_journal_tx(last_seq(&meta), RowCommit::ARCHIVE)
         .unwrap();
     root_own_lone(&meta, "m1", (3 << 40) | 1, 8);
     // Idx 2: still `Lone`: queued.

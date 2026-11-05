@@ -734,7 +734,7 @@ impl View {
             constellation_meta::DurableWait::Ungated => {
                 let changed = self
                     .meta
-                    .reclass_journal_tx(target.first, constellation_meta::RowClass::Lone)
+                    .reclass_journal_tx(target.first, constellation_meta::RowCommit::LONE)
                     .inspect_err(|error| {
                         tracing::warn!(%error, first = target.first, "could not re-tag a row answered with the gate off: EIO");
                     })?;

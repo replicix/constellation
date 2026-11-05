@@ -940,11 +940,19 @@ impl Core {
                     // ([`Self::report_deleg_durable`]), not decided again
                     // for every step's view.
                     match self.dl.reported.get(&d.gen).map(|r| r.class) {
-                        Some(constellation_meta::RowClass::Lone) => "lone",
-                        Some(constellation_meta::RowClass::Archive) => "archive",
-                        Some(constellation_meta::RowClass::RootGroup) => "root-group",
-                        Some(constellation_meta::RowClass::DelegGroup) => "deleg-group",
-                        Some(constellation_meta::RowClass::NonStealable) => "non-stealable",
+                        Some(constellation_meta::RowCommit::Singleton { .. }) => "lone",
+                        Some(constellation_meta::RowCommit::Group {
+                            on: GroupOn::Archive,
+                            ..
+                        }) => "archive",
+                        Some(constellation_meta::RowCommit::Group {
+                            on: GroupOn::Root, ..
+                        }) => "root-group",
+                        Some(constellation_meta::RowCommit::Group {
+                            on: GroupOn::Delegate,
+                            ..
+                        }) => "deleg-group",
+                        Some(constellation_meta::RowCommit::Final) => "non-stealable",
                         None => "",
                     }
                     .to_string(),
@@ -2043,7 +2051,8 @@ impl Core {
         // (A settle's refusal is never `Lone`: it waits for the group, also
         // for this node's own client — see `Core::settle_refusal`.)
         let class_asker = if settle { Asker::Remote } else { asker };
-        let mut class = self.deleg_ack_class(gen, class_asker, replica);
+        let rule = self.deleg_rule(gen, class_asker, replica);
+        let mut class = rule.ack_class(gen);
         let dedup = replica.recent_outcome(rid).is_some()
             || replica.completed_outcome(rid).ok().flatten().is_some();
         if dedup {
@@ -2072,9 +2081,9 @@ impl Core {
             // store classes again where it journals them: the fast path's
             // rows may go in between (see below).
             if asker == Asker::Own {
-                constellation_meta::PendingClass::set_own(class.into(), limits)
+                constellation_meta::PendingClass::set_own(self.deleg_row_commit(gen, rule), limits)
             } else {
-                constellation_meta::PendingClass::set(class.into())
+                constellation_meta::PendingClass::set(self.deleg_row_commit(gen, rule))
             }
         });
         if !dedup
@@ -2328,6 +2337,33 @@ impl Core {
     /// root too, like every other node's.
     pub fn deleg_ack_class(&self, gen: u64, asker: Asker, replica: &dyn Replica) -> AckClass {
         self.deleg_rule(gen, asker, replica).ack_class(gen)
+    }
+
+    /// The rule stored with a row of generation `gen` this delegate
+    /// journals (or publishes for its fast path): its configuration's, in
+    /// the version of the group in force. With `Config::per_row_class` (the
+    /// negative control) a row journaled while the delegate assesses itself
+    /// lone carries a version of its own.
+    fn deleg_row_commit(&self, gen: u64, rule: CommitRule) -> constellation_meta::RowCommit {
+        let commit = constellation_meta::RowCommit::from(rule);
+        match (self.cfg.per_row_class, self.dl.mine.get(&gen), commit) {
+            (true, Some(d), constellation_meta::RowCommit::Group { on, .. })
+                if self.deleg_lone(d) =>
+            {
+                constellation_meta::RowCommit::group(
+                    constellation_meta::RowCommit::PER_ROW_STAMP,
+                    on,
+                )
+            }
+            (true, Some(d), constellation_meta::RowCommit::Singleton { .. })
+                if self.deleg_lone(d) =>
+            {
+                constellation_meta::RowCommit::Singleton {
+                    config_version: constellation_meta::RowCommit::PER_ROW_STAMP,
+                }
+            }
+            _ => commit,
+        }
     }
 
     /// Plan 46 M1.1 step 2: the commit rule of this node's delegate
@@ -3252,7 +3288,7 @@ impl Core {
         let mut current = BTreeMap::new();
         let mut raised = Vec::new();
         for d in self.dl.mine.values() {
-            let class = self.deleg_ack_class(d.gen, Asker::Own, replica);
+            let rule = self.deleg_rule(d.gen, Asker::Own, replica);
             let uncapped = self.deleg_committed_through(d, replica.log_stream_idx(d.gen));
             let through = caps.get(&d.gen).map_or(uncapped, |c| c.committed);
             // The prefix is floored at the log's index, which this node's own
@@ -3279,7 +3315,7 @@ impl Core {
             current.insert(
                 d.gen,
                 constellation_meta::DelegDurable {
-                    class: class.into(),
+                    class: self.deleg_row_commit(d.gen, rule),
                     through,
                     horizon: self.deleg_lone_horizon(through),
                     lost: d.stopped || d.lapsed || d.backup_sealed,

@@ -307,7 +307,7 @@ fn a_gated_holders_close_returns_once_its_manifest_row_is_durable() {
         true,
         meta.journal_tip().unwrap(),
         false,
-        constellation_meta::RowClass::RootGroup,
+        constellation_meta::RowCommit::ROOT_GROUP,
         false,
     );
     let (fs, _dir, _core) = holder_fs(meta.clone(), true);
@@ -343,7 +343,7 @@ fn a_gated_holders_close_returns_once_its_manifest_row_is_durable() {
             true,
             tip,
             false,
-            constellation_meta::RowClass::RootGroup,
+            constellation_meta::RowCommit::ROOT_GROUP,
             false,
         );
         assert_eq!(close.join().unwrap(), Ok(()));
@@ -363,7 +363,7 @@ fn a_gated_holders_close_returns_once_its_manifest_row_is_durable() {
 /// parent: the row stayed gated-class.
 #[test]
 fn ungated_fast_path_answer_retags_the_row_lone() {
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
     let session = meta.session();
@@ -371,7 +371,7 @@ fn ungated_fast_path_answer_retags_the_row_lone() {
         true,
         meta.journal_tip().unwrap(),
         false,
-        RowClass::RootGroup,
+        RowCommit::ROOT_GROUP,
         false,
     );
     let (fs, _dir, _core) = holder_fs(meta.clone(), true);
@@ -393,14 +393,14 @@ fn ungated_fast_path_answer_retags_the_row_lone() {
         // Journaled under the class the core published with the gate.
         assert_eq!(
             meta.journal_tx_class(tip).unwrap(),
-            Some(RowClass::RootGroup)
+            Some(RowCommit::ROOT_GROUP)
         );
         std::thread::sleep(Duration::from_millis(100));
         assert!(!close.is_finished(), "the close waits for the group");
         // The gate goes off, the lease still this node's.
-        session.set_durable(false, u64::MAX, false, RowClass::Lone, true);
+        session.set_durable(false, u64::MAX, false, RowCommit::LONE, true);
         assert_eq!(close.join().unwrap(), Ok(()));
-        assert_eq!(meta.journal_tx_class(tip).unwrap(), Some(RowClass::Lone));
+        assert_eq!(meta.journal_tx_class(tip).unwrap(), Some(RowCommit::LONE));
     });
     assert_eq!(session.stats().fast_acks_downgraded, 1);
 }
@@ -431,7 +431,7 @@ fn journaled_past_durable(meta: &Meta) -> u64 {
 /// `Ok`.
 #[test]
 fn a_failed_retag_fails_the_fast_path_close() {
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
     let session = meta.session();
@@ -439,7 +439,7 @@ fn a_failed_retag_fails_the_fast_path_close() {
         true,
         meta.journal_tip().unwrap(),
         false,
-        RowClass::RootGroup,
+        RowCommit::ROOT_GROUP,
         false,
     );
     let (fs, _dir, _core) = holder_fs(meta.clone(), true);
@@ -454,11 +454,11 @@ fn a_failed_retag_fails_the_fast_path_close() {
         let tip = journaled_past_durable(&meta);
         std::thread::sleep(Duration::from_millis(100));
         assert!(!close.is_finished(), "the close waits for the group");
-        session.set_durable(false, u64::MAX, false, RowClass::Lone, true);
+        session.set_durable(false, u64::MAX, false, RowCommit::LONE, true);
         assert_eq!(close.join().unwrap(), Err(Code::Io));
         assert_eq!(
             meta.journal_tx_class(tip).unwrap(),
-            Some(RowClass::RootGroup)
+            Some(RowCommit::ROOT_GROUP)
         );
     });
     assert_eq!(session.stats().fast_acks_downgraded, 0);
@@ -468,14 +468,14 @@ fn a_failed_retag_fails_the_fast_path_close() {
 /// re-tag fails. Fails on the parent: the create was answered `Ok`.
 #[test]
 fn a_failed_retag_fails_the_fast_path_op() {
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let session = meta.session();
     session.set_durable(
         true,
         meta.journal_tip().unwrap(),
         false,
-        RowClass::RootGroup,
+        RowCommit::ROOT_GROUP,
         false,
     );
     let (fs, _dir, _core) = holder_fs(meta.clone(), true);
@@ -500,7 +500,7 @@ fn a_failed_retag_fails_the_fast_path_op() {
         let tip = journaled_past_durable(&meta);
         std::thread::sleep(Duration::from_millis(100));
         assert!(!op.is_finished(), "the op waits for the group");
-        session.set_durable(false, u64::MAX, false, RowClass::Lone, true);
+        session.set_durable(false, u64::MAX, false, RowCommit::LONE, true);
         assert_eq!(
             op.join().unwrap(),
             Err(Code::Io),
@@ -508,7 +508,7 @@ fn a_failed_retag_fails_the_fast_path_op() {
         );
         assert_eq!(
             meta.journal_tx_class(tip).unwrap(),
-            Some(RowClass::RootGroup)
+            Some(RowCommit::ROOT_GROUP)
         );
     });
     assert_eq!(session.stats().fast_acks_downgraded, 0);
@@ -522,7 +522,7 @@ fn a_failed_retag_fails_the_fast_path_op() {
 /// answered `Ok` and its row re-tagged `Lone`.
 #[test]
 fn an_unexpected_ungated_wait_is_counted_and_resubmitted() {
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
     use std::sync::atomic::{AtomicBool, Ordering};
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let session = meta.session();
@@ -530,7 +530,7 @@ fn an_unexpected_ungated_wait_is_counted_and_resubmitted() {
         true,
         meta.journal_tip().unwrap(),
         false,
-        RowClass::RootGroup,
+        RowCommit::ROOT_GROUP,
         false,
     );
     let (fs, _dir, mut core) = holder_fs(meta.clone(), true);
@@ -556,7 +556,7 @@ fn an_unexpected_ungated_wait_is_counted_and_resubmitted() {
             std::thread::sleep(Duration::from_millis(100));
             assert!(!op.is_finished(), "the op waits for the group");
             // Released: the gate is off, the node may not answer alone.
-            session.set_durable(false, u64::MAX, false, RowClass::Lone, false);
+            session.set_durable(false, u64::MAX, false, RowCommit::LONE, false);
             tip
         }));
         let result = op.join().unwrap();
@@ -565,7 +565,7 @@ fn an_unexpected_ungated_wait_is_counted_and_resubmitted() {
         let tip = waiting.unwrap_or_else(|e| std::panic::resume_unwind(e));
         assert_eq!(
             meta.journal_tx_class(tip).unwrap(),
-            Some(RowClass::RootGroup),
+            Some(RowCommit::ROOT_GROUP),
             "not answered as a lone node's"
         );
         result
@@ -587,11 +587,11 @@ fn an_unexpected_ungated_wait_is_counted_and_resubmitted() {
 /// once, whatever the core said.
 #[test]
 fn a_lone_row_journaled_after_the_node_stopped_being_lone_is_in_doubt() {
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
     use std::sync::atomic::{AtomicBool, Ordering};
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let session = meta.session();
-    session.set_durable(false, u64::MAX, false, RowClass::Lone, false);
+    session.set_durable(false, u64::MAX, false, RowCommit::LONE, false);
     let (fs, _dir, mut core) = holder_fs(meta.clone(), false);
     let ino = meta.allocate_ino(ROOT_INO).unwrap();
     let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
@@ -614,7 +614,7 @@ fn a_lone_row_journaled_after_the_node_stopped_being_lone_is_in_doubt() {
     });
     assert!(result.is_err(), "not answered OK: {result:?}");
     let tip = meta.journal_tip().unwrap();
-    assert_eq!(meta.journal_tx_class(tip).unwrap(), Some(RowClass::Lone));
+    assert_eq!(meta.journal_tx_class(tip).unwrap(), Some(RowCommit::LONE));
     let submitted = submitted.lock().unwrap();
     assert_eq!(submitted.len(), 1, "resubmitted once: {submitted:?}");
     assert!(submitted[0].1, "in doubt");
@@ -631,12 +631,12 @@ fn a_lone_row_journaled_after_the_node_stopped_being_lone_is_in_doubt() {
 /// Fails on the parent: the row was answered `Ok` at once on this disk.
 #[test]
 fn a_lone_row_is_in_doubt_while_a_lapse_is_not_handed_to_the_core() {
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
     use std::sync::atomic::{AtomicBool, Ordering};
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let session = meta.session();
     // The core's last word: lone, the gate off.
-    session.set_durable(false, u64::MAX, false, RowClass::Lone, true);
+    session.set_durable(false, u64::MAX, false, RowCommit::LONE, true);
     let off = Arc::new(crate::authority_driver::OffCore::new(5_000));
     {
         let off = off.clone();
@@ -1476,7 +1476,7 @@ const DELEG_GEN: u64 = 7;
 /// (`class`) and the committed stream index (`through`) for it. Returns
 /// the directory too.
 fn delegate_fs(
-    class: constellation_meta::RowClass,
+    class: constellation_meta::RowCommit,
     through: u64,
 ) -> (
     View,
@@ -1592,9 +1592,9 @@ fn core_answering_in_doubt(
 /// class waited: the write went through the core and parked there.
 #[test]
 fn the_delegates_fast_path_writes_then_waits_for_its_group() {
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowClass::DelegGroup, 0);
+    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowCommit::DELEG_GROUP, 0);
     let h = fs.sync.as_ref().unwrap();
     let (op, rid) = delegate_create(dir, 1);
     let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
@@ -1606,7 +1606,7 @@ fn the_delegates_fast_path_writes_then_waits_for_its_group() {
             // Journaled on this thread, under the published class.
             assert_eq!(
                 meta.journal_tx_class(meta.journal_tip().unwrap()).unwrap(),
-                Some(RowClass::DelegGroup)
+                Some(RowCommit::DELEG_GROUP)
             );
             std::thread::sleep(Duration::from_millis(100));
             assert!(!write.is_finished(), "the write waits for its group");
@@ -1614,7 +1614,7 @@ fn the_delegates_fast_path_writes_then_waits_for_its_group() {
             meta.session().set_deleg_durable(
                 DELEG_GEN,
                 Some(constellation_meta::DelegDurable {
-                    class: RowClass::DelegGroup,
+                    class: RowCommit::DELEG_GROUP,
                     through: 1,
                     horizon: u64::MAX,
                     lost: false,
@@ -1644,9 +1644,9 @@ fn the_delegates_fast_path_writes_then_waits_for_its_group() {
 /// does not wait (`Lone`) never looks at the watermark.
 #[test]
 fn the_delegates_fast_path_answers_a_lone_row_and_a_committed_row_at_once() {
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowClass::Lone, 0);
+    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowCommit::LONE, 0);
     let h = fs.sync.as_ref().unwrap();
     let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
     let (first, second) = std::thread::scope(|scope| {
@@ -1655,14 +1655,14 @@ fn the_delegates_fast_path_answers_a_lone_row_and_a_committed_row_at_once() {
         let first = fs.mutate_op_rebasable_with_rid(h, dir, &op, rid).is_ok();
         assert_eq!(
             meta.journal_tx_class(meta.journal_tip().unwrap()).unwrap(),
-            Some(RowClass::Lone)
+            Some(RowCommit::LONE)
         );
         assert_eq!(meta.session().stats().fast_acks_waited, 0);
         // A group class with the watermark past the row: answered, counted.
         meta.session().set_deleg_durable(
             DELEG_GEN,
             Some(constellation_meta::DelegDurable {
-                class: RowClass::DelegGroup,
+                class: RowCommit::DELEG_GROUP,
                 through: u64::MAX,
                 horizon: u64::MAX,
                 lost: false,
@@ -1681,7 +1681,7 @@ fn the_delegates_fast_path_answers_a_lone_row_and_a_committed_row_at_once() {
     );
     assert_eq!(
         meta.journal_tx_class(meta.journal_tip().unwrap()).unwrap(),
-        Some(RowClass::DelegGroup)
+        Some(RowCommit::DELEG_GROUP)
     );
     assert_eq!(meta.session().stats().fast_acks_waited, 1);
     assert_eq!(h.delegates.executed(), 2);
@@ -1697,9 +1697,9 @@ fn the_delegates_fast_path_answers_a_lone_row_and_a_committed_row_at_once() {
 /// was journaled `Lone` and answered at once on this disk.
 #[test]
 fn a_delegates_lone_row_waits_for_its_group_while_a_lapse_is_not_handed_to_the_core() {
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowClass::Lone, 0);
+    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowCommit::LONE, 0);
     let h = fs.sync.as_ref().unwrap();
     let session = meta.session();
     let off = Arc::new(crate::authority_driver::OffCore::new(5_000));
@@ -1718,7 +1718,7 @@ fn a_delegates_lone_row_waits_for_its_group_while_a_lapse_is_not_handed_to_the_c
         assert!(fs.mutate_op_rebasable_with_rid(h, dir, &op, rid).is_ok());
         assert_eq!(
             meta.journal_tx_class(meta.journal_tip().unwrap()).unwrap(),
-            Some(RowClass::Lone)
+            Some(RowCommit::LONE)
         );
         // The process was frozen: the probe's tick is overdue by seconds.
         let now = crate::authority_driver::wait_now_ms();
@@ -1728,7 +1728,7 @@ fn a_delegates_lone_row_waits_for_its_group_while_a_lapse_is_not_handed_to_the_c
             journaled_stream_row(&meta, 2);
             assert_eq!(
                 meta.journal_tx_class(meta.journal_tip().unwrap()).unwrap(),
-                Some(RowClass::DelegGroup),
+                Some(RowCommit::DELEG_GROUP),
                 "journaled for the group"
             );
             std::thread::sleep(Duration::from_millis(100));
@@ -1737,7 +1737,7 @@ fn a_delegates_lone_row_waits_for_its_group_while_a_lapse_is_not_handed_to_the_c
             session.set_deleg_durable(
                 DELEG_GEN,
                 Some(constellation_meta::DelegDurable {
-                    class: RowClass::Lone,
+                    class: RowCommit::LONE,
                     through: 2,
                     horizon: u64::MAX,
                     lost: false,
@@ -1753,7 +1753,7 @@ fn a_delegates_lone_row_waits_for_its_group_while_a_lapse_is_not_handed_to_the_c
         assert!(result.is_ok());
         // The driver hands the lapse: the published word stands again.
         off.lapse_stepped(now);
-        assert_eq!(session.deleg_row_class(DELEG_GEN), Some(RowClass::Lone));
+        assert_eq!(session.deleg_row_class(DELEG_GEN), Some(RowCommit::LONE));
     });
     assert!(
         submitted.lock().unwrap().is_empty(),
@@ -1767,10 +1767,10 @@ fn a_delegates_lone_row_waits_for_its_group_while_a_lapse_is_not_handed_to_the_c
 /// core under its rid, which answers from the row's commit.
 #[test]
 fn the_delegates_fast_path_resubmits_in_doubt_when_its_generation_is_lost() {
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
     use std::sync::atomic::{AtomicBool, Ordering};
     for withdraw in [false, true] {
-        let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowClass::DelegGroup, 0);
+        let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowCommit::DELEG_GROUP, 0);
         let h = fs.sync.as_ref().unwrap();
         let (op, rid) = delegate_create(dir, 1);
         let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
@@ -1787,7 +1787,7 @@ fn the_delegates_fast_path_resubmits_in_doubt_when_its_generation_is_lost() {
                     meta.session().set_deleg_durable(
                         DELEG_GEN,
                         Some(constellation_meta::DelegDurable {
-                            class: RowClass::DelegGroup,
+                            class: RowCommit::DELEG_GROUP,
                             through: 0,
                             horizon: u64::MAX,
                             lost: true,
@@ -1820,9 +1820,9 @@ fn the_delegates_fast_path_resubmits_in_doubt_when_its_generation_is_lost() {
 /// journaled `DelegGroup` and wait for its group.
 #[test]
 fn a_delegates_row_is_classed_when_it_is_journaled_not_when_admitted() {
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowClass::Lone, 0);
+    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowCommit::LONE, 0);
     let h = fs.sync.as_ref().unwrap();
     let (op, rid) = delegate_create(dir, 1);
     let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
@@ -1839,7 +1839,7 @@ fn a_delegates_row_is_classed_when_it_is_journaled_not_when_admitted() {
                 m.session().set_deleg_durable(
                     DELEG_GEN,
                     Some(constellation_meta::DelegDurable {
-                        class: RowClass::DelegGroup,
+                        class: RowCommit::DELEG_GROUP,
                         through: 0,
                         horizon: u64::MAX,
                         lost: false,
@@ -1859,7 +1859,7 @@ fn a_delegates_row_is_classed_when_it_is_journaled_not_when_admitted() {
         meta.session().set_deleg_durable(
             DELEG_GEN,
             Some(constellation_meta::DelegDurable {
-                class: RowClass::DelegGroup,
+                class: RowCommit::DELEG_GROUP,
                 through: 1,
                 horizon: u64::MAX,
                 lost: false,
@@ -1872,7 +1872,7 @@ fn a_delegates_row_is_classed_when_it_is_journaled_not_when_admitted() {
     });
     assert!(hook_ran.load(Ordering::Relaxed), "the hook never ran");
     assert!(
-        class == Some(RowClass::DelegGroup) && waited,
+        class == Some(RowCommit::DELEG_GROUP) && waited,
         "the core published DelegGroup before the row was journaled: journaled class {class:?}, \
          write waited for its group: {waited}"
     );
@@ -1886,15 +1886,15 @@ fn a_delegates_row_is_classed_when_it_is_journaled_not_when_admitted() {
 /// fast path journal `Lone` rows without bound past the lead.
 #[test]
 fn a_delegates_row_past_the_lead_waits_while_the_core_still_publishes_lone() {
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowClass::Lone, 0);
+    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowCommit::LONE, 0);
     let h = fs.sync.as_ref().unwrap();
     let publish = |through, horizon| {
         meta.session().set_deleg_durable(
             DELEG_GEN,
             Some(constellation_meta::DelegDurable {
-                class: RowClass::Lone,
+                class: RowCommit::LONE,
                 through,
                 horizon,
                 lost: false,
@@ -1914,7 +1914,7 @@ fn a_delegates_row_past_the_lead_waits_while_the_core_still_publishes_lone() {
             assert!(fs.mutate_op_rebasable_with_rid(h, dir, &op, rid).is_ok());
             assert_eq!(
                 tip_class(),
-                Some(RowClass::Lone),
+                Some(RowCommit::LONE),
                 "row {seq}, within the lead"
             );
         }
@@ -1925,7 +1925,7 @@ fn a_delegates_row_past_the_lead_waits_while_the_core_still_publishes_lone() {
             journaled_stream_row(&meta, 3);
             assert_eq!(
                 tip_class(),
-                Some(RowClass::DelegGroup),
+                Some(RowCommit::DELEG_GROUP),
                 "row 3 is past the lead"
             );
             std::thread::sleep(Duration::from_millis(100));
@@ -1946,7 +1946,7 @@ fn a_delegates_row_past_the_lead_waits_while_the_core_still_publishes_lone() {
         assert!(result.is_ok() && fourth.is_ok());
         assert_eq!(
             fourth_class,
-            Some(RowClass::Lone),
+            Some(RowCommit::LONE),
             "row 4, within the new lead"
         );
     });
@@ -1965,9 +1965,9 @@ fn a_delegates_row_past_the_lead_waits_while_the_core_still_publishes_lone() {
 /// through the gated row has committed.
 #[test]
 fn a_delegates_lone_row_follows_only_a_committed_gated_row() {
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowClass::DelegGroup, 0);
+    let (fs, meta, dir, _tmp, mut core) = delegate_fs(RowCommit::DELEG_GROUP, 0);
     let h = fs.sync.as_ref().unwrap();
     let publish = |class, through| {
         meta.session().set_deleg_durable(
@@ -1991,19 +1991,19 @@ fn a_delegates_lone_row_follows_only_a_committed_gated_row() {
         assert_eq!(meta.delegate_gated_idx(DELEG_GEN).unwrap(), 1);
         // The core publishes `Lone` again with nothing more committed (the
         // lead moved, or the publication is of a step before the row).
-        publish(RowClass::Lone, 0);
+        publish(RowCommit::LONE, 0);
         let second = scope.spawn(|| fs.mutate_op_rebasable_with_rid(h, dir, &op2, rid2));
         let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             journaled_stream_row(&meta, 2);
             assert_eq!(
                 tip_class(),
-                Some(RowClass::DelegGroup),
+                Some(RowCommit::DELEG_GROUP),
                 "row 2 follows an uncommitted gated row"
             );
             std::thread::sleep(Duration::from_millis(100));
             assert!(!first.is_finished() && !second.is_finished());
         }));
-        publish(RowClass::Lone, 2);
+        publish(RowCommit::LONE, 2);
         let (first, second) = (first.join().unwrap(), second.join().unwrap());
         // Both committed: the next row is `Lone` and answered at once.
         let (op3, rid3) = delegate_create(dir, 3);
@@ -2015,7 +2015,7 @@ fn a_delegates_lone_row_follows_only_a_committed_gated_row() {
             std::panic::resume_unwind(e);
         }
         assert!(first.is_ok() && second.is_ok() && third.is_ok());
-        assert_eq!(third_class, Some(RowClass::Lone));
+        assert_eq!(third_class, Some(RowCommit::LONE));
     });
     assert!(
         submitted.lock().unwrap().is_empty(),
@@ -2031,10 +2031,10 @@ fn a_delegates_lone_row_follows_only_a_committed_gated_row() {
 #[test]
 #[ignore]
 fn lone_check_cost() {
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let session = meta.session();
-    session.set_durable(false, u64::MAX, false, RowClass::Lone, true);
+    session.set_durable(false, u64::MAX, false, RowCommit::LONE, true);
     let off = Arc::new(crate::authority_driver::OffCore::new(5_000));
     let n: u64 = 20_000_000;
     let run = |threads: usize| -> f64 {

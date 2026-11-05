@@ -1317,7 +1317,7 @@ impl Core {
                     // nothing is queued to mark): its client's retry dedups
                     // against the successor's re-ship if the group held it,
                     // and executes once if not.
-                    if !constellation_meta::RowClass::from(class).gated() {
+                    if !class.gated() {
                         self.replay.unacked.insert(rid);
                     }
                     if let Some(c) = self.clients.get_mut(&rid) {
@@ -2123,7 +2123,7 @@ impl Core {
             if held_for_remote {
                 if let Some(j) = row {
                     if let Err(error) =
-                        replica.reclass_journal_tx(j, constellation_meta::RowClass::NonStealable)
+                        replica.reclass_journal_tx(j, constellation_meta::RowCommit::FINAL)
                     {
                         tracing::warn!(node = self.cfg.node_id, %error, "could not re-tag a row answered in a hold: EIO");
                         if let ParkedWhat::Reply { outcome, .. } = &mut p.what {
@@ -2134,9 +2134,12 @@ impl Core {
             }
             if downgraded {
                 if let Some(j) = row {
-                    if let Err(error) =
-                        replica.reclass_journal_tx(j, constellation_meta::RowClass::Lone)
-                    {
+                    if let Err(error) = replica.reclass_journal_tx(
+                        j,
+                        constellation_meta::RowCommit::Singleton {
+                            config_version: self.root_config_version(),
+                        },
+                    ) {
                         tracing::warn!(node = self.cfg.node_id, %error, "could not re-tag a row answered with the gate off: EIO");
                         if let ParkedWhat::Reply { outcome, .. }
                         | ParkedWhat::Finish { outcome, .. } = &mut p.what

@@ -1917,7 +1917,7 @@ pub(crate) mod pending_upload_tests {
         // it as a member copy and queues nothing; the replay this test is
         // about is the lone branch's, or an abandoned group's: the row is
         // journaled as a lone one's.)
-        let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+        let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
         b.meta
             .apply_adopted_records(
                 &[

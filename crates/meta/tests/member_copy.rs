@@ -5,7 +5,7 @@
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::{
     execute_mutate, BackupTx, LogRecord, MemberTx, Meta, MetaStore, MutateOp, PendingClass,
-    Position, ReadKey, Rid, RowClass, TouchSet,
+    Position, ReadKey, Rid, RowCommit, TouchSet,
 };
 
 const HOLDER: u64 = 1;
@@ -61,7 +61,7 @@ fn shipped(seq: u64) -> Position {
 }
 
 /// Run `create name` as the holder at epoch 1 under `class`, rid `seq`.
-fn holder_create(meta: &Meta, class: RowClass, name: &str, n: u64, seq: u64) {
+fn holder_create(meta: &Meta, class: RowCommit, name: &str, n: u64, seq: u64) {
     let _c = PendingClass::set(class);
     execute_mutate(meta, &create_op(name, ino(n)), Some(rid(seq))).unwrap();
 }
@@ -71,7 +71,7 @@ fn apply_rows(meta: &Meta, seq: u64, epoch: u64, through: u64, rows: &[u64], rec
         .unwrap();
 }
 
-fn mtx(first: u64, last: u64, class: RowClass, records: Vec<LogRecord>) -> MemberTx {
+fn mtx(first: u64, last: u64, class: RowCommit, records: Vec<LogRecord>) -> MemberTx {
     MemberTx {
         tx: BackupTx {
             first,
@@ -95,8 +95,8 @@ fn strand_below_epoch_moves_gated_rows_to_the_member_copy() {
     let meta = Meta::open_in_memory().unwrap();
     let before = raw_ns(&meta);
     meta.set_holder_epoch(1);
-    holder_create(&meta, RowClass::RootGroup, "a", 1, 1);
-    holder_create(&meta, RowClass::Lone, "b", 2, 2);
+    holder_create(&meta, RowCommit::ROOT_GROUP, "a", 1, 1);
+    holder_create(&meta, RowCommit::LONE, "b", 2, 2);
     meta.set_holder_epoch(0);
     let stranded = meta.strand_below_epoch(2).unwrap();
     assert_eq!(stranded.member_copied, 1);
@@ -111,7 +111,7 @@ fn strand_below_epoch_moves_gated_rows_to_the_member_copy() {
     );
     let (info, rows) = meta.member_copy_rows(1).unwrap().expect("a member copy");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].class, RowClass::RootGroup);
+    assert_eq!(rows[0].class, RowCommit::ROOT_GROUP);
     assert_eq!(rows[0].rid, Some(rid(1)));
     assert!(rows[0].op.is_some());
     // (A recovery's strand holds reads of it, as a segment's does.)
@@ -131,8 +131,8 @@ fn strand_below_epoch_moves_gated_rows_to_the_member_copy() {
 fn an_ungated_row_is_still_queued() {
     let meta = Meta::open_in_memory().unwrap();
     meta.set_holder_epoch(1);
-    holder_create(&meta, RowClass::Archive, "a", 1, 1);
-    holder_create(&meta, RowClass::NonStealable, "b", 2, 2);
+    holder_create(&meta, RowCommit::ARCHIVE, "a", 1, 1);
+    holder_create(&meta, RowCommit::FINAL, "b", 2, 2);
     meta.set_holder_epoch(0);
     // (An Archive row is gated by Q12 but a never-acknowledged one: it goes
     // to the member copy and is dropped at the next marker.)
@@ -162,7 +162,7 @@ fn an_ungated_row_is_still_queued() {
 fn a_committed_row_moved_to_the_member_copy_holds_its_readers() {
     let meta = Meta::open_in_memory().unwrap();
     meta.set_holder_epoch(1);
-    holder_create(&meta, RowClass::RootGroup, "data", 1, 1);
+    holder_create(&meta, RowCommit::ROOT_GROUP, "data", 1, 1);
     meta.set_holder_epoch(0);
     let key = [ReadKey::Dentry(ROOT_INO, "data".into())];
     assert!(meta.lookup(ROOT_INO, "data").unwrap().is_some());
@@ -206,7 +206,7 @@ fn a_committed_row_moved_to_the_member_copy_holds_its_readers() {
 fn a_recovery_strand_holds_its_readers_until_the_reship() {
     let meta = Meta::open_in_memory().unwrap();
     meta.set_holder_epoch(1);
-    holder_create(&meta, RowClass::RootGroup, "data", 1, 1);
+    holder_create(&meta, RowCommit::ROOT_GROUP, "data", 1, 1);
     meta.set_holder_epoch(0);
     let key = [ReadKey::Dentry(ROOT_INO, "data".into())];
     assert_eq!(meta.strand_below_epoch(2).unwrap().member_copied, 1);
@@ -238,7 +238,7 @@ fn a_recovery_strand_holds_its_readers_until_the_reship() {
 fn a_row_that_never_leaves_the_copy_stops_holding_after_the_cap() {
     let meta = Meta::open_in_memory().unwrap();
     meta.set_holder_epoch(1);
-    holder_create(&meta, RowClass::RootGroup, "data", 1, 1);
+    holder_create(&meta, RowCommit::ROOT_GROUP, "data", 1, 1);
     meta.set_holder_epoch(0);
     let key = [ReadKey::Dentry(ROOT_INO, "data".into())];
     let dir = [ReadKey::Dir(ROOT_INO)];
@@ -281,7 +281,7 @@ fn a_row_the_namespace_already_has_does_not_hold_its_readers() {
     let r = create("data", ino(1), 10);
     apply_rows(&meta, 1, 1, 2, &[1, 2], &[r.clone(), completed(rid(1))]);
     assert!(meta.lookup(ROOT_INO, "data").unwrap().is_some());
-    let row = mtx(1, 2, RowClass::RootGroup, vec![r, completed(rid(1))]);
+    let row = mtx(1, 2, RowCommit::ROOT_GROUP, vec![r, completed(rid(1))]);
     meta.member_copy_put_rows(1, 1, &[row]).unwrap();
     assert!(meta.member_copy_carries(rid(1)).unwrap());
     assert!(!meta.member_copy_touches(&[ReadKey::Dentry(ROOT_INO, "data".into())]));
@@ -473,8 +473,8 @@ fn a_rebuild_keeps_a_committed_shadow() {
     .unwrap();
     // A gated row of this node's own journal: member copy; a lone one: queue.
     meta.set_holder_epoch(1);
-    holder_create(&meta, RowClass::RootGroup, "g", 4, 4);
-    holder_create(&meta, RowClass::Lone, "l", 5, 5);
+    holder_create(&meta, RowCommit::ROOT_GROUP, "g", 4, 4);
+    holder_create(&meta, RowCommit::LONE, "l", 5, 5);
     meta.set_holder_epoch(0);
     let side = Meta::open_in_memory().unwrap();
     meta.replace_ns_from_rebuilt(&side, &Default::default())
@@ -648,8 +648,8 @@ fn a_rebuild_drops_the_member_rows_its_log_re_shipped() {
     put(
         &meta,
         &[
-            mtx(4, 4, RowClass::RootGroup, vec![create("a", ino(1), 10)]),
-            mtx(5, 5, RowClass::RootGroup, vec![create("b", ino(2), 11)]),
+            mtx(4, 4, RowCommit::ROOT_GROUP, vec![create("a", ino(1), 10)]),
+            mtx(5, 5, RowCommit::ROOT_GROUP, vec![create("b", ino(2), 11)]),
         ],
     );
     let side = Meta::open_in_memory().unwrap();
@@ -744,9 +744,9 @@ fn the_member_copy_is_dropped_when_the_archive_carries_it() {
     put(
         &meta,
         &[
-            mtx(1, 2, RowClass::RootGroup, vec![create("a", ino(1), 10)]),
-            mtx(3, 3, RowClass::RootGroup, vec![create("b", ino(2), 11)]),
-            mtx(4, 4, RowClass::RootGroup, vec![create("c", ino(3), 12)]),
+            mtx(1, 2, RowCommit::ROOT_GROUP, vec![create("a", ino(1), 10)]),
+            mtx(3, 3, RowCommit::ROOT_GROUP, vec![create("b", ino(2), 11)]),
+            mtx(4, 4, RowCommit::ROOT_GROUP, vec![create("c", ino(3), 12)]),
         ],
     );
     // A re-ship names the first by identity.
@@ -786,9 +786,9 @@ fn tail_follows_drops_member_rows_past_through() {
     put(
         &meta,
         &[
-            mtx(1, 1, RowClass::RootGroup, vec![create("a", ino(1), 10)]),
-            mtx(2, 2, RowClass::RootGroup, vec![create("b", ino(2), 11)]),
-            mtx(3, 3, RowClass::RootGroup, vec![create("c", ino(3), 12)]),
+            mtx(1, 1, RowCommit::ROOT_GROUP, vec![create("a", ino(1), 10)]),
+            mtx(2, 2, RowCommit::ROOT_GROUP, vec![create("b", ino(2), 11)]),
+            mtx(3, 3, RowCommit::ROOT_GROUP, vec![create("c", ino(3), 12)]),
         ],
     );
     let marker = vec![LogRecord::TailFollowsThrough {
@@ -812,9 +812,9 @@ fn a_marker_without_tail_follows_drops_only_archive_rows() {
     put(
         &meta,
         &[
-            mtx(1, 1, RowClass::RootGroup, vec![create("a", ino(1), 10)]),
-            mtx(2, 2, RowClass::Archive, vec![create("b", ino(2), 11)]),
-            mtx(3, 3, RowClass::Lone, vec![create("c", ino(3), 12)]),
+            mtx(1, 1, RowCommit::ROOT_GROUP, vec![create("a", ino(1), 10)]),
+            mtx(2, 2, RowCommit::ARCHIVE, vec![create("b", ino(2), 11)]),
+            mtx(3, 3, RowCommit::LONE, vec![create("c", ino(3), 12)]),
         ],
     );
     let applied = meta
@@ -846,7 +846,7 @@ fn an_abandoned_rid_less_row_is_queued_under_one_rid_on_every_member() {
     let queued_on = |node: u64, epoch: u64, records: Vec<LogRecord>| -> Vec<Rid> {
         let meta = Meta::open_in_memory().unwrap();
         meta.set_node_prefix(node).unwrap();
-        meta.member_copy_put_rows(epoch, 3, &[mtx(3, 3, RowClass::RootGroup, records)])
+        meta.member_copy_put_rows(epoch, 3, &[mtx(3, 3, RowCommit::ROOT_GROUP, records)])
             .unwrap();
         let marker = vec![LogRecord::GroupAbandoned {
             epoch,
@@ -887,7 +887,7 @@ fn group_abandoned_moves_the_member_copy_to_the_replay_queue() {
     let mut row1 = mtx(
         1,
         2,
-        RowClass::RootGroup,
+        RowCommit::ROOT_GROUP,
         vec![create("a", ino(1), 10), completed(rid(1))],
     );
     row1.rid = Some(rid(1));
@@ -895,10 +895,10 @@ fn group_abandoned_moves_the_member_copy_to_the_replay_queue() {
     let row2 = mtx(
         3,
         3,
-        RowClass::RootGroup,
+        RowCommit::ROOT_GROUP,
         vec![create("b", ino(2), 11), completed(rid(2))],
     );
-    let mut lone = mtx(4, 4, RowClass::Lone, vec![create("c", ino(3), 12)]);
+    let mut lone = mtx(4, 4, RowCommit::LONE, vec![create("c", ino(3), 12)]);
     lone.rid = Some(rid(3));
     lone.op = Some(create_op("c", ino(3)));
     put(&meta, &[row1, row2, lone]);
@@ -935,7 +935,7 @@ fn a_member_copy_is_ruled_after_a_restart() {
             &[mtx(
                 1,
                 1,
-                RowClass::RootGroup,
+                RowCommit::ROOT_GROUP,
                 vec![create("a", ino(1), 10)],
             )],
         );
@@ -985,13 +985,13 @@ fn a_streamed_committed_row_named_by_rolled_back_is_retracted() {
             mtx(
                 3,
                 3,
-                RowClass::RootGroup,
+                RowCommit::ROOT_GROUP,
                 vec![create("a", ino(1), 10), completed(rid(1))],
             ),
             mtx(
                 4,
                 4,
-                RowClass::RootGroup,
+                RowCommit::ROOT_GROUP,
                 vec![create("k", ino(7), 13), completed(rid(7))],
             ),
         ],
@@ -1170,7 +1170,7 @@ fn an_uncommitted_rolled_back_record_retracts_nothing_until_the_log_carries_it()
         &[mtx(
             3,
             3,
-            RowClass::RootGroup,
+            RowCommit::ROOT_GROUP,
             vec![create("a", ino(1), 10), completed(rid(1))],
         )],
     )

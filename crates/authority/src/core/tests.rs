@@ -2493,7 +2493,7 @@ fn lose_renewal_with_an_unshipped_create(h: &mut Harness) -> Vec<Action> {
 /// `class` (plan 43 C1-4: what a deposition does to it depends on it).
 fn lose_renewal_with_a_create_of_class(
     h: &mut Harness,
-    class: Option<constellation_meta::RowClass>,
+    class: Option<constellation_meta::RowCommit>,
 ) -> Vec<Action> {
     h.hold(1, None);
     // Something unshipped, so the deposition has work to roll back.
@@ -4170,7 +4170,7 @@ fn a_truncate_the_tail_carried_leaves_its_commit_on_the_cut_base() {
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let mut h = Harness::new(2);
     let file = h.meta.create(ROOT_INO, "f7", 0o644, 0, 0).unwrap();
     constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"payload-1"), None)
@@ -4232,7 +4232,7 @@ fn a_folded_truncate_replays_as_the_base_checked_cut() {
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let stranded = |h: &mut Harness| {
         let file = h.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
         constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"payload-1"), None)
@@ -4471,7 +4471,7 @@ fn a_no_op_completion_is_not_the_truncates_effect() {
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let mut h = Harness::new(2);
     let file = h.meta.create(ROOT_INO, "f7", 0o644, 0, 0).unwrap();
     constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"payload-1"), None)
@@ -4525,7 +4525,7 @@ fn two_folded_truncates_and_their_commit_all_land() {
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let mut h = Harness::new(2);
     let file = h.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
     constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"payload-1"), None)
@@ -4578,7 +4578,7 @@ fn the_drain_leaves_a_folded_truncates_row_as_it_was() {
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let (_holder, mut requester) = pair();
     let file = requester.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
     constellation_meta::execute_mutate(
@@ -4931,7 +4931,7 @@ fn a_deposed_holders_adopted_manifest_commit_is_not_replayed() {
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     use constellation_fs_core::{ChunkHash, Manifest};
     let mut h = Harness::new(1);
     let file = h.meta.create(ROOT_INO, "same", 0o644, 0, 0).unwrap();
@@ -14698,15 +14698,16 @@ mod backup_crash {
             constellation_meta::execute_mutate(&h.meta, &op2, Some(rid2)).unwrap();
         }
         let class_of = |h: &Harness, rid| {
-            crate::replica::Replica::journal_class_of_rid(&h.meta, rid).map(|(_, c)| c)
+            crate::replica::Replica::journal_class_of_rid(&h.meta, rid)
+                .map(|(_, c)| c.versionless())
         };
         assert_eq!(
             class_of(&h, rid1),
-            Some(constellation_meta::RowClass::Archive)
+            Some(constellation_meta::RowCommit::ARCHIVE)
         );
         assert_eq!(
             class_of(&h, rid2),
-            Some(constellation_meta::RowClass::Archive)
+            Some(constellation_meta::RowCommit::ARCHIVE)
         );
         // Rid 1's client asks again, in doubt: found done, its answer waits
         // for the journal's tip.
@@ -14733,12 +14734,12 @@ mod backup_crash {
         ));
         assert_eq!(
             class_of(&h, rid1),
-            Some(constellation_meta::RowClass::Lone),
+            Some(constellation_meta::RowCommit::LONE),
             "answered lone over a row still tagged otherwise"
         );
         assert_eq!(
             class_of(&h, rid2),
-            Some(constellation_meta::RowClass::Archive),
+            Some(constellation_meta::RowCommit::ARCHIVE),
             "another op's row was re-tagged"
         );
     }
@@ -14765,7 +14766,8 @@ mod backup_crash {
             constellation_meta::execute_mutate(&h.meta, &op2, Some(rid2)).unwrap();
         }
         let class_of = |h: &Harness, rid| {
-            crate::replica::Replica::journal_class_of_rid(&h.meta, rid).map(|(_, c)| c)
+            crate::replica::Replica::journal_class_of_rid(&h.meta, rid)
+                .map(|(_, c)| c.versionless())
         };
         let out = h.step(Event::SubmitInDoubt {
             rid: rid1,
@@ -14783,7 +14785,7 @@ mod backup_crash {
         assert_eq!(class_of(&h, rid1), None, "the row is still unshipped");
         assert_eq!(
             class_of(&h, rid2),
-            Some(constellation_meta::RowClass::Archive)
+            Some(constellation_meta::RowCommit::ARCHIVE)
         );
         // The gate goes off: the answer leaves.
         h.advance(100);
@@ -14803,7 +14805,7 @@ mod backup_crash {
         );
         assert_eq!(
             class_of(&h, rid2),
-            Some(constellation_meta::RowClass::Archive),
+            Some(constellation_meta::RowCommit::ARCHIVE),
             "another op's row was re-tagged"
         );
     }
@@ -39725,7 +39727,7 @@ fn a_deposed_nodes_op_waits_for_its_own_earlier_write_then_forwards() {
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let (mut h, (before_rid, before_op), rid, retry) = op_submitted_while_deposed();
     recover_deposed_node(&mut h);
     assert_eq!(h.meta.pending_replays().unwrap().len(), 1);
@@ -39787,7 +39789,7 @@ fn a_stalled_s3_does_not_forward_a_deposed_nodes_op_ahead_of_its_own_write() {
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let (mut h, _before, rid, _retry) = op_submitted_while_deposed();
     recover_deposed_node(&mut h);
     h.advance(1_000);
@@ -39879,7 +39881,7 @@ fn the_gate_leaves_a_replay_to_the_drain_until_its_delegate_rows_are_here() {
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let (mut h, _rid, _q) = deposed_root_with_a_marker_replay();
     let mut out = Vec::new();
     h.core
@@ -39907,7 +39909,7 @@ fn the_gate_forgets_a_replay_the_log_already_settled_whatever_its_deps() {
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let (mut h, rid, _q) = deposed_root_with_a_marker_replay();
     let seg = [
         LogRecord::Create {
@@ -40239,7 +40241,7 @@ fn a_replay_with_one_lost_generation_keeps_the_rows_of_the_live_one() {
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let (mut h, rid, q) = deposed_root_with_a_marker_replay();
     let mut deps = constellation_meta::Streams::NONE;
     deps.raise(4, 7);
@@ -40272,7 +40274,7 @@ fn a_replay_does_not_wait_on_the_successors_stream_of_an_undone_grants_number() 
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let mut h = Harness::new(1);
     h.core.cfg.delegation = true;
     h.hold(1, None);
@@ -40362,7 +40364,7 @@ fn a_replay_does_not_keep_rows_of_a_generation_the_log_ended_below_its_own_cut()
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let (mut h, rid, q) = deposed_root_with_a_marker_replay();
     // This replica's own memory: generation 4 ended at its cursor 7 (the
     // rows it appended), so row 7 is not lost *here*.
@@ -40504,7 +40506,7 @@ fn a_deposed_nodes_own_op_at_the_head_of_its_replay_queue_is_not_held_behind_the
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let (mut h, [(rx, x), (ry, _y)]) = deposed_with_stranded_rows(["x", "y"]);
     let out = resubmit_in_doubt(&mut h, rx, &x);
     // It goes to the holder at once (held, it sat in a backoff).
@@ -40537,7 +40539,7 @@ fn a_deposed_nodes_own_op_behind_another_replay_is_held_until_it_settles() {
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let (mut h, [(ry, y), (rx, x)]) = deposed_with_stranded_rows(["y", "x"]);
     let out = resubmit_in_doubt(&mut h, rx, &x);
     assert!(!forwards_of(&out, rx), "held, not forwarded: {out:?}");
@@ -40568,7 +40570,7 @@ fn a_deposed_nodes_own_op_in_the_middle_of_its_queue_is_held_for_the_one_ahead_o
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let (mut h, [(ry, y), (rx, x), (rz, _z)]) = deposed_with_stranded_rows(["y", "x", "z"]);
     let out = resubmit_in_doubt(&mut h, rx, &x);
     assert!(!forwards_of(&out, rx), "held for ry: {out:?}");
@@ -40607,7 +40609,7 @@ fn a_deposed_nodes_own_op_keeps_the_live_rows_its_queue_entry_recorded() {
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let mut h = Harness::new(1);
     h.core.cfg.delegation = true;
     h.hold(1, None);
@@ -40722,7 +40724,7 @@ fn a_lost_fast_path_write_resubmitted_in_doubt_is_decided_once_across_a_takeover
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let mut h = Harness::new(1);
     h.hold(1, None);
     let rx = h.rid(1);
@@ -40810,7 +40812,7 @@ fn a_resubmission_in_doubt_merges_into_the_live_replay_of_its_rid() {
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let mut h = Harness::new(1);
     h.hold(1, None);
     let rx = h.rid(1);
@@ -40899,7 +40901,7 @@ fn a_replay_of_a_rid_leaves_the_clients_in_doubt_mark_for_its_resubmission() {
     // Plan 43 C1-4: this test is about the lone branch's replay (a row nobody was
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
-    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowClass::Lone);
+    let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
     let mut h = Harness::new(1);
     h.hold(1, None);
     let rx = h.rid(1);
@@ -44149,7 +44151,7 @@ mod deleg_group {
         assert!(client_answers(&out).is_empty(), "answered alone: {out:?}");
         assert_eq!(
             h.meta.journal_classes_of_rid(rid).unwrap(),
-            vec![constellation_meta::RowClass::DelegGroup]
+            vec![constellation_meta::RowCommit::DELEG_GROUP]
         );
         let (req, round, last) = batch(&out).expect("the refusal streams to the root");
         let out = root_acks(&mut h, req, round, last);
@@ -44287,7 +44289,7 @@ mod deleg_group {
         );
         assert_eq!(
             h.meta.session().deleg_row_class(7),
-            Some(constellation_meta::RowClass::DelegGroup),
+            Some(constellation_meta::RowCommit::DELEG_GROUP),
             "published: the fast path's rows wait too"
         );
         let (rid, out) = own_create(&mut h, dir, 1);
@@ -44331,7 +44333,7 @@ mod deleg_group {
         let published = |h: &Harness| h.meta.session().deleg_row_class(7);
         no_links(&mut h, 0);
         assert_eq!(class(&h), AckClass::Lone, "nobody linked");
-        assert_eq!(published(&h), Some(constellation_meta::RowClass::Lone));
+        assert_eq!(published(&h), Some(constellation_meta::RowCommit::LONE));
         // Paused for seconds: the lapse is handed with the next event.
         h.step(Event::OwnLag {
             from: w(h.now).minus(1),
@@ -44344,7 +44346,7 @@ mod deleg_group {
         );
         assert_eq!(
             published(&h),
-            Some(constellation_meta::RowClass::DelegGroup),
+            Some(constellation_meta::RowCommit::DELEG_GROUP),
             "the lapse event publishes it"
         );
         // A snapshot taken before the lapse was handed does not restore it.
@@ -44355,7 +44357,7 @@ mod deleg_group {
         h.advance(100);
         no_links(&mut h, 1);
         assert_eq!(class(&h), AckClass::Lone);
-        assert_eq!(published(&h), Some(constellation_meta::RowClass::Lone));
+        assert_eq!(published(&h), Some(constellation_meta::RowCommit::LONE));
     }
 
     /// A lone delegate answers its own node's rows from its disk only while
@@ -44394,7 +44396,7 @@ mod deleg_group {
         );
         assert_eq!(
             h.meta.session().deleg_row_class(7),
-            Some(constellation_meta::RowClass::DelegGroup)
+            Some(constellation_meta::RowCommit::DELEG_GROUP)
         );
         let (held, out) = own_create(&mut h, dir, 5);
         assert!(client_answers(&out).is_empty(), "answered alone: {out:?}");
@@ -44427,7 +44429,7 @@ mod deleg_group {
         );
         assert_eq!(
             h.meta.session().deleg_row_class(7),
-            Some(constellation_meta::RowClass::Lone)
+            Some(constellation_meta::RowCommit::LONE)
         );
         let (req, round, last) = batch(&out).expect("the forward's row streams");
         assert_eq!(last, 6);
@@ -45025,7 +45027,7 @@ mod deleg_group {
     /// generation's, and the unlink is no row of either.
     #[test]
     fn an_unlink_that_moves_a_files_keys_into_another_generation_is_not_the_delegates() {
-        use constellation_meta::RowClass;
+        use constellation_meta::RowCommit;
         let mut h = Harness::new(3);
         let (dir, file, low, _) = two_ranges_one_file(&mut h);
         // A lead of one row: the first own row of a generation is `Lone`.
@@ -45049,7 +45051,7 @@ mod deleg_group {
             },
         );
         assert_eq!(a, None);
-        let classes = |h: &Harness, gen| -> Vec<(u64, RowClass)> {
+        let classes = |h: &Harness, gen| -> Vec<(u64, RowCommit)> {
             h.meta
                 .delegate_rows_for_audit(gen)
                 .unwrap()
@@ -45059,7 +45061,7 @@ mod deleg_group {
         };
         assert_eq!(
             classes(&h, 7),
-            vec![(1, RowClass::Lone), (2, RowClass::DelegGroup)],
+            vec![(1, RowCommit::LONE), (2, RowCommit::DELEG_GROUP)],
             "the unlink is not generation 7's row"
         );
         assert!(classes(&h, 8).is_empty());
@@ -45099,7 +45101,7 @@ mod deleg_group {
         /// The rename's answer (`None`: not answered).
         answered: Option<AnswerSource>,
         /// The journal's `(idx, class, rid)` rows of the generation.
-        rows: Vec<(u64, constellation_meta::RowClass, Option<Rid>)>,
+        rows: Vec<(u64, constellation_meta::RowCommit, Option<Rid>)>,
         /// What the end of the generation at the root's cursor (row 1)
         /// dropped, and the rids it queued for replay.
         dropped: usize,
@@ -45111,7 +45113,7 @@ mod deleg_group {
     }
 
     impl RenameRace {
-        fn classes(&self) -> Vec<(u64, constellation_meta::RowClass)> {
+        fn classes(&self) -> Vec<(u64, constellation_meta::RowCommit)> {
             self.rows.iter().map(|(idx, c, _)| (*idx, *c)).collect()
         }
     }
@@ -45191,7 +45193,7 @@ mod deleg_group {
     /// the create, and both are dropped.
     #[test]
     fn a_core_path_lone_row_is_not_journaled_past_the_lead_and_behind_an_open_gated_row() {
-        use constellation_meta::RowClass;
+        use constellation_meta::RowCommit;
         let r = core_rename_amid_fast_path_rows(|meta, now, dir| {
             fast_create(meta, now, dir, 2, "x");
             fast_create(meta, now, dir, 3, "f");
@@ -45199,10 +45201,10 @@ mod deleg_group {
         assert_eq!(
             r.classes(),
             vec![
-                (1, RowClass::Lone),
-                (2, RowClass::Lone),
-                (3, RowClass::DelegGroup),
-                (4, RowClass::DelegGroup),
+                (1, RowCommit::LONE),
+                (2, RowCommit::LONE),
+                (3, RowCommit::DELEG_GROUP),
+                (4, RowCommit::DELEG_GROUP),
             ],
             "the rename's row waits for the root: {:?}",
             r.rows
@@ -45221,12 +45223,12 @@ mod deleg_group {
     /// `Lone` was journaled behind that open row.
     #[test]
     fn a_core_path_lone_row_is_not_journaled_behind_an_open_gated_row_within_the_lead() {
-        use constellation_meta::RowClass;
+        use constellation_meta::RowCommit;
         let r = core_rename_amid_fast_path_rows(|meta, now, dir| {
             meta.session().set_deleg_durable(
                 7,
                 Some(constellation_meta::DelegDurable {
-                    class: RowClass::DelegGroup,
+                    class: RowCommit::DELEG_GROUP,
                     through: 0,
                     horizon: u64::MAX,
                     lost: false,
@@ -45237,9 +45239,9 @@ mod deleg_group {
         assert_eq!(
             r.classes(),
             vec![
-                (1, RowClass::Lone),
-                (2, RowClass::DelegGroup),
-                (3, RowClass::DelegGroup),
+                (1, RowCommit::LONE),
+                (2, RowCommit::DELEG_GROUP),
+                (3, RowCommit::DELEG_GROUP),
             ],
             "{:?}",
             r.rows
@@ -45434,12 +45436,12 @@ mod deleg_group {
         // (Published by the steps the harness took.)
         assert_eq!(
             h.meta.session().deleg_row_class(7),
-            Some(constellation_meta::RowClass::Lone)
+            Some(constellation_meta::RowCommit::LONE)
         );
         root_is_near(&mut h);
         assert_eq!(
             h.meta.session().deleg_row_class(7),
-            Some(constellation_meta::RowClass::DelegGroup)
+            Some(constellation_meta::RowCommit::DELEG_GROUP)
         );
         let (_, out) = own_create(&mut h, dir, 1);
         let (req, round, last) = batch(&out).expect("sent to the root");
@@ -45539,7 +45541,7 @@ mod deleg_group {
         };
         {
             let _class =
-                constellation_meta::PendingClass::set(constellation_meta::RowClass::DelegGroup);
+                constellation_meta::PendingClass::set(constellation_meta::RowCommit::DELEG_GROUP);
             h.meta
                 .delegate_execute(
                     &op,
@@ -45595,7 +45597,7 @@ mod deleg_group {
         };
         {
             let _class =
-                constellation_meta::PendingClass::set(constellation_meta::RowClass::DelegGroup);
+                constellation_meta::PendingClass::set(constellation_meta::RowCommit::DELEG_GROUP);
             h.meta
                 .delegate_execute(
                     &op,
@@ -45625,7 +45627,7 @@ mod deleg_group {
         assert!(h.core.deleg_lone(&h.core.dl.mine[&7]));
         assert_eq!(
             h.meta.session().deleg_row_class(7),
-            Some(constellation_meta::RowClass::Lone)
+            Some(constellation_meta::RowCommit::LONE)
         );
         // The root appends the row: the fast path's wait ends, it answers.
         root_acks(&mut h, req, round, last);
@@ -51813,7 +51815,7 @@ mod c1_class {
     use super::c1_counted::{ack, appends, listed_holder, pos};
     use super::*;
     use crate::AnswerSource;
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
 
     fn sources(actions: &[Action]) -> Vec<(Rid, AnswerSource)> {
         actions
@@ -51825,8 +51827,13 @@ mod c1_class {
             .collect()
     }
 
-    fn classes_of(h: &Harness, rid: Rid) -> Vec<RowClass> {
-        h.meta.journal_classes_of_rid(rid).unwrap()
+    fn classes_of(h: &Harness, rid: Rid) -> Vec<RowCommit> {
+        h.meta
+            .journal_classes_of_rid(rid)
+            .unwrap()
+            .into_iter()
+            .map(RowCommit::versionless)
+            .collect()
     }
 
     /// The backup is gone and no peer is eligible: nothing gates any more.
@@ -51836,6 +51843,52 @@ mod c1_class {
         h.core.ack.candidate = None;
         h.core.ack.eligible = Some(false);
         assert_eq!(h.core.durable_jseq(), u64::MAX);
+    }
+
+    /// Plan 46 M1.1 step 3: a row carries the version of the configuration
+    /// its rule was looked up in — the lease's `config_version` at the
+    /// journaling — and keeps it when the configuration changes after it.
+    /// (A row journaled before the change stays at the old version: no
+    /// decision of a later moment re-stamps it.)
+    #[test]
+    fn a_row_carries_the_version_of_the_configuration_it_was_journaled_in() {
+        let (mut h, _) = listed_holder();
+        let version = |h: &Harness| h.core.lease.held.as_ref().unwrap().0.config_version;
+        let v1 = version(&h);
+        let versions_of = |h: &Harness, rid| -> Vec<Option<u64>> {
+            h.meta
+                .journal_classes_of_rid(rid)
+                .unwrap()
+                .into_iter()
+                .map(RowCommit::config_version)
+                .collect()
+        };
+        let submit = |h: &mut Harness, seq: u64, name: &str| {
+            let _ = h.step(Event::Submit {
+                policy: Policy::Client,
+                rid: h.rid(seq),
+                op: h.create(name),
+                tag: Default::default(),
+            });
+        };
+        submit(&mut h, 2, "a");
+        assert_eq!(versions_of(&h, h.rid(2)), vec![Some(v1)]);
+        // The configuration changes (a CAS the holder read: a backup added or
+        // removed, a delegation granted): the next row is stamped with it.
+        h.core.lease.held.as_mut().unwrap().0.config_version += 1;
+        submit(&mut h, 3, "b");
+        assert_eq!(versions_of(&h, h.rid(3)), vec![Some(v1 + 1)]);
+        assert_eq!(
+            versions_of(&h, h.rid(2)),
+            vec![Some(v1)],
+            "the earlier row keeps its configuration's version"
+        );
+        // The session's published rule (what the FUSE fast path stamps) is
+        // in the version in force too.
+        assert_eq!(
+            h.meta.session().published_class().config_version(),
+            Some(v1 + 1)
+        );
     }
 
     /// A row the core journals carries the class its answer waits for (the
@@ -51851,7 +51904,7 @@ mod c1_class {
             tag: Default::default(),
         });
         assert!(sources(&out).is_empty(), "parked for the backup: {out:?}");
-        assert_eq!(classes_of(&h, h.rid(2)), vec![RowClass::RootGroup]);
+        assert_eq!(classes_of(&h, h.rid(2)), vec![RowCommit::ROOT_GROUP]);
         // A peer's forward is journaled as an own op until C2.
         let out = h.step(Event::Peer {
             from: 3,
@@ -51882,7 +51935,7 @@ mod c1_class {
             incarnation: 1,
             seq: 1,
         };
-        assert_eq!(classes_of(&h, forwarded), vec![RowClass::RootGroup]);
+        assert_eq!(classes_of(&h, forwarded), vec![RowCommit::ROOT_GROUP]);
         // None of it took the session's published class.
         assert_eq!(h.core.stats.journal_class_from_session, 0);
     }
@@ -51903,7 +51956,7 @@ mod c1_class {
             tag: Default::default(),
         });
         assert!(sources(&out).is_empty(), "parked for the backup: {out:?}");
-        assert_eq!(classes_of(&h, rid), vec![RowClass::RootGroup]);
+        assert_eq!(classes_of(&h, rid), vec![RowCommit::ROOT_GROUP]);
         gate_goes_off(&mut h);
         let mut out = Vec::new();
         h.core.complete_ready(h.clk(), &h.meta, &mut out);
@@ -51913,7 +51966,7 @@ mod c1_class {
             sources(&out),
             vec![(rid, AnswerSource::Sequenced(AckClass::Lone))]
         );
-        assert_eq!(classes_of(&h, rid), vec![RowClass::Lone]);
+        assert_eq!(classes_of(&h, rid), vec![RowCommit::LONE]);
         assert_eq!(h.core.stats.acks_downgraded_lone, 1);
     }
 
@@ -51952,7 +52005,7 @@ mod c1_class {
             ),
             "{out:?}"
         );
-        assert_eq!(classes_of(&h, rid), vec![RowClass::RootGroup]);
+        assert_eq!(classes_of(&h, rid), vec![RowCommit::ROOT_GROUP]);
         assert_eq!(h.core.stats.acks_downgraded_lone, 0);
     }
 
@@ -52004,7 +52057,7 @@ mod c1_class {
             incarnation: 1,
             seq: 1,
         };
-        assert_eq!(classes_of(&h, rid), vec![RowClass::RootGroup]);
+        assert_eq!(classes_of(&h, rid), vec![RowCommit::ROOT_GROUP]);
         let tip = h.meta.journal_tip().unwrap();
         h.core.note_shipped(&[], tip);
         let mut out = Vec::new();
@@ -52035,7 +52088,7 @@ mod c1_class {
             sources(&out),
             vec![(rid, AnswerSource::Sequenced(AckClass::RootGroup))]
         );
-        assert_eq!(classes_of(&h, rid), vec![RowClass::RootGroup]);
+        assert_eq!(classes_of(&h, rid), vec![RowCommit::ROOT_GROUP]);
         assert_eq!(h.core.stats.acks_downgraded_lone, 0);
         assert_eq!(h.core.ack_need(&pos(tip)), None);
     }
@@ -52095,7 +52148,7 @@ mod c1_class {
             incarnation: 1,
             seq: 2,
         };
-        assert_eq!(classes_of(&h, second), vec![RowClass::RootGroup]);
+        assert_eq!(classes_of(&h, second), vec![RowCommit::ROOT_GROUP]);
         let tip = h.meta.journal_tip().unwrap();
         h.core.note_shipped(&[], tip);
         let mut out = Vec::new();
@@ -52128,7 +52181,7 @@ mod c1_class {
 mod c1_member_copy {
     use super::backup_crash::{backup_lease, find_s3};
     use super::*;
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
 
     /// A deposed holder's committed row is rolled back and kept as the
     /// member copy of its epoch; nothing is queued for replay, and its
@@ -52138,9 +52191,9 @@ mod c1_member_copy {
     #[test]
     fn a_deposed_backed_holder_queues_no_replay_for_gated_rows() {
         for (class, replayed) in [
-            (RowClass::RootGroup, false),
-            (RowClass::Archive, false),
-            (RowClass::Lone, true),
+            (RowCommit::ROOT_GROUP, false),
+            (RowCommit::ARCHIVE, false),
+            (RowCommit::LONE, true),
         ] {
             let mut h = Harness::new(1);
             let out = lose_renewal_with_a_create_of_class(&mut h, Some(class));
@@ -52868,7 +52921,7 @@ mod c2f_lone_root {
     use super::*;
     use crate::core::backup::is_answer;
     use crate::AnswerSource;
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
 
     const FROM: NodeId = 3;
 
@@ -52909,8 +52962,13 @@ mod c2f_lone_root {
             .collect()
     }
 
-    fn classes_of(h: &Harness, rid: Rid) -> Vec<RowClass> {
-        h.meta.journal_classes_of_rid(rid).unwrap()
+    fn classes_of(h: &Harness, rid: Rid) -> Vec<RowCommit> {
+        h.meta
+            .journal_classes_of_rid(rid)
+            .unwrap()
+            .into_iter()
+            .map(RowCommit::versionless)
+            .collect()
     }
 
     /// The listed backup is gone and no peer is in budget: the root is lone.
@@ -52951,7 +53009,7 @@ mod c2f_lone_root {
         let mut h = lone_root();
         let out = h.step(forward(&h, 71, 1, "f"));
         assert!(answers(&out).is_empty(), "waits for the archive: {out:?}");
-        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::Archive]);
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowCommit::ARCHIVE]);
         // Its own client: at once, the lone node's answer.
         let own = h.rid(2);
         let out = h.step(Event::Submit {
@@ -52968,7 +53026,7 @@ mod c2f_lone_root {
             )),
             "{out:?}"
         );
-        assert_eq!(classes_of(&h, own), vec![RowClass::Lone]);
+        assert_eq!(classes_of(&h, own), vec![RowCommit::LONE]);
         // Nothing for the forward until the log carries it.
         assert!(answers(&release(&mut h)).is_empty());
         let archived = h.core.stats.ack_classes[AckClass::Archive.index()];
@@ -53028,13 +53086,13 @@ mod c2f_lone_root {
         let (mut h, _) = listed_holder();
         let out = h.step(forward(&h, 71, 1, "f"));
         assert!(answers(&out).is_empty(), "parked for the backup: {out:?}");
-        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::RootGroup]);
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowCommit::ROOT_GROUP]);
         gate_goes_off(&mut h);
         assert!(answers(&release(&mut h)).is_empty());
         // A retry re-attaches and waits on.
         let out = h.step(forward(&h, 72, 1, "f"));
         assert!(answers(&out).is_empty(), "{out:?}");
-        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::RootGroup]);
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowCommit::ROOT_GROUP]);
         assert_eq!(h.core.stats.acks_downgraded_lone, 0);
         ship_all(&mut h);
         assert!(matches!(
@@ -53131,7 +53189,7 @@ mod c2f_lone_root {
         let epoch = h.core.lease.epoch().unwrap();
         h.core.lease.adopt_epoch_hold(h.clk(), epoch);
         {
-            let _class = constellation_meta::PendingClass::set(RowClass::NonStealable);
+            let _class = constellation_meta::PendingClass::set(RowCommit::FINAL);
             constellation_meta::execute_mutate(&h.meta, &h.create("f"), Some(forwarded(1)))
                 .unwrap();
         }
@@ -53144,7 +53202,7 @@ mod c2f_lone_root {
         h.core.lease.release_local();
         assert!(!h.core.lease.epoch_held());
         assert_eq!(class(&h), AckClass::Archive, "after it");
-        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::NonStealable]);
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowCommit::FINAL]);
     }
 
     /// The C2f review, MUST 1 (a): a lone root's answer to another node,
@@ -53171,7 +53229,7 @@ mod c2f_lone_root {
         );
         let ns = AckClass::NonStealable.index();
         assert_eq!(h.core.stats.ack_classes[ns], before[ns] + 1);
-        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::NonStealable]);
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowCommit::FINAL]);
         assert_eq!(h.core.stats.acks_downgraded_lone, 0);
     }
 
@@ -53198,7 +53256,7 @@ mod c2f_lone_root {
         );
         let ns = AckClass::NonStealable.index();
         assert_eq!(h.core.stats.ack_classes[ns], before[ns] + 1);
-        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::NonStealable]);
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowCommit::FINAL]);
     }
 
     /// SHOULD 5 (restored in C2g): a journaled refusal of another node's
@@ -53254,7 +53312,7 @@ mod c2f_lone_root {
         h.core.clear_holder_epoch(&h.meta);
         let session = h.meta.session();
         assert!(!session.durable_lone_ok());
-        assert_eq!(session.published_class(), RowClass::Archive);
+        assert_eq!(session.published_class(), RowCommit::ARCHIVE);
         assert_eq!(
             session.wait_durable(u64::MAX - 1, std::time::Duration::from_millis(1)),
             constellation_meta::DurableWait::Unexpected
@@ -53268,7 +53326,7 @@ mod c2f_lone_root {
     #[test]
     fn an_own_retry_of_a_hold_row_after_the_hold_is_the_nodes_now() {
         let journal = |h: &Harness, name: &str, rid: Rid| {
-            let _class = constellation_meta::PendingClass::set(RowClass::NonStealable);
+            let _class = constellation_meta::PendingClass::set(RowCommit::FINAL);
             constellation_meta::execute_mutate(&h.meta, &h.create(name), Some(rid)).unwrap();
         };
         let h = lone_root();
@@ -53277,14 +53335,14 @@ mod c2f_lone_root {
             h.core.journaled_answer_class(&h.meta, h.rid(5)).unwrap(),
             AckClass::Lone
         );
-        assert_eq!(classes_of(&h, h.rid(5)), vec![RowClass::Lone]);
+        assert_eq!(classes_of(&h, h.rid(5)), vec![RowCommit::LONE]);
         let (h, _) = listed_holder();
         journal(&h, "hb", h.rid(6));
         assert_eq!(
             h.core.journaled_answer_class(&h.meta, h.rid(6)).unwrap(),
             AckClass::Archive
         );
-        assert_eq!(classes_of(&h, h.rid(6)), vec![RowClass::NonStealable]);
+        assert_eq!(classes_of(&h, h.rid(6)), vec![RowCommit::FINAL]);
     }
 
     /// SHOULD 6: a lone root's replay of another node's rid (the takeover
@@ -53301,7 +53359,7 @@ mod c2f_lone_root {
         h.core
             .replay_queue_locally(h.clk(), &h.meta, &mut out)
             .unwrap();
-        assert_eq!(classes_of(&h, forwarded(3)), vec![RowClass::Archive]);
+        assert_eq!(classes_of(&h, forwarded(3)), vec![RowCommit::ARCHIVE]);
     }
 
     /// The maintainer's answer to C2f's first question: a non-stealable
@@ -53361,13 +53419,13 @@ mod c2f_lone_root {
         let mut h = lone_root();
         h.step(forward(&h, 71, 1, "f"));
         let first = h.meta.journal_tip().unwrap();
-        assert!(h.meta.reclass_journal_tx(first, RowClass::Lone).unwrap());
+        assert!(h.meta.reclass_journal_tx(first, RowCommit::LONE).unwrap());
         let class = h
             .core
             .journaled_answer_class_for(&h.meta, forwarded(1), Asker::Remote)
             .unwrap();
         assert_eq!(class, AckClass::Archive);
-        assert_eq!(classes_of(&h, forwarded(1)), vec![RowClass::Archive]);
+        assert_eq!(classes_of(&h, forwarded(1)), vec![RowCommit::ARCHIVE]);
     }
 
     /// §5.4 (D5): what the core publishes for the fast path's `Ungated`
@@ -53928,8 +53986,13 @@ mod c2g_settle {
         let out = h.step(Event::Timer { id: deadline });
         assert!(replies(&out).is_empty(), "answered alone: {out:?}");
         assert_eq!(
-            h.meta.journal_classes_of_rid(rid).unwrap(),
-            vec![constellation_meta::RowClass::Archive]
+            h.meta
+                .journal_classes_of_rid(rid)
+                .unwrap()
+                .into_iter()
+                .map(constellation_meta::RowCommit::versionless)
+                .collect::<Vec<_>>(),
+            vec![constellation_meta::RowCommit::ARCHIVE]
         );
         let out = h.archive_lands();
         assert!(
@@ -53997,8 +54060,13 @@ mod c2g_settle {
             .inbox_drain(h.clk(), vec![batch], &h.meta, &mut out)
             .unwrap();
         assert_eq!(
-            h.meta.journal_classes_of_rid(h.rid(1)).unwrap(),
-            vec![constellation_meta::RowClass::Archive]
+            h.meta
+                .journal_classes_of_rid(h.rid(1))
+                .unwrap()
+                .into_iter()
+                .map(constellation_meta::RowCommit::versionless)
+                .collect::<Vec<_>>(),
+            vec![constellation_meta::RowCommit::ARCHIVE]
         );
     }
 
@@ -54152,8 +54220,13 @@ mod c2g_settle {
         );
         assert!(abandoned_row(&h, rid3(1)), "no refusal journaled: {out:?}");
         assert_eq!(
-            h.meta.journal_classes_of_rid(rid3(1)).unwrap(),
-            vec![constellation_meta::RowClass::Archive]
+            h.meta
+                .journal_classes_of_rid(rid3(1))
+                .unwrap()
+                .into_iter()
+                .map(constellation_meta::RowCommit::versionless)
+                .collect::<Vec<_>>(),
+            vec![constellation_meta::RowCommit::ARCHIVE]
         );
         assert_eq!(h.core.stats.settles_refused, 1);
         assert_eq!(h.core.stats.gate_settles_answered, 1);
@@ -55971,7 +56044,7 @@ mod await_retry {
     use super::*;
     use constellation_fs_core::types::ROOT_INO;
     use constellation_fs_core::{ChunkHash, ChunkInfo, ChunkLayout, Ino, Manifest};
-    use constellation_meta::RowClass;
+    use constellation_meta::RowCommit;
 
     pub(super) fn rid_of(node: NodeId, seq: u64) -> Rid {
         Rid {
@@ -55995,7 +56068,7 @@ mod await_retry {
 
     /// Execute `op` on `h` as `rid` (another node's forward, or this
     /// node's own client), journaled under `class`.
-    pub(super) fn exec_as(h: &Harness, class: RowClass, rid: Rid, op: &MutateOp) {
+    pub(super) fn exec_as(h: &Harness, class: RowCommit, rid: Rid, op: &MutateOp) {
         let _class = constellation_meta::PendingClass::set(class);
         constellation_meta::execute_mutate(&h.meta, op, Some(rid)).unwrap();
     }
@@ -56134,7 +56207,7 @@ mod await_retry {
     fn a_dropped_remote_row_becomes_a_placeholder_not_a_copy() {
         let (mut h, broken) = holder_with_a_seed();
         let r = rid_of(2, 1);
-        exec_as(&h, RowClass::Archive, r, &chmod(broken, 0o600));
+        exec_as(&h, RowCommit::ARCHIVE, r, &chmod(broken, 0o600));
         drop_held(&h, broken);
         assert!(
             queue(&h).contains(&(2, 1, true)),
@@ -56176,9 +56249,14 @@ mod await_retry {
         // create of an unrelated name (a dependent by the directory's
         // inode, on other keys) and its unlink of the renamed name (on the
         // rename's).
-        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "moved"));
-        exec_as(&h, RowClass::Lone, e, &create_in(ROOT_INO, "z", ino_z));
-        exec_as(&h, RowClass::Lone, d, &unlink_in_root("moved"));
+        exec_as(
+            &h,
+            RowCommit::ARCHIVE,
+            p,
+            &rename_in_root("broken", "moved"),
+        );
+        exec_as(&h, RowCommit::LONE, e, &create_in(ROOT_INO, "z", ino_z));
+        exec_as(&h, RowCommit::LONE, d, &unlink_in_root("moved"));
         drop_held(&h, broken);
         assert_eq!(
             queue(&h),
@@ -56240,9 +56318,14 @@ mod await_retry {
         let (mut h, broken) = holder_with_a_seed();
         let ino_z = h.meta.allocate_ino(ROOT_INO).unwrap();
         let (p, e, d) = (rid_of(2, 1), rid_of(1, 6), rid_of(1, 7));
-        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "moved"));
-        exec_as(&h, RowClass::Lone, e, &create_in(ROOT_INO, "z", ino_z));
-        exec_as(&h, RowClass::Lone, d, &unlink_in_root("moved"));
+        exec_as(
+            &h,
+            RowCommit::ARCHIVE,
+            p,
+            &rename_in_root("broken", "moved"),
+        );
+        exec_as(&h, RowCommit::LONE, e, &create_in(ROOT_INO, "z", ino_z));
+        exec_as(&h, RowCommit::LONE, d, &unlink_in_root("moved"));
         drop_held(&h, broken);
 
         let mut out = Vec::new();
@@ -56279,8 +56362,13 @@ mod await_retry {
     fn a_forward_overlapping_a_queued_entry_is_parked() {
         let (mut h, broken) = holder_with_a_seed();
         let (p, d) = (rid_of(2, 1), rid_of(1, 7));
-        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "moved"));
-        exec_as(&h, RowClass::Lone, d, &unlink_in_root("moved"));
+        exec_as(
+            &h,
+            RowCommit::ARCHIVE,
+            p,
+            &rename_in_root("broken", "moved"),
+        );
+        exec_as(&h, RowCommit::LONE, d, &unlink_in_root("moved"));
         drop_held(&h, broken);
 
         // A new op of node 3 on the name the queue is about to rename and
@@ -56340,9 +56428,9 @@ mod await_retry {
     fn a_requesters_retry_executes_in_the_dropped_rows_place() {
         let (mut h, broken) = holder_with_a_seed();
         let (a, p, d) = (rid_of(1, 6), rid_of(2, 1), rid_of(1, 7));
-        exec_as(&h, RowClass::Lone, a, &rename_in_root("broken", "tmp"));
-        exec_as(&h, RowClass::Archive, p, &rename_in_root("tmp", "moved"));
-        exec_as(&h, RowClass::Lone, d, &unlink_in_root("moved"));
+        exec_as(&h, RowCommit::LONE, a, &rename_in_root("broken", "tmp"));
+        exec_as(&h, RowCommit::ARCHIVE, p, &rename_in_root("tmp", "moved"));
+        exec_as(&h, RowCommit::LONE, d, &unlink_in_root("moved"));
         drop_held(&h, broken);
         assert_eq!(queue(&h)[1..], [(1, 6, false), (2, 1, true), (1, 7, false)]);
 
@@ -56392,9 +56480,9 @@ mod await_retry {
     fn the_park_rule_never_waits_on_an_entry_behind_the_op() {
         let (mut h, broken) = holder_with_a_seed();
         let (p1, p2, d) = (rid_of(2, 1), rid_of(3, 1), rid_of(1, 7));
-        exec_as(&h, RowClass::Archive, p1, &rename_in_root("broken", "a"));
-        exec_as(&h, RowClass::Archive, p2, &rename_in_root("a", "b"));
-        exec_as(&h, RowClass::Lone, d, &unlink_in_root("b"));
+        exec_as(&h, RowCommit::ARCHIVE, p1, &rename_in_root("broken", "a"));
+        exec_as(&h, RowCommit::ARCHIVE, p2, &rename_in_root("a", "b"));
+        exec_as(&h, RowCommit::LONE, d, &unlink_in_root("b"));
         drop_held(&h, broken);
         assert_eq!(queue(&h)[1..], [(2, 1, true), (3, 1, true), (1, 7, false)]);
 
@@ -56560,7 +56648,7 @@ mod await_retry {
     fn drop_held_journals_rolled_back_ahead_of_its_refusals() {
         let (mut h, broken) = holder_with_a_seed();
         let own = rid_of(1, 6);
-        exec_as(&h, RowClass::Lone, own, &chmod(broken, 0o600));
+        exec_as(&h, RowCommit::LONE, own, &chmod(broken, 0o600));
         let txs = h.meta.journal_txs_from(0, usize::MAX).unwrap();
         let first_of = |pred: fn(&LogRecord) -> bool| {
             txs.iter()
@@ -56886,7 +56974,12 @@ mod await_retry {
     #[test]
     fn a_group_row_is_kept_when_nothing_says_it_was_not_answered() {
         let (h, broken) = holder_with_a_seed();
-        exec_as(&h, RowClass::RootGroup, rid_of(2, 1), &chmod(broken, 0o600));
+        exec_as(
+            &h,
+            RowCommit::ROOT_GROUP,
+            rid_of(2, 1),
+            &chmod(broken, 0o600),
+        );
         drop_held(&h, broken);
         assert!(
             queue(&h).contains(&(2, 1, false)),
@@ -56900,7 +56993,12 @@ mod await_retry {
     fn placeholder_with_a_short_bound() -> (Harness, Rid) {
         let (mut h, broken) = holder_with_a_seed();
         let p = rid_of(2, 1);
-        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "moved"));
+        exec_as(
+            &h,
+            RowCommit::ARCHIVE,
+            p,
+            &rename_in_root("broken", "moved"),
+        );
         drop_held(&h, broken);
         h.core.cfg.drop_held_await_ms = 2_000;
         (h, p)
@@ -56948,7 +57046,7 @@ mod await_retry {
         );
         let classes = h.meta.journal_classes_of_rid(r).unwrap();
         assert!(
-            !classes.is_empty() && classes.iter().all(|c| *c != RowClass::Lone),
+            !classes.is_empty() && classes.iter().all(|c| *c != RowCommit::LONE),
             "never the lone shortcut: {classes:?}"
         );
         h.archive_lands();
@@ -57029,9 +57127,19 @@ mod await_retry {
         let (mut h, broken) = holder_with_a_seed();
         let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
         let (p, d, d2) = (rid_of(2, 1), rid_of(1, 6), rid_of(1, 7));
-        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "moved"));
-        exec_as(&h, RowClass::Lone, d, &rename_in_root("moved", "elsewhere"));
-        exec_as(&h, RowClass::Lone, d2, &create_in(ROOT_INO, "moved", ino));
+        exec_as(
+            &h,
+            RowCommit::ARCHIVE,
+            p,
+            &rename_in_root("broken", "moved"),
+        );
+        exec_as(
+            &h,
+            RowCommit::LONE,
+            d,
+            &rename_in_root("moved", "elsewhere"),
+        );
+        exec_as(&h, RowCommit::LONE, d2, &create_in(ROOT_INO, "moved", ino));
         drop_held(&h, broken);
         h.core.cfg.drop_held_await_ms = 2_000;
         assert_eq!(queue(&h)[1..], [(2, 1, true), (1, 6, false), (1, 7, false)]);
@@ -57526,8 +57634,8 @@ mod await_retry {
         let (mut h, broken) = holder_with_a_seed();
         h.core.cfg.delegation = false;
         let (p, d) = (rid_of(2, 1), rid_of(1, 7));
-        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "a"));
-        exec_as(&h, RowClass::Lone, d, &unlink_in_root("a"));
+        exec_as(&h, RowCommit::ARCHIVE, p, &rename_in_root("broken", "a"));
+        exec_as(&h, RowCommit::LONE, d, &unlink_in_root("a"));
         drop_held(&h, broken);
 
         let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
@@ -57594,7 +57702,7 @@ mod await_retry {
         // (A lease that outlasts the minutes the test lets pass.)
         h.set_lease_end(h.now.plus(3_600_000));
         let p = rid_of(2, 1);
-        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "a"));
+        exec_as(&h, RowCommit::ARCHIVE, p, &rename_in_root("broken", "a"));
         drop_held(&h, broken);
         let cfg = h.core.config().clone();
         let window = cfg.acquire_deadline_ms - cfg.settle_window();
@@ -57676,8 +57784,8 @@ mod await_retry {
         let (mut h, broken) = holder_with_a_seed();
         assert!(h.core.cfg.delegation);
         let (p, d) = (rid_of(2, 1), rid_of(1, 7));
-        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "a"));
-        exec_as(&h, RowClass::Lone, d, &unlink_in_root("a"));
+        exec_as(&h, RowCommit::ARCHIVE, p, &rename_in_root("broken", "a"));
+        exec_as(&h, RowCommit::LONE, d, &unlink_in_root("a"));
         drop_held(&h, broken);
         // The unlink is held behind the placeholder (the requester is not
         // retrying).
@@ -57770,8 +57878,13 @@ mod await_retry {
     fn a_deposed_holder_aborts_the_ops_parked_behind_its_queue() {
         let (mut h, broken) = holder_with_a_seed();
         let (p, d) = (rid_of(2, 1), rid_of(1, 7));
-        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "moved"));
-        exec_as(&h, RowClass::Lone, d, &unlink_in_root("moved"));
+        exec_as(
+            &h,
+            RowCommit::ARCHIVE,
+            p,
+            &rename_in_root("broken", "moved"),
+        );
+        exec_as(&h, RowCommit::LONE, d, &unlink_in_root("moved"));
         drop_held(&h, broken);
         let n3 = rid_of(3, 1);
         let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
@@ -57903,8 +58016,13 @@ mod await_retry {
     fn an_inbox_op_behind_the_queue_halts_its_batch_in_order_and_is_counted() {
         let (mut h, broken) = holder_with_a_seed();
         let (p, d) = (rid_of(2, 1), rid_of(1, 7));
-        exec_as(&h, RowClass::Archive, p, &rename_in_root("broken", "moved"));
-        exec_as(&h, RowClass::Lone, d, &unlink_in_root("moved"));
+        exec_as(
+            &h,
+            RowCommit::ARCHIVE,
+            p,
+            &rename_in_root("broken", "moved"),
+        );
+        exec_as(&h, RowCommit::LONE, d, &unlink_in_root("moved"));
         drop_held(&h, broken);
         let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
         let batch = inbox_batch(3, 0, 1, &create_in(ROOT_INO, "moved", ino));

@@ -71,9 +71,9 @@
 use crate::mutate::MutateOp;
 use crate::record::LogRecord;
 use crate::replay::TouchSet;
-use crate::store::local::RowClass;
+use crate::store::local::RowCommit;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -782,7 +782,7 @@ pub struct DelegDurable {
     /// The class of a row the fast path journals under the generation now
     /// (`Core::deleg_ack_class(.., Asker::Own)`): `Lone` or `NonStealable`
     /// answer at once, `DelegGroup` and `Archive` wait.
-    pub class: RowClass,
+    pub class: RowCommit,
     /// The highest stream index whose prefix is committed: the log carries
     /// it, or every member of the group (and of a requested change) holds
     /// it (`Core::deleg_committed_through`).
@@ -822,7 +822,7 @@ pub struct SessionState {
     /// the class a FUSE fast-path row is journaled with
     /// (`Meta::finish_local`). Stored before the gate so a reader that sees
     /// the gate has seen the class.
-    durable_class: AtomicU8,
+    durable_class: AtomicU64,
     /// Plan 43 C2 (§5.4, D5): with the gate off, this node may answer its
     /// own clients on its disk alone — it is a lone root, or holds a
     /// continuation epoch (`Core::root_lone`, `epoch_held`). Published with
@@ -865,7 +865,7 @@ impl Default for SessionState {
             durable_gate: AtomicBool::new(false),
             durable_lost: AtomicBool::new(false),
             durable_jseq: AtomicU64::new(0),
-            durable_class: AtomicU8::new(RowClass::Lone.to_u8()),
+            durable_class: AtomicU64::new(RowCommit::LONE.to_bits()),
             // (Nothing published yet: a replica no core drives answers as
             // before. The core publishes `false` at its start, before the
             // mount serves, and the truth at every step after.)
@@ -1564,14 +1564,14 @@ impl SessionState {
     /// wakes the waiters. `lone_ok` (plan 43 C2, §5.4): with the gate off,
     /// the node may answer its own clients on its disk alone (it is lone,
     /// or holds an epoch).
-    pub fn set_durable(&self, gate: bool, jseq: u64, lost: bool, class: RowClass, lone_ok: bool) {
+    pub fn set_durable(&self, gate: bool, jseq: u64, lost: bool, class: RowCommit, lone_ok: bool) {
         self.durable_lost.store(lost, Ordering::Relaxed);
         // Release, read with Acquire after the fast path's journal write
         // (`durable_lone_ok`, `wait_durable`): a writer that reads the gate
         // or this flag after its row is journaled sees the core's latest
         // "may not answer alone" (plan 43 C2f follow-up).
         self.durable_lone_ok.store(lone_ok, Ordering::Release);
-        self.durable_class.store(class.to_u8(), Ordering::Release);
+        self.durable_class.store(class.to_bits(), Ordering::Release);
         self.durable_gate.store(gate, Ordering::Release);
         let before = self.durable_jseq.swap(jseq, Ordering::Relaxed);
         if !gate || jseq > before {
@@ -1658,7 +1658,7 @@ impl SessionState {
     /// I1 class 2: a published `Lone` is `DelegGroup` while the guard
     /// ([`Self::set_lone_guard`]) says this node has a lapse its core has
     /// not been handed: the class was judged on links older than the lapse.
-    pub fn deleg_row_class(&self, gen: u64) -> Option<RowClass> {
+    pub fn deleg_row_class(&self, gen: u64) -> Option<RowCommit> {
         let class = self
             .inner
             .lock()
@@ -1674,9 +1674,9 @@ impl SessionState {
     /// waits for the group like a `DelegGroup` one, and goes in doubt
     /// through the core (D5) at the wait's budget. The guard reads atomics
     /// only, and only a `Lone` class asks it.
-    fn guarded(&self, class: RowClass) -> RowClass {
-        if class == RowClass::Lone && self.lone_guard.get().is_some_and(|guard| guard()) {
-            RowClass::DelegGroup
+    fn guarded(&self, class: RowCommit) -> RowCommit {
+        if class.is_singleton() && self.lone_guard.get().is_some_and(|guard| guard()) {
+            class.demoted()
         } else {
             class
         }
@@ -1698,15 +1698,15 @@ impl SessionState {
     /// otherwise the row waits for the group like a `DelegGroup` one. What
     /// is published lags the journal and the commit (the core publishes at
     /// the end of a step), and both lags only ever make the class stronger.
-    pub fn deleg_row_class_at(&self, gen: u64, idx: u64, gated: u64) -> Option<RowClass> {
+    pub fn deleg_row_class_at(&self, gen: u64, idx: u64, gated: u64) -> Option<RowCommit> {
         let (class, horizon, through) = {
             let g = self.inner.lock().unwrap();
             let d = g.deleg_durable.get(&gen)?;
             (d.class, d.horizon, d.through)
         };
-        if class == RowClass::Lone && lone_row_holds(idx, gated, through, horizon) {
+        if class.is_singleton() && lone_row_holds(idx, gated, through, horizon) {
             self.note_lone_demoted(idx > horizon);
-            return Some(RowClass::DelegGroup);
+            return Some(class.demoted());
         }
         Some(self.guarded(class))
     }
@@ -1749,8 +1749,8 @@ impl SessionState {
 
     /// Plan 43 C1-2: the class the core published with the gate. The
     /// fast path's rows are journaled with it and its wait follows it.
-    pub fn published_class(&self) -> RowClass {
-        RowClass::from_u8(self.durable_class.load(Ordering::Acquire))
+    pub fn published_class(&self) -> RowCommit {
+        RowCommit::from_bits(self.durable_class.load(Ordering::Acquire))
     }
 
     /// Plan 43 C2 (§5.4, D5): with the gate off, the core said this node may
@@ -2218,8 +2218,8 @@ mod tests {
         let wait = |gen, idx| s.wait_deleg_durable(gen, idx, Duration::ZERO);
         assert_eq!(wait(7, 1), DurableWait::Lost, "never published");
         assert_eq!(s.deleg_row_class(7), None);
-        s.set_deleg_durable(7, Some(published(RowClass::DelegGroup, 0, false)));
-        assert_eq!(s.deleg_row_class(7), Some(RowClass::DelegGroup));
+        s.set_deleg_durable(7, Some(published(RowCommit::DELEG_GROUP, 0, false)));
+        assert_eq!(s.deleg_row_class(7), Some(RowCommit::DELEG_GROUP));
         assert_eq!(wait(7, 1), DurableWait::TimedOut);
         assert_eq!(wait(8, 1), DurableWait::Lost, "another generation");
         // A waiter is woken by the raise (and not by waiting out its budget).
@@ -2229,16 +2229,16 @@ mod tests {
         };
         std::thread::sleep(Duration::from_millis(50));
         let started = Instant::now();
-        s.set_deleg_durable(7, Some(published(RowClass::DelegGroup, 2, false)));
+        s.set_deleg_durable(7, Some(published(RowCommit::DELEG_GROUP, 2, false)));
         assert!(matches!(waiter.join().unwrap(), DurableWait::Durable(_)));
         assert!(started.elapsed() < Duration::from_secs(5));
         // Committed stays committed when the delegation is lost; the rest
         // is in doubt.
-        s.set_deleg_durable(7, Some(published(RowClass::DelegGroup, 2, true)));
+        s.set_deleg_durable(7, Some(published(RowCommit::DELEG_GROUP, 2, true)));
         assert!(matches!(wait(7, 2), DurableWait::Durable(_)));
         assert_eq!(wait(7, 3), DurableWait::Lost);
         // Withdrawn while a waiter sleeps: it is told, not left to its budget.
-        s.set_deleg_durable(7, Some(published(RowClass::DelegGroup, 2, false)));
+        s.set_deleg_durable(7, Some(published(RowCommit::DELEG_GROUP, 2, false)));
         let waiter = {
             let s = s.clone();
             std::thread::spawn(move || s.wait_deleg_durable(7, 3, Duration::from_secs(30)))
@@ -2259,7 +2259,7 @@ mod tests {
     fn withdrawn_generations_keep_a_bounded_high_water() {
         let s = SessionState::default();
         let published = |through| DelegDurable {
-            class: RowClass::DelegGroup,
+            class: RowCommit::DELEG_GROUP,
             through,
             horizon: u64::MAX,
             lost: false,
@@ -2292,7 +2292,7 @@ mod tests {
         s.set_deleg_durable(
             7,
             Some(DelegDurable {
-                class: RowClass::DelegGroup,
+                class: RowCommit::DELEG_GROUP,
                 through: 2,
                 horizon: u64::MAX,
                 lost: false,
@@ -2328,21 +2328,21 @@ mod tests {
         };
         assert_eq!(s.deleg_row_class_at(7, 1, 0), None, "not published");
         // Committed 10, a lead of 4: indexes up to 14 are within it.
-        publish(RowClass::Lone, 10, 14);
-        assert_eq!(s.deleg_row_class_at(7, 14, 0), Some(RowClass::Lone));
-        assert_eq!(s.deleg_row_class_at(7, 15, 0), Some(RowClass::DelegGroup));
+        publish(RowCommit::LONE, 10, 14);
+        assert_eq!(s.deleg_row_class_at(7, 14, 0), Some(RowCommit::LONE));
+        assert_eq!(s.deleg_row_class_at(7, 15, 0), Some(RowCommit::DELEG_GROUP));
         // A gated row of its own at or below the committed prefix is behind
         // it; one above is not.
-        assert_eq!(s.deleg_row_class_at(7, 12, 10), Some(RowClass::Lone));
-        assert_eq!(s.deleg_row_class_at(7, 12, 11), Some(RowClass::DelegGroup));
-        // The class that waits stays whatever the index.
-        publish(RowClass::DelegGroup, 10, 14);
-        assert_eq!(s.deleg_row_class_at(7, 1, 0), Some(RowClass::DelegGroup));
-        publish(RowClass::NonStealable, 10, 14);
+        assert_eq!(s.deleg_row_class_at(7, 12, 10), Some(RowCommit::LONE));
         assert_eq!(
-            s.deleg_row_class_at(7, 99, 99),
-            Some(RowClass::NonStealable)
+            s.deleg_row_class_at(7, 12, 11),
+            Some(RowCommit::DELEG_GROUP)
         );
+        // The class that waits stays whatever the index.
+        publish(RowCommit::DELEG_GROUP, 10, 14);
+        assert_eq!(s.deleg_row_class_at(7, 1, 0), Some(RowCommit::DELEG_GROUP));
+        publish(RowCommit::FINAL, 10, 14);
+        assert_eq!(s.deleg_row_class_at(7, 99, 99), Some(RowCommit::FINAL));
     }
 
     /// I1 class 2 for the delegate's fast path: with `Lone` published and
@@ -2363,24 +2363,24 @@ mod tests {
         s.set_deleg_durable(
             7,
             Some(DelegDurable {
-                class: RowClass::Lone,
+                class: RowCommit::LONE,
                 through: 10,
                 horizon: 14,
                 lost: false,
             }),
         );
-        assert_eq!(s.deleg_row_class(7), Some(RowClass::Lone));
-        assert_eq!(s.deleg_row_class_at(7, 12, 0), Some(RowClass::Lone));
+        assert_eq!(s.deleg_row_class(7), Some(RowCommit::LONE));
+        assert_eq!(s.deleg_row_class_at(7, 12, 0), Some(RowCommit::LONE));
         lapse.store(true, Ordering::Relaxed);
-        assert_eq!(s.deleg_row_class(7), Some(RowClass::DelegGroup));
-        assert_eq!(s.deleg_row_class_at(7, 12, 0), Some(RowClass::DelegGroup));
+        assert_eq!(s.deleg_row_class(7), Some(RowCommit::DELEG_GROUP));
+        assert_eq!(s.deleg_row_class_at(7, 12, 0), Some(RowCommit::DELEG_GROUP));
         assert_eq!(s.deleg_row_class_at(8, 1, 0), None, "not published");
         lapse.store(false, Ordering::Relaxed);
-        assert_eq!(s.deleg_row_class(7), Some(RowClass::Lone));
-        assert_eq!(s.deleg_row_class_at(7, 12, 0), Some(RowClass::Lone));
+        assert_eq!(s.deleg_row_class(7), Some(RowCommit::LONE));
+        assert_eq!(s.deleg_row_class_at(7, 12, 0), Some(RowCommit::LONE));
         // The classes that wait or never answer from the disk are untouched.
         lapse.store(true, Ordering::Relaxed);
-        for class in [RowClass::DelegGroup, RowClass::NonStealable] {
+        for class in [RowCommit::DELEG_GROUP, RowCommit::FINAL] {
             s.set_deleg_durable(
                 7,
                 Some(DelegDurable {
@@ -2401,16 +2401,16 @@ mod tests {
     #[test]
     fn the_session_publishes_the_class_with_the_gate() {
         let s = SessionState::default();
-        assert_eq!(s.published_class(), RowClass::Lone, "nothing published");
-        s.set_durable(true, 7, false, RowClass::RootGroup, false);
-        assert_eq!(s.published_class(), RowClass::RootGroup);
+        assert_eq!(s.published_class(), RowCommit::LONE, "nothing published");
+        s.set_durable(true, 7, false, RowCommit::ROOT_GROUP, false);
+        assert_eq!(s.published_class(), RowCommit::ROOT_GROUP);
         assert!(s.durable_gated());
-        s.set_durable(true, 7, false, RowClass::Archive, false);
-        assert_eq!(s.published_class(), RowClass::Archive);
+        s.set_durable(true, 7, false, RowCommit::ARCHIVE, false);
+        assert_eq!(s.published_class(), RowCommit::ARCHIVE);
         // The gate goes off: the class the core publishes with it is the
         // lone node's, and a waiter finds the gate off.
-        s.set_durable(false, u64::MAX, false, RowClass::Lone, true);
-        assert_eq!(s.published_class(), RowClass::Lone);
+        s.set_durable(false, u64::MAX, false, RowCommit::LONE, true);
+        assert_eq!(s.published_class(), RowCommit::LONE);
         assert_eq!(
             s.wait_durable(9, Duration::from_millis(1)),
             DurableWait::Ungated
@@ -2426,10 +2426,10 @@ mod tests {
     #[test]
     fn an_ungated_wait_is_answered_only_where_the_node_may_answer_alone() {
         let s = SessionState::default();
-        s.set_durable(true, 3, false, RowClass::RootGroup, false);
+        s.set_durable(true, 3, false, RowCommit::ROOT_GROUP, false);
         // An epoch's hold: the gate is off and the node may answer — at
         // once, whatever the budget.
-        s.set_durable(false, u64::MAX, false, RowClass::NonStealable, true);
+        s.set_durable(false, u64::MAX, false, RowCommit::FINAL, true);
         let started = Instant::now();
         assert_eq!(
             s.wait_durable(9, Duration::from_secs(30)),
@@ -2437,13 +2437,13 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(1));
         // Released (or handed off): the gate is off, the node not lone.
-        s.set_durable(false, u64::MAX, false, RowClass::Lone, false);
+        s.set_durable(false, u64::MAX, false, RowCommit::LONE, false);
         assert_eq!(
             s.wait_durable(9, Duration::from_secs(30)),
             DurableWait::Unexpected
         );
         // Lost wins.
-        s.set_durable(false, u64::MAX, true, RowClass::Lone, false);
+        s.set_durable(false, u64::MAX, true, RowCommit::LONE, false);
         assert_eq!(
             s.wait_durable(9, Duration::from_millis(1)),
             DurableWait::Lost
@@ -3127,14 +3127,14 @@ mod tests {
         };
         let dentry = |name: &str| [ReadKey::Dentry(root, name.into())];
         let s = meta.session();
-        s.set_durable(true, 0, false, RowClass::RootGroup, false);
+        s.set_durable(true, 0, false, RowCommit::ROOT_GROUP, false);
         crate::mutate::execute(&meta, &create("a"), None).unwrap();
         assert!(meta.durability_pending(&dentry("a")));
         s.set_durable(
             true,
             meta.journal_tip().unwrap(),
             false,
-            RowClass::RootGroup,
+            RowCommit::ROOT_GROUP,
             false,
         );
         crate::mutate::execute(&meta, &create("b"), None).unwrap();
@@ -3150,17 +3150,17 @@ mod tests {
             true,
             meta.journal_tip().unwrap(),
             false,
-            RowClass::RootGroup,
+            RowCommit::ROOT_GROUP,
             false,
         );
         assert!(!meta.durability_pending(&[ReadKey::Dir(root)]));
 
         // Gate off: `c` is journaled untracked; with the gate back on it
         // is compared against the tip (and `a` stays exact).
-        s.set_durable(false, u64::MAX, false, RowClass::Lone, true);
+        s.set_durable(false, u64::MAX, false, RowCommit::LONE, true);
         let before = meta.journal_tip().unwrap();
         crate::mutate::execute(&meta, &create("c"), None).unwrap();
-        s.set_durable(true, before, false, RowClass::RootGroup, false);
+        s.set_durable(true, before, false, RowCommit::ROOT_GROUP, false);
         assert!(meta.durability_pending(&dentry("c")));
         assert!(!meta.durability_pending(&dentry("a")));
         assert!(
@@ -3171,7 +3171,7 @@ mod tests {
             true,
             meta.journal_tip().unwrap(),
             false,
-            RowClass::RootGroup,
+            RowCommit::ROOT_GROUP,
             false,
         );
         assert!(!meta.durability_pending(&dentry("c")));

@@ -98,7 +98,7 @@ impl Drop for PendingLocalOpGuard {
 }
 
 thread_local! {
-    static PENDING_CLASS: std::cell::Cell<Option<crate::store::local::RowClass>> =
+    static PENDING_CLASS: std::cell::Cell<Option<crate::store::local::RowCommit>> =
         const { std::cell::Cell::new(None) };
     static LAST_JOURNALED: std::cell::Cell<Option<JournaledRow>> =
         const { std::cell::Cell::new(None) };
@@ -129,7 +129,7 @@ pub(crate) fn note_from_session() {
 pub struct PendingClass;
 
 impl PendingClass {
-    pub fn set(class: crate::store::local::RowClass) -> PendingClassGuard {
+    pub fn set(class: crate::store::local::RowCommit) -> PendingClassGuard {
         PendingClassGuard {
             prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
             prev_own: PENDING_OWN.with(|c| c.replace(None)),
@@ -149,14 +149,14 @@ impl PendingClass {
     /// the truth), and journals `DelegGroup` where the decision no longer
     /// holds; the core reads the class the row got
     /// ([`take_last_journaled`]).
-    pub fn set_own(class: crate::store::local::RowClass, limits: OwnLimits) -> PendingClassGuard {
+    pub fn set_own(class: crate::store::local::RowCommit, limits: OwnLimits) -> PendingClassGuard {
         PendingClassGuard {
             prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
             prev_own: PENDING_OWN.with(|c| c.replace(Some(limits))),
         }
     }
 
-    pub(crate) fn current() -> Option<crate::store::local::RowClass> {
+    pub(crate) fn current() -> Option<crate::store::local::RowCommit> {
         PENDING_CLASS.with(|c| c.get())
     }
 
@@ -183,7 +183,7 @@ pub struct OwnLimits {
 }
 
 pub struct PendingClassGuard {
-    prev: Option<crate::store::local::RowClass>,
+    prev: Option<crate::store::local::RowCommit>,
     prev_own: Option<OwnLimits>,
 }
 
@@ -241,7 +241,7 @@ impl Drop for PendingClassGuard {
 pub struct JournaledRow {
     pub first: u64,
     pub last: u64,
-    pub class: crate::store::local::RowClass,
+    pub class: crate::store::local::RowCommit,
 }
 
 /// Forget the last journaled row of this thread (before an execution whose

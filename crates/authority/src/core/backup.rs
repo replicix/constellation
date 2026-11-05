@@ -31,7 +31,7 @@
 //! the core and then waits by the row's own class (plan 43 C1-2): the class
 //! the core published with the gate when the row was journaled
 //! (`Core::root_ack_class`, stored with the journal row as
-//! `constellation_meta::RowClass`), so what the row is tagged with and what
+//! `constellation_meta::RowCommit`), so what the row is tagged with and what
 //! its answer waits for agree; a row whose answer was released because the
 //! gate went off (the group is gone and no peer is eligible, or an epoch
 //! hold took over), not because the row is committed, is re-tagged `Lone`
@@ -363,6 +363,7 @@ use crate::action::{Action, AnswerSource, S3Op};
 use crate::event::{PeerMsg, S3Result};
 use crate::ids::{Epoch, HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 use crate::replica::Replica;
+pub use constellation_meta::GroupOn;
 use constellation_meta::{BackupRole, BackupTx, MutateOutcome, Rid};
 use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
 use std::collections::{BTreeMap, BTreeSet};
@@ -635,7 +636,7 @@ pub(crate) struct AckState {
     /// in the order they were made.
     pub(crate) renew_held_deleg: Vec<(FreshHold, NodeId, PeerMsg)>,
     /// What the replica's durability gate was last told.
-    reported: Option<(bool, u64, bool, constellation_meta::RowClass, bool)>,
+    reported: Option<(bool, u64, bool, constellation_meta::RowCommit, bool)>,
     /// A fast takeover of a tenure that served strict reads is waiting for
     /// its marker, where the successor's floor starts (see the module
     /// doc); `false` after the floor was set or when none is due.
@@ -1066,7 +1067,7 @@ pub enum Asker {
 impl AckClass {
     /// Q12's rule: the classes whose answer waited for a group or the
     /// archive, so what it says is committed. Not `NonStealable` and not
-    /// `Lone`. (`RowClass::gated`, the stored class's.)
+    /// `Lone`. (`RowCommit::gated`, the stored class's.)
     pub fn gated(&self) -> bool {
         !matches!(self, AckClass::NonStealable | AckClass::Lone)
     }
@@ -1101,32 +1102,6 @@ impl AckClass {
             AckClass::Lone => "lone",
         }
     }
-}
-
-impl From<AckClass> for constellation_meta::RowClass {
-    /// Plan 43 C1-2: the class stored with a journal row.
-    fn from(class: AckClass) -> Self {
-        match class {
-            AckClass::Archive => constellation_meta::RowClass::Archive,
-            AckClass::RootGroup => constellation_meta::RowClass::RootGroup,
-            AckClass::DelegGroup { .. } => constellation_meta::RowClass::DelegGroup,
-            AckClass::NonStealable => constellation_meta::RowClass::NonStealable,
-            AckClass::Lone => constellation_meta::RowClass::Lone,
-        }
-    }
-}
-
-/// Plan 46 M1.1 step 2: what a [`CommitRule`]'s group waits on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupOn {
-    /// No member listed: an applied, unfenced log segment (`ack=s3`, a
-    /// holder with no backup yet but one to be had, an ended generation).
-    Archive,
-    /// The root's holder and the backups its lease lists.
-    Root,
-    /// A delegate generation's recorded backups, or the root's appended
-    /// row when none is recorded.
-    Delegate,
 }
 
 /// Plan 46 M1.1 step 2: the commit rule of a sequencer's configuration
@@ -1175,6 +1150,22 @@ impl CommitRule {
                 GroupOn::Archive => AckClass::Archive,
                 GroupOn::Root => AckClass::RootGroup,
                 GroupOn::Delegate => AckClass::DelegGroup { gen },
+            },
+        }
+    }
+}
+
+impl From<CommitRule> for constellation_meta::RowCommit {
+    /// Plan 46 M1.1 step 3: the rule stored with a journal row, in the
+    /// version of the configuration it was looked up in.
+    fn from(rule: CommitRule) -> Self {
+        match rule {
+            CommitRule::Group { version, on, .. } => {
+                constellation_meta::RowCommit::group(version, on)
+            }
+            CommitRule::Final => constellation_meta::RowCommit::Final,
+            CommitRule::Singleton { version } => constellation_meta::RowCommit::Singleton {
+                config_version: version,
             },
         }
     }
@@ -1343,12 +1334,7 @@ impl Core {
             waiting_for_group: self.waiting_for_group(self.clk),
             member_copies: self.bk.member_epochs.len(),
             sealed_unread: self.bk.sealed_unread,
-            lone: self.root_lone()
-                || self
-                    .dl
-                    .reported
-                    .values()
-                    .any(|r| r.class == constellation_meta::RowClass::Lone),
+            lone: self.root_lone() || self.dl.reported.values().any(|r| r.class.is_singleton()),
             ungated_shadows: self.stats.ungated_shadows,
             ungated_shadows_non_stealable: self.stats.ungated_shadows_non_stealable,
             settles_sent: self.stats.settles_sent,
@@ -1747,6 +1733,14 @@ impl Core {
         }
     }
 
+    /// The `config_version` of the lease this node holds (0: none).
+    pub(crate) fn root_config_version(&self) -> u64 {
+        self.lease
+            .held
+            .as_ref()
+            .map_or(0, |(lease, _)| lease.config_version)
+    }
+
     /// Plan 46 M1.1 step 2: the commit rule of this node's root
     /// configuration, for an answer to `asker`, looked up once. A
     /// continuation epoch's hold is `Final`; under `ack=s3` the group has no
@@ -1758,11 +1752,7 @@ impl Core {
     /// is never answered on the lone root's disk alone (§5.1's table, the
     /// `Remote` column).
     pub fn root_rule(&self, asker: Asker) -> CommitRule {
-        let version = self
-            .lease
-            .held
-            .as_ref()
-            .map_or(0, |(l, _)| l.config_version);
+        let version = self.root_config_version();
         let archive = CommitRule::Group {
             version,
             members: 0,
@@ -1820,7 +1810,7 @@ impl Core {
     /// at its deposition the row goes to the member copy, never to the
     /// replay queue (the requester's retry by rid is the op's one copy, H1).
     pub(crate) fn journal_class_for(&self, asker: Asker) -> constellation_meta::PendingClassGuard {
-        constellation_meta::PendingClass::set(self.root_ack_class_for(asker).into())
+        constellation_meta::PendingClass::set(self.root_rule(asker).into())
     }
 
     /// Who an answer to `node`'s request goes to.
@@ -1860,27 +1850,35 @@ impl Core {
                     && !self.ack.shipped_rows.contains(&first) =>
             {
                 replica
-                    .reclass_journal_tx(first, constellation_meta::RowClass::Lone)
+                    .reclass_journal_tx(first, constellation_meta::RowCommit::LONE)
                     .inspect_err(|error| {
                         tracing::warn!(node = self.cfg.node_id, ?rid, %error, "could not re-tag a row answered with the gate off: EIO");
                     })?;
                 AckClass::Lone
             }
-            Some((_, constellation_meta::RowClass::Lone)) => AckClass::Lone,
-            Some((_, constellation_meta::RowClass::Archive)) => AckClass::Archive,
-            Some((_, constellation_meta::RowClass::RootGroup)) => AckClass::RootGroup,
+            Some((_, class)) if class.is_singleton() => AckClass::Lone,
+            Some((_, class)) if class.is_archive() => AckClass::Archive,
+            Some((
+                _,
+                constellation_meta::RowCommit::Group {
+                    on: GroupOn::Root, ..
+                },
+            )) => AckClass::RootGroup,
             // Plan 43 C2f review: a row of a continuation epoch's hold is
             // non-stealable only while the hold lasts. After it, this node's
             // own client is answered as the node is now: on its disk alone
             // only if it is lone (the row re-tagged `Lone`, so its strand
             // follows the answer), from the archive otherwise (`flex-crash`
             // seed 39's shape, for the own client).
-            Some((first, constellation_meta::RowClass::NonStealable))
-                if !self.lease.epoch_held() =>
-            {
+            Some((first, class)) if class.is_final() && !self.lease.epoch_held() => {
                 if self.root_lone() {
                     replica
-                        .reclass_journal_tx(first, constellation_meta::RowClass::Lone)
+                        .reclass_journal_tx(
+                            first,
+                            constellation_meta::RowCommit::Singleton {
+                                config_version: self.root_config_version(),
+                            },
+                        )
                         .inspect_err(|error| {
                             tracing::warn!(node = self.cfg.node_id, ?rid, %error, "could not re-tag a hold's row answered alone: EIO");
                         })?;
@@ -1889,8 +1887,17 @@ impl Core {
                     AckClass::Archive
                 }
             }
-            Some((_, constellation_meta::RowClass::NonStealable)) => AckClass::NonStealable,
-            Some((_, constellation_meta::RowClass::DelegGroup)) | None => self.root_ack_class(),
+            Some((_, class)) if class.is_final() => AckClass::NonStealable,
+            Some((
+                _,
+                constellation_meta::RowCommit::Group {
+                    on: GroupOn::Delegate,
+                    ..
+                },
+            ))
+            | None => self.root_ack_class(),
+            // (Exhaustive: every variant is read above.)
+            Some(_) => self.root_ack_class(),
         })
     }
 
@@ -1921,9 +1928,9 @@ impl Core {
         // deposition or `repair drop-held` does with it follows the answer).
         if self.lease.epoch_held() {
             if let Some((first, class)) = replica.journal_class_of_rid(rid) {
-                if class != constellation_meta::RowClass::NonStealable {
+                if !class.is_final() {
                     replica
-                        .reclass_journal_tx(first, constellation_meta::RowClass::NonStealable)
+                        .reclass_journal_tx(first, constellation_meta::RowCommit::FINAL)
                         .inspect_err(|error| {
                             tracing::warn!(node = self.cfg.node_id, ?rid, %error, "could not re-tag a row answered in a hold: EIO");
                         })?;
@@ -1932,31 +1939,42 @@ impl Core {
             return Ok(AckClass::NonStealable);
         }
         Ok(match replica.journal_class_of_rid(rid) {
-            Some((first, constellation_meta::RowClass::Lone)) => {
+            Some((first, class)) if class.is_singleton() => {
                 if rid.node != self.cfg.node_id {
                     replica
-                        .reclass_journal_tx(first, constellation_meta::RowClass::Archive)
+                        .reclass_journal_tx(first, constellation_meta::RowCommit::ARCHIVE)
                         .inspect_err(|error| {
                             tracing::warn!(node = self.cfg.node_id, ?rid, %error, "could not re-tag a row answered from the archive: EIO");
                         })?;
                 }
                 AckClass::Archive
             }
-            Some((_, constellation_meta::RowClass::Archive)) => AckClass::Archive,
-            Some((_, constellation_meta::RowClass::RootGroup)) => AckClass::RootGroup,
+            Some((_, class)) if class.is_archive() => AckClass::Archive,
+            Some((
+                _,
+                constellation_meta::RowCommit::Group {
+                    on: GroupOn::Root, ..
+                },
+            )) => AckClass::RootGroup,
             // A row of a continuation epoch's hold is non-stealable while
             // the hold lasts; once it ended, the row is one more unshipped
             // row of this tenure, and another node's answer waits for the
             // log (`flex-crash` seed 39: a rename journaled in the hold and
             // held back behind a dead member's chunk, answered at a retry
             // after the hold as the hold's).
-            Some((_, constellation_meta::RowClass::NonStealable)) if self.lease.epoch_held() => {
+            Some((_, class)) if class.is_final() && self.lease.epoch_held() => {
                 AckClass::NonStealable
             }
-            Some((_, constellation_meta::RowClass::NonStealable)) => AckClass::Archive,
-            Some((_, constellation_meta::RowClass::DelegGroup)) | None => {
-                self.root_ack_class_for(asker)
-            }
+            Some((_, class)) if class.is_final() => AckClass::Archive,
+            Some((
+                _,
+                constellation_meta::RowCommit::Group {
+                    on: GroupOn::Delegate,
+                    ..
+                },
+            ))
+            | None => self.root_ack_class_for(asker),
+            Some(_) => self.root_ack_class_for(asker),
         })
     }
 
@@ -1988,13 +2006,16 @@ impl Core {
     ) -> Result<AckClass, constellation_meta::MetaError> {
         Ok(
             match constellation_meta::take_last_journaled().map(|r| r.class) {
-                Some(constellation_meta::RowClass::DelegGroup) => self.root_ack_class(),
-                Some(class) => match class {
-                    constellation_meta::RowClass::Lone => AckClass::Lone,
-                    constellation_meta::RowClass::Archive => AckClass::Archive,
-                    constellation_meta::RowClass::RootGroup => AckClass::RootGroup,
-                    _ => AckClass::NonStealable,
-                },
+                Some(constellation_meta::RowCommit::Group {
+                    on: GroupOn::Delegate,
+                    ..
+                }) => self.root_ack_class(),
+                Some(class) if class.is_singleton() => AckClass::Lone,
+                Some(class) if class.is_archive() => AckClass::Archive,
+                Some(constellation_meta::RowCommit::Group {
+                    on: GroupOn::Root, ..
+                }) => AckClass::RootGroup,
+                Some(_) => AckClass::NonStealable,
                 None => return self.journaled_answer_class(replica, rid),
             },
         )
@@ -2087,7 +2108,7 @@ impl Core {
         // Plan 43 C1-2: the class of the answers this node gives its own
         // clients, published with the gate: the FUSE fast path journals
         // its rows with it and waits by it.
-        let class: constellation_meta::RowClass = self.root_ack_class().into();
+        let class: constellation_meta::RowCommit = self.root_rule(Asker::Own).into();
         // Plan 43 C2 (§5.4, D5): with the gate off, the fast path answers its
         // own clients on this disk only where this node is lone or holds an
         // epoch; the gate off for any other reason (a release, a handoff) is
@@ -2108,7 +2129,7 @@ impl Core {
     /// lone node's.
     pub(crate) fn clear_holder_epoch(&mut self, replica: &dyn Replica) {
         let lost = self.lease.lost;
-        let class = constellation_meta::RowClass::Archive;
+        let class = constellation_meta::RowCommit::ARCHIVE;
         self.ack.reported = Some((false, u64::MAX, lost, class, false));
         replica.set_durable(false, u64::MAX, lost, class, false);
         replica.set_holder_epoch(0);

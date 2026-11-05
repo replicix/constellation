@@ -736,7 +736,7 @@ pub trait Replica {
         gate: bool,
         jseq: u64,
         lost: bool,
-        class: constellation_meta::RowClass,
+        class: constellation_meta::RowCommit,
         lone_ok: bool,
     );
     /// Plan 43 C2d: what the core knows of the delegation `gen` this node
@@ -747,16 +747,16 @@ pub trait Replica {
     fn class_from_session(&self) -> u64;
     /// Plan 43 C1-2: the class of the unshipped journal transaction that
     /// carries `rid` (the latest of them), if any.
-    fn journal_class_of_rid(&self, rid: Rid) -> Option<(u64, constellation_meta::RowClass)>;
+    fn journal_class_of_rid(&self, rid: Rid) -> Option<(u64, constellation_meta::RowCommit)>;
     /// Plan 43 C1-4: the class of the journal transaction starting at
     /// journal seq `first`, if it is still in the journal.
-    fn journal_tx_class(&self, first: u64) -> Option<constellation_meta::RowClass>;
+    fn journal_tx_class(&self, first: u64) -> Option<constellation_meta::RowCommit>;
     /// Plan 43 C1-2 (D4): re-tag the journal row holding `seq`
     /// (`Meta::reclass_journal_tx`).
     fn reclass_journal_tx(
         &self,
         seq: u64,
-        class: constellation_meta::RowClass,
+        class: constellation_meta::RowCommit,
     ) -> Result<bool, MetaError>;
 
     // ---- holder state ----
@@ -1905,7 +1905,7 @@ impl Replica for Meta {
         gate: bool,
         jseq: u64,
         lost: bool,
-        class: constellation_meta::RowClass,
+        class: constellation_meta::RowCommit,
         lone_ok: bool,
     ) {
         self.session().set_durable(gate, jseq, lost, class, lone_ok)
@@ -1915,11 +1915,11 @@ impl Replica for Meta {
         self.session().set_deleg_durable(gen, d)
     }
 
-    fn journal_tx_class(&self, first: u64) -> Option<constellation_meta::RowClass> {
+    fn journal_tx_class(&self, first: u64) -> Option<constellation_meta::RowCommit> {
         Meta::journal_tx_class(self, first).ok().flatten()
     }
 
-    fn journal_class_of_rid(&self, rid: Rid) -> Option<(u64, constellation_meta::RowClass)> {
+    fn journal_class_of_rid(&self, rid: Rid) -> Option<(u64, constellation_meta::RowCommit)> {
         Meta::journal_rows_of_rid(self, rid)
             .ok()
             .and_then(|v| v.last().copied())
@@ -1932,7 +1932,7 @@ impl Replica for Meta {
     fn reclass_journal_tx(
         &self,
         seq: u64,
-        class: constellation_meta::RowClass,
+        class: constellation_meta::RowCommit,
     ) -> Result<bool, MetaError> {
         Meta::reclass_journal_tx(self, seq, class)
     }

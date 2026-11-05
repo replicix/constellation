@@ -812,6 +812,7 @@ impl NodeHandle {
             oracles: env.oracles.clone(),
             forwards: HashMap::new(),
             lone_audit_seen: BTreeMap::new(),
+            versions_seen_tip: 0,
             lone_stats_seen: None,
             rebuild_stub: env.rebuild_stub,
             plant_ungated_fast_path: env.plant_ungated_fast_path,
@@ -1135,6 +1136,9 @@ struct Driver {
     /// committed prefix the lone-lead oracle last judged, so a step that
     /// changed neither is not judged again.
     lone_audit_seen: BTreeMap<u64, (u64, u64)>,
+    /// The journal tip the row-version oracle last judged (plan 46 M1.1
+    /// step 3).
+    versions_seen_tip: u64,
     /// The counters of the lone-lead oracle's non-vacuity (`LoneLead`)
     /// as this driver last read them: `(held_by_gate, demoted)`.
     lone_stats_seen: Option<(u64, u64)>,
@@ -1188,7 +1192,7 @@ struct HeldWrite {
     /// A delegate's write: the class `Meta::finish_local` journaled its row
     /// with (`Meta::delegate_execute_admitted`: decided at the journaling,
     /// as the engine's fast path does), once its transaction is over.
-    journaled: Arc<Mutex<Option<constellation_meta::RowClass>>>,
+    journaled: Arc<Mutex<Option<constellation_meta::RowCommit>>>,
     tag: LockTag,
     shared: Arc<Shared>,
     release_at: tokio::time::Instant,
@@ -2315,6 +2319,7 @@ impl Driver {
             self.note_journaled_refusals();
             self.note_identity();
             self.note_lone_rows();
+            self.note_row_versions();
             self.dispatch(actions);
             self.poll_fast_waits();
             self.refresh_view();
@@ -2838,6 +2843,46 @@ impl Driver {
         );
     }
 
+    /// Plan 46 M1.1 step 3: the row-version oracle
+    /// ([`super::oracle::RowVersions`]) judges the rows this node journaled
+    /// since the last event that moved its journal.
+    fn note_row_versions(&mut self) {
+        let tip = self.meta.journal_tip().unwrap_or(0);
+        if tip == self.versions_seen_tip {
+            return;
+        }
+        if tip < self.versions_seen_tip {
+            // The journal was wiped (a restart without it): its seqs start
+            // again.
+            self.oracles.row_versions.lock().unwrap().forget(self.id);
+        }
+        self.versions_seen_tip = tip;
+        let Ok(rows) = self.meta.journal_rows_for_audit() else {
+            return;
+        };
+        let stores: Vec<_> = self
+            .oracles
+            .stores
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        let group_max = |gen: u64| {
+            stores
+                .iter()
+                .filter_map(|m| m.deleg_group(gen).ok().flatten())
+                .map(|g| g.version)
+                .max()
+                .unwrap_or(0)
+        };
+        self.oracles
+            .row_versions
+            .lock()
+            .unwrap()
+            .judge(self.id, &rows, &group_max);
+    }
+
     /// The lone delegate's lead oracle ([`super::oracle::LoneLead`]): this
     /// node's own `Lone` rows of each generation it is the delegate of, judged
     /// against the prefix its core knows committed.
@@ -3234,7 +3279,7 @@ impl Driver {
         // with it and the answer says it and waits by it.
         let row_class = session.deleg_row_class(gen)?;
         let class = ack_class_of(row_class, gen);
-        let journaled: Arc<Mutex<Option<constellation_meta::RowClass>>> = Default::default();
+        let journaled: Arc<Mutex<Option<constellation_meta::RowCommit>>> = Default::default();
         let (_, write_ms) = self.shared.hold_next.lock().unwrap().take()?;
         let epoch = self.core.ship().max_epoch.max(1);
         let (phase_tx, phase) = std::sync::mpsc::channel();
@@ -4203,19 +4248,27 @@ pub fn meta_holds_rid(meta: &Meta, rid: Rid) -> bool {
     })
 }
 
-/// The class a journal row of `RowClass` answers as, for the delegation
-/// `gen` (the inverse of `AckClass`'s `Into<RowClass>`).
+/// The class a journal row of `RowCommit` answers as, for the delegation
+/// `gen`.
 fn ack_class_of(
-    class: constellation_meta::RowClass,
+    class: constellation_meta::RowCommit,
     gen: u64,
 ) -> constellation_authority::core::AckClass {
-    use constellation_authority::core::AckClass;
-    use constellation_meta::RowClass;
+    use constellation_authority::core::{AckClass, GroupOn};
+    use constellation_meta::RowCommit;
     match class {
-        RowClass::Lone => AckClass::Lone,
-        RowClass::Archive => AckClass::Archive,
-        RowClass::RootGroup => AckClass::RootGroup,
-        RowClass::DelegGroup => AckClass::DelegGroup { gen },
-        RowClass::NonStealable => AckClass::NonStealable,
+        RowCommit::Singleton { .. } => AckClass::Lone,
+        RowCommit::Group {
+            on: GroupOn::Archive,
+            ..
+        } => AckClass::Archive,
+        RowCommit::Group {
+            on: GroupOn::Root, ..
+        } => AckClass::RootGroup,
+        RowCommit::Group {
+            on: GroupOn::Delegate,
+            ..
+        } => AckClass::DelegGroup { gen },
+        RowCommit::Final => AckClass::NonStealable,
     }
 }

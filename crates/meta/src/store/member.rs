@@ -38,7 +38,7 @@
 //!    the inherited tail of a tenure that has not shipped it yet (D2).
 
 use super::backup::tail_key;
-use super::local::RowClass;
+use super::local::RowCommit;
 use super::{kv_get_tx, kv_set_tx, Meta};
 use crate::error::MetaError;
 use crate::locks::LockTag;
@@ -281,7 +281,7 @@ pub struct MemberTx {
     pub tx: BackupTx,
     /// What the row's answer waited for. A transaction that came from a
     /// backup's tail was held by the whole group: `RootGroup`.
-    pub class: RowClass,
+    pub class: RowCommit,
     pub rid: Option<Rid>,
     pub op: Option<MutateOp>,
     pub lock_tag: LockTag,
@@ -292,7 +292,7 @@ impl MemberTx {
     pub fn from_backup(tx: BackupTx) -> MemberTx {
         MemberTx {
             tx,
-            class: RowClass::RootGroup,
+            class: RowCommit::ROOT_GROUP,
             rid: None,
             op: None,
             lock_tag: LockTag::NONE,
@@ -420,7 +420,7 @@ impl Meta {
                 },
                 None => MemberTx {
                     tx: t,
-                    class: RowClass::Lone,
+                    class: RowCommit::LONE,
                     rid: None,
                     op: None,
                     lock_tag: LockTag::NONE,
@@ -888,8 +888,7 @@ pub(crate) fn member_rules_tx(
                 continue;
             }
             if abandoned.contains(&e) {
-                if row.class != RowClass::Lone
-                    && super::spec::queue_abandoned_tx(tx, meta, e, &row)?
+                if !row.class.is_singleton() && super::spec::queue_abandoned_tx(tx, meta, e, &row)?
                 {
                     out.abandoned += 1;
                 }
@@ -906,10 +905,7 @@ pub(crate) fn member_rules_tx(
             if f.first_of_epoch
                 && f.epoch > e
                 && !follows.contains(&e)
-                && matches!(
-                    row.class,
-                    RowClass::Archive | RowClass::Lone | RowClass::NonStealable
-                )
+                && (row.class.is_archive() || row.class.is_singleton() || row.class.is_final())
             {
                 tx.remove(&meta.backup_tail, key);
                 meta.release_copy_row(e, first);
@@ -1045,7 +1041,7 @@ mod release_tests {
                 records: vec![],
                 origin: (0, 0),
             },
-            class: RowClass::RootGroup,
+            class: RowCommit::ROOT_GROUP,
             rid: None,
             op: None,
             lock_tag: Default::default(),

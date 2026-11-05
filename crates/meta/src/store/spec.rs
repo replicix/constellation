@@ -117,7 +117,7 @@ use crate::record::LogRecord;
 use crate::replay::{apply_batch_tx, apply_record, ApplyCx, TouchSet};
 use crate::rid::Rid;
 use crate::session::{JournalPos, Position, Streams};
-use crate::store::local::{self, LogPrefixView, RowClass};
+use crate::store::local::{self, LogPrefixView, RowCommit};
 use crate::store::{
     adjust_usage_tx, counter_add_tx, counter_get, counter_set_tx, kv_get_tx, kv_set_tx, misc, ns,
     Meta, UsageTracker, KV_APPLIED_SEQ, KV_DELEG_SPEC_COUNT, KV_LOCAL_SPEC_COUNT, KV_NEXT_SPEC_SEQ,
@@ -459,7 +459,7 @@ struct QueuedReplay {
     /// the client was told is committed (`gated`) is queued only by an
     /// operator's abandon of its group; every other entry is the lone
     /// branch's. The simulation's oracle (I2 (b)) judges the former.
-    class: RowClass,
+    class: RowCommit,
     /// Plan 46 M0.2 (R1): this entry is a placeholder, not a copy of an
     /// op: see [`AwaitRetry`]. Its `op` is inert and never executed.
     await_retry: Option<AwaitRetry>,
@@ -580,7 +580,7 @@ pub struct StrandedOp {
     /// See `QueuedReplay::truncate_base`.
     pub truncate_base: Option<Vec<u8>>,
     /// See `QueuedReplay::class`.
-    pub class: RowClass,
+    pub class: RowCommit,
     /// See [`AwaitRetry`]: set for a placeholder, whose `op` is inert.
     pub await_retry: Option<AwaitRetry>,
     /// See `QueuedReplay::dropped`.
@@ -1294,9 +1294,9 @@ fn mark_queued_class_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
     key: u64,
-    class: RowClass,
+    class: RowCommit,
 ) -> Result<(), MetaError> {
-    if class == RowClass::Lone {
+    if class.is_singleton() {
         return Ok(());
     }
     if let Some(v) = tx.get(&meta.pending_replay, seq_key(key))? {
@@ -1341,7 +1341,7 @@ fn enqueue_replay_as_tx(
         truncate_base,
         lock_tag,
         deps,
-        class: RowClass::Lone,
+        class: RowCommit::LONE,
         await_retry: None,
         dropped: false,
     };
@@ -2057,7 +2057,7 @@ fn redo_row_tx(
                         &row.before,
                     )?;
                     if gated {
-                        mark_queued_class_tx(tx, meta, row.origin, RowClass::RootGroup)?;
+                        mark_queued_class_tx(tx, meta, row.origin, RowCommit::ROOT_GROUP)?;
                     }
                     out.shadows += 1;
                     out.committed_rolled_back += usize::from(gated);
@@ -2097,7 +2097,7 @@ fn redo_row_tx(
                 if let Some((rid, op, tag)) = own {
                     enqueue_replay_tx(tx, meta, row.origin, rid, op, tag, &row.before)?;
                     if gated {
-                        mark_queued_class_tx(tx, meta, row.origin, RowClass::RootGroup)?;
+                        mark_queued_class_tx(tx, meta, row.origin, RowCommit::ROOT_GROUP)?;
                     }
                     out.shadows += 1;
                 } else {
@@ -2122,7 +2122,7 @@ fn redo_row_tx(
                             &[],
                         )?;
                         if gated {
-                            mark_queued_class_tx(tx, meta, row.origin, RowClass::RootGroup)?;
+                            mark_queued_class_tx(tx, meta, row.origin, RowCommit::ROOT_GROUP)?;
                         }
                     }
                     out.hints += 1;
@@ -3840,10 +3840,12 @@ pub(crate) fn mark_await_retry_tx(
     let node: u64 = kv_get_tx(&*tx, &meta.local, KV_NODE_PREFIX)?
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let never_given = match row.class {
-        RowClass::Archive => true,
-        RowClass::RootGroup | RowClass::DelegGroup => unanswered(row.rid),
-        _ => false,
+    let never_given = if row.class.is_archive() {
+        true
+    } else if row.class.gated() {
+        unanswered(row.rid)
+    } else {
+        false
     };
     if row.rid.node == node
         || !never_given
@@ -3857,7 +3859,7 @@ pub(crate) fn mark_await_retry_tx(
         records: Vec::new(),
     };
     row.await_retry = Some(AwaitRetry { keys, since_ms });
-    row.class = RowClass::Lone;
+    row.class = RowCommit::LONE;
     row.truncate_base = None;
     row.lock_tag = LockTag::NONE;
     row.deps = Streams::NONE;
@@ -3899,7 +3901,7 @@ pub(crate) fn refuse_queued_tx(
         truncate_base: None,
         lock_tag: LockTag::NONE,
         deps: Streams::NONE,
-        class: RowClass::Lone,
+        class: RowCommit::LONE,
         await_retry: None,
         dropped,
     };

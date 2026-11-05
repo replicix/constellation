@@ -1304,7 +1304,7 @@ fn an_orphan_end_queues_a_delegates_answered_gated_row() {
         .unwrap();
     {
         let _class =
-            constellation_meta::PendingClass::set(constellation_meta::RowClass::DelegGroup);
+            constellation_meta::PendingClass::set(constellation_meta::RowCommit::DELEG_GROUP);
         delegate_create(&meta, g, RID, "x", (2u64 << 40) | 20);
     }
     meta.apply_segment_rows(1, 2, 0, &[], &[], &[no_tail(1, 0)], &TouchSet::default())

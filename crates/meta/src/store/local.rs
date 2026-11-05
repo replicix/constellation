@@ -121,64 +121,197 @@ enum Journaled {
     Appended,
 }
 
-/// Plan 43 §5.1: what a journal row's acknowledgement waited, or waits, for
-/// — the class of the sequencer's commit point at the moment the row was
-/// journaled (C1-2). The class is stored with the row because what a
-/// deposition or a takeover does to it (C1-4: a gated row goes to the member
-/// copy, an ungated one is replayed) must follow what its client was told,
-/// not what the node believes later. It is fixed at journal time for
-/// everything that *waits*; the one change after the fact is a row whose own
-/// client was answered with the gate off: it is re-tagged `Lone`
-/// ([`Meta::reclass_journal_tx`]), so that its strand behaviour matches the
-/// answer (S7: "gated implies committed at the answer").
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum RowClass {
-    /// Nothing but this node's disk holds it: a lone sequencer's row.
-    #[default]
-    Lone,
-    /// The row waits for an applied, unfenced log segment (`ack=s3`, or a
+/// What a [`RowCommit::Group`]'s configuration waits on (plan 46 M1.1:
+/// step 7 deletes it with the answer classes it names).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GroupOn {
+    /// No member listed: an applied, unfenced log segment (`ack=s3`, a
     /// holder with no backup yet but one to be had).
     Archive,
     /// The root group: the holder's journal and every backup the lease
     /// object lists hold it.
-    RootGroup,
-    /// The delegation's group (C2).
-    DelegGroup,
-    /// A designee's or an epoch hold's row: never stolen, never gated.
-    NonStealable,
+    Root,
+    /// The delegation's group (C2): a recorded backup's tail, or the root's
+    /// appended row.
+    Delegate,
 }
 
-impl RowClass {
-    /// Q12's rule: the classes whose acknowledgement waits for a group or
-    /// the archive, so the row is committed once it is answered. Not
-    /// `NonStealable` (its holder cannot be replaced, nothing waits) and
-    /// not `Lone`.
+/// Plan 46 M1.1 step 3 (§5.1): the commit rule a journal row was written
+/// under, stamped with the configuration it was written in. A row carries
+/// its configuration's version, not the class of one decision: what a
+/// deposition or a takeover does to it (a committed row goes to the member
+/// copy, a singleton's is replayed) follows what its client was told, which
+/// is the rule of the configuration in force at its position. It is fixed
+/// at the journaling; the one change after the fact is a row whose own
+/// client was answered with the gate off: it is re-tagged `Singleton`
+/// ([`Meta::reclass_journal_tx`]), so that its strand behaviour matches the
+/// answer (S7: "gated implies committed at the answer").
+///
+/// Replaces the five-valued `RowClass` (Lone = `Singleton`, NonStealable =
+/// `Final`, Archive, RootGroup and DelegGroup = `Group`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RowCommit {
+    /// Committed once the configuration's members hold the row (or the
+    /// archive, none listed): the answer waited for it.
+    Group {
+        /// The configuration's version: the lease's `config_version`, or
+        /// the generation's `DelegGroup` version.
+        config_version: u64,
+        on: GroupOn,
+    },
+    /// A non-stealable configuration (a designee, an epoch hold): never
+    /// stolen, never gated.
+    Final,
+    /// Nothing but this node's disk holds it: a singleton sequencer's row
+    /// (kept as a variant until M2.1: the replay and the member-copy drop
+    /// rules read it).
+    Singleton { config_version: u64 },
+}
+
+impl Default for RowCommit {
+    fn default() -> Self {
+        RowCommit::LONE
+    }
+}
+
+impl RowCommit {
+    /// The forms of version 0: what code that does not know the
+    /// configuration it journals under stamps (placeholders, tests).
+    pub const LONE: RowCommit = RowCommit::Singleton { config_version: 0 };
+    pub const ARCHIVE: RowCommit = RowCommit::group(0, GroupOn::Archive);
+    pub const ROOT_GROUP: RowCommit = RowCommit::group(0, GroupOn::Root);
+    pub const DELEG_GROUP: RowCommit = RowCommit::group(0, GroupOn::Delegate);
+    pub const FINAL: RowCommit = RowCommit::Final;
+    /// The version the `per_row_class` negative control stamps (no
+    /// configuration has it: a CAS bumps a version by one).
+    pub const PER_ROW_STAMP: u64 = (1 << 60) - 1;
+
+    pub const fn group(config_version: u64, on: GroupOn) -> RowCommit {
+        RowCommit::Group { config_version, on }
+    }
+
+    /// Q12's rule: the rows whose acknowledgement waited for a group or the
+    /// archive, so the row is committed once it is answered. Not `Final`
+    /// (its holder cannot be replaced, nothing waits) and not `Singleton`.
     pub fn gated(self) -> bool {
+        matches!(self, RowCommit::Group { .. })
+    }
+
+    pub fn is_singleton(self) -> bool {
+        matches!(self, RowCommit::Singleton { .. })
+    }
+
+    pub fn is_final(self) -> bool {
+        matches!(self, RowCommit::Final)
+    }
+
+    /// A group that waits for the archive alone (no member listed).
+    pub fn is_archive(self) -> bool {
         matches!(
             self,
-            RowClass::Archive | RowClass::RootGroup | RowClass::DelegGroup
+            RowCommit::Group {
+                on: GroupOn::Archive,
+                ..
+            }
         )
     }
 
-    pub(crate) fn to_u8(self) -> u8 {
+    /// The configuration version the row carries (`Final` has none).
+    pub fn config_version(self) -> Option<u64> {
         match self {
-            RowClass::Lone => 0,
-            RowClass::Archive => 1,
-            RowClass::RootGroup => 2,
-            RowClass::DelegGroup => 3,
-            RowClass::NonStealable => 4,
+            RowCommit::Group { config_version, .. } | RowCommit::Singleton { config_version } => {
+                Some(config_version)
+            }
+            RowCommit::Final => None,
         }
     }
 
-    pub(crate) fn from_u8(v: u8) -> RowClass {
-        match v {
-            1 => RowClass::Archive,
-            2 => RowClass::RootGroup,
-            3 => RowClass::DelegGroup,
-            4 => RowClass::NonStealable,
-            _ => RowClass::Lone,
+    /// A singleton's row waits for its group instead: the delegation's
+    /// group at the same configuration version. Any other rule is kept.
+    pub fn demoted(self) -> RowCommit {
+        match self {
+            RowCommit::Singleton { config_version } => {
+                RowCommit::group(config_version, GroupOn::Delegate)
+            }
+            other => other,
         }
     }
+
+    /// The same rule at version 0: what a test that does not know the
+    /// configuration compares.
+    pub fn versionless(self) -> RowCommit {
+        match self {
+            RowCommit::Group { on, .. } => RowCommit::group(0, on),
+            RowCommit::Final => RowCommit::Final,
+            RowCommit::Singleton { .. } => RowCommit::LONE,
+        }
+    }
+
+    /// The row re-tagged a singleton's, in the version it carries (a
+    /// `Final` one in `version`).
+    pub fn as_singleton(self, version: u64) -> RowCommit {
+        RowCommit::Singleton {
+            config_version: self.config_version().unwrap_or(version),
+        }
+    }
+
+    /// The row re-tagged a group that waits for the archive, in the version
+    /// it carries (a `Final` one in `version`).
+    pub fn as_archive(self, version: u64) -> RowCommit {
+        RowCommit::group(self.config_version().unwrap_or(version), GroupOn::Archive)
+    }
+
+    const VERSION_BITS: u32 = 60;
+
+    /// The row's rule in one word (the session publishes it atomically): the
+    /// variant in the top bits, the version below. Versions are far below
+    /// 2^60 (one CAS bumps one).
+    pub(crate) fn to_bits(self) -> u64 {
+        let tag =
+            |t: u64, v: u64| (t << Self::VERSION_BITS) | (v & ((1 << Self::VERSION_BITS) - 1));
+        match self {
+            RowCommit::Singleton { config_version } => tag(0, config_version),
+            RowCommit::Group {
+                config_version,
+                on: GroupOn::Archive,
+            } => tag(1, config_version),
+            RowCommit::Group {
+                config_version,
+                on: GroupOn::Root,
+            } => tag(2, config_version),
+            RowCommit::Group {
+                config_version,
+                on: GroupOn::Delegate,
+            } => tag(3, config_version),
+            RowCommit::Final => tag(4, 0),
+        }
+    }
+
+    pub(crate) fn from_bits(bits: u64) -> RowCommit {
+        let v = bits & ((1 << Self::VERSION_BITS) - 1);
+        match bits >> Self::VERSION_BITS {
+            1 => RowCommit::group(v, GroupOn::Archive),
+            2 => RowCommit::group(v, GroupOn::Root),
+            3 => RowCommit::group(v, GroupOn::Delegate),
+            4 => RowCommit::Final,
+            _ => RowCommit::Singleton { config_version: v },
+        }
+    }
+}
+
+/// A journal transaction as the simulation's row-version oracle reads it.
+#[cfg(any(test, feature = "test-util"))]
+#[derive(Clone, Copy, Debug)]
+pub struct AuditRow {
+    /// The transaction's first journal seq.
+    pub first: u64,
+    /// The lease epoch it executed under (0: this node held none).
+    pub epoch: u64,
+    /// The delegation generation (0: the root's own) and the index in it.
+    pub gen: u64,
+    pub idx: u64,
+    /// The rule it was journaled under, with its configuration's version.
+    pub class: RowCommit,
 }
 
 /// A `journal_tx` value: one journaled transaction still in `journal`.
@@ -204,7 +337,7 @@ pub(crate) struct JournalTx {
     /// (`journal::PendingClass`, else the session's published class). It
     /// sits right after `idx`, before `rid`, so that [`JournalTxHead`]
     /// decodes it as part of its prefix.
-    pub class: RowClass,
+    pub class: RowCommit,
     /// The rid `mutate::execute` ran it under, if any.
     pub rid: Option<Rid>,
     /// The op `mutate::execute` ran, if the transaction came from one. A
@@ -241,7 +374,7 @@ pub(crate) struct JournalTxHead {
     pub epoch: u64,
     pub gen: u64,
     pub idx: u64,
-    pub class: RowClass,
+    pub class: RowCommit,
 }
 
 pub(crate) fn tx_key(first: u64) -> Vec<u8> {
@@ -615,7 +748,7 @@ impl Meta {
         // is what their wait follows.
         let mut class = match (journal::PendingClass::current(), class_at_journal) {
             (Some(c), _) | (None, Some(c)) => c,
-            (None, None) if delegated => RowClass::Lone,
+            (None, None) if delegated => RowCommit::LONE,
             (None, None) => {
                 journal::note_from_session();
                 self.session().published_class()
@@ -638,10 +771,10 @@ impl Meta {
             let held = kv_get_tx(tx, &self.local, &key)?
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
-            if let (RowClass::Lone, Some(limits)) = (class, own) {
+            if let (true, Some(limits)) = (class.is_singleton(), own) {
                 if crate::session::lone_row_holds(idx, held, limits.committed, limits.horizon) {
                     self.session().note_lone_demoted(idx > limits.horizon);
-                    class = RowClass::DelegGroup;
+                    class = class.demoted();
                 }
             }
             // The same rule across this node's generations: the keys of one
@@ -653,12 +786,9 @@ impl Meta {
             // generation together. A core with the hysteresis off (its
             // limits say nothing) holds nothing back here either.
             let hysteresis = own.is_none_or(|l| l.committed != u64::MAX);
-            if class == RowClass::Lone
-                && hysteresis
-                && gated_open_elsewhere_tx(tx, self, gen, true)?
-            {
+            if class.is_singleton() && hysteresis && gated_open_elsewhere_tx(tx, self, gen, true)? {
                 self.session().note_lone_demoted(false);
-                class = RowClass::DelegGroup;
+                class = class.demoted();
             }
             if class.gated() && idx > held {
                 kv_set_tx(tx, &self.local, &key, &idx.to_string());
@@ -748,8 +878,10 @@ impl Meta {
     /// transaction: a row whose own client was answered with the gate off
     /// (`Lone`) must strand as the answer said. A row that is gone (shipped
     /// rows are durable anyway) or already of that class is left alone.
-    /// Returns whether a row changed.
-    pub fn reclass_journal_tx(&self, seq: u64, class: RowClass) -> Result<bool, MetaError> {
+    /// `to` names the rule to re-tag to: the row keeps the configuration
+    /// version it carries (`to`'s version applies only to a `Final` row,
+    /// which has none). Returns whether a row changed.
+    pub fn reclass_journal_tx(&self, seq: u64, to: RowCommit) -> Result<bool, MetaError> {
         #[cfg(any(test, feature = "test-util"))]
         if reclass_fault::take() {
             return Err(MetaError::Io(std::io::Error::other(
@@ -766,6 +898,14 @@ impl Meta {
         };
         let Some((first, mut row)) = owner.filter(|(_, row)| row.last >= seq) else {
             return Ok(false);
+        };
+        let class = match to {
+            RowCommit::Singleton { config_version } => row.class.as_singleton(config_version),
+            RowCommit::Group {
+                config_version,
+                on: GroupOn::Archive,
+            } => row.class.as_archive(config_version),
+            other => other,
         };
         if row.class == class {
             return Ok(false);
@@ -789,7 +929,7 @@ impl Meta {
 
     /// Plan 43 C1-2: the class of the journal transaction that holds
     /// journal seq `seq` (`None`: no such unshipped transaction).
-    pub fn journal_tx_class(&self, seq: u64) -> Result<Option<RowClass>, MetaError> {
+    pub fn journal_tx_class(&self, seq: u64) -> Result<Option<RowCommit>, MetaError> {
         let r = self.db.read_tx();
         match r.range(&self.journal_tx, ..=tx_key(seq)).next_back() {
             Some(guard) => {
@@ -804,7 +944,7 @@ impl Meta {
     /// Plan 43 C1-2: the classes of the unshipped journal transactions that
     /// carry `rid`, oldest first (the simulation's claim check reads the
     /// answering row's class; a shipped row is gone from the journal).
-    pub fn journal_classes_of_rid(&self, rid: Rid) -> Result<Vec<RowClass>, MetaError> {
+    pub fn journal_classes_of_rid(&self, rid: Rid) -> Result<Vec<RowCommit>, MetaError> {
         Ok(self
             .journal_rows_of_rid(rid)?
             .into_iter()
@@ -814,10 +954,10 @@ impl Meta {
 
     /// Plan 43 C1-2: `(first journal seq, class)` of the unshipped
     /// transactions that carry `rid`, oldest first.
-    pub fn journal_rows_of_rid(&self, rid: Rid) -> Result<Vec<(u64, RowClass)>, MetaError> {
+    pub fn journal_rows_of_rid(&self, rid: Rid) -> Result<Vec<(u64, RowCommit)>, MetaError> {
         let r = self.db.read_tx();
         let rows = read_journal_txs(&r, self)?;
-        let by_rid: Vec<(u64, RowClass)> = rows
+        let by_rid: Vec<(u64, RowCommit)> = rows
             .iter()
             .filter(|(_, row)| row.rid == Some(rid))
             .map(|(first, row)| (*first, row.class))
@@ -968,15 +1108,32 @@ impl Meta {
     pub fn delegate_rows_for_audit(
         &self,
         gen: u64,
-    ) -> Result<Vec<(u64, RowClass, Option<Rid>)>, MetaError> {
+    ) -> Result<Vec<(u64, RowCommit, Option<Rid>)>, MetaError> {
         let r = self.db.read_tx();
-        let mut rows: Vec<(u64, RowClass, Option<Rid>)> = read_journal_txs(&r, self)?
+        let mut rows: Vec<(u64, RowCommit, Option<Rid>)> = read_journal_txs(&r, self)?
             .into_iter()
             .filter(|(_, row)| row.gen == gen)
             .map(|(_, row)| (row.idx, row.class, row.rid))
             .collect();
         rows.sort_by_key(|(idx, ..)| *idx);
         Ok(rows)
+    }
+
+    /// Testing only (the simulation's row-version oracle): every unretired
+    /// journal transaction, in journal order.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn journal_rows_for_audit(&self) -> Result<Vec<AuditRow>, MetaError> {
+        let r = self.db.read_tx();
+        Ok(read_journal_txs(&r, self)?
+            .into_iter()
+            .map(|(first, row)| AuditRow {
+                first,
+                epoch: row.epoch,
+                gen: row.gen,
+                idx: row.idx,
+                class: row.class,
+            })
+            .collect())
     }
 
     /// Whether a takeover's strand took rows of this node's stream `gen`
@@ -1681,7 +1838,7 @@ impl Meta {
         // (A control row the core journals through the same path — a grant,
         // a recall — carries the class the core set.)
         let _class = (adopted && journal::PendingClass::current().is_none())
-            .then(|| journal::PendingClass::set(RowClass::RootGroup));
+            .then(|| journal::PendingClass::set(RowCommit::ROOT_GROUP));
         // Plan 30 §M12: a grant or a recall changes who may execute
         // what; the root's fast path checks that under the shared side
         // (`Meta::deleg_gate`). Taken before the write transaction, in
@@ -2093,21 +2250,21 @@ mod tests {
     fn a_journal_row_records_its_class_and_the_head_reads_it() {
         use crate::session::SessionState;
         use crate::store::journal::PendingClass;
-        use crate::store::local::{read_journal_tx_heads, RowClass};
+        use crate::store::local::{read_journal_tx_heads, RowCommit};
         let meta = Meta::open_in_memory().unwrap();
         meta.set_holder_epoch(1);
         // Nothing published, nothing set: a lone row.
         create(&meta, 1);
         // The session publishes the gate with a class: the fast path's rows.
         let session: &SessionState = meta.session();
-        session.set_durable(true, 0, false, RowClass::RootGroup, false);
+        session.set_durable(true, 0, false, RowCommit::ROOT_GROUP, false);
         create(&meta, 2);
         // The core's own class wins, scoped to its call.
         {
-            let _c = PendingClass::set(RowClass::Archive);
+            let _c = PendingClass::set(RowCommit::ARCHIVE);
             create(&meta, 3);
             {
-                let _inner = PendingClass::set(RowClass::NonStealable);
+                let _inner = PendingClass::set(RowCommit::FINAL);
                 create(&meta, 4);
             }
             create(&meta, 5);
@@ -2115,23 +2272,23 @@ mod tests {
         create(&meta, 6);
         let r = meta.db.read_tx();
         let heads = read_journal_tx_heads(&r, &meta).unwrap();
-        let classes: Vec<RowClass> = heads.iter().map(|(_, h)| h.class).collect();
+        let classes: Vec<RowCommit> = heads.iter().map(|(_, h)| h.class).collect();
         // (Each create journals one transaction; read the rids' classes.)
         assert_eq!(
             classes,
             vec![
-                RowClass::Lone,
-                RowClass::RootGroup,
-                RowClass::Archive,
-                RowClass::NonStealable,
-                RowClass::Archive,
-                RowClass::RootGroup,
+                RowCommit::LONE,
+                RowCommit::ROOT_GROUP,
+                RowCommit::ARCHIVE,
+                RowCommit::FINAL,
+                RowCommit::ARCHIVE,
+                RowCommit::ROOT_GROUP,
             ]
         );
         // The classes that wait for something are the gated ones (Q12).
-        assert!(RowClass::Archive.gated() && RowClass::RootGroup.gated());
-        assert!(RowClass::DelegGroup.gated());
-        assert!(!RowClass::Lone.gated() && !RowClass::NonStealable.gated());
+        assert!(RowCommit::ARCHIVE.gated() && RowCommit::ROOT_GROUP.gated());
+        assert!(RowCommit::DELEG_GROUP.gated());
+        assert!(!RowCommit::LONE.gated() && !RowCommit::FINAL.gated());
         // Only the fast path's threads fall back to the published class
         // (counted: the core's own thread must never).
         assert_eq!(crate::rows_from_session_on_this_thread(), 3);
@@ -2143,7 +2300,7 @@ mod tests {
         };
         assert_eq!(
             meta.journal_classes_of_rid(rid).unwrap(),
-            vec![RowClass::Archive]
+            vec![RowCommit::ARCHIVE]
         );
     }
 
@@ -2153,11 +2310,11 @@ mod tests {
     #[test]
     fn reclass_rewrites_only_the_class() {
         use crate::store::journal::PendingClass;
-        use crate::store::local::{get_journal_tx, read_journal_txs, RowClass};
+        use crate::store::local::{get_journal_tx, read_journal_txs, RowCommit};
         let meta = Meta::open_in_memory().unwrap();
         meta.set_holder_epoch(1);
         {
-            let _c = PendingClass::set(RowClass::RootGroup);
+            let _c = PendingClass::set(RowCommit::ROOT_GROUP);
             create(&meta, 1);
             create(&meta, 2);
         }
@@ -2168,12 +2325,12 @@ mod tests {
         assert_eq!(before.len(), 2);
         let (first2, row2) = (before[1].0, before[1].1.clone());
         // Any seq the row holds finds it (its last, here).
-        assert!(meta.reclass_journal_tx(row2.last, RowClass::Lone).unwrap());
+        assert!(meta.reclass_journal_tx(row2.last, RowCommit::LONE).unwrap());
         let r = meta.db.read_tx();
         let after = read_journal_txs(&r, &meta).unwrap();
-        assert_eq!(after[0].1.class, RowClass::RootGroup, "the other row");
+        assert_eq!(after[0].1.class, RowCommit::ROOT_GROUP, "the other row");
         let mut expect = row2.clone();
-        expect.class = RowClass::Lone;
+        expect.class = RowCommit::LONE;
         assert_eq!(
             format!("{:?}", get_journal_tx(&r, &meta, first2).unwrap().unwrap()),
             format!("{expect:?}"),
@@ -2181,14 +2338,80 @@ mod tests {
         );
         drop(r);
         // Again: nothing changes.
-        assert!(!meta.reclass_journal_tx(first2, RowClass::Lone).unwrap());
+        assert!(!meta.reclass_journal_tx(first2, RowCommit::LONE).unwrap());
         // A seq past every row finds none.
         assert!(!meta
-            .reclass_journal_tx(row2.last + 100, RowClass::Lone)
+            .reclass_journal_tx(row2.last + 100, RowCommit::LONE)
             .unwrap());
         // A shipped row is gone: a no-op.
         ship_all(&meta, 1);
-        assert!(!meta.reclass_journal_tx(first2, RowClass::Archive).unwrap());
+        assert!(!meta.reclass_journal_tx(first2, RowCommit::ARCHIVE).unwrap());
+    }
+
+    /// Plan 46 M1.1 step 3: a row carries the version of the configuration
+    /// it was journaled under, across a change of configuration: the row
+    /// journaled before the change keeps its version, a row journaled after
+    /// carries the new one, a re-tag changes the rule but not the version
+    /// (a `Final` row has none and takes the re-tag's), and the version
+    /// survives the session's one-word publication.
+    #[test]
+    fn a_rows_version_survives_a_change_of_configuration_and_a_retag() {
+        use crate::store::journal::PendingClass;
+        use crate::store::local::{read_journal_txs, GroupOn, RowCommit};
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_holder_epoch(1);
+        for (n, rule) in [
+            (1, RowCommit::group(7, GroupOn::Root)),
+            (2, RowCommit::group(8, GroupOn::Root)),
+            (3, RowCommit::Singleton { config_version: 9 }),
+            (4, RowCommit::Final),
+        ] {
+            let _c = PendingClass::set(rule);
+            create(&meta, n);
+        }
+        let rows = |meta: &Meta| {
+            let r = meta.db.read_tx();
+            read_journal_txs(&r, meta)
+                .unwrap()
+                .into_iter()
+                .map(|(first, row)| (first, row.class))
+                .collect::<Vec<_>>()
+        };
+        let before = rows(&meta);
+        assert_eq!(
+            before.iter().map(|r| r.1).collect::<Vec<_>>(),
+            vec![
+                RowCommit::group(7, GroupOn::Root),
+                RowCommit::group(8, GroupOn::Root),
+                RowCommit::Singleton { config_version: 9 },
+                RowCommit::Final,
+            ]
+        );
+        // Re-tagged singleton / archive: the rule changes, the version stays.
+        assert!(meta
+            .reclass_journal_tx(before[0].0, RowCommit::LONE)
+            .unwrap());
+        assert!(meta
+            .reclass_journal_tx(before[1].0, RowCommit::ARCHIVE)
+            .unwrap());
+        // A `Final` row has no version: the re-tag's applies.
+        let hold = RowCommit::Singleton { config_version: 11 };
+        assert!(meta.reclass_journal_tx(before[3].0, hold).unwrap());
+        let after: Vec<_> = rows(&meta).into_iter().map(|r| r.1).collect();
+        assert_eq!(
+            after,
+            vec![
+                RowCommit::Singleton { config_version: 7 },
+                RowCommit::group(8, GroupOn::Archive),
+                RowCommit::Singleton { config_version: 9 },
+                RowCommit::Singleton { config_version: 11 },
+            ]
+        );
+        for rule in after.iter().chain([&RowCommit::Final]) {
+            assert_eq!(RowCommit::from_bits(rule.to_bits()), *rule);
+        }
+        meta.session().set_durable(true, 3, false, after[1], false);
+        assert_eq!(meta.session().published_class(), after[1]);
     }
 
     /// `status` (`speculation_counts`, `has_outstanding_speculation`,
@@ -2444,7 +2667,7 @@ mod root_substitution_tests {
         };
         let meta = Meta::open_in_memory().unwrap();
         let mut n = 0;
-        let mut journal = |class: Option<(RowClass, Option<OwnLimits>)>| -> (u64, RowClass) {
+        let mut journal = |class: Option<(RowCommit, Option<OwnLimits>)>| -> (u64, RowCommit) {
             n += 1;
             let _class = class.map(|(c, limits)| match limits {
                 Some(l) => PendingClass::set_own(c, l),
@@ -2475,40 +2698,40 @@ mod root_substitution_tests {
             (idx, take_last_journaled().unwrap().class)
         };
         let lim =
-            |committed, horizon| Some((RowClass::Lone, Some(OwnLimits { committed, horizon })));
+            |committed, horizon| Some((RowCommit::LONE, Some(OwnLimits { committed, horizon })));
         // Committed 0, horizon 2: rows 1 and 2 are within it.
-        assert_eq!(journal(lim(0, 2)), (1, RowClass::Lone));
-        assert_eq!(journal(lim(0, 2)), (2, RowClass::Lone));
+        assert_eq!(journal(lim(0, 2)), (1, RowCommit::LONE));
+        assert_eq!(journal(lim(0, 2)), (2, RowCommit::LONE));
         assert_eq!(meta.delegate_gated_idx(5).unwrap(), 0);
         // Row 3 is past it: it waits for the group, and is the gated mark.
-        assert_eq!(journal(lim(0, 2)), (3, RowClass::DelegGroup));
+        assert_eq!(journal(lim(0, 2)), (3, RowCommit::DELEG_GROUP));
         assert_eq!(meta.delegate_gated_idx(5).unwrap(), 3);
         // A forward's row is the class the core decided, whatever its place,
         // and sets no mark.
         assert_eq!(
-            journal(Some((RowClass::Lone, None))),
-            (4, RowClass::Lone),
+            journal(Some((RowCommit::LONE, None))),
+            (4, RowCommit::LONE),
             "not an own row"
         );
         // Within a horizon that has moved, behind the open row 3: held.
-        assert_eq!(journal(lim(2, 50)), (5, RowClass::DelegGroup));
+        assert_eq!(journal(lim(2, 50)), (5, RowCommit::DELEG_GROUP));
         assert_eq!(meta.delegate_gated_idx(5).unwrap(), 5);
         // Once the prefix covers the mark the row is `Lone` again.
-        assert_eq!(journal(lim(5, 50)), (6, RowClass::Lone));
+        assert_eq!(journal(lim(5, 50)), (6, RowCommit::LONE));
         // A class that waits stays, and a limit that says nothing holds
         // nothing back (the hysteresis and the lead off).
         assert_eq!(
             journal(Some((
-                RowClass::DelegGroup,
+                RowCommit::DELEG_GROUP,
                 Some(OwnLimits {
                     committed: 99,
                     horizon: 99
                 })
             ))),
-            (7, RowClass::DelegGroup)
+            (7, RowCommit::DELEG_GROUP)
         );
         assert_eq!(meta.delegate_gated_idx(5).unwrap(), 7);
-        assert_eq!(journal(lim(u64::MAX, u64::MAX)), (8, RowClass::Lone));
+        assert_eq!(journal(lim(u64::MAX, u64::MAX)), (8, RowCommit::LONE));
         let stats = meta.session().stats();
         assert_eq!(
             (
@@ -2533,9 +2756,9 @@ mod root_substitution_tests {
         };
         let meta = Meta::open_in_memory().unwrap();
         let mut n = 0;
-        let mut journal = |gen: u64, committed: u64, horizon: u64| -> (u64, RowClass) {
+        let mut journal = |gen: u64, committed: u64, horizon: u64| -> (u64, RowCommit) {
             n += 1;
-            let _class = PendingClass::set_own(RowClass::Lone, OwnLimits { committed, horizon });
+            let _class = PendingClass::set_own(RowCommit::LONE, OwnLimits { committed, horizon });
             clear_last_journaled();
             let (_, idx) = meta
                 .delegate_execute(
@@ -2561,7 +2784,7 @@ mod root_substitution_tests {
             (idx, take_last_journaled().unwrap().class)
         };
         // Generation 5's row 1 is past its horizon: gated, open.
-        assert_eq!(journal(5, 0, 0), (1, RowClass::DelegGroup));
+        assert_eq!(journal(5, 0, 0), (1, RowCommit::DELEG_GROUP));
         assert!(meta.delegate_gated_open_elsewhere(6).unwrap());
         assert!(
             !meta.delegate_gated_open_elsewhere(5).unwrap(),
@@ -2569,28 +2792,28 @@ mod root_substitution_tests {
         );
         // Generation 6's own row, within its lead and behind nothing of its
         // own, follows it: it waits for its group too.
-        assert_eq!(journal(6, 0, 50), (1, RowClass::DelegGroup));
+        assert_eq!(journal(6, 0, 50), (1, RowCommit::DELEG_GROUP));
         // The hysteresis off: nothing is held back.
-        assert_eq!(journal(6, u64::MAX, u64::MAX), (2, RowClass::Lone));
+        assert_eq!(journal(6, u64::MAX, u64::MAX), (2, RowCommit::LONE));
         // The core publishes generation 5's row 1 committed: 6 is `Lone`
         // again past its own committed mark, and 5 leaves the open list.
         meta.session().set_deleg_durable(
             5,
             Some(DelegDurable {
-                class: RowClass::Lone,
+                class: RowCommit::LONE,
                 through: 1,
                 horizon: 2,
                 lost: false,
             }),
         );
         assert!(!meta.delegate_gated_open_elsewhere(6).unwrap());
-        assert_eq!(journal(6, 1, 50), (3, RowClass::Lone));
+        assert_eq!(journal(6, 1, 50), (3, RowCommit::LONE));
         let r = meta.db.read_tx();
         assert_eq!(read_gated_open(&r, &meta).unwrap(), vec![6]);
         drop(r);
         // A mark whose row left the journal (stranded with its generation's
         // end, or retired by the log) is not open either.
-        assert_eq!(journal(5, 1, 1), (2, RowClass::DelegGroup));
+        assert_eq!(journal(5, 1, 1), (2, RowCommit::DELEG_GROUP));
         assert!(meta.delegate_gated_open_elsewhere(6).unwrap());
         let r = meta.db.read_tx();
         let first = journal_origins_from(&r, &meta, 5, 2)

@@ -66926,3 +66926,63 @@ timing nondeterminism, not the refactor.
 
 **Gates** (box 1): fmt, clippy `-D warnings` (authority, all targets) clean; authority lib 1,047 passed; release sim suite 407
 passed, 0 failed, 12 ignored.
+
+## Plan 46 M1.1 step 3: rows carry their configuration (2026-11-05)
+
+`RowCommit` replaces `RowClass` in the journal encoding, the replay queue, the member copy, the held rows, the session's
+published rule and the replica trait: `Group { config_version, on }`, `Final` (old `NonStealable`), `Singleton { config_version }`
+(old `Lone`: the replay and the member-copy drop rules read it until M2.1). The core stamps every row from step 2's lookup
+(`PendingClass::set(rule.into())`; a delegate's fast path publishes the rule with its version, the root's too, in one atomic
+word: tag in the top four bits, version in the low sixty), so a row journaled before a change of configuration keeps the old
+version and one after it carries the new one; a re-tag (`reclass_journal_tx`) changes the rule and keeps the version (a `Final` row
+has none and takes the re-tag's). Deviation from the plan's variant, flagged: `Group` also carries `on` (`GroupOn`: the archive,
+the root's group, a delegate's group). The strand (`mark_await_retry_tx` reads an `Archive` row as never answered, a group row only
+by `unanswered`) and the member-copy drop rule (an `Archive` row is dropped at a later epoch's first row, a group row kept), and the
+answer-class maps, still tell them apart; folding them changes the strand's behaviour and the sweeps are to show none. Step 7 deletes
+`on` with `AckClass`. `RowCommit::LONE`, `ARCHIVE`, `ROOT_GROUP`, `DELEG_GROUP`, `FINAL` are the version-0 forms for placeholders
+(member-copy rows built from a backup's tail, queued entries, tests); `versionless()` is what the core tests compare.
+
+*Oracle `row_version_matches_config`* (sim, strict under `strict_commit`, `SWEEP-ROWVERSION-TOTALS`): the sim records every lease
+landing in the bucket (`config_version` per epoch), and each node's new journal rows are judged after the event that wrote them. A
+root row's version must be one a lease of its epoch or an earlier one carried (a takeover re-journals its predecessor's committed tail
+under the predecessor's configuration; a version-0 root row is such an adopted tail, counted not judged); a generation's row is either
+that (the root's append) or at most the highest `DelegGroup` version any store holds. It does not judge equality with the newest version:
+the fast path stamps the rule the core last published, which lags a landing the holder has not read (step 4 compares versions at the
+writer lock). The first draft judged by epoch alone and found 12 of 2,000 `delegated-group-switch` seeds failing (a delegate that is
+also a root journals its own generation's rows under the root's epoch, with the group's version): fixed in the oracle, not the core.
+
+*Knob* `AUTHORITY_SIM_PER_ROW_CLASS=1` (`Config::per_row_class`): a delegate that assesses itself lone stamps `RowCommit::PER_ROW_STAMP`
+(the model's `LONE` stamp) instead of its configuration's version. `+commit`, 300 seeds: `long-delegated` 299 failing (the oracle),
+`delegated-group-switch` 2; with the knob off the same configurations have 0. Test
+`the_row_version_oracle_catches_a_per_row_class` (seeds 3, 4, 5 fail with the knob and pass without) and the unit test
+`row_versions_must_exist_in_the_configurations_history`.
+
+Tests: meta `a_rows_version_survives_a_change_of_configuration_and_a_retag` (versions across a change, re-tags, the one-word publication),
+core `a_row_carries_the_version_of_the_configuration_it_was_journaled_in` (the lease's version stamped, an earlier row keeps its own, the
+published rule follows).
+
+**Sweeps** (box 1, release, `+commit`, seeds 0..1,999, main / branch): `delegated-holder-cut`, `long-delegated`,
+`delegated-root-crash` 0 / 0 failing; `delegated-epoch` 47 / 47, the same seeds (shadow installs, as on main); `delegated-group-switch`
+0 / 0; row-version mismatches 0 on all of them (rows judged 190,000, 290,000, 178,000, 148,000, 464,000). Oracle totals identical but for the
+one-answer naming wobble of step 2.
+
+Also `+commit`, seeds 0..299, main / branch, 19 more configurations (`long-delegated-lead`, `-hysteresis-off`, `-backup`, `-late-answers`,
+`delegated-backup`, `-no-backup-root-near`, `-backup-and-delegate-die`, `-crash`, `-partition`, `-lone-s3-cut`, `-two-gens-root-crash`,
+`-two-gens-one-backed`, `-root-gone`, `-delegate-restart`, `-core-stall-root-lease6`, `placement-hot`, `far`, `long-backup`,
+`locks-long-grants`): the same failing sets (only the known `-core-stall-root-lease6` 37 / 37 and the lead-off control's 6 / 6), row-version
+mismatches 0.
+
+**Gates** (box 1): fmt, clippy `-D warnings` (meta, authority, engine, all targets) clean; meta 395, authority lib 1,048, engine lib
+951 passed; the release sim suite 409 passed, 0 failed, 12 ignored.
+
+**Performance gate** (box 3, quiet, release builds of main `34654759` = A and this commit = B, built on the box; `bench/commit-rule/g1-abba.sh`
+A B B A, state dirs on each file system). `ack-latency` topology 1 (the lone root's own ops, the fast path that stamps rows): p50, B / A, over
+52 runs per variant (12 + 40 rounds, 300 samples) per file system: ext4 chmod 1.05, create 0.97, rename 1.01, unlink 0.98, write 1.00; xfs 1.04, 1.02,
+1.05, 0.97, 1.00; btrfs 0.86, 1.02, 0.98, 0.93, 1.00 (p90 0.96 to 1.03 but chmod 0.86); tmpfs 1.13, 1.02, 1.18, 1.14, 1.00 in that batch, which
+had one noisy window (rounds 21 to 30 of the 40: B/A 1.2 to 1.4 for every op; 0.94 to 1.09 in the other blocks of ten), and on a rerun of 60 rounds on tmpfs
+0.99 create, 1.00 rename, 1.00 unlink, 1.01 chmod, 1.02 write (p90 0.96 to 1.08). The ops are 35 to 90 us and the runs bimodal (64 to 70 us or 100 us
+for the same op), so a single batch of fewer than about 50 runs can show 10 % either way; no direction survives the larger samples, and `write` (4 KiB
+and `fsync`) is within 0.2 % on ext4, xfs, btrfs. Topology 2 (backup; 4 runs per variant, ext4 xfs btrfs tmpfs): holder and forwarded ops
+B / A p50 0.96 to 1.14, p90 0.93 to 1.25, with no direction. `vfs-bench` (dispatch overhead and allocations per op, three runs each, A B B A A B): overhead 97 / 98 ns
+(`mock/getattr`, A / B), 98 / 94 (`lookup`), 98 / 98 (`read`), 84 / 84 (`observer`), 97 / 94, 114 / 78, 96 / 97 (`view` getattr, lookup, read); allocations per op
+identical; the target (under 1 us) holds. The journal row grows by 2 bytes for a small version (tag, varint, `on`), 9 at most.

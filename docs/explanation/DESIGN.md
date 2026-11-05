@@ -639,9 +639,11 @@ renamed for the vocabulary.
 
 ### Local store
 
-(Each journal row records the class its answer waits for, `RowClass`, decided
-when the row is journaled; a row answered without a commit is re-tagged
-`Lone`; plan 43 C1-2. A holder sealed by a claimant keeps its unshipped
+(Each journal row records the commit rule it was written under and the
+version of the configuration in force, `RowCommit` — `Group { config_version, on }` (`on`: what
+the group waits on, until plan 46 step 7), `Final`, or `Singleton { config_version }` — stamped when the row is journaled
+from the one lookup of the configuration (`Core::rule_of`); a row answered
+without a commit is re-tagged `Singleton`; plan 43 C1-2, plan 46 M1.1. A holder sealed by a claimant keeps its unshipped
 rows in the `member_copy` part of the backup keyspace, apart from the tail it
 holds as a backup; C1-3.)
 

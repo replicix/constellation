@@ -1258,6 +1258,10 @@ pub struct Report {
     /// whose row is tagged with another class than the answer names
     /// (fails under `strict_commit`).
     pub class_claim_mismatch: usize,
+    /// Plan 46 M1.1 step 3: rows whose version is not their configuration's
+    /// (`row_version_matches_config`), and how many rows were judged.
+    pub row_version_mismatch: usize,
+    pub row_versions_checked: usize,
     pub acks_unsourced: usize,
     pub unjournaled_landed: usize,
     /// Answers with no recorded request (must be 0).
@@ -5898,6 +5902,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.unverified_relays = found.unverified_relays;
     report.class_mismatch = found.class_mismatch;
     report.class_claim_mismatch = found.class_claim.len();
+    report.row_version_mismatch = found.row_version.len();
+    report.row_versions_checked = oracles.row_versions.lock().unwrap().checked;
     report.unjournaled_landed = found.unjournaled_landed.len();
     report.acks_unsourced = oracles
         .acks_unsourced
@@ -5948,6 +5954,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     for (strict, what, list) in [
         (cfg.strict_commit, "I1", &found.i1),
         (cfg.strict_commit, "class claim", &found.class_claim),
+        (cfg.strict_commit, "row version", &found.row_version),
         // Plan 43 C1-4: a durable acknowledgement policy is a commit: its
         // rows are never queued twice (I2 (b), for rows standing for a
         // committed answer), complete verbatim (I2 (c)), and are rolled back

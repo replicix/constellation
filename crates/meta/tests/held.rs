@@ -856,7 +856,7 @@ fn chmod(ino: Ino, mode: u32) -> MutateOp {
 /// around its call).
 fn exec_as(
     meta: &Meta,
-    class: constellation_meta::RowClass,
+    class: constellation_meta::RowCommit,
     rid: constellation_meta::Rid,
     op: &MutateOp,
 ) {
@@ -897,7 +897,13 @@ fn node_one_with_a_seed() -> (Meta, Ino) {
 /// had.
 #[test]
 fn drop_held_marks_remote_rows_await_retry() {
-    use constellation_meta::RowClass::{Archive, Lone, RootGroup};
+    use constellation_meta::RowCommit;
+    #[allow(non_upper_case_globals)]
+    const Archive: RowCommit = RowCommit::ARCHIVE;
+    #[allow(non_upper_case_globals)]
+    const Lone: RowCommit = RowCommit::LONE;
+    #[allow(non_upper_case_globals)]
+    const RootGroup: RowCommit = RowCommit::ROOT_GROUP;
     let (meta, broken) = node_one_with_a_seed();
     // Another node's unanswered rows: gated by the archive, which a held
     // (unshipped) row never reaches.
@@ -981,7 +987,11 @@ fn drop_held_marks_remote_rows_await_retry() {
 /// dependents of a remote row behind it.
 #[test]
 fn drop_held_keeps_dependents_in_journal_order() {
-    use constellation_meta::RowClass::{Archive, Lone};
+    use constellation_meta::RowCommit;
+    #[allow(non_upper_case_globals)]
+    const Archive: RowCommit = RowCommit::ARCHIVE;
+    #[allow(non_upper_case_globals)]
+    const Lone: RowCommit = RowCommit::LONE;
     let (meta, broken) = node_one_with_a_seed();
     let rename = MutateOp::Rename {
         parent: ROOT_INO,
@@ -1056,7 +1066,9 @@ fn drop_held_keeps_dependents_in_journal_order() {
 /// is a new generation.
 #[test]
 fn the_queue_snapshot_is_cached_and_every_change_invalidates_it() {
-    use constellation_meta::RowClass::Archive;
+    use constellation_meta::RowCommit;
+    #[allow(non_upper_case_globals)]
+    const Archive: RowCommit = RowCommit::ARCHIVE;
     use std::sync::Arc;
     let (meta, broken) = node_one_with_a_seed();
     assert!(meta.queue_snapshot().unwrap().is_empty());
@@ -1104,7 +1116,9 @@ fn the_queue_snapshot_is_cached_and_every_change_invalidates_it() {
 /// behind the queue); one on other keys does.
 #[test]
 fn the_fast_path_refuses_an_op_on_keys_the_queue_holds() {
-    use constellation_meta::RowClass::Archive;
+    use constellation_meta::RowCommit;
+    #[allow(non_upper_case_globals)]
+    const Archive: RowCommit = RowCommit::ARCHIVE;
     let (meta, broken) = node_one_with_a_seed();
     let other = meta.create(ROOT_INO, "other", 0o644, 0, 0).unwrap().ino;
     exec_as(&meta, Archive, rid_of(7, 1), &chmod(broken, 0o600));
@@ -1126,7 +1140,9 @@ fn the_fast_path_refuses_an_op_on_keys_the_queue_holds() {
 #[test]
 fn a_read_of_a_sibling_under_a_placeholders_shared_parent_is_not_blocked() {
     use constellation_meta::ReadKey;
-    use constellation_meta::RowClass::Archive;
+    use constellation_meta::RowCommit;
+    #[allow(non_upper_case_globals)]
+    const Archive: RowCommit = RowCommit::ARCHIVE;
     let (meta, broken) = node_one_with_a_seed();
     let rename = MutateOp::Rename {
         parent: ROOT_INO,
@@ -1173,7 +1189,9 @@ fn a_read_of_a_sibling_under_a_placeholders_shared_parent_is_not_blocked() {
 /// `chmod` of that inode waits behind it.
 #[test]
 fn a_placeholder_holds_the_keys_its_row_wrote_not_only_the_ones_it_names() {
-    use constellation_meta::RowClass::Archive;
+    use constellation_meta::RowCommit;
+    #[allow(non_upper_case_globals)]
+    const Archive: RowCommit = RowCommit::ARCHIVE;
     let (meta, broken) = node_one_with_a_seed();
     let unlink = MutateOp::Unlink {
         parent: ROOT_INO,
@@ -1201,7 +1219,9 @@ fn a_placeholder_holds_the_keys_its_row_wrote_not_only_the_ones_it_names() {
 /// and forgets the entry; nobody is going to retry what completed.
 #[test]
 fn a_remote_row_the_log_completed_is_not_a_placeholder() {
-    use constellation_meta::RowClass::Archive;
+    use constellation_meta::RowCommit;
+    #[allow(non_upper_case_globals)]
+    const Archive: RowCommit = RowCommit::ARCHIVE;
     let (meta, broken) = node_one_with_a_seed();
     exec_as(&meta, Archive, rid_of(7, 1), &chmod(broken, 0o600));
     exec_as(&meta, Archive, rid_of(7, 2), &chmod(broken, 0o640));
@@ -1344,7 +1364,9 @@ fn a_drop_keeps_the_pending_row_of_a_chunk_a_write_session_names() {
 /// copy: it keeps nothing held.
 #[test]
 fn an_op_the_drop_rolled_back_does_not_keep_its_chunk() {
-    use constellation_meta::RowClass::Lone;
+    use constellation_meta::RowCommit;
+    #[allow(non_upper_case_globals)]
+    const Lone: RowCommit = RowCommit::LONE;
     let meta = Meta::open_in_memory().unwrap();
     meta.set_node_prefix(1).unwrap();
     meta.set_holder_epoch(1);
@@ -1393,7 +1415,9 @@ fn an_op_the_drop_rolled_back_does_not_keep_its_chunk() {
 /// its chunk held like any other (`exclude_rolled_back: false`).
 #[test]
 fn an_op_the_drop_rolled_back_keeps_its_chunk_when_the_refusal_will_not_ship() {
-    use constellation_meta::RowClass::Lone;
+    use constellation_meta::RowCommit;
+    #[allow(non_upper_case_globals)]
+    const Lone: RowCommit = RowCommit::LONE;
     for (exclude, kept) in [(true, false), (false, true)] {
         let meta = Meta::open_in_memory().unwrap();
         meta.set_node_prefix(1).unwrap();

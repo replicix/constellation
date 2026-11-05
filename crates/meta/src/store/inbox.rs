@@ -96,7 +96,7 @@ pub struct OutcomeRow {
     pub gen: u64,
     pub idx: u64,
     /// The class the row was journaled under.
-    pub class: super::local::RowClass,
+    pub class: super::local::RowCommit,
 }
 
 fn decode_outcome(v: &[u8]) -> Result<CompletedOutcome, MetaError> {

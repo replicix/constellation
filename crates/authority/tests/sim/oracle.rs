@@ -90,6 +90,8 @@ pub struct Oracles {
     /// Nodes whose core holds a continuation epoch right now: the core
     /// counts their journal as a copy until plan 46 M1.4.
     pub epoch_holds: Mutex<BTreeSet<NodeId>>,
+    /// Plan 46 M1.1 step 3: the row-version oracle (see [`RowVersions`]).
+    pub row_versions: Arc<Mutex<RowVersions>>,
     /// Plan 46 M0.3: the run's reachability history (see `reach.rs`), the
     /// op each rid submitted (to find the delegate of its keys), and every
     /// unsettled `EIO` with what the history says of it.
@@ -242,7 +244,7 @@ impl LoneLead {
         &mut self,
         node: NodeId,
         gen: u64,
-        rows: &[(u64, constellation_meta::RowClass, Option<Rid>)],
+        rows: &[(u64, constellation_meta::RowCommit, Option<Rid>)],
         committed: u64,
         lead: u64,
     ) {
@@ -261,7 +263,7 @@ impl LoneLead {
                 if *idx > committed && open_gated.is_none() {
                     open_gated = Some(*idx);
                 }
-            } else if *class == constellation_meta::RowClass::Lone {
+            } else if class.is_singleton() {
                 // Judged the once, when it first shows.
                 if !self.lone_rows_seen.insert(key) {
                     continue;
@@ -311,7 +313,9 @@ impl Oracles {
         let reach = bucket.reach();
         let epoch_backups: Arc<Mutex<BTreeMap<u64, Vec<NodeId>>>> = Arc::default();
         let epoch_backups_hook = epoch_backups.clone();
+        let row_versions: Arc<Mutex<RowVersions>> = Arc::default();
         {
+            let row_versions = row_versions.clone();
             let leases = leases.clone();
             let reach = reach.clone();
             bucket.set_lease_hook(Arc::new(move |node, prev, new| {
@@ -319,6 +323,10 @@ impl Oracles {
                     .lock()
                     .unwrap()
                     .insert(new.epoch, new.backups.clone());
+                row_versions
+                    .lock()
+                    .unwrap()
+                    .lease_landed(new.epoch, new.config_version);
                 reach.lease_landed(
                     new.holder,
                     new.released,
@@ -356,6 +364,7 @@ impl Oracles {
             appended: Mutex::new(HashMap::new()),
             epoch_backups,
             epoch_holds: Mutex::new(BTreeSet::new()),
+            row_versions,
             acks_unsourced: AtomicU64::new(0),
         })
     }
@@ -883,14 +892,38 @@ pub fn answer_treatment(source: Option<constellation_authority::AnswerSource>) -
 /// the core says so, D4). `rows`: the classes of the answerer's unshipped
 /// transactions of the rid; `delegated`: the row is a delegate's or the
 /// root's copy of one (`Lone` until C2/C3 move them: not compared).
+/// Whether the row's rule is the answer class `c`'s (the version aside).
+fn row_is_class(row: constellation_meta::RowCommit, c: AckClass) -> bool {
+    use constellation_authority::core::GroupOn;
+    use constellation_meta::RowCommit;
+    match c {
+        AckClass::Lone => row.is_singleton(),
+        AckClass::Archive => row.is_archive(),
+        AckClass::RootGroup => matches!(
+            row,
+            RowCommit::Group {
+                on: GroupOn::Root,
+                ..
+            }
+        ),
+        AckClass::DelegGroup { .. } => matches!(
+            row,
+            RowCommit::Group {
+                on: GroupOn::Delegate,
+                ..
+            }
+        ),
+        AckClass::NonStealable => row.is_final(),
+    }
+}
+
 pub fn check_claim(
     claim: Option<AckClass>,
     committed: Option<bool>,
     judged: Option<AckClass>,
-    rows: &[constellation_meta::RowClass],
+    rows: &[constellation_meta::RowCommit],
     delegated: bool,
 ) -> Option<String> {
-    use constellation_meta::RowClass;
     let gated = match (claim, committed) {
         (Some(c), _) => c.gated(),
         (None, Some(c)) => c,
@@ -908,7 +941,7 @@ pub fn check_claim(
     }
     let ok = match claim {
         Some(AckClass::DelegGroup { .. }) => true,
-        Some(c) => rows.contains(&RowClass::from(c)),
+        Some(c) => rows.iter().any(|r| row_is_class(*r, c)),
         None => rows.iter().any(|r| r.gated() == gated),
     };
     (!ok).then(|| {
@@ -1421,6 +1454,94 @@ fn deleg_group(
     }
 }
 
+/// Plan 46 M1.1 step 3: `row_version_matches_config`, the sim's form of the
+/// model property. A journal row carries the version of the configuration
+/// its rule was looked up in: a root row (a lease epoch) the `config_version`
+/// of a lease object that epoch carried, or an earlier epoch (a takeover
+/// re-journals its predecessor's committed tail under the predecessor's
+/// configuration; the oracle records every lease landing in the bucket), a
+/// delegate's row (a generation) a `DelegGroup`
+/// version some store knows. The version is the one the node's core had
+/// applied when it journaled, which may lag what the stores say (a landing
+/// the holder has not read yet, a published rule the fast path stamped): so
+/// the sim judges that the version *exists* in the configuration's history,
+/// not that it is the newest. A row stamped from anything else (the mutable
+/// "peer in budget" assessment: the `per_row_class` control) has none.
+/// A root row of version 0 is unstamped (a takeover's adopted tail, which
+/// the predecessor's configuration committed): counted, not judged.
+#[derive(Debug, Default)]
+pub struct RowVersions {
+    /// Every `config_version` a lease object carried, per epoch.
+    lease: BTreeMap<u64, BTreeSet<u64>>,
+    /// The highest journal seq judged per node.
+    judged_to: BTreeMap<NodeId, u64>,
+    pub checked: usize,
+    pub unstamped: usize,
+    pub violations: Vec<String>,
+}
+
+impl RowVersions {
+    pub fn lease_landed(&mut self, epoch: u64, version: u64) {
+        self.lease.entry(epoch).or_default().insert(version);
+    }
+
+    /// `node`'s journal was wiped: its seqs start again.
+    pub fn forget(&mut self, node: NodeId) {
+        self.judged_to.remove(&node);
+    }
+
+    /// Judge the rows of `node`'s journal that are new since the last call
+    /// (`rows`: `Meta::journal_rows_for_audit`), `group_max(gen)` being the
+    /// highest `DelegGroup` version any store holds for `gen`.
+    pub fn judge(
+        &mut self,
+        node: NodeId,
+        rows: &[constellation_meta::AuditRow],
+        group_max: &dyn Fn(u64) -> u64,
+    ) {
+        let from = self.judged_to.get(&node).copied().unwrap_or(0);
+        for row in rows.iter().filter(|r| r.first > from) {
+            let (seq, epoch, gen, idx, class) = (row.first, row.epoch, row.gen, row.idx, row.class);
+            self.judged_to.insert(node, seq);
+            let Some(v) = class.config_version() else {
+                continue;
+            };
+            if epoch != 0 && gen == 0 && v == 0 {
+                self.unstamped += 1;
+                continue;
+            }
+            self.checked += 1;
+            let of_a_lease =
+                epoch != 0 && self.lease.range(..=epoch).any(|(_, vs)| vs.contains(&v));
+            if gen == 0 {
+                if !of_a_lease {
+                    self.violations.push(format!(
+                        "row_version_matches_config: node {node} journal seq {seq} (epoch {epoch}) \
+                         carries version {v}, which no lease of the epoch or an earlier one \
+                         carried ({:?})",
+                        self.lease.range(..=epoch).collect::<Vec<_>>()
+                    ));
+                }
+            } else {
+                // A generation's row: its own node's execution (the
+                // delegation's group version) or the root's append of it (the
+                // lease's), the same journal holding both when a delegate is
+                // also a root.
+                let max = group_max(gen);
+                if !of_a_lease && v > max {
+                    self.violations.push(format!(
+                        "row_version_matches_config: node {node} journal seq {seq} (epoch {epoch}, \
+                         stream ({gen},{idx})) carries version {v}: no lease of the epoch or an \
+                         earlier one carried it ({:?}) and it is above the highest group version \
+                         any store holds for the generation ({max})",
+                        self.lease.range(..=epoch).collect::<Vec<_>>()
+                    ));
+                }
+            }
+        }
+    }
+}
+
 /// The class the core would be expected to give the answer (plan §5.1's
 /// table), from the answerer's state.
 fn expected_class(
@@ -1639,6 +1760,9 @@ pub struct Findings {
     /// Plan 43 C1-2: answers whose class claim is not borne out
     /// (`strict_commit` fails the run on one).
     pub class_claim: Vec<String>,
+    /// Plan 46 M1.1 step 3: rows whose version is not their configuration's
+    /// (`strict_commit` fails the run on one).
+    pub row_version: Vec<String>,
     /// I2 (b): one description per rid queued on two nodes (a copy standing
     /// for a committed answer).
     pub i2: Vec<String>,
@@ -1660,6 +1784,7 @@ impl Findings {
         [
             &self.i1,
             &self.class_claim,
+            &self.row_version,
             &self.i2,
             &self.i2c,
             &self.i4,
@@ -1721,6 +1846,7 @@ pub fn end_of_run(
     let mut f = Findings {
         i1: o.i1_violations.lock().unwrap().clone(),
         class_claim: o.claim_violations.lock().unwrap().clone(),
+        row_version: o.row_versions.lock().unwrap().violations.clone(),
         i6: o.leases.violations.lock().unwrap().clone(),
         ..Findings::default()
     };
@@ -3068,6 +3194,53 @@ mod tests {
         let j = w.judge(2, &st, r);
         assert_eq!(j.class, None, "{}", j.detail);
         assert!(j.detail.contains("no backup"), "{}", j.detail);
+    }
+
+    /// Plan 46 M1.1 step 3: a row's version must exist in its configuration's
+    /// history: a lease version of its epoch, a `DelegGroup` version some
+    /// store holds. The `per_row_class` stamp and an unknown lease version
+    /// are violations; a root row of version 0 (an adopted tail) is
+    /// unstamped, not judged; a row is judged once.
+    #[test]
+    fn row_versions_must_exist_in_the_configurations_history() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let mut rv = RowVersions::default();
+        rv.lease_landed(3, 5);
+        rv.lease_landed(3, 6);
+        let row = |first, epoch, gen, idx, class| constellation_meta::AuditRow {
+            first,
+            epoch,
+            gen,
+            idx,
+            class,
+        };
+        let rows = vec![
+            row(1, 3, 0, 0, RowCommit::group(5, GroupOn::Root)),
+            row(2, 3, 0, 0, RowCommit::Singleton { config_version: 6 }),
+            row(3, 3, 0, 0, RowCommit::group(0, GroupOn::Root)),
+            row(4, 0, 7, 1, RowCommit::group(2, GroupOn::Delegate)),
+            row(5, 0, 7, 2, RowCommit::Final),
+            row(
+                6,
+                0,
+                7,
+                3,
+                RowCommit::Singleton {
+                    config_version: RowCommit::PER_ROW_STAMP,
+                },
+            ),
+            row(7, 3, 0, 0, RowCommit::group(9, GroupOn::Root)),
+            // An earlier epoch's configuration (an adopted tail): judged ok.
+            row(8, 4, 0, 0, RowCommit::group(5, GroupOn::Root)),
+        ];
+        let group_max = |gen: u64| if gen == 7 { 2 } else { 0 };
+        rv.judge(1, &rows, &group_max);
+        assert_eq!(rv.violations.len(), 2, "{:?}", rv.violations);
+        assert!(rv.violations[0].contains("seq 6"), "{:?}", rv.violations);
+        assert!(rv.violations[1].contains("seq 7"), "{:?}", rv.violations);
+        assert_eq!((rv.checked, rv.unstamped), (6, 1));
+        rv.judge(1, &rows, &group_max);
+        assert_eq!(rv.violations.len(), 2, "judged once");
     }
 
     /// An epoch hold's journal counts as the root's copy until plan 46 M1.4
