@@ -5,7 +5,11 @@
 //! chunk 3: reconfiguration under old ∪ new; chunk 4: subtree sets,
 //! release, recall as a request (and the §9 verdict: one cut per stream);
 //! chunk 5: per-key linearizability and the causal cut; chunk 6: the end
-//! of a placed grant, C3's verbatim re-ship, L1 and L2b. The design's
+//! of a placed grant, C3's verbatim re-ship, L1 and L2b; chunk 7: sticky
+//! grants, the abandon and ADR-43's no-tail orphan rule; chunk 8: the
+//! singleton, `first_peer_join` (the roster's journaled bump) and the
+//! root's own sticky grants; chunk 9: settlement (I4), S4 and no server
+//! queue (I2(b)). The design's
 //! topologies are explored exhaustively under a state cap and a timeout,
 //! with every `always` property the model registers checked and every
 //! `sometimes` witness required (non-vacuity); each planted bug (a knob)
@@ -45,10 +49,12 @@ const CAP_DEEP: (usize, Duration) = (20_000_000, Duration::from_secs(1800));
 const GENERATED: usize = 4;
 
 /// Properties checked as an event (a `Violation` in the state).
-const EVENTS: [&str; 3] = [
+const EVENTS: [&str; 5] = [
     "ack_implies_committed_by_config",
     "recall_safety",
     "two_subtrees_one_order",
+    "no_lone_answer_with_peer",
+    "settle_after_reads_recalled",
 ];
 
 /// `/a`, `/b`, `/D1/a`, `/D1/b`, `/D2/a`, `/D2/b`.
@@ -908,4 +914,438 @@ fn c6_knob_no_reappend_is_found() {
     let mut m = c6_t4_claim();
     m.no_reappend = true;
     assert_finds_within("c6-t4+no_reappend", &m, "acked_at_or_below_cut", CAP_LARGE);
+}
+
+// ======== chunk 7: sticky grants, abandon, ADR-43's no-tail proof
+
+fn sticky(node: u8, dirs: u8) -> NodeGrant {
+    NodeGrant {
+        node,
+        dirs,
+        kind: GrantKind::Sticky,
+        backups: 0,
+    }
+}
+
+/// C7-T1, the sticky lifecycle: node 1 holds `/D1` sticky (final, no
+/// group) and node 2 holds `/D2` placed (group `{delegate, root}`). The
+/// root forwards `/D1/b` to the holder; the holder creates `/D1/a`; node 2
+/// creates `/D2/a`. The holder may release (only once drained: the root
+/// has appended through its last row), and the operator may abandon the
+/// sticky stream (at most once, at any time: a holder lost to the root may
+/// still be answering).
+fn c7_t1() -> NodeStreamModel {
+    NodeStreamModel::design(vec![
+        vec![create(D1B)],
+        vec![create(D1A)],
+        vec![create(D2A)],
+    ])
+    .with_grant(sticky(1, D1))
+    .with_grant(placed(2, D2, 0))
+    .with_stream_release(1)
+    .with_abandon(1)
+}
+
+/// C7-T1 with one crash and no placed grant: the holder lost mid-write
+/// blocks its subtree until the operator abandons it (or another node
+/// crashes).
+fn c7_t1_crash() -> NodeStreamModel {
+    NodeStreamModel::design(vec![vec![create(D1B)], vec![create(D1A)], vec![]])
+        .with_grant(sticky(1, D1))
+        .with_stream_release(1)
+        .with_abandon(1)
+        .with_faults(1, 0)
+}
+
+/// C7-T2, ADR-43's orphan rule against a sticky grant: the root (no
+/// backup) mints node 1's sticky grant on `/D1` at run time (its
+/// `DelegateNode` record); node 2 writes `/a` and may claim the lease from
+/// the archive alone (a no-tail marker), which ends every number of the
+/// deposed tenure's epoch its journal does not list.
+fn c7_t2() -> NodeStreamModel {
+    NodeStreamModel::design(vec![vec![], vec![create(D1A)], vec![create(RA)]])
+        .with_grant(sticky(1, 0))
+        .with_grow(1, D1)
+        .with_faults(0, 1)
+}
+
+/// C7-T3, a grant minted in epoch e honoured by e + 1: the root (backed by
+/// node 2) mints node 1's sticky grant (`/D1`) and grows it (`/D2`), each
+/// possibly in the next tenure (a later tenure journals a record for an
+/// older number); node 2 writes `/a` and claims with the tail. Node 1
+/// writes `/D2/a`.
+fn c7_t3() -> NodeStreamModel {
+    NodeStreamModel::design(vec![vec![], vec![create(D2A)], vec![create(RA)]])
+        .with_root_backups(1 << 2)
+        .with_grant(sticky(1, 0))
+        .with_grow(1, D1)
+        .with_grow(1, D2)
+        .with_faults(0, 1)
+}
+
+/// C7-T3 deep: four nodes, two depositions: node 2 claims with the tail
+/// (its lone tenure inherits it), node 3 then claims from the archive (a
+/// no-tail marker whose orphan rule covers the second tenure's numbers
+/// only); node 1 writes `/D1/a`, node 3 writes `/a`.
+fn c7_t3_deep() -> NodeStreamModel {
+    NodeStreamModel::design(vec![vec![], vec![create(D1A)], vec![], vec![create(RA)]])
+        .with_root_backups(1 << 2)
+        .with_grant(sticky(1, 0))
+        .with_grow(1, D1)
+        .with_faults(0, 2)
+}
+
+/// C7-T4, a handover: node 1 holds `/D1` sticky, node 2 writes into it
+/// (forwarded, answered final by the holder) until the holder releases
+/// (the root's request for the dominant writer, abstracted to the
+/// release's guard) and the root grants `/D1` to node 2 (a `DelegateNode`
+/// record minting node 2's sticky grant).
+fn c7_t4() -> NodeStreamModel {
+    NodeStreamModel::design(vec![vec![], vec![create(D1A)], vec![create(D1B)]])
+        .with_grant(sticky(1, D1))
+        .with_grant(sticky(2, 0))
+        .with_stream_release(1)
+        .with_grow(2, D1)
+}
+
+/// C7-T5, a designation (`designation_final` re-proved): node 1 holds
+/// `/D1` designated; the root forwards into it; the holder may release
+/// (`online`); one crash.
+fn c7_t5() -> NodeStreamModel {
+    NodeStreamModel::design(vec![vec![create(D1B)], vec![create(D1A)]])
+        .with_grant(NodeGrant {
+            node: 1,
+            dirs: D1,
+            kind: GrantKind::Designated,
+            backups: 0,
+        })
+        .with_stream_release(1)
+        .with_faults(1, 0)
+}
+
+#[test]
+fn c7_design_t1_sticky_release_abandon() {
+    assert_clean_within("c7-t1", &c7_t1(), CAP_LARGE);
+}
+
+#[test]
+fn c7_design_t1_crash_abandon() {
+    assert_clean_within("c7-t1-crash", &c7_t1_crash(), CAP_LARGE);
+}
+
+#[test]
+fn c7_design_t2_orphan_rule_no_tail_claim() {
+    assert_clean_within("c7-t2", &c7_t2(), CAP_LARGE);
+}
+
+#[test]
+fn c7_design_t3_minted_in_e_honoured_by_e_plus_1() {
+    assert_clean_within("c7-t3", &c7_t3(), CAP_LARGE);
+}
+
+#[test]
+#[ignore = "large: run with --include-ignored (release)"]
+fn c7_design_t3_deep_two_claims() {
+    assert_clean_within("c7-t3-deep", &c7_t3_deep(), CAP_DEEP);
+}
+
+#[test]
+fn c7_design_t4_handover() {
+    assert_clean_within("c7-t4", &c7_t4(), CAP_LARGE);
+}
+
+#[test]
+fn c7_design_t5_designation_final() {
+    assert_clean_within("c7-t5", &c7_t5(), CAP_LARGE);
+}
+
+/// The TTL reclaims the sticky grant: the end has neither the holder's
+/// release nor the operator's abandon, and (with that oracle's event
+/// passed) the cut drops a final answer, uncounted (I5).
+#[test]
+fn c7_knob_ttl_reclaims_sticky_is_found() {
+    let mut m = c7_t1();
+    m.ttl_reclaims_sticky = true;
+    assert_finds_within(
+        "c7-t1+ttl_reclaims_sticky",
+        &m,
+        "sticky_ends_only_by_holder_or_operator",
+        CAP_LARGE,
+    );
+    assert_finds_within(
+        "c7-t1+ttl_reclaims_sticky+i5",
+        &m,
+        "rollback_only_singleton_or_operator",
+        CAP_LARGE,
+    );
+    let mut m = c7_t5();
+    m.ttl_reclaims_sticky = true;
+    assert_finds_within(
+        "c7-t5+ttl_reclaims_sticky",
+        &m,
+        "designation_final",
+        CAP_LARGE,
+    );
+}
+
+/// The holder releases before the root has appended through its last row
+/// (the release names the cut it knows): an answered final row lies past
+/// the cut, a rollback no operator or singleton event counts.
+#[test]
+fn c7_knob_holder_releases_before_drain_is_found() {
+    let mut m = c7_t1();
+    m.holder_releases_before_drain = true;
+    assert_finds_within(
+        "c7-t1+holder_releases_before_drain",
+        &m,
+        "rollback_only_singleton_or_operator",
+        CAP_LARGE,
+    );
+    assert_finds_within(
+        "c7-t1+holder_releases_before_drain+cut",
+        &m,
+        "acked_at_or_below_cut",
+        CAP_LARGE,
+    );
+}
+
+/// The sticky holder answers once the grant's record is in the root's
+/// journal, before it is committed (the archive, for a root with no
+/// backup): the root is deposed before shipping, the claimant's no-tail
+/// marker proves the number never granted, and the orphan rule ends a
+/// grant that answered (and I5 counts the rollback).
+#[test]
+fn c7_knob_sticky_answers_before_grant_committed_is_found() {
+    let mut m = c7_t2();
+    m.sticky_answers_before_grant_committed = true;
+    // `recall_safety` finds the early honour by definition; off, the harm.
+    m.check_recall = false;
+    assert_finds_within(
+        "c7-t2+sticky_answers_before_grant_committed",
+        &m,
+        "orphan_rule_never_ends_an_answering_grant",
+        CAP_LARGE,
+    );
+    assert_finds_within(
+        "c7-t2+sticky_answers_before_grant_committed+i5",
+        &m,
+        "rollback_only_singleton_or_operator",
+        CAP_LARGE,
+    );
+}
+
+// ======== chunk 8: the root's own sticky grants, the singleton, first_peer_join
+
+/// C8-T1, `first_peer_join`: node 0 is a singleton (node 1 not in the
+/// roster) and answers `/a`, `/b` from its disk; node 1 joins, the root
+/// sees the roster (and journals the lease's `config_version` bump), node
+/// 1 unlinks `/a` (forwarded); node 1 may claim the lease from the archive
+/// (the singleton's death-then-join: its unshipped answered rows are
+/// exported, Q6).
+fn c8_t1() -> NodeStreamModel {
+    NodeStreamModel::design(vec![vec![create(RA), create(RB)], vec![unlink(RA)]])
+        .with_roster(1, 1 << 1, 0)
+        .with_faults(0, 1)
+}
+
+/// C8-T2, the root's own sticky grant: two peers, the root with no group
+/// takes a sticky grant on `/D1` (never `/`), committed by the archive; its
+/// ops in `/D1` are final at local speed, `/a` waits for the archive; node
+/// 1 writes `/b` then `/D1/b` (forwarded to the root's grant); node 1 may
+/// claim the lease (the root's sticky subtree then blocks).
+fn c8_t2() -> NodeStreamModel {
+    NodeStreamModel::design(vec![
+        vec![create(D1A), create(RA)],
+        vec![create(RB), create(D1B)],
+    ])
+    .with_grant(sticky(0, 0))
+    .with_grow(1, D1)
+    .with_faults(0, 1)
+}
+
+/// C8-T3, peer → singleton: node 1 is in the roster and may leave (and
+/// join again); the root journals the bump to the singleton when it sees
+/// the departure and answers alone once the bump is committed (the
+/// archive); node 1 unlinks `/a` and may claim after its return.
+fn c8_t3() -> NodeStreamModel {
+    NodeStreamModel::design(vec![vec![create(RA), create(RB)], vec![unlink(RA)]])
+        .with_roster(0b11, 1 << 1, 1 << 1)
+        .with_faults(0, 1)
+}
+
+#[test]
+fn c8_design_t1_first_peer_join() {
+    assert_clean_within("c8-t1", &c8_t1(), CAP_FAULTS);
+}
+
+#[test]
+fn c8_design_t2_root_own_sticky_grant() {
+    assert_clean_within("c8-t2", &c8_t2(), CAP_FAULTS);
+}
+
+#[test]
+fn c8_design_t3_peer_leaves_singleton_bump() {
+    assert_clean_within("c8-t3", &c8_t3(), CAP_FAULTS);
+}
+
+/// The root keeps answering alone after its roster view shows the peer (no
+/// bump): found by `no_lone_answer_with_peer`; with that oracle off, the
+/// harm: node 1 claims from the archive and a row answered alone after the
+/// root saw it is lost, which no singleton event covers (I5).
+#[test]
+fn c8_knob_singleton_after_join_is_found() {
+    let mut m = c8_t1();
+    m.singleton_after_join = true;
+    assert_finds_within(
+        "c8-t1+singleton_after_join",
+        &m,
+        "no_lone_answer_with_peer",
+        CAP_FAULTS,
+    );
+    m.check_lone = false;
+    assert_finds_within(
+        "c8-t1+singleton_after_join+i5",
+        &m,
+        "rollback_only_singleton_or_operator",
+        CAP_FAULTS,
+    );
+}
+
+/// The root answers a joined peer's forward alone (its singleton test
+/// waits for the roster read): the peer claims from the archive and its
+/// answered op is lost, which no singleton event covers (I5: a singleton's
+/// rollback is of its own clients' rows).
+#[test]
+fn c8_knob_singleton_serves_forwards_is_found() {
+    let mut m = c8_t1();
+    m.singleton_serves_forwards = true;
+    assert_finds_within(
+        "c8-t1+singleton_serves_forwards",
+        &m,
+        "rollback_only_singleton_or_operator",
+        CAP_FAULTS,
+    );
+}
+
+/// The singleton test at answer time (no journaled bump in the gate): rows
+/// journaled while the peer was in the roster are answered alone once the
+/// root sees it leave: I1 by configuration.
+#[test]
+fn c8_knob_bump_by_event_is_found() {
+    let mut m = c8_t3();
+    m.bump_by_event = true;
+    assert_finds_within(
+        "c8-t3+bump_by_event",
+        &m,
+        "ack_implies_committed_by_config",
+        CAP_FAULTS,
+    );
+}
+
+/// A sticky grant on `/` for the root: its `/` rows are final in its own
+/// stream, and its successor (which sequences `/` as the lease holder)
+/// orders `/` while the grant holds it.
+#[test]
+fn c8_knob_root_sticky_on_slash_is_found() {
+    let mut m = c8_t2();
+    m.root_sticky_on_slash = true;
+    assert_finds_within(
+        "c8-t2+root_sticky_on_slash",
+        &m,
+        "released_subtree_sequenced_after_cut",
+        CAP_FAULTS,
+    );
+}
+
+// ======== chunk 9: settlement (I4), S4, no server queue (I2(b))
+
+/// C9-T1: node 1 holds `/D1` sticky and grants a read delegation on it;
+/// node 2 moves `/D1/b` to `/b` (cross-subtree: the root parks it and
+/// requests the release, which waits for the read recall) and may pass
+/// its deadline (the settle parks at the root with the op and is answered
+/// after the release: the op's outcome, or `Refused` superseding it).
+fn c9_t1() -> NodeStreamModel {
+    NodeStreamModel::design(vec![vec![], vec![create(D1A)], vec![mv(D1B, RB)]])
+        .with_initial(present(&[D1B]))
+        .with_grant(sticky(1, D1))
+        .with_reads(1)
+        .with_deadlines(1)
+}
+
+/// C9-T2: node 1 holds `/D1` placed (group `{delegate, root}`); node 2
+/// creates `/D1/b` (forwarded) and may pass its deadline: the settle goes
+/// to the sequencer in force, whose `Refused` is answered once committed.
+fn c9_t2() -> NodeStreamModel {
+    NodeStreamModel::design(vec![vec![], vec![], vec![create(D1B)]])
+        .with_grant(placed(1, D1, 0))
+        .with_deadlines(1)
+}
+
+/// C9-T3, the takeover gate's settle by request-release: node 1 holds
+/// `/D1` sticky and moves `/D1/a` to `/b` (cross-subtree, parked at the
+/// root); the root forwards `/D1/b` into the grant; node 2 may claim the
+/// lease from the archive; node 1's retry and settle meet the new root,
+/// which requests the release before it answers.
+fn c9_t3() -> NodeStreamModel {
+    NodeStreamModel::design(vec![vec![create(D1B)], vec![mv(D1A, RB)], vec![]])
+        .with_initial(present(&[D1A]))
+        .with_grant(sticky(1, D1))
+        .with_faults(0, 1)
+        .with_deadlines(1)
+}
+
+#[test]
+fn c9_design_t1_settle_by_release_after_read_recall() {
+    assert_clean_within("c9-t1", &c9_t1(), CAP_LARGE);
+}
+
+#[test]
+fn c9_design_t2_settle_at_the_delegate() {
+    assert_clean_within("c9-t2", &c9_t2(), CAP_LARGE);
+}
+
+#[test]
+fn c9_design_t3_settle_at_a_new_root() {
+    assert_clean_within("c9-t3", &c9_t3(), CAP_LARGE);
+}
+
+/// S4: the release (the root's cut) before the read recall.
+#[test]
+fn c9_knob_cut_before_read_recall_is_found() {
+    let mut m = c9_t1();
+    m.cut_before_read_recall = true;
+    assert_finds_within(
+        "c9-t1+cut_before_read_recall",
+        &m,
+        "settle_after_reads_recalled",
+        CAP_LARGE,
+    );
+}
+
+/// The settle goes to the lease holder, which refuses a key a node stream
+/// holds without the release: the forwarded op lands after the `EIO`.
+#[test]
+fn c9_knob_settle_unowned_is_found() {
+    let mut m = c9_t2();
+    m.settle_unowned = true;
+    assert_finds_within(
+        "c9-t2+settle_unowned",
+        &m,
+        "eio_never_lands_late",
+        CAP_LARGE,
+    );
+}
+
+/// A server-side queue: the deposed root's parked op is handed to the
+/// claimant while the requester retries: two executable copies.
+#[test]
+fn c9_knob_server_replay_queue_is_found() {
+    let mut m = c9_t3();
+    m.server_replay_queue = true;
+    assert_finds_within(
+        "c9-t3+server_replay_queue",
+        &m,
+        "one_executable_copy",
+        CAP_LARGE,
+    );
 }

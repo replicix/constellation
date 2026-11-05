@@ -129,12 +129,24 @@
 //! (`per_key_linearizable`, `causal_cut`, `marker_order`,
 //! `converged_at_quiescence`); chunk 6 the TTL end, C3's verbatim re-ship
 //! by a delegate taking the root, member copies (L2b) and the L1 mark
-//! (`acked_at_or_below_cut`, `verbatim_identity`). Each has planted-bug
-//! knobs (`lone_delegate`, `root_journal_counts`, `no_dedup`,
+//! (`acked_at_or_below_cut`, `verbatim_identity`); chunk 7 sticky grants,
+//! the operator's abandon and ADR-43's no-tail orphan rule against them
+//! (`sticky_ends_only_by_holder_or_operator`, `designation_final`,
+//! `rollback_only_singleton_or_operator` (I5),
+//! `orphan_rule_never_ends_an_answering_grant`); chunk 8 the singleton, the
+//! roster's journaled `config_version` bump both ways and the root's own
+//! sticky grants (`no_lone_answer_with_peer`); chunk 9 settlement, S4 and
+//! no server queue (`eio_never_lands_late` (I4),
+//! `settle_after_reads_recalled`, `one_executable_copy` (I2(b))). Each has
+//! planted-bug knobs (`lone_delegate`, `root_journal_counts`, `no_dedup`,
 //! `per_row_class`, `ack_by_latest_config`, `root_executes_before_at`,
 //! `execute_after_release`, `per_subtree_streams`,
 //! `honour_uncommitted_grant`, `deps_ignored`, `end_before_seal`,
-//! `no_reappend`, `drop_member_copy`, `l1_mark_cleared_by_stream`).
+//! `no_reappend`, `drop_member_copy`, `l1_mark_cleared_by_stream`,
+//! `ttl_reclaims_sticky`, `holder_releases_before_drain`,
+//! `sticky_answers_before_grant_committed`, `singleton_after_join`,
+//! `singleton_serves_forwards`, `bump_by_event`, `root_sticky_on_slash`,
+//! `settle_unowned`, `cut_before_read_recall`, `server_replay_queue`).
 //! `tests/node_stream.rs`.
 //!
 //! # What is modeled

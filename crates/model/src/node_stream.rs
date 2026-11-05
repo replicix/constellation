@@ -186,6 +186,79 @@
 //!   [`Action::Rescue`]): a requester whose answered row turned void
 //!   replays it by rid (the product's rescue); unreachable in the design.
 //!
+//! ## Chunk 7: sticky grants, the abandon, ADR-43's no-tail proof
+//!
+//! - **Sticky** streams are `Final` and never ended by the TTL. The holder
+//!   releases ([`Action::ReleaseAll`], [`NodeStreamModel::stream_releases`])
+//!   only once **drained**: the root reported it appended through the
+//!   stream's last row ([`Stream::root_appended`], learned by
+//!   [`Action::RootAck`]); the root then journals `DelegateNodeEnded` once
+//!   its journal shows the release. The triggers (idle, unmount, suspend,
+//!   network-down, `constellation release`, the root's handover request
+//!   for a dominant writer) are the release's nondeterminism; a handover
+//!   is the release followed by a `Grow` record granting the subtree to
+//!   the requester's stream ([`NodeStreamModel::with_grow`] on a stream
+//!   with no initial set mints that grant).
+//! - **`abandon`** ([`Action::Abandon`], at most one): the operator ends a
+//!   sticky stream at the root's cursor, no seal. The holder may still be
+//!   answering (lost to the root, not dead): its rows past the cut are
+//!   void, and every answered one is **exported** as a conflict copy
+//!   ([`State::exported`]); it stops when it learns the end.
+//! - A crashed sticky holder keeps its disk: its rows are not lost, the
+//!   subtree blocks until it returns (not modeled) or the abandon.
+//! - **Epochs and minting (ADR-43).** Each tenure has an epoch
+//!   ([`State::epoch`]); a grant is minted by the first `DelegateNode`
+//!   record of its number ([`State::minted`]); a later tenure may journal a
+//!   record (growth) for an older number. A claim whose marker carries **no
+//!   tail** (the archive alone) runs the **orphan rule**: every number of
+//!   the deposed tenure's epoch that the adopted journal does not list is
+//!   ended at cut 0 ([`State::orphaned`]). A grant is honoured once its
+//!   record is committed (M1.0 answer 4), so an answering grant is always
+//!   listed by an adopted prefix (the archive, or a tail that carries every
+//!   committed row).
+//!
+//! ## Chunk 8: the singleton, `first_peer_join`, the root's own grants
+//!
+//! - **Roster** ([`State::roster`], [`Action::Join`], [`Action::Leave`]): a
+//!   node out of the roster starts nothing and cannot claim. The root's
+//!   view ([`State::view_roster`]) changes by a roster read
+//!   ([`Action::SeeRoster`]) and when it serves a forward from a node its
+//!   view lacks (a linked peer). When its **singleton test** flips, the
+//!   root journals the lease's `config_version` bump in the same step: a
+//!   record row starting a configuration with [`Cfg::singleton`] flipped,
+//!   committed under old ∪ new (the archive, in both directions, for a
+//!   root with no backup), so nothing after it is answered alone until it
+//!   commits, and rows before it keep their rule. A singleton
+//!   configuration's rule is the root's disk ([`NodeStreamModel::rule_of`]).
+//! - **Death then join** (Q6): a joined peer may claim from the archive; a
+//!   singleton's answered rows it does not carry are exported (rows of the
+//!   singleton's own clients journaled while its view had no peer); any
+//!   other lost answered root row is an I5 violation.
+//! - **The root's own sticky grant** (D3): a grant whose holder is node 0,
+//!   minted by a `Grow` only while node 0 roots, has a peer in view and no
+//!   group; the root sequences its own and forwarded ops in that subtree
+//!   in that stream (final), and appends it like any node stream. A
+//!   deposed root's grant blocks its subtree. Never on `/`.
+//!
+//! ## Chunk 9: settlement (I4), S4, no server queue (I2(b))
+//!
+//! - **Deadline** ([`Action::Deadline`], at most
+//!   [`NodeStreamModel::max_deadlines`]): the requester settles its op
+//!   ([`Msg::Settle`]) at the sequencer in force by the root's table; it
+//!   resends no copy of the op from then on. The sequencer answers the
+//!   rid's outcome if it has one (its streams; a delegate also its
+//!   installed prefix of the log), else, holding every key, journals
+//!   `Refused { rid, ABANDONED }` ([`RowKind::Refused`]), answered `EIO`
+//!   once committed by that stream's rule. A root whose keys a node stream
+//!   holds parks the settle and requests the release (ADR-44's in-gate
+//!   recall as `SubtreeReleased`, also after a claim); the settle then
+//!   answers the outcome, or refuses and supersedes the parked op.
+//! - **S4** as one bit per node stream ([`State::reads`],
+//!   [`Action::GrantRead`], [`Action::RecallRead`]): a holder's release
+//!   (the root's cut) waits for its read delegation's recall.
+//! - **No server queue**: a deposed root's parked ops die with its tenure;
+//!   the requester's retry is the only source of another copy.
+//!
 //! # Properties
 //!
 //! - `ack_implies_committed_by_config` (I1, plan 46 §5.9): at the moment a
@@ -223,7 +296,28 @@
 //! - `acked_at_or_below_cut` (chunk 6, M1.2's oracle): no answered row of
 //!   an ended stream lies past its cut.
 //! - `verbatim_identity` (chunk 6, I2(c)): every answered row has one
-//!   identity, its original origin `(stream, idx)`, wherever it is.
+//!   identity, its original origin `(stream, idx)`, wherever it is (an
+//!   exported rid's rolled-back row is a conflict copy, not an identity).
+//! - `rollback_only_singleton_or_operator` (chunk 7, I5): every answered row
+//!   past a cut is exported by the operator's abandon, and every answered
+//!   root row a claim loses is a singleton's own client's row journaled
+//!   while the root's view had no peer (exported); `acked_never_lost` and
+//!   `acked_at_or_below_cut` exempt exactly these.
+//! - `sticky_ends_only_by_holder_or_operator` (chunk 7): a sticky stream's
+//!   end follows its holder's release, the abandon, or (never in the log)
+//!   the orphan rule.
+//! - `designation_final` (chunk 7, re-proved): a designation ends only by
+//!   its holder's release and no answer of it is past a cut.
+//! - `orphan_rule_never_ends_an_answering_grant` (chunk 7, ADR-43).
+//! - `no_lone_answer_with_peer` (chunk 8): the root answers from its disk
+//!   alone (neither the archive nor every listed backup holds the row) only
+//!   a row journaled while its roster view had no peer.
+//! - `eio_never_lands_late` (chunk 9, I4): a rid answered `EIO`, settled,
+//!   has no live row, ever.
+//! - `settle_after_reads_recalled` (chunk 9, S4): the root acts in a
+//!   released directory only after the releasing stream's read recall.
+//! - `one_executable_copy` (chunk 9, I2(b)): at most one executable copy of
+//!   a rid's op (a forward to a live sequencer, or a parked op).
 //!
 //! # Knobs (each a planted bug the checker must find)
 //!
@@ -260,6 +354,27 @@
 //!   a stream when its end is journaled, before the log carries it.
 //! - `l1_mark_cleared_by_stream` (chunk 6, L1): the streamed install of the
 //!   stream's end or of the delegate's release clears the mark.
+//! - `ttl_reclaims_sticky` (chunk 7): the TTL ends a non-stealable grant
+//!   (sticky or designated) like a placed one.
+//! - `holder_releases_before_drain` (chunk 7): the holder releases naming
+//!   the cut it knows appended, and the root ends there.
+//! - `sticky_answers_before_grant_committed` (chunk 7): a non-stealable
+//!   holder honours a `DelegateNode` record once it is in the root's
+//!   journal (with `check_recall` off, to show the orphan rule's harm).
+//! - `singleton_after_join` (chunk 8): the root's view shows the peer but
+//!   it journals no bump and keeps answering alone.
+//! - `singleton_serves_forwards` (chunk 8): the root's singleton test
+//!   ignores a peer's forward (waits for the roster read).
+//! - `bump_by_event` (chunk 8): the root's gate takes the singleton test
+//!   at answer time (its roster view), not the configuration at the row.
+//! - `root_sticky_on_slash` (chunk 8): the root's own sticky grant covers
+//!   `/` while the lease holder still sequences `/`.
+//! - `settle_unowned` (chunk 9): settles go to the lease holder, which
+//!   refuses keys a node stream holds at once (no release).
+//! - `cut_before_read_recall` (chunk 9, S4): a holder releases with its
+//!   read delegation outstanding.
+//! - `server_replay_queue` (chunk 9): a deposed root's parked ops are handed
+//!   to the claimant.
 
 use crate::delegation::{dir_of, eval, force, HEvt, Key, KeyOp, KeySpec, Ret, Rid, View, WriteOp};
 use stateright::semantics::{ConsistencyTester, LinearizabilityTester};
@@ -321,6 +436,9 @@ pub struct Cfg {
     /// Begun by a record row at `start` (which commits under old ∪ new);
     /// `false` for the initial configuration and a lease claim's.
     pub record: bool,
+    /// The root's configuration with no write-eligible peer in the roster
+    /// (chunk 8): the `Singleton` rule, the root's disk.
+    pub singleton: bool,
 }
 
 /// What a row is.
@@ -338,6 +456,10 @@ pub enum RowKind {
     Grow { stream: u8, dirs: u8 },
     /// The root's `DelegateNodeEnded { through }` for `stream`.
     Ended { stream: u8, through: u8 },
+    /// `Refused { rid, ABANDONED }` (chunk 9): the settle's outcome for a
+    /// rid with none, journaled by the sequencer in force; answered `EIO`,
+    /// settled ([`Ret::Conflicted`] stands for it in this model).
+    Refused,
 }
 
 /// A journaled row. In the root's journal an appended row keeps its
@@ -356,12 +478,15 @@ pub struct Row {
     pub kind: RowKind,
     /// The requester's causal position (chunk 5; zero otherwise).
     pub deps: Deps,
+    /// A root row journaled while the root's roster view showed no
+    /// write-eligible peer (chunk 8's oracle; `false` elsewhere).
+    pub alone: bool,
 }
 
 impl Row {
-    /// A record (no op, no requester).
+    /// A record (no requester): neither an op nor a settle's refusal.
     pub fn record(&self) -> bool {
-        self.kind != RowKind::Op
+        !matches!(self.kind, RowKind::Op | RowKind::Refused)
     }
 }
 
@@ -394,7 +519,16 @@ pub struct Stream {
     pub durable: u8,
     /// The holder's replica (chunk 5's readers, the convergence check).
     pub rview: View,
+    /// Non-stealable streams: the prefix of `rows` the root reported
+    /// appended (chunk 7: the holder's drain before its release).
+    pub root_appended: u8,
+    /// Chunk 7's `holder_releases_before_drain` knob: the cut the holder's
+    /// release named ([`NONE`] otherwise).
+    pub release_through: u8,
 }
+
+/// "None" for a `u8` position or epoch.
+pub const NONE: u8 = 0xFF;
 
 /// An answer parked at its executor until the row is committed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -412,6 +546,8 @@ pub struct Wait {
     pub rid: Rid,
     pub op: WriteOp,
     pub deps: Deps,
+    /// A settle (chunk 9), parked like the op it settles.
+    pub settle: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -430,7 +566,13 @@ pub enum Msg {
         idx: u8,
     },
     /// The receiver does not hold a key of the op: re-resolve.
-    NotOwner { rid: Rid },
+    /// `from`: the candidate that bounced it (a requester ignores the
+    /// answer to an attempt it has since superseded by a retry).
+    NotOwner { rid: Rid, from: u8 },
+    /// Chunk 9: the requester's settle of `rid` (its deadline passed).
+    Settle { to: u8, rid: Rid, op: WriteOp },
+    /// The receiver does not hold a key of the settle: re-resolve.
+    SettleNotOwner { rid: Rid, from: u8 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -454,60 +596,88 @@ pub struct Violation {
 }
 
 /// A delegate answered through the root's committed copy.
-pub const SAW_VIA_ROOT: u32 = 1;
+pub const SAW_VIA_ROOT: u64 = 1;
 /// A delegate answered through its recorded backup.
-pub const SAW_DELEG_BACKUP: u32 = 1 << 1;
+pub const SAW_DELEG_BACKUP: u64 = 1 << 1;
 /// A non-stealable stream answered (`Final`).
-pub const SAW_FINAL: u32 = 1 << 2;
+pub const SAW_FINAL: u64 = 1 << 2;
 /// An answer went to another node (a forward).
-pub const SAW_FORWARD: u32 = 1 << 3;
+pub const SAW_FORWARD: u64 = 1 << 3;
 /// The root answered its own row through its backups, before the archive.
-pub const SAW_ROOT_GROUP: u32 = 1 << 4;
+pub const SAW_ROOT_GROUP: u64 = 1 << 4;
 /// The root answered its own row once the archive carried it.
-pub const SAW_ARCHIVE: u32 = 1 << 5;
+pub const SAW_ARCHIVE: u64 = 1 << 5;
 /// An answer whose row (or its appended copy) the archive did not carry.
-pub const SAW_BEFORE_ARCHIVE: u32 = 1 << 6;
+pub const SAW_BEFORE_ARCHIVE: u64 = 1 << 6;
 /// A retried rid found in the sequencer's stream (completed-dedup).
-pub const SAW_DEDUP: u32 = 1 << 7;
+pub const SAW_DEDUP: u64 = 1 << 7;
 /// The root appended a crashed delegate's row from a member's copy.
-pub const SAW_SEAL: u32 = 1 << 8;
+pub const SAW_SEAL: u64 = 1 << 8;
 /// A root that took the lease by a claim answered.
-pub const SAW_TAKEOVER_ANSWER: u32 = 1 << 9;
+pub const SAW_TAKEOVER_ANSWER: u64 = 1 << 9;
 /// A row journaled under a recorded (reconfigured) configuration answered.
-pub const SAW_RECONFIG_ANSWER: u32 = 1 << 10;
+pub const SAW_RECONFIG_ANSWER: u64 = 1 << 10;
 /// A node crashed after an answer.
-pub const SAW_CRASH_AFTER_ACK: u32 = 1 << 11;
+pub const SAW_CRASH_AFTER_ACK: u64 = 1 << 11;
 /// A requester resent its op by rid.
-pub const SAW_RETRY: u32 = 1 << 12;
+pub const SAW_RETRY: u64 = 1 << 12;
 /// A delegate answered a row one of whose rule's members is down (the
 /// archive covered it).
-pub const SAW_COVERED: u32 = 1 << 13;
+pub const SAW_COVERED: u64 = 1 << 13;
 /// The root executed in a directory a node stream had released.
-pub const SAW_RELEASED_EXEC: u32 = 1 << 14;
+pub const SAW_RELEASED_EXEC: u64 = 1 << 14;
 /// A delegate executed an op between two of its subtrees.
-pub const SAW_TWO_SUBTREES: u32 = 1 << 15;
+pub const SAW_TWO_SUBTREES: u64 = 1 << 15;
 /// A sequencer answered `NotOwner`.
-pub const SAW_NOT_OWNER: u32 = 1 << 16;
+pub const SAW_NOT_OWNER: u64 = 1 << 16;
 /// A delegate executed in a directory it was granted by a `Grow` record.
-pub const SAW_GROWN: u32 = 1 << 17;
+pub const SAW_GROWN: u64 = 1 << 17;
 /// A holder released every subtree (`StreamReleased`).
-pub const SAW_STREAM_RELEASED: u32 = 1 << 18;
+pub const SAW_STREAM_RELEASED: u64 = 1 << 18;
 /// A sequencer parked an op for its `deps`.
-pub const SAW_DEPS_WAIT: u32 = 1 << 19;
+pub const SAW_DEPS_WAIT: u64 = 1 << 19;
 /// The model reached quiescence with replicas compared.
-pub const SAW_QUIESCENT: u32 = 1 << 20;
+pub const SAW_QUIESCENT: u64 = 1 << 20;
 /// The root ended a placed grant (TTL).
-pub const SAW_TTL_END: u32 = 1 << 21;
+pub const SAW_TTL_END: u64 = 1 << 21;
 /// A delegate took the root and re-appended its own rows.
-pub const SAW_DELEG_CLAIM: u32 = 1 << 22;
+pub const SAW_DELEG_CLAIM: u64 = 1 << 22;
 /// A stream's end sealed rows from a member's copy.
-pub const SAW_MEMBER_SEAL: u32 = 1 << 23;
+pub const SAW_MEMBER_SEAL: u64 = 1 << 23;
 /// L1: a delegate installed a root row on a key its own ordered row wrote.
-pub const SAW_L1: u32 = 1 << 24;
+pub const SAW_L1: u64 = 1 << 24;
 /// The root answered a retried rid from a delegate's row it appended.
-pub const SAW_APPENDED_DEDUP: u32 = 1 << 25;
+pub const SAW_APPENDED_DEDUP: u64 = 1 << 25;
 /// A reader saw both the marker and the data on a replica.
-pub const SAW_MARKER_AND_DATA: u32 = 1 << 26;
+pub const SAW_MARKER_AND_DATA: u64 = 1 << 26;
+/// Chunk 7: a sticky stream ended after its holder's drained release.
+pub const SAW_STICKY_RELEASED: u64 = 1 << 27;
+/// Chunk 7: an acknowledged row past an abandon's cut was exported.
+pub const SAW_ABANDON_EXPORT: u64 = 1 << 28;
+/// Chunk 7: ADR-43's orphan rule ended a number (at cut 0).
+pub const SAW_ORPHAN: u64 = 1 << 29;
+/// Chunk 7: a non-stealable grant minted by an earlier tenure answered.
+pub const SAW_LATER_EPOCH: u64 = 1 << 30;
+/// Chunk 8: a singleton root answered from its disk.
+pub const SAW_SINGLETON: u64 = 1 << 31;
+/// Chunk 8: the root answered a row journaled after a roster bump.
+pub const SAW_BUMP_ANSWER: u64 = 1 << 32;
+/// Chunk 8: a claim exported a singleton's lost answered row.
+pub const SAW_SINGLETON_EXPORT: u64 = 1 << 33;
+/// Chunk 8: the root answered a row of its own sticky grant.
+pub const SAW_ROOT_STICKY: u64 = 1 << 34;
+/// Chunk 9: a requester was answered `EIO`, settled.
+pub const SAW_EIO: u64 = 1 << 35;
+/// Chunk 9: a settle was answered with the rid's outcome.
+pub const SAW_SETTLE_OUTCOME: u64 = 1 << 36;
+/// Chunk 9: the root answered a settle in a released directory.
+pub const SAW_SETTLE_RELEASE: u64 = 1 << 37;
+/// Chunk 9: a holder released after recalling its read delegation.
+pub const SAW_READ_RECALLED: u64 = 1 << 38;
+/// Chunk 8: a peer joined a singleton's roster and the root bumped.
+pub const SAW_JOIN_BUMP: u64 = 1 << 39;
+/// Chunk 8: a peer left and the root bumped to the singleton.
+pub const SAW_LEAVE_BUMP: u64 = 1 << 40;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -526,7 +696,7 @@ pub struct State {
     /// kept sorted: their order is not state.
     pub acked: Vec<(Rid, Ret, u8, u8)>,
     pub violation: Option<Violation>,
-    pub saw: u32,
+    pub saw: u64,
     /// The lease holder.
     pub root: u8,
     /// Bitmask over nodes: crashed or deposed (never return).
@@ -544,6 +714,34 @@ pub struct State {
     /// so a claim with the archive alone waits for `shipped` to reach it.
     /// Tracked with two depositions or more.
     pub inherited: u8,
+    /// Chunk 7: the lease epoch of the current tenure (ADR-43).
+    pub epoch: u8,
+    /// Per stream, the epoch of the tenure that minted its grant (`0`:
+    /// before the first step, in the archive; [`NONE`]: not minted yet).
+    pub minted: Deps,
+    /// Bitmask over streams: ended by the operator's `abandon`.
+    pub abandoned: u8,
+    /// Bitmask over streams: ended by ADR-43's orphan rule (cut 0).
+    pub orphaned: u8,
+    /// Acknowledged rids rolled back by a counted operator or singleton
+    /// event and exported as conflict copies (I5). Sorted.
+    pub exported: Vec<Rid>,
+    /// Chunk 8: the roster (bitmask over nodes that joined, not left).
+    pub roster: u8,
+    /// The root's view of the roster (its last read).
+    pub view_roster: u8,
+    pub joins: u8,
+    pub leaves: u8,
+    /// Chunk 9: bitmask over streams with a read delegation outstanding
+    /// (the one-bit abstraction of S4).
+    pub reads: u8,
+    /// Bitmask over streams that granted their read delegation (once).
+    pub reads_granted: u8,
+    /// Bitmask over nodes whose outstanding op is being settled.
+    pub settling: u8,
+    /// Rids answered `EIO`, settled (I4). Sorted.
+    pub eio: Vec<Rid>,
+    pub deadlines: u8,
 }
 
 impl State {
@@ -609,6 +807,21 @@ pub enum Action {
     Durable(u8),
     /// Node `i` replays an answered op whose row turned void, by rid.
     Rescue(u8),
+    /// Chunk 7: the operator abandons stream `g` (`repair abandon --node`).
+    Abandon(u8),
+    /// Chunk 8: node `i` joins the roster.
+    Join(u8),
+    /// Chunk 8: node `i` leaves the roster.
+    Leave(u8),
+    /// Chunk 8: the root reads the roster (and journals the singleton
+    /// bump when its singleton test flips).
+    SeeRoster,
+    /// Chunk 9: node `i`'s deadline passes; it settles its op.
+    Deadline(u8),
+    /// Chunk 9: the holder of stream `g` grants a read delegation.
+    GrantRead(u8),
+    /// Chunk 9: the holder of stream `g` recalls its read delegation.
+    RecallRead(u8),
 }
 
 #[derive(Clone, Debug)]
@@ -647,6 +860,12 @@ pub struct NodeStreamModel {
     pub shadow_replay: bool,
     /// The I1 oracle at answer time (off only to show a knob's harm).
     pub check_i1: bool,
+    /// Chunk 8's `no_lone_answer_with_peer` oracle (off only to show a
+    /// knob's harm).
+    pub check_lone: bool,
+    /// The `recall_safety` oracle at execution (off only to show a knob's
+    /// harm).
+    pub check_recall: bool,
     pub lone_delegate: bool,
     pub root_journal_counts: bool,
     pub no_dedup: bool,
@@ -661,12 +880,35 @@ pub struct NodeStreamModel {
     pub no_reappend: bool,
     pub drop_member_copy: bool,
     pub l1_mark_cleared_by_stream: bool,
+    /// Chunk 7: streams the operator may abandon (at most one abandon).
+    pub abandon: Vec<u8>,
+    /// Chunk 8: the initial roster (bitmask over nodes; default all).
+    pub initial_roster: u8,
+    /// Nodes that may join the roster (each once).
+    pub joiners: u8,
+    /// Nodes that may leave the roster (each once).
+    pub leavers: u8,
+    /// Chunk 9: deadlines (at most this many settles).
+    pub max_deadlines: u8,
+    /// Chunk 9: streams whose holder grants a read delegation (once).
+    pub reads: u8,
+    pub ttl_reclaims_sticky: bool,
+    pub sticky_answers_before_grant_committed: bool,
+    pub holder_releases_before_drain: bool,
+    pub singleton_after_join: bool,
+    pub bump_by_event: bool,
+    pub root_sticky_on_slash: bool,
+    pub settle_unowned: bool,
+    pub cut_before_read_recall: bool,
+    pub server_replay_queue: bool,
+    pub singleton_serves_forwards: bool,
 }
 
 /// Where a received op stands at a sequencer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Status {
-    Run,
+    /// Executable in this stream.
+    Run(u8),
     /// Waiting: for a release (`false`) or for its `deps` (`true`).
     Blocked(bool),
     Bounce,
@@ -677,7 +919,7 @@ impl NodeStreamModel {
     pub fn design(scripts: Vec<Vec<WriteOp>>) -> Self {
         assert!(
             scripts.len() >= 2,
-            "a root with no peer is the singleton (a later chunk)"
+            "a singleton is a roster of one: give the peer a script and leave it out of the roster"
         );
         NodeStreamModel {
             n: scripts.len() as u8,
@@ -699,6 +941,8 @@ impl NodeStreamModel {
             probe: None,
             shadow_replay: false,
             check_i1: true,
+            check_lone: true,
+            check_recall: true,
             lone_delegate: false,
             root_journal_counts: false,
             no_dedup: false,
@@ -713,6 +957,22 @@ impl NodeStreamModel {
             no_reappend: false,
             drop_member_copy: false,
             l1_mark_cleared_by_stream: false,
+            abandon: Vec::new(),
+            initial_roster: 0,
+            joiners: 0,
+            leavers: 0,
+            max_deadlines: 0,
+            reads: 0,
+            ttl_reclaims_sticky: false,
+            sticky_answers_before_grant_committed: false,
+            holder_releases_before_drain: false,
+            singleton_after_join: false,
+            bump_by_event: false,
+            root_sticky_on_slash: false,
+            settle_unowned: false,
+            cut_before_read_recall: false,
+            server_replay_queue: false,
+            singleton_serves_forwards: false,
         }
     }
 
@@ -723,9 +983,11 @@ impl NodeStreamModel {
     }
 
     pub fn with_grant(mut self, g: NodeGrant) -> Self {
-        // Delegates are other nodes (the root's own sticky grants are a
-        // later chunk), on disjoint subtree sets, never `/`.
-        assert!(g.node != 0 && g.node < self.n);
+        // Delegates are other nodes, on disjoint subtree sets, never `/`;
+        // the root's own grant (chunk 8) is sticky and minted at run time
+        // (a `Grow` record of a stream with no initial set).
+        assert!(g.node < self.n);
+        assert!(g.node != 0 || (g.kind == GrantKind::Sticky && g.dirs == 0));
         assert!(self.grants.len() + 1 < MAXS);
         assert_eq!(g.dirs & 1, 0, "never a grant on `/`");
         assert_eq!(g.backups & (1 << g.node), 0);
@@ -770,12 +1032,45 @@ impl NodeStreamModel {
         self
     }
 
-    /// Plan the growth of `stream`'s set by `dirs` (directories no grant
-    /// holds).
+    /// Plan the growth of `stream`'s set by `dirs`: directories no grant
+    /// holds, or (a handover, chunk 7) a non-stealable grant's, journaled
+    /// once that grant has released them. A growth of a stream with no
+    /// initial set mints its grant (its `DelegateNode` record).
     pub fn with_grow(mut self, stream: u8, dirs: u8) -> Self {
         assert!(stream != ROOT && dirs & 1 == 0);
-        assert!(self.grants.iter().all(|g| g.dirs & dirs == 0));
+        assert!(self
+            .grants
+            .iter()
+            .all(|g| g.dirs & dirs == 0 || g.kind != GrantKind::Placed));
         self.grows.push((stream, dirs));
+        self
+    }
+
+    /// Chunk 7: the operator may abandon `stream` (a sticky grant).
+    pub fn with_abandon(mut self, stream: u8) -> Self {
+        assert_eq!(self.grants[stream as usize - 1].kind, GrantKind::Sticky);
+        self.abandon.push(stream);
+        self
+    }
+
+    /// Chunk 8: the initial roster, and the nodes that may join or leave.
+    pub fn with_roster(mut self, initial: u8, joiners: u8, leavers: u8) -> Self {
+        assert!(initial & 1 != 0, "the root is in the roster");
+        self.initial_roster = initial;
+        self.joiners = joiners;
+        self.leavers = leavers;
+        self
+    }
+
+    /// Chunk 9: at most `n` deadlines (settles).
+    pub fn with_deadlines(mut self, n: u8) -> Self {
+        self.max_deadlines = n;
+        self
+    }
+
+    /// Chunk 9: stream `g`'s holder grants a read delegation (once).
+    pub fn with_reads(mut self, g: u8) -> Self {
+        self.reads |= 1 << g;
         self
     }
 
@@ -809,18 +1104,20 @@ impl NodeStreamModel {
     /// The installed prefix of the root's journal matters (deps, growth,
     /// replicas).
     fn learns(&self) -> bool {
-        self.replicas || self.causal || !self.grows.is_empty()
+        self.replicas || self.causal || !self.grows.is_empty() || !self.abandon.is_empty()
     }
 
     /// A stream's end may be journaled (TTL, or a delegate's claim).
     fn ends(&self, g: u8) -> bool {
-        self.ttl_ends.contains(&g)
+        self.ttl(g)
             || (self.delegate_may_claim && self.grants[g as usize - 1].kind == GrantKind::Placed)
     }
 
     /// Every directory a node stream ever holds (granted or grown).
     fn delegated_dirs(&self) -> u8 {
-        self.grants.iter().fold(0, |m, g| m | g.dirs) | self.grows.iter().fold(0, |m, g| m | g.1)
+        self.grants.iter().fold(0, |m, g| m | g.dirs)
+            | self.grows.iter().fold(0, |m, g| m | g.1)
+            | u8::from(self.root_sticky_on_slash)
     }
 
     /// The sequencer of a stream.
@@ -855,12 +1152,42 @@ impl NodeStreamModel {
     /// record commits under old ∪ new.
     fn rules(&self, cfgs: &[Cfg], stream: u8, v: usize, idx: u8) -> [Option<Rule>; 2] {
         let c = cfgs[v];
-        let new = self.rule(stream, c.backups);
+        let new = self.rule_of(stream, &c);
         if c.record && c.start == idx && v > 0 {
-            [Some(new), Some(self.rule(stream, cfgs[v - 1].backups))]
+            [Some(new), Some(self.rule_of(stream, &cfgs[v - 1]))]
         } else {
             [Some(new), None]
         }
+    }
+
+    /// The rule of configuration `c` of `stream`: a singleton root's is its
+    /// disk (`Singleton`, chunk 8), otherwise [`Self::rule`].
+    pub fn rule_of(&self, stream: u8, c: &Cfg) -> Rule {
+        if stream == ROOT && c.singleton {
+            Rule::Final
+        } else {
+            self.rule(stream, c.backups)
+        }
+    }
+
+    /// The initial roster.
+    fn roster0(&self) -> u8 {
+        if self.initial_roster == 0 {
+            ((1u16 << self.n) - 1) as u8
+        } else {
+            self.initial_roster
+        }
+    }
+
+    /// Stream `g`'s grant is non-stealable (sticky or a designation).
+    fn non_stealable(&self, g: u8) -> bool {
+        g != ROOT && self.grants[g as usize - 1].kind != GrantKind::Placed
+    }
+
+    /// The (planted) TTL reclaims stream `g`: a placed grant on the TTL
+    /// list, or, with `ttl_reclaims_sticky`, a non-stealable one.
+    fn ttl(&self, g: u8) -> bool {
+        self.ttl_ends.contains(&g) || (self.ttl_reclaims_sticky && self.non_stealable(g))
     }
 
     /// The planned backups not yet in `stream`'s configuration (learners).
@@ -965,7 +1292,9 @@ fn void_row(s: &State, g: u8, idx: u8) -> bool {
 /// the root's journal (the first `upto` rows) over the initial grants.
 /// `early`: count releases journaled in node streams but not yet appended
 /// (the `root_executes_before_at` knob).
-fn table_upto(m: &NodeStreamModel, s: &State, upto: usize, early: bool) -> [u8; DIRS] {
+/// `slash`: the lease holder sequences `/` whatever grant covers it (the
+/// `root_sticky_on_slash` knob's product view; the oracle passes `false`).
+fn table_upto(m: &NodeStreamModel, s: &State, upto: usize, early: bool, slash: bool) -> [u8; DIRS] {
     let mut t = [ROOT; DIRS];
     for (k, g) in m.grants.iter().enumerate() {
         for d in bits(g.dirs) {
@@ -994,6 +1323,9 @@ fn table_upto(m: &NodeStreamModel, s: &State, upto: usize, early: bool) -> [u8; 
             _ => {}
         }
     }
+    if slash && m.root_sticky_on_slash {
+        t[0] = ROOT;
+    }
     if early {
         for g in 1..s.streams.len() {
             for r in &s.streams[g].rows {
@@ -1017,6 +1349,7 @@ fn table(m: &NodeStreamModel, s: &State) -> [u8; DIRS] {
         s,
         s.streams[ROOT as usize].rows.len(),
         m.root_executes_before_at,
+        true,
     )
 }
 
@@ -1038,7 +1371,7 @@ fn route(m: &NodeStreamModel, s: &State, op: WriteOp) -> u8 {
 /// Bitmask over keys the root holds by its table (its rebuild after a
 /// claim).
 fn root_keys(m: &NodeStreamModel, s: &State) -> View {
-    let t = table_upto(m, s, s.streams[ROOT as usize].rows.len(), false);
+    let t = table_upto(m, s, s.streams[ROOT as usize].rows.len(), false, true);
     (0..View::BITS as u8)
         .filter(|&k| t[dir_of(k) as usize] == ROOT)
         .fold(0, |v, k| v | (1 << k))
@@ -1050,14 +1383,25 @@ fn deleg_owns(m: &NodeStreamModel, s: &State, g: u8, dir: usize) -> bool {
     if st.stopped {
         return false;
     }
-    let initial = m.grants[g as usize - 1].dirs & (1 << dir) != 0;
+    let grant = m.grants[g as usize - 1];
+    let initial = grant.dirs & (1 << dir) != 0;
+    // What the holder knows committed: its installed prefix of the root's
+    // journal, or (the root's own grant, chunk 8) the root's committed
+    // prefix.
+    let known = if grant.node == s.root {
+        root_committed_prefix(m, s)
+    } else {
+        st.applied as usize
+    };
+    let early = m.honour_uncommitted_grant
+        || (m.sticky_answers_before_grant_committed && grant.kind != GrantKind::Placed);
     let grown = s.streams[ROOT as usize]
         .rows
         .iter()
         .enumerate()
         .any(|(p, r)| {
             matches!(r.kind, RowKind::Grow { stream, dirs } if stream == g && dirs & (1 << dir) != 0)
-                && (m.honour_uncommitted_grant || p < st.applied as usize)
+                && (early || p < known)
         });
     let released = !m.execute_after_release
         && st
@@ -1078,7 +1422,9 @@ fn deleg_may_hold(m: &NodeStreamModel, s: &State, g: u8, dir: usize) -> bool {
         .rows
         .iter()
         .any(|r| matches!(r.kind, RowKind::Released { dirs, .. } if dirs & (1 << dir) != 0));
-    (initial || grown) && !released && ended(s, g).is_none()
+    // A holder lost to the root may answer past the operator's abandon:
+    // the documented loss, its rows past the cut exported (I5).
+    (initial || grown) && !released && (ended(s, g).is_none() || s.abandoned & (1 << g) != 0)
 }
 
 /// The root's journal carries every node stream through `deps`.
@@ -1100,37 +1446,160 @@ fn deps_ok_deleg(m: &NodeStreamModel, s: &State, g: u8, deps: &Deps) -> bool {
                 .all(|h| count_in(rows, h as u8) >= deps[h] as usize))
 }
 
-/// Where `op` stands at sequencer candidate `node`.
+/// Where `op` stands at sequencer candidate `node`: its own grant's
+/// stream first (a delegate's, or the root's own sticky grant), then, at
+/// the root, the root's journal.
 fn status(m: &NodeStreamModel, s: &State, node: u8, op: WriteOp, deps: &Deps) -> Status {
     let dirs = op_dirs(op);
-    if node == s.root {
-        let t = table(m, s);
-        if bits(dirs).all(|d| t[d] == ROOT) {
-            if deps_ok_root(m, s, deps) {
-                Status::Run
-            } else {
-                Status::Blocked(true)
-            }
-        } else if route(m, s, op) == ROOT {
-            Status::Blocked(false)
-        } else {
-            Status::Bounce
-        }
-    } else if let Some(g) = m
+    if let Some(g) = m
         .stream_of_node(node)
         .filter(|&g| !s.streams[g as usize].stopped)
     {
         if bits(dirs).all(|d| deleg_owns(m, s, g, d)) {
-            if deps_ok_deleg(m, s, g, deps) {
-                Status::Run
+            let ok = if node == s.root {
+                deps_ok_root(m, s, deps)
+            } else {
+                deps_ok_deleg(m, s, g, deps)
+            };
+            return if ok {
+                Status::Run(g)
             } else {
                 Status::Blocked(true)
-            }
+            };
+        }
+    }
+    if node != s.root {
+        return Status::Bounce;
+    }
+    let t = table(m, s);
+    if bits(dirs).all(|d| t[d] == ROOT) {
+        if deps_ok_root(m, s, deps) {
+            Status::Run(ROOT)
+        } else {
+            Status::Blocked(true)
+        }
+    } else {
+        let r = route(m, s, op);
+        // A cross-subtree op waits for the release; an op in the root's
+        // own grant waits until the root honours it (its record commits).
+        if r == ROOT || m.executor(s, r) == node {
+            Status::Blocked(false)
         } else {
             Status::Bounce
         }
-    } else {
-        Status::Bounce
+    }
+}
+
+/// The streams `node` sequences: the root's journal (at the root) and its
+/// own grant's stream while it honours it.
+fn seq_streams(m: &NodeStreamModel, s: &State, node: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    if node == s.root {
+        out.push(ROOT);
+    }
+    if let Some(g) = m
+        .stream_of_node(node)
+        .filter(|&g| !s.streams[g as usize].stopped)
+    {
+        out.push(g);
+    }
+    out
+}
+
+/// `node`'s completed-dedup: the row of `rid` in a stream it sequences,
+/// else (a delegate) in its installed prefix of the root's journal (the
+/// log's completed rids: a retry that meets a new owner after a growth).
+fn find_rid(m: &NodeStreamModel, s: &State, node: u8, rid: Rid) -> Option<(u8, u8)> {
+    let find = |rows: &[Row]| rows.iter().position(|r| !r.record() && r.rid == rid);
+    let own = seq_streams(m, s, node)
+        .into_iter()
+        .find_map(|g| find(&s.streams[g as usize].rows).map(|idx| (g, idx as u8)));
+    own.or_else(|| {
+        let g = m.stream_of_node(node).filter(|_| node != s.root)?;
+        let applied = s.streams[g as usize].applied as usize;
+        find(&s.streams[ROOT as usize].rows[..applied]).map(|p| (ROOT, p as u8))
+    })
+}
+
+/// The root's roster view becomes `view`; when its singleton test flips
+/// it journals the lease's `config_version` bump at once (M1.0 answer 5;
+/// the `singleton_after_join` knob keeps answering alone on a join).
+fn set_roster_view(m: &NodeStreamModel, s: &mut State, view: u8) {
+    let had = has_peer(s, s.view_roster);
+    let has = has_peer(s, view);
+    s.view_roster = view;
+    if had == has || (m.singleton_after_join && has) {
+        return;
+    }
+    s.saw |= if has { SAW_JOIN_BUMP } else { SAW_LEAVE_BUMP };
+    let root = &mut s.streams[ROOT as usize];
+    let idx = root.rows.len() as u8;
+    let backups = root.cfgs.last().unwrap().backups;
+    root.cfgs.push(Cfg {
+        start: idx,
+        backups,
+        record: true,
+        singleton: !has,
+    });
+    let v = (root.cfgs.len() - 1) as u8;
+    root.rows.push(Row {
+        stream: ROOT,
+        idx,
+        rid: Rid {
+            node: RECORD_NODE,
+            seq: idx,
+        },
+        op: WriteOp::Create(0),
+        ret: Ret::Ok,
+        version: v,
+        kind: RowKind::Cfg,
+        deps: [0; MAXS],
+        alone: !has,
+    });
+}
+
+/// The root serves a request of `from`: a node that forwards is a linked
+/// peer, so the root is no singleton from here on (the event that raises
+/// the singleton test, before the op is journaled). The
+/// `singleton_serves_forwards` knob waits for the roster read.
+fn note_requester(m: &NodeStreamModel, s: &mut State, at: u8, from: u8) {
+    if at == s.root && from != at && !m.singleton_serves_forwards {
+        let view = s.view_roster | (1 << from);
+        set_roster_view(m, s, view);
+    }
+}
+
+/// `mask` names a write-eligible peer of the root.
+fn has_peer(s: &State, mask: u8) -> bool {
+    mask & !(1 << s.root) != 0
+}
+
+/// S4 (chunk 9): the root acts in `dirs` (an op or a settle's refusal);
+/// every node stream that held one of them and released it (or ended)
+/// has recalled its read delegation.
+fn check_reads(m: &NodeStreamModel, s: &mut State, dirs: u8, rid: Rid, idx: u8) {
+    if s.reads == 0 {
+        return;
+    }
+    let rows = &s.streams[ROOT as usize].rows;
+    let stale = (1..s.streams.len()).any(|h| {
+        let hs = h as u8;
+        s.reads & (1 << h) != 0
+            && bits(dirs).any(|d| {
+                let held = m.grants[h - 1].dirs & (1 << d) != 0
+                    || rows.iter().any(|r| {
+                        matches!(r.kind, RowKind::Grow { stream, dirs } if stream == hs && dirs & (1 << d) != 0)
+                    });
+                let gone = ended(s, hs).is_some()
+                    || s.streams[h]
+                        .rows
+                        .iter()
+                        .any(|r| matches!(r.kind, RowKind::Released { dirs, .. } if dirs & (1 << d) != 0));
+                held && gone
+            })
+    });
+    if stale {
+        s.violate("settle_after_reads_recalled", rid, ROOT, idx);
     }
 }
 
@@ -1270,7 +1739,9 @@ fn deleg_gate_prefix(m: &NodeStreamModel, s: &State, g: u8) -> usize {
 /// May the executor answer row `idx` of `stream` now?
 fn may_answer(m: &NodeStreamModel, s: &State, stream: u8, idx: u8) -> bool {
     if stream == ROOT {
-        root_pos_committed(m, s, idx as usize)
+        // The `bump_by_event` knob: the root's singleton test at answer
+        // time (its roster view) instead of the configuration at the row.
+        (m.bump_by_event && !has_peer(s, s.view_roster)) || root_pos_committed(m, s, idx as usize)
     } else {
         (idx as usize) < deleg_gate_prefix(m, s, stream)
     }
@@ -1302,6 +1773,10 @@ fn available(s: &State, g: u8, exec: u8) -> usize {
 /// which the root will append it, with the answered result.
 pub fn acked_never_lost(m: &NodeStreamModel, s: &State) -> bool {
     s.acked.iter().all(|&(rid, ret, _, _)| {
+        // A counted rollback (I5) is exported, not lost.
+        if s.exported.binary_search(&rid).is_ok() {
+            return true;
+        }
         let root = &s.streams[ROOT as usize];
         if let Some(r) = root
             .rows
@@ -1315,14 +1790,116 @@ pub fn acked_never_lost(m: &NodeStreamModel, s: &State) -> bool {
             if let Some(idx) = st.rows.iter().position(|r| !r.record() && r.rid == rid) {
                 // A stopped holder is unreachable, not gone: its disk keeps
                 // the row (the end waits for a member, C2e).
+                // A non-stealable stream's holder keeps its disk until it
+                // returns (chunk 7: the subtree blocks meanwhile).
                 let exec = m.executor(s, g as u8);
                 return st.rows[idx].ret == ret
                     && (root_pos(s, g as u8, idx as u8).is_some()
                         || s.live(exec)
+                        || m.non_stealable(g as u8)
                         || idx < available(s, g as u8, exec));
             }
         }
         false
+    })
+}
+
+/// I5 (chunk 7, plan 46 §5.9): every acknowledged row that is rolled back
+/// (past a stream's cut) is a counted operator or singleton event, exported
+/// as a conflict copy. A singleton's lost root rows are judged at the claim
+/// (an event: [`State::violation`]).
+pub fn rollback_only_singleton_or_operator(s: &State) -> bool {
+    s.acked.iter().all(|&(rid, _, g, idx)| {
+        g == ROOT || !void_row(s, g, idx) || s.exported.binary_search(&rid).is_ok()
+    })
+}
+
+/// Chunk 7: a sticky stream ends only by its holder's release or the
+/// operator's `abandon` (or, never having been in the log, by ADR-43's
+/// orphan rule: `orphan_rule_never_ends_an_answering_grant`).
+pub fn sticky_ends_only_by_holder_or_operator(m: &NodeStreamModel, s: &State) -> bool {
+    ended_kinds(m, s, GrantKind::Sticky)
+        .all(|g| s.abandoned & (1 << g) != 0 || s.orphaned & (1 << g) != 0 || holder_released(s, g))
+}
+
+/// `designation_final` (re-proved under node streams): a designation ends
+/// only by its holder's release (`online`), and no answer of it is ever
+/// past a cut.
+pub fn designation_final(m: &NodeStreamModel, s: &State) -> bool {
+    ended_kinds(m, s, GrantKind::Designated).all(|g| holder_released(s, g))
+        && s.acked.iter().all(|&(_, _, g, idx)| {
+            g == ROOT
+                || m.grants[g as usize - 1].kind != GrantKind::Designated
+                || !void_row(s, g, idx)
+        })
+}
+
+/// The ended streams of grant kind `kind`.
+fn ended_kinds<'a>(
+    m: &'a NodeStreamModel,
+    s: &'a State,
+    kind: GrantKind,
+) -> impl Iterator<Item = u8> + 'a {
+    (1..s.streams.len() as u8)
+        .filter(move |&g| m.grants[g as usize - 1].kind == kind && ended(s, g).is_some())
+}
+
+/// Stream `g`'s holder journaled the release of everything it held.
+fn holder_released(s: &State, g: u8) -> bool {
+    s.streams[g as usize]
+        .rows
+        .iter()
+        .any(|r| matches!(r.kind, RowKind::Released { .. }))
+}
+
+/// ADR-43 against sticky grants (chunk 7): a number the orphan rule ends
+/// (a no-tail claim, cut 0) never answered.
+pub fn orphan_rule_never_ends_an_answering_grant(s: &State) -> bool {
+    s.acked
+        .iter()
+        .all(|&(_, _, g, _)| g == ROOT || s.orphaned & (1 << g) == 0)
+}
+
+/// I4 (chunk 9): a rid answered `EIO`, settled, never has a live row (the
+/// root's own, or a node stream's below its cut).
+pub fn eio_never_lands_late(s: &State) -> bool {
+    s.eio.iter().all(|&rid| {
+        let root = s.streams[ROOT as usize]
+            .rows
+            .iter()
+            .any(|r| r.stream == ROOT && r.kind == RowKind::Op && r.rid == rid);
+        let deleg = s.streams[1..].iter().enumerate().any(|(k, st)| {
+            st.rows
+                .iter()
+                .any(|r| r.kind == RowKind::Op && r.rid == rid && !void_row(s, k as u8 + 1, r.idx))
+        });
+        !root && !deleg
+    })
+}
+
+/// I2(b) (chunk 9): no server-side queue: at most one executable copy of a
+/// rid's op exists (a forward to a live, honouring sequencer, or an op
+/// parked at a live one); the requester's entry is the only source of
+/// another.
+pub fn one_executable_copy(m: &NodeStreamModel, s: &State) -> bool {
+    s.nodes.iter().enumerate().all(|(i, n)| {
+        (0..n.next).all(|seq| {
+            let rid = Rid { node: i as u8, seq };
+            let fwd = s
+                .net
+                .iter()
+                .filter(|msg| {
+                    matches!(msg, Msg::Fwd { to, rid: r, .. }
+                        if *r == rid && s.live(*to) && !m.stopped_node(s, *to))
+                })
+                .count();
+            let parked = s
+                .waiting
+                .iter()
+                .filter(|w| w.rid == rid && !w.settle && s.live(w.node))
+                .count();
+            fwd + parked <= 1
+        })
     })
 }
 
@@ -1389,7 +1966,7 @@ pub fn released_subtree_sequenced_after_cut(m: &NodeStreamModel, s: &State) -> b
         if dirs & m.delegated_dirs() == 0 {
             continue;
         }
-        let t = table_upto(m, s, p, false);
+        let t = table_upto(m, s, p, false, false);
         if bits(dirs).any(|d| t[d] != ROOT) {
             return false;
         }
@@ -1424,11 +2001,14 @@ pub fn released_subtree_sequenced_after_cut(m: &NodeStreamModel, s: &State) -> b
     true
 }
 
-/// M1.2's oracle: no answered row of an ended stream lies past its cut.
+/// M1.2's oracle: no answered row of an ended stream lies past its cut,
+/// but for the operator's abandon (chunk 7: exported, I5).
 pub fn acked_at_or_below_cut(s: &State) -> bool {
-    s.acked
-        .iter()
-        .all(|&(_, _, g, idx)| g == ROOT || !void_row(s, g, idx))
+    s.acked.iter().all(|&(rid, _, g, idx)| {
+        g == ROOT
+            || !void_row(s, g, idx)
+            || (s.abandoned & (1 << g) != 0 && s.exported.binary_search(&rid).is_ok())
+    })
 }
 
 /// I2(c): every answered rid has one identity, its original origin,
@@ -1436,6 +2016,11 @@ pub fn acked_at_or_below_cut(s: &State) -> bool {
 /// the node streams below their cuts).
 pub fn verbatim_identity(s: &State) -> bool {
     s.acked.iter().all(|&(rid, _, so, io)| {
+        // An exported rid's rolled-back row is a conflict copy, not an
+        // identity of the rid (I5).
+        if s.exported.binary_search(&rid).is_ok() {
+            return true;
+        }
         let same = |st: u8, idx: u8| st == so && idx == io;
         s.acked
             .iter()
@@ -1681,13 +2266,21 @@ fn requester_answered(m: &NodeStreamModel, s: &mut State, rid: Rid, ret: Ret, st
         return;
     }
     node.outstanding = false;
-    if m.causal {
+    s.settling &= !(1 << i);
+    let eio = ret == Ret::Conflicted;
+    if m.causal && !eio {
         let o = &mut node.observed[stream as usize];
         *o = (*o).max(idx + 1);
     }
+    if eio {
+        // `EIO`, settled: the op did not, and will not, happen.
+        s.saw |= SAW_EIO;
+        s.eio.push(rid);
+        s.eio.sort_unstable();
+    }
     if m.history {
         let op = m.scripts[i][rid.seq as usize];
-        returned(s, rid.node, rid, op, ret);
+        returned(s, rid.node, rid, op, if eio { Ret::Skipped } else { ret });
     }
 }
 
@@ -1718,6 +2311,11 @@ fn recompute_rview(m: &NodeStreamModel, s: &mut State, g: u8) {
 /// The root journals stream `g`'s end at its cursor.
 fn end_stream(m: &NodeStreamModel, s: &mut State, g: u8) {
     let through = appended(s, g) as u8;
+    end_stream_at(m, s, g, through);
+}
+
+/// The root journals stream `g`'s end with cut `through`.
+fn end_stream_at(m: &NodeStreamModel, s: &mut State, g: u8, through: u8) {
     let root = &mut s.streams[ROOT as usize];
     let pos = root.rows.len() as u8;
     let version = (root.cfgs.len() - 1) as u8;
@@ -1733,6 +2331,7 @@ fn end_stream(m: &NodeStreamModel, s: &mut State, g: u8) {
         version,
         kind: RowKind::Ended { stream: g, through },
         deps: [0; MAXS],
+        alone: false,
     });
     if m.drop_member_copy {
         for h in s.streams[g as usize].held.iter_mut() {
@@ -1741,16 +2340,20 @@ fn end_stream(m: &NodeStreamModel, s: &mut State, g: u8) {
     }
 }
 
-fn execute(m: &NodeStreamModel, s: &mut State, at: u8, rid: Rid, op: WriteOp, deps: Deps) {
-    let stream = if at == s.root {
-        ROOT
-    } else {
-        m.stream_of_node(at).unwrap()
-    };
+#[allow(clippy::too_many_arguments)]
+fn execute(
+    m: &NodeStreamModel,
+    s: &mut State,
+    at: u8,
+    stream: u8,
+    rid: Rid,
+    op: WriteOp,
+    deps: Deps,
+) {
     let dirs = op_dirs(op);
     let idx = s.streams[stream as usize].rows.len() as u8;
     if stream != ROOT {
-        if bits(dirs).any(|d| !deleg_may_hold(m, s, stream, d)) {
+        if m.check_recall && bits(dirs).any(|d| !deleg_may_hold(m, s, stream, d)) {
             s.violate("recall_safety", rid, stream, idx);
         }
         if dirs.count_ones() > 1 {
@@ -1762,6 +2365,7 @@ fn execute(m: &NodeStreamModel, s: &mut State, at: u8, rid: Rid, op: WriteOp, de
         }
     } else if dirs & m.delegated_dirs() != 0 {
         s.saw |= SAW_RELEASED_EXEC;
+        check_reads(m, s, dirs, rid, idx);
     }
     // The root executes against its journal, a delegate against its keys.
     let base = if stream == ROOT {
@@ -1774,6 +2378,7 @@ fn execute(m: &NodeStreamModel, s: &mut State, at: u8, rid: Rid, op: WriteOp, de
     s.view = (s.view & !mask) | (after & mask);
     let executor = at;
     let lone = m.per_row_class && stream != ROOT && !s.peer_in_budget;
+    let alone = stream == ROOT && !has_peer(s, s.view_roster);
     let st = &mut s.streams[stream as usize];
     let row = Row {
         stream,
@@ -1788,6 +2393,7 @@ fn execute(m: &NodeStreamModel, s: &mut State, at: u8, rid: Rid, op: WriteOp, de
         },
         kind: RowKind::Op,
         deps,
+        alone,
     };
     st.rows.push(row);
     if m.replicas && stream != ROOT {
@@ -1803,38 +2409,25 @@ fn execute(m: &NodeStreamModel, s: &mut State, at: u8, rid: Rid, op: WriteOp, de
 /// Sequencer candidate `at` receives `rid`: completed-dedup, else execute,
 /// park, or answer `NotOwner`.
 fn receive(m: &NodeStreamModel, s: &mut State, at: u8, rid: Rid, op: WriteOp, deps: Deps) {
-    let mine = if at == s.root {
-        Some(ROOT)
-    } else {
-        m.stream_of_node(at)
-            .filter(|&g| !s.streams[g as usize].stopped)
-    };
-    if let (Some(stream), false) = (mine, m.no_dedup) {
-        let found = s.streams[stream as usize]
-            .rows
-            .iter()
-            .position(|r| !r.record() && r.rid == rid);
-        if let Some(idx) = found {
-            let idx = idx as u8;
+    note_requester(m, s, at, rid.node);
+    if !m.no_dedup {
+        if let Some((stream, idx)) = find_rid(m, s, at, rid) {
             s.saw |= SAW_DEDUP;
             if stream == ROOT && s.streams[ROOT as usize].rows[idx as usize].stream != ROOT {
                 s.saw |= SAW_APPENDED_DEDUP;
             }
-            if !s.pending.iter().any(|p| p.stream == stream && p.idx == idx) {
-                s.pending.push(Pending {
-                    executor: at,
-                    stream,
-                    idx,
-                });
-            }
+            park_answer(s, at, stream, idx);
             return;
         }
     }
-    if s.waiting.iter().any(|w| w.node == at && w.rid == rid) {
+    if s.waiting
+        .iter()
+        .any(|w| w.node == at && w.rid == rid && !w.settle)
+    {
         return;
     }
     match status(m, s, at, op, &deps) {
-        Status::Run => execute(m, s, at, rid, op, deps),
+        Status::Run(g) => execute(m, s, at, g, rid, op, deps),
         Status::Blocked(for_deps) => {
             if for_deps {
                 s.saw |= SAW_DEPS_WAIT;
@@ -1844,12 +2437,101 @@ fn receive(m: &NodeStreamModel, s: &mut State, at: u8, rid: Rid, op: WriteOp, de
                 rid,
                 op,
                 deps,
+                settle: false,
             });
         }
         Status::Bounce => {
             s.saw |= SAW_NOT_OWNER;
-            s.net.push(Msg::NotOwner { rid });
+            s.net.push(Msg::NotOwner { rid, from: at });
         }
+    }
+}
+
+/// `at` answers the row `(stream, idx)` once it is committed.
+fn park_answer(s: &mut State, at: u8, stream: u8, idx: u8) {
+    if !s.pending.iter().any(|p| p.stream == stream && p.idx == idx) {
+        s.pending.push(Pending {
+            executor: at,
+            stream,
+            idx,
+        });
+    }
+}
+
+/// Chunk 9: sequencer candidate `at` receives the settle of `rid`. It
+/// answers the rid's outcome when it has one (its streams; a delegate also
+/// its installed prefix of the root's journal), else, holding every key,
+/// journals `Refused { rid, ABANDONED }`; a root whose keys a node stream
+/// holds parks the settle and requests the release (ADR-44 as
+/// `SubtreeReleased`); a candidate that holds no key answers `NotOwner`.
+fn receive_settle(m: &NodeStreamModel, s: &mut State, at: u8, rid: Rid, op: WriteOp) {
+    note_requester(m, s, at, rid.node);
+    if let Some((stream, idx)) = find_rid(m, s, at, rid) {
+        s.saw |= SAW_SETTLE_OUTCOME;
+        park_answer(s, at, stream, idx);
+        return;
+    }
+    if s.waiting
+        .iter()
+        .any(|w| w.node == at && w.rid == rid && w.settle)
+    {
+        return;
+    }
+    match status(m, s, at, op, &[0; MAXS]) {
+        Status::Run(g) => refuse(m, s, at, g, rid, op),
+        _ if m.settle_unowned && at == s.root => refuse(m, s, at, ROOT, rid, op),
+        Status::Blocked(_) => s.waiting.push(Wait {
+            node: at,
+            rid,
+            op,
+            deps: [0; MAXS],
+            settle: true,
+        }),
+        Status::Bounce => s.net.push(Msg::SettleNotOwner { rid, from: at }),
+    }
+}
+
+/// `at` journals `Refused { rid, ABANDONED }` in `stream` and answers it
+/// once committed; the settle supersedes a parked copy of the op.
+fn refuse(m: &NodeStreamModel, s: &mut State, at: u8, stream: u8, rid: Rid, op: WriteOp) {
+    let idx = s.streams[stream as usize].rows.len() as u8;
+    let dirs = op_dirs(op);
+    if stream == ROOT && dirs & m.delegated_dirs() != 0 {
+        s.saw |= SAW_SETTLE_RELEASE;
+        check_reads(m, s, dirs, rid, idx);
+    }
+    let alone = stream == ROOT && !has_peer(s, s.view_roster);
+    let st = &mut s.streams[stream as usize];
+    let version = (st.cfgs.len() - 1) as u8;
+    st.rows.push(Row {
+        stream,
+        idx,
+        rid,
+        op,
+        ret: Ret::Conflicted,
+        version,
+        kind: RowKind::Refused,
+        deps: [0; MAXS],
+        alone,
+    });
+    s.waiting
+        .retain(|w| !(w.node == at && w.rid == rid && !w.settle));
+    park_answer(s, at, stream, idx);
+}
+
+/// Node `i` sends the settle of its outstanding `rid` to the sequencer in
+/// force by the root's table (the `settle_unowned` knob: to the root).
+fn submit_settle(m: &NodeStreamModel, s: &mut State, i: u8, rid: Rid, op: WriteOp) {
+    let to = if m.settle_unowned {
+        s.root
+    } else {
+        m.executor(s, route(m, s, op))
+    };
+    s.nodes[i as usize].sent_to = to;
+    if to == i {
+        receive_settle(m, s, i, rid, op);
+    } else {
+        s.net.push(Msg::Settle { to, rid, op });
     }
 }
 
@@ -1874,6 +2556,13 @@ impl Model for NodeStreamModel {
         let n = self.n();
         let mut streams = vec![self.root_backups];
         streams.extend(self.grants.iter().map(|g| g.backups));
+        let roster = self.roster0();
+        let mut minted = [0u8; MAXS];
+        for (k, g) in self.grants.iter().enumerate() {
+            if g.dirs == 0 {
+                minted[k + 1] = NONE;
+            }
+        }
         vec![State {
             nodes: vec![
                 Node {
@@ -1886,7 +2575,8 @@ impl Model for NodeStreamModel {
             ],
             streams: streams
                 .into_iter()
-                .map(|backups| Stream {
+                .enumerate()
+                .map(|(k, backups)| Stream {
                     rows: Vec::new(),
                     held: vec![0; n],
                     root_committed: 0,
@@ -1895,6 +2585,7 @@ impl Model for NodeStreamModel {
                         start: 0,
                         backups,
                         record: false,
+                        singleton: k == ROOT as usize && roster & !1 == 0,
                     }],
                     reconfigured: false,
                     stopped: false,
@@ -1906,6 +2597,8 @@ impl Model for NodeStreamModel {
                     } else {
                         0
                     },
+                    root_appended: 0,
+                    release_through: NONE,
                 })
                 .collect(),
             shipped: 0,
@@ -1924,6 +2617,20 @@ impl Model for NodeStreamModel {
             history: Vec::new(),
             rescued: false,
             inherited: 0,
+            epoch: 1,
+            minted,
+            abandoned: 0,
+            orphaned: 0,
+            exported: Vec::new(),
+            roster,
+            view_roster: roster,
+            joins: 0,
+            leaves: 0,
+            reads: 0,
+            reads_granted: 0,
+            settling: 0,
+            eio: Vec::new(),
+            deadlines: 0,
         }]
     }
 
@@ -1938,14 +2645,25 @@ impl Model for NodeStreamModel {
                 continue;
             }
             if !node.outstanding {
-                if (node.next as usize) < self.scripts[i as usize].len() {
+                // A node out of the roster starts nothing (chunk 8).
+                if (node.next as usize) < self.scripts[i as usize].len() && s.roster & (1 << i) != 0
+                {
                     actions.push(Action::Start(i));
                 }
-            } else if !s.live(node.sent_to) || self.stopped_node(s, node.sent_to) {
-                let op = self.scripts[i as usize][node.next as usize - 1];
-                let to = self.executor(s, route(self, s, op));
-                if s.live(to) && !self.stopped_node(s, to) {
-                    actions.push(Action::Retry(i));
+            } else {
+                if !s.live(node.sent_to) || self.stopped_node(s, node.sent_to) {
+                    let op = self.scripts[i as usize][node.next as usize - 1];
+                    let to = if s.settling & (1 << i) != 0 && self.settle_unowned {
+                        s.root
+                    } else {
+                        self.executor(s, route(self, s, op))
+                    };
+                    if s.live(to) && !self.stopped_node(s, to) {
+                        actions.push(Action::Retry(i));
+                    }
+                }
+                if s.deadlines < self.max_deadlines && s.settling & (1 << i) == 0 {
+                    actions.push(Action::Deadline(i));
                 }
             }
         }
@@ -1953,8 +2671,8 @@ impl Model for NodeStreamModel {
             actions.push(Action::Deliver(k));
         }
         for (k, w) in s.waiting.iter().enumerate() {
-            if s.live(w.node)
-                && !matches!(status(self, s, w.node, w.op, &w.deps), Status::Blocked(_))
+            let deps = if w.settle { [0; MAXS] } else { w.deps };
+            if s.live(w.node) && !matches!(status(self, s, w.node, w.op, &deps), Status::Blocked(_))
             {
                 actions.push(Action::Exec(k));
             }
@@ -2007,9 +2725,14 @@ impl Model for NodeStreamModel {
                 )
             });
             let reported = via_root && root_reported(self, s, stream) > st.root_committed;
+            // A non-stealable holder learns the root's appended cursor (its
+            // drain before a release, chunk 7).
+            let drained = self.non_stealable(stream)
+                && exec != s.root
+                && appended(s, stream) > st.root_appended as usize;
             if s.live(exec)
                 && !st.stopped
-                && (reported || root_archived(s, stream) > st.root_archived)
+                && (reported || drained || root_archived(s, stream) > st.root_archived)
             {
                 actions.push(Action::RootAck(stream));
             }
@@ -2026,15 +2749,27 @@ impl Model for NodeStreamModel {
                         }
                     }
                 }
-                for d in bits(asked) {
-                    actions.push(Action::Release {
-                        stream,
-                        dirs: 1 << d,
-                    });
+                // S4 (chunk 9): the cut is answered only after the read
+                // recall.
+                let reads_clear = s.reads & (1 << stream) == 0 || self.cut_before_read_recall;
+                if reads_clear {
+                    for d in bits(asked) {
+                        actions.push(Action::Release {
+                            stream,
+                            dirs: 1 << d,
+                        });
+                    }
                 }
                 let owned = (1..DIRS).any(|d| deleg_owns(self, s, stream, d));
+                // A non-stealable holder releases only once drained: the
+                // root has appended through its last row (chunk 7).
+                let drained_all = !self.non_stealable(stream)
+                    || self.holder_releases_before_drain
+                    || st.root_appended as usize == st.rows.len();
                 if self.stream_releases.contains(&stream)
                     && owned
+                    && drained_all
+                    && reads_clear
                     && !st
                         .rows
                         .iter()
@@ -2042,8 +2777,15 @@ impl Model for NodeStreamModel {
                 {
                     actions.push(Action::ReleaseAll(stream));
                 }
-                if self.ttl_ends.contains(&stream) {
+                if self.ttl(stream) {
                     actions.push(Action::Stop(stream));
+                }
+                if self.reads & (1 << stream) != 0 && s.reads_granted & (1 << stream) == 0 && owned
+                {
+                    actions.push(Action::GrantRead(stream));
+                }
+                if s.reads & (1 << stream) != 0 {
+                    actions.push(Action::RecallRead(stream));
                 }
             }
             // C2e: a stream whose configuration names backups ends only
@@ -2053,6 +2795,25 @@ impl Model for NodeStreamModel {
             let sealable = group == 0 || bits(group).any(|b| s.live(b as u8));
             if end.is_none() && self.ends(stream) && (st.stopped || !s.live(exec)) && sealable {
                 actions.push(Action::End(stream));
+            }
+            // A non-stealable stream ends once the root's journal shows the
+            // holder's release (the knob: once the holder named its cut).
+            if end.is_none() && self.non_stealable(stream) && !(self.ttl(stream) && st.stopped) {
+                let shown = s.streams[ROOT as usize]
+                    .rows
+                    .iter()
+                    .any(|r| r.stream == stream && matches!(r.kind, RowKind::Released { .. }));
+                let named = self.holder_releases_before_drain && st.release_through != NONE;
+                if shown || named {
+                    actions.push(Action::End(stream));
+                }
+            }
+            if end.is_none()
+                && self.abandon.contains(&stream)
+                && s.abandoned == 0
+                && s.minted[stream as usize] != NONE
+            {
+                actions.push(Action::Abandon(stream));
             }
             if s.live(exec) && exec != s.root {
                 if self.learns() && (st.applied as usize) < rcp {
@@ -2073,7 +2834,7 @@ impl Model for NodeStreamModel {
         }
         if s.crashes < self.max_crashes {
             for i in 0..self.n() as u8 {
-                if i != s.root && s.live(i) {
+                if i != s.root && s.live(i) && s.roster & (1 << i) != 0 {
                     actions.push(Action::Crash(i));
                 }
             }
@@ -2089,7 +2850,8 @@ impl Model for NodeStreamModel {
                         && (self.delegate_may_claim || !self.holds_grant(c))
                         && s.shipped >= s.inherited
                 };
-                if eligible && s.live(c) {
+                // A claimant is write-eligible: in the roster (chunk 8).
+                if eligible && s.live(c) && s.roster & (1 << c) != 0 {
                     actions.push(Action::Depose { claimant: c });
                 }
             }
@@ -2099,14 +2861,36 @@ impl Model for NodeStreamModel {
         }
         if !self.grows.is_empty() {
             let t = table(self, s);
+            let root_cfg = *s.streams[ROOT as usize].cfgs.last().unwrap();
             for (k, &(g, dirs)) in self.grows.iter().enumerate() {
                 let done = s.streams[ROOT as usize].rows.iter().any(
-                    |r| matches!(r.kind, RowKind::Grow { stream, dirs: d } if stream == g && d == dirs),
+                    |r| matches!(r.kind, RowKind::Grow { stream, dirs: d } if stream == g && d & !1 == dirs),
                 );
-                if !done && ended(s, g).is_none() && bits(dirs).all(|d| t[d] == ROOT) {
+                // The root's own sticky grant (chunk 8, D3): only while it
+                // roots, has a write-eligible peer and no group.
+                let own = self.grants[g as usize - 1].node;
+                let allowed = own != 0
+                    || (s.root == 0
+                        && has_peer(s, s.view_roster)
+                        && root_cfg.backups == 0
+                        && !root_cfg.singleton);
+                if !done && allowed && ended(s, g).is_none() && bits(dirs).all(|d| t[d] == ROOT) {
                     actions.push(Action::Grow(k as u8));
                 }
             }
+        }
+        for i in 0..self.n() as u8 {
+            let bit = 1 << i;
+            if self.joiners & bit != 0 && s.joins & bit == 0 && s.roster & bit == 0 && s.live(i) {
+                actions.push(Action::Join(i));
+            }
+            if self.leavers & bit != 0 && s.leaves & bit == 0 && s.roster & bit != 0 && i != s.root
+            {
+                actions.push(Action::Leave(i));
+            }
+        }
+        if s.view_roster != s.roster {
+            actions.push(Action::SeeRoster);
         }
         if self.shadow_replay && !s.rescued {
             for &(rid, _, g, idx) in &s.acked {
@@ -2147,7 +2931,18 @@ impl Model for NodeStreamModel {
                 let seq = s.nodes[i as usize].next - 1;
                 let op = self.scripts[i as usize][seq as usize];
                 s.saw |= SAW_RETRY;
-                submit(self, &mut s, i, Rid { node: i, seq }, op);
+                if s.settling & (1 << i) != 0 {
+                    submit_settle(self, &mut s, i, Rid { node: i, seq }, op);
+                } else {
+                    submit(self, &mut s, i, Rid { node: i, seq }, op);
+                }
+            }
+            Action::Deadline(i) => {
+                let seq = s.nodes[i as usize].next - 1;
+                let op = self.scripts[i as usize][seq as usize];
+                s.settling |= 1 << i;
+                s.deadlines += 1;
+                submit_settle(self, &mut s, i, Rid { node: i, seq }, op);
             }
             Action::Rescue(i) => {
                 let &(rid, ..) = s.acked.iter().find(|&&(rid, _, g, idx)| {
@@ -2172,28 +2967,61 @@ impl Model for NodeStreamModel {
                     stream,
                     idx,
                 } => requester_answered(self, &mut s, rid, ret, stream, idx),
-                Msg::NotOwner { rid } => {
+                Msg::NotOwner { rid, from } => {
+                    // A settling requester sends no copy of the op again.
                     let node = s.nodes[rid.node as usize];
-                    if s.live(rid.node) && node.outstanding && node.next == rid.seq + 1 {
+                    if s.live(rid.node)
+                        && node.outstanding
+                        && node.next == rid.seq + 1
+                        && node.sent_to == from
+                        && s.settling & (1 << rid.node) == 0
+                    {
                         let op = self.scripts[rid.node as usize][rid.seq as usize];
                         submit(self, &mut s, rid.node, rid, op);
+                    }
+                }
+                Msg::Settle { to, rid, op } => {
+                    if s.live(to) && !self.stopped_node(&s, to) {
+                        receive_settle(self, &mut s, to, rid, op);
+                    }
+                }
+                Msg::SettleNotOwner { rid, from } => {
+                    let node = s.nodes[rid.node as usize];
+                    if s.live(rid.node)
+                        && node.outstanding
+                        && node.next == rid.seq + 1
+                        && node.sent_to == from
+                        && s.settling & (1 << rid.node) != 0
+                    {
+                        let op = self.scripts[rid.node as usize][rid.seq as usize];
+                        submit_settle(self, &mut s, rid.node, rid, op);
                     }
                 }
             },
             Action::Exec(k) => {
                 let w = s.waiting.remove(k);
-                match status(self, &s, w.node, w.op, &w.deps) {
-                    Status::Run => execute(self, &mut s, w.node, w.rid, w.op, w.deps),
-                    Status::Bounce => {
-                        s.saw |= SAW_NOT_OWNER;
-                        s.net.push(Msg::NotOwner { rid: w.rid });
+                if w.settle {
+                    if w.node == s.root && op_dirs(w.op) & self.delegated_dirs() != 0 {
+                        s.saw |= SAW_SETTLE_RELEASE;
                     }
-                    Status::Blocked(_) => return None,
+                    receive_settle(self, &mut s, w.node, w.rid, w.op);
+                } else {
+                    match status(self, &s, w.node, w.op, &w.deps) {
+                        Status::Run(_) => receive(self, &mut s, w.node, w.rid, w.op, w.deps),
+                        Status::Bounce => {
+                            s.saw |= SAW_NOT_OWNER;
+                            s.net.push(Msg::NotOwner {
+                                rid: w.rid,
+                                from: w.node,
+                            });
+                        }
+                        Status::Blocked(_) => return None,
+                    }
                 }
             }
             Action::Release { stream, dirs } => {
                 // Justified only by an op whose keys span node streams.
-                let t = table_upto(self, &s, s.streams[ROOT as usize].rows.len(), false);
+                let t = table_upto(self, &s, s.streams[ROOT as usize].rows.len(), false, true);
                 let spans = |op: WriteOp| {
                     let mut st = bits(op_dirs(op)).map(|d| t[d]);
                     let first = st.next().unwrap();
@@ -2215,6 +3043,9 @@ impl Model for NodeStreamModel {
                         idx,
                     );
                 }
+                if s.reads_granted & (1 << stream) != 0 && s.reads & (1 << stream) == 0 {
+                    s.saw |= SAW_READ_RECALLED;
+                }
                 push_release(&mut s, stream, dirs);
             }
             Action::ReleaseAll(g) => {
@@ -2222,10 +3053,53 @@ impl Model for NodeStreamModel {
                     .filter(|&d| deleg_owns(self, &s, g, d))
                     .fold(0u8, |m, d| m | (1 << d));
                 s.saw |= SAW_STREAM_RELEASED;
+                if s.reads_granted & (1 << g) != 0 && s.reads & (1 << g) == 0 {
+                    s.saw |= SAW_READ_RECALLED;
+                }
+                if self.holder_releases_before_drain && self.non_stealable(g) {
+                    // The planted bug: the release names the cut the
+                    // holder knows appended, not its stream's end.
+                    let st = &mut s.streams[g as usize];
+                    st.release_through = st.root_appended;
+                }
                 push_release(&mut s, g, dirs);
             }
+            Action::Abandon(g) => {
+                // The operator ends the stream at the root's cursor, no
+                // seal: rows past it are lost for others and kept by the
+                // holder as conflict copies on its return (I5's export).
+                s.abandoned |= 1 << g;
+                end_stream(self, &mut s, g);
+                export_void(&mut s, g);
+            }
+            Action::Join(i) => {
+                s.roster |= 1 << i;
+                s.joins |= 1 << i;
+            }
+            Action::Leave(i) => {
+                s.roster &= !(1 << i);
+                s.leaves |= 1 << i;
+            }
+            Action::SeeRoster => {
+                let view = s.roster;
+                set_roster_view(self, &mut s, view);
+            }
+            Action::GrantRead(g) => {
+                s.reads |= 1 << g;
+                s.reads_granted |= 1 << g;
+            }
+            Action::RecallRead(g) => {
+                s.reads &= !(1 << g);
+            }
             Action::Grow(k) => {
-                let (g, dirs) = self.grows[k as usize];
+                let (g, mut dirs) = self.grows[k as usize];
+                if s.minted[g as usize] == NONE {
+                    // The first record of a number mints it (ADR-43).
+                    s.minted[g as usize] = s.epoch;
+                }
+                if self.root_sticky_on_slash && self.grants[g as usize - 1].node == 0 {
+                    dirs |= 1;
+                }
                 let root = &mut s.streams[ROOT as usize];
                 let pos = root.rows.len() as u8;
                 let version = (root.cfgs.len() - 1) as u8;
@@ -2241,6 +3115,7 @@ impl Model for NodeStreamModel {
                     version,
                     kind: RowKind::Grow { stream: g, dirs },
                     deps: [0; MAXS],
+                    alone: false,
                 });
             }
             Action::Stop(g) => {
@@ -2250,6 +3125,17 @@ impl Model for NodeStreamModel {
                 s.waiting.retain(|w| w.node != node);
             }
             Action::End(g) => {
+                let st = &s.streams[g as usize];
+                let named = self.holder_releases_before_drain
+                    && self.non_stealable(g)
+                    && st.release_through != NONE;
+                if named {
+                    // The root ends at the cut the release named.
+                    let through = st.release_through;
+                    end_stream_at(self, &mut s, g, through);
+                    return Some(finish(self, s));
+                }
+                let released = self.non_stealable(g) && holder_released(&s, g);
                 if !self.end_before_seal {
                     let exec = self.executor(&s, g);
                     let avail = available(&s, g, exec);
@@ -2261,7 +3147,11 @@ impl Model for NodeStreamModel {
                     }
                 }
                 end_stream(self, &mut s, g);
-                s.saw |= SAW_TTL_END;
+                s.saw |= if released {
+                    SAW_STICKY_RELEASED
+                } else {
+                    SAW_TTL_END
+                };
             }
             Action::Learn(g) => {
                 let row = s.streams[ROOT as usize].rows[s.streams[g as usize].applied as usize];
@@ -2289,6 +3179,16 @@ impl Model for NodeStreamModel {
                 if row.stream == ROOT && row.kind == RowKind::Op && op_keys(row.op) & own_keys != 0
                 {
                     s.saw |= SAW_L1;
+                }
+                // The holder learns an end it did not ask for (the abandon,
+                // the orphan rule): it stops; its rows past the cut are its
+                // conflict copies.
+                let imposed = (s.abandoned | s.orphaned) & (1 << g) != 0;
+                if imposed && matches!(row.kind, RowKind::Ended { stream, .. } if stream == g) {
+                    let node = self.grants[g as usize - 1].node;
+                    s.streams[g as usize].stopped = true;
+                    s.pending.retain(|p| !(p.executor == node && p.stream == g));
+                    s.waiting.retain(|w| w.node != node);
                 }
                 if self.replicas {
                     recompute_rview(self, &mut s, g);
@@ -2329,9 +3229,13 @@ impl Model for NodeStreamModel {
             Action::RootAck(g) => {
                 let committed = root_reported(self, &s, g);
                 let archived = root_archived(&s, g);
+                let app = appended(&s, g) as u8;
                 let st = &mut s.streams[g as usize];
                 st.root_committed = st.root_committed.max(committed);
                 st.root_archived = archived;
+                if self.non_stealable(g) {
+                    st.root_appended = app;
+                }
             }
             Action::Answer(k) => {
                 let p = s.pending.remove(k);
@@ -2339,6 +3243,35 @@ impl Model for NodeStreamModel {
                 // The oracle, at emission, from the stores.
                 if self.check_i1 && !committed(self, &s, p.stream, p.idx) {
                     s.violate("ack_implies_committed_by_config", row.rid, p.stream, p.idx);
+                }
+                if p.stream == ROOT && row.stream == ROOT {
+                    // Chunk 8's oracle, from the stores and the roster: an
+                    // answer from the root's disk alone (neither the archive
+                    // nor every listed backup holds the row) only for a row
+                    // journaled while the root's view had no peer.
+                    let root = &s.streams[ROOT as usize];
+                    let c = root.cfgs[cfg_at(&root.cfgs, p.idx)];
+                    let group = c.backups != 0 && bits(c.backups).all(|b| root.held[b] > p.idx);
+                    let lone = p.idx >= s.shipped && !group;
+                    if lone && !row.alone && self.check_lone {
+                        s.violate("no_lone_answer_with_peer", row.rid, ROOT, p.idx);
+                    }
+                }
+                if p.stream != ROOT
+                    && void_row(&s, p.stream, p.idx)
+                    && s.abandoned & (1 << p.stream) != 0
+                {
+                    s.exported.push(row.rid);
+                    s.saw |= SAW_ABANDON_EXPORT;
+                }
+                if p.stream != ROOT && self.non_stealable(p.stream) {
+                    let e = s.minted[p.stream as usize];
+                    if e != 0 && e != NONE && e < s.epoch {
+                        s.saw |= SAW_LATER_EPOCH;
+                    }
+                    if self.grants[p.stream as usize - 1].node == s.root {
+                        s.saw |= SAW_ROOT_STICKY;
+                    }
                 }
                 let entry = (row.rid, row.ret, row.stream, row.idx);
                 if !s.acked.contains(&entry) {
@@ -2356,15 +3289,30 @@ impl Model for NodeStreamModel {
                     s.saw |= SAW_TAKEOVER_ANSWER;
                 }
                 let st = &s.streams[p.stream as usize];
-                let (backups, recorded) = if p.stream == ROOT {
+                let (cfg, recorded) = if p.stream == ROOT {
                     let v = cfg_at(&st.cfgs, p.idx);
-                    (st.cfgs[v].backups, st.cfgs[..=v].iter().any(|c| c.record))
+                    let bumped = st.cfgs[1..=v]
+                        .iter()
+                        .zip(&st.cfgs[..v])
+                        .any(|(c, prev)| c.record && c.singleton != prev.singleton);
+                    if bumped {
+                        s.saw |= SAW_BUMP_ANSWER;
+                    }
+                    (st.cfgs[v], st.cfgs[..=v].iter().any(|c| c.record))
                 } else if row.version == LONE {
-                    (0, false)
+                    (
+                        Cfg {
+                            start: 0,
+                            backups: 0,
+                            record: false,
+                            singleton: false,
+                        },
+                        false,
+                    )
                 } else {
                     let v = row.version as usize;
                     let rec = st.cfgs[..=v].iter().any(|c| c.record);
-                    (st.cfgs[v].backups, rec)
+                    (st.cfgs[v], rec)
                 };
                 let dead = p.stream != ROOT
                     && row.version != LONE
@@ -2379,7 +3327,8 @@ impl Model for NodeStreamModel {
                 if dead {
                     s.saw |= SAW_COVERED;
                 }
-                s.saw |= match self.rule(p.stream, backups) {
+                s.saw |= match self.rule_of(p.stream, &cfg) {
+                    Rule::Final if p.stream == ROOT => SAW_SINGLETON,
                     Rule::Final => SAW_FINAL,
                     Rule::Group { via_root: true, .. } => SAW_VIA_ROOT,
                     Rule::Group { .. } if p.stream != ROOT => SAW_DELEG_BACKUP,
@@ -2420,6 +3369,15 @@ impl Model for NodeStreamModel {
                 } else {
                     shipped
                 };
+                // The deposed root's own rows past the adopted prefix are
+                // gone; an answered one is a singleton's (journaled while its
+                // roster view had no peer: exported on its return, Q6's
+                // contract) or an I5 violation.
+                let lost: Vec<Row> = st.rows[len as usize..]
+                    .iter()
+                    .filter(|r| r.stream == ROOT && !r.record())
+                    .copied()
+                    .collect();
                 st.rows.truncate(len as usize);
                 for h in st.held.iter_mut() {
                     *h = (*h).min(len);
@@ -2437,7 +3395,24 @@ impl Model for NodeStreamModel {
                     start: len,
                     backups: nb,
                     record: false,
+                    singleton: s.roster & !(1 << claimant) == 0,
                 });
+                for r in lost {
+                    if !s.acked.iter().any(|a| a.0 == r.rid) {
+                        continue;
+                    }
+                    // A singleton's own client's row; a peer's op means a
+                    // linked peer, so no singleton.
+                    if r.alone && r.rid.node == old {
+                        s.exported.push(r.rid);
+                        s.saw |= SAW_SINGLETON_EXPORT;
+                    } else {
+                        s.violate("rollback_only_singleton_or_operator", r.rid, ROOT, r.idx);
+                    }
+                }
+                let prev_epoch = s.epoch;
+                s.epoch += 1;
+                s.view_roster = s.roster;
                 s.root = claimant;
                 s.inherited = if self.max_depositions >= 2 && nb == 0 {
                     len
@@ -2445,9 +3420,34 @@ impl Model for NodeStreamModel {
                     0
                 };
                 // The deposed root's parked answers and ops die with its
-                // tenure.
-                s.pending.retain(|p| p.stream != ROOT);
+                // tenure (the `server_replay_queue` knob hands its parked
+                // ops to the claimant instead).
+                s.pending.retain(|p| p.stream != ROOT && p.executor != old);
+                if self.server_replay_queue {
+                    for w in s.waiting.iter_mut() {
+                        if w.node == old && !w.settle {
+                            w.node = claimant;
+                        }
+                    }
+                }
                 s.waiting.retain(|w| w.node != old);
+                // ADR-43's orphan rule: a claim whose marker carries no
+                // tail (the archive alone) proves that the log never
+                // grants a number of the deposed tenure's epoch it does not
+                // carry; such a number with no record in the adopted
+                // journal is ended at what the log holds of it (0).
+                if backups == 0 {
+                    for g in 1..s.streams.len() as u8 {
+                        let listed = s.streams[ROOT as usize].rows.iter().any(|r| {
+                            matches!(r.kind, RowKind::Grow { stream, .. } | RowKind::Ended { stream, .. } if stream == g)
+                        });
+                        if s.minted[g as usize] == prev_epoch && !listed {
+                            s.orphaned |= 1 << g;
+                            s.saw |= SAW_ORPHAN;
+                            end_stream_at(self, &mut s, g, 0);
+                        }
+                    }
+                }
                 // A delegate taking the root re-appends its own rows the
                 // adopted journal lacks, verbatim, then ends its generation.
                 if let Some(g) = self.stream_of_node(claimant) {
@@ -2502,10 +3502,12 @@ impl Model for NodeStreamModel {
                 let new = self.reconfigs.iter().find(|r| r.0 == stream)?.1;
                 let st = &mut s.streams[stream as usize];
                 let idx = st.rows.len() as u8;
+                let singleton = st.cfgs.last().unwrap().singleton;
                 st.cfgs.push(Cfg {
                     start: idx,
                     backups: new,
                     record: true,
+                    singleton,
                 });
                 let v = (st.cfgs.len() - 1) as u8;
                 st.rows.push(Row {
@@ -2520,6 +3522,7 @@ impl Model for NodeStreamModel {
                     version: v,
                     kind: RowKind::Cfg,
                     deps: [0; MAXS],
+                    alone: false,
                 });
                 st.reconfigured = true;
             }
@@ -2527,23 +3530,7 @@ impl Model for NodeStreamModel {
                 s.peer_in_budget = false;
             }
         }
-        if self.replicas && quiescent(self, &s) {
-            s.saw |= SAW_QUIESCENT;
-        }
-        if let Some((marker, data)) = self.probe {
-            let bit = |v: View, k: Key| v & (1 << k) != 0;
-            if replica_views(self, &s)
-                .into_iter()
-                .any(|v| bit(v, marker) && bit(v, data))
-            {
-                s.saw |= SAW_MARKER_AND_DATA;
-            }
-        }
-        s.net.sort_unstable();
-        s.pending.sort_unstable();
-        s.waiting.sort_unstable();
-        s.acked.sort_unstable();
-        Some(s)
+        Some(finish(self, s))
     }
 
     fn properties(&self) -> Vec<Property<Self>> {
@@ -2584,6 +3571,39 @@ impl Model for NodeStreamModel {
                     .all(|(n, sc)| !n.outstanding && n.next as usize == sc.len())
             }),
             Property::sometimes("forward_answered", |_, s: &State| s.saw & SAW_FORWARD != 0),
+            // Chunk 7.
+            Property::always("rollback_only_singleton_or_operator", |_, s: &State| {
+                s.violation
+                    .is_none_or(|v| v.property != "rollback_only_singleton_or_operator")
+                    && rollback_only_singleton_or_operator(s)
+            }),
+            Property::always(
+                "sticky_ends_only_by_holder_or_operator",
+                |m: &NodeStreamModel, s: &State| sticky_ends_only_by_holder_or_operator(m, s),
+            ),
+            Property::always("designation_final", |m: &NodeStreamModel, s: &State| {
+                designation_final(m, s)
+            }),
+            Property::always(
+                "orphan_rule_never_ends_an_answering_grant",
+                |_, s: &State| orphan_rule_never_ends_an_answering_grant(s),
+            ),
+            // Chunk 8.
+            Property::always("no_lone_answer_with_peer", |_, s: &State| {
+                s.violation
+                    .is_none_or(|v| v.property != "no_lone_answer_with_peer")
+            }),
+            // Chunk 9.
+            Property::always("eio_never_lands_late", |_, s: &State| {
+                eio_never_lands_late(s)
+            }),
+            Property::always("one_executable_copy", |m: &NodeStreamModel, s: &State| {
+                one_executable_copy(m, s)
+            }),
+            Property::always("settle_after_reads_recalled", |_, s: &State| {
+                s.violation
+                    .is_none_or(|v| v.property != "settle_after_reads_recalled")
+            }),
         ];
         if self.history {
             props.push(Property::always(
@@ -2780,8 +3800,110 @@ impl Model for NodeStreamModel {
                 |_, s: &State| s.saw & SAW_L1 != 0,
             ));
         }
+        self.witnesses_c7_c9(&mut props);
         props
     }
+}
+
+impl NodeStreamModel {
+    /// Chunks 7 to 9's `sometimes` witnesses, each registered only where
+    /// its topology can reach it.
+    fn witnesses_c7_c9(&self, props: &mut Vec<Property<Self>>) {
+        macro_rules! w {
+            ($name:expr, $bit:expr) => {
+                props.push(Property::sometimes($name, |_, s: &State| s.saw & $bit != 0))
+            };
+        }
+        let sticky_release = self.stream_releases.iter().any(|&g| self.non_stealable(g));
+        if sticky_release && !self.holder_releases_before_drain && !self.ttl_reclaims_sticky {
+            w!("sticky_released", SAW_STICKY_RELEASED);
+        }
+        if !self.abandon.is_empty() {
+            w!("abandon_exported", SAW_ABANDON_EXPORT);
+        }
+        let mints = self.grows.iter().any(|&(g, _)| {
+            self.grants[g as usize - 1].dirs == 0 && self.grants[g as usize - 1].node != 0
+        });
+        if mints && self.max_depositions > 0 && self.root_backups == 0 {
+            w!("orphan_rule_ran", SAW_ORPHAN);
+        }
+        if mints && self.max_depositions > 0 && self.root_backups != 0 {
+            w!("honoured_by_a_later_tenure", SAW_LATER_EPOCH);
+        }
+        // A singleton: no peer at the start, or a peer that may leave.
+        let roster = self.roster0();
+        let singleton = roster & !1 == 0 || self.leavers != 0;
+        if singleton && !self.bump_by_event {
+            w!("singleton_answer", SAW_SINGLETON);
+            if self.max_depositions > 0 && self.joiners != 0 {
+                w!("singleton_export", SAW_SINGLETON_EXPORT);
+            }
+        }
+        let joins = self.joiners != 0 && roster & !1 == 0 && !self.singleton_after_join;
+        if joins {
+            w!("join_bump", SAW_JOIN_BUMP);
+        }
+        if self.leavers != 0 && !self.bump_by_event {
+            w!("leave_bump", SAW_LEAVE_BUMP);
+        }
+        if joins || (self.leavers != 0 && !self.bump_by_event) {
+            w!("bump_answer", SAW_BUMP_ANSWER);
+        }
+        if self.grants.iter().any(|g| g.node == 0) {
+            w!("root_sticky_answer", SAW_ROOT_STICKY);
+        }
+        if self.max_deadlines > 0 {
+            w!("eio_settled", SAW_EIO);
+            w!("settle_outcome", SAW_SETTLE_OUTCOME);
+            if self.scripts.iter().flatten().any(|&op| self.spans(op)) {
+                w!("settle_by_release", SAW_SETTLE_RELEASE);
+            }
+        }
+        if self.reads != 0 && !self.cut_before_read_recall {
+            w!("read_recalled_before_cut", SAW_READ_RECALLED);
+        }
+    }
+}
+
+/// The end of every step: the witnesses read off the new state, and the
+/// unordered collections sorted (their order is not state).
+fn finish(m: &NodeStreamModel, mut s: State) -> State {
+    if m.replicas && quiescent(m, &s) {
+        s.saw |= SAW_QUIESCENT;
+    }
+    if let Some((marker, data)) = m.probe {
+        let bit = |v: View, k: Key| v & (1 << k) != 0;
+        if replica_views(m, &s)
+            .into_iter()
+            .any(|v| bit(v, marker) && bit(v, data))
+        {
+            s.saw |= SAW_MARKER_AND_DATA;
+        }
+    }
+    s.net.sort_unstable();
+    s.pending.sort_unstable();
+    s.waiting.sort_unstable();
+    s.acked.sort_unstable();
+    s.exported.sort_unstable();
+    s.exported.dedup();
+    s
+}
+
+/// Stream `g`'s acknowledged rows past its cut are exported as conflict
+/// copies (the abandon's I5 event; the holder exports them on its return).
+fn export_void(s: &mut State, g: u8) {
+    let rids: Vec<Rid> = s
+        .acked
+        .iter()
+        .filter(|&&(_, _, h, idx)| h == g && void_row(s, g, idx))
+        .map(|&(rid, ..)| rid)
+        .collect();
+    if !rids.is_empty() {
+        s.saw |= SAW_ABANDON_EXPORT;
+    }
+    s.exported.extend(rids);
+    s.exported.sort_unstable();
+    s.exported.dedup();
 }
 
 /// Stream `g`'s holder journals the release of `dirs`.
@@ -2808,5 +3930,6 @@ fn push_release(s: &mut State, g: u8, dirs: u8) {
         version,
         kind: RowKind::Released { dirs, at },
         deps: [0; MAXS],
+        alone: false,
     });
 }
