@@ -66732,3 +66732,46 @@ refresh change (9,402 lost) and not after.
   corruption. `base` and `off` were not run at 10M.
 - Added `cell.py` phase `opendirs`, `BIG_WRITE_MODE`, a populate RSS sampler and a `root` store, `listtool.py holdmany`,
   `bench/readdirplus/report-rerun.py`, and the harness scenario `readdirplus-strict-bench`.
+
+## Open item: a stalled lone root answers its own client `Lone` after its lease could be taken (2026-11-05)
+
+`delegated-core-stall-root-lease6+commit` fails 218 of 2,000 seeds on main. It fails 0 without `+commit`.
+
+The answer is not committed by the configuration in force. Every failure is the same I1 "expected lone,
+committed by none". In each one:
+
+- the client is the answering node's own;
+- the answer comes at the end of the 9 s or the 12.5 s `StallStep`;
+- the 6 s lease has already been claimed by another node.
+
+This is a pre-existing class. It is not what the `Ok(())` of the core-stall check (sim.rs) refers to:
+that check judges delegation loss only.
+
+The mechanism:
+
+- The stalled step's clock reading is stale. Admission (`new_mutation_epoch(now)`) passes on it.
+- The row's class comes from `root_lone`, which has no time term.
+- The own client is answered `Lone` in that same step. Nothing re-reads the clock before the answer.
+
+Traced seeds 1, 12, 16, 19, 23:
+
+- The `ok` answers (121 of 218) are replayed by rid when the deposed root reads its lease, and are
+  accepted 230 to 260 ms after the answer.
+- The refusals (97) have no effect.
+
+So nothing acknowledged is lost. The exposure is ADR-41's `Lone` contract (the successor does not
+show the row until the replay; a conflicting write turns it into a conflict copy), stretched past the
+lease's end by the stall.
+
+Only answers committed on the node's own disk are affected. `Archive` and `RootGroup` answers have an
+external commit point that the takeover fences.
+
+Plan 46 M1.3 removes `Lone` on nodes with peers. It does not remove the cause: a sticky grant's
+own-subtree answers and the singleton's commit on the node's disk too. M1.3 carries the rule:
+
+- An answer committed on this node's disk under a lease or grant re-checks that lease or grant at a
+  fresh clock reading after the journal write.
+- If the lease or grant is no longer usable, it parks the answer as `Archive` instead (aborted at
+  deposition, the requester retries by rid).
+
+This config's `+commit` 0/2,000 is an M1.3 exit. Landing it before M1.3 is a fallback if M1.3 slips.
