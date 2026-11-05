@@ -2961,6 +2961,10 @@ mod tests {
         w.metas[&1]
             .apply_delegate_tx(&records, Some(r), 1, 1, Position::ZERO)
             .unwrap();
+        w.o.appended
+            .lock()
+            .unwrap()
+            .insert((1, 1), (1, vec![3], false));
         let j = w.judge(2, &st, r);
         assert_eq!(j.class, None, "{}", j.detail);
         assert!(j.detail.contains("listed backup 3"), "{}", j.detail);

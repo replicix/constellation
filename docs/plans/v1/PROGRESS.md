@@ -66837,3 +66837,33 @@ first 400 hold an own op back by the gated mark alone); the lead-off control 0 â
 
 **Gates** (box 2): fmt, clippy `-D warnings` (authority, all targets) clean; authority lib 1,045 passed; the release sim suite
 406 passed, 0 failed, 12 ignored.
+
+**Second review round (2026-11-05, Opus re-check of 36f1b89f: CHANGES NEEDED; fixed on box 2, release).**
+- *Oracle.* The review's re-check showed that the tenure rule still hid I1: it accepted the root's copy when any past configuration
+  passed, and counted the current holder's journal as a listed backup (epoch 1's backup B seals, holds epoch 2 alone, appends a
+  delegate's row, the delegate answers before the archive: judged committed). The sim driver now records, when a root takes a delegate's
+  row (`Oracles::appended`: epoch, backups, epoch hold), the tenure that appended it, and the judgement uses only that tenure: the
+  backups its epoch ended with must hold the row (the holder's journal stands in only for one of those), a lone tenure's copy is
+  none, an epoch hold's journal counts until M1.4 (in force at the append or at the answer: the core counts it while the hold is
+  in force, `delegated-epoch`). A row a successor re-journaled while sealing keeps its first record. Unit test
+  `i1_deleg_group_lone_successor_row_is_not_committed_by_its_old_backup_role` (fails before); the three earlier tests pass. The
+  epoch-hold detail message lost its `\` continuation (22 stray spaces): fixed.
+- *Sweeps with the fixed oracle, `+commit`, main / branch, box 2.* `delegated-holder-cut` 0..1,999: 0 / 0 failing (the shape-73 row
+  passes by its epoch's backup). The other 47 delegated configurations (every `delegated-*` of `sweep_config` except holder-cut,
+  `long-delegated`, `long-delegated-backup`, `long-delegated-late-answers`, `far`, `placement-hot`), seeds 0..299: the same
+  failing sets on both, except `delegated-core-stall-root-lease6` (37 / 43 failing, the class below) and `delegated-epoch` (not
+  in main's `sweep_config`; branch 0..1,999: 47 failing, all "shadow installed for an answer not said to be committed", none from
+  the oracle; main 61 in the first review). No failure is the fixed oracle's (an early version of the recording found "no append
+  recorded" for rows that reached the root's journal off the stream, and a re-journaled row's record was overwritten: both fixed
+  above, then clean).
+- *Open: a stalled root answers its own client `Lone` after its lease was taken over (pre-existing on main; ~218 / 2,000 seeds of
+  `delegated-core-stall-root-lease6+commit`).* In that configuration a root stalled past its 6 s lease is taken over, and at the end
+  of the stall (about 20.3 s or 34.8 s, the ends of the 9 s and 12.5 s `StallStep`s) it answers its own client `Lone`, judged
+  "committed by none" (I1); `LEASE LOST` follows. Present on main (217 of 217 failures on main are this signature), not a step 1
+  regression (no step 1 path is reached there); the failing set reshuffles with trajectory (60 shared of 218 / 235). Not the `Ok(())`
+  of the core-stall check, which judges delegation loss. To be triaged separately.
+- *Open (M1.2).* The delegate's ask back-off does not reach the ship cadence: the root's acknowledgement has to say the commit is
+  archive-bound.
+
+**Gates** (box 2): fmt, clippy `-D warnings` (authority, all targets) clean; authority lib 1,045 passed; the release sim suite
+407 passed, 0 failed, 12 ignored.
