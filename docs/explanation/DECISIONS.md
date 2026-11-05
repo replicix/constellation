@@ -2450,6 +2450,19 @@ and plan 43 Q16.
 (2026-11-03)**: the push runs while the root is usable *or in a takeover
 gate whose journal work is done*.
 
+**Amended by plan 46 M1.1 step 1 (2026-11-05, the maintainer's "M1.0
+answers", plan 46 §11)**: the lone-journal branch of the Decision is
+removed. `committed` counts the root's appended copy only once the root's
+own configuration has committed it (`Core::config_committed_jseq`): shipped,
+or held by every backup it gates on; a lone root (no backup listed, none to
+be had), usable or in an ADR-42 gate, commits by the archive alone. "Only
+taken over at the lease's expiry" does not make its journal a second copy: a
+lone root paused past its expiry is taken over from the archive, and a row
+the delegate answered on that journal is lost when the delegate then fails
+(model `node_stream`: knob `root_journal_counts` violates
+`acked_never_lost`). An epoch hold's journal still counts until plan 46 M1.4.
+Cost: such a delegate's `DelegGroup` answers wait for the root's ship.
+
 **Context**: with no backup recorded for its generation the group of a
 delegate is `{delegate, root}`, and the delegate answered a row once the
 root had *journaled its append* of it (`DelegateStreamAck.through`, plan 43
@@ -2686,9 +2699,10 @@ or is releasing is unchanged. A settle of the gated root's own plans no recall
   generations start at `shippable`, not at the gate's opening (the bound is
   unchanged: any instant after the tenure began). The off-core lane stays off
   in the gate (a fenced root publishes no certificate).
-- `committed` inside the gate: a lone gated root (no backup listed) counts its
-  journal at once (`u64::MAX`, as a lone usable root under ADR-41); a backed
-  one raises it when the row ships (nothing is backed before the gate opens).
+- `committed` inside the gate: a lone gated root (no backup listed) counted its
+  journal at once (`u64::MAX`, as a lone usable root under ADR-41) until plan
+  46 M1.1 step 1 (ADR-41's amendment): it, like a backed one, raises it when
+  the row ships (nothing is backed before the gate opens).
 - New interaction found by the sweeps, fixed here (two I1 classes):
   - *Fix A.* Inside the gate the replica's `completed` also holds what the gate
     re-appended to its journal; `answer_awaiting_log` no longer answers an op of

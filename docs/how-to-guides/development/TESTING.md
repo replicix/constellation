@@ -4985,7 +4985,9 @@ holder journal and every listed backup's tail hold the transaction),
 `DelegGroup { gen }` (the delegate's journal and each backup *the answerer's own
 table records* (`DelegGroup` records, plan 43 C2c: the oracle reads the
 answerer's store, not the backup the delegate happens to append to) in its
-delegate tail, or the root's journal when none is recorded), `NonStealable` (a designee,
+delegate tail, or, when none is recorded, the root's journal once every backup
+the lease lists holds the row: with none listed only the archive commits the
+root's copy, plan 46 M1.1), `NonStealable` (a designee,
 or an epoch's hold owner) and `Lone` (the answerer's own client, its group is
 itself, and no peer within the RTT budget that has been linked for the
 stability window — `backup_stable_ms`, the core's own candidate rule: a link

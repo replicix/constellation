@@ -126,8 +126,8 @@ through the delegate. It then:
      ([ADR-41](../../explanation/DECISIONS.md#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16)).
      The delegate sends the row at once rather than on the stream tick; a
      node's op costs one round trip to the root, and one more from the
-     root to its backup when it has one (the root pushes the commit as it
-     rises).
+     root to its backup when it has one, or the root's next ship when it
+     has none (the root pushes the commit as it rises).
    - With a backup recorded (a `DelegGroup` record naming it) the group is
      the delegate and that backup, chosen by RTT to the delegate, exactly
      like the root's (see [Durability and failover](durability-and-failover.md)).

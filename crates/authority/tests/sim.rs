@@ -5621,6 +5621,7 @@ fn sweep_config() {
         // Plan 43 C2: the M11 configurations the sweep did not name.
         "delegated-crash" => delegated_crash_config(),
         "delegated-partition" => delegated_partition_config(),
+        "delegated-epoch" => delegated_epoch_config(),
         "delegated-root-crash" => delegated_root_crash_config(),
         "shared-dir" => shared_dir_config(),
         "shared-dir-split" => shared_dir_split_config(),

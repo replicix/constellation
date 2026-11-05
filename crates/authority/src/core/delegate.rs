@@ -2982,9 +2982,9 @@ impl Core {
         // this tenure committed stays committed: it is shipped, or on every
         // backup this tenure gated on, which a successor holds or has
         // sealed. A full scan lowers the cap after a send only through
-        // `durable_jseq` falling while the lease is held (a backup newly
-        // listed with nothing counted, a listing out or in doubt, an
-        // `AckPolicy` change); the narrowed scan never claims less than the
+        // `config_committed_jseq` falling while the lease is held (a backup
+        // newly listed with nothing counted, a listing out or in doubt, an
+        // `AckPolicy` change, an epoch hold ending); the narrowed scan never claims less than the
         // prefix already sent there, which (b) justifies, and the cap is the
         // full scan's wherever that is not below it. `committed_sent` is
         // assigned, not raised, by a batch's acknowledgement: it may go back,
@@ -4971,8 +4971,17 @@ impl Core {
         let committed = committed.min(through);
         let committed_rose = committed > d.root_committed;
         if is_ask {
-            d.poke_backoff_ms = 0;
+            if committed_rose {
+                d.poke_backoff_ms = 0;
+            } else {
+                // The root had nothing more committed (a lone root's commit
+                // rises when it ships): ask again after the back-off, not on
+                // every tick, or the ask costs one round trip per tick for
+                // the whole wait of the root's ship cadence.
+                self.deleg_poke_backoff(now, gen);
+            }
         }
+        let d = self.dl.mine.get_mut(&gen).expect("present");
         if committed_rose {
             d.root_committed = committed;
             self.stats.deleg_root_committed_raised += 1;

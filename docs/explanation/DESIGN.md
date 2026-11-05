@@ -877,10 +877,11 @@ chosen per filesystem and topology
   else: a delegate with no recorded backup counts the root's appended row
   only once the root's own configuration has committed it
   ([ADR-41](DECISIONS.md#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16),
-  its lone-journal branch removed in plan 46 M1.1, the ADR's amended text
-  following with M1.3), which for a lone root is the archive: a lone root
-  paused past its expiry is taken over from the archive alone, and a row
-  answered on its journal would be lost with the delegate. Another node's forward is acknowledged once its segment
+  as amended by plan 46 M1.1: its lone-journal branch removed), which for a
+  lone root is the archive: a lone root paused past its expiry is taken over
+  from the archive alone, and a row answered on its journal would be lost
+  with the delegate (an epoch hold's journal still counts until plan 46
+  M1.4). Another node's forward is acknowledged once its segment
   is in the log: its row is journaled `Archive`, a deposition keeps it as
   a member copy, and the requester's retry by rid is its only other copy
   ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3),

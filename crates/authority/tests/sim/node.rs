@@ -930,6 +930,7 @@ impl NodeHandle {
     /// store), exactly like a killed process's outstanding PUTs.
     pub fn crash(&self, bus: &Bus) {
         self.shared.alive.store(false, Ordering::SeqCst);
+        self.oracles.epoch_holds.lock().unwrap().remove(&self.id);
         self.shared.lane_wake.notify_one();
         bus.detach(self.id);
         self.task.abort();
@@ -2181,6 +2182,14 @@ impl Driver {
                 _ => None,
             };
             let actions = self.core.handle(now, event, &*self.meta);
+            {
+                let mut holds = self.oracles.epoch_holds.lock().unwrap();
+                if self.core.lease().epoch_held() {
+                    holds.insert(self.id);
+                } else {
+                    holds.remove(&self.id);
+                }
+            }
             {
                 let refused = self.core.stats.deleg_deps_refused;
                 if refused > self.deps_refused_seen {
