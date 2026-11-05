@@ -6274,6 +6274,7 @@ mod token_tests {
     /// log owners), not O(locks × owners): the same tag as asked one owner
     /// at a time, at a cost near the one owner's.
     #[test]
+    #[ignore = "wall-clock guard: run with --ignored on a quiet box"]
     fn a_tag_over_ten_thousand_owners_stays_cheap() {
         let t = LockTables::default();
         let n = 10_000u64;
@@ -7161,6 +7162,7 @@ mod token_tests {
     /// stays near the one at 1,000 (a scan would be ten times it), and the
     /// whole of it under a bound a scan never met.
     #[test]
+    #[ignore = "wall-clock guard: run with --ignored on a quiet box"]
     fn late_admissions_over_ten_thousand_owners_stay_cheap() {
         // `(seconds for the admissions from the table, from the memory)`.
         fn run(n: u64) -> (f64, f64) {
