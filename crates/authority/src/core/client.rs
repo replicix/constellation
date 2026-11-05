@@ -2199,6 +2199,7 @@ impl Core {
                 self.completed_source(replica, rid),
                 AnswerSource::Sequenced(AckClass::Lone),
             );
+            self.park_settled_acceptance(now, rid, &outcome, replica, out);
             self.finish_as(now, rid, outcome, source, replica, out);
             return;
         }
@@ -3417,6 +3418,7 @@ impl Core {
                 self.completed_source(replica, rid),
                 AnswerSource::Sequenced(AckClass::Lone),
             );
+            self.park_settled_acceptance(now, rid, &outcome, replica, out);
             self.finish_as(now, rid, outcome, source, replica, out);
             return;
         }
@@ -3668,6 +3670,30 @@ impl Core {
                 .then_some(outcome);
         }
         self.ack_need(&position).is_none().then_some(outcome)
+    }
+
+    /// Plan 41 P41-01: an acceptance `settled_outcome` found at a lease
+    /// holder (a deadline, a lease-path refusal) is a dedup answer like
+    /// `resolve_in_doubt_then_execute`'s: it waits for the read-delegation
+    /// quarantine (`dedup_acceptance_wait`), parked as `finish` parks a
+    /// local answer. A non-holder knows no successor's quarantine (open).
+    fn park_settled_acceptance(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        outcome: &MutateOutcome,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if !matches!(outcome, MutateOutcome::Accepted { .. })
+            || !(self.lease.held.is_some() || self.lease.epoch_held())
+        {
+            return;
+        }
+        if let Some(wait) = self.dedup_acceptance_wait(now, replica, out) {
+            let durable = self.rd.parked_local.remove(&rid).and_then(|(_, d)| d);
+            self.rd.parked_local.insert(rid, (wait, durable));
+        }
     }
 
     /// The op is neither executed here nor answered by anyone: the client
