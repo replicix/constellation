@@ -16205,14 +16205,14 @@ fn c2_delegated_long_delegation_prod_settles_every_eio() {
 /// fixes, which landed after the classifier; seed 1, its replacement, by S5
 /// (ADR-42: the gate serves the live delegate's generation); seed 2, the
 /// next, by ADR-44 (the gate recalls the generation its own op needs, on
-/// demand); seed 260 is one of the violations that stay: the gated root's own
-/// op on a live delegate's subtree that the delegate does not answer before
-/// its grant from this tenure.) Fails on any build before the
+/// demand), as is 260; seed 449 is one of the violations that stay: the gated
+/// root's own settle, held in its gate past the settle window after the
+/// recall it needed had ended.) Fails on any build before the
 /// classification: no counter.
 #[test]
 fn m03_a_reachable_sequencers_requester_is_not_isolated() {
     let cfg = long_delegated_late_answers_config;
-    let seed = 260;
+    let seed = 449;
     let r = run_seed(seed, cfg()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
     assert!(
         r.unsettled_violations > 0,

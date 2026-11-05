@@ -717,6 +717,21 @@ impl Core {
     /// before the route, and one that answered `NotHolder` naming this node
     /// has disowned the generation). The gate does the same now
     /// (`gate_recall_on_demand` with no redirect), not when it opens.
+    /// ADR-44: this node's own settle waits in `Backoff` for the recall its
+    /// gate sent on demand, and is routed as a settle again then
+    /// (`on_forward_backoff` -> `settle_route`).
+    fn gate_hold_settle(&mut self, now: Now, rid: Rid, out: &mut Vec<Action>) {
+        let delay = self.cfg.recall_hold_ms.max(50);
+        let timer = self.set_timer_wait(now.wait.plus(delay), Timer::ForwardBackoff(rid), out);
+        if let Some(c) = self.clients.get_mut(&rid) {
+            c.phase = Phase::Backoff;
+            c.gate_recall_wait = true;
+            if let Some(t) = c.timer.replace(timer) {
+                self.cancel_timer(t, out);
+            }
+        }
+    }
+
     /// `true`: a recall the op needs is in flight in the gate.
     fn gate_recall_for_own(
         &mut self,
@@ -1125,15 +1140,7 @@ impl Core {
         // `settle_route`) once the cut may be journaled, not sent down the
         // lease path, which waits for the open.
         if self.gate_recall_for_own(now, rid, replica, out) && settle {
-            let delay = self.cfg.recall_hold_ms.max(50);
-            let timer = self.set_timer_wait(now.wait.plus(delay), Timer::ForwardBackoff(rid), out);
-            if let Some(c) = self.clients.get_mut(&rid) {
-                c.phase = Phase::Backoff;
-                c.gate_recall_wait = true;
-                if let Some(t) = c.timer.replace(timer) {
-                    self.cancel_timer(t, out);
-                }
-            }
+            self.gate_hold_settle(now, rid, out);
             return;
         }
         // Plan 31 C8: a forward-only node forwards whatever
@@ -1872,7 +1879,22 @@ impl Core {
             .get_mut(&rid)
             .is_some_and(|c| std::mem::take(&mut c.gate_recall_wait));
         if settle && gate_recall_wait {
+            if let Some(c) = self.clients.get_mut(&rid) {
+                c.held_by = held_by;
+            }
             self.settle_route(now, rid, replica, out);
+            return;
+        }
+        // ADR-44: an open root would execute the op here (above), after
+        // recalling what its keys fall under: its delegate answered
+        // `NotHolder` naming this node, or `Held`, and the backoff tries it
+        // again. In a shippable gate the recall goes out now; a settle
+        // waits for it here.
+        if self.gate_recall_for_own(now, rid, replica, out) && settle {
+            self.gate_hold_settle(now, rid, out);
+            if let Some(c) = self.clients.get_mut(&rid) {
+                c.held_by = held_by;
+            }
             return;
         }
         // Plan 30 §M12: the op may be this node's own to execute by now

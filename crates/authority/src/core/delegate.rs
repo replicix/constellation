@@ -7053,6 +7053,14 @@ impl Core {
                 to,
                 msg: PeerMsg::DelegRecall { req, dir, gen },
             });
+        } else {
+            tracing::debug!(
+                node = self.me(),
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
+                gate_recalled,
+                gated = self.lease.gate.is_some(),
+                "an unanswered recall is not sent again now (this root is not usable)"
+            );
         }
         let t = self.set_timer_wait(now.wait.plus(back_off), Timer::DelegRecallResend(gen), out);
         let g = self.dl.gens.get_mut(&gen).expect("present");
