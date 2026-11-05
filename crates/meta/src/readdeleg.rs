@@ -232,6 +232,26 @@ fn bucket(ms: u64) -> usize {
 }
 
 impl ReadDelegations {
+    /// A process restart in the simulator, which keeps the node's `Meta`
+    /// (its journal) across a crash: both tables are the process's memory
+    /// (module doc), so a restarted daemon starts with none of them. A
+    /// held delegation kept across the restart would be judged on the new
+    /// incarnation's honour clock against a stamp from the old one: a
+    /// backward wall step while the node was down (the clock mix's
+    /// reboot) made it look live for that much longer
+    /// (`strict-isolated-reader-beats` seed 218011). What a restart must
+    /// still wait out of the grants is the persisted horizon
+    /// ([`crate::store::Meta::load_grant_quarantine`]), which the core
+    /// loads at start. The counters are kept (the simulator sums them).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn reset_for_restart(&self) {
+        *self.inner.lock().unwrap() = Inner::default();
+        self.live_grants.store(0, Ordering::SeqCst);
+        self.alone.store(true, Ordering::SeqCst);
+    }
+}
+
+impl ReadDelegations {
     // ---- holder side ----
 
     /// Record a grant to `node` on `ino`, live until `until` (this node's

@@ -8800,6 +8800,30 @@ fn the_causal_cut_oracle_catches_a_delegate_that_skips_its_dependency_wait() {
     );
 }
 
+/// Simulator fidelity, pinned: `strict-isolated-reader-beats` seeds 218011,
+/// 218233, 218388, 218613 and 218848 (default clock mix). The mix reboots the
+/// isolated reader (node 3) with a backward wall step (-1.9 to -8.9 s); the
+/// simulator restarts a node with its `Meta`, and the read-delegation tables
+/// in it (the process's memory in the daemon) survived the restart. The held
+/// delegation's honour stamp, from the old incarnation's clock, read as live
+/// on the new, stepped-back one, and the reader served strict reads from it
+/// for about 4.7 s while still isolated (close-to-open). A restarted node now
+/// starts with empty tables (`ReadDelegations::reset_for_restart`), as the
+/// daemon does; what a restart must wait out of its grants is the persisted
+/// horizon, which the core loads at start.
+#[test]
+fn regression_a_restart_keeps_no_read_delegation_seeds_218011_and_more() {
+    let failures: Vec<String> = [218011u64, 218233, 218388, 218613, 218848]
+        .into_iter()
+        .filter_map(|seed| {
+            run_seed(seed, strict_isolated_reader_beats_config())
+                .err()
+                .map(|e| format!("strict-isolated-reader-beats seed {seed}: {e}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 const CAUSAL_CUT_SEEDS: u64 = 40;
 
 /// Oracle false positive, pinned: seed 1525 of `delegated-group-switch` with

@@ -511,7 +511,13 @@ impl NodeHandle {
         epoch: SimEpoch,
     ) -> NodeHandle {
         let meta = match meta {
-            Some(m) => m,
+            Some(m) => {
+                // The read-delegation tables are the process's memory: a
+                // restarted daemon has none (only the persisted horizon,
+                // which the core loads at start).
+                m.read_delegations().reset_for_restart();
+                m
+            }
             None => {
                 let m = Meta::open_in_memory().expect("meta");
                 m.set_node_prefix(id).expect("prefix");
