@@ -6,6 +6,7 @@ pub mod error;
 pub mod hlc;
 pub mod locks;
 pub mod mutate;
+mod owner_table;
 pub mod policy_lex;
 pub mod prune;
 pub mod readdeleg;

@@ -116,6 +116,7 @@
 //! lock anywhere each is one relaxed atomic load (two loads while locks
 //! are held under grants that are still honoured).
 
+use crate::owner_table::{LapsedMemory, OwnerTable};
 use crate::session::Position;
 use constellation_types::clock::{HonourMs, Now, WaitMs};
 use serde::{Deserialize, Serialize};
@@ -901,8 +902,9 @@ pub struct LockStats {
 /// five).
 #[derive(Default)]
 struct Inner {
-    /// Sequencer side.
-    grants: BTreeMap<GrantId, Grant>,
+    /// Sequencer side: the grant records, indexed by inode and end
+    /// ([`OwnerTable`]: the only way to change them).
+    grants: OwnerTable,
     /// Node side, by inode.
     held: BTreeMap<u64, HeldGrant>,
     local: BTreeMap<u64, Vec<LocalLock>>,
@@ -952,8 +954,7 @@ struct Inner {
     /// by the inode leaving this table and by its release. At most
     /// [`ENDED_KEPT`] in all, the oldest evicted first (an evicted entry
     /// only refuses what it would have admitted).
-    lapsed: BTreeMap<u64, Vec<Grant>>,
-    lapsed_order: std::collections::VecDeque<GrantId>,
+    lapsed: LapsedMemory,
     /// Sequencer side, plan 43 C7-F F-c: the grants this table replaced by a
     /// newer one of the same node *while the old one was live* (a
     /// re-affirmation: [`LockTables::note_continues`]), old id → new id. The
@@ -1247,16 +1248,10 @@ impl Inner {
     /// outwait: the next holder may be granted from now on). Whether any
     /// was dropped.
     fn drop_expired(&mut self, now: WaitMs) -> bool {
-        if !self.grants.values().any(|e| e.until <= now) {
+        if !self.grants.any_expired(now) {
             return false;
         }
-        let expired: Vec<Grant> = self
-            .grants
-            .values()
-            .filter(|e| e.until <= now)
-            .copied()
-            .collect();
-        for e in expired {
+        for e in self.grants.expired(now) {
             self.grants.remove(&e.id);
             self.note_ended(e.id, e.until);
             if e.settled {
@@ -1273,41 +1268,12 @@ impl Inner {
 
     /// Remember a settled record that expired here (see [`Inner::lapsed`]).
     fn remember_lapsed(&mut self, e: Grant) {
-        self.forget_lapsed(e.id);
-        self.lapsed.entry(e.ino).or_default().push(e);
-        self.lapsed_order.push_back(e.id);
-        while self.lapsed_order.len() > ENDED_KEPT {
-            if let Some(old) = self.lapsed_order.pop_front() {
-                self.remove_lapsed(old);
-            }
-        }
-    }
-
-    fn remove_lapsed(&mut self, id: GrantId) -> Option<Grant> {
-        let mut found = None;
-        let mut empty = None;
-        for (ino, v) in self.lapsed.iter_mut() {
-            if let Some(i) = v.iter().position(|g| g.id == id) {
-                found = Some(v.remove(i));
-                if v.is_empty() {
-                    empty = Some(*ino);
-                }
-                break;
-            }
-        }
-        if let Some(ino) = empty {
-            self.lapsed.remove(&ino);
-        }
-        found
+        self.lapsed.remember(e, ENDED_KEPT);
     }
 
     /// `id`'s memory goes (it was released, admitted late, superseded).
     fn forget_lapsed(&mut self, id: GrantId) -> Option<Grant> {
-        let g = self.remove_lapsed(id)?;
-        if let Some(i) = self.lapsed_order.iter().position(|x| *x == id) {
-            self.lapsed_order.remove(i);
-        }
-        Some(g)
+        self.lapsed.forget(&id)
     }
 
     /// A record of `node` in `mode` enters (or is strengthened in) this
@@ -1321,10 +1287,9 @@ impl Inner {
         if self.lapsed.is_empty() {
             return;
         }
-        let Some(v) = self.lapsed.get(&ino) else {
-            return;
-        };
-        let gone: Vec<GrantId> = v
+        let gone: Vec<GrantId> = self
+            .lapsed
+            .on_ino(ino)
             .iter()
             .filter(|e| e.node == node || e.mode.conflicts(mode))
             .map(|e| e.id)
@@ -1340,16 +1305,7 @@ impl Inner {
         if self.lapsed.is_empty() {
             return;
         }
-        let gone: Vec<GrantId> = self
-            .lapsed
-            .values()
-            .flatten()
-            .filter(|g| under(g))
-            .map(|g| g.id)
-            .collect();
-        for id in gone {
-            self.forget_lapsed(id);
-        }
+        self.lapsed.forget_where(under);
     }
 
     /// The table's clock now (see `LockTables::set_clock`), or
@@ -1999,8 +1955,8 @@ impl LockTables {
     pub fn own_grant(&self, ino: u64, node: u64, now: WaitMs) -> Option<Grant> {
         self.lock()
             .grants
-            .values()
-            .find(|e| e.ino == ino && e.node == node && e.until > now)
+            .on_ino(ino)
+            .find(|e| e.node == node && e.until > now)
             .copied()
     }
 
@@ -2008,11 +1964,13 @@ impl LockTables {
     /// recalled flag, and extend it.
     pub fn upgrade(&self, id: GrantId, mode: LockMode, until: WaitMs) -> bool {
         let mut g = self.lock();
-        match g.grants.get_mut(&id) {
-            Some(e) => {
-                e.mode = e.mode.max(mode);
-                e.until = e.until.max(until);
-                let (ino, node, mode) = (e.ino, e.node, e.mode);
+        let changed = g.grants.update(&id, |e| {
+            e.mode = e.mode.max(mode);
+            e.until = e.until.max(until);
+            (e.ino, e.node, e.mode)
+        });
+        match changed {
+            Some((ino, node, mode)) => {
                 g.supersede(ino, node, mode);
                 true
             }
@@ -2045,31 +2003,23 @@ impl LockTables {
         };
         let mut g = self.lock();
         let mut until = until;
-        g.grants.retain(|_, e| {
-            if e.node == node && e.ino == ino {
-                until = until.max(e.until);
-                false
-            } else {
-                true
-            }
-        });
-        g.grants.insert(
+        for e in g.grants.remove_on_ino_where(ino, |e| e.node == node) {
+            until = until.max(e.until);
+        }
+        g.grants.insert(Grant {
             id,
-            Grant {
-                id,
-                node,
-                ino,
-                mode,
-                until,
-                recalled: false,
-                gen,
-                confirmed: Grant::MINTED,
-                // A mint: made only where no grace, floor or barrier holds
-                // the inode, so every grant before it was issued before it
-                // (`Grant::settled`).
-                settled: true,
-            },
-        );
+            node,
+            ino,
+            mode,
+            until,
+            recalled: false,
+            gen,
+            confirmed: Grant::MINTED,
+            // A mint: made only where no grace, floor or barrier holds
+            // the inode, so every grant before it was issued before it
+            // (`Grant::settled`).
+            settled: true,
+        });
         g.supersede(ino, node, mode);
         g.stats.grants_made += 1;
         id
@@ -2081,9 +2031,9 @@ impl LockTables {
     pub fn install(&self, grant: Grant) {
         let mut g = self.lock();
         g.grants
-            .retain(|_, e| !(e.node == grant.node && e.ino == grant.ino));
+            .remove_on_ino_where(grant.ino, |e| e.node == grant.node);
         g.supersede(grant.ino, grant.node, grant.mode);
-        g.grants.insert(grant.id, grant);
+        g.grants.insert(grant);
     }
 
     /// [`Self::install`] for a grant that moved carrying what was left of
@@ -2095,16 +2045,14 @@ impl LockTables {
     pub fn install_keeping_later(&self, grant: Grant) {
         let mut g = self.lock();
         let mut grant = grant;
-        g.grants.retain(|_, e| {
-            if e.node == grant.node && e.ino == grant.ino {
-                grant.until = grant.until.max(e.until);
-                false
-            } else {
-                true
-            }
-        });
+        for e in g
+            .grants
+            .remove_on_ino_where(grant.ino, |e| e.node == grant.node)
+        {
+            grant.until = grant.until.max(e.until);
+        }
         g.supersede(grant.ino, grant.node, grant.mode);
-        g.grants.insert(grant.id, grant);
+        g.grants.insert(grant);
     }
 
     /// Install a grant made elsewhere unless this table already has a
@@ -2132,13 +2080,13 @@ impl LockTables {
             self.expired_dropped.store(true, Ordering::Relaxed);
         }
         if g.grants
-            .values()
-            .any(|e| e.ino == grant.ino && (e.node == grant.node || e.mode.conflicts(grant.mode)))
+            .on_ino(grant.ino)
+            .any(|e| e.node == grant.node || e.mode.conflicts(grant.mode))
         {
             return false;
         }
         g.supersede(grant.ino, grant.node, grant.mode);
-        g.grants.insert(grant.id, grant);
+        g.grants.insert(grant);
         true
     }
 
@@ -2150,8 +2098,8 @@ impl LockTables {
             self.expired_dropped.store(true, Ordering::Relaxed);
         }
         g.grants
-            .values()
-            .filter(|e| e.ino == ino && e.node != node && e.mode.conflicts(mode))
+            .on_ino(ino)
+            .filter(|e| e.node != node && e.mode.conflicts(mode))
             .copied()
             .collect()
     }
@@ -2196,10 +2144,16 @@ impl LockTables {
         from: (u64, i64),
     ) -> Option<(LockMode, bool)> {
         let mut g = self.lock();
-        let e = g.grants.get_mut(&id).filter(|e| e.node == node)?;
-        e.until = e.until.max(until);
-        e.confirm(from.0, from.1);
-        Some((e.mode, e.recalled))
+        g.grants
+            .update(&id, |e| {
+                if e.node != node {
+                    return None;
+                }
+                e.until = e.until.max(until);
+                e.confirm(from.0, from.1);
+                Some((e.mode, e.recalled))
+            })
+            .flatten()
     }
 
     /// [`Self::extend`] for a record that is still live: `None` unless
@@ -2221,25 +2175,27 @@ impl LockTables {
     ) -> Option<(LockMode, bool)> {
         let mut g = self.lock();
         let now = g.now_or(fallback);
-        let e = g
-            .grants
-            .get_mut(&id)
-            .filter(|e| e.node == node && e.until > now.wait)?;
-        e.until = e.until.max(until);
-        e.confirm(from.0, from.1);
-        Some((e.mode, e.recalled))
+        g.grants
+            .update(&id, |e| {
+                if e.node != node || e.until <= now.wait {
+                    return None;
+                }
+                e.until = e.until.max(until);
+                e.confirm(from.0, from.1);
+                Some((e.mode, e.recalled))
+            })
+            .flatten()
     }
 
     pub fn mark_recalled(&self, id: GrantId) -> bool {
-        let mut g = self.lock();
-        match g.grants.get_mut(&id) {
-            Some(e) => {
+        self.lock()
+            .grants
+            .update(&id, |e| {
                 let first = !e.recalled;
                 e.recalled = true;
                 first
-            }
-            None => false,
-        }
+            })
+            .unwrap_or(false)
     }
 
     /// The grant ended here (released, or outwaited): gone from the
@@ -2358,7 +2314,7 @@ impl LockTables {
         let mut g = self.lock();
         // An id this table replaced while it was live is its replacement.
         let mut id = id;
-        if !g.grants.contains_key(&id) && !g.lapsed.values().flatten().any(|e| e.id == id) {
+        if !g.grants.contains_key(&id) && !g.lapsed.contains(&id) {
             for _ in 0..4 {
                 let Some(next) = g.continues.get(&id).copied() else {
                     break;
@@ -2371,11 +2327,12 @@ impl LockTables {
         }
         // Belt and braces: a live record of another node in a conflicting
         // mode beside the one admitted would mean a supersede path is
-        // missing; never admit beside it.
+        // missing; never admit beside it. O(records on the inode): the
+        // owner table's inode index (plan 41 item 7).
         let beside = |g: &Inner, ino: u64, node: u64, mode: LockMode| {
-            g.grants.values().any(|o| {
-                o.ino == ino && o.until > now.wait && o.node != node && o.mode.conflicts(mode)
-            })
+            g.grants
+                .on_ino(ino)
+                .any(|o| o.until > now.wait && o.node != node && o.mode.conflicts(mode))
         };
         if let Some(e) = g
             .grants
@@ -2388,33 +2345,26 @@ impl LockTables {
                 g.stats.late_refused += 1;
                 return None;
             }
-            let e = g.grants.get_mut(&id).expect("present");
-            e.until = e.until.max(until);
-            e.confirmed = Some(from);
-            let out = LateAdmitted {
-                id,
-                mode: e.mode,
-                recalled: e.recalled,
-                from_memory: false,
-            };
+            let out = g
+                .grants
+                .update(&id, |e| {
+                    e.until = e.until.max(until);
+                    e.confirmed = Some(from);
+                    LateAdmitted {
+                        id,
+                        mode: e.mode,
+                        recalled: e.recalled,
+                        from_memory: false,
+                    }
+                })
+                .expect("present");
             g.ended.remove(&id);
             g.stats.late_admitted += 1;
             return Some(out);
         }
-        let known = g.lapsed.values().flatten().any(|e| e.id == id);
-        if known {
-            let ok = g
-                .lapsed
-                .values()
-                .flatten()
-                .find(|e| e.id == id)
-                .is_some_and(|e| e.node == node && e.mode.covers(mode) && e.settled);
-            let conflicting = g
-                .lapsed
-                .values()
-                .flatten()
-                .find(|e| e.id == id)
-                .is_some_and(|e| beside(&g, e.ino, e.node, e.mode));
+        if let Some(e) = g.lapsed.get(&id).copied() {
+            let ok = e.node == node && e.mode.covers(mode) && e.settled;
+            let conflicting = beside(&g, e.ino, e.node, e.mode);
             if ok && !conflicting {
                 let mut e = g.forget_lapsed(id).expect("remembered");
                 e.until = until;
@@ -2422,10 +2372,9 @@ impl LockTables {
                 e.confirmed = Some(from);
                 e.settled = true;
                 // The same node's older record on the inode is replaced.
-                g.grants
-                    .retain(|_, o| !(o.node == e.node && o.ino == e.ino));
+                g.grants.remove_on_ino_where(e.ino, |o| o.node == e.node);
                 g.supersede(e.ino, e.node, e.mode);
-                g.grants.insert(e.id, e);
+                g.grants.insert(e);
                 g.ended.remove(&id);
                 g.stats.late_admitted += 1;
                 return Some(LateAdmitted {
@@ -2462,7 +2411,7 @@ impl LockTables {
                 ..e.to_wire(now)
             })
             .collect();
-        out.extend(g.lapsed.values().flatten().map(|e| GrantWire {
+        out.extend(g.lapsed.values().map(|e| GrantWire {
             lapsed: true,
             ..e.to_wire(now)
         }));
@@ -2483,8 +2432,8 @@ impl LockTables {
         // same node) supersedes it at once.
         let beside = g
             .grants
-            .values()
-            .any(|o| o.ino == grant.ino && (o.node == grant.node || o.mode.conflicts(grant.mode)));
+            .on_ino(grant.ino)
+            .any(|o| o.node == grant.node || o.mode.conflicts(grant.mode));
         if !beside {
             g.remember_lapsed(grant);
         }
@@ -2492,17 +2441,12 @@ impl LockTables {
 
     /// How many lapsed memories are kept (tests, status).
     pub fn lapsed_len(&self) -> usize {
-        self.lock().lapsed_order.len()
+        self.lock().lapsed.len()
     }
 
     /// The lapsed memory of `id`, if any (tests).
     pub fn lapsed_get(&self, id: GrantId) -> Option<Grant> {
-        self.lock()
-            .lapsed
-            .values()
-            .flatten()
-            .find(|e| e.id == id)
-            .copied()
+        self.lock().lapsed.get(&id).copied()
     }
 
     /// How long an ended grant is remembered past the end of its record:
@@ -2874,12 +2818,7 @@ impl LockTables {
 
     /// Grants whose `until` has passed (still in the table).
     pub fn expired(&self, now: WaitMs) -> Vec<Grant> {
-        self.lock()
-            .grants
-            .values()
-            .filter(|e| e.until <= now)
-            .copied()
-            .collect()
+        self.lock().grants.expired(now)
     }
 
     pub fn grants_snapshot(&self) -> Vec<Grant> {
@@ -2889,15 +2828,7 @@ impl LockTables {
     /// Remove and return the grants of generation `gen`.
     pub fn take_by_gen(&self, gen: u64) -> Vec<Grant> {
         let mut g = self.lock();
-        let taken: Vec<Grant> = g
-            .grants
-            .values()
-            .filter(|e| e.gen == gen)
-            .copied()
-            .collect();
-        for t in &taken {
-            g.grants.remove(&t.id);
-        }
+        let taken = g.grants.remove_where(|e| e.gen == gen);
         // The generation's inodes leave this table: so does the memory.
         g.supersede_where(|e| e.gen == gen);
         taken
@@ -2910,7 +2841,7 @@ impl LockTables {
         g.grants
             .values()
             .map(|e| (e.id, e.ino))
-            .chain(g.lapsed.values().flatten().map(|e| (e.id, e.ino)))
+            .chain(g.lapsed.values().map(|e| (e.id, e.ino)))
             .collect()
     }
 
@@ -2924,15 +2855,7 @@ impl LockTables {
             return Vec::new();
         }
         let mut g = self.lock();
-        let taken: Vec<Grant> = g
-            .grants
-            .values()
-            .filter(|e| ids.contains(&e.id))
-            .copied()
-            .collect();
-        for t in &taken {
-            g.grants.remove(&t.id);
-        }
+        let taken = g.grants.remove_where(|e| ids.contains(&e.id));
         g.supersede_where(|e| ids.contains(&e.id));
         taken
     }
@@ -2963,15 +2886,7 @@ impl LockTables {
     /// [`Self::take_where_outside`].
     pub fn take_where(&self, under: impl Fn(u64) -> bool) -> Vec<Grant> {
         let mut g = self.lock();
-        let taken: Vec<Grant> = g
-            .grants
-            .values()
-            .filter(|e| under(e.ino))
-            .copied()
-            .collect();
-        for t in &taken {
-            g.grants.remove(&t.id);
-        }
+        let taken = g.grants.remove_where(|e| under(e.ino));
         g.supersede_where(|e| under(e.ino));
         taken
     }
@@ -2998,7 +2913,6 @@ impl LockTables {
         let n = g.grants.len();
         g.grants.clear();
         g.lapsed.clear();
-        g.lapsed_order.clear();
         n
     }
 
@@ -3723,15 +3637,17 @@ impl LockTables {
         }
         let sent = now.honour;
         let end = now.wait.plus((ttl + margin_ms).max(0) as u64);
-        let mut recalled = false;
-        if let Some(e) = g.grants.get_mut(&id) {
-            e.until = e.until.max(end);
-            // Confirmed from this renewal's send on this node's own clock
-            // (`clock`), as a peer's renewal confirms from its holder's
-            // (plan 43 C7b, row 29).
-            e.confirm(clock, sent.0);
-            recalled = e.recalled;
-        }
+        let recalled = g
+            .grants
+            .update(&id, |e| {
+                e.until = e.until.max(end);
+                // Confirmed from this renewal's send on this node's own
+                // clock (`clock`), as a peer's renewal confirms from its
+                // holder's (plan 43 C7b, row 29).
+                e.confirm(clock, sent.0);
+                e.recalled
+            })
+            .unwrap_or(false);
         if let Some(h) = g.held.get_mut(&ino) {
             h.renewing = None;
             h.route = Some(me);
@@ -7151,6 +7067,60 @@ mod token_tests {
         )
     }
 
+    /// Plan 41 item 7, the complexity guard: closing 10,000 locked files of
+    /// the sequencer's own grants admits up to 10,000 late renewals in one
+    /// renewal step. Each was O(records) (a scan for a conflicting record, a
+    /// `retain` over every record, scans of the lapsed memory), the step
+    /// O(n²): 1 to 58 s, during which nothing renewed. Now each is
+    /// O(records on the inode): the per-admission cost at 10,000 records
+    /// stays near the one at 1,000 (a scan would be ten times it), and the
+    /// whole of it under a bound a scan never met.
+    #[test]
+    fn late_admissions_over_ten_thousand_owners_stay_cheap() {
+        // `(seconds for the admissions from the table, from the memory)`.
+        fn run(n: u64) -> (f64, f64) {
+            let t = LockTables::default();
+            let ids: Vec<GrantId> = (0..n)
+                .map(|ino| mint(&t, 2, ino, LockMode::Exclusive, 100))
+                .collect();
+            // Every record expired, still in the table: the first path.
+            let s = std::time::Instant::now();
+            for id in &ids {
+                assert!(admit(&t, *id, 2, LockMode::Exclusive, 150).is_some());
+            }
+            let table = s.elapsed().as_secs_f64();
+            // Every record outwaited into the memory (the newest 4,096 kept):
+            // the second path, each admission replacing the node's record.
+            assert_eq!(t.lapsed_len(), 0);
+            outwait(&t, 0, 1_000);
+            let kept: Vec<GrantId> = ids
+                .iter()
+                .copied()
+                .filter(|id| t.lapsed_get(*id).is_some())
+                .collect();
+            assert_eq!(kept.len() as u64, n.min(ENDED_KEPT as u64));
+            let s = std::time::Instant::now();
+            for id in &kept {
+                assert!(admit(&t, *id, 2, LockMode::Exclusive, 1_050).is_some());
+            }
+            let memory = s.elapsed().as_secs_f64() * n as f64 / kept.len() as f64;
+            assert_eq!(t.lapsed_len(), 0);
+            assert_eq!(t.grants_len() as u64, kept.len() as u64);
+            (table, memory)
+        }
+        let _warm = run(1_000);
+        let small = run(1_000);
+        let big = run(10_000);
+        // Per admission, 10,000 against 1,000 records: O(log n) is about
+        // 1.3 times, a scan 10 times. 4 leaves room for a noisy host.
+        let ratio = |b: f64, s: f64| (b / 10_000.0) / (s / 1_000.0).max(1e-9);
+        assert!(
+            ratio(big.0, small.0) < 4.0 && ratio(big.1, small.1) < 4.0,
+            "late admissions scale with the table: 1,000 {small:?} s, 10,000 {big:?} s"
+        );
+        assert!(big.0 + big.1 < 2.0, "10,000 late admissions took {big:?} s");
+    }
+
     /// The record is still in the table, expired and not dropped: a late
     /// renewal extends it (looked up before anything drops it), is confirmed
     /// from the admission so an older token is judged by its window, and
@@ -7496,20 +7466,17 @@ mod token_tests {
         let id = mint(&t, 2, 7, LockMode::Exclusive, 100);
         outwait(&t, 7, 150);
         // A conflicting live record the supersede paths did not see.
-        t.lock().grants.insert(
-            GrantId { node: 9, seq: 5 },
-            Grant {
-                id: GrantId { node: 9, seq: 5 },
-                node: 3,
-                ino: 7,
-                mode: LockMode::Exclusive,
-                until: WaitMs(900),
-                recalled: false,
-                gen: 0,
-                confirmed: Some((1, 0)),
-                settled: true,
-            },
-        );
+        t.lock().grants.insert(Grant {
+            id: GrantId { node: 9, seq: 5 },
+            node: 3,
+            ino: 7,
+            mode: LockMode::Exclusive,
+            until: WaitMs(900),
+            recalled: false,
+            gen: 0,
+            confirmed: Some((1, 0)),
+            settled: true,
+        });
         assert!(admit(&t, id, 2, LockMode::Exclusive, 170).is_none());
     }
 
