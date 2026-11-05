@@ -5592,39 +5592,12 @@ impl Meta {
         } else {
             self.named_generations_tx(&tx)?
         };
-        // Plan 46 M0.4 (MUST-1): this node's own delegate rows of a
-        // generation the table does not list are taken out whatever the
-        // claim carries, not only with a tail (`own_gens`). With no tail,
-        // nothing the predecessors' journals held past the log ever ships
-        // (only a tenure's own successor re-ships its tail, and this claim
-        // re-ships none), and this tenure mints in its own block only: an
-        // unlisted generation's rows can never follow a `Delegate` in the
-        // log. Left in the journal, they shipped as this root's rows under
-        // their origin, with no grant in the log (a seal takeover with a tail
-        // below the grant unlists it everywhere and ends it nowhere, then a
-        // tail-less claim by its delegate), carrying outcomes for rids the
-        // log had already settled. They are rolled back, queued for replay by
-        // rid (the replay dedups against the rid's outcome in the log: a rid
-        // settled `Refused` is forgotten, never executed), and the generation
-        // ends here at what the log holds of it. With a tail the caller
-        // passes every generation it journals rows of (`own_gens`), and the
-        // gate's re-append decides which go back after the tail.
-        let unlisted_own: Vec<u64> = {
-            let listed: std::collections::BTreeSet<u64> =
-                crate::delegation::read_table_tx(&tx, self)?
-                    .iter()
-                    .map(|d| d.gen)
-                    .collect();
-            let mut out = Vec::new();
-            for g in local::deleg_gens_awaiting_end_tx(&tx, self, &listed)? {
-                if !own_gens.contains(&g) && local::deleg_idx_assigned_tx(&tx, &self.local, g)? {
-                    out.push(g);
-                }
-            }
-            out
-        };
-        let own_gens: Vec<u64> = own_gens.iter().chain(&unlisted_own).copied().collect();
-        let own_gens = own_gens.as_slice();
+        // (Plan 46 M0.4 MUST-1, below: the table before the strand.)
+        let table_before: std::collections::BTreeSet<u64> =
+            crate::delegation::read_table_tx(&tx, self)?
+                .iter()
+                .map(|d| d.gen)
+                .collect();
         let own = |entry: &LiveEntry| match entry {
             LiveEntry::Local { gen, .. } if *gen != 0 && own_gens.contains(gen) => Some(*gen),
             _ => None,
@@ -5651,8 +5624,66 @@ impl Meta {
             false,
             |entry| entry.superseded_by_takeover(epoch, carried) && !abandons(entry),
         )?;
-        let orphaned = self.orphaned_tx(&tx, proof, &listed_before, &HashSet::new())?;
+        // Plan 46 M0.4 (MUST-1): this node's own delegate rows of a
+        // generation the table does not list are taken out whatever the
+        // claim carries, not only with a tail (`own_gens`). With no tail,
+        // nothing the predecessors' journals held past the log ever ships,
+        // and this tenure mints in its own block only: an unlisted
+        // generation's rows can never follow a `Delegate` in the log. They
+        // are rolled back, queued for replay by rid (deduped against the
+        // rid's outcome in the log), and the generation ends here at what the
+        // log holds of it.
+        //
+        // Unlisted both before the strand above and after it. Not after it
+        // only: the strand takes out a committed streamed entry the log
+        // carries (`superseded_by_takeover`), its `Delegate` among them,
+        // and the log's copy still lists the generation. Not before it
+        // only: an outstanding streamed-ahead end of the deposed tenure
+        // unlists a generation the log granted, and the strand takes the
+        // end out and lists the generation again (the orphan rule judges it
+        // after the strand for the same reason); its rows then ship
+        // verbatim under the log's grant. So a second pass, in the same
+        // transaction; the replay queue is keyed by the entries' own
+        // sequence, so the replay order is still the journal's.
+        let unlisted_own: Vec<u64> = {
+            let listed: std::collections::BTreeSet<u64> =
+                crate::delegation::read_table_tx(&tx, self)?
+                    .iter()
+                    .map(|d| d.gen)
+                    .chain(table_before.iter().copied())
+                    .collect();
+            let mut out = Vec::new();
+            for g in local::deleg_gens_awaiting_end_tx(&tx, self, &listed)? {
+                if !own_gens.contains(&g) && local::deleg_idx_assigned_tx(&tx, &self.local, g)? {
+                    out.push(g);
+                }
+            }
+            out
+        };
         let mut stranded = stranded;
+        if !unlisted_own.is_empty() {
+            let more = strand_tx(
+                &mut tx,
+                self,
+                &staged,
+                |entry| matches!(entry, LiveEntry::Local { gen, .. } if *gen != 0 && unlisted_own.contains(gen)),
+                true,
+                false,
+                false,
+                |_| false,
+            )?;
+            stranded.shadows += more.shadows;
+            stranded.hints += more.hints;
+            stranded.locals += more.locals;
+            stranded.member_copied += more.member_copied;
+            stranded.superseded += more.superseded;
+            stranded.committed_rolled_back += more.committed_rolled_back;
+            stranded.gated_queued += more.gated_queued;
+            stranded.deleg_dropped += more.deleg_dropped;
+        }
+        let own_gens: Vec<u64> = own_gens.iter().chain(&unlisted_own).copied().collect();
+        let own_gens = own_gens.as_slice();
+        let orphaned = self.orphaned_tx(&tx, proof, &listed_before, &HashSet::new())?;
         let mut orphan_cuts: Vec<(u64, u64)> = Vec::new();
         for gen in &unlisted_own {
             if orphaned.contains(gen) {

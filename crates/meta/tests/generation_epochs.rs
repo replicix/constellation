@@ -1291,3 +1291,54 @@ fn an_orphan_end_queues_a_delegates_answered_gated_row() {
         "the answered row is queued for replay by rid, never dropped"
     );
 }
+
+/// Review of the M0.4 MUST-1 fix: a generation the log granted, which only an
+/// outstanding streamed-ahead end of the deposed tenure unlists here
+/// (`RecallCut` installed without the void), is listed again once the claim's
+/// strand takes that speculation out. The claimant's own rows of it ship
+/// under the log's grant, verbatim, as before the fix: the selection of
+/// "unlisted" generations is made against the table after the strand, as the
+/// orphan rule's is (`orphaned_tx`), not before it.
+#[test]
+fn a_claimant_without_a_tail_keeps_its_rows_of_a_generation_only_speculation_ended() {
+    let g = gen(1, 1);
+    let meta = Meta::open_in_memory().unwrap();
+    meta.apply_segment(1, 1, &[delegate(g)], &TouchSet::default())
+        .unwrap();
+    delegate_create(&meta, g, RID, "x", (2u64 << 40) | 20);
+    // The lone root of epoch 1 streamed its end of `g` ahead of S3, not held
+    // by any group, then lost its lease.
+    meta.install_streamed_committed(
+        1,
+        2,
+        1,
+        1,
+        &[LogRecord::RecallCut {
+            dir: ROOT_INO,
+            gen: g,
+            through: 1,
+        }],
+        false,
+        (0, 0),
+    )
+    .unwrap();
+    assert!(
+        meta.delegation_table().iter().all(|d| d.gen != g),
+        "unlisted by the speculation only"
+    );
+    assert_eq!(meta.void_cut(g).unwrap(), None);
+    let proof = constellation_meta::OrphanProof::of(&[no_tail(1, 0)]);
+    meta.strand_for_takeover_carrying(2, &[], None, &Default::default(), &proof)
+        .unwrap();
+    assert!(
+        meta.delegation_table().iter().any(|d| d.gen == g),
+        "the strand relisted it"
+    );
+    assert!(
+        ships_a_row_of(&meta, g),
+        "its row ships under the log's grant"
+    );
+    assert!(meta.lookup(ROOT_INO, "x").unwrap().is_some());
+    assert_eq!(meta.void_cut(g).unwrap(), None);
+    assert!(!meta.delegate_stranded(g).unwrap());
+}
