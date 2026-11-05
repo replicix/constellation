@@ -84,6 +84,98 @@ fn two_nodes(
     Ok((env, root, a, b))
 }
 
+/// What [`backed_by_third`] hands back: the environment, the scratch root,
+/// and nodes A (the holder), B (the reader) and C (A's backup).
+type BackedRig = (
+    crate::s3env::S3Env,
+    tempfile::TempDir,
+    Client,
+    Client,
+    Client,
+);
+
+/// Three nodes on a fresh filesystem: A (with `hold` as its sync-hold
+/// file) holds the lease and is backed by C; B, mounted only once C is
+/// A's backup (one backup at the default `CONSTELLATION_BACKUPS`), is
+/// neither. `f0` exists everywhere.
+///
+/// For the scenarios whose reader must see a refusal against A's
+/// unshipped state without being able to apply it. Since plan 43 C2f a
+/// root answers another node only once the row is committed: a lone root
+/// from the archive (which A's held sync never reaches: the refusal itself
+/// would wait, `EIO` at its deadline), a backed root once its backup holds
+/// the row. A backup is streamed A's journal before S3, so the reader is
+/// not the backup: C is.
+fn backed_by_third(scenario: &str, extra: &[(&str, &str)], hold: &Path) -> Result<BackedRig> {
+    let (env, root) = setup(scenario)?;
+    let backend = format!("s3://{BUCKET}/{scenario}-{}", ts());
+    let mk = |name: &str, hold: Option<&Path>| -> Result<Client> {
+        let mut c =
+            Client::new(root.path(), name, &env.direct_endpoint, &backend)?.with_own_node_key();
+        for (k, v) in extra {
+            c = c.with_env(k, v);
+        }
+        if let Some(hold) = hold {
+            c = c.with_env(
+                "CONSTELLATION_FAULT_HOLD_SYNC_FILE",
+                hold.to_str().context("hold path")?,
+            );
+        }
+        Ok(c)
+    };
+    let mut a = mk("a", Some(hold))?;
+    let mut b = mk("b", None)?;
+    let mut c = mk("c", None)?;
+    a.fs_create()?;
+    a.mount()?;
+    c.mount()?;
+    wait_for_p2p(&[&a, &c])?;
+    std::fs::write(a.mnt.join("f0"), b"zero")?;
+    eventually("A holds the lease", Duration::from_secs(20), || {
+        let lease = lease_of(&a)?;
+        anyhow::ensure!(lease["held"] == true, "A does not hold: {lease}");
+        Ok(())
+    })?;
+    let c_id = c.control_status()?["node_id"]
+        .as_u64()
+        .context("C reports no node id")?;
+    eventually("A lists C as its backup", Duration::from_secs(30), || {
+        let ack = ack_of(&a)?;
+        let backups: Vec<u64> = ack["backups"]
+            .as_array()
+            .map(|v| v.iter().filter_map(|x| x.as_u64()).collect())
+            .unwrap_or_default();
+        anyhow::ensure!(
+            ack["policy"] == "backup" && backups == [c_id],
+            "A's backup set is not [C]: {ack}"
+        );
+        Ok(())
+    })?;
+    b.mount()?;
+    wait_for_p2p(&[&a, &b, &c])?;
+    eventually("f0 visible on B", Duration::from_secs(20), || {
+        anyhow::ensure!(b.mnt.join("f0").is_file(), "f0 missing on B");
+        Ok(())
+    })?;
+    Ok((env, root, a, b, c))
+}
+
+/// That A is still backed by C alone (B never became a backup: it would
+/// be streamed A's held rows and need not wait for them).
+fn still_backed_by_c(a: &Client, c: &Client) -> Result<()> {
+    let c_id = c.control_status()?["node_id"].as_u64().unwrap_or(0);
+    let ack = ack_of(a)?;
+    let backups: Vec<u64> = ack["backups"]
+        .as_array()
+        .map(|v| v.iter().filter_map(|x| x.as_u64()).collect())
+        .unwrap_or_default();
+    anyhow::ensure!(
+        ack["policy"] == "backup" && backups == [c_id],
+        "A's backup set changed during the run (not [C]): {ack}"
+    );
+    Ok(())
+}
+
 /// Hold `a`'s sync rounds via its hold file and wait until a round has
 /// observed it (nothing A journals ships from then on).
 fn hold_sync(root: &Path, hold: &Path) -> Result<()> {
@@ -110,11 +202,16 @@ fn hold_sync(root: &Path, hold: &Path) -> Result<()> {
 /// refusal raised B's `observed` to A's journal position, both lookups
 /// wait for it, and both find their file once A ships (the hold lifts
 /// after ~0.5 s), well inside the 2 s budget.
+///
+/// Three nodes since plan 43 C2f ([`backed_by_third`]): A is backed by C,
+/// so the refusal is answered once C holds its row (a lone A would answer
+/// B only from the archive, which the hold keeps A from reaching; a B that
+/// backs A is streamed `g` and need not wait).
 pub fn session_exists_observed(_seed: u64) -> Result<()> {
     const NAME: &str = "session-exists-observed";
     let tmp = tempfile::tempdir()?;
     let hold = tmp.path().join("hold-a");
-    let (_env, _root, mut a, mut b) = two_nodes(NAME, &[], Some(&hold))?;
+    let (_env, _root, mut a, mut b, mut c) = backed_by_third(NAME, &[], &hold)?;
     hold_sync(tmp.path(), &hold)?;
     let result = (|| -> Result<()> {
         std::fs::write(a.mnt.join("g"), b"gee")?;
@@ -164,10 +261,11 @@ pub fn session_exists_observed(_seed: u64) -> Result<()> {
             n(&after, "timeouts") == 0,
             "B's reads timed out (degraded) although A shipped within 0.5 s: {after}"
         );
-        Ok(())
+        still_backed_by_c(&a, &c)
     })();
     let _ = std::fs::remove_file(&hold);
     b.unmount()?;
+    c.unmount()?;
     a.unmount()?;
     result
 }
@@ -535,89 +633,124 @@ pub fn session_stale_base_rename(seed: u64) -> Result<()> {
     super::m5::stale_base_rename_divergence(seed)
 }
 
-/// Read-your-writes across a holder kill. C's forwarded create is acked
-/// by A while A cannot reach S3, then A is killed: the create never
-/// ships. B takes over; C tails B's epoch marker, which strands C's
-/// shadow (rolled back, queued for replay by rid) until the replay lands
-/// through B. C lists the directory and stats its own file every 20 ms
-/// throughout: before M6 the stranding window left C's own acknowledged
-/// create out of its listing; now every read shows it (the queued replay
-/// blocks reads of its keys, the directory included).
+/// Read-your-writes across a holder kill. Before plan 43 C2f, C's forwarded
+/// create was acknowledged by A from memory while A could not reach S3; A
+/// was killed, B took over, and C's shadow was stranded until its replay
+/// landed through B: C's listing had to show its own create throughout.
+/// Since C2f a lone root (the rig's `CONSTELLATION_BACKUPS=0`) answers
+/// another node only from the archive, so that shadow cannot arise (as in
+/// `holder-crash-no-phantom-*`, [`super::unacked_create`]): C's create
+/// blocks while A's S3 is cut, A is killed, B's write takes the lease over,
+/// and C's create ends by its deadline or is executed by rid through B.
+/// C lists the directory and stats `phantom` every 20 ms throughout: once
+/// its create has returned success, every read shows it (read-your-writes);
+/// the nodes agree on `phantom` as I4 has it
+/// ([`super::check_create_outcome`]); C never held, stranded or replayed a
+/// shadow, and no read timed out.
 pub fn session_ryw_after_holder_kill(_seed: u64) -> Result<()> {
     const NAME: &str = "session-ryw-after-holder-kill";
     let (_env, _root, mut a, mut b, mut c, sw) =
         phantom_setup_with(NAME, &[("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000")])?;
     let result = (|| -> Result<()> {
-        sw.cut();
-        create_new(&c.mnt, "phantom")
-            .context("C's forwarded create must be acked while A's lease is still valid")?;
-        a.kill9()?;
         let rolled_before = n(&speculation_of(&c)?, "rolled_back");
+        let unsettled_before = super::unsettled_eio_of(&c)?;
+        let create = super::unacked_create(&mut a, &c, &sw)?;
         // B's write takes over once A's lease runs out.
         let takeover = {
             let mnt = b.mnt.clone();
             std::thread::spawn(move || std::fs::write(mnt.join("b-after"), b"b"))
         };
-        let deadline = Instant::now() + Duration::from_secs(40);
-        let mut stats = 0u64;
+        let deadline = Instant::now() + Duration::from_secs(150);
+        let mut create = Some(create);
+        let mut created: Option<std::io::Result<()>> = None;
+        let mut created_at = None;
+        let (mut reads, mut after_ack) = (0u64, 0u64);
         let mut missing = Vec::new();
         let mut slowest = Duration::ZERO;
         loop {
+            if create.as_ref().is_some_and(|h| h.is_finished()) {
+                let r = create
+                    .take()
+                    .expect("present")
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("the create thread panicked"))?;
+                eprintln!("    {NAME}: C's create returned {r:?}");
+                created = Some(r);
+                created_at = Some(Instant::now());
+            }
+            // Only reads started after the create returned success owe it.
+            let acked = matches!(created, Some(Ok(())));
             // `ls` (a readdir always reaches the daemon; a `stat` is
             // mostly answered from the kernel's 1 s entry cache) and `stat`.
             let started = Instant::now();
             let listed = std::fs::read_dir(&c.mnt)?
                 .filter_map(|e| e.ok())
                 .any(|e| e.file_name() == "phantom");
-            if !listed {
-                missing.push(format!(
-                    "ls at {:?} before the deadline",
-                    deadline - Instant::now()
-                ));
-            }
-            if let Err(e) = std::fs::metadata(c.mnt.join("phantom")) {
-                missing.push(format!("stat at {:?}: {e}", deadline - Instant::now()));
-            }
+            let stat = std::fs::metadata(c.mnt.join("phantom"));
             slowest = slowest.max(started.elapsed());
-            stats += 1;
-            let spec = speculation_of(&c)?;
-            let settled = n(&spec, "rolled_back") > rolled_before
-                && n(&spec, "pending_replay") == 0
-                && takeover.is_finished();
-            if settled || Instant::now() >= deadline {
+            reads += 1;
+            if acked {
+                after_ack += 1;
+                let since = created_at.map(|t| t.elapsed()).unwrap_or_default();
+                if !listed {
+                    missing.push(format!("ls {since:?} after the ack"));
+                }
+                if let Err(e) = stat {
+                    missing.push(format!("stat {since:?} after the ack: {e}"));
+                }
+            }
+            if (created.is_some() && takeover.is_finished()) || Instant::now() >= deadline {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        // Reads keep going a little after both ended: the window right
+        // after the takeover's marker.
+        if matches!(created, Some(Ok(()))) {
+            for _ in 0..50 {
+                let listed = std::fs::read_dir(&c.mnt)?
+                    .filter_map(|e| e.ok())
+                    .any(|e| e.file_name() == "phantom");
+                if !listed {
+                    missing.push("ls after the takeover".into());
+                }
+                if let Err(e) = std::fs::metadata(c.mnt.join("phantom")) {
+                    missing.push(format!("stat after the takeover: {e}"));
+                }
+                after_ack += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let created = created.ok_or_else(|| {
+            anyhow::anyhow!("C's create had not returned 150 s after A was killed")
+        })?;
         takeover
             .join()
             .map_err(|_| anyhow::anyhow!("takeover thread panicked"))?
             .context("B's write (the takeover)")?;
-        let spec = speculation_of(&c)?;
         let session = session_of(&c)?;
         print_session(NAME, "C", &session);
         eprintln!(
-            "    {NAME}: C stat'ed its phantom {stats} times, slowest {slowest:?}; speculation {spec}"
-        );
-        anyhow::ensure!(
-            n(&spec, "rolled_back") > rolled_before,
-            "C's shadow was never stranded (the scenario did not exercise the window): {spec}"
+            "    {NAME}: C listed + stat'ed {reads} times ({after_ack} after its create's \
+             success), slowest {slowest:?}"
         );
         anyhow::ensure!(
             missing.is_empty(),
             "C's own acknowledged create was missing from its reads {} time(s): {missing:?}",
             missing.len()
         );
+        let exists = super::phantom_agreement(&[("b", &b), ("c", &c)], Duration::from_secs(30))?;
+        super::check_create_outcome(
+            "c",
+            &created,
+            exists,
+            super::unsettled_eio_of(&c)?.saturating_sub(unsettled_before),
+        )?;
+        super::no_shadow_ever(&c, rolled_before)?;
         anyhow::ensure!(
-            n(&session, "timeouts") == 0,
+            n(&session_of(&c)?, "timeouts") == 0,
             "a read of the phantom timed out (degraded): {session}"
         );
-        if n(&session, "replay_blocked") == 0 {
-            eprintln!(
-                "    {NAME}: note: no read landed inside the stranding window this run \
-                 (replay-blocked 0); the listing check above still held throughout"
-            );
-        }
         Ok(())
     })();
     c.unmount()?;
@@ -631,26 +764,23 @@ pub fn session_ryw_after_holder_kill(_seed: u64) -> Result<()> {
 /// (`CONSTELLATION_SESSION_WAIT_MS=1500`) and answer from the replica —
 /// no `EIO` — the first logs one warning, the rest only count.
 ///
-/// Both nodes run with `CONSTELLATION_BACKUPS=0`. The hold stops A's sync
-/// rounds only; a backup is fed A's journal over P2P, before S3. A takes B
-/// as its backup once its backup tick has run, and under load that tick
-/// fell inside B's reads: B applied `g` from the stream and the rest of
-/// its reads were rightly fast — the scenario failed "a degraded read took
-/// 1.3 s" (the first, cut short by the stream; then µs) in 5 of 5 runs at
-/// load 50.
+/// B is not A's backup. The hold stops A's sync rounds only; a backup is
+/// fed A's journal over P2P, before S3. When A took B as its backup inside
+/// B's reads, B applied `g` from the stream and the rest of its reads were
+/// rightly fast — the scenario failed "a degraded read took 1.3 s" (the
+/// first, cut short by the stream; then µs) in 5 of 5 runs at load 50. It
+/// then ran with `CONSTELLATION_BACKUPS=0`, which since plan 43 C2f makes
+/// A a lone root that answers B's create only from the archive: with A's
+/// sync held the refusal itself waited, and B's create ended in `EIO` at
+/// its deadline. Now C backs A ([`backed_by_third`]): the refusal is
+/// committed once C holds it, and B still cannot apply `g`.
 pub fn session_wait_degrades(_seed: u64) -> Result<()> {
     const NAME: &str = "session-wait-degrades";
     const BUDGET_MS: u64 = 1_500;
     let tmp = tempfile::tempdir()?;
     let hold = tmp.path().join("hold-a");
-    let (_env, _root, mut a, mut b) = two_nodes(
-        NAME,
-        &[
-            ("CONSTELLATION_SESSION_WAIT_MS", "1500"),
-            ("CONSTELLATION_BACKUPS", "0"),
-        ],
-        Some(&hold),
-    )?;
+    let (_env, _root, mut a, mut b, mut c) =
+        backed_by_third(NAME, &[("CONSTELLATION_SESSION_WAIT_MS", "1500")], &hold)?;
     let result = (|| -> Result<()> {
         hold_sync(tmp.path(), &hold)?;
         std::fs::write(a.mnt.join("g"), b"gee")?;
@@ -704,6 +834,7 @@ pub fn session_wait_degrades(_seed: u64) -> Result<()> {
                 Duration::from_millis(BUDGET_MS * 3),
             )?;
         }
+        still_backed_by_c(&a, &c)?;
         // Lift the hold: A ships, B catches up, reads are fast again.
         std::fs::remove_file(&hold)?;
         eventually("g visible on B", Duration::from_secs(20), || {
@@ -731,6 +862,7 @@ pub fn session_wait_degrades(_seed: u64) -> Result<()> {
     })();
     let _ = std::fs::remove_file(&hold);
     b.unmount()?;
+    c.unmount()?;
     a.unmount()?;
     result
 }
