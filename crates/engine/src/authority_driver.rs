@@ -3099,7 +3099,15 @@ impl Driver {
         if step_us >= SLOW_STEP_US {
             // Plan 41: what the lock lane renewed meanwhile (cumulative: the
             // difference between two of these lines is the stall's).
-            let lane = self.deps.off_core.lock_lane.lock().unwrap().stats;
+            // Never waited for: the lane holds its mutex through a round (plan
+            // 41 item 7), and the core must not wait on the lane.
+            let lane = self
+                .deps
+                .off_core
+                .lock_lane
+                .try_lock()
+                .map(|l| l.stats)
+                .unwrap_or_default();
             // Everything the core does (backup heartbeats included)
             // waits for this step: a long one silences the node.
             tracing::warn!(
@@ -3227,12 +3235,15 @@ impl Driver {
         status.delegation_fast_path_executed = self.deps.delegates.executed();
         status.delegation_fast_path_routed = self.deps.delegates.routed();
         status.delegation_fast_path_fenced = self.deps.delegates.fenced();
-        {
-            let l = self.deps.off_core.lock_lane.lock().unwrap();
+        // Plan 41 item 7: the lane holds its mutex through a round (10,000
+        // own renewals while the FUSE threads close as many locked files took
+        // seconds, and every step's refresh waited for it: 0.5 to 3 s each).
+        // The core never waits on the lane: status keeps the last copy.
+        if let Ok(l) = self.deps.off_core.lock_lane.try_lock() {
             status.lock_lane = l.stats;
             status.lock_lane_in_flight = l.in_flight();
-            status.lock_lane_enabled = crate::lock_lane::lock_lane_on();
         }
+        status.lock_lane_enabled = crate::lock_lane::lock_lane_on();
         {
             let w = self.deps.off_core.deleg_windows.stats();
             status.delegation_root_answers_off_core = w.answered_off_core.load(Ordering::Relaxed);

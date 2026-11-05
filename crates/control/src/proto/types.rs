@@ -2104,6 +2104,15 @@ pub struct LockLaneStatus {
     /// (at most one per `backup_takeover_ms`).
     #[serde(default)]
     pub probes: u64,
+    /// Plan 41 item 7: due remote renewals left for a later look because
+    /// the lane's last request to their owner was still out (one request
+    /// in flight per owner), and the times the lane's thread woke (it
+    /// sleeps until the next renewal point, and with no grant held until a
+    /// grant is installed).
+    #[serde(default)]
+    pub owner_busy: u64,
+    #[serde(default)]
+    pub wakes: u64,
 }
 
 /// One lock owner fenced on this node (`LockStatus::fenced_owners`).

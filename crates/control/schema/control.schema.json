@@ -4769,6 +4769,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "owner_busy": {
+          "default": 0,
+          "description": "Plan 41 item 7: due remote renewals left for a later look because\nthe lane's last request to their owner was still out (one request\nin flight per owner), and the times the lane's thread woke (it\nsleeps until the next renewal point, and with no grant held until a\ngrant is installed).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "probes": {
           "default": 0,
           "description": "Plan 41 D3: reads of the lease object the lane asked for, for the own\ngrants of a tenure that can be taken over early whose core was stuck\n(at most one per `backup_takeover_ms`).",
@@ -4804,6 +4811,12 @@
           "type": "integer"
         },
         "uncovered": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "wakes": {
+          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -5054,13 +5067,15 @@
             "late_ok": 0,
             "max_stuck_ms": 0,
             "own_renewals": 0,
+            "owner_busy": 0,
             "probes": 0,
             "remote_ok": 0,
             "remote_sent": 0,
             "stall_stops": 0,
             "stuck_ticks": 0,
             "ticks": 0,
-            "uncovered": 0
+            "uncovered": 0,
+            "wakes": 0
           },
           "description": "Plan 41: the renewal lane beside the authority core."
         },

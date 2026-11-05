@@ -20,7 +20,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -4194,7 +4194,7 @@ pub fn lock_lane_overhead(_seed: u64) -> Result<()> {
                     "    P41OVH scenario={NAME} lane={lane} phase={phase} node={} grants_a={} grants_b={} \
                      held={} secs={secs:.1} lane_cpu_pct={:.4} proc_cpu_pct={:.3} \
                      lane_switches_per_min={:.1} proc_switches_per_min={:.1} \
-                     core_renewals={} lane_own={} lane_remote_sent={} lane_remote_ok={} lane_ticks={} stuck_ticks={} lapse_parks={} owners_fenced={} \
+                     core_renewals={} lane_own={} lane_remote_sent={} lane_remote_ok={} lane_ticks={} stuck_ticks={} lane_wakes={} owner_busy={} lapse_parks={} owners_fenced={} \
                      s3_get={} s3_head={} s3_put={} s3_list={} s3_delete={} s3_copy={} lost={}",
                     c.name,
                     grants.0,
@@ -4210,6 +4210,8 @@ pub fn lock_lane_overhead(_seed: u64) -> Result<()> {
                     d(&s0["locks"]["lane"]["remote_ok"], &s1["locks"]["lane"]["remote_ok"]),
                     d(&s0["locks"]["lane"]["ticks"], &s1["locks"]["lane"]["ticks"]),
                     d(&s0["locks"]["lane"]["stuck_ticks"], &s1["locks"]["lane"]["stuck_ticks"]),
+                    d(&s0["locks"]["lane"]["wakes"], &s1["locks"]["lane"]["wakes"]),
+                    d(&s0["locks"]["lane"]["owner_busy"], &s1["locks"]["lane"]["owner_busy"]),
                     d(&s0["locks"]["lapse_parks"], &s1["locks"]["lapse_parks"]),
                     s1["locks"]["owners_fenced"],
                     s3("get"),
@@ -4220,6 +4222,12 @@ pub fn lock_lane_overhead(_seed: u64) -> Result<()> {
                     s3("copy"),
                     s1["locks"]["lost"],
                 );
+                if std::env::var_os("CONSTELLATION_HARNESS_OVH_KEEP_LOGS").is_some() {
+                    eprintln!(
+                        "    P41OVH-STATUS phase={phase} node={} {}",
+                        c.name, s1["locks"]
+                    );
+                }
                 anyhow::ensure!(
                     s1["locks"]["lost"].as_u64().unwrap_or(0) == 0
                         && s1["locks"]["owners_fenced"].as_u64().unwrap_or(0) == 0,
@@ -4283,14 +4291,65 @@ pub fn lock_lane_overhead(_seed: u64) -> Result<()> {
                 other => bail!("unknown phase {other}"),
             }
         }
-        // Closing 10,000 locked descriptors on a loaded mount does not finish
-        // within minutes (each close waits for its lock's release): the
-        // measurement is over, so the daemons are killed and the mounts
-        // detached, the descriptors left alone.
-        std::mem::forget(std::mem::take(&mut held));
+        // `CONSTELLATION_HARNESS_OVH_CLOSE=1`: close the held descriptors (16
+        // threads) and time it, bounded by `CONSTELLATION_HARNESS_OVH_CLOSE_S`
+        // (300): before plan 41 item 7's fixes closing 10,000 locked
+        // descriptors did not finish in 10 minutes (the ops parked behind
+        // lapsing grants). Otherwise the measurement is over, so the daemons
+        // are killed and the mounts detached, the descriptors left alone.
+        if std::env::var("CONSTELLATION_HARNESS_OVH_CLOSE").is_ok_and(|v| v.trim() == "1") {
+            let fds = held.len();
+            let mut chunks: Vec<Vec<File>> = (0..16).map(|_| Vec::new()).collect();
+            for (i, f) in std::mem::take(&mut held).into_iter().enumerate() {
+                chunks[i % 16].push(f);
+            }
+            let t0 = Instant::now();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let close_errors = Arc::new(AtomicU64::new(0));
+            let errors = close_errors.clone();
+            std::thread::spawn(move || {
+                std::thread::scope(|sc| {
+                    for c in chunks {
+                        let errors = errors.clone();
+                        sc.spawn(move || {
+                            for f in c {
+                                use std::os::fd::IntoRawFd;
+                                // SAFETY: the descriptor is ours, closed once.
+                                if unsafe { libc::close(f.into_raw_fd()) } != 0 {
+                                    errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        });
+                    }
+                });
+                let _ = tx.send(());
+            });
+            let limit = Duration::from_secs(env_u64("CONSTELLATION_HARNESS_OVH_CLOSE_S", 300));
+            let done = rx.recv_timeout(limit).is_ok();
+            for c in clients.iter() {
+                let st = c.control_status().unwrap_or_default();
+                eprintln!(
+                    "    P41OVH scenario={NAME} lane={lane} phase=close node={} fds={fds} secs={:.1} done={done} \
+                     close_errors={} held={} lapse_parks={} lost={} owners_fenced={}",
+                    c.name,
+                    t0.elapsed().as_secs_f64(),
+                    close_errors.load(Ordering::Relaxed),
+                    st["locks"]["grants_held"],
+                    st["locks"]["lapse_parks"],
+                    st["locks"]["lost"],
+                    st["locks"]["owners_fenced"],
+                );
+            }
+            anyhow::ensure!(
+                done,
+                "closing {fds} locked descriptors did not finish in {limit:?}"
+            );
+        } else {
+            std::mem::forget(std::mem::take(&mut held));
+        }
         Ok(())
     })();
-    if result.is_err() {
+    if result.is_err() || std::env::var_os("CONSTELLATION_HARNESS_OVH_KEEP_LOGS").is_some() {
         keep_logs(NAME, &clients);
     }
     for c in clients.iter_mut().rev() {

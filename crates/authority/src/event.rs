@@ -1287,6 +1287,15 @@ pub enum LockOutcome {
     Busy,
 }
 
+/// The most entries one `LockRenew` carries (plan 41 item 7): a request
+/// and its answer must fit a P2P frame (`constellation_net::message::MAX_FRAME`,
+/// 64 KiB; the engine checks the bound against the wire's at compile time).
+/// Sent whole, a renewal round of a node holding thousands of grants could
+/// not be encoded: it failed, timed out (a lease read each), and the grants it
+/// carried were due again, the next round larger still — 10,000 remote grants
+/// lapsed.
+pub const LOCK_RENEW_MAX_ENTRIES: usize = 512;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LockRenewEntry {
     pub ino: Ino,

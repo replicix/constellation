@@ -19,14 +19,14 @@
 
 use crate::authority_driver::OffCore;
 use crate::sync::SyncRequest;
-use constellation_authority::lane::{LaneAction, LaneEvent, LaneFacts, LockLaneView};
+use constellation_authority::lane::{LaneAction, LaneEvent, LaneFacts, LockLaneView, RenewLane};
 use constellation_authority::NodeId;
 use constellation_meta::Meta;
 use constellation_net::{Payload, Peers};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 /// Whether the lane runs (`CONSTELLATION_LOCK_LANE`: `off`, `0`, `false`).
 pub(crate) fn lock_lane_on() -> bool {
@@ -65,16 +65,25 @@ impl LaneFacts for EngineFacts {
     }
 }
 
-/// The running lane: stops when dropped (its thread ends within a tick).
+/// The running lane: stops when dropped (its thread is woken and ends).
 pub(crate) struct LockLane {
     stop: Arc<AtomicBool>,
+    wake: Arc<Notify>,
 }
 
 impl Drop for LockLane {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
     }
 }
+
+/// The longest the lane sleeps while grants are held, whatever their
+/// renewal points say: a forward step of the honour clock (a suspend) is
+/// not seen by the timer the lane sleeps on, and a change to the tables
+/// that wakes no one (a recalled grant pinned again) is seen within it.
+/// With no grant held the lane sleeps until one is installed.
+const MAX_SLEEP_MS: i64 = 1_000;
 
 impl LockLane {
     /// Start the lane (`None` with the lane off, or if its thread cannot be
@@ -96,6 +105,15 @@ impl LockLane {
         }
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let wake = Arc::new(Notify::new());
+        {
+            // Plan 41 item 7: a grant installed, or one whose renewal failed,
+            // due before the instant the lane sleeps until wakes it.
+            let wake = wake.clone();
+            meta.locks()
+                .set_lane_waker(Arc::new(move || wake.notify_one()));
+        }
+        let thread_wake = wake.clone();
         let body = move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -111,16 +129,22 @@ impl LockLane {
                 node_id,
                 forward_timeout_ms,
                 thread_stop,
+                thread_wake,
             ));
         };
         std::thread::Builder::new()
             .name("cst-lock-lane".into())
             .spawn(body)
             .ok()?;
-        Some(Self { stop })
+        Some(Self { stop, wake })
     }
 }
 
+/// The lane's thread: it looks at the tables when a grant may be due
+/// (`RenewLane::next_wake`: the next renewal point, a few times a second
+/// while a renewal the core sent is out, never more often than `every`) and
+/// sleeps otherwise — with no grant held, until one is installed (plan 41
+/// item 7: it ticked every 250 ms, 957 wake-ups a minute on an idle node).
 async fn lane_loop(
     meta: Arc<Meta>,
     peers: Peers,
@@ -128,30 +152,55 @@ async fn lane_loop(
     node_id: NodeId,
     forward_timeout_ms: u64,
     stop: Arc<AtomicBool>,
+    wake: Arc<Notify>,
 ) {
-    let every = Duration::from_millis((forward_timeout_ms / 4).clamp(50, 250));
-    let mut tick = tokio::time::interval(every);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let every = (forward_timeout_ms / 4).clamp(50, 250) as i64;
     let facts = Arc::new(EngineFacts {
         off_core: off_core.clone(),
         meta: meta.clone(),
     });
     let timeout = Duration::from_millis(forward_timeout_ms.max(1));
-    while !stop.load(Ordering::Relaxed) {
-        tick.tick().await;
-        // The common case, nothing held: one short lock.
-        if meta.locks().held_count() == 0 {
-            continue;
-        }
+    let mut last = constellation_authority::HonourMs(i64::MIN / 2);
+    while !stop.load(Ordering::SeqCst) {
+        // Awake: a grant that becomes due from here on wakes the next
+        // sleep at once (`lane_sleeps_until`).
+        meta.locks().lane_sleeps_until(i64::MAX);
         let clk = constellation_platform::clock::protocol().now();
-        let stuck_ms = off_core.stuck_ms(clk.wait.0);
-        let actions = off_core.lock_lane.lock().unwrap().handle(
-            clk,
-            LaneEvent::Tick { stuck_ms },
-            meta.locks(),
-            &*facts,
-        );
-        run(actions, &peers, &off_core, &meta, &facts, node_id, timeout);
+        off_core.lock_lane.lock().unwrap().stats.wakes += 1;
+        if meta.locks().held_count() > 0 && clk.honour.since(last) >= every {
+            last = clk.honour;
+            let stuck_ms = off_core.stuck_ms(clk.wait.0);
+            let actions = off_core.lock_lane.lock().unwrap().handle(
+                clk,
+                LaneEvent::Tick { stuck_ms },
+                meta.locks(),
+                &*facts,
+            );
+            run(actions, &peers, &off_core, &meta, &facts, node_id, timeout);
+        }
+        let stale_ms = facts.view().forward_timeout_ms as i64;
+        let next =
+            off_core
+                .lock_lane
+                .lock()
+                .unwrap()
+                .next_wake(clk, last, stale_ms, every, meta.locks());
+        meta.locks()
+            .lane_sleeps_until(RenewLane::sleep_mark(next, last, every));
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        match next {
+            None => wake.notified().await,
+            Some(n) => {
+                let now = constellation_platform::clock::protocol().honour();
+                let ms = n.since(now).clamp(0, MAX_SLEEP_MS) as u64;
+                tokio::select! {
+                    _ = wake.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
+                }
+            }
+        }
     }
 }
 
@@ -477,6 +526,81 @@ mod tests {
             told.is_some()
         );
         blocked.await.unwrap();
+    }
+
+    /// Plan 41 item 7 (fail-before: 957 wake-ups a minute on an idle node):
+    /// with no grant held the lane's thread sleeps; a grant installed wakes
+    /// it, and it renews the grant at its renewal point, not before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_lane_sleeps_while_nothing_is_held_and_an_install_wakes_it() {
+        use constellation_authority::lane::LockLaneView;
+        use constellation_authority::HonourMs;
+        use constellation_meta::locks::{HeldGrant, LockMode};
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let off_core = Arc::new(OffCore::new(5_000));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *off_core.urgent.lock().unwrap() = Some(tx);
+        let _lane = LockLane::start(meta.clone(), Peers::disabled(), off_core.clone(), 1, 400)
+            .expect("the lane is on by default");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let idle = off_core.lock_lane.lock().unwrap().stats.wakes;
+        assert!(idle <= 1, "woke {idle} times in 1.2 s with nothing held");
+        let clk = constellation_platform::clock::protocol().now();
+        off_core.lane_cell.publish(LockLaneView {
+            me: 1,
+            epoch: 1,
+            root_ok: true,
+            cap_until: HonourMs(clk.honour.0 + 60_000),
+            fast: false,
+            last_fresh: HonourMs(0),
+            window_ms: 1_500,
+            marked: true,
+            owner: 0,
+            clock: constellation_platform::clock::protocol().id(),
+            lock_ttl_ms: 4_000,
+            margin_ms: 500,
+            forward_timeout_ms: 400,
+        });
+        let id = meta
+            .locks()
+            .grant(1, 1, 7, LockMode::Exclusive, clk.wait.plus(5_000), 0);
+        let due = HonourMs(clk.honour.0 + 600);
+        meta.locks().install_held(
+            7,
+            HeldGrant {
+                id,
+                mode: LockMode::Exclusive,
+                until: HonourMs(clk.honour.0 + 5_000),
+                renew_at: due,
+                owner: 1,
+                recalled: false,
+                position: constellation_meta::Position::ZERO,
+                renewing: None,
+                releasing: false,
+                first_use: false,
+                idle_since: None,
+                installed: clk.honour,
+                lapsing: None,
+                written: false,
+                route: None,
+            },
+        );
+        let told = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("not renewed in time");
+        assert!(matches!(told, Some(SyncRequest::LaneOwn { renewed: 1 })));
+        // Renewed from a send at or after its renewal point (the next point
+        // is that send plus (ttl - margin) / 2).
+        let next = meta.locks().held(7).unwrap().renew_at;
+        assert!(
+            next.0 >= due.0 + (4_000 - 500) / 2,
+            "renewed before its renewal point: next at {next:?}, due {due:?}"
+        );
+        let woke = off_core.lock_lane.lock().unwrap().stats.wakes - idle;
+        assert!(
+            woke <= 4,
+            "woke {woke} times for one grant due in 600 ms (a tick every 100 ms is 6)"
+        );
     }
 
     #[test]

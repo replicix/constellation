@@ -778,6 +778,8 @@ impl EngineControl {
                         max_stuck_ms: core.lock_lane.max_stuck_ms,
                         in_flight: core.lock_lane_in_flight as u64,
                         probes: core.lock_lane.probes,
+                        owner_busy: core.lock_lane.owner_busy,
+                        wakes: core.lock_lane.wakes,
                     },
                 }
             },

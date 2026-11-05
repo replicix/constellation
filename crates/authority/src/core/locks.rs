@@ -346,6 +346,10 @@ pub(crate) struct LockState {
     renew_timer: Option<TimerId>,
     /// When `renew_timer` fires (honour clock).
     renew_at: Option<HonourMs>,
+    /// When the renewal tick last ran (honour clock): the next one for a
+    /// renewal point runs no sooner than [`Core::lock_renew_gap_ms`] after
+    /// it (plan 41 item 7).
+    renew_ticked: Option<HonourMs>,
     /// Delegate: generations whose renewal a lock renewal asked for
     /// (too little of the delegation left to extend the grant by much).
     deleg_renew_wanted: std::collections::BTreeSet<u64>,
@@ -774,6 +778,10 @@ enum Served {
     Parked,
 }
 
+/// Held grants from which the renewal tick is coalesced
+/// (`Core::lock_arm_renew_tick`, plan 41 item 7).
+pub(crate) const RENEW_COALESCE_FROM: usize = 64;
+
 impl Core {
     pub fn lock_view(&self) -> LockView {
         LockView {
@@ -789,6 +797,14 @@ impl Core {
 
     pub(crate) fn lock_margin_ms(&self) -> i64 {
         self.cfg.expiry_margin_ms as i64
+    }
+
+    /// The least time between two renewal ticks armed for renewal points
+    /// (`lock_arm_renew_tick`): a 32nd of the half window a holder renews
+    /// within (`(ttl − margin) / 2`), at most 250 ms — 250 ms at the
+    /// default 20 s TTL.
+    pub(crate) fn lock_renew_gap_ms(&self) -> u64 {
+        ((self.lock_ttl_ms() - self.lock_margin_ms()).max(0) / 64).clamp(0, 250) as u64
     }
 
     /// The shortest grant worth making: its holder honours it for
@@ -5220,7 +5236,23 @@ impl Core {
         // windows.
         let mut at = now.honour.plus((self.cfg.lock_ttl_ms / 4).max(50));
         if let Some(first) = replica.locks().next_renewal(now) {
-            at = at.min(first.max(now.honour.plus(1)));
+            // Not sooner than a gap after the last tick (plan 41 item 7):
+            // armed at each grant's own renewal point, a node holding
+            // 10,000 remote grants ticked about once a millisecond, each
+            // tick a walk of every held grant and a request of one entry —
+            // the core was saturated, its renewals timed out (a lease read
+            // each), and every grant lapsed with the lane off. A renewal
+            // point is half-way through the window: the gap (at most a
+            // 32nd of that half) costs no window. Only with many grants
+            // held ([`RENEW_COALESCE_FROM`]): with a few, a tick is cheap
+            // and each renewal goes at its own point, as it always did.
+            let floor = match self.lk.renew_ticked {
+                Some(t) if replica.locks().held_count() >= RENEW_COALESCE_FROM => {
+                    t.plus(self.lock_renew_gap_ms())
+                }
+                _ => now.honour,
+            };
+            at = at.min(first.max(now.honour.plus(1)).max(floor));
         }
         // Plan 43 C7-F F-c: a lapsing grant asks for its late renewal again
         // until it is answered or gives up, at the owner-poll cadence.
@@ -5247,6 +5279,7 @@ impl Core {
     ) {
         self.lk.renew_timer = None;
         self.lk.renew_at = None;
+        self.lk.renew_ticked = Some(now.honour);
         let mut relearn = false;
         if !self.lk.deleg_moved.is_empty() {
             let table = replica.delegation_table();
@@ -5364,6 +5397,14 @@ impl Core {
         if relearn {
             self.lock_relearn_owner(out);
         }
+        // At most `LOCK_RENEW_MAX_ENTRIES` a request: one that does not fit a
+        // P2P frame never leaves (plan 41 item 7).
+        let by_owner = by_owner.into_iter().flat_map(|(to, entries)| {
+            entries
+                .chunks(crate::event::LOCK_RENEW_MAX_ENTRIES)
+                .map(|c| (to, c.to_vec()))
+                .collect::<Vec<_>>()
+        });
         for (to, entries) in by_owner {
             let req = self.op_id();
             let timer = self.set_timer_honour(

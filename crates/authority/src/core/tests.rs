@@ -23664,6 +23664,98 @@ mod locks {
         );
     }
 
+    /// Plan 41 item 7: renewal points a millisecond apart are not a tick
+    /// each. Armed at every grant's own point, a node holding 10,000 remote
+    /// grants ticked about once a millisecond (each tick a walk of every
+    /// held grant and a request of one entry), its core saturated and with
+    /// the lane off every grant lapsed. The next tick comes no sooner than
+    /// `lock_renew_gap_ms` after the last, and renews what came due meanwhile.
+    #[test]
+    fn renewal_ticks_are_a_gap_apart_and_renew_what_came_due_meanwhile() {
+        let mut r = requester();
+        // Many grants held (the coalescing applies from
+        // `RENEW_COALESCE_FROM`), not due for a long while.
+        for k in 0..crate::core::locks::RENEW_COALESCE_FROM as u64 {
+            let h = constellation_meta::locks::HeldGrant {
+                id: GrantId {
+                    node: 1,
+                    seq: 1_000 + k,
+                },
+                mode: X,
+                until: r.honour().plus(600_000),
+                renew_at: r.honour().plus(300_000),
+                owner: 1,
+                recalled: false,
+                position: Position::ZERO,
+                renewing: None,
+                releasing: false,
+                first_use: false,
+                idle_since: None,
+                installed: r.honour(),
+                lapsing: None,
+                written: false,
+                route: None,
+            };
+            r.meta.locks().install_held(10_000 + k, h);
+        }
+        let req = lock_control(&mut r, 50, 42, true);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(1),
+            },
+        });
+        let mut tick = timer_of(&out, TimerKind::LockRenewTick);
+        r.advance(1);
+        let req = lock_control(&mut r, 51, 43, true);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(2),
+            },
+        });
+        assert!(matches!(lock_answer(&out, 51), LockAnswer::Granted { .. }));
+        let first = r.meta.locks().held(42).unwrap().renew_at;
+        let second = r.meta.locks().held(43).unwrap().renew_at;
+        assert!(
+            second > first && second.0 - first.0 < 10,
+            "{first:?} {second:?}"
+        );
+        let gap = r.core.lock_renew_gap_ms();
+        assert!(gap > 10, "gap {gap}");
+        let renewed = |out: &[Action], ino: Ino| {
+            sends(out).iter().any(|(_, m)| {
+                matches!(m, PeerMsg::LockRenew { entries, .. } if entries.iter().any(|e| e.ino == ino))
+            })
+        };
+        // Tick until 42 is renewed (the cadence ticks come first).
+        let mut out = Vec::new();
+        let mut at = HonourMs(0);
+        for _ in 0..10 {
+            at = r.core.timer_honour(tick).unwrap();
+            r.now = Ms(at.0);
+            out = r.step(Event::Timer { id: tick });
+            if renewed(&out, 42) {
+                break;
+            }
+            tick = timer_of(&out, TimerKind::LockRenewTick);
+        }
+        assert!(renewed(&out, 42), "{out:?}");
+        assert!(!renewed(&out, 43), "{out:?}");
+        assert!(at >= first && at < second, "ticked at {at:?}");
+        let tick = timer_of(&out, TimerKind::LockRenewTick);
+        assert_eq!(
+            r.core.timer_honour(tick),
+            Some(at.plus(gap)),
+            "the next tick is a gap later, not at 43's point"
+        );
+        r.now = Ms(at.plus(gap).0);
+        let out = r.step(Event::Timer { id: tick });
+        assert!(renewed(&out, 43), "{out:?}");
+    }
+
     /// A renewal that finds no reachable owner reads the lease for it; the
     /// grant's renewal point stays in the past meanwhile, and the tick
     /// armed from it fired every millisecond while S3 was cut (the read

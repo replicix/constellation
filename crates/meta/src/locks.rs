@@ -1485,6 +1485,17 @@ impl Inner {
         }
     }
 
+    /// [`Self::observe`], and whether it changed what
+    /// [`LockTables::track`] keeps (a grant became lapsing, or a lapsing one
+    /// gave up and was dropped): the callers on the ops' paths (a parked op
+    /// polls every 20 ms) walk the tables only then.
+    fn observe_changed(&mut self, ino: u64, now: Now, park_ms: i64) -> (Observed, bool) {
+        let before = self.held.get(&ino).map(|h| h.lapsing.is_some());
+        let obs = self.observe(ino, now, park_ms);
+        let after = self.held.get(&ino).map(|h| h.lapsing.is_some());
+        (obs, before != after)
+    }
+
     /// A lapsing grant's park ended without an answer in time: handled as
     /// a lapse was before F-c (dropped, tainted, its owners captured, since
     /// the end of its window).
@@ -1607,7 +1618,18 @@ pub struct LockTables {
     /// Tests only: [`LockTables::set_gap_hook_for_tests`].
     #[cfg(any(test, feature = "test-util"))]
     gap_hook: Mutex<Option<GapHook>>,
+    /// Plan 41 item 7: the lock renewal lane's wake-up
+    /// ([`LockTables::set_lane_waker`]) and the honour instant it sleeps
+    /// until ([`LockTables::lane_sleeps_until`]; `i64::MAX` with nothing
+    /// to renew, 0 while no lane sleeps). A held grant installed, or one
+    /// whose renewal failed, due before it calls the waker: the lane sleeps
+    /// until its next deadline instead of ticking.
+    lane_waker: Mutex<Option<LaneWaker>>,
+    lane_wake_at: AtomicI64,
 }
+
+/// See [`LockTables::set_lane_waker`].
+pub type LaneWaker = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// See [`LockTables::set_gap_hook_for_tests`].
 #[cfg(any(test, feature = "test-util"))]
@@ -1770,6 +1792,61 @@ impl LockTables {
         self.refence(g);
     }
 
+    /// After a renewal extended a held grant (under the table lock): what
+    /// [`Self::track`] keeps only moves later then — `next_end`,
+    /// `lapse_from_ms` and `fence_from_ms` are lower bounds, kept or
+    /// recomputed when passed, and a renewal neither adds nor removes a
+    /// held grant or a taint — so nothing is recomputed; a renewal that
+    /// ended a lapse counts one lapsing grant fewer. Recomputed after every
+    /// renewal, each
+    /// one walked every held grant and local lock: a renewal round of
+    /// 10,000 grants was 10,000 walks of 10,000 (plan 41 item 7: 0.63 s
+    /// core steps for the lane's results, the lane at 14 to 22 % of a core,
+    /// remote grants barely renewed at all).
+    fn track_extended(&self, _g: &Inner, resumed: bool) {
+        // A lapse ended: one lapsing grant fewer (`lapsing_n` is kept exact
+        // under the table lock by every change to `held`). Recomputed with a
+        // full walk, 10,000 late renewals admitted in one round were 10^8
+        // steps again.
+        if resumed {
+            let _ = self
+                .lapsing_n
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+        }
+    }
+
+    /// Plan 41 item 7: the lock renewal lane's wake-up, called (outside the
+    /// table lock) when a held grant becomes due before the instant the
+    /// lane sleeps until ([`Self::lane_sleeps_until`]). A later call
+    /// replaces it (a restarted lane over the same tables).
+    pub fn set_lane_waker(&self, wake: LaneWaker) {
+        *self.lane_waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(wake);
+    }
+
+    /// The lane sleeps until `at` (honour ms; `i64::MAX`: nothing held is
+    /// due ever, until a grant is installed or a renewal fails). It stores
+    /// `i64::MAX` before it looks at the tables and the instant it found
+    /// after: a grant that became due in between wakes it at once.
+    pub fn lane_sleeps_until(&self, at: i64) {
+        self.lane_wake_at.store(at, Ordering::SeqCst);
+    }
+
+    /// A held grant may be due from `due` (honour ms): wake the lane if it
+    /// sleeps past that. Never under the table lock.
+    fn wake_lane_for(&self, due: HonourMs) {
+        if due.0 >= self.lane_wake_at.load(Ordering::SeqCst) {
+            return;
+        }
+        let wake = self
+            .lane_waker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+
     /// Plan 43 C7-F F-c: how long a lapsing grant parks (see the field).
     pub fn set_lapse_park_ms(&self, ms: i64) {
         self.lapse_park_ms.store(ms.max(0), Ordering::Relaxed);
@@ -1844,9 +1921,11 @@ impl LockTables {
     /// grant that pins something becomes so here).
     pub fn lapse_pending(&self, ino: u64, now: Now) -> bool {
         let mut g = self.lock();
-        let lapsing = g.observe(ino, now, self.park_ms()) == Observed::Lapsing;
-        self.track(&g);
-        lapsing
+        let (obs, changed) = g.observe_changed(ino, now, self.park_ms());
+        if changed {
+            self.track(&g);
+        }
+        obs == Observed::Lapsing
     }
 
     /// Whether `ino`'s held grant is lapsing now.
@@ -3091,6 +3170,11 @@ impl LockTables {
         }
         g.stats.granted += 1;
         self.track(&g);
+        let due = g.held.get(&ino).map(|h| h.renew_at);
+        drop(g);
+        if let Some(due) = due {
+            self.wake_lane_for(due);
+        }
         Installed::Ok { recalled }
     }
 
@@ -3398,20 +3482,81 @@ impl LockTables {
         let mut due = Vec::new();
         let Inner { held, local, .. } = &mut *g;
         for (ino, h) in held.iter_mut() {
-            let pinned = local.get(ino).is_some_and(|v| !v.is_empty());
+            // The cheap tests first: a grant not due yet costs two
+            // comparisons, not a lookup of its local locks (plan 41 item
+            // 7: the lane looks at every held grant when it wakes).
+            if h.until <= now || now < h.renew_at || h.lapsing.is_some() {
+                continue;
+            }
             let marked = h.renewing.is_some_and(|t| now.since(t) < stale_ms)
                 && !(core_stuck && !lane_marked(*ino, h.id));
-            if h.until > now
-                && now >= h.renew_at
-                && !marked
-                && h.lapsing.is_none()
-                && Self::renewable(h, pinned, now, budget)
-            {
+            if marked {
+                continue;
+            }
+            let pinned = local.get(ino).is_some_and(|v| !v.is_empty());
+            if Self::renewable(h, pinned, now, budget) {
                 h.renewing = Some(now);
                 due.push((*ino, *h));
             }
         }
         due
+    }
+
+    /// Plan 41 item 7: when the lock lane looks again (honour clock): the
+    /// earliest instant at which [`Self::due_renewals_lane`] may return a
+    /// grant held now. `None`: none ever will, until a grant is installed
+    /// or a renewal fails, which wake the lane ([`Self::set_lane_waker`]).
+    ///
+    /// - A grant not marked and renewable: its renewal point.
+    /// - A grant marked by the lane's own renewal (`lane_marked`): when the
+    ///   mark goes stale (`stale_ms`); the lane's answer or timeout wakes it
+    ///   sooner.
+    /// - A grant marked by the core's renewal, or honoured but not renewable
+    ///   now (recalled with nothing pinning it yet): `now + poll_ms` — the
+    ///   lane renews the first at once should the core get stuck in a step
+    ///   meanwhile, and the second once something pins it, as its tick did.
+    /// - Lapsed or lapsing grants are the core's: never.
+    pub fn lane_next_due(
+        &self,
+        now: Now,
+        stale_ms: i64,
+        poll_ms: i64,
+        lane_marked: impl Fn(u64, GrantId) -> bool,
+    ) -> Option<HonourMs> {
+        let now = now.honour;
+        let budget = self.first_use_budget_ms();
+        let poll = now.plus(poll_ms.max(1) as u64);
+        let g = self.lock();
+        let mut next: Option<HonourMs> = None;
+        for (ino, h) in g.held.iter() {
+            if h.until <= now || h.lapsing.is_some() {
+                continue;
+            }
+            let at = match h.renewing {
+                Some(t) if now.since(t) < stale_ms => {
+                    let stale = t.plus(stale_ms.max(0) as u64);
+                    if lane_marked(*ino, h.id) {
+                        stale
+                    } else {
+                        stale.min(poll)
+                    }
+                }
+                _ if h.renew_at > now => h.renew_at,
+                _ => {
+                    let pinned = g.local.get(ino).is_some_and(|v| !v.is_empty());
+                    if Self::renewable(h, pinned, now, budget) {
+                        now
+                    } else {
+                        poll
+                    }
+                }
+            };
+            next = Some(next.map_or(at, |n| n.min(at)));
+            if next == Some(now) {
+                break;
+            }
+        }
+        next
     }
 
     /// The earliest renewal point among the grants [`Self::due_renewals`]
@@ -3508,7 +3653,14 @@ impl LockTables {
                     .lapse_park_ms_max
                     .max(now.wait.0.saturating_sub(l.at.0).max(0) as u64);
             }
-            self.track(&g);
+            self.track_extended(&g, resumed.is_some());
+            // A lapse ended: the lane did not count this grant (lapsing
+            // grants are the core's) and may sleep past its renewal point.
+            let due = resumed.and(g.held.get(&ino).map(|h| h.renew_at));
+            drop(g);
+            if let Some(due) = due {
+                self.wake_lane_for(due);
+            }
         }
     }
 
@@ -3588,7 +3740,8 @@ impl LockTables {
             h.recalled |= recalled;
         }
         g.stats.renewals += 1;
-        self.track(&g);
+        // Not lapsing (checked above): nothing resumed.
+        self.track_extended(&g, false);
         true
     }
 
@@ -3612,12 +3765,19 @@ impl LockTables {
         // (A renewal of an id the owner has since replaced by a newer one of
         // its own, which a recall made this node adopt, fails for the grant
         // held now: its late renewal, if lapsing, is sent again.)
+        let mut due = None;
         if let Some(h) = g
             .held
             .get_mut(&ino)
             .filter(|h| h.id == id || (h.id.node == id.node && h.id.seq > id.seq))
         {
-            h.renewing = None;
+            if h.renewing.take().is_some() {
+                due = Some(h.renew_at);
+            }
+        }
+        drop(g);
+        if let Some(due) = due {
+            self.wake_lane_for(due);
         }
     }
 
@@ -3725,8 +3885,10 @@ impl LockTables {
         if !g.fenced_at(ino, now.honour) {
             return Fence::Ok;
         }
-        let obs = g.observe(ino, now, self.park_ms());
-        self.track(&g);
+        let (obs, changed) = g.observe_changed(ino, now, self.park_ms());
+        if changed {
+            self.track(&g);
+        }
         if obs == Observed::Lapsing {
             return Fence::Parked;
         }
@@ -3782,8 +3944,11 @@ impl LockTables {
             .map(|(i, _)| *i)
             .collect();
         let mut out = Vec::new();
+        let mut changed = false;
         for ino in inos {
-            if g.observe(ino, now, self.park_ms()) != Observed::Lapsing {
+            let (obs, c) = g.observe_changed(ino, now, self.park_ms());
+            changed |= c;
+            if obs != Observed::Lapsing {
                 continue;
             }
             let since = g.held.get(&ino).map_or(now.honour, |h| h.until);
@@ -3802,7 +3967,9 @@ impl LockTables {
                 }
             }
         }
-        self.track(&g);
+        if changed {
+            self.track(&g);
+        }
         out
     }
 
@@ -4016,10 +4183,15 @@ impl LockTables {
             .map(|(i, _)| *i)
             .collect();
         let mut any = false;
+        let mut changed = false;
         for ino in inos {
-            any |= g.observe(ino, now, self.park_ms()) == Observed::Lapsing;
+            let (obs, c) = g.observe_changed(ino, now, self.park_ms());
+            any |= obs == Observed::Lapsing;
+            changed |= c;
         }
-        self.track(&g);
+        if changed {
+            self.track(&g);
+        }
         any
     }
 
@@ -7954,5 +8126,85 @@ mod window_tests {
             "{:?}",
             seen.lock().unwrap()
         );
+    }
+
+    /// Plan 41 item 7: the lane sleeps until its next deadline and is woken
+    /// only for a grant due before it — installed, or whose renewal failed
+    /// (or resumed from a lapse) — never while no lane sleeps, and never
+    /// for a grant due after its deadline.
+    #[test]
+    fn the_lane_is_woken_only_for_a_grant_due_before_it_looks_again() {
+        let t = LockTables::default();
+        let woken = Arc::new(AtomicUsize::new(0));
+        {
+            let woken = woken.clone();
+            t.set_lane_waker(Arc::new(move || {
+                woken.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        let id = |seq| GrantId { node: 3, seq };
+        // No lane sleeping: nobody woken.
+        t.install_held(8, held_of(id(1), X, 9_000, 2_000));
+        assert_eq!(woken.load(Ordering::SeqCst), 0);
+        // Awake (looking at the tables): every install wakes the next sleep.
+        t.lane_sleeps_until(i64::MAX);
+        t.install_held(9, held_of(id(2), X, 9_000, 6_000));
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
+        // Asleep until 5 000: a grant due at 6 000 does not wake it, one
+        // due at 4 000 does.
+        t.lane_sleeps_until(5_000);
+        t.install_held(10, held_of(id(3), X, 9_000, 6_000));
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
+        t.install_held(11, held_of(id(4), X, 9_000, 4_000));
+        assert_eq!(woken.load(Ordering::SeqCst), 2);
+        // A renewal that fails makes its grant due again: woken. One that
+        // was not out (nothing marked) changes nothing.
+        let due = t.due_renewals(at(2_000));
+        assert_eq!(due.len(), 1);
+        t.renewal_failed(8, id(1));
+        assert_eq!(woken.load(Ordering::SeqCst), 3);
+        t.renewal_failed(8, id(1));
+        assert_eq!(woken.load(Ordering::SeqCst), 3);
+        // The lane's look: the earliest renewal point, a core's mark a poll
+        // from now, the lane's own mark when it goes stale.
+        assert_eq!(
+            t.lane_next_due(at(1_000), 400, 250, |_, _| false),
+            Some(HonourMs(2_000))
+        );
+        let due = t.due_renewals_lane(at(2_000), 400, false, |_, _| false);
+        assert_eq!(due.len(), 1, "only the due grant is taken");
+        assert_eq!(
+            t.lane_next_due(at(2_010), 400, 250, |_, _| true),
+            Some(HonourMs(2_400))
+        );
+        assert_eq!(
+            t.lane_next_due(at(2_010), 400, 250, |_, _| false),
+            Some(HonourMs(2_260))
+        );
+        // Nothing held: no look at all.
+        let empty = LockTables::default();
+        assert_eq!(empty.lane_next_due(at(0), 400, 250, |_, _| false), None);
+    }
+
+    /// Plan 41 item 7: a renewal recomputes nothing over the whole table (it
+    /// walked every held grant and local lock, a round of 10,000 renewals
+    /// 10^8 steps), and what the park gates read stays a lower bound: the
+    /// earliest end is recomputed when passed, and the answer is exact.
+    #[test]
+    fn a_renewal_leaves_the_gates_hints_lower_bounds_and_their_answers_exact() {
+        let t = LockTables::default();
+        let a = GrantId { node: 3, seq: 1 };
+        let b = GrantId { node: 3, seq: 2 };
+        t.install_held(8, held_of(a, X, 3_000, 2_000));
+        t.install_held(9, held_of(b, X, 10_000, 8_000));
+        assert!(t.may_park(at(2_990)), "8 ends within the lookahead");
+        t.renewed(8, a, a, X, HonourMs(2_900), 4_000, 500, false, 3, at(2_950));
+        assert_eq!(t.held(8).unwrap().until, HonourMs(6_400));
+        // The hint still says 3 000 (a lower bound); the gate's answer is
+        // exact all the same, and the hint is the true earliest end after.
+        assert!(t.next_end.load(Ordering::Relaxed) <= 6_400);
+        assert!(!t.may_park(at(2_990)));
+        assert_eq!(t.next_end.load(Ordering::Relaxed), 6_400);
+        assert!(!t.may_park_est(WaitMs(2_990)));
     }
 }

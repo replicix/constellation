@@ -39,6 +39,11 @@ pub const OLDER_ALPNS: &[&[u8]] = &[b"constellation/2", b"constellation/1"];
 /// Largest accepted frame. Messages are small; the cap just stops a
 /// malicious peer from making us allocate.
 pub const MAX_FRAME: usize = 64 * 1024;
+/// The most entries a `LockRenew` (and so its `LockRenewed`) may carry and
+/// still fit [`MAX_FRAME`] at the largest values
+/// (`maximum_lock_renewals_fit_a_frame`); the holders chunk their renewal
+/// rounds by it (`constellation_authority::event::LOCK_RENEW_MAX_ENTRIES`).
+pub const LOCK_RENEW_MAX_ENTRIES: usize = 512;
 /// iroh-gossip's transport frame. Its default is only 4 KiB; every node
 /// must configure this same value so a full bloom bucket is deliverable.
 pub const GOSSIP_MAX_MESSAGE_SIZE: usize = 32 * 1024;
@@ -1515,6 +1520,85 @@ mod tests {
             n <= GOSSIP_CONTENT_LIMIT,
             "maximum exact delta is {n} bytes, content limit is {GOSSIP_CONTENT_LIMIT}"
         );
+    }
+
+    /// Plan 41 item 7: a lock renewal round of `LOCK_RENEW_MAX_ENTRIES`
+    /// entries, and its answer, fit a frame at the largest values (a round
+    /// of 10,000 grants did not: it was never sent, and every grant lapsed).
+    #[test]
+    fn maximum_lock_renewals_fit_a_frame() {
+        let entries = (0..LOCK_RENEW_MAX_ENTRIES)
+            .map(|_| LockRenewWire {
+                ino: u64::MAX,
+                grant: (u64::MAX, u64::MAX),
+                exclusive: true,
+                late: true,
+            })
+            .collect();
+        let req = Signed::new(
+            &key(),
+            &Payload::LockRenew {
+                from: u64::MAX,
+                req_id: u64::MAX,
+                entries,
+                sent_ms: i64::MIN,
+                clock: u64::MAX,
+            },
+        )
+        .unwrap();
+        let n = req
+            .encode()
+            .expect("maximum renewal exceeds MAX_FRAME")
+            .len();
+        assert!(n <= MAX_FRAME, "{n}");
+        let results = (0..LOCK_RENEW_MAX_ENTRIES)
+            .map(|_| {
+                (
+                    u64::MAX,
+                    (u64::MAX, u64::MAX),
+                    LockRenewResultWire::Ok {
+                        ttl_ms: u64::MAX,
+                        recalled: true,
+                        id: (u64::MAX, u64::MAX),
+                        exclusive: true,
+                    },
+                )
+            })
+            .collect();
+        let reply = Signed::new(
+            &key(),
+            &Payload::LockRenewed {
+                req_id: u64::MAX,
+                results,
+            },
+        )
+        .unwrap();
+        let n = reply
+            .encode()
+            .expect("maximum answer exceeds MAX_FRAME")
+            .len();
+        assert!(n <= MAX_FRAME, "{n}");
+        // Four times as many would not fit: the bound is the frame's.
+        let entries = (0..4 * LOCK_RENEW_MAX_ENTRIES)
+            .map(|_| LockRenewWire {
+                ino: u64::MAX,
+                grant: (u64::MAX, u64::MAX),
+                exclusive: true,
+                late: true,
+            })
+            .collect();
+        let big = Signed::new(
+            &key(),
+            &Payload::LockRenew {
+                from: 1,
+                req_id: 1,
+                entries,
+                sent_ms: 0,
+                clock: 1,
+            },
+        )
+        .unwrap();
+        assert!(big.encode().is_err(), "a round of 2,048 fit a frame");
     }
 
     /// The largest request and reply a session can produce must fit a

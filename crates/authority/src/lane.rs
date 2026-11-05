@@ -64,7 +64,7 @@ use crate::ids::{HonourMs, NodeId, Now};
 use crate::root_probe::{RootProbe, Ticket, Want};
 use constellation_fs_core::Ino;
 use constellation_meta::locks::{GrantId, LockTables};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 /// Request ids of the lane's `LockRenew` carry this bit, so a core never
@@ -256,6 +256,12 @@ pub struct LaneStats {
     pub late_ok: u64,
     pub deferred: u64,
     pub stall_stops: u64,
+    /// Due remote renewals left for the next look: the lane's last
+    /// request to their owner was still out (plan 41 item 7).
+    pub owner_busy: u64,
+    /// Plan 41 item 7: the lane's driver woke (its timer or a wake-up from
+    /// the tables), counted by the driver.
+    pub wakes: u64,
     /// Plan 41 D3: reads of the lease object this lane asked for.
     pub probes: u64,
     /// Ticks that found grants held, and those of them at which the core was
@@ -290,6 +296,12 @@ pub struct RenewLane {
     probe: Option<Arc<RootProbe>>,
     hung_ms: i64,
     inflight: HashMap<u64, Pending>,
+    /// Every entry of `inflight`, for the per-grant lookups of a tick
+    /// (plan 41 item 7: searched through every request's entries, a tick
+    /// with 10,000 grants in flight and the core stuck made 10^8
+    /// comparisons). Counted: a stale request's entries may be out again
+    /// in a newer one.
+    inflight_entries: HashMap<(Ino, GrantId), u32>,
     late: HashMap<u64, (NodeId, HonourMs)>,
     pub stats: LaneStats,
 }
@@ -303,6 +315,7 @@ impl RenewLane {
             probe: None,
             hung_ms: DEFAULT_HUNG_MS,
             inflight: HashMap::new(),
+            inflight_entries: HashMap::new(),
             late: HashMap::new(),
             stats: LaneStats::default(),
         }
@@ -329,6 +342,64 @@ impl RenewLane {
         self.inflight.len()
     }
 
+    /// A request is no longer waited for: out of `inflight` and its entries
+    /// out of the index.
+    fn take_inflight(&mut self, req: u64) -> Option<Pending> {
+        let p = self.inflight.remove(&req)?;
+        for e in &p.entries {
+            if let std::collections::hash_map::Entry::Occupied(mut o) =
+                self.inflight_entries.entry(*e)
+            {
+                *o.get_mut() -= 1;
+                if *o.get() == 0 {
+                    o.remove();
+                }
+            }
+        }
+        Some(p)
+    }
+
+    /// What the lane, about to sleep until `next` ([`Self::next_wake`]),
+    /// tells the tables ([`LockTables::lane_sleeps_until`]): `i64::MAX`
+    /// with nothing to look at (any grant installed wakes it); `i64::MIN`
+    /// when it sleeps only for the poll after its last look (`last + poll`,
+    /// which nothing can bring forward: woken sooner, it would only look
+    /// again at that same instant — with 10,000 grants the core's failed
+    /// renewals woke it 185,000 times a minute for 139 looks); else `next`.
+    pub fn sleep_mark(next: Option<HonourMs>, last: HonourMs, poll_ms: i64) -> i64 {
+        match next {
+            None => i64::MAX,
+            Some(n) if n <= last.plus(poll_ms.max(0) as u64) => i64::MIN,
+            Some(n) => n.0,
+        }
+    }
+
+    /// Plan 41 item 7: when the lane looks again (honour clock), from
+    /// `now`: the earliest instant a grant held now may be due for it
+    /// ([`LockTables::lane_next_due`]: renewal points; while a renewal the
+    /// core sent is out, `poll_ms` from now, so that a core stuck in a step
+    /// meanwhile is noticed as its tick noticed it), and never sooner than
+    /// `poll_ms` after the last look (`last`): a lane holding 10,000
+    /// grants wakes a few times a second, not at each one's renewal point.
+    /// `None`: nothing held will be due before a grant is installed or a
+    /// renewal fails, which wake the lane ([`LockTables::set_lane_waker`]).
+    pub fn next_wake(
+        &self,
+        now: Now,
+        last: HonourMs,
+        stale_ms: i64,
+        poll_ms: i64,
+        locks: &LockTables,
+    ) -> Option<HonourMs> {
+        if locks.held_count() == 0 {
+            return None;
+        }
+        let next = locks.lane_next_due(now, stale_ms, poll_ms, |ino, id| {
+            self.inflight_entries.contains_key(&(ino, id))
+        })?;
+        Some(next.max(last.plus(poll_ms.max(0) as u64)))
+    }
+
     /// Handle one event at `now` (the driver's reading of the protocol clock,
     /// taken before the event is handled and before anything is sent).
     pub fn handle(
@@ -342,7 +413,7 @@ impl RenewLane {
             LaneEvent::Tick { stuck_ms } => self.tick(now, stuck_ms, locks, facts),
             LaneEvent::Answered { req, results } => self.answered(now, req, results, locks, facts),
             LaneEvent::Failed { req } => {
-                let Some(p) = self.inflight.remove(&req) else {
+                let Some(p) = self.take_inflight(req) else {
                     return Vec::new();
                 };
                 // The owner the renewal went to did not answer: it may be
@@ -391,11 +462,7 @@ impl RenewLane {
             now,
             view.forward_timeout_ms as i64,
             core_stuck,
-            |ino, id| {
-                self.inflight
-                    .values()
-                    .any(|p| p.entries.contains(&(ino, id)))
-            },
+            |ino, id| self.inflight_entries.contains_key(&(ino, id)),
         );
         if due.is_empty() {
             return Vec::new();
@@ -441,6 +508,15 @@ impl RenewLane {
             }
         }
         let mut own = 0u32;
+        // Owners with a request of the lane's still waited for (one past the
+        // forward timeout is as good as failed: its entries are due again).
+        let stale_ms = view.forward_timeout_ms as i64;
+        let busy: HashSet<NodeId> = self
+            .inflight
+            .values()
+            .filter(|p| now.honour.since(p.sent) < stale_ms)
+            .map(|p| p.to)
+            .collect();
         let mut by_owner: BTreeMap<
             NodeId,
             Vec<(Ino, GrantId, constellation_meta::locks::LockMode)>,
@@ -490,6 +566,16 @@ impl RenewLane {
                 .filter(|r| *r != view.me)
                 .or(Some(view.owner).filter(|o| *o != 0 && *o != view.me));
             match route {
+                // One request in flight per owner (plan 41 item 7): the next
+                // waits for its answer or its timeout. A request carries
+                // every due entry; re-sent whole at every tick while the
+                // owner's core was busy with the last, 10,000 grants made
+                // 143,180 entries a minute for 20,581 answers, each a load
+                // on that very core.
+                Some(to) if stuck_ms <= self.max_stall_ms && busy.contains(&to) => {
+                    self.stats.owner_busy += 1;
+                    locks.renewal_failed(ino, h.id);
+                }
                 Some(to) if stuck_ms <= self.max_stall_ms => {
                     by_owner.entry(to).or_default().push((ino, h.id, h.mode));
                 }
@@ -512,10 +598,20 @@ impl RenewLane {
             self.stats.own_renewals += own as u64;
             out.push(LaneAction::OwnRenewed { renewed: own });
         }
+        // At most `LOCK_RENEW_MAX_ENTRIES` a request (a P2P frame's worth).
+        let by_owner = by_owner.into_iter().flat_map(|(to, entries)| {
+            entries
+                .chunks(crate::event::LOCK_RENEW_MAX_ENTRIES)
+                .map(|c| (to, c.to_vec()))
+                .collect::<Vec<_>>()
+        });
         for (to, entries) in by_owner {
             self.next += 1;
             let req = LOCK_LANE_REQ_BIT | self.next;
             self.stats.remote_sent += entries.len() as u64;
+            for (i, id, _) in &entries {
+                *self.inflight_entries.entry((*i, *id)).or_default() += 1;
+            }
             self.inflight.insert(
                 req,
                 Pending {
@@ -550,9 +646,9 @@ impl RenewLane {
         facts: &dyn LaneFacts,
     ) -> Vec<LaneAction> {
         let margin = facts.view().margin_ms;
-        let (from, sent, late) = match (self.inflight.remove(&req), self.late.remove(&req)) {
+        let (from, sent, late) = match (self.take_inflight(req), self.late.remove(&req)) {
             (Some(p), _) => {
-                let answered: Vec<(Ino, GrantId)> =
+                let answered: HashSet<(Ino, GrantId)> =
                     results.iter().map(|(i, g, _)| (*i, *g)).collect();
                 // An entry the answer does not name is due again.
                 for (ino, id) in p.entries.iter().filter(|e| !answered.contains(e)) {
@@ -1409,5 +1505,156 @@ mod tests {
             "{out:?}"
         );
         assert_eq!(t.held(7).unwrap().until, HonourMs(3_500), "not extended");
+    }
+
+    /// Plan 41 item 7: the lane looks when something may be due, not on a
+    /// timer: with nothing held never (an install wakes it); else at the
+    /// earliest renewal point, never sooner than a poll after its last
+    /// look; while its own renewal is out, when that goes stale (its answer
+    /// or timeout wakes it sooner); while the core's is out, a poll later
+    /// (a core stuck in a step is noticed as its tick noticed it). And it
+    /// touches only the due grants.
+    #[test]
+    fn the_lane_wakes_for_the_next_renewal_point_and_sends_only_due_grants() {
+        let t = LockTables::default();
+        let mut lane = RenewLane::new(DEFAULT_MAX_STALL_MS);
+        let long_ago = HonourMs(-1_000_000);
+        assert_eq!(lane.next_wake(at(0), long_ago, 400, 250, &t), None);
+        // Owner 3's grants: inode 8 due at 2 000, inode 9 at 5 000.
+        let id8 = remote(&t, 3);
+        t.install_held(9, held(3, 4, 9_000, 5_000));
+        assert_eq!(
+            lane.next_wake(at(1_000), long_ago, 400, 250, &t),
+            Some(HonourMs(2_000))
+        );
+        assert_eq!(
+            lane.next_wake(at(1_900), HonourMs(1_900), 400, 250, &t),
+            Some(HonourMs(2_150)),
+            "a poll after the last look at the soonest"
+        );
+        let mut v = view();
+        v.root_ok = false;
+        v.owner = 3;
+        let f = facts(v);
+        let out = tick(&mut lane, &t, &f, 2_000);
+        let [LaneAction::Send { req, entries, .. }] = out.as_slice() else {
+            panic!("{out:?}");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ino, 8, "only the due grant");
+        assert_eq!(t.held(9).unwrap().renewing, None, "not touched");
+        // Its own renewal out: when it goes stale.
+        assert_eq!(
+            lane.next_wake(at(2_000), HonourMs(2_000), 400, 250, &t),
+            Some(HonourMs(2_400))
+        );
+        lane.handle(
+            at(2_010),
+            LaneEvent::Answered {
+                req: *req,
+                results: vec![(8, id8, ok(id8, 4_000))],
+            },
+            &t,
+            &f,
+        );
+        assert!(lane.inflight_entries.is_empty());
+        // Renewed: its next renewal point (2 000 + 3 500 / 2).
+        assert_eq!(
+            lane.next_wake(at(2_010), HonourMs(2_000), 400, 250, &t),
+            Some(HonourMs(3_750))
+        );
+        // The core's renewal out: a poll from now.
+        assert_eq!(t.due_renewals(at(3_750)).len(), 1);
+        assert_eq!(
+            lane.next_wake(at(3_760), HonourMs(3_750), 400, 250, &t),
+            Some(HonourMs(4_010))
+        );
+    }
+
+    /// Plan 41 item 7: one request of the lane's in flight per owner. The
+    /// next waits for its answer or its timeout (the entries due meanwhile
+    /// stay unmarked, the core's or the next look's); re-sent whole at every
+    /// tick while the owner's core was busy, 10,000 grants made 143,180
+    /// entries a minute for 20,581 answers.
+    #[test]
+    fn one_request_per_owner_is_in_flight() {
+        let t = LockTables::default();
+        let id8 = remote(&t, 3);
+        let id9 = GrantId { node: 3, seq: 4 };
+        t.install_held(9, held(3, 4, 9_000, 2_100));
+        let mut lane = RenewLane::new(DEFAULT_MAX_STALL_MS);
+        let mut v = view();
+        v.root_ok = false;
+        v.owner = 3;
+        let f = facts(v);
+        let out = tick(&mut lane, &t, &f, 2_000);
+        let [LaneAction::Send { req: r1, .. }] = out.as_slice() else {
+            panic!("{out:?}");
+        };
+        let r1 = *r1;
+        assert!(tick(&mut lane, &t, &f, 2_100).is_empty());
+        assert_eq!(lane.stats.owner_busy, 1);
+        assert_eq!(t.held(9).unwrap().renewing, None, "left unmarked");
+        lane.handle(
+            at(2_150),
+            LaneEvent::Answered {
+                req: r1,
+                results: vec![(8, id8, ok(id8, 4_000))],
+            },
+            &t,
+            &f,
+        );
+        let out = tick(&mut lane, &t, &f, 2_200);
+        let [LaneAction::Send {
+            req: r2, entries, ..
+        }] = out.as_slice()
+        else {
+            panic!("{out:?}");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].grant, id9);
+        // Past the forward timeout a request no answer came for holds the
+        // owner no longer (its entries are due again).
+        let r2 = *r2;
+        assert!(tick(&mut lane, &t, &f, 2_599).is_empty());
+        let out = tick(&mut lane, &t, &f, 2_600);
+        assert!(
+            matches!(out.as_slice(), [LaneAction::Send { req, .. }] if *req != r2),
+            "{out:?}"
+        );
+        // An answer's or a failure's entries leave the index.
+        lane.handle(at(2_700), LaneEvent::Failed { req: r2 }, &t, &f);
+        assert_eq!(lane.inflight_entries.len(), 1);
+    }
+
+    /// Plan 41 item 7: a round of more due grants than a P2P frame holds
+    /// goes out in requests of at most `LOCK_RENEW_MAX_ENTRIES` (sent whole,
+    /// it could not be encoded and every grant in it lapsed).
+    #[test]
+    fn a_large_round_is_sent_in_frame_sized_requests() {
+        let t = LockTables::default();
+        let n = 2 * crate::event::LOCK_RENEW_MAX_ENTRIES + 100;
+        for k in 0..n as u64 {
+            t.install_held(100 + k, held(3, 10 + k, 3_500, 2_000));
+        }
+        let mut lane = RenewLane::new(DEFAULT_MAX_STALL_MS);
+        let mut v = view();
+        v.root_ok = false;
+        v.owner = 3;
+        let f = facts(v);
+        let out = tick(&mut lane, &t, &f, 2_000);
+        let sizes: Vec<usize> = out
+            .iter()
+            .map(|a| match a {
+                LaneAction::Send { to: 3, entries, .. } => entries.len(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(sizes.len(), 3, "{sizes:?}");
+        assert!(sizes
+            .iter()
+            .all(|s| *s <= crate::event::LOCK_RENEW_MAX_ENTRIES));
+        assert_eq!(sizes.iter().sum::<usize>(), n);
+        assert_eq!(lane.in_flight(), 3);
     }
 }

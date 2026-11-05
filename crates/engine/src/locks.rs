@@ -2537,6 +2537,13 @@ pub fn outcome_of(w: LockOutcomeWire) -> LockOutcome {
     }
 }
 
+// A renewal round is chunked by the authority's bound; the wire's is the one
+// its test shows fits a P2P frame (plan 41 item 7).
+const _: () = assert!(
+    constellation_authority::event::LOCK_RENEW_MAX_ENTRIES
+        <= constellation_net::message::LOCK_RENEW_MAX_ENTRIES
+);
+
 pub fn renew_entries_wire(entries: &[LockRenewEntry]) -> Vec<LockRenewWire> {
     entries
         .iter()
