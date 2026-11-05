@@ -12,11 +12,15 @@
 //! cargo test -p constellation-model --release -- --nocapture
 //! ```
 //!
-//! Every test today fits the ~60s-each budget at its current bounds
-//! (`max_tick`/`max_seq`/workload size); a future milestone that needs a
-//! bigger configuration to reproduce something should mark it
-//! `#[ignore]` per plan 30 §M1, rather than growing the default bounds
-//! for everyone.
+//! The default set keeps every test under ~20 s (release, alone on box 1)
+//! so that the whole crate runs in under five minutes; a configuration
+//! that needs longer is `#[ignore]`d with its time in the reason (plan 30
+//! §M1), rather than growing the default bounds for everyone. The
+//! exhaustive set, ignored tests included:
+//!
+//! ```text
+//! cargo test -p constellation-model --release -- --include-ignored
+//! ```
 //!
 //! [`protocol::AuthorityModel`] is a `stateright::Model`. Build one with
 //! [`protocol::AuthorityModel::new`] and the `with_*` builder methods,
@@ -117,9 +121,21 @@
 //! the skeleton (static grants, no faults); chunk 2 adds a crash, a root
 //! deposition with the seal, retry by rid and completed-dedup
 //! (`acked_never_lost`, `exactly_once`); chunk 3 adds reconfiguration
-//! under old ∪ new (`row_version_matches_config`). Each has planted-bug
+//! under old ∪ new (`row_version_matches_config`); chunk 4 subtree sets,
+//! release as a stream row and recall as a request (`recall_safety`,
+//! `released_subtree_sequenced_after_cut`, `two_subtrees_one_order`,
+//! `journal_valid`: one cut per stream suffices); chunk 5 per-key
+//! linearizability and the causal cut with `deps` per node stream
+//! (`per_key_linearizable`, `causal_cut`, `marker_order`,
+//! `converged_at_quiescence`); chunk 6 the TTL end, C3's verbatim re-ship
+//! by a delegate taking the root, member copies (L2b) and the L1 mark
+//! (`acked_at_or_below_cut`, `verbatim_identity`). Each has planted-bug
 //! knobs (`lone_delegate`, `root_journal_counts`, `no_dedup`,
-//! `per_row_class`, `ack_by_latest_config`). `tests/node_stream.rs`.
+//! `per_row_class`, `ack_by_latest_config`, `root_executes_before_at`,
+//! `execute_after_release`, `per_subtree_streams`,
+//! `honour_uncommitted_grant`, `deps_ignored`, `end_before_seal`,
+//! `no_reappend`, `drop_member_copy`, `l1_mark_cleared_by_stream`).
+//! `tests/node_stream.rs`.
 //!
 //! # What is modeled
 //!

@@ -298,6 +298,7 @@ fn granting_before_expiry_plus_margin_violates_under_drift() {
 }
 
 #[test]
+#[ignore = "heavy (~61 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn the_lease_margin_is_clean_under_drift() {
     assert_clean(
         "drift-margin-3",
@@ -325,6 +326,7 @@ fn fast_takeover_without_replication_or_grace_violates() {
 /// The mirror alone is not enough: it is asynchronous, so a grant made
 /// after the last mirror is unknown to the successor.
 #[test]
+#[ignore = "heavy (~45 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn fast_takeover_with_only_the_async_mirror_violates() {
     let m = LockModel {
         backup: 2,
@@ -385,6 +387,7 @@ fn fast_takeover_with_grace_is_clean_with_a_backup_far_ahead() {
 /// level with, far ahead of and far behind the root's; the cap witnessed
 /// where it can be (level).
 #[test]
+#[ignore = "heavy (~128 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn fast_takeover_with_beat_cap_is_clean() {
     for (label, offsets) in [
         ("level", vec![0, 0, 0]),
@@ -420,6 +423,7 @@ fn two_lockers() -> Vec<Vec<Op>> {
 
 /// The same under clocks within `D = 1` that step once, margins of 3.
 #[test]
+#[ignore = "heavy (~64 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn fast_takeover_with_beat_cap_is_clean_under_drift() {
     let m = LockModel {
         backup: 2,
@@ -537,6 +541,7 @@ fn the_beat_cap_counts_the_lease_the_takeover_replaced() {
 }
 
 #[test]
+#[ignore = "heavy (~22 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn fast_takeover_with_grace_and_mirror_is_clean() {
     let m = LockModel {
         backup: 2,
@@ -633,6 +638,7 @@ fn fast_takeover_renewals_without_the_probe_violate() {
 /// ticks and 5 renewals (30.1M states, 9.8M unique), a size at which the
 /// old rule is violated.
 #[test]
+#[ignore = "heavy (~51 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn fast_takeover_renewals_with_the_probe_are_clean() {
     // The shared state budget, a longer clock: 132 s in a debug build
     // on a loaded host.
@@ -758,6 +764,7 @@ fn a_delegation_move_that_loses_state_violates() {
 
 /// The same on the way back: a recall whose answer carries no table.
 #[test]
+#[ignore = "heavy (~47 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn a_recall_that_loses_state_violates() {
     let m = LockModel {
         delegate: 1,
@@ -782,6 +789,7 @@ fn a_recall_that_loses_state_violates() {
 }
 
 #[test]
+#[ignore = "heavy (~58 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn delegation_moves_with_state_are_clean() {
     let m = LockModel {
         delegate: 2,
@@ -903,6 +911,7 @@ fn reinstating_next_to_a_conflicting_grant_breaks_the_table() {
 
 /// The design: a handoff lost, re-sent with the next renewal.
 #[test]
+#[ignore = "heavy (~22 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn lost_handoffs_resent_are_clean() {
     let m = LockModel {
         delegate: 2,
@@ -943,6 +952,7 @@ fn a_delegation_inside_a_released_takeovers_grace_violates_if_the_grace_stays() 
 /// The design: the grace rides the delegation's first renewal; reclaims
 /// go to the delegate.
 #[test]
+#[ignore = "heavy (~45 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn a_released_takeovers_grace_follows_the_delegation() {
     let m = LockModel {
         delegate: 2,
@@ -1109,6 +1119,7 @@ const WITH_A_LOST_HANDOFF: &[&str] = &[
 /// The rule: a grant never renewed carries what is left of its record,
 /// plus the margin at the receipt.
 #[test]
+#[ignore = "heavy (~20 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn carrying_unproven_grants_across_three_moves_is_clean() {
     assert_clean(
         "carry-unproven-3-moves",
@@ -1118,6 +1129,7 @@ fn carrying_unproven_grants_across_three_moves_is_clean() {
 }
 
 #[test]
+#[ignore = "heavy (~30 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn carrying_unproven_grants_with_a_renewal_is_clean() {
     assert_clean(
         "carry-unproven-renewal",
@@ -1141,6 +1153,7 @@ fn carrying_unproven_grants_with_a_lost_handoff_is_clean() {
 /// record it measures, and one that reaches it later is refused: whether
 /// the grant was used is not what makes the carry safe.
 #[test]
+#[ignore = "heavy (~20 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn carrying_all_grants_across_three_moves_is_clean() {
     assert_clean(
         "carry-all-3-moves",
@@ -1150,6 +1163,7 @@ fn carrying_all_grants_across_three_moves_is_clean() {
 }
 
 #[test]
+#[ignore = "heavy (~35 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn carrying_all_grants_with_a_renewal_is_clean() {
     assert_clean(
         "carry-all-renewal",
@@ -1198,6 +1212,7 @@ fn carrying_under_drift(stamp: MoveStamp, max_tick: u8) -> LockModel {
 }
 
 #[test]
+#[ignore = "heavy (~21 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn restamping_is_clean_under_drift() {
     assert_clean(
         "carry-drift-restamp",
@@ -1207,6 +1222,7 @@ fn restamping_is_clean_under_drift() {
 }
 
 #[test]
+#[ignore = "heavy (~38 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn carrying_unproven_grants_is_clean_under_drift() {
     assert_clean(
         "carry-drift-unproven",
@@ -1412,6 +1428,7 @@ fn late_lone(scripts: Vec<Vec<Op>>) -> LockModel {
 }
 
 #[test]
+#[ignore = "heavy (~26 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn late_reclaim_at_a_live_owner_is_clean() {
     assert_clean_dfs(
         "late-lone",
@@ -1580,6 +1597,7 @@ fn a_late_renewal_after_a_non_final_mirror_is_refused() {
 /// lapsed grant is remembered, node 2 is granted over it, and node 1's late
 /// renewal is admitted beside node 2's live grant.
 #[test]
+#[ignore = "heavy (~24 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn a_lapsed_memory_not_superseded_by_a_conflicting_grant_violates() {
     let m = LockModel {
         late_lapsed_unsuperseded: true,
@@ -2112,6 +2130,7 @@ fn a_claimant_ahead_beyond_the_margin_violates() {
 /// The observation rule with the same offsets (and the holder behind, a
 /// node far ahead and one far behind): clean, the takeover witnessed.
 #[test]
+#[ignore = "heavy (~47 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn the_observed_claim_is_clean_with_offsets_up_to_a_ttl() {
     for (label, offsets) in [
         ("ahead", vec![0, 3, 3]),
@@ -2150,6 +2169,7 @@ fn a_lane_ignoring_freshness_renews_through_a_fast_takeovers_grace() {
 }
 
 #[test]
+#[ignore = "heavy (~36 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn design_a_lane_on_a_fast_tenure_is_clean() {
     assert_clean(
         "lane-fast",
@@ -2219,6 +2239,7 @@ fn a_lane_that_keeps_its_certificate_and_revives_records_renews_through_the_succ
 }
 
 #[test]
+#[ignore = "heavy (~30 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn design_a_lane_after_a_release_is_clean() {
     assert_clean(
         "lane-release",

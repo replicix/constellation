@@ -466,6 +466,7 @@ fn positions_stranded_shadow_deep() {
 /// may crash, node 1 unlinks the name (possibly after taking over) and
 /// reads the directory. Exhaustive.
 #[test]
+#[ignore = "heavy (~28 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn positions_holds_across_a_crash_and_takeover() {
     let model = AuthorityModel::new(2)
         .with_protocol(Protocol::Positions)

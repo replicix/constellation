@@ -115,6 +115,7 @@ fn acking_before_the_removal_cas_lands_loses_an_acked_write() {
 /// tail would replace the log's holder without what the dead holder
 /// acknowledged.
 #[test]
+#[ignore = "heavy (~24 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn an_unlisted_backup_taking_over_loses_an_acked_write() {
     let m = BackupModel {
         takeover_requires_listing: false,
@@ -187,6 +188,7 @@ fn backup_three_nodes_with_reconfiguration_is_clean() {
 /// The design under `ack=s3`: no backups, acknowledgements on landing, a
 /// crash and a fast takeover fenced by the log slot.
 #[test]
+#[ignore = "heavy (~24 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn ack_s3_with_a_crash_and_fast_takeover_is_clean() {
     let m = BackupModel {
         max_tick: 2,

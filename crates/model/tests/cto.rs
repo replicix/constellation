@@ -204,6 +204,7 @@ fn drifting(margin: i16, deleg_ttl: i16, max_tick: u8) -> CtoModel {
 /// With a margin of 1 on both sides (`M_d + M_s < 4D`), the delegate
 /// still honours its grant after the holder outwaited a lost recall.
 #[test]
+#[ignore = "heavy (~20 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn recall_override_without_enough_margin_violates_under_drift() {
     assert_violates("drift-margin-1", &drifting(1, 2, 6));
 }
@@ -310,6 +311,7 @@ fn deep_drift_takeover_release() {
 /// delegation and does not wait the horizon out — the reader's next open
 /// is local and stale.
 #[test]
+#[ignore = "heavy (~26 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn fast_takeover_without_the_horizon_violates() {
     let m = CtoModel {
         horizon_wait: false,
@@ -323,6 +325,7 @@ fn fast_takeover_without_the_horizon_violates() {
 /// deposed holder keeps answering strict reads past the window the
 /// successor waited for.
 #[test]
+#[ignore = "heavy (~26 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn fast_takeover_without_the_probe_violates() {
     let m = CtoModel {
         probe_freshness: false,
@@ -338,6 +341,7 @@ fn fast_takeover_without_the_probe_violates() {
 /// Both rules: a fast takeover with a delegation outstanding is clean,
 /// the successor's floor and the fast takeover both witnessed.
 #[test]
+#[ignore = "heavy (~25 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn fast_takeover_with_horizon_and_probe_is_clean() {
     let m = CtoModel {
         max_tick: 6,
@@ -354,6 +358,7 @@ fn fast_takeover_with_horizon_and_probe_is_clean() {
 /// The same under clocks off by ±1 that step once each, with margins of
 /// 3 (> 2D): still clean.
 #[test]
+#[ignore = "heavy (~22 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn fast_takeover_is_clean_under_drift_within_the_margin() {
     let m = CtoModel {
         max_offset: 1,
@@ -378,6 +383,7 @@ fn fast_takeover_is_clean_under_drift_within_the_margin() {
 /// against the old expiry, as the model did, the takeover counted as a TTL
 /// one: no floor, and the reader's delegation is read stale.)
 #[test]
+#[ignore = "heavy (~24 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn fast_takeover_is_clean_with_a_successor_far_ahead() {
     let m = CtoModel {
         init_offsets: Some(vec![0, 9, 9]),
@@ -640,11 +646,13 @@ fn double_seal(inherit_mark: bool) -> CtoModel {
 }
 
 #[test]
+#[ignore = "heavy (~24 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn a_tenure_sealed_inside_its_floor_leaves_no_floor_without_the_inherited_mark() {
     assert_violates("double-seal-unmarked", &double_seal(false));
 }
 
 #[test]
+#[ignore = "heavy (~24 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn a_tenure_that_inherits_a_floor_marks_its_register_and_the_double_seal_is_clean() {
     assert_clean(
         "double-seal-marked",
@@ -731,11 +739,13 @@ fn rated_floor(budget: i16) -> CtoModel {
 }
 
 #[test]
+#[ignore = "heavy (~25 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn fast_takeover_floor_rate_beyond_the_budget_violates() {
     assert_violates("floor-rate-no-budget", &rated_floor(0));
 }
 
 #[test]
+#[ignore = "heavy (~25 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn fast_takeover_floor_rate_within_the_budget_is_clean() {
     assert_clean(
         "floor-rate-within-budget",
@@ -935,6 +945,7 @@ fn a_holder_behind_beyond_the_margin_violates() {
 /// The observation rule, with the same offsets (and the other way round):
 /// clean, and the takeover happens (the claimant waits out the TTL).
 #[test]
+#[ignore = "heavy (~89 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn the_observed_claim_is_clean_with_offsets_up_to_a_ttl() {
     for (label, offsets) in [
         ("ahead", vec![0, 6, 6]),
@@ -952,6 +963,7 @@ fn the_observed_claim_is_clean_with_offsets_up_to_a_ttl() {
 /// The observation rule with oscillators at the rate budget's edge
 /// (`rate_period` 4, budget 1: 25 %) and offsets of a whole lease: clean.
 #[test]
+#[ignore = "heavy (~29 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn the_observed_claim_is_clean_with_offsets_and_rates_within_the_budget() {
     let m = CtoModel {
         rate_period: 4,

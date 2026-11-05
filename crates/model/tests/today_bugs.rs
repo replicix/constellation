@@ -223,6 +223,7 @@ fn today_finds_bug_b() {
 /// test: both do still fail at these bounds — that is the expected,
 /// unfixed state, not a gap in this test.)
 #[test]
+#[ignore = "heavy (~33 s release): cargo test -p constellation-model --release -- --include-ignored"]
 fn exactly_once_is_linearizable() {
     let started = Instant::now();
     let model = AuthorityModel::new(2)

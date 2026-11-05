@@ -368,7 +368,8 @@ subtree-set stream keeps `recall_safety` with one cut per stream. If it
 needs a per-subtree cut that re-creates cross-cut dependencies, the
 fallback is **one subtree per node** (a node dominating two trees gets
 one grant on their common ancestor or one of them) with the rest of §5
-unchanged.
+unchanged. M1.0's chunk 4 decided it: one cut per stream holds, no
+fallback (§9).
 
 ### 5.3 Sticky placement
 
@@ -883,7 +884,7 @@ every milestone.
 
 | Risk | Where | Fallback |
 |---|---|---|
-| The subtree-set stream cannot keep `recall_safety` with one cut (a released subtree's rows interleave with kept ones so that the root's cursor cannot be split cleanly). | M1.0 | One subtree per node (a node dominating two trees gets one grant); the rest of §5 unchanged. Decided at the timebox (D7). |
+| The subtree-set stream cannot keep `recall_safety` with one cut (a released subtree's rows interleave with kept ones so that the root's cursor cannot be split cleanly). | M1.0 | One subtree per node (a node dominating two trees gets one grant); the rest of §5 unchanged. Decided at the timebox (D7). **Decided by M1.0 chunk 4 (2026-11-05): not needed.** The root appends a node stream in order, so it sequences a released directory once its journal shows the `SubtreeReleased` row (past `at`); the kept subtrees' rows below `at` are appended with it (latency, not safety). `node_stream`'s `recall_safety`, `released_subtree_sequenced_after_cut`, `journal_valid`, I1, per-key linearizability and the causal cut hold with released and kept rows interleaved around `at`, a crash and a deposition; acting before appending through `at` is found (knob `root_executes_before_at`). |
 | The ownership walk and the recall plan are rewritten; the recall-by-request path is new. | M1.2 | The model first; the fail-before sims above with the xgen machinery deleted; fable review before M1.3. |
 | A far writer's product promise becomes conditional on a sticky grant; a holder lost mid-write blocks a subtree for others for as long as it is away. | M1.3 | Automatic grants by placement (D2), the release triggers, `release --wait` in lifecycle hooks, `abandon` documented; the optional self-fence for operators who prefer a bounded block to a final answer. |
 | The logind inhibitor's window is shorter than a drain under load. | M1.3 | The shipped drop-in raising `InhibitDelayMaxSec`; a drain that cannot finish releases what it has and the rest is a lost-holder case on resume (its rows stay final and stream on resume; nothing is rolled back). |
