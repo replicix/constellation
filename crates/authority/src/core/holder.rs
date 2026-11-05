@@ -553,7 +553,7 @@ impl Core {
         let wait = match fresh {
             Some(inos) => self.recall_needed(now, &inos, Some(from), replica, out),
             None if matches!(outcome, MutateOutcome::Accepted { .. }) => {
-                self.dedup_acceptance_wait(now, replica, out)
+                self.dedup_acceptance_wait(now, rid, replica, out)
             }
             None => None,
         };

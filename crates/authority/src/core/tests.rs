@@ -9436,6 +9436,226 @@ mod cto {
         (h, dir, q)
     }
 
+    /// Plan 41 P41-01 (review S1): an acceptance answered from the dedup
+    /// at a lease holder waits for the read-delegation quarantine, on each
+    /// of the three paths that find an applied op. Each of these tests
+    /// fails with its call site's wait removed.
+    fn quarantine_for(h: &mut Harness, ms: u64) -> WaitMs {
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let q = h.clk().wait.plus(ms);
+        h.meta.read_delegations().set_quarantine(q);
+        q
+    }
+
+    /// A requester's forward (rid of node 2) that executed at this holder
+    /// before: its retry inside a quarantine is parked, then answered.
+    #[test]
+    fn a_forwarded_retry_of_an_applied_op_waits_out_the_quarantine() {
+        let (mut h, _) = holder_with_file();
+        let rid = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 1,
+        };
+        let op = h.create("x");
+        constellation_meta::execute_mutate(&h.meta, &op, Some(rid)).unwrap();
+        // (The rows are in the log already: the answer waits for nothing
+        // else.)
+        let tip = h.meta.journal_tip().unwrap();
+        let seqs: Vec<u64> = (1..=tip).collect();
+        h.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+        quarantine_for(&mut h, 1_000);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(77),
+                rid,
+                op,
+                acked_through: 0,
+                deps: Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: false,
+            },
+        });
+        let answered = |out: &[Action]| {
+            sends(out).iter().any(|(to, m)| {
+                *to == 2
+                    && matches!(
+                        m,
+                        PeerMsg::MutateReply {
+                            outcome: MutateOutcome::Accepted { .. },
+                            ..
+                        }
+                    )
+            })
+        };
+        assert!(
+            !answered(&out),
+            "acknowledged inside the quarantine: {out:?}"
+        );
+        let t = timer_of(&out, TimerKind::GrantQuarantine);
+        h.advance(1_001);
+        let mut out = h.step(Event::Timer { id: t });
+        for p in timers(&out, TimerKind::Poll) {
+            out.extend(h.step(Event::Timer { id: p }));
+        }
+        assert!(answered(&out), "not answered after the quarantine: {out:?}");
+    }
+
+    /// The deadline of an op forwarded elsewhere, completed in the log and
+    /// applied here, where this node now holds the lease: the settled
+    /// acceptance waits out the quarantine.
+    #[test]
+    fn a_deadline_settling_at_a_holder_waits_out_the_quarantine() {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        let rid = h.rid(1);
+        let op = h.create("d");
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: op.clone(),
+            tag: Default::default(),
+        });
+        let deadline = timers(&out, TimerKind::ClientDeadline)[0];
+        let holder = Meta::open_in_memory().unwrap();
+        holder.set_node_prefix(2).unwrap();
+        let records = constellation_meta::execute_mutate(&holder, &op, Some(rid)).unwrap();
+        crate::replica::Replica::apply_segment(&h.meta, 1, 1, 0, &[], &[], &records).unwrap();
+        h.hold(1, None);
+        h.advance(60_000);
+        quarantine_for(&mut h, 3_000);
+        let out = h.step(Event::Timer { id: deadline });
+        assert!(
+            replies(&out).is_empty(),
+            "acknowledged inside the quarantine: {out:?}"
+        );
+        let t = timer_of(&out, TimerKind::GrantQuarantine);
+        h.advance(3_001);
+        let out = h.step(Event::Timer { id: t });
+        let r = replies(&out);
+        assert_eq!(r.len(), 1, "{out:?}");
+        assert!(matches!(
+            r[0].1,
+            ClientReply::Outcome(MutateOutcome::Accepted { .. })
+        ));
+    }
+
+    /// The lease path's resolution of an in-doubt op found completed
+    /// (`resolve_in_doubt_then_execute`): the acceptance waits out the
+    /// quarantine of the tenure just won.
+    #[test]
+    fn a_resolved_in_doubt_op_waits_out_the_quarantine() {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        let rid = h.rid(1);
+        let op = h.create("a");
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: op.clone(),
+            tag: Default::default(),
+        });
+        let timeout = timers(&out, TimerKind::ForwardTimeout)[0];
+        let holder = Meta::open_in_memory().unwrap();
+        holder.set_node_prefix(2).unwrap();
+        let records = constellation_meta::execute_mutate(&holder, &op, Some(rid)).unwrap();
+        crate::replica::Replica::apply_segment(&h.meta, 1, 1, 0, &[], &[], &records).unwrap();
+        let mut t = timeout;
+        for attempt in 1..=2 {
+            h.advance(500);
+            let out = h.step(Event::Timer { id: t });
+            let b = timers(&out, TimerKind::ForwardBackoff)[0];
+            h.advance(100 * attempt);
+            let out = h.step(Event::Timer { id: b });
+            t = timers(&out, TimerKind::ForwardTimeout)[0];
+        }
+        h.advance(500);
+        let out = h.step(Event::Timer { id: t });
+        let (get, _) = s3_ops(&out)[0];
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(None)),
+        });
+        let (create, _) = s3_ops(&out)[0];
+        let out = h.step(Event::S3 {
+            op: create,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        let (drain, _) = s3_ops(&out)[0];
+        quarantine_for(&mut h, 3_000);
+        let out = h.step(Event::S3 {
+            op: drain,
+            result: S3Result::InboxDrain(Ok(Vec::new())),
+        });
+        assert_eq!(h.core.stats.forward_indoubt_resolved, 1, "{out:?}");
+        assert!(
+            replies(&out).is_empty(),
+            "acknowledged inside the quarantine: {out:?}"
+        );
+        let t = timer_of(&out, TimerKind::GrantQuarantine);
+        h.advance(3_001);
+        let out = h.step(Event::Timer { id: t });
+        let r = replies(&out);
+        assert_eq!(r.len(), 1, "{out:?}");
+        assert!(matches!(
+            r[0].1,
+            ClientReply::Outcome(MutateOutcome::Accepted { .. })
+        ));
+    }
+
+    /// Review S3: a local write parked for durability and for a grant's
+    /// recall, whose deadline gave the durability park up, is settled at
+    /// that deadline by the same rid (as its retry would be) and found
+    /// completed: that answer still waits for the recall, not only for
+    /// durability and the quarantine (none here), once the row is durable.
+    #[test]
+    fn a_dedup_after_an_aborted_park_still_waits_for_the_recall() {
+        let (mut h, ino) = holder_with_file();
+        let grant = grant_of(&ask(&mut h, 2, 7, ino));
+        h.core.lease.held.as_mut().expect("held").0.ack_policy =
+            constellation_store_s3::AckPolicy::S3;
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: setattr(ino),
+            tag: Default::default(),
+        });
+        assert!(replies(&out).is_empty(), "parked: {out:?}");
+        let rs = recalls(&out);
+        let [(2, recall, _, g)] = rs.as_slice() else {
+            panic!("expected one recall to node 2: {out:?}")
+        };
+        assert_eq!(*g, grant.id);
+        let deadline = timers(&out, TimerKind::ClientDeadline)[0];
+        // The deadline drops the durability park and settles the rid: found
+        // completed, answered again once durable (and recalled).
+        let out = h.step(Event::Timer { id: deadline });
+        assert!(replies(&out).is_empty(), "{out:?}");
+        let tip = h.meta.journal_tip().unwrap();
+        let seqs: Vec<u64> = (1..=tip).collect();
+        h.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+        let out = activity(&mut h);
+        assert!(
+            replies(&out).is_empty(),
+            "acknowledged with the recall out: {out:?}"
+        );
+        assert!(recalls(&out).is_empty(), "the recall is not sent twice");
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: *recall },
+        });
+        let r = replies(&out);
+        assert_eq!(r.len(), 1, "{out:?}");
+        assert!(matches!(
+            r[0].1,
+            ClientReply::Outcome(MutateOutcome::Accepted { .. })
+        ));
+    }
+
     fn renewal(req: u64, gen: u64, first: bool) -> Event {
         Event::Peer {
             from: 3,

@@ -2394,7 +2394,7 @@ impl Core {
                 // read-delegation quarantine as a fresh execution's does
                 // (`dedup_acceptance_wait`).
                 let wait = matches!(outcome, MutateOutcome::Accepted { .. })
-                    .then(|| self.dedup_acceptance_wait(now, replica, out))
+                    .then(|| self.dedup_acceptance_wait(now, rid, replica, out))
                     .flatten();
                 if wait.is_some() || durable.is_some() {
                     self.rd
@@ -3690,7 +3690,7 @@ impl Core {
         {
             return;
         }
-        if let Some(wait) = self.dedup_acceptance_wait(now, replica, out) {
+        if let Some(wait) = self.dedup_acceptance_wait(now, rid, replica, out) {
             let durable = self.rd.parked_local.remove(&rid).and_then(|(_, d)| d);
             self.rd.parked_local.insert(rid, (wait, durable));
         }

@@ -66163,13 +66163,26 @@ quarantine as a fresh execution does (`Core::dedup_acceptance_wait`, the
 quarantine part of `recall_needed`), in both paths. Within one tenure the
 first answer already waited for it, so nothing changes once it is over.
 
+Review round (Opus): three holder-side sites answer an already-applied
+`Accepted`, and all three now wait: `resolve_in_doubt_then_execute`, the
+holder's forward dedup, and `settled_outcome` at a lease holder
+(`park_settled_acceptance`, at the client deadline and in
+`refuse_on_lease_path`; M1). Core unit tests cover the first, the second and
+the deadline site, each failing with its wait removed (S1). Also (S3):
+`abort_durable_park_of` remembers the grant recalls the dropped park still
+waited for (`aborted_recalls`), and the dedup of the same rid waits for them
+again, so one tenure's retry or settle cannot acknowledge before a recall in
+flight.
+
 Fail-before: `a_successor_does_not_acknowledge_its_predecessors_held_op_inside_the_floor`
 (seeds 217253..217255) fails on main at 217254 and passes with the fix.
 Authority lib and sim tests pass; `long_locks` at 1 000 seeds is clean (34
 configurations, 28 min).
 
-Open: a non-holder answering an in-doubt op from the applied log
-(`settled_outcome`) does not know a successor's quarantine (not reached).
+Open (S2): a non-holder answering an in-doubt op from its applied log
+(`settled_outcome` with no lease, `answer_awaiting_log`, the inbox answer)
+does not know a successor's quarantine; in `backup-strict` 23 acknowledgements
+in 300 seeds are this class at a node that just lost its lease.
 Separately, `strict-isolated-reader-beats` fails 5 of 2 000 seeds
 (218011, 218233, 218388, 218613, 218848) on main and with this fix: each has
 the mix's reboot of the isolated reader with a backward wall step, after which

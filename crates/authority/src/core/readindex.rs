@@ -258,6 +258,12 @@ pub(crate) struct ReadState {
     parked: BTreeMap<u64, Parked>,
     next_park: u64,
     parked_rids: BTreeMap<Rid, u64>,
+    /// Plan 41 P41-01 (review S3): the grant recalls a local acknowledgement
+    /// was still waiting for when its deadline aborted its durability park
+    /// (`abort_durable_park_of`), by rid. The op's retry finds it completed
+    /// and waits for them again (`dedup_acceptance_wait`); only recalls
+    /// still running count.
+    aborted_recalls: BTreeMap<Rid, BTreeSet<u64>>,
     /// `execute_local` found recalls (or a durability wait) needed;
     /// `finish` parks.
     pub(crate) parked_local: BTreeMap<Rid, (RecallWait, Option<u64>)>,
@@ -624,13 +630,28 @@ impl Core {
     /// tenure a dedup hit is an op this tenure executed, whose own answer
     /// waited for the quarantine already; waiting again costs nothing once
     /// it is over.
+    ///
+    /// Within one tenure the answer may also have waited for a grant's
+    /// recall that its deadline then gave up (`abort_durable_park_of`); a
+    /// retry by `rid` waits for that recall, still running, again.
     pub(crate) fn dedup_acceptance_wait(
         &mut self,
         now: Now,
+        rid: Rid,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Option<RecallWait> {
-        self.recall_needed(now, &[], None, replica, out)
+        let mut wait = self.recall_needed(now, &[], None, replica, out);
+        if let Some(grants) = self.rd.aborted_recalls.remove(&rid) {
+            let live: BTreeSet<u64> = grants
+                .into_iter()
+                .filter(|g| self.rd.recalls.contains_key(g))
+                .collect();
+            if !live.is_empty() {
+                wait.get_or_insert_with(Default::default).0.extend(live);
+            }
+        }
+        wait
     }
 
     pub(crate) fn start_recalls(
@@ -1208,7 +1229,23 @@ impl Core {
         let Some(id) = id else {
             return false;
         };
-        self.rd.parked.remove(&id);
+        if let Some(p) = self.rd.parked.remove(&id) {
+            // Plan 41 P41-01 (review S3): the retry waits for the recalls
+            // this park still waited for (ended ones are dropped here, so
+            // the map stays bounded by the recalls running).
+            let recalls = &self.rd.recalls;
+            self.rd
+                .aborted_recalls
+                .retain(|_, g| g.iter().any(|id| recalls.contains_key(id)));
+            let live: BTreeSet<u64> = p
+                .waiting
+                .into_iter()
+                .filter(|g| recalls.contains_key(g))
+                .collect();
+            if !live.is_empty() {
+                self.rd.aborted_recalls.insert(rid, live);
+            }
+        }
         let _ = out;
         true
     }
