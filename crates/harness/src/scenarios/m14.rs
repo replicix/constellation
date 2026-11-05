@@ -2756,8 +2756,8 @@ pub fn lock_device_stall_lone_node(_seed: u64) -> Result<()> {
         Ok(())
     };
     hook("slow")?;
-    let result = lock_lapse_lone_run(NAME, &c, LoneStall::Device { ms, dm, lane_off })
-        .and_then(|expected| {
+    let result = lock_lapse_lone_run(NAME, &c, LoneStall::Device { ms, dm, lane_off }).and_then(
+        |expected| {
             hook("fast")?;
             c.unmount()?;
             c.mount()?;
@@ -2770,7 +2770,8 @@ pub fn lock_device_stall_lone_node(_seed: u64) -> Result<()> {
                 String::from_utf8_lossy(&fsck.stderr)
             );
             Ok(())
-        });
+        },
+    );
     let _ = hook("fast");
     if result.is_err() {
         keep_logs(NAME, std::slice::from_ref(&c));
@@ -3218,11 +3219,7 @@ enum LoneStall {
     /// this long, with 8 threads fsyncing on the mount (plan 41's real-device
     /// reproduction, `lock-device-stall-lone-node`). The lane-on arm must not
     /// lapse; the lane-off arm only records.
-    Device {
-        ms: u64,
-        dm: String,
-        lane_off: bool,
-    },
+    Device { ms: u64, dm: String, lane_off: bool },
 }
 
 impl LoneStall {
@@ -3538,7 +3535,11 @@ fn lock_lapse_lone_run(name: &str, c: &Client, stall: LoneStall) -> Result<LoneE
             let parks = fence["lapse_parks"].as_u64().unwrap_or(0);
             let parked_ms = fence["lapse_park_ms_max"].as_u64().unwrap_or(0);
             anyhow::ensure!(
-                device || after_eio || fenced_ops > 0 || eios > 0 || (parks > 0 && parked_ms >= ms / 3),
+                device
+                    || after_eio
+                    || fenced_ops > 0
+                    || eios > 0
+                    || (parks > 0 && parked_ms >= ms / 3),
                 "with CONSTELLATION_LOCK_LANE=off a {ms} ms store stall lapsed nothing (lapse \
                  parks {parks}, longest {parked_ms} ms): the fault point did not reach the core \
                  (or the scenario is vacuous); locks: {fence}"

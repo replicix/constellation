@@ -16323,10 +16323,8 @@ mod locks {
         gate.epoch = 3;
         gate.drained = true;
         h.hold(3, Some(gate));
-        h.core.bk.gate_orphan_proof = Some((
-            3,
-            constellation_meta::OrphanProof::of(&[no_tail(2, 0)]),
-        ));
+        h.core.bk.gate_orphan_proof =
+            Some((3, constellation_meta::OrphanProof::of(&[no_tail(2, 0)])));
         let mut out = Vec::new();
         h.core.complete_gate(h.clk(), &h.meta, &mut out);
         assert!(
