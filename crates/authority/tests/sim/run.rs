@@ -287,6 +287,17 @@ pub enum LagOf {
     NonHolder,
 }
 
+/// How the lock lane's task waits ([`SimConfig::lane_loop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneLoopKind {
+    /// The daemon's loop: `constellation_authority::lane::LaneLoop`'s
+    /// decisions, sleeping until a grant may be due or a wake.
+    Sleeping,
+    /// A tick every `forward_timeout / 4` (50..250 ms), as before plan 41
+    /// item 7.
+    Fixed,
+}
+
 /// Plan 41 D3 non-vacuity: a probe that does not do what the design says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeMutant {
@@ -680,6 +691,12 @@ pub struct SimConfig {
     /// publishes. `false` is the code before it: the fail-before of the
     /// core-stall configurations (`locks-core-stall`).
     pub lock_lane: bool,
+    /// How the lock lane's task waits (plan 41 item 7): the daemon's
+    /// sleeping loop (`Sleeping`, the default), or the fixed tick it had
+    /// before (`Fixed`, `forward_timeout / 4` clamped to 50..250 ms), which
+    /// the control tests whose seeds were tuned to that schedule pin.
+    /// `AUTHORITY_SIM_LANE_LOOP=fixed` flips the default.
+    pub lane_loop: LaneLoopKind,
     /// Test-only non-vacuity: the lock lane ignores a fast tenure's
     /// freshness rule (`locks-core-stall-backup-unfresh` must find a
     /// violation).
@@ -1047,6 +1064,11 @@ impl Default for SimConfig {
             root_probe_mutant: ProbeMutant::None,
             // `AUTHORITY_SIM_NO_LOCK_LANE=1`: the code without the lock lane.
             lock_lane: std::env::var_os("AUTHORITY_SIM_NO_LOCK_LANE").is_none(),
+            lane_loop: if std::env::var("AUTHORITY_SIM_LANE_LOOP").as_deref() == Ok("fixed") {
+                LaneLoopKind::Fixed
+            } else {
+                LaneLoopKind::Sleeping
+            },
             lock_lane_ignores_freshness: false,
             skip_close_on_recall: false,
             strict_commit: false,
@@ -4238,6 +4260,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         root_probe_mutant: cfg.root_probe_mutant,
         probe_reads: cfg.probe_reads,
         lock_lane: cfg.lock_lane,
+        lane_loop: cfg.lane_loop,
         lock_lane_ignores_freshness: cfg.lock_lane_ignores_freshness,
         skip_close_on_recall: cfg.skip_close_on_recall,
         oracles: oracles.clone(),

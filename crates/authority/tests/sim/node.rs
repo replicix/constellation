@@ -292,6 +292,9 @@ pub struct Shared {
     /// `lock_lane::LockLane`): its requests in flight, shared by its task
     /// and the bus tap that hands it the owners' answers.
     pub lane: Mutex<constellation_authority::lane::RenewLane>,
+    /// Wakes the lock lane's sleeping task: the tables' waker
+    /// (`set_lane_waker`), and a crash.
+    pub lane_wake: tokio::sync::Notify,
 }
 
 /// See `Shared::held_ctl`.
@@ -429,6 +432,8 @@ pub struct NodeEnv {
     pub probe_reads: super::store::SlowReads,
     /// See `SimConfig::lock_lane`.
     pub lock_lane: bool,
+    /// See `SimConfig::lane_loop`.
+    pub lane_loop: super::run::LaneLoopKind,
     /// See `SimConfig::lock_lane_ignores_freshness`.
     pub lock_lane_ignores_freshness: bool,
     /// See `SimConfig::skip_close_on_recall`.
@@ -592,6 +597,7 @@ impl NodeHandle {
             lane: Mutex::new(constellation_authority::lane::RenewLane::new(
                 constellation_authority::lane::DEFAULT_MAX_STALL_MS,
             )),
+            lane_wake: tokio::sync::Notify::new(),
         });
         {
             let shared = shared.clone();
@@ -821,7 +827,13 @@ impl NodeHandle {
             ));
         }
         if env.lock_lane && cfg_locks {
+            {
+                let shared = shared.clone();
+                meta.locks()
+                    .set_lane_waker(Arc::new(move || shared.lane_wake.notify_one()));
+            }
             tokio::spawn(lock_lane_loop(
+                env.lane_loop,
                 id,
                 shared.clone(),
                 env.bus.clone(),
@@ -918,6 +930,7 @@ impl NodeHandle {
     /// store), exactly like a killed process's outstanding PUTs.
     pub fn crash(&self, bus: &Bus) {
         self.shared.alive.store(false, Ordering::SeqCst);
+        self.shared.lane_wake.notify_one();
         bus.detach(self.id);
         self.task.abort();
         self.shared.replies.lock().unwrap().clear();
@@ -1394,6 +1407,7 @@ fn apply_lane_actions(
 /// `timeout_ms` is given up on (a late answer still counts).
 #[allow(clippy::too_many_arguments)]
 async fn lock_lane_loop(
+    kind: super::run::LaneLoopKind,
     id: NodeId,
     shared: Arc<Shared>,
     bus: Arc<Bus>,
@@ -1405,9 +1419,38 @@ async fn lock_lane_loop(
     root: Arc<RootCtx>,
 ) {
     use constellation_authority::lane::LaneEvent;
+    use constellation_authority::lane::{LaneFacts, LaneLoop, LaneSleep};
+    let sleeping = kind == super::run::LaneLoopKind::Sleeping;
     let facts = SimLaneFacts { cell, meta };
+    let mut lp = LaneLoop::new(every_ms as i64);
+    let mut first = true;
     loop {
-        tokio::time::sleep(std::time::Duration::from_millis(every_ms)).await;
+        if sleeping {
+            // The daemon's loop: the first pass is at once, then sleep as
+            // `LaneLoop::plan_sleep` says. (A crash wakes it.)
+            lp.awake(facts.meta.locks());
+            if !first {
+                let sleep = {
+                    let lane = shared.lane.lock().unwrap();
+                    let now = clock.now();
+                    let stale = facts.view().forward_timeout_ms as i64;
+                    lp.plan_sleep(&lane, now, clock.now().honour, stale, facts.meta.locks())
+                };
+                match sleep {
+                    LaneSleep::Forever => shared.lane_wake.notified().await,
+                    LaneSleep::For(ms) => {
+                        tokio::select! {
+                            biased;
+                            _ = shared.lane_wake.notified() => {}
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {}
+                        }
+                    }
+                }
+            }
+            first = false;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(every_ms)).await;
+        }
         if !shared.alive.load(Ordering::SeqCst) {
             return;
         }
@@ -1417,9 +1460,16 @@ async fn lock_lane_loop(
             .unwrap()
             .is_some_and(|until| tokio::time::Instant::now() < until)
         {
+            // A stopped process looks at nothing; look again soon.
+            if sleeping {
+                tokio::time::sleep(std::time::Duration::from_millis(every_ms)).await;
+            }
             continue;
         }
         let now = clock.now();
+        if sleeping && !lp.look_due(now, facts.meta.locks()) {
+            continue;
+        }
         let busy = shared.busy_since.load(Ordering::SeqCst);
         let stuck_ms = if busy != 0 { now.wait.0 - busy } else { 0 };
         let actions = shared.lane.lock().unwrap().handle(

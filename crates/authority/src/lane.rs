@@ -705,6 +705,85 @@ impl RenewLane {
     }
 }
 
+/// The longest the lane sleeps while grants are held, whatever their
+/// renewal points say: a forward step of the honour clock (a suspend) is
+/// not seen by the timer the lane sleeps on, and a change to the tables
+/// that wakes no one (a late renewal reviving a lapsed grant, a recalled
+/// grant pinned again) is seen within it. With no grant held the lane
+/// sleeps until one is installed.
+pub const MAX_SLEEP_MS: i64 = 1_000;
+
+/// How long the lane's loop sleeps ([`LaneLoop::plan_sleep`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneSleep {
+    /// Until a wake (a grant installed, a renewal failed): nothing is held.
+    Forever,
+    /// At most this long, less if woken.
+    For(u64),
+}
+
+/// The decisions of the lane's loop, shared by the daemon's thread
+/// (`lock_lane::lane_loop`) and the simulation's task, which keep only the
+/// waiting (`Notify` and a timer): whether a wake is a look, how long to
+/// sleep after it, and what the tables are told to wake it for.
+#[derive(Clone, Copy, Debug)]
+pub struct LaneLoop {
+    /// Honour instant of the last look (a tick handed to the lane).
+    pub last: HonourMs,
+    /// The least time between two looks.
+    pub every: i64,
+}
+
+impl LaneLoop {
+    pub fn new(every_ms: i64) -> Self {
+        Self {
+            last: HonourMs(i64::MIN / 2),
+            every: every_ms,
+        }
+    }
+
+    /// Awake, before the clock is read: a grant that becomes due from here
+    /// on wakes the next sleep at once ([`LockTables::lane_sleeps_until`]).
+    pub fn awake(&self, locks: &LockTables) {
+        locks.lane_sleeps_until(i64::MAX);
+    }
+
+    /// Is this wake a look at the grants (a tick for the lane)? Records it.
+    pub fn look_due(&mut self, now: Now, locks: &LockTables) -> bool {
+        if locks.held_count() > 0 && now.honour.since(self.last) >= self.every {
+            self.last = now.honour;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// After the look: tell the tables what wakes the lane
+    /// ([`RenewLane::sleep_mark`]) and how long it sleeps (`after`: the
+    /// honour clock read after the look). Nothing held:
+    /// until a wake. Grants held but none the lane's now (all lapsed or
+    /// lapsing: `next_wake` is `None`): a late renewal can make one
+    /// honoured again without waking anyone, so at most [`MAX_SLEEP_MS`],
+    /// or the lane sleeps through the next core stall.
+    pub fn plan_sleep(
+        &self,
+        lane: &RenewLane,
+        now: Now,
+        after: HonourMs,
+        stale_ms: i64,
+        locks: &LockTables,
+    ) -> LaneSleep {
+        let next = lane.next_wake(now, self.last, stale_ms, self.every, locks);
+        locks.lane_sleeps_until(RenewLane::sleep_mark(next, self.last, self.every));
+        match next {
+            None if locks.held_count() == 0 => LaneSleep::Forever,
+            None => LaneSleep::For(MAX_SLEEP_MS as u64),
+            // From `after`, the clock read once the look was done.
+            Some(n) => LaneSleep::For(n.since(after).clamp(0, MAX_SLEEP_MS) as u64),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1656,5 +1735,39 @@ mod tests {
             .all(|s| *s <= crate::event::LOCK_RENEW_MAX_ENTRIES));
         assert_eq!(sizes.iter().sum::<usize>(), n);
         assert_eq!(lane.in_flight(), 3);
+    }
+
+    /// Review MUST-1 of plan 41 item 7: grants held but every one lapsed at
+    /// the look (`next_wake` is `None`): a late renewal can honour one again
+    /// without waking anyone, so the loop sleeps at most `MAX_SLEEP_MS`.
+    /// Only with nothing held does it sleep until a wake. Fails with the
+    /// cap removed (the lane then slept through the next core stall).
+    #[test]
+    fn a_loop_that_found_only_lapsed_grants_sleeps_at_most_max_sleep() {
+        let t = LockTables::default();
+        let lane = RenewLane::new(DEFAULT_MAX_STALL_MS);
+        let lp = LaneLoop::new(250);
+        assert_eq!(
+            lp.plan_sleep(&lane, at(5_000), HonourMs(5_000), 400, &t),
+            LaneSleep::Forever,
+            "nothing held"
+        );
+        // Held, lapsed 10 ms ago, not lapsing: nothing the lane may renew.
+        t.install_held(7, held(3, 10, 4_990, 4_000));
+        assert_eq!(
+            lane.next_wake(at(5_000), lp.last, 400, 250, &t),
+            None,
+            "the lane's look finds nothing to wake for"
+        );
+        assert_eq!(
+            lp.plan_sleep(&lane, at(5_000), HonourMs(5_000), 400, &t),
+            LaneSleep::For(MAX_SLEEP_MS as u64)
+        );
+        // A grant due later sleeps until then, capped.
+        t.install_held(8, held(3, 11, 20_000, 5_300));
+        assert_eq!(
+            lp.plan_sleep(&lane, at(5_000), HonourMs(5_000), 400, &t),
+            LaneSleep::For(300)
+        );
     }
 }

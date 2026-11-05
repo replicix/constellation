@@ -483,6 +483,7 @@ fn replay_seed() {
         Ok("locks-writer-hold-delegated-backup") => locks_writer_hold_delegated_group_config(true),
         Ok("locks-stall-step") => locks_stall_step_config(),
         Ok("locks-core-stall") => locks_core_stall_config(),
+        Ok("locks-core-stall-after-lapse") => locks_core_stall_after_lapse_config(),
         Ok("locks-core-stall-root") => locks_core_stall_root_config(),
         Ok("locks-core-stall-unlaned") => locks_core_stall_unlaned_config(),
         Ok("locks-core-stall-single") => locks_core_stall_single_config(),
@@ -2938,6 +2939,19 @@ fn unclocked(cfg: SimConfig) -> SimConfig {
     SimConfig {
         clock_faults: false,
         rate_budget_ppm: 0,
+        ..cfg
+    }
+}
+
+/// The lock lane's task on the fixed tick it had before plan 41 item 7
+/// ([`sim::run::LaneLoopKind::Fixed`]). The control tests whose seeds were
+/// tuned to that schedule (a seed that shows a violation, a race or a
+/// handed-back grant) pin it: the daemon's sleeping loop draws other
+/// trajectories, so the same seeds show nothing there. Everything else runs
+/// the sleeping loop, the production one.
+fn fixed_lane(cfg: SimConfig) -> SimConfig {
+    SimConfig {
+        lane_loop: sim::run::LaneLoopKind::Fixed,
         ..cfg
     }
 }
@@ -5718,6 +5732,7 @@ fn sweep_config() {
         "locks-writer-hold-delegated-backup" => locks_writer_hold_delegated_group_config(true),
         "locks-stall-step" => locks_stall_step_config(),
         "locks-core-stall" => locks_core_stall_config(),
+        "locks-core-stall-after-lapse" => locks_core_stall_after_lapse_config(),
         "locks-core-stall-root" => locks_core_stall_root_config(),
         "locks-core-stall-unlaned" => locks_core_stall_unlaned_config(),
         "locks-core-stall-single" => locks_core_stall_single_config(),
@@ -10693,6 +10708,46 @@ fn locks_core_stall_config() -> SimConfig {
     }
 }
 
+/// Plan 41 item 7: grants lapse (a locker partitioned for 2.5 s, longer than
+/// a window), a late renewal revives them after the heal, and then the core
+/// of every non-root node is stuck for 2 s. The lane must renew through the
+/// stall: a lane that looked while every grant it held was lapsed, and
+/// slept without a timeout, was woken by nothing the late renewal did
+/// (the first version of the sleeping loop, review MUST-1).
+fn locks_core_stall_after_lapse_config() -> SimConfig {
+    let stall = |at_ms, node, for_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::StallStep {
+            node,
+            for_ms,
+            after_event: None,
+        },
+    };
+    let isolate = |at_ms, node, for_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::IsolateReader { node, for_ms },
+    };
+    // One long critical section per client, so that no grant is installed
+    // (which wakes the lane) after the lapse and the late renewal.
+    SimConfig {
+        clients_per_node: 1,
+        ops_per_client: 1,
+        lock_files: 8,
+        lock_ratio: 1.0,
+        lock_ios: (90, 90),
+        lock_io_ms: (90, 110),
+        faults: vec![
+            isolate(500, 2, 2_800),
+            isolate(500, 3, 2_800),
+            stall(600, 2, 2_500),
+            stall(600, 3, 2_500),
+            stall(5_000, 2, 2_000),
+            stall(5_000, 3, 2_000),
+        ],
+        ..locks_core_stall_config()
+    }
+}
+
 /// The lease holder's core stuck for 2 s (every grant's owner): its own
 /// clients' grants are renewed by its lane (L3); the grants its peers hold
 /// of it are not (answering them is plan 41 L5: they lapse after the
@@ -12471,8 +12526,11 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
 fn a_credited_arrival_cap_splits() {
     use pinned::run_seed;
     for seed in [195_424, 199_719, 202_419] {
-        let e = run_seed(seed, fast_takeover_skewed_successor_credited_config())
-            .expect_err("a cap counted from the credit never failed: no control");
+        let e = run_seed(
+            seed,
+            fixed_lane(fast_takeover_skewed_successor_credited_config()),
+        )
+        .expect_err("a cap counted from the credit never failed: no control");
         assert!(e.contains("mutual exclusion violated"), "seed {seed}: {e}");
         let at = violation_ms(&e).unwrap_or_else(|| panic!("seed {seed}: no time in {e}"));
         assert!(
@@ -12480,7 +12538,7 @@ fn a_credited_arrival_cap_splits() {
             "seed {seed}: the violation is at t={at}, not inside the first failover's floor \
              window (a failure of the second failover is not this control's): {e}"
         );
-        run_seed(seed, fast_takeover_skewed_successor_config())
+        run_seed(seed, fixed_lane(fast_takeover_skewed_successor_config()))
             .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
     }
 }
@@ -12914,9 +12972,9 @@ fn a_locker_keeps_its_grant_across_a_seal_and_a_forward_step() {
 fn a_late_renewal_against_a_stale_mirror_is_refused_and_the_naive_successor_violates() {
     use pinned::run_seed;
     for seed in [12u64, 18, 20, 34, 43, 106, 202, 336] {
-        run_seed(seed, locks_late_stale_mirror_config())
+        run_seed(seed, fixed_lane(locks_late_stale_mirror_config()))
             .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
-        let e = run_seed(seed, locks_late_stale_mirror_naive_config())
+        let e = run_seed(seed, fixed_lane(locks_late_stale_mirror_naive_config()))
             .expect_err("a successor trusting a stale mirror never violated: no control");
         assert!(
             e.contains("mutual exclusion violated") && e.contains("after a late renewal"),
@@ -13764,12 +13822,12 @@ fn a_backed_lock_root_stuck_in_a_step_keeps_its_own_grants() {
     let seeds = 232_400..232_416;
     let t = run_m14(
         "locks-core-stall-backup-long-beats",
-        locks_core_stall_backup_long_beats_config(),
+        fixed_lane(locks_core_stall_backup_long_beats_config()),
         seeds.clone(),
     );
     let u = run_m14(
         "locks-core-stall-backup-long-beats-unprobed",
-        locks_core_stall_backup_long_beats_unprobed_config(),
+        fixed_lane(locks_core_stall_backup_long_beats_unprobed_config()),
         seeds,
     );
     assert!(t.grants > 50, "{t:?}");
@@ -13798,10 +13856,13 @@ fn a_backed_lock_root_stuck_in_a_step_keeps_its_own_grants() {
 #[test]
 fn a_probe_that_ignores_what_it_reads_is_caught() {
     for seed in [21u64, 290, 366] {
-        run_seed(seed, locks_core_stall_backup_long_config())
+        run_seed(seed, fixed_lane(locks_core_stall_backup_long_config()))
             .unwrap_or_else(|e| panic!("locks-core-stall-backup-long seed {seed}: {e}"));
-        let e = run_seed(seed, locks_core_stall_backup_long_blind_config())
-            .expect_err("locks-core-stall-backup-long-blind must fail");
+        let e = run_seed(
+            seed,
+            fixed_lane(locks_core_stall_backup_long_blind_config()),
+        )
+        .expect_err("locks-core-stall-backup-long-blind must fail");
         assert!(
             e.contains("mutual exclusion"),
             "seed {seed}: another failure: {e}"
@@ -13828,10 +13889,16 @@ fn a_probe_that_ignores_what_it_reads_is_caught() {
 #[test]
 fn a_proof_dated_at_the_return_of_the_read_is_caught() {
     for seed in [193u64, 247, 277, 871] {
-        run_seed(seed, locks_core_stall_backup_long_slow_reads_config())
-            .unwrap_or_else(|e| panic!("locks-core-stall-backup-long-slow-reads seed {seed}: {e}"));
-        let e = run_seed(seed, locks_core_stall_backup_long_dated_at_return_config())
-            .expect_err("locks-core-stall-backup-long-dated-at-return must fail");
+        run_seed(
+            seed,
+            fixed_lane(locks_core_stall_backup_long_slow_reads_config()),
+        )
+        .unwrap_or_else(|e| panic!("locks-core-stall-backup-long-slow-reads seed {seed}: {e}"));
+        let e = run_seed(
+            seed,
+            fixed_lane(locks_core_stall_backup_long_dated_at_return_config()),
+        )
+        .expect_err("locks-core-stall-backup-long-dated-at-return must fail");
         assert!(
             e.contains("probe dating violated"),
             "seed {seed}: another failure: {e}"
@@ -14098,6 +14165,45 @@ fn locks_survive_core_stalls() {
     assert_eq!(
         c.clients.fenced_ios, 0,
         "a core stall alone fenced I/O with the lane on: {c:?}"
+    );
+}
+
+/// Plan 41 item 7: the production (sleeping) loop renews through stalls that
+/// follow isolation and stall of the same nodes as the fixed tick does (the
+/// loops' draws differ, so over the seeds, not per seed). This covers the
+/// sleeping loop in a scenario of lapses and late renewals; it does not
+/// reproduce review MUST-1's exact state (every held grant lapsed at one
+/// look and no install after): with the cap removed it still passes. That
+/// decision is pinned by `lane::tests::a_loop_that_found_only_lapsed_grants_sleeps_at_most_max_sleep`
+/// and by the engine's `a_lane_that_found_only_lapsed_grants_looks_again_after_a_late_renewal`.
+#[test]
+fn a_lane_that_slept_through_a_lapse_still_renews_through_the_next_stall() {
+    use sim::run::LaneLoopKind;
+    let with = |kind| SimConfig {
+        lane_loop: kind,
+        ..unclocked(locks_core_stall_after_lapse_config())
+    };
+    let seeds = 232_000..232_040;
+    let sleeping = run_m14(
+        "locks-core-stall-after-lapse",
+        with(LaneLoopKind::Sleeping),
+        seeds.clone(),
+    );
+    let fixed = run_m14(
+        "locks-core-stall-after-lapse+fixed",
+        with(LaneLoopKind::Fixed),
+        seeds.clone(),
+    );
+    assert!(sleeping.lane_renewals > 20, "{sleeping:?}");
+    assert!(
+        sleeping.clients.fenced_ios > 0 && fixed.clients.fenced_ios > 0,
+        "the partitions fenced nothing: the configuration is vacuous"
+    );
+    assert!(
+        sleeping.clients.fenced_ios * 4 <= fixed.clients.fenced_ios * 5,
+        "the sleeping lane fenced {} I/Os, the fixed tick {}: {sleeping:?}",
+        sleeping.clients.fenced_ios,
+        fixed.clients.fenced_ios
     );
 }
 
@@ -14395,7 +14501,7 @@ fn regression_a_grant_handed_back_during_a_release_is_renewed() {
             locks_blips_tight_delegated_config(),
         ),
     ] {
-        let report = run_seed(seed, cfg).unwrap_or_else(|e| {
+        let report = run_seed(seed, fixed_lane(cfg)).unwrap_or_else(|e| {
             panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
         });
         let sum = |f: fn(&constellation_authority::Stats) -> u64| -> u64 {
