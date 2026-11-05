@@ -66654,9 +66654,11 @@ The acceptance runs above found the lane awake 957 times a minute with nothing h
   (`RenewLane::sleep_mark`; without it the core's failed renewals woke it 185,000 times a minute). Its per-grant lookup of
   entries in flight scanned every request (10^8 comparisons with the core stuck), now a counted index; an answer's
   entries are matched through a set; one live request per owner (`owner_busy`): it re-sent whole rounds to an owner whose
-  core had not answered the last (143,180 entries a minute for 20,581 answers). The simulation's lane task keeps its
-  fixed tick (the sleeping loop changed the schedule six seed-tuned controls rely on; `long_locks` × 300 passed with
-  both loops).
+  core had not answered the last (143,180 entries a minute for 20,581 answers). The loop's decisions are one helper
+  (`constellation_authority::lane::LaneLoop`: when a wake is a look, how long to sleep, what the tables are told), used
+  by the engine's `lane_loop` and the simulation's lane task; the simulation runs the sleeping loop by default
+  (`SimConfig::lane_loop`, `AUTHORITY_SIM_LANE_LOOP=fixed` flips it) and the six control tests whose seeds were tuned
+  to the fixed 250 ms tick pin `LaneLoopKind::Fixed` (`fixed_lane`).
 - **The core waited for the lane.** `Driver::refresh` copied the lane's stats into status under the lane's mutex, which
   the lane holds through a round: while 10,000 locked files closed every step's refresh waited 0.5 to 3 s for it
   (diagnostic logs), and the slow-step log line did the same. Both use `try_lock` now; status keeps the last copy.
@@ -66669,6 +66671,19 @@ Result: idle 0 wake-ups (957 before); 10,000 grants 0.09 to 0.14 % of a core for
 1.3 % for the whole process (59 to 76 %); 9.0 renewals per grant per minute lane on and off in every cell (no added
 message, no added S3 request); 10,000 at both nodes: no lock lost, no owner fenced, lane on and off (2,498 / 3,040 lost
 before); closing 9,900 locked remote grants takes 60 s with no error (it never finished before).
+
+Review round (Opus, CHANGES NEEDED, one MUST): the sleeping loop slept without a timeout when grants were held but
+every one was lapsed at its look (`next_wake` is `None`), and a late renewal that honours a lapsed grant wakes no one,
+so the lane slept through the next core stall. It now sleeps without a timeout only with nothing held, else at most
+`MAX_SLEEP_MS` (1 s; `LaneLoop::plan_sleep`). Pinned by the engine test
+`a_lane_that_found_only_lapsed_grants_looks_again_after_a_late_renewal` and the helper's
+`a_loop_that_found_only_lapsed_grants_sleeps_at_most_max_sleep`, both fail with the cap removed. The simulation scenario
+`locks-core-stall-after-lapse` (isolation and a stall of the same nodes, then a second stall; the sleeping loop against the
+fixed tick over 40 seeds) passes either way: the simulation does not reach the state (every held grant lapsed at one look,
+no install after), so it covers the sleeping loop but is not the fail-before. Core renewal chunking now has its own test
+(`a_large_renewal_round_goes_out_in_frame_sized_requests_each_applied_on_its_own`). The correctness cells were repeated
+3 times each, lane on and off (`bench/lock-lane/RESULTS.md`): 10,000 grants at both nodes, 0 lost and 0 owners fenced in
+all six runs; closing 9,900 remote locked fds, 59 to 60 s, 0 errors, 0 lost, 0 fenced in all six.
 
 Not fixed (spec):
 

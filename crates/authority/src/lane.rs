@@ -566,7 +566,7 @@ impl RenewLane {
                 .filter(|r| *r != view.me)
                 .or(Some(view.owner).filter(|o| *o != 0 && *o != view.me));
             match route {
-                // One request in flight per owner (plan 41 item 7): the next
+                // One round in flight per owner (a chunked round is several requests) (plan 41 item 7): the next
                 // waits for its answer or its timeout. A request carries
                 // every due entry; re-sent whole at every tick while the
                 // owner's core was busy with the last, 10,000 grants made

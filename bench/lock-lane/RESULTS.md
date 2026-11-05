@@ -448,6 +448,31 @@ takes the grant's `renewing` mark first. The 0.5 % bound of item 7 is met with
 10,000 grants (own, remote, both); a round's work is O(due grants) plus one walk
 of the held grants per wake-up (at most four a second).
 
+Repeated runs (review S3; the build with the sleeping-loop cap and the shared loop
+helper, same host, 3 runs per cell, each a fresh cluster; `bN,aN_bN` phases, 20 s
+TTL, 60 s windows):
+
+| cell | lane | run 1 / 2 / 3 |
+|---|---|---|
+| locks lost / owners fenced / lapse parks, 10,000 at A and 10,000 at B (both nodes) | on | 0 / 0 / 0 in all three |
+| same | off | 0 / 0 / 0 in all three |
+| lane thread CPU, 10,000 remote at B (`bN`) | on | 0.098 / 0.105 / 0.113 % |
+| lane thread CPU, 10,000 at A and at B, A / B | on | 0.075 / 0.080 / 0.080 % ; 0.101 / 0.102 / 0.111 % |
+| process CPU, 10,000 at A and at B, A / B | on / off | 1.2 to 1.3 % / 0.9 % ; 1.1 to 1.2 % / 0.8 to 0.9 % |
+| lane wake-ups in the 60 s window, 10,000 at A / at B | on | 99 ; 96 to 106 |
+| renewals in the window at B (the node's `locks.renewals`) | on / off | 89,100 / 89,100 (lane on: 85,301 to 87,681 of them sent by the lane) |
+
+The 9,900 remote locked fds closed at B, 10 min TTL (`bN`, `CONSTELLATION_HARNESS_OVH_CLOSE=1`):
+
+| lane | close time, 3 runs (A / B) | `close` errors | lock lost | owners fenced | lapse parks |
+|---|---|---:|---:|---:|---:|
+| on | 59.5 / 59.2 / 59.2 s ; 60.1 / 59.2 / 59.4 s | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| off | 59.3 / 59.1 / 58.9 s ; 59.4 / 59.1 / 59.0 s | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+Raw logs: `P41OVH` lines of the 12 runs. The earlier single-run cells above are
+confirmed on every one of the 12 runs; the own-grant close cell (10,000 at A) was
+not part of this repetition and remains a single run, not fixed (below).
+
 Closing the descriptors at the end:
 
 | cell | lane | close time | `close` errors | owners fenced | locks lost |
