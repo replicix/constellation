@@ -16093,6 +16093,12 @@ mod locks {
     /// of epoch 1 only a streamed (committed) entry carried, and has
     /// executed a row of it; its core holds the generation.
     fn orphan_delegate_of(g: u64) -> Harness {
+        orphan_delegate_of_grant(g, true)
+    }
+
+    /// [`orphan_delegate_of`], the grant streamed as held by the root's group
+    /// (`committed`) or not.
+    fn orphan_delegate_of_grant(g: u64, committed: bool) -> Harness {
         let mut h = Harness::new(3);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
@@ -16109,7 +16115,7 @@ mod locks {
                     designated: false,
                     range: (0, 0),
                 }],
-                true,
+                committed,
                 (0, 0),
             )
             .unwrap();
@@ -16258,6 +16264,90 @@ mod locks {
             crate::replica::Replica::gate_orphan_proof_persisted(&h.meta),
             None,
             "cleared with the gate"
+        );
+    }
+
+    /// Plan 46 M0.4 MUST-1 at the gate: this node is the delegate of `g`, a
+    /// grant of epoch 1 that epoch 2's seal takeover (a tail below the grant)
+    /// unlisted, whose client's rid epoch 2 settled `Refused { ABANDONED }`.
+    /// Epoch 2 then ended without a tail, and this node claims epoch 3 with
+    /// none: the gate (no backup tail to re-apply) must still strand its own
+    /// rows of the unlisted generation, stop the generation, and the replay by
+    /// rid must meet the refusal and forget the entry (nothing executes). Fails
+    /// when the gate hands the strand no generations without a tail.
+    #[test]
+    fn a_tail_less_gate_strands_the_delegate_s_rows_of_a_generation_the_log_never_granted() {
+        let g = (1u64 << constellation_meta::delegation::GEN_EPOCH_SHIFT) | 1;
+        let mut h = orphan_delegate_of_grant(g, false);
+        let rid = Rid {
+            node: 3,
+            incarnation: 1,
+            seq: 1,
+        };
+        let no_tail = |prev_epoch, through| LogRecord::TailFollowsThrough {
+            prev_epoch,
+            through,
+        };
+        // Epoch 2's marker: the seal takeover with a tail below the grant.
+        h.meta
+            .apply_segment_rows(
+                1,
+                2,
+                0,
+                &[],
+                &[],
+                &[no_tail(1, 5)],
+                &constellation_meta::TouchSet::default(),
+            )
+            .unwrap();
+        assert!(h.meta.delegation_table().iter().all(|d| d.gen != g));
+        // Its settle of the client's rid.
+        h.meta
+            .apply_segment_rows(
+                2,
+                2,
+                0,
+                &[],
+                &[],
+                &[LogRecord::Refused {
+                    rid,
+                    code: crate::ABANDONED_CODE,
+                }],
+                &constellation_meta::TouchSet::default(),
+            )
+            .unwrap();
+        assert!(h.meta.journal_own_gens().unwrap().contains(&g));
+        // Epoch 3: this node claims with no tail.
+        assert!(h.core.dl.mine.contains_key(&g));
+        let mut gate = takeover_gate(true);
+        gate.epoch = 3;
+        gate.drained = true;
+        h.hold(3, Some(gate));
+        h.core.bk.gate_orphan_proof = Some((
+            3,
+            constellation_meta::OrphanProof::of(&[no_tail(2, 0)]),
+        ));
+        let mut out = Vec::new();
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert!(
+            !h.meta.journal_own_gens().unwrap().contains(&g),
+            "its row would ship under a grant the log never made"
+        );
+        assert!(h.core.dl.mine[&g].stopped, "g never executes again");
+        assert_eq!(
+            h.meta.completed_outcome(rid).unwrap(),
+            Some(constellation_meta::CompletedOutcome::Refused {
+                code: crate::ABANDONED_CODE
+            })
+        );
+        assert!(
+            h.meta.pending_replays().unwrap().is_empty(),
+            "the replay met the refusal and forgot the entry: {:?}",
+            h.meta.pending_replays().unwrap()
+        );
+        assert!(
+            h.meta.lookup(ROOT_INO, "x").unwrap().is_none(),
+            "and nothing of it ran"
         );
     }
 
