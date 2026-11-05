@@ -1140,8 +1140,8 @@ struct Driver {
     /// step 3).
     versions_seen_tip: u64,
     /// The counters of the lone-lead oracle's non-vacuity (`LoneLead`)
-    /// as this driver last read them: `(held_by_gate, demoted)`.
-    lone_stats_seen: Option<(u64, u64)>,
+    /// as this driver last read them: `held_by_gate`.
+    lone_stats_seen: Option<u64>,
     rebuild_stub: bool,
     plant_ungated_fast_path: bool,
     plant_claim_root_group_on_lone: bool,
@@ -1193,6 +1193,11 @@ struct HeldWrite {
     /// with (`Meta::delegate_execute_admitted`: decided at the journaling,
     /// as the engine's fast path does), once its transaction is over.
     journaled: Arc<Mutex<Option<constellation_meta::RowCommit>>>,
+    /// A delegate's write the store refused unwritten at its journaling
+    /// (`MetaError::NotAdmitted`: the configuration changed since the core
+    /// published its rule, or the generation ended): as the engine does, the
+    /// op goes through the core.
+    refused: Arc<AtomicBool>,
     tag: LockTag,
     shared: Arc<Shared>,
     release_at: tokio::time::Instant,
@@ -2847,8 +2852,27 @@ impl Driver {
     /// ([`super::oracle::RowVersions`]) judges the rows this node journaled
     /// since the last event that moved its journal.
     fn note_row_versions(&mut self) {
+        let group_now = |gen: u64| {
+            self.meta
+                .deleg_group(gen)
+                .ok()
+                .flatten()
+                .map_or(0, |g| g.version)
+        };
+        // The configuration this node's core has applied: the lease it
+        // holds, else the one it last held.
+        let lease = self.core.lease();
+        let lease_now = lease
+            .held
+            .as_ref()
+            .map_or(lease.last_config_version, |(l, _)| l.config_version);
         let tip = self.meta.journal_tip().unwrap_or(0);
         if tip == self.versions_seen_tip {
+            self.oracles
+                .row_versions
+                .lock()
+                .unwrap()
+                .tick(self.id, lease_now, &group_now);
             return;
         }
         if tip < self.versions_seen_tip {
@@ -2871,16 +2895,13 @@ impl Driver {
         let group_max = |gen: u64| {
             stores
                 .iter()
-                .filter_map(|m| m.deleg_group(gen).ok().flatten())
-                .map(|g| g.version)
+                .map(|m| m.deleg_group_top(gen))
                 .max()
                 .unwrap_or(0)
         };
-        self.oracles
-            .row_versions
-            .lock()
-            .unwrap()
-            .judge(self.id, &rows, &group_max);
+        let mut rv = self.oracles.row_versions.lock().unwrap();
+        rv.judge(self.id, &rows, lease_now, &group_now, &group_max);
+        rv.tick(self.id, lease_now, &group_now);
     }
 
     /// The lone delegate's lead oracle ([`super::oracle::LoneLead`]): this
@@ -2892,17 +2913,10 @@ impl Driver {
         let lead = (self.core.config().delegation_stream_rows as u64).max(1);
         // The counters that show the rule was exercised: read as deltas (a
         // restart brings a new core, whose counters start again).
-        let session = self.meta.session().stats();
-        let now = (
-            self.core.stats.deleg_lone_held_by_gate,
-            self.core.stats.deleg_lone_demoted
-                + session.lone_demoted_past_lead
-                + session.lone_demoted_behind_gated,
-        );
+        let now = self.core.stats.deleg_lone_held_by_gate;
         if let Some(seen) = self.lone_stats_seen {
             let mut ll = self.oracles.lone_lead.lock().unwrap();
-            ll.held_by_gate += now.0.saturating_sub(seen.0);
-            ll.demoted_at_journal += now.1.saturating_sub(seen.1);
+            ll.held_by_gate += now.saturating_sub(seen);
         }
         self.lone_stats_seen = Some(now);
         for m in &view.mine {
@@ -3199,6 +3213,7 @@ impl Driver {
             deleg: None,
             class: None,
             journaled: Default::default(),
+            refused: Default::default(),
             tag: tag.clone(),
             shared: self.shared.clone(),
             release_at: tokio::time::Instant::now() + std::time::Duration::from_millis(write_ms),
@@ -3280,6 +3295,7 @@ impl Driver {
         let row_class = session.deleg_row_class(gen)?;
         let class = ack_class_of(row_class, gen);
         let journaled: Arc<Mutex<Option<constellation_meta::RowCommit>>> = Default::default();
+        let refused = Arc::new(AtomicBool::new(false));
         let (_, write_ms) = self.shared.hold_next.lock().unwrap().take()?;
         let epoch = self.core.ship().max_epoch.max(1);
         let (phase_tx, phase) = std::sync::mpsc::channel();
@@ -3289,6 +3305,7 @@ impl Driver {
         let thread = {
             let (meta, op, tag) = (self.meta.clone(), op.clone(), tag.clone());
             let journaled = journaled.clone();
+            let refused = refused.clone();
             let checked = phase_tx.clone();
             let mut go_rx = Some(go_rx);
             let clock = self.clock.clone();
@@ -3317,6 +3334,9 @@ impl Driver {
                     );
                     *journaled.lock().unwrap() =
                         constellation_meta::take_last_journaled().map(|j| j.class);
+                    if matches!(r, Err(constellation_meta::MetaError::NotAdmitted)) {
+                        refused.store(true, Ordering::Relaxed);
+                    }
                     r
                 };
                 constellation_meta::write_check_hook::set(None);
@@ -3338,6 +3358,7 @@ impl Driver {
             deleg: Some(gen),
             class: Some(class),
             journaled: journaled.clone(),
+            refused: refused.clone(),
             tag: tag.clone(),
             shared: self.shared.clone(),
             release_at: tokio::time::Instant::now() + std::time::Duration::from_millis(write_ms),
@@ -3386,6 +3407,10 @@ impl Driver {
                 if let Some(t) = held.thread.take() {
                     t.join().expect("held write thread");
                 }
+                if refused.load(Ordering::Relaxed) {
+                    // Refused unwritten: the core orders it.
+                    return None;
+                }
                 if let Some(idx) = idx {
                     session.note_stream(gen, idx);
                 }
@@ -3408,9 +3433,27 @@ impl Driver {
         let _ = held.epoch;
         let deleg = held.deleg;
         let journaled = held.journaled.clone();
+        let refused = held.refused.clone();
         let class = held.class;
         let tag = held.tag.clone();
         let (outcome, idx, landed_at) = held.finish();
+        if refused.load(Ordering::Relaxed) {
+            // Refused unwritten at the journaling (the configuration changed
+            // while the write was held): through the core, as the engine
+            // does.
+            tracing::debug!(
+                node = self.id,
+                ?rid,
+                "sim: the held write was refused; through the core"
+            );
+            self.ready.push_back(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op,
+                tag,
+            });
+            return;
+        }
         let class = match (deleg, class) {
             (Some(gen), Some(class)) => Some(
                 journaled

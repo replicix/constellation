@@ -733,6 +733,12 @@ pub struct Meta {
     /// store, to hold a writer there.
     #[cfg(test)]
     pub(crate) horizon_write_hook: std::sync::Mutex<Option<HorizonWriteHook>>,
+    /// Simulation oracle: the highest `DelegGroup` version this replica ever
+    /// applied per generation (the group row goes with the generation, so
+    /// the store alone cannot say which version a row of an ended
+    /// generation was journaled under: [`Meta::deleg_group_top`]).
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) deleg_group_top: std::sync::Mutex<std::collections::BTreeMap<u64, u64>>,
     /// Plan 30 §M14: lock grants (sequencer side), grants held and local
     /// locks (node side) (`crate::locks`).
     pub(crate) locks: crate::locks::LockTables,
@@ -1270,6 +1276,8 @@ impl Meta {
             horizon_written: Default::default(),
             #[cfg(test)]
             horizon_write_hook: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "test-util"))]
+            deleg_group_top: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             locks: crate::locks::LockTables::default(),
             foreign_apply_hook: std::sync::OnceLock::new(),
             rollback_hook: std::sync::OnceLock::new(),

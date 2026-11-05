@@ -513,6 +513,12 @@ pub(crate) fn apply_group_tx(
     let bytes = postcard::to_allocvec(&row)
         .map_err(|e| MetaError::Invalid(format!("delegation group row: {e}")))?;
     ns::ns_insert(tx, &meta.ns, dirty, group_key(gen), bytes)?;
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        let mut top = meta.deleg_group_top.lock().unwrap();
+        let t = top.entry(gen).or_default();
+        *t = (*t).max(version);
+    }
     Ok(true)
 }
 
@@ -545,6 +551,18 @@ impl Meta {
         crate::store::backup::injected_read_fault()?;
         let r = self.db.read_tx();
         read_group_tx(&r, self, gen)
+    }
+
+    /// Simulation oracle: the highest `DelegGroup` version of `gen` this
+    /// replica ever applied (0: none), kept after the generation ends.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn deleg_group_top(&self, gen: Gen) -> u64 {
+        self.deleg_group_top
+            .lock()
+            .unwrap()
+            .get(&gen)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Plan 30 §M12: whether the table names any live delegation, as

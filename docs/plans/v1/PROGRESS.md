@@ -67061,3 +67061,70 @@ stopped at 5.52M entries. No corruption: the listings, pins and handover after t
 the create path's memory and latency, not the listing's; under the load-robustness rule latency may degrade but the
 memory growth and the 610 s stall need an owner. Not a plan 40 item.
 
+
+## Plan 46 M1.1 step 4: the fast path carries the version (2026-11-05)
+
+A delegate's fast path no longer decides a class. `report_deleg_durable` publishes the rule the core decided with the version of the
+configuration it was decided under, and how far the group has committed (`DelegDurable { commit, through, lost }`: the horizon is gone);
+under the store's writer lock `Meta::finish_local` stamps that rule only while the version it names is the one the store records (the latest
+`DelegGroup` record applied, `SessionState::deleg_commit_at_journal`), and refuses the op unwritten (`MetaError::NotAdmitted`, through the
+core, which reads the configuration when it stamps) otherwise: a change of configuration between the publication and the journal sends the op
+to the core. The core's own op is stamped as decided. Deleted: the under-lock re-class by the row's place (`lone_row_holds`, the lead and
+hysteresis demotion in `finish_local`, `deleg_row_class_at`), `OwnLimits` and `PendingClass::set_own`'s limits, the published horizon,
+`Core::deleg_lone_horizon` / `deleg_own_limits`, the core's read-back of the journaled class and its `deleg_lone_demoted` counter, the session's
+`lone_demoted_*` counters, the engine's `journaled_class` fallback (the write gate reads the row's `RowCommit`). ADR-33 (DECISIONS.md) carries
+the amendment.
+
+**Deviations, flagged.** (1) The published value keeps the variant with the version (`commit: RowCommit`), not a bare `(version, through)`:
+a lone delegate is still an event-time `Singleton` until step 6. (2) `PendingClass::set_for_own_client(commit)` stays (no limits): the store
+needs to know a row is the node's own client's to mark a gated row (`deleg_gated_key`), which the core's hysteresis
+(`deleg_lone_held_by_gated`) reads until step 6. (3) The store still *refuses* (not re-classes) a `Singleton` stamp that would follow an open
+gated row of the node's own (this generation: `gated > published through`; another generation: `gated_open_elsewhere_tx`): without it a
+`Lone` row journaled behind an uncommitted gated row is replayed without it at a root's crash (the F2 review finding, test
+`a_delegates_lone_row_follows_only_a_committed_gated_row`, rewritten to expect the refusal). (4) The lead is no longer enforced under the lock:
+the fast path can pass it by the rows journaled between two core steps (the F1 test is gone; the sims show 0 `Lone` rows past the lead). (5) The
+core publishes the rule it is about to stamp on its own op before it journals it (`Core::deleg_publish_rule`), which closes the
+decide-then-wait-for-the-lock window the old re-class covered (the two `core_rename_amid_fast_path_rows` tests became one that pins it).
+(6) The core refreshes the generation's applied `DelegGroup` version (`deleg_group_refresh_one`) before it stamps a delegate row: it stamped
+the version of its last refresh, which the strict oracle found one event behind the store.
+
+**Version-0 placeholders.** (a) The predecessor's adopted tail (`apply_backup_tail`) and this node's own delegate rows re-appended at the
+gate (`jobs.rs`) are stamped `Group{Root}` at the version of the lease the successor holds (the configuration of the journal the rows are
+rows of; a backup records one version for the whole tail, `BackupTx` carries none per row, so the predecessor's own would need a wire field);
+they were committed by the predecessor's group, which is what the `Group` rule says and nothing in the tenure waits for. (b) The `Group{Archive}`
+published by `clear_holder_epoch` takes the version last published (else the lease's); `Core::root_config_version` is the held lease's, else
+the last one held (`LeaseState::last_config_version`, also set at `acquire_won` before the lease is adopted: the tenure's first replays and
+records were stamped version 0). Also found by the strict oracle and fixed the same way: `repair drop-held`'s `Refused` rows (`Archive` at
+the tenure's version), and the root's append of a delegate's stream row (`Meta::apply_delegate_tx`: `Singleton` at the generation's applied
+group version, not the `LONE` default). No design change was needed.
+
+**Oracle** `row_version_matches_config` is strict: no version-0 exemption under a lease; a row's version is the configuration the journaling
+node has applied (its core's lease version, its replica's `DelegGroup` row, `Meta::deleg_group_top` for a generation that ended in the event)
+now or at its previous event; a version that existed but was superseded is a violation (unit test `a_stale_but_existing_version_is_caught`).
+The knob `AUTHORITY_SIM_PER_ROW_CLASS=1` still fails it: `long-delegated+commit` 299 of 300 seeds, `delegated-group-switch` 3 of 300 (0 with it
+off). Judged against the bucket's newest lease version the oracle failed on a holder's own add-then-record (the version it has not read yet is
+not in force for it): oracle error, fixed in the oracle.
+
+**Fail-before** (main with the new tests inserted): meta `the_fast_path_refuses_a_row_when_the_configuration_changed_since_the_publication`
+and core `a_configuration_change_between_the_publication_and_the_journal_sends_the_row_to_the_core` (a `DelegGroup` record applied after the
+publication: main journals the row with the published version, `Ok`; the branch refuses it, the core's row carries version 1 and waits for the
+new group). The engine twin is `a_delegates_fast_path_row_waits_for_the_published_version_to_reach_the_store`.
+
+**Sweeps** (box 1, release, `+commit`, seeds 0..1,999; main = 8c0c65dc, then this branch; row-version mismatches 0 on every branch run, rows judged
+290,299 / 464,267 / 447,364 / 298,999 / 247,665 / 288,804): `long-delegated`, `delegated-group-switch`, `placement-hot`, `long-delegated-backup`,
+`-late-answers`, `-lead` 0 / 0 failing; the controls fail by design on the same seeds on both: `-hysteresis-off` 33 / 33, `-lead-off` 1,397 / 1,397
+(identical sets); the lone-lead oracle counts 0 `Lone` rows past the lead and 0 behind an uncommitted gated row on the branch's `long-delegated`
+and `-lead` runs. Knob on, 300 seeds: `long-delegated` 299 failing, `delegated-group-switch` 3, all `row_version_matches_config`.
+
+**Gates** (box 1): fmt, clippy `-D warnings` (meta, authority, engine, all targets), meta 404, authority lib 1,048, engine lib 951, release sim
+suite 410 passed, 0 failed, 12 ignored.
+
+**Performance gate** (box 3, quiet, release builds of main = A and this branch = B built on box 1; `bench/commit-rule/g1-abba.sh`, A B B A, state
+dirs on each file system). `ack-latency` topology 1 (the lone root's own ops), p50 B / A over 50 runs per variant: ext4 chmod 0.93, create 0.97, rename
+0.98, unlink 0.88, write 1.00; xfs 1.01, 1.01, 0.96, 0.96, 1.00; btrfs 1.12, 1.01, 0.96, 0.95, 1.00; tmpfs 1.16, 1.03, 1.23, 1.18, 0.97. The tmpfs and
+btrfs batches were rerun with 60 more runs per variant: tmpfs 1.04, 0.99, 0.95, 1.05, 1.04; btrfs 1.05, 0.97, 1.05, 1.02, 1.00, and a control of two
+copies of A against each other (60 runs, same ops) shows 0.89 to 1.04 on tmpfs and 0.86 to 1.04 on btrfs: the 35 to 90 us ops are bimodal and a batch
+of 50 runs moves 10 % either way; no direction survives, and `write` (4 KiB and `fsync`) is within 0.2 to 4 %. Topology 2 (backup; 4 runs per
+variant): holder and forwarded ops p50 B / A 0.93 to 1.08 on all four, p90 0.81 to 1.16, no direction. Neither topology runs the delegate fast path or
+`finish_local`'s delegated branch, which is all this step changes. `vfs-bench` (three runs each, A B B A A B): dispatch overhead 60 to 130 ns in both
+(`mock` and `view` lookup), allocations per op identical; the target (under 1 us) holds.

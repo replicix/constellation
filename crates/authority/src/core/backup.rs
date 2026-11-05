@@ -1334,7 +1334,7 @@ impl Core {
             waiting_for_group: self.waiting_for_group(self.clk),
             member_copies: self.bk.member_epochs.len(),
             sealed_unread: self.bk.sealed_unread,
-            lone: self.root_lone() || self.dl.reported.values().any(|r| r.class.is_singleton()),
+            lone: self.root_lone() || self.dl.reported.values().any(|r| r.commit.is_singleton()),
             ungated_shadows: self.stats.ungated_shadows,
             ungated_shadows_non_stealable: self.stats.ungated_shadows_non_stealable,
             settles_sent: self.stats.settles_sent,
@@ -1733,12 +1733,16 @@ impl Core {
         }
     }
 
-    /// The `config_version` of the lease this node holds (0: none).
+    /// The `config_version` of the lease this node holds; while it holds none
+    /// (a claim not yet adopted, a lease lost), of the one it last held (0:
+    /// never).
     pub(crate) fn root_config_version(&self) -> u64 {
         self.lease
             .held
             .as_ref()
-            .map_or(0, |(lease, _)| lease.config_version)
+            .map_or(self.lease.last_config_version, |(lease, _)| {
+                lease.config_version
+            })
     }
 
     /// Plan 46 M1.1 step 2: the commit rule of this node's root
@@ -2147,7 +2151,16 @@ impl Core {
     /// lone node's.
     pub(crate) fn clear_holder_epoch(&mut self, replica: &dyn Replica) {
         let lost = self.lease.lost;
-        let class = constellation_meta::RowCommit::ARCHIVE;
+        // The archive's rule at the configuration the fast path's rows have
+        // been journaled under until now (the version last published, else
+        // the lease's): a row journaled in this window still belongs to the
+        // tenure whose configuration it is, not to version 0.
+        let version = self
+            .ack
+            .reported
+            .and_then(|(_, _, _, published, _)| published.config_version())
+            .unwrap_or_else(|| self.root_config_version());
+        let class = constellation_meta::RowCommit::group(version, GroupOn::Archive);
         self.ack.reported = Some((false, u64::MAX, lost, class, false));
         replica.set_durable(false, u64::MAX, lost, class, false);
         replica.set_holder_epoch(0);
@@ -5604,6 +5617,20 @@ impl Core {
         let mut applied = 0u64;
         let mut moved: Vec<constellation_meta::BackupTx> = Vec::new();
         let mut failed: Option<String> = None;
+        // Plan 46 M1.1 step 4: the adopted rows are journaled in this
+        // tenure's journal, so they carry the configuration in force here:
+        // the lease this node holds now (the claim's version, which the
+        // gate runs under). The predecessor's group committed them (the
+        // sealer holds the tail, write-all), which is what the `Group`
+        // rule says and nothing in this tenure waits for; the version only
+        // names the configuration of the journal they are rows of. (The
+        // predecessor's own version per row is not recorded on a backup:
+        // `BackupTx` carries none, and the member copy keeps one version for
+        // the whole tail.) Not the version-0 placeholder.
+        let _class = constellation_meta::PendingClass::set(constellation_meta::RowCommit::group(
+            self.root_config_version(),
+            GroupOn::Root,
+        ));
         for tx in &tail {
             if tx.records.is_empty() {
                 // A hole: rows the holder had shipped (or rolled back)

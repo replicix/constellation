@@ -4587,8 +4587,9 @@ lone delegate's own `Lone` row is more than the lead past the committed
 prefix or behind an uncommitted gated row of its own, judging each row once,
 the step it first shows in the journal, against the prefix known then: they
 fail by design, `SWEEP-LONE-LEAD-TOTALS` counts the rows judged, the ops the
-gated mark alone held back from `Lone`, and the `Lone` decisions the store made
-`DelegGroup` where it journaled the row), and every
+gated mark alone held back from `Lone`; the store no longer classes a row again
+where it journals it: the fast path stamps the published rule only at the
+version the store records, else the op goes through the core), and every
 lock configuration of `long_locks` (`locks`, `locks-partition`, …,
 `locks-failover-backup-writes`). Use each long test's own start (its
 source) to sweep the same seeds.

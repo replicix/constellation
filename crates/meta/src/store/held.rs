@@ -1324,7 +1324,11 @@ impl Meta {
         // The `Refused` records the drop journals are answered by the log
         // alone — nobody is told of them, and a retry meets the record —
         // so they are `Archive` rows, the class the core's check wants set.
-        let _class = super::journal::PendingClass::set(super::local::RowCommit::ARCHIVE);
+        // (A caller that holds a configuration sets its own: the core's drop
+        // is the archive's rule at the tenure's version.)
+        let _class = super::journal::PendingClass::current()
+            .is_none()
+            .then(|| super::journal::PendingClass::set(super::local::RowCommit::ARCHIVE));
         let mut tx = self.db.write_tx();
         if remote {
             // The inode's remote-pending chunks are unrecoverable from

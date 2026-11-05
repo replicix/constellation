@@ -6151,11 +6151,10 @@ fn sweep_config() {
                 Ok(report) => {
                     eprintln!("SWEEP-L3 {label} seed {seed}: {}", recall_stall(&report));
                     let ord = std::sync::atomic::Ordering::Relaxed;
-                    if report.lone_held_by_gate + report.lone_demoted_at_journal > 0 {
+                    if report.lone_held_by_gate > 0 {
                         eprintln!(
-                            "SWEEP-LONE-GATE {label} seed {seed}: held back by the gated mark {}, \
-                             made DelegGroup at the journaling {}",
-                            report.lone_held_by_gate, report.lone_demoted_at_journal
+                            "SWEEP-LONE-GATE {label} seed {seed}: held back by the gated mark {}",
+                            report.lone_held_by_gate
                         );
                     }
                     oracle_totals.lock().unwrap().add(&label, seed, &report);
@@ -7672,7 +7671,7 @@ struct OracleTotals {
     /// behind an uncommitted gated row of their own, own `Lone` rows judged,
     /// own gated rows judged, ops the gated mark held back from `Lone`, `Lone`
     /// decisions made `DelegGroup` where the row was journaled].
-    lone_lead: [u64; 6],
+    lone_lead: [u64; 5],
     /// Plan 46 M0.3: unsettled `EIO`s by isolated requesters (allowed) and
     /// by requesters that could reach a sequencer (I4 violations), and the
     /// seeds with a violation.
@@ -7838,7 +7837,6 @@ impl OracleTotals {
             r.lone_rows_judged,
             r.gated_rows_judged,
             r.lone_held_by_gate as usize,
-            r.lone_demoted_at_journal as usize,
         ]) {
             *t += n as u64;
         }
@@ -7976,14 +7974,13 @@ impl OracleTotals {
         eprintln!(
             "SWEEP-LONE-LEAD-TOTALS {label} seeds {}/{seeds}: own Lone rows past the lead {}, \
              behind an uncommitted gated row {}; own rows judged: Lone {}, gated {}; held back \
-             by the gated mark {}, made DelegGroup at the journaling {}",
+             by the gated mark {}",
             self.seeds,
             self.lone_lead[0],
             self.lone_lead[1],
             self.lone_lead[2],
             self.lone_lead[3],
-            self.lone_lead[4],
-            self.lone_lead[5]
+            self.lone_lead[4]
         );
         eprintln!(
             "SWEEP-XGEN-TOTALS {label} seeds {}/{seeds}: acks waiting on another generation {} \

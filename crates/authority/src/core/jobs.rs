@@ -1559,6 +1559,14 @@ impl Core {
         // of a generation it never granted. They are replayed by rid.
         let listed: std::collections::BTreeSet<u64> =
             replica.delegation_table().iter().map(|d| d.gen).collect();
+        // The rows are journaled in this tenure's journal: stamped with the
+        // configuration in force there (the lease this node holds now), as
+        // the adopted tail's are (`apply_backup_tail`), not a version-0
+        // placeholder.
+        let _class = constellation_meta::PendingClass::set(constellation_meta::RowCommit::group(
+            self.root_config_version(),
+            constellation_meta::GroupOn::Root,
+        ));
         for (t, deps) in &rows {
             let (gen, idx) = t.origin;
             let cursor = replica.log_stream_idx(gen);
@@ -3678,6 +3686,9 @@ impl Core {
             .as_ref()
             .is_some_and(|p| p.holder == self.cfg.node_id && !p.released && p.granted_delegations);
         let lease = sent;
+        // (The rows journaled before the lease is adopted below — the
+        // tenure's first replays and records — are stamped with it.)
+        self.lease.last_config_version = lease.config_version;
         self.ack.inherited_last = None;
         self.ack.mark_own = lease.granted_delegations && (self.cfg.strict_mounts || own_carry);
         self.ack.mark_inherited = lease.granted_delegations && !self.ack.mark_own;

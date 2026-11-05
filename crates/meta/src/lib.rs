@@ -57,7 +57,7 @@ pub use store::inbox::{CompletedOutcome, InboxAck, InboxAckArmed, OutcomeRow};
 pub use store::journal::{before_delegate_write_hook, write_check_hook};
 pub use store::journal::{
     clear_last_journaled, rows_from_session_on_this_thread, take_last_journaled, JournaledRow,
-    OwnLimits, PendingClass, PendingClassGuard,
+    PendingClass, PendingClassGuard,
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use store::local::fail_reclass_on_this_thread_for_tests;

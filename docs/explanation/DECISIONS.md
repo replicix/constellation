@@ -1840,6 +1840,28 @@ disk, and the deposed root's replay and the requester's retry are two copies
 of one op, queued at once on two nodes).
 
 
+**Plan 46 M1.1 step 4 (2026-11-05): the fast path carries the version, the
+store no longer classes a row again.** A delegate's fast path publishes
+`(rule, version, through)` and the horizon is gone: under the writer lock the
+store stamps the published rule only while the version it names is the one the
+store records (the latest `DelegGroup` record applied), and while no gated row
+of the node's own that the published prefix does not cover stands before a
+`Singleton` row (the hysteresis, across the node's generations). Anything else
+refuses the op unwritten, and the core, which reads the configuration when it
+stamps the row, decides it. A change of configuration between the publication
+and the journal therefore reaches the core instead of being stamped with the
+version of a rule that is no longer in force. The core's own op is stamped as
+it decided (no `OwnLimits`, no second class by the row's place): it publishes
+the rule it is about to stamp before it journals, so the fast path's rows that
+go in while it waits for the writer lock carry the same rule. The lead is
+the core's decision at publication, no longer a bound enforced under the lock
+(the fast path can pass it by the rows journaled between two core steps; step
+6 makes it the admission back-pressure on own ops and the lone delegate a
+recorded configuration). The rows a takeover re-journals (the predecessor's
+tail, the delegate's own rows) and the rows the root appends of a delegate's
+stream carry the configuration in force in the journal they are rows of, never
+a version-0 placeholder.
+
 ## ADR-34: Kernel FUSE race workarounds
 
 **Context**: three races in the Linux kernel's FUSE client, reproduced on

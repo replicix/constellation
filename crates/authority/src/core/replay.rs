@@ -685,6 +685,12 @@ impl Core {
                 .map(|(rid, _)| *rid)
                 .collect()
         };
+        // The `Refused` rows the drop journals are the archive's, at the
+        // configuration this tenure's journal is in (plan 46 M1.1 step 4).
+        let _class = constellation_meta::PendingClass::set(constellation_meta::RowCommit::group(
+            self.root_config_version(),
+            constellation_meta::GroupOn::Archive,
+        ));
         let dropped = replica.drop_held(
             ino,
             now.wall.0 / 1000,

@@ -110,6 +110,12 @@ pub enum Plan {
 pub struct LeaseState {
     /// The lease we believe we hold, with the tag to swap it.
     pub held: Option<(Lease, LeaseTag)>,
+    /// Plan 46 M1.1 step 4: the `config_version` of the lease this node last
+    /// held or was granted (0: never). A row journaled while the replica
+    /// still has the holder's epoch but `held` is not set (a claim being
+    /// adopted, a lease lost before the replica let go) belongs to that
+    /// tenure's configuration, not to version 0.
+    pub last_config_version: u64,
     pub held_since: Option<WaitMs>,
     pub wanted: Vec<NodeId>,
     pub wanted_since: Option<WaitMs>,
@@ -728,6 +734,7 @@ impl LeaseState {
         self.last_seen = Some(lease.clone());
         self.observe_own(now, &lease, &tag);
         self.cached_holder = Some(lease.holder);
+        self.last_config_version = lease.config_version;
         self.held = Some((lease, tag));
         self.held_gen += 1;
         self.reconfig_doubt = None;
@@ -778,6 +785,7 @@ impl LeaseState {
         // been served before it landed, and says nothing of it. Only a
         // version other than the held one settles the doubt.
         let same_version = self.held.as_ref().is_some_and(|(_, t)| *t == tag);
+        self.last_config_version = lease.config_version;
         self.held = Some((lease, tag));
         self.held_gen += 1;
         if !same_version {

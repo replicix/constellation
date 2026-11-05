@@ -103,7 +103,7 @@ thread_local! {
     static LAST_JOURNALED: std::cell::Cell<Option<JournaledRow>> =
         const { std::cell::Cell::new(None) };
     static FROM_SESSION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static PENDING_OWN: std::cell::Cell<Option<OwnLimits>> = const { std::cell::Cell::new(None) };
+    static PENDING_OWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// How many rows this thread journaled with the session's published class
@@ -132,27 +132,21 @@ impl PendingClass {
     pub fn set(class: crate::store::local::RowCommit) -> PendingClassGuard {
         PendingClassGuard {
             prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
-            prev_own: PENDING_OWN.with(|c| c.replace(None)),
+            prev_own: PENDING_OWN.with(|c| c.replace(false)),
         }
     }
 
     /// [`Self::set`] for a row of a delegate's own node's client, executed
     /// by the delegate (not another node's forward). A gated one is
     /// recorded against its generation (`Meta::delegate_gated_idx`): the
-    /// delegate's `Lone` rows wait for it to commit.
-    ///
-    /// A `Lone` class is the core's decision from the journal as it stood
-    /// then; the row is journaled later, once the op holds the writer lock,
-    /// and the FUSE fast path's rows may have gone in between.
-    /// `Meta::finish_local` classes the row again by its own place in the
-    /// stream, against `limits` (what the core knew then, which only lags
-    /// the truth), and journals `DelegGroup` where the decision no longer
-    /// holds; the core reads the class the row got
-    /// ([`take_last_journaled`]).
-    pub fn set_own(class: crate::store::local::RowCommit, limits: OwnLimits) -> PendingClassGuard {
+    /// delegate's `Lone` rows wait for it to commit (the core's decision,
+    /// `Core::deleg_lone_held_by_gated`, until the lone lead leaves the
+    /// commit). The row is stamped as given: the store never classes it
+    /// again where it journals it.
+    pub fn set_for_own_client(class: crate::store::local::RowCommit) -> PendingClassGuard {
         PendingClassGuard {
             prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
-            prev_own: PENDING_OWN.with(|c| c.replace(Some(limits))),
+            prev_own: PENDING_OWN.with(|c| c.replace(true)),
         }
     }
 
@@ -160,46 +154,31 @@ impl PendingClass {
         PENDING_CLASS.with(|c| c.get())
     }
 
-    /// Set for a row of the delegate's own node's client (the limits the
-    /// core decided its class under).
-    pub(crate) fn own() -> Option<OwnLimits> {
+    /// Set for a row of the delegate's own node's client.
+    pub(crate) fn own() -> bool {
         PENDING_OWN.with(|c| c.get())
     }
 }
 
-/// What the core knew of a generation's stream when it decided the class of
-/// an own op ([`PendingClass::set_own`]): the committed prefix and the
-/// highest index a `Lone` row may take (`DelegDurable::horizon`). Both are
-/// read before the op waits for the writer lock and only lag the truth (the
-/// prefix only grows), so a class judged against them is never weaker than
-/// one judged at the write.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OwnLimits {
-    /// A gated row of this node's own clients at or below this index has
-    /// committed (`u64::MAX`: no row holds a `Lone` one back).
-    pub committed: u64,
-    /// The highest index a `Lone` row may take (`u64::MAX`: no limit).
-    pub horizon: u64,
-}
-
 pub struct PendingClassGuard {
     prev: Option<crate::store::local::RowCommit>,
-    prev_own: Option<OwnLimits>,
+    prev_own: bool,
 }
 
 thread_local! {
     static CLASS_AT_JOURNAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Plan 43 C2d (§5.1): the class of the row the delegate's FUSE fast path
-/// journals is decided at the journaling — under the store's writer lock,
-/// from the class the core has published for the generation by then
-/// (`SessionState::deleg_row_class`) — not at the op's admission, which may
-/// be long before it holds the lock. With this set (by
-/// [`crate::Meta::delegate_execute_admitted`]) and no [`PendingClass`],
-/// `Meta::finish_local` reads the published class of the op's generation; a
-/// generation the core no longer publishes refuses the op unwritten
-/// (`MetaError::NotAdmitted`, through the core).
+/// Plan 43 C2d (§5.1), plan 46 M1.1 step 4: the rule of the row the
+/// delegate's FUSE fast path journals is the one the core has published for
+/// the generation (`SessionState::deleg_row_class`), read under the store's
+/// writer lock, not at the op's admission, which may be long before it
+/// holds the lock. With this set (by [`crate::Meta::delegate_execute_admitted`])
+/// and no [`PendingClass`], `Meta::finish_local` stamps the published rule,
+/// provided the version it names is the one the store records
+/// (`SessionState::deleg_commit_at_journal`); a generation the core no
+/// longer publishes, or a version that has changed, refuses the op
+/// unwritten (`MetaError::NotAdmitted`, through the core).
 pub(crate) struct ClassAtJournal;
 
 impl ClassAtJournal {

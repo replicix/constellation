@@ -664,33 +664,41 @@ impl Meta {
         if end <= local.start {
             return Ok(());
         }
-        // Plan 43 C2d (§5.1): the delegate fast path's row is classed now,
-        // under the writer lock, by what the core has published for the
-        // generation at this moment, and by the row's own place in the
-        // stream: a `Lone` class is the core's for a row within the lead
-        // it published (`SessionState::deleg_row_class_at`), and one behind
-        // a gated row of this node's own that has not committed is
-        // `DelegGroup` (`Meta::delegate_gated_idx`). Decided before anything
-        // is recorded: a generation no longer published refuses the op
-        // unwritten.
+        // Plan 43 C2d (§5.1), plan 46 M1.1 step 4: the delegate fast path's
+        // row is stamped now, under the writer lock, with the rule the core
+        // has published for the generation, if the version of the
+        // configuration that rule was decided under is the one this store
+        // records now (the latest `DelegGroup` record applied), and a
+        // `Singleton` rule follows no open gated row of this node's own.
+        // The row is not classed again by its place in the stream: a
+        // changed version (a record applied since the publication), an open
+        // gated row, or a generation no longer published refuses the op
+        // unwritten, and the core decides it from what it reads then.
+        // Decided before anything is recorded.
         let class_at_journal = match journal::PendingDelegate::peek() {
             Some(d)
                 if d.idx.is_none()
                     && journal::ClassAtJournal::active()
                     && journal::PendingClass::current().is_none() =>
             {
-                let next = kv_get_tx(tx, &self.local, &deleg_idx_key(d.gen))?
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(0)
-                    + 1;
+                let version =
+                    crate::delegation::read_group_tx(&*tx, self, d.gen)?.map_or(0, |g| g.version);
                 let gated = kv_get_tx(tx, &self.local, &deleg_gated_key(d.gen))?
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(0);
-                Some(
-                    self.session()
-                        .deleg_row_class_at(d.gen, next, gated)
-                        .ok_or(MetaError::NotAdmitted)?,
-                )
+                let commit = self
+                    .session()
+                    .deleg_commit_at_journal(d.gen, version, gated)
+                    .ok_or(MetaError::NotAdmitted)?;
+                // The same across this node's generations (a takeover's
+                // strand ends every own generation together; the keys of one
+                // generation's gated row can be another's by the time a
+                // later row touches them): a `Singleton` rule behind an open
+                // gated row of another generation is not stamped either.
+                if commit.is_singleton() && gated_open_elsewhere_tx(tx, self, d.gen, true)? {
+                    return Err(MetaError::NotAdmitted);
+                }
+                Some(commit)
             }
             _ => None,
         };
@@ -752,7 +760,7 @@ impl Meta {
         // rows); the FUSE fast path's threads publish nothing of their own
         // and take the class the core last published with the gate, which
         // is what their wait follows.
-        let mut class = match (journal::PendingClass::current(), class_at_journal) {
+        let class = match (journal::PendingClass::current(), class_at_journal) {
             (Some(c), _) | (None, Some(c)) => c,
             (None, None) if delegated => RowCommit::LONE,
             (None, None) => {
@@ -761,43 +769,21 @@ impl Meta {
             }
         };
         // Plan 43 C2 (hysteresis): a gated row of this delegate's own node's
-        // clients is the generation's gated high-water: its `Lone` rows
-        // are journaled only after it has committed (`deleg_gated_key`).
-        //
-        // The core's own op arrives with the class the core decided before
-        // it waited for this writer lock (`PendingClass::set_own`), and the
-        // FUSE fast path's rows may have gone in since. It is classed here
-        // as the fast path's is, by its own place in the stream, against
-        // what the core knew then (which only lags): `DelegGroup` where it
-        // is past the lead or follows a gated row that has not committed.
-        // The core reads the class the row got.
-        let own = journal::PendingClass::own();
-        if gen != 0 && (class_at_journal.is_some() || own.is_some()) {
+        // clients is the generation's gated high-water: the core decides a
+        // `Lone` row only after it has committed (`deleg_gated_key`; the
+        // core's `deleg_lone_held_by_gated`). The row keeps the rule it
+        // was given.
+        if gen != 0 && (class_at_journal.is_some() || journal::PendingClass::own()) && class.gated()
+        {
             let key = deleg_gated_key(gen);
             let held = kv_get_tx(tx, &self.local, &key)?
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
-            if let (true, Some(limits)) = (class.is_singleton(), own) {
-                if crate::session::lone_row_holds(idx, held, limits.committed, limits.horizon) {
-                    self.session().note_lone_demoted(idx > limits.horizon);
-                    class = class.demoted();
-                }
-            }
-            // The same rule across this node's generations: the keys of one
-            // generation's gated row can be another generation's by the time
-            // a later row touches them (an unlink of an inode's primary link
-            // moves its own keys to the delegation of the next link: two
-            // ranges of a split directory, or a range and a whole subtree,
-            // held by one node), and a takeover's strand ends every own
-            // generation together. A core with the hysteresis off (its
-            // limits say nothing) holds nothing back here either.
-            let hysteresis = own.is_none_or(|l| l.committed != u64::MAX);
-            if class.is_singleton() && hysteresis && gated_open_elsewhere_tx(tx, self, gen, true)? {
-                self.session().note_lone_demoted(false);
-                class = class.demoted();
-            }
-            if class.gated() && idx > held {
+            if idx > held {
                 kv_set_tx(tx, &self.local, &key, &idx.to_string());
+                // (The marks found closed leave the open list here: it stays
+                // a few entries.)
+                gated_open_elsewhere_tx(tx, self, gen, true)?;
                 note_gated_open_tx(tx, self, gen)?;
             }
         }
@@ -1274,6 +1260,23 @@ impl Meta {
         idx: u64,
         deps: crate::session::Position,
     ) -> Result<bool, MetaError> {
+        // Plan 46 M1.1 step 4: the root's append of a delegate's row is
+        // stamped with the configuration of the generation in force where
+        // it is journaled: the `DelegGroup` version this replica has applied
+        // (the same `Singleton` tag as before: the replay and member-copy
+        // rules read it, M2.1), not a version-0 placeholder.
+        let _class = journal::PendingClass::current().is_none().then(|| {
+            let version = {
+                let r = self.db.read_tx();
+                crate::delegation::read_group_tx(&r, self, gen)
+                    .ok()
+                    .flatten()
+                    .map_or(0, |g| g.version)
+            };
+            journal::PendingClass::set(RowCommit::Singleton {
+                config_version: version,
+            })
+        });
         // A delegate's refusal (see `delegate_refusal`) is a `Refused`
         // row of its own: journaled here the same way, under the
         // stream's origin.
@@ -2693,27 +2696,23 @@ mod root_substitution_tests {
         );
     }
 
-    /// The core decides an own op's class before it waits for the writer
-    /// lock, and the fast path's rows may go in meanwhile: the store classes
-    /// the core's row again where it journals it (`PendingClass::set_own`),
-    /// against what the core knew: `Lone` stays only within the horizon and
-    /// behind no gated row of the node's own that the committed prefix does
-    /// not cover, and the class only ever goes to the stronger one. A row
-    /// that is not the node's own client's (a forward) is left as it was
-    /// decided.
+    /// Plan 46 M1.1 step 4: a row is stamped with the rule it is given, at
+    /// whatever place of the stream it lands: the store no longer classes an
+    /// own row again where it journals it (the lead and the committed prefix
+    /// are the core's decision). A gated row of the node's own clients is
+    /// the generation's gated mark; a forward's row sets none.
     #[test]
-    fn an_own_lone_row_is_classed_again_where_it_is_journaled() {
-        use crate::store::journal::{
-            clear_last_journaled, take_last_journaled, OwnLimits, PendingClass,
-        };
+    fn an_own_row_is_stamped_as_given_and_a_gated_one_is_marked() {
+        use crate::store::journal::{clear_last_journaled, take_last_journaled, PendingClass};
         let meta = Meta::open_in_memory().unwrap();
         let mut n = 0;
-        let mut journal = |class: Option<(RowCommit, Option<OwnLimits>)>| -> (u64, RowCommit) {
+        let mut journal = |class: RowCommit, own: bool| -> (u64, RowCommit) {
             n += 1;
-            let _class = class.map(|(c, limits)| match limits {
-                Some(l) => PendingClass::set_own(c, l),
-                None => PendingClass::set(c),
-            });
+            let _class = if own {
+                PendingClass::set_for_own_client(class)
+            } else {
+                PendingClass::set(class)
+            };
             clear_last_journaled();
             let (_, idx) = meta
                 .delegate_execute(
@@ -2738,68 +2737,112 @@ mod root_substitution_tests {
                 .unwrap();
             (idx, take_last_journaled().unwrap().class)
         };
-        let lim =
-            |committed, horizon| Some((RowCommit::LONE, Some(OwnLimits { committed, horizon })));
-        // Committed 0, horizon 2: rows 1 and 2 are within it.
-        assert_eq!(journal(lim(0, 2)), (1, RowCommit::LONE));
-        assert_eq!(journal(lim(0, 2)), (2, RowCommit::LONE));
+        assert_eq!(journal(RowCommit::LONE, true), (1, RowCommit::LONE));
         assert_eq!(meta.delegate_gated_idx(5).unwrap(), 0);
-        // Row 3 is past it: it waits for the group, and is the gated mark.
-        assert_eq!(journal(lim(0, 2)), (3, RowCommit::DELEG_GROUP));
-        assert_eq!(meta.delegate_gated_idx(5).unwrap(), 3);
-        // A forward's row is the class the core decided, whatever its place,
-        // and sets no mark.
         assert_eq!(
-            journal(Some((RowCommit::LONE, None))),
-            (4, RowCommit::LONE),
-            "not an own row"
+            journal(RowCommit::DELEG_GROUP, true),
+            (2, RowCommit::DELEG_GROUP)
         );
-        // Within a horizon that has moved, behind the open row 3: held.
-        assert_eq!(journal(lim(2, 50)), (5, RowCommit::DELEG_GROUP));
-        assert_eq!(meta.delegate_gated_idx(5).unwrap(), 5);
-        // Once the prefix covers the mark the row is `Lone` again.
-        assert_eq!(journal(lim(5, 50)), (6, RowCommit::LONE));
-        // A class that waits stays, and a limit that says nothing holds
-        // nothing back (the hysteresis and the lead off).
+        assert_eq!(meta.delegate_gated_idx(5).unwrap(), 2);
+        // Behind the open gated row 2 the store still stamps what the core
+        // decided (a `Lone` row it chose to journal).
+        assert_eq!(journal(RowCommit::LONE, true), (3, RowCommit::LONE));
+        // A forward's gated row sets no mark.
         assert_eq!(
-            journal(Some((
-                RowCommit::DELEG_GROUP,
-                Some(OwnLimits {
-                    committed: 99,
-                    horizon: 99
-                })
-            ))),
-            (7, RowCommit::DELEG_GROUP)
+            journal(RowCommit::DELEG_GROUP, false),
+            (4, RowCommit::DELEG_GROUP)
         );
-        assert_eq!(meta.delegate_gated_idx(5).unwrap(), 7);
-        assert_eq!(journal(lim(u64::MAX, u64::MAX)), (8, RowCommit::LONE));
-        let stats = meta.session().stats();
+        assert_eq!(meta.delegate_gated_idx(5).unwrap(), 2);
+    }
+
+    /// Plan 46 M1.1 step 4 (fail-before: the row is stamped with the
+    /// published version whatever the store records): the delegate fast path
+    /// stamps the rule the core published, and only while the version it names
+    /// is the one the store records under the writer lock. A `DelegGroup`
+    /// record applied between the publication and the journal refuses the op
+    /// unwritten (the core stamps it), and the row is journaled once the core
+    /// publishes the new version.
+    #[test]
+    fn the_fast_path_refuses_a_row_when_the_configuration_changed_since_the_publication() {
+        use crate::session::DelegDurable;
+        use crate::store::journal::{clear_last_journaled, take_last_journaled};
+        let meta = Meta::open_in_memory().unwrap();
+        let publish = |version| {
+            meta.session().set_deleg_durable(
+                5,
+                Some(DelegDurable {
+                    commit: RowCommit::group(version, GroupOn::Delegate),
+                    through: 0,
+                    lost: false,
+                }),
+            );
+        };
+        let mut n = 0;
+        let mut fast = || {
+            n += 1;
+            clear_last_journaled();
+            meta.delegate_execute_admitted(
+                &MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: format!("f{n}"),
+                    ino: (3 << 40) | n,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                Some(Rid {
+                    node: 3,
+                    incarnation: 1,
+                    seq: n,
+                }),
+                5,
+                Default::default(),
+                &crate::locks::LockTag::NONE,
+                Now::same(0),
+                Box::new(|| true),
+            )
+        };
+        publish(0);
+        assert!(fast().is_ok());
         assert_eq!(
-            (
-                stats.lone_demoted_past_lead,
-                stats.lone_demoted_behind_gated
-            ),
-            (1, 1)
+            take_last_journaled().unwrap().class,
+            RowCommit::group(0, GroupOn::Delegate)
+        );
+        // The store applies a `DelegGroup` record (version 1): the published
+        // rule is of version 0, and the op is refused unwritten.
+        meta.apply_records(&[LogRecord::DelegGroup {
+            dir: ROOT_INO,
+            gen: 5,
+            version: 1,
+            backups: vec![2],
+        }])
+        .unwrap();
+        assert!(matches!(fast(), Err(MetaError::NotAdmitted)));
+        assert_eq!(meta.delegate_idx(5).unwrap(), 1, "nothing was journaled");
+        // The core publishes the version the store records: stamped with it.
+        publish(1);
+        assert!(fast().is_ok());
+        assert_eq!(
+            take_last_journaled().unwrap().class,
+            RowCommit::group(1, GroupOn::Delegate)
         );
     }
 
-    /// The hysteresis spans this node's generations: an own `Lone` row of one
-    /// generation is journaled `DelegGroup` while a gated row of another of
-    /// its generations is open (above the prefix the core published as
-    /// committed, and still in the journal), whatever the core decided; the
-    /// open list forgets a generation once its mark is committed. Limits
-    /// that say nothing (the hysteresis off) hold nothing back.
+    /// The gated mark spans this node's generations: an own gated row of
+    /// one generation is open (above the prefix the core published as
+    /// committed, and still in the journal) for every other generation's
+    /// decision (`Meta::delegate_gated_open_elsewhere`, the core's
+    /// hysteresis); the open list forgets a generation once its mark is
+    /// committed or its row left the journal.
     #[test]
-    fn an_own_lone_row_waits_for_an_open_gated_row_of_another_generation() {
+    fn a_gated_mark_is_open_to_the_other_generations_until_it_commits() {
         use crate::session::DelegDurable;
-        use crate::store::journal::{
-            clear_last_journaled, take_last_journaled, OwnLimits, PendingClass,
-        };
+        use crate::store::journal::{clear_last_journaled, take_last_journaled, PendingClass};
         let meta = Meta::open_in_memory().unwrap();
         let mut n = 0;
-        let mut journal = |gen: u64, committed: u64, horizon: u64| -> (u64, RowCommit) {
+        let mut journal = |gen: u64, class: RowCommit| -> (u64, RowCommit) {
             n += 1;
-            let _class = PendingClass::set_own(RowCommit::LONE, OwnLimits { committed, horizon });
+            let _class = PendingClass::set_for_own_client(class);
             clear_last_journaled();
             let (_, idx) = meta
                 .delegate_execute(
@@ -2824,37 +2867,40 @@ mod root_substitution_tests {
                 .unwrap();
             (idx, take_last_journaled().unwrap().class)
         };
-        // Generation 5's row 1 is past its horizon: gated, open.
-        assert_eq!(journal(5, 0, 0), (1, RowCommit::DELEG_GROUP));
+        // Generation 5's row 1 is gated, open.
+        assert_eq!(
+            journal(5, RowCommit::DELEG_GROUP),
+            (1, RowCommit::DELEG_GROUP)
+        );
         assert!(meta.delegate_gated_open_elsewhere(6).unwrap());
         assert!(
             !meta.delegate_gated_open_elsewhere(5).unwrap(),
             "not its own"
         );
-        // Generation 6's own row, within its lead and behind nothing of its
-        // own, follows it: it waits for its group too.
-        assert_eq!(journal(6, 0, 50), (1, RowCommit::DELEG_GROUP));
-        // The hysteresis off: nothing is held back.
-        assert_eq!(journal(6, u64::MAX, u64::MAX), (2, RowCommit::LONE));
-        // The core publishes generation 5's row 1 committed: 6 is `Lone`
-        // again past its own committed mark, and 5 leaves the open list.
+        // The core publishes generation 5's row 1 committed: it is closed,
+        // and 5 leaves the open list when the next gated row is marked.
         meta.session().set_deleg_durable(
             5,
             Some(DelegDurable {
-                class: RowCommit::LONE,
+                commit: RowCommit::LONE,
                 through: 1,
-                horizon: 2,
                 lost: false,
             }),
         );
         assert!(!meta.delegate_gated_open_elsewhere(6).unwrap());
-        assert_eq!(journal(6, 1, 50), (3, RowCommit::LONE));
+        assert_eq!(
+            journal(6, RowCommit::DELEG_GROUP),
+            (1, RowCommit::DELEG_GROUP)
+        );
         let r = meta.db.read_tx();
         assert_eq!(read_gated_open(&r, &meta).unwrap(), vec![6]);
         drop(r);
         // A mark whose row left the journal (stranded with its generation's
         // end, or retired by the log) is not open either.
-        assert_eq!(journal(5, 1, 1), (2, RowCommit::DELEG_GROUP));
+        assert_eq!(
+            journal(5, RowCommit::DELEG_GROUP),
+            (2, RowCommit::DELEG_GROUP)
+        );
         assert!(meta.delegate_gated_open_elsewhere(6).unwrap());
         let r = meta.db.read_tx();
         let first = journal_origins_from(&r, &meta, 5, 2)
@@ -3103,7 +3149,8 @@ fn gated_open_elsewhere_r(
 
 /// Plan 43 C2 (hysteresis across generations): whether an own row of `gen`
 /// follows an open gated row of another generation of this node, under the
-/// writer lock. At a takeover's strand every own generation ends together:
+/// writer lock (the store only prunes the open list with it now; the core
+/// decides from [`Meta::delegate_gated_open_elsewhere`]). At a takeover's strand every own generation ends together:
 /// the uncommitted gated row is dropped (its client was not answered) and a
 /// later `Lone` row of the other generation is replayed without it (a
 /// `setxattr` of a file, its primary link unlinked, then a `removexattr`

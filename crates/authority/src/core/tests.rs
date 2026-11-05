@@ -45107,9 +45107,6 @@ mod deleg_group {
         dropped: usize,
         queued: Vec<Rid>,
         rename: Rid,
-        /// Rows the store journaled `DelegGroup` that the core had decided
-        /// `Lone`.
-        demoted: u64,
     }
 
     impl RenameRace {
@@ -45173,28 +45170,32 @@ mod deleg_group {
             dropped: applied.stranded.deleg_dropped,
             queued,
             rename,
-            demoted: h.core.stats.deleg_lone_demoted,
         }
     }
 
-    /// Review follow-up of F1/F2 (fail-before): the core decides an own op's
-    /// class from the journal as it stands, then waits for the store's
-    /// writer lock; the fast path journals meanwhile. Here the lead is two
-    /// rows past the root's cursor (nothing committed, row 1 journaled): the
-    /// core finds room for one `Lone` row and decides the rename `Lone`; the
-    /// fast path then journals `x` (row 2, the last within the lead) and the
-    /// create of `f` (row 3, past it: `DelegGroup`, its client waits), and
-    /// the rename was journaled as row 4, past the lead and behind the open
-    /// create, and answered `Lone`. At the root's crash the create is
-    /// dropped and the rename replayed without it: it fails, after its
-    /// client was told it succeeded. Now `Meta::finish_local` classes the
-    /// core's own row too, under the writer lock, and the core answers by the
-    /// class the row was journaled with: the rename waits for the root like
-    /// the create, and both are dropped.
+    /// Review follow-up of F1/F2, plan 46 M1.1 step 4: the core decides an
+    /// own op's rule, then waits for the store's writer lock, and the fast
+    /// path journals meanwhile. The store no longer classes the core's row
+    /// again where it journals it: the core publishes the rule it stamps
+    /// before the write (`Core::deleg_publish_rule`), so the fast path's rows
+    /// that go in meanwhile are stamped with it too. Here the lead is two
+    /// rows past the root's cursor (nothing committed, row 1 journaled) and
+    /// the core decides the rename `Lone`; the fast path journals `x` and the
+    /// create of `f` (`Lone` as published, the lead is the core's decision
+    /// and no longer enforced under the writer lock), and the rename follows
+    /// them. No row of the stream waits for its group, so nothing answered
+    /// `Lone` depends on a row the strand drops: at the root's crash every
+    /// row past the cursor is replayed in order, the rename after the create
+    /// it renames.
     #[test]
-    fn a_core_path_lone_row_is_not_journaled_past_the_lead_and_behind_an_open_gated_row() {
+    fn a_core_path_rows_rule_is_the_one_the_fast_path_rows_around_it_carry() {
         use constellation_meta::RowCommit;
         let r = core_rename_amid_fast_path_rows(|meta, now, dir| {
+            assert_eq!(
+                meta.session().deleg_row_class(7),
+                Some(RowCommit::LONE),
+                "published before the core's row is journaled"
+            );
             fast_create(meta, now, dir, 2, "x");
             fast_create(meta, now, dir, 3, "f");
         });
@@ -45203,53 +45204,100 @@ mod deleg_group {
             vec![
                 (1, RowCommit::LONE),
                 (2, RowCommit::LONE),
-                (3, RowCommit::DELEG_GROUP),
-                (4, RowCommit::DELEG_GROUP),
-            ],
-            "the rename's row waits for the root: {:?}",
-            r.rows
-        );
-        assert_eq!(r.answered, None, "the rename waits for the root");
-        assert_eq!(r.demoted, 1);
-        assert_eq!(r.dropped, 2, "the create and the rename are dropped");
-        assert_eq!(r.queued.len(), 1, "only x is replayed: {:?}", r.queued);
-        assert!(!r.queued.contains(&r.rename));
-    }
-
-    /// The same inside the lead: the published class lags the core's
-    /// decision (the core publishes at the end of a step), so a write the
-    /// fast path journals in between is still `DelegGroup` (the delegate
-    /// had a backup candidate a step ago), and the rename the core decided
-    /// `Lone` was journaled behind that open row.
-    #[test]
-    fn a_core_path_lone_row_is_not_journaled_behind_an_open_gated_row_within_the_lead() {
-        use constellation_meta::RowCommit;
-        let r = core_rename_amid_fast_path_rows(|meta, now, dir| {
-            meta.session().set_deleg_durable(
-                7,
-                Some(constellation_meta::DelegDurable {
-                    class: RowCommit::DELEG_GROUP,
-                    through: 0,
-                    horizon: u64::MAX,
-                    lost: false,
-                }),
-            );
-            fast_create(meta, now, dir, 2, "f");
-        });
-        assert_eq!(
-            r.classes(),
-            vec![
-                (1, RowCommit::LONE),
-                (2, RowCommit::DELEG_GROUP),
-                (3, RowCommit::DELEG_GROUP),
+                (3, RowCommit::LONE),
+                (4, RowCommit::LONE),
             ],
             "{:?}",
             r.rows
         );
-        assert_eq!(r.answered, None, "the rename waits for the root");
-        assert_eq!(r.demoted, 1);
-        assert_eq!(r.dropped, 2, "the create and the rename are dropped");
-        assert!(r.queued.is_empty(), "nothing is replayed: {:?}", r.queued);
+        assert_eq!(
+            r.answered,
+            Some(AnswerSource::Sequenced(AckClass::Lone)),
+            "the rename is answered from the disk"
+        );
+        assert_eq!(r.dropped, 0, "no gated row to drop");
+        assert_eq!(
+            r.queued.len(),
+            3,
+            "x, the create and the rename are replayed: {:?}",
+            r.queued
+        );
+        assert_eq!(r.queued.last(), Some(&r.rename), "in order");
+    }
+
+    /// Plan 46 M1.1 step 4 (fail-before: the row is stamped with the
+    /// published version): the fast path stamps the rule the core published
+    /// only at the version the store records under its writer lock. A
+    /// `DelegGroup` record applied after the core's publication (the core has
+    /// not read it yet) refuses the fast path's row, which goes through the
+    /// core; the core reads the configuration when it stamps, so the row
+    /// carries the new version, and it waits for the new group's member.
+    #[test]
+    fn a_configuration_change_between_the_publication_and_the_journal_sends_the_row_to_the_core() {
+        use constellation_meta::{GroupOn, MetaError, RowCommit};
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        root_is_near(&mut h);
+        let published = h.meta.session().deleg_row_class(7);
+        assert_eq!(published, Some(RowCommit::group(0, GroupOn::Delegate)));
+        // The root's record reaches the replica (node 4 joins the group); the
+        // core has not seen it yet (no event since).
+        Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegGroup {
+                dir,
+                gen: 7,
+                version: 1,
+                backups: vec![4],
+            }],
+        )
+        .unwrap();
+        assert_eq!(h.meta.session().deleg_row_class(7), published);
+        let now = h.clk();
+        let refused = h.meta.delegate_execute_admitted(
+            &MutateOp::Create {
+                parent: dir,
+                name: "fast".into(),
+                ino: h.meta.allocate_ino(dir).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            Some(h.rid(9)),
+            7,
+            Default::default(),
+            &Default::default(),
+            now,
+            Box::new(|| true),
+        );
+        assert!(
+            matches!(refused, Err(MetaError::NotAdmitted)),
+            "stamped with the stale version: {refused:?}"
+        );
+        assert_eq!(h.meta.delegate_idx(7).unwrap(), 0, "nothing journaled");
+        // Through the core: it reads the record, stamps its version, and the
+        // answer waits for the group it names (the backup), not the old one.
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (rid, out) = own_create(&mut h, dir, 1);
+        assert!(
+            client_answers(&out).is_empty(),
+            "waits for its group: {out:?}"
+        );
+        assert_eq!(
+            h.meta.delegate_rows_for_audit(7).unwrap()[0].1,
+            RowCommit::group(1, GroupOn::Delegate),
+            "the row carries the new version"
+        );
+        let _ = rid;
+        assert_eq!(
+            h.meta.session().deleg_row_class(7),
+            Some(RowCommit::group(1, GroupOn::Delegate))
+        );
     }
 
     /// A backup counts only once the delegate's own table records a
@@ -53309,10 +53357,17 @@ mod c2f_lone_root {
         h.core.lease.lost = true;
         assert_eq!(h.core.root_ack_class(), AckClass::Archive);
         h.core.lease.lost = false;
+        let version = h.core.root_config_version();
+        assert!(version > 0, "a held lease has a configuration");
         h.core.clear_holder_epoch(&h.meta);
         let session = h.meta.session();
         assert!(!session.durable_lone_ok());
-        assert_eq!(session.published_class(), RowCommit::ARCHIVE);
+        // The archive's rule at the configuration the rows were journaled
+        // under (plan 46 M1.1 step 4: no version-0 placeholder).
+        assert_eq!(
+            session.published_class(),
+            RowCommit::group(version, constellation_meta::GroupOn::Archive)
+        );
         assert_eq!(
             session.wait_durable(u64::MAX - 1, std::time::Duration::from_millis(1)),
             constellation_meta::DurableWait::Unexpected

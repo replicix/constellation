@@ -939,7 +939,7 @@ impl Core {
                     // The class published at the last event
                     // ([`Self::report_deleg_durable`]), not decided again
                     // for every step's view.
-                    match self.dl.reported.get(&d.gen).map(|r| r.class) {
+                    match self.dl.reported.get(&d.gen).map(|r| r.commit) {
                         Some(constellation_meta::RowCommit::Singleton { .. }) => "lone",
                         Some(constellation_meta::RowCommit::Group {
                             on: GroupOn::Archive,
@@ -2048,6 +2048,13 @@ impl Core {
         // now waits for, by who is asked; set for the journaling below (the
         // row's class is fixed there) and for the answer after it.
         let asker = if from == 0 { Asker::Own } else { Asker::Remote };
+        // Plan 46 M1.1 step 4: the row is stamped with the configuration in
+        // force when it is journaled: the version this replica has applied
+        // now, not the one the last refresh read (a record applied by an
+        // earlier step of this event loop since).
+        if let Some(d) = self.dl.mine.get_mut(&gen) {
+            Self::deleg_group_refresh_one(d, replica);
+        }
         // (A settle's refusal is never `Lone`: it waits for the group, also
         // for this node's own client — see `Core::settle_refusal`.)
         let class_asker = if settle { Asker::Remote } else { asker };
@@ -2066,22 +2073,18 @@ impl Core {
                 (wait_gen, exec_idx) = (g, Some(idx));
             }
         }
-        // (Only a `Lone` decision can be undone at the journaling.)
-        let limits = if class == AckClass::Lone {
-            self.deleg_own_limits(gen, replica)
-        } else {
-            constellation_meta::OwnLimits {
-                committed: u64::MAX,
-                horizon: u64::MAX,
-            }
-        };
+        if !dedup && asker == Asker::Own && !settle {
+            self.deleg_publish_rule(gen, self.deleg_row_commit(gen, rule), replica);
+        }
         let _row_class = (!dedup).then(|| {
             // The delegate's own node's rows are the ones its `Lone` rows
-            // follow ([`Self::deleg_lone_held_by_gated`]), and the ones the
-            // store classes again where it journals them: the fast path's
-            // rows may go in between (see below).
+            // follow ([`Self::deleg_lone_held_by_gated`]): the store marks
+            // a gated one. The row is stamped as decided here, from the
+            // configuration read now (the store never classes it again).
             if asker == Asker::Own {
-                constellation_meta::PendingClass::set_own(self.deleg_row_commit(gen, rule), limits)
+                constellation_meta::PendingClass::set_for_own_client(
+                    self.deleg_row_commit(gen, rule),
+                )
             } else {
                 constellation_meta::PendingClass::set(self.deleg_row_commit(gen, rule))
             }
@@ -2198,22 +2201,6 @@ impl Core {
                 }
             }
         };
-        // The class the row was journaled with is its class. The store
-        // classed the row again where it journaled it, under the writer
-        // lock (`Meta::finish_local`): the FUSE fast path's rows go in
-        // while this core waits for it, and a `Lone` decision made before
-        // that no longer holds for a row past the lead or behind a gated
-        // row that has not committed. Only ever to the stronger class: the
-        // row waits for its group (below) like a `DelegGroup` row the core
-        // decided itself.
-        if !dedup && exec_idx.is_some() && class == AckClass::Lone {
-            if let Some(row) = constellation_meta::take_last_journaled() {
-                if row.class.gated() {
-                    class = AckClass::DelegGroup { gen };
-                    self.stats.deleg_lone_demoted += 1;
-                }
-            }
-        }
         let position = Position {
             seq: replica.applied_seq().unwrap_or(0),
             pending: None,
@@ -2484,49 +2471,6 @@ impl Core {
         let committed = self.deleg_committed_capped(d.gen, replica);
         self.deleg_lone_lead_full(d, replica, committed)
             || self.deleg_lone_held_by_gated(d, replica, committed)
-    }
-
-    /// The highest stream index a `Lone` row of `d`'s generation may take:
-    /// the committed prefix plus the lead. The row that takes index `n` is
-    /// within the lead exactly when `n <= horizon`
-    /// ([`Self::deleg_lone_lead_full`] asked about the index before it).
-    /// Published with the class ([`Self::report_deleg_durable`]) so the
-    /// fast path classes each row by its own index, under the writer lock,
-    /// instead of by the class the core published at the end of its last
-    /// step: the journal moves between the steps of a busy core. The
-    /// core's own ops carry it with the committed prefix
-    /// ([`Self::deleg_own_limits`]): they wait for the writer lock after
-    /// their class is decided.
-    fn deleg_lone_horizon(&self, through: u64) -> u64 {
-        if self.cfg.delegation_lone_lead {
-            through.saturating_add((self.cfg.delegation_stream_rows as u64).max(1))
-        } else {
-            u64::MAX
-        }
-    }
-
-    /// What the store needs to class an own row again where it journals it
-    /// ([`constellation_meta::PendingClass::set_own`]): the committed prefix
-    /// and the horizon as this core knows them now, which only lag the
-    /// store's truth by the time the row waits for the writer lock. With the
-    /// hysteresis off (the simulation's negative control) no gated row holds
-    /// a `Lone` row back.
-    fn deleg_own_limits(&self, gen: u64, replica: &dyn Replica) -> constellation_meta::OwnLimits {
-        if !self.dl.mine.contains_key(&gen) {
-            return constellation_meta::OwnLimits {
-                committed: u64::MAX,
-                horizon: u64::MAX,
-            };
-        }
-        let committed = self.deleg_committed_capped(gen, replica);
-        constellation_meta::OwnLimits {
-            committed: if self.cfg.delegation_lone_hysteresis {
-                committed
-            } else {
-                u64::MAX
-            },
-            horizon: self.deleg_lone_horizon(committed),
-        }
     }
 
     /// The only thing that keeps a lone delegate's next own row from being
@@ -3317,9 +3261,8 @@ impl Core {
             current.insert(
                 d.gen,
                 constellation_meta::DelegDurable {
-                    class: self.deleg_row_commit(d.gen, rule),
+                    commit: self.deleg_row_commit(d.gen, rule),
                     through,
-                    horizon: self.deleg_lone_horizon(through),
                     lost: d.stopped || d.lapsed || d.backup_sealed,
                 },
             );
@@ -3340,6 +3283,33 @@ impl Core {
             }
         }
         self.dl.reported = current;
+    }
+
+    /// Plan 46 M1.1 step 4: the rule this core is about to stamp on its own
+    /// node's row of `gen` is the one the fast path stamps from now: publish
+    /// it before the row is journaled (the prefix and the lost flag as last
+    /// reported; `report_deleg_durable` refreshes them at the end of the
+    /// step). The core decides, then waits for the store's writer lock, and
+    /// the fast path's rows go in meanwhile: with the previous step's rule
+    /// still published, a row of the old rule (a gated one, say, where the
+    /// core just decided `Lone`) would land ahead of the core's row, which
+    /// the store no longer classes again. A fast-path row journaled after
+    /// this reads the new rule under the writer lock; one journaled before
+    /// it is in the journal the core's decision read.
+    fn deleg_publish_rule(
+        &mut self,
+        gen: u64,
+        commit: constellation_meta::RowCommit,
+        replica: &dyn Replica,
+    ) {
+        let Some(reported) = self.dl.reported.get_mut(&gen) else {
+            return;
+        };
+        if reported.commit == commit {
+            return;
+        }
+        reported.commit = commit;
+        replica.set_deleg_durable(gen, Some(*reported));
     }
 
     /// Plan 43 C2 (§3.4, D7): where row `(gen, idx)` of a delegate's stream
@@ -3443,19 +3413,24 @@ impl Core {
     /// records it.
     pub(crate) fn deleg_group_refresh(&mut self, replica: &dyn Replica) {
         for d in self.dl.mine.values_mut() {
-            // A read that failed is not "no record": the group known stays
-            // (plan 43 C2e review: an emptied group made the delegate lone).
-            let Ok(row) = replica.deleg_group(d.gen) else {
-                continue;
-            };
-            let (version, backups) = row.map_or((0, Vec::new()), |r| (r.version, r.backups));
-            if version != d.group_version || backups != d.group_backups {
-                d.group_version = version;
-                d.group_backups = backups;
-            }
-            if d.group_requested.as_ref() == Some(&d.group_backups) {
-                d.group_requested = None;
-            }
+            Self::deleg_group_refresh_one(d, replica);
+        }
+    }
+
+    /// [`Self::deleg_group_refresh`] for one generation.
+    fn deleg_group_refresh_one(d: &mut DelegateState, replica: &dyn Replica) {
+        // A read that failed is not "no record": the group known stays
+        // (plan 43 C2e review: an emptied group made the delegate lone).
+        let Ok(row) = replica.deleg_group(d.gen) else {
+            return;
+        };
+        let (version, backups) = row.map_or((0, Vec::new()), |r| (r.version, r.backups));
+        if version != d.group_version || backups != d.group_backups {
+            d.group_version = version;
+            d.group_backups = backups;
+        }
+        if d.group_requested.as_ref() == Some(&d.group_backups) {
+            d.group_requested = None;
         }
     }
 

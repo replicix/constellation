@@ -471,14 +471,15 @@ impl View {
             // overflow) goes through the core, to the root. Likewise a
             // generation the core has not published a class for yet.
             //
-            // Plan 43 C2d (§5.1): the row's class is decided when it is
-            // journaled, under the store's writer lock, from the class the
-            // core has published for the generation by then
-            // (`Meta::delegate_execute_admitted`), not now: `Lone` or
-            // `NonStealable` is answered at once, a class that waits
-            // (`DelegGroup`, `Archive`) once the group holds the row. The
-            // check here only sends a generation the core has not
-            // published yet through the core.
+            // Plan 43 C2d (§5.1), plan 46 M1.1 step 4: the row is stamped
+            // when it is journaled, under the store's writer lock, with the
+            // rule the core has published for the generation by then
+            // (`Meta::delegate_execute_admitted`), provided the
+            // configuration version it names is the store's: `Singleton` or
+            // `Final` is answered at once, a rule that waits (`Group`) once
+            // the group holds the row. The check here only sends a
+            // generation the core has not published yet through the core;
+            // a version that changed before the journal is refused there.
             if let (Some(deps), Some(_)) = (
                 session.deps().filter(|d| session.reaches(d)),
                 session.deleg_row_class(gen),
@@ -498,7 +499,7 @@ impl View {
                     now,
                     Box::new(move || delegates.honours(gen)),
                 );
-                let journaled_class = constellation_meta::take_last_journaled().map(|r| r.class);
+                let row = constellation_meta::take_last_journaled().map(|r| r.class);
                 // Journaled (or refused): the admission ends here, before
                 // the core can answer a recall with a `through` this op
                 // would be past.
@@ -552,13 +553,13 @@ impl View {
                         // (a delegate that turned lone meanwhile waits on:
                         // the row is `DelegGroup`, never answered as lone).
                         //
-                        // The class is the one the row was journaled with.
+                        // The rule is the row's own (its `RowCommit`).
                         // An op that journaled no row of its own (nothing
                         // changed) answers on the stream as it stands, by
-                        // the class published now; a generation withdrawn
+                        // the rule published now; a generation withdrawn
                         // meanwhile is in doubt.
-                        let class = journaled_class.or_else(|| session.deleg_row_class(gen));
-                        if class.is_none_or(|c| c.gated()) {
+                        let commit = row.or_else(|| session.deleg_row_class(gen));
+                        if commit.is_none_or(|c| c.gated()) {
                             match session.wait_deleg_durable(gen, idx, DURABLE_WAIT_BUDGET) {
                                 constellation_meta::DurableWait::Durable(waited) => {
                                     session.count_fast_ack(waited);
