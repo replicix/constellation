@@ -54,7 +54,7 @@
 //! by an operator's `delegate` after the epoch closed.
 
 use super::backup::{FreshHold, FreshVerdict};
-use super::{AckClass, Asker, Core, Timer};
+use super::{AckClass, Asker, CommitRule, Core, GroupOn, Timer};
 use crate::action::{Action, AnswerSource, ControlOk};
 use crate::event::PeerMsg;
 use crate::ids::{Epoch, HonourMs, NodeId, Now, OpId, TimerId, WaitMs};
@@ -2327,21 +2327,42 @@ impl Core {
     /// ([`Self::deleg_lone_held_by_gated`]); otherwise they wait for the
     /// root too, like every other node's.
     pub fn deleg_ack_class(&self, gen: u64, asker: Asker, replica: &dyn Replica) -> AckClass {
+        self.deleg_rule(gen, asker, replica).ack_class(gen)
+    }
+
+    /// Plan 46 M1.1 step 2: the commit rule of this node's delegate
+    /// generation `gen`, for an answer to `asker` ([`Self::deleg_ack_class`]
+    /// is its class). Under `ack=s3`, or once the generation ended here
+    /// (what is left of it is in the log), the group has no member and the
+    /// archive carries it; a designation is `Final`; a lone delegate's own
+    /// node's client is the singleton; otherwise the generation's group at
+    /// its applied `DelegGroup` version.
+    pub fn deleg_rule(&self, gen: u64, asker: Asker, replica: &dyn Replica) -> CommitRule {
+        let archive = CommitRule::Group {
+            version: 0,
+            members: 0,
+            on: GroupOn::Archive,
+        };
         if self.cfg.ack_s3 {
-            return AckClass::Archive;
+            return archive;
         }
         match self.dl.mine.get(&gen) {
-            Some(d) if d.designated => AckClass::NonStealable,
+            Some(d) if d.designated => CommitRule::Final,
             Some(d)
                 if asker == Asker::Own
                     && self.deleg_lone(d)
                     && !self.deleg_lone_held(d, replica) =>
             {
-                AckClass::Lone
+                CommitRule::Singleton {
+                    version: d.group_version,
+                }
             }
-            Some(_) => AckClass::DelegGroup { gen },
-            // The generation ended here: what is left of it is in the log.
-            None => AckClass::Archive,
+            Some(d) => CommitRule::Group {
+                version: d.group_version,
+                members: d.group_backups.len(),
+                on: GroupOn::Delegate,
+            },
+            None => archive,
         }
     }
 

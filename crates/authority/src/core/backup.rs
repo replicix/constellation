@@ -1116,6 +1116,70 @@ impl From<AckClass> for constellation_meta::RowClass {
     }
 }
 
+/// Plan 46 M1.1 step 2: what a [`CommitRule`]'s group waits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupOn {
+    /// No member listed: an applied, unfenced log segment (`ack=s3`, a
+    /// holder with no backup yet but one to be had, an ended generation).
+    Archive,
+    /// The root's holder and the backups its lease lists.
+    Root,
+    /// A delegate generation's recorded backups, or the root's appended
+    /// row when none is recorded.
+    Delegate,
+}
+
+/// Plan 46 M1.1 step 2: the commit rule of a sequencer's configuration
+/// (§5.1), looked up once ([`Core::rule_of`]); the five answer classes are
+/// maps from it ([`CommitRule::ack_class`]) until step 7 deletes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitRule {
+    /// Committed once every member of the configuration holds the row, or
+    /// the archive carries it when none is listed.
+    Group {
+        /// The configuration's version: the lease's `config_version`, or
+        /// the generation's `DelegGroup` version.
+        version: u64,
+        /// How many nodes besides the holder the rule waits for.
+        members: usize,
+        on: GroupOn,
+    },
+    /// A non-stealable configuration (a designation, an epoch hold): the
+    /// holder's disk has the row.
+    Final,
+    /// A sequencer no peer could back (the roster holds no peer within the
+    /// budget): answered from its own disk, to its own node's client.
+    Singleton {
+        /// The configuration's version, as for `Group`.
+        version: u64,
+    },
+}
+
+/// The sequencer a [`CommitRule`] is looked up for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleStream {
+    /// This node's root lease.
+    Root,
+    /// This node's delegate generation `gen`.
+    Delegate(u64),
+}
+
+impl CommitRule {
+    /// The answer class the rule maps to (`gen`: the generation of a
+    /// [`GroupOn::Delegate`] rule).
+    pub fn ack_class(&self, gen: u64) -> AckClass {
+        match self {
+            CommitRule::Final => AckClass::NonStealable,
+            CommitRule::Singleton { .. } => AckClass::Lone,
+            CommitRule::Group { on, .. } => match on {
+                GroupOn::Archive => AckClass::Archive,
+                GroupOn::Root => AckClass::RootGroup,
+                GroupOn::Delegate => AckClass::DelegGroup { gen },
+            },
+        }
+    }
+}
+
 /// Whether a holder's reply is a definitive answer (the outcome of the op,
 /// accepted or refused) as opposed to a redirect, a retry or a hold.
 pub(crate) fn is_answer(outcome: &MutateOutcome) -> bool {
@@ -1671,41 +1735,74 @@ impl Core {
             && self.durable_jseq() == u64::MAX
     }
 
-    /// Plan 43 C2 (§2.1): [`Self::root_ack_class`] for an answer to `asker`.
-    /// A lone root answers its own node's client as `Lone` and every other
-    /// node's forward from the archive (`Archive`): a remote is never
-    /// answered on the lone root's disk alone (§5.1's table, the `Remote`
-    /// column).
-    pub fn root_ack_class_for(&self, asker: Asker) -> AckClass {
-        match self.root_ack_class() {
-            AckClass::Lone if asker == Asker::Remote => AckClass::Archive,
-            class => class,
+    /// Plan 46 M1.1 step 2: the one lookup of the commit rule of `stream`'s
+    /// configuration, for an answer to `asker`: from the configuration (the
+    /// lease, or the generation's group), and for the singleton from the
+    /// event's own assessment ([`Self::root_lone`], [`Self::deleg_lone`]),
+    /// never from what an earlier row was given.
+    pub fn rule_of(&self, stream: RuleStream, asker: Asker, replica: &dyn Replica) -> CommitRule {
+        match stream {
+            RuleStream::Root => self.root_rule(asker),
+            RuleStream::Delegate(gen) => self.deleg_rule(gen, asker, replica),
         }
     }
 
-    /// Plan 43 §5.1: the class of an answer this node gives as the root
-    /// sequencer to its own node's client, by what the answer waits for: a
-    /// continuation epoch's hold is non-stealable; under `ack=s3` the
-    /// archive; with a listed (or doubted) backup the root group; while a
-    /// backup is being had (a candidate, an eligible or not yet assessed
-    /// peer) the archive; and otherwise nothing but this node's disk —
-    /// `Lone`. The same decision as [`Self::ack_need`] (`durable_jseq`),
-    /// named. Another node's answer: [`Self::root_ack_class_for`].
-    pub fn root_ack_class(&self) -> AckClass {
+    /// Plan 46 M1.1 step 2: the commit rule of this node's root
+    /// configuration, for an answer to `asker`, looked up once. A
+    /// continuation epoch's hold is `Final`; under `ack=s3` the group has no
+    /// member and the archive carries it; with a listed (or doubted) backup
+    /// the group is the root's; while a backup is being had (a candidate, an
+    /// eligible or not yet assessed peer) the archive; and otherwise nothing
+    /// but this node's disk: the singleton, to its own node's client. A
+    /// lone root answers another node's forward from the archive: a remote
+    /// is never answered on the lone root's disk alone (§5.1's table, the
+    /// `Remote` column).
+    pub fn root_rule(&self, asker: Asker) -> CommitRule {
+        let version = self
+            .lease
+            .held
+            .as_ref()
+            .map_or(0, |(l, _)| l.config_version);
+        let archive = CommitRule::Group {
+            version,
+            members: 0,
+            on: GroupOn::Archive,
+        };
         if self.lease.epoch_held() {
-            AckClass::NonStealable
+            CommitRule::Final
         } else if self.lease.ack_policy() == AckPolicy::S3 {
-            AckClass::Archive
+            archive
         } else if !self.lease.backups().is_empty() || self.doubted_backups().next().is_some() {
-            AckClass::RootGroup
+            CommitRule::Group {
+                version,
+                members: self.lease.backups().len() + self.doubted_backups().count(),
+                on: GroupOn::Root,
+            }
         } else if self.durable_jseq() != u64::MAX || !self.root_lone() {
             // (Plan 43 C2f review, D5: nothing gating but the node not lone —
-            // the lease released, lost, not held — is no `Lone` answer: a
+            // the lease released, lost, not held — is no singleton answer: a
             // fast-path row journaled now waits, and finds the gate off.)
-            AckClass::Archive
+            archive
+        } else if asker == Asker::Remote {
+            archive
         } else {
-            AckClass::Lone
+            CommitRule::Singleton { version }
         }
+    }
+
+    /// Plan 43 C2 (§2.1): [`Self::root_ack_class`] for an answer to `asker`
+    /// ([`Self::root_rule`] mapped to its class).
+    pub fn root_ack_class_for(&self, asker: Asker) -> AckClass {
+        self.root_rule(asker).ack_class(0)
+    }
+
+    /// Plan 43 §5.1: the class of an answer this node gives as the root
+    /// sequencer to its own node's client, by what the answer waits for
+    /// ([`Self::root_rule`]). The same decision as [`Self::ack_need`]
+    /// (`durable_jseq`), named. Another node's answer:
+    /// [`Self::root_ack_class_for`].
+    pub fn root_ack_class(&self) -> AckClass {
+        self.root_ack_class_for(Asker::Own)
     }
 
     /// Plan 43 C1-2: the class a journal row this node writes now is tagged

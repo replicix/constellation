@@ -66903,3 +66903,26 @@ runs on the quiet timing box (437 in the sixth); it now fences none and takes 13
 Gates (release, debuginfo off): fmt clean; clippy `-D warnings` on meta, engine and authority, all targets, clean;
 meta lib 399, engine lib 951, authority lib 1,045 passed; sim suite 403 passed, 0 failed, 12 ignored; `long_locks`
 × 300 seeds passed.
+
+## Plan 46 M1.1 step 2: one lookup of the commit rule per configuration (2026-11-05)
+
+A refactor; behaviour unchanged. `Core::rule_of(stream, asker, replica) -> CommitRule` is the one lookup of a sequencer's
+configuration: `Group { version, members, on }` (`on`: the archive when no member is listed, the root's group, a delegate
+generation's group), `Final` (a designation, an epoch hold) or `Singleton { version }`. The root's rule (`root_rule`) reads the
+lease (`config_version`, backups, `ack_policy`, the epoch hold) and the event's singleton test (`root_lone`, which keeps
+`backup_could_be_had`); a delegate generation's (`deleg_rule`) reads its applied `DelegGroup` version and recorded backups, its
+designation and `deleg_lone`. `root_ack_class`, `root_ack_class_for` and `deleg_ack_class` are thin maps (`CommitRule::ack_class`),
+kept until step 7. `members` is a count (no allocation on the per-op path); the root computes `durable_jseq` once where the old
+decision body computed it twice. Another node's answer from a singleton is the archive's rule (root) or the group's (delegate),
+as before. Tests: `the_roots_commit_rule_is_one_lookup_of_its_configuration`, `a_delegates_commit_rule_is_one_lookup_of_its_group`
+(the existing class tests are the behavioural guard).
+
+**Sweeps** (box 1, release, `+commit`, seeds 0..1,999, main / branch): `delegated-holder-cut`, `long-delegated`,
+`delegated-root-crash`, `delegated-epoch`, and without it `backup`, `long-backup`, `far`: the same failing sets (none; the
+`delegated-epoch` shadow-install set is the same 47 seeds) and identical oracle totals (i1 = 0, i2 = 0, i2c, i4, i5, class-mismatch
+identical per configuration). One counter moves by one answer (`archive` 23,181 to 23,180, `root-group` 35,504 to 35,505 in
+`delegated-holder-cut`) in some runs of both main and the branch under load (main alone, 1 of 8 runs at 16 threads); it is the sim's
+timing nondeterminism, not the refactor.
+
+**Gates** (box 1): fmt, clippy `-D warnings` (authority, all targets) clean; authority lib 1,047 passed; release sim suite 407
+passed, 0 failed, 12 ignored.

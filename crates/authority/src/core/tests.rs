@@ -14324,6 +14324,52 @@ mod backup_crash {
         }
     }
 
+    /// Plan 46 M1.1 step 2: the root's rule is one lookup of its
+    /// configuration (the lease's version and members; the singleton test
+    /// of the event), and the answer classes are its maps.
+    #[test]
+    fn the_roots_commit_rule_is_one_lookup_of_its_configuration() {
+        use super::super::{CommitRule, GroupOn, RuleStream};
+        let rule = |h: &Harness, asker| h.core.rule_of(RuleStream::Root, asker, &h.meta);
+        // A singleton: its own client's rule is the singleton, another node's
+        // the archive; both at the lease's version.
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1]);
+        h.hold(1, None);
+        h.core.ack.eligible = Some(h.core.backup_could_be_had());
+        let v = h.core.lease.held.as_ref().unwrap().0.config_version;
+        assert_eq!(rule(&h, Asker::Own), CommitRule::Singleton { version: v });
+        assert_eq!(
+            rule(&h, Asker::Remote),
+            CommitRule::Group {
+                version: v,
+                members: 0,
+                on: GroupOn::Archive
+            }
+        );
+        // A listed backup: the root group at the lease's version.
+        {
+            let lease = &mut h.core.lease.held.as_mut().unwrap().0;
+            lease.backups = vec![2];
+            lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        }
+        let v = h.core.lease.held.as_ref().unwrap().0.config_version;
+        for asker in [Asker::Own, Asker::Remote] {
+            assert_eq!(
+                rule(&h, asker),
+                CommitRule::Group {
+                    version: v,
+                    members: 1,
+                    on: GroupOn::Root
+                }
+            );
+            assert_eq!(
+                rule(&h, asker).ack_class(0),
+                h.core.root_ack_class_for(asker)
+            );
+        }
+    }
+
     /// I1 class 2 (backup+commit seed 578, long-backup 1942 under slow
     /// reads): a root resumed from a pause answered alone on the directory
     /// it held before it. Node 2 came up meanwhile; its link was in the
@@ -44117,6 +44163,42 @@ mod deleg_group {
                 } if *r == rid
             )),
             "{out:?}"
+        );
+    }
+
+    /// Plan 46 M1.1 step 2: a delegate generation's rule is one lookup of
+    /// its group: the singleton for its own node's client while lone, the
+    /// group at the applied `DelegGroup` version for every other asker and
+    /// once the root is near.
+    #[test]
+    fn a_delegates_commit_rule_is_one_lookup_of_its_group() {
+        use super::super::{CommitRule, GroupOn, RuleStream};
+        let (mut h, _dir, _, _) = delegate_renewed_once();
+        let version = h.core.dl.mine[&7].group_version;
+        let members = h.core.dl.mine[&7].group_backups.len();
+        let rule = |h: &Harness, asker| h.core.rule_of(RuleStream::Delegate(7), asker, &h.meta);
+        let group = CommitRule::Group {
+            version,
+            members,
+            on: GroupOn::Delegate,
+        };
+        assert_eq!(rule(&h, Asker::Own), CommitRule::Singleton { version });
+        assert_eq!(rule(&h, Asker::Remote), group);
+        root_is_near(&mut h);
+        assert_eq!(rule(&h, Asker::Own), group);
+        assert_eq!(
+            rule(&h, Asker::Own).ack_class(7),
+            AckClass::DelegGroup { gen: 7 }
+        );
+        // A generation this node does not hold: what is left is in the log.
+        assert_eq!(
+            h.core
+                .rule_of(RuleStream::Delegate(99), Asker::Own, &h.meta),
+            CommitRule::Group {
+                version: 0,
+                members: 0,
+                on: GroupOn::Archive
+            }
         );
     }
 
