@@ -1390,8 +1390,10 @@ Open, decided by measurement or later:
 - [ ] Status/metrics/schema (with per-view `unlinked_refs`), configuration
       and TESTING docs, proposed DESIGN text recorded (R7).
 - [x] Harness scenarios 3× green on both transports (P9, 2026-10-24; PROGRESS
-      "Plan 40 P9"). One intermittent `--cto strict` visibility failure under
-      load with plus on is open there.
+      "Plan 40 P9"). The one intermittent `--cto strict` visibility failure
+      under load with plus on is not reproduced on main bab70fe8: 40 runs
+      (`auto` and `always`, both transports, 3,000 rounds each, load 26 to 31),
+      none failed (PROGRESS "the strict visibility failure under load, rerun").
 - [ ] xcheckfs runs with zero findings from this plan (R8): **partial.** One
       hour, `auto`, one node: zero mismatches, zero differences by `xcheckfs
       verify` before and after (without the `stress-ng` step, a typo found

@@ -66249,3 +66249,20 @@ fmt, clippy `-p constellation-meta -p constellation-authority --all-targets -D w
 | `long-delegated-late-answers` 2,000..10,000, no knob | 2560 | none |
 | `backup-crash` 0..2,000, no knob / knob | none / none | none / none |
 | `delegated-root-crash` 0..2,000, no knob / knob | none / none | none / none |
+
+## Plan 40 P9: the strict visibility failure under load, rerun on main (2026-11-05)
+
+Question: is the intermittent `--cto strict` visibility failure of `readdirplus-strict` under load with plus on (P9,
+2026-10-24; the ship-ack race and the later strict close-to-open fixes landed since) still reproducible?
+
+Build: main at bab70fe8 (release). Host: a 16-core devbox shared with another job, kernel
+7.3.0-0.rc4.260925g165768bb7026.42.fc46, `fuse.enable_uring` `Y`, `stress-ng --cpu 24` beside the runs, load
+average 26 to 31 over the runs (the 20 to 40 band where the 2026-10-24 ring runs failed 4 in about 110 000 rounds).
+Scenario `readdirplus-strict` with `READDIRPLUS_STRICT_ROUNDS=3000` (the `ls -l` lister on A, a stat on the reader every
+other round), seeds 1 to 10, `CONSTELLATION_FUSE_READDIRPLUS` `auto` and `always`, `CONSTELLATION_FUSE_TRANSPORT`
+`dev-fuse` and `auto`: 40 runs, 120 000 rounds, 40 of 40 passed (rc 0), no stale read, no re-read recorded.
+
+Not reproduced. Caveat: the per-run logs were on the box's tmpfs and went with the box's stop, so the `auto` legs'
+transport census (ring negotiated or fallen back) was not kept; the host grants the ring, so they ran on it unless the
+ladder fell back. 120 000 rounds with 0 failures bounds the old rate (4 in 110 000) only loosely (about 0.01 chance of
+no failure at that rate, so it is evidence, not proof). The maintainer decides whether to tick the box.
