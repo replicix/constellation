@@ -1896,8 +1896,17 @@ impl Core {
                 },
             ))
             | None => self.root_ack_class(),
-            // (Exhaustive: every variant is read above.)
-            Some(_) => self.root_ack_class(),
+            // (The variants the guarded arms above cover: no wildcard, so a
+            // new one fails to compile here.)
+            Some((
+                _,
+                constellation_meta::RowCommit::Singleton { .. }
+                | constellation_meta::RowCommit::Final
+                | constellation_meta::RowCommit::Group {
+                    on: GroupOn::Archive,
+                    ..
+                },
+            )) => self.root_ack_class(),
         })
     }
 
@@ -1974,7 +1983,16 @@ impl Core {
                 },
             ))
             | None => self.root_ack_class_for(asker),
-            Some(_) => self.root_ack_class_for(asker),
+            // (The variants the guarded arms above cover: no wildcard.)
+            Some((
+                _,
+                constellation_meta::RowCommit::Singleton { .. }
+                | constellation_meta::RowCommit::Final
+                | constellation_meta::RowCommit::Group {
+                    on: GroupOn::Archive,
+                    ..
+                },
+            )) => self.root_ack_class_for(asker),
         })
     }
 

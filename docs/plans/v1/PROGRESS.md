@@ -66986,3 +66986,21 @@ and `fsync`) is within 0.2 % on ext4, xfs, btrfs. Topology 2 (backup; 4 runs per
 B / A p50 0.96 to 1.14, p90 0.93 to 1.25, with no direction. `vfs-bench` (dispatch overhead and allocations per op, three runs each, A B B A A B): overhead 97 / 98 ns
 (`mock/getattr`, A / B), 98 / 94 (`lookup`), 98 / 98 (`read`), 84 / 84 (`observer`), 97 / 94, 114 / 78, 96 / 97 (`view` getattr, lookup, read); allocations per op
 identical; the target (under 1 us) holds. The journal row grows by 2 bytes for a small version (tag, varint, `on`), 9 at most.
+
+### Plan 46 M1.1 step 3: fix round (2026-11-05)
+
+The oracle `row_version_matches_config` now judges a row's version by its `RowCommit` variant instead of "in any history": `Group{Delegate}`
+against the generation's group versions (0 up to the highest seen, contiguous because the root issues `latest + 1`), `Group{Root}` against the
+lease versions of the row's epoch or an earlier one, `Final` skipped, `Singleton` and `Group{Archive}` against the lease history for a root
+journal, the group history for a delegation stream on a node with no lease, either where a delegate is also the root. Version 0 is judged too:
+accepted for epoch 0 ("no configuration yet") and a delegate's archive row ("no group"); under a lease, a root-group or archive row of version 0 is
+a placeholder (a predecessor's adopted tail stamped `ROOT_GROUP`, a fast-path row journaled after `clear_holder_epoch` under the published
+`ARCHIVE`), counted and not judged until step 4. The first run of this stricter oracle failed 12 sim tests on exactly those rows with the knob
+off: an oracle mapping error, not a product bug. The negative control now stamps the group's version plus `RowCommit::PER_ROW_SKEW` (1000), a
+version in no history. `RowCommit::from_bits` panics on an unknown tag, `to_bits` asserts the version fits 60 bits (three unit tests), and two
+`Some(_)` arms in `backup.rs` are exhaustive.
+
+Gates (box 1): fmt, clippy `-D warnings` (meta, authority, engine, all targets), meta 398, authority lib 1,048, engine lib 951, release sim
+suite 409 passed, 0 failed. Sweeps `+commit`, seeds 0..299: knob on `long-delegated` 300 failing, `delegated-group-switch` 2 (seeds 51, 170);
+knob off `long-delegated`, `delegated-group-switch`, `delegated-holder-cut`, `delegated-root-crash`, `backup`, `long-backup`, `far` 0 failing,
+`delegated-epoch` 7 failing (all the known shadow-install finding); row-version mismatches 0 in all.

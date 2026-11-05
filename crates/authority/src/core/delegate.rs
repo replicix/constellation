@@ -2343,23 +2343,25 @@ impl Core {
     /// journals (or publishes for its fast path): its configuration's, in
     /// the version of the group in force. With `Config::per_row_class` (the
     /// negative control) a row journaled while the delegate assesses itself
-    /// lone carries a version of its own.
+    /// lone carries a wrong version (`RowCommit::PER_ROW_SKEW` past its group's).
     fn deleg_row_commit(&self, gen: u64, rule: CommitRule) -> constellation_meta::RowCommit {
         let commit = constellation_meta::RowCommit::from(rule);
+        // The negative control stamps a version close to the real one and
+        // in no history: the group's applied version plus a skew no run
+        // reaches.
+        let skewed =
+            |d: &DelegateState| d.group_version + constellation_meta::RowCommit::PER_ROW_SKEW;
         match (self.cfg.per_row_class, self.dl.mine.get(&gen), commit) {
             (true, Some(d), constellation_meta::RowCommit::Group { on, .. })
                 if self.deleg_lone(d) =>
             {
-                constellation_meta::RowCommit::group(
-                    constellation_meta::RowCommit::PER_ROW_STAMP,
-                    on,
-                )
+                constellation_meta::RowCommit::group(skewed(d), on)
             }
             (true, Some(d), constellation_meta::RowCommit::Singleton { .. })
                 if self.deleg_lone(d) =>
             {
                 constellation_meta::RowCommit::Singleton {
-                    config_version: constellation_meta::RowCommit::PER_ROW_STAMP,
+                    config_version: skewed(d),
                 }
             }
             _ => commit,

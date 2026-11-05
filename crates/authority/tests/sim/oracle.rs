@@ -1456,23 +1456,49 @@ fn deleg_group(
 
 /// Plan 46 M1.1 step 3: `row_version_matches_config`, the sim's form of the
 /// model property. A journal row carries the version of the configuration
-/// its rule was looked up in: a root row (a lease epoch) the `config_version`
-/// of a lease object that epoch carried, or an earlier epoch (a takeover
-/// re-journals its predecessor's committed tail under the predecessor's
-/// configuration; the oracle records every lease landing in the bucket), a
-/// delegate's row (a generation) a `DelegGroup`
-/// version some store knows. The version is the one the node's core had
-/// applied when it journaled, which may lag what the stores say (a landing
-/// the holder has not read yet, a published rule the fast path stamped): so
-/// the sim judges that the version *exists* in the configuration's history,
-/// not that it is the newest. A row stamped from anything else (the mutable
-/// "peer in budget" assessment: the `per_row_class` control) has none.
-/// A root row of version 0 is unstamped (a takeover's adopted tail, which
-/// the predecessor's configuration committed): counted, not judged.
+/// its rule was looked up in, and which configuration that is follows from
+/// the rule (`Core::root_rule`, `Core::deleg_rule`), so the oracle judges
+/// each row against the history of the namespace its rule is stamped from:
+///
+/// - `Group{on: Delegate}`: the generation's `DelegGroup` configuration
+///   (`DelegateState::group_version`). Its history is version 0 (no record
+///   applied) and every version a record brought, which the root issues one
+///   at a time (`latest + 1`), so exactly `0..=highest seen`.
+/// - `Group{on: Root}`: the root's lease configuration (`config_version`
+///   of the lease object): a version a lease of the row's epoch or an
+///   earlier one carried (a takeover re-journals its predecessor's tail
+///   under the predecessor's configuration; the oracle records every lease
+///   landing in the bucket). A row journaled while no lease is held
+///   (epoch 0) carries version 0, "no configuration yet"
+///   (`Core::root_config_version`). A root-group row of version 0 under a
+///   lease is a predecessor's tail a takeover re-journaled (stamped
+///   `ROOT_GROUP`, committed by the predecessor's group), like an archive
+///   row of version 0 journaled in the window after `clear_holder_epoch`:
+///   counted, not judged.
+/// - `Final` carries no version and is not judged.
+/// - `Group{on: Archive}` and `Singleton`: both namespaces stamp them (the
+///   root's rule: the lease's; a delegate's: its group's, and an archive
+///   row of a delegate that has no group — `ack=s3`, or the generation
+///   ended — is version 0, "no group"). A row of a delegation stream
+///   executed on a node that held no lease (epoch 0) is the delegate's: its
+///   group's history. A root-journal row (no stream) is the lease's. A
+///   stream row journaled under a lease (a delegate that is also the root,
+///   or the root's append) may be either: judged against both, a violation
+///   only when neither history holds it.
+///
+/// The version is the one the node's core had applied when it journaled,
+/// which may lag what the stores say (a landing the holder has not read
+/// yet, a published rule the fast path stamped): so the sim judges
+/// *membership* in the history, not that the version is the newest (step 4
+/// tightens that). A row stamped from anything else (the `per_row_class`
+/// control) is in neither.
 #[derive(Debug, Default)]
 pub struct RowVersions {
     /// Every `config_version` a lease object carried, per epoch.
     lease: BTreeMap<u64, BTreeSet<u64>>,
+    /// The highest `DelegGroup` version seen per generation (the history is
+    /// `0..=` it).
+    group_top: BTreeMap<u64, u64>,
     /// The highest journal seq judged per node.
     judged_to: BTreeMap<NodeId, u64>,
     pub checked: usize,
@@ -1503,40 +1529,66 @@ impl RowVersions {
         for row in rows.iter().filter(|r| r.first > from) {
             let (seq, epoch, gen, idx, class) = (row.first, row.epoch, row.gen, row.idx, row.class);
             self.judged_to.insert(node, seq);
+            if gen != 0 {
+                let top = self.group_top.entry(gen).or_default();
+                *top = (*top).max(group_max(gen));
+            }
             let Some(v) = class.config_version() else {
+                // `Final`: no configuration to carry.
+                self.unstamped += 1;
                 continue;
             };
-            if epoch != 0 && gen == 0 && v == 0 {
+            // Version-0 placeholders under a lease: a predecessor's committed
+            // tail a takeover re-journals is stamped `ROOT_GROUP`
+            // (`Meta::journal_records`' `adopted`, committed by the
+            // predecessor's group), and a fast-path row journaled in the
+            // window after `clear_holder_epoch` carries the `ARCHIVE` it
+            // published (in doubt, never answered). Counted, not judged; step 4
+            // replaces both by the configuration's own version.
+            if epoch != 0
+                && v == 0
+                && matches!(
+                    class,
+                    constellation_meta::RowCommit::Group {
+                        on: constellation_meta::GroupOn::Root
+                            | constellation_meta::GroupOn::Archive,
+                        ..
+                    }
+                )
+            {
                 self.unstamped += 1;
                 continue;
             }
             self.checked += 1;
-            let of_a_lease =
-                epoch != 0 && self.lease.range(..=epoch).any(|(_, vs)| vs.contains(&v));
-            if gen == 0 {
-                if !of_a_lease {
-                    self.violations.push(format!(
-                        "row_version_matches_config: node {node} journal seq {seq} (epoch {epoch}) \
-                         carries version {v}, which no lease of the epoch or an earlier one \
-                         carried ({:?})",
-                        self.lease.range(..=epoch).collect::<Vec<_>>()
-                    ));
-                }
+            let in_leases = if epoch == 0 {
+                // No lease held: "no configuration yet".
+                v == 0
             } else {
-                // A generation's row: its own node's execution (the
-                // delegation's group version) or the root's append of it (the
-                // lease's), the same journal holding both when a delegate is
-                // also a root.
-                let max = group_max(gen);
-                if !of_a_lease && v > max {
-                    self.violations.push(format!(
-                        "row_version_matches_config: node {node} journal seq {seq} (epoch {epoch}, \
-                         stream ({gen},{idx})) carries version {v}: no lease of the epoch or an \
-                         earlier one carried it ({:?}) and it is above the highest group version \
-                         any store holds for the generation ({max})",
-                        self.lease.range(..=epoch).collect::<Vec<_>>()
-                    ));
-                }
+                self.lease.range(..=epoch).any(|(_, vs)| vs.contains(&v))
+            };
+            let top = self.group_top.get(&gen).copied().unwrap_or(0);
+            let in_group = gen != 0 && v <= top;
+            let ok = match class {
+                constellation_meta::RowCommit::Group {
+                    on: constellation_meta::GroupOn::Delegate,
+                    ..
+                } => in_group,
+                constellation_meta::RowCommit::Group {
+                    on: constellation_meta::GroupOn::Root,
+                    ..
+                } => in_leases,
+                _ if gen == 0 => in_leases,
+                _ if epoch == 0 => in_group,
+                _ => in_leases || in_group,
+            };
+            if !ok {
+                self.violations.push(format!(
+                    "row_version_matches_config: node {node} journal seq {seq} (epoch {epoch}, \
+                     stream ({gen},{idx})) {class:?}: version {v} is in no history of its \
+                     namespace (leases up to the epoch {:?}; the generation's group versions \
+                     0..={top})",
+                    self.lease.range(..=epoch).collect::<Vec<_>>()
+                ));
             }
         }
     }
@@ -3196,13 +3248,13 @@ mod tests {
         assert!(j.detail.contains("no backup"), "{}", j.detail);
     }
 
-    /// Plan 46 M1.1 step 3: a row's version must exist in its configuration's
-    /// history: a lease version of its epoch, a `DelegGroup` version some
-    /// store holds. The `per_row_class` stamp and an unknown lease version
-    /// are violations; a root row of version 0 (an adopted tail) is
-    /// unstamped, not judged; a row is judged once.
+    /// Plan 46 M1.1 step 3: a row's version must be in the history of the
+    /// namespace its rule is stamped from: lease versions for a root row,
+    /// `DelegGroup` versions for a `Group{Delegate}` row, and the
+    /// other namespace's version is a violation. Version 0 is judged too,
+    /// but for an adopted tail.
     #[test]
-    fn row_versions_must_exist_in_the_configurations_history() {
+    fn row_versions_must_exist_in_their_namespaces_history() {
         use constellation_meta::{GroupOn, RowCommit};
         let mut rv = RowVersions::default();
         rv.lease_landed(3, 5);
@@ -3215,32 +3267,40 @@ mod tests {
             class,
         };
         let rows = vec![
+            // ok: leases of epoch 3.
             row(1, 3, 0, 0, RowCommit::group(5, GroupOn::Root)),
             row(2, 3, 0, 0, RowCommit::Singleton { config_version: 6 }),
+            // unstamped, not judged: an adopted tail (version 0, root group).
             row(3, 3, 0, 0, RowCommit::group(0, GroupOn::Root)),
+            // ok / ok (Final unjudged) / 6: a group version above the top.
             row(4, 0, 7, 1, RowCommit::group(2, GroupOn::Delegate)),
             row(5, 0, 7, 2, RowCommit::Final),
-            row(
-                6,
-                0,
-                7,
-                3,
-                RowCommit::Singleton {
-                    config_version: RowCommit::PER_ROW_STAMP,
-                },
-            ),
+            row(6, 0, 7, 3, RowCommit::group(3, GroupOn::Delegate)),
+            // 7: an unknown lease version.
             row(7, 3, 0, 0, RowCommit::group(9, GroupOn::Root)),
-            // An earlier epoch's configuration (an adopted tail): judged ok.
+            // ok: an earlier epoch's configuration (an adopted tail).
             row(8, 4, 0, 0, RowCommit::group(5, GroupOn::Root)),
+            // 9: a lease version stamped on a delegate-group row (the
+            // other namespace; no group has reached 5).
+            row(9, 0, 7, 4, RowCommit::group(5, GroupOn::Delegate)),
+            // ok: a delegate's archive row with no group (version 0).
+            row(10, 0, 7, 5, RowCommit::ARCHIVE),
+            // ok: no lease held, no configuration yet.
+            row(11, 0, 0, 0, RowCommit::LONE),
+            // 12: a delegate-group version on a root-group row.
+            row(12, 3, 0, 0, RowCommit::group(2, GroupOn::Root)),
         ];
         let group_max = |gen: u64| if gen == 7 { 2 } else { 0 };
         rv.judge(1, &rows, &group_max);
-        assert_eq!(rv.violations.len(), 2, "{:?}", rv.violations);
-        assert!(rv.violations[0].contains("seq 6"), "{:?}", rv.violations);
-        assert!(rv.violations[1].contains("seq 7"), "{:?}", rv.violations);
-        assert_eq!((rv.checked, rv.unstamped), (6, 1));
+        let seqs: Vec<_> = rv
+            .violations
+            .iter()
+            .map(|v| v.split("seq ").nth(1).unwrap().split(' ').next().unwrap())
+            .collect();
+        assert_eq!(seqs, ["6", "7", "9", "12"], "{:?}", rv.violations);
+        assert_eq!((rv.checked, rv.unstamped), (10, 2));
         rv.judge(1, &rows, &group_max);
-        assert_eq!(rv.violations.len(), 2, "judged once");
+        assert_eq!(rv.violations.len(), 4, "judged once");
     }
 
     /// An epoch hold's journal counts as the root's copy until plan 46 M1.4

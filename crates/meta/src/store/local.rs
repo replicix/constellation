@@ -182,9 +182,9 @@ impl RowCommit {
     pub const ROOT_GROUP: RowCommit = RowCommit::group(0, GroupOn::Root);
     pub const DELEG_GROUP: RowCommit = RowCommit::group(0, GroupOn::Delegate);
     pub const FINAL: RowCommit = RowCommit::Final;
-    /// The version the `per_row_class` negative control stamps (no
-    /// configuration has it: a CAS bumps a version by one).
-    pub const PER_ROW_STAMP: u64 = (1 << 60) - 1;
+    /// What the `per_row_class` negative control adds to a row's real
+    /// version: no configuration reaches it (a CAS bumps a version by one).
+    pub const PER_ROW_SKEW: u64 = 1_000;
 
     pub const fn group(config_version: u64, on: GroupOn) -> RowCommit {
         RowCommit::Group { config_version, on }
@@ -267,8 +267,13 @@ impl RowCommit {
     /// variant in the top bits, the version below. Versions are far below
     /// 2^60 (one CAS bumps one).
     pub(crate) fn to_bits(self) -> u64 {
-        let tag =
-            |t: u64, v: u64| (t << Self::VERSION_BITS) | (v & ((1 << Self::VERSION_BITS) - 1));
+        let tag = |t: u64, v: u64| {
+            assert!(
+                v < 1 << Self::VERSION_BITS,
+                "row version {v} exceeds 60 bits"
+            );
+            (t << Self::VERSION_BITS) | v
+        };
         match self {
             RowCommit::Singleton { config_version } => tag(0, config_version),
             RowCommit::Group {
@@ -290,11 +295,12 @@ impl RowCommit {
     pub(crate) fn from_bits(bits: u64) -> RowCommit {
         let v = bits & ((1 << Self::VERSION_BITS) - 1);
         match bits >> Self::VERSION_BITS {
+            0 => RowCommit::Singleton { config_version: v },
             1 => RowCommit::group(v, GroupOn::Archive),
             2 => RowCommit::group(v, GroupOn::Root),
             3 => RowCommit::group(v, GroupOn::Delegate),
             4 => RowCommit::Final,
-            _ => RowCommit::Singleton { config_version: v },
+            tag => panic!("unknown row commit tag {tag} in {bits:#x}"),
         }
     }
 }
@@ -2206,6 +2212,41 @@ mod tests {
     use constellation_fs_core::types::ROOT_INO;
 
     const GARBAGE: &[u8] = b"\xff\xff\xff\xff not a postcard row";
+
+    #[test]
+    fn row_commit_bits_round_trip() {
+        use crate::store::local::{GroupOn, RowCommit};
+        let max = (1u64 << 60) - 1;
+        for v in [0, 1, 7, max] {
+            for rc in [
+                RowCommit::Singleton { config_version: v },
+                RowCommit::group(v, GroupOn::Archive),
+                RowCommit::group(v, GroupOn::Root),
+                RowCommit::group(v, GroupOn::Delegate),
+            ] {
+                assert_eq!(RowCommit::from_bits(rc.to_bits()), rc);
+            }
+        }
+        assert_eq!(
+            RowCommit::from_bits(RowCommit::Final.to_bits()),
+            RowCommit::Final
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown row commit tag")]
+    fn row_commit_unknown_tag_panics() {
+        crate::store::local::RowCommit::from_bits(9 << 60);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds 60 bits")]
+    fn row_commit_version_too_big_panics() {
+        crate::store::local::RowCommit::Singleton {
+            config_version: 1 << 60,
+        }
+        .to_bits();
+    }
 
     fn create(meta: &Meta, n: u64) {
         execute(

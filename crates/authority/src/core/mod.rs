@@ -455,8 +455,8 @@ pub struct Config {
     pub delegation_lone_hysteresis: bool,
     /// Plan 46 M1.1 step 3's negative control, never set in production: a
     /// delegate stamps a row journaled while it assesses itself lone with
-    /// a version of its own (`RowCommit::PER_ROW_STAMP`) instead of its
-    /// configuration's — the journal-time class of the mutable "peer in
+    /// a version that is in no history (its group's plus
+    /// `RowCommit::PER_ROW_SKEW`) instead of its configuration's — the journal-time class of the mutable "peer in
     /// budget" assessment that rows no longer carry. The simulation's
     /// `row_version_matches_config` oracle must fail with it
     /// (`AUTHORITY_SIM_PER_ROW_CLASS=1`).
