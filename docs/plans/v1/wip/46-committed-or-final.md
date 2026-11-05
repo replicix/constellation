@@ -793,7 +793,7 @@ histories. Gates at the last commit: fmt and clippy `-D warnings` clean, authori
 
 | M | Scope | Deletions | Fail-before | Oracles / sims / scenarios / model | Exit |
 |---|---|---|---|---|---|
-| **M1.0 Model** (two-week timebox, D7) | `crates/model/src/delegation.rs`: the range dimension removed; a node holds a *set* of subtrees under one stream `(gen, idx)` with one group and one cut; `SubtreeReleased`/`StreamReleased` as stream rows; sticky grants (never ended by TTL; ended by the holder's record or `abandon`); the root's own sticky grants; the singleton and `first_peer_join`. Properties: `recall_safety`, `causal_cut`, `per_key_linearizable`, `exactly_once`, `designation_final` (re-proved), new `ack_implies_committed_by_config`, `released_subtree_sequenced_after_cut`, `sticky_ends_only_by_holder_or_operator`, `no_lone_answer_with_peer`, `two_subtrees_one_order` (a rename between a node's two subtrees needs no recall). `flex.rs`: the hold as {owner, one member}. | The model's `Range`, `split`, xgen knobs. | Knobs that re-introduce each deleted mechanism must violate: `lone_delegate` (a delegate answers without a group), `per_row_class`, `ttl_reclaims_sticky`. | Stateright exhaustive on the small topologies the model uses today; counterexamples checked in. | Properties proven, or at the timebox the fallback decided (one subtree per node) or C3 as written started first (D7). |
+| **M1.0 Model** (two-week timebox, D7: 2026-11-05 to 2026-11-19) | `crates/model/src/node_stream.rs`, a new untimed model (abstract TTL), built in chunks (§11, "M1.0 answers"); `delegation.rs` stays the timed model of placed grants (it never had the range dimension); a node holds a *set* of subtrees under one stream `(gen, idx)` with one group and one cut; `SubtreeReleased`/`StreamReleased` as stream rows; sticky grants (never ended by TTL; ended by the holder's record or `abandon`); the root's own sticky grants; the singleton and `first_peer_join`. Properties: `recall_safety`, `causal_cut`, `per_key_linearizable`, `exactly_once`, `designation_final` (re-proved), new `ack_implies_committed_by_config`, `released_subtree_sequenced_after_cut`, `sticky_ends_only_by_holder_or_operator`, `no_lone_answer_with_peer`, `two_subtrees_one_order` (a rename between a node's two subtrees needs no recall). `flex.rs`: the hold as {owner, one member}. | `crates/model/src/hotdir.rs` (the hash-range model), deleted with the splits in M1.2. | Knobs that re-introduce each deleted mechanism must violate: `lone_delegate` (a delegate answers without a group), `per_row_class`, `ttl_reclaims_sticky`. | Stateright exhaustive on the small topologies the model uses today; counterexamples checked in. | Properties proven, or at the timebox the fallback decided (one subtree per node) or C3 as written started first (D7). |
 | **M1.1 Classes at the configuration** | `RowCommit::{Group{config_version}, Final}` replaces `RowClass`/`AckClass`; one lookup of the configuration in force replaces `root_ack_class_for`, `deleg_ack_class`, the under-lock re-class, the published horizon-with-class and `journaled_class`; the fast path carries the version; the lease's and the stream's reconfiguration records commit under old ∪ new uniformly; `status.ack.classes` becomes `{group, final, singleton, archive_waits}`. The configuration lookup still has to answer "singleton or not": the singleton test is `backup_could_be_had` as of the event (landed with the i1-592 fix: a node with a roster peer linked within the budget, stable or measured yet or not, is never lone, and the cached assessment is raised by every event); M2.3 replaces it with the roster's. It is M1.1's singleton test, kept as such. | The five classes; `LoneLead` oracle; the lead as a commit input. | Sims whose seeds fail today under `+commit` on the class decided one step early (`delegated-holder-cut +commit` seeds 124, 228, 501, 763, 1849, 1900; the C2f far seeds): pass with the rule; a knob `AUTHORITY_SIM_PER_ROW_CLASS=1` re-enabling the old decision must fail. | I1 strict (`strict_commit`) on **every** delegated config; new oracle `row_version_matches_config` (every acknowledged row's version is the configuration in force at its position). | Zero I1 on every config ×2,000; `status` and docs updated. |
 | **M1.2 One stream per node, no lone delegate, C3 verbatim** | The records of §5.2; `DelegationTable` keyed by node with the folded subtree set; the ownership walk resolves to the node; recall becomes a request answered by `SubtreeReleased`; TTL end for placed grants writes `DelegateNodeEnded`; a node with no group and no sticky grant is forwarded, not delegated; C3 items 1–4 under one stream (verbatim root append, verbatim tail in one transaction, the delegate taking the root re-appends verbatim, the deposed root's member copy and predecessor seal); plan 45's key-move rule removed (one stream owns every link's parent or the op is cross-subtree). | `Delegate`, `Recall`, `RecallCut`, `DelegGroup`; `range`, `place_splits`, the histograms, `deleg_windows.rs`' per-range state, `delegate --range`, `CONSTELLATION_DELEGATION_SPLIT`; `deleg_caps`, `deleg_note_xdeps`, `deleg_covered`, `deleg_xgen_*`; `delegation_stream_rows` as a commit input (kept as the batch size); the lone↔group hysteresis; `deleg_lost_after_ack`; the fold, `MutateOp::Records`, holed generations, the deposed root's rebuild-replay, `Action::RebuildReplica`'s delegation branch; `Delegate.designated` (now `SubtreeGrant.kind`). | `delegated-two-gens-one-backed` (ADR-39's 40 of 200 seeds with the rule off) must pass with `deleg_caps` deleted, re-expressed as `delegated-two-dirs-one-backed` (one node, two subtrees, one stream); `placement-hot` ×2,000 including seed 593 (C3 item 4); `delegated-holder-cut` ×2,000; `long-delegated-late-answers-lr`'s 3 I2 copies. | New oracle `acked_at_or_below_cut` (every acknowledged row of a node generation is at or below its cut); I2c strict on every config; `member_copies_drained`; harness `placement-hot`, `delegate-backup-handoff-failover`, `delegated-group-switch`, new `two-subtrees-one-stream-rename` (a rename between a node's two subtrees under a root crash); `two-gens-ack-cost`, `hash-range-split-merge`, `shared-dir-split*` and bench config `b` retired. | Zero I1/I2/I2c/I5 on every config ×2,000; the harness catalogue green; the "Deleted" table complete. |
 | **M1.3 Sticky grants and sticky placement** | §5.3 and §5.4: `SubtreeGrant::Sticky`, placement's sticky proposal for far writers and for the root's own subtrees (never `/`), the long dwell, the handover request; `crates/engine/src/sticky.rs` (idle release, unmount, logind inhibitor, NetworkManager dispatcher, `constellation release`), `repair abandon --node`; the self-fence setting (off); `status.delegation.sticky` (holders, age, last release reason). **Carried from stage 0 (D-1, D-3):** S4 (`DelegCut{req,gen,through}`: the recall's cut is answered before its read recalls; spec in the settle spec) built here with the recall rework, the follow-up S1 (branch `rbe2`), and the cause-6 lease-path buckets A, C, O. | The automatic recall on 30 s windows; the lone root's `Lone` answers for a node with write-eligible peers (its own subtrees now hold grants; the rest waits for the archive). | Sim: `far` and `far-root-writes` (the root with distant peers writing its own subtree) under `strict_durability` with non-singleton rollbacks counted: today's lone rollbacks must be zero after; a knob `AUTHORITY_SIM_TTL_RECLAIMS_STICKY=1` must violate `sticky_ends_only_by_holder_or_operator`. | Model M1.0's properties; sims `sticky-idle-release`, `sticky-handover-ping-pong` (two nodes alternating writes in one subtree with gaps above the grace: the grant changes hands at most once per minimum tenure; a one-off write forwards without a handover), `sticky-holder-dies` (the subtree blocks; `abandon` ends it; the returned holder exports copies), `first-peer-join`; harness `sticky-release-on-unmount`, `sticky-handover-alternating` (the handover count and each writer's latency, measured), `sticky-release-cmd`, `sticky-suspend-inhibitor` (a fake logind on the test bus), `sticky-abandon`; `ack-latency` topology 5 (the far writer's own ops at local speed, final). | Zero non-singleton rollbacks on every config; the carried I4 ceilings (S4, the in-gate residual classes, buckets A, C, O) at zero or re-pinned with the reason; G1/G2 re-measured (the G1 p90 nudge decision re-taken on the new numbers, D9). |
@@ -937,6 +937,55 @@ All eight answered by the maintainer on 2026-11-01: each as recommended below.
 - **Q8 — The flex strict flags' owner.** M1.4 turns them on; if M1.0's
   timebox sends C3-as-written first, do they wait for stage 1 or go on
   with variant 3(i) alone? *Decided: wait.*
+
+### M1.0 answers (the maintainer, 2026-11-05)
+
+The M1.0 work breakdown's eight questions, each answered as recommended:
+
+- **Where the model lives.** `crates/model/src/node_stream.rs` (new,
+  untimed, abstract TTL; chunk 1 landed); `delegation.rs` stays for the
+  clock margins of placed grants; `hotdir.rs` is deleted with the splits
+  in M1.2. The M1.0 row above is corrected accordingly.
+- **ADR-41's lone-journal commit is removed.** The root's appended copy
+  counts as a delegate's second member only when the root's own
+  configuration committed it (its backups hold it, or the archive does);
+  a delegate whose root has no group waits for the archive (an S3 round
+  trip, recorded as a transient: a delegate within budget of the root
+  implies the root has a peer in budget, so the root should have a
+  backup). See the ADR draft note below.
+- **One commit rule per stream.** `Final` only when every grant of the
+  stream is non-stealable; a node with a group commits designated-subtree
+  rows by its group too; sticky and placed grants never mix in one stream.
+- **A grant is honoured once its `DelegateNode` record is committed** by
+  the root's configuration (the archive when the root has no group), for
+  placed grants too: the premise ADR-43's no-tail rule needs.
+- **Singleton → peer is a journaled configuration change**: the root
+  journals a lease `config_version` bump when the roster first shows a
+  write-eligible peer and answers nothing new alone until it commits;
+  rows before it keep the singleton rule.
+- **S4 in the model** is a one-bit read-recall step in the release path
+  (chunk C9); the read side stays the sim's.
+- **Pipelining.** M1.1 starts once chunks C1–C3 are green; C4–C11
+  continue; M1.2 and M1.3 wait for their gates.
+- **Timebox (D7):** 2026-11-05 to 2026-11-19.
+
+**ADR draft note (ADR-41 amended; the ADR itself lands with M1.3's code).**
+*Decision:* the `u64::MAX` branch of ADR-41 (a lone root's journal counts
+as committed for the group `{delegate, root}`) is deleted; the root reports
+`DelegateStreamAck.committed` only through rows its own configuration has
+committed, and with no backup that is the archive. *Reason:* a lone root
+can be taken over at the lease's expiry while paused; the claimant adopts
+the archive alone, so a row the delegate answered on the root's journal is
+lost when the delegate then fails. The model shows it as harm, not by
+definition: with the I1 oracle off, `node_stream`'s knob
+`root_journal_counts` violates `acked_never_lost` (root appends and
+reports, delegate answers, delegate crashes, node 2 claims the lease from
+the archive), and the same topology under the new rule is clean
+(`c2_knob_root_journal_counts_loses_an_acked_row`,
+`c2_design_t1_lone_root_crash_and_takeover`). *Cost:* such a delegate's
+answers wait for the archive until the root has a backup. The text is
+written into `DECISIONS.md` with M1.3's code, where the lone root's other
+`Lone` answers go too.
 
 ## 12. Exit criteria
 

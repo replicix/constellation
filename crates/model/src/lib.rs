@@ -113,9 +113,13 @@
 //! Plan 46 M1.0 (module [`node_stream`]) is the stage-1 structure: a
 //! delegation is a grant to a node covering a set of subtrees, one stream
 //! per node, and the commit rule a property of the stream's configuration
-//! (`ack_implies_committed_by_config`). It is built in chunks; chunk 1 is
-//! the skeleton (static grants, no faults) with planted-bug knobs
-//! (`lone_delegate`, `root_journal_counts`). `tests/node_stream.rs`.
+//! (`ack_implies_committed_by_config`). It is built in chunks: chunk 1 is
+//! the skeleton (static grants, no faults); chunk 2 adds a crash, a root
+//! deposition with the seal, retry by rid and completed-dedup
+//! (`acked_never_lost`, `exactly_once`); chunk 3 adds reconfiguration
+//! under old ∪ new (`row_version_matches_config`). Each has planted-bug
+//! knobs (`lone_delegate`, `root_journal_counts`, `no_dedup`,
+//! `per_row_class`, `ack_by_latest_config`). `tests/node_stream.rs`.
 //!
 //! # What is modeled
 //!
