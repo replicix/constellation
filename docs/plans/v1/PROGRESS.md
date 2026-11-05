@@ -66368,10 +66368,11 @@ origin `(g, i)`, with no `Delegate { g }` in the log, completing rids the log ha
 - **Test** (`generation_epochs.rs`): `a_claimant_without_a_tail_ships_none_of_its_rows_of_a_generation_the_log_never_listed`
   (fails on main: the row ships); asserts the rollback, the queued rid, the log's refusal as the rid's outcome after the
   strand, the stranded mark and the cut 0. Guard: `a_claimant_without_a_tail_keeps_its_rows_of_a_listed_generation`.
-- **Not done**: the shipper guard the review proposed as belt and braces (refuse a `Local` row with `gen != 0` of an unlisted
-  generation in `take_shippable`). A root's own appends of a delegate's rows are `Local { gen }` rows too, and a root that
+- **Shipper guard**: not as the review proposed (refuse a `Local` row with `gen != 0` of an unlisted
+  generation in `take_shippable`); a narrowed counting guard landed in the M0.4 follow-up (see the table at the end).
+  Why a refusal is wrong: a root's own appends of a delegate's rows are `Local { gen }` rows too, and a root that
   journals its own `Recall` of the generation unlists it before they ship: the guard would hold them at the head of the
-  journal for good. Nor the sim scenario (`delegated-backup` with a forced hand-over to the delegate after a seal
+  journal for good. Nor is there a sim scenario (`delegated-backup` with a forced hand-over to the delegate after a seal
   takeover); the sim has no knob that steers the second claim to the delegate.
 - **SHOULD-1 (confirmed, deferred: L2b)**: C2 §3.8 drops a delegate's gated row stranded by a recall pass, and ADR-43's
   orphan rule runs its strand as a recall: at an orphan cut of 0 an answered `DelegGroup` row (ADR-41's lone-root second
@@ -66386,3 +66387,39 @@ origin `(g, i)`, with no `Delegate { g }` in the log, completing rids the log ha
   unsettled-violation lines (0/0, 0/13, 0/24, 226/587, 0/7 per knob mode), and identical per-seed segment counts and bytes
   except `long-delegated-late-answers` seed 1217, which varies between runs of main itself. The rule never fires in them:
   the chain needs a seal takeover below a streamed grant followed by the grant's delegate claiming without a tail.
+
+## Plan 46 M0.4: what the whole-C2 review required, and what landed (2026-11-05)
+
+The review (fable, on main 39e85a17) and the MUST-1 review (Opus) asked for the items below. Landed means on this branch; the
+fixes of the first two rows are in the sections above.
+
+| Required | State |
+|---|---|
+| MUST-1: a tail-less claimant strands its rows of an unlisted generation | Landed (`Meta::strand_for_takeover_carrying`; the selection reads the table before and after the strand, so a speculative end the strand lists again keeps its verbatim rows; tests in `generation_epochs.rs`). |
+| SHOULD-1: the §3.8 drop at an orphan cut of 0 | Deferred to M1.2 (L2b pair); ADR-43's text states the drop; pin `an_orphan_end_queues_a_delegates_answered_gated_row` ignored. |
+| Shipper guard (MUST-1 belt and braces; Opus SHOULD) | Landed, narrowed and not a refusal: `Meta::check_shippable_origins` counts, and trips a debug assertion for, a head row whose origin index this node assigned under a generation the table does not list and that has no void cut. `status.ack.unjustified_ships`; the sim fails a run in which any node's counter is not 0 (`I2c unjustified_ships`); `the_shipper_counts_an_own_row_of_an_unlisted_generation_without_a_void_cut`. |
+| Core-level test of the gate wiring (Opus SHOULD) | Landed: `a_tail_less_gate_strands_the_delegate_s_rows_of_a_generation_the_log_never_granted` (`complete_gate` with no backup tail: the generation is stopped, the replay by rid meets `Refused { ABANDONED }` and forgets the entry). No sim scenario: no knob steers the second claim to the delegate. |
+| SHOULD-5: the member-copy read hold's cap is silent | Counted and warned (rate limited, 10 s): `status.ack.held_copy_lapsed`; the unit test `a_row_that_never_leaves_the_copy_stops_holding_after_the_cap` asserts the counter rises when the cap lapses. Not done: failing `member_copies_drained` on `backup-crash-slow` 840's shape, and triaging why the successor's tail does not carry that tenure's `RootGroup` refusals (`TailOf` retirement, `member.rs`); open. |
+| SHOULD-6: documents | Landed: ADR-33's status line (C2g' and C2h's scenarios landed, the strict flags per configuration, D9), DESIGN §4's `Local` bullet (ADR-41's lone-root journal as a second copy, rolled back by a TTL claim of a live root; removed in plan 46 M1.3), plan 46 §6's ratchet counts (18 strict, 14 ceilings), plan 43 §4 I4 as built (the classifier's four verdicts, `sim/reach.rs`). ADR-43's wording the review names ("its rows roll back and replay by rid", "the stall and the N4 wait remain") was corrected with the MUST-1 fix. |
+| `cargo fmt --all` | Landed (`crates/harness/src/scenarios/m14.rs`). |
+
+**Open, not landed**
+
+- **SHOULD-4 (classifier gaps)**, `crates/authority/tests/sim/reach.rs`: (a) `gen_members` (line ~757) is the union of every view
+  ever published up to `at`, so a stale member that is dead makes `tail_reachable` false and the row "generation tail
+  unreachable" though the current group answers; the fix is the members of the latest `DelegGroup` version in the view at
+  `at`. (b) The tenure group's tail is checked at the two instants `done - 1` and `start` (`reach.rs` near line 1125); a member
+  reachable in between is ignored; the fix is to test reachability over the stretch. Both change verdict counts of the
+  ratchet's configurations (the ceilings are set from sweeps), so each needs a re-sweep and re-set ceilings; not small, not
+  done.
+- **SHOULD-2 and SHOULD-3 (classifier soundness)**: not in this round. The review carries SHOULD-2 to stage 1 if that slips past
+  a quarter (`Owner::Blocked` goes with one stream per node); SHOULD-3's fix (an own unexpired lease is acquirable at once) is
+  open.
+- **Stage 1**: ADR-41's lone-journal commit and ADR-43's no-tail proof against sticky grants (M1.0's model before M1.3), L2b and
+  the §3.8 drop (M1.2), the in-gate class (M1.3 with S4).
+
+**Gates** (release sim, debuginfo off): `cargo fmt --all --check` clean for the whole workspace; clippy `-D warnings` on meta,
+authority, engine, harness and control, all targets, clean; meta all targets pass; authority lib 1,033 passed; engine lib 949
+passed; control schema blessed (two new `status.ack` fields); the release sim suite 394 passed, 0 failed, 12 ignored. 1,000-seed
+sweeps (seeds 0 to 999), without and with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, of `long-delegated-late-answers` and
+`delegated-root-gone`: 0 failing seeds in all four, so `unjustified_ships` stayed 0.
