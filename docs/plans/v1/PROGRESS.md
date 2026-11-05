@@ -66578,3 +66578,42 @@ as amended by D-1, C7a, C7b without item 8, the documents, the reviews); C3, C4,
 stage 2, C6 superseded, C7b-8 in M3.2); the C0 and C2 four-file-system baselines and `bench/commit-rule/RESULTS.md`'s pending rows fold into plan 46's
 G1–G6 re-measure; §11.2's open findings moved to plan 46 M3.2. Links to the plan (the README, plan 46, DECISIONS, the earlier PROGRESS sections, the
 harness's `commit.rs` comment) point at `done/`.
+
+## Classifier: the lease path's two gaps closed (2026-11-05)
+
+The two classifier gaps of the lease-path arm that plan 46 carried to M1.3 (the hang notes above,
+`delegated-backup-and-delegate-die` seeds 214, 1004 and 435), closed in the sim's I4 classifier (`tests/sim/reach.rs`); no
+product change.
+
+- **A claimant that becomes the root ends generations as a root does.** The lease-path arm judged only the claim; the claimant
+  is the root once its claim is done, inherits the generations its predecessors left live (`delegation_sync`, delegate.rs:
+  "inherited a delegation from a predecessor root") and ends each only with its tail ("the generation is not ended without its
+  tail"). A lease-path run now counts only if, from the claim's end to the run's end, the claimant reaches a holder of the tail
+  of every generation it has to end for the op (`claimant_reaches_tails`, the condition the root arm puts on a root, `tail`);
+  else "generation tail unreachable". Seeds 214 and 1004: node 1 claims at the window's start, inherits generation 1:1 whose
+  delegate (2) and backup (3) are dead from 2.3 s, and waits for its tail to the end of the run.
+- **The claimant is a source of its own claim only with a tail in place.** The claim asks itself in place and hands the tail
+  over only if it holds rows of an asked epoch in its journal (holding the lease, or neither holding nor deposed), a backup role
+  of it or a member copy of it (`begin_tail_fetch`, `seal_tail_hold`, seal_tail.rs); one that holds nothing waits for another
+  member. The classifier counted the requester as a member that always holds. The sim nodes now publish the epochs whose tail
+  they hold in place (`Reach::note_tails`, from the core's lease state and the replica's journal, role and member copies), the
+  lease bodies carry their epoch and the inherited tail's, and the claim's group arm counts the requester only while it holds an
+  asked epoch (unknown, as in the unit tests that set no epochs: as before). Seed 435: node 1, the deposed holder of epoch 1,
+  had shipped every row of it (its deposition rolled back 0, no member copy), so the claim of epoch 2's lease (Local, the
+  inherited epoch-1 tail named 1 and 2) waits for node 2, dead from 2.3 s; "no sequencer in time".
+
+`SWEEP-UNSETTLED-ALL` (with `AUTHORITY_SIM_UNSETTLED_ALL`) prints every unsettled `EIO`'s verdict, to compare classifiers EIO
+by EIO. Pins: `a_claimant_root_needs_a_holder_of_the_generations_tail` and
+`a_claimant_member_holds_the_tail_only_with_a_copy_in_place` (each with near cases that stay reachable: a member up, a member
+reached after the claim, a generation without a group; a copy of an asked epoch, nothing published); both fail without the fix.
+
+**Measured** (buckets isolated / none in time / generation tail unreachable / violations). `delegated-backup-and-delegate-die`,
+2,000 seeds: none 0/0/467/30 before, 0/7/478/12 after (18 moved); slow 0/0/662/3 before, 0/0/663/2 after (1 moved). Every
+moved `EIO` was a lease-path one (none left); the 14 violations left are the in-gate residual (itself, takeover gate, seed 494's
+shape). The 32 ratchet configurations, 300 seeds without the knob: only `delegated-backup-and-delegate-die` (4 violations to 0:
+seeds 110 and 214 to generation tail unreachable, 239 twice to none in time) and `-abandon` (1 to 0: seed 239, the claimant
+root's generations abandoned by the operator only at 26.1 s, after the `EIO` at 21.8 s) moved; every other count is equal. No
+`EIO` moved in seeds 0..99: the ceilings stand. Sweep times equal (105 s and 104 s for the 32).
+
+**Gates**: fmt, clippy `-D warnings` (authority, all targets) clean; authority lib 1,039 passed; the release sim suite 402 passed,
+0 failed, 12 ignored.

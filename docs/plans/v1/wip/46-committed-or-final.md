@@ -783,7 +783,7 @@ stage 1:** SHOULD-1 (the §3.8 drop of an answered gated row at an orphan cut of
 gate, a rid that took effect, an unreachable delegate, a refusal not shipped by the window's end) to **M1.3** with S4, where the on-demand recall becomes
 a request the holder answers with `SubtreeReleased`; ADR-41's lone-journal commit and ADR-43's no-tail proof against sticky grants to the **M1.0**
 model, before M1.3; two classifier gaps in the lease-path arm (the generation-tail condition the root arm applies; the requester counted as a member holding
-the tail, seed 435) and the unmet `member_copies_drained` on `backup-crash-slow` 840's shape (`TailOf` retirement) to **M1.3**; `long-backup` with the knob,
+the tail, seed 435; both closed 2026-11-05, PROGRESS "Classifier: the lease path's two gaps closed") and the unmet `member_copies_drained` on `backup-crash-slow` 840's shape (`TailOf` retirement) to **M1.3**; `long-backup` with the knob,
 seed 728 (`member_copies_drained`), untriaged, to **M1.3**. **Side findings fixed:** the stateright linearizability search was exponential in overlap
 (seed 1498 of `far`, `backup`, `backup-two` ran past 20 minutes); it is the Wing and Gong search with Lowe's memoization now, cross-checked on 10,698
 histories. Gates at the last commit: fmt and clippy `-D warnings` clean, authority lib 1,039 passed, the release sim suite 400 passed, 0 failed, 12 ignored.

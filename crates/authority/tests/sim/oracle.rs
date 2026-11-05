@@ -305,6 +305,8 @@ impl Oracles {
                         .as_ref()
                         .map(|t| t.members.clone())
                         .unwrap_or_default(),
+                    new.epoch,
+                    new.inherited_tail.as_ref().map_or(0, |t| t.epoch),
                 );
                 leases.landed(node, prev, new)
             }));

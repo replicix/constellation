@@ -63,8 +63,13 @@
 //! handled after the TTL; that read's own transit, from the history, is part
 //! of the claim), asks its peers for the promise check, writes the CAS, and,
 //! for a lease with a group, fetches the group's tail from a running member it
-//! can reach at any time up to the window's end. If that claim cannot finish inside the window
+//! can reach at any time up to the window's end (itself only while it holds a
+//! tail of an epoch the claim asks for in place: rows of it in its journal, a
+//! backup role of it, a member copy of it). If that claim cannot finish inside the window
 //! by design and no root is in force, the requester had no sequencer *in time*.
+//! Once the claim is done the claimant is the root, and ends the generations
+//! it has to end for the op as any root does: only with a holder of each one's
+//! tail it reaches (else `generation_tail_unreachable`).
 //!
 //! The allowed verdicts, each counted apart (`Report::unsettled_*`):
 //!
@@ -109,6 +114,10 @@ pub struct LeaseSpan {
     /// The members of the tail this tenure inherited and has not yet
     /// shipped (`Lease::inherited_tail`): a claimant fetches it from them too.
     pub inherited: Vec<NodeId>,
+    /// The body's epoch and that of the tail it inherited (0: not known, as
+    /// in the unit tests: every member is then taken to hold the tail).
+    pub epoch: u64,
+    pub inherited_epoch: u64,
 }
 
 /// What a node's core holds: the S3 lease, a continuation epoch, nothing.
@@ -298,6 +307,9 @@ struct Inner {
     leases: Vec<LeaseSpan>,
     /// What each node's core said it was, step by step (`note_view`).
     views: std::collections::BTreeMap<NodeId, Vec<View>>,
+    /// `(at, epochs)` per node, when they changed: the epochs whose tail the
+    /// node could hand a claimant in place (`note_tails`).
+    tails: std::collections::BTreeMap<NodeId, Vec<(u64, Vec<u64>)>>,
     /// Round-trip floors (ms) of P2P and S3, the lease TTL, how long past
     /// its end a lease with backups is not a non-backup's to claim, and how
     /// much longer than a plain S3 request a lease read takes.
@@ -474,17 +486,54 @@ impl Reach {
         self.inner.lock().unwrap().s3.push((at, node, cut));
     }
 
-    /// A lease body landed in the bucket.
+    /// A lease body of `epoch` landed in the bucket (`inherited_epoch`: the
+    /// epoch of the tail it inherited, 0 for none).
+    #[allow(clippy::too_many_arguments)]
     pub fn lease_landed(
         &self,
         holder: NodeId,
         released: bool,
         backups: Vec<NodeId>,
         inherited: Vec<NodeId>,
+        epoch: u64,
+        inherited_epoch: u64,
     ) {
         let at = self.now_ms();
-        let ttl = self.inner.lock().unwrap().lease_ttl_ms;
-        self.lease_landed_full(at, holder, at + ttl, released, backups, inherited);
+        let ends_ms = at + self.inner.lock().unwrap().lease_ttl_ms;
+        self.lease_landed_span(LeaseSpan {
+            at_ms: at,
+            holder,
+            ends_ms,
+            released,
+            backups,
+            inherited,
+            epoch,
+            inherited_epoch,
+        });
+    }
+
+    /// The highest epoch of a lease body that landed.
+    pub fn max_epoch(&self) -> u64 {
+        let g = self.inner.lock().unwrap();
+        g.leases.iter().map(|l| l.epoch).max().unwrap_or(0)
+    }
+
+    /// `node`'s core could hand a claimant the tail of each of `epochs` in
+    /// place now (`Core::seal_tail_hold`: rows it executed under the epoch
+    /// and holds in its journal, a backup role of it, a member copy of it);
+    /// kept when it changed.
+    pub fn note_tails(&self, node: NodeId, epochs: Vec<u64>) {
+        self.note_tails_at(self.now_ms(), node, epochs);
+    }
+
+    pub fn note_tails_at(&self, at: u64, node: NodeId, epochs: Vec<u64>) {
+        let mut g = self.inner.lock().unwrap();
+        let since = attach_since(&g, at, node);
+        let v = g.tails.entry(node).or_default();
+        if v.last().is_some_and(|(t, e)| *t >= since && *e == epochs) {
+            return;
+        }
+        v.push((at, epochs));
     }
 
     pub fn lease_landed_at(&self, at: u64, holder: NodeId, ends: u64, released: bool) {
@@ -511,14 +560,20 @@ impl Reach {
         backups: Vec<NodeId>,
         inherited: Vec<NodeId>,
     ) {
-        self.inner.lock().unwrap().leases.push(LeaseSpan {
+        self.lease_landed_span(LeaseSpan {
             at_ms: at,
             holder,
             ends_ms: ends,
             released,
             backups,
             inherited,
+            epoch: 0,
+            inherited_epoch: 0,
         });
+    }
+
+    pub fn lease_landed_span(&self, span: LeaseSpan) {
+        self.inner.lock().unwrap().leases.push(span);
     }
 
     /// `node`'s core published its authority after a step (kept when it
@@ -895,6 +950,83 @@ fn tail_reachable(g: &Inner, at: u64, r: NodeId, node: NodeId, gen: u64) -> bool
             .any(|h| running(g, at, h) && peer_up(g, at, r, h))
 }
 
+/// The generations the root has to end before it executes `q`'s op at `at`
+/// (each needs a holder of its tail the root reaches, [`root_path`]): the
+/// one whose grant does not live, or every one of keys across generations.
+/// None when the keys are the root's, or a live delegate's.
+fn gens_to_end(g: &Inner, q: &Question, at: u64) -> Vec<(NodeId, u64)> {
+    match q.owner_at(at).1 {
+        Owner::Root => Vec::new(),
+        Owner::Delegate { node, gen } if delegate_in_force(g, at, node, gen) => Vec::new(),
+        Owner::Delegate { node, gen } => vec![(node, gen)],
+        Owner::Blocked(gens) => gens,
+    }
+}
+
+/// Whether the requester, once its claim of the lease is done at `done` and
+/// it is the root, reaches a holder of the tail of every generation it has to
+/// end for `q`'s op, at some instant up to `to`: the condition [`root_path`]
+/// puts on a root in force (`tail`). The claimant inherits the generations
+/// its predecessors left live (`Core::delegation_sync`, delegate.rs: "inherited
+/// a delegation from a predecessor root") and ends each only with its tail:
+/// a recorded backup it cannot reach for the seal leaves the generation
+/// unended (`deleg_seal_backup`, delegate.rs: "the generation is not ended
+/// without its tail"). Plan 46 M0.3 (hang item 1, seeds 214 and 1004 of
+/// `delegated-backup-and-delegate-die`: the claimant became the root, then
+/// waited for a dead group's tail as the roots of the allowed `EIO`s do).
+fn claimant_reaches_tails(g: &Inner, q: &Question, done: u64, to: u64) -> Result<(), String> {
+    let me = q.requester;
+    let mut points = vec![done];
+    points.extend(change_marks(g, done, to));
+    points.extend(
+        q.owners
+            .iter()
+            .map(|(t, _)| *t)
+            .filter(|t| *t > done && *t <= to),
+    );
+    points.sort_unstable();
+    points.dedup();
+    let mut why: Option<String> = None;
+    for t in points {
+        let gens = gens_to_end(g, q, t);
+        match gens
+            .iter()
+            .find(|(node, gen)| !tail_reachable(g, t, me, *node, *gen))
+        {
+            None => return Ok(()),
+            Some((node, gen)) => {
+                why.get_or_insert_with(|| {
+                    format!(
+                        "the claimant {me}, the root once its claim is done at {done} ms, reaches no holder of \
+                         generation {gen}'s tail (delegate {node}, members {:?}) up to {to} ms",
+                        gen_members(g, t, *node, *gen)
+                    )
+                });
+            }
+        }
+    }
+    Err(why.unwrap_or_default())
+}
+
+/// Whether `n` could hand a claimant the tail of one of `epochs` in place at
+/// `at`, as its core last published it since it was last attached
+/// ([`Reach::note_tails`]); `None` when that is not known (no epoch known, or
+/// nothing published, as in the unit tests that set no epochs).
+fn holds_tail_of(g: &Inner, at: u64, n: NodeId, epochs: &[u64]) -> Option<bool> {
+    if epochs.is_empty() {
+        return None;
+    }
+    let since = attach_since(g, at, n);
+    let (_, held) = g
+        .tails
+        .get(&n)?
+        .iter()
+        .rev()
+        .find(|(t, _)| *t <= at)
+        .filter(|(t, _)| *t >= since)?;
+    Some(held.iter().any(|e| epochs.contains(e)))
+}
+
 /// The sequencer `q`'s requester could reach in the segment starting at
 /// `at` (every state is constant until the next recorded change).
 fn reach_at(g: &Inner, q: &Question, at: u64) -> Seg {
@@ -1256,10 +1388,35 @@ fn claim_done(
             // (The tail a tenure inherited was the previous tenure's.)
             since = tenure_start(g, since.saturating_sub(1));
         }
+        // The epochs whose tail the claim asks for (`LeaseState::classify`,
+        // lease.rs, `Plan::FetchTail`: the lease's own, and the inherited
+        // tail's), over the tenure's bodies.
+        let mut asked: Vec<u64> = g
+            .leases
+            .iter()
+            .filter(|b| b.at_ms <= l.at_ms && tenure_start(g, b.at_ms) == tenure_start(g, l.at_ms))
+            .flat_map(|b| [b.epoch, b.inherited_epoch])
+            .filter(|e| *e != 0)
+            .collect();
+        asked.sort_unstable();
+        asked.dedup();
+        // The claimant is a source of its own claim, asked in place: it hands
+        // the tail over only if it holds rows of an asked epoch, a role or a
+        // member copy of it (`begin_tail_fetch`, seal_tail.rs: "This node's
+        // own copy ... asked in place", `seal_tail_hold`); one that holds
+        // nothing waits for another member like everyone (plan 46 M0.3, hang
+        // item 1, `delegated-backup-and-delegate-die` seed 435: the deposed
+        // holder of the inherited epoch had shipped every row of it). Its own
+        // lease is its own (as before).
+        let me_holds = |at: u64| l.holder == me || holds_tail_of(g, at, me, &asked).unwrap_or(true);
         let reachable = |at: u64| {
             members.iter().any(|m| {
                 !went_down_between(g, *m, since, at)
-                    && (*m == me || (running(g, at, *m) && peer_up(g, at, me, *m)))
+                    && if *m == me {
+                        me_holds(at)
+                    } else {
+                        running(g, at, *m) && peer_up(g, at, me, *m)
+                    }
             })
         };
         if !members.is_empty() {
@@ -1293,11 +1450,16 @@ fn claim_done(
             match fetched {
                 Some(d) if d <= until => return Ok(d),
                 _ => {
+                    let own = if members.contains(&me) && !me_holds(until) {
+                        format!(" (the claimant itself holds no tail of epochs {asked:?})")
+                    } else {
+                        String::new()
+                    };
                     return Err(format!(
                         "no member of the tenure's group {members:?} had been running since the tenure began and \
                          was reachable for its tail between the claim's start ({start} ms) and the window's end \
-                         ({until} ms)"
-                    ))
+                         ({until} ms){own}"
+                    ));
                 }
             }
         }
@@ -1405,7 +1567,13 @@ fn classify(g: &Inner, q: Question) -> Verdict {
             Via::Itself => (to, Some(q.requester)),
             Via::Root(n) | Via::Delegate(n) => (to, Some(n)),
             Via::LeasePath => match claim_done(g, q.requester, from, q.from_ms, to) {
-                Ok(done) => (done, None),
+                Ok(done) => match claimant_reaches_tails(g, &q, done, to) {
+                    Ok(()) => (done, None),
+                    Err(why) => {
+                        tail_blocked.get_or_insert(why);
+                        continue;
+                    }
+                },
                 Err(why) => {
                     claim_blocked.get_or_insert(why);
                     continue;
@@ -3141,6 +3309,148 @@ mod tests {
         r.attached_at(3_000, 1, false);
         r.partition_at(3_000, 3, 2, true);
         r.partition_at(6_990, 3, 2, false);
+        assert!(r.classify(q(3)).no_sequencer_in_time());
+    }
+
+    /// Plan 46 M0.3, hang item 1 (`delegated-backup-and-delegate-die` seeds
+    /// 214 and 1004): a requester whose only way is the lease path becomes the
+    /// root by its claim, and ends the op's generation, as any root, only with
+    /// a holder of its tail it reaches.
+    #[test]
+    fn a_claimant_root_needs_a_holder_of_the_generations_tail() {
+        // Node 1, the root, is down from 500 (its lease ran out at 1 000);
+        // generation 7 (delegate 2, member 4) ran out at 1 000 and is due at
+        // 1 310; delegate and member are down from 1 100. Node 3 claims (done
+        // at 5 180) and reaches no holder of the tail.
+        let world = || {
+            let r = world();
+            r.attached_at(0, 4, true);
+            r.note_view_at(500, 2, Held::No, vec![(7, 1_000)], vec![(7, 4)], 0);
+            r.attached_at(500, 1, false);
+            r.attached_at(1_100, 2, false);
+            r
+        };
+        let r = world();
+        r.attached_at(1_100, 4, false);
+        let v = r.classify(q(3).delegated(2, 7));
+        let Verdict::GenerationTailUnreachable { why } = v else {
+            panic!("{v:?}")
+        };
+        assert!(
+            why.contains("claimant 3") && why.contains("generation 7"),
+            "{why}"
+        );
+        // The member is up and reachable: the claimant ends the generation.
+        let r = world();
+        let v = r.classify(q(3).delegated(2, 7));
+        assert!(
+            matches!(
+                v,
+                Verdict::Reachable {
+                    via: Via::LeasePath,
+                    to_ms: 5_180,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+        // Cut from the claimant until 6 000, after the claim is done: reached
+        // inside the window, so the claimant ends it.
+        let r = world();
+        r.partition_at(1_000, 3, 4, true);
+        r.partition_at(6_000, 3, 4, false);
+        assert!(
+            matches!(
+                r.classify(q(3).delegated(2, 7)),
+                Verdict::Reachable {
+                    via: Via::LeasePath,
+                    ..
+                }
+            ),
+            "the tail was reachable from the claimant once root"
+        );
+        // Cut for the whole window: unreachable.
+        let r = world();
+        r.partition_at(1_000, 3, 4, true);
+        assert!(r
+            .classify(q(3).delegated(2, 7))
+            .generation_tail_unreachable());
+        // A generation without a group has no tail elsewhere: nothing is
+        // missing, the lease path counts.
+        let r = Reach::default();
+        r.configure(cfg(0, 0));
+        for n in 1..=3 {
+            r.attached_at(0, n, true);
+        }
+        r.lease_landed_at(0, 1, 1_000, false);
+        r.note_view_at(0, 1, Held::Lease, vec![], vec![], 0);
+        r.note_view_at(500, 2, Held::No, vec![(7, 1_000)], vec![], 0);
+        r.attached_at(500, 1, false);
+        r.attached_at(1_100, 2, false);
+        assert!(matches!(
+            r.classify(q(3).delegated(2, 7)),
+            Verdict::Reachable {
+                via: Via::LeasePath,
+                ..
+            }
+        ));
+    }
+
+    /// Plan 46 M0.3, hang item 1 (`delegated-backup-and-delegate-die` seed
+    /// 435): a claimant that is a member of the group whose tail its claim
+    /// needs holds that tail only if it has it in place (`seal_tail_hold`).
+    #[test]
+    fn a_claimant_member_holds_the_tail_only_with_a_copy_in_place() {
+        // Node 2 took the lease over (epoch 2) with node 1's epoch-1 tail
+        // (members 3 and 2) and died at 3 000; node 3 claims.
+        let world = |tails: Option<Vec<u64>>| {
+            let r = world();
+            r.lease_landed_span(LeaseSpan {
+                at_ms: 2_500,
+                holder: 2,
+                ends_ms: 3_500,
+                released: false,
+                backups: vec![],
+                inherited: vec![2, 3],
+                epoch: 2,
+                inherited_epoch: 1,
+            });
+            r.attached_at(3_000, 2, false);
+            if let Some(t) = tails {
+                r.note_tails_at(0, 3, t);
+            }
+            r
+        };
+        // It holds nothing of epoch 1 or 2: no member answers.
+        let v = world(Some(vec![])).classify(q(3));
+        let Verdict::NoSequencerInTime { why } = v else {
+            panic!("{v:?}")
+        };
+        assert!(why.contains("holds no tail"), "{why}");
+        // A copy of another epoch is no copy of these.
+        assert!(world(Some(vec![5])).classify(q(3)).no_sequencer_in_time());
+        // A copy of the inherited epoch, or of the lease's own, is the tail.
+        for held in [vec![1], vec![2]] {
+            let v = world(Some(held)).classify(q(3));
+            assert!(
+                matches!(
+                    v,
+                    Verdict::Reachable {
+                        via: Via::LeasePath,
+                        ..
+                    }
+                ),
+                "{v:?}"
+            );
+        }
+        // Not known (nothing published): taken to hold it, as before.
+        assert!(matches!(
+            world(None).classify(q(3)),
+            Verdict::Reachable { .. }
+        ));
+        // A copy dropped before the window: none in time.
+        let r = world(Some(vec![1]));
+        r.note_tails_at(3_900, 3, vec![]);
         assert!(r.classify(q(3)).no_sequencer_in_time());
     }
 }

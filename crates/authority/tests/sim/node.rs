@@ -2548,6 +2548,27 @@ impl Driver {
             self.oracles
                 .reach
                 .note_view(self.id, held, grants, members, busy);
+            // The epochs whose tail this node could hand a claimant in place
+            // (`Core::seal_tail_hold`): the epoch it holds the lease of, or,
+            // holding none and not deposed, those its journal has rows of; the
+            // epoch it is a backup of; its member copies.
+            let mut tails: Vec<u64> = Vec::new();
+            match view.held_epoch {
+                Some(e) if !lease.epoch_held() => tails.push(e),
+                Some(_) => {}
+                None if lease.lost || view.journal_len == 0 => {}
+                None => tails
+                    .extend((1..=self.oracles.reach.max_epoch()).filter(|e| {
+                        Replica::journal_has_epoch_rows(&*self.meta, *e) == Some(true)
+                    })),
+            }
+            if view.ack.backing_epoch != 0 {
+                tails.push(view.ack.backing_epoch);
+            }
+            tails.extend(Replica::member_copy_epochs(&*self.meta));
+            tails.sort_unstable();
+            tails.dedup();
+            self.oracles.reach.note_tails(self.id, tails);
             // The generation history: this holder's delegation table, kept
             // when its generations changed (install, recall, end).
             if held != super::reach::Held::No {

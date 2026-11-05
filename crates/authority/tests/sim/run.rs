@@ -1276,6 +1276,10 @@ pub struct Report {
     pub unsettled_violations: usize,
     pub unsettled_examples: Vec<String>,
     pub unsettled_causes: BTreeMap<String, usize>,
+    /// Every unsettled `EIO`, its cause and description, kept only with
+    /// `AUTHORITY_SIM_UNSETTLED_ALL` (a sweep prints them, to compare the
+    /// verdicts of two classifiers EIO by EIO).
+    pub unsettled_all: Vec<String>,
     /// I5: acknowledged, rolled-back ops whose answer was not Lone.
     pub non_lone_rollbacks: usize,
     /// Plan 43 C2 (§5.3): shadows and hints installed for an answer not
@@ -4056,6 +4060,12 @@ fn count_unsettled(oracles: &super::oracle::Oracles, report: &mut Report) -> Vec
         *report.unsettled_causes.entry(u.cause()).or_default() += 1;
     }
     report.unsettled_examples = bad.iter().take(5).cloned().collect();
+    if std::env::var_os("AUTHORITY_SIM_UNSETTLED_ALL").is_some() {
+        report.unsettled_all = all
+            .iter()
+            .map(|u| format!("{} | {}", u.cause(), u.describe()))
+            .collect();
+    }
     bad
 }
 

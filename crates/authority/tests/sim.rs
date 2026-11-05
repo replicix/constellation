@@ -7742,6 +7742,9 @@ impl OracleTotals {
                 eprintln!("SWEEP-UNSETTLED {label} seed {seed}: {e}");
             }
         }
+        for e in &r.unsettled_all {
+            eprintln!("SWEEP-UNSETTLED-ALL {label} seed {seed}: {e}");
+        }
         // (The cores' `client_unsettled_eio` below counts the last
         // incarnation of each node only; the classification covers every
         // incarnation, so its total can exceed it in a run with restarts.)
