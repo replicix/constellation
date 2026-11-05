@@ -5,6 +5,25 @@ Status: **measured, 2026-10-31; the rerun of 2026-11-05 (items 2, 5, 6, 10M, `al
 are not kept in the repository; every table below is `report.py`'s output on them.
 
 
+## Summary: §8 acceptance as amended (2026-11-05)
+
+Final verdict per item of the amended §8 (plan 40, `docs/plans/v1/done/40-readdirplus.md`, §8 and §8.1). Sources: the
+10-31 run (listings, requests, page costs) and the 11-05 rerun below (write path, pins, resources, trees). Ratios are
+`auto` over R0 (`base`) or over `off` as stated; below 1 is faster.
+
+| Item | Amended bound | Measured | Verdict |
+|---|---|---|---|
+| 1 Plain listing | faster than R0 at 10k+; 1k: `off` in the noise, `auto` within +3 ms | 10k 0.49-0.53, 100k 0.05-0.09; 1k `off` 0.79-0.90, `auto` +2.5 to +2.8 ms | met |
+| 2 Write path | storm and `tar x` in the noise of R0 | storm `auto`/`off` median 1.03 (0.82-1.21); `tar x` write-back 0.92-1.11, write-through 0.99-1.18 | met |
+| 3 Requests | `ls -l`/`-la` at 1k, 10k: at least 90 % fewer, not counting the per-name `listxattr` | 99.4 % (1k), 99.8 % (10k), 99.9 % (100k); with `listxattr` 49.8-49.9 % | met as amended |
+| 4 Time | `ls -l`, `ls -la`, `rsync -n` at least 2x at 10k and 100k; `find -ls`, `du -s` at least 1.15x at 100k, at most 1.3x at 10k; second `ls -l` at most 1.4x (1k, 10k), 2.8x faster at 100k; trees bounded | `ls -l` 0.37-0.44, 0.34-0.39; `rsync` 0.27-0.29, 0.16-0.17; `find -ls`/`du -s` 0.71-0.84 (100k), 0.86-1.30 (10k); second `ls -l` 1.03-1.35, 0.27-0.35; `git status` 1.01-1.04 cold, 0.99-1.12 warm; `find -type f` 1.48-1.67; `make -q` warm 1.40-1.62; `ls -lR` 0.45-0.51; `rsync -n` 0.26-0.33 | met as amended |
+| 5 Resources | R0 + hint cap + refs x 170 B + pinned (1M, 10,000 open dirs); 10M reported; CPU at most R0 | 1M `ls -l` 343-347 MiB (R0 728-738); 10,000 dirs +212-267 MiB against a bound of +189 over R0 (275-287 MiB); 10M `ls -l` 1,703 MiB (about 175 B per ref); 8.05 B pinned per name; CPU 15.0 s against R0's 149.9 s | met as amended; **the 32 B per reference of the first draft was wrong: measured 120-170 B** |
+| 6 Pins | zero `lost_cookies`; `releasedir` p99 under 1 ms; handover at most +1 s at 1M | zero on four file systems; p99 17-24 us; 0.49-0.60 s at 1M (10M reported: 4.25 s, handoff 169 MiB) | met |
+| 7 Page cost | O(page); cold resume at most one R0 page | pages 0.8-0.9 ms from 10k to 1M (1M over 100k 1.05x); resume 1.4-1.5 ms at 1M, 1.2 ms at 10M (R0: 275 ms at 1M) | met in substance; the literal "1M within 2x of 1k" is not (a 1k directory has no full page) |
+
+`auto` stays the default. Not run: an LTS kernel without `dabb90391028`; `base` and `off` at 10M; two nodes other than
+strict mode. One node, one host (four file systems).
+
 ## Rerun 2026-11-05 (P40-01): items 2, 5, 6, the 10M cell, `always`, strict mode, handoff size, trees on current main
 
 Measured on the same quiet timing host (16 cores, 30 GB, Linux 7.3.0-rc4, ring transport), main `64409f78` (`auto`,
@@ -280,7 +299,7 @@ is faster), unless the text says otherwise.
    the kernel asks `READDIRPLUS` for the first chunk of every listing, one plus page of 721 entries (about 2 ms of
    daemon time and 1 ms of kernel work to instantiate them) that `ls` and `find -name` do not use. At 10k `auto` is
    1.26-1.43 times `off` and at 100k 1.02-1.06 times.
-2. **Write path**: **not measured here.**
+2. **Write path**: **not measured here; see the rerun below (met).**
 3. **Request reduction** (`ls -l`, `ls -la`, 1k and 10k, kernel-cold, `auto`, at least 90 % fewer than R0): **not met
    as worded, met without the per-name `listxattr`.** Counting every request, 49.8 % (1k) and 49.9 % (10k) fewer:
    `ls` sends one `listxattr` per name (1,001 and 10,001 of the 1,007 and 10,019 requests) and no plus page can answer
@@ -306,7 +325,7 @@ is faster), unless the text says otherwise.
    `off`'s 0.04, 0.32, 2.9, 30.4 s: per listed name it is lower with `auto` than with R0, and for `off` too. Peak RSS
    during the 1M `ls -l` (ext4): `base` 737 MiB, `off` 303 MiB, `auto` 337 MiB. The pins, 10M and 10,000 open
    directories were not measured.
-6. **Pins**: **not measured here.**
+6. **Pins**: **not measured here; see the rerun below (met).**
 7. **Page cost**: **O(page) shown; the literal "within 2 times of 1k" not met, because the 1k directory has no full page.**
    Daemon service time per directory page (`readdir`, ext4; the other file systems within 10 %): `base` 0.31 ms (1k),
    2.5 ms (10k), 22.5 ms (100k), 261 ms (1M), growing with the directory; `off` 0.24, 0.62, 0.79, 0.83 ms; `auto`

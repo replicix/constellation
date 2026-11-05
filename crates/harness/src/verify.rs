@@ -2823,8 +2823,8 @@ mod tests {
         // The verdict names the op, the path and the last certain op,
         // counted under its own class.
         let rep = log.judge(&ev);
-        assert_eq!(rep.counts["enoent-owned"], 2, "{rep:?}");
-        assert_eq!(rep.bugs.len(), 2, "{:?}", rep.bugs);
+        assert_eq!(rep.counts["enoent-owned"], 3, "{rep:?}");
+        assert_eq!(rep.bugs.len(), 3, "{:?}", rep.bugs);
         assert!(rep.allowed.is_empty());
         assert!(
             rep.bugs[0].contains("a rename errno 2")
@@ -2837,6 +2837,14 @@ mod tests {
             rep.bugs[1].contains("a unlink")
                 && rep.bugs[1].contains("w/g1")
                 && rep.bugs[1].contains("acknowledged rename from w/f1"),
+            "{:?}",
+            rep.bugs
+        );
+        // The failed-then-acknowledged-again name (f6) is owned again.
+        assert!(
+            rep.bugs[2].contains("a unlink")
+                && rep.bugs[2].contains("w/f6")
+                && rep.bugs[2].contains("acknowledged write seq 7"),
             "{:?}",
             rep.bugs
         );

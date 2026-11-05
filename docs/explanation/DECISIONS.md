@@ -1499,7 +1499,7 @@ rolls back to the old image, and the views take a remount to move.
 
 **See**: `crates/frontend-fuse/src/refs.rs`; PROGRESS, "Fix: a partial
 `FORGET` reaped an orphan the kernel still referenced";
-[plan 40 §4.4](../plans/v1/wip/40-readdirplus.md). Amends plan 31 §6.11.
+[plan 40 §4.4](../plans/v1/done/40-readdirplus.md). Amends plan 31 §6.11.
 
 ## ADR-32: Logging never blocks a daemon thread
 
@@ -2113,7 +2113,7 @@ name-only entry costs the kernel one lookup instead).
 questions marked resolved and the coder spec's decisions); built (P1–P8;
 the default `auto` stands unless the R8 measurements fail it).
 
-**See**: [plan 40](../plans/v1/wip/40-readdirplus.md) §4.5, §4.9 and §9;
+**See**: [plan 40](../plans/v1/done/40-readdirplus.md) §4.5, §4.9 and §9;
 `crates/engine/src/view/{listing,cookie,plus}.rs`,
 `crates/frontend-fuse/src/adapter.rs` (`ReaddirPlus`); PROGRESS, "Plan 40".
 

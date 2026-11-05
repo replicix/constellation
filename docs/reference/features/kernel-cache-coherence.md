@@ -284,6 +284,6 @@ which the page leaves as the kernel has them.
 - Plan 42 (`docs/plans/v1/done/42-kernel-race-workarounds.md`)
 - ADR-34 in [DECISIONS](../../explanation/DECISIONS.md)
 - [Close-to-open modes](cto-modes.md), [Cluster locks](cluster-locks.md)
-- Plan 40 (`docs/plans/v1/wip/40-readdirplus.md`)
+- Plan 40 (`docs/plans/v1/done/40-readdirplus.md`)
 - Code: `crates/frontend-fuse/src/{pagecache,repair,kernel_fixes,workarounds,reply,notify,plus_stats}.rs`,
   `crates/engine/src/view/kernel_cache.rs`, `crates/engine/src/kernel_inval.rs`

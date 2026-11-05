@@ -47143,7 +47143,7 @@ unreached and the dentry covered, a `stat` by path (a lookup that missed the
 kernel's caches) answered the inode's row from before a commit the node had
 already acknowledged — an `fstat` of the same file waited. `.` and `..`
 returned their target's attributes with no wait at all. Found while
-designing plan 40 (`wip/40-readdirplus.md` §9 recorded the drift).
+designing plan 40 (`done/40-readdirplus.md` §9 recorded the drift).
 
 ### What changed
 
@@ -67004,3 +67004,60 @@ Gates (box 1): fmt, clippy `-D warnings` (meta, authority, engine, all targets),
 suite 409 passed, 0 failed. Sweeps `+commit`, seeds 0..299: knob on `long-delegated` 300 failing, `delegated-group-switch` 2 (seeds 51, 170);
 knob off `long-delegated`, `delegated-group-switch`, `delegated-holder-cut`, `delegated-root-crash`, `backup`, `long-backup`, `far` 0 failing,
 `delegated-epoch` 7 failing (all the known shadow-install finding); row-version mismatches 0 in all.
+
+## Plan 40 closed: READDIRPLUS and name-ordered listings (2026-11-05)
+
+Plan 40 moves to `done/`. Everything R0-R8 asks for landed; the §8 acceptance was amended by the maintainer to the
+achievable wording and is met on ext4, xfs, btrfs and tmpfs (kernel 7.3.0-rc4, one node), `auto` stays the default.
+
+### What was decided and recorded
+
+| Item | State | Where |
+|---|---|---|
+| §8 items 1, 3, 4 restated to the achievable wording (§8.1's sketch), with the final numbers | done | `done/40-readdirplus.md` §8, §8.1 |
+| §8 item 5: the 32 B per kernel reference was wrong; measured 120-170 B (10,000 open directories: +212-267 MiB for `auto`; 10M `ls -l` 1,703 MiB for 10,000,001 references, about 175 B each); the formula and bound amended to 170 B per reference | done, finding recorded | §8 item 5, §8.1 "Finding on item 5's formula" |
+| Summary table of the verdict per amended item | done | `bench/readdirplus/RESULTS.md`, "Summary" |
+| R8's xcheckfs runs: the 22-30 min runs of 2026-10-24 accepted instead of a 1 h repeat (D-6) | accepted | plan §10 |
+| R1-R8 boxes ticked with evidence (commits and PROGRESS sections) | done | plan §10 |
+| `wip/40-readdirplus.md` to `done/`; links fixed (DECISIONS ADR-31/ADR-37, `kernel-cache-coherence.md`, this file); README row | done | `docs/plans/v1/README.md` |
+
+Item 7's literal "1M within 2x of 1k" is not met (a 1k directory has no full page); it is met in substance (O(page): 1M
+over 100k 1.05 times, cold resume 1.4-1.5 ms at 1M and 1.2 ms at 10M) and the verdict says so; the maintainer may want
+that item reworded.
+
+### Gates (final tree = `83d858ec` plus this commit's docs and two test fixes; build host, 16 cores, Fedora, kernel 7.3.0-rc4)
+
+- `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- pjdfstest (`tests/compliance.sh`, the suite's own binary, as root): **8798 passed, 0 failed** on `/dev/fuse` and on
+  the ring (`uring`), baseline empty.
+- `cargo test --workspace` found two failures that are not plan 40's code: the `readdirplus-strict-bench` scenario added
+  by the 11-05 rerun was unclassified in the k8s parity table (`k8s::parity`, now `Skip::Local`), and
+  `verify::tests::enoent_of_an_owned_name_is_an_error` expected two verdicts where its own later `f6` case yields three
+  (stale since `c68c01af`; the assertions now count three). Both fixed in this commit. After that: 3,472 passed, 2
+  failed in `constellation-platform` under co-located load (`No space left on device` on an xattr test, and the flock
+  probe), 61 passed 0 failed alone. The authority lib tests passed (0 failed). `smoke.sh` passed. The authority
+  `--test sim` suite did not finish within its time bound (164 tests passed, none failed, in 90 min on a loaded box; a
+  second run was stopped by me for the harness run): not completed. `tests/integration.sh` did not run: the box has no
+  `docker compose` plugin (floci is exercised by the harness instead).
+- The full `harness run` catalogue on the final binaries (about 3h45m, partly co-located with the unit tests): 279
+  PASSED, 7 FAILED, 37 SKIPPED (no `sqlite3`, no `CAP_SYS_ADMIN` for the passthrough and zero-copy rows). Rerun alone,
+  twice each: `commit-strips-pending-upload` and `small-file-write-path` passed both times (load). Failed both times:
+  `session-exists-observed`, `session-ryw-after-holder-kill`, `session-wait-degrades`,
+  `s3-cut-create-holder-restart`, `writeback-close-metered-nonowner`. A `git bisect` over the 551 commits since
+  `73ea9987` with `session-exists-observed` and `writeback-close-metered-nonowner` as the probe names `b10d0965` ("a lone
+  root answers other nodes from the archive", plan 43 C2, authority) as the first bad commit; the same commit range is
+  not plan 40's (listing, adapter, view listing code). `session-wait-degrades` also fails on `73ea9987` and
+  `session-ryw-after-holder-kill` and `session-wait-degrades` failed on main in plan 42's gate record; `s3-cut-create-holder-restart`
+  passes on `73ea9987` and was not bisected. All five belong to the authority/session lane (plan 43/46 own them). The
+  stress-ng row passed with no baseline failures. The k8s parity and kernel-race rows passed, including every `-plus` row.
+
+### Open follow-up outside plan 40: populating 10M entries costs memory and can stall (to be triaged)
+
+Evidence: `bench/readdirplus/RESULTS.md`, "The 10M cell" (rerun of 2026-11-05). Creating 10,000,000 entries in one
+directory (16 threads) drove the daemon to **17-21.5 GiB RSS** (about 3.3 KB per entry; write-through peak 21.5 GiB, host
+load 16-25). In write-back mode the daemon stood at 17-18 GB at 5.5M entries, `fjall` journal commits waited up to 5 s on
+the journal lock, one **`create` stalled for 610 s**, the host reclaimed memory (51 % I/O wait), and the populate was
+stopped at 5.52M entries. No corruption: the listings, pins and handover after the write-through populate were exact. This is
+the create path's memory and latency, not the listing's; under the load-robustness rule latency may degrade but the
+memory growth and the 610 s stall need an owner. Not a plan 40 item.
+

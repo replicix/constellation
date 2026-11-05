@@ -646,6 +646,7 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ),
     ("readdirplus-strict", Skip::Local(&[CTO_STRICT, KILL])),
     ("readdirplus-handover", Skip::Local(&[UPGRADE])),
+    ("readdirplus-strict-bench", Skip::Local(&[CTO_STRICT, KILL])),
     ("readdir-huge-delete", Skip::Local(&[READDIR_KNOBS, WRITE_MODE])),
     ("readdir-seekdir-after-delete", Skip::Local(&[KILL, WRITE_MODE])),
     ("readdir-many-open-dirs", Skip::Local(&[READDIR_KNOBS, WRITE_MODE, RSS])),

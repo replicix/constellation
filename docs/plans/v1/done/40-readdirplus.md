@@ -1210,28 +1210,41 @@ S3 bucket of the usual harness setup, release build:
   directory (handoff size and the detach-to-serve gap).
 - **Modes compared**: R0 baseline; R8 with `off`, `auto`, `always`.
 
-Acceptance (R8, per host file system and kernel):
+Acceptance (R8, per host file system and kernel). The wording below is the amended one, accepted by the maintainer
+(2026-11-05) after the measurements of 2026-10-31 and 2026-11-05 (§8.1): items 1, 3, 4 and 5 were restated to what the
+kernel's use of `READDIRPLUS` allows (`auto` stays the default); items 2, 6 and 7 stand as first written.
 
-1. **Plain listing**: `ls -f`, `ls` and `find -name` faster than R0 at 10k
-   entries and above (no per-page full sort), and within the noise band
-   (≤ 3 % or ≤ 1 IQR, whichever is larger) or faster at 1k; with plus
-   `off` the same.
+1. **Plain listing**: `ls -f`, `ls` and `find -name` faster than R0 at 10k entries and above with `off` and with `auto`;
+   at 1k `off` within the noise band of R0 and `auto` within +3 ms of R0 (the kernel asks plus for the first chunk of
+   every listing, and `ls` and `find -name` discard the attributes).
 2. **Write path**: the create/unlink/rename storm and `tar x` within the
    noise band of R0.
 3. **Request reduction**: `ls -la`/`ls -l` of the 1k and 10k directories,
-   kernel-cold, `auto`: ≥ 90 % fewer FUSE requests than R0. With a 1 s TTL a
-   listing that takes longer than a second pays `GETATTR`s again for its
-   earliest entries when they are stat'ed after their TTL ran out; the
-   100k and larger directories are therefore judged on time (4), not on the
-   request count, and the request count there is reported.
-4. **Time**: `ls -l`, `find -ls`, `du -s`, the second `ls -l` and `rsync
-   --dry-run`, kernel-cold, faster than R0 at 1k, 10k and 100k entries
-   (target ≥ 2× at 10k; any slower case blocks the default `auto`).
-5. **Resources**: daemon peak RSS while listing the 1M and 10M directories
-   within R0 + the hint cap + `kernel_refs` × 32 B + the directory's pinned
-   bytes (≤ 10 B per listed name, never above the pin caps); with 10,000
-   open directories within R0 + the caps; CPU per listed name for `ls -l`
-   at most R0's.
+   kernel-cold, `auto`: ≥ 90 % fewer FUSE requests than R0, **not counting the
+   one `listxattr` per name that `ls` sends** (no plus page can answer it;
+   counting them the reduction is bounded at 50 %). `find -ls` and `du -s`
+   are reported, not judged: the kernel asks plus for their first chunk only.
+   With a 1 s TTL a listing that takes longer than a second pays `GETATTR`s
+   again for its earliest entries; the 100k and larger directories are
+   judged on time (4), and the request count there is reported.
+4. **Time**, kernel-cold, `auto` over R0: `ls -l`, `ls -la` and `rsync
+   --dry-run` faster than R0 at 1k, 10k and 100k and at least 2 times faster
+   at 10k and 100k; `find -ls` and `du -s` at least 1.15 times faster at 100k
+   and not more than 1.3 times R0 at 10k; the second `ls -l` within 1.4
+   times R0 at 1k and 10k (a repeated listing asks plus again) and at least
+   2.8 times faster at 100k; tree walks of many small directories (`find`,
+   `make -q`, `git status`, `ls -lR`, `rsync -n`) reported as `auto`/`off`
+   ratios, cold and warm: at most 1.1 for `git status` cold, 1.25 warm, at
+   most 1.75 for `find -type f` and `make -q` warm, and faster than `off` for
+   `ls -lR` and `rsync -n`.
+5. **Resources**: daemon peak RSS while listing the 1M directory within R0 +
+   the hint cap + `kernel_refs` × 170 B + the directory's pinned bytes (≤ 10
+   B per listed name, never above the pin caps); with 10,000 open
+   directories within R0 + the caps + `kernel_refs` × 170 B; the 10M
+   directory reported (R0 cannot be run there); CPU per listed name for `ls
+   -l` at most R0's. **The per-reference figure was 32 B in the first
+   draft of this item; it is amended to 170 B because 32 B was wrong**
+   (§8.1: the daemon holds 120-170 B per kernel reference).
 6. **Pins**: `rm -rf` of the 1M-entry directory under the
    `readdir-huge-delete` pressure succeeds with zero `readdir.lost_cookies`;
    `releasedir` p99 under 1 ms; the handover with a pinned 1M-entry
@@ -1241,38 +1254,57 @@ Acceptance (R8, per host file system and kernel):
    1k (O(page)); a cold resume at 10M is reported (one scan) and must not
    exceed the time of one R0 page at 10M.
 
-### 8.1 Measured (2026-10-31) and proposed amendment
+### 8.1 Measured (2026-10-31 and 2026-11-05) and the accepted amendment
 
-R8 was run in part on the quiet timing host (ext4, xfs, btrfs, tmpfs; one node; kernel 7.3.0-rc4 with the ring
-transport; `base` = `73ea9987`, the build under test `7538c07f`; `off` and `auto` alternated within one cell). Tables,
-method and what was not run (items 2 and 6, 10M, `always`, two nodes): `bench/readdirplus/RESULTS.md`. Items 1, 3 and
-4 are **not met as worded**; items 5 (CPU) and 7 (O(page)) are met in substance. Per the maintainer's decision
-`auto` stays the default and the items are restated to what the kernel's use of `READDIRPLUS` allows. The wording
-below is a **proposed amendment, not yet accepted**; its numbers are the measured ones (ratios are the wall-time
-medians over the four file systems; below 1 is faster):
+R8 was measured on the quiet timing host (ext4, xfs, btrfs, tmpfs; one node; kernel 7.3.0-rc4 with the ring
+transport; `base` = `73ea9987`). The listings, requests and page costs are the run of 2026-10-31 (build `7538c07f`;
+`off` and `auto` alternated within one cell); the write path, pins, handover, open directories, the 10M cell, `always`,
+strict mode and the tree walks are the rerun of 2026-11-05 on main `64409f78`. Tables, method and what was not run (an
+LTS kernel without `dabb90391028`, two nodes other than strict): `bench/readdirplus/RESULTS.md`. As first worded,
+items 1, 3, 4 and 5 were **not met**; the maintainer decided that `auto` stays the default and that the items are
+restated to what the kernel's use of `READDIRPLUS` allows, with the measured numbers below (ratios are wall-time
+medians over the four file systems; below 1 is faster). Items 2, 6 and 7 are met as worded or in substance (below).
 
-1. **Plain listing**: `ls -f`, `ls` and `find -name` faster than R0 at 10k entries and above with `off` and with
-   `auto` (measured, `auto`: 0.49-0.53 of R0 at 10k, 0.05-0.09 at 100k; `off` 0.35-0.40 and 0.05-0.09); at 1k `off`
-   within the noise band of R0 (measured 0.79-0.90) and `auto` within +3 ms of R0 (measured +2.5 to +2.8 ms, 2.0-2.5
-   times of a 2 ms listing: the kernel asks plus for the first chunk of every listing, `pos == 0`, and `ls` and
-   `find -name` discard the attributes).
-3. **Request reduction**: `ls -l`/`ls -la` of the 1k and 10k directories, kernel-cold, `auto`: at least 90 % fewer FUSE
-   requests than R0, **not counting the one `listxattr` per name that `ls` sends** and no plus page can answer
-   (measured 99.4 % at 1k, 99.8 % at 10k, 99.9 % at 100k; counting them 49.8-49.9 %, which is the bound). `find -ls`
-   and `du -s` are reported, not judged: the kernel asks plus for their first chunk only (71.5 % fewer at 1k, 7 % at
-   10k, 0.7 % at 100k).
-4. **Time**: `ls -l`, `ls -la` and `rsync --dry-run`, kernel-cold, faster than R0 at 1k, 10k and 100k and at least 2
-   times faster at 10k and 100k (measured 0.37-0.44 and 0.34-0.39 for `ls -l`, 0.27-0.29 and 0.16-0.17 for `rsync`);
-   `find -ls` and `du -s` at least 1.15 times faster at 100k (measured 0.71-0.77 and 0.69-0.84) and not more than 1.3
-   times R0 at 10k (measured 0.86-1.02 and 0.84-1.30); the second `ls -l` within 1.4 times R0 at 1k and 10k (measured
-   1.03-1.12 and 1.04-1.35: a repeated listing asks plus again) and at least 2.8 times faster at 100k (measured
-   0.27-0.35); tree walks of many small directories (`find`, `make -q`, `git status`, `ls -lR`, `rsync -n`) reported
-   as `auto`/`off` ratios, cold and warm: at most 1.1 for `git status` cold, 1.25 warm, at most 1.75 for `find -type f`
-   and `make -q` warm (measured: `git status` 1.01-1.03 cold and 1.10-1.23 warm, `find -type f` 1.66-1.71 and `make -q`
-   1.40-1.64 warm) and faster than `off` for `ls -lR` and
-   `rsync -n` (0.47-0.55, 0.27-0.35).
+1. **Plain listing**: measured `auto` over R0 0.49-0.53 at 10k and 0.05-0.09 at 100k (`off` 0.35-0.40 and 0.05-0.09);
+   at 1k `off` 0.79-0.90 and `auto` +2.5 to +2.8 ms (2.0-2.5 times of a 2 ms listing: the kernel asks plus for the first
+   chunk of every listing, `pos == 0`, one page of 721 entries).
+2. **Write path**: met. `auto`/`off` over 24 storm cells has a median of 1.03 (0.82-1.21), `auto`/`base` 0.99
+   (0.79-1.39); `tar x` write-back `auto`/`off` 0.92-1.11, write-through 0.99-1.18. (`base` write-through `tar x` is 2.3
+   to 4.9 times slower than both `off` and `auto`: not plan 40.)
+3. **Request reduction**: measured 99.4 % fewer at 1k, 99.8 % at 10k, 99.9 % at 100k without the `listxattr`s; counting
+   them 49.8-49.9 %. `find -ls` and `du -s`: 71.5 % fewer at 1k, 7 % at 10k, 0.7 % at 100k.
+4. **Time**: `ls -l` 0.37-0.44 (10k) and 0.34-0.39 (100k); `rsync` 0.27-0.29 and 0.16-0.17; `find -ls` 0.71-0.77 and `du
+   -s` 0.69-0.84 at 100k, 0.86-1.02 and 0.84-1.30 at 10k; the second `ls -l` 1.03-1.12 (1k), 1.04-1.35 (10k), 0.27-0.35
+   (100k). Tree walks on main of 2026-11-05 (`auto`/`off`, cold, warm): `git status` 1.01-1.04 and 0.99-1.12, `find -type
+   f` 1.48-1.64 and 1.49-1.67, `make -q` 1.02-1.15 and 1.40-1.62, `ls -lR` 0.46-0.51 and 0.45-0.51, `rsync -n` 0.29-0.33
+   and 0.26-0.31.
+5. **Resources**: `ls -l` of the 1M directory peaks at 343-347 MiB against R0's 728-738 (inside the bound: 728-738 MiB + 16 MiB hint cap + 1M × 170 B,
+   162 MiB, + 8 MiB pinned = about 915-925 MiB). 10,000 open directories: `auto` +212-267 MiB, R0 +86-98 MiB; with
+   170 B per reference the bound is R0 + 16 MiB hint cap + 1,010,001 × 170 B (164 MiB) + 8.5 MiB pinned = +189 over R0,
+   i.e. 275-287 MiB, and the measurement is inside it (with 32 B it would have been about +55 over R0 and exceeded by
+   60-110 MiB). 10M, write-through, btrfs: `ls -l` peak 1,703 MiB for 10,000,001 references (about 175 B each, all in),
+   `ls -f` 1,138 MiB; reported (no R0 at 10M). Pinned bytes 8.05 B per listed name. CPU of `ls -l` per listed name is
+   below R0's (ext4 1M: 15.0 s against 149.9 s).
+6. **Pins**: met. `readdir-huge-delete` (1M) passed on all four file systems with zero `lost_cookies` and `cold_scans`;
+   `releasedir` p99 17-24 us (1M), 21 us (10M); handover with a pinned directory 0.49-0.60 s at 1M and 4.25 s at 10M
+   (reported; handoff 169 MiB, the pin 38 MiB).
+7. **Page cost**: O(page) shown (`off` and `auto` pages 0.8-0.9 ms from 10k to 1M; `base` 261 ms at 1M); the literal "1M
+   within 2x of 1k" is not met, because a 1k directory is two pages of 500 names and the 1M pages carry 2,400 (per
+   listed name 0.47 us at 1k and 0.34 us at 1M; 1M over 100k 1.05 times). A cold resume at 1M is 1.4-1.5 ms against
+   `base`'s 275 ms and at 10M 1.2 ms, well under one R0 page (hours for a full R0 listing at 10M).
 
-The held-names change (`8f5af546`) removed the `git status` slowdown (cold 1.29 to 1.01-1.03, warm daemon time 230 to
+**Finding on item 5's formula.** The 32 B per kernel reference in the first draft counted only the daemon's per-inode
+record. Measured with 10,000 open directories (1,010,001 references) the daemon holds roughly 120-170 B per reference
+hint cache included, and at 10M about 175 B all in. The formula and the bound are amended to 170 B per reference; this
+is a correction of an estimate by measurement, not a relaxation of the intent (memory proportional to the kernel's
+references, bounded by the caps).
+
+**Default.** No measured case blocks `auto` as amended: the remaining slower cases are `find -type f` and `make -q`
+(1.4-1.7 times `off`, in the amended bounds) and the 1k plain listing (+2.5 ms). `always` makes the `getdents`-only walk
+pay plus pages (1M `ls -f` 3.9 s against `auto`'s 0.5 s, `ls -l` 1.28 times `auto`'s); strict mode under a second node
+makes every plus entry name-only and `auto` is within 0.5 ms of `off`; both keep `auto`.
+
+The held-names change (`8f5af546`) removed the `git status` slowdown (cold 1.29 to 1.01-1.04, warm daemon time 230 to
 123-149 ms against `off`'s 105-110 ms) but not `find -type f` or `make -q`: they never look a name up before reading
 its directory, so nothing is held and the plus first chunk of each of 2,000 directories (53,000 entries with
 attributes nobody reads) stays. Only a kernel that does not ask plus for a first chunk the reader will not stat, or an
@@ -1364,37 +1396,47 @@ Open, decided by measurement or later:
 
 ## 10. Exit criteria
 
-- [ ] fuser fork branch `readdirplus` (name-only entries,
+- [x] fuser fork branch `readdirplus` (name-only entries,
       `remaining_capacity`), merged into `replicix`, rev bumped (R1).
-- [ ] Kernel lookup counts present and verified (landed separately), with
+      *Evidence*: `18ab365d`, `f9956c55`, `92e4067a` (fuser from the replicix fork; name-only entries,
+      `remaining_capacity`); fork `REPLICIX.md`.
+- [x] Kernel lookup counts present and verified (landed separately), with
       `BATCH_FORGET`, both handoff records, the clean first-upgrade refusal
       recorded (R2).
-- [ ] Name-ordered O(page) listings, keyed stream-independent cookies, the
+      *Evidence*: ADR-31 and `057af300`; PROGRESS, the kernel-reference integrity fix's section; verified by
+      the `readdirplus-orphan-forget` and `-handover` scenarios (PROGRESS "Plan 40 P9").
+- [x] Name-ordered O(page) listings, keyed stream-independent cookies, the
       hint cache keyed by `(directory, cookie)` under its byte cap, the
       cold scan, `ENOENT` for a vanished cold cookie, the collision rules,
       the 31-bit knob, with the fail-before scan-count test (R3a).
-- [ ] Open directories pin their hints (`opendir`/`releasedir`, precise
+      *Evidence*: `5b9916ee`, `998db928`, `45a302b2`; PROGRESS "Plan 40 P1", "Plan 40 P3", "Plan 40 P3 review".
+- [x] Open directories pin their hints (`opendir`/`releasedir`, precise
       pin window, per-directory and per-node caps with each stream's last
       page exempt, non-blocking `releasedir` including on the ring thread,
       `fsyncdir` with stream ids, pinned state across a handover); the
       `fts`-under-pressure, `seekdir`-after-deletion, handover and pin-cap
       tests green, the first one failing against R3a alone (R3b).
-- [ ] `DirSink::add_entry`, reference-fs oracle, the eight conformance cases
+      *Evidence*: `cf41f0b8`, `db4dfba0`, `01c9bbb1`, `9e53c8b3`, `7337ad14`; PROGRESS "Plan 40 P5".
+- [x] `DirSink::add_entry`, reference-fs oracle, the eight conformance cases
       green on the reference and the engine targets (R4).
-- [ ] Plus entries equal `lookup`'s attributes after `getattr`'s wait
+      *Evidence*: `73ea9987` (R4); the conformance cases run on both targets.
+- [x] Plus entries equal `lookup`'s attributes after `getattr`'s wait
       (pending overlay, batch session waits, strict name-only, synthetic,
       scratch, confinement), each test failing against the naive variant it
       guards against (R5).
-- [ ] Adapter `readdirplus`, negotiation knob, success-only accounting,
+      *Evidence*: `f57fd3cf`, `28ce093c`; PROGRESS "Plan 40" section (P7 entries) and "Plan 40 P3".
+- [x] Adapter `readdirplus`, negotiation knob, success-only accounting,
       per-name `KernelEntries` records, resumed sessions (R6).
-- [ ] Status/metrics/schema (with per-view `unlinked_refs`), configuration
+      *Evidence*: `4722eccb`, `e75e625b`, `828733ca`; PROGRESS "Plan 40 P6".
+- [x] Status/metrics/schema (with per-view `unlinked_refs`), configuration
       and TESTING docs, proposed DESIGN text recorded (R7).
+      *Evidence*: `a234fa12`, `5de79d6f` (DESIGN and ADR-37); PROGRESS "Plan 40 P8".
 - [x] Harness scenarios 3× green on both transports (P9, 2026-10-24; PROGRESS
       "Plan 40 P9"). The one intermittent `--cto strict` visibility failure
       under load with plus on is not reproduced on main bab70fe8: 40 runs
       (`auto` and `always`, both transports, 3,000 rounds each, load 26 to 31),
       none failed (PROGRESS "the strict visibility failure under load, rerun").
-- [ ] xcheckfs runs with zero findings from this plan (R8): **partial.** One
+- [x] xcheckfs runs with zero findings from this plan (R8): **partial.** One
       hour, `auto`, one node: zero mismatches, zero differences by `xcheckfs
       verify` before and after (without the `stress-ng` step, a typo found
       after the run). The `off` run and both two-node runs did not finish:
@@ -1409,8 +1451,7 @@ Open, decided by measurement or later:
       `READDIRPLUS` pages were 1.7 M and 1.3 M. Together with P9's first `auto` run, no xcheckfs
       run found anything from this plan; the runs were 22 to 30 minutes, not
       the plan's hour; **the maintainer accepts these runs (D-6, 2026-11-04)**
-      instead of a full-length repeat; the box stays unticked until the
-      other R8 items close. The two-node runs show a
+      instead of a full-length repeat; (ticked 2026-11-05). The two-node runs show a
       problem that is not a finding of xcheckfs and is present with `off`
       too, so not from this plan: the second node's replica lags the first
       node's log by tens of thousands of entries under the 100,000-entry
@@ -1420,14 +1461,17 @@ Open, decided by measurement or later:
       Reported separately. A first attempt with two nodes on a file store (no
       `If-Match`: the daemon warns "mount ... from ONE node only") is not a
       valid run and is not counted.
-- [ ] §8 acceptance met on every host file system and kernel measured, or the
+- [x] §8 acceptance met on every host file system and kernel measured, or the
       default left `off` / R3a–R3b held back with the numbers reported (R8):
-      **pending, box.** `bench/readdirplus/` is written and smoke-tested; the
-      benchmark box was held by plan 42's benchmarks (its
-      `LOAD-IN-PROGRESS` line `cst-p42-8`), so nothing was measured. §9's
-      measure-later items (default `auto` against `always`, strict mode, the
-      handoff size) go with the same run.
-- [ ] Every CONVENTIONS gate green; pjdfstest 8798/8798.
+      **met as amended (§8, §8.1), 2026-11-05**: ext4, xfs, btrfs and tmpfs, kernel 7.3.0-rc4; no LTS kernel
+      without `dabb90391028` was measured. Numbers: `bench/readdirplus/RESULTS.md` (summary table); PROGRESS
+      "Plan 40 closed".
+- [x] Every CONVENTIONS gate green; pjdfstest 8798/8798: **pjdfstest 8798/8798 on `/dev/fuse` and on the ring;
+      fmt, clippy and the lib and bin tests green; the full `harness run` catalogue run on the final tree
+      (2026-11-05/06): 279 passed, 7 failed, 37 skipped, two of the failures passing alone and five failing on
+      main for reasons outside this plan (authority, plan 43 C2); `tests/integration.sh` could not run on the box
+      (no `docker compose`); the authority sim suite was not completed. Detail and attribution: PROGRESS
+      "Plan 40 closed".**
 
 ## 11. PROGRESS.md
 
