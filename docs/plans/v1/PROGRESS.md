@@ -66775,3 +66775,34 @@ own-subtree answers and the singleton's commit on the node's disk too. M1.3 carr
   deposition, the requester retries by rid).
 
 This config's `+commit` 0/2,000 is an M1.3 exit. Landing it before M1.3 is a fallback if M1.3 slips.
+
+## Plan 46 M1.1 step 1: a lone root's journal is no second copy (2026-11-05)
+
+ADR-41's lone-journal branch removed (plan 46 §11, "M1.0 answers"; the ADR's amended text follows with M1.3). A root's
+`DelegateStreamAck.committed` counts a delegate's appended row only once the root's own configuration has committed it:
+`Core::config_committed_jseq` is `durable_jseq`, except that a lone root's `u64::MAX` (no backup, none to be had) commits
+nothing beyond the archive; an epoch hold's journal still counts (M1.4 makes the hold a group). A lone root paused past
+its expiry is taken over from the archive alone, so a row a delegate answered on that journal was lost when the delegate
+then failed (model: `node_stream`'s knob `root_journal_counts` violates `acked_never_lost`, M1.0 C2). The sim oracle's
+`DelegGroup` judgement counts the root's appended copy only when every backup the lease lists holds it.
+
+**Fail-before.** Core `a_lone_root_acks_a_delegates_row_as_committed_only_once_it_ships` (replaces
+`a_lone_root_acks_a_delegates_row_as_committed_at_once`): `committed` 1 at once on main. With the tightened oracle on main,
+`+commit`, seeds 0..1,999: `long-delegated`, `delegated-crash`, `delegated-root-crash` fail 2,000 of 2,000 each (a lone root
+serving delegates; their `deleg-group` answers rested on its journal); also `delegated-no-backup-root-near` 86,
+`delegated-holder-cut` 1 (73), `long-delegated-backup` 1, `delegated-two-gens-one-backed` 1; on main's oracle every one of the
+12 delegated configurations is clean under `+commit` (I1 = 0), so the M1.1 row's fail-before seeds (124 … 1900) no longer fail.
+
+**After**, seeds 0..1,999 (main / branch, box 2): `long-delegated`, `delegated-crash`, `delegated-root-crash` no failing seed on
+either, with and without `+commit` (branch); I1, I2, I2c, I4, I5 0 on both; unsettled `EIO`s 4 / 2, 0 / 0, 0 / 0; failover p50 /
+p90 646 / 6,454 vs 677 / 6,442 ms (`long-delegated`), 159 / 5,219 vs 153 / 5,220 ms (`delegated-root-crash`). The answers that
+were `deleg-group` on the root's journal are judged `archive` now (the cost the M1.0 answer accepts: such a delegate's answers
+wait for the archive until the root has a backup).
+
+Trajectory-picked witnesses moved and were re-picked from scans of the branch: `LONE_LEAD_SEEDS` 57, 103 → 64, 118 (15 of the
+first 400 hold an own op back by the gated mark alone); the lead-off control 0 → 1; the hysteresis-off control 57, 103 → 64,
+118; `regression_a_grant_handed_back_during_a_release_is_renewed` 2764 → 1586 and 1351 → 649 (six and seven of 0..4,000); `locks_writer_hold_delegated_without_the_settle_is_caught` 5798, 5813, 6110 → 2790, 3104,
+4268 (the first three of 0..4,400, the settle clean on each).
+
+**Gates** (box 2): fmt, clippy `-D warnings` (authority, all targets) clean; authority lib 1,039 passed; the release sim suite
+403 passed, 0 failed, 12 ignored.

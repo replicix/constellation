@@ -13664,7 +13664,11 @@ fn locks_writer_hold_delegated_without_the_settle_is_caught() {
     // (Plan 46 L3: a recall sent again moved the schedule once more; 556,
     // 2027 and 2570 show none, and 5798, 5813 and 6110 are the first three of
     // seeds 0 to 33 000 that do, the settle clean on all of them.)
-    let seeds = [5798, 5813, 6110];
+    // (Plan 46 M1.1: a lone root's journal no longer counts as a delegate's
+    // second copy; 5798, 5813 and 6110 show none, and 2790, 3104 and 4268
+    // are the first three of seeds 0 to 4 400 that do, the settle clean on
+    // each.)
+    let seeds = [2790, 3104, 4268];
     let mut caught = 0;
     for seed in seeds {
         if let Err(e) = run_seed(seed, locks_writer_hold_delegated_unsettled_config()) {
@@ -14484,7 +14488,9 @@ fn regression_a_grant_handed_back_during_a_release_is_renewed() {
         // (Plan 43 C2 moved the trajectories of 4196, 7730 and 4550 to no
         // grant handed back during a release; 1043 and 2764 of
         // `locks-unlinked-delegated-blips` and 1351 of
-        // `locks-blips-tight-delegated` hand one back now.)
+        // `locks-blips-tight-delegated` hand one back now. Plan 46 M1.1
+        // moved 2764's and 1351's to none; 1586 is one of the six of seeds 0
+        // to 4 000 of the first that do, 649 one of the seven of the second.)
         (
             "locks-unlinked-delegated-blips",
             1043,
@@ -14492,12 +14498,12 @@ fn regression_a_grant_handed_back_during_a_release_is_renewed() {
         ),
         (
             "locks-unlinked-delegated-blips",
-            2764,
+            1586,
             locks_unlinked_blips_config(),
         ),
         (
             "locks-blips-tight-delegated",
-            1351,
+            649,
             locks_blips_tight_delegated_config(),
         ),
     ] {
@@ -17023,9 +17029,11 @@ fn a_lone_delegates_own_lone_rows_stay_within_the_lead_and_behind_no_open_gated_
     );
 }
 
-/// (Seeds 57 and 103 hold an own op back from `Lone` for the gated mark alone,
-/// as do 235 and 377 of the first 400: the non-vacuity of the hysteresis.)
-const LONE_LEAD_SEEDS: [u64; 8] = [1, 2, 3, 4, 5, 6, 57, 103];
+/// (Seeds 64 and 118 hold an own op back from `Lone` for the gated mark alone,
+/// as do 13 others of the first 400: the non-vacuity of the hysteresis. Plan
+/// 46 M1.1 moved the trajectories: 57 and 103 hold none since a lone root's
+/// journal stopped counting as the delegate's second copy.)
+const LONE_LEAD_SEEDS: [u64; 8] = [1, 2, 3, 4, 5, 6, 64, 118];
 
 /// The oracle's negative controls: with the lead disabled
 /// (`Config::delegation_lone_lead`) a lone delegate journals `Lone` rows past
@@ -17034,7 +17042,8 @@ const LONE_LEAD_SEEDS: [u64; 8] = [1, 2, 3, 4, 5, 6, 57, 103];
 #[test]
 fn the_lone_lead_oracle_catches_a_disabled_lead_and_a_disabled_hysteresis() {
     // Seeds a sweep of 300 found each to trip (the hysteresis control needs
-    // a gated row of its own and a `Lone` one after it, which is rarer).
+    // a gated row of its own and a `Lone` one after it, which is rarer; plan
+    // 46 M1.1's trajectories: 0, 57 and 103 trip no more).
     type Control = (
         &'static str,
         fn() -> SimConfig,
@@ -17046,13 +17055,13 @@ fn the_lone_lead_oracle_catches_a_disabled_lead_and_a_disabled_hysteresis() {
             "long-delegated-lead-off",
             long_delegated_lead_off_config,
             "more than the lead",
-            &[0, 3],
+            &[1, 3],
         ),
         (
             "long-delegated-hysteresis-off",
             long_delegated_hysteresis_off_config,
             "follows own gated row",
-            &[57, 103],
+            &[64, 118],
         ),
     ];
     for (label, config, needle, seeds) in controls {

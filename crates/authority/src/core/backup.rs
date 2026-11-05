@@ -1474,6 +1474,20 @@ impl Core {
     }
 
     /// `durable_jseq` under the held version's `Local` or `Backup` policy.
+    /// Plan 46 M1.1: the journal seq through which this tenure's
+    /// configuration has committed its rows, for a copy another sequencer
+    /// counts on (a delegate's row this root appended,
+    /// `DelegateStreamAck.committed`): [`Self::durable_jseq`], except that a
+    /// lone root's journal (`u64::MAX` outside an epoch hold) commits
+    /// nothing beyond the archive (`shipped_through`). An epoch hold's
+    /// journal still counts until plan 46 M1.4 makes the hold a group.
+    pub(crate) fn config_committed_jseq(&self) -> u64 {
+        match self.durable_jseq() {
+            u64::MAX if !self.lease.epoch_held() => self.ack.shipped_through,
+            d => d,
+        }
+    }
+
     fn durable_jseq_held(&self) -> u64 {
         let committed = self.lease.backups();
         if committed.is_empty() {

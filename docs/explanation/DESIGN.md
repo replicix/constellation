@@ -873,15 +873,14 @@ chosen per filesystem and topology
   directory older than the node's own last lapse, nor before the first
   one). Its own node's op is acknowledged once it is on the
   sequencer's disk, the one speculation a deposition may roll back (it
-  replays by rid). There is a second one
-  ([ADR-41](DECISIONS.md#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16)):
-  a delegate with no recorded backup acknowledges once the lone root's
-  journal holds the row's append, so that journal is the group's second
-  copy, and it reaches the OS, not the disk (the commit is `u64::MAX`). A
-  TTL claim of a live, unaware root (a suspend, an S3 cut, a stalled disk)
-  rolls such an acknowledged row back, and it replays by rid. A lone
-  root's commit is removed in plan 46 M1.3 (no lone delegate, sticky
-  grants, a singleton as the only lone sequencer). Another node's forward is acknowledged once its segment
+  replays by rid). A lone root's journal is no second copy for anyone
+  else: a delegate with no recorded backup counts the root's appended row
+  only once the root's own configuration has committed it
+  ([ADR-41](DECISIONS.md#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16),
+  its lone-journal branch removed in plan 46 M1.1, the ADR's amended text
+  following with M1.3), which for a lone root is the archive: a lone root
+  paused past its expiry is taken over from the archive alone, and a row
+  answered on its journal would be lost with the delegate. Another node's forward is acknowledged once its segment
   is in the log: its row is journaled `Archive`, a deposition keeps it as
   a member copy, and the requester's retry by rid is its only other copy
   ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3),

@@ -46043,13 +46043,17 @@ mod deleg_group {
         assert!(stream_acks_to_3(&out).is_empty(), "{out:?}");
     }
 
-    /// The root's journal counts for a root nothing gates (`durable_jseq` is
-    /// `u64::MAX`, a lone root): its successor takes over only at the
-    /// lease's expiry, so no backup's seal can leave the row behind. The
-    /// acknowledgement says committed at once (unlike
-    /// `holder_append_uncommitted`, whose use answers `Lone`).
+    /// Plan 46 M1.1 (§11, "M1.0 answers": ADR-41's lone-journal branch
+    /// removed): a lone root (`durable_jseq` is `u64::MAX`: no backup, none
+    /// to be had) acknowledges a delegate's batch as appended but commits
+    /// its copy only by the archive. Its journal is no second copy: a lone
+    /// root paused past its expiry is taken over from the archive alone, and
+    /// a row the delegate answered on that journal is lost when the delegate
+    /// then fails (model: `node_stream`'s knob `root_journal_counts` violates
+    /// `acked_never_lost`). Once the row ships, the push says committed.
+    /// Fails before: `committed` 1 at once.
     #[test]
-    fn a_lone_root_acks_a_delegates_row_as_committed_at_once() {
+    fn a_lone_root_acks_a_delegates_row_as_committed_only_once_it_ships() {
         let mut h = Harness::new(1);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
@@ -46058,6 +46062,20 @@ mod deleg_group {
         h.core.ack.eligible = Some(false);
         assert_eq!(h.core.durable_jseq(), u64::MAX);
         let out = root_takes_a_delegates_batch(&mut h);
+        assert_eq!(h.core.dl.gens[&7].cursor, 1, "the root did not append");
+        assert_eq!(
+            stream_acks_to_3(&out),
+            vec![(OpId(10), 1, 1, 0, false)],
+            "appended, not committed: {out:?}"
+        );
+        // Nothing new: no push while the row is on the root's journal alone.
+        let out = poke(&mut h);
+        assert!(stream_acks_to_3(&out).is_empty(), "{out:?}");
+        // The log carries it: committed, pushed on the batch's round and
+        // request.
+        let tip = h.meta.journal_tip().unwrap();
+        h.core.note_shipped(&[], tip);
+        let out = poke(&mut h);
         assert_eq!(
             stream_acks_to_3(&out),
             vec![(OpId(10), 1, 1, 1, false)],

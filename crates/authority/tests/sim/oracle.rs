@@ -1116,7 +1116,7 @@ fn classify(
     if let Some(t) = tx {
         let (g, i) = t.origin;
         if g != 0 {
-            match deleg_group(o, answerer, st, (rid, want), g, i, t, holder_txs) {
+            match deleg_group(o, answerer, st, (rid, want), g, i, t, lease, holder_txs) {
                 Ok(why) => {
                     detail.push(format!("deleg-group: {why}"));
                     return Some(AckClass::DelegGroup { gen: g });
@@ -1265,7 +1265,11 @@ fn root_group(
 }
 
 /// DelegGroup: the delegate holds `(g, i)`; each recorded backup's delegate
-/// tail holds it, or, with none recorded, the root's journal does.
+/// tail holds it, or, with none recorded, the root's journal does and the
+/// root's own configuration committed that copy: every backup the lease
+/// object lists holds it (plan 46 §11, "M1.0 answers": a lone root's
+/// journal is no second copy; with no backup the root commits by the
+/// archive, judged before this).
 #[allow(clippy::too_many_arguments)]
 fn deleg_group(
     o: &Oracles,
@@ -1275,6 +1279,7 @@ fn deleg_group(
     g: u64,
     i: u64,
     t: &TxRef,
+    lease: Option<&Lease>,
     holder_txs: &[BackupTx],
 ) -> Result<String, String> {
     // The delegate's journal holds it — or the root appended it and the
@@ -1315,9 +1320,27 @@ fn deleg_group(
         return Ok(format!("every recorded backup {backups:?} holds ({g},{i})"));
     }
     if root_has {
-        Ok(format!(
-            "no backup recorded; the root journal holds ({g},{i})"
-        ))
+        match lease {
+            Some(l) if !l.backups.is_empty() => match root_group(o, l, (rid, want), holder_txs) {
+                Ok(()) => Ok(format!(
+                    "no backup recorded; the root journal holds ({g},{i}) and every \
+                     backup the lease lists holds it"
+                )),
+                Err(why) => Err(format!(
+                    "no backup recorded; the root journal holds ({g},{i}) but its \
+                     configuration has not committed it: {why}"
+                )),
+            },
+            Some(l) => Err(format!(
+                "no backup recorded; the root journal holds ({g},{i}) but the lease at \
+                 epoch {} lists no backup: only the archive commits the root's copy",
+                l.epoch
+            )),
+            None => Err(format!(
+                "no backup recorded; the root journal holds ({g},{i}) but there is no \
+                 lease object"
+            )),
+        }
     } else {
         Err(format!(
             "no backup recorded and the root's journal lacks the appended row ({g},{i})"
@@ -2830,6 +2853,57 @@ mod tests {
         assert_eq!(w.judge(1, &st, r).class, Some(AckClass::Archive));
     }
 
+    /// Plan 46 M1.1: with no delegate backup recorded, the root's appended
+    /// copy counts once the root's own configuration committed it: every
+    /// backup the lease lists holds the append.
+    #[test]
+    fn i1_deleg_group_counts_the_root_append_once_the_roots_backups_hold_it() {
+        let w = world();
+        let r = rid(3, 1);
+        let m = &w.metas[&2];
+        let ino = m.allocate_ino(ROOT_INO).unwrap();
+        let op = MutateOp::Create {
+            parent: ROOT_INO,
+            name: "x".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let (records, _) = m
+            .delegate_execute(
+                &op,
+                Some(r),
+                1,
+                Position::ZERO,
+                &constellation_meta::locks::LockTag::NONE,
+                Now::same(0),
+            )
+            .unwrap();
+        w.lease(1, 1, &[3]);
+        let st = AnswererState {
+            holds_gens: vec![1],
+            ..Default::default()
+        };
+        w.metas[&1]
+            .apply_delegate_tx(&records, Some(r), 1, 1, Position::ZERO)
+            .unwrap();
+        let j = w.judge(2, &st, r);
+        assert_eq!(j.class, None, "{}", j.detail);
+        assert!(j.detail.contains("listed backup 3"), "{}", j.detail);
+        // The root's backup holds the append: the root's configuration
+        // committed its copy.
+        let txs = Replica::journal_txs_from(&*w.metas[&1], 0, usize::MAX);
+        w.metas[&3].backup_append(1, &txs).unwrap();
+        let j = w.judge(2, &st, r);
+        assert_eq!(
+            j.class,
+            Some(AckClass::DelegGroup { gen: 1 }),
+            "{}",
+            j.detail
+        );
+    }
+
     #[test]
     fn i1_deleg_group_needs_the_root_append_when_no_backup() {
         let w = world();
@@ -2865,17 +2939,15 @@ mod tests {
         assert_eq!(j.tx.as_ref().map(|t| t.origin), Some((1, 1)));
         assert_eq!(j.class, None, "{}", j.detail);
         assert_eq!(j.expected, Expected::Class(AckClass::DelegGroup { gen: 1 }));
-        // The root appends the row (origin (1, 1)) to its journal.
+        // The root appends the row (origin (1, 1)) to its journal. A lone
+        // root's journal is no second copy (plan 46 M1.1): with no backup
+        // listed only the archive commits the root's copy.
         w.metas[&1]
             .apply_delegate_tx(&records, Some(r), 1, 1, Position::ZERO)
             .unwrap();
         let j = w.judge(2, &st, r);
-        assert_eq!(
-            j.class,
-            Some(AckClass::DelegGroup { gen: 1 }),
-            "{}",
-            j.detail
-        );
+        assert_eq!(j.class, None, "{}", j.detail);
+        assert!(j.detail.contains("lists no backup"), "{}", j.detail);
         // With a recorded backup it is the backup's tail that must hold it.
         let st = AnswererState {
             holds_gens: vec![1],

@@ -119,7 +119,8 @@ through the delegate. It then:
    - With no backup recorded for the generation the group is the delegate
      and the root: the answer leaves when the root has appended the row and
      its own tenure has *committed* the append (shipped, or held by every
-     backup it gates on; a lone root's journal counts) — the root's
+     backup it gates on; a lone root's journal does not count, so with no
+     backup the answer waits for the archive, plan 46 M1.1) — the root's
      `DelegateStreamAck.committed` reaches the row's index, `through` being
      the appended cursor that only paces the stream
      ([ADR-41](../../explanation/DECISIONS.md#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16)).

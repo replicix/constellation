@@ -2935,15 +2935,19 @@ impl Core {
     /// root}` counts the root's copy of a row only once it survives the
     /// root's deposition: the row is shipped (`journal_acked_seq`, or out of
     /// order), or this tenure holds the lease, is not lost, and every
-    /// backup it gates on holds it (`durable_jseq`; `u64::MAX` for a lone
-    /// root or an epoch hold, where the journal counts: nothing takes a
-    /// lone root's tenure over before its expiry). A root with backups
-    /// therefore acknowledges only once they hold the append: its successor
-    /// is a backup, or has sealed one, and holds the row. Unlike
-    /// [`Self::holder_append_cap`] (whose use answers `Lone` and so excludes
-    /// a lone tenure) this one counts a lone tenure's journal. Cached like
-    /// it, in `dl.root_caps` (keyed also by where the scan starts, the
-    /// committed prefix last sent); a store error caps at 0, uncached.
+    /// backup it gates on holds it ([`Self::config_committed_jseq`]). A root
+    /// with backups therefore acknowledges only once they hold the append:
+    /// its successor is a backup, or has sealed one, and holds the row. A
+    /// lone root's journal counts for nothing (plan 46 §11, "M1.0 answers":
+    /// ADR-41's lone-journal branch removed): a lone root paused past its
+    /// expiry is taken over from the archive alone, and a row the delegate
+    /// answered on that journal is lost when the delegate then fails; with
+    /// no backup the root's configuration commits by the archive. (Model:
+    /// `node_stream`'s knob `root_journal_counts` violates
+    /// `acked_never_lost`.) An epoch hold's journal still counts (plan 46
+    /// M1.4 makes the hold a group). Cached like [`Self::holder_append_cap`],
+    /// in `dl.root_caps` (keyed also by where the scan starts, the committed
+    /// prefix last sent); a store error caps at 0, uncached.
     pub(crate) fn root_append_cap(&mut self, gen: u64, replica: &dyn Replica) -> u64 {
         let tip = replica.holder_append_tip();
         if tip == 0 {
@@ -2955,7 +2959,7 @@ impl Core {
             return u64::MAX;
         }
         let holds = self.lease.held.is_some() && !self.lease.lost;
-        let durable = self.durable_jseq();
+        let durable = self.config_committed_jseq();
         let stamp = HolderCapStamp {
             tip,
             shipped,
