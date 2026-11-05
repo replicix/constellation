@@ -2362,6 +2362,20 @@ pub const CAMPAIGN: &[Scenario] = &[
         run: m14::lock_store_stall_past_lease,
     },
     Scenario {
+        name: "lock-lane-overhead",
+        desc: "plan 41 section 9 items 6 and 7: renewal traffic and idle cost of the lock lane: two nodes, phases with no lock held, 1, 100 and N remote grants held at B and N own grants at A, each sampled for a window; P41OVH lines with the lane thread's CPU and wake-ups, the lock and lane counters and the S3 request counters as deltas (CONSTELLATION_LOCK_LANE=off for the baseline; CONSTELLATION_HARNESS_OVH_WINDOW_S, CONSTELLATION_HARNESS_OVH_N)",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: m14::lock_lane_overhead,
+    },
+    Scenario {
+        name: "lock-xcheckfs-cell",
+        desc: "plan 41 section 8.3: the xcheckfs stress lane (CONSTELLATION_HARNESS_XC_SCRIPT, _XC_BIN, _XC_PRIMARY_BASE, _XC_OUT) with node A's mount as the secondary, one or two nodes (CONSTELLATION_HARNESS_XC_NODES), write-back, --locks cluster; B holds flocks; the state dir is where TMPDIR is (a slow device via CONSTELLATION_HARNESS_DEVICE_HOOK); passes when the lane is clean and no node lost a lock or fenced an owner",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: m14::lock_xcheckfs_cell,
+    },
+    Scenario {
         name: "lock-store-stall-holder",
         desc: "plan 41 L4: two nodes, B holds an exclusive flock granted by A while A's client blocks on it; one metadata write of B's holds B's store 10 s (a 3 s lock TTL): B's lane renews the grant at the owner, so B keeps the lock (its write under it answers OK, nothing lost or fenced, lane.remote_ok > 0) and A gets it only after B's unlock; CONSTELLATION_HARNESS_HOLDER_LANE=off expects B's EIO (the in-scenario fail-before)",
         requires: &[],

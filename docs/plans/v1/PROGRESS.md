@@ -66423,3 +66423,27 @@ authority, engine, harness and control, all targets, clean; meta all targets pas
 passed; control schema blessed (two new `status.ack` fields); the release sim suite 394 passed, 0 failed, 12 ignored. 1,000-seed
 sweeps (seeds 0 to 999), without and with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, of `long-delegated-late-answers` and
 `delegated-root-gone`: 0 failing seeds in all four, so `unjustified_ships` stayed 0.
+
+
+## Plan 41 acceptance runs, items 6 and 7 and the xcheckfs cells
+
+- Ran plan 41 section 9 items 6 and 7 and section 8.3's xcheckfs cells (results and method in
+  `bench/lock-lane/RESULTS.md`, "Plan 41 section 9 items 6 and 7 and the xcheckfs cells"). Nothing in the plan is ticked.
+- Item 6 (renewal traffic): 1 held grant 9 renewals per minute with the lane on and off; 100 held grants 9.0 per grant per
+  minute off, 10.0 on (+11 %, the lane adds one entry per grant per minute); no S3 request added (B's GET/PUT/LIST equal on and off).
+  The renewal rate does not depend on the lock TTL (the lease's usable window caps it), so "10,000 held, none due" cannot be set up.
+- Item 7 (idle and CPU): **not met.** The lane ticks every 250 ms with no grant held (957 wake-ups per minute, 0.010 % of a core), not
+  zero. With 10,000 held grants its CPU is 13.8 to 22.4 % of a core (bound: 0.5 %): 16.3 % remote at B, 22.4 % own at A. At 10,000
+  own grants the lane adds 20,000 lapse parks (0 with it off); at 10,000 remote grants it sends 143,180 renewal entries a minute for 20,581
+  answered; B's core takes 0.63 s per `LaneRenewed` step. With the lane off 10,000 remote grants are barely renewed by the core either
+  (25 to 161 a minute, 2,600 lapse parks), and 10,000 at both nodes lose locks with the lane on and off (2,498 / 3,040): a scale limit of the core, not
+  only of the lane.
+- xcheckfs cells (lane on; write-back; the stress lane with node A as the secondary): finding-08 cell (1 node, host load up to 52, state on ext4)
+  1.09 M operations, 0 mismatches, nothing lost or fenced; two nodes with the state dirs on a `dm-delay` device (1 s flush), without and with 9 12 s
+  freezes (5.5 M operations each): 0 locks lost, 0 owners fenced, 0 fenced `EIO`; lane off with the freezes the same. No lock-lapse finding. The
+  freeze cell stalled B's core 12 s but also froze the owner A (L5's case), so it does not separate the arms (B's lapse parks 79 on, 97 off, no `EIO`). The
+  finding-08 stall itself (18 s) did not occur on this host (longest core step 77 ms). Unrelated mismatches: the mount root's mtime
+  2 s late in two-node runs (write-back), time-range differences at the maximum time with a btrfs primary, one `mmap` mtime at verify.
+- Harness additions: `lock-lane-overhead` (phases, `CONSTELLATION_HARNESS_OVH_*`, `P41OVH` lines) and `lock-xcheckfs-cell`
+  (`CONSTELLATION_HARNESS_XC_*`). The scenarios kill the daemons at the end of a 10,000-grant run: closing the descriptors did not finish
+  within 10 minutes (`lock-wait` threads spinning at 15 % CPU each in B's daemon, lane off), itself worth a look.

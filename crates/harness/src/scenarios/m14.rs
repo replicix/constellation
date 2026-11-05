@@ -4029,3 +4029,465 @@ mod outwait_tests {
         assert!(outwaits_allowed(1, 3, 2));
     }
 }
+
+// ------------------------------------------------------------------ lock-lane-overhead
+
+/// What `/proc` says about one daemon's CPU and wake-ups: the lane's thread
+/// (`cst-lock-lane`) and the whole process, in clock ticks and context
+/// switches.
+#[derive(Clone, Copy, Default)]
+struct ProcSample {
+    lane_ticks: u64,
+    lane_switches: u64,
+    proc_ticks: u64,
+    proc_switches: u64,
+    at_ms: u64,
+}
+
+fn proc_sample(pid: u32, started: Instant) -> ProcSample {
+    let mut s = ProcSample {
+        at_ms: started.elapsed().as_millis() as u64,
+        ..Default::default()
+    };
+    let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return s;
+    };
+    for t in dir.flatten() {
+        let p = t.path();
+        let comm = std::fs::read_to_string(p.join("comm")).unwrap_or_default();
+        // `schedstat`: nanoseconds on a CPU (the clock-tick `stat` fields are too coarse
+        // for a thread that uses a few milliseconds a minute).
+        let ticks = std::fs::read_to_string(p.join("schedstat"))
+            .ok()
+            .and_then(|t| {
+                t.split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+            .unwrap_or(0);
+        let status = std::fs::read_to_string(p.join("status")).unwrap_or_default();
+        let mut sw = 0u64;
+        for line in status.lines() {
+            if let Some(v) = line
+                .strip_prefix("voluntary_ctxt_switches:")
+                .or_else(|| line.strip_prefix("nonvoluntary_ctxt_switches:"))
+            {
+                sw += v.trim().parse::<u64>().unwrap_or(0);
+            }
+        }
+        s.proc_ticks += ticks;
+        s.proc_switches += sw;
+        if comm.trim() == "cst-lock-lane" {
+            s.lane_ticks += ticks;
+            s.lane_switches += sw;
+        }
+    }
+    s
+}
+
+/// Plan 41 section 9 items 6 and 7: renewal traffic and idle cost of the
+/// lock renewal lane. Two nodes; phases with no lock held, one grant held
+/// at B (a remote grant: B renews at A), 100 and `N` grants held at B and
+/// `N` at A (A's own grants), each sampled for a window. Per phase and node
+/// one `P41OVH` line: the lane's and the process's CPU and wake-ups, the
+/// lock counters (`renewals` the core's, `lane.*` the lane's) and the S3
+/// request counters, all as deltas over the window.
+/// `CONSTELLATION_LOCK_LANE=off` runs the daemons without the lane (the
+/// baseline); `CONSTELLATION_HARNESS_OVH_WINDOW_S` (60) and
+/// `CONSTELLATION_HARNESS_OVH_N` (10000) size it.
+pub fn lock_lane_overhead(_seed: u64) -> Result<()> {
+    const NAME: &str = "lock-lane-overhead";
+    let env_u64 = |k: &str, d: u64| -> u64 {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(d)
+    };
+    let window = Duration::from_secs(env_u64("CONSTELLATION_HARNESS_OVH_WINDOW_S", 60));
+    let n = env_u64("CONSTELLATION_HARNESS_OVH_N", 10_000) as usize;
+    let lane = std::env::var("CONSTELLATION_LOCK_LANE").unwrap_or_else(|_| "on".into());
+    // 10,000 held descriptors in this process.
+    unsafe {
+        let lim = libc::rlimit {
+            rlim_cur: 200_000,
+            rlim_max: 200_000,
+        };
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+            let mut cur: libc::rlimit = std::mem::zeroed();
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut cur);
+            cur.rlim_cur = cur.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &cur);
+        }
+    }
+    let (_env, _root, mut clients, _) =
+        cluster(NAME, &["a", "b"], &[("CONSTELLATION_LOCK_LANE", &lane)], 0)?;
+    let mut killed = false;
+    let result = (|| -> Result<()> {
+        killed = n > 1_000;
+        let started = Instant::now();
+        let a = &clients[0];
+        let b = &clients[1];
+        let dir_a = a.mnt.join("ovh");
+        std::fs::create_dir_all(&dir_a)?;
+        {
+            let total = 2 * n + 101;
+            let t0 = Instant::now();
+            let res: Vec<Result<()>> = std::thread::scope(|sc| {
+                let hs: Vec<_> = (0..16usize)
+                    .map(|k| {
+                        let d = dir_a.clone();
+                        sc.spawn(move || -> Result<()> {
+                            let mut i = k;
+                            while i < total {
+                                std::fs::write(d.join(format!("f{i}")), b"x")?;
+                                i += 16;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                hs.into_iter()
+                    .map(|h| h.join().expect("create thread"))
+                    .collect()
+            });
+            for r in res {
+                r?;
+            }
+            eprintln!(
+                "    {NAME}: {total} files created in {:.1}s",
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        let last = format!("f{}", 2 * n + 100);
+        eventually("files visible on B", Duration::from_secs(300), || {
+            anyhow::ensure!(
+                b.mnt.join("ovh").join(&last).exists(),
+                "{last} missing on B"
+            );
+            Ok(())
+        })?;
+        let pids = [a.pid().context("a pid")?, b.pid().context("b pid")?];
+        let sample = |phase: &str, grants: (usize, usize), hold: &mut dyn FnMut() -> Result<()>| {
+            hold()?;
+            // Let the burst of acquiring settle before the window.
+            std::thread::sleep(Duration::from_secs(10));
+            let before: Vec<(ProcSample, serde_json::Value)> = clients
+                .iter()
+                .zip(pids)
+                .map(|(c, p)| {
+                    (
+                        proc_sample(p, started),
+                        c.control_status().unwrap_or_default(),
+                    )
+                })
+                .collect();
+            std::thread::sleep(window);
+            for ((c, p), (b0, s0)) in clients.iter().zip(pids).zip(before) {
+                let b1 = proc_sample(p, started);
+                let s1 = c.control_status()?;
+                let d = |a: &serde_json::Value, b: &serde_json::Value| -> i64 {
+                    b.as_i64().unwrap_or(0) - a.as_i64().unwrap_or(0)
+                };
+                let secs = (b1.at_ms - b0.at_ms) as f64 / 1000.0;
+                let s3 = |k: &str| d(&s0["s3"][k], &s1["s3"][k]);
+                eprintln!(
+                    "    P41OVH scenario={NAME} lane={lane} phase={phase} node={} grants_a={} grants_b={} \
+                     held={} secs={secs:.1} lane_cpu_pct={:.4} proc_cpu_pct={:.3} \
+                     lane_switches_per_min={:.1} proc_switches_per_min={:.1} \
+                     core_renewals={} lane_own={} lane_remote_sent={} lane_remote_ok={} lane_ticks={} stuck_ticks={} lapse_parks={} owners_fenced={} \
+                     s3_get={} s3_head={} s3_put={} s3_list={} s3_delete={} s3_copy={} lost={}",
+                    c.name,
+                    grants.0,
+                    grants.1,
+                    s1["locks"]["grants_held"],
+                    (b1.lane_ticks - b0.lane_ticks) as f64 / 1e9 / secs * 100.0,
+                    (b1.proc_ticks - b0.proc_ticks) as f64 / 1e9 / secs * 100.0,
+                    (b1.lane_switches - b0.lane_switches) as f64 / secs * 60.0,
+                    (b1.proc_switches - b0.proc_switches) as f64 / secs * 60.0,
+                    d(&s0["locks"]["renewals"], &s1["locks"]["renewals"]),
+                    d(&s0["locks"]["lane"]["own_renewals"], &s1["locks"]["lane"]["own_renewals"]),
+                    d(&s0["locks"]["lane"]["remote_sent"], &s1["locks"]["lane"]["remote_sent"]),
+                    d(&s0["locks"]["lane"]["remote_ok"], &s1["locks"]["lane"]["remote_ok"]),
+                    d(&s0["locks"]["lane"]["ticks"], &s1["locks"]["lane"]["ticks"]),
+                    d(&s0["locks"]["lane"]["stuck_ticks"], &s1["locks"]["lane"]["stuck_ticks"]),
+                    d(&s0["locks"]["lapse_parks"], &s1["locks"]["lapse_parks"]),
+                    s1["locks"]["owners_fenced"],
+                    s3("get"),
+                    s3("head"),
+                    s3("put"),
+                    s3("list"),
+                    s3("delete"),
+                    s3("copy"),
+                    s1["locks"]["lost"],
+                );
+                anyhow::ensure!(
+                    s1["locks"]["lost"].as_u64().unwrap_or(0) == 0
+                        && s1["locks"]["owners_fenced"].as_u64().unwrap_or(0) == 0,
+                    "a lock was lost or an owner fenced on {} in phase {phase}: {}",
+                    c.name,
+                    s1["locks"]
+                );
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let mut held: Vec<File> = Vec::new();
+        let lock_range =
+            |held: &mut Vec<File>, node: &Client, from: usize, to: usize| -> Result<()> {
+                // 32 threads: each first lock of a file on a non-sequencer is a round trip.
+                let t0 = Instant::now();
+                let threads = 32usize;
+                let got: Vec<Result<Vec<File>>> = std::thread::scope(|sc| {
+                    let hs: Vec<_> = (0..threads)
+                        .map(|k| {
+                            let mnt = node.mnt.clone();
+                            sc.spawn(move || -> Result<Vec<File>> {
+                                let mut v = Vec::new();
+                                let mut i = from + k;
+                                while i < to {
+                                    let f = open_rw(&mnt.join("ovh").join(format!("f{i}")))?;
+                                    flock(&f, libc::LOCK_EX)
+                                        .map_err(|e| anyhow::anyhow!("lock f{i}: {e}"))?;
+                                    v.push(f);
+                                    i += threads;
+                                }
+                                Ok(v)
+                            })
+                        })
+                        .collect();
+                    hs.into_iter()
+                        .map(|h| h.join().expect("lock thread"))
+                        .collect()
+                });
+                for r in got {
+                    held.extend(r?);
+                }
+                eprintln!(
+                    "    {NAME}: {} locks taken on {} in {:.1}s ({} held)",
+                    to - from,
+                    node.name,
+                    t0.elapsed().as_secs_f64(),
+                    held.len()
+                );
+                Ok(())
+            };
+        let phases = std::env::var("CONSTELLATION_HARNESS_OVH_PHASES")
+            .unwrap_or_else(|_| "idle,b1,b100,bN,aN_bN".into());
+        for ph in phases.split(',').map(str::trim) {
+            match ph {
+                "idle" => sample("idle", (0, 0), &mut || Ok(()))?,
+                "b1" => sample("b1", (0, 1), &mut || lock_range(&mut held, b, 0, 1))?,
+                "b100" => sample("b100", (0, 100), &mut || lock_range(&mut held, b, 1, 100))?,
+                "bN" => sample("bN", (0, n), &mut || lock_range(&mut held, b, 100, n))?,
+                "aN" => sample("aN", (n, 0), &mut || lock_range(&mut held, a, 0, n))?,
+                "aN_bN" => sample("aN_bN", (n, n), &mut || lock_range(&mut held, a, n, 2 * n))?,
+                other => bail!("unknown phase {other}"),
+            }
+        }
+        // Closing 10,000 locked descriptors on a loaded mount does not finish
+        // within minutes (each close waits for its lock's release): the
+        // measurement is over, so the daemons are killed and the mounts
+        // detached, the descriptors left alone.
+        std::mem::forget(std::mem::take(&mut held));
+        Ok(())
+    })();
+    if result.is_err() {
+        keep_logs(NAME, &clients);
+    }
+    for c in clients.iter_mut().rev() {
+        if killed {
+            let _ = c.kill9();
+            c.detach_dead_mount();
+        } else {
+            let _ = c.unmount();
+        }
+    }
+    result
+}
+
+// ------------------------------------------------------------------ lock-xcheckfs-cell
+
+/// Plan 41 section 8.3 / 9, the xcheckfs cells: the xcheckfs stress lane
+/// (`tests/external/run-stress.sh` of the sibling project, named by
+/// `CONSTELLATION_HARNESS_XC_SCRIPT`, with `CONSTELLATION_HARNESS_XC_BIN`)
+/// runs with node A's mount as the secondary and a tree on another file
+/// system as the primary: its lock stressors (`lockf`, `fcntl`, `flock`,
+/// `locka`, `lockofd`) and the mirrored writes put locks on A, the way the
+/// run of 2026-10-13 (finding 08) did. `CONSTELLATION_HARNESS_XC_NODES`
+/// (1 or 2): with two, B holds `XC_B_LOCKS` flocks (default 20) for the
+/// whole run and re-locks a file now and then, so A's lane renews remote
+/// grants too. The daemons run write-back, `--locks cluster`, the lane per
+/// `CONSTELLATION_LOCK_LANE`. The scenario's `TMPDIR` is where the state
+/// lives (a slow device in the bench's cells);
+/// `CONSTELLATION_HARNESS_DEVICE_HOOK slow|fast` swaps it once the daemons
+/// are mounted. Passing: the script exits 0 (no mismatch, `verify` clean)
+/// and no node lost a lock, fenced an owner or answered a fenced `EIO`.
+pub fn lock_xcheckfs_cell(_seed: u64) -> Result<()> {
+    const NAME: &str = "lock-xcheckfs-cell";
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let script =
+        var("CONSTELLATION_HARNESS_XC_SCRIPT").context("CONSTELLATION_HARNESS_XC_SCRIPT")?;
+    let xc_bin = var("CONSTELLATION_HARNESS_XC_BIN").context("CONSTELLATION_HARNESS_XC_BIN")?;
+    let primary_base = var("CONSTELLATION_HARNESS_XC_PRIMARY_BASE")
+        .context("CONSTELLATION_HARNESS_XC_PRIMARY_BASE")?;
+    let out = var("CONSTELLATION_HARNESS_XC_OUT").context("CONSTELLATION_HARNESS_XC_OUT")?;
+    let nodes: usize = var("CONSTELLATION_HARNESS_XC_NODES")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let b_locks: usize = var("CONSTELLATION_HARNESS_XC_B_LOCKS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let max_s: u64 = var("CONSTELLATION_HARNESS_XC_MAX_S")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5400);
+    let lane = var("CONSTELLATION_LOCK_LANE").unwrap_or_else(|| "on".into());
+    let names: &[&str] = if nodes >= 2 { &["a", "b"] } else { &["a"] };
+    let (env, root) = setup(NAME)?;
+    let backend = format!("s3://{BUCKET}/{NAME}-{}", ts());
+    let mut clients = Vec::new();
+    for name in names {
+        let mut c = Client::new(root.path(), name, &env.direct_endpoint, &backend)?
+            .with_own_node_key()
+            .with_write_mode("back")
+            .with_env("CONSTELLATION_LOCKS", "cluster")
+            .with_env("CONSTELLATION_LOCK_LANE", &lane)
+            .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "200")
+            .with_env(
+                "RUST_LOG",
+                "info,constellation_authority::core::locks=debug,constellation::locks=debug",
+            );
+        c = c.with_env(
+            "CONSTELLATION_FAULT_P2P_DENY_FILE",
+            &super::m9::c_deny_path(root.path(), name)
+                .display()
+                .to_string(),
+        );
+        clients.push(c);
+    }
+    clients[0].fs_create()?;
+    for c in clients.iter_mut() {
+        c.mount()?;
+    }
+    if clients.len() > 1 {
+        let refs: Vec<&Client> = clients.iter().collect();
+        wait_for_p2p(&refs)?;
+    }
+    let hook = |mode: &str| -> Result<()> {
+        if let Ok(h) = std::env::var("CONSTELLATION_HARNESS_DEVICE_HOOK") {
+            let st = std::process::Command::new(&h).arg(mode).status()?;
+            anyhow::ensure!(st.success(), "{h} {mode}: {st}");
+        }
+        Ok(())
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut b_thread = None;
+    let result = (|| -> Result<()> {
+        let a = &clients[0];
+        let sub = a.mnt.join("xc");
+        std::fs::create_dir_all(&sub)?;
+        if let Some(b) = clients.get(1) {
+            std::fs::create_dir_all(a.mnt.join("bl"))?;
+            for i in 0..b_locks {
+                std::fs::write(a.mnt.join("bl").join(format!("l{i}")), b"x")?;
+            }
+            eventually("B's files visible", Duration::from_secs(60), || {
+                anyhow::ensure!(
+                    b.mnt.join("bl").join(format!("l{}", b_locks - 1)).exists(),
+                    "missing"
+                );
+                Ok(())
+            })?;
+            let (bm, stop2) = (b.mnt.clone(), stop.clone());
+            b_thread = Some(std::thread::spawn(move || -> Result<u64> {
+                let mut held = Vec::new();
+                for i in 0..b_locks {
+                    let f = open_rw(&bm.join("bl").join(format!("l{i}")))?;
+                    flock(&f, libc::LOCK_EX).map_err(|e| anyhow::anyhow!("B lock l{i}: {e}"))?;
+                    held.push(f);
+                }
+                let mut cycles = 0u64;
+                while !stop2.load(Ordering::Relaxed) {
+                    // Re-lock one held file now and then (an unlock and a lock).
+                    let i = (cycles as usize) % held.len().max(1);
+                    if let Some(f) = held.get(i) {
+                        flock(f, libc::LOCK_UN).map_err(|e| anyhow::anyhow!("B unlock: {e}"))?;
+                        flock(f, libc::LOCK_EX).map_err(|e| anyhow::anyhow!("B relock: {e}"))?;
+                    }
+                    cycles += 1;
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                Ok(cycles)
+            }));
+        }
+        hook("slow")?;
+        eprintln!("    {NAME}: running the xcheckfs stress lane ({nodes} node(s), lane {lane})");
+        let mut child = std::process::Command::new("timeout")
+            .arg("--kill-after=60s")
+            .arg(max_s.to_string())
+            .arg("bash")
+            .arg(&script)
+            .env("XCHECKFS", &xc_bin)
+            .env("PRIMARY_BASE", &primary_base)
+            .env("SECONDARY_BASE", &sub)
+            .env("STRESS_BASE", &primary_base)
+            .env("KEEP", "failed")
+            .stdout(std::fs::File::create(&out)?)
+            .stderr(std::fs::File::create(format!("{out}.err"))?)
+            .spawn()
+            .context("spawning the stress lane")?;
+        // While it runs, record the lock counters now and then.
+        let started = Instant::now();
+        let rc = loop {
+            if let Some(st) = child.try_wait()? {
+                break st;
+            }
+            std::thread::sleep(Duration::from_secs(30));
+            for c in &clients {
+                if let Ok(l) = locks_of(c) {
+                    eprintln!(
+                        "    {NAME}: t={}s {} grants_held={} lost={} owners_fenced={} fenced_io={} owner_fenced_ops={} lane={}",
+                        started.elapsed().as_secs(), c.name, l["grants_held"], l["lost"], l["owners_fenced"], l["fenced_io"], l["owner_fenced_ops"], l["lane"]
+                    );
+                }
+            }
+        };
+        hook("fast")?;
+        eprintln!(
+            "    {NAME}: the lane exited {rc} after {}s",
+            started.elapsed().as_secs()
+        );
+        let mut bad = Vec::new();
+        for c in &clients {
+            let l = locks_of(c)?;
+            eprintln!("    P41XC node={} lane={lane} locks={l}", c.name);
+            if l["lost"].as_u64().unwrap_or(0) != 0
+                || l["owners_fenced"].as_u64().unwrap_or(0) != 0
+                || l["owner_fenced_ops"].as_u64().unwrap_or(0) != 0
+                || l["fenced_io"].as_u64().unwrap_or(0) != 0
+            {
+                bad.push(c.name.clone());
+            }
+        }
+        anyhow::ensure!(
+            bad.is_empty(),
+            "lock lapse on {bad:?} (lost / fenced counters above)"
+        );
+        anyhow::ensure!(rc.success(), "the stress lane failed: {rc} (see {out})");
+        Ok(())
+    })();
+    stop.store(true, Ordering::Relaxed);
+    if let Some(t) = b_thread {
+        match t.join() {
+            Ok(Ok(n)) => eprintln!("    {NAME}: B re-locked {n} times"),
+            Ok(Err(e)) => eprintln!("    {NAME}: B's lock thread failed: {e:#}"),
+            Err(_) => eprintln!("    {NAME}: B's lock thread panicked"),
+        }
+    }
+    let _ = hook("fast");
+    if result.is_err() {
+        keep_logs(NAME, &clients);
+    }
+    for c in clients.iter_mut().rev() {
+        let _ = c.unmount();
+    }
+    result
+}
