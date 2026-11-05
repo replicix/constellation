@@ -8843,6 +8843,31 @@ fn regression_an_abandoned_ops_effect_explains_a_read_seed_7211() {
     });
 }
 
+/// Known gap, pinned (fails on main): `long-delegated-late-answers` seed 2560
+/// (no knob; the default clock mix's reboot of node 1 sets it up). Node 1, the
+/// root, appended node 3's delegate rows of `d2` (gen 1:2, among them
+/// `Completed(2,1,6)`, `Refused(3,1,7)`, `Completed(2,1,8)`) to its epoch-1
+/// journal and was suspended, then rebooted, before shipping them. Node 3 took
+/// the lease over (epoch 2) and executed its own delegate rows again at the
+/// gate (`own delegate row at the gate`), without `TailOf` identities. Node 1,
+/// back, moved its unshipped rows to its member copy when the epoch-2 marker
+/// arrived; coverage retires a row only by `TailOf` identity or by its own
+/// epoch's segments, so those three rows stayed. When node 1 later took the
+/// lease (epoch 5) it re-shipped them (`seq 39`): the log completes rids
+/// (2,1,6) and (2,1,8) twice, and its second `Create d2/f0` replaces the
+/// entry a later rename had put there: the log no longer replays to the
+/// replicas' state (convergence at head 44).
+#[test]
+#[ignore = "known gap: a member copy re-ships rows whose rids the log already completed (seed 2560)"]
+fn known_gap_a_member_copy_reships_a_completed_rid_seed_2560() {
+    run_seed(2560, long_delegated_late_answers_config()).unwrap_or_else(|e| {
+        panic!(
+            "long-delegated-late-answers seed 2560: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=long-delegated-late-answers"
+        )
+    });
+}
+
 const CAUSAL_CUT_SEEDS: u64 = 40;
 
 /// Oracle false positive, pinned: seed 1525 of `delegated-group-switch` with
