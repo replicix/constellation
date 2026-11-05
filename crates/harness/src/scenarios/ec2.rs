@@ -1071,9 +1071,13 @@ pub fn inbox_withdraw_hole(_seed: u64) -> Result<()> {
 ///    create must still complete within [`CREATE_BUDGET`] of the thaw
 ///    plus the freeze — it keeps forwarding instead of waiting on S3;
 /// 3. B also loses P2P to everyone: nothing can serve its create, which
-///    must fail (`EIO`) within the documented bound
-///    (`CONSTELLATION_S3_LESS_OP_DEADLINE_MS`, 20 s, after the stall is
-///    detected, 6 s) — not after the 120 s in-doubt deadline.
+///    must fail (`EIO`) within the documented bound — not after the 120 s
+///    in-doubt deadline. The bound: the op's attempts end at
+///    `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` (20 s), then the op is settled
+///    before its `EIO` (plan 43 C2, §5.3 item 5: an `Abandon` along the
+///    op's route for one settle window, a quarter of the client deadline:
+///    30 s at the 60 s TTL; nothing answers it here, so the `EIO` is an
+///    unsettled one) — about 50 s.
 ///
 /// After the heal the phase-1 and phase-2 files read back everywhere.
 pub fn s3_cut_create_holder_restart(_seed: u64) -> Result<()> {
@@ -1086,8 +1090,9 @@ pub fn s3_cut_create_holder_restart(_seed: u64) -> Result<()> {
     const CLOSE_BUDGET: Duration = Duration::from_secs(20);
     /// Phase 2's freeze: longer than B's forward retries (~1.5 s).
     const FREEZE: Duration = Duration::from_secs(5);
-    /// Phase 3: the S3-less bound (20 s) plus slack.
-    const FAIL_BUDGET: Duration = Duration::from_secs(35);
+    /// Phase 3: the S3-less bound (20 s), the settle window after it (30 s,
+    /// plan 43 C2's `Abandon` before `EIO`), plus slack.
+    const FAIL_BUDGET: Duration = Duration::from_secs(65);
     let (env, root) = setup(NAME)?;
     env.s3_proxy()?;
     let (pa, pb, pc) = (
