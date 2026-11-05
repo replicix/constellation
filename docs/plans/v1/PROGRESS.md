@@ -66778,13 +66778,14 @@ This config's `+commit` 0/2,000 is an M1.3 exit. Landing it before M1.3 is a fal
 
 ## Plan 46 M1.1 step 1: a lone root's journal is no second copy (2026-11-05)
 
-ADR-41's lone-journal branch removed (plan 46 §11, "M1.0 answers"; the ADR's amended text follows with M1.3). A root's
+ADR-41's lone-journal branch removed (plan 46 §11, "M1.0 answers"; ADR-41's amendment, ADR-42's correction and DESIGN land with this step, in the review round below). A root's
 `DelegateStreamAck.committed` counts a delegate's appended row only once the root's own configuration has committed it:
 `Core::config_committed_jseq` is `durable_jseq`, except that a lone root's `u64::MAX` (no backup, none to be had) commits
 nothing beyond the archive; an epoch hold's journal still counts (M1.4 makes the hold a group). A lone root paused past
 its expiry is taken over from the archive alone, so a row a delegate answered on that journal was lost when the delegate
 then failed (model: `node_stream`'s knob `root_journal_counts` violates `acked_never_lost`, M1.0 C2). The sim oracle's
-`DelegGroup` judgement counts the root's appended copy only when every backup the lease lists holds it.
+`DelegGroup` judgement counts the root's appended copy only when the tenure that appended the row committed it (its lease
+configuration's backups hold it; an epoch hold's journal counts until M1.4); see the review round below.
 
 **Fail-before.** Core `a_lone_root_acks_a_delegates_row_as_committed_only_once_it_ships` (replaces
 `a_lone_root_acks_a_delegates_row_as_committed_at_once`): `committed` 1 at once on main. With the tightened oracle on main,
@@ -66806,3 +66807,33 @@ first 400 hold an own op back by the gated mark alone); the lead-off control 0 �
 
 **Gates** (box 2): fmt, clippy `-D warnings` (authority, all targets) clean; authority lib 1,039 passed; the release sim suite
 403 passed, 0 failed, 12 ignored.
+
+**Review round (2026-11-05, Opus review of ea0a9378: CHANGES NEEDED; fixed on box 2, release).**
+- *Oracle (MUST 1, 2).* The first oracle judged the root's copy against the lease at answer time. It now judges against the
+  tenure that appended the row: the oracle keeps every landed lease's `(epoch, backups)` and counts the copy when some tenure's
+  backups all hold it (tail of that epoch, or the lease holder's journal), and counts an epoch hold's journal (the core does, Q6)
+  until M1.4. Unit tests: a row committed under epoch 1's root and backup and inherited by a sealing successor is committed
+  (`delegated-holder-cut` seed 73's shape); an epoch hold's row counts; a lone root's does not.
+- *Docs (MUST 3).* ADR-41's amendment, ADR-42's correction, DESIGN §4, `delegations.md` and TESTING land with step 1 (the first
+  commit's message says "follows with M1.3": superseded).
+- *Sweeps (MUST 4), `+commit`, seeds 0..1,999, main / branch.* 39 delegated configurations (every `delegated-*` of `sweep_config`,
+  `long-delegated*`, `far`, `placement-hot`, and `delegated-epoch`, now in `sweep_config`): 35 configurations 0 / 0 failing, the
+  same empty set. Not equal: `delegated-epoch` 61 / 47 (shadow installs for an answer not said to be committed, the same class
+  on both; none from the oracle: the 93 "lease lists no backup" failures of the first oracle are gone); `delegated-core-stall-root-lease6`
+  218 / 235 (the same class on both, a lone answer judged by none; a known failing configuration, `Ok(())` in its core-stall
+  check; the sets differ by trajectory); `long-delegated-hysteresis-off` 6 / 33 (the lone-lead oracle's negative control, fails
+  by design). `delegated-holder-cut` 0 / 0 (seed 73 passes). New `delegated-lone-s3-cut` (a lone root, a delegate and two S3 cuts):
+  0 failing on branch and main, `+commit+unsettled` 0 failing both, unsettled `EIO` 0 / 0, I4 0 / 0, I1 0 / 0.
+- *Asks (SHOULD 5).* A delegate's ask for the root's commit that raises nothing backs off (four ticks, doubling to 2 s) instead of
+  repeating every tick. Asks per 2,000 seeds, main / step 1 only (review, per 1,000, doubled) / now: `long-delegated` 62 / 8,814 /
+  6,977; `delegated-root-crash` 7 / 5,810 / 5,103; `delegated-root-gone` 6 / 5,548 / 4,755; `delegated-partition` 3 / 3,978 / 3,506.
+  A reduction of 12 to 21 %, not the ship cadence: the remaining asks are first asks of new parks. Getting to the cadence needs the
+  root's acknowledgement to say the commit is archive-bound (a protocol change): left for M1.2.
+- *Latency (review, mean wait of a parked delegate acknowledgement, main to branch).* `long-delegated` 125 to 139 ms (+11 %),
+  `delegated-root-crash` 248 to 283 (+14 %), `delegated-root-gone` 245 to 292 (+19 %), `delegated-partition` 65 to 106 (+64 %);
+  waits of 1 s or more under `delegated-partition` 93 to 189 per 1,000 seeds. Now, waits of 200 ms or more per 2,000 seeds (main / branch):
+  3,122 / 2,202, 1,644 / 1,932, 1,018 / 1,320, 287 / 573; 1 s or more: 787 / 826, 1,506 / 1,526, 942 / 960, 217 / 417.
+- The lead-off control's seeds `1, 3` became `1, 4` (the ask back-off moved the trajectories).
+
+**Gates** (box 2): fmt, clippy `-D warnings` (authority, all targets) clean; authority lib 1,045 passed; the release sim suite
+406 passed, 0 failed, 12 ignored.
