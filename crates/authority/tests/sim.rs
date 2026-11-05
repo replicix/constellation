@@ -8824,6 +8824,25 @@ fn regression_a_restart_keeps_no_read_delegation_seeds_218011_and_more() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// Oracle false positive, pinned: `long-delegated-late-answers` seed 7211 (no
+/// knob). Node 2's create of `d1/f0`, forwarded to node 1, the root, after
+/// node 2 had sealed node 1's epoch, ran there before node 1 learned of the
+/// seal; a read on node 1 saw it, 70 ms before the successor's first segment
+/// rolled it back. The create was answered `Abandoned` (plan 43 C2: settled,
+/// no effect in the log). The session check counted only rolled-back and
+/// in-doubt ops as tentative, so the read looked like a read-your-writes
+/// violation of node 1's earlier unlink of the name; an `Abandoned` op's
+/// effect now explains a read as a tentative one's does.
+#[test]
+fn regression_an_abandoned_ops_effect_explains_a_read_seed_7211() {
+    run_seed(7211, long_delegated_late_answers_config()).unwrap_or_else(|e| {
+        panic!(
+            "long-delegated-late-answers seed 7211: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=long-delegated-late-answers"
+        )
+    });
+}
+
 const CAUSAL_CUT_SEEDS: u64 = 40;
 
 /// Oracle false positive, pinned: seed 1525 of `delegated-group-switch` with

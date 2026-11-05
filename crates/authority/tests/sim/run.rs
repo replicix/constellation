@@ -5635,11 +5635,30 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     }
     // Plan 30 §M6: per-node read-your-writes and monotonic reads, with the
     // log as the witness (see `session.rs`). Enforced when reads wait.
+    // An op answered `Abandoned` (plan 43 C2: settled at its deadline, no
+    // effect in the log, ever) was in doubt until then, like a tentative
+    // one: a deposed holder that executed it before it learned of the seal
+    // showed its effect to its own readers until the successor's segment
+    // rolled it back (`long-delegated-late-answers` 7211: node 2's create,
+    // forwarded to the sealed root node 1, seen by a read there 70 ms
+    // before the strand). Its effect explains a read the way a rolled-back
+    // op's does.
+    let session_tentative: HashSet<Rid> = tentative
+        .iter()
+        .copied()
+        .chain(
+            history
+                .returned()
+                .into_iter()
+                .filter(|(_, ret)| *ret == NsRet::Abandoned)
+                .map(|(rid, _)| rid),
+        )
+        .collect();
     report.sessions = super::session::check_sessions(
         &events,
         &history.ticks(),
         &history.reads(),
-        &tentative,
+        &session_tentative,
         &oracle.completed_at,
         &oracle.refused_at,
         &journal,
