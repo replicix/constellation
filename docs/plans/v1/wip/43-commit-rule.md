@@ -507,8 +507,14 @@ in the code, in PROGRESS and in failure messages.
   or `Refused { r, .. }` is committed somewhere (then the client gets
   that outcome instead) or `Refused { r, Abandoned }` is committed by
   the sequencer now in force (then `EIO`). The one exception is an
-  *isolated requester* (no sequencer, inbox or lease path answered for
-  `2 × acquire_deadline_ms`), counted as `client.unsettled_eio`. For
+  *unsettled* `EIO` that the reachability history excuses: as built (plan
+  46 §6, M0.3), the sim's classifier (`crates/authority/tests/sim/reach.rs`)
+  gives four verdicts (an isolated requester; no sequencer reachable that
+  could commit within the allowance the lease's and the grants' own
+  deadlines give; a generation's tail unreachable; otherwise a violation,
+  which `+unsettled` fails), counted by the product as
+  `client.unsettled_eio`. The earlier wording ("no sequencer, inbox or
+  lease path answered for `2 × acquire_deadline_ms`") is not the rule. For
   every settled `EIO`, no execution of `r` exists anywhere afterwards;
   for an unsettled one, any later execution of `r` is ordered in the log
   before every op its node's clients invoked after the answer.

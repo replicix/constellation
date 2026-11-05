@@ -666,7 +666,7 @@ unreachable and **20,566 violations** (the review round counted a generation tha
 
 **The M0.3 exit "I4 strict everywhere" is not met.** Strict mode is a flag of the two configurations with no unsettled `EIO`
 (`delegated-long-delegation-prod`, `delegated-root-gone`) and runs in a ratchet test for more at zero violations without
-the knob (fifteen, after the settle fixes: four more passed a 2,000-seed sweep); the 17 configurations where the product still fails to settle are guarded there by ceilings on their violations and on their allowed unsettled `EIO`s. The violations are six
+the knob (18 in the ratchet at M0.4: fifteen after the settle fixes, three more after the M0.3 G and B fixes and the `long-backup` pass); the other 14 configurations are guarded there by ceilings on their violations and on their allowed unsettled `EIO`s (`m03_the_configurations_at_zero_violations_stay_there`, `crates/authority/tests/sim.rs`; eight of the 14 are at 0 violations, the rest are causes still open in PROGRESS; a fix lowers a ceiling). The violations are six
 causes in the product (a root in its takeover gate answering a settle `Busy`; the new root's own settle falling to the lease
 path inside its gate; a delegate's own op held by the root for itself; a redirect loop between root and delegate; a local
 execution parked behind a recall; the lease path's last stretch), with seeds and lines in PROGRESS, and `delegated-group-switch`

@@ -1599,7 +1599,9 @@ C2a to C2g (the answer's source; a generation's end carries its cut; a
 delegate acknowledges once its group holds the row; its fast path writes and
 then waits; the end of a generation waits for its group; a lone root answers
 other nodes from the archive; an op is settled before `EIO`, ADR-18's
-amendment). Not yet: the rest of C2 (the scenarios and strict flags), C3–C5. Each milestone amends this
+amendment), C2g′ and C2h's scenarios (the settle's classifier and the ratchet
+of plan 46 M0.3; the strict flags stay per-configuration, D9 defers the
+rest). Not yet: C3–C5 as redone under plan 46 stages 1–2. Each milestone amends this
 record; C1's rejected options are below.
 DESIGN.md states each part in the milestone that makes it true (plan 43
 §6).
