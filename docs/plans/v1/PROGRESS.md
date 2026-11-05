@@ -66816,8 +66816,8 @@ first 400 hold an own op back by the gated mark alone); the lead-off control 0 โ
   (`delegated-holder-cut` seed 73's shape); an epoch hold's row counts; a lone root's does not.
 - *Docs (MUST 3).* ADR-41's amendment, ADR-42's correction, DESIGN ยง4, `delegations.md` and TESTING land with step 1 (the first
   commit's message says "follows with M1.3": superseded).
-- *Sweeps (MUST 4), `+commit`, seeds 0..1,999, main / branch.* 39 delegated configurations (every `delegated-*` of `sweep_config`,
-  `long-delegated*`, `far`, `placement-hot`, and `delegated-epoch`, now in `sweep_config`): 35 configurations 0 / 0 failing, the
+- *Sweeps (MUST 4), `+commit`, seeds 0..1,999, main / branch.* 40 delegated configurations (every `delegated-*` of `sweep_config`,
+  `long-delegated*`, `far`, `placement-hot`, and `delegated-epoch`, now in `sweep_config`): 36 configurations 0 / 0 failing, the
   same empty set. Not equal: `delegated-epoch` 61 / 47 (shadow installs for an answer not said to be committed, the same class
   on both; none from the oracle: the 93 "lease lists no backup" failures of the first oracle are gone); `delegated-core-stall-root-lease6`
   218 / 235 (the same class on both, a lone answer judged by none; a known failing configuration, `Ok(())` in its core-stall
