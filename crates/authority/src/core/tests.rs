@@ -23756,6 +23756,143 @@ mod locks {
         assert!(renewed(&out, 43), "{out:?}");
     }
 
+    /// Plan 41 item 7: a tick with more due grants at one owner than a P2P
+    /// frame carries sends several renewals of at most
+    /// `LOCK_RENEW_MAX_ENTRIES`, each its own request with its own timer; a
+    /// timeout re-dues only its own entries, and the answer to another
+    /// applies on its own. (The largest request, at the largest values,
+    /// encodes within `MAX_FRAME`: `maximum_lock_renewals_fit_a_frame` in
+    /// the net crate, for the net crate's bound, which this one may not
+    /// exceed.)
+    #[test]
+    fn a_large_renewal_round_goes_out_in_frame_sized_requests_each_applied_on_its_own() {
+        const MAX: usize = crate::event::LOCK_RENEW_MAX_ENTRIES;
+        const _: () = assert!(MAX <= constellation_net::message::LOCK_RENEW_MAX_ENTRIES);
+        let mut r = requester();
+        let due_n = 2 * MAX + 1;
+        let installed = r.honour();
+        for k in 0..due_n as u64 {
+            let h = constellation_meta::locks::HeldGrant {
+                id: GrantId {
+                    node: 1,
+                    seq: 1_000 + k,
+                },
+                mode: X,
+                until: installed.plus(2_000),
+                renew_at: HonourMs(installed.0 - 1),
+                owner: 1,
+                recalled: false,
+                position: Position::ZERO,
+                renewing: None,
+                releasing: false,
+                first_use: false,
+                idle_since: None,
+                installed,
+                lapsing: None,
+                written: false,
+                route: None,
+            };
+            r.meta.locks().install_held(10_000 + k, h);
+        }
+        let req = lock_control(&mut r, 50, 42, true);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(1),
+            },
+        });
+        let mut tick = timer_of(&out, TimerKind::LockRenewTick);
+        let mut out = Vec::new();
+        for _ in 0..10 {
+            r.now = Ms(r.core.timer_honour(tick).unwrap().0.max(r.now.0));
+            out = r.step(Event::Timer { id: tick });
+            if !sends(&out).is_empty() {
+                break;
+            }
+            tick = timer_of(&out, TimerKind::LockRenewTick);
+        }
+        let sent: Vec<(OpId, Vec<crate::event::LockRenewEntry>)> = sends(&out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::LockRenew { req, entries, .. } if to == 1 => Some((*req, entries.clone())),
+                _ => None,
+            })
+            .collect();
+        let sizes: Vec<usize> = sent.iter().map(|(_, e)| e.len()).collect();
+        assert_eq!(sizes, [MAX, MAX, 1], "{out:?}");
+        let mut all: Vec<_> = sent
+            .iter()
+            .flat_map(|(_, e)| e.iter().map(|e| e.ino))
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            due_n,
+            "every due grant is in exactly one request"
+        );
+        let reqs: std::collections::BTreeSet<_> = sent.iter().map(|(q, _)| *q).collect();
+        assert_eq!(reqs.len(), 3, "a request each");
+        let timeouts = timers(&out, TimerKind::LockRenewTimeout);
+        assert_eq!(timeouts.len(), 3, "a timer each: {out:?}");
+        // (Each timer is set just before its request is sent, in order.)
+        let ino_of = |chunk: usize, k: usize| sent[chunk].1[k].ino;
+        let renewing = |r: &Harness, ino: Ino| r.meta.locks().held(ino).unwrap().renewing.is_some();
+        assert!(sent
+            .iter()
+            .all(|(_, e)| e.iter().all(|e| renewing(&r, e.ino))));
+        // The first request is not answered in time: its entries, and no
+        // others, are due again.
+        let before = r.meta.locks().held(ino_of(0, 0)).unwrap().renew_at;
+        r.now = Ms(r.now.0 + 1);
+        r.step(Event::Timer { id: timeouts[0] });
+        for k in [0, MAX - 1] {
+            let h = r.meta.locks().held(ino_of(0, k)).unwrap();
+            assert!(h.renewing.is_none() && h.renew_at == before, "{h:?}");
+        }
+        assert!(sent[1].1.iter().all(|e| renewing(&r, e.ino)));
+        assert!(sent[2].1.iter().all(|e| renewing(&r, e.ino)));
+        // The second is answered: those grants are renewed and no longer
+        // due; the third is still waiting.
+        let now = r.honour();
+        let results = sent[1]
+            .1
+            .iter()
+            .map(|e| {
+                (
+                    e.ino,
+                    e.grant,
+                    LockRenewResult::Ok {
+                        ttl_ms: 20_000,
+                        recalled: false,
+                        id: e.grant,
+                        mode: X,
+                    },
+                )
+            })
+            .collect();
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRenewed {
+                req: sent[1].0,
+                results,
+            },
+        });
+        for k in [0, MAX - 1] {
+            let h = r.meta.locks().held(ino_of(1, k)).unwrap();
+            assert!(
+                h.renewing.is_none() && h.renew_at > now && h.until > now.plus(10_000),
+                "{h:?}"
+            );
+        }
+        assert!(sent[2].1.iter().all(|e| renewing(&r, e.ino)));
+        assert!(sent[0]
+            .1
+            .iter()
+            .all(|e| !renewing(&r, e.ino) && r.meta.locks().held(e.ino).unwrap().renew_at <= now));
+    }
+
     /// A renewal that finds no reachable owner reads the lease for it; the
     /// grant's renewal point stays in the past meanwhile, and the tick
     /// armed from it fired every millisecond while S3 was cut (the read
