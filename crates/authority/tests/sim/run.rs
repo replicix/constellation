@@ -1782,7 +1782,9 @@ async fn panic_watch() -> String {
 /// has at most this many events and this many tentative ops (each a
 /// synthetic thread in flight forever): its search is exponential in
 /// overlapping ops, and a 72-op crash-heavy history did not finish in
-/// minutes. The witnessed check is exact for this spec and always runs.
+/// minutes. (The search is now `history::linearizable`'s, memoized; the
+/// bounds stay, and keep it within its 128 ops.) The witnessed check is
+/// exact for this spec and always runs.
 const STATERIGHT_EVENT_BOUND: usize = 80;
 const STATERIGHT_TENTATIVE_BOUND: usize = 6;
 
@@ -4029,6 +4031,34 @@ async fn operator_drop_hopeless(
     }
 }
 
+/// Plan 46 M0.3: classify and count every unsettled `EIO` the run told
+/// (`Report::unsettled_*`); returns the violations described. Called by
+/// every run that reaches its end checks, the ones that end with a claim
+/// waiting for a group's tail included.
+fn count_unsettled(oracles: &super::oracle::Oracles, report: &mut Report) -> Vec<String> {
+    let all = oracles.unsettled.lock().unwrap();
+    report.unsettled_isolated = all.iter().filter(|u| u.verdict.isolated()).count();
+    report.unsettled_no_sequencer_in_time = all
+        .iter()
+        .filter(|u| u.verdict.no_sequencer_in_time())
+        .count();
+    report.unsettled_generation_tail_unreachable = all
+        .iter()
+        .filter(|u| u.verdict.generation_tail_unreachable())
+        .count();
+    let bad: Vec<String> = all
+        .iter()
+        .filter(|u| !u.verdict.allowed())
+        .map(|u| u.describe())
+        .collect();
+    report.unsettled_violations = bad.len();
+    for u in all.iter() {
+        *report.unsettled_causes.entry(u.cause()).or_default() += 1;
+    }
+    report.unsettled_examples = bad.iter().take(5).cloned().collect();
+    bad
+}
+
 /// Run one seed. `Err` carries the failure and the replay command.
 pub fn run_seed(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // `AUTHORITY_SIM_WATCHDOG=1`: an OS thread reports any event whose
@@ -5253,6 +5283,20 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 report.faults
             ));
         }
+        // Plan 46 M0.3: the unsettled `EIO`s this run told are counted (and
+        // judged under `strict_unsettled`) like any other run's.
+        let unsettled_violations = count_unsettled(&oracles, &mut report);
+        if cfg.strict_unsettled {
+            if let Some(first) = unsettled_violations.first() {
+                return Err(format!(
+                    "{first}\n  ({} I4 (unsettled EIO of a requester that was not isolated) \
+                     violation(s); the run ended with a claim waiting for a group's tail)\n  \
+                     faults: {:?}",
+                    unsettled_violations.len(),
+                    report.faults
+                ));
+            }
+        }
         return Ok(report);
     }
     // Plan 43 C2e: the operator ended a delegation generation whose group
@@ -5834,29 +5878,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.non_verbatim = found.i2c.len();
     report.late_landings = found.i4.len();
     report.settled_landings = found.i4.iter().filter(|m| m.starts_with("I4: rid")).count();
-    let unsettled_violations: Vec<String> = {
-        let all = oracles.unsettled.lock().unwrap();
-        report.unsettled_isolated = all.iter().filter(|u| u.verdict.isolated()).count();
-        report.unsettled_no_sequencer_in_time = all
-            .iter()
-            .filter(|u| u.verdict.no_sequencer_in_time())
-            .count();
-        report.unsettled_generation_tail_unreachable = all
-            .iter()
-            .filter(|u| u.verdict.generation_tail_unreachable())
-            .count();
-        let bad: Vec<String> = all
-            .iter()
-            .filter(|u| !u.verdict.allowed())
-            .map(|u| u.describe())
-            .collect();
-        report.unsettled_violations = bad.len();
-        for u in all.iter() {
-            *report.unsettled_causes.entry(u.cause()).or_default() += 1;
-        }
-        report.unsettled_examples = bad.iter().take(5).cloned().collect();
-        bad
-    };
+    let unsettled_violations = count_unsettled(&oracles, &mut report);
     report.non_lone_rollbacks = found.i5.len();
     {
         let ord = std::sync::atomic::Ordering::Relaxed;

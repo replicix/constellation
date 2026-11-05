@@ -16263,6 +16263,37 @@ fn m03_the_configurations_without_an_unsettled_eio_run_strict() {
     }
 }
 
+/// Load robustness: a run's checks finish. `far` seed 1498 with the
+/// lease-reads knob (`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`) ends with a
+/// history of 72 events, 11 ops open at once and 6 in flight forever;
+/// stateright's search (`is_consistent`, no memory of the states it saw)
+/// spun on it for over 20 minutes, after the run itself had ended. The
+/// memoized search (`history::check_linearizable`) decides it at once.
+/// Hangs (does not fail) on the parent: the bound below turns that into a
+/// failure.
+#[test]
+fn a_crowded_history_is_checked_in_bounded_time() {
+    let cfg = SimConfig {
+        lease_reads: sim::store::SlowReads {
+            before: (0, 0),
+            reply: (800, 1000),
+        },
+        ..far_config()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run_seed(1498, cfg));
+    });
+    let r = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("far seed 1498 (lease-reads knob) did not finish in 120 s")
+        .unwrap_or_else(|e| panic!("far seed 1498 (lease-reads knob): {e}"));
+    assert!(
+        r.stateright_checked,
+        "far seed 1498 no longer runs the generic linearizability check"
+    );
+}
+
 /// Plan 46 M0.3, the ratchet, in two halves, both over seeds 0 to 99 of each
 /// configuration without the lease-reads knob, the configurations run in
 /// parallel. The sweeps that set the lists are in PROGRESS ("Plan 43 C2h").
@@ -16319,15 +16350,22 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     // 2026-11-04, the re-trace of cause 6, measured less, and again after
     // ADR-44 (2026-11-05: delegated-backup, delegated-holder-cut,
     // long-delegated-backup and long-delegated-late-answers measure 0 and 0
-    // in seeds 0..99); never raised)
+    // in seeds 0..99); never raised for a count the ceiling already saw:
+    // delegated-backup-and-delegate-die's allowed ceiling was set while its
+    // runs that end waiting for a group's tail counted nothing)
     let ceilings: [(&str, Config, usize, usize); 14] = [
         ("backup-strict", backup_strict_config, 0, 0),
         ("backup-two", backup_two_config, 0, 0),
+        // (Allowed 0 to 26: the runs that end with a root waiting for a
+        // group's tail now count their unsettled `EIO`s, every one of the
+        // 26 a generation whose tail cannot be reached, the shape this
+        // configuration is for; 467 such and 30 violations in 2,000 seeds,
+        // none of them in seeds 0..99.)
         (
             "delegated-backup-and-delegate-die",
             delegated_backup_and_delegate_die_config,
             0,
-            0,
+            26,
         ),
         (
             "delegated-backup-and-delegate-die-abandon",

@@ -409,7 +409,24 @@ const TENTATIVE_THREAD_BASE: ThreadId = 1 << 40;
 
 /// Check the history for linearizability against [`NsSpec`], treating
 /// `tentative` rids per the module doc. Returns the reason on failure.
+///
+/// Stateright's `LinearizabilityTester` validates the history (a thread
+/// invokes only after its previous op returned); the search is
+/// [`linearizable`]'s, which memoizes what it explored. The tester's own
+/// search (`is_consistent`) keeps no memory of the states it has seen and
+/// is exponential in the ops that overlap: `far` seed 1498 with the
+/// lease-reads knob (72 events, 11 ops open at once, 6 in flight forever)
+/// did not finish in 20 minutes. Both decide the same question
+/// (`the_memoized_search_agrees_with_stateright`).
 pub fn check_linearizable(events: &[HistEvt], tentative: &HashSet<Rid>) -> Result<(), String> {
+    check_linearizable_with(events, tentative, false)
+}
+
+fn check_linearizable_with(
+    events: &[HistEvt],
+    tentative: &HashSet<Rid>,
+    stateright_search: bool,
+) -> Result<(), String> {
     // Plan 43 C2: a settled op had no effect and never will (the
     // exactly-once check fails one the log completes): left out.
     let abandoned: HashSet<Rid> = events
@@ -424,6 +441,11 @@ pub fn check_linearizable(events: &[HistEvt], tentative: &HashSet<Rid>) -> Resul
         })
         .collect();
     let mut tester = LinearizabilityTester::<ThreadId, NsSpec>::new(NsSpec::default());
+    // The same history for the search: each op, its invocation's index,
+    // and its return (index, value), `None` while in flight (forever, for
+    // a tentative op).
+    let mut ops: Vec<LinOp> = Vec::new();
+    let mut open: std::collections::HashMap<ThreadId, usize> = std::collections::HashMap::new();
     for (i, evt) in events.iter().enumerate() {
         let r = match evt {
             HistEvt::Invoke { rid, .. } | HistEvt::Return { rid, .. }
@@ -437,6 +459,12 @@ pub fn check_linearizable(events: &[HistEvt], tentative: &HashSet<Rid>) -> Resul
                 } else {
                     *thread
                 };
+                open.insert(thread, ops.len());
+                ops.push(LinOp {
+                    op: op.clone(),
+                    invoked: i,
+                    ret: None,
+                });
                 tester.on_invoke(thread, op.clone()).map(|_| ())
             }
             HistEvt::Return { thread, rid, ret } => {
@@ -445,6 +473,9 @@ pub fn check_linearizable(events: &[HistEvt], tentative: &HashSet<Rid>) -> Resul
                     // its invocation, or not at all.
                     Ok(())
                 } else {
+                    if let Some(k) = open.remove(thread) {
+                        ops[k].ret = Some((i, *ret));
+                    }
                     tester.on_return(*thread, *ret).map(|_| ())
                 }
             }
@@ -455,11 +486,92 @@ pub fn check_linearizable(events: &[HistEvt], tentative: &HashSet<Rid>) -> Resul
             ));
         }
     }
-    if tester.is_consistent() {
+    let consistent = if stateright_search {
+        tester.is_consistent()
+    } else {
+        linearizable(&ops)?
+    };
+    if consistent {
         Ok(())
     } else {
         Err("history is not linearizable".to_string())
     }
+}
+
+/// One op of a history, for [`linearizable`].
+struct LinOp {
+    op: NsOp,
+    /// The index of its invocation in the history.
+    invoked: usize,
+    /// The index of its return and the value returned; `None`: in flight
+    /// (it may take effect anywhere after its invocation, or never).
+    ret: Option<(usize, NsRet)>,
+}
+
+/// The Wing and Gong search with Lowe's memoization: an order of the ops
+/// that respects real time (an op goes next only if no op still to place
+/// returned before it was invoked) in which every returned op's value is
+/// the spec's answer, and every op in flight either takes effect (the
+/// spec's own answer, as stateright applies one) or never does. A
+/// configuration (the ops placed, the spec's state) is explored once.
+fn linearizable(ops: &[LinOp]) -> Result<bool, String> {
+    if ops.len() > 128 {
+        return Err(format!(
+            "{} ops: more than the linearizability search's bound of 128",
+            ops.len()
+        ));
+    }
+    let returned: u128 = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.ret.is_some())
+        .fold(0, |m, (k, _)| m | (1u128 << k));
+    let mut seen: HashSet<(u128, BTreeSet<String>)> = HashSet::new();
+    fn go(
+        ops: &[LinOp],
+        returned: u128,
+        placed: u128,
+        state: &NsSpec,
+        seen: &mut HashSet<(u128, BTreeSet<String>)>,
+    ) -> bool {
+        if placed & returned == returned {
+            return true;
+        }
+        // The first return of an op still to place: nothing invoked after
+        // it can go before it.
+        let bound = ops
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| placed & (1u128 << k) == 0)
+            .filter_map(|(_, o)| o.ret.map(|(at, _)| at))
+            .min()
+            .unwrap_or(usize::MAX);
+        for (k, o) in ops.iter().enumerate() {
+            if placed & (1u128 << k) != 0 || o.invoked > bound {
+                continue;
+            }
+            let mut next = state.clone();
+            match &o.ret {
+                Some((_, ret)) => {
+                    if !next.is_valid_step(&o.op, ret) {
+                        continue;
+                    }
+                }
+                None => {
+                    next.invoke(&o.op);
+                }
+            }
+            let placed = placed | (1u128 << k);
+            if !seen.insert((placed, next.present.clone())) {
+                continue;
+            }
+            if go(ops, returned, placed, &next, seen) {
+                return true;
+            }
+        }
+        false
+    }
+    Ok(go(ops, returned, 0, &NsSpec::default(), &mut seen))
 }
 
 /// Plan 45 §12 O2: each completed rid's journal row, as the shipping
@@ -1408,5 +1520,88 @@ mod tests {
         // Nothing acknowledged: as created.
         let recs = [rec(false, Some(false), 1)];
         assert!(check_trunc_commits(&recs, &fin(0, None), 4096).is_ok());
+    }
+
+    /// The memoized search ([`linearizable`]) and stateright's own
+    /// (`is_consistent`) decide the same on random small histories: threads
+    /// whose ops take effect at a random instant between invocation and
+    /// return (the answer the spec gives then, now and again replaced by
+    /// another value), some left in flight, some marked tentative, some
+    /// settled. Both verdicts occur.
+    #[test]
+    fn the_memoized_search_agrees_with_stateright() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let names = ["a", "b", "c"];
+        let rets = [NsRet::Ok, NsRet::Eexist, NsRet::Enoent];
+        let (mut yes, mut no) = (0, 0);
+        for case in 0..3_000u64 {
+            let mut rng = StdRng::seed_from_u64(case);
+            let mut spec = NsSpec::default();
+            let mut events = Vec::new();
+            // Per thread: (rid, op, answer once it took effect).
+            let mut busy: std::collections::BTreeMap<ThreadId, (Rid, NsOp, Option<NsRet>)> =
+                std::collections::BTreeMap::new();
+            let mut seq = 0;
+            let ops = rng.random_range(3..10);
+            let threads = rng.random_range(2..5u64);
+            let mut tentative = HashSet::new();
+            while seq < ops || !busy.is_empty() {
+                let t = rng.random_range(1..=threads);
+                match busy.get_mut(&t) {
+                    None if seq < ops => {
+                        seq += 1;
+                        let n = |rng: &mut StdRng| names[rng.random_range(0..3)].to_string();
+                        let op = match rng.random_range(0..7) {
+                            0 => NsOp::Create(n(&mut rng)),
+                            1 => NsOp::Unlink(n(&mut rng)),
+                            2 => NsOp::Rename(n(&mut rng), n(&mut rng)),
+                            3 => NsOp::Put(n(&mut rng)),
+                            4 => NsOp::Link(n(&mut rng), n(&mut rng)),
+                            5 => NsOp::Exchange(n(&mut rng), n(&mut rng)),
+                            _ => NsOp::Same(n(&mut rng), n(&mut rng)),
+                        };
+                        let r = rid(seq);
+                        if rng.random_bool(0.1) {
+                            tentative.insert(r);
+                        }
+                        events.push(HistEvt::Invoke {
+                            thread: t,
+                            rid: r,
+                            op: op.clone(),
+                        });
+                        busy.insert(t, (r, op, None));
+                    }
+                    None => {}
+                    Some((_, op, done @ None)) => *done = Some(spec.invoke(op)),
+                    Some((r, _, Some(ret))) => {
+                        let r = *r;
+                        let ret = match rng.random_range(0..12) {
+                            0 => rets[rng.random_range(0..3)],
+                            1 => NsRet::Abandoned,
+                            _ => *ret,
+                        };
+                        busy.remove(&t);
+                        // Some ops never return (in flight at the end).
+                        if seq < ops || !rng.random_bool(0.15) {
+                            events.push(HistEvt::Return {
+                                thread: t,
+                                rid: r,
+                                ret,
+                            });
+                        }
+                    }
+                }
+            }
+            let memo = check_linearizable_with(&events, &tentative, false);
+            let sr = check_linearizable_with(&events, &tentative, true);
+            assert_eq!(memo, sr, "case {case}: {events:?} tentative {tentative:?}");
+            if memo.is_ok() {
+                yes += 1;
+            } else {
+                no += 1;
+            }
+        }
+        assert!(yes > 300 && no > 300, "linearizable {yes}, not {no}");
     }
 }

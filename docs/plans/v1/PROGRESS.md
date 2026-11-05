@@ -66531,3 +66531,36 @@ none raised. The witness of `m03_a_reachable_sequencers_requester_is_not_isolate
 
 **Gates**: fmt (workspace), clippy `-D warnings` (authority, meta, all targets), authority lib 1039 passed, meta all targets, the release
 sim suite 398 passed, 0 failed, 12 ignored.
+
+## Plan 46 M0.3 side findings: the waiting runs' unsettled `EIO`s counted, a crowded history checked in bounded time (2026-11-05)
+
+**Counting.** A run that ends with a root waiting for a group's tail (`waiting_for_group`) returned before the unsettled `EIO`s
+were counted; they now are (`run.rs` `count_unsettled`, called on both paths), and under `strict_unsettled` such a run fails on a
+violation as any other run does. Configurations that end runs that way (2,000 seeds, none / slow lease reads):
+`delegated-backup-and-delegate-die` 1,847 / 1,846 runs, `-abandon` 8 / 4, `long-delegated-backup` 1 / 0; only the first counts
+anything new. Its buckets (isolated / none in time / generation tail unreachable / violations (seeds)): none 0 / 0 / 467 / 30 (27),
+slow 0 / 0 / 662 / 3 (3); before, 12 in all were reported. Violation causes: the takeover gate waiting out the read-delegation
+quarantine with the restarted root's own op in it (none 12, slow 2; seed 494: `jobs.rs` 2301, the ADR-42/44 in-gate residual of
+the m03 witness, seed 904) and the lease path (none 18, slow 1). Of the lease path, seeds 214 and 1004: the requester claims the
+lease at the window's start (epoch 3), inherits generation 1:1 whose delegate and backup are dead and waits for its tail, as
+every other `EIO` of the configuration; the classifier's lease-path arm (`reach.rs` 984-995) does not apply the generation-tail
+condition its root arm does (`tail(r)`), so a shape it labels "generation tail unreachable" for a root reads as a violation for a
+claimant. Seed 435: the claim itself waits for the tail of epoch 2 (`seal_tail.rs` 630; the takeover holder acknowledged alone
+and died), and the classifier counts the requester as a member holding the tail (`reach.rs` 1260-1262). Both are classifier
+gaps, not fixed here. Ratchet: seeds 0..99 without the knob measure 0 violations and 26 allowed (all "generation tail
+unreachable"); the allowed ceiling moves from 0 to 26 (a count the ceiling never saw, not a rise over a measured one).
+
+**Hangs.** The reported runs of `far`, `backup` and `backup-two` with the knob that spun past 20 minutes are one seed, 1498 (the
+three configurations draw the same run). Neither the sim nor the product: the simulated clock and every node had stopped; the
+CPU was in stateright's linearizability search (`LinearizabilityTester::is_consistent`, from `history::check_linearizable`) on
+a history of 72 events with 11 ops open at once and 6 in flight forever. Its search keeps no memory of what it explored and is
+exponential in overlap (seeds of `far` with 5 to 8 ops open took up to 8 s). The search is now the Wing and Gong one with Lowe's
+memoization (`history::linearizable`; stateright still validates the history); seed 1498 checks in about 0.1 ms. Pinned:
+`a_crowded_history_is_checked_in_bounded_time` (120 s bound; hangs on the parent). Cross-checked:
+`the_memoized_search_agrees_with_stateright` (3,000 random histories with in-flight, tentative and settled ops, both verdicts),
+and on 10,698 sim histories of `far`, `backup` and `backup-two` (2,000 seeds each, both modes) the two agreed on every one. No sim
+time or event guard was added: the hang was after the run, and the client waits are already capped (`client_cap`).
+
+**Sweeps** (2,000 seeds of the 34 ratchet and strict configurations, both modes): no hang, no failing seed but `long-backup`
+with the knob seed 728 (`member_copies_drained`, known, untriaged). **Gates**: fmt, clippy `-D warnings` (authority, all
+targets), authority lib 1,039 passed, the release sim suite 400 passed, 0 failed, 12 ignored.
