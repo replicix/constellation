@@ -2909,7 +2909,11 @@ block.
   re-adoption never gets one. A covered number that the table no
   longer lists, that this replica holds no trace of in the log (no cut key, no log index) and that no outstanding speculation
   ends is ended as the log's `Recall` would, at what the log holds of it (0), after the cut loop (a generation the segment
-  itself ends stays out by its cut key): its rows roll back and replay by rid. Candidates are the table's list before the
+  itself ends stays out by its cut key): its rows roll back and replay by rid (a delegate's gated row, `DelegGroup`, is
+  dropped there instead, C2 §3.8, on the premise that a committed row is at or below the cut, which a cut of 0 breaks: an
+  answered one is then rescued only by its other copies, the requester's persisted shadow and the deposed root's queued
+  append, both replays by rid; the L2b pair, deferred to plan 46 M1.2, review M0.4 SHOULD-1; pin
+  `an_orphan_end_queues_a_delegates_answered_gated_row`, ignored). Candidates are the table's list before the
   strand, the numbers a live entry's records grant (a streamed `Delegate` whose `RecallCut` streamed too), the generations
   this node holds delegate rows of (`deleg_gens_awaiting_end`) and those of its live shadows and hints. Old-mint numbers are
   left alone. The claimant never applies its own marker as a segment, so its takeover strand runs the same rule with its
@@ -2923,9 +2927,18 @@ block.
   covered marker's. The claimant's proof is persisted per epoch (`local["gate_orphan_proof"]`) before its marker can
   ship (a failed write withholds the marker: the gate stays pending and retries), and the strand of a re-adoption of the same epoch reads it back (an other epoch's is ignored; a re-adoption writes none),
   so a claimant that crashed between its marker and its strand still runs the rule; a backup-role read or write failure fails the claim or acquisition (never "no role, no tail"), and a marker's abandon comes from the gate's `gate_abandoned`, not the in-memory claim; a takeover that ships no marker (a released
-  lease) computes and keeps no proof. Residuals, still open: a takeover that carries a tail (a grant past the sealed `through`
-  never ships, but a replica cannot tell where the grant sat without per-row tail facts), so the stall and the N4 wait remain
-  there; a rebuild window spanning the marker; a re-adoption whose crashed predecessor never landed its first marker (the
+  lease) computes and keeps no proof. A claimant's strand also takes out, with or without a tail, its own delegate rows of every
+  generation the table does not list (plan 46 M0.4 review MUST-1): with no tail nothing older than its claim that the log
+  does not carry ever ships, so such a generation's `Delegate` never reaches the log; the rows are queued for replay by rid
+  (the replay dedups against the rid's outcome in the log, so a rid the log settled `Refused` never executes), the generation
+  is ended at what the log holds of it and marked stranded. This closes the integrity side of a takeover that carries a tail
+  below a grant: the grant's delegate, claiming later without a tail (its predecessor had no backup, or released), shipped
+  those rows as root rows under an origin the log never granted, completing rids the log had refused
+  (`a_claimant_without_a_tail_ships_none_of_its_rows_of_a_generation_the_log_never_listed`). Residuals, still open: a
+  takeover that carries a tail (a grant past the sealed `through` never ships, but a replica cannot tell where the grant sat
+  without per-row tail facts), so the stall and the N4 wait remain there on every replica until the generation's delegate
+  claims the root (no row of it reaches the log: only the delegate's journal holds them past the sealed `through`, and its
+  own claim now strands them; the delegate's replica shows their effects meanwhile); a rebuild window spanning the marker; a re-adoption whose crashed predecessor never landed its first marker (the
   re-adoption's marker is then the first of the epoch; its tail is re-shipped from the persisted backup role, and a
   re-adopted lease that names an inherited tail never gets a no-tail record); the persisted proof's read failing (read as
   none; the crash window is then open); and a sticky grant (plan 46 M1.2: a later tenure

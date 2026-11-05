@@ -66041,7 +66041,9 @@ cursor, and the member's acknowledged, unshipped rows were lost (I1). Pre-existi
   is answered or claimed until it reads) and a role write error fails the claim or the append (never "no role, no tail"); a
   re-adopted lease that names an inherited tail never gets a no-tail record; a marker's abandon is the gate's
   (`gate_abandoned`), not the in-memory claim's.
-- **Still open**: a takeover that carries a tail (a replica cannot tell where in the predecessor's journal the grant sat); a
+- **Still open**: a takeover that carries a tail (a replica cannot tell where in the predecessor's journal the grant sat; a
+  stall on every replica, and until plan 46 M0.4 an integrity hole once the grant's delegate claimed without a tail: see
+  "MUST-1: a tail-less claimant strands its rows of an unlisted generation"); a
   rebuild window spanning the marker; a read failure of the persisted proof (read as none); and sticky grants (plan 46 M1.2), which void the no-tail rule's premise (a number is journaled only by
   its epoch's tenure) and need the rule revisited before they land.
 
@@ -66344,3 +66346,43 @@ Maintainer decisions of 2026-11-04/05 and what remains per plan (evidence: the s
 | 41 | xcheckfs with no lock-lapse findings, a clean `long_locks`, the maintainer's acceptance of the §9 tables (`bench/lock-lane/RESULTS.md`); the item-4 scenario and L5/L6 are plan 46's. |
 | 43 | Plan 46 M0.4, then the evidence ticks, the README row, `git mv` to `done/`. |
 | 46 | Stage 0: M0.4 (whole-C2 fable review). Stage 1 carries S4, S1, the in-gate class, buckets A, C, O (M1.3), the flex strict flags (M1.4), L2b and the C3 rule (M1.2). |
+
+## MUST-1: a tail-less claimant strands its rows of an unlisted generation (plan 46 M0.4)
+
+The whole-C2 review (M0.4) found ADR-43's "takeover that carries a tail" residual to be an integrity hole, not only a stall.
+Chain: the root of epoch 1 streams its grant of `g` to D ahead of its group; its backup seals it with a tail through a
+sequence below the grant (no orphan proof: a replica cannot tell where the grant sat); every replica unlists `g` and ends it
+nowhere, and D's `Local { gen: g }` rows stay in its journal; epoch 2 settles their rids `Refused { ABANDONED }`; epoch 2's
+holder then dies without backups or releases, and D claims with no tail. The gate passed its strand no own generations
+without a tail, the proof covered epoch 2 only, and the re-append guard never saw the rows: D shipped them as root rows under
+origin `(g, i)`, with no `Delegate { g }` in the log, completing rids the log had refused (I2a, I2c, I4 late landing).
+
+- **Fix** (`Meta::strand_for_takeover_carrying`): the claimant's strand also takes out its own delegate rows (it assigned
+  their indices) of every generation the table does not list and the log never ended (`deleg_gens_awaiting_end`), whatever
+  the claim carries. With a tail the gate passes every journaled generation already and its re-append decides what goes
+  back; without one nothing older than the claim that the log does not carry ever ships, so such a generation's grant never
+  reaches the log. The rows are rolled back and queued for replay by rid, the generation is ended at what the log holds of it
+  (the cut the orphan rule writes) and marked stranded. The replay dedups against the rid's outcome in the log: a rid the
+  log settled `Refused { ABANDONED }` is forgotten, never executed (`completed_as_outcome`). The core stops every delegated
+  generation the store marked stranded (the mark is never lifted), not only those it passed in.
+- **Test** (`generation_epochs.rs`): `a_claimant_without_a_tail_ships_none_of_its_rows_of_a_generation_the_log_never_listed`
+  (fails on main: the row ships); asserts the rollback, the queued rid, the log's refusal as the rid's outcome after the
+  strand, the stranded mark and the cut 0. Guard: `a_claimant_without_a_tail_keeps_its_rows_of_a_listed_generation`.
+- **Not done**: the shipper guard the review proposed as belt and braces (refuse a `Local` row with `gen != 0` of an unlisted
+  generation in `take_shippable`). A root's own appends of a delegate's rows are `Local { gen }` rows too, and a root that
+  journals its own `Recall` of the generation unlists it before they ship: the guard would hold them at the head of the
+  journal for good. Nor the sim scenario (`delegated-backup` with a forced hand-over to the delegate after a seal
+  takeover); the sim has no knob that steers the second claim to the delegate.
+- **SHOULD-1 (confirmed, deferred: L2b)**: C2 §3.8 drops a delegate's gated row stranded by a recall pass, and ADR-43's
+  orphan rule runs its strand as a recall: at an orphan cut of 0 an answered `DelegGroup` row (ADR-41's lone-root second
+  copy) is dropped with nothing queued at the delegate. Its other copies are the requester's persisted shadow and the
+  deposed root's queued append, both replays by rid: the L2b pair, whose copy-count question (I2 ledger) is M1.2's. Pinned,
+  ignored: `an_orphan_end_queues_a_delegates_answered_gated_row` (fails on main and on the fix); ADR-43's text now says so.
+- **Gates**: clippy `-D warnings` (meta, authority, all targets) clean; `cargo fmt --check` clean on the changed files
+  (`crates/harness/src/scenarios/m14.rs` differs under the box's rustfmt on main too); meta all targets pass; authority
+  lib 1,032 passed; the release sim suite 394 passed, 0 failed, 12 ignored. Sweeps, 2,000 seeds, without and with
+  `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, main vs the fix: `delegated-root-gone`, `delegated-two-gens-root-crash`,
+  `delegated-root-crash`, `long-delegated-late-answers`, `backup-crash` have no failing seed on either side, identical
+  unsettled-violation lines (0/0, 0/13, 0/24, 226/587, 0/7 per knob mode), and identical per-seed segment counts and bytes
+  except `long-delegated-late-answers` seed 1217, which varies between runs of main itself. The rule never fires in them:
+  the chain needs a seal takeover below a streamed grant followed by the grant's delegate claiming without a tail.

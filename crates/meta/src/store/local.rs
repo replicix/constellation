@@ -2673,6 +2673,18 @@ fn deleg_idx_key(gen: u64) -> String {
     format!("deleg_idx:{gen}")
 }
 
+/// Whether this node assigned stream indices under `gen` (it executed rows
+/// of it as its delegate), in the caller's snapshot or transaction.
+pub(crate) fn deleg_idx_assigned_tx(
+    r: &impl Readable,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+) -> Result<bool, MetaError> {
+    Ok(kv_get_tx(r, local, &deleg_idx_key(gen))?
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|i| i > 0))
+}
+
 /// `local` kv: the highest index of generation `gen` this node, its
 /// delegate, journaled for its own node's client with a gated class
 /// (`Meta::delegate_gated_idx`).

@@ -5592,6 +5592,39 @@ impl Meta {
         } else {
             self.named_generations_tx(&tx)?
         };
+        // Plan 46 M0.4 (MUST-1): this node's own delegate rows of a
+        // generation the table does not list are taken out whatever the
+        // claim carries, not only with a tail (`own_gens`). With no tail,
+        // nothing the predecessors' journals held past the log ever ships
+        // (only a tenure's own successor re-ships its tail, and this claim
+        // re-ships none), and this tenure mints in its own block only: an
+        // unlisted generation's rows can never follow a `Delegate` in the
+        // log. Left in the journal, they shipped as this root's rows under
+        // their origin, with no grant in the log (a seal takeover with a tail
+        // below the grant unlists it everywhere and ends it nowhere, then a
+        // tail-less claim by its delegate), carrying outcomes for rids the
+        // log had already settled. They are rolled back, queued for replay by
+        // rid (the replay dedups against the rid's outcome in the log: a rid
+        // settled `Refused` is forgotten, never executed), and the generation
+        // ends here at what the log holds of it. With a tail the caller
+        // passes every generation it journals rows of (`own_gens`), and the
+        // gate's re-append decides which go back after the tail.
+        let unlisted_own: Vec<u64> = {
+            let listed: std::collections::BTreeSet<u64> =
+                crate::delegation::read_table_tx(&tx, self)?
+                    .iter()
+                    .map(|d| d.gen)
+                    .collect();
+            let mut out = Vec::new();
+            for g in local::deleg_gens_awaiting_end_tx(&tx, self, &listed)? {
+                if !own_gens.contains(&g) && local::deleg_idx_assigned_tx(&tx, &self.local, g)? {
+                    out.push(g);
+                }
+            }
+            out
+        };
+        let own_gens: Vec<u64> = own_gens.iter().chain(&unlisted_own).copied().collect();
+        let own_gens = own_gens.as_slice();
         let own = |entry: &LiveEntry| match entry {
             LiveEntry::Local { gen, .. } if *gen != 0 && own_gens.contains(gen) => Some(*gen),
             _ => None,
@@ -5621,6 +5654,13 @@ impl Meta {
         let orphaned = self.orphaned_tx(&tx, proof, &listed_before, &HashSet::new())?;
         let mut stranded = stranded;
         let mut orphan_cuts: Vec<(u64, u64)> = Vec::new();
+        for gen in &unlisted_own {
+            if orphaned.contains(gen) {
+                continue;
+            }
+            let cut = local::bump_void_cut_at_log_idx_tx(&mut tx, &self.local, *gen)?;
+            orphan_cuts.push((*gen, cut));
+        }
         if !orphaned.is_empty() {
             for gen in &orphaned {
                 let cut = local::bump_void_cut_at_log_idx_tx(&mut tx, &self.local, *gen)?;

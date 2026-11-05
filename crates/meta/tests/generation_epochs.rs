@@ -1152,3 +1152,142 @@ fn a_re_adoption_marker_proves_nothing_of_the_tail_its_tenure_re_ships() {
     );
     assert!(meta.lookup(ROOT_INO, "x").unwrap().is_some());
 }
+
+/// Plan 46 M0.4 review MUST-1 (the two-takeover chain). The root of epoch 1
+/// streamed its grant of `g` (not yet held by its group) to this node, which executed
+/// as the delegate. The backup of epoch 2 sealed that root with a tail
+/// through a sequence below the grant (`TailFollowsThrough { 1, 5 }`: no
+/// proof, a replica cannot tell where the grant sat): every replica unlisted
+/// `g` and ended it nowhere, and this node's row of `g` stayed in its
+/// journal. Epoch 2 then settled the row's rid (`Refused { ABANDONED }`).
+/// This node claims epoch 3 with no tail: its proof covers epoch 2 only, the
+/// strand was handed no own generations (the gate passes them only with a
+/// tail), and the row shipped as a root row of a generation the log never
+/// granted, completing a rid the log had refused. The claim's strand must
+/// take it out and queue it for replay by rid, whose dedup then meets the
+/// refusal: nothing of it ever executes again.
+#[test]
+fn a_claimant_without_a_tail_ships_none_of_its_rows_of_a_generation_the_log_never_listed() {
+    let g = gen(1, 1);
+    // Streamed uncommitted: the group (the backup that sealed) never held
+    // the grant, which sat past the sealed `through`.
+    let meta = delegate_of_a_streamed_grant(g, false);
+    meta.apply_segment_rows(1, 2, 0, &[], &[], &[no_tail(1, 5)], &TouchSet::default())
+        .unwrap();
+    assert!(
+        meta.delegation_table().iter().all(|d| d.gen != g),
+        "the seal takeover's marker strands the streamed grant"
+    );
+    assert_eq!(meta.void_cut(g).unwrap(), None, "and ends g nowhere");
+    assert!(ships_a_row_of(&meta, g), "the delegate's row is still held");
+    let abandoned = constellation_types::Code::Canceled;
+    meta.apply_segment_rows(
+        2,
+        2,
+        0,
+        &[],
+        &[],
+        &[LogRecord::Refused {
+            rid: RID,
+            code: abandoned,
+        }],
+        &TouchSet::default(),
+    )
+    .unwrap();
+    // Epoch 3's claim by this node, without a tail (its predecessor had no
+    // backup, or released): what the gate passes (no own generations).
+    let proof = constellation_meta::OrphanProof::of(&[no_tail(2, 0)]);
+    assert!(!proof.covers(1));
+    meta.strand_for_takeover_carrying(3, &[], None, &Default::default(), &proof)
+        .unwrap();
+    assert!(
+        !ships_a_row_of(&meta, g),
+        "its row would ship under an origin the log never granted"
+    );
+    assert!(
+        meta.lookup(ROOT_INO, "x").unwrap().is_none(),
+        "the row is rolled back"
+    );
+    assert!(
+        meta.pending_replays()
+            .unwrap()
+            .iter()
+            .any(|op| op.rid == RID),
+        "and queued for replay by rid"
+    );
+    assert_eq!(
+        meta.completed_outcome(RID).unwrap(),
+        Some(constellation_meta::CompletedOutcome::Refused { code: abandoned }),
+        "the replay finds the log's settled refusal, and runs nothing"
+    );
+    assert!(
+        meta.delegate_stranded(g).unwrap(),
+        "never executed in again"
+    );
+    assert_eq!(
+        meta.void_cut(g).unwrap(),
+        Some(0),
+        "ended at what the log holds"
+    );
+    assert!(meta.deps_lost_deps(&at(g, 1)));
+    assert!(meta
+        .deleg_gens_awaiting_end(&Default::default())
+        .unwrap()
+        .is_empty());
+}
+
+/// The guard of the same rule: a claimant without a tail keeps its rows of a
+/// generation the log lists (they ship under the log's grant), and the
+/// generation stays live.
+#[test]
+fn a_claimant_without_a_tail_keeps_its_rows_of_a_listed_generation() {
+    let g = gen(1, 1);
+    let meta = Meta::open_in_memory().unwrap();
+    meta.apply_segment(1, 1, &[delegate(g)], &TouchSet::default())
+        .unwrap();
+    delegate_create(&meta, g, RID, "x", (2u64 << 40) | 20);
+    let proof = constellation_meta::OrphanProof::of(&[no_tail(2, 0)]);
+    meta.strand_for_takeover_carrying(3, &[], None, &Default::default(), &proof)
+        .unwrap();
+    assert!(ships_a_row_of(&meta, g));
+    assert!(meta.lookup(ROOT_INO, "x").unwrap().is_some());
+    assert_eq!(meta.void_cut(g).unwrap(), None);
+    assert!(!meta.delegate_stranded(g).unwrap());
+}
+
+/// Plan 46 M0.4 review SHOULD-1 (pin, ignored: L2b, deferred to plan 46
+/// M1.2). ADR-43 says an orphan-ended generation's rows "roll back and replay
+/// by rid", but the orphan pass strands them as a recall does, and C2 §3.8
+/// drops a delegate's gated row there (`strand_local_tx`: `recall && gated &&
+/// gen != 0 && epoch == 0`), on the premise that a committed row is at or
+/// below the cut. At an orphan cut of 0 that premise fails: a `DelegGroup`
+/// row may be answered (ADR-41: a lone root's journal counts as the second
+/// copy), and the delegate keeps nothing of it. What rescues it today is the
+/// requester's persisted shadow and the deposed root's queued append, both
+/// replays by rid: the L2b pair. Queuing it here as well adds a third copy
+/// of the rid beside them, which is L2b's own question (the member copies of
+/// M1.2 remove both decision sites).
+#[test]
+#[ignore = "L2b: plan 46 M1.2 (review M0.4 SHOULD-1)"]
+fn an_orphan_end_queues_a_delegates_answered_gated_row() {
+    let g = gen(1, 1);
+    let meta = Meta::open_in_memory().unwrap();
+    meta.install_streamed_committed(1, 1, 1, 1, &[delegate(g)], false, (0, 0))
+        .unwrap();
+    {
+        let _class =
+            constellation_meta::PendingClass::set(constellation_meta::RowClass::DelegGroup);
+        delegate_create(&meta, g, RID, "x", (2u64 << 40) | 20);
+    }
+    meta.apply_segment_rows(1, 2, 0, &[], &[], &[no_tail(1, 0)], &TouchSet::default())
+        .unwrap();
+    assert_eq!(meta.void_cut(g).unwrap(), Some(0), "ended at 0");
+    assert!(meta.lookup(ROOT_INO, "x").unwrap().is_none());
+    assert!(
+        meta.pending_replays()
+            .unwrap()
+            .iter()
+            .any(|op| op.rid == RID),
+        "the answered row is queued for replay by rid, never dropped"
+    );
+}

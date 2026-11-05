@@ -1313,6 +1313,9 @@ impl Core {
             // precede it (`strand_for_takeover`). Once: the tail is
             // cleared below, and a later pass of the gate (waiting for
             // the drain) must not strand the tail's own re-journaled rows.
+            // Without a tail the strand still takes this node's own rows of
+            // a generation the table does not list (plan 46 M0.4 MUST-1,
+            // `Meta::strand_for_takeover_carrying`): they replay by rid.
             let own_gens: Vec<u64> = if gate.backup_tail_epoch.is_some() {
                 self.own_journaled_gens(replica)
             } else {
@@ -1411,12 +1414,12 @@ impl Core {
                     // again: ended by this node once its gate opens, or
                     // by the next root should this one crash or lose the
                     // lease first.
-                    // (With the generations the orphan rule ended, which
-                    // the strand marks the same way.)
+                    // (With the generations the orphan rule ended, and
+                    // those this node journals rows of that the table does
+                    // not list, which the strand marks the same way, with or
+                    // without a tail: the mark is never lifted.)
                     for (gen, d) in self.dl.mine.iter_mut() {
-                        if (own_gens.contains(gen) || !proof.is_empty())
-                            && replica.delegate_stranded(*gen)
-                        {
+                        if replica.delegate_stranded(*gen) {
                             d.stopped = true;
                         }
                     }
