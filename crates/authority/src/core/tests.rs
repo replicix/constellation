@@ -54854,6 +54854,17 @@ mod c2g_settle {
         assert!(abandoned_row(&h, rid3(1)));
         assert!(h.meta.lookup(ROOT_INO, "a").unwrap().is_some());
         assert!(h.meta.lookup(dir, "b").unwrap().is_none());
+        // The gated root's own op the same (`submit`).
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        let op = rename_into(&h, dir);
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        assert_eq!(recalls_to_4(&out).len(), 1, "own op: {out:?}");
     }
 
     /// ADR-44: a shippable gate recalls nothing on its own initiative. Its

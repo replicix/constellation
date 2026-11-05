@@ -182,6 +182,10 @@ pub(crate) struct ClientOp {
     /// lease-path execution of it from now on asks for the rid's outcome,
     /// or for its refusal for good, instead of executing it.
     pub settle: bool,
+    /// ADR-44: this settle waits in `Backoff` for a recall this node's
+    /// shippable gate sent on demand; the backoff routes it as a settle
+    /// again (`settle_route`), where the gate answers it after the cut.
+    pub gate_recall_wait: bool,
 }
 
 /// Chunk metered-own-rows: an observed position's pending upload
@@ -636,6 +640,7 @@ impl Core {
                 excused: Vec::new(),
                 answered_by: None,
                 settle: false,
+                gate_recall_wait: false,
                 tag,
             },
         );
@@ -701,29 +706,33 @@ impl Core {
             self.clients.get_mut(&rid).expect("present").phase = Phase::Gated;
             return;
         }
-        self.gate_recall_for_own(now, rid, replica, out);
         self.route(now, rid, replica, out);
     }
 
-    /// ADR-44: this node's own op or settle, the root in a shippable
-    /// takeover gate: the generations of other nodes it needs ended are
-    /// recalled now (`gate_recall_on_demand`), not when the gate opens.
+    /// ADR-44: this node's own op or settle, routed while this node is the
+    /// root in a shippable takeover gate (its view closed: it waits for the
+    /// open). An open root would execute it here and recall, first, every
+    /// generation its keys fall under (`execute_local_outcome` plans the
+    /// recall without a redirect: a live, reachable delegate was tried
+    /// before the route, and one that answered `NotHolder` naming this node
+    /// has disowned the generation). The gate does the same now
+    /// (`gate_recall_on_demand` with no redirect), not when it opens.
+    /// `true`: a recall the op needs is in flight in the gate.
     fn gate_recall_for_own(
         &mut self,
         now: Now,
         rid: Rid,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
-    ) {
+    ) -> bool {
         if !self.cfg.delegation || self.lease.gate.is_none() {
-            return;
+            return false;
         }
         let Some(op) = self.clients.get(&rid).map(|c| c.op.clone()) else {
-            return;
+            return false;
         };
         let keys = super::holder::keys_of_op_in(&op, replica);
-        let me = self.cfg.node_id;
-        self.gate_recall_on_demand(now, Some(me), &keys, replica, out);
+        self.gate_recall_on_demand(now, None, &keys, replica, out)
     }
 
     /// Whether an earlier op of this node touching a common inode is
@@ -1107,9 +1116,26 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let Some(policy) = self.clients.get(&rid).map(|c| c.policy) else {
+        let Some((policy, settle)) = self.clients.get(&rid).map(|c| (c.policy, c.settle)) else {
             return;
         };
+        // ADR-44: this node is the root in a shippable takeover gate; the
+        // generations the op needs ended are recalled now. A settle whose
+        // recall is in flight is asked again here (`on_forward_backoff` ->
+        // `settle_route`) once the cut may be journaled, not sent down the
+        // lease path, which waits for the open.
+        if self.gate_recall_for_own(now, rid, replica, out) && settle {
+            let delay = self.cfg.recall_hold_ms.max(50);
+            let timer = self.set_timer_wait(now.wait.plus(delay), Timer::ForwardBackoff(rid), out);
+            if let Some(c) = self.clients.get_mut(&rid) {
+                c.phase = Phase::Backoff;
+                c.gate_recall_wait = true;
+                if let Some(t) = c.timer.replace(timer) {
+                    self.cancel_timer(t, out);
+                }
+            }
+            return;
+        }
         // Plan 31 C8: a forward-only node forwards whatever
         // `CONSTELLATION_FORWARD` says.
         if !self.cfg.forwarding && !self.mode.forwards() {
@@ -1836,6 +1862,17 @@ impl Core {
         if let Some(epoch) = self.lease.new_mutation_epoch(now, &self.cfg) {
             let outcome = self.resolve_in_doubt_then_execute(now, rid, epoch, replica, out);
             self.finish(now, rid, outcome, replica, out);
+            return;
+        }
+        // ADR-44: this node's own settle, held for a recall its shippable
+        // gate sent on demand: routed as a settle again (the gate answers
+        // it once the cut is journaled, S1).
+        let gate_recall_wait = self
+            .clients
+            .get_mut(&rid)
+            .is_some_and(|c| std::mem::take(&mut c.gate_recall_wait));
+        if settle && gate_recall_wait {
+            self.settle_route(now, rid, replica, out);
             return;
         }
         // Plan 30 §M12: the op may be this node's own to execute by now
@@ -3580,7 +3617,6 @@ impl Core {
             }
             self.stats.gate_settles_held_executed += 1;
         }
-        self.gate_recall_for_own(now, rid, replica, out);
         if let Some(c) = self.clients.get_mut(&rid) {
             c.phase = Phase::Backoff;
         }
