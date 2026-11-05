@@ -1405,9 +1405,12 @@ cost when the node is idle
   answer may carry a **read delegation** (5 s, capped by the lease), under
   which later opens of that inode are local. Before acknowledging any
   mutation that touches a delegated inode (including an unlinked or
-  replaced one), the sequencer recalls the delegation or outwaits it; a
-  forward held longer than half its timeout is answered `Held` and
-  retried by rid. The sequencer persists a grant horizon before it
+  replaced one), the sequencer recalls the delegation or outwaits it. A
+  forwarded or inbox op waits for that (and for the grant quarantine)
+  *before* it executes, so its row never reaches the log while a
+  delegation that misses it is live: whoever answers its requester from
+  the log later answers after the delegation ended. A forward held longer
+  than half its timeout is answered `Held` and retried by rid. The sequencer persists a grant horizon before it
   answers, so it grants nothing new after a restart until earlier grants
   have expired, and a fast successor waits the horizon out before it
   acknowledges anything. Kernel caches have a zero TTL under strict,

@@ -66291,8 +66291,10 @@ no failure at that rate, so it is evidence, not proof). The maintainer decides w
   grant quarantine, before it executes a forwarded op. This is the inbox path's mechanism, factored out as
   `Core::recall_before_execute`. The op parks unexecuted as `ExecuteReply` (`Held` and re-attach; `Busy` on a lost
   lease). New grants on its inodes are blocked until it runs. Settles and dedup hits do not wait; an op touching no
-  granted inode executes at once. Every non-root "answer from the log" site now answers rows that reached the log only
-  after the conflicting grants ended (the inbox and delegate paths already recalled first). The bab70fe8 waits
+  granted inode executes at once. Every non-root "answer from the log" site now answers a forwarded, inbox or delegate
+  row only after the conflicting grants ended (the inbox and delegate paths already recalled first). Not covered: the
+  root's own local ops (recall after executing; reachable only when the lease is lost while its honour runs) and the
+  takeover gate's local replay of the queue (`replay_locally`), both open. The bab70fe8 waits
   (`dedup_acceptance_wait`, `aborted_recalls`, `park_settled_acceptance`) stay; local ops still recall after executing.
   New stat `forward_recalls_first`; debug assertion after a fresh forwarded execution.
 - Tests: `a_requester_answers_a_forwarded_op_from_the_log_inside_the_holders_recall` un-ignored (passes); core tests
@@ -66315,4 +66317,9 @@ no failure at that rate, so it is evidence, not proof). The maintainer decides w
 
   p90 moved little, and the other strict configs are unchanged. Before the fix, a forwarded op executed during the
   quarantine shipped at once, and its requester could take the answer from the log before the quarantine ended (the
-  same hole, with a predecessor's grants). Now the row waits for the quarantine.
+  same hole, with a predecessor's grants). Now the row waits for the quarantine. Reviewer's re-run (release) matches
+  the table, and `delegated-root-crash`, `delegated-two-gens-root-crash`, `delegated-crash` (`+unsettled`, 1 000 seeds)
+  are bit-identical to main (no strict reads, no quarantine). More ops now end `Abandoned` at their settle (the op parked
+  unexecuted when the window ran out): `long-strict` 169 to 209 of 300 seeds, `backup-strict+unsettled` 820 to 890 of
+  1 000; unsettled `EIO` unchanged (0; `long-strict` 2 and 2). This is the simulation's deadline ratio (12 s deadline,
+  5 s grant TTL); at the defaults (120 s) a 5.5 s park does not reach the settle window.

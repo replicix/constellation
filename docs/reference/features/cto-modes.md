@@ -289,7 +289,10 @@ before it executes), and a release of the lease. An op recalled before it
 executes leaves no row in the log while a delegation that misses it is
 live, so no node can answer its requester from the log early (after the
 sequencer crashed, say); new delegations on what it touches wait until it
-has executed. A change to a dentry also recalls the
+has executed (or, if it never does — a lost lease, a settle — until the
+block lapses, twice `ttl + margin` later). The sequencer's own (local)
+ops and a takeover's replay of its queue still execute first and recall
+after. A change to a dentry also recalls the
 parent directory's delegation, and an `unlink`, `rmdir` or `rename`
 also recalls the inodes it changes that its records do not name: the
 unlinked (or replaced) inode, whose `nlink` and `ctime` change or which
