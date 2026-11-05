@@ -17080,7 +17080,7 @@ fn the_lone_lead_oracle_catches_a_disabled_lead_and_a_disabled_hysteresis() {
             "long-delegated-lead-off",
             long_delegated_lead_off_config,
             "more than the lead",
-            &[1, 3],
+            &[1, 4],
         ),
         (
             "long-delegated-hysteresis-off",

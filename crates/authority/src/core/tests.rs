@@ -46747,10 +46747,11 @@ mod deleg_group {
         assert_eq!(d.core.stats.deleg_root_pokes, 0);
     }
 
-    /// An ask that finds nothing committed is asked again one stream tick
-    /// after it was sent, no more often (`poke_after`, not per event), and
-    /// holds back nothing: its answer is not a refusal or a batch that took
-    /// nothing, so no back-off delays the asking or the next row.
+    /// An ask that finds nothing committed is asked again after the
+    /// back-off, four ticks (a lone root's commit rises when it ships, not
+    /// per tick: plan 46 M1.1 step 1), no more often (`poke_after`, not per
+    /// event), and holds back nothing: its answer is not a refusal or a batch
+    /// that took nothing, so the next row goes at once.
     #[test]
     fn an_ask_that_finds_nothing_committed_is_asked_again_a_tick_later_and_holds_back_no_row() {
         let (mut d, mut r, _, _, last, dir) = parked_pair();
@@ -46770,11 +46771,14 @@ mod deleg_group {
             (s.stream_after, s.inflight, s.root_committed),
             (None, None, 0)
         );
-        // The answer is no back-off: the next ask is due one tick after the
-        // first, not four.
-        assert_eq!(s.poke_after, Some(sent.plus(tick)));
+        // The empty answer backs the asking off, four ticks, not one.
+        assert!(s.poke_after.unwrap() >= sent.plus(4 * tick));
         assert_eq!(d.core.stats.deleg_stream_no_progress, 0);
-        // The ask is made again on the next tick.
+        for _ in 0..3 {
+            let out = armed_tick(&mut d, &mut r);
+            assert_eq!(root_ask(&out), None, "asked again inside the back-off");
+        }
+        // The ask is made again once it is over.
         let out = armed_tick(&mut d, &mut r);
         assert!(root_ask(&out).is_some(), "{out:?}");
         assert_eq!(d.core.stats.deleg_root_pokes, 2);
@@ -46900,10 +46904,13 @@ mod deleg_group {
         }
         let out = armed_tick(&mut d, &mut r);
         let (req, round) = root_ask(&out).expect("not asked again after the back-off");
-        // An answer ends the back-off: the next ask is a tick later.
-        d.step(stream_ack_committed(1, req, round, last, 0));
-        let out = armed_tick(&mut d, &mut r);
-        assert!(root_ask(&out).is_some(), "the back-off outlived the answer");
+        // An answer that raises the commit ends the back-off (one that finds
+        // nothing committed keeps it: plan 46 M1.1 step 1).
+        d.step(stream_ack_committed(1, req, round, last, last));
+        assert_eq!(
+            d.core.dl.mine[&7].poke_backoff_ms, 0,
+            "the back-off outlived the answer"
+        );
         let _ = tick;
     }
 
