@@ -8826,7 +8826,10 @@ fn regression_the_sims_resubmission_is_no_late_landing_seed_1525() {
 /// follow-up fixes: seed 234 acknowledges a row (I1) while the group's version
 /// is changing, with no backup recorded and the root's journal lacking the
 /// appended row; seed 615 is a late landing (I4): an op answered in doubt that
-/// lands after a later one. Both failed when pinned; both pass now.
+/// lands after a later one. Both failed when pinned. Seed 234 passes since
+/// 4b4b608e ("a delegate is lone only when no backup could be had from any
+/// peer", bisected from the pin 224212d6: its parent fails, it passes); 615's
+/// late landing is attributed to M0.3 S1-S3 and was not bisected.
 #[test]
 fn delegated_group_switch_findings_seeds_234_and_615() {
     // Every seed runs, and every failure is reported (a first failure must not
