@@ -12611,13 +12611,38 @@ fn regression_the_strict_side_of_a_claimant_ahead() {
 /// S3 past its acknowledged, unshipped writes. It asks the holder now (an
 /// unobserved holder is live). (Seeds 260 and 2391 fail the same check with an
 /// offset of 0 too, `AUTHORITY_SIM_OFFSETS=3:0`, before and after: not a
-/// clock offset; they are left out.)
+/// clock offset; they are left out, see
+/// `a_requester_answers_a_forwarded_op_from_the_log_inside_the_holders_recall`.)
 #[test]
 fn regression_a_reader_ahead_of_the_holder_does_not_tail_past_its_writes() {
     regress(
         "strict-reader-ahead",
         strict_reader_ahead_config(),
         around(&[695, 882, 999]),
+    );
+}
+
+/// `strict-reader-ahead` seeds 260 and 217244 (offset 0 too): the residue
+/// of the row above, a product gap. Node 3, cut from holder 1, holds a read
+/// delegation on the root. Node 2 forwards a write to the root (P2P); holder
+/// 1 executes it, starts the recall of node 3's grant (it fails at the
+/// transport: outwaited to its TTL) and ships the segment carrying the
+/// `Completed` row, the reply parked for the recall. Holder 1 crashes. Node
+/// 2's retry reads the lease (holder 1, live, unreachable), takes the inbox
+/// path, and `inbox_enqueue` answers the client from the `Completed` row it
+/// applied from the stream, hundreds of ms before the grant ends; node 3
+/// then serves the root from its grant without the write. The holder's
+/// dedup answers wait for the quarantine (P41-01); a non-holder's answer
+/// from the log does not (`park_settled_acceptance`: "a non-holder knows no
+/// successor's quarantine"). Kept as a repro (`#[ignore]`): expected to
+/// FAIL until the gap is closed.
+#[test]
+#[ignore]
+fn a_requester_answers_a_forwarded_op_from_the_log_inside_the_holders_recall() {
+    regress(
+        "strict-reader-ahead",
+        strict_reader_ahead_config(),
+        [260, 217244],
     );
 }
 
