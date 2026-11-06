@@ -14769,7 +14769,6 @@ fn locks_unlinked_random_config(backup: bool) -> SimConfig {
             base.core.clone()
         },
         random_faults: 2,
-        strict_commit_exempt: (!backup).then_some(INBOX_DRAINED_REFUSAL),
         ..base
     }
 }
@@ -14798,17 +14797,9 @@ fn locks_unlinked_partition_config() -> SimConfig {
         lock_ios: c.lock_ios,
         lock_io_ms: c.lock_io_ms,
         faults: c.faults,
-        strict_commit_exempt: Some(INBOX_DRAINED_REFUSAL),
         ..locks_unlinked_delegated_config()
     }
 }
-
-/// The documented `strict_commit` exception of the partitioned lock
-/// configurations (lki1 triage, mechanism D, 2 seeds of 2,000 in each).
-const INBOX_DRAINED_REFUSAL: &str = "plan 46 M1.1 follow-up (lki1 D, unscheduled): a lone new \
-     root's own lock write, queued in its inbox while cut off and drained in its takeover gate \
-     (`LockLapsed`, journaled `EIO`), is answered at the open as `archive_waits` while its row is \
-     a `Singleton` row of the unshipped journal: the answer is the singleton's, the claim is not";
 
 /// `locks-unlinked-delegated-partition` without the unlinks: the lock
 /// files stay in `d1` (node 2's), so every grant's owner is a delegate,
@@ -15800,22 +15791,23 @@ fn strict_commit_is_the_default_of_a_delegated_configuration() {
         locks_delegate_ahead_config(),
         locks_executor_behind_config(),
         locks_unlinked_blips_config(),
-        locks_unlinked_partition_config(),
-        locks_delegated_partition_config(),
-        locks_unlinked_random_config(false),
         delegated_designated_config(),
     ] {
         let why = cfg.strict_commit_exemption().expect("an exception");
         assert!(why.contains("plan 46 M"), "{why}");
     }
     // lki1 triage: the lock lane is strict by default but for the
-    // configurations above.
+    // configurations above (the partitioned ones since mechanism D's fix).
     for cfg in [
         locks_delegated_config(),
         with_lock_writes(locks_delegated_config(), "d2"),
         locks_unlinked_delegated_config(),
         locks_unlinked_random_config(true),
+        locks_unlinked_random_config(false),
         locks_stall_step_delegated_config(),
+        locks_unlinked_partition_config(),
+        locks_delegated_partition_config(),
+        locks_delegated_partition_skew_config(),
     ] {
         assert!(cfg.lock_files > 0 && cfg.is_delegated());
         assert_eq!(cfg.strict_commit_exemption(), None);

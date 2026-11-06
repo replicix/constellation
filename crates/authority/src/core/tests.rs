@@ -29165,6 +29165,57 @@ mod locks {
         assert_ne!(mtime(&h, ino), 7);
     }
 
+    /// lki1 D: an inbox op refused for a lapsed grant is journaled under the
+    /// code every other lapsed refusal is (`LAPSED_CODE`), not `EIO`, a
+    /// dropped op's code (`DROPPED_CODE`). Read back as a drop's
+    /// (`completed_source`), the lone root's own op, drained in its takeover
+    /// gate, was answered as another node's: a claim of `archive_waits` for
+    /// its singleton row (`locks-delegated-partition+commit` seed 426). Fails
+    /// on the parent: journaled `Refused { Io }`, its source the archive.
+    #[test]
+    fn an_inbox_ops_lapsed_refusal_is_journaled_as_lapsed() {
+        let (mut h, ino) = holder_with_file();
+        let rid = h.rid(1);
+        let mut batch = super::inbox_batch(rid.node, 0, rid.seq, &setattr_mtime(ino, 7));
+        batch.ops[0].lock_tag =
+            token(GrantId { node: 1, seq: 1 }, h.now.0 - 1).to_wire(HonourMs(0));
+        // A lone root (the seed's; as `lone_singleton_root`): its own op's
+        // row is a singleton row.
+        h.core.ack.eligible = Some(false);
+        {
+            let lease = &mut h.core.lease.held.as_mut().unwrap().0;
+            lease.ack_policy = constellation_store_s3::AckPolicy::Local;
+            lease.singleton = true;
+        }
+        h.core.ack.cfg_seen = None;
+        h.core.ack.spans.clear();
+        h.core.sync_cfg_spans(&h.meta);
+        assert!(h.core.root_lone());
+        let mut out = Vec::new();
+        h.core
+            .inbox_drain(h.clk(), vec![batch], &h.meta, &mut out)
+            .unwrap();
+        assert_eq!(h.core.stats.lock_lapsed_refusals, 1);
+        assert_eq!(
+            h.meta.completed_outcome(rid).unwrap(),
+            Some(constellation_meta::CompletedOutcome::Refused {
+                code: crate::core::client::LAPSED_CODE
+            })
+        );
+        assert_eq!(
+            h.core.completed_source(&h.meta, rid).unwrap(),
+            crate::AnswerSource::Sequenced(h.core.journaled_answer_class(&h.meta, rid).unwrap())
+        );
+        assert!(
+            !h.core
+                .journaled_answer_class(&h.meta, rid)
+                .unwrap()
+                .is_archive(),
+            "a singleton row of this node's own op"
+        );
+        assert_ne!(mtime(&h, ino), 7);
+    }
+
     /// Layer A: a stranded op replayed by rid after a holder change carries
     /// its token (persisted with its replay row). The forward goes out with
     /// it; the sequencer refuses it; the replay is settled as refused (its

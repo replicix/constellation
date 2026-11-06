@@ -1668,14 +1668,21 @@ impl Core {
                     self.stats.inbox_refused_ops += 1;
                 }
                 // Plan 30 §M14 phase 2: the op's lock grant ended. Journaled
-                // (`EIO`), as a P2P refusal is: the requester learns inbox
-                // outcomes from the log, and the position must be answered
-                // for the drain to move on. Nothing else ran.
+                // as a P2P refusal is (`LAPSED_CODE`): the requester learns
+                // inbox outcomes from the log, and the position must be
+                // answered for the drain to move on. Nothing else ran. Not
+                // `EIO`: that is a dropped op's code (`DROPPED_CODE`), and
+                // read back as one (`completed_source`) the lone root's own
+                // op drained in its takeover gate was answered as another
+                // node's, claiming the archive for its singleton row.
                 Err(error) => {
-                    if matches!(error, MetaError::LockLapsed) {
+                    let code = if matches!(error, MetaError::LockLapsed) {
                         self.stats.lock_lapsed_refusals += 1;
-                    }
-                    replica.journal_inbox_refusal(rid, error.code(), ack, decoded.as_ref().ok())?;
+                        super::client::LAPSED_CODE
+                    } else {
+                        error.code()
+                    };
+                    replica.journal_inbox_refusal(rid, code, ack, decoded.as_ref().ok())?;
                     self.stats.inbox_refused_ops += 1;
                 }
             }
