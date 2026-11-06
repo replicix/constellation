@@ -570,7 +570,9 @@ at once (`Final`); `Close` flushes the journal into the log.
 `hold_answer_committed_or_final` and `hold_owner_never_deposed_except_by_retire`
 hold on the flex bounds (`N = 3, f = 1`, with and without drift, and
 `N = 2, f = 1` with one-member epochs); the knob `hold_answers_uncommitted`
-(today's answer to members) is found by the first. M1.4's model gate is met.
+(today's answer to members) is found by the first. M1.4's model gate is met
+(definitionally; the gate's fail-before evidence is the strict flex crash
+sims `epoch-member-dies-with-chunk` and `flex-crash`, see §11, M1.0 review).
 
 ### 5.8 Stage 3: C4 as specified, then C7b-8
 
@@ -1005,7 +1007,7 @@ written into `DECISIONS.md` with M1.3's code, where the lone root's other
 
 ### M1.0 answers, chunk C11 (the maintainer, 2026-11-06)
 
-Two decisions the combined topologies forced:
+Three decisions the combined topologies and their review forced:
 
 - **Claim = release.** A sticky (or designated) holder that takes the root
   by a lease claim journals the release of its directories (`StreamReleased`)
@@ -1022,7 +1024,18 @@ Two decisions the combined topologies forced:
   was granted and unrecalled: `check_reads` treated the ended stream as
   gone); the knob `abandon_skips_read_recall` re-introduces it and is found
   by `settle_after_reads_recalled`. Product gap: `repair abandon --node` and
-  its recall, else expiry, are M1.3.
+  its recall, else expiry, are M1.3. The review (below) extended it: the
+  expiry is the root's clock event, independent of the holder being alive
+  (a dead holder's read grant is waited out, so the abandon is reachable),
+  and a claim's release waits for the claimant's read delegation the same
+  way (knob `claim_skips_read_recall`).
+- **Leave ends grants first.** A node's `Leave` first ends its grants with
+  a record (the holder's release if alive; the root's abandon for a dead
+  node) and only then leaves the roster, so the roster-only singleton test
+  never sees a live grant held off-roster (the root would answer a
+  delegate's row from its disk, ADR-41's lone branch). Property
+  `no_live_grant_off_roster`, knob `leave_keeps_grants`, topology X3b.
+  **Product gap: M1.1 step 5 lands with this rule** (the roster code).
 
 *Model (M1.0 chunk C11, 2026-11-06).* `tests/node_stream.rs` composes the
 mechanisms on six topologies (`c11_design_x1` placed everything with history,
@@ -1033,13 +1046,27 @@ sticky grant and a deposition; `x4` claim plus sticky): every `always`
 property clean, every `sometimes` witness reached, with all knobs off. Every
 knob's counterexample length is checked in (`TRACES`). The suite is 254 s
 on the shared build box. An ill-formed X3 (a placed grant to a peer while the
-roster was the root alone) is kept out: it is not a reachable configuration.
+roster was the root alone) is not a reachable configuration; the review's
+X3b is its well-formed form (the placed holder is in the roster and leaves
+by ending its grant first).
 The `lib.rs` doc has the timing table and the node-stream action → code
 mapping with the product gaps (M1.1 steps 5 to 7, M1.2 to M1.4, the claim's
 release, abandon's recall, else expiry).
 
-- TODO: go/no-go verdict (D7).
-- TODO: C11's review (fable) cleared.
+Review cleared: C11 review (fable, 2026-11-06): cleared with conditions — MUST-1 (partial SubtreeReleased counted as the holder's release), SHOULD-1 (abandon's expire half unreachable; the claim's release ignored reads), SHOULD-2 (roster-only singleton test with a live grant). Fixed in the model ff3066b0, knobs found, design clean.
+
+Go/no-go: GO (D7, 2026-11-06): M1.2 and M1.4 proceed; M1.1 step 5 lands with the Leave-ends-grants rule (maintainer, 2026-11-06); M1.3 after MUST-1 and SHOULD-1 are green (done in ff3066b0). No fallback.
+
+*What the model's M1.4 and I1 claims carry (review SHOULD-3 and nits).* C10's
+`hold_answer_committed_or_final` is **definitional in the model**: a crash
+keeps the owner's journal and the member's copy and nothing is retired, so
+the property cannot fail there. **The M1.4 gate therefore requires the flex
+crash strict sims (`epoch-member-dies-with-chunk`, `flex-crash`) as
+fail-before** (they are the evidence for the group, not the model). Likewise
+I1 is definitional for `Final` (the sticky guarantee rests on
+`acked_at_or_below_cut`, sticky-ends-only-by-holder-or-operator and I5), and
+X1 has one writer (it composes faults, not concurrency). All stated in the
+`lib.rs` doc.
 
 ## 12. Exit criteria
 
