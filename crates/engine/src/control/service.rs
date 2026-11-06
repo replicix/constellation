@@ -589,6 +589,7 @@ impl EngineControl {
                     xgen_ack_delay_max_ms: stats.deleg_xgen_ack_delay_max_ms,
                     lost_deps_stopped: stats.deleg_lost_deps_stopped,
                     append_deps_lost: stats.deleg_append_deps_lost,
+                    append_skipped: stats.deleg_append_skipped,
                     drain_deps_waits: stats.deleg_drain_deps_waits,
                     designee_syncs: stats.deleg_designee_syncs,
                     designee_sync_failures: stats.deleg_designee_sync_failures,

@@ -1153,7 +1153,9 @@ a live delegation owned their keys), `fast_path_fenced` (ops the delegate's
 fast path sent through the core because its generation ended at this
 node's takeover gate while the op waited for the store's writer lock),
 `forwarded_to_delegate`, `deps_waits`,
-`streamed_txs`, `appended_txs`, `cross_subtree`, `recalls_sent`,
+`streamed_txs`, `appended_txs`, `append_skipped` (records of an appended
+row the root's tolerant apply could not apply: the row is journaled as
+streamed all the same, and the count must stay 0), `cross_subtree`, `recalls_sent`,
 `recalls_drained`, `recalls_expired`, `reclaimed`, `ended`,
 `renewals_off_core` (renewals the off-core lane sent while the core was
 stuck in a step), `root_answers_off_core` and `root_answers_deferred` (the

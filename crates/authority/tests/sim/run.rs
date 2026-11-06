@@ -5567,6 +5567,19 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             ));
         }
     }
+    // Plan 46 M1.2 step 4: the root appends a delegate's row verbatim; a
+    // record its tolerant apply skipped is a divergence (any fails), except
+    // under `speculate_on_stale_base`, the knob that installs replies on a
+    // base the requester lacks to show the divergence it causes.
+    let stale_base = (cfg.core)(1, 1).speculate_on_stale_base;
+    for (id, stats) in &report.stats {
+        if stats.deleg_append_skipped > 0 && !stale_base {
+            return Err(format!(
+                "node {id}: {} record(s) of a delegate's row skipped by the root's verbatim append\n  stats: {:#?}",
+                stats.deleg_append_skipped, report.stats
+            ));
+        }
+    }
     // The causal cut: a refusal for lacking deps at the current root (see
     // `Oracles::note_deps_refused`; a deposed root's refusal is no
     // violation, `long-delegated-late-answers` seed 4947).

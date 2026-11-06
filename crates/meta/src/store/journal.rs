@@ -64,7 +64,7 @@ pub(crate) fn peek_next_seq(
 
 thread_local! {
     static PENDING_COMPLETION: std::cell::Cell<Option<Rid>> = const { std::cell::Cell::new(None) };
-    static PENDING_OP: std::cell::RefCell<Option<(Option<Rid>, crate::mutate::MutateOp)>> =
+    static PENDING_OP: std::cell::RefCell<Option<(Option<Rid>, Option<crate::mutate::MutateOp>)>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -77,14 +77,23 @@ pub(crate) struct PendingLocalOp;
 
 impl PendingLocalOp {
     pub(crate) fn set(rid: Option<Rid>, op: &crate::mutate::MutateOp) -> PendingLocalOpGuard {
-        PENDING_OP.with(|c| *c.borrow_mut() = Some((rid, op.clone())));
+        PENDING_OP.with(|c| *c.borrow_mut() = Some((rid, Some(op.clone()))));
+        PendingLocalOpGuard
+    }
+
+    /// The rid a transaction completes, and no op: the root's verbatim
+    /// append of a delegate's row (plan 46 M1.2 step 4). The row is the
+    /// delegate's, not an op this node can execute again, so nothing may
+    /// replay it as `MutateOp::Records`.
+    pub(crate) fn set_rid_only(rid: Option<Rid>) -> PendingLocalOpGuard {
+        PENDING_OP.with(|c| *c.borrow_mut() = Some((rid, None)));
         PendingLocalOpGuard
     }
 
     /// Taken by the first journaled transaction that finishes while it is
     /// set, so a second transaction in the same call (none today) could
     /// not claim the same op.
-    pub(crate) fn take() -> Option<(Option<Rid>, crate::mutate::MutateOp)> {
+    pub(crate) fn take() -> Option<(Option<Rid>, Option<crate::mutate::MutateOp>)> {
         PENDING_OP.with(|c| c.borrow_mut().take())
     }
 }

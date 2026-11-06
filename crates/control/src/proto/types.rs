@@ -443,6 +443,9 @@ pub struct DelegationReport {
     /// tail's drain at a dependency the root did not hold yet.
     pub lost_deps_stopped: u64,
     pub append_deps_lost: u64,
+    /// Records of a delegate's row the root journaled verbatim but could not
+    /// apply (must stay 0).
+    pub append_skipped: u64,
     pub drain_deps_waits: u64,
     /// A designee's journal syncs before its stream sends rows (off the
     /// core), and those that failed (the stream waits and asks again).

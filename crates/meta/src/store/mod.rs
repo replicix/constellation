@@ -783,6 +783,11 @@ pub struct Meta {
     /// Scans of a generation's unshipped holder appends
     /// ([`Meta::holder_scans`]).
     holder_scans: AtomicU64,
+    /// Plan 46 M1.2 step 4: records of a delegate's transaction the root's
+    /// append journaled but could not apply (a tolerant apply; the sim
+    /// fails a seed that has any), not yet taken by the core
+    /// ([`Meta::take_deleg_append_skipped`]).
+    deleg_append_skipped: AtomicU64,
     /// Plan 40: dentries decoded by the directory reads (`readdir`,
     /// `readdir_after` and their scratch twins) — what a page costs
     /// ([`Meta::dentries_read`]).
@@ -1057,6 +1062,12 @@ impl Meta {
         self.holder_scans.load(Ordering::Relaxed)
     }
 
+    /// Records the root's verbatim appends of delegate transactions could
+    /// not apply since the last call (and reset).
+    pub fn take_deleg_append_skipped(&self) -> u64 {
+        self.deleg_append_skipped.swap(0, Ordering::Relaxed)
+    }
+
     pub(crate) fn note_local_rows_read(&self, n: usize) {
         self.local_rows_read.fetch_add(n as u64, Ordering::Relaxed);
     }
@@ -1297,6 +1308,7 @@ impl Meta {
             local_rows_read: AtomicU64::new(0),
             dirty_probes: AtomicU64::new(0),
             holder_scans: AtomicU64::new(0),
+            deleg_append_skipped: AtomicU64::new(0),
             dentries_read: AtomicU64::new(0),
             snapshot_gen: AtomicU64::new(0),
             snapshot_hook: std::sync::RwLock::new(None),

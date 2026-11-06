@@ -1061,6 +1061,10 @@ pub struct Stats {
     /// Root: delegate rows not appended, a dependency lost with its
     /// generation.
     pub deleg_append_deps_lost: u64,
+    /// Plan 46 M1.2 step 4: records of a delegate's transaction the root's
+    /// verbatim append journaled but its tolerant apply skipped. The sim
+    /// fails a seed that has any.
+    pub deleg_append_skipped: u64,
     /// Root: a sealed tail's drain stopped at a row whose dependency it
     /// does not hold yet (another generation of the dead delegate).
     pub deleg_drain_deps_waits: u64,

@@ -708,7 +708,7 @@ impl Meta {
             _ => None,
         };
         let (rid, op) = match journal::PendingLocalOp::take() {
-            Some((rid, op)) => (rid, Some(op)),
+            Some((rid, op)) => (rid, op),
             None => (None, None),
         };
         let spec_seq = match local.capture {
@@ -1273,6 +1273,14 @@ impl Meta {
     /// journal with the delegate's origin and `deps`, completing `rid`
     /// once. A rid the log or this journal already completed is skipped
     /// (`Ok(false)`).
+    ///
+    /// Plan 46 M1.2 step 4 (C3-1): the transaction is journaled verbatim,
+    /// the records as streamed and in the order streamed (an `Atime` row,
+    /// an atime-only transaction, a `Refused`, an `InboxAck` and each
+    /// `Completed` included), under the delegate's `(gen, idx)`, with its
+    /// rid and no op. The apply is tolerant: a record that does not apply
+    /// is journaled all the same and counted
+    /// ([`Meta::take_deleg_append_skipped`]).
     ///
     /// Plan 45 §12 O1: a rid this root holds a live shadow of (it
     /// forwarded the op to the delegate and installed the reply) is
@@ -1857,14 +1865,21 @@ impl Meta {
         // With a rid, the transaction is that op's (plan 30 §M9): a
         // stranding replays it *by rid* — where `completed` dedups —
         // never as anonymous records under a derived rid, which would
-        // re-apply a stale effect out of order.
+        // re-apply a stale effect out of order. A delegate's row the root
+        // appends (plan 46 M1.2 step 4) is journaled as streamed, with its
+        // rid and no op: it is not one this node can execute again.
+        let verbatim = how == Journaled::Appended;
         let _op = rid.map(|rid| {
-            journal::PendingLocalOp::set(
-                Some(rid),
-                &crate::mutate::MutateOp::Records {
-                    records: records.to_vec(),
-                },
-            )
+            if verbatim {
+                journal::PendingLocalOp::set_rid_only(Some(rid))
+            } else {
+                journal::PendingLocalOp::set(
+                    Some(rid),
+                    &crate::mutate::MutateOp::Records {
+                        records: records.to_vec(),
+                    },
+                )
+            }
         });
         // Plan 43 C1-2: a predecessor's tail was committed by its group
         // (the sealer held it, write-all), whatever this tenure waits for.
@@ -1903,7 +1918,7 @@ impl Meta {
         };
         let local = self.begin_local(&tx)?;
         let staged = UsageTracker::staging();
-        let (_, applied) = {
+        let (skipped, applied) = {
             let cx = ApplyCx {
                 dirty: local.dirty(self),
                 durable: true,
@@ -1918,16 +1933,70 @@ impl Meta {
                 true,
             )?
         };
+        if verbatim {
+            // The streamed records exactly, in order: an `Atime` row, an
+            // atime-only transaction, a `Refused` and an `InboxAck` row
+            // included, each `Completed` where the delegate journaled it.
+            // The apply above is tolerant (every replica applies the same
+            // records by the same rules), and a record it skipped is
+            // counted: the sim fails a seed that has one.
+            if skipped > 0 {
+                self.deleg_append_skipped
+                    .fetch_add(skipped as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            debug_assert!(
+                journal::PendingCompletion::take().is_none(),
+                "a verbatim append carries its own completions"
+            );
+            for rec in &applied {
+                match rec {
+                    LogRecord::Completed { rid } => {
+                        journal::append_completion_tx(
+                            &mut tx,
+                            &self.journal_ks,
+                            &self.local,
+                            &self.completed,
+                            *rid,
+                        )?;
+                    }
+                    LogRecord::Refused { rid, code } => {
+                        let seq = journal::append_tx(
+                            &mut tx,
+                            &self.journal_ks,
+                            &self.local,
+                            &self.completed,
+                            rec,
+                        )?;
+                        let now_ms = constellation_fs_core::types::now_ns() / 1_000_000;
+                        tx.insert(
+                            &self.completed,
+                            rid.to_key(),
+                            Meta::encode_refused_row(seq, now_ms, *code),
+                        );
+                    }
+                    _ => {
+                        journal::append_tx(
+                            &mut tx,
+                            &self.journal_ks,
+                            &self.local,
+                            &self.completed,
+                            rec,
+                        )?;
+                    }
+                }
+            }
+        }
         let rows: Vec<&LogRecord> = applied
             .iter()
             .filter(|rec| {
-                !matches!(
-                    rec,
-                    LogRecord::Completed { .. }
-                        | LogRecord::Atime { .. }
-                        | LogRecord::Refused { .. }
-                        | LogRecord::InboxAck { .. }
-                )
+                !verbatim
+                    && !matches!(
+                        rec,
+                        LogRecord::Completed { .. }
+                            | LogRecord::Atime { .. }
+                            | LogRecord::Refused { .. }
+                            | LogRecord::InboxAck { .. }
+                    )
             })
             .collect();
         let n = rows.len();
@@ -1939,7 +2008,7 @@ impl Meta {
                 (rid.is_some() && i + 1 == n).then(|| journal::PendingCompletion::set(rid));
             journal::append_tx(&mut tx, &self.journal_ks, &self.local, &self.completed, rec)?;
         }
-        if n == 0 {
+        if n == 0 && !verbatim {
             // The rid is this transaction's own, or the one `execute`
             // armed for the `MutateOp::Records` op it runs (which no row
             // took above): a replay by rid whose records all lost to a
@@ -4039,5 +4108,154 @@ mod origin_index_tests {
         for seed in [1, 0x9e37_79b9, 42, 7_777, 31_337, 0xdead_beef] {
             run(seed, 160);
         }
+    }
+}
+
+/// Plan 46 M1.2 step 4 (C3-1, c3-spec D2): the root's append of a delegate's
+/// row journals the streamed records as they are.
+#[cfg(test)]
+mod verbatim_append_tests {
+    use super::*;
+    use crate::rid::Rid;
+    use constellation_fs_core::types::ROOT_INO;
+
+    fn rid(seq: u64) -> Rid {
+        Rid {
+            node: 3,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    fn create(name: &str, n: u64) -> LogRecord {
+        LogRecord::Create {
+            parent: ROOT_INO,
+            name: name.into(),
+            ino: (3 << 40) | n,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 5,
+        }
+    }
+
+    /// Every journal row, in order, with its transaction's head.
+    fn journal(meta: &Meta) -> Vec<(JournalTx, Vec<LogRecord>)> {
+        let r = meta.db.read_tx();
+        let mut heads = read_journal_txs(&r, meta).unwrap();
+        heads.sort_by_key(|(first, _)| *first);
+        heads
+            .into_iter()
+            .map(|(first, row)| {
+                let recs = journal_records(&r, meta, first, row.last)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(_, rec)| rec)
+                    .collect();
+                (row, recs)
+            })
+            .collect()
+    }
+
+    /// `[Create, Atime, Completed]`, an atime-only transaction, a
+    /// transaction whose `Refused` precedes its `Completed`, and one that
+    /// ends in an `InboxAck`: the root's journal carries each as streamed.
+    /// (Before: the `Atime` was dropped, the atime-only transaction
+    /// journaled nothing, the `Refused` moved behind the rows.)
+    #[test]
+    fn an_appended_row_is_journaled_verbatim() {
+        let meta = Meta::open_in_memory().unwrap();
+        let gen = 9;
+        let atime = LogRecord::Atime {
+            ino: (3 << 40) | 1,
+            atime_ns: 7,
+            time_ns: 7,
+        };
+        let txs: Vec<(Option<Rid>, Vec<LogRecord>)> = vec![
+            (
+                Some(rid(1)),
+                vec![
+                    create("a", 1),
+                    atime.clone(),
+                    LogRecord::Completed { rid: rid(1) },
+                ],
+            ),
+            (
+                Some(rid(2)),
+                vec![atime.clone(), LogRecord::Completed { rid: rid(2) }],
+            ),
+            (
+                Some(rid(3)),
+                vec![
+                    create("b", 2),
+                    LogRecord::Refused {
+                        rid: rid(4),
+                        code: constellation_types::Code::NotFound,
+                    },
+                    LogRecord::Completed { rid: rid(3) },
+                ],
+            ),
+            (
+                Some(rid(5)),
+                vec![
+                    create("c", 3),
+                    LogRecord::Completed { rid: rid(5) },
+                    LogRecord::InboxAck {
+                        epoch: 1,
+                        node: 3,
+                        n: 1,
+                        i: 0,
+                    },
+                ],
+            ),
+        ];
+        for (k, (r, records)) in txs.iter().enumerate() {
+            assert!(meta
+                .apply_delegate_tx(records, *r, gen, k as u64 + 1, Default::default())
+                .unwrap());
+        }
+        let got = journal(&meta);
+        assert_eq!(got.len(), txs.len());
+        for (k, ((row, recs), (_, want))) in got.iter().zip(&txs).enumerate() {
+            assert_eq!((row.gen, row.idx), (gen, k as u64 + 1));
+            assert_eq!(recs, want, "transaction {}", k + 1);
+        }
+        assert_eq!(meta.take_deleg_append_skipped(), 0);
+        // The streams read back the same (what a re-stream carries).
+        let back = meta.delegate_txs_from(gen, 1, usize::MAX).unwrap();
+        assert_eq!(
+            back.iter().map(|t| t.records.clone()).collect::<Vec<_>>(),
+            txs.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>()
+        );
+        // And a record the apply could not take is counted, not dropped.
+        let orphan = LogRecord::Create {
+            parent: (9 << 40) | 99,
+            name: "x".into(),
+            ino: (3 << 40) | 50,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 5,
+        };
+        let records = vec![orphan, LogRecord::Completed { rid: rid(6) }];
+        meta.apply_delegate_tx(&records, Some(rid(6)), gen, 5, Default::default())
+            .unwrap();
+        assert_eq!(journal(&meta).last().unwrap().1, records);
+        assert_eq!(meta.take_deleg_append_skipped(), 1);
+    }
+
+    /// The journal row of an appended transaction names its rid and no op:
+    /// nothing may replay it as `MutateOp::Records`.
+    #[test]
+    fn an_appended_row_journals_no_replay_op() {
+        let meta = Meta::open_in_memory().unwrap();
+        let records = vec![create("a", 1), LogRecord::Completed { rid: rid(1) }];
+        assert!(meta
+            .apply_delegate_tx(&records, Some(rid(1)), 9, 1, Default::default())
+            .unwrap());
+        let rows = journal(&meta);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.rid, Some(rid(1)));
+        assert!(rows[0].0.op.is_none(), "{:?}", rows[0].0.op);
     }
 }

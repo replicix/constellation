@@ -67575,3 +67575,44 @@ new failure, no version mismatch. Known and in triage elsewhere (not run here, n
 **Gates** (box 1): fmt `--check` and clippy `--workspace --all-targets -D warnings` clean; lib tests meta 406, authority 1,060, engine 952, control 146 (the schema test after the
 bless); release sim suite 421 passed, 0 failed, 12 ignored. No perf gate: names and counters only. No hot-path change: the FUSE fast path (engine) is untouched, the core's answer
 paths build a `RowCommit` (24 bytes, copied) where they built an `AckClass`, and read no store they did not.
+
+### Plan 46 M1.2 step 4: the root's append is verbatim (2026-11-06)
+
+C3-1 (c3-spec D2). `Meta::apply_delegate_tx` journals the streamed records exactly as streamed and in the order streamed: an `Atime` row, an
+atime-only transaction, a `Refused` and an `InboxAck` row included, each `Completed` where the delegate journaled it. Before, the append
+re-derived its rows from the apply: it dropped `Atime` rows, journaled nothing for an atime-only transaction, moved `Refused`/`InboxAck`
+behind the rows and put the completion after the last row. The row keeps its rid and its `(gen, idx)` and `deps`, and now carries no op
+(`PendingLocalOp::set_rid_only`): it is the delegate's row, nothing may replay it as `MutateOp::Records`. The `RowCommit` stamp is as M1.1
+step 4 left it (the generation's applied `DelegGroup` version, read in the journaling transaction). The apply stays tolerant (every replica
+applies the same records by the same rules) and counts every record it skipped: `Meta::take_deleg_append_skipped`, `Replica::
+take_deleg_append_skipped`, the core's `deleg_append_skipped`, `status.delegation.append_skipped` (schema re-blessed). The sim fails a seed
+that has any (`run.rs`, next to the `deleg_lost_after_ack` check), except under `speculate_on_stale_base`, the knob that installs replies on
+a base the requester lacks "to show the divergence it causes": its seeds skip a `Link`/`Exchange` whose endpoint the root lacks, on main
+as well (`delegated-backup+links-local+stalebase` seeds 13, 261, 691, 870, 1035 and `long-delegated+links-local+stalebase` 299, 664, 1322,
+1361, 1650 skip; the regression test `regression_a_root_appending_over_its_own_shadow_keeps_the_log_prefix` runs seed 13 and failed on the
+first version of the hook). Deleted: the re-derived row selection in the append (`apply_records_journaled_inner`'s Appended branch), the
+append's `MutateOp::Records` op. The refusal special case (`[Refused]`: journaled over a live shadow, stranding it) stays: it was verbatim.
+Not done here (c3-spec D2's second half): a rid completed elsewhere is still skipped, not appended and counted (`deleg_append_rid_elsewhere`).
+
+**Fail-before** (main with the two new tests only, box 2): meta `an_appended_row_is_journaled_verbatim` (transaction 1 journaled
+`[Create, Completed]` for the streamed `[Create, Atime, Completed]`) and `an_appended_row_journals_no_replay_op` (the row's op was
+`Some(Records { .. })`) fail; both pass on the branch.
+
+**Sweeps** (box 2, release, seeds 0..1,999; main = base, branch = this): `+commit` and `+identity` on `long-delegated-backup`,
+`long-delegated-late-answers`, `delegated-backup`: 0 failing on both. The I2c "delegate records" share was 0 on main already on all three
+(i2c = 0, in 0 seeds, both variants): step 0's baseline had none to remove, so the meta tests are the fail-before, as c3-spec §3.4 says.
+The `-lr` L2b pin (`l2b_findings_a_committed_delegate_row_lands_with_its_identity`, `--ignored`) fails on the same five seeds with the same
+identity mismatches on both (step 7's). The stalebase configs fail on the same sets on both (`delegated-backup+links-local+stalebase`
+261, 870, 1035; `long-delegated+links-local+stalebase` 299, 664, 1322, 1361, 1650: read-your-writes, the knob's own divergence). No skip
+in any non-stalebase sweep.
+
+**Gates** (box 2): fmt, clippy `-D warnings` (meta, authority, engine, control, all targets), meta lib 406 (the two new tests included) and its integration tests (`--no-fail-fast`; five tests of `holder_capture` appended hand-built rows without the `Completed` a delegate journals, which the append used to add: the helper and one call now carry it), authority lib 1,049,
+engine lib 951, control 146 (schema blessed), release sim suite 410 passed, 0 failed, 12 ignored.
+
+**Performance gate** (box 3, quiet; main = A, branch = B, `bench/commit-rule/g1-abba.sh`, A B B A, `ack-latency` topologies 3 and 4, where
+the root appends the delegate's stream; 10 runs per variant per file system, 200 samples per op and actor, medians over runs of p50 / p90).
+The delegate's own ops, B / A p50: ext4 chmod 1.00, create 1.00, rename 1.01, unlink 1.02, write 1.00 (topology 3); xfs 1.00, 1.01, 0.98,
+0.97, 1.00; btrfs 1.00, 1.01, 1.00, 1.00, 1.00; tmpfs 1.02, 0.99, 0.98, 1.01, 1.00; topology 4: 0.94 to 1.04 on all four, one cell
+above +3 % on p50 (xfs create 1.04, spread of the runs overlapping) and one on p90 (ext4 unlink 1.12, 460 to 554 us against 455 to 554 us:
+the same). The ops forwarded to the root are bimodal (chmod and unlink on xfs 0.74, on ext4 chmod 1.15) with no direction across file
+systems. No regression on any file system.

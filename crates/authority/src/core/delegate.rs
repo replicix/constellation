@@ -4141,7 +4141,9 @@ impl Core {
                 }
                 break;
             }
-            match replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps) {
+            let applied = replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps);
+            self.stats.deleg_append_skipped += replica.take_deleg_append_skipped();
+            match applied {
                 Ok(_) => {
                     replica.note_foreign_executed(&tx.records);
                     cursor = tx.idx;
@@ -8075,7 +8077,9 @@ impl Core {
                 );
                 break;
             }
-            match replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps) {
+            let applied = replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps);
+            self.stats.deleg_append_skipped += replica.take_deleg_append_skipped();
+            match applied {
                 Ok(_) => {
                     // (No causal-cut check here: `reaches_streams` held
                     // above and only rises, so a check after the append

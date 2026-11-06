@@ -1836,7 +1836,7 @@ fn a_segment_carrying_a_journaled_rid_makes_its_outcome_the_logs() {
     let r = rid(1);
     assert!(meta
         .apply_delegate_tx(
-            &[create("m", (2 << 40) | 1)],
+            &[create("m", (2 << 40) | 1), LogRecord::Completed { rid: r }],
             Some(r),
             4,
             1,
@@ -2265,7 +2265,14 @@ fn create_rec(name: &str, ino: u64) -> LogRecord {
 fn root_appends(meta: &Meta, gen: u64, idx: u64, name: &str) {
     assert!(meta
         .apply_delegate_tx(
-            &[create_rec(name, (2 << 40) | idx)],
+            // As the delegate journaled it: the op's records and its
+            // completion (the append is verbatim).
+            &[
+                create_rec(name, (2 << 40) | idx),
+                LogRecord::Completed {
+                    rid: delegate_rid(idx),
+                },
+            ],
             Some(delegate_rid(idx)),
             gen,
             idx,
