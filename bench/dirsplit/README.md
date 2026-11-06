@@ -1,9 +1,12 @@
-# Directory hash-range split benchmark
+# Hot shared directory benchmark
 
-Does splitting one hot shared directory into name-hash ranges (plan 30
-§M12, "GIGA+", see [Delegations](../../docs/reference/features/delegations.md#hot-shared-directories))
-pay off, and under which network topology? The results and the verdict
-are in [RESULTS.md](RESULTS.md).
+Began as the measurement of splitting one hot shared directory into
+name-hash ranges (plan 30 §M12, "GIGA+"), which never paid off (the
+results and the verdict are in [RESULTS.md](RESULTS.md), ADR-38). Plan 46
+D5 deleted the splits: the configurations `b` (automatic split) and `c`
+(hand split) and the `own` workload are gone, and what is left measures
+one hot directory under the placement (`a`) and delegated whole (`d`) in
+the same topologies.
 
 ## What runs
 
@@ -29,29 +32,23 @@ host, each placed on a *site*:
 
 Each phase runs one workload on a fresh directory, `DIRSPLIT_THREADS`
 (4) closed-loop threads per writer on the writer's own mount, a warm-up
-(5 s; 20 s for `b`, whose placement window must see the load first) and
-a 15 s measurement. Files are empty, so no data goes to S3. Workloads:
+(5 s) and a 15 s measurement. Files are empty, so no data goes to S3. Workloads:
 
 | workload | op |
 |---|---|
 | `uniform` | create (`open(O_CREAT|O_EXCL)` + `close`) of a random name |
 | `mix` | a create, and the unlink of the thread's 17th-newest file |
 | `rename` | rename one of the thread's 16 files to a new random name |
-| `own` | a create of a random name hashing into the writer's own range of `N` (**synthetic** best case for a split) |
 
 Configurations:
 
 | config | meaning |
 |---|---|
-| `a` | `CONSTELLATION_DELEGATION_SPLIT=0`: no hash-range split; the placement may still delegate the directory whole to a dominant writer (reported as `whole`) |
-| `b` | the automatic placement with splits turned on, `CONSTELLATION_DELEGATION_SPLIT=20` set explicitly (splits are off by default); reports whether a split fired |
-| `c` | a hand split, `N` ranges, range `i` delegated to writer `i` (for `own` that is the writer that dominates it) |
+| `a` | the placement as it is; it may delegate the directory whole to a dominant writer (reported as `whole`) |
 | `d` | the directory delegated whole to `w0` |
 
-`a`, `c` and `d` share a cluster mounted with `SPLIT=0`, their order
-rotated by one per repetition; `b` runs on a cluster of its own (the knob
-is read at mount); `rename` runs on a cluster per configuration (see
-below). After each phase every delegation of the directory is
+`a` and `d` share a cluster, their order rotated by one per repetition;
+`rename` runs on a cluster per configuration (see below). After each phase every delegation of the directory is
 recalled, and the root and the last writer must list exactly the names
 the writers left (`converged`).
 
@@ -59,7 +56,7 @@ Recorded per phase (one JSON line): ops/s in total and per writer,
 p50/p90/p99/max op latency (in total and per op kind), errors by kind,
 every daemon's CPU (utime+stime over the window), S3 requests per node
 by class, the delegation counters' deltas, the directory's delegation
-table at the window's start and end, when a `b` split fired, and each
+table at the window's start and end, and each
 node's P2P RTTs and backups.
 
 ## Topologies
@@ -96,21 +93,20 @@ bench/dirsplit/analyze.py $OUT > tables.md
 ```
 
 `run-cell.sh` runs one cell: `REPS` (default 3) repetitions of a
-cluster for `uniform`, `mix` and `own` under `a`, `c` and `d` (order
-rotated per repetition), one cluster per configuration for `rename` (a
-hand split's cross-range renames leave the root slower, which would skew
-later phases), and a `b` cluster for every workload, `rename` last. Every
+cluster for `uniform` and `mix` under `a` and `d` (order rotated per
+repetition) and one cluster per configuration for `rename` (its recalls
+leave the root slower, which would skew later phases). Every
 harness run is under `timeout`; the cell starts once the host's 1-minute
 load average is below `MAX_LOAD` (4). One phase directly:
 
 ```sh
 DIRSPLIT_LAYOUT=half DIRSPLIT_WRITERS=4 DIRSPLIT_S3_NEAR_MS=20 DIRSPLIT_S3_FAR_MS=80 \
 DIRSPLIT_RTT_LOCAL_MS=0.5 DIRSPLIT_RTT_REMOTE_MS=60 DIRSPLIT_WORKLOADS=uniform \
-DIRSPLIT_CONFIGS=a,c DIRSPLIT_OUT=/tmp/x.jsonl CONSTELLATION_BIN=target/release/constellation \
+DIRSPLIT_CONFIGS=a,d DIRSPLIT_OUT=/tmp/x.jsonl CONSTELLATION_BIN=target/release/constellation \
 target/release/harness run dirsplit-bench --s3-backend process
 ```
 
-Other knobs: `DIRSPLIT_THREADS`, `DIRSPLIT_WARM_S`, `DIRSPLIT_BWARM_S`,
+Other knobs: `DIRSPLIT_THREADS`, `DIRSPLIT_WARM_S`,
 `DIRSPLIT_MEASURE_S`, `DIRSPLIT_ROTATE`, `DIRSPLIT_REP`, `DIRSPLIT_LABEL`,
 and `DIRSPLIT_ENV=K=V,...` for extra daemon environment. A crashed run's
 `lo` qdisc is removed by the next run (its marker names a dead pid) or by

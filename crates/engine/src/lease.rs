@@ -602,7 +602,6 @@ mod tests {
                 node: 3,
                 gen: 7,
                 designated: false,
-                range: (0, 0),
             },
         ])
         .unwrap();

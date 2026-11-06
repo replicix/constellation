@@ -1473,14 +1473,6 @@
         },
         "path": {
           "type": "string"
-        },
-        "range": {
-          "default": null,
-          "description": "Plan 30 §M12: one name-hash range of the directory,\n`\"<idx>/<count>\"` (`count` a power of two); absent: the whole\ndirectory and its subtree.",
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
       "required": [
@@ -1894,11 +1886,6 @@
           "minimum": 0,
           "type": "integer"
         },
-        "place_range_recalls": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
         "place_recalled": {
           "format": "uint64",
           "minimum": 0,
@@ -1910,12 +1897,6 @@
           "type": "integer"
         },
         "place_skipped_unreachable": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "place_splits": {
-          "description": "Plan 30 §M12: hot directories split into hash ranges, and range\ngenerations recalled by the placement.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -2199,8 +2180,6 @@
         "place_recalled",
         "place_skipped_cooldown",
         "place_skipped_unreachable",
-        "place_splits",
-        "place_range_recalls",
         "read_index_served",
         "read_grants"
       ],
@@ -2230,10 +2209,6 @@
         },
         "path": {
           "type": "string"
-        },
-        "range": {
-          "description": "Plan 30 §M12: `\"<idx>/<count>\"` for a hash range of the\ndirectory's names; empty for the whole directory.",
-          "type": "string"
         }
       },
       "required": [
@@ -2241,8 +2216,7 @@
         "path",
         "node",
         "gen",
-        "designated",
-        "range"
+        "designated"
       ],
       "type": "object"
     },

@@ -1011,7 +1011,7 @@ fn read_live(r: &impl Readable, meta: &Meta) -> Result<Vec<(u64, LiveEntry)>, Me
         let floor = counter_get(r, &meta.local, KV_SPEC_FLOOR)?;
         for guard in r.range(&meta.spec_live, seq_key(floor)..) {
             let (k, v) = guard.into_inner()?;
-            out.push((decode_seq(&k)?, postcard::from_bytes(&v)?));
+            out.push((decode_seq(&k)?, crate::record::from_bytes_exact(&v)?));
         }
     }
     if counter_get(r, &meta.local, KV_LOCAL_SPEC_COUNT)? == 0 {
@@ -1043,7 +1043,7 @@ fn live_non_local(r: &impl Readable, meta: &Meta) -> Result<Vec<(u64, LiveEntry)
     let floor = counter_get(r, &meta.local, KV_SPEC_FLOOR)?;
     for guard in r.range(&meta.spec_live, seq_key(floor)..) {
         let (k, v) = guard.into_inner()?;
-        out.push((decode_seq(&k)?, postcard::from_bytes(&v)?));
+        out.push((decode_seq(&k)?, crate::record::from_bytes_exact(&v)?));
     }
     Ok(out)
 }
@@ -1085,7 +1085,7 @@ fn live_speculation_touches(
 ) -> Result<bool, MetaError> {
     for (seq, _) in read_live(r, meta)? {
         if let Some(v) = r.get(&meta.spec, seq_key(seq))? {
-            let row: SpecRow = postcard::from_bytes(&v)?;
+            let row: SpecRow = crate::record::from_bytes_exact(&v)?;
             let mut theirs = TouchSet::from_records(row.records.iter());
             // The inodes it changed but names no record by (plan 45
             // review of the follow-ups): a shadowed `unlink a` whose
@@ -1149,7 +1149,7 @@ fn streamed_entry_with(
             continue;
         }
         if let Some(v) = r.get(&meta.spec, seq_key(seq))? {
-            let row: SpecRow = postcard::from_bytes(&v)?;
+            let row: SpecRow = crate::record::from_bytes_exact(&v)?;
             if row.records.iter().any(&matches) {
                 return Ok(Some(seq));
             }
@@ -1174,7 +1174,7 @@ fn adopt_streamed_tx(
         return Ok(false);
     };
     if let Some(v) = tx.get(&meta.spec, seq_key(spec_seq))? {
-        let mut row: SpecRow = postcard::from_bytes(&v)?;
+        let mut row: SpecRow = crate::record::from_bytes_exact(&v)?;
         if let SpecKind::Streamed { own, .. } = &mut row.kind {
             *own = Some((rid, op.clone(), tag.clone()));
         }
@@ -1195,7 +1195,7 @@ fn shadow_row_for(
             continue;
         }
         if let Some(v) = r.get(&meta.spec, seq_key(seq))? {
-            let row: SpecRow = postcard::from_bytes(&v)?;
+            let row: SpecRow = crate::record::from_bytes_exact(&v)?;
             if let SpecKind::Shadow {
                 epoch,
                 op,
@@ -1218,7 +1218,7 @@ fn read_rows_from(
     let mut out = Vec::new();
     for guard in r.range(spec, seq_key(from)..) {
         let (k, v) = guard.into_inner()?;
-        out.push((decode_seq(&k)?, postcard::from_bytes(&v)?));
+        out.push((decode_seq(&k)?, crate::record::from_bytes_exact(&v)?));
     }
     Ok(out)
 }
@@ -1377,7 +1377,7 @@ fn mark_queued_class_tx(
         return Ok(());
     }
     if let Some(v) = tx.get(&meta.pending_replay, seq_key(key))? {
-        let mut row: QueuedReplay = postcard::from_bytes(&v)?;
+        let mut row: QueuedReplay = crate::record::from_bytes_exact(&v)?;
         row.class = class;
         tx.insert(
             &meta.pending_replay,
@@ -2478,7 +2478,7 @@ impl DelegSummary {
             return Ok(());
         };
         if let Some(v) = r.get(&meta.spec, seq_key(spec_seq))? {
-            let touched = row_touches(r, meta, &postcard::from_bytes::<SpecRow>(&v)?)?;
+            let touched = row_touches(r, meta, &crate::record::from_bytes_exact::<SpecRow>(&v)?)?;
             self.add(&touched);
         }
         Ok(())
@@ -2502,7 +2502,7 @@ impl DelegSummary {
                 continue;
             };
             if let Some(v) = r.get(&meta.spec, seq_key(spec_seq))? {
-                let touched = row_touches(r, meta, &postcard::from_bytes::<SpecRow>(&v)?)?;
+                let touched = row_touches(r, meta, &crate::record::from_bytes_exact::<SpecRow>(&v)?)?;
                 self.add(&touched);
                 rows += 1;
             }
@@ -2949,7 +2949,7 @@ pub(crate) fn unwind_shadow_for_append_tx(
     let Some(v) = tx.get(&meta.spec, seq_key(shadow_seq))? else {
         return Ok(None);
     };
-    let shadow: SpecRow = postcard::from_bytes(&v)?;
+    let shadow: SpecRow = crate::record::from_bytes_exact(&v)?;
     let later = read_rows_from(tx, &meta.spec, shadow_seq + 1)?;
     let shadow_keys: HashSet<&[u8]> = shadow.before.iter().map(|(k, _)| k.as_slice()).collect();
     let mut touches = incoming_touches(tx, meta, records)?;
@@ -3151,7 +3151,7 @@ fn superseded_root_appends_tx(
         };
         let (k, v) = guard.into_inner()?;
         let first = local::decode_tx_key(&k)?;
-        let head: local::JournalTxHead = postcard::from_bytes(&v)?;
+        let head: local::JournalTxHead = crate::record::from_bytes_exact(&v)?;
         if head.last < position
             || head.gen == 0
             || head.epoch == 0
@@ -3355,7 +3355,7 @@ pub(crate) fn retire_tx(
         let mut out = Vec::new();
         for guard in tx.range(&meta.spec_live, seq_key(floor)..) {
             let (k, v) = guard.into_inner()?;
-            out.push((decode_seq(&k)?, postcard::from_bytes(&v)?));
+            out.push((decode_seq(&k)?, crate::record::from_bytes_exact(&v)?));
         }
         out
     };
@@ -3487,7 +3487,7 @@ pub(crate) fn retire_local_tx(
     let mut held_below = false;
     for guard in tx.range(&meta.journal_tx, local::tx_key(from)..=local::tx_key(upto)) {
         let (k, v) = guard.into_inner()?;
-        let row: local::JournalTxHead = postcard::from_bytes(&v)?;
+        let row: local::JournalTxHead = crate::record::from_bytes_exact(&v)?;
         let first = local::decode_tx_key(&k)?;
         let in_ship = match only {
             Some(Shipped::Run(start)) => first >= start,
@@ -3555,7 +3555,7 @@ pub(crate) fn retire_local_tx(
             continue;
         }
         if let Some(v) = tx.get(&meta.spec, seq_key(seq))? {
-            let mut spec_row: SpecRow = postcard::from_bytes(&v)?;
+            let mut spec_row: SpecRow = crate::record::from_bytes_exact(&v)?;
             spec_row.kind = SpecKind::Foreign {
                 segment_seq: applied_seq,
             };
@@ -3673,7 +3673,7 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
         }
         if let LiveEntry::Shadow { .. } = entry {
             if let Some(v) = tx.get(&meta.spec, seq_key(*seq))? {
-                let row: SpecRow = postcard::from_bytes(&v)?;
+                let row: SpecRow = crate::record::from_bytes_exact(&v)?;
                 if let SpecKind::Shadow {
                     rid,
                     op,
@@ -3717,7 +3717,7 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
         let (key, before) = match row.spec_seq {
             Some(seq) => match tx.get(&meta.spec, seq_key(seq))? {
                 Some(v) => {
-                    let spec_row = postcard::from_bytes::<SpecRow>(&v)?;
+                    let spec_row = crate::record::from_bytes_exact::<SpecRow>(&v)?;
                     (spec_row.origin, spec_row.before)
                 }
                 None => (seq, Vec::new()),
@@ -3752,7 +3752,7 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
             counter_add_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, -1)?;
             continue;
         };
-        let row: SpecRow = postcard::from_bytes(&v)?;
+        let row: SpecRow = crate::record::from_bytes_exact(&v)?;
         let completing: Option<Rid> = match &row.kind {
             SpecKind::Shadow { rid, .. } => Some(*rid),
             _ => row.records.iter().find_map(|r| match r {
@@ -3826,7 +3826,7 @@ pub(crate) fn row_keys_and_origin(
 ) -> Result<RowKeysAndOrigin, MetaError> {
     match r.get(&meta.spec, seq_key(seq))? {
         Some(v) => {
-            let row: SpecRow = postcard::from_bytes(&v)?;
+            let row: SpecRow = crate::record::from_bytes_exact(&v)?;
             Ok(Some((
                 row.before.into_iter().map(|(key, _)| key).collect(),
                 row.origin,
@@ -3913,7 +3913,7 @@ pub(crate) fn mark_await_retry_tx(
     let Some(v) = tx.get(&meta.pending_replay, seq_key(key))? else {
         return Ok(None);
     };
-    let mut row: QueuedReplay = postcard::from_bytes(&v)?;
+    let mut row: QueuedReplay = crate::record::from_bytes_exact(&v)?;
     let node: u64 = kv_get_tx(&*tx, &meta.local, KV_NODE_PREFIX)?
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
@@ -4018,7 +4018,7 @@ pub(crate) fn queued_at(
 ) -> Result<Option<(Rid, MutateOp)>, MetaError> {
     match r.get(&meta.pending_replay, seq_key(key))? {
         Some(v) => {
-            let row: QueuedReplay = postcard::from_bytes(&v)?;
+            let row: QueuedReplay = crate::record::from_bytes_exact(&v)?;
             Ok(Some((row.rid, row.op)))
         }
         None => Ok(None),
@@ -4037,7 +4037,7 @@ pub(crate) fn read_pending_replays(
     }
     for guard in r.iter(&meta.pending_replay) {
         let (k, v) = guard.into_inner()?;
-        let row: QueuedReplay = postcard::from_bytes(&v)?;
+        let row: QueuedReplay = crate::record::from_bytes_exact(&v)?;
         out.push(StrandedOp {
             queue_seq: decode_seq(&k)?,
             rid: row.rid,
@@ -4209,7 +4209,7 @@ impl Meta {
                 LiveEntry::Shadow { rid, .. } if open.contains(&rid) => {
                     // As `shadow_row_for`: the row must still be a shadow.
                     if let Some(v) = r.get(&self.spec, seq_key(seq))? {
-                        let row: SpecRow = postcard::from_bytes(&v)?;
+                        let row: SpecRow = crate::record::from_bytes_exact(&v)?;
                         if matches!(row.kind, SpecKind::Shadow { .. }) {
                             open.remove(&rid);
                             found.insert(rid);
@@ -4218,7 +4218,7 @@ impl Meta {
                 }
                 LiveEntry::Streamed { .. } => {
                     if let Some(v) = r.get(&self.spec, seq_key(seq))? {
-                        let row: SpecRow = postcard::from_bytes(&v)?;
+                        let row: SpecRow = crate::record::from_bytes_exact(&v)?;
                         for rec in &row.records {
                             if let LogRecord::Completed { rid } = rec {
                                 if open.remove(rid) {
@@ -4606,7 +4606,7 @@ impl Meta {
         let mut shadow_lacks_effect = None;
         if let Some((seq, ..)) = &adopt {
             if let Some(v) = tx.get(&self.spec, seq_key(*seq))? {
-                let row: SpecRow = postcard::from_bytes(&v)?;
+                let row: SpecRow = crate::record::from_bytes_exact(&v)?;
                 if !same_effect(&row.records, records) {
                     shadow_lacks_effect = Some(*seq);
                 }
@@ -4662,7 +4662,7 @@ impl Meta {
         }
         if let Some((seq, rid, op, tag)) = adopt {
             if let Some(v) = tx.get(&self.spec, seq_key(seq))? {
-                let mut row: SpecRow = postcard::from_bytes(&v)?;
+                let mut row: SpecRow = crate::record::from_bytes_exact(&v)?;
                 let gated = committed || matches!(row.kind, SpecKind::Shadow { gated: true, .. });
                 row.kind = SpecKind::Streamed {
                     epoch,
@@ -5054,7 +5054,7 @@ impl Meta {
             let changed = !later.dentries.is_empty() || !later.inos.is_empty();
             if changed {
                 if let Some(v) = tx.get(&self.spec, seq_key(*spec_seq))? {
-                    let row: SpecRow = postcard::from_bytes(&v)?;
+                    let row: SpecRow = crate::record::from_bytes_exact(&v)?;
                     if supersedes(&later, &row.records) {
                         superseded.insert(*spec_seq);
                         hints_ending.insert(*spec_seq);
@@ -5087,7 +5087,7 @@ impl Meta {
                 continue;
             }
             if let Some(v) = tx.get(&self.spec, seq_key(*spec_seq))? {
-                if let SpecKind::Streamed { first, .. } = postcard::from_bytes::<SpecRow>(&v)?.kind
+                if let SpecKind::Streamed { first, .. } = crate::record::from_bytes_exact::<SpecRow>(&v)?.kind
                 {
                     confirmed.push((*spec_seq, first, *last));
                 }
@@ -5118,7 +5118,7 @@ impl Meta {
                     continue;
                 }
                 if let Some(v) = tx.get(&self.spec, seq_key(*spec_seq))? {
-                    let row: SpecRow = postcard::from_bytes(&v)?;
+                    let row: SpecRow = crate::record::from_bytes_exact(&v)?;
                     // (A refusal's row too: its outcome is the record.)
                     if row.records.iter().any(|r| match r {
                         LogRecord::Completed { rid } => completes.contains(rid),
@@ -5195,7 +5195,7 @@ impl Meta {
                 let Some(v) = tx.get(&self.spec, seq_key(spec_seq))? else {
                     continue;
                 };
-                let row: SpecRow = postcard::from_bytes(&v)?;
+                let row: SpecRow = crate::record::from_bytes_exact(&v)?;
                 if row_touches(&tx, self, &row)?.overlaps(&touch) {
                     first = Some(spec_seq);
                     break;
@@ -5240,7 +5240,7 @@ impl Meta {
                     }
                     _ => match tx.get(&self.spec, seq_key(*spec_seq))? {
                         Some(v) => {
-                            let row: SpecRow = postcard::from_bytes(&v)?;
+                            let row: SpecRow = crate::record::from_bytes_exact(&v)?;
                             row_touches(&tx, self, &row)?.overlaps(&incoming)
                         }
                         None => false,
@@ -5383,7 +5383,7 @@ impl Meta {
         }
         for (spec_seq, _, _) in &confirmed {
             if let Some(v) = tx.get(&self.spec, seq_key(*spec_seq))? {
-                let mut row: SpecRow = postcard::from_bytes(&v)?;
+                let mut row: SpecRow = crate::record::from_bytes_exact(&v)?;
                 row.kind = SpecKind::Foreign { segment_seq: seq };
                 put_row(&mut tx, &self.spec, *spec_seq, &row)?;
             }
@@ -6192,7 +6192,7 @@ impl Meta {
             let Some(v) = tx.get(&self.spec, seq_key(seq))? else {
                 continue;
             };
-            let row: SpecRow = postcard::from_bytes(&v)?;
+            let row: SpecRow = crate::record::from_bytes_exact(&v)?;
             for rec in &row.records {
                 if let LogRecord::Delegate { gen, .. } = rec {
                     named.insert(*gen);
@@ -6216,7 +6216,7 @@ impl Meta {
             let Some(v) = r.get(&self.spec, seq_key(seq))? else {
                 continue;
             };
-            let row: SpecRow = postcard::from_bytes(&v)?;
+            let row: SpecRow = crate::record::from_bytes_exact(&v)?;
             for rec in &row.records {
                 if let LogRecord::Recall { gen, .. } | LogRecord::RecallCut { gen, .. } = rec {
                     if kv_get_tx(r, &self.local, &local::deleg_void_cut_key(*gen))?.is_none() {
@@ -6350,7 +6350,7 @@ impl Meta {
         let r = self.db.read_tx();
         for (seq, _) in live_non_local(&r, self)? {
             if let Some(v) = r.get(&self.spec, seq_key(seq))? {
-                let row: SpecRow = postcard::from_bytes(&v)?;
+                let row: SpecRow = crate::record::from_bytes_exact(&v)?;
                 if TouchSet::from_records(row.records.iter()).overlaps(keys) {
                     return Ok(true);
                 }
@@ -6402,7 +6402,7 @@ impl Meta {
             let mut any = false;
             for guard in r.range(&self.spec_live, seq_key(floor)..) {
                 let (_, v) = guard.into_inner()?;
-                let entry: LiveEntry = postcard::from_bytes(&v)?;
+                let entry: LiveEntry = crate::record::from_bytes_exact(&v)?;
                 any |= stale(&entry);
             }
             if !any {
@@ -6514,7 +6514,7 @@ impl Meta {
         let Some(v) = tx.get(&self.pending_replay, seq_key(queue_seq))? else {
             return Ok(());
         };
-        let mut row: QueuedReplay = postcard::from_bytes(&v)?;
+        let mut row: QueuedReplay = crate::record::from_bytes_exact(&v)?;
         row.refused = Some(refusal);
         tx.insert(
             &self.pending_replay,
@@ -6535,7 +6535,7 @@ impl Meta {
         let Some(v) = tx.get(&self.pending_replay, seq_key(queue_seq))? else {
             return Ok(());
         };
-        let mut row: QueuedReplay = postcard::from_bytes(&v)?;
+        let mut row: QueuedReplay = crate::record::from_bytes_exact(&v)?;
         if row.foreign {
             return Ok(());
         }

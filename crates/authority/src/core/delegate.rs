@@ -60,7 +60,7 @@ use crate::event::PeerMsg;
 use crate::ids::{Epoch, HonourMs, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
-use constellation_meta::delegation::{Ownership, Range};
+use constellation_meta::delegation::Ownership;
 use constellation_meta::locks::LockTag;
 use constellation_meta::{
     LogRecord, MetaError, MutateOp, MutateOutcome, OwnChunks, Position, RecallNeed, Rid, TouchSet,
@@ -104,8 +104,6 @@ pub enum DelegKind {
 pub(crate) struct GenState {
     pub dir: Ino,
     pub node: NodeId,
-    /// Plan 30 §M12: the part of `dir` (a hash range, or the whole).
-    pub range: Range,
     /// Why it exists (phase 2b): an operator, the placement, a
     /// designation.
     pub kind: DelegKind,
@@ -1032,7 +1030,7 @@ impl Core {
     /// by the next sync). Kept for good, every recall and re-delegation
     /// left one more entry that every step walked — the `status` view
     /// (`deleg_view`), the window publication, the re-delegation scan,
-    /// `root_progress`: after 1,900 recalls in a split directory a root's
+    /// `root_progress`: after 1,900 recalls in one directory a root's
     /// own creates went from 2,100 to 260 a second for as long as it ran,
     /// 70 % of its core in `deleg_view`. A step with nothing due costs one
     /// comparison.
@@ -1511,7 +1509,6 @@ impl Core {
                     GenState {
                         dir: d.dir,
                         node: d.node,
-                        range: d.range,
                         kind: if d.designated {
                             DelegKind::Designated
                         } else {
@@ -2546,8 +2543,8 @@ impl Core {
     /// The rule spans this node's generations: a gated row of another of
     /// them that is open holds a `Lone` row of `d`'s back too
     /// ([`Replica::delegate_gated_open_elsewhere`]). One node can hold two
-    /// generations whose keys meet (two ranges of a split directory, or a
-    /// range and a whole subtree): an unlink of a file's primary link moves
+    /// generations whose keys meet (two subtrees, one delegated inside
+    /// another's directory tree): an unlink of a file's primary link moves
     /// the file's own keys to the generation of its next link, with neither
     /// generation ending, and a takeover's strand ends every own generation
     /// together.
@@ -4030,7 +4027,7 @@ impl Core {
         if gs.ended {
             return;
         }
-        let (dir, kind, range) = (gs.dir, gs.kind, gs.range);
+        let (dir, kind) = (gs.dir, gs.kind);
         let tail = gs.sealed_tail.clone();
         let ends_recall = self.root_ends_recall(now, gen);
         let mut sealed = false;
@@ -4076,7 +4073,7 @@ impl Core {
         }
         self.end_generation(now, gen, None, replica, out);
         if sealed && kind != DelegKind::Designated {
-            match self.delegate_dir(now, dir, from, kind, range, replica, out) {
+            match self.delegate_dir(now, dir, from, kind, replica, out) {
                 Ok(new_gen) => {
                     tracing::info!(
                         node = self.me(),
@@ -4902,8 +4899,8 @@ impl Core {
             if let Some(l) = self.dl.mine.get(&gen).and_then(|d| d.lost_from) {
                 txs.retain(|t| t.idx < l);
             }
-            // Plan 30 §M12: a node holds several generations (the ranges
-            // of a directory, a subtree); a transaction of one may depend
+            // Plan 30 §M12: a node holds several generations (one per
+            // delegated subtree); a transaction of one may depend
             // on this node's own execution under another (it reached it
             // locally). The root must hold that first: the batch stops
             // before a transaction whose own-generation deps the root has
@@ -6879,7 +6876,6 @@ impl Core {
                     .blocked
                     .get(&ino)
                     .is_some_and(|until| *until > now.wait)
-                && !self.split_directory(ino, replica)
             {
                 let until = now.wait.plus((ttl + margin) as u64);
                 let id = replica.read_delegations().grant(from, ino, until);
@@ -6909,17 +6905,6 @@ impl Core {
             grant,
             ahead: None,
         })
-    }
-
-    /// Plan 30 §M8 under §M12: whether `ino` is a directory split into
-    /// name-hash ranges. Its entries have a sequencer per range (the root
-    /// for the ranges nobody holds), and each one's writes recall only
-    /// the read delegations in its own table, while a delegation on the
-    /// directory covers all its entries. So none is granted on it, by the
-    /// root or by a range's delegate: a lookup in it asks the name's
-    /// sequencer every time.
-    pub(crate) fn split_directory(&self, ino: Ino, replica: &dyn Replica) -> bool {
-        self.cfg.delegation && replica.delegation_table().is_split(ino)
     }
 
     /// Phase 2b: where a strict read of `ino` goes — the delegate owning
@@ -7055,14 +7040,14 @@ impl Core {
         if !self.root_usable(now) {
             return;
         }
-        let again: Vec<(u64, Ino, NodeId, DelegKind, Range)> = self
+        let again: Vec<(u64, Ino, NodeId, DelegKind)> = self
             .dl
             .gens
             .iter()
             .filter(|(_, g)| g.ended && g.redelegate)
-            .map(|(gen, g)| (*gen, g.dir, g.node, g.kind, g.range))
+            .map(|(gen, g)| (*gen, g.dir, g.node, g.kind))
             .collect();
-        for (gen, dir, node, kind, range) in again {
+        for (gen, dir, node, kind) in again {
             let gate_recalled = self.dl.gens.get(&gen).is_some_and(|g| g.gate_recalled);
             if let Some(g) = self.dl.gens.get_mut(&gen) {
                 g.redelegate = false;
@@ -7079,14 +7064,14 @@ impl Core {
                 continue;
             }
             if !self.links.get(&node).is_some_and(|l| l.connected) {
-                // The delegate is away for the moment (M12: a range's
-                // delegate reconnecting mid-recall): once it is back.
+                // The delegate is away for the moment (reconnecting
+                // mid-recall): once it is back.
                 if let Some(g) = self.dl.gens.get_mut(&gen) {
                     g.redelegate = true;
                 }
                 continue;
             }
-            match self.delegate_dir(now, dir, node, kind, range, replica, out) {
+            match self.delegate_dir(now, dir, node, kind, replica, out) {
                 Ok(new_gen) => {
                     self.stats.deleg_redelegated += 1;
                     // ADR-44: the subtree of a generation the gate recalled on
@@ -8211,14 +8196,12 @@ impl Core {
 
     // ----------------------------------------------------- controls
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_control_delegate(
         &mut self,
         now: Now,
         op: OpId,
         dir: Ino,
         node: NodeId,
-        range: Range,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -8228,18 +8211,7 @@ impl Core {
                 result: Err(msg),
             });
         };
-        // ADR-38: a directory split into ranges has no strict listing (one
-        // sequencer answers it, whose position does not cover the other
-        // ranges' streams), so none is split under `cto=strict`.
-        if range.bits > 0 && self.cfg.strict_mounts {
-            return fail(
-                out,
-                "a directory cannot be split into hash ranges under --cto strict \
-                 (delegate it whole instead)"
-                    .into(),
-            );
-        }
-        match self.delegate_dir(now, dir, node, DelegKind::Manual, range, replica, out) {
+        match self.delegate_dir(now, dir, node, DelegKind::Manual, replica, out) {
             Ok(gen) => out.push(Action::ControlDone {
                 op,
                 result: Ok(ControlOk::Text(format!(
@@ -8254,14 +8226,12 @@ impl Core {
     /// root's generation state. The checks every path shares (an
     /// operator's control, the placement, a designation, a
     /// re-delegation after a cross-subtree op).
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn delegate_dir(
         &mut self,
         now: Now,
         dir: Ino,
         node: NodeId,
         kind: DelegKind,
-        range: Range,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<u64, String> {
@@ -8291,51 +8261,15 @@ impl Core {
                 d.dir, d.gen
             ));
         }
-        if range.is_whole() {
-            if table.is_split(dir) {
-                return Err(format!("directory {dir} is split into ranges"));
-            }
-            // A delegation on a descendant of `dir` would be shadowed.
-            if table
-                .iter()
-                .any(|d| d.dir != dir && is_under(replica.namespace(), d.dir, dir))
-            {
-                return Err(format!("a directory under {dir} is already delegated"));
-            }
-            if kind != DelegKind::Designated
-                && table
-                    .iter()
-                    .any(|d| d.node == node && !d.designated && d.range.is_whole())
-            {
-                return Err(format!("node {node} already holds a delegation"));
-            }
-        } else {
-            // Plan 30 §M12: one split depth per directory; a range is
-            // delegated once; never over a designation.
-            if kind == DelegKind::Designated {
-                return Err("a designation covers a whole directory".into());
-            }
-            let ranges = table.ranges_of(dir);
-            if let Some(d) = ranges.iter().find(|d| d.range.is_whole()) {
-                return Err(format!(
-                    "directory {dir} is wholly delegated (gen {})",
-                    d.gen
-                ));
-            }
-            if let Some(d) = ranges.iter().find(|d| d.range.bits != range.bits) {
-                return Err(format!(
-                    "directory {dir} is split {} ways, not {}",
-                    1u64 << d.range.bits,
-                    1u64 << range.bits
-                ));
-            }
-            if let Some(d) = ranges.iter().find(|d| d.range == range) {
-                return Err(format!(
-                    "range {} of {dir} is delegated (gen {})",
-                    range.label(),
-                    d.gen
-                ));
-            }
+        // A delegation on a descendant of `dir` would be shadowed.
+        if table
+            .iter()
+            .any(|d| d.dir != dir && is_under(replica.namespace(), d.dir, dir))
+        {
+            return Err(format!("a directory under {dir} is already delegated"));
+        }
+        if kind != DelegKind::Designated && table.iter().any(|d| d.node == node && !d.designated) {
+            return Err(format!("node {node} already holds a delegation"));
         }
         // Plan 30 §M8 under M11: the read delegations this root granted
         // under `dir` must be gone before the delegate executes, since its
@@ -8394,7 +8328,6 @@ impl Core {
                     node,
                     gen,
                     designated,
-                    range: (range.bits, range.idx),
                 }],
                 None,
             )
@@ -8415,7 +8348,6 @@ impl Core {
             GenState {
                 dir,
                 node,
-                range,
                 kind,
                 group: GroupState::default(),
                 redelegate: false,
@@ -8684,25 +8616,8 @@ impl Core {
                 }
                 continue;
             }
-            if table.is_split(dir) {
-                // Plan 30 §M12: the ranges end first; the designation
-                // follows on the next sync.
-                for d in table.ranges_of(dir) {
-                    if self.dl.gens.get(&d.gen).is_some_and(|g| !g.ended) {
-                        self.start_recall(now, d.gen, out);
-                    }
-                }
-                continue;
-            }
-            if let Err(why) = self.delegate_dir(
-                now,
-                dir,
-                node,
-                DelegKind::Designated,
-                Range::WHOLE,
-                replica,
-                out,
-            ) {
+            if let Err(why) = self.delegate_dir(now, dir, node, DelegKind::Designated, replica, out)
+            {
                 tracing::debug!(
                     node = self.me(),
                     dir,
@@ -8746,7 +8661,7 @@ impl Core {
             return;
         }
         let table = replica.delegation_table();
-        let entries = table.ranges_of(dir);
+        let entries: Vec<_> = table.get(dir).into_iter().collect();
         // A designation is the operator's offline authority (plans
         // 03–05): only `online` releases it. Recalling it here would just
         // see it re-delegated by the next designation sync, after
@@ -8768,8 +8683,7 @@ impl Core {
             });
             return;
         }
-        // Plan 30 §M12: every generation of the directory (one whole, or
-        // its ranges); the control is answered when the last one ended.
+        // The directory's generation; the control is answered when it ended.
         let gens: Vec<u64> = entries
             .iter()
             .map(|d| d.gen)

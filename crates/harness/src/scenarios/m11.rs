@@ -186,7 +186,7 @@ pub(super) fn cluster_with_deleg_ttl(
         // sends its first ops through the root's inbox, escalates on
         // that demand, and the root hands it the lease before the
         // scenario's first phase (`shared-dir-multi-writer`: "this node
-        // does not hold the lease" at the range delegation).
+        // does not hold the lease" at a delegation).
         wait_for_connected_peers(&refs)?;
     }
     std::fs::write(clients[0].mnt.join("f"), b"initial")?;
@@ -1573,106 +1573,6 @@ pub fn delegate_crash_with_backup(_seed: u64) -> Result<()> {
     result
 }
 
-/// ADR-39's cost: b holds two generations, `/d1` whole and range 0/2 of
-/// `/d2`, both backed by c, and writes in both at once (two threads in
-/// each, creates of names in b's half of `/d2`). A `DelegGroup`
-/// acknowledgement of a row waits for the row's dependencies on b's other
-/// generation (every op carries the node's whole session as its `deps`).
-/// Prints the create latencies (all four writers, then a phase with the
-/// four in `/d1` only, which no other generation's row can hold back) and
-/// b's counters of acknowledgements that waited for the other generation.
-/// Run it against a binary without the rule (`CONSTELLATION_BIN`) for the
-/// comparison.
-pub fn two_gens_ack_cost(_seed: u64) -> Result<()> {
-    const NAME: &str = "two-gens-ack-cost";
-    const PER_WRITER: usize = 150;
-    let (_env, _root, mut clients, _) = cluster(
-        NAME,
-        &["a", "b", "c"],
-        &[("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "50")],
-        0,
-    )?;
-    let result = (|| -> Result<()> {
-        let a = &clients[0];
-        let b = &clients[1];
-        let b_id = node_id(b)?;
-        for d in ["d1", "d2"] {
-            std::fs::create_dir(a.mnt.join(d))?;
-        }
-        eventually("dirs visible on b", Duration::from_secs(20), || {
-            anyhow::ensure!(b.mnt.join("d1").is_dir() && b.mnt.join("d2").is_dir());
-            Ok(())
-        })?;
-        delegate(a, "/d1", b_id)?;
-        wait_installed(b, "/d1", Duration::from_secs(20))?;
-        delegate_range(a, "/d2", b_id, "0/2")?;
-        wait_installed_range(b, "/d2", "0/2", Duration::from_secs(20))?;
-        eventually("b backs both generations", Duration::from_secs(30), || {
-            let d = deleg_of(b)?;
-            let backed = d["backups"].as_array().map_or(0, |v| v.len());
-            anyhow::ensure!(backed >= 2, "backups: {d}");
-            Ok(())
-        })?;
-        let run = |dirs: [&str; 4], tag: &str| -> Result<Vec<Duration>> {
-            let handles: Vec<_> = dirs
-                .iter()
-                .enumerate()
-                .map(|(w, dir)| {
-                    let mnt = b.mnt.clone();
-                    let dir = dir.to_string();
-                    let tag = format!("{tag}{w}");
-                    std::thread::spawn(move || -> Result<Vec<Duration>> {
-                        let mut lat = Vec::new();
-                        let mut i = 0usize;
-                        let mut written = 0;
-                        while written < PER_WRITER {
-                            let name = format!("{tag}-{i}");
-                            i += 1;
-                            if dir == "d2"
-                                && constellation_meta::delegation::Range::of(1, &name).idx != 0
-                            {
-                                continue;
-                            }
-                            let path = mnt.join(&dir).join(&name);
-                            lat.push(write_timed(&path, name.as_bytes())?);
-                            written += 1;
-                        }
-                        Ok(lat)
-                    })
-                })
-                .collect();
-            let mut all = Vec::new();
-            for h in handles {
-                all.extend(h.join().map_err(|_| anyhow::anyhow!("writer panicked"))??);
-            }
-            Ok(all)
-        };
-        let before = deleg_of(b)?;
-        let both = run(["d1", "d2", "d1", "d2"], "x")?;
-        let mid = deleg_of(b)?;
-        let one = run(["d1", "d1", "d1", "d1"], "y")?;
-        let after = deleg_of(b)?;
-        let delta =
-            |x: &serde_json::Value, y: &serde_json::Value, k: &str| n(y, k).saturating_sub(n(x, k));
-        eprintln!(
-            "    {NAME}: two generations at once: {}; acks that waited for the other generation {} ({} ms, max {} ms)",
-            dist(both),
-            delta(&before, &mid, "xgen_acks_delayed"),
-            delta(&before, &mid, "xgen_ack_delay_ms"),
-            n(&mid, "xgen_ack_delay_max_ms"),
-        );
-        eprintln!(
-            "    {NAME}: one generation: {}; acks that waited for the other generation {}",
-            dist(one),
-            delta(&mid, &after, "xgen_acks_delayed"),
-        );
-        Ok(())
-    })();
-    dump_logs_on_failure(NAME, &clients, &result);
-    unmount_all(&mut clients);
-    result
-}
-
 /// Phase 2b: automatic placement. b dominates the writes under `d1` for
 /// a window: the root delegates `d1` to b by itself; then c takes the
 /// writes over and b stops: after the dwell the placement recalls b's
@@ -1958,56 +1858,6 @@ pub fn designation_as_delegation(_seed: u64) -> Result<()> {
 
 // ------------------------------------------------------------ plan 30 M12
 
-/// `constellation delegate <path> --to <node> --range <idx>/<count>`.
-pub(super) fn delegate_range(
-    root: &Client,
-    path: &str,
-    node: u64,
-    range: &str,
-) -> Result<serde_json::Value> {
-    root.control(
-        "designation.delegate",
-        serde_json::json!({"path": path, "node": node, "range": range}),
-    )
-    .with_context(|| {
-        format!(
-            "delegating range {range} of {path} to {node} on {}",
-            root.name
-        )
-    })
-}
-
-/// Wait until `delegate` holds a live grant on range `range` of `path`.
-pub(super) fn wait_installed_range(
-    delegate: &Client,
-    path: &str,
-    range: &str,
-    deadline: Duration,
-) -> Result<u64> {
-    let mut gen = 0;
-    eventually(
-        &format!("{} holds range {range} of {path}", delegate.name),
-        deadline,
-        || {
-            let d = deleg_of(delegate)?;
-            let table = d["table"].as_array().cloned().unwrap_or_default();
-            let entry = table
-                .iter()
-                .find(|e| e["path"] == path && e["range"] == range)
-                .with_context(|| format!("{path} {range} not in {}'s table: {d}", delegate.name))?;
-            let g = n(entry, "gen");
-            let mine = d["mine"].as_array().cloned().unwrap_or_default();
-            let held = mine
-                .iter()
-                .any(|m| m[1].as_u64() == Some(g) && m[3] == false);
-            anyhow::ensure!(held, "{} has not installed gen {g}: {d}", delegate.name);
-            gen = g;
-            Ok(())
-        },
-    )?;
-    Ok(gen)
-}
-
 /// The names under `dir` on `c`.
 fn names_in(c: &Client, dir: &str) -> Result<Vec<String>> {
     let mut v: Vec<String> = std::fs::read_dir(c.mnt.join(dir))?
@@ -2017,31 +1867,17 @@ fn names_in(c: &Client, dir: &str) -> Result<Vec<String>> {
     Ok(v)
 }
 
-/// A name of the form `<tag>-<i>` whose hash falls in range `idx` of
-/// `1 << bits` (the placement's split hashes names the same way).
-fn name_in_range(tag: &str, bits: u8, idx: u32) -> String {
-    use constellation_meta::delegation::Range;
-    (0..)
-        .map(|i| format!("{tag}-{i}"))
-        .find(|n| Range::of(bits, n).idx == idx)
-        .expect("a name in the range")
-}
-
-/// Plan 30 §M12: four nodes creating unique names in one directory.
-/// Phase 0, the single sequencer: three of them forward every create to
-/// the root. Phase 1, the directory's names split into four hash ranges
-/// (three delegated, one the root's): each node executes its range
-/// locally and forwards the rest to the range's delegate; the root only
-/// appends. Throughput against the single sequencer, every name on
-/// every node, the directory listing identical everywhere, no S3
-/// request added per file.
+/// Plan 30 §M12: four nodes creating unique names in one directory under
+/// the single sequencer: three of them forward every create to the root.
+/// Every name on every node, the directory listing identical everywhere,
+/// no S3 request added per file. (Plan 46 D5 deleted the second phase,
+/// the directory split into hash ranges.)
 pub fn shared_dir_multi_writer(_seed: u64) -> Result<()> {
     const NAME: &str = "shared-dir-multi-writer";
     const FILES: usize = 100;
     let (_env, _root, mut clients, proxies) = cluster(NAME, &["a", "b", "c", "d"], &[], 4)?;
     let result = (|| -> Result<()> {
         let a = &clients[0];
-        let ids: Vec<u64> = clients.iter().map(node_id).collect::<Result<_>>()?;
         std::fs::create_dir(a.mnt.join("shared"))?;
         for x in &clients[1..] {
             eventually("dir visible", Duration::from_secs(20), || {
@@ -2073,7 +1909,7 @@ pub fn shared_dir_multi_writer(_seed: u64) -> Result<()> {
             all_visible(x, &warm, Duration::from_secs(60))?;
         }
         std::thread::sleep(Duration::from_secs(2));
-        // Phase 0: the single sequencer.
+        // The single sequencer.
         for p in &proxies {
             p.reset();
         }
@@ -2105,74 +1941,8 @@ pub fn shared_dir_multi_writer(_seed: u64) -> Result<()> {
             4 * FILES,
             (4 * FILES) as f64 / wall0.as_secs_f64()
         );
-        // Phase 1: the names split four ways; b, c and d own a range each,
-        // the fourth stays the root's.
-        for (i, x) in clients.iter().enumerate().skip(1) {
-            delegate_range(a, "/shared", ids[i], &format!("{}/4", i - 1))?;
-            wait_installed_range(
-                x,
-                "/shared",
-                &format!("{}/4", i - 1),
-                Duration::from_secs(20),
-            )?;
-        }
-        print_deleg(NAME, "a", &deleg_of(a)?);
-        for p in &proxies {
-            p.reset();
-        }
-        let (wall1, names1) = write_concurrently(&writers("p1-"), FILES)?;
         let mut all = warm.clone();
         all.extend(names0.iter().cloned());
-        all.extend(names1.iter().cloned());
-        for x in clients.iter() {
-            all_visible(x, &all, Duration::from_secs(90))?;
-        }
-        let s3_1: Vec<u64> = proxies.iter().map(|p| p.tally().total()).collect();
-        let log_puts1: Vec<usize> = proxies.iter().map(|p| puts_of(p, "log/")).collect();
-        let chunk_puts1: Vec<usize> = proxies.iter().map(|p| puts_of(p, "chunks/")).collect();
-        let mut executed = Vec::new();
-        for x in &clients[1..] {
-            let d = deleg_of(x)?;
-            executed.push(n(&d, "executed") + n(&d, "fast_path_executed"));
-            print_deleg(NAME, &x.name, &d);
-        }
-        eprintln!(
-            "    {NAME}: split four ways: {} files by 4 writers in {wall1:?} ({:.0} files/s, \
-             single sequencer {:.0} files/s); S3 requests {s3_1:?}, log PUTs {log_puts1:?}, chunk \
-             PUTs {chunk_puts1:?}; the range delegates executed {executed:?}",
-            4 * FILES,
-            (4 * FILES) as f64 / wall1.as_secs_f64(),
-            (4 * FILES) as f64 / wall0.as_secs_f64()
-        );
-        anyhow::ensure!(
-            executed.iter().all(|e| *e > 0),
-            "a range delegate executed nothing: {executed:?}"
-        );
-        anyhow::ensure!(
-            chunk_puts1 == chunk_puts0,
-            "chunk PUTs changed: {chunk_puts0:?} -> {chunk_puts1:?}"
-        );
-        // The root ships one segment per shipper round, so its log PUTs
-        // track the phase's wall time, not its ops (M12 round 2: a
-        // comparison of the raw counts failed on the phases' timing
-        // alone); the delegation must not raise the *rate* — no extra
-        // segments for the streams it appends.
-        let rate0 = log_puts0[0] as f64 / wall0.as_secs_f64().max(1e-9);
-        let rate1 = log_puts1[0] as f64 / wall1.as_secs_f64().max(1e-9);
-        eprintln!(
-            "    {NAME}: the root's log PUT rate: single sequencer {rate0:.0}/s, split {rate1:.0}/s"
-        );
-        anyhow::ensure!(
-            log_puts1[0] <= log_puts0[0] + log_puts0[0] / 5 + 5 || rate1 <= rate0 * 1.3 + 20.0,
-            "the root's log PUTs grew, in count and in rate: {} -> {} PUTs, {rate0:.0}/s -> \
-             {rate1:.0}/s",
-            log_puts0[0],
-            log_puts1[0]
-        );
-        anyhow::ensure!(
-            log_puts1[1..].iter().all(|n| *n == 0),
-            "a delegate shipped segments: {log_puts1:?}"
-        );
         // The listing is identical everywhere, with every name once.
         let expected: Vec<String> = {
             let mut v: Vec<String> = all
@@ -2203,284 +1973,6 @@ pub fn shared_dir_multi_writer(_seed: u64) -> Result<()> {
             p.ensure_sane()?;
         }
         ensure_no_conflicts(&clients.iter().collect::<Vec<_>>())?;
-        Ok(())
-    })();
-    dump_logs_on_failure(NAME, &clients, &result);
-    unmount_all(&mut clients);
-    result
-}
-
-/// Plan 30 §M12: the placement (with `CONSTELLATION_DELEGATION_SPLIT=20`;
-/// splits are off by default) splits a hot shared
-/// directory by itself: four writers, no dominant one, and the root
-/// delegates hash ranges of `shared` to the writers (`place_splits`);
-/// when the writers stop, the ranges are recalled after the dwell
-/// (`place_range_recalls`) and the directory is whole again; everything
-/// converges.
-pub fn hash_range_split_merge(_seed: u64) -> Result<()> {
-    const NAME: &str = "hash-range-split-merge";
-    let (_env, _root, mut clients, _) = cluster(
-        NAME,
-        &["a", "b", "c", "d"],
-        &[
-            ("CONSTELLATION_DELEGATION_PLACEMENT", ""),
-            // Automatic splits are off by default (ADR-38): this
-            // scenario covers them, so they are turned on.
-            ("CONSTELLATION_DELEGATION_SPLIT", "20"),
-            ("CONSTELLATION_DELEGATION_WINDOW_MS", "4000"),
-            ("CONSTELLATION_DELEGATION_MIN_OPS", "40"),
-            ("CONSTELLATION_DELEGATION_DWELL_MS", "4000"),
-            ("CONSTELLATION_DELEGATION_COOLDOWN_MS", "2000"),
-        ],
-        0,
-    )?;
-    let result = (|| -> Result<()> {
-        let a = &clients[0];
-        std::fs::create_dir(a.mnt.join("shared"))?;
-        for x in &clients[1..] {
-            eventually("dir visible", Duration::from_secs(20), || {
-                anyhow::ensure!(x.mnt.join("shared").is_dir());
-                Ok(())
-            })?;
-        }
-        let stop = Arc::new(AtomicBool::new(false));
-        let _guard = StopOnDrop(stop.clone());
-        // M12 round 2: each writer's names have locality — they hash
-        // into its own quarter of the name space (a writer with a naming
-        // scheme of its own); the placement delegates a range only to a
-        // node that dominates it, so names spread uniformly across the
-        // writers would never split the directory (by design: that
-        // split only adds a hop to every op).
-        let handles: Vec<_> = clients
-            .iter()
-            .enumerate()
-            .map(|(j, c)| {
-                let (mnt, tag, stop) = (c.mnt.clone(), c.name.clone(), stop.clone());
-                std::thread::spawn(move || -> Result<Vec<String>> {
-                    use constellation_meta::delegation::Range;
-                    let mut names = Vec::new();
-                    let mut i = 0;
-                    while !stop.load(Ordering::Relaxed) {
-                        let base = loop {
-                            let n = format!("{tag}-{i}");
-                            i += 1;
-                            if Range::of(2, &n).idx == j as u32 {
-                                break n;
-                            }
-                        };
-                        let name = format!("shared/{base}");
-                        write_timed(&mnt.join(&name), name.as_bytes())?;
-                        names.push(name);
-                        std::thread::sleep(Duration::from_millis(15));
-                    }
-                    Ok(names)
-                })
-            })
-            .collect();
-        let t0 = Instant::now();
-        let ranges_of = |c: &Client| -> Result<Vec<(String, u64)>> {
-            let d = deleg_of(c)?;
-            Ok(d["table"]
-                .as_array()
-                .map(|t| {
-                    t.iter()
-                        .filter(|e| e["path"] == "/shared" && e["range"] != "")
-                        .map(|e| (e["range"].as_str().unwrap_or("").to_string(), n(e, "node")))
-                        .collect()
-                })
-                .unwrap_or_default())
-        };
-        eventually_value("shared is split", Duration::from_secs(40), || {
-            let r = ranges_of(a)?;
-            anyhow::ensure!(r.len() >= 2, "not split yet: {r:?}");
-            Ok(())
-        })?;
-        let split_after = t0.elapsed();
-        let ranges = ranges_of(a)?;
-        eprintln!("    {NAME}: shared split after {split_after:?}: {ranges:?}");
-        // Every range delegate executes locally.
-        eventually(
-            "the range delegates execute",
-            Duration::from_secs(30),
-            || {
-                for x in &clients[1..] {
-                    let d = deleg_of(x)?;
-                    if ranges
-                        .iter()
-                        .any(|(_, node)| Some(*node) == node_id(x).ok())
-                    {
-                        anyhow::ensure!(
-                            n(&d, "executed") + n(&d, "fast_path_executed") > 0,
-                            "{} executed nothing as a range delegate: {d}",
-                            x.name
-                        );
-                    }
-                }
-                Ok(())
-            },
-        )?;
-        std::thread::sleep(Duration::from_secs(2));
-        stop.store(true, Ordering::Relaxed);
-        let mut all = Vec::new();
-        for h in handles {
-            all.extend(h.join().map_err(|_| anyhow::anyhow!("writer panicked"))??);
-        }
-        let t1 = Instant::now();
-        eventually_value("shared is merged", Duration::from_secs(40), || {
-            let r = ranges_of(a)?;
-            anyhow::ensure!(r.is_empty(), "still split: {r:?}");
-            Ok(())
-        })?;
-        let da = deleg_of(a)?;
-        print_deleg(NAME, "a", &da);
-        eprintln!(
-            "    {NAME}: {} files while split; merged {:?} after the writers stopped; splits {} \
-             range recalls {} (evaluations {})",
-            all.len(),
-            t1.elapsed(),
-            n(&da, "place_splits"),
-            n(&da, "place_range_recalls"),
-            n(&da, "place_evaluations")
-        );
-        anyhow::ensure!(n(&da, "place_splits") >= 1, "no split counted: {da}");
-        anyhow::ensure!(
-            n(&da, "place_range_recalls") >= 1,
-            "no range recalled: {da}"
-        );
-        for x in clients.iter() {
-            all_visible(x, &all, Duration::from_secs(90))?;
-        }
-        ensure_no_conflicts(&clients.iter().collect::<Vec<_>>())?;
-        Ok(())
-    })();
-    dump_logs_on_failure(NAME, &clients, &result);
-    unmount_all(&mut clients);
-    result
-}
-
-/// Plan 30 §M12: `shared` split two ways by hand (b the low range, c the
-/// high one); b renames a name of its range into a name of c's: a
-/// cross-range op — the root recalls both ranges, executes the rename
-/// after their streams, and delegates both again; the file is where the
-/// rename put it on every node, and both delegates execute locally
-/// again afterwards.
-pub fn cross_range_rename(_seed: u64) -> Result<()> {
-    const NAME: &str = "cross-range-rename";
-    let (_env, _root, mut clients, _) = cluster(NAME, &["a", "b", "c"], &[], 0)?;
-    let result = (|| -> Result<()> {
-        let a = &clients[0];
-        let b = &clients[1];
-        let c = &clients[2];
-        let b_id = node_id(b)?;
-        let c_id = node_id(c)?;
-        std::fs::create_dir(a.mnt.join("shared"))?;
-        for x in [b, c] {
-            eventually("dir visible", Duration::from_secs(20), || {
-                anyhow::ensure!(x.mnt.join("shared").is_dir());
-                Ok(())
-            })?;
-        }
-        delegate_range(a, "/shared", b_id, "0/2")?;
-        delegate_range(a, "/shared", c_id, "1/2")?;
-        let gen_b = wait_installed_range(b, "/shared", "0/2", Duration::from_secs(20))?;
-        let gen_c = wait_installed_range(c, "/shared", "1/2", Duration::from_secs(20))?;
-        let low = name_in_range("low", 1, 0);
-        let high = name_in_range("high", 1, 1);
-        // Warm both ranges with local writes.
-        let mut all = Vec::new();
-        for (x, tag, idx) in [(b, "b", 0u32), (c, "c", 1u32)] {
-            for i in 0..10 {
-                let leaf = name_in_range(&format!("{tag}{i}"), 1, idx);
-                let name = format!("shared/{leaf}");
-                write_timed(&x.mnt.join(&name), name.as_bytes())?;
-                all.push(name);
-            }
-        }
-        let src = format!("shared/{low}");
-        let dst = format!("shared/{high}");
-        write_timed(&b.mnt.join(&src), b"moved".as_slice())?;
-        let db0 = deleg_of(b)?;
-        let dc0 = deleg_of(c)?;
-        anyhow::ensure!(
-            n(&db0, "executed") + n(&db0, "fast_path_executed") >= 11,
-            "b did not execute locally: {db0}"
-        );
-        anyhow::ensure!(
-            n(&dc0, "executed") + n(&dc0, "fast_path_executed") >= 10,
-            "c did not execute locally: {dc0}"
-        );
-        let t = Instant::now();
-        std::fs::rename(b.mnt.join(&src), b.mnt.join(&dst)).context("the cross-range rename")?;
-        let took = t.elapsed();
-        let da = deleg_of(a)?;
-        print_deleg(NAME, "a", &da);
-        eprintln!(
-            "    {NAME}: rename {src} -> {dst} (range 0/2 -> 1/2) on b took {took:?}; root \
-             cross-subtree {} recalls sent {} drained {} ended {}",
-            n(&da, "cross_subtree"),
-            n(&da, "recalls_sent"),
-            n(&da, "recalls_drained"),
-            n(&da, "ended")
-        );
-        anyhow::ensure!(
-            n(&da, "cross_subtree") >= 1,
-            "the rename was not cross-range: {da}"
-        );
-        anyhow::ensure!(n(&da, "ended") >= 2, "both ranges should have ended: {da}");
-        for x in [a, b, c] {
-            eventually(
-                &format!("{} sees the move", x.name),
-                Duration::from_secs(30),
-                || {
-                    anyhow::ensure!(!x.mnt.join(&src).exists(), "{src} still on {}", x.name);
-                    anyhow::ensure!(
-                        std::fs::read(x.mnt.join(&dst)).ok().as_deref() == Some(b"moved"),
-                        "{dst} wrong on {}",
-                        x.name
-                    );
-                    Ok(())
-                },
-            )?;
-        }
-        // Both ranges are delegated again (new generations) and execute
-        // locally again.
-        let gen_b2 = wait_installed_range(b, "/shared", "0/2", Duration::from_secs(30))?;
-        let gen_c2 = wait_installed_range(c, "/shared", "1/2", Duration::from_secs(30))?;
-        anyhow::ensure!(
-            gen_b2 > gen_b && gen_c2 > gen_c,
-            "ranges not re-delegated: {gen_b}->{gen_b2}, {gen_c}->{gen_c2}"
-        );
-        let (again_b, lat_b) = {
-            let mut names = Vec::new();
-            let mut lat = Vec::new();
-            for i in 0..10 {
-                let leaf = name_in_range(&format!("again-b{i}"), 1, 0);
-                let name = format!("shared/{leaf}");
-                lat.push(write_timed(&b.mnt.join(&name), name.as_bytes())?);
-                names.push(name);
-            }
-            (names, lat)
-        };
-        eprintln!(
-            "    {NAME}: re-delegated (b gen {gen_b}->{gen_b2}, c gen {gen_c}->{gen_c2}, re-delegated {}); b's local writes after: {}",
-            n(&deleg_of(a)?, "redelegated"),
-            dist(lat_b)
-        );
-        all.extend(again_b);
-        all.push(dst.clone());
-        for x in [a, b, c] {
-            eventually(
-                &format!("{} sees every file", x.name),
-                Duration::from_secs(60),
-                || {
-                    for name in &all {
-                        anyhow::ensure!(x.mnt.join(name).exists(), "{name} missing on {}", x.name);
-                    }
-                    Ok(())
-                },
-            )?;
-        }
-        ensure_no_conflicts(&[a, b, c])?;
         Ok(())
     })();
     dump_logs_on_failure(NAME, &clients, &result);

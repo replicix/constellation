@@ -943,8 +943,8 @@ forwards waits for one S3 commit. §9 has the failover rules.
 a grant goes to a node and covers a set of subtrees under one stream
 (`DelegateNode`, `SubtreeReleased`, `DelegateNodeGroup`,
 `DelegateNodeEnded` replace `Delegate`, `Recall`, `RecallCut`,
-`DelegGroup`); the lone delegate and its bounded lead, hash-range splits,
-the cross-generation dependency rule
+`DelegGroup`); the lone delegate and its bounded lead, (hash-range splits
+are already deleted), the cross-generation dependency rule
 ([ADR-39](DECISIONS.md#adr-39-a-delegates-group-acknowledgement-waits-for-the-rows-dependencies-on-its-other-generations))
 and the 30 s placement windows go; far writers hold sticky non-stealable
 grants released by the holder. The one lease, one log, the ownership walk
@@ -1068,15 +1068,9 @@ lease and one log
   ahead is applied but not followed by the clock) merged by `max` and
   `nlink` changes are deltas, so creates
   in one directory commute and hold their parent only *shared*. A
-  directory can be split into up to 16 name-hash ranges (GIGA+), each
-  delegated separately, but only to a node that dominates that range. The
-  placement does **not** split automatically by default
-  (`CONSTELLATION_DELEGATION_SPLIT=0`): on real names a split measured
-  0.01× to 0.91× the throughput of none in every topology, and pays only
-  when each writer's names hash into its own range. Automatic splitting is
-  an opt-in expert setting, not available with `--cto strict` (a strict
-  listing of a split directory asks one sequencer only), and hand splits
-  stay available otherwise; delegating the
+  directory was once splittable into name-hash ranges (GIGA+); on real
+  names a split measured 0.01× to 0.91× the throughput of none in every
+  topology, and plan 46 D5 deleted the mechanism. Delegating the
   directory whole is the tool for writers far from the root
   ([ADR-38](DECISIONS.md#adr-38-automatic-directory-hash-range-splits-are-off-by-default)).
 
@@ -1251,7 +1245,7 @@ promise (hard constraint 5).
 
 A node that does not own the keys of a mutation is a *requester*: it
 forwards the op with its rid to the *owning sequencer*, which is the root
-lease holder or the delegate of the subtree (or hash range). Sequencers
+lease holder or the delegate of the subtree. Sequencers
 validate and order; only the root **appends** to the log. A requester
 with a stale table is redirected (`NotHolder`, at most two hops).
 

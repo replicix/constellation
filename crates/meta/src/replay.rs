@@ -1025,7 +1025,6 @@ fn apply_one(
             node,
             gen,
             designated,
-            range,
         } => {
             // A generation number is unique in the log, so a grant of `gen`
             // is preceded by no end of it there: a void on it here would be
@@ -1057,10 +1056,6 @@ fn apply_one(
                 node: *node,
                 gen: *gen,
                 designated: *designated,
-                range: crate::delegation::Range {
-                    bits: range.0,
-                    idx: range.1,
-                },
             });
             crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
             Ok(Applied::Done)

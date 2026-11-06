@@ -1,24 +1,23 @@
 #!/bin/bash
-# One cell of the directory-split matrix: REPS repetitions of a fresh
-# cluster mounted with SPLIT=0 running configurations a, c, d (their
-# order rotated per repetition), rename on a fresh cluster per
-# configuration, and a fresh cluster mounted with SPLIT=20 (set explicitly: the default is off) running b
-# (rename last), for every workload. One JSON line per phase goes
+# One cell of the hot-directory matrix: REPS repetitions of a fresh
+# cluster running configurations a and d (their order rotated per
+# repetition), rename on a fresh cluster per configuration, for every
+# workload. (Plan 46 D5 deleted the hash-range splits: the configurations
+# b and c and the `own` workload are gone.) One JSON line per phase goes
 # to $OUT/<label>.jsonl, the harness logs next to it.
 #
 #   run-cell.sh LABEL LAYOUT WRITERS S3_NEAR S3_FAR RTT_LOCAL RTT_REMOTE \
 #               [REPS] [WORKLOADS] [CONFIGS]
 #
-# CONFIGS is the SPLIT=0 cluster's set (default a,c,d); b runs unless
-# NO_B=1. Paths: BIN_DIR (constellation, harness), S3_BIN_DIR
+# CONFIGS is the set of configurations (default a,d). Paths: BIN_DIR (constellation, harness), S3_BIN_DIR
 # (versitygw, toxiproxy-server), OUT. Every harness run is bounded by
 # `timeout`; before the cell the script waits (at most 10 minutes) for
 # the 1-minute load average to drop below MAX_LOAD (4).
 set -u
 label=$1 layout=$2 writers=$3 s3n=$4 s3f=$5 rttl=$6 rttr=$7
 reps=${8:-3}
-workloads=${9:-uniform,mix,own,rename}
-configs=${10:-a,c,d}
+workloads=${9:-uniform,mix,rename}
+configs=${10:-a,d}
 : "${BIN_DIR:?}" "${S3_BIN_DIR:?}" "${OUT:?}"
 MAX_LOAD=${MAX_LOAD:-4}
 mkdir -p "$OUT"
@@ -32,7 +31,7 @@ export DIRSPLIT_RTT_LOCAL_MS=$rttl DIRSPLIT_RTT_REMOTE_MS=$rttr
 export DIRSPLIT_WORKLOADS=$workloads
 export DIRSPLIT_OUT=$OUT/$label.jsonl
 export DIRSPLIT_WARM_S=${DIRSPLIT_WARM_S:-5} DIRSPLIT_MEASURE_S=${DIRSPLIT_MEASURE_S:-15}
-export DIRSPLIT_BWARM_S=${DIRSPLIT_BWARM_S:-20} DIRSPLIT_THREADS=${DIRSPLIT_THREADS:-4}
+export DIRSPLIT_THREADS=${DIRSPLIT_THREADS:-4}
 
 wait_load() {
     local i
@@ -58,10 +57,9 @@ one() { # one TAG CONFIGS ROTATE
     fi
 }
 
-# rename runs on clusters of its own, one per configuration: a hand
-# split's cross-range renames recall and re-delegate the ranges hundreds
-# of times, and the root stays slower after that (see RESULTS.md), which
-# would skew every later phase on the same cluster.
+# rename runs on clusters of its own, one per configuration: its recalls
+# and re-delegations leave the root slower (see RESULTS.md), which would
+# skew every later phase on the same cluster.
 plain=$(echo ",$workloads," | sed 's/,rename,/,/g; s/^,//; s/,$//')
 IFS=, read -r -a cfgs <<< "$configs"
 # The host is quiet before the cell. (Between its own runs the load
@@ -80,5 +78,4 @@ for rep in $(seq 1 "$reps"); do
             DIRSPLIT_WORKLOADS=rename one "r$rep-rename-$c" "$c" 0
         done
     fi
-    [ "${NO_B:-0}" = 1 ] || one "r$rep-b" b 0
 done

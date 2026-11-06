@@ -498,7 +498,6 @@ impl EngineControl {
                             node: d.node,
                             gen: d.gen,
                             designated: d.designated,
-                            range: d.range.label(),
                         })
                         .collect(),
                     mine: v.mine.clone(),
@@ -609,8 +608,6 @@ impl EngineControl {
                     place_recalled: stats.place_recalled,
                     place_skipped_cooldown: stats.place_skipped_cooldown,
                     place_skipped_unreachable: stats.place_skipped_unreachable,
-                    place_splits: stats.place_splits,
-                    place_range_recalls: stats.place_range_recalls,
                     read_index_served: stats.deleg_read_index_served,
                     read_grants: stats.deleg_read_grants,
                     root_answers_off_core: core.delegation_root_answers_off_core,
@@ -1089,42 +1086,15 @@ impl EngineControl {
             .collect()
     }
 
-    pub(crate) fn delegate(
-        &self,
-        path: &str,
-        node: u64,
-        range: Option<&str>,
-    ) -> std::result::Result<String, String> {
+    pub(crate) fn delegate(&self, path: &str, node: u64) -> std::result::Result<String, String> {
         let dir = self
             .meta
             .resolve_path(path)
             .map_err(|e| format!("{e:#}"))?
             .ok_or_else(|| format!("no such directory: {path}"))?;
-        // Plan 30 §M12: `"<idx>/<count>"`, `count` a power of two.
-        let range = match range.map(str::trim).filter(|r| !r.is_empty()) {
-            None => (0u8, 0u32),
-            Some(r) => {
-                let (i, k) = r
-                    .split_once('/')
-                    .ok_or_else(|| format!("range {r}: expected <idx>/<count>"))?;
-                let idx: u32 = i.parse().map_err(|_| format!("range {r}: bad index"))?;
-                let count: u32 = k.parse().map_err(|_| format!("range {r}: bad count"))?;
-                if !count.is_power_of_two() || count > 16 || idx >= count {
-                    return Err(format!(
-                        "range {r}: count must be 2, 4, 8 or 16 and idx below it"
-                    ));
-                }
-                (count.trailing_zeros() as u8, idx)
-            }
-        };
         let (reply, receive) = tokio::sync::oneshot::channel();
         self.sync_tx
-            .send(sync::SyncRequest::Delegate {
-                dir,
-                node,
-                range,
-                reply,
-            })
+            .send(sync::SyncRequest::Delegate { dir, node, reply })
             .map_err(|_| "sync task is not running".to_string())?;
         tokio::task::block_in_place(|| {
             self.rt
@@ -1160,7 +1130,6 @@ impl EngineControl {
                 node: d.node,
                 gen: d.gen,
                 designated: d.designated,
-                range: d.range.label(),
             })
             .collect()
     }

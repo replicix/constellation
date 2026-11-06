@@ -719,7 +719,7 @@ fn rows_in(r: &impl Readable, meta: &Meta, epoch: u64) -> Result<Vec<MemberTx>, 
     let mut out = Vec::new();
     for guard in r.range(&meta.backup_tail, tail_key(e, 0)..=tail_key(e, u64::MAX)) {
         let (_, v) = guard.into_inner()?;
-        out.push(postcard::from_bytes(&v)?);
+        out.push(crate::record::from_bytes_exact(&v)?);
     }
     Ok(out)
 }
@@ -810,7 +810,7 @@ pub(crate) fn put_row_tx(
     );
     let key = tail_key(member_epoch(epoch), row.tx.first);
     let keep = match tx.get(&meta.backup_tail, &key)? {
-        Some(v) => Some(postcard::from_bytes::<MemberTx>(&v)?),
+        Some(v) => Some(crate::record::from_bytes_exact::<MemberTx>(&v)?),
         None => None,
     };
     let row = match keep {

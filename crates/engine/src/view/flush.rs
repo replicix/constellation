@@ -1242,10 +1242,10 @@ impl View {
         let view = self.sync.as_ref().map(|handle| handle.lease.clone());
         let mut admitted = view.as_ref().and_then(|view| view.admit());
         // Plan 30 §M12: the sequencer's own commit runs here only for a
-        // file the root owns; one a range's (or a subtree's) delegate owns
+        // file the root owns; one a subtree's delegate owns
         // goes through the core, like the file's create did — before,
         // the root committed the manifest of a file it had created
-        // through a range delegate against a replica that lacked the
+        // through a delegate against a replica that lacked the
         // inode, the close's error was swallowed and the content never
         // published (harness `shared-dir-multi-writer`, the root's own
         // files in the split phase read back empty for the whole run).

@@ -3009,11 +3009,7 @@ fn the_root_forgets_ended_generations() {
     for i in 0..CYCLES {
         let out = h.step(Event::Control {
             op: OpId(1_000 + 2 * i),
-            req: Control::Delegate {
-                dir,
-                node: 3,
-                range: (0, 0),
-            },
+            req: Control::Delegate { dir, node: 3 },
         });
         assert!(
             out.iter()
@@ -3104,11 +3100,7 @@ fn two_tenures_never_mint_the_same_generation_number() {
         .unwrap();
         let out = h.step(Event::Control {
             op: OpId(1_000),
-            req: Control::Delegate {
-                dir,
-                node: 3,
-                range: (0, 0),
-            },
+            req: Control::Delegate { dir, node: 3 },
         });
         assert!(
             out.iter()
@@ -3157,7 +3149,6 @@ fn two_tenures_never_mint_the_same_generation_number() {
                 node: 4,
                 gen: gens[1],
                 designated: false,
-                range: (0, 0),
             },
         ],
     )
@@ -3166,11 +3157,7 @@ fn two_tenures_never_mint_the_same_generation_number() {
     assert_eq!(gens[1] >> GEN_EPOCH_SHIFT, 2);
     let out = h.step(Event::Control {
         op: OpId(1_001),
-        req: Control::Delegate {
-            dir: next,
-            node: 5,
-            range: (0, 0),
-        },
+        req: Control::Delegate { dir: next, node: 5 },
     });
     let refusal = out.iter().find_map(|a| match a {
         Action::ControlDone { result: Err(e), .. } => Some(e.clone()),
@@ -9318,11 +9305,7 @@ mod cto {
         let (mut h, dir, file, grants) = holder_with_scanned_dir();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate {
-                dir,
-                node: 3,
-                range: (0, 0),
-            },
+            req: Control::Delegate { dir, node: 3 },
         });
         assert!(
             out.iter().any(|a| matches!(
@@ -9411,11 +9394,7 @@ mod cto {
         let (mut h, dir, _file, _grants) = holder_with_scanned_dir();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate {
-                dir,
-                node: 3,
-                range: (0, 0),
-            },
+            req: Control::Delegate { dir, node: 3 },
         });
         let expiries = timers(&out, TimerKind::GrantExpiry);
         assert_eq!(expiries.len(), 2, "{out:?}");
@@ -9481,85 +9460,6 @@ mod cto {
         sync(&mut h);
         let d = h.meta.delegation_table().get(dir).expect("designated");
         assert!(d.designated && d.node == 3, "{d:?}");
-    }
-
-    /// A name in range `idx` of a directory split `1 << bits` ways.
-    fn name_in_range(bits: u8, idx: u32) -> String {
-        (0..)
-            .map(|i| format!("n{i}"))
-            .find(|n| constellation_meta::delegation::Range::of(bits, n).idx == idx)
-            .unwrap()
-    }
-
-    /// A split directory's entries have a sequencer per range (M12), and
-    /// each one's writes recall only the grants in its own table, so a
-    /// read delegation on the directory (which covers its entries) is
-    /// never granted: with both halves of `p` delegated, a read of `p`
-    /// itself resolves to neither, and the root answered it with a grant
-    /// under which node 5 then looked names up locally, missing a create
-    /// node 3 had acknowledged in its range. A lookup of a name asks the
-    /// name's sequencer. Fails on the parent: the root grants.
-    #[test]
-    fn the_root_grants_no_read_delegation_on_a_split_directory() {
-        let (mut h, dir, _file, _grants) = holder_with_scanned_dir();
-        for (op, node, idx) in [(900, 3, 0), (901, 4, 1)] {
-            let out = h.step(Event::Control {
-                op: OpId(op),
-                req: Control::Delegate {
-                    dir,
-                    node,
-                    range: (1, idx),
-                },
-            });
-            assert!(
-                out.iter()
-                    .any(|a| matches!(a, Action::ControlDone { result: Ok(_), .. })),
-                "range {idx} not delegated: {out:?}"
-            );
-        }
-        assert!(h.meta.delegation_table().is_split(dir));
-        for (req, ahead) in [(50, ReadAhead::Listing), (51, ReadAhead::None)] {
-            let outcome = ask_in(&mut h, 5, req, (dir, true, None), ahead);
-            assert!(
-                matches!(outcome, ReadIndexOutcome::Ok { grant: None, .. }),
-                "a read delegation on a split directory: {outcome:?}"
-            );
-        }
-        for (req, idx, holder) in [(52, 0, 3), (53, 1, 4)] {
-            let name = name_in_range(1, idx);
-            let outcome = ask_in(&mut h, 5, req, (dir, true, Some(&name)), ReadAhead::None);
-            assert_eq!(outcome, ReadIndexOutcome::NotHolder { holder }, "{name}");
-        }
-    }
-
-    /// The same at a range's delegate: with one half of `/d` delegated
-    /// here, a read of `/d` resolves to this range, and the delegate
-    /// granted a delegation on the directory (for a lookup of one of its
-    /// names too) that the root's creates in the other half never recall.
-    /// Fails on the parent: both reads are granted.
-    #[test]
-    fn a_range_delegate_grants_no_read_delegation_on_its_directory() {
-        let mut h = Harness::new(3);
-        h.core.cfg.delegation = true;
-        h.core.cfg.p2p = true;
-        h.core.lease.cached_holder = Some(1);
-        let dir = delegated_range_to_me(&h.meta, 3, (1, 0));
-        let mut out = Vec::new();
-        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        let req = renew_req(&out, 7).expect("no renewal on install");
-        h.step(renewed(&h, req, 7, 5_000));
-        let name = name_in_range(1, 0);
-        for (req, name, ahead) in [
-            (1, None, ReadAhead::Listing),
-            (2, Some(name.as_str()), ReadAhead::None),
-        ] {
-            let outcome = ask_in(&mut h, 2, req, (dir, true, name), ahead);
-            assert!(
-                matches!(outcome, ReadIndexOutcome::Ok { grant: None, .. }),
-                "answered here, with a grant on the split directory: {outcome:?}"
-            );
-        }
-        assert_eq!(h.meta.read_delegations().live_grants(), 0);
     }
 
     /// A delegate's unlink of a second link, in its subtree, to a file whose
@@ -9886,11 +9786,7 @@ mod cto {
         let (mut h, dir, q) = holder_in_quarantine();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate {
-                dir,
-                node: 3,
-                range: (0, 0),
-            },
+            req: Control::Delegate { dir, node: 3 },
         });
         assert!(
             out.iter()
@@ -9960,11 +9856,7 @@ mod cto {
         let (mut h, dir, _file, _grants) = holder_with_scanned_dir();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate {
-                dir,
-                node: 3,
-                range: (0, 0),
-            },
+            req: Control::Delegate { dir, node: 3 },
         });
         let rs = recalls(&out);
         assert_eq!(rs.len(), 2, "{out:?}");
@@ -10079,11 +9971,7 @@ mod cto {
         let (mut h, dir) = lone_holder_with_dir();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate {
-                dir,
-                node: 3,
-                range: (0, 0),
-            },
+            req: Control::Delegate { dir, node: 3 },
         });
         assert!(
             out.iter()
@@ -10142,11 +10030,7 @@ mod cto {
         let (mut h, dir, _q) = holder_in_quarantine();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate {
-                dir,
-                node: 3,
-                range: (0, 0),
-            },
+            req: Control::Delegate { dir, node: 3 },
         });
         assert!(
             out.iter()
@@ -13695,7 +13579,6 @@ fn a_held_forward_executes_locally_once_the_delegation_installs() {
             node: 3,
             gen: 1,
             designated: true,
-            range: (0, 0),
         }],
     )
     .unwrap();
@@ -15936,7 +15819,6 @@ mod locks {
                     node: 3,
                     gen: 7,
                     designated: false,
-                    range: (0, 0),
                 },
             ],
         )
@@ -16021,7 +15903,6 @@ mod locks {
                     node: 3,
                     gen: 7,
                     designated: false,
-                    range: (0, 0),
                 },
             ],
         )
@@ -16353,7 +16234,6 @@ mod locks {
                     node: 3,
                     gen: g,
                     designated: false,
-                    range: (0, 0),
                 }],
                 committed,
                 (0, 0),
@@ -17499,7 +17379,6 @@ mod locks {
                     node: 3,
                     gen: 8,
                     designated: false,
-                    range: (0, 0),
                 },
             ],
         )
@@ -20309,11 +20188,7 @@ mod locks {
         };
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate {
-                dir,
-                node: 3,
-                range: (0, 0),
-            },
+            req: Control::Delegate { dir, node: 3 },
         });
         assert!(
             out.iter().any(|a| matches!(
@@ -23581,7 +23456,6 @@ mod locks {
                         node: 3,
                         gen: 7,
                         designated: false,
-                        range: (0, 0),
                     },
                 ],
             )
@@ -31371,7 +31245,6 @@ mod locks {
                 node: 3,
                 gen,
                 designated: false,
-                range: (0, 0),
             }],
         )
         .unwrap();
@@ -31619,7 +31492,6 @@ mod locks {
                     node: 3,
                     gen: 8,
                     designated: false,
-                    range: (0, 0),
                 },
             ],
         )
@@ -33123,7 +32995,6 @@ fn undelegate_refuses_a_designation() {
             node: 2,
             gen: 1,
             designated: true,
-            range: (0, 0),
         }],
     )
     .unwrap();
@@ -33278,11 +33149,7 @@ fn a_write_into_a_fresh_delegation_is_recalled_until_the_root_sees_the_delegate(
         let (mut h, dir) = root_with_dir();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate {
-                dir,
-                node: 3,
-                range: (0, 0),
-            },
+            req: Control::Delegate { dir, node: 3 },
         });
         assert!(
             out.iter().any(|a| matches!(
@@ -33383,11 +33250,7 @@ mod s3_no_loops {
         let (mut h, dir) = root_with_dir();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate {
-                dir,
-                node: 3,
-                range: (0, 0),
-            },
+            req: Control::Delegate { dir, node: 3 },
         });
         assert!(
             out.iter().any(|a| matches!(
@@ -33908,7 +33771,6 @@ fn the_takeover_drain_defers_only_the_delegated_requester() {
             node: 2,
             gen: 1,
             designated: false,
-            range: (0, 0),
         }],
     )
     .unwrap();
@@ -33990,7 +33852,6 @@ fn an_inbox_op_waits_for_its_deps() {
             node: 2,
             gen: 1,
             designated: false,
-            range: (0, 0),
         }],
     )
     .unwrap();
@@ -34083,7 +33944,6 @@ fn a_delegate_reply_base_covers_what_it_applied_before_the_grant_and_streamed_st
             node: 3,
             gen: 1,
             designated: true,
-            range: (0, 0),
         }],
     );
     let mut out = Vec::new();
@@ -36783,7 +36643,6 @@ fn a_barrier_inside_a_delegated_subtree_does_not_reach_the_delegate() {
             node: 2,
             gen: 1,
             designated: false,
-            range: (0, 0),
         }],
     )
     .unwrap();
@@ -37186,15 +37045,6 @@ fn a_barrier_around_a_deposition_waits_for_the_replay_not_the_strand() {
     assert_eq!(done, Some(Ok(ControlOk::Done)));
 }
 
-/// ADR-38: automatic hash-range splits are off by default; the placement
-/// stays on.
-#[test]
-fn automatic_splits_are_off_by_default() {
-    let c = crate::Config::defaults(1, 0);
-    assert!(c.placement);
-    assert_eq!(c.placement_split_pct, 0);
-}
-
 /// Harness `auto-placement` (2 in 11): the root's roster is read at
 /// mount and every 5 s; a peer that registered after it mounted and
 /// writes at once is connected, forwarding, and dominant, but not in the
@@ -37229,9 +37079,8 @@ fn placement_re_reads_the_roster_for_a_connected_writer_it_does_not_list() {
         lapses: 0,
         issued: WaitMs(i64::MAX),
     });
-    for i in 0..40 {
-        let bucket = super::placement::bucket_of(&format!("b-{i}"));
-        h.core.place_note(2, [(dir, Some(bucket))]);
+    for _ in 0..40 {
+        h.core.place_note(2, [dir]);
     }
     let tick = |h: &mut Harness| {
         let (now, mut out) = (h.now, Vec::new());
@@ -37271,153 +37120,17 @@ fn placement_re_reads_the_roster_for_a_connected_writer_it_does_not_list() {
     );
 }
 
-/// ADR-38: a root (node 1) whose placement sees two connected writers,
-/// nodes 2 and 3, each creating 40 names in `d1` that hash into its own
-/// half of the name space: no node dominates, both write 50 %, and each
-/// half has a local writer. Returns the harness and `d1`.
-fn root_with_two_range_writers(
-    split_pct: u64,
-    strict: bool,
-) -> (Harness, constellation_fs_core::Ino) {
-    let mut h = Harness::new(1);
-    h.core.cfg.delegation = true;
-    h.core.cfg.placement = true;
-    h.core.cfg.placement_min_ops = 20;
-    h.core.cfg.placement_split_pct = split_pct;
-    h.core.cfg.strict_mounts = strict;
-    h.hold(1, None);
-    let op = h.create("d1");
-    constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
-    let MutateOp::Create { ino: dir, .. } = op else {
-        unreachable!()
-    };
-    h.step(Event::Roster {
-        write_eligible: vec![1, 2, 3],
-        issued: WaitMs(i64::MAX),
-    });
-    h.step(Event::Peers {
-        links: [2, 3]
-            .map(|node| crate::event::PeerLink {
-                node,
-                connected: true,
-                last_seen: Some(w(h.now)),
-                rtt_ms: Some(1),
-                since: Some(w(h.now)),
-            })
-            .to_vec(),
-        lapses: 0,
-        issued: WaitMs(i64::MAX),
-    });
-    for (node, idx) in [(2, 0), (3, 1)] {
-        let names = (0..)
-            .map(|i| format!("n{i}"))
-            .filter(|n| constellation_meta::delegation::Range::of(1, n).idx == idx)
-            .take(40);
-        for name in names {
-            h.core
-                .place_note(node, [(dir, Some(super::placement::bucket_of(&name)))]);
-        }
-    }
-    (h, dir)
-}
-
-fn placement_tick(h: &mut Harness) -> Vec<Action> {
-    let (now, mut out) = (h.now, Vec::new());
-    h.core
-        .on_placement_timer(Now::same(now.0), &h.meta, &mut out);
-    out
-}
-
-/// The control group of the two tests below: with the split on and no
-/// strict mounts the placement splits the directory.
-#[test]
-fn the_placement_splits_a_hot_directory_when_asked_to() {
-    let (mut h, dir) = root_with_two_range_writers(20, false);
-    placement_tick(&mut h);
-    assert_eq!(h.core.stats.place_splits, 1);
-    assert!(h.meta.delegation_table().is_split(dir));
-}
-
-/// ADR-38: automatic splits are off by default, however hot the directory.
-#[test]
-fn the_placement_does_not_split_by_default() {
-    let (mut h, dir) =
-        root_with_two_range_writers(Config::defaults(1, 0).placement_split_pct, false);
-    placement_tick(&mut h);
-    assert_eq!(h.core.stats.place_splits, 0);
-    assert!(!h.meta.delegation_table().is_split(dir));
-}
-
-/// ADR-38: under `--cto strict` the placement never splits, whatever
-/// `CONSTELLATION_DELEGATION_SPLIT` says (a strict listing of a split
-/// directory asks one sequencer only). Fails before: it splits.
-#[test]
-fn the_placement_never_splits_under_cto_strict() {
-    let (mut h, dir) = root_with_two_range_writers(20, true);
-    placement_tick(&mut h);
-    assert_eq!(h.core.stats.place_splits, 0);
-    assert!(!h.meta.delegation_table().is_split(dir));
-}
-
-/// ADR-38: a hand split is refused under `--cto strict`, a whole
-/// delegation is not. Fails before: the split is accepted.
-#[test]
-fn a_manual_range_split_is_refused_under_cto_strict() {
-    let (mut h, dir) = root_with_two_range_writers(0, true);
-    let delegate = |h: &mut Harness, op: u64, range: (u8, u32)| {
-        let out = h.step(Event::Control {
-            op: OpId(op),
-            req: Control::Delegate {
-                dir,
-                node: 2,
-                range,
-            },
-        });
-        out.into_iter()
-            .find_map(|a| match a {
-                Action::ControlDone { result, .. } => Some(result),
-                _ => None,
-            })
-            .expect("no answer")
-    };
-    let refused = delegate(&mut h, 900, (1, 0)).expect_err("a split under strict");
-    assert!(refused.contains("--cto strict"), "{refused}");
-    assert!(!h.meta.delegation_table().is_split(dir));
-    delegate(&mut h, 901, (0, 0)).expect("a whole delegation is allowed");
-    // Not strict: the same split is accepted.
-    let (mut h, dir) = root_with_two_range_writers(0, false);
-    let out = h.step(Event::Control {
-        op: OpId(902),
-        req: Control::Delegate {
-            dir,
-            node: 2,
-            range: (1, 0),
-        },
-    });
-    assert!(
-        out.iter()
-            .any(|a| matches!(a, Action::ControlDone { result: Ok(_), .. })),
-        "{out:?}"
-    );
-}
-
 /// A replica of node `me` whose table delegates `/d` to `me` as
 /// generation 7 (the root is node 1). Returns the directory.
 fn delegated_to_me(meta: &Meta, me: NodeId) -> constellation_fs_core::Ino {
-    delegated_range_to_me(meta, me, (0, 0))
-}
-
-/// [`delegated_to_me`] for the name-hash range `(bits, idx)` of `/d`
-/// (`(0, 0)`: the whole directory).
-fn delegated_range_to_me(meta: &Meta, me: NodeId, range: (u8, u32)) -> constellation_fs_core::Ino {
     let dir = meta.allocate_ino(ROOT_INO).unwrap();
-    delegated_dir_to(meta, me, range, dir);
+    delegated_dir_to(meta, me, dir);
     dir
 }
 
-/// [`delegated_range_to_me`] for the directory `dir` (another node's
+/// [`delegated_to_me`] for the directory `dir` (another node's
 /// allocation of the same directory: two cores that exchange rows).
-fn delegated_dir_to(meta: &Meta, me: NodeId, range: (u8, u32), dir: constellation_fs_core::Ino) {
+fn delegated_dir_to(meta: &Meta, me: NodeId, dir: constellation_fs_core::Ino) {
     crate::replica::Replica::apply_segment(
         meta,
         1,
@@ -37440,7 +37153,6 @@ fn delegated_dir_to(meta: &Meta, me: NodeId, range: (u8, u32), dir: constellatio
                 node: me,
                 gen: 7,
                 designated: false,
-                range,
             },
         ],
     )
@@ -38422,7 +38134,6 @@ mod redelegated_to_the_requester {
                 node: 3,
                 gen: 7,
                 designated: false,
-                range: (0, 0),
             }],
         )
         .unwrap();
@@ -38633,7 +38344,6 @@ mod delegated_lock_dead_end {
                     node: 2,
                     gen: 7,
                     designated: false,
-                    range: (0, 0),
                 },
             ],
         )
@@ -40447,7 +40157,6 @@ fn list_generation(h: &Harness, dir: u64, gen: u64) {
             node: 3,
             gen,
             designated: false,
-            range: (0, 0),
         }])
         .unwrap();
 }
@@ -40784,7 +40493,6 @@ fn a_replay_does_not_wait_on_the_successors_stream_of_an_undone_grants_number() 
             node: 2,
             gen: 4,
             designated: false,
-            range: (0, 0),
         }])
         .unwrap();
     let data = LogRecord::Create {
@@ -43337,7 +43045,6 @@ mod recall_cut {
                 node: 3,
                 gen: 8,
                 designated: false,
-                range: (0, 0),
             },
         ];
         h.meta.install_streamed(1, 1, 1, 2, &records).unwrap();
@@ -43407,7 +43114,6 @@ mod recall_cut {
                 node: 3,
                 gen: 8,
                 designated: false,
-                range: (0, 0),
             },
         ];
         h.meta.install_streamed(1, 1, 1, 2, &records).unwrap();
@@ -43457,545 +43163,6 @@ mod recall_cut {
             assert!(h.core.dl.install_waiting.is_empty());
             assert!(h.core.dl.install_retry.is_none());
         }
-    }
-
-    /// This node holds both halves of `/d` (name-hash range 0 as generation
-    /// 7, range 1 as 8), renewed; a name of each half.
-    fn two_ranges() -> (Harness, constellation_fs_core::Ino, String, String) {
-        let mut h = Harness::new(3);
-        h.core.cfg.delegation = true;
-        h.core.cfg.p2p = true;
-        h.core.lease.cached_holder = Some(1);
-        let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
-        let delegate = |gen: u64, idx: u32| LogRecord::Delegate {
-            dir,
-            node: 3,
-            gen,
-            designated: false,
-            range: (1, idx),
-        };
-        Replica::apply_segment(
-            &h.meta,
-            1,
-            1,
-            0,
-            &[],
-            &[],
-            &[
-                LogRecord::Mkdir {
-                    parent: ROOT_INO,
-                    name: "d".into(),
-                    ino: dir,
-                    mode: 0o755,
-                    uid: 0,
-                    gid: 0,
-                    time_ns: 1,
-                },
-                delegate(7, 0),
-                delegate(8, 1),
-            ],
-        )
-        .unwrap();
-        let mut out = Vec::new();
-        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        for gen in [7, 8] {
-            let req = renew_req(&out, gen).expect("no renewal on install");
-            h.step(renewed(&h, req, gen, 5_000));
-        }
-        let name = |idx: u32| {
-            (0..)
-                .map(|i| format!("n{i}"))
-                .find(|n| constellation_meta::delegation::Range::of(1, n).idx == idx)
-                .unwrap()
-        };
-        (h, dir, name(0), name(1))
-    }
-
-    fn create_in(h: &mut Harness, dir: constellation_fs_core::Ino, seq: u64, name: &str) {
-        let rid = h.rid(seq);
-        let op = MutateOp::Create {
-            parent: dir,
-            name: name.into(),
-            ino: h.meta.allocate_ino(dir).unwrap(),
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-        };
-        let out = h.step(Event::Submit {
-            policy: Policy::Client,
-            rid,
-            op,
-            tag: Default::default(),
-        });
-        assert!(replies(&out).iter().any(|(r, _)| *r == rid), "{out:?}");
-    }
-
-    /// Fail-before: this node holds generations 7 and 8, the two halves of
-    /// `/d`. Cut off from the root, it answers a create in each half, row
-    /// 7:1 and then row 8:1, which depends on 7:1 (`deps` (7, 1)). The root
-    /// ends generation 7 at its cursor 0 while 8 lives on. Row 7:1 strands
-    /// (replayed by rid, later), but 8:1 went out once 7 was no longer held
-    /// (the stream's `acked_here`), and the root, counting a dependency on
-    /// generation 7 as void, appended it: the log carries 8:1 ahead of the
-    /// create it followed. A row whose dependency is lost with its
-    /// generation is never streamed: the generation stops there, the root
-    /// ends it at the row before (its recall's answer says so), and the row
-    /// strands with the rest and is replayed by rid after its cause.
-    #[test]
-    fn a_row_depending_on_an_ended_generations_lost_row_never_streams() {
-        let (mut h, dir, low, high) = two_ranges();
-        create_in(&mut h, dir, 1, &low);
-        create_in(&mut h, dir, 2, &high);
-        assert_eq!(
-            (
-                Replica::delegate_idx(&h.meta, 7),
-                Replica::delegate_idx(&h.meta, 8)
-            ),
-            (1, 1)
-        );
-        let row = Replica::delegate_txs_from(&h.meta, 8, 1, 10);
-        assert!(
-            row[0].deps.streams.iter().any(|(g, i)| g == 7 && i == 1),
-            "{:?}",
-            row[0].deps
-        );
-        Replica::apply_segment(
-            &h.meta,
-            2,
-            1,
-            0,
-            &[],
-            &[],
-            &[LogRecord::RecallCut {
-                dir,
-                gen: 7,
-                through: 0,
-            }],
-        )
-        .unwrap();
-        let mut out = Vec::new();
-        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        h.advance(h.core.cfg.delegation_stream_tick_ms.max(1) * 10);
-        let ticks = timers(&out, TimerKind::DelegStream);
-        for t in ticks {
-            out.extend(h.step(Event::Timer { id: t }));
-        }
-        let sent: Vec<u64> = sends(&out)
-            .into_iter()
-            .filter_map(|(_, m)| match m {
-                PeerMsg::DelegateStream { gen: 8, txs, .. } => txs.first().map(|t| t.idx),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            (sent, h.core.dl.mine.get(&8).map(|d| d.stopped)),
-            (vec![], Some(true)),
-            "(gen 8 batches sent, stopped): {out:?}"
-        );
-        // A recall is answered at the row before.
-        let out = h.step(Event::Peer {
-            from: 1,
-            msg: PeerMsg::DelegRecall {
-                req: OpId(77),
-                dir,
-                gen: 8,
-            },
-        });
-        let through = sends(&out).into_iter().find_map(|(_, m)| match m {
-            PeerMsg::DelegRecalled {
-                gen: 8, through, ..
-            } => Some(*through),
-            _ => None,
-        });
-        assert_eq!(through, Some(0), "{out:?}");
-    }
-
-    /// Node 2's forward of a create of `name` under `dir` (request `req`)
-    /// with `deps`; what the delegate sent.
-    fn forward_with_deps(
-        h: &mut Harness,
-        dir: constellation_fs_core::Ino,
-        name: &str,
-        req: u64,
-        deps: constellation_meta::Position,
-    ) -> Vec<Action> {
-        let ino = h.meta.allocate_ino(dir).unwrap();
-        h.step(Event::Peer {
-            from: 2,
-            msg: PeerMsg::MutateRequest {
-                req: OpId(req),
-                rid: Rid {
-                    node: 2,
-                    incarnation: 1,
-                    seq: req,
-                },
-                op: MutateOp::Create {
-                    parent: dir,
-                    name: name.into(),
-                    ino,
-                    mode: 0o644,
-                    uid: 0,
-                    gid: 0,
-                },
-                acked_through: 0,
-                deps,
-                applied: 0,
-                tag: Default::default(),
-                settle: false,
-            },
-        })
-    }
-
-    fn reply_to_2(out: &[Action], req: u64) -> Option<&MutateOutcome> {
-        sends(out).into_iter().find_map(|(to, m)| match m {
-            PeerMsg::MutateReply {
-                req: r, outcome, ..
-            } if to == 2 && *r == OpId(req) => Some(outcome),
-            _ => None,
-        })
-    }
-
-    /// Review must-fix 1 (fail-before): this node holds generations 7 (no
-    /// backup: its group is the root's append) and 8 (backup 5). Node 2's
-    /// create under 8 depends on its create under 7 (`deps` (7, 1)). 8's
-    /// backup held the row and the delegate answered it, while 7:1 was not
-    /// committed. 7 then ended at 0: 7:1 strands, so 8 stops before 8:1 and
-    /// ends there, and the strand drops 8:1 though node 2 was told it
-    /// committed. A `DelegGroup` acknowledgement now waits for the row's
-    /// dependencies on the node's other generations, and is aborted (node 2
-    /// retries by rid) when one of them is lost.
-    #[test]
-    fn a_group_acknowledgement_waits_for_the_rows_other_generation_dependencies() {
-        let (mut h, dir, low, high) = two_ranges();
-        Replica::apply_segment(
-            &h.meta,
-            2,
-            1,
-            0,
-            &[],
-            &[],
-            &[LogRecord::DelegGroup {
-                dir,
-                gen: 8,
-                version: 1,
-                backups: vec![5],
-            }],
-        )
-        .unwrap();
-        let mut out = Vec::new();
-        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        // Node 5 is near: a backup candidate, so 8's group stays as recorded.
-        h.core.cfg.backup_rtt_budget_ms = 50;
-        h.core.cfg.backups_max = 1;
-        h.core.cfg.backup_stable_ms = 0;
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3, 5],
-            issued: WaitMs(i64::MAX),
-        });
-        h.step(Event::Peers {
-            links: vec![crate::event::PeerLink {
-                node: 5,
-                connected: true,
-                last_seen: None,
-                rtt_ms: Some(5),
-                since: Some(WaitMs(0)),
-            }],
-            lapses: 0,
-            issued: WaitMs(i64::MAX),
-        });
-        let d8 = h.core.dl.mine.get_mut(&8).unwrap();
-        d8.backup = Some(5);
-        d8.group_requested = None;
-        let out = forward_with_deps(&mut h, dir, &low, 500, constellation_meta::Position::ZERO);
-        assert!(reply_to_2(&out, 500).is_none(), "{out:?}");
-        let on_7 = constellation_meta::Position::ZERO.with_streams_wire(&[(7, 1)]);
-        let out = forward_with_deps(&mut h, dir, &high, 501, on_7);
-        assert!(reply_to_2(&out, 501).is_none(), "{out:?}");
-        let breq = sends(&out)
-            .into_iter()
-            .find_map(|(to, m)| match m {
-                PeerMsg::DelegBackupAppend { req, gen: 8, .. } if to == 5 => Some(*req),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("not appended to 8's backup: {out:?}"));
-        let out = h.step(Event::Peer {
-            from: 5,
-            msg: PeerMsg::DelegBackupAck {
-                req: breq,
-                gen: 8,
-                acked: 1,
-                sealed: false,
-            },
-        });
-        assert_eq!(
-            reply_to_2(&out, 501),
-            None,
-            "8:1 answered while the row of 7 it depends on was not committed"
-        );
-        // The fast path's watermark says the same.
-        assert!(
-            !matches!(
-                h.meta
-                    .session()
-                    .wait_deleg_durable(8, 1, std::time::Duration::ZERO),
-                constellation_meta::DurableWait::Durable(_)
-            ),
-            "the fast path's watermark covers 8:1"
-        );
-        // Generation 7 ends at 0: 7:1 is lost to the log, and so is 8:1.
-        Replica::apply_segment(
-            &h.meta,
-            3,
-            1,
-            0,
-            &[],
-            &[],
-            &[LogRecord::RecallCut {
-                dir,
-                gen: 7,
-                through: 0,
-            }],
-        )
-        .unwrap();
-        let mut out = Vec::new();
-        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        h.core.complete_ready(h.clk(), &h.meta, &mut out);
-        assert_eq!(
-            reply_to_2(&out, 501),
-            Some(&MutateOutcome::Busy),
-            "the acknowledgement of 8:1 is aborted: {out:?}"
-        );
-        assert_eq!(h.core.dl.mine[&8].lost_from, Some(1));
-    }
-
-    /// The setup of the review's probe: generations 7 (the root's append its
-    /// group) and 8 (backup 5) of this node; node 2's create under 7 (7:1),
-    /// then its create under 8 with `deps` (7, 1), while 8's stream and
-    /// backup are backed off so 8:1 is not read for a batch yet.
-    fn row_unread_behind_a_busy_backup() -> (Harness, constellation_fs_core::Ino) {
-        let (mut h, dir, low, high) = two_ranges();
-        Replica::apply_segment(
-            &h.meta,
-            2,
-            1,
-            0,
-            &[],
-            &[],
-            &[LogRecord::DelegGroup {
-                dir,
-                gen: 8,
-                version: 1,
-                backups: vec![5],
-            }],
-        )
-        .unwrap();
-        let mut out = Vec::new();
-        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        h.core.cfg.backup_rtt_budget_ms = 50;
-        h.core.cfg.backups_max = 1;
-        h.core.cfg.backup_stable_ms = 0;
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3, 5],
-            issued: WaitMs(i64::MAX),
-        });
-        h.step(Event::Peers {
-            links: vec![crate::event::PeerLink {
-                node: 5,
-                connected: true,
-                last_seen: None,
-                rtt_ms: Some(5),
-                since: Some(WaitMs(0)),
-            }],
-            lapses: 0,
-            issued: WaitMs(i64::MAX),
-        });
-        let d8 = h.core.dl.mine.get_mut(&8).unwrap();
-        d8.backup = Some(5);
-        d8.group_requested = None;
-        let out = forward_with_deps(&mut h, dir, &low, 500, constellation_meta::Position::ZERO);
-        assert!(reply_to_2(&out, 500).is_none(), "{out:?}");
-        let d8 = h.core.dl.mine.get_mut(&8).unwrap();
-        d8.stream_after = Some(WaitMs(i64::MAX / 4));
-        d8.backup_after = Some(WaitMs(i64::MAX / 4));
-        let on_7 = constellation_meta::Position::ZERO.with_streams_wire(&[(7, 1)]);
-        let out = forward_with_deps(&mut h, dir, &high, 501, on_7);
-        assert!(reply_to_2(&out, 501).is_none(), "{out:?}");
-        assert!(h.core.dl.mine[&8].xdeps.is_empty(), "read already");
-        (h, dir)
-    }
-
-    /// 8's backup slot frees: what the append and its acknowledgement
-    /// bring (`None` when nothing was appended).
-    fn backup_slot_frees(h: &mut Harness) -> Option<Vec<Action>> {
-        h.core.dl.mine.get_mut(&8).unwrap().backup_after = None;
-        let mut out = Vec::new();
-        h.core.deleg_backup_stream(h.clk(), &h.meta, &mut out);
-        let breq = sends(&out).into_iter().find_map(|(to, m)| match m {
-            PeerMsg::DelegBackupAppend { req, gen: 8, .. } if to == 5 => Some(*req),
-            _ => None,
-        })?;
-        Some(h.step(Event::Peer {
-            from: 5,
-            msg: PeerMsg::DelegBackupAck {
-                req: breq,
-                gen: 8,
-                acked: 1,
-                sealed: false,
-            },
-        }))
-    }
-
-    /// Review of the acknowledgement rule, must-fix (fail-before: the
-    /// review's probe): 8:1 depends on 7:1 but is first read for a batch
-    /// after 7 ended and left this node's generations. Its dependency was
-    /// not recorded (only generations still held were), 8's backup held it
-    /// and the delegate answered it; then the stream found the lost
-    /// dependency and stopped 8 before 8:1, and the end dropped an answered
-    /// row. Now a row whose dependency is lost when it is read stops the
-    /// generation there before anything holds it, and a dependency on an
-    /// ended generation of this node whose end is not applied yet (the
-    /// table ahead of the log) waits like one on a held generation.
-    #[test]
-    fn a_row_read_after_its_dependencys_generation_left_is_never_answered() {
-        // The end applied from the log: the dependency is lost at the read.
-        let (mut h, dir) = row_unread_behind_a_busy_backup();
-        let end = [LogRecord::RecallCut {
-            dir,
-            gen: 7,
-            through: 0,
-        }];
-        Replica::apply_segment(&h.meta, 3, 1, 0, &[], &[], &end).unwrap();
-        let mut out = Vec::new();
-        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        assert!(!h.core.dl.mine.contains_key(&7));
-        let out = backup_slot_frees(&mut h);
-        assert!(out.is_none(), "8:1 appended to the backup: {out:?}");
-        assert_eq!(h.core.dl.mine[&8].lost_from, Some(1));
-        let mut out = Vec::new();
-        h.core.complete_ready(h.clk(), &h.meta, &mut out);
-        assert_eq!(reply_to_2(&out, 501), Some(&MutateOutcome::Busy), "{out:?}");
-        assert_eq!(h.core.stats.deleg_lost_after_ack, 0);
-        // The end installed ahead of the log: 7 left, its void not known.
-        let (mut h, dir) = row_unread_behind_a_busy_backup();
-        let end = [LogRecord::RecallCut {
-            dir,
-            gen: 7,
-            through: 0,
-        }];
-        h.meta.install_streamed(1, 1, 1, 1, &end).unwrap();
-        let mut out = Vec::new();
-        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        assert!(!h.core.dl.mine.contains_key(&7));
-        let out = backup_slot_frees(&mut h).expect("appended to the backup");
-        assert_eq!(
-            reply_to_2(&out, 501),
-            None,
-            "8:1 answered while 7:1 waits for 7's end: {out:?}"
-        );
-        assert_eq!(
-            h.core.dl.mine[&8]
-                .xdeps
-                .get(&7)
-                .map(|r| r.clone().into_iter().collect::<Vec<_>>()),
-            Some(vec![(1, 1)])
-        );
-        Replica::apply_segment(&h.meta, 3, 1, 1, &[1], &[], &end).unwrap();
-        let mut out = Vec::new();
-        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        h.core.complete_ready(h.clk(), &h.meta, &mut out);
-        assert_eq!(reply_to_2(&out, 501), Some(&MutateOutcome::Busy), "{out:?}");
-        assert_eq!(h.core.stats.deleg_lost_after_ack, 0);
-    }
-
-    /// The check that a generation not held here is this node's own (it
-    /// assigned stream indices in it) decides what waits: a dependency on
-    /// another node's generation that this replica holds ahead of its log
-    /// (a forward's reply raised it) waits for nothing, while one on this
-    /// node's own ended generation is recorded (the test above). One read
-    /// per generation and batch, not a query of the journal per batch.
-    #[test]
-    fn a_dependency_on_another_nodes_generation_waits_for_nothing() {
-        let (mut h, dir) = row_unread_behind_a_busy_backup();
-        // 8:1 (deps (7, 1)) is still unread; node 2's next create under 8
-        // depends on node 4's generation 99, held here ahead of the log.
-        Replica::note_stream(&h.meta, 99, 5);
-        assert_eq!(Replica::log_stream_idx(&h.meta, 99), 0);
-        assert_eq!(Replica::delegate_assigned(&h.meta, 99), Some(false));
-        assert_eq!(Replica::delegate_assigned(&h.meta, 7), Some(true));
-        let name = (0..)
-            .map(|i| format!("z{i}"))
-            .find(|n| constellation_meta::delegation::Range::of(1, n).idx == 1)
-            .unwrap();
-        let on_99 = constellation_meta::Position::ZERO.with_streams_wire(&[(99, 5)]);
-        let out = forward_with_deps(&mut h, dir, &name, 502, on_99);
-        assert!(reply_to_2(&out, 502).is_none(), "{out:?}");
-        h.core.dl.mine.get_mut(&8).unwrap().backup_after = None;
-        let mut out = Vec::new();
-        h.core.deleg_backup_stream(h.clk(), &h.meta, &mut out);
-        let xdeps = h.core.dl.mine[&8].xdeps.clone();
-        assert_eq!(
-            (
-                xdeps.get(&7).map(|r| r.keys().copied().collect::<Vec<_>>()),
-                xdeps.contains_key(&99)
-            ),
-            (Some(vec![1]), false),
-            "{xdeps:?}"
-        );
-        // 7 is held here: no read; 99 is not: one check, once.
-        assert_eq!(h.core.stats.deleg_xdeps_own_checks, 1);
-    }
-
-    /// Review follow-up (fail-before): the stream finds a row whose
-    /// dependency was lost only in a batch it reads. With a batch of
-    /// generation 8 in flight when generation 7 ends, the recall answered
-    /// the whole stream (`delegate_idx`), which the root's cursor can never
-    /// reach: the generation waited for its grant to run out. The answer
-    /// reads the journal and stops before the row.
-    #[test]
-    fn a_recall_answers_before_a_lost_dependency_the_stream_has_not_read() {
-        let (mut h, dir, low, high) = two_ranges();
-        create_in(&mut h, dir, 1, &high);
-        assert!(h.core.dl.mine[&8].inflight.is_some(), "8:1 in flight");
-        create_in(&mut h, dir, 2, &low);
-        let high2 = (0..)
-            .map(|i| format!("m{i}"))
-            .find(|n| constellation_meta::delegation::Range::of(1, n).idx == 1)
-            .unwrap();
-        create_in(&mut h, dir, 3, &high2);
-        assert_eq!(Replica::delegate_idx(&h.meta, 8), 2);
-        Replica::apply_segment(
-            &h.meta,
-            2,
-            1,
-            0,
-            &[],
-            &[],
-            &[LogRecord::RecallCut {
-                dir,
-                gen: 7,
-                through: 0,
-            }],
-        )
-        .unwrap();
-        let mut out = Vec::new();
-        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        assert!(h.core.dl.mine[&8].inflight.is_some(), "still in flight");
-        let out = h.step(Event::Peer {
-            from: 1,
-            msg: PeerMsg::DelegRecall {
-                req: OpId(77),
-                dir,
-                gen: 8,
-            },
-        });
-        let through = sends(&out).into_iter().find_map(|(_, m)| match m {
-            PeerMsg::DelegRecalled {
-                gen: 8, through, ..
-            } => Some(*through),
-            _ => None,
-        });
-        assert_eq!(through, Some(1), "{out:?}");
-        assert_eq!(h.core.dl.mine[&8].lost_from, Some(2));
     }
 
     /// Review must-fix 2 (fail-before): the root takes none of a batch (a
@@ -44141,7 +43308,6 @@ mod recall_cut {
                     node: 4,
                     gen: 8,
                     designated: false,
-                    range: (0, 0),
                 },
             ],
         )
@@ -44235,7 +43401,6 @@ mod recall_cut {
                     node: 4,
                     gen: 8,
                     designated: false,
-                    range: (0, 0),
                 },
             ],
         )
@@ -45425,162 +44590,6 @@ mod deleg_group {
         assert!(h.core.dl.mine[&7].stopped);
     }
 
-    /// This node holds two generations whose keys meet: `/d` split in two,
-    /// range of `low` delegated as generation 7 and range of `high` as 8,
-    /// both to node 3, with a file linked under both names. `low` sorts
-    /// first, so the file's primary link is `low` and its own keys are
-    /// generation 7's until that link is unlinked. Both generations renewed;
-    /// returns `(dir, file, low, high)`.
-    fn two_ranges_one_file(h: &mut Harness) -> (Ino, Ino, String, String) {
-        use constellation_meta::delegation::Range;
-        h.core.cfg.delegation = true;
-        h.core.cfg.p2p = true;
-        h.core.lease.cached_holder = Some(1);
-        let names: Vec<String> = (0..64).map(|i| format!("n{i:02}")).collect();
-        let low = names[0].clone();
-        let high = names
-            .iter()
-            .find(|n| Range::of(1, n) != Range::of(1, &low))
-            .expect("a name in the other range")
-            .clone();
-        assert!(low < high);
-        let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
-        let file = h.meta.allocate_ino(dir).unwrap();
-        let range = |n: &str| {
-            let r = Range::of(1, n);
-            (r.bits, r.idx)
-        };
-        Replica::apply_segment(
-            &h.meta,
-            1,
-            1,
-            0,
-            &[],
-            &[],
-            &[
-                LogRecord::Mkdir {
-                    parent: ROOT_INO,
-                    name: "d".into(),
-                    ino: dir,
-                    mode: 0o755,
-                    uid: 0,
-                    gid: 0,
-                    time_ns: 1,
-                },
-                LogRecord::Create {
-                    parent: dir,
-                    name: low.clone(),
-                    ino: file,
-                    mode: 0o644,
-                    uid: 0,
-                    gid: 0,
-                    time_ns: 1,
-                },
-                LogRecord::Link {
-                    ino: file,
-                    parent: dir,
-                    name: high.clone(),
-                    time_ns: 1,
-                },
-                LogRecord::Delegate {
-                    dir,
-                    node: 3,
-                    gen: 7,
-                    designated: false,
-                    range: range(&low),
-                },
-                LogRecord::Delegate {
-                    dir,
-                    node: 3,
-                    gen: 8,
-                    designated: false,
-                    range: range(&high),
-                },
-            ],
-        )
-        .unwrap();
-        let mut out = Vec::new();
-        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        for gen in [7, 8] {
-            let req = renew_req(&out, gen).expect("no renewal on install");
-            h.step(renewed(h, req, gen, 5_000));
-        }
-        (dir, file, low, high)
-    }
-
-    /// The delegate's own client's op `op` (`seq`), and its answer.
-    fn own_op(h: &mut Harness, seq: u64, op: MutateOp) -> (Rid, Option<AnswerSource>) {
-        let rid = h.rid(seq);
-        let out = h.step(Event::Submit {
-            policy: Policy::Client,
-            rid,
-            op,
-            tag: Default::default(),
-        });
-        let answer = client_answers(&out)
-            .into_iter()
-            .find(|(r, _)| *r == rid)
-            .map(|(_, source)| source);
-        (rid, answer)
-    }
-
-    /// Review follow-up of 5b6a6b1e (fail-before), closed at the source by
-    /// plan 46 M0.3 S5 (ADR-42). The gated mark is the generation's, and one
-    /// node's generations could share keys without either ending: generation
-    /// 7 journaled a `setxattr` of the file past the lead (gated, not
-    /// committed) and the unlink of its primary link, which made the file's
-    /// keys generation 8's (the primary link is the lowest name: the next
-    /// one is in 8's range); 8's first row, a `removexattr` answered `Lone`,
-    /// was then dropped with 7's open rows at the root's crash and replayed
-    /// alone, after its client was told it succeeded. Now the unlink of the
-    /// primary name of an inode with another name holds that name too
-    /// (`TouchSet::from_op_in_names`), so it is cross-subtree: the delegate
-    /// does not execute it, no key moves between two generations of one node
-    /// while both live, and the state the original test built cannot arise.
-    /// The test keeps the rule's other half: the rows before it stay one
-    /// generation's, and the unlink is no row of either.
-    #[test]
-    fn an_unlink_that_moves_a_files_keys_into_another_generation_is_not_the_delegates() {
-        use constellation_meta::RowCommit;
-        let mut h = Harness::new(3);
-        let (dir, file, low, _) = two_ranges_one_file(&mut h);
-        // A lead of one row: the first own row of a generation is `Lone`.
-        h.core.cfg.delegation_stream_rows = 1;
-        let set = |name: &str| MutateOp::SetXattr {
-            ino: file,
-            name: name.into(),
-            value: b"v".to_vec(),
-            mode: 0,
-        };
-        let (_, a) = own_op(&mut h, 1, set("user.pad"));
-        assert_eq!(a, Some(crate::AnswerSource::Sequenced(RowCommit::LONE)));
-        let (_, a) = own_op(&mut h, 2, set("user.k"));
-        assert_eq!(a, None, "past the lead: waits for the root");
-        let (_, a) = own_op(
-            &mut h,
-            3,
-            MutateOp::Unlink {
-                parent: dir,
-                name: low,
-            },
-        );
-        assert_eq!(a, None);
-        let classes = |h: &Harness, gen| -> Vec<(u64, RowCommit)> {
-            h.meta
-                .delegate_rows_for_audit(gen)
-                .unwrap()
-                .into_iter()
-                .map(|(idx, c, _)| (idx, c))
-                .collect()
-        };
-        assert_eq!(
-            classes(&h, 7),
-            vec![(1, RowCommit::LONE), (2, RowCommit::DELEG_GROUP)],
-            "the unlink is not generation 7's row"
-        );
-        assert!(classes(&h, 8).is_empty());
-    }
-
     /// The fast path's write of `name` in `dir` as the delegate's FUSE
     /// thread does it: classed under the writer lock by what the core has
     /// published ([`Meta::delegate_execute_admitted`]).
@@ -46414,7 +45423,6 @@ mod deleg_group {
                     node: 3,
                     gen: 8,
                     designated: false,
-                    range: (0, 0),
                 },
             ],
         )
@@ -47233,7 +46241,7 @@ mod deleg_group {
     fn parked_pair() -> (Harness, Harness, OpId, u64, u64, Ino) {
         let (mut d, dir, _, _) = delegate_renewed_once();
         let mut r = root_backed_by_node_2();
-        delegated_dir_to(&r.meta, 3, (0, 0), dir);
+        delegated_dir_to(&r.meta, 3, dir);
         let mut out = Vec::new();
         r.core.delegation_sync(r.clk(), &r.meta, &mut out);
         let round = round_of(&d, 7);
@@ -47510,7 +46518,7 @@ mod deleg_group {
     fn lone_parked_pair() -> (Harness, Harness, u64) {
         let (mut d, dir, _, _) = delegate_renewed_once();
         let mut r = lone_singleton_root();
-        delegated_dir_to(&r.meta, 3, (0, 0), dir);
+        delegated_dir_to(&r.meta, 3, dir);
         let mut out = Vec::new();
         r.core.delegation_sync(r.clk(), &r.meta, &mut out);
         let round = round_of(&d, 7);
@@ -48330,7 +47338,6 @@ mod designee_stream {
                     node: 3,
                     gen: 7,
                     designated: true,
-                    range: (0, 0),
                 },
             ],
         )
@@ -49617,7 +48624,6 @@ mod deleg_windows_tests {
                     node: 3,
                     gen: 8,
                     designated: false,
-                    range: (0, 0),
                 },
             ],
         )
@@ -53816,7 +52822,6 @@ mod deleg_root_read {
                     node: 2,
                     gen: 1,
                     designated: false,
-                    range: (0, 0),
                 },
             ],
         )
@@ -55768,7 +54773,6 @@ mod c2g_settle {
                     node,
                     gen: 8,
                     designated: false,
-                    range: (0, 0),
                 },
             ],
         )
@@ -55912,7 +54916,6 @@ mod c2g_settle {
                 node: 1,
                 gen: 8,
                 designated: false,
-                range: (0, 0),
             }],
         )
         .unwrap();

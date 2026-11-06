@@ -19,7 +19,6 @@ fn a_rebuild_onto_a_table_with_a_live_delegation_turns_the_fast_path_check_on() 
             node: 4,
             gen: (1 << 32) | 1,
             designated: false,
-            range: (0, 0),
         }],
         &TouchSet::default(),
     )

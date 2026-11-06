@@ -172,7 +172,7 @@ impl MutateOp {
     }
 
     pub fn from_postcard(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        postcard::from_bytes(bytes)
+        crate::record::from_bytes_exact(bytes)
     }
 }
 
@@ -417,7 +417,7 @@ impl MutateOutcome {
     }
 
     pub fn from_postcard(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        postcard::from_bytes(bytes)
+        crate::record::from_bytes_exact(bytes)
     }
 }
 

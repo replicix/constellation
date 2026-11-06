@@ -453,8 +453,6 @@ pub enum SyncRequest {
     Delegate {
         dir: Ino,
         node: u64,
-        /// Plan 30 §M12: `(bits, idx)`; `(0, 0)` is the whole directory.
-        range: (u8, u32),
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     Undelegate {

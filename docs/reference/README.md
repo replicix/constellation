@@ -7,7 +7,7 @@ Technical descriptions of how specific parts of Constellation work.
 - [P2P relays](features/p2p-relays.md) — relay modes, env vars, trust model, status fields
 - [Forwarded mutations](features/forwarded-mutations.md) — wire protocol, exactly-once rids, speculation and stranded-op recovery, the S3 inbox, status
 - [Lease placement](features/lease-placement.md) — subtree placement by dominant writer, root-lease weighted-medoid cost, thresholds, placement status
-- [Delegations](features/delegations.md) — delegated sub-sequencers over one log: ownership, recall, placement, hash-range splits of hot directories
+- [Delegations](features/delegations.md) — delegated sub-sequencers over one log: ownership, recall, placement
 - [Close-to-open modes](features/cto-modes.md) — positions and session guarantees, direct log streams, `--cto bounded|strict`, ReadIndex and read delegations
 - [Kernel cache coherence](features/kernel-cache-coherence.md) — what the Linux kernel caches for a mount, keep-cache across opens, the workarounds for three FUSE client races and their settings, what `status` reports
 - [Durability and failover](features/durability-and-failover.md) — acknowledgement layers, backups chosen by RTT, seal-based failover, `ack=s3`, `--fsync-mode`/`--write-mode`, flexible continuation epochs

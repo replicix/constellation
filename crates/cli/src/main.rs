@@ -413,10 +413,6 @@ enum Command {
         /// The delegate's node id.
         #[arg(long)]
         to: u64,
-        /// Plan 30 §M12: one name-hash range of the directory,
-        /// `<idx>/<count>` (count 2, 4, 8 or 16), instead of the whole.
-        #[arg(long)]
-        range: Option<String>,
     },
     /// Plan 30 §M11: recall the delegation on a directory.
     Undelegate {
@@ -1863,18 +1859,13 @@ fn run() -> Result<()> {
             target,
             state_dir,
             to,
-            range,
         } => {
             let (t, dir) = resolve_target(&target, state_dir)?;
             let path = target::effective_path(&t);
             ctl::<cm::DesignationDelegate>(
                 &rt,
                 &dir,
-                api::DelegateParams {
-                    path,
-                    node: to,
-                    range,
-                },
+                api::DelegateParams { path, node: to },
                 print_ack,
             )
         }

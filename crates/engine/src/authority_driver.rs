@@ -750,8 +750,7 @@ pub fn load_config(
     // Plan 30 §M11 phase 2b: the placement's knobs.
     // Plan 30 §M12: on by default (a dominant writer's subtree moves to
     // it); `CONSTELLATION_DELEGATION_PLACEMENT=off` pins the single
-    // sequencer. A hot shared directory splits into hash ranges only with
-    // `CONSTELLATION_DELEGATION_SPLIT` set (off by default, ADR-38).
+    // sequencer.
     c.placement = c.delegation
         && !matches!(
             std::env::var("CONSTELLATION_DELEGATION_PLACEMENT")
@@ -761,12 +760,10 @@ pub fn load_config(
                 .as_str(),
             "0" | "off" | "false"
         );
-    // `0` is a value for the four share/rate knobs: SPLIT=0 turns hash
-    // range splits off, LEAVE=0 never recalls a placed delegation for
-    // its share (only for its rate), DOMINANCE=0 gives a subtree to its
-    // top writer whatever its share, MIN_OPS=0 drops the rate floor.
-    c.placement_split_pct =
-        env_u64_zero_ok("CONSTELLATION_DELEGATION_SPLIT", c.placement_split_pct).min(100);
+    // `0` is a value for the three share/rate knobs: LEAVE=0 never recalls a
+    // placed delegation for its share (only for its rate), DOMINANCE=0 gives
+    // a subtree to its top writer whatever its share, MIN_OPS=0 drops the
+    // rate floor.
     c.placement_window_ms = env_ms("CONSTELLATION_DELEGATION_WINDOW_MS", c.placement_window_ms);
     c.placement_min_ops = env_u64_zero_ok("CONSTELLATION_DELEGATION_MIN_OPS", c.placement_min_ops);
     c.placement_dominance_pct = env_u64_zero_ok(
@@ -1002,7 +999,7 @@ const STUCK_JOB: Duration = Duration::from_secs(20);
 /// most [`DELEG_ROWS_ALWAYS`] generations, and at most this often beyond.
 /// A root keeps an ended generation for as long as its delegate may take
 /// it for live (`Core::deleg_forget_ended`): after a burst of recalls (1,900
-/// in 15 s, a split directory's cross-range renames) the rows, rebuilt
+/// in 15 s, a directory's cross-subtree renames) the rows, rebuilt
 /// after every step, were 70 % of the root's core for that long.
 const DELEG_ROWS_EVERY: Duration = Duration::from_millis(100);
 /// See [`DELEG_ROWS_EVERY`].
@@ -1604,7 +1601,7 @@ fn sealed_tail_event(
     through: u64,
     next: Option<u64>,
 ) -> Event {
-    let txs = match postcard::from_bytes(txs) {
+    let txs = match constellation_meta::from_bytes_exact(txs) {
         Ok(txs) => txs,
         // A refusal (`held: false`) carries no tail: its rows are never read,
         // and a member whose sync is down answers with no bytes at all.
@@ -1645,7 +1642,7 @@ fn sealed_tail_event(
 /// empty tail: the root would end the generation without the rows
 /// acknowledged through that backup (I1).
 fn deleg_sealed_event(to: NodeId, req: OpId, gen: u64, sealed: bool, txs: &[u8]) -> Event {
-    let txs = match postcard::from_bytes(txs) {
+    let txs = match constellation_meta::from_bytes_exact(txs) {
         Ok(txs) => txs,
         // An unsealed answer carries no tail (a backup whose sync is down
         // answers with no bytes at all).
@@ -3830,15 +3827,9 @@ impl Driver {
             SyncRequest::SyncDesignations { entries } => {
                 control(Control::SyncDesignations { entries }, ControlReply::None)
             }
-            SyncRequest::Delegate {
-                dir,
-                node,
-                range,
-                reply,
-            } => control(
-                Control::Delegate { dir, node, range },
-                ControlReply::Text(reply),
-            ),
+            SyncRequest::Delegate { dir, node, reply } => {
+                control(Control::Delegate { dir, node }, ControlReply::Text(reply))
+            }
             SyncRequest::Undelegate { dir, reply } => {
                 control(Control::Undelegate { dir }, ControlReply::Text(reply))
             }

@@ -2071,7 +2071,6 @@ mod tests {
                         node: 4,
                         gen: g,
                         designated: false,
-                        range: (0, 0),
                     },
                     LogRecord::RecallCut {
                         dir: ROOT_INO,

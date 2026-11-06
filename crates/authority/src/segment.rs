@@ -87,7 +87,7 @@ pub fn encode(
 }
 
 pub fn decode(payload: &[u8]) -> Result<Segment, SegmentError> {
-    let env: SegmentEnvelope = postcard::from_bytes(payload)?;
+    let env: SegmentEnvelope = constellation_meta::from_bytes_exact(payload)?;
     if env.v != SEGMENT_VERSION {
         return Err(SegmentError::Version(env.v));
     }
@@ -105,6 +105,28 @@ pub fn decode(payload: &[u8]) -> Result<Segment, SegmentError> {
 mod tests {
     use super::*;
     use constellation_meta::Rid;
+
+    /// M1.2 step 1: a segment carrying a `Delegate` record of the old shape
+    /// (two trailing range bytes) is refused, as is one with trailing bytes.
+    #[test]
+    fn old_shape_delegate_in_a_segment_is_refused() {
+        let rec = LogRecord::Delegate {
+            dir: 7,
+            node: 2,
+            gen: 5,
+            designated: false,
+        };
+        let bytes = encode(5, 3, 17, &[16], &[(0, 0)], std::slice::from_ref(&rec)).unwrap();
+        assert!(decode(&bytes).is_ok());
+        let rb = rec.to_postcard().unwrap();
+        let at = bytes.windows(rb.len()).position(|w| w == rb).unwrap() + rb.len();
+        let mut old = bytes.clone();
+        old.splice(at..at, [0, 0]);
+        assert!(decode(&old).is_err());
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(decode(&trailing).is_err());
+    }
 
     #[test]
     fn round_trips_and_matches_the_shipper_encoding() {

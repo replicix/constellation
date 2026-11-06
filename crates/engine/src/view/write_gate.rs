@@ -585,8 +585,8 @@ impl View {
         // forwards it to the delegate or recalls the grant first. The
         // check and the execution hold the delegation gate shared, so no
         // grant is journaled between them (`Meta::deleg_gate`; before it,
-        // the root executed its own creates and unlinks in a split
-        // directory behind the range's delegate: two winners under
+        // the root executed its own creates and unlinks in a delegated
+        // directory behind the delegate: two winners under
         // harness `chaos-soak-4`). Placement counts these executions
         // too (`note_fast_path`), or the root's share of a directory is
         // invisible to it.

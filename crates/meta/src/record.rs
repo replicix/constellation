@@ -229,11 +229,6 @@ pub enum LogRecord {
         /// never recalled by TTL or placement, only by `online`; a
         /// cross-subtree op touching it is refused (`EXDEV`).
         designated: bool,
-        /// Plan 30 §M12: the name-hash range of `dir` this generation
-        /// owns (`(0, 0)`: the whole directory and its subtree; `(b,
-        /// i)`: the names whose hash's top `b` bits are `i`, in `dir`
-        /// itself only — GIGA+).
-        range: (u8, u32),
     },
     /// Plan 30 §M11: generation `gen` of the delegation on `dir` ended.
     /// Every record of its stream that is not before this one in the log
@@ -446,6 +441,20 @@ impl LogRecord {
     }
 }
 
+/// Decode a whole value from `bytes`, refusing leftover bytes. A file
+/// system written before plan 46 M1.2 step 1 (whose `Delegate` record and
+/// delegation row carried a range) must be reformatted; this makes a record
+/// or row of the old shape fail loudly where it is detectable, instead of
+/// decoding into the wrong op with its tail ignored.
+pub fn from_bytes_exact<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, postcard::Error> {
+    let (value, rest) = postcard::take_from_bytes(bytes)?;
+    if rest.is_empty() {
+        Ok(value)
+    } else {
+        Err(postcard::Error::SerdeDeCustom)
+    }
+}
+
 impl LogRecord {
     /// Encode for the local journal BLOB and for S3 segment payloads.
     pub fn to_postcard(&self) -> Result<Vec<u8>, postcard::Error> {
@@ -454,13 +463,56 @@ impl LogRecord {
 
     /// Decode a journal / segment record.
     pub fn from_postcard(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        postcard::from_bytes(bytes)
+        from_bytes_exact(bytes)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `Delegate` record as written before plan 46 M1.2 step 1: the new
+    /// shape followed by the removed whole-range `(bits, idx)` bytes.
+    fn old_delegate() -> (LogRecord, Vec<u8>, Vec<u8>) {
+        let new = LogRecord::Delegate {
+            dir: 7,
+            node: 2,
+            gen: 5,
+            designated: false,
+        };
+        let new_bytes = new.to_postcard().unwrap();
+        let mut old_bytes = new_bytes.clone();
+        old_bytes.extend_from_slice(&[0, 0]);
+        (new, new_bytes, old_bytes)
+    }
+
+    /// M1.2 step 1: a file system written before it is reformatted; a
+    /// decoder refuses leftover bytes, so an old `Delegate` record fails
+    /// loudly instead of decoding with its range bytes ignored.
+    #[test]
+    fn old_shape_delegate_record_is_refused() {
+        let (new, new_bytes, old_bytes) = old_delegate();
+        assert_eq!(LogRecord::from_postcard(&new_bytes).unwrap(), new);
+        assert!(LogRecord::from_postcard(&old_bytes).is_err());
+        // Inside a backup transaction (a journal row's records): the old
+        // record shifts the rest of the stream, which must not decode.
+        let tx = crate::store::backup::BackupTx {
+            first: 1,
+            last: 1,
+            records: vec![new],
+            origin: (0, 0),
+        };
+        let tx_bytes = postcard::to_allocvec(&tx).unwrap();
+        assert_eq!(from_bytes_exact::<crate::store::backup::BackupTx>(&tx_bytes).unwrap(), tx);
+        let at = tx_bytes
+            .windows(new_bytes.len())
+            .position(|w| w == new_bytes)
+            .unwrap()
+            + new_bytes.len();
+        let mut old_tx = tx_bytes.clone();
+        old_tx.splice(at..at, [0, 0]);
+        assert!(from_bytes_exact::<crate::store::backup::BackupTx>(&old_tx).is_err());
+    }
 
     #[test]
     fn postcard_roundtrip() {

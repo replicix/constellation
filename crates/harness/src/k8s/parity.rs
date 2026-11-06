@@ -575,10 +575,6 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ),
     ("root-failover-with-delegates", Skip::Local(&[KILL, NODES4])),
     ("delegate-crash-backup", Skip::Local(&[KILL, NODES3])),
-    (
-        "two-gens-ack-cost",
-        Skip::Local(&[NODES3, "compares against a binary without the rule (CONSTELLATION_BIN)"]),
-    ),
     ("delegate-root-loss", Skip::Local(&[KILL])),
     ("delegate-root-blackhole", Skip::Local(&[STOP])),
     (
@@ -618,11 +614,6 @@ pub const SKIPPED: &[(&str, Skip)] = &[
         Skip::Local(&[NODES3, "takes a subtree offline (`offline /site`) through a local client"]),
     ),
     ("shared-dir-multi-writer", Skip::Local(&[NODES4, COUNT])),
-    (
-        "hash-range-split-merge",
-        Skip::Local(&[NODES4, "tunes automatic delegation (CONSTELLATION_DELEGATION_*)"]),
-    ),
-    ("cross-range-rename", Skip::Local(&[NODES3])),
     ("inbox-create-storm-p2p-off", Skip::Local(&[P2P_OFF, NODES3])),
     ("dedup-write-storm", Skip::Local(&[P2P_OFF, WRITE_MODE])),
     ("inbox-sporadic-write-p2p-off", Skip::Local(&[P2P_OFF, NODES3])),

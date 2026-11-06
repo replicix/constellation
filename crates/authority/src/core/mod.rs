@@ -492,13 +492,6 @@ pub struct Config {
     /// for a dwell, the placement recalls it.
     pub placement_dominance_pct: u64,
     pub placement_leave_pct: u64,
-    /// Plan 30 §M12: a hot directory several nodes each write at least
-    /// this share of (and none dominates) is split into name-hash
-    /// ranges delegated to them (GIGA+). 0, the default, turns automatic
-    /// splitting off: on real names a split ran at 0.01 to 0.91 times the
-    /// throughput of none (ADR-38, `bench/dirsplit/RESULTS.md`); 20 is
-    /// the value the expert setting was tuned with.
-    pub placement_split_pct: u64,
     /// `CONSTELLATION_DELEGATION_DWELL_MS` (60 s) and
     /// `CONSTELLATION_DELEGATION_COOLDOWN_MS` (30 s).
     pub placement_dwell_ms: u64,
@@ -785,7 +778,6 @@ impl Config {
             placement_min_ops: 200,
             placement_dominance_pct: 70,
             placement_leave_pct: 50,
-            placement_split_pct: 0,
             placement_dwell_ms: 60_000,
             placement_cooldown_ms: 30_000,
         }
@@ -1318,11 +1310,6 @@ pub struct Stats {
     pub place_recalled: u64,
     pub place_skipped_cooldown: u64,
     pub place_skipped_unreachable: u64,
-    /// Plan 30 §M12: directories split into ranges, and range
-    /// generations recalled (a directory whose every range was recalled
-    /// is merged back).
-    pub place_splits: u64,
-    pub place_range_recalls: u64,
     /// Delegate: ReadIndex answered for its subtree, read grants given.
     pub deleg_read_index_served: u64,
     pub deleg_read_grants: u64,
@@ -3505,12 +3492,8 @@ impl Core {
                     result: Ok(ControlOk::Done),
                 });
             }
-            Control::Delegate { dir, node, range } => {
-                let range = constellation_meta::delegation::Range {
-                    bits: range.0,
-                    idx: range.1,
-                };
-                self.on_control_delegate(now, op, dir, node, range, replica, out)
+            Control::Delegate { dir, node } => {
+                self.on_control_delegate(now, op, dir, node, replica, out)
             }
             Control::Undelegate { dir } => self.on_control_undelegate(now, op, dir, replica, out),
             Control::Retire => {

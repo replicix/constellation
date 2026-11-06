@@ -7,10 +7,12 @@ Per (cell, workload, configuration): the median over the repetitions,
 and the spread (min-max) of total throughput; op latency p50/p90/p99 (the
 median of each repetition's percentile); per-node throughput (median of
 the repetitions' slowest and fastest writer); root CPU; S3 PUT and GET
-per second over every node; errors; how often a split fired (b) or the
-placement delegated the directory whole (a, b); whether every phase
-converged. Then the c/a ratio per cell and workload with its spread over
-the repetitions (each repetition's c over the same repetition's a).
+per second over every node; errors; how often the placement delegated the
+directory whole (a); whether every phase converged. Then the d/a ratio
+per cell and workload with its spread over the repetitions (each
+repetition's d over the same repetition's a). Phases of the deleted
+configurations b and c and of the `own` workload (old result files) are
+skipped.
 """
 import json
 import os
@@ -20,12 +22,10 @@ import sys
 from collections import defaultdict
 
 CONFIG_NAMES = {
-    "a": "a splits off",
-    "b": "b automatic",
-    "c": "c hand split",
+    "a": "a placement",
     "d": "d whole to w0",
 }
-WORKLOADS = ["uniform", "mix", "rename", "own"]
+WORKLOADS = ["uniform", "mix", "rename"]
 
 
 def load(paths):
@@ -112,30 +112,30 @@ def main():
     print("Throughput is ops/s over all writers (median of the repetitions, "
           "min-max in brackets); node lo/hi the slowest and fastest writer's ops/s; "
           "latencies in ms; S3 requests per second over every node; "
-          "`split` how many repetitions' b phase split the directory, `whole` how many "
-          "a/b phases ran with the placement's whole-directory delegation in place.\n")
+          "`whole` how many "
+          "a phases ran with the placement's whole-directory delegation in place.\n")
     for label in labels:
         print(f"### {label}\n")
-        print("| workload | config | n | ops/s [min-max] | node lo/hi | p50 | p90 | p99 | root CPU % | S3 PUT/s | S3 GET/s | errors | split | whole | converged |")
-        print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        print("| workload | config | n | ops/s [min-max] | node lo/hi | p50 | p90 | p99 | root CPU % | S3 PUT/s | S3 GET/s | errors | whole | converged |")
+        print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for wl in WORKLOADS:
-            for cfg in "abcd":
+            for cfg in "ad":
                 s = by.get((label, wl, cfg))
                 if not s:
                     continue
-                print(f"| {wl}{' (synthetic)' if wl == 'own' else ''} | {CONFIG_NAMES[cfg]} | {s['n']} | "
+                print(f"| {wl} | {CONFIG_NAMES[cfg]} | {s['n']} | "
                       f"{fmt(s['ops'])} [{fmt(s['ops_min'])}-{fmt(s['ops_max'])}] | "
                       f"{fmt(s['node_min'])}/{fmt(s['node_max'])} | {lat(s['p50'])} | {lat(s['p90'])} | {lat(s['p99'])} | "
                       f"{fmt(s['root_cpu'])} | {fmt(s['s3put'], 1)} | {fmt(s['s3get'], 1)} | {s['errors']} | "
-                      f"{s['split_fired'] if cfg == 'b' else '-'} | {s['placed_whole'] if cfg in 'ab' else '-'} | "
+                      f"{s['placed_whole'] if cfg == 'a' else '-'} | "
                       f"{'yes' if s['converged'] else 'NO'} |")
         print()
-    print("## c against a\n")
-    print("Each repetition's hand-split throughput over the same repetition's splits-off "
-          "throughput: median [min-max]; above 1 the split is faster. p50 ratio likewise "
-          "(below 1 the split is faster).\n")
-    print("| cell | workload | c/a ops/s | c/a p50 | d/a ops/s | b/a ops/s |")
-    print("|---|---|---|---|---|---|")
+    print("## d against a\n")
+    print("Each repetition's whole-delegation throughput over the same repetition's "
+          "placement throughput: median [min-max]; above 1 the delegation is faster. p50 "
+          "ratio likewise (below 1 it is faster).\n")
+    print("| cell | workload | d/a ops/s | d/a p50 |")
+    print("|---|---|---|---|")
     for label in labels:
         for wl in WORKLOADS:
             a = by.get((label, wl, "a"))
@@ -150,7 +150,7 @@ def main():
                 if not rs:
                     return "-"
                 return f"{statistics.median(rs):.2f} [{min(rs):.2f}-{max(rs):.2f}]"
-            print(f"| {label} | {wl}{' (synthetic)' if wl == 'own' else ''} | {ratio('c')} | {ratio('c', 'p50_by_rep')} | {ratio('d')} | {ratio('b')} |")
+            print(f"| {label} | {wl} | {ratio('d')} | {ratio('d', 'p50_by_rep')} |")
     if failed:
         print("\n## Failed phases\n")
         for r in failed:

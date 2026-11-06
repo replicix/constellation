@@ -1546,7 +1546,6 @@ fn delegate_fs(
             node: 1,
             gen: DELEG_GEN,
             designated: false,
-            range: (0, 0),
         },
     ])
     .unwrap();

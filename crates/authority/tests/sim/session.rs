@@ -73,9 +73,7 @@
 //! an effect, or to keep seeing it. A read whose session wait timed out
 //! answered degraded by design; its violations are counted separately.
 
-use super::history::{
-    dir_of, range_idx_of, witness_order, HistEvt, JournalOrder, NsOp, NsRet, ReadEvt,
-};
+use super::history::{dir_of, witness_order, HistEvt, JournalOrder, NsOp, NsRet, ReadEvt};
 use constellation_meta::Rid;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -113,8 +111,7 @@ fn names_of(op: &NsOp) -> Vec<&str> {
 /// Which successes bind a refusal that has no `Refused` row in the log
 /// (the fallback window): the whole namespace with one sequencer; under
 /// delegation, keys of different owners are ordered independently, so only
-/// successes on a name of the same directory (of the same hash range, when
-/// ranges are checked). That is the projection the linearizability check
+/// successes on a name of the same directory. That is the projection the linearizability check
 /// uses, which loses nothing there because linearizability is local; for a
 /// refusal's window it is only a lower bound on what the sequencer
 /// ordered, since one sequencer can own several directories (the root's
@@ -125,7 +122,6 @@ fn names_of(op: &NsOp) -> Vec<&str> {
 pub enum Scope {
     Global,
     Dir,
-    Range(u8),
 }
 
 impl Scope {
@@ -133,9 +129,6 @@ impl Scope {
         match self {
             Scope::Global => true,
             Scope::Dir => dir_of(a) == dir_of(b),
-            Scope::Range(bits) => {
-                dir_of(a) == dir_of(b) && range_idx_of(bits, a) == range_idx_of(bits, b)
-            }
         }
     }
 }
@@ -1026,7 +1019,7 @@ mod tests {
         // (c) The 4125 shape: the row precedes the other owner's
         // late-appended success (and the create): state 0, then the read
         // sees `d1/f` present at state 1. Accepted in every scope.
-        for scope in [Scope::Global, Scope::Dir, Scope::Range(1)] {
+        for scope in [Scope::Global, Scope::Dir] {
             let r = check_sessions(
                 &events,
                 &ticks,
@@ -1047,7 +1040,7 @@ mod tests {
         // unlink (state 3: absent): the read of `d1/f` present is stale,
         // in every scope; `d2/x` is another directory but sits before the
         // row.
-        for scope in [Scope::Global, Scope::Dir, Scope::Range(1)] {
+        for scope in [Scope::Global, Scope::Dir] {
             let r = check_sessions(
                 &events,
                 &ticks,
@@ -1135,7 +1128,7 @@ mod tests {
             Scope::Dir,
         );
         assert!(r.violations.is_empty(), "{r:?}");
-        for scope in [Scope::Global, Scope::Dir, Scope::Range(1)] {
+        for scope in [Scope::Global, Scope::Dir] {
             let r = check_sessions(
                 &events,
                 &ticks,
@@ -1209,7 +1202,7 @@ mod tests {
         let none = HashSet::new();
         let present = vec![read(2, "d2/f", true, 8, 9)];
         let absent = vec![read(2, "d2/f", false, 8, 9)];
-        for scope in [Scope::Global, Scope::Dir, Scope::Range(1)] {
+        for scope in [Scope::Global, Scope::Dir] {
             let r = check_sessions(
                 &events,
                 &ticks,
@@ -1392,7 +1385,8 @@ mod tests {
         let none = HashSet::new();
         let no_rows = HashMap::new();
         let bad = vec![read(2, "d2/b", true, 4, 5), read(2, "d2/a", false, 8, 9)];
-        for scope in [Scope::Dir, Scope::Range(1)] {
+        {
+            let scope = Scope::Dir;
             let r = check_sessions(
                 &events,
                 &ticks,
@@ -1430,7 +1424,7 @@ mod tests {
             read(2, "d2/b", true, 4, 5),
             read(2, "d2/a", true, 8, 9),
         ];
-        for scope in [Scope::Global, Scope::Dir, Scope::Range(1)] {
+        for scope in [Scope::Global, Scope::Dir] {
             let r = check_sessions(
                 &events,
                 &ticks,
@@ -1494,7 +1488,8 @@ mod tests {
             .collect();
         let none = HashSet::new();
         let no_rows = HashMap::new();
-        for scope in [Scope::Dir, Scope::Range(1)] {
+        {
+            let scope = Scope::Dir;
             let r = check_sessions(
                 &events,
                 &ticks,
@@ -1723,7 +1718,7 @@ mod tests {
             read(2, "d3/y", false, 18, 19),
         ];
         let root: SequencerOf = log.keys().map(|r| (*r, (1, 1, 0))).collect();
-        for scope in [Scope::Global, Scope::Dir, Scope::Range(1)] {
+        for scope in [Scope::Global, Scope::Dir] {
             let r = check_sessions(
                 &events,
                 &ticks,
@@ -1743,7 +1738,8 @@ mod tests {
         // not a cut under `Dir` and `Range`, the leniency stays closed.
         let mut other = root.clone();
         other.insert(rid(1, 1), (1, 1, 7));
-        for scope in [Scope::Dir, Scope::Range(1)] {
+        {
+            let scope = Scope::Dir;
             let r = check_sessions(
                 &events,
                 &ticks,

@@ -1090,7 +1090,7 @@ pub(crate) fn conflict_count(
     let mut n = 0u64;
     for guard in r.iter(reintegration) {
         let (_, v) = guard.into_inner()?;
-        let row: ReintegrationRow = postcard::from_bytes(&v)?;
+        let row: ReintegrationRow = crate::record::from_bytes_exact(&v)?;
         if row.disposition == "conflict" {
             n += 1;
         }

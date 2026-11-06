@@ -290,6 +290,11 @@
 //! | `DeliverForwardRequest` reply position (`Positions`) | `Core::on_mutate_request` → `PeerMsg::MutateReply { position, base }` (M5's `reply_base` generalized; `positions::reply_position`) |
 //! | `DeliverForwardReply` → `Phase::AwaitingLog` (`Positions`) | `Core::on_mutate_reply`'s stale-base branch → `ClientPhase::AwaitingLog`, answered by `answer_awaiting_log` (`positions::on_tailed`) |
 //!
+//! TODO(plan 46 M1.2): the shared-parent hold of an op (`TouchSet::shared`,
+//! which `Delegations::resolve_ownership` counts toward the covering
+//! delegation) is unmodeled: the hotdir model that exercised it was
+//! deleted with the hash-range splits, and no other model replaces it.
+//!
 //! ## Action → code mapping, `node_stream` (plan 46 M1.0 chunk 11)
 //!
 //! Product paths are under `crates/authority/src/core/` (`delegate.rs`,
@@ -476,7 +481,6 @@ pub mod clk;
 pub mod cto;
 pub mod delegation;
 pub mod flex;
-pub mod hotdir;
 pub mod inbox;
 pub mod locks;
 pub mod namespace;

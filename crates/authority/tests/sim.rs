@@ -363,7 +363,6 @@ fn replay_seed() {
         Ok("delegated-root-crash") => delegated_root_crash_config(),
         Ok("delegated-root-gone") => delegated_root_gone_config(),
         Ok("delegated-delegate-restart") => delegated_delegate_restart_config(),
-        Ok("delegated-two-gens-root-crash") => delegated_two_gens_root_crash_config(),
         Ok("delegated-backup") => delegated_backup_config(),
         Ok("delegated-no-backup-root-near") => delegated_no_backup_root_near_config(),
         Ok("tloss-two-node") => tloss_two_node_config(),
@@ -373,20 +372,13 @@ fn replay_seed() {
         }
         Ok("delegated-group-switch") => delegated_group_switch_config(),
         Ok("delegated-backup-crash") => delegated_backup_crash_config(),
-        Ok("delegated-two-gens-one-backed") => delegated_two_gens_one_backed_config(),
         Ok("delegated-two-dirs-one-backed") => delegated_two_dirs_one_backed_config(),
-        Ok("delegated-two-gens-backed") => delegated_two_gens_backed_config(),
-        Ok("delegated-two-gens-backlog") => delegated_two_gens_backlog_config(),
         Ok("delegated-designated") => delegated_designated_config(),
         Ok("delegated-placement") => delegated_placement_config(),
         Ok("delegated-strict") => delegated_strict_config(),
         Ok("shared-dir") => shared_dir_config(),
-        Ok("shared-dir-split") => shared_dir_split_config(),
-        Ok("shared-dir-default") => shared_dir_default_config(),
-        Ok("shared-dir-fast-path") => shared_dir_fast_path_config(),
-        Ok("shared-dir-fast-path-unchecked") => shared_dir_fast_path_unchecked_config(),
-        Ok("shared-dir-ranges") => shared_dir_ranges_config(),
-        Ok("shared-dir-faults") => shared_dir_faults_config(),
+        Ok("delegated-fast-path") => delegated_fast_path_config(),
+        Ok("delegated-fast-path-unchecked") => delegated_fast_path_unchecked_config(),
         Ok("long-delegated") => long_delegated_config(),
         Ok("long-delegated-backup") => long_delegated_backup_config(),
         Ok("long-delegated-lead") => long_delegated_lead_config(),
@@ -4544,7 +4536,6 @@ fn placement_hot_config() -> SimConfig {
         ops_per_client: 16,
         dirs: vec!["d1".into(), "d2".into()],
         cross_ratio: 0.3,
-        check_range_bits: 2,
         read_ratio: 0.3,
         core: std::sync::Arc::new(sim::run::placement_backup_core_config),
         ..backup_hot_config()
@@ -4594,8 +4585,11 @@ fn regression_a_delegate_taking_the_root_over_re_appends_its_rows() {
     let mut reappended = 0;
     // (The root's acknowledgement of a delegate's batch carries only what its
     // own tenure committed, plan 43 Q16, ADR-41; that moved the three
-    // trajectories off the takeover that re-appends. 39 re-appends one row.)
-    for seed in [15, 311, 590, 39] {
+    // trajectories off the takeover that re-appends. Plan 46 D5 deleted the
+    // placement's hash-range splits, which moved the trajectories again:
+    // seeds 15, 311, 590 and 39 no longer re-append; 746 re-appends one row
+    // and 879 five.)
+    for seed in [746, 879] {
         let report = run_seed(seed, placement_hot_config()).unwrap_or_else(|e| {
             panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=placement-hot")
         });
@@ -5674,15 +5668,7 @@ fn sweep_config() {
         "delegated-lone-s3-cut" => delegated_lone_s3_cut_config(),
         "delegated-root-crash" => delegated_root_crash_config(),
         "shared-dir" => shared_dir_config(),
-        "shared-dir-split" => shared_dir_split_config(),
-        "shared-dir-default" => shared_dir_default_config(),
-        "shared-dir-ranges" => shared_dir_ranges_config(),
-        "shared-dir-faults" => shared_dir_faults_config(),
-        "delegated-two-gens-root-crash" => delegated_two_gens_root_crash_config(),
-        "delegated-two-gens-one-backed" => delegated_two_gens_one_backed_config(),
         "delegated-two-dirs-one-backed" => delegated_two_dirs_one_backed_config(),
-        "delegated-two-gens-backed" => delegated_two_gens_backed_config(),
-        "delegated-two-gens-backlog" => delegated_two_gens_backlog_config(),
         "delegated-root-gone" => delegated_root_gone_config(),
         "delegated-delegate-restart" => delegated_delegate_restart_config(),
         "long-delegated-backup" => long_delegated_backup_config(),
@@ -6525,6 +6511,58 @@ fn delegated_config() -> SimConfig {
     }
 }
 
+/// Plan 46 M1.2 step 1: the delegated workload with the daemon's FUSE fast
+/// path modelled: the root executes its own ops outside the core, admitted
+/// by `Meta::root_fast_path`, which must refuse an op in a whole
+/// delegation's subtree (it is the delegate's to sequence).
+fn delegated_fast_path_config() -> SimConfig {
+    SimConfig {
+        fast_path: sim::run::FastPath::Checked,
+        ops_per_client: 12,
+        cross_ratio: 0.5,
+        ..delegated_config()
+    }
+}
+
+/// The same with the admission skipped: the negative control. The root
+/// executes names the log gave to a delegate; the oracle must catch it.
+fn delegated_fast_path_unchecked_config() -> SimConfig {
+    SimConfig {
+        fast_path: sim::run::FastPath::Unchecked,
+        ..delegated_fast_path_config()
+    }
+}
+
+/// Plan 46 M1.2 step 1: the root's fast path executes what the root owns
+/// and leaves a whole delegation's subtree to its delegate.
+#[test]
+fn delegated_fast_path_respects_whole_delegations() {
+    let t = run_m11(
+        "delegated-fast-path",
+        delegated_fast_path_config(),
+        78_000..78_020,
+    );
+    assert!(t.executed > 0, "delegates never executed: {t:?}");
+    assert!(
+        t.fast_path_executed > 0,
+        "the fast path never executed: {t:?}"
+    );
+}
+
+/// Without the admission the root's fast path executes inside a delegated
+/// subtree: two sequencers for one name. The checker must catch it.
+#[test]
+fn delegated_unchecked_fast_path_is_caught() {
+    let mut caught = 0;
+    for seed in 78_000..78_040 {
+        if let Err(e) = run_seed(seed, delegated_fast_path_unchecked_config()) {
+            eprintln!("seed {seed}: {}", e.lines().next().unwrap_or(""));
+            caught += 1;
+        }
+    }
+    assert!(caught > 0, "the unchecked fast path was never caught");
+}
+
 /// Plan 46 M1.1 step 1: a lone root (no backup), a delegate and an S3 cut
 /// together. The root's commit rises only when it ships (its journal is no
 /// second copy), so with the root cut from S3 the archive does not come
@@ -6697,33 +6735,6 @@ fn delegated_delegate_restart_config() -> SimConfig {
     }
 }
 
-/// `git-under-flock-faults` fault #14: one delegate holds two
-/// generations (all of `d1`, half of `d2`'s names: a node holds one
-/// whole delegation, the harness's delegate held a whole directory and
-/// a range of `/`) and its marker writer
-/// alternates between them, so each generation's transactions depend
-/// on the other's; the root dies once rows of both are in the log (the
-/// delegate retired them) and a successor inherits the table.
-fn delegated_two_gens_root_crash_config() -> SimConfig {
-    SimConfig {
-        nodes: 3,
-        delegations: vec![("d1".into(), 2)],
-        range_delegations: vec![("d2".into(), 2, (1, 0))],
-        // `d2`'s halves have different owners: linearizable per range.
-        check_range_bits: 1,
-        marker_pairs: 10,
-        cross_ratio: 0.0,
-        faults: vec![ScheduledFault {
-            at_ms: 2_000,
-            kind: FaultKind::CrashHolder {
-                restart_ms: Some(6_000),
-                keep_journal: true,
-            },
-        }],
-        ..delegated_config()
-    }
-}
-
 /// Delegates with backups (the M9 backup configuration): every
 /// acknowledgement waits for the backup.
 fn delegated_backup_config() -> SimConfig {
@@ -6874,39 +6885,22 @@ fn delegated_group_switch_config() -> SimConfig {
     }
 }
 
-/// One node holds two generations with a backup each: `d1` whole and
-/// range 0 of `d2` to node 2 (a second whole delegation to a node is
-/// refused), node 3 the backup of both, and node 2's clients write in both
-/// at once. No fault: the cost of the cross-generation acknowledgement rule
-/// (`SWEEP-XGEN-TOTALS`: acknowledgements that waited for the other
-/// generation's row).
-fn delegated_two_gens_backed_config() -> SimConfig {
-    SimConfig {
-        delegations: vec![("d1".into(), 2)],
-        range_delegations: vec![("d2".into(), 2, (1, 0))],
-        check_range_bits: 1,
-        cross_ratio: 0.0,
-        clients_per_node: 4,
-        ops_per_client: 16,
-        ..delegated_backup_config()
-    }
-}
-
-/// The review of the cross-generation acknowledgement rule: node 2 holds
-/// `d1` whole, backed by node 3, and range 0 of `d2` with no backup (its
-/// group is the delegate and the root: `delegation_backed_gens_max` 1), and
-/// its clients write in both at once, so a row of `d1` follows rows of
-/// `d2` the root has not appended (every op carries the node's session as
-/// its `deps`). Node 2 loses the root at 1.2 s and dies at 1.5 s: the root
-/// ends `d2`'s range at its cursor (its later rows strand), and `d1` by its
-/// backup's sealed tail. A row of `d1` past one of `d2` the log never got
-/// is never appended (the drain ends before it), and none such was
-/// acknowledged: an acknowledgement through the backup waits for the row's
-/// dependencies on the node's other generations. Without that rule the
-/// drain dropped rows the backup had acknowledged (I1).
-fn delegated_two_gens_one_backed_config() -> SimConfig {
+/// Plan 46 M1.2 step 3: one node, two subtrees. Node 2 holds `d1` and `d2`
+/// whole, backed by node 3 (at most one backed generation per node), and its
+/// clients write in both at once; it loses the root at 1.2 s and dies at
+/// 1.5 s. The root keeps two generations for the node on main (one stream
+/// after M1.2 step 9), and a third of the renames cross between the two
+/// subtrees (a recall on main; run at the delegate once there is one stream).
+/// (Plan 46 D5 deleted the hash-range splits, which made two generations of
+/// one node share a directory: the `delegated-two-gens-*` configs went with
+/// them.)
+fn delegated_two_dirs_one_backed_config() -> SimConfig {
     SimConfig {
         core: std::sync::Arc::new(sim::run::deleg_one_backed_gen_core_config),
+        delegations: vec![("d1".into(), 2), ("d2".into(), 2)],
+        cross_ratio: 0.3,
+        clients_per_node: 4,
+        ops_per_client: 16,
         faults: vec![
             ScheduledFault {
                 at_ms: 1_200,
@@ -6925,64 +6919,7 @@ fn delegated_two_gens_one_backed_config() -> SimConfig {
                 },
             },
         ],
-        ..delegated_two_gens_backed_config()
-    }
-}
-
-/// Plan 46 M1.2 step 3: one node, two subtrees. As
-/// `delegated-two-gens-one-backed`, but node 2 holds `d1` and `d2` whole, so
-/// the root keeps two generations for the node on main (one stream after
-/// M1.2 step 9), and a third of the renames cross between the two
-/// subtrees (a recall on main; run at the delegate once there is one stream).
-fn delegated_two_dirs_one_backed_config() -> SimConfig {
-    SimConfig {
-        delegations: vec![("d1".into(), 2), ("d2".into(), 2)],
-        range_delegations: Vec::new(),
-        check_range_bits: 0,
-        cross_ratio: 0.3,
-        ..delegated_two_gens_one_backed_config()
-    }
-}
-
-/// The review of ADR-39's rule: as `delegated-two-gens-one-backed`, but
-/// node 2 lives on, cut from the root (1 s to 10 s), and its backup (node
-/// 3) is frozen from 1 s to 6.8 s and cut from the root too, so the root
-/// cannot seal it: node 2's appends to it back up, and the rows of `d1`
-/// behind them are first read for a batch only after node 2 has applied
-/// the end of its unbacked range of `d2` (reclaimed at the root's cursor)
-/// and let go of it. Without recording the dependencies on that ended
-/// generation, the backup's acknowledgement answered rows that depended on
-/// its lost rows, and the end of `d1` at the drain of the backup's sealed
-/// tail dropped them (I1).
-fn delegated_two_gens_backlog_config() -> SimConfig {
-    SimConfig {
-        core: std::sync::Arc::new(sim::run::deleg_one_backed_gen_backlog_core_config),
-        faults: vec![
-            ScheduledFault {
-                at_ms: 1_000,
-                kind: FaultKind::Partition {
-                    a: 1,
-                    b: 2,
-                    for_ms: 9_000,
-                },
-            },
-            ScheduledFault {
-                at_ms: 1_000,
-                kind: FaultKind::Partition {
-                    a: 1,
-                    b: 3,
-                    for_ms: 9_000,
-                },
-            },
-            ScheduledFault {
-                at_ms: 1_000,
-                kind: FaultKind::Pause {
-                    node: 3,
-                    for_ms: 5_800,
-                },
-            },
-        ],
-        ..delegated_two_gens_one_backed_config()
+        ..delegated_backup_config()
     }
 }
 
@@ -7046,8 +6983,6 @@ fn delegated_placement_config() -> SimConfig {
         delegations: Vec::new(),
         cross_ratio: 0.0,
         ops_per_client: 16,
-        // M12: the placement may split a shared directory; per range.
-        check_range_bits: 2,
         core: std::sync::Arc::new(sim::run::placement_core_config),
         ..delegated_config()
     }
@@ -7067,67 +7002,6 @@ fn shared_dir_config() -> SimConfig {
         shared_dir: true,
         cross_ratio: 0.0,
         ..delegated_config()
-    }
-}
-
-/// Plan 30 §M12: the same workload with the placement on: the root
-/// splits `shared` into hash ranges delegated to the writers.
-fn shared_dir_split_config() -> SimConfig {
-    SimConfig {
-        ops_per_client: 20,
-        names: 6,
-        check_range_bits: 2,
-        core: std::sync::Arc::new(sim::run::placement_core_config),
-        ..shared_dir_config()
-    }
-}
-
-/// The same workload under the production default: automatic hash-range
-/// splits off (ADR-38), the rest of the placement as in the split sims.
-fn shared_dir_default_config() -> SimConfig {
-    SimConfig {
-        core: std::sync::Arc::new(sim::run::placement_default_split_core_config),
-        ..shared_dir_split_config()
-    }
-}
-
-/// M12 round 2: the split workload with the daemon's FUSE fast path
-/// modelled — the root executes its own ops outside the core, admitted
-/// by `Meta::root_fast_path` (harness `chaos-soak-4`: four nodes racing
-/// on the same names, the placement splitting the directory under them).
-fn shared_dir_fast_path_config() -> SimConfig {
-    SimConfig {
-        fast_path: sim::run::FastPath::Checked,
-        ..shared_dir_split_config()
-    }
-}
-
-/// The same with the admission skipped: the daemon before round 2.
-fn shared_dir_fast_path_unchecked_config() -> SimConfig {
-    SimConfig {
-        fast_path: sim::run::FastPath::Unchecked,
-        ..shared_dir_split_config()
-    }
-}
-
-/// Plan 30 §M12: `shared` split two ways by hand (node 2 the low range,
-/// node 3 the high one), renames within the directory crossing ranges:
-/// the root's recall path.
-fn shared_dir_ranges_config() -> SimConfig {
-    SimConfig {
-        range_delegations: vec![("shared".into(), 2, (1, 0)), ("shared".into(), 3, (1, 1))],
-        ops_per_client: 10,
-        check_range_bits: 1,
-        ..shared_dir_config()
-    }
-}
-
-/// The hand split under random faults (crashes, partitions, a root
-/// failover with live range delegates).
-fn shared_dir_faults_config() -> SimConfig {
-    SimConfig {
-        random_faults: 2,
-        ..shared_dir_ranges_config()
     }
 }
 
@@ -8634,8 +8508,6 @@ struct M11Totals {
     acks_parked: u64,
     place_delegated: u64,
     place_recalled: u64,
-    place_splits: u64,
-    place_range_recalls: u64,
     redelegated: u64,
     refused_designated: u64,
     designated: u64,
@@ -8676,8 +8548,6 @@ impl M11Totals {
             self.acks_parked += s.deleg_acks_parked;
             self.place_delegated += s.place_delegated;
             self.place_recalled += s.place_recalled;
-            self.place_splits += s.place_splits;
-            self.place_range_recalls += s.place_range_recalls;
             self.redelegated += s.deleg_redelegated;
             self.refused_designated += s.deleg_refused_designated;
             self.designated += s.deleg_designated;
@@ -8860,27 +8730,6 @@ fn delegated_delegate_restart_readopts_its_generation() {
         t.reclaimed, 0,
         "the root reclaimed a restarted delegate's generation unrenewed: {t:?}"
     );
-}
-
-/// `git-under-flock-faults` fault #14: a root failover under a delegate
-/// of two generations whose rows depend on each other. The re-stream
-/// restarted both from 0 while their early rows were already retired
-/// (the log carried them): each generation's first unretired row waited
-/// for the other's acknowledgement, no batch was ever sent, and every op
-/// parked on the new root until its deadline (seeds 18, 85 and 92 never
-/// quiesced). The re-stream now starts where the log is.
-#[test]
-fn delegated_two_generations_re_stream_after_a_root_failover() {
-    let t = run_m11(
-        "delegated-two-gens-root-crash",
-        delegated_two_gens_root_crash_config(),
-        0..100,
-    );
-    assert!(
-        t.inherited > 0,
-        "no successor inherited a generation: {t:?}"
-    );
-    assert!(t.restreams > 0, "no delegate re-streamed: {t:?}");
 }
 
 /// Plan 46 M0.3 (the 2026-10-16 trace): the root is stalled between applying
@@ -9351,31 +9200,6 @@ fn delegated_delegate_crash_drains_the_backup() {
     assert!(t.sealed_drained > 0, "no sealed tail was drained: {t:?}");
 }
 
-/// One node's backed and unbacked generations die together: the backup's
-/// tail is drained up to the first row whose dependency on the unbacked
-/// generation was lost, and no acknowledged row is dropped.
-#[test]
-fn delegated_two_gens_one_backed_keep_their_acknowledgements() {
-    let t = run_m11(
-        "delegated-two-gens-one-backed",
-        delegated_two_gens_one_backed_config(),
-        68_100..68_120,
-    );
-    assert!(t.seals_sent > 0, "no backup was sealed: {t:?}");
-}
-
-/// The same node keeps going behind a frozen backup and a cut root: rows
-/// of the backed generation first read after the unbacked one ended are
-/// not acknowledged on a lost dependency.
-#[test]
-fn delegated_two_gens_backlog_keep_their_acknowledgements() {
-    let _ = run_m11(
-        "delegated-two-gens-backlog",
-        delegated_two_gens_backlog_config(),
-        68_200..68_220,
-    );
-}
-
 /// Plan 46 M1.2 step 3: one node holds two whole subtrees (two generations
 /// on main) and loses the root; its backup's sealed tail is drained and no
 /// acknowledged row is dropped. `acked_at_or_below_cut` runs in report mode.
@@ -9437,94 +9261,6 @@ fn shared_dir_single_sequencer_converges() {
         t.dirs_checked >= t.seeds as usize,
         "per-directory checks missing: {t:?}"
     );
-}
-
-/// Plan 30 §M12: the placement splits the hot shared directory into
-/// hash ranges; the delegates execute their ranges locally; every
-/// directory's history is linearizable and the replicas converge.
-#[test]
-fn shared_dir_is_split_into_ranges() {
-    let t = run_m11(
-        "shared-dir-split",
-        shared_dir_split_config(),
-        73_000..73_020,
-    );
-    assert!(t.place_splits > 0, "the placement never split: {t:?}");
-    assert!(t.executed > 0, "range delegates never executed: {t:?}");
-}
-
-/// ADR-38: with the default configuration the placement never splits a
-/// hot shared directory, however hot, and the workload still converges
-/// and checks linearizable.
-#[test]
-fn shared_dir_is_not_split_by_default() {
-    let t = run_m11(
-        "shared-dir-default",
-        shared_dir_default_config(),
-        73_100..73_110,
-    );
-    assert_eq!(t.place_splits, 0, "the placement split by default: {t:?}");
-}
-
-/// M12 round 2: the root's fast path executes what the root owns and
-/// sends what a range's delegate owns through the core; every
-/// directory's history stays linearizable under the split.
-#[test]
-fn shared_dir_fast_path_respects_the_ranges() {
-    let t = run_m11(
-        "shared-dir-fast-path",
-        shared_dir_fast_path_config(),
-        76_000..76_020,
-    );
-    assert!(t.place_splits > 0, "the placement never split: {t:?}");
-    assert!(t.executed > 0, "range delegates never executed: {t:?}");
-    assert!(
-        t.fast_path_executed > 0,
-        "the fast path never executed: {t:?}"
-    );
-}
-
-/// M12 round 2: without the admission the root executes, on its fast
-/// path, names the log has given to a range's delegate — two winners
-/// for one create or unlink (the tester's `chaos-soak-4` under the
-/// placement). The checker catches it on these seeds (a few in sixty:
-/// which seeds hit the window moves with any change of schedule, such as
-/// the mid-ship lease renewal, so the range is wide).
-#[test]
-fn shared_dir_unchecked_fast_path_is_caught() {
-    let mut caught = 0;
-    for seed in 77_480..77_500 {
-        if let Err(e) = run_seed(seed, shared_dir_fast_path_unchecked_config()) {
-            eprintln!("seed {seed}: {}", e.lines().next().unwrap_or(""));
-            caught += 1;
-        }
-    }
-    assert!(caught > 0, "the unchecked fast path was never caught");
-}
-
-/// Plan 30 §M12: a hand split with cross-range renames: recalled by the
-/// root, re-delegated after.
-#[test]
-fn shared_dir_ranges_survive_cross_range_renames() {
-    let t = run_m11(
-        "shared-dir-ranges",
-        shared_dir_ranges_config(),
-        74_000..74_020,
-    );
-    assert!(t.executed > 0, "range delegates never executed: {t:?}");
-    assert!(t.cross_subtree > 0, "no cross-range op: {t:?}");
-    assert!(t.redelegated > 0, "ranges never re-delegated: {t:?}");
-}
-
-/// Plan 30 §M12: the hand split under random faults.
-#[test]
-fn shared_dir_ranges_under_random_faults() {
-    let t = run_m11(
-        "shared-dir-faults",
-        shared_dir_faults_config(),
-        75_000..75_030,
-    );
-    assert!(t.executed > 0, "range delegates never executed: {t:?}");
 }
 
 /// Phase 2b (M8): strict reads under delegation are served by the owning
@@ -16044,8 +15780,7 @@ fn i1_a_root_resumed_from_a_pause_does_not_answer_alone_on_a_stale_directory() {
 /// `delegated-no-backup-root-near` 242: the refused delegate stopped, the gate
 /// inherited the generation as live and outwaited it); and the root neither
 /// redirects to a generation it recalls nor outwaits a delegate that disowned
-/// its own (`long-delegated` 178 and 1198, `delegated-two-gens-root-crash`
-/// 651, `delegated-holder-cut` 6: a settle bounced between the two nodes).
+/// its own (`long-delegated` 178 and 1198, `delegated-holder-cut` 6: a settle bounced between the two nodes).
 /// Each seed answers one `EIO` unsettled on the parent (`client_unsettled_eio`
 /// is the counter, here without the classifier that excuses an isolated
 /// requester: none of these seeds is one) and none now.
@@ -16073,11 +15808,6 @@ fn settle_before_eio_a_gate_a_renewal_and_a_redirect_loop_leave_no_unsettled_eio
             "long-delegated-late-answers",
             long_delegated_late_answers_config(),
             vec![13],
-        ),
-        (
-            "delegated-two-gens-root-crash",
-            delegated_two_gens_root_crash_config(),
-            vec![651],
         ),
     ];
     let mut unsettled = Vec::new();
@@ -16296,11 +16026,6 @@ fn i1_a_delegate_counts_the_roots_copy_only_through_what_the_roots_tenure_commit
             "long-delegated-late-answers (slow lease reads)",
             slow(long_delegated_late_answers_config()),
             vec![1596],
-        ),
-        (
-            "delegated-two-gens-backlog (slow lease reads)",
-            slow(delegated_two_gens_backlog_config()),
-            vec![1965],
         ),
     ];
     for (label, cfg, seeds) in cases {
@@ -16872,7 +16597,7 @@ fn a_crowded_history_is_checked_in_bounded_time() {
 #[test]
 fn m03_the_configurations_at_zero_violations_stay_there() {
     type Config = fn() -> SimConfig;
-    let strict_configs: [(&str, Config); 18] = [
+    let strict_configs: [(&str, Config); 13] = [
         ("delegated-crash", delegated_crash_config),
         // (0 of 2,000 seeds `+unsettled` after S5, ADR-42; 1 violation in
         // seeds 0..100 before.)
@@ -16887,15 +16612,7 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         ("backup-hot", backup_hot_config),
         ("locks-delegated", locks_delegated_config),
         ("shared-dir", shared_dir_config),
-        ("shared-dir-split", shared_dir_split_config),
-        ("shared-dir-default", shared_dir_default_config),
-        ("shared-dir-ranges", shared_dir_ranges_config),
-        (
-            "delegated-two-gens-root-crash",
-            delegated_two_gens_root_crash_config,
-        ),
         ("long-sessions", long_sessions_config),
-        ("shared-dir-faults", shared_dir_faults_config),
         ("tloss-two-node", tloss_two_node_config),
         // (Plan 46 M0.3 G and B: 0 of 2,000 seeds `+unsettled` without the
         // knob, 5 and 2 violations before.)
@@ -17050,7 +16767,7 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
 /// (`long-delegated` 1198, `delegated-holder-cut` 6). Each fails with I4 on
 /// the parent of the settle fixes and passes now. (`settle_before_eio_...`
 /// above holds the seeds whose `EIO`, `tloss-two-node` 35, `long-delegated`
-/// 178 and `delegated-two-gens-root-crash` 651, the classifier excuses on the
+/// 178, the classifier excuses on the
 /// parent.)
 #[test]
 fn m03_the_settle_causes_s1_to_s3_leave_no_unsettled_eio_in_these_seeds() {
@@ -17311,11 +17028,10 @@ const I4_SEEDS: &[I4Seeds] = &[(
 #[test]
 fn hard_links_and_exchanges_converge_under_faults() {
     type Config = fn() -> SimConfig;
-    let configs: [(&str, Config); 5] = [
+    let configs: [(&str, Config); 4] = [
         ("backup", backup_config),
         ("backup-crash", backup_crash_config),
         ("delegated-crash", delegated_crash_config),
-        ("shared-dir-split", shared_dir_split_config),
         ("flex", flex_config),
     ];
     for (label, config) in configs {
@@ -17356,7 +17072,7 @@ fn hard_links_and_exchanges_converge_under_faults() {
 #[test]
 fn regression_a_root_appending_over_its_own_shadow_keeps_the_log_prefix() {
     type Config = fn() -> SimConfig;
-    let cases: [(&str, Config, &str, &[u64]); 3] = [
+    let cases: [(&str, Config, &str, &[u64]); 2] = [
         (
             "long-delegated",
             long_delegated_config,
@@ -17368,12 +17084,6 @@ fn regression_a_root_appending_over_its_own_shadow_keeps_the_log_prefix() {
             delegated_backup_config,
             "links-local+stalebase",
             &[13],
-        ),
-        (
-            "shared-dir-split",
-            shared_dir_split_config,
-            "stalebase",
-            &[298],
         ),
     ];
     for (label, config, variants, seeds) in cases {

@@ -95,7 +95,7 @@ pub(crate) fn hole_tail_rolled_back_tx(
         tail_key(0, 0)..tail_key(super::member::MEMBER_COPY_BASE, 0),
     ) {
         let (k, v) = guard.into_inner()?;
-        let t: BackupTx = postcard::from_bytes(&v)?;
+        let t: BackupTx = crate::record::from_bytes_exact(&v)?;
         if t.records.is_empty() {
             continue;
         }
@@ -220,7 +220,7 @@ impl Meta {
             }
             let (last, origin) = match r.get(&self.journal_tx, tx_key(seq))? {
                 Some(h) => {
-                    let h = postcard::from_bytes::<JournalTxHead>(&h)?;
+                    let h = crate::record::from_bytes_exact::<JournalTxHead>(&h)?;
                     (h.last.max(seq), (h.gen, h.idx))
                 }
                 None => (seq, (0, 0)),
@@ -296,7 +296,7 @@ impl Meta {
             tail_key(epoch, 0)..=tail_key(epoch, u64::MAX),
         ) {
             let (_, v) = guard.into_inner()?;
-            let t: BackupTx = postcard::from_bytes(&v)?;
+            let t: BackupTx = crate::record::from_bytes_exact(&v)?;
             if prev.is_some_and(|p| t.first != p + 1) {
                 break;
             }
@@ -317,7 +317,7 @@ impl Meta {
             tail_key(epoch, 0)..=tail_key(epoch, u64::MAX),
         ) {
             let (_, v) = guard.into_inner()?;
-            out.push(postcard::from_bytes(&v)?);
+            out.push(crate::record::from_bytes_exact(&v)?);
         }
         Ok(out)
     }
@@ -361,7 +361,7 @@ impl Meta {
                 survivor = Some(survivor.map_or((e, first), |s| s.min((e, first))));
                 break;
             }
-            let t: BackupTx = postcard::from_bytes(&v)?;
+            let t: BackupTx = crate::record::from_bytes_exact(&v)?;
             if t.last <= through {
                 doomed.push(k.to_vec());
             } else if row_set.contains(&t.last) {
@@ -577,7 +577,7 @@ impl Meta {
         for guard in r.range(&self.backup_tail, tail_key(e, 0)..=tail_key(e, u64::MAX)) {
             let (_, v) = guard.into_inner()?;
             out.push(
-                postcard::from_bytes(&v)
+                crate::record::from_bytes_exact(&v)
                     .map_err(|e| MetaError::Invalid(format!("delegate tx: {e}")))?,
             );
         }

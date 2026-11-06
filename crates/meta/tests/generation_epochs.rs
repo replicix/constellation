@@ -104,7 +104,6 @@ fn a_dependency_on_a_generation_that_ended_without_a_key_is_voided_when_checked(
                     node: 4,
                     gen: g,
                     designated: false,
-                    range: (0, 0),
                 },
                 LogRecord::RecallCut {
                     dir: ROOT_INO,
@@ -182,7 +181,6 @@ fn a_lost_dependency_on_a_keyless_ended_generation_is_lost_at_the_first_check() 
                     node: 4,
                     gen: g,
                     designated: false,
-                    range: (0, 0),
                 },
                 LogRecord::RecallCut {
                     dir: ROOT_INO,
@@ -243,7 +241,6 @@ fn a_restart_does_not_void_a_generation_above_the_tables_highest() {
                     node: 4,
                     gen: ended,
                     designated: false,
-                    range: (0, 0),
                 },
                 LogRecord::RecallCut {
                     dir: ROOT_INO,
@@ -307,7 +304,6 @@ fn an_in_process_rebuild_carries_the_ends_its_window_holds() {
         node: 4,
         gen: g,
         designated: false,
-        range: (0, 0),
     };
     rebuilt
         .apply_segment(
@@ -387,7 +383,6 @@ fn delegate(g: u64) -> LogRecord {
         node: 4,
         gen: g,
         designated: false,
-        range: (0, 0),
     }
 }
 

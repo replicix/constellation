@@ -2624,7 +2624,7 @@ mod tests {
     }
 
     fn table(rows: &[(u64, u64, u64)]) -> constellation_meta::delegation::DelegationTable {
-        use constellation_meta::delegation::{DelegationRecord, Range};
+        use constellation_meta::delegation::DelegationRecord;
         let mut t = constellation_meta::delegation::DelegationTable::default();
         for (dir, node, gen) in rows {
             t.apply(DelegationRecord::Delegate {
@@ -2632,7 +2632,6 @@ mod tests {
                 node: *node,
                 gen: *gen,
                 designated: false,
-                range: Range::WHOLE,
             });
         }
         t

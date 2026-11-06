@@ -243,9 +243,6 @@ pub struct DelegationStatus {
     /// Phase 2b: an offline designation (never recalled by TTL or
     /// placement).
     pub designated: bool,
-    /// Plan 30 §M12: `"<idx>/<count>"` for a hash range of the
-    /// directory's names; empty for the whole directory.
-    pub range: String,
 }
 
 /// A generation delegated to this node that is not installed yet: an
@@ -460,10 +457,6 @@ pub struct DelegationReport {
     pub place_recalled: u64,
     pub place_skipped_cooldown: u64,
     pub place_skipped_unreachable: u64,
-    /// Plan 30 §M12: hot directories split into hash ranges, and range
-    /// generations recalled by the placement.
-    pub place_splits: u64,
-    pub place_range_recalls: u64,
     pub read_index_served: u64,
     pub read_grants: u64,
     // ---- plan 41 R2 (appended) ----
@@ -2676,11 +2669,6 @@ pub struct OfflineParams {
 pub struct DelegateParams {
     pub path: String,
     pub node: u64,
-    /// Plan 30 §M12: one name-hash range of the directory,
-    /// `"<idx>/<count>"` (`count` a power of two); absent: the whole
-    /// directory and its subtree.
-    #[serde(default)]
-    pub range: Option<String>,
 }
 
 /// `node.leave`. `node_id: None` retires this node; `Some(id)` is admin

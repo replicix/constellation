@@ -1,6 +1,9 @@
-//! Directory hash-range split benchmark (`dirsplit-bench`, run by name
-//! only): does splitting one hot shared directory into name-hash ranges
-//! (plan 30 §M12, "GIGA+") pay off, and under which network topology?
+//! Hot shared directory benchmark (`dirsplit-bench`, run by name only):
+//! what one hot directory costs under the single sequencer and under a
+//! whole-directory delegation, and under which network topology. (It began
+//! as the measurement of plan 30 §M12's hash-range splits, "GIGA+"; plan 46
+//! D5 deleted the splits, and with them the configurations `b`, the
+//! automatic split, and `c`, the hand split, and the `own` workload.)
 //!
 //! One root (`r`, never a writer) and `N` writer nodes (`w0`..), each
 //! placed on a *site*. A site has its own S3 latency (a toxiproxy route
@@ -11,20 +14,13 @@
 //! link is born delayed). Every phase runs one workload on a fresh
 //! directory under one configuration:
 //!
-//! - `a`: hash-range splits off (`CONSTELLATION_DELEGATION_SPLIT=0`; the
-//!   placement still delegates subtrees);
-//! - `b`: the automatic placement with splits on (`SPLIT=20`, set
-//!   explicitly: splits are off by default); the phase reports whether a
-//!   split fired;
-//! - `c`: a hand split, one range per writer, range `i` to writer `i`;
+//! - `a`: the placement as it is (it may delegate the directory whole to
+//!   a dominant writer);
 //! - `d`: the directory delegated whole to `w0`.
 //!
-//! `a`, `c` and `d` share a cluster (mounted with `SPLIT=0`); `b` needs
-//! its own (the knob is read at mount). Workloads: `uniform` (creates of
-//! random names), `mix` (create, and unlink the thread's 16th-newest
-//! file), `rename` (rename a thread's own file to a random new name) and
-//! `own` (creates of names hashing into the writer's own range of `N`:
-//! the synthetic best case for a split). Every op is a FUSE call on the
+//! Workloads: `uniform` (creates of random names), `mix` (create, and
+//! unlink the thread's 16th-newest file) and `rename` (rename a thread's
+//! own file to a random new name). Every op is a FUSE call on the
 //! writer's own mount; files are empty, so no data reaches S3.
 //!
 //! Settings come from the environment (`DIRSPLIT_*`, see [`Spec`]); one
@@ -32,10 +28,7 @@
 //! S3 backend (`--s3-backend process`) and `sudo -n tc`. The scripts
 //! and the report are in `bench/dirsplit/`.
 
-use super::m11::{
-    deleg_of, delegate, delegate_range, n, node_id, undelegate, unmount_all, wait_installed,
-    wait_installed_range,
-};
+use super::m11::{deleg_of, delegate, n, node_id, undelegate, unmount_all, wait_installed};
 use super::{eventually, lease_of, setup, ts, wait_for_p2p};
 use crate::client::Client;
 use crate::reqlog::CountingProxy;
@@ -82,9 +75,6 @@ struct Spec {
     rotate: usize,
     threads: usize,
     warm_s: u64,
-    /// The warm-up of a `b` phase (the placement window must see the
-    /// load before it can split).
-    bwarm_s: u64,
     measure_s: u64,
     out: std::path::PathBuf,
     extra_env: Vec<(String, String)>,
@@ -116,28 +106,24 @@ impl Spec {
         let writers: usize = parse_num("DIRSPLIT_WRITERS", "4")?;
         anyhow::ensure!(
             [2, 4, 8, 16].contains(&writers),
-            "DIRSPLIT_WRITERS must be 2, 4, 8 or 16 (one range each)"
+            "DIRSPLIT_WRITERS must be 2, 4, 8 or 16"
         );
-        let configs: Vec<char> = env_or("DIRSPLIT_CONFIGS", "a,c,d")
+        let configs: Vec<char> = env_or("DIRSPLIT_CONFIGS", "a,d")
             .split(',')
             .filter_map(|s| s.trim().chars().next())
             .collect();
         anyhow::ensure!(
-            configs.iter().all(|c| "abcd".contains(*c)),
-            "DIRSPLIT_CONFIGS: a, b, c, d"
+            configs.iter().all(|c| "ad".contains(*c)),
+            "DIRSPLIT_CONFIGS: a, d"
         );
-        anyhow::ensure!(
-            !configs.contains(&'b') || configs.len() == 1,
-            "DIRSPLIT_CONFIGS: b needs a cluster of its own (SPLIT is read at mount)"
-        );
-        let workloads: Vec<String> = env_or("DIRSPLIT_WORKLOADS", "uniform,mix,rename,own")
+        let workloads: Vec<String> = env_or("DIRSPLIT_WORKLOADS", "uniform,mix,rename")
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
         for w in &workloads {
             anyhow::ensure!(
-                ["uniform", "mix", "rename", "own"].contains(&w.as_str()),
+                ["uniform", "mix", "rename"].contains(&w.as_str()),
                 "unknown workload {w:?}"
             );
         }
@@ -160,7 +146,6 @@ impl Spec {
             rotate: parse_num("DIRSPLIT_ROTATE", "0")?,
             threads: parse_num("DIRSPLIT_THREADS", "4")?,
             warm_s: parse_num("DIRSPLIT_WARM_S", "5")?,
-            bwarm_s: parse_num("DIRSPLIT_BWARM_S", "20")?,
             measure_s: parse_num("DIRSPLIT_MEASURE_S", "15")?,
             out: env_or("DIRSPLIT_OUT", "dirsplit.jsonl").into(),
             extra_env,
@@ -193,10 +178,6 @@ impl Spec {
             self.rtt_remote_ms
         };
         (rtt * 500.0).round() as u64
-    }
-
-    fn bits(&self) -> u8 {
-        self.writers.trailing_zeros() as u8
     }
 }
 
@@ -318,7 +299,7 @@ struct Cluster {
     netem: PairNetem,
 }
 
-fn build_cluster(spec: &Spec, split_pct: &str) -> Result<Cluster> {
+fn build_cluster(spec: &Spec) -> Result<Cluster> {
     let (env, root) = setup(NAME)?;
     let backend = format!("s3://{BUCKET}/{NAME}-{}", ts());
     let mut names = vec!["r".to_string()];
@@ -335,8 +316,7 @@ fn build_cluster(spec: &Spec, split_pct: &str) -> Result<Cluster> {
             // placement, no handoff on forwarded demand, no idle release.
             .with_env("CONSTELLATION_LEASE_PLACEMENT", "off")
             .with_env("CONSTELLATION_LEASE_WANTED_GRACE_MS", "600000")
-            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
-            .with_env("CONSTELLATION_DELEGATION_SPLIT", split_pct);
+            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000");
         for (k, v) in &spec.extra_env {
             c = c.with_env(k, v);
         }
@@ -446,24 +426,12 @@ struct ThreadOut {
 
 struct Names {
     rng: Rng,
-    /// `Some(idx)`: only names hashing into range `idx` of `bits`.
-    own: Option<(u8, u32)>,
     prefix: String,
 }
 
 impl Names {
     fn next(&mut self) -> String {
-        loop {
-            let name = format!("{}{:016x}", self.prefix, self.rng.next());
-            match self.own {
-                None => return name,
-                Some((bits, idx)) => {
-                    if constellation_meta::delegation::Range::of(bits, &name).idx == idx {
-                        return name;
-                    }
-                }
-            }
-        }
+        format!("{}{:016x}", self.prefix, self.rng.next())
     }
 }
 
@@ -514,7 +482,7 @@ fn run_thread(
     while !stop.load(Ordering::Relaxed) {
         i += 1;
         match workload.as_str() {
-            "uniform" | "own" => {
+            "uniform" => {
                 let n = names.next();
                 let start = Instant::now();
                 let (lat_us, err) = timed(|| create(&dir.join(&n)));
@@ -625,21 +593,16 @@ fn cpu_s(pid: u32) -> f64 {
     (utime + stime) / hz
 }
 
-/// The ranges (or the whole entry) of `path` in `c`'s delegation table:
-/// `[(range, node)]`, `""` for a whole delegation.
-fn table_of(c: &Client, path: &str) -> Vec<(String, u64)> {
+/// The delegations of `path` in `c`'s delegation table: `[node]`.
+fn table_of(c: &Client, path: &str) -> Vec<u64> {
     deleg_of(c)
         .ok()
         .and_then(|d| d["table"].as_array().cloned())
         .unwrap_or_default()
         .iter()
         .filter(|e| e["path"] == path)
-        .map(|e| (e["range"].as_str().unwrap_or("").to_string(), n(e, "node")))
+        .map(|e| n(e, "node"))
         .collect()
-}
-
-fn is_split(table: &[(String, u64)]) -> bool {
-    table.iter().any(|(r, _)| !r.is_empty())
 }
 
 const DELEG_COUNTERS: &[&str] = &[
@@ -654,8 +617,6 @@ const DELEG_COUNTERS: &[&str] = &[
     "deps_waits",
     "streamed_txs",
     "appended_txs",
-    "place_splits",
-    "place_range_recalls",
     "place_delegated",
     "place_recalled",
     "lapsed",
@@ -720,20 +681,9 @@ fn run_phase(
             Ok(())
         })?;
     }
-    let count = spec.writers;
-    match config {
-        'c' => {
-            for (i, w) in writers.iter().enumerate() {
-                let range = format!("{i}/{count}");
-                delegate_range(root, &path, ids[i + 1], &range)?;
-                wait_installed_range(w, &path, &range, Duration::from_secs(60))?;
-            }
-        }
-        'd' => {
-            delegate(root, &path, ids[1])?;
-            wait_installed(&writers[0], &path, Duration::from_secs(60))?;
-        }
-        _ => {}
+    if config == 'd' {
+        delegate(root, &path, ids[1])?;
+        wait_installed(&writers[0], &path, Duration::from_secs(60))?;
     }
     let stop = Arc::new(AtomicBool::new(false));
     let t_launch = Instant::now();
@@ -746,24 +696,15 @@ fn run_phase(
                     ^ ((wi as u64) << 20)
                     ^ (t as u64 + 1)
                     | 1),
-                own: (workload == "own").then(|| (spec.bits(), wi as u32)),
                 prefix: format!("{}t{t}-", w.name),
             };
             let (d, wl, st) = (w.mnt.join(&dir), workload.to_string(), stop.clone());
             handles.push((wi, std::thread::spawn(move || run_thread(d, wl, names, st))));
         }
     }
-    // Warm-up; a `b` phase watches for its split meanwhile.
-    let warm = Duration::from_secs(if config == 'b' {
-        spec.bwarm_s
-    } else {
-        spec.warm_s
-    });
-    let mut split_after: Option<f64> = None;
+    // Warm-up.
+    let warm = Duration::from_secs(spec.warm_s);
     while t_launch.elapsed() < warm {
-        if config == 'b' && split_after.is_none() && is_split(&table_of(root, &path)) {
-            split_after = Some(t_launch.elapsed().as_secs_f64());
-        }
         std::thread::sleep(Duration::from_millis(500));
     }
     // Measurement.
@@ -779,9 +720,6 @@ fn run_phase(
     let views = clients.iter().map(peer_view).collect::<Vec<_>>();
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(spec.measure_s) {
-        if config == 'b' && split_after.is_none() && is_split(&table_of(root, &path)) {
-            split_after = Some(t_launch.elapsed().as_secs_f64());
-        }
         std::thread::sleep(Duration::from_millis(500));
     }
     let t_end = Instant::now();
@@ -926,7 +864,6 @@ fn run_phase(
         "sites": (0..=spec.writers).map(|i| spec.site(i)).collect::<Vec<_>>(),
         "threads": spec.threads,
         "workload": workload,
-        "synthetic": workload == "own",
         "config": config.to_string(),
         "seq": seq,
         "measure_s": wall,
@@ -944,10 +881,7 @@ fn run_phase(
         "deleg": deleg,
         "table_at_start": table_start,
         "table_at_end": table_end,
-        "split_after_s": split_after,
-        "split_fired": config == 'b' && (split_after.is_some() || is_split(&table_end)),
-        "placed_whole": config != 'c' && config != 'd'
-            && table_start.iter().chain(&table_end).any(|(r, _)| r.is_empty()),
+        "placed_whole": config != 'd' && (!table_start.is_empty() || !table_end.is_empty()),
         "converged": converged,
         "views": views,
     });
@@ -975,9 +909,7 @@ fn append(out: &std::path::Path, v: &Value) -> Result<()> {
 pub fn dirsplit_bench(_seed: u64) -> Result<()> {
     let spec = Spec::from_env()?;
     eprintln!("    {NAME}: {spec:?}");
-    // Splits are off by default (ADR-38): `b` turns them on explicitly.
-    let split = if spec.configs == ['b'] { "20" } else { "0" };
-    let mut cl = build_cluster(&spec, split)?;
+    let mut cl = build_cluster(&spec)?;
     let result = (|| -> Result<()> {
         let ids: Vec<u64> = cl.clients.iter().map(node_id).collect::<Result<_>>()?;
         // Backups and link measurements settle (the backup candidates

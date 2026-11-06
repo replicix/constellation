@@ -401,7 +401,6 @@ fn a_replay_does_not_name_rows_of_a_grant_the_strand_undoes() {
         node: 2,
         gen,
         designated: false,
-        range: (0, 0),
     }])
     .unwrap();
     let data = LogRecord::Create {
@@ -2090,7 +2089,6 @@ fn a_reused_generation_number_drops_the_void_a_deposed_roots_unshipped_end_left(
         node: 4,
         gen,
         designated: false,
-        range: (0, 0),
     }])
     .unwrap();
     meta.apply_records_journaled(&[LogRecord::RecallCut {
@@ -2116,7 +2114,6 @@ fn a_reused_generation_number_drops_the_void_a_deposed_roots_unshipped_end_left(
             node: 1,
             gen,
             designated: false,
-            range: (0, 0),
         }],
         &TouchSet::default(),
     )

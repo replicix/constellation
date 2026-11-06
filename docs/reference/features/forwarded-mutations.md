@@ -174,7 +174,7 @@ lease's acknowledgement policy; see
 
 With delegations (plan 30 M11), the sequencer of an op is resolved per
 key from the replicated delegation table: a key under a delegated
-subtree (or a delegated name-hash range) belongs to that delegate,
+subtree belongs to that delegate,
 everything else to the holder. A requester sends the op to the owner. An
 op whose keys have two owners (a rename across delegations, `rmdir` of a
 delegated root) goes to the holder, which recalls the delegations

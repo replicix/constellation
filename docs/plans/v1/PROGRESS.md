@@ -67659,7 +67659,6 @@ The wait percentiles are unchanged; the counts above 200 ms / 1 s differ by abou
 The negative control `the_lone_lead_oracle_catches_a_disabled_lead_and_a_disabled_hysteresis` moved a seed (64 no longer trips the hysteresis control; 88 does, as 118 still does); the control goes with M1.2 step 13.
 No perf gate: off the steady path (an ask is made only while an answer waits on the root's commit).
 
-
 ### Plan 46 M1.1 step 7 follow-up: the lock lane's and the designation's I1 triage (2026-11-06)
 
 Step 7 exempted every delegated lock-lane configuration (`lock_files > 0`) and `delegated-designated` from the `strict_commit` default. Triaged
@@ -67790,3 +67789,57 @@ reads (14, before 16) and seed 339's lock wait (as before).
 
 **Gates** (box 1): fmt `--check`, clippy `--workspace --all-targets -D warnings` debug and release clean; authority lib 1,065 debug and
 release; release sim suite 423 passed, 0 failed, 13 ignored.
+
+### Plan 46 M1.2 step 1: hash-range splits deleted (D5) (2026-11-06)
+
+A pure deletion: a delegation is a directory's whole subtree. No version bump, no compatibility shim: the delegation record and the table row are encoded without the range.
+The diff is 56 files, +415 / -4,460 (34 `#[test]` functions, 9 of them the model's).
+
+**Deleted.**
+- Code: `Range`, `name_hash` and the `range` of `Delegation`, `DelegationRecord::Delegate`, `LogRecord::Delegate`, `Control::Delegate`, `SyncRequest::Delegate`, `GenState` and the table row
+  (the row is `(dir, node, gen, designated)`); `DirOwner` (`Split`; the walk returns `Option<Delegation>`), `ranges_of`, `is_split`, `Namespace::primary_dentry`, `owner_of_dentry`;
+  `Core::split_directory` and its two read-grant guards; the placement's split half, the 16-bucket name-hash histogram (`Counts`, `bucket_of`; a count is a `u64` now), `placement_split_pct`,
+  `CONSTELLATION_DELEGATION_SPLIT` and its `--cto strict` warning, `Stats::place_splits` / `place_range_recalls`; the CLI `--range` (clap refuses it, no alias),
+  `DelegateParams.range`, `DelegationStatus.range` and the two report counters (control schema re-blessed, 28 lines out). There is no `PeerMsg::Delegate` in this tree: the `range` rode on `Control::Delegate` and `SyncRequest::Delegate`.
+  `engine/src/sync.rs` stays (the sync loop); only its `range` went.
+- Model: `crates/model/src/hotdir.rs` and `tests/hotdir.rs`.
+- Harness: `hash-range-split-merge`, `cross-range-rename`, `two-gens-ack-cost` (scenarios, k8s parity entries, helpers `delegate_range`, `wait_installed_range`, `name_in_range`); `shared-dir-multi-writer` keeps its single-sequencer phase, the second phase (four ranges) is gone;
+  `dirsplit-bench` loses configurations `b` (automatic split) and `c` (hand split: it used `--range`) and the `own` workload; `bench/dirsplit` scripts, README and `analyze.py` follow (RESULTS.md and tables.md are history).
+  There is no harness scenario `shared-dir-split*`: that name is a sim config.
+- Sim: configs `shared-dir-split`, `-default`, `-fast-path`, `-fast-path-unchecked`, `-ranges`, `-faults`, `delegated-two-gens-root-crash`, `-backed`, `-backlog`, `-one-backed` (its fields went into `delegated-two-dirs-one-backed`, which no longer inherits from it),
+  `SimConfig::range_delegations` / `check_range_bits`, `FastPath::Unchecked`, `project_range`, `Scope::Range`; `shared-dir` stays (names without hash locality). The placement sims run with no split.
+
+**What each removed test showed.**
+- Read-grant guard: `the_root_grants_no_read_delegation_on_a_split_directory`, `a_range_delegate_grants_no_read_delegation_on_its_directory` (a range's writes recall only the grants in its own table, so no grant on a split directory); meta `a_file_in_a_split_directory_resolves_to_its_range` (a file resolves to its name's range).
+- Placement knob (ADR-38): `automatic_splits_are_off_by_default`, `the_placement_splits_a_hot_directory_when_asked_to`, `_does_not_split_by_default`, `_never_splits_under_cto_strict`, `a_manual_range_split_is_refused_under_cto_strict`.
+- The ADR-39 family, which needs two generations of one node that share a directory, so only ranges built them (two whole subtrees share no key): `a_row_depending_on_an_ended_generations_lost_row_never_streams`,
+  `a_group_acknowledgement_waits_for_the_rows_other_generation_dependencies`, `a_row_read_after_its_dependencys_generation_left_is_never_answered`, `a_dependency_on_another_nodes_generation_waits_for_nothing`,
+  `a_recall_answers_before_a_lost_dependency_the_stream_has_not_read`, and plan 45's `an_unlink_that_moves_a_files_keys_into_another_generation_is_not_the_delegates` (its closing rule keeps the unlink cross-subtree).
+  ADR-39's code (`deleg_caps`, `deleg_note_xdeps`, the xgen counters) stays until step 12; the ignored known-gap test with two whole delegations and injected deps (`a_sealed_tail_never_appends_a_row_whose_dependency_was_lost`) stays.
+- Sim tests: `shared_dir_is_split_into_ranges` and `shared_dir_fast_path_respects_the_ranges` (the placement split, delegates executed, per-range linearizable), `shared_dir_is_not_split_by_default`, `shared_dir_unchecked_fast_path_is_caught`
+  (the unchecked fast path executes names a range's delegate owns: two winners, seed 77002 in the old note), `shared_dir_ranges_survive_cross_range_renames`, `shared_dir_ranges_under_random_faults`, `delegated_two_generations_re_stream_after_a_root_failover`
+  (fault #14: two generations with rows depending on each other re-streamed from the log), `delegated_two_gens_one_backed_keep_their_acknowledgements`, `delegated_two_gens_backlog_keep_their_acknowledgements`; entries in the settle-before-EIO list (`delegated-two-gens-root-crash` 651),
+  the slow-lease-read list (`-backlog` 1965), `m03` (`shared-dir-split`, `-default`, `-ranges`, `-faults`, `delegated-two-gens-root-crash`), the `+links` list and the stalebase regression (`shared-dir-split` 298).
+  `regression_a_delegate_taking_the_root_over_re_appends_its_rows` is re-pinned: seeds 15, 311, 590 and 39 no longer take that takeover without splits; 746 (one row) and 879 (five) do.
+- Harness: `hash-range-split-merge` (the placement splits `shared` four ways, then merges), `cross-range-rename` (a cross-range rename recalls both ranges and re-delegates), `two-gens-ack-cost` (ADR-39's cost with two generations), `shared-dir-multi-writer` phase 1 (range delegates execute locally, the root's log PUT rate does not grow).
+- Model `hotdir` (9 tests: commutative parent attributes under an HLC, hash-range ownership, the shared / exclusive parent hold with naive counterexamples, the cross-range rename). Its HLC and shared-parent-hold half had no other model; the rules are pinned by the meta tests and pjdfstest.
+
+**One counting change.** An op's directories are counted once per op by the placement (`dirs_of_keys` deduplicates the directory): with the histogram gone, a rename inside one directory is one count, where two names with different buckets were two. It moves the placement's window counts, not its rules.
+
+**Sweeps** (box 1, release, `+commit`, seeds 0..1,999, main `1a0d7d84` against this tree; rebased onto `ea458227` afterwards): `placement-hot`, `delegated-group-switch`, `long-delegated`: 0 failing seeds on both (identical, empty sets).
+`delegated-group-switch` and `long-delegated` totals are identical; `placement-hot` moves (no splits any more): answers from a delegate's stream 2,096 -> 556, settles sent 546 -> 96, unsettled EIO violations 3 (2 seeds) -> 0, cut rows judged 19,730 -> 5,431, `acked_at_or_below_cut` 0 on both.
+`long-delegated` shows 191 `acked_at_or_below_cut` violations in 40 seeds on both (report mode, step 3's baseline).
+
+**Perf** (box 3, quiet, binaries built on box 1; A = main, B = this tree; `vfs-bench` three runs each A B B A A B): dispatch overhead 50 to 140 ns per op on both (targets < 1,000 ns), no direction between A and B
+(observer getattr 80-90 / 90, mock getattr 100-110 / 100-120, mock lookup 90-100 / 90-100, mock read 100-110 / 110, view getattr 70-100 / 80-110, view lookup 70-110 / 70-90, view read 70-120 / 50-140). `vfs-bench` does not run the ownership walk,
+so a micro-benchmark of `DelegationTable::resolve` (a dentry, an inode and a shared hold in a directory 15 levels deep, four delegations; best of 7 x 300,000 calls, three runs each, A B B A A B, not committed): main 362.1 to 363.5 ns, this tree 347.3 to 351.7 ns per call (4 % faster: the range branch and the split lookups are gone).
+
+**Gates** (box 1): fmt `--check`, clippy `--workspace --all-targets -D warnings` clean; lib tests meta 409, authority 1,049, engine 952, control 146, harness 164 (the k8s parity tests included), model 5, net 128, constellation bins 95; meta integration tests and the model suite (release, hotdir gone) pass; control schema test passes after the re-bless (no version bump);
+release authority sim suite 414 passed, 0 failed, 13 ignored (the re-pinned `regression_a_delegate_taking_the_root_over_re_appends_its_rows` included).
+
+### Plan 46 M1.2 step 1 fix round (review)
+
+- **Old data (maintainer decision 2026-11-06).** A file system written before plan 46 M1.2 step 1 must be reformatted (no upgrade path, no version bump); the decoders refuse leftover bytes (`constellation_meta::from_bytes_exact`: `postcard::take_from_bytes` and an empty remainder) wherever a log, segment, journal, backup-tail, speculation or delegation row is decoded whole, so an old `Delegate` record (two trailing range bytes) or an old table row fails loudly instead of decoding shifted. Tests: `old_shape_delegate_record_is_refused` (standalone and inside a `BackupTx`), `old_shape_delegate_in_a_segment_is_refused`, `old_shape_table_row_is_refused`.
+- **Fast-path ownership coverage.** `delegated-fast-path` (`FastPath::Checked`, whole delegations) and its negative control `delegated-fast-path-unchecked` replace the deleted range configs.
+- **Placement counting.** A rename inside one directory counts as one op (previously one or two, by hash bucket): rename-heavy workloads reach `min_ops` later and are recalled for low rate sooner.
+- The model's shared-parent hold is unmodeled (TODO in `crates/model/src/lib.rs`).

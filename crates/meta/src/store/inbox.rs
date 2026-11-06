@@ -217,7 +217,7 @@ impl Meta {
             return Ok(None);
         };
         let (k, hv) = guard.into_inner()?;
-        let head: super::local::JournalTxHead = postcard::from_bytes(&hv)?;
+        let head: super::local::JournalTxHead = crate::record::from_bytes_exact(&hv)?;
         Ok((head.last >= position).then(|| OutcomeRow {
             jseq: super::local::decode_tx_key(&k).unwrap_or(0),
             gen: head.gen,

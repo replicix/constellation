@@ -1645,13 +1645,10 @@ impl Core {
                     self.lease.cached_holder = Some(holder);
                 }
                 // M12 round 2: this node's table names `from` the owner of
-                // the op's keys (a range, or a subtree, just delegated to
-                // it) but `from` answered `NotHolder` — its own table has
+                // the op's keys (a subtree just delegated to it) but `from` answered `NotHolder` — its own table has
                 // not applied the grant yet. Executing here now would
                 // recall the grant this node just gave (the root's own
-                // create 3 ms after a split, harness
-                // `hash-range-split-merge`: the range gone, the directory
-                // stuck half-split for the cool-down); ask again in a
+                // create 3 ms after a grant); ask again in a
                 // stream tick instead, like a `Held` (the backoff retries
                 // the delegate path first, then the forward).
                 let grant_lags = self.cfg.delegation
@@ -1898,7 +1895,7 @@ impl Core {
             return;
         }
         // Plan 30 §M12: the op may be this node's own to execute by now
-        // (a delegation of its subtree — or its hash range — installed
+        // (a delegation of its subtree installed
         // while the forward was held: the root answers `Held` to a
         // delegate's own op until the delegate's table carries the
         // grant). The delegate path dedups by rid.

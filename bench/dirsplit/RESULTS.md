@@ -1,5 +1,10 @@
 # Directory hash-range split benchmark: results
 
+*Historical. Plan 46 D5 deleted the hash-range splits this benchmark measured
+(configurations `b` and `c`, the `own` workload); the harness scenario and the
+scripts now measure configurations `a` (the placement) and `d` (the directory
+delegated whole) only, and the tables below were made before that.*
+
 How the benchmark runs is in [README.md](README.md). The full per-cell tables
 (throughput, latency percentiles, root CPU, S3 requests, errors, convergence)
 are in [tables.md](tables.md). They were made by `analyze.py` from three

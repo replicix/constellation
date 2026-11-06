@@ -567,7 +567,6 @@ impl Core {
             .get(&ino)
             .is_some_and(|until| *until > now.wait)
             || self.under_pending_designation(ino, replica)
-            || self.split_directory(ino, replica)
         {
             return None;
         }

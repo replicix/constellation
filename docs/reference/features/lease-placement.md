@@ -4,8 +4,7 @@ Placement moves sequencing toward the nodes that write. There are two
 levels since plan 30:
 
 - **Subtree placement** (plan 30 M11–M12, on by default): the root
-  lease holder delegates a subtree, or a name-hash range of a hot
-  directory, to the node that dominates its writes. That node then
+  lease holder delegates a subtree to the node that dominates its writes. That node then
   sequences it at local speed. This is the main mechanism; it is
   described in [Delegations](delegations.md#automatic-placement) and
   summarized [below](#subtree-placement).
@@ -30,7 +29,7 @@ levels since plan 30:
 
 - **Root lease**: the one S3 lease; its holder appends the log and
   sequences everything not delegated.
-- **Delegation**: a subtree or name-hash range sequenced by another node
+- **Delegation**: a subtree sequenced by another node
   for the root (see [Delegations](delegations.md)).
 - **Writer weight**: operations attributed to a node in the recent window.
 - **Medoid**: an actual writer node minimizing weighted RTT to all writers.
@@ -47,9 +46,6 @@ sliding window (30 s by default) it:
   other whole delegation;
 - recalls a placed delegation when the delegate's share stays below 50%,
   or the subtree's rate below half the floor, for a 60 s dwell;
-- splits a hot directory that no node dominates, but that several nodes
-  each write at least 20% of, into name-hash ranges, giving each range
-  to a node that dominates that range;
 - keeps a recalled directory in a 30 s cool-down.
 
 It never delegates the root directory and never recalls a manual

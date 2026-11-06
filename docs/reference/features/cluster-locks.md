@@ -35,8 +35,7 @@ between nodes safely. It is on by default whenever P2P is on.
 ## Terminology
 
 - **Owning sequencer**: the node that sequences a file's mutations. It
-  is the lease holder, or the delegate of the file's subtree or name-hash
-  range (see [Delegations](delegations.md)). It also holds the file's
+  is the lease holder, or the delegate of the file's subtree (see [Delegations](delegations.md)). It also holds the file's
   lock table.
 - **Grant**: a node's shared or exclusive right to lock one whole file,
   given by the owning sequencer and leased for a short time.
@@ -1795,8 +1794,8 @@ found no owner for the whole cut, and their grants lapsed under their
 I/O while the root had them and would have renewed them
 (`locks-blips-tight-delegated`: 482 fenced I/Os in 4000 seeds, now 0).
 
-Name-hash range delegations need nothing extra: a file's lock owner is
-resolved from its primary link, like every other ownership lookup.
+A file's lock owner is resolved from its primary link, like every other
+ownership lookup.
 
 ### Without P2P
 

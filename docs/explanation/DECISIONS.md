@@ -752,9 +752,8 @@ delegate subtrees to their dominant writers over P2P.
   dominant writer rather than be spread.
 - **Hot shared directories** (plan 30 M12): parent attributes merge
   commutatively (HLC timestamps with `max`, `nlink` as deltas), creates
-  and unlinks hold their parent *shared*, and a directory can be split
-  into up to 16 name-hash ranges (GIGA+), each delegated separately.
-  Placement delegates a range only to a writer that dominates it.
+  and unlinks hold their parent *shared*. (A directory could also be
+  split into up to 16 name-hash ranges, GIGA+; plan 46 D5 deleted that, ADR-38.)
 - Offline designations are non-stealable delegations: the same
   machinery without TTL expiry.
 
@@ -764,11 +763,8 @@ cost moves to cross-subtree ops (a recall round trip, or a TTL wait if
 the delegate is gone) and to the root, which must stay reachable to
 append streams. The root lease stays put while any delegation or lock
 grant is live. No delegation exists inside a continuation epoch.
-Automatic hash-range splits fire only when writers' names fall into
-distinct hash ranges; names hashed uniformly across writers give no
-range a dominant writer, and splitting such a directory measured
-20–40% slower on a LAN than leaving it with the root, so placement
-leaves it alone. Manual `delegate --range` remains available.
+(Hash-range splits of a hot directory, once part of this decision,
+measured slower on real names and were deleted by plan 46 D5, ADR-38.)
 
 **Rejected**: per-subtree partitions with their own logs (ADR-5's
 original plan; cross-partition ops need distributed commit).
@@ -784,7 +780,7 @@ optimistic commits (ADR-28).
 [`crates/authority/src/core/placement.rs`](../../crates/authority/src/core/placement.rs),
 [`crates/meta/src/delegation.rs`](../../crates/meta/src/delegation.rs),
 [`crates/meta/src/hlc.rs`](../../crates/meta/src/hlc.rs);
-models `crates/model/src/delegation.rs`, `crates/model/src/hotdir.rs`.
+model `crates/model/src/delegation.rs` (the model `hotdir.rs` went with the splits, plan 46 D5).
 Amends ADR-5, ADR-14 and ADR-15.
 
 **Amended (a stuck core and delegations, plan 41)**: both ends of a
@@ -1718,8 +1714,8 @@ crash drops the create at the strand and replays the rename, which fails on a
 name never created; I5 allows this, the answer was `Lone`, but nothing is
 gained by it; the same held for a delegate that turned lone after journaling
 `DelegGroup` rows). The rule spans the node's generations, not one: a node
-can hold two generations whose keys meet with neither ending (two ranges of a
-split directory, or a range and a whole subtree: an unlink of a file's primary
+could hold two generations whose keys meet with neither ending (two ranges of a
+split directory, or a range and a whole subtree; ranges are deleted, D5: an unlink of a file's primary
 link moves the file's own keys to the generation of its next link), and a
 takeover ends all of them together, so an open gated row of any of them holds
 the `Lone` rows of the others (2026-10-30: found by review; a `setxattr` past
@@ -2197,10 +2193,16 @@ the default `auto` stands unless the R8 measurements fail it).
 ## ADR-38: Automatic directory hash-range splits are off by default
 
 **Superseded by [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
-(plan 46 M1.2)**: the split mechanism is deleted, not kept as an expert
-setting (`CONSTELLATION_DELEGATION_SPLIT`, `delegate --range`, `range`
-on the record, `place_splits`); it was the main source of a node holding
-several generations. The evidence below stands as the reason.
+(plan 46 M1.2)**: the ranges are deleted by plan 46 D5 (done in M1.2
+step 1), not kept as an expert setting: `CONSTELLATION_DELEGATION_SPLIT`,
+`delegate --range` (clap refuses it), the `range` of the delegation
+record and table (`DirOwner::Split`, `GenState`), `place_splits` and the
+placement's split half, the model `hotdir`, the harness scenarios
+`hash-range-split-merge`, `cross-range-rename` and `two-gens-ack-cost`,
+the `shared-dir-split*` sims and the benchmark's configurations `b` and
+`c`. It was the main source of a node holding several generations. The
+text below is the decision as it stood; the evidence stands as the reason
+for the deletion.
 
 **Context**: plan 30 §M12 lets the root's placement split a hot shared
 directory into 2 to 16 name-hash ranges (GIGA+) and delegate each range to
@@ -2336,8 +2338,9 @@ of `/a/x` that wrote `/b/marker` shares no key) and the cost of the whole
 session is small (below).
 
 **Evidence** (the simulation, release build; the harness on one box):
-- `delegated-two-gens-one-backed` (node 2 holds `d1` backed and a range of
-  `d2` unbacked, writes in both at once, loses the root and dies): with
+- `delegated-two-gens-one-backed` (deleted with the ranges, plan 46 D5;
+  node 2 held `d1` backed and a range of
+  `d2` unbacked, wrote in both at once, lost the root and died): with
   the rule off, 40 of 200 seeds answered a write the log never carried
   (`returned success but completed 0 times`); with it, none of 2,000.
 - The cost in the simulation, `delegated-two-gens-backed` (the same node,

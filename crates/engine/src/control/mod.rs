@@ -650,9 +650,7 @@ pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
         })
     });
     unary::<DesignationOffline>(r, svc, |s, _, p| ack(s.offline(&p.path, p.read_only)));
-    unary::<DesignationDelegate>(r, svc, |s, _, p| {
-        ack(s.delegate(&p.path, p.node, p.range.as_deref()))
-    });
+    unary::<DesignationDelegate>(r, svc, |s, _, p| ack(s.delegate(&p.path, p.node)));
     unary::<DesignationUndelegate>(r, svc, |s, _, p| ack(s.undelegate(&p.path)));
     unary::<DesignationListDelegations>(r, svc, |s, _, _| {
         Ok(DelegationListing {

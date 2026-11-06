@@ -1511,13 +1511,6 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m11::delegate_crash_with_backup,
     },
     Scenario {
-        name: "two-gens-ack-cost",
-        desc: "ADR-39's cost: b holds /d1 whole and range 0/2 of /d2, both backed by c, and four threads on b create files in both at once, then in /d1 only; prints the create latencies and the acknowledgements that waited for the other generation (run with CONSTELLATION_BIN for a binary without the rule)",
-        requires: &[],
-        caps: &[],
-        run: m11::two_gens_ack_cost,
-    },
-    Scenario {
         name: "delegate-root-loss",
         desc: "two nodes, b the root's backup and the delegate of /d1, writing and fsyncing \
                there; the root is kill -9ed: b takes the root over and no write + fsync waits \
@@ -1617,24 +1610,10 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "shared-dir-multi-writer",
-        desc: "plan 30 M12: four nodes creating unique names in one directory; the single sequencer (three nodes forwarding every create) against the directory split into four hash ranges (three delegated, one the root's): throughput, every name on every node, an identical listing everywhere, no S3 request added per file",
+        desc: "plan 30 M12: four nodes creating unique names in one directory under the single sequencer (three nodes forwarding every create): every name on every node, an identical listing everywhere, no S3 request added per file",
         requires: &[],
         caps: &[],
         run: m11::shared_dir_multi_writer,
-    },
-    Scenario {
-        name: "hash-range-split-merge",
-        desc: "plan 30 M12: the placement, with automatic splits turned on (CONSTELLATION_DELEGATION_SPLIT=20; they are off by default), splits a hot shared directory written by four nodes into hash ranges delegated to them; when the writers stop the ranges are recalled after the dwell and the directory is whole again; everything converges",
-        requires: &[],
-        caps: &[],
-        run: m11::hash_range_split_merge,
-    },
-    Scenario {
-        name: "cross-range-rename",
-        desc: "plan 30 M12: a directory split two ways by hand; a rename from one range into the other is a cross-range op: the root recalls both ranges, executes it after their streams and delegates both again; the file is where the rename put it everywhere, the delegates execute locally again",
-        requires: &[],
-        caps: &[],
-        run: m11::cross_range_rename,
     },
     Scenario {
         name: "inbox-create-storm-p2p-off",
@@ -2328,7 +2307,7 @@ pub const SCENARIOS: &[Scenario] = &[
 pub const CAMPAIGN: &[Scenario] = &[
     Scenario {
         name: "dirsplit-bench",
-        desc: "directory hash-range split benchmark (bench/dirsplit): a root and N writers placed on sites with per-node S3 latency and per-pair P2P delay; one hot directory per phase under splits off, the automatic placement, a hand split one range per writer, or the directory delegated whole; throughput, op latency, root CPU, S3 requests, errors, appended as JSON to DIRSPLIT_OUT (settings in DIRSPLIT_*; the process S3 backend and sudo tc)",
+        desc: "hot shared directory benchmark (bench/dirsplit): a root and N writers placed on sites with per-node S3 latency and per-pair P2P delay; one hot directory per phase under the automatic placement or delegated whole; throughput, op latency, root CPU, S3 requests, errors, appended as JSON to DIRSPLIT_OUT (settings in DIRSPLIT_*; the process S3 backend and sudo tc)",
         requires: &[],
         caps: &[],
         run: dirsplit::dirsplit_bench,
