@@ -157,19 +157,44 @@
 //! checked in as its path length (`TRACES` in that file; regenerate with
 //! `RECORD_TRACES=1`).
 //!
-//! The two maintainer decisions of 2026-11-06 recorded by chunk 11 (plan
-//! 46 §11): **claim = release** (a sticky holder that takes the root
-//! journals the release of its directories before its verbatim re-append
-//! and the end, so the end is the holder's own) and **recall, else expire**
-//! (the abandon first recalls the stream's read delegations; a reader that
-//! cannot be reached is waited out, as a cut waits for the recall; the
-//! model's `RecallRead` stands for either, and no read delegation is
-//! granted on an ended stream). The combined topologies X3 with an
-//! ill-formed roster (a placed grant to a peer while the roster is the root
-//! alone) stays out: it is not a configuration the product can reach.
+//! The maintainer decisions of 2026-11-06 recorded by chunk 11 and the
+//! M1.0 review fixes (plan 46 §11): **claim = release** (a sticky holder
+//! that takes the root journals the release of its directories before its
+//! verbatim re-append and the end, so the end is the holder's own);
+//! **recall, else expire** (the abandon and a claim's release first
+//! recall the stream's read delegations, `RecallRead`; a reader whose
+//! holder is down is waited out, the root's clock `ExpireRead`, as a cut
+//! waits for the recall; no read delegation is granted on an ended stream);
+//! **leave ends grants first** (a node leaves the roster only once its
+//! grant is ended, by its release or the operator's abandon, so the
+//! roster-only singleton test never sees a live grant off-roster:
+//! `no_live_grant_off_roster`, knob `leave_keeps_grants`, topology X3b).
+//! The review's MUST-1: a partial `SubtreeReleased` is not the holder's
+//! release of the stream; the end, the claim's release and
+//! `sticky_ends_only_by_holder_or_operator` need the released directories
+//! to cover the held set (knob `partial_release_ends_stream`, topology
+//! `sticky(1, D1|D2)`).
+//!
+//! What the properties do and do not carry (M1.0 review, stated so the
+//! M1.1 to M1.4 gates are not read as stronger than they are):
+//!
+//! - X1 has **one writer** (node 2): it composes the faults (a crash, a
+//!   deposition, the TTL end, the history and the causal cut), not
+//!   concurrent writers; concurrency is in X2 to X4 and the chunk
+//!   topologies.
+//! - `ack_implies_committed_by_config` (I1) is **definitional for `Final`**:
+//!   an answer by a `Final` rule is committed by construction. The sticky
+//!   guarantee rests on `acked_at_or_below_cut`, `sticky_ends_only_by_holder_or_operator`
+//!   and I5 (`rollback_only_singleton_or_operator`), not on I1.
+//! - Chunk 10's `hold_answer_committed_or_final` ([`flex`]) is
+//!   **definitional in the model**: a crash keeps the owner's journal and
+//!   the member's copy, and nothing is retired. M1.4's gate is therefore
+//!   the product's, not the model's: the flex crash sims under the strict
+//!   flags (`epoch-member-dies-with-chunk`, `flex-crash`) must be run as
+//!   fail-before for M1.4.
 //!
 //! ## Timing of the M1.0 suite (release, 16-core shared box, 4 test
-//! threads; the whole crate, ignored tests excluded, 254 s)
+//! threads; the whole crate, ignored tests excluded, 298 s after the review fixes)
 //!
 //! | Test | Unique states | Time |
 //! |---|---|---|
@@ -178,8 +203,11 @@
 //! | `c11_design_x2_sticky_and_placed` | 345k | 1.4 s |
 //! | `c11_design_x2r_reads_and_deadlines` | 905k | 3.4 s |
 //! | `c11_design_x3_roster_and_grants` | 104k | 0.3 s |
-//! | `c11_design_x4_claim_and_sticky` | 1.74M | 6 s |
-//! | `--test node_stream` (70 tests) | | 30 s |
+//! | `c11_design_x3b_leave_ends_grants` | 20k | 0.1 s |
+//! | `c11_design_x4_claim_and_sticky` (with reads) | 5.37M | 22 s |
+//! | `c7_design_t1_crash_reads_abandon` | 485k | 2 s |
+//! | `r1_design_partial_release_does_not_end_the_stream` | 22k | 0.1 s |
+//! | `--test node_stream` (77 tests) | | 30 s |
 //! | `--test locks` (68 tests, the largest) | | 101 s |
 //!
 //! A topology that would exceed its cap (10M unique states, about 1 GB per
@@ -283,7 +311,8 @@
 //! | `Release`, `ReleaseAll`, `Grow`, `Stop`, `End` | `meta/src/delegation.rs::DelegationTable::apply` (`DelegationRecord`), `delegate.rs::deleg_handed_back_to`/`deleg_end_sealed`. **Gap:** `SubtreeReleased`/`StreamReleased`/`DelegateNodeEnded` stream rows and recall as a request (M1.2); the sticky grant kind and the holder's release (M1.3); claim = release (the claim's release record, not built) |
 //! | `Learn`, `Durable` | `delegate.rs::deleg_learn_root` (the delegate's install of the root's journal), the archive's durable apply |
 //! | `Abandon` | `seal_tail.rs::on_control_abandon_group` is the group-wide ancestor. **Gap:** `repair abandon --node` (M1.3), and its read recall, else expiry (not built) |
-//! | `Join`, `Leave`, `SeeRoster` | the roster and `first_peer_join` (`lease.rs`, `backup.rs::backup_candidacies`). **Gap:** the journaled singleton-to-peer `config_version` bump (M1.1 step 5) |
+//! | `ExpireRead` | the read grant's expiry in `meta/src/readdeleg.rs` (the root's clock; independent of the holder). **Gap:** the abandon's and the claim's wait for it (M1.3) |
+//! | `Join`, `Leave`, `SeeRoster` | the roster and the lease's singleton test (`lease.rs`, `backup.rs::backup_candidacies`; no `first_peer_join` identifier exists in the product: the peer-join logic is spread over these). **Gap:** the journaled singleton-to-peer `config_version` bump (M1.1 step 5). **Product gap: `Leave` must end the node's grants first** (the holder's release, the root's abandon for a dead node) before the node leaves the roster (M1.1 step 5 / the roster code) |
 //! | `Deadline` | `holder.rs::settle_refusal`/`gate_settle` (the `Refused{rid, ABANDONED}` before an `EIO`) |
 //! | `GrantRead`, `RecallRead` | `meta/src/readdeleg.rs` (`grant`, `recall`, `recall_inos`), `delegate.rs::deleg_read_recall_pending`; the model's bit is one stream's read delegation. **Gap:** S4's recall before the cut (M1.3) |
 //!

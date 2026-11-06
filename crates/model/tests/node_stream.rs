@@ -251,6 +251,22 @@ fn assert_finds_within(
 /// label is missing here fails, so no knob goes unrecorded.
 const TRACES: &[(&str, &str, usize)] = &[
     (
+        "c7-t1-crash+reads+abandon_skips_read_recall",
+        "settle_after_reads_recalled",
+        6,
+    ),
+    ("c11-x3b+leave_keeps_grants", "no_live_grant_off_roster", 7),
+    (
+        "c11-x4+claim_skips_read_recall",
+        "settle_after_reads_recalled",
+        5,
+    ),
+    (
+        "r1-sticky-d1d2+partial_release_ends_stream",
+        "sticky_ends_only_by_holder_or_operator",
+        8,
+    ),
+    (
         "c11-x2r+abandon_skips_read_recall",
         "settle_after_reads_recalled",
         6,
@@ -1196,6 +1212,14 @@ fn c7_design_t1_crash_abandon() {
     assert_clean_within("c7-t1-crash", &c7_t1_crash(), CAP_LARGE);
 }
 
+/// C7-T1 with one crash, the holder's read delegation and the abandon (M1.0
+/// review SHOULD-1): a dead holder cannot recall, so the abandon waits for
+/// the read grant's expiry, "recall, else expire".
+#[test]
+fn c7_design_t1_crash_reads_abandon() {
+    assert_clean_within("c7-t1-crash+reads", &c7_t1_crash().with_reads(1), CAP_LARGE);
+}
+
 #[test]
 fn c7_design_t2_orphan_rule_no_tail_claim() {
     assert_clean_within("c7-t2", &c7_t2(), CAP_LARGE);
@@ -1582,10 +1606,10 @@ fn c11_x2r_reads_and_deadlines() -> NodeStreamModel {
         .with_deadlines(1)
 }
 
-/// X3, the roster with grants: the root alone in the roster at first, with
-/// a sticky grant of its own minted at run time on `/D1` (never `/`), and a
-/// placed delegate on `/D2` (node 2); the peers join (the bump), node 1 may
-/// leave, and one deposition.
+/// X3, the roster with the root's own grant: the root alone in the roster at
+/// first, with a sticky grant of its own minted at run time on `/D1` (never
+/// `/`); node 1 joins (the bump) and may leave (the bump back), and one
+/// deposition. (The placed delegate that leaves is X3b.)
 fn c11_x3_roster_and_grants() -> NodeStreamModel {
     NodeStreamModel::design(vec![
         vec![create(D1A), create(RA)],
@@ -1597,17 +1621,34 @@ fn c11_x3_roster_and_grants() -> NodeStreamModel {
     .with_faults(0, 1)
 }
 
+/// X3b, "Leave ends grants first" (M1.0 review SHOULD-2): node 2 is in the
+/// roster and holds `/D2` placed (no recorded backup: its group is
+/// `{delegate, root}`); node 1 joins. Node 2 may leave, and only after its
+/// grant is ended by its own release (`StreamReleased`, then the root's
+/// `DelegateNodeEnded`); the root then sees a roster without it and is a
+/// singleton again (the bump). The root writes `/D2/b` (forwarded to the
+/// holder, or its own once released), node 2 writes `/D2/a`.
+fn c11_x3b_leave_ends_grants() -> NodeStreamModel {
+    NodeStreamModel::design(vec![vec![create(D2B)], vec![], vec![create(D2A)]])
+        .with_grant(placed(2, D2, 0))
+        .with_stream_release(1)
+        .with_roster(0b101, 1 << 1, 1 << 2)
+}
+
 /// X4, the claim with a sticky grant: node 1 backs the root and holds
 /// `/D1` placed with node 2 as its backup, may claim the lease
 /// (re-appending verbatim) and end its generation; node 2 holds a sticky
 /// grant minted at run time on `/D2`, writes into `/D1`, and may claim
-/// next. Two depositions.
+/// next. Both streams grant a read delegation, which a claim's release
+/// waits for (M1.0 review SHOULD-1). Two depositions.
 fn c11_x4_claim_and_sticky() -> NodeStreamModel {
     let mut m = NodeStreamModel::design(vec![vec![], vec![create(D1A)], vec![create(D2A)]])
         .with_root_backups(1 << 1)
         .with_grant(placed(1, D1, 1 << 2))
         .with_grant(sticky(2, 0))
         .with_grow(2, D2)
+        .with_reads(1)
+        .with_reads(2)
         .with_faults(0, 2);
     m.delegate_may_claim = true;
     m.shadow_replay = true;
@@ -1640,6 +1681,11 @@ fn c11_design_x3_roster_and_grants() {
 }
 
 #[test]
+fn c11_design_x3b_leave_ends_grants() {
+    assert_clean_within("c11-x3b", &c11_x3b_leave_ends_grants(), CAP_LARGE);
+}
+
+#[test]
 fn c11_design_x4_claim_and_sticky() {
     assert_clean_within("c11-x4", &c11_x4_claim_and_sticky(), CAP_LARGE);
 }
@@ -1669,6 +1715,88 @@ fn c11_knob_abandon_skips_read_recall_is_found() {
         "c11-x2r+abandon_skips_read_recall",
         &m,
         "settle_after_reads_recalled",
+        CAP_LARGE,
+    );
+}
+
+// ----------------------------------------------- the M1.0 review fixes
+
+/// MUST-1: node 1 holds `/D1` and `/D2` sticky in one stream; the root's
+/// move out of `/D1` requests the release of `/D1` only (a
+/// `SubtreeReleased`); node 1 writes `/D2/a` and may claim the lease (the
+/// claim's release covers what is left). A partial release is not the
+/// holder's release of the stream.
+fn r1_sticky_two_dirs_partial_release() -> NodeStreamModel {
+    let mut m = NodeStreamModel::design(vec![vec![mv(D1B, RB)], vec![create(D2A)]])
+        .with_initial(present(&[D1B]))
+        .with_grant(sticky(1, D1 | D2))
+        .with_stream_release(1)
+        .with_faults(0, 1);
+    m.delegate_may_claim = true;
+    m
+}
+
+#[test]
+fn r1_design_partial_release_does_not_end_the_stream() {
+    assert_clean_within(
+        "r1-sticky-d1d2",
+        &r1_sticky_two_dirs_partial_release(),
+        CAP_LARGE,
+    );
+}
+
+/// The old rule: any `Released` row is the holder's release of the stream
+/// (the root's end after it, and the claim's skipped release).
+#[test]
+fn r1_knob_partial_release_ends_stream_is_found() {
+    let mut m = r1_sticky_two_dirs_partial_release();
+    m.partial_release_ends_stream = true;
+    assert_finds_within(
+        "r1-sticky-d1d2+partial_release_ends_stream",
+        &m,
+        "sticky_ends_only_by_holder_or_operator",
+        CAP_LARGE,
+    );
+}
+
+/// SHOULD-1: the operator's abandon of a dead holder's stream waits for the
+/// holder's read delegation to expire; the knob abandons at once.
+#[test]
+fn r1_knob_abandon_skips_read_expiry_is_found() {
+    let mut m = c7_t1_crash().with_reads(1);
+    m.abandon_skips_read_recall = true;
+    assert_finds_within(
+        "c7-t1-crash+reads+abandon_skips_read_recall",
+        &m,
+        "settle_after_reads_recalled",
+        CAP_LARGE,
+    );
+}
+
+/// SHOULD-1: a claim's release does not wait for the claimant's read
+/// delegation: the new root acts in the directory while it is granted.
+#[test]
+fn r1_knob_claim_skips_read_recall_is_found() {
+    let mut m = c11_x4_claim_and_sticky();
+    m.claim_skips_read_recall = true;
+    assert_finds_within(
+        "c11-x4+claim_skips_read_recall",
+        &m,
+        "settle_after_reads_recalled",
+        CAP_LARGE,
+    );
+}
+
+/// SHOULD-2: a node leaves the roster with its grant live; the root, a
+/// singleton by the roster alone, answers a delegate row from its disk.
+#[test]
+fn r1_knob_leave_keeps_grants_is_found() {
+    let mut m = c11_x3b_leave_ends_grants();
+    m.leave_keeps_grants = true;
+    assert_finds_within(
+        "c11-x3b+leave_keeps_grants",
+        &m,
+        "no_live_grant_off_roster",
         CAP_LARGE,
     );
 }

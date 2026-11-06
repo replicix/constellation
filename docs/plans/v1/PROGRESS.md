@@ -67247,3 +67247,15 @@ to expire, as a cut does; no read grant on an ended stream; knob `abandon_skips_
 clean with every knob off, every `sometimes` witness reached; each knob's counterexample length is in `TRACES` (43 entries, `RECORD_TRACES=1` to
 regenerate). Box 1, release: the crate's suite 254 s (4 test threads, ignored tests excluded); `--test node_stream` 30 s. Product gaps named in the
 `lib.rs` mapping table: M1.1 steps 5 to 7, M1.2 to M1.4, the claim's release record, abandon's recall, else expiry. Go/no-go and the fable review: open.
+
+### Plan 46 M1.0 review fixes (2026-11-06)
+
+`crates/model/src/node_stream.rs`, `tests/node_stream.rs`, the `lib.rs` doc, plan 46 §11. The C11 review (fable) cleared with conditions; all three are
+fixed in the model with their knobs found and the design clean. **MUST-1:** a partial `SubtreeReleased` is not the holder's release of the stream (the
+root's end, the claim's own release and `sticky_ends_only_by_holder_or_operator` need the released directories to cover the held set; topology
+`sticky(1, D1|D2)`, knob `partial_release_ends_stream`). **SHOULD-1, "recall, else expire":** the read grant's expiry is the root's clock event
+(`ExpireRead`), so a dead holder's read grant is waited out and the abandon is reachable; a claim's release waits for the claimant's read delegation too
+(knobs `abandon_skips_read_recall` on x4/c7-t1-crash with reads, `claim_skips_read_recall`). **SHOULD-2, "Leave ends grants first":** `Leave` is enabled
+only once the node's grants are ended (its release, or the abandon of a dead node); property `no_live_grant_off_roster`, knob `leave_keeps_grants`,
+topology X3b. Product gap marked in the `lib.rs` mapping: `Leave` must end grants first (M1.1 step 5). The `lib.rs` doc now states that C10's hold
+property and I1 for `Final` are definitional and that M1.4's gate is the strict flex crash sims as fail-before.

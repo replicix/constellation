@@ -205,10 +205,25 @@
 //!   void, and every answered one is **exported** as a conflict copy
 //!   ([`State::exported`]); it stops when it learns the end. The abandon
 //!   first recalls the stream's read delegations, else waits for their
-//!   expiry, as a cut does (decision 2026-11-06; one `RecallRead` stands for
-//!   either); knob `abandon_skips_read_recall`.
+//!   expiry, as a cut does (decision 2026-11-06). The holder's recall is
+//!   [`Action::RecallRead`]; the expiry is the root's clock
+//!   ([`Action::ExpireRead`], offered where the holder cannot recall: it is
+//!   down, stopped, or the root), so a dead holder's read grant is waited
+//!   out and the abandon is reachable. A lease claim's release waits for
+//!   the claimant's read delegation the same way. Knobs
+//!   `abandon_skips_read_recall`, `claim_skips_read_recall`. (A TTL or seal
+//!   end with a read grant outstanding is not modeled: the read grant is
+//!   capped by the grant's TTL.)
 //! - A crashed sticky holder keeps its disk: its rows are not lost, the
 //!   subtree blocks until it returns (not modeled) or the abandon.
+//! - **A partial release is not the stream's release** (M1.0 review,
+//!   MUST-1): the holder's release of the stream is a `StreamReleased` or
+//!   `SubtreeReleased` rows that together cover the held set
+//!   ([`held_dirs`]: the grant's directories and its `Grow` records);
+//!   the root's `DelegateNodeEnded`, the claim's own release and
+//!   `sticky_ends_only_by_holder_or_operator` all use that definition
+//!   (knob `partial_release_ends_stream` restores "any release row" for the
+//!   end and the claim, not for the property).
 //! - **Epochs and minting (ADR-43).** Each tenure has an epoch
 //!   ([`State::epoch`]); a grant is minted by the first `DelegateNode`
 //!   record of its number ([`State::minted`]); a later tenure may journal a
@@ -233,6 +248,14 @@
 //!   root with no backup), so nothing after it is answered alone until it
 //!   commits, and rows before it keep their rule. A singleton
 //!   configuration's rule is the root's disk ([`NodeStreamModel::rule_of`]).
+//! - **Leave ends grants first** (M1.0 review, SHOULD-2; maintainer
+//!   decision 2026-11-06): [`Action::Leave`] is enabled only when the node
+//!   holds no live grant (minted, not ended): the holder released it (the
+//!   release row, then the root's `DelegateNodeEnded`; a placed stream
+//!   ends the same way once its release is shown) or, for a dead node, the
+//!   operator abandoned it. So the roster-only singleton test never sees a
+//!   live grant held off-roster (`no_live_grant_off_roster`); knob
+//!   `leave_keeps_grants` is the old behaviour.
 //! - **Death then join** (Q6): a joined peer may claim from the archive; a
 //!   singleton's answered rows it does not carry are exported (rows of the
 //!   singleton's own clients journaled while its view had no peer); any
@@ -361,6 +384,12 @@
 //!   ends a sticky stream without first recalling (or waiting out) its read
 //!   delegations; the root then acts in the directory while a reader holds
 //!   a grant.
+//! - `partial_release_ends_stream` (M1.0 review MUST-1): a partial
+//!   `SubtreeReleased` counts as the holder's release of the stream.
+//! - `claim_skips_read_recall` (M1.0 review SHOULD-1): a lease claim's
+//!   release does not wait for the claimant's read delegation.
+//! - `leave_keeps_grants` (M1.0 review SHOULD-2): a node leaves the roster
+//!   with its grant live.
 //! - `drop_member_copy` (chunk 6, L2b): the members retire their copies of
 //!   a stream when its end is journaled, before the log carries it.
 //! - `l1_mark_cleared_by_stream` (chunk 6, L1): the streamed install of the
@@ -689,6 +718,14 @@ pub const SAW_READ_RECALLED: u64 = 1 << 38;
 pub const SAW_JOIN_BUMP: u64 = 1 << 39;
 /// Chunk 8: a peer left and the root bumped to the singleton.
 pub const SAW_LEAVE_BUMP: u64 = 1 << 40;
+/// M1.0 review: the operator abandoned the stream of a dead holder after
+/// its read delegation had expired.
+pub const SAW_ABANDON_DEAD_READ: u64 = 1 << 41;
+/// M1.0 review: a node left the roster after ending its grant.
+pub const SAW_LEAVE_ENDED_GRANT: u64 = 1 << 42;
+/// M1.0 review: a lease claim's release came after its read delegation was
+/// granted and recalled (or expired).
+pub const SAW_CLAIM_AFTER_READ: u64 = 1 << 43;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -833,6 +870,9 @@ pub enum Action {
     GrantRead(u8),
     /// Chunk 9: the holder of stream `g` recalls its read delegation.
     RecallRead(u8),
+    /// The root's clock: the read delegation of `stream` expires (the
+    /// holder need not be alive; "recall, else expire", 2026-11-06).
+    ExpireRead(u8),
 }
 
 #[derive(Clone, Debug)]
@@ -897,6 +937,21 @@ pub struct NodeStreamModel {
     /// read delegations still granted (the model before "recall, else
     /// expire"); `settle_after_reads_recalled` must find the root acting.
     pub abandon_skips_read_recall: bool,
+    /// M1.0 review fix (MUST-1), the knob: a partial `SubtreeReleased` of
+    /// a sticky stream counts as the holder's release of the whole stream
+    /// (the root ends the stream after it, and a claim skips its own
+    /// release): the model before the review. The properties keep the
+    /// strict definition, so `sticky_ends_only_by_holder_or_operator` must
+    /// find the end.
+    pub partial_release_ends_stream: bool,
+    /// M1.0 review fix (SHOULD-1), the knob: a lease claim's release (the
+    /// claimant's own stream) does not wait for the stream's read
+    /// delegation to be recalled or to expire.
+    pub claim_skips_read_recall: bool,
+    /// M1.0 review fix (SHOULD-2), the knob: a node leaves the roster with
+    /// its grant still live (the model before "Leave ends grants first");
+    /// `no_live_grant_off_roster` must find it.
+    pub leave_keeps_grants: bool,
     pub drop_member_copy: bool,
     pub l1_mark_cleared_by_stream: bool,
     /// Chunk 7: streams the operator may abandon (at most one abandon).
@@ -976,6 +1031,9 @@ impl NodeStreamModel {
             no_reappend: false,
             claim_ends_sticky_silently: false,
             abandon_skips_read_recall: false,
+            partial_release_ends_stream: false,
+            claim_skips_read_recall: false,
+            leave_keeps_grants: false,
             drop_member_copy: false,
             l1_mark_cleared_by_stream: false,
             abandon: Vec::new(),
@@ -1839,15 +1897,16 @@ pub fn rollback_only_singleton_or_operator(s: &State) -> bool {
 /// operator's `abandon` (or, never having been in the log, by ADR-43's
 /// orphan rule: `orphan_rule_never_ends_an_answering_grant`).
 pub fn sticky_ends_only_by_holder_or_operator(m: &NodeStreamModel, s: &State) -> bool {
-    ended_kinds(m, s, GrantKind::Sticky)
-        .all(|g| s.abandoned & (1 << g) != 0 || s.orphaned & (1 << g) != 0 || holder_released(s, g))
+    ended_kinds(m, s, GrantKind::Sticky).all(|g| {
+        s.abandoned & (1 << g) != 0 || s.orphaned & (1 << g) != 0 || holder_released(m, s, g)
+    })
 }
 
 /// `designation_final` (re-proved under node streams): a designation ends
 /// only by its holder's release (`online`), and no answer of it is ever
 /// past a cut.
 pub fn designation_final(m: &NodeStreamModel, s: &State) -> bool {
-    ended_kinds(m, s, GrantKind::Designated).all(|g| holder_released(s, g))
+    ended_kinds(m, s, GrantKind::Designated).all(|g| holder_released(m, s, g))
         && s.acked.iter().all(|&(_, _, g, idx)| {
             g == ROOT
                 || m.grants[g as usize - 1].kind != GrantKind::Designated
@@ -1865,12 +1924,62 @@ fn ended_kinds<'a>(
         .filter(move |&g| m.grants[g as usize - 1].kind == kind && ended(s, g).is_some())
 }
 
-/// Stream `g`'s holder journaled the release of everything it held.
-fn holder_released(s: &State, g: u8) -> bool {
-    s.streams[g as usize]
+/// Every directory stream `g` holds by its grant or by a `Grow` record in
+/// the root's journal.
+fn held_dirs(m: &NodeStreamModel, s: &State, g: u8) -> u8 {
+    s.streams[ROOT as usize]
         .rows
         .iter()
+        .fold(m.grants[g as usize - 1].dirs, |acc, r| match r.kind {
+            RowKind::Grow { stream, dirs } if stream == g => acc | dirs,
+            _ => acc,
+        })
+        & !1
+}
+
+/// The union of the directories the `Released` rows of stream `g` in
+/// `rows` name.
+fn released_dirs(rows: &[Row], g: u8) -> u8 {
+    rows.iter().fold(0, |acc, r| match r.kind {
+        RowKind::Released { dirs, .. } if r.stream == g => acc | dirs,
+        _ => acc,
+    })
+}
+
+/// Stream `g`'s holder released everything it held (M1.0 review MUST-1):
+/// a `StreamReleased`, or `SubtreeReleased` rows that together cover the
+/// held set. A partial release is not the end of the stream.
+fn holder_released(m: &NodeStreamModel, s: &State, g: u8) -> bool {
+    let rows = &s.streams[g as usize].rows;
+    rows.iter()
         .any(|r| matches!(r.kind, RowKind::Released { .. }))
+        && released_dirs(rows, g) & held_dirs(m, s, g) == held_dirs(m, s, g)
+}
+
+/// The root's journal shows the holder's release of stream `g`: of the whole
+/// held set (the knob `partial_release_ends_stream`: of anything).
+fn release_shown(m: &NodeStreamModel, s: &State, g: u8) -> bool {
+    let rows = &s.streams[ROOT as usize].rows;
+    let any = rows
+        .iter()
+        .any(|r| r.stream == g && matches!(r.kind, RowKind::Released { .. }));
+    any && (m.partial_release_ends_stream
+        || released_dirs(rows, g) & held_dirs(m, s, g) == held_dirs(m, s, g))
+}
+
+/// M1.0 review SHOULD-2: node `node` holds a live grant (minted, not ended).
+fn live_grant(m: &NodeStreamModel, s: &State, node: u8) -> bool {
+    m.stream_of_node(node)
+        .is_some_and(|g| s.minted[g as usize] != NONE && ended(s, g).is_none())
+}
+
+/// M1.0 review SHOULD-2 (`no_live_grant_off_roster`): no grant is live
+/// while its node is out of the roster, so the roster-only singleton test
+/// never sees a peer's grant as no peer.
+pub fn no_live_grant_off_roster(m: &NodeStreamModel, s: &State) -> bool {
+    m.grants
+        .iter()
+        .all(|g| s.roster & (1 << g.node) != 0 || !live_grant(m, s, g.node))
 }
 
 /// ADR-43 against sticky grants (chunk 7): a number the orphan rule ends
@@ -2787,15 +2896,7 @@ impl Model for NodeStreamModel {
                 let drained_all = !self.non_stealable(stream)
                     || self.holder_releases_before_drain
                     || st.root_appended as usize == st.rows.len();
-                if self.stream_releases.contains(&stream)
-                    && owned
-                    && drained_all
-                    && reads_clear
-                    && !st
-                        .rows
-                        .iter()
-                        .any(|r| matches!(r.kind, RowKind::Released { .. }))
-                {
+                if self.stream_releases.contains(&stream) && owned && drained_all && reads_clear {
                     actions.push(Action::ReleaseAll(stream));
                 }
                 if self.ttl(stream) {
@@ -2814,6 +2915,13 @@ impl Model for NodeStreamModel {
                     actions.push(Action::RecallRead(stream));
                 }
             }
+            // The root's clock: the read grant expires whether or not its
+            // holder is alive ("recall, else expire"). With a live holder
+            // it has the effect of its `RecallRead`, so it is offered only
+            // where the holder cannot recall (down, stopped, or the root).
+            if s.reads & (1 << stream) != 0 && !serving {
+                actions.push(Action::ExpireRead(stream));
+            }
             // C2e: a stream whose configuration names backups ends only
             // after one of them seals; with none live it waits for the
             // group (the operator's `abandon-group`, not modeled).
@@ -2824,11 +2932,11 @@ impl Model for NodeStreamModel {
             }
             // A non-stealable stream ends once the root's journal shows the
             // holder's release (the knob: once the holder named its cut).
-            if end.is_none() && self.non_stealable(stream) && !(self.ttl(stream) && st.stopped) {
-                let shown = s.streams[ROOT as usize]
-                    .rows
-                    .iter()
-                    .any(|r| r.stream == stream && matches!(r.kind, RowKind::Released { .. }));
+            if end.is_none()
+                && (self.non_stealable(stream) || self.stream_releases.contains(&stream))
+                && !(self.ttl(stream) && st.stopped)
+            {
+                let shown = release_shown(self, s, stream);
                 let named = self.holder_releases_before_drain && st.release_through != NONE;
                 if shown || named {
                     actions.push(Action::End(stream));
@@ -2882,7 +2990,14 @@ impl Model for NodeStreamModel {
                         && s.shipped >= s.inherited
                 };
                 // A claimant is write-eligible: in the roster (chunk 8).
-                if eligible && s.live(c) && s.roster & (1 << c) != 0 {
+                // The claim's release waits for the claimant's read
+                // delegation to be recalled or to expire (the holder is the
+                // claimant: it recalls; recall, else expire).
+                let reads_clear = self.claim_skips_read_recall
+                    || self
+                        .stream_of_node(c)
+                        .is_none_or(|g| s.reads & (1 << g) == 0);
+                if eligible && reads_clear && s.live(c) && s.roster & (1 << c) != 0 {
                     actions.push(Action::Depose { claimant: c });
                 }
             }
@@ -2915,7 +3030,14 @@ impl Model for NodeStreamModel {
             if self.joiners & bit != 0 && s.joins & bit == 0 && s.roster & bit == 0 && s.live(i) {
                 actions.push(Action::Join(i));
             }
-            if self.leavers & bit != 0 && s.leaves & bit == 0 && s.roster & bit != 0 && i != s.root
+            // Leave ends grants first (maintainer decision 2026-11-06): a
+            // node leaves the roster once its grant is ended (the holder's
+            // release, or the operator's abandon of a dead node).
+            if self.leavers & bit != 0
+                && s.leaves & bit == 0
+                && s.roster & bit != 0
+                && i != s.root
+                && (self.leave_keeps_grants || !live_grant(self, s, i))
             {
                 actions.push(Action::Leave(i));
             }
@@ -3100,6 +3222,9 @@ impl Model for NodeStreamModel {
                 // seal: rows past it are lost for others and kept by the
                 // holder as conflict copies on its return (I5's export).
                 s.abandoned |= 1 << g;
+                if s.reads_granted & (1 << g) != 0 && !s.live(self.executor(&s, g)) {
+                    s.saw |= SAW_ABANDON_DEAD_READ;
+                }
                 end_stream(self, &mut s, g);
                 export_void(&mut s, g);
             }
@@ -3108,6 +3233,9 @@ impl Model for NodeStreamModel {
                 s.joins |= 1 << i;
             }
             Action::Leave(i) => {
+                if self.grants.iter().any(|g| g.node == i) {
+                    s.saw |= SAW_LEAVE_ENDED_GRANT;
+                }
                 s.roster &= !(1 << i);
                 s.leaves |= 1 << i;
             }
@@ -3119,7 +3247,7 @@ impl Model for NodeStreamModel {
                 s.reads |= 1 << g;
                 s.reads_granted |= 1 << g;
             }
-            Action::RecallRead(g) => {
+            Action::RecallRead(g) | Action::ExpireRead(g) => {
                 s.reads &= !(1 << g);
             }
             Action::Grow(k) => {
@@ -3166,7 +3294,7 @@ impl Model for NodeStreamModel {
                     end_stream_at(self, &mut s, g, through);
                     return Some(finish(self, s));
                 }
-                let released = self.non_stealable(g) && holder_released(&s, g);
+                let released = self.non_stealable(g) && holder_released(self, &s, g);
                 if !self.end_before_seal {
                     let exec = self.executor(&s, g);
                     let avail = available(&s, g, exec);
@@ -3388,6 +3516,12 @@ impl Model for NodeStreamModel {
                 }
             }
             Action::Depose { claimant } => {
+                if self
+                    .stream_of_node(claimant)
+                    .is_some_and(|g| s.reads_granted & (1 << g) != 0)
+                {
+                    s.saw |= SAW_CLAIM_AFTER_READ;
+                }
                 let old = s.root;
                 s.down |= 1 << old;
                 s.depositions += 1;
@@ -3487,16 +3621,20 @@ impl Model for NodeStreamModel {
                         // decision 2026-11-06): a sticky holder's claim
                         // journals the release of its grant in the same
                         // step, so the end that follows is the holder's.
-                        if self.non_stealable(g)
-                            && !self.claim_ends_sticky_silently
-                            && !s.streams[g as usize]
+                        // The release covers everything the grant held that a
+                        // release of its own has not yet returned (MUST-1:
+                        // a partial one is not the holder's whole release).
+                        let released = if self.partial_release_ends_stream {
+                            s.streams[g as usize]
                                 .rows
                                 .iter()
                                 .any(|r| matches!(r.kind, RowKind::Released { .. }))
-                        {
-                            let dirs = (1..DIRS)
-                                .filter(|&d| deleg_owns(self, &s, g, d))
-                                .fold(0u8, |m, d| m | (1 << d));
+                        } else {
+                            holder_released(self, &s, g)
+                        };
+                        if self.non_stealable(g) && !self.claim_ends_sticky_silently && !released {
+                            let dirs = held_dirs(self, &s, g)
+                                & !released_dirs(&s.streams[g as usize].rows, g);
                             push_release(&mut s, g, dirs);
                         }
                         if !self.no_reappend {
@@ -3590,6 +3728,10 @@ impl Model for NodeStreamModel {
                 acked_never_lost(m, s)
             }),
             Property::always("exactly_once", |_, s: &State| exactly_once(s)),
+            Property::always(
+                "no_live_grant_off_roster",
+                |m: &NodeStreamModel, s: &State| no_live_grant_off_roster(m, s),
+            ),
             Property::always("row_version_matches_config", |_, s: &State| {
                 row_version_matches_config(s)
             }),
@@ -3906,7 +4048,32 @@ impl NodeStreamModel {
                 w!("settle_by_release", SAW_SETTLE_RELEASE);
             }
         }
-        if self.reads != 0 && !self.cut_before_read_recall {
+        if self.reads != 0
+            && self.max_crashes > 0
+            && self.abandon.iter().any(|&g| self.reads & (1 << g) != 0)
+            && !self.abandon_skips_read_recall
+        {
+            w!("abandon_after_read_expiry", SAW_ABANDON_DEAD_READ);
+        }
+        if self.leavers != 0
+            && !self.leave_keeps_grants
+            && self
+                .grants
+                .iter()
+                .any(|g| self.leavers & (1 << g.node) != 0)
+        {
+            w!("leave_after_grant_ended", SAW_LEAVE_ENDED_GRANT);
+        }
+        if self.delegate_may_claim
+            && self.max_depositions > 0
+            && self.reads != 0
+            && !self.claim_skips_read_recall
+        {
+            w!("claim_after_read_recall", SAW_CLAIM_AFTER_READ);
+        }
+        let cuts = !self.stream_releases.is_empty()
+            || self.scripts.iter().flatten().any(|&op| self.spans(op));
+        if self.reads != 0 && cuts && !self.cut_before_read_recall {
             w!("read_recalled_before_cut", SAW_READ_RECALLED);
         }
     }
