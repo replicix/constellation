@@ -14,6 +14,7 @@ mod sim {
     pub mod chunks;
     pub mod clock;
     pub mod cto;
+    pub mod cut;
     pub mod epochs;
     pub mod history;
     pub mod locks;
@@ -372,6 +373,7 @@ fn replay_seed() {
         Ok("delegated-group-switch") => delegated_group_switch_config(),
         Ok("delegated-backup-crash") => delegated_backup_crash_config(),
         Ok("delegated-two-gens-one-backed") => delegated_two_gens_one_backed_config(),
+        Ok("delegated-two-dirs-one-backed") => delegated_two_dirs_one_backed_config(),
         Ok("delegated-two-gens-backed") => delegated_two_gens_backed_config(),
         Ok("delegated-two-gens-backlog") => delegated_two_gens_backlog_config(),
         Ok("delegated-designated") => delegated_designated_config(),
@@ -5632,6 +5634,7 @@ fn sweep_config() {
         "shared-dir-faults" => shared_dir_faults_config(),
         "delegated-two-gens-root-crash" => delegated_two_gens_root_crash_config(),
         "delegated-two-gens-one-backed" => delegated_two_gens_one_backed_config(),
+        "delegated-two-dirs-one-backed" => delegated_two_dirs_one_backed_config(),
         "delegated-two-gens-backed" => delegated_two_gens_backed_config(),
         "delegated-two-gens-backlog" => delegated_two_gens_backlog_config(),
         "delegated-root-gone" => delegated_root_gone_config(),
@@ -6877,6 +6880,21 @@ fn delegated_two_gens_one_backed_config() -> SimConfig {
     }
 }
 
+/// Plan 46 M1.2 step 3: one node, two subtrees. As
+/// `delegated-two-gens-one-backed`, but node 2 holds `d1` and `d2` whole, so
+/// the root keeps two generations for the node on main (one stream after
+/// M1.2 step 9), and a third of the renames cross between the two
+/// subtrees (a recall on main; run at the delegate once there is one stream).
+fn delegated_two_dirs_one_backed_config() -> SimConfig {
+    SimConfig {
+        delegations: vec![("d1".into(), 2), ("d2".into(), 2)],
+        range_delegations: Vec::new(),
+        check_range_bits: 0,
+        cross_ratio: 0.3,
+        ..delegated_two_gens_one_backed_config()
+    }
+}
+
 /// The review of ADR-39's rule: as `delegated-two-gens-one-backed`, but
 /// node 2 lives on, cut from the root (1 s to 10 s), and its backup (node
 /// 3) is frozen from 1 s to 6.8 s and cut from the root too, so the root
@@ -7611,6 +7629,10 @@ struct OracleTotals {
     claimed: [u64; 5],
     i2: usize,
     i2c: usize,
+    /// Plan 46 M1.2 step 3, `acked_at_or_below_cut` (`cut.rs`): answers past
+    /// their stream's cut (and the seeds with one), the answered rows of cut
+    /// streams judged, the abandon-excused ones.
+    cut: (usize, u64, usize, usize, usize),
     i4: usize,
     /// Plan 43 C2: of `i4`, settled `EIO`s whose rid completed.
     i4_settled: usize,
@@ -7842,6 +7864,11 @@ impl OracleTotals {
         }
         self.i2 += r.identity_copies;
         self.i2c += r.non_verbatim;
+        self.cut.0 += r.acked_past_cut;
+        self.cut.1 += u64::from(r.acked_past_cut > 0);
+        self.cut.2 += r.cut_rows_judged;
+        self.cut.3 += r.cut_abandoned;
+        self.cut.4 += r.acked_past_cut_refusals;
         self.i4 += r.late_landings;
         self.i4_settled += r.settled_landings;
         self.i5 += r.non_lone_rollbacks;
@@ -7896,12 +7923,13 @@ impl OracleTotals {
             + r.unsettled_no_sequencer_in_time
             + r.unsettled_generation_tail_unreachable
             + r.unsettled_violations
+            + r.acked_past_cut
             > 0
         {
             eprintln!(
                 "SWEEP-ORACLES {label} seed {seed}: i1={uncommitted} {:?} i2={} i2c={} i4={} i5={} \
                  unjournaled={unjournaled} {:?} mismatched={mismatched} {:?} relays={} \
-                 unjournaled-landed={} unsettled-eio={unsettled} (isolated {}, no sequencer in time {}, generation tail unreachable {}, violations {}) rebuilds={}/{}",
+                 unjournaled-landed={} cut={} unsettled-eio={unsettled} (isolated {}, no sequencer in time {}, generation tail unreachable {}, violations {}) rebuilds={}/{}",
                 r.uncommitted_acks,
                 r.identity_copies,
                 r.non_verbatim,
@@ -7911,6 +7939,7 @@ impl OracleTotals {
                 r.mismatched_acks,
                 r.unverified_relays,
                 r.unjournaled_landed,
+                r.acked_past_cut,
                 r.unsettled_isolated,
                 r.unsettled_no_sequencer_in_time,
                 r.unsettled_generation_tail_unreachable,
@@ -7966,6 +7995,11 @@ impl OracleTotals {
             self.unsettled_class[2],
             self.unsettled_class[3],
             constellation_authority::core::AckClass::NAMES.iter().zip(self.claimed).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "SWEEP-CUT-TOTALS {label} seeds {}/{seeds}: acked_at_or_below_cut violations {} (in {} seeds; {} of them refusals), \
+             answered rows of cut streams judged {}, excused by an abandon {}",
+            self.seeds, self.cut.0, self.cut.1, self.cut.4, self.cut.2, self.cut.3
         );
         eprintln!(
             "SWEEP-UNSETTLED-CAUSES {label} seeds {}/{seeds}: {:?}",
@@ -9199,6 +9233,23 @@ fn delegated_two_gens_backlog_keep_their_acknowledgements() {
         delegated_two_gens_backlog_config(),
         68_200..68_220,
     );
+}
+
+/// Plan 46 M1.2 step 3: one node holds two whole subtrees (two generations
+/// on main) and loses the root; its backup's sealed tail is drained and no
+/// acknowledged row is dropped. `acked_at_or_below_cut` runs in report mode.
+#[test]
+fn delegated_two_dirs_one_backed_keep_their_acknowledgements() {
+    let cfg = delegated_two_dirs_one_backed_config();
+    assert_eq!(cfg.cut_mode, sim::cut::CutMode::Report);
+    assert!(cfg.delegations.iter().all(|(_, n)| *n == 2) && cfg.delegations.len() == 2);
+    let mut judged = 0;
+    for seed in 68_300..68_320 {
+        let r = run_seed(seed, cfg.clone())
+            .unwrap_or_else(|e| panic!("delegated-two-dirs-one-backed seed {seed}: {e}"));
+        judged += r.cut_rows_judged;
+    }
+    eprintln!("delegated-two-dirs-one-backed: {judged} answered rows of cut streams judged");
 }
 
 /// Phase 2b: designations are never recalled by time; cross ops touching
@@ -11612,6 +11663,24 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
         },
         "settle" => SimConfig {
             strict_settle: true,
+            ..cfg
+        },
+        // Plan 46 M1.2 step 3: `acked_at_or_below_cut` strict (`cut.rs`),
+        // and I2c and `member_copies_drained` strict (`strict_verbatim`):
+        // the oracles M1.2 step 16 turns on for every configuration.
+        "cut" => SimConfig {
+            cut_mode: sim::cut::CutMode::Strict,
+            strict_verbatim: true,
+            ..cfg
+        },
+        // The default, named: a sweep's label that is not a bare
+        // configuration name (some `core_stall_check`s match the bare one).
+        "report" => SimConfig {
+            cut_mode: sim::cut::CutMode::Report,
+            ..cfg
+        },
+        "verbatim" => SimConfig {
+            strict_verbatim: true,
             ..cfg
         },
         // Plan 46 M0.3: I4 strict for the unsettled `EIO` too: only an
@@ -15550,6 +15619,12 @@ fn c0_variants_set_their_flags() {
     let c = strict(SimConfig::default(), "oracles");
     assert!(c.strict_commit && c.strict_identity && c.strict_settle && c.strict_lone);
     assert!(strict(SimConfig::default(), "rebuild-stub").rebuild_stub);
+    // Plan 46 M1.2 step 3: `+cut` is `acked_at_or_below_cut`, I2c and
+    // `member_copies_drained` strict; by default the cut oracle only counts.
+    let c = strict(SimConfig::default(), "cut");
+    assert!(c.cut_mode.is_strict() && c.strict_verbatim && !c.strict_commit);
+    let c = SimConfig::default();
+    assert!(!c.cut_mode.is_strict() && !c.strict_verbatim);
 }
 
 /// Plan 43 C0 §10.3, positive control: where every answer waits for the

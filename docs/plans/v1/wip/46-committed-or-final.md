@@ -1112,6 +1112,28 @@ test that shows the state cannot arise), "Unchanged on purpose", "Gates"
 (I1/I2/I2c/I4/I5 per config) after each milestone, so the progression to
 zero on every configuration is the plan's evidence.
 
+M1.2 step 0 baseline (2026-11-06, `main` at `efb96179`, 53 delegated
+configurations x 2,000 seeds, `+commit`; the full table is PROGRESS, "Plan 46
+M1.2 steps 0 and 3"): I1 0 and I2 0 on every configuration that passes
+`+commit`; I2c 207 (`delegated-backup-and-delegate-die-abandon`, 113 seeds) and
+7 (`metered-shared`); I5 3 (`delegated-two-gens-one-backed`), 1 (the abandon
+configuration), 2 (`metered-shared`). Seeds failing `+commit`:
+`delegated-epoch` 47, `delegated-core-stall-root-lease6` 235,
+`drop-held-chain` 3, `drop-held-chain-backed` 238, `metered-shared` 250. The
+fail-before list: ADR-39's rule off, `delegated-two-gens-one-backed` fails 364 of
+2,000 seeds (0 with the rule); `placement-hot` (593, 616, `-lr`),
+`delegated-holder-cut` and `long-delegated-late-answers-lr` are clean on this
+main (a regression guard, not a fail-before); the L2b pin still fails 5 of 5,
+and no other seed of 10,000..16,999 does. Step 3's baseline (new oracle
+`acked_at_or_below_cut`, report mode, every delegated configuration x 300): 0 on
+`placement-hot`, `delegated-two-gens-*`, `delegated-two-dirs-one-backed` and the
+backup configurations; nonzero on `delegated-core-stall-root-lease6` (10,198),
+`delegated-long-delegation` (2,671), `delegated-delegate-step-back` (1,640),
+`delegated-partition` (758), `delegated-epoch` (245) and 7 more (listed in
+PROGRESS). I2c and `member_copies_drained` strict fail on main for
+`delegated-backup-and-delegate-die-abandon` (14 of 300), `drop-held-chain-backed`
+(51) and `metered-shared` (20).
+
 ## Sources
 
 - Plan 43 (`docs/plans/v1/done/43-commit-rule.md`), ADR-33, ADR-38,

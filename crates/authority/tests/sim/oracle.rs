@@ -1855,6 +1855,12 @@ pub struct Findings {
     pub i5: Vec<String>,
     /// I6 (plan 43 C7b): TTL claims of a live lease.
     pub i6: Vec<String>,
+    /// Plan 46 M1.2 step 3, `acked_at_or_below_cut` (`cut.rs`): answers for a
+    /// row past its stream's cut; the rows judged and the abandon-excused.
+    pub cut: Vec<String>,
+    pub cut_judged: usize,
+    pub cut_abandoned: usize,
+    pub cut_refusals: usize,
 }
 
 impl Findings {
@@ -1870,6 +1876,7 @@ impl Findings {
             &self.unjournaled_landed,
             &self.i5,
             &self.i6,
+            &self.cut,
         ]
         .into_iter()
         .flat_map(|v| v.iter().take(5).cloned())
@@ -2122,6 +2129,12 @@ pub fn end_of_run(
         }
     }
     f.i5.sort();
+    // Plan 46 M1.2 step 3: `acked_at_or_below_cut`.
+    let cut = super::cut::judge(&acks, &super::cut::StreamCuts::of_log(log));
+    f.cut = cut.past_cut;
+    f.cut_judged = cut.judged;
+    f.cut_abandoned = cut.abandoned;
+    f.cut_refusals = cut.refusals;
     f
 }
 

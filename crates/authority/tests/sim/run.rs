@@ -715,6 +715,12 @@ pub struct SimConfig {
     /// once (b), or answered under a group class yet not completed
     /// verbatim in the log (c), fails the run.
     pub strict_identity: bool,
+    /// Plan 46 M1.2 step 3: I2c (verbatim) and `member_copies_drained` fail
+    /// the run, as under `strict_durability`, without the rest of it (`+verbatim`).
+    pub strict_verbatim: bool,
+    /// Plan 46 M1.2 step 3: whether a row acknowledged past its stream's cut
+    /// fails the run (`cut.rs`). `Report` on main, until step 16.
+    pub cut_mode: super::cut::CutMode,
     /// I4 `unacked_fails_never_lands_late`: an op answered in doubt that
     /// lands in the log after an op its node invoked later fails the run.
     pub strict_settle: bool,
@@ -1073,6 +1079,8 @@ impl Default for SimConfig {
             skip_close_on_recall: false,
             strict_commit: false,
             strict_identity: false,
+            strict_verbatim: false,
+            cut_mode: super::cut::CutMode::default(),
             strict_settle: false,
             strict_unsettled: false,
             strict_lone: false,
@@ -1280,6 +1288,14 @@ pub struct Report {
     /// 0; fails a `strict_durability` run).
     pub member_copy_rows_left: usize,
     pub non_verbatim: usize,
+    /// Plan 46 M1.2 step 3, `acked_at_or_below_cut`: rows answered past their
+    /// stream's cut, the answered rows of cut streams judged, and those an
+    /// operator's abandon excuses.
+    pub acked_past_cut: usize,
+    pub cut_rows_judged: usize,
+    pub cut_abandoned: usize,
+    /// Of `acked_past_cut`, answers that were refusals.
+    pub acked_past_cut_refusals: usize,
     /// I4: in-doubt rids that landed after an op invoked later.
     pub late_landings: usize,
     /// Plan 43 C2: of those, a settled `EIO`'s rid the log completes
@@ -5663,7 +5679,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             }
         }
         report.member_copy_rows_left = left.len();
-        if !left.is_empty() && cfg.strict_durability {
+        if !left.is_empty() && (cfg.strict_durability || cfg.strict_verbatim) {
             return Err(lin_context(format!(
                 "member_copies_drained: member copies outlive the archive at convergence: {left:?}"
             )));
@@ -5913,6 +5929,10 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.identity_copies_ungated = found.i2_ungated.len();
     report.identity_foreign_gated = found.i2_foreign_gated.len();
     report.non_verbatim = found.i2c.len();
+    report.acked_past_cut = found.cut.len();
+    report.cut_rows_judged = found.cut_judged;
+    report.cut_abandoned = found.cut_abandoned;
+    report.acked_past_cut_refusals = found.cut_refusals;
     report.late_landings = found.i4.len();
     report.settled_landings = found.i4.iter().filter(|m| m.starts_with("I4: rid")).count();
     let unsettled_violations = count_unsettled(&oracles, &mut report);
@@ -5962,9 +5982,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             &found.i2,
         ),
         (
-            cfg.strict_identity || cfg.strict_durability,
+            cfg.strict_identity || cfg.strict_durability || cfg.strict_verbatim,
             "I2c",
             &found.i2c,
+        ),
+        // Plan 46 M1.2 step 3 (`cut.rs`): report mode on main.
+        (
+            cfg.cut_mode.is_strict(),
+            "acked_at_or_below_cut",
+            &found.cut,
         ),
         (cfg.strict_settle, "I4", &found.i4),
         (cfg.strict_settle, "I4", &found.unjournaled_landed),

@@ -67264,3 +67264,67 @@ property and I1 for `Final` are definitional and that M1.4's gate is the strict 
 ### `long_locks` hang follow-up (2026-11-06)
 
 `run_m14` (the sweep driver of `long_locks` and the lock sweeps) now prints a line per configuration (start, and wall time at the end), a line per seed with `AUTHORITY_SIM_TRACE=1`, and runs a per-seed watchdog: a seed that runs ten times the median of its configuration's finished seeds (60 s before eight have finished, never under 10 s) prints the configuration, the seed, a replay line and `gdb -batch ... thread apply all bt` of every thread, then lets the run go on. Run `long_locks` with `--nocapture` to see them. Three runs at 1,000 seeds (34 configurations, `timeout 4h`) on a 16-core box: alone 30 min, and twice concurrently under load (the full sim suite looping with 16 test threads plus six busy loops, load average about 60) 41 min each. All passed, no watchdog report; the slowest seed was 0.14 s alone and 0.32 s under load, so no seed came near the limit. The first 3 h attempt of the closure did not reproduce; its hang, if there was one, remains unexplained, and the next occurrence will name its configuration and seed.
+
+### Plan 46 M1.2 steps 0 and 3: baseline, fail-before list and the `acked_at_or_below_cut` oracle (2026-11-06)
+
+No product code. Step 0 is evidence on `main` at `efb96179` (release sim, 16-core shared box, 4 threads per sweep, four sweeps at a time); step 3 adds
+the sim oracle `acked_at_or_below_cut` (`crates/authority/tests/sim/cut.rs`, hooks in `oracle.rs`, `run.rs`, `sim.rs`) and the configuration
+`delegated-two-dirs-one-backed`.
+
+**Baseline table, 53 delegated configurations x 2,000 seeds, `+commit`.** Counts are over the seeds that passed `+commit` (a seed that fails it
+is not counted in the totals); I1, I2, I2c and I5 are zero everywhere not listed. I2 is 0 on every configuration. Seeds that fail `+commit`:
+
+| Configuration | Seeds failing `+commit` | Other counts (seeds) |
+|---|---|---|
+| `delegated-epoch` | 47 | I1: a shadow installed for an answer not said to be committed (42 seeds with one, 5 with two); I4 2 (2) |
+| `delegated-core-stall-root-lease6` | 235 | I1 `lone/*` answers (240 over the sweep without `+commit`: 131 ok, 53 `EEXIST`, 56 `ENOENT`); I5 131 (130) |
+| `drop-held-chain` | 3 | class claim (a claimed archive commit that only `lone` judged) |
+| `drop-held-chain-backed` | 238 | I1 (289 over the plain sweep: `archive/ok` 153, `unjournaled/ok` 132, `archive/refused:EEXIST` 4); 618 member-copy rows left at convergence |
+| `metered-shared` | 250 | I1 303 (237); I2c 7 (4); I5 2 (1); 164 member-copy rows left |
+| `long-delegated-lead-off`, `long-delegated-hysteresis-off` | 1,397 / 33 | the lone-lead oracle, by design (the configurations switch the rule off) |
+| `delegated-backup-and-delegate-die-abandon` | 0 | I2c 207 (113 seeds), I5 1 (1) |
+| `delegated-two-gens-one-backed` | 0 | I5 3 (1) |
+| `delegated-holder-cut`, `delegated-long-delegation` (6), `delegated-root-rate-fast` (25) | 0 | I4 1 (1) / 6 (6) / 25 (25) |
+
+The other 40 configurations (`long-delegated`, `-lead`, `-backup`, `-late-answers`, `delegated-backup`, `-crash`, `-partition`, `-root-crash`, `-root-gone`, `-delegate-restart`,
+`-group-switch`, `-lone-s3-cut`, `-two-gens-{root-crash,backed,backlog}`, the 14 `delegated-core-*` ones, `-root-step-forward`, `-delegate-step-back`, `-long-delegation-prod`,
+`placement-hot`, `shared-dir`, `-default`, `-faults`, `-split`, `-ranges`, `delegated-no-backup-root-near`, `-backup-and-delegate-die`) are zero in all five columns.
+
+**Fail-before list (what main shows today).**
+
+| Item | Result on main |
+|---|---|
+| `delegated-two-gens-one-backed`, ADR-39's rule off (`Core::deleg_caps` made to cap nothing and ignore a lost dependency, in a scratch build only) | 36 of 200 seeds fail, 364 of 2,000 (312 of them "returned success but completed 0 times in the log", 52 a history window that no state refuses). With the rule: 0 of 2,000 |
+| `placement-hot` 0..1,999, `+commit+identity+lone`, with and without `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` (`-lr`) | 0 failing, I2, I2c and I5 all 0: seed 593 and its `-lr` variant, and 616, pass on this main. The plan's "593 fails" no longer holds; step 7's guard for it is a regression guard, not a fail-before |
+| `delegated-holder-cut` 0..1,999, `+commit+identity+lone` | 0 failing; I4 1 (1) |
+| `long-delegated-late-answers` `-lr`, 0..1,999, `+commit+identity` | I2 0, I2c 0 (the "3 I2 copies" are gone); 1 failing seed, 1793 (`row_version_matches_config`, a version-4 archive row on node 2); I4 6 (6) |
+| `long-delegated-backup` `-lr`, 0..1,999, `+commit+identity` | I2 and I2c 0; 1 failing seed, 1938 (`row_version_matches_config`, a version-0 `Delegate` row); I5 2 (1) |
+| **L2b pin** `l2b_findings_a_committed_delegate_row_lands_with_its_identity` (seeds 13016, 13907, 14284, 15005, 15996, `+identity`, `-lr`) | **still fails, 5 of 5** (I2c: the rid completes in a new-identity segment of the epoch-3 root; 13016 has 6 violations). A sweep of 10,000..16,999 of both configurations under `-lr` and `+commit+identity` finds exactly these five seeds and no other. The pin stays `#[ignore]` for step 7, which closes it |
+
+**Step 3.**
+
+- `acked_at_or_below_cut` (the model's property of that name): every non-relay answer whose transaction is a delegate stream row `(gen, idx)` is at or below
+  the lowest `RecallCut { gen, through }` the log carries. An operator's abandon (`GroupAbandoned` of the generation) excuses a row and is counted apart;
+  refusals are counted apart too. `CutMode::{Report, Strict}` is a `SimConfig` field (`cut_mode`), `Report` by default; step 16 changes
+  `CutMode::default`. `+cut` sets `Strict` and `strict_verbatim`; `+verbatim` sets `strict_verbatim` alone (I2c and `member_copies_drained` fail the run, as under
+  `strict_durability`); `+report` names the default. Unit tests in `cut.rs` (a row past the cut fails in strict mode, passes in report mode; the abandon exemption;
+  the lowest cut wins; the root's own and cut-less streams are not judged), and `c0_variants_set_their_flags`.
+- `delegated-two-dirs-one-backed`: node 2 holds `d1` and `d2` whole (two generations on main), one backed, the two-gens fault schedule, a third of the renames across
+  the two subtrees. 0 in every column on 300 seeds.
+- **Baseline, every delegated configuration (the 53 above and the new one) x 300 seeds, report mode.** Every seed of the configurations not listed counts 0 answers past a cut.
+  Answers past a cut (seeds with one; refusals among them) / answered rows of cut streams judged:
+  `delegated-core-stall-root-lease6` 10,198 (300; 5,081) / 17,172; `delegated-long-delegation` 2,671 (157; 1,334) / 19,980; `-long-delegation-prod` 2,497 (156; 1,230) / 18,922;
+  `delegated-delegate-step-back` 1,640 (170; 820) / 11,506; `delegated-partition` 758 (186; 387) / 5,319; `delegated-epoch` 245 (74; 125) / 5,070;
+  `delegated-core-stall-unlaned` 144 (122; 77) / 10,830; `delegated-core-hang` 61 (61; 29) / 3,384; `delegated-crash` 32 (13; 20) / 4,130;
+  `delegated-core-stall-forwarded` 20 (20; 7) / 4,981; `long-delegated` 17 (5; 6) / 8,611; `long-delegated-lead` and `-hysteresis-off` 8 (5; 1); `shared-dir-faults` 3 (1; 0).
+  `delegated-backup-and-delegate-die-abandon` counts 0 and 60 rows an abandon excuses. Clean today (0 past a cut on all 300 seeds, rows judged):
+  `delegated-two-gens-*`, `delegated-two-dirs-one-backed`, `placement-hot`, `long-delegated-backup`, `-late-answers`, `delegated-backup`, `delegated-root-crash`.
+- **I2c and `member_copies_drained` strict on every delegated configuration (`+verbatim`, 300 seeds).** Failing on main, recorded, nothing loosened:
+  `delegated-backup-and-delegate-die-abandon` 14 seeds (I2c: 11, 13, 47, 68, 71, 122, 140, 192, 197, 203, 204, 233, 285, 287);
+  `drop-held-chain-backed` 51 (`member_copies_drained` 50; the 51st does not reach quiescence); `metered-shared` 20 (`member_copies_drained` 18 and 2 other;
+  seeds 12, 28, 35, 44, 48, 75, 76, 148, 166, 168, 176, 187, 197, 203, 205, 206, 209, 222, 254, 268). These are fail-before evidence for steps 7 and 14.
+  (`long-delegated-lead-off` and `-hysteresis-off` also fail, on the lone-lead oracle they exist to trip.)
+- Method notes: a bare configuration label runs `core_stall_check`, which fails three negative controls by design (`delegated-core-stall-unlaned`, `-root-unlaned`,
+  `-root-backup-unprobed`), so the sweeps carry a variant (`+commit`, `+report`). Totals do not include a seed that failed a strict flag.
+
+Gates (box 1, release): fmt clean; clippy `-D warnings` on the authority crate, all targets, clean; authority lib 1,049 passed; release sim suite 418 passed, 0 failed, 12 ignored (126 s).
