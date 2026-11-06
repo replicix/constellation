@@ -627,7 +627,7 @@ pub struct Meta {
     pub(crate) deleg_any: AtomicBool,
     /// Plan 30 §M12: the root's FUSE fast path holds this *shared*
     /// from its ownership check through its execution; a transaction
-    /// that journals a `Delegate` or `Recall` record here
+    /// that journals a `DelegateNode` or `DelegateNodeEnded` record here
     /// (`apply_records_journaled_completing`, the root's grant) holds it
     /// *exclusively*. So a fast-path write that checked the table
     /// before a grant is journaled before the grant's record, and one
@@ -733,13 +733,13 @@ pub struct Meta {
     /// store, to hold a writer there.
     #[cfg(test)]
     pub(crate) horizon_write_hook: std::sync::Mutex<Option<HorizonWriteHook>>,
-    /// Simulation oracle: the highest `DelegGroup` version this replica ever
+    /// Simulation oracle: the highest `DelegateNodeGroup` version this replica ever
     /// applied per generation (the group row goes with the generation, so
     /// the store alone cannot say which version a row of an ended
     /// generation was journaled under: [`Meta::deleg_group_top`]).
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) deleg_group_top: std::sync::Mutex<std::collections::BTreeMap<u64, u64>>,
-    /// Simulation oracle: each `DelegGroup` version this replica applied per
+    /// Simulation oracle: each `DelegateNodeGroup` version this replica applied per
     /// generation with the journal's next seq at that moment (a row whose
     /// first seq is at or past it was journaled under the version or a later
     /// one: [`Meta::deleg_group_at`]).
@@ -1365,7 +1365,7 @@ impl Meta {
     /// ([`Meta::replace_ns_from_rebuilt`]), the side replica's, read before
     /// the commit. Not the table this store holds then: the reset re-applies
     /// kept committed entries onto the rebuilt namespace, and a
-    /// streamed-ahead `RecallCut` among them writes the table row without
+    /// streamed-ahead `DelegateNodeEnded` among them writes the table row without
     /// the void (only the durable log voids), so reading it back would void
     /// that end here and call it ended before the open.
     pub(crate) fn seed_session_generations(

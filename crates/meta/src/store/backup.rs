@@ -644,7 +644,7 @@ impl Meta {
         Ok(())
     }
 
-    /// The generation ended (its `Recall` is in the log): drop its rows.
+    /// The generation ended (its `DelegateNodeEnded` is in the log): drop its rows.
     pub fn deleg_backup_clear(&self, gen: u64) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         let e = deleg_epoch(gen);

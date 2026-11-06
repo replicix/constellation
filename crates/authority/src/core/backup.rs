@@ -1132,7 +1132,7 @@ pub enum CommitRule {
     /// the archive carries it when none is listed.
     Group {
         /// The configuration's version: the lease's `config_version`, or
-        /// the generation's `DelegGroup` version.
+        /// the generation's `DelegateNodeGroup` version.
         version: u64,
         /// How many nodes besides the holder the rule waits for.
         members: usize,

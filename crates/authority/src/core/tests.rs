@@ -3183,12 +3183,7 @@ fn two_tenures_never_mint_the_same_generation_number() {
         &[
             mkdir(other, "e"),
             mkdir(next, "f"),
-            LogRecord::Delegate {
-                dir: other,
-                node: 4,
-                gen: gens[1],
-                designated: false,
-            },
+            LogRecord::delegate_one(4, gens[1], other, constellation_meta::SubtreeKind::Placed),
         ],
     )
     .unwrap();
@@ -9498,7 +9493,7 @@ mod cto {
         // Node 4's read granted nothing, so nothing is left to recall.
         sync(&mut h);
         let d = h.meta.delegation_table().get(dir).expect("designated");
-        assert!(d.designated && d.node == 3, "{d:?}");
+        assert!(d.designated() && d.node == 3, "{d:?}");
     }
 
     /// A delegate's unlink of a second link, in its subtree, to a file whose
@@ -9975,7 +9970,7 @@ mod cto {
         h.advance(3_001);
         sync(&mut h);
         let d = h.meta.delegation_table().get(dir).expect("designated");
-        assert!(d.designated && d.node == 3, "{d:?}");
+        assert!(d.designated() && d.node == 3, "{d:?}");
     }
 
     /// A root with a kernel cache TTL that no peer or roster event has
@@ -13613,12 +13608,12 @@ fn a_held_forward_executes_locally_once_the_delegation_installs() {
         0,
         &[],
         &[],
-        &[LogRecord::Delegate {
+        &[LogRecord::delegate_one(
+            3,
+            1,
             dir,
-            node: 3,
-            gen: 1,
-            designated: true,
-        }],
+            constellation_meta::SubtreeKind::Designated,
+        )],
     )
     .unwrap();
     let mut out = Vec::new();
@@ -15853,12 +15848,7 @@ mod locks {
                     gid: 0,
                     time_ns: 2,
                 },
-                LogRecord::Delegate {
-                    dir,
-                    node: 3,
-                    gen: 7,
-                    designated: false,
-                },
+                LogRecord::delegate_one(3, 7, dir, constellation_meta::SubtreeKind::Placed),
             ],
         )
         .unwrap();
@@ -15937,12 +15927,7 @@ mod locks {
                     gid: 0,
                     time_ns: 2,
                 },
-                LogRecord::Delegate {
-                    dir,
-                    node: 3,
-                    gen: 7,
-                    designated: false,
-                },
+                LogRecord::delegate_one(3, 7, dir, constellation_meta::SubtreeKind::Placed),
             ],
         )
         .unwrap();
@@ -16049,7 +16034,7 @@ mod locks {
 
     /// The same with the generation unknown to the core: a restarted node
     /// re-adopts only the generations its log's table lists, and the
-    /// `Delegate` record of this one is in the very tail it is about to
+    /// `DelegateNode` record of this one is in the very tail it is about to
     /// re-apply. Its own rows of the generation are in its journal all the
     /// same, ahead of the tail, and are stranded with it (the store says
     /// which generations it assigned stream indices in). Not stranded, they
@@ -16305,7 +16290,7 @@ mod locks {
     }
 
     /// The gate on the same delegate with a tail that ends the generation
-    /// (`RecallCut`, or an older log's `Recall`): every replica voids it at
+    /// (`DelegateNodeEnded`): every replica voids it at
     /// the tail's cut, so the rows past it are not re-appended; they are
     /// replayed by rid. Fails on the parent of the review fix: the extent of
     /// the tail was read after `apply_backup_tail` had cleared it, the
@@ -16313,58 +16298,52 @@ mod locks {
     /// past the cut.
     #[test]
     fn the_takeover_gate_re_appends_nothing_past_a_tails_end_of_the_generation() {
-        for legacy in [false, true] {
-            let mut h = Harness::new(3);
-            h.core.cfg.delegation = true;
-            h.core.cfg.p2p = true;
-            let (dir, _) = delegated_file(&h.meta);
-            two_delegate_rows(&h, dir);
-            let end = if legacy {
-                LogRecord::Recall { dir, gen: 7 }
-            } else {
-                LogRecord::RecallCut {
-                    dir,
-                    gen: 7,
-                    through: 0,
-                }
-            };
-            h.meta
-                .backup_append(
-                    1,
-                    &[constellation_meta::BackupTx {
-                        first: 1,
-                        last: 1,
-                        records: vec![end],
-                        origin: (0, 0),
-                    }],
-                )
-                .unwrap();
-            h.core = Core::new(h.core.cfg.clone());
-            h.hold(
-                2,
-                Some(PendingGate {
-                    epoch: 2,
-                    takeover: true,
-                    marker_shipped: true,
-                    drained: false,
-                    fast_prev: false,
-                    backup_tail_epoch: Some(1),
-                    shippable: true,
-                }),
-            );
-            h.core.bk.tail_through = 1;
-            let mut out = Vec::new();
-            h.core.complete_gate(h.clk(), &h.meta, &mut out);
-            assert_eq!(
-                h.core.stats.own_deleg_rows_reappended, 0,
-                "legacy {legacy}: re-appended past the tail's end"
-            );
-            let own = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
-                .into_iter()
-                .filter(|tx| tx.origin.0 == 7)
-                .count();
-            assert_eq!(own, 0, "legacy {legacy}");
-        }
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let (dir, _) = delegated_file(&h.meta);
+        two_delegate_rows(&h, dir);
+        let end = LogRecord::DelegateNodeEnded {
+            node: 3,
+            gen: 7,
+            through: 0,
+        };
+        h.meta
+            .backup_append(
+                1,
+                &[constellation_meta::BackupTx {
+                    first: 1,
+                    last: 1,
+                    records: vec![end],
+                    origin: (0, 0),
+                }],
+            )
+            .unwrap();
+        h.core = Core::new(h.core.cfg.clone());
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: true,
+            }),
+        );
+        h.core.bk.tail_through = 1;
+        let mut out = Vec::new();
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert_eq!(
+            h.core.stats.own_deleg_rows_reappended, 0,
+            "re-appended past the tail's end"
+        );
+        let own = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+            .into_iter()
+            .filter(|tx| tx.origin.0 == 7)
+            .count();
+        assert_eq!(own, 0);
     }
 
     /// A row whose `deps` were not captured (no journal head recorded them)
@@ -16428,12 +16407,12 @@ mod locks {
                 1,
                 1,
                 1,
-                &[LogRecord::Delegate {
-                    dir: ROOT_INO,
-                    node: 3,
-                    gen: g,
-                    designated: false,
-                }],
+                &[LogRecord::delegate_one(
+                    3,
+                    g,
+                    ROOT_INO,
+                    constellation_meta::SubtreeKind::Placed,
+                )],
                 committed,
                 (0, 0),
             )
@@ -16920,7 +16899,7 @@ mod locks {
     /// delegate that takes the root over with its predecessor's backup
     /// tail has its own rows of the generation stranded; when it then ends
     /// the generation as the root, its void cut is the log's (the cursor),
-    /// as the `Recall` gives every other replica. With its own stream head
+    /// as the `DelegateNodeEnded` gives every other replica. With its own stream head
     /// as the cut while the stranded rows were replayed by rid as root rows,
     /// its client re-sent an op depending on such a row with the same deps,
     /// and the next root answered `Held` (deps lost) forever
@@ -16963,7 +16942,7 @@ mod locks {
             h.core.dl.gens.get(&7).is_some_and(|g| g.ended),
             "the generation was not ended"
         );
-        // Plan 43 C2: the `RecallCut` record carries the same cut, the
+        // Plan 43 C2: the `DelegateNodeEnded` record carries the same cut, the
         // cursor, so every other replica voids where this one does.
         let cursor = h.core.dl.gens[&7].cursor;
         assert_eq!(cursor, 2, "cursor {cursor}");
@@ -16971,7 +16950,7 @@ mod locks {
             .into_iter()
             .flat_map(|tx| tx.records)
             .filter_map(|r| match r {
-                LogRecord::RecallCut {
+                LogRecord::DelegateNodeEnded {
                     gen: 7, through, ..
                 } => Some(through),
                 _ => None,
@@ -17572,13 +17551,12 @@ mod locks {
             &[],
             &[],
             &[
-                LogRecord::Recall { dir, gen: 7 },
-                LogRecord::Delegate {
-                    dir,
+                LogRecord::DelegateNodeEnded {
                     node: 3,
-                    gen: 8,
-                    designated: false,
+                    gen: 7,
+                    through: 0,
                 },
+                LogRecord::delegate_one(3, 8, dir, constellation_meta::SubtreeKind::Placed),
             ],
         )
         .unwrap();
@@ -17787,7 +17765,7 @@ mod locks {
             .into_iter()
             .flat_map(|tx| tx.records)
             .filter_map(|r| match r {
-                LogRecord::RecallCut {
+                LogRecord::DelegateNodeEnded {
                     gen: 7, through, ..
                 } => Some(through),
                 _ => None,
@@ -17799,7 +17777,7 @@ mod locks {
     /// lease (an epoch's flush there) while it recalled a generation. The
     /// release dropped the generation with its recall, so the delegate's
     /// answer was ignored and the grants it handed back dropped, and no
-    /// `RecallCut` was journaled (only a root does): the table kept the
+    /// `DelegateNodeEnded` was journaled (only a root does): the table kept the
     /// subtree delegated to a node that had handed it back, and the
     /// handed-back grants' renewals were refused until they lapsed. The
     /// release waits for the recall: the answer's grant comes back into
@@ -23650,12 +23628,7 @@ mod locks {
                         gid: 0,
                         time_ns: 2,
                     },
-                    LogRecord::Delegate {
-                        dir,
-                        node: 3,
-                        gen: 7,
-                        designated: false,
-                    },
+                    LogRecord::delegate_one(3, 7, dir, constellation_meta::SubtreeKind::Placed),
                 ],
             )
             .unwrap();
@@ -24331,13 +24304,13 @@ mod locks {
     /// delegate-fenced-io (`locks-blips-tight-delegated` seed 1): a
     /// continuation epoch's recall-all takes a delegate's grants back to
     /// the root, which ends the generation in its own journal at once.
-    /// Under the S3 cut the `Recall` record reaches nobody else, so every
+    /// Under the S3 cut the `DelegateNodeEnded` record reaches nobody else, so every
     /// other table still names the delegate. It answered the subtree's
     /// renewals and requests `NotOwner { 0 }`, the holders found no owner
     /// for the whole cut, and their grants lapsed under their I/O. The
     /// recalled delegate now names the root that recalled it, also for a
     /// generation it never installed (an epoch was active when its table
-    /// named it: seed 293), until the `Recall` record reaches its table.
+    /// named it: seed 293), until the `DelegateNodeEnded` record reaches its table.
     #[test]
     fn a_recalled_delegate_sends_its_subtrees_locks_to_the_root() {
         for installed in [true, false] {
@@ -24396,7 +24369,7 @@ mod locks {
                 ),
                 "installed {installed}: {out:?}"
             );
-            // The `Recall` record reaches this table: the generation is
+            // The `DelegateNodeEnded` record reaches this table: the generation is
             // gone, and with it what its recall handed back.
             crate::replica::Replica::apply_segment(
                 &h.meta,
@@ -24405,7 +24378,11 @@ mod locks {
                 0,
                 &[],
                 &[],
-                &[LogRecord::Recall { dir, gen: 7 }],
+                &[LogRecord::DelegateNodeEnded {
+                    node: 3,
+                    gen: 7,
+                    through: 0,
+                }],
             )
             .unwrap();
             let mut out = Vec::new();
@@ -31439,12 +31416,12 @@ mod locks {
             0,
             &[],
             &[],
-            &[LogRecord::Delegate {
-                dir,
-                node: 3,
+            &[LogRecord::delegate_one(
+                3,
                 gen,
-                designated: false,
-            }],
+                dir,
+                constellation_meta::SubtreeKind::Placed,
+            )],
         )
         .unwrap();
     }
@@ -31685,13 +31662,12 @@ mod locks {
             &[],
             &[],
             &[
-                LogRecord::Recall { dir, gen: 7 },
-                LogRecord::Delegate {
-                    dir,
+                LogRecord::DelegateNodeEnded {
                     node: 3,
-                    gen: 8,
-                    designated: false,
+                    gen: 7,
+                    through: 0,
                 },
+                LogRecord::delegate_one(3, 8, dir, constellation_meta::SubtreeKind::Placed),
             ],
         )
         .unwrap();
@@ -33189,12 +33165,12 @@ fn undelegate_refuses_a_designation() {
         0,
         &[],
         &[],
-        &[LogRecord::Delegate {
+        &[LogRecord::delegate_one(
+            2,
+            1,
             dir,
-            node: 2,
-            gen: 1,
-            designated: true,
-        }],
+            constellation_meta::SubtreeKind::Designated,
+        )],
     )
     .unwrap();
     let mut out = Vec::new();
@@ -33258,12 +33234,7 @@ fn a_forward_refused_by_a_journaled_designation_refusal_waits_for_its_row() {
                 gid: 0,
                 time_ns: 2,
             },
-            LogRecord::Delegate {
-                dir,
-                node: 2,
-                gen: 1,
-                designated: true,
-            },
+            LogRecord::delegate_one(2, 1, dir, constellation_meta::SubtreeKind::Designated),
         ],
     )
     .unwrap();
@@ -33964,12 +33935,12 @@ fn the_takeover_drain_defers_only_the_delegated_requester() {
         0,
         &[],
         &[],
-        &[LogRecord::Delegate {
+        &[LogRecord::delegate_one(
+            2,
+            1,
             dir,
-            node: 2,
-            gen: 1,
-            designated: false,
-        }],
+            constellation_meta::SubtreeKind::Placed,
+        )],
     )
     .unwrap();
     // Requester 2 writes under the delegated directory (twice: its second
@@ -34015,7 +33986,11 @@ fn the_takeover_drain_defers_only_the_delegated_requester() {
         0,
         &[],
         &[],
-        &[LogRecord::Recall { dir, gen: 1 }],
+        &[LogRecord::DelegateNodeEnded {
+            node: 3,
+            gen: 1,
+            through: 0,
+        }],
     )
     .unwrap();
     let mut out = Vec::new();
@@ -34045,12 +34020,12 @@ fn an_inbox_op_waits_for_its_deps() {
         0,
         &[],
         &[],
-        &[LogRecord::Delegate {
+        &[LogRecord::delegate_one(
+            2,
+            1,
             dir,
-            node: 2,
-            gen: 1,
-            designated: false,
-        }],
+            constellation_meta::SubtreeKind::Placed,
+        )],
     )
     .unwrap();
     // Requester 2 (the delegate) wrote data under `dir` (stream index 5)
@@ -34137,12 +34112,12 @@ fn a_delegate_reply_base_covers_what_it_applied_before_the_grant_and_streamed_st
     apply(
         &h,
         3,
-        &[LogRecord::Delegate {
+        &[LogRecord::delegate_one(
+            3,
+            1,
             dir,
-            node: 3,
-            gen: 1,
-            designated: true,
-        }],
+            constellation_meta::SubtreeKind::Designated,
+        )],
     );
     let mut out = Vec::new();
     h.core.delegation_sync(h.clk(), &h.meta, &mut out);
@@ -36836,12 +36811,12 @@ fn a_barrier_inside_a_delegated_subtree_does_not_reach_the_delegate() {
         0,
         &[],
         &[],
-        &[LogRecord::Delegate {
+        &[LogRecord::delegate_one(
+            2,
+            1,
             dir,
-            node: 2,
-            gen: 1,
-            designated: false,
-        }],
+            constellation_meta::SubtreeKind::Placed,
+        )],
     )
     .unwrap();
     let mut out = Vec::new();
@@ -37346,12 +37321,7 @@ fn delegated_dir_to(meta: &Meta, me: NodeId, dir: constellation_fs_core::Ino) {
                 gid: 0,
                 time_ns: 1,
             },
-            LogRecord::Delegate {
-                dir,
-                node: me,
-                gen: 7,
-                designated: false,
-            },
+            LogRecord::delegate_one(me, 7, dir, constellation_meta::SubtreeKind::Placed),
         ],
     )
     .unwrap();
@@ -37448,7 +37418,7 @@ fn a_not_holder_reply_does_not_make_its_sender_the_holder() {
 
 /// The K5a fix round's post-handoff stall: a delegate restarted with its
 /// node identity and journal (a K5 handoff, `daemon --upgrade`, a crash
-/// and remount) installed nothing at start — only a `Delegate`/`Recall`
+/// and remount) installed nothing at start — only a `DelegateNode`/`DelegateNodeEnded`
 /// segment ran the table sync — so its writes under the subtree bounced
 /// between the root (`NotHolder` naming it) and itself until the root
 /// reclaimed the grant nobody renewed (about 4 s on kind, 7 s in the
@@ -38327,12 +38297,12 @@ mod redelegated_to_the_requester {
             0,
             &[],
             &[],
-            &[LogRecord::Delegate {
+            &[LogRecord::delegate_one(
+                3,
+                7,
                 dir,
-                node: 3,
-                gen: 7,
-                designated: false,
-            }],
+                constellation_meta::SubtreeKind::Placed,
+            )],
         )
         .unwrap();
         let mut out = Vec::new();
@@ -38537,12 +38507,7 @@ mod delegated_lock_dead_end {
                     gid: 0,
                     time_ns: 2,
                 },
-                LogRecord::Delegate {
-                    dir,
-                    node: 2,
-                    gen: 7,
-                    designated: false,
-                },
+                LogRecord::delegate_one(2, 7, dir, constellation_meta::SubtreeKind::Placed),
             ],
         )
         .unwrap();
@@ -40347,15 +40312,15 @@ fn the_gate_forgets_a_replay_the_log_already_settled_whatever_its_deps() {
 }
 
 /// List generation `gen` (a delegation of `dir` to node 3) in the table
-/// this replica holds from the log, as a `Delegate` record applied.
+/// this replica holds from the log, as a `DelegateNode` record applied.
 fn list_generation(h: &Harness, dir: u64, gen: u64) {
     h.meta
-        .apply_records_journaled(&[LogRecord::Delegate {
-            dir,
-            node: 3,
+        .apply_records_journaled(&[LogRecord::delegate_one(
+            3,
             gen,
-            designated: false,
-        }])
+            dir,
+            constellation_meta::SubtreeKind::Placed,
+        )])
         .unwrap();
 }
 
@@ -40440,7 +40405,11 @@ fn the_gate_keeps_a_name_s_order(h: &mut Harness, [p, d, f, new]: [u64; 4], queu
         "the create ran ahead of the unlink: {queued:?}"
     );
     h.meta
-        .apply_records_journaled(&[LogRecord::Recall { dir: d, gen: 5 }])
+        .apply_records_journaled(&[LogRecord::DelegateNodeEnded {
+            node: 3,
+            gen: 5,
+            through: 0,
+        }])
         .unwrap();
     run_the_gate(h);
     assert!(queued_rids(h).is_empty());
@@ -40539,7 +40508,11 @@ fn the_gate_runs_a_held_entry_s_dependent_after_it(
         "the second entry ran ahead of the first: {queued:?}"
     );
     h.meta
-        .apply_records_journaled(&[LogRecord::Recall { dir: d, gen: 5 }])
+        .apply_records_journaled(&[LogRecord::DelegateNodeEnded {
+            node: 3,
+            gen: 5,
+            through: 0,
+        }])
         .unwrap();
     run_the_gate(&mut h);
     assert!(queued_rids(&h).is_empty());
@@ -40671,7 +40644,7 @@ fn a_replay_with_one_lost_generation_keeps_the_rows_of_the_live_one() {
 
 /// The successor allocates its first new generation above the log's
 /// highest, which is the number a deposed root's unshipped grant carried:
-/// once the successor's `Delegate` of that number is applied here, a row
+/// once the successor's `DelegateNode` of that number is applied here, a row
 /// recorded under the undone grant would be a dependency on an unrelated
 /// stream, and the replay would wait for it to reach the index. The strand
 /// does not record it, so the replay runs.
@@ -40686,12 +40659,12 @@ fn a_replay_does_not_wait_on_the_successors_stream_of_an_undone_grants_number() 
     h.hold(1, None);
     let dir = (2u64 << 40) | 9;
     h.meta
-        .apply_records_journaled(&[LogRecord::Delegate {
+        .apply_records_journaled(&[LogRecord::delegate_one(
+            2,
+            4,
             dir,
-            node: 2,
-            gen: 4,
-            designated: false,
-        }])
+            constellation_meta::SubtreeKind::Placed,
+        )])
         .unwrap();
     let data = LogRecord::Create {
         parent: ROOT_INO,
@@ -40756,7 +40729,7 @@ fn a_replay_does_not_wait_on_the_successors_stream_of_an_undone_grants_number() 
 
 /// Long-delegated-backup seed 3585: a deposed root ended generations 9 and
 /// 11 itself after appending their rows (13, 14 and 2) and executed a
-/// cross-subtree rename after them; the `Recall` it journaled never
+/// cross-subtree rename after them; the `DelegateNodeEnded` it journaled never
 /// shipped. Its session still holds the cut it ended them at, while the
 /// log's successor ended them lower (12 and 1). The rename's replay named
 /// the rows, this replica did not call them lost (they are below its own
@@ -40800,9 +40773,12 @@ fn a_replay_does_not_keep_rows_of_a_generation_the_log_ended_below_its_own_cut()
         "the live generation stays: {kept:?}"
     );
     // And when generation 5 ends too, the next re-send drops it.
-    let dir = 1 << 40;
     h.meta
-        .apply_records_journaled(&[LogRecord::Recall { dir, gen: 5 }])
+        .apply_records_journaled(&[LogRecord::DelegateNodeEnded {
+            node: 3,
+            gen: 5,
+            through: 0,
+        }])
         .unwrap();
     let mut out = Vec::new();
     h.core.hold_for_lost_deps(h.clk(), rid, &h.meta, &mut out);
@@ -41063,9 +41039,10 @@ fn a_deposed_nodes_own_op_keeps_the_live_rows_its_queue_entry_recorded() {
     crate::replica::Replica::void_stream(&h.meta, 4, 0);
     h.core.clients.get_mut(&rx).unwrap().deps.streams = constellation_meta::Streams::NONE;
     h.meta
-        .apply_records_journaled(&[LogRecord::Recall {
-            dir: 1 << 40,
+        .apply_records_journaled(&[LogRecord::DelegateNodeEnded {
+            node: 3,
             gen: 4,
+            through: 0,
         }])
         .unwrap();
     let mut out = Vec::new();
@@ -42952,7 +42929,7 @@ mod recall_cut {
 
     /// The root ends generation 7 (the delegate silent, the recall
     /// outwaited) with the cursor at 3: the record it journals says so, and
-    /// no `Recall` is written any more.
+    /// no `DelegateNodeEnded` is written any more.
     #[test]
     fn the_recall_record_carries_the_cut() {
         let mut h = Harness::new(1);
@@ -42974,18 +42951,12 @@ mod recall_cut {
         assert!(h.core.dl.gens[&7].ended, "not ended: {out:?}");
         let records = journal_records(&h);
         assert!(
-            records.contains(&LogRecord::RecallCut {
-                dir,
+            records.contains(&LogRecord::DelegateNodeEnded {
+                node: 3,
                 gen: 7,
                 through: 3
             }),
             "{records:?}"
-        );
-        assert!(
-            !records
-                .iter()
-                .any(|r| matches!(r, LogRecord::Recall { .. })),
-            "a `Recall` was written: {records:?}"
         );
         // The root's own session voids it at the cut it wrote.
         assert_eq!(Replica::void_cut(&h.meta, 7), Some(3));
@@ -43026,7 +42997,7 @@ mod recall_cut {
         assert!(
             !journal_records(&h)
                 .iter()
-                .any(|r| matches!(r, LogRecord::RecallCut { .. })),
+                .any(|r| matches!(r, LogRecord::DelegateNodeEnded { .. })),
             "the end is still journaled"
         );
         assert_eq!(Replica::void_cut(&h.meta, 7), None, "still voided here");
@@ -43104,7 +43075,7 @@ mod recall_cut {
     /// at the generation's new owner).
     #[test]
     fn a_park_past_the_cut_is_aborted_not_released() {
-        let (mut h, dir) = delegate_with_a_parked_ack();
+        let (mut h, _dir) = delegate_with_a_parked_ack();
         Replica::apply_segment(
             &h.meta,
             2,
@@ -43112,8 +43083,8 @@ mod recall_cut {
             0,
             &[],
             &[],
-            &[LogRecord::RecallCut {
-                dir,
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
                 gen: 7,
                 through: 0,
             }],
@@ -43183,8 +43154,8 @@ mod recall_cut {
             0,
             &[],
             &[],
-            &[LogRecord::RecallCut {
-                dir,
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
                 gen: 7,
                 through: 1,
             }],
@@ -43233,17 +43204,12 @@ mod recall_cut {
         assert!(replies(&out).iter().any(|(r, _)| *r == create), "{out:?}");
         assert_eq!(Replica::delegate_tx_pending(&h.meta, 7, 1), Some(true));
         let records = [
-            LogRecord::RecallCut {
-                dir,
+            LogRecord::DelegateNodeEnded {
+                node: 3,
                 gen: 7,
                 through: 0,
             },
-            LogRecord::Delegate {
-                dir,
-                node: 3,
-                gen: 8,
-                designated: false,
-            },
+            LogRecord::delegate_one(3, 8, dir, constellation_meta::SubtreeKind::Placed),
         ];
         h.meta.install_streamed(1, 1, 1, 2, &records).unwrap();
         let mut out = Vec::new();
@@ -43286,7 +43252,7 @@ mod recall_cut {
 
     /// The path-B shape of the test above with the end `end` of generation
     /// 7: 7:1 journaled, the end and a new
-    /// `Delegate` of 8 streamed ahead, a sync. What the segment applies.
+    /// `DelegateNode` of 8 streamed ahead, a sync. What the segment applies.
     fn path_b_waiting(end: LogRecord) -> (Harness, [LogRecord; 2]) {
         let (mut h, dir, _, _) = delegate_renewed_once();
         let ino = h.meta.allocate_ino(dir).unwrap();
@@ -43307,12 +43273,7 @@ mod recall_cut {
         assert!(replies(&out).iter().any(|(r, _)| *r == rid), "{out:?}");
         let records = [
             end,
-            LogRecord::Delegate {
-                dir,
-                node: 3,
-                gen: 8,
-                designated: false,
-            },
+            LogRecord::delegate_one(3, 8, dir, constellation_meta::SubtreeKind::Placed),
         ];
         h.meta.install_streamed(1, 1, 1, 2, &records).unwrap();
         let mut out = Vec::new();
@@ -43328,39 +43289,29 @@ mod recall_cut {
     }
 
     /// Review follow-up: the wait ends when the end is applied from the log,
-    /// not when the rows leave the journal, and a legacy `Recall` keeps a
-    /// cut (fail-before: it waited for ever; the cut it keeps now is the
-    /// log's index of the generation). The retry timer syncs again when no
-    /// segment does.
+    /// not when the rows leave the journal (fail-before: it waited for
+    /// ever). The retry timer syncs again when no segment does.
     #[test]
     fn a_waiting_install_ends_at_the_end_in_the_log() {
-        let dir_of = |h: &Harness| h.core.dl.mine[&7].dir;
-        for legacy in [false, true] {
-            let (h0, _, _, _) = delegate_renewed_once();
-            let dir = dir_of(&h0);
-            drop(h0);
-            let end = if legacy {
-                LogRecord::Recall { dir, gen: 7 }
-            } else {
-                LogRecord::RecallCut {
-                    dir,
-                    gen: 7,
-                    through: 0,
-                }
-            };
-            let (mut h, records) = path_b_waiting(end);
-            let retry = h.core.dl.install_retry.expect("the retry timer is armed");
-            Replica::apply_segment(&h.meta, 2, 1, 2, &[1, 2], &[], &records).unwrap();
-            h.advance(1_001);
-            h.step(Event::Timer { id: retry });
-            assert!(
-                h.core.dl.mine.contains_key(&8),
-                "(legacy {legacy}): not installed; journal row of 7 left: {:?}",
-                Replica::delegate_tx_pending(&h.meta, 7, 1)
-            );
-            assert!(h.core.dl.install_waiting.is_empty());
-            assert!(h.core.dl.install_retry.is_none());
-        }
+        let (h0, _, _, _) = delegate_renewed_once();
+        drop(h0);
+        let end = LogRecord::DelegateNodeEnded {
+            node: 3,
+            gen: 7,
+            through: 0,
+        };
+        let (mut h, records) = path_b_waiting(end);
+        let retry = h.core.dl.install_retry.expect("the retry timer is armed");
+        Replica::apply_segment(&h.meta, 2, 1, 2, &[1, 2], &[], &records).unwrap();
+        h.advance(1_001);
+        h.step(Event::Timer { id: retry });
+        assert!(
+            h.core.dl.mine.contains_key(&8),
+            "not installed; journal row of 7 left: {:?}",
+            Replica::delegate_tx_pending(&h.meta, 7, 1)
+        );
+        assert!(h.core.dl.install_waiting.is_empty());
+        assert!(h.core.dl.install_retry.is_none());
     }
 
     /// Review must-fix 2 (fail-before): the root takes none of a batch (a
@@ -43501,12 +43452,7 @@ mod recall_cut {
                     gid: 0,
                     time_ns: 3,
                 },
-                LogRecord::Delegate {
-                    dir: e,
-                    node: 4,
-                    gen: 8,
-                    designated: false,
-                },
+                LogRecord::delegate_one(4, 8, e, constellation_meta::SubtreeKind::Placed),
             ],
         )
         .unwrap();
@@ -43594,12 +43540,7 @@ mod recall_cut {
                     gid: 0,
                     time_ns: 3,
                 },
-                LogRecord::Delegate {
-                    dir: e,
-                    node: 4,
-                    gen: 8,
-                    designated: false,
-                },
+                LogRecord::delegate_one(4, 8, e, constellation_meta::SubtreeKind::Placed),
             ],
         )
         .unwrap();
@@ -43649,7 +43590,7 @@ mod recall_cut {
 
 /// Plan 43 C2 (§2.1, §3.1-3.5): a delegate acknowledges once its group holds
 /// the row — the root's journaled append when no backup is recorded, the
-/// recorded backup after a `DelegGroup` record — and its own node's client
+/// recorded backup after a `DelegateNodeGroup` record — and its own node's client
 /// is answered from its disk only while it is lone.
 mod deleg_group {
     use super::*;
@@ -43803,11 +43744,11 @@ mod deleg_group {
         })
     }
 
-    /// The log records `DelegGroup { version, backups }` of generation 7 and
+    /// The log records `DelegateNodeGroup { version, backups }` of generation 7 and
     /// the delegate's core learns it (the segment path).
     fn record_group(
         h: &mut Harness,
-        dir: Ino,
+        _dir: Ino,
         seq: u64,
         version: u64,
         backups: Vec<u64>,
@@ -43819,8 +43760,8 @@ mod deleg_group {
             0,
             &[],
             &[],
-            &[LogRecord::DelegGroup {
-                dir,
+            &[LogRecord::DelegateNodeGroup {
+                node: 3,
                 gen: 7,
                 version,
                 backups,
@@ -44051,7 +43992,7 @@ mod deleg_group {
 
     /// Plan 46 M1.1 step 2: a delegate generation's rule is one lookup of
     /// its group: the singleton for its own node's client while lone, the
-    /// group at the applied `DelegGroup` version for every other asker and
+    /// group at the applied `DelegateNodeGroup` version for every other asker and
     /// once the root is near.
     #[test]
     fn a_delegates_commit_rule_is_one_lookup_of_its_group() {
@@ -44599,12 +44540,12 @@ mod deleg_group {
     /// A create, then a rename of what it created, with the lead flipping
     /// between them and the root crashing before the create commits:
     /// returns the rename's answer (`None`: not answered), and what the end
-    /// of the generation (`RecallCut` at the root's cursor) dropped and
+    /// of the generation (`DelegateNodeEnded` at the root's cursor) dropped and
     /// queued for replay.
     ///
     /// A batch of two records (one create): rows 1 and 2 are `Lone` (within
     /// the lead of the root's cursor), the create of `moved` (row 3) is
-    /// `DelegGroup` (two rows past it); the root's acks of rows 1 and 2
+    /// `DelegateNodeGroup` (two rows past it); the root's acks of rows 1 and 2
     /// bring the lead back, with row 3 not yet committed.
     fn create_then_rename_at_a_root_crash(
         hysteresis: bool,
@@ -44657,8 +44598,8 @@ mod deleg_group {
             0,
             &[],
             &[],
-            &[LogRecord::RecallCut {
-                dir,
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
                 gen: 7,
                 through: 2,
             }],
@@ -44678,7 +44619,7 @@ mod deleg_group {
     }
 
     /// Review follow-up F2 (fail-before): with the lead flipping back, a
-    /// `Lone` row must not sit behind an uncommitted `DelegGroup` row of the
+    /// `Lone` row must not sit behind an uncommitted `DelegateNodeGroup` row of the
     /// same generation. A create of `moved` waited for the root, and the
     /// rename of `moved` that follows it, journaled once the lead is back,
     /// was answered `Lone`: at a root crash the strand dropped the create
@@ -44873,8 +44814,8 @@ mod deleg_group {
             0,
             &[],
             &[],
-            &[LogRecord::RecallCut {
-                dir,
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
                 gen: 7,
                 through: 1,
             }],
@@ -45010,7 +44951,7 @@ mod deleg_group {
     /// Plan 46 M1.1 step 4 (fail-before: the row is stamped with the
     /// published version): the fast path stamps the rule the core published
     /// only at the version the store records under its writer lock. A
-    /// `DelegGroup` record applied after the core's publication (the core has
+    /// `DelegateNodeGroup` record applied after the core's publication (the core has
     /// not read it yet) refuses the fast path's row, which goes through the
     /// core; the core reads the configuration when it stamps, so the row
     /// carries the new version, and it waits for the new group's member.
@@ -45030,8 +44971,8 @@ mod deleg_group {
             0,
             &[],
             &[],
-            &[LogRecord::DelegGroup {
-                dir,
+            &[LogRecord::DelegateNodeGroup {
+                node: 3,
                 gen: 7,
                 version: 1,
                 backups: vec![4],
@@ -45083,7 +45024,7 @@ mod deleg_group {
     }
 
     /// A backup counts only once the delegate's own table records a
-    /// `DelegGroup` naming it (D4): its acknowledgements before that are not
+    /// `DelegateNodeGroup` naming it (D4): its acknowledgements before that are not
     /// the delegate's commit; after, they are, and the root's append is not
     /// needed any more.
     #[test]
@@ -45128,7 +45069,7 @@ mod deleg_group {
 
     /// Review follow-up (fail-before): the generation's group as the table
     /// records it is read again at every sync; a read that failed took it
-    /// for "no `DelegGroup` record" and emptied the group, so the delegate
+    /// for "no `DelegateNodeGroup` record" and emptied the group, so the delegate
     /// was lone for a moment and answered its own rows from its disk while
     /// the root ends the generation by the recorded backup's tail. The group
     /// it knew stays.
@@ -45274,7 +45215,7 @@ mod deleg_group {
     /// Plan 43 C2d: what the core tells the delegate's FUSE fast path —
     /// the class its own clients' rows are journaled with, and how far the
     /// group has committed the stream. Lone: the row is `Lone`; the root
-    /// comes within reach: `DelegGroup`, committed on the root's append;
+    /// comes within reach: `DelegateNodeGroup`, committed on the root's append;
     /// the generation ending here withdraws it.
     #[test]
     fn the_core_publishes_the_class_and_the_commit_point_to_the_fast_path() {
@@ -45425,7 +45366,7 @@ mod deleg_group {
         assert_eq!(h.core.dl.mine[&7].group_requested, Some(vec![]));
     }
 
-    /// Review claim 2 (fail-before): a row journaled `DelegGroup` (root near)
+    /// Review claim 2 (fail-before): a row journaled `DelegateNodeGroup` (root near)
     /// and answered by the fast path after the delegate turned lone (root
     /// out of its RTT budget) is an answered row all the same: a backup
     /// candidate that holds none of it must not be put in the group record
@@ -45434,7 +45375,7 @@ mod deleg_group {
     fn a_group_row_answered_after_the_delegate_turned_lone_keeps_acked_max() {
         let (mut h, dir, _, _) = delegate_renewed_once();
         root_is_near(&mut h);
-        // The FUSE thread's write, journaled DelegGroup (root near).
+        // The FUSE thread's write, journaled DelegateNodeGroup (root near).
         let ino = h.meta.allocate_ino(dir).unwrap();
         let op = MutateOp::Create {
             parent: dir,
@@ -45616,12 +45557,7 @@ mod deleg_group {
                     gid: 0,
                     time_ns: 1,
                 },
-                LogRecord::Delegate {
-                    dir: dir2,
-                    node: 3,
-                    gen: 8,
-                    designated: false,
-                },
+                LogRecord::delegate_one(3, 8, dir2, constellation_meta::SubtreeKind::Placed),
             ],
         )
         .unwrap();
@@ -45673,7 +45609,7 @@ mod deleg_group {
     }
 
     /// The requester's deadline settles a rid from the delegate's own
-    /// journal only when its row is committed: an uncommitted `DelegGroup`
+    /// journal only when its row is committed: an uncommitted `DelegateNodeGroup`
     /// row is not an outcome the generation's end will keep (D6).
     #[test]
     fn settled_outcome_does_not_answer_an_uncommitted_delegate_row() {
@@ -47384,7 +47320,7 @@ mod deleg_group {
         );
     }
 
-    /// The root journals the group a delegate asks for: `DelegGroup` at the
+    /// The root journals the group a delegate asks for: `DelegateNodeGroup` at the
     /// next version when the request differs from the latest record, nothing
     /// when it is the same.
     #[test]
@@ -47395,7 +47331,7 @@ mod deleg_group {
                 .into_iter()
                 .flat_map(|tx| tx.records)
                 .filter_map(|r| match r {
-                    LogRecord::DelegGroup {
+                    LogRecord::DelegateNodeGroup {
                         gen: 7,
                         version,
                         backups,
@@ -47452,8 +47388,8 @@ mod deleg_group {
             0,
             &[],
             &[],
-            &[LogRecord::RecallCut {
-                dir,
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
                 gen: 7,
                 through: 0,
             }],
@@ -47483,8 +47419,8 @@ mod deleg_group {
             0,
             &[],
             &[],
-            &[LogRecord::RecallCut {
-                dir,
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
                 gen: 7,
                 through: 0,
             }],
@@ -47531,12 +47467,7 @@ mod designee_stream {
                     gid: 0,
                     time_ns: 1,
                 },
-                LogRecord::Delegate {
-                    dir,
-                    node: 3,
-                    gen: 7,
-                    designated: true,
-                },
+                LogRecord::delegate_one(3, 7, dir, constellation_meta::SubtreeKind::Designated),
             ],
         )
         .unwrap();
@@ -48819,12 +48750,7 @@ mod deleg_windows_tests {
                     gid: 0,
                     time_ns: 3,
                 },
-                LogRecord::Delegate {
-                    dir: e,
-                    node: 3,
-                    gen: 8,
-                    designated: false,
-                },
+                LogRecord::delegate_one(3, 8, e, constellation_meta::SubtreeKind::Placed),
             ],
         )
         .unwrap();
@@ -48961,8 +48887,8 @@ mod deleg_windows_tests {
         let _ = delegated_to_me(&h.meta, 3);
         Replica::apply_records_journaled(
             &h.meta,
-            &[LogRecord::DelegGroup {
-                dir: h.meta.lookup(ROOT_INO, "d").unwrap().unwrap().ino,
+            &[LogRecord::DelegateNodeGroup {
+                node: 3,
                 gen: 7,
                 version: 1,
                 backups: vec![4],
@@ -49034,7 +48960,7 @@ mod deleg_windows_tests {
         assert!(
             !journal_records_of_gen(&h, 7)
                 .iter()
-                .any(|r| matches!(r, LogRecord::Delegate { .. })),
+                .any(|r| matches!(r, LogRecord::DelegateNode { .. })),
             "and delegates nothing"
         );
         assert!(h.meta.deleg_prev_roots(7).unwrap().is_empty());
@@ -49581,10 +49507,9 @@ mod deleg_windows_tests {
         assert!(!g.waiting_for_group);
         assert_eq!(h.core.stats.groups_abandoned, 1);
         let records = journal_records(&h);
-        let dir = g.dir;
         assert!(
-            records.contains(&LogRecord::RecallCut {
-                dir,
+            records.contains(&LogRecord::DelegateNodeEnded {
+                node: 3,
                 gen: 7,
                 through: 3
             }),
@@ -49997,7 +49922,7 @@ mod deleg_windows_tests {
         assert_eq!(acked(&out), Some((2, false)));
     }
 
-    /// The journal row of an operator's end of a generation (`RecallCut`
+    /// The journal row of an operator's end of a generation (`DelegateNodeEnded`
     /// and `GroupAbandoned { gen }`, one transaction) matches its own
     /// segment when this node recovers it after a crash: only the epoch
     /// marker's `GroupAbandoned { gen: 0 }` is no journal row.
@@ -53501,12 +53426,7 @@ mod deleg_root_read {
                     gid: 0,
                     time_ns: 1,
                 },
-                LogRecord::Delegate {
-                    dir,
-                    node: 2,
-                    gen: 1,
-                    designated: false,
-                },
+                LogRecord::delegate_one(2, 1, dir, constellation_meta::SubtreeKind::Placed),
             ],
         )
         .unwrap();
@@ -55452,12 +55372,7 @@ mod c2g_settle {
                     gid: 0,
                     time_ns: 1,
                 },
-                LogRecord::Delegate {
-                    dir,
-                    node,
-                    gen: 8,
-                    designated: false,
-                },
+                LogRecord::delegate_one(node, 8, dir, constellation_meta::SubtreeKind::Placed),
             ],
         )
         .unwrap();
@@ -55595,12 +55510,12 @@ mod c2g_settle {
             0,
             &[],
             &[],
-            &[LogRecord::Delegate {
-                dir: e,
-                node: 1,
-                gen: 8,
-                designated: false,
-            }],
+            &[LogRecord::delegate_one(
+                1,
+                8,
+                e,
+                constellation_meta::SubtreeKind::Placed,
+            )],
         )
         .unwrap();
         connect_4(&mut h);
@@ -55760,7 +55675,7 @@ mod c2g_settle {
     /// generation it took on known, an op the plan sends to a recall (a
     /// deps park released by a gated batch, an execution kept from a usable
     /// phase) would have sent `DelegRecall`, closed the generation's window
-    /// and, once the delegate drained it, ended it (`RecallCut`) in a view
+    /// and, once the delegate drained it, ended it (`DelegateNodeEnded`) in a view
     /// that is closed. The plan answers `Gated`, `start_recall` sends
     /// nothing. Fails on the parent: `Wait`, a `DelegRecall` to node 4.
     #[test]
@@ -55792,7 +55707,7 @@ mod c2g_settle {
 
     /// S5 (fable review MUST 2): a recall drained while this tenure was
     /// usable (its generation kept across a gate that `adopt_epoch_hold`
-    /// installs) is not ended inside the gate (`RecallCut`, `void_stream`),
+    /// installs) is not ended inside the gate (`DelegateNodeEnded`, `void_stream`),
     /// but when the gate opens. Fails on the parent's `root_progress`: ended
     /// at the delegate's answer.
     #[test]

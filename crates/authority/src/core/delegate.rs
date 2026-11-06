@@ -63,7 +63,8 @@ use constellation_fs_core::Ino;
 use constellation_meta::delegation::Ownership;
 use constellation_meta::locks::LockTag;
 use constellation_meta::{
-    LogRecord, MetaError, MutateOp, MutateOutcome, OwnChunks, Position, RecallNeed, Rid, TouchSet,
+    LogRecord, MetaError, MutateOp, MutateOutcome, OwnChunks, Position, RecallNeed, Rid,
+    SubtreeKind, TouchSet,
 };
 use constellation_types::Code;
 use std::collections::{BTreeMap, BTreeSet};
@@ -108,7 +109,7 @@ pub(crate) struct GenState {
     /// designation.
     pub kind: DelegKind,
     /// Plan 43 C2: the generation's configuration — the latest
-    /// `DelegGroup` record this root journaled (seeded from its table
+    /// `DelegateNodeGroup` record this root journaled (seeded from its table
     /// for an inherited generation). The root drains its backup (seal)
     /// when the delegate dies.
     pub group: GroupState,
@@ -124,14 +125,14 @@ pub(crate) struct GenState {
     /// ADR-44: the recall was started inside a shippable takeover gate, on
     /// demand (an op or a settle that needs this generation ended,
     /// [`Core::gate_recall_on_demand`]). Only such a recall is resent, has
-    /// its drain taken and is ended (`RecallCut`) before the gate opens.
+    /// its drain taken and is ended (`DelegateNodeEnded`) before the gate opens.
     pub gate_recalled: bool,
     /// Placement: since when the delegate's share has been below the
     /// leave threshold (`None`: it is not).
     pub below_since: Option<WaitMs>,
     /// Plan 43 C2e (§3.7): the seals asked of the group's members, by request
     /// id: `(member, strict)`. A *strict* member is one of the latest
-    /// `DelegGroup` version (the end waits for one of them); a best-effort
+    /// `DelegateNodeGroup` version (the end waits for one of them); a best-effort
     /// one is named only by an older record (sealed once, its tail drained
     /// when it comes while the generation is still ending, never waited
     /// for). A late answer to any earlier request is as good as the latest's.
@@ -142,7 +143,7 @@ pub(crate) struct GenState {
     /// recall now): kept, and drained again after every event, until the
     /// cursor reaches the end. The generation stays `Sealing` meanwhile.
     pub sealed_tail: Option<std::sync::Arc<SealedTail>>,
-    /// Plan 43 C2 (Q1): the generation cannot end: its latest `DelegGroup`
+    /// Plan 43 C2 (Q1): the generation cannot end: its latest `DelegateNodeGroup`
     /// record names a backup, which may hold acknowledged rows the root
     /// does not, and none has answered its seal with a tail drained to its
     /// end. Asked again every window until one does (counted in
@@ -243,7 +244,7 @@ pub(crate) struct SealedTail {
 }
 
 /// Plan 43 C2: a generation's configuration as the root knows it (the
-/// latest `DelegGroup` record journaled for it; version 0 and no backups:
+/// latest `DelegateNodeGroup` record journaled for it; version 0 and no backups:
 /// the group is the delegate and the root).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct GroupState {
@@ -254,7 +255,7 @@ pub(crate) struct GroupState {
 }
 
 impl GroupState {
-    pub(crate) fn of(row: Option<constellation_meta::delegation::DelegGroupRow>) -> Self {
+    pub(crate) fn of(row: Option<constellation_meta::delegation::NodeGroupRow>) -> Self {
         row.map(|r| GroupState {
             version: r.version,
             backups: r.backups,
@@ -535,7 +536,7 @@ pub(crate) struct DelegateState {
     /// The dependencies of this stream's rows on rows of this node's other
     /// generations not committed when the row was read for a batch
     /// (`h -> idx -> i`: row `idx` depends on `(h, i)`), and the index
-    /// through which every row's are recorded: a `DelegGroup`
+    /// through which every row's are recorded: a `DelegateNodeGroup`
     /// acknowledgement waits for them ([`Core::deleg_caps`]).
     pub xdeps: BTreeMap<u64, BTreeMap<u64, u64>>,
     pub xrec: u64,
@@ -770,7 +771,7 @@ pub(crate) struct DelegationState {
     /// it answered, with the root that recalled them: the subtree's lock
     /// grants went back there (`on_deleg_recall`), so lock requests and
     /// renewals for it are sent there (`NotOwner { root }`) rather than
-    /// refused with `NotOwner { 0 }` until the `Recall` record reaches
+    /// refused with `NotOwner { 0 }` until the `DelegateNodeEnded` record reaches
     /// this table — under an S3 cut, only after it. Also for a
     /// generation never installed here (an epoch was active when the
     /// table named it). `(root, recalled at, row seen)`: dropped once the
@@ -1369,7 +1370,8 @@ impl Core {
             // the journal as it was and goes on (`delegate-handoff-renewal`);
             // a designee is exempt: it renews nothing, and its stream
             // sends only rows a sync put on its disk (`deleg_stream`).
-            let rebooted = !d.designated && replica.deleg_held_on_another_boot(d.gen, now.boot.id);
+            let rebooted =
+                !d.designated() && replica.deleg_held_on_another_boot(d.gen, now.boot.id);
             if rebooted {
                 self.stats.deleg_rebooted_holder += 1;
                 tracing::warn!(
@@ -1422,7 +1424,7 @@ impl Core {
                     lapsed: false,
                     parked: Vec::new(),
                     executed: 0,
-                    designated: d.designated,
+                    designated: d.designated(),
                     last_root: self.root_node(),
                     backup: None,
                     backup_acked: 0,
@@ -1452,7 +1454,7 @@ impl Core {
                     xheld_since: None,
                 },
             );
-            if d.designated {
+            if d.designated() {
                 // Honoured whatever the root says or the clock does
                 // (DESIGN.md §5.2: the designee writes while isolated).
                 self.dl.mine.get_mut(&d.gen).expect("present").until = HonourMs(i64::MAX / 2);
@@ -1533,14 +1535,14 @@ impl Core {
                     d.node,
                     inherited_until,
                     inherited_until,
-                    !d.designated,
+                    !d.designated(),
                 );
                 self.dl.gens.insert(
                     d.gen,
                     GenState {
                         dir: d.dir,
                         node: d.node,
-                        kind: if d.designated {
+                        kind: if d.designated() {
                             DelegKind::Designated
                         } else {
                             DelegKind::Manual
@@ -2301,7 +2303,7 @@ impl Core {
             self.own_chunks_for(from, rid, &outcome, (gen, &position), replica)
         };
         // Plan 43 C2 (§3.4): `class` is the row's, fixed when it was
-        // journaled. A row whose class waits (`DelegGroup`, `Archive`) is
+        // journaled. A row whose class waits (`DelegateNodeGroup`, `Archive`) is
         // answered once its group holds it: the root's append of the stream
         // that its own tenure committed, or the recorded backup's
         // acknowledgement, or the log.
@@ -2419,7 +2421,7 @@ impl Core {
     /// (what is left of it is in the log), the group has no member and the
     /// archive carries it; a designation is `Final`; a lone delegate's own
     /// node's client is the singleton; otherwise the generation's group at
-    /// its applied `DelegGroup` version.
+    /// its applied `DelegateNodeGroup` version.
     pub fn deleg_rule(&self, gen: u64, asker: Asker, replica: &dyn Replica) -> CommitRule {
         let archive = CommitRule::Group {
             version: 0,
@@ -2455,7 +2457,7 @@ impl Core {
     /// delegate's own journal and uncommitted; the retry's answer then
     /// waits for it exactly as the first execution's did. A row of this
     /// generation that waits for its group (gated), or any row asked for by
-    /// another node, parks under `DelegGroup`: a remote must never be
+    /// another node, parks under `DelegateNodeGroup`: a remote must never be
     /// answered a `Lone` row, and prefix commit makes the row committed once
     /// the root's append (or the backup) holds a later index. This node's
     /// own client, retrying a `Lone` row, is answered at once as `Lone`.
@@ -2511,7 +2513,7 @@ impl Core {
     /// journal ran ahead of the stream without bound, and every forward
     /// waited for the backlog: 90,000 rows, minutes, until the client
     /// deadline answered `EIO`. Past the lead its own rows wait for the root
-    /// too (`DelegGroup`), so its node's load is held to what the stream
+    /// too (`DelegateNodeGroup`), so its node's load is held to what the stream
     /// carries and a forward waits for a bounded few batches.
     fn deleg_lone_lead_full(
         &self,
@@ -2573,7 +2575,7 @@ impl Core {
     /// runs without the effect it was answered on top of (a create of `f`,
     /// then a rename of `f`: the rename fails). The lead flips a lone
     /// delegate's class back and forth, and a delegate that turned lone
-    /// after journaling `DelegGroup` rows has such rows too: `Lone` returns
+    /// after journaling `DelegateNodeGroup` rows has such rows too: `Lone` returns
     /// only once every one of them has committed. Another node's forward is
     /// left out: I5 would allow rolling back a `Lone` answer behind it, and
     /// counting it would hold a delegate that serves remote nodes back for
@@ -2632,7 +2634,7 @@ impl Core {
     }
 
     /// The backup this delegate tells the root it wants (`DelegRenew.backup`,
-    /// the *request* for a `DelegGroup` record): the change it asked for and
+    /// the *request* for a `DelegateNodeGroup` record): the change it asked for and
     /// the table does not record yet, else the group it applied.
     pub(crate) fn deleg_requested_backup(d: &DelegateState) -> Option<NodeId> {
         match &d.group_requested {
@@ -2723,7 +2725,7 @@ impl Core {
     }
 
     /// What each generation this node delegates has committed for its
-    /// `DelegGroup` acknowledgements ([`XCap`]). A row is committed when
+    /// `DelegateNodeGroup` acknowledgements ([`XCap`]). A row is committed when
     /// the log carries it, or when its group holds it **and** every row of
     /// the stream up to it has its dependencies on this node's other
     /// generations committed (a prefix rule: a later row is committed only
@@ -2900,7 +2902,7 @@ impl Core {
     }
 
     /// Plan 43 C2 (§3.4): transaction `(gen, idx)` is committed — the answer
-    /// of a row of the class `DelegGroup` may leave — from what this
+    /// of a row of the class `DelegateNodeGroup` may leave — from what this
     /// delegate knows: the log carries it, or every member of the group
     /// holds it. See [`Self::deleg_stream_state_with`].
     pub(crate) fn deleg_stream_durable(&self, gen: u64, idx: u64, replica: &dyn Replica) -> bool {
@@ -3267,7 +3269,7 @@ impl Core {
     }
 
     /// The committed prefix of `gen`'s stream by the acknowledgement rule
-    /// ([`Self::deleg_caps`]): what a `DelegGroup` answer waits for, and so
+    /// ([`Self::deleg_caps`]): what a `DelegateNodeGroup` answer waits for, and so
     /// what the `Lone` lead and the hysteresis count as committed too (a
     /// gated row its group holds but whose dependency on another generation
     /// is open is not committed: a `Lone` row behind it would be replayed
@@ -3351,7 +3353,7 @@ impl Core {
             let through = through.min(holder_caps.get(&d.gen).copied().unwrap_or(u64::MAX));
             // The fast path answers its own node's clients from the FUSE
             // thread, where the core does not see it: every index committed
-            // may have been answered — as a `DelegGroup` row journaled
+            // may have been answered — as a `DelegateNodeGroup` row journaled
             // before the delegate turned lone is, whatever the class is
             // now — so `deleg_group_maintain` lets go of none of them
             // before the group that is left holds it (`acked_max`).
@@ -3466,7 +3468,7 @@ impl Core {
     /// one is due — the transposition of the root lease's add-then-record,
     /// remove-when-safe rules (`backup_promote`, `removal_safe`). The
     /// delegate *requests* it in its next renewal (`DelegRenew.backup`); the
-    /// root journals the `DelegGroup` record; the delegate counts the new
+    /// root journals the `DelegateNodeGroup` record; the delegate counts the new
     /// member only once its own table records it, and an acknowledgement
     /// needs the members of both versions meanwhile.
     ///
@@ -3965,7 +3967,7 @@ impl Core {
     /// generation, delegate the directory to the backup.
     ///
     /// Plan 43 C2e (§3.7, D3, D8): a *strict* member (of the latest
-    /// `DelegGroup` version) ends the generation once its tail is drained to
+    /// `DelegateNodeGroup` version) ends the generation once its tail is drained to
     /// its end — the rows acknowledged through the group are on every
     /// member, so one member's tail is the group's — and until then the
     /// generation stays `Sealing` ([`Self::deleg_end_sealed`]). A
@@ -4094,7 +4096,7 @@ impl Core {
             }
             // The drain stopped at a row whose dependency was lost with its
             // generation: no row from there on was acknowledged (a
-            // `DelegGroup` acknowledgement waits for the row's dependencies
+            // `DelegateNodeGroup` acknowledgement waits for the row's dependencies
             // on the delegate's other generations, `Core::deleg_caps`), so
             // the generation ends before it; the rows strand and are
             // replayed by rid (or dropped, unanswered) on the delegate.
@@ -5478,7 +5480,7 @@ impl Core {
         self.dl.by_req.insert(req, (gen, ReqKind::Renew));
         let d = self.dl.mine.get_mut(&gen).expect("present");
         // Plan 43 C2: the renewal carries the *request* for a group change
-        // (the root journals a `DelegGroup` record for it), or the group the
+        // (the root journals a `DelegateNodeGroup` record for it), or the group the
         // delegate applied.
         let backup = Self::deleg_requested_backup(d);
         d.renew_backup = backup;
@@ -5516,26 +5518,20 @@ impl Core {
     }
 
     /// Plan 43 C2 (§3.3): the root journals the generation's configuration
-    /// as asked by its delegate's renewal: `DelegGroup { version: latest + 1,
+    /// as asked by its delegate's renewal: `DelegateNodeGroup { version: latest + 1,
     /// backups }`. Only while the generation lives and is not ending (the
     /// end uses the latest record). The record is a root row like any other
     /// (its class is the root's now); no answer waits for it, and the
     /// delegate counts the new member only once its own table records it,
     /// i.e. once the record is committed (D4).
-    fn deleg_journal_group(
-        &mut self,
-        gen: u64,
-        dir: Ino,
-        backups: Vec<NodeId>,
-        replica: &dyn Replica,
-    ) {
+    fn deleg_journal_group(&mut self, gen: u64, backups: Vec<NodeId>, replica: &dyn Replica) {
         let Some(g) = self.dl.gens.get(&gen) else {
             return;
         };
         let version = g.group.version + 1;
         let _class = self.journal_class();
-        let rec = LogRecord::DelegGroup {
-            dir,
+        let rec = LogRecord::DelegateNodeGroup {
+            node: g.node,
             gen,
             version,
             backups: backups.clone(),
@@ -5601,7 +5597,7 @@ impl Core {
         }
         let mut ttl_ms = 0u64;
         let mut hold = None;
-        let mut group_change: Option<(Ino, Vec<NodeId>)> = None;
+        let mut group_change: Option<Vec<NodeId>> = None;
         // Plan 46 M0.3 (S5, ADR-42): a takeover gate whose journal work is
         // done answers the renewals of a generation it has taken on
         // (`delegation_sync` at `RootSync::Gated`): its keys are not among
@@ -5678,13 +5674,13 @@ impl Core {
                     if let RenewFrom::Core { backup, .. } = source {
                         let want: Vec<NodeId> = backup.into_iter().collect();
                         if want != g.group.backups {
-                            group_change = Some((g.dir, want));
+                            group_change = Some(want);
                         }
                     }
                 }
             }
-            if let Some((dir, want)) = group_change {
-                self.deleg_journal_group(gen, dir, want, replica);
+            if let Some(want) = group_change {
+                self.deleg_journal_group(gen, want, replica);
             }
             tracing::debug!(
                 node = self.me(),
@@ -7035,7 +7031,7 @@ impl Core {
         };
         // The gate never recalls (ADR-42): a generation it took on is the
         // delegate's until the gate opens, and a recall sent inside it would
-        // end the generation (`RecallCut`) in a view that is closed.
+        // end the generation (`DelegateNodeEnded`) in a view that is closed.
         if self.lease.gate.is_some()
             && involved
                 .iter()
@@ -7189,7 +7185,7 @@ impl Core {
     /// Plan 46 M0.3 (S3): how long after the root granted a generation its
     /// delegate's own op forwarded to the root may still mean "my table has not
     /// carried the grant yet". The delegate learns the grant from the
-    /// log's `Delegate` record (one stream tick) and from its first
+    /// log's `DelegateNode` record (one stream tick) and from its first
     /// renewal's answer; each is a P2P round trip the product waits
     /// [`Core::deleg_request_timeout_ms`] for before it counts the request
     /// dropped and sends it again. So: two stream ticks plus two such round
@@ -7324,7 +7320,7 @@ impl Core {
     /// lease's end drops it with its recall (`deleg_on_lease_gone`), the
     /// delegate's answer finds no request to match (`on_deleg_recalled`)
     /// and the lock grants it hands back are dropped
-    /// (`lock_install_returned`), and no `RecallCut` is journaled, which
+    /// (`lock_install_returned`), and no `DelegateNodeEnded` is journaled, which
     /// only a root does (`end_generation`). The table kept the generation
     /// delegated while the delegate had handed it back here
     /// (`handed_back`): lock requests went round the two
@@ -7442,7 +7438,7 @@ impl Core {
     }
 
     /// Plan 46 M1.2 step 7 (c3-spec D6): this root has just inherited `gen`
-    /// from a predecessor. When its latest `DelegGroup` records no backup (the
+    /// from a predecessor. When its latest `DelegateNodeGroup` records no backup (the
     /// group is the delegate and a root) the rows the delegate was answered
     /// through may sit only on the delegate and on whichever root appended
     /// them: the previous holder of the lease this node claimed, whose member
@@ -8224,7 +8220,7 @@ impl Core {
             .min_by_key(|(_, _, a)| *a)
     }
 
-    /// End `gen` here and now: the `RecallCut` record journaled (the table
+    /// End `gen` here and now: the `DelegateNodeEnded` record journaled (the table
     /// row changes with it), later stream records of it refused, every
     /// parked execution waiting on it released.
     ///
@@ -8266,6 +8262,7 @@ impl Core {
         // Whatever ends a generation passed a closed slot (an expiry, a
         // recall); closed here too, for every other way in.
         self.dw.close(gen);
+        let node = g.node;
         let dir = g.dir;
         let cursor = g.cursor;
         let drained = matches!(g.recall, RecallPhase::Drained(_));
@@ -8289,7 +8286,7 @@ impl Core {
             cursor
         };
         let _class = self.journal_class();
-        let mut records = vec![LogRecord::RecallCut { dir, gen, through }];
+        let mut records = vec![LogRecord::DelegateNodeEnded { node, gen, through }];
         if let Some(through_known) = abandoned {
             records.push(LogRecord::GroupAbandoned {
                 epoch: 0,
@@ -8306,7 +8303,7 @@ impl Core {
         replica.note_void_cut(gen, through);
         // What this root holds of the generation's replies (its own
         // forwarded ops' shadows and hints) is stranded like on any
-        // other replica applying the `Recall` (long-delegated seed 72780).
+        // other replica applying the `DelegateNodeEnded` (long-delegated seed 72780).
         match replica.strand_recalled_speculation(gen) {
             Ok(s) if s.any() => {
                 tracing::info!(
@@ -8726,7 +8723,7 @@ impl Core {
         }
     }
 
-    /// Delegate `dir` to `node` as `kind`: the `Delegate` record and the
+    /// Delegate `dir` to `node` as `kind`: the `DelegateNode` record and the
     /// root's generation state. The checks every path shares (an
     /// operator's control, the placement, a designation, a
     /// re-delegation after a cross-subtree op).
@@ -8772,7 +8769,8 @@ impl Core {
         {
             return Err(format!("a directory under {dir} is already delegated"));
         }
-        if kind != DelegKind::Designated && table.iter().any(|d| d.node == node && !d.designated) {
+        if kind != DelegKind::Designated && table.iter().any(|d| d.node == node && !d.designated())
+        {
             return Err(format!("node {node} already holds a delegation"));
         }
         // Plan 30 §M8 under M11: the read delegations this root granted
@@ -8827,12 +8825,16 @@ impl Core {
         let _class = self.journal_class();
         replica
             .apply_records_journaled(
-                &[LogRecord::Delegate {
-                    dir,
+                &[LogRecord::delegate_one(
                     node,
                     gen,
-                    designated,
-                }],
+                    dir,
+                    if designated {
+                        SubtreeKind::Designated
+                    } else {
+                        SubtreeKind::Placed
+                    },
+                )],
                 None,
             )
             .map_err(|e| e.to_string())?;
@@ -9108,8 +9110,8 @@ impl Core {
                 continue;
             }
             match table.get(dir) {
-                Some(d) if d.designated && d.node == node => continue,
-                Some(d) if !d.designated => {
+                Some(d) if d.designated() && d.node == node => continue,
+                Some(d) if !d.designated() => {
                     // A placed or manual delegation on the very directory:
                     // it ends, the designation follows on the next sync.
                     if self.dl.gens.get(&d.gen).is_some_and(|g| !g.ended) {
@@ -9120,7 +9122,7 @@ impl Core {
                 _ => {}
             }
             if let Some(d) = table.covering(replica.namespace(), dir) {
-                if !d.designated && self.dl.gens.get(&d.gen).is_some_and(|g| !g.ended) {
+                if !d.designated() && self.dl.gens.get(&d.gen).is_some_and(|g| !g.ended) {
                     self.start_recall(now, d.gen, out);
                 }
                 continue;
@@ -9139,7 +9141,7 @@ impl Core {
         let released: Vec<u64> = table
             .iter()
             .filter(|d| {
-                d.designated
+                d.designated()
                     && !entries
                         .iter()
                         .any(|(dir, node)| *dir == d.dir && *node == d.node)
@@ -9175,7 +9177,7 @@ impl Core {
         // 03–05): only `online` releases it. Recalling it here would just
         // see it re-delegated by the next designation sync, after
         // bouncing the designee's in-flight ops.
-        if entries.iter().any(|d| d.designated)
+        if entries.iter().any(|d| d.designated())
             || entries.iter().any(|d| {
                 self.dl
                     .gens

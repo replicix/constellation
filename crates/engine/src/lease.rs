@@ -597,12 +597,7 @@ mod tests {
                 gid: 0,
                 time_ns: 1,
             },
-            LogRecord::Delegate {
-                dir,
-                node: 3,
-                gen: 7,
-                designated: false,
-            },
+            LogRecord::delegate_one(3, 7, dir, constellation_meta::SubtreeKind::Placed),
         ])
         .unwrap();
         let x = meta.allocate_ino(ROOT_INO).unwrap();

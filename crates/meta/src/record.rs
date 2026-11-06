@@ -215,31 +215,6 @@ pub enum LogRecord {
         n: u64,
         i: u32,
     },
-    /// Plan 30 §M11: `dir` and everything under it is sequenced by
-    /// `node` under delegation generation `gen` from this record on. The
-    /// replicated delegation table is the fold of these records; applying
-    /// one updates the `0x30 | Delegation` row (`crate::delegation`), so a
-    /// commit carries the table and a bootstrapped replica learns it.
-    /// Touches no inode or dentry (see `TouchSet::add`).
-    Delegate {
-        dir: u64,
-        node: u64,
-        gen: u64,
-        /// Plan 30 §M11 phase 2b: an offline designation (plans 03–05):
-        /// never recalled by TTL or placement, only by `online`; a
-        /// cross-subtree op touching it is refused (`EXDEV`).
-        designated: bool,
-    },
-    /// Plan 30 §M11: generation `gen` of the delegation on `dir` ended.
-    /// Every record of its stream that is not before this one in the log
-    /// is void: a delegate that still holds such records rolls them back
-    /// and replays them by rid, and a requester's observation of them is
-    /// void (M6's rule for a tenure that ended without shipping).
-    ///
-    /// Plan 43 C2: no longer written (see [`LogRecord::RecallCut`], which
-    /// carries the cut); still read, for the logs written before it, with
-    /// the cut each replica infers from what it holds of the generation.
-    Recall { dir: u64, gen: u64 },
     /// Plan 30 §M9 × §M6: carried by the epoch marker of a sealed
     /// backup's takeover. The successor re-ships the acknowledged tail of
     /// the predecessor's tenure (`prev_epoch`) in its own segments *after*
@@ -318,23 +293,6 @@ pub enum LogRecord {
         held: bool,
         by: Option<String>,
     },
-    /// Plan 43 C2: generation `gen` of the delegation on `dir` ended, and
-    /// its stream is cut at `through`: the root had appended the
-    /// generation's rows `1..=through` before this record (its cursor, or
-    /// further when the root held the generation itself), and every row of
-    /// the generation past it is void — never in the log, and never to be
-    /// acknowledged. Replaces [`LogRecord::Recall`] for everything written
-    /// from this change on, so that every replica reads the cut from the
-    /// record instead of inferring it from what it happens to hold (a
-    /// delegate's own head, which holds its unappended rows too).
-    ///
-    /// Appended after `SnapHold` rather than as a field of `Recall`: the
-    /// records are postcard, not self-describing, so a field added to an
-    /// existing variant would make every segment and journal row that
-    /// carries a `Recall` undecodable (as with `SnapCreate2`). A `Recall`
-    /// already in a log keeps its meaning (the cut inferred from what the
-    /// replica holds of the generation).
-    RecallCut { dir: u64, gen: u64, through: u64 },
     /// Plan 43 C1-3 (§5.8, Q1): the operator abandoned the group of epoch
     /// `epoch` (`gen` 0: the root group; C2 uses the other generations):
     /// the claimant that took the lease went on without that group's tail,
@@ -376,25 +334,6 @@ pub enum LogRecord {
     /// on; `TailFollows` stays decodable and keeps its meaning for logs
     /// written before (`through` unknown: nothing is dropped by it).
     TailFollowsThrough { prev_epoch: u64, through: u64 },
-    /// Plan 43 C2: the configuration of delegation generation `gen` on
-    /// `dir` at `version` (strictly increasing per generation from 1; no
-    /// record is version 0, no backup: the group is the delegate and the
-    /// root, whose journaled append of a row is its second copy). Journaled
-    /// by the root only, while the generation lives, when the delegate asks
-    /// for a different backup (`DelegRenew.backup`). A delegate counts a
-    /// backup's acknowledgements only once its own replica's table records
-    /// this version, i.e. once the record is committed (vertical Paxos: a
-    /// configuration is used only when its master holds it durably).
-    /// Touches no inode or dentry.
-    ///
-    /// Appended at the end of the enum, as the postcard ordering comment on
-    /// this type requires.
-    DelegGroup {
-        dir: u64,
-        gen: u64,
-        version: u64,
-        backups: Vec<u64>,
-    },
     /// Plan 46 M0.2 follow-up (defect B): `repair drop-held` rolled back
     /// the holder's journal transactions `idents` — each the identity a
     /// member keys a transaction by ([`LogRecord::TailOf`]'s pair if the
@@ -417,6 +356,101 @@ pub enum LogRecord {
     /// Appended at the end of the enum, as the postcard ordering comment on
     /// this type requires.
     RolledBack { idents: Vec<(u64, u64)> },
+    /// Plan 46 M1.2 step 8a (§5.2): the root grants `node` the subtrees
+    /// `dirs` under generation `gen`: the generation opens with its first
+    /// record, and a later record of the same `(node, gen)` *grows* the
+    /// live stream's set (the node has one stream, one group, one cut). The
+    /// replicated delegation table is the fold of these records (see
+    /// `crate::delegation`); a commit carries it and a bootstrapped replica
+    /// learns it. A delegate learns a growth from its table, never from a
+    /// message. Touches no inode or dentry.
+    DelegateNode {
+        node: u64,
+        gen: u64,
+        dirs: Vec<SubtreeGrant>,
+    },
+    /// A row of the delegate's own stream (§5.2): the holder of `(node,
+    /// gen)` releases the subtree `dir`; `at` is the last index of the
+    /// stream that touched it, so the root sequences ops in `dir` only
+    /// after appending through `at`. The rest of the node's set stays
+    /// delegated. Touches no inode or dentry.
+    SubtreeReleased {
+        node: u64,
+        gen: u64,
+        dir: u64,
+        at: u64,
+    },
+    /// A row of the delegate's own stream: the holder releases every
+    /// subtree of `(node, gen)` (unmount, suspend, an explicit release);
+    /// `through` is the stream's last index. The generation itself ends
+    /// with the root's [`LogRecord::DelegateNodeEnded`]. Touches nothing.
+    StreamReleased { node: u64, gen: u64, through: u64 },
+    /// Plan 43 C2 under one stream: the configuration of `(node, gen)` at
+    /// `version` (strictly increasing per generation from 1; no record is
+    /// version 0, no backup: the group is the delegate and the root).
+    /// Journaled by the root only, while the generation lives, when the
+    /// delegate asks for a different backup. A delegate counts a backup's
+    /// acknowledgements only once its own replica's table records this
+    /// version (vertical Paxos). Touches no inode or dentry.
+    DelegateNodeGroup {
+        node: u64,
+        gen: u64,
+        version: u64,
+        backups: Vec<u64>,
+    },
+    /// Plan 43 C2 under one stream: generation `gen` of `node` ended and
+    /// its stream is cut at `through`: the root had appended the
+    /// generation's rows `1..=through` before this record (its cursor, or
+    /// further when the root held the generation itself), and every row of
+    /// the generation past it is void: never in the log, never to be
+    /// acknowledged. Every replica reads the cut from the record. Touches
+    /// no inode or dentry.
+    DelegateNodeEnded { node: u64, gen: u64, through: u64 },
+}
+
+/// What a granted subtree is (§5.2): `Placed` is the placement policy's
+/// (TTL-ended); `Sticky` a grant that never ends by TTL (§5.4; nothing writes
+/// it before M1.3 step 4, the wire shape is fixed now); `Designated` an
+/// offline designation (plans 03-05), never
+/// recalled by TTL or placement, only by `online`; a cross-subtree op
+/// touching it is refused (`EXDEV`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SubtreeKind {
+    Placed,
+    Sticky,
+    Designated,
+}
+
+/// One subtree of a [`LogRecord::DelegateNode`] grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SubtreeGrant {
+    pub dir: u64,
+    pub kind: SubtreeKind,
+}
+
+impl LogRecord {
+    /// A `DelegateNode` of one subtree: what the core writes until step 9
+    /// grows a stream in place (one directory per grant).
+    pub fn delegate_one(node: u64, gen: u64, dir: u64, kind: SubtreeKind) -> Self {
+        LogRecord::DelegateNode {
+            node,
+            gen,
+            dirs: vec![SubtreeGrant { dir, kind }],
+        }
+    }
+
+    /// The generation a delegation record of this kind names, with its
+    /// node (`None`: not a delegation record).
+    pub fn delegation_stream(&self) -> Option<(u64, u64)> {
+        match self {
+            LogRecord::DelegateNode { node, gen, .. }
+            | LogRecord::SubtreeReleased { node, gen, .. }
+            | LogRecord::StreamReleased { node, gen, .. }
+            | LogRecord::DelegateNodeGroup { node, gen, .. }
+            | LogRecord::DelegateNodeEnded { node, gen, .. } => Some((*node, *gen)),
+            _ => None,
+        }
+    }
 }
 
 impl LogRecord {
@@ -442,7 +476,7 @@ impl LogRecord {
 }
 
 /// Decode a whole value from `bytes`, refusing leftover bytes. A file
-/// system written before plan 46 M1.2 step 1 (whose `Delegate` record and
+/// system written before plan 46 M1.2 step 1 (whose `DelegateNode` record and
 /// delegation row carried a range) must be reformatted; this makes a record
 /// or row of the old shape fail loudly where it is detectable, instead of
 /// decoding into the wrong op with its tail ignored.
@@ -471,28 +505,16 @@ impl LogRecord {
 mod tests {
     use super::*;
 
-    /// A `Delegate` record as written before plan 46 M1.2 step 1: the new
-    /// shape followed by the removed whole-range `(bits, idx)` bytes.
-    fn old_delegate() -> (LogRecord, Vec<u8>, Vec<u8>) {
-        let new = LogRecord::Delegate {
-            dir: 7,
-            node: 2,
-            gen: 5,
-            designated: false,
-        };
+    /// A `DelegateNode` record followed by leftover bytes (a record of an
+    /// older shape): the decoder refuses it instead of decoding it with the
+    /// tail ignored. File systems written before M1.2 are reformatted.
+    #[test]
+    fn a_record_with_leftover_bytes_is_refused() {
+        let new = LogRecord::delegate_one(2, 5, 7, SubtreeKind::Placed);
         let new_bytes = new.to_postcard().unwrap();
+        assert_eq!(LogRecord::from_postcard(&new_bytes).unwrap(), new);
         let mut old_bytes = new_bytes.clone();
         old_bytes.extend_from_slice(&[0, 0]);
-        (new, new_bytes, old_bytes)
-    }
-
-    /// M1.2 step 1: a file system written before it is reformatted; a
-    /// decoder refuses leftover bytes, so an old `Delegate` record fails
-    /// loudly instead of decoding with its range bytes ignored.
-    #[test]
-    fn old_shape_delegate_record_is_refused() {
-        let (new, new_bytes, old_bytes) = old_delegate();
-        assert_eq!(LogRecord::from_postcard(&new_bytes).unwrap(), new);
         assert!(LogRecord::from_postcard(&old_bytes).is_err());
         // Inside a backup transaction (a journal row's records): the old
         // record shifts the rest of the stream, which must not decode.
@@ -532,31 +554,58 @@ mod tests {
         assert_eq!(LogRecord::from_postcard(&bytes).unwrap(), r);
     }
 
-    /// Plan 43 C2 (D1): `RecallCut` is a variant of its own, appended after
-    /// the last one — a `Recall` written before it still decodes, and the
-    /// postcard tags of every earlier variant did not move.
+    /// M1.2 step 8a: the §5.2 records round-trip, a grant carries several
+    /// subtrees with their kinds, and each refuses a trailing byte.
     #[test]
-    fn recall_cut_is_appended_and_recall_still_decodes() {
-        let old = LogRecord::Recall { dir: 7, gen: 3 };
-        let bytes = old.to_postcard().unwrap();
-        assert_eq!(LogRecord::from_postcard(&bytes).unwrap(), old);
-        let cut = LogRecord::RecallCut {
-            dir: 7,
-            gen: 3,
-            through: 12,
-        };
-        let bytes = cut.to_postcard().unwrap();
-        assert_eq!(LogRecord::from_postcard(&bytes).unwrap(), cut);
-        // The tags: `SnapHold` was the last variant (25), `RecallCut`
-        // follows it; `Recall` kept its own.
-        let snap_hold = LogRecord::SnapHold {
-            id: "s".into(),
-            held: true,
-            by: None,
-        };
-        assert_eq!(snap_hold.to_postcard().unwrap()[0], 25);
-        assert_eq!(bytes[0], 26);
-        assert_eq!(old.to_postcard().unwrap()[0], 21);
+    fn the_node_stream_records_round_trip() {
+        let recs = [
+            LogRecord::DelegateNode {
+                node: 2,
+                gen: 5,
+                dirs: vec![
+                    SubtreeGrant {
+                        dir: 7,
+                        kind: SubtreeKind::Placed,
+                    },
+                    SubtreeGrant {
+                        dir: 9,
+                        kind: SubtreeKind::Designated,
+                    },
+                    SubtreeGrant {
+                        dir: 11,
+                        kind: SubtreeKind::Sticky,
+                    },
+                ],
+            },
+            LogRecord::SubtreeReleased {
+                node: 2,
+                gen: 5,
+                dir: 7,
+                at: 11,
+            },
+            LogRecord::StreamReleased {
+                node: 2,
+                gen: 5,
+                through: 12,
+            },
+            LogRecord::DelegateNodeGroup {
+                node: 2,
+                gen: 5,
+                version: 1,
+                backups: vec![3],
+            },
+            LogRecord::DelegateNodeEnded {
+                node: 2,
+                gen: 5,
+                through: 12,
+            },
+        ];
+        for r in recs {
+            let mut bytes = r.to_postcard().unwrap();
+            assert_eq!(LogRecord::from_postcard(&bytes).unwrap(), r);
+            bytes.push(0);
+            assert!(LogRecord::from_postcard(&bytes).is_err());
+        }
     }
 
     #[test]

@@ -1295,7 +1295,7 @@ impl Meta {
 
     /// `drop_held` / `drop_held_remote` with what only the core knows
     /// (plan 46 M0.2 review): `unanswered(rid)` says that the answer of
-    /// another node's op, journaled `RootGroup`/`DelegGroup`, is certainly
+    /// another node's op, journaled `RootGroup`/`DelegateNodeGroup`, is certainly
     /// not given — it still waits in the core for its group — so the row
     /// may become a placeholder like an `Archive` one. The offline forms
     /// above know nothing: such a row keeps its op, the only copy that can

@@ -777,7 +777,7 @@ pub struct AnswererState {
     /// A continuation epoch's hold is in force.
     pub epoch_held: bool,
     /// Per generation this node holds as a delegate: the backups its own
-    /// store's table records for it (`DelegGroup`, plan 43 C2; empty: no
+    /// store's table records for it (`DelegateNodeGroup`, plan 43 C2; empty: no
     /// record, the group is the delegate and the root). Read from the
     /// answerer's store, not from the core — the delegate counts a backup
     /// only once its own table names it, and the oracle must not take the
@@ -801,7 +801,7 @@ impl AnswererState {
             designated_gens: meta
                 .delegation_table()
                 .iter()
-                .filter(|d| d.node == id && d.designated)
+                .filter(|d| d.node == id && d.designated())
                 .map(|d| d.gen)
                 .collect(),
         }
@@ -1260,7 +1260,7 @@ fn classify(
         _ => detail.push("root-group: not a root row".into()),
     }
 
-    // 3. DelegGroup.
+    // 3. DelegateNodeGroup.
     if let Some(t) = tx {
         let (g, i) = t.origin;
         if g != 0 {
@@ -1427,7 +1427,7 @@ fn backups_hold(
     Ok(())
 }
 
-/// DelegGroup: the delegate holds `(g, i)`; each recorded backup's delegate
+/// DelegateNodeGroup: the delegate holds `(g, i)`; each recorded backup's delegate
 /// tail holds it, or, with none recorded, the root's journal does and the
 /// root's own configuration committed that copy: every backup the lease
 /// object lists holds it (plan 46 §11, "M1.0 answers": a lone root's
@@ -1552,7 +1552,7 @@ fn deleg_group(
 /// the oracle judges each row against the newest version of the namespace its
 /// rule is stamped from:
 ///
-/// - `Group{on: Delegate}`: the generation's `DelegGroup` configuration as
+/// - `Group{on: Delegate}`: the generation's `DelegateNodeGroup` configuration as
 ///   the journaling node's replica has applied it (`DelegateState::
 ///   group_version`; 0 while no record is applied).
 /// - `Group{on: Root}`: the root's lease configuration (`config_version` of
@@ -1578,7 +1578,7 @@ fn deleg_group(
 /// "In force" is the configuration the journaling node has applied: the lease
 /// its core holds (a landing the holder has not read yet is not in force for
 /// it: add-then-record journals the old version until the holder learns the
-/// change, and the record commits under both), the `DelegGroup` record its
+/// change, and the record commits under both), the `DelegateNodeGroup` record its
 /// replica has applied. A delegate's group is judged by journal position
 /// (`Meta::deleg_group_at`: the version applied when the row was journaled,
 /// exactly); the lease's version by event (below; the lease has no per-position history to judge by,
@@ -1598,10 +1598,10 @@ pub struct RowVersions {
     /// The lease version each node's core had applied at its previous event
     /// (`tick`).
     lease_seen: BTreeMap<NodeId, u64>,
-    /// The `DelegGroup` version each node's replica had applied at its
+    /// The `DelegateNodeGroup` version each node's replica had applied at its
     /// previous event, per generation it has a row of.
     group_seen: BTreeMap<(NodeId, u64), u64>,
-    /// The highest `DelegGroup` version any store has held of a generation:
+    /// The highest `DelegateNodeGroup` version any store has held of a generation:
     /// the one in force when the generation ended within an event (its
     /// group row goes with it), which a row journaled before the end carries.
     group_top: BTreeMap<u64, u64>,
@@ -1645,7 +1645,7 @@ impl RowVersions {
 
     /// Judge the rows of `node`'s journal that are new since the last call
     /// (`rows`: `Meta::journal_rows_for_audit`), `group_now(gen)` being the
-    /// `DelegGroup` version `node`'s replica has applied for `gen`.
+    /// `DelegateNodeGroup` version `node`'s replica has applied for `gen`.
     pub fn judge(
         &mut self,
         node: NodeId,
@@ -1661,7 +1661,7 @@ impl RowVersions {
         // read once for the whole call: a generation's first row seeds its
         // entry below with the version applied *now*, which is no previous
         // event's for the rows of the same event after it (two rows of a new
-        // generation journaled before its first `DelegGroup` record was
+        // generation journaled before its first `DelegateNodeGroup` record was
         // installed in that event: the second was judged against the record,
         // long-delegated-backup seed 634).
         let group_before: BTreeMap<u64, u64> = self
@@ -2671,11 +2671,13 @@ mod tests {
         use constellation_meta::delegation::DelegationRecord;
         let mut t = constellation_meta::delegation::DelegationTable::default();
         for (dir, node, gen) in rows {
-            t.apply(DelegationRecord::Delegate {
-                dir: *dir,
+            t.apply(DelegationRecord::DelegateNode {
                 node: *node,
                 gen: *gen,
-                designated: false,
+                dirs: vec![constellation_meta::SubtreeGrant {
+                    dir: *dir,
+                    kind: constellation_meta::SubtreeKind::Placed,
+                }],
             });
         }
         t
@@ -3432,7 +3434,7 @@ mod tests {
 
     /// Plan 46 M1.1 steps 3 and 4: a row's version must be the configuration
     /// in force, in the namespace its rule is stamped from: the lease's newest
-    /// version for a root row, the node's applied `DelegGroup` version for a
+    /// version for a root row, the node's applied `DelegateNodeGroup` version for a
     /// `Group{Delegate}` row, with the lag of the node's previous event. A
     /// version that existed but was superseded (before that event), a
     /// version-0 placeholder under a lease, and the other namespace's version
@@ -3602,7 +3604,7 @@ mod tests {
 
     /// Plan 46 M1.1 step 5 triage (long-delegated-backup seed 634): two rows
     /// of a generation new to the oracle, journaled in one event before the
-    /// generation's first `DelegGroup` record was installed (later in that
+    /// generation's first `DelegateNodeGroup` record was installed (later in that
     /// event: no recorded version at or below their position), both carry
     /// version 0. The first row seeds the generation's "previous event"
     /// entry with the version applied by the end of the event; the second
@@ -3636,7 +3638,7 @@ mod tests {
     /// and stamped the archive rows with its tenure's version 4, which the
     /// oracle's "epoch 0 is version 0" called a violation), 0 when it never
     /// held one; and a delegate's group row journaled before the generation's
-    /// first `DelegGroup` record is version 0 by position (`Meta::
+    /// first `DelegateNodeGroup` record is version 0 by position (`Meta::
     /// deleg_group_at` is `Some(0)`; seed 1938 of `long-delegated-backup`).
     #[test]
     fn an_epoch_0_row_carries_the_last_held_lease() {
@@ -3845,8 +3847,8 @@ mod tests {
             .apply_segment(
                 2,
                 1,
-                &[LogRecord::DelegGroup {
-                    dir: ROOT_INO,
+                &[LogRecord::DelegateNodeGroup {
+                    node: 3,
                     gen: 1,
                     version: 1,
                     backups: vec![3],

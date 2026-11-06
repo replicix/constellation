@@ -1568,12 +1568,7 @@ fn delegate_fs(
             gid: 0,
             time_ns: 1,
         },
-        LogRecord::Delegate {
-            dir,
-            node: 1,
-            gen: DELEG_GEN,
-            designated: false,
-        },
+        LogRecord::delegate_one(1, DELEG_GEN, dir, constellation_meta::SubtreeKind::Placed),
     ])
     .unwrap();
     let (fs, tmp, core) = holder_fs(meta.clone(), false);
@@ -1760,7 +1755,7 @@ fn the_delegates_fast_path_answers_a_lone_row_and_a_committed_row_at_once() {
 /// FUSE threads before its driver can hand the core the lapse. The class the
 /// core published (`Lone`) was judged on links older than the lapse: while
 /// the probe reports a lapse the driver has not stepped on, the delegate's
-/// fast path journals the row `DelegGroup` and waits for the group like a
+/// fast path journals the row `DelegateNodeGroup` and waits for the group like a
 /// gated row (in doubt through the core at the wait's budget, D5); once the
 /// lapse is handed, the published word stands. Fails on the parent: the row
 /// was journaled `Lone` and answered at once on this disk.
@@ -1885,8 +1880,8 @@ fn the_delegates_fast_path_resubmits_in_doubt_when_its_generation_is_lost() {
 /// Review claim 1 (fail-before): the row's class is decided when it is
 /// journaled (plan 43 §5.1), not at the admission. A write admitted while
 /// the core published `Lone`, then waiting for the writer lock while the
-/// core publishes `DelegGroup` (a backup candidate became stable), must be
-/// journaled `DelegGroup` and wait for its group.
+/// core publishes `DelegateNodeGroup` (a backup candidate became stable), must be
+/// journaled `DelegateNodeGroup` and wait for its group.
 #[test]
 fn a_delegates_row_is_classed_when_it_is_journaled_not_when_admitted() {
     use constellation_meta::RowCommit;
@@ -1942,7 +1937,7 @@ fn a_delegates_row_is_classed_when_it_is_journaled_not_when_admitted() {
     assert!(hook_ran.load(Ordering::Relaxed), "the hook never ran");
     assert!(
         class == Some(RowCommit::DELEG_GROUP) && waited,
-        "the core published DelegGroup before the row was journaled: journaled class {class:?}, \
+        "the core published DelegateNodeGroup before the row was journaled: journaled class {class:?}, \
          write waited for its group: {waited}"
     );
 }
@@ -1979,7 +1974,7 @@ fn a_delegates_lone_row_follows_only_a_committed_gated_row() {
     let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
     std::thread::scope(|scope| {
         let responder = scope.spawn(|| core_answering_in_doubt(&mut core, &stop, &submitted));
-        // Row 1 is journaled `DelegGroup` and waits (the lead was full).
+        // Row 1 is journaled `DelegateNodeGroup` and waits (the lead was full).
         let first = scope.spawn(|| fs.mutate_op_rebasable_with_rid(h, dir, &op1, rid1));
         journaled_stream_row(&meta, 1);
         assert_eq!(meta.delegate_gated_idx(DELEG_GEN).unwrap(), 1);
@@ -2023,7 +2018,7 @@ fn a_delegates_lone_row_follows_only_a_committed_gated_row() {
 }
 
 /// Plan 46 M1.1 step 4 (fail-before: the row is stamped with the published
-/// version): a `DelegGroup` record the store applies between the core's
+/// version): a `DelegateNodeGroup` record the store applies between the core's
 /// publication and the fast path's journal sends the op through the core,
 /// and the row is journaled by the fast path again once the core publishes
 /// the version the store records.
@@ -2050,8 +2045,8 @@ fn a_delegates_fast_path_row_waits_for_the_published_version_to_reach_the_store(
     std::thread::scope(|scope| {
         let responder = scope.spawn(|| core_answering_in_doubt(&mut core, &stop, &submitted));
         // The store applies the group's version 1; the core still publishes 0.
-        meta.apply_records(&[constellation_meta::LogRecord::DelegGroup {
-            dir,
+        meta.apply_records(&[constellation_meta::LogRecord::DelegateNodeGroup {
+            node: 1,
             gen: DELEG_GEN,
             version: 1,
             backups: vec![2],

@@ -13,7 +13,7 @@ use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::InodeKind;
 use constellation_meta::{
     execute_mutate, CloneSpec, LogRecord, Meta, MetaStore, MutateOp, PublishBasis, Rid,
-    SetXattrMode, SnapshotRow, TouchSet,
+    SetXattrMode, SnapshotRow, SubtreeKind, TouchSet,
 };
 use constellation_types::clock::Now;
 use std::collections::BTreeMap;
@@ -389,20 +389,15 @@ fn a_deposed_roots_replay_names_the_delegate_rows_it_was_ordered_after() {
 /// judged against the successor's unrelated stream of that number and the
 /// replay would wait for that stream to reach the index (long-delegated-
 /// backup seed 3585's review). The rows of a grant that shipped (the
-/// test above: its `Delegate` is not in the journal) stay named.
+/// test above: its `DelegateNode` is not in the journal) stay named.
 #[test]
 fn a_replay_does_not_name_rows_of_a_grant_the_strand_undoes() {
     let meta = Meta::open_in_memory().unwrap();
     meta.set_holder_epoch(1);
     let (gen, idx) = (4, 7);
     let dir = (2 << 40) | 9;
-    meta.apply_records_journaled(&[LogRecord::Delegate {
-        dir,
-        node: 2,
-        gen,
-        designated: false,
-    }])
-    .unwrap();
+    meta.apply_records_journaled(&[LogRecord::delegate_one(2, gen, dir, SubtreeKind::Placed)])
+        .unwrap();
     let data = LogRecord::Create {
         parent: ROOT_INO,
         name: "data".into(),
@@ -541,7 +536,7 @@ fn a_segment_tailed_under_local_speculation_is_inserted_before_it() {
 /// stream transactions go *after* every segment it tails, but a segment
 /// is rewound under them only from the oldest one it conflicts with — one
 /// that touches none of them commutes with them and applies on top. The
-/// replica equals the log order either way, and a `Recall` still strands
+/// replica equals the log order either way, and a `DelegateNodeEnded` still strands
 /// the delegate's rows from under the segments applied on top of them.
 #[test]
 fn a_segment_goes_under_a_delegates_stream_only_where_it_conflicts() {
@@ -634,7 +629,11 @@ fn a_segment_goes_under_a_delegates_stream_only_where_it_conflicts() {
 
     // The log recalls the generation without its rows: they are stranded
     // and rolled back from under both segments.
-    let recall = vec![LogRecord::Recall { dir: d, gen }];
+    let recall = vec![LogRecord::DelegateNodeEnded {
+        node: 2,
+        gen,
+        through: 0,
+    }];
     let applied = meta
         .apply_segment(4, 1, &recall, &TouchSet::default())
         .unwrap();
@@ -1001,7 +1000,7 @@ fn deps_on(gen: u64, idx: u64) -> constellation_meta::Position {
     }
 }
 
-/// Plan 43 C2: the end of a generation carries its cut (`RecallCut`), and
+/// Plan 43 C2: the end of a generation carries its cut (`DelegateNodeEnded`), and
 /// a replica that applies it from the log voids the generation there — not
 /// at what it holds of it. A delegate's replica holds its own unappended
 /// rows as well: the record said the root appended one row, the delegate
@@ -1009,11 +1008,11 @@ fn deps_on(gen: u64, idx: u64) -> constellation_meta::Position {
 /// Fails on the parent, where the cut was this replica's own head.
 #[test]
 fn a_void_cut_is_the_records_through() {
-    let (meta, d) = delegate_of_three_rows();
+    let (meta, _d) = delegate_of_three_rows();
     let gen = 7;
     assert_eq!(meta.void_cut(gen).unwrap(), None, "live: no cut");
-    let end = vec![LogRecord::RecallCut {
-        dir: d,
+    let end = vec![LogRecord::DelegateNodeEnded {
+        node: 2,
         gen,
         through: 1,
     }];
@@ -1039,8 +1038,8 @@ fn a_void_cut_is_the_records_through() {
     );
     // The cut only rises: the same record again, or a lower one, moves
     // nothing.
-    let lower = vec![LogRecord::RecallCut {
-        dir: d,
+    let lower = vec![LogRecord::DelegateNodeEnded {
+        node: 2,
         gen,
         through: 0,
     }];
@@ -1050,7 +1049,7 @@ fn a_void_cut_is_the_records_through() {
     assert_eq!(session.void_cut(gen), Some(1));
 }
 
-/// Plan 43 C2: a root persists the cut when it journals the `RecallCut`
+/// Plan 43 C2: a root persists the cut when it journals the `DelegateNodeEnded`
 /// record. If that journal row leaves the journal unshipped (a deposed
 /// root's strand or rebuild), the record never reaches the log, so the
 /// persisted cut goes with it. Otherwise a restart would seed the cut from a
@@ -1060,8 +1059,8 @@ fn a_void_cut_is_the_records_through() {
 #[test]
 fn a_stranded_recall_record_takes_its_persisted_cut_with_it() {
     let gen = 9;
-    let end = [LogRecord::RecallCut {
-        dir: ROOT_INO,
+    let end = [LogRecord::DelegateNodeEnded {
+        node: 2,
         gen,
         through: 12,
     }];
@@ -1086,46 +1085,14 @@ fn a_stranded_recall_record_takes_its_persisted_cut_with_it() {
     assert!(meta.strand_below_epoch(2).unwrap().any());
     assert_eq!(meta.void_cut(gen).unwrap(), None, "the strand dropped it");
     // The generation's end as the log carries it (the successor's, lower).
-    let lower = vec![LogRecord::RecallCut {
-        dir: ROOT_INO,
+    let lower = vec![LogRecord::DelegateNodeEnded {
+        node: 2,
         gen,
         through: 8,
     }];
     meta.apply_segment(1, 1, &lower, &TouchSet::default())
         .unwrap();
     assert_eq!(meta.void_cut(gen).unwrap(), Some(8), "the log's cut");
-}
-
-/// Plan 43 C2 (D1): a `Recall` already in a log (written before the cut was
-/// in the record) keeps its meaning: its generation's rows not before it in
-/// the log never take effect. The cut is what the log holds of the
-/// generation, kept (the path B review: a restart and a waiting install find
-/// the end applied) and the session's, not the replica's own head, which
-/// counts a delegate's unappended rows: a dependency on one is lost. (The
-/// test expected no kept cut and the delegate's head, 3, as the session's
-/// cut, as before the review; `Replica::apply_segment` noted the log's
-/// index all along.)
-#[test]
-fn an_old_recall_record_cuts_at_what_the_log_holds() {
-    let (meta, d) = delegate_of_three_rows();
-    let gen = 7;
-    let end = vec![LogRecord::Recall { dir: d, gen }];
-    meta.apply_segment(2, 1, &end, &TouchSet::default())
-        .unwrap();
-    let session = meta.session();
-    assert!(session.is_voided(gen));
-    assert_eq!(
-        meta.void_cut(gen).unwrap(),
-        Some(0),
-        "the log's index, kept"
-    );
-    assert_eq!(
-        session.void_cut(gen),
-        Some(0),
-        "the log holds none of the delegate's three rows"
-    );
-    assert!(session.deps_lost(&deps_on(gen, 1)));
-    assert!(session.deps_lost(&deps_on(gen, 3)));
 }
 
 /// The publish rule: a holder with unshipped work publishes the log
@@ -1868,16 +1835,16 @@ fn a_segment_carrying_a_journaled_rid_makes_its_outcome_the_logs() {
     assert!(!meta.outcome_from_log(rid(2)).unwrap(), "no row at all");
 }
 
-/// Plan 43 C2 (§3.1): a `DelegGroup` record sets the generation's row in the
+/// Plan 43 C2 (§3.1): a `DelegateNodeGroup` record sets the generation's row in the
 /// table — its latest version's backups, and every backup any version named —
 /// and the generation's end deletes it.
 #[test]
 fn a_deleg_group_record_updates_the_table_row() {
-    let (meta, d) = delegate_of_three_rows();
+    let (meta, _d) = delegate_of_three_rows();
     let gen = 7;
     assert_eq!(meta.deleg_group(gen).unwrap(), None, "no record: version 0");
-    let group = |version, backups: Vec<u64>| LogRecord::DelegGroup {
-        dir: d,
+    let group = |version, backups: Vec<u64>| LogRecord::DelegateNodeGroup {
+        node: 2,
         gen,
         version,
         backups,
@@ -1903,8 +1870,8 @@ fn a_deleg_group_record_updates_the_table_row() {
         (3, vec![5], vec![4, 5])
     );
     // The generation's end takes the row with the table's.
-    let end = vec![LogRecord::RecallCut {
-        dir: d,
+    let end = vec![LogRecord::DelegateNodeEnded {
+        node: 2,
         gen,
         through: 1,
     }];
@@ -1921,10 +1888,10 @@ fn a_deleg_group_record_updates_the_table_row() {
 /// stale re-ship) changes nothing.
 #[test]
 fn a_stale_deleg_group_record_is_ignored() {
-    let (meta, d) = delegate_of_three_rows();
+    let (meta, _d) = delegate_of_three_rows();
     let gen = 7;
-    let group = |version, backups: Vec<u64>| LogRecord::DelegGroup {
-        dir: d,
+    let group = |version, backups: Vec<u64>| LogRecord::DelegateNodeGroup {
+        node: 2,
         gen,
         version,
         backups,
@@ -1944,7 +1911,7 @@ fn a_stale_deleg_group_record_is_ignored() {
 }
 
 /// Plan 43 C2 (§3.8): at the end of a generation a delegate's rows past the
-/// cut that waited for a group (`DelegGroup`: their clients were never
+/// cut that waited for a group (`DelegateNodeGroup`: their clients were never
 /// answered) are dropped, not queued for replay; a `Lone` row — answered on
 /// the delegate's disk alone — is replayed as before. Fails on the parent,
 /// which queued all of them.
@@ -1994,8 +1961,8 @@ fn a_recalled_delegates_gated_rows_are_dropped_and_its_lone_rows_replayed() {
         .unwrap();
         meta.session().note_stream(gen, seq);
     }
-    let end = vec![LogRecord::RecallCut {
-        dir: d,
+    let end = vec![LogRecord::DelegateNodeEnded {
+        node: 2,
         gen,
         through: 0,
     }];
@@ -2084,15 +2051,15 @@ fn a_reused_generation_number_drops_the_void_a_deposed_roots_unshipped_end_left(
     let gen = 18;
     let meta = Meta::open_in_memory().unwrap();
     meta.set_holder_epoch(1);
-    meta.apply_records_journaled(&[LogRecord::Delegate {
-        dir: ROOT_INO,
-        node: 4,
+    meta.apply_records_journaled(&[LogRecord::delegate_one(
+        4,
         gen,
-        designated: false,
-    }])
+        ROOT_INO,
+        SubtreeKind::Placed,
+    )])
     .unwrap();
-    meta.apply_records_journaled(&[LogRecord::RecallCut {
-        dir: ROOT_INO,
+    meta.apply_records_journaled(&[LogRecord::DelegateNodeEnded {
+        node: 2,
         gen,
         through: 0,
     }])
@@ -2109,12 +2076,12 @@ fn a_reused_generation_number_drops_the_void_a_deposed_roots_unshipped_end_left(
     meta.apply_segment(
         1,
         2,
-        &[LogRecord::Delegate {
-            dir: ROOT_INO,
-            node: 1,
+        &[LogRecord::delegate_one(
+            1,
             gen,
-            designated: false,
-        }],
+            ROOT_INO,
+            SubtreeKind::Placed,
+        )],
         &TouchSet::default(),
     )
     .unwrap();
@@ -2519,7 +2486,7 @@ fn a_refusal_landed_by_rid_supersedes_a_completed_append() {
 }
 
 /// Seed 2560, review SHOULD-3 (b): the segment carries the rid's outcome
-/// and a `RecallCut` of the generation below the row. The first pass drops
+/// and a `DelegateNodeEnded` of the generation below the row. The first pass drops
 /// the append quietly, so the recall pass does not queue it (L2b (b)).
 /// Fails before: the recall pass queues the append for a replay by rid.
 #[test]
@@ -2530,8 +2497,8 @@ fn an_outcome_and_a_recall_cut_in_one_segment_queue_nothing() {
         LogRecord::Completed {
             rid: delegate_rid(1),
         },
-        LogRecord::RecallCut {
-            dir: ROOT_INO,
+        LogRecord::DelegateNodeEnded {
+            node: 2,
             gen: 5,
             through: 0,
         },

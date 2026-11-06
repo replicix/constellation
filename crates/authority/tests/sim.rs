@@ -4576,7 +4576,7 @@ fn placement_hot_slow_lease_reads_config() -> SimConfig {
 /// `placement-hot` seeds 15, 311 and 590 (I2c). A delegate that is also the
 /// root's backup seals the root and takes it over with its own rows of the
 /// generation in its journal, rows its group committed and the clients
-/// were answered (`DelegGroup`). The gate strands them ahead of the
+/// were answered (`DelegateNodeGroup`). The gate strands them ahead of the
 /// predecessor's tail and used to re-execute them by rid after it: the log
 /// carried them as root rows of the new tenure, re-stamped, not under the
 /// identity they were committed with. They are re-appended verbatim under
@@ -6571,7 +6571,7 @@ fn delegated_unchecked_fast_path_is_caught() {
 /// Plan 46 M1.1 step 1: a lone root (no backup), a delegate and an S3 cut
 /// together. The root's commit rises only when it ships (its journal is no
 /// second copy), so with the root cut from S3 the archive does not come
-/// for the cut's length: the delegate's `DelegGroup` answers wait, and must
+/// for the cut's length: the delegate's `DelegateNodeGroup` answers wait, and must
 /// neither be answered early (`+commit`) nor end unsettled (`+unsettled`).
 fn delegated_lone_s3_cut_config() -> SimConfig {
     SimConfig {
@@ -6855,7 +6855,7 @@ fn delegated_backup_and_delegate_die_abandon_config() -> SimConfig {
 /// `d1`'s delegate changes and changes back. Four nodes; node 3, the
 /// delegate's first backup, crashes at 1.5 s and returns with its journal at
 /// 5.5 s; node 4 is cut from the delegate for 2 s at 3 s. A delegate counts a
-/// backup only once the `DelegGroup` record naming it is applied, and needs
+/// backup only once the `DelegateNodeGroup` record naming it is applied, and needs
 /// both versions of the group while a change is pending: no
 /// acknowledgement through a member the applied record does not name
 /// (`strict_commit`, I1), and no acknowledged row lost. I2 is not strict.
@@ -7033,7 +7033,7 @@ fn long_delegated_config() -> SimConfig {
 /// `long-delegated` with a stream batch of two records: a lone delegate's
 /// own rows wait for the root once its journal is two transactions past
 /// the root's cursor (`Core::deleg_lone_lead_full`), so its own clients'
-/// rows move between `Lone` and `DelegGroup` as the stream catches up.
+/// rows move between `Lone` and `DelegateNodeGroup` as the stream catches up.
 fn long_delegated_lead_config() -> SimConfig {
     SimConfig {
         core: std::sync::Arc::new(|node, inc| {
@@ -7668,7 +7668,7 @@ struct OracleTotals {
     /// The lone delegate's lead oracle: [own `Lone` rows past the lead,
     /// behind an uncommitted gated row of their own, own `Lone` rows judged,
     /// own gated rows judged, ops the gated mark held back from `Lone`, `Lone`
-    /// decisions made `DelegGroup` where the row was journaled].
+    /// decisions made `DelegateNodeGroup` where the row was journaled].
     lone_lead: [u64; 5],
     /// Plan 46 M0.3: unsettled `EIO`s by isolated requesters (allowed) and
     /// by requesters that could reach a sequencer (I4 violations), and the
@@ -9366,7 +9366,7 @@ fn delegated_strict_reads_are_served_by_the_delegate() {
 }
 
 /// Plan 30 §M11 (single-node-unchanged / p2p-off-no-delegation): the
-/// ordinary configurations never write a `Delegate` record and never
+/// ordinary configurations never write a `DelegateNode` record and never
 /// park an execution on a delegation.
 #[test]
 fn no_delegation_without_a_delegate_record() {
@@ -9522,13 +9522,13 @@ fn regression_long_delegated_seeds() {
 /// - 71251: an unanswered seal of a crashed delegate's backup set the
 ///   recall back to "none", the restarted delegate's renewals were
 ///   granted again, and the root's op parked on the recall ended `EIO`;
-/// - 71792: a deposed root's stranded `Delegate` record was replayed as
+/// - 71792: a deposed root's stranded `DelegateNode` record was replayed as
 ///   plain records through its successor — a grant to the successor
 ///   itself that nothing ended, every op under it parked forever;
 /// - 75504: a paused, then deposed root's late stream acknowledgement
 ///   counted for its successor, and the delegate never streamed its last
 ///   transaction to it;
-/// - 78172: a `Recall` installed first by the pre-S3 stream was skipped
+/// - 78172: a `DelegateNodeEnded` installed first by the pre-S3 stream was skipped
 ///   with its segment's streamed rows and never stranded a requester's
 ///   shadow of the recalled generation;
 /// - 77901: the `marker-order` class of 74189 under backups;
@@ -9803,7 +9803,7 @@ fn regression_long_delegated_late_answers_seed_2945() {
 /// `long-delegated-backup` seed 3585 (a replay held forever): the paused
 /// root ended two delegations itself after appending their rows and
 /// executed a cross-subtree rename after them, then was deposed with the
-/// `Recall`s unshipped; its successor ended the same generations lower.
+/// `DelegateNodeEnded`s unshipped; its successor ended the same generations lower.
 /// The rename's replay (by rid) named the rows between the two cuts: the
 /// deposed node's session did not call them lost (its own cut was above
 /// them), the successor refused them as lost, `Held`, forever, and the
@@ -11315,7 +11315,7 @@ fn locks_blips_tight_delegated_config() -> SimConfig {
 ///
 /// - 1, 15, 36, 41, 67: a continuation epoch's recall-all took the
 ///   delegates' grants back to the root, which ended the generations in
-///   its own journal; the `Recall` record reached the other tables only
+///   its own journal; the `DelegateNodeEnded` record reached the other tables only
 ///   after the cut, so the holders (the delegate itself among them) sent
 ///   their renewals to the recalled delegate, answered `NotOwner { 0 }`,
 ///   and the lease read that followed failed in the cut. The delegate now
@@ -14240,7 +14240,7 @@ fn a_stranded_end_of_a_generation_does_not_void_it() {
 
 /// `delegated-holder-cut` seed 1240 under slow lease reads: a restarted
 /// delegate took the root over with its own rows of a generation in its
-/// journal and the generation unknown to its core (its `Delegate` record
+/// journal and the generation unknown to its core (its `DelegateNode` record
 /// was in the tail it re-applied); the takeover gate did not strand them,
 /// and they shipped ahead of the tail's rename they depended on (an
 /// unlink of the name before the rename that made it). It fails before the
@@ -14875,7 +14875,7 @@ fn regression_long_delegated_late_answers_seed_9287() {
 /// lease reads 1477, 5718 and 9955 (L1: a former delegate's replica
 /// diverged from the log prefix): the root's pre-S3 stream delivered the append of node 2's
 /// own row of a generation (`create d1/f3`, or a rename to it), the
-/// generation's `RecallCut`, and the root's own `unlink` (or rename) of the
+/// generation's `DelegateNodeEnded`, and the root's own `unlink` (or rename) of the
 /// name, while a shadow of node 2's older than its own row was
 /// outstanding. The install of the later rows rolled back from the shadow
 /// and redid the own `Local` row on top of them (the early return for the
@@ -16380,7 +16380,7 @@ fn c0_a_deposed_roots_captured_journal_needs_no_rebuild() {
 
 /// I1, `long-delegated`: a delegate acknowledges once its group holds the
 /// row — the root's append when no backup is recorded, the recorded backup
-/// after its `DelegGroup` record — never on its own disk alone for another
+/// after its `DelegateNodeGroup` record — never on its own disk alone for another
 /// node's request (plan 43 C2). C0 pinned the seeds where a delegate with no
 /// backup acknowledged alone (`uncommitted_acks["deleg-group/ok"] > 0`) and
 /// `+commit` failed on them; here none of them counts a `deleg-group/*`
@@ -17245,7 +17245,7 @@ fn regression_delegated_backup_links_stalebase_seed_138() {
 
 /// The lone delegate's lead oracle (`LoneLead`): over seeds of
 /// `long-delegated-lead` (a stream batch of two records, so the class
-/// flips between `Lone` and `DelegGroup` as the stream catches up) a
+/// flips between `Lone` and `DelegateNodeGroup` as the stream catches up) a
 /// lone delegate's own `Lone` rows are never more than the lead past the
 /// committed prefix and never behind an uncommitted gated row of its own;
 /// the rule is exercised (own `Lone` and gated rows were judged).

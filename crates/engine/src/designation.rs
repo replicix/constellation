@@ -8,7 +8,7 @@
 //! sees the designation object (`SyncDesignations`, after every refresh
 //! here), never recalls it by TTL or placement, refuses a cross-subtree
 //! op touching it (`EXDEV`) and any write under it that reaches the root
-//! (`EROFS`: only the designee sequences it), and writes the `Recall`
+//! (`EROFS`: only the designee sequences it), and writes the `DelegateNodeEnded`
 //! when `online` releases the object. A non-designee writing under the
 //! path forwards to the designee like any delegated write; the designee's
 //! own writes run on its fast path under a grant that never expires

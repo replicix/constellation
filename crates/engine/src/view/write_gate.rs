@@ -554,7 +554,7 @@ impl View {
                         // rid through the core, which answers from the
                         // row's commit or re-executes it at the new owner
                         // (a delegate that turned lone meanwhile waits on:
-                        // the row is `DelegGroup`, never answered as lone).
+                        // the row is `DelegateNodeGroup`, never answered as lone).
                         //
                         // The rule is the row's own (its `RowCommit`).
                         // An op that journaled no row of its own (nothing

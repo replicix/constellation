@@ -899,10 +899,11 @@ impl Core {
             if seg.records.iter().any(|r| {
                 matches!(
                     r,
-                    LogRecord::Delegate { .. }
-                        | LogRecord::Recall { .. }
-                        | LogRecord::RecallCut { .. }
-                        | LogRecord::DelegGroup { .. }
+                    LogRecord::DelegateNode { .. }
+                        | LogRecord::SubtreeReleased { .. }
+                        | LogRecord::StreamReleased { .. }
+                        | LogRecord::DelegateNodeEnded { .. }
+                        | LogRecord::DelegateNodeGroup { .. }
                 )
             }) {
                 self.delegation_sync(now, replica, out);
@@ -1280,7 +1281,7 @@ impl Core {
     /// delegate (it assigned their stream indices), with every generation
     /// its core holds: what a takeover's strand must take out ahead of the
     /// predecessor's tail. Not the core's table alone: a restart re-adopts
-    /// only the generations the log's table lists, and the `Delegate`
+    /// only the generations the log's table lists, and the `DelegateNode`
     /// record of one may still be in the very tail being re-applied
     /// (delegated-holder-cut seed 1240: a delegate restarted, took the root
     /// over with its own rows of the generation in its journal and none in
@@ -1584,7 +1585,7 @@ impl Core {
     /// Why they apply as they did (the ownership argument): the root
     /// executes nothing on the keys of a live generation, so no tail row
     /// but the generation's own touches them — unless the tail ends the
-    /// generation (`Recall`/`RecallCut` of it), after which root rows may.
+    /// generation (`DelegateNodeEnded` of it), after which root rows may.
     /// Such a generation's rows are left to the replay: those above the cut
     /// were never committed (the end waits for the group), and their
     /// clients retry. So is everything of a generation from a row that
@@ -1622,11 +1623,8 @@ impl Core {
                 carried.insert(t.origin);
             }
             for r in &t.records {
-                match r {
-                    LogRecord::Recall { gen, .. } | LogRecord::RecallCut { gen, .. } => {
-                        ended.insert(*gen);
-                    }
-                    _ => {}
+                if let LogRecord::DelegateNodeEnded { gen, .. } = r {
+                    ended.insert(*gen);
                 }
             }
         }
@@ -2894,7 +2892,7 @@ impl Core {
                 Some(w) if w.bound_passed => self.dl.release_wait = Some(w),
                 Some(w) => {
                     self.cancel_timer(w.timer, out);
-                    // The generations' ends journaled their `RecallCut`s,
+                    // The generations' ends journaled their `DelegateNodeEnded`s,
                     // after the delegates' last rows: they ship before the
                     // lease goes (the next root learns the table from the
                     // log). A round decides again once they shipped

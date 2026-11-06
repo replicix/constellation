@@ -161,7 +161,7 @@ pub enum SpecKind {
     /// A forwarded op's accepted reply, installed ahead of the log.
     /// `epoch` is the accepting holder's; `op` is what a replay re-sends.
     /// Plan 30 §M11: `gen` is the accepting delegate's generation (0: the
-    /// root's); the log's `Recall` of it strands the shadow.
+    /// root's); the log's `DelegateNodeEnded` of it strands the shadow.
     Shadow {
         rid: Rid,
         epoch: u64,
@@ -313,7 +313,7 @@ impl LiveEntry {
     /// epoch and only ever retires by shipping. Plan 30 §M11: a delegate
     /// stream's row is tied to its generation, not to any epoch — a root
     /// takeover strands nothing of it (the delegate re-streams to the
-    /// successor); only the log's `Recall` of the generation does (or, for
+    /// successor); only the log's `DelegateNodeEnded` of the generation does (or, for
     /// a root's append, a later tenure's segment that lands the row's rids
     /// by another copy: [`superseded_root_appends_tx`]).
     ///
@@ -1503,7 +1503,7 @@ fn derive_replay_op(records: &[LogRecord]) -> Option<MutateOp> {
     // tenure, not an effect to redo. A transaction made only of those
     // (an inbox refusal, a deduplicated batch position) replays nothing:
     // the requester re-submits, or the successor's drain re-evaluates.
-    // Plan 30 §M11: so is a lost tenure's `Delegate` or `Recall`: the
+    // Plan 30 §M11: so is a lost tenure's `DelegateNode` or `DelegateNodeEnded`: the
     // delegation table is the root's own, decided by the tenure that
     // wrote it. Replayed as plain records through the successor, a
     // deposed root's re-delegation became a grant *to the successor
@@ -1519,10 +1519,11 @@ fn derive_replay_op(records: &[LogRecord]) -> Option<MutateOp> {
                     | LogRecord::Atime { .. }
                     | LogRecord::Refused { .. }
                     | LogRecord::InboxAck { .. }
-                    | LogRecord::Delegate { .. }
-                    | LogRecord::Recall { .. }
-                    | LogRecord::RecallCut { .. }
-                    | LogRecord::DelegGroup { .. }
+                    | LogRecord::DelegateNode { .. }
+                    | LogRecord::SubtreeReleased { .. }
+                    | LogRecord::StreamReleased { .. }
+                    | LogRecord::DelegateNodeEnded { .. }
+                    | LogRecord::DelegateNodeGroup { .. }
                     // Plan 43 C1-4: bookkeeping of a re-shipped tail, no
                     // effect to redo.
                     | LogRecord::TailOf { .. }
@@ -1653,7 +1654,7 @@ fn strand_local_tx(
         // Plan 43 C2: the same goes for a generation's end that this root
         // journaled but never shipped. Its persisted cut goes with it, or a
         // restart would read the cut from a record the log never carried.
-        if let LogRecord::RecallCut { gen, through, .. } = rec {
+        if let LogRecord::DelegateNodeEnded { gen, through, .. } = rec {
             local::retract_void_cut_tx(tx, &meta.local, *gen, *through)?;
         }
         // And the void its journaling set in the session: unless the log
@@ -1661,10 +1662,10 @@ fn strand_local_tx(
         // row: the table here, rolled back or rebuilt from the log, no
         // longer lists it), it is live again, and the void is lifted once
         // this transaction commits (`Meta::stage_unvoid`).
-        if let LogRecord::RecallCut { gen, .. } | LogRecord::Recall { gen, .. } = rec {
+        if let LogRecord::DelegateNodeEnded { node, gen, .. } = rec {
             if crate::delegation::read_table_tx(&*tx, meta)?
-                .iter()
-                .any(|d| d.gen == *gen)
+                .stream(*node, *gen)
+                .is_some()
             {
                 meta.stage_unvoid(*gen);
             }
@@ -1748,7 +1749,7 @@ fn strand_local_tx(
     // (the replay finds them completed) and re-appends (C3) the ones that
     // continue the stream, so what is left replays by rid through the
     // sequencer, which dedups any other copy. It is not dropped as the
-    // recall drop above does: a `DelegGroup` row committed by the delegate's
+    // recall drop above does: a `DelegateNodeGroup` row committed by the delegate's
     // own backups is answered and in no root tail, and a halted one would be
     // lost with the generation the gate ends. (b) the recall pass queues the
     // root appends past the cut (`recall`, `!member`, `epoch` > 0) with their
@@ -1843,7 +1844,7 @@ fn strand_local_tx(
 /// (the older a generation, the likelier the log has it already).
 ///
 /// Not the generations whose grant this pass takes out of the journal too
-/// (`undone`: a `Delegate` row of the stranded tenure, never shipped): the
+/// (`undone`: a `DelegateNode` row of the stranded tenure, never shipped): the
 /// log never had them, and a successor allocates above the log's highest
 /// number, so the number it issues next is the very one such a grant
 /// carried. A row recorded under it would be judged against the
@@ -1852,7 +1853,7 @@ fn strand_local_tx(
 /// anything, as the pass goes oldest first and the grant's own row is
 /// gone from the journal by the time a later transaction is examined. A
 /// shipped grant's number is in the log, so it never lands here; its
-/// unshipped `Recall` does not put it there either (the 2945 case).
+/// unshipped `DelegateNodeEnded` does not put it there either (the 2945 case).
 fn stranded_local_deps(
     r: &impl Readable,
     meta: &Meta,
@@ -1901,7 +1902,7 @@ fn streams_of(highest: &std::collections::BTreeMap<u64, u64>) -> Streams {
     deps
 }
 
-/// The delegation generations whose `Delegate` record sits in the journal
+/// The delegation generations whose `DelegateNode` record sits in the journal
 /// transactions starting at `firsts` — the grants a pass that strands
 /// those transactions undoes (see [`stranded_local_deps`]).
 fn undone_grants(
@@ -1915,7 +1916,7 @@ fn undone_grants(
             continue;
         };
         for (_, rec) in local::journal_records(r, meta, first, row.last)? {
-            if let LogRecord::Delegate { gen, .. } = rec {
+            if let LogRecord::DelegateNode { gen, .. } = rec {
                 gens.insert(gen);
             }
         }
@@ -3949,7 +3950,7 @@ pub(crate) fn strand_seqs_tx(
 ///   drain finds it done, and nothing needs a place;
 /// - the row was journaled `Archive`: a lone sequencer's answer to another
 ///   node waits for an applied segment, and a held transaction (the only
-///   kind an operator drops) never ships. A `RootGroup`/`DelegGroup` row's
+///   kind an operator drops) never ships. A `RootGroup`/`DelegateNodeGroup` row's
 ///   answer leaves once the group has the row, which only the core knows
 ///   (the group's acknowledgements are its memory): it is a placeholder
 ///   only when `unanswered(rid)` says the answer certainly has not left —
@@ -4870,7 +4871,7 @@ impl Meta {
     /// generation this node executed as the delegate is its own
     /// transaction coming back through the log: its records are skipped
     /// (applied here already) and the transaction retires like a shipped
-    /// one. A `Recall` record strands what is left of that generation
+    /// one. A `DelegateNodeEnded` record strands what is left of that generation
     /// here (the delegate's unappended rows, rolled back and queued for
     /// replay by rid).
     #[allow(clippy::too_many_arguments)]
@@ -4885,24 +4886,23 @@ impl Meta {
         pending: &TouchSet,
     ) -> Result<SegmentApplied, MetaError> {
         // Plan 30 §M11: the generations this segment recalls, from all of
-        // its records — a `Recall` the pre-S3 stream installed here first
+        // its records — a `DelegateNodeEnded` the pre-S3 stream installed here first
         // is among the rows skipped below, and still ends its generation
         // (long-delegated-backup seed 78172: a requester's shadow of the
         // recalled generation was never stranded, and stayed forever).
         let recalled: HashSet<u64> = records
             .iter()
             .filter_map(|rec| match rec {
-                LogRecord::Recall { gen, .. } | LogRecord::RecallCut { gen, .. } => Some(*gen),
+                LogRecord::DelegateNodeEnded { gen, .. } => Some(*gen),
                 _ => None,
             })
             .collect();
-        // The same records' cuts (`None`: an older `Recall`), all of them
-        // also: kept below, in this transaction.
-        let ends: Vec<(u64, Option<u64>)> = records
+        // The same records' cuts, all of them also: kept below, in this
+        // transaction.
+        let ends: Vec<(u64, u64)> = records
             .iter()
             .filter_map(|rec| match rec {
-                LogRecord::Recall { gen, .. } => Some((*gen, None)),
-                LogRecord::RecallCut { gen, through, .. } => Some((*gen, Some(*through))),
+                LogRecord::DelegateNodeEnded { gen, through, .. } => Some((*gen, *through)),
                 _ => None,
             })
             .collect();
@@ -5207,7 +5207,7 @@ impl Meta {
         // oldest one it conflicts with, not under the oldest one. Their
         // keys are the subtree's, which the log changes only through
         // this delegate's own rows (skipped below, or rolled back with
-        // their row) or after a `Recall` (which strands them); a segment
+        // their row) or after a `DelegateNodeEnded` (which strands them); a segment
         // that touches none of them commutes with them, so it applies on
         // top, captured as a `Foreign` row — the state every replica
         // reaches when they ship after it (B-2's rule below, for the
@@ -5479,17 +5479,12 @@ impl Meta {
         // index of the generation, or not at all, below the record's cut).
         // Only raised, as the durable apply of the record does. (From every
         // record of the segment: `records` here is what was not skipped.)
-        for (gen, cut) in &ends {
-            match cut {
-                Some(through) => local::bump_void_cut_tx(&mut tx, &self.local, *gen, *through)?,
-                None => {
-                    local::bump_void_cut_at_log_idx_tx(&mut tx, &self.local, *gen)?;
-                }
-            }
+        for (gen, through) in &ends {
+            local::bump_void_cut_tx(&mut tx, &self.local, *gen, *through)?;
         }
         // ADR-43: a generation whose grant the segment proves will never be
         // in the log (an abandon, or a takeover that carries no tail) is
-        // ended here as the log's `Recall` would end it, at what the log
+        // ended here as the log's `DelegateNodeEnded` would end it, at what the log
         // holds of it (`orphaned_tx`). The cut loop
         // above must run first: a generation this segment ends (the
         // stream installed the end before the marker) then has its cut key,
@@ -5507,7 +5502,7 @@ impl Meta {
         let recalled: HashSet<u64> = recalled.iter().chain(orphaned.iter()).copied().collect();
         // Plan 30 §M11: a generation the log recalls strands whatever of
         // it this node still holds unappended (past the cut: everything
-        // appended is before the `Recall` record, hence retired above).
+        // appended is before the `DelegateNodeEnded` record, hence retired above).
         let mut stranded = stranded;
         if !recalled.is_empty() {
             let more = strand_tx(
@@ -5526,7 +5521,7 @@ impl Meta {
             stranded.deleg_dropped += more.deleg_dropped;
             // L1: the log ended these generations, so no `Local` row of
             // them is left to order (`local::note_deleg_streamed_tx`). Here
-            // as well as in `replay::apply_one`: a `Recall` the stream
+            // as well as in `replay::apply_one`: a `DelegateNodeEnded` the stream
             // installed first is among the rows skipped above, and the
             // streamed install must not clear the mark itself.
             for gen in &recalled {
@@ -5700,7 +5695,7 @@ impl Meta {
     /// takes the root over has those rows in its journal *before* the predecessor's backup
     /// tail it is about to re-apply, but the log orders them the other
     /// way: the tail holds the predecessor's appends of them (after the
-    /// `Delegate` that granted them, and before whatever it appended
+    /// `DelegateNode` that granted them, and before whatever it appended
     /// later), and the rest were never appended. Shipped in journal
     /// order, they overtook the predecessor's tail (delegated-holder-cut
     /// seed 772: a create in `d1` shipped ahead of the tail's rename of
@@ -5766,7 +5761,7 @@ impl Meta {
     /// log will never grant is ended at what the log holds of it (0), and this
     /// node's own rows of it as its delegate are rolled back and replayed by
     /// rid. Left in the journal, they shipped as this root's first rows,
-    /// rows of a generation with no `Delegate` in the log, ahead of the
+    /// rows of a generation with no `DelegateNode` in the log, ahead of the
     /// stranded root rows they were executed on.
     pub fn strand_for_takeover_carrying(
         &self,
@@ -5842,9 +5837,10 @@ impl Meta {
             .any(|r| {
                 matches!(
                     r,
-                    LogRecord::Delegate { .. }
-                        | LogRecord::Recall { .. }
-                        | LogRecord::RecallCut { .. }
+                    LogRecord::DelegateNode { .. }
+                        | LogRecord::SubtreeReleased { .. }
+                        | LogRecord::StreamReleased { .. }
+                        | LogRecord::DelegateNodeEnded { .. }
                 )
             })
             .then(|| self.deleg_gate.write().unwrap_or_else(|e| e.into_inner()));
@@ -6096,14 +6092,14 @@ impl Meta {
         // claim carries, not only with a tail (`own_gens`). With no tail,
         // nothing the predecessors' journals held past the log ever ships,
         // and this tenure mints in its own block only: an unlisted
-        // generation's rows can never follow a `Delegate` in the log. They
+        // generation's rows can never follow a `DelegateNode` in the log. They
         // are rolled back, queued for replay by rid (deduped against the
         // rid's outcome in the log), and the generation ends here at what the
         // log holds of it.
         //
         // Unlisted both before the strand above and after it. Not after it
         // only: the strand takes out a committed streamed entry the log
-        // carries (`superseded_by_takeover`), its `Delegate` among them,
+        // carries (`superseded_by_takeover`), its `DelegateNode` among them,
         // and the log's copy still lists the generation. Not before it
         // only: an outstanding streamed-ahead end of the deposed tenure
         // unlists a generation the log granted, and the strand takes the
@@ -6225,7 +6221,7 @@ impl Meta {
 
     /// ADR-43 (the restart path): the generations whose end only
     /// outstanding requester or subscriber speculation carries: a
-    /// `Recall`/`RecallCut` among the records of a live `Shadow` or
+    /// `DelegateNodeEnded` among the records of a live `Shadow` or
     /// `Streamed` entry, of a generation this replica has no durable end of
     /// (`deleg_void_cut`, written only by the log's apply of the record).
     /// Such an install writes the table row without the void
@@ -6243,7 +6239,7 @@ impl Meta {
     /// ([`OrphanProof`]: an operator's abandon of the root group of an epoch,
     /// or a takeover marker that says no tail of the epoch it took over
     /// follows) shows the log will never grant, after the segment's strands.
-    /// A number is minted, and its `Delegate` journaled, by the tenure of its
+    /// A number is minted, and its `DelegateNode` journaled, by the tenure of its
     /// epoch only (`gen_epoch`), and a row of a generation is appended only
     /// after its grant; the proof says that nothing of the epochs it covers
     /// that the log does not carry yet ever will be (the strand above already
@@ -6311,7 +6307,7 @@ impl Meta {
     /// never listed the grant holds them, and the strand may take the entry,
     /// queuing its rid for replay, held while the generation lives, without
     /// ending the generation), and those a live entry's records grant (a
-    /// streamed `Delegate` whose `RecallCut` streamed too: the install took
+    /// streamed `DelegateNode` whose `DelegateNodeEnded` streamed too: the install took
     /// the generation out of the table again, and a dependency on it waited
     /// for an end nothing applies, the N4 wait).
     fn named_generations_tx(
@@ -6334,7 +6330,7 @@ impl Meta {
             };
             let row: SpecRow = crate::record::from_bytes_exact(&v)?;
             for rec in &row.records {
-                if let LogRecord::Delegate { gen, .. } = rec {
+                if let LogRecord::DelegateNode { gen, .. } = rec {
                     named.insert(*gen);
                 }
             }
@@ -6358,7 +6354,7 @@ impl Meta {
             };
             let row: SpecRow = crate::record::from_bytes_exact(&v)?;
             for rec in &row.records {
-                if let LogRecord::Recall { gen, .. } | LogRecord::RecallCut { gen, .. } = rec {
+                if let LogRecord::DelegateNodeEnded { gen, .. } = rec {
                     if kv_get_tx(r, &self.local, &local::deleg_void_cut_key(*gen))?.is_none() {
                         out.insert(*gen);
                     }
@@ -6369,12 +6365,12 @@ impl Meta {
     }
 
     /// Plan 30 §M11 on the root: it ended generation `gen` itself (its
-    /// own `Recall` journaled, never applied from a segment here), so the
+    /// own `DelegateNodeEnded` journaled, never applied from a segment here), so the
     /// segment path's recall strand never runs on its replica. Its own
     /// shadows and hints from that delegate's replies are stranded here
     /// the same way (rolled back, queued for replay by rid once the
     /// generation is gone); its own `Local` rows of `gen` are the
-    /// delegate's appended stream, before the `Recall`, and stay.
+    /// delegate's appended stream, before the `DelegateNodeEnded`, and stay.
     /// Without this, the root kept a shadow of its own create that the
     /// delegate never streamed (partitioned, outwaited), executed its
     /// next op on top of it and journaled an `unlink` of a name the log

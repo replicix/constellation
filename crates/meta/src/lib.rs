@@ -33,7 +33,7 @@ pub use readdeleg::{
     recall_inos, recall_inos_executed, recall_inos_of_op, CtoStats, HeldDelegation,
     ReadDelegations, ReadGrant, RecallNeed,
 };
-pub use record::{from_bytes_exact, CloneNode, LogRecord};
+pub use record::{from_bytes_exact, CloneNode, LogRecord, SubtreeGrant, SubtreeKind};
 pub use reintegrate::{conflict_dentry_name, CONFLICT_DIR};
 pub use replay::TouchSet;
 pub use rid::Rid;

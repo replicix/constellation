@@ -88,7 +88,7 @@ pub use delegate::{DelegKind, DelegRenewCert, DelegView, RecallPhase};
 pub use seal_tail::WaitingForGroup;
 
 /// Plan 30 §M11 phase 2b: read delegations a *delegate* grants carry
-/// `epoch = DELEG_READ_EPOCH_BASE + gen`, so a `Recall` of the
+/// `epoch = DELEG_READ_EPOCH_BASE + gen`, so a `DelegateNodeEnded` of the
 /// generation voids exactly them (`ReadDelegations::void_epoch`).
 pub const DELEG_READ_EPOCH_BASE: u64 = 1 << 48;
 pub use inbox::InboxView;
@@ -413,7 +413,7 @@ pub struct Config {
     // ---- plan 30 §M11: delegated sub-sequencers ----
     /// `CONSTELLATION_DELEGATION` (default on): this node delegates (as
     /// the root) and accepts delegations (as a delegate). Off, or P2P
-    /// off, is a strict no-op: no `Delegate` record is ever written.
+    /// off, is a strict no-op: no `DelegateNode` record is ever written.
     pub delegation: bool,
     /// `CONSTELLATION_DELEGATION_TTL_MS` (default 5000): a grant's ttl;
     /// the margin is the lease's (`expiry_margin_ms`).
@@ -1292,7 +1292,7 @@ pub struct Stats {
     /// Plan 43 C2 (D7): parked delegate acknowledgements aborted because
     /// their row left the journal without the log carrying it.
     pub deleg_acks_dropped: u64,
-    /// Plan 43 C2: `DelegGroup` records this root journaled for a delegate's
+    /// Plan 43 C2: `DelegateNodeGroup` records this root journaled for a delegate's
     /// request; delegate rows (gated, uncommitted) a recall of their
     /// generation dropped instead of replaying (`speculation.deleg_dropped`).
     pub deleg_group_records: u64,

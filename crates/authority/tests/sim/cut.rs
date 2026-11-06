@@ -1,7 +1,7 @@
 //! Plan 46 M1.2 step 3: `acked_at_or_below_cut`, the sim's form of the
 //! model's property of that name (`crates/model/src/node_stream.rs`): every
 //! answered row of a delegate stream is at or below the stream's cut. The
-//! cut is what the log records: a `RecallCut { gen, through }` ends the
+//! cut is what the log records: a `DelegateNodeEnded { gen, through }` ends the
 //! generation and voids every row of it past `through` ("never in the log,
 //! and never to be acknowledged", `record.rs`). An answer whose transaction
 //! has the origin `(gen, idx)` with `idx > through` was acknowledged for a
@@ -47,7 +47,7 @@ impl CutMode {
 /// What the log says about the ends of delegate streams.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StreamCuts {
-    /// Generation -> the lowest `through` any `RecallCut` of it carries.
+    /// Generation -> the lowest `through` any `DelegateNodeEnded` of it carries.
     pub cut: BTreeMap<u64, u64>,
     /// Generations an operator's `GroupAbandoned` names.
     pub abandoned: BTreeSet<u64>,
@@ -58,7 +58,7 @@ impl StreamCuts {
         let mut c = StreamCuts::default();
         for r in records {
             match r {
-                LogRecord::RecallCut { gen, through, .. } => {
+                LogRecord::DelegateNodeEnded { gen, through, .. } => {
                     let t = c.cut.entry(*gen).or_insert(*through);
                     *t = (*t).min(*through);
                 }
@@ -98,7 +98,7 @@ impl CutFindings {
 }
 
 /// Every non-relay answer whose transaction is a delegate stream row
-/// (`origin.0 != 0`) is at or below the cut its stream's `RecallCut` gave.
+/// (`origin.0 != 0`) is at or below the cut its stream's `DelegateNodeEnded` gave.
 pub fn judge(acks: &[AckEntry], cuts: &StreamCuts) -> CutFindings {
     let mut f = CutFindings::default();
     let mut seen: BTreeSet<Rid> = BTreeSet::new();
@@ -177,8 +177,8 @@ mod tests {
     }
 
     fn cut(gen: u64, through: u64) -> LogRecord {
-        LogRecord::RecallCut {
-            dir: 10 + gen,
+        LogRecord::DelegateNodeEnded {
+            node: 3,
             gen,
             through,
         }

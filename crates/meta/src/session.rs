@@ -53,7 +53,7 @@
 //! - a delegation stream generation that ended before this incarnation
 //!   started. A lock's floor is the join of every releaser's frontier
 //!   since the lock was first taken, so it keeps naming generations long
-//!   after their `Recall`; a replica that applied the `Recall` while
+//!   after their `DelegateNodeEnded`; a replica that applied the `DelegateNodeEnded` while
 //!   running voids the generation (`void_stream`), one that restarted
 //!   since has no memory of it — `voided` and `streams` are volatile —
 //!   and never reaches the grant's position. [`crate::Meta::session_wait_at`]
@@ -499,11 +499,11 @@ struct Inner {
     /// Plan 30 §M11: per delegation generation, the stream index this
     /// replica holds (applied, executed or appended).
     streams: std::collections::BTreeMap<u64, u64>,
-    /// Plan 30 §M11: generations whose `Recall` this replica applied:
+    /// Plan 30 §M11: generations whose `DelegateNodeEnded` this replica applied:
     /// any dependency on them is satisfied (void past the cut).
     voided: std::collections::BTreeSet<u64>,
     /// The log's cut of each voided generation: the stream index its
-    /// root appended before the `Recall` (what this replica holds of it
+    /// root appended before the `DelegateNodeEnded` (what this replica holds of it
     /// *from the log*, never a delegate's own executed-but-unappended
     /// rows). A dependency past it is *lost*: a tentative
     /// acknowledgement, stranded and replayed by rid (see
@@ -766,7 +766,7 @@ pub enum DurableWait {
 /// decide a class. Under the writer lock it compares the version published
 /// here with the one the store records (`SessionState::deleg_commit_at_journal`,
 /// `Meta::finish_local`): a change between the publication and the journal
-/// (a `DelegGroup` record the store applied since) sends the op to the core,
+/// (a `DelegateNodeGroup` record the store applied since) sends the op to the core,
 /// which stamps the row from the configuration it reads then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegDurable {
@@ -925,7 +925,7 @@ impl SessionState {
     /// Void every unreached generation `observed` names for which
     /// `ended` says the generation is over (the persisted delegation
     /// table once delegated it and no longer lists it): the rule
-    /// `void_stream` applies at a `Recall`, for a replica that applied
+    /// `void_stream` applies at a `DelegateNodeEnded`, for a replica that applied
     /// the record in an earlier incarnation. Returns how many.
     pub fn void_ended(&self, ended: impl Fn(u64) -> bool) -> usize {
         self.void_ended_among(self.unreached_streams(), ended)
@@ -1061,7 +1061,7 @@ impl SessionState {
         // are replayed by rid, and its writes wait for those replays), and
         // a dependency there would never be met (`deps_lost`). `observed`
         // can name one past the cut (a reply that arrived after the
-        // `Recall` applied here: long-delegated seed 70176).
+        // `DelegateNodeEnded` applied here: long-delegated seed 70176).
         for gen in g.voided.iter() {
             if streams.get(*gen).is_some() {
                 let cut = g
@@ -1152,7 +1152,7 @@ impl SessionState {
         }
     }
 
-    /// Plan 30 §M11: generation `gen` ended at `cut` (a `Recall` record
+    /// Plan 30 §M11: generation `gen` ended at `cut` (a `DelegateNodeEnded` record
     /// applied): every dependency on it past the cut is void. The
     /// watermark is lowered to the cut; from here on a wait on the stream
     /// is satisfied at once.
@@ -1164,7 +1164,7 @@ impl SessionState {
         self.cv.notify_all();
     }
 
-    /// The end of `gen` this root journaled (`RecallCut`, voiding it here
+    /// The end of `gen` this root journaled (`DelegateNodeEnded`, voiding it here
     /// at once) left the journal unshipped with its transaction (a deposed
     /// root's rollback or rebuild), and the table, as the log has it, still
     /// lists the generation: it is live again here too. Left voided, a
@@ -1187,7 +1187,7 @@ impl SessionState {
     /// causal` reader): the stream indices and the voided generations
     /// live here in memory, and a replica that opens its store again
     /// re-applies nothing below its applied position — so a generation
-    /// whose `Recall` it applied before the restart is neither held nor
+    /// whose `DelegateNodeEnded` it applied before the restart is neither held nor
     /// voided afterwards, and a watermark naming it (a lock grant's
     /// floor: the releaser's frontier, which still names the stream it
     /// was answered from) is never reached: every read under it waits
@@ -1205,8 +1205,8 @@ impl SessionState {
     /// (what the store holds of it), as the eager seeding gave it.
     ///
     /// Plan 43 C2: the cut of a generation the table no longer lists is
-    /// the one its `RecallCut` record carried (`void_cut`, persisted when
-    /// the record was applied from the log), else — a generation a `Recall`
+    /// the one its `DelegateNodeEnded` record carried (`void_cut`, persisted when
+    /// the record was applied from the log), else — a generation a `DelegateNodeEnded`
     /// of an older log ended — what the log holds of it (`log_idx`).
     pub fn seed_generations(
         &self,
@@ -1241,7 +1241,7 @@ impl SessionState {
                 g.observed.streams.lower(gen, cut);
                 // Set, not raised: the store's cut is the log's. After an
                 // in-process rebuild a deposed root's own cut of the
-                // generation (its journaled `RecallCut`, stranded since) may
+                // generation (its journaled `DelegateNodeEnded`, stranded since) may
                 // sit above the log's, and keeping it would count a
                 // dependency between the two as not lost. At an open the
                 // map is empty, and set is raise.
@@ -1277,7 +1277,7 @@ impl SessionState {
 
     /// The log's cut of voided generation `gen` (see `Inner::void_cuts`).
     /// Only raised: rows of the generation the log carries after its
-    /// `Recall` (a root that was itself the delegate ships its own rows
+    /// `DelegateNodeEnded` (a root that was itself the delegate ships its own rows
     /// after ending the generation) are not lost.
     pub fn note_void_cut(&self, gen: u64, cut: u64) {
         let mut g = self.inner.lock().unwrap();
@@ -1655,7 +1655,7 @@ impl SessionState {
     /// Plan 46 M1.1 step 4: the rule the fast path stamps its row of `gen`
     /// with at the journaling, under the store's writer lock, given the
     /// version of the generation's configuration the store records there
-    /// (`store_version`: the latest `DelegGroup` record applied, 0 when none)
+    /// (`store_version`: the latest `DelegateNodeGroup` record applied, 0 when none)
     /// and the highest index of an own gated row journaled under the
     /// generation (`gated`), and the stream index the row takes (`idx`).
     /// `None`: the core has not published the
@@ -1705,7 +1705,7 @@ impl SessionState {
 
     /// `Lone` is not a class to journal under while this node has a lapse
     /// its core has not been handed ([`Self::set_lone_guard`]): the row
-    /// waits for the group like a `DelegGroup` one, and goes in doubt
+    /// waits for the group like a `DelegateNodeGroup` one, and goes in doubt
     /// through the core (D5) at the wait's budget. The guard reads atomics
     /// only, and only a `Lone` class asks it.
     fn guarded(&self, class: RowCommit) -> RowCommit {
@@ -1735,7 +1735,7 @@ impl SessionState {
     /// stopped, lapsed or lost its backup (the answer is in doubt: the core
     /// dedups the retry by rid and answers from the row's commit);
     /// `TimedOut` at `budget`. Never `Ungated`: a delegate that turned
-    /// lone after it journaled a `DelegGroup` row still waits for that
+    /// lone after it journaled a `DelegateNodeGroup` row still waits for that
     /// row's commit (the root's append), as the core's own answer does.
     pub fn wait_deleg_durable(&self, gen: u64, idx: u64, budget: Duration) -> DurableWait {
         let started = Instant::now();
@@ -1785,7 +1785,7 @@ impl SessionState {
     /// and a newer directory, and must not answer on the disk alone then. A
     /// row journaled `Lone` meanwhile waits like a gated one and takes the
     /// in-doubt path through the core (D5). The same holds for a delegate's
-    /// fast path: a `Lone` class it has published is `DelegGroup` while the
+    /// fast path: a `Lone` class it has published is `DelegateNodeGroup` while the
     /// guard fires ([`Self::deleg_row_class`]).
     ///
     /// Set once (the first guard stays), read on every fast-path operation
@@ -2025,7 +2025,7 @@ impl crate::store::Meta {
     /// as void is looked up in the persisted delegation table (one point
     /// read, only when such a dependency is outstanding — never on the
     /// fast path): once delegated and no longer live, it has ended, and
-    /// the dependency is void, as a `Recall` applied in this incarnation
+    /// the dependency is void, as a `DelegateNodeEnded` applied in this incarnation
     /// would have made it.
     fn void_ended_generations(&self) {
         self.void_ended_among(self.session.unreached_streams());
@@ -2040,7 +2040,7 @@ impl crate::store::Meta {
     /// a client's dependency on it would wait for the rest of the process.
     /// Slow path only, and only for those generations
     /// ([`SessionState::ended_before_open`]): an end this incarnation saw
-    /// (a streamed-ahead install of a `RecallCut` the successor may strand)
+    /// (a streamed-ahead install of a `DelegateNodeEnded` the successor may strand)
     /// is the durable log's to void, not a check's. The cut is what the
     /// session holds of the generation (0 after a restart), as the seeding
     /// gave it.
@@ -2322,7 +2322,7 @@ mod tests {
     /// Plan 46 M1.1 step 4: the fast path stamps the rule the core published
     /// and nothing else, as long as the version it was decided under is the
     /// one the store records under the writer lock; a different one (a
-    /// `DelegGroup` record applied since) is no rule to stamp: the op goes
+    /// `DelegateNodeGroup` record applied since) is no rule to stamp: the op goes
     /// through the core. A rule that names no applied version (the archive's,
     /// a designation's) is stamped as published.
     #[test]
@@ -2380,7 +2380,7 @@ mod tests {
 
     /// I1 class 2 for the delegate's fast path: with `Lone` published and
     /// the lone guard firing (a lapse the core has not been handed), the
-    /// class a row is journaled with is `DelegGroup`, by the row's place too;
+    /// class a row is journaled with is `DelegateNodeGroup`, by the row's place too;
     /// a class that waits is never changed, and the word stands again when
     /// the guard clears. Fails before: `Lone` throughout.
     #[test]
@@ -2689,7 +2689,7 @@ mod tests {
     }
 
     /// Plan 43 C2: the cut of a generation that ended before the restart is
-    /// the one its `RecallCut` record carried (persisted when the record
+    /// the one its `DelegateNodeEnded` record carried (persisted when the record
     /// was applied), not what the log happens to hold of it — a log
     /// written before the record has only the latter.
     #[test]
@@ -2715,7 +2715,7 @@ mod tests {
         assert_eq!(s.void_cut(1), Some(800));
         assert!(!s.deps_lost(&floor(1, 800)));
         assert!(s.deps_lost(&floor(1, 801)));
-        // No record cut (an older log's `Recall`): the log's index, as before.
+        // No record cut (an orphaned grant's end): the log's index.
         let s = SessionState::default();
         s.seed_generations(1, &[1].into(), &live, &log_idx, &|_| None);
         assert_eq!(s.void_cut(1), Some(816));
@@ -2950,7 +2950,7 @@ mod tests {
     }
 
     /// EC2 campaign 7 B-2: a lock grant's floor named a delegation
-    /// generation that ended before this incarnation (its `Recall` was
+    /// generation that ended before this incarnation (its `DelegateNodeEnded` was
     /// applied by an earlier one; `voided` is volatile). The persisted
     /// table says it ended: the dependency is voided and the read goes
     /// through at once, instead of every read paying the whole budget.

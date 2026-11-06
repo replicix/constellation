@@ -68121,3 +68121,30 @@ ext4, xfs, btrfs and tmpfs): pooled geometric mean of the medians, branch over m
 
 **Gates** (debug and release): `fmt --check`, `clippy --workspace --all-targets -D warnings`; lib tests meta 411 / 409, authority 1,073, engine 953; meta integration (`--tests`) 636 debug,
 634 release; release authority sim suite 420 passed, 0 failed, 12 ignored.
+
+### Plan 46 M1.2 step 8a: the node-stream records and the table (§5.2)
+
+Appended `LogRecord::{DelegateNode { node, gen, dirs: Vec<SubtreeGrant> }, SubtreeReleased { node, gen, dir, at }, StreamReleased { node, gen,
+through }, DelegateNodeGroup { node, gen, version, backups }, DelegateNodeEnded { node, gen, through }}`; `SubtreeGrant { dir, kind }` with
+`SubtreeKind::{Placed, Sticky, Designated}` (nothing writes `Sticky` before M1.3 step 4; its wire shape is fixed now). Removed `Delegate`,
+`Recall`, `RecallCut`, `DelegGroup` and every reader of them (the old `Recall` branches that inferred a cut from what a replica holds: replay,
+`Replica::apply_segment`, the segment's `ends`). No compatibility and no version bump: file systems are reformatted (decoders refuse leftover bytes).
+
+`DelegationTable` folds one `NodeStream` per `(node, gen)` (a node has one stream per generation until step 9; keyed by node in effect) with
+the subtree set, and a `by_dir` index for the walk. `DelegateNode` opens or grows (same gen) the stream, `SubtreeReleased` / `StreamReleased`
+shrink it (a stream with nothing left stays live until the root's end), `DelegateNodeEnded` removes it (matched by gen: numbers are unique,
+ADR-43). `Delegation.designated` is now `kind` (`designated()` helper); `resolve` dedupes owners by stream, so a rename between two subtrees
+of one stream is `Delegated`, not cross-subtree; `owner_of_dir` / `owner_of_dentry` resolve to `(node, gen)`. The table row is
+`[(node, gen, [(dir, kind)])], max_gen`. Replay, the deleg-gate (also taken by the two release records) and the spec/strand paths were ported.
+The core still writes one directory per grant (`LogRecord::delegate_one`); `group_spans` reads the group row unchanged (the record is
+`DelegateNodeGroup`, the row type `NodeGroupRow`). The control schema's doc comment naming `DelegGroup` is left for step 9's re-bless.
+
+Tests: meta unit `the_table_folds_a_grow_a_partial_release_and_an_end`, store test
+`the_stores_walk_resolves_both_subtrees_to_one_stream`, record round trips (all five, `Sticky` included, trailing byte refused). Removed:
+the old-`Recall` tests (no reader left).
+
+Gates (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta lib and integration, authority lib (1,072), engine lib (952),
+control, release authority sim suite 419 passed, 0 failed, 12 ignored. Sweeps: 47 delegated and shared configs, `+commit`, seeds 0..299,
+main against this branch: identical failing sets on every config. Perf (A/B, 10 rounds, 300 samples, pooled): topology 2 (delegated-relevant) holder and
+forward ops within 0.95..1.03 on ext4, xfs, btrfs, tmpfs; topology 1 (empty table, the walk never runs) small ops bimodal, 0.88..1.29 in both
+directions (an A/A control on ext4 shows 0.88..1.06); `vfs_bench` dispatch 5 ns direct, 89 ns observed, equal to main. The tmpfs A/A control did not run.

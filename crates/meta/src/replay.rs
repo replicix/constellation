@@ -116,10 +116,11 @@ impl TouchSet {
             | LogRecord::Completed { .. }
             | LogRecord::Refused { .. }
             | LogRecord::InboxAck { .. }
-            | LogRecord::Delegate { .. }
-            | LogRecord::Recall { .. }
-            | LogRecord::RecallCut { .. }
-            | LogRecord::DelegGroup { .. }
+            | LogRecord::DelegateNode { .. }
+            | LogRecord::SubtreeReleased { .. }
+            | LogRecord::StreamReleased { .. }
+            | LogRecord::DelegateNodeGroup { .. }
+            | LogRecord::DelegateNodeEnded { .. }
             | LogRecord::GroupAbandoned { .. }
             | LogRecord::TailOf { .. }
             | LogRecord::TailFollowsThrough { .. }
@@ -1018,18 +1019,13 @@ fn apply_one(
         // Plan 30 §M11: the delegation table is one `0x30` row written
         // through the ordinary `ns` funnel — dirty-tracked (so the
         // publisher carries it) and captured (so a holder's unshipped
-        // `Delegate`/`Recall` is substituted out of its commits like any
+        // `DelegateNode`/`DelegateNodeEnded` is substituted out of its commits like any
         // other unshipped effect).
-        LogRecord::Delegate {
-            dir,
-            node,
-            gen,
-            designated,
-        } => {
+        LogRecord::DelegateNode { node, gen, dirs } => {
             // A generation number is unique in the log, so a grant of `gen`
             // is preceded by no end of it there: a void on it here would be
             // one a deposed root's own journaled end left (`void_stream`
-            // when the `RecallCut` was journaled) whose row never reached
+            // when the `DelegateNodeEnded` was journaled) whose row never reached
             // the log with the grant before it. Before ADR-43 a successor
             // re-minted a number the log never named, so the new
             // generation met that void and, left voided, its rows dropped
@@ -1051,63 +1047,49 @@ fn apply_one(
                 meta.session().unvoid(*gen);
             }
             let mut table = crate::delegation::read_table_tx(tx, meta)?;
-            table.apply(crate::delegation::DelegationRecord::Delegate {
-                dir: *dir,
+            table.apply(crate::delegation::DelegationRecord::DelegateNode {
                 node: *node,
                 gen: *gen,
-                designated: *designated,
+                dirs: dirs.clone(),
             });
             crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
             Ok(Applied::Done)
         }
-        LogRecord::Recall { dir, gen } => {
+        // Plan 46 M1.2 step 8a (§5.2): rows of the delegate's own stream.
+        // The table forgets the subtree (or, for `StreamReleased`, every
+        // subtree); the stream itself lives on until the root's
+        // `DelegateNodeEnded`, whose cut voids what is past it.
+        LogRecord::SubtreeReleased { node, gen, dir, .. } => {
             let mut table = crate::delegation::read_table_tx(tx, meta)?;
-            table.apply(crate::delegation::DelegationRecord::Recall {
+            table.apply(crate::delegation::DelegationRecord::SubtreeReleased {
+                node: *node,
+                gen: *gen,
                 dir: *dir,
+            });
+            crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
+            Ok(Applied::Done)
+        }
+        LogRecord::StreamReleased { node, gen, .. } => {
+            let mut table = crate::delegation::read_table_tx(tx, meta)?;
+            table.apply(crate::delegation::DelegationRecord::StreamReleased {
+                node: *node,
                 gen: *gen,
             });
             crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
-            crate::delegation::remove_group_tx(tx, meta, dirty, *gen)?;
-            // M12 round 2 (623da2c's holder-cut shape with delegations):
-            // the generation is void from here for *every* replica — the
-            // rule the record states (its rows not before it in the log
-            // never take effect; a stranded one is replayed by rid), not
-            // only for the root that wrote it. Before, only that root
-            // voided it (`void_stream` at the recall): its successor,
-            // inheriting the table from the log after the root died with
-            // the generation's last rows unshipped, refused every batch
-            // whose deps named them (`reaches_streams`: neither applied
-            // nor void) and the delegate re-sent it forever (813 batches
-            // in 9 s, sim seed 1604); and the delegate itself kept naming
-            // the dead generation in its `deps`. Only from the durable log
-            // — a streamed-ahead install of the record may strand, and
-            // the generation would then be live again under the successor.
-            if durable {
-                let cut = meta.session().stream_applied(*gen);
-                meta.session().void_stream(*gen, cut);
-                // A dependency past what the log holds of the generation is
-                // lost (a delegate's own unappended rows never take effect):
-                // the session's cut is the one kept, as `Replica::
-                // apply_segment` notes it too. (The store alone used to keep
-                // the replica's own head, a delegate's unappended rows in it.)
-                let log = crate::store::local::bump_void_cut_at_log_idx_tx(tx, &meta.local, *gen)?;
-                meta.session().note_void_cut(*gen, log);
-                crate::store::local::clear_deleg_streamed_tx(tx, &meta.local, *gen);
-            }
             Ok(Applied::Done)
         }
         // Plan 43 C2: the generation's end with its cut. Every replica
         // reads the cut from the record, not from what it holds of the
         // generation (a delegate's head holds its unappended rows too).
-        LogRecord::RecallCut { dir, gen, through } => {
+        LogRecord::DelegateNodeEnded { node, gen, through } => {
             let mut table = crate::delegation::read_table_tx(tx, meta)?;
-            table.apply(crate::delegation::DelegationRecord::Recall {
-                dir: *dir,
+            table.apply(crate::delegation::DelegationRecord::DelegateNodeEnded {
+                node: *node,
                 gen: *gen,
             });
             crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
             crate::delegation::remove_group_tx(tx, meta, dirty, *gen)?;
-            // As `Recall`: only from the durable log (a streamed-ahead
+            // Only from the durable log (a streamed-ahead
             // install of the record may strand, and the generation would
             // then be live again under the successor) — the void, and the
             // cut kept for a restart (`deleg_void_cut`: written with the
@@ -1119,7 +1101,7 @@ fn apply_one(
                 crate::store::local::bump_void_cut_tx(tx, &meta.local, *gen, *through)?;
                 // L1: none of the generation's `Local` rows outlives this
                 // segment (appended ones retire with it, the rest strand).
-                // Not from the stream: its `RecallCut` arrives between the
+                // Not from the stream: its `DelegateNodeEnded` arrives between the
                 // delegate's own row and the root's rows after it.
                 crate::store::local::clear_deleg_streamed_tx(tx, &meta.local, *gen);
             }
@@ -1129,7 +1111,7 @@ fn apply_one(
         // beside the table's row (same funnel: dirty-tracked, captured, so
         // an unshipped record strands with the rows around it). A stale or
         // replayed version changes nothing.
-        LogRecord::DelegGroup {
+        LogRecord::DelegateNodeGroup {
             gen,
             version,
             backups,

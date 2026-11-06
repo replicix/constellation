@@ -311,13 +311,13 @@ pub trait Replica {
     /// The live delegation table as this replica knows it.
     fn delegation_table(&self) -> DelegationTable;
     /// Plan 43 C2: generation `gen`'s configuration as this replica's table
-    /// records it (`None`: no `DelegGroup` record applied: the group is the
+    /// records it (`None`: no `DelegateNodeGroup` record applied: the group is the
     /// delegate and the root). `Err`: the table could not be read, which
     /// is not "no record": the caller keeps what it knew.
     fn deleg_group(
         &self,
         gen: u64,
-    ) -> Result<Option<constellation_meta::delegation::DelegGroupRow>, MetaError>;
+    ) -> Result<Option<constellation_meta::delegation::NodeGroupRow>, MetaError>;
     /// Who executes an op touching `keys` (an ancestor walk on this
     /// replica's table; `Root` at once when the table is empty).
     fn resolve_ownership(&self, keys: &TouchSet) -> Ownership;
@@ -556,7 +556,7 @@ pub trait Replica {
     /// locks), shared with the FUSE threads.
     fn locks(&self) -> &constellation_meta::locks::LockTables;
     /// Whether any delegation is live in this replica's table (one atomic
-    /// read: `Meta::delegations_any`; a `Delegate` record flips it inside the
+    /// read: `Meta::delegations_any`; a `DelegateNode` record flips it inside the
     /// store write that applies it). The lock lane re-checks it live.
     fn delegations_any(&self) -> bool;
     /// Plan 30 §M14: whether `ino` is `dir` or below it (its primary
@@ -1205,7 +1205,7 @@ impl Replica for Meta {
             let gen = match rec {
                 // Plan 43 C2: the record carries the cut: every replica
                 // voids the generation at it, not at what it holds.
-                LogRecord::RecallCut { gen, through, .. } => {
+                LogRecord::DelegateNodeEnded { gen, through, .. } => {
                     self.session().void_stream(*gen, *through);
                     self.session().note_void_cut(*gen, *through);
                     // The cut kept for a restart and for an install that
@@ -1214,17 +1214,6 @@ impl Replica for Meta {
                     // (`apply_segment_rows`), also when the record was
                     // installed from the root's stream before and the
                     // segment did not apply it again.
-                    *gen
-                }
-                // A log written before the cut was in the record: the cut
-                // is what this replica holds of the generation.
-                LogRecord::Recall { gen, .. } => {
-                    let cut = self.session().stream_applied(*gen);
-                    self.session().void_stream(*gen, cut);
-                    // What the log holds of it (a delegate's own unappended
-                    // rows are not): a dependency past this is lost.
-                    self.session()
-                        .note_void_cut(*gen, Meta::log_stream_idx(self, *gen).unwrap_or(0));
                     *gen
                 }
                 _ => continue,
@@ -1278,7 +1267,7 @@ impl Replica for Meta {
     fn deleg_group(
         &self,
         gen: u64,
-    ) -> Result<Option<constellation_meta::delegation::DelegGroupRow>, MetaError> {
+    ) -> Result<Option<constellation_meta::delegation::NodeGroupRow>, MetaError> {
         Meta::deleg_group(self, gen).inspect_err(|error| {
             tracing::warn!(%error, gen = %constellation_meta::delegation::GenLabel::of(gen), "reading a delegation's group failed");
         })
@@ -1917,7 +1906,7 @@ impl Replica for Meta {
     ) -> Result<(), MetaError> {
         // Adopted: an adopted manifest's chunks are enrolled as pending
         // uploads (`Meta::apply_adopted_records`); the other callers
-        // (`Delegate`/`Recall` records) name no chunk.
+        // (`DelegateNode`/`DelegateNodeEnded` records) name no chunk.
         Meta::apply_adopted_records(self, records, rid)
     }
 
@@ -2109,14 +2098,14 @@ mod tests {
                 1,
                 1,
                 &[
-                    LogRecord::Delegate {
-                        dir: ROOT_INO,
-                        node: 4,
-                        gen: g,
-                        designated: false,
-                    },
-                    LogRecord::RecallCut {
-                        dir: ROOT_INO,
+                    LogRecord::delegate_one(
+                        4,
+                        g,
+                        ROOT_INO,
+                        constellation_meta::SubtreeKind::Placed,
+                    ),
+                    LogRecord::DelegateNodeEnded {
+                        node: 3,
                         gen: g,
                         through: 0,
                     },

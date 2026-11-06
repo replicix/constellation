@@ -106,16 +106,11 @@ mod tests {
     use super::*;
     use constellation_meta::Rid;
 
-    /// M1.2 step 1: a segment carrying a `Delegate` record of the old shape
+    /// M1.2 step 1: a segment carrying a `DelegateNode` record of the old shape
     /// (two trailing range bytes) is refused, as is one with trailing bytes.
     #[test]
     fn old_shape_delegate_in_a_segment_is_refused() {
-        let rec = LogRecord::Delegate {
-            dir: 7,
-            node: 2,
-            gen: 5,
-            designated: false,
-        };
+        let rec = LogRecord::delegate_one(2, 5, 7, constellation_meta::SubtreeKind::Placed);
         let bytes = encode(5, 3, 17, &[16], &[(0, 0)], std::slice::from_ref(&rec)).unwrap();
         assert!(decode(&bytes).is_ok());
         let rb = rec.to_postcard().unwrap();

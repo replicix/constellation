@@ -379,7 +379,7 @@ pub(crate) struct LockState {
     /// node its delegate named the owner (`NotOwner { root }`) once a
     /// recall had taken the subtree's grants back to that root
     /// (`DelegationState::handed_back`). Requests and renewals for the
-    /// subtree go there until the `Recall` record reaches this table —
+    /// subtree go there until the `DelegateNodeEnded` record reaches this table —
     /// which under an S3 cut is only after it (the root ends the
     /// generation in its journal at once, a continuation epoch's
     /// recall-all). Sent to the stale delegate meanwhile, they were

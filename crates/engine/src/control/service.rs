@@ -499,7 +499,7 @@ impl EngineControl {
                             path: self.meta.path_of(d.dir).unwrap_or_default(),
                             node: d.node,
                             gen: d.gen,
-                            designated: d.designated,
+                            designated: d.designated(),
                         })
                         .collect(),
                     mine: v.mine.clone(),
@@ -1132,7 +1132,7 @@ impl EngineControl {
                 path: self.meta.path_of(d.dir).unwrap_or_default(),
                 node: d.node,
                 gen: d.gen,
-                designated: d.designated,
+                designated: d.designated(),
             })
             .collect()
     }

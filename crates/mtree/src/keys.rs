@@ -134,7 +134,7 @@ pub enum Subsystem {
     Designation = 0x04,
     Hold = 0x05,
     /// Plan 30 §M11: the live delegation table (one global record, an
-    /// empty id), maintained by the `Delegate`/`Recall` log records so
+    /// empty id), maintained by the `DelegateNode`/`DelegateNodeEnded` log records so
     /// that a bootstrapped replica learns it from the commit it loads.
     Delegation = 0x07,
     // 0x06 was `Partition` (the namespace-partition map), retired by

@@ -160,7 +160,7 @@ impl PendingClass {
 
     /// [`Self::set`] for the root's append of a delegate's stream row: a
     /// `Singleton` class whose configuration version is the generation's
-    /// applied `DelegGroup` version, read by `Meta::finish_local` in the
+    /// applied `DelegateNodeGroup` version, read by `Meta::finish_local` in the
     /// transaction that journals the row.
     pub(crate) fn set_stream_version(class: crate::store::local::RowCommit) -> PendingClassGuard {
         PendingClassGuard {

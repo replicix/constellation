@@ -98,7 +98,7 @@ pub async fn replay_log(raw: Arc<dyn ObjectStore>, snapshots_at: &BTreeSet<Seq>)
                         rid.seq,
                         code.posix_name()
                     ),
-                    LogRecord::Recall { gen, .. } => format!("Recall(g{gen})"),
+                    LogRecord::DelegateNodeEnded { gen, .. } => format!("Ended(g{gen})"),
                     other => format!("{other:?}")
                         .split_whitespace()
                         .next()

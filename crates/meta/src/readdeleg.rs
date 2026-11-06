@@ -545,7 +545,7 @@ impl ReadDelegations {
     }
 
     /// Plan 30 §M11 phase 2b: a delegate's generation ended (its
-    /// `Recall` applied): every delegation it granted is void.
+    /// `DelegateNodeEnded` applied): every delegation it granted is void.
     pub fn void_epoch(&self, epoch: u64) {
         let mut g = self.inner.lock().unwrap();
         g.held.retain(|_, h| h.epoch != epoch);

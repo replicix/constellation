@@ -1,5 +1,5 @@
 //! L1: a former delegate's replica after the root's pre-S3 stream and the
-//! segment that carry its own row, the generation's `RecallCut` and a later
+//! segment that carry its own row, the generation's `DelegateNodeEnded` and a later
 //! root row on the same name must equal the log prefix.
 
 use constellation_fs_core::types::ROOT_INO;
@@ -129,8 +129,8 @@ impl Fx {
     }
 
     fn recall(&self) -> LogRecord {
-        LogRecord::RecallCut {
-            dir: self.d,
+        LogRecord::DelegateNodeEnded {
+            node: 2,
             gen: GEN,
             through: 1,
         }
@@ -225,7 +225,7 @@ fn run(later: Later, via_stream: bool, reopen: bool) {
         meta.lookup(fx.e, "s").unwrap().is_some(),
         "the shadow stays"
     );
-    // The log's `RecallCut` cleared the generation's mark.
+    // The log's `DelegateNodeEnded` cleared the generation's mark.
     assert_eq!(meta.deleg_streamed(GEN).unwrap(), None);
 }
 
@@ -268,7 +268,7 @@ fn a_streamed_recall_cut_keeps_the_mark_and_the_durable_one_clears_it() {
         .install_streamed_committed(1, HOLDER, 1, 2, &fx.x_recs, true, (GEN, 1))
         .unwrap();
     assert_eq!(fx.meta.deleg_streamed(GEN).unwrap(), Some((1, 1)));
-    // The streamed `RecallCut` arrives before the root's later rows: the
+    // The streamed `DelegateNodeEnded` arrives before the root's later rows: the
     // mark must still order the own row ahead of them.
     fx.meta
         .install_streamed_committed(
@@ -282,7 +282,7 @@ fn a_streamed_recall_cut_keeps_the_mark_and_the_durable_one_clears_it() {
         )
         .unwrap();
     assert_eq!(fx.meta.deleg_streamed(GEN).unwrap(), Some((1, 1)));
-    // The log's `RecallCut` ends the generation: the mark goes.
+    // The log's `DelegateNodeEnded` ends the generation: the mark goes.
     fx.apply_segment(Later::Unlink);
     assert_eq!(fx.meta.deleg_streamed(GEN).unwrap(), None);
 }

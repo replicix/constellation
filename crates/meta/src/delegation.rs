@@ -29,6 +29,7 @@
 //! op's keys — two or three walks for a rename, one for everything else.
 
 use crate::error::MetaError;
+use crate::record::{SubtreeGrant, SubtreeKind};
 use crate::replay::TouchSet;
 use crate::store::{ns, Meta};
 use constellation_fs_core::types::ROOT_INO;
@@ -45,41 +46,69 @@ pub type NodeId = u64;
 /// tenures.
 pub type Gen = u64;
 
-/// The log records that maintain the table (phase 2 adds them to
-/// `LogRecord`; they touch no inode or dentry, like `Completed`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The log records that maintain the table (they touch no inode or
+/// dentry, like `Completed`): the fold of [`LogRecord::DelegateNode`]
+/// (a generation opens, or its set grows), `SubtreeReleased`,
+/// `StreamReleased` and `DelegateNodeEnded` (plan 46 M1.2 step 8a, §5.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DelegationRecord {
-    /// `dir` (its whole subtree) is sequenced by `node` under generation
-    /// `gen` from this record on.
-    Delegate {
-        dir: Ino,
+    /// `node` holds the subtrees `dirs` under generation `gen` from this
+    /// record on: the generation's first record opens its stream, a later
+    /// one grows the live stream's set.
+    DelegateNode {
         node: NodeId,
         gen: Gen,
-        designated: bool,
+        dirs: Vec<SubtreeGrant>,
     },
+    /// The holder released the subtree `dir`; the rest of the set stays.
+    SubtreeReleased { node: NodeId, gen: Gen, dir: Ino },
+    /// The holder released every subtree (the generation lives on, with an
+    /// empty set, until the root ends it).
+    StreamReleased { node: NodeId, gen: Gen },
     /// Generation `gen` ended: every record of its stream that is not
     /// before this one in the log is void.
-    Recall { dir: Ino, gen: Gen },
+    DelegateNodeEnded { node: NodeId, gen: Gen },
 }
 
+/// One live subtree grant, as the walk finds it: the subtree `dir`, the
+/// stream `(node, gen)` that sequences it, and what kind of grant it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Delegation {
     pub dir: Ino,
     pub node: NodeId,
     pub gen: Gen,
-    /// Phase 2b: an offline designation — recalled only by `online`.
-    pub designated: bool,
+    /// Phase 2b: a `Designated` subtree is an offline designation:
+    /// recalled only by `online`.
+    pub kind: SubtreeKind,
+}
+
+impl Delegation {
+    /// An offline designation (never recalled by TTL or placement).
+    pub fn designated(&self) -> bool {
+        self.kind == SubtreeKind::Designated
+    }
+
+    /// The stream that sequences the subtree.
+    pub fn stream(&self) -> (NodeId, Gen) {
+        (self.node, self.gen)
+    }
 }
 
 /// The live delegations, derived from the log prefix (plus, on the root,
-/// its unshipped journal). Delegations never overlap: the root writes a
-/// `Delegate` only for a directory no live delegation contains, and only
-/// after every delegation under it was recalled (plan 46 D5 deleted the
-/// hash-range splits: a delegation is always a directory's whole subtree).
+/// its unshipped journal): one [`NodeStream`] per `(node, gen)` with the
+/// subtree set folded from its records, and a `by_dir` index for the
+/// ownership walk. A node has one stream per generation, so a table keyed
+/// by node holds as many entries as the node has live generations (one, from
+/// step 9 on). Subtrees never overlap in one directory: the root writes a
+/// grant only for a directory no live grant contains, and only after every
+/// grant under it was recalled (plan 46 D5 deleted the hash-range splits).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DelegationTable {
-    by_dir: BTreeMap<Ino, Delegation>,
-    /// The highest generation any `Delegate` record ever named. A number
+    /// The live streams and the subtrees each holds.
+    streams: BTreeMap<(NodeId, Gen), BTreeMap<Ino, SubtreeKind>>,
+    /// The walk's index: a subtree's directory to its stream and kind.
+    by_dir: BTreeMap<Ino, (NodeId, Gen, SubtreeKind)>,
+    /// The highest generation any `DelegateNode` record ever named. A number
     /// is minted by one tenure in its epoch's block (ADR-43), so no two
     /// tenures mint the same one and a successor's numbers are above it
     /// anyway; it floors the next mint (`Meta::next_delegation_gen`) and
@@ -87,38 +116,79 @@ pub struct DelegationTable {
     max_gen: Gen,
 }
 
-type Row = (Ino, NodeId, Gen, bool);
+/// A live stream's subtrees (the persisted row of one stream).
+type Row = (NodeId, Gen, Vec<(Ino, SubtreeKind)>);
+
+/// One node stream as the table folded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeStream {
+    pub node: NodeId,
+    pub gen: Gen,
+    /// The subtrees it holds now, in directory order.
+    pub subtrees: Vec<(Ino, SubtreeKind)>,
+}
 
 impl DelegationTable {
     pub fn apply(&mut self, rec: DelegationRecord) {
         match rec {
-            DelegationRecord::Delegate {
-                dir,
-                node,
-                gen,
-                designated,
-            } => {
+            DelegationRecord::DelegateNode { node, gen, dirs } => {
                 self.max_gen = self.max_gen.max(gen);
-                self.by_dir.insert(
-                    dir,
-                    Delegation {
-                        dir,
-                        node,
-                        gen,
-                        designated,
-                    },
-                );
+                self.streams.entry((node, gen)).or_default();
+                for g in dirs {
+                    // A directory has one holder: a grant of it replaces
+                    // whatever stream held it (the fold of a recall the log
+                    // lacked, as before).
+                    if let Some((n, gn, _)) = self.by_dir.insert(g.dir, (node, gen, g.kind)) {
+                        if (n, gn) != (node, gen) {
+                            if let Some(set) = self.streams.get_mut(&(n, gn)) {
+                                set.remove(&g.dir);
+                            }
+                        }
+                    }
+                    if let Some(set) = self.streams.get_mut(&(node, gen)) {
+                        set.insert(g.dir, g.kind);
+                    }
+                }
             }
-            DelegationRecord::Recall { dir, gen } => {
-                if self.by_dir.get(&dir).is_some_and(|e| e.gen == gen) {
+            DelegationRecord::SubtreeReleased { node, gen, dir } => {
+                if self
+                    .by_dir
+                    .get(&dir)
+                    .is_some_and(|e| (e.0, e.1) == (node, gen))
+                {
                     self.by_dir.remove(&dir);
+                    if let Some(set) = self.streams.get_mut(&(node, gen)) {
+                        set.remove(&dir);
+                    }
+                }
+            }
+            DelegationRecord::StreamReleased { node, gen } => {
+                if let Some(set) = self.streams.get_mut(&(node, gen)) {
+                    for dir in std::mem::take(set).into_keys() {
+                        self.by_dir.remove(&dir);
+                    }
+                }
+            }
+            // A generation number is unique in the log (ADR-43: minted in
+            // one tenure's epoch block), so the end names its stream by
+            // `gen`; `node` is the record's redundancy for its readers.
+            DelegationRecord::DelegateNodeEnded { node: _, gen } => {
+                let Some(key) = self.streams.keys().find(|(_, g)| *g == gen).copied() else {
+                    return;
+                };
+                if let Some(set) = self.streams.remove(&key) {
+                    for dir in set.into_keys() {
+                        self.by_dir.remove(&dir);
+                    }
                 }
             }
         }
     }
 
+    /// Whether no stream is live (a stream that released everything is
+    /// live until the root ends it).
     pub fn is_empty(&self) -> bool {
-        self.by_dir.is_empty()
+        self.streams.is_empty()
     }
 
     /// The highest generation ever delegated (0: none).
@@ -126,12 +196,13 @@ impl DelegationTable {
         self.max_gen
     }
 
-    /// The `0x30 | Delegation` row's value: postcard of the live rows,
-    /// sorted by directory.
+    /// The `0x30 | Delegation` row's value: postcard of the live streams,
+    /// sorted by `(node, gen)`.
     pub fn encode(&self) -> Vec<u8> {
         let rows: Vec<Row> = self
+            .streams
             .iter()
-            .map(|d| (d.dir, d.node, d.gen, d.designated))
+            .map(|(&(n, g), set)| (n, g, set.iter().map(|(&d, &k)| (d, k)).collect()))
             .collect();
         postcard::to_allocvec(&(rows, self.max_gen)).unwrap_or_default()
     }
@@ -143,24 +214,65 @@ impl DelegationTable {
             max_gen,
             ..DelegationTable::default()
         };
-        for (dir, node, gen, designated) in rows {
-            t.apply(DelegationRecord::Delegate {
-                dir,
+        for (node, gen, dirs) in rows {
+            t.apply(DelegationRecord::DelegateNode {
                 node,
                 gen,
-                designated,
+                dirs: dirs
+                    .into_iter()
+                    .map(|(dir, kind)| SubtreeGrant { dir, kind })
+                    .collect(),
             });
         }
         Ok(t)
     }
 
-    /// The delegation of `dir` itself, if any.
+    /// The subtree grant on `dir` itself, if any.
     pub fn get(&self, dir: Ino) -> Option<Delegation> {
-        self.by_dir.get(&dir).copied()
+        self.by_dir.get(&dir).map(|&(node, gen, kind)| Delegation {
+            dir,
+            node,
+            gen,
+            kind,
+        })
     }
 
+    /// Every live subtree grant, by directory.
     pub fn iter(&self) -> impl Iterator<Item = Delegation> + '_ {
-        self.by_dir.values().copied()
+        self.by_dir
+            .iter()
+            .map(|(&dir, &(node, gen, kind))| Delegation {
+                dir,
+                node,
+                gen,
+                kind,
+            })
+    }
+
+    /// Every live stream with the subtrees it holds, by `(node, gen)`.
+    pub fn streams(&self) -> impl Iterator<Item = NodeStream> + '_ {
+        self.streams.iter().map(|(&(node, gen), set)| NodeStream {
+            node,
+            gen,
+            subtrees: set.iter().map(|(&d, &k)| (d, k)).collect(),
+        })
+    }
+
+    /// The live stream `(node, gen)`: its subtrees (`None`: not live).
+    pub fn stream(&self, node: NodeId, gen: Gen) -> Option<NodeStream> {
+        self.streams.get(&(node, gen)).map(|set| NodeStream {
+            node,
+            gen,
+            subtrees: set.iter().map(|(&d, &k)| (d, k)).collect(),
+        })
+    }
+
+    /// The node that holds generation `gen` (`None`: not live).
+    pub fn node_of_gen(&self, gen: Gen) -> Option<NodeId> {
+        self.streams
+            .keys()
+            .find(|(_, g)| *g == gen)
+            .map(|&(n, _)| n)
     }
 
     /// The delegation containing `dir`: the innermost one on it or an
@@ -173,12 +285,23 @@ impl DelegationTable {
         // Bounded by the tree's depth; the guard only stops a corrupt
         // parent chain from looping.
         for _ in 0..MAX_WALK {
-            if let Some(w) = self.by_dir.get(&d) {
-                return Some(*w);
+            if let Some(w) = self.get(d) {
+                return Some(w);
             }
             d = ns.parent_of(d)?;
         }
         None
+    }
+
+    /// The stream `(node, gen)` that sequences `dir` (`None`: the root).
+    pub fn owner_of_dir(&self, ns: &dyn Namespace, dir: Ino) -> Option<(NodeId, Gen)> {
+        self.covering(ns, dir).map(|d| d.stream())
+    }
+
+    /// The stream that sequences the dentry `parent/_`: the one holding
+    /// `parent`'s containing subtree (`None`: the root).
+    pub fn owner_of_dentry(&self, ns: &dyn Namespace, parent: Ino) -> Option<(NodeId, Gen)> {
+        self.owner_of_dir(ns, parent)
     }
 
     /// Who executes an op touching `keys`.
@@ -186,9 +309,14 @@ impl DelegationTable {
         if self.by_dir.is_empty() {
             return Ownership::Root;
         }
+        // Owners are streams: two subtrees of one node's stream are one
+        // owner (a rename between them is an ordinary op of the stream).
         let mut owners: Vec<Option<Delegation>> = Vec::new();
         let mut note = |o: Option<Delegation>| {
-            if !owners.contains(&o) {
+            if !owners
+                .iter()
+                .any(|x| x.map(|d| d.stream()) == o.map(|d| d.stream()))
+            {
                 owners.push(o);
             }
         };
@@ -276,7 +404,7 @@ pub(crate) fn write_table_tx(
 }
 
 /// Plan 43 C2: the configuration of one delegation generation as this
-/// replica's table records it: the latest [`LogRecord::DelegGroup`] applied
+/// replica's table records it: the latest [`LogRecord::DelegateNodeGroup`] applied
 /// (`version` 0: none, the group is the delegate and the root), and every
 /// backup any record of the generation ever named (`named`, sorted: the
 /// seal's best-effort set at the generation's end, C2e). A separate key per
@@ -284,7 +412,7 @@ pub(crate) fn write_table_tx(
 /// not change; written in the same funnel (dirty-tracked, captured, rolled
 /// back with the table) and deleted with the generation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DelegGroupRow {
+pub struct NodeGroupRow {
     pub version: u64,
     pub backups: Vec<NodeId>,
     pub named: Vec<NodeId>,
@@ -301,7 +429,7 @@ pub(crate) fn read_group_tx(
     r: &impl Readable,
     meta: &Meta,
     gen: Gen,
-) -> Result<Option<DelegGroupRow>, MetaError> {
+) -> Result<Option<NodeGroupRow>, MetaError> {
     match r.get(&meta.ns, group_key(gen))? {
         Some(v) => Ok(Some(crate::record::from_bytes_exact(&v).map_err(|e| {
             MetaError::Invalid(format!("delegation group row: {e}"))
@@ -310,7 +438,7 @@ pub(crate) fn read_group_tx(
     }
 }
 
-/// Apply a `DelegGroup` record: a version above the row's replaces it; a
+/// Apply a `DelegateNodeGroup` record: a version above the row's replaces it; a
 /// replayed or stale one is ignored. `true`: the row changed.
 pub(crate) fn apply_group_tx(
     tx: &mut SingleWriterWriteTx,
@@ -328,7 +456,7 @@ pub(crate) fn apply_group_tx(
     named.extend_from_slice(backups);
     named.sort_unstable();
     named.dedup();
-    let row = DelegGroupRow {
+    let row = NodeGroupRow {
         version,
         backups: backups.to_vec(),
         named,
@@ -367,7 +495,8 @@ pub(crate) fn remove_group_tx(
 
 impl Meta {
     /// The live delegation table as this replica knows it: the fold of
-    /// every `Delegate`/`Recall` record it applied (its journal
+    /// every `DelegateNode`/`SubtreeReleased`/`StreamReleased`/
+    /// `DelegateNodeEnded` record it applied (its journal
     /// included, on the root). One point read of a small key.
     pub fn delegation_table(&self) -> DelegationTable {
         let r = self.db.read_tx();
@@ -375,15 +504,15 @@ impl Meta {
     }
 
     /// Plan 43 C2: generation `gen`'s configuration as this replica's table
-    /// records it (`None`: no `DelegGroup` record applied, version 0).
-    pub fn deleg_group(&self, gen: Gen) -> Result<Option<DelegGroupRow>, MetaError> {
+    /// records it (`None`: no `DelegateNodeGroup` record applied, version 0).
+    pub fn deleg_group(&self, gen: Gen) -> Result<Option<NodeGroupRow>, MetaError> {
         #[cfg(any(test, feature = "test-util"))]
         crate::store::backup::injected_read_fault()?;
         let r = self.db.read_tx();
         read_group_tx(&r, self, gen)
     }
 
-    /// Simulation oracle: the highest `DelegGroup` version of `gen` this
+    /// Simulation oracle: the highest `DelegateNodeGroup` version of `gen` this
     /// replica ever applied (0: none), kept after the generation ends.
     #[cfg(any(test, feature = "test-util"))]
     pub fn deleg_group_top(&self, gen: Gen) -> u64 {
@@ -395,7 +524,7 @@ impl Meta {
             .unwrap_or(0)
     }
 
-    /// Simulation oracle: the `DelegGroup` version of `gen` in force at the
+    /// Simulation oracle: the `DelegateNodeGroup` version of `gen` in force at the
     /// journal position of the row whose first seq is `first`: the latest
     /// version this replica applied while the journal's next seq was at or
     /// below `first`; `Some(0)` when every recorded version was applied after
@@ -424,8 +553,8 @@ impl Meta {
     }
 
     /// Plan 30 §M12: the lock the root's FUSE fast path holds shared
-    /// across its ownership check and execution, and a `Delegate`/
-    /// `Recall` transaction holds exclusively (see `Meta::deleg_gate`).
+    /// across its ownership check and execution, and a `DelegateNode`/
+    /// `DelegateNodeEnded` transaction holds exclusively (see `Meta::deleg_gate`).
     pub fn delegation_gate(&self) -> &std::sync::RwLock<()> {
         &self.deleg_gate
     }
@@ -686,8 +815,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// M1.2 step 1: a table row written before it (with the range's
-    /// `(bits, idx)`) is refused, not decoded shifted.
+    /// A table row of an older shape (a rows-of-dirs layout) is refused,
+    /// not decoded shifted.
     #[test]
     fn old_shape_table_row_is_refused() {
         let new = DelegationTable::default();
@@ -725,20 +854,21 @@ mod tests {
         }
     }
 
+    fn grant(node: NodeId, gen: Gen, dir: Ino) -> DelegationRecord {
+        DelegationRecord::DelegateNode {
+            node,
+            gen,
+            dirs: vec![SubtreeGrant {
+                dir,
+                kind: SubtreeKind::Placed,
+            }],
+        }
+    }
+
     fn table() -> DelegationTable {
         let mut t = DelegationTable::default();
-        t.apply(DelegationRecord::Delegate {
-            dir: 2,
-            node: 7,
-            gen: 1,
-            designated: false,
-        });
-        t.apply(DelegationRecord::Delegate {
-            dir: 3,
-            node: 8,
-            gen: 2,
-            designated: false,
-        });
+        t.apply(grant(7, 1, 2));
+        t.apply(grant(8, 2, 3));
         t
     }
 
@@ -757,12 +887,7 @@ mod tests {
         assert_eq!(t.covering(&ns, 1), None);
         // A nested delegation is innermost.
         let mut t2 = t.clone();
-        t2.apply(DelegationRecord::Delegate {
-            dir: 4,
-            node: 9,
-            gen: 3,
-            designated: false,
-        });
+        t2.apply(grant(9, 3, 4));
         assert_eq!(t2.covering(&ns, 4).map(|d| d.gen), Some(3));
     }
 
@@ -814,15 +939,138 @@ mod tests {
     }
 
     #[test]
-    fn a_recall_ends_only_its_generation_and_an_empty_table_is_free() {
+    fn an_end_ends_only_its_generation_and_an_empty_table_is_free() {
         let ns = Tree::new();
         let mut t = table();
-        t.apply(DelegationRecord::Recall { dir: 2, gen: 0 });
-        assert!(t.get(2).is_some(), "a stale recall changes nothing");
-        t.apply(DelegationRecord::Recall { dir: 2, gen: 1 });
+        t.apply(DelegationRecord::DelegateNodeEnded { node: 7, gen: 0 });
+        assert!(t.get(2).is_some(), "a stale end changes nothing");
+        t.apply(DelegationRecord::DelegateNodeEnded { node: 7, gen: 1 });
         assert!(t.get(2).is_none());
         assert_eq!(t.resolve(&ns, &dentry(4, "x")), Ownership::Root);
         let empty = DelegationTable::default();
         assert_eq!(empty.resolve(&ns, &dentry(4, "x")), Ownership::Root);
+    }
+
+    fn grow(node: NodeId, gen: Gen, dirs: &[(Ino, SubtreeKind)]) -> DelegationRecord {
+        DelegationRecord::DelegateNode {
+            node,
+            gen,
+            dirs: dirs
+                .iter()
+                .map(|&(dir, kind)| SubtreeGrant { dir, kind })
+                .collect(),
+        }
+    }
+
+    /// M1.2 step 8a: a node holds subtrees `/D1` (2) and `/D2` (3) in one
+    /// stream. A grow adds a subtree to the live stream (same gen), a
+    /// partial release shrinks it, an end removes it; the walk resolves a
+    /// dentry under either subtree to the one stream, and an op between the
+    /// two subtrees is the stream's own (not cross-subtree).
+    #[test]
+    fn the_table_folds_a_grow_a_partial_release_and_an_end() {
+        use SubtreeKind::{Designated, Placed, Sticky};
+        let ns = Tree::new();
+        let mut t = DelegationTable::default();
+        t.apply(grow(7, 5, &[(2, Placed)]));
+        assert_eq!(t.stream(7, 5).unwrap().subtrees, vec![(2, Placed)]);
+        // The grow: same node, same gen, one more subtree.
+        t.apply(grow(7, 5, &[(3, Designated)]));
+        assert_eq!(
+            t.stream(7, 5).unwrap().subtrees,
+            vec![(2, Placed), (3, Designated)]
+        );
+        assert_eq!(t.streams().count(), 1, "one stream, not two");
+        assert_eq!(t.max_gen(), 5);
+        // The walk: a dentry under either subtree is the one stream's.
+        let under_d3 = t.covering(&ns, 4).unwrap();
+        assert_eq!((under_d3.node, under_d3.gen, under_d3.dir), (7, 5, 2));
+        assert!(!under_d3.designated());
+        let under_d2 = t.covering(&ns, 3).unwrap();
+        assert_eq!((under_d2.node, under_d2.gen, under_d2.dir), (7, 5, 3));
+        assert!(under_d2.designated());
+        assert_eq!(t.owner_of_dir(&ns, 4), Some((7, 5)));
+        assert_eq!(t.owner_of_dentry(&ns, 3), Some((7, 5)));
+        assert!(matches!(
+            t.resolve(&ns, &dentry(4, "x")),
+            Ownership::Delegated(Delegation {
+                node: 7,
+                gen: 5,
+                ..
+            })
+        ));
+        // A rename between the two subtrees is one owner: no recall.
+        let mut between = dentry(4, "a");
+        between.dentries.insert((3, "b".into()));
+        assert!(matches!(
+            t.resolve(&ns, &between),
+            Ownership::Delegated(Delegation {
+                node: 7,
+                gen: 5,
+                ..
+            })
+        ));
+        // Into the root directory it is still cross-subtree.
+        let mut up = dentry(4, "a");
+        up.dentries.insert((1, "b".into()));
+        assert!(matches!(
+            t.resolve(&ns, &up),
+            Ownership::CrossSubtree {
+                root_owned: true,
+                ..
+            }
+        ));
+        // A release by another stream, or of a subtree the stream does not
+        // hold, changes nothing.
+        t.apply(DelegationRecord::SubtreeReleased {
+            node: 8,
+            gen: 5,
+            dir: 2,
+        });
+        t.apply(DelegationRecord::SubtreeReleased {
+            node: 7,
+            gen: 5,
+            dir: 9,
+        });
+        assert_eq!(t.stream(7, 5).unwrap().subtrees.len(), 2);
+        // The partial release: only `/D1` leaves; the walk finds the root
+        // there and the stream under `/D2`.
+        t.apply(DelegationRecord::SubtreeReleased {
+            node: 7,
+            gen: 5,
+            dir: 2,
+        });
+        assert_eq!(t.stream(7, 5).unwrap().subtrees, vec![(3, Designated)]);
+        assert_eq!(t.resolve(&ns, &dentry(4, "x")), Ownership::Root);
+        assert!(matches!(
+            t.resolve(&ns, &dentry(3, "x")),
+            Ownership::Delegated(Delegation {
+                node: 7,
+                gen: 5,
+                ..
+            })
+        ));
+        // A release of everything leaves the stream live, with no subtree,
+        // until the root ends it.
+        t.apply(DelegationRecord::StreamReleased { node: 7, gen: 5 });
+        assert!(t.stream(7, 5).unwrap().subtrees.is_empty());
+        assert!(!t.is_empty());
+        assert_eq!(t.resolve(&ns, &dentry(3, "x")), Ownership::Root);
+        t.apply(grow(7, 5, &[(2, Placed)]));
+        assert!(t.get(2).is_some(), "a stream grows again after a release");
+        // The end removes the stream and its subtrees; the number stays
+        // minted.
+        t.apply(DelegationRecord::DelegateNodeEnded { node: 7, gen: 5 });
+        assert!(t.is_empty());
+        assert!(t.get(2).is_none());
+        assert_eq!(t.max_gen(), 5);
+        // The persisted row round-trips a multi-subtree stream.
+        let mut t = DelegationTable::default();
+        t.apply(grow(7, 5, &[(2, Placed), (3, Designated), (4, Sticky)]));
+        t.apply(grow(8, 6, &[]));
+        let sticky = t.get(4).unwrap();
+        assert_eq!(sticky.kind, Sticky);
+        assert!(!sticky.designated());
+        assert_eq!(DelegationTable::decode(&t.encode()).unwrap(), t);
     }
 }

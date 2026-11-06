@@ -7,7 +7,9 @@
 
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::delegation::{gen_epoch, GEN_EPOCH_SHIFT, GEN_MAX_EPOCH};
-use constellation_meta::{LogRecord, Meta, MetaStore, MutateOp, Position, Rid, Streams, TouchSet};
+use constellation_meta::{
+    LogRecord, Meta, MetaStore, MutateOp, Position, Rid, Streams, SubtreeKind, TouchSet,
+};
 
 const fn gen(epoch: u64, n: u64) -> u64 {
     (epoch << GEN_EPOCH_SHIFT) | n
@@ -99,14 +101,9 @@ fn a_dependency_on_a_generation_that_ended_without_a_key_is_voided_when_checked(
         .into_iter()
         .flat_map(|g| {
             [
-                LogRecord::Delegate {
-                    dir: ROOT_INO,
-                    node: 4,
-                    gen: g,
-                    designated: false,
-                },
-                LogRecord::RecallCut {
-                    dir: ROOT_INO,
+                LogRecord::delegate_one(4, g, ROOT_INO, SubtreeKind::Placed),
+                LogRecord::DelegateNodeEnded {
+                    node: 2,
                     gen: g,
                     through: 0,
                 },
@@ -176,14 +173,9 @@ fn a_lost_dependency_on_a_keyless_ended_generation_is_lost_at_the_first_check() 
         .into_iter()
         .flat_map(|g| {
             [
-                LogRecord::Delegate {
-                    dir: ROOT_INO,
-                    node: 4,
-                    gen: g,
-                    designated: false,
-                },
-                LogRecord::RecallCut {
-                    dir: ROOT_INO,
+                LogRecord::delegate_one(4, g, ROOT_INO, SubtreeKind::Placed),
+                LogRecord::DelegateNodeEnded {
+                    node: 2,
                     gen: g,
                     through: 0,
                 },
@@ -236,14 +228,9 @@ fn a_restart_does_not_void_a_generation_above_the_tables_highest() {
             1,
             1,
             &[
-                LogRecord::Delegate {
-                    dir: ROOT_INO,
-                    node: 4,
-                    gen: ended,
-                    designated: false,
-                },
-                LogRecord::RecallCut {
-                    dir: ROOT_INO,
+                LogRecord::delegate_one(4, ended, ROOT_INO, SubtreeKind::Placed),
+                LogRecord::DelegateNodeEnded {
+                    node: 2,
                     gen: ended,
                     through: 3,
                 },
@@ -299,26 +286,21 @@ fn at(g: u64, i: u64) -> Position {
 fn an_in_process_rebuild_carries_the_ends_its_window_holds() {
     let (keyless, ended, live) = (gen(4, 2), gen(5, 3), gen(6, 1));
     let rebuilt = Meta::open_in_memory().unwrap();
-    let delegate = |g: u64| LogRecord::Delegate {
-        dir: ROOT_INO,
-        node: 4,
-        gen: g,
-        designated: false,
-    };
+    let delegate = |g: u64| LogRecord::delegate_one(4, g, ROOT_INO, SubtreeKind::Placed);
     rebuilt
         .apply_segment(
             1,
             1,
             &[
                 delegate(keyless),
-                LogRecord::RecallCut {
-                    dir: ROOT_INO,
+                LogRecord::DelegateNodeEnded {
+                    node: 2,
                     gen: keyless,
                     through: 0,
                 },
                 delegate(ended),
-                LogRecord::RecallCut {
-                    dir: ROOT_INO,
+                LogRecord::DelegateNodeEnded {
+                    node: 2,
                     gen: ended,
                     through: 3,
                 },
@@ -378,18 +360,13 @@ fn an_in_process_rebuild_carries_the_ends_its_window_holds() {
 }
 
 fn delegate(g: u64) -> LogRecord {
-    LogRecord::Delegate {
-        dir: ROOT_INO,
-        node: 4,
-        gen: g,
-        designated: false,
-    }
+    LogRecord::delegate_one(4, g, ROOT_INO, SubtreeKind::Placed)
 }
 
 /// ADR-43 (review, round 3): the session is seeded after an in-process
 /// rebuild from the side replica's table (the durable log's), not from the
 /// table this store holds once the reset has re-applied its kept committed
-/// entries: a streamed-ahead `RecallCut` among them writes the table row
+/// entries: a streamed-ahead `DelegateNodeEnded` among them writes the table row
 /// without the void (only the durable log voids), so reading the table back
 /// would void that end here and count it as ended before the open, which
 /// the lazy void's restriction keeps out; were the entry to strand, nothing
@@ -423,8 +400,8 @@ fn a_rebuild_does_not_void_an_end_a_kept_streamed_entry_carries() {
             gid: 0,
             time_ns: 10,
         },
-        LogRecord::RecallCut {
-            dir: ROOT_INO,
+        LogRecord::DelegateNodeEnded {
+            node: 2,
             gen: h,
             through: 9,
         },
@@ -476,8 +453,8 @@ fn a_rebuild_takes_the_log_s_cut_over_a_deposed_roots_own() {
         1,
         &[
             delegate(g),
-            LogRecord::RecallCut {
-                dir: ROOT_INO,
+            LogRecord::DelegateNodeEnded {
+                node: 2,
                 gen: g,
                 through: 5,
             },
@@ -498,7 +475,7 @@ fn a_rebuild_takes_the_log_s_cut_over_a_deposed_roots_own() {
 }
 
 /// A store holding the table row of `h` (granted in the log, `h`'s log
-/// index at 7) and an outstanding streamed-ahead `RecallCut { h, 9 }`
+/// index at 7) and an outstanding streamed-ahead `DelegateNodeEnded { h, 9 }`
 /// (`committed`: gated or not), closed: the restart's input.
 fn store_with_a_streamed_ahead_end(path: &std::path::Path, h: u64, committed: bool) {
     let meta = Meta::open(path).unwrap();
@@ -510,8 +487,8 @@ fn store_with_a_streamed_ahead_end(path: &std::path::Path, h: u64, committed: bo
         2,
         1,
         1,
-        &[LogRecord::RecallCut {
-            dir: ROOT_INO,
+        &[LogRecord::DelegateNodeEnded {
+            node: 2,
             gen: h,
             through: 9,
         }],
@@ -529,7 +506,7 @@ fn store_with_a_streamed_ahead_end(path: &std::path::Path, h: u64, committed: bo
 
 /// ADR-43 (the restart path's exposure, PROGRESS round 3's open item): the
 /// open seeds the session from the store's table plus the speculative set, and an
-/// outstanding streamed-ahead `RecallCut` wrote its row without the void
+/// outstanding streamed-ahead `DelegateNodeEnded` wrote its row without the void
 /// (only the durable log voids). The open must not void that end nor count
 /// it as ended before the open.
 #[test]
@@ -603,8 +580,8 @@ fn a_read_does_not_void_an_end_only_a_streamed_entry_carries() {
         2,
         1,
         1,
-        &[LogRecord::RecallCut {
-            dir: ROOT_INO,
+        &[LogRecord::DelegateNodeEnded {
+            node: 2,
             gen: h,
             through: 9,
         }],
@@ -617,7 +594,7 @@ fn a_read_does_not_void_an_end_only_a_streamed_entry_carries() {
 }
 
 /// The `persist_void_cut` crash window (ADR-43 round 4, open item 2): the
-/// segment that carries a `RecallCut` the root's stream installed here first
+/// segment that carries a `DelegateNodeEnded` the root's stream installed here first
 /// confirms that entry and skips its row, so nothing applies the record
 /// again; the cut it carries must be kept in the segment's own transaction.
 /// Written after the commit (the replica's `persist_void_cut`, which a
@@ -639,8 +616,8 @@ fn a_crash_after_a_segment_confirms_a_streamed_end_keeps_the_record_s_cut() {
             1,
             &[1],
             &[(0, 0)],
-            &[LogRecord::RecallCut {
-                dir: ROOT_INO,
+            &[LogRecord::DelegateNodeEnded {
+                node: 2,
                 gen: h,
                 through: 9,
             }],
@@ -689,7 +666,7 @@ fn delegate_create(meta: &Meta, g: u64, rid: Rid, name: &str, ino: u64) {
 /// end applied, so `deleg_gens_awaiting_end` named `g` for good (across
 /// restarts) and `delegation_sync` installed no later grant here; the rows'
 /// effects stayed in this replica, which the log never carries. The abandon
-/// ends `g` as the log's `Recall` would, at what the log holds of it (0): the
+/// ends `g` as the log's `DelegateNodeEnded` would, at what the log holds of it (0): the
 /// rows are rolled back and queued for replay by rid, and the cut is kept.
 #[test]
 fn an_abandon_ends_a_generation_whose_grant_never_reached_the_log() {
@@ -797,7 +774,7 @@ fn an_abandon_leaves_a_generation_the_log_granted_alone() {
 /// The guard for an end only the successor's stream carries so far: the
 /// log granted `g` (epoch 1), this node executed as its delegate, and the
 /// claimant of epoch 2 (which abandoned epoch 1's group) streamed its
-/// `RecallCut` of `g` ahead of its marker. The table no longer lists `g`,
+/// `DelegateNodeEnded` of `g` ahead of its marker. The table no longer lists `g`,
 /// no cut is kept, and the delegate's row is still held, yet the log WILL
 /// carry the end (and, below its cut, rows of `g`): the abandon must leave
 /// `g` alone, or the row would be replayed by rid while the log may carry
@@ -819,8 +796,8 @@ fn an_abandon_leaves_a_generation_a_later_stream_ends_alone() {
         2,
         1,
         1,
-        &[LogRecord::RecallCut {
-            dir: ROOT_INO,
+        &[LogRecord::DelegateNodeEnded {
+            node: 2,
             gen: g,
             through: 1,
         }],
@@ -982,7 +959,7 @@ fn ended_and_replayed(meta: &Meta, g: u64) {
 /// carried. Its own marker never runs through the segment path, so the
 /// abandon's orphan rule did not run on it: its row of `g` stayed in its
 /// journal and was the first row it shipped as root, a row of a generation
-/// with no `Delegate` in the log. The claim's strand ends `g` as every other
+/// with no `DelegateNode` in the log. The claim's strand ends `g` as every other
 /// replica does: the row is rolled back and replayed by rid as a root row.
 #[test]
 fn an_abandoning_claimant_that_was_the_orphan_s_delegate_ships_none_of_its_rows() {
@@ -1101,8 +1078,8 @@ fn a_takeover_without_a_tail_ends_a_streamed_grant_and_end_after_a_restart() {
             1,
             2,
             2,
-            &[LogRecord::RecallCut {
-                dir: ROOT_INO,
+            &[LogRecord::DelegateNodeEnded {
+                node: 2,
                 gen: g,
                 through: 1,
             }],
@@ -1283,7 +1260,7 @@ fn a_claimant_without_a_tail_keeps_its_rows_of_a_listed_generation() {
 /// by rid", but the orphan pass strands them as a recall does, and C2 §3.8
 /// drops a delegate's gated row there (`strand_local_tx`: `recall && gated &&
 /// gen != 0 && epoch == 0`), on the premise that a committed row is at or
-/// below the cut. At an orphan cut of 0 that premise fails: a `DelegGroup`
+/// below the cut. At an orphan cut of 0 that premise fails: a `DelegateNodeGroup`
 /// row may be answered (ADR-41: a lone root's journal counts as the second
 /// copy), and the delegate keeps nothing of it. What rescues it today is the
 /// requester's persisted shadow and the deposed root's queued append, both
@@ -1317,7 +1294,7 @@ fn an_orphan_end_queues_a_delegates_answered_gated_row() {
 
 /// Review of the M0.4 MUST-1 fix: a generation the log granted, which only an
 /// outstanding streamed-ahead end of the deposed tenure unlists here
-/// (`RecallCut` installed without the void), is listed again once the claim's
+/// (`DelegateNodeEnded` installed without the void), is listed again once the claim's
 /// strand takes that speculation out. The claimant's own rows of it ship
 /// under the log's grant, verbatim, as before the fix: the selection of
 /// "unlisted" generations is made against the table after the strand, as the
@@ -1336,8 +1313,8 @@ fn a_claimant_without_a_tail_keeps_its_rows_of_a_generation_only_speculation_end
         2,
         1,
         1,
-        &[LogRecord::RecallCut {
-            dir: ROOT_INO,
+        &[LogRecord::DelegateNodeEnded {
+            node: 2,
             gen: g,
             through: 1,
         }],

@@ -197,7 +197,7 @@ impl LaneCell {
 }
 
 /// The read side of the certificate the lane judges by: the cell, and the
-/// one fact that must be read live (a `Delegate` record flips it inside a
+/// one fact that must be read live (a `DelegateNode` record flips it inside a
 /// step's own store write).
 pub trait LaneFacts {
     fn view(&self) -> LockLaneView;

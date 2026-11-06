@@ -3570,7 +3570,7 @@ impl Driver {
 
     /// Plan 43 C2d: a delegate's fast-path write is over (`idx`: the stream
     /// index it journaled; `None`: refused, nothing journaled). A row whose
-    /// class waits (`DelegGroup`, `Archive`) is answered once its group
+    /// class waits (`DelegateNodeGroup`, `Archive`) is answered once its group
     /// holds it (`poll_fast_waits`), as the engine's thread waits in
     /// `wait_deleg_durable`; `Lone` and `NonStealable` rows at once.
     #[allow(clippy::too_many_arguments)]

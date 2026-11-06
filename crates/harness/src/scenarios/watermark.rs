@@ -6,7 +6,7 @@
 //! nobody reaches: a lock grant carries the lock's floor, the join of
 //! every releaser's frontier since the lock was first taken, and that
 //! floor keeps naming delegation stream generations long after their
-//! `Recall`. A replica that applied the `Recall` while running voids the
+//! `DelegateNodeEnded`. A replica that applied the `DelegateNodeEnded` while running voids the
 //! generation; one that restarted since (the committers, killed and
 //! remounted over and over) has no memory of it, so the grant's position
 //! is never reached and every read on the node waits the whole session

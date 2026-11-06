@@ -164,14 +164,14 @@ pub enum GroupOn {
 /// answer (S7: "gated implies committed at the answer").
 ///
 /// Replaces the five-valued `RowClass` (Lone = `Singleton`, NonStealable =
-/// `Final`, Archive, RootGroup and DelegGroup = `Group`).
+/// `Final`, Archive, RootGroup and DelegateNodeGroup = `Group`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RowCommit {
     /// Committed once the configuration's members hold the row (or the
     /// archive, none listed): the answer waited for it.
     Group {
         /// The configuration's version: the lease's `config_version`, or
-        /// the generation's `DelegGroup` version.
+        /// the generation's `DelegateNodeGroup` version.
         config_version: u64,
         on: GroupOn,
     },
@@ -685,7 +685,7 @@ impl Meta {
         // row is stamped now, under the writer lock, with the rule the core
         // has published for the generation, if the version of the
         // configuration that rule was decided under is the one this store
-        // records now (the latest `DelegGroup` record applied), and a
+        // records now (the latest `DelegateNodeGroup` record applied), and a
         // `Singleton` rule follows no open gated row of this node's own.
         // The row is not classed again by its place in the stream: a
         // changed version (a record applied since the publication), an open
@@ -777,7 +777,7 @@ impl Meta {
         // Plan 43 C1-2: the row's class, decided at the journaling. The
         // core says it (`journal::PendingClass`) around every call of its
         // own; a transaction under a delegation origin is `Lone` at C1 (C2
-        // makes the delegate's `DelegGroup`, C3 moves the root's appended
+        // makes the delegate's `DelegateNodeGroup`, C3 moves the root's appended
         // rows); the FUSE fast path's threads publish nothing of their own
         // and take the class the core last published with the gate, which
         // is what their wait follows.
@@ -799,7 +799,7 @@ impl Meta {
             }
         };
         // Plan 46 M1.1 step 4 (review): the root's append of a delegate's
-        // stream row is stamped with the generation's `DelegGroup` version
+        // stream row is stamped with the generation's `DelegateNodeGroup` version
         // as this transaction reads it.
         let class = match (class, gen != 0 && journal::PendingClass::stream_version()) {
             (RowCommit::Singleton { .. }, true) => RowCommit::Singleton {
@@ -1246,9 +1246,10 @@ impl Meta {
             .unwrap_or(0))
     }
 
-    /// Plan 43 C2: the cut the log's `RecallCut` record of generation `gen`
+    /// Plan 43 C2: the cut the log's `DelegateNodeEnded` record of generation `gen`
     /// carried, as this replica applied it from the log: `None` for a
-    /// generation not ended by one (live, or ended by an older `Recall`).
+    /// generation not ended by one (live, or ended as an orphan: never granted
+    /// in the log).
     pub fn void_cut(&self, gen: u64) -> Result<Option<u64>, MetaError> {
         let r = self.db.read_tx();
         Ok(kv_get_tx(&r, &self.local, &deleg_void_cut_key(gen))?
@@ -1281,7 +1282,7 @@ impl Meta {
 
     /// L1: the `(epoch, idx)` of generation `gen`'s newest own row whose root
     /// append the pre-S3 stream delivered here ([`deleg_streamed_key`]);
-    /// `None` when there is none, or after the log's `Recall`/`RecallCut`
+    /// `None` when there is none, or after the log's `DelegateNodeEnded`
     /// of the generation (never after a streamed one).
     pub fn deleg_streamed(&self, gen: u64) -> Result<Option<(u64, u64)>, MetaError> {
         let r = self.db.read_tx();
@@ -1292,7 +1293,7 @@ impl Meta {
     /// journal still holds (a delegation origin, unshipped) and whose end
     /// this replica has not applied from the log ([`Meta::void_cut`]: no
     /// cut persisted). A delegate can learn such an end ahead of the log
-    /// (the root's stream installs its `RecallCut` speculatively); its rows
+    /// (the root's stream installs its `DelegateNodeEnded` speculatively); its rows
     /// past the cut leave the journal only when the record's segment is
     /// applied (the strand), and until then they are in this replica's
     /// state.
@@ -1346,7 +1347,7 @@ impl Meta {
     ) -> Result<bool, MetaError> {
         // Plan 46 M1.1 step 4: the root's append of a delegate's row is
         // stamped with the configuration of the generation in force where
-        // it is journaled: the `DelegGroup` version this replica has applied
+        // it is journaled: the `DelegateNodeGroup` version this replica has applied
         // (the same `Singleton` tag as before: the replay and member-copy
         // rules read it, M2.1), not a version-0 placeholder.
         let _class = journal::PendingClass::current()
@@ -1913,9 +1914,10 @@ impl Meta {
             .any(|r| {
                 matches!(
                     r,
-                    LogRecord::Delegate { .. }
-                        | LogRecord::Recall { .. }
-                        | LogRecord::RecallCut { .. }
+                    LogRecord::DelegateNode { .. }
+                        | LogRecord::SubtreeReleased { .. }
+                        | LogRecord::StreamReleased { .. }
+                        | LogRecord::DelegateNodeEnded { .. }
                 )
             })
             .then(|| self.deleg_gate.write().unwrap_or_else(|e| e.into_inner()));
@@ -3039,7 +3041,7 @@ mod root_substitution_tests {
     /// Plan 46 M1.1 step 4 (fail-before: the row is stamped with the
     /// published version whatever the store records): the delegate fast path
     /// stamps the rule the core published, and only while the version it names
-    /// is the one the store records under the writer lock. A `DelegGroup`
+    /// is the one the store records under the writer lock. A `DelegateNodeGroup`
     /// record applied between the publication and the journal refuses the op
     /// unwritten (the core stamps it), and the row is journaled once the core
     /// publishes the new version.
@@ -3090,10 +3092,10 @@ mod root_substitution_tests {
             take_last_journaled().unwrap().class,
             RowCommit::group(0, GroupOn::Delegate)
         );
-        // The store applies a `DelegGroup` record (version 1): the published
+        // The store applies a `DelegateNodeGroup` record (version 1): the published
         // rule is of version 0, and the op is refused unwritten.
-        meta.apply_records(&[LogRecord::DelegGroup {
-            dir: ROOT_INO,
+        meta.apply_records(&[LogRecord::DelegateNodeGroup {
+            node: 1,
             gen: 5,
             version: 1,
             backups: vec![2],
@@ -3111,7 +3113,7 @@ mod root_substitution_tests {
     }
 
     /// The simulation's row-version oracle (fail-before: `None` for a row
-    /// journaled before the generation's first `DelegGroup` record, which the
+    /// journaled before the generation's first `DelegateNodeGroup` record, which the
     /// oracle then judged against the version applied by the end of the
     /// event, `long-delegated-backup` seed 1938 under slow lease reads): the
     /// version in force at a row's journal position is 0 ("no group") until
@@ -3160,8 +3162,8 @@ mod root_substitution_tests {
         };
         let before = fast(0);
         assert_eq!(meta.deleg_group_at(5, before), None, "nothing recorded");
-        meta.apply_records(&[LogRecord::DelegGroup {
-            dir: ROOT_INO,
+        meta.apply_records(&[LogRecord::DelegateNodeGroup {
+            node: 1,
             gen: 5,
             version: 1,
             backups: vec![2],
@@ -3610,13 +3612,13 @@ pub(crate) fn deleg_log_idx_key(gen: u64) -> String {
     format!("{DELEG_LOG_IDX_PREFIX}{gen}")
 }
 
-/// `local` kv: the cut of generation `gen` the log's `RecallCut` record
+/// `local` kv: the cut of generation `gen` the log's `DelegateNodeEnded` record
 /// carried (plan 43 C2): the highest stream index its root appended before
 /// the generation ended. Raise-only, except that it goes when the journal
 /// row of the record that set it is stranded unshipped
-/// ([`retract_void_cut_tx`]). Absent for a generation ended by a
-/// `Recall` (a log written before the cut was in the record): the cut is
-/// then what the replica holds of it from the log (`deleg_log_idx_key`).
+/// ([`retract_void_cut_tx`]). Absent for a generation not ended by one: the
+/// cut of an orphan end is what the replica holds of it from the log
+/// (`deleg_log_idx_key`).
 pub(crate) fn deleg_void_cut_key(gen: u64) -> String {
     format!("{DELEG_VOID_CUT_PREFIX}{gen}")
 }
@@ -3818,8 +3820,7 @@ pub(crate) fn bump_void_cut_tx(
     Ok(())
 }
 
-/// A `Recall { gen }` of an older log (no cut in the record) applied from
-/// the log: the cut kept is what the log holds of the generation, as the
+/// A generation ended as an orphan (no cut in any record): the cut kept is what the log holds of the generation, as the
 /// session voids it (`Replica::apply_segment`), so a restart, and a
 /// delegate's install that waits for the end of its old generation
 /// ([`Meta::deleg_gens_awaiting_end`]), find the end applied. Returns that
@@ -3879,7 +3880,7 @@ pub(crate) fn deleg_gens_awaiting_end_tx(
     Ok(out)
 }
 
-/// Forget the persisted cut of `gen` set by a `RecallCut { through }` that
+/// Forget the persisted cut of `gen` set by a `DelegateNodeEnded { through }` that
 /// this node journaled and is now stranded unshipped, so the log never
 /// carries it (`spec::strand_local_tx`). The cut is removed only while it
 /// is that record's: a cut that the log's own record raised is left alone.
@@ -4250,9 +4251,10 @@ mod origin_index_tests {
                         seg * 1000,
                         &[seg * 1000],
                         &[(0, 0)],
-                        &[LogRecord::Recall {
-                            dir: d2 | 1,
+                        &[LogRecord::DelegateNodeEnded {
+                            node: 0,
                             gen: own_b,
+                            through: meta.delegate_idx(own_b).unwrap_or(0),
                         }],
                         &TouchSet::default(),
                     )

@@ -430,7 +430,7 @@ fn journal_carries_outcome(replica: &dyn Replica, rid: Rid) -> bool {
 
 /// The rows of `streams` whose generation is live in the delegation table
 /// this replica holds from the log. A generation the table does not list
-/// has ended (its `Recall` is applied: its rows are in the log below the
+/// has ended (its `DelegateNodeEnded` is applied: its rows are in the log below the
 /// cut, or lost with it) or was never in the log (a deposed root's
 /// delegation that did not ship): the rows named in it can only be met or
 /// are never coming, so nobody waits for them.
@@ -962,9 +962,9 @@ impl Core {
         // generation are replaced by the fresh session. Which generation
         // ended is the log's word, not this replica's own memory of it:
         // a deposed root's session still holds the cut at which it ended
-        // the generation itself (`end_generation`, a `Recall` that was
+        // the generation itself (`end_generation`, a `DelegateNodeEnded` that was
         // journaled and never shipped), above the one the successor's
-        // `Recall` made of it in the log, and its `deps_lost` calls the
+        // `DelegateNodeEnded` made of it in the log, and its `deps_lost` calls the
         // rows between them present while the executor refuses them as
         // lost (long-delegated-backup seed 3585: `Held`, re-sent, forever).
         let mut owed = None;
@@ -1362,7 +1362,7 @@ impl Core {
                     && replica
                         .delegation_table()
                         .iter()
-                        .any(|d| d.gen == gen && d.designated)))
+                        .any(|d| d.gen == gen && d.designated())))
     }
 
     fn note_ungated_shadow(

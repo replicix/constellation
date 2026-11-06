@@ -348,7 +348,7 @@ impl Core {
         }
         for (node, (dir, total)) in chosen {
             if table.covering(ns, dir).is_some()
-                || table.iter().any(|d| d.node == node && !d.designated)
+                || table.iter().any(|d| d.node == node && !d.designated())
             {
                 continue;
             }
