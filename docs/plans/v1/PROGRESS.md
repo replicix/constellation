@@ -67200,3 +67200,41 @@ check, no in-flight PUTs; the same variant as `expiry_based_check_is_clean_under
 two-member epoch, two ops answered on the owner's disk). Existing flex tests are unchanged in outcome (the new machinery runs only when `check_hold_answers` is on, so their state counts are unchanged; 29 passed, 43 s).
 Scope: the owner keeps its disk across a crash in this model, so the property is the definitional one at the answer; the loss it guards against
 (the owner's death with the unreplicated epoch journal) is the sim's `epoch-member-dies-with-chunk` and `flex-crash` (M1.4).
+
+## Plan 41 closed: lock renewals through local disk stalls (2026-11-06)
+
+Every exit criterion of plan 41 §12 is ticked, each with an evidence pointer in the plan; the plan moves to `done/`.
+L5 and L6 are plan 46 stage 3's (D-8); seed 300 of `delegated-core-stall-root-backup` is a known gap (D-7, follow-up
+"proof from backup beats"). The audit found one small gap, filled: `CONSTELLATION_FAULT_STORE_STALL_FILE` (with
+the `core`/`core-only` keywords, the lane's fault point) had no row in `configuration.md`'s test-only table.
+
+| Item | State | Where |
+|---|---|---|
+| L0, renewal freshness on fast tenures | verified | `9d00417b`, "Fix: a fast-tenure root renewed lock grants ... (plan 41 L0)" |
+| L1, lock tables safe for two writers | done | `4a19afef`, "Plan 41 L1" (the audit covers 116 sites, not 79) |
+| Model | done | `0446e927`; the lane tests rerun in release with the ignored ones, 6 of 6 |
+| L2 to L4, the lane | done | `0446e927`, `f852b5cd`, the review commits; "Plan 41 L2, L3, L4, L7, L8", "Plan 41 review" |
+| Max-stall bound, fail-before | checked at closure | with the bound removed from `lane.rs`, `remote_renewals_stop_once_the_driver_is_hung_and_own_ones_do_not` fails |
+| D3, the root's proof off the core | done | "Plan 41 D3" and its review follow-ups |
+| L7, docs | done | `4927ff63`, `92515938`, `0c94d40e`, and the configuration row above |
+| L8, §9 and xcheckfs | done | `bench/lock-lane/RESULTS.md`, "Plan 41 acceptance runs", "Plan 41 item 7: the lane at 10,000 grants", "Plan 41 item 7, last open item" |
+| L5, L6, §9 items 3, 4 and 8 | moved | plan 46 stage 3 (D-8) |
+
+Accepted with the closure, recorded in §12: item 7's numbers are met (no wake-up with nothing held, 0.09 to 0.14 % of a
+core with 10,000 grants) but a wake-up still walks the held grants once, not O(due grants); the finding-08 18 s stall
+did not recur on the xcheckfs host, so the cells show no lock-lapse finding without reproducing it; the certificate is
+a `LaneCell`, not `LeaseView` atomics; `lock-store-stall-backup` was not written (the sim's `locks-core-stall-backup*`
+carry that safety); the lane-off baselines were recorded with L8 against the pre-lane base, not before L3.
+
+Gates (2026-11-05/06, the spare box, Linux 7.3, state on btrfs, `main` at `459c831d` plus the configuration row,
+release, debuginfo off): `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets -- -D warnings`
+clean; meta lib 397, engine lib 951, authority lib 1,045 passed; the model's lane tests 6 of 6 (with the ignored ones);
+the release sim suite 407 passed, 0 failed, 12 ignored (4.5 h on a loaded box); pjdfstest 8798/8798 on `/dev/fuse`;
+the harness lock scenarios `lock-lapse-lone-node`, `lock-stall-lone-node`, `lock-store-stall-past-lease`,
+`lock-store-stall-holder`, `lock-failover`, `lock-holder-killed-contention`, `lock-fence-at-close`,
+`lock-release-at-close`, `flock-cross-node`, `lock-holder-partitioned`: three rounds, 30 of 30 passed;
+`long_locks` at 1,000 seeds: clean twice (34 configurations, 29 min each). A first attempt, run with its output captured right
+after the sim suite, had not finished at its 3 h bound and printed nothing to tell which configuration it was in; the two
+runs after it, with `--nocapture`, finished in 29 min. A hang of the sim is a bug: open, to be reproduced with per-configuration
+output (not attributed to plan 41).
+

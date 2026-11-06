@@ -1444,25 +1444,30 @@ durability regression. Vendored fjall change number 10 stays unused.
 
 ## 12. Exit criteria
 
-- [ ] L0 (landed separately) verified present: the renewal-only model
+- [x] L0 (landed separately) verified present: the renewal-only model
       knob with the own-grant counterexample and the clean BFS run, the
       `cached_owner` variant or its PROGRESS note, one freshness
       predicate for new grants, lock renewals and `on_deleg_renew`, the
       core unit tests, the docs; anything missing completed.
-- [ ] L1: atomic primitives, every core window decision one critical
+      *Evidence:* `9d00417b`; PROGRESS "Fix: a fast-tenure root renewed lock grants and delegations without fresh S3 liveness (plan 41 L0)" (knob `renew_probe_freshness` and `cached_owner` with their violation tests, the clean 7/3 and 7/5 runs, `liveness_fresh`, the core tests, cluster-locks and ADR-25).
+- [x] L1: atomic primitives, every core window decision one critical
       section (79-site audit list with the stale-`now` check in
       PROGRESS), no store access or logging under the tables' mutex
       (`take_where` at `:3944`/`:4481`, `check_tag`; debug guard on),
       the fail-before race and mutex-latency tests.
-- [ ] Model: the lane clean with stalls; each of the four non-vacuity
+      *Evidence:* `4a19afef`; PROGRESS "Plan 41 L1" (the audit grew to 116 sites, each with a verdict, and the stale-`now` check; `take_where_outside`, logging after the guard, the debug guard; fail-before `an_extension_landing_before_the_expiry_decision_is_not_outwaited`, `a_window_renewed_after_the_lapse_look_is_not_dropped`, `a_store_read_in_a_delegation_move_does_not_hold_the_tables`).
+- [x] Model: the lane clean with stalls; each of the four non-vacuity
       knobs violates.
-- [ ] L2: `lane.rs`, `lock_lane_view` and the extended `LeaseView`
+      *Evidence:* `0446e927`; `crates/model/tests/locks.rs` "plan 41 L2": three `design_a_lane_*` runs clean; `lane_ignores_freshness` and `lane_ignores_cap` violate alone, `lane_keeps_cert_after_release` with `lane_extends_expired_records` only together (the model's atomic `Release`; the code's gap pinned by `each_excluded_state_withdraws_the_certificate_in_its_own_step`), PROGRESS "Plan 41 L2, L3, L4, L7, L8", deviations. Rerun in release (with the ignored ones) at closure.
+- [x] L2: `lane.rs`, `lock_lane_view` and the extended `LeaseView`
       published in `refresh()`, the `Lane*` events, the sim with
       `StallCore` and holder beats; §8.1 configs clean, the lane-off
       fail-before showing fenced I/O.
-- [ ] L3–L4: engine lane (own grants, held grants), the fault point,
+      *Evidence:* `0446e927`, review `33ccde81`, `85a239ff`, `1150ab01`, `261ea495`; PROGRESS "Plan 41 L2, L3, L4, L7, L8" and "Plan 41 review" (the certificate is a `LaneCell`, not `LeaseView` atomics: a recorded deviation; `LaneOwn`/`LaneRenewed`; `locks-core-stall*` clean; `locks_survive_core_stalls` with the unlaned configuration fencing I/O).
+- [x] L3–L4: engine lane (own grants, held grants), the fault point,
       the max-stall bound, each with its fail-before test; the lane-off
       baselines recorded before L3.
+      *Evidence:* `f852b5cd` (engine lane on its own thread, fault keywords `core`/`core-only`, `lock-stall-lone-node` with its lane-off arm); the max-stall bound `remote_renewals_stop_once_the_driver_is_hung_and_own_ones_do_not` (fails with the bound removed, checked at closure) and §9 item 2's 30 s bound cell; lane-off baselines in `bench/lock-lane/RESULTS.md` (lane-off tables and "The branch against main", recorded with L8 against the pre-lane base rather than before L3).
 - [ ] L5/L6 only if chosen (§11): peers' answers with the in-`lock_answer`
       held set and the opt-in lead; the probe at ≤ 1 per round.
       **Moved to plan 46 stage 3 (D-8, 2026-11-05).** Item 4 of §9 has no
@@ -1478,14 +1483,17 @@ durability regression. Vendored fjall change number 10 stays unused.
       with the lease-reads knob; it fails on main too: the lease `GET` is slower
       than the takeover window) is accepted as a known gap for this plan's
       closure; follow-up: "proof from backup beats".
-- [ ] L7: status/metrics/schema, configuration, cluster-locks,
+- [x] L7: status/metrics/schema, configuration, cluster-locks,
       durability-and-failover, host guidance, TESTING docs, ADR-25
       amended, the proposed DESIGN text recorded.
-- [ ] L8: harness scenarios 3× green (`lock-lapse-lone-node`
+      *Evidence:* `4927ff63`, `92515938` (DESIGN.md edited with the ADR link, rule 5), `0c94d40e`: `LockStatus.lane`, `configuration.md` (the fault point's row added at closure), `cluster-locks.md` "Renewals off the core" and troubleshooting (host guidance `lazytime`/`noatime`), `TESTING.md`, ADR-25 amended; durability-and-failover is L6's only.
+- [x] L8: harness scenarios 3× green (`lock-lapse-lone-node`
       included), `long_locks` at 1,000 seeds clean, §9 acceptance met on
       every host file system, the real-device reproduction clean,
       xcheckfs runs with no lock-lapse findings.
-- [ ] Every CONVENTIONS gate green; pjdfstest 8798/8798.
+      *Evidence:* closure run 2026-11-05/06 on `main` at `459c831d` (PROGRESS "Plan 41 closed"): ten lock scenarios (`lock-lapse-lone-node`, `lock-stall-lone-node`, `lock-store-stall-past-lease`, `lock-store-stall-holder`, `lock-failover`, `lock-holder-killed-contention`, `lock-fence-at-close`, `lock-release-at-close`, `flock-cross-node`, `lock-holder-partitioned`) 3 × 30 of 30 passed; `long_locks` at 1,000 seeds clean twice (34 configurations, 29 min each; a first attempt with captured output did not finish within 3 h, open in PROGRESS). §9 in `bench/lock-lane/RESULTS.md`: items 1 and 2 and the real-device reproduction ("Plan 41 section 9 acceptance", `64409f78`), item 5 ("No regression on normal workloads", both item-7 sections), items 6 and 7 ("Plan 41 item 7: the lane's fixes, before and after", `5c579ad3`, `31271763`; the close cell `154788ae`, "Plan 41 item 7, last open item"); items 3 and 8 are L5's and item 4 L6's (D-8); the xcheckfs cells (`40d05593`, "xcheckfs cells"): no lock-lapse finding. Accepted with the closure: item 7's CPU and wake-up numbers are met but a wake-up walks the held grants once (not O(due)); the finding-08 18 s stall did not recur on the xcheckfs host; `lock-store-stall-backup` was not written (its safety is the sim's `locks-core-stall-backup*`).
+- [x] Every CONVENTIONS gate green; pjdfstest 8798/8798.
+      *Evidence:* closure run on `459c831d` (PROGRESS "Plan 41 closed"): fmt and clippy `--workspace --all-targets -D warnings` clean; meta lib 397, engine lib 951, authority lib 1,045 passed (release); the model's lane tests with the ignored ones 6 of 6; release sim suite 407 passed, 0 failed, 12 ignored; pjdfstest 8798/8798 (`/dev/fuse`).
 
 ## 13. PROGRESS.md
 
