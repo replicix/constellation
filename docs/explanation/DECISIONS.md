@@ -1841,26 +1841,35 @@ of one op, queued at once on two nodes).
 
 
 **Plan 46 M1.1 step 4 (2026-11-05): the fast path carries the version, the
-store no longer classes a row again.** A delegate's fast path publishes
-`(rule, version, through)` and the horizon is gone: under the writer lock the
+store no longer classes a row again by its place.** A delegate's fast path
+publishes `(rule, version, through, horizon)`: under the writer lock the
 store stamps the published rule only while the version it names is the one the
-store records (the latest `DelegGroup` record applied), and while no gated row
-of the node's own that the published prefix does not cover stands before a
-`Singleton` row (the hysteresis, across the node's generations). Anything else
-refuses the op unwritten, and the core, which reads the configuration when it
-stamps the row, decides it. A change of configuration between the publication
-and the journal therefore reaches the core instead of being stamped with the
-version of a rule that is no longer in force. The core's own op is stamped as
-it decided (no `OwnLimits`, no second class by the row's place): it publishes
-the rule it is about to stamp before it journals, so the fast path's rows that
-go in while it waits for the writer lock carry the same rule. The lead is
-the core's decision at publication, no longer a bound enforced under the lock
-(the fast path can pass it by the rows journaled between two core steps; step
-6 makes it the admission back-pressure on own ops and the lone delegate a
-recorded configuration). The rows a takeover re-journals (the predecessor's
-tail, the delegate's own rows) and the rows the root appends of a delegate's
-stream carry the configuration in force in the journal they are rows of, never
-a version-0 placeholder.
+store records (the latest `DelegGroup` record applied), and, for a `Singleton`
+rule, only while no gated row of the node's own that the published prefix does
+not cover stands before it (the hysteresis, across the node's generations) and
+the row's index is within the published horizon (the committed prefix plus the
+lead: a lone delegate's own load stays bounded by what its stream carries until
+step 6 takes the lead out of the commit). Anything else refuses the op
+unwritten, and the core, which reads the configuration when it stamps the
+row, decides it. A change of configuration between the publication and the
+journal therefore reaches the core instead of being stamped with the version
+of a rule that is no longer in force. The core's own op is stamped as it
+decided, with one exception: it decides from the journal as it stood and
+journals once it holds the writer lock, and the fast path's rows go in
+meanwhile, so a `Singleton` row of the node's own clients that would land
+behind an open gated row of the node's own is stamped `Group` at the same
+version by the store, and the core reads the stamp back and waits for the
+group (a `Singleton` row journaled behind a gated row is replayed without it
+at a root's crash, after its client was answered). The core publishes the rule
+it is about to stamp before it journals, so the fast path's rows that go in
+while it waits carry the rule it decided and not a previous step's. The rows
+a takeover re-journals (the predecessor's tail, the delegate's own rows)
+carry the lease version of the successor, the configuration of the journal
+they are rows of and not the commit configuration of the group that
+committed them (step 5 must not read them as such), and the rows the root
+appends of a delegate's stream carry the generation's applied `DelegGroup`
+version (read in the journaling transaction, `Singleton` tag), never a
+version-0 placeholder.
 
 ## ADR-34: Kernel FUSE race workarounds
 

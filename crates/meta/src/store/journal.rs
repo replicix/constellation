@@ -97,13 +97,19 @@ impl Drop for PendingLocalOpGuard {
     }
 }
 
+/// `PENDING_OWN`: an own client's row whose gated rows are marked, and which
+/// (`OWN_HYSTERESIS`) also waits behind an open gated row when `Singleton`.
+const OWN_MARKS_ONLY: u8 = 1;
+const OWN_HYSTERESIS: u8 = 2;
+
 thread_local! {
     static PENDING_CLASS: std::cell::Cell<Option<crate::store::local::RowCommit>> =
         const { std::cell::Cell::new(None) };
     static LAST_JOURNALED: std::cell::Cell<Option<JournaledRow>> =
         const { std::cell::Cell::new(None) };
     static FROM_SESSION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static PENDING_OWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PENDING_OWN: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static PENDING_STREAM_VERSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// How many rows this thread journaled with the session's published class
@@ -132,8 +138,25 @@ impl PendingClass {
     pub fn set(class: crate::store::local::RowCommit) -> PendingClassGuard {
         PendingClassGuard {
             prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
-            prev_own: PENDING_OWN.with(|c| c.replace(false)),
+            prev_own: PENDING_OWN.with(|c| c.replace(0)),
+            prev_stream: PENDING_STREAM_VERSION.with(|c| c.replace(false)),
         }
+    }
+
+    /// [`Self::set`] for the root's append of a delegate's stream row: a
+    /// `Singleton` class whose configuration version is the generation's
+    /// applied `DelegGroup` version, read by `Meta::finish_local` in the
+    /// transaction that journals the row.
+    pub(crate) fn set_stream_version(class: crate::store::local::RowCommit) -> PendingClassGuard {
+        PendingClassGuard {
+            prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
+            prev_own: PENDING_OWN.with(|c| c.replace(0)),
+            prev_stream: PENDING_STREAM_VERSION.with(|c| c.replace(true)),
+        }
+    }
+
+    pub(crate) fn stream_version() -> bool {
+        PENDING_STREAM_VERSION.with(|c| c.get())
     }
 
     /// [`Self::set`] for a row of a delegate's own node's client, executed
@@ -146,7 +169,21 @@ impl PendingClass {
     pub fn set_for_own_client(class: crate::store::local::RowCommit) -> PendingClassGuard {
         PendingClassGuard {
             prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
-            prev_own: PENDING_OWN.with(|c| c.replace(true)),
+            prev_own: PENDING_OWN.with(|c| c.replace(OWN_HYSTERESIS)),
+            prev_stream: PENDING_STREAM_VERSION.with(|c| c.replace(false)),
+        }
+    }
+
+    /// [`Self::set_for_own_client`] for the simulation's negative control
+    /// (`Config::delegation_lone_hysteresis` off): the row is marked when
+    /// gated, but a `Singleton` stamp is kept behind an open gated row.
+    pub fn set_for_own_client_without_hysteresis(
+        class: crate::store::local::RowCommit,
+    ) -> PendingClassGuard {
+        PendingClassGuard {
+            prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
+            prev_own: PENDING_OWN.with(|c| c.replace(OWN_MARKS_ONLY)),
+            prev_stream: PENDING_STREAM_VERSION.with(|c| c.replace(false)),
         }
     }
 
@@ -156,13 +193,22 @@ impl PendingClass {
 
     /// Set for a row of the delegate's own node's client.
     pub(crate) fn own() -> bool {
-        PENDING_OWN.with(|c| c.get())
+        PENDING_OWN.with(|c| c.get()) != 0
+    }
+
+    /// Set for a row of the delegate's own node's client, which a `Singleton`
+    /// stamp follows no open gated row of the node's own
+    /// ([`Self::set_for_own_client`]): not with
+    /// [`Self::set_for_own_client_without_hysteresis`].
+    pub(crate) fn follows_open_gated_rows() -> bool {
+        PENDING_OWN.with(|c| c.get()) == OWN_HYSTERESIS
     }
 }
 
 pub struct PendingClassGuard {
     prev: Option<crate::store::local::RowCommit>,
-    prev_own: bool,
+    prev_own: u8,
+    prev_stream: bool,
 }
 
 thread_local! {
@@ -207,6 +253,7 @@ impl Drop for PendingClassGuard {
     fn drop(&mut self) {
         PENDING_CLASS.with(|c| c.set(self.prev));
         PENDING_OWN.with(|c| c.set(self.prev_own));
+        PENDING_STREAM_VERSION.with(|c| c.set(self.prev_stream));
     }
 }
 

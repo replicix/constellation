@@ -5627,6 +5627,13 @@ impl Core {
         // predecessor's own version per row is not recorded on a backup:
         // `BackupTx` carries none, and the member copy keeps one version for
         // the whole tail.) Not the version-0 placeholder.
+        //
+        // NOT the commit configuration of these rows (plan 46 M1.1 step 5):
+        // the version stamped here is the successor's lease version, the
+        // configuration of the journal the rows sit in, while the group that
+        // committed each row is the predecessor's, at a version this stamp
+        // does not name. The old ∪ new reconfiguration rule and the replay
+        // must not read these versions as the rows' commit configurations.
         let _class = constellation_meta::PendingClass::set(constellation_meta::RowCommit::group(
             self.root_config_version(),
             GroupOn::Root,

@@ -739,6 +739,13 @@ pub struct Meta {
     /// generation was journaled under: [`Meta::deleg_group_top`]).
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) deleg_group_top: std::sync::Mutex<std::collections::BTreeMap<u64, u64>>,
+    /// Simulation oracle: each `DelegGroup` version this replica applied per
+    /// generation with the journal's next seq at that moment (a row whose
+    /// first seq is at or past it was journaled under the version or a later
+    /// one: [`Meta::deleg_group_at`]).
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) deleg_group_history:
+        std::sync::Mutex<std::collections::BTreeMap<u64, Vec<(u64, u64)>>>,
     /// Plan 30 §M14: lock grants (sequencer side), grants held and local
     /// locks (node side) (`crate::locks`).
     pub(crate) locks: crate::locks::LockTables,
@@ -1278,6 +1285,8 @@ impl Meta {
             horizon_write_hook: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "test-util"))]
             deleg_group_top: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            #[cfg(any(test, feature = "test-util"))]
+            deleg_group_history: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             locks: crate::locks::LockTables::default(),
             foreign_apply_hook: std::sync::OnceLock::new(),
             rollback_hook: std::sync::OnceLock::new(),

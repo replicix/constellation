@@ -67128,3 +67128,58 @@ of 50 runs moves 10 % either way; no direction survives, and `write` (4 KiB and 
 variant): holder and forwarded ops p50 B / A 0.93 to 1.08 on all four, p90 0.81 to 1.16, no direction. Neither topology runs the delegate fast path or
 `finish_local`'s delegated branch, which is all this step changes. `vfs-bench` (three runs each, A B B A A B): dispatch overhead 60 to 130 ns in both
 (`mock` and `view` lookup), allocations per op identical; the target (under 1 us) holds.
+
+### Plan 46 M1.1 step 4, review fix round (2026-11-06)
+
+1. **I2: the core's own `Singleton` row behind an open gated row.** The core decides an own op's rule from the journal as it stood, then
+   waits for the writer lock; the fast path's rows (a gated one, under a group rule published before the core's) go in meanwhile, and step
+   4 no longer checked a core-path row: the `Singleton` row k+1 landed behind the uncommitted gated row k, answered at once, and a root's
+   crash dropped k and replayed k+1 without it. Under the writer lock `Meta::finish_local` now stamps a core-path own `Singleton` row
+   `Group` (same version, `RowCommit::demoted`) when a gated row of the node's own is open (this generation: its mark above the published
+   prefix and the row still in the journal; another generation: `gated_open_elsewhere_tx`), and the core reads the stamp back
+   (`take_last_journaled`) and waits for the group like a row it decided gated. The simulation's negative control
+   (`delegation_lone_hysteresis` off) keeps the old behaviour (`PendingClass::set_for_own_client_without_hysteresis`: marks, no demotion).
+   Fail-before (1e5744d8 plus the new tests only, box 1): meta `an_own_singleton_row_behind_an_open_gated_row_is_stamped_as_a_group_row`
+   and `..._of_another_generation_waits_too` fail (row 3 stamped `Singleton`, expected `Group`), core
+   `a_core_path_singleton_row_does_not_land_behind_an_open_gated_fast_path_row` fails (the rename journaled `Singleton` at idx 3). The existing
+   guard `a_delegates_lone_row_follows_only_a_committed_gated_row` stays green.
+2. **Load robustness: the lead is enforced under the lock again** until row 6 lands. `DelegDurable` carries `horizon` (the committed prefix plus
+   the lead, `Core::deleg_lone_horizon`) and `deleg_commit_at_journal` refuses a fast-path `Singleton` stamp whose index is past it
+   (`NotAdmitted`, the core decides it and makes it wait for the group): own-load backlog is bounded by the lead again, not by fast-path rate
+   times the core's step interval. Fail-before: meta `the_fast_path_refuses_a_singleton_row_past_the_published_horizon` (row 3 past horizon 2 was
+   stamped on 1e5744d8). The core-path test `a_core_path_rows_rule_is_the_one_the_fast_path_rows_around_it_carry` now runs with a lead of three,
+   so that `x` and `f` are within the horizon.
+3. **Adopted-tail rows carry the journal's configuration, not their commit configuration.** Comments at `apply_backup_tail` (`backup.rs`) and
+   the gate's re-append (`jobs.rs`), the ADR amendment and the plan's step 5 notes (`46-committed-or-final.md`, after the M1.1 row): old ∪ new
+   and the replay must not read the successor's lease version on those rows as the version that committed them.
+4. **Oracle by journal position.** `row_version_matches_config` judges a delegate's `Group` row against the `DelegGroup` version the
+   journaling replica had applied when the row was journaled (`Meta::deleg_group_at`, test-util: each applied version with the journal's next
+   seq, recorded by `apply_group_tx`), exactly: a stamp one record behind is caught even when the record was applied in the same event (unit
+   test `a_stale_but_existing_version_is_caught`, extended). The lease's version is still judged per event (now or at the previous event): the
+   core's lease changes inside an event have no position. Without a recorded history (a replica rebuilt from the log) the old rule applies.
+   With the knob off, 0 mismatches on every swept configuration (below): no oracle error and no product bug found.
+5. **Who applies `DelegGroup` records:** the core thread (`jobs.rs:834` segments, `delegate.rs:5372` the root's own record, `apply_backup_tail`
+   through the replica); the fast path never. The exception is bootstrap and rebuild (`shipper.rs:140`, `rebuild_replica`,
+   `Meta::replace_ns_from_rebuilt`), from the driver, not the core: the core reads the version when it stamps and the fast path compares it
+   under the lock, so a swap is caught the same way (notes in /tmp/m11s4f-notes.md).
+6. `Meta::apply_delegate_tx` no longer reads the generation's `DelegGroup` version in a read transaction of its own: `PendingClass::
+   set_stream_version` makes `finish_local` read it in the journaling transaction. The ADR amendment (DECISIONS.md) is rewritten to match
+   what is stamped (the generation's applied version, `Singleton` tag; the lead under the lock; the core's demotion) and the "same rule while
+   the core waits" sentence is corrected: the published rule is what the fast path's rows carry, and the core's `Singleton` row follows no open
+   gated row.
+
+**Gates** (box 1): fmt, clippy `-D warnings` (meta, authority, engine, all targets), meta 406, authority lib 1,049, engine lib 951, release sim
+suite 410 passed, 0 failed, 12 ignored. **Sweeps** (`+commit`, seeds 0..1,999, release): `long-delegated`, `-backup`, `-late-answers`, `-lead`,
+`delegated-group-switch`, `placement-hot` 0 failing, row-version mismatches 0 (rows judged 290,299 / 298,999 / 247,665 / 288,804 / 464,267 /
+447,362); the controls fail on the same seeds as step 4's (`-hysteresis-off` 33, `-lead-off` 1,397, set differences 0 / 0). Knob
+`AUTHORITY_SIM_PER_ROW_CLASS=1`, 300 seeds: `long-delegated` 300 failing, `delegated-group-switch` 3, all `row_version_matches_config`. The
+lone-lead oracle counts 0 `Lone` rows past the lead and 0 behind an uncommitted gated row.
+
+**Performance gate** (box 3, quiet; main = A, the fix = B, `bench/commit-rule/g1-abba.sh`, A B B A, topology 1, state dirs on each file system; 50
+runs per variant, plus 60 more on ext4, xfs and btrfs, pooled): p50 B / A on ext4 chmod 1.08, create 1.00, rename 1.00, unlink 0.98, write 1.00;
+xfs 1.13, 1.01, 1.06, 1.06, 1.00; btrfs 1.00, 0.97, 1.02, 0.97, 1.00; tmpfs (50 runs) 1.03, 0.99, 1.00, 1.08, 1.01. The 35 to 90 us ops are
+bimodal and A against a second copy of A (60 runs) reads chmod 0.93, 1.04, 1.08 and rename 0.96 to 0.98 on the same three file systems: the ±3 %
+bound is not resolvable on those ops (chmod 36 vs 40 us is one mode against the other), `write` (4 KiB and `fsync`) is within 1 %. Topology 1
+(the lone root's own ops) takes none of the changed code but two short-circuited `gen != 0` tests in `finish_local`; the delegate fast path's
+added cost is one `deleg_idx` point read under the writer lock, which no topology of the harness exercises. `vfs-bench` (three runs each, A B B A
+A B): dispatch overhead 84 to 123 ns in both builds (under 1 us), allocations per op identical.

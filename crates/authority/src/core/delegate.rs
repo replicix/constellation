@@ -2081,8 +2081,15 @@ impl Core {
             // follow ([`Self::deleg_lone_held_by_gated`]): the store marks
             // a gated one. The row is stamped as decided here, from the
             // configuration read now (the store never classes it again).
-            if asker == Asker::Own {
+            if asker == Asker::Own && self.cfg.delegation_lone_hysteresis {
                 constellation_meta::PendingClass::set_for_own_client(
+                    self.deleg_row_commit(gen, rule),
+                )
+            } else if asker == Asker::Own {
+                // The negative control (no hysteresis): the row is marked
+                // when gated, and the store keeps it `Singleton` where the
+                // core decided it.
+                constellation_meta::PendingClass::set_for_own_client_without_hysteresis(
                     self.deleg_row_commit(gen, rule),
                 )
             } else {
@@ -2201,6 +2208,20 @@ impl Core {
                 }
             }
         };
+        // Plan 46 M1.1 step 4 (review, I2): the rule the row was journaled
+        // with is its rule. The store journals an own `Singleton` row as
+        // `Group` where a gated row of this node's own clients is open
+        // ahead of it (`Meta::finish_local`): the fast path's rows go in
+        // while this core waits for the writer lock, after it read the
+        // journal for its decision. The row then waits for its group (below)
+        // like a gated row the core decided itself.
+        if !dedup && exec_idx.is_some() && class == AckClass::Lone {
+            if let Some(row) = constellation_meta::take_last_journaled() {
+                if row.class.gated() {
+                    class = AckClass::DelegGroup { gen };
+                }
+            }
+        }
         let position = Position {
             seq: replica.applied_seq().unwrap_or(0),
             pending: None,
@@ -2461,6 +2482,23 @@ impl Core {
         self.cfg.delegation_lone_lead
             && replica.delegate_idx(d.gen).saturating_sub(committed)
                 >= (self.cfg.delegation_stream_rows as u64).max(1)
+    }
+
+    /// The highest stream index a `Singleton` row of a generation may take:
+    /// the committed prefix plus the lead. The row that takes index `n` is
+    /// within the lead exactly when `n <= horizon`
+    /// ([`Self::deleg_lone_lead_full`] asked about the index before it).
+    /// Published with the rule ([`Self::report_deleg_durable`]) so the store
+    /// refuses a fast-path `Singleton` stamp past it under the writer lock,
+    /// where the journal has moved since the core's last step (the op goes
+    /// through the core, which decides it with the lead). Until step 6 takes
+    /// the lead out of the commit.
+    fn deleg_lone_horizon(&self, through: u64) -> u64 {
+        if self.cfg.delegation_lone_lead {
+            through.saturating_add((self.cfg.delegation_stream_rows as u64).max(1))
+        } else {
+            u64::MAX
+        }
     }
 
     /// A lone delegate's own row is not `Lone` now: its journal is a lead
@@ -3263,6 +3301,7 @@ impl Core {
                 constellation_meta::DelegDurable {
                     commit: self.deleg_row_commit(d.gen, rule),
                     through,
+                    horizon: self.deleg_lone_horizon(through),
                     lost: d.stopped || d.lapsed || d.backup_sealed,
                 },
             );

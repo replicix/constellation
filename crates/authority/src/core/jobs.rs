@@ -1563,6 +1563,12 @@ impl Core {
         // configuration in force there (the lease this node holds now), as
         // the adopted tail's are (`apply_backup_tail`), not a version-0
         // placeholder.
+        //
+        // NOT the commit configuration of these rows (plan 46 M1.1 step 5):
+        // this is the version of the journal the rows are re-appended into
+        // (this tenure's lease), not of the group that committed them. The
+        // old ∪ new reconfiguration rule and the replay must not read these
+        // versions as the rows' commit configurations.
         let _class = constellation_meta::PendingClass::set(constellation_meta::RowCommit::group(
             self.root_config_version(),
             constellation_meta::GroupOn::Root,

@@ -1484,7 +1484,9 @@ fn deleg_group(
 /// its core holds (a landing the holder has not read yet is not in force for
 /// it: add-then-record journals the old version until the holder learns the
 /// change, and the record commits under both), the `DelegGroup` record its
-/// replica has applied. The version the node had applied at its previous
+/// replica has applied. A delegate's group is judged by journal position
+/// (`Meta::deleg_group_at`: the version applied when the row was journaled,
+/// exactly); the lease's version by event (below). The version the node had applied at its previous
 /// event is as good as the one at this event (a published rule the fast path
 /// stamped, a record the store applied after the core's last read, which the
 /// fast path refuses). An older version, one that existed but was
@@ -1548,6 +1550,7 @@ impl RowVersions {
         lease_now: u64,
         group_now: &dyn Fn(u64) -> u64,
         group_max: &dyn Fn(u64) -> u64,
+        group_at: &dyn Fn(u64, u64) -> Option<u64>,
     ) {
         let from = self.judged_to.get(&node).copied().unwrap_or(0);
         let lease_prev = self.lease_seen.get(&node).copied();
@@ -1571,8 +1574,17 @@ impl RowVersions {
                 v == lease_now || Some(v) == lease_prev
             };
             let group_prev = self.group_seen.get(&(node, gen)).copied().unwrap_or(0);
+            // The version the node's replica had applied at the row's journal
+            // position (`Meta::deleg_group_at`), exactly: a stamp one record
+            // behind is caught even when the record was applied in the same
+            // event. Without a recorded history (a replica rebuilt from the
+            // log) the node's applied version now or at its previous event.
             let ended = group_now(gen) == 0 && v == self.group_top.get(&gen).copied().unwrap_or(0);
-            let in_group = gen != 0 && (v == group_now(gen) || v == group_prev || ended);
+            let in_group = gen != 0
+                && match group_at(gen, seq) {
+                    Some(in_force) => v == in_force,
+                    None => v == group_now(gen) || v == group_prev || ended,
+                };
             let ok = match class {
                 constellation_meta::RowCommit::Group {
                     on: constellation_meta::GroupOn::Delegate,
@@ -3312,7 +3324,7 @@ mod tests {
             // 12: a delegate-group version on a root-group row.
             row(12, 3, 0, 0, RowCommit::group(2, GroupOn::Root)),
         ];
-        rv.judge(1, &rows, 6, &group_now, &|g| group_now(g));
+        rv.judge(1, &rows, 6, &group_now, &|g| group_now(g), &|_, _| None);
         let seqs: Vec<_> = rv
             .violations
             .iter()
@@ -3320,7 +3332,7 @@ mod tests {
             .collect();
         assert_eq!(seqs, ["8", "9", "10", "11", "12"], "{:?}", rv.violations);
         assert_eq!((rv.checked, rv.unstamped), (11, 1));
-        rv.judge(1, &rows, 6, &group_now, &|g| group_now(g));
+        rv.judge(1, &rows, 6, &group_now, &|g| group_now(g), &|_, _| None);
         assert_eq!(rv.violations.len(), 5, "judged once");
     }
 
@@ -3343,7 +3355,7 @@ mod tests {
             idx: 0,
             class: RowCommit::group(6, GroupOn::Root),
         }];
-        rv.judge(1, &rows, 8, &|_| 0, &|_| 0);
+        rv.judge(1, &rows, 8, &|_| 0, &|_| 0, &|_, _| None);
         assert_eq!(rv.violations.len(), 1, "{:?}", rv.violations);
         // The delegate's group: applied at 3 two events ago, now 5.
         let mut rv = RowVersions::default();
@@ -3355,7 +3367,27 @@ mod tests {
             idx: 1,
             class: RowCommit::group(3, GroupOn::Delegate),
         }];
-        rv.judge(1, &rows, 0, &|_| 5, &|_| 5);
+        rv.judge(1, &rows, 0, &|_| 5, &|_| 5, &|_, _| None);
+        // By journal position: version 1 was applied while the journal's
+        // next seq was 1, version 2 at 5 (both in this one event): a row at
+        // seq 7 carrying 1 is one record behind and is caught, though the
+        // node's previous event had applied 1; the row at seq 3 carrying 1
+        // was journaled before version 2 and is right.
+        let mut rv = RowVersions::default();
+        rv.group_seen.insert((1, 7), 1);
+        let row = |first, v| constellation_meta::AuditRow {
+            first,
+            epoch: 0,
+            gen: 7,
+            idx: first,
+            class: RowCommit::group(v, GroupOn::Delegate),
+        };
+        let at = |_gen: u64, first: u64| Some(if first >= 5 { 2 } else { 1 });
+        rv.judge(1, &[row(3, 1), row(7, 1)], 0, &|_| 2, &|_| 2, &at);
+        assert_eq!(rv.violations.len(), 1, "{:?}", rv.violations);
+        assert!(rv.violations[0].contains("seq 7"), "{:?}", rv.violations);
+        rv.judge(1, &[row(9, 2)], 0, &|_| 2, &|_| 2, &at);
+        assert_eq!(rv.violations.len(), 1, "{:?}", rv.violations);
         assert_eq!(rv.violations.len(), 1, "{:?}", rv.violations);
     }
 

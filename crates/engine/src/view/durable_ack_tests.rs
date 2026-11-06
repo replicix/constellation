@@ -1521,6 +1521,7 @@ fn delegate_fs(
         Some(constellation_meta::DelegDurable {
             commit: class,
             through,
+            horizon: u64::MAX,
             lost: false,
         }),
     );
@@ -1615,6 +1616,7 @@ fn the_delegates_fast_path_writes_then_waits_for_its_group() {
                 Some(constellation_meta::DelegDurable {
                     commit: RowCommit::DELEG_GROUP,
                     through: 1,
+                    horizon: u64::MAX,
                     lost: false,
                 }),
             );
@@ -1662,6 +1664,7 @@ fn the_delegates_fast_path_answers_a_lone_row_and_a_committed_row_at_once() {
             Some(constellation_meta::DelegDurable {
                 commit: RowCommit::DELEG_GROUP,
                 through: u64::MAX,
+                horizon: u64::MAX,
                 lost: false,
             }),
         );
@@ -1736,6 +1739,7 @@ fn a_delegates_lone_row_waits_for_its_group_while_a_lapse_is_not_handed_to_the_c
                 Some(constellation_meta::DelegDurable {
                     commit: RowCommit::LONE,
                     through: 2,
+                    horizon: u64::MAX,
                     lost: false,
                 }),
             );
@@ -1785,6 +1789,7 @@ fn the_delegates_fast_path_resubmits_in_doubt_when_its_generation_is_lost() {
                         Some(constellation_meta::DelegDurable {
                             commit: RowCommit::DELEG_GROUP,
                             through: 0,
+                            horizon: u64::MAX,
                             lost: true,
                         }),
                     );
@@ -1836,6 +1841,7 @@ fn a_delegates_row_is_classed_when_it_is_journaled_not_when_admitted() {
                     Some(constellation_meta::DelegDurable {
                         commit: RowCommit::DELEG_GROUP,
                         through: 0,
+                        horizon: u64::MAX,
                         lost: false,
                     }),
                 );
@@ -1855,6 +1861,7 @@ fn a_delegates_row_is_classed_when_it_is_journaled_not_when_admitted() {
             Some(constellation_meta::DelegDurable {
                 commit: RowCommit::DELEG_GROUP,
                 through: 1,
+                horizon: u64::MAX,
                 lost: false,
             }),
         );
@@ -1892,6 +1899,7 @@ fn a_delegates_lone_row_follows_only_a_committed_gated_row() {
             Some(constellation_meta::DelegDurable {
                 commit: class,
                 through,
+                horizon: u64::MAX,
                 lost: false,
             }),
         );
@@ -1962,6 +1970,7 @@ fn a_delegates_fast_path_row_waits_for_the_published_version_to_reach_the_store(
             Some(constellation_meta::DelegDurable {
                 commit: RowCommit::group(version, GroupOn::Delegate),
                 through: 10,
+                horizon: u64::MAX,
                 lost: false,
             }),
         );

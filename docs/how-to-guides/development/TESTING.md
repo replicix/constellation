@@ -4589,7 +4589,10 @@ the step it first shows in the journal, against the prefix known then: they
 fail by design, `SWEEP-LONE-LEAD-TOTALS` counts the rows judged, the ops the
 gated mark alone held back from `Lone`; the store no longer classes a row again
 where it journals it: the fast path stamps the published rule only at the
-version the store records, else the op goes through the core), and every
+version the store records and, for `Singleton`, within the published horizon and
+behind no open gated row, else the op goes through the core; the core's own
+`Singleton` row behind an open gated row is stamped `Group` and the core waits
+for the group), and every
 lock configuration of `long_locks` (`locks`, `locks-partition`, …,
 `locks-failover-backup-writes`). Use each long test's own start (its
 source) to sweep the same seeds.

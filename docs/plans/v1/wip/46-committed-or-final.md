@@ -801,6 +801,12 @@ histories. Gates at the last commit: fmt and clippy `-D warnings` clean, authori
 | **M1.4 The hold as a group** | §5.7: `StreamAheadAck`, the hold's answers wait for one member; a one-member epoch's hold is `Final`. | The hold's uncommitted `NonStealable` answers; variant 3(i)'s special case from M0.2. | `flex-crash` and the `flex*` configs under the strict flags D9 deferred (36–81 of 2,000 seeds fail today): zero after. | The flex model's property with the group; `strict_commit`, `strict_identity` on every flex config; harness `epoch-member-dies-with-chunk`, `flex-crash`'s scenario ×3. | The flex strict flags on (D9); the C2h deferral closed; the I4 ceilings of the flex configurations at zero. |
 | **M1.5 Docs and gates** | DESIGN §4 "Delegated sub-sequencers", §4 "Acknowledgement and durability", §5.2, §9 "Delegates" and the failover table rewritten for the new records; `delegations.md`, `durability-and-failover.md`, `configuration.md`, `lease-placement.md`; ADR-40 amended with what landed; TESTING.md. | — | — | Full CONVENTIONS gates (pjdfstest 8798/8798); the four-file-system perf gates of §8. | All green; the stage reviewed. |
 
+*M1.1 step 5 notes (from step 4's review, 2026-11-06):* the rows a takeover re-journals (the predecessor's adopted tail,
+`apply_backup_tail`; this node's own delegate rows re-appended at the gate, `jobs.rs`) are stamped `Group{Root}` with the successor's
+lease version: the configuration of the journal they are rows of, **not** the configuration that committed them (the predecessor's
+group, at a version a backup does not record per row). Old ∪ new reconfiguration and the replay must not read these versions as
+commit configurations; if step 5 needs them, `BackupTx` has to carry the predecessor's version per row.
+
 *L2b (known gap, deferred 2026-11-04; PROGRESS, "L2b"):* **M1.2 must close L2b.** A committed delegate row that a
 delegate-turned-root re-appends in a lone tenure, ending unshipped below the next root's cut, survives only as rescue copies
 by rid (I2 in `long-delegated-backup` 13016; I2c in 13907, 14284, 15005, 15996, all under slow lease reads). M1.2's member

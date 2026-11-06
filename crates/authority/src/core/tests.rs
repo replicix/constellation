@@ -45121,9 +45121,12 @@ mod deleg_group {
     /// row 1 is journaled and not committed, and `fast` runs right before
     /// the rename's write, as the FUSE threads' writes do
     /// (`before_delegate_write_hook`).
-    fn core_rename_amid_fast_path_rows(fast: impl FnOnce(&Meta, Now, Ino) + 'static) -> RenameRace {
+    fn core_rename_amid_fast_path_rows(
+        lead: usize,
+        fast: impl FnOnce(&Meta, Now, Ino) + 'static,
+    ) -> RenameRace {
         let (mut h, dir, _, _) = delegate_renewed_once();
-        h.core.cfg.delegation_stream_rows = 2;
+        h.core.cfg.delegation_stream_rows = lead;
         let (_, out) = own_create(&mut h, dir, 1);
         assert_eq!(
             client_answers(&out)[0].1,
@@ -45178,19 +45181,18 @@ mod deleg_group {
     /// path journals meanwhile. The store no longer classes the core's row
     /// again where it journals it: the core publishes the rule it stamps
     /// before the write (`Core::deleg_publish_rule`), so the fast path's rows
-    /// that go in meanwhile are stamped with it too. Here the lead is two
+    /// that go in meanwhile are stamped with it too. Here the lead is three
     /// rows past the root's cursor (nothing committed, row 1 journaled) and
     /// the core decides the rename `Lone`; the fast path journals `x` and the
-    /// create of `f` (`Lone` as published, the lead is the core's decision
-    /// and no longer enforced under the writer lock), and the rename follows
-    /// them. No row of the stream waits for its group, so nothing answered
+    /// create of `f` (`Lone` as published, within the published horizon),
+    /// and the rename follows them. No row of the stream waits for its group, so nothing answered
     /// `Lone` depends on a row the strand drops: at the root's crash every
     /// row past the cursor is replayed in order, the rename after the create
     /// it renames.
     #[test]
     fn a_core_path_rows_rule_is_the_one_the_fast_path_rows_around_it_carry() {
         use constellation_meta::RowCommit;
-        let r = core_rename_amid_fast_path_rows(|meta, now, dir| {
+        let r = core_rename_amid_fast_path_rows(3, |meta, now, dir| {
             assert_eq!(
                 meta.session().deleg_row_class(7),
                 Some(RowCommit::LONE),
@@ -45223,6 +45225,65 @@ mod deleg_group {
             r.queued
         );
         assert_eq!(r.queued.last(), Some(&r.rename), "in order");
+    }
+
+    /// Plan 46 M1.1 step 4 (review, I2; fail-before: the core's `Singleton` row
+    /// is stamped as decided): the core reads the journal, decides the
+    /// rename `Lone` (nothing of its node's own is gated), and waits for the
+    /// writer lock; meanwhile the fast path, under a group rule published
+    /// before the core's, journals the create of `f` as a gated row (it waits
+    /// for its group). The rename of `f` then follows an uncommitted gated
+    /// row: journaled and answered `Lone`, a root's crash drops the create
+    /// (its client was not answered) and replays the rename without it. The
+    /// store stamps the row `Group` where it journals it behind an open gated
+    /// row of the node's own, and the core reads that and waits for the group:
+    /// the rename is not answered, and both rows are dropped and replayed in
+    /// order.
+    #[test]
+    fn a_core_path_singleton_row_does_not_land_behind_an_open_gated_fast_path_row() {
+        use constellation_meta::RowCommit;
+        let r = core_rename_amid_fast_path_rows(2, |meta, now, dir| {
+            let lone = meta.session().deleg_row_class(7).unwrap();
+            assert_eq!(lone, RowCommit::LONE, "the core decided `Lone`");
+            // The group rule the fast path's rows follow, published before
+            // the core's own (nothing committed past row 0).
+            meta.session().set_deleg_durable(
+                7,
+                Some(constellation_meta::DelegDurable {
+                    commit: lone.demoted(),
+                    through: 0,
+                    horizon: u64::MAX,
+                    lost: false,
+                }),
+            );
+            fast_create(meta, now, dir, 2, "f");
+            meta.session().set_deleg_durable(
+                7,
+                Some(constellation_meta::DelegDurable {
+                    commit: lone,
+                    through: 0,
+                    horizon: u64::MAX,
+                    lost: false,
+                }),
+            );
+        });
+        assert_eq!(
+            r.classes(),
+            vec![
+                (1, RowCommit::LONE),
+                (2, RowCommit::DELEG_GROUP),
+                (3, RowCommit::DELEG_GROUP),
+            ],
+            "{:?}",
+            r.rows
+        );
+        assert_eq!(r.answered, None, "the rename waits for its group");
+        assert_eq!(r.dropped, 2, "the create and the rename are dropped");
+        assert!(
+            r.queued.is_empty(),
+            "neither was answered, nothing is replayed (the clients retry): {:?}",
+            r.queued
+        );
     }
 
     /// Plan 46 M1.1 step 4 (fail-before: the row is stamped with the

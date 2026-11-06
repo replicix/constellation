@@ -2900,7 +2900,9 @@ impl Driver {
                 .unwrap_or(0)
         };
         let mut rv = self.oracles.row_versions.lock().unwrap();
-        rv.judge(self.id, &rows, lease_now, &group_now, &group_max);
+        let meta = self.meta.clone();
+        let group_at = move |gen: u64, first: u64| meta.deleg_group_at(gen, first);
+        rv.judge(self.id, &rows, lease_now, &group_now, &group_max, &group_at);
         rv.tick(self.id, lease_now, &group_now);
     }
 

@@ -518,6 +518,13 @@ pub(crate) fn apply_group_tx(
         let mut top = meta.deleg_group_top.lock().unwrap();
         let t = top.entry(gen).or_default();
         *t = (*t).max(version);
+        let next = crate::store::journal::peek_next_seq(&*tx, &meta.local)?;
+        meta.deleg_group_history
+            .lock()
+            .unwrap()
+            .entry(gen)
+            .or_default()
+            .push((version, next));
     }
     Ok(true)
 }
@@ -563,6 +570,23 @@ impl Meta {
             .get(&gen)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Simulation oracle: the `DelegGroup` version of `gen` in force at the
+    /// journal position of the row whose first seq is `first`: the latest
+    /// version this replica applied while the journal's next seq was at or
+    /// below `first`. `None`: no version was applied before that position
+    /// (or none was recorded: a replica rebuilt from the log).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn deleg_group_at(&self, gen: Gen, first: u64) -> Option<u64> {
+        self.deleg_group_history
+            .lock()
+            .unwrap()
+            .get(&gen)?
+            .iter()
+            .rev()
+            .find(|(_, next)| *next <= first)
+            .map(|(v, _)| *v)
     }
 
     /// Plan 30 §M12: whether the table names any live delegation, as

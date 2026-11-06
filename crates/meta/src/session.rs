@@ -778,6 +778,14 @@ pub struct DelegDurable {
     /// it, or every member of the group (and of a requested change) holds
     /// it (`Core::deleg_committed_through`).
     pub through: u64,
+    /// The highest stream index a `Singleton` row may take: the committed
+    /// prefix plus the lead (`Core::deleg_lone_horizon`). The fast path
+    /// refuses a `Singleton` stamp past it under the writer lock (the op goes
+    /// through the core, which makes the row wait for its group): the journal
+    /// moves between the core's steps, and the lead is what holds a lone
+    /// delegate's own load to what its stream to the root carries (until step
+    /// 6 takes the lead out of the commit). `u64::MAX`: no limit.
+    pub horizon: u64,
     /// The generation is stopped, lapsed or lost its backup: nothing more
     /// will commit under it from here, the op's answer is in doubt.
     pub lost: bool,
@@ -1649,7 +1657,8 @@ impl SessionState {
     /// version of the generation's configuration the store records there
     /// (`store_version`: the latest `DelegGroup` record applied, 0 when none)
     /// and the highest index of an own gated row journaled under the
-    /// generation (`gated`). `None`: the core has not published the
+    /// generation (`gated`), and the stream index the row takes (`idx`).
+    /// `None`: the core has not published the
     /// generation, or the state it published its rule on is not the store's
     /// now: the rule was decided under another version (a record applied
     /// since), or a `Singleton` rule predates an own gated row that the
@@ -1667,11 +1676,12 @@ impl SessionState {
         gen: u64,
         store_version: u64,
         gated: u64,
+        idx: u64,
     ) -> Option<RowCommit> {
-        let (commit, through) = {
+        let (commit, through, horizon) = {
             let g = self.inner.lock().unwrap();
             let d = g.deleg_durable.get(&gen)?;
-            (d.commit, d.through)
+            (d.commit, d.through, d.horizon)
         };
         let commit = self.guarded(commit);
         let names_applied = matches!(
@@ -1685,7 +1695,9 @@ impl SessionState {
         if names_applied && commit.config_version() != Some(store_version) {
             return None;
         }
-        if commit.is_singleton() && gated > through {
+        // A `Singleton` row follows no open gated row of the node's own and
+        // stays within the published lead.
+        if commit.is_singleton() && (gated > through || idx > horizon) {
             return None;
         }
         Some(commit)
@@ -2213,6 +2225,7 @@ mod tests {
         let published = |commit, through, lost| DelegDurable {
             commit,
             through,
+            horizon: u64::MAX,
             lost,
         };
         let wait = |gen, idx| s.wait_deleg_durable(gen, idx, Duration::ZERO);
@@ -2261,6 +2274,7 @@ mod tests {
         let published = |through| DelegDurable {
             commit: RowCommit::DELEG_GROUP,
             through,
+            horizon: u64::MAX,
             lost: false,
         };
         let wait = |gen, idx| s.wait_deleg_durable(gen, idx, Duration::ZERO);
@@ -2293,6 +2307,7 @@ mod tests {
             Some(DelegDurable {
                 commit: RowCommit::DELEG_GROUP,
                 through: 2,
+                horizon: u64::MAX,
                 lost: false,
             }),
         );
@@ -2319,41 +2334,48 @@ mod tests {
                 Some(DelegDurable {
                     commit,
                     through: 10,
+                    horizon: u64::MAX,
                     lost: false,
                 }),
             );
         };
-        assert_eq!(s.deleg_commit_at_journal(7, 0, 0), None, "not published");
+        assert_eq!(s.deleg_commit_at_journal(7, 0, 0, 1), None, "not published");
         let group = |v| RowCommit::group(v, crate::store::local::GroupOn::Delegate);
         publish(group(3));
-        assert_eq!(s.deleg_commit_at_journal(7, 3, 0), Some(group(3)));
+        assert_eq!(s.deleg_commit_at_journal(7, 3, 0, 1), Some(group(3)));
         assert_eq!(
-            s.deleg_commit_at_journal(7, 4, 0),
+            s.deleg_commit_at_journal(7, 4, 0, 1),
             None,
             "a record applied since"
         );
         assert_eq!(
-            s.deleg_commit_at_journal(7, 2, 0),
+            s.deleg_commit_at_journal(7, 2, 0, 1),
             None,
             "the store is behind"
         );
         publish(RowCommit::Singleton { config_version: 3 });
         assert_eq!(
-            s.deleg_commit_at_journal(7, 3, 0),
+            s.deleg_commit_at_journal(7, 3, 0, 1),
             Some(RowCommit::Singleton { config_version: 3 })
         );
-        assert_eq!(s.deleg_commit_at_journal(7, 4, 0), None);
+        assert_eq!(s.deleg_commit_at_journal(7, 4, 0, 1), None);
         // A `Singleton` rule behind an own gated row the published prefix
         // (10) does not cover is no rule to stamp; one it covers is.
-        assert_eq!(s.deleg_commit_at_journal(7, 3, 11), None);
+        assert_eq!(s.deleg_commit_at_journal(7, 3, 11, 1), None);
         assert_eq!(
-            s.deleg_commit_at_journal(7, 3, 10),
+            s.deleg_commit_at_journal(7, 3, 10, 1),
             Some(RowCommit::Singleton { config_version: 3 })
         );
         publish(RowCommit::FINAL);
-        assert_eq!(s.deleg_commit_at_journal(7, 9, 0), Some(RowCommit::FINAL));
+        assert_eq!(
+            s.deleg_commit_at_journal(7, 9, 0, 1),
+            Some(RowCommit::FINAL)
+        );
         publish(RowCommit::ARCHIVE);
-        assert_eq!(s.deleg_commit_at_journal(7, 9, 0), Some(RowCommit::ARCHIVE));
+        assert_eq!(
+            s.deleg_commit_at_journal(7, 9, 0, 1),
+            Some(RowCommit::ARCHIVE)
+        );
     }
 
     /// I1 class 2 for the delegate's fast path: with `Lone` published and
@@ -2376,21 +2398,22 @@ mod tests {
             Some(DelegDurable {
                 commit: RowCommit::LONE,
                 through: 10,
+                horizon: u64::MAX,
                 lost: false,
             }),
         );
         assert_eq!(s.deleg_row_class(7), Some(RowCommit::LONE));
-        assert_eq!(s.deleg_commit_at_journal(7, 0, 0), Some(RowCommit::LONE));
+        assert_eq!(s.deleg_commit_at_journal(7, 0, 0, 1), Some(RowCommit::LONE));
         lapse.store(true, Ordering::Relaxed);
         assert_eq!(s.deleg_row_class(7), Some(RowCommit::DELEG_GROUP));
         assert_eq!(
-            s.deleg_commit_at_journal(7, 0, 0),
+            s.deleg_commit_at_journal(7, 0, 0, 1),
             Some(RowCommit::DELEG_GROUP)
         );
-        assert_eq!(s.deleg_commit_at_journal(8, 0, 0), None, "not published");
+        assert_eq!(s.deleg_commit_at_journal(8, 0, 0, 1), None, "not published");
         lapse.store(false, Ordering::Relaxed);
         assert_eq!(s.deleg_row_class(7), Some(RowCommit::LONE));
-        assert_eq!(s.deleg_commit_at_journal(7, 0, 0), Some(RowCommit::LONE));
+        assert_eq!(s.deleg_commit_at_journal(7, 0, 0, 1), Some(RowCommit::LONE));
         // The classes that wait or never answer from the disk are untouched.
         lapse.store(true, Ordering::Relaxed);
         for commit in [RowCommit::DELEG_GROUP, RowCommit::FINAL] {
@@ -2399,11 +2422,12 @@ mod tests {
                 Some(DelegDurable {
                     commit,
                     through: 10,
+                    horizon: u64::MAX,
                     lost: false,
                 }),
             );
             assert_eq!(s.deleg_row_class(7), Some(commit));
-            assert_eq!(s.deleg_commit_at_journal(7, 0, 0), Some(commit));
+            assert_eq!(s.deleg_commit_at_journal(7, 0, 0, 1), Some(commit));
         }
     }
 
