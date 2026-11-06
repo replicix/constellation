@@ -1179,6 +1179,10 @@ pub struct Report {
     /// Plan 30 §M9: acknowledged ops that were rolled back at some point
     /// (exempted as tentative unless `strict_durability`).
     pub acked_rolled_back: usize,
+    /// Plan 46 M1.3 step 0: of the acknowledged rids a node rolled back, the
+    /// ones the oracle judged `Lone` at the answer (the singleton's, which a
+    /// TTL takeover may roll back and D3 removes for a root with peers).
+    pub lone_rolled_back: usize,
     /// Plan 30 §M9: per holder crash, simulated ms from the crash to the
     /// first mutation any node acknowledged afterwards.
     pub failover_ms: Vec<u64>,
@@ -5071,11 +5075,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let mut tentative: HashSet<Rid> = abandoned.lock().unwrap().clone();
     let acked: HashSet<Rid> = history.returned().into_iter().map(|(rid, _)| rid).collect();
     let mut rolled_back_acked = 0usize;
+    let mut rolled_back_lone = 0usize;
     for id in cluster.ids() {
         let n = cluster.get(id);
         for rid in n.shared.tentative.lock().unwrap().iter() {
             if acked.contains(rid) {
                 rolled_back_acked += 1;
+                if lone_answered.contains(rid) {
+                    rolled_back_lone += 1;
+                }
             }
             if !strict_durability || lone_answered.contains(rid) {
                 tentative.insert(*rid);
@@ -5127,6 +5135,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         eprintln!("SWEEP-LONE-JUDGE seed {seed}: {}", lone_disagree.join("; "));
     }
     report.acked_rolled_back = rolled_back_acked;
+    report.lone_rolled_back = rolled_back_lone;
     if cfg.keeps_backups {
         let dropped: u64 = report.stats.values().map(|s| s.backup_ack_timeouts).sum();
         if dropped > 0 {

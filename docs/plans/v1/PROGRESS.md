@@ -68152,3 +68152,85 @@ directions (an A/A control on ext4 shows 0.88..1.06); `vfs_bench` dispatch 5 ns 
 ### Plan 46 M1.2 step 8a fix: review SHOULDs
 
 Rebased on main (one PROGRESS conflict, both sides kept; no code on main wrote or read the old delegation records). A re-grant of a directory now drops the losing stream once its set is empty (the old fold did; the empty stream had flipped `is_empty`, `deleg_any` and the table's `stream` against `iter`). `DelegationTable::gens()` and `has_gen(gen)` enumerate live generations by stream, so a stream that released every subtree is still live; every reader that collected live generations through `iter()` (session void check, `Meta` restart seeding, the replay-origin check, the strand's listed sets, the authority's replay holds, the delegate's named/live sets, the jobs' listed set, client checks) and the strand's end check (which keyed by `(node, gen)` while the fold ends by gen alone) use them. One table test (the regrant loser, a released stream, the end by gen); the replica fixture's end record names node 4, the node it grants to.
+
+## Plan 46 M1.3 step 0 — evidence
+
+Runs and sim configurations only; no product code changed. Base: main `15d8d225` (M1.3 step 1 on it), release sim binary, every run under
+`timeout`. Sim changes: three configurations and a test, a `SWEEP-ROLLBACKS` line (acknowledged rids rolled back, and of them the ones the
+oracle judged `Lone`: `Report::lone_rolled_back`), and `replay_seed` now takes `AUTHORITY_SIM_LEASE_READS` like `sweep_config` (a failing
+seed of a knob sweep replays with the knob; before, the replay ran without it and passed).
+
+**New configurations** (`tests/sim.rs`; `far_root_writes_and_the_sticky_stubs_run_in_report_mode` runs 8 seeds of each):
+- `far-root-writes`: `far`'s topology (every pair 120 ms, no backup), three nodes; node 1 is the root and writes its own `d1` (and `/`), nodes 2 and 3
+  hold `d2` and `d3` by grants; the lease holder crashes at 3 s and returns at 11 s (the TTL takeover that rolls `Lone` answers back).
+  M1.3's count: acknowledged rids rolled back, `Lone` ones included, to zero.
+- `sticky-idle-release`, `sticky-handover-ping-pong`, `sticky-holder-dies`: stubs in report mode (no strict flag of their own). What each will
+  exercise is in its doc comment: idle release and re-grant (step 4+), the handover count with gaps above the grace (step 5), the lost holder's
+  block and `abandon` (step 4+). Today they are `far-root-writes` with placement on, a shared directory between two nodes, and a crash of node 2.
+
+**Counts**, 2,000 seeds, release, non-singleton rollbacks counted (`i5`; `+durability` is `strict_durability`):
+
+| Configuration | failing | acknowledged rids rolled back | non-`Lone` (I5) | judged `Lone` (seeds) |
+|---|---|---|---|---|
+| `far+durability` | 0 | 2 | 0 | 2 (2) |
+| `far-root-writes+durability` (the same without it) | 0 | 70 | 0 | 70 (65) |
+| `singleton-first-peer+durability` | 0 | 0 | 0 | 0 |
+| `sticky-idle-release` / `-handover-ping-pong` | 0 / 0 | 26 / 24 | 0 / 0 | 26 (20) / 24 (22) |
+| `sticky-holder-dies` | 0 | 502 | 0 | 336 (126) |
+
+The non-singleton count is zero everywhere; the `Lone` rollbacks of a root with far peers (`far-root-writes` 70 in 65 seeds) are what D3 and
+M1.3 step 4 remove. Answer classes of `far-root-writes`: 68,995 `singleton` and 84,171 `archive_waits`.
+
+**Pinned S4 seeds** (settle spec: `long-delegated-late-answers` 13 and 29, `long-delegated` 1648, `long-delegated-backup` 510): all four pass
+on this main, plain, `+unsettled` and with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`; the trajectories moved since the pins. They no longer pin S4.
+Current `+unsettled` sweeps (failing seeds of 2,000, without / with the knob): `long-delegated-late-answers` 5 / 84, `long-delegated` 1 (291) / 27,
+`long-delegated-backup` 2 (291, 1943) / 43. Re-pin S4 (step 15) from these.
+
+**Cause-6 buckets on main** (knob sweeps, `+unsettled`, 2,000 seeds; 243 I4 lines over `backup-crash`, `delegated-holder-cut`,
+`long-backup`, `long-delegated{,-backup,-late-answers}`). Bucket by the oracle's verdict, traced with `RUST_LOG=constellation_authority=debug`:
+- **C** (the claim's CAS lost, slow re-reads): `backup-crash` 57 (35 `LeasePath`/idle verdicts in the sweeps; 880, 1278). Nodes 3, 1 and 2 each end a
+  `fuse-acquire` unacquired within 1.2 s (10.26, 11.22, 11.42 s) while the lease names node 2's earlier incarnation; node 2 re-adopts it at 11.44 s and
+  takes the epoch by TTL only at 12.47 s; node 1's op goes in doubt at 12.30 s, inside the window.
+- **A** (the lease won, the own op still in its gate): `delegated-holder-cut` 252 (about 50 `Itself` verdicts, core in the takeover gate/floor; 110,
+  303). Node 2 takes epoch 2 at 13.25 s and waits out the read-delegation quarantine; its own op loops "the holder is unreachable, routing again"
+  with itself as holder, the recall of generation 1:2 (delegate 3) is in flight; EIO at 24.3 s.
+- **O** (forwarded to the named, re-adopting holder instead of claiming): `delegated-holder-cut` 128 (about 53 `Root`/core-busy verdicts; 530,
+  581). Node 3's claim ends unacquired at 12.45 s, it routes to node 1 (the restarted holder) for 2.5 s; node 1 takes a takeover epoch at 14.05 s and is
+  reachable from 14.09 s; EIO at 14.98 s. It is O/B-shaped: the root became reachable 0.9 s before the EIO and was not asked again.
+- The rest of the `Root` verdicts (52 `takeover gate+job`, 45 `+floor`) are the in-gate class (ADR-42), `Delegate` 7.
+
+**`backup-crash-slow` 840 and `long-backup` 728** (`member_copies_drained`): both pass on main now (all variants; `backup-crash-slow` ×2,000 plain,
+`+verbatim`, `+cut`; `long-backup` ×2,000 with and without the knob, plain and `+verbatim`: 0 `member_copies_drained` anywhere). Bisected: both fail
+on `08cdb62a` with the same shape (a `RootGroup` `Refused` row of the deposed holder's own tenure, epoch 1, stays in the member copy at convergence;
+no `TailOf` or epoch row retires it) and both pass from `10ebac2d` (M1.1 step 5; `15032a56` before it still fails 728). Class: a member-copy leak of a
+refusal no successor tail carries (`meta/src/store/member.rs`, the retirement rules: `TailOf` at `:860`, shipped-row cover at `:1002`). Not a
+fix: the schedule of 728 changed with the commit (it had no holder crash before, one after), so the class may persist at a lower rate; no seed of 12,000
+runs shows it. The strict-verbatim sweeps show another class, the benign `tail_done_skipped` overlap (`backup-crash-slow` 865, `backup-crash` 517,
+958, 1004, 1429, `long-backup` 369 and 1732 with the knob), documented at `tests/sim/run.rs` (M1.2 step 5).
+
+**`lease6`** (`delegated-core-stall-root-lease6+commit`): seeds 16 and 1 pass on main (they failed at `2d8eb93c`). 19 of 2,000 seeds fail, all I1 `acked_implies_committed`
+"expected singleton, committed by none" at t about 34.8 s (the end of the second stall), among them 8, 11, 32, 154, 197, 396, 638, 723, 807, 896, 948,
+960. The rule of the lease6 report stands (F1: a fresh clock read after the write); M1.3's exit is this configuration `+commit` at 0 of 2,000.
+
+**Perf baseline.** G2 (topology 5, `net-wan` 60 ms each way, the harness's local S3, 100 samples, 5 runs, median p50 / p90, build `15d8d225`, on the
+shared build box while idle, so indicative; the timing box has no `tc`): forwarded `create` 121.5 / 142.2 ms, `rename` 112.8 / 139.2, `write` 124.3 / 144.9;
+the root's own `create` 0.1 / 0.1, `write` 3.1 / 3.8. G1 and topologies 3 and 4 on the timing box (box 3, quiet, build `15d8d225` twice in `g1-abba.sh` order A B B A A B, so 6 runs per file system
+pooled, 200 samples, topologies 2, 3, 4; medians over runs of p50 / p90 in us; G1 = topology 2's holder + 500 us). G2 is not measured there: the
+timing box has no `tc` (no `net-wan`), so topology 5 above ran on the build box.
+
+| fs | op | T2 holder | T3 delegate | G1 | T4 delegate (own ops) |
+|---|---|---|---|---|---|
+| ext4 | create / write | 374 / 626, 3407 / 4347 | 703 / 1152, 3775 / 4671 | p50 met, p90 over 26; met | 522 / 846, 3588 / 4510 |
+| ext4 | rename / unlink / chmod | 253 / 344, 243 / 338, 241 / 357 | 755 / 1622, 761 / 1677, 721 / 1265 | p50 over 2, 18, met; p90 over 778, 839, 408 | 501 / 1326, 473 / 1146, 414 / 615 |
+| xfs | create / write | 364 / 462, 2222 / 2375 | 686 / 817, 2559 / 2732 | met; met | 501 / 626, 2366 / 2526 |
+| xfs | rename / unlink / chmod | 254 / 330, 243 / 335, 232 / 331 | 709 / 899, 743 / 972, 671 / 1004 | p50 met; p90 over 69, 137, 173 | 502 / 609, 460 / 548, 410 / 518 |
+| btrfs | create / write | 375 / 470, 3330 / 3802 | 694 / 846, 3713 / 3919 | met; met | 500 / 628, 3503 / 4280 |
+| btrfs | rename / unlink / chmod | 261 / 317, 247 / 328, 227 / 313 | 715 / 895, 734 / 969, 704 / 1027 | p50 met; p90 over 78, 141, 214 | 494 / 598, 467 / 567, 410 / 514 |
+| tmpfs | create / write | 355 / 443, 379 / 494 | 678 / 807, 740 / 905 | met; met | 519 / 661, 564 / 713 |
+| tmpfs | rename / unlink / chmod | 247 / 310, 245 / 343, 230 / 337 | 710 / 896, 707 / 935, 678 / 984 | p50 met; p90 over 86, 92, 147 | 538 / 652, 498 / 599, 445 / 561 |
+
+G1's p50 holds on every file system (ext4 rename and unlink over by 2 and 18 us); the p90 of rename, unlink and chmod is over the budget by
+69 to 214 us on xfs, btrfs and tmpfs and by 408 to 839 us on ext4 (the ext4 spread is wide: p90 1.2 to 1.7 ms). This is the baseline the G1 p90 nudge
+decision (D9) is re-taken against at M1.3's exit.
+
+**Gates**: fmt, clippy `--all-targets -D warnings` (authority), authority lib 1,076 (debug and release), release sim suite 420 passed, 0 failed, 12 ignored.

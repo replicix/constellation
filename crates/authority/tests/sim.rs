@@ -293,6 +293,10 @@ fn replay_seed() {
         Ok("backup") => backup_config(),
         Ok("acks3") => ack_s3_config(),
         Ok("backup-far") | Ok("far") => far_config(),
+        Ok("far-root-writes") => far_root_writes_config(),
+        Ok("sticky-idle-release") => sticky_idle_release_config(),
+        Ok("sticky-handover-ping-pong") => sticky_handover_ping_pong_config(),
+        Ok("sticky-holder-dies") => sticky_holder_dies_config(),
         Ok("backup-two") => backup_two_config(),
         Ok("backup-strict") => backup_strict_config(),
         Ok("backup-strict-inbox-off") => backup_strict_inbox_off_config(),
@@ -597,6 +601,21 @@ fn replay_seed() {
             config.holder_beats
         },
         ..config
+    };
+    // `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`: slow lease GETs, as in
+    // `sweep_config` (a sweep's failing seed replays with the same knob).
+    let config = match std::env::var("AUTHORITY_SIM_LEASE_READS") {
+        Ok(v) => {
+            let n: Vec<u64> = v.split(':').map(|x| x.parse().expect("ms")).collect();
+            SimConfig {
+                lease_reads: sim::store::SlowReads {
+                    before: (n[0], n[1]),
+                    reply: (n[2], n[3]),
+                },
+                ..config
+            }
+        }
+        Err(_) => config,
     };
     match run_seed(seed, config) {
         Ok(report) => eprintln!("seed {seed} passed: {report:#?}"),
@@ -1659,6 +1678,87 @@ fn far_config() -> SimConfig {
         strict_commit: true,
         strict_identity: true,
         ..backup_config()
+    }
+}
+
+/// Plan 46 M1.3 step 0: `far`, with subtrees. Every pair is far (no
+/// backup), node 1 is the root and writes its own directory `d1` (and `/`),
+/// and nodes 2 and 3 hold `d2` and `d3` by grants. Today node 1's own ops
+/// are `Lone` answers a TTL takeover may roll back (a far peer is no
+/// "peer in budget"); D3 and M1.3 step 4 make the root's own subtree a
+/// sticky grant and the rest wait for the archive. The count M1.3 drives to
+/// zero: the rollbacks of acknowledged ops, the `Lone` ones included
+/// (`+durability` makes a non-`Lone` one fail; `SWEEP-ORACLE-TOTALS` and
+/// `acked_rolled_back` have the rest). Report mode: no strict flag of its
+/// own beyond `far`'s.
+fn far_root_writes_config() -> SimConfig {
+    SimConfig {
+        nodes: 3,
+        clients_per_node: 2,
+        ops_per_client: 12,
+        names: 4,
+        random_faults: 0,
+        dirs: vec!["d1".into(), "d2".into(), "d3".into()],
+        delegations: vec![("d2".into(), 2), ("d3".into(), 3)],
+        cross_ratio: 0.0,
+        faults: vec![ScheduledFault {
+            at_ms: 3_000,
+            kind: FaultKind::CrashHolder {
+                restart_ms: Some(8_000),
+                keep_journal: true,
+            },
+        }],
+        ..far_config()
+    }
+}
+
+/// Plan 46 M1.3 step 0, a stub (report mode: counted, never failing). Once
+/// step 4 lands: a sticky holder writes, goes idle past the idle release
+/// (about 60 s in production, scaled in the sim) and releases with
+/// `SubtreeReleased`; the next write forwards, then the placement grants
+/// again. Today: the far writers' placed grants and the TTL.
+fn sticky_idle_release_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::placement_core_config),
+        delegations: Vec::new(),
+        ops_per_client: 16,
+        ..far_root_writes_config()
+    }
+}
+
+/// Plan 46 M1.3 step 0, a stub. Once step 5 lands: two nodes alternate
+/// writes in one subtree with gaps above the grace; the grant changes hands
+/// at most once per minimum tenure and a one-off write forwards without a
+/// handover (the oracle reports the handover count). Today: one shared
+/// directory, placement on, every pair far.
+fn sticky_handover_ping_pong_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::placement_core_config),
+        ..SimConfig {
+            nodes: 2,
+            dirs: vec!["shared".into()],
+            delegations: Vec::new(),
+            shared_dir: true,
+            ..far_root_writes_config()
+        }
+    }
+}
+
+/// Plan 46 M1.3 step 0, a stub. Once step 4 lands: the holder of a sticky
+/// grant dies; its subtree blocks (`EROFS`/`EXDEV`) until `repair abandon`
+/// ends it, and the returned holder exports its copies. Today: the far
+/// delegate of `d2` crashes and returns; the grant ends by the TTL.
+fn sticky_holder_dies_config() -> SimConfig {
+    SimConfig {
+        faults: vec![ScheduledFault {
+            at_ms: 2_500,
+            kind: FaultKind::CrashNode {
+                node: 2,
+                restart_ms: Some(10_000),
+                keep_journal: true,
+            },
+        }],
+        ..far_root_writes_config()
     }
 }
 
@@ -5629,6 +5729,10 @@ fn sweep_config() {
         "backup" => backup_config(),
         "acks3" => ack_s3_config(),
         "far" | "backup-far" => far_config(),
+        "far-root-writes" => far_root_writes_config(),
+        "sticky-idle-release" => sticky_idle_release_config(),
+        "sticky-handover-ping-pong" => sticky_handover_ping_pong_config(),
+        "sticky-holder-dies" => sticky_holder_dies_config(),
         "backup-departs" => backup_departs_config(),
         "singleton-first-peer" => singleton_first_peer_config(),
         "backup-group-cut-ttl" => backup_group_cut_ttl_config(GroupCut::Both),
@@ -7610,6 +7714,9 @@ struct OracleTotals {
     /// Plan 43 C2: of `i4`, settled `EIO`s whose rid completed.
     i4_settled: usize,
     i5: usize,
+    /// Plan 46 M1.3 step 0: acknowledged rids rolled back (`acked_rolled_back`), of them
+    /// the `Lone` ones, and the seeds with a `Lone` one.
+    rolled_back: (usize, usize, u64),
     seeds_with: [u64; 7],
     unmapped: usize,
     rebuilds: (u64, u64),
@@ -7856,6 +7963,9 @@ impl OracleTotals {
         self.i4 += r.late_landings;
         self.i4_settled += r.settled_landings;
         self.i5 += r.non_lone_rollbacks;
+        self.rolled_back.0 += r.acked_rolled_back;
+        self.rolled_back.1 += r.lone_rolled_back;
+        self.rolled_back.2 += u64::from(r.lone_rolled_back > 0);
         for (i, n) in [
             uncommitted,
             r.identity_copies,
@@ -7979,6 +8089,10 @@ impl OracleTotals {
             self.unsettled_class[2],
             self.unsettled_class[3],
             constellation_authority::core::ACK_COUNTERS.iter().zip(self.claimed).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "SWEEP-ROLLBACKS {label} seeds {}/{seeds}: acknowledged rids rolled back {} (non-Lone {}), of them judged Lone {} (in {} seeds)",
+            self.seeds, self.rolled_back.0, self.i5, self.rolled_back.1, self.rolled_back.2
         );
         eprintln!(
             "SWEEP-CUT-TOTALS {label} seeds {}/{seeds}: acked_at_or_below_cut violations {} (in {} seeds; {} of them refusals), \
@@ -17345,5 +17459,30 @@ fn the_lone_lead_oracle_catches_a_disabled_lead_and_a_disabled_hysteresis() {
             tripped,
             "{label}: a seed of {seeds:?} did not trip the oracle ({needle})"
         );
+    }
+}
+
+/// Plan 46 M1.3 step 0: `far-root-writes` and the `sticky-*` stubs run in
+/// report mode: their rollbacks are counted (`SWEEP-ROLLBACKS`), never a
+/// failure of their own. A few seeds, so the suite proves the
+/// configurations run; the sweeps (`AUTHORITY_SIM_CONFIG=far-root-writes+durability`) are
+/// M1.3's evidence.
+#[test]
+fn far_root_writes_and_the_sticky_stubs_run_in_report_mode() {
+    let cases = [
+        ("far-root-writes", far_root_writes_config()),
+        ("sticky-idle-release", sticky_idle_release_config()),
+        (
+            "sticky-handover-ping-pong",
+            sticky_handover_ping_pong_config(),
+        ),
+        ("sticky-holder-dies", sticky_holder_dies_config()),
+    ];
+    for (label, config) in cases {
+        for seed in 0..8 {
+            run_seed(seed, config.clone()).unwrap_or_else(|e| {
+                panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+            });
+        }
     }
 }
