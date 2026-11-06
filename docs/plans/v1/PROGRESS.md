@@ -67844,3 +67844,37 @@ release authority sim suite 414 passed, 0 failed, 13 ignored (the re-pinned `reg
 - **Placement counting.** A rename inside one directory counts as one op (previously one or two, by hash bucket): rename-heavy workloads reach `min_ops` later and are recalled for low rate sooner.
 - The model's shared-parent hold is unmodeled (TODO in `crates/model/src/lib.rs`).
 - Gates (box 2, debug and release): fmt, clippy `--workspace --all-targets -D warnings` clean; meta (lib and integration), authority lib, engine lib, control pass; release authority sim 416 passed, 0 failed. The strict decode touches only whole-value decodes; the journal-head readers (`JournalTxHead`, a prefix of a `JournalTx` row by design) keep the prefix decode. `placement-hot`, `delegated-group-switch`, `long-delegated` and `delegated-fast-path` `+commit`, seeds 0..1,999: 0 failing; the control `delegated-fast-path-unchecked`: 491 failing.
+
+### Plan 46 M1.2 step 6: a delegate that takes the root leaves no hole (2026-11-06)
+
+C3-3 (c3-spec D5 and D7), on the step 4 verbatim append and the step 5 one-transaction re-ship.
+
+- **The mark is renamed.** `deleg_ended_at_gate:{gen}` replaces `deleg_stranded:{gen}` (`Meta::deleg_ended_at_gate`,
+  `mark_deleg_ended_at_gate_tx`, `Replica::deleg_ended_at_gate`). Its meaning is unchanged: this node's takeover gate ended its own
+  generation, and it never executes in it again (`begin_local`'s refusal, the core's `stopped`, `delegation_sync`, the fast path's
+  fence message). `mark_deleg_stranded_tx` and `delegate_stranded` are gone.
+- **The hole is gone.** A row the gate does not re-append (an ended generation, an unlisted one, a lost dependency, a gap) leaves the
+  journal and is replayed by rid as a root row, but the delegate's persisted stream counter used to stay past it, so a recall of the
+  generation needed a separate answer (`on_deleg_recall`'s holed branch). Now the counter is the log's index of the generation:
+  `reship_at_takeover` sets it for every generation it ended, in its own transaction after the tail (a crash between the re-ship and
+  the gate's re-append leaves no hole), and `Core::reappend_own_delegate_rows` sets it again once the rows are re-appended
+  (`Meta::end_own_streams_at_log`, `settle_deleg_idx_at_log_tx`). `on_deleg_recall` answers `delegate_idx(gen)`, capped by this
+  node's own uncommitted holder appends (`holder_append_cap`, which is `u64::MAX` for a node that appended none): one branch.
+- **Kept:** the core's re-append (`reappend_own_delegate_rows`, verbatim since step 4/5) and the L1 mark
+  (`l1_mark_cleared_by_stream`): the end still cuts at what the log holds of the stream.
+- **Not done (step 7/14):** the own rows are still stranded and re-appended by the core in separate transactions, not moved inside
+  the re-ship's (c3-spec §5.1); a re-append that halts still replays by rid. The pinned bug (below) is unchanged.
+
+**Fail-before** (main plus the new tests; debug): core `a_row_the_gate_does_not_re_append_leaves_no_hole_in_its_stream` (counter 2,
+log 0), `a_restarted_delegate_re_adopts_an_ended_generation_stopped` (counter 2, log 0; the recall answer is the counter), meta
+`a_takeover_strand_ends_every_own_generation` (counter 3, log 0). `the_takeover_gate_strands_own_rows_of_a_generation_the_core_does_not_hold`
+gained the verbatim and counter-equals-log assertions (it passes on main: the re-append was verbatim already).
+
+**Sweeps** (release, ×2,000, `+commit`, box 1, branch against main): `delegated-root-crash`, `delegated-two-gens-root-crash`,
+`long-delegated-backup` 0 failing on both. **Pinned bug:** `a_deposed_roots_appended_delegate_row_never_lands_past_its_generations_seal`
+still fails (ignored; step 7 and 14 close it), and `delegated-core-stall-root-sealed` `-lr` (lease reads `0:0:800:1000`) ×2,000 fails
+the same 9 seeds on main and on the branch (182, 552, 773, 783, 885, 1032, 1098, 1713, 1795): this step does not change them.
+
+**Gates** (box 1, debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta lib and integration, authority lib
+(1,068), engine lib (952): all pass (the 17 debug failures noted at step 5 are gone since the fixtures carry the `Completed`); release
+sim suite 423 passed, 0 failed, 13 ignored. No perf gate (takeover only).

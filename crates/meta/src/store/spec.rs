@@ -702,6 +702,9 @@ struct StrandPart {
     stranded: Stranded,
     orphan_cuts: Vec<(u64, u64)>,
     work: bool,
+    /// The generations this strand ended at the gate (marked,
+    /// [`Meta::deleg_ended_at_gate`]).
+    ended: Vec<u64>,
 }
 
 /// What a stranding pass rolled back.
@@ -5600,22 +5603,24 @@ impl Meta {
     /// the appended ones in their place (completing their rids) and the
     /// queued replay re-executes the rest by rid after it, in order.
     ///
-    /// A generation that lost rows has a hole in its stream from here on:
-    /// the rows the predecessor never appended are root rows now, but
-    /// this node's persisted stream counter still counts them, so its
-    /// next row of the generation would follow the hole and no root's
-    /// cursor ever reaches it. Every own generation, holed or not, is
-    /// marked in the same transaction ([`Meta::delegate_stranded`]): it
-    /// ends at this gate, and this node never executes in it again.
-    /// It ends at what the log holds of it, by this node once its gate
-    /// opens, or by whichever root inherits it if this node crashes or
-    /// loses the lease first (`locks-unlinked-delegated-dbackup-random`
-    /// seeds 2477 and 2982: the delegate-turned-root crashed inside its
-    /// takeover gate, restarted as the generation's delegate and
-    /// streamed index 6 to a root waiting for 3, forever). The mark is
-    /// never cleared: generations are never reused (ADR-43: a number
-    /// carries the epoch of the tenure that minted it, so no two tenures
-    /// mint the same one).
+    /// Every own generation is marked in the same transaction
+    /// ([`Meta::deleg_ended_at_gate`], plan 46 M1.2 step 6, c3-spec D7): it
+    /// ends at this gate, and this node never executes in it again. The
+    /// rows the predecessor never appended leave the journal here (the
+    /// tail re-journals the appended ones, the gate re-appends the rest
+    /// verbatim under their generation when it can, and what does not go
+    /// back is replayed by rid as root rows), so the stream has no hole:
+    /// its counter is set to what the log holds of it at the end of this
+    /// transaction, and again after the gate's re-append
+    /// ([`Meta::end_own_streams_at_log`]). The generation ends at that,
+    /// by this node once its gate opens, or by whichever root inherits it
+    /// if this node crashes or loses the lease first
+    /// (`locks-unlinked-delegated-dbackup-random` seeds 2477 and 2982: the
+    /// delegate-turned-root crashed inside its takeover gate, restarted as
+    /// the generation's delegate and streamed index 6 to a root waiting
+    /// for 3, forever). The mark is never cleared: generations are never
+    /// reused (ADR-43: a number carries the epoch of the tenure that
+    /// minted it, so no two tenures mint the same one).
     ///
     /// The mark is also the gate's fence. The strand, the backup tail
     /// and the replay are separate store transactions, and nothing of
@@ -5851,6 +5856,12 @@ impl Meta {
             report.tail_moved = moved.len();
             crate::store::backup::backup_clear_tx(&mut tx, self)?;
         }
+        // The streams this gate ended hold what the log holds of them from
+        // here on (the tail's rows counted): no row past it stays in the
+        // journal, so the counter has no hole.
+        for gen in &part.ended {
+            local::settle_deleg_idx_at_log_tx(&mut tx, &self.local, *gen)?;
+        }
         if !part.work && tail.is_none() {
             // Nothing to strand and no tail: nothing to commit.
             return Ok(report);
@@ -5905,6 +5916,22 @@ impl Meta {
             }
         }
         Ok(report)
+    }
+
+    /// Plan 46 M1.2 step 6: the stream counters of the generations this
+    /// node's takeover gate ended are the log's index of each, after the
+    /// gate re-appended its own rows under them (`Core::reappend_own_delegate_rows`),
+    /// which raised the log's index past what the tail left. Only
+    /// generations the gate ended ([`Meta::deleg_ended_at_gate`]).
+    pub fn end_own_streams_at_log(&self, gens: &[u64]) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        for gen in gens {
+            if local::deleg_ended_at_gate_tx(&tx, &self.local, *gen)? {
+                local::settle_deleg_idx_at_log_tx(&mut tx, &self.local, *gen)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// The strand of [`Self::reship_at_takeover`], in the caller's
@@ -6032,7 +6059,7 @@ impl Meta {
                 let cut = local::bump_void_cut_at_log_idx_tx(tx, &self.local, *gen)?;
                 orphan_cuts.push((*gen, cut));
                 // Never executed in again (`Meta::begin_local`).
-                local::mark_deleg_stranded_tx(tx, &self.local, *gen);
+                local::mark_deleg_ended_at_gate_tx(tx, &self.local, *gen);
             }
             let ended: HashSet<u64> = orphaned.iter().copied().collect();
             let more = strand_tx(
@@ -6058,6 +6085,7 @@ impl Meta {
                 stranded,
                 orphan_cuts,
                 work: false,
+                ended: Vec::new(),
             });
         }
         // Every generation this node holds as the delegate ends here,
@@ -6075,13 +6103,18 @@ impl Meta {
         // `load-probe-takeover` under `pause:lock-lapse+500:10000@b`,
         // seeds 55/69/75/77). Nothing of this node executes on the
         // replica between this strand and the end of the gate's replay.
+        let mut ended: Vec<u64> = own_gens.to_vec();
         for gen in own_gens {
-            local::mark_deleg_stranded_tx(tx, &self.local, *gen);
+            local::mark_deleg_ended_at_gate_tx(tx, &self.local, *gen);
         }
+        ended.extend(orphaned.iter().copied());
+        ended.sort_unstable();
+        ended.dedup();
         Ok(StrandPart {
             stranded,
             orphan_cuts,
             work: true,
+            ended,
         })
     }
 

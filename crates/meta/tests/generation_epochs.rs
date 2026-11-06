@@ -997,7 +997,7 @@ fn an_abandoning_claimant_that_was_the_orphan_s_delegate_ships_none_of_its_rows(
     assert!(!ships_a_row_of(&meta, g), "its row would ship ungranted");
     ended_and_replayed(&meta, g);
     assert!(
-        meta.delegate_stranded(g).unwrap(),
+        meta.deleg_ended_at_gate(g).unwrap(),
         "never executed in again"
     );
 }
@@ -1216,7 +1216,7 @@ fn a_claimant_without_a_tail_ships_none_of_its_rows_of_a_generation_the_log_neve
         "the replay finds the log's settled refusal, and runs nothing"
     );
     assert!(
-        meta.delegate_stranded(g).unwrap(),
+        meta.deleg_ended_at_gate(g).unwrap(),
         "never executed in again"
     );
     assert_eq!(
@@ -1275,7 +1275,7 @@ fn a_claimant_without_a_tail_keeps_its_rows_of_a_listed_generation() {
     assert!(ships_a_row_of(&meta, g));
     assert!(meta.lookup(ROOT_INO, "x").unwrap().is_some());
     assert_eq!(meta.void_cut(g).unwrap(), None);
-    assert!(!meta.delegate_stranded(g).unwrap());
+    assert!(!meta.deleg_ended_at_gate(g).unwrap());
 }
 
 /// Plan 46 M0.4 review SHOULD-1 (pin, ignored: L2b, deferred to plan 46
@@ -1363,5 +1363,5 @@ fn a_claimant_without_a_tail_keeps_its_rows_of_a_generation_only_speculation_end
     );
     assert!(meta.lookup(ROOT_INO, "x").unwrap().is_some());
     assert_eq!(meta.void_cut(g).unwrap(), None);
-    assert!(!meta.delegate_stranded(g).unwrap());
+    assert!(!meta.deleg_ended_at_gate(g).unwrap());
 }

@@ -1364,10 +1364,10 @@ impl Core {
                     dir: d.dir,
                     gen: d.gen,
                     until: HonourMs(0),
-                    // A takeover's strand left a hole in this stream
+                    // This node's takeover gate ended the generation
                     // (`Meta::strand_for_takeover`): it ends at what the
                     // log holds of it; nothing more executes here.
-                    stopped: replica.delegate_stranded(d.gen) || rebooted,
+                    stopped: replica.deleg_ended_at_gate(d.gen) || rebooted,
                     stream_after: None,
                     stream_backoff_ms: 0,
                     refused: false,
@@ -1794,7 +1794,7 @@ impl Core {
                 // generation a takeover's strand ended is refused at the
                 // write already (`Meta::begin_local`), so the core never
                 // executes under it, nor journals a refusal into it.
-                (!s.stopped && !s.lapsed && !replica.delegate_stranded(d.gen)).then_some(d.gen)
+                (!s.stopped && !s.lapsed && !replica.deleg_ended_at_gate(d.gen)).then_some(d.gen)
             }
             _ => None,
         }
@@ -6728,19 +6728,17 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        // A stream a takeover's strand holed has nothing past what the
-        // log holds of it: its counter's later indices were root rows'.
-        // Not past this node's own holder appends its tenure has not
-        // committed (a takeover gate's re-append, unshipped, perhaps never:
-        // a node deposed before its gate's segment ships): the next root's
-        // log would lack a row the cut covers.
-        let through = if replica.delegate_stranded(gen) {
-            replica
-                .log_stream_idx(gen)
-                .min(self.holder_append_cap(gen, replica))
-        } else {
-            replica.delegate_idx(gen)
-        };
+        // The stream's counter is what its rows are: a generation this
+        // node's takeover gate ended has the log's index of it (the rows
+        // the gate re-appended counted, the others replayed by rid as root
+        // rows, `Meta::end_own_streams_at_log`): no hole. Not past this
+        // node's own holder appends its tenure has not committed (a
+        // takeover gate's re-append, unshipped, perhaps never: a node
+        // deposed before its gate's segment ships): the next root's log
+        // would lack a row the cut covers.
+        let through = replica
+            .delegate_idx(gen)
+            .min(self.holder_append_cap(gen, replica));
         // Plan 30 §M14: the subtree's lock grants go back with the answer;
         // its waiters are told to ask the root.
         let locks = self.lock_hand_back(now, gen, replica);
@@ -7829,7 +7827,7 @@ impl Core {
         // same deps, forever (`delegated-holder-cut` seed 139 under the
         // clock mix). Worked out before the record is journaled; every
         // replica reads it from the record.
-        let own = self.dl.mine.contains_key(&gen) && !replica.delegate_stranded(gen);
+        let own = self.dl.mine.contains_key(&gen) && !replica.deleg_ended_at_gate(gen);
         let through = if own {
             cursor.max(replica.stream_applied(gen))
         } else {

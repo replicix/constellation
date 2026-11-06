@@ -510,7 +510,7 @@ impl View {
                     // node's own takeover gate (`Meta::begin_local`): the
                     // core orders the op either way, and after the
                     // stranded rows its gate replays in the second case.
-                    if self.meta.delegate_stranded(gen).unwrap_or(false) {
+                    if self.meta.deleg_ended_at_gate(gen).unwrap_or(false) {
                         tracing::info!(
                             ?rid,
                             gen = %constellation_meta::delegation::GenLabel::of(gen),

@@ -637,7 +637,8 @@ impl Meta {
         // store is the fence. The root's append of a delegate's row
         // (`idx: Some`) is not an execution of this node's.
         if let Some(d) = journal::PendingDelegate::peek() {
-            if d.idx.is_none() && kv_get_tx(tx, &self.local, &deleg_stranded_key(d.gen))?.is_some()
+            if d.idx.is_none()
+                && kv_get_tx(tx, &self.local, &deleg_ended_at_gate_key(d.gen))?.is_some()
             {
                 return Err(MetaError::NotAdmitted);
             }
@@ -1179,12 +1180,16 @@ impl Meta {
             .collect())
     }
 
-    /// Whether a takeover's strand took rows of this node's stream `gen`
-    /// out of it (`Meta::strand_for_takeover`): the stream has a hole the
-    /// generation cannot continue past.
-    pub fn delegate_stranded(&self, gen: u64) -> Result<bool, MetaError> {
+    /// Whether this node's takeover gate ended its own generation `gen`
+    /// (`Meta::strand_for_takeover` marks every own generation, in the
+    /// strand's transaction): the rows it executed as the delegate were
+    /// re-appended under the generation or replayed by rid, and the node
+    /// never executes in it again. Never cleared (generations are not
+    /// reused, ADR-43). The stream has no hole: its counter is the log's
+    /// ([`Meta::end_own_streams_at_log`]).
+    pub fn deleg_ended_at_gate(&self, gen: u64) -> Result<bool, MetaError> {
         let r = self.db.read_tx();
-        Ok(kv_get_tx(&r, &self.local, &deleg_stranded_key(gen))?.is_some())
+        deleg_ended_at_gate_tx(&r, &self.local, gen)
     }
 
     /// Plan 43 C2e follow-up: this node, the delegate of `gen`, holds a grant
@@ -3306,9 +3311,10 @@ mod root_substitution_tests {
         assert!(!meta.delegate_gated_open_elsewhere(6).unwrap());
     }
 
-    /// A takeover's strand of this node's own delegate rows leaves its
-    /// stream counter past them; every generation this node holds is
-    /// marked in the same transaction, holed or not: it ends at the gate.
+    /// A takeover's strand of this node's own delegate rows takes them out
+    /// of the journal and sets the stream counter to the log's index (no
+    /// hole: step 6); every generation this node holds is marked in the
+    /// same transaction: it ends at the gate.
     /// From the mark on, under the writer lock, the node's own delegate
     /// execution under it is refused unwritten (`NotAdmitted`: the fast
     /// path admitted it before the strand, the store is the fence), while
@@ -3345,20 +3351,24 @@ mod root_substitution_tests {
             assert_eq!(idx, n);
         }
         // Before the strand the generation executes.
-        assert!(!meta.delegate_stranded(5).unwrap());
+        assert!(!meta.deleg_ended_at_gate(5).unwrap());
         let stranded = meta.strand_for_takeover(2, &[5, 9], None).unwrap();
         assert_eq!(stranded.locals, 3, "{stranded:?}");
-        assert!(meta.delegate_stranded(5).unwrap());
+        assert!(meta.deleg_ended_at_gate(5).unwrap());
         assert!(
-            meta.delegate_stranded(9).unwrap(),
+            meta.deleg_ended_at_gate(9).unwrap(),
             "a generation without a row here ends at the gate too"
         );
         assert!(
-            !meta.delegate_stranded(11).unwrap(),
+            !meta.deleg_ended_at_gate(11).unwrap(),
             "not one of this node's"
         );
-        assert_eq!(meta.delegate_idx(5).unwrap(), 3, "the counter stays");
         assert_eq!(meta.log_stream_idx(5).unwrap(), 0);
+        assert_eq!(
+            meta.delegate_idx(5).unwrap(),
+            meta.log_stream_idx(5).unwrap(),
+            "the stream has no hole: its counter is the log's"
+        );
         assert!(meta.delegate_txs_from(5, 1, usize::MAX).unwrap().is_empty());
 
         // The fence: the node's own execution under an ended generation is
@@ -3378,7 +3388,7 @@ mod root_substitution_tests {
                 "gen {gen}: {refused:?}"
             );
             assert_eq!(meta.journal_len().unwrap(), journal);
-            assert_eq!(meta.delegate_idx(5).unwrap(), 3);
+            assert_eq!(meta.delegate_idx(5).unwrap(), 0);
             assert!(meta.lookup(ROOT_INO, "f4").unwrap().is_none());
         }
         // A generation this node still delegates is not fenced.
@@ -3418,7 +3428,7 @@ mod root_substitution_tests {
         // tail's re-journal would precede it.
         let quiet = Meta::open_in_memory().unwrap();
         assert!(!quiet.strand_for_takeover(2, &[7], None).unwrap().any());
-        assert!(quiet.delegate_stranded(7).unwrap());
+        assert!(quiet.deleg_ended_at_gate(7).unwrap());
         let refused = quiet.delegate_execute(
             &create("f1", 1),
             Some(rid(1)),
@@ -3665,20 +3675,49 @@ fn deleg_held_key(gen: u64) -> String {
     format!("deleg_held_boot:{gen}")
 }
 
-/// `local` kv: generation `gen`'s stream lost rows to a takeover's
-/// strand (`Meta::strand_for_takeover`); this node, its delegate, never
-/// executes in it again.
-fn deleg_stranded_key(gen: u64) -> String {
-    format!("deleg_stranded:{gen}")
+/// `local` kv: this node's takeover gate ended its own generation `gen`
+/// (`Meta::strand_for_takeover`): its rows were re-appended under the
+/// generation or replayed by rid; this node, its delegate, never executes
+/// in it again.
+fn deleg_ended_at_gate_key(gen: u64) -> String {
+    format!("deleg_ended_at_gate:{gen}")
 }
 
-/// Mark generation `gen` stranded (see [`deleg_stranded_key`]).
-pub(crate) fn mark_deleg_stranded_tx(
+/// Whether the mark of [`deleg_ended_at_gate_key`] is set, in the caller's
+/// snapshot or transaction.
+pub(crate) fn deleg_ended_at_gate_tx(
+    r: &impl Readable,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+) -> Result<bool, MetaError> {
+    Ok(kv_get_tx(r, local, &deleg_ended_at_gate_key(gen))?.is_some())
+}
+
+/// Mark generation `gen` ended at this node's takeover gate (see
+/// [`deleg_ended_at_gate_key`]).
+pub(crate) fn mark_deleg_ended_at_gate_tx(
     tx: &mut SingleWriterWriteTx,
     local: &SingleWriterTxKeyspace,
     gen: u64,
 ) {
-    kv_set_tx(tx, local, &deleg_stranded_key(gen), "1");
+    kv_set_tx(tx, local, &deleg_ended_at_gate_key(gen), "1");
+}
+
+/// Plan 46 M1.2 step 6 (c3-spec D7): an ended-at-the-gate generation's stream
+/// counter is the log's index of it: the rows the gate did not re-append
+/// left the journal and are replayed by rid, as root rows, so the stream
+/// has no row past what the log holds of it (no hole) and a recall of it
+/// is answered from the counter.
+pub(crate) fn settle_deleg_idx_at_log_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+) -> Result<(), MetaError> {
+    let at = kv_get_tx(tx, local, &deleg_log_idx_key(gen))?
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    kv_set_tx(tx, local, &deleg_idx_key(gen), &at.to_string());
+    Ok(())
 }
 
 /// Raise the persisted log index of `gen` to `idx`.

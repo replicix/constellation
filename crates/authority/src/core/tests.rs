@@ -15936,11 +15936,14 @@ mod locks {
     }
 
     /// strand-takeover-quiescence: a takeover's strand of a delegate's own
-    /// rows marks the generation; a restarted core re-adopts it stopped
-    /// and answers a recall at the log's index of the stream, not its
-    /// counter.
+    /// rows marks the generation (`deleg_ended_at_gate`); a restarted core
+    /// re-adopts it stopped and answers a recall from the stream's counter,
+    /// which is the log's index of it: no hole (plan 46 M1.2 step 6; before,
+    /// the counter stayed past the rows the strand took out and the answer
+    /// was a separate branch). Fails on the parent: the counter stayed 2
+    /// with the log at 0.
     #[test]
-    fn a_restarted_delegate_re_adopts_a_stranded_generation_stopped() {
+    fn a_restarted_delegate_re_adopts_an_ended_generation_stopped() {
         let mut h = Harness::new(3);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
@@ -15950,7 +15953,11 @@ mod locks {
         assert!(!h.core.dl.mine[&7].stopped);
         two_delegate_rows(&h, dir);
         h.meta.strand_for_takeover(2, &[7], None).unwrap();
-        assert_eq!(h.meta.delegate_idx(7).unwrap(), 2, "the counter stays");
+        assert_eq!(
+            h.meta.delegate_idx(7).unwrap(),
+            h.meta.log_stream_idx(7).unwrap(),
+            "no hole: the counter is the log's"
+        );
         // The restart.
         h.core = Core::new(h.core.cfg.clone());
         h.core.lease.cached_holder = Some(1);
@@ -15997,7 +16004,7 @@ mod locks {
         );
         assert!(!h.core.dl.mine[&7].stopped);
         h.core.complete_gate(h.clk(), &h.meta, &mut out);
-        assert!(h.meta.delegate_stranded(7).unwrap());
+        assert!(h.meta.deleg_ended_at_gate(7).unwrap());
         assert!(h.core.dl.mine[&7].stopped, "the gate left it running");
     }
 
@@ -16102,7 +16109,84 @@ mod locks {
             h.meta.pending_replays().unwrap().is_empty(),
             "nothing is executed again by rid"
         );
-        assert!(h.meta.delegate_stranded(7).unwrap());
+        assert!(h.meta.deleg_ended_at_gate(7).unwrap());
+        // Verbatim, under their generation, and no hole: the stream's
+        // counter is the log's index of it.
+        assert_eq!(h.meta.log_stream_idx(7).unwrap(), 2);
+        assert_eq!(h.meta.delegate_idx(7).unwrap(), 2);
+    }
+
+    /// Plan 46 M1.2 step 6 (c3-spec D7): a row the gate does not re-append
+    /// (here: its dependencies were not captured, so it and the rest replay
+    /// by rid as root rows) leaves no hole in its stream. The counter is the
+    /// log's index, which is the generation's end, and a recall of it
+    /// afterwards, at this node as the generation's delegate again, is
+    /// answered from the log, `through` the log's index and never the rows
+    /// the replay took. Fails on the parent: the counter stayed 2 with the
+    /// log at 0, and only a separate branch of the recall answer covered it.
+    #[test]
+    fn a_row_the_gate_does_not_re_append_leaves_no_hole_in_its_stream() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let (dir, _) = delegated_file(&h.meta);
+        two_delegate_rows(&h, dir);
+        let rows: Vec<_> = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+            .into_iter()
+            .filter(|tx| tx.origin.0 == 7)
+            .map(|tx| (tx, None))
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(h.meta.delegate_idx(7).unwrap(), 2);
+        h.core = Core::new(h.core.cfg.clone());
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: true,
+            }),
+        );
+        h.core.bk.gate_own_rows = Some((2, rows));
+        let mut out = Vec::new();
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.stats.own_deleg_rows_reappended, 0);
+        assert!(h.meta.deleg_ended_at_gate(7).unwrap());
+        assert_eq!(h.meta.log_stream_idx(7).unwrap(), 0);
+        assert_eq!(
+            h.meta.delegate_idx(7).unwrap(),
+            0,
+            "the replayed rows are root rows: the stream has no index past the log's"
+        );
+        // A restarted core re-adopts it stopped; a recall is answered from
+        // the counter.
+        h.core = Core::new(h.core.cfg.clone());
+        h.core.lease.cached_holder = Some(1);
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegRecall {
+                req: OpId(5),
+                dir,
+                gen: 7,
+            },
+        });
+        assert!(
+            sends(&out).iter().any(|(to, m)| *to == 1
+                && matches!(
+                    m,
+                    PeerMsg::DelegRecalled {
+                        gen: 7,
+                        through: 0,
+                        ..
+                    }
+                )),
+            "{out:?}"
+        );
     }
 
     /// The gate on the same delegate with a tail that ends the generation
@@ -16571,7 +16655,7 @@ mod locks {
         let mut out = Vec::new();
         h.core.complete_gate(h.clk(), &h.meta, &mut out);
         assert_eq!(h.meta.void_cut(g).unwrap(), Some(0));
-        assert!(h.meta.delegate_stranded(g).unwrap());
+        assert!(h.meta.deleg_ended_at_gate(g).unwrap());
         assert!(h.core.dl.mine[&g].stopped, "the gate left it running");
     }
 
@@ -16755,7 +16839,7 @@ mod locks {
             }),
         );
         h.core.complete_gate(h.clk(), &h.meta, &mut out);
-        assert!(h.meta.delegate_stranded(7).unwrap());
+        assert!(h.meta.deleg_ended_at_gate(7).unwrap());
         assert_eq!(h.meta.log_stream_idx(7).unwrap(), 2, "re-appended");
         // The root side: it inherits the generation it delegated to
         // itself and ends it.

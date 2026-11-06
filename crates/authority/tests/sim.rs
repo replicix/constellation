@@ -14678,7 +14678,7 @@ fn regression_a_grant_handed_back_during_a_release_is_renewed() {
 /// persisted stream counter still counted the stranded rows: its next
 /// row followed the hole, the new root's cursor waited below it, and the
 /// same batch was re-sent for the rest of the run. Now the strand marks
-/// the generation (`Meta::delegate_stranded`): it executes nothing more
+/// the generation (`Meta::deleg_ended_at_gate`): it executes nothing more
 /// and answers a recall at the log's index of it, so the root ends it.
 #[test]
 fn regression_locks_unlinked_delegated_dbackup_random_seeds_2477_2982() {

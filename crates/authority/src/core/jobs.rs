@@ -1499,7 +1499,7 @@ impl Core {
                     // not list, which the strand marks the same way, with or
                     // without a tail: the mark is never lifted.)
                     for (gen, d) in self.dl.mine.iter_mut() {
-                        if replica.delegate_stranded(*gen) {
+                        if replica.deleg_ended_at_gate(*gen) {
                             d.stopped = true;
                         }
                     }
@@ -1752,6 +1752,13 @@ impl Core {
                 "re-appended this node's own delegate rows after the predecessor's tail"
             );
         }
+        // Plan 46 M1.2 step 6 (c3-spec D7): the generations end here at what
+        // the log holds of them, the rows just re-appended counted. A row
+        // that did not go back left the journal (replayed by rid as a root
+        // row), so no stream index of the generation is past the log's: no
+        // hole, and a recall of it is answered from the counter.
+        let gens: Vec<u64> = own_gens.into_iter().collect();
+        replica.end_own_streams_at_log(&gens)?;
         Ok(())
     }
 

@@ -402,10 +402,14 @@ pub trait Replica {
     /// executed. `true` if it waited (one writer-lock turn); nothing
     /// while no such write is in its transaction.
     fn settle_tagged_writes(&self) -> bool;
-    /// A takeover's strand took rows of this delegate's stream `gen` out
-    /// of it (`Meta::delegate_stranded`): the generation is never
-    /// executed in here again.
-    fn delegate_stranded(&self, gen: u64) -> bool;
+    /// This node's takeover gate ended its own generation `gen`
+    /// (`Meta::deleg_ended_at_gate`): the generation is never executed in
+    /// here again.
+    fn deleg_ended_at_gate(&self, gen: u64) -> bool;
+    /// The gate's re-append of its own rows under `gens` is done: their
+    /// stream counters are the log's index of each, no hole
+    /// (`Meta::end_own_streams_at_log`).
+    fn end_own_streams_at_log(&self, gens: &[u64]) -> Result<(), String>;
     /// Plan 43 C2e follow-up: record (synced) that this node holds a grant of
     /// `gen` on boot `boot` (`Meta::deleg_note_held`); `false`: it could not
     /// be, and the grant must not be used.
@@ -1456,13 +1460,17 @@ impl Replica for Meta {
         Meta::settle_tagged_writes(self)
     }
 
-    fn delegate_stranded(&self, gen: u64) -> bool {
+    fn deleg_ended_at_gate(&self, gen: u64) -> bool {
         // An unreadable mark is taken as set: the cost is a generation
         // ended early, not a stream that never drains.
-        Meta::delegate_stranded(self, gen).unwrap_or_else(|e| {
-            tracing::warn!(gen = %constellation_meta::delegation::GenLabel::of(gen), error = %e, "delegate-stranded mark unreadable; taking it as set");
+        Meta::deleg_ended_at_gate(self, gen).unwrap_or_else(|e| {
+            tracing::warn!(gen = %constellation_meta::delegation::GenLabel::of(gen), error = %e, "gate-ended mark unreadable; taking it as set");
             true
         })
+    }
+
+    fn end_own_streams_at_log(&self, gens: &[u64]) -> Result<(), String> {
+        Meta::end_own_streams_at_log(self, gens).map_err(|e| e.to_string())
     }
 
     fn deleg_note_held(&self, gen: u64, boot: u64) -> bool {
