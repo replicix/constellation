@@ -4843,12 +4843,13 @@ impl Core {
     }
 
     /// The cadence of the root's ship (`sync_interval_ms`), and so of an
-    /// archive-bound commit's rise: the delegate's fallback ask.
+    /// archive-bound commit's rise: the delegate's fallback ask. Capped at
+    /// the stream back-off's ceiling (2 s): `sync_interval_ms` is only the
+    /// floor of the ship cadence (close and fsync nudge a ship sooner), and a
+    /// lost push must not park an answer for a long configured interval.
     fn deleg_ship_interval_ms(&self) -> u64 {
-        self.cfg
-            .sync_interval_ms
-            .max(self.cfg.delegation_stream_tick_ms)
-            .max(1)
+        let tick = self.cfg.delegation_stream_tick_ms.max(1);
+        self.cfg.sync_interval_ms.clamp(tick, 2_000.max(tick))
     }
 
     /// An ask for the commit was refused, failed or timed out: the next one
@@ -4858,13 +4859,16 @@ impl Core {
         let tick = self.cfg.delegation_stream_tick_ms.max(1);
         let ship = self.deleg_ship_interval_ms();
         if let Some(d) = self.dl.mine.get_mut(&gen) {
-            if d.archive_bound {
-                // The next ask is the fallback's: one ship interval on.
-                d.poke_after = Some(now.wait.plus(ship));
-                return;
-            }
             d.poke_backoff_ms = (d.poke_backoff_ms * 2).clamp(tick * 4, 2_000);
-            d.poke_after = Some(now.wait.plus(d.poke_backoff_ms));
+            // Archive-bound: the next ask is the fallback's, one ship interval
+            // on, and no sooner than the back-off (a partitioned root is not
+            // asked more often than without the flag).
+            let wait = if d.archive_bound {
+                ship.max(d.poke_backoff_ms)
+            } else {
+                d.poke_backoff_ms
+            };
+            d.poke_after = Some(now.wait.plus(wait));
         }
     }
 
