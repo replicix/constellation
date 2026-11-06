@@ -5098,6 +5098,65 @@ fn a_retired_nodes_stranded_journal_is_not_replayed() {
     }
 }
 
+/// Plan 46 M1.1 step 5 (the admin leave records the retired node in every
+/// lease): the retirement drop forgets only a source's stranded journal,
+/// never an acknowledged row whose group or archive holds it. A row the
+/// holder streamed as committed (its backups held it, or a delegate's row
+/// it appended, `origin` != (0, 0)) is not stranded by a later tenure's
+/// takeover, so no replay of it is ever queued for the drop to forget —
+/// whether its source is retired as root or retired later, while it was
+/// a delegate or a plain member. The successor re-ships it from its tail
+/// (or the delegate re-streams it).
+#[test]
+fn a_retired_former_roots_committed_stream_is_not_dropped() {
+    // (delegate origin)
+    for origin in [(0, 0), (7, 1)] {
+        let mut h = Harness::new(2);
+        h.core.lease.cached_holder = Some(3);
+        let rid = Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 4,
+        };
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let records = [
+            LogRecord::Create {
+                parent: ROOT_INO,
+                name: "acked-by-the-group".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 3,
+            },
+            LogRecord::Completed { rid },
+        ];
+        // Node 1 was root at epoch 1 and streamed the row as committed.
+        h.meta
+            .install_streamed_committed(1, 1, 2, 3, &records, true, origin)
+            .unwrap();
+        // Node 3 took over (epoch 2); node 1 then retired while not root:
+        // the leave recorded it in node 3's lease (`Lease::with_retired`).
+        h.meta.strand_below_epoch(2).unwrap();
+        assert!(
+            h.meta.pending_replays().unwrap().is_empty(),
+            "{origin:?}: a committed streamed row is not stranded by a takeover"
+        );
+        let lease = lease_of(3, 3, h.now.plus(10_000).0);
+        let lease = lease.with_retired(1);
+        let now = h.now;
+        h.core.lease.note_object(&lease);
+        let mut out = Vec::new();
+        h.core.on_drain_tick(Now::same(now.0), &h.meta, &mut out);
+        assert_eq!(h.core.stats.replays_of_retired_dropped, 0, "{origin:?}");
+        assert_eq!(
+            h.meta.streamed_tip(1).unwrap(),
+            Some(3),
+            "{origin:?}: the committed entry is still held here"
+        );
+    }
+}
+
 /// Read-your-writes across a stranding: while one of this node's own ops
 /// is queued for replay (rolled back), reads of its keys wait even on the
 /// fast path; other keys do not.
