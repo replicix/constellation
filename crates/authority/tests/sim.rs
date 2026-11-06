@@ -5700,6 +5700,7 @@ fn sweep_config() {
         "flex" => flex_config(),
         "flex-crash" => flex_crash_config(),
         "flex-backup" => flex_backup_config(),
+        "flex-zero" => flex_zero_config(),
         "drop-held-chain" => drop_held_chain_config(),
         "drop-held-chain-requester-dies" => drop_held_chain_requester_dies_config(),
         "drop-held-chain-backed" => drop_held_chain_backed_config(),
@@ -11661,6 +11662,11 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
         },
         "lone" => SimConfig {
             strict_lone: true,
+            ..cfg
+        },
+        // Plan 46 M1.4 step 0: the durability oracle strict (`+durability`).
+        "durability" => SimConfig {
+            strict_durability: true,
             ..cfg
         },
         "oracles" => SimConfig {
