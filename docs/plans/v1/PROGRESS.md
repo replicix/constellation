@@ -67769,3 +67769,24 @@ From the step's review (land after items 1 to 3; item 4 is a note).
    the claim reads it) or accept it is for the plan's owner.
 4. **Follow-up, not built** (plan 46 M1.2 notes): the writer-lock hold over a takeover's tail is unbounded; proposal: cap the holder's unshipped
    rows (about 20,000) with back-pressure on the fast path; the hold is reported per takeover as `reship.duration_ms_max`.
+
+
+### Plan 46 M1.1 step 7 follow-up: mechanism D and `delegated-designated` 136 (2026-11-06)
+
+The two `strict_commit` exceptions the lki1 triage left without a pinned path, root-caused and fixed:
+
+| | Cause | Class | Fix |
+|---|---|---|---|
+| D | The takeover gate's inbox drain journaled a lapsed-grant refusal as `error.code()` (`EIO`), the one site `LAPSED_CODE` (plan 30 §M14) had not reached. `EIO` is a dropped op's code (`DROPPED_CODE`), so `completed_source` read the lone root's own refusal as a drop's and answered it as another node's: a claim of `archive_waits` for its `Singleton` row (answered at the acquisition's end, `on_acquire_finished` → `resolve_in_doubt_then_execute`) | wrong claim only (the answer is the singleton's) | the drain journals `LAPSED_CODE`, as the P2P, local, delegate and replay paths do |
+| 136 | A forward of a rid whose `EXDEV` refusal the inbox drain had journaled 8 ms before (unshipped) met `RecallPlan::Refuse` first and was answered at once, unjournaled, with the designation's `Final` | product, I1: an answer of a row its configuration had not committed | a rid with an outcome here skips the designation's refusal; the dedup answers it once its row commits |
+
+**Exemptions removed:** `locks-unlinked-delegated-partition`, `locks-delegated-partition` (and `-skew`), `locks-unlinked-delegated-random`, `delegated-designated`; `strict_commit_is_the_default_of_a_delegated_configuration` pins them strict.
+
+**Tests.** Core `an_inbox_ops_lapsed_refusal_is_journaled_as_lapsed` (fails before: `Refused { Io }`, its source the archive), `a_forward_refused_by_a_journaled_designation_refusal_waits_for_its_row` (fails before: `EXDEV` in the same step).
+
+**Sweeps** (×2,000, `+commit`, box 1): `locks-unlinked-delegated-partition`, `locks-delegated-partition`, `locks-unlinked-delegated-random`,
+`delegated-designated` 0 failing; `locks-delegated-partition-skew` 15 (before 19): 0 claim or I1 (before 2 claims of D), the known stale
+reads (14, before 16) and seed 339's lock wait (as before).
+
+**Gates** (box 1): fmt `--check`, clippy `--workspace --all-targets -D warnings` debug and release clean; authority lib 1,065 debug and
+release; release sim suite 423 passed, 0 failed, 13 ignored.

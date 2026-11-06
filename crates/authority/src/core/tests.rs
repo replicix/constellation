@@ -33152,6 +33152,120 @@ fn undelegate_refuses_a_designation() {
     );
 }
 
+/// Plan 46 I1: a forward of a rid whose refusal this root already journaled
+/// (an inbox drain refused the same op under the designation) is answered
+/// from that row once it commits, not refused anew at once: the answer was
+/// the drain's row's outcome before the row was in the archive
+/// (`delegated-designated+commit` seed 136). Fails on the parent: `EXDEV`
+/// in the same step, the row unshipped.
+#[test]
+fn a_forward_refused_by_a_journaled_designation_refusal_waits_for_its_row() {
+    let (mut h, dir) = root_with_dir();
+    let other = h.meta.allocate_ino(ROOT_INO).unwrap();
+    crate::replica::Replica::apply_segment(
+        &h.meta,
+        2,
+        1,
+        0,
+        &[],
+        &[],
+        &[
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "d2".into(),
+                ino: other,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+            LogRecord::Create {
+                parent: dir,
+                name: "f".into(),
+                ino: (1u64 << 40) | 77,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 2,
+            },
+            LogRecord::Delegate {
+                dir,
+                node: 2,
+                gen: 1,
+                designated: true,
+                range: (0, 0),
+            },
+        ],
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+    let rename = MutateOp::Rename {
+        parent: dir,
+        name: "f".into(),
+        new_parent: other,
+        new_name: "f".into(),
+        noreplace: false,
+    };
+    let forward = |h: &mut Harness, req: u64, seq: u64| {
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: Rid {
+                    node: 3,
+                    incarnation: 1,
+                    seq,
+                },
+                op: rename.clone(),
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: false,
+            },
+        })
+    };
+    let reply = |out: &[Action], req: u64| {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::MutateReply {
+                req: r, outcome, ..
+            } if to == 3 && *r == OpId(req) => Some(outcome.clone()),
+            _ => None,
+        })
+    };
+    // A fresh rid: refused at once, nothing journaled (the designation's).
+    let out = forward(&mut h, 1, 1);
+    assert_eq!(
+        reply(&out, 1),
+        Some(MutateOutcome::Errno(Code::CrossDevice)),
+        "{out:?}"
+    );
+    // The drain journaled the refusal of rid 2 (unshipped); its forward waits.
+    let rid = Rid {
+        node: 3,
+        incarnation: 1,
+        seq: 2,
+    };
+    {
+        let _class = h.core.journal_class_for(super::Asker::Remote);
+        crate::replica::Replica::journal_refusal(&h.meta, rid, Code::CrossDevice, Some(&rename))
+            .unwrap();
+    }
+    let out = forward(&mut h, 2, 2);
+    assert_eq!(
+        reply(&out, 2),
+        None,
+        "answered before its row commits: {out:?}"
+    );
+    let out = h.archive_lands();
+    assert_eq!(
+        reply(&out, 2),
+        Some(MutateOutcome::Errno(Code::CrossDevice)),
+        "{out:?}"
+    );
+}
+
 /// `startup-link-lag`: the root delegates `d1` to node 3, and node 2's
 /// write into it reaches the root (node 2 had no link to 3 yet). The
 /// root redirects it to the delegate only if its own links show 3

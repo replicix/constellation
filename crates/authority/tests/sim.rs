@@ -7034,11 +7034,6 @@ fn delegated_designated_config() -> SimConfig {
                 for_ms: 9_000,
             },
         }],
-        strict_commit_exempt: Some(
-            "plan 46 M1.1 follow-up (lki1, unscheduled): a forward refused `EXDEV` under an \
-             unreachable designation journals nothing and is answered at once, while an inbox \
-             drain of the same rid journaled the same refusal, unshipped (seed 136 of 2,000)",
-        ),
         ..delegated_config()
     }
 }
@@ -15778,6 +15773,9 @@ fn c0_count(map: &std::collections::BTreeMap<String, usize>, key: &str) -> usize
 fn strict_commit_is_the_default_of_a_delegated_configuration() {
     assert!(delegated_config().is_delegated());
     assert!(delegated_config().strict_commit_exemption().is_none());
+    assert!(delegated_designated_config()
+        .strict_commit_exemption()
+        .is_none());
     assert!(placement_hot_config().is_delegated());
     assert!(!SimConfig::default().is_delegated());
     for cfg in [
@@ -15791,7 +15789,6 @@ fn strict_commit_is_the_default_of_a_delegated_configuration() {
         locks_delegate_ahead_config(),
         locks_executor_behind_config(),
         locks_unlinked_blips_config(),
-        delegated_designated_config(),
     ] {
         let why = cfg.strict_commit_exemption().expect("an exception");
         assert!(why.contains("plan 46 M"), "{why}");

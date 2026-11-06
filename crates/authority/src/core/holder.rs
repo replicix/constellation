@@ -410,9 +410,18 @@ impl Core {
                         return;
                     }
                 }
+                // A rid that already has its outcome here (a retry, a forward
+                // of an op an inbox drain refused) is answered from it below,
+                // once its row commits: nothing runs, so nothing is refused
+                // anew for the designation (seed 136 of `delegated-designated`:
+                // answered `EXDEV` at once while the drain's journaled copy of
+                // the same refusal was unshipped).
+                let has_outcome = replica.recent_outcome(rid).is_some()
+                    || replica.completed_outcome(rid).ok().flatten().is_some();
                 let wait = match self.deleg_recall_plan(now, &keys, replica, out) {
                     super::delegate::RecallPlan::None => Default::default(),
                     super::delegate::RecallPlan::Wait(w) => w,
+                    super::delegate::RecallPlan::Refuse(_) if has_outcome => Default::default(),
                     // The gate recalls nothing (ADR-42): the requester retries.
                     super::delegate::RecallPlan::Gated => {
                         if req != OpId(0) {
