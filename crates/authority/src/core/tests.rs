@@ -40135,7 +40135,7 @@ fn deposed_root_with_a_marker_replay() -> (Harness, Rid, constellation_meta::Str
     assert!(h
         .meta
         .apply_delegate_tx(
-            &[data],
+            &[data, LogRecord::Completed { rid: data_rid }],
             Some(data_rid),
             4,
             7,
@@ -40596,7 +40596,7 @@ fn a_replay_does_not_wait_on_the_successors_stream_of_an_undone_grants_number() 
     assert!(h
         .meta
         .apply_delegate_tx(
-            &[data],
+            &[data, LogRecord::Completed { rid: data_rid }],
             Some(data_rid),
             4,
             7,
@@ -40921,7 +40921,7 @@ fn a_deposed_nodes_own_op_keeps_the_live_rows_its_queue_entry_recorded() {
     assert!(h
         .meta
         .apply_delegate_tx(
-            &[data],
+            &[data, LogRecord::Completed { rid: data_rid }],
             Some(data_rid),
             4,
             7,

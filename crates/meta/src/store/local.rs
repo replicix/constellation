@@ -3996,7 +3996,7 @@ mod origin_index_tests {
                     // A root's append of another delegate's transaction,
                     // one to three records.
                     appended_idx += 1;
-                    let records: Vec<LogRecord> = (0..1 + rng.below(3))
+                    let mut records: Vec<LogRecord> = (0..1 + rng.below(3))
                         .map(|k| LogRecord::Create {
                             parent: c | 1,
                             name: format!("c{n}-{k}"),
@@ -4012,6 +4012,10 @@ mod origin_index_tests {
                         incarnation: 1,
                         seq: n,
                     });
+                    // A delegate journals the completion of its rid.
+                    if let Some(rid) = rid {
+                        records.push(LogRecord::Completed { rid });
+                    }
                     meta.apply_delegate_tx(
                         &records,
                         rid,

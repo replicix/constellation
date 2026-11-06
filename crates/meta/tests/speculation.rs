@@ -1587,14 +1587,10 @@ fn a_root_appending_a_delegates_git_object_keeps_the_object() {
             .unwrap());
     }
     for (idx, (r, _, recs)) in ops.iter().enumerate() {
-        let body: Vec<LogRecord> = recs
-            .iter()
-            .filter(|rec| !matches!(rec, LogRecord::Completed { .. }))
-            .cloned()
-            .collect();
+        // The delegate's row carries its own `Completed`.
         assert!(meta
             .apply_delegate_tx(
-                &body,
+                recs,
                 Some(*r),
                 gen,
                 idx as u64 + 1,
@@ -2223,7 +2219,7 @@ fn a_root_appending_a_delegates_exchange_over_its_shadow_swaps_once() {
     assert_eq!(names(&meta), (Some(b), Some(a)), "read-your-writes");
     assert!(meta
         .apply_delegate_tx(
-            std::slice::from_ref(&exchange),
+            &[exchange.clone(), completed(rid(1))],
             Some(rid(1)),
             gen,
             1,
@@ -2337,7 +2333,7 @@ fn o1_a_root_appending_an_exchange_under_a_later_shadow_keeps_their_order() {
             .unwrap());
     }
     meta.apply_delegate_tx(
-        std::slice::from_ref(&e1),
+        &[e1.clone(), completed(rid(1))],
         Some(rid(1)),
         5,
         1,
@@ -2395,7 +2391,7 @@ fn o1_a_root_appending_a_rename_under_a_later_shadow_keeps_their_order() {
         )
         .unwrap());
     meta.apply_delegate_tx(
-        std::slice::from_ref(&rename),
+        &[rename.clone(), completed(rid(1))],
         Some(rid(1)),
         5,
         1,
@@ -2433,7 +2429,7 @@ fn o1_a_root_appending_over_its_own_shadow_takes_the_shadows_place() {
     }
     assert!(meta
         .apply_delegate_tx(
-            &[create("a", x, 10)],
+            &[create("a", x, 10), completed(rid(1))],
             Some(rid(1)),
             5,
             1,
@@ -2513,7 +2509,7 @@ fn o1_a_root_appending_under_its_own_rows_keeps_the_journal_order() {
         .unwrap());
     assert!(meta
         .apply_delegate_tx(
-            std::slice::from_ref(&rename),
+            &[rename.clone(), completed(rid(1))],
             Some(rid(1)),
             5,
             1,

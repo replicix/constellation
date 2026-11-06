@@ -329,7 +329,7 @@ fn a_deposed_roots_replay_names_the_delegate_rows_it_was_ordered_after() {
     };
     assert!(meta
         .apply_delegate_tx(
-            &[data],
+            &[data, LogRecord::Completed { rid: data_rid }],
             Some(data_rid),
             gen,
             idx,
@@ -362,7 +362,7 @@ fn a_deposed_roots_replay_names_the_delegate_rows_it_was_ordered_after() {
     };
     assert!(meta
         .apply_delegate_tx(
-            &[later],
+            &[later, LogRecord::Completed { rid: later_rid }],
             Some(later_rid),
             gen,
             idx + 1,
@@ -420,7 +420,7 @@ fn a_replay_does_not_name_rows_of_a_grant_the_strand_undoes() {
     };
     assert!(meta
         .apply_delegate_tx(
-            &[data],
+            &[data, LogRecord::Completed { rid: data_rid }],
             Some(data_rid),
             gen,
             idx,
@@ -1453,7 +1453,12 @@ fn a_rebuild_takes_back_the_stream_index_of_a_delegate_row_it_drops() {
     let append = |meta: &Meta| {
         assert!(meta
             .apply_delegate_tx(
-                std::slice::from_ref(&create),
+                &[
+                    create.clone(),
+                    LogRecord::Completed {
+                        rid: delegate_rid(1),
+                    },
+                ],
                 Some(delegate_rid(1)),
                 gen,
                 1,
@@ -2158,7 +2163,7 @@ fn holder_appends_from_is_the_full_read_from_the_index_on() {
         };
         assert!(meta
             .apply_delegate_tx(
-                &[create],
+                &[create, LogRecord::Completed { rid: r }],
                 Some(r),
                 gen,
                 idx,
