@@ -33064,7 +33064,6 @@ fn a_forward_refused_by_a_journaled_designation_refusal_waits_for_its_row() {
                 node: 2,
                 gen: 1,
                 designated: true,
-                range: (0, 0),
             },
         ],
     )
