@@ -2907,6 +2907,69 @@ mod root_substitution_tests {
         );
     }
 
+    /// The simulation's row-version oracle (fail-before: `None` for a row
+    /// journaled before the generation's first `DelegGroup` record, which the
+    /// oracle then judged against the version applied by the end of the
+    /// event, `long-delegated-backup` seed 1938 under slow lease reads): the
+    /// version in force at a row's journal position is 0 ("no group") until
+    /// the first record is applied, and `None` only for a generation with no
+    /// recorded version.
+    #[test]
+    fn the_group_version_at_a_position_before_the_first_record_is_zero() {
+        use crate::session::DelegDurable;
+        use crate::store::journal::{clear_last_journaled, take_last_journaled};
+        let meta = Meta::open_in_memory().unwrap();
+        let mut n = 0;
+        let mut fast = |version| {
+            meta.session().set_deleg_durable(
+                5,
+                Some(DelegDurable {
+                    commit: RowCommit::group(version, GroupOn::Delegate),
+                    through: 0,
+                    horizon: u64::MAX,
+                    lost: false,
+                }),
+            );
+            n += 1;
+            clear_last_journaled();
+            meta.delegate_execute_admitted(
+                &MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: format!("f{n}"),
+                    ino: (3 << 40) | n,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                Some(Rid {
+                    node: 3,
+                    incarnation: 1,
+                    seq: n,
+                }),
+                5,
+                Default::default(),
+                &crate::locks::LockTag::NONE,
+                Now::same(0),
+                Box::new(|| true),
+            )
+            .unwrap();
+            take_last_journaled().unwrap().first
+        };
+        let before = fast(0);
+        assert_eq!(meta.deleg_group_at(5, before), None, "nothing recorded");
+        meta.apply_records(&[LogRecord::DelegGroup {
+            dir: ROOT_INO,
+            gen: 5,
+            version: 1,
+            backups: vec![2],
+        }])
+        .unwrap();
+        let after = fast(1);
+        assert_eq!(meta.deleg_group_at(5, before), Some(0));
+        assert_eq!(meta.deleg_group_at(5, after), Some(1));
+        assert_eq!(meta.deleg_group_at(6, after), None);
+    }
+
     /// Plan 46 M1.1 step 4 (review; fail-before: the fast path stamps a
     /// `Singleton` row past the published lead): a lone delegate's own load is
     /// bounded by the lead (the committed prefix plus `delegation_stream_rows`,

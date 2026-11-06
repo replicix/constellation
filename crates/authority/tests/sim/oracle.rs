@@ -1507,7 +1507,8 @@ fn deleg_group(
 ///   group_version`; 0 while no record is applied).
 /// - `Group{on: Root}`: the root's lease configuration (`config_version` of
 ///   the lease object) of the row's epoch. A row journaled while no lease is
-///   held (epoch 0) carries version 0, "no configuration yet"
+///   held (epoch 0) carries the version of the lease the node last held, 0
+///   if it never held one, "no configuration yet"
 ///   (`Core::root_config_version`). A takeover's re-journaled tail of the
 ///   predecessor carries the successor's configuration (the one in force in
 ///   the journal the rows are in: `Core::apply_backup_tail`), and so does a
@@ -1624,12 +1625,13 @@ impl RowVersions {
                 continue;
             };
             self.checked += 1;
-            let in_lease = if epoch == 0 {
-                // No lease held: "no configuration yet".
-                v == 0
-            } else {
-                v == lease_now || Some(v) == lease_prev
-            };
+            // The lease the core holds, else the one it last held
+            // (`Core::root_config_version`), whatever the row's epoch: a row
+            // journaled at epoch 0 after the lease was lost (the window after
+            // `clear_holder_epoch`, an inbox drain after a deposition) belongs
+            // to the last tenure's configuration, and a node that never held
+            // one has version 0, "no configuration yet".
+            let in_lease = v == lease_now || Some(v) == lease_prev;
             let group_prev = group_before.get(&gen).copied().unwrap_or(0);
             // The version the node's replica had applied at the row's journal
             // position (`Meta::deleg_group_at`), exactly: a stamp one record
@@ -3378,8 +3380,10 @@ mod tests {
             // ok: a delegate row at the applied group / the one before it.
             row(3, 0, 7, 1, RowCommit::group(2, GroupOn::Delegate)),
             row(4, 0, 7, 2, RowCommit::group(1, GroupOn::Delegate)),
-            // ok: no configuration yet, and a delegate archive row with no group.
-            row(5, 0, 0, 0, RowCommit::LONE),
+            // ok: a root row at epoch 0 (no lease held now) carrying the
+            // lease the node holds or last held, and a delegate archive row
+            // with no group.
+            row(5, 0, 0, 0, RowCommit::Singleton { config_version: 6 }),
             row(6, 0, 7, 3, RowCommit::ARCHIVE),
             // ok: Final is not judged.
             row(7, 0, 7, 4, RowCommit::Final),
@@ -3489,6 +3493,65 @@ mod tests {
         rv.tick(1, 0, &|_| 1);
         rv.judge(1, &[row(19, 3)], 0, &|_| 1, &|_| 1, &|_, _| None);
         assert_eq!(rv.violations.len(), 1, "{:?}", rv.violations);
+    }
+
+    /// A root row journaled at epoch 0 carries the lease the node last held
+    /// (`Core::root_config_version`; `long-delegated-late-answers` seed 1793
+    /// under slow lease reads: a deposed holder drained its inbox at epoch 0
+    /// and stamped the archive rows with its tenure's version 4, which the
+    /// oracle's "epoch 0 is version 0" called a violation), 0 when it never
+    /// held one; and a delegate's group row journaled before the generation's
+    /// first `DelegGroup` record is version 0 by position (`Meta::
+    /// deleg_group_at` is `Some(0)`; seed 1938 of `long-delegated-backup`).
+    #[test]
+    fn an_epoch_0_row_carries_the_last_held_lease() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let row = |first, gen, class| constellation_meta::AuditRow {
+            first,
+            epoch: 0,
+            gen,
+            idx: first,
+            class,
+        };
+        // The node last held a lease of version 4.
+        let mut rv = RowVersions::default();
+        rv.tick(1, 4, &|_| 0);
+        let rows = [
+            row(1, 0, RowCommit::group(4, GroupOn::Archive)),
+            // Version 0 after a tenure: a placeholder, not the configuration.
+            row(2, 0, RowCommit::group(0, GroupOn::Archive)),
+            row(3, 0, RowCommit::group(3, GroupOn::Archive)),
+        ];
+        rv.judge(1, &rows, 4, &|_| 0, &|_| 0, &|_, _| None);
+        let seqs: Vec<_> = rv
+            .violations
+            .iter()
+            .map(|v| v.split("seq ").nth(1).unwrap().split(' ').next().unwrap())
+            .collect();
+        assert_eq!(seqs, ["2", "3"], "{:?}", rv.violations);
+        // A node that never held a lease: version 0.
+        let mut rv = RowVersions::default();
+        rv.judge(
+            2,
+            &[row(1, 0, RowCommit::LONE)],
+            0,
+            &|_| 0,
+            &|_| 0,
+            &|_, _| None,
+        );
+        assert!(rv.violations.is_empty(), "{:?}", rv.violations);
+        // A delegate row before the first record, judged after the record
+        // was applied in the same event: version 0 by position.
+        let mut rv = RowVersions::default();
+        let at = |_gen: u64, first: u64| Some(if first >= 5 { 1 } else { 0 });
+        let rows = [
+            row(3, 7, RowCommit::group(0, GroupOn::Delegate)),
+            row(6, 7, RowCommit::group(1, GroupOn::Delegate)),
+            row(7, 7, RowCommit::group(0, GroupOn::Delegate)),
+        ];
+        rv.judge(3, &rows, 0, &|_| 1, &|_| 1, &at);
+        assert_eq!(rv.violations.len(), 1, "{:?}", rv.violations);
+        assert!(rv.violations[0].contains("seq 7"), "{:?}", rv.violations);
     }
 
     /// An epoch hold's journal counts as the root's copy until plan 46 M1.4

@@ -67453,3 +67453,43 @@ Sweeps ×2,000 `+commit` (`long-backup`, `long-delegated-backup`, `backup-depart
 **Performance gate** (box 3, quiet; main = A, this branch = B, A B B A, topology 1, 40 runs per variant, 300 samples; ext4 repeated, pooled 80 runs): `ack-latency` p50 B / A ext4 chmod 1.03, create 1.00,
 rename 1.00, unlink 1.01, write 1.00; xfs 0.96, 1.01, 0.95, 0.94, 1.00; btrfs 0.95, 0.95, 1.07, 1.01, 1.00; tmpfs 0.92, 1.00, 0.92, 0.94, 1.03 (A against a second copy of A: 0.93 to 1.16).
 `vfs-bench` dispatch overhead (mock getattr, observed less direct) 95 to 100 ns for A and B alike.
+
+### Plan 46 M1.2: the two `-lr` `row_version_matches_config` seeds are oracle errors (2026-11-06)
+
+The two step-0 failures under slow lease reads (`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, `+commit`) were the oracle's, not the product's.
+No product code.
+
+- `long-delegated-late-answers` seed 1793: node 2, deposed at epoch 2 (lease version 4), drains its inbox's older batches after the loss and
+  journals three archive rows at epoch 0 with version 4. The core stamps `Core::root_config_version` (the held lease's, else the one last
+  held: step 4's design, `LeaseState::last_config_version`, `clear_holder_epoch`), but the oracle read epoch 0 as "version 0". The oracle now
+  judges a root row against the lease the node holds or last held whatever its epoch (0 for a node that never held one); a version-0 row after
+  a tenure is still a violation. The `RowVersions` doc said as much already for the window after `clear_holder_epoch`.
+- `long-delegated-backup` seed 1938: node 2 journals row 2 of a new generation `Group{Delegate}` at version 0 and applies the generation's
+  first `DelegGroup` record (version 1) later in the same event. `Meta::deleg_group_at` (test-util) returned `None` for a position before
+  every recorded version, and the oracle fell back to the version applied by the end of the event. It now returns `Some(0)` there ("no
+  group"), `None` only for a generation with no recorded version.
+
+Tests: oracle `an_epoch_0_row_carries_the_last_held_lease` (fails on the old oracle: the version-4 row is called a violation), meta
+`the_group_version_at_a_position_before_the_first_record_is_zero` (the old accessor answers `None`); `row_versions_must_be_the_configuration_in_force`'s
+epoch-0 row now carries the node's lease version. M1.1 step 5's tip (`c825fb97`) has the same oracle: seed 1793 fails there the same way; 1938
+passes there on a different trajectory.
+
+**Sweep** (box 1, release, `-lr`, `+commit`, seeds 0..1,999, 56 delegated configurations: the step-0 baseline's 54 and
+`drop-held-chain-requester-dies`, `metered-shared-unbacked`): row-version mismatches 0 everywhere (rows
+judged from 12,619 to 946,380 per configuration), and no failing seed names the oracle. Seeds failing other oracles: `delegated-core-stall-root-lease6`
+242, `metered-shared` 78 (76 I1, 2 other), `delegated-epoch` 24, `drop-held-chain-backed` 20 (I1), the controls `-lead-off` 1,423 and
+`-hysteresis-off` 30, and **`delegated-core-stall-root-sealed` 6 (seeds 182, 552, 773, 1489, 1713, 1795: a rid of `d2` took effect in the
+log where the spec refuses it, `EEXIST` or `ENOENT`)**, new under `-lr` (0 in the step-0 baseline without slow lease reads); open, to be
+triaged. Every other configuration 0 failing.
+
+Gates (box 1): fmt, clippy `-D warnings` (meta, authority, all targets), meta lib 407, authority lib 1,049, release sim suite 419 passed,
+0 failed, 12 ignored.
+
+**Rebased on M1.1 step 5** (`11bdd0f0`): `RowVersions::judge` keeps step 5's per-call `group_before` (a new generation's rows of one event
+share its previous event) and takes this fix's lease rule; both oracle tests kept. Fail-before on the rebased tree with the two fixes reverted
+and the tests kept: `the_group_version_at_a_position_before_the_first_record_is_zero` and `an_epoch_0_row_carries_the_last_held_lease` fail
+(and `row_versions_must_be_the_configuration_in_force`, whose epoch-0 row now carries the node's lease version). Sweep again (box 2, release,
+`-lr`, `+commit`, ×2,000, the same 56 configurations): row-version mismatches 0 everywhere (rows judged from 12,684 to 954,150 per
+configuration). Seeds failing other oracles: `delegated-core-stall-root-lease6` 93, `metered-shared` 99, `delegated-epoch` 21,
+`drop-held-chain-backed` 18 (I1 all four), the controls `-lead-off` 1,412 and `-hysteresis-off` 30, `delegated-core-stall-root-sealed` 9
+(below); every other configuration 0 failing.

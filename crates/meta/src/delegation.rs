@@ -575,18 +575,22 @@ impl Meta {
     /// Simulation oracle: the `DelegGroup` version of `gen` in force at the
     /// journal position of the row whose first seq is `first`: the latest
     /// version this replica applied while the journal's next seq was at or
-    /// below `first`. `None`: no version was applied before that position
-    /// (or none was recorded: a replica rebuilt from the log).
+    /// below `first`; `Some(0)` when every recorded version was applied after
+    /// that position (the row was journaled while no record was applied: "no
+    /// group"). `None`: no version of `gen` was recorded on this replica (none
+    /// applied yet, or a replica rebuilt from the log, whose records went
+    /// into the rebuilt copy's history).
     #[cfg(any(test, feature = "test-util"))]
     pub fn deleg_group_at(&self, gen: Gen, first: u64) -> Option<u64> {
-        self.deleg_group_history
-            .lock()
-            .unwrap()
-            .get(&gen)?
-            .iter()
-            .rev()
-            .find(|(_, next)| *next <= first)
-            .map(|(v, _)| *v)
+        let history = self.deleg_group_history.lock().unwrap();
+        let applied = history.get(&gen)?;
+        Some(
+            applied
+                .iter()
+                .rev()
+                .find(|(_, next)| *next <= first)
+                .map_or(0, |(v, _)| *v),
+        )
     }
 
     /// Plan 30 §M12: whether the table names any live delegation, as
