@@ -1,5 +1,3 @@
-    Checking constellation-model v1.0.0 (/home/fedora/m10c10/crates/model)
-    Finished `release` profile [optimized] target(s) in 1.04s
 //! Plan 30 §M10: continuation epochs with flexible quorums — the
 //! `FlexEpochs` variant.
 //!
