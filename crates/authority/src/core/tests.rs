@@ -2636,8 +2636,9 @@ fn a_lost_renewal_deposes_and_the_round_recovers() {
     );
 }
 
-/// A deposed root whose journal holds a delegation's row it appended
-/// (which the strand by epoch leaves: it belongs to its generation):
+/// A deposed root whose journal holds a row without before-images (a
+/// delegation's row it journaled outside speculation: the strand cannot roll
+/// it back; plan 46 M1.2 step 7 sends only such a journal to the rebuild):
 /// the deposition recovery rebuilds the namespace from the shared log
 /// (`Action::RebuildReplica`), and the rebuilt
 /// replica holds whatever the log had when the rebuild read it — here
@@ -2650,37 +2651,12 @@ fn a_lost_renewal_deposes_and_the_round_recovers() {
 #[test]
 fn a_deposition_rebuild_moves_the_cursor_to_the_rebuilt_position() {
     let mut h = Harness::new(1);
+    // A write journaled outside speculation (no holder epoch yet, nothing
+    // outstanding): no before-images, so no strand can roll it back.
+    h.meta.create(ROOT_INO, "uncaptured", 0o644, 0, 0).unwrap();
+    assert_eq!(h.meta.uncaptured_tx_count().unwrap(), 1);
     let out = lose_renewal_with_an_unshipped_create(&mut h);
     assert!(h.core.lease().lost);
-    // A row of generation 7 this root appended from its delegate's stream.
-    crate::replica::Replica::apply_backup_tx_journaled(
-        &h.meta,
-        &[
-            LogRecord::Create {
-                parent: ROOT_INO,
-                name: "appended".into(),
-                ino: h.meta.allocate_ino(ROOT_INO).unwrap(),
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                time_ns: 3,
-            },
-            LogRecord::Completed {
-                rid: Rid {
-                    node: 2,
-                    incarnation: 1,
-                    seq: 1,
-                },
-            },
-        ],
-        Some(Rid {
-            node: 2,
-            incarnation: 1,
-            seq: 1,
-        }),
-        (7, 1),
-    )
-    .unwrap();
     let (tail, req) = s3_ops(&out)[0];
     assert!(matches!(req, S3Op::SegmentRun { from: 1, .. }), "{req:?}");
     let out = h.step(Event::S3 {
@@ -2711,6 +2687,69 @@ fn a_deposition_rebuild_moves_the_cursor_to_the_rebuilt_position() {
         "the cursor follows the rebuilt replica, not the pre-rebuild head"
     );
     assert!(h.core.ship.head_seq >= 3);
+}
+
+/// Plan 46 M1.2 step 7 (c3-spec §6.2, D12): a deposed root whose journal holds
+/// the delegate row it appended (a captured row of generation 7, which it is
+/// not the delegate of) never asks for a rebuild: the strand rolls it back from
+/// its before-images and keeps it as a member copy of its generation, and the
+/// recovery is complete. Before: `Action::RebuildReplica` (the journal held a
+/// row), whose reset queued the append for replay by rid.
+#[test]
+fn a_deposed_root_never_asks_for_a_rebuild_with_a_captured_journal() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let appended = Rid {
+        node: 2,
+        incarnation: 1,
+        seq: 1,
+    };
+    crate::replica::Replica::apply_backup_tx_journaled(
+        &h.meta,
+        &[
+            LogRecord::Create {
+                parent: ROOT_INO,
+                name: "appended".into(),
+                ino: h.meta.allocate_ino(ROOT_INO).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 3,
+            },
+            LogRecord::Completed { rid: appended },
+        ],
+        Some(appended),
+        (7, 1),
+    )
+    .unwrap();
+    assert_eq!(h.meta.uncaptured_tx_count().unwrap(), 0);
+    let out = lose_renewal_with_an_unshipped_create(&mut h);
+    assert!(h.core.lease().lost);
+    let (tail, _) = s3_ops(&out)[0];
+    let out = h.step(Event::S3 {
+        op: tail,
+        result: S3Result::SegmentRun(Ok(Vec::new())),
+    });
+    let out = at_head(&mut h, out);
+    assert!(
+        !out.iter()
+            .any(|a| matches!(a, Action::RebuildReplica { .. })),
+        "a captured journal is rolled back, not rebuilt"
+    );
+    assert!(!h.core.lease().lost, "the recovery is complete");
+    assert_eq!(h.core.stats.depositions, 1);
+    assert_eq!(crate::replica::Replica::journal_len(&h.meta).unwrap(), 0);
+    let tail = h.meta.deleg_backup_tail(7).unwrap();
+    assert_eq!(tail.iter().map(|t| t.idx).collect::<Vec<_>>(), vec![1]);
+    assert_eq!(tail[0].rid, Some(appended));
+    assert!(
+        h.meta
+            .pending_replays()
+            .unwrap()
+            .iter()
+            .all(|q| q.rid != appended),
+        "the appended row is never queued for replay"
+    );
 }
 
 /// Plan 43 §11 Q20 (h): a restarted core fences from its replica's
@@ -48854,6 +48893,281 @@ mod deleg_windows_tests {
             "(generation 8 ended, its cursor, the stream the root holds): \
              8:1 appended, 8:2 (deps on the lost 7:1) not, the generation ended"
         );
+    }
+
+    /// A root (node 1) that claimed the lease of node `prev` and inherited
+    /// generation 7, delegated to node 3 with no recorded backup.
+    fn root_inheriting_a_backup_less_generation(prev: NodeId) -> (Harness, Vec<Action>) {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.delegation_ttl_ms = 1_000;
+        h.hold(1, None);
+        h.core.lease.prev_holder = Some(prev);
+        let _ = delegated_to_me(&h.meta, 3);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.gens.contains_key(&7));
+        (h, out)
+    }
+
+    fn prev_root_seal(out: &[Action], to: NodeId) -> Option<OpId> {
+        sends(out).iter().find_map(|(n, m)| match m {
+            PeerMsg::DelegSeal { req, gen: 7 } if *n == to => Some(*req),
+            _ => None,
+        })
+    }
+
+    fn row_at(idx: u64) -> constellation_meta::DelegateTx {
+        constellation_meta::DelegateTx {
+            idx,
+            rid: None,
+            records: Vec::new(),
+            deps: constellation_meta::Position::ZERO,
+        }
+    }
+
+    /// Plan 46 M1.2 step 7 (c3-spec D6): a root that inherits a generation
+    /// with no recorded backup seals the holder of the lease it claimed. The
+    /// set persists.
+    #[test]
+    fn a_root_inheriting_a_backup_less_generation_seals_its_predecessor() {
+        let (h, out) = root_inheriting_a_backup_less_generation(2);
+        assert!(prev_root_seal(&out, 2).is_some(), "no seal: {out:?}");
+        assert_eq!(
+            h.core.dl.gens[&7]
+                .prev_roots
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(h.meta.deleg_prev_roots(7).unwrap(), vec![2]);
+        assert_eq!(h.core.stats.deleg_prev_root_seals, 1);
+    }
+
+    /// A generation whose record names a backup is sealed through the group
+    /// (C2's set, unchanged): no previous root is sealed.
+    #[test]
+    fn a_generation_with_a_recorded_backup_seals_no_previous_root() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        h.core.lease.prev_holder = Some(2);
+        let _ = delegated_to_me(&h.meta, 3);
+        Replica::apply_records_journaled(
+            &h.meta,
+            &[LogRecord::DelegGroup {
+                dir: h.meta.lookup(ROOT_INO, "d").unwrap().unwrap().ino,
+                gen: 7,
+                version: 1,
+                backups: vec![4],
+            }],
+            None,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].prev_roots.is_empty());
+        assert!(prev_root_seal(&out, 2).is_none());
+    }
+
+    /// The previous root answers a seal from its member copy (what its
+    /// deposition kept of its appends), which `on_deleg_seal` reads as a held
+    /// tail.
+    #[test]
+    fn a_member_copy_is_served_to_the_next_roots_seal() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let mut copy = row_at(1);
+        copy.rid = Some(h.rid(1));
+        Replica::deleg_backup_append(&h.meta, 7, &[copy.clone()], 0).unwrap();
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegSeal {
+                req: OpId(5),
+                gen: 7,
+            },
+        });
+        let answer = sends(&out).iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegSealed {
+                gen: 7,
+                sealed,
+                txs,
+                ..
+            } if *to == 1 => Some((*sealed, txs.clone())),
+            _ => None,
+        });
+        assert_eq!(answer, Some((true, vec![copy])), "{out:?}");
+    }
+
+    /// The previous root's answer appends its rows past the cursor and settles
+    /// it, and does not end the generation or re-delegate it (as a backup's
+    /// answer does): the generation ends by its own expiry afterwards.
+    #[test]
+    fn a_predecessors_answer_never_ends_or_redelegates() {
+        let (mut h, out) = root_inheriting_a_backup_less_generation(2);
+        let seal = prev_root_seal(&out, 2).unwrap();
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert!(!h.core.dl.gens[&7].ended, "waits for the predecessor");
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegSealed {
+                req: seal,
+                gen: 7,
+                sealed: true,
+                txs: vec![row_at(1), row_at(2)],
+            },
+        });
+        let g = &h.core.dl.gens[&7];
+        assert!(g.prev_roots.is_empty(), "settled");
+        assert_eq!(g.cursor, 2, "its rows are appended");
+        assert!(!g.ended, "its answer ends nothing");
+        assert!(
+            !journal_records_of_gen(&h, 7)
+                .iter()
+                .any(|r| matches!(r, LogRecord::Delegate { .. })),
+            "and delegates nothing"
+        );
+        assert!(h.meta.deleg_prev_roots(7).unwrap().is_empty());
+        assert_eq!(h.core.stats.deleg_prev_root_rows, 2);
+        let _ = out;
+        // The generation's own expiry ends it now.
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].ended);
+    }
+
+    /// A previous root that holds nothing satisfies the seal too.
+    #[test]
+    fn a_predecessor_that_holds_nothing_satisfies_the_seal() {
+        let (mut h, out) = root_inheriting_a_backup_less_generation(2);
+        let seal = prev_root_seal(&out, 2).unwrap();
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegSealed {
+                req: seal,
+                gen: 7,
+                sealed: false,
+                txs: Vec::new(),
+            },
+        });
+        assert!(h.core.dl.gens[&7].prev_roots.is_empty());
+    }
+
+    /// A recall that drained while a previous root was unsettled ends the
+    /// generation as soon as the predecessor's rows are appended (the drained
+    /// recall never asked for the end, so nothing was marked as waiting: seeds
+    /// 14285 and 15437 of `long-delegated-late-answers` under slow lease reads
+    /// hung).
+    #[test]
+    fn a_drained_recall_ends_the_generation_once_the_predecessor_answers() {
+        let (mut h, out) = root_inheriting_a_backup_less_generation(2);
+        let seal = prev_root_seal(&out, 2).unwrap();
+        h.core.dl.gens.get_mut(&7).unwrap().recall = RecallPhase::Drained(1);
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegSealed {
+                req: seal,
+                gen: 7,
+                sealed: true,
+                txs: vec![row_at(1)],
+            },
+        });
+        assert!(h.core.dl.gens[&7].ended, "the drained recall ends it now");
+    }
+
+    /// The delegate's drained recall answer is the proof that is left when the
+    /// previous root never answers (it is gone): the root has appended through
+    /// the head the delegate reported, so it holds every row the delegate
+    /// executed. (A delegate that was recalled renews no more.)
+    #[test]
+    fn a_drained_recall_settles_a_predecessor_that_never_answers() {
+        let (mut h, _) = root_inheriting_a_backup_less_generation(2);
+        h.core.dl.gens.get_mut(&7).unwrap().recall = RecallPhase::Drained(0);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.dl.gens[&7].ended,
+            "{:?}",
+            h.core.dl.gens[&7].prev_roots
+        );
+        assert_eq!(h.core.stats.deleg_prev_root_recalls, 1);
+    }
+
+    /// The end waits for the predecessor, status says so, and the operator's
+    /// `abandon-group --gen` is the way out.
+    #[test]
+    fn the_generation_end_waits_for_the_predecessor_until_abandoned() {
+        let (mut h, _) = root_inheriting_a_backup_less_generation(2);
+        for _ in 0..3 {
+            h.core.dw.set_until_for_tests(7, w(h.now));
+            let mut out = Vec::new();
+            h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+            assert!(!h.core.dl.gens[&7].ended, "waits: {out:?}");
+            h.advance(2_000);
+        }
+        assert!(h.core.dl.gens[&7].waiting_for_group);
+        assert!(h.core.stats.deleg_prev_root_waits >= 3);
+        let mut out = Vec::new();
+        h.core
+            .on_control_abandon_generation(h.clk(), OpId(77), 0, 7, true, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].ended, "abandoned: {out:?}");
+        assert!(h.meta.deleg_prev_roots(7).unwrap().is_empty());
+    }
+
+    /// The delegate keeps every row it executed until the log carries it:
+    /// a renewal whose stream head this root has appended through says no
+    /// previous root holds a row this root lacks. A head past the cursor does
+    /// not.
+    #[test]
+    fn a_delegate_renewal_at_the_cursor_satisfies_the_predecessor_seal() {
+        let (mut h, _) = root_inheriting_a_backup_less_generation(2);
+        let renew = |h: &mut Harness, head: u64, req: u64| {
+            h.step(Event::Peer {
+                from: 3,
+                msg: PeerMsg::DelegRenew {
+                    req: OpId(req),
+                    gen: 7,
+                    round: 1,
+                    backup: None,
+                    stream_head: head,
+                    stream_head_at: 0,
+                    first: false,
+                },
+            })
+        };
+        renew(&mut h, 3, 1);
+        assert!(
+            !h.core.dl.gens[&7].prev_roots.is_empty(),
+            "rows 1..3 not here"
+        );
+        renew(&mut h, 0, 2);
+        assert!(h.core.dl.gens[&7].prev_roots.is_empty());
+        assert_eq!(h.core.stats.deleg_prev_root_renewals, 1);
+    }
+
+    /// An unanswered seal is asked again every `backup_takeover_ms`.
+    #[test]
+    fn an_unanswered_predecessor_seal_is_asked_again() {
+        let (mut h, out) = root_inheriting_a_backup_less_generation(2);
+        assert!(prev_root_seal(&out, 2).is_some());
+        h.advance(h.core.cfg.backup_takeover_ms + 100);
+        let mut out = Vec::new();
+        h.core.deleg_after_event(h.clk(), &h.meta, &mut out);
+        assert!(prev_root_seal(&out, 2).is_some(), "asked again: {out:?}");
+    }
+
+    fn journal_records_of_gen(h: &Harness, _gen: u64) -> Vec<LogRecord> {
+        Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+            .into_iter()
+            .flat_map(|tx| tx.records)
+            .collect()
     }
 
     /// Plan 43 C2e (§3.7, D3): the end seals every backup a record named.

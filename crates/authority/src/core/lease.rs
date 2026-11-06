@@ -119,6 +119,10 @@ pub struct LeaseState {
     pub held_since: Option<WaitMs>,
     pub wanted: Vec<NodeId>,
     pub wanted_since: Option<WaitMs>,
+    /// Plan 46 M1.2 step 7 (c3-spec D6): the holder of the lease this node's
+    /// last claim took over (`None`: a create, or a claim of its own lease).
+    /// A generation this root inherits with no recorded backup seals it.
+    pub prev_holder: Option<NodeId>,
     /// Deposed: never ship under the old epoch again until recovered.
     pub lost: bool,
     /// After a deposition, the epoch below which own unshipped work is

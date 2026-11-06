@@ -1903,10 +1903,19 @@ impl Core {
         let floor = self.lease.lost_floor.max(1);
         let mut rolled = 0u64;
         replica.clear_streamed();
+        // Plan 46 M1.2 step 7 (c3-spec §6.2): the delegates' rows this node
+        // appended as the root go to the member copy of their generation; its
+        // own rows as a delegate stay (its live stream), unless the gate
+        // ended the generation (what it re-appended is appended rows now).
+        let own_gens: Vec<u64> = self
+            .own_journaled_gens(replica)
+            .into_iter()
+            .filter(|g| !replica.deleg_ended_at_gate(*g))
+            .collect();
         let stranded = replica
-            .strand_below_epoch(floor)
+            .strand_deposed(floor, &own_gens)
             .map_err(|e| e.to_string())?;
-        rolled += (stranded.locals + stranded.member_copied) as u64;
+        rolled += (stranded.locals + stranded.member_copied + stranded.deleg_member_copied) as u64;
         self.stats.speculation_rolled_back += (stranded.shadows + stranded.hints) as u64;
         self.note_committed_stranded(&stranded);
         let clk = self.clk;
@@ -1918,7 +1927,10 @@ impl Core {
         {
             *recover_rolled = rolled;
         }
-        let left = replica.journal_len().map_err(|e| e.to_string())?;
+        // Only a row without before-images needs the rebuild: a journal of
+        // captured rows (this node's own delegate rows among them) was rolled
+        // back or is its live stream (c3-spec D12).
+        let left = replica.uncaptured_tx_count().map_err(|e| e.to_string())?;
         if left > 0 {
             let op = self.op_id();
             self.set_phase(Phase::Recover { op }, Some(op));
@@ -4004,6 +4016,12 @@ impl Core {
             self.stats.takeovers += 1;
         }
         self.lease.adopt(now, lease, tag, Some(gate));
+        // Plan 46 M1.2 step 7 (c3-spec D6): whom a generation inherited with
+        // no recorded backup is sealed with.
+        self.lease.prev_holder = prev
+            .as_ref()
+            .map(|p| p.holder)
+            .filter(|h| *h != self.cfg.node_id);
         self.release_superseded(true, replica);
         self.shipped_touches.clear();
         self.shipped_floor = self.ship.head_seq;

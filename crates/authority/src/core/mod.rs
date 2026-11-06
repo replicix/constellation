@@ -1300,6 +1300,15 @@ pub struct Stats {
     /// Plan 43 C2 (Q1): seals asked again because the recorded backup had
     /// not answered (the generation is not ended without its tail).
     pub deleg_seal_waits: u64,
+    /// Plan 46 M1.2 step 7 (c3-spec D6): seals asked of a generation's
+    /// previous root, rows its answers carried past the cursor, ends that
+    /// waited for one, and renewals of the delegate that settled the set.
+    pub deleg_prev_root_seals: u64,
+    pub deleg_prev_root_rows: u64,
+    pub deleg_prev_root_waits: u64,
+    pub deleg_prev_root_renewals: u64,
+    /// ... and recalls whose drained answer settled the set.
+    pub deleg_prev_root_recalls: u64,
     /// Backup of a delegate: transactions persisted, seals.
     pub deleg_backup_persisted: u64,
     pub deleg_backup_seals: u64,
@@ -2903,6 +2912,7 @@ impl Core {
                 first,
             } => {
                 self.lock_note_delegate_head(now, from, gen, stream_head, stream_head_at);
+                self.deleg_prev_roots_renewed(now, from, gen, stream_head, replica, out);
                 self.on_deleg_renew(
                     now,
                     from,

@@ -9036,43 +9036,70 @@ fn a_marker_is_never_seen_without_the_data_a_deposition_moved_to_the_member_copy
 /// rid (the requester's shadow replay, or the recall pass's queued copy),
 /// which lands with a new identity.
 ///
-/// Deferred to plan 46 M1.2 (member copies), which must close it; the ignore
-/// goes then. See PROGRESS, "L2b".
+/// Plan 46 M1.2 step 7 closes seeds 13016, 14284 and 15005 (this test); 13907
+/// and 15996 are another mechanism and stay pinned, ignored, below. See
+/// PROGRESS, "L2b".
 #[test]
-#[ignore = "L2b, deferred to plan 46 M1.2: seeds 13016 (I2), 13907, 14284, 15005 and 15996 (I2c) fail +identity under slow lease reads"]
 fn l2b_findings_a_committed_delegate_row_lands_with_its_identity() {
     let slow = |cfg: SimConfig| SimConfig {
         lease_reads: SLOW_LEASE_READS,
         ..cfg
     };
-    let witnesses: [(&str, SimConfig, &[u64]); 2] = [
-        (
-            "long-delegated-backup",
-            long_delegated_backup_config(),
-            &[13_016, 14_284, 15_005],
-        ),
-        (
-            "long-delegated-late-answers",
-            long_delegated_late_answers_config(),
-            &[13_907, 15_996],
-        ),
-    ];
+    // Plan 46 M1.2 step 7 closed these three (a deposed root keeps its
+    // appended delegate rows as a member copy; the next root of a backup-less
+    // generation seals its predecessor).
+    let seeds = [13_016u64, 14_284, 15_005];
     // Every seed runs, and every failure is reported.
-    let mut failures = Vec::new();
-    for (label, cfg, seeds) in witnesses {
-        for &seed in seeds {
-            if let Err(e) = run_seed(seed, strict(slow(cfg.clone()), "identity")) {
-                failures.push(format!("{label} seed {seed}: {e}"));
-            }
-        }
-    }
+    let cfg = strict(slow(long_delegated_backup_config()), "identity");
+    let failures: Vec<String> = seeds
+        .iter()
+        .filter_map(|&seed| {
+            run_seed(seed, cfg.clone())
+                .err()
+                .map(|e| format!("long-delegated-backup seed {seed}: {e}"))
+        })
+        .collect();
     assert!(
         failures.is_empty(),
-        "L2b: {} of 5 witnesses fail (replay with AUTHORITY_SIM_CONFIG=<label> \
+        "L2b: {} of {} witnesses fail (replay with AUTHORITY_SIM_CONFIG=long-delegated-backup \
          AUTHORITY_SIM_LEASE_READS=0:0:800:1000 and the identity variant):\n{}",
         failures.len(),
+        seeds.len(),
         failures.join("\n")
     );
+}
+
+/// L2b's other two witnesses, which plan 46 M1.2 step 7 does not close: seeds
+/// 13907 and 15996 of `long-delegated-late-answers` (`+identity`, slow lease
+/// reads), I2c. The generation has a recorded backup (so no previous root is
+/// sealed: C2's seal set decides), its delegate (node 2) took the root over
+/// and re-appended its own rows at its gate, and its tenure never opened the
+/// gate (the read-delegation quarantine) before the next root claimed the
+/// lease. The next root recalls the delegate, which answers with the stream
+/// capped below its own unshipped holder appends (`holder_append_cap`, plan 43
+/// Q16): the generation ends below rows the group acknowledged, and the
+/// requester's shadow replay lands the row again by rid. Closed by the plan's
+/// removal of the cap and the lone-journal commit (steps 13/14), or by a seal
+/// of the recorded group at a recall's end; see PROGRESS.
+#[test]
+#[ignore = "L2b, open after plan 46 M1.2 step 7: seeds 13907 and 15996 (I2c) fail +identity under slow lease reads: a recorded-backup generation ended below rows its delegate-turned-root held (holder_append_cap)"]
+fn l2b_findings_a_recall_capped_by_the_delegates_unshipped_appends() {
+    let cfg = strict(
+        SimConfig {
+            lease_reads: SLOW_LEASE_READS,
+            ..long_delegated_late_answers_config()
+        },
+        "identity",
+    );
+    let failures: Vec<String> = [13_907u64, 15_996]
+        .iter()
+        .filter_map(|&seed| {
+            run_seed(seed, cfg.clone())
+                .err()
+                .map(|e| format!("long-delegated-late-answers seed {seed}: {e}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Plan 46 M1.2, pinned: `delegated-core-stall-root-sealed+commit` under slow
@@ -9094,13 +9121,11 @@ fn l2b_findings_a_committed_delegate_row_lands_with_its_identity() {
 /// which carry no check, are applied later (by the old root's drain at its
 /// next tenure in seed 182), and the second `Create` lands.
 ///
-/// Deferred to plan 46 M1.2 (C3 item 4: a deposed root keeps another
+/// Closed by plan 46 M1.2 step 7 (C3 item 4: a deposed root keeps another
 /// node's appended rows as a member copy, the next root seals the
-/// predecessor's stream; `MutateOp::Records` copies and the deposed root's
-/// rebuild-replay go), which must close it; the ignore goes then. See
+/// predecessor's stream; the deposed root's rebuild-replay of them goes). See
 /// PROGRESS, "delegated-core-stall-root-sealed".
 #[test]
-#[ignore = "plan 46 M1.2 (C3 item 4): a deposed root's appended delegate row replays as unchecked Records; 9 of 2,000 seeds under slow lease reads"]
 fn a_deposed_roots_appended_delegate_row_never_lands_past_its_generations_seal() {
     let cfg = strict(
         SimConfig {
@@ -16236,44 +16261,29 @@ fn backup_two_config_runs() {
 }
 
 /// Plan 43 C0, the sim's rebuild: a deposed root whose journal rows were
-/// not captured rebuilds its replica from the log. With the old stub (every
-/// rebuild failed: "rebuilding the deposed replica from the log failed") the
-/// recovery never finished; with the real rebuild it does, and every
-/// existing check still holds. The seeds are the paused configurations of
-/// `long-delegated-late-answers` that were fixed on main (9287, 2945; 2924
-/// since plan 43 C2, 3036 since plan 43 Q16's interim rule); re-pinned to 270
-/// and 2822 (the unclocked runs where a rebuild runs and the stub keeps
-/// failing) after plan 46 M0.3 S5 moved the schedules of 9287 and 3036.
+/// not captured rebuilds its replica from the log. Plan 46 M1.2 step 7 (c3-spec
+/// D12) narrowed that to the rows a strand cannot roll back: a deposed root's
+/// appends of delegates' rows are captured, so the strand rolls them back and
+/// keeps them as a member copy, and no rebuild runs. These are the seeds where
+/// one ran before (`long-delegated-late-answers`, unclocked); with the real
+/// rebuild or with the stub that fails every one, the run needs none and every
+/// existing check still holds.
 #[test]
-fn c0_the_real_rebuild_recovers_a_deposed_root() {
+fn c0_a_deposed_roots_captured_journal_needs_no_rebuild() {
     use pinned::c0_run;
     let cfg = long_delegated_late_answers_config;
     for seed in REBUILD_SEEDS {
         let real = c0_run("long-delegated-late-answers", seed, cfg());
-        assert!(
-            real.rebuilds.0 > 0,
-            "seed {seed}: no rebuild ran: {:?}",
-            real.rebuilds
-        );
-        assert_eq!(real.rebuilds.1, 0, "seed {seed}: a rebuild failed");
+        assert_eq!(real.rebuilds, (0, 0), "seed {seed}: a rebuild ran");
         let stub = c0_run(
             "long-delegated-late-answers+rebuild-stub",
             seed,
             strict(cfg(), "rebuild-stub"),
         );
-        assert!(
-            stub.rebuilds.1 > 0,
-            "seed {seed}: the stub never answered: {:?}",
-            stub.rebuilds
-        );
-        assert_eq!(stub.rebuilds.0, 0);
-        // The recovery the stub kept failing (every retry of the round
-        // asks again) ends after the real rebuild's first success.
-        assert!(
-            stub.rebuilds.1 > 5 * real.rebuilds.0,
-            "seed {seed}: the stub failed {} times, the real rebuild ran {}",
-            stub.rebuilds.1,
-            real.rebuilds.0
+        assert_eq!(
+            stub.rebuilds,
+            (0, 0),
+            "seed {seed}: a rebuild was asked for"
         );
     }
 }
@@ -16986,8 +16996,8 @@ const I2C_BACKUP_CRASH: &[u64] = &[800, 802, 803];
 /// (703, whose trajectory plan 43 C1-1's listed-acknowledgement count shifted
 /// to no rollback, gave its place to 935: 1 rollback, `+lone` fails with I5.)
 const I5_BACKUP: &[u64] = &[746, 819, 931, 935];
-/// The paused configurations of `long-delegated-late-answers` where the
-/// sim's `RebuildReplica` fires (9287 still does).
+/// The configurations of `long-delegated-late-answers` where the sim's
+/// `RebuildReplica` fired before plan 46 M1.2 step 7 (9287 did).
 /// (2945's trajectory, moved by plan 43 C2's settle, no longer rebuilds;
 /// 2924 did. The root's acknowledgement of a delegate's batch carries only
 /// what its own tenure committed (plan 43 Q16, ADR-41), which moved 2924's

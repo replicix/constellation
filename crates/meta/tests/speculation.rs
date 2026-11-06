@@ -2643,3 +2643,72 @@ fn a_streamed_transaction_does_not_adopt_a_shadow_that_lacks_its_effect() {
     apply(&reference, 1, 1, &tx);
     assert_eq!(raw_ns(&meta), raw_ns(&reference));
 }
+
+/// Plan 46 M1.2 step 7 (c3-spec §6.1, D12): a deposed root keeps the delegate
+/// rows it appended as a member copy of their generation
+/// (`backup_tail[DELEG_BACKUP_BASE + gen]`, verbatim), in the strand's own
+/// transaction: rolled back from the namespace, out of the journal, the
+/// generation's log index retracted, nothing queued for replay (a queued
+/// copy is a second executable copy of the rid, and `MutateOp::Records`
+/// carries no check).
+#[test]
+fn a_deposed_root_keeps_appended_delegate_rows_as_a_member_copy() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    for i in 1..=2u64 {
+        let name = ["a", "b"][i as usize - 1];
+        meta.apply_delegate_tx(
+            &[create(name, ino(i), 10 + i as i64), completed(rid(i))],
+            Some(rid(i)),
+            5,
+            i,
+            Position::ZERO,
+        )
+        .unwrap();
+    }
+    assert_eq!(meta.log_stream_idx(5).unwrap(), 2);
+    let stranded = meta.strand_deposed(2, &[]).unwrap();
+    assert_eq!(stranded.deleg_member_copied, 2);
+    assert_eq!(stranded.locals, 0, "nothing is queued");
+    assert_eq!(meta.journal_len().unwrap(), 0);
+    assert_eq!(meta.uncaptured_tx_count().unwrap(), 0);
+    assert_eq!(meta.log_stream_idx(5).unwrap(), 0, "the log index retracts");
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_none());
+    assert!(meta.lookup(ROOT_INO, "b").unwrap().is_none());
+    assert!(meta.pending_replays().unwrap().is_empty());
+    assert_eq!(meta.completed_position(rid(1)).unwrap(), None);
+    let tail = meta.deleg_backup_tail(5).unwrap();
+    assert_eq!(tail.iter().map(|t| t.idx).collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(tail[0].rid, Some(rid(1)));
+    assert_eq!(
+        tail[0].records,
+        vec![create("a", ino(1), 11), completed(rid(1))]
+    );
+    assert_eq!(
+        tail[1].records,
+        vec![create("b", ino(2), 12), completed(rid(2))]
+    );
+    assert!(meta.deleg_backup_holds_any(5).unwrap());
+}
+
+/// The same journal, with generation 5 among the node's own (it is the
+/// delegate of it): the rows are its live stream, never a copy.
+#[test]
+fn a_deposed_root_leaves_its_own_delegates_rows_where_they_are() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    meta.apply_delegate_tx(
+        &[create("a", ino(1), 11), completed(rid(1))],
+        Some(rid(1)),
+        5,
+        1,
+        Position::ZERO,
+    )
+    .unwrap();
+    let rows = meta.journal_len().unwrap();
+    let stranded = meta.strand_deposed(2, &[5]).unwrap();
+    assert_eq!(stranded.deleg_member_copied, 0);
+    assert_eq!(meta.journal_len().unwrap(), rows);
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
+    assert!(!meta.deleg_backup_holds_any(5).unwrap());
+}

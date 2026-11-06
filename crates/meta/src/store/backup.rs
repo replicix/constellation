@@ -499,8 +499,29 @@ fn deleg_epoch(gen: u64) -> u64 {
     DELEG_BACKUP_BASE + gen
 }
 
+fn deleg_prev_roots_key(gen: u64) -> String {
+    format!("deleg_prev_roots:{gen}")
+}
+
 fn deleg_sealed_key(gen: u64) -> String {
     format!("deleg_backup_sealed:{gen}")
+}
+
+/// Plan 46 M1.2 step 7 (c3-spec §6.1): a deposed root's append of a
+/// delegate's row, kept as a member copy of generation `gen`, in the
+/// caller's transaction: the key and the bytes [`Meta::deleg_backup_append`]
+/// writes, so a node that is also a recorded backup of `gen` shares the slot
+/// with the same content.
+pub(crate) fn deleg_member_copy_put_tx(
+    tx: &mut fjall::SingleWriterWriteTx,
+    meta: &Meta,
+    gen: u64,
+    t: &super::DelegateTx,
+) -> Result<(), MetaError> {
+    let bytes =
+        postcard::to_allocvec(t).map_err(|e| MetaError::Invalid(format!("delegate tx: {e}")))?;
+    tx.insert(&meta.backup_tail, tail_key(deleg_epoch(gen), t.idx), bytes);
+    Ok(())
 }
 
 impl Meta {
@@ -598,6 +619,29 @@ impl Meta {
         read_fault::check()?;
         let r = self.db.read_tx();
         Ok(kv_get_tx(&r, &self.local, &deleg_sealed_key(gen))?.is_some())
+    }
+
+    /// Plan 46 M1.2 step 7 (c3-spec D6): the previous roots the next root of
+    /// `gen` still has to seal (node-local, sorted). Empty: none.
+    pub fn deleg_prev_roots(&self, gen: u64) -> Result<Vec<u64>, MetaError> {
+        let r = self.db.read_tx();
+        Ok(kv_get_tx(&r, &self.local, &deleg_prev_roots_key(gen))?
+            .map(|v| v.split(',').filter_map(|n| n.parse().ok()).collect())
+            .unwrap_or_default())
+    }
+
+    /// Persist the set [`Self::deleg_prev_roots`] reads (`nodes` empty removes it).
+    pub fn set_deleg_prev_roots(&self, gen: u64, nodes: &[u64]) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        let key = deleg_prev_roots_key(gen);
+        if nodes.is_empty() {
+            tx.remove(&self.local, key.as_bytes().to_vec());
+        } else {
+            let v: Vec<String> = nodes.iter().map(|n| n.to_string()).collect();
+            kv_set_tx(&mut tx, &self.local, &key, &v.join(","));
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// The generation ended (its `Recall` is in the log): drop its rows.

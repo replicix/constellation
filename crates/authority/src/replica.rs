@@ -178,6 +178,14 @@ pub trait Replica {
     /// Roll back every speculative entry accepted below `epoch` and
     /// queue its op for replay.
     fn strand_below_epoch(&self, epoch: Epoch) -> Result<Stranded, MetaError>;
+    /// A deposition's strand (plan 46 M1.2 step 7, `Meta::strand_deposed`):
+    /// [`Self::strand_below_epoch`], and the delegates' rows this node
+    /// appended as the root (a generation not in `own_gens`) are kept as a
+    /// member copy of their generation instead of being rebuilt and replayed.
+    fn strand_deposed(&self, floor: Epoch, own_gens: &[u64]) -> Result<Stranded, MetaError>;
+    /// Unshipped journal rows without before-images (`Meta::uncaptured_tx_count`):
+    /// the only rows a strand cannot roll back.
+    fn uncaptured_tx_count(&self) -> Result<u64, MetaError>;
     /// The takeover gate's re-ship, in one store transaction (plan 46 M1.2
     /// step 5, `Meta::reship_at_takeover`): the strand
     /// ([`Self::strand_below_epoch`] plus this node's own transactions as the
@@ -468,6 +476,11 @@ pub trait Replica {
     /// takes no append, plan 43 C2e).
     fn deleg_backup_sealed(&self, gen: u64) -> Option<bool>;
     fn deleg_backup_clear(&self, gen: u64);
+    /// Plan 46 M1.2 step 7 (c3-spec D6): the previous roots the next root of
+    /// `gen` still has to seal (persisted); `None`: unreadable.
+    fn deleg_prev_roots(&self, gen: u64) -> Option<Vec<u64>>;
+    /// Persist that set (empty removes it); `false`: it could not be.
+    fn set_deleg_prev_roots(&self, gen: u64, nodes: &[u64]) -> bool;
     /// The session watermark (what this node's client has observed).
     fn observed(&self) -> Position;
     /// Plan 30 §M11: the `deps` of a write submitted here (`observed`
@@ -1008,6 +1021,14 @@ impl Replica for Meta {
         Meta::has_outstanding_speculation(self)
     }
 
+    fn strand_deposed(&self, floor: Epoch, own_gens: &[u64]) -> Result<Stranded, MetaError> {
+        Meta::strand_deposed(self, floor, own_gens)
+    }
+
+    fn uncaptured_tx_count(&self) -> Result<u64, MetaError> {
+        Meta::uncaptured_tx_count(self)
+    }
+
     fn strand_below_epoch(&self, epoch: Epoch) -> Result<Stranded, MetaError> {
         Meta::strand_below_epoch(self, epoch)
     }
@@ -1426,6 +1447,20 @@ impl Replica for Meta {
 
     fn deleg_backup_clear(&self, gen: u64) {
         let _ = Meta::deleg_backup_clear(self, gen);
+    }
+
+    fn deleg_prev_roots(&self, gen: u64) -> Option<Vec<u64>> {
+        Meta::deleg_prev_roots(self, gen).ok()
+    }
+
+    fn set_deleg_prev_roots(&self, gen: u64, nodes: &[u64]) -> bool {
+        match Meta::set_deleg_prev_roots(self, gen, nodes) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, gen = %constellation_meta::delegation::GenLabel::of(gen), "persisting the previous roots to seal failed");
+                false
+            }
+        }
     }
 
     fn stream_applied(&self, gen: u64) -> u64 {

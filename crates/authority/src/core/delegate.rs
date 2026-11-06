@@ -156,6 +156,22 @@ pub(crate) struct GenState {
     /// What this root knows of each member it asked to seal (status: the
     /// operator weighs `abandon-group` by it).
     pub member_notes: BTreeMap<NodeId, MemberNote>,
+    /// Plan 46 M1.2 step 7 (c3-spec D6): the previous roots this root still
+    /// has to seal, for a generation it inherited with no recorded backup (its
+    /// group is the delegate and a root: a root that appended rows the delegate
+    /// was answered through has them only as a member copy, and the root's
+    /// cursor does not cover them). The generation does not end while any is
+    /// left (`end_generation`); each leaves by its answer drained to its end
+    /// ("holds nothing" included), or all together by a renewal of the delegate
+    /// that proves this root has every row it executed. Persisted
+    /// (`Replica::set_deleg_prev_roots`).
+    pub prev_roots: BTreeSet<NodeId>,
+    /// The requests of those seals (a late answer to any is as good).
+    pub prev_reqs: BTreeMap<OpId, NodeId>,
+    /// A previous root's sealed tail the drain has not reached the end of.
+    pub prev_tails: BTreeMap<NodeId, std::sync::Arc<SealedTail>>,
+    /// The end of the generation was asked for and waits for `prev_roots`.
+    pub prev_blocked: bool,
     /// When this root last heard from the delegate about this generation (a
     /// renewal, a stream batch, a recall's answer), on its wait clock.
     pub delegate_heard: Option<WaitMs>,
@@ -610,6 +626,9 @@ pub(crate) enum ReqKind {
     BackupAppend,
     /// Phase 2b: the root's seal request to a dead delegate's backup.
     Seal,
+    /// Plan 46 M1.2 step 7 (c3-spec D6): the next root's seal request to the
+    /// previous root of a generation without a recorded backup.
+    SealPrevRoot,
 }
 
 impl DelegationState {
@@ -1526,6 +1545,10 @@ impl Core {
                         waiting_warned: None,
                         waiting_since: None,
                         member_notes: BTreeMap::new(),
+                        prev_roots: BTreeSet::new(),
+                        prev_reqs: BTreeMap::new(),
+                        prev_tails: BTreeMap::new(),
+                        prev_blocked: false,
                         delegate_heard: None,
                         cursor,
                         last_batch: None,
@@ -1547,6 +1570,9 @@ impl Core {
                 self.stats.deleg_inherited += 1;
                 if level == RootSync::Gated {
                     self.stats.deleg_gated_inherited += 1;
+                }
+                if d.node != me {
+                    self.deleg_inherit_prev_roots(now, d.gen, replica, out);
                 }
                 if d.node == me {
                     // A predecessor delegated this subtree to the node
@@ -3937,6 +3963,12 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        if matches!(self.dl.by_req.get(&req), Some((g, ReqKind::SealPrevRoot)) if *g == gen) {
+            // (Kept in `by_req` until the set is settled: a late answer to an
+            // earlier request is as good.)
+            self.on_prev_root_sealed(now, from, req, gen, sealed, txs, replica, out);
+            return;
+        }
         let Some((g, ReqKind::Seal)) = self.dl.by_req.remove(&req) else {
             return;
         };
@@ -4249,6 +4281,15 @@ impl Core {
             .collect();
         for (gen, from) in stalled {
             self.deleg_end_sealed(now, gen, from, false, replica, out);
+        }
+        // Plan 46 M1.2 step 7 (D6): the previous roots' seals.
+        if self
+            .dl
+            .gens
+            .values()
+            .any(|g| !g.ended && !g.prev_roots.is_empty())
+        {
+            self.deleg_prev_roots_step(now, replica, out);
         }
         if self.dl.mine.is_empty() && !self.deleg_known() {
             return;
@@ -5291,6 +5332,16 @@ impl Core {
                     );
                 }
                 self.arm_stream_tick(now, out);
+            }
+            ReqKind::SealPrevRoot => {
+                // The previous root is unreachable: the next round of
+                // `deleg_prev_roots_step` asks again (the request stays known: a
+                // late answer is as good).
+                if let Some(g) = self.dl.gens.get_mut(&gen) {
+                    if let Some(&m) = g.prev_reqs.get(&req) {
+                        g.member_notes.entry(m).or_default().failed = Some(now.wait);
+                    }
+                }
             }
             ReqKind::Seal => {
                 // Phase 2b: the backup did not answer the seal: the
@@ -7369,6 +7420,250 @@ impl Core {
         self.dl.gens.get_mut(&gen).expect("present").expiry = Some(t);
     }
 
+    /// Plan 46 M1.2 step 7 (c3-spec D6): this root has just inherited `gen`
+    /// from a predecessor. When its latest `DelegGroup` records no backup (the
+    /// group is the delegate and a root) the rows the delegate was answered
+    /// through may sit only on the delegate and on whichever root appended
+    /// them: the previous holder of the lease this node claimed, whose member
+    /// copy (`backup_tail[DELEG_BACKUP_BASE + gen]`, what its deposition kept
+    /// of its appends) holds the ones the log never got. It is sealed and its
+    /// answer appended; the generation does not end before
+    /// (`end_generation`). The set persists, with whatever an earlier
+    /// tenure of this node still owed, until each has answered.
+    fn deleg_inherit_prev_roots(
+        &mut self,
+        now: Now,
+        gen: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let me = self.me();
+        let Some(g) = self.dl.gens.get(&gen) else {
+            return;
+        };
+        if g.node == me || !g.group.strict().is_empty() {
+            return;
+        }
+        let mut set: BTreeSet<NodeId> = replica
+            .deleg_prev_roots(gen)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if let Some(prev) = self.lease.prev_holder {
+            set.insert(prev);
+        }
+        set.remove(&me);
+        if set.is_empty() {
+            return;
+        }
+        let nodes: Vec<NodeId> = set.iter().copied().collect();
+        replica.set_deleg_prev_roots(gen, &nodes);
+        tracing::info!(
+            node = me,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
+            prev_roots = ?nodes,
+            "inherited a generation without a recorded backup: sealing the previous root(s)"
+        );
+        if let Some(g) = self.dl.gens.get_mut(&gen) {
+            g.prev_roots = set;
+        }
+        self.deleg_prev_roots_step(now, replica, out);
+    }
+
+    /// The previous roots' seals (D6), after every event: ask each that has
+    /// not answered (again every `backup_takeover_ms`), drain the tails that
+    /// came, and settle the ones drained to their end.
+    fn deleg_prev_roots_step(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        let gens: Vec<u64> = self
+            .dl
+            .gens
+            .iter()
+            .filter(|(_, g)| !g.ended && !g.prev_roots.is_empty())
+            .map(|(gen, _)| *gen)
+            .collect();
+        for gen in gens {
+            let tails: Vec<(NodeId, std::sync::Arc<SealedTail>)> = self.dl.gens[&gen]
+                .prev_tails
+                .iter()
+                .map(|(n, t)| (*n, t.clone()))
+                .collect();
+            for (node, tail) in tails {
+                let mut drained_to = self.dl.gens[&gen].cursor;
+                let mut lost = false;
+                if self.root_ends_recall(now, gen) {
+                    (drained_to, lost) =
+                        self.deleg_drain_tail(now, gen, &tail.txs, false, replica, out);
+                }
+                // A row whose dependency was lost with its generation was
+                // never acknowledged (as for a backup's tail): the drain
+                // stops there and the previous root has nothing more to give.
+                if drained_to >= tail.end || lost {
+                    self.deleg_prev_root_done(now, gen, node, replica, out);
+                }
+            }
+            let Some(g) = self.dl.gens.get(&gen) else {
+                continue;
+            };
+            let due: Vec<NodeId> = g
+                .prev_roots
+                .iter()
+                .copied()
+                .filter(|n| !g.prev_tails.contains_key(n))
+                .filter(|n| {
+                    g.member_notes
+                        .get(n)
+                        .and_then(|m| m.asked)
+                        .is_none_or(|at| now.wait.since(at) >= self.cfg.backup_takeover_ms as i64)
+                })
+                .collect();
+            for node in due {
+                self.deleg_send_prev_root_seal(gen, node, out);
+            }
+        }
+    }
+
+    fn deleg_send_prev_root_seal(&mut self, gen: u64, node: NodeId, out: &mut Vec<Action>) {
+        let req = self.op_id();
+        self.dl.by_req.insert(req, (gen, ReqKind::SealPrevRoot));
+        let now = self.clk.wait;
+        if let Some(g) = self.dl.gens.get_mut(&gen) {
+            g.prev_reqs.insert(req, node);
+            g.member_notes.entry(node).or_default().asked = Some(now);
+        }
+        self.stats.deleg_prev_root_seals += 1;
+        out.push(Action::Send {
+            to: node,
+            msg: PeerMsg::DelegSeal { req, gen },
+        });
+    }
+
+    /// `node` is settled: its tail drained to its end, or it held nothing.
+    fn deleg_prev_root_done(
+        &mut self,
+        now: Now,
+        gen: u64,
+        node: NodeId,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(g) = self.dl.gens.get_mut(&gen) else {
+            return;
+        };
+        g.prev_roots.remove(&node);
+        g.prev_tails.remove(&node);
+        if g.prev_roots.is_empty() {
+            self.deleg_prev_roots_cleared(now, gen, true, replica, out);
+        } else {
+            let nodes: Vec<NodeId> = g.prev_roots.iter().copied().collect();
+            replica.set_deleg_prev_roots(gen, &nodes);
+        }
+    }
+
+    /// Every previous root of `gen` is settled (or the delegate showed this
+    /// root has every row it executed, or the operator abandoned the group):
+    /// forget the requests and the persisted set, and let the end that waited
+    /// go on.
+    fn deleg_prev_roots_cleared(
+        &mut self,
+        now: Now,
+        gen: u64,
+        progress: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        replica.set_deleg_prev_roots(gen, &[]);
+        let Some(g) = self.dl.gens.get_mut(&gen) else {
+            return;
+        };
+        g.prev_roots.clear();
+        g.prev_tails.clear();
+        let reqs = std::mem::take(&mut g.prev_reqs);
+        for req in reqs.keys() {
+            self.dl.by_req.remove(req);
+        }
+        let g = self.dl.gens.get_mut(&gen).expect("present");
+        if std::mem::take(&mut g.prev_blocked) {
+            g.waiting_for_group = false;
+            g.waiting_since = None;
+            // The end that waited is tried now, not at the next window.
+            self.dw.close(gen);
+            self.dw.set_until_closed(gen, now.wait);
+            self.arm_gen_expiry(now, gen, out);
+        }
+        // A recall that drained meanwhile ends the generation now
+        // (`root_progress` skips a generation with previous roots left: it
+        // never asked for the end, so nothing is marked blocked).
+        if progress {
+            self.root_progress(now, replica, out);
+        }
+    }
+
+    /// A previous root's answer to a seal (D6): append its tail from the
+    /// cursor as a backup's is appended, and settle it once the cursor
+    /// reaches the end. Never ends the generation, never re-delegates it:
+    /// the previous root is no delegate.
+    #[allow(clippy::too_many_arguments)]
+    fn on_prev_root_sealed(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        req: OpId,
+        gen: u64,
+        sealed: bool,
+        txs: Vec<constellation_meta::DelegateTx>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(gs) = self.dl.gens.get_mut(&gen) else {
+            return;
+        };
+        if gs.ended || gs.prev_reqs.get(&req) != Some(&from) || !gs.prev_roots.contains(&from) {
+            return;
+        }
+        gs.member_notes.entry(from).or_default().answered = Some(now.wait);
+        if !sealed {
+            // It holds nothing of the generation (and is sealed against more).
+            self.deleg_prev_root_done(now, gen, from, replica, out);
+            return;
+        }
+        let end = txs.iter().fold(
+            gs.cursor,
+            |end, tx| {
+                if tx.idx == end + 1 {
+                    tx.idx
+                } else {
+                    end
+                }
+            },
+        );
+        self.stats.deleg_prev_root_rows += txs.iter().filter(|t| t.idx > gs.cursor).count() as u64;
+        gs.prev_tails
+            .insert(from, std::sync::Arc::new(SealedTail { from, txs, end }));
+        self.deleg_prev_roots_step(now, replica, out);
+    }
+
+    /// The delegate's renewal says its stream head is `head`: when this root
+    /// has appended through it, it holds every row the delegate executed, and
+    /// so every row any previous root appended (the delegate keeps its rows
+    /// until the log carries them): the previous roots need not be asked.
+    pub(crate) fn deleg_prev_roots_renewed(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        gen: u64,
+        head: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let satisfied = self.dl.gens.get(&gen).is_some_and(|g| {
+            !g.ended && g.node == from && !g.prev_roots.is_empty() && head <= g.cursor
+        });
+        if satisfied {
+            self.stats.deleg_prev_root_renewals += 1;
+            self.deleg_prev_roots_cleared(now, gen, true, replica, out);
+        }
+    }
+
     /// Plan 43 C2e: ask `member` to seal `gen`. `strict`: it is one of the
     /// latest version's members, whose tail the end waits for.
     fn deleg_send_seal(&mut self, gen: u64, member: NodeId, strict: bool, out: &mut Vec<Action>) {
@@ -7590,6 +7885,27 @@ impl Core {
 
     /// A drained recall whose stream caught up ends the generation.
     fn root_progress(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        // Plan 46 M1.2 step 7 (D6): the delegate answered the recall with the
+        // head of its stream and this root has appended through it: it holds
+        // every row the delegate executed, so no previous root holds one it
+        // lacks (as for a renewal's `stream_head`, `deleg_prev_roots_renewed`).
+        // A delegate that was recalled renews no more, and a dead previous
+        // root answers nothing: this is the proof that is left.
+        let proven: Vec<u64> = self
+            .dl
+            .gens
+            .iter()
+            .filter(|(_, g)| {
+                !g.ended
+                    && !g.prev_roots.is_empty()
+                    && matches!(g.recall, RecallPhase::Drained(th) if g.cursor >= th)
+            })
+            .map(|(gen, _)| *gen)
+            .collect();
+        for gen in proven {
+            self.stats.deleg_prev_root_recalls += 1;
+            self.deleg_prev_roots_cleared(now, gen, false, replica, out);
+        }
         // Plan 46 M0.3 (S5, ADR-42): the takeover gate ends no generation (a
         // recall kept from a usable phase of this tenure is ended when the
         // gate opens: `delegation_sync`), except, under ADR-44, one it
@@ -7605,6 +7921,7 @@ impl Core {
             .iter()
             .filter(|(_, g)| {
                 !g.ended
+                    && g.prev_roots.is_empty()
                     && (!gated || (g.gate_recalled && g.inherited))
                     && matches!(g.recall, RecallPhase::Drained(th) if g.cursor >= th)
             })
@@ -7799,6 +8116,13 @@ impl Core {
         if g.ended {
             return;
         }
+        // Plan 46 M1.2 step 7 (c3-spec D6): not while a previous root's tail
+        // may hold rows past the cursor (`abandon-group` is the operator's
+        // way out: `abandoned`).
+        if abandoned.is_none() && !g.prev_roots.is_empty() {
+            self.deleg_end_waits_for_prev_roots(now, gen, out);
+            return;
+        }
         if let Some(at) = g.recall_started {
             let ms = now.wait.since(at).max(0) as u64;
             self.stats.deleg_recalls_timed += 1;
@@ -7897,11 +8221,59 @@ impl Core {
         }
     }
 
+    /// The end of `gen` was asked for while previous roots are unsettled: it
+    /// waits (the status says so, a WARN once a minute) and the expiry asks
+    /// again.
+    fn deleg_end_waits_for_prev_roots(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
+        self.stats.deleg_prev_root_waits += 1;
+        let warn = {
+            let Some(g) = self.dl.gens.get_mut(&gen) else {
+                return;
+            };
+            g.prev_blocked = true;
+            g.waiting_for_group = true;
+            g.waiting_since.get_or_insert(now.wait);
+            let due = g
+                .waiting_warned
+                .is_none_or(|at| now.wait.since(at) >= 60_000);
+            if due {
+                g.waiting_warned = Some(now.wait);
+            }
+            due
+        };
+        if warn {
+            tracing::warn!(
+                node = self.me(),
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
+                "a delegation's previous root has not answered its seal: the generation is not ended without its tail \
+                 (`constellation repair abandon-group --gen {gen}` ends it at the root's cursor; rows only it held are lost)"
+            );
+        }
+        self.dw.close(gen);
+        self.dw.set_until_closed(
+            gen,
+            now.wait
+                .plus(self.cfg.backup_takeover_ms.max(self.cfg.forward_timeout_ms)),
+        );
+        self.arm_gen_expiry(now, gen, out);
+    }
+
     fn mark_ended(&mut self, now: Now, gen: u64, replica: &dyn Replica, out: &mut Vec<Action>) {
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return;
         };
         let first = !g.ended;
+        if !g.prev_roots.is_empty() || !g.prev_reqs.is_empty() {
+            replica.set_deleg_prev_roots(gen, &[]);
+            for req in std::mem::take(&mut g.prev_reqs).keys() {
+                self.dl.by_req.remove(req);
+            }
+            let g = self.dl.gens.get_mut(&gen).expect("present");
+            g.prev_roots.clear();
+            g.prev_tails.clear();
+            g.prev_blocked = false;
+        }
+        let g = self.dl.gens.get_mut(&gen).expect("present");
         g.ended = true;
         g.waiting_for_group = false;
         g.waiting_since = None;
@@ -8359,6 +8731,10 @@ impl Core {
                 waiting_warned: None,
                 waiting_since: None,
                 member_notes: BTreeMap::new(),
+                prev_roots: BTreeSet::new(),
+                prev_reqs: BTreeMap::new(),
+                prev_tails: BTreeMap::new(),
+                prev_blocked: false,
                 delegate_heard: None,
                 cursor: 0,
                 last_batch: None,

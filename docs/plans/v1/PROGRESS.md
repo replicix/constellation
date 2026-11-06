@@ -67891,3 +67891,79 @@ Raise only: an own row still in the journal keeps its index (the strand's settle
 
 **Fail-before** (debug): core `the_counter_of_an_ended_generation_follows_the_re_append_without_the_settle` (counter 0, log 2):
 re-append without the settle, a retried pass with an empty capture, a restart, and the re-appended rows counted as own.
+
+### Plan 46 M1.2 step 7: a deposed root keeps the delegate rows it appended as a member copy; the next root seals its predecessor (2026-11-06)
+
+C3-4 (c3-spec D6 and D12).
+
+- **Meta.** `Meta::strand_deposed(floor, own_gens)`: `strand_below_epoch`'s fates, and a `Local` row of another node's generation (`gen` != 0,
+  a lease epoch below `floor`, `gen` not one of this node's own as a delegate) is rolled back from its before-images, leaves the journal, its
+  `completed` row goes (unless the log carries it) and the generation's log index retracts, and the row is written verbatim into
+  `backup_tail[DELEG_BACKUP_BASE + gen]` under its index (`deleg_member_copy_put_tx`, the key and bytes of `deleg_backup_append`) in the same
+  transaction. Never queued (`Stranded::deleg_member_copied`). `Strand::deleg_copy` carries the set to `strand_local_tx`.
+- **Core, deposed root.** `recover_deposed` calls `strand_deposed` with `own_gens` = the generations the node is the delegate of
+  (`own_journaled_gens`) minus the ones its gate ended (`deleg_ended_at_gate`: what the gate re-appended is appended rows now), and asks
+  for `RebuildReplica` only if `uncaptured_tx_count() > 0` (the journal holds a row without before-images), no longer for any journal row
+  (D12). A row of a generation is always captured (`begin_local`), so the rebuild now stays for non-holder rows of the node's own.
+- **Core, next root (D6).** `LeaseState::prev_holder` (the holder of the lease the last claim took over; `None` for a create or a claim of the
+  node's own lease). A root inheriting a generation whose latest `DelegGroup` names no backup, and whose delegate is not itself, puts
+  `prev_holder` (plus the persisted `deleg_prev_roots:{gen}`, `Replica::{deleg_prev_roots,set_deleg_prev_roots}`) in `GenState::prev_roots`,
+  and sends `DelegSeal` (`ReqKind::SealPrevRoot`; asked again every `backup_takeover_ms`, after every event). The answer (`on_prev_root_sealed`)
+  drains its tail from the cursor like a backup's (`deleg_drain_tail`), settles the node once the cursor reaches the tail's end or on `sealed:
+  false`, and never ends or re-delegates. A delegate's `DelegRenew` with `stream_head <= cursor` settles the whole set. `end_generation`
+  (every end, except `abandon-group`'s) does not end while `prev_roots` is non-empty: `waiting_for_group`, a WARN once a minute, the expiry
+  asks again. `mark_ended` forgets the set. The member side needed nothing (`on_deleg_seal` answers from `deleg_backup_holds_any`).
+  Stats: `deleg_prev_root_{seals,rows,waits,renewals}`.
+- **Not done here.** `reset_for_rebuilt_ns_tx` (the uncaptured fallback and the retention rebuild) still queues a `Lone` append as `Records`: it
+  is not given the node's own generations, and a row of a generation is never uncaptured, so a rebuild finds none but the retention rebuild's
+  (a node behind the log's pruned tail). The `Records` copy of an own delegate row stays (D13).
+
+**Fail-before** (debug): meta `a_deposed_root_keeps_appended_delegate_rows_as_a_member_copy` (no `strand_deposed` on main),
+`a_deposed_root_leaves_its_own_delegates_rows_where_they_are`; core `a_deposed_root_never_asks_for_a_rebuild_with_a_captured_journal` (main:
+`RebuildReplica`, checked on a clean main tree), `a_root_inheriting_a_backup_less_generation_seals_its_predecessor`,
+`a_generation_with_a_recorded_backup_seals_no_previous_root`, `a_member_copy_is_served_to_the_next_roots_seal`,
+`a_predecessors_answer_never_ends_or_redelegates`, `a_predecessor_that_holds_nothing_satisfies_the_seal`,
+`the_generation_end_waits_for_the_predecessor_until_abandoned`, `a_delegate_renewal_at_the_cursor_satisfies_the_predecessor_seal`,
+`an_unanswered_predecessor_seal_is_asked_again`. `a_deposition_rebuild_moves_the_cursor_to_the_rebuilt_position` now uses an uncaptured row
+(it used a delegate append, which no longer rebuilds).
+
+**Pinned bug closed.** `a_deposed_roots_appended_delegate_row_never_lands_past_its_generations_seal` passes 9 of 9 and loses its `#[ignore]`;
+`delegated-core-stall-root-sealed+commit` with slow lease reads, seeds 0..1,999: main 9 failing, this branch 0.
+
+**L2b: three of five seeds closed.** `long-delegated-backup` 13016, 14284 and 15005 (`+identity`, slow lease reads) pass; the pin keeps them
+(`l2b_findings_a_committed_delegate_row_lands_with_its_identity`, no longer ignored). `long-delegated-late-answers` 13907 and 15996 still fail
+I2c, and fail the same way on main: they are a different mechanism and the step does not close them
+(`l2b_findings_a_recall_capped_by_the_delegates_unshipped_appends`, ignored). Seed 13907: gen 1:1 has a recorded backup (node 3) and its
+delegate is node 2. Node 2 takes the root (epoch 2), the gate re-appends the delegate's rows 5 and 6 into its journal, and the gate does not open
+(read-delegation quarantine) before node 1 claims epoch 3. Node 1 recalls the delegate; the delegate answers `delegate_idx.min(holder_append_cap)`
+= 4, because rows 5 and 6 are its tenure's unshipped holder appends (plan 43 Q16). Node 1 ends the generation at 4 and, as the group has a recorded
+backup, seals nobody (D6 is for backup-less groups; C2's seal set is for a silent delegate). The rows only the group and node 2's journal hold
+are below the cut; the requester's shadow of rid 1/8 replays by rid and lands the row again, which a later segment's `superseded` rule then
+accepts. Nothing is lost, the identity is (I2c). A fix needs the recall answer not capped below rows the delegate still holds (the cap and
+the lone-journal commit go with steps 13/14), or the next root sealing a recorded group at a recall's end. Not done: outside the spec's D6.
+
+**Regression guards.** `placement-hot` 593 and `-lr` 616 and `long-delegated-late-answers-lr` I2 were already clean on main (step 0).
+
+**Two findings of the sweeps, fixed in this step.**
+1. A drained recall never asks for the end, so `root_progress`'s filter skipped a generation with previous roots left and nothing re-tried it
+   when the answer came: `long-delegated-late-answers+identity` seeds 14285 and 15437 (slow lease reads) hung ("a client op was never
+   answered"). `deleg_prev_roots_cleared` now runs `root_progress` always. Test `a_drained_recall_ends_the_generation_once_the_predecessor_answers`.
+2. A delegate that was recalled renews no more, and a dead previous root answers nothing, so `delegated_root_loss_hands_the_writes_to_a_ttl_successor`
+   waited 42 s on the dead root. The proof that is left is the delegate's own recall answer: when the drained recall's `through` is at or
+   below the cursor, this root holds every row the delegate executed, and the set is settled (`root_progress`, `deleg_prev_root_recalls`; the
+   same argument as the renewal's `stream_head`). Test `a_drained_recall_settles_a_predecessor_that_never_answers`.
+
+**Sim.** `c0_the_real_rebuild_recovers_a_deposed_root` asserted a rebuild on seeds 270 and 2822 (a deposed root's delegate append); with the
+append rolled back and member-copied none runs on any seed of 12,000 `long-delegated-late-answers` and `long-delegated-backup` runs, so it is
+`c0_a_deposed_roots_captured_journal_needs_no_rebuild` (rebuilds 0/0, also with the stub that fails every rebuild).
+
+**Sweeps** (box 2, release, ×2,000, slow lease reads unless noted, branch against main, failing sets identical): `placement-hot+commit` (with
+and without `-lr`) and `+commit+identity+lone` (with and without): 0 and 0 (593, 616 clean); `long-delegated-backup+commit` 0 and 0;
+`long-delegated-late-answers+commit` 0 and 0; `long-delegated-backup+identity` 0..1,999: 658, 1383 (both: the step 5 sealed-tail overlap) and
+13,000..15,999: 14556, 14675, 14959, 15591 (both); `long-delegated-late-answers+identity` 0..1,999: 144, 365, 397, 589, 1281, 1295 (both) and
+13,000..15,999: 13002, 13907, 14025, 14229, 14284, 14504, 14627, 15372, 15720, 15996 (both). `delegated-core-stall-root-sealed+commit`: main 9,
+branch 0. `delegated-root-gone+commit` 0. Rebuilds: none on the branch in `long-delegated-late-answers` 0..5,999 (and 2,000..5,999 `-lr`) and
+`long-delegated-backup` 0..3,999.
+
+**Gates** (box 2, debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta lib and integration (636 debug, 634
+release), authority lib 1,068, engine lib 952, release sim suite 418 passed, 0 failed, 12 ignored. No perf gate (takeover only).

@@ -739,6 +739,11 @@ pub struct Stranded {
     /// of the generation a recall ended, rolled back and dropped instead of
     /// queued for replay (`speculation.deleg_dropped`). Not in `locals`.
     pub deleg_dropped: usize,
+    /// Plan 46 M1.2 step 7 (c3-spec §6.1): a delegate's row this node
+    /// appended as the root, rolled back by a deposition and kept as a member
+    /// copy of its generation (`backup_tail[DELEG_BACKUP_BASE + gen]`), never
+    /// queued. Not in `locals`.
+    pub deleg_member_copied: usize,
 }
 
 impl Stranded {
@@ -747,6 +752,7 @@ impl Stranded {
             + self.hints
             + self.locals
             + self.member_copied
+            + self.deleg_member_copied
             + self.superseded
             + self.deleg_dropped
             > 0
@@ -829,6 +835,9 @@ enum Stranding {
     Queued,
     /// A gated row, moved to the member copy of its epoch.
     Member,
+    /// Plan 46 M1.2 step 7: a delegate's row this root appended, moved to
+    /// the member copy of its generation (`Stranded::deleg_member_copied`).
+    DelegMember,
     /// A gated row queued for replay in a pass that must not (counted,
     /// `Stranded::gated_queued`; a debug build asserts).
     GatedQueued,
@@ -894,6 +903,12 @@ struct Strand<'a> {
     /// stranded row, then dropped. Set per row by `redo_row_tx` for a
     /// `Local` entry of the pass's `quiet` set.
     superseded: bool,
+    /// Plan 46 M1.2 step 7 (c3-spec §6.1): a deposition's pass. A `Local` row
+    /// of another node's generation (`gen` != 0, a lease epoch, `gen` not in
+    /// this set: the root's append of a delegate's row) is rolled back and kept
+    /// as a member copy of that generation, never queued. The set is this
+    /// node's own generations as a delegate.
+    deleg_copy: Option<&'a HashSet<u64>>,
 }
 
 impl Strand<'static> {
@@ -906,6 +921,7 @@ impl Strand<'static> {
         hold: false,
         deps_of: None,
         superseded: false,
+        deleg_copy: None,
     };
 }
 
@@ -1654,6 +1670,30 @@ fn strand_local_tx(
             }
         }
     }
+    // Plan 46 M1.2 step 7 (c3-spec §6.1, D12): a delegate's row this node
+    // appended as the root (`gen` != 0 under a lease epoch, not one of its own
+    // generations as a delegate) is another node's stream's row. It was rolled
+    // back above (journal rows, `completed`, the generation's log index); it
+    // is not this node's to re-execute and is never queued: the delegate's
+    // answer waits for a group that may include this node's append, so the
+    // row is kept verbatim as a member copy of its generation, which the next
+    // root's seal of the generation reads (`DelegSeal`, `deleg_backup_tail`).
+    if let Some(own) = strand.deleg_copy {
+        if row.gen != 0 && row.epoch > 0 && !own.contains(&row.gen) {
+            super::backup::deleg_member_copy_put_tx(
+                tx,
+                meta,
+                row.gen,
+                &super::DelegateTx {
+                    idx: row.idx,
+                    rid: row.rid,
+                    records,
+                    deps: row.deps,
+                },
+            )?;
+            return Ok(Stranding::DelegMember);
+        }
+    }
     // Plan 43 C1-4 (§5.2 item 2, §5.6): a row this node's client was told
     // is committed (its group or the archive held it) is not this node's to
     // re-execute: it was rolled back above and goes to the member copy of
@@ -2152,6 +2192,7 @@ fn redo_row_tx(
                 };
                 match strand_local_tx(tx, meta, first, row.origin, &row.before, undone, strand)? {
                     Stranding::Member => out.member_copied += 1,
+                    Stranding::DelegMember => out.deleg_member_copied += 1,
                     Stranding::Queued => out.locals += 1,
                     Stranding::GatedQueued => {
                         out.locals += 1;
@@ -3213,6 +3254,22 @@ fn strand_tx(
     hold: bool,
     quiet: impl Fn(&LiveEntry) -> bool,
 ) -> Result<Stranded, MetaError> {
+    strand_tx_deleg(tx, meta, staged, strands, member, recall, hold, quiet, None)
+}
+
+/// [`strand_tx`] with `deleg_copy` ([`Strand::deleg_copy`]).
+#[allow(clippy::too_many_arguments)]
+fn strand_tx_deleg(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    staged: &UsageTracker,
+    strands: impl Fn(&LiveEntry) -> bool,
+    member: bool,
+    recall: bool,
+    hold: bool,
+    quiet: impl Fn(&LiveEntry) -> bool,
+    deleg_copy: Option<&HashSet<u64>>,
+) -> Result<Stranded, MetaError> {
     let live: HashMap<u64, LiveEntry> = read_live(tx, meta)?.into_iter().collect();
     let stranded: HashSet<u64> = live
         .iter()
@@ -3235,6 +3292,7 @@ fn strand_tx(
         hold,
         deps_of: None,
         superseded: false,
+        deleg_copy,
     };
     Ok(rewind_tx(tx, meta, staged, &live, &stranded, cutoff, strand, None)?.0)
 }
@@ -3743,6 +3801,7 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
                 hold: false,
                 deps_of: Some(&deps_of),
                 superseded: false,
+                deleg_copy: None,
             },
         )?;
     }
@@ -5573,6 +5632,52 @@ impl Meta {
             false,
             true,
             |_| false,
+        )?;
+        if !stranded.any() {
+            return Ok(stranded);
+        }
+        let from = journal_from(&tx, self)?;
+        compact_tx(&mut tx, self, from)?;
+        let (bytes, files) = staged.raw_delta();
+        adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
+        tx.commit()?;
+        self.report_rolled_back();
+        staged.drain_into(self.usage_tracker());
+        Ok(stranded)
+    }
+
+    /// Plan 46 M1.2 step 7 (c3-spec §6.1): a deposition's strand.
+    /// [`Self::strand_below_epoch`]'s fates, and a delegate's row this node
+    /// appended as the root (a `Local` row of a generation not in `own_gens`,
+    /// journaled under a lease epoch below `floor`) is rolled back from its
+    /// before-images, leaves the journal (and the generation's log index
+    /// retracts) and is kept verbatim as a member copy of its generation
+    /// (`backup_tail[DELEG_BACKUP_BASE + gen]`, key `idx`), in the same
+    /// transaction. Never queued: the delegate holds the row until the log
+    /// carries it and the next root's `DelegSeal` of a backup-less generation
+    /// reads this copy. `own_gens` are the generations this node is the
+    /// delegate of (their rows are its live stream: left alone).
+    pub fn strand_deposed(&self, floor: u64, own_gens: &[u64]) -> Result<Stranded, MetaError> {
+        let own: HashSet<u64> = own_gens.iter().copied().collect();
+        let mut tx = self.db.write_tx();
+        let staged = UsageTracker::staging();
+        let stranded = strand_tx_deleg(
+            &mut tx,
+            self,
+            &staged,
+            |entry| {
+                entry.stranded_by_takeover(floor)
+                    || matches!(
+                        entry,
+                        LiveEntry::Local { epoch, gen, .. }
+                            if *gen != 0 && *epoch != 0 && *epoch < floor && !own.contains(gen)
+                    )
+            },
+            true,
+            false,
+            true,
+            |_| false,
+            Some(&own),
         )?;
         if !stranded.any() {
             return Ok(stranded);
