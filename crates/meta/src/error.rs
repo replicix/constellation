@@ -49,6 +49,24 @@ pub enum MetaError {
     #[error("the fast path's admission ran out before the write")]
     NotAdmitted,
 
+    /// Plan 46 M1.2 step 5 (c3-spec D3): a record of the predecessor's
+    /// sealed tail that does not apply to the state the tail was built on.
+    /// The takeover's re-ship is one store transaction (`Meta::
+    /// reship_at_takeover`), so nothing of it changed: not the strand, not
+    /// the tail's earlier rows, not the fence. The caller keeps the gate
+    /// closed; a retry fails the same way until the premise (the archive
+    /// prefix the tail extends) is repaired, which is an operator's
+    /// decision, never a silent skip.
+    #[error(
+        "the sealed tail of epoch {prev} (journal rows {first}..={last}) does not apply: {why}"
+    )]
+    TailDiverged {
+        prev: u64,
+        first: u64,
+        last: u64,
+        why: String,
+    },
+
     #[error("fjall: {0}")]
     Fjall(#[from] fjall::Error),
 
@@ -86,7 +104,7 @@ impl MetaError {
             NoData => Code::NoData,
             Invalid(_) => Code::Invalid,
             Conflict => Code::Again,
-            LockLapsed | NotAdmitted => Code::Io,
+            LockLapsed | NotAdmitted | TailDiverged { .. } => Code::Io,
             Fjall(_) | Io(_) | Record(_) | Key(_) | Json(_) | Postcard(_) => Code::Io,
         }
     }

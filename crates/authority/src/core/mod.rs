@@ -1710,6 +1710,13 @@ pub struct Stats {
     /// Plan 43 C1-4: tail transactions past a gap, not re-shipped (never
     /// acknowledged; their clients retry by rid).
     pub tail_beyond_gap_dropped: u64,
+    /// Plan 46 M1.2 step 5 (c3-spec D3): a sealed tail that did not apply
+    /// (`MetaError::TailDiverged`), one per pass of the closed gate. Must
+    /// stay 0; the sim fails a seed that has one.
+    pub tail_diverged: u64,
+    /// Plan 46 M1.2 step 5: tail transactions whose rid already had an
+    /// outcome here (the log carried them), not re-shipped.
+    pub tail_done_skipped: u64,
     pub inherited_tails_cleared: u64,
     pub ttl_claims_without_tail: u64,
     /// Plan 43 C1-2: journal rows the core wrote without setting their

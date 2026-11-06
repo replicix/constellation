@@ -119,6 +119,21 @@ enum Journaled {
     /// The root's append of a delegate's transaction (plan 45 §12 O1:
     /// its own live shadow of the rid is replaced, not applied over).
     Appended,
+    /// Plan 46 M1.2 step 5: a takeover's re-ship of its predecessor's
+    /// sealed tail. Journaled verbatim as [`Self::Appended`] is (the records
+    /// as the tail holds them, in its order), with [`Self::Adopted`]'s
+    /// manifest enrolment, and strict: a record that does not apply is
+    /// [`MetaError::TailDiverged`], not a skip.
+    Tail,
+}
+
+/// What [`Meta::journal_records_tx`] leaves for its caller once its
+/// transaction has committed: the usage deltas to drain and the records to
+/// note as unshipped.
+pub(crate) struct JournaledTx {
+    pub(crate) staged: UsageTracker,
+    pub(crate) moved: UsageTracker,
+    pub(crate) applied: Vec<LogRecord>,
 }
 
 /// What a [`RowCommit::Group`]'s configuration waits on: the journal's
@@ -1861,32 +1876,6 @@ impl Meta {
         rid: Option<crate::Rid>,
         how: Journaled,
     ) -> Result<(), MetaError> {
-        let adopted = how == Journaled::Adopted;
-        // With a rid, the transaction is that op's (plan 30 §M9): a
-        // stranding replays it *by rid* — where `completed` dedups —
-        // never as anonymous records under a derived rid, which would
-        // re-apply a stale effect out of order. A delegate's row the root
-        // appends (plan 46 M1.2 step 4) is journaled as streamed, with its
-        // rid and no op: it is not one this node can execute again.
-        let verbatim = how == Journaled::Appended;
-        let _op = rid.map(|rid| {
-            if verbatim {
-                journal::PendingLocalOp::set_rid_only(Some(rid))
-            } else {
-                journal::PendingLocalOp::set(
-                    Some(rid),
-                    &crate::mutate::MutateOp::Records {
-                        records: records.to_vec(),
-                    },
-                )
-            }
-        });
-        // Plan 43 C1-2: a predecessor's tail was committed by its group
-        // (the sealer held it, write-all), whatever this tenure waits for.
-        // (A control row the core journals through the same path — a grant,
-        // a recall — carries the class the core set.)
-        let _class = (adopted && journal::PendingClass::current().is_none())
-            .then(|| journal::PendingClass::set(RowCommit::ROOT_GROUP));
         // Plan 30 §M12: a grant or a recall changes who may execute
         // what; the root's fast path checks that under the shared side
         // (`Meta::deleg_gate`). Taken before the write transaction, in
@@ -1903,6 +1892,79 @@ impl Meta {
             })
             .then(|| self.deleg_gate.write().unwrap_or_else(|e| e.into_inner()));
         let mut tx = self.db.write_tx();
+        let done = self.journal_records_tx(&mut tx, records, rid, how)?;
+        tx.commit()?;
+        done.staged.drain_into(self.usage_tracker());
+        done.moved.drain_into(self.usage_tracker());
+        // The rows journaled here are unshipped work of this tenure, like
+        // `mutate::execute`'s: plan 30 §M5's forward-reply `base`, §M8's
+        // ReadIndex positions and §M9's holder-read durability wait all
+        // ask what the unshipped journal touched.
+        self.note_unshipped(&done.applied);
+        Ok(())
+    }
+
+    /// One transaction of a sealed tail, journaled verbatim under its
+    /// delegation origin `(gen, idx)` (`(0, 0)`: the predecessor's own row)
+    /// inside the caller's transaction ([`Meta::reship_at_takeover`]): the
+    /// store half of [`Self::apply_adopted_records_from`], strict.
+    pub(crate) fn journal_tail_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        records: &[LogRecord],
+        rid: Option<Rid>,
+        (gen, idx): (u64, u64),
+    ) -> Result<JournaledTx, MetaError> {
+        let _d = (gen != 0)
+            .then(|| journal::PendingDelegate::set(gen, Some(idx), crate::session::Position::ZERO));
+        let done = self.journal_records_tx(tx, records, rid, Journaled::Tail)?;
+        if gen != 0 {
+            bump_log_idx_tx(tx, &self.local, gen, idx)?;
+        }
+        Ok(done)
+    }
+
+    /// The body of [`Self::apply_records_journaled_inner`] inside a
+    /// transaction the caller owns: the takeover's re-ship
+    /// ([`Meta::reship_at_takeover`]) journals a whole tail in one. The
+    /// caller takes the delegation gate (when `records` name a grant or a
+    /// recall), commits, drains the usage trackers and notes the unshipped
+    /// rows.
+    fn journal_records_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        records: &[LogRecord],
+        rid: Option<crate::Rid>,
+        how: Journaled,
+    ) -> Result<JournaledTx, MetaError> {
+        let adopted = matches!(how, Journaled::Adopted | Journaled::Tail);
+        // With a rid, the transaction is that op's (plan 30 §M9): a
+        // stranding replays it *by rid* — where `completed` dedups —
+        // never as anonymous records under a derived rid, which would
+        // re-apply a stale effect out of order. A delegate's row the root
+        // appends (plan 46 M1.2 step 4) is journaled as streamed, with its
+        // rid and no op: it is not one this node can execute again.
+        let verbatim = matches!(how, Journaled::Appended | Journaled::Tail);
+        let rid_only = how == Journaled::Appended;
+        let _op = rid.map(|rid| {
+            if rid_only {
+                journal::PendingLocalOp::set_rid_only(Some(rid))
+            } else {
+                journal::PendingLocalOp::set(
+                    Some(rid),
+                    &crate::mutate::MutateOp::Records {
+                        records: records.to_vec(),
+                    },
+                )
+            }
+        });
+        // Plan 43 C1-2: a predecessor's tail was committed by its group
+        // (the sealer held it, write-all), whatever this tenure waits for.
+        // (A control row the core journals through the same path — a grant,
+        // a recall — carries the class the core set.)
+        let _class = (adopted && journal::PendingClass::current().is_none())
+            .then(|| journal::PendingClass::set(RowCommit::ROOT_GROUP));
+
         // Plan 45 §12 O1: the root's own live shadow of the rid it
         // appends is that transaction's effect already; it is taken out
         // by rid and the append goes in its place (see
@@ -1912,26 +1974,40 @@ impl Meta {
         let moved = UsageTracker::staging();
         let unwind = match (how, rid) {
             (Journaled::Appended, Some(rid)) => {
-                spec::unwind_shadow_for_append_tx(&mut tx, self, &moved, rid, records)?
+                spec::unwind_shadow_for_append_tx(tx, self, &moved, rid, records)?
             }
             _ => None,
         };
-        let local = self.begin_local(&tx)?;
+        let local = self.begin_local(&*tx)?;
         let staged = UsageTracker::staging();
         let (skipped, applied) = {
             let cx = ApplyCx {
                 dirty: local.dirty(self),
                 durable: true,
             };
-            apply_batch_tx(
-                &mut tx,
-                self,
-                cx,
-                records,
-                &TouchSet::default(),
-                &staged,
-                true,
-            )?
+            if how == Journaled::Tail {
+                // Strict: the tail extends the archive prefix this replica
+                // holds, so every record applies exactly. One that does not
+                // is a broken premise, reported with nothing journaled
+                // (c3-spec V1); the caller drops the whole transaction.
+                let mut applied = Vec::with_capacity(records.len());
+                for rec in records {
+                    if let Some(why) = crate::replay::apply_record(tx, self, cx, rec, &staged)? {
+                        let mut shown = format!("{rec:?}");
+                        shown.truncate(240);
+                        return Err(MetaError::TailDiverged {
+                            prev: 0,
+                            first: 0,
+                            last: 0,
+                            why: format!("{why}: {shown}"),
+                        });
+                    }
+                    applied.push(rec.clone());
+                }
+                (0, applied)
+            } else {
+                apply_batch_tx(tx, self, cx, records, &TouchSet::default(), &staged, true)?
+            }
         };
         if verbatim {
             // The streamed records exactly, in order: an `Atime` row, an
@@ -1940,7 +2016,7 @@ impl Meta {
             // The apply above is tolerant (every replica applies the same
             // records by the same rules), and a record it skipped is
             // counted: the sim fails a seed that has one.
-            if skipped > 0 {
+            if skipped > 0 && how == Journaled::Appended {
                 self.deleg_append_skipped
                     .fetch_add(skipped as u64, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1969,7 +2045,7 @@ impl Meta {
                 match rec {
                     LogRecord::Completed { rid } => {
                         journal::append_completion_tx(
-                            &mut tx,
+                            tx,
                             &self.journal_ks,
                             &self.local,
                             &self.completed,
@@ -1978,7 +2054,7 @@ impl Meta {
                     }
                     LogRecord::Refused { rid, code } => {
                         let seq = journal::append_tx(
-                            &mut tx,
+                            tx,
                             &self.journal_ks,
                             &self.local,
                             &self.completed,
@@ -1993,7 +2069,7 @@ impl Meta {
                     }
                     _ => {
                         journal::append_tx(
-                            &mut tx,
+                            tx,
                             &self.journal_ks,
                             &self.local,
                             &self.completed,
@@ -2023,7 +2099,7 @@ impl Meta {
             // the calling op is left alone.
             let _armed =
                 (rid.is_some() && i + 1 == n).then(|| journal::PendingCompletion::set(rid));
-            journal::append_tx(&mut tx, &self.journal_ks, &self.local, &self.completed, rec)?;
+            journal::append_tx(tx, &self.journal_ks, &self.local, &self.completed, rec)?;
         }
         if n == 0 && !verbatim {
             // The rid is this transaction's own, or the one `execute`
@@ -2037,7 +2113,7 @@ impl Meta {
                 // state), but the op completed here: the log must still
                 // say so, once.
                 journal::append_completion_tx(
-                    &mut tx,
+                    tx,
                     &self.journal_ks,
                     &self.local,
                     &self.completed,
@@ -2045,7 +2121,7 @@ impl Meta {
                 )?;
             }
         }
-        if adopted {
+        if adopted && !verbatim {
             // Plan 30 §M9: the predecessor's outcome rows ride its tail
             // too — a journaled refusal (the rid's outcome, which every
             // later execution of it must dedup to) and an inbox position's
@@ -2060,7 +2136,7 @@ impl Meta {
                 match rec {
                     LogRecord::Refused { rid, code } => {
                         let seq = journal::append_tx(
-                            &mut tx,
+                            tx,
                             &self.journal_ks,
                             &self.local,
                             &self.completed,
@@ -2075,7 +2151,7 @@ impl Meta {
                     }
                     LogRecord::InboxAck { .. } => {
                         journal::append_tx(
-                            &mut tx,
+                            tx,
                             &self.journal_ks,
                             &self.local,
                             &self.completed,
@@ -2085,29 +2161,27 @@ impl Meta {
                     _ => {}
                 }
             }
+        }
+        if adopted {
             for rec in &applied {
                 if let LogRecord::WriteManifest { ino, manifest, .. } = rec {
-                    crate::store::held::enroll_adopted_manifest_tx(&mut tx, self, *ino, manifest)?;
+                    crate::store::held::enroll_adopted_manifest_tx(tx, self, *ino, manifest)?;
                 }
             }
         }
         let (bytes, files) = staged.raw_delta();
-        adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
-        self.finish_local(&mut tx, local)?;
+        adjust_usage_tx(tx, &self.local, bytes, files)?;
+        self.finish_local(tx, local)?;
         if let Some(unwind) = unwind {
-            spec::redo_after_append_tx(&mut tx, self, &moved, unwind)?;
+            spec::redo_after_append_tx(tx, self, &moved, unwind)?;
         }
         let (bytes, files) = moved.raw_delta();
-        adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
-        tx.commit()?;
-        staged.drain_into(self.usage_tracker());
-        moved.drain_into(self.usage_tracker());
-        // The rows journaled here are unshipped work of this tenure, like
-        // `mutate::execute`'s: plan 30 §M5's forward-reply `base`, §M8's
-        // ReadIndex positions and §M9's holder-read durability wait all
-        // ask what the unshipped journal touched.
-        self.note_unshipped(&applied);
-        Ok(())
+        adjust_usage_tx(tx, &self.local, bytes, files)?;
+        Ok(JournaledTx {
+            staged,
+            moved,
+            applied,
+        })
     }
 }
 

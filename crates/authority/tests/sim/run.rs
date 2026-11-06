@@ -5581,6 +5581,17 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             ));
         }
     }
+    // Plan 46 M1.2 step 5 (c3-spec D3): a successor re-ships its sealed
+    // tail verbatim; a record that does not apply is a broken premise and a
+    // closed gate (`TailDiverged`), never a skip. Any fails the seed.
+    for (id, stats) in &report.stats {
+        if stats.tail_diverged > 0 {
+            return Err(format!(
+                "node {id}: the sealed tail did not apply ({} gate pass(es), TailDiverged)\n  stats: {:#?}",
+                stats.tail_diverged, report.stats
+            ));
+        }
+    }
     // The causal cut: a refusal for lacking deps at the current root (see
     // `Oracles::note_deps_refused`; a deposed root's refusal is no
     // violation, `long-delegated-late-answers` seed 4947).

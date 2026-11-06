@@ -1289,6 +1289,41 @@ impl Core {
         gens.into_iter().collect()
     }
 
+    /// The re-ship of a takeover failed (`Meta::reship_at_takeover`):
+    /// nothing changed, the gate stays closed and retries every round.
+    ///
+    /// `MetaError::TailDiverged` is the one that does not heal by itself: a
+    /// record of the sealed tail does not apply to the state the tail was
+    /// built on (a broken premise: the strand and the archive prefix should
+    /// have made it apply exactly). It is an ERROR with the tail's epoch,
+    /// its journal rows and the record, and `stats.tail_diverged` counts
+    /// each pass; the sim fails the seed. The node does not serve as root
+    /// until it is resolved, and no recovery here drops the rows: the
+    /// operator stops this node (its lease then passes to another claimant,
+    /// which fetches the tail from the sealer or a member copy) or abandons
+    /// the group (the explicit decision to give up what no one else
+    /// re-ships, plan 43 C1-4). Integrity over availability.
+    fn reship_failed(&mut self, e: constellation_meta::MetaError) -> GateStep {
+        if let constellation_meta::MetaError::TailDiverged {
+            prev,
+            first,
+            last,
+            why,
+        } = &e
+        {
+            self.stats.tail_diverged += 1;
+            tracing::error!(
+                node = self.cfg.node_id,
+                prev,
+                first,
+                last,
+                why,
+                "the predecessor's sealed tail does not apply: the takeover gate stays closed and changes nothing (operator: stop this node so another claimant takes over, or abandon the group)"
+            );
+        }
+        GateStep::Failed(e.to_string())
+    }
+
     /// `shipper::complete_gate`: after the marker (or with none needed),
     /// strand what the new epoch supersedes, replay the queue locally,
     /// drain the older epochs' inbox, open the view.
@@ -1307,6 +1342,24 @@ impl Core {
         // Whatever the old tenure streamed ahead is stranded or re-shipped
         // under this one.
         replica.clear_streamed();
+        // Plan 46 M1.2 step 5: the strand and the predecessor's tail are one
+        // store transaction (`Meta::reship_at_takeover`), which also clears
+        // the tail: what the gate needs of it afterwards (the delegate rows
+        // it carries, its contiguous prefix) is read now.
+        let tail_rows: Option<Vec<constellation_meta::BackupTx>> = match gate.backup_tail_epoch {
+            Some(e) => match replica.backup_tail(e) {
+                Some(rows) => Some(rows),
+                None => {
+                    return GateStep::Failed(format!(
+                        "the backup tail of epoch {e} could not be read"
+                    ))
+                }
+            },
+            None => None,
+        };
+        let tail_through = self.bk.tail_through;
+        let tail_args = gate.backup_tail_epoch.map(|e| self.tail_args(e));
+        let mut reshipped = false;
         if gate.takeover {
             // With a predecessor's backup tail to re-apply, this node's
             // own rows as a delegate too: they must follow the tail, not
@@ -1353,9 +1406,8 @@ impl Core {
             // `apply_backup_tail`): a committed shadow of one of them here
             // would apply twice; one of a row the tail does not carry stays
             // until the delegate's re-stream is appended.
-            let carried: std::collections::HashSet<constellation_meta::Rid> = gate
-                .backup_tail_epoch
-                .and_then(|e| replica.backup_tail(e))
+            let carried: std::collections::HashSet<constellation_meta::Rid> = tail_rows
+                .as_deref()
                 .unwrap_or_default()
                 .iter()
                 .filter(|t| t.origin.0 != 0 && t.last <= self.bk.tail_through)
@@ -1384,14 +1436,22 @@ impl Core {
                     proof
                 }
             };
-            match replica.strand_for_takeover(
-                gate.epoch,
-                &own_gens,
-                self.bk.gate_abandoned,
-                &carried,
-                &proof,
+            match replica.reship_at_takeover(
+                Some(constellation_meta::StrandArgs {
+                    epoch: gate.epoch,
+                    own_gens: &own_gens,
+                    abandoned: self.bk.gate_abandoned,
+                    carried: &carried,
+                    proof: &proof,
+                }),
+                tail_args,
             ) {
-                Ok(stranded) => {
+                Ok(report) => {
+                    let stranded = report.stranded;
+                    if let Some(args) = tail_args {
+                        self.tail_reshipped(args, &report, replica);
+                        reshipped = true;
+                    }
                     self.lock_note_replay_pins(now, replica);
                     if stranded.any() {
                         tracing::warn!(
@@ -1424,20 +1484,24 @@ impl Core {
                         }
                     }
                 }
-                Err(e) => return GateStep::Failed(e.to_string()),
+                Err(e) => return self.reship_failed(e),
             }
         }
         // Plan 30 §M9: what this node held as the predecessor's backup
-        // goes into its own journal now, in journal order — before the
-        // replay of anything stranded, so the replay finds it completed.
-        if let Some(prev_epoch) = gate.backup_tail_epoch {
-            // (Read before the apply trims it and clears its extent.)
-            let tail = replica.backup_tail(prev_epoch).unwrap_or_default();
-            let through = self.bk.tail_through;
-            if let Err(e) = self.apply_backup_tail(prev_epoch, replica) {
-                return GateStep::Failed(e);
+        // goes into its own journal, in journal order — before the replay
+        // of anything stranded, so the replay finds it completed. (Done by
+        // the strand's transaction above for a takeover; alone for a gate
+        // that is not one.)
+        if let (Some(args), false) = (tail_args, reshipped) {
+            match replica.reship_at_takeover(None, Some(args)) {
+                Ok(report) => self.tail_reshipped(args, &report, replica),
+                Err(e) => return self.reship_failed(e),
             }
-            if let Err(e) = self.reappend_own_delegate_rows(gate.epoch, &tail, through, replica) {
+        }
+        if let Some(tail) = tail_rows {
+            if let Err(e) =
+                self.reappend_own_delegate_rows(gate.epoch, &tail, tail_through, replica)
+            {
                 return GateStep::Failed(e);
             }
             if let Some(g) = self.lease.gate.as_mut() {

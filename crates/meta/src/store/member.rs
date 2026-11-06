@@ -765,6 +765,21 @@ fn set_info_tx(
     Ok(())
 }
 
+/// [`Meta::member_copy_put`] in the caller's transaction (the takeover
+/// keeping the tail it re-journaled, [`Meta::reship_at_takeover`]).
+pub(crate) fn put_rows_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    epoch: u64,
+    config_version: u64,
+    txs: &[BackupTx],
+) -> Result<(), MetaError> {
+    for t in txs {
+        put_row_tx(tx, meta, epoch, &MemberTx::from_backup(t.clone()))?;
+    }
+    set_info_tx(tx, epoch, meta, Some(config_version), 0)
+}
+
 /// Put one row of `epoch`'s member copy in the caller's transaction (a
 /// deposition's strand, a takeover moving the tail it re-journaled). A row
 /// held already keeps its class and op: a snapshot taken at a seal and the

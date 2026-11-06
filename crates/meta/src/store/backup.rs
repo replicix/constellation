@@ -118,6 +118,34 @@ pub(crate) fn hole_tail_rolled_back_tx(
     Ok(holed)
 }
 
+/// [`Meta::backup_clear`] in the caller's transaction. The caller resets
+/// `backup_tail_floor` once the transaction has committed.
+pub(crate) fn backup_clear_tx(
+    tx: &mut fjall::SingleWriterWriteTx,
+    meta: &Meta,
+) -> Result<(), MetaError> {
+    // The holder's tail only: the keys from `MEMBER_COPY_BASE` up are
+    // the member copies and, past them, the delegates' streams this
+    // node backs (`DELEG_BACKUP_BASE`), which outlive any holder
+    // tenure (long-delegated-backup seed 70232: a node that
+    // stopped being the holder's backup wiped a delegate's rows too;
+    // its acknowledgement fell to 0 for good, the delegate re-sent
+    // and was answered short in a loop, and its client's op waited
+    // for a segment no holder was left to ship).
+    let keys: Vec<Vec<u8>> = tx
+        .range(
+            &meta.backup_tail,
+            tail_key(0, 0)..tail_key(super::member::MEMBER_COPY_BASE, 0),
+        )
+        .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
+        .collect::<Result<_, _>>()?;
+    for k in keys {
+        tx.remove(&meta.backup_tail, k);
+    }
+    tx.remove(&meta.local, KV_BACKUP_ROLE.as_bytes().to_vec());
+    Ok(())
+}
+
 /// Whom this node backs (persisted).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackupRole {
@@ -388,25 +416,7 @@ impl Meta {
     pub fn backup_clear(&self) -> Result<(), MetaError> {
         *self.backup_tail_floor.lock().unwrap() = None;
         let mut tx = self.db.write_tx();
-        // The holder's tail only: the keys from `MEMBER_COPY_BASE` up are
-        // the member copies and, past them, the delegates' streams this
-        // node backs (`DELEG_BACKUP_BASE`), which outlive any holder
-        // tenure (long-delegated-backup seed 70232: a node that
-        // stopped being the holder's backup wiped a delegate's rows too;
-        // its acknowledgement fell to 0 for good, the delegate re-sent
-        // and was answered short in a loop, and its client's op waited
-        // for a segment no holder was left to ship).
-        let keys: Vec<Vec<u8>> = tx
-            .range(
-                &self.backup_tail,
-                tail_key(0, 0)..tail_key(super::member::MEMBER_COPY_BASE, 0),
-            )
-            .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
-            .collect::<Result<_, _>>()?;
-        for k in keys {
-            tx.remove(&self.backup_tail, k);
-        }
-        tx.remove(&self.local, KV_BACKUP_ROLE.as_bytes().to_vec());
+        backup_clear_tx(&mut tx, self)?;
         tx.commit()?;
         Ok(())
     }

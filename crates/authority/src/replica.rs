@@ -178,24 +178,23 @@ pub trait Replica {
     /// Roll back every speculative entry accepted below `epoch` and
     /// queue its op for replay.
     fn strand_below_epoch(&self, epoch: Epoch) -> Result<Stranded, MetaError>;
-    /// The takeover gate's strand: [`Self::strand_below_epoch`] plus this
-    /// node's own transactions as the delegate of `own_gens`
-    /// (`Meta::strand_for_takeover`). `abandoned`: the epoch of a group the
-    /// operator gave up (this claim's marker says so): its committed
-    /// entries strand and replay too (plan 43 C1-4). `carried`: the rids of
-    /// the delegate rows the tail the gate re-applies carries
-    /// (`Meta::strand_for_takeover_carrying`). `proof`: what this claim's
-    /// marker proves the log will never grant (ADR-43's orphan rule, which
-    /// the claimant runs here: it never applies its own marker as a
-    /// segment).
-    fn strand_for_takeover(
+    /// The takeover gate's re-ship, in one store transaction (plan 46 M1.2
+    /// step 5, `Meta::reship_at_takeover`): the strand
+    /// ([`Self::strand_below_epoch`] plus this node's own transactions as the
+    /// delegate of `own_gens`, `Meta::strand_for_takeover`; `abandoned`: the
+    /// epoch of a group the operator gave up, whose committed entries strand
+    /// and replay too, plan 43 C1-4; `carried`: the rids of the delegate rows
+    /// the tail carries; `proof`: what this claim's marker proves the log
+    /// will never grant, ADR-43's orphan rule, which the claimant runs here
+    /// because it never applies its own marker as a segment) and the
+    /// predecessor's sealed tail, verbatim, then its move into a member copy
+    /// and its clear. `MetaError::TailDiverged`: a tail record does not
+    /// apply; nothing changed.
+    fn reship_at_takeover(
         &self,
-        epoch: Epoch,
-        own_gens: &[u64],
-        abandoned: Option<Epoch>,
-        carried: &std::collections::HashSet<Rid>,
-        proof: &constellation_meta::OrphanProof,
-    ) -> Result<Stranded, MetaError>;
+        strand: Option<constellation_meta::StrandArgs<'_>>,
+        tail: Option<constellation_meta::TailArgs>,
+    ) -> Result<constellation_meta::ReshipReport, MetaError>;
     /// The pre-S3 stream installed the holder's journal through `pos`
     /// (`SessionState::note_streamed`).
     fn note_streamed(&self, pos: JournalPos);
@@ -1009,15 +1008,12 @@ impl Replica for Meta {
         Meta::strand_below_epoch(self, epoch)
     }
 
-    fn strand_for_takeover(
+    fn reship_at_takeover(
         &self,
-        epoch: Epoch,
-        own_gens: &[u64],
-        abandoned: Option<Epoch>,
-        carried: &std::collections::HashSet<Rid>,
-        proof: &constellation_meta::OrphanProof,
-    ) -> Result<Stranded, MetaError> {
-        Meta::strand_for_takeover_carrying(self, epoch, own_gens, abandoned, carried, proof)
+        strand: Option<constellation_meta::StrandArgs<'_>>,
+        tail: Option<constellation_meta::TailArgs>,
+    ) -> Result<constellation_meta::ReshipReport, MetaError> {
+        Meta::reship_at_takeover(self, strand, tail)
     }
 
     fn strand_recalled_speculation(&self, gen: u64) -> Result<Stranded, MetaError> {

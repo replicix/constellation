@@ -67686,3 +67686,58 @@ after: `locks-delegated-production-ttl(-heavy)` one lock overlap each, stale rea
 
 **Tests.** Core `the_holders_own_lapsed_refusal_waits_for_its_commit` (fails before: answered in the same step); oracle unit
 `an_unjournaled_refusals_claim_is_not_judged`.
+
+### Plan 46 M1.2 step 5: a successor re-ships its sealed tail verbatim, in one transaction (2026-11-06)
+
+C3-2 (c3-spec D3). `Meta::reship_at_takeover(strand, tail)` does the takeover's strand and the predecessor's sealed tail in ONE store
+transaction: the strand (everything `strand_for_takeover_carrying` did, including the successor's own entries the tail carries, C1-4's
+`superseded`, and the fence mark of every own generation), then each transaction of the tail's contiguous prefix journaled verbatim (the records
+as the sealer holds them and in its order, an `Atime`, a `Refused` and an `InboxAck` included, behind the `TailOf` identity, under the row's
+`(gen, idx)`, with the session's stream position noted after the commit), then the tail's move into the member copy of its epoch and its clear.
+Both halves or neither commit. A record that does not apply is `MetaError::TailDiverged { prev, first, last, why }`: nothing changed (no strand,
+no earlier row of the tail, no fence), the tail is still held, and the strict apply (`Journaled::Tail`) never journals a skipped record.
+Rows past the sealed hold's contiguous prefix and holes are not re-shipped, a rid that already has an outcome is skipped (counted, `tail_done_skipped`), as before.
+
+**What happens on `TailDiverged`** (`Core::reship_failed`). The gate stays closed (`GateStep::Failed`) and the node does not serve as root. It
+retries every round; a retry fails the same way (idempotent: nothing changed). It is an ERROR with the tail's epoch, its journal rows and the
+record, `stats.tail_diverged` counts each pass, and the sim fails the seed. No recovery drops rows: the operator stops the node (its lease then
+passes to another claimant, which fetches the tail from the sealer or a member copy) or abandons the group (plan 43 C1-4's explicit decision).
+Integrity over availability. Not surfaced in `status` yet (no control-schema change in this step). One gap, documented in the code: a tail that
+carries a `Recall`/`RecallCut`/`DelegGroup` applies its session effects (`void_stream`, ...) inside the transaction, and a rolled-back
+`TailDiverged` leaves them in memory until the next pass; they are idempotent and the same tail re-applies them.
+
+**Deleted.** The separate strand-then-tail transactions: `Core::apply_backup_tail`'s per-transaction loop (now `tail_args` and `tail_reshipped`,
+the core's bookkeeping; the old name stays `#[cfg(test)]` as the tail-only entry the core tests drive), its per-transaction `backup_trim`, the
+separate `member_copy_put` and `backup_clear` calls, `Replica::strand_for_takeover` (now `reship_at_takeover`). `Meta::strand_for_takeover*` stay as
+the no-tail entry of the same function. `apply_records_journaled_inner` is split in a body that runs inside a caller's transaction
+(`journal_records_tx`) and the wrapper that opens, commits and drains. The own-delegate-row re-append after the tail
+(`reappend_own_delegate_rows`) is step 6's and stays a separate step.
+
+**Fail-before** (main, box 2; the test file with the old sequence as its helper, `reship.rs`): `a_sealed_tail_is_applied_verbatim` (main journals
+`[TailOf, Create, Completed, Refused]` for the tail `[Create, Atime, Refused, Completed]`: `Atime` dropped, `Refused` moved after the rows),
+`a_diverging_tail_applies_nothing` (a tail row whose parent is missing: main returns `Ok` and applies both rows), and
+`a_failing_tail_leaves_no_strand_without_its_tail` (the atomicity test: a tail that fails on its last transaction; on main the strand is already
+committed, the journal row of this node gone and its replay queued, the tail half applied) fail; all three pass on the branch. Core
+`a_diverging_tail_keeps_the_gate_closed` (`Failed`, the gate stays, `tail_diverged` counts each pass, the tail is still held).
+
+**Regression caught by the sweep, fixed.** First version: `delegated-holder-cut+commit` failed 153 of 2,000 seeds (causal cut: a delegate batch
+refused for lacking its deps; acknowledged rows missing) because the old wrapper noted each re-shipped delegate row in the session
+(`note_stream(gen, idx)`) and the one-transaction version did not. Noted after the commit now: 0 failing.
+
+**Sweeps** (box 2, release, seeds 0..1,999, `+commit` strict, main = base): `backup-crash`, `long-backup`, `delegated-holder-cut`: 0 failing on
+both; the failover distribution (`SWEEP-FAILOVER`, virtual time) is identical: backup-crash p50 1,207 / p90 4,209 ms, long-backup 1,171 / 4,579,
+delegated-holder-cut 6,744 / 15,122 (the sim does not model store time, so the one-transaction apply shows in the lock-hold measure below, not here).
+`backup-crash` 800..1,399: 728 re-ships ran (`re-shipped the predecessor's backup tail` lines), **0 `TailDiverged`**; `delegated-holder-cut`
+800..1,399: 719 re-ships, 0. The sim fails a seed with any `tail_diverged`. Pinned bug
+`a_deposed_roots_appended_delegate_row_never_lands_past_its_generations_seal` (`--ignored`): fails the same 9 seeds with the same messages on main
+and on this branch (this step does not touch it: it is step 7's), so it stays ignored.
+
+**Writer-lock hold** (c3-spec §10; `reship_lock_hold_over_a_large_tail`, ignored measurement, release, box 2 quiet, a second thread writing flat out
+while the re-ship runs): 1,000 tail rows 24 ms, 10,000 rows 283 ms (3 runs: 283, 284, 283; about 28 us per row), 50,000 rows 1.64 s; the longest wait
+of the concurrent writer equals the hold (272 to 274 ms at 10,000 rows). Under the spec's 1 s bound at 10,000 rows; the bound is crossed at roughly
+35,000 rows of unshipped tail.
+
+**Gates** (box 2): fmt, clippy `-D warnings` (meta, authority, engine, all targets), engine lib 952 passed, release sim suite 422 passed, 0 failed,
+13 ignored. **Pre-existing, not this step:** 17 tests fail in debug on main already (meta: lib 1 and two integration binaries with 6 and 4; authority lib 6;
+the same sets on main and on the branch): the step 4 fix round's `debug_assert!` in `apply_delegate_tx` fires for hand-built delegate
+rows without a `Completed`. Same sets on main and branch; the release builds do not assert. To fix in a follow-up (add the `Completed` to those fixtures).

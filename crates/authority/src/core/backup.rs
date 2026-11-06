@@ -5818,147 +5818,64 @@ impl Core {
         replica.backup_clear();
     }
 
-    /// The takeover gate (after the marker and the strand): apply what is
-    /// left of the predecessor's tail into this node's own journal, in
-    /// journal order, skipping transactions the log already completed.
-    /// `Err` keeps the gate pending (retried by every round).
-    pub(crate) fn apply_backup_tail(
+    /// What the takeover's re-ship takes of the predecessor's sealed tail of
+    /// `prev_epoch` ([`constellation_meta::TailArgs`]).
+    ///
+    /// Plan 43 C1-4 (D6): the re-ship is the sealed tail's contiguous
+    /// prefix (`bk.tail_through`). Rows past a gap were never acknowledged
+    /// (the holder counts contiguous acknowledgements); their clients retry
+    /// by rid.
+    ///
+    /// Plan 46 M1.1 step 4: the adopted rows are journaled in this tenure's
+    /// journal, so they carry the configuration in force here: the lease
+    /// this node holds now (the claim's version, which the gate runs under).
+    /// The predecessor's group committed them (the sealer holds the tail,
+    /// write-all), which is what the `Group` rule says and nothing in this
+    /// tenure waits for; the version only names the configuration of the
+    /// journal they are rows of. (The predecessor's own version per row is
+    /// not recorded on a backup: `BackupTx` carries none, and the member
+    /// copy keeps one version for the whole tail.) Not the version-0
+    /// placeholder.
+    ///
+    /// NOT the commit configuration of these rows (plan 46 M1.1 step 5):
+    /// the version stamped here is the successor's lease version, the
+    /// configuration of the journal the rows sit in, while the group that
+    /// committed each row is the predecessor's, at a version this stamp does
+    /// not name. The old ∪ new reconfiguration rule and the replay must not
+    /// read these versions as the rows' commit configurations.
+    pub(crate) fn tail_args(&self, prev_epoch: Epoch) -> constellation_meta::TailArgs {
+        constellation_meta::TailArgs {
+            epoch: prev_epoch,
+            through: self.bk.tail_through,
+            config_version: self.bk.role.map_or(0, |r| r.config_version),
+            class: Some(constellation_meta::RowCommit::group(
+                self.root_config_version(),
+                GroupOn::Root,
+            )),
+        }
+    }
+
+    /// The takeover's re-ship of the predecessor's tail committed
+    /// (`Meta::reship_at_takeover`, one store transaction with the strand;
+    /// it also moved the tail into a member copy and cleared it): the
+    /// core's half of it.
+    pub(crate) fn tail_reshipped(
         &mut self,
-        prev_epoch: Epoch,
+        args: constellation_meta::TailArgs,
+        report: &constellation_meta::ReshipReport,
         replica: &dyn Replica,
-    ) -> Result<(), String> {
-        let Some(tail) = replica.backup_tail(prev_epoch) else {
-            return Err(format!(
-                "the backup tail of epoch {prev_epoch} could not be read"
-            ));
-        };
-        // Plan 43 C1-4 (D6): the re-ship is the sealed tail's contiguous
-        // prefix. Rows past a gap were never acknowledged (the holder counts
-        // contiguous acknowledgements); their clients retry by rid.
-        let through = self.bk.tail_through;
-        let mut applied = 0u64;
-        let mut moved: Vec<constellation_meta::BackupTx> = Vec::new();
-        let mut failed: Option<String> = None;
-        // Plan 46 M1.1 step 4: the adopted rows are journaled in this
-        // tenure's journal, so they carry the configuration in force here:
-        // the lease this node holds now (the claim's version, which the
-        // gate runs under). The predecessor's group committed them (the
-        // sealer holds the tail, write-all), which is what the `Group`
-        // rule says and nothing in this tenure waits for; the version only
-        // names the configuration of the journal they are rows of. (The
-        // predecessor's own version per row is not recorded on a backup:
-        // `BackupTx` carries none, and the member copy keeps one version for
-        // the whole tail.) Not the version-0 placeholder.
-        //
-        // NOT the commit configuration of these rows (plan 46 M1.1 step 5):
-        // the version stamped here is the successor's lease version, the
-        // configuration of the journal the rows sit in, while the group that
-        // committed each row is the predecessor's, at a version this stamp
-        // does not name. The old ∪ new reconfiguration rule and the replay
-        // must not read these versions as the rows' commit configurations.
-        let _class = constellation_meta::PendingClass::set(constellation_meta::RowCommit::group(
-            self.root_config_version(),
-            GroupOn::Root,
-        ));
-        for tx in &tail {
-            if tx.records.is_empty() {
-                // A hole: rows the holder had shipped (or rolled back)
-                // before it streamed past them; nothing to re-apply.
-                replica.backup_trim(prev_epoch, tx.last, &[]);
-                continue;
-            }
-            if tx.last > through {
-                self.stats.tail_beyond_gap_dropped += 1;
-                replica.backup_trim(prev_epoch, tx.last, &[]);
-                continue;
-            }
-            let rid = tx.records.iter().find_map(|r| match r {
-                constellation_meta::LogRecord::Completed { rid } => Some(*rid),
-                _ => None,
-            });
-            // A refusal's transaction is done once its rid has an outcome
-            // here too (the log carried the refusal already).
-            let refused = tx.records.iter().find_map(|r| match r {
-                constellation_meta::LogRecord::Refused { rid, .. } => Some(*rid),
-                _ => None,
-            });
-            let done = rid
-                .is_some_and(|rid| replica.completed_position(rid).ok().flatten().is_some())
-                || refused
-                    .is_some_and(|rid| replica.completed_outcome(rid).ok().flatten().is_some());
-            tracing::debug!(
-                node = self.cfg.node_id,
-                first = tx.first,
-                last = tx.last,
-                origin = ?tx.origin,
-                ?rid,
-                ?refused,
-                done,
-                "backup tail transaction"
-            );
-            if !done {
-                // Plan 43 C1-4 (D10): the transaction's identity travels with
-                // it, as its first record: the journal that first held it.
-                // One that carries one already keeps it (re-shipped twice,
-                // A to B to C, it is A's still).
-                // A root's append of a delegate's row too: its origin is the
-                // delegation's identity, the `TailOf` the tenure's (what a
-                // subscriber's committed stream entry and a member copy of
-                // the deposed group retire by).
-                let records: std::borrow::Cow<'_, [constellation_meta::LogRecord]> =
-                    if constellation_meta::tail_identity(&tx.records).is_none() {
-                        let mut r = Vec::with_capacity(tx.records.len() + 1);
-                        r.push(constellation_meta::LogRecord::TailOf {
-                            epoch: prev_epoch,
-                            jseq: tx.first,
-                        });
-                        r.extend(tx.records.iter().cloned());
-                        std::borrow::Cow::Owned(r)
-                    } else {
-                        std::borrow::Cow::Borrowed(&tx.records)
-                    };
-                // Under the row's delegation origin: a root's append of a
-                // delegate's stream row stays one (delegated-holder-cut
-                // seed 1719).
-                if let Err(e) = replica.apply_backup_tx_journaled(&records, rid, tx.origin) {
-                    failed = Some(format!("re-applying the backup tail: {e}"));
-                    break;
-                }
-                applied += 1;
-                // This node's journal holds the row now; the group's copy
-                // stays as a member copy until the log carries it.
-                if tx.origin == (0, 0) {
-                    moved.push(tx.clone());
-                }
-            }
-            replica.backup_trim(prev_epoch, tx.last, &[]);
-        }
-        if !tail.is_empty() {
-            tracing::info!(
-                node = self.cfg.node_id,
-                prev_epoch,
-                held = tail.len(),
-                applied,
-                "re-shipping the predecessor's backup tail under the new epoch"
-            );
-        }
-        // Plan 43 C1-4 (S4): the successor keeps the committed rows it
-        // re-ships as a member copy of the epoch they were committed in, so
-        // that a claimant of its lease that fetches the inherited tail finds
-        // them here whatever happens to its journal, until the log carries
-        // their identities.
-        if !moved.is_empty() {
-            let cv = self.bk.role.map_or(0, |r| r.config_version);
-            if !replica.member_copy_put(prev_epoch, cv, &moved) {
-                return Err("keeping the re-shipped tail as a member copy".into());
-            }
-        }
-        if let Some(e) = failed {
-            // (Retried by the next round: what applied is journaled, held as
-            // a member copy and trimmed from the tail.)
-            return Err(e);
-        }
-        self.stats.backup_tail_applied += applied;
+    ) {
+        self.stats.tail_beyond_gap_dropped += report.tail_beyond_gap as u64;
+        self.stats.tail_done_skipped += report.tail_done as u64;
+        tracing::info!(
+            node = self.cfg.node_id,
+            prev_epoch = args.epoch,
+            applied = report.tail_applied,
+            beyond_gap = report.tail_beyond_gap,
+            done = report.tail_done,
+            "re-shipped the predecessor's backup tail under the new epoch"
+        );
+        self.stats.backup_tail_applied += report.tail_applied as u64;
         self.stats.backup_takeovers += 1;
         // Plan 43 C1-3 (D2): the lease names this tail until the journal is
         // shipped through what it now holds.
@@ -5973,7 +5890,21 @@ impl Core {
         self.bk.role = None;
         self.bk.acked = 0;
         self.bk.tail_through = 0;
-        replica.backup_clear();
+    }
+
+    /// The tail alone, as before the strand joined it (the core tests that
+    /// drive a re-ship without a gate).
+    #[cfg(test)]
+    pub(crate) fn apply_backup_tail(
+        &mut self,
+        prev_epoch: Epoch,
+        replica: &dyn Replica,
+    ) -> Result<(), String> {
+        let args = self.tail_args(prev_epoch);
+        let report = replica
+            .reship_at_takeover(None, Some(args))
+            .map_err(|e| e.to_string())?;
+        self.tail_reshipped(args, &report, replica);
         Ok(())
     }
 

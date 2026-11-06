@@ -52940,6 +52940,81 @@ mod c1_member_copy {
         });
     }
 
+    /// Plan 46 M1.2 step 5 (c3-spec D3): a sealed tail with a record that
+    /// does not apply keeps the gate closed: `Failed`, the gate stays, the
+    /// strand and the tail are not applied (one transaction), the tail is
+    /// still held, and every pass fails the same way and counts it. Fails on
+    /// the parent: the tail's rows were applied tolerantly and the gate
+    /// opened.
+    #[test]
+    fn a_diverging_tail_keeps_the_gate_closed() {
+        let holder = Harness::new(1);
+        holder.meta.set_holder_epoch(1);
+        let rid = Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 1,
+        };
+        constellation_meta::execute_mutate(&holder.meta, &holder.create("a"), Some(rid)).unwrap();
+        let mut txs = holder.meta.journal_txs_from(1, 1000).unwrap();
+        // The tail's second record names a parent no one created.
+        txs.push(constellation_meta::BackupTx {
+            first: txs.last().unwrap().last + 1,
+            last: txs.last().unwrap().last + 2,
+            records: vec![
+                LogRecord::Create {
+                    parent: (9 << 40) | 99,
+                    name: "b".into(),
+                    ino: (1 << 40) | 77,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Completed {
+                    rid: Rid {
+                        node: 1,
+                        incarnation: 1,
+                        seq: 2,
+                    },
+                },
+            ],
+            origin: (0, 0),
+        });
+        let through = txs.last().unwrap().last;
+        let mut h = Harness::new(2);
+        assert!(crate::Replica::backup_append(&h.meta, 1, &txs));
+        h.core.bk.tail_through = through;
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: true,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: false,
+            }),
+        );
+        for pass in 1..=2u64 {
+            let mut out = Vec::new();
+            let step = h.core.complete_gate(h.clk(), &h.meta, &mut out);
+            assert!(
+                matches!(step, super::jobs::GateStep::Failed(_)),
+                "the gate must fail"
+            );
+            assert!(h.core.lease.gate.is_some(), "the gate stays closed");
+            assert_eq!(h.core.stats.tail_diverged, pass);
+            assert!(h.meta.lookup(ROOT_INO, "a").unwrap().is_none());
+            assert_eq!(
+                crate::Replica::backup_tail(&h.meta, 1).map(|t| t.len()),
+                Some(txs.len()),
+                "the tail is still held"
+            );
+        }
+    }
+
     /// The identity is transitive: a tail whose transactions carry one
     /// already (they were a re-ship) keeps it, A to B to C.
     #[test]

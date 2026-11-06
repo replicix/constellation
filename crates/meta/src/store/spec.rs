@@ -627,6 +627,53 @@ impl StrandedOp {
     }
 }
 
+/// The strand half of [`Meta::reship_at_takeover`] (see
+/// [`Meta::strand_for_takeover_carrying`] for each field).
+#[derive(Clone, Copy, Debug)]
+pub struct StrandArgs<'a> {
+    pub epoch: u64,
+    pub own_gens: &'a [u64],
+    pub abandoned: Option<u64>,
+    pub carried: &'a HashSet<Rid>,
+    pub proof: &'a OrphanProof,
+}
+
+/// The tail half of [`Meta::reship_at_takeover`]: the sealed tail of
+/// `epoch` as this node holds it as the predecessor's backup, its
+/// contiguous prefix reaching `through` (the sealer's hold, C1-4 D6), and
+/// the member copy's configuration version.
+#[derive(Clone, Copy, Debug)]
+pub struct TailArgs {
+    pub epoch: u64,
+    pub through: u64,
+    pub config_version: u64,
+    /// The commit class the re-journaled rows carry (the successor's
+    /// configuration); `None`: the default for an adopted tail
+    /// ([`RowCommit::ROOT_GROUP`]).
+    pub class: Option<RowCommit>,
+}
+
+/// What [`Meta::reship_at_takeover`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReshipReport {
+    pub stranded: Stranded,
+    /// Tail transactions journaled.
+    pub tail_applied: usize,
+    /// Transactions past the sealed hold's contiguous prefix, not re-shipped.
+    pub tail_beyond_gap: usize,
+    /// Transactions whose rid already had an outcome here, skipped.
+    pub tail_done: usize,
+    /// Rows kept as a member copy of the tail's epoch.
+    pub tail_moved: usize,
+}
+
+#[derive(Default)]
+struct StrandPart {
+    stranded: Stranded,
+    orphan_cuts: Vec<(u64, u64)>,
+    work: bool,
+}
+
 /// What a stranding pass rolled back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stranded {
@@ -5587,16 +5634,246 @@ impl Meta {
         carried: &HashSet<Rid>,
         proof: &OrphanProof,
     ) -> Result<Stranded, MetaError> {
+        Ok(self
+            .reship_at_takeover(
+                Some(StrandArgs {
+                    epoch,
+                    own_gens,
+                    abandoned,
+                    carried,
+                    proof,
+                }),
+                None,
+            )?
+            .stranded)
+    }
+
+    /// Plan 46 M1.2 step 5 (c3-spec D3, D4): a takeover's re-ship, in ONE
+    /// store transaction: the strand (`strand`: everything
+    /// [`Self::strand_for_takeover_carrying`] does, which includes the
+    /// successor's own entries the tail carries — C1-4's `superseded` — and
+    /// the fence mark of every own generation) and then the predecessor's
+    /// sealed tail (`tail`), verbatim: each transaction of its contiguous
+    /// prefix journaled with the records as the tail holds them, in order
+    /// (an `Atime`, a `Refused` and an `InboxAck` row included), under its
+    /// identity (`TailOf`) and its delegation origin, then the tail's move
+    /// into the member copy of its epoch and its clear. Both halves or
+    /// neither commit.
+    ///
+    /// A record that does not apply is [`MetaError::TailDiverged`]: the
+    /// tail extends the archive prefix this replica holds (the strand took
+    /// out what it carries), so every record applies exactly; one that does
+    /// not is a broken premise, reported, never journaled, and nothing of
+    /// the strand or of the tail's earlier rows is visible. The caller
+    /// keeps the takeover gate closed. The same tail fails the same way on
+    /// a retry, so the retry is idempotent and the node does not serve as
+    /// root until the premise is repaired (the operator's decision: stop
+    /// this node so another claimant fetches the tail, or abandon the
+    /// group). There is no recovery that drops the rows.
+    ///
+    /// V3 (c3-spec §8): no reader and no writer of the successor sees a
+    /// state between the rollback of a committed entry and its
+    /// re-application, and a crash between the strand and the tail (two
+    /// transactions before) cannot leave the strand without the tail it
+    /// made room for. The cost is the writer lock for the whole tail
+    /// (measured: `reship_lock_hold_over_a_large_tail`).
+    ///
+    /// A transaction of the tail whose rid already has an outcome here is
+    /// skipped (`tail_done`: the log carried it), a hole or a transaction
+    /// past the sealed hold's contiguous prefix (`through`; never
+    /// acknowledged, its client retries by rid) is not re-shipped.
+    pub fn reship_at_takeover(
+        &self,
+        strand: Option<StrandArgs<'_>>,
+        tail: Option<TailArgs>,
+    ) -> Result<ReshipReport, MetaError> {
+        let txs: Vec<crate::BackupTx> = match &tail {
+            Some(t) => self.backup_tail(t.epoch)?,
+            None => Vec::new(),
+        };
+        // Plan 30 §M12: a grant or a recall changes who may execute what;
+        // the fast path checks that under the shared side. Taken before the
+        // write transaction (the fast path's order: gate, then database).
+        let _gate = txs
+            .iter()
+            .flat_map(|t| t.records.iter())
+            .any(|r| {
+                matches!(
+                    r,
+                    LogRecord::Delegate { .. }
+                        | LogRecord::Recall { .. }
+                        | LogRecord::RecallCut { .. }
+                )
+            })
+            .then(|| self.deleg_gate.write().unwrap_or_else(|e| e.into_inner()));
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
+        let mut report = ReshipReport::default();
+        let mut part = StrandPart::default();
+        if let Some(args) = strand {
+            part = self.strand_part_tx(&mut tx, &staged, args)?;
+            report.stranded = part.stranded;
+        }
+        let mut journaled: Vec<((u64, u64), local::JournaledTx)> = Vec::new();
+        if let Some(t) = &tail {
+            let _class = t.class.map(crate::store::journal::PendingClass::set);
+            let mut moved: Vec<crate::BackupTx> = Vec::new();
+            for bt in &txs {
+                if bt.records.is_empty() {
+                    // A hole: rows the holder had shipped (or rolled back)
+                    // before it streamed past them; nothing to re-apply.
+                    continue;
+                }
+                if bt.last > t.through {
+                    report.tail_beyond_gap += 1;
+                    continue;
+                }
+                let rid = bt.records.iter().find_map(|r| match r {
+                    LogRecord::Completed { rid } => Some(*rid),
+                    _ => None,
+                });
+                let refused = bt.records.iter().find_map(|r| match r {
+                    LogRecord::Refused { rid, .. } => Some(*rid),
+                    _ => None,
+                });
+                let done = match (rid, refused) {
+                    (Some(rid), _)
+                        if matches!(
+                            crate::store::inbox::completed_outcome_tx(&tx, self, rid)?,
+                            Some(crate::store::inbox::CompletedOutcome::Executed { .. })
+                        ) =>
+                    {
+                        true
+                    }
+                    (_, Some(rid))
+                        if crate::store::inbox::completed_outcome_tx(&tx, self, rid)?.is_some() =>
+                    {
+                        true
+                    }
+                    _ => false,
+                };
+                if done {
+                    report.tail_done += 1;
+                    continue;
+                }
+                // Plan 43 C1-4 (D10): the transaction's identity travels with
+                // it, as its first record: the journal that first held it.
+                // One that carries one already keeps it (re-shipped twice,
+                // A to B to C, it is A's still); a root's append of a
+                // delegate's row too (the delegation's identity is its
+                // origin, the `TailOf` the tenure's).
+                let records: std::borrow::Cow<'_, [LogRecord]> =
+                    if crate::store::member::tail_identity(&bt.records).is_none() {
+                        let mut r = Vec::with_capacity(bt.records.len() + 1);
+                        r.push(LogRecord::TailOf {
+                            epoch: t.epoch,
+                            jseq: bt.first,
+                        });
+                        r.extend(bt.records.iter().cloned());
+                        std::borrow::Cow::Owned(r)
+                    } else {
+                        std::borrow::Cow::Borrowed(&bt.records)
+                    };
+                let one = self
+                    .journal_tail_tx(&mut tx, &records, rid, bt.origin)
+                    .map_err(|e| match e {
+                        MetaError::TailDiverged { why, .. } => MetaError::TailDiverged {
+                            prev: t.epoch,
+                            first: bt.first,
+                            last: bt.last,
+                            why,
+                        },
+                        other => other,
+                    })?;
+                journaled.push((bt.origin, one));
+                // This node's journal holds the row now; the group's copy
+                // stays as a member copy until the log carries it.
+                if bt.origin == (0, 0) {
+                    moved.push(bt.clone());
+                }
+            }
+            // Plan 43 C1-4 (S4): the successor keeps the committed rows it
+            // re-ships as a member copy of the epoch they were committed in,
+            // so that a claimant of its lease that fetches the inherited
+            // tail finds them here whatever happens to its journal, until
+            // the log carries their identities.
+            if !moved.is_empty() {
+                crate::store::member::put_rows_tx(
+                    &mut tx,
+                    self,
+                    t.epoch,
+                    t.config_version,
+                    &moved,
+                )?;
+            }
+            report.tail_applied = journaled.len();
+            report.tail_moved = moved.len();
+            crate::store::backup::backup_clear_tx(&mut tx, self)?;
+        }
+        if !part.work && tail.is_none() {
+            // Nothing to strand and no tail: nothing to commit.
+            return Ok(report);
+        }
+        let from = journal_from(&tx, self)?;
+        compact_tx(&mut tx, self, from)?;
+        let (bytes, files) = staged.raw_delta();
+        adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
+        tx.commit()?;
+        for (gen, cut) in part.orphan_cuts {
+            tracing::info!(
+                gen = %crate::delegation::GenLabel::of(gen),
+                cut,
+                "this claim ended a delegation generation whose grant never reached the log"
+            );
+            self.session.void_stream(gen, cut);
+            self.session.note_void_cut(gen, cut);
+        }
+        self.report_rolled_back();
+        staged.drain_into(self.usage_tracker());
+        if tail.is_some() {
+            *self.backup_tail_floor.lock().unwrap() = None;
+            for ((gen, idx), one) in journaled {
+                one.staged.drain_into(self.usage_tracker());
+                one.moved.drain_into(self.usage_tracker());
+                self.note_unshipped(&one.applied);
+                // A root's append of a delegate's row, re-shipped: the
+                // session's per-generation position follows (the core's
+                // `deps` checks and the delegate's acknowledgement read it).
+                if gen != 0 {
+                    self.session.note_stream(gen, idx);
+                }
+            }
+            if report.tail_moved > 0 {
+                self.note_member_copies(true);
+                self.sync()?;
+            }
+        }
+        Ok(report)
+    }
+
+    /// The strand of [`Self::reship_at_takeover`], in the caller's
+    /// transaction (everything [`Self::strand_for_takeover`] documents).
+    fn strand_part_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        staged: &UsageTracker,
+        args: StrandArgs<'_>,
+    ) -> Result<StrandPart, MetaError> {
+        let StrandArgs {
+            epoch,
+            own_gens,
+            abandoned,
+            carried,
+            proof,
+        } = args;
         let listed_before = if proof.is_empty() {
             Default::default()
         } else {
-            self.named_generations_tx(&tx)?
+            self.named_generations_tx(&*tx)?
         };
         // (Plan 46 M0.4 MUST-1, below: the table before the strand.)
         let table_before: std::collections::BTreeSet<u64> =
-            crate::delegation::read_table_tx(&tx, self)?
+            crate::delegation::read_table_tx(&*tx, self)?
                 .iter()
                 .map(|d| d.gen)
                 .collect();
@@ -5612,9 +5889,9 @@ impl Meta {
         // group, whose rows no one re-ships.
         let abandons = |entry: &LiveEntry| abandoned.is_some_and(|a| entry.stranded_by_abandon(a));
         let stranded = strand_tx(
-            &mut tx,
+            tx,
             self,
-            &staged,
+            staged,
             |entry| {
                 entry.stranded_by_takeover(epoch)
                     || own(entry).is_some()
@@ -5649,14 +5926,14 @@ impl Meta {
         // sequence, so the replay order is still the journal's.
         let unlisted_own: Vec<u64> = {
             let listed: std::collections::BTreeSet<u64> =
-                crate::delegation::read_table_tx(&tx, self)?
+                crate::delegation::read_table_tx(&*tx, self)?
                     .iter()
                     .map(|d| d.gen)
                     .chain(table_before.iter().copied())
                     .collect();
             let mut out = Vec::new();
-            for g in local::deleg_gens_awaiting_end_tx(&tx, self, &listed)? {
-                if !own_gens.contains(&g) && local::deleg_idx_assigned_tx(&tx, &self.local, g)? {
+            for g in local::deleg_gens_awaiting_end_tx(&*tx, self, &listed)? {
+                if !own_gens.contains(&g) && local::deleg_idx_assigned_tx(&*tx, &self.local, g)? {
                     out.push(g);
                 }
             }
@@ -5665,9 +5942,9 @@ impl Meta {
         let mut stranded = stranded;
         if !unlisted_own.is_empty() {
             let more = strand_tx(
-                &mut tx,
+                tx,
                 self,
-                &staged,
+                staged,
                 |entry| matches!(entry, LiveEntry::Local { gen, .. } if *gen != 0 && unlisted_own.contains(gen)),
                 true,
                 false,
@@ -5685,27 +5962,27 @@ impl Meta {
         }
         let own_gens: Vec<u64> = own_gens.iter().chain(&unlisted_own).copied().collect();
         let own_gens = own_gens.as_slice();
-        let orphaned = self.orphaned_tx(&tx, proof, &listed_before, &HashSet::new())?;
+        let orphaned = self.orphaned_tx(&*tx, proof, &listed_before, &HashSet::new())?;
         let mut orphan_cuts: Vec<(u64, u64)> = Vec::new();
         for gen in &unlisted_own {
             if orphaned.contains(gen) {
                 continue;
             }
-            let cut = local::bump_void_cut_at_log_idx_tx(&mut tx, &self.local, *gen)?;
+            let cut = local::bump_void_cut_at_log_idx_tx(tx, &self.local, *gen)?;
             orphan_cuts.push((*gen, cut));
         }
         if !orphaned.is_empty() {
             for gen in &orphaned {
-                let cut = local::bump_void_cut_at_log_idx_tx(&mut tx, &self.local, *gen)?;
+                let cut = local::bump_void_cut_at_log_idx_tx(tx, &self.local, *gen)?;
                 orphan_cuts.push((*gen, cut));
                 // Never executed in again (`Meta::begin_local`).
-                local::mark_deleg_stranded_tx(&mut tx, &self.local, *gen);
+                local::mark_deleg_stranded_tx(tx, &self.local, *gen);
             }
             let ended: HashSet<u64> = orphaned.iter().copied().collect();
             let more = strand_tx(
-                &mut tx,
+                tx,
                 self,
-                &staged,
+                staged,
                 |entry| entry.stranded_by_recall(&ended),
                 false,
                 true,
@@ -5717,11 +5994,15 @@ impl Meta {
             stranded.locals += more.locals;
             stranded.deleg_dropped += more.deleg_dropped;
             for gen in &orphaned {
-                local::clear_deleg_streamed_tx(&mut tx, &self.local, *gen);
+                local::clear_deleg_streamed_tx(tx, &self.local, *gen);
             }
         }
         if !stranded.any() && own_gens.is_empty() && orphan_cuts.is_empty() {
-            return Ok(stranded);
+            return Ok(StrandPart {
+                stranded,
+                orphan_cuts,
+                work: false,
+            });
         }
         // Every generation this node holds as the delegate ends here,
         // whether or not the strand took rows of it: from this
@@ -5739,25 +6020,13 @@ impl Meta {
         // seeds 55/69/75/77). Nothing of this node executes on the
         // replica between this strand and the end of the gate's replay.
         for gen in own_gens {
-            local::mark_deleg_stranded_tx(&mut tx, &self.local, *gen);
+            local::mark_deleg_stranded_tx(tx, &self.local, *gen);
         }
-        let from = journal_from(&tx, self)?;
-        compact_tx(&mut tx, self, from)?;
-        let (bytes, files) = staged.raw_delta();
-        adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
-        tx.commit()?;
-        for (gen, cut) in orphan_cuts {
-            tracing::info!(
-                gen = %crate::delegation::GenLabel::of(gen),
-                cut,
-                "this claim ended a delegation generation whose grant never reached the log"
-            );
-            self.session.void_stream(gen, cut);
-            self.session.note_void_cut(gen, cut);
-        }
-        self.report_rolled_back();
-        staged.drain_into(self.usage_tracker());
-        Ok(stranded)
+        Ok(StrandPart {
+            stranded,
+            orphan_cuts,
+            work: true,
+        })
     }
 
     /// ADR-43 (the restart path): the generations whose end only

@@ -157,6 +157,18 @@ fn get_inbox_ack_tx(
     )))
 }
 
+/// [`Meta::completed_outcome`] in the caller's transaction.
+pub(crate) fn completed_outcome_tx(
+    r: &impl Readable,
+    meta: &Meta,
+    rid: Rid,
+) -> Result<Option<CompletedOutcome>, MetaError> {
+    match r.get(&meta.completed, rid.to_key())? {
+        Some(v) => Ok(Some(decode_outcome(&v)?)),
+        None => Ok(None),
+    }
+}
+
 impl Meta {
     /// Everything the log (or this holder's own unshipped journal) says
     /// about `rid`: executed, refused, or nothing yet.
