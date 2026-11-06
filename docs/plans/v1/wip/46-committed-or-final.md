@@ -1053,9 +1053,9 @@ The `lib.rs` doc has the timing table and the node-stream action → code
 mapping with the product gaps (M1.1 steps 5 to 7, M1.2 to M1.4, the claim's
 release, abandon's recall, else expiry).
 
-Review cleared: C11 review (fable, 2026-11-06): cleared with conditions — MUST-1 (partial SubtreeReleased counted as the holder's release), SHOULD-1 (abandon's expire half unreachable; the claim's release ignored reads), SHOULD-2 (roster-only singleton test with a live grant). Fixed in the model ff3066b0, knobs found, design clean.
+Review cleared: C11 review (fable, 2026-11-06): cleared with conditions — MUST-1 (partial SubtreeReleased counted as the holder's release), SHOULD-1 (abandon's expire half unreachable; the claim's release ignored reads), SHOULD-2 (roster-only singleton test with a live grant). Fixed in the model 494df306, knobs found, design clean.
 
-Go/no-go: GO (D7, 2026-11-06): M1.2 and M1.4 proceed; M1.1 step 5 lands with the Leave-ends-grants rule (maintainer, 2026-11-06); M1.3 after MUST-1 and SHOULD-1 are green (done in ff3066b0). No fallback.
+Go/no-go: GO (D7, 2026-11-06): M1.2 and M1.4 proceed; M1.1 step 5 lands with the Leave-ends-grants rule (maintainer, 2026-11-06); M1.3 after MUST-1 and SHOULD-1 are green (done in 494df306). No fallback.
 
 *What the model's M1.4 and I1 claims carry (review SHOULD-3 and nits).* C10's
 `hold_answer_committed_or_final` is **definitional in the model**: a crash
