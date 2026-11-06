@@ -1003,6 +1003,44 @@ answers wait for the archive until the root has a backup. The text is
 written into `DECISIONS.md` with M1.3's code, where the lone root's other
 `Lone` answers go too.
 
+### M1.0 answers, chunk C11 (the maintainer, 2026-11-06)
+
+Two decisions the combined topologies forced:
+
+- **Claim = release.** A sticky (or designated) holder that takes the root
+  by a lease claim journals the release of its directories (`StreamReleased`)
+  before its verbatim re-append and the end of its generation, so the end is
+  the holder's own and `sticky_ends_only_by_holder_or_operator` holds. Found
+  by X4 (the claim ended a sticky stream with no release of its own); the
+  knob `claim_ends_sticky_silently` re-introduces the old behaviour and is
+  found. Product gap: the claim's release record is not built (M1.3).
+- **Recall, else expire.** The operator's `abandon` of a stream first recalls
+  the read delegations in the abandoned directories; a reader that cannot
+  be reached is waited out (its grant's expiry) before the root settles
+  there, the rule a cut already follows (S4). No read delegation is granted
+  on an ended stream. Found by X2r (the root settled while a read delegation
+  was granted and unrecalled: `check_reads` treated the ended stream as
+  gone); the knob `abandon_skips_read_recall` re-introduces it and is found
+  by `settle_after_reads_recalled`. Product gap: `repair abandon --node` and
+  its recall, else expiry, are M1.3.
+
+*Model (M1.0 chunk C11, 2026-11-06).* `tests/node_stream.rs` composes the
+mechanisms on six topologies (`c11_design_x1` placed everything with history,
+causal cut, TTL, crash and deposition; `x1r` replicas and TTL; `x2` sticky and
+placed side by side with release and abandon; `x2r` read delegations,
+deadlines and abandon on a sticky stream; `x3` roster join/leave, root's own
+sticky grant and a deposition; `x4` claim plus sticky): every `always`
+property clean, every `sometimes` witness reached, with all knobs off. Every
+knob's counterexample length is checked in (`TRACES`). The suite is 254 s
+on the shared build box. An ill-formed X3 (a placed grant to a peer while the
+roster was the root alone) is kept out: it is not a reachable configuration.
+The `lib.rs` doc has the timing table and the node-stream action → code
+mapping with the product gaps (M1.1 steps 5 to 7, M1.2 to M1.4, the claim's
+release, abandon's recall, else expiry).
+
+- TODO: go/no-go verdict (D7).
+- TODO: C11's review (fable) cleared.
+
 ## 12. Exit criteria
 
 - [x] Stage 0 (complete 2026-11-05): C2g, C2g′ and C2h's scenarios landed with their

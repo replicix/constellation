@@ -64,7 +64,8 @@ fn run_capped(
     checker
 }
 
-fn assert_violates(label: &str, model: &FlexEpochs, property: &'static str) {
+/// Returns the length of the printed counterexample path.
+fn assert_violates(label: &str, model: &FlexEpochs, property: &'static str) -> usize {
     let checker = run(label, model, true);
     let d = checker
         .discovery(property)
@@ -84,6 +85,7 @@ fn assert_violates(label: &str, model: &FlexEpochs, property: &'static str) {
         last.epochs,
         last.history
     );
+    d.into_actions().len()
 }
 
 fn assert_clean(label: &str, model: &FlexEpochs, sometimes: &[&'static str]) {
@@ -669,7 +671,9 @@ fn c10_knob_hold_answers_uncommitted_is_found() {
         hold_answers_uncommitted: true,
         ..hold_group(full())
     };
-    assert_violates("c10-knob", &m, HOLD);
+    // Checked in (plan 46 M1.0 C11): a crash, a two-member epoch, two ops
+    // answered on the owner's disk.
+    assert_eq!(assert_violates("c10-knob", &m, HOLD), 6);
 }
 
 // ---- plan 43 C7b: promises anchored to the claimed key (Appendix B row 3) ----

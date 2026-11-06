@@ -203,7 +203,10 @@
 //!   sticky stream at the root's cursor, no seal. The holder may still be
 //!   answering (lost to the root, not dead): its rows past the cut are
 //!   void, and every answered one is **exported** as a conflict copy
-//!   ([`State::exported`]); it stops when it learns the end.
+//!   ([`State::exported`]); it stops when it learns the end. The abandon
+//!   first recalls the stream's read delegations, else waits for their
+//!   expiry, as a cut does (decision 2026-11-06; one `RecallRead` stands for
+//!   either); knob `abandon_skips_read_recall`.
 //! - A crashed sticky holder keeps its disk: its rows are not lost, the
 //!   subtree blocks until it returns (not modeled) or the abandon.
 //! - **Epochs and minting (ADR-43).** Each tenure has an epoch
@@ -350,6 +353,14 @@
 //!   without sealing from the recorded members first.
 //! - `no_reappend` (chunk 6): a delegate taking the root ends its
 //!   generation at the adopted cursor without re-appending its own rows.
+//! - `claim_ends_sticky_silently` (chunk 11): a sticky holder's claim of
+//!   the root ends its stream with no release of its own (the model's
+//!   rule is "claim = release": the claim journals the holder's release in
+//!   the same step); the end is then nobody's.
+//! - `abandon_skips_read_recall` (chunk 11, S4): the operator's abandon
+//!   ends a sticky stream without first recalling (or waiting out) its read
+//!   delegations; the root then acts in the directory while a reader holds
+//!   a grant.
 //! - `drop_member_copy` (chunk 6, L2b): the members retire their copies of
 //!   a stream when its end is journaled, before the log carries it.
 //! - `l1_mark_cleared_by_stream` (chunk 6, L1): the streamed install of the
@@ -878,6 +889,14 @@ pub struct NodeStreamModel {
     pub deps_ignored: bool,
     pub end_before_seal: bool,
     pub no_reappend: bool,
+    /// Chunk 11, the knob: a sticky (or designated) holder's claim of the
+    /// root ends its generation with no record of the holder's own (what
+    /// the model did before the maintainer's decision "claim = release").
+    pub claim_ends_sticky_silently: bool,
+    /// Chunk 11, the knob: the operator's abandon ends the stream with its
+    /// read delegations still granted (the model before "recall, else
+    /// expire"); `settle_after_reads_recalled` must find the root acting.
+    pub abandon_skips_read_recall: bool,
     pub drop_member_copy: bool,
     pub l1_mark_cleared_by_stream: bool,
     /// Chunk 7: streams the operator may abandon (at most one abandon).
@@ -955,6 +974,8 @@ impl NodeStreamModel {
             deps_ignored: false,
             end_before_seal: false,
             no_reappend: false,
+            claim_ends_sticky_silently: false,
+            abandon_skips_read_recall: false,
             drop_member_copy: false,
             l1_mark_cleared_by_stream: false,
             abandon: Vec::new(),
@@ -2780,7 +2801,12 @@ impl Model for NodeStreamModel {
                 if self.ttl(stream) {
                     actions.push(Action::Stop(stream));
                 }
-                if self.reads & (1 << stream) != 0 && s.reads_granted & (1 << stream) == 0 && owned
+                // No read delegation is granted on an ended stream (its
+                // directories are the root's again).
+                if self.reads & (1 << stream) != 0
+                    && s.reads_granted & (1 << stream) == 0
+                    && owned
+                    && end.is_none()
                 {
                     actions.push(Action::GrantRead(stream));
                 }
@@ -2812,6 +2838,11 @@ impl Model for NodeStreamModel {
                 && self.abandon.contains(&stream)
                 && s.abandoned == 0
                 && s.minted[stream as usize] != NONE
+                // Recall, else expire (maintainer decision 2026-11-06): the
+                // operator's abandon first recalls the stream's read
+                // delegations; an unreachable reader's grant is waited out
+                // (the model's `RecallRead` is either), as a cut waits.
+                && (s.reads & (1 << stream) == 0 || self.abandon_skips_read_recall)
             {
                 actions.push(Action::Abandon(stream));
             }
@@ -3452,6 +3483,22 @@ impl Model for NodeStreamModel {
                 // adopted journal lacks, verbatim, then ends its generation.
                 if let Some(g) = self.stream_of_node(claimant) {
                     if ended(&s, g).is_none() {
+                        // Claim = release (plan 46 M1.0 C11, maintainer
+                        // decision 2026-11-06): a sticky holder's claim
+                        // journals the release of its grant in the same
+                        // step, so the end that follows is the holder's.
+                        if self.non_stealable(g)
+                            && !self.claim_ends_sticky_silently
+                            && !s.streams[g as usize]
+                                .rows
+                                .iter()
+                                .any(|r| matches!(r.kind, RowKind::Released { .. }))
+                        {
+                            let dirs = (1..DIRS)
+                                .filter(|&d| deleg_owns(self, &s, g, d))
+                                .fold(0u8, |m, d| m | (1 << d));
+                            push_release(&mut s, g, dirs);
+                        }
                         if !self.no_reappend {
                             let k = appended(&s, g);
                             let tail = s.streams[g as usize].rows[k..].to_vec();

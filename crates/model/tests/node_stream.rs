@@ -198,16 +198,17 @@ fn assert_clean_within(label: &str, model: &NodeStreamModel, cap: (usize, Durati
         }
     }
     // Every `sometimes` the model registers for this topology is reached.
-    for p in model.properties() {
-        if p.expectation != Expectation::Sometimes {
-            continue;
-        }
-        assert!(
-            checker.discovery(p.name).is_some(),
-            "{label}: `{}` never reached (vacuous)",
-            p.name
-        );
-    }
+    let vacuous: Vec<&str> = model
+        .properties()
+        .into_iter()
+        .filter(|p| p.expectation == Expectation::Sometimes)
+        .filter(|p| checker.discovery(p.name).is_none())
+        .map(|p| p.name)
+        .collect();
+    assert!(
+        vacuous.is_empty(),
+        "{label}: `sometimes` witnesses never reached (vacuous): {vacuous:?}"
+    );
 }
 
 fn assert_finds(label: &str, model: &NodeStreamModel, prop: &'static str) {
@@ -238,6 +239,168 @@ fn assert_finds_within(
     if EVENTS.contains(&prop) {
         assert_eq!(d.last_state().violation.map(|v| v.property), Some(prop));
     }
+    assert_trace(label, prop, d.into_actions().len());
+}
+
+/// The counterexample of each knob, checked in as its path length (plan 46
+/// M1.0 chunk 11): `(label, property, actions)`. The checker is breadth
+/// first on one thread and its hashing is fixed, so the length is
+/// reproducible; a change of the model that moves it is a change of the
+/// counterexample and is looked at (the path is printed with `--nocapture`).
+/// Stateright's path is valid but not always the shortest one. A knob whose
+/// label is missing here fails, so no knob goes unrecorded.
+const TRACES: &[(&str, &str, usize)] = &[
+    (
+        "c11-x2r+abandon_skips_read_recall",
+        "settle_after_reads_recalled",
+        6,
+    ),
+    (
+        "c11-x4+claim_ends_sticky_silently",
+        "sticky_ends_only_by_holder_or_operator",
+        6,
+    ),
+    ("c2-t1+lone_delegate", "acked_never_lost", 7),
+    ("c2-t1+root_journal_counts", "acked_never_lost", 8),
+    (
+        "c2-t1+root_journal_counts+i1",
+        "ack_implies_committed_by_config",
+        8,
+    ),
+    ("c2-t1b+no_dedup", "exactly_once", 12),
+    (
+        "c3-deleg-add+ack_by_latest_config",
+        "ack_implies_committed_by_config",
+        7,
+    ),
+    (
+        "c3-deleg-remove+ack_by_latest_config",
+        "ack_implies_committed_by_config",
+        6,
+    ),
+    (
+        "c3-deleg-remove+per_row_class",
+        "row_version_matches_config",
+        6,
+    ),
+    (
+        "c3-deleg-remove+per_row_class+i1",
+        "ack_implies_committed_by_config",
+        5,
+    ),
+    ("c3-deleg-remove+per_row_class+lost", "acked_never_lost", 5),
+    ("c4-t1+execute_after_release", "recall_safety", 10),
+    (
+        "c4-t1+history+root_executes_before_at",
+        "per_key_linearizable",
+        11,
+    ),
+    ("c4-t1+per_subtree_streams", "two_subtrees_one_order", 10),
+    (
+        "c4-t1+root_executes_before_at",
+        "released_subtree_sequenced_after_cut",
+        14,
+    ),
+    ("c4-t1+root_executes_before_at+journal", "journal_valid", 13),
+    ("c4-t3+honour_uncommitted_grant", "recall_safety", 7),
+    ("c5-t1+deps_ignored", "causal_cut", 10),
+    ("c5-t1+deps_ignored+reader", "marker_order", 10),
+    ("c6-t1+end_before_seal", "acked_at_or_below_cut", 7),
+    (
+        "c6-t2+l1_mark_cleared_by_stream",
+        "converged_at_quiescence",
+        15,
+    ),
+    (
+        "c6-t3+l1_mark_cleared_by_stream",
+        "converged_at_quiescence",
+        14,
+    ),
+    ("c6-t4+drop_member_copy", "verbatim_identity", 8),
+    ("c6-t4+no_reappend", "acked_at_or_below_cut", 9),
+    (
+        "c7-t1+holder_releases_before_drain",
+        "rollback_only_singleton_or_operator",
+        6,
+    ),
+    (
+        "c7-t1+holder_releases_before_drain+cut",
+        "acked_at_or_below_cut",
+        6,
+    ),
+    (
+        "c7-t1+ttl_reclaims_sticky",
+        "sticky_ends_only_by_holder_or_operator",
+        6,
+    ),
+    (
+        "c7-t1+ttl_reclaims_sticky+i5",
+        "rollback_only_singleton_or_operator",
+        6,
+    ),
+    (
+        "c7-t2+sticky_answers_before_grant_committed",
+        "orphan_rule_never_ends_an_answering_grant",
+        7,
+    ),
+    (
+        "c7-t2+sticky_answers_before_grant_committed+i5",
+        "rollback_only_singleton_or_operator",
+        7,
+    ),
+    ("c7-t5+ttl_reclaims_sticky", "designation_final", 7),
+    ("c8-t1+singleton_after_join", "no_lone_answer_with_peer", 11),
+    (
+        "c8-t1+singleton_after_join+i5",
+        "rollback_only_singleton_or_operator",
+        12,
+    ),
+    (
+        "c8-t1+singleton_serves_forwards",
+        "rollback_only_singleton_or_operator",
+        10,
+    ),
+    (
+        "c8-t2+root_sticky_on_slash",
+        "released_subtree_sequenced_after_cut",
+        9,
+    ),
+    ("c8-t3+bump_by_event", "ack_implies_committed_by_config", 9),
+    (
+        "c9-t1+cut_before_read_recall",
+        "settle_after_reads_recalled",
+        9,
+    ),
+    ("c9-t2+settle_unowned", "eio_never_lands_late", 11),
+    ("c9-t3+server_replay_queue", "one_executable_copy", 8),
+    ("t1+lone_delegate", "ack_implies_committed_by_config", 17),
+    (
+        "t1+root_journal_counts",
+        "ack_implies_committed_by_config",
+        18,
+    ),
+    (
+        "t1b+root_journal_counts",
+        "ack_implies_committed_by_config",
+        9,
+    ),
+    ("t2+lone_delegate", "ack_implies_committed_by_config", 8),
+];
+
+fn assert_trace(label: &str, prop: &str, len: usize) {
+    println!("TRACE {label}|{prop}|{len}");
+    // `RECORD_TRACES=1` only prints the `TRACE` lines (to regenerate the table).
+    if std::env::var_os("RECORD_TRACES").is_some() {
+        return;
+    }
+    let (_, _, want) = TRACES
+        .iter()
+        .find(|t| t.0 == label && t.1 == prop)
+        .unwrap_or_else(|| panic!("{label}: `{prop}` path of {len} actions is not in TRACES"));
+    assert_eq!(
+        len, *want,
+        "{label}: the counterexample for `{prop}` changed length"
+    );
 }
 
 // ------------------------------------------------------------- the design
@@ -1346,6 +1509,166 @@ fn c9_knob_server_replay_queue_is_found() {
         "c9-t3+server_replay_queue",
         &m,
         "one_executable_copy",
+        CAP_LARGE,
+    );
+}
+
+// ------------------------------------------------------- chunk 11: combined
+//
+// The chunks' topologies each switch one mechanism on. These switch
+// several on at once, so that the mechanisms are checked against each
+// other: every `always` property the model registers (the model registers
+// each wherever the mechanism it needs is on) and every `sometimes`
+// witness. A script is one or two ops per node; what a topology adds is
+// composition, not length (a third op with a history, a crash and a
+// deposition already exceeds 40M generated states; the `sometimes` witness
+// of each topology is checked, so a script is chosen so that every one is
+// reached).
+
+/// X1, the placed stream with everything on it: node 1 holds `/D1` and
+/// `/D2` placed (group `{delegate, node 2}`), node 2 also backs the root.
+/// Node 2 writes `/D1/b` (the delegate's) and then `/b` (the root's, with
+/// the delegate's row in its `deps`: the root waits for it); the TTL may
+/// end the grant; per-key history and the causal cut; one crash and one
+/// deposition.
+fn c11_x1_placed_everything() -> NodeStreamModel {
+    let mut m = NodeStreamModel::design(vec![vec![], vec![], vec![create(D1B), create(RB)]])
+        .with_initial(present(&[D1A]))
+        .with_root_backups(1 << 2)
+        .with_grant(placed(1, D1 | D2, 1 << 2))
+        .with_ttl_end(1)
+        .with_faults(1, 1);
+    m.history = true;
+    m.causal = true;
+    m
+}
+
+/// X1r, the replicas: C5's topology (the delegate's replica, the archive's
+/// durable apply, a marker/data reader on every replica, `deps`) with the
+/// TTL end and one crash.
+fn c11_x1r_replicas_and_ttl() -> NodeStreamModel {
+    let mut m = c5_t1().with_ttl_end(1).with_faults(1, 0);
+    m.history = true;
+    m
+}
+
+/// X2, the kinds side by side: node 1 holds `/D1` sticky (final), node 2
+/// holds `/D2` placed (group `{delegate, node 1}`); the holder may release
+/// and the operator abandon. The root writes `/D2/a` (forwarded to the
+/// delegate), node 1 writes `/D1/a`. (The read delegations, the deadline
+/// and the move out of the sticky stream are X2r: with them a third op
+/// exceeds the cap.)
+fn c11_x2_sticky_and_placed() -> NodeStreamModel {
+    NodeStreamModel::design(vec![vec![create(D2A)], vec![create(D1A)], vec![]])
+        .with_grant(sticky(1, D1))
+        .with_grant(placed(2, D2, 1 << 1))
+        .with_stream_release(1)
+        .with_abandon(1)
+}
+
+/// X2r, the read delegations and the deadline on the sticky stream: the
+/// root writes `/D1/a` (forwarded to the holder), node 2's move out of the
+/// sticky stream is parked at the root and settled by a deadline; the
+/// holder may release and the operator abandon; the stream's read
+/// delegation is granted and recalled (the abandon waits for the recall,
+/// maintainer decision 2026-11-06).
+fn c11_x2r_reads_and_deadlines() -> NodeStreamModel {
+    NodeStreamModel::design(vec![vec![create(D1A)], vec![], vec![mv(D1B, RB)]])
+        .with_initial(present(&[D1B]))
+        .with_grant(sticky(1, D1))
+        .with_stream_release(1)
+        .with_abandon(1)
+        .with_reads(1)
+        .with_deadlines(1)
+}
+
+/// X3, the roster with grants: the root alone in the roster at first, with
+/// a sticky grant of its own minted at run time on `/D1` (never `/`), and a
+/// placed delegate on `/D2` (node 2); the peers join (the bump), node 1 may
+/// leave, and one deposition.
+fn c11_x3_roster_and_grants() -> NodeStreamModel {
+    NodeStreamModel::design(vec![
+        vec![create(D1A), create(RA)],
+        vec![create(RB), create(D1B)],
+    ])
+    .with_grant(sticky(0, 0))
+    .with_grow(1, D1)
+    .with_roster(0b01, 1 << 1, 1 << 1)
+    .with_faults(0, 1)
+}
+
+/// X4, the claim with a sticky grant: node 1 backs the root and holds
+/// `/D1` placed with node 2 as its backup, may claim the lease
+/// (re-appending verbatim) and end its generation; node 2 holds a sticky
+/// grant minted at run time on `/D2`, writes into `/D1`, and may claim
+/// next. Two depositions.
+fn c11_x4_claim_and_sticky() -> NodeStreamModel {
+    let mut m = NodeStreamModel::design(vec![vec![], vec![create(D1A)], vec![create(D2A)]])
+        .with_root_backups(1 << 1)
+        .with_grant(placed(1, D1, 1 << 2))
+        .with_grant(sticky(2, 0))
+        .with_grow(2, D2)
+        .with_faults(0, 2);
+    m.delegate_may_claim = true;
+    m.shadow_replay = true;
+    m
+}
+
+#[test]
+fn c11_design_x1_placed_everything() {
+    assert_clean_within("c11-x1", &c11_x1_placed_everything(), CAP_LARGE);
+}
+
+#[test]
+fn c11_design_x1r_replicas_and_ttl() {
+    assert_clean_within("c11-x1r", &c11_x1r_replicas_and_ttl(), CAP_LARGE);
+}
+
+#[test]
+fn c11_design_x2_sticky_and_placed() {
+    assert_clean_within("c11-x2", &c11_x2_sticky_and_placed(), CAP_LARGE);
+}
+
+#[test]
+fn c11_design_x2r_reads_and_deadlines() {
+    assert_clean_within("c11-x2r", &c11_x2r_reads_and_deadlines(), CAP_LARGE);
+}
+
+#[test]
+fn c11_design_x3_roster_and_grants() {
+    assert_clean_within("c11-x3", &c11_x3_roster_and_grants(), CAP_LARGE);
+}
+
+#[test]
+fn c11_design_x4_claim_and_sticky() {
+    assert_clean_within("c11-x4", &c11_x4_claim_and_sticky(), CAP_LARGE);
+}
+
+/// The claim's end of a sticky holder's generation with no release of its
+/// own (the model before "claim = release"): the second claimant is node
+/// 2, the sticky holder, and its stream ends by nobody's hand.
+#[test]
+fn c11_knob_claim_ends_sticky_silently_is_found() {
+    let mut m = c11_x4_claim_and_sticky();
+    m.claim_ends_sticky_silently = true;
+    assert_finds_within(
+        "c11-x4+claim_ends_sticky_silently",
+        &m,
+        "sticky_ends_only_by_holder_or_operator",
+        CAP_LARGE,
+    );
+}
+
+/// The operator's abandon before the read recall: the root settles in the
+/// abandoned directory while a reader holds its read grant.
+#[test]
+fn c11_knob_abandon_skips_read_recall_is_found() {
+    let mut m = c11_x2r_reads_and_deadlines();
+    m.abandon_skips_read_recall = true;
+    assert_finds_within(
+        "c11-x2r+abandon_skips_read_recall",
+        &m,
+        "settle_after_reads_recalled",
         CAP_LARGE,
     );
 }

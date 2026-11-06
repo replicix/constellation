@@ -67238,3 +67238,12 @@ after the sim suite, had not finished at its 3 h bound and printed nothing to te
 runs after it, with `--nocapture`, finished in 29 min. A hang of the sim is a bug: open, to be reproduced with per-configuration
 output (not attributed to plan 41).
 
+### Plan 46 M1.0 chunk C11: integration of the node-stream model (2026-11-06)
+
+`crates/model/src/node_stream.rs`, `tests/node_stream.rs`, `tests/flex_epochs.rs`, the `lib.rs` doc, plan 46 §11. Two maintainer decisions
+(2026-11-06): **claim = release** (a sticky holder's claim of the root journals the release of its directories before the verbatim re-append and the
+end; knob `claim_ends_sticky_silently`) and **recall, else expire** (the operator's abandon of a stream waits for its read delegations to be recalled or
+to expire, as a cut does; no read grant on an ended stream; knob `abandon_skips_read_recall`). The combined topologies X1, X1r, X2, X2r, X3, X4 are
+clean with every knob off, every `sometimes` witness reached; each knob's counterexample length is in `TRACES` (43 entries, `RECORD_TRACES=1` to
+regenerate). Box 1, release: the crate's suite 254 s (4 test threads, ignored tests excluded); `--test node_stream` 30 s. Product gaps named in the
+`lib.rs` mapping table: M1.1 steps 5 to 7, M1.2 to M1.4, the claim's release record, abandon's recall, else expiry. Go/no-go and the fable review: open.

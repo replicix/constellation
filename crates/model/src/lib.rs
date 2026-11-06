@@ -146,8 +146,45 @@
 //! `ttl_reclaims_sticky`, `holder_releases_before_drain`,
 //! `sticky_answers_before_grant_committed`, `singleton_after_join`,
 //! `singleton_serves_forwards`, `bump_by_event`, `root_sticky_on_slash`,
-//! `settle_unowned`, `cut_before_read_recall`, `server_replay_queue`).
-//! `tests/node_stream.rs`.
+//! `settle_unowned`, `cut_before_read_recall`, `server_replay_queue`);
+//! chunk 11 adds `claim_ends_sticky_silently` ("claim = release": a
+//! sticky holder's claim of the lease journals its release first) and
+//! `abandon_skips_read_recall` ("recall, else expire": the operator's
+//! abandon waits for the stream's read delegations to be recalled or to
+//! expire, as a cut does), and the combined topologies X1 to X4
+//! (`tests/node_stream.rs`: every property of the model switched on at
+//! once, on two or three ops per node). Every knob's counterexample is
+//! checked in as its path length (`TRACES` in that file; regenerate with
+//! `RECORD_TRACES=1`).
+//!
+//! The two maintainer decisions of 2026-11-06 recorded by chunk 11 (plan
+//! 46 §11): **claim = release** (a sticky holder that takes the root
+//! journals the release of its directories before its verbatim re-append
+//! and the end, so the end is the holder's own) and **recall, else expire**
+//! (the abandon first recalls the stream's read delegations; a reader that
+//! cannot be reached is waited out, as a cut waits for the recall; the
+//! model's `RecallRead` stands for either, and no read delegation is
+//! granted on an ended stream). The combined topologies X3 with an
+//! ill-formed roster (a placed grant to a peer while the roster is the root
+//! alone) stays out: it is not a configuration the product can reach.
+//!
+//! ## Timing of the M1.0 suite (release, 16-core shared box, 4 test
+//! threads; the whole crate, ignored tests excluded, 254 s)
+//!
+//! | Test | Unique states | Time |
+//! |---|---|---|
+//! | `c11_design_x1_placed_everything` | 130k | 0.4 s |
+//! | `c11_design_x1r_replicas_and_ttl` | 5.7M | 30 s |
+//! | `c11_design_x2_sticky_and_placed` | 345k | 1.4 s |
+//! | `c11_design_x2r_reads_and_deadlines` | 905k | 3.4 s |
+//! | `c11_design_x3_roster_and_grants` | 104k | 0.3 s |
+//! | `c11_design_x4_claim_and_sticky` | 1.74M | 6 s |
+//! | `--test node_stream` (70 tests) | | 30 s |
+//! | `--test locks` (68 tests, the largest) | | 101 s |
+//!
+//! A topology that would exceed its cap (10M unique states, about 1 GB per
+//! million) is cut in ops, not in properties: a third op with the history,
+//! a crash and a deposition already exceeds 40M generated states.
 //!
 //! Plan 46 M1.0 chunk 10 extends [`flex`] with the epoch hold as a group
 //! {owner, one member} (`StreamAheadAck`): a row is answered once a member
@@ -224,6 +261,31 @@
 //! | `Read` (plan 30 §M6) | the FUSE read paths (`engine/src/view/ops.rs`: `lookup`, `getattr`, `readdir`, `open`, `readlink`, `getxattr`, `listxattr`); under `Positions` gated by the session wait (phase 2: a `Replica`/core check before the local `MetaStore` read, bounded by `CONSTELLATION_SESSION_WAIT_MS`) |
 //! | `DeliverForwardRequest` reply position (`Positions`) | `Core::on_mutate_request` → `PeerMsg::MutateReply { position, base }` (M5's `reply_base` generalized; `positions::reply_position`) |
 //! | `DeliverForwardReply` → `Phase::AwaitingLog` (`Positions`) | `Core::on_mutate_reply`'s stale-base branch → `ClientPhase::AwaitingLog`, answered by `answer_awaiting_log` (`positions::on_tailed`) |
+//!
+//! ## Action → code mapping, `node_stream` (plan 46 M1.0 chunk 11)
+//!
+//! Product paths are under `crates/authority/src/core/` (`delegate.rs`,
+//! `backup.rs`, `seal_tail.rs`, `holder.rs`, `lease.rs`, `stream.rs`) and
+//! `crates/meta/src/` (`delegation.rs`, `owner_table.rs`, `readdeleg.rs`).
+//! The product today has one lane per delegation generation with ranges;
+//! the node-stream structure is what M1.1 to M1.4 build, so a row names the
+//! code that gets replaced or extended and, where the model is ahead, the
+//! **gap**.
+//!
+//! | `node_stream::Action` | Product code it abstracts |
+//! |---|---|
+//! | `Start`, `Deliver`, `Exec` | `delegate.rs::delegate_try_execute`/`delegate_execute_now` (the grant's owner runs it), `answer_not_owner`; forward and bounce in `crates/engine/src/forward.rs` |
+//! | `Replicate` | `replica.rs`/`store/backup.rs::deleg_backup_append` (a member copies the stream's next row); the per-stream rule is `deleg_rule` / `deleg_ack_class` / `deleg_row_commit`. **Gap:** one stream per node (M1.1 steps 5 to 7) |
+//! | `Append`, `Ship`, `RootAck` | the root's verbatim append of a delegate's rows (`deleg_committed_through`, `holder_append_committed`), the root's segment shipper, `DelegateStreamAck.committed`; ADR-41's lone-journal branch is removed (`deleg_counts_root`). **Gap:** M1.2 |
+//! | `Answer` | `delegate.rs::deleg_row_commit` (the answer's gate) and, for the root's own rows, `backup.rs::root_ack_class` |
+//! | `Crash`, `Depose`, `Retry`, `Rescue` | fail-stop; `seal_tail.rs::on_seal_tail`/`claim_without_tail` and `jobs.rs::claim_with_tail`/`claim_orphan_proof` (takeover, orphan proof); the requester's rid retry in `forward.rs`, `replay.rs` |
+//! | `Reconfig`, `TogglePeer` | `delegate.rs::deleg_group_refresh`/`deleg_journal_group` (group change under old ∪ new); the peer-in-budget flag is `backup_peers_in_budget`. **Gap:** `config_version` on stream rows (M1.1) |
+//! | `Release`, `ReleaseAll`, `Grow`, `Stop`, `End` | `meta/src/delegation.rs::DelegationTable::apply` (`DelegationRecord`), `delegate.rs::deleg_handed_back_to`/`deleg_end_sealed`. **Gap:** `SubtreeReleased`/`StreamReleased`/`DelegateNodeEnded` stream rows and recall as a request (M1.2); the sticky grant kind and the holder's release (M1.3); claim = release (the claim's release record, not built) |
+//! | `Learn`, `Durable` | `delegate.rs::deleg_learn_root` (the delegate's install of the root's journal), the archive's durable apply |
+//! | `Abandon` | `seal_tail.rs::on_control_abandon_group` is the group-wide ancestor. **Gap:** `repair abandon --node` (M1.3), and its read recall, else expiry (not built) |
+//! | `Join`, `Leave`, `SeeRoster` | the roster and `first_peer_join` (`lease.rs`, `backup.rs::backup_candidacies`). **Gap:** the journaled singleton-to-peer `config_version` bump (M1.1 step 5) |
+//! | `Deadline` | `holder.rs::settle_refusal`/`gate_settle` (the `Refused{rid, ABANDONED}` before an `EIO`) |
+//! | `GrantRead`, `RecallRead` | `meta/src/readdeleg.rs` (`grant`, `recall`, `recall_inos`), `delegate.rs::deleg_read_recall_pending`; the model's bit is one stream's read delegation. **Gap:** S4's recall before the cut (M1.3) |
 //!
 //! # Simplifications
 //!
