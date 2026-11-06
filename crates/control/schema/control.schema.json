@@ -1523,6 +1523,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "append_uncompleted": {
+          "description": "Appended rows with a rid and no completion for it (must stay 0).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "appended_txs": {
           "format": "uint64",
           "minimum": 0,
@@ -2182,6 +2188,7 @@
         "lost_deps_stopped",
         "append_deps_lost",
         "append_skipped",
+        "append_uncompleted",
         "drain_deps_waits",
         "designee_syncs",
         "designee_sync_failures",

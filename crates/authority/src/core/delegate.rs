@@ -4143,6 +4143,7 @@ impl Core {
             }
             let applied = replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps);
             self.stats.deleg_append_skipped += replica.take_deleg_append_skipped();
+            self.stats.deleg_append_uncompleted += replica.take_deleg_append_uncompleted();
             match applied {
                 Ok(_) => {
                     replica.note_foreign_executed(&tx.records);
@@ -8079,6 +8080,7 @@ impl Core {
             }
             let applied = replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps);
             self.stats.deleg_append_skipped += replica.take_deleg_append_skipped();
+            self.stats.deleg_append_uncompleted += replica.take_deleg_append_uncompleted();
             match applied {
                 Ok(_) => {
                     // (No causal-cut check here: `reaches_streams` held

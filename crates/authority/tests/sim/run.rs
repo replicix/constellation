@@ -5571,8 +5571,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // record its tolerant apply skipped is a divergence (any fails), except
     // under `speculate_on_stale_base`, the knob that installs replies on a
     // base the requester lacks to show the divergence it causes.
+    // (The knob is uniform across nodes, so node 1's config speaks for all.)
     let stale_base = (cfg.core)(1, 1).speculate_on_stale_base;
     for (id, stats) in &report.stats {
+        if stats.deleg_append_uncompleted > 0 {
+            return Err(format!(
+                "node {id}: {} appended delegate row(s) with a rid and no Completed/Refused for it\n  stats: {:#?}",
+                stats.deleg_append_uncompleted, report.stats
+            ));
+        }
         if stats.deleg_append_skipped > 0 && !stale_base {
             return Err(format!(
                 "node {id}: {} record(s) of a delegate's row skipped by the root's verbatim append\n  stats: {:#?}",

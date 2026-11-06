@@ -446,6 +446,8 @@ pub struct DelegationReport {
     /// Records of a delegate's row the root journaled verbatim but could not
     /// apply (must stay 0).
     pub append_skipped: u64,
+    /// Appended rows with a rid and no completion for it (must stay 0).
+    pub append_uncompleted: u64,
     pub drain_deps_waits: u64,
     /// A designee's journal syncs before its stream sends rows (off the
     /// core), and those that failed (the stream waits and asks again).

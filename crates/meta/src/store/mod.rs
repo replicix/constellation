@@ -788,6 +788,9 @@ pub struct Meta {
     /// fails a seed that has any), not yet taken by the core
     /// ([`Meta::take_deleg_append_skipped`]).
     deleg_append_skipped: AtomicU64,
+    /// Appended rows with a rid whose records carry no `Completed` or
+    /// `Refused` for it ([`Meta::take_deleg_append_uncompleted`]).
+    deleg_append_uncompleted: AtomicU64,
     /// Plan 40: dentries decoded by the directory reads (`readdir`,
     /// `readdir_after` and their scratch twins) — what a page costs
     /// ([`Meta::dentries_read`]).
@@ -1064,6 +1067,10 @@ impl Meta {
 
     /// Records the root's verbatim appends of delegate transactions could
     /// not apply since the last call (and reset).
+    pub fn take_deleg_append_uncompleted(&self) -> u64 {
+        self.deleg_append_uncompleted.swap(0, Ordering::Relaxed)
+    }
+
     pub fn take_deleg_append_skipped(&self) -> u64 {
         self.deleg_append_skipped.swap(0, Ordering::Relaxed)
     }
@@ -1309,6 +1316,7 @@ impl Meta {
             dirty_probes: AtomicU64::new(0),
             holder_scans: AtomicU64::new(0),
             deleg_append_skipped: AtomicU64::new(0),
+            deleg_append_uncompleted: AtomicU64::new(0),
             dentries_read: AtomicU64::new(0),
             snapshot_gen: AtomicU64::new(0),
             snapshot_hook: std::sync::RwLock::new(None),

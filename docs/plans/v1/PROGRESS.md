@@ -67582,7 +67582,7 @@ C3-1 (c3-spec D2). `Meta::apply_delegate_tx` journals the streamed records exact
 atime-only transaction, a `Refused` and an `InboxAck` row included, each `Completed` where the delegate journaled it. Before, the append
 re-derived its rows from the apply: it dropped `Atime` rows, journaled nothing for an atime-only transaction, moved `Refused`/`InboxAck`
 behind the rows and put the completion after the last row. The row keeps its rid and its `(gen, idx)` and `deps`, and now carries no op
-(`PendingLocalOp::set_rid_only`): it is the delegate's row, nothing may replay it as `MutateOp::Records`. The `RowCommit` stamp is as M1.1
+(`PendingLocalOp::set_rid_only`): it is the delegate's row and records no replay op (but see the fix round below: a strand or a member re-queue still derives `MutateOp::Records` from its records). The `RowCommit` stamp is as M1.1
 step 4 left it (the generation's applied `DelegGroup` version, read in the journaling transaction). The apply stays tolerant (every replica
 applies the same records by the same rules) and counts every record it skipped: `Meta::take_deleg_append_skipped`, `Replica::
 take_deleg_append_skipped`, the core's `deleg_append_skipped`, `status.delegation.append_skipped` (schema re-blessed). The sim fails a seed
@@ -67616,3 +67616,13 @@ The delegate's own ops, B / A p50: ext4 chmod 1.00, create 1.00, rename 1.01, un
 above +3 % on p50 (xfs create 1.04, spread of the runs overlapping) and one on p90 (ext4 unlink 1.12, 460 to 554 us against 455 to 554 us:
 the same). The ops forwarded to the root are bimodal (chmod and unlink on xfs 0.74, on ext4 chmod 1.15) with no direction across file
 systems. No regression on any file system.
+
+**Fix round (review of step 4).** (1) The doc of `PendingLocalOp::set_rid_only` said nothing may replay the row as `MutateOp::Records`; that was
+false: the strand (`spec.rs`) and the member re-queue fall back to `derive_replay_op(records)` for a row with no op, which still yields
+`MutateOp::Records`. Corrected; the open bug is pinned by `a_deposed_roots_appended_delegate_row_never_lands_past_its_generations_seal` and
+closed by later M1.2 steps. Consequences to remember: a lone `WriteManifest` row now replays as an optimistic `SetManifest`, and a row of
+only atime, refusal or inbox-ack records queues nothing. (2) I2 guard: completing the rid now depends on the stream carrying
+`Completed{rid}` (or `Refused{rid}`); the old append always completed it. `apply_delegate_tx` counts a row with a rid and neither
+(`Meta::take_deleg_append_uncompleted`, `deleg_append_uncompleted`, `status.delegation.append_uncompleted`, schema re-blessed) and
+`debug_assert!`s; the sim fails a seed where it is nonzero (any configuration, stale-base included). Meta test
+`an_appended_row_with_a_rid_and_no_completion_is_counted`. (3) `run.rs` reads the stale-base knob from node 1: a comment says it is uniform.

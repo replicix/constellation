@@ -339,6 +339,8 @@ pub trait Replica {
     /// since the last call (a tolerant apply; counted, and the sim fails a
     /// seed that has one).
     fn take_deleg_append_skipped(&self) -> u64;
+    /// Appended delegate rows with a rid and no completion for it (must stay 0).
+    fn take_deleg_append_uncompleted(&self) -> u64;
     /// This node's unretired transactions of stream `gen` from `from_idx`.
     fn delegate_txs_from(&self, gen: u64, from_idx: u64, max_rows: usize) -> Vec<DelegateTx>;
     /// Plan 30 §M11: journal a delegate's refusal as the next transaction
@@ -1294,6 +1296,10 @@ impl Replica for Meta {
 
     fn take_deleg_append_skipped(&self) -> u64 {
         Meta::take_deleg_append_skipped(self)
+    }
+
+    fn take_deleg_append_uncompleted(&self) -> u64 {
+        Meta::take_deleg_append_uncompleted(self)
     }
 
     fn delegate_txs_from(&self, gen: u64, from_idx: u64, max_rows: usize) -> Vec<DelegateTx> {

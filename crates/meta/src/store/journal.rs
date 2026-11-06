@@ -83,8 +83,14 @@ impl PendingLocalOp {
 
     /// The rid a transaction completes, and no op: the root's verbatim
     /// append of a delegate's row (plan 46 M1.2 step 4). The row is the
-    /// delegate's, not an op this node can execute again, so nothing may
-    /// replay it as `MutateOp::Records`.
+    /// delegate's, not an op this node can execute again, so it records
+    /// none. A strand (`spec.rs`) or a member re-queue that meets a row
+    /// without an op still falls back to `derive_replay_op(records)`, which
+    /// yields `MutateOp::Records` (a lone `WriteManifest` becomes an
+    /// optimistic `SetManifest`; a row of atime, refusal or inbox-ack
+    /// records queues nothing): the bug pinned by
+    /// `a_deposed_roots_appended_delegate_row_never_lands_past_its_generations_seal`
+    /// stays open until a later M1.2 step closes it.
     pub(crate) fn set_rid_only(rid: Option<Rid>) -> PendingLocalOpGuard {
         PENDING_OP.with(|c| *c.borrow_mut() = Some((rid, None)));
         PendingLocalOpGuard

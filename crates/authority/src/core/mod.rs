@@ -1065,6 +1065,9 @@ pub struct Stats {
     /// verbatim append journaled but its tolerant apply skipped. The sim
     /// fails a seed that has any.
     pub deleg_append_skipped: u64,
+    /// Appended delegate rows with a rid and no `Completed`/`Refused` for
+    /// it (must stay 0; the sim fails a seed that has one).
+    pub deleg_append_uncompleted: u64,
     /// Root: a sealed tail's drain stopped at a row whose dependency it
     /// does not hold yet (another generation of the dead delegate).
     pub deleg_drain_deps_waits: u64,

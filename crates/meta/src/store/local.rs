@@ -1944,6 +1944,23 @@ impl Meta {
                 self.deleg_append_skipped
                     .fetch_add(skipped as u64, std::sync::atomic::Ordering::Relaxed);
             }
+            // The rid completes only if the stream says so (the old append
+            // always completed it): a row with a rid and no `Completed` or
+            // `Refused` for it would leave the rid open.
+            let completed = rid.is_none_or(|r| {
+                applied.iter().any(|rec| {
+                    matches!(rec, LogRecord::Completed { rid: x }
+                        | LogRecord::Refused { rid: x, .. } if *x == r)
+                })
+            });
+            if !completed {
+                self.deleg_append_uncompleted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            debug_assert!(
+                completed,
+                "a delegate's row with a rid carries no Completed or Refused for it"
+            );
             debug_assert!(
                 journal::PendingCompletion::take().is_none(),
                 "a verbatim append carries its own completions"
@@ -4257,5 +4274,34 @@ mod verbatim_append_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0.rid, Some(rid(1)));
         assert!(rows[0].0.op.is_none(), "{:?}", rows[0].0.op);
+    }
+
+    /// A row with a rid whose records carry no `Completed`/`Refused` for it
+    /// is counted (and trips a debug assertion); a normal row is not.
+    #[test]
+    fn an_appended_row_with_a_rid_and_no_completion_is_counted() {
+        let meta = Meta::open_in_memory().unwrap();
+        let ok = vec![create("a", 1), LogRecord::Completed { rid: rid(1) }];
+        meta.apply_delegate_tx(&ok, Some(rid(1)), 9, 1, Default::default())
+            .unwrap();
+        let refused = vec![LogRecord::Refused {
+            rid: rid(2),
+            code: constellation_types::Code::NotFound,
+        }];
+        meta.apply_delegate_tx(&refused, Some(rid(2)), 9, 2, Default::default())
+            .unwrap();
+        let ridless = vec![create("c", 3)];
+        meta.apply_delegate_tx(&ridless, None, 9, 3, Default::default())
+            .unwrap();
+        assert_eq!(meta.take_deleg_append_uncompleted(), 0);
+        // A fresh store: the debug assertion unwinds out of the call, the
+        // counter is already bumped.
+        let meta = Meta::open_in_memory().unwrap();
+        let bad = vec![create("b", 2)];
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = meta.apply_delegate_tx(&bad, Some(rid(3)), 9, 1, Default::default());
+        }));
+        assert_eq!(r.is_err(), cfg!(debug_assertions));
+        assert_eq!(meta.take_deleg_append_uncompleted(), 1);
     }
 }
