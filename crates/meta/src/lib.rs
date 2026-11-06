@@ -68,6 +68,8 @@ pub use store::member::{
     tail_identity, MemberCopyInfo, MemberOutcome, MemberTx, HELD_COPY_MAX_AGE_MS,
 };
 pub use store::remote::RemoteBlockers;
+#[cfg(any(test, feature = "test-util"))]
+pub use store::spec::fail_next_reship_sync_on_this_thread_for_tests;
 pub use store::spec::{
     created_ino_of, AwaitRetry, OrphanProof, QueueSnapshot, Refusal, ReshipReport, SegmentApplied,
     SpecKind, SpeculationCounts, StrandArgs, Stranded, StrandedOp, TailArgs,

@@ -7164,6 +7164,56 @@
       ],
       "type": "object"
     },
+    "ReshipStatus": {
+      "description": "Plan 46 M1.2 step 5 (c3-spec D3, §4.2): the takeover's re-ship of the\npredecessor's sealed tail, one store transaction with the strand, since\nstart.",
+      "properties": {
+        "duration_ms_max": {
+          "description": "The longest one takeover's re-ship held the store's writer lock\n(ms).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "superseded": {
+          "description": "Committed requester/subscriber entries the re-applied tail\nsuperseded.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sync_failed": {
+          "description": "The sync after a re-ship's commit failed (the re-ship stood).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tail_applied": {
+          "description": "Tail transactions journaled verbatim.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tail_diverged": {
+          "description": "Passes of a takeover gate held closed by a tail that does not apply\n(`TailDiverged`). Must stay 0; non-zero: the node holds the lease\nwith its gate closed until an operator stops it (another claimant\nthen fetches the tail) or abandons the group.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tail_rid_done": {
+          "description": "Tail transactions skipped because their rid already had an outcome\nhere. Must stay 0.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "superseded",
+        "tail_applied",
+        "tail_rid_done",
+        "tail_diverged",
+        "duration_ms_max",
+        "sync_failed"
+      ],
+      "type": "object"
+    },
     "ResumeReport": {
       "description": "What a `Resumed` did.",
       "properties": {
@@ -9884,6 +9934,10 @@
           "minimum": 0,
           "type": "integer"
         },
+        "reship": {
+          "$ref": "#/$defs/ReshipStatus",
+          "description": "Plan 46 M1.2 step 5 (c3-spec §4.2): the takeover's re-ship of the\npredecessor's sealed tail."
+        },
         "s3": {
           "$ref": "#/$defs/S3RequestStatus",
           "description": "Object-store requests this daemon has issued since it started\n(every filesystem it serves), by kind and by key area."
@@ -9944,6 +9998,7 @@
         "epoch",
         "reintegration",
         "speculation",
+        "reship",
         "held",
         "session",
         "cto",

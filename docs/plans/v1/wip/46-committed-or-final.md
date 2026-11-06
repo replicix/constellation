@@ -823,6 +823,12 @@ commit configurations; if step 5 needs them, `BackupTx` has to carry the predece
 event. Nothing reads the adopted-tail rows' versions as commit configurations. The two seeds left open then closed in the triage and the fix round: `long-backup+commit` seed 1421 (an inbox poll was journaled while a release was in flight: product bug,
 fixed) and `long-delegated-backup+commit` seed 634 (a row-version oracle error, fixed); the delegate-side stamping gap behind the latter was the oracle's.
 
+*M1.2 step 5 follow-up (2026-11-06; C3 §10, `Meta::reship_at_takeover`):* the writer-lock hold over a takeover's tail is unbounded
+(about 28 us per row: over 1 s past about 35,000 unshipped rows, under a long S3 stall that lets the holder's unshipped journal grow).
+Proposal, not built: cap the holder's unshipped rows (about 20,000) with back-pressure on the fast path. Until then the hold is reported per
+takeover as `status.reship.duration_ms_max` (the longest one since start), next to `reship.tail_diverged` (a closed gate that needs an
+operator) and `reship.tail_rid_done` (must stay 0).
+
 *M1.1 step 6 superseded (maintainer, 2026-11-06):* the lead's removal as a commit input and the lone delegate as a recorded stream configuration are
 dropped from M1.1; **M1.2 step 13 closes them** (the lone delegate and its lead stay until then, and `long-delegated-lead`, `-lead-off`,
 `-hysteresis-off` and the `LoneLead` oracle with them). M1.1 exits after step 7.

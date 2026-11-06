@@ -40,6 +40,10 @@ pub(crate) const READOPT_REASON: &str = "readopt-for-forward";
 /// for its caller's own timeout instead.
 const BARRIER_ROUNDS: u32 = 3;
 
+/// How often the ERROR of a diverged sealed tail repeats while the takeover
+/// gate stays closed (`Core::reship_failed`).
+const TAIL_DIVERGED_LOG_EVERY_MS: i64 = 60_000;
+
 /// A `Control::Barrier` waiting for this node's journal to ship through
 /// `upto`, the journal's tip when it was admitted.
 ///
@@ -1303,7 +1307,7 @@ impl Core {
     /// which fetches the tail from the sealer or a member copy) or abandons
     /// the group (the explicit decision to give up what no one else
     /// re-ships, plan 43 C1-4). Integrity over availability.
-    fn reship_failed(&mut self, e: constellation_meta::MetaError) -> GateStep {
+    fn reship_failed(&mut self, now: Now, e: constellation_meta::MetaError) -> GateStep {
         if let constellation_meta::MetaError::TailDiverged {
             prev,
             first,
@@ -1312,14 +1316,29 @@ impl Core {
         } = &e
         {
             self.stats.tail_diverged += 1;
-            tracing::error!(
-                node = self.cfg.node_id,
-                prev,
-                first,
-                last,
-                why,
-                "the predecessor's sealed tail does not apply: the takeover gate stays closed and changes nothing (operator: stop this node so another claimant takes over, or abandon the group)"
-            );
+            // Every round of the closed gate fails the same way: the ERROR
+            // is logged the first time and then once a minute, with the
+            // passes it stood for (`status.reship.tail_diverged` counts
+            // them all).
+            let due = match self.bk.tail_diverged_logged {
+                None => Some(0),
+                Some((at, n)) if now.wait.since(at) >= TAIL_DIVERGED_LOG_EVERY_MS => Some(n),
+                Some(_) => None,
+            };
+            if let Some(repeats) = due {
+                self.bk.tail_diverged_logged = Some((now.wait, 0));
+                tracing::error!(
+                    node = self.cfg.node_id,
+                    prev,
+                    first,
+                    last,
+                    why,
+                    repeats,
+                    "the predecessor's sealed tail does not apply: the takeover gate stays closed and changes nothing (operator: stop this node so another claimant takes over, or abandon the group)"
+                );
+            } else if let Some((_, n)) = self.bk.tail_diverged_logged.as_mut() {
+                *n += 1;
+            }
         }
         GateStep::Failed(e.to_string())
     }
@@ -1447,6 +1466,7 @@ impl Core {
                 tail_args,
             ) {
                 Ok(report) => {
+                    self.bk.tail_diverged_logged = None;
                     let stranded = report.stranded;
                     if let Some(args) = tail_args {
                         self.tail_reshipped(args, &report, replica);
@@ -1484,7 +1504,7 @@ impl Core {
                         }
                     }
                 }
-                Err(e) => return self.reship_failed(e),
+                Err(e) => return self.reship_failed(now, e),
             }
         }
         // Plan 30 §M9: what this node held as the predecessor's backup
@@ -1495,7 +1515,7 @@ impl Core {
         if let (Some(args), false) = (tail_args, reshipped) {
             match replica.reship_at_takeover(None, Some(args)) {
                 Ok(report) => self.tail_reshipped(args, &report, replica),
-                Err(e) => return self.reship_failed(e),
+                Err(e) => return self.reship_failed(now, e),
             }
         }
         if let Some(tail) = tail_rows {

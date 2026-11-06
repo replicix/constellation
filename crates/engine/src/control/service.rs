@@ -337,6 +337,14 @@ impl EngineControl {
                 },
                 speculation.2,
             ),
+            reship: api::ReshipStatus {
+                superseded: stats.committed_superseded,
+                tail_applied: stats.backup_tail_applied,
+                tail_rid_done: stats.tail_done_skipped,
+                tail_diverged: stats.tail_diverged,
+                duration_ms_max: stats.reship_duration_ms_max,
+                sync_failed: stats.reship_sync_failed,
+            },
             speculation: {
                 let counts = self.meta.speculation_counts().unwrap_or_default();
                 api::SpeculationStatus {

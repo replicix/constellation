@@ -627,6 +627,28 @@ impl StrandedOp {
     }
 }
 
+/// The sync after [`Meta::reship_at_takeover`]'s commit (a test can fail it).
+fn reship_sync(meta: &Meta) -> Result<(), MetaError> {
+    #[cfg(any(test, feature = "test-util"))]
+    if FAIL_RESHIP_SYNC.with(|c| c.replace(false)) {
+        return Err(MetaError::Io(std::io::Error::other(
+            "injected re-ship sync fault (testing only)",
+        )));
+    }
+    meta.sync()
+}
+
+#[cfg(any(test, feature = "test-util"))]
+thread_local! {
+    static FAIL_RESHIP_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test hook: the next sync after a re-ship's commit on this thread fails.
+#[cfg(any(test, feature = "test-util"))]
+pub fn fail_next_reship_sync_on_this_thread_for_tests() {
+    FAIL_RESHIP_SYNC.with(|c| c.set(true));
+}
+
 /// The strand half of [`Meta::reship_at_takeover`] (see
 /// [`Meta::strand_for_takeover_carrying`] for each field).
 #[derive(Clone, Copy, Debug)]
@@ -665,6 +687,14 @@ pub struct ReshipReport {
     pub tail_done: usize,
     /// Rows kept as a member copy of the tail's epoch.
     pub tail_moved: usize,
+    /// How long the store's writer lock was held (the transaction's open
+    /// to its commit), in milliseconds: the takeover's stall of every
+    /// other writer (c3-spec `reship.duration_ms_max`).
+    pub hold_ms: u64,
+    /// The commit stood, but the `fsync` that follows it (the member
+    /// copy's) failed: logged here, counted by the caller. The rows are in
+    /// the store; only a power loss before the next sync could drop them.
+    pub sync_failed: bool,
 }
 
 #[derive(Default)]
@@ -5707,6 +5737,7 @@ impl Meta {
             })
             .then(|| self.deleg_gate.write().unwrap_or_else(|e| e.into_inner()));
         let mut tx = self.db.write_tx();
+        let held_since = std::time::Instant::now();
         let staged = UsageTracker::staging();
         let mut report = ReshipReport::default();
         let mut part = StrandPart::default();
@@ -5753,6 +5784,14 @@ impl Meta {
                     _ => false,
                 };
                 if done {
+                    tracing::warn!(
+                        epoch = t.epoch,
+                        first = bt.first,
+                        last = bt.last,
+                        origin = ?bt.origin,
+                        rid = ?rid.or(refused),
+                        "a row of the sealed tail already has an outcome here; not re-shipped"
+                    );
                     report.tail_done += 1;
                     continue;
                 }
@@ -5819,6 +5858,7 @@ impl Meta {
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;
+        report.hold_ms = u64::try_from(held_since.elapsed().as_millis()).unwrap_or(u64::MAX);
         for (gen, cut) in part.orphan_cuts {
             tracing::info!(
                 gen = %crate::delegation::GenLabel::of(gen),
@@ -5845,7 +5885,21 @@ impl Meta {
             }
             if report.tail_moved > 0 {
                 self.note_member_copies(true);
-                self.sync()?;
+                // The transaction has committed (it reached the OS, as every
+                // commit does: a process crash loses nothing); this `fsync`
+                // only closes the power-loss window of the member copy. Its
+                // failure must not turn the call into an `Err`: `Err` means
+                // nothing changed, the caller would retry over a cleared
+                // tail and skip its bookkeeping (the strand's rollback
+                // accounting, the stats). It is reported in the result and
+                // the next sync (any other safety write's) covers the rows.
+                if let Err(e) = reship_sync(self) {
+                    tracing::warn!(
+                        error = %e,
+                        "the re-ship committed but the sync that follows it failed; the next sync covers it"
+                    );
+                    report.sync_failed = true;
+                }
             }
         }
         Ok(report)

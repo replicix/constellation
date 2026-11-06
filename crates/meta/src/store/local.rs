@@ -1992,6 +1992,20 @@ impl Meta {
                 // (c3-spec V1); the caller drops the whole transaction.
                 let mut applied = Vec::with_capacity(records.len());
                 for rec in records {
+                    // `apply_one` takes a durable create of a present inode
+                    // for the record applied again and returns `Done`; the
+                    // tail's rows whose rid is done here were skipped
+                    // before this point, so here it is a divergence.
+                    if crate::replay::creates_existing_ino(tx, self, rec)? {
+                        let mut shown = format!("{rec:?}");
+                        shown.truncate(240);
+                        return Err(MetaError::TailDiverged {
+                            prev: 0,
+                            first: 0,
+                            last: 0,
+                            why: format!("the inode it creates already exists: {shown}"),
+                        });
+                    }
                     if let Some(why) = crate::replay::apply_record(tx, self, cx, rec, &staged)? {
                         let mut shown = format!("{rec:?}");
                         shown.truncate(240);

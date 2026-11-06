@@ -900,6 +900,10 @@ pub(crate) struct BackupState {
         )>,
     )>,
     pub(crate) member_epochs: Vec<Epoch>,
+    /// Plan 46 M1.2 step 5: when the ERROR of a diverged tail was last
+    /// logged and how many passes it has stood for since (it repeats every
+    /// round of the closed gate, `Core::reship_failed`).
+    pub(crate) tail_diverged_logged: Option<(WaitMs, u64)>,
 }
 
 /// The most own lapses remembered (older ones than
@@ -5867,6 +5871,13 @@ impl Core {
     ) {
         self.stats.tail_beyond_gap_dropped += report.tail_beyond_gap as u64;
         self.stats.tail_done_skipped += report.tail_done as u64;
+        self.stats.reship_sync_failed += u64::from(report.sync_failed);
+        self.stats.reship_duration_ms_max = self.stats.reship_duration_ms_max.max(report.hold_ms);
+        // A row of the tail whose rid the log already carried (the holder's
+        // upload landed while its backup still listed the row: `backup-crash`
+        // seed 1004) is skipped, never re-journaled; counted (`reship.
+        // tail_rid_done`), logged by the store, and failed by the sim under
+        // strict identity.
         tracing::info!(
             node = self.cfg.node_id,
             prev_epoch = args.epoch,

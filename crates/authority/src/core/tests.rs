@@ -53006,6 +53006,12 @@ mod c1_member_copy {
             );
             assert!(h.core.lease.gate.is_some(), "the gate stays closed");
             assert_eq!(h.core.stats.tail_diverged, pass);
+            // The ERROR is logged once, the repeats of the same minute are
+            // counted, not logged.
+            assert_eq!(
+                h.core.bk.tail_diverged_logged.map(|(_, n)| n),
+                Some(pass - 1)
+            );
             assert!(h.meta.lookup(ROOT_INO, "a").unwrap().is_none());
             assert_eq!(
                 crate::Replica::backup_tail(&h.meta, 1).map(|t| t.len()),
@@ -53013,6 +53019,55 @@ mod c1_member_copy {
                 "the tail is still held"
             );
         }
+    }
+
+    /// The re-ship committed but the sync after it failed: the gate still
+    /// takes the committed result (`Err` means nothing changed, and the
+    /// tail is gone: a retry would skip the bookkeeping): the takeover is
+    /// counted, the failure is counted, the tail is cleared and applied.
+    /// Fails on the parent: the failed sync returned `Err`, the gate
+    /// reported `Failed` over a committed re-ship.
+    #[test]
+    fn a_failed_sync_after_the_reship_commit_keeps_the_committed_result() {
+        let holder = Harness::new(1);
+        holder.meta.set_holder_epoch(1);
+        let rid = Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 1,
+        };
+        constellation_meta::execute_mutate(&holder.meta, &holder.create("a"), Some(rid)).unwrap();
+        let txs = holder.meta.journal_txs_from(1, 1000).unwrap();
+        let mut h = Harness::new(2);
+        assert!(crate::Replica::backup_append(&h.meta, 1, &txs));
+        h.core.bk.tail_through = txs.last().unwrap().last;
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: true,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: false,
+            }),
+        );
+        constellation_meta::fail_next_reship_sync_on_this_thread_for_tests();
+        let mut out = Vec::new();
+        let step = h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert!(
+            !matches!(step, super::jobs::GateStep::Failed(_)),
+            "the committed re-ship must not read as a failure"
+        );
+        assert_eq!(h.core.stats.reship_sync_failed, 1);
+        assert_eq!(h.core.stats.backup_takeovers, 1, "the bookkeeping ran");
+        assert_eq!(h.core.stats.backup_tail_applied, 1);
+        assert!(h.meta.lookup(ROOT_INO, "a").unwrap().is_some());
+        assert_eq!(
+            crate::Replica::backup_tail(&h.meta, 1).map(|t| t.len()),
+            Some(0)
+        );
     }
 
     /// The identity is transitive: a tail whose transactions carry one

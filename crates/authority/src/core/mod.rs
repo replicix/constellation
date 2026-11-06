@@ -1717,6 +1717,11 @@ pub struct Stats {
     /// Plan 46 M1.2 step 5: tail transactions whose rid already had an
     /// outcome here (the log carried them), not re-shipped.
     pub tail_done_skipped: u64,
+    /// Plan 46 M1.2 step 5: the longest the store's writer lock was held by
+    /// one takeover's re-ship (ms; c3-spec `reship.duration_ms_max`).
+    pub reship_duration_ms_max: u64,
+    /// The sync after a re-ship's commit failed (the re-ship stood).
+    pub reship_sync_failed: u64,
     pub inherited_tails_cleared: u64,
     pub ttl_claims_without_tail: u64,
     /// Plan 43 C1-2: journal rows the core wrote without setting their

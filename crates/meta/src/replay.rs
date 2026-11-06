@@ -572,6 +572,23 @@ pub(crate) fn apply_batch_tx(
     Ok((skipped, applied))
 }
 
+/// Whether `rec` creates an inode this replica already holds: the tolerant
+/// apply takes that for the same record applied again and does nothing
+/// (`apply_one`), which a strict re-ship must not (plan 46 M1.2 step 5: an
+/// inode is created once, so a tail row that creates a present one is a
+/// diverged premise; a row already applied here is told by its rid, which
+/// the caller has checked).
+pub(crate) fn creates_existing_ino(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    rec: &LogRecord,
+) -> Result<bool, MetaError> {
+    match primary_ino(rec) {
+        Some(ino) => Ok(ns::get_inode_record(tx, &meta.ns, ino)?.is_some()),
+        None => Ok(false),
+    }
+}
+
 fn primary_ino(rec: &LogRecord) -> Option<Ino> {
     match rec {
         LogRecord::Mkdir { ino, .. }

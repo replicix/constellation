@@ -5591,6 +5591,19 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 stats.tail_diverged, report.stats
             ));
         }
+        // A row of the tail whose rid the log had already carried is skipped,
+        // not re-shipped (`tail_rid_done`, c3-spec §4.3): under strict
+        // identity or verbatim the seed fails. It is a benign overlap, not a
+        // divergence (the row's effect is in the log; seen on the step's
+        // parent too, `backup-crash` seed 1004: the log held the row while
+        // the backup still listed it), so `strict_commit` alone does not
+        // fail on it.
+        if stats.tail_done_skipped > 0 && (cfg.strict_identity || cfg.strict_verbatim) {
+            return Err(format!(
+                "node {id}: {} row(s) of the sealed tail were skipped for an outcome already here\n  stats: {:#?}",
+                stats.tail_done_skipped, report.stats
+            ));
+        }
     }
     // The causal cut: a refusal for lacking deps at the current root (see
     // `Oracles::note_deps_refused`; a deposed root's refusal is no

@@ -156,6 +156,81 @@ fn a_diverging_tail_applies_nothing() {
     assert!(meta.member_copy(EPOCH_PREV).unwrap().is_none());
 }
 
+/// Strict under the tail: a durable create of an inode this replica already
+/// holds is not "the same record applied again" (the tolerant apply's
+/// reading, a silent `Done`) but a divergence: the rid is not done here, so
+/// the row is not one already re-shipped. Nothing changes. (Before: the
+/// create was swallowed and the tail applied.)
+#[test]
+fn a_create_of_an_existing_inode_diverges() {
+    let meta = Meta::open_in_memory().unwrap();
+    execute_mutate(
+        &meta,
+        &MutateOp::Create {
+            parent: ROOT_INO,
+            name: "x".into(),
+            ino: ino(7),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+        Some(rid(9, 1)),
+    )
+    .unwrap();
+    let before = raw_ns(&meta);
+    let journal = meta.journal_len().unwrap();
+    let bad = tx(
+        1,
+        2,
+        vec![
+            create(ROOT_INO, "y", ino(7)),
+            LogRecord::Completed { rid: rid(2, 1) },
+        ],
+    );
+    let err = reship(&meta, std::slice::from_ref(&bad)).unwrap_err();
+    assert!(
+        matches!(err, constellation_meta::MetaError::TailDiverged { .. }),
+        "{err}"
+    );
+    assert_eq!(raw_ns(&meta), before);
+    assert_eq!(meta.journal_len().unwrap(), journal);
+    assert_eq!(meta.backup_tail(EPOCH_PREV).unwrap(), vec![bad]);
+}
+
+/// The one way a row of the tail may already be here is its rid done (the
+/// log carried it): it is skipped and counted (`tail_done`, which the core
+/// exports as `reship.tail_rid_done` and the sim fails a seed for), not
+/// re-created and not a divergence.
+#[test]
+fn a_row_whose_rid_is_done_is_skipped_and_counted() {
+    let meta = Meta::open_in_memory().unwrap();
+    execute_mutate(
+        &meta,
+        &MutateOp::Create {
+            parent: ROOT_INO,
+            name: "x".into(),
+            ino: ino(7),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+        Some(rid(2, 1)),
+    )
+    .unwrap();
+    let journal = meta.journal_len().unwrap();
+    let same = tx(
+        1,
+        2,
+        vec![
+            create(ROOT_INO, "x", ino(7)),
+            LogRecord::Completed { rid: rid(2, 1) },
+        ],
+    );
+    let report = reship(&meta, &[same]).unwrap();
+    assert_eq!((report.tail_done, report.tail_applied), (1, 0));
+    assert_eq!(meta.journal_len().unwrap(), journal);
+}
+
 /// This node's own unshipped row of the old tenure, journaled as the holder
 /// of epoch 1 (an ungated row: the strand rolls it back and queues its
 /// replay).

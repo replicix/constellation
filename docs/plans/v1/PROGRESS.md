@@ -67741,3 +67741,31 @@ of the concurrent writer equals the hold (272 to 274 ms at 10,000 rows). Under t
 13 ignored. **Pre-existing, not this step:** 17 tests fail in debug on main already (meta: lib 1 and two integration binaries with 6 and 4; authority lib 6;
 the same sets on main and on the branch): the step 4 fix round's `debug_assert!` in `apply_delegate_tx` fires for hand-built delegate
 rows without a `Completed`. Same sets on main and branch; the release builds do not assert. To fix in a follow-up (add the `Completed` to those fixtures).
+
+### Plan 46 M1.2 step 5, fix round (2026-11-06): the re-ship's post-commit sync, the operator signal, a strict tail
+
+From the step's review (land after items 1 to 3; item 4 is a note).
+
+1. **A sync failure after the commit is not an `Err`.** `Meta::reship_at_takeover` returned the `fsync` of the member copy's error after
+   its transaction had committed, which broke "`Err` means nothing changed": the next pass saw an empty tail and skipped the strand's rollback
+   accounting and the stats. The commit reached the OS like every commit (a process crash loses nothing); the `fsync` only closes the power-loss
+   window of the member copy, and the next safety write's sync covers the rows. So the call returns `Ok` with `ReshipReport::sync_failed`
+   (WARN in the store, `reship.sync_failed` in status); syncing before reporting would leave the same window (the commit is already visible), so
+   it was not chosen. Test: `a_failed_sync_after_the_reship_commit_keeps_the_committed_result` (a test hook fails the sync; the gate takes the
+   result and runs its bookkeeping: `backup_takeovers`, `backup_tail_applied`, the tail cleared).
+2. **Operator signal for `TailDiverged`.** `status.reship.{superseded, tail_applied, tail_rid_done, tail_diverged, duration_ms_max, sync_failed}`
+   (c3-spec §4.2; `ReshipStatus`, schema re-blessed, no version bump); `duration_ms_max` is the longest writer-lock hold of one re-ship
+   (`ReshipReport::hold_ms`). The per-round ERROR is logged the first time and then once a minute with the passes it stood for (`repeats`); the
+   counter counts every pass. Tests: the diverging-tail core test checks the repeat count, the control postcard test the new fields.
+3. **Strict under `Journaled::Tail`.** (a) A durable create of an inode the replica already holds was a silent `Done` in `apply_one` (the tolerant
+   apply's "the same record again"); in the tail it is `TailDiverged` (`creates_existing_ino`): a row already applied here is told by its rid, which
+   the transaction-level skip checks first, so what reaches the record is a different row. Tests: `a_create_of_an_existing_inode_diverges`,
+   `a_row_whose_rid_is_done_is_skipped_and_counted`. (b) The rid-done skip is counted (`reship.tail_rid_done`), logged (WARN with the rid) and the sim
+   fails a seed with it under `strict_identity` or `strict_verbatim` (c3-spec §4.3). **Finding:** the skip is not rare: under `+commit` 27 of
+   6,000 seeds show it (`backup-crash` 517, 958, 1004, 1429; `delegated-holder-cut` and `long-backup` the others), and the parent shows it on the
+   same seed (`held=1 applied=0`): the row's rid is completed here before the re-ship (the log carried it while the backup still listed it).
+   The effect is in the log, the oracles are green; it is a benign overlap, not a divergence, so the sim does not fail `strict_commit` on it and
+   the core has no `debug_assert!` for it (it would fire on those seeds in debug). Whether to close the overlap (trim the backup's listing before
+   the claim reads it) or accept it is for the plan's owner.
+4. **Follow-up, not built** (plan 46 M1.2 notes): the writer-lock hold over a takeover's tail is unbounded; proposal: cap the holder's unshipped
+   rows (about 20,000) with back-pressure on the fast path; the hold is reported per takeover as `reship.duration_ms_max`.

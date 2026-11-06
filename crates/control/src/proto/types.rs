@@ -603,6 +603,9 @@ pub struct StatusReport {
     pub reintegration: ReintegrationStatus,
     /// Plan 30 §M3a speculation log and stranded-op recovery.
     pub speculation: SpeculationStatus,
+    /// Plan 46 M1.2 step 5 (c3-spec §4.2): the takeover's re-ship of the
+    /// predecessor's sealed tail.
+    pub reship: ReshipStatus,
     /// Plan 30 §M4: journal records held back behind unrecoverable
     /// pending chunks (everything else keeps shipping).
     pub held: HeldStatus,
@@ -1540,6 +1543,31 @@ pub struct ReintegrationStatus {
     pub stranded_records: u64,
     pub conflicts_materialized: u64,
     pub in_progress: bool,
+}
+
+/// Plan 46 M1.2 step 5 (c3-spec D3, §4.2): the takeover's re-ship of the
+/// predecessor's sealed tail, one store transaction with the strand, since
+/// start.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ReshipStatus {
+    /// Committed requester/subscriber entries the re-applied tail
+    /// superseded.
+    pub superseded: u64,
+    /// Tail transactions journaled verbatim.
+    pub tail_applied: u64,
+    /// Tail transactions skipped because their rid already had an outcome
+    /// here. Must stay 0.
+    pub tail_rid_done: u64,
+    /// Passes of a takeover gate held closed by a tail that does not apply
+    /// (`TailDiverged`). Must stay 0; non-zero: the node holds the lease
+    /// with its gate closed until an operator stops it (another claimant
+    /// then fetches the tail) or abandons the group.
+    pub tail_diverged: u64,
+    /// The longest one takeover's re-ship held the store's writer lock
+    /// (ms).
+    pub duration_ms_max: u64,
+    /// The sync after a re-ship's commit failed (the re-ship stood).
+    pub sync_failed: u64,
 }
 
 /// Plan 30 §M3a: this node's speculation log (`constellation_meta::
@@ -4471,6 +4499,8 @@ mod tests {
             ..Default::default()
         };
         report.spool.head_seq = 4;
+        report.reship.tail_diverged = 3;
+        report.reship.duration_ms_max = 280;
         report.p2p.peers.push(PeerStatus {
             node_id: 3,
             coop: Some(SourceStatus {
@@ -4483,6 +4513,10 @@ mod tests {
         let back: StatusReport = blob.decode().unwrap();
         assert_eq!(back.fs_uuid, "u");
         assert_eq!(back.spool.head_seq, 4);
+        assert_eq!(
+            (back.reship.tail_diverged, back.reship.duration_ms_max),
+            (3, 280)
+        );
         let peer = &back.p2p.peers[0];
         assert_eq!(peer.node_id, 3);
         assert_eq!(peer.coop.as_ref().unwrap().id, "s3");
