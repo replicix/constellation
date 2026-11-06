@@ -35186,6 +35186,66 @@ fn an_inbox_poll_is_one_get_until_it_hits() {
     assert_eq!((from, width), (1, full));
 }
 
+/// Plan 46 M1.1 step 5 triage (long-backup seed 1421): a poll that lands
+/// while the lease is being released (a handoff's CAS in flight, the journal
+/// drained) journals nothing, not even the acknowledgement of an op the node
+/// answered already: released, the row was left unshipped, a root row of a
+/// tenure that ended with no tail, and stayed a member copy for ever. The
+/// batch is left in the inbox for the next holder.
+#[test]
+fn an_inbox_poll_landing_in_a_release_journals_nothing() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    h.core.note_demand(h.clk(), 2, true);
+    h.step(Event::Peers {
+        links: vec![crate::event::PeerLink {
+            node: 2,
+            connected: false,
+            last_seen: None,
+            rtt_ms: None,
+            since: None,
+        }],
+        lapses: 0,
+    });
+    let poll = |out: &[Action]| {
+        s3_ops(out).into_iter().find_map(|(op, r)| match r {
+            S3Op::InboxRun { node: 2, .. } => Some(op),
+            _ => None,
+        })
+    };
+    let mut out = Vec::new();
+    h.core.inbox_holder_tick(h.clk(), &h.meta, &mut out);
+    let op = poll(&out).expect("polled at once");
+    let a = h.create("a");
+    let mut out = h.step(Event::S3 {
+        op,
+        result: S3Result::InboxRun(Ok(vec![inbox_batch(2, 0, 1, &a)])),
+    });
+    assert!(h.meta.child_ino(ROOT_INO, "a").unwrap().is_some());
+    if poll(&out).is_none() {
+        h.core.inbox_holder_tick(h.clk(), &h.meta, &mut out);
+    }
+    let op = poll(&out).expect("polled again after the hit");
+    // The journal drained and the release CAS went out; the poll lands
+    // before it does, carrying a re-submission of the op already answered.
+    h.core.lease.releasing = true;
+    let before = Replica::journal_len(&h.meta).unwrap();
+    let deduped = h.core.stats.inbox_deduped_ops;
+    h.step(Event::S3 {
+        op,
+        result: S3Result::InboxRun(Ok(vec![inbox_batch(2, 1, 1, &a)])),
+    });
+    assert_eq!(
+        Replica::journal_len(&h.meta).unwrap(),
+        before,
+        "nothing journaled while the lease is being released"
+    );
+    assert_eq!(
+        h.core.stats.inbox_deduped_ops, deduped,
+        "the batch is left for the next holder"
+    );
+}
+
 /// Answer the requester's inbox numbering and batch PUTs in `out` until
 /// nothing more is asked; every PUT's batch, in order.
 fn land_inbox_puts(

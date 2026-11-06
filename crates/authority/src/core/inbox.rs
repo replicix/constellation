@@ -1472,6 +1472,17 @@ impl Core {
                 self.stats.inbox_deduped_ops += 1;
                 continue;
             }
+            // Admitted before anything is journaled, the acknowledgement of
+            // a duplicate below included: a poll that landed while the lease
+            // was being released (a handoff's CAS in flight, the journal
+            // drained) journaled that ack after the drain, and the release
+            // left it behind unshipped: a `Group{Root}` row of a tenure that
+            // ended with no tail, kept as a member copy for ever
+            // (long-backup seed 1421). The batch stays in the inbox for the
+            // next holder's drain.
+            if admitted && self.lease.new_mutation_epoch(now, &self.cfg).is_none() {
+                return Err(Halt::Fenced);
+            }
             // Then the rid: executed or refused already (this tenure's
             // `recent` or journal, or the log), by any path.
             if replica.recent_outcome(rid).is_some() || replica.completed_outcome(rid)?.is_some() {
@@ -1485,9 +1496,6 @@ impl Core {
                 completed = ?replica.completed_outcome(rid),
                 "inbox: executing a batch op"
             );
-            if admitted && self.lease.new_mutation_epoch(now, &self.cfg).is_none() {
-                return Err(Halt::Fenced);
-            }
             let decoded = MutateOp::from_postcard(&op.op);
             // Plan 30 §M8: recall before executing (see `Halt::Recall`).
             let touched = decoded
