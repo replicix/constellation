@@ -1598,6 +1598,19 @@ impl RowVersions {
     ) {
         let from = self.judged_to.get(&node).copied().unwrap_or(0);
         let lease_prev = self.lease_seen.get(&node).copied();
+        // The group versions the node had applied at its previous event,
+        // read once for the whole call: a generation's first row seeds its
+        // entry below with the version applied *now*, which is no previous
+        // event's for the rows of the same event after it (two rows of a new
+        // generation journaled before its first `DelegGroup` record was
+        // installed in that event: the second was judged against the record,
+        // long-delegated-backup seed 634).
+        let group_before: BTreeMap<u64, u64> = self
+            .group_seen
+            .iter()
+            .filter(|((n, _), _)| *n == node)
+            .map(|((_, g), v)| (*g, *v))
+            .collect();
         for row in rows.iter().filter(|r| r.first > from) {
             let (seq, epoch, gen, idx, class) = (row.first, row.epoch, row.gen, row.idx, row.class);
             self.judged_to.insert(node, seq);
@@ -1617,7 +1630,7 @@ impl RowVersions {
             } else {
                 v == lease_now || Some(v) == lease_prev
             };
-            let group_prev = self.group_seen.get(&(node, gen)).copied().unwrap_or(0);
+            let group_prev = group_before.get(&gen).copied().unwrap_or(0);
             // The version the node's replica had applied at the row's journal
             // position (`Meta::deleg_group_at`), exactly: a stamp one record
             // behind is caught even when the record was applied in the same
@@ -3445,6 +3458,36 @@ mod tests {
         assert!(rv.violations[0].contains("seq 7"), "{:?}", rv.violations);
         rv.judge(1, &[row(9, 2)], 0, &|_| 2, &|_| 2, &at);
         assert_eq!(rv.violations.len(), 1, "{:?}", rv.violations);
+        assert_eq!(rv.violations.len(), 1, "{:?}", rv.violations);
+    }
+
+    /// Plan 46 M1.1 step 5 triage (long-delegated-backup seed 634): two rows
+    /// of a generation new to the oracle, journaled in one event before the
+    /// generation's first `DelegGroup` record was installed (later in that
+    /// event: no recorded version at or below their position), both carry
+    /// version 0. The first row seeds the generation's "previous event"
+    /// entry with the version applied by the end of the event; the second
+    /// is judged against the same previous event as the first, not that.
+    #[test]
+    fn rows_of_a_new_generation_in_one_event_share_its_previous_event() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let mut rv = RowVersions::default();
+        let row = |first, idx| constellation_meta::AuditRow {
+            first,
+            epoch: 0,
+            gen: 7,
+            idx,
+            class: RowCommit::group(0, GroupOn::Delegate),
+        };
+        rv.judge(1, &[row(17, 1), row(18, 2)], 0, &|_| 1, &|_| 1, &|_, _| {
+            None
+        });
+        assert!(rv.violations.is_empty(), "{:?}", rv.violations);
+        // The record is in force from the next event on: a row stamped 0
+        // two events later is one behind.
+        rv.tick(1, 0, &|_| 1);
+        rv.tick(1, 0, &|_| 1);
+        rv.judge(1, &[row(19, 3)], 0, &|_| 1, &|_| 1, &|_, _| None);
         assert_eq!(rv.violations.len(), 1, "{:?}", rv.violations);
     }
 
