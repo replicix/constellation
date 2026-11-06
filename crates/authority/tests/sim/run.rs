@@ -1260,6 +1260,8 @@ pub struct Report {
     /// (`row_version_matches_config`), and how many rows were judged.
     pub row_version_mismatch: usize,
     pub row_versions_checked: usize,
+    /// Re-tags the row-version oracle judged (a row seen under another rule).
+    pub row_versions_retags: usize,
     pub acks_unsourced: usize,
     pub unjournaled_landed: usize,
     /// Answers with no recorded request (must be 0).
@@ -5891,6 +5893,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.class_claim_mismatch = found.class_claim.len();
     report.row_version_mismatch = found.row_version.len();
     report.row_versions_checked = oracles.row_versions.lock().unwrap().checked;
+    report.row_versions_retags = oracles.row_versions.lock().unwrap().retags;
     report.unjournaled_landed = found.unjournaled_landed.len();
     report.acks_unsourced = oracles
         .acks_unsourced

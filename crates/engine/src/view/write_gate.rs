@@ -11,6 +11,9 @@ use super::*;
 pub(super) struct AckTarget {
     pub(super) first: u64,
     pub(super) last: u64,
+    /// The configuration version the row was journaled in (`None`: no row
+    /// of its own, or a `Final` one).
+    pub(super) version: Option<u64>,
 }
 
 /// A cheap, non-cryptographic random value in `[0, 1)`, fresh per call.
@@ -729,18 +732,36 @@ impl View {
             // Plan 43 C1-2 (D4): the gate went off with the lease still this
             // node's, and the node is lone or holds an epoch (plan 43 C2,
             // §5.4): the answer is a lone node's, so the row is re-tagged
-            // `Lone` before it is given — what a deposition does with it
-            // must match what the client was told. A re-tag that fails
+            // `Singleton` before it is given — what a deposition does with it
+            // must match what the client was told. The store keeps the
+            // version the row was journaled in (plan 46 M1.1 review: never
+            // the placeholder 0; the sim oracle judges the re-tag). A re-tag
+            // that fails
             // leaves the row gated-class: no answer is given on it.
             constellation_meta::DurableWait::Ungated => {
-                let changed = self
-                    .meta
-                    .reclass_journal_tx(target.first, constellation_meta::RowCommit::LONE)
-                    .inspect_err(|error| {
-                        tracing::warn!(%error, first = target.first, "could not re-tag a row answered with the gate off: EIO");
-                    })?;
-                if changed {
-                    session.count_fast_ack_downgraded();
+                // Plan 46 M1.1 review (SHOULD-1, ADR-33 step 5): a row of a
+                // configuration a change has replaced is not re-tagged: the
+                // gate is off only once that configuration's own rule has
+                // committed it (`durable_jseq`'s caps), so it is committed,
+                // and its strand follows the group. Only an epoch's hold
+                // (the published rule is `Final`) re-tags it whatever the
+                // version: the answer there rests on this disk alone.
+                let published = session.published_class();
+                let replaced = !published.is_final()
+                    && matches!(
+                        (target.version, published.config_version()),
+                        (Some(row), Some(now)) if row < now
+                    );
+                if !replaced {
+                    let changed = self
+                        .meta
+                        .reclass_journal_tx(target.first, constellation_meta::RowCommit::LONE)
+                        .inspect_err(|error| {
+                            tracing::warn!(%error, first = target.first, "could not re-tag a row answered with the gate off: EIO");
+                        })?;
+                    if changed {
+                        session.count_fast_ack_downgraded();
+                    }
                 }
                 Ok(true)
             }
@@ -780,6 +801,7 @@ impl View {
                 (row.class.gated() || !self.meta.session().durable_lone_ok()).then_some(AckTarget {
                     first: row.first,
                     last: row.last,
+                    version: row.class.config_version(),
                 })
             }
             None => h.lease.ack_gated().then(|| {
@@ -787,6 +809,7 @@ impl View {
                 AckTarget {
                     first: tip,
                     last: tip,
+                    version: None,
                 }
             }),
         }

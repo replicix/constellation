@@ -4967,7 +4967,8 @@ configuration that cannot hold them yet carries
 `SimConfig::strict_commit_exempt`, a reason naming the plan item that closes it
 (a sweep's `+commit` still makes it strict); each exception goes with that item.
 The exceptions on 2026-11-06: `delegated-epoch` and `delegated-designated` (plan 46 M1.4),
-`delegated-core-stall-root-lease6` (M2.3), `long-delegated-lead-off` and
+`delegated-core-stall-root-lease6` (M1.3, the stale-clock re-check rule), `locks-writer-hold-delegated`
+(M1.2 step 15, harness and sim fixes), `long-delegated-lead-off` and
 `-hysteresis-off` (M1.2 step 13), and the configurations that drive the lock lane
 and delegate (`lock_files > 0`; M3.1). `drop-held-chain` and `-backed`
 (M2.2) and `metered-shared` (M1.2 step 16) are not delegated by configuration and stay

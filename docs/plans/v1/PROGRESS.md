@@ -67549,6 +67549,10 @@ version with the configuration's (`row_version_matches_config`). `class-mismatch
 and `SimConfig::strict_commit_exemption()` is `None`. The negative control `AUTHORITY_SIM_PER_ROW_CLASS=1` fails `row_version_matches_config` without `+commit`
 (`the_row_version_oracle_catches_a_per_row_class`); `strict_commit_is_the_default_of_a_delegated_configuration` pins the exceptions.
 
+**Not yet met (M1.1 review, 2026-11-06):** §12's "no per-row class decision site left" holds for the root only. The delegate's rule for its own node's rows still
+decides per row: `deleg_lone`, with `deleg_lone_held`, in `deleg_rule` (`delegate.rs`) makes a row `Singleton` or `Group` from the event's assessment, and stays until
+M1.2 step 13 deletes the lone delegate and its lead.
+
 **Documented exceptions (`strict_commit_exempt`; `+commit` still makes each strict).** Each fails `+commit` identically on main (`11bdd0f0`: same failing seeds, same
 messages); none is new:
 
@@ -67556,7 +67560,7 @@ messages); none is new:
 |---|---|---|
 | `delegated-epoch` | 59 (a shadow installed for an answer not said to be committed) | M1.4 (the hold as a group) |
 | `delegated-designated` | seed 69000 (a frozen epoch's `EROFS` refusal claimed archive-bound, judged singleton), found by the default | M1.4 |
-| `delegated-core-stall-root-lease6` | 19 (`lone/*` answers of a stalled root, rolled back by its successor) | M2.3 (the roster's singleton test, `ack=local` removed) |
+| `delegated-core-stall-root-lease6` | 19 (`lone/*` answers of a stalled root, rolled back by its successor) | M1.3 (the stale-clock re-check rule, moved from M2.3 by the M1.1 review) |
 | `long-delegated-lead-off`, `-hysteresis-off` | 1,403 / 30 (the `LoneLead` oracle, by design: negative controls) | M1.2 step 13 (deleted with them) |
 | every configuration that drives the lock lane (`lock_files > 0`) and delegates: `locks-delegated-writes`, `locks-unlinked-delegated`, `locks-stall-step-delegated(-ahead)`, `locks-writer-hold-delegated(-group, -doubt)`, `locks-unlinked-delegated-dbackup-random` | 8 seeds of the suite's ranges, identical on main under `+commit`: a lapsed grant's `LockLapsed` refusal journals nothing and is claimed archive-bound; a write answered after its grant lapsed meets the archive's `ENOLCK` | M3.1 (C4, the lock lane on the new records) |
 
@@ -68068,3 +68072,39 @@ the tests and the harness (`sticky-suspend-inhibitor`), and reports whether each
 5.19 macros cargo picks by default). `packaging/` ships the logind drop-in (`InhibitDelayMaxSec=30`, justified in the file) and the NetworkManager
 `pre-down` script calling `constellation release --wait`, which does not exist until step 6 (the script no-ops until then). Not yet wired into
 `HostServices::native` (the engine's handler is step 6). Four platform tests; non-Linux builds unchanged.
+
+### Plan 46 M1.1 review fix round (2026-11-06)
+
+The M1.1 review (fable, cb4d8dd5) cleared the milestone with conditions; this round closes SHOULD-1, SHOULD-3 and the nits. SHOULD-2 (Leave-ends-grants not
+built; safety rests on the lone-root cap, `config_committed_jseq`) is re-checked at M1.2 steps 13 and 14, or step 11 lands first.
+
+**SHOULD-1, gated-row re-tags outside the hold.** Confining every re-tag to the epoch hold was tried and is wrong: a row journaled `Archive` while the event's singleton
+test was still unassessed (the lease already says singleton, the first assessment of peers out) that the test then finds lone is answered alone; left `Archive` it is
+a committed row to the deposition (member copy), not a replayed one, and the answered create is lost (`a_lost_renewal_deposes_and_the_round_recovers`,
+`a_barrier_around_a_deposition_waits_for_the_replay_not_the_strand`, `a_local_execution_is_sequenced_and_counted_by_class` fail with 0 replays queued). So the rule is
+the narrower one that ADR-33 step 5 names: a row of a configuration a change **replaced** (its version below the lease's, the published rule's, outside a hold) is answered by
+its own rule once the gate is off (the spans' caps made the closed configuration commit it), and is **not** re-tagged; the row of the configuration in force, answered
+on this disk alone, and any row answered in an epoch's hold, is re-tagged `Singleton`, **in the version it was journaled in** (the store's re-tag already keeps it; the
+`LONE` argument's version 0 applies only to a `Final` row, which no path re-tags in the fast path). The claims of such an answer carry that version (`as_singleton`), no
+longer version 0. Sites: the fast path (`write_gate.rs`, `AckTarget.version`), the parked release (`readindex.rs`, `downgraded`). `backup.rs`'s re-tags are left: the
+`Final` row of a hold answered after it takes the configuration in force (Final has no version), and `as_archive(0)` re-tags a `Singleton` (which has one). The ADR-33 step 5
+text and DESIGN ("Local store") say so.
+
+**Oracle.** `RowVersions` remembers the rule each judged row carried (`judged_class`): a row seen under another rule is a re-tag, and is judged (`retags`; the sweep totals print
+"re-tags judged"): it keeps its version, a `Final` one that gets a rule is judged as a new row. A re-tag moves no tip, so `Meta::reclass_changes()` (test-util) is the cue
+for `note_row_versions` to read the journal again. Unit `a_retag_is_judged_again` (fails before: a judged seq was never looked at again).
+
+**Tests.** Engine `ungated_fast_path_answer_of_a_replaced_configuration_keeps_its_rule` (fails before: re-tagged `Singleton`), `ungated_fast_path_answer_retags_the_row_keeping_its_version`;
+core `a_gated_row_of_a_replaced_configuration_is_not_retagged` (fails before: `Lone`, one downgrade), the existing `a_gated_row_answered_after_the_gate_went_off_is_lone` unchanged
+(same configuration: still re-tagged).
+
+**SHOULD-3, one closing item per exemption.** `HELD_WRITE_ANSWERED_LATE` (`locks-writer-hold-delegated`, the sim answers a held write at the hold's end, after its generation ended):
+**M1.2 step 15 (harness and sim fixes)**. `delegated-core-stall-root-lease6` (a stalled core answers with a stale `now`; the lease6 triage's F1: re-read the clock after the
+journal write, park for the archive if the lease is no longer usable): **M1.3** (it was M2.3), with its `+commit` 0 of 2,000 in M1.3's exit. The exemption reasons, the step 7
+table above, TESTING.md and the plan say the same; `strict_commit_is_the_default_of_a_delegated_configuration` pins each reason's item.
+
+**Nits.** (a) The root fast path stamps the rule the core published at its previous event unchecked (`local.rs`), and the oracle judges a root row by event: kept, and documented
+at both places (the lease has no per-position history to judge by, as a `DelegGroup` has; the event's lag is the fast path's by design); no false-positive-free by-position
+oracle exists without a new store history. (b) `crates/model/src/lib.rs`: the `config_version`-on-rows and singleton-bump gaps are closed (M1.1 steps 3 to 5), "one stream per node"
+is M1.2, Leave-ends-grants stays a product gap. (c) DESIGN "Local store": `GroupOn` is kept until M1.2, not removed in step 7. (d) Step 7's section above states that `deleg_lone`'s
+per-row decision remains until M1.2 step 13, so §12's "no per-row class decision site left" is not yet met.

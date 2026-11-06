@@ -1581,7 +1581,9 @@ fn deleg_group(
 /// change, and the record commits under both), the `DelegGroup` record its
 /// replica has applied. A delegate's group is judged by journal position
 /// (`Meta::deleg_group_at`: the version applied when the row was journaled,
-/// exactly); the lease's version by event (below). The version the node had applied at its previous
+/// exactly); the lease's version by event (below; the lease has no per-position history to judge by,
+/// and the event's lag is exactly the fast path's: it stamps the rule the core published at the
+/// end of its previous event, so a root row's version is the lease's at that event or at this one). The version the node had applied at its previous
 /// event is as good as the one at this event (a published rule the fast path
 /// stamped, a record the store applied after the core's last read, which the
 /// fast path refuses). An older version, one that existed but was
@@ -1605,6 +1607,11 @@ pub struct RowVersions {
     group_top: BTreeMap<u64, u64>,
     /// The highest journal seq judged per node.
     judged_to: BTreeMap<NodeId, u64>,
+    /// The rule each judged row (node, first seq) carried when it was
+    /// judged: a row seen again under another rule was re-tagged.
+    judged_class: BTreeMap<(NodeId, u64), constellation_meta::RowCommit>,
+    /// Re-tags judged (plan 46 M1.1 review, SHOULD-1).
+    pub retags: usize,
     pub checked: usize,
     pub unstamped: usize,
     pub violations: Vec<String>,
@@ -1618,6 +1625,7 @@ impl RowVersions {
     /// `node`'s journal was wiped: its seqs start again.
     pub fn forget(&mut self, node: NodeId) {
         self.judged_to.remove(&node);
+        self.judged_class.retain(|(n, _), _| *n != node);
     }
 
     /// An event of `node` is over: what its core can have read by now is the
@@ -1662,9 +1670,45 @@ impl RowVersions {
             .filter(|((n, _), _)| *n == node)
             .map(|((_, g), v)| (*g, *v))
             .collect();
-        for row in rows.iter().filter(|r| r.first > from) {
+        // A row judged before and carrying another rule now was re-tagged
+        // (`Meta::reclass_journal_tx`): the configuration it was journaled
+        // in does not change with the re-tag, so it keeps its version (never
+        // the placeholder 0); one that had none (`Final`) is judged as a new
+        // row. Never judged again would let a re-tag drop the version
+        // unseen (plan 46 M1.1 review, SHOULD-1).
+        let mut rejudge: Vec<u64> = Vec::new();
+        for row in rows.iter().filter(|r| r.first <= from) {
+            let Some(before) = self.judged_class.get(&(node, row.first)).copied() else {
+                continue;
+            };
+            if before == row.class {
+                continue;
+            }
+            self.retags += 1;
+            self.judged_class.insert((node, row.first), row.class);
+            match (before.config_version(), row.class.config_version()) {
+                (None, _) => rejudge.push(row.first),
+                (Some(was), Some(now)) if was == now => {}
+                (Some(_), None) => {}
+                (Some(was), Some(now)) => self.violations.push(format!(
+                    "row_version_matches_config: node {node} journal seq {} was re-tagged \
+                     {before:?} -> {:?}: a re-tag keeps the row's version ({was}), not {now}",
+                    row.first, row.class
+                )),
+            }
+        }
+        let present: std::collections::BTreeSet<u64> = rows.iter().map(|r| r.first).collect();
+        self.judged_class
+            .retain(|(n, s), _| *n != node || present.contains(s));
+        for row in rows
+            .iter()
+            .filter(|r| r.first > from || rejudge.contains(&r.first))
+        {
             let (seq, epoch, gen, idx, class) = (row.first, row.epoch, row.gen, row.idx, row.class);
-            self.judged_to.insert(node, seq);
+            if seq > from {
+                self.judged_to.insert(node, seq);
+            }
+            self.judged_class.insert((node, seq), class);
             if gen != 0 {
                 let top = self.group_top.entry(gen).or_default();
                 *top = (*top).max(group_max(gen));
@@ -3447,6 +3491,58 @@ mod tests {
         assert_eq!((rv.checked, rv.unstamped), (11, 1));
         rv.judge(1, &rows, 6, &group_now, &|g| group_now(g), &|_, _| None);
         assert_eq!(rv.violations.len(), 5, "judged once");
+    }
+
+    /// Plan 46 M1.1 review (SHOULD-1): a row judged once and seen again
+    /// under another rule was re-tagged, and the re-tag is judged: it keeps
+    /// the version the row was journaled in (a placeholder 0 is a
+    /// violation, the same version under another rule is not), and a
+    /// `Final` row that gets a rule is judged as a new row. Fails on the
+    /// parent: a judged seq was never looked at again.
+    #[test]
+    fn a_retag_is_judged_again() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let mut rv = RowVersions::default();
+        let group_now = |_: u64| 0;
+        rv.tick(1, 6, &group_now);
+        let row = |first, class| constellation_meta::AuditRow {
+            first,
+            epoch: 3,
+            gen: 0,
+            idx: 0,
+            class,
+        };
+        let judge = |rv: &mut RowVersions, rows: &[constellation_meta::AuditRow]| {
+            rv.judge(1, rows, 6, &group_now, &|g| group_now(g), &|_, _| None)
+        };
+        let journaled = vec![
+            row(1, RowCommit::group(6, GroupOn::Root)),
+            row(2, RowCommit::group(6, GroupOn::Root)),
+            row(3, RowCommit::Final),
+            row(4, RowCommit::Final),
+        ];
+        judge(&mut rv, &journaled);
+        assert!(rv.violations.is_empty(), "{:?}", rv.violations);
+        let retagged = vec![
+            // Same version, another rule: fine.
+            row(1, RowCommit::Singleton { config_version: 6 }),
+            // The placeholder version: a violation.
+            row(2, RowCommit::LONE),
+            // A Final row given the configuration in force: fine; one given
+            // a version that is not in force: a violation.
+            row(3, RowCommit::Singleton { config_version: 6 }),
+            row(4, RowCommit::Singleton { config_version: 2 }),
+        ];
+        judge(&mut rv, &retagged);
+        let seqs: Vec<_> = rv
+            .violations
+            .iter()
+            .map(|v| v.split("seq ").nth(1).unwrap().split(' ').next().unwrap())
+            .collect();
+        assert_eq!(seqs, ["2", "4"], "{:?}", rv.violations);
+        assert_eq!(rv.retags, 4);
+        judge(&mut rv, &retagged);
+        assert_eq!(rv.violations.len(), 2, "judged once");
     }
 
     /// Step 4: a version that existed but was superseded before the node's

@@ -356,26 +356,23 @@ fn a_gated_holders_close_returns_once_its_manifest_row_is_durable() {
     assert_eq!(session.stats().fast_acks_waited, 1);
 }
 
-/// Plan 43 C1-2 (D4): the gate goes off while a fast-path close waits (the
-/// group is gone, the lease still this node's): the close returns, the row
-/// it journaled is re-tagged `Lone` — it was answered on this disk alone,
-/// and what a deposition does with the row must match. Fails on the
-/// parent: the row stayed gated-class.
-#[test]
-fn ungated_fast_path_answer_retags_the_row_lone() {
-    use constellation_meta::RowCommit;
+/// The gate goes off while a fast-path close waits, the lease still this
+/// node's: `published` is the rule the core publishes with it (`Final`: an
+/// epoch's hold; the lone node's otherwise). Returns the row's rule after
+/// the close and the session's downgrade count. The row is journaled under
+/// configuration version 5.
+fn close_with_the_gate_going_off(
+    published: constellation_meta::RowCommit,
+) -> (constellation_meta::RowCommit, u64) {
+    use constellation_meta::{GroupOn, RowCommit};
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
     let session = meta.session();
-    session.set_durable(
-        true,
-        meta.journal_tip().unwrap(),
-        false,
-        RowCommit::ROOT_GROUP,
-        false,
-    );
+    let group = RowCommit::group(5, GroupOn::Root);
+    session.set_durable(true, meta.journal_tip().unwrap(), false, group, false);
     let (fs, _dir, _core) = holder_fs(meta.clone(), true);
     fs.do_write(file.ino, 0, b"hello").unwrap();
+    let mut after = RowCommit::LONE;
     std::thread::scope(|scope| {
         let close = scope.spawn(|| fs.flush_inode(file.ino, false));
         let started = std::time::Instant::now();
@@ -391,18 +388,48 @@ fn ungated_fast_path_answer_retags_the_row_lone() {
             std::thread::sleep(Duration::from_millis(1));
         };
         // Journaled under the class the core published with the gate.
-        assert_eq!(
-            meta.journal_tx_class(tip).unwrap(),
-            Some(RowCommit::ROOT_GROUP)
-        );
+        assert_eq!(meta.journal_tx_class(tip).unwrap(), Some(group));
         std::thread::sleep(Duration::from_millis(100));
         assert!(!close.is_finished(), "the close waits for the group");
         // The gate goes off, the lease still this node's.
-        session.set_durable(false, u64::MAX, false, RowCommit::LONE, true);
+        session.set_durable(false, u64::MAX, false, published, true);
         assert_eq!(close.join().unwrap(), Ok(()));
-        assert_eq!(meta.journal_tx_class(tip).unwrap(), Some(RowCommit::LONE));
+        after = meta.journal_tx_class(tip).unwrap().unwrap();
     });
-    assert_eq!(session.stats().fast_acks_downgraded, 1);
+    (after, session.stats().fast_acks_downgraded)
+}
+
+/// Plan 43 C1-2 (D4), plan 46 M1.1 review (SHOULD-1): the gate goes off while
+/// a fast-path close waits, in a continuation epoch's hold (`Final` is what
+/// the core publishes) or as a lone root's of the configuration the row was
+/// journaled in (before the event's singleton test was assessed): the row is
+/// answered on this disk alone, and is re-tagged `Singleton` in the version
+/// it was journaled in, never the placeholder 0.
+#[test]
+fn ungated_fast_path_answer_retags_the_row_keeping_its_version() {
+    use constellation_meta::RowCommit;
+    for published in [RowCommit::FINAL, RowCommit::Singleton { config_version: 5 }] {
+        let (after, downgraded) = close_with_the_gate_going_off(published);
+        assert_eq!(
+            after,
+            RowCommit::Singleton { config_version: 5 },
+            "published {published:?}"
+        );
+        assert_eq!(downgraded, 1, "published {published:?}");
+    }
+}
+
+/// ADR-33 step 5: a row of a configuration a change has replaced (the
+/// published version is a later one, outside a hold) is committed by its
+/// own rule once the gate is off, and keeps it: no re-tag. Fails on the
+/// parent: the row was re-tagged `Singleton` whatever took the gate off.
+#[test]
+fn ungated_fast_path_answer_of_a_replaced_configuration_keeps_its_rule() {
+    use constellation_meta::{GroupOn, RowCommit};
+    let (after, downgraded) =
+        close_with_the_gate_going_off(RowCommit::Singleton { config_version: 6 });
+    assert_eq!(after, RowCommit::group(5, GroupOn::Root));
+    assert_eq!(downgraded, 0);
 }
 
 /// Waits until something journaled past the durable watermark; returns

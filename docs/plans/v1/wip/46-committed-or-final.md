@@ -842,6 +842,14 @@ compares a claim with the rule of the row that carries the answer and judges by 
 `strict_commit_exempt` naming the plan item that closes each. The rows whose `row_version_matches_config` fails on `long-delegated-late-answers-lr` seed
 1793 and `long-delegated-backup-lr` seed 1938 are known and in triage elsewhere.
 
+M1.1 review (fable, 2026-11-06, cb4d8dd5): cleared with conditions — SHOULD-1 gated-row re-tags outside the hold, fixed <sha>; SHOULD-2 Leave-ends-grants not built, safety rests on the lone-root cap: re-check at M1.2 steps 13/14 (or land step 11 first); SHOULD-3 exemption closing items, fixed <sha>; NITs fixed.
+
+*M1.1 review fixes (PROGRESS, "Plan 46 M1.1 review fix round"):* a gated row is re-tagged `Singleton` only under a continuation epoch's hold (ADR-33 step 5), in the version
+it carries; the sim oracle judges a re-tag. Each remaining `strict_commit` exemption has one closing item: `HELD_WRITE_ANSWERED_LATE` (the writer-hold sim artefact,
+`locks-writer-hold-delegated`) closes at **M1.2 step 15 (harness and sim fixes)**; `delegated-core-stall-root-lease6` closes at **M1.3**, with the stale-clock re-check rule
+(an answer committed on this node's disk under a lease re-reads the clock after the write and parks if the lease is no longer usable; the lease6 triage's F1) and that
+configuration's `+commit` 0 of 2,000 in M1.3's exit (it was M2.3 before).
+
 *L2b (known gap, deferred 2026-11-04; PROGRESS, "L2b"):* **M1.2 must close L2b.** A committed delegate row that a
 delegate-turned-root re-appends in a lone tenure, ending unshipped below the next root's cut, survives only as rescue copies
 by rid (I2 in `long-delegated-backup` 13016; I2c in 13907, 14284, 15005, 15996, all under slow lease reads). M1.2's member

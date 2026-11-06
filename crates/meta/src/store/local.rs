@@ -784,6 +784,15 @@ impl Meta {
         let class = match (journal::PendingClass::current(), class_at_journal) {
             (Some(c), _) | (None, Some(c)) => c,
             (None, None) if delegated => RowCommit::LONE,
+            // (The published rule is not checked against the configuration
+            // in force: it is the rule the core published at the end of its
+            // previous event, so its version is what that event had applied.
+            // A configuration the core has not read yet is the lag the
+            // fast path has by design (a gated row waits for the closed
+            // configuration, a `Singleton` one for `lone_ok`); the sim's
+            // row-version oracle judges a root row by event for the same
+            // reason, there being no per-position history of the lease to
+            // judge it by, as there is of a `DelegGroup`.)
             (None, None) => {
                 journal::note_from_session();
                 self.session().published_class()
@@ -957,7 +966,18 @@ impl Meta {
         row.class = class;
         put_journal_tx(&mut tx, self, first, &row)?;
         tx.commit()?;
+        #[cfg(any(test, feature = "test-util"))]
+        reclass_fault::CHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
+    }
+
+    /// Testing only (the simulation's row-version oracle): how many re-tags
+    /// ([`Self::reclass_journal_tx`]) have changed a row, in any store of
+    /// the process. A change since the last read is the cue to judge the
+    /// journal again: a re-tag moves no tip.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn reclass_changes() -> u64 {
+        reclass_fault::CHANGED.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Plan 43 C1-3: whether an unshipped journal transaction was executed
@@ -3895,6 +3915,8 @@ pub fn fail_reclass_on_this_thread_for_tests(n: u32) {
 
 #[cfg(any(test, feature = "test-util"))]
 mod reclass_fault {
+    pub(super) static CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     thread_local! {
         pub(super) static LEFT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }

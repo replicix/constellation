@@ -2125,8 +2125,18 @@ impl Core {
             let downgraded = unarchived
                 && !held_for_remote
                 && match &p.what {
+                    // Plan 46 M1.1 review (SHOULD-1, ADR-33 step 5): a row of
+                    // a configuration a change has replaced is answered by
+                    // its own rule, committed once the gate is off
+                    // (`durable_jseq`'s caps), and keeps it; the row of the
+                    // configuration in force (or any row of an epoch's hold)
+                    // is the one answered on this disk alone.
                     ParkedWhat::Reply { class, .. } | ParkedWhat::Finish { class, .. } => {
                         class.gated()
+                            && (self.lease.epoch_held()
+                                || class
+                                    .config_version()
+                                    .is_none_or(|v| v >= self.root_config_version()))
                     }
                     _ => false,
                 };
@@ -2200,7 +2210,8 @@ impl Core {
                     class,
                 } => {
                     let class = if downgraded {
-                        constellation_meta::RowCommit::LONE
+                        // The row's own version (never the placeholder 0).
+                        class.as_singleton(self.root_config_version())
                     } else if held_for_remote {
                         constellation_meta::RowCommit::FINAL
                     } else {
@@ -2242,7 +2253,7 @@ impl Core {
                     rid,
                     outcome,
                     AnswerSource::Sequenced(if downgraded {
-                        constellation_meta::RowCommit::LONE
+                        class.as_singleton(self.root_config_version())
                     } else {
                         class
                     }),

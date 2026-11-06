@@ -813,6 +813,7 @@ impl NodeHandle {
             forwards: HashMap::new(),
             lone_audit_seen: BTreeMap::new(),
             versions_seen_tip: 0,
+            versions_seen_retags: 0,
             lone_stats_seen: None,
             rebuild_stub: env.rebuild_stub,
             plant_ungated_fast_path: env.plant_ungated_fast_path,
@@ -1139,6 +1140,7 @@ struct Driver {
     /// The journal tip the row-version oracle last judged (plan 46 M1.1
     /// step 3).
     versions_seen_tip: u64,
+    versions_seen_retags: u64,
     /// The counters of the lone-lead oracle's non-vacuity (`LoneLead`)
     /// as this driver last read them: `held_by_gate`.
     lone_stats_seen: Option<u64>,
@@ -2876,7 +2878,11 @@ impl Driver {
             .as_ref()
             .map_or(lease.last_config_version, |(l, _)| l.config_version);
         let tip = self.meta.journal_tip().unwrap_or(0);
-        if tip == self.versions_seen_tip {
+        // A re-tag moves no tip: judge again when one changed a row.
+        let retags = constellation_meta::Meta::reclass_changes();
+        let retagged = retags != self.versions_seen_retags;
+        self.versions_seen_retags = retags;
+        if tip == self.versions_seen_tip && !retagged {
             self.oracles
                 .row_versions
                 .lock()

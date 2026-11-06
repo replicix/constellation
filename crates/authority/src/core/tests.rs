@@ -52439,6 +52439,53 @@ mod c1_class {
         assert_eq!(h.core.stats.acks_downgraded_lone, 1);
     }
 
+    /// Plan 46 M1.1 review (SHOULD-1, ADR-33 step 5): a gated row of a
+    /// configuration that a change replaced is answered by its own rule once
+    /// the gate is off, and is not re-tagged `Singleton`: the closed
+    /// configuration committed it, and its strand follows the group. Fails
+    /// on the parent: re-tagged and answered `Lone` whatever configuration
+    /// the row was journaled in.
+    #[test]
+    fn a_gated_row_of_a_replaced_configuration_is_not_retagged() {
+        let (mut h, _) = listed_holder();
+        let rid = h.rid(2);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("r"),
+            tag: Default::default(),
+        });
+        assert!(sources(&out).is_empty(), "parked for the backup: {out:?}");
+        let v1 = h.core.root_config_version();
+        gate_goes_off(&mut h);
+        // The change that took the group away is a later version.
+        h.core.lease.held.as_mut().unwrap().0.config_version = v1 + 1;
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert_eq!(
+            sources(&out),
+            vec![(rid, AnswerSource::Sequenced(RowCommit::ROOT_GROUP))]
+        );
+        assert_eq!(classes_of(&h, rid), vec![RowCommit::ROOT_GROUP]);
+        assert_eq!(h.core.stats.acks_downgraded_lone, 0);
+        // An epoch's hold re-tags it whatever its version.
+        let (mut h, _) = listed_holder();
+        let rid = h.rid(2);
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("r"),
+            tag: Default::default(),
+        });
+        let epoch = h.core.lease.epoch().unwrap();
+        h.core.lease.adopt_epoch_hold(h.clk(), epoch);
+        h.core.lease.held.as_mut().unwrap().0.config_version += 1;
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.stats.acks_downgraded_lone, 1);
+        assert_eq!(classes_of(&h, rid), vec![RowCommit::LONE]);
+    }
+
     /// D4, the C1-2/C1-3 review: the gate goes off while an answer is
     /// parked, and the store fails the `Lone` re-tag. The row keeps its
     /// gated class, so the answer can claim neither it nor `Lone`: `EIO`.

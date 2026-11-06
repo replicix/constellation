@@ -7302,7 +7302,7 @@ fn delegated_core_stall_root_lease6_config() -> SimConfig {
     SimConfig {
         core: std::sync::Arc::new(sim::run::sim_core_config),
         strict_commit_exempt: Some(
-            "plan 46 M2.3 (`ack=local` removed, the roster's singleton test): a stalled root's singleton answers are rolled back by its successor",
+            "plan 46 M1.3 (the stale-clock re-check rule: an answer committed on this node's disk under a lease is given only after a fresh clock read finds the lease usable): a stalled root's singleton answers are rolled back by its successor",
         ),
         ..delegated_core_stall_root_config()
     }
@@ -7624,6 +7624,7 @@ struct OracleTotals {
     /// Plan 46 M1.1 step 3: `row_version_matches_config` violations, the
     /// seeds with one, and the rows judged.
     row_version: (usize, u64, usize),
+    row_version_retags: usize,
     row_version_seeds: Vec<u64>,
     downgraded_lone: u64,
     class_from_session: u64,
@@ -7708,6 +7709,7 @@ impl OracleTotals {
         self.row_version.0 += r.row_version_mismatch;
         self.row_version.1 += u64::from(r.row_version_mismatch > 0);
         self.row_version.2 += r.row_versions_checked;
+        self.row_version_retags += r.row_versions_retags;
         if r.row_version_mismatch > 0 && self.row_version_seeds.len() < 30 {
             self.row_version_seeds.push(seed);
         }
@@ -8072,11 +8074,12 @@ impl OracleTotals {
         }
         eprintln!(
             "SWEEP-ROWVERSION-TOTALS {label} seeds {}/{seeds}: row-version-mismatch={} in {} seeds, \
-             rows judged {}; mismatch in seeds {:?}",
+             rows judged {} (re-tags judged {}); mismatch in seeds {:?}",
             self.seeds,
             self.row_version.0,
             self.row_version.1,
             self.row_version.2,
+            self.row_version_retags,
             self.row_version_seeds
         );
         eprintln!(
@@ -10700,7 +10703,7 @@ fn locks_writer_hold_delegated_config() -> SimConfig {
 
 /// The documented `strict_commit` exception of every configuration with a
 /// held delegate write (`DelegateWriteHold`), lki1 triage mechanism B.
-const HELD_WRITE_ANSWERED_LATE: &str = "plan 46 M1.1 follow-up (lki1 B, unscheduled sim fix): \
+const HELD_WRITE_ANSWERED_LATE: &str = "plan 46 M1.2 step 15 (harness and sim fixes; lki1 B): \
      the sim lets a held delegate write commit at its node's next store write but answers it at \
      the hold's end; meanwhile its generation ends and the row is stranded and refused on replay \
      (`ENOLCK`), so the `ok` is judged against a row no store has. The engine's thread answers as \
@@ -15618,6 +15621,28 @@ fn strict_commit_is_the_default_of_a_delegated_configuration() {
         let why = cfg.strict_commit_exemption().expect("an exception");
         assert!(why.contains("plan 46 M"), "{why}");
     }
+    // Each exemption names its one closing plan item (M1.1 review, SHOULD-3).
+    let closes = |cfg: SimConfig, item: &str| {
+        let why = cfg.strict_commit_exemption().expect("an exception");
+        assert!(why.starts_with(&format!("plan 46 {item}")), "{why}");
+    };
+    closes(
+        delegated_core_stall_root_lease6_config(),
+        "M1.3 (the stale-clock re-check rule",
+    );
+    for cfg in [
+        locks_writer_hold_delegated_config(),
+        locks_writer_hold_delegated_doubt_config(),
+        locks_writer_hold_delegated_group_config(false),
+    ] {
+        if cfg.strict_commit_exemption() == Some(HELD_WRITE_ANSWERED_LATE) {
+            closes(cfg, "M1.2 step 15 (harness and sim fixes");
+        }
+    }
+    assert_eq!(
+        locks_writer_hold_delegated_config().strict_commit_exemption(),
+        Some(HELD_WRITE_ANSWERED_LATE)
+    );
     // lki1 triage: the lock lane is strict by default but for the
     // configurations above (the partitioned ones since mechanism D's fix).
     for cfg in [

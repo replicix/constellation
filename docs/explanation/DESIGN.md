@@ -641,9 +641,9 @@ renamed for the vocabulary.
 
 (Each journal row records the commit rule it was written under and the
 version of the configuration in force, `RowCommit` — `Group { config_version, on }` (`on`: what
-the group waits on, until plan 46 step 7), `Final`, or `Singleton { config_version }` — stamped when the row is journaled
-from the one lookup of the configuration (`Core::rule_of`); a row answered
-without a commit is re-tagged `Singleton` (only in an epoch's hold: since plan 46 M1.1 step 5 a row keeps its rule, and a change of the lease's configuration
+the group waits on; kept until plan 46 M1.2 makes it one stream per node), `Final`, or `Singleton { config_version }` — stamped when the row is journaled
+from the one lookup of the configuration (`Core::rule_of`); a row of the
+configuration in force answered without a commit (lone, or in an epoch's hold) is re-tagged `Singleton`, in its own version; since plan 46 M1.1 step 5 a row of a replaced configuration keeps its rule, and a change of the lease's configuration
 commits under the old rule and the new, [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)); plan 43 C1-2, plan 46 M1.1. A holder sealed by a claimant keeps its unshipped
 rows in the `member_copy` part of the backup keyspace, apart from the tail it
 holds as a backup; C1-3.)
