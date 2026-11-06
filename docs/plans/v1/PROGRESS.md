@@ -67626,3 +67626,35 @@ only atime, refusal or inbox-ack records queues nothing. (2) I2 guard: completin
 (`Meta::take_deleg_append_uncompleted`, `deleg_append_uncompleted`, `status.delegation.append_uncompleted`, schema re-blessed) and
 `debug_assert!`s; the sim fails a seed where it is nonzero (any configuration, stale-base included). Meta test
 `an_appended_row_with_a_rid_and_no_completion_is_counted`. (3) `run.rs` reads the stale-base knob from node 1: a comment says it is uniform.
+
+### Plan 46 M1.2 step 2: the delegate's ask cadence (2026-11-06)
+
+`DelegateStreamAck` (and its wire payload) gains `archive_bound: bool`. The root sets it when its configuration commits by the archive alone (`Core::config_archive_bound`: a lone root
+outside an epoch hold) and `committed` is below `through`: the commit of the stream then moves only at the root's next ship. The delegate keeps the flag (`DelegateState::archive_bound`,
+reset with a round change) and, while it is set, does not ask the root for its commit every tick (the 4-tick, doubling back-off): it waits for the root's push (already sent when
+`committed` rises, `root_stream_push`) and asks only as the fallback, one ship interval (`sync_interval_ms`) after the answer began to wait and every interval after that, because a push
+can be lost. Streams of a root with backups are unchanged (tick asks, back-off). No version bump, no shim.
+
+**Deleted:** the tick-driven re-ask (and its doubling back-off) for archive-bound streams.
+
+**Fail-before.** `a_delegate_of_a_lone_root_does_not_ask_every_tick`: ten ticks send at most one ask; with the cadence off it sends 2 (one per back-off; the sim's tick is 50 ms).
+`a_lost_push_of_a_lone_roots_ship_is_recovered_by_the_fallback_ask` (liveness): the push of the ship is dropped, the fallback ask releases the parked answer within one ship interval.
+
+**Sweeps** (box 1, release, `+commit`, seeds 0..1,999, main `3fbea268` against this tree; both with the new wait histogram). All four: 0 failing seeds on both (same set).
+
+| Configuration | asks main | asks now | of them archive-bound | asks that raised the commit main -> now | parked acks waited >= 200 ms / >= 1 s main -> now | p50 / p90 (log2 bucket bounds) |
+|---|---|---|---|---|---|---|
+| `long-delegated` | 7,055 | 3,940 | 750 | 928 -> 453 | 2,261 / 842 -> 2,227 / 819 | < 64 ms / < 128 ms, both |
+| `delegated-root-crash` | 5,142 | 2,059 | 681 | 522 -> 152 | 1,934 / 1,535 -> 1,945 / 1,556 | same |
+| `delegated-root-gone` | 4,741 | 1,159 | 901 | 504 -> 34 | 1,318 / 954 -> 1,335 / 991 | same |
+| `delegated-partition` | 3,467 | 1,065 | 801 | 365 -> 23 | 573 / 417 -> 584 / 430 | same |
+
+The plan's 62 / 7 / 6 / 3 are the counts before M1.1 step 1 made the lone root's journal commit nothing; main now sits at the numbers in the first column. The asks left are the tick
+asks of streams whose root has backups (unchanged by design) and the fallback asks of archive-bound streams, which fire while the root's ship is late (a stalled or unreachable root).
+The wait percentiles are unchanged; the counts above 200 ms / 1 s differ by about one percent either way (executions diverge once an ask changes).
+
+**New instrumentation:** `Stats::deleg_stream_ack_wait_hist` (log2 buckets), `deleg_root_pokes_archive_bound`; the sweep prints `SWEEP-PARKED-WAIT` (p50 / p90 bucket bounds, archive-bound asks).
+
+**Gates** (box 1): fmt `--check`, clippy `--workspace --all-targets -D warnings` clean; lib tests authority 1,062, engine 952, meta 407, net 128; release sim suite 422 passed, 0 failed, 13 ignored.
+The negative control `the_lone_lead_oracle_catches_a_disabled_lead_and_a_disabled_hysteresis` moved a seed (64 no longer trips the hysteresis control; 88 does, as 118 still does); the control goes with M1.2 step 13.
+No perf gate: off the steady path (an ask is made only while an answer waits on the root's commit).

@@ -777,6 +777,11 @@ pub enum PeerMsg {
     /// committed its appends of the stream: the prefix a delegate without a
     /// recorded backup counts as the root's copy (plan 43 Q16, ADR-41); an
     /// ack that rises it is also sent unsolicited, as `through` stays.
+    /// `archive_bound` (plan 46 M1.2): the root's commit of this stream moves
+    /// only at its next ship (its configuration has no backup: the archive
+    /// commits, and `committed` is below `through`). The delegate then does
+    /// not ask again every tick: it waits for the root's push, with a
+    /// fallback ask at the ship interval (a push can be lost).
     DelegateStreamAck {
         req: OpId,
         gen: u64,
@@ -784,6 +789,7 @@ pub enum PeerMsg {
         through: u64,
         committed: u64,
         refused: bool,
+        archive_bound: bool,
     },
     /// Plan 30 §M11: a delegate renews its grant on `gen`; the root
     /// answers with the ttl (0: refused — the generation is ending or is

@@ -300,6 +300,7 @@ pub enum SyncRequest {
         through: u64,
         committed: u64,
         refused: bool,
+        archive_bound: bool,
     },
     /// The off-core lane sent a delegation renewal (urgent lane, ahead of
     /// its answer: [`Event::DelegRenewSentOffCore`]).

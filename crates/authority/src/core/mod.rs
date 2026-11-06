@@ -1265,12 +1265,17 @@ pub struct Stats {
     /// released by the log while their group's commit was not heard (not by
     /// the commit): what a lost push leaves (ADR-41).
     pub deleg_stream_ack_wait_max_ms: u64,
+    /// The waits of parked acknowledgements by `ceil(log2(ms + 1))` (the last
+    /// bucket takes the rest): the sweeps' p50 and p90.
+    pub deleg_stream_ack_wait_hist: [u64; 16],
     pub deleg_stream_acks_slow: u64,
     pub deleg_stream_acks_late: u64,
     pub deleg_stream_acks_by_log: u64,
     /// Delegate: empty batches sent to ask the root for its commit while an
     /// answer waited on it (`deleg_poke_root`, ADR-41).
     pub deleg_root_pokes: u64,
+    /// Of them, the fallback asks of an archive-bound stream (plan 46 M1.2).
+    pub deleg_root_pokes_archive_bound: u64,
     /// Delegate: of those asks, the answers that raised the root's committed
     /// prefix (the push they stood in for had not).
     pub deleg_root_asks_raised: u64,
@@ -2875,8 +2880,19 @@ impl Core {
                 through,
                 committed,
                 refused,
+                archive_bound,
             } => self.on_delegate_stream_ack(
-                now, from, req, gen, round, through, committed, refused, replica, out,
+                now,
+                from,
+                req,
+                gen,
+                round,
+                through,
+                committed,
+                refused,
+                archive_bound,
+                replica,
+                out,
             ),
             PeerMsg::DelegRenew {
                 req,

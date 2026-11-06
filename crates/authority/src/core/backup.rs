@@ -1635,6 +1635,14 @@ impl Core {
         }
     }
 
+    /// Plan 46 M1.2: this root's configuration commits by the archive alone
+    /// (a lone root, outside an epoch hold): a delegate's rows it appended
+    /// commit at its next ship, not as an acknowledgement comes in
+    /// (`DelegateStreamAck.archive_bound`).
+    pub(crate) fn config_archive_bound(&self) -> bool {
+        self.durable_jseq() == u64::MAX && !self.lease.epoch_held()
+    }
+
     /// Plan 46 M1.1 step 5: the lease this node holds records a singleton's
     /// configuration (no peer within the budget, no backup).
     fn held_singleton(&self) -> bool {

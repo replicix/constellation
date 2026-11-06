@@ -370,6 +370,10 @@ pub(crate) struct DelegateState {
     /// at most `streamed_through`): the root's copy a delegate without a
     /// recorded backup counts for its group (plan 43 Q16, ADR-41).
     pub root_committed: u64,
+    /// The root's last word on this stream said its commit moves only at its
+    /// next ship (`DelegateStreamAck.archive_bound`, plan 46 M1.2): the
+    /// delegate waits for the root's push and asks only at the ship interval.
+    pub archive_bound: bool,
     /// The next time this delegate may ask the root for its commit with an
     /// empty batch (`deleg_poke_root`): one stream tick after the last ask.
     pub poke_after: Option<WaitMs>,
@@ -1371,6 +1375,7 @@ impl Core {
                     refused: false,
                     streamed_through: replica.log_stream_idx(d.gen),
                     root_committed: replica.log_stream_idx(d.gen),
+                    archive_bound: false,
                     poke_after: None,
                     ask: None,
                     poke_backoff_ms: 0,
@@ -3094,6 +3099,7 @@ impl Core {
             };
             g.committed_sent = committed;
             let (to, through) = (g.node, g.cursor);
+            let archive_bound = self.config_archive_bound();
             let every = self.cfg.delegation_push_drop_every;
             let nth =
                 self.stats.deleg_stream_acks_pushed + self.stats.deleg_stream_acks_push_dropped + 1;
@@ -3113,6 +3119,7 @@ impl Core {
                     through,
                     committed,
                     refused: false,
+                    archive_bound: archive_bound && committed < through,
                 },
             });
         }
@@ -4314,6 +4321,7 @@ impl Core {
                 }
                 d.poke_backoff_ms = 0;
                 d.poke_after = None;
+                d.archive_bound = false;
                 if d.last_root.is_some() && root.is_some() {
                     d.streamed_through = replica.log_stream_idx(d.gen);
                     d.root_committed = d.streamed_through;
@@ -4801,18 +4809,25 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let tick = self.cfg.delegation_stream_tick_ms.max(1);
+        let ship = self.deleg_ship_interval_ms();
         let d = self.dl.mine.get_mut(&gen).expect("present");
+        // An archive-bound commit moves when the root ships, and the root's
+        // push says so: the ask is only the fallback for a push that was
+        // lost, at the ship interval, not a tick.
+        let archive_bound = d.archive_bound;
+        let gap = if archive_bound { ship } else { tick };
         if d.ask.is_some()
             || d.poke_after.is_some_and(|t| now.wait < t)
-            || now.wait.since(since) < tick as i64
+            || now.wait.since(since) < gap as i64
         {
             return;
         }
-        d.poke_after = Some(now.wait.plus(tick));
+        d.poke_after = Some(now.wait.plus(gap));
         let round = d.stream_round;
         let req = self.op_id();
         self.dl.by_req.insert(req, (gen, ReqKind::Poke));
         self.stats.deleg_root_pokes += 1;
+        self.stats.deleg_root_pokes_archive_bound += u64::from(archive_bound);
         self.dl.mine.get_mut(&gen).expect("present").ask = Some((req, now.wait));
         out.push(Action::Send {
             to: root,
@@ -4827,12 +4842,27 @@ impl Core {
         });
     }
 
+    /// The cadence of the root's ship (`sync_interval_ms`), and so of an
+    /// archive-bound commit's rise: the delegate's fallback ask.
+    fn deleg_ship_interval_ms(&self) -> u64 {
+        self.cfg
+            .sync_interval_ms
+            .max(self.cfg.delegation_stream_tick_ms)
+            .max(1)
+    }
+
     /// An ask for the commit was refused, failed or timed out: the next one
     /// waits as long as a stream's back-off (a root inside its takeover gate,
     /// a partition, must not be asked every tick).
     fn deleg_poke_backoff(&mut self, now: Now, gen: u64) {
         let tick = self.cfg.delegation_stream_tick_ms.max(1);
+        let ship = self.deleg_ship_interval_ms();
         if let Some(d) = self.dl.mine.get_mut(&gen) {
+            if d.archive_bound {
+                // The next ask is the fallback's: one ship interval on.
+                d.poke_after = Some(now.wait.plus(ship));
+                return;
+            }
             d.poke_backoff_ms = (d.poke_backoff_ms * 2).clamp(tick * 4, 2_000);
             d.poke_after = Some(now.wait.plus(d.poke_backoff_ms));
         }
@@ -5018,6 +5048,7 @@ impl Core {
         through: u64,
         committed: u64,
         refused: bool,
+        archive_bound: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -5092,6 +5123,11 @@ impl Core {
         // one. Cumulative, and never past what the root appended.
         let committed = committed.min(through);
         let committed_rose = committed > d.root_committed;
+        // The root's word on its commit's cadence (an answer older than what
+        // the delegate already counted says nothing new).
+        if committed >= d.root_committed {
+            d.archive_bound = archive_bound;
+        }
         if is_ask {
             if committed_rose {
                 d.poke_backoff_ms = 0;
@@ -7999,6 +8035,7 @@ impl Core {
                     through,
                     committed: 0,
                     refused: true,
+                    archive_bound: false,
                 },
             });
         };
@@ -8158,6 +8195,7 @@ impl Core {
                 through: cursor,
                 committed,
                 refused: false,
+                archive_bound: self.config_archive_bound() && committed < cursor,
             },
         });
         self.root_progress(now, replica, out);

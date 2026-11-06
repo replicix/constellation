@@ -3619,6 +3619,7 @@ impl Driver {
                 through,
                 committed,
                 refused,
+                archive_bound,
             } => Some(Internal::Event(Event::Peer {
                 from,
                 msg: PeerMsg::DelegateStreamAck {
@@ -3628,6 +3629,7 @@ impl Driver {
                     through,
                     committed,
                     refused,
+                    archive_bound,
                 },
             })),
             SyncRequest::DelegRenewSentOffCore {
@@ -4793,6 +4795,7 @@ impl Driver {
                 through,
                 committed,
                 refused,
+                archive_bound,
             } => {
                 let payload = Payload::DelegateStreamAck {
                     from: self.node_id,
@@ -4802,6 +4805,7 @@ impl Driver {
                     through,
                     committed,
                     refused,
+                    archive_bound,
                 };
                 self.one_way(to, payload);
             }

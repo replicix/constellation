@@ -1195,6 +1195,7 @@ pub trait PeerService: Send + Sync + 'static {
         _through: u64,
         _committed: u64,
         _refused: bool,
+        _archive_bound: bool,
     ) {
     }
     /// Plan 30 §M11 phase 2b: a delegate's append to this backup.

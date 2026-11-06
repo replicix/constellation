@@ -665,6 +665,7 @@ impl constellation_net::PeerService for P2pBridge {
         through: u64,
         committed: u64,
         refused: bool,
+        archive_bound: bool,
     ) {
         if crate::fault::p2p_denied(from) {
             return;
@@ -677,6 +678,7 @@ impl constellation_net::PeerService for P2pBridge {
             through,
             committed,
             refused,
+            archive_bound,
         });
     }
 

@@ -17196,6 +17196,7 @@ mod locks {
                     through: last,
                     committed: last,
                     refused: false,
+                    archive_bound: false,
                 },
             });
         }
@@ -17228,6 +17229,7 @@ mod locks {
                 through: last,
                 committed: last,
                 refused: false,
+                archive_bound: false,
             },
         });
         assert!(
@@ -37478,6 +37480,7 @@ fn a_delegates_late_answers_still_count() {
             through: last,
             committed: last,
             refused: false,
+            archive_bound: false,
         },
     });
     assert_eq!(
@@ -37585,6 +37588,7 @@ fn a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited() {
             through: last,
             committed: last,
             refused: false,
+            archive_bound: false,
         },
     });
     assert_eq!(
@@ -37601,6 +37605,7 @@ fn a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited() {
             through: last,
             committed: last,
             refused: false,
+            archive_bound: false,
         },
     });
     assert_eq!(h.core.dl.mine[&7].streamed_through, last);
@@ -37689,6 +37694,7 @@ fn stream_ack_committed(
             through,
             committed,
             refused: false,
+            archive_bound: false,
         },
     }
 }
@@ -43825,6 +43831,7 @@ mod recall_cut {
                 through: 0,
                 committed: 0,
                 refused: false,
+                archive_bound: false,
             },
         });
         let resent = sends(&out)
@@ -43864,6 +43871,7 @@ mod recall_cut {
                 through: 0,
                 committed: 0,
                 refused: false,
+                archive_bound: false,
             },
         });
         assert_eq!(
@@ -47142,6 +47150,7 @@ mod deleg_group {
                 through,
                 committed: 0,
                 refused: true,
+                archive_bound: false,
             },
         }
     }
@@ -47268,6 +47277,140 @@ mod deleg_group {
         assert_eq!(d.core.stats.deleg_root_pokes, 0);
     }
 
+    /// A lone root (no backup, none to be had; its configuration commits by
+    /// the archive alone), as in `a_lone_root_acks_a_delegates_row_as_committed_only_once_it_ships`.
+    fn lone_singleton_root() -> Harness {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.delegation_ttl_ms = 1_000;
+        h.hold(1, None);
+        h.core.ack.eligible = Some(false);
+        h.core.lease.held.as_mut().unwrap().0.singleton = true;
+        h.core.lease.held.as_mut().unwrap().0.ack_policy = constellation_store_s3::AckPolicy::Local;
+        h.core.ack.cfg_seen = None;
+        h.core.ack.spans.clear();
+        h.core.sync_cfg_spans(&h.meta);
+        assert_eq!(h.core.durable_jseq(), u64::MAX);
+        h
+    }
+
+    /// [`parked_pair`] with a lone root: the delegate's create (request 500)
+    /// is appended by the root and acknowledged as appended, committed at
+    /// the root's next ship; the answer is parked. `(delegate, root, the
+    /// stream index of the row)`.
+    fn lone_parked_pair() -> (Harness, Harness, u64) {
+        let (mut d, dir, _, _) = delegate_renewed_once();
+        let mut r = lone_singleton_root();
+        delegated_dir_to(&r.meta, 3, (0, 0), dir);
+        let mut out = Vec::new();
+        r.core.delegation_sync(r.clk(), &r.meta, &mut out);
+        let round = round_of(&d, 7);
+        r.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(1),
+                gen: 7,
+                round,
+                backup: None,
+                stream_head: 0,
+                stream_head_at: 0,
+                first: false,
+            },
+        });
+        let out = forward_create(&mut d, dir, 1, 500);
+        let (req, round, last) = batch(&out).expect("sent to the root");
+        let rout = deliver(&mut r, 3, &out);
+        assert_eq!(
+            stream_acks_to_3(&rout),
+            vec![(req, round, last, 0, false)],
+            "appended, not committed: {rout:?}"
+        );
+        let said_archive_bound = sends(&rout).into_iter().any(|(to, m)| {
+            to == 3
+                && matches!(
+                    m,
+                    PeerMsg::DelegateStreamAck {
+                        archive_bound: true,
+                        ..
+                    }
+                )
+        });
+        assert!(said_archive_bound, "the ack is not archive-bound: {rout:?}");
+        let dout = deliver(&mut d, 1, &rout);
+        assert_eq!(answer_to_2(&dout, 500), None, "{dout:?}");
+        assert!(d.core.dl.mine[&7].archive_bound);
+        (d, r, last)
+    }
+
+    /// Plan 46 M1.2 step 2: a stream whose commit moves only when the root
+    /// ships (a lone root) is not asked for every few ticks: the ack says so
+    /// (`archive_bound`) and the delegate waits for the root's push, asking
+    /// only at the ship interval. Ten ticks send at most one ask.
+    /// Fails before: one ask per back-off (four ticks), three or more.
+    #[test]
+    fn a_delegate_of_a_lone_root_does_not_ask_every_tick() {
+        let (mut d, mut r, _) = lone_parked_pair();
+        let mut asks = 0;
+        for _ in 0..10 {
+            let out = stream_tick(&mut d, &mut r);
+            if root_ask(&out).is_some() {
+                asks += 1;
+                // (The root answers: nothing is committed before its ship.)
+                let rout = deliver(&mut r, 3, &out);
+                deliver(&mut d, 1, &rout);
+            }
+        }
+        assert!(asks <= 1, "{asks} asks in ten ticks");
+        assert!(d.core.stats.deleg_root_pokes <= 1);
+    }
+
+    /// The push of a lone root's ship is lost: the fallback ask, one ship
+    /// interval after the answer began to wait, recovers the commit and the
+    /// parked answer leaves (liveness: ADR-41 case 1 for an archive-bound
+    /// stream).
+    #[test]
+    fn a_lost_push_of_a_lone_roots_ship_is_recovered_by_the_fallback_ask() {
+        let (mut d, mut r, last) = lone_parked_pair();
+        let parked_at = d.clk().wait;
+        let tip = r.meta.journal_tip().unwrap();
+        r.core.note_shipped(&[], tip);
+        let pushed = poke(&mut r);
+        assert_eq!(
+            stream_acks_to_3(&pushed).len(),
+            1,
+            "the root did not push the ship: {pushed:?}"
+        );
+        // (The push is lost: it is not delivered.)
+        let ship = r
+            .core
+            .cfg
+            .sync_interval_ms
+            .max(d.core.cfg.delegation_stream_tick_ms);
+        let mut released = None;
+        for _ in 0..(2 * ship / d.core.cfg.delegation_stream_tick_ms + 2) {
+            let out = stream_tick(&mut d, &mut r);
+            if let Some((req, round)) = root_ask(&out) {
+                let rout = deliver(&mut r, 3, &out);
+                assert_eq!(
+                    stream_acks_to_3(&rout),
+                    vec![(req, round, last, last, false)],
+                    "{rout:?}"
+                );
+                let dout = deliver(&mut d, 1, &rout);
+                assert!(answer_to_2(&dout, 500).is_some(), "not released: {dout:?}");
+                released = Some(d.clk().wait.since(parked_at));
+                break;
+            }
+        }
+        let waited = released.expect("never asked: the answer stays parked");
+        let tick = d.core.cfg.delegation_stream_tick_ms as i64;
+        assert!(
+            waited <= ship as i64 + tick,
+            "released {waited} ms after parking, past the ship interval {ship}"
+        );
+    }
+
     /// An ask that finds nothing committed is asked again after the
     /// back-off, four ticks (a lone root's commit rises when it ships, not
     /// per tick: plan 46 M1.1 step 1), no more often (`poke_after`, not per
@@ -47338,6 +47481,7 @@ mod deleg_group {
                 through: last,
                 committed: last,
                 refused: false,
+                archive_bound: false,
             },
         };
         let dout = d.step(rout);

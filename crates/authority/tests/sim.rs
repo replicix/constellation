@@ -7728,6 +7728,8 @@ struct OracleTotals {
     /// asked the root for its commit, of them answers that raised the root's
     /// committed prefix, pushes dropped on purpose, waited 200 ms or more].
     parked: [u64; 8],
+    parked_hist: [u64; 16],
+    pokes_archive_bound: u64,
     /// Plan 43 C1-3: attempts to fetch a group's tail, fetches completed (of
     /// them, of an inherited tail), claims that carried no tail (must be 0
     /// outside an abandon), groups abandoned, runs that ended waiting.
@@ -7821,6 +7823,14 @@ impl OracleTotals {
             self.parked[5] += st.deleg_root_asks_raised;
             self.parked[6] += st.deleg_stream_acks_push_dropped;
             self.parked[7] += st.deleg_stream_acks_late;
+            self.pokes_archive_bound += st.deleg_root_pokes_archive_bound;
+            for (a, b) in self
+                .parked_hist
+                .iter_mut()
+                .zip(st.deleg_stream_ack_wait_hist)
+            {
+                *a += b;
+            }
         }
         for st in r.stats.values() {
             self.downgraded_lone += st.acks_downgraded_lone;
@@ -8122,6 +8132,28 @@ impl OracleTotals {
             self.parked[6],
             self.parked[7]
         );
+        {
+            // Upper bounds of the log2 buckets holding the median and the 90th percentile.
+            let total: u64 = self.parked_hist.iter().sum();
+            let at = |pct: u64| {
+                let want = (total * pct).div_ceil(100).max(1);
+                let mut acc = 0;
+                for (i, n) in self.parked_hist.iter().enumerate() {
+                    acc += n;
+                    if acc >= want {
+                        return if i == 0 { 0 } else { (1u64 << i) - 1 };
+                    }
+                }
+                0
+            };
+            eprintln!(
+                "SWEEP-PARKED-WAIT {label} seeds {}/{seeds}: n {total}, p50 < {} ms, p90 < {} ms (log2 buckets, upper bounds); asks of archive-bound streams {}",
+                self.seeds,
+                at(50) + 1,
+                at(90) + 1,
+                self.pokes_archive_bound
+            );
+        }
         eprintln!(
             "SWEEP-ROWVERSION-TOTALS {label} seeds {}/{seeds}: row-version-mismatch={} in {} seeds, \
              rows judged {}; mismatch in seeds {:?}",
@@ -17439,7 +17471,8 @@ fn the_row_version_oracle_catches_a_per_row_class() {
 fn the_lone_lead_oracle_catches_a_disabled_lead_and_a_disabled_hysteresis() {
     // Seeds a sweep of 300 found each to trip (the hysteresis control needs
     // a gated row of its own and a `Lone` one after it, which is rarer; plan
-    // 46 M1.1's trajectories: 0, 57 and 103 trip no more).
+    // 46 M1.1's trajectories: 0, 57 and 103 trip no more; M1.2 step 2's ask
+    // cadence moved 64 off the list for 88).
     type Control = (
         &'static str,
         fn() -> SimConfig,
@@ -17457,7 +17490,7 @@ fn the_lone_lead_oracle_catches_a_disabled_lead_and_a_disabled_hysteresis() {
             "long-delegated-hysteresis-off",
             long_delegated_hysteresis_off_config,
             "follows own gated row",
-            &[64, 118],
+            &[88, 118],
         ),
     ];
     for (label, config, needle, seeds) in controls {

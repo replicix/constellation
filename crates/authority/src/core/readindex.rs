@@ -2070,6 +2070,8 @@ impl Core {
                 self.stats.deleg_stream_ack_wait_ms += waited;
                 self.stats.deleg_stream_ack_wait_max_ms =
                     self.stats.deleg_stream_ack_wait_max_ms.max(waited);
+                let bucket = (u64::BITS - waited.leading_zeros()).min(15) as usize;
+                self.stats.deleg_stream_ack_wait_hist[bucket] += 1;
                 self.stats.deleg_stream_acks_slow += u64::from(waited >= SLOW_ACK_MS);
                 self.stats.deleg_stream_acks_late += u64::from(waited >= LATE_ACK_MS);
                 // Released by the log, not by the group's commit: the row

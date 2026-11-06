@@ -431,6 +431,7 @@ pub enum Payload {
         through: u64,
         committed: u64,
         refused: bool,
+        archive_bound: bool,
     },
     /// Plan 30 §M11, one way: a delegate renews its grant on `gen`; the
     /// root answers with its own [`Payload::DelegRenewed`] (`ttl_ms` 0
@@ -1838,6 +1839,7 @@ mod tests {
             through: 9,
             committed: 4,
             refused: false,
+            archive_bound: true,
         };
         let frame = Signed::new(&k, &payload).unwrap().encode().unwrap();
         let back = Signed::decode(&frame[4..]).unwrap();
