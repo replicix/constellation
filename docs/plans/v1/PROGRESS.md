@@ -67396,3 +67396,27 @@ variant, 300 samples): `ack-latency` p50 B / A on ext4 chmod 0.85, create 0.98, 
 control), no direction survives; `write` (4 KiB and `fsync`) is within 2 %. The lease CAS runs per transition only: the steady-path core test counts 0. `vfs-bench`
 (A / B): dispatch overhead 83 to 100 ns in both, allocations per op identical.
 
+
+### Step 5 triage: the two open seeds (2026-11-06)
+
+Both are pre-existing defects the step's timing exposed; neither is in step 5's rule (C8 conditions 1 to 5 unchanged, no row re-classed).
+
+- **`long-backup+commit` seed 1421** (`member_copies_drained`), a product bug. A handoff drained the journal and sent its release CAS; the inbox poll
+  for a third node landed before the CAS did and found the batch's op answered already: `execute_inbox_batch` journaled the `InboxAck` of the
+  duplicate *before* its admission check (`new_mutation_epoch`, closed while releasing). The release left the row unshipped, a `Group{Root}` row of
+  a tenure that ended with no tail; the next holder drained the batch itself, and the row stayed in the deposed node's member copy (a root-group row
+  waits for coverage, none came). Main has the same order (its run of the seed ends in the backup's seal, whose tail covers the row). Fix: the
+  admission check comes first, before anything is journaled; the batch stays in the inbox for the next holder. Core test
+  `an_inbox_poll_landing_in_a_release_journals_nothing` (fails on the step: a fourth journal row).
+- **`long-delegated-backup+commit` seed 634** (`row_version_matches_config`), an oracle error. A new generation's two parked ops ran in one event
+  before that event installed the generation's first `DelegGroup` record; both rows rightly carry version 0 (the history records the record past
+  them, so `deleg_group_at` has nothing and the oracle falls back to the node's applied version now or at its previous event). The first row seeded
+  the generation's "previous event" entry with the version applied by the end of the event, and the second was judged against it. Fix:
+  `RowVersions::judge` reads the node's previous-event versions once, before its rows. Oracle test
+  `rows_of_a_new_generation_in_one_event_share_its_previous_event` (fails before).
+
+Sweeps (box 1, release, `+commit`, seeds 0..1,999): `long-backup`, `long-delegated-backup`, `backup-departs`, `delegated-group-switch`,
+`singleton-first-peer`, `long-delegated`, `backup`, `delegated-holder-cut`, `far`: 0 failing, row-version mismatches 0. Scan ×500: `long-acks3`,
+`long-delegated-late-answers`, `long-delegated-lead`, `long-strict`, `long-sessions`, `backup-two`, `backup-crash`, `backup-reconfig-doubt`,
+`backup-partition`, `delegated-backup`: 0 failing; the negative controls `long-delegated-lead-off` (348 vs main 339) and
+`long-delegated-hysteresis-off` (9 vs main 11) fail by design with their knob's violation only.
