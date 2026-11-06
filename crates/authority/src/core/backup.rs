@@ -366,7 +366,7 @@ use crate::replica::Replica;
 pub use constellation_meta::GroupOn;
 use constellation_meta::{BackupRole, BackupTx, MutateOutcome, Rid};
 use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// How many times a reconfiguration CAS is retried against a re-read
 /// object before the holder gives up on it (and re-plans later).
@@ -731,6 +731,14 @@ pub(crate) struct AckState {
     /// while it ran (sent when it fires).
     stream_ahead_timer: Option<TimerId>,
     stream_ahead_pending: bool,
+    /// Plan 46 M1.4 step 1, hold owner: the highest journal seq each epoch
+    /// member acknowledged holding (`PeerMsg::StreamAheadAck`), for the
+    /// continuation epoch `hold_epoch`. Nothing reads it yet.
+    pub(crate) hold_acked: BTreeMap<NodeId, u64>,
+    hold_epoch: Option<Epoch>,
+    /// Batches of the hold streamed to a member and not yet acknowledged:
+    /// `(last seq, sent at)`, oldest first (bounded; the wait statistic only).
+    pub(crate) hold_sent: BTreeMap<NodeId, VecDeque<(u64, WaitMs)>>,
     /// The last run of the periodic backup bookkeeping (selection,
     /// timeouts, promotion): a few times per second is plenty, and the
     /// per-event path stays the append and the release.
@@ -1073,6 +1081,9 @@ const BEAT_CLOCKS_KEPT: usize = 2;
 /// of a fast takeover's floor (about 19 s of beats at the default
 /// interval; the cap needs only the recent ones).
 const BEAT_LAGS_KEPT: usize = 64;
+
+/// How many unacknowledged hold batches per member the owner times.
+const HOLD_SENT_MAX: usize = 256;
 
 /// How many early `StreamAhead` batches a subscriber keeps.
 const AHEAD_WAITING_MAX: usize = 32;
@@ -3415,6 +3426,11 @@ impl Core {
                 self.ack.ahead_of.clear();
                 self.ack.stream_ahead_pending = false;
             }
+            if !self.lease.epoch_held() {
+                self.ack.hold_acked.clear();
+                self.ack.hold_epoch = None;
+                self.ack.hold_sent.clear();
+            }
             self.ack.acked_hwm = 0;
             self.report_durable(replica);
             self.watch_s3_holder(now, replica, out);
@@ -4588,7 +4604,17 @@ impl Core {
         // stream-ahead its own clients' forwards and reads waited for S3
         // (the OVH run's finding 4: the backup's small-file writes cost
         // an S3 round trip each, the other non-owners' did not).
-        let subscribers: Vec<NodeId> = self.stream_subscribers();
+        let mut subscribers: Vec<NodeId> = self.stream_subscribers();
+        // Plan 46 M1.4 step 1: the hold streams to every member of its
+        // epoch, subscribed or not (a member answers it with the ack the
+        // group's rule will wait for).
+        if self.epoch_streams_ahead() {
+            for m in self.pr.epoch_members.clone() {
+                if m != self.cfg.node_id && !subscribers.contains(&m) {
+                    subscribers.push(m);
+                }
+            }
+        }
         if subscribers.is_empty() {
             self.ack.streamed_through = to;
             self.ack.ahead_of.clear();
@@ -4664,6 +4690,18 @@ impl Core {
                 continue;
             }
             sent = sent.max(batch.len() as u64);
+            if in_epoch {
+                if self.ack.hold_epoch != Some(epoch) {
+                    self.ack.hold_acked.clear();
+                    self.ack.hold_sent.clear();
+                    self.ack.hold_epoch = Some(epoch);
+                }
+                let q = self.ack.hold_sent.entry(n).or_default();
+                q.push_back((reached, now.wait));
+                while q.len() > HOLD_SENT_MAX {
+                    q.pop_front();
+                }
+            }
             out.push(Action::Send {
                 to: n,
                 msg: PeerMsg::StreamAhead {
@@ -4690,7 +4728,47 @@ impl Core {
         if in_epoch {
             self.stats.epoch_streamed_ahead += sent;
         }
-        let _ = now;
+    }
+
+    /// Plan 46 M1.4 step 1, hold owner: a member holds this node's epoch
+    /// journal through `through`. Recorded (the highest per member) only
+    /// while this node owns the hold of `epoch` and `from` is another
+    /// member of it; anything else is ignored. Nothing answers on it yet.
+    pub(crate) fn on_stream_ahead_ack(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        epoch: Epoch,
+        through: u64,
+        replica: &dyn Replica,
+    ) {
+        if !self.lease.epoch_held()
+            || self.lease.epoch() != Some(epoch)
+            || from == self.cfg.node_id
+            || !self.pr.epoch_members.contains(&from)
+        {
+            self.stats.hold_acks_ignored += 1;
+            return;
+        }
+        if self.ack.hold_epoch != Some(epoch) {
+            self.ack.hold_acked.clear();
+            self.ack.hold_sent.clear();
+            self.ack.hold_epoch = Some(epoch);
+        }
+        // A member cannot hold more than the journal has.
+        let through = through.min(replica.journal_tip());
+        let acked = self.ack.hold_acked.entry(from).or_insert(0);
+        *acked = (*acked).max(through);
+        self.stats.hold_acks += 1;
+        if let Some(q) = self.ack.hold_sent.get_mut(&from) {
+            while let Some(&(last, sent)) = q.front() {
+                if last > through {
+                    break;
+                }
+                self.stats.hold_ack_wait_ms += (now.wait.0 - sent.0).max(0) as u64;
+                q.pop_front();
+            }
+        }
     }
 
     // ------------------------------------------------- parked ack abort
@@ -6018,6 +6096,10 @@ impl Core {
             return;
         }
         let mut completed: Vec<(constellation_meta::Rid, constellation_meta::KeySet)> = Vec::new();
+        // Plan 46 M1.4 step 1: the highest journal seq this call left
+        // durable here (installed by a committed store transaction, or held
+        // already); an open epoch's member acknowledges it to the owner.
+        let mut held_through: Option<u64> = None;
         let mut txs = txs.into_iter();
         while let Some(tx) = txs.next() {
             let Some((e, next)) = self.bk.ahead_next else {
@@ -6047,6 +6129,7 @@ impl Core {
             let held_tip = replica.streamed_tip(epoch).ok().flatten();
             if held_tip.is_some_and(|tip| tx.first <= tip) {
                 self.stats.streamed_held_already += 1;
+                held_through = held_through.max(Some(tx.last.min(held_tip.unwrap_or(0))));
                 self.bk.ahead_next = Some((epoch, tx.last + 1));
                 replica.note_streamed(constellation_meta::JournalPos {
                     epoch,
@@ -6074,6 +6157,7 @@ impl Core {
                 // before streaming past them — in the log at or below
                 // `base`, which this node has applied. The cursor steps
                 // over them.
+                held_through = held_through.max(Some(tx.last));
                 self.bk.ahead_next = Some((epoch, tx.last + 1));
                 replica.note_streamed(constellation_meta::JournalPos {
                     epoch,
@@ -6086,6 +6170,7 @@ impl Core {
             // committed entry installed now would wait for a segment that went
             // by. The cursor steps over it.
             if replica.row_in_log(epoch, tx.last) {
+                held_through = held_through.max(Some(tx.last));
                 self.bk.ahead_next = Some((epoch, tx.last + 1));
                 replica.note_streamed(constellation_meta::JournalPos {
                     epoch,
@@ -6122,6 +6207,7 @@ impl Core {
                         "streamed transaction installed ahead of the log"
                     );
                     self.stats.streamed_installed += 1;
+                    held_through = held_through.max(Some(tx.last));
                     if self.epoch.open {
                         self.stats.epoch_streamed_installed += 1;
                     }
@@ -6160,6 +6246,14 @@ impl Core {
                     self.bk.ahead_next = None;
                 }
             }
+        }
+        // The batch is in this node's store: tell the hold owner how far
+        // (the group's rule waits for it; step 2).
+        if let (true, Some(through)) = (self.epoch.open, held_through) {
+            out.push(Action::Send {
+                to: from,
+                msg: PeerMsg::StreamAheadAck { epoch, through },
+            });
         }
         // This node's own ops among them that wait for the log have their
         // effect here now.

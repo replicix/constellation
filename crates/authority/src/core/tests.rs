@@ -59069,3 +59069,214 @@ mod m11_step5 {
         );
     }
 }
+
+/// Plan 46 M1.4 step 1: `StreamAheadAck`, the member's acknowledgement of
+/// the epoch hold's stream-ahead, and the owner's record of it. No answer
+/// waits for it yet.
+mod hold_ack {
+    use super::*;
+
+    /// The hold owner (node 1) of continuation epoch 1 with members 1, 2
+    /// and 3, streaming (`active`), holding `rows` creates.
+    fn owner(rows: u64) -> Harness {
+        let mut h = Harness::with(1, true);
+        h.hold(1, None);
+        h.core.lease.adopt_epoch_hold(h.clk(), 1);
+        h.core.pr.epoch_members = vec![1, 2, 3];
+        h.core.epoch = EpochState {
+            open: true,
+            active: true,
+            ..Default::default()
+        };
+        for i in 0..rows {
+            submit_create(&mut h, i + 1, &format!("f{i}"));
+        }
+        h
+    }
+
+    fn ack(h: &mut Harness, from: NodeId, epoch: Epoch, through: u64) {
+        h.step(Event::Peer {
+            from,
+            msg: PeerMsg::StreamAheadAck { epoch, through },
+        });
+    }
+
+    fn tip(h: &Harness) -> u64 {
+        Replica::journal_tip(&h.meta)
+    }
+
+    /// A member (node 2, epoch open) that installed the owner's batch
+    /// acknowledges the batch's last seq to the owner, from the store: the
+    /// row is there when the ack leaves. A batch it did not install (a
+    /// wrong epoch, a gap) or a node whose epoch is not open acknowledges
+    /// nothing; the same batch again (an owner that restarted re-streams
+    /// its journal) is acknowledged again, from what the replica holds.
+    #[test]
+    fn a_member_acks_only_what_its_store_holds() {
+        let acks = |out: &[Action]| -> Vec<(NodeId, Epoch, u64)> {
+            sends(out)
+                .into_iter()
+                .filter_map(|(to, m)| match m {
+                    PeerMsg::StreamAheadAck { epoch, through } => Some((to, *epoch, *through)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (mut owner, mut sub, req) = stream_pair();
+        submit_create(&mut owner, 1, "a");
+        let (p1, through) = holder_ship(&mut owner, 1, 100);
+        sub.step(Event::Peer {
+            from: 1,
+            msg: segment_frame(req, 1, 1, p1),
+        });
+        submit_create(&mut owner, 2, "b");
+        submit_create(&mut owner, 3, "c");
+        let txs = Replica::journal_txs_from(&owner.meta, through + 1, 100);
+        assert_eq!(txs.len(), 2);
+        let last = txs[1].last;
+        let batch = |epoch: Epoch, txs: Vec<constellation_meta::BackupTx>| PeerMsg::StreamAhead {
+            epoch,
+            base: 1,
+            txs,
+            committed: false,
+        };
+        sub.core.ship.max_epoch = 1;
+        // Not an open epoch: installed, not acknowledged.
+        let out = sub.step(Event::Peer {
+            from: 1,
+            msg: batch(1, vec![txs[0].clone()]),
+        });
+        assert!(acks(&out).is_empty(), "{out:?}");
+        assert_eq!(sub.core.stats.streamed_installed, 1);
+        sub.core.epoch.open = true;
+        // Another epoch's batch (dropped), and one behind a gap: nothing.
+        let out = sub.step(Event::Peer {
+            from: 1,
+            msg: batch(2, txs.clone()),
+        });
+        assert!(acks(&out).is_empty(), "{out:?}");
+        let mut gapped = txs[1].clone();
+        gapped.first += 5;
+        gapped.last += 5;
+        let out = sub.step(Event::Peer {
+            from: 1,
+            msg: batch(1, vec![gapped]),
+        });
+        assert!(acks(&out).is_empty(), "{out:?}");
+        // The batch: the store holds it when the ack leaves.
+        sub.core.bk.ahead_next = Some((1, txs[1].first));
+        let out = sub.step(Event::Peer {
+            from: 1,
+            msg: batch(1, vec![txs[1].clone()]),
+        });
+        assert_eq!(acks(&out), vec![(1, 1, last)], "{out:?}");
+        assert_eq!(
+            Replica::streamed_tip(&sub.meta, 1).unwrap(),
+            Some(last),
+            "in the store"
+        );
+        assert!(MetaStore::lookup(&sub.meta, ROOT_INO, "c")
+            .unwrap()
+            .is_some());
+        // The owner streams everything again: held already, acknowledged
+        // again through the same seq, nothing installed twice.
+        let installed = sub.core.stats.streamed_installed;
+        sub.core.bk.ahead_next = Some((1, through + 1));
+        let out = sub.step(Event::Peer {
+            from: 1,
+            msg: batch(1, txs.clone()),
+        });
+        assert_eq!(acks(&out), vec![(1, 1, last)], "{out:?}");
+        assert_eq!(sub.core.stats.streamed_installed, installed);
+    }
+
+    /// The owner keeps the highest `through` each member acknowledged, never
+    /// lowering it, and not above its own journal.
+    #[test]
+    fn the_owner_records_the_highest_through_per_member() {
+        let mut h = owner(3);
+        let tip = tip(&h);
+        assert!(tip >= 3);
+        assert!(h.core.ack.hold_acked.is_empty());
+        ack(&mut h, 2, 1, 1);
+        ack(&mut h, 2, 1, tip);
+        ack(&mut h, 2, 1, 2);
+        ack(&mut h, 3, 1, 2);
+        assert_eq!(h.core.ack.hold_acked.get(&2), Some(&tip));
+        assert_eq!(h.core.ack.hold_acked.get(&3), Some(&2));
+        assert_eq!(h.core.stats.hold_acks, 4);
+        assert_eq!(h.core.stats.hold_acks_ignored, 0);
+        ack(&mut h, 3, 1, tip + 100);
+        assert_eq!(
+            h.core.ack.hold_acked.get(&3),
+            Some(&tip),
+            "no member holds more than the journal has"
+        );
+    }
+
+    /// An ack from a node outside the epoch, for another epoch, from the
+    /// owner itself, or while no hold is owned, is ignored.
+    #[test]
+    fn an_ack_from_outside_the_epoch_or_for_another_is_ignored() {
+        let mut h = owner(2);
+        let tip = tip(&h);
+        ack(&mut h, 4, 1, tip);
+        ack(&mut h, 2, 2, tip);
+        ack(&mut h, 2, 0, tip);
+        ack(&mut h, 1, 1, tip);
+        assert!(
+            h.core.ack.hold_acked.is_empty(),
+            "{:?}",
+            h.core.ack.hold_acked
+        );
+        assert_eq!(h.core.stats.hold_acks, 0);
+        assert_eq!(h.core.stats.hold_acks_ignored, 4);
+        ack(&mut h, 2, 1, tip);
+        assert_eq!(h.core.ack.hold_acked.get(&2), Some(&tip));
+        // The hold ends: what was recorded goes, and an ack counts for nothing.
+        h.core.lease.release_local();
+        ack(&mut h, 3, 1, tip);
+        assert!(!h.core.ack.hold_acked.contains_key(&3));
+        assert_eq!(h.core.stats.hold_acks_ignored, 5);
+        // A node that holds an S3 lease, no hold: ignored too.
+        let mut l = Harness::with(1, true);
+        l.hold(1, None);
+        l.core.pr.epoch_members = vec![1, 2];
+        submit_create(&mut l, 1, "a");
+        let tip = Replica::journal_tip(&l.meta);
+        ack(&mut l, 2, 1, tip);
+        assert!(l.core.ack.hold_acked.is_empty());
+        assert_eq!(l.core.stats.hold_acks_ignored, 1);
+    }
+
+    /// The hold streams to every member of its epoch, subscribed or not,
+    /// and the owner's wait for an acknowledgement is counted per batch.
+    #[test]
+    fn the_hold_streams_to_every_member_and_times_the_ack() {
+        let mut h = owner(2);
+        assert!(h.core.stream_subscribers().is_empty(), "nobody subscribed");
+        let tip = tip(&h);
+        let mut out = Vec::new();
+        h.core.stream_ahead(h.clk(), 0, tip, &h.meta, &mut out);
+        let to: Vec<NodeId> = sends(&out)
+            .into_iter()
+            .filter(|(_, m)| matches!(m, PeerMsg::StreamAhead { .. }))
+            .map(|(to, _)| to)
+            .collect();
+        assert_eq!(to, vec![2, 3], "{out:?}");
+        // (The creates streamed ahead already, to the members too.)
+        let (n2, n3) = (
+            h.core.ack.hold_sent[&2].len() as u64,
+            h.core.ack.hold_sent[&3].len() as u64,
+        );
+        assert!(n2 >= 1 && n3 >= 1);
+        h.advance(40);
+        ack(&mut h, 2, 1, tip);
+        assert_eq!(h.core.stats.hold_ack_wait_ms, 40 * n2);
+        assert!(h.core.ack.hold_sent[&2].is_empty());
+        h.advance(10);
+        ack(&mut h, 3, 1, tip);
+        assert_eq!(h.core.stats.hold_ack_wait_ms, 40 * n2 + 50 * n3);
+        assert_eq!(h.core.stats.hold_acks, 2);
+    }
+}

@@ -861,6 +861,15 @@ pub enum Payload {
         through: u64,
         next: Option<u64>,
     },
+    /// Plan 46 M1.4 step 1: an epoch member tells the hold owner it holds
+    /// the owner's journal of `epoch` through `through` (its store
+    /// transaction committed). Cumulative; `from` is the member. Answered
+    /// with [`Payload::Ok`] (nothing to say).
+    StreamAheadAck {
+        from: u64,
+        epoch: u64,
+        through: u64,
+    },
 }
 
 /// A lease's renewal key on the wire (`constellation_store_s3::RenewalKey`):

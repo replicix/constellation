@@ -444,6 +444,8 @@ impl EngineControl {
                     backup_ack_timeouts: stats.backup_ack_timeouts,
                     acks_waited: stats.acks_waited,
                     ack_wait_ms_total: stats.ack_wait_ms_total,
+                    hold_acks: stats.hold_acks,
+                    hold_ack_wait_ms: stats.hold_ack_wait_ms,
                     acks_aborted: stats.acks_aborted,
                     streamed_ahead: stats.streamed_ahead,
                     streamed_installed: stats.streamed_installed,

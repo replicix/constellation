@@ -4024,6 +4024,14 @@ impl Driver {
                     committed,
                 },
             })),
+            SyncRequest::PeerStreamAheadAck {
+                from,
+                epoch,
+                through,
+            } => Some(Internal::Event(Event::Peer {
+                from,
+                msg: PeerMsg::StreamAheadAck { epoch, through },
+            })),
             SyncRequest::PeerHolderAlive {
                 holder,
                 epoch,
@@ -5857,6 +5865,28 @@ impl Driver {
                     };
                     // Fire and forget: a follower that misses a batch
                     // gets the rows from the segment.
+                    let _ = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
+                });
+            }
+            PeerMsg::StreamAheadAck { epoch, through } => {
+                let peers = self.deps.peers.clone();
+                let from = self.node_id;
+                let timeout = Duration::from_millis(self.core.config().backup_ack_timeout_ms);
+                if crate::fault::p2p_denied(to) {
+                    return;
+                }
+                tokio::spawn(async move {
+                    let payload = Payload::StreamAheadAck {
+                        from,
+                        epoch,
+                        through,
+                    };
+                    // Fire and forget, cumulative: the next batch's ack
+                    // covers a lost one.
                     let _ = tokio::time::timeout(
                         timeout,
                         peers.request_to_node_timeout(to, &payload, timeout),

@@ -67994,3 +67994,65 @@ they are closed now.
    backup stream, the delegate crashes for good. `+commit` ×2,000, with and without slow lease reads: 0 failing. (The oracles judge; the sum of
    `deleg_prev_root_rows` is not asserted.) `reset_for_rebuilt_ns_tx` still queues appended rows as `Records`, as noted above.
 7. `set_deleg_prev_roots` failures are logged and counted (`Stats::deleg_prev_roots_persist_failed`, `persist_prev_roots`), not ignored.
+
+### Plan 46 M1.4 step 0 (baseline and fail-before, runs only)
+
+Main `cb4d8dd5`, release sim binary, seeds 0..1,999. Two sim-harness additions only (no product change): the `+durability` variant
+(`strict_durability`) and `flex-zero` in `sweep_config`. Every configuration ran under `+commit+identity+settle` (std) and with `+durability`
+(dur). Failing seeds:
+
+| configuration | std | dur | mechanism (std) |
+|---|---|---|---|
+| `flex` | 71 | 71 | I1, the hold's `Final` |
+| `flex-crash` | 28 | 263 | 27 I1 hold, 1 I4 late landing (186); dur: 242 refusals that saw an acknowledged effect rolled back |
+| `flex-tight` | 61 | 70 | 56 I1 hold, 5 I1 class claim (182, 390, 717, 1119, 1286); dur: 9 history-order |
+| `flex-backup` | 73 | 73 | I1 hold |
+| `flex-taker-ahead` | 39 | 39 | I1 hold |
+| `flex-promiser-restart-step-forward` | 136 | 136 | I1 hold |
+| `delegated-epoch` | 56 | 139 | 55 I1 hold, 1 I4 late landing (606); dur: 82 history-order, 2 rolled-back refusals |
+| `locks-unlinked-delegated-blips` | 3 | 3 | 2 I1 hold (351, 1877), 1 I4 late landing (132) |
+| `locks-blips-tight-faults` | 1 | 4 | I1 class claim (1747, a singleton claim, not the hold); dur: I5 962 and 1488, history-order 1935 |
+| `locks-blips-tight-delegated` | 0 | 1 | dur: history-order 26 |
+| `flex-zero`, `locks-blips`, `-tight`, `-tight-single`, `-tight-long-lease`, `-tight-in-doubt`, `locks-core-stall-blips` | 0 | 0 | |
+
+(`+lone`, `flex`/`flex-crash`/`flex-tight`/`flex-backup`: I5 only in `flex-tight`, seeds 353, 615, 915, 1147, 1328, 1489, the same seeds as its
+history-order failures. `flex-crash+lone`: 0 I5; seeds 807 and 39 are clean on this main.)
+
+Classification. **The hold's `Final` I1** ("shadow(s) installed for an answer not said to be committed") is every I1 of the flex configurations, by
+definition, and removes with step 2. **I2(b): 0** on every configuration (M0.2 closed it; `flex-crash+identity` 0). **I5: none** in the flex
+configurations but `flex-tight+lone` (the hold's answers rolled back; the durability variant sees the same seeds as history-order failures), so
+step 2 owns them. **The `+durability` flex-crash class** (242 refusals that observed an effect later rolled back) is the hold answering before the
+effect is held by a second node: step 2 too. **I1 class claim, `flex-tight` (5)**: an answer says `archive_waits` for a row the hold owner holds as
+`Final` (the owner changed its rule between the answer and its re-tag); a step 2 mechanism, to be confirmed there. **I4 ceilings: 3 seeds in
+all** (`flex-crash` 186, `delegated-epoch` 606, `locks-unlinked-delegated-blips` 132): `unacked_fails_never_lands_late`, an op answered in doubt
+that lands after a later op was invoked, each after an epoch outage with a reboot or a member crash. They do not fail I1 and the hold's rule does
+not touch them: candidates for step 6b (not the lease-path buckets A, C, O by their faults; to be confirmed when triaged). The singleton claim
+(`locks-blips-tight-faults` 1747) is M1.1's.
+
+Model: `c10_knob_hold_answers_uncommitted_is_found` and the three `c10_design_*` tests pass (4 of 4). Harness (release, `--s3-backend docker`,
+host loaded by other jobs): `epoch-member-dies-with-chunk` seeds 42, 43, 44: PASSED (48.5, 52.5, 44.1 s); `epoch-member-lost` (the nearest
+scenario to the sim's `flex-crash`; the harness has no scenario of that name) PASSED (17.2, 17.4, 14.9 s). The S3-outage own-op latency baseline
+for the perf gate was not measured here (step 2's gate).
+
+### Plan 46 M1.4 step 1 (`StreamAheadAck`)
+
+**What landed.** `PeerMsg::StreamAheadAck { epoch, through }` (member to owner, one-way, cumulative), `Payload::StreamAheadAck { from, epoch,
+through }`, `SyncRequest::PeerStreamAheadAck`, `PeerService::stream_ahead_ack`; wire break, no shims. A member whose epoch is open sends it at the end
+of `on_stream_ahead`, after `install_streamed` returned (the store transaction committed), with the highest seq the call left in its store: an
+installed transaction, one it held already (an owner that restarted re-streams its journal), a hole, or a row the log has. Nothing is sent for a
+batch it dropped, parked or failed to install. The owner (`on_stream_ahead_ack`) keeps `ack.hold_acked: BTreeMap<NodeId, jseq>` (highest per member,
+clamped to its journal tip) only while it owns the hold of that epoch and the sender is another member; anything else counts in
+`hold_acks_ignored`. The hold now streams to every member of its epoch (`pr.epoch_members`), subscribed or not. Status: `status.ack.hold_acks` and
+`hold_ack_wait_ms` (the per-batch sum, send to ack; schema re-blessed, no version bump). **No answer reads any of it.**
+
+**Tests** (core `hold_ack`): `a_member_acks_only_what_its_store_holds`, `the_owner_records_the_highest_through_per_member`,
+`an_ack_from_outside_the_epoch_or_for_another_is_ignored`, `the_hold_streams_to_every_member_and_times_the_ack`.
+
+**Sweeps** (release, ×2,000, `+commit+identity+settle`): the failing sets are not identical to main's: the new messages shift the sim's random
+draws (flex 71 to 64, flex-crash 28 to 32, flex-tight 61 to 51 seeds; all I1 hold, same classes, no new class; plain `flex`, `flex-crash`,
+`flex-tight` ×2,000 pass on both). With the ack send and the extra recipients compiled out, the sets are identical to main's on all three
+(71, 28, 61), so nothing else in the step changes behaviour. Open for step 2: a member that drops a batch (not following the owner yet) never acks,
+and the owner does not resend; the hold's rule needs a resend or the deadline.
+
+**Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta, net, control (schema), authority lib 1,076, engine lib
+952, release sim suite 419 passed, 0 failed, 12 ignored. No perf gate (wire only).

@@ -1065,6 +1065,15 @@ pub enum PeerMsg {
         through: u64,
         next: Option<u64>,
     },
+    /// Plan 46 M1.4 step 1: an epoch member holds the hold owner's journal
+    /// through `through` of `epoch` (its store transaction for the
+    /// `StreamAhead` batch committed). Member to owner, one-way, cumulative
+    /// (the highest `through` counts). The owner ignores one that is from a
+    /// node outside the epoch, for another epoch, or while it holds no hold.
+    StreamAheadAck {
+        epoch: Epoch,
+        through: u64,
+    },
 }
 
 impl PeerMsg {
@@ -1116,6 +1125,7 @@ impl PeerMsg {
             PeerMsg::LockTestReply { .. } => "LockTestReply",
             PeerMsg::SealTail { .. } => "SealTail",
             PeerMsg::SealedTail { .. } => "SealedTail",
+            PeerMsg::StreamAheadAck { .. } => "StreamAheadAck",
         }
     }
 

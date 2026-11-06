@@ -1017,6 +1017,17 @@ impl constellation_net::PeerService for P2pBridge {
         });
     }
 
+    fn stream_ahead_ack(&self, from: u64, epoch: u64, through: u64) {
+        if crate::fault::p2p_denied(from) {
+            return;
+        }
+        let _ = self.nudge.send(sync::SyncRequest::PeerStreamAheadAck {
+            from,
+            epoch,
+            through,
+        });
+    }
+
     fn holder_alive(
         &self,
         holder: u64,

@@ -518,6 +518,13 @@ pub enum SyncRequest {
         txs: Vec<constellation_meta::BackupTx>,
         committed: bool,
     },
+    /// Plan 46 M1.4 step 1: an epoch member holds the hold owner's
+    /// journal through `through`.
+    PeerStreamAheadAck {
+        from: u64,
+        epoch: u64,
+        through: u64,
+    },
     /// The lease holder's off-core liveness heartbeat, stamped with its
     /// arrival (this node's wait clock, ms): `Event::HolderAlive`, with the beat's number
     /// and stamps (`constellation_net::Beat`).

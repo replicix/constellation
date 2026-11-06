@@ -2434,6 +2434,13 @@ pub struct AckStatus {
     pub backup_ack_timeouts: u64,
     pub acks_waited: u64,
     pub ack_wait_ms_total: u64,
+    /// Plan 46 M1.4: as an epoch hold's owner, the members' acknowledgements
+    /// of the stream-ahead recorded, and the summed wait for them (per
+    /// batch, sent to acknowledged).
+    #[serde(default)]
+    pub hold_acks: u64,
+    #[serde(default)]
+    pub hold_ack_wait_ms: u64,
     pub acks_aborted: u64,
     pub streamed_ahead: u64,
     pub streamed_installed: u64,

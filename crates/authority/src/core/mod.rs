@@ -1762,6 +1762,13 @@ pub struct Stats {
     /// A member's accepted forwards whose `base` only the epoch stream
     /// could deliver, answered once it did.
     pub epoch_forwards_streamed: u64,
+    /// Plan 46 M1.4 step 1, hold owner: member acknowledgements of the
+    /// stream-ahead recorded, their summed latency (batch sent to ack
+    /// received, per batch), and those ignored (a node outside the epoch,
+    /// another epoch, no hold).
+    pub hold_acks: u64,
+    pub hold_ack_wait_ms: u64,
+    pub hold_acks_ignored: u64,
 }
 
 /// The log cursor and ship bookkeeping (`Shipper::PartState` + `SpoolInfo`).
@@ -2856,6 +2863,9 @@ impl Core {
                 txs,
                 committed,
             } => self.on_stream_ahead(now, from, epoch, base, txs, committed, replica, out),
+            PeerMsg::StreamAheadAck { epoch, through } => {
+                self.on_stream_ahead_ack(now, from, epoch, through, replica)
+            }
             PeerMsg::BackupHold { epoch, for_ms } => self.on_backup_hold(now, from, epoch, for_ms),
             PeerMsg::PromiseRequest { req, key } => {
                 self.on_promise_request(now, from, req, key, replica, out)

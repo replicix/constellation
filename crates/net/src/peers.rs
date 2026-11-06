@@ -1526,6 +1526,7 @@ fn claimed_node_id(payload: &Payload) -> Option<u64> {
         | DelegRenewed { from, .. }
         | DelegBackupAppend { from, .. }
         | StreamAhead { from, .. }
+        | StreamAheadAck { from, .. }
         | LockGranted { from, .. }
         | LockCancel { from, .. }
         | LockReleased { from, .. }
@@ -1871,6 +1872,14 @@ async fn handle_stream<S: PeerService>(
                 committed,
             } => {
                 service.stream_ahead(from, epoch, base, txs, committed);
+                Some(Payload::Ok { req_id: 0 })
+            }
+            Payload::StreamAheadAck {
+                from,
+                epoch,
+                through,
+            } => {
+                service.stream_ahead_ack(from, epoch, through);
                 Some(Payload::Ok { req_id: 0 })
             }
             Payload::BackupHold {

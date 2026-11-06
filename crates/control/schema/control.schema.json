@@ -241,6 +241,19 @@
           "minimum": 0,
           "type": "integer"
         },
+        "hold_ack_wait_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hold_acks": {
+          "default": 0,
+          "description": "Plan 46 M1.4: as an epoch hold's owner, the members' acknowledgements\nof the stream-ahead recorded, and the summed wait for them (per\nbatch, sent to acknowledged).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "inbox_halted": {
           "default": 0,
           "description": "Inbox batches halted at an op behind the replay queue (the ops\nbehind it in the batch wait with it: a batch runs in order).",
