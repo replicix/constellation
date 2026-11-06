@@ -263,6 +263,9 @@ impl Harness {
             granted_delegations: true,
             retired: Vec::new(),
             inherited_tail: None,
+            // A harness tenure is a singleton's configuration until a test
+            // lists a backup (plan 46 M1.1 step 5).
+            singleton: true,
         };
         self.core.lease.adopt(self.clk(), lease, tag(), gate);
         self.meta.set_holder_epoch(epoch);
@@ -273,6 +276,38 @@ impl Harness {
 /// agree).
 fn hm(ms: Ms) -> HonourMs {
     HonourMs(ms.0)
+}
+
+/// Plan 46 M1.1 step 5: the lease change this core has out (a backup-set
+/// reconfiguration or a singleton bump) lands.
+fn land_reconfig(h: &mut Harness) -> Vec<Action> {
+    let mut out = Vec::new();
+    if h.core.ack.reconfig.is_some() {
+        h.core
+            .on_reconfig_put(h.clk(), S3Result::LeasePut(Ok(tag())), &h.meta, &mut out);
+    }
+    out
+}
+
+/// A singleton bump runs its course: it is issued (the rate limit past),
+/// lands, and the log carries the journal through it.
+fn settle_singleton(h: &mut Harness) -> Vec<Action> {
+    let mut all = Vec::new();
+    for _ in 0..4 {
+        h.advance(400);
+        all.extend(h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        }));
+        all.extend(land_reconfig(h));
+        let tip = h.meta.journal_tip().unwrap();
+        h.core.note_shipped(&[], tip);
+        all.extend(h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        }));
+    }
+    all
 }
 
 fn tag() -> constellation_store_s3::LeaseTag {
@@ -2554,6 +2589,7 @@ fn lose_renewal_with_a_create_of_class(
         granted_delegations: false,
         retired: Vec::new(),
         inherited_tail: None,
+        singleton: false,
     };
     h.step(Event::S3 {
         op: reread,
@@ -12268,6 +12304,12 @@ mod pipelined_appends {
         journal(&h, "a", 1);
         journaled(&mut h, 900);
         let reconfig_min = h.core.cfg.backup_reconfig_min_ms;
+        // (A peer's configuration: no singleton bump stands in the way.)
+        h.core.lease.held.as_mut().unwrap().0.singleton = false;
+        h.core.ack.reconfig = None;
+        h.core.ack.reconfig_wanted = None;
+        h.core.ack.cfg_seen = None;
+        h.core.sync_cfg_spans(&h.meta);
         // Every candidate times out (no acknowledgement, no heartbeat
         // answer); the bring-ups over two minutes, with their times.
         let start = h.now;
@@ -12721,6 +12763,7 @@ mod m10 {
             granted_delegations: false,
             retired: Vec::new(),
             inherited_tail: None,
+            singleton: false,
         }
     }
 
@@ -13380,6 +13423,7 @@ mod m10 {
             h.core.config(),
             Some(&Lease::granted("p0", 1, 4, 10_000)),
             false,
+            false,
         );
         assert_eq!(
             granted.epoch, 5,
@@ -13664,6 +13708,7 @@ fn lease_of(holder: NodeId, epoch: Epoch, expires_unix_ms: i64) -> Lease {
         granted_delegations: false,
         retired: Vec::new(),
         inherited_tail: None,
+        singleton: false,
     }
 }
 
@@ -14196,7 +14241,7 @@ mod backup_crash {
 
     /// The configuration of the backup-sim configs: a backup within 50 ms,
     /// a link stable after 200 ms.
-    fn backup_node(h: &mut Harness, roster: Vec<NodeId>) {
+    pub(super) fn backup_node(h: &mut Harness, roster: Vec<NodeId>) {
         h.core.cfg.p2p = true;
         h.core.cfg.backup_rtt_budget_ms = 50;
         h.core.cfg.backups_max = 1;
@@ -14208,7 +14253,12 @@ mod backup_crash {
 
     /// Node 2 linked (or not), its link up for `age` ms and measured at
     /// `rtt_ms`.
-    fn link_2(h: &mut Harness, connected: bool, rtt_ms: Option<u64>, age: u64) -> Vec<Action> {
+    pub(super) fn link_2(
+        h: &mut Harness,
+        connected: bool,
+        rtt_ms: Option<u64>,
+        age: u64,
+    ) -> Vec<Action> {
         link_2_after(h, connected, rtt_ms, age, 0)
     }
 
@@ -14416,6 +14466,7 @@ mod backup_crash {
             last_write: WaitMs(0),
             acked_seqs: Vec::new(),
         });
+        settle_singleton(&mut h);
         assert_eq!(h.core.ack_need(&pos), None, "a singleton waits for ever");
         assert!(h.core.root_lone());
         // Another lapse: not lone until the next snapshot after it; and a
@@ -14431,6 +14482,7 @@ mod backup_crash {
             last_write: WaitMs(0),
             acked_seqs: Vec::new(),
         });
+        settle_singleton(&mut h);
         assert!(h.core.root_lone());
     }
 
@@ -14524,10 +14576,12 @@ mod backup_crash {
         h.advance(10);
         link_2_after(&mut h, false, None, 0, 1);
         h.advance(100);
-        let out = h.step(Event::Activity {
+        let mut out = h.step(Event::Activity {
             last_write: WaitMs(0),
             acked_seqs: Vec::new(),
         });
+        // Plan 46 M1.1 step 5: at the lease's singleton bump, committed.
+        out.extend(settle_singleton(&mut h));
         assert_eq!(replies(&out).len(), 1, "{out:?}");
     }
 
@@ -14719,10 +14773,18 @@ mod backup_crash {
         });
         assert!(replies(&out).is_empty(), "answered at once: {out:?}");
         // The peer goes away; the next selection pass finds nobody in
-        // budget, the gate is off, and the answer leaves.
+        // budget. Plan 46 M1.1 step 5: the rule does not change until the
+        // lease's singleton bump has landed and the log carries the
+        // journal through it, and the row keeps its class (Archive).
         h.advance(100);
         let out = link_2(&mut h, false, None, 0);
-        assert_eq!(h.core.durable_jseq(), u64::MAX, "the gate is still on");
+        assert!(
+            replies(&out).is_empty(),
+            "answered before the bump: {out:?}"
+        );
+        assert_ne!(h.core.durable_jseq(), u64::MAX, "the gate is still on");
+        let out = settle_singleton(&mut h);
+        assert_eq!(h.core.durable_jseq(), u64::MAX, "the bump is committed");
         let replied = replies(&out);
         assert_eq!(replied.len(), 1, "{out:?}");
         assert!(matches!(
@@ -14730,12 +14792,12 @@ mod backup_crash {
                 Action::Reply { source, .. } => Some(*source),
                 _ => None,
             }),
-            Some(crate::AnswerSource::Sequenced(AckClass::Lone))
+            Some(crate::AnswerSource::Sequenced(AckClass::Archive))
         ));
         assert_eq!(
             class_of(&h, rid1),
-            Some(constellation_meta::RowCommit::LONE),
-            "answered lone over a row still tagged otherwise"
+            Some(constellation_meta::RowCommit::ARCHIVE),
+            "answered from the archive: the row keeps its class"
         );
         assert_eq!(
             class_of(&h, rid2),
@@ -14787,10 +14849,11 @@ mod backup_crash {
             class_of(&h, rid2),
             Some(constellation_meta::RowCommit::ARCHIVE)
         );
-        // The gate goes off: the answer leaves.
+        // The peer goes away: the answer leaves from the archive once the
+        // log carries the journal (the bump's commit), as the archive's.
         h.advance(100);
-        let out = link_2(&mut h, false, None, 0);
-        assert_eq!(h.core.durable_jseq(), u64::MAX, "the gate is still on");
+        let mut out = link_2(&mut h, false, None, 0);
+        out.extend(settle_singleton(&mut h));
         let sources: Vec<_> = out
             .iter()
             .filter_map(|a| match a {
@@ -28483,7 +28546,7 @@ mod locks {
         let next = h
             .core
             .lease
-            .granted_lease(h.clk(), &h.core.cfg, Some(&own), false);
+            .granted_lease(h.clk(), &h.core.cfg, Some(&own), false, false);
         assert_eq!(next.epoch, 4);
         assert!(next.granted_delegations);
         let mut other = lease_of(2, 4, h.now.0 + 5_000);
@@ -28491,14 +28554,14 @@ mod locks {
         let next = h
             .core
             .lease
-            .granted_lease(h.clk(), &h.core.cfg, Some(&other), false);
+            .granted_lease(h.clk(), &h.core.cfg, Some(&other), false, false);
         assert_eq!(next.epoch, 5);
         assert!(!next.granted_delegations);
         own.released = true;
         let next = h
             .core
             .lease
-            .granted_lease(h.clk(), &h.core.cfg, Some(&own), false);
+            .granted_lease(h.clk(), &h.core.cfg, Some(&own), false, false);
         assert!(
             !next.granted_delegations,
             "a released lease ended its tenure"
@@ -34900,6 +34963,7 @@ fn an_inbox_op_is_forwarded_once_the_holder_is_reachable() {
         granted_delegations: false,
         retired: Vec::new(),
         inherited_tail: None,
+        singleton: false,
     };
     let out = h.step(Event::S3 {
         op: get,
@@ -36636,6 +36700,7 @@ fn a_barrier_around_a_deposition_waits_for_the_replay_not_the_strand() {
         granted_delegations: false,
         retired: Vec::new(),
         inherited_tail: None,
+        singleton: false,
     };
     let deposed = h.step(Event::S3 {
         op: reread,
@@ -39245,6 +39310,7 @@ fn root_lease(holder: NodeId, epoch: Epoch, expires: Ms) -> Lease {
         granted_delegations: false,
         retired: Vec::new(),
         inherited_tail: None,
+        singleton: false,
     }
 }
 
@@ -41921,7 +41987,10 @@ mod honour_clock {
         let mut h = Harness::new(1);
         h.step_wall(-3_000);
         let cfg = h.core.config().clone();
-        let lease = h.core.lease.granted_lease(h.clk(), &cfg, None, false);
+        let lease = h
+            .core
+            .lease
+            .granted_lease(h.clk(), &cfg, None, false, false);
         assert_eq!(lease.expires_unix_ms, h.now.0 + cfg.ttl_ms as i64);
         assert_eq!(lease.holder_expires_ms, h.honour().0 + cfg.ttl_ms as i64);
         assert_eq!(lease.holder_expires_ms - lease.expires_unix_ms, 3_000);
@@ -45383,10 +45452,16 @@ mod deleg_group {
         let out = record_group(&mut h, dir, 2, 1, vec![4]);
         assert_eq!(h.core.dl.mine[&7].group_backups, vec![4]);
         assert!(h.core.dl.mine[&7].group_requested.is_none());
-        assert!(
-            answer_to_2(&out, 500).is_some(),
-            "recorded: the backup's ack counts: {out:?}"
+        // Plan 46 M1.1 step 5: a row keeps the rule of the group it was
+        // journaled in (here the delegate and the root, no backup
+        // recorded), and the record commits under old and new: the
+        // backup's hold does not answer it; the root's commit does.
+        assert_eq!(
+            answer_to_2(&out, 500),
+            None,
+            "the row's own group is the delegate and the root: {out:?}"
         );
+        h.core.dl.mine.get_mut(&7).unwrap().root_committed = 10;
         // A later row waits for the backup alone — not for the root.
         let out = forward_create(&mut h, dir, 2, 501);
         let (breq, last) = backup_append(&out).expect("appended");
@@ -45495,9 +45570,19 @@ mod deleg_group {
             "{renewals:?}"
         );
         let out = record_group(&mut h, dir, 3, 2, vec![]);
+        // Plan 46 M1.1 step 5: the row was journaled under the group that
+        // names the backup, and keeps that rule (the record without it
+        // commits under old and new): the backup holds nothing, so it
+        // waits for the log, not the root's append.
+        assert_eq!(
+            answer_to_2(&out, 500),
+            None,
+            "the row keeps the group it was journaled in: {out:?}"
+        );
+        let log = h.meta.log_stream_idx(7).unwrap();
         assert!(
-            answer_to_2(&out, 500).is_some(),
-            "the record without the backup is applied: the root's append is the group: {out:?}"
+            h.core.dl.mine[&7].group_spans.iter().any(|s| s.end > log),
+            "the closed group still bears on the row"
         );
     }
 
@@ -46253,6 +46338,12 @@ mod deleg_group {
         h.core.cfg.delegation_ttl_ms = 1_000;
         h.hold(1, None);
         h.core.ack.eligible = Some(false);
+        // The bump that records the singleton landed and is committed.
+        h.core.lease.held.as_mut().unwrap().0.singleton = true;
+        h.core.lease.held.as_mut().unwrap().0.ack_policy = constellation_store_s3::AckPolicy::Local;
+        h.core.ack.cfg_seen = None;
+        h.core.ack.spans.clear();
+        h.core.sync_cfg_spans(&h.meta);
         assert_eq!(h.core.durable_jseq(), u64::MAX);
         let out = root_takes_a_delegates_batch(&mut h);
         assert_eq!(h.core.dl.gens[&7].cursor, 1, "the root did not append");
@@ -47821,6 +47912,9 @@ mod c1_counted {
         let mut h = Harness::new(1);
         h.hold(1, None);
         h.core.lease.held.as_mut().unwrap().0.config_version = cv;
+        // A candidate is being brought up: the tenure is a peer's
+        // configuration (plan 46 M1.1 step 5), the lease says so.
+        h.core.lease.held.as_mut().unwrap().0.singleton = false;
         h.core.ack.candidate = Some(2);
         h.core.ack.peers.insert(
             2,
@@ -47934,8 +48028,13 @@ mod c1_counted {
         assert_eq!(listed.len(), 1, "an append at the new version: {out:?}");
         assert_eq!(listed[0].2, 2);
         ack(&mut h, listed[0].0, tip2, false);
-        assert_eq!(h.core.ack_need(&pos(tip2)), None);
         assert_eq!(h.core.ack.peers[&2].counted, tip2);
+        // (The row was journaled under the version before the listing, the
+        // archive's rule: the backup's hold alone does not commit it, plan
+        // 46 M1.1 step 5.)
+        assert_eq!(h.core.ack_need(&pos(tip2)), Some(tip2));
+        h.core.note_shipped(&[], tip2);
+        assert_eq!(h.core.ack_need(&pos(tip2)), None);
     }
 
     /// 892, the discard: the candidate read the lease unlisted while the
@@ -47966,6 +48065,10 @@ mod c1_counted {
         ack(&mut h, resend[0].0, tip2, false);
         let p = &h.core.ack.peers[&2];
         assert_eq!((p.acked, p.counted), (tip2, tip2));
+        // (Journaled under the version before the listing: the archive's
+        // rule, plan 46 M1.1 step 5.)
+        assert_eq!(h.core.ack_need(&pos(tip2)), Some(tip2));
+        h.core.note_shipped(&[], tip2);
         assert_eq!(h.core.ack_need(&pos(tip2)), None);
     }
 
@@ -47990,6 +48093,10 @@ mod c1_counted {
         assert_eq!(listed.len(), 1, "{out:?}");
         assert_eq!(listed[0].2, 4);
         ack(&mut h, listed[0].0, tip1 + 4, false);
+        // (Journaled under the version before the listing: the archive's
+        // rule, plan 46 M1.1 step 5.)
+        assert_eq!(h.core.ack_need(&pos(tip1)), Some(tip1));
+        h.core.note_shipped(&[], tip1);
         assert_eq!(h.core.ack_need(&pos(tip1)), None);
     }
 
@@ -48003,7 +48110,10 @@ mod c1_counted {
         let listed = appends(&out);
         assert_eq!(listed.len(), 1, "{out:?}");
         ack(&mut h, listed[0].0, tip1, false);
-        assert_eq!(h.core.ack_need(&pos(tip1)), None);
+        // (Row `a` was journaled under the version before the listing, the
+        // archive's rule: the backup's hold does not commit it; plan 46
+        // M1.1 step 5.)
+        assert_eq!(h.core.ack_need(&pos(tip1)), Some(tip1));
         // Everything acknowledged is in the log: the removal of the last
         // backup is safe to issue (`removal_safe`).
         h.core.note_shipped(&[tip1], tip1);
@@ -51951,6 +52061,12 @@ mod c1_class {
         h.core.ack.peers.clear();
         h.core.ack.candidate = None;
         h.core.ack.eligible = Some(false);
+        // The bump that records the singleton landed and is committed.
+        h.core.lease.held.as_mut().unwrap().0.singleton = true;
+        h.core.lease.held.as_mut().unwrap().0.ack_policy = constellation_store_s3::AckPolicy::Local;
+        h.core.ack.cfg_seen = None;
+        h.core.ack.spans.clear();
+        h.core.sync_cfg_spans(&h.meta);
         assert_eq!(h.core.durable_jseq(), u64::MAX);
     }
 
@@ -53086,6 +53202,12 @@ mod c2f_lone_root {
         h.core.ack.peers.clear();
         h.core.ack.candidate = None;
         h.core.ack.eligible = Some(false);
+        // The bump that records the singleton landed and is committed.
+        h.core.lease.held.as_mut().unwrap().0.singleton = true;
+        h.core.lease.held.as_mut().unwrap().0.ack_policy = constellation_store_s3::AckPolicy::Local;
+        h.core.ack.cfg_seen = None;
+        h.core.ack.spans.clear();
+        h.core.sync_cfg_spans(&h.meta);
         assert_eq!(h.core.durable_jseq(), u64::MAX);
         assert!(h.core.root_lone());
     }
@@ -53100,6 +53222,14 @@ mod c2f_lone_root {
         let mut out = Vec::new();
         h.core.complete_ready(h.clk(), &h.meta, &mut out);
         out
+    }
+
+    /// The roster read says the requester of a forward is no peer (C8
+    /// condition 3 counts a requester until the directory or the roster
+    /// says otherwise): the root is a singleton again.
+    fn forget_requesters(h: &mut Harness) {
+        h.core.peer_requesters.clear();
+        h.core.ack.eligible = Some(false);
     }
 
     /// The log carries everything journaled so far.
@@ -53119,6 +53249,7 @@ mod c2f_lone_root {
         let out = h.step(forward(&h, 71, 1, "f"));
         assert!(answers(&out).is_empty(), "waits for the archive: {out:?}");
         assert_eq!(classes_of(&h, forwarded(1)), vec![RowCommit::ARCHIVE]);
+        forget_requesters(&mut h);
         // Its own client: at once, the lone node's answer.
         let own = h.rid(2);
         let out = h.step(Event::Submit {
@@ -53164,6 +53295,7 @@ mod c2f_lone_root {
     fn a_lone_roots_forwarded_row_never_enters_the_replay_queue() {
         let mut h = lone_root();
         h.step(forward(&h, 71, 1, "f"));
+        forget_requesters(&mut h);
         let own = h.rid(2);
         h.step(Event::Submit {
             policy: Policy::Client,
@@ -58157,5 +58289,270 @@ mod await_retry {
             .unwrap();
         assert!(h.meta.lookup(ROOT_INO, "moved").unwrap().is_some());
         assert_eq!(h.core.stats.inbox_halted, 1);
+    }
+}
+
+/// Plan 46 M1.1 step 5: reconfiguration under old and new, uniformly. A row
+/// keeps the rule of the configuration it was journaled in; a change of the
+/// lease's backup set or of its singleton flag commits under the old rule
+/// and the new one, and every later row under the new one. The singleton
+/// transition is a lease `config_version` bump, triggered by the event-time
+/// singleton test (the C8 model's conditions 1 to 5).
+mod m11_step5 {
+    use super::backup_crash::{backup_node, link_2};
+    use super::c1_counted::{ack, appends, holder, listed_holder, pos, reconfigure, row};
+    use super::*;
+    use constellation_meta::RowCommit;
+
+    fn swap_lease(out: &[Action]) -> Option<Lease> {
+        out.iter().find_map(|a| match a {
+            Action::S3 {
+                req: S3Op::LeaseSwap { lease, .. },
+                ..
+            } => Some(lease.clone()),
+            _ => None,
+        })
+    }
+
+    fn classes_of(h: &Harness, rid: Rid) -> Vec<RowCommit> {
+        h.meta.journal_classes_of_rid(rid).unwrap()
+    }
+
+    fn submit(h: &mut Harness, seq: u64, name: &str) -> (Rid, Vec<Action>) {
+        let rid = h.rid(seq);
+        let op = h.create(name);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        (rid, out)
+    }
+
+    fn release(h: &mut Harness) -> Vec<Action> {
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        out
+    }
+
+    fn ship_through_tip(h: &mut Harness) {
+        let tip = h.meta.journal_tip().unwrap();
+        h.core.note_shipped(&[], tip);
+    }
+
+    fn activity(h: &mut Harness) -> Vec<Action> {
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        })
+    }
+
+    /// (a) A peer leaves a root whose row waits for its backup: the removal
+    /// lands as a singleton's configuration, and the next own row is not
+    /// answered alone at once: nothing after the change is answered before
+    /// the old rule (the backup's hold, or the archive) has committed
+    /// everything before it. Rows before keep their rule and version
+    /// (conditions 1 and 2). Fails on main: the removal's landing releases
+    /// the parked row and the next row alone.
+    #[test]
+    fn a_peer_that_leaves_waits_for_the_bump_before_the_next_row_is_answered_alone() {
+        let (mut h, _) = listed_holder();
+        let v1 = h.core.lease.held.as_ref().unwrap().0.config_version;
+        let (old, out) = submit(&mut h, 2, "r");
+        assert!(replies(&out).is_empty(), "parked for the backup: {out:?}");
+        assert_eq!(classes_of(&h, old)[0].versionless(), RowCommit::ROOT_GROUP);
+        // The backup leaves; nobody else is in budget: the removal lands.
+        let out = reconfigure(&mut h, vec![], Ok(()));
+        assert!(
+            replies(&out).is_empty(),
+            "answered alone by the landing: {out:?}"
+        );
+        let v2 = h.core.lease.held.as_ref().unwrap().0.config_version;
+        assert!(v2 > v1);
+        assert_ne!(h.core.durable_jseq(), u64::MAX, "the bump is not committed");
+        // The next row carries the new version and waits as well.
+        let (new, out) = submit(&mut h, 3, "n");
+        assert!(replies(&out).is_empty(), "answered alone at once: {out:?}");
+        let version = |h: &Harness, rid| -> Vec<Option<u64>> {
+            classes_of(h, rid)
+                .into_iter()
+                .map(RowCommit::config_version)
+                .collect()
+        };
+        assert_eq!(version(&h, old), vec![Some(v1)], "rows before keep theirs");
+        assert_eq!(classes_of(&h, old)[0].versionless(), RowCommit::ROOT_GROUP);
+        assert_eq!(version(&h, new), vec![Some(v2)]);
+        // The archive carries the journal: both are answered, the old row
+        // as the group row it is, the new one as the singleton's.
+        ship_through_tip(&mut h);
+        let out = release(&mut h);
+        assert_eq!(replies(&out).len(), 2, "{out:?}");
+        assert_eq!(classes_of(&h, old)[0].versionless(), RowCommit::ROOT_GROUP);
+    }
+
+    /// (b) A row journaled under v1 is answered by v1's rule, not by the
+    /// members of v2 alone (the C8 knob `ack_by_latest_config`): a row
+    /// waiting for the archive when a backup is listed stays archive-bound
+    /// until the log carries it, though the new backup holds it. Fails on
+    /// main: the new member's hold answers it.
+    #[test]
+    fn a_row_journaled_under_v1_is_not_answered_by_v2s_members_alone() {
+        let mut h = holder(1);
+        let (tip1, (req1, _, cv)) = row(&mut h, "a", 1);
+        assert_eq!(cv, 1);
+        ack(&mut h, req1, tip1, false);
+        // The listing lands: v2 names the backup.
+        let out = reconfigure(&mut h, vec![2], Ok(()));
+        let listed = appends(&out);
+        assert_eq!(listed.len(), 1, "an append at the new version: {out:?}");
+        assert_eq!(listed[0].2, 2);
+        ack(&mut h, listed[0].0, tip1, false);
+        assert_eq!(h.core.ack.peers[&2].counted, tip1, "the backup holds it");
+        assert_eq!(
+            h.core.ack_need(&pos(tip1)),
+            Some(tip1),
+            "v1's rule (the archive) has not committed the row"
+        );
+        // A row of v2 is committed by v2's members, but not past v1's row.
+        ship_through_tip(&mut h);
+        assert_eq!(h.core.ack_need(&pos(tip1)), None);
+    }
+
+    /// (c) A forward from a peer the root's view lacks (the roster read has
+    /// not come) is a singleton-test event: the root is no singleton from
+    /// that event, before it journals the peer's op, and asks for the
+    /// bump in the same event; its own client's next row is not answered
+    /// alone. Fails on main: the root stays lone until the roster read.
+    #[test]
+    fn a_forward_from_a_newly_joined_peer_bumps_before_the_roster_read() {
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1]);
+        h.hold(1, None);
+        h.core.ack.eligible = Some(h.core.backup_could_be_had());
+        assert!(h.core.root_lone(), "a singleton");
+        let before = h.core.stats.reconfig_cas;
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(71),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: 1,
+                },
+                op: h.create("f"),
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: false,
+            },
+        });
+        assert!(!h.core.root_lone(), "a peer asked: no singleton any more");
+        let swap = swap_lease(&out).expect("the bump is issued in the same event");
+        assert!(!swap.singleton, "{swap:?}");
+        assert_eq!(h.core.stats.reconfig_cas, before + 1);
+        let (own, out) = submit(&mut h, 2, "o");
+        assert!(replies(&out).is_empty(), "answered alone: {out:?}");
+        assert_eq!(
+            classes_of(&h, own)[0].versionless(),
+            RowCommit::ARCHIVE,
+            "waits for the archive"
+        );
+    }
+
+    /// (2) The singleton transition commits under old and new in both
+    /// directions: a singleton that meets a peer answers nothing alone
+    /// from the event on; a root that loses its peer answers alone only
+    /// once the log carries the journal through the bump.
+    #[test]
+    fn the_singleton_bump_commits_under_old_and_new_in_both_directions() {
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1, 2]);
+        link_2(&mut h, false, None, 0);
+        h.hold(1, None);
+        h.core.ack.eligible = Some(h.core.backup_could_be_had());
+        assert!(h.core.root_lone());
+        // A peer links: the event flips the test; the bump is issued.
+        let out = link_2(&mut h, true, Some(5), 0);
+        assert!(!h.core.root_lone());
+        assert!(swap_lease(&out).is_some_and(|l| !l.singleton), "{out:?}");
+        let (r1, out) = submit(&mut h, 1, "r1");
+        assert!(replies(&out).is_empty(), "{out:?}");
+        super::land_reconfig(&mut h);
+        assert!(!h.core.lease.held.as_ref().unwrap().0.singleton);
+        // The peer goes away: the next selection pass lowers the test, and
+        // the bump back to a singleton is issued, then lands.
+        h.advance(100);
+        link_2(&mut h, false, None, 0);
+        h.advance(400);
+        let out = activity(&mut h);
+        assert!(swap_lease(&out).is_some_and(|l| l.singleton), "{out:?}");
+        super::land_reconfig(&mut h);
+        assert!(h.core.lease.held.as_ref().unwrap().0.singleton);
+        // Nothing is answered alone until the archive carries the journal
+        // through the bump: neither the row before it nor the next.
+        let (r2, out) = submit(&mut h, 2, "r2");
+        assert!(replies(&out).is_empty(), "answered alone: {out:?}");
+        assert_eq!(
+            classes_of(&h, r2)[0].versionless(),
+            RowCommit::LONE,
+            "a singleton's row once the lease says so"
+        );
+        assert_eq!(classes_of(&h, r1)[0].versionless(), RowCommit::ARCHIVE);
+        let tip_r1 = h.meta.journal_tip().unwrap() - 1;
+        h.core.note_shipped(&[], tip_r1);
+        let out = release(&mut h);
+        assert_eq!(replies(&out).len(), 2, "{out:?}");
+        // Steady from here: a later row is answered at once, no CAS.
+        let cas = h.core.stats.reconfig_cas;
+        let (_, out) = submit(&mut h, 3, "r3");
+        assert_eq!(replies(&out).len(), 1, "{out:?}");
+        assert_eq!(h.core.stats.reconfig_cas, cas);
+    }
+
+    /// Perf: the steady path takes no lease CAS: a singleton and a backed
+    /// root answer a run of rows without a configuration change.
+    #[test]
+    fn the_steady_path_takes_no_lease_cas() {
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1]);
+        h.hold(1, None);
+        h.core.ack.eligible = Some(h.core.backup_could_be_had());
+        for i in 0..50 {
+            let (_, out) = submit(&mut h, 10 + i, &format!("f{i}"));
+            assert_eq!(replies(&out).len(), 1, "{out:?}");
+            h.advance(150);
+            activity(&mut h);
+        }
+        assert_eq!(h.core.stats.reconfig_cas, 0);
+        assert_eq!(h.core.stats.cfg_spans_closed, 0);
+        let (mut h, _) = listed_holder();
+        let cas = h.core.stats.reconfig_cas;
+        for i in 0..50 {
+            submit(&mut h, 10 + i, &format!("g{i}"));
+            h.advance(5);
+            activity(&mut h);
+        }
+        assert_eq!(h.core.stats.reconfig_cas, cas);
+    }
+
+    /// (4) A claimant is in the roster: a peer that left (retired by the
+    /// admin leave, which fences the lease against it) never claims again
+    /// until it rejoins under a new id.
+    #[test]
+    fn a_departed_peer_cannot_claim() {
+        let held = Lease::granted("p0", 2, 3, 10_000);
+        let fenced = held.fenced_for_retirement(1, 0);
+        let h = Harness::new(1);
+        let plan = h
+            .core
+            .lease
+            .classify(h.clk(), h.core.config(), Some((fenced, tag())), 0);
+        assert!(
+            matches!(plan, crate::core::lease::Plan::Refused(_)),
+            "{plan:?}"
+        );
     }
 }

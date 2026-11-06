@@ -67328,3 +67328,71 @@ The other 40 configurations (`long-delegated`, `-lead`, `-backup`, `-late-answer
   `-root-backup-unprobed`), so the sweeps carry a variant (`+commit`, `+report`). Totals do not include a seed that failed a strict flag.
 
 Gates (box 1, release): fmt clean; clippy `-D warnings` on the authority crate, all targets, clean; authority lib 1,049 passed; release sim suite 418 passed, 0 failed, 12 ignored (126 s).
+
+## Plan 46 M1.1 step 5: reconfiguration under old and new, the singleton transition as a lease bump (2026-11-06)
+
+**What changed.** A row keeps the rule of the configuration it was journaled in, and a change of the configuration commits its position under the
+old rule and the new one, every later row under the new one. For the root a configuration is the held lease's backup set, policy and a new flag,
+`Lease::singleton` (`with_singleton` bumps `config_version`; `reconfigured` lands as a peer's configuration; a claim CAS stamps the flag from the
+claimant's event-time test, `Core::singleton_test`). When a landed change (a reconfiguration, a bump, an adopted re-read of one) replaces the held
+configuration, `Core::sync_cfg_spans` closes the old one at the journal's tip (`AckState::spans`); `durable_jseq` is capped by every closed
+configuration whose own rule (its backups' holds, or the archive) has not covered its end; a singleton's closed configuration never caps. The
+singleton transition: `lone_by_event()` (the event-time test, now also true for a node that sent the root a request: a forward, a settle, an inbox
+batch, until the directory lists it or a roster read does not) against the lease's flag triggers `singleton_maintain`, a reconfiguration CAS of the
+same set that moves the flag, in the event that flipped the test; the event's tip is noted (`flip_tip`) so that rows past it are archive-bound though
+the CAS has not landed. Answering alone needs the lease to say singleton, the test to say singleton and every closed configuration covered; a row
+journaled under the singleton configuration is stamped `Singleton` from the moment the lease says so and waits for the closed configuration. For a
+delegate generation the same for the `DelegGroup` record (`DelegateState::group_spans`: a row journaled under group v1 is committed by v1's
+members, or the root for a group with none, or the log, after v2 is applied). **Deleted:** the per-event lone/not-lone flips: the gated-row
+re-tag to `Lone` when the gate went off (`journaled_answer_class`; the parked-release downgrade is left for an epoch hold's rows, M1.4), the
+under-the-gate `durable_jseq == MAX` test in `root_rule`. A group row of the configuration in force that lists no member (the adopted tail rows,
+stamped with the successor's version) is answered as `Lone` without a re-tag. `repair drop-held` found a latent hole this exposed: an own
+client's parked answer (`Finish`) whose row was rolled back was released when the log passed its seq (`drop-held-chain-backed` seed 592, I1); it is
+aborted now (`readindex.rs`). Oracle: a `Group{Root}` claim is judged against the backup set of the row's own lease version
+(`Oracles::version_backups`), and a `Group{Root}` row of a memberless version is judged as a singleton's. ADR-33 (DECISIONS.md) carries the
+amendment, DESIGN §4 the sentence.
+
+**C8 conditions** (core tests in `core/tests.rs`, module `m11_step5`): (1) rows before the bump keep class and version, rows after carry the new one:
+`a_peer_that_leaves_waits_for_the_bump_before_the_next_row_is_answered_alone`; (2) old and new in both directions, nothing alone until the archive
+carries the journal through the bump: `the_singleton_bump_commits_under_old_and_new_in_both_directions`; (3) a forward from a peer the view lacks
+bumps before the roster read, in the same event: `a_forward_from_a_newly_joined_peer_bumps_before_the_roster_read`; (4) a claimant is in the roster:
+the roster is the registry, and a node retired by `leave` is fenced by the lease (`classify` refuses): `a_departed_peer_cannot_claim` (verified,
+not changed; the core does not read the roster at a claim: its test rosters list peers only); (5) Q6's window is unchanged (a singleton's own
+clients' rows journaled while its view had no peer, exported on return): not widened, no code. Also (b) `a_row_journaled_under_v1_is_not_answered_by_v2s_members_alone`
+(the knob `ack_by_latest_config` as the product behaved it) and `the_steady_path_takes_no_lease_cas` (0 CAS and 0 closed configurations over 50
+rows, singleton and backed). Existing tests whose lease was a singleton by accident (`holder()`/`hold()` now say what they are), and the
+D4 re-tag tests, were rewritten to the new rule (the answer leaves once the bump landed and the archive carries the journal).
+
+**Fail-before** (main `6070c5e4` plus the new tests, box 1): 4 of the 6 fail (`..._waits_for_the_bump...`,
+`..._not_answered_by_v2s_members_alone`, `..._bumps_before_the_roster_read`, `..._both_directions`); the departed-peer and steady-path tests are guards
+and pass on both.
+
+**Sim.** New config `singleton-first-peer` (one node, a fresh node joins at 1.5 s, the backup crashes at 3 s) and test
+`singleton_first_peer_bumps_the_configuration`. Nine negative controls shifted their witness seeds and were re-picked by scanning (lone-lead off 2, 3;
+credited cap 193943, 194714, 195424; stale mirror 15..234; blind probe 21, 91, 132; dated-at-return 115, 193, 216, 300; held write
+unsettled 981, 2329, 2462; unchecked held write 230130..230150; shared dir unchecked 77480..77500; the delegated-holder-cut failover set loses 1603,
+gains 1620).
+
+**Sweeps** (box 1, release, `+commit`, seeds 0..1,999, main = `6070c5e4` with the new config added to its table, then this branch): `backup-departs`,
+`delegated-group-switch`, `singleton-first-peer`, `long-delegated`, `backup`, and also `delegated-holder-cut`, `far`: 0 failing on both, I1 0,
+row-version mismatches 0 on the branch (rows judged 97,700 / 464,173 / 66,049 / ...). Two extra configurations are **not** clean, open, 
+not fixed (main 0 / 0): `long-backup+commit` seed 1421 (`member_copies_drained`: a deposed node keeps a `Group{Root}` inbox-ack row of epoch 2 as a member copy
+past convergence; probably the gated row no longer re-tagged `Lone`, so the deposition keeps it) and `long-delegated-backup+commit` seed 634
+(`row_version_matches_config`: a delegate's own row of the new generation 1:3 stamped version 0 while its replica had applied the group's version 1; with
+the readindex abort arm disabled it still fails, so not that change). Both stay in the triage list for the next round.
+
+**Gates** (box 1): fmt, clippy `-D warnings` (meta, authority, engine, store-s3, all targets) clean; workspace `cargo check --all-targets` clean; lib tests meta 406,
+authority 1,055, engine 951, store-s3 237 passed; release sim suite 411 passed, 0 failed, 12 ignored.
+
+**Deviations.** (1) The bump is a lease CAS (S3), not a journal record: its position is the journal tip at landing (`CfgSpan::end`), and rows
+between the trigger and the landing carry the old version under an archive rule (conservative; the model's version carried instantly).
+(2) Condition 4 is verified, not enforced in the core. (3) The root's rows during a peer-to-singleton wait are stamped `Singleton`, answered when the closed
+configuration is covered; the fast path waits by the published gate. (4) A singleton tenure whose claim runs before the first directory snapshot
+starts as a peer's configuration and bumps once the snapshot shows nobody (one CAS, once per tenure).
+
+**Performance gate** (box 3, quiet; main = A, this branch = B, `bench/commit-rule/g1-abba.sh`, A B B A, topology 1, state dirs on each file system, 40 runs per
+variant, 300 samples): `ack-latency` p50 B / A on ext4 chmod 0.85, create 0.98, rename 1.02, unlink 0.96, write 1.00; xfs 0.92, 1.02, 0.84, 0.91, 1.00; btrfs
+1.01, 1.05, 1.10, 1.03, 1.00; tmpfs 0.99, 1.01, 0.99, 0.97, 0.98. The 35 to 90 us ops are bimodal (A against a second copy of A moved 0.86 to 1.08 in step 4's
+control), no direction survives; `write` (4 KiB and `fsync`) is within 2 %. The lease CAS runs per transition only: the steady-path core test counts 0. `vfs-bench`
+(A / B): dispatch overhead 83 to 100 ns in both, allocations per op identical.
+

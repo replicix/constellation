@@ -3271,7 +3271,9 @@ impl Core {
                 self.finish_acquire(now, false, replica, out);
             }
             Plan::Create => {
-                let lease = self.lease.granted_lease(now, &self.cfg, None, false);
+                let lease =
+                    self.lease
+                        .granted_lease(now, &self.cfg, None, false, self.singleton_test());
                 let op = self.issue_s3(
                     S3Op::LeaseCreate {
                         lease: lease.clone(),
@@ -3570,9 +3572,13 @@ impl Core {
             self.finish_acquire(now, false, replica, out);
             return;
         }
-        let mut lease = self
-            .lease
-            .granted_lease(now, &self.cfg, Some(prev), inherits_duty);
+        let mut lease = self.lease.granted_lease(
+            now,
+            &self.cfg,
+            Some(prev),
+            inherits_duty,
+            self.singleton_test(),
+        );
         // Plan 43 C1-3: the claim's tail. A listed backup that claims at
         // expiry seals its role first, a self-sealed holder takes its own
         // member copy as the tail; whatever tail the claim re-ships is

@@ -2979,6 +2979,25 @@ impl Driver {
                 j.class.is_none() && !(j.expected == Expected::Unjournaled && kind.is_refusal());
             // Plan 43 C1-2: the claim of a commit, and the row's own class.
             let rows = self.meta.journal_classes_of_rid(rid).unwrap_or_default();
+            // Plan 46 M1.1 step 5: a `Group{Root}` row of a version that lists
+            // no member (a successor's re-journaled tail rows carry its own
+            // version, the configuration of the journal they are rows of) has
+            // no group behind it: its answer rests on the disk alone and is
+            // judged as a singleton's.
+            let rows: Vec<constellation_meta::RowCommit> = {
+                let versions = self.oracles.version_backups.lock().unwrap();
+                rows.into_iter()
+                    .map(|r| match r {
+                        constellation_meta::RowCommit::Group {
+                            config_version,
+                            on: constellation_authority::core::GroupOn::Root,
+                        } if versions.get(&config_version).is_some_and(Vec::is_empty) => {
+                            constellation_meta::RowCommit::Singleton { config_version }
+                        }
+                        r => r,
+                    })
+                    .collect()
+            };
             let delegated = j.tx.as_ref().is_some_and(|t| t.origin.0 != 0)
                 || matches!(
                     j.class,

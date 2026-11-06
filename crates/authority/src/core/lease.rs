@@ -632,6 +632,7 @@ impl LeaseState {
         cfg: &Config,
         prev: Option<&Lease>,
         inherits_duty: bool,
+        singleton: bool,
     ) -> Lease {
         let own =
             prev.filter(|p| p.holder == cfg.node_id && !p.released && self.sealed_own < p.epoch);
@@ -666,6 +667,10 @@ impl LeaseState {
                 || own.is_some_and(|p| p.granted_delegations),
             retired: prev.map(|p| p.retired.clone()).unwrap_or_default(),
             inherited_tail: None,
+            // Plan 46 M1.1 step 5: a tenure is born a singleton's when its
+            // claimant's event-time test says so (no ack=s3); otherwise a
+            // peer's, and a bump moves it.
+            singleton: singleton && !cfg.ack_s3,
         }
     }
 
@@ -1193,7 +1198,7 @@ mod tests {
         let cfg = cfg();
         let now = Now::same(1_000_000);
         let mut st = LeaseState::default();
-        let v4 = st.granted_lease(now, &cfg, None, false);
+        let v4 = st.granted_lease(now, &cfg, None, false, false);
         let v5 = v4.reconfigured(vec![2], AckPolicy::Backup);
         assert!(v5.config_version > v4.config_version);
         st.adopt(now, v5.clone(), tag(), None);
@@ -1223,7 +1228,7 @@ mod tests {
         let cfg = cfg();
         let now = Now::same(1_000_000);
         let mut st = LeaseState::default();
-        let v4 = st.granted_lease(now, &cfg, None, false);
+        let v4 = st.granted_lease(now, &cfg, None, false, false);
         st.adopt(now, v4.clone(), tag(), None);
         st.reconfig_doubt = Some(ReconfigDoubt::default());
         st.renewed(now, v4.clone(), tag());
@@ -1241,7 +1246,7 @@ mod tests {
         let cfg = cfg();
         let now = Now::same(1_000_000);
         let mut st = LeaseState::default();
-        let v4 = st.granted_lease(now, &cfg, None, false);
+        let v4 = st.granted_lease(now, &cfg, None, false, false);
         st.adopt(now, v4.clone(), tag(), None);
         let sent_at = st.held_gen();
         let v5 = v4.reconfigured(vec![2], AckPolicy::Backup);
@@ -1273,7 +1278,7 @@ mod tests {
         let cfg = cfg();
         let now = Now::same(1_000_000);
         let mut st = LeaseState::default();
-        let v4 = st.granted_lease(now, &cfg, None, false);
+        let v4 = st.granted_lease(now, &cfg, None, false, false);
         st.adopt(now, v4.clone(), tag(), None);
         // A read goes out; then a renewal of ours lands (same version, its
         // own tag), and a reconfiguration CAS conditioned on that tag is lost.
@@ -1309,7 +1314,7 @@ mod tests {
         let now = Now::same(1_000_000);
         assert_eq!(st.classify(now, &cfg, None, 0), Plan::Create);
         // A live foreign holder is busy.
-        let mut foreign = st.granted_lease(now, &cfg, None, false);
+        let mut foreign = st.granted_lease(now, &cfg, None, false, false);
         foreign.holder = 3;
         match st.classify(now, &cfg, Some((foreign.clone(), tag())), 0) {
             Plan::Busy { holder: 3, .. } => {}
@@ -1348,7 +1353,7 @@ mod tests {
         }
         // Our own live lease we do not track: re-adopted through the gate
         // (M4); tracked: held.
-        let mine = st.granted_lease(now, &cfg, None, false);
+        let mine = st.granted_lease(now, &cfg, None, false, false);
         match st.classify(now, &cfg, Some((mine.clone(), tag())), 0) {
             Plan::Claim {
                 takeover: true,
@@ -1378,7 +1383,7 @@ mod tests {
     /// A foreign (node 3) lease body written by a holder whose clocks have
     /// nothing to do with the claimant's, stamping `ttl_ms`.
     fn foreign(cfg: &Config, at: Now, ttl_ms: u64) -> Lease {
-        let mut l = LeaseState::default().granted_lease(at, cfg, None, false);
+        let mut l = LeaseState::default().granted_lease(at, cfg, None, false, false);
         l.holder = 3;
         l.holder_clock = 33;
         l.ttl_ms = ttl_ms;
@@ -1752,7 +1757,7 @@ mod tests {
         let cfg = cfg();
         let st = LeaseState::default();
         let t0 = Now::same(1_000_000);
-        let mine = st.granted_lease(t0, &cfg, None, false);
+        let mine = st.granted_lease(t0, &cfg, None, false, false);
         for step in [-3_600_000i64, 0, 5_000, cfg.ttl_ms as i64 + 1, 3_600_000] {
             // The wall now: `step` from the grant (past `expires_unix_ms`
             // for the larger ones); the three clocks otherwise agree.
@@ -1799,7 +1804,7 @@ mod tests {
         let now = Now::same(5_000_000);
         let mut st = LeaseState::default();
         assert_eq!(st.new_mutation_epoch(now, &cfg), None);
-        let lease = st.granted_lease(now, &cfg, None, false);
+        let lease = st.granted_lease(now, &cfg, None, false, false);
         st.adopt(
             now,
             lease,
@@ -1847,7 +1852,7 @@ mod tests {
             release_when_idle: true,
             ..LeaseState::default()
         };
-        let lease = st.granted_lease(t0, &cfg, None, false);
+        let lease = st.granted_lease(t0, &cfg, None, false, false);
         st.adopt(t0, lease, tag(), None);
         assert!(!st.wants_handoff(t0.plus(900), &cfg), "dwell not met");
         st.touch(t0.plus(800));
@@ -1877,7 +1882,7 @@ mod tests {
             release_when_idle: true,
             ..LeaseState::default()
         };
-        let lease = st.granted_lease(t0, &cfg, None, false);
+        let lease = st.granted_lease(t0, &cfg, None, false, false);
         st.adopt(t0, lease, tag(), None);
         st.touch(t0.plus(800));
         // 700 ms later on every clock but the wall clock, which stepped
@@ -1908,7 +1913,7 @@ mod tests {
         cfg.wanted_grace_ms = 2_000;
         let t0 = Now::same(1_000_000);
         let mut st = LeaseState::default();
-        let lease = st.granted_lease(t0, &cfg, None, false);
+        let lease = st.granted_lease(t0, &cfg, None, false, false);
         st.adopt(t0, lease.clone(), tag(), None);
         assert!(!st.wants_handoff(t0.plus(9_000), &cfg), "nobody waiting");
         st.renewed(t0.plus(500), lease.wanting(9), tag());

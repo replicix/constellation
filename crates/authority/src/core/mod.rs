@@ -1513,6 +1513,11 @@ pub struct Stats {
     pub backups_added: u64,
     pub backups_removed: u64,
     pub reconfig_cas: u64,
+    /// Plan 46 M1.1 step 5: configurations closed by a landed change of the
+    /// backup set or the singleton flag ([`Core::sync_cfg_spans`]).
+    pub cfg_spans_closed: u64,
+    /// Singleton bumps issued (`reconfig_cas` counts them too).
+    pub singleton_bumps: u64,
     /// Holder: appends sent, acks received, backups that timed out.
     pub backup_appends: u64,
     pub backup_acks: u64,
@@ -2109,6 +2114,13 @@ pub struct Core {
     /// What the last deposition recovery did (`Control::Reintegrate`).
     last_recovery: Option<String>,
     roster: Vec<NodeId>,
+    /// Plan 46 M1.1 step 5 (C8 condition 3): nodes that sent this node a
+    /// request (a forward, a settle, an inbox batch) since the directory
+    /// last showed them: a request from a peer is a singleton-test event,
+    /// counted as the peer's link until the next `Peers` snapshot lists it
+    /// (or a `Roster` read does not) - the root bumps its configuration
+    /// before it journals a peer's op, not at the roster read.
+    peer_requesters: std::collections::BTreeSet<NodeId>,
     links: BTreeMap<NodeId, PeerLink>,
     /// I1 class 2: `Event::OwnLag` events this core has handled, and the
     /// highest count of them the driver had handed when it took the
@@ -2227,6 +2239,7 @@ impl Core {
             epoch_replacing: false,
             last_recovery: None,
             roster: Vec::new(),
+            peer_requesters: Default::default(),
             links: BTreeMap::new(),
             lapses_seen: 0,
             peers_lapses: 0,
@@ -2463,6 +2476,9 @@ impl Core {
         }
         self.clk = now;
         self.refresh_backup_eligibility();
+        // A lease change that landed since the last event closes the old
+        // configuration before any row of this one is journaled.
+        self.sync_cfg_spans(replica);
         self.deleg_root_sync_due(now, replica, &mut out);
         match event {
             Event::Submit {
@@ -2519,6 +2535,10 @@ impl Core {
                     self.note_foreign(now, replica, &mut out);
                 }
                 self.roster = write_eligible;
+                // The roster read is the authority on who is a peer: a
+                // requester it does not list is none.
+                let roster = &self.roster;
+                self.peer_requesters.retain(|n| roster.contains(n));
                 self.refresh_backup_eligibility();
                 // A holder polls a requester it has just learned of at
                 // once (M13 round 2), not at its next round's end.
@@ -2541,6 +2561,10 @@ impl Core {
                     }
                 }
                 self.links = links.into_iter().map(|l| (l.node, l)).collect();
+                // The directory now shows every requester it knows: the
+                // links are the truth from here on.
+                let links = &self.links;
+                self.peer_requesters.retain(|n| !links.contains_key(n));
                 self.peers_seen = true;
                 self.peers_lapses = self.peers_lapses.max(lapses);
                 self.refresh_backup_eligibility();

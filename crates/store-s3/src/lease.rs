@@ -176,6 +176,20 @@ pub struct Lease {
     /// release (everything is in the log).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherited_tail: Option<Box<InheritedTail>>,
+    /// Plan 46 M1.1 step 5: the configuration is a singleton's: no peer
+    /// within the budget, no backup listed, so the holder's own disk is the
+    /// commit rule for its own node's clients. Changed only by a
+    /// `config_version` bump that also changes nothing else
+    /// ([`Lease::with_singleton`]) or by a reconfiguration, which lists a
+    /// peer's backup (`false`); the holder answers alone only while the
+    /// lease it holds says so and the bump is committed under both rules
+    /// (the archive carries the journal through it).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub singleton: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Plan 43 C1-3 (D2): the group a tenure's re-shipped tail came from
@@ -236,6 +250,7 @@ impl Lease {
             granted_delegations: false,
             retired: Vec::new(),
             inherited_tail: None,
+            singleton: false,
         }
     }
 
@@ -267,6 +282,7 @@ impl Lease {
             config_version: self.config_version + 1,
             ack_policy: AckPolicy::Local,
             retired,
+            singleton: false,
             ..self.clone()
         }
     }
@@ -281,6 +297,21 @@ impl Lease {
         Self {
             backups,
             ack_policy,
+            config_version: self.config_version + 1,
+            // A change of the backup set lands as a peer configuration; a
+            // singleton is a `with_singleton` bump (plan 46 M1.1 step 5).
+            singleton: false,
+            ..self.clone()
+        }
+    }
+
+    /// Plan 46 M1.1 step 5: this lease with its singleton flag set to
+    /// `singleton` and `config_version` bumped: the journaled transition
+    /// between a singleton's configuration and a peer's, with the backup
+    /// set as it is (a singleton lists none).
+    pub fn with_singleton(&self, singleton: bool) -> Self {
+        Self {
+            singleton,
             config_version: self.config_version + 1,
             ..self.clone()
         }

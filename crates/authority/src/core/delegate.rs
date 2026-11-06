@@ -489,6 +489,13 @@ pub(crate) struct DelegateState {
     /// members of the applied group and of this one (D4, the union rule) —
     /// the root may end the generation by either version.
     pub group_requested: Option<Vec<NodeId>>,
+    /// Plan 46 M1.1 step 5: the groups this generation has had that its
+    /// rows are not all committed under yet (oldest first). A row keeps the
+    /// rule of the group it was journaled in, and a change of the group
+    /// commits under old and new: nothing past a closed group's end is
+    /// answered before that group's own members hold its end (or the log
+    /// carries it).
+    pub group_spans: Vec<GroupSpan>,
     /// The highest index answered under a group (`removal_safe`'s bound).
     pub acked_max: u64,
     /// Plan 43 C2e follow-up: this process recorded, synced, that it holds a
@@ -514,6 +521,20 @@ pub(crate) struct DelegateState {
     /// Since when the committed prefix has been held below the group's by
     /// another generation's uncommitted row (the measurement).
     pub xheld_since: Option<WaitMs>,
+}
+
+/// Plan 46 M1.1 step 5: a closed group of a delegate generation
+/// ([`DelegateState::group_spans`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupSpan {
+    /// The group's members (none: the group is the delegate and the root).
+    pub backups: Vec<NodeId>,
+    /// What the backup of that group held when the group closed (it may
+    /// hold more since, while it is the generation's backup still).
+    pub acked: u64,
+    /// The generation's stream index when the record that closed the group
+    /// was applied.
+    pub end: u64,
 }
 
 /// A renewal or backup append [`Core::deleg_expire_inflight`] gave up
@@ -1398,6 +1419,7 @@ impl Core {
                     group_version: group.as_ref().map_or(0, |g| g.version),
                     group_backups: group.map(|g| g.backups).unwrap_or_default(),
                     group_requested: None,
+                    group_spans: Vec::new(),
                     acked_max: 0,
                     held_noted: false,
                     synced_through: 0,
@@ -3196,7 +3218,32 @@ impl Core {
                 .min()
                 .unwrap_or(d.root_committed)
         };
-        held(&d.group_backups).min(d.group_requested.as_deref().map_or(u64::MAX, held))
+        let current =
+            held(&d.group_backups).min(d.group_requested.as_deref().map_or(u64::MAX, held));
+        d.group_spans
+            .iter()
+            .filter_map(|s| Self::group_span_cap(d, s))
+            .fold(current, u64::min)
+    }
+
+    /// The index through which a closed group's own members hold the
+    /// stream, while they do not hold its end (`None`: they do).
+    fn group_span_cap(d: &DelegateState, s: &GroupSpan) -> Option<u64> {
+        let through = match s.backups.as_slice() {
+            [] => d.root_committed,
+            members => members
+                .iter()
+                .map(|b| {
+                    if d.backup == Some(*b) {
+                        s.acked.max(d.backup_acked)
+                    } else {
+                        s.acked
+                    }
+                })
+                .min()
+                .unwrap_or(0),
+        };
+        (through < s.end).then_some(through)
     }
 
     /// The committed prefix of `gen`'s stream by the acknowledgement rule
@@ -3465,8 +3512,30 @@ impl Core {
         };
         let (version, backups) = row.map_or((0, Vec::new()), |r| (r.version, r.backups));
         if version != d.group_version || backups != d.group_backups {
+            if backups != d.group_backups {
+                // The record closes the group it replaces at the stream's
+                // index now: rows before keep that group's rule.
+                let acked = if d.group_backups.contains(&d.backup.unwrap_or(0)) {
+                    d.backup_acked
+                } else {
+                    0
+                };
+                d.group_spans.push(GroupSpan {
+                    backups: std::mem::take(&mut d.group_backups),
+                    acked,
+                    end: replica.delegate_idx(d.gen),
+                });
+            }
             d.group_version = version;
             d.group_backups = backups;
+        }
+        if !d.group_spans.is_empty() {
+            let log = replica.log_stream_idx(d.gen);
+            let spans = std::mem::take(&mut d.group_spans);
+            d.group_spans = spans
+                .into_iter()
+                .filter(|s| Self::group_span_cap(d, s).is_some_and(|t| t.max(log) < s.end))
+                .collect();
         }
         if d.group_requested.as_ref() == Some(&d.group_backups) {
             d.group_requested = None;

@@ -47,7 +47,7 @@ pub(super) fn holder_fs(
     let cfg = Config::defaults(1, 1);
     let now = Ms(now_unix_ms());
     let mut state = LeaseState::default();
-    let lease = state.granted_lease(Now::same(now.0), &cfg, None, false);
+    let lease = state.granted_lease(Now::same(now.0), &cfg, None, false, false);
     state.adopt(Now::same(now.0), lease, tag, None);
     let view = Arc::new(crate::lease::LeaseView::default());
     view.mirror(&state, Now::same(now.0), &cfg, gated);

@@ -537,6 +537,26 @@ fn lease_fast(lease: &Lease) -> bool {
     lease.ack_policy != AckPolicy::Local || !lease.backups.is_empty()
 }
 
+/// Plan 46 M1.1 step 5: the commit-relevant part of the lease a tenure
+/// holds: what changes the rule its rows are committed by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CfgSeen {
+    pub(crate) epoch: Epoch,
+    /// The listed backups (none unless the policy is `Backup`).
+    pub(crate) backups: Vec<NodeId>,
+    pub(crate) singleton: bool,
+}
+
+/// A closed configuration of the tenure ([`AckState::spans`]): its rule and
+/// the journal position it ended at (the tip when the change that
+/// replaced it landed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CfgSpan {
+    pub(crate) backups: Vec<NodeId>,
+    pub(crate) singleton: bool,
+    pub(crate) end: u64,
+}
+
 /// A backup-set reconfiguration CAS in flight.
 #[derive(Debug, Clone)]
 pub(crate) struct Reconfig {
@@ -573,6 +593,24 @@ pub(crate) struct AckState {
     /// A peer streamed to before it is added to the lease.
     pub candidate: Option<NodeId>,
     pub(crate) reconfig: Option<Reconfig>,
+    /// Plan 46 M1.1 step 5: the configurations of this tenure that are
+    /// closed (a landed change of the backup set or of the singleton flag
+    /// replaced them) and whose rows the journal still holds uncommitted
+    /// under their own rule: a row keeps the rule of the configuration it
+    /// was journaled in, and a change commits under old and new (the
+    /// change's position, the journal's tip when it landed, must be
+    /// committed by the old rule before the new rule answers anything past
+    /// it). Oldest first; one is dropped once its rule has covered its end
+    /// ([`Core::cfg_span_cap`]).
+    pub(crate) spans: Vec<CfgSpan>,
+    /// The configuration of the held lease as of the last
+    /// [`Core::sync_cfg_spans`].
+    pub(crate) cfg_seen: Option<CfgSeen>,
+    /// The journal's tip at the event in which the singleton test turned
+    /// against a lease that still says singleton: rows past it are not
+    /// answered alone (the archive rule), though the lease's bump has not
+    /// landed; the singleton configuration ends here.
+    pub(crate) flip_tip: Option<u64>,
     /// A reconfiguration the job slot's lease CAS made us postpone.
     pub(crate) reconfig_wanted: Option<Vec<NodeId>>,
     /// M9 `S3`: the shipped-through journal seq and the shipped rows
@@ -1478,6 +1516,115 @@ impl Core {
     /// The durable journal seq under the current policy: `u64::MAX` when
     /// nothing gates acknowledgements.
     pub(crate) fn durable_jseq(&self) -> u64 {
+        let held = self.durable_jseq_cfg();
+        if self.ack.spans.is_empty() || self.lease.epoch_held() {
+            return held;
+        }
+        // Plan 46 M1.1 step 5: a row keeps the rule of the configuration it
+        // was journaled in, and a change commits under old and new: nothing
+        // past a closed configuration's end is acknowledged before that
+        // configuration's own rule has committed its end.
+        self.ack
+            .spans
+            .iter()
+            .filter_map(|s| self.cfg_span_cap(s))
+            .fold(held, u64::min)
+    }
+
+    /// The journal seq through which a closed configuration's own rule has
+    /// committed, while it has not committed its end (`None`: it has; a
+    /// singleton's rule never gates).
+    fn cfg_span_cap(&self, span: &CfgSpan) -> Option<u64> {
+        if span.singleton {
+            return None;
+        }
+        let through = self.backed_through(span.backups.iter().copied());
+        (through < span.end).then_some(through)
+    }
+
+    /// The configuration the held lease says rows are committed by, or
+    /// `None` while the node holds none (or an epoch's hold: its rule is
+    /// the hold's).
+    fn lease_cfg(&self) -> Option<CfgSeen> {
+        if self.lease.lost || self.lease.epoch_held() {
+            return None;
+        }
+        let (lease, _) = self.lease.held.as_ref()?;
+        let backed = lease.ack_policy == AckPolicy::Backup;
+        Some(CfgSeen {
+            epoch: lease.epoch,
+            backups: if backed {
+                lease.backups.clone()
+            } else {
+                Vec::new()
+            },
+            singleton: lease.singleton && lease.ack_policy == AckPolicy::Local,
+        })
+    }
+
+    /// Plan 46 M1.1 step 5: notice a change of the held lease's
+    /// configuration (a landed reconfiguration or singleton bump, an
+    /// adopted re-read of one) and close the configuration it replaced at
+    /// the journal's tip: rows before keep the old rule, the change commits
+    /// under old and new. Run where a lease lands and at the start of every
+    /// event, before a row is journaled under the new configuration.
+    pub(crate) fn sync_cfg_spans(&mut self, replica: &dyn Replica) {
+        let cur = self.lease_cfg();
+        match (cur, self.ack.cfg_seen.take()) {
+            (None, _) => self.ack.spans.clear(),
+            (Some(c), Some(seen)) if seen.epoch == c.epoch => {
+                if seen != c {
+                    let tip = replica.journal_tip();
+                    if let Some(flip) = self.ack.flip_tip.take().filter(|f| *f < tip) {
+                        // A singleton's configuration until the test turned,
+                        // the archive's from there to the landing.
+                        if seen.singleton {
+                            self.ack.spans.push(CfgSpan {
+                                backups: Vec::new(),
+                                singleton: true,
+                                end: flip,
+                            });
+                            self.ack.spans.push(CfgSpan {
+                                backups: Vec::new(),
+                                singleton: false,
+                                end: tip,
+                            });
+                        } else {
+                            self.ack.spans.push(CfgSpan {
+                                backups: seen.backups,
+                                singleton: false,
+                                end: tip,
+                            });
+                        }
+                    } else {
+                        self.ack.spans.push(CfgSpan {
+                            backups: seen.backups,
+                            singleton: seen.singleton,
+                            end: tip,
+                        });
+                    }
+                    self.stats.cfg_spans_closed += 1;
+                }
+                self.ack.flip_tip = None;
+                self.ack.cfg_seen = Some(c);
+            }
+            (Some(c), _) => {
+                self.ack.spans.clear();
+                self.ack.flip_tip = None;
+                self.ack.cfg_seen = Some(c);
+            }
+        }
+        self.note_singleton_flip(replica);
+        if !self.ack.spans.is_empty() {
+            let spans = std::mem::take(&mut self.ack.spans);
+            self.ack.spans = spans
+                .into_iter()
+                .filter(|s| self.cfg_span_cap(s).is_some())
+                .collect();
+        }
+    }
+
+    fn durable_jseq_cfg(&self) -> u64 {
         if self.lease.epoch_held() {
             // Plan 30 §M10 (found by `node-leave` on M9's round 2): a
             // continuation epoch's hold acknowledges locally — nothing
@@ -1538,6 +1685,88 @@ impl Core {
         }
     }
 
+    /// Plan 46 M1.1 step 5: the lease this node holds records a singleton's
+    /// configuration (no peer within the budget, no backup).
+    fn held_singleton(&self) -> bool {
+        self.lease
+            .held
+            .as_ref()
+            .is_some_and(|(l, _)| l.singleton && l.ack_policy == AckPolicy::Local)
+    }
+
+    /// The event-time singleton test (plan 46 D3, M1.1's test until M2.3
+    /// replaces it with the roster's): no candidate being brought up, no
+    /// roster peer linked within the budget (`ack.eligible`, raised at
+    /// every event and lowered by the selection pass), and not yet
+    /// unassessed. What triggers a bump of the lease's configuration, and
+    /// one of the two conditions of answering alone.
+    pub(crate) fn lone_by_event(&self) -> bool {
+        let unassessed = self.ack.eligible.is_none() && self.backups_possible();
+        self.ack.candidate.is_none() && self.ack.eligible != Some(true) && !unassessed
+    }
+
+    /// The test a claim CAS stamps its lease with: assessed now, from the
+    /// links and the roster as they are (the lease's flag starts a tenure's
+    /// configuration; the bump moves it).
+    pub(crate) fn singleton_test(&self) -> bool {
+        self.ack.candidate.is_none() && !self.backup_could_be_had()
+    }
+
+    /// Plan 46 M1.1 step 5 (C8 conditions 1 and 3): a request from `node`
+    /// (a forward, a settle, an inbox batch) is a singleton-test event: a
+    /// node that asks this root for something is a peer, linked, whatever
+    /// the roster read in hand says. Counted at once, before any later row
+    /// is journaled; the lease's bump follows in the same event.
+    pub(crate) fn note_peer_request(&mut self, node: NodeId) {
+        // (Only the root's: a delegate's requesters are no peer of the
+        // root's configuration.)
+        if self.lease.held.is_some()
+            && node != self.cfg.node_id
+            && node != 0
+            && self.peer_requesters.insert(node)
+        {
+            self.refresh_backup_eligibility();
+        }
+    }
+
+    /// The event in which the singleton test turns against a lease that
+    /// says singleton ends the singleton configuration in the journal: the
+    /// tip is noted (once) for [`Self::sync_cfg_spans`].
+    fn note_singleton_flip(&mut self, replica: &dyn Replica) {
+        if self.ack.flip_tip.is_none()
+            && !self.lease.lost
+            && !self.lease.epoch_held()
+            && self.held_singleton()
+            && self.lease.backups().is_empty()
+            && !self.lone_by_event()
+        {
+            self.ack.flip_tip = Some(replica.journal_tip());
+        }
+    }
+
+    /// Plan 46 M1.1 step 5: the singleton test flipped against the lease's
+    /// configuration - ask for the bump (a reconfiguration CAS of the same
+    /// backup set that moves the flag), in the event that flipped it.
+    fn singleton_maintain(&mut self, replica: &dyn Replica) {
+        self.note_singleton_flip(replica);
+        let Some((lease, _)) = self.lease.held.as_ref() else {
+            return;
+        };
+        if self.lease.lost
+            || self.lease.epoch_held()
+            || !self.cfg.p2p
+            || lease.ack_policy != AckPolicy::Local
+            || !lease.backups.is_empty()
+            || self.ack.reconfig.is_some()
+            || self.ack.reconfig_wanted.is_some()
+        {
+            return;
+        }
+        if self.lone_by_event() != lease.singleton {
+            self.ack.reconfig_wanted = Some(Vec::new());
+        }
+    }
+
     fn durable_jseq_held(&self) -> u64 {
         let committed = self.lease.backups();
         if committed.is_empty() {
@@ -1562,12 +1791,16 @@ impl Core {
             // linked: it is no candidate, but it takes over with its tail, so
             // the acknowledgements wait for the archive (`shipped_through`)
             // instead of leaving on this disk.
-            let unassessed = self.ack.eligible.is_none() && self.backups_possible();
-            return if self.ack.candidate.is_some() || self.ack.eligible == Some(true) || unassessed
-            {
-                self.ack.shipped_through
-            } else {
+            //
+            // Plan 46 M1.1 step 5: and the configuration the lease records
+            // must be a singleton's. The test above is the event's; the
+            // rule changes only at the lease's bump, which commits under
+            // old and new (`sync_cfg_spans`): a peer that left does not make
+            // the next row lone before the bump has landed.
+            return if self.lone_by_event() && self.held_singleton() {
                 u64::MAX
+            } else {
+                self.ack.shipped_through
             };
         }
         self.backed_through(committed.iter().copied())
@@ -1718,7 +1951,13 @@ impl Core {
             && !self.lease.lost
             && !self.lease.epoch_held()
             && self.lease.ack_policy() != AckPolicy::S3
-            && self.durable_jseq() == u64::MAX
+            // The configuration's own rule (plan 46 M1.1 step 5): a row
+            // journaled under the singleton's configuration is a singleton
+            // row from the moment the lease says so, though what a closed
+            // configuration still owes keeps it from being answered
+            // (`durable_jseq`: the answer waits, the stamp does not
+            // change).
+            && self.durable_jseq_cfg() == u64::MAX
     }
 
     /// Plan 46 M1.1 step 2: the one lookup of the commit rule of `stream`'s
@@ -1772,7 +2011,7 @@ impl Core {
                 members: self.lease.backups().len() + self.doubted_backups().count(),
                 on: GroupOn::Root,
             }
-        } else if self.durable_jseq() != u64::MAX || !self.root_lone() {
+        } else if !self.root_lone() {
             // (Plan 43 C2f review, D5: nothing gating but the node not lone —
             // the lease released, lost, not held — is no singleton answer: a
             // fast-path row journaled now waits, and finds the gate off.)
@@ -1844,30 +2083,35 @@ impl Core {
         rid: Rid,
     ) -> Result<AckClass, constellation_meta::MetaError> {
         Ok(match replica.journal_class_of_rid(rid) {
-            // A gated row nothing gates any more (its group is gone, the
-            // lease lists no backup): answered on this disk alone, so it
-            // is a lone node's answer and the row is re-tagged `Lone`, as
-            // a parked one released with the gate off is (D4).
-            Some((first, class))
-                if class.gated()
-                    && self.durable_jseq() == u64::MAX
-                    && !self.ack.shipped_rows.contains(&first) =>
-            {
-                replica
-                    .reclass_journal_tx(first, constellation_meta::RowCommit::LONE)
-                    .inspect_err(|error| {
-                        tracing::warn!(node = self.cfg.node_id, ?rid, %error, "could not re-tag a row answered with the gate off: EIO");
-                    })?;
-                AckClass::Lone
-            }
+            // Plan 46 M1.1 step 5: a row keeps the rule it was journaled
+            // under. A gated row whose group is gone is not re-tagged
+            // `Lone`: the configuration that replaced it commits under old
+            // and new ([`Self::sync_cfg_spans`]), so the row is answered
+            // when its own rule has committed it (`durable_jseq`).
             Some((_, class)) if class.is_singleton() => AckClass::Lone,
             Some((_, class)) if class.is_archive() => AckClass::Archive,
             Some((
                 _,
                 constellation_meta::RowCommit::Group {
-                    on: GroupOn::Root, ..
+                    config_version,
+                    on: GroupOn::Root,
                 },
-            )) => AckClass::RootGroup,
+            )) => {
+                // A group row of the configuration in force that lists no
+                // member (the successor's journal holds the predecessor's
+                // tail as rows of its own version, plan 46 M1.1 step 4's
+                // note): no group stands behind it now, and the answer is
+                // named for what it rests on, this disk.
+                if self.lease.held.is_some()
+                    && config_version == self.root_config_version()
+                    && self.lease.backups().is_empty()
+                    && self.doubted_backups().next().is_none()
+                {
+                    AckClass::Lone
+                } else {
+                    AckClass::RootGroup
+                }
+            }
             // Plan 43 C2f review: a row of a continuation epoch's hold is
             // non-stealable only while the hold lasts. After it, this node's
             // own client is answered as the node is now: on its disk alone
@@ -3247,6 +3491,8 @@ impl Core {
         // Plan 43 C7-F F-a0 (b): an inherited mark nothing stands on any
         // more is cleared (a few flag reads unless the tenure has one).
         self.maybe_clear_inherited_mark(now, replica, out);
+        self.sync_cfg_spans(replica);
+        self.singleton_maintain(replica);
         if let Some(backups) = self.ack.reconfig_wanted.take() {
             self.issue_reconfig(now, backups, replica, out);
         }
@@ -3379,6 +3625,12 @@ impl Core {
         // still never changes with the clock alone. Before the first
         // snapshot nothing is known either.
         if !self.peers_seen || self.peers_lapses < self.lapses_seen {
+            return true;
+        }
+        // Plan 46 M1.1 step 5 (C8 condition 3): a node that asked this one
+        // for something is a linked peer until the directory says
+        // otherwise.
+        if !self.peer_requesters.is_empty() {
             return true;
         }
         self.links.values().any(|l| {
@@ -3834,6 +4086,19 @@ impl Core {
             AckPolicy::Backup
         };
         let mut new = lease.reconfigured(backups.clone(), policy);
+        // Plan 46 M1.1 step 5: the singleton flag follows the event's test
+        // (a set with a backup is a peer's configuration). A change that
+        // moves neither the set nor the flag is no change.
+        new.singleton = backups.is_empty() && policy == AckPolicy::Local && self.lone_by_event();
+        if new.backups == lease.backups
+            && new.ack_policy == lease.ack_policy
+            && new.singleton == lease.singleton
+        {
+            return;
+        }
+        if new.backups == lease.backups && new.ack_policy == lease.ack_policy {
+            self.stats.singleton_bumps += 1;
+        }
         self.clear_covered_tail(&mut new);
         // Plan 43 C7-F F-a0 L3: the tenure becomes sealable here (a lease
         // that lists a backup, or says `ack=s3`): a duty it stands on now
@@ -3929,6 +4194,7 @@ impl Core {
                     self.ack.mark_inherited = true;
                 }
                 self.lease.renewed(now, r.lease, tag);
+                self.sync_cfg_spans(replica);
                 // The catch-all (L3): a duty that arose with the CAS out
                 // and the tenure now sealable but unmarked (a duty that
                 // no answer path gates: the gates hold the answers).
@@ -4022,6 +4288,7 @@ impl Core {
                 // Lost the CAS to our own renewal or a `wanted_by` edit:
                 // retry against the fresh object.
                 self.lease.renewed(now, cur.clone(), tag.clone());
+                self.sync_cfg_spans(replica);
                 if self.lease_cas_in_flight() || self.ack.unmarking.is_some() {
                     // A CAS of the lease's own is out (a renewal started
                     // beside this reconfiguration, which gates on the same):
@@ -4035,6 +4302,7 @@ impl Core {
                     self.reconcile_peers_with_lease();
                 } else if r.attempts < RECONFIG_ATTEMPTS {
                     let mut new = cur.reconfigured(r.lease.backups.clone(), r.lease.ack_policy);
+                    new.singleton = r.lease.singleton;
                     let marks =
                         lease_fast(&new) && (r.marks || self.tenure_duty_live(now, replica));
                     if marks {

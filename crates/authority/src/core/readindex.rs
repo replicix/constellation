@@ -1996,6 +1996,21 @@ impl Core {
                         return false;
                     }
                 }
+                // Plan 46 M1.1 step 5: the same for an own client's answer
+                // (`Finish`) that waited long for its configuration's rule
+                // (the archive past a change of the lease): its row was
+                // rolled back (`repair drop-held`) while it waited, no
+                // outcome is left, and the log passing its seq is no commit
+                // (`drop-held-chain-backed` seed 592).
+                if let (true, Some(_), ParkedWhat::Finish { rid, .. }) = (ready, p.durable, &p.what)
+                {
+                    if replica.journal_class_of_rid(*rid).is_none()
+                        && replica.completed_outcome(*rid).ok().flatten().is_none()
+                    {
+                        gone.push(**id);
+                        return false;
+                    }
+                }
                 ready
             })
             .map(|(id, _)| *id)

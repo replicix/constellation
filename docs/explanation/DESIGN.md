@@ -643,7 +643,8 @@ renamed for the vocabulary.
 version of the configuration in force, `RowCommit` — `Group { config_version, on }` (`on`: what
 the group waits on, until plan 46 step 7), `Final`, or `Singleton { config_version }` — stamped when the row is journaled
 from the one lookup of the configuration (`Core::rule_of`); a row answered
-without a commit is re-tagged `Singleton`; plan 43 C1-2, plan 46 M1.1. A holder sealed by a claimant keeps its unshipped
+without a commit is re-tagged `Singleton` (only in an epoch's hold: since plan 46 M1.1 step 5 a row keeps its rule, and a change of the lease's configuration
+commits under the old rule and the new, [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)); plan 43 C1-2, plan 46 M1.1. A holder sealed by a claimant keeps its unshipped
 rows in the `member_copy` part of the backup keyspace, apart from the tail it
 holds as a backup; C1-3.)
 
@@ -883,7 +884,12 @@ chosen per filesystem and topology
   lone root is the archive: a lone root paused past its expiry is taken over
   from the archive alone, and a row answered on its journal would be lost
   with the delegate (an epoch hold's journal still counts until plan 46
-  M1.4). Another node's forward is acknowledged once its segment
+  M1.4). The root's answering alone is a configuration the lease records
+  (`singleton`): the transition to and from a peer's configuration is a
+  `config_version` bump committed under old and new (plan 46 M1.1 step 5), so
+  nothing is answered alone until the archive carries the journal through it,
+  and a node that asks the root for something counts as a peer from that
+  request on. Another node's forward is acknowledged once its segment
   is in the log: its row is journaled `Archive`, a deposition keeps it as
   a member copy, and the requester's retry by rid is its only other copy
   ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3),

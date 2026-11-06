@@ -87,6 +87,12 @@ pub struct Oracles {
     /// the rows it appended by that backup's copy (the core counts the
     /// configuration as it is, not as it was at the append).
     pub epoch_backups: Arc<Mutex<BTreeMap<u64, Vec<NodeId>>>>,
+    /// Plan 46 M1.1 step 5: the backup set of every lease version that
+    /// landed (`config_version -> backups`; a version names one landing:
+    /// every tenure starts above its predecessor's). A row keeps the rule of
+    /// the configuration it was journaled in, so a `Group{Root}` row is
+    /// judged by the set of its own version, whatever the lease lists now.
+    pub version_backups: Arc<Mutex<BTreeMap<u64, Vec<NodeId>>>>,
     /// Nodes whose core holds a continuation epoch right now: the core
     /// counts their journal as a copy until plan 46 M1.4.
     pub epoch_holds: Mutex<BTreeSet<NodeId>>,
@@ -310,6 +316,8 @@ impl Oracles {
         let reach = bucket.reach();
         let epoch_backups: Arc<Mutex<BTreeMap<u64, Vec<NodeId>>>> = Arc::default();
         let epoch_backups_hook = epoch_backups.clone();
+        let version_backups: Arc<Mutex<BTreeMap<u64, Vec<NodeId>>>> = Arc::default();
+        let version_backups_hook = version_backups.clone();
         let row_versions: Arc<Mutex<RowVersions>> = Arc::default();
         {
             let row_versions = row_versions.clone();
@@ -320,6 +328,10 @@ impl Oracles {
                     .lock()
                     .unwrap()
                     .insert(new.epoch, new.backups.clone());
+                version_backups_hook
+                    .lock()
+                    .unwrap()
+                    .insert(new.config_version, new.backups.clone());
                 row_versions
                     .lock()
                     .unwrap()
@@ -360,6 +372,7 @@ impl Oracles {
             lone_lead: Mutex::new(LoneLead::default()),
             appended: Mutex::new(HashMap::new()),
             epoch_backups,
+            version_backups,
             epoch_holds: Mutex::new(BTreeSet::new()),
             row_versions,
             acks_unsourced: AtomicU64::new(0),
@@ -1070,6 +1083,26 @@ pub fn committed_at_answer(
         })
     };
 
+    // Plan 46 M1.1 step 5: the group a root row commits by is the one of
+    // the version it was journaled in.
+    let row_backups = {
+        let version_of = |node: NodeId| -> Option<u64> {
+            o.store(node)?
+                .journal_classes_of_rid(rid)
+                .ok()?
+                .into_iter()
+                .find_map(|c| match c {
+                    constellation_meta::RowCommit::Group {
+                        config_version,
+                        on: constellation_meta::GroupOn::Root,
+                    } => Some(config_version),
+                    _ => None,
+                })
+        };
+        version_of(answerer)
+            .or_else(|| holder.and_then(version_of))
+            .and_then(|v| o.version_backups.lock().unwrap().get(&v).cloned())
+    };
     let class = classify(
         o,
         bus,
@@ -1077,6 +1110,7 @@ pub fn committed_at_answer(
         st,
         (rid, want),
         lease.as_ref(),
+        row_backups.as_deref(),
         tx.as_ref(),
         &own_txs,
         &holder_txs,
@@ -1135,6 +1169,7 @@ fn classify(
     st: &AnswererState,
     (rid, want): (Rid, Option<Code>),
     lease: Option<&Lease>,
+    row_backups: Option<&[NodeId]>,
     tx: Option<&TxRef>,
     own_txs: &[BackupTx],
     holder_txs: &[BackupTx],
@@ -1148,9 +1183,17 @@ fn classify(
     detail.push("archive: not in an applied unfenced segment".into());
 
     // 2. RootGroup: the lease object's holder and every listed backup.
+    // (A version that lists nobody is the configuration of a row stamped for
+    // a listing that was out when it was journaled: the set the lease lists
+    // now is the group it rests on.)
+    let group = row_backups
+        .filter(|g| !g.is_empty())
+        .or(lease.map(|l| l.backups.as_slice()));
     match (lease, tx) {
-        (Some(l), Some(t)) if t.origin == (0, 0) && !l.backups.is_empty() => {
-            match root_group(o, l, (rid, want), holder_txs) {
+        (Some(l), Some(t))
+            if t.origin == (0, 0) && group.is_some_and(|g| !g.is_empty()) =>
+        {
+            match root_group(o, l, group.unwrap_or(&[]), (rid, want), holder_txs) {
                 Ok(()) => {
                     detail.push("root-group: holder and every listed backup hold it".into());
                     return Some(AckClass::RootGroup);
@@ -1159,7 +1202,7 @@ fn classify(
             }
         }
         (Some(l), Some(t)) if t.origin == (0, 0) => detail.push(format!(
-            "root-group: the lease at epoch {} (holder {}) lists no backup",
+            "root-group: the lease at epoch {} (holder {}) lists no backup (the row's version lists {row_backups:?})",
             l.epoch, l.holder
         )),
         (None, _) => detail.push("root-group: no lease object".into()),
@@ -1282,6 +1325,7 @@ fn peer_in_budget(o: &Oracles, bus: &Bus, answerer: NodeId) -> Option<NodeId> {
 fn root_group(
     o: &Oracles,
     l: &Lease,
+    backups: &[NodeId],
     (rid, want): (Rid, Option<Code>),
     holder_txs: &[BackupTx],
 ) -> Result<(), String> {
@@ -1291,7 +1335,7 @@ fn root_group(
             l.holder, l.epoch
         ));
     };
-    backups_hold(o, l.epoch, &l.backups, ht, Some((l.holder, holder_txs)))
+    backups_hold(o, l.epoch, backups, ht, Some((l.holder, holder_txs)))
 }
 
 /// Every backup in `backups` holds `ht` in its tail of `epoch` (or of the

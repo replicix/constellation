@@ -113,6 +113,8 @@ impl Core {
     ) {
         replica.forget_acked_through(rid.node, rid.incarnation, acked_through);
         self.note_foreign(now, replica, out);
+        // C8 condition 3: a request from a peer is a singleton-test event.
+        self.note_peer_request(from);
         if from != self.cfg.node_id {
             self.note_demand(now, from, true);
         }
@@ -1126,7 +1128,16 @@ impl Core {
         asker: super::Asker,
         out: &mut Vec<Action>,
     ) {
-        if super::backup::is_answer(outcome) && asker == super::Asker::Remote && self.root_lone() {
+        // Plan 46 M1.1 step 5: a forward is a peer's request, so the root
+        // is no singleton from it on; the answer waits for the log all the
+        // same when nothing is listed to back the row.
+        if super::backup::is_answer(outcome)
+            && asker == super::Asker::Remote
+            && self.lease.held.is_some()
+            && !self.lease.lost
+            && !self.lease.epoch_held()
+            && self.lease.backups().is_empty()
+        {
             self.nudge(now, out);
         }
     }

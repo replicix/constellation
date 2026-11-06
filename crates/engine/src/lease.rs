@@ -392,7 +392,7 @@ mod tests {
         let cfg = Config::defaults(7, 1);
         let start = crate::locks::now();
         let mut state = LeaseState::default();
-        let lease = state.granted_lease(start, &cfg, None, false);
+        let lease = state.granted_lease(start, &cfg, None, false, false);
         state.adopt(start, lease, tag(), None);
         let view = LeaseView::default();
         view.mirror(&state, start, &cfg, false);
@@ -415,7 +415,7 @@ mod tests {
         let view = LeaseView::default();
         let renewed = crate::locks::now();
         let mut state = LeaseState::default();
-        let lease = state.granted_lease(renewed, &cfg, None, false);
+        let lease = state.granted_lease(renewed, &cfg, None, false, false);
         state.adopt(renewed, lease, tag(), None);
         view.mirror(&state, renewed, &cfg, false);
         let sent = renewed.honour;
@@ -499,7 +499,7 @@ mod tests {
         assert!(!view.usable());
         assert!(view.admit().is_none());
 
-        let lease = state.granted_lease(Now::same(now.0), &cfg, None, false);
+        let lease = state.granted_lease(Now::same(now.0), &cfg, None, false, false);
         state.adopt(Now::same(now.0), lease, tag(), None);
         view.mirror(&state, Now::same(now.0), &cfg, false);
         assert!(view.usable());
@@ -547,7 +547,7 @@ mod tests {
         let now = Ms(now_unix_ms());
         let view = std::sync::Arc::new(LeaseView::default());
         let mut state = LeaseState::default();
-        let lease = state.granted_lease(Now::same(now.0), &cfg, None, false);
+        let lease = state.granted_lease(Now::same(now.0), &cfg, None, false, false);
         state.adopt(Now::same(now.0), lease, tag(), None);
         view.mirror(&state, Now::same(now.0), &cfg, false);
         let rt = tokio::runtime::Builder::new_multi_thread()

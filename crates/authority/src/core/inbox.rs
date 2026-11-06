@@ -1456,6 +1456,7 @@ impl Core {
         // a lone root's row of it is `Archive`, so its deposition keeps the
         // row as a member copy instead of queueing a second copy of the op
         // beside the batch the next holder drains.
+        self.note_peer_request(batch.node);
         let _class = self.journal_class_for(self.asker_of(batch.node));
         for (i, op) in batch.ops.iter().enumerate() {
             let rid = rid_of(op);

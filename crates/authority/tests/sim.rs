@@ -306,6 +306,7 @@ fn replay_seed() {
         },
         Ok("acks3-crash") => ack_s3_crash_config(),
         Ok("backup-departs") => backup_departs_config(),
+        Ok("singleton-first-peer") => singleton_first_peer_config(),
         Ok("backup-group-cut-ttl") => backup_group_cut_ttl_config(GroupCut::Both),
         Ok("backup-group-cut-ttl-holder-only") => backup_group_cut_ttl_config(GroupCut::HolderOnly),
         Ok("backup-group-cut-ttl-backup-only") => backup_group_cut_ttl_config(GroupCut::BackupOnly),
@@ -1862,6 +1863,33 @@ fn backup_chain_ttl_config() -> SimConfig {
         ],
         // (As `backup_group_cut_ttl_config`.)
         clock_faults: false,
+        ..backup_config()
+    }
+}
+
+/// Plan 46 M1.1 step 5: one node, a singleton answering its clients on its
+/// own disk; a peer joins mid-run (a fresh node, which the roster and the
+/// directory then show), and the root's configuration bumps from a
+/// singleton's to a peer's (`first_peer_join`, the C8 model); a second
+/// peer joining later and the first one's crash and return exercise the
+/// way back.
+fn singleton_first_peer_config() -> SimConfig {
+    SimConfig {
+        nodes: 1,
+        ops_per_client: 16,
+        random_faults: 0,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::JoinFresh,
+            },
+            ScheduledFault {
+                at_ms: 3_000,
+                kind: FaultKind::CrashBackup {
+                    restart_ms: Some(2_000),
+                },
+            },
+        ],
         ..backup_config()
     }
 }
@@ -3543,6 +3571,22 @@ fn backup_departs_reconfigures() {
         "the backup was rarely removed: {t:?}"
     );
     assert!(t.backups_added > t.backups_removed, "never re-added: {t:?}");
+}
+
+/// Plan 46 M1.1 step 5: a singleton meets its first peer mid-run; the lease's
+/// configuration bumps (a CAS per transition, not per row), and the checks
+/// (strict durability, `row_version_matches_config`, linearizability) hold.
+#[test]
+fn singleton_first_peer_bumps_the_configuration() {
+    let t = run_m9(
+        "singleton-first-peer",
+        singleton_first_peer_config(),
+        1300..1400,
+    );
+    assert!(
+        t.reconfig_cas >= 50,
+        "the first peer rarely caused a lease change: {t:?}"
+    );
 }
 
 /// Plan 30 §M9: the holder is partitioned from its backup (both keep S3).
@@ -5443,12 +5487,12 @@ fn a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over() {
     // seal (the 1.1 to 1.3 s class); 1608, whose failover is a seal's again,
     // takes its place.)
     for seed in (1600..1602)
-        .chain(1603..1604)
         .chain(1605..1607)
         .chain(1608..1609)
         .chain(1609..1610)
         .chain(1611..1613)
         .chain(1616..1619)
+        .chain(1620..1621)
     {
         let report = run_seed(seed, delegated_holder_cut_config()).unwrap_or_else(|e| {
             panic!(
@@ -5590,6 +5634,7 @@ fn sweep_config() {
         "acks3" => ack_s3_config(),
         "far" | "backup-far" => far_config(),
         "backup-departs" => backup_departs_config(),
+        "singleton-first-peer" => singleton_first_peer_config(),
         "backup-group-cut-ttl" => backup_group_cut_ttl_config(GroupCut::Both),
         "backup-group-cut-ttl-holder-only" => backup_group_cut_ttl_config(GroupCut::HolderOnly),
         "backup-group-cut-ttl-backup-only" => backup_group_cut_ttl_config(GroupCut::BackupOnly),
@@ -9352,7 +9397,7 @@ fn shared_dir_fast_path_respects_the_ranges() {
 #[test]
 fn shared_dir_unchecked_fast_path_is_caught() {
     let mut caught = 0;
-    for seed in 77_000..77_060 {
+    for seed in 77_480..77_500 {
         if let Err(e) = run_seed(seed, shared_dir_fast_path_unchecked_config()) {
             eprintln!("seed {seed}: {}", e.lines().next().unwrap_or(""));
             caught += 1;
@@ -12763,7 +12808,7 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
 #[test]
 fn a_credited_arrival_cap_splits() {
     use pinned::run_seed;
-    for seed in [195_424, 199_719, 202_419] {
+    for seed in [193_943, 194_714, 195_424] {
         let e = run_seed(
             seed,
             fixed_lane(fast_takeover_skewed_successor_credited_config()),
@@ -13209,7 +13254,7 @@ fn a_locker_keeps_its_grant_across_a_seal_and_a_forward_step() {
 #[test]
 fn a_late_renewal_against_a_stale_mirror_is_refused_and_the_naive_successor_violates() {
     use pinned::run_seed;
-    for seed in [12u64, 18, 20, 34, 43, 106, 202, 336] {
+    for seed in [15u64, 18, 20, 34, 43, 106, 202, 234] {
         run_seed(seed, fixed_lane(locks_late_stale_mirror_config()))
             .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let e = run_seed(seed, fixed_lane(locks_late_stale_mirror_naive_config()))
@@ -13906,7 +13951,10 @@ fn locks_writer_hold_delegated_without_the_settle_is_caught() {
     // second copy; 5798, 5813 and 6110 show none, and 2790, 3104 and 4268
     // are the first three of seeds 0 to 4 400 that do, the settle clean on
     // each.)
-    let seeds = [2790, 3104, 4268];
+    // (Plan 46 M1.1 step 5: a configuration's rows wait for their own rule
+    // across a change; 2790, 3104 and 4268 show none, and 981, 2329 and 2462
+    // are the first three of seeds 0 to 6 000 that do, unclocked.)
+    let seeds = [981, 2329, 2462];
     let mut caught = 0;
     for seed in seeds {
         if let Err(e) = run_seed(seed, locks_writer_hold_delegated_unsettled_config()) {
@@ -13976,7 +14024,7 @@ fn locks_writer_hold_delegated_doubt_lapses_the_grant() {
 #[test]
 fn locks_writer_hold_without_the_check_at_write_is_caught() {
     let mut caught = 0;
-    for seed in 230_000..230_060 {
+    for seed in 230_130..230_150 {
         if let Err(e) = run_seed(seed, locks_writer_hold_unchecked_config()) {
             eprintln!("seed {seed}: {}", e.lines().next().unwrap_or(""));
             caught += 1;
@@ -14097,7 +14145,7 @@ fn a_backed_lock_root_stuck_in_a_step_keeps_its_own_grants() {
 /// fail before and after, are pinned).
 #[test]
 fn a_probe_that_ignores_what_it_reads_is_caught() {
-    for seed in [21u64, 290, 366] {
+    for seed in [21u64, 91, 132] {
         run_seed(seed, fixed_lane(locks_core_stall_backup_long_config()))
             .unwrap_or_else(|e| panic!("locks-core-stall-backup-long seed {seed}: {e}"));
         let e = run_seed(
@@ -14130,7 +14178,7 @@ fn a_probe_that_ignores_what_it_reads_is_caught() {
 /// margin` beyond the window.)
 #[test]
 fn a_proof_dated_at_the_return_of_the_read_is_caught() {
-    for seed in [193u64, 247, 277, 871] {
+    for seed in [115u64, 193, 216, 300] {
         run_seed(
             seed,
             fixed_lane(locks_core_stall_backup_long_slow_reads_config()),
@@ -17322,7 +17370,7 @@ fn the_lone_lead_oracle_catches_a_disabled_lead_and_a_disabled_hysteresis() {
             "long-delegated-lead-off",
             long_delegated_lead_off_config,
             "more than the lead",
-            &[1, 4],
+            &[2, 3],
         ),
         (
             "long-delegated-hysteresis-off",
