@@ -16116,6 +16116,82 @@ mod locks {
         assert_eq!(h.meta.delegate_idx(7).unwrap(), 2);
     }
 
+    /// Plan 46 M1.2 step 6 (review fix): the stream counter of an ended
+    /// generation follows the log in the very commit that re-appends the
+    /// node's own rows, not in a later call. A failure after the re-append
+    /// (the replay queue unreadable, the settle erroring) makes the retried
+    /// gate pass see an emptied capture and return before the settle; a crash
+    /// there is not settled at boot either. Here the settle (`Meta::
+    /// end_own_streams_at_log`) never runs after the re-append: the counter
+    /// equals the log all the same (a, b: a retried pass and a restart find
+    /// it so), and a later strand counts the re-appended rows as this node's
+    /// own (c). Fails on the parent: the counter stayed 0 with the log at 2,
+    /// and the generation was not among the journal's own.
+    #[test]
+    fn the_counter_of_an_ended_generation_follows_the_re_append_without_the_settle() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let (dir, _) = delegated_file(&h.meta);
+        two_delegate_rows(&h, dir);
+        let rows: Vec<constellation_meta::BackupTx> =
+            crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+                .into_iter()
+                .filter(|tx| tx.origin.0 == 7)
+                .collect();
+        assert_eq!(rows.len(), 2);
+        // The gate's strand: the generation ends, its rows leave the journal.
+        h.meta.strand_for_takeover(2, &[7], None).unwrap();
+        assert!(h.meta.deleg_ended_at_gate(7).unwrap());
+        assert!(!h.meta.journal_own_gens().unwrap().contains(&7));
+        assert_eq!(h.meta.log_stream_idx(7).unwrap(), 0);
+        assert_eq!(h.meta.delegate_idx(7).unwrap(), 0);
+        // The re-append, and then the failure: no settle call.
+        for t in &rows {
+            let completes = t.records.iter().find_map(|r| match r {
+                LogRecord::Completed { rid } => Some(*rid),
+                _ => None,
+            });
+            assert!(crate::replica::Replica::apply_backup_tx_journaled(
+                &h.meta, &t.records, completes, t.origin
+            )
+            .is_ok());
+        }
+        let check = |h: &Harness| {
+            assert_eq!(h.meta.log_stream_idx(7).unwrap(), 2);
+            assert_eq!(
+                h.meta.delegate_idx(7).unwrap(),
+                2,
+                "the counter equals the log"
+            );
+        };
+        check(&h);
+        // (a) The retried pass: its capture is empty, nothing re-appends and
+        // nothing settles; the counter is where the re-append left it.
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: true,
+            }),
+        );
+        h.core.bk.gate_own_rows = Some((2, Vec::new()));
+        h.core
+            .reappend_own_delegate_rows(2, &[], 0, &h.meta)
+            .unwrap();
+        check(&h);
+        // (b) The restart: a new core over the same store.
+        h.core = Core::new(h.core.cfg.clone());
+        check(&h);
+        // (c) A later strand counts the re-appended rows as this node's own.
+        assert!(h.meta.journal_own_gens().unwrap().contains(&7));
+    }
+
     /// Plan 46 M1.2 step 6 (c3-spec D7): a row the gate does not re-append
     /// (here: its dependencies were not captured, so it and the rest replay
     /// by rid as root rows) leaves no hole in its stream. The counter is the

@@ -3736,6 +3736,21 @@ pub(crate) fn bump_log_idx_tx(
         .unwrap_or(0);
     if idx > cur {
         kv_set_tx(tx, local, &key, &idx.to_string());
+        // Plan 46 M1.2 step 6: the stream counter of a generation this node's
+        // gate ended is the log's index of it ([`settle_deleg_idx_at_log_tx`]),
+        // so a row appended later (the gate's re-append of its own rows)
+        // raises it in the very transaction that raises the log's index: a
+        // failure or a crash between that commit and the gate's own settle
+        // (`Meta::end_own_streams_at_log`) leaves no counter behind the log.
+        // Raised only: an own row still in the journal keeps its index.
+        if deleg_ended_at_gate_tx(&*tx, local, gen)? {
+            let counter = kv_get_tx(&*tx, local, &deleg_idx_key(gen))?
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            if idx > counter {
+                kv_set_tx(tx, local, &deleg_idx_key(gen), &idx.to_string());
+            }
+        }
     }
     Ok(())
 }

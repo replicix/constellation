@@ -67878,3 +67878,16 @@ the same 9 seeds on main and on the branch (182, 552, 773, 783, 885, 1032, 1098,
 **Gates** (box 1, debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta lib and integration, authority lib
 (1,068), engine lib (952): all pass (the 17 debug failures noted at step 5 are gone since the fixtures carry the `Completed`); release
 sim suite 423 passed, 0 failed, 13 ignored. No perf gate (takeover only).
+
+### Plan 46 M1.2 step 6, review fix: the counter follows the re-append
+
+`reappend_own_delegate_rows` emptied its capture before appending, so a failure after the re-append (the replay queue read, the
+settle) made the retried gate pass return early and never settle; a crash between the re-append commits and the settle was not
+settled at boot either. The ended generation's stream counter then stayed behind the log, and `deleg_idx_assigned_tx` /
+`journal_own_gens` stopped counting the re-appended journal rows as this node's own for a later strand. Fix: `bump_log_idx_tx`
+raises the counter of a generation ended at the gate to the log's index in the same transaction that raises the log's index
+(`crates/meta/src/store/local.rs`): atomic with the re-append, so idempotent across retry and crash, and nothing to re-settle at boot.
+Raise only: an own row still in the journal keeps its index (the strand's settle still lowers it). The gate's explicit settle stays.
+
+**Fail-before** (debug): core `the_counter_of_an_ended_generation_follows_the_re_append_without_the_settle` (counter 0, log 2):
+re-append without the settle, a retried pass with an empty capture, a restart, and the re-appended rows counted as own.
