@@ -9183,6 +9183,61 @@ fn l2b_findings_a_committed_delegate_row_lands_with_its_identity() {
     );
 }
 
+/// Plan 46 M1.2, pinned: `delegated-core-stall-root-sealed+commit` under slow
+/// lease reads (`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`) fails seeds 182,
+/// 552, 773, 783, 885, 1032, 1098, 1713 and 1795 (1489 too before M1.1
+/// step 5 moved its schedule): an op in `d2` takes effect in the log
+/// where the spec refuses it (`EEXIST`/`ENOENT`), e.g. a second `Create` of
+/// a name another node created in between, applied without its check.
+///
+/// Mechanism (seed 182): `d2`'s delegate, cut from its backup and from S3,
+/// executes rid 3/14 (`Create d2/f1`) and streams it to the root, which is
+/// stalled. The backup seals the root and takes epoch 2. Back from the
+/// stall, its lease good on its own clock and its lease read slow, the old
+/// root appends the row (appended, not committed: its tenure had a group)
+/// and only then reads the successor. Its deposition queues the root append
+/// of the delegate row for replay by rid, as `MutateOp::Records` derived
+/// from the row's records. The successor seals the generation below the
+/// row and executes 2/13 (`Create d2/f1`) on `d2`; the queued records,
+/// which carry no check, are applied later (by the old root's drain at its
+/// next tenure in seed 182), and the second `Create` lands.
+///
+/// Deferred to plan 46 M1.2 (C3 item 4: a deposed root keeps another
+/// node's appended rows as a member copy, the next root seals the
+/// predecessor's stream; `MutateOp::Records` copies and the deposed root's
+/// rebuild-replay go), which must close it; the ignore goes then. See
+/// PROGRESS, "delegated-core-stall-root-sealed".
+#[test]
+#[ignore = "plan 46 M1.2 (C3 item 4): a deposed root's appended delegate row replays as unchecked Records; 9 of 2,000 seeds under slow lease reads"]
+fn a_deposed_roots_appended_delegate_row_never_lands_past_its_generations_seal() {
+    let cfg = strict(
+        SimConfig {
+            lease_reads: SLOW_LEASE_READS,
+            ..delegated_core_stall_root_sealed_config()
+        },
+        "commit",
+    );
+    // Every seed runs, and every failure is reported.
+    let seeds = [182u64, 552, 773, 783, 885, 1_032, 1_098, 1_713, 1_795];
+    let failures: Vec<String> = seeds
+        .iter()
+        .filter_map(|&seed| {
+            run_seed(seed, cfg.clone())
+                .err()
+                .map(|e| format!("seed {seed}: {e}"))
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} witnesses fail (replay with \
+         AUTHORITY_SIM_CONFIG=delegated-core-stall-root-sealed+commit \
+         AUTHORITY_SIM_LEASE_READS=0:0:800:1000):\n{}",
+        failures.len(),
+        seeds.len(),
+        failures.join("\n")
+    );
+}
+
 /// Plan 43 C2e (Q1, strict): the delegate and its backup die for good; the
 /// root does not end their generations without a member's tail. The runs end
 /// `waiting_for_group` and every acknowledged row is still held somewhere

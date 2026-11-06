@@ -67493,3 +67493,34 @@ and the tests kept: `the_group_version_at_a_position_before_the_first_record_is_
 configuration). Seeds failing other oracles: `delegated-core-stall-root-lease6` 93, `metered-shared` 99, `delegated-epoch` 21,
 `drop-held-chain-backed` 18 (I1 all four), the controls `-lead-off` 1,412 and `-hysteresis-off` 30, `delegated-core-stall-root-sealed` 9
 (below); every other configuration 0 failing.
+
+### Plan 46 M1.2: `delegated-core-stall-root-sealed` under slow lease reads is a product bug, pinned for C3 item 4 (2026-11-06)
+
+`delegated-core-stall-root-sealed+commit` with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` fails 9 of 2,000 seeds on this branch (182, 552,
+773, 783, 885, 1032, 1098, 1713, 1795) and 6 before M1.1 step 5 (182, 552, 773, 1489, 1713, 1795); main (`11bdd0f0`) fails 182, 552
+and 1795 the same way (traced there): an
+op in `d2` takes effect in the log where the spec refuses it, `EEXIST` or `ENOENT`. A refused op applied: product integrity bug, not the
+oracle's.
+
+Seed 182: `d2`'s delegate (node 3), cut from its backup (node 2) and from S3, executes rid 3/14 (`Create d2/f1`, its row 12) and streams it
+to the root (node 1), which is in its 14 s stall. Node 2 seals epoch 1 and takes epoch 2. Back from the stall, its lease still good on its
+own clock (30 s TTL) and its lease read slow, node 1 appends row 12 (`DelegateStream`: `root_ends_recall`, `core/delegate.rs` ~7997;
+acknowledged through 12, committed 11: its tenure had a group) and reads the successor in the same instant. Its deposition queues the
+append for replay by rid: the root journals the append `Lone`, so L2's drop of gated appends (`meta/src/store/spec.rs:1676`) keeps it, and
+it is queued (`spec.rs:1698`, generation 0) as `MutateOp::Records` from the row's records (`derive_replay_op`, `spec.rs:1405`). Node 2
+seals the generation below row 12 and executes rid 2/13 (`Create d2/f1`) on `d2`. At epoch 3 node 1's drain applies the queued records
+(`core/replay.rs` ~1445: `Records` carry no check), the second `Create` lands, and the delegate's client is answered from the dedup. In 783
+and 1032 node 1's drain sends it by rid through the forward path, with the same result. Without slow lease reads the old root reads the successor before the
+batch arrives and refuses it (0 of 2,000 in the step-0 baseline).
+
+Not fixed here: the fix is C3 item 4 of M1.2 (a deposed root keeps another node's appended rows as a member copy and the next root seals
+the predecessor's stream; `Records` copies and the deposed root's rebuild-replay go), with ADR-41's lone-journal commit removed, which is why
+a `Lone` append is still queued today (for a lone tenure it can be the row's last copy). Pinned:
+`a_deposed_roots_appended_delegate_row_never_lands_past_its_generations_seal` (ignored; fails 9 of 9; loses its `#[ignore]` in M1.2).
+
+Not `delegated-core-stall-root-lease6`'s mechanism: both start from a core acting after a stall on a lease it still holds on its own clock,
+but lease6 is an answer given on a stale `now` (I1, the M1.3 rule: re-check the lease before answering a class that commits locally); here
+nothing is answered on the stale view, and the harm is the unchecked replay of an uncommitted delegate row. M1.3's rule does not close it.
+
+Gates (box 2, this branch): fmt, clippy `-D warnings` (meta, authority, all targets) clean; meta lib 407, authority lib 1,060; release sim
+suite 421 passed, 0 failed, 13 ignored.
