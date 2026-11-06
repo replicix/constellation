@@ -172,6 +172,9 @@ pub(crate) struct GenState {
     pub prev_tails: BTreeMap<NodeId, std::sync::Arc<SealedTail>>,
     /// The end of the generation was asked for and waits for `prev_roots`.
     pub prev_blocked: bool,
+    /// Previous roots settled in this tenure (a transitive answer naming one
+    /// again does not ask it twice).
+    pub prev_done: BTreeSet<NodeId>,
     /// When this root last heard from the delegate about this generation (a
     /// renewal, a stream batch, a recall's answer), on its wait clock.
     pub delegate_heard: Option<WaitMs>,
@@ -819,6 +822,8 @@ pub struct WaitingMemberView {
     pub node: NodeId,
     /// Of the latest group version (the end waits for it).
     pub strict: bool,
+    /// A previous root this root seals (c3-spec D6); the end waits for it.
+    pub previous_root: bool,
     pub asked_ms: Option<u64>,
     pub failed_ms: Option<u64>,
     pub answered_ms: Option<u64>,
@@ -914,13 +919,20 @@ impl Core {
                         .group
                         .strict()
                         .iter()
-                        .map(|n| (*n, true))
-                        .chain(g.group.best_effort().into_iter().map(|n| (n, false)))
-                        .map(|(node, strict)| {
+                        .map(|n| (*n, true, false))
+                        .chain(g.group.best_effort().into_iter().map(|n| (n, false, false)))
+                        .chain(
+                            g.prev_roots
+                                .iter()
+                                .filter(|n| !g.group.strict().contains(n))
+                                .map(|n| (*n, true, true)),
+                        )
+                        .map(|(node, strict, previous_root)| {
                             let note = g.member_notes.get(&node).cloned().unwrap_or_default();
                             WaitingMemberView {
                                 node,
                                 strict,
+                                previous_root,
                                 asked_ms: ago(note.asked),
                                 failed_ms: ago(note.failed),
                                 answered_ms: ago(note.answered),
@@ -1549,6 +1561,7 @@ impl Core {
                         prev_reqs: BTreeMap::new(),
                         prev_tails: BTreeMap::new(),
                         prev_blocked: false,
+                        prev_done: BTreeSet::new(),
                         delegate_heard: None,
                         cursor,
                         last_batch: None,
@@ -3913,6 +3926,12 @@ impl Core {
             return;
         }
         self.dl.sealed.insert(gen);
+        // The previous roots this node itself still owed (it was deposed and
+        // succeeded before its own predecessor answered): the root seals them
+        // too (c3-spec D6, transitive). Unreadable: no answer.
+        let Some(prev_roots) = replica.deleg_prev_roots(gen) else {
+            return;
+        };
         let txs = if backing {
             let Some(tail) = replica.deleg_backup_tail(gen) else {
                 return;
@@ -3937,6 +3956,7 @@ impl Core {
                 gen,
                 sealed: backing,
                 txs,
+                prev_roots,
             },
         });
     }
@@ -3960,13 +3980,14 @@ impl Core {
         gen: u64,
         sealed: bool,
         txs: Vec<constellation_meta::DelegateTx>,
+        prev_roots: Vec<NodeId>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         if matches!(self.dl.by_req.get(&req), Some((g, ReqKind::SealPrevRoot)) if *g == gen) {
             // (Kept in `by_req` until the set is settled: a late answer to an
             // earlier request is as good.)
-            self.on_prev_root_sealed(now, from, req, gen, sealed, txs, replica, out);
+            self.on_prev_root_sealed(now, from, req, gen, sealed, txs, prev_roots, replica, out);
             return;
         }
         let Some((g, ReqKind::Seal)) = self.dl.by_req.remove(&req) else {
@@ -7452,12 +7473,28 @@ impl Core {
         if let Some(prev) = self.lease.prev_holder {
             set.insert(prev);
         }
-        set.remove(&me);
+        // This node's own member copy of `gen` (what an earlier deposition of
+        // it kept of the rows it appended, c3-spec §6.1) is one the generation
+        // must be drained from before it ends, like any previous root's: a
+        // node that claims again after its successor died holds rows the log
+        // may not (and its cursor says nothing of them). It is "asked" with
+        // no message: the tail is read here (`deleg_load_own_copy`, retried
+        // by every round of the step). A copy that holds nothing is no debt; one
+        // that cannot be read leaves the set as it was.
+        match replica.deleg_backup_holds_any(gen) {
+            Some(true) => {
+                set.insert(me);
+            }
+            Some(false) => {
+                set.remove(&me);
+            }
+            None => {}
+        }
         if set.is_empty() {
             return;
         }
         let nodes: Vec<NodeId> = set.iter().copied().collect();
-        replica.set_deleg_prev_roots(gen, &nodes);
+        self.persist_prev_roots(gen, &nodes, replica);
         tracing::info!(
             node = me,
             gen = %constellation_meta::delegation::GenLabel::of(gen),
@@ -7468,6 +7505,20 @@ impl Core {
             g.prev_roots = set;
         }
         self.deleg_prev_roots_step(now, replica, out);
+    }
+
+    /// Persist the previous roots still to seal; a failure is logged and
+    /// counted (the set is then only in memory: a restart before it settles
+    /// seals what the claim names, not what an earlier tenure owed).
+    fn persist_prev_roots(&mut self, gen: u64, nodes: &[NodeId], replica: &dyn Replica) {
+        if !replica.set_deleg_prev_roots(gen, nodes) {
+            self.stats.deleg_prev_roots_persist_failed += 1;
+            tracing::warn!(
+                node = self.me(),
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
+                "the previous roots to seal could not be persisted"
+            );
+        }
     }
 
     /// The previous roots' seals (D6), after every event: ask each that has
@@ -7482,6 +7533,11 @@ impl Core {
             .map(|(gen, _)| *gen)
             .collect();
         for gen in gens {
+            if self.dl.gens[&gen].prev_roots.contains(&self.me())
+                && !self.dl.gens[&gen].prev_tails.contains_key(&self.me())
+            {
+                self.deleg_load_own_copy(gen, replica);
+            }
             let tails: Vec<(NodeId, std::sync::Arc<SealedTail>)> = self.dl.gens[&gen]
                 .prev_tails
                 .iter()
@@ -7504,11 +7560,12 @@ impl Core {
             let Some(g) = self.dl.gens.get(&gen) else {
                 continue;
             };
+            let me = self.me();
             let due: Vec<NodeId> = g
                 .prev_roots
                 .iter()
                 .copied()
-                .filter(|n| !g.prev_tails.contains_key(n))
+                .filter(|n| *n != me && !g.prev_tails.contains_key(n))
                 .filter(|n| {
                     g.member_notes
                         .get(n)
@@ -7551,11 +7608,12 @@ impl Core {
         };
         g.prev_roots.remove(&node);
         g.prev_tails.remove(&node);
+        g.prev_done.insert(node);
         if g.prev_roots.is_empty() {
             self.deleg_prev_roots_cleared(now, gen, true, replica, out);
         } else {
             let nodes: Vec<NodeId> = g.prev_roots.iter().copied().collect();
-            replica.set_deleg_prev_roots(gen, &nodes);
+            self.persist_prev_roots(gen, &nodes, replica);
         }
     }
 
@@ -7571,7 +7629,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        replica.set_deleg_prev_roots(gen, &[]);
+        self.persist_prev_roots(gen, &[], replica);
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return;
         };
@@ -7611,6 +7669,7 @@ impl Core {
         gen: u64,
         sealed: bool,
         txs: Vec<constellation_meta::DelegateTx>,
+        prev_roots: Vec<NodeId>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -7621,6 +7680,22 @@ impl Core {
             return;
         }
         gs.member_notes.entry(from).or_default().answered = Some(now.wait);
+        // Transitive (D6): the roots the answering node itself still owed a
+        // seal are sealed too (before it is settled, so the set is never empty
+        // between them).
+        let mut added = false;
+        for n in prev_roots {
+            if n != from && !gs.prev_done.contains(&n) && gs.prev_roots.insert(n) {
+                added = true;
+            }
+        }
+        if added {
+            let nodes: Vec<NodeId> = gs.prev_roots.iter().copied().collect();
+            self.persist_prev_roots(gen, &nodes, replica);
+        }
+        let Some(gs) = self.dl.gens.get_mut(&gen) else {
+            return;
+        };
         if !sealed {
             // It holds nothing of the generation (and is sealed against more).
             self.deleg_prev_root_done(now, gen, from, replica, out);
@@ -7640,6 +7715,33 @@ impl Core {
         gs.prev_tails
             .insert(from, std::sync::Arc::new(SealedTail { from, txs, end }));
         self.deleg_prev_roots_step(now, replica, out);
+    }
+
+    /// This node is among `gen`'s previous roots (a transitive answer named
+    /// it): its own member copy is the tail it contributes, read locally. A
+    /// copy that cannot be read is retried by the next round of the step.
+    fn deleg_load_own_copy(&mut self, gen: u64, replica: &dyn Replica) {
+        let me = self.me();
+        let txs = match replica.deleg_backup_holds_any(gen) {
+            Some(true) => replica.deleg_backup_tail(gen),
+            // It holds nothing: nothing to drain (settled by the step).
+            Some(false) => Some(Vec::new()),
+            None => None,
+        };
+        if let (Some(txs), Some(g)) = (txs, self.dl.gens.get_mut(&gen)) {
+            let end = txs.iter().fold(
+                g.cursor,
+                |end, tx| {
+                    if tx.idx == end + 1 {
+                        tx.idx
+                    } else {
+                        end
+                    }
+                },
+            );
+            g.prev_tails
+                .insert(me, std::sync::Arc::new(SealedTail { from: me, txs, end }));
+        }
     }
 
     /// The delegate's renewal says its stream head is `head`: when this root
@@ -7885,12 +7987,16 @@ impl Core {
 
     /// A drained recall whose stream caught up ends the generation.
     fn root_progress(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
-        // Plan 46 M1.2 step 7 (D6): the delegate answered the recall with the
-        // head of its stream and this root has appended through it: it holds
-        // every row the delegate executed, so no previous root holds one it
-        // lacks (as for a renewal's `stream_head`, `deleg_prev_roots_renewed`).
-        // A delegate that was recalled renews no more, and a dead previous
-        // root answers nothing: this is the proof that is left.
+        // Plan 46 M1.2 step 7 (D6): the delegate answered the recall with
+        // `through`, its stream's index capped by its own holder appends its
+        // tenure has not committed (`holder_append_cap`, `on_deleg_recall`), not
+        // by its head: the rows above the cap were never acknowledged either
+        // (`DelegateStreamAck.committed` is capped the same way). A root that has
+        // appended through it holds every row acknowledged to a client, so no
+        // previous root holds an acknowledged row it lacks (as for a renewal's
+        // `stream_head`, `deleg_prev_roots_renewed`). A delegate that was
+        // recalled renews no more, and a dead previous root answers nothing:
+        // this is the proof that is left.
         let proven: Vec<u64> = self
             .dl
             .gens
@@ -7980,6 +8086,19 @@ impl Core {
                     t.from, g.cursor, t.end
                 ))
             }
+            // Plan 46 M1.2 step 7 (c3-spec D6): a previous root whose tail is
+            // in hand or not yet answered may hold rows its clients were told
+            // are committed, that no other member has: not given up without
+            // `--force` (which the operator gives after confirming it is gone).
+            Some(g) if !force && (!g.prev_roots.is_empty() || !g.prev_tails.is_empty()) => {
+                Err(format!(
+                    "generation {gen} still waits for the tail of previous root(s) {:?} ({} tail(s) in hand): rows only a previous \
+                     root held, acknowledged to their clients, would be lost. Confirm from elsewhere that they are down, then run \
+                     the command again with --force",
+                    g.prev_roots,
+                    g.prev_tails.len()
+                ))
+            }
             // The discriminator (C2e follow-up): a delegate or a strict
             // member this root heard from within a grant's ttl may be alive
             // and cut from it only; its tail, or the delegate's rows, are not
@@ -7999,7 +8118,12 @@ impl Core {
                 "this node cannot end generation {gen} now (it is not a usable root)"
             )),
             Some(g) => {
-                let known = g.sealed_tail.as_ref().map_or(g.cursor, |t| t.end.max(g.cursor));
+                let known = g
+                    .sealed_tail
+                    .iter()
+                    .map(|t| t.end)
+                    .chain(g.prev_tails.values().map(|t| t.end))
+                    .fold(g.cursor, u64::max);
                 let cursor = g.cursor;
                 let forced = force && heard.is_some();
                 // The audit of `--force`: who was heard from, and when.
@@ -8085,6 +8209,13 @@ impl Core {
                 (
                     *m,
                     "a member of its group",
+                    ago(self.deleg_member_heard(g, *m)),
+                )
+            }))
+            .chain(g.prev_roots.iter().map(|m| {
+                (
+                    *m,
+                    "a previous root of its generation",
                     ago(self.deleg_member_heard(g, *m)),
                 )
             }))
@@ -8264,7 +8395,10 @@ impl Core {
         };
         let first = !g.ended;
         if !g.prev_roots.is_empty() || !g.prev_reqs.is_empty() {
-            replica.set_deleg_prev_roots(gen, &[]);
+            self.persist_prev_roots(gen, &[], replica);
+            let Some(g) = self.dl.gens.get_mut(&gen) else {
+                return;
+            };
             for req in std::mem::take(&mut g.prev_reqs).keys() {
                 self.dl.by_req.remove(req);
             }
@@ -8735,6 +8869,7 @@ impl Core {
                 prev_reqs: BTreeMap::new(),
                 prev_tails: BTreeMap::new(),
                 prev_blocked: false,
+                prev_done: BTreeSet::new(),
                 delegate_heard: None,
                 cursor: 0,
                 last_batch: None,

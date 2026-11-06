@@ -48631,6 +48631,7 @@ mod deleg_windows_tests {
                 gen: 7,
                 sealed: true,
                 txs: tail,
+                prev_roots: Vec::new(),
             },
         });
         assert!(
@@ -48729,6 +48730,7 @@ mod deleg_windows_tests {
                 gen: 7,
                 sealed: true,
                 txs: tail,
+                prev_roots: Vec::new(),
             },
         });
         let g = &h.core.dl.gens[&7];
@@ -48884,6 +48886,7 @@ mod deleg_windows_tests {
                     row(2, on_7),
                     row(3, constellation_meta::Position::ZERO),
                 ],
+                prev_roots: Vec::new(),
             },
         });
         let g = &h.core.dl.gens[&8];
@@ -49021,6 +49024,7 @@ mod deleg_windows_tests {
                 gen: 7,
                 sealed: true,
                 txs: vec![row_at(1), row_at(2)],
+                prev_roots: Vec::new(),
             },
         });
         let g = &h.core.dl.gens[&7];
@@ -49055,6 +49059,7 @@ mod deleg_windows_tests {
                 gen: 7,
                 sealed: false,
                 txs: Vec::new(),
+                prev_roots: Vec::new(),
             },
         });
         assert!(h.core.dl.gens[&7].prev_roots.is_empty());
@@ -49077,6 +49082,7 @@ mod deleg_windows_tests {
                 gen: 7,
                 sealed: true,
                 txs: vec![row_at(1)],
+                prev_roots: Vec::new(),
             },
         });
         assert!(h.core.dl.gens[&7].ended, "the drained recall ends it now");
@@ -49163,6 +49169,158 @@ mod deleg_windows_tests {
         assert!(prev_root_seal(&out, 2).is_some(), "asked again: {out:?}");
     }
 
+    /// Plan 46 M1.2 step 7 fix (c3-spec D6, item 1): a node that claims the
+    /// lease again after its successor died holds, as a member copy, rows it
+    /// appended as an earlier root that the log may not carry, and its cursor
+    /// says nothing of them: it drains its own copy before the generation can
+    /// end. A (node 1) deposed, B (node 2) claimed and died, the delegate
+    /// (node 3) died, A claims again: B never answers, the answer that
+    /// settles it ("holds nothing") must not end the generation below A's own
+    /// copy.
+    #[test]
+    fn a_reclaiming_node_drains_its_own_member_copy_before_the_generation_ends() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.delegation_ttl_ms = 1_000;
+        h.hold(1, None);
+        h.core.lease.prev_holder = Some(2);
+        let _ = delegated_to_me(&h.meta, 3);
+        Replica::deleg_backup_append(&h.meta, 7, &[row_at(1), row_at(2)], 0).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let g = &h.core.dl.gens[&7];
+        assert_eq!(g.cursor, 2, "its own rows are appended at once");
+        assert!(
+            !g.prev_roots.contains(&1),
+            "and settled: {:?}",
+            g.prev_roots
+        );
+        let seal = prev_root_seal(&out, 2).expect("the predecessor is sealed");
+        assert!(prev_root_seal(&out, 1).is_none(), "no seal to itself");
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegSealed {
+                req: seal,
+                gen: 7,
+                sealed: false,
+                txs: Vec::new(),
+                prev_roots: Vec::new(),
+            },
+        });
+        let g = &h.core.dl.gens[&7];
+        assert!(g.prev_roots.is_empty(), "settled");
+        assert_eq!(g.cursor, 2, "the generation ends at its own copy's end");
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].ended);
+        assert_eq!(h.core.dl.gens[&7].cursor, 2);
+    }
+
+    /// Item 2: a previous root's answer names the roots it itself still owed a
+    /// seal (A deposed, B deposed before A answered, C seals B only): C seals
+    /// A too, and the generation does not settle before A answers.
+    #[test]
+    fn a_previous_roots_answer_names_the_roots_it_still_owed() {
+        let (mut h, out) = root_inheriting_a_backup_less_generation(2);
+        let seal = prev_root_seal(&out, 2).unwrap();
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegSealed {
+                req: seal,
+                gen: 7,
+                sealed: false,
+                txs: Vec::new(),
+                prev_roots: vec![4],
+            },
+        });
+        let seal4 = prev_root_seal(&out, 4).unwrap_or_else(|| panic!("node 4 not sealed: {out:?}"));
+        let g = &h.core.dl.gens[&7];
+        assert_eq!(g.prev_roots.iter().copied().collect::<Vec<_>>(), vec![4]);
+        assert_eq!(h.meta.deleg_prev_roots(7).unwrap(), vec![4]);
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert!(!h.core.dl.gens[&7].ended, "waits for node 4");
+        // Naming a settled root again does not ask it twice.
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegSealed {
+                req: seal4,
+                gen: 7,
+                sealed: true,
+                txs: vec![row_at(1), row_at(2)],
+                prev_roots: vec![2],
+            },
+        });
+        let g = &h.core.dl.gens[&7];
+        assert!(g.prev_roots.is_empty(), "{:?}", g.prev_roots);
+        assert_eq!(g.cursor, 2);
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].ended);
+    }
+
+    /// The answering side: a node that still owes previous roots says so in
+    /// its seal answer.
+    #[test]
+    fn a_seal_answer_carries_the_answerers_own_previous_roots() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        Replica::set_deleg_prev_roots(&h.meta, 7, &[4, 5]);
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegSeal {
+                req: OpId(5),
+                gen: 7,
+            },
+        });
+        let named = sends(&out).iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegSealed {
+                gen: 7, prev_roots, ..
+            } if *to == 1 => Some(prev_roots.clone()),
+            _ => None,
+        });
+        assert_eq!(named, Some(vec![4, 5]), "{out:?}");
+    }
+
+    /// Items 3 and 4: a previous root being waited on is listed in the
+    /// waiting view, and `abandon-group` without `--force` refuses while one is
+    /// unanswered or its tail is held; with `--force` it ends the generation.
+    #[test]
+    fn a_waited_on_previous_root_is_listed_and_guards_abandon_group() {
+        let (mut h, _) = root_inheriting_a_backup_less_generation(2);
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let view = h.core.deleg_view();
+        let waiting = view.waiting.iter().find(|v| v.gen == 7).expect("listed");
+        assert!(
+            waiting
+                .members
+                .iter()
+                .any(|m| m.node == 2 && m.previous_root),
+            "{:?}",
+            waiting.members
+        );
+        let mut out = Vec::new();
+        h.core
+            .on_control_abandon_generation(h.clk(), OpId(77), 0, 7, false, &h.meta, &mut out);
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::ControlDone { result: Err(_), .. })),
+            "refused: {out:?}"
+        );
+        assert!(!h.core.dl.gens[&7].ended);
+        let mut out = Vec::new();
+        h.core
+            .on_control_abandon_generation(h.clk(), OpId(78), 0, 7, true, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].ended, "forced: {out:?}");
+    }
+
     fn journal_records_of_gen(h: &Harness, _gen: u64) -> Vec<LogRecord> {
         Replica::journal_txs_from(&h.meta, 0, usize::MAX)
             .into_iter()
@@ -49218,6 +49376,7 @@ mod deleg_windows_tests {
                 gen: 7,
                 sealed: true,
                 txs: vec![row(1), row(2)],
+                prev_roots: Vec::new(),
             },
         });
         let g = &h.core.dl.gens[&7];
@@ -49239,6 +49398,7 @@ mod deleg_windows_tests {
                 gen: 7,
                 sealed: true,
                 txs: vec![row(1), row(2), row(3)],
+                prev_roots: Vec::new(),
             },
         });
         let g = &h.core.dl.gens[&7];
@@ -49492,6 +49652,7 @@ mod deleg_windows_tests {
                 gen: 7,
                 sealed: true,
                 txs: vec![tail_row(1)],
+                prev_roots: Vec::new(),
             },
         });
         assert!(
@@ -49507,6 +49668,7 @@ mod deleg_windows_tests {
                 gen: 7,
                 sealed: false,
                 txs: Vec::new(),
+                prev_roots: Vec::new(),
             },
         });
         assert!(
@@ -49527,6 +49689,7 @@ mod deleg_windows_tests {
                 gen: 7,
                 sealed: true,
                 txs: vec![tail_row(1), tail_row(2)],
+                prev_roots: Vec::new(),
             },
         });
         assert!(h.core.dl.gens[&7].ended);
@@ -49604,6 +49767,7 @@ mod deleg_windows_tests {
                 gen: 7,
                 sealed: true,
                 txs: vec![tail_row(1), stuck],
+                prev_roots: Vec::new(),
             },
         });
         assert!(!h.core.dl.gens[&7].ended);

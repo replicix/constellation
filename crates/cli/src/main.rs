@@ -4166,7 +4166,13 @@ fn render_waiting_generations(delegation: &api::DelegationReport) -> Vec<String>
                     format!(
                         "node {}{} (asked {}, unreachable {}, answered {}, heard {})",
                         m.node,
-                        if m.strict { "" } else { ", older record" },
+                        if m.previous_root {
+                            ", previous root"
+                        } else if m.strict {
+                            ""
+                        } else {
+                            ", older record"
+                        },
                         ago(m.asked_ms),
                         ago(m.failed_ms),
                         ago(m.answered_ms),
@@ -4928,6 +4934,7 @@ mod parse_byte_size_tests {
             members: vec![api::WaitingMemberStatus {
                 node: 4,
                 strict: true,
+                previous_root: false,
                 asked_ms: Some(2_000),
                 failed_ms: Some(2_000),
                 answered_ms: None,

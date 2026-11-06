@@ -67967,3 +67967,30 @@ branch 0. `delegated-root-gone+commit` 0. Rebuilds: none on the branch in `long-
 
 **Gates** (box 2, debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta lib and integration (636 debug, 634
 release), authority lib 1,068, engine lib 952, release sim suite 418 passed, 0 failed, 12 ignored. No perf gate (takeover only).
+
+### Plan 46 M1.2 step 7, fix round (Opus review SHOULDs)
+
+Items 1 and 2 are not losses today only because `root_append_cap` makes a lone root's journal count for nothing; steps 13/14 remove the cap, so
+they are closed now.
+
+1. **A node that claims again drains its own member copy.** `deleg_inherit_prev_roots` no longer removes the node itself from the set when its
+   own `backup_tail[DELEG_BACKUP_BASE + gen]` holds rows: the copy is loaded as the node's own tail (`deleg_load_own_copy`, no message; retried by
+   every round of the step) and drained from the cursor like a previous root's, and the generation does not end below it. (A deposed, B claims and
+   dies before draining A, the delegate dies, A claims again: the generation ended at A's cursor, below A's own copy.) Test
+   `a_reclaiming_node_drains_its_own_member_copy_before_the_generation_ends` (fails with the self-removal back).
+2. **Transitive previous roots.** `DelegSealed` carries `prev_roots`: the answering node's own persisted set for the generation (`on_deleg_seal`;
+   `Payload::DelegSealed`, `PeerMsg::DelegSealed`, the driver's reply channel). The asking root adds them (not the ones it settled in this tenure:
+   `GenState::prev_done`) before it settles the answerer, and seals them too; the end waits for all. Tests
+   `a_previous_roots_answer_names_the_roots_it_still_owed` (fails without the union), `a_seal_answer_carries_the_answerers_own_previous_roots`.
+3. **Status lists the previous roots** being waited on (`WaitingMemberStatus.previous_root`, schema re-blessed, no version bump; the CLI says
+   "previous root").
+4. **`abandon-group` guard.** Without `--force` it refuses while a previous root is unanswered or its tail is held (`prev_roots`/`prev_tails`), and
+   `deleg_group_heard_lately` weighs previous roots too; the cut `known` includes their tails. Test
+   `a_waited_on_previous_root_is_listed_and_guards_abandon_group` (fails with the guard and the listing removed).
+5. The comment at the drained-recall shortcut (`root_progress`) now says `through` is capped by `holder_append_cap`, and why that still proves the
+   root holds every acknowledged row.
+6. **Sim** `delegated-root-deposed-delegate-dies` (c3 §6.5; `replay_seed`, `sweep_config`, test `delegated_root_deposed_delegate_dies_loses_nothing`
+   over seeds 0..19 `+commit`): three nodes, a delegate of `d1` with no recorded backup (`delegation_backed_gens_max = 0`), the root loses S3 and its
+   backup stream, the delegate crashes for good. `+commit` ×2,000, with and without slow lease reads: 0 failing. (The oracles judge; the sum of
+   `deleg_prev_root_rows` is not asserted.) `reset_for_rebuilt_ns_tx` still queues appended rows as `Records`, as noted above.
+7. `set_deleg_prev_roots` failures are logged and counted (`Stats::deleg_prev_roots_persist_failed`, `persist_prev_roots`), not ignored.

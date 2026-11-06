@@ -1230,6 +1230,7 @@ pub trait PeerService: Send + Sync + 'static {
                 gen,
                 sealed: false,
                 txs: Vec::new(),
+                prev_roots: Vec::new(),
             }
         })
     }

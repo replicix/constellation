@@ -1309,6 +1309,9 @@ pub struct Stats {
     pub deleg_prev_root_renewals: u64,
     /// ... and recalls whose drained answer settled the set.
     pub deleg_prev_root_recalls: u64,
+    /// ... and persists of the previous-roots set that failed (the set is then
+    /// only in memory).
+    pub deleg_prev_roots_persist_failed: u64,
     /// Backup of a delegate: transactions persisted, seals.
     pub deleg_backup_persisted: u64,
     pub deleg_backup_seals: u64,
@@ -3006,7 +3009,8 @@ impl Core {
                 gen,
                 sealed,
                 txs,
-            } => self.on_deleg_sealed(now, from, req, gen, sealed, txs, replica, out),
+                prev_roots,
+            } => self.on_deleg_sealed(now, from, req, gen, sealed, txs, prev_roots, replica, out),
             // Plan 43 C1-3: a claimant asks for the tail of an epoch this
             // node was a member of the group of, and the answer.
             PeerMsg::SealTail {

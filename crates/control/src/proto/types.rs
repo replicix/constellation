@@ -297,6 +297,9 @@ pub struct WaitingMemberStatus {
     /// A member of the latest recorded group (the end waits for one of
     /// these); otherwise only an older record named it.
     pub strict: bool,
+    /// A previous root of the generation this root seals (plan 46 M1.2 step
+    /// 7): the end waits for its tail too (it may hold rows the log lacks).
+    pub previous_root: bool,
     pub asked_ms: Option<u64>,
     /// The last time the transport to it failed (down, or cut from the root).
     pub failed_ms: Option<u64>,

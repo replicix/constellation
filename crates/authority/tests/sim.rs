@@ -399,6 +399,7 @@ fn replay_seed() {
             delegated_core_stall_root_backup_unprobed_config()
         }
         Ok("delegated-core-stall-root-sealed") => delegated_core_stall_root_sealed_config(),
+        Ok("delegated-root-deposed-delegate-dies") => delegated_root_deposed_delegate_dies_config(),
         Ok("delegated-core-stall-root-hang") => delegated_core_stall_root_hang_config(),
         Ok("delegated-core-stall-both") => delegated_core_stall_both_config(),
         Ok("delegated-core-stall-root-recall") => delegated_core_stall_root_recall_config(),
@@ -5687,6 +5688,7 @@ fn sweep_config() {
             delegated_core_stall_root_backup_unprobed_config()
         }
         "delegated-core-stall-root-sealed" => delegated_core_stall_root_sealed_config(),
+        "delegated-root-deposed-delegate-dies" => delegated_root_deposed_delegate_dies_config(),
         "delegated-core-stall-root-hang" => delegated_core_stall_root_hang_config(),
         "delegated-core-stall-both" => delegated_core_stall_both_config(),
         "delegated-core-stall-root-recall" => delegated_core_stall_root_recall_config(),
@@ -7380,6 +7382,45 @@ fn delegated_core_stall_root_sealed_config() -> SimConfig {
             ),
         ],
         ..delegated_core_stall_root_backup_config()
+    }
+}
+
+/// Plan 46 M1.2 step 7 (c3-spec §6.5): a root that is deposed holding the
+/// rows its delegate was answered through, whose delegate then dies for good.
+/// Three nodes, node 1 the root with node 2 its backup, node 3 the delegate of
+/// `d1` with no recorded backup (`delegation_backed_gens_max = 0`: the group
+/// is the delegate and the root that appended). The root loses S3 and its
+/// backup stream for a while: its appends of node 3's rows are the root's copy
+/// alone, a successor (node 2) seals the root and takes over, and node 3 is
+/// gone before its rows are in the log. The rows the root appended are a
+/// member copy on a node the generation's end must seal (or, on a node that
+/// claims again, drain), or acknowledged rows are lost (`check_exactly_once`,
+/// `acked_held_somewhere`).
+fn delegated_root_deposed_delegate_dies_config() -> SimConfig {
+    let at = |at_ms, kind| ScheduledFault { at_ms, kind };
+    SimConfig {
+        core: std::sync::Arc::new(|node, incarnation| {
+            let mut c = sim::run::deleg_backup_core_config(node, incarnation);
+            c.delegation_backed_gens_max = 0;
+            c
+        }),
+        clients_per_node: 2,
+        ops_per_client: 30,
+        delegations: vec![("d1".into(), 3)],
+        faults: vec![
+            at(1_500, FaultKind::CutS3Holder { for_ms: 12_000 }),
+            at(1_500, FaultKind::PartitionBackup { for_ms: 4_000 }),
+            at(
+                3_500,
+                FaultKind::CrashNode {
+                    node: 3,
+                    restart_ms: None,
+                    keep_journal: true,
+                },
+            ),
+        ],
+        settle_ms: 60_000,
+        ..delegated_config()
     }
 }
 
@@ -9153,6 +9194,21 @@ fn a_deposed_roots_appended_delegate_row_never_lands_past_its_generations_seal()
         seeds.len(),
         failures.join("\n")
     );
+}
+
+/// Plan 46 M1.2 step 7 (c3-spec §6.5): `delegated-root-deposed-delegate-dies`
+/// loses no acknowledged row (seeds 0..20, `+commit`).
+#[test]
+fn delegated_root_deposed_delegate_dies_loses_nothing() {
+    let cfg = strict(delegated_root_deposed_delegate_dies_config(), "commit");
+    let failures: Vec<String> = (0..20u64)
+        .filter_map(|seed| {
+            run_seed(seed, cfg.clone())
+                .err()
+                .map(|e| format!("seed {seed}: {e}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Plan 43 C2e (Q1, strict): the delegate and its backup die for good; the

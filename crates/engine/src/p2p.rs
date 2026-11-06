@@ -272,6 +272,7 @@ impl constellation_net::PeerService for P2pBridge {
                 gen,
                 sealed: false,
                 txs: Vec::new(),
+                prev_roots: Vec::new(),
             };
             let (reply, receive) = tokio::sync::oneshot::channel();
             if self
@@ -282,11 +283,12 @@ impl constellation_net::PeerService for P2pBridge {
                 return none;
             }
             match receive.await {
-                Ok((sealed, txs)) => constellation_net::Payload::DelegSealed {
+                Ok((sealed, txs, prev_roots)) => constellation_net::Payload::DelegSealed {
                     req_id,
                     gen,
                     sealed,
                     txs: postcard::to_allocvec(&txs).unwrap_or_default(),
+                    prev_roots,
                 },
                 Err(_) => none,
             }

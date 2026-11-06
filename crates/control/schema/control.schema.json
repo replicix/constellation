@@ -10679,6 +10679,10 @@
           "minimum": 0,
           "type": "integer"
         },
+        "previous_root": {
+          "description": "A previous root of the generation this root seals (plan 46 M1.2 step\n7): the end waits for its tail too (it may hold rows the log lacks).",
+          "type": "boolean"
+        },
         "strict": {
           "description": "A member of the latest recorded group (the end waits for one of\nthese); otherwise only an older record named it.",
           "type": "boolean"
@@ -10686,7 +10690,8 @@
       },
       "required": [
         "node",
-        "strict"
+        "strict",
+        "previous_root"
       ],
       "type": "object"
     },

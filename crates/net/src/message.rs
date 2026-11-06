@@ -531,6 +531,11 @@ pub enum Payload {
         gen: u64,
         sealed: bool,
         txs: Vec<u8>,
+        /// Plan 46 M1.2 step 7 (c3-spec D6): the previous roots the answering
+        /// node itself still had to seal for `gen` (a node deposed and
+        /// succeeded before its own predecessor answered): the sealing root
+        /// seals them too.
+        prev_roots: Vec<u64>,
     },
     /// Plan 30 §M8: the sequencer recalls read delegation `grant` on
     /// `ino`; the delegate stops honouring it, then answers

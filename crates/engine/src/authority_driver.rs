@@ -917,7 +917,7 @@ pub struct Driver {
     lock_renew_replies: HashMap<OpId, oneshot::Sender<LockRenewResults>>,
     lock_test_replies: HashMap<OpId, oneshot::Sender<LockTestOutcome>>,
     deleg_backup_replies: HashMap<OpId, oneshot::Sender<(u64, bool)>>,
-    deleg_seal_replies: HashMap<OpId, oneshot::Sender<(bool, Vec<constellation_meta::DelegateTx>)>>,
+    deleg_seal_replies: HashMap<OpId, oneshot::Sender<crate::sync::DelegSealAnswer>>,
     /// Plan 43 C1-3: a claimant's `SealTail` handed to the core, answered
     /// by the `SealedTail` the core sends back to the claimant.
     seal_tail_replies: HashMap<(NodeId, OpId), oneshot::Sender<crate::sync::SealTailAnswer>>,
@@ -1641,7 +1641,14 @@ fn sealed_tail_event(
 /// (`PeerFailed`: the seal is asked again), never a `sealed` answer with an
 /// empty tail: the root would end the generation without the rows
 /// acknowledged through that backup (I1).
-fn deleg_sealed_event(to: NodeId, req: OpId, gen: u64, sealed: bool, txs: &[u8]) -> Event {
+fn deleg_sealed_event(
+    to: NodeId,
+    req: OpId,
+    gen: u64,
+    sealed: bool,
+    txs: &[u8],
+    prev_roots: Vec<u64>,
+) -> Event {
     let txs = match constellation_meta::from_bytes_exact(txs) {
         Ok(txs) => txs,
         // An unsealed answer carries no tail (a backup whose sync is down
@@ -1671,6 +1678,7 @@ fn deleg_sealed_event(to: NodeId, req: OpId, gen: u64, sealed: bool, txs: &[u8])
             gen,
             sealed,
             txs,
+            prev_roots,
         },
     }
 }
@@ -4998,10 +5006,14 @@ impl Driver {
                 }
             }
             PeerMsg::DelegSealed {
-                req, sealed, txs, ..
+                req,
+                sealed,
+                txs,
+                prev_roots,
+                ..
             } => {
                 if let Some(tx) = self.deleg_seal_replies.remove(&req) {
-                    let _ = tx.send((sealed, txs));
+                    let _ = tx.send((sealed, txs, prev_roots));
                 }
             }
             // Plan 43 C1-3: the core's answer to a claimant's `SealTail`
@@ -5154,9 +5166,10 @@ impl Driver {
                             gen,
                             sealed,
                             txs,
+                            prev_roots,
                         })) if req_id == req.0 => {
                             let _ = tx.send(Internal::Event(deleg_sealed_event(
-                                to, req, gen, sealed, &txs,
+                                to, req, gen, sealed, &txs, prev_roots,
                             )));
                         }
                         _ => {
@@ -7842,7 +7855,7 @@ mod tests {
             }
         }
         let empty = postcard::to_allocvec(&Vec::<constellation_meta::DelegateTx>::new()).unwrap();
-        match super::deleg_sealed_event(4, req, 11, true, &empty) {
+        match super::deleg_sealed_event(4, req, 11, true, &empty, Vec::new()) {
             Event::Peer {
                 from: 4,
                 msg:
@@ -7853,11 +7866,11 @@ mod tests {
             other => panic!("a decodable empty delegation tail: {other:?}"),
         }
         for bad in [&[5u8][..], &[][..], &[0xff; 12][..]] {
-            match super::deleg_sealed_event(4, req, 11, true, bad) {
+            match super::deleg_sealed_event(4, req, 11, true, bad, Vec::new()) {
                 Event::PeerFailed { req: r, to: 4, .. } => assert_eq!(r, req),
                 other => panic!("an undecodable delegation tail {bad:?}: {other:?}"),
             }
-            match super::deleg_sealed_event(4, req, 11, false, bad) {
+            match super::deleg_sealed_event(4, req, 11, false, bad, Vec::new()) {
                 Event::Peer {
                     from: 4,
                     msg:

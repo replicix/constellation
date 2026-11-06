@@ -920,6 +920,9 @@ pub enum PeerMsg {
         /// Whether this node was the backup (else `txs` is empty).
         sealed: bool,
         txs: Vec<DelegateTx>,
+        /// Plan 46 M1.2 step 7 (c3-spec D6): the previous roots the answering
+        /// node still had to seal for `gen`; the root seals them too.
+        prev_roots: Vec<NodeId>,
     },
     /// Plan 30 §M14: a node asks the owning sequencer of `ino` for a
     /// lock grant in `mode`; `blocking` parks at the owner until the

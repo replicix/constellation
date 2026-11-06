@@ -116,6 +116,10 @@ pub type SealTailAnswer = (
     Option<u64>,
 );
 
+/// A delegation backup's answer to a seal: `(sealed, tail, previous roots still
+/// owed)`.
+pub type DelegSealAnswer = (bool, Vec<constellation_meta::DelegateTx>, Vec<u64>);
+
 /// A request to the daemon's sync task — the authority core's driver
 /// (`crate::authority_driver`), which turns each into a core event.
 pub enum SyncRequest {
@@ -428,11 +432,11 @@ pub enum SyncRequest {
         reply: tokio::sync::oneshot::Sender<(u64, bool)>,
     },
     /// Plan 30 §M11 phase 2b: the root's seal request to this backup;
-    /// answered `(sealed, tail)`.
+    /// answered `(sealed, tail, previous roots still owed)`.
     PeerDelegSeal {
         root: u64,
         gen: u64,
-        reply: tokio::sync::oneshot::Sender<(bool, Vec<constellation_meta::DelegateTx>)>,
+        reply: tokio::sync::oneshot::Sender<DelegSealAnswer>,
     },
     /// Plan 43 C1-3: a claimant's request to seal `epoch` and send this
     /// node's tail of it; answered `(held, txs, through, next)`.

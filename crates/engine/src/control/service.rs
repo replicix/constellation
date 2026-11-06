@@ -535,6 +535,7 @@ impl EngineControl {
                                 .map(|m| api::WaitingMemberStatus {
                                     node: m.node,
                                     strict: m.strict,
+                                    previous_root: m.previous_root,
                                     asked_ms: m.asked_ms,
                                     failed_ms: m.failed_ms,
                                     answered_ms: m.answered_ms,
