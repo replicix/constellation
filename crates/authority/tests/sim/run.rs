@@ -783,6 +783,8 @@ pub enum FastPath {
     #[default]
     Off,
     Checked,
+    /// The admission skipped: the negative control.
+    Unchecked,
 }
 
 /// Core tunables scaled down for simulation (seconds, not minutes).

@@ -499,7 +499,7 @@ fn transactions_between(
     let mut heads: BTreeMap<u64, local::JournalTxHead> = BTreeMap::new();
     for guard in r.range(&meta.journal_tx, local::tx_key(from)..=local::tx_key(upto)) {
         let (k, v) = guard.into_inner()?;
-        heads.insert(local::decode_tx_key(&k)?, crate::record::from_bytes_exact(&v)?);
+        heads.insert(local::decode_tx_key(&k)?, postcard::from_bytes(&v)?);
     }
     let end = heads.values().map(|h| h.last).fold(upto, u64::max);
     let mut out: Vec<Tx> = Vec::new();

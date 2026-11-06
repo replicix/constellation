@@ -2502,7 +2502,8 @@ impl DelegSummary {
                 continue;
             };
             if let Some(v) = r.get(&meta.spec, seq_key(spec_seq))? {
-                let touched = row_touches(r, meta, &crate::record::from_bytes_exact::<SpecRow>(&v)?)?;
+                let touched =
+                    row_touches(r, meta, &crate::record::from_bytes_exact::<SpecRow>(&v)?)?;
                 self.add(&touched);
                 rows += 1;
             }
@@ -3151,7 +3152,7 @@ fn superseded_root_appends_tx(
         };
         let (k, v) = guard.into_inner()?;
         let first = local::decode_tx_key(&k)?;
-        let head: local::JournalTxHead = crate::record::from_bytes_exact(&v)?;
+        let head: local::JournalTxHead = postcard::from_bytes(&v)?;
         if head.last < position
             || head.gen == 0
             || head.epoch == 0
@@ -3487,7 +3488,7 @@ pub(crate) fn retire_local_tx(
     let mut held_below = false;
     for guard in tx.range(&meta.journal_tx, local::tx_key(from)..=local::tx_key(upto)) {
         let (k, v) = guard.into_inner()?;
-        let row: local::JournalTxHead = crate::record::from_bytes_exact(&v)?;
+        let row: local::JournalTxHead = postcard::from_bytes(&v)?;
         let first = local::decode_tx_key(&k)?;
         let in_ship = match only {
             Some(Shipped::Run(start)) => first >= start,
@@ -5087,7 +5088,8 @@ impl Meta {
                 continue;
             }
             if let Some(v) = tx.get(&self.spec, seq_key(*spec_seq))? {
-                if let SpecKind::Streamed { first, .. } = crate::record::from_bytes_exact::<SpecRow>(&v)?.kind
+                if let SpecKind::Streamed { first, .. } =
+                    crate::record::from_bytes_exact::<SpecRow>(&v)?.kind
                 {
                     confirmed.push((*spec_seq, first, *last));
                 }

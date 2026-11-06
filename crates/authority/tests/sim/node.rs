@@ -3115,7 +3115,7 @@ impl Driver {
     /// which holds no delegation and is not acknowledgement-gated,
     /// executes here, outside the core, exactly as
     /// `view::View::mutate_op_rebasable_with_rid` does: admitted by
-    /// `Meta::root_fast_path` (`Checked`), then
+    /// `Meta::root_fast_path` (`Checked`) or blindly (`Unchecked`), then
     /// `execute_mutate`, the acknowledgement fed to the core as
     /// `Event::Activity` and the keys to the placement. `None`: not a
     /// fast-path op; the core handles the event.
@@ -3158,7 +3158,10 @@ impl Driver {
         {
             return None;
         }
-        let admission = Some(self.meta.root_fast_path(op)?);
+        let admission = match self.fast_path {
+            FastPath::Checked => Some(self.meta.root_fast_path(op)?),
+            _ => None,
+        };
         // F1 (`WriterLockHold`): this write waits for the writer lock
         // behind a slow writer, past its check. (The delegation gate is
         // not held across the wait: the configurations that hold writes

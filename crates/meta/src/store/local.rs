@@ -427,7 +427,7 @@ pub(crate) fn get_journal_tx_head(
     first: u64,
 ) -> Result<Option<JournalTxHead>, MetaError> {
     match r.get(&meta.journal_tx, tx_key(first))? {
-        Some(v) => Ok(Some(crate::record::from_bytes_exact(&v)?)),
+        Some(v) => Ok(Some(postcard::from_bytes(&v)?)),
         None => Ok(None),
     }
 }
@@ -534,7 +534,7 @@ pub(crate) fn read_journal_tx_heads(
     let mut out = Vec::new();
     for guard in r.range(&meta.journal_tx, tx_key(from)..) {
         let (k, v) = guard.into_inner()?;
-        out.push((decode_tx_key(&k)?, crate::record::from_bytes_exact(&v)?));
+        out.push((decode_tx_key(&k)?, postcard::from_bytes(&v)?));
     }
     meta.note_local_rows_read(out.len());
     Ok(out)
@@ -567,7 +567,7 @@ pub(crate) fn first_captured_from(
 ) -> Result<Option<u64>, MetaError> {
     for guard in r.range(&meta.journal_tx, tx_key(from)..) {
         let (_, v) = guard.into_inner()?;
-        let row: JournalTxHead = crate::record::from_bytes_exact(&v)?;
+        let row: JournalTxHead = postcard::from_bytes(&v)?;
         if let Some(seq) = row.spec_seq {
             return Ok(Some(seq));
         }
@@ -932,7 +932,10 @@ impl Meta {
         let owner = match tx.range(&self.journal_tx, ..=tx_key(seq)).next_back() {
             Some(guard) => {
                 let (k, v) = guard.into_inner()?;
-                Some((decode_tx_key(&k)?, crate::record::from_bytes_exact::<JournalTx>(&v)?))
+                Some((
+                    decode_tx_key(&k)?,
+                    crate::record::from_bytes_exact::<JournalTx>(&v)?,
+                ))
             }
             None => None,
         };
@@ -974,7 +977,7 @@ impl Meta {
         match r.range(&self.journal_tx, ..=tx_key(seq)).next_back() {
             Some(guard) => {
                 let (_, v) = guard.into_inner()?;
-                let head: JournalTxHead = crate::record::from_bytes_exact(&v)?;
+                let head: JournalTxHead = postcard::from_bytes(&v)?;
                 Ok((head.last >= seq).then_some(head.class))
             }
             None => Ok(None),
@@ -1497,7 +1500,7 @@ impl Meta {
         let decode = |guard: fjall::Guard| -> Result<(u64, JournalTxHead), MetaError> {
             let (k, v) = guard.into_inner()?;
             self.note_local_rows_read(1);
-            Ok((decode_tx_key(&k)?, crate::record::from_bytes_exact(&v)?))
+            Ok((decode_tx_key(&k)?, postcard::from_bytes(&v)?))
         };
         // The transaction starting at or below `seq`, past the watermark.
         let floor = |seq: u64| -> Result<Option<(u64, JournalTxHead)>, MetaError> {
@@ -1699,7 +1702,7 @@ impl Meta {
         let from = journal::acked_watermark(tx, &self.local)?.saturating_add(1);
         for guard in tx.range(&self.journal_tx, tx_key(from)..) {
             let (k, v) = guard.into_inner()?;
-            let h: JournalTxHead = crate::record::from_bytes_exact(&v)?;
+            let h: JournalTxHead = postcard::from_bytes(&v)?;
             self.note_local_rows_read(1);
             if h.gen != 0 && wanted.remove(&(h.gen, h.idx)) {
                 out.push((decode_tx_key(&k)?, h.last, h.spec_seq));
@@ -1733,7 +1736,7 @@ impl Meta {
         let owner = match r.range(&self.journal_tx, ..=tx_key(last_seq)).next_back() {
             Some(guard) => {
                 let (k, v) = guard.into_inner()?;
-                let row: JournalTxHead = crate::record::from_bytes_exact(&v)?;
+                let row: JournalTxHead = postcard::from_bytes(&v)?;
                 Some((decode_tx_key(&k)?, row.last))
             }
             None => None,
@@ -1767,7 +1770,7 @@ impl Meta {
         };
         if let Some(guard) = r.range(&self.journal_tx, ..=tx_key(last_seq)).next_back() {
             let (k, v) = guard.into_inner()?;
-            let row: JournalTxHead = crate::record::from_bytes_exact(&v)?;
+            let row: JournalTxHead = postcard::from_bytes(&v)?;
             if decode_tx_key(&k)? <= last_seq && row.last > last_seq {
                 batch.extend(journal_records(&r, self, last_seq + 1, row.last)?);
             }

@@ -220,7 +220,7 @@ impl Meta {
             }
             let (last, origin) = match r.get(&self.journal_tx, tx_key(seq))? {
                 Some(h) => {
-                    let h = crate::record::from_bytes_exact::<JournalTxHead>(&h)?;
+                    let h = postcard::from_bytes::<JournalTxHead>(&h)?;
                     (h.last.max(seq), (h.gen, h.idx))
                 }
                 None => (seq, (0, 0)),

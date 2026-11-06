@@ -229,7 +229,9 @@ impl constellation_net::PeerService for P2pBridge {
                 acked: 0,
                 sealed: true,
             };
-            let Ok(txs) = constellation_meta::from_bytes_exact::<Vec<constellation_meta::DelegateTx>>(&txs) else {
+            let Ok(txs) =
+                constellation_meta::from_bytes_exact::<Vec<constellation_meta::DelegateTx>>(&txs)
+            else {
                 return sealed;
             };
             let (reply, receive) = tokio::sync::oneshot::channel();
@@ -635,7 +637,9 @@ impl constellation_net::PeerService for P2pBridge {
         }
         let (Ok(txs), Ok(leaving), Ok(leaving_barriers)) = (
             constellation_meta::from_bytes_exact::<Vec<constellation_meta::DelegateTx>>(&txs),
-            constellation_meta::from_bytes_exact::<Vec<constellation_meta::locks::GrantWire>>(&leaving),
+            constellation_meta::from_bytes_exact::<Vec<constellation_meta::locks::GrantWire>>(
+                &leaving,
+            ),
             constellation_meta::from_bytes_exact::<Vec<(u64, i64)>>(&leaving_barriers),
         ) else {
             tracing::warn!(
@@ -935,7 +939,9 @@ impl constellation_net::PeerService for P2pBridge {
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 return refuse;
             }
-            let Ok(txs) = constellation_meta::from_bytes_exact::<Vec<constellation_meta::BackupTx>>(&txs) else {
+            let Ok(txs) =
+                constellation_meta::from_bytes_exact::<Vec<constellation_meta::BackupTx>>(&txs)
+            else {
                 return refuse;
             };
             tracing::trace!(target: "constellation::fwd", from, "append queued");
@@ -995,7 +1001,9 @@ impl constellation_net::PeerService for P2pBridge {
         if crate::fault::p2p_denied(from) {
             return;
         }
-        let Ok(txs) = constellation_meta::from_bytes_exact::<Vec<constellation_meta::BackupTx>>(&txs) else {
+        let Ok(txs) =
+            constellation_meta::from_bytes_exact::<Vec<constellation_meta::BackupTx>>(&txs)
+        else {
             return;
         };
         let _ = self.nudge.send(sync::SyncRequest::PeerStreamAhead {

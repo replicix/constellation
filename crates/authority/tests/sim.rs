@@ -5692,6 +5692,8 @@ fn sweep_config() {
         "delegated-core-stall-root-recall" => delegated_core_stall_root_recall_config(),
         "delegated-core-stall-root-recall-open" => delegated_core_stall_root_recall_open_config(),
         "placement-hot" => placement_hot_config(),
+        "delegated-fast-path" => delegated_fast_path_config(),
+        "delegated-fast-path-unchecked" => delegated_fast_path_unchecked_config(),
         "backup-hot" => backup_hot_config(),
         "flex" => flex_config(),
         "flex-crash" => flex_crash_config(),

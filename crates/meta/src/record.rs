@@ -503,7 +503,10 @@ mod tests {
             origin: (0, 0),
         };
         let tx_bytes = postcard::to_allocvec(&tx).unwrap();
-        assert_eq!(from_bytes_exact::<crate::store::backup::BackupTx>(&tx_bytes).unwrap(), tx);
+        assert_eq!(
+            from_bytes_exact::<crate::store::backup::BackupTx>(&tx_bytes).unwrap(),
+            tx
+        );
         let at = tx_bytes
             .windows(new_bytes.len())
             .position(|w| w == new_bytes)

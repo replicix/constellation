@@ -701,7 +701,6 @@ mod tests {
         assert!(DelegationTable::decode(&trailing).is_err());
     }
 
-
     /// `/` (1), `/D1` (2), `/D2` (3), `/D1/D3` (4); file 10 under D3,
     /// file 11 under `/`.
     struct Tree {
