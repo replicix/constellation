@@ -67259,3 +67259,8 @@ root's end, the claim's own release and `sticky_ends_only_by_holder_or_operator`
 only once the node's grants are ended (its release, or the abandon of a dead node); property `no_live_grant_off_roster`, knob `leave_keeps_grants`,
 topology X3b. Product gap marked in the `lib.rs` mapping: `Leave` must end grants first (M1.1 step 5). The `lib.rs` doc now states that C10's hold
 property and I1 for `Final` are definitional and that M1.4's gate is the strict flex crash sims as fail-before.
+
+
+### `long_locks` hang follow-up (2026-11-06)
+
+`run_m14` (the sweep driver of `long_locks` and the lock sweeps) now prints a line per configuration (start, and wall time at the end), a line per seed with `AUTHORITY_SIM_TRACE=1`, and runs a per-seed watchdog: a seed that runs ten times the median of its configuration's finished seeds (60 s before eight have finished, never under 10 s) prints the configuration, the seed, a replay line and `gdb -batch ... thread apply all bt` of every thread, then lets the run go on. Run `long_locks` with `--nocapture` to see them. Three runs at 1,000 seeds (34 configurations, `timeout 4h`) on a 16-core box: alone 30 min, and twice concurrently under load (the full sim suite looping with 16 test threads plus six busy loops, load average about 60) 41 min each. All passed, no watchdog report; the slowest seed was 0.14 s alone and 0.32 s under load, so no seed came near the limit. The first 3 h attempt of the closure did not reproduce; its hang, if there was one, remains unexplained, and the next occurrence will name its configuration and seed.

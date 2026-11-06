@@ -11951,14 +11951,113 @@ impl M14Totals {
 
 fn run_m14(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> M14Totals {
     let mut totals = M14Totals::default();
+    // Progress and a per-seed watchdog (a seed that runs 10 times the median
+    // prints its configuration, seed and every thread's backtrace and lets the
+    // run go on). `AUTHORITY_SIM_TRACE=1` prints a line per seed; the
+    // per-configuration lines are always printed (read them with `--nocapture`).
+    let trace = std::env::var_os("AUTHORITY_SIM_TRACE").is_some();
+    let started = std::time::Instant::now();
+    let watch = SeedWatch::start(label);
+    let n = seeds.end.saturating_sub(seeds.start);
+    eprintln!("[progress] {label}: start, {n} seeds");
     for seed in seeds {
+        watch.begin(seed);
+        let t = std::time::Instant::now();
         let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| {
             panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
         });
+        watch.end(t.elapsed());
+        if trace {
+            eprintln!("[progress] {label} seed {seed}: {:?}", t.elapsed());
+        }
         totals.add(&report);
     }
     eprintln!("{label}: {totals:#?}");
+    eprintln!("[progress] {label}: done in {:?}", started.elapsed());
     totals
+}
+
+/// The per-seed watchdog of `run_m14`: a thread that, every second, compares
+/// the running seed's wall time with ten times the median of the seeds this
+/// configuration has finished (60 s before it has eight; never under 10 s) and
+/// once per seed prints a gdb backtrace of every thread of the process.
+struct SeedWatch {
+    state: std::sync::Arc<std::sync::Mutex<WatchState>>,
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct WatchState {
+    seed: Option<(u64, std::time::Instant)>,
+    done: Vec<std::time::Duration>,
+    reported: bool,
+}
+
+impl SeedWatch {
+    fn start(label: &str) -> SeedWatch {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(WatchState::default()));
+        let (stop, rx) = std::sync::mpsc::channel::<()>();
+        let (st, label) = (state.clone(), label.to_string());
+        let thread = std::thread::spawn(move || {
+            while rx.recv_timeout(std::time::Duration::from_secs(1)).is_err() {
+                let mut s = st.lock().unwrap();
+                let Some((seed, since)) = s.seed else {
+                    continue;
+                };
+                let mut d = s.done.clone();
+                d.sort();
+                let limit = if d.len() < 8 {
+                    std::time::Duration::from_secs(60)
+                } else {
+                    (d[d.len() / 2] * 10).max(std::time::Duration::from_secs(10))
+                };
+                if since.elapsed() <= limit || s.reported {
+                    continue;
+                }
+                s.reported = true;
+                drop(s);
+                eprintln!(
+                    "[watchdog] {label} seed {seed}: running {:?} (limit {limit:?}); \
+                     replay with AUTHORITY_SIM_CONFIG={label} AUTHORITY_SIM_START={seed} \
+                     AUTHORITY_SIM_SEEDS=1; thread backtraces follow",
+                    since.elapsed()
+                );
+                let out = std::process::Command::new("gdb")
+                    .args(["-batch", "-p", &std::process::id().to_string()])
+                    .args(["-ex", "thread apply all bt"])
+                    .output();
+                match out {
+                    Ok(o) => eprintln!("{}", String::from_utf8_lossy(&o.stdout)),
+                    Err(e) => eprintln!("[watchdog] gdb unavailable: {e}"),
+                }
+            }
+        });
+        SeedWatch {
+            state,
+            stop,
+            thread: Some(thread),
+        }
+    }
+    fn begin(&self, seed: u64) {
+        let mut s = self.state.lock().unwrap();
+        s.seed = Some((seed, std::time::Instant::now()));
+        s.reported = false;
+    }
+    fn end(&self, took: std::time::Duration) {
+        let mut s = self.state.lock().unwrap();
+        s.seed = None;
+        s.done.push(took);
+    }
+}
+
+impl Drop for SeedWatch {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 /// Plan 30 §M14: no two nodes ever perform I/O under conflicting locks;
