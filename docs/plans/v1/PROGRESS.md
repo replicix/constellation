@@ -67420,3 +67420,36 @@ Sweeps (box 1, release, `+commit`, seeds 0..1,999): `long-backup`, `long-delegat
 `long-delegated-late-answers`, `long-delegated-lead`, `long-strict`, `long-sessions`, `backup-two`, `backup-crash`, `backup-reconfig-doubt`,
 `backup-partition`, `delegated-backup`: 0 failing; the negative controls `long-delegated-lead-off` (348 vs main 339) and
 `long-delegated-hysteresis-off` (9 vs main 11) fail by design with their knob's violation only.
+
+
+### Step 5 review fixes (2026-11-06)
+
+An Opus review of step 5 found one integrity hole and four lesser ones; all five are closed, each MUST/SHOULD with a test that fails on the step-5 tip.
+
+1. **Peer to singleton, the fast path (C8 condition 2).** `root_lone()` ignored the closed configurations' caps, and `report_durable` published `lone_ok` from it: with the bump
+   landed and the archive short of the change's position, the FUSE fast path journaled a `Singleton` row and answered it at once while the rows before were unarchived.
+   `lone_ok` is now `root_lone() && durable_jseq() == u64::MAX` (or an epoch's hold); the stamp is unchanged (still `Singleton` from the lease's bump), the answer waits for
+   the gate like a gated row's. Core test `lone_ok_is_not_published_while_a_closed_configuration_is_uncommitted` (fails before), engine test
+   `a_singleton_row_waits_while_a_closed_configuration_is_uncommitted` (pins the fast path's wait by the published word).
+2. **Stale roster read (C8 condition 3).** A read issued before a peer registered but delivered after its forward dropped the peer from `peer_requesters`, the selection pass lowered
+   the test and the root bumped back to a singleton with the peer live. `Event::Roster` and `Event::Peers` carry `issued` (the wait clock before the read, taken by the
+   poller, `SyncRequest::Roster { roster, issued }`; the sim's mirrors too); `peer_requesters` keeps the wait clock of each node's latest request and a read drops it only if
+   issued after it (a conservative tie keeps it). Core test `a_read_issued_before_a_forward_does_not_forget_its_requester` (fails before: the bump back).
+3. **Condition 4 enforced for a node retired while not root.** `fence_retired` fenced only the leases the node held; another node's lease had no entry, so `classify` let the retired
+   node claim it. The leave now records the node in `retired` of every lease it does not hold (`Lease::with_retired`: no epoch bump, no expiry, the tenure goes on) and fences the
+   one it held as before; `classify` already refuses a listed node. Smaller than a claim-time registry read (an S3 GET and a race of its own on every claim) and it needs no
+   core change. Residual: a lease object created after the leave (none exist outside the filesystem's creation) and the node's own registry poll, which stops it within seconds.
+   store-s3 test `a_retirement_is_recorded_in_a_lease_another_node_holds` (fails before), core test `a_peer_retired_while_not_root_cannot_claim` (pin).
+4. `ack_class_of` labels an adopted-tail `Group{Root}` row `Lone` only under a lease that says singleton (`held_singleton()`).
+5. The plan's M1.1 step 5 note no longer lists seeds 1421 and 634 as open.
+
+DECISIONS' step 5 entry now says what is true: nothing is answered alone until the archive carries the bump, on the core's path and the fast path's, and condition 4's mechanism.
+
+**Gates** (box 1): fmt, clippy `-D warnings` (all targets) clean; lib tests meta 406, authority 1,059, engine 952, store-s3 238; release sim suite 412 passed, 0 failed, 12 ignored.
+Sweeps ×2,000 `+commit` (`long-backup`, `long-delegated-backup`, `backup-departs`, `delegated-group-switch`, `singleton-first-peer`, `long-delegated`, `backup`,
+`delegated-holder-cut`, `far`): 0 failing, row-version mismatches 0; controls ×500 `long-delegated-lead-off` 348 and `long-delegated-hysteresis-off` 9 failing, on their knob's violation only
+(the same counts as before the round).
+
+**Performance gate** (box 3, quiet; main = A, this branch = B, A B B A, topology 1, 40 runs per variant, 300 samples; ext4 repeated, pooled 80 runs): `ack-latency` p50 B / A ext4 chmod 1.03, create 1.00,
+rename 1.00, unlink 1.01, write 1.00; xfs 0.96, 1.01, 0.95, 0.94, 1.00; btrfs 0.95, 0.95, 1.07, 1.01, 1.00; tmpfs 0.92, 1.00, 0.92, 0.94, 1.03 (A against a second copy of A: 0.93 to 1.16).
+`vfs-bench` dispatch overhead (mock getattr, observed less direct) 95 to 100 ns for A and B alike.
