@@ -29122,6 +29122,49 @@ mod locks {
         assert_ne!(mtime(&h, ino), 7);
     }
 
+    /// Plan 46 I1: the refusal's row is the rid's outcome, so its answer to
+    /// the holder's own client waits for that row's commit as every other
+    /// refusal's does (`ack_need`), here the archive's. Fails on the parent:
+    /// answered `LockLapsed` in the same step, the row unshipped
+    /// (`locks-unlinked-delegated+commit` seed 121: an answer that claims
+    /// `archive_waits` of a row no archive carried).
+    #[test]
+    fn the_holders_own_lapsed_refusal_waits_for_its_commit() {
+        let (mut h, ino) = holder_with_file();
+        {
+            let lease = &mut h.core.lease.held.as_mut().unwrap().0;
+            lease.ack_policy = constellation_store_s3::AckPolicy::S3;
+            lease.singleton = false;
+        }
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            rid,
+            op: setattr_mtime(ino, 7),
+            policy: Policy::Client,
+            tag: token(GrantId { node: 1, seq: 1 }, h.now.0 - 1),
+        });
+        assert!(
+            replies(&out).is_empty(),
+            "answered before the archive carries the refusal: {out:?}"
+        );
+        assert_eq!(
+            h.meta.completed_outcome(rid).unwrap(),
+            Some(constellation_meta::CompletedOutcome::Refused {
+                code: crate::core::client::LAPSED_CODE
+            })
+        );
+        let out = h.archive_lands();
+        let rs = replies(&out);
+        assert!(
+            matches!(
+                rs.as_slice(),
+                [(r, ClientReply::Outcome(MutateOutcome::LockLapsed))] if *r == rid
+            ),
+            "{out:?}"
+        );
+        assert_ne!(mtime(&h, ino), 7);
+    }
+
     /// Layer A: a stranded op replayed by rid after a holder change carries
     /// its token (persisted with its replay row). The forward goes out with
     /// it; the sequencer refuses it; the replay is settled as refused (its

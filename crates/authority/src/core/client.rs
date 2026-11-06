@@ -2665,11 +2665,14 @@ impl Core {
                     (MutateOutcome::Conflict { manifest: None }, None)
                 }
                 // Plan 30 §M14 phase 2: the op's lock grant ended; nothing ran
-                // but the refusal's row, so there is nothing to wait for.
+                // but the refusal's row. That row is the rid's outcome, so the
+                // answer waits for its commit as every refusal's does (below;
+                // plan 46 I1: answered at once, it claimed a commit nothing
+                // backed).
                 Err(MetaError::LockLapsed) => {
                     self.stats.lock_lapsed_refusals += 1;
                     self.record_refusal(rid, LAPSED_CODE, Some(&op), super::Asker::Own, replica);
-                    return MutateOutcome::LockLapsed;
+                    (MutateOutcome::LockLapsed, None)
                 }
                 Err(error) => {
                     // Plan 30 §M9: a definitive refusal is journaled as an
