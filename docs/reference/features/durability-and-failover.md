@@ -1564,11 +1564,13 @@ See [Configuration](../configuration.md) for parsing rules.
   many member copies of sealed epochs this node keeps); `classes`
   (plan 43 C2a): the definitive answers this node gave as a sequencer
   (an answer to a forwarder, or to its own client when it was not
-  another node's answer passed on) by what they waited for, as
-  `[name, count]` pairs for `archive`, `root-group`, `deleg-group`,
-  `non-stealable` and `lone` — the class a row has under today's gating
-  (`Core::root_ack_class_for`, `Core::deleg_ack_class`); a `lone` answer
-  is only ever to the node's own client (plan 43 C2); `lone` (plan 43 C2):
+  another node's answer passed on) by the rule of the configuration they
+  waited for, as `[name, count]` pairs for `group` (a configuration with
+  members), `final`, `singleton` and `archive_waits` (a configuration with
+  none: the archive carries the row; disjoint from `group`; plan 46 M1.1
+  step 7, which replaced the five class names `archive`, `root-group`,
+  `deleg-group`, `non-stealable` and `lone`); a `singleton` answer is only
+  ever to the node's own client (plan 43 C2); `lone` (plan 43 C2):
   this node answers its own clients as a lone sequencer, the root lease's
   or a delegation's it holds; `ungated_shadows`: shadows and hints this
   node installed for an answer its sequencer did not say is committed (must

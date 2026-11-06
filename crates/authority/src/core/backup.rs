@@ -30,7 +30,7 @@
 //! other, only the reply waits. The FUSE fast path writes its row outside
 //! the core and then waits by the row's own class (plan 43 C1-2): the class
 //! the core published with the gate when the row was journaled
-//! (`Core::root_ack_class`, stored with the journal row as
+//! (`Core::root_commit`, stored with the journal row as
 //! `constellation_meta::RowCommit`), so what the row is tagged with and what
 //! its answer waits for agree; a row whose answer was released because the
 //! gate went off (the group is gone and no peer is eligible, or an epoch
@@ -1073,24 +1073,30 @@ const BEAT_LAGS_KEPT: usize = 64;
 /// How many early `StreamAhead` batches a subscriber keeps.
 const AHEAD_WAITING_MAX: usize = 32;
 
-/// Plan 43 §5.1: what an answer waits for — the commit point of the
-/// sequencer that gives it. C0 names it (the simulation's I1 oracle
-/// classifies every answer by it); C1/C2 make the core decide it at
-/// journal time (`Core::ack_class`). Nothing in the core uses it yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum AckClass {
-    /// An applied, unfenced log segment carries the outcome.
-    Archive,
-    /// The root group: the holder's journal and every backup the lease
-    /// object lists hold the transaction.
-    RootGroup,
-    /// The delegation's group: the delegate's journal and each recorded
-    /// backup's delegate tail, or the root's appended row `(gen, idx)`.
-    DelegGroup { gen: u64 },
-    /// A designee or an epoch's hold owner (§11 Q3): not stealable.
-    NonStealable,
-    /// A lone sequencer answering its own node's client (Layer A).
-    Lone,
+/// Plan 46 M1.1 step 7: the names of `Stats::ack_classes`, in counter order
+/// (`status.ack.classes`): the definitive answers this node gave, by what
+/// their row's configuration made them wait for. `group` counts the
+/// configurations that have members, `archive_waits` those that have none
+/// (the archive carries the row): the two are disjoint.
+pub const ACK_COUNTERS: [&str; 4] = ["group", "final", "singleton", "archive_waits"];
+
+/// The counter's name of an answer under `commit` (`ACK_COUNTERS`).
+pub fn commit_name(commit: constellation_meta::RowCommit) -> &'static str {
+    ACK_COUNTERS[ack_counter(commit)]
+}
+
+/// The place in `Stats::ack_classes` of an answer under `commit`.
+pub fn ack_counter(commit: constellation_meta::RowCommit) -> usize {
+    use constellation_meta::RowCommit;
+    match commit {
+        RowCommit::Group {
+            on: GroupOn::Archive,
+            ..
+        } => 3,
+        RowCommit::Group { .. } => 0,
+        RowCommit::Final => 1,
+        RowCommit::Singleton { .. } => 2,
+    }
 }
 
 /// Plan 43 C2 (§2.1): who an answer goes to — plan 43 §5.1's two columns.
@@ -1102,49 +1108,9 @@ pub enum Asker {
     Remote,
 }
 
-impl AckClass {
-    /// Q12's rule: the classes whose answer waited for a group or the
-    /// archive, so what it says is committed. Not `NonStealable` and not
-    /// `Lone`. (`RowCommit::gated`, the stored class's.)
-    pub fn gated(&self) -> bool {
-        !matches!(self, AckClass::NonStealable | AckClass::Lone)
-    }
-
-    /// The class's names in counter order (`AckClass::index`).
-    pub const NAMES: [&'static str; 5] = [
-        "archive",
-        "root-group",
-        "deleg-group",
-        "non-stealable",
-        "lone",
-    ];
-
-    /// The class's place in `Stats::ack_classes`.
-    pub fn index(&self) -> usize {
-        match self {
-            AckClass::Archive => 0,
-            AckClass::RootGroup => 1,
-            AckClass::DelegGroup { .. } => 2,
-            AckClass::NonStealable => 3,
-            AckClass::Lone => 4,
-        }
-    }
-
-    /// The class's name in reports and counters.
-    pub fn name(&self) -> &'static str {
-        match self {
-            AckClass::Archive => "archive",
-            AckClass::RootGroup => "root-group",
-            AckClass::DelegGroup { .. } => "deleg-group",
-            AckClass::NonStealable => "non-stealable",
-            AckClass::Lone => "lone",
-        }
-    }
-}
-
 /// Plan 46 M1.1 step 2: the commit rule of a sequencer's configuration
-/// (§5.1), looked up once ([`Core::rule_of`]); the five answer classes are
-/// maps from it ([`CommitRule::ack_class`]) until step 7 deletes them.
+/// (§5.1), looked up once ([`Core::rule_of`]); the rule stored with a row
+/// and named by its answer is the same one (`RowCommit::from`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitRule {
     /// Committed once every member of the configuration holds the row, or
@@ -1175,22 +1141,6 @@ pub enum RuleStream {
     Root,
     /// This node's delegate generation `gen`.
     Delegate(u64),
-}
-
-impl CommitRule {
-    /// The answer class the rule maps to (`gen`: the generation of a
-    /// [`GroupOn::Delegate`] rule).
-    pub fn ack_class(&self, gen: u64) -> AckClass {
-        match self {
-            CommitRule::Final => AckClass::NonStealable,
-            CommitRule::Singleton { .. } => AckClass::Lone,
-            CommitRule::Group { on, .. } => match on {
-                GroupOn::Archive => AckClass::Archive,
-                GroupOn::Root => AckClass::RootGroup,
-                GroupOn::Delegate => AckClass::DelegGroup { gen },
-            },
-        }
-    }
 }
 
 impl From<CommitRule> for constellation_meta::RowCommit {
@@ -1248,7 +1198,7 @@ pub struct AckView {
     pub reconfig_in_flight: bool,
     /// Plan 43 C2a: the definitive answers this node gave as a sequencer
     /// by the class they waited for (`Stats::ack_classes`, named by
-    /// `AckClass::NAMES`).
+    /// `ACK_COUNTERS`).
     pub classes: Vec<(&'static str, u64)>,
     /// Plan 43 C1-3: a claim of the lease waits for the tail of an old
     /// group (`status.lease.waiting_for_group`), and the member copies this
@@ -1364,7 +1314,7 @@ impl Core {
             sealed_epoch: self.bk.sealed,
             last_seal: self.bk.last_seal,
             reconfig_in_flight: self.ack.reconfig.is_some(),
-            classes: AckClass::NAMES
+            classes: ACK_COUNTERS
                 .iter()
                 .copied()
                 .zip(self.stats.ack_classes)
@@ -1923,11 +1873,11 @@ impl Core {
     pub(crate) fn answer_need(
         &self,
         position: &constellation_meta::Position,
-        class: AckClass,
+        class: constellation_meta::RowCommit,
         asker: Asker,
         shipped: u64,
     ) -> Option<u64> {
-        if class == AckClass::NonStealable {
+        if class.is_final() {
             return None;
         }
         let jseq = position.pending.map(|p| p.jseq)?;
@@ -2023,24 +1973,17 @@ impl Core {
         }
     }
 
-    /// Plan 43 C2 (§2.1): [`Self::root_ack_class`] for an answer to `asker`
-    /// ([`Self::root_rule`] mapped to its class).
-    pub fn root_ack_class_for(&self, asker: Asker) -> AckClass {
-        self.root_rule(asker).ack_class(0)
-    }
-
-    /// Plan 43 §5.1: the class of an answer this node gives as the root
-    /// sequencer to its own node's client, by what the answer waits for
+    /// Plan 46 M1.1 step 7: the rule of an answer this node gives as the
+    /// root sequencer to `asker`, as the commit a row and an answer carry
     /// ([`Self::root_rule`]). The same decision as [`Self::ack_need`]
-    /// (`durable_jseq`), named. Another node's answer:
-    /// [`Self::root_ack_class_for`].
-    pub fn root_ack_class(&self) -> AckClass {
-        self.root_ack_class_for(Asker::Own)
+    /// (`durable_jseq`), named.
+    pub fn root_commit(&self, asker: Asker) -> constellation_meta::RowCommit {
+        self.root_rule(asker).into()
     }
 
     /// Plan 43 C1-2: the class a journal row this node writes now is tagged
     /// with, for the scope of the journaling call (the guard): what an answer
-    /// to the row's own client waits for ([`Self::root_ack_class`]). The
+    /// to the row's own client waits for ([`Self::root_commit`]). The
     /// class is fixed at the journaling; only a row answered with the gate
     /// off is re-tagged `Lone` (`complete_ready`). Another node's op:
     /// [`Self::journal_class_for`].
@@ -2081,18 +2024,18 @@ impl Core {
         &self,
         replica: &dyn Replica,
         rid: Rid,
-    ) -> Result<AckClass, constellation_meta::MetaError> {
+    ) -> Result<constellation_meta::RowCommit, constellation_meta::MetaError> {
         Ok(match replica.journal_class_of_rid(rid) {
             // Plan 46 M1.1 step 5: a row keeps the rule it was journaled
             // under. A gated row whose group is gone is not re-tagged
             // `Lone`: the configuration that replaced it commits under old
             // and new ([`Self::sync_cfg_spans`]), so the row is answered
             // when its own rule has committed it (`durable_jseq`).
-            Some((_, class)) if class.is_singleton() => AckClass::Lone,
-            Some((_, class)) if class.is_archive() => AckClass::Archive,
+            Some((_, class)) if class.is_singleton() => class,
+            Some((_, class)) if class.is_archive() => class,
             Some((
                 _,
-                constellation_meta::RowCommit::Group {
+                class @ constellation_meta::RowCommit::Group {
                     config_version,
                     on: GroupOn::Root,
                 },
@@ -2108,9 +2051,9 @@ impl Core {
                     && self.lease.backups().is_empty()
                     && self.doubted_backups().next().is_none()
                 {
-                    AckClass::Lone
+                    constellation_meta::RowCommit::Singleton { config_version }
                 } else {
-                    AckClass::RootGroup
+                    class
                 }
             }
             // Plan 43 C2f review: a row of a continuation epoch's hold is
@@ -2131,12 +2074,14 @@ impl Core {
                         .inspect_err(|error| {
                             tracing::warn!(node = self.cfg.node_id, ?rid, %error, "could not re-tag a hold's row answered alone: EIO");
                         })?;
-                    AckClass::Lone
+                    constellation_meta::RowCommit::Singleton {
+                        config_version: self.root_config_version(),
+                    }
                 } else {
-                    AckClass::Archive
+                    constellation_meta::RowCommit::as_archive(class, self.root_config_version())
                 }
             }
-            Some((_, class)) if class.is_final() => AckClass::NonStealable,
+            Some((_, class)) if class.is_final() => class,
             Some((
                 _,
                 constellation_meta::RowCommit::Group {
@@ -2144,7 +2089,7 @@ impl Core {
                     ..
                 },
             ))
-            | None => self.root_ack_class(),
+            | None => self.root_commit(Asker::Own),
             // (The variants the guarded arms above cover: no wildcard, so a
             // new one fails to compile here.)
             Some((
@@ -2155,7 +2100,7 @@ impl Core {
                     on: GroupOn::Archive,
                     ..
                 },
-            )) => self.root_ack_class(),
+            )) => self.root_commit(Asker::Own),
         })
     }
 
@@ -2175,7 +2120,7 @@ impl Core {
         replica: &dyn Replica,
         rid: Rid,
         asker: Asker,
-    ) -> Result<AckClass, constellation_meta::MetaError> {
+    ) -> Result<constellation_meta::RowCommit, constellation_meta::MetaError> {
         if asker == Asker::Own {
             return self.journaled_answer_class(replica, rid);
         }
@@ -2194,7 +2139,7 @@ impl Core {
                         })?;
                 }
             }
-            return Ok(AckClass::NonStealable);
+            return Ok(constellation_meta::RowCommit::Final);
         }
         Ok(match replica.journal_class_of_rid(rid) {
             Some((first, class)) if class.is_singleton() => {
@@ -2205,25 +2150,23 @@ impl Core {
                             tracing::warn!(node = self.cfg.node_id, ?rid, %error, "could not re-tag a row answered from the archive: EIO");
                         })?;
                 }
-                AckClass::Archive
+                class.as_archive(0)
             }
-            Some((_, class)) if class.is_archive() => AckClass::Archive,
+            Some((_, class)) if class.is_archive() => class,
             Some((
                 _,
-                constellation_meta::RowCommit::Group {
+                class @ constellation_meta::RowCommit::Group {
                     on: GroupOn::Root, ..
                 },
-            )) => AckClass::RootGroup,
+            )) => class,
             // A row of a continuation epoch's hold is non-stealable while
             // the hold lasts; once it ended, the row is one more unshipped
             // row of this tenure, and another node's answer waits for the
             // log (`flex-crash` seed 39: a rename journaled in the hold and
             // held back behind a dead member's chunk, answered at a retry
             // after the hold as the hold's).
-            Some((_, class)) if class.is_final() && self.lease.epoch_held() => {
-                AckClass::NonStealable
-            }
-            Some((_, class)) if class.is_final() => AckClass::Archive,
+            Some((_, class)) if class.is_final() && self.lease.epoch_held() => class,
+            Some((_, class)) if class.is_final() => class.as_archive(self.root_config_version()),
             Some((
                 _,
                 constellation_meta::RowCommit::Group {
@@ -2231,7 +2174,7 @@ impl Core {
                     ..
                 },
             ))
-            | None => self.root_ack_class_for(asker),
+            | None => self.root_commit(asker),
             // (The variants the guarded arms above cover: no wildcard.)
             Some((
                 _,
@@ -2241,7 +2184,7 @@ impl Core {
                     on: GroupOn::Archive,
                     ..
                 },
-            )) => self.root_ack_class_for(asker),
+            )) => self.root_commit(asker),
         })
     }
 
@@ -2270,19 +2213,14 @@ impl Core {
         &self,
         replica: &dyn Replica,
         rid: Rid,
-    ) -> Result<AckClass, constellation_meta::MetaError> {
+    ) -> Result<constellation_meta::RowCommit, constellation_meta::MetaError> {
         Ok(
             match constellation_meta::take_last_journaled().map(|r| r.class) {
                 Some(constellation_meta::RowCommit::Group {
                     on: GroupOn::Delegate,
                     ..
-                }) => self.root_ack_class(),
-                Some(class) if class.is_singleton() => AckClass::Lone,
-                Some(class) if class.is_archive() => AckClass::Archive,
-                Some(constellation_meta::RowCommit::Group {
-                    on: GroupOn::Root, ..
-                }) => AckClass::RootGroup,
-                Some(_) => AckClass::NonStealable,
+                }) => self.root_commit(Asker::Own),
+                Some(class) => class,
                 None => return self.journaled_answer_class(replica, rid),
             },
         )
@@ -2305,7 +2243,7 @@ impl Core {
                     || code == constellation_meta::DROPPED_CODE
         );
         Ok(AnswerSource::Sequenced(if replica.outcome_from_log(rid) {
-            AckClass::Archive
+            constellation_meta::RowCommit::ARCHIVE
         } else if settled {
             // A settle's refusal is answered as another node's would be,
             // never re-tagged `Lone` (`Core::settle_refusal`).
@@ -2321,7 +2259,7 @@ impl Core {
         &mut self,
         to: NodeId,
         msg: PeerMsg,
-        class: AckClass,
+        class: constellation_meta::RowCommit,
         out: &mut Vec<Action>,
     ) {
         self.send_answer_committed(to, msg, class, class.gated(), out)
@@ -2333,7 +2271,7 @@ impl Core {
         &mut self,
         to: NodeId,
         mut msg: PeerMsg,
-        class: AckClass,
+        class: constellation_meta::RowCommit,
         says_committed: bool,
         out: &mut Vec<Action>,
     ) {
@@ -2342,7 +2280,7 @@ impl Core {
         } = &mut msg
         {
             if is_answer(outcome) {
-                self.stats.ack_classes[class.index()] += 1;
+                self.stats.ack_classes[ack_counter(class)] += 1;
                 // Plan 43 C1-2: a gated answer is a commit; the requester's
                 // shadow of it is not speculation (C1-4).
                 *committed = says_committed;

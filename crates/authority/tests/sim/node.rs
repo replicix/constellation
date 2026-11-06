@@ -1166,7 +1166,7 @@ struct FastWait {
     outcome: MutateOutcome,
     gen: u64,
     idx: u64,
-    class: constellation_authority::core::AckClass,
+    class: constellation_meta::RowCommit,
     /// The engine's wait budget ends here: the op is then in doubt.
     deadline: tokio::time::Instant,
 }
@@ -1188,7 +1188,7 @@ struct HeldWrite {
     /// A delegate's write: the class its row was journaled with (the one
     /// the core had published when the write was admitted), which its
     /// answer says and waits by.
-    class: Option<constellation_authority::core::AckClass>,
+    class: Option<constellation_meta::RowCommit>,
     /// A delegate's write: the class `Meta::finish_local` journaled its row
     /// with (`Meta::delegate_execute_admitted`: decided at the journaling,
     /// as the engine's fast path does), once its transaction is over.
@@ -3007,11 +3007,9 @@ impl Driver {
                     })
                     .collect()
             };
-            let delegated = j.tx.as_ref().is_some_and(|t| t.origin.0 != 0)
-                || matches!(
-                    j.class,
-                    Some(constellation_authority::core::AckClass::DelegGroup { .. })
-                );
+            // (A delegation-group judgement is a transaction of origin
+            // `(gen, idx)` with `gen` not 0.)
+            let delegated = j.tx.as_ref().is_some_and(|t| t.origin.0 != 0);
             if let Some(why) =
                 super::oracle::check_claim(claimed, committed, j.class, &rows, delegated)
             {
@@ -3323,7 +3321,7 @@ impl Driver {
         // admission as the engine's fast path does: the row is journaled
         // with it and the answer says it and waits by it.
         let row_class = session.deleg_row_class(gen)?;
-        let class = ack_class_of(row_class, gen);
+        let class = row_class;
         let journaled: Arc<Mutex<Option<constellation_meta::RowCommit>>> = Default::default();
         let refused = Arc::new(AtomicBool::new(false));
         let (_, write_ms) = self.shared.hold_next.lock().unwrap().take()?;
@@ -3444,10 +3442,7 @@ impl Driver {
                 if let Some(idx) = idx {
                     session.note_stream(gen, idx);
                 }
-                let class = journaled
-                    .lock()
-                    .unwrap()
-                    .map_or(class, |c| ack_class_of(c, gen));
+                let class = journaled.lock().unwrap().unwrap_or(class);
                 Some(self.delegate_done(now, rid, op, tag, outcome, gen, idx, class))
             }
             Err(_) => panic!("held write thread vanished"),
@@ -3485,12 +3480,7 @@ impl Driver {
             return;
         }
         let class = match (deleg, class) {
-            (Some(gen), Some(class)) => Some(
-                journaled
-                    .lock()
-                    .unwrap()
-                    .map_or(class, |c| ack_class_of(c, gen)),
-            ),
+            (Some(_), Some(class)) => Some(journaled.lock().unwrap().unwrap_or(class)),
             _ => class,
         };
         match &outcome {
@@ -3529,16 +3519,19 @@ impl Driver {
         rid: Rid,
         op: &MutateOp,
         outcome: MutateOutcome,
-        deleg: Option<constellation_authority::core::AckClass>,
+        deleg: Option<constellation_meta::RowCommit>,
     ) -> Vec<Action> {
         let mut class = match deleg {
             Some(class) => class,
-            None => self.core.root_ack_class(),
+            None => self
+                .core
+                .root_commit(constellation_authority::core::Asker::Own),
         };
-        if self.plant_claim_root_group_on_lone
-            && class == constellation_authority::core::AckClass::Lone
-        {
-            class = constellation_authority::core::AckClass::RootGroup;
+        if self.plant_claim_root_group_on_lone && class.is_singleton() {
+            class = constellation_meta::RowCommit::group(
+                class.config_version().unwrap_or(0),
+                constellation_authority::core::GroupOn::Root,
+            );
         }
         self.shared
             .fast_path_executed
@@ -3577,7 +3570,7 @@ impl Driver {
         outcome: MutateOutcome,
         gen: u64,
         idx: Option<u64>,
-        class: constellation_authority::core::AckClass,
+        class: constellation_meta::RowCommit,
     ) -> Vec<Action> {
         match idx {
             Some(idx) if class.gated() && matches!(outcome, MutateOutcome::Accepted { .. }) => {
@@ -4320,29 +4313,4 @@ pub fn meta_holds_rid(meta: &Meta, rid: Rid) -> bool {
         carries(&Replica::backup_tail(meta, e).unwrap_or_default())
             || Replica::member_copy(meta, e).is_some_and(|(_, txs)| carries(&txs))
     })
-}
-
-/// The class a journal row of `RowCommit` answers as, for the delegation
-/// `gen`.
-fn ack_class_of(
-    class: constellation_meta::RowCommit,
-    gen: u64,
-) -> constellation_authority::core::AckClass {
-    use constellation_authority::core::{AckClass, GroupOn};
-    use constellation_meta::RowCommit;
-    match class {
-        RowCommit::Singleton { .. } => AckClass::Lone,
-        RowCommit::Group {
-            on: GroupOn::Archive,
-            ..
-        } => AckClass::Archive,
-        RowCommit::Group {
-            on: GroupOn::Root, ..
-        } => AckClass::RootGroup,
-        RowCommit::Group {
-            on: GroupOn::Delegate,
-            ..
-        } => AckClass::DelegGroup { gen },
-        RowCommit::Final => AckClass::NonStealable,
-    }
 }

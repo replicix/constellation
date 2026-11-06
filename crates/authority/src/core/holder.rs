@@ -438,7 +438,7 @@ impl Core {
                             // this refusal; it is the designation's (a
                             // designee holds the keys, non-stealable), not an
                             // answer the archive carries.
-                            let class = super::AckClass::NonStealable;
+                            let class = constellation_meta::RowCommit::FINAL;
                             self.send_answer(
                                 from,
                                 PeerMsg::MutateReply {
@@ -648,12 +648,12 @@ impl Core {
         // until the log carries it — and never on its own disk alone.
         let asker = self.asker_of(from);
         let (outcome, class) = if executed {
-            (outcome, self.root_ack_class_for(asker))
+            (outcome, self.root_commit(asker))
         } else {
             Self::eio_unless_recorded(
                 outcome,
                 self.journaled_answer_class_for(replica, rid, asker),
-                super::AckClass::Lone,
+                constellation_meta::RowCommit::LONE,
             )
         };
         let shipped = replica.journal_acked_seq().unwrap_or(0);
@@ -753,11 +753,11 @@ impl Core {
         &self,
         rid: Rid,
         position: &Position,
-        class: super::AckClass,
+        class: constellation_meta::RowCommit,
         shipped: u64,
         replica: &dyn Replica,
     ) -> Option<u64> {
-        if class == super::AckClass::NonStealable {
+        if class.is_final() {
             return None;
         }
         match replica.outcome_row(rid) {

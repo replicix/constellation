@@ -303,9 +303,9 @@
 //! | `node_stream::Action` | Product code it abstracts |
 //! |---|---|
 //! | `Start`, `Deliver`, `Exec` | `delegate.rs::delegate_try_execute`/`delegate_execute_now` (the grant's owner runs it), `answer_not_owner`; forward and bounce in `crates/engine/src/forward.rs` |
-//! | `Replicate` | `replica.rs`/`store/backup.rs::deleg_backup_append` (a member copies the stream's next row); the per-stream rule is `deleg_rule` / `deleg_ack_class` / `deleg_row_commit`. **Gap:** one stream per node (M1.1 steps 5 to 7) |
+//! | `Replicate` | `replica.rs`/`store/backup.rs::deleg_backup_append` (a member copies the stream's next row); the per-stream rule is `deleg_rule` / `deleg_row_commit`. **Gap:** one stream per node (M1.1 steps 5 to 7) |
 //! | `Append`, `Ship`, `RootAck` | the root's verbatim append of a delegate's rows (`deleg_committed_through`, `holder_append_committed`), the root's segment shipper, `DelegateStreamAck.committed`; ADR-41's lone-journal branch is removed (`deleg_counts_root`). **Gap:** M1.2 |
-//! | `Answer` | `delegate.rs::deleg_row_commit` (the answer's gate) and, for the root's own rows, `backup.rs::root_ack_class` |
+//! | `Answer` | `delegate.rs::deleg_row_commit` (the answer's gate) and, for the root's own rows, `backup.rs::root_commit` |
 //! | `Crash`, `Depose`, `Retry`, `Rescue` | fail-stop; `seal_tail.rs::on_seal_tail`/`claim_without_tail` and `jobs.rs::claim_with_tail`/`claim_orphan_proof` (takeover, orphan proof); the requester's rid retry in `forward.rs`, `replay.rs` |
 //! | `Reconfig`, `TogglePeer` | `delegate.rs::deleg_group_refresh`/`deleg_journal_group` (group change under old ∪ new); the peer-in-budget flag is `backup_peers_in_budget`. **Gap:** `config_version` on stream rows (M1.1) |
 //! | `Release`, `ReleaseAll`, `Grow`, `Stop`, `End` | `meta/src/delegation.rs::DelegationTable::apply` (`DelegationRecord`), `delegate.rs::deleg_handed_back_to`/`deleg_end_sealed`. **Gap:** `SubtreeReleased`/`StreamReleased`/`DelegateNodeEnded` stream rows and recall as a request (M1.2); the sticky grant kind and the holder's release (M1.3); claim = release (the claim's release record, not built) |

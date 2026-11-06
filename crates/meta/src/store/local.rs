@@ -121,8 +121,9 @@ enum Journaled {
     Appended,
 }
 
-/// What a [`RowCommit::Group`]'s configuration waits on (plan 46 M1.1:
-/// step 7 deletes it with the answer classes it names).
+/// What a [`RowCommit::Group`]'s configuration waits on: the journal's
+/// stored form of whose copies the group counts (it stays with the row
+/// encoding until M1.2 makes one stream per node).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GroupOn {
     /// No member listed: an applied, unfenced log segment (`ack=s3`, a

@@ -177,7 +177,7 @@
         },
         "classes": {
           "default": [],
-          "description": "Plan 43 C2a: the definitive answers this node gave as a sequencer,\nby the class they waited for: `(class, count)` for `archive`,\n`root-group`, `deleg-group`, `non-stealable` and `lone`.",
+          "description": "Plan 43 C2a, plan 46 M1.1 step 7: the definitive answers this node\ngave as a sequencer, by the rule of the configuration they waited\nfor: `(name, count)` for `group` (a configuration with members),\n`final`, `singleton` and `archive_waits` (a configuration with none:\nthe archive carries the row). `archive_waits` is disjoint from\n`group`.",
           "items": {
             "maxItems": 2,
             "minItems": 2,
@@ -1810,7 +1810,7 @@
           "type": "integer"
         },
         "mine": {
-          "description": "Delegations this node holds: `(dir, gen, until_ms, stopped,\nstreamed_through, executed, parked, class)`; `class` is what this\nnode's own clients' answers wait for (`lone`, `deleg-group`,\n`archive`, `non-stealable`; plan 43 C2e).",
+          "description": "Delegations this node holds: `(dir, gen, until_ms, stopped,\nstreamed_through, executed, parked, class)`; `class` is what this\nnode's own clients' answers wait for (`singleton`, `group`,\n`archive_waits`, `final`; plan 43 C2e, plan 46 M1.1 step 7).",
           "items": {
             "maxItems": 8,
             "minItems": 8,

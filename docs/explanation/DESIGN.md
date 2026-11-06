@@ -865,6 +865,21 @@ a singleton still answers from its disk; everyone else answers under a
 group, a sticky non-stealable grant, or the archive. `Backup` and `S3`
 are unchanged. This text changes with the code.*
 
+**One rule per stream, named by its configuration** (plan 46 M1.1, steps 2 to
+7). There are no answer classes. A sequencer's commit rule is looked up from
+its configuration, once (`Core::rule_of`: `Group` with the configuration's
+version and its members, `Final`, or `Singleton`), and a journal row is stamped
+with it (`RowCommit`, in the version of the configuration in force at the row's
+position). An answer carries the row's rule (`AnswerSource::Sequenced`), and
+what a deposition or a takeover does to a row follows the rule it was written
+under. `status.ack.classes` counts the definitive answers by it: `group` (a
+configuration with members), `final`, `singleton` and `archive_waits` (a
+configuration with no member, whose rows the archive commits); `group` and
+`archive_waits` are disjoint. The simulation judges every answer against the
+configuration the cluster's own state shows, in every delegated configuration
+by default (`strict_commit`): zero I1, and every row's version the
+configuration's at its position (`row_version_matches_config`).
+
 What a sequencer's acknowledgement means is the tenure's `ack_policy`,
 chosen per filesystem and topology
 ([ADR-21](DECISIONS.md#adr-21-layered-durability-and-seal-based-failover)):

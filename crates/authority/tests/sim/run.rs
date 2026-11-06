@@ -711,6 +711,13 @@ pub struct SimConfig {
     /// the run. Always counted (`Report::uncommitted_acks`); the flag only
     /// decides failure. Default off until C2 makes it hold everywhere.
     pub strict_commit: bool,
+    /// Plan 46 M1.1 step 7: a delegated configuration runs `strict_commit`
+    /// by default ([`SimConfig::is_delegated`]); this is the documented
+    /// exception ([`SimConfig::strict_commit_exemption`] adds the lock lane's). The reason names the plan item that closes the
+    /// configuration's I1 (the release suite stays at 0 failed while it
+    /// stands); the exception is removed with that item. A sweep's
+    /// `+commit` still makes the configuration strict.
+    pub strict_commit_exempt: Option<&'static str>,
     /// I2 `one_identity_per_op`: a rid queued for execution on two nodes at
     /// once (b), or answered under a group class yet not completed
     /// verbatim in the log (c), fails the run.
@@ -980,6 +987,28 @@ pub fn flex_unchecked_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c
 }
 
+impl SimConfig {
+    /// A configuration with delegations: scheduled ones (whole directories or
+    /// hash ranges), or the placement engine that makes them.
+    pub fn is_delegated(&self) -> bool {
+        !self.delegations.is_empty()
+            || !self.range_delegations.is_empty()
+            || (self.core)(1, 0).placement
+    }
+
+    /// The documented reason this configuration does not run `strict_commit`
+    /// by default, or `None`: its own exception, or the lock lane's.
+    pub fn strict_commit_exemption(&self) -> Option<&'static str> {
+        self.strict_commit_exempt
+            .or((self.lock_files > 0).then_some(
+                "plan 46 M3.1 (C4, the lock lane on the new records): a lapsed lock grant's \
+             `LockLapsed` refusal journals nothing and is claimed archive-bound, and a write \
+             answered after its grant lapsed meets the archive's `ENOLCK` refusal \
+             (found by the step 7 default; identical on main under `+commit`)",
+            ))
+    }
+}
+
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
@@ -1078,6 +1107,7 @@ impl Default for SimConfig {
             lock_lane_ignores_freshness: false,
             skip_close_on_recall: false,
             strict_commit: false,
+            strict_commit_exempt: None,
             strict_identity: false,
             strict_verbatim: false,
             cut_mode: super::cut::CutMode::default(),
@@ -1255,13 +1285,11 @@ pub struct Report {
     pub unjournaled_refusals: BTreeMap<String, usize>,
     /// Plan 43 C2a, I1: judged answers whose rid a transaction carries with
     /// another outcome (by answer kind); relays with no judged answer of
-    /// the sequencer they name behind them; answers whose claimed class was
-    /// not the class judged (informational); outcomes no sequencer decided
+    /// the sequencer they name behind them; outcomes no sequencer decided
     /// (a node's own error, not judged); and unjournaled refusals whose rid
     /// the log completes (D6 of C0: fails under `strict_settle`).
     pub mismatched_acks: BTreeMap<String, usize>,
     pub unverified_relays: usize,
-    pub class_mismatch: usize,
     /// Plan 43 C1-2: answers that claim a commit no class bears out, or
     /// whose row is tagged with another class than the answer names
     /// (fails under `strict_commit`).
@@ -4110,7 +4138,13 @@ fn count_unsettled(oracles: &super::oracle::Oracles, report: &mut Report) -> Vec
 }
 
 /// Run one seed. `Err` carries the failure and the replay command.
-pub fn run_seed(seed: u64, cfg: SimConfig) -> Result<Report, String> {
+pub fn run_seed(seed: u64, mut cfg: SimConfig) -> Result<Report, String> {
+    // Plan 46 M1.1 step 7: every delegated configuration judges I1, the
+    // answer's claim and the rows' versions, unless it carries a documented
+    // exception.
+    if cfg.is_delegated() && cfg.strict_commit_exemption().is_none() {
+        cfg.strict_commit = true;
+    }
     // `AUTHORITY_SIM_WATCHDOG=1`: an OS thread reports any event whose
     // handling has taken more than two seconds of real time.
     if std::env::var_os("AUTHORITY_SIM_WATCHDOG").is_some() {
@@ -5112,9 +5146,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         .lock()
         .unwrap()
         .iter()
-        .filter(|a| {
-            a.claimed == Some(constellation_authority::core::AckClass::Lone) && !a.is_relay()
-        })
+        .filter(|a| a.claimed.is_some_and(|c| c.is_singleton()) && !a.is_relay())
         .map(|a| a.rid)
         .collect();
     let mut lone_disagree: Vec<String> = Vec::new();
@@ -5914,7 +5946,6 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.unjournaled_refusals = found.unjournaled_refusals.clone();
     report.mismatched_acks = found.mismatched_acks.clone();
     report.unverified_relays = found.unverified_relays;
-    report.class_mismatch = found.class_mismatch;
     report.class_claim_mismatch = found.class_claim.len();
     report.row_version_mismatch = found.row_version.len();
     report.row_versions_checked = oracles.row_versions.lock().unwrap().checked;

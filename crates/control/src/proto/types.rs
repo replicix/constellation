@@ -318,8 +318,8 @@ pub struct DelegationReport {
     pub table: Vec<DelegationStatus>,
     /// Delegations this node holds: `(dir, gen, until_ms, stopped,
     /// streamed_through, executed, parked, class)`; `class` is what this
-    /// node's own clients' answers wait for (`lone`, `deleg-group`,
-    /// `archive`, `non-stealable`; plan 43 C2e).
+    /// node's own clients' answers wait for (`singleton`, `group`,
+    /// `archive_waits`, `final`; plan 43 C2e, plan 46 M1.1 step 7).
     #[allow(clippy::type_complexity)]
     pub mine: Vec<(u64, u64, i64, bool, u64, u64, usize, String)>,
     /// As the root: `(dir, node, gen, cursor, until_ms, recall, ended,
@@ -2490,9 +2490,12 @@ pub struct AckStatus {
     pub store_writer_lock_wait_us: u64,
     #[serde(default)]
     pub store_writer_lock_wait_max_us: u64,
-    /// Plan 43 C2a: the definitive answers this node gave as a sequencer,
-    /// by the class they waited for: `(class, count)` for `archive`,
-    /// `root-group`, `deleg-group`, `non-stealable` and `lone`.
+    /// Plan 43 C2a, plan 46 M1.1 step 7: the definitive answers this node
+    /// gave as a sequencer, by the rule of the configuration they waited
+    /// for: `(name, count)` for `group` (a configuration with members),
+    /// `final`, `singleton` and `archive_waits` (a configuration with none:
+    /// the archive carries the row). `archive_waits` is disjoint from
+    /// `group`.
     #[serde(default)]
     pub classes: Vec<(String, u64)>,
 }

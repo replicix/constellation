@@ -72,7 +72,6 @@
 //! blocks new grants on it until it has.
 
 use super::client::Phase as ClientPhase;
-use super::AckClass;
 use super::{Core, S3For, Timer};
 use crate::action::{Action, AnswerSource, ControlOk, ReadAnswer, S3Op};
 use crate::event::{PeerMsg, ReadAhead, ReadGrantMsg, ReadIndexOutcome, S3Result};
@@ -143,7 +142,7 @@ pub(crate) enum ParkedWhat {
         blockers: Option<(WaitMs, constellation_meta::RemoteBlockers)>,
         /// Plan 43 C2a: what the answer waits for (the class the row was
         /// journaled under), counted when it leaves.
-        class: AckClass,
+        class: constellation_meta::RowCommit,
         /// Plan 43 C2f: the rid's `completed` row when the answer parked for
         /// durability. A row rolled back meanwhile (`repair drop-held`
         /// strands a held transaction and queues its op again) leaves the
@@ -157,7 +156,7 @@ pub(crate) enum ParkedWhat {
     Finish {
         rid: Rid,
         outcome: MutateOutcome,
-        class: AckClass,
+        class: constellation_meta::RowCommit,
     },
     /// A FUSE fast-path write (`Control::Recall`).
     Control { op: OpId },
@@ -1406,7 +1405,7 @@ impl Core {
         base: Option<Seq>,
         position: Position,
         gen: u64,
-        class: AckClass,
+        class: constellation_meta::RowCommit,
         out: &mut Vec<Action>,
     ) {
         let id = self.park(
@@ -2200,9 +2199,9 @@ impl Core {
                     class,
                 } => {
                     let class = if downgraded {
-                        AckClass::Lone
+                        constellation_meta::RowCommit::LONE
                     } else if held_for_remote {
-                        AckClass::NonStealable
+                        constellation_meta::RowCommit::FINAL
                     } else {
                         class
                     };
@@ -2241,7 +2240,11 @@ impl Core {
                     now,
                     rid,
                     outcome,
-                    AnswerSource::Sequenced(if downgraded { AckClass::Lone } else { class }),
+                    AnswerSource::Sequenced(if downgraded {
+                        constellation_meta::RowCommit::LONE
+                    } else {
+                        class
+                    }),
                     replica,
                     out,
                 ),
@@ -2335,7 +2338,7 @@ impl Core {
         wait: RecallWait,
         durable: Option<u64>,
         outcome: MutateOutcome,
-        class: AckClass,
+        class: constellation_meta::RowCommit,
     ) {
         if let Some(c) = self.clients.get_mut(&rid) {
             c.phase = ClientPhase::Recalling;

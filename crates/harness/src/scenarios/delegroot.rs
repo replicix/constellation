@@ -1841,7 +1841,7 @@ fn overwrite_outcome_allowed(file: usize, ledger: &[Overwrite], content: &[u8]) 
 /// delegate of `/d1`, so `b` acknowledges a write only once its group has
 /// the row. `b` overwrites ten files (`O_TRUNC`, write, `fsync`) round after
 /// round; once its acknowledgements are all group ones (`status.delegation.mine[].class`:
-/// `deleg-group`, and `ack.classes` none `lone`), `a` is frozen (`SIGSTOP`), `b` seals it and takes the root over,
+/// `group`, and `ack.classes` none `singleton`), `a` is frozen (`SIGSTOP`), `b` seals it and takes the root over,
 /// and `a` is thawed deposed, with whatever of `b`'s rows it appended to its
 /// journal. After quiescence every file is byte-exact on both nodes as its
 /// last acknowledged overwrite left it (or an attempt after it), and no
@@ -1916,7 +1916,7 @@ pub fn takeover_loss_two_node(seed: u64) -> Result<()> {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .find(|c| c[0] == "lone")
+                    .find(|c| c[0] == "singleton")
                     .and_then(|c| c[1].as_u64())
                     .unwrap_or(0);
                 eprintln!("    {name}: b's answers by class before the freeze: {classes}");
@@ -1940,7 +1940,7 @@ pub fn takeover_loss_two_node(seed: u64) -> Result<()> {
                     n(&d, "fast_path_executed")
                 );
                 anyhow::ensure!(
-                    class == Some(serde_json::json!("deleg-group")),
+                    class == Some(serde_json::json!("group")),
                     "b's generation of /d1 does not acknowledge through its group: {class:?} \
                      (status.delegation.mine: {})",
                     d["mine"]

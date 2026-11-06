@@ -16,11 +16,10 @@
 //! there is no lock a handler could await, and no in-flight round it could
 //! wait on, because a round is just core state advanced by events.
 
-use crate::core::AckClass;
 use crate::event::PeerMsg;
 use crate::ids::{Epoch, NodeId, OpId, Seq, TimerId, WaitMs};
 use constellation_fs_core::Ino;
-use constellation_meta::{MutateOp, MutateOutcome, Rid};
+use constellation_meta::{MutateOp, MutateOutcome, Rid, RowCommit};
 use constellation_store_s3::heartbeat::Promise;
 use constellation_store_s3::inbox::{InboxBatch, InboxKey};
 use constellation_store_s3::{Lease, LeaseTag};
@@ -170,17 +169,17 @@ pub enum Action {
 /// Plan 43 C2a: who decided the outcome a client is answered with (the
 /// simulation's I1 oracle judges the `Sequenced` answers and verifies the
 /// `Relayed` ones; `Stats::ack_classes` counts the `Sequenced` ones per
-/// class).
+/// rule).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnswerSource {
     /// This node decided it, as a sequencer — or read it from its applied
-    /// log (`Archive`), as an inbox op's outcome is. The class is what the
-    /// answer waited for.
-    Sequenced(AckClass),
+    /// log (an archive-bound group), as an inbox op's outcome is. The rule is
+    /// the one the answer waited for, in its configuration's version.
+    Sequenced(RowCommit),
     /// Another node's `MutateReply`, passed on: the sequencer's own
     /// emission was judged where it left. (An op that waited for the log
     /// to carry what the sequencer accepted is answered what the log
-    /// carries: `Sequenced(Archive)`, which can differ from it.)
+    /// carries: an archive-bound `Sequenced`, which can differ from it.)
     Relayed { from: NodeId },
     /// `InDoubt`, and every outcome no sequencer decided (an error of this
     /// node's own, such as a shadow that could not be installed).

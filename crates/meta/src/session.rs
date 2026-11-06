@@ -811,7 +811,7 @@ pub struct SessionState {
     /// The highest journal seq that is durable under that policy.
     durable_jseq: AtomicU64,
     /// Plan 43 C1-2: the class of the answers the core gives its own
-    /// node's clients (`Core::root_ack_class`), published with the gate:
+    /// node's clients (`Core::root_commit`), published with the gate:
     /// the class a FUSE fast-path row is journaled with
     /// (`Meta::finish_local`). Stored before the gate so a reader that sees
     /// the gate has seen the class.

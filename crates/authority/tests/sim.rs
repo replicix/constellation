@@ -6607,6 +6607,9 @@ fn delegated_epoch_config() -> SimConfig {
                 for_ms: 5_000,
             },
         }],
+        strict_commit_exempt: Some(
+            "plan 46 M1.4 (the hold as a group): an epoch hold's non-stealable answers install shadows no commit backs",
+        ),
         ..delegated_config()
     }
 }
@@ -7030,6 +7033,9 @@ fn delegated_designated_config() -> SimConfig {
                 for_ms: 9_000,
             },
         }],
+        strict_commit_exempt: Some(
+            "plan 46 M1.4 (the hold as a group): a frozen epoch's EROFS refusal is claimed archive-bound and judged singleton",
+        ),
         ..delegated_config()
     }
 }
@@ -7174,6 +7180,9 @@ fn long_delegated_lead_off_config() -> SimConfig {
             c.delegation_lone_lead = false;
             c
         }),
+        strict_commit_exempt: Some(
+            "plan 46 M1.2 step 13 (the lone delegate and its lead deleted with this configuration): the negative control fails by design",
+        ),
         ..long_delegated_config()
     }
 }
@@ -7190,6 +7199,9 @@ fn long_delegated_hysteresis_off_config() -> SimConfig {
             c.delegation_lone_hysteresis = false;
             c
         }),
+        strict_commit_exempt: Some(
+            "plan 46 M1.2 step 13 (the lone delegate and its hysteresis deleted with this configuration): the negative control fails by design",
+        ),
         ..long_delegated_config()
     }
 }
@@ -7201,7 +7213,6 @@ fn long_delegated_hysteresis_off_config() -> SimConfig {
 /// (`the_row_version_oracle_catches_a_per_row_class`).
 fn long_delegated_per_row_class_config() -> SimConfig {
     SimConfig {
-        strict_commit: true,
         core: std::sync::Arc::new(|node, inc| {
             let mut c = sim::run::sim_core_config(node, inc);
             c.per_row_class = true;
@@ -7413,6 +7424,9 @@ fn delegated_core_stall_root_unlaned_config() -> SimConfig {
 fn delegated_core_stall_root_lease6_config() -> SimConfig {
     SimConfig {
         core: std::sync::Arc::new(sim::run::sim_core_config),
+        strict_commit_exempt: Some(
+            "plan 46 M2.3 (`ack=local` removed, the roster's singleton test): a stalled root's singleton answers are rolled back by its successor",
+        ),
         ..delegated_core_stall_root_config()
     }
 }
@@ -7659,19 +7673,17 @@ struct OracleTotals {
     uncommitted: std::collections::BTreeMap<String, usize>,
     unjournaled: std::collections::BTreeMap<String, usize>,
     /// Plan 43 C2a: answers a transaction carries another outcome of, by
-    /// answer kind; relays with no judged answer behind them; claimed class
-    /// not the judged one (informational); unsourced outcomes; unjournaled
+    /// answer kind; relays with no judged answer behind them; unsourced outcomes; unjournaled
     /// refusals whose rid the log completes; the cores' own count of
     /// sequenced answers by class (`Stats::ack_classes`, summed).
     mismatched: std::collections::BTreeMap<String, usize>,
     unverified_relays: usize,
-    class_mismatch: usize,
     unsourced: usize,
     unjournaled_landed: usize,
     /// Plan 43 C2: the clients' settles — sent, answered `Abandoned`,
     /// answered with the late outcome, settled locally, unsettled `EIO`.
     settles: [u64; 5],
-    claimed: [u64; 5],
+    claimed: [u64; 4],
     i2: usize,
     i2c: usize,
     /// Plan 46 M1.2 step 3, `acked_at_or_below_cut` (`cut.rs`): answers past
@@ -7770,7 +7782,6 @@ impl OracleTotals {
         }
         let mismatched: usize = r.mismatched_acks.values().sum();
         self.unverified_relays += r.unverified_relays;
-        self.class_mismatch += r.class_mismatch;
         self.class_claim.0 += r.class_claim_mismatch;
         self.class_claim.1 += u64::from(r.class_claim_mismatch > 0);
         if r.class_claim_mismatch > 0 && self.class_claim_seeds.len() < 30 {
@@ -8004,7 +8015,7 @@ impl OracleTotals {
              i2c={} (in {}) i4={} (in {}) i5={} (in {}) unjournaled={unjournaled} {:?} unmapped={} \
              rebuilds={}/{} (in {} seeds) max-backups={}; acks by class {:?}; \
              i1-mismatched={mismatched} {:?} (in {} seeds) unverified-relays={} (in {} seeds) \
-             class-mismatch={} unsourced={} unjournaled-landed={}; settles \
+             version-mismatch={} unsourced={} unjournaled-landed={}; settles \
              (sent/abandoned/late-success/local/unsettled-eio) {:?} i4-settled={}; unsettled EIO \
              isolated={} violations={} (in {} seeds) no-sequencer-in-time={} generation-tail-unreachable={}; cores' sequenced answers by class {:?}",
             self.seeds,
@@ -8029,7 +8040,7 @@ impl OracleTotals {
             self.seeds_with[5],
             self.unverified_relays,
             self.seeds_with[6],
-            self.class_mismatch,
+            self.row_version.0,
             self.unsourced,
             self.unjournaled_landed,
             self.settles,
@@ -8039,7 +8050,7 @@ impl OracleTotals {
             self.unsettled_seeds,
             self.unsettled_class[2],
             self.unsettled_class[3],
-            constellation_authority::core::AckClass::NAMES.iter().zip(self.claimed).collect::<Vec<_>>()
+            constellation_authority::core::ACK_COUNTERS.iter().zip(self.claimed).collect::<Vec<_>>()
         );
         eprintln!(
             "SWEEP-CUT-TOTALS {label} seeds {}/{seeds}: acked_at_or_below_cut violations {} (in {} seeds; {} of them refusals), \
@@ -8887,13 +8898,13 @@ fn delegated_no_backup_root_near_acknowledges_through_the_root() {
         let deleg: Vec<_> = r
             .uncommitted_acks
             .iter()
-            .filter(|(k, _)| k.starts_with("deleg-group/"))
+            .filter(|(k, _)| k.starts_with("group/"))
             .collect();
         assert!(
             deleg.is_empty(),
             "delegated-no-backup-root-near seed {seed}: a delegate answered outside its group: {deleg:?}"
         );
-        waited += c0_count(&r.acks_by_class, "deleg-group");
+        waited += c0_count(&r.acks_by_class, "group");
     }
     assert!(waited > 0, "no delegate answer waited for the root");
 }
@@ -15504,7 +15515,7 @@ fn regression_delegated_long_delegation_no_refusal_for_an_op_that_lands() {
         let deleg: Vec<_> = r
             .uncommitted_acks
             .iter()
-            .filter(|(k, _)| k.starts_with("deleg-group/"))
+            .filter(|(k, _)| k.starts_with("group/"))
             .collect();
         assert!(
             deleg.is_empty(),
@@ -15712,6 +15723,27 @@ fn c0_count(map: &std::collections::BTreeMap<String, usize>, key: &str) -> usize
     map.get(key).copied().unwrap_or(0)
 }
 
+/// Plan 46 M1.1 step 7: `strict_commit` is the default of a delegated
+/// configuration; the exceptions are documented ones, each naming the plan
+/// item that closes it.
+#[test]
+fn strict_commit_is_the_default_of_a_delegated_configuration() {
+    assert!(delegated_config().is_delegated());
+    assert!(delegated_config().strict_commit_exemption().is_none());
+    assert!(placement_hot_config().is_delegated());
+    assert!(!SimConfig::default().is_delegated());
+    for cfg in [
+        delegated_epoch_config(),
+        delegated_core_stall_root_lease6_config(),
+        long_delegated_lead_off_config(),
+        long_delegated_hysteresis_off_config(),
+        locks_delegated_config(),
+    ] {
+        let why = cfg.strict_commit_exemption().expect("an exception");
+        assert!(why.contains("plan 46 M"), "{why}");
+    }
+}
+
 /// The replay-seed names the strict variants attach to.
 #[test]
 fn c0_variants_set_their_flags() {
@@ -15764,7 +15796,7 @@ fn c0_i1_finds_no_uncommitted_group_answer_under_backup() {
     let mut groups = 0usize;
     for seed in 700..760 {
         let r = c0_run("backup", seed, backup_config());
-        groups += c0_count(&r.acks_by_class, "root-group");
+        groups += c0_count(&r.acks_by_class, "group");
         assert!(
             r.uncommitted_acks.is_empty(),
             "backup seed {seed}: answers uncommitted: {:?}: {:?}",
@@ -16268,7 +16300,7 @@ fn c0_the_oracles_are_clean_on_one_node() {
             "single seed {seed}: {r:?}"
         );
         assert!(
-            c0_count(&r.acks_by_class, "lone") > 0,
+            c0_count(&r.acks_by_class, "singleton") > 0,
             "single seed {seed}: no lone answer judged"
         );
     }
@@ -16373,7 +16405,7 @@ fn c0_i1_catches_a_planted_ungated_fast_path() {
             ..planted()
         };
         let r = c0_run("backup+planted", seed, cfg.clone());
-        let n = c0_count(&r.uncommitted_acks, "root-group/ok");
+        let n = c0_count(&r.uncommitted_acks, "group/ok");
         if n > 0 {
             caught += 1;
             let e = run_seed(seed, strict(cfg, "commit"))
@@ -16393,11 +16425,7 @@ fn c0_i1_catches_a_planted_ungated_fast_path() {
             ..backup_config()
         };
         let r = c0_run("backup+fast-path", seed, cfg);
-        assert_eq!(
-            c0_count(&r.uncommitted_acks, "root-group/ok"),
-            0,
-            "seed {seed}"
-        );
+        assert_eq!(c0_count(&r.uncommitted_acks, "group/ok"), 0, "seed {seed}");
     }
 }
 
@@ -16476,7 +16504,7 @@ fn c2c_a_delegate_never_acknowledges_alone() {
         let alone: Vec<_> = r
             .uncommitted_acks
             .iter()
-            .filter(|(k, _)| k.starts_with("deleg-group/"))
+            .filter(|(k, _)| k.starts_with("group/"))
             .collect();
         assert!(
             alone.is_empty(),
@@ -16510,7 +16538,7 @@ fn c2f_a_lone_root_answers_other_nodes_from_the_archive() {
             r.oracle_examples
         );
         assert_eq!(r.ungated_shadows, 0, "far seed {seed}");
-        archived += c0_count(&r.acks_by_class, "archive");
+        archived += c0_count(&r.acks_by_class, "archive_waits");
     }
     assert!(archived > 0, "no answer was judged archive");
 }
@@ -17395,11 +17423,9 @@ fn the_row_version_oracle_catches_a_per_row_class() {
             err.contains("row_version_matches_config") && err.contains("row version"),
             "seed {seed}: {err}"
         );
-        let clean = SimConfig {
-            strict_commit: true,
-            ..long_delegated_config()
-        };
-        let report = run_seed(seed, clean).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        // (No `+commit`: a delegated configuration is strict by default.)
+        let report =
+            run_seed(seed, long_delegated_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         assert_eq!(report.row_version_mismatch, 0, "seed {seed}");
         assert!(report.row_versions_checked > 0, "seed {seed}");
     }

@@ -823,6 +823,19 @@ commit configurations; if step 5 needs them, `BackupTx` has to carry the predece
 event. Nothing reads the adopted-tail rows' versions as commit configurations. The two seeds left open then closed in the triage and the fix round: `long-backup+commit` seed 1421 (an inbox poll was journaled while a release was in flight: product bug,
 fixed) and `long-delegated-backup+commit` seed 634 (a row-version oracle error, fixed); the delegate-side stamping gap behind the latter was the oracle's.
 
+*M1.1 step 6 superseded (maintainer, 2026-11-06):* the lead's removal as a commit input and the lone delegate as a recorded stream configuration are
+dropped from M1.1; **M1.2 step 13 closes them** (the lone delegate and its lead stay until then, and `long-delegated-lead`, `-lead-off`,
+`-hysteresis-off` and the `LoneLead` oracle with them). M1.1 exits after step 7.
+
+*M1.1 step 7 landed (2026-11-06; PROGRESS, "Plan 46 M1.1 step 7"):* `AckClass`, the step-2 wrappers (`root_ack_class`, `root_ack_class_for`,
+`deleg_ack_class`, `CommitRule::ack_class`) and the five class names are gone; `AnswerSource::Sequenced(RowCommit)`; `status.ack.classes` is
+`{group, final, singleton, archive_waits}` (`archive_waits` disjoint from `group`, Q7; the control schema re-blessed, no version bump); the sim oracle
+compares a claim with the rule of the row that carries the answer and judges by configuration; `class-mismatch` is the row-version mismatch
+(`version-mismatch`, zero); `strict_commit` is the default of every delegated sim configuration. **M1.1 exit:** every delegated configuration
+×2,000 under `+commit` has zero I1 and zero version mismatch, except the configurations listed in PROGRESS, which carry a documented
+`strict_commit_exempt` naming the plan item that closes each. The rows whose `row_version_matches_config` fails on `long-delegated-late-answers-lr` seed
+1793 and `long-delegated-backup-lr` seed 1938 are known and in triage elsewhere.
+
 *L2b (known gap, deferred 2026-11-04; PROGRESS, "L2b"):* **M1.2 must close L2b.** A committed delegate row that a
 delegate-turned-root re-appends in a lone tenure, ending unshipped below the next root's cut, survives only as rescue copies
 by rid (I2 in `long-delegated-backup` 13016; I2c in 13907, 14284, 15005, 15996, all under slow lease reads). M1.2's member

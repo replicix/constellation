@@ -2518,7 +2518,7 @@ relay of its own so requests can be attributed per role):
         2026-10-16 acknowledged-write loss): `b`, `a`'s listed backup and the
         delegate of `/d1`, overwrites ten files (`O_TRUNC`, write, `fsync`)
         round after round. After three rounds `b`'s answers must all be
-        group ones (`status.ack.classes`: no `lone`, some `deleg-group`),
+        group ones (`status.ack.classes`: no `singleton`, some `group`),
         then `a` is frozen (`SIGSTOP`) across `b`'s takeover of the root and
         thawed deposed; two rounds on the new root and two more with `a`
         back. After quiescence each file is byte-exact and equal on both
@@ -4974,7 +4974,7 @@ root answers every other node from the archive; C3
 
 | Oracle | Judged | Counter (`Report`) | Flag |
 |---|---|---|---|
-| I1 `acked_implies_committed` | at the answering sequencer's emission: every definitive answer (`Accepted`, `Errno`, `Exists`, `Conflict`, `LockLapsed`) of a `MutateReply` or of a node's own client reply that this node decided (`Action::Reply.source`: `Sequenced`), by reading every node's store, the bucket's lease and the log as they are then (`tests/sim/oracle.rs`, `committed_at_answer`), independently of what the core claims; what a transaction carries must be the answer's own outcome (plan 43 C2a: a completion for an acceptance, a `Refused` of the answer's code for a refusal — an `Exists` hint is `EEXIST`, a conflict `ESTALE`, a lapsed grant `ENOLCK`), and the same rid carried with another outcome by the archive, the answerer's journal or the lease holder's is a violation of its own whether or not a class holds. A requester passing another node's answer on (`Relayed`) is not judged but verified at the end of the run: an earlier judged `MutateReply` of that node with the same outcome must exist | `acks_by_class`, `uncommitted_acks` (`"{expected class}/{answer}"`), `mismatched_acks` (by answer kind), `unverified_relays`, `class_mismatch` (informational: the core's claimed class is not the judged one), `unjournaled_refusals` (D6: a refusal that journaled no `Refused` row, e.g. a frozen epoch's `EROFS`: nothing executed, not a violation), `acks_unsourced` (an outcome no sequencer decided: a node's own error; not judged), `acks_unmapped` (must be 0); `ungated_shadows` (plan 43 C2: shadows and hints a requester installed for an answer not said to be committed, over every incarnation; a non-stealable sequencer's — a hold owner's in an open epoch, a designee's — are counted apart, `ungated_shadows_non_stealable`, and allowed; fails the run under the flag) | `strict_commit` |
+| I1 `acked_implies_committed` | at the answering sequencer's emission: every definitive answer (`Accepted`, `Errno`, `Exists`, `Conflict`, `LockLapsed`) of a `MutateReply` or of a node's own client reply that this node decided (`Action::Reply.source`: `Sequenced`), by reading every node's store, the bucket's lease and the log as they are then (`tests/sim/oracle.rs`, `committed_at_answer`), independently of what the core claims; what a transaction carries must be the answer's own outcome (plan 43 C2a: a completion for an acceptance, a `Refused` of the answer's code for a refusal — an `Exists` hint is `EEXIST`, a conflict `ESTALE`, a lapsed grant `ENOLCK`), and the same rid carried with another outcome by the archive, the answerer's journal or the lease holder's is a violation of its own whether or not a class holds. A requester passing another node's answer on (`Relayed`) is not judged but verified at the end of the run: an earlier judged `MutateReply` of that node with the same outcome must exist | `acks_by_class`, `uncommitted_acks` (`"{expected class}/{answer}"`), `mismatched_acks` (by answer kind), `unverified_relays`, `row_version_mismatch` (plan 46 M1.1 step 7: a row's version is not its configuration's at its position, `row_version_matches_config`; printed as `version-mismatch` in the sweep totals; must be 0), `unjournaled_refusals` (D6: a refusal that journaled no `Refused` row, e.g. a frozen epoch's `EROFS`: nothing executed, not a violation), `acks_unsourced` (an outcome no sequencer decided: a node's own error; not judged), `acks_unmapped` (must be 0); `ungated_shadows` (plan 43 C2: shadows and hints a requester installed for an answer not said to be committed, over every incarnation; a non-stealable sequencer's — a hold owner's in an open epoch, a designee's — are counted apart, `ungated_shadows_non_stealable`, and allowed; fails the run under the flag) | `strict_commit` |
 | I2 `one_identity_per_op` (b) | after every event a node handles: no rid queued for execution (`pending_replays`, the core's client map) on two nodes at once (`IdentityLedger`), judged when a queued copy stands for a committed answer (its entry's class is gated: plan 43 C1-4; a stranded committed entry, an abandoned member row); the pairs of lone-branch and delegate copies are counted apart | `identity_copies`, `identity_copies_ungated` | `strict_identity`, `strict_durability` |
 | I2 (c) verbatim | end of run: an OK answered under a group class is completed in the log under the identity it was committed with (the transaction's `LogRecord::TailOf`, kept through any number of re-ships, else epoch, node and journal row; or `(gen, idx)`) and with its records as one run, ignoring the `TailOf` records of either (plan 43 C1-4, D9) | `non_verbatim` | `strict_identity`, `strict_durability` |
 | `member_copies_drained` (plan 43 C1-4) | a converged run: no node still holds a row of a member copy (the archive carries every identity, or a marker said the row was never committed) | `member_copy_rows_left` | `strict_durability` |
@@ -4983,24 +4983,42 @@ root answers every other node from the archive; C3
 | I5 `speculation_only_lone` | end of run: an OK that was rolled back whose answer was not class Lone (a rollback is what the core counts as one: a stranded replay, not a committed row kept as a member copy, and not a refusal this node never answered) | `non_lone_rollbacks` | `strict_lone`, `strict_durability` |
 | I6 `no_ttl_claim_of_a_live_lease` (plan 43 C7b) | at every lease CAS the sim's bucket accepts that replaces another node's unreleased, unfenced lease without a permit (`takeover_permit` of the claimant when it sent the CAS, naming that epoch and holder, with the backup listed or the policy `S3`): the predecessor's own honour end for the body (`holder_expires_ms` less its margin, on the clock `holder_clock` names, read with `ProtocolClock::peek_honour`, which moves no clock) against the predecessor's honour reading now. A claim before that end is a violation ("TTL claim of a live lease: node X took epoch E of node Y at true t ms, which honours it for another u ms"); a predecessor that is dead or restarted since honours nothing | `lease_ttl_claims`, `lease_live_claims` (the violations), `seals_of_a_live_holder` (a permitted claim of a `Backup` lease whose holder still honoured it: count only), `permitted_claims` | `strict_lease_claims` |
 
-**Classes** (`constellation_authority::core::AckClass`): `Archive` (an applied,
-unfenced log segment carries the outcome), `RootGroup` (the lease object's
-holder journal and every listed backup's tail hold the transaction),
-`DelegGroup { gen }` (the delegate's journal and each backup *the answerer's own
-table records* (`DelegGroup` records, plan 43 C2c: the oracle reads the
-answerer's store, not the backup the delegate happens to append to) in its
-delegate tail, or, when none is recorded, the root's journal once every backup
-the lease lists holds the row: with none listed only the archive commits the
-root's copy, plan 46 M1.1), `NonStealable` (a designee,
-or an epoch's hold owner) and `Lone` (the answerer's own client, its group is
-itself, and no peer within the RTT budget that has been linked for the
-stability window — `backup_stable_ms`, the core's own candidate rule: a link
-that has only just come up is not a backup candidate yet). The first class that
-holds is recorded; none is an I1 violation. The core says who decided every
-answer it gives a client (`AnswerSource`: `Sequenced(class)`, `Relayed { from }`,
-or `None` for an outcome nobody decided) and counts its sequenced answers per
-class (`Stats::ack_classes`, `status.ack.classes`; the sweep totals print them
-as "cores' sequenced answers by class" beside the oracle's `acks by class`).
+**Rules** (plan 46 M1.1 step 7 replaced the five answer classes; the oracle's
+`Judged` is what it finds from the cluster's own state): `archive_waits` (an
+applied, unfenced log segment carries the outcome), `group` (the lease object's
+holder journal and every listed backup's tail hold the transaction; or the
+delegate's journal and each backup *the answerer's own table records*
+(`DelegGroup` records, plan 43 C2c: the oracle reads the answerer's store, not
+the backup the delegate happens to append to) in its delegate tail, or, when
+none is recorded, the root's journal once every backup the lease lists holds
+the row: with none listed only the archive commits the root's copy, plan 46
+M1.1), `final` (a designee, or an epoch's hold owner) and `singleton` (the
+answerer's own client, its group is itself, and no peer within the RTT budget
+that has been linked for the stability window — `backup_stable_ms`, the core's
+own candidate rule: a link that has only just come up is not a backup candidate
+yet). The first that holds is recorded; none is an I1 violation. The core says
+who decided every answer it gives a client (`AnswerSource`:
+`Sequenced(RowCommit)`, `Relayed { from }`, or `None` for an outcome nobody
+decided) and counts its sequenced answers per rule (`Stats::ack_classes`,
+`status.ack.classes`: `group`, `final`, `singleton`, `archive_waits`; the sweep
+totals print them as "cores' sequenced answers by class" beside the oracle's
+`acks by class`). A claim is compared with the rule of the journal row that
+carries the answer, and the row's version with the configuration's
+(`version-mismatch` in the totals, must be 0).
+
+**`strict_commit` by default (plan 46 M1.1 step 7).** `run_seed` turns it on for
+every delegated configuration (`SimConfig::is_delegated`: scheduled delegations,
+range delegations or the placement engine), so I1, the claim check and
+`row_version_matches_config` fail a delegated run without `+commit`. A
+configuration that cannot hold them yet carries
+`SimConfig::strict_commit_exempt`, a reason naming the plan item that closes it
+(a sweep's `+commit` still makes it strict); each exception goes with that item.
+The exceptions on 2026-11-06: `delegated-epoch` and `delegated-designated` (plan 46 M1.4),
+`delegated-core-stall-root-lease6` (M2.3), `long-delegated-lead-off` and
+`-hysteresis-off` (M1.2 step 13), and the configurations that drive the lock lane
+and delegate (`lock_files > 0`; M3.1). `drop-held-chain` and `-backed`
+(M2.2) and `metered-shared` (M1.2 step 16) are not delegated by configuration and stay
+strict under `+commit` only.
 `SWEEP-ORACLES` (per seed with any
 counter) and `SWEEP-ORACLE-TOTALS` (per sweep, with `acks_by_class`) print the
 counts; `AUTHORITY_SIM_ORACLE_DEBUG=1` prints each I1 violation as judged, and (`ORACLE-END`) the relays no judged answer backs and the unjournaled refusals that landed, with every answer of the rid. The M11 configurations `delegated-crash`, `delegated-partition`, `delegated-root-crash` and `shared-dir`, `-split`, `-ranges`, `-faults` are sweep names too (plan 43 C2a).

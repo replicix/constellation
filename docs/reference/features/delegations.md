@@ -1139,8 +1139,8 @@ writer whatever the share, and `MIN_OPS=0` drops the rate floor. See
 
 `constellation status` (JSON, under `delegation`) shows `enabled`, the
 table, `mine` (this node's generations, each row ending with the class its
-own clients' answers wait for: `lone`, `deleg-group`, `root-group`, `archive` or
-`non-stealable`; the class the core last published to the fast path, so it can
+own clients' answers wait for: `singleton`, `group`, `archive_waits` or
+`final`; the rule the core last published to the fast path, so it can
 lag the next answer's by one core event), `gens` (as the root: `[dir, node, gen,
 cursor, until_ms, recall, ended, waiting_for_group]`; `waiting_for_group` says
 the generation cannot end for want of its group's tail, see "Failures"),

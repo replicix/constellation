@@ -23,9 +23,9 @@ use super::bus::Bus;
 use super::clock::Clock;
 use super::node::Shared;
 use super::store::Bucket;
-use constellation_authority::core::AckClass;
 use constellation_authority::segment::{self, Segment};
 use constellation_authority::{NodeId, Replica, Seq};
+use constellation_meta::RowCommit;
 use constellation_meta::{BackupTx, LogRecord, Meta, MutateOutcome, Rid};
 use constellation_store_s3::{AckPolicy, Lease, LogStore};
 use constellation_types::Code;
@@ -695,11 +695,40 @@ fn describe_code(code: Option<Code>) -> String {
 // I1.
 // ---------------------------------------------------------------------
 
+/// Plan 46 M1.1 step 7: the rule of the configuration an answer's commit
+/// point belongs to, as the oracle finds it from the cluster's own state
+/// (the archive, the lease object, the journals, the delegation table): the
+/// core's claim (`RowCommit`) is compared with it, never taken from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Judged {
+    /// A configuration with members: the holder and each of them hold the
+    /// transaction.
+    Group,
+    /// A configuration with no member: an applied, unfenced log segment
+    /// carries it.
+    Archive,
+    /// A non-stealable configuration (a designee, an epoch's hold owner).
+    Final,
+    /// A singleton: its own disk.
+    Singleton,
+}
+
+impl Judged {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Judged::Group => "group",
+            Judged::Archive => "archive_waits",
+            Judged::Final => "final",
+            Judged::Singleton => "singleton",
+        }
+    }
+}
+
 /// What an answer's judgement expected, from the answerer's state (plan §5.1's
-/// table), for the per-class counts.
+/// table), for the per-rule counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expected {
-    Class(AckClass),
+    Class(Judged),
     /// No transaction of the rid anywhere (a refusal that journaled no
     /// `Refused`, or an acceptance with nothing behind it).
     Unjournaled,
@@ -728,7 +757,7 @@ pub struct TxRef {
 #[derive(Debug, Clone)]
 pub struct Judgement {
     /// The first class that holds.
-    pub class: Option<AckClass>,
+    pub class: Option<Judged>,
     pub expected: Expected,
     pub tx: Option<TxRef>,
     /// What each class check saw (for failures).
@@ -873,7 +902,7 @@ impl OutcomeKind {
 pub struct Treatment {
     pub judge: bool,
     pub relay_from: Option<NodeId>,
-    pub claimed: Option<AckClass>,
+    pub claimed: Option<RowCommit>,
     pub unsourced: bool,
 }
 
@@ -903,46 +932,54 @@ pub fn answer_treatment(source: Option<constellation_authority::AnswerSource>) -
 /// transactions of the rid; `delegated`: the row is a delegate's or the
 /// root's copy of one (`Lone` until C2/C3 move them: not compared).
 /// Whether the row's rule is the answer class `c`'s (the version aside).
-fn row_is_class(row: constellation_meta::RowCommit, c: AckClass) -> bool {
+fn row_is_class(row: constellation_meta::RowCommit, c: RowCommit) -> bool {
     use constellation_authority::core::GroupOn;
-    use constellation_meta::RowCommit;
     match c {
-        AckClass::Lone => row.is_singleton(),
-        AckClass::Archive => row.is_archive(),
-        AckClass::RootGroup => matches!(
+        RowCommit::Singleton { .. } => row.is_singleton(),
+        RowCommit::Group {
+            on: GroupOn::Archive,
+            ..
+        } => row.is_archive(),
+        RowCommit::Group {
+            on: GroupOn::Root, ..
+        } => matches!(
             row,
             RowCommit::Group {
                 on: GroupOn::Root,
                 ..
             }
         ),
-        AckClass::DelegGroup { .. } => matches!(
+        RowCommit::Group {
+            on: GroupOn::Delegate,
+            ..
+        } => matches!(
             row,
             RowCommit::Group {
                 on: GroupOn::Delegate,
                 ..
             }
         ),
-        AckClass::NonStealable => row.is_final(),
+        RowCommit::Final => row.is_final(),
     }
 }
 
 pub fn check_claim(
-    claim: Option<AckClass>,
+    claim: Option<RowCommit>,
     committed: Option<bool>,
-    judged: Option<AckClass>,
+    judged: Option<Judged>,
     rows: &[constellation_meta::RowCommit],
     delegated: bool,
 ) -> Option<String> {
+    use constellation_authority::core::{commit_name, GroupOn};
     let gated = match (claim, committed) {
         (Some(c), _) => c.gated(),
         (None, Some(c)) => c,
         (None, None) => return None,
     };
-    if gated && matches!(judged, Some(AckClass::Lone) | Some(AckClass::NonStealable)) {
+    if gated && matches!(judged, Some(Judged::Singleton) | Some(Judged::Final)) {
         return Some(format!(
             "the answer claims a commit ({}) but only {} judges it",
-            claim.map_or("committed".to_string(), |c| c.name().to_string()),
+            claim.map_or("committed", commit_name),
             judged.map_or("none", |c| c.name())
         ));
     }
@@ -950,15 +987,17 @@ pub fn check_claim(
         return None;
     }
     let ok = match claim {
-        Some(AckClass::DelegGroup { .. }) => true,
+        Some(RowCommit::Group {
+            on: GroupOn::Delegate,
+            ..
+        }) => true,
         Some(c) => rows.iter().any(|r| row_is_class(*r, c)),
         None => rows.iter().any(|r| r.gated() == gated),
     };
     (!ok).then(|| {
         format!(
             "the answer says {} but the journal row of the rid is tagged {:?}",
-            claim.map_or(if gated { "committed" } else { "uncommitted" }, |c| c
-                .name()),
+            claim.map_or(if gated { "committed" } else { "uncommitted" }, commit_name),
             rows
         )
     })
@@ -981,7 +1020,7 @@ pub struct AckEntry {
     /// The class the core said the answer waited for
     /// (`AnswerSource::Sequenced`; none for a `MutateReply`, which carries
     /// no source).
-    pub claimed: Option<AckClass>,
+    pub claimed: Option<RowCommit>,
     pub judged: Option<Judgement>,
 }
 
@@ -1018,7 +1057,7 @@ pub fn lone_answered(acks: &[AckEntry]) -> HashSet<Rid> {
         if heard.get(&a.rid).is_some_and(|k| !k.contains(&a.kind)) {
             continue;
         }
-        *lone.entry(a.rid).or_insert(true) &= j.class == Some(AckClass::Lone);
+        *lone.entry(a.rid).or_insert(true) &= j.class == Some(Judged::Singleton);
     }
     lone.into_iter()
         .filter(|(_, l)| *l)
@@ -1174,11 +1213,11 @@ fn classify(
     own_txs: &[BackupTx],
     holder_txs: &[BackupTx],
     detail: &mut Vec<String>,
-) -> Option<AckClass> {
+) -> Option<Judged> {
     // 1. Archive.
     if let Some((seq, _, _)) = o.bucket.archive.outcome_as(rid, want) {
         detail.push(format!("archive: in applied segment {seq}"));
-        return Some(AckClass::Archive);
+        return Some(Judged::Archive);
     }
     detail.push("archive: not in an applied unfenced segment".into());
 
@@ -1196,7 +1235,7 @@ fn classify(
             match root_group(o, l, group.unwrap_or(&[]), (rid, want), holder_txs) {
                 Ok(()) => {
                     detail.push("root-group: holder and every listed backup hold it".into());
-                    return Some(AckClass::RootGroup);
+                    return Some(Judged::Group);
                 }
                 Err(why) => detail.push(format!("root-group: {why}")),
             }
@@ -1217,7 +1256,7 @@ fn classify(
             match deleg_group(o, answerer, st, (rid, want), g, i, t, lease, holder_txs) {
                 Ok(why) => {
                     detail.push(format!("deleg-group: {why}"));
-                    return Some(AckClass::DelegGroup { gen: g });
+                    return Some(Judged::Group);
                 }
                 Err(why) => detail.push(format!("deleg-group: {why}")),
             }
@@ -1229,11 +1268,11 @@ fn classify(
         let (g, _) = t.origin;
         if g != 0 && st.designated_gens.contains(&g) {
             detail.push(format!("non-stealable: designee of generation {g}"));
-            return Some(AckClass::NonStealable);
+            return Some(Judged::Final);
         }
         if g == 0 && st.epoch_held {
             detail.push("non-stealable: epoch hold owner".into());
-            return Some(AckClass::NonStealable);
+            return Some(Judged::Final);
         }
     }
 
@@ -1281,7 +1320,7 @@ fn classify(
     // (`own_txs` only feeds T; a Lone answer needs no copy elsewhere.)
     let _ = own_txs;
     detail.push("lone: its group is itself and no peer is within the budget".into());
-    Some(AckClass::Lone)
+    Some(Judged::Singleton)
 }
 
 /// A live node `answerer` is linked to within its RTT budget, if any, as
@@ -1702,36 +1741,36 @@ fn expected_class(
             .iter()
             .any(|(gen, b)| *gen == g && !b.is_empty());
         return Expected::Class(if st.designated_gens.contains(&g) {
-            AckClass::NonStealable
+            Judged::Final
         } else if rid.node == answerer && !backed && peer_in_budget(o, bus, answerer).is_none() {
-            AckClass::Lone
+            Judged::Singleton
         } else {
-            AckClass::DelegGroup { gen: g }
+            Judged::Group
         });
     }
     if st.epoch_held {
-        return Expected::Class(AckClass::NonStealable);
+        return Expected::Class(Judged::Final);
     }
     let Some(l) = lease else {
-        return Expected::Class(AckClass::Archive);
+        return Expected::Class(Judged::Archive);
     };
     if l.ack_policy == AckPolicy::S3 {
-        return Expected::Class(AckClass::Archive);
+        return Expected::Class(Judged::Archive);
     }
     if !l.backups.is_empty() {
-        return Expected::Class(AckClass::RootGroup);
+        return Expected::Class(Judged::Group);
     }
     if peer_in_budget(o, bus, answerer).is_some() {
         // The bring-up rule: while a backup could be had, wait for the
         // archive.
-        return Expected::Class(AckClass::Archive);
+        return Expected::Class(Judged::Archive);
     }
     if rid.node == answerer {
-        Expected::Class(AckClass::Lone)
+        Expected::Class(Judged::Singleton)
     } else {
         // Plan 43 C2's rule: a lone root answers another node's forward
         // from the archive (today such an answer is a violation).
-        Expected::Class(AckClass::Archive)
+        Expected::Class(Judged::Archive)
     }
 }
 
@@ -1886,10 +1925,6 @@ pub struct Findings {
     /// of the sequencer they name behind them.
     pub mismatched_acks: BTreeMap<String, usize>,
     pub unverified_relays: usize,
-    /// Answers whose claimed class (`AnswerSource::Sequenced`) is not the
-    /// class the judgement found (informational: the first class that
-    /// holds may be stronger than the one the answer waited for).
-    pub class_mismatch: usize,
     /// Plan 43 C2a, D6 of C0: an unjournaled refusal answered to a client
     /// whose rid the log later completes (a failure under `strict_settle`).
     pub unjournaled_landed: Vec<String>,
@@ -2013,11 +2048,6 @@ pub fn end_of_run(
         if j.mismatch.is_some() {
             *f.mismatched_acks.entry(a.kind.name()).or_default() += 1;
         }
-        if a.claimed
-            .is_some_and(|c| Some(c.index()) != j.class.map(|c| c.index()))
-        {
-            f.class_mismatch += 1;
-        }
         if j.class.is_none() {
             if j.expected == Expected::Unjournaled && a.kind.is_refusal() {
                 *f.unjournaled_refusals
@@ -2051,18 +2081,13 @@ pub fn end_of_run(
                     .or_default() += 1;
             }
         }
-        if a.kind == OutcomeKind::Ok && j.class != Some(AckClass::Lone) {
+        if a.kind == OutcomeKind::Ok && j.class != Some(Judged::Singleton) {
             let t = non_lone_ok.entry(a.rid).or_insert(a.tick);
             *t = (*t).min(a.tick);
         }
         // I2 (c): an OK answered under a group class names a transaction
         // the log must carry as it was committed.
-        if a.kind == OutcomeKind::Ok
-            && matches!(
-                j.class,
-                Some(AckClass::RootGroup) | Some(AckClass::DelegGroup { .. })
-            )
-        {
+        if a.kind == OutcomeKind::Ok && j.class == Some(Judged::Group) {
             if let Some(t) = &j.tx {
                 if let Some(why) =
                     not_verbatim(log, a.rid, t, converged).filter(|_| !survives(&a.rid))
@@ -2149,7 +2174,7 @@ pub fn end_of_run(
                     && a.kind == OutcomeKind::Ok
                     && a.judged
                         .as_ref()
-                        .is_some_and(|j| j.class != Some(AckClass::Lone))
+                        .is_some_and(|j| j.class != Some(Judged::Singleton))
             }) else {
                 continue;
             };
@@ -2164,7 +2189,7 @@ pub fn end_of_run(
             // completes the rid (its replay refused, or nobody's).
             if a.judged
                 .as_ref()
-                .is_some_and(|j| j.class == Some(AckClass::NonStealable))
+                .is_some_and(|j| j.class == Some(Judged::Final))
                 && log.completed_at.contains_key(rid)
             {
                 continue;
@@ -2706,7 +2731,7 @@ mod tests {
         );
         // The same answer kind as the log's: committed, no mismatch.
         let j = w.judge_as(1, &st, r, &MutateOutcome::Errno(Code::Exists));
-        assert_eq!(j.class, Some(AckClass::Archive), "{}", j.detail);
+        assert_eq!(j.class, Some(Judged::Archive), "{}", j.detail);
         assert_eq!(j.mismatch, None);
         // A refusal of another code is another outcome too.
         let j = w.judge_as(1, &st, r, &MutateOutcome::Errno(Code::NotFound));
@@ -2722,7 +2747,7 @@ mod tests {
                 epoch: 1,
             },
         );
-        assert_eq!(j.class, Some(AckClass::Archive), "{}", j.detail);
+        assert_eq!(j.class, Some(Judged::Archive), "{}", j.detail);
         let j = w.judge_as(1, &st, r, &MutateOutcome::Conflict { manifest: None });
         assert!(j.mismatch.is_some(), "{}", j.detail);
     }
@@ -2736,7 +2761,7 @@ mod tests {
         w.lease(1, 1, &[]);
         let st = holder_state(1);
         let j = w.judge(1, &st, r);
-        assert_eq!(j.class, Some(AckClass::Lone), "{}", j.detail);
+        assert_eq!(j.class, Some(Judged::Singleton), "{}", j.detail);
         assert_eq!(j.mismatch, None);
         // Answered refused: no transaction carries a refusal, a completion
         // does. (A lone node's answer to its own client needs no
@@ -2826,8 +2851,8 @@ mod tests {
     fn i5_judges_only_the_answers_before_the_rollback() {
         let group = |a: AckEntry| AckEntry {
             judged: Some(Judgement {
-                class: Some(AckClass::RootGroup),
-                expected: Expected::Class(AckClass::RootGroup),
+                class: Some(Judged::Group),
+                expected: Expected::Class(Judged::Group),
                 tx: None,
                 detail: String::new(),
                 mismatch: None,
@@ -2876,13 +2901,13 @@ mod tests {
         let rolled = HashMap::from([(r, 6)]);
         // Never completed in the log (its replay refused, or nobody's): a
         // violation.
-        let f = findings_rolled_back(acks(AckClass::NonStealable), &[], &rolled);
+        let f = findings_rolled_back(acks(Judged::Final), &[], &rolled);
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
         // Completed by the owner's replay: not.
-        let f = findings_rolled_back(acks(AckClass::NonStealable), &[(r, (3, 0))], &rolled);
+        let f = findings_rolled_back(acks(Judged::Final), &[(r, (3, 0))], &rolled);
         assert!(f.i5.is_empty(), "{:?}", f.i5);
         // A group's OK is a violation whatever the log says.
-        let f = findings_rolled_back(acks(AckClass::RootGroup), &[(r, (3, 0))], &rolled);
+        let f = findings_rolled_back(acks(Judged::Group), &[(r, (3, 0))], &rolled);
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
     }
 
@@ -2894,8 +2919,8 @@ mod tests {
     #[test]
     fn i5_excuses_a_dropped_rid_only_if_its_effect_survives() {
         let judged = Some(Judgement {
-            class: Some(AckClass::RootGroup),
-            expected: Expected::Class(AckClass::RootGroup),
+            class: Some(Judged::Group),
+            expected: Expected::Class(Judged::Group),
             tx: None,
             detail: String::new(),
             mismatch: None,
@@ -2951,8 +2976,8 @@ mod tests {
             relay_from: None,
             claimed: None,
             judged: Some(Judgement {
-                class: Some(AckClass::Lone),
-                expected: Expected::Class(AckClass::Lone),
+                class: Some(Judged::Singleton),
+                expected: Expected::Class(Judged::Singleton),
                 tx: None,
                 detail: String::new(),
                 mismatch: None,
@@ -2974,9 +2999,9 @@ mod tests {
     /// Fails on the parent (the claim decided it).
     #[test]
     fn only_a_rid_judged_lone_is_excused() {
-        let judged = |class: Option<AckClass>| Judgement {
+        let judged = |class: Option<Judged>| Judgement {
             class,
-            expected: Expected::Class(AckClass::RootGroup),
+            expected: Expected::Class(Judged::Group),
             tx: None,
             detail: String::new(),
             mismatch: None,
@@ -2986,56 +3011,56 @@ mod tests {
         let acks = vec![
             // Claimed and judged `Lone`: excused.
             AckEntry {
-                claimed: Some(AckClass::Lone),
+                claimed: Some(RowCommit::LONE),
                 ..ack(1, a, 1, OutcomeKind::Ok, false)
             },
             // Claimed `Lone`, judged a group's: not excused.
             AckEntry {
-                claimed: Some(AckClass::Lone),
-                judged: Some(judged(Some(AckClass::RootGroup))),
+                claimed: Some(RowCommit::LONE),
+                judged: Some(judged(Some(Judged::Group))),
                 ..ack(1, b, 2, OutcomeKind::Ok, false)
             },
             // Claimed `Lone`, no class held: not excused.
             AckEntry {
-                claimed: Some(AckClass::Lone),
+                claimed: Some(RowCommit::LONE),
                 judged: Some(judged(None)),
                 ..ack(1, c, 3, OutcomeKind::Ok, false)
             },
             // Judged `Lone` once, a group's at a second answer: not excused.
             AckEntry {
-                claimed: Some(AckClass::Lone),
+                claimed: Some(RowCommit::LONE),
                 ..ack(1, d, 4, OutcomeKind::Ok, false)
             },
             AckEntry {
-                claimed: Some(AckClass::Lone),
-                judged: Some(judged(Some(AckClass::RootGroup))),
+                claimed: Some(RowCommit::LONE),
+                judged: Some(judged(Some(Judged::Group))),
                 ..ack(1, d, 5, OutcomeKind::Ok, false)
             },
             // Judged `Lone` at its client's answer; the replay after the
             // rollback refused by the next root, a committed refusal its
             // client never heard (long-backup seed 1063): excused.
             AckEntry {
-                claimed: Some(AckClass::Lone),
+                claimed: Some(RowCommit::LONE),
                 ..ack(1, e, 6, OutcomeKind::Ok, false)
             },
             AckEntry {
-                judged: Some(judged(Some(AckClass::RootGroup))),
+                judged: Some(judged(Some(Judged::Group))),
                 ..ack(3, e, 7, OutcomeKind::Refused(Code::NotFound), true)
             },
             // The same, the second answer of the outcome its client heard:
             // not excused.
             AckEntry {
-                claimed: Some(AckClass::Lone),
+                claimed: Some(RowCommit::LONE),
                 ..ack(1, f, 8, OutcomeKind::Ok, false)
             },
             AckEntry {
-                judged: Some(judged(Some(AckClass::RootGroup))),
+                judged: Some(judged(Some(Judged::Group))),
                 ..ack(3, f, 9, OutcomeKind::Ok, true)
             },
             // A relayed answer: judged at the sequencer's reply of the
             // outcome relayed, not at another reply of the rid.
             AckEntry {
-                judged: Some(judged(Some(AckClass::RootGroup))),
+                judged: Some(judged(Some(Judged::Group))),
                 ..ack(3, g, 10, OutcomeKind::Ok, true)
             },
             relay(1, 3, g, 11, OutcomeKind::Ok),
@@ -3102,9 +3127,9 @@ mod tests {
         // reply (same rid, same kind, another node) and never judged it.
         use constellation_authority::AnswerSource;
         let treat = |s| super::answer_treatment(s);
-        let t = treat(Some(AnswerSource::Sequenced(AckClass::Lone)));
+        let t = treat(Some(AnswerSource::Sequenced(RowCommit::LONE)));
         assert!(t.judge && t.relay_from.is_none());
-        assert_eq!(t.claimed, Some(AckClass::Lone));
+        assert_eq!(t.claimed, Some(RowCommit::LONE));
         // A `MutateReply` (no source) is a sequencer's answer: judged.
         let t = treat(None);
         assert!(t.judge && t.relay_from.is_none() && t.claimed.is_none());
@@ -3182,13 +3207,13 @@ mod tests {
         let j = w.judge(1, &st, r);
         assert_eq!(j.class, None, "{}", j.detail);
         assert!(j.detail.contains("listed backup 2"), "{}", j.detail);
-        assert_eq!(j.expected, Expected::Class(AckClass::RootGroup));
+        assert_eq!(j.expected, Expected::Class(Judged::Group));
         // The backup holds it (as the row was shipped to it).
         w.metas[&2]
             .backup_append(1, std::slice::from_ref(&tx))
             .unwrap();
         let j = w.judge(1, &st, r);
-        assert_eq!(j.class, Some(AckClass::RootGroup), "{}", j.detail);
+        assert_eq!(j.class, Some(Judged::Group), "{}", j.detail);
         // Records that differ are not the same row.
         let other = BackupTx {
             records: vec![LogRecord::Completed { rid: r }],
@@ -3200,7 +3225,7 @@ mod tests {
         // The tail is trimmed once the segment lands: the archive holds it.
         w.metas[&2].backup_trim(1, u64::MAX, &[]).unwrap();
         w.o.bucket.archive.note_segment(1, seg(1, &[r]));
-        assert_eq!(w.judge(1, &st, r).class, Some(AckClass::Archive));
+        assert_eq!(w.judge(1, &st, r).class, Some(Judged::Archive));
     }
 
     /// Plan 46 M1.1: with no delegate backup recorded, the root's appended
@@ -3250,12 +3275,7 @@ mod tests {
         let txs = Replica::journal_txs_from(&*w.metas[&1], 0, usize::MAX);
         w.metas[&3].backup_append(1, &txs).unwrap();
         let j = w.judge(2, &st, r);
-        assert_eq!(
-            j.class,
-            Some(AckClass::DelegGroup { gen: 1 }),
-            "{}",
-            j.detail
-        );
+        assert_eq!(j.class, Some(Judged::Group), "{}", j.detail);
     }
 
     /// Node 2's delegate row `(1, 1)` of rid `(3, 1)`, appended to node 1's
@@ -3315,12 +3335,7 @@ mod tests {
         assert!(j.detail.contains("epoch 1"), "{}", j.detail);
         w.metas[&3].backup_append(1, &txs).unwrap();
         let j = w.judge(2, &st, r);
-        assert_eq!(
-            j.class,
-            Some(AckClass::DelegGroup { gen: 1 }),
-            "{}",
-            j.detail
-        );
+        assert_eq!(j.class, Some(Judged::Group), "{}", j.detail);
         assert!(j.detail.contains("tenure of epoch 1"), "{}", j.detail);
     }
 
@@ -3578,12 +3593,7 @@ mod tests {
             .unwrap()
             .insert((1, 1), (1, vec![], true));
         let j = w.judge(2, &st, r);
-        assert_eq!(
-            j.class,
-            Some(AckClass::DelegGroup { gen: 1 }),
-            "{}",
-            j.detail
-        );
+        assert_eq!(j.class, Some(Judged::Group), "{}", j.detail);
         // A hold that began after the append counts as well.
         w.o.appended
             .lock()
@@ -3591,12 +3601,7 @@ mod tests {
             .insert((1, 1), (1, vec![], false));
         w.o.epoch_holds.lock().unwrap().insert(1);
         let j = w.judge(2, &st, r);
-        assert_eq!(
-            j.class,
-            Some(AckClass::DelegGroup { gen: 1 }),
-            "{}",
-            j.detail
-        );
+        assert_eq!(j.class, Some(Judged::Group), "{}", j.detail);
         assert!(j.detail.contains("epoch hold"), "{}", j.detail);
     }
 
@@ -3634,7 +3639,7 @@ mod tests {
         let j = w.judge(2, &st, r);
         assert_eq!(j.tx.as_ref().map(|t| t.origin), Some((1, 1)));
         assert_eq!(j.class, None, "{}", j.detail);
-        assert_eq!(j.expected, Expected::Class(AckClass::DelegGroup { gen: 1 }));
+        assert_eq!(j.expected, Expected::Class(Judged::Group));
         // The root appends the row (origin (1, 1)) to its journal. A lone
         // root's journal is no second copy (plan 46 M1.1): with no backup
         // listed only the archive commits the root's copy.
@@ -3664,12 +3669,7 @@ mod tests {
         };
         w.metas[&3].deleg_backup_append(1, 0, &[dtx]).unwrap();
         let j = w.judge(2, &st, r);
-        assert_eq!(
-            j.class,
-            Some(AckClass::DelegGroup { gen: 1 }),
-            "{}",
-            j.detail
-        );
+        assert_eq!(j.class, Some(Judged::Group), "{}", j.detail);
     }
 
     /// Plan 43 C2 (§7.1 item 3): the delegate's group is the record its own
@@ -3741,12 +3741,7 @@ mod tests {
         };
         assert_eq!(st.deleg_groups, vec![(1, vec![3])]);
         let j = w.judge(2, &st, r);
-        assert_eq!(
-            j.class,
-            Some(AckClass::DelegGroup { gen: 1 }),
-            "{}",
-            j.detail
-        );
+        assert_eq!(j.class, Some(Judged::Group), "{}", j.detail);
     }
 
     #[test]
@@ -3758,13 +3753,13 @@ mod tests {
         let st = holder_state(1);
         // Its own client, a group of itself, nobody near: Lone.
         let j = w.judge(1, &st, own);
-        assert_eq!(j.class, Some(AckClass::Lone), "{}", j.detail);
+        assert_eq!(j.class, Some(Judged::Singleton), "{}", j.detail);
         // Another node's client is not answered Lone.
         let remote = rid(3, 1);
         w.create(1, remote, "b");
         let j = w.judge(1, &st, remote);
         assert_eq!(j.class, None, "{}", j.detail);
-        assert_eq!(j.expected, Expected::Class(AckClass::Archive));
+        assert_eq!(j.expected, Expected::Class(Judged::Archive));
         // A peer linked within the budget (the node could have had a backup).
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         w.bus.attach(2, tx);
@@ -3782,17 +3777,17 @@ mod tests {
         // ... unless it is out of budget, or the link is cut.
         w.o.budgets.lock().unwrap().insert(1, (50, 0));
         w.bus.set_rtt(1, 2, 120);
-        assert_eq!(w.judge(1, &st, own).class, Some(AckClass::Lone));
+        assert_eq!(w.judge(1, &st, own).class, Some(Judged::Singleton));
         w.bus.set_rtt(1, 2, 5);
         w.bus.set_partition(1, 2, true);
-        assert_eq!(w.judge(1, &st, own).class, Some(AckClass::Lone));
+        assert_eq!(w.judge(1, &st, own).class, Some(Judged::Singleton));
         w.bus.set_partition(1, 2, false);
         // ... or the directory its core was given does not report the peer
         // up (the bus is ahead of the driver's last poll: the core was told
         // of nobody): lone by its own information. A core with no directory
         // entry at all was told nothing and counts every link.
         w.o.note_directory(1, BTreeMap::new());
-        assert_eq!(w.judge(1, &st, own).class, Some(AckClass::Lone));
+        assert_eq!(w.judge(1, &st, own).class, Some(Judged::Singleton));
         w.o.directory.lock().unwrap().remove(&1);
         assert_eq!(w.judge(1, &st, own).class, None);
         // A listed backup (even one nobody can reach) makes it a group of two.
@@ -3816,7 +3811,7 @@ mod tests {
             ..Default::default()
         };
         let j = w.judge(1, &hold, r);
-        assert_eq!(j.class, Some(AckClass::NonStealable), "{}", j.detail);
+        assert_eq!(j.class, Some(Judged::Final), "{}", j.detail);
     }
 
     /// A log with one applied segment whose completion of `r` is at record

@@ -6,8 +6,19 @@ use super::*;
 use crate::action::{ClientReply, S3Op};
 use crate::event::{CasFailure, PeerMsg, Policy, S3Result, UploadResult};
 use constellation_fs_core::types::ROOT_INO;
-use constellation_meta::{LogRecord, Meta, MetaStore, MutateOp, MutateOutcome, OwnChunks, Rid};
+use constellation_meta::{
+    LogRecord, Meta, MetaStore, MutateOp, MutateOutcome, OwnChunks, Rid, RowCommit,
+};
 use constellation_store_s3::{Lease, LeaseMode, LeaseStore};
+
+/// An answer's source with its rule at version 0: what a test that does not
+/// know the configuration's version compares.
+fn versionless(source: crate::AnswerSource) -> crate::AnswerSource {
+    match source {
+        crate::AnswerSource::Sequenced(c) => crate::AnswerSource::Sequenced(c.versionless()),
+        other => other,
+    }
+}
 
 /// A wall stamp read as the wait clock (the harness's clocks agree
 /// unless a test sets `wait_off`).
@@ -14411,11 +14422,19 @@ mod backup_crash {
             let what = format!("(rtt {rtt:?}, link up {age} ms)");
             if gated {
                 assert_eq!(h.core.ack_need(&pos), Some(5), "{what}");
-                assert_eq!(h.core.root_ack_class(), AckClass::Archive, "{what}");
+                assert_eq!(
+                    h.core.root_commit(Asker::Own).versionless(),
+                    RowCommit::ARCHIVE,
+                    "{what}"
+                );
                 assert!(!h.core.root_lone(), "{what}");
             } else {
                 assert_eq!(h.core.ack_need(&pos), None, "{what}");
-                assert_eq!(h.core.root_ack_class(), AckClass::Lone, "{what}");
+                assert_eq!(
+                    h.core.root_commit(Asker::Own).versionless(),
+                    RowCommit::LONE,
+                    "{what}"
+                );
                 assert!(h.core.root_lone(), "{what}");
             }
         }
@@ -14453,7 +14472,11 @@ mod backup_crash {
             h.core.ack.eligible = Some(h.core.backup_could_be_had());
             let what = format!("(roster {roster:?}, node 2 linked {linked})");
             assert_eq!(h.core.ack_need(&pos), None, "{what}");
-            assert_eq!(h.core.root_ack_class(), AckClass::Lone, "{what}");
+            assert_eq!(
+                h.core.root_commit(Asker::Own).versionless(),
+                RowCommit::LONE,
+                "{what}"
+            );
             assert!(h.core.root_lone(), "{what}");
         }
     }
@@ -14498,8 +14521,8 @@ mod backup_crash {
                 }
             );
             assert_eq!(
-                rule(&h, asker).ack_class(0),
-                h.core.root_ack_class_for(asker)
+                RowCommit::from(rule(&h, asker)).versionless(),
+                h.core.root_commit(asker).versionless()
             );
         }
     }
@@ -14531,7 +14554,10 @@ mod backup_crash {
             "answered alone on a directory older than its lapse"
         );
         assert!(!h.core.root_lone());
-        assert_ne!(h.core.root_ack_class(), AckClass::Lone);
+        assert_ne!(
+            h.core.root_commit(Asker::Own).versionless(),
+            RowCommit::LONE
+        );
         // The snapshots queued during the pause were taken before the lapse
         // was handed: they show where the peers were, not that none is.
         h.advance(10);
@@ -14687,7 +14713,10 @@ mod backup_crash {
         h.advance(10);
         link_2(&mut h, true, Some(5), 1_000);
         assert_eq!(h.core.ack_need(&pos), Some(5), "answered alone");
-        assert_ne!(h.core.root_ack_class(), AckClass::Lone);
+        assert_ne!(
+            h.core.root_commit(Asker::Own).versionless(),
+            RowCommit::LONE
+        );
 
         // The roster is what changed: node 2 was linked but not listed.
         let mut h = Harness::new(1);
@@ -14794,7 +14823,11 @@ mod backup_crash {
                         replies(&out).is_empty(),
                         "{what} answered before the archive held the row: {out:?}"
                     );
-                    assert_ne!(h.core.root_ack_class(), AckClass::Lone, "{what}");
+                    assert_ne!(
+                        h.core.root_commit(Asker::Own).versionless(),
+                        RowCommit::LONE,
+                        "{what}"
+                    );
                     out = h.archive_lands();
                 }
                 assert_eq!(replies(&out).len(), 1, "{what} {out:?}");
@@ -14826,7 +14859,10 @@ mod backup_crash {
         link_2(&mut h, true, Some(5), 0);
         h.hold(1, None);
         h.core.ack.eligible = Some(h.core.backup_could_be_had());
-        assert_eq!(h.core.root_ack_class(), AckClass::Archive);
+        assert_eq!(
+            h.core.root_commit(Asker::Own).versionless(),
+            RowCommit::ARCHIVE
+        );
         // Two ops of this node journaled as the root (the inbox drain's):
         // rid 1's row first, rid 2's after it, the tip.
         let (rid1, rid2) = (h.rid(1), h.rid(2));
@@ -14874,10 +14910,10 @@ mod backup_crash {
         assert_eq!(replied.len(), 1, "{out:?}");
         assert!(matches!(
             out.iter().find_map(|a| match a {
-                Action::Reply { source, .. } => Some(*source),
+                Action::Reply { source, .. } => Some(versionless(*source)),
                 _ => None,
             }),
-            Some(crate::AnswerSource::Sequenced(AckClass::Archive))
+            Some(crate::AnswerSource::Sequenced(RowCommit::ARCHIVE))
         ));
         assert_eq!(
             class_of(&h, rid1),
@@ -14942,13 +14978,13 @@ mod backup_crash {
         let sources: Vec<_> = out
             .iter()
             .filter_map(|a| match a {
-                Action::Reply { source, .. } => Some(*source),
+                Action::Reply { source, .. } => Some(versionless(*source)),
                 _ => None,
             })
             .collect();
         assert_eq!(
             sources,
-            vec![crate::AnswerSource::Sequenced(AckClass::Archive)],
+            vec![crate::AnswerSource::Sequenced(RowCommit::ARCHIVE)],
             "{out:?}"
         );
         assert_eq!(
@@ -15026,7 +15062,10 @@ mod backup_crash {
             Some(5),
             "acknowledged on this disk alone with node 2 in budget"
         );
-        assert_ne!(h.core.root_ack_class(), AckClass::Lone);
+        assert_ne!(
+            h.core.root_commit(Asker::Own).versionless(),
+            RowCommit::LONE
+        );
     }
 
     /// Plan 43 C7-F F-a0 (the ack side of the review's F1): a `Local`
@@ -34981,7 +35020,10 @@ fn a_candidate_that_sealed_the_epoch_is_not_reinvited() {
         Some(true),
         "a linked sealer is no lone peer"
     );
-    assert_eq!(h.core.root_ack_class(), AckClass::Archive);
+    assert_eq!(
+        h.core.root_commit(Asker::Own).versionless(),
+        RowCommit::ARCHIVE
+    );
 }
 
 /// EC2 follow-up (the 4-node `cto-strict-root` EIO): an op that went to
@@ -42568,7 +42610,7 @@ mod answer_sources {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::Reply { rid, source, .. } => Some((*rid, *source)),
+                Action::Reply { rid, source, .. } => Some((*rid, versionless(*source))),
                 _ => None,
             })
             .collect()
@@ -42580,7 +42622,7 @@ mod answer_sources {
     fn a_local_execution_is_sequenced_and_counted_by_class() {
         let mut h = Harness::new(1);
         h.hold(1, None);
-        let class = h.core.root_ack_class();
+        let class = h.core.root_commit(Asker::Own).versionless();
         let out = h.step(Event::Submit {
             policy: Policy::Client,
             rid: h.rid(1),
@@ -42590,24 +42632,32 @@ mod answer_sources {
         // (Parked as the archive's while the first assessment of peers was
         // out, released when it found none: the answer a lone node gives,
         // so it says `Lone` and its row is re-tagged, plan 43 C1-2 D4.)
-        assert_eq!(class, AckClass::Archive);
+        assert_eq!(class, RowCommit::ARCHIVE);
         assert_eq!(
             sources(&out),
-            vec![(h.rid(1), AnswerSource::Sequenced(AckClass::Lone))]
+            vec![(h.rid(1), AnswerSource::Sequenced(RowCommit::LONE))]
         );
-        assert_eq!(h.core.stats.ack_classes[AckClass::Lone.index()], 1);
+        assert_eq!(h.core.stats.ack_classes[ack_counter(RowCommit::LONE)], 1);
         assert_eq!(h.core.stats.ack_classes.iter().sum::<u64>(), 1);
         // The status view names them.
         let view = h.core.ack_view();
-        assert_eq!(view.classes.len(), 5);
+        // Plan 46 M1.1 step 7: four counters, by the rule of the answer's
+        // configuration.
+        assert_eq!(
+            view.classes
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            ["group", "final", "singleton", "archive_waits"]
+        );
         assert!(view
             .classes
             .iter()
-            .any(|(name, n)| *name == AckClass::Lone.name() && *n == 1));
+            .any(|(name, n)| *name == commit_name(RowCommit::LONE) && *n == 1));
         // A refusal is a sequencer's answer too; by now no peer is eligible
         // and nothing gates: the node is alone.
-        let class = h.core.root_ack_class();
-        assert_eq!(class, AckClass::Lone);
+        let class = h.core.root_commit(Asker::Own).versionless();
+        assert_eq!(class, RowCommit::LONE);
         let out = h.step(Event::Submit {
             policy: Policy::Client,
             rid: h.rid(2),
@@ -42622,7 +42672,7 @@ mod answer_sources {
             vec![(h.rid(2), AnswerSource::Sequenced(class))],
             "a refusal is the sequencer's answer too"
         );
-        assert_eq!(h.core.stats.ack_classes[class.index()], 2);
+        assert_eq!(h.core.stats.ack_classes[ack_counter(class)], 2);
         assert_eq!(h.core.stats.ack_classes.iter().sum::<u64>(), 2);
     }
 
@@ -42703,7 +42753,7 @@ mod answer_sources {
     fn a_forwarded_answer_is_counted_by_the_class_it_waited_for() {
         let mut h = Harness::new(1);
         h.hold(1, None);
-        let class = h.core.root_ack_class();
+        let class = h.core.root_commit(Asker::Own).versionless();
         let out = h.step_archived(Event::Peer {
             from: 2,
             msg: PeerMsg::MutateRequest {
@@ -42731,9 +42781,9 @@ mod answer_sources {
         // (Journaled as the archive's; answered, once the first assessment
         // of peers found none, from the archive all the same: another node
         // is never answered on a lone node's disk, plan 43 C2.)
-        assert_eq!(class, AckClass::Archive);
-        assert_eq!(h.core.stats.ack_classes[AckClass::Archive.index()], 1);
-        assert_eq!(h.core.stats.ack_classes[AckClass::Lone.index()], 0);
+        assert_eq!(class, RowCommit::ARCHIVE);
+        assert_eq!(h.core.stats.ack_classes[ack_counter(RowCommit::ARCHIVE)], 1);
+        assert_eq!(h.core.stats.ack_classes[ack_counter(RowCommit::LONE)], 0);
         // A hold on a retry (`Busy`, `NotHolder`) is no answer.
         let before = h.core.stats.ack_classes;
         h.core.lease.gate = Some(PendingGate {
@@ -44223,7 +44273,7 @@ mod deleg_group {
         );
         assert!(committed, "a group-held answer says it is committed");
         assert_eq!(
-            h.core.stats.ack_classes[AckClass::DelegGroup { gen: 7 }.index()],
+            h.core.stats.ack_classes[ack_counter(RowCommit::DELEG_GROUP)],
             1
         );
         assert_eq!(h.core.dl.mine[&7].acked_max, 1);
@@ -44413,7 +44463,7 @@ mod deleg_group {
                 Action::Reply {
                     rid: r,
                     reply: ClientReply::Outcome(MutateOutcome::Abandoned),
-                    source: AnswerSource::Sequenced(AckClass::DelegGroup { gen: 7 }),
+                    source: AnswerSource::Sequenced(RowCommit::DELEG_GROUP),
                 } if *r == rid
             )),
             "{out:?}"
@@ -44441,8 +44491,8 @@ mod deleg_group {
         root_is_near(&mut h);
         assert_eq!(rule(&h, Asker::Own), group);
         assert_eq!(
-            rule(&h, Asker::Own).ack_class(7),
-            AckClass::DelegGroup { gen: 7 }
+            RowCommit::from(rule(&h, Asker::Own)).versionless(),
+            RowCommit::DELEG_GROUP
         );
         // A generation this node does not hold: what is left is in the log.
         assert_eq!(
@@ -44465,14 +44515,14 @@ mod deleg_group {
         let (mut h, dir, _, _) = delegate_renewed_once();
         assert!(h.core.deleg_lone(&h.core.dl.mine[&7]));
         assert_eq!(
-            h.core.deleg_ack_class(7, Asker::Own, &h.meta),
-            AckClass::Lone,
+            RowCommit::from(h.core.deleg_rule(7, Asker::Own, &h.meta)).versionless(),
+            RowCommit::LONE,
             "lone: its own client's row is answered at once"
         );
         let (rid, out) = own_create(&mut h, dir, 1);
         assert_eq!(
             client_answers(&out),
-            vec![(rid, AnswerSource::Sequenced(AckClass::Lone))],
+            vec![(rid, AnswerSource::Sequenced(RowCommit::LONE))],
             "{out:?}"
         );
         // (Its row streams to the root meanwhile.)
@@ -44486,8 +44536,8 @@ mod deleg_group {
         // The root comes within the budget: the next own op waits.
         root_is_near(&mut h);
         assert_eq!(
-            h.core.deleg_ack_class(7, Asker::Own, &h.meta),
-            AckClass::DelegGroup { gen: 7 },
+            RowCommit::from(h.core.deleg_rule(7, Asker::Own, &h.meta)).versionless(),
+            RowCommit::DELEG_GROUP,
             "not lone: its own client's row waits for the group"
         );
         let (rid, out) = own_create(&mut h, dir, 3);
@@ -44496,10 +44546,7 @@ mod deleg_group {
             batch(&out).unwrap_or_else(|| panic!("not sent to the root: {out:?}"));
         let out = root_acks(&mut h, req, round, last);
         assert!(
-            client_answers(&out).contains(&(
-                rid,
-                AnswerSource::Sequenced(AckClass::DelegGroup { gen: 7 })
-            )),
+            client_answers(&out).contains(&(rid, AnswerSource::Sequenced(RowCommit::DELEG_GROUP))),
             "{out:?}"
         );
     }
@@ -44538,8 +44585,8 @@ mod deleg_group {
         assert!(h.core.backup_candidates(h.clk()).is_empty(), "no candidate");
         assert!(!h.core.deleg_lone(&h.core.dl.mine[&7]), "a root to back it");
         assert_eq!(
-            h.core.deleg_ack_class(7, Asker::Own, &h.meta),
-            AckClass::DelegGroup { gen: 7 }
+            RowCommit::from(h.core.deleg_rule(7, Asker::Own, &h.meta)).versionless(),
+            RowCommit::DELEG_GROUP
         );
         assert_eq!(
             h.meta.session().deleg_row_class(7),
@@ -44552,10 +44599,7 @@ mod deleg_group {
         let out = root_acks(&mut h, req, round, last);
         assert_eq!(
             client_answers(&out),
-            vec![(
-                rid,
-                AnswerSource::Sequenced(AckClass::DelegGroup { gen: 7 })
-            )],
+            vec![(rid, AnswerSource::Sequenced(RowCommit::DELEG_GROUP))],
             "{out:?}"
         );
     }
@@ -44585,10 +44629,11 @@ mod deleg_group {
                 issued: WaitMs(i64::MAX),
             })
         };
-        let class = |h: &Harness| h.core.deleg_ack_class(7, Asker::Own, &h.meta);
+        let class =
+            |h: &Harness| RowCommit::from(h.core.deleg_rule(7, Asker::Own, &h.meta)).versionless();
         let published = |h: &Harness| h.meta.session().deleg_row_class(7);
         no_links(&mut h, 0);
-        assert_eq!(class(&h), AckClass::Lone, "nobody linked");
+        assert_eq!(class(&h), RowCommit::LONE, "nobody linked");
         assert_eq!(published(&h), Some(constellation_meta::RowCommit::LONE));
         // Paused for seconds: the lapse is handed with the next event.
         h.step(Event::OwnLag {
@@ -44597,7 +44642,7 @@ mod deleg_group {
         });
         assert_eq!(
             class(&h),
-            AckClass::DelegGroup { gen: 7 },
+            RowCommit::DELEG_GROUP,
             "no snapshot since its lapse"
         );
         assert_eq!(
@@ -44608,11 +44653,11 @@ mod deleg_group {
         // A snapshot taken before the lapse was handed does not restore it.
         h.advance(100);
         no_links(&mut h, 0);
-        assert_eq!(class(&h), AckClass::DelegGroup { gen: 7 });
+        assert_eq!(class(&h), RowCommit::DELEG_GROUP);
         // One taken after does.
         h.advance(100);
         no_links(&mut h, 1);
-        assert_eq!(class(&h), AckClass::Lone);
+        assert_eq!(class(&h), RowCommit::LONE);
         assert_eq!(published(&h), Some(constellation_meta::RowCommit::LONE));
     }
 
@@ -44635,7 +44680,7 @@ mod deleg_group {
             let (rid, out) = own_create(&mut h, dir, seq);
             assert_eq!(
                 client_answers(&out),
-                vec![(rid, AnswerSource::Sequenced(AckClass::Lone))],
+                vec![(rid, AnswerSource::Sequenced(RowCommit::LONE))],
                 "row {seq}, within a batch of the root: {out:?}"
             );
             if seq == 1 {
@@ -44647,8 +44692,8 @@ mod deleg_group {
         // Four rows past the root's cursor: the next one waits for the root,
         // and the fast path journals with that class too.
         assert_eq!(
-            h.core.deleg_ack_class(7, Asker::Own, &h.meta),
-            AckClass::DelegGroup { gen: 7 }
+            RowCommit::from(h.core.deleg_rule(7, Asker::Own, &h.meta)).versionless(),
+            RowCommit::DELEG_GROUP
         );
         assert_eq!(
             h.meta.session().deleg_row_class(7),
@@ -44672,16 +44717,13 @@ mod deleg_group {
         let out = root_acks(&mut h, req, round, last);
         assert_eq!(
             client_answers(&out),
-            vec![(
-                held,
-                AnswerSource::Sequenced(AckClass::DelegGroup { gen: 7 })
-            )],
+            vec![(held, AnswerSource::Sequenced(RowCommit::DELEG_GROUP))],
             "{out:?}"
         );
         // Within a batch again: its own rows are answered at once.
         assert_eq!(
-            h.core.deleg_ack_class(7, Asker::Own, &h.meta),
-            AckClass::Lone
+            RowCommit::from(h.core.deleg_rule(7, Asker::Own, &h.meta)).versionless(),
+            RowCommit::LONE
         );
         assert_eq!(
             h.meta.session().deleg_row_class(7),
@@ -44997,7 +45039,7 @@ mod deleg_group {
         let (_, out) = own_create(&mut h, dir, 2);
         assert_eq!(
             client_answers(&out)[0].1,
-            AnswerSource::Sequenced(AckClass::Lone)
+            AnswerSource::Sequenced(RowCommit::LONE)
         );
         // Row 3 is two past the root's cursor: it waits for the root.
         let ino = h.meta.allocate_ino(dir).unwrap();
@@ -45082,7 +45124,7 @@ mod deleg_group {
         let (answered, dropped, queued, rename) = create_then_rename_at_a_root_crash(false);
         assert_eq!(
             answered,
-            Some(crate::AnswerSource::Sequenced(AckClass::Lone))
+            Some(crate::AnswerSource::Sequenced(RowCommit::LONE))
         );
         assert_eq!(dropped, 1, "the create is dropped");
         assert_eq!(queued, vec![rename], "the rename is replayed alone");
@@ -45295,7 +45337,7 @@ mod deleg_group {
             mode: 0,
         };
         let (_, a) = own_op(&mut h, 1, set("user.pad"));
-        assert_eq!(a, Some(crate::AnswerSource::Sequenced(AckClass::Lone)));
+        assert_eq!(a, Some(crate::AnswerSource::Sequenced(RowCommit::LONE)));
         let (_, a) = own_op(&mut h, 2, set("user.k"));
         assert_eq!(a, None, "past the lead: waits for the root");
         let (_, a) = own_op(
@@ -45386,7 +45428,7 @@ mod deleg_group {
         let (_, out) = own_create(&mut h, dir, 1);
         assert_eq!(
             client_answers(&out)[0].1,
-            AnswerSource::Sequenced(AckClass::Lone)
+            AnswerSource::Sequenced(RowCommit::LONE)
         );
         let now = h.clk();
         constellation_meta::before_delegate_write_hook::set(Some(Box::new(move |meta| {
@@ -45470,7 +45512,7 @@ mod deleg_group {
         );
         assert_eq!(
             r.answered,
-            Some(AnswerSource::Sequenced(AckClass::Lone)),
+            Some(AnswerSource::Sequenced(RowCommit::LONE)),
             "the rename is answered from the disk"
         );
         assert_eq!(r.dropped, 0, "no gated row to drop");
@@ -46333,7 +46375,7 @@ mod deleg_group {
         h.core.answer_awaiting_log(h.clk(), &h.meta, &mut out);
         assert_eq!(
             client_answers(&out),
-            vec![(rid, AnswerSource::Sequenced(AckClass::Archive))],
+            vec![(rid, AnswerSource::Sequenced(RowCommit::ARCHIVE))],
             "{out:?}"
         );
     }
@@ -52244,7 +52286,7 @@ mod c1_class {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::Reply { rid, source, .. } => Some((*rid, *source)),
+                Action::Reply { rid, source, .. } => Some((*rid, versionless(*source))),
                 _ => None,
             })
             .collect()
@@ -52321,11 +52363,14 @@ mod c1_class {
     }
 
     /// A row the core journals carries the class its answer waits for (the
-    /// node's own answers: `root_ack_class`), whichever path journaled it.
+    /// node's own answers: `root_commit`), whichever path journaled it.
     #[test]
     fn a_row_is_journaled_with_the_class_its_answer_waits_for() {
         let (mut h, _) = listed_holder();
-        assert_eq!(h.core.root_ack_class(), AckClass::RootGroup);
+        assert_eq!(
+            h.core.root_commit(Asker::Own).versionless(),
+            RowCommit::ROOT_GROUP
+        );
         let out = h.step(Event::Submit {
             policy: Policy::Client,
             rid: h.rid(2),
@@ -52393,7 +52438,7 @@ mod c1_class {
         // says.
         assert_eq!(
             sources(&out),
-            vec![(rid, AnswerSource::Sequenced(AckClass::Lone))]
+            vec![(rid, AnswerSource::Sequenced(RowCommit::LONE))]
         );
         assert_eq!(classes_of(&h, rid), vec![RowCommit::LONE]);
         assert_eq!(h.core.stats.acks_downgraded_lone, 1);
@@ -52515,7 +52560,7 @@ mod c1_class {
         let out = ack(&mut h, sent[0].0, tip, false);
         assert_eq!(
             sources(&out),
-            vec![(rid, AnswerSource::Sequenced(AckClass::RootGroup))]
+            vec![(rid, AnswerSource::Sequenced(RowCommit::ROOT_GROUP))]
         );
         assert_eq!(classes_of(&h, rid), vec![RowCommit::ROOT_GROUP]);
         assert_eq!(h.core.stats.acks_downgraded_lone, 0);
@@ -53466,15 +53511,15 @@ mod c2f_lone_root {
         assert!(
             out.iter().any(|a| matches!(
                 a,
-                Action::Reply { rid, source: AnswerSource::Sequenced(AckClass::Lone), .. }
-                    if *rid == own
+                Action::Reply { rid, source: AnswerSource::Sequenced(c), .. }
+                    if *rid == own && c.is_singleton()
             )),
             "{out:?}"
         );
         assert_eq!(classes_of(&h, own), vec![RowCommit::LONE]);
         // Nothing for the forward until the log carries it.
         assert!(answers(&release(&mut h)).is_empty());
-        let archived = h.core.stats.ack_classes[AckClass::Archive.index()];
+        let archived = h.core.stats.ack_classes[ack_counter(RowCommit::ARCHIVE)];
         ship_all(&mut h);
         let out = release(&mut h);
         assert!(
@@ -53485,7 +53530,7 @@ mod c2f_lone_root {
             "{out:?}"
         );
         assert_eq!(
-            h.core.stats.ack_classes[AckClass::Archive.index()],
+            h.core.stats.ack_classes[ack_counter(RowCommit::ARCHIVE)],
             archived + 1
         );
         assert_eq!(h.core.stats.acks_downgraded_lone, 0);
@@ -53644,10 +53689,10 @@ mod c2f_lone_root {
                 .journaled_answer_class_for(&h.meta, forwarded(1), Asker::Remote)
                 .unwrap()
         };
-        assert_eq!(class(&h), AckClass::NonStealable, "in the hold");
+        assert_eq!(class(&h).versionless(), RowCommit::FINAL, "in the hold");
         h.core.lease.release_local();
         assert!(!h.core.lease.epoch_held());
-        assert_eq!(class(&h), AckClass::Archive, "after it");
+        assert_eq!(class(&h).versionless(), RowCommit::ARCHIVE, "after it");
         assert_eq!(classes_of(&h, forwarded(1)), vec![RowCommit::FINAL]);
     }
 
@@ -53673,7 +53718,7 @@ mod c2f_lone_root {
             ),
             "{out:?}"
         );
-        let ns = AckClass::NonStealable.index();
+        let ns = ack_counter(RowCommit::FINAL);
         assert_eq!(h.core.stats.ack_classes[ns], before[ns] + 1);
         assert_eq!(classes_of(&h, forwarded(1)), vec![RowCommit::FINAL]);
         assert_eq!(h.core.stats.acks_downgraded_lone, 0);
@@ -53700,7 +53745,7 @@ mod c2f_lone_root {
             ),
             "{out:?}"
         );
-        let ns = AckClass::NonStealable.index();
+        let ns = ack_counter(RowCommit::FINAL);
         assert_eq!(h.core.stats.ack_classes[ns], before[ns] + 1);
         assert_eq!(classes_of(&h, forwarded(1)), vec![RowCommit::FINAL]);
     }
@@ -53751,9 +53796,15 @@ mod c2f_lone_root {
     #[test]
     fn a_node_that_is_not_lone_publishes_no_lone_class() {
         let mut h = lone_root();
-        assert_eq!(h.core.root_ack_class(), AckClass::Lone);
+        assert_eq!(
+            h.core.root_commit(Asker::Own).versionless(),
+            RowCommit::LONE
+        );
         h.core.lease.lost = true;
-        assert_eq!(h.core.root_ack_class(), AckClass::Archive);
+        assert_eq!(
+            h.core.root_commit(Asker::Own).versionless(),
+            RowCommit::ARCHIVE
+        );
         h.core.lease.lost = false;
         let version = h.core.root_config_version();
         assert!(version > 0, "a held lease has a configuration");
@@ -53785,15 +53836,21 @@ mod c2f_lone_root {
         let h = lone_root();
         journal(&h, "ha", h.rid(5));
         assert_eq!(
-            h.core.journaled_answer_class(&h.meta, h.rid(5)).unwrap(),
-            AckClass::Lone
+            h.core
+                .journaled_answer_class(&h.meta, h.rid(5))
+                .unwrap()
+                .versionless(),
+            RowCommit::LONE
         );
         assert_eq!(classes_of(&h, h.rid(5)), vec![RowCommit::LONE]);
         let (h, _) = listed_holder();
         journal(&h, "hb", h.rid(6));
         assert_eq!(
-            h.core.journaled_answer_class(&h.meta, h.rid(6)).unwrap(),
-            AckClass::Archive
+            h.core
+                .journaled_answer_class(&h.meta, h.rid(6))
+                .unwrap()
+                .versionless(),
+            RowCommit::ARCHIVE
         );
         assert_eq!(classes_of(&h, h.rid(6)), vec![RowCommit::FINAL]);
     }
@@ -53877,7 +53934,7 @@ mod c2f_lone_root {
             .core
             .journaled_answer_class_for(&h.meta, forwarded(1), Asker::Remote)
             .unwrap();
-        assert_eq!(class, AckClass::Archive);
+        assert_eq!(class.versionless(), RowCommit::ARCHIVE);
         assert_eq!(classes_of(&h, forwarded(1)), vec![RowCommit::ARCHIVE]);
     }
 
@@ -54044,7 +54101,7 @@ mod c2g_settle {
         );
         assert!(h.meta.lookup(ROOT_INO, "s").unwrap().is_none());
         assert_eq!(
-            h.core.stats.ack_classes[AckClass::RootGroup.index()],
+            h.core.stats.ack_classes[ack_counter(RowCommit::ROOT_GROUP)],
             1,
             "answered as the root group's"
         );
@@ -54454,8 +54511,8 @@ mod c2g_settle {
                 Action::Reply {
                     rid: r,
                     reply: ClientReply::Outcome(MutateOutcome::Abandoned),
-                    source: crate::AnswerSource::Sequenced(AckClass::Archive),
-                } if *r == rid
+                    source: crate::AnswerSource::Sequenced(c),
+                } if *r == rid && c.versionless() == RowCommit::ARCHIVE
             )),
             "{out:?}"
         );

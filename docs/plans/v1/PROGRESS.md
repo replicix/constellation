@@ -67524,3 +67524,54 @@ nothing is answered on the stale view, and the harm is the unchecked replay of a
 
 Gates (box 2, this branch): fmt, clippy `-D warnings` (meta, authority, all targets) clean; meta lib 407, authority lib 1,060; release sim
 suite 421 passed, 0 failed, 13 ignored.
+
+
+### Plan 46 M1.1 step 7: names and counters; M1.1 exit (2026-11-06)
+
+M1.1 step 6 is dropped (maintainer, 2026-11-06): the lone delegate and its lead stay until M1.2 step 13, which also deletes `long-delegated-lead`, `-lead-off`,
+`-hysteresis-off` and the `LoneLead` oracle. M1.1 exits with this step.
+
+**Deleted / renamed.** `AckClass` (five variants, `NAMES`, `index`, `name`, `gated`), `CommitRule::ack_class`, `Core::root_ack_class`, `root_ack_class_for`
+(now `Core::root_commit(asker)`, the rule looked up once and converted: `RowCommit::from(rule)`), `Core::deleg_ack_class` (callers use `deleg_rule`), the oracle's
+`class_mismatch`. `AnswerSource::Sequenced(RowCommit)`: the answer carries the rule of the row it answers, in the row's version where the core has it (a row's own
+commit, the rule it just looked up) and at version 0 for the answers of nothing journaled. `journaled_answer_class*` and `executed_answer_class` return the row's own
+`RowCommit`. `Stats::ack_classes` is `[u64; 4]`, named by `ACK_COUNTERS` (`group`, `final`, `singleton`, `archive_waits`; `ack_counter`, `commit_name`).
+`status.delegation.mine[].class` uses the same four names.
+
+**Schema.** `status.ack.classes` is `[name, count]` pairs for `group` (a configuration with members: root or delegation group), `final`, `singleton` and `archive_waits`
+(a configuration with none: the archive carries the row; disjoint from `group`, Q7). The wire shape is unchanged: the control schema is re-blessed (two descriptions),
+no version bump. Harness `takeover-loss-two-node` reads `singleton` / `group`.
+
+**Sim oracle.** The oracle judges by configuration: `Judged::{Group, Archive, Final, Singleton}` is what it finds from the cluster's state (`Archive` prints as
+`archive_waits`); the core's claim (`RowCommit`) is compared with the rule of the journal row that carries the answer (`check_claim`, strict under `strict_commit`), and a row's
+version with the configuration's (`row_version_matches_config`). `class-mismatch` is gone; the sweep totals print `version-mismatch` (the row-version oracle's count).
+`strict_commit` is on by default for every delegated configuration: `run_seed` sets it when `SimConfig::is_delegated()` (scheduled or range delegations, or the placement engine)
+and `SimConfig::strict_commit_exemption()` is `None`. The negative control `AUTHORITY_SIM_PER_ROW_CLASS=1` fails `row_version_matches_config` without `+commit`
+(`the_row_version_oracle_catches_a_per_row_class`); `strict_commit_is_the_default_of_a_delegated_configuration` pins the exceptions.
+
+**Documented exceptions (`strict_commit_exempt`; `+commit` still makes each strict).** Each fails `+commit` identically on main (`11bdd0f0`: same failing seeds, same
+messages); none is new:
+
+| Configuration | Fails `+commit` ×2,000 (main = this tree) | Closed by |
+|---|---|---|
+| `delegated-epoch` | 59 (a shadow installed for an answer not said to be committed) | M1.4 (the hold as a group) |
+| `delegated-designated` | seed 69000 (a frozen epoch's `EROFS` refusal claimed archive-bound, judged singleton), found by the default | M1.4 |
+| `delegated-core-stall-root-lease6` | 19 (`lone/*` answers of a stalled root, rolled back by its successor) | M2.3 (the roster's singleton test, `ack=local` removed) |
+| `long-delegated-lead-off`, `-hysteresis-off` | 1,403 / 30 (the `LoneLead` oracle, by design: negative controls) | M1.2 step 13 (deleted with them) |
+| every configuration that drives the lock lane (`lock_files > 0`) and delegates: `locks-delegated-writes`, `locks-unlinked-delegated`, `locks-stall-step-delegated(-ahead)`, `locks-writer-hold-delegated(-group, -doubt)`, `locks-unlinked-delegated-dbackup-random` | 8 seeds of the suite's ranges, identical on main under `+commit`: a lapsed grant's `LockLapsed` refusal journals nothing and is claimed archive-bound; a write answered after its grant lapsed meets the archive's `ENOLCK` | M3.1 (C4, the lock lane on the new records) |
+
+**Not delegated by configuration, so not defaulted (strict only under `+commit`):** `drop-held-chain` (1,547 failing, I1) and `-backed` (664): closed by M2.2 (drop-held as
+refuse-and-retry); `metered-shared` (264): closed by M1.2 step 16 (C3 verbatim, `member_copies_drained`). Same seeds as on main.
+
+**Exit sweep** (box 1, release, `+commit` strict, seeds 0..1,999, 54 delegated configurations: the M1.2 step 0 list plus `delegated-two-dirs-one-backed`): zero I1 and zero version
+mismatch in each of these 54 configurations (the seven that fail, fail on other properties; the delegated lock-lane configurations are not in this list and are exempt, see below); 47 configurations 0 failing seeds. The seven that fail (the five above plus the two negative controls) fail with the same seeds as main in each
+(`delegated-core-stall-root-lease6` 19, `delegated-epoch` 59, `drop-held-chain` 1,547, `-backed` 664, `metered-shared` 264, `long-delegated-hysteresis-off` 30, `-lead-off` 1,403); no
+new failure, no version mismatch. Known and in triage elsewhere (not run here, not fixed): `row_version` on `long-delegated-late-answers` `-lr` seed 1793 and `long-delegated-backup` `-lr` seed 1938.
+`long-delegated`: acks by rule `{"archive_waits": 116,724, "singleton": 63,972}` over the sweep.
+
+**Fail-before.** The core's `status` view test `a_local_execution_is_sequenced_and_counted_by_class` expects the four counters by name; on main it fails
+(`["archive", "root-group", "deleg-group", "non-stealable", "lone"]`).
+
+**Gates** (box 1): fmt `--check` and clippy `--workspace --all-targets -D warnings` clean; lib tests meta 406, authority 1,060, engine 952, control 146 (the schema test after the
+bless); release sim suite 421 passed, 0 failed, 12 ignored. No perf gate: names and counters only. No hot-path change: the FUSE fast path (engine) is untouched, the core's answer
+paths build a `RowCommit` (24 bytes, copied) where they built an `AckClass`, and read no store they did not.

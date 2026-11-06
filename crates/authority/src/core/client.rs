@@ -11,7 +11,7 @@
 //! never to a client.
 
 use super::backup::is_answer;
-use super::{AckClass, Core, S3For, Timer};
+use super::{ack_counter, Core, S3For, Timer};
 use crate::action::{Action, AnswerSource, ClientReply, S3Op};
 use crate::event::{PeerMsg, Policy, S3Result};
 use crate::ids::{Epoch, NodeId, Now, OpId, WaitMs};
@@ -2267,9 +2267,9 @@ impl Core {
         if !sent {
             // This node's own refusal (nothing journaled).
             // (Nothing journaled, nothing to commit: this node's own answer,
-            // as a lone node's. Not `root_ack_class`, which since the C2f
+            // as a lone node's. Not `root_commit`, which since the C2f
             // review is `Archive` for a node that holds no lease.)
-            let source = AnswerSource::Sequenced(AckClass::Lone);
+            let source = AnswerSource::Sequenced(constellation_meta::RowCommit::LONE);
             self.finish_as(now, rid, MutateOutcome::Errno(code), source, replica, out);
             return;
         }
@@ -2278,7 +2278,7 @@ impl Core {
             let (outcome, source) = Self::eio_unless_recorded(
                 outcome,
                 self.completed_source(replica, rid),
-                AnswerSource::Sequenced(AckClass::Lone),
+                AnswerSource::Sequenced(constellation_meta::RowCommit::LONE),
             );
             self.park_settled_acceptance(now, rid, &outcome, replica, out);
             self.finish_as(now, rid, outcome, source, replica, out);
@@ -2439,11 +2439,12 @@ impl Core {
                     streams: Default::default(),
                 };
                 let class = if replica.outcome_from_log(rid) {
-                    Ok(AckClass::Archive)
+                    Ok(constellation_meta::RowCommit::ARCHIVE)
                 } else {
                     self.journaled_answer_class_for(replica, rid, super::Asker::Remote)
                 };
-                let (outcome, class) = Self::eio_unless_recorded(outcome, class, AckClass::Lone);
+                let (outcome, class) =
+                    Self::eio_unless_recorded(outcome, class, constellation_meta::RowCommit::LONE);
                 if !replica.outcome_from_log(rid) {
                     let shipped = replica.journal_acked_seq().unwrap_or(0);
                     if let Some(need) =
@@ -2485,7 +2486,7 @@ impl Core {
                 let (outcome, source) = Self::eio_unless_recorded(
                     outcome,
                     self.completed_source(replica, rid),
-                    AnswerSource::Sequenced(AckClass::Lone),
+                    AnswerSource::Sequenced(constellation_meta::RowCommit::LONE),
                 );
                 if let Some(c) = self.clients.get_mut(&rid) {
                     c.answered_by = Some(source);
@@ -2517,7 +2518,7 @@ impl Core {
         let (outcome, class) = Self::eio_unless_recorded(
             outcome,
             self.executed_answer_class(replica, rid),
-            AckClass::Lone,
+            constellation_meta::RowCommit::LONE,
         );
         if let Some(c) = self.clients.get_mut(&rid) {
             c.answered_by = Some(AnswerSource::Sequenced(class));
@@ -2699,7 +2700,7 @@ impl Core {
         // answer: never the lone shortcut, `settle_refusal`.)
         let durable = if settle {
             let shipped = replica.journal_acked_seq().unwrap_or(0);
-            let class = self.root_ack_class_for(super::Asker::Remote);
+            let class = self.root_commit(super::Asker::Remote);
             self.answer_need(&position, class, super::Asker::Remote, shipped)
         } else {
             self.ack_need(&position)
@@ -3150,7 +3151,9 @@ impl Core {
                     // run again and refused): the client hears what the log
                     // carries.
                     if let Some(c) = self.clients.get_mut(&rid) {
-                        c.answered_by = Some(AnswerSource::Sequenced(AckClass::Archive));
+                        c.answered_by = Some(AnswerSource::Sequenced(
+                            constellation_meta::RowCommit::ARCHIVE,
+                        ));
                     }
                 }
                 // M13: an inbox outcome rides the log behind every row it
@@ -3161,7 +3164,9 @@ impl Core {
                 None => {
                     self.inbox_answered(now, rid);
                     if let Some(c) = self.clients.get_mut(&rid) {
-                        c.answered_by = Some(AnswerSource::Sequenced(AckClass::Archive));
+                        c.answered_by = Some(AnswerSource::Sequenced(
+                            constellation_meta::RowCommit::ARCHIVE,
+                        ));
                     }
                 }
             }
@@ -3315,7 +3320,7 @@ impl Core {
                     now,
                     rid,
                     outcome,
-                    AnswerSource::Sequenced(AckClass::Archive),
+                    AnswerSource::Sequenced(constellation_meta::RowCommit::ARCHIVE),
                     replica,
                     out,
                 );
@@ -3497,7 +3502,7 @@ impl Core {
             let (outcome, source) = Self::eio_unless_recorded(
                 outcome,
                 self.completed_source(replica, rid),
-                AnswerSource::Sequenced(AckClass::Lone),
+                AnswerSource::Sequenced(constellation_meta::RowCommit::LONE),
             );
             self.park_settled_acceptance(now, rid, &outcome, replica, out);
             self.finish_as(now, rid, outcome, source, replica, out);
@@ -3754,7 +3759,7 @@ impl Core {
             // A settle's refusal: answered once committed, as another
             // node's answer (never the lone shortcut, `Core::settle_refusal`).
             let shipped = replica.journal_acked_seq().unwrap_or(0);
-            let class = self.root_ack_class_for(super::Asker::Remote);
+            let class = self.root_commit(super::Asker::Remote);
             return self
                 .answer_need(&position, class, super::Asker::Remote, shipped)
                 .is_none()
@@ -3879,12 +3884,12 @@ impl Core {
             Some(source) => source,
             None if is_answer(outcome) => {
                 debug_assert!(false, "an outcome with no source: {outcome:?}");
-                AnswerSource::Sequenced(AckClass::Archive)
+                AnswerSource::Sequenced(constellation_meta::RowCommit::ARCHIVE)
             }
             None => AnswerSource::None,
         };
         if let (AnswerSource::Sequenced(class), true) = (source, is_answer(outcome)) {
-            self.stats.ack_classes[class.index()] += 1;
+            self.stats.ack_classes[ack_counter(class)] += 1;
         }
         source
     }
@@ -3919,7 +3924,7 @@ impl Core {
                     Some(AnswerSource::Sequenced(class)) => class,
                     other => {
                         debug_assert!(false, "a parked local answer with source {other:?}");
-                        AckClass::Archive
+                        constellation_meta::RowCommit::ARCHIVE
                     }
                 };
                 self.park_finish(now, rid, wait, durable, outcome, class);

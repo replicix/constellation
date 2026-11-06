@@ -399,7 +399,7 @@ impl Core {
             let (outcome, source) = Self::eio_unless_recorded(
                 outcome,
                 self.completed_source(replica, rid),
-                crate::action::AnswerSource::Sequenced(super::AckClass::Lone),
+                crate::action::AnswerSource::Sequenced(constellation_meta::RowCommit::LONE),
             );
             self.finish_as(now, rid, outcome, source, replica, out);
             return;

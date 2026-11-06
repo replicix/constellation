@@ -1596,7 +1596,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "takeover-loss-two-node",
-        desc: "plan 43 C2h, plan 46 M0.3 (the 2026-10-16 acknowledged-write loss): two nodes, b the root's backup and the delegate of /d1 overwriting ten files (O_TRUNC, write, fsync) round after round; b's generation acknowledges through its group (status.delegation.mine[].class deleg-group); a is frozen (SIGSTOP) across b's takeover of the root and thawed deposed; after quiescence every file is byte-exact on both nodes as its last acknowledged overwrite left it, and there is no conflict copy",
+        desc: "plan 43 C2h, plan 46 M0.3 (the 2026-10-16 acknowledged-write loss): two nodes, b the root's backup and the delegate of /d1 overwriting ten files (O_TRUNC, write, fsync) round after round; b's generation acknowledges through its group (status.delegation.mine[].class group); a is frozen (SIGSTOP) across b's takeover of the root and thawed deposed; after quiescence every file is byte-exact on both nodes as its last acknowledged overwrite left it, and there is no conflict copy",
         requires: &[],
         caps: &[],
         run: delegroot::takeover_loss_two_node,

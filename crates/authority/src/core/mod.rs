@@ -77,8 +77,8 @@ use constellation_types::Code;
 use std::collections::{BTreeMap, VecDeque};
 
 pub use backup::{
-    beat_sent_ms, liveness_fresh, AckClass, AckView, Asker, CommitRule, GroupOn, RuleStream,
-    SealRecord,
+    ack_counter, beat_sent_ms, commit_name, liveness_fresh, AckView, Asker, CommitRule, GroupOn,
+    RuleStream, SealRecord, ACK_COUNTERS,
 };
 pub use client::{ClientPhase, ABANDONED_CODE};
 pub use deleg_windows::{
@@ -1618,11 +1618,11 @@ pub struct Stats {
     pub lock_lapsed_refusals: u64,
     pub unacked_replays_refused: u64,
     /// Plan 43 C2a: definitive answers this node gave as a sequencer, by
-    /// the class they waited for (`AckClass::index`: archive, root-group,
-    /// deleg-group, non-stealable, lone) — a `MutateReply` to a requester,
+    /// the rule they waited for (`ACK_COUNTERS`: group, final, singleton,
+    /// archive_waits) — a `MutateReply` to a requester,
     /// or an outcome to this node's own client that was not another node's
     /// answer passed on.
-    pub ack_classes: [u64; 5],
+    pub ack_classes: [u64; 4],
     /// Plan 43 C1-2 (D4): gated answers released with the gate off, whose
     /// rows were re-tagged `Lone` (answered as a lone node would).
     pub acks_downgraded_lone: u64,

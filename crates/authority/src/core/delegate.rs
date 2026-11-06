@@ -54,7 +54,7 @@
 //! by an operator's `delegate` after the epoch closed.
 
 use super::backup::{FreshHold, FreshVerdict};
-use super::{AckClass, Asker, CommitRule, Core, GroupOn, Timer};
+use super::{Asker, CommitRule, Core, GroupOn, Timer};
 use crate::action::{Action, AnswerSource, ControlOk};
 use crate::event::PeerMsg;
 use crate::ids::{Epoch, HonourMs, NodeId, Now, OpId, TimerId, WaitMs};
@@ -813,7 +813,7 @@ pub struct DelegView {
     /// class)`: `until` a reading of this node's honour clock (plan 43
     /// C7-H1; the engine's `DelegView` judges it on that clock); `class`
     /// the name of the class this node's own clients' answers wait for
-    /// (plan 43 C2e: `AckClass::name`).
+    /// (plan 43 C2e: `commit_name`).
     #[allow(clippy::type_complexity)]
     pub mine: Vec<(Ino, u64, i64, bool, u64, u64, usize, String)>,
     /// `(dir, node, gen, cursor, until_ms (wall, for status), recall, ended,
@@ -960,23 +960,11 @@ impl Core {
                     // The class published at the last event
                     // ([`Self::report_deleg_durable`]), not decided again
                     // for every step's view.
-                    match self.dl.reported.get(&d.gen).map(|r| r.commit) {
-                        Some(constellation_meta::RowCommit::Singleton { .. }) => "lone",
-                        Some(constellation_meta::RowCommit::Group {
-                            on: GroupOn::Archive,
-                            ..
-                        }) => "archive",
-                        Some(constellation_meta::RowCommit::Group {
-                            on: GroupOn::Root, ..
-                        }) => "root-group",
-                        Some(constellation_meta::RowCommit::Group {
-                            on: GroupOn::Delegate,
-                            ..
-                        }) => "deleg-group",
-                        Some(constellation_meta::RowCommit::Final) => "non-stealable",
-                        None => "",
-                    }
-                    .to_string(),
+                    self.dl
+                        .reported
+                        .get(&d.gen)
+                        .map_or("", |r| super::commit_name(r.commit))
+                        .to_string(),
                 )
             })
             .collect();
@@ -2081,7 +2069,7 @@ impl Core {
         // for this node's own client — see `Core::settle_refusal`.)
         let class_asker = if settle { Asker::Remote } else { asker };
         let rule = self.deleg_rule(gen, class_asker, replica);
-        let mut class = rule.ack_class(gen);
+        let mut class: constellation_meta::RowCommit = rule.into();
         let dedup = replica.recent_outcome(rid).is_some()
             || replica.completed_outcome(rid).ok().flatten().is_some();
         if dedup {
@@ -2120,7 +2108,13 @@ impl Core {
         });
         if !dedup
             && asker == Asker::Own
-            && matches!(class, AckClass::DelegGroup { .. })
+            && matches!(
+                class,
+                constellation_meta::RowCommit::Group {
+                    on: GroupOn::Delegate,
+                    ..
+                }
+            )
             && self.deleg_lone_held_by_gate_alone(gen, replica)
         {
             self.stats.deleg_lone_held_by_gate += 1;
@@ -2237,10 +2231,13 @@ impl Core {
         // while this core waits for the writer lock, after it read the
         // journal for its decision. The row then waits for its group (below)
         // like a gated row the core decided itself.
-        if !dedup && exec_idx.is_some() && class == AckClass::Lone {
+        if !dedup && exec_idx.is_some() && class.is_singleton() {
             if let Some(row) = constellation_meta::take_last_journaled() {
                 if row.class.gated() {
-                    class = AckClass::DelegGroup { gen };
+                    class = constellation_meta::RowCommit::group(
+                        class.config_version().unwrap_or(0),
+                        GroupOn::Delegate,
+                    );
                 }
             }
         }
@@ -2347,28 +2344,6 @@ impl Core {
         }
     }
 
-    /// Plan 43 C2 (§2.1): what an answer of a row this delegate journals now
-    /// waits for, by whom it is asked. A designation's rows are
-    /// non-stealable; under `ack=s3` the archive; a lone delegate (below)
-    /// answers its own node's client from its disk (`Lone`, the one
-    /// speculation place) and every other node's forward from the group of
-    /// the generation — the root, whose append its tenure has committed is
-    /// the second copy (Q16, ADR-41); otherwise the group (a recorded backup, or the root).
-    ///
-    /// Decided at journal time and never again for that row: a delegate
-    /// that turns lone after journaling a `DelegGroup` row still waits for
-    /// that row's commit, and the row's strand behaviour follows it.
-    ///
-    /// A lone delegate's own rows are `Lone` only while its journal is
-    /// within a bounded lead of what the root holds
-    /// ([`Self::deleg_lone_lead_full`]) and no gated row of its own node's
-    /// clients is uncommitted ahead of them
-    /// ([`Self::deleg_lone_held_by_gated`]); otherwise they wait for the
-    /// root too, like every other node's.
-    pub fn deleg_ack_class(&self, gen: u64, asker: Asker, replica: &dyn Replica) -> AckClass {
-        self.deleg_rule(gen, asker, replica).ack_class(gen)
-    }
-
     /// The rule stored with a row of generation `gen` this delegate
     /// journals (or publishes for its fast path): its configuration's, in
     /// the version of the group in force. With `Config::per_row_class` (the
@@ -2399,8 +2374,7 @@ impl Core {
     }
 
     /// Plan 46 M1.1 step 2: the commit rule of this node's delegate
-    /// generation `gen`, for an answer to `asker` ([`Self::deleg_ack_class`]
-    /// is its class). Under `ack=s3`, or once the generation ended here
+    /// generation `gen`, for an answer to `asker`. Under `ack=s3`, or once the generation ended here
     /// (what is left of it is in the log), the group has no member and the
     /// archive carries it; a designation is `Final`; a lone delegate's own
     /// node's client is the singleton; otherwise the generation's group at
@@ -2453,31 +2427,34 @@ impl Core {
     /// commits only through the log, or drops the row and aborts the wait.
     fn deleg_dedup_wait(
         &self,
-        class: AckClass,
+        class: constellation_meta::RowCommit,
         gen: u64,
         rid: Rid,
         from: NodeId,
         replica: &dyn Replica,
-    ) -> (AckClass, Option<(u64, u64)>) {
-        let committed_class = |gen: u64| {
-            if self.cfg.ack_s3 {
-                AckClass::Archive
-            } else {
-                AckClass::DelegGroup { gen }
-            }
+    ) -> (constellation_meta::RowCommit, Option<(u64, u64)>) {
+        let committed_class = |row: constellation_meta::RowCommit| {
+            constellation_meta::RowCommit::group(
+                row.config_version().unwrap_or(0),
+                if self.cfg.ack_s3 {
+                    GroupOn::Archive
+                } else {
+                    GroupOn::Delegate
+                },
+            )
         };
         match replica.outcome_row(rid) {
             Some(r) if r.gen != 0 => {
-                if class == AckClass::NonStealable {
+                if class.is_final() {
                     (class, None)
                 } else if r.class.gated() || from != 0 || r.gen != gen {
-                    (committed_class(r.gen), Some((r.gen, r.idx)))
+                    (committed_class(r.class), Some((r.gen, r.idx)))
                 } else {
-                    (AckClass::Lone, None)
+                    (r.class.as_singleton(0), None)
                 }
             }
-            _ if class == AckClass::NonStealable => (class, None),
-            _ => (AckClass::Archive, None),
+            _ if class.is_final() => (class, None),
+            _ => (class.as_archive(0), None),
         }
     }
 
