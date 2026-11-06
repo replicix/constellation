@@ -287,6 +287,23 @@ impl Lease {
         }
     }
 
+    /// Plan 46 M1.1 step 5 (C8 condition 4): the lease of a partition whose
+    /// holder is another node, with `node` recorded as retired and nothing
+    /// else changed (the tenure goes on: no epoch bump, no expiry). `node`
+    /// is a retired claimant that held nothing then: `classify` refuses its
+    /// claim all the same, though it has not yet seen its registry
+    /// tombstone.
+    pub fn with_retired(&self, node: u64) -> Self {
+        let mut retired = self.retired.clone();
+        retired.push(node);
+        retired.sort_unstable();
+        retired.dedup();
+        Self {
+            retired,
+            ..self.clone()
+        }
+    }
+
     /// Plan 30 §M9: this lease with a new backup set and acknowledgement
     /// policy, `config_version` bumped. Everything else is copied: a
     /// reconfiguration moves neither the holder nor the expiry.
@@ -589,8 +606,9 @@ impl LeaseStore {
 /// released, not expired). Used by admin `leave --node-id` to refuse
 /// retiring a node that still appears to own write authority.
 /// Plan 30 §M10: fence every lease that names `node` (admin `leave
-/// --node-id`): CAS it to [`Lease::fenced_for_retirement`]. Returns the
-/// partitions fenced. A lost race re-reads and retries; a released lease
+/// --node-id`): CAS it to [`Lease::fenced_for_retirement`]; every other
+/// lease records `node` as retired ([`Lease::with_retired`], plan 46 M1.1
+/// step 5, C8 condition 4). Returns the partitions written. A lost race re-reads and retries; a released lease
 /// is fenced too (its `retired` list is what stops the node re-claiming
 /// it).
 pub async fn fence_retired(
@@ -615,10 +633,18 @@ pub async fn fence_retired(
             let Some((lease, tag)) = leases.get().await? else {
                 break;
             };
-            if lease.holder != node || lease.retired.contains(&node) {
+            if lease.retired.contains(&node) {
                 break;
             }
-            let fenced = lease.fenced_for_retirement(node, now_unix_ms());
+            // The node's own tenure is fenced (and ended); on another
+            // node's lease (or a released one) it is only recorded, so
+            // the retired node cannot claim it either (a node retired
+            // while not root held nothing to fence).
+            let fenced = if lease.holder == node {
+                lease.fenced_for_retirement(node, now_unix_ms())
+            } else {
+                lease.with_retired(node)
+            };
             match leases.try_swap(&fenced, &tag).await {
                 Ok(_) => {
                     out.push(partition.clone());
@@ -790,6 +816,24 @@ mod tests {
         v.as_object_mut().unwrap().remove("ttl_ms");
         let l: Lease = serde_json::from_value(v).unwrap();
         assert_eq!(l.ttl_ms, 0);
+    }
+
+    /// C8 condition 4: a node retired while it held nothing is still
+    /// recorded in the leases of other holders, which go on unchanged.
+    #[tokio::test]
+    async fn a_retirement_is_recorded_in_a_lease_another_node_holds() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let s = LeaseStore::new(store.clone(), P, LeaseMode::Cas);
+        s.try_create(&Lease::granted(P, 7, 1, TTL)).await.unwrap();
+        let (before, _) = s.get().await.unwrap().unwrap();
+        let fenced = fence_retired(store.clone(), 3).await.unwrap();
+        assert_eq!(fenced, vec![P.to_string()]);
+        let (after, _) = s.get().await.unwrap().unwrap();
+        assert_eq!(after.retired, vec![3]);
+        assert_eq!((after.holder, after.epoch), (before.holder, before.epoch));
+        assert!(!after.is_fenced(), "the holder's tenure goes on");
+        // Idempotent.
+        assert!(fence_retired(store, 3).await.unwrap().is_empty());
     }
 
     #[tokio::test]

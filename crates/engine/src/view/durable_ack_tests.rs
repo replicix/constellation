@@ -681,6 +681,49 @@ fn a_lone_row_is_in_doubt_while_a_lapse_is_not_handed_to_the_core() {
     assert_eq!(session.stats().ungated_unexpected, 1);
 }
 
+/// Plan 46 M1.1 step 5 (C8 condition 2): with the singleton's bump landed
+/// but the archive short of the change's position, the core publishes the
+/// gate on and `lone_ok` off: a `Singleton` row the fast path journals then
+/// is not answered at once, it waits for the gate (the published watermark)
+/// like a gated row, and is answered once the core publishes the node lone.
+#[test]
+fn a_singleton_row_waits_while_a_closed_configuration_is_uncommitted() {
+    use constellation_meta::RowCommit;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let session = meta.session();
+    // Gate on below the tip, the class the lease stamps, not lone.
+    session.set_durable(true, 0, false, RowCommit::LONE, false);
+    let (fs, _dir, _core) = holder_fs(meta.clone(), true);
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let ino = meta.allocate_ino(ROOT_INO).unwrap();
+            let r = fs.mutate_op(
+                ROOT_INO,
+                constellation_meta::MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: "w".into(),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+            );
+            done.store(true, Ordering::SeqCst);
+            r
+        });
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "answered alone with the closed configuration uncommitted"
+        );
+        // The archive carries the journal: the core publishes lone again.
+        session.set_durable(false, u64::MAX, false, RowCommit::LONE, true);
+        assert_eq!(writer.join().unwrap(), Ok(()));
+    });
+}
+
 /// Plan 43 C1-2: the fast path's wait follows the class the row was
 /// journaled under, not the gate as it stands after the execution: a row
 /// journaled `Lone` (the gate was off) is answered at once, whatever the

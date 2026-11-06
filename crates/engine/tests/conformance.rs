@@ -157,7 +157,10 @@ impl Node {
             .expect("the registry's roster");
         engine
             .sync_tx()
-            .send(SyncRequest::Roster(roster))
+            .send(SyncRequest::Roster {
+                roster,
+                issued: constellation_authority::WaitMs(i64::MAX),
+            })
             .expect("the sync task runs");
     }
 

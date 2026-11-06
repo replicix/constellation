@@ -820,8 +820,8 @@ commit configurations; if step 5 needs them, `BackupTx` has to carry the predece
 
 *M1.1 step 5 landed (2026-11-06; PROGRESS, "Plan 46 M1.1 step 5"):* old-and-new commit for the lease's change and the generation's `DelegGroup` change
 (`AckState::spans`, `DelegateState::group_spans`), the singleton transition as a lease bump (`Lease::singleton`), a peer's request as a singleton-test
-event. Nothing reads the adopted-tail rows' versions as commit configurations. Open for the next round: `long-backup+commit` seed 1421 and
-`long-delegated-backup+commit` seed 634 (main clean), and the delegate-side stamping gap behind the latter.
+event. Nothing reads the adopted-tail rows' versions as commit configurations. The two seeds left open then closed in the triage and the fix round: `long-backup+commit` seed 1421 (an inbox poll was journaled while a release was in flight: product bug,
+fixed) and `long-delegated-backup+commit` seed 634 (a row-version oracle error, fixed); the delegate-side stamping gap behind the latter was the oracle's.
 
 *L2b (known gap, deferred 2026-11-04; PROGRESS, "L2b"):* **M1.2 must close L2b.** A committed delegate row that a
 delegate-turned-root re-appends in a lone tenure, ending unshipped below the next root's cut, survives only as rescue copies

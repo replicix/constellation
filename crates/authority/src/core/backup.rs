@@ -1717,13 +1717,13 @@ impl Core {
     /// node that asks this root for something is a peer, linked, whatever
     /// the roster read in hand says. Counted at once, before any later row
     /// is journaled; the lease's bump follows in the same event.
-    pub(crate) fn note_peer_request(&mut self, node: NodeId) {
+    pub(crate) fn note_peer_request(&mut self, now: Now, node: NodeId) {
         // (Only the root's: a delegate's requesters are no peer of the
         // root's configuration.)
         if self.lease.held.is_some()
             && node != self.cfg.node_id
             && node != 0
-            && self.peer_requesters.insert(node)
+            && self.peer_requesters.insert(node, now.wait).is_none()
         {
             self.refresh_backup_eligibility();
         }
@@ -2103,6 +2103,7 @@ impl Core {
                 // note): no group stands behind it now, and the answer is
                 // named for what it rests on, this disk.
                 if self.lease.held.is_some()
+                    && self.held_singleton()
                     && config_version == self.root_config_version()
                     && self.lease.backups().is_empty()
                     && self.doubted_backups().next().is_none()
@@ -2379,7 +2380,14 @@ impl Core {
         // own clients on this disk only where this node is lone or holds an
         // epoch; the gate off for any other reason (a release, a handoff) is
         // in doubt there.
-        let lone_ok = self.root_lone() || self.lease.epoch_held();
+        //
+        // Plan 46 M1.1 step 5 (C8 condition 2): a singleton's row is the
+        // lease's stamp from the bump on, but it is answered alone only when
+        // no closed configuration still owes its end (`durable_jseq`: the
+        // spans' caps): until the archive carries the journal through the
+        // bump, a Singleton row waits like a gated one.
+        let lone_ok =
+            (self.root_lone() && self.durable_jseq() == u64::MAX) || self.lease.epoch_held();
         if self.ack.reported != Some((gate, jseq, lost, class, lone_ok)) {
             self.ack.reported = Some((gate, jseq, lost, class, lone_ok));
             replica.set_durable(gate, jseq, lost, class, lone_ok);

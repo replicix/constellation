@@ -95,8 +95,15 @@ pub enum Event {
     /// succeeded (the rows through `through` are on the disk).
     DelegStreamSynced { gen: u64, through: u64, ok: bool },
     /// The membership poll read the write-eligible roster (M13's inbox
-    /// polls it; M9 picks backups from it).
-    Roster { write_eligible: Vec<NodeId> },
+    /// polls it; M9 picks backups from it). `issued`: this node's wait
+    /// clock when the read was issued (taken before it, never after): a
+    /// requester is dropped on a read only if it asked before that
+    /// (`Core::peer_requesters`), for an older read may predate the
+    /// requester's registration.
+    Roster {
+        write_eligible: Vec<NodeId>,
+        issued: WaitMs,
+    },
     /// Plan 30 §M10: the filesystem's `epoch_slack` as `meta.json` now
     /// says (the driver re-reads it with the roster).
     Slack { epoch_slack: u32 },
@@ -106,7 +113,13 @@ pub enum Event {
     /// events the driver had handed to this core when it took the snapshot
     /// (read before it, never after): the core is lone on it only if no
     /// lapse of its own was handed since (`Core::backup_could_be_had`).
-    Peers { links: Vec<PeerLink>, lapses: u64 },
+    /// `issued`: the wait clock before the snapshot was taken, as for
+    /// [`Event::Roster`].
+    Peers {
+        links: Vec<PeerLink>,
+        lapses: u64,
+        issued: WaitMs,
+    },
     /// EC2 campaign 8 A-1: this node's own S3 path, as the driver sees it
     /// (sent with every `Peers` refresh). `stalled`: no S3 request of this
     /// node has completed for the driver's stall window

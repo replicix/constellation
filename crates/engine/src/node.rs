@@ -1322,7 +1322,11 @@ impl Engine {
                 }
             });
         }
-        let _ = sync_tx.send(crate::sync::SyncRequest::Roster(initial_roster));
+        // (Read before the core ran: no requester can predate it.)
+        let _ = sync_tx.send(crate::sync::SyncRequest::Roster {
+            roster: initial_roster,
+            issued: constellation_authority::WaitMs(i64::MIN),
+        });
         if !read_only_member {
             phase(&on_phase, "adopting the root directory owner");
             rt.block_on(adopt_root(&host, &meta, &sync_tx, &forward, node_id))
@@ -1432,10 +1436,15 @@ impl Engine {
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         background.wait_active().await;
+                        let issued =
+                            constellation_authority::WaitMs(crate::authority_driver::wait_now_ms());
                         let scan =
                             crate::p2p::refresh_peers(&peers, store_inner.clone(), Some(&epochs))
                                 .await;
-                        let _ = sync_tx.send(crate::sync::SyncRequest::Roster(epochs.roster()));
+                        let _ = sync_tx.send(crate::sync::SyncRequest::Roster {
+                            roster: epochs.roster(),
+                            issued,
+                        });
                         peers.probe_all().await;
                         tick += 1;
                         if tick.is_multiple_of(SLACK_REREAD_TICKS) {
@@ -1506,13 +1515,16 @@ impl Engine {
                     if tick.is_multiple_of(SLACK_REREAD_TICKS) {
                         reread_slack(&store_inner, &sync_tx_roster).await;
                     }
+                    let issued =
+                        constellation_authority::WaitMs(crate::authority_driver::wait_now_ms());
                     if let Some(roster) =
                         crate::epoch::refresh_roster(&epochs, store_inner.clone()).await
                     {
                         // A requester this holder has not polled yet (a
                         // node that mounted after our last read): the core
                         // polls it at once (plan 30 M13 round 2).
-                        let _ = sync_tx_roster.send(crate::sync::SyncRequest::Roster(roster));
+                        let _ = sync_tx_roster
+                            .send(crate::sync::SyncRequest::Roster { roster, issued });
                     }
                     match constellation_store_s3::get_node(store_inner.clone(), node_id).await {
                         Ok(None) => {

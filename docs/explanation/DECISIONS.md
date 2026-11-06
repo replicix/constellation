@@ -1888,22 +1888,30 @@ configuration never caps. For a delegate generation the same holds for the
 v1 is committed by v1's members, or the log, after v2 is applied (the root, for
 a group with no backup). The singleton transition is the event-time test
 (`backup_could_be_had`, which now counts a node that has sent the root a
-request: a forward, a settle, an inbox batch, until the directory lists it) acting through the lease: when it
+request: a forward, a settle, an inbox batch, until a roster read or a directory snapshot issued after the request says otherwise) acting through the lease: when it
 flips against the lease's flag the root issues a reconfiguration CAS of the
 same backup set that moves the flag (`singleton_maintain`, in the event that
 flipped it); the answer-alone rule needs the lease to say singleton, the test
 to say singleton, and every closed configuration covered. Nothing is answered
 alone from the trigger until the bump lands and the archive carries the
-journal through it (the C8 model's conditions 1 to 3: peer to singleton waits
-for the archive, singleton to peer from the event); the claim CAS of a tenure
+journal through it, on every path: the core's answers and the FUSE fast path's
+alike (the published `lone_ok` is off while a closed configuration is
+uncommitted, so a `Singleton` row journaled there waits like a gated one) (the
+C8 model's conditions 1 to 3: peer to singleton waits for the archive,
+singleton to peer from the event); the claim CAS of a tenure
 stamps the flag from the claimant's test at that moment. The per-event flips
 are gone: a gated row is no longer re-tagged `Lone` when the gate goes off (it
 is answered by its own rule once the change that replaced it is covered), and
 a row journaled under the singleton's configuration is stamped `Singleton`
 from the moment the lease says so though its answer waits for the closed
-configuration. A claimant is in the roster: a retired node is fenced by its
-lease (`Lease::fenced_for_retirement`, refused by `classify`), and the roster
-is the registry; the remaining loss is Q6's accepted window (a singleton's own
+configuration. A claimant is in the roster (C8 condition 4): the admin leave
+records the retirement in every lease, fencing the one the node held
+(`Lease::fenced_for_retirement`) and marking the others
+(`Lease::with_retired`), and `classify` refuses a claim by a node a lease
+lists as retired, so a node retired while it was not root cannot claim either
+(a lease object created after the leave is not covered: partitions' leases
+exist from the filesystem's creation, and the node's own registry poll stops
+it within seconds); the remaining loss is Q6's accepted window (a singleton's own
 clients' rows journaled while its view had no peer, exported on return).
 Rows a takeover re-journals carry the successor's version and are not read as
 commit configurations by any of this (only the lease and the `DelegGroup`

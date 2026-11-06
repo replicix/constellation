@@ -1927,6 +1927,7 @@ impl Driver {
                     if tx
                         .send(Event::Roster {
                             write_eligible: nodes.clone(),
+                            issued: clock.now().wait,
                         })
                         .is_err()
                     {
@@ -1936,6 +1937,7 @@ impl Driver {
                     // it is taken is then not counted as seen by it.
                     let lapses = shared.lapses_handed.load(Ordering::SeqCst);
                     let now = clock.now();
+                    let issued = now.wait;
                     // With P2P off the directory is empty (`Peers::disabled`).
                     let links: Vec<PeerLink> = nodes
                         .into_iter()
@@ -1964,7 +1966,14 @@ impl Driver {
                             .filter_map(|l| l.since.map(|s| (l.node, s.0)))
                             .collect(),
                     );
-                    if tx.send(Event::Peers { links, lapses }).is_err() {
+                    if tx
+                        .send(Event::Peers {
+                            links,
+                            lapses,
+                            issued,
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -3842,6 +3851,7 @@ impl Driver {
                 Action::RefreshRoster => {
                     let _ = self.tx.send(Event::Roster {
                         write_eligible: self.bus.nodes(),
+                        issued: self.clock.now().wait,
                     });
                 }
                 Action::Announce {

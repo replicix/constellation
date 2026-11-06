@@ -114,7 +114,7 @@ impl Core {
         replica.forget_acked_through(rid.node, rid.incarnation, acked_through);
         self.note_foreign(now, replica, out);
         // C8 condition 3: a request from a peer is a singleton-test event.
-        self.note_peer_request(from);
+        self.note_peer_request(now, from);
         if from != self.cfg.node_id {
             self.note_demand(now, from, true);
         }

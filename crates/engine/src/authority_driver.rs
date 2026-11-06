@@ -3359,8 +3359,9 @@ impl Driver {
         match req {
             SyncRequest::Nudge => control(Control::Nudge, ControlReply::None),
             SyncRequest::Journaled => control(Control::Journaled, ControlReply::None),
-            SyncRequest::Roster(roster) => Some(Internal::Event(Event::Roster {
+            SyncRequest::Roster { roster, issued } => Some(Internal::Event(Event::Roster {
                 write_eligible: roster,
+                issued,
             })),
             SyncRequest::EpochChanged => {
                 self.report_epoch(false);
@@ -4674,11 +4675,12 @@ impl Driver {
                 Action::RefreshRoster => {
                     let store = self.deps.store_inner.clone();
                     let sync_tx = self.sync_tx.clone();
+                    let issued = WaitMs(wait_now_ms());
                     tokio::spawn(async move {
                         if let Ok(roster) =
                             constellation_store_s3::write_eligible_roster(store).await
                         {
-                            let _ = sync_tx.send(SyncRequest::Roster(roster));
+                            let _ = sync_tx.send(SyncRequest::Roster { roster, issued });
                         }
                     });
                 }
@@ -6777,11 +6779,13 @@ async fn peer_links_task(
         // after): the core is lone on this one only if it was taken after
         // its last lapse was handed.
         let handed = lapses.handed();
+        let issued = WaitMs(wait_now_ms());
         let links = peer_links(&peers, &mut since);
         if tx
             .send(Internal::Event(Event::Peers {
                 links,
                 lapses: handed,
+                issued,
             }))
             .is_err()
         {

@@ -122,8 +122,12 @@ pub enum SyncRequest {
     /// Run a sync round soon; the sender does not wait.
     Nudge,
     /// The write-eligible roster from the registry poll (M13: who the
-    /// holder polls).
-    Roster(Vec<u64>),
+    /// holder polls). `issued`: this node's wait clock before the read
+    /// began (`Event::Roster::issued`).
+    Roster {
+        roster: Vec<u64>,
+        issued: constellation_authority::WaitMs,
+    },
     /// The continuation-epoch machine changed state (the driver
     /// re-reports it to the core).
     EpochChanged,

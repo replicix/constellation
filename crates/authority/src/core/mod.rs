@@ -2120,7 +2120,11 @@ pub struct Core {
     /// counted as the peer's link until the next `Peers` snapshot lists it
     /// (or a `Roster` read does not) - the root bumps its configuration
     /// before it journals a peer's op, not at the roster read.
-    peer_requesters: std::collections::BTreeSet<NodeId>,
+    ///
+    /// Each is kept with the wait clock of its latest request: a `Roster` or
+    /// `Peers` read drops it only if the read was issued after that, for an
+    /// older read may predate the requester's registration and lack it.
+    peer_requesters: BTreeMap<NodeId, WaitMs>,
     links: BTreeMap<NodeId, PeerLink>,
     /// I1 class 2: `Event::OwnLag` events this core has handled, and the
     /// highest count of them the driver had handed when it took the
@@ -2530,7 +2534,10 @@ impl Core {
                 self.on_conflict_copy_done(now, queue_seq, ok, replica, &mut out)
             }
             Event::RebuildDone { op, ok } => self.on_rebuild_done(now, op, ok, replica, &mut out),
-            Event::Roster { write_eligible } => {
+            Event::Roster {
+                write_eligible,
+                issued,
+            } => {
                 if write_eligible.iter().any(|n| *n != self.cfg.node_id) {
                     self.note_foreign(now, replica, &mut out);
                 }
@@ -2538,7 +2545,8 @@ impl Core {
                 // The roster read is the authority on who is a peer: a
                 // requester it does not list is none.
                 let roster = &self.roster;
-                self.peer_requesters.retain(|n| roster.contains(n));
+                self.peer_requesters
+                    .retain(|n, at| roster.contains(n) || issued <= *at);
                 self.refresh_backup_eligibility();
                 // A holder polls a requester it has just learned of at
                 // once (M13 round 2), not at its next round's end.
@@ -2546,7 +2554,11 @@ impl Core {
                     self.inbox_holder_tick(now, replica, &mut out);
                 }
             }
-            Event::Peers { links, lapses } => {
+            Event::Peers {
+                links,
+                lapses,
+                issued,
+            } => {
                 tracing::trace!(
                     node = self.cfg.node_id,
                     links = ?links.iter().map(|l| (l.node, l.connected)).collect::<Vec<_>>(),
@@ -2564,7 +2576,8 @@ impl Core {
                 // The directory now shows every requester it knows: the
                 // links are the truth from here on.
                 let links = &self.links;
-                self.peer_requesters.retain(|n| !links.contains_key(n));
+                self.peer_requesters
+                    .retain(|n, at| !links.contains_key(n) || issued <= *at);
                 self.peers_seen = true;
                 self.peers_lapses = self.peers_lapses.max(lapses);
                 self.refresh_backup_eligibility();
