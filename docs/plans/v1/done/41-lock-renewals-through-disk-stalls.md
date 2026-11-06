@@ -1328,7 +1328,7 @@ section 9 acceptance"):* [item 1](../../../../bench/lock-lane/RESULTS.md#item-1-
 [item 4](../../../../bench/lock-lane/RESULTS.md#item-4-not-run) (no scenario; L6 is plan 46's, D-8) and the
 [real-device reproduction](../../../../bench/lock-lane/RESULTS.md#real-device-reproduction-lock-device-stall-lone-node-10-runs-per-file-system)
 (PROGRESS, "Plan 41 acceptance runs"). The L8 and exit boxes stay unticked
-until the maintainer accepts them against these tables.
+until the maintainer accepts them against these tables (accepted 2026-11-06, with the caveats in §12 and the `long_locks` timeout as a follow-up).
 
 *Items 6 and 7 after the lane's fixes (2026-11-05;
 [RESULTS](../../../../bench/lock-lane/RESULTS.md#plan-41-item-7-the-lanes-fixes-before-and-after-2026-11-05),
