@@ -3010,9 +3010,16 @@ impl Driver {
             // (A delegation-group judgement is a transaction of origin
             // `(gen, idx)` with `gen` not 0.)
             let delegated = j.tx.as_ref().is_some_and(|t| t.origin.0 != 0);
-            if let Some(why) =
-                super::oracle::check_claim(claimed, committed, j.class, &rows, delegated)
-            {
+            // A refusal no journal carries claims nothing to compare.
+            let unjournaled_refusal = j.tx.is_none() && kind.is_refusal();
+            if let Some(why) = super::oracle::check_claim(
+                claimed,
+                committed,
+                j.class,
+                &rows,
+                delegated,
+                unjournaled_refusal,
+            ) {
                 let text = format!(
                     "class claim: node {} answered rid {rid:?} ({}) at t={at_ms} ms: {why} \
                      (journal rows {rows:?}, judged: {})",

@@ -713,7 +713,7 @@ pub struct SimConfig {
     pub strict_commit: bool,
     /// Plan 46 M1.1 step 7: a delegated configuration runs `strict_commit`
     /// by default ([`SimConfig::is_delegated`]); this is the documented
-    /// exception ([`SimConfig::strict_commit_exemption`] adds the lock lane's). The reason names the plan item that closes the
+    /// exception ([`SimConfig::strict_commit_exemption`]). The reason names the plan item that closes the
     /// configuration's I1 (the release suite stays at 0 failed while it
     /// stands); the exception is removed with that item. A sweep's
     /// `+commit` still makes the configuration strict.
@@ -997,15 +997,9 @@ impl SimConfig {
     }
 
     /// The documented reason this configuration does not run `strict_commit`
-    /// by default, or `None`: its own exception, or the lock lane's.
+    /// by default, or `None`.
     pub fn strict_commit_exemption(&self) -> Option<&'static str> {
         self.strict_commit_exempt
-            .or((self.lock_files > 0).then_some(
-                "plan 46 M3.1 (C4, the lock lane on the new records): a lapsed lock grant's \
-             `LockLapsed` refusal journals nothing and is claimed archive-bound, and a write \
-             answered after its grant lapsed meets the archive's `ENOLCK` refusal \
-             (found by the step 7 default; identical on main under `+commit`)",
-            ))
     }
 }
 

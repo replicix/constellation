@@ -67658,3 +67658,31 @@ The wait percentiles are unchanged; the counts above 200 ms / 1 s differ by abou
 **Gates** (box 1): fmt `--check`, clippy `--workspace --all-targets -D warnings` clean; lib tests authority 1,062, engine 952, meta 407, net 128; release sim suite 422 passed, 0 failed, 13 ignored.
 The negative control `the_lone_lead_oracle_catches_a_disabled_lead_and_a_disabled_hysteresis` moved a seed (64 no longer trips the hysteresis control; 88 does, as 118 still does); the control goes with M1.2 step 13.
 No perf gate: off the steady path (an ask is made only while an answer waits on the root's commit).
+
+
+### Plan 46 M1.1 step 7 follow-up: the lock lane's and the designation's I1 triage (2026-11-06)
+
+Step 7 exempted every delegated lock-lane configuration (`lock_files > 0`) and `delegated-designated` from the `strict_commit` default. Triaged
+×2,000 under `+commit` (33 delegated lock configurations and `delegated-designated`, now a sweep name), on this branch and on main (identical
+counts, main one fewer per configuration: the sweep's own summary line). Five mechanisms:
+
+| | Mechanism | Class | Seeds (before → after) |
+|---|---|---|---|
+| A | The root's own op refused for a lapsed grant was answered at once (`execute_local_outcome`'s `return MutateOutcome::LockLapsed`, since plan 30 §M14 phase 2), its journaled refusal uncommitted: a claim of `archive_waits` judged singleton, or I1 under a listed backup or a peer in budget | product, fixed: the refusal's answer waits for its row's commit like every refusal's (`ack_need`) | 25–80 per configuration → 0 |
+| C | A lone root's `EROFS`/`EXDEV` under an unreachable designation journals nothing (`RecallPlan::Refuse`); its nominal claim was compared with a vacuous singleton judgement (not a frozen epoch, as step 7 had it) | oracle, fixed: `check_claim` skips a refusal no journal carries, as I1 does | `delegated-designated` 1,586 → 1 |
+| B | `DelegateWriteHold`: the sim commits a held delegate write at the node's next store write but answers it at the hold's end; meanwhile the generation ends and the row is stranded and refused on replay (`ENOLCK`) | sim artefact, not fixed (answering at the commit shortens the critical sections and multiplies `locks-delegate-ahead`'s known stale reads, rows 9/30, 69 → 555) | writer-hold family 36–123 per configuration |
+| D | A lone new root's own lock write, drained from its inbox in its takeover gate (`LockLapsed`, journaled `EIO`), is answered at the open as `archive_waits` from a `Singleton` row of its unshipped journal | product, claim only (the answer is the singleton's); path not pinned | 2 per partitioned configuration |
+| E | `locks-unlinked-delegated-blips` 351: a delegate's row the root appended inside a multi-member continuation epoch's hold is counted committed | known, M1.4 | 1 |
+
+`delegated-designated` 136 (a forward refused `EXDEV` at once while an inbox drain journaled the same refusal, unshipped) is on main too.
+
+**Exemption, narrowed.** `SimConfig::strict_commit_exemption` is the configuration's own `strict_commit_exempt` only (the lock lane's blanket
+exception is gone): the writer-hold family (B: `locks-writer-hold-delegated`, `-unsettled`, `-doubt`, `-group`, `-backup`, `locks-delegate-ahead`,
+`locks-executor-behind`, `-late`), the partitioned ones (D: `locks-unlinked-delegated-partition`, `locks-delegated-partition`, `-skew`,
+`locks-unlinked-delegated-random`), `locks-unlinked-delegated-blips` (E, M1.4) and `delegated-designated` (seed 136). Every other delegated lock
+configuration is strict by default (`strict_commit_is_the_default_of_a_delegated_configuration` pins both lists). Not I1, the same before and
+after: `locks-delegated-production-ttl(-heavy)` one lock overlap each, stale reads in `-partition-skew` (16), `-stall-step-delegated-ahead` (1),
+`-unlinked-delegated-random` (1).
+
+**Tests.** Core `the_holders_own_lapsed_refusal_waits_for_its_commit` (fails before: answered in the same step); oracle unit
+`an_unjournaled_refusals_claim_is_not_judged`.

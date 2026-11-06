@@ -5607,6 +5607,7 @@ fn sweep_config() {
     let label = std::env::var("AUTHORITY_SIM_CONFIG").unwrap_or("delegated-holder-cut".into());
     let base_config = |label: &str| match label {
         "delegated-holder-cut" => delegated_holder_cut_config(),
+        "delegated-designated" => delegated_designated_config(),
         "long-delegated" => long_delegated_config(),
         "long-delegated-lead" => long_delegated_lead_config(),
         "long-delegated-lead-off" => long_delegated_lead_off_config(),
@@ -7034,7 +7035,9 @@ fn delegated_designated_config() -> SimConfig {
             },
         }],
         strict_commit_exempt: Some(
-            "plan 46 M1.4 (the hold as a group): a frozen epoch's EROFS refusal is claimed archive-bound and judged singleton",
+            "plan 46 M1.1 follow-up (lki1, unscheduled): a forward refused `EXDEV` under an \
+             unreachable designation journals nothing and is answered at once, while an inbox \
+             drain of the same rid journaled the same refusal, unshipped (seed 136 of 2,000)",
         ),
         ..delegated_config()
     }
@@ -10875,9 +10878,18 @@ fn locks_writer_hold_delegated_config() -> SimConfig {
         ops_per_client: 10,
         lock_ios: (2, 8),
         faults: vec![hold(400), hold(8_000), hold(16_000)],
+        strict_commit_exempt: Some(HELD_WRITE_ANSWERED_LATE),
         ..with_lock_writes(delegated_config(), "d2")
     }
 }
+
+/// The documented `strict_commit` exception of every configuration with a
+/// held delegate write (`DelegateWriteHold`), lki1 triage mechanism B.
+const HELD_WRITE_ANSWERED_LATE: &str = "plan 46 M1.1 follow-up (lki1 B, unscheduled sim fix): \
+     the sim lets a held delegate write commit at its node's next store write but answers it at \
+     the hold's end; meanwhile its generation ends and the row is stranded and refused on replay \
+     (`ENOLCK`), so the `ok` is judged against a row no store has. The engine's thread answers as \
+     its commit returns, before any such rollback";
 
 /// [`locks_writer_hold_delegated_config`] with the settle off: positions
 /// are reported while a pinned write is still committing.
@@ -14757,6 +14769,7 @@ fn locks_unlinked_random_config(backup: bool) -> SimConfig {
             base.core.clone()
         },
         random_faults: 2,
+        strict_commit_exempt: (!backup).then_some(INBOX_DRAINED_REFUSAL),
         ..base
     }
 }
@@ -14769,6 +14782,10 @@ fn locks_unlinked_blips_config() -> SimConfig {
         lock_ios: c.lock_ios,
         lock_io_ms: c.lock_io_ms,
         faults: c.faults,
+        strict_commit_exempt: Some(
+            "plan 46 M1.4 (the hold as a group): a delegate's row the root appended inside a \
+             continuation epoch's hold (S3 away) is counted committed and answered (seed 351)",
+        ),
         ..locks_unlinked_delegated_config()
     }
 }
@@ -14781,9 +14798,17 @@ fn locks_unlinked_partition_config() -> SimConfig {
         lock_ios: c.lock_ios,
         lock_io_ms: c.lock_io_ms,
         faults: c.faults,
+        strict_commit_exempt: Some(INBOX_DRAINED_REFUSAL),
         ..locks_unlinked_delegated_config()
     }
 }
+
+/// The documented `strict_commit` exception of the partitioned lock
+/// configurations (lki1 triage, mechanism D, 2 seeds of 2,000 in each).
+const INBOX_DRAINED_REFUSAL: &str = "plan 46 M1.1 follow-up (lki1 D, unscheduled): a lone new \
+     root's own lock write, queued in its inbox while cut off and drained in its takeover gate \
+     (`LockLapsed`, journaled `EIO`), is answered at the open as `archive_waits` while its row is \
+     a `Singleton` row of the unshipped journal: the answer is the singleton's, the claim is not";
 
 /// `locks-unlinked-delegated-partition` without the unlinks: the lock
 /// files stay in `d1` (node 2's), so every grant's owner is a delegate,
@@ -15769,10 +15794,31 @@ fn strict_commit_is_the_default_of_a_delegated_configuration() {
         delegated_core_stall_root_lease6_config(),
         long_delegated_lead_off_config(),
         long_delegated_hysteresis_off_config(),
-        locks_delegated_config(),
+        locks_writer_hold_delegated_config(),
+        locks_writer_hold_delegated_doubt_config(),
+        locks_writer_hold_delegated_group_config(false),
+        locks_delegate_ahead_config(),
+        locks_executor_behind_config(),
+        locks_unlinked_blips_config(),
+        locks_unlinked_partition_config(),
+        locks_delegated_partition_config(),
+        locks_unlinked_random_config(false),
+        delegated_designated_config(),
     ] {
         let why = cfg.strict_commit_exemption().expect("an exception");
         assert!(why.contains("plan 46 M"), "{why}");
+    }
+    // lki1 triage: the lock lane is strict by default but for the
+    // configurations above.
+    for cfg in [
+        locks_delegated_config(),
+        with_lock_writes(locks_delegated_config(), "d2"),
+        locks_unlinked_delegated_config(),
+        locks_unlinked_random_config(true),
+        locks_stall_step_delegated_config(),
+    ] {
+        assert!(cfg.lock_files > 0 && cfg.is_delegated());
+        assert_eq!(cfg.strict_commit_exemption(), None);
     }
 }
 

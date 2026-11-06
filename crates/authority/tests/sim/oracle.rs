@@ -969,8 +969,19 @@ pub fn check_claim(
     judged: Option<Judged>,
     rows: &[constellation_meta::RowCommit],
     delegated: bool,
+    unjournaled_refusal: bool,
 ) -> Option<String> {
     use constellation_authority::core::{commit_name, GroupOn};
+    // A refusal no journal carries (a designation's `EROFS`/`EXDEV`, a
+    // frozen epoch's `EROFS`, a fast path's `LockLapsed` at the write) is no
+    // row's answer: its claim is the nominal rule of nothing journaled
+    // (version 0, plan 46 M1.1 step 7), and `Singleton` judges it only
+    // vacuously (a lone answerer's disk "holds" a row that is not there).
+    // I1 exempts it the same way (`uncommitted`); whether it should have
+    // been journaled is I4's (`unjournaled_then_landed`).
+    if unjournaled_refusal {
+        return None;
+    }
     let gated = match (claim, committed) {
         (Some(c), _) => c.gated(),
         (None, Some(c)) => c,
@@ -3166,6 +3177,20 @@ mod tests {
             "{:?}",
             f.unjournaled_landed
         );
+    }
+
+    /// lki1 triage (`delegated-designated+commit` seed 69000): a lone root's
+    /// `EROFS` under an unreachable designation journals nothing; its claim
+    /// (the nominal rule of nothing journaled) is not compared with the
+    /// vacuous `Singleton` judgement. A journaled refusal still is.
+    #[test]
+    fn an_unjournaled_refusals_claim_is_not_judged() {
+        let archive = Some(RowCommit::ARCHIVE);
+        let lone = Some(Judged::Singleton);
+        assert!(check_claim(archive, None, lone, &[], false, false).is_some());
+        assert_eq!(check_claim(archive, None, lone, &[], false, true), None);
+        let rows = [RowCommit::ARCHIVE];
+        assert!(check_claim(archive, None, lone, &rows, false, false).is_some());
     }
 
     #[test]
