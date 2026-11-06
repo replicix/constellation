@@ -68056,3 +68056,15 @@ and the owner does not resend; the hold's rule needs a resend or the deadline.
 
 **Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta, net, control (schema), authority lib 1,076, engine lib
 952, release sim suite 419 passed, 0 failed, 12 ignored. No perf gate (wire only).
+
+### Plan 46 M1.3 step 1: the logind lifecycle source and the platform triggers
+
+`platform::linux_logind::LogindLifecycle` (Linux only): takes a logind `sleep:shutdown` delay inhibitor, turns `PrepareForSleep(true)` /
+`PrepareForShutdown(true)` into `LifecycleEvent::Suspending { deadline = now + InhibitDelayMaxUSec }`, runs the caller's handler on a blocking
+thread, and closes the inhibitor when it returns; `PrepareForSleep(false)` delivers `Resumed` and retakes the inhibitor. No system bus or no
+logind: `system()` returns `None` with one log line. `FakeLogind` serves the same `Manager` interface on a unix socket (`Endpoint::Peer`) for
+the tests and the harness (`sticky-suspend-inhibitor`), and reports whether each inhibitor is still held. zbus is pinned `=5.12.0`
+(`default-features = false`, features `tokio`, `p2p`), with `zbus_macros` held at 5.12.0 in the lockfile (5.12.0 does not build against the
+5.19 macros cargo picks by default). `packaging/` ships the logind drop-in (`InhibitDelayMaxSec=30`, justified in the file) and the NetworkManager
+`pre-down` script calling `constellation release --wait`, which does not exist until step 6 (the script no-ops until then). Not yet wired into
+`HostServices::native` (the engine's handler is step 6). Four platform tests; non-Linux builds unchanged.

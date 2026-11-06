@@ -1,0 +1,19 @@
+#!/bin/sh
+# Installed to /etc/NetworkManager/dispatcher.d/pre-down.d/50-constellation-release
+# (mode 0755, owned by root). NetworkManager runs it before an interface is
+# taken down on a planned shutdown of the link; the node hands back its
+# sticky grants while the object store is still reachable (plan 46 5.4).
+#
+# Requires the `constellation release <fs> [--wait]` command (plan 46 M1.3
+# step 6); until it exists the call fails and is ignored, which is the safe
+# direction. NetworkManager passes the interface in $1 and the action in $2.
+# Never block the link going down for long and never fail it: the dispatcher
+# gives pre-down scripts a bounded time, and a failure here only means the
+# grants stay held (a lost-holder case on return, no rollback).
+[ "$2" = "pre-down" ] || exit 0
+command -v constellation >/dev/null 2>&1 || exit 0
+# Called without a file system, `release` is expected to act on every mount
+# of the invoking user's nodes (step 6 defines it; until then this no-ops).
+# Bound the wait below the dispatcher's own timeout.
+timeout 20 constellation release --wait >/dev/null 2>&1
+exit 0

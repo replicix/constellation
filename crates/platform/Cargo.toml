@@ -16,5 +16,16 @@ zeroize = "1.9.0"
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# The Linux logind lifecycle source (plan 46 M1.3): a D-Bus client, pure
+# Rust, on the tokio the workspace already uses. Pinned exactly; the
+# features are the tokio runtime (no async-io threads) and p2p (the fake
+# logind and test buses speak without a broker); nothing else is
+# default. Other targets do not build it.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "=5.12.0", default-features = false, features = ["tokio", "p2p"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net"] }
+futures-util = { version = "0.3", default-features = false }
+tracing.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
