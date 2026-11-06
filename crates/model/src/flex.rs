@@ -1,3 +1,5 @@
+    Checking constellation-model v1.0.0 (/home/fedora/m10c10/crates/model)
+    Finished `release` profile [optimized] target(s) in 1.04s
 //! Plan 30 §M10: continuation epochs with flexible quorums — the
 //! `FlexEpochs` variant.
 //!
@@ -59,6 +61,17 @@
 //!   formation-time version) without a promise check, ships its journal
 //!   and becomes an ordinary S3 holder. Members learn the close and only
 //!   then resume promises.
+//! - **The hold as a group** (plan 46 §5.7, M1.0 chunk C10;
+//!   `check_hold_answers`, knob `hold_answers_uncommitted`). The hold's
+//!   configuration is {owner, one member}. The owner executes an op into
+//!   its journal at once but answers it only when a member holds the row:
+//!   the member copies the owner's stream-ahead ([`Action::StreamAhead`],
+//!   persisted) and the owner receives the `StreamAheadAck`
+//!   ([`Action::AnswerHold`]). A one-member epoch's hold is `Final` (the
+//!   owner's disk; nobody else is in the epoch). `Close` flushes the
+//!   journal into the log, where the archive's rule answers it. Today's
+//!   behaviour (the knob) answers on the owner's disk in any epoch
+//!   (`NonStealable` to its members).
 //! - **Everything else is today's.** Renewal by CAS; a takeover ships its
 //!   epoch marker and tails to head; a holder that tails a higher marker
 //!   is deposed; a member of an open epoch does no S3 acquisition of any
@@ -114,6 +127,12 @@
 //!   holder journals it), so the history is totally ordered in real time
 //!   and is linearizable iff replaying it through
 //!   [`crate::namespace::NamespaceSpec`] reproduces every return.
+//! - `hold_answer_committed_or_final` (plan 46 C10, opt-in): a row the hold
+//!   answered while its epoch is open is held by a member other than the
+//!   owner, or the epoch has one member. (Definitional at the answer, like
+//!   `ack_implies_committed_by_config`: the model's owner keeps its disk
+//!   across a crash, so the loss the rule prevents, the owner's death with
+//!   the epoch journal, is the sim's `epoch-member-dies-with-chunk`.)
 //! - `converged_at_quiescence` (always): once no epoch is open, every
 //!   acknowledged operation is in the log (an epoch whose close finds the
 //!   register moved has lost its journal to a conflict).
@@ -264,6 +283,16 @@ pub struct FlexEpochs {
     /// failed property (`HasDiscoveries::AnyFailures`) still ends on the
     /// property a test is about.
     pub check_hold_owner: bool,
+    /// Plan 46 M1.0 C10 (§5.7): check `hold_answer_committed_or_final`.
+    /// Off by default for the same reason as `check_hold_owner`; off, the
+    /// hold answers on the owner's disk as before (no `StreamAhead`
+    /// interleavings, so the older runs' state counts are unchanged).
+    pub check_hold_answers: bool,
+    /// Plan 46 M1.0 C10 knob: the hold answers a row before one member has
+    /// it (today's `NonStealable` answer to members); the design waits for
+    /// a [`Action::StreamAhead`] and answers only then, except in a
+    /// one-member epoch, whose hold is `Final`.
+    pub hold_answers_uncommitted: bool,
     // ---- plan 43 C7b ----
     /// What a promise says and how a taker counts it ([`PromiseRule`]).
     pub promise_rule: PromiseRule,
@@ -308,6 +337,8 @@ impl FlexEpochs {
             claim_rule: true,
             resolve_by_epoch: true,
             check_hold_owner: false,
+            check_hold_answers: false,
+            hold_answers_uncommitted: false,
             promise_rule: PromiseRule::Expiry,
             lease_claim: crate::clk::ClaimRule::Wall,
         }
@@ -325,6 +356,13 @@ impl FlexEpochs {
     /// before the leases an epoch wants to carry do).
     pub fn ttl_rule_holds(&self) -> bool {
         self.promise_ttl * 4 <= self.lease_ttl
+    }
+
+    /// Plan 46 C10: the hold's answers wait for a member. Only when the
+    /// property is checked: the earlier flex runs (which never looked at
+    /// answers) keep today's state space, and the knob is today's answer.
+    fn hold_waits(&self) -> bool {
+        self.check_hold_answers && !self.hold_answers_uncommitted
     }
 
     fn f(&self) -> u8 {
@@ -385,6 +423,10 @@ pub struct Node {
     pub known: u8,
     /// An epoch holder's journal (history indices; persisted).
     pub journal: Vec<u8>,
+    /// Plan 46 C10: a member's copy of the owner's stream-ahead (history
+    /// indices; persisted); the owner's `StreamAheadAck` source. Dropped
+    /// when the member leaves the epoch.
+    pub copy: Vec<u8>,
     /// `on_demand`: the register's expiry as this node last read it.
     pub seen: i16,
     /// Plan 43 C7b (`Observed` claims, `Anchored` promises): the register
@@ -405,15 +447,19 @@ pub struct EpochRec {
     pub closed: bool,
 }
 
-pub const SAW_MISSING_EPOCH: u8 = 1;
-pub const SAW_CHECKED_TAKEOVER: u8 = 2;
-pub const SAW_FLUSH: u8 = 4;
-pub const SAW_SEAL: u8 = 8;
-pub const SAW_FAST_S3: u8 = 16;
-pub const SAW_CONFLICT: u8 = 32;
+pub const SAW_MISSING_EPOCH: u16 = 1;
+pub const SAW_CHECKED_TAKEOVER: u16 = 2;
+pub const SAW_FLUSH: u16 = 4;
+pub const SAW_SEAL: u16 = 8;
+pub const SAW_FAST_S3: u16 = 16;
+pub const SAW_CONFLICT: u16 = 32;
 /// Plan 43 C0: an epoch's hold owner lost its epoch journal because the
 /// register moved under it (`Action::Close`'s strand branch).
-pub const SAW_HOLD_OWNER_DEPOSED: u8 = 64;
+pub const SAW_HOLD_OWNER_DEPOSED: u16 = 64;
+/// Plan 46 C10: a hold answered a row after a member's `StreamAheadAck`.
+pub const SAW_HOLD_MEMBER_ANSWER: u16 = 128;
+/// Plan 46 C10: a one-member epoch's hold answered (`Final`).
+pub const SAW_HOLD_FINAL_ANSWER: u16 = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -430,7 +476,10 @@ pub struct State {
     pub crashes: u8,
     /// Executed ops: `(op, return)`, in real-time order.
     pub history: Vec<(NsOp, NsRet)>,
-    pub saw: u8,
+    /// Plan 46 C10: bitmask of the history indices the client was answered
+    /// (executed ops are answered at once outside a hold).
+    pub answered: u16,
+    pub saw: u16,
 }
 
 impl State {
@@ -453,6 +502,39 @@ impl State {
     fn epoch_holder(&self, i: usize) -> bool {
         self.open_epoch_of(i)
             .is_some_and(|r| r.holder == i as u8 && !r.closed)
+    }
+
+    /// Plan 46 C10: the one-member epoch of node `i`'s hold is `Final`.
+    fn hold_final(&self, i: usize) -> bool {
+        self.open_epoch_of(i)
+            .is_some_and(|r| r.members.count_ones() == 1)
+    }
+
+    /// Plan 46 C10: rows of the hold owner `i`'s journal a member holds.
+    fn member_held(&self, i: usize) -> u16 {
+        let Some(idx) = self.nodes[i].epoch else {
+            return 0;
+        };
+        let mask = self.epochs[idx as usize].members;
+        let mut held = 0u16;
+        for j in 0..self.nodes.len() {
+            if j != i && mask & (1 << j) != 0 && self.nodes[j].epoch == Some(idx) {
+                for k in &self.nodes[j].copy {
+                    held |= 1 << k;
+                }
+            }
+        }
+        held
+    }
+
+    /// Plan 46 C10: some journal row of owner `i` is unanswered and held
+    /// by a member.
+    fn hold_answerable(&self, i: usize) -> bool {
+        let held = self.member_held(i);
+        self.nodes[i]
+            .journal
+            .iter()
+            .any(|k| held & (1 << k) != 0 && self.answered & (1 << k) == 0)
     }
 
     fn s3_usable(&self, m: &FlexEpochs, i: usize) -> Option<LeaseView> {
@@ -673,6 +755,12 @@ pub enum Action {
     Learn(u8),
     /// Execute the next op at this authority.
     Op(u8),
+    /// Plan 46 C10: this member copies the hold owner's stream-ahead (its
+    /// journal) and persists it (`StreamAheadAck`'s subject).
+    StreamAhead(u8),
+    /// Plan 46 C10: this epoch owner receives a member's `StreamAheadAck`
+    /// and answers every row of its journal that a member holds.
+    AnswerHold(u8),
     /// `on_demand`: read the register (its expiry).
     Observe(u8),
     /// Plan 43 C7b: read the register; the first read showing its current
@@ -747,6 +835,7 @@ impl Model for FlexEpochs {
                     sealed: 0,
                     known: 1,
                     journal: Vec::new(),
+                    copy: Vec::new(),
                     seen: expires,
                     obs: None,
                     pending_key: None,
@@ -763,6 +852,7 @@ impl Model for FlexEpochs {
                 epochs: Vec::new(),
                 crashes: 0,
                 history: Vec::new(),
+                answered: 0,
                 saw: 0,
             });
         }
@@ -837,6 +927,17 @@ impl Model for FlexEpochs {
                 }
                 if r.holder == iu && !r.closed {
                     actions.push(Action::Close(iu));
+                    if self.hold_waits() && s.hold_answerable(i) {
+                        actions.push(Action::AnswerHold(iu));
+                    }
+                }
+                if self.hold_waits()
+                    && r.holder != iu
+                    && !r.closed
+                    && s.nodes[r.holder as usize].alive
+                    && node.copy != s.nodes[r.holder as usize].journal
+                {
+                    actions.push(Action::StreamAhead(iu));
                 }
                 // A member does no S3 acquisition of any kind.
                 continue;
@@ -980,6 +1081,7 @@ impl Model for FlexEpochs {
                     }
                     for k in journal {
                         s.log.push(Entry::Op(k));
+                        s.answered |= 1 << k;
                     }
                     let expires = s.local(h) + self.lease_ttl;
                     s.reg.expires = expires;
@@ -1011,6 +1113,7 @@ impl Model for FlexEpochs {
             }
             Action::Learn(m) => {
                 s.nodes[m as usize].epoch = None;
+                s.nodes[m as usize].copy.clear();
             }
             Action::Op(i) => {
                 let i = i as usize;
@@ -1024,13 +1127,42 @@ impl Model for FlexEpochs {
                     let (ret, _) = namespace::eval(dir, op);
                     s.history.push((op, ret));
                     s.nodes[i].journal.push(k as u8);
+                    // Plan 46 C10: a one-member hold is `Final` (answered
+                    // from the owner's disk); otherwise the answer waits
+                    // for a member's `StreamAheadAck`, unless the knob.
+                    if s.hold_final(i) {
+                        s.answered |= 1 << k;
+                        s.saw |= SAW_HOLD_FINAL_ANSWER;
+                    } else if !self.hold_waits() {
+                        s.answered |= 1 << k;
+                    }
                 } else {
                     let dir = s.log_dir(s.log.len());
                     let (ret, _) = namespace::eval(dir, op);
                     s.history.push((op, ret));
                     s.log.push(Entry::Op(k as u8));
                     s.nodes[i].applied = s.log.len() as u8;
+                    s.answered |= 1 << k;
                 }
+            }
+            Action::StreamAhead(m) => {
+                let m = m as usize;
+                let h = s.open_epoch_of(m)?.holder as usize;
+                s.nodes[m].copy = s.nodes[h].journal.clone();
+            }
+            Action::AnswerHold(h) => {
+                let h = h as usize;
+                let held = s.member_held(h);
+                let before = s.answered;
+                for k in s.nodes[h].journal.clone() {
+                    if held & (1 << k) != 0 {
+                        s.answered |= 1 << k;
+                    }
+                }
+                if s.answered == before {
+                    return None;
+                }
+                s.saw |= SAW_HOLD_MEMBER_ANSWER;
             }
             Action::Tail(i) => {
                 let i = i as usize;
@@ -1091,6 +1223,37 @@ impl Model for FlexEpochs {
                 "hold_owner_never_deposed_except_by_retire",
                 |_, s: &State| s.saw & SAW_HOLD_OWNER_DEPOSED == 0,
             ));
+        }
+        // Plan 46 M1.0 C10 (§5.7): the hold is a group {owner, one member}.
+        // A row the hold answered while its epoch is open is committed:
+        // a member (other than the owner) holds it (`StreamAheadAck`), or
+        // the epoch has one member and the hold is `Final`. (Once the
+        // epoch closes the journal is in the log, the archive's rule.)
+        if self.check_hold_answers {
+            props.push(Property::always(
+                "hold_answer_committed_or_final",
+                |_, s: &State| {
+                    (0..s.nodes.len()).all(|i| {
+                        if !s.epoch_holder(i) || s.hold_final(i) {
+                            return true;
+                        }
+                        let held = s.member_held(i);
+                        s.nodes[i]
+                            .journal
+                            .iter()
+                            .all(|k| s.answered & (1 << k) == 0 || held & (1 << k) != 0)
+                    })
+                },
+            ));
+            props.push(Property::sometimes(
+                "hold_answered_by_member",
+                |_, s: &State| s.saw & SAW_HOLD_MEMBER_ANSWER != 0,
+            ));
+            if self.min_members == 1 {
+                props.push(Property::sometimes("hold_final_answer", |_, s: &State| {
+                    s.saw & SAW_HOLD_FINAL_ANSWER != 0
+                }));
+            }
         }
         if self.min_members < self.nodes {
             props.push(Property::sometimes(

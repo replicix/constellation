@@ -67183,3 +67183,20 @@ bound is not resolvable on those ops (chmod 36 vs 40 us is one mode against the 
 (the lone root's own ops) takes none of the changed code but two short-circuited `gen != 0` tests in `finish_local`; the delegate fast path's
 added cost is one `deleg_idx` point read under the writer lock, which no topology of the harness exercises. `vfs-bench` (three runs each, A B B A
 A B): dispatch overhead 84 to 123 ns in both builds (under 1 us), allocations per op identical.
+
+### Plan 46 M1.0 chunk C10: the epoch hold as a group (2026-11-06)
+
+`crates/model/src/flex.rs` (and `tests/flex_epochs.rs`, the `lib.rs` doc): the hold's configuration is {owner, one member} (plan 46 §5.7). The
+owner executes an op into its epoch journal and answers it only once a member holds the row (`Action::StreamAhead`: the member copies and
+persists the owner's stream-ahead; `Action::AnswerHold`: the owner receives the `StreamAheadAck`); a one-member epoch's hold is `Final` (answered
+from the owner's disk); `Close` flushes the journal into the log (answered by the archive's rule). New state: `Node::copy`, `State::answered`.
+Opt-in properties (`check_hold_answers`): `hold_answer_committed_or_final` (a row answered while its epoch is open is held by a member other than
+the owner, or the epoch has one member) and the `sometimes` witnesses `hold_answered_by_member`, `hold_final_answer`; `hold_owner_never_deposed_except_by_retire`
+is kept. Knob `hold_answers_uncommitted` (today's `NonStealable` answer to members).
+
+Box 1, release, `--test flex_epochs c10`: design `N = 3, f = 1` 1,778,066 unique states (5.8 s), with drift `D = 1` and margin 3 (extreme offsets, expiry
+check, no in-flight PUTs; the same variant as `expiry_based_check_is_clean_under_drift`) 3,234,484 (9.8 s), `N = 2, f = 1` (one-member epochs, `Final`)
+52,428 (0.09 s): exhaustive, clean, every witness reached. The knob is found (4,087 unique states, a counterexample of 6 steps: a crash, a
+two-member epoch, two ops answered on the owner's disk). Existing flex tests are unchanged in outcome (the new machinery runs only when `check_hold_answers` is on, so their state counts are unchanged; 29 passed, 43 s).
+Scope: the owner keeps its disk across a crash in this model, so the property is the definitional one at the answer; the loss it guards against
+(the owner's death with the unreplicated epoch journal) is the sim's `epoch-member-dies-with-chunk` and `flex-crash` (M1.4).

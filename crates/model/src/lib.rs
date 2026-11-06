@@ -149,6 +149,12 @@
 //! `settle_unowned`, `cut_before_read_recall`, `server_replay_queue`).
 //! `tests/node_stream.rs`.
 //!
+//! Plan 46 M1.0 chunk 10 extends [`flex`] with the epoch hold as a group
+//! {owner, one member} (`StreamAheadAck`): a row is answered once a member
+//! holds it, a one-member epoch's hold is `Final`; the property is
+//! `hold_answer_committed_or_final` and the knob `hold_answers_uncommitted`
+//! (today's answer on the owner's disk to members). `tests/flex_epochs.rs`.
+//!
 //! # What is modeled
 //!
 //! - **Actors.** `N` `Node`s (2–3 across the tests) plus one implicit

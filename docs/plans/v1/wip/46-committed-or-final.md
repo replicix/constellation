@@ -563,6 +563,15 @@ hold is `Final` (non-stealable, as today; nobody else is in the epoch).
 Row 51's hold classes and row 52's variant 3 go; `hold_owner_never_deposed_except_by_retire`
 stays as the guard for the retire path.
 
+*Model (M1.0 chunk C10, 2026-11-06).* `crates/model/src/flex.rs` models the
+group: the owner executes into its journal and answers a row once a member
+holds it (`StreamAhead`, then `AnswerHold`); a one-member epoch answers
+at once (`Final`); `Close` flushes the journal into the log.
+`hold_answer_committed_or_final` and `hold_owner_never_deposed_except_by_retire`
+hold on the flex bounds (`N = 3, f = 1`, with and without drift, and
+`N = 2, f = 1` with one-member epochs); the knob `hold_answers_uncommitted`
+(today's answer to members) is found by the first. M1.4's model gate is met.
+
 ### 5.8 Stage 3: C4 as specified, then C7b-8
 
 Plan 43 §5.5 and its coder spec, unchanged in substance: `LockGrant`,

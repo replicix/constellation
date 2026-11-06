@@ -587,6 +587,91 @@ fn an_unguarded_seal_takeover_deposes_the_hold_owner() {
     }
 }
 
+// ---- plan 46 M1.0 C10: the epoch hold as a group {owner, one member} ----
+//
+// §5.7: the hold's rows are answered once one member holds them
+// (`StreamAheadAck`); a one-member epoch's hold is `Final`. Today's hold
+// answers on the owner's disk in every epoch (`NonStealable` to members).
+
+const HOLD: &str = "hold_answer_committed_or_final";
+
+fn hold_group(m: FlexEpochs) -> FlexEpochs {
+    FlexEpochs {
+        check_hold_owner: true,
+        check_hold_answers: true,
+        ..m
+    }
+}
+
+/// `N = 3`, `f = 1` (epochs of two or three members), a crash with
+/// restart: every answered hold row is held by a member; a member
+/// answered, an epoch flushed, the owner is never deposed.
+#[test]
+fn c10_design_hold_group_is_clean() {
+    assert_clean_checking(
+        "c10-hold-group",
+        &hold_group(full()),
+        &[
+            "epoch_with_missing_node",
+            "epoch_flushed",
+            "all_ops_done",
+            "hold_answered_by_member",
+        ],
+        CAP,
+        &["hold_owner_never_deposed_except_by_retire", HOLD],
+    );
+}
+
+/// The same under drift `D = 1`, margin 3.
+#[test]
+fn c10_design_hold_group_is_clean_under_drift() {
+    // The smaller promise variant (`expiry_based_check_is_clean_under_drift`):
+    // the hold's rule does not depend on how a taker counts promises.
+    let m = FlexEpochs {
+        compare_to_expiry: true,
+        read_after_expiry: false,
+        inflight_puts: false,
+        extreme_offsets: true,
+        ..drifting(hold_group(full()))
+    };
+    assert_clean_checking(
+        "c10-hold-group-drift",
+        &m,
+        &["hold_answered_by_member"],
+        CAP,
+        &["hold_owner_never_deposed_except_by_retire", HOLD],
+    );
+}
+
+/// `N = 2`, `f = 1`: an epoch may have one member, whose hold is `Final`:
+/// it answers without a member's copy and the property holds.
+#[test]
+fn c10_design_one_member_hold_is_final() {
+    assert_clean_checking(
+        "c10-one-member",
+        &hold_group(FlexEpochs::new(2, 1)),
+        &[
+            "hold_final_answer",
+            "hold_answered_by_member",
+            "epoch_with_missing_node",
+        ],
+        CAP,
+        &["hold_owner_never_deposed_except_by_retire", HOLD],
+    );
+}
+
+/// Today's behaviour: the hold answers on its owner's disk in a
+/// multi-member epoch, before a member holds the row. Found by
+/// `hold_answer_committed_or_final`, path printed.
+#[test]
+fn c10_knob_hold_answers_uncommitted_is_found() {
+    let m = FlexEpochs {
+        hold_answers_uncommitted: true,
+        ..hold_group(full())
+    };
+    assert_violates("c10-knob", &m, HOLD);
+}
+
 // ---- plan 43 C7b: promises anchored to the claimed key (Appendix B row 3) ----
 //
 // A promise's `no_epoch_until` is an instant on the promiser's wall, which a
