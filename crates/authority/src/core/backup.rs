@@ -1694,12 +1694,17 @@ impl Core {
     /// `DelegateStreamAck.committed`): [`Self::durable_jseq`], except that a
     /// lone root's journal (`u64::MAX` outside an epoch hold) commits
     /// nothing beyond the archive (`shipped_through`). An epoch hold's
-    /// journal still counts until plan 46 M1.4 step 3 counts it by the
-    /// member-acked seq.
+    /// journal counts by the member-acked seq (plan 46 M1.4 step 3): a
+    /// row is committed once a member's store holds it
+    /// ([`Self::hold_acked_through`]), as the hold's own answers are.
     pub(crate) fn config_committed_jseq(&self) -> u64 {
+        if self.hold_group() {
+            return self.hold_acked_through();
+        }
         if self.lease.epoch_held() {
-            // Still the journal's tip until step 3 counts a delegate's row
-            // by the member-acked seq.
+            // A `Final` hold (a one-member epoch, or the knob
+            // `hold_answers_uncommitted`): its journal is the answer's own
+            // commit, and there is no member to count by.
             return u64::MAX;
         }
         match self.durable_jseq() {

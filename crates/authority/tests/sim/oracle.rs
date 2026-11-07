@@ -93,9 +93,14 @@ pub struct Oracles {
     /// the configuration it was journaled in, so a `Group{Root}` row is
     /// judged by the set of its own version, whatever the lease lists now.
     pub version_backups: Arc<Mutex<BTreeMap<u64, Vec<NodeId>>>>,
-    /// Nodes whose core holds a continuation epoch right now: the core
-    /// counts their journal as a copy until plan 46 M1.4.
+    /// Nodes whose core holds a continuation epoch right now: a delegate's
+    /// row their journal holds counts once a member holds it (plan 46 M1.4).
     pub epoch_holds: Mutex<BTreeSet<NodeId>>,
+    /// Plan 46 M1.4 step 3: the highest journal seq of a continuation epoch
+    /// each node's store has held as streamed speculation, ever seen: a
+    /// member's copy that committed a delegate's row stays what committed it
+    /// after the epoch ended and the copy was retired or stranded.
+    pub streamed_seen: Mutex<BTreeMap<(NodeId, u64), u64>>,
     /// Plan 46 M1.1 step 3: the row-version oracle (see [`RowVersions`]).
     pub row_versions: Arc<Mutex<RowVersions>>,
     /// Plan 46 M0.3: the run's reachability history (see `reach.rs`), the
@@ -374,6 +379,7 @@ impl Oracles {
             epoch_backups,
             version_backups,
             epoch_holds: Mutex::new(BTreeSet::new()),
+            streamed_seen: Mutex::new(BTreeMap::new()),
             row_versions,
             acks_unsourced: AtomicU64::new(0),
         })
@@ -526,6 +532,22 @@ impl Oracles {
             .lock()
             .unwrap()
             .insert(id, (budget_ms, stable_ms));
+    }
+
+    /// `node`'s store after an event: note the tip of each continuation
+    /// epoch it holds as streamed speculation (`streamed_seen`).
+    pub fn note_streamed(&self, node: NodeId, meta: &Meta) {
+        self.note_streamed_to(node, meta, self.reach.max_epoch());
+    }
+
+    fn note_streamed_to(&self, node: NodeId, meta: &Meta, max_epoch: u64) {
+        let mut seen = self.streamed_seen.lock().unwrap();
+        for epoch in 1..=max_epoch {
+            if let Ok(Some(tip)) = Replica::streamed_tip(meta, epoch) {
+                let t = seen.entry((node, epoch)).or_insert(0);
+                *t = (*t).max(tip);
+            }
+        }
     }
 
     /// The links `id`'s directory reported up, with their `since` (wait ms).
@@ -1450,6 +1472,24 @@ fn backups_hold(
     Ok(())
 }
 
+/// A node other than the hold's owner whose store held the hold's journal
+/// (the streamed speculation of one of `epochs`) through `last` at some
+/// event (`Oracles::note_streamed`).
+fn hold_member_streamed(
+    o: &Oracles,
+    holder: Option<NodeId>,
+    epochs: &[u64],
+    last: u64,
+) -> Option<NodeId> {
+    o.streamed_seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|((n, ep), tip)| {
+            (Some(*n) != holder && epochs.contains(ep) && *tip >= last).then_some(*n)
+        })
+}
+
 /// DelegateNodeGroup: the delegate holds `(g, i)`; each recorded backup's delegate
 /// tail holds it, or, with none recorded, the root's journal does and the
 /// root's own configuration committed that copy: every backup the lease
@@ -1530,15 +1570,35 @@ fn deleg_group(
             .get(&e)
             .cloned()
             .unwrap_or(at_append);
-        // An epoch hold's journal still counts until plan 46 M1.4
-        // (`Core::config_committed_jseq`, Q6).
-        // The core counts the journal while the hold is in force when it
-        // computes the ack, so a hold that began after the append counts too.
+        // Plan 46 M1.4 step 3: an epoch hold is a group of the owner and a
+        // member, so the root's copy counts in a hold once a member's store
+        // holds the row: as streamed speculation of the hold's epoch through
+        // the row's last seq (the member-acked seq the core counts by,
+        // `Core::config_committed_jseq`), or, for the delegate that is the
+        // member, as its own journal row (the stream delivers it back and
+        // the member's store already holds it). The owner's journal alone
+        // does not count. The core counts by the acks while the hold is in
+        // force when it computes the ack, so a hold that began after the
+        // append counts too.
         let hold_now = lease.is_some_and(|l| o.epoch_holds.lock().unwrap().contains(&l.holder));
-        if held || hold_now {
+        let holder = lease.map(|l| l.holder);
+        let mut epochs = vec![e];
+        if let Some(le) = lease.map(|l| l.epoch).filter(|le| *le != e) {
+            epochs.push(le);
+        }
+        // (Streamed speculation exists only in a hold: no gate on the
+        // tenure's record, which may be noted after the hold ended.)
+        if let Some(n) = hold_member_streamed(o, holder, &epochs, ht.last) {
             return Ok(format!(
-                "no backup recorded; the root journal holds ({g},{i}) and the root \
-                 is (or was when it appended it) an epoch hold: its journal counts until M1.4"
+                "no backup recorded; the root journal holds ({g},{i}) in an epoch hold \
+                 and node {n}'s store held the hold's journal through {}",
+                ht.last
+            ));
+        }
+        if (held || hold_now) && t.node == answerer && Some(answerer) != holder {
+            return Ok(format!(
+                "no backup recorded; the root journal holds ({g},{i}) in an epoch hold \
+                 and the delegate {answerer}, a member, holds the row in its own journal"
             ));
         }
         if bs.is_empty() {
@@ -3736,17 +3796,20 @@ mod tests {
         assert!(rv.violations[0].contains("seq 7"), "{:?}", rv.violations);
     }
 
-    /// An epoch hold's journal counts as the root's copy until plan 46 M1.4
-    /// (`Core::config_committed_jseq`); a lone root's does not.
+    /// Plan 46 M1.4 step 3: an epoch hold's journal counts as the root's
+    /// copy once a member's store holds the row (`Core::config_committed_jseq`
+    /// counts by the member-acked seq): the delegate's own journal row, or a
+    /// streamed copy of the hold's epoch through the row. The owner's
+    /// journal alone does not count, and a lone root's does not either.
     #[test]
-    fn i1_deleg_group_counts_an_epoch_holds_journal_not_a_lone_roots() {
+    fn i1_deleg_group_counts_a_hold_by_a_member_not_the_owners_journal() {
         let w = world();
         let r = rid(3, 1);
         let st = AnswererState {
             holds_gens: vec![1],
             ..Default::default()
         };
-        root_appended_row(&w);
+        let txs = root_appended_row(&w);
         w.lease(1, 1, &[]);
         w.o.appended
             .lock()
@@ -3755,12 +3818,30 @@ mod tests {
         let j = w.judge(2, &st, r);
         assert_eq!(j.class, None, "{}", j.detail);
         assert!(j.detail.contains("lone root's"), "{}", j.detail);
+        // Appended in a hold: the delegate that is a member holds its own row.
         w.o.appended
             .lock()
             .unwrap()
             .insert((1, 1), (1, vec![], true));
         let j = w.judge(2, &st, r);
         assert_eq!(j.class, Some(Judged::Group), "{}", j.detail);
+        assert!(j.detail.contains("own journal"), "{}", j.detail);
+        // The owner's journal alone is no member's copy, a streamed copy of
+        // another epoch is none either, one of the hold's epoch through the
+        // row is.
+        let t = txs.iter().find(|t| t.origin == (1, 1)).expect("row");
+        assert_eq!(hold_member_streamed(&w.o, Some(1), &[1], t.last), None);
+        w.metas[&3]
+            .install_streamed(9, 1, t.first, t.last, &t.records)
+            .unwrap();
+        w.o.note_streamed_to(3, &w.metas[&3], 9);
+        assert_eq!(hold_member_streamed(&w.o, Some(1), &[1], t.last), None);
+        w.metas[&3]
+            .install_streamed(1, 1, t.first, t.last, &t.records)
+            .unwrap();
+        w.o.note_streamed_to(3, &w.metas[&3], 9);
+        assert_eq!(hold_member_streamed(&w.o, Some(1), &[1], t.last), Some(3));
+        assert_eq!(hold_member_streamed(&w.o, Some(3), &[1], t.last), None);
         // A hold that began after the append counts as well.
         w.o.appended
             .lock()
@@ -3769,7 +3850,6 @@ mod tests {
         w.o.epoch_holds.lock().unwrap().insert(1);
         let j = w.judge(2, &st, r);
         assert_eq!(j.class, Some(Judged::Group), "{}", j.detail);
-        assert!(j.detail.contains("epoch hold"), "{}", j.detail);
     }
 
     #[test]

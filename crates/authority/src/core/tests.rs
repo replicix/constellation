@@ -59552,6 +59552,37 @@ mod hold_ack {
         assert!(accepted_to_peer(&out, 3), "{out:?}");
     }
 
+    /// Plan 46 M1.4 step 3: a delegate's row the hold's owner appended counts
+    /// as committed by the member-acked seq (`config_committed_jseq`, what
+    /// `DelegateStreamAck.committed` follows), not by the owner's journal; a
+    /// `Final` hold (one member, or the knob) still counts its journal.
+    #[test]
+    fn a_holds_committed_seq_for_a_delegate_is_the_member_acked_one() {
+        let mut h = owner(0);
+        h.core.pr.epoch_members = vec![1, 2];
+        assert_eq!(h.core.config_committed_jseq(), 0, "no member holds a row");
+        let _ = create_nowait(&mut h, 1, "a");
+        let _ = remote_create(&mut h, 3, 1, "b");
+        let txs = Replica::journal_txs_from(&h.meta, 1, 100);
+        assert!(txs.len() >= 2, "{txs:?}");
+        let (first, tip) = (txs[0].last, tip(&h));
+        // A node outside the epoch counts for nothing.
+        ack(&mut h, 4, 1, tip);
+        assert_eq!(h.core.config_committed_jseq(), 0);
+        ack(&mut h, 2, 1, first);
+        assert_eq!(h.core.config_committed_jseq(), first);
+        ack(&mut h, 2, 1, tip);
+        assert_eq!(h.core.config_committed_jseq(), tip);
+        // Final holds count their journal.
+        let mut one = owner(0);
+        one.core.pr.epoch_members = vec![1];
+        assert_eq!(one.core.config_committed_jseq(), u64::MAX);
+        let mut knob = owner(0);
+        knob.core.cfg.hold_answers_uncommitted = true;
+        knob.core.pr.epoch_members = vec![1, 2];
+        assert_eq!(knob.core.config_committed_jseq(), u64::MAX);
+    }
+
     #[test]
     fn the_knob_restores_the_answer_from_the_owners_disk() {
         let mut h = owner(0);

@@ -2210,6 +2210,7 @@ impl Driver {
             if self.core.lease().epoch().is_some() {
                 self.record_deleg_rows(is_stream);
             }
+            self.oracles.note_streamed(self.id, &self.meta);
             {
                 let mut holds = self.oracles.epoch_holds.lock().unwrap();
                 if self.core.lease().epoch_held() {

@@ -6784,9 +6784,6 @@ fn delegated_epoch_config() -> SimConfig {
                 for_ms: 5_000,
             },
         }],
-        strict_commit_exempt: Some(
-            "plan 46 M1.4 (the hold as a group): an epoch hold's non-stealable answers install shadows no commit backs",
-        ),
         ..delegated_config()
     }
 }
@@ -14793,10 +14790,6 @@ fn locks_unlinked_blips_config() -> SimConfig {
         lock_ios: c.lock_ios,
         lock_io_ms: c.lock_io_ms,
         faults: c.faults,
-        strict_commit_exempt: Some(
-            "plan 46 M1.4 (the hold as a group): a delegate's row the root appended inside a \
-             continuation epoch's hold (S3 away) is counted committed and answered (seed 351)",
-        ),
         ..locks_unlinked_delegated_config()
     }
 }
@@ -15795,8 +15788,13 @@ fn strict_commit_is_the_default_of_a_delegated_configuration() {
         .is_none());
     assert!(placement_hot_config().is_delegated());
     assert!(!SimConfig::default().is_delegated());
+    // Plan 46 M1.4 step 3: a delegate's rows in a hold count by a member's
+    // copy, so these two configurations are strict.
+    assert!(delegated_epoch_config().strict_commit_exemption().is_none());
+    assert!(locks_unlinked_blips_config()
+        .strict_commit_exemption()
+        .is_none());
     for cfg in [
-        delegated_epoch_config(),
         delegated_core_stall_root_lease6_config(),
         long_delegated_lead_off_config(),
         long_delegated_hysteresis_off_config(),
@@ -15805,7 +15803,6 @@ fn strict_commit_is_the_default_of_a_delegated_configuration() {
         locks_writer_hold_delegated_group_config(false),
         locks_delegate_ahead_config(),
         locks_executor_behind_config(),
-        locks_unlinked_blips_config(),
     ] {
         let why = cfg.strict_commit_exemption().expect("an exception");
         assert!(why.contains("plan 46 M"), "{why}");

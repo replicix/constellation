@@ -68409,3 +68409,30 @@ of the replaced configuration, while the archive does not carry the row yet (`cf
 
 **Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (lib, integration), authority lib 1,088, engine lib 953, control,
 release authority sim suite 422 passed, 0 failed, 12 ignored.
+
+### Plan 46 M1.4 step 3 (a delegate's rows in a hold)
+
+**Change.** `Core::config_committed_jseq` in a hold with a member (`hold_group()`) returns the member-acked seq (`hold_acked_through()`) instead of
+`u64::MAX`, so `root_append_cap` and `DelegateStreamAck.committed` follow the members' `StreamAheadAck`s; a `Final` hold (one member, or the knob
+`hold_answers_uncommitted`) still counts its journal, as its own answers do. In the oracle the root's appended copy counts in a hold once a member
+holds it: a member's store held the hold's journal through the row (`Oracles::streamed_seen`, a latch of each node's streamed tip per epoch, since the
+copy is retired or stranded after the hold ends), or the delegate that is the member holds the row in its own journal (the stream delivers it back and
+`install_streamed_committed` installs nothing for it, but the ack covers it). The owner's journal alone does not count.
+
+**Deleted.** The "journal counts until M1.4" branches of `config_committed_jseq` and of `deleg_group`'s hold exception (`held || hold_now` no longer
+counts by itself; the tenure's hold flag now only gates the delegate-own-row case); the `strict_commit_exempt` entries of `delegated-epoch` and
+`locks-unlinked-delegated-blips` (the pinning test now asserts both are strict).
+
+**Fail-before** (main b5a3f32a, `+commit`, ×2,000): `delegated-epoch` 983 and 1711, `locks-unlinked-delegated-blips` 351: I1 (a delegate's row answered
+as committed on the hold owner's journal). With the step: 0 I1 in every sweep.
+
+**Sweeps** (release, ×2,000 `+commit`; failing sets, main to step): `delegated-epoch` [436, 438, 680, 773, 833, 868, 983, 1373, 1711] to [436, 438, 680,
+773, 833, 868, 1373]; `locks-unlinked-delegated-blips` [159, 351] to [805, 904, 1131]; `flex`, `flex-crash`, `flex-tight`, `flex-backup`, `flex-zero`,
+`flex-taker-ahead`, `flex-promiser-restart-step-forward`, every other `locks-*-blips*`, `locks-core-stall-blips`, `long-delegated`,
+`delegated-root-crash`: identical sets. Every remaining failure is a class claim of the "claim-at-acquisition" shape (a parked `Archive` row of an earlier
+tenure released when the node takes its lease again; 805, 904, 1131 are draws a moved schedule shifted, the same shape as 159 on main): M1.3's, not the
+hold. The two exemptions go whole: the default release suite stays green with both configurations strict (no failing seed is in it).
+
+**Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (lib, integration), authority lib 1,089, engine lib 953, control,
+release authority sim suite 422 passed, 0 failed, 12 ignored. New tests: core `a_holds_committed_seq_for_a_delegate_is_the_member_acked_one`, oracle
+`i1_deleg_group_counts_a_hold_by_a_member_not_the_owners_journal`.
