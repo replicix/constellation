@@ -8,7 +8,7 @@ use constellation_net::reconcile::{
     decode_keys, Answer, Delta, DeltaOutcome, Fingerprint, Key, KeySet, Query, Range, Reply,
     Summary, FANOUT_BITS, MAX_DELTA_KEYS, MAX_QUERIES_PER_REQUEST, MAX_ROUNDS, REPLY_BUDGET,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::Instant;
 
 /// Incarnation / sequence bookkeeping shared by all mirrors
@@ -219,6 +219,7 @@ pub fn respond_leaf(
 }
 
 /// Initiator side of RBSR for any `LocationMirror`, against the owner.
+/// Depth first (plan 47 P3); the P1 tables were measured breadth first.
 /// For a mirror with a `granularity` `g` the descent stops at depth
 /// `g`: a range that would split below `g` is expanded into its
 /// depth-`g` sub-ranges (queried with real fingerprints) and the owner,
@@ -236,12 +237,12 @@ pub fn rbsr_repair<M: LocationMirror + ?Sized>(
     let gran = m.granularity();
     let bogus: Fingerprint = [0xFF; 16];
     // (range, forced)
-    let mut queue: VecDeque<(Range, bool)> = VecDeque::new();
-    let push = |queue: &mut VecDeque<(Range, bool)>, r: Range| match gran {
+    let mut queue: Vec<(Range, bool)> = Vec::new();
+    let push = |queue: &mut Vec<(Range, bool)>, r: Range| match gran {
         Some(g) if r.bits + FANOUT_BITS > g && r.bits < g => {
             let d = u32::from(g - r.bits);
             for i in 0..(1u64 << d) {
-                queue.push_back((
+                queue.push((
                     Range {
                         bits: g,
                         path: (r.path << d) | i,
@@ -250,7 +251,7 @@ pub fn rbsr_repair<M: LocationMirror + ?Sized>(
                 ));
             }
         }
-        _ => queue.push_back((r, false)),
+        _ => queue.push((r, false)),
     };
     for r in Range::level(start_bits.min(16)) {
         // A level deeper than the leaf depth cannot be queried.
@@ -264,7 +265,7 @@ pub fn rbsr_repair<M: LocationMirror + ?Sized>(
         push(&mut queue, Range::ROOT);
     }
     for r in extra {
-        queue.push_back((*r, true));
+        queue.push((*r, true));
     }
     while !queue.is_empty() {
         if st.rounds >= MAX_ROUNDS {
@@ -273,8 +274,11 @@ pub fn rbsr_repair<M: LocationMirror + ?Sized>(
         }
         let n = queue.len().min(MAX_QUERIES_PER_REQUEST);
         let t0 = Instant::now();
+        // Depth first, as the product's `Session` since plan 47 P3: the
+        // next request takes the most recently queued ranges.
         let queries: Vec<Query> = queue
             .iter()
+            .rev()
             .take(n)
             .map(|&(r, forced)| {
                 if forced {
@@ -310,7 +314,7 @@ pub fn rbsr_repair<M: LocationMirror + ?Sized>(
             break;
         }
         let t2 = Instant::now();
-        let settled: Vec<(Range, bool)> = queue.drain(..processed).collect();
+        let settled: Vec<(Range, bool)> = queue.split_off(queue.len() - processed);
         let mut by_range: HashMap<Range, &Answer> = HashMap::new();
         for a in &reply.answers {
             match a {

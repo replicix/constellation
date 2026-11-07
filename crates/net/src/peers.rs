@@ -2091,6 +2091,10 @@ async fn handle_stream<S: PeerService>(
             Payload::ReconcileRequest { queries } => {
                 Some(service.reconcile_requested(queries).await)
             }
+            Payload::ReplayRequest {
+                incarnation,
+                after_seq,
+            } => Some(service.replay_requested(incarnation, after_seq).await),
             Payload::ChunkHandoff {
                 requester,
                 req_id,
@@ -2137,6 +2141,7 @@ async fn handle_stream<S: PeerService>(
             | Payload::CacheSummary { .. }
             | Payload::CacheSetDelta { .. }
             | Payload::ReconcileReply { .. }
+            | Payload::ReplayReply { .. }
             | Payload::ChunkResponse { .. }
             | Payload::LogFrame { .. }
             | Payload::LogEnd { .. }
@@ -3431,6 +3436,8 @@ mod tests {
     /// Answers reconciliation rounds from a fixed owner set.
     struct ReconServer {
         set: crate::reconcile::KeySet,
+        /// The owner's delta log and summary, when it serves replay.
+        replay: Option<(crate::reconcile::DeltaLog, crate::reconcile::Summary)>,
     }
 
     impl PeerService for ReconServer {
@@ -3472,6 +3479,25 @@ mod tests {
                 }
             })
         }
+        fn replay_requested(
+            &self,
+            incarnation: u64,
+            after_seq: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+            Box::pin(async move {
+                let reply = match &self.replay {
+                    Some((log, summary)) => crate::reconcile::respond_replay(
+                        log,
+                        *summary,
+                        incarnation,
+                        after_seq,
+                        crate::reconcile::REPLAY_PAGE_BUDGET,
+                    ),
+                    None => crate::reconcile::ReplayReply::unavailable(),
+                };
+                Payload::ReplayReply { reply }
+            })
+        }
         fn node_id(&self) -> u64 {
             1
         }
@@ -3504,7 +3530,10 @@ mod tests {
         asker.refresh_registry(registry);
         assert_eq!(asker.node_id_for_key(&a_key), Some(1));
         assert_eq!(asker.node_id_for_key(&"00".repeat(32)), None);
-        let service = Arc::new(ReconServer { set: owner.clone() });
+        let service = Arc::new(ReconServer {
+            set: owner.clone(),
+            replay: None,
+        });
         tokio::spawn(async move { holder.serve(service).await });
 
         let mut mirror = KeySet::new();
@@ -3525,6 +3554,131 @@ mod tests {
         }
         assert!(session.rounds > 1, "50k keys cannot fit one frame");
         assert!(mirror == owner);
+    }
+
+    /// Plan 47 P3 over real QUIC frames: a backlog of deltas pages through
+    /// several replies and the mirror comes out exactly the owner's set;
+    /// an owner without the log answers "unavailable" and a session over
+    /// the same connection repairs the same gap.
+    #[tokio::test]
+    async fn delta_replay_pages_over_quic_and_falls_back_to_a_session() {
+        use crate::reconcile::{
+            encode_keys, start_bits_for, Delta, DeltaLog, KeySet, Mirror, Session, Summary,
+            MAX_REPLAY_PAGES,
+        };
+        // 24 ticks of 1,500 adds each on top of a 20k-key set.
+        let mut set =
+            KeySet::from_keys((0..20_000u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+        let start = set.clone();
+        let mut log = DeltaLog::new(1 << 30, Duration::from_secs(600));
+        for seq in 1..=24u64 {
+            let base = set.root_fingerprint();
+            let adds: Vec<u64> = (0..1_500u64)
+                .map(|i| (seq * 10_000 + i).wrapping_mul(0xD6E8_FEB8_6659_FD93))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            for &k in &adds {
+                set.insert(k);
+            }
+            log.push(
+                Delta {
+                    incarnation: 3,
+                    seq,
+                    base,
+                    root: set.root_fingerprint(),
+                    adds: encode_keys(0, &adds),
+                    removes: Vec::new(),
+                },
+                std::time::Instant::now(),
+            );
+        }
+        let summary = Summary {
+            incarnation: 3,
+            seq: 24,
+            root: set.root_fingerprint(),
+            count: set.len() as u64,
+        };
+        for with_log in [true, false] {
+            let topic = crate::topic_for(Some(&[10u8; 32]), "fs");
+            let a = P2p::spawn(iroh::SecretKey::generate(), topic)
+                .await
+                .unwrap();
+            let b = P2p::spawn(iroh::SecretKey::generate(), topic)
+                .await
+                .unwrap();
+            let (a_key, b_key) = (a.pubkey_hex(), b.pubkey_hex());
+            let (a_addr, b_addr) = (a.addr(), b.addr());
+            let holder = Peers::new(a, 1);
+            let asker = Peers::new(b, 2);
+            let registry = vec![
+                (1, a_key, serde_json::to_value(&a_addr).unwrap()),
+                (2, b_key, serde_json::to_value(&b_addr).unwrap()),
+            ];
+            holder.refresh_registry(registry.clone());
+            asker.refresh_registry(registry);
+            let service = Arc::new(ReconServer {
+                set: set.clone(),
+                replay: with_log.then(|| (log.clone(), summary)),
+            });
+            tokio::spawn(async move { holder.serve(service).await });
+
+            let mut mirror = Mirror {
+                keys: start.clone(),
+                incarnation: Some(3),
+                last_seq: 0,
+                exact_seq: Some(0),
+            };
+            let (inc, mut after) = mirror.replay_point().unwrap();
+            let mut pages = 0;
+            let mut replayed = false;
+            for _ in 0..MAX_REPLAY_PAGES {
+                let reply = asker
+                    .request_to_node_timeout(
+                        1,
+                        &Payload::ReplayRequest {
+                            incarnation: inc,
+                            after_seq: after,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await
+                    .expect("replay request failed");
+                let Payload::ReplayReply { reply } = reply else {
+                    panic!("unexpected reply {reply:?}");
+                };
+                if !reply.available {
+                    break;
+                }
+                pages += 1;
+                after = mirror.apply_replay(&reply.deltas, after).unwrap();
+                if after >= reply.summary.seq {
+                    replayed = mirror.matches(&reply.summary);
+                    break;
+                }
+            }
+            if with_log {
+                assert!(replayed && pages > 1, "replayed={replayed} pages={pages}");
+            } else {
+                assert!(!replayed && pages == 0);
+                let mut session = Session::new(start_bits_for(mirror.keys.len()));
+                while let Some(queries) = session.next_request(&mirror.keys) {
+                    let reply = asker
+                        .request_to_node_timeout(
+                            1,
+                            &Payload::ReconcileRequest { queries },
+                            Duration::from_secs(20),
+                        )
+                        .await
+                        .expect("reconcile round failed");
+                    let Payload::ReconcileReply { reply } = reply else {
+                        panic!("unexpected reply {reply:?}");
+                    };
+                    session.apply(&mut mirror.keys, &reply).unwrap();
+                }
+            }
+            assert!(mirror.keys == set, "with_log={with_log}");
+        }
     }
 
     /// TTFB is measured to the control reply, so it tracks how long the

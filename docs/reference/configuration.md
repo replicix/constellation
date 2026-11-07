@@ -806,6 +806,7 @@ unmount or lease handoff. A dropped bump only costs freshness.
 | `CONSTELLATION_COOP_DIGEST` | `exact` | `exact` (alias `rbsr`) or `bloom`; an unknown value warns and uses `exact` | how peers learn each other's cached chunks: exact mirrors kept by reconciliation, or bloom digests |
 | `CONSTELLATION_DIGEST_INTERVAL_S` | `30` | seconds, minimum `1` | exact: summary heartbeat and liveness sweep; bloom: snapshot rotation |
 | `CONSTELLATION_DIGEST_TTL_S` | `4 × DIGEST_INTERVAL_S` | seconds, at least `2 × DIGEST_INTERVAL_S` | how long an unconfirmed peer mirror or digest stays usable |
+| `CONSTELLATION_COOP_REPLAY_LOG_BYTES` | `8388608` | bytes; `0` turns replay off | exact mode: bytes of recently published deltas this node keeps so a peer that missed some can replay them instead of running a reconciliation session (also bounded to 10 minutes) |
 
 `CONSTELLATION_P2P=off` disables forwarding, placement messages, segment
 push, handoff acceleration, and cooperative peer transfer. Correctness and

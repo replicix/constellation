@@ -1,9 +1,11 @@
 # Plan 47 — Chunk-location digests: research, measure, then decide
 
-> **Status (2026-11-07): proposed.** Phase P0 (research) is next. Phase P3
-> (design and implementation) runs only if P0 and P1 together show that a
-> change is worth making, and only after the maintainer accepts the
-> decision record (P2).
+> **Status (2026-11-07): P0-P2 done, P3 implemented.** The maintainer's P2
+> decision (2026-11-07): keep the exact mirror, fix the range-repair livelock,
+> add delta-log replay as the first repair step with range-based repair as the
+> fallback; no storage change (`bench/coop-digest/DECISION.md` section 7). P3
+> delivered both; evidence in `bench/coop-digest/RESULTS.md` section 12. What
+> remains open before the plan can close is in section 7.
 
 Read `docs/plans/v1/CONVENTIONS.md` first.
 
@@ -141,16 +143,48 @@ metrics, and removal of whatever the change replaces. Each step has a
 fail-before test where it fixes behaviour, the harness scenarios for
 removals and repair, and the P1 benchmark re-run as its acceptance.
 
+### 6.1 What P3 did (2026-11-07, maintainer's decision)
+
+| Step | Change | Fail-before / tests | Evidence |
+|---|---|---|---|
+| P3.1 | `Session` walks depth first (a stack, `crates/net/src/reconcile.rs`): the first `Items` answers are applied within a few rounds, so a session cut by `MAX_ROUNDS` keeps its progress and the next one continues; the livelock of breadth-first walks on 8 Mi-key peers (gaps of 50 k or more, a 100 k burst, a 160 k restart) is gone | `a_large_gap_on_a_large_set_converges_because_sessions_keep_progress` (3 M keys, 60 k changes; fails on the parent: "session 4 used 256 rounds and applied nothing") | RESULTS 12.1: 8 Mi keys, 100 k gap: 26.1 MiB in 3 sessions (P1: failed, 517 MiB); 30 k: 12.1 MiB (was 24.6) |
+| P3.2 | Delta-log replay: `DeltaLog` (8 MiB and 10 minutes by default, `CONSTELLATION_COOP_REPLAY_LOG_BYTES`, 0 = off), `ReplayRequest`/`ReplayReply` (signed postcard, 48 KiB pages, at most 64), `Mirror::exact_seq`/`apply_replay`, the engine's first repair step in `run_session` with the session as fallback; result accepted only if count and root fingerprint equal the owner's summary at the last replayed seq | net: small gap, paging, truncated by size and age, restart, silent change, reordering, differing mirror refused, malformed page, restart clears the exact point, frame fit, QUIC paging with session fallback; engine: log follows publishing, silent tick clears it | RESULTS 12.2: 100 k changes on 8 Mi keys 767 KiB / 22.6 ms against 26.1 MiB / 314 ms; 1 k: 8.2 KiB against 777 KiB |
+| P3.3 | Status: `replay_hits`, `replay_misses`, `replay_bytes`, `replay_log_bytes` (control schema re-blessed), `/metrics` `constellation_coop_replay_*`; harness `coop-churn` prints them | schema test | RESULTS 12.5: `replay_hits=2` over real nodes |
+| P3.4 | Bench: `product` repair method and `--plog` A/B in `bench/coop-digest`; the generic initiator is depth first too | | RESULTS 12.2-12.4 |
+
+Steady wire is byte-identical and publisher CPU within noise (RESULTS 12.3);
+the owner's log is 1.2 / 7.3 / 8.4 MB at 0.1 / 1 / 10 % churn per minute on
+8 Mi keys (12.4).
+
 ## 7. Exit criteria
 
-- [ ] P0: `RESEARCH.md` reviewed; candidate list and predictions agreed.
-- [ ] P1: `RESULTS.md` with reproducible measurements for every candidate
-      kept after P0; no estimated figure in the comparison.
-- [ ] P2: decision recorded and accepted by the maintainer (ADR on a change).
-- [ ] P3 (if a change): implemented; the P1 suite shows the predicted gain;
-      no regression on ext4, xfs, btrfs or tmpfs hosts; harness coop
-      scenarios green; every CONVENTIONS gate green; pjdfstest 8798/8798;
-      docs (DESIGN, feature reference, configuration) updated.
+- [x] P0: `RESEARCH.md` reviewed; candidate list and predictions agreed
+      (the maintainer's P2 decision of 2026-11-07 is made on it).
+- [x] P1: `RESULTS.md` with reproducible measurements for every candidate
+      kept after P0; no estimated figure in the comparison (the section 7
+      CPU "derived wall" columns are computed from measured CPU and rounds
+      and say so).
+- [x] P2: decision recorded and accepted by the maintainer (2026-11-07: keep
+      the exact mirror, fix the livelock, replay first; `DECISION.md` section 7).
+      No ADR: no candidate replaced the status quo.
+- [ ] P3 (the decision's two repair changes):
+  - [x] implemented (depth-first sessions, delta-log replay); the P1 suite
+        shows the gain: RESULTS section 12.
+  - [x] no regression on ext4, xfs, btrfs or tmpfs hosts: the change is in
+        `net::reconcile`, `engine::coop`, the control status and the bench;
+        no filesystem, cache-storage or read/write path code is touched, and
+        steady wire and publisher CPU are unchanged within noise (12.3).
+  - [x] harness coop scenarios green (`coop-cache-hit`, `coop-fallback`,
+        `coop-exact-churn`, `coop-digest-compare`; replay used by real nodes).
+  - [x] gates in debug and release: fmt, clippy `--workspace --all-targets
+        -D warnings`, net, engine and control tests (net 139, engine 954,
+        control 146), `cargo test --workspace`.
+  - [ ] pjdfstest 8798/8798, `tests/smoke.sh`, `tests/integration.sh` and the
+        full harness matrix of CONVENTIONS "Definition of done": **not run**
+        for P3 (the containerized lane and the full matrix were out of
+        the P3 brief). The diff does not touch what they exercise.
+  - [x] docs (feature reference, configuration, DESIGN, DECISION, RESULTS,
+        PROGRESS) updated.
 
 ## 8. Dependencies and scheduling
 

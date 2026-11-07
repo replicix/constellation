@@ -1,6 +1,8 @@
-# Plan 47 P2 — decision record (DRAFT, the maintainer decides)
+# Plan 47 P2 — decision record
 
-Status: draft applying the plan's §5 rule mechanically to the P1 numbers in
+Status: **decided by the maintainer on 2026-11-07 (section 7); outcome of the
+implementation in section 7.2.** The text below, up to section 6, is the draft
+that applied the plan's §5 rule mechanically to the P1 numbers in
 `RESULTS.md`. Every figure below is quoted from a table there (section
 numbers in brackets); nothing is new. Where the rule needs a judgement that
 the numbers cannot make (what counts as "a real cost", what counts as
@@ -122,3 +124,40 @@ Both would also make peers above 8 Mi keys visible (C6b w = 32: 64 MiB and
 - The status quo's `peer_stale_misses` in a real fleet was not measured (the
   candidates are not in the daemon); the break-even `f` above is the interface
   to whatever the harness or production later reports.
+
+## 7 Decision (maintainer, 2026-11-07) and outcome (P3)
+
+### 7.1 The decision
+
+**Keep the exact mirror** (C1: the flat sorted shards, 11.1 B per key, no false
+positives, no compatibility change to the storage). No candidate of section 3
+is adopted, so the rule's mechanical outcome stands. Two repair changes from
+section 5 are made, no storage change:
+
+1. **Fix the range-based repair livelock** (section 5, item 1).
+2. **Delta-log replay as the first repair step, RBSR as the fallback** (section 5,
+   item 2). Protocol additions follow P0's stance: no compatibility shim and no
+   version bump; a peer that cannot answer a replay request (older version,
+   bloom mode, replay off) makes the mirror run the session, and a mixed
+   fleet falls back to S3 as it does today for every digest message.
+
+The open points of section 6 are closed by this: 5.3 GiB per node at 64 x 8 Mi
+keys is accepted; C6b, C3 and C5 are not built; the rule's "smaller measured
+improvement" clause is what this plan delivers. Shrink-to-fit of the shard
+vectors (section 5, item 4) and compact storage (item 3) are not done.
+
+### 7.2 Outcome (measured with the product code, RESULTS section 12)
+
+| Item | P1 (status quo) | P3 | Where |
+|---|---|---|---|
+| Real session, 8 Mi keys, gap of 50 k or 100 k changes, 100 k burst, restart (160 k differences) | **FAILED**: 50 sessions, 517 MiB, nothing applied | converges: 50 k in 2 sessions and 17.2 MiB, 100 k in 3 sessions and 26.1 MiB, burst 3 sessions and 26.2 MiB, restart 3 sessions and 32.7 MiB | 12.1 |
+| Real session, 8 Mi keys, 30 k gap | 24.6 MiB, 3 sessions, 611 rounds | 12.1 MiB, 2 sessions, 294 rounds | 12.1 |
+| Sparse gaps, 1 Mi / 8 Mi keys, 1 k changes | 545 / 852 KiB | 504 / 777 KiB | 12.1 |
+| Repair of a gap the owner's log still covers (product path: replay first), 8 Mi keys | n/a | 1 k: 8.2 KiB; 10 k: 77 KiB; 30 k: 232 KiB; 100 k: 767 KiB (17 rounds, 22 ms CPU) against 26.1 MiB (314 ms) by session | 12.2 |
+| Silent burst or restart | RBSR | unchanged cost plus 227 B for the failed replay probe (burst); no probe on restart | 12.2 |
+| Steady wire (delta + summary) | 715 KB per peer-minute at 1 % churn on 8 Mi keys | identical bytes (the log is local) | 12.3 |
+| Publisher CPU per 250 ms tick, log on against off (box 3, A/B/B/A, 4 runs each) | | within noise: 8 Mi keys +0.0 % (1 %) and +0.2 % (10 %); 1 Mi keys +2.8 % (1 %) and +2.3 % (10 %), about 1 us of a 6.5 / 44 us tick | 12.3 |
+| Owner memory for the log | none | 1.2 MB (0.1 %), 7.3 MB (1 %), 8.4 MB (cap reached at 10 %, 2.6 minutes of history), allocator-live, on 8 Mi keys; 8 MiB default cap, one log per node | 12.4 |
+
+Not changed, and not claimed: receiver memory (11.1 B per key), staleness,
+lookup latency.

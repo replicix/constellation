@@ -50,6 +50,9 @@ pub(super) struct ChurnStats {
     reconcile_rounds: u64,
     reconcile_cpu_us: u64,
     reconcile_failures: u64,
+    replay_hits: u64,
+    replay_misses: u64,
+    replay_bytes: u64,
     peer_set_bytes: u64,
 }
 
@@ -64,7 +67,8 @@ impl ChurnStats {
         eprintln!(
             "    coop-churn[{}]: peer_hits={} peer_misses={} false_positives={} stale_misses={} \
              s3_fetches={} digest_bytes={} ({:.0} B/s fleet) msgs={} digest_cpu_us={} \
-             reconcile_rounds={} ({:.1} us/round, failures={}) peer_set_bytes={} in {:.1?}",
+             reconcile_rounds={} ({:.1} us/round, failures={}) replay_hits={} replay_misses={} \
+             replay_bytes={} peer_set_bytes={} in {:.1?}",
             self.mode,
             self.peer_hits,
             self.peer_misses,
@@ -78,6 +82,9 @@ impl ChurnStats {
             self.reconcile_rounds,
             per_round,
             self.reconcile_failures,
+            self.replay_hits,
+            self.replay_misses,
+            self.replay_bytes,
             self.peer_set_bytes,
             self.elapsed,
         );
@@ -279,6 +286,9 @@ fn churn_rounds(
         stats.reconcile_rounds += u(&c, "reconcile_rounds");
         stats.reconcile_cpu_us += u(&c, "reconcile_cpu_us");
         stats.reconcile_failures += u(&c, "reconcile_failures");
+        stats.replay_hits += u(&c, "replay_hits");
+        stats.replay_misses += u(&c, "replay_misses");
+        stats.replay_bytes += u(&c, "replay_bytes");
         stats.peer_set_bytes += u(&c, "peer_set_bytes");
     }
     Ok(stats)

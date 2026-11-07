@@ -1643,8 +1643,10 @@ invariant 2 forces its op after the delete regardless of what it had seen.
   keeps an **exact mirror** of each peer's published chunk set (its clean
   or pinned chunks, keyed by 8-byte hash prefixes): pushed deltas every
   250 ms keep mirrors current, a small summary heartbeat detects drift,
-  and range-based set reconciliation (Negentropy-style additive
-  fingerprints over hash-prefix ranges) repairs any gap. So a peer fetch
+  a gap is first repaired by replaying the owner's bounded log of recent
+  deltas (verified against its fingerprint), and range-based set
+  reconciliation (Negentropy-style additive fingerprints over
+  hash-prefix ranges) repairs whatever replay cannot. So a peer fetch
   never goes to a node that does not have the chunk, and a removal
   propagates within one tick
   ([ADR-26](DECISIONS.md#adr-26-exact-chunk-location-reconciliation-replaces-bloom-digests),

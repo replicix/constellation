@@ -455,6 +455,15 @@ impl constellation_net::PeerService for P2pBridge {
         Box::pin(async move { self.coop.reconcile_reply(queries).await })
     }
 
+    fn replay_requested(
+        &self,
+        incarnation: u64,
+        after_seq: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move { self.coop.replay_reply(incarnation, after_seq) })
+    }
+
     fn serve_chunk(
         &self,
         hash: [u8; 32],

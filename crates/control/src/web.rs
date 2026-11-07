@@ -753,6 +753,21 @@ pub fn render_metrics(status: &StatusReport, sched: Option<&SnapSchedReport>) ->
         status.coop.reconcile_rounds
     );
     gauge!(
+        "constellation_coop_replay_hits_total",
+        "Mirror repairs finished by replaying the owner's delta log.",
+        status.coop.replay_hits
+    );
+    gauge!(
+        "constellation_coop_replay_misses_total",
+        "Mirror repairs that tried delta-log replay and fell back to a session.",
+        status.coop.replay_misses
+    );
+    gauge!(
+        "constellation_coop_replay_bytes_total",
+        "Wire bytes of delta-log replay requests and replies.",
+        status.coop.replay_bytes
+    );
+    gauge!(
         "constellation_coop_peer_set_entries",
         "Entries held about peers' caches (mirror keys or bloom inserts).",
         status.coop.peer_set_entries

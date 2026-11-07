@@ -8,7 +8,12 @@
 //!   sim          staleness under loss and reordering, many peers
 //!   cuckoo-load  filter insert failures and rebuilds at 50-95% load
 
-use constellation_net::reconcile::{DeltaOutcome, KeySet, Range, Summary};
+use constellation_net::message::wire_len;
+use constellation_net::reconcile::{
+    respond_replay, DeltaLog as ProductLog, DeltaOutcome, KeySet, Mirror, Range, Summary,
+    MAX_REPLAY_PAGES, REPLAY_PAGE_BUDGET,
+};
+use constellation_net::Payload;
 use coop_digest::cand::bloomc::{self, BloomMirror};
 use coop_digest::cand::cuckoo::LoneFilter;
 use coop_digest::cand::fuse::{build_snapshot, snapshot_wire, FuseSet};
@@ -267,6 +272,13 @@ fn cmd_steady(a: &Args) {
     let mut churn = Churn::new(seed ^ 7, &publ.keys);
     churn.add_frac = a.num("add-frac", 0.5);
     let mut log = DeltaLog::new(1 << 30);
+    // Plan 47 P3: the product's bounded delta log, charged to the
+    // publisher's time (A/B with `--plog 0`).
+    let use_plog = a.num::<u32>("plog", 1) != 0;
+    let plog_cap: usize = a.num("plog-bytes", 8 << 20);
+    let mut plog = ProductLog::new(plog_cap, std::time::Duration::from_secs(600));
+    let mut plog_peak = 0usize;
+    let clock0 = Instant::now();
     let ticks = (minutes * 240.0) as u64;
     let interval_ticks = interval_s * 4;
     let (mut pub_ns, mut recv_ns) = (Vec::new(), Vec::new());
@@ -282,6 +294,18 @@ fn cmd_steady(a: &Args) {
         changes_total += ev.len() as u64;
         let t0 = Instant::now();
         let out = publ.absorb(&ev, false, true);
+        if use_plog {
+            // Simulated time, 250 ms per tick, so the age bound is exercised.
+            let now = clock0 + std::time::Duration::from_millis(250 * t);
+            plog.prune(now);
+            if out.silent {
+                plog.clear();
+            }
+            for d in &out.deltas {
+                plog.push(d.clone(), now);
+            }
+            plog_peak = plog_peak.max(plog.bytes());
+        }
         pub_ns.push(t0.elapsed().as_nanos() as f64);
         let t1 = Instant::now();
         for d in &out.deltas {
@@ -350,6 +374,10 @@ fn cmd_steady(a: &Args) {
     // Publisher, churn state and delta log gone: what remains above the
     // key vector is the mirror alone.
     let log_bytes = log.bytes();
+    let (plog_now, plog_len) = (plog.bytes(), plog.len());
+    let live_with_log = live_bytes();
+    drop(plog);
+    let plog_live = live_with_log.saturating_sub(live_bytes());
     drop(churn);
     drop(log);
     drop(publ);
@@ -375,7 +403,15 @@ fn cmd_steady(a: &Args) {
                 snap_ns as f64 / snaps.max(1) as f64 / 1e6
             ),
             Mir::Bloom(_) => format!(" bloom snapshot rebuild {:.1} ms per interval", quantile(&snap_round_ns, 0.5) / 1e6),
-            _ => format!(" delta log {:.0} B/min", per_min(log_bytes as u64)),
+            _ => format!(
+                " delta log {:.0} B/min; product log {} B counted, {} B allocator-live, peak {} B ({} entries) cap {} B",
+                per_min(log_bytes as u64),
+                plog_now,
+                plog_live,
+                plog_peak,
+                plog_len,
+                if use_plog { plog_cap } else { 0 }
+            ),
         }
     );
 }
@@ -385,7 +421,108 @@ struct World {
     base_summary: Summary,
     publ: Publisher,
     log: DeltaLog,
+    /// The product's `reconcile::DeltaLog`, filled as `LocalSet::absorb`
+    /// does (a silent tick clears it).
+    plog: ProductLog,
     silent: bool,
+}
+
+/// What the daemon does for one gap (plan 47 P3): replay the owner's delta
+/// log if the mirror's incarnation is the owner's, and run range sessions
+/// (the real `Session` through `sync_in_memory`, as the daemon repeats
+/// them) when replay cannot finish. Bytes are signed-frame sizes for the
+/// replay messages and postcard sizes for the session rounds.
+struct ProductRun {
+    via: &'static str,
+    sessions: usize,
+    rounds: usize,
+    replay_bytes: usize,
+    session_bytes: usize,
+    ok: bool,
+    cpu_ms: f64,
+    fneg: usize,
+}
+
+fn product_repair(w: &World, n: usize) -> ProductRun {
+    let owner = &w.publ.keys;
+    let summary = w.publ.summary();
+    let mut mirror = Mirror {
+        keys: KeySet::from_keys(w.base.iter().copied()),
+        incarnation: Some(w.base_summary.incarnation),
+        last_seq: w.base_summary.seq,
+        exact_seq: Some(w.base_summary.seq),
+    };
+    let t0 = Instant::now();
+    let mut run = ProductRun {
+        via: "session",
+        sessions: 0,
+        rounds: 0,
+        replay_bytes: 0,
+        session_bytes: 0,
+        ok: false,
+        cpu_ms: 0.0,
+        fneg: 0,
+    };
+    let mut replayed = false;
+    // The daemon skips replay when the owner's incarnation changed.
+    if let Some((inc, mut after)) = mirror.replay_point() {
+        if inc == summary.incarnation {
+            replayed = true;
+            for _ in 0..MAX_REPLAY_PAGES {
+                let req = Payload::ReplayRequest {
+                    incarnation: inc,
+                    after_seq: after,
+                };
+                let reply = respond_replay(&w.plog, summary, inc, after, REPLAY_PAGE_BUDGET);
+                run.rounds += 1;
+                run.replay_bytes += wire_len(&req);
+                let reply_msg = Payload::ReplayReply { reply };
+                run.replay_bytes += wire_len(&reply_msg);
+                let Payload::ReplayReply { reply } = reply_msg else {
+                    unreachable!()
+                };
+                if !reply.available {
+                    break;
+                }
+                let Ok(last) = mirror.apply_replay(&reply.deltas, after) else {
+                    break;
+                };
+                let progressed = last > after;
+                after = last;
+                if after >= reply.summary.seq {
+                    if mirror.matches(&reply.summary) {
+                        run.via = "replay";
+                    }
+                    break;
+                }
+                if !progressed {
+                    break;
+                }
+            }
+        }
+    }
+    if run.via != "replay" {
+        run.via = if replayed {
+            "replay, then session"
+        } else {
+            "session"
+        };
+        while mirror.keys.root_fingerprint() != owner.root_fingerprint() && run.sessions < 50 {
+            let sb = constellation_net::reconcile::start_bits_for(mirror.keys.len());
+            let (r, b) = constellation_net::reconcile::sync_in_memory(&mut mirror.keys, owner, sb);
+            run.sessions += 1;
+            run.rounds += r;
+            run.session_bytes += b;
+        }
+    }
+    run.cpu_ms = t0.elapsed().as_secs_f64() * 1e3;
+    run.ok = mirror.keys.root_fingerprint() == owner.root_fingerprint();
+    run.fneg = owner
+        .iter()
+        .step_by((n / 20_000).max(1))
+        .filter(|&k| !mirror.keys.contains(k))
+        .count();
+    run
 }
 
 fn make_world(base: &[u64], scenario: &str, seed: u64) -> World {
@@ -394,12 +531,17 @@ fn make_world(base: &[u64], scenario: &str, seed: u64) -> World {
     let base_summary = publ.summary();
     let mut churn = Churn::new(seed ^ 0x77, &publ.keys);
     let mut log = DeltaLog::new(1 << 30);
+    let mut plog = ProductLog::new(1 << 30, std::time::Duration::from_secs(3600));
     let mut silent = false;
     let mut tick = |publ: &mut Publisher, log: &mut DeltaLog, d: usize, silent: &mut bool| {
         let ev = churn.tick(d);
         let out = publ.absorb(&ev, false, true);
         *silent |= out.silent;
+        if out.silent {
+            plog.clear();
+        }
         for x in out.deltas {
+            plog.push(x.clone(), Instant::now());
             log.push(x);
         }
     };
@@ -434,6 +576,7 @@ fn make_world(base: &[u64], scenario: &str, seed: u64) -> World {
         base_summary,
         publ,
         log,
+        plog,
         silent,
     }
 }
@@ -443,16 +586,35 @@ fn cmd_repair(a: &Args) {
     let seed: u64 = a.num("seed", 1);
     let scenarios = a.str("scenarios", "gap1,gap1k,gap100k,burst100k,restart,initial");
     let specs = a.str("specs", "c1,c6a,c6b,c3,c4,c5,c8a");
-    let methods = a.str("methods", "rbsr,real,riblt,replay");
+    let methods = a.str("methods", "rbsr,real,riblt,replay,product");
     let base = peer_keys(seed, 0, n);
     for sc in scenarios.split(',') {
         let w = make_world(&base, sc, seed);
         let summary = w.publ.summary();
+        if methods.split(',').any(|m| m == "product") && sc != "initial" {
+            // The daemon's repair path with the product code: replay first,
+            // range sessions when replay cannot finish (exact mirror only).
+            let r = product_repair(&w, n);
+            println!(
+                "| {sc} | exact | product | {} | {} | {} | {} | {:.1} | {} B replay + {} B session | {} |",
+                if r.ok && r.fneg == 0 { "ok" } else { "FAILED" },
+                r.sessions,
+                r.rounds,
+                human((r.replay_bytes + r.session_bytes) as f64),
+                r.cpu_ms,
+                r.replay_bytes,
+                r.session_bytes,
+                r.via,
+            );
+        }
         let diff = if sc == "initial" { n } else { 0 };
         let _ = diff;
         for sp in specs.split(',') {
             let spec = Spec::parse(sp).unwrap_or_else(|| panic!("spec {sp}"));
             for me in methods.split(',') {
+                if me == "product" {
+                    continue;
+                }
                 let mut m = if sc == "initial" {
                     spec.empty(n)
                 } else {

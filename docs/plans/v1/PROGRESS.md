@@ -68669,3 +68669,21 @@ Sweeps again, `+commit`, 2,000 seeds, final binary, base = step 9 (configs not n
 136 -> 135, `locks-blips-tight-delegated` 3 -> 5 and `locks-unlinked-delegated-blips` 3 -> 4 (the class claim above), `locks-unlinked-delegated-partition` 3 -> 3,
 `long-delegated-hysteresis-off` 29 -> 31 (negative control, same signature). Latency (`SWEEP-L3`, ms): `delegated-two-dirs-one-backed` mean 2,592 -> 1,818, max 8,834 ->
 12,449 (the crashed delegate's tail, as before this round); `placement-hot` 61 -> 58, max 2,827 -> 2,828; `long-delegated` 253 -> 309; `delegated-partition` 2,927 -> 2,926.
+
+## Plan 47 P3: range-repair livelock fixed, delta-log replay first
+
+The maintainer's P2 decision (2026-11-07): keep the exact mirror; fix the livelock; add delta-log replay in front of range-based repair. No storage change.
+
+| Item | State | Where |
+|---|---|---|
+| Livelock: `Session` queued ranges FIFO (breadth first), so on 8 Mi-key peers a gap of 50 k or more changes (a 100 k burst, a 160 k restart) spent every 256-round session on `Children` frontiers, applied no `Items`, and the next session repeated it (P1: 50 sessions, 517 MiB, nothing applied). The walk is now depth first (a stack); each `Items` answer lands at once, so a cut session keeps its progress | done, fail-before test | `crates/net/src/reconcile.rs` (`Session`, test `a_large_gap_on_a_large_set_converges_because_sessions_keep_progress`) |
+| Delta-log replay: `DeltaLog` (size and age bounds), `respond_replay`, `ReplayReply`, `Mirror::{exact_seq, replay_point, apply_replay}`; `Payload::{ReplayRequest, ReplayReply}`, `PeerService::replay_requested`; the engine tries replay before a session and accepts it only when count and root fingerprint equal the owner's summary at the last replayed seq | done | `crates/net/src/{reconcile,message,peers,endpoint}.rs`, `crates/engine/src/{coop.rs,coop/exact.rs,p2p.rs}` |
+| Knob `CONSTELLATION_COOP_REPLAY_LOG_BYTES` (default 8 MiB, 0 = off); status `replay_hits`, `replay_misses`, `replay_bytes`, `replay_log_bytes`; `/metrics` `constellation_coop_replay_*`; schema re-blessed | done | `crates/control/src/{proto/types.rs,web.rs}`, `crates/control/schema/control.schema.json`, `docs/reference/{configuration.md,features/cooperative-cache.md}` |
+| Bench: `product` repair method (replay then sessions), `--plog` A/B, depth-first generic initiator; results, decision | done | `bench/coop-digest/{src,RESULTS.md (section 12),DECISION.md (section 7),raw/p3-*}` |
+| Plan 47 | wip; open: pjdfstest, smoke, integration and the full harness matrix were not run for P3 | `docs/plans/v1/wip/47-chunk-location-digests.md` |
+
+Evidence (RESULTS section 12): 8 Mi keys, 100 k changes: session only 26.1 MiB / 3 sessions / 314 ms (P1: never finished); replay first 767 KiB / 17 rounds / 22.6 ms; 1 k: 777 KiB against 8.2 KiB; a silent burst costs 227 B more than before; steady wire identical, publisher CPU within noise (box 3, A/B/B/A); log memory 1.2 / 7.3 / 8.4 MB at 0.1 / 1 / 10 % churn per minute on 8 Mi keys. Real nodes: `coop-exact-churn` repaired two gaps by replay.
+
+Gates (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, net lib (139), engine lib (954), control (146), `cargo test --workspace`, release `cargo build --workspace`, harness `coop-cache-hit`, `coop-fallback`, `coop-exact-churn`, `coop-digest-compare` PASSED; bench crate fmt, clippy, tests.
+
+One bug found on the way: `Coop::report` took the `local` lock twice inside one struct literal (the first guard lives to the end of the statement) and deadlocked; the lock is taken once before the literal.

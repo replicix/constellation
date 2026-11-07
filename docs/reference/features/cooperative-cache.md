@@ -72,6 +72,36 @@ and one *mirror* of every peer's published set.
   cache rebuild, is published silently. `seq` advances and a summary
   goes out at once, and peers reconcile.
 
+### Delta-log replay
+
+Most gaps are a few lost or reordered deltas that the owner still has.
+Each node keeps its recently published deltas in a log, bounded in
+bytes (8 MiB by default, about ten minutes of 1 % churn on an 8M-chunk
+cache) and in age (10 minutes). When a mirror learns it is behind (a
+summary that does not match, a delta applied off its base, or the
+liveness sweep), the first repair step is a `ReplayRequest`: "send me your deltas after `seq` N",
+where N is the last `seq` the mirror was known to be exact at. The owner
+answers `ReplayReply` with the consecutive deltas from N + 1 up to its
+current `seq`, paged at 48 KiB of delta bytes (a larger backlog takes
+more requests, at most 64). The mirror applies them in order and
+accepts the result only if its count and root fingerprint equal the
+owner's summary at the last replayed `seq`, so the mirror is exactly the
+owner's set, never a guess. A delta only says which keys are present or
+absent, so deltas already applied by gossip, or applied out of order,
+are applied again harmlessly.
+
+Replay is refused, and the mirror runs a reconciliation session instead,
+when: the owner restarted (new incarnation, no log), the log was cut by
+the size or age bound before N + 1, the change was published silently
+(more than 8 delta messages in one tick: no deltas exist, and the log
+is emptied), the mirror has no exact point yet (initial sync), or the
+fingerprint check fails. Replay costs the missed deltas' own bytes: for
+100k changes on an 8M-chunk peer about 0.77 MB against 26 MB for a
+session, and no fingerprint walk. A node answers replay only in exact
+mode; a peer that cannot answer it (bloom mode, replay off, an older
+version) makes the request fail or come back unavailable, and the
+session runs, as for every digest message.
+
 ### Reconciliation sessions
 
 The mirror holder sends `ReconcileRequest` rounds directly to the owner
@@ -86,6 +116,16 @@ for that range. For each query the owner answers:
   initiator settles the equal and empty children locally and queries
   the rest next round.
 
+The walk is depth first: the next request takes the ranges just
+queued, so an `Items` answer lands in the mirror within a few rounds.
+(A breadth-first walk had to finish a whole level first; on an 8M-chunk
+peer with a gap of 50k or more changes a level did not fit in one
+session's 256 rounds, no `Items` answer was ever reached and every
+session repeated the last one. It converges now: a 100k-change gap takes
+3 sessions and about 26 MB.) Each applied answer is exact on its own, so
+a session cut short by the round cap leaves a mirror nearer the owner,
+and the next one settles what is done with no answer and continues.
+
 A session starts at the root when no difference is known. It starts
 deeper (16 or 256 ranges) when a summary already showed a difference on
 a large set. A session ends when every range is settled or after 256
@@ -96,8 +136,9 @@ at most 4 run at once, and each round has a 5 s timeout. No session is
 ever on a read or write path.
 
 A liveness sweep every digest interval probes peers whose mirror has not
-been confirmed for two intervals. The probe is one root query, about
-200 bytes each way when in sync. So a broken gossip mesh costs
+been confirmed for two intervals. The probe is one replay request from
+the mirror's last exact point (or, with no such point, one root query),
+about 200 bytes each way when in sync. So a broken gossip mesh costs
 freshness, not exactness, and a new peer is synced even before its
 first summary arrives.
 
@@ -107,6 +148,8 @@ first summary arrives.
 |---|---|
 | `CacheSummary` | ~150 bytes |
 | `CacheSetDelta` | ≤ 2048 keys, ≤ ~21 KiB (inside the 31 KiB gossip content limit) |
+| `ReplayRequest` | an incarnation and a `seq`, ~120 bytes signed |
+| `ReplayReply` | ≤ 48 KiB of deltas plus the owner's summary (the first delta is always sent, so a page is never empty; under the 64 KiB frame) |
 | `ReconcileRequest` | ≤ 512 ranges, ~19 KiB |
 | `ReconcileReply` | ≤ 48 KiB of answers; the owner stops early and reports `processed`, and the rest is re-sent (always under the 64 KiB stream frame) |
 
@@ -190,6 +233,7 @@ later read went to S3.
 | `CONSTELLATION_COOP_DIGEST` | `exact` | `exact` or `bloom` |
 | `CONSTELLATION_DIGEST_INTERVAL_S` | `30` | summary heartbeat and liveness sweep (exact); bloom snapshot rotation (bloom) |
 | `CONSTELLATION_DIGEST_TTL_S` | `4 × interval` | a mirror or bloom unconfirmed for this long is not used for lookups |
+| `CONSTELLATION_COOP_REPLAY_LOG_BYTES` | `8388608` | bytes of recent deltas kept for peers to replay; `0` turns replay off (this node keeps no log and does not try to replay from others) |
 
 ## Status and metrics
 
@@ -197,8 +241,8 @@ The control API's `status` reply (JSON, under `coop`) and `constellation
 status` expose the counters below. `/metrics` exports a subset:
 `peer_hits`, `peer_misses`, `peer_false_positives`, `peer_stale_misses`,
 `peer_errors`, `hedges`, `digest_bytes_sent`, `digest_bytes_received`,
-`digest_cpu_us`, `reconcile_rounds` and `peer_set_entries`, as
-`constellation_coop_*`.
+`digest_cpu_us`, `reconcile_rounds`, `replay_hits`, `replay_misses`,
+`replay_bytes` and `peer_set_entries`, as `constellation_coop_*`.
 
 - `digest_mode`
 - `peer_false_positives`, `peer_stale_misses`, `peer_misses`
@@ -209,6 +253,14 @@ status` expose the counters below. `/metrics` exports a subset:
 - `reconcile_sessions`, `reconcile_rounds`, `reconcile_failures`,
   `reconcile_cpu_us`: the exact-mode sessions this node initiated. The
   CPU counter covers both sides of the rounds this node took part in.
+- `replay_hits`, `replay_misses`, `replay_bytes`: repairs finished by
+  delta-log replay, repairs that tried it and fell back to a session
+  (log cut, silent burst, fingerprint mismatch, transport error), and
+  the wire bytes of replay requests and replies. A restarted owner or a
+  mirror with no exact point is not a miss (replay is not tried), and
+  neither is a current mirror's liveness probe (an empty reply with a
+  matching summary).
+  `replay_log_bytes` is the size of this node's own log.
 - `local_set_entries`, `peer_set_entries`, `peer_set_bytes`
 - `fresh_hint_hits`, `fresh_hint_misses`: fetches of a chunk no mirror
   listed yet, from the node that wrote it

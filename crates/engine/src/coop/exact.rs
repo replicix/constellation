@@ -32,8 +32,9 @@ use super::Coop;
 use constellation_fs_core::cache::{DigestBatch, DigestChange};
 use constellation_net::message::wire_len;
 use constellation_net::reconcile::{
-    encode_keys, key_of, respond, start_bits_for, Delta, DeltaOutcome, Key, KeySet, Mirror, Query,
-    Session, Summary, MAX_DELTA_KEYS, REPLY_BUDGET,
+    encode_keys, key_of, respond, respond_replay, start_bits_for, Delta, DeltaLog, DeltaOutcome,
+    Key, KeySet, Mirror, Query, ReplayReply, Session, Summary, MAX_DELTA_KEYS, MAX_REPLAY_PAGES,
+    REPLAY_PAGE_BUDGET, REPLY_BUDGET,
 };
 use constellation_net::{ChunkDecline, Payload};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -75,6 +76,9 @@ pub(super) struct LocalSet {
     recent: HashMap<Key, Instant>,
     recent_order: VecDeque<(Key, Instant)>,
     grace: Duration,
+    /// The deltas this node published recently (plan 47 P3), for peers
+    /// that missed some: replayed in front of a reconciliation session.
+    log: DeltaLog,
 }
 
 /// Result of absorbing one journal drain.
@@ -86,7 +90,7 @@ pub(super) struct Absorbed {
 }
 
 impl LocalSet {
-    pub(super) fn new(grace: Duration) -> Self {
+    pub(super) fn new(grace: Duration, log_bytes: usize, log_age: Duration) -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -99,7 +103,23 @@ impl LocalSet {
             recent: HashMap::new(),
             recent_order: VecDeque::new(),
             grace,
+            log: DeltaLog::new(log_bytes, log_age),
         }
+    }
+
+    pub(super) fn log_bytes(&self) -> usize {
+        self.log.bytes()
+    }
+
+    /// Answer a peer's replay request from the delta log.
+    pub(super) fn replay(&self, incarnation: u64, after_seq: u64) -> ReplayReply {
+        respond_replay(
+            &self.log,
+            self.summary(),
+            incarnation,
+            after_seq,
+            REPLAY_PAGE_BUDGET,
+        )
     }
 
     pub(super) fn summary(&self) -> Summary {
@@ -144,6 +164,7 @@ impl LocalSet {
     /// net change comes back as chained deltas ready to gossip.
     pub(super) fn absorb(&mut self, batch: &DigestBatch, now: Instant, emit: bool) -> Absorbed {
         self.prune_recent(now);
+        self.log.prune(now);
         // Final desired presence of every touched key; the journal is
         // ordered, so a later event for the same key wins.
         let mut touched: HashMap<Key, bool> = HashMap::new();
@@ -198,6 +219,9 @@ impl LocalSet {
                 self.keys.insert(k);
             }
             self.seq += 1;
+            // No delta exists for this change: a peer asking for the
+            // deltas before it cannot be served by replay.
+            self.log.clear();
             return Absorbed {
                 deltas: Vec::new(),
                 silent: emit,
@@ -223,14 +247,16 @@ impl LocalSet {
                 }
             }
             self.seq += 1;
-            deltas.push(Delta {
+            let delta = Delta {
                 incarnation: self.incarnation,
                 seq: self.seq,
                 base,
                 root: self.keys.root_fingerprint(),
                 adds: encode_keys(0, &a),
                 removes: encode_keys(0, &r),
-            });
+            };
+            self.log.push(delta.clone(), now);
+            deltas.push(delta);
         }
         Absorbed {
             deltas,
@@ -420,6 +446,26 @@ impl Coop {
         payload
     }
 
+    /// Answer a peer's request for the deltas after `after_seq`.
+    pub fn replay_reply(&self, incarnation: u64, after_seq: u64) -> Payload {
+        let request = Payload::ReplayRequest {
+            incarnation,
+            after_seq,
+        };
+        if !self.exact_active() {
+            return Payload::ReplayReply {
+                reply: ReplayReply::unavailable(),
+            };
+        }
+        self.note_rx(&request);
+        let started = Instant::now();
+        let reply = self.local.lock().unwrap().replay(incarnation, after_seq);
+        self.note_cpu(started, true);
+        let payload = Payload::ReplayReply { reply };
+        self.note_tx(&payload);
+        payload
+    }
+
     /// Peers whose fresh mirror holds `key`, pruning mirrors of peers
     /// that left the registry, are really this node (a shared node key:
     /// a fetch from them would dial ourselves), or are long past
@@ -562,13 +608,26 @@ impl Coop {
         self.counters
             .reconcile_sessions
             .fetch_add(1, Ordering::Relaxed);
-        let start_bits = {
+        {
             let mut map = self.mirrors.lock().unwrap();
             let pm = map.entry(node_id).or_default();
             pm.last_session = Some(Instant::now());
             if pm.oversize {
                 return;
             }
+        }
+        // First step (plan 47 P3): replay the owner's recent deltas. Only
+        // when it ends with the mirror equal to the owner's summary is
+        // the repair done; anything else falls through to the session.
+        if self.replay_enabled() && self.run_replay(node_id).await == Some(true) {
+            self.finish_session(node_id, true);
+            return;
+        }
+        let start_bits = {
+            let mut map = self.mirrors.lock().unwrap();
+            let Some(pm) = map.get_mut(&node_id) else {
+                return;
+            };
             let advertised = pm.advertised.map(|s| s.count as usize).unwrap_or(0);
             if pm.known_different() {
                 start_bits_for(pm.mirror.keys.len().max(advertised))
@@ -646,6 +705,12 @@ impl Coop {
                 return;
             }
         }
+        self.finish_session(node_id, session.is_done());
+    }
+
+    /// Whether the mirror matches what its owner last advertised after a
+    /// repair, and a follow-up session if not.
+    fn finish_session(&self, node_id: u64, done: bool) {
         let resync = {
             let mut map = self.mirrors.lock().unwrap();
             let Some(pm) = map.get_mut(&node_id) else {
@@ -659,12 +724,141 @@ impl Coop {
                 None => false,
             }
         };
-        if resync || !session.is_done() {
+        if resync || !done {
             // The owner churned mid-session (or the round cap hit): the
             // next session only walks the ranges that changed since.
             self.request_sync(node_id);
         }
     }
+
+    fn replay_enabled(&self) -> bool {
+        self.config.replay_log_bytes > 0
+    }
+
+    /// Try to repair `node_id`'s mirror by replaying the deltas its owner
+    /// logged after the point the mirror was last exact at.
+    ///
+    /// `None`: not attempted (no exact point, or an owner that restarted
+    /// since: its log is gone). `Some(true)`: the mirror now equals the
+    /// owner's summary at the last replayed `seq`, verified by count and
+    /// root fingerprint. `Some(false)`: the log could not serve it, a
+    /// delta was malformed, or the fingerprint differs; the caller runs a
+    /// session (which also repairs whatever a failed replay applied).
+    ///
+    /// A mirror that is already current gets an empty page and a matching
+    /// summary: that is the liveness probe the sweep needs (one small
+    /// round trip, like the session's root query) and counts as neither a
+    /// hit nor a miss.
+    async fn run_replay(&self, node_id: u64) -> Option<bool> {
+        let (incarnation, mut after) = {
+            let map = self.mirrors.lock().unwrap();
+            let pm = map.get(&node_id)?;
+            let (incarnation, exact) = pm.mirror.replay_point()?;
+            if pm.oversize
+                || pm
+                    .advertised
+                    .is_some_and(|advertised| advertised.incarnation != incarnation)
+            {
+                return None;
+            }
+            (incarnation, exact)
+        };
+        let mut applied = 0usize;
+        // One extra round if gossip moved the mirror past the replayed
+        // point while the replay ran.
+        let mut raced = false;
+        for _ in 0..MAX_REPLAY_PAGES {
+            let request = Payload::ReplayRequest {
+                incarnation,
+                after_seq: after,
+            };
+            self.note_tx(&request);
+            let sent = wire_len(&request) as u64;
+            let reply = match self
+                .peers
+                .request_to_node_timeout(node_id, &request, RECONCILE_TIMEOUT)
+                .await
+            {
+                Ok(payload @ Payload::ReplayReply { .. }) => {
+                    self.note_rx(&payload);
+                    self.counters
+                        .replay_bytes
+                        .fetch_add(sent + wire_len(&payload) as u64, Ordering::Relaxed);
+                    match payload {
+                        Payload::ReplayReply { reply } => reply,
+                        _ => unreachable!(),
+                    }
+                }
+                Ok(_) | Err(_) => {
+                    // The session that follows counts its own failure.
+                    self.counters.replay_misses.fetch_add(1, Ordering::Relaxed);
+                    return Some(false);
+                }
+            };
+            let started = Instant::now();
+            let step = {
+                let mut map = self.mirrors.lock().unwrap();
+                let pm = map.get_mut(&node_id)?;
+                if !reply.available
+                    || reply.summary.incarnation != incarnation
+                    || reply.summary.count as usize > MAX_MIRROR_KEYS
+                    || pm.mirror.incarnation != Some(incarnation)
+                {
+                    Step::Miss
+                } else {
+                    pm.advertise(reply.summary);
+                    match pm.mirror.apply_replay(&reply.deltas, after) {
+                        Err(_) => Step::Miss,
+                        Ok(last) => {
+                            let progressed = last > after;
+                            applied += reply.deltas.len();
+                            after = last;
+                            if after >= reply.summary.seq {
+                                if pm.mirror.matches(&reply.summary) {
+                                    Step::Hit
+                                } else if pm.mirror.last_seq > after && !raced {
+                                    // Gossip applied a newer delta on top of
+                                    // a not-yet-exact mirror: ask again
+                                    // from the replayed point.
+                                    raced = true;
+                                    Step::More
+                                } else {
+                                    Step::Miss
+                                }
+                            } else if progressed {
+                                Step::More
+                            } else {
+                                Step::Miss
+                            }
+                        }
+                    }
+                }
+            };
+            self.note_cpu(started, true);
+            match step {
+                Step::Hit => {
+                    if applied > 0 {
+                        self.counters.replay_hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Some(true);
+                }
+                Step::Miss => {
+                    self.counters.replay_misses.fetch_add(1, Ordering::Relaxed);
+                    return Some(false);
+                }
+                Step::More => {}
+            }
+        }
+        self.counters.replay_misses.fetch_add(1, Ordering::Relaxed);
+        Some(false)
+    }
+}
+
+/// What one replayed page did to the repair.
+enum Step {
+    Hit,
+    Miss,
+    More,
 }
 
 fn decline() -> Payload {
@@ -700,7 +894,7 @@ mod tests {
 
     #[test]
     fn absorb_publishes_net_changes_as_chained_deltas() {
-        let mut local = LocalSet::new(Duration::from_secs(10));
+        let mut local = LocalSet::new(Duration::from_secs(10), 1 << 20, Duration::from_secs(600));
         let now = Instant::now();
         let empty_root = local.keys.root_fingerprint();
         let out = local.absorb(
@@ -738,7 +932,7 @@ mod tests {
 
     #[test]
     fn a_large_tick_is_split_and_a_huge_one_goes_silent() {
-        let mut local = LocalSet::new(Duration::from_secs(10));
+        let mut local = LocalSet::new(Duration::from_secs(10), 1 << 20, Duration::from_secs(600));
         let now = Instant::now();
         let adds = (0..(MAX_DELTA_KEYS as u64 * 2 + 5))
             .map(|n| DigestChange::Add(h(n)))
@@ -760,9 +954,55 @@ mod tests {
         assert_eq!(local.keys.len(), expected, "a silent tick still applies");
     }
 
+    /// Plan 47 P3: the published deltas are logged, a silent tick (seq
+    /// moves with no delta) empties the log, and replay refuses what the
+    /// log cannot reach back to.
+    #[test]
+    fn the_delta_log_follows_publishing_and_a_silent_tick_clears_it() {
+        let mut local = LocalSet::new(Duration::from_secs(10), 1 << 20, Duration::from_secs(600));
+        let now = Instant::now();
+        let inc = local.summary().incarnation;
+        let mut mirror = Mirror::default();
+        for n in 0..3u64 {
+            let out = local.absorb(&batch(vec![DigestChange::Add(h(n))]), now, true);
+            if n == 0 {
+                // The mirror follows the first delta only.
+                assert_eq!(mirror.apply_delta(&out.deltas[0]), DeltaOutcome::Exact);
+            }
+        }
+        assert!(local.log_bytes() > 0);
+        let reply = local.replay(inc, 1);
+        assert!(reply.available && reply.deltas.len() == 2);
+        assert_eq!(mirror.apply_replay(&reply.deltas, 1), Ok(3));
+        assert!(mirror.matches(&reply.summary));
+        assert!(mirror.keys == local.keys);
+
+        let huge = (0..(MAX_DELTA_KEYS * MAX_DELTAS_PER_TICK) as u64 + 1)
+            .map(|n| DigestChange::Add(h(1_000_000 + n)))
+            .collect();
+        let out = local.absorb(&batch(huge), now, true);
+        assert!(out.silent);
+        assert_eq!(local.log_bytes(), 0);
+        assert!(!local.replay(inc, 3).available);
+        // A mirror already at the silent seq has nothing missing.
+        let seq = local.summary().seq;
+        assert!(local.replay(inc, seq).available);
+        // The next delta starts a new run only a current mirror can use.
+        local.absorb(&batch(vec![DigestChange::Add(h(9))]), now, true);
+        assert!(!local.replay(inc, 3).available);
+        assert!(local.replay(inc, seq).available);
+        assert!(!local.replay(inc ^ 1, seq).available, "other incarnation");
+
+        // Replay off: nothing is kept.
+        let mut off = LocalSet::new(Duration::from_secs(10), 0, Duration::from_secs(600));
+        off.absorb(&batch(vec![DigestChange::Add(h(1))]), now, true);
+        assert_eq!(off.log_bytes(), 0);
+        assert!(!off.replay(off.summary().incarnation, 0).available);
+    }
+
     #[test]
     fn a_rebuild_publishes_the_difference_only() {
-        let mut local = LocalSet::new(Duration::from_secs(10));
+        let mut local = LocalSet::new(Duration::from_secs(10), 1 << 20, Duration::from_secs(600));
         let now = Instant::now();
         local.absorb(
             &batch(vec![DigestChange::Add(h(1)), DigestChange::Add(h(2))]),
@@ -786,7 +1026,7 @@ mod tests {
 
     #[test]
     fn recent_removals_expire_after_the_grace_window() {
-        let mut local = LocalSet::new(Duration::from_millis(50));
+        let mut local = LocalSet::new(Duration::from_millis(50), 1 << 20, Duration::from_secs(600));
         let t0 = Instant::now();
         local.absorb(&batch(vec![DigestChange::Add(h(1))]), t0, true);
         local.absorb(&batch(vec![DigestChange::Remove(h(1))]), t0, true);

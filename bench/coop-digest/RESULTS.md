@@ -16,6 +16,7 @@ Contents: [1 What was run](#1-what-was-run) ·
 [9 Filter insert failures](#9-filter-insert-failures-and-rebuilds) ·
 [10 Crates](#10-crates-licence-and-unsafe) ·
 [11 Not measured](#11-what-was-not-measured) ·
+[12 P3 results](#12-p3-results-the-livelock-fix-and-delta-log-replay) ·
 [Reproducing](#reproducing)
 
 ## 1 What was run
@@ -1078,6 +1079,182 @@ own `Cargo.lock`.
 - Timings for the 8 Mi-key initial sync (minutes per run) were measured once
   on the correctness box (`raw/repair.md`) and not repeated on the timing box;
   the 1 Mi-key initial sync was.
+
+## 12 P3 results: the livelock fix and delta-log replay
+
+Phase P3 after the maintainer's decision (`DECISION.md` section 7): the exact
+mirror stays; the repair path changed. Everything here ran the **product code**
+(`reconcile::Session`, `respond`, `respond_replay`, `Mirror::apply_replay`,
+`DeltaLog`) through this crate; the P1 tables above are the "before". Raw rows:
+`raw/p3-repair-1m.md`, `raw/p3-repair-8m.md` (bytes and rounds, correctness
+box, deterministic), `raw/p3-box3-timing.md` (A/B timing and repair CPU, quiet
+box), `raw/p3-log-memory.md` (log memory). Binary of record on both boxes:
+`d1a3a4c4b252672c` (first 16 hex of sha256) for the timing runs and the repair
+rows; the memory rows came from a later build that only adds an allocator
+counter to the printed line.
+
+### 12.1 The livelock
+
+**Cause.** `Session` (`crates/net/src/reconcile.rs`) kept its pending ranges in
+a FIFO queue, so the walk was breadth first: it asked about every range of a
+level before any range of the next. On a peer of 8 Mi keys the owner answers a
+disputed level-16 range (about 128 keys, above `ITEMS_THRESHOLD` = 32) with
+`Children` (16 child fingerprints, about 436 bytes, about 110 per 48 KiB
+reply), and a gap of 50 k or more changes disputes tens of thousands of them.
+The 256 rounds of `MAX_ROUNDS` went to `Children` frontiers; no `Items`
+answer, the only answer that changes the mirror, was ever reached; the session
+ended with the mirror untouched and the driver's next session started from
+the same start level and repeated it exactly (P1: 50 sessions, 517 MiB, no key
+applied). **Fix.** The walk is depth first (a stack: the next request takes
+the ranges just queued): the first `Items` answers arrive after a handful of
+rounds and are applied at once, so a session that hits the round cap has still
+moved the mirror toward the owner, and the next one settles what is done with
+an equal fingerprint and no answer. Nothing about exactness changes: every
+applied answer was exact on its own, and a session still ends only when every
+range is settled.
+
+**Fail-before test**: `reconcile::tests::a_large_gap_on_a_large_set_converges_because_sessions_keep_progress`
+(3 M keys, 60 k changes: about 46 keys per level-16 range, about 35 k disputed
+level-16 ranges, about 310 rounds of `Children` alone, the product's constants;
+the smallest set the CI can afford with the 8 Mi-key shape, 2.4 s in a debug
+build). On the parent it fails ("session 4 used 256 rounds and applied nothing
+(58134 differences left)"); with the fix it converges.
+
+Rows (C1, the real `Session` repeated as the daemon does, up to 50 sessions;
+bytes are postcard lengths of requests and replies):
+
+| scenario | P1 (breadth first), 8 Mi keys | P3 (depth first), 8 Mi keys | P1, 1 Mi keys | P3, 1 Mi keys |
+|---|---|---|---|---|
+| gap1 | 6.4 KiB / 4 rounds / 1 sess | 6.4 KiB / 4 / 1 | 5.9 KiB / 3 / 1 | 5.9 KiB / 3 / 1 |
+| gap1k | 852.2 KiB / 21 / 1 | 777.2 KiB / 22 / 1 | 544.8 KiB / 13 / 1 | 503.5 KiB / 14 / 1 |
+| gap10k | 5.45 MiB / 136 / 1 | 5.25 MiB / 132 / 1 | | |
+| gap30k | 24.57 MiB / 611 / 3 | 12.07 MiB / 294 / 2 | | |
+| gap50k | **FAILED** (50 sess, 518.5 MiB) | 17.24 MiB / 415 / 2 | | |
+| gap100k | **FAILED** (50 sess, 517.4 MiB) | 26.14 MiB / 621 / 3 | 8.16 MiB / 164 / 1 | 8.11 MiB / 165 / 1 |
+| burst100k | **FAILED** (50 sess, 517.4 MiB) | 26.15 MiB / 621 / 3 | 8.16 MiB / 164 / 1 | 8.11 MiB / 165 / 1 |
+| restart (160 k differences at 8 Mi) | **FAILED** (50 sess, 516.8 MiB) | 32.68 MiB / 766 / 3 | 3.80 MiB / 81 / 1 | 3.75 MiB / 82 / 1 |
+
+No false negatives in the 20 000-key sample of any row. Wall time derived as
+in section 7 (CPU plus rounds times RTT): 100 k at 8 Mi keys is 931 ms CPU
+(owner plus receiver, in-process) plus 621 round trips, 1.0 s at 1 ms RTT and
+31 s at 50 ms; in P1 the same gap never finished. The bytes are about 3x the
+1 Mi-key figure per change because 8 Mi-key level-16 ranges need a `Children`
+step; the generic initiator used for the other candidates (`rbsr`) was changed
+to depth first too and agrees within 1 % with the real one (`raw/p3-repair-8m.md`).
+CPU of the session itself is unchanged: gap100k at 1 Mi keys 64.9 ms
+(median of three runs on the timing box) against 19 + 44 ms in P1.
+
+### 12.2 Delta-log replay, then RBSR
+
+Design (`reconcile.rs`, `engine/src/coop/exact.rs`): the owner keeps its
+published `Delta`s in a `DeltaLog` (a contiguous run of `seq`, at most 8 MiB
+by default and at most 10 minutes old, newest always kept; a silent tick, in
+which `seq` moves with no delta, empties it). A mirror remembers `exact_seq`,
+the owner `seq` at which it last equalled the owner exactly (an exact delta, a
+matching summary, a finished session or replay), and when it learns it is
+behind it sends `ReplayRequest { incarnation, after_seq: exact_seq }`; the
+owner answers `ReplayReply { summary, available, deltas }`, the consecutive
+deltas from `after_seq + 1` to its current `seq`, paged at 48 KiB of delta
+bytes (never fewer than one delta per page), at most 64 pages. The mirror
+applies them in order and takes the result as exact only if its count and root
+fingerprint equal the owner's summary at the last replayed `seq`; otherwise
+the session runs. Replay is not attempted for a restarted owner (the
+incarnation differs: its log is gone) or a mirror with no exact point (initial
+sync). A current mirror's liveness probe is the same request with an empty
+answer. Because a delta only names keys present or absent, re-applying deltas
+that gossip already applied, or applying out of order, ends on the same set,
+which the fingerprint then confirms.
+
+Tests (net): small gap exact; paged backlog within the budget (and a budget
+below one delta still makes progress); truncated log by size and by age refuses
+and a session converges; restart (other incarnation) and a silent change leave
+no replay; reordered deltas repaired from the exact point; a mirror dirtied
+in a way the log cannot explain is never accepted (`exact_seq` does not move);
+malformed pages refused without side effects; a restart clears the exact point;
+the largest replay page fits `MAX_FRAME`; paging over real QUIC with the session
+fallback over the same connection. Engine: the log follows publishing and a
+silent tick clears it.
+
+Rows (`product` method: the daemon's flow, replay first and sessions when it
+cannot finish; bytes are signed-frame sizes for replay and postcard for
+sessions; CPU is the whole in-process repair, owner and receiver together:
+median of three runs on the timing box for gap1, gap1k, gap100k, burst100k and
+restart, one run on the correctness box for gap10k to gap50k):
+
+| scenario | 8 Mi keys: session only (P3 `real`) | 8 Mi keys: product | 1 Mi keys: session only | 1 Mi keys: product |
+|---|---|---|---|---|
+| gap1 | 6.4 KiB / 4 rounds / 0.2 ms | **273 B** / 1 round / 0.0 ms | 5.9 KiB / 3 / 0.1 ms | 273 B / 1 / 0.0 ms |
+| gap1k | 777 KiB / 22 / 10.0 ms | **8.2 KiB** / 1 / 0.3 ms | 503 KiB / 14 / 5.9 ms | 8.2 KiB / 1 / 0.1 ms |
+| gap10k | 5.25 MiB / 132 / 66 ms | **77.3 KiB** / 2 / 2.6 ms | 2.59 MiB / 60 | 77.2 KiB / 2 |
+| gap30k | 12.07 MiB / 294 / 151 ms | **232 KiB** / 5 / 7.5 ms | 4.65 MiB / 99 | 231 KiB / 5 |
+| gap50k | 17.24 MiB / 415 / 213 ms | **385 KiB** / 10 / 11.8 ms | 6.03 MiB / 126 | 384 KiB / 10 |
+| gap100k (7 ticks) | 26.14 MiB / 621 / 314 ms | **767 KiB** / 17 / 22.6 ms | 8.11 MiB / 165 / 64.9 ms | 765 KiB / 17 / 4.7 ms |
+| burst100k (silent) | 26.15 MiB / 621 / 314 ms | 26.15 MiB / 622 / 314 ms (227 B probe, then the session) | 8.11 MiB / 165 | 8.11 MiB / 166 |
+| restart | 32.68 MiB / 766 / 380 ms | same (no replay attempted) | 3.75 MiB / 82 / 34 ms | same |
+
+Replay is 34x fewer bytes and 14x less CPU than the session at 100 k changes
+on 8 Mi keys, 95x fewer bytes at 1 k, and costs 227 B when it cannot help.
+The simulation of section 8 predicted 16.9x fewer repair bytes per peer-minute
+under loss; that row was not re-run (the product path is the same replay).
+Over real nodes, `coop-exact-churn` showed replay in use (below).
+
+### 12.3 Steady state (box 3, A/B/B/A, four runs each, 2 simulated minutes)
+
+`steady --spec c1 ... --plog 0` (A: no log, the pre-P3 publisher) against
+`--plog 1` (B: the product `DeltaLog` charged to the publisher's time:
+`prune`, the delta clone and `push`). Publisher `absorb` per 250 ms tick,
+median over the four runs of each row's p50 (range of the four), microseconds:
+
+| n | churn per minute | A (no log) | B (log) | B/A |
+|---|---|---|---|---|
+| 1 Mi | 1 % | 6.49 (6.17-7.48) | 6.67 (6.33-6.83) | +2.8 % |
+| 1 Mi | 10 % | 43.75 (43.59-43.87) | 44.75 (44.26-45.31) | +2.3 % |
+| 8 Mi | 1 % | 112.7 (111.1-115.4) | 112.4 (110.5-113.2) | -0.2 % |
+| 8 Mi | 10 % | 1008 (989-1035) | 1011 (987-1033) | +0.2 % |
+
+The 1 Mi-key rows are at the edge of the noise (A's own spread at 1 %
+covers B; at 10 % the cost is about 1 us per tick). Steady wire is identical
+by construction and in the rows: 122 932 B delta + 248 B summary per
+peer-minute (1 Mi, 1 %), 877 311 (1 Mi, 10 %), 715 014 (8 Mi, 1 %), 6 427 911
+(8 Mi, 10 %) in both arms; replay adds traffic only during repairs. Receiver
+apply and mirror memory are untouched (the receiver does nothing new until a
+repair).
+
+### 12.4 Log memory (10 simulated minutes, default 8 MiB cap, 10 min age bound)
+
+| n | churn per minute | log, counted bytes | allocator-live | entries |
+|---|---|---|---|---|
+| 8 Mi | 0.1 % | 0.95 MB | 1.17 MB | 2 400 (10 min) |
+| 8 Mi | 1 % | 7.04 MB | 7.27 MB | 2 400 (10 min) |
+| 8 Mi | 10 % | 8.38 MB | 8.44 MB | 628 (size cap, 2.6 min) |
+| 1 Mi | 1 % | 1.12 MB | 1.35 MB | 2 400 (10 min) |
+| 1 Mi | 10 % | 8.39 MB | 8.62 MB | 2 323 (size cap) |
+
+One log per node regardless of the number of peers. At the default cap a
+mirror that missed up to 10 minutes of 1 % churn on an 8 Mi-key peer, or about
+2.6 minutes of 10 %, is repaired by replay; older gaps fall back to a session
+(26 MiB at 100 k changes, 12 MiB at 30 k).
+
+### 12.5 Real nodes
+
+`coop-cache-hit`, `coop-fallback`, `coop-exact-churn` and `coop-digest-compare`
+(release, three nodes, S3 in docker, FUSE) pass. In one `coop-exact-churn` run
+the daemons repaired two gaps by replay (`replay_hits=2`, `replay_misses=0`,
+874 wire bytes, `reconcile_failures=0`, zero false positives); in the other
+runs the sweep's liveness probes matched and nothing needed repair.
+
+### 12.6 Reproducing P3
+
+```
+cd bench/coop-digest
+cargo build --release --locked
+$BIN repair --n 8000000 --specs c1 --scenarios gap1k,gap10k,gap30k,gap50k,gap100k,burst100k,restart,initial --methods real,rbsr,replay,product
+$BIN repair --n 1000000 --specs c1 --scenarios gap1,gap1k,gap10k,gap30k,gap50k,gap100k,burst100k,restart,initial --methods real,rbsr,replay,product
+$BIN steady --spec c1 --n 8000000 --churn 1 --minutes 2 --plog 0     # A
+$BIN steady --spec c1 --n 8000000 --churn 1 --minutes 2 --plog 1     # B
+$BIN steady --spec c1 --n 8000000 --churn 1 --minutes 10 --plog 1    # log memory
+cargo test -p constellation-net --lib reconcile   # in the repo root: the fail-before test
+```
 
 ## Reproducing
 

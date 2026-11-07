@@ -1236,6 +1236,27 @@
           "minimum": 0,
           "type": "integer"
         },
+        "replay_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "replay_hits": {
+          "description": "Plan 47 P3: repairs finished by replaying the owner's delta log,\nrepairs that tried it and fell back to a session, wire bytes of\nreplay requests and replies, and the bytes this node's own log\nholds for its peers.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "replay_log_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "replay_misses": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "s3_fetches": {
           "format": "uint64",
           "minimum": 0,
@@ -1271,6 +1292,10 @@
         "reconcile_sessions",
         "reconcile_rounds",
         "reconcile_failures",
+        "replay_hits",
+        "replay_misses",
+        "replay_bytes",
+        "replay_log_bytes",
         "reconcile_cpu_us",
         "local_set_entries",
         "peer_set_entries",

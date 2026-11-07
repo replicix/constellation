@@ -1075,6 +1075,20 @@ pub trait PeerService: Send + Sync + 'static {
             }
         })
     }
+    /// Plan 47 P3: the deltas this node published after `after_seq` of
+    /// `incarnation`. The default is unavailable, which sends the asker
+    /// to a reconciliation session.
+    fn replay_requested(
+        &self,
+        _incarnation: u64,
+        _after_seq: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::ReplayReply {
+                reply: crate::reconcile::ReplayReply::unavailable(),
+            }
+        })
+    }
     /// Serve a clean/pinned chunk, or decline with the reason (busy,
     /// absent, or recently removed — see [`ChunkDecline`]). `from_hex`
     /// is the requester's node-key hex, used for the per-peer

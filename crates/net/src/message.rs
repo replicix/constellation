@@ -277,6 +277,16 @@ pub enum Payload {
     ReconcileReply {
         reply: crate::reconcile::Reply,
     },
+    /// Plan 47 P3: "send me your deltas after `after_seq`" (the first
+    /// repair step, before a reconciliation session), sent directly to
+    /// the owner of the set being mirrored.
+    ReplayRequest {
+        incarnation: u64,
+        after_seq: u64,
+    },
+    ReplayReply {
+        reply: crate::reconcile::ReplayReply,
+    },
     /// Non-holder asks the lease holder to validate and journal `op`
     /// (postcard-encoded `MutateOp` from constellation-meta).
     MutateRequest {
@@ -1670,6 +1680,57 @@ mod tests {
             msg.encode().is_ok(),
             "children-only reply exceeds MAX_FRAME"
         );
+    }
+
+    /// Plan 47 P3: the largest replay page (a few worst-case deltas up to
+    /// the page budget, plus the one-delta minimum) fits a stream frame.
+    #[test]
+    fn maximum_replay_frames_fit_a_stream_frame() {
+        use crate::reconcile::{
+            encode_keys, respond_replay, Delta, DeltaLog, Summary, MAX_DELTA_KEYS,
+            REPLAY_PAGE_BUDGET,
+        };
+        let keys = |salt: u64| -> Vec<u64> {
+            (0..MAX_DELTA_KEYS as u64)
+                .map(|i| (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ salt)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        let mut log = DeltaLog::new(1 << 30, std::time::Duration::from_secs(60));
+        for seq in 1..=12u64 {
+            let ks = keys(seq << 40);
+            let half = ks.len() / 2;
+            log.push(
+                Delta {
+                    incarnation: u64::MAX,
+                    seq,
+                    base: [0xFF; 16],
+                    root: [0xFE; 16],
+                    adds: encode_keys(0, &ks[..half]),
+                    removes: encode_keys(0, &ks[half..]),
+                },
+                std::time::Instant::now(),
+            );
+        }
+        let summary = Summary {
+            incarnation: u64::MAX,
+            seq: 12,
+            root: [0xFF; 16],
+            count: u64::MAX,
+        };
+        for budget in [REPLAY_PAGE_BUDGET, 1] {
+            let reply = respond_replay(&log, summary, u64::MAX, 0, budget);
+            assert!(reply.available && !reply.deltas.is_empty());
+            let msg = Signed::new(&key(), &Payload::ReplayReply { reply }).unwrap();
+            let n = msg.encode().expect("replay page exceeds MAX_FRAME").len();
+            assert!(n <= MAX_FRAME, "{n}");
+        }
+        let req = Payload::ReplayRequest {
+            incarnation: u64::MAX,
+            after_seq: u64::MAX,
+        };
+        assert!(Signed::new(&key(), &req).unwrap().encode().is_ok());
     }
 
     /// Plan 43 C7-F F-a / C7-H1: the beat's guard rides after the three

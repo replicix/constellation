@@ -1477,6 +1477,14 @@ pub struct CoopStatus {
     pub reconcile_sessions: u64,
     pub reconcile_rounds: u64,
     pub reconcile_failures: u64,
+    /// Plan 47 P3: repairs finished by replaying the owner's delta log,
+    /// repairs that tried it and fell back to a session, wire bytes of
+    /// replay requests and replies, and the bytes this node's own log
+    /// holds for its peers.
+    pub replay_hits: u64,
+    pub replay_misses: u64,
+    pub replay_bytes: u64,
+    pub replay_log_bytes: u64,
     /// Part of `digest_cpu_us` spent on reconciliation rounds.
     pub reconcile_cpu_us: u64,
     /// Keys in this node's published servable set.

@@ -119,7 +119,22 @@ struct CoopConfig {
     digest_interval: Duration,
     digest_ttl: Duration,
     mode: DigestMode,
+    /// Plan 47 P3: bytes of recent deltas this node keeps so a peer with
+    /// a gap can replay them instead of running a reconciliation
+    /// session (`CONSTELLATION_COOP_REPLAY_LOG_BYTES`; 0 turns replay
+    /// off on both sides).
+    replay_log_bytes: usize,
+    /// Age bound of the same log.
+    replay_log_age: Duration,
 }
+
+/// Default of `CONSTELLATION_COOP_REPLAY_LOG_BYTES`: about ten minutes of
+/// 1 % churn on an 8 Mi-chunk cache (plan 47 P1 measured 0.7 MB per
+/// minute there).
+const DEFAULT_REPLAY_LOG_BYTES: usize = 8 << 20;
+/// Deltas older than this are not replayed: a mirror that stale is
+/// past `digest_ttl` anyway and a session is the better first step.
+const REPLAY_LOG_MAX_AGE: Duration = Duration::from_secs(600);
 
 impl CoopConfig {
     /// How long a holder remembers a dropped chunk, so a requester whose
@@ -151,6 +166,11 @@ impl CoopConfig {
             digest_interval: Duration::from_secs(interval_s),
             digest_ttl: Duration::from_secs(ttl_s),
             mode: DigestMode::parse(std::env::var("CONSTELLATION_COOP_DIGEST").ok().as_deref()),
+            replay_log_bytes: std::env::var("CONSTELLATION_COOP_REPLAY_LOG_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_REPLAY_LOG_BYTES),
+            replay_log_age: REPLAY_LOG_MAX_AGE,
         }
     }
 }
@@ -208,6 +228,12 @@ struct Counters {
     reconcile_sessions: AtomicU64,
     reconcile_rounds: AtomicU64,
     reconcile_failures: AtomicU64,
+    /// Plan 47 P3: repairs finished by delta-log replay, repairs where
+    /// replay was tried and fell back to a session, and the wire bytes
+    /// of replay requests and replies (both are also in `digest_bytes_*`).
+    replay_hits: AtomicU64,
+    replay_misses: AtomicU64,
+    replay_bytes: AtomicU64,
     /// Part of `digest_cpu_us` spent answering or applying rounds.
     reconcile_cpu_us: AtomicU64,
     /// Fetches of a chunk no mirror listed, from the node that wrote the
@@ -358,7 +384,11 @@ impl Coop {
             counters: Counters::default(),
             budget: Mutex::new(ServeBudget::default()),
             peer_slots: Mutex::new(HashMap::new()),
-            local: Mutex::new(exact::LocalSet::new(config.recent_grace())),
+            local: Mutex::new(exact::LocalSet::new(
+                config.recent_grace(),
+                config.replay_log_bytes,
+                config.replay_log_age,
+            )),
             mirrors: Mutex::new(HashMap::new()),
             sync_tx,
             sync_rx: Mutex::new(Some(sync_rx)),
@@ -473,6 +503,8 @@ impl Coop {
                 digest_ttl: Duration::from_secs(60),
                 // `main.rs`'s upload-hint test feeds a bloom snapshot.
                 mode: DigestMode::Bloom,
+                replay_log_bytes: 0,
+                replay_log_age: REPLAY_LOG_MAX_AGE,
             },
         )
     }
@@ -1194,6 +1226,12 @@ impl Coop {
             .collect();
         drop(sel);
         let (peer_set_entries, peer_set_bytes) = self.peer_set_footprint();
+        // One guard: two `lock()` temporaries in the struct literal below
+        // would both live to the end of the statement and deadlock.
+        let (local_set_entries, replay_log_bytes) = {
+            let local = self.local.lock().unwrap();
+            (local.keys.len() as u64, local.log_bytes() as u64)
+        };
         constellation_control::proto::types::CoopStatus {
             peer_hits: self.counters.peer_hits.load(Ordering::Relaxed),
             peer_misses: self.counters.peer_misses.load(Ordering::Relaxed),
@@ -1220,10 +1258,14 @@ impl Coop {
             reconcile_sessions: self.counters.reconcile_sessions.load(Ordering::Relaxed),
             reconcile_rounds: self.counters.reconcile_rounds.load(Ordering::Relaxed),
             reconcile_failures: self.counters.reconcile_failures.load(Ordering::Relaxed),
+            replay_hits: self.counters.replay_hits.load(Ordering::Relaxed),
+            replay_misses: self.counters.replay_misses.load(Ordering::Relaxed),
+            replay_bytes: self.counters.replay_bytes.load(Ordering::Relaxed),
+            replay_log_bytes,
             reconcile_cpu_us: self.counters.reconcile_cpu_us.load(Ordering::Relaxed),
             fresh_hint_hits: self.counters.fresh_hint_hits.load(Ordering::Relaxed),
             fresh_hint_misses: self.counters.fresh_hint_misses.load(Ordering::Relaxed),
-            local_set_entries: self.local.lock().unwrap().keys.len() as u64,
+            local_set_entries,
             peer_set_entries,
             peer_set_bytes,
         }
@@ -1623,6 +1665,8 @@ mod tests {
             digest_interval: Duration::from_secs(30),
             digest_ttl: Duration::from_secs(120),
             mode,
+            replay_log_bytes: DEFAULT_REPLAY_LOG_BYTES,
+            replay_log_age: REPLAY_LOG_MAX_AGE,
         }
     }
 
