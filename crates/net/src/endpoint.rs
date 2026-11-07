@@ -25,6 +25,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+/// What a dial task reports: the pooled connection, or why not.
+type DialOutcome = std::result::Result<iroh::endpoint::Connection, String>;
+type DialRx = tokio::sync::watch::Receiver<Option<DialOutcome>>;
 type ConnectionSlot = Arc<tokio::sync::Mutex<Option<iroh::endpoint::Connection>>>;
 /// Called with a peer's endpoint id after its pooled connection was
 /// found dead and evicted (see [`Pool::probe`]).
@@ -216,6 +219,36 @@ impl DialWatch {
     }
 }
 
+/// Test seam: what the pool's next dials do before they touch the
+/// network (a delay, then a failure for the first `fail` of them).
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TestDial {
+    delay: Mutex<Duration>,
+    fail: std::sync::atomic::AtomicUsize,
+    /// The next `rejoin_fail` gossip rejoins fail; `rejoins` counts them.
+    rejoin_fail: std::sync::atomic::AtomicUsize,
+    rejoins: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl TestDial {
+    async fn before(&self) -> Result<()> {
+        let delay = *self.delay.lock().unwrap();
+        tokio::time::sleep(delay).await;
+        let failed = self
+            .fail
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok();
+        anyhow::ensure!(!failed, "injected dial failure");
+        Ok(())
+    }
+}
+
 struct Pool {
     connections: Mutex<HashMap<iroh::EndpointId, ConnectionSlot>>,
     /// Every connection the endpoint completed a handshake for, either
@@ -230,6 +263,10 @@ struct Pool {
     probing: Mutex<HashSet<iroh::EndpointId>>,
     /// Probes started, for tests.
     probes: std::sync::atomic::AtomicUsize,
+    /// Peers with a dial in flight (see [`P2p::connection`]): the dial
+    /// runs on a task of its own, so a caller giving up on it does not
+    /// abandon the handshake.
+    dialing: Mutex<HashMap<iroh::EndpointId, DialRx>>,
     key: SecretKey,
     on_evict: Mutex<Option<EvictHook>>,
 }
@@ -247,6 +284,7 @@ impl Pool {
             tracked: Mutex::new(HashMap::new()),
             probing: Mutex::new(HashSet::new()),
             probes: std::sync::atomic::AtomicUsize::new(0),
+            dialing: Mutex::new(HashMap::new()),
             key,
             on_evict: Mutex::new(None),
         }
@@ -1570,7 +1608,10 @@ pub struct P2p {
     policy: AddrPolicy,
     /// `CONSTELLATION_P2P_DIAL_TIMEOUT_MS`, read at spawn.
     dial_timeout: Duration,
-    dial_watch: DialWatch,
+    dial_watch: Arc<DialWatch>,
+    /// Failures and delays injected into the pool's dials, for tests.
+    #[cfg(test)]
+    test_dial: Arc<TestDial>,
     /// The liveness lane ([`Self::request_liveness`]): one connection per
     /// peer of its own, apart from [`Self::pool`].
     liveness: Mutex<HashMap<iroh::EndpointId, ConnectionSlot>>,
@@ -1650,7 +1691,9 @@ impl P2p {
             preferred,
             policy,
             dial_timeout: dial_timeout(),
-            dial_watch: DialWatch::default(),
+            dial_watch: Arc::new(DialWatch::default()),
+            #[cfg(test)]
+            test_dial: Arc::new(TestDial::default()),
             liveness: Mutex::new(HashMap::new()),
         })
     }
@@ -1862,6 +1905,17 @@ impl P2p {
     /// incarnation's own `Join` may already have been swallowed while
     /// the stale neighbor state still stood).
     pub async fn rejoin(&self, peer: iroh::EndpointId) -> Result<()> {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.test_dial.rejoins.fetch_add(1, SeqCst);
+            let failed = self
+                .test_dial
+                .rejoin_fail
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            anyhow::ensure!(!failed, "injected rejoin failure");
+        }
         let guard = self.sender.lock().await;
         let Some(tx) = guard.as_ref() else {
             anyhow::bail!("gossip topic not joined yet");
@@ -2235,36 +2289,79 @@ impl P2p {
             }
             *slot = None;
         }
-        // Bounded: the gate is held across the dial, and a dial whose
-        // every address is gone would otherwise hold it — and every other
-        // request to this peer — for the whole QUIC handshake timeout.
-        let limit = self.dial_timeout;
-        let conn = match tokio::time::timeout(limit, self.endpoint.connect(peer.clone(), ALPN))
-            .await
-            .map_err(|_| {
-                self.dial_watch.timed_out(Instant::now(), limit);
-                anyhow::anyhow!("dialing peer timed out after {limit:?}")
-            })? {
-            Ok(conn) => {
-                self.dial_watch.answered();
-                conn
-            }
-            Err(e) => {
-                self.dial_watch.answered();
-                if refused_alpn(&e) && version_log_due(&peer.id) {
-                    // Off the gate: learning the peer's version is one
-                    // more dial, and the caller's error is the same.
-                    tokio::spawn(probe_peer_version(
-                        self.endpoint.clone(),
-                        peer.clone(),
-                        limit,
-                    ));
+        drop(slot);
+        // The dial runs on a task of its own, bounded by `dial_timeout`,
+        // and the callers wait for it: a caller's own timeout (the lease
+        // path's 500 ms) drops its wait, not the handshake. Before, the
+        // dial lived in the caller's future, so on a loaded host every
+        // request cancelled its dial before the handshake finished and the
+        // next one started over — a path never came back. One dial per
+        // peer at a time; a caller that arrives meanwhile joins it.
+        let mut rx = {
+            let mut dialing = self.pool.dialing.lock().unwrap();
+            match dialing.get(&peer.id) {
+                Some(rx) => rx.clone(),
+                None => {
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    dialing.insert(peer.id, rx.clone());
+                    self.spawn_dial(peer.clone(), gate, tx);
+                    rx
                 }
-                return Err(anyhow::Error::from(e).context("dialing peer"));
             }
         };
-        *slot = Some(conn.clone());
-        Ok(conn)
+        let outcome = rx
+            .wait_for(|outcome| outcome.is_some())
+            .await
+            .map_err(|_| anyhow::anyhow!("the dial task ended without an answer"))?
+            .clone()
+            .expect("waited for an outcome");
+        outcome.map_err(|why| anyhow::anyhow!(why))
+    }
+
+    fn spawn_dial(
+        &self,
+        peer: EndpointAddr,
+        gate: ConnectionSlot,
+        tx: tokio::sync::watch::Sender<Option<DialOutcome>>,
+    ) {
+        let endpoint = self.endpoint.clone();
+        let pool = self.pool.clone();
+        let watch = self.dial_watch.clone();
+        let limit = self.dial_timeout;
+        #[cfg(test)]
+        let test_dial = self.test_dial.clone();
+        tokio::spawn(async move {
+            let dial = async {
+                #[cfg(test)]
+                test_dial.before().await?;
+                endpoint
+                    .connect(peer.clone(), ALPN)
+                    .await
+                    .map_err(anyhow::Error::from)
+            };
+            let outcome = match tokio::time::timeout(limit, dial).await {
+                Err(_) => {
+                    watch.timed_out(Instant::now(), limit);
+                    Err(format!("dialing peer timed out after {limit:?}"))
+                }
+                Ok(Ok(conn)) => {
+                    watch.answered();
+                    *gate.lock().await = Some(conn.clone());
+                    Ok(conn)
+                }
+                Ok(Err(e)) => {
+                    watch.answered();
+                    if refused_alpn(e.as_ref()) && version_log_due(&peer.id) {
+                        tokio::spawn(probe_peer_version(endpoint.clone(), peer.clone(), limit));
+                    }
+                    Err(format!("{:#}", e.context("dialing peer")))
+                }
+            };
+            // Out of the map before the answer goes out, so a caller that
+            // sees a failure and dials again starts a new attempt.
+            pool.dialing.lock().unwrap().remove(&peer.id);
+            let _ = tx.send(Some(outcome));
+        });
     }
 
     async fn invalidate_connection(&self, peer: iroh::EndpointId, stable_id: usize) {
@@ -2303,6 +2400,46 @@ impl P2p {
             .flatten()
             .filter(|weak| weak.upgrade().is_some_and(|c| c.close_reason().is_none()))
             .count()
+    }
+
+    /// Delay every dial by `delay` and fail the first `fail` of them.
+    #[cfg(test)]
+    pub(crate) fn inject_dial(&self, delay: Duration, fail: usize) {
+        *self.test_dial.delay.lock().unwrap() = delay;
+        self.test_dial
+            .fail
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Fail the next `fail` gossip rejoins.
+    #[cfg(test)]
+    pub(crate) fn inject_rejoin_failures(&self, fail: usize) {
+        self.test_dial
+            .rejoin_fail
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many gossip rejoins were attempted.
+    #[cfg(test)]
+    pub(crate) fn rejoins(&self) -> usize {
+        self.test_dial
+            .rejoins
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether the gossip topic was joined.
+    pub async fn gossip_joined(&self) -> bool {
+        self.sender.lock().await.is_some()
+    }
+
+    /// Run the evict hook for `id`, as a lost address or a dead
+    /// connection does.
+    #[cfg(test)]
+    pub(crate) fn fire_evict_hook(&self, id: iroh::EndpointId) {
+        let hook = self.pool.on_evict.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(id);
+        }
     }
 
     /// The pooled connection's id, to tell whether it was replaced. For

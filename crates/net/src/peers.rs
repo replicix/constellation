@@ -26,6 +26,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How long after closing every connection to a dead peer incarnation
 /// to send the gossip `Join` (see [`Peers::new`]).
+/// A lost path is re-dialed with this backoff (doubling up to
+/// [`REDIAL_BACKOFF_MAX`]) until the peer answers, it leaves the
+/// directory, or [`REDIAL_GIVE_UP`] passes; the periodic registry probe
+/// takes over after that.
+const REDIAL_BACKOFF_START: Duration = Duration::from_millis(100);
+const REDIAL_BACKOFF_MAX: Duration = Duration::from_secs(2);
+const REDIAL_GIVE_UP: Duration = Duration::from_secs(120);
 const GOSSIP_REJOIN_DELAY: Duration = Duration::from_millis(300);
 
 /// A holder agreed to hand `part` over — see [`Peers::request_lease`].
@@ -132,6 +139,13 @@ struct Inner {
     /// Bumped whenever a peer enters or leaves the directory or its
     /// `connected` flag flips (see [`Peers::links_changed`]).
     links: tokio::sync::watch::Sender<u64>,
+    /// Nodes with a re-dial loop running ([`Peers::redial`]).
+    redialing: Mutex<std::collections::HashSet<u64>>,
+    /// Peers whose gossip link is up (a `NeighborUp` not yet followed by a
+    /// `NeighborDown`), and those with a rejoin loop running
+    /// ([`Peers::regossip`]).
+    gossip_up: Mutex<std::collections::HashSet<iroh::EndpointId>>,
+    regossiping: Mutex<std::collections::HashSet<iroh::EndpointId>>,
 }
 
 impl Inner {
@@ -156,6 +170,9 @@ impl Peers {
             refresher: Mutex::new(None),
             warned_shared_key: std::sync::atomic::AtomicBool::new(false),
             links: tokio::sync::watch::Sender::new(0),
+            redialing: Mutex::new(std::collections::HashSet::new()),
+            gossip_up: Mutex::new(std::collections::HashSet::new()),
+            regossiping: Mutex::new(std::collections::HashSet::new()),
         });
         // A dead pooled connection was just evicted (the peer crashed,
         // or restarted under the same key) and every connection to it
@@ -182,23 +199,81 @@ impl Peers {
             if flipped {
                 inner.links_changed();
             }
+            // Every connection to it was closed, gossip's included.
+            inner.gossip_up.lock().unwrap().remove(&endpoint);
             if let (Some(node), Ok(rt)) = (node, tokio::runtime::Handle::try_current()) {
                 let peers = Peers { inner: Some(inner) };
                 let rejoin = peers.clone();
-                rt.spawn(async move {
-                    let _ = peers.ping_node(node).await;
-                });
-                rt.spawn(async move {
-                    tokio::time::sleep(GOSSIP_REJOIN_DELAY).await;
-                    if let Some(inner) = rejoin.inner.as_ref() {
-                        if let Err(error) = inner.p2p.rejoin(endpoint).await {
-                            tracing::debug!(%error, node, "gossip rejoin failed");
-                        }
-                    }
-                });
+                rt.spawn(async move { peers.redial(node).await });
+                rt.spawn(async move { rejoin.regossip(endpoint).await });
             }
         }));
         Self { inner: Some(inner) }
+    }
+
+    /// Ping `node` until it answers, backing off between attempts: the
+    /// hook's single ping used to be the only re-dial, so one that failed
+    /// (a dial that timed out or was refused while the host was loaded)
+    /// left the path down until something else asked for the peer. One
+    /// loop per node; every ping is bounded by the request timeout and
+    /// every dial by the dial timeout.
+    async fn redial(&self, node: u64) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        if !inner.redialing.lock().unwrap().insert(node) {
+            return;
+        }
+        let started = Instant::now();
+        let mut backoff = REDIAL_BACKOFF_START;
+        loop {
+            if self.ping_node(node).await {
+                break;
+            }
+            let known = inner.peers.lock().unwrap().contains_key(&node);
+            if !known || started.elapsed() >= REDIAL_GIVE_UP {
+                break;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(REDIAL_BACKOFF_MAX);
+        }
+        inner.redialing.lock().unwrap().remove(&node);
+    }
+
+    /// Re-form the gossip link to `endpoint` after its connections were
+    /// closed: a `Join` once the gossip actor has seen the closes, then
+    /// again with backoff until the neighbor is up. A single `Join` was
+    /// all there was, so one that was lost (its dial failed or timed out,
+    /// or it went out on a connection still closing) left gossip from the
+    /// peer silent until the next address loss. Gives up like
+    /// [`Self::redial`] (a topic not joined has nothing to re-form).
+    async fn regossip(&self, endpoint: iroh::EndpointId) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        if !inner.regossiping.lock().unwrap().insert(endpoint) {
+            return;
+        }
+        let started = Instant::now();
+        let mut delay = GOSSIP_REJOIN_DELAY;
+        let mut first = true;
+        loop {
+            tokio::time::sleep(delay).await;
+            // The first `Join` goes out whatever the neighbor state says:
+            // a stale `NeighborUp` may be all there is.
+            if !first && inner.gossip_up.lock().unwrap().contains(&endpoint)
+                || started.elapsed() >= REDIAL_GIVE_UP
+                || !inner.p2p.gossip_joined().await
+            {
+                break;
+            }
+            first = false;
+            if let Err(error) = inner.p2p.rejoin(endpoint).await {
+                tracing::debug!(%error, "gossip rejoin failed");
+            }
+            delay = (delay * 2).min(REDIAL_BACKOFF_MAX);
+        }
+        inner.regossiping.lock().unwrap().remove(&endpoint);
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -706,6 +781,14 @@ impl Peers {
         let Some(inner) = self.inner.as_ref() else {
             return;
         };
+        {
+            let mut gossip_up = inner.gossip_up.lock().unwrap();
+            if up {
+                gossip_up.insert(endpoint);
+            } else {
+                gossip_up.remove(&endpoint);
+            }
+        }
         let mut map = inner.peers.lock().unwrap();
         if let Some(p) = map.values_mut().find(|p| p.addr.id == endpoint) {
             if std::mem::replace(&mut p.connected, up) != up {
@@ -3209,6 +3292,73 @@ mod tests {
             "the first request after a close must redial, not fail"
         );
         assert_ne!(Some(first), inner.p2p.pooled_connection_id(peer).await);
+    }
+
+    /// A dial slower than the caller's timeout must still finish: each
+    /// request used to abandon its own dial when its 500 ms ran out and
+    /// the next started over, so on a loaded host a handshake that needed
+    /// more than that never completed.
+    #[tokio::test]
+    async fn a_dial_slower_than_the_request_timeout_still_completes() {
+        let service = ChunkServer::new(Some(vec![1u8; 4096]), Duration::ZERO);
+        let asker = chunk_pair(service).await;
+        let inner = asker.inner.as_ref().unwrap();
+        inner.p2p.inject_dial(Duration::from_millis(700), 0);
+        let started = Instant::now();
+        let mut answered = false;
+        while !answered && started.elapsed() < Duration::from_secs(10) {
+            answered = ping_within(&asker, Duration::from_millis(300)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            answered,
+            "every attempt abandoned the dial before it finished"
+        );
+    }
+
+    /// A lost path is re-dialed until it is back: the evict hook's first
+    /// re-dial fails, and nothing else is asking for the peer.
+    #[tokio::test]
+    async fn a_failed_redial_after_an_evict_is_retried() {
+        let service = ChunkServer::new(Some(vec![1u8; 4096]), Duration::ZERO);
+        let asker = chunk_pair(service).await;
+        let inner = asker.inner.as_ref().unwrap();
+        let peer = inner.peers.lock().unwrap().get(&1).unwrap().addr.id;
+        assert!(ping_within(&asker, Duration::from_secs(20)).await);
+        inner.p2p.close_pooled_connection(peer).await;
+        inner.p2p.inject_dial(Duration::ZERO, 2);
+        inner.p2p.fire_evict_hook(peer);
+        let started = Instant::now();
+        let connected = |a: &Peers| a.inner.as_ref().unwrap().peers.lock().unwrap()[&1].connected;
+        while !connected(&asker) && started.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            connected(&asker),
+            "the peer was not re-dialed after the first re-dial failed"
+        );
+    }
+
+    /// The same for gossip: a rejoin that fails is tried again.
+    #[tokio::test]
+    async fn a_failed_gossip_rejoin_is_retried() {
+        let (holder, asker, _service) = pair(false).await;
+        let holder_id = holder.node_addr().unwrap().id;
+        let asker_id = asker.node_addr().unwrap().id;
+        let _holder_rx = holder.join_topic(vec![asker_id]).await.unwrap();
+        let _asker_rx = asker.join_topic(vec![holder_id]).await.unwrap();
+        let inner = asker.inner.as_ref().unwrap();
+        inner.p2p.inject_rejoin_failures(2);
+        inner.p2p.fire_evict_hook(holder_id);
+        let started = Instant::now();
+        while inner.p2p.rejoins() < 3 && started.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            inner.p2p.rejoins() >= 3,
+            "a failed rejoin was not tried again ({} attempts)",
+            inner.p2p.rejoins()
+        );
     }
 
     /// [`Peers::ping_node`] with a caller-chosen bound, so a test can say
