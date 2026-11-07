@@ -432,7 +432,7 @@ quarter of the lease TTL and logs an error.
 
 | Command | Meaning |
 |---|---|
-| `constellation delegate TARGET --to NODE` | delegate a directory's subtree to node `NODE`. The node running it must hold the lease. See [Delegations](features/delegations.md) |
+| `constellation delegate TARGET --to NODE [--sticky]` | delegate a directory's subtree to node `NODE` (`--sticky`: a grant the TTL and the placement never take back). The node running it must hold the lease. See [Delegations](features/delegations.md) |
 | `constellation undelegate TARGET` | recall the delegation on a directory (refused for a designation: use `constellation online`) |
 | `constellation delegations TARGET` | list the live delegation table |
 | `constellation reintegrate TARGET` | run a deposed holder's recovery now: roll back the stranded journal and replay it by rid (it also runs on its own) |

@@ -409,16 +409,27 @@ pub enum LogRecord {
 }
 
 /// What a granted subtree is (§5.2): `Placed` is the placement policy's
-/// (TTL-ended); `Sticky` a grant that never ends by TTL (§5.4; nothing writes
-/// it before M1.3 step 4, the wire shape is fixed now); `Designated` an
+/// (TTL-ended); `Sticky` a grant that never ends by TTL (§5.4): it ends by
+/// the holder's release or an operator action; `Designated` an
 /// offline designation (plans 03-05), never
 /// recalled by TTL or placement, only by `online`; a cross-subtree op
-/// touching it is refused (`EXDEV`).
+/// touching it is refused (`EXDEV`). `Sticky` and `Designated` are
+/// non-stealable ([`SubtreeKind::non_stealable`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SubtreeKind {
     Placed,
     Sticky,
     Designated,
+}
+
+impl SubtreeKind {
+    /// The root cannot take the grant back by itself: no TTL end, no
+    /// placement recall, `EROFS` at its root for anyone else and `EXDEV`
+    /// across its boundary while the holder is out of reach. A stream is
+    /// `Final` only when every grant it holds is.
+    pub fn non_stealable(self) -> bool {
+        matches!(self, SubtreeKind::Sticky | SubtreeKind::Designated)
+    }
 }
 
 /// One subtree of a [`LogRecord::DelegateNode`] grant.

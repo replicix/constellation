@@ -23,6 +23,7 @@ mod sim {
     pub mod reach;
     pub mod run;
     pub mod session;
+    pub mod sticky;
     pub mod store;
 }
 
@@ -297,6 +298,7 @@ fn replay_seed() {
         Ok("sticky-idle-release") => sticky_idle_release_config(),
         Ok("sticky-handover-ping-pong") => sticky_handover_ping_pong_config(),
         Ok("sticky-holder-dies") => sticky_holder_dies_config(),
+        Ok("sticky-ttl") => sticky_ttl_config(),
         Ok("backup-two") => backup_two_config(),
         Ok("backup-strict") => backup_strict_config(),
         Ok("backup-strict-inbox-off") => backup_strict_inbox_off_config(),
@@ -1763,6 +1765,42 @@ fn sticky_holder_dies_config() -> SimConfig {
             },
         }],
         ..far_root_writes_config()
+    }
+}
+
+/// Plan 46 M1.3 step 4: two sticky grants made by the operator
+/// (`constellation delegate --sticky`), cross-subtree ops (`EXDEV` at the
+/// sticky boundary) and a partition of one holder from the root for longer
+/// than the delegation's TTL. A sticky grant outlives the silence: the
+/// stream ends by no TTL (`sticky_ends_only_by_holder_or_operator`, strict
+/// on every configuration), and the writes of the holders are `Final`.
+fn sticky_ttl_config() -> SimConfig {
+    SimConfig {
+        dirs: vec!["d1".into(), "d2".into()],
+        delegations: Vec::new(),
+        sticky_delegations: vec![("d1".into(), 2), ("d2".into(), 3)],
+        cross_ratio: 0.2,
+        ops_per_client: 12,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_000,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 2,
+                    for_ms: 9_000,
+                },
+            },
+            // The operator takes the other holder's grant back: it ends
+            // by the holder's release.
+            ScheduledFault {
+                at_ms: 4_000,
+                kind: FaultKind::UndelegateDir {
+                    dir: "d2".into(),
+                    within_ms: 8_000,
+                },
+            },
+        ],
+        ..delegated_config()
     }
 }
 
@@ -5737,6 +5775,7 @@ fn sweep_config() {
         "sticky-idle-release" => sticky_idle_release_config(),
         "sticky-handover-ping-pong" => sticky_handover_ping_pong_config(),
         "sticky-holder-dies" => sticky_holder_dies_config(),
+        "sticky-ttl" => sticky_ttl_config(),
         "backup-departs" => backup_departs_config(),
         "singleton-first-peer" => singleton_first_peer_config(),
         "backup-group-cut-ttl" => backup_group_cut_ttl_config(GroupCut::Both),
@@ -7778,6 +7817,11 @@ struct OracleTotals {
     /// their stream's cut (and the seeds with one), the answered rows of cut
     /// streams judged, the abandon-excused ones.
     cut: (usize, u64, usize, usize, usize),
+    /// Plan 46 M1.3 step 4: sticky streams in the log, ended by release, by
+    /// abandon, unexcused; the core's counters (grants made, ended by
+    /// reason: released, abandoned, other).
+    sticky: [u64; 5],
+    sticky_core: [u64; 4],
     i4: usize,
     /// Plan 43 C2: of `i4`, settled `EIO`s whose rid completed.
     i4_settled: usize,
@@ -8031,6 +8075,14 @@ impl OracleTotals {
         self.cut.2 += r.cut_rows_judged;
         self.cut.3 += r.cut_abandoned;
         self.cut.4 += r.acked_past_cut_refusals;
+        self.sticky[0] += r.sticky_granted as u64;
+        self.sticky[1] += r.sticky_ended_released as u64;
+        self.sticky[2] += r.sticky_ended_abandoned as u64;
+        self.sticky[3] += r.sticky_ended_unexcused as u64;
+        self.sticky[4] += r.sticky_ended_claimed as u64;
+        for (t, c) in self.sticky_core.iter_mut().zip(r.sticky_core) {
+            *t += c;
+        }
         self.i4 += r.late_landings;
         self.i4_settled += r.settled_landings;
         self.i5 += r.non_lone_rollbacks;
@@ -8169,6 +8221,20 @@ impl OracleTotals {
             "SWEEP-CUT-TOTALS {label} seeds {}/{seeds}: acked_at_or_below_cut violations {} (in {} seeds; {} of them refusals), \
              answered rows of cut streams judged {}, excused by an abandon {}",
             self.seeds, self.cut.0, self.cut.1, self.cut.4, self.cut.2, self.cut.3
+        );
+        eprintln!(
+            "SWEEP-STICKY-TOTALS {label} seeds {}/{seeds}: sticky streams in the log {} (ended by release {}, by abandon {}, by the holder's own claim {}, unexcused {}); \
+             core: grants made {}, ended released {}, abandoned {}, other {}",
+            self.seeds,
+            self.sticky[0],
+            self.sticky[1],
+            self.sticky[2],
+            self.sticky[4],
+            self.sticky[3],
+            self.sticky_core[0],
+            self.sticky_core[1],
+            self.sticky_core[2],
+            self.sticky_core[3]
         );
         eprintln!(
             "SWEEP-UNSETTLED-CAUSES {label} seeds {}/{seeds}: {:?}",
@@ -17661,5 +17727,52 @@ fn far_root_writes_and_the_sticky_stubs_run_in_report_mode() {
                 panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
             });
         }
+    }
+}
+
+/// Plan 46 M1.3 step 4: a sticky grant survives the TTL. The holders of
+/// `sticky-ttl` are silent past the delegation's TTL (a partition) and the
+/// root does not take the grants back; the operator's `undelegate` ends one
+/// by the holder's release. `sticky_ends_only_by_holder_or_operator` (strict
+/// on every configuration) holds, and the coverage counters are non-zero.
+#[test]
+fn sticky_grants_survive_the_ttl_and_end_by_the_holders_release() {
+    let (mut made, mut in_log, mut released) = (0, 0, 0);
+    for seed in 0..24 {
+        let r = run_seed(seed, sticky_ttl_config()).unwrap_or_else(|e| {
+            panic!("sticky-ttl seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=sticky-ttl")
+        });
+        assert_eq!(r.sticky_ended_unexcused, 0, "seed {seed}");
+        assert_eq!(
+            r.sticky_core[3], 0,
+            "seed {seed}: a sticky stream ended otherwise"
+        );
+        made += r.sticky_core[0];
+        in_log += r.sticky_granted;
+        released += r.sticky_ended_released as u64 + r.sticky_core[1];
+    }
+    assert!(made > 0 && in_log > 0, "no sticky grant was made");
+    assert!(
+        released > 0,
+        "no sticky grant ended by its holder's release"
+    );
+}
+
+/// The oracle's negative control: with the TTL taking sticky grants back
+/// (`Config::ttl_reclaims_sticky`, `AUTHORITY_SIM_TTL_RECLAIMS_STICKY=1`)
+/// the run fails with `sticky_ends_only_by_holder_or_operator`.
+#[test]
+fn the_sticky_oracle_catches_a_ttl_that_reclaims_sticky_grants() {
+    let config = SimConfig {
+        ttl_reclaims_sticky: true,
+        ..sticky_ttl_config()
+    };
+    for seed in [0u64, 1, 2] {
+        let e = run_seed(seed, config.clone())
+            .expect_err("the TTL took a sticky grant back and no oracle noticed");
+        assert!(
+            e.contains("sticky_ends_only_by_holder_or_operator"),
+            "seed {seed}: {e}"
+        );
     }
 }

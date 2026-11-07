@@ -78,14 +78,20 @@ pub struct Delegation {
     pub node: NodeId,
     pub gen: Gen,
     /// Phase 2b: a `Designated` subtree is an offline designation:
-    /// recalled only by `online`.
+    /// recalled only by `online`; a `Sticky` one ends by its holder's
+    /// release or an operator action.
     pub kind: SubtreeKind,
 }
 
 impl Delegation {
-    /// An offline designation (never recalled by TTL or placement).
+    /// An offline designation (recalled only by `online`).
     pub fn designated(&self) -> bool {
         self.kind == SubtreeKind::Designated
+    }
+
+    /// Never ended by TTL or placement (a sticky grant or a designation).
+    pub fn non_stealable(&self) -> bool {
+        self.kind.non_stealable()
     }
 
     /// The stream that sequences the subtree.
@@ -1128,6 +1134,9 @@ mod tests {
         let sticky = t.get(4).unwrap();
         assert_eq!(sticky.kind, Sticky);
         assert!(!sticky.designated());
+        assert!(sticky.non_stealable());
+        assert!(t.get(3).unwrap().non_stealable());
+        assert!(!t.get(2).unwrap().non_stealable());
         assert_eq!(DelegationTable::decode(&t.encode()).unwrap(), t);
     }
 

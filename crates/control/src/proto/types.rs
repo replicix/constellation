@@ -2703,6 +2703,10 @@ pub struct OfflineParams {
 pub struct DelegateParams {
     pub path: String,
     pub node: u64,
+    /// A sticky grant (plan 46 M1.3 step 4): never taken back by the TTL or
+    /// the placement; it ends by the holder's release or an operator action.
+    #[serde(default)]
+    pub sticky: bool,
 }
 
 /// `node.leave`. `node_id: None` retires this node; `Some(id)` is admin

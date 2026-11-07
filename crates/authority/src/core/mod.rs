@@ -133,6 +133,11 @@ pub struct Config {
     /// executes (`delegate.rs`, the model's rule 1), so it can answer ahead
     /// of its cause. The causal-cut oracle must then fail the run.
     pub skip_deleg_dep_wait: bool,
+    /// Fault injection for the simulation's negative control (never set by
+    /// the engine): the root ends a sticky grant by its TTL as it does a
+    /// placed one (plan 46 M1.3 step 4, `ttl_reclaims_sticky`). The sim's
+    /// `sticky_ends_only_by_holder_or_operator` must then fail the run.
+    pub ttl_reclaims_sticky: bool,
     pub ttl_ms: u64,
     /// `lease::EXPIRY_MARGIN_MS`: a lease is usable only with this much
     /// left.
@@ -675,6 +680,7 @@ impl Config {
             partition: constellation_store_s3::log::PARTITION.to_string(),
             single_writer: false,
             skip_deleg_dep_wait: false,
+            ttl_reclaims_sticky: false,
             ttl_ms,
             expiry_margin_ms: 1_000,
             idle_release_ms: 30_000,
@@ -1236,6 +1242,15 @@ pub struct Stats {
     pub deleg_inherited: u64,
     pub deleg_refused_designated: u64,
     pub deleg_designated: u64,
+    /// Plan 46 M1.3 step 4: sticky grants made (a stream's first or a growth).
+    pub deleg_sticky: u64,
+    /// Sticky streams the root ended: by the holder's release (its release
+    /// row reached the root), by an operator's abandon, or by anything else
+    /// (a TTL end, which the oracle `sticky_ends_only_by_holder_or_operator`
+    /// fails).
+    pub deleg_sticky_ended_released: u64,
+    pub deleg_sticky_ended_abandoned: u64,
+    pub deleg_sticky_ended_other: u64,
     pub deleg_redelegated: u64,
     pub deleg_seals_sent: u64,
     pub deleg_sealed_drained: u64,
@@ -3595,8 +3610,8 @@ impl Core {
                     result: Ok(ControlOk::Done),
                 });
             }
-            Control::Delegate { dir, node } => {
-                self.on_control_delegate(now, op, dir, node, replica, out)
+            Control::Delegate { dir, node, sticky } => {
+                self.on_control_delegate(now, op, dir, node, sticky, replica, out)
             }
             Control::Undelegate { dir } => self.on_control_undelegate(now, op, dir, replica, out),
             Control::Retire => {

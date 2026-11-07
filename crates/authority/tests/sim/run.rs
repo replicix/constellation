@@ -41,6 +41,10 @@ pub enum FaultKind {
     /// to the lowest live node that is not the lease holder, through the
     /// holder, retrying until it answers (up to `within_ms`).
     DelegateDir { dir: String, within_ms: u64 },
+    /// Plan 46 M1.3 step 4: the operator's `undelegate` of directory `dir`
+    /// (by name under the root), through the lease holder, retried for
+    /// `within_ms`. A sticky grant ends by it: the holder releases.
+    UndelegateDir { dir: String, within_ms: u64 },
     CrashNode {
         node: NodeId,
         restart_ms: Option<u64>,
@@ -473,6 +477,15 @@ pub struct SimConfig {
     /// Plan 30 §M11 phase 2b: offline designations `(dir, designee)`,
     /// synced into the table by the root at setup.
     pub designations: Vec<(String, NodeId)>,
+    /// Plan 46 M1.3 step 4: sticky grants `(dir, holder)`, made through the
+    /// root's control (`constellation delegate --sticky`) after the setup's
+    /// ordinary delegations.
+    pub sticky_delegations: Vec<(String, NodeId)>,
+    /// Negative control (`Config::ttl_reclaims_sticky`): the product path
+    /// TTL-ends sticky grants. `AUTHORITY_SIM_TTL_RECLAIMS_STICKY=1` sets it
+    /// on every configuration; `sticky_ends_only_by_holder_or_operator` must
+    /// then fail the run.
+    pub ttl_reclaims_sticky: bool,
     /// Plan 30 §M12: every client writes in `dirs[0]` with names of its
     /// own (`<dir>/n<node>-f<i>`): a hot shared directory with no
     /// colliding names.
@@ -1028,6 +1041,9 @@ impl Default for SimConfig {
             delegations: Vec::new(),
             serial_delegations: false,
             designations: Vec::new(),
+            sticky_delegations: Vec::new(),
+            ttl_reclaims_sticky: std::env::var_os("AUTHORITY_SIM_TTL_RECLAIMS_STICKY")
+                .is_some_and(|v| v == "1"),
             shared_dir: false,
             cross_ratio: 0.0,
             marker_pairs: 0,
@@ -1296,6 +1312,17 @@ pub struct Report {
     pub acked_past_cut: usize,
     pub cut_rows_judged: usize,
     pub cut_abandoned: usize,
+    /// Plan 46 M1.3 step 4, `sticky_ends_only_by_holder_or_operator`: sticky
+    /// streams in the log, those ended by the holder's release and by an
+    /// operator's abandon, and those that ended otherwise (a violation).
+    pub sticky_granted: usize,
+    pub sticky_ended_released: usize,
+    pub sticky_ended_abandoned: usize,
+    pub sticky_ended_claimed: usize,
+    pub sticky_ended_unexcused: usize,
+    /// Core counters, summed over the nodes: sticky grants made, and sticky
+    /// streams ended by reason (released, abandoned, other).
+    pub sticky_core: [u64; 4],
     /// Of `acked_past_cut`, answers that were refusals.
     pub acked_past_cut_refusals: usize,
     /// I4: in-doubt rids that landed after an op invoked later.
@@ -3011,6 +3038,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                             h.control(constellation_authority::Control::Delegate {
                                 dir: ino,
                                 node: to,
+                                sticky: false,
                             }),
                         )
                         .await;
@@ -3026,6 +3054,34 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             note(format!("t={} could not delegate {dir}", fault.at_ms));
+        }
+        FaultKind::UndelegateDir { dir, within_ms } => {
+            let t0 = cluster.env.clock.elapsed_ms();
+            while cluster.env.clock.elapsed_ms() < t0 + within_ms {
+                let holder = read_lease(&cluster.env.bucket)
+                    .await
+                    .map(|l| l.holder)
+                    .filter(|h| *h != 0 && cluster.ids().contains(h) && cluster.get(*h).alive());
+                if let Some(holder) = holder {
+                    let h = cluster.get(holder);
+                    if let Some(ino) = h.meta.child_ino(ROOT_INO, &dir).ok().flatten() {
+                        let r = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            h.control(constellation_authority::Control::Undelegate { dir: ino }),
+                        )
+                        .await;
+                        if let Ok(Ok(Ok(_))) = r {
+                            note(format!(
+                                "t={} undelegated {dir} through holder {holder}",
+                                cluster.env.clock.elapsed_ms()
+                            ));
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            note(format!("t={} could not undelegate {dir}", fault.at_ms));
         }
         FaultKind::CrashHolder {
             restart_ms,
@@ -4262,6 +4318,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         rebuild_stub: cfg.rebuild_stub,
         plant_ungated_fast_path: cfg.plant_ungated_fast_path,
         skip_deleg_dep_wait: cfg.skip_deleg_dep_wait,
+        ttl_reclaims_sticky: cfg.ttl_reclaims_sticky,
         plant_claim_root_group_on_lone: cfg.plant_claim_root_group_on_lone,
     };
     env.world
@@ -5923,6 +5980,17 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.acked_past_cut = found.cut.len();
     report.cut_rows_judged = found.cut_judged;
     report.cut_abandoned = found.cut_abandoned;
+    report.sticky_granted = found.sticky_granted;
+    report.sticky_ended_released = found.sticky_released;
+    report.sticky_ended_abandoned = found.sticky_abandoned;
+    report.sticky_ended_claimed = found.sticky_claimed;
+    report.sticky_ended_unexcused = found.sticky.len();
+    for s in report.stats.values() {
+        report.sticky_core[0] += s.deleg_sticky;
+        report.sticky_core[1] += s.deleg_sticky_ended_released;
+        report.sticky_core[2] += s.deleg_sticky_ended_abandoned;
+        report.sticky_core[3] += s.deleg_sticky_ended_other;
+    }
     report.acked_past_cut_refusals = found.cut_refusals;
     report.late_landings = found.i4.len();
     report.settled_landings = found.i4.iter().filter(|m| m.starts_with("I4: rid")).count();
@@ -5948,7 +6016,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let counters = format!(
         "oracle counters: acks by class {:?}, uncommitted {:?}, unjournaled refusals {:?}, \
          mismatched {:?}, unverified relays {}, identity copies {}, non-verbatim {}, \
-         late landings {}, non-lone rollbacks {}",
+         late landings {}, non-lone rollbacks {}, sticky core (grants, released, abandoned, other) {:?}",
         report.acks_by_class,
         report.uncommitted_acks,
         report.unjournaled_refusals,
@@ -5957,7 +6025,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.identity_copies,
         report.non_verbatim,
         report.late_landings,
-        report.non_lone_rollbacks
+        report.non_lone_rollbacks,
+        report.sticky_core
     );
     for (strict, what, list) in [
         (cfg.strict_commit, "I1", &found.i1),
@@ -5982,6 +6051,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             cfg.cut_mode.is_strict(),
             "acked_at_or_below_cut",
             &found.cut,
+        ),
+        // Plan 46 M1.3 step 4: strict on every configuration (it judges
+        // nothing without a sticky grant).
+        (
+            true,
+            "sticky_ends_only_by_holder_or_operator",
+            &found.sticky,
         ),
         (cfg.strict_settle, "I4", &found.i4),
         (cfg.strict_settle, "I4", &found.unjournaled_landed),
@@ -6108,7 +6184,12 @@ async fn setup_dirs(cluster: &Arc<Cluster>, cfg: &SimConfig, failures: &Arc<Mute
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    for (dir, node) in &cfg.delegations {
+    for (dir, node, sticky) in cfg
+        .delegations
+        .iter()
+        .map(|(d, n)| (d, n, false))
+        .chain(cfg.sticky_delegations.iter().map(|(d, n)| (d, n, true)))
+    {
         let Some(ino) = handle.meta.child_ino(ROOT_INO, dir).ok().flatten() else {
             failures
                 .lock()
@@ -6122,6 +6203,7 @@ async fn setup_dirs(cluster: &Arc<Cluster>, cfg: &SimConfig, failures: &Arc<Mute
                 .control(constellation_authority::Control::Delegate {
                     dir: ino,
                     node: *node,
+                    sticky,
                 })
                 .await
             {
@@ -6201,6 +6283,7 @@ async fn setup_dirs(cluster: &Arc<Cluster>, cfg: &SimConfig, failures: &Arc<Mute
             .delegations
             .iter()
             .chain(cfg.designations.iter())
+            .chain(cfg.sticky_delegations.iter())
             .all(|(_, node)| {
                 let v = cluster.get(*node).view();
                 v.delegation

@@ -457,6 +457,7 @@ pub enum SyncRequest {
     Delegate {
         dir: Ino,
         node: u64,
+        sticky: bool,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     Undelegate {

@@ -3832,9 +3832,15 @@ impl Driver {
             SyncRequest::SyncDesignations { entries } => {
                 control(Control::SyncDesignations { entries }, ControlReply::None)
             }
-            SyncRequest::Delegate { dir, node, reply } => {
-                control(Control::Delegate { dir, node }, ControlReply::Text(reply))
-            }
+            SyncRequest::Delegate {
+                dir,
+                node,
+                sticky,
+                reply,
+            } => control(
+                Control::Delegate { dir, node, sticky },
+                ControlReply::Text(reply),
+            ),
             SyncRequest::Undelegate { dir, reply } => {
                 control(Control::Undelegate { dir }, ControlReply::Text(reply))
             }

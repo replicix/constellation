@@ -120,6 +120,10 @@ pub struct Oracles {
     /// *current* root (the one holding the highest lease epoch written) is
     /// a delegate that executed ahead of its cause.
     pub causal_cut: Mutex<Vec<String>>,
+    /// Plan 46 M1.3 step 4: the generations whose holder sent the root a
+    /// release (a note on its stream: a row, or the cut a rowless release
+    /// ends at; the latter leaves nothing in the log).
+    pub sticky_released: Mutex<BTreeSet<u64>>,
     /// The delegation table as the lease holder had it, each time it changed
     /// (`(at_ms, holder, table)`): the generation history (install, recall,
     /// end) that decides who owns an op's keys at each instant.
@@ -366,6 +370,7 @@ impl Oracles {
             ops: Mutex::new(HashMap::new()),
             unsettled: Mutex::new(Vec::new()),
             causal_cut: Mutex::new(Vec::new()),
+            sticky_released: Mutex::new(BTreeSet::new()),
             tables: Mutex::new(Vec::new()),
             bucket,
             stores: Mutex::new(BTreeMap::new()),
@@ -823,9 +828,10 @@ pub struct AnswererState {
     pub deleg_groups: Vec<(u64, Vec<NodeId>)>,
     /// The generations this node holds as a delegate.
     pub holds_gens: Vec<u64>,
-    /// The generations of the delegation table that are designations of
-    /// this node (never stolen by the root).
-    pub designated_gens: Vec<u64>,
+    /// The generations of the delegation table that are non-stealable
+    /// (sticky grants and designations) of this node: never stolen by the
+    /// root.
+    pub non_stealable_gens: Vec<u64>,
 }
 
 impl AnswererState {
@@ -836,10 +842,10 @@ impl AnswererState {
             epoch_held: core.lease().epoch_held(),
             deleg_groups: recorded_groups(meta, view.mine.iter().map(|m| m.1)),
             holds_gens: view.mine.iter().map(|m| m.1).collect(),
-            designated_gens: meta
+            non_stealable_gens: meta
                 .delegation_table()
                 .iter()
-                .filter(|d| d.node == id && d.designated())
+                .filter(|d| d.node == id && d.non_stealable())
                 .map(|d| d.gen)
                 .collect(),
         }
@@ -1318,8 +1324,8 @@ fn classify(
     // 4. NonStealable: a designee, or an epoch's hold owner on a root row.
     if let Some(t) = tx {
         let (g, _) = t.origin;
-        if g != 0 && st.designated_gens.contains(&g) {
-            detail.push(format!("non-stealable: designee of generation {g}"));
+        if g != 0 && st.non_stealable_gens.contains(&g) {
+            detail.push(format!("non-stealable: holder of generation {g}"));
             return Some(Judged::Final);
         }
         if g == 0 && st.epoch_held {
@@ -1931,7 +1937,7 @@ fn expected_class(
             .deleg_groups
             .iter()
             .any(|(gen, b)| *gen == g && !b.is_empty());
-        return Expected::Class(if st.designated_gens.contains(&g) {
+        return Expected::Class(if st.non_stealable_gens.contains(&g) {
             Judged::Final
         } else if rid.node == answerer && !backed && peer_in_budget(o, bus, answerer).is_none() {
             Judged::Singleton
@@ -2146,6 +2152,13 @@ pub struct Findings {
     pub cut_judged: usize,
     pub cut_abandoned: usize,
     pub cut_refusals: usize,
+    /// Plan 46 M1.3 step 4, `sticky_ends_only_by_holder_or_operator`
+    /// (`sticky.rs`): sticky streams that ended otherwise, and the counts.
+    pub sticky: Vec<String>,
+    pub sticky_granted: usize,
+    pub sticky_released: usize,
+    pub sticky_abandoned: usize,
+    pub sticky_claimed: usize,
 }
 
 impl Findings {
@@ -2162,6 +2175,7 @@ impl Findings {
             &self.i5,
             &self.i6,
             &self.cut,
+            &self.sticky,
         ]
         .into_iter()
         .flat_map(|v| v.iter().take(5).cloned())
@@ -2410,6 +2424,12 @@ pub fn end_of_run(
     f.cut_judged = cut.judged;
     f.cut_abandoned = cut.abandoned;
     f.cut_refusals = cut.refusals;
+    let sticky = super::sticky::StickyEnds::of_log(log).judge(&o.sticky_released.lock().unwrap());
+    f.sticky_granted = sticky.granted;
+    f.sticky_released = sticky.ended_released;
+    f.sticky_abandoned = sticky.ended_abandoned;
+    f.sticky_claimed = sticky.ended_claimed;
+    f.sticky = sticky.violations;
     f
 }
 

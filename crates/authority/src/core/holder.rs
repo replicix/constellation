@@ -352,11 +352,11 @@ impl Core {
                             && now.wait < self.gen_until(d.gen)
                             && self.links.get(&d.node).is_some_and(|l| l.connected)
                     });
-                    // (A designation is never recalled: its designee's own op
+                    // (A non-stealable grant is never recalled: its designee's own op
                     // is held as it was, and `deleg_recall_plan` refuses.)
-                    let designated = self.dl.gens.get(&d.gen).is_some_and(|g| g.designated());
+                    let non_stealable = self.dl.gens.get(&d.gen).is_some_and(|g| g.non_stealable());
                     let disowned =
-                        from == d.node && !designated && !self.grant_in_flight(now, d.gen);
+                        from == d.node && !non_stealable && !self.grant_in_flight(now, d.gen);
                     if disowned && live.is_some_and(|g| g.recall == RecallPhase::None) {
                         self.stats.deleg_disowned_recalls += 1;
                     }
@@ -367,11 +367,12 @@ impl Core {
                     // execution is still redirected as before: parked here it
                     // would be a second executable copy beside the one the
                     // requester may still have parked at the delegate. A
-                    // designation is never skipped: `deleg_recall_plan`
+                    // non-stealable grant is never skipped: `deleg_recall_plan`
                     // refuses it (`EROFS`) while `online` recalls it.
                     if d.node != self.cfg.node_id
-                        && live
-                            .is_some_and(|g| g.recall == RecallPhase::None || !settle || designated)
+                        && live.is_some_and(|g| {
+                            g.recall == RecallPhase::None || !settle || non_stealable
+                        })
                         && !disowned
                     {
                         // Wholly a live delegate's: the requester's table

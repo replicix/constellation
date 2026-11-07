@@ -240,15 +240,16 @@ impl Core {
         false
     }
 
-    /// `node` holds a designated stream, or a designation to it is pending
+    /// `node` holds a non-stealable stream (sticky or designated), or a
+    /// designation to it is pending
     /// (`DelegationState::designating`).
-    fn place_node_designated(&self, node: NodeId) -> bool {
+    fn place_node_non_stealable(&self, node: NodeId) -> bool {
         self.dl.designating.values().any(|n| *n == node)
             || self
                 .dl
                 .gens
                 .values()
-                .any(|g| !g.ended && g.node == node && g.designated())
+                .any(|g| !g.ended && g.node == node && g.non_stealable())
     }
 
     fn place_evaluate(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
@@ -389,7 +390,7 @@ impl Core {
             // A node that holds designations only takes nothing a recall can
             // reclaim (a stream never mixes grant kinds): skipped, not asked
             // again every round; the same while a designation to it waits.
-            if self.place_node_designated(node) {
+            if self.place_node_non_stealable(node) {
                 self.stats.place_skipped_designated += 1;
                 continue;
             }

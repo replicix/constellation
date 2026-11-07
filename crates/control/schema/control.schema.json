@@ -1511,6 +1511,11 @@
         },
         "path": {
           "type": "string"
+        },
+        "sticky": {
+          "default": false,
+          "description": "A sticky grant (plan 46 M1.3 step 4): never taken back by the TTL or\nthe placement; it ends by the holder's release or an operator action.",
+          "type": "boolean"
         }
       },
       "required": [

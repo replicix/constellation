@@ -446,6 +446,8 @@ pub struct NodeEnv {
     pub plant_ungated_fast_path: bool,
     /// See `SimConfig::skip_deleg_dep_wait`.
     pub skip_deleg_dep_wait: bool,
+    /// See `SimConfig::ttl_reclaims_sticky`.
+    pub ttl_reclaims_sticky: bool,
     /// See `SimConfig::plant_claim_root_group_on_lone`.
     pub plant_claim_root_group_on_lone: bool,
 }
@@ -728,6 +730,7 @@ impl NodeHandle {
         env.world.register(id, meta.clone());
         let mut cfg = (env.config)(id, incarnation);
         cfg.skip_deleg_dep_wait = env.skip_deleg_dep_wait;
+        cfg.ttl_reclaims_sticky = env.ttl_reclaims_sticky;
         // Plan 43 C2g: the simulation's settle window scales with its lease
         // TTL as production's does (half a TTL: 30 s of 60 s), unless a
         // configuration sets one (`sim_core_config` leaves it unset), and is
@@ -3704,6 +3707,17 @@ impl Driver {
                     }
                 }
                 Action::Send { to, msg } => {
+                    // Plan 46 M1.3 step 4: a holder's release (a row's note,
+                    // or the cut of a rowless one) is its own end of a sticky
+                    // grant, whether or not the log carries a row of it.
+                    if let PeerMsg::DelegateStream {
+                        gen,
+                        released: Some(_),
+                        ..
+                    } = &msg
+                    {
+                        self.oracles.sticky_released.lock().unwrap().insert(*gen);
+                    }
                     // (`OpId(0)`: the core re-executing a parked request whose
                     // `Held` reply was sent already; that reply matches no
                     // request at the requester, which gets its answer from

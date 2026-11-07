@@ -1362,7 +1362,7 @@ impl Core {
                     && replica
                         .delegation_table()
                         .iter()
-                        .any(|d| d.gen == gen && d.designated())))
+                        .any(|d| d.gen == gen && d.non_stealable())))
     }
 
     fn note_ungated_shadow(

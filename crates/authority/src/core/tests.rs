@@ -3134,7 +3134,11 @@ fn the_root_forgets_ended_generations() {
     for i in 0..CYCLES {
         let out = h.step(Event::Control {
             op: OpId(1_000 + 2 * i),
-            req: Control::Delegate { dir, node: 3 },
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                sticky: false,
+            },
         });
         assert!(
             out.iter()
@@ -3216,7 +3220,11 @@ fn two_tenures_never_mint_the_same_generation_number() {
         .unwrap();
         let out = h.step(Event::Control {
             op: OpId(1_000),
-            req: Control::Delegate { dir, node: 3 },
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                sticky: false,
+            },
         });
         assert!(
             out.iter()
@@ -3268,7 +3276,11 @@ fn two_tenures_never_mint_the_same_generation_number() {
     assert_eq!(gens[1] >> GEN_EPOCH_SHIFT, 2);
     let out = h.step(Event::Control {
         op: OpId(1_001),
-        req: Control::Delegate { dir: next, node: 5 },
+        req: Control::Delegate {
+            dir: next,
+            node: 5,
+            sticky: false,
+        },
     });
     let refusal = out.iter().find_map(|a| match a {
         Action::ControlDone { result: Err(e), .. } => Some(e.clone()),
@@ -9430,7 +9442,11 @@ mod cto {
         let (mut h, dir, file, grants) = holder_with_scanned_dir();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate { dir, node: 3 },
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                sticky: false,
+            },
         });
         assert!(
             out.iter().any(|a| matches!(
@@ -9519,7 +9535,11 @@ mod cto {
         let (mut h, dir, _file, _grants) = holder_with_scanned_dir();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate { dir, node: 3 },
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                sticky: false,
+            },
         });
         let expiries = timers(&out, TimerKind::GrantExpiry);
         assert_eq!(expiries.len(), 2, "{out:?}");
@@ -9911,7 +9931,11 @@ mod cto {
         let (mut h, dir, q) = holder_in_quarantine();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate { dir, node: 3 },
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                sticky: false,
+            },
         });
         assert!(
             out.iter()
@@ -9981,7 +10005,11 @@ mod cto {
         let (mut h, dir, _file, _grants) = holder_with_scanned_dir();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate { dir, node: 3 },
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                sticky: false,
+            },
         });
         let rs = recalls(&out);
         assert_eq!(rs.len(), 2, "{out:?}");
@@ -10096,7 +10124,11 @@ mod cto {
         let (mut h, dir) = lone_holder_with_dir();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate { dir, node: 3 },
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                sticky: false,
+            },
         });
         assert!(
             out.iter()
@@ -10155,7 +10187,11 @@ mod cto {
         let (mut h, dir, _q) = holder_in_quarantine();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate { dir, node: 3 },
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                sticky: false,
+            },
         });
         assert!(
             out.iter()
@@ -20651,7 +20687,11 @@ mod locks {
         };
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate { dir, node: 3 },
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                sticky: false,
+            },
         });
         assert!(
             out.iter().any(|a| matches!(
@@ -33588,7 +33628,11 @@ fn a_write_into_a_fresh_delegation_is_recalled_until_the_root_sees_the_delegate(
         let (mut h, dir) = root_with_dir();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate { dir, node: 3 },
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                sticky: false,
+            },
         });
         assert!(
             out.iter().any(|a| matches!(
@@ -33689,7 +33733,11 @@ mod s3_no_loops {
         let (mut h, dir) = root_with_dir();
         let out = h.step(Event::Control {
             op: OpId(900),
-            req: Control::Delegate { dir, node: 3 },
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                sticky: false,
+            },
         });
         assert!(
             out.iter().any(|a| matches!(
@@ -38399,6 +38447,7 @@ fn a_grant_the_root_has_not_committed_is_learned_but_not_honoured_until_the_log_
 fn a_generation_recalled_while_parked_is_not_installed_when_its_record_reaches_the_log() {
     for kind in [
         constellation_meta::SubtreeKind::Placed,
+        constellation_meta::SubtreeKind::Sticky,
         constellation_meta::SubtreeKind::Designated,
     ] {
         let (mut h, records, dir) = delegate_learning_a_streamed_grant_of(false, kind);
@@ -39845,7 +39894,7 @@ fn a_lane_request_that_failed_at_the_transport_is_not_a_pending_renewal() {
 #[test]
 fn deleg_off_core_registration_ignores_a_designation() {
     let (mut h, _dir, t0, _lapse) = delegate_renewed_once();
-    h.core.dl.mine.get_mut(&7).unwrap().designated = true;
+    h.core.dl.mine.get_mut(&7).unwrap().non_stealable = true;
     h.step(lane_sent(&h, 1, hm(t0.plus(2_500))));
     assert!(h.core.deleg_late_reqs().is_empty());
     assert_eq!(h.core.stats.deleg_renewals_off_core, 0);
@@ -39864,9 +39913,9 @@ fn deleg_renew_certs_name_only_what_the_core_would_renew() {
     h.core.lease.cached_holder = Some(3);
     assert!(h.core.deleg_renew_certs().is_empty());
     h.core.lease.cached_holder = Some(1);
-    h.core.dl.mine.get_mut(&7).unwrap().designated = true;
+    h.core.dl.mine.get_mut(&7).unwrap().non_stealable = true;
     assert!(h.core.deleg_renew_certs().is_empty());
-    h.core.dl.mine.get_mut(&7).unwrap().designated = false;
+    h.core.dl.mine.get_mut(&7).unwrap().non_stealable = false;
     h.core.dl.mine.get_mut(&7).unwrap().stopped = true;
     assert!(h.core.deleg_renew_certs().is_empty());
 }
@@ -47901,7 +47950,7 @@ mod designee_stream {
         .unwrap();
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        assert!(h.core.dl.mine[&7].designated);
+        assert!(h.core.dl.mine[&7].non_stealable);
         (h, dir)
     }
 
@@ -60282,7 +60331,11 @@ mod step9_one_stream_per_node {
     fn delegate(h: &mut Harness, op: u64, dir: constellation_fs_core::Ino, node: NodeId) -> bool {
         let out = h.step(Event::Control {
             op: OpId(op),
-            req: Control::Delegate { dir, node },
+            req: Control::Delegate {
+                dir,
+                node,
+                sticky: false,
+            },
         });
         out.iter()
             .any(|a| matches!(a, Action::ControlDone { op: o, result: Ok(_) } if *o == OpId(op)))
@@ -60714,7 +60767,11 @@ mod step9_one_stream_per_node {
         h.meta.read_delegations().grant(2, d2, until);
         let out = h.step(Event::Control {
             op: OpId(901),
-            req: Control::Delegate { dir: d2, node: 3 },
+            req: Control::Delegate {
+                dir: d2,
+                node: 3,
+                sticky: false,
+            },
         });
         assert!(
             out.iter().any(|a| matches!(
@@ -61429,5 +61486,369 @@ mod step9_one_stream_per_node {
             "the cut claims {} ms of a head heard 2000 ms ago",
             at - (now.wall.0 - 2_000)
         );
+    }
+}
+
+/// Plan 46 M1.3 step 4, the sticky kind: a grant the TTL, the placement and
+/// a cross-subtree op never take back (`GrantKind::non_stealable`, with the
+/// designation).
+mod step4_sticky {
+    use super::*;
+    use crate::core::delegate::{RecallPhase, RecallPlan};
+    use crate::core::{Asker, CommitRule, DelegKind};
+    use crate::replica::Replica;
+    use constellation_meta::{SubtreeGrant, SubtreeKind};
+
+    fn mkdir(h: &Harness, name: &str) -> (constellation_fs_core::Ino, LogRecord) {
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        (
+            ino,
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: name.into(),
+                ino,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+        )
+    }
+
+    fn control_delegate(
+        h: &mut Harness,
+        op: u64,
+        dir: constellation_fs_core::Ino,
+        node: NodeId,
+        sticky: bool,
+    ) -> (bool, Vec<Action>) {
+        let out = h.step(Event::Control {
+            op: OpId(op),
+            req: Control::Delegate { dir, node, sticky },
+        });
+        let ok = out
+            .iter()
+            .any(|a| matches!(a, Action::ControlDone { op: o, result: Ok(_) } if *o == OpId(op)));
+        (ok, out)
+    }
+
+    /// The root with `d1` and `d2`, a placement that would take a grant
+    /// back, and node 2's link up.
+    fn root_with_two_dirs() -> (
+        Harness,
+        constellation_fs_core::Ino,
+        constellation_fs_core::Ino,
+    ) {
+        let (h, d1) = root_with_dir();
+        let (d2, rec) = mkdir(&h, "d2");
+        Replica::apply_segment(&h.meta, 2, 1, 0, &[], &[], &[rec]).unwrap();
+        (h, d1, d2)
+    }
+
+    fn sticky_gen_of(h: &Harness, dir: constellation_fs_core::Ino) -> u64 {
+        let d = h.meta.delegation_table().get(dir).expect("granted");
+        assert_eq!(d.kind, SubtreeKind::Sticky, "{d:?}");
+        d.gen
+    }
+
+    /// A sticky grant has no TTL end: the root arms no expiry for it, and a
+    /// long silence of its holder takes nothing back. Fails when the TTL
+    /// treats it as a placed grant (the knob `ttl_reclaims_sticky` is that
+    /// code: it arms the expiry, which the second half shows).
+    #[test]
+    fn a_sticky_grant_arms_no_ttl_end() {
+        let (mut h, d1, _d2) = root_with_two_dirs();
+        let (ok, out) = control_delegate(&mut h, 900, d1, 3, true);
+        assert!(ok, "{out:?}");
+        let gen = sticky_gen_of(&h, d1);
+        assert_eq!(h.core.dl.gens[&gen].kind(), DelegKind::Sticky);
+        assert!(h.core.dl.gens[&gen].non_stealable());
+        assert!(
+            timers(&out, TimerKind::DelegExpiry).is_empty(),
+            "an expiry was armed for a sticky grant: {out:?}"
+        );
+        assert!(h.core.dl.gens[&gen].expiry.is_none());
+        // Silence for a hundred TTLs: still the holder's.
+        h.advance(100 * h.core.cfg.delegation_ttl_ms);
+        assert!(!h.core.dl.gens[&gen].ended);
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::None);
+        assert_eq!(h.core.stats.deleg_sticky, 1);
+        // The negative control: the same grant under the knob is TTL-ended
+        // as a placed one.
+        let (mut h, d1, _d2) = root_with_two_dirs();
+        h.core.cfg.ttl_reclaims_sticky = true;
+        let (ok, out) = control_delegate(&mut h, 900, d1, 3, true);
+        assert!(ok, "{out:?}");
+        assert!(
+            !timers(&out, TimerKind::DelegExpiry).is_empty(),
+            "the knob left the TTL alone: {out:?}"
+        );
+    }
+
+    /// The placement never recalls a sticky grant, however little its holder
+    /// writes under it, and grants a node that holds sticky grants nothing
+    /// that can be taken back.
+    #[test]
+    fn the_placement_never_recalls_a_sticky_grant() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.placement = true;
+        h.core.cfg.placement_min_ops = 20;
+        h.hold(1, None);
+        let mut dirs = Vec::new();
+        for name in ["w1", "w2"] {
+            let (d, rec) = mkdir(&h, name);
+            Replica::apply_segment(&h.meta, dirs.len() as u64 + 1, 1, 0, &[], &[], &[rec]).unwrap();
+            dirs.push(d);
+        }
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2],
+            issued: WaitMs(i64::MAX),
+        });
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 2,
+                connected: true,
+                last_seen: Some(w(h.now)),
+                rtt_ms: Some(1),
+                since: Some(w(h.now)),
+            }],
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+        let mut out = Vec::new();
+        let gen = h
+            .core
+            .delegate_dir(h.clk(), dirs[0], 2, DelegKind::Sticky, &h.meta, &mut out)
+            .unwrap();
+        let why = h
+            .core
+            .delegate_dir(h.clk(), dirs[1], 2, DelegKind::Placed, &h.meta, &mut out)
+            .expect_err("a stealable grant joined a sticky stream");
+        assert!(why.contains("sticky directories only"), "{why}");
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        let tick = |h: &mut Harness| {
+            let (now, mut out) = (h.now, Vec::new());
+            h.core
+                .on_placement_timer(Now::same(now.0), &h.meta, &mut out);
+        };
+        tick(&mut h);
+        assert_eq!(h.core.stats.place_skipped_designated, 1);
+        assert_eq!(h.core.stats.place_delegated, 0);
+        // Node 2 writes nothing under its sticky subtree for many dwells.
+        for _ in 0..3 {
+            h.advance(h.core.cfg.placement_dwell_ms + 1_000);
+            tick(&mut h);
+        }
+        assert_eq!(h.core.stats.place_recalled, 0);
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::None);
+        assert!(!h.core.dl.gens[&gen].ended);
+    }
+
+    /// An op the root cannot hand to the holder is refused, not recalled:
+    /// `EROFS` for an op inside the sticky subtree, `EXDEV` for one across
+    /// its boundary; the stream stays.
+    #[test]
+    fn an_op_under_a_sticky_grant_is_refused_at_the_root() {
+        let (mut h, d1, _d2) = root_with_two_dirs();
+        let (ok, out) = control_delegate(&mut h, 900, d1, 3, true);
+        assert!(ok, "{out:?}");
+        let gen = sticky_gen_of(&h, d1);
+        let inside = constellation_meta::TouchSet {
+            dentries: [(d1, "x".to_string())].into_iter().collect(),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let plan = h
+            .core
+            .deleg_recall_plan(h.clk(), &inside, &h.meta, &mut out);
+        assert!(
+            matches!(plan, RecallPlan::Refuse(c) if c == constellation_types::Code::ReadOnly),
+            "{plan:?}"
+        );
+        let across = constellation_meta::TouchSet {
+            dentries: [(d1, "x".to_string()), (ROOT_INO, "y".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let plan = h
+            .core
+            .deleg_recall_plan(h.clk(), &across, &h.meta, &mut out);
+        assert!(
+            matches!(plan, RecallPlan::Refuse(c) if c == constellation_types::Code::CrossDevice),
+            "{plan:?}"
+        );
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::None);
+        assert!(sends(&out)
+            .iter()
+            .all(|(_, m)| !matches!(m, PeerMsg::ReleaseRequest { .. })));
+        assert_eq!(h.core.stats.deleg_refused_designated, 2);
+    }
+
+    /// A stream never mixes the families: a sticky grant joins a sticky
+    /// stream, not a designated one or one that can be reclaimed, and a
+    /// grant that can be reclaimed does not join a sticky stream.
+    #[test]
+    fn a_stream_does_not_mix_sticky_with_the_other_families() {
+        let (mut h, d1, d2) = root_with_two_dirs();
+        let (d3, rec) = mkdir(&h, "d3");
+        Replica::apply_segment(&h.meta, 3, 1, 0, &[], &[], &[rec]).unwrap();
+        let (ok, _) = control_delegate(&mut h, 900, d1, 3, true);
+        assert!(ok);
+        let (ok, _) = control_delegate(&mut h, 901, d2, 3, false);
+        assert!(!ok, "a stealable grant joined a sticky stream");
+        let mut out = Vec::new();
+        assert!(h
+            .core
+            .delegate_dir(h.clk(), d2, 3, DelegKind::Designated, &h.meta, &mut out)
+            .is_err());
+        let (ok, _) = control_delegate(&mut h, 902, d3, 3, true);
+        assert!(ok, "a sticky grant did not join the sticky stream");
+        let gen = sticky_gen_of(&h, d1);
+        assert_eq!(h.core.dl.gens[&gen].dir_list().len(), 2);
+        // And a sticky grant to a node with a stealable stream waits for
+        // the operator to take that one back.
+        let (mut h, d1, d2) = root_with_two_dirs();
+        let (ok, _) = control_delegate(&mut h, 900, d1, 3, false);
+        assert!(ok);
+        let (ok, out) = control_delegate(&mut h, 901, d2, 3, true);
+        assert!(!ok);
+        assert!(
+            out.iter().any(|a| matches!(a, Action::ControlDone { result: Err(why), .. } if why.contains("undelegate"))),
+            "{out:?}"
+        );
+    }
+
+    /// `undelegate` is the operator's action on a sticky grant (a designation
+    /// is released by `online` only): the stream is recalled.
+    #[test]
+    fn the_operator_undelegates_a_sticky_grant() {
+        let (mut h, d1, _d2) = root_with_two_dirs();
+        let (ok, _) = control_delegate(&mut h, 900, d1, 3, true);
+        assert!(ok);
+        let gen = sticky_gen_of(&h, d1);
+        let out = h.step(Event::Control {
+            op: OpId(901),
+            req: Control::Undelegate { dir: d1 },
+        });
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::ReleaseRequest { .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::Sent);
+    }
+
+    fn holder_of(
+        committed: bool,
+        grants: &[(SubtreeKind, &str)],
+    ) -> (Harness, Vec<constellation_fs_core::Ino>) {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let mut records = Vec::new();
+        let mut dirs = Vec::new();
+        for (_, name) in grants {
+            let (d, rec) = mkdir(&h, name);
+            records.push(rec);
+            dirs.push(d);
+        }
+        records.push(LogRecord::DelegateNode {
+            node: 3,
+            gen: 7,
+            dirs: grants
+                .iter()
+                .zip(&dirs)
+                .map(|((kind, _), dir)| SubtreeGrant {
+                    dir: *dir,
+                    kind: *kind,
+                })
+                .collect(),
+        });
+        let n = records.len() as u64;
+        Replica::install_streamed(&h.meta, 1, 1, 1, n, &records, committed, (0, 0)).unwrap();
+        (h, dirs)
+    }
+
+    /// A stream is `Final` (honoured with no renewal, answered from its
+    /// holder's disk) only when every grant in it is non-stealable.
+    #[test]
+    fn a_stream_is_final_only_when_every_grant_in_it_is_non_stealable() {
+        for (grants, final_) in [
+            (vec![(SubtreeKind::Sticky, "a")], true),
+            (
+                vec![(SubtreeKind::Sticky, "a"), (SubtreeKind::Sticky, "b")],
+                true,
+            ),
+            (vec![(SubtreeKind::Designated, "a")], true),
+            (vec![(SubtreeKind::Placed, "a")], false),
+            (
+                vec![(SubtreeKind::Sticky, "a"), (SubtreeKind::Placed, "b")],
+                false,
+            ),
+        ] {
+            let (mut h, _) = holder_of(true, &grants);
+            let mut out = Vec::new();
+            h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+            let d = &h.core.dl.mine[&7];
+            assert_eq!(d.non_stealable, final_, "{grants:?}");
+            let rule = h.core.deleg_rule(7, Asker::Own, &h.meta);
+            assert_eq!(rule == CommitRule::Final, final_, "{grants:?}: {rule:?}");
+            assert_eq!(
+                d.until.0 > 1_000_000_000_000,
+                final_,
+                "{grants:?}: honoured with no renewal"
+            );
+        }
+    }
+
+    /// A sticky grant is honoured once its `DelegateNode` is committed,
+    /// with no renewal (step 8b's rule): parked while the record is only a
+    /// streamed entry, executing from the sync the log's segment triggers.
+    #[test]
+    fn a_sticky_grant_is_honoured_once_its_record_is_committed() {
+        let (mut h, dirs) = holder_of(false, &[(SubtreeKind::Sticky, "a")]);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine.is_empty(), "installed an uncommitted grant");
+        let records = vec![
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "a".into(),
+                ino: dirs[0],
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+            LogRecord::delegate_one(3, 7, dirs[0], SubtreeKind::Sticky),
+        ];
+        Replica::apply_segment(&h.meta, 1, 1, 2, &[1], &[], &records).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine.contains_key(&7));
+        assert!(h.core.dl.mine[&7].non_stealable);
+        let rid = h.rid(1);
+        let op = MutateOp::Create {
+            parent: dirs[0],
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dirs[0]).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        assert_eq!(h.core.dl.mine[&7].executed, 1);
     }
 }

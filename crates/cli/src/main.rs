@@ -413,6 +413,11 @@ enum Command {
         /// The delegate's node id.
         #[arg(long)]
         to: u64,
+        /// A sticky grant: the TTL and the placement never take it back;
+        /// it ends by the holder's release or an operator action
+        /// (`undelegate`).
+        #[arg(long)]
+        sticky: bool,
     },
     /// Plan 30 §M11: recall the delegation on a directory.
     Undelegate {
@@ -1859,13 +1864,18 @@ fn run() -> Result<()> {
             target,
             state_dir,
             to,
+            sticky,
         } => {
             let (t, dir) = resolve_target(&target, state_dir)?;
             let path = target::effective_path(&t);
             ctl::<cm::DesignationDelegate>(
                 &rt,
                 &dir,
-                api::DelegateParams { path, node: to },
+                api::DelegateParams {
+                    path,
+                    node: to,
+                    sticky,
+                },
                 print_ack,
             )
         }

@@ -98,6 +98,41 @@ pub enum DelegKind {
     /// An offline designation (plans 03–05): recalled only by `online`;
     /// never expires; a cross-subtree op touching it is refused.
     Designated,
+    /// Plan 46 M1.3 step 4 (`constellation delegate --sticky`): a grant the
+    /// root does not take back by itself. No TTL end, no placement recall,
+    /// no recall by a cross-subtree op; it ends by the holder's release or
+    /// an operator action.
+    Sticky,
+}
+
+impl DelegKind {
+    /// The one test of the family: the root cannot take the grant back by
+    /// itself (no TTL end, no placement recall, `EROFS` at the root and
+    /// `EXDEV` across the boundary while the holder is out of reach,
+    /// locks that outlive the holder's silence). A stream is `Final` only
+    /// when every grant in it is.
+    pub(crate) fn non_stealable(self) -> bool {
+        matches!(self, DelegKind::Designated | DelegKind::Sticky)
+    }
+
+    /// Whether a grant of kind `other` may join a stream holding `self`:
+    /// a stream never mixes the families (stealable, sticky, designated).
+    pub(crate) fn joins(self, other: DelegKind) -> bool {
+        if self.non_stealable() || other.non_stealable() {
+            self == other
+        } else {
+            true
+        }
+    }
+
+    /// The kind the record carries.
+    pub(crate) fn subtree_kind(self) -> SubtreeKind {
+        match self {
+            DelegKind::Designated => SubtreeKind::Designated,
+            DelegKind::Sticky => SubtreeKind::Sticky,
+            DelegKind::Manual | DelegKind::Placed => SubtreeKind::Placed,
+        }
+    }
 }
 
 /// Step 10: a request for some subtrees of a stream is sent this many times
@@ -269,8 +304,14 @@ impl StreamView {
         }
     }
 
-    pub(crate) fn designated(&self) -> bool {
-        !self.dirs.is_empty() && self.dirs.iter().all(|(_, k)| *k == SubtreeKind::Designated)
+    /// Every grant of the stream is non-stealable.
+    pub(crate) fn non_stealable(&self) -> bool {
+        !self.dirs.is_empty() && self.dirs.iter().all(|(_, k)| k.non_stealable())
+    }
+
+    /// Every grant of the stream is sticky.
+    pub(crate) fn sticky(&self) -> bool {
+        !self.dirs.is_empty() && self.dirs.iter().all(|(_, k)| *k == SubtreeKind::Sticky)
     }
 
     pub(crate) fn dir_list(&self) -> Vec<Ino> {
@@ -279,20 +320,28 @@ impl StreamView {
 }
 
 impl GenState {
-    /// Every grant of the stream is non-stealable (a designation): the one
-    /// rule of the stream is `Final`, and the TTL, the placement and a
-    /// recall by a cross-subtree op leave it alone. A stream with any
-    /// stealable grant has the group rule and is reclaimed whole.
+    /// Every grant of the stream is non-stealable (a sticky grant or a
+    /// designation): the one rule of the stream is `Final`, and the TTL, the
+    /// placement and a recall by a cross-subtree op leave it alone. A stream
+    /// with any stealable grant has the group rule and is reclaimed whole.
+    pub(crate) fn non_stealable(&self) -> bool {
+        !self.dirs.is_empty() && self.dirs.values().all(|k| k.non_stealable())
+    }
+
+    /// Every grant of the stream is an offline designation (what only
+    /// `online` releases).
     pub(crate) fn designated(&self) -> bool {
         !self.dirs.is_empty() && self.dirs.values().all(|k| *k == DelegKind::Designated)
     }
 
-    /// The stream's kind: `Designated` when every grant is, `Manual` when an
-    /// operator granted any of its subtrees (the placement does not recall
-    /// it), otherwise `Placed`.
+    /// The stream's kind: `Designated` or `Sticky` when every grant is,
+    /// `Manual` when an operator granted any of its subtrees (the placement
+    /// does not recall it), otherwise `Placed`.
     pub(crate) fn kind(&self) -> DelegKind {
         if self.designated() {
             DelegKind::Designated
+        } else if !self.dirs.is_empty() && self.dirs.values().all(|k| *k == DelegKind::Sticky) {
+            DelegKind::Sticky
         } else if self.dirs.values().any(|k| *k == DelegKind::Manual) || self.dirs.is_empty() {
             DelegKind::Manual
         } else {
@@ -649,8 +698,9 @@ pub(crate) struct DelegateState {
     pub parked: Vec<ParkedDeleg>,
     /// Executed under this generation here (for `status`).
     pub executed: u64,
-    /// Phase 2b: a designation — honoured whatever the clock says.
-    pub designated: bool,
+    /// Phase 2b: every grant is non-stealable (a designation or a sticky
+    /// grant): honoured whatever the clock says.
+    pub non_stealable: bool,
     /// Phase 2b: the root the stream last went to; a different one
     /// (a failover) gets every unretired transaction again.
     pub last_root: Option<NodeId>,
@@ -1456,7 +1506,7 @@ impl Core {
             let Some(g) = self.dl.gens.get_mut(&gen) else {
                 continue;
             };
-            if g.ended || !g.inherited || g.node == me || g.designated() {
+            if g.ended || !g.inherited || g.node == me || g.non_stealable() {
                 continue;
             }
             if g.recall == RecallPhase::None {
@@ -1662,7 +1712,7 @@ impl Core {
             // a designee is exempt: it renews nothing, and its stream
             // sends only rows a sync put on its disk (`deleg_stream`).
             let rebooted =
-                !d.designated() && replica.deleg_held_on_another_boot(d.gen, now.boot.id);
+                !d.non_stealable() && replica.deleg_held_on_another_boot(d.gen, now.boot.id);
             if rebooted {
                 self.stats.deleg_rebooted_holder += 1;
                 tracing::warn!(
@@ -1720,7 +1770,7 @@ impl Core {
                     lapsed: false,
                     parked: Vec::new(),
                     executed: 0,
-                    designated: d.designated(),
+                    non_stealable: d.non_stealable(),
                     last_root: self.root_node(),
                     backup: None,
                     backup_acked: 0,
@@ -1750,7 +1800,7 @@ impl Core {
                     xheld_since: None,
                 },
             );
-            if d.designated() {
+            if d.non_stealable() {
                 // Honoured whatever the root says or the clock does
                 // (DESIGN.md §5.2: the designee writes while isolated).
                 self.dl.mine.get_mut(&d.gen).expect("present").until = HonourMs(i64::MAX / 2);
@@ -1846,13 +1896,7 @@ impl Core {
                     // journal (a predecessor's, applied late): the stream
                     // holds it.
                     for (dir, kind) in &d.dirs {
-                        g.dirs
-                            .entry(*dir)
-                            .or_insert(if *kind == SubtreeKind::Designated {
-                                DelegKind::Designated
-                            } else {
-                                DelegKind::Manual
-                            });
+                        g.dirs.entry(*dir).or_insert(kind_of(*kind));
                     }
                     // And a release it did not append (a predecessor's row,
                     // applied late): the stream no longer holds the subtree.
@@ -1917,25 +1961,12 @@ impl Core {
                     d.node,
                     inherited_until,
                     inherited_until,
-                    !d.designated(),
+                    !(d.non_stealable() && !(self.cfg.ttl_reclaims_sticky && d.sticky())),
                 );
                 self.dl.gens.insert(
                     d.gen,
                     GenState {
-                        dirs: d
-                            .dirs
-                            .iter()
-                            .map(|(dir, k)| {
-                                (
-                                    *dir,
-                                    if *k == SubtreeKind::Designated {
-                                        DelegKind::Designated
-                                    } else {
-                                        DelegKind::Manual
-                                    },
-                                )
-                            })
-                            .collect(),
+                        dirs: d.dirs.iter().map(|(dir, k)| (*dir, kind_of(*k))).collect(),
                         node: d.node,
                         group: GroupState::of(group_row),
                         redelegate_dirs: BTreeMap::new(),
@@ -2153,7 +2184,7 @@ impl Core {
             }
             return false;
         }
-        let designated_stream = d.designated;
+        let non_stealable_stream = d.non_stealable;
         let mut promoted = 0u64;
         // Only a renewal sent after this point counts: not one in flight,
         // nor one answered or sent by the lane already.
@@ -2167,7 +2198,7 @@ impl Core {
             }
             // A stream never mixes grant kinds: a designated stream grows
             // by designations only, honoured once committed.
-            if designated_stream {
+            if non_stealable_stream {
                 d.grown.remove(&dir);
                 d.dirs.insert(dir);
                 promoted += 1;
@@ -2231,7 +2262,7 @@ impl Core {
         // if one explains it. A recalled or refused generation (`stopped`),
         // and one already counted at its lapse (`lapsed`), are not.
         if self.dl.mine.get(&gen).is_some_and(|d| {
-            !d.lapsed && !d.stopped && !d.designated && now.honour >= self.deleg_lapse_at(d)
+            !d.lapsed && !d.stopped && !d.non_stealable && now.honour >= self.deleg_lapse_at(d)
         }) {
             self.deleg_note_loss(gen, true);
         }
@@ -2459,7 +2490,7 @@ impl Core {
             .dl
             .mine
             .get(&gen)
-            .is_some_and(|d| now.honour < d.until || d.designated);
+            .is_some_and(|d| now.honour < d.until || d.non_stealable);
         // The model's rule 1: the delegate waits for `deps` too.
         let reaches = settle || self.cfg.skip_deleg_dep_wait || replica.reaches(&deps);
         // Phase 2b (M8): the read delegations this delegate granted on
@@ -2975,7 +3006,7 @@ impl Core {
             return archive;
         }
         match self.dl.mine.get(&gen) {
-            Some(d) if d.designated => CommitRule::Final,
+            Some(d) if d.non_stealable => CommitRule::Final,
             Some(d)
                 if asker == Asker::Own
                     && self.deleg_lone(d)
@@ -3103,7 +3134,7 @@ impl Core {
         let Some(d) = self.dl.mine.get(&gen) else {
             return false;
         };
-        if self.cfg.ack_s3 || d.designated || !self.deleg_lone(d) {
+        if self.cfg.ack_s3 || d.non_stealable || !self.deleg_lone(d) {
             return false;
         }
         let committed = self.deleg_committed_capped(gen, replica);
@@ -4625,7 +4656,7 @@ impl Core {
         if gs.ended {
             return;
         }
-        let (dirs, designated) = (gs.dirs.clone(), gs.designated());
+        let (dirs, non_stealable) = (gs.dirs.clone(), gs.non_stealable());
         let tail = gs.sealed_tail.clone();
         let ends_recall = self.root_ends_recall(now, gen);
         let mut sealed = false;
@@ -4670,7 +4701,7 @@ impl Core {
             }
         }
         self.end_generation(now, gen, None, replica, out);
-        if sealed && !designated {
+        if sealed && !non_stealable {
             // Every subtree of the stream, to the backup: the first grant
             // opens its stream, the rest grow it.
             for (dir, kind) in dirs {
@@ -5133,7 +5164,7 @@ impl Core {
                 // just before its core got stuck was queued to that core
                 // (nothing was stuck yet) and waits for it; only a request
                 // made after the stall began is answered off the core.
-                let early = !d.renew_resent && !d.stopped && !d.designated && age >= resend;
+                let early = !d.renew_resent && !d.stopped && !d.non_stealable && age >= resend;
                 if age >= timeout || early {
                     d.renew_resend_next = early;
                     late.push((req, root, sent));
@@ -5583,7 +5614,7 @@ impl Core {
             // The sync is a full flush of the store: off the core
             // (`Action::SyncDelegStream`), the rows it covers sent once it
             // is done (`Core::on_deleg_stream_synced`).
-            if d.designated {
+            if d.non_stealable {
                 if last > d.synced_through && d.sync_inflight.is_none() {
                     let through = replica.delegate_idx(gen);
                     self.stats.deleg_designee_syncs += 1;
@@ -6500,7 +6531,7 @@ impl Core {
                 .filter(|(gen, g)| {
                     !g.ended
                         && g.recall == RecallPhase::None
-                        && !g.designated()
+                        && !g.non_stealable()
                         && self.deleg_settled(**gen, replica)
                 })
                 .map(|(gen, _)| *gen)
@@ -6628,7 +6659,7 @@ impl Core {
             self.cancel_timer(t, out);
         }
         let d = self.dl.mine.get(&gen).expect("present");
-        if d.designated || d.stopped || d.lapsed {
+        if d.non_stealable || d.stopped || d.lapsed {
             return;
         }
         let at = self.deleg_lapse_at(d).max(now.honour.plus(1));
@@ -6663,7 +6694,7 @@ impl Core {
             return;
         };
         d.lapse_timer = None;
-        if d.designated || d.stopped || d.lapsed {
+        if d.non_stealable || d.stopped || d.lapsed {
             return;
         }
         let d = self.dl.mine.get(&gen).expect("present");
@@ -6748,7 +6779,7 @@ impl Core {
         self.dl
             .mine
             .values()
-            .filter(move |d| root.is_some() && !d.stopped && !d.designated && d.until.0 > 0)
+            .filter(move |d| root.is_some() && !d.stopped && !d.non_stealable && d.until.0 > 0)
             .map(move |d| {
                 let (next_due, period_ms) = Self::deleg_next_renewal(d, timeout);
                 DelegRenewCert {
@@ -6934,7 +6965,7 @@ impl Core {
         let Some(d) = self.dl.mine.get_mut(&gen) else {
             return;
         };
-        if d.stopped || d.designated || d.stream_round != round || d.until.0 == 0 {
+        if d.stopped || d.non_stealable || d.stream_round != round || d.until.0 == 0 {
             return;
         }
         d.last_renew_sent = d.last_renew_sent.max(sent);
@@ -7192,7 +7223,7 @@ impl Core {
         let Some(d) = self.dl.mine.get_mut(&gen) else {
             return false;
         };
-        if d.held_noted || d.designated {
+        if d.held_noted || d.non_stealable {
             return true;
         }
         if replica.deleg_note_held(gen, now.boot.id) {
@@ -7247,7 +7278,7 @@ impl Core {
             Some(d)
                 if ttl_ms > 0
                     && serving
-                    && !d.designated
+                    && !d.non_stealable
                     && root == Some(from)
                     && d.stream_round == round
                     && d.core_granted_round == Some(round) =>
@@ -7895,13 +7926,13 @@ impl Core {
         {
             return RecallPlan::Gated;
         }
-        let designated = involved.iter().any(|(g, _)| {
+        let non_stealable = involved.iter().any(|(g, _)| {
             self.dl
                 .gens
                 .get(g)
-                .is_some_and(|s| !s.ended && s.designated())
+                .is_some_and(|s| !s.ended && s.non_stealable())
         });
-        if designated {
+        if non_stealable {
             // Plans 03–05: only the designee writes under its path
             // (`EROFS` for anyone else once the designee is unreachable),
             // and nothing moves across its boundary (`EXDEV`).
@@ -8464,12 +8495,23 @@ impl Core {
         }
     }
 
+    /// Whether the TTL leaves a grant of this kind alone: every non-stealable
+    /// kind, but for the simulation's negative control
+    /// (`Config::ttl_reclaims_sticky`: the code without this step's rule).
+    fn ttl_exempt_kind(&self, k: DelegKind) -> bool {
+        k.non_stealable() && !(self.cfg.ttl_reclaims_sticky && k == DelegKind::Sticky)
+    }
+
+    fn ttl_exempt(&self, g: &GenState) -> bool {
+        g.non_stealable() && self.ttl_exempt_kind(g.kind())
+    }
+
     fn arm_gen_expiry(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
         let Some(g) = self.dl.gens.get(&gen) else {
             return;
         };
-        if g.ended || g.designated() {
-            // A designation never expires: `online` ends it (an
+        if g.ended || self.ttl_exempt(g) {
+            // A non-stealable grant never expires: `online` ends it (an
             // unreachable designee's stays until it returns, DESIGN.md
             // §5.2).
             return;
@@ -9274,6 +9316,16 @@ impl Core {
         let dirs = g.dir_list();
         let cursor = g.cursor;
         let drained = matches!(g.recall, RecallPhase::Drained(_));
+        // Plan 46 M1.3 step 4 (coverage): how a sticky stream ended.
+        if g.kind() == DelegKind::Sticky {
+            if abandoned.is_some() {
+                self.stats.deleg_sticky_ended_abandoned += 1;
+            } else if drained {
+                self.stats.deleg_sticky_ended_released += 1;
+            } else {
+                self.stats.deleg_sticky_ended_other += 1;
+            }
+        }
         // Plan 43 C2: the generation's end carries its cut: the rows this
         // root appended (`cursor`) — or, when this root was the
         // generation's delegate itself (inherited at a takeover), further:
@@ -9743,12 +9795,14 @@ impl Core {
 
     // ----------------------------------------------------- controls
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_control_delegate(
         &mut self,
         now: Now,
         op: OpId,
         dir: Ino,
         node: NodeId,
+        sticky: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -9758,7 +9812,12 @@ impl Core {
                 result: Err(msg),
             });
         };
-        match self.delegate_dir(now, dir, node, DelegKind::Manual, replica, out) {
+        let kind = if sticky {
+            DelegKind::Sticky
+        } else {
+            DelegKind::Manual
+        };
+        match self.delegate_dir(now, dir, node, kind, replica, out) {
             Ok(gen) => out.push(Action::ControlDone {
                 op,
                 result: Ok(ControlOk::Text(format!(
@@ -9804,7 +9863,6 @@ impl Core {
         // stream is live grows it (below); one to a node with none opens
         // its stream. Checked before anything is touched, so a refusal
         // costs nothing and the placement does not retry it every round.
-        let designating_kind = kind == DelegKind::Designated;
         let live_stream = self
             .dl
             .gens
@@ -9813,11 +9871,34 @@ impl Core {
             .map(|(gen, _)| *gen);
         if let Some(gen) = live_stream {
             let g = &self.dl.gens[&gen];
-            if g.designated() != designating_kind {
-                if !designating_kind {
+            let held = g.kind();
+            if !held.joins(kind) {
+                if held.non_stealable() && kind.non_stealable() {
                     return Err(format!(
-                        "node {node} holds designated directories only; a grant that can be \
-                         reclaimed waits until they are released"
+                        "node {node} holds {} directories only; the other kind of grant that can \
+                         never be reclaimed waits until they are released",
+                        if held == DelegKind::Sticky {
+                            "sticky"
+                        } else {
+                            "designated"
+                        }
+                    ));
+                }
+                if held.non_stealable() {
+                    return Err(format!(
+                        "node {node} holds {} directories only; a grant that can be \
+                         reclaimed waits until they are released",
+                        if held == DelegKind::Sticky {
+                            "sticky"
+                        } else {
+                            "designated"
+                        }
+                    ));
+                }
+                if kind == DelegKind::Sticky {
+                    return Err(format!(
+                        "node {node} holds delegations that can be reclaimed; \
+                         `undelegate` them first (a stream never mixes grant kinds)"
                     ));
                 }
                 // A designation on a node with a stealable stream: that
@@ -9842,7 +9923,7 @@ impl Core {
             if g.recall != RecallPhase::None || g.waiting_for_group || g.prev_blocked {
                 return Err(format!("node {node}'s delegation is being recalled"));
             }
-        } else if !designating_kind && self.dl.designating.values().any(|n| *n == node) {
+        } else if !kind.non_stealable() && self.dl.designating.values().any(|n| *n == node) {
             return Err(format!(
                 "a designation to node {node} is pending; nothing that can be reclaimed is granted to it"
             ));
@@ -9881,7 +9962,7 @@ impl Core {
         // not journaled.
         let quarantine = self.first_renewal_quarantine(now, replica);
         self.dl.growing.retain(|_, (_, until)| *until > now.wait);
-        if live_stream.is_some() && kind != DelegKind::Designated {
+        if live_stream.is_some() && !kind.non_stealable() {
             // A grown subtree has no first renewal to wait out the quarantine
             // (or the read delegations) with, and the stream's renewals must
             // not wait for them (they renew the honoured subtrees): it is
@@ -9908,9 +9989,17 @@ impl Core {
             }
             self.dl.growing.remove(&dir);
         }
-        if kind == DelegKind::Designated {
+        if kind.non_stealable() {
+            // A non-stealable holder executes from the moment it installs the
+            // record (no renewal), so the grant is journaled only once no
+            // read delegation under `dir` is left. A designation's wait is
+            // kept in `designating` (the designation sync retries it); a
+            // sticky grant's is an error the operator retries.
+            let designating = kind == DelegKind::Designated;
             if !read_grants.grants.is_empty() {
-                self.dl.designating.insert(dir, node);
+                if designating {
+                    self.dl.designating.insert(dir, node);
+                }
                 let n = read_grants.grants.len();
                 self.start_recalls(now, read_grants, out);
                 return Err(format!(
@@ -9918,7 +10007,9 @@ impl Core {
                 ));
             }
             if let Some(q) = quarantine {
-                self.dl.designating.insert(dir, node);
+                if designating {
+                    self.dl.designating.insert(dir, node);
+                }
                 return Err(format!(
                     "read delegations granted before this tenure may be honoured for {} ms",
                     q.since(now.wait)
@@ -9944,20 +10035,10 @@ impl Core {
         let gen = replica
             .next_delegation_gen(epoch, highest + 1)
             .map_err(|e| e.to_string())?;
-        let designated = kind == DelegKind::Designated;
         let _class = self.journal_class();
         replica
             .apply_records_journaled(
-                &[LogRecord::delegate_one(
-                    node,
-                    gen,
-                    dir,
-                    if designated {
-                        SubtreeKind::Designated
-                    } else {
-                        SubtreeKind::Placed
-                    },
-                )],
+                &[LogRecord::delegate_one(node, gen, dir, kind.subtree_kind())],
                 None,
             )
             .map_err(|e| e.to_string())?;
@@ -9970,8 +10051,13 @@ impl Core {
         let first_until = quarantine
             .map_or(now.wait, |q| q.max(now.wait))
             .plus(self.reclaim_horizon_ms());
-        self.dw
-            .insert(gen, node, first_until, first_until, !designated);
+        self.dw.insert(
+            gen,
+            node,
+            first_until,
+            first_until,
+            !self.ttl_exempt_kind(kind),
+        );
         self.dl.gens.insert(
             gen,
             GenState {
@@ -10023,6 +10109,7 @@ impl Core {
         match kind {
             DelegKind::Placed => self.stats.place_delegated += 1,
             DelegKind::Designated => self.stats.deleg_designated += 1,
+            DelegKind::Sticky => self.stats.deleg_sticky += 1,
             DelegKind::Manual => {}
         }
         self.lease.touch(now);
@@ -10060,16 +10147,7 @@ impl Core {
         let _class = self.journal_class();
         replica
             .apply_records_journaled(
-                &[LogRecord::delegate_one(
-                    node,
-                    gen,
-                    dir,
-                    if kind == DelegKind::Designated {
-                        SubtreeKind::Designated
-                    } else {
-                        SubtreeKind::Placed
-                    },
-                )],
+                &[LogRecord::delegate_one(node, gen, dir, kind.subtree_kind())],
                 None,
             )
             .map_err(|e| e.to_string())?;
@@ -10087,6 +10165,7 @@ impl Core {
         match kind {
             DelegKind::Placed => self.stats.place_delegated += 1,
             DelegKind::Designated => self.stats.deleg_designated += 1,
+            DelegKind::Sticky => self.stats.deleg_sticky += 1,
             DelegKind::Manual => {}
         }
         self.lease.touch(now);
@@ -10309,7 +10388,7 @@ impl Core {
             }
             match table.get(dir) {
                 Some(d) if d.designated() && d.node == node => continue,
-                Some(d) if !d.designated() => {
+                Some(d) if !d.non_stealable() => {
                     // A placed or manual delegation on the very directory:
                     // it ends, the designation follows on the next sync.
                     if self.dl.gens.get(&d.gen).is_some_and(|g| !g.ended) {
@@ -10320,7 +10399,7 @@ impl Core {
                 _ => {}
             }
             if let Some(d) = table.covering(replica.namespace(), dir) {
-                if !d.designated() && self.dl.gens.get(&d.gen).is_some_and(|g| !g.ended) {
+                if !d.non_stealable() && self.dl.gens.get(&d.gen).is_some_and(|g| !g.ended) {
                     self.start_recall(now, d.gen, out);
                 }
                 continue;
@@ -10533,10 +10612,10 @@ pub(crate) enum RecallPlan {
 
 /// The kind a subtree was granted as, from the table's.
 fn kind_of(k: SubtreeKind) -> DelegKind {
-    if k == SubtreeKind::Designated {
-        DelegKind::Designated
-    } else {
-        DelegKind::Manual
+    match k {
+        SubtreeKind::Designated => DelegKind::Designated,
+        SubtreeKind::Sticky => DelegKind::Sticky,
+        SubtreeKind::Placed => DelegKind::Manual,
     }
 }
 

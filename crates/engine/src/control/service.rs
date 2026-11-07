@@ -1080,7 +1080,12 @@ impl EngineControl {
             .collect()
     }
 
-    pub(crate) fn delegate(&self, path: &str, node: u64) -> std::result::Result<String, String> {
+    pub(crate) fn delegate(
+        &self,
+        path: &str,
+        node: u64,
+        sticky: bool,
+    ) -> std::result::Result<String, String> {
         let dir = self
             .meta
             .resolve_path(path)
@@ -1088,7 +1093,12 @@ impl EngineControl {
             .ok_or_else(|| format!("no such directory: {path}"))?;
         let (reply, receive) = tokio::sync::oneshot::channel();
         self.sync_tx
-            .send(sync::SyncRequest::Delegate { dir, node, reply })
+            .send(sync::SyncRequest::Delegate {
+                dir,
+                node,
+                sticky,
+                reply,
+            })
             .map_err(|_| "sync task is not running".to_string())?;
         tokio::task::block_in_place(|| {
             self.rt

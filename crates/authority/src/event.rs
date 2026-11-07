@@ -440,8 +440,13 @@ pub enum Control {
     /// again.
     Retire,
     /// Plan 30 §M11: delegate `dir` to `node` (this node must hold the
-    /// root lease; answered `Text`).
-    Delegate { dir: Ino, node: NodeId },
+    /// root lease; answered `Text`). `sticky` (plan 46 M1.3 step 4): the
+    /// grant is one the TTL and the placement never take back.
+    Delegate {
+        dir: Ino,
+        node: NodeId,
+        sticky: bool,
+    },
     /// Plan 30 §M11: recall the delegation on `dir` (drained, or outwaited
     /// by its grant's expiry; answered `Text` once the generation ended).
     Undelegate { dir: Ino },

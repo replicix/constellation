@@ -1067,7 +1067,7 @@ with the rule off, 40 of 200 seeds lost an acknowledged write) and
 
 | Command | Meaning |
 |---|---|
-| `constellation delegate TARGET --to NODE` | delegate the directory `TARGET` to node `NODE`. Run it on the root lease holder. Refused if the directory overlaps a live delegation, is the root, or `NODE`'s stream is being recalled or holds designations only; a node that holds a delegation takes the directory into that stream (plan 46 M1.2 step 9) |
+| `constellation delegate TARGET --to NODE [--sticky]` | delegate the directory `TARGET` to node `NODE`. Run it on the root lease holder. Refused if the directory overlaps a live delegation, is the root, or `NODE`'s stream is being recalled or holds designations or sticky grants only (and, for `--sticky`, if it holds grants that can be reclaimed: `undelegate` them first); a node that holds a delegation takes the directory into that stream (plan 46 M1.2 step 9). A sticky grant (plan 46 M1.3 step 4) is non-stealable like a designation: no TTL end, no placement recall, `EROFS` at the root and `EXDEV` across its boundary while its holder is out of reach, and its stream is `Final`. It ends by its holder's release or an operator action (`undelegate`) |
 | `constellation undelegate TARGET` | recall the delegation on a directory. Refused for a designation, which only `constellation online` releases |
 | `constellation delegations TARGET` | list the live table: directory, path, node, generation, designated |
 

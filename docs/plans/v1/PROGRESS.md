@@ -68790,3 +68790,46 @@ Re-pins: `m03_a_reachable_sequencers_requester_is_not_isolated` (seed 904 is clo
 **Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta, authority lib (1,102), engine lib (953), store-s3 lib, control, release
 authority sim suite 424 passed, 0 failed, 12 ignored. (The engine lib needs a raised open-file limit on the build box; at the default 1,024 a dozen view tests
 fail on main too.) No perf gate (lease path).
+
+### Plan 46 M1.3 step 4 (the sticky kind)
+
+`constellation delegate --sticky` grants a subtree that the root never takes back by itself. `SubtreeGrant.kind = Sticky` is written (the variant came
+with M1.2 step 8a); the core's `DelegKind` gains `Sticky`. The test "the root cannot take this grant back" is one function now, `non_stealable()`, on
+`SubtreeKind`, `DelegKind`, the table's `Delegation`, the delegate's `StreamView` and the root's `GenState` (true when every grant of the stream is), and
+the delegate's `DelegView.non_stealable` replaces `designated`. A stream is `Final` only when every grant in it is non-stealable; a stream never mixes
+the families (stealable, sticky, designated: `DelegKind::joins`). Every `designated` site was classified (a: non-stealable, converted; b: designation
+lifecycle, kept); the list is in the step's notes: about 40 sites in `core/delegate.rs`, one each in `holder.rs`, `client.rs`, `locks.rs`, `placement.rs`,
+and the kept ones are the designation sync (`on_control_sync_designations`: only a designation is released by its absence from the list, a sticky grant
+is never recalled by it), `undelegate` (refuses a designation and recalls a sticky grant: the operator's action), the `designating` map, and the status rows.
+
+- **What a sticky grant gets, as a designation does.** No TTL end (`arm_gen_expiry` arms nothing), no lapse at the holder (honoured from the committed
+  `DelegateNode`, no renewal: step 8b's rule, reused), no placement recall (`kind()` is `Sticky`, never `Placed`), `EROFS` at the root for an op inside
+  while the holder is out of reach and `EXDEV` across the boundary, the lock outwait barrier skips a silent holder, the holder syncs its rows to its disk
+  before they stream (`Final`). The read delegations under the directory are recalled first (an error the operator retries; a designation keeps its
+  `designating` wait). `delegate --sticky` to a node that holds grants that can be reclaimed is refused until `undelegate` took them back.
+- **Control.** `Control::Delegate { sticky }`, `SyncRequest::Delegate`, `DelegateParams.sticky` (defaulted), the CLI flag; schema re-blessed.
+- **Sim.** New oracle `sticky_ends_only_by_holder_or_operator` (`tests/sim/sticky.rs`), strict on every configuration: a sticky stream ends only by the
+  holder's release (a `SubtreeReleased` per granted subtree, a `StreamReleased`, or the note the sim saw the holder send: a rowless release leaves nothing
+  in the log), by the holder that claims the root lease and ends its own stream (its segment carries the end; claim = release, which step 12 turns into a
+  row), or by the operator's `GroupAbandoned`. Knob `Config::ttl_reclaims_sticky` / `SimConfig::ttl_reclaims_sticky` / `AUTHORITY_SIM_TTL_RECLAIMS_STICKY=1`
+  keeps the root's expiry for a sticky grant (the code without this step). New config `sticky-ttl` (two sticky grants, a partition of one holder longer
+  than the TTL, cross-subtree ops, an operator `undelegate` of the other: `FaultKind::UndelegateDir`). Counters: `SWEEP-STICKY-TOTALS`, core
+  `deleg_sticky`, `deleg_sticky_ended_{released,abandoned,other}`.
+- **Tests** (core, `step4_sticky`, six of seven fail with `non_stealable()` made designation-only, which is main's behaviour for a sticky grant):
+  `a_sticky_grant_arms_no_ttl_end` (and the knob arms it), `the_placement_never_recalls_a_sticky_grant`, `an_op_under_a_sticky_grant_is_refused_at_the_root`
+  (`EROFS` inside, `EXDEV` across, no release request), `a_stream_does_not_mix_sticky_with_the_other_families`,
+  `a_stream_is_final_only_when_every_grant_in_it_is_non_stealable`, `a_sticky_grant_is_honoured_once_its_record_is_committed`, and
+  `the_operator_undelegates_a_sticky_grant` (passes on main too: it pins the operator path). The 8b recall-while-parked test also runs `Sticky`. Sim:
+  `sticky_grants_survive_the_ttl_and_end_by_the_holders_release`, `the_sticky_oracle_catches_a_ttl_that_reclaims_sticky_grants` (seeds 0, 1, 2 of
+  `sticky-ttl` fail with the knob; a 300-seed knob sweep fails 279), and the oracle's own unit test.
+- **Sweeps** (release, seeds 0..1,999): `delegated-designated`, `placement-hot`, `long-delegated`: no failing seed on main and none here (identical
+  sets). `sticky-ttl`: 0 failing seeds; 4,000 sticky streams in the log, 2,000 ended by the holder's release, 4 by the holder's own claim, 0 unexcused;
+  core counters: 3,348 grants made, 1,870 ended released, 4 other (those claims). The first sweep found those four claims (seeds 88, 549, 1477, 1906:
+  the partitioned holder won the lease and ended its own stream with no row) and fixed the oracle, not the product: step 12 writes the row.
+- **Perf.** The ownership walk is untouched (no `non_stealable()` on it). `vfs-bench` (report only, A/B/B/A on one box), overhead per op, main against
+  this change: `view` getattr 97/77 against 87/105 ns, lookup 90/107 against 92/78, read 129/93 against 82/68; no extra allocation; all under 1 us.
+- **Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta, authority (1,122), engine (955), net, control, constellation
+  (bin tests), release authority sim suite 427 passed, 0 failed, 12 ignored.
+
+Not in this step: the holder's release command and idle release (step 5/6), `status.delegation.sticky` and the docs of the kind (step 17), claim =
+release as a row (step 12), `repair abandon --node` (step 13).

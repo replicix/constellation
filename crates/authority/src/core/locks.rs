@@ -2687,10 +2687,10 @@ impl Core {
             if g.ended || g.node == me {
                 continue;
             }
-            let designated = g.designated();
+            let non_stealable = g.non_stealable();
             match self.lk.heads.get(gen) {
                 Some((sent, head, heard)) => {
-                    if !designated || now.wait.since(*heard) < online_ms {
+                    if !non_stealable || now.wait.since(*heard) < online_ms {
                         // (`sent` is the delegate's clock: one that runs
                         // ahead stamps a renewal later than this root has
                         // heard it. The head is no fresher than the moment
@@ -2702,7 +2702,7 @@ impl Core {
                         pos = constellation_meta::locks::floor_join(&pos, &p);
                     }
                 }
-                None if designated && now.wait.since(g.granted) >= online_ms => {}
+                None if non_stealable && now.wait.since(g.granted) >= online_ms => {}
                 None => at = i64::MIN,
             }
         }
