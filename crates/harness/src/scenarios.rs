@@ -9076,6 +9076,12 @@ fn writeback_fsync_after_close(seed: u64, env: &S3Env, root: &std::path::Path) -
             anyhow::ensure!(a.mnt.join("d").is_dir(), "not yet");
             Ok(())
         })?;
+        // B answers A's close with "the stream carries it" (A keeps its
+        // chunks held) only once B has a backup. Before, B is unbacked and
+        // answers "upload" (plan 31 C8 fix, `OwnChunks::Upload`): A's close
+        // uploads its chunks at once, nothing is left queued, and the
+        // scenario's premise is gone.
+        m9::wait_for_backup(&b, Duration::from_secs(60))?;
         let report = a.control(
             "node.lifecycle",
             serde_json::json!({ "event": { "NetworkChanged": { "reachable": true, "metered": true } } }),
