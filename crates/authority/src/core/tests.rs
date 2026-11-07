@@ -410,6 +410,7 @@ fn release_answer(
         dirs,
         end_at: None,
         locks,
+        leaving: false,
     };
     deliver_stream(h, node, gen, vec![row], Some(note))
 }
@@ -427,6 +428,7 @@ fn release_note_only(
         dirs,
         end_at: None,
         locks,
+        leaving: false,
     };
     deliver_stream(h, node, gen, Vec::new(), Some(note))
 }
@@ -21214,6 +21216,10 @@ mod locks {
                 let d = h.core.dl.mine.get_mut(&7).expect("installed");
                 d.until = until;
                 d.renew = None;
+                // The root answered the delegate a moment after the write
+                // passed its check (its send time, on its clock): the next
+                // renewal claims its head as of then.
+                d.root_answer = Some((1, now + 1));
                 let out = h.core.handle(
                     h.clk(),
                     Event::Peer {
@@ -21234,8 +21240,9 @@ mod locks {
                     PeerMsg::DelegRenew {
                         gen: 7,
                         stream_head,
+                        stream_head_at,
                         ..
-                    } if to == 1 => Some(*stream_head),
+                    } if to == 1 => Some((*stream_head, *stream_head_at)),
                     _ => None,
                 });
                 // Let it go if nothing did.
@@ -21246,11 +21253,23 @@ mod locks {
                 meta.set_writer_wait_hook_for_tests(None);
                 head.expect("a renewal")
             });
+            let (head, claimed_at) = head;
+            // (The head is claimed as of a moment after the write began.)
+            assert_eq!(claimed_at, now + 1);
             if settle {
                 assert_eq!(head, before + 1, "the head lacks the pinned write");
                 assert_eq!(h.meta.locks().stats().settle_waits, 1);
             } else {
+                // The negative control of the settle under the root's clock
+                // cut (plan 46 M1.2 step 11): a write held uncommitted
+                // across a renewal round trip is missing from a head that
+                // is claimed as of a moment after it began, so the root's
+                // cut would settle a barrier on a head that lacks it.
                 assert_eq!(head, before, "without the settle the head lacks it");
+                assert!(
+                    claimed_at > now,
+                    "the head is not claimed as of a moment after the write began"
+                );
             }
         }
     }
@@ -61087,6 +61106,7 @@ mod step9_one_stream_per_node {
             dirs: vec![d1],
             end_at: None,
             locks: Default::default(),
+            leaving: false,
         };
         deliver_stream(&mut h, 3, gen, vec![row], Some(note));
         assert!(
@@ -61153,6 +61173,7 @@ mod step9_one_stream_per_node {
             dirs: vec![d1],
             end_at: None,
             locks: Default::default(),
+            leaving: false,
         };
         // The release row alone: the delegate's earlier row is missing (a
         // batch lost), so nothing is appended.
@@ -61828,9 +61849,126 @@ mod step9_one_stream_per_node {
         assert!(h.meta.delegation_table().get(d1).is_none());
     }
 
+    /// Review MUST-2: between the answer of the leave and the registry
+    /// retiring the node, nothing is granted to it: the admin form marks the
+    /// node leaving before it asks, and a grant to it (an operator's, the
+    /// placement's, a designation's: all go through `delegate_dir`) is
+    /// refused, naming the leave.
+    #[test]
+    fn nothing_is_granted_to_a_node_whose_grants_are_being_ended() {
+        let (mut h, d1) = root_with_dir();
+        let out = h.step(Event::Control {
+            op: OpId(910),
+            req: Control::EndGrantsOf { node: 3 },
+        });
+        assert!(
+            matches!(control_answer(&out, 910), Some(Ok(_))),
+            "the node holds nothing: {out:?}"
+        );
+        let out = h.step(Event::Control {
+            op: OpId(911),
+            req: Control::Delegate { dir: d1, node: 3 },
+        });
+        let answer = control_answer(&out, 911).expect("no answer");
+        assert!(
+            answer.as_ref().is_err_and(|e| e.contains("leaving")),
+            "a grant was made to a leaving node: {answer:?}"
+        );
+        assert!(h.meta.delegation_table().get(d1).is_none());
+        // Another node is granted as ever.
+        assert!(delegate(&mut h, 912, d1, 4));
+    }
+
+    /// Review MUST-2, the self form: a holder that leaves says so in its
+    /// release, and the root that receives it grants the node nothing more.
+    #[test]
+    fn a_leaving_holders_release_tells_the_root_to_grant_it_nothing() {
+        // The holder's note.
+        let (mut h, _records, _a) = delegate_learning_a_streamed_grant(true);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (_, req, _) = renewal_sent(&out).expect("no first renewal");
+        h.step(renewed(&h, req, 7, 5_000));
+        let out = h.step(Event::Control {
+            op: OpId(77),
+            req: Control::ReleaseGrants,
+        });
+        let note = release_note_to(&out, 1).expect("the stream was not released toward the root");
+        assert!(note.leaving, "the release does not say the node leaves");
+        // The root's side.
+        let (mut r, d1) = root_with_dir();
+        assert!(delegate(&mut r, 900, d1, 3));
+        let gen = r.meta.delegation_table().get(d1).unwrap().gen;
+        let (d2, rec) = mkdir(&r, "d2");
+        crate::replica::Replica::apply_segment(&r.meta, 2, 1, 0, &[], &[], &[rec]).unwrap();
+        let note = constellation_meta::locks::ReleaseNote {
+            dirs: vec![d1],
+            end_at: None,
+            locks: Default::default(),
+            leaving: true,
+        };
+        deliver_stream(&mut r, 3, gen, Vec::new(), Some(note));
+        let out = r.step(Event::Control {
+            op: OpId(920),
+            req: Control::Delegate { dir: d2, node: 3 },
+        });
+        let answer = control_answer(&out, 920).expect("no answer");
+        assert!(
+            answer.as_ref().is_err_and(|e| e.contains("leaving")),
+            "{answer:?}"
+        );
+    }
+
+    /// Review MUST-3: a stream stopped for another reason (a refused
+    /// renewal, a backup's seal, lost dependencies, a held note, an epoch)
+    /// is not released, and not ended in the log: the leave is not done
+    /// until the table drops it.
+    #[test]
+    fn a_stopped_stream_that_was_never_released_is_not_a_finished_leave() {
+        let (mut h, _records, _a) = delegate_learning_a_streamed_grant(true);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (_, req, _) = renewal_sent(&out).expect("no first renewal");
+        h.step(renewed(&h, req, 7, 5_000));
+        h.core.dl.mine.get_mut(&7).unwrap().stopped = true;
+        let out = h.step(Event::Control {
+            op: OpId(77),
+            req: Control::ReleaseGrants,
+        });
+        assert!(
+            control_answer(&out, 77).is_none(),
+            "the leave was answered with a live, unended stream: {out:?}"
+        );
+        h.advance(600);
+        let out = h.step(Event::Slack { epoch_slack: 0 });
+        assert!(control_answer(&out, 77).is_none(), "{out:?}");
+        // The log ends it: the leave is done.
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
+                gen: 7,
+                through: 0,
+            }],
+        )
+        .unwrap();
+        // The delegate learns the end (and drops the stream).
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.advance(600);
+        out.extend(h.step(Event::Slack { epoch_slack: 0 }));
+        let answer = control_answer(&out, 77).unwrap_or_else(|| panic!("not answered: {out:?}"));
+        assert!(answer.is_ok(), "{answer:?}");
+    }
+
     /// A node that is not the root cannot end another node's grants: it
     /// refuses the retirement of a node the table lists a stream for, and
-    /// lets one through that holds none.
+    /// of one it lists none for (its table may lag the root's).
     #[test]
     fn a_non_root_refuses_to_retire_a_node_that_holds_a_grant() {
         let mut h = Harness::new(2);
@@ -61842,11 +61980,13 @@ mod step9_one_stream_per_node {
             req: Control::EndGrantsOf { node: 3 },
         });
         assert!(matches!(control_answer(&out, 1), Some(Err(_))), "{out:?}");
+        // (Its table may lag the root's: it does not say that a node holds
+        // nothing either.)
         let out = h.step(Event::Control {
             op: OpId(2),
             req: Control::EndGrantsOf { node: 4 },
         });
-        assert!(matches!(control_answer(&out, 2), Some(Ok(_))), "{out:?}");
+        assert!(matches!(control_answer(&out, 2), Some(Err(_))), "{out:?}");
     }
 
     /// Step 10 review SHOULD-1: a subtree this node released and the root
@@ -61917,6 +62057,7 @@ mod step9_one_stream_per_node {
                     floor: Default::default(),
                     barrier: 0,
                 },
+                leaving: false,
             },
             row: Some(4),
             first_row: Some(4),
@@ -61924,6 +62065,7 @@ mod step9_one_stream_per_node {
             holds: 0,
             left_at: WaitMs(1_000),
             to: 1,
+            ends: false,
         };
         let merged = pending(1_000).merge(pending(3_000), WaitMs(1_000));
         assert_eq!(merged.note.locks.carry, vec![(id, 3_000)]);

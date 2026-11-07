@@ -14252,13 +14252,16 @@ fn locks_writer_hold_delegated_without_the_settle_stays_clean_under_the_roots_cu
     // must stay clean without the settle.)
     let seeds = [635, 3358, 3403];
     for seed in seeds {
-        if let Err(e) = run_seed(seed, locks_writer_hold_delegated_unsettled_config()) {
-            assert!(
-                !(e.contains("held write") && e.contains("inside")),
-                "seed {seed}: the held write landed inside the next holder's section without the settle \
+        // (Strictly clean: any other error fails the pin as well. The settle
+        // itself is controlled by `a_delegates_renewal_reports_a_pinned_write_once_its_window_is_over`
+        // in the core tests, which holds a tagged write across a renewal
+        // round trip with the settle off.)
+        run_seed(seed, locks_writer_hold_delegated_unsettled_config()).unwrap_or_else(|e| {
+            panic!(
+                "seed {seed}: the unsettled run is not clean under the root's clock cut \
                  (the cut is as of the delegate's clock?): {e}"
-            );
-        }
+            )
+        });
         run_seed(seed, locks_writer_hold_delegated_config())
             .unwrap_or_else(|e| panic!("locks-writer-hold-delegated seed {seed}: {e}"));
     }

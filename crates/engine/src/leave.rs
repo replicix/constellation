@@ -64,6 +64,32 @@ pub fn designations_held_by(mgr: &DesignationManager, node_id: u64) -> Vec<Strin
         .collect()
 }
 
+/// Admin form, before its grants are ended: without `force` a live
+/// designation of `target` refuses the leave; with it the designations are
+/// released, so none is journaled to the node between the end of its grants
+/// and its retirement.
+pub async fn prepare_admin_leave(
+    designations: &DesignationManager,
+    target: u64,
+    force: bool,
+) -> Result<(), LeaveError> {
+    if force {
+        designations
+            .release_of(target)
+            .await
+            .map_err(|e| LeaveError::Other(format!("releasing designations of {target}: {e}")))?;
+    } else if let Some(path) = designations_held_by(designations, target)
+        .into_iter()
+        .next()
+    {
+        return Err(LeaveError::LiveDesignation {
+            node_id: target,
+            path,
+        });
+    }
+    Ok(())
+}
+
 /// Admin form: retire a *different* node via a still-mounted peer.
 pub async fn admin_leave(
     store: Arc<dyn ObjectStore>,
@@ -349,6 +375,32 @@ mod tests {
         );
         let err = pre_leave_checks(&meta, &designations, id, true).unwrap_err();
         assert!(matches!(err, LeaveError::StrandedJournal), "{err}");
+    }
+
+    /// Review MUST-2: an admin leave drops the designations of the node
+    /// before its grants are ended (`--force`), or refuses before anything is
+    /// ended (without it), so none is journaled to the node meanwhile.
+    #[tokio::test]
+    async fn admin_leave_drops_or_refuses_the_nodes_designations_before_ending_its_grants() {
+        use constellation_store_s3::designation::Designation;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let a = claim_node_id(store.clone()).await.unwrap();
+        let b = claim_node_id(store.clone()).await.unwrap();
+        let ds = DesignationStore::new(store.clone(), DesignationMode::Cas);
+        ds.create(&Designation::new("/x", b, false)).await.unwrap();
+        let designations = DesignationManager::new(ds, open_meta(), Peers::disabled(), a);
+        designations.refresh().await;
+        assert_eq!(
+            designations_held_by(&designations, b),
+            vec!["/x".to_string()]
+        );
+        let err = prepare_admin_leave(&designations, b, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LeaveError::LiveDesignation { .. }), "{err}");
+        assert_eq!(designations_held_by(&designations, b).len(), 1);
+        prepare_admin_leave(&designations, b, true).await.unwrap();
+        assert!(designations_held_by(&designations, b).is_empty());
     }
 
     #[test]

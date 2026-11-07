@@ -1514,6 +1514,12 @@ promises cannot gate it. Epochs are kept away from such leases instead:
   the upload drains). An application or script that relies on `sync` to
   make such data durable must `fsync` the files (or close them under
   `--write-mode through`) instead.
+- After a failover, or under a new delegation generation, no lock barrier
+  settles until the delegate's second renewal: the root cuts a delegate's
+  stream as of a moment of its own clock that precedes the renewal (the
+  send time of the answer the delegate had received), and the first
+  renewal of a generation has received none. A lock requested across a
+  barrier waits one more renewal round trip.
 - A node that enrolls during an open epoch is not accounted for.
 - An epoch's hold owner that dies leaves the other members frozen until
   it returns or is retired.

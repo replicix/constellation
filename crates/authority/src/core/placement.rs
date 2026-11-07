@@ -218,6 +218,9 @@ impl Core {
     /// `auto-placement`, 2 in 11: `place_skipped_unreachable` 9, the
     /// lease on b at the 5 s evaluation, `d1` never delegated).
     fn place_eligible(&mut self, now: Now, node: NodeId, out: &mut Vec<Action>) -> bool {
+        if self.is_leaving(node) {
+            return false;
+        }
         if !self.links.get(&node).is_some_and(|l| l.connected) {
             return false;
         }

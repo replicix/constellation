@@ -1220,6 +1220,17 @@ impl EngineControl {
                 // is alive, else at the expiry, before its registry entry
                 // goes (the roster-only singleton test must never see a
                 // live grant held off the roster).
+                // Nothing is designated to the node meanwhile: a refusal
+                // (a live designation, no `--force`) comes before anything
+                // is ended, and `--force` drops its designations first.
+                let designations = self.designations.clone();
+                tokio::task::block_in_place(|| {
+                    self.rt.block_on(async {
+                        leave::prepare_admin_leave(&designations, target, force)
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                })?;
                 let (reply, receive) = tokio::sync::oneshot::channel();
                 self.sync_tx
                     .send(sync::SyncRequest::EndGrantsOf {

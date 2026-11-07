@@ -542,6 +542,9 @@ pub struct ReleaseNote {
     pub end_at: Option<u64>,
     /// The lock grants of the released subtrees, handed back.
     pub locks: LockHandback,
+    /// The releasing node is leaving: the root grants it nothing more.
+    #[serde(default)]
+    pub leaving: bool,
 }
 
 /// Join two lock floors (positions: watermarks, so the join is what both

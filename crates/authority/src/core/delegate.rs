@@ -538,6 +538,9 @@ pub(crate) struct PendingRelease {
     /// The root that asked: a release that journaled no row answers it
     /// directly.
     pub to: NodeId,
+    /// The release gives the whole stream up (or ends it at a cut): once
+    /// the root acknowledges it, the stream is released, not only a part.
+    pub ends: bool,
 }
 
 impl PendingRelease {
@@ -574,6 +577,7 @@ impl PendingRelease {
         note.locks.floor =
             constellation_meta::locks::floor_join(&note.locks.floor, &new.locks.floor);
         note.locks.barrier = note.locks.barrier.max(new.locks.barrier);
+        note.leaving |= new.leaving;
         self.note = note;
         // A release that journaled no row ends the stream at its cut: the
         // note is acknowledged by the batch that carries it.
@@ -587,6 +591,7 @@ impl PendingRelease {
             (a, b) => a.or(b),
         };
         self.held |= later.held;
+        self.ends |= later.ends;
         self.holds += later.holds;
         self.left_at = now;
         self.to = later.to;
@@ -621,6 +626,10 @@ pub(crate) struct DelegateState {
     /// Plan 46 M1.2 step 10: this node released subtrees on the root's
     /// request and the root has not acknowledged the release row yet.
     pub release: Option<PendingRelease>,
+    /// Plan 46 M1.2 step 11: the root acknowledged the release of the whole
+    /// stream (a leave counts only these as released; the others wait for
+    /// the log to end them).
+    pub release_acked: bool,
     /// Plan 46 M1.2 step 10: the subtrees this node released from the stream
     /// (a repeated or late request for one is not news: it is not a subtree
     /// the node has yet to learn). A subtree granted to the stream again
@@ -1099,6 +1108,12 @@ pub(crate) struct DelegationState {
     /// for the grants of a node to end in the log (see [`LeaveWait`]).
     pub leave_waits: Vec<LeaveWait>,
     pub leave_timer: Option<TimerId>,
+    /// The nodes leaving (this node is their root): nothing is granted to
+    /// them from the moment their leave starts, so no grant is made between
+    /// the end of their grants and the retirement of their registry entry.
+    pub leaving: BTreeSet<NodeId>,
+    /// This node is leaving: its release notes say so to the root.
+    pub leave_self: bool,
     /// The generations a release request reached this node for at least once
     /// (the simulation's loss of the first one, L3).
     pub release_first: BTreeSet<u64>,
@@ -1785,6 +1800,7 @@ impl Core {
                     dirs: d.dir_list().into_iter().collect(),
                     grown: BTreeMap::new(),
                     release: None,
+                    release_acked: false,
                     release_pending: (BTreeSet::new(), 0),
                     released_dirs: BTreeSet::new(),
                     root_answer: None,
@@ -5883,6 +5899,11 @@ impl Core {
                     None => answers_inflight,
                 }
         }) {
+            // (Only a release of the whole stream counts as the stream
+            // released: a stream a refused renewal, a backup's seal, lost
+            // dependencies, a held note that failed or an epoch stopped is
+            // not released, nor ended in the log.)
+            d.release_acked |= d.release.as_ref().is_some_and(|r| r.ends);
             d.release = None;
         }
         if !progressed && !answers_inflight {
@@ -7539,6 +7560,7 @@ impl Core {
                 dirs: asked.iter().copied().collect(),
                 end_at: Some(cut),
                 locks: Default::default(),
+                leaving: self.dl.leave_self,
             };
             self.send_release_cut(gen, from, note, out);
             self.lock_reserve_all(now, replica, out);
@@ -7697,6 +7719,7 @@ impl Core {
             dirs: asked_list.clone(),
             end_at: rowless.then_some(cut),
             locks,
+            leaving: self.dl.leave_self,
         };
         let parked = {
             let d = self.dl.mine.get_mut(&gen).expect("present");
@@ -7716,6 +7739,7 @@ impl Core {
                 holds: 0,
                 left_at: now.wait,
                 to: from,
+                ends: whole || rowless,
             };
             // A note the root has not acknowledged is never dropped for
             // this one: the two are one.
@@ -9720,6 +9744,9 @@ impl Core {
         if let Some(g) = self.dl.gens.get_mut(&gen) {
             g.delegate_heard = Some(now.wait);
         }
+        if released.as_ref().is_some_and(|n| n.leaving) {
+            self.leave_mark(from);
+        }
         self.deleg_live_by_stream(now, gen);
         let g = self.dl.gens.get(&gen).expect("present");
         tracing::debug!(
@@ -9958,6 +9985,9 @@ impl Core {
         }
         if node == self.me() {
             return Err("cannot delegate to the root itself".into());
+        }
+        if self.dl.leaving.contains(&node) {
+            return Err(format!("node {node} is leaving; nothing is granted to it"));
         }
         // Plan 46 M1.2 step 9: a node holds one stream, and a stream never
         // mixes grant kinds (maintainer decision 2026-11-07): it holds
@@ -10613,6 +10643,19 @@ impl Core {
             .saturating_add(5_000)
     }
 
+    /// `node` is leaving: this root grants it nothing more, and a
+    /// designation waiting to be journaled for it is dropped.
+    fn leave_mark(&mut self, node: NodeId) {
+        self.dl.leaving.insert(node);
+        self.dl.designating.retain(|_, n| *n != node);
+        self.dl.growing.retain(|_, (n, _)| *n != node);
+    }
+
+    /// `node` is leaving (see [`DelegationState::leaving`]).
+    pub(crate) fn is_leaving(&self, node: NodeId) -> bool {
+        self.dl.leaving.contains(&node)
+    }
+
     /// The streams the table lists for `node`, with a live generation here
     /// (a root) or not.
     fn leave_streams_of(&self, node: NodeId, replica: &dyn Replica) -> BTreeSet<u64> {
@@ -10657,6 +10700,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let me = self.me();
+        self.dl.leave_self = true;
         self.dl.leave_waits.push(LeaveWait {
             op,
             who: me,
@@ -10689,15 +10733,17 @@ impl Core {
             });
             return;
         }
-        if self.leave_streams_of(node, replica).is_empty()
-            && !self.dl.gens.values().any(|g| g.node == node && !g.ended)
-        {
+        if !self.cfg.delegation || !self.cfg.p2p {
+            // (No grant is made, so none is held.)
             out.push(Action::ControlDone {
                 op,
                 result: Ok(ControlOk::Text(format!("node {node} holds no delegation"))),
             });
             return;
         }
+        // A node that is not the root cannot tell whether `node` holds
+        // anything (its table may lag the root's): it never answers that
+        // the node holds nothing.
         if !self.root_usable(now) {
             out.push(Action::ControlDone {
                 op,
@@ -10711,6 +10757,8 @@ impl Core {
             });
             return;
         }
+        // Nothing more is granted to the node from here on.
+        self.leave_mark(node);
         self.dl.leave_waits.push(LeaveWait {
             op,
             who: node,
@@ -10746,12 +10794,13 @@ impl Core {
                 // the batch that carried it says, and the stream is
                 // stopped. A stream this node never installed is listed
                 // until the root's end reaches the table.)
+                // (Only the root's acknowledgement of the release of the whole
+                // stream counts: a stream stopped by a refused renewal, a
+                // backup's seal, lost dependencies, a held note or an epoch
+                // is not ended in the log, and is the table's to drop.)
+                // (A stream the log ended is dropped from `mine`.)
                 streams.iter().all(|g| self.dl.mine.contains_key(g))
-                    && self
-                        .dl
-                        .mine
-                        .values()
-                        .all(|d| d.stopped && d.release.is_none())
+                    && self.dl.mine.values().all(|d| d.release_acked)
             } else {
                 streams.is_empty() && !self.dl.gens.values().any(|g| g.node == w.who && !g.ended)
             };
@@ -10766,6 +10815,11 @@ impl Core {
                 continue;
             }
             if now.wait >= w.deadline {
+                if w.who != me {
+                    // (The retirement does not follow: the node is not
+                    // leaving, and may be granted again.)
+                    self.dl.leaving.remove(&w.who);
+                }
                 out.push(Action::ControlDone {
                     op: w.op,
                     result: Err(format!(
@@ -10784,12 +10838,7 @@ impl Core {
                 let mut gens: BTreeSet<u64> = streams;
                 gens.extend(self.dl.mine.keys().copied());
                 for gen in gens {
-                    if self
-                        .dl
-                        .mine
-                        .get(&gen)
-                        .is_some_and(|d| d.stopped && d.release.is_none())
-                    {
+                    if self.dl.mine.get(&gen).is_some_and(|d| d.release_acked) {
                         continue;
                     }
                     let due = w
@@ -10905,6 +10954,7 @@ impl Core {
         self.dl.answered_granting.clear();
         self.dl.floor_sent.clear();
         self.dl.designating.clear();
+        self.dl.leaving.clear();
         self.dl.growing.clear();
         self.dl.cert_set = false;
         self.dl.forget_at.clear();

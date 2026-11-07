@@ -82,6 +82,33 @@ impl DesignationManager {
             .collect()
     }
 
+    /// Release every live designation of `node`, whichever node holds the
+    /// claim (the operator's `leave --force` of a node that is gone: it never
+    /// runs `online` itself). Returns how many were released.
+    pub async fn release_of(&self, node: u64) -> Result<usize> {
+        let mut released = 0;
+        for d in self.snapshot().into_iter().filter(|d| d.designee == node) {
+            let Some((cur, tag)) = self
+                .store
+                .get(&d.path)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+            else {
+                continue;
+            };
+            if cur.released || cur.designee != node {
+                continue;
+            }
+            self.store
+                .release(&cur, &tag)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            released += 1;
+        }
+        self.refresh().await;
+        Ok(released)
+    }
+
     pub async fn offline(&self, path: &str, read_only: bool) -> Result<String> {
         self.meta
             .resolve_path(path)
