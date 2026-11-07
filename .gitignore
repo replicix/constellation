@@ -24,3 +24,4 @@ local.mk
 /bench/remote/workers.local.toml
 __pycache__/
 *.pyc
+/bench/coop-digest/target

@@ -53,6 +53,7 @@ exclude = [
     "bench/dbbench",
     "bench/prollybench",
     "bench/enginebench",
+    "bench/coop-digest",
     "vendor/fjall",
     "vendor/lsm-tree",
     "vendor/netwatch",
