@@ -2171,10 +2171,57 @@ impl Core {
                 self.client_deadline(now, rid, false, replica, out);
                 continue;
             }
+            // Plan 46 M1.3 step 3 (bucket A): a settle whose lease was won
+            // while the op still waited is the gate's to answer now.
+            if self.settled_by_gate(now, rid, replica, out) {
+                continue;
+            }
             self.acquire_retry_hint = retry_hint;
             self.schedule_acquire_retry(now, rid, out);
         }
         self.acquire_retry_hint = None;
+    }
+
+    /// Plan 46 M1.3 step 3 (bucket A, `delegated-holder-cut` 252): this
+    /// node's own settle, its lease won while the op was on the lease path or
+    /// in the acquire backoff: the takeover gate (read quarantine, drain)
+    /// keeps the view closed for 12 to 20 s, and the op looped "the holder is
+    /// unreachable, routing again" with this node as the holder until its
+    /// deadline, long after the gate's journal work was done. `settle_route`
+    /// (the settle's own routing, S1) answers it on the keys the gate owns,
+    /// as it does for a settle that began while the gate stood. Only where the
+    /// gate answers: any other settle goes on as it did.
+    fn settled_by_gate(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        let Some(c) = self.clients.get(&rid) else {
+            return false;
+        };
+        if !c.settle || c.policy != Policy::Client {
+            return false;
+        }
+        if !matches!(
+            self.gate_settle(now, self.cfg.node_id, &c.op, replica),
+            Some(super::holder::GateSettle::Answer(_))
+        ) {
+            return false;
+        }
+        // (A rid that took effect here is not answered before the
+        // quarantine: `settle_route` would go on to the lease path, whose
+        // acquisition ends at once under the gate and calls this again.)
+        if super::holder::took_effect_here(replica, rid) {
+            return false;
+        }
+        if let Some(t) = self.clients.get_mut(&rid).and_then(|c| c.timer.take()) {
+            self.cancel_timer(t, out);
+        }
+        self.stats.gate_settles_after_win += 1;
+        self.settle_route(now, rid, replica, out);
+        true
     }
 
     /// Answer every op on the lease path with `code` (a frozen epoch's,
@@ -2330,6 +2377,10 @@ impl Core {
             self.finish(now, rid, outcome, replica, out);
             return;
         }
+        // Plan 46 M1.3 step 3 (bucket A): a settle the gate answers.
+        if self.settled_by_gate(now, rid, replica, out) {
+            return;
+        }
         // A node's later write must not overtake its own earlier ones: the
         // replays this node has to settle first (a deposition's, queued by
         // rid) hold the op here, as they hold one that was forwarded
@@ -2386,7 +2437,40 @@ impl Core {
             // who and under which epoch) rather than spinning on
             // acquisitions until that holder lets go; the escalation
             // asks for the lease on the op's behalf meanwhile.
+            //
+            // Plan 46 M1.3 step 3 (bucket O, `delegated-holder-cut` 128): not
+            // for a settle whose holder is silent and whose lease this
+            // node's own observation lets it claim by TTL (`claim_due`)
+            // before the op's deadline: the route read the lease (a second,
+            // slow one before the job's own) and put the settle in the inbox
+            // of a holder nobody reaches, a restarted one that only
+            // re-adopts at a forward or its own claim; the settle waited
+            // there while the claim, which is all that can end it, was a
+            // read behind. It claims. (A claim that falls due after the
+            // deadline helps nothing, and a live holder cut off by a
+            // partition drains the inbox: `delegated-long-delegation`.)
+            let until = self
+                .clients
+                .get(&rid)
+                .filter(|c| c.settle)
+                .map(|c| c.submitted.plus(self.cfg.acquire_deadline_ms));
+            let settle_claims = until.is_some_and(|until| {
+                self.lease
+                    .claim_due(&self.cfg)
+                    .is_some_and(|due| due <= until)
+            }) && !self.mode.forwards()
+                && !self.cfg.single_writer
+                && !self.s3_less()
+                && self
+                    .lease
+                    .obs
+                    .as_ref()
+                    .is_some_and(|o| Some(o.body.holder) == self.lease.cached_holder);
+            if settle_claims {
+                self.stats.settle_claims_not_routes += 1;
+            }
             if self.cfg.inbox
+                && !settle_claims
                 && self
                     .clients
                     .get(&rid)

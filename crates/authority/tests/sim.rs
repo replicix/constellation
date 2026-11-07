@@ -1172,7 +1172,9 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
     // twice each. EC2 follow-up (an inbox-waiting op is forwarded once the
     // holder is reachable) moved the schedules again: 10396 and 11750
     // reach it four times each now (10729 and 11608 no longer do).
-    for seed in [10396, 11750] {
+    // Plan 46 M1.3 step 3 (the retry of a claim that lost its CAS, the
+    // settle that claims): 10294 and 10498 reach it four times each.
+    for seed in [10294, 10498] {
         let report = run_seed(seed, long_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let multi: u64 = report
             .stats
@@ -16873,12 +16875,15 @@ fn c2_delegated_long_delegation_prod_settles_every_eio() {
 /// next, by ADR-44 (the gate recalls the generation its own op needs, on
 /// demand), as are 260 and 449; seed 904 is one of the violations that stay:
 /// the gated root's own op settled in its gate while the generation's first
-/// renewal still waited for the quarantine.) Fails on any build before the
-/// classification: no counter.
+/// renewal still waited for the quarantine; closed by plan 46 M1.3 step 3
+/// (bucket A: the gate answers a settle whose lease was won while the op
+/// waited), and seed 1774 is the one that stays: root 4, in its takeover
+/// gate and floor, reachable for the last 2.4 s of the window.) Fails on any
+/// build before the classification: no counter.
 #[test]
 fn m03_a_reachable_sequencers_requester_is_not_isolated() {
     let cfg = long_delegated_late_answers_config;
-    let seed = 904;
+    let seed = 1774;
     let r = run_seed(seed, cfg()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
     assert!(
         r.unsettled_violations > 0,

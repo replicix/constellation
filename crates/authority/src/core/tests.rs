@@ -13907,6 +13907,75 @@ fn a_takeover_deposed_while_retrying_its_marker_finishes_the_acquisition() {
     );
 }
 
+/// Plan 46 M1.3 step 3, bucket C (`backup-crash` 57): a takeover claim whose
+/// CAS loses to another write of the lease object (a waiter's `wanted_by`
+/// registration here) ends unacquired, and the op that waited for it retries
+/// at the shortest backoff, not at the grown one (the second round's 200 ms
+/// on the parent, then up to 2 s): the lease moved, and its fresh read is
+/// what the op needs.
+#[test]
+fn an_op_whose_claim_lost_its_cas_to_a_registration_retries_at_once() {
+    let mut h = Harness::new(1);
+    h.core.cfg.takeover_promise_check = false;
+    let rid = h.rid(1);
+    // No holder known: the op reads the lease, finds it run out, and claims.
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op: h.create("own"),
+        tag: Default::default(),
+    });
+    let (get, req) = only_s3(&out);
+    assert!(matches!(req, S3Op::LeaseGet), "{req:?}");
+    let theirs = lease_of(3, 1, h.now.0 - 1);
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((theirs.clone(), tag())))),
+    });
+    let (get, req) = only_s3(&out);
+    assert!(matches!(req, S3Op::LeaseGet), "the job's own read: {req:?}");
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((theirs, tag())))),
+    });
+    let (tail, req) = only_s3(&out);
+    assert!(matches!(req, S3Op::SegmentRun { .. }), "{req:?}");
+    let out = h.step(Event::S3 {
+        op: tail,
+        result: S3Result::SegmentRun(Ok(Vec::new())),
+    });
+    let (gap, _) = only_s3(&out);
+    let out = h.step(Event::S3 {
+        op: gap,
+        result: S3Result::SegmentGap(Ok(None)),
+    });
+    let (cas, req) = only_s3(&out);
+    assert!(matches!(req, S3Op::LeaseSwap { .. }), "{req:?}");
+    // Node 2 registered in `wanted_by` since the read: the CAS is lost.
+    let out = h.step(Event::S3 {
+        op: cas,
+        result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+    });
+    assert_eq!(h.core.job(), None, "{out:?}");
+    let after: Vec<u64> = out
+        .iter()
+        .filter_map(|a| match a {
+            Action::SetTimer {
+                kind: TimerKind::AcquireRetry,
+                after_ms,
+                ..
+            } => Some(*after_ms),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        after,
+        vec![h.core.config().acquire_retry_min_ms],
+        "the retry waits its backoff: {out:?}"
+    );
+    assert_eq!(h.core.stats.acquire_claims_lost_retried, 1);
+}
+
 /// Plan 43 C7b (row 28): a strict reader that learns the holder from the
 /// lease judges it live or run out by its own observation of the renewal key,
 /// never by the holder's wall expiry against its own clock. A body whose
@@ -55266,6 +55335,134 @@ mod c2g_settle {
             "{out:?}"
         );
         assert!(h.meta.lookup(ROOT_INO, "own").unwrap().is_none());
+    }
+
+    /// Plan 46 M1.3 step 3, bucket A (`delegated-holder-cut` 252): a settle
+    /// that began before this node won the lease, and waits in the acquire
+    /// backoff, is answered by the gate once the gate's journal work is done:
+    /// refused locally and answered when the row ships. On the parent its
+    /// retry routed it again with this node as the holder, until its deadline
+    /// (the unsettled `EIO`).
+    #[test]
+    fn a_settle_waiting_for_the_lease_is_answered_by_the_gate_that_won_it() {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        let rid = h.rid(1);
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("own"),
+            tag: Default::default(),
+        });
+        // The lease is won with the gate's journal work done.
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: None,
+                shippable: true,
+            }),
+        );
+        h.core.ack.peers.clear();
+        h.core.ack.candidate = None;
+        h.core.ack.eligible = Some(false);
+        // The op's settle began earlier; it waits for its acquire retry.
+        let c = h.core.clients.get_mut(&rid).expect("in flight");
+        c.settle = true;
+        c.forwarded = true;
+        c.phase = client::Phase::AcquireRetry;
+        c.timer = None;
+        let mut out = Vec::new();
+        h.core.on_acquire_retry(h.clk(), rid, &h.meta, &mut out);
+        assert!(abandoned_row(&h, rid), "not settled by the gate: {out:?}");
+        assert_eq!(h.core.stats.gate_settles_after_win, 1);
+        let out = h.archive_lands();
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::Reply {
+                    rid: r,
+                    reply: ClientReply::Outcome(MutateOutcome::Abandoned),
+                    ..
+                } if *r == rid
+            )),
+            "{out:?}"
+        );
+    }
+
+    /// A settle in the acquire backoff whose holder is silent (its link down
+    /// past the grace) and whose lease is claimable by TTL 10 s after this
+    /// node's first sight of it; the op's client deadline is `deadline_ms`
+    /// from its submission. Returns the harness and the op after
+    /// `on_acquire_retry`.
+    fn silent_holders_settle_retries(deadline_ms: u64) -> (Harness, Rid) {
+        let mut h = Harness::new(1);
+        h.core.cfg.inbox = true;
+        h.core.cfg.forwarding = true;
+        h.core.cfg.acquire_deadline_ms = deadline_ms;
+        h.core
+            .lease
+            .observe(h.clk(), Some(&(lease_of(2, 1, h.now.0 + 10_000), tag())));
+        h.core.lease.cached_holder = Some(2);
+        let rid = h.rid(1);
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("own"),
+            tag: Default::default(),
+        });
+        let c = h.core.clients.get_mut(&rid).expect("in flight");
+        c.settle = true;
+        c.forwarded = true;
+        c.phase = client::Phase::AcquireRetry;
+        c.timer = None;
+        if let Some(l) = h.core.links.get_mut(&2) {
+            l.connected = false;
+        }
+        h.core.note_p2p_result(h.clk(), 2, false);
+        h.advance(4_000);
+        assert!(!h.core.reaches(h.clk(), 2));
+        assert!(h
+            .core
+            .lease
+            .claim_due(h.core.config())
+            .is_some_and(|d| d > h.clk().wait));
+        let mut out = Vec::new();
+        h.core.on_acquire_retry(h.clk(), rid, &h.meta, &mut out);
+        (h, rid)
+    }
+
+    /// Plan 46 M1.3 step 3, bucket O (`delegated-holder-cut` 128): a settle
+    /// whose holder is silent and whose lease this node may claim by its TTL
+    /// before the op's deadline takes the lease path, not the route (a second
+    /// slow lease read, then the inbox of a holder nobody reaches). On the
+    /// parent the retry read the lease for the route (`LearnHolder`) and the
+    /// claim was a read behind.
+    #[test]
+    fn a_settle_of_a_silent_holder_claims_instead_of_routing() {
+        let (h, rid) = silent_holders_settle_retries(20_000);
+        assert_eq!(h.core.stats.settle_claims_not_routes, 1);
+        assert!(matches!(
+            h.core.clients().find(|(r, _)| *r == rid),
+            Some((_, ClientPhase::Settling))
+        ));
+        assert_eq!(h.core.job(), Some(JobKind::Acquire));
+    }
+
+    /// ... but not when the claim falls due after the op's deadline: it helps
+    /// nothing there, and a live holder cut off by a partition drains the
+    /// inbox (`delegated-long-delegation`, where the same rule cost 500 more
+    /// unsettled `EIO`s).
+    #[test]
+    fn a_settle_whose_claim_falls_due_after_its_deadline_still_routes() {
+        let (h, rid) = silent_holders_settle_retries(5_000);
+        assert_eq!(h.core.stats.settle_claims_not_routes, 0);
+        assert!(h.core.clients().any(|(r, _)| r == rid));
+        assert_eq!(h.core.job(), None, "the route read the lease, no claim job");
     }
 
     /// S1: a deposition before the refusal shipped answers the parked settle

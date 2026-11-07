@@ -68721,3 +68721,66 @@ round. So a re-dial after `Pool::reset_using` (`crates/net/src/endpoint.rs`, the
 `DIAL_TIMEOUT` 5 s) stalls without a timeout reaching the retry, only when the host is loaded (the two nodes re-dial each other at the same
 instant). This is a load-induced failure and so a bug by the maintainer's rule; it predates this plan (the plan adds one default trait
 method to `endpoint.rs`). Not fixed here: needs the dial and retry path traced with the noq state of the stuck connection.
+
+### Plan 46 M1.3 step 3 (cause-6 buckets C, A, O)
+
+Three small changes on the lease and claim paths, one core test each (all fail on the parent); the seeds step 0 named pass: `backup-crash` 57 (C),
+`delegated-holder-cut` 252 (A) and 128 (O), each `+unsettled` with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`.
+
+- **A, a lease won while the own op is in its gate** (`delegated-holder-cut` 252). An op whose settle began before the node won the lease sat in the
+  acquire backoff; its retry (`on_acquire_retry`, and `on_acquire_finished` after an acquisition that ended under the gate) routed it again with this node
+  as the holder until its deadline, long after the gate's journal work was done. `Core::settled_by_gate` (`client.rs`) sends such a settle to
+  `settle_route` (S1) when `gate_settle` says `Answer` and the rid did not take effect here; the gate refuses it locally and answers when the row ships.
+  The took-effect guard matters: `settle_route` otherwise falls through to the lease path, whose acquisition ends at once under the gate and calls the
+  helper again (a stack overflow in `long-delegated-backup` with slow reads, found by the sweep). Test
+  `a_settle_waiting_for_the_lease_is_answered_by_the_gate_that_won_it`; counter `gate_settles_after_win`.
+- **O, a settle of a silent holder routed instead of claimed** (`delegated-holder-cut` 128). The retry of a settle whose holder was unreachable went to
+  `route`: a lease read (slow under the knob) and the inbox of a restarted holder that re-adopts only at a forward or its own claim, while the claim,
+  all that could end the settle, was a second read behind. Now a settle whose observed lease becomes claimable by TTL before the op's deadline
+  (`claim_due <= submitted + acquire_deadline`) takes the lease path (`on_acquire_retry`). The deadline bound matters: the first version (any
+  `claim_due`) made `delegated-long-delegation` worse by 500 violations (a partitioned live root drains the inbox). Tests
+  `a_settle_of_a_silent_holder_claims_instead_of_routing`, `a_settle_whose_claim_falls_due_after_its_deadline_still_routes`; counter
+  `settle_claims_not_routes`.
+- **C, a claim's CAS lost to a registration or a re-adoption** (`backup-crash` 57). The waiting ops retried at the backoff their failed rounds had grown
+  to (200 ms up to 2 s) after a CAS that cost a verify read in store-s3, on top of a second of lease read. `acquire_claim_lost` (`jobs.rs`) sets the
+  retry hint so the ops retry at `acquire_retry_min_ms`. The first version read the lease again inside the job (2 retries): it fixed 57 but held the
+  job slot for two more slow reads and kept ops from forwarding to a reachable holder: slow-read violations rose in `backup-two` 10 to 21,
+  `delegated-group-switch` 27 to 100, `placement-hot` 6 to 18, `long-delegated` 32 to 61, `backup-crash` 7 to 12 (the C-only run reproduced them; the
+  A- and O-only runs did not). Not done: carrying the verify read's body out of store-s3 with the conflict (the true fresh ETag) would save the second
+  read; it changes `CasFailure` and the driver. Test `an_op_whose_claim_lost_its_cas_to_a_registration_retries_at_once` (the retry timer 200 ms on
+  the parent, 100 ms now); counter `acquire_claims_lost_retried`.
+
+**Sweeps** (release, seeds 0..1,999, plain; violations of the I4 oracle, base main `126968b8` to this change; `K` is `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`):
+
+| configuration | no knob | K |
+|---|---|---|
+| `backup-crash` | 0 to 0 | 7 to 4 |
+| `backup-strict` | 3 to 0 | 35 to 29 |
+| `backup-two` | 0 to 0 | 10 to 4 |
+| `delegated-backup` | 0 to 0 | 9 to 4 |
+| `delegated-backup-and-delegate-die` / `-abandon` | 13 to 13 / 12 to 12 | 3 to 3 / 3 to 3 |
+| `delegated-group-switch` | 0 to 0 | 27 to 24 |
+| `delegated-holder-cut` | 31 to 0 | 71 to 41 |
+| `delegated-long-delegation` | 1,158 to 1,158 | 1,233 to 1,227 |
+| `delegated-no-backup-root-near` | 0 to 0 | 13 to 10 |
+| `long-backup` | 0 to 0 | 32 to 27 |
+| `long-delegated` | 1 to 2 | 32 to 21 |
+| `long-delegated-backup` | 3 to 1 | 54 to 37 |
+| `long-delegated-late-answers` | 5 to 1 | 111 to 77 |
+| `placement-hot` | 0 to 0 | 6 to 6 |
+
+By the oracle's verdict, summed over the 15 configurations (knob / no knob): the C verdict (`lease-path`) 64 to 44 / 1 to 1, the A verdict (`itself`) 76 to 53 /
+69 to 29, the O verdict (`root`) 324 to 248 / 35 to 35. The `+unsettled` failing sets (seeds): no knob, every configuration is a subset of main's except
+`long-delegated`, where seed 1127 is new (a `Delegate(3)` verdict; it passes with A off, a moved trajectory, not a new class: 2 seeds against 1); with the knob
+each configuration's set shrinks (`delegated-holder-cut` 62 to 39, `long-delegated-late-answers` 82 to 63, `long-delegated-backup` 42 to 28, `backup-strict` 28 to 22,
+`long-backup` 22 to 16) and a few seeds move in (for example `backup-crash` 205, `placement-hot` 1356). Allowed (isolated, none in time, tail) counts moved by at most
+a few: `backup-crash` 0 to 2, `backup-strict` 0 to 2 with the knob (violations that became "no sequencer in time"), `long-backup` 16 to 11. Seeds 0..99 without the knob
+(the ratchet) measure the same on both sides for every ceiling configuration (all at their floors but `delegated-long-delegation` and the excluded `flex-crash`
+78 to 79 against 125), so no ceiling changes; the 2,000-seed counts above are the lowered ones.
+
+Re-pins: `m03_a_reachable_sequencers_requester_is_not_isolated` (seed 904 is closed by A; 1774 stays a violation) and
+`regression_every_inbox_batch_of_a_rid_is_withdrawn` (the schedules moved; 10294 and 10498 reach the multi-batch withdraw four times each).
+
+**Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta, authority lib (1,102), engine lib (953), store-s3 lib, control, release
+authority sim suite 424 passed, 0 failed, 12 ignored. (The engine lib needs a raised open-file limit on the build box; at the default 1,024 a dozen view tests
+fail on main too.) No perf gate (lease path).

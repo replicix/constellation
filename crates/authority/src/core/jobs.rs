@@ -5004,7 +5004,8 @@ impl Core {
             (Phase::Cas { plan, sent }, S3Result::LeasePut(Ok(tag))) => {
                 self.acquire_won(now, plan, *sent, tag, replica, out)
             }
-            (Phase::Cas { .. }, S3Result::LeasePut(Err(CasFailure::Conflict))) => {
+            (Phase::Cas { plan, .. }, S3Result::LeasePut(Err(CasFailure::Conflict))) => {
+                self.acquire_claim_lost(now, &plan);
                 self.finish_acquire(now, false, replica, out)
             }
             (Phase::Cas { plan, sent }, S3Result::LeasePut(Err(CasFailure::Failed(e)))) => {
@@ -5024,6 +5025,35 @@ impl Core {
                 );
             }
         }
+    }
+
+    /// Plan 46 M1.3 step 3 (bucket C, `backup-crash` 57): the claim's CAS lost
+    /// to another write of the lease object: a waiter's `wanted_by`
+    /// registration, or the old holder's re-adoption. The acquisition ends
+    /// unacquired as ever (an op whose holder is reachable forwards at once),
+    /// but the ops waiting for the lease retry at the shortest backoff, not
+    /// at the one their failed rounds had grown to (up to 2 s): the lease
+    /// moved, its fresh read is what they need, and under slow lease reads
+    /// the backoff came on top of a second of read and a second of verify.
+    /// (Reading again inside the job, to keep the slot, made every such
+    /// claim hold up the node's other work for two more reads and cost the
+    /// slow-read sweeps more than it saved: `backup-two`, `placement-hot`.)
+    /// Not for a re-adoption for a forward (its refusal is the answer).
+    fn acquire_claim_lost(&mut self, now: Now, plan: &Plan) {
+        if !matches!(plan, Plan::Claim { .. } | Plan::Create) {
+            return;
+        }
+        if matches!(
+            self.job.as_ref().map(|j| &j.what),
+            Some(What::Acquire {
+                reason: READOPT_REASON,
+                ..
+            })
+        ) {
+            return;
+        }
+        self.stats.acquire_claims_lost_retried += 1;
+        self.acquire_retry_hint = Some(now.wait);
     }
 
     /// The re-read after an acquisition CAS that failed without an answer.

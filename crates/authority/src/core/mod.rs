@@ -1276,6 +1276,16 @@ pub struct Stats {
     /// An acquisition asked while this node held its own unreleased lease
     /// became a renewal at the next round (`Core::begin_acquire`).
     pub acquire_renewed_instead: u64,
+    /// Plan 46 M1.3 step 3 (bucket C): acquisitions whose claim CAS lost to
+    /// another write of the lease object, whose waiting ops retry at the
+    /// shortest backoff.
+    pub acquire_claims_lost_retried: u64,
+    /// Plan 46 M1.3 step 3 (bucket A): settles answered by the takeover gate
+    /// after the lease was won while the op waited (`Core::settled_by_gate`).
+    pub gate_settles_after_win: u64,
+    /// Plan 46 M1.3 step 3 (bucket O): settles of a silent holder whose lease
+    /// this node may claim by TTL that took the lease path, not the route.
+    pub settle_claims_not_routes: u64,
     pub refused_entries_survived: u64,
     /// A refusal answered a refused entry's settle before the log here showed
     /// the rid's row (the copy waits for it).
