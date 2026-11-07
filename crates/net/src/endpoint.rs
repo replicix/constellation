@@ -222,9 +222,23 @@ impl DialWatch {
 /// Test seam: what the pool's next dials do before they touch the
 /// network (a delay, then a failure for the first `fail` of them).
 #[cfg(test)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct TestDial {
     delay: Mutex<Duration>,
+    /// While set, a dial waits (before touching the network) for a permit
+    /// of `release`; `started` counts the dials that began.
+    hold: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Semaphore,
+    started: std::sync::atomic::AtomicUsize,
+    /// The next dial panics.
+    panic_next: std::sync::atomic::AtomicBool,
+    /// Every connection a dial completed, installed or not.
+    dialed: Mutex<Vec<iroh::endpoint::Connection>>,
+    /// While armed, the next caller of `P2p::connection` that found no
+    /// pooled connection waits at `pause_gate` after looking at the slot.
+    pause: std::sync::atomic::AtomicBool,
+    paused: std::sync::atomic::AtomicUsize,
+    pause_gate: tokio::sync::Semaphore,
     fail: std::sync::atomic::AtomicUsize,
     /// The next `rejoin_fail` gossip rejoins fail; `rejoins` counts them.
     rejoin_fail: std::sync::atomic::AtomicUsize,
@@ -232,8 +246,42 @@ struct TestDial {
 }
 
 #[cfg(test)]
+impl Default for TestDial {
+    fn default() -> Self {
+        Self {
+            delay: Mutex::default(),
+            hold: Default::default(),
+            release: tokio::sync::Semaphore::new(0),
+            started: Default::default(),
+            panic_next: Default::default(),
+            dialed: Mutex::default(),
+            pause: Default::default(),
+            paused: Default::default(),
+            pause_gate: tokio::sync::Semaphore::new(0),
+            fail: Default::default(),
+            rejoin_fail: Default::default(),
+            rejoins: Default::default(),
+        }
+    }
+}
+
+#[cfg(test)]
 impl TestDial {
+    async fn pause_after_slot(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.pause.swap(false, SeqCst) {
+            self.paused.fetch_add(1, SeqCst);
+            self.pause_gate.acquire().await.unwrap().forget();
+        }
+    }
+
     async fn before(&self) -> Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.started.fetch_add(1, SeqCst);
+        assert!(!self.panic_next.swap(false, SeqCst), "injected dial panic");
+        if self.hold.load(SeqCst) {
+            self.release.acquire().await.unwrap().forget();
+        }
         let delay = *self.delay.lock().unwrap();
         tokio::time::sleep(delay).await;
         let failed = self
@@ -246,6 +294,28 @@ impl TestDial {
             .is_ok();
         anyhow::ensure!(!failed, "injected dial failure");
         Ok(())
+    }
+}
+
+/// A dial's entry in [`Pool::dialing`]; removed when it is, or when the
+/// task ends without having done so.
+struct DialEntry {
+    pool: Arc<Pool>,
+    id: iroh::EndpointId,
+    armed: bool,
+}
+
+impl DialEntry {
+    fn remove(&mut self) {
+        if std::mem::take(&mut self.armed) {
+            self.pool.dialing.lock().unwrap().remove(&self.id);
+        }
+    }
+}
+
+impl Drop for DialEntry {
+    fn drop(&mut self) {
+        self.remove();
     }
 }
 
@@ -267,6 +337,18 @@ struct Pool {
     /// runs on a task of its own, so a caller giving up on it does not
     /// abandon the handshake.
     dialing: Mutex<HashMap<iroh::EndpointId, DialRx>>,
+    /// Bumped by everything that resets the pool as a whole
+    /// ([`Pool::reset_using`], [`Pool::close_all`]); `peer_epochs` by an
+    /// evict of one peer. A dial remembers both when it starts and
+    /// installs its connection only if they are unchanged: it no longer
+    /// holds the peer's gate while it runs, so the reset finds the slot
+    /// empty and could not otherwise tell that a handshake on a path it
+    /// just tore down was still on its way.
+    epoch: std::sync::atomic::AtomicU64,
+    peer_epochs: Mutex<HashMap<iroh::EndpointId, u64>>,
+    /// Set when the node says goodbye to a successor
+    /// ([`P2p::close_for_successor`]): no dial starts or installs after.
+    closed: std::sync::atomic::AtomicBool,
     key: SecretKey,
     on_evict: Mutex<Option<EvictHook>>,
 }
@@ -285,6 +367,9 @@ impl Pool {
             probing: Mutex::new(HashSet::new()),
             probes: std::sync::atomic::AtomicUsize::new(0),
             dialing: Mutex::new(HashMap::new()),
+            epoch: std::sync::atomic::AtomicU64::new(0),
+            peer_epochs: Mutex::new(HashMap::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
             key,
             on_evict: Mutex::new(None),
         }
@@ -292,6 +377,29 @@ impl Pool {
 
     fn gate(&self, id: &iroh::EndpointId) -> Option<ConnectionSlot> {
         self.connections.lock().unwrap().get(id).cloned()
+    }
+
+    /// What a dial to `id` must find unchanged to install its connection.
+    fn epoch_of(&self, id: &iroh::EndpointId) -> (u64, u64) {
+        let peer = self.peer_epochs.lock().unwrap().get(id).copied();
+        (
+            self.epoch.load(std::sync::atomic::Ordering::SeqCst),
+            peer.unwrap_or(0),
+        )
+    }
+
+    /// Dials begun so far will not install their connections.
+    fn invalidate_dials(&self) {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The same for dials to `id` alone.
+    fn invalidate_dials_to(&self, id: iroh::EndpointId) {
+        *self.peer_epochs.lock().unwrap().entry(id).or_insert(0) += 1;
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Probe the connection pooled for `id`, if any, in the background.
@@ -497,6 +605,7 @@ impl Pool {
 
     /// Plan 31 C8: close every pooled and tracked connection.
     async fn close_all(&self, why: &'static str) -> usize {
+        self.invalidate_dials();
         let slots: Vec<ConnectionSlot> =
             self.connections.lock().unwrap().values().cloned().collect();
         let mut closed = 0usize;
@@ -544,6 +653,9 @@ impl Pool {
         lost: &HashSet<std::net::IpAddr>,
         why: &'static str,
     ) -> (usize, usize) {
+        // Before the slots are looked at: a handshake still running may be
+        // on a lost address, and must not be installed once this is done.
+        self.invalidate_dials();
         let affected = |conn: &iroh::endpoint::Connection| {
             let paths = conn.paths();
             let mut verdict = Some(false);
@@ -630,6 +742,7 @@ impl Pool {
         let Some(conn) = self.unpool(&gate, stable).await else {
             return;
         };
+        self.invalidate_dials_to(id);
         close_unless_closed(&conn, why.as_bytes());
         let others = self.tracked.lock().unwrap().remove(&id).unwrap_or_default();
         let mut closed = 0usize;
@@ -1777,6 +1890,9 @@ impl P2p {
     pub async fn close_for_successor(&self) -> usize {
         self.set_accept_inbound(false);
         self.set_gossip(false);
+        self.pool
+            .closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let closed = self.pool.close_all("handed over").await;
         self.endpoint.close().await;
         closed
@@ -2289,7 +2405,8 @@ impl P2p {
             }
             *slot = None;
         }
-        drop(slot);
+        #[cfg(test)]
+        self.test_dial.pause_after_slot().await;
         // The dial runs on a task of its own, bounded by `dial_timeout`,
         // and the callers wait for it: a caller's own timeout (the lease
         // path's 500 ms) drops its wait, not the handshake. Before, the
@@ -2297,18 +2414,27 @@ impl P2p {
         // request cancelled its dial before the handshake finished and the
         // next one started over — a path never came back. One dial per
         // peer at a time; a caller that arrives meanwhile joins it.
+        //
+        // The slot stays locked while the map is looked at: the dial
+        // installs its connection and leaves the map under the same lock,
+        // so a caller either sees the connection or sees the dial, never
+        // neither (which started a second dial that replaced the first's
+        // connection and orphaned it).
         let mut rx = {
             let mut dialing = self.pool.dialing.lock().unwrap();
             match dialing.get(&peer.id) {
                 Some(rx) => rx.clone(),
                 None => {
+                    anyhow::ensure!(!self.pool.is_closed(), "the node said goodbye");
                     let (tx, rx) = tokio::sync::watch::channel(None);
                     dialing.insert(peer.id, rx.clone());
-                    self.spawn_dial(peer.clone(), gate, tx);
+                    let epoch = self.pool.epoch_of(&peer.id);
+                    self.spawn_dial(peer.clone(), gate.clone(), tx, epoch);
                     rx
                 }
             }
         };
+        drop(slot);
         let outcome = rx
             .wait_for(|outcome| outcome.is_some())
             .await
@@ -2323,6 +2449,7 @@ impl P2p {
         peer: EndpointAddr,
         gate: ConnectionSlot,
         tx: tokio::sync::watch::Sender<Option<DialOutcome>>,
+        epoch: (u64, u64),
     ) {
         let endpoint = self.endpoint.clone();
         let pool = self.pool.clone();
@@ -2331,6 +2458,12 @@ impl P2p {
         #[cfg(test)]
         let test_dial = self.test_dial.clone();
         tokio::spawn(async move {
+            // Out of the map however this task ends, a panic included.
+            let mut entry = DialEntry {
+                pool: pool.clone(),
+                id: peer.id,
+                armed: true,
+            };
             let dial = async {
                 #[cfg(test)]
                 test_dial.before().await?;
@@ -2346,8 +2479,28 @@ impl P2p {
                 }
                 Ok(Ok(conn)) => {
                     watch.answered();
-                    *gate.lock().await = Some(conn.clone());
-                    Ok(conn)
+                    #[cfg(test)]
+                    test_dial.dialed.lock().unwrap().push(conn.clone());
+                    let mut slot = gate.lock().await;
+                    let outcome = if pool.is_closed() || pool.epoch_of(&peer.id) != epoch {
+                        // A reset overtook the handshake (it may have run
+                        // over an address the reset tore down): the
+                        // callers get an error and dial again.
+                        close_unless_closed(&conn, b"dial overtaken by a reset");
+                        Err("the dial was overtaken by a reset".to_string())
+                    } else if let Some(pooled) = slot
+                        .as_ref()
+                        .filter(|pooled| pooled.close_reason().is_none())
+                    {
+                        close_unless_closed(&conn, b"duplicate connection");
+                        Ok(pooled.clone())
+                    } else {
+                        *slot = Some(conn.clone());
+                        Ok(conn)
+                    };
+                    // Under the slot lock, see `connection`.
+                    entry.remove();
+                    outcome
                 }
                 Ok(Err(e)) => {
                     watch.answered();
@@ -2359,7 +2512,7 @@ impl P2p {
             };
             // Out of the map before the answer goes out, so a caller that
             // sees a failure and dials again starts a new attempt.
-            pool.dialing.lock().unwrap().remove(&peer.id);
+            entry.remove();
             let _ = tx.send(Some(outcome));
         });
     }
@@ -2425,6 +2578,89 @@ impl P2p {
         self.test_dial
             .rejoins
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Hold every dial before it touches the network until
+    /// [`Self::release_dials`] gives it a permit.
+    #[cfg(test)]
+    pub(crate) fn hold_dials(&self) {
+        self.test_dial
+            .hold
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_dials(&self, n: usize) {
+        self.test_dial.release.add_permits(n);
+    }
+
+    /// How many dials began.
+    #[cfg(test)]
+    pub(crate) fn dials_started(&self) -> usize {
+        self.test_dial
+            .started
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The next dial panics.
+    #[cfg(test)]
+    pub(crate) fn inject_dial_panic(&self) {
+        self.test_dial
+            .panic_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Every connection a dial completed so far.
+    #[cfg(test)]
+    pub(crate) fn dialed_connections(&self) -> Vec<iroh::endpoint::Connection> {
+        self.test_dial.dialed.lock().unwrap().clone()
+    }
+
+    /// Make the next caller that finds no pooled connection wait after
+    /// looking at the slot; `paused_callers` says when it does.
+    #[cfg(test)]
+    pub(crate) fn arm_pause(&self) {
+        self.test_dial
+            .pause
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paused_callers(&self) -> usize {
+        self.test_dial
+            .paused
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resume_paused(&self) {
+        self.test_dial.pause_gate.add_permits(1);
+    }
+
+    /// Peers with a dial in flight.
+    #[cfg(test)]
+    pub(crate) fn dialing_entries(&self) -> usize {
+        self.pool.dialing.lock().unwrap().len()
+    }
+
+    /// [`Pool::reset_using`] for tests.
+    #[cfg(test)]
+    pub(crate) async fn reset_using_for_test(&self) -> (usize, usize) {
+        self.pool.reset_using(&HashSet::new(), "test reset").await
+    }
+
+    /// Whether the pool holds a connection for `peer`, open or not.
+    #[cfg(test)]
+    pub(crate) async fn pooled_any(&self, peer: iroh::EndpointId) -> bool {
+        match self.pool.gate(&peer) {
+            Some(gate) => gate.lock().await.is_some(),
+            None => false,
+        }
+    }
+
+    /// Whether the node said goodbye to a successor.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.pool.is_closed()
     }
 
     /// Whether the gossip topic was joined.

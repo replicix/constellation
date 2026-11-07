@@ -24,8 +24,6 @@ use std::time::{Duration, Instant};
 /// short enough that it never dominates the idle-release window.
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// How long after closing every connection to a dead peer incarnation
-/// to send the gossip `Join` (see [`Peers::new`]).
 /// A lost path is re-dialed with this backoff (doubling up to
 /// [`REDIAL_BACKOFF_MAX`]) until the peer answers, it leaves the
 /// directory, or [`REDIAL_GIVE_UP`] passes; the periodic registry probe
@@ -33,6 +31,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const REDIAL_BACKOFF_START: Duration = Duration::from_millis(100);
 const REDIAL_BACKOFF_MAX: Duration = Duration::from_secs(2);
 const REDIAL_GIVE_UP: Duration = Duration::from_secs(120);
+/// How long after closing every connection to a dead peer incarnation
+/// to send the gossip `Join` (see [`Peers::new`]).
 const GOSSIP_REJOIN_DELAY: Duration = Duration::from_millis(300);
 
 /// A holder agreed to hand `part` over — see [`Peers::request_lease`].
@@ -148,6 +148,22 @@ struct Inner {
     regossiping: Mutex<std::collections::HashSet<iroh::EndpointId>>,
 }
 
+/// A key in one of [`Inner`]'s loop sets, removed when the loop ends,
+/// however it ends (the node may be gone by then).
+struct Registered<K: std::hash::Hash + Eq + Copy> {
+    weak: std::sync::Weak<Inner>,
+    set: fn(&Inner) -> &Mutex<std::collections::HashSet<K>>,
+    key: K,
+}
+
+impl<K: std::hash::Hash + Eq + Copy> Drop for Registered<K> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.weak.upgrade() {
+            (self.set)(&inner).lock().unwrap().remove(&self.key);
+        }
+    }
+}
+
 impl Inner {
     fn links_changed(&self) {
         self.links.send_modify(|v| *v = v.wrapping_add(1));
@@ -180,8 +196,9 @@ impl Peers {
         // then re-dial at once. A restarted peer is back to `connected`
         // within one round trip instead of waiting for the next
         // registry-tick probe (or a gossip neighbor-up, which a restart
-        // under the same key does not produce); a dead one costs one
-        // failed dial. Gossip is re-formed with a `Join` once its actor
+        // under the same key does not produce); a dead one costs failed
+        // dials with a bounded backoff (`REDIAL_BACKOFF_*`) until it
+        // leaves the directory or `REDIAL_GIVE_UP` passes. Gossip is re-formed with a `Join` once its actor
         // has seen the closes (a `Join` queued before that would go out
         // on a closing connection and be lost).
         let weak = Arc::downgrade(&inner);
@@ -202,10 +219,10 @@ impl Peers {
             // Every connection to it was closed, gossip's included.
             inner.gossip_up.lock().unwrap().remove(&endpoint);
             if let (Some(node), Ok(rt)) = (node, tokio::runtime::Handle::try_current()) {
-                let peers = Peers { inner: Some(inner) };
-                let rejoin = peers.clone();
-                rt.spawn(async move { peers.redial(node).await });
-                rt.spawn(async move { rejoin.regossip(endpoint).await });
+                // The loops hold the node only while an attempt runs.
+                let (redial, regossip) = (Arc::downgrade(&inner), Arc::downgrade(&inner));
+                rt.spawn(Peers::redial(redial, node));
+                rt.spawn(Peers::regossip(regossip, endpoint));
             }
         }));
         Self { inner: Some(inner) }
@@ -216,28 +233,43 @@ impl Peers {
     /// (a dial that timed out or was refused while the host was loaded)
     /// left the path down until something else asked for the peer. One
     /// loop per node; every ping is bounded by the request timeout and
-    /// every dial by the dial timeout.
-    async fn redial(&self, node: u64) {
-        let Some(inner) = self.inner.as_ref() else {
+    /// every dial by the dial timeout. The loop holds the node only while
+    /// an attempt runs, and ends when the node is gone or said goodbye.
+    async fn redial(weak: std::sync::Weak<Inner>, node: u64) {
+        let Some(inner) = weak.upgrade() else {
             return;
         };
         if !inner.redialing.lock().unwrap().insert(node) {
             return;
         }
+        drop(inner);
+        let _registered = Registered {
+            weak: weak.clone(),
+            set: |inner: &Inner| &inner.redialing,
+            key: node,
+        };
         let started = Instant::now();
         let mut backoff = REDIAL_BACKOFF_START;
         loop {
-            if self.ping_node(node).await {
+            let Some(inner) = weak.upgrade() else {
+                break;
+            };
+            if inner.p2p.is_closed() {
                 break;
             }
+            let answered = Peers {
+                inner: Some(inner.clone()),
+            }
+            .ping_node(node)
+            .await;
             let known = inner.peers.lock().unwrap().contains_key(&node);
-            if !known || started.elapsed() >= REDIAL_GIVE_UP {
+            drop(inner);
+            if answered || !known || started.elapsed() >= REDIAL_GIVE_UP {
                 break;
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(REDIAL_BACKOFF_MAX);
         }
-        inner.redialing.lock().unwrap().remove(&node);
     }
 
     /// Re-form the gossip link to `endpoint` after its connections were
@@ -246,22 +278,33 @@ impl Peers {
     /// all there was, so one that was lost (its dial failed or timed out,
     /// or it went out on a connection still closing) left gossip from the
     /// peer silent until the next address loss. Gives up like
-    /// [`Self::redial`] (a topic not joined has nothing to re-form).
-    async fn regossip(&self, endpoint: iroh::EndpointId) {
-        let Some(inner) = self.inner.as_ref() else {
+    /// [`Self::redial`] (a topic not joined has nothing to re-form), and
+    /// like it holds the node only while an attempt runs.
+    async fn regossip(weak: std::sync::Weak<Inner>, endpoint: iroh::EndpointId) {
+        let Some(inner) = weak.upgrade() else {
             return;
         };
         if !inner.regossiping.lock().unwrap().insert(endpoint) {
             return;
         }
+        drop(inner);
+        let _registered = Registered {
+            weak: weak.clone(),
+            set: |inner: &Inner| &inner.regossiping,
+            key: endpoint,
+        };
         let started = Instant::now();
         let mut delay = GOSSIP_REJOIN_DELAY;
         let mut first = true;
         loop {
             tokio::time::sleep(delay).await;
+            let Some(inner) = weak.upgrade() else {
+                break;
+            };
             // The first `Join` goes out whatever the neighbor state says:
             // a stale `NeighborUp` may be all there is.
-            if !first && inner.gossip_up.lock().unwrap().contains(&endpoint)
+            if inner.p2p.is_closed()
+                || !first && inner.gossip_up.lock().unwrap().contains(&endpoint)
                 || started.elapsed() >= REDIAL_GIVE_UP
                 || !inner.p2p.gossip_joined().await
             {
@@ -273,7 +316,6 @@ impl Peers {
             }
             delay = (delay * 2).min(REDIAL_BACKOFF_MAX);
         }
-        inner.regossiping.lock().unwrap().remove(&endpoint);
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -3358,6 +3400,166 @@ mod tests {
             inner.p2p.rejoins() >= 3,
             "a failed rejoin was not tried again ({} attempts)",
             inner.p2p.rejoins()
+        );
+    }
+
+    /// Poll `cond` for up to `secs` seconds.
+    async fn wait_for(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
+        let started = Instant::now();
+        while !cond() {
+            if started.elapsed() > Duration::from_secs(secs) {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// A connection whose handshake finished after the pool was reset
+    /// (here: the local addresses it may have used are gone) must not be
+    /// installed: the dial no longer holds the gate, so the reset found
+    /// the slot empty and the finished handshake was pooled after it.
+    #[tokio::test]
+    async fn a_reset_during_a_dial_discards_the_connection() {
+        let service = ChunkServer::new(Some(vec![1u8; 4096]), Duration::ZERO);
+        let asker = chunk_pair(service).await;
+        let inner = asker.inner.as_ref().unwrap();
+        let peer = inner.peers.lock().unwrap().get(&1).unwrap().addr.id;
+        inner.p2p.hold_dials();
+        let waiter = asker.clone();
+        let ping = tokio::spawn(async move { ping_within(&waiter, Duration::from_secs(20)).await });
+        assert!(wait_for(10, || inner.p2p.dials_started() == 1).await);
+        inner.p2p.reset_using_for_test().await;
+        inner.p2p.release_dials(1);
+        assert!(
+            !ping.await.unwrap(),
+            "the caller got a connection from a dial that a reset overtook"
+        );
+        assert!(
+            !inner.p2p.pooled_any(peer).await,
+            "a dial begun before the reset was installed after it"
+        );
+        let dialed = inner.p2p.dialed_connections();
+        assert_eq!(dialed.len(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), dialed[0].closed())
+                .await
+                .is_ok(),
+            "the discarded connection was left open"
+        );
+        assert_eq!(inner.p2p.dialing_entries(), 0);
+    }
+
+    /// The same for `close_all` (a goodbye or a suspension).
+    #[tokio::test]
+    async fn a_close_all_during_a_dial_discards_the_connection() {
+        let service = ChunkServer::new(Some(vec![1u8; 4096]), Duration::ZERO);
+        let asker = chunk_pair(service).await;
+        let inner = asker.inner.as_ref().unwrap();
+        let peer = inner.peers.lock().unwrap().get(&1).unwrap().addr.id;
+        inner.p2p.hold_dials();
+        let waiter = asker.clone();
+        let ping = tokio::spawn(async move { ping_within(&waiter, Duration::from_secs(20)).await });
+        assert!(wait_for(10, || inner.p2p.dials_started() == 1).await);
+        inner.p2p.close_all("test goodbye").await;
+        inner.p2p.release_dials(1);
+        assert!(!ping.await.unwrap());
+        assert!(
+            !inner.p2p.pooled_any(peer).await,
+            "a dial begun before close_all was installed after it"
+        );
+        let dialed = inner.p2p.dialed_connections();
+        assert_eq!(dialed.len(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), dialed[0].closed())
+                .await
+                .is_ok()
+        );
+    }
+
+    /// After the goodbye to a successor no new dial may start.
+    #[tokio::test]
+    async fn no_dial_starts_after_the_goodbye() {
+        let service = ChunkServer::new(Some(vec![1u8; 4096]), Duration::ZERO);
+        let asker = chunk_pair(service).await;
+        let inner = asker.inner.as_ref().unwrap();
+        tokio::time::timeout(Duration::from_secs(30), inner.p2p.close_for_successor())
+            .await
+            .unwrap();
+        assert!(!ping_within(&asker, Duration::from_secs(5)).await);
+        assert_eq!(inner.p2p.dials_started(), 0, "a dial began after goodbye");
+    }
+
+    /// One caller drops the slot, the dial it would have joined finishes
+    /// and leaves the map, and the caller then dials again: two
+    /// connections for one peer, the first orphaned. The caller is held
+    /// between looking at the slot and looking at the dials.
+    #[tokio::test]
+    async fn racing_callers_share_one_dial_and_one_connection() {
+        let service = ChunkServer::new(Some(vec![1u8; 4096]), Duration::ZERO);
+        let asker = chunk_pair(service).await;
+        let inner = asker.inner.as_ref().unwrap();
+        let peer = inner.peers.lock().unwrap().get(&1).unwrap().addr.id;
+        inner.p2p.hold_dials();
+        let first = asker.clone();
+        let one = tokio::spawn(async move { ping_within(&first, Duration::from_secs(20)).await });
+        assert!(wait_for(10, || inner.p2p.dials_started() == 1).await);
+        inner.p2p.arm_pause();
+        let second = asker.clone();
+        let two = tokio::spawn(async move { ping_within(&second, Duration::from_secs(20)).await });
+        assert!(wait_for(10, || inner.p2p.paused_callers() == 1).await);
+        // The first dial completes while the second caller is held.
+        inner.p2p.release_dials(1);
+        assert!(wait_for(10, || !inner.p2p.dialed_connections().is_empty()).await);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        inner.p2p.release_dials(8);
+        inner.p2p.resume_paused();
+        assert!(one.await.unwrap() && two.await.unwrap());
+        assert_eq!(inner.p2p.dials_started(), 1, "a second dial began");
+        let dialed = inner.p2p.dialed_connections();
+        assert_eq!(dialed.len(), 1, "two connections for one peer");
+        assert_eq!(
+            inner.p2p.pooled_connection_id(peer).await,
+            Some(dialed[0].stable_id())
+        );
+        assert!(dialed[0].close_reason().is_none());
+    }
+
+    /// A dial task that panics must not leave its entry in the map: every
+    /// later caller would join a dial that is never answered.
+    #[tokio::test]
+    async fn a_panicking_dial_leaves_no_entry_behind() {
+        let service = ChunkServer::new(Some(vec![1u8; 4096]), Duration::ZERO);
+        let asker = chunk_pair(service).await;
+        let inner = asker.inner.as_ref().unwrap();
+        inner.p2p.inject_dial_panic();
+        assert!(!ping_within(&asker, Duration::from_secs(5)).await);
+        assert!(
+            wait_for(5, || inner.p2p.dialing_entries() == 0).await,
+            "the panicked dial's entry is still in the map"
+        );
+        assert!(ping_within(&asker, Duration::from_secs(20)).await);
+    }
+
+    /// A re-dial loop holds no strong handle between attempts and ends
+    /// when the handle is gone: it used to keep the whole node alive for
+    /// up to the give-up time.
+    #[tokio::test]
+    async fn a_redial_loop_does_not_keep_the_node_alive() {
+        let service = ChunkServer::new(Some(vec![1u8; 4096]), Duration::ZERO);
+        let asker = chunk_pair(service).await;
+        let inner = asker.inner.as_ref().unwrap();
+        let peer = inner.peers.lock().unwrap().get(&1).unwrap().addr.id;
+        inner.p2p.inject_dial(Duration::ZERO, usize::MAX / 2);
+        inner.p2p.fire_evict_hook(peer);
+        inner.p2p.fire_evict_hook(peer);
+        let weak = Arc::downgrade(inner);
+        // Let the loop run an attempt or two.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(asker);
+        assert!(
+            wait_for(10, || weak.strong_count() == 0).await,
+            "the loops still hold the node"
         );
     }
 
