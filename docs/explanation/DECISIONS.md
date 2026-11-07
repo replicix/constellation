@@ -1898,10 +1898,10 @@ singleton to peer from the event); the claim CAS of a tenure
 stamps the flag from the claimant's test at that moment. The per-event flips
 are gone: a gated row of a configuration that a change replaced is no longer
 re-tagged `Lone` when the gate goes off (it is answered by its own rule once
-the change that replaced it is covered); the re-tag that remains is the row of
-the configuration in force, answered on this disk alone (a row journaled before
-the event's singleton test was assessed that the test then finds lone, and any
-row answered in an epoch's hold: a deposition replays it, as the answer said),
+the change that replaced it is covered); the re-tags that remain are the row of
+the configuration in force answered on this disk alone (a row journaled before
+the event's singleton test was assessed that the test then finds lone) and a row
+of any version answered in an epoch's hold (a deposition replays it, as the answer said),
 in the version the row was journaled in, never the placeholder 0
 (`Meta::reclass_journal_tx`; the sim oracle judges every re-tag), and
 a row journaled under the singleton's configuration is stamped `Singleton`
