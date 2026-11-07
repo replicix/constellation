@@ -294,6 +294,22 @@ impl PeerMirror {
         }
     }
 
+    /// After a repair: whether the mirror equals what the owner last
+    /// advertised (count and root). Only then is it fresh: a session cut
+    /// at the round cap, or one the owner outran, leaves a partly
+    /// repaired mirror that must not count as current. `matches` also
+    /// moves the exact point.
+    fn settle(&mut self) -> bool {
+        let matched = match self.advertised {
+            Some(s) => self.mirror.matches(&s),
+            None => false,
+        };
+        if matched {
+            self.confirmed_at = Some(Instant::now());
+        }
+        matched
+    }
+
     fn known_different(&self) -> bool {
         self.advertised.is_some_and(|s| {
             s.root != self.mirror.keys.root_fingerprint()
@@ -716,13 +732,7 @@ impl Coop {
             let Some(pm) = map.get_mut(&node_id) else {
                 return;
             };
-            // Freshly reconciled: current as of this session even if the
-            // owner changed while it ran.
-            pm.confirmed_at = Some(Instant::now());
-            match pm.advertised {
-                Some(s) => !pm.mirror.matches(&s),
-                None => false,
-            }
+            !pm.settle()
         };
         if resync || !done {
             // The owner churned mid-session (or the round cap hit): the
@@ -998,6 +1008,32 @@ mod tests {
         off.absorb(&batch(vec![DigestChange::Add(h(1))]), now, true);
         assert_eq!(off.log_bytes(), 0);
         assert!(!off.replay(off.summary().incarnation, 0).available);
+    }
+
+    /// A repair that ends short of the owner's advertised set (the round
+    /// cap, or the owner outran it) does not make the mirror fresh.
+    #[test]
+    fn a_partly_repaired_mirror_is_not_confirmed() {
+        let mut owner = LocalSet::new(Duration::from_secs(10), 1 << 20, Duration::from_secs(600));
+        owner.absorb(
+            &batch((0..50u64).map(|n| DigestChange::Add(h(n))).collect()),
+            Instant::now(),
+            true,
+        );
+        let mut pm = PeerMirror::default();
+        pm.advertise(owner.summary());
+        // Half of the owner's keys: a session cut short.
+        for n in 0..25u64 {
+            pm.mirror.keys.insert(key_of(&h(n).0));
+        }
+        assert!(!pm.settle());
+        assert!(pm.confirmed_at.is_none() && !pm.fresh(Duration::from_secs(60)));
+        // The rest arrives: now it matches and is confirmed.
+        for n in 25..50u64 {
+            pm.mirror.keys.insert(key_of(&h(n).0));
+        }
+        assert!(pm.settle());
+        assert!(pm.fresh(Duration::from_secs(60)));
     }
 
     #[test]

@@ -68687,3 +68687,37 @@ Evidence (RESULTS section 12): 8 Mi keys, 100 k changes: session only 26.1 MiB /
 Gates (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, net lib (139), engine lib (954), control (146), `cargo test --workspace`, release `cargo build --workspace`, harness `coop-cache-hit`, `coop-fallback`, `coop-exact-churn`, `coop-digest-compare` PASSED; bench crate fmt, clippy, tests.
 
 One bug found on the way: `Coop::report` took the `local` lock twice inside one struct literal (the first guard lives to the end of the statement) and deadlocked; the lock is taken once before the literal.
+
+### Plan 47 closure round: review fixes and the umbrella gates (2026-11-07)
+
+Review of P3 (verdict: land) had one SHOULD and three NITs; all fixed with tests, then the gates were run on a shared box (Linux 7.3,
+16 cores, release build for the harness and pjdfstest). The plan stays in `wip/`: two items are open (below).
+
+| Item | State | Where |
+|---|---|---|
+| The log default (8 MiB) exceeded what one repair fetches (64 pages of 48 KiB) | fixed: `respond_replay` answers `unavailable` at once when the bytes since the asked `seq` exceed `MAX_REPLAY_BACKLOG`; the log default is that reach, 3 MiB | `reconcile.rs`, `coop.rs`; `a_backlog_beyond_the_page_cap_is_refused_up_front` fails without the check |
+| `ReplayRequest`/`ReplayReply` inserted mid-enum, renumbering later `Payload` variants | fixed: appended at the end; an older node does not know them, the request fails and the session runs, as the docs say | `message.rs` |
+| A session cut at `MAX_ROUNDS` set `confirmed_at` | fixed: `PeerMirror::settle` confirms only on a count and root match with the advertised summary | `exact.rs`; `a_partly_repaired_mirror_is_not_confirmed` fails without it |
+| `DELTA_LOG_OVERHEAD` (96 B) understated the memory per entry | fixed: the log counts the inline entry (112 B) plus buffer capacity plus 16 B per block; 96 B stays as the wire estimate for page budgets | `reconcile.rs`; `the_log_counts_what_a_delta_holds_in_memory`; RESULTS 12.4 (counted against allocator-live within 3 % at the cap) |
+| Repair rows re-run | bytes and rounds identical to the first run (no gap in the table exceeds 3 MiB); CPU within noise | RESULTS 12.5.1, `raw/p3c-*.md` |
+
+Gates (the final tree): fmt and clippy `-D warnings` clean; `cargo test --workspace` release 5,044 passed 0 failed, debug 5,046 passed 1
+failed (`handover::tests::a_log_tail_round_trips_through_a_memfd`: expects `EBADF` for a closed descriptor, which a parallel test can reuse;
+passes alone 3 of 3); `coop-cache-hit`, `coop-fallback`, `coop-exact-churn`, `coop-digest-compare` 3 rounds, all passed; `tests/smoke.sh`,
+`tests/integration.sh` (docker compose is on the box) passed; pjdfstest 8798/8798 (ring, empty baseline). Full `harness run --seed 42`: 280
+passed, 11 skipped, 5 failed. `csi-credential-revocation`: no `versitygw` on the box. `writeback-fsync` ("the back close left nothing queued on
+A"), `git-under-flock-b2b` and `git-under-flock-rounds` (longest turn 90 s, limit 30 s) fail identically on `origin/main`: findings of the
+tree, not of this plan. `append-setattr-size` failed in the matrix (mount died at startup), failed once alone, passed on the next rerun; on
+`origin/main` it failed with ENOSPC.
+
+**Open: `addr_churn` under load.** `crates/net/tests/addr_churn.rs` failed once inside a full `cargo test --workspace`. Alone: 50 of 50
+passed (29 s each). Under a concurrent `cargo test` of the authority and engine libs: 9 of 10 passed, then 2 of 3 with `RUST_LOG`
+(`constellation_net`, `netwatch`, `noq` at debug) passed. Every failure is the same: after the first address loss (the selected path's
+interface is deleted) both ends' watchers reset their connections (`closed=2`), then A to B has no path and no answered ping for the whole
+150 s measuring window ("longest without an answered ping 150.1 s", paths `None`); B to A recovered at once. The log shows the reset, both
+sockets rebound, and `Opened NAT traversal path ... remote [::ffff:10.99.0.2]:37834` at 5 s intervals twice on one connection, then
+nothing: no `gossip neighbor left or lost`, no dial timeout, no probe, until the test itself re-creates the interface at the end of the
+round. So a re-dial after `Pool::reset_using` (`crates/net/src/endpoint.rs`, the reset around line 486 and the dial at 1954 and 2255, bound
+`DIAL_TIMEOUT` 5 s) stalls without a timeout reaching the retry, only when the host is loaded (the two nodes re-dial each other at the same
+instant). This is a load-induced failure and so a bug by the maintainer's rule; it predates this plan (the plan adds one default trait
+method to `endpoint.rs`). Not fixed here: needs the dial and retry path traced with the noq state of the stuck connection.

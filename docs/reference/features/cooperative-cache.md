@@ -76,14 +76,14 @@ and one *mirror* of every peer's published set.
 
 Most gaps are a few lost or reordered deltas that the owner still has.
 Each node keeps its recently published deltas in a log, bounded in
-bytes (8 MiB by default, about ten minutes of 1 % churn on an 8M-chunk
-cache) and in age (10 minutes). When a mirror learns it is behind (a
+bytes (3 MiB by default, which is what one repair can fetch: some four
+minutes of 1 % churn on an 8M-chunk cache) and in age (10 minutes). When a mirror learns it is behind (a
 summary that does not match, a delta applied off its base, or the
 liveness sweep), the first repair step is a `ReplayRequest`: "send me your deltas after `seq` N",
 where N is the last `seq` the mirror was known to be exact at. The owner
 answers `ReplayReply` with the consecutive deltas from N + 1 up to its
 current `seq`, paged at 48 KiB of delta bytes (a larger backlog takes
-more requests, at most 64). The mirror applies them in order and
+more requests, at most 64; a backlog beyond that is refused at once). The mirror applies them in order and
 accepts the result only if its count and root fingerprint equal the
 owner's summary at the last replayed `seq`, so the mirror is exactly the
 owner's set, never a guess. A delta only says which keys are present or
@@ -94,12 +94,12 @@ Replay is refused, and the mirror runs a reconciliation session instead,
 when: the owner restarted (new incarnation, no log), the log was cut by
 the size or age bound before N + 1, the change was published silently
 (more than 8 delta messages in one tick: no deltas exist, and the log
-is emptied), the mirror has no exact point yet (initial sync), or the
+is emptied), the backlog is more than 64 pages (about 3 MiB), the mirror has no exact point yet (initial sync), or the
 fingerprint check fails. Replay costs the missed deltas' own bytes: for
 100k changes on an 8M-chunk peer about 0.77 MB against 26 MB for a
 session, and no fingerprint walk. A node answers replay only in exact
 mode; a peer that cannot answer it (bloom mode, replay off, an older
-version) makes the request fail or come back unavailable, and the
+version, whose decoder does not know the message) makes the request fail or come back unavailable, and the
 session runs, as for every digest message.
 
 ### Reconciliation sessions
@@ -233,7 +233,7 @@ later read went to S3.
 | `CONSTELLATION_COOP_DIGEST` | `exact` | `exact` or `bloom` |
 | `CONSTELLATION_DIGEST_INTERVAL_S` | `30` | summary heartbeat and liveness sweep (exact); bloom snapshot rotation (bloom) |
 | `CONSTELLATION_DIGEST_TTL_S` | `4 × interval` | a mirror or bloom unconfirmed for this long is not used for lookups |
-| `CONSTELLATION_COOP_REPLAY_LOG_BYTES` | `8388608` | bytes of recent deltas kept for peers to replay; `0` turns replay off (this node keeps no log and does not try to replay from others) |
+| `CONSTELLATION_COOP_REPLAY_LOG_BYTES` | `3145728` | bytes of recent deltas kept for peers to replay; `0` turns replay off (this node keeps no log and does not try to replay from others) |
 
 ## Status and metrics
 

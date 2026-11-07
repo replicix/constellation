@@ -128,10 +128,12 @@ struct CoopConfig {
     replay_log_age: Duration,
 }
 
-/// Default of `CONSTELLATION_COOP_REPLAY_LOG_BYTES`: about ten minutes of
-/// 1 % churn on an 8 Mi-chunk cache (plan 47 P1 measured 0.7 MB per
-/// minute there).
-const DEFAULT_REPLAY_LOG_BYTES: usize = 8 << 20;
+/// Default of `CONSTELLATION_COOP_REPLAY_LOG_BYTES`: what one repair can
+/// fetch (64 pages of 48 KiB, about 3 MiB: some four minutes of 1 %
+/// churn on an 8 Mi-chunk cache, plan 47 P1 measured 0.7 MB per minute
+/// there). A bigger backlog is refused by the owner anyway, so a bigger
+/// log would only hold memory.
+const DEFAULT_REPLAY_LOG_BYTES: usize = constellation_net::reconcile::MAX_REPLAY_BACKLOG;
 /// Deltas older than this are not replayed: a mirror that stale is
 /// past `digest_ttl` anyway and a session is the better first step.
 const REPLAY_LOG_MAX_AGE: Duration = Duration::from_secs(600);

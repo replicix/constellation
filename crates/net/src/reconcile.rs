@@ -137,9 +137,17 @@ pub const REPLAY_PAGE_BUDGET: usize = 48 * 1024;
 /// Hard cap on the replay pages of one repair; a larger backlog falls
 /// back to a range session.
 pub const MAX_REPLAY_PAGES: usize = 64;
-/// Wire and memory overhead charged per logged delta besides its key
-/// bytes (two fingerprints, seq, incarnation, vector headers).
-const DELTA_LOG_OVERHEAD: usize = 96;
+/// Most delta bytes (wire cost) one repair can fetch; a backlog beyond
+/// it is refused up front, and a log larger than it is never useful.
+pub const MAX_REPLAY_BACKLOG: usize = REPLAY_PAGE_BUDGET * MAX_REPLAY_PAGES;
+/// Wire overhead charged per delta besides its key bytes (two
+/// fingerprints, seq, incarnation, two length prefixes: about 60 bytes
+/// encoded, rounded up). Only the page budget uses it; the log's own
+/// memory is accounted by [`delta_mem_cost`].
+const DELTA_WIRE_OVERHEAD: usize = 96;
+/// Allocator bookkeeping charged per heap block (glibc: an 8-byte header
+/// and 16-byte rounding, so 16 is the average).
+const MALLOC_OVERHEAD: usize = 16;
 
 /// Largest per-set shard fan-out (2^16 shards). At 64 keys per shard
 /// that is 4M keys before shards start to grow past their target.
@@ -902,8 +910,22 @@ impl ReplayReply {
     }
 }
 
+/// Bytes a delta takes in a reply page.
 fn delta_cost(d: &Delta) -> usize {
-    d.adds.len() + d.removes.len() + DELTA_LOG_OVERHEAD
+    d.adds.len() + d.removes.len() + DELTA_WIRE_OVERHEAD
+}
+
+/// Memory a logged delta holds: the inline entry (timestamp + `Delta`)
+/// plus the capacity of its two key buffers and their allocator blocks.
+fn delta_mem_cost(d: &Delta) -> usize {
+    let heap = |v: &Vec<u8>| {
+        if v.capacity() == 0 {
+            0
+        } else {
+            v.capacity() + MALLOC_OVERHEAD
+        }
+    };
+    std::mem::size_of::<(std::time::Instant, Delta)>() + heap(&d.adds) + heap(&d.removes)
 }
 
 /// The owner's bounded memory of the deltas it published: at most
@@ -929,7 +951,7 @@ impl DeltaLog {
         }
     }
 
-    /// Bytes held (key bytes plus per-delta overhead).
+    /// Memory held (entries plus key buffers, see [`delta_mem_cost`]).
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -960,7 +982,7 @@ impl DeltaLog {
         {
             self.clear();
         }
-        self.bytes += delta_cost(&d);
+        self.bytes += delta_mem_cost(&d);
         self.entries.push_back((now, d));
         self.prune(now);
     }
@@ -981,7 +1003,7 @@ impl DeltaLog {
 
     fn pop_front(&mut self) {
         if let Some((_, d)) = self.entries.pop_front() {
-            self.bytes -= delta_cost(&d);
+            self.bytes -= delta_mem_cost(&d);
         }
     }
 }
@@ -1019,6 +1041,17 @@ pub fn respond_replay(
         return unavailable;
     }
     let skip = (after_seq + 1 - first.seq) as usize;
+    // More than one repair can fetch: say so at once rather than serve
+    // the pages one by one and fall back at the cap anyway.
+    let backlog: usize = log
+        .entries
+        .iter()
+        .skip(skip)
+        .map(|(_, d)| delta_cost(d))
+        .sum();
+    if backlog > MAX_REPLAY_BACKLOG {
+        return unavailable;
+    }
     let mut used = 0usize;
     let mut deltas = Vec::new();
     for (_, d) in log.entries.iter().skip(skip) {
@@ -1941,6 +1974,57 @@ mod tests {
         assert_eq!(m.exact_seq, Some(1), "exact point must not advance");
         sync_in_memory(&mut m.keys, &sets[3], 0);
         assert!(m.keys == sets[3]);
+    }
+
+    /// A backlog bigger than one repair can fetch is refused at once
+    /// (the asker would otherwise spend all its round trips and still
+    /// fall back); a smaller one is served.
+    #[test]
+    fn a_backlog_beyond_the_page_cap_is_refused_up_front() {
+        let mut log = big_log();
+        let fat = |seq: u64| Delta {
+            incarnation: 3,
+            seq,
+            base: [0; 16],
+            root: [0; 16],
+            adds: vec![7; 40_000],
+            removes: Vec::new(),
+        };
+        for seq in 1..=100 {
+            log.push(fat(seq), far());
+        }
+        let summary = Summary {
+            incarnation: 3,
+            seq: 100,
+            root: [0; 16],
+            count: 0,
+        };
+        // 100 x ~40 KB = ~4 MB > 3 MiB: refused from the start...
+        assert!(!respond_replay(&log, summary, 3, 0, REPLAY_PAGE_BUDGET).available);
+        // ...and from seq 10 (90 deltas), but 50 deltas (~2 MB) fit.
+        assert!(!respond_replay(&log, summary, 3, 10, REPLAY_PAGE_BUDGET).available);
+        let r = respond_replay(&log, summary, 3, 50, REPLAY_PAGE_BUDGET);
+        assert!(r.available && !r.deltas.is_empty());
+    }
+
+    /// The log's byte count covers what a delta holds in memory: the
+    /// inline entry plus its buffers and their allocator blocks.
+    #[test]
+    fn the_log_counts_what_a_delta_holds_in_memory() {
+        let mut log = big_log();
+        let d = Delta {
+            incarnation: 1,
+            seq: 1,
+            base: [0; 16],
+            root: [0; 16],
+            adds: vec![1; 100],
+            removes: Vec::new(),
+        };
+        let cap = d.adds.capacity();
+        log.push(d, far());
+        let entry = std::mem::size_of::<(std::time::Instant, Delta)>();
+        assert_eq!(log.bytes(), entry + cap + MALLOC_OVERHEAD);
+        assert!(entry >= 112, "entry is {entry} bytes");
     }
 
     #[test]

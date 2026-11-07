@@ -1,6 +1,8 @@
 # Plan 47 — Chunk-location digests: research, measure, then decide
 
-> **Status (2026-11-07): P0-P2 done, P3 implemented.** The maintainer's P2
+> **Status (2026-11-07): P0-P2 done, P3 implemented and reviewed; two
+> items open (section 7: the harness matrix's pre-existing failures and the
+> `addr_churn` load failure).** The maintainer's P2
 > decision (2026-11-07): keep the exact mirror, fix the range-repair livelock,
 > add delta-log replay as the first repair step with range-based repair as the
 > fallback; no storage change (`bench/coop-digest/DECISION.md` section 7). P3
@@ -148,12 +150,12 @@ removals and repair, and the P1 benchmark re-run as its acceptance.
 | Step | Change | Fail-before / tests | Evidence |
 |---|---|---|---|
 | P3.1 | `Session` walks depth first (a stack, `crates/net/src/reconcile.rs`): the first `Items` answers are applied within a few rounds, so a session cut by `MAX_ROUNDS` keeps its progress and the next one continues; the livelock of breadth-first walks on 8 Mi-key peers (gaps of 50 k or more, a 100 k burst, a 160 k restart) is gone | `a_large_gap_on_a_large_set_converges_because_sessions_keep_progress` (3 M keys, 60 k changes; fails on the parent: "session 4 used 256 rounds and applied nothing") | RESULTS 12.1: 8 Mi keys, 100 k gap: 26.1 MiB in 3 sessions (P1: failed, 517 MiB); 30 k: 12.1 MiB (was 24.6) |
-| P3.2 | Delta-log replay: `DeltaLog` (8 MiB and 10 minutes by default, `CONSTELLATION_COOP_REPLAY_LOG_BYTES`, 0 = off), `ReplayRequest`/`ReplayReply` (signed postcard, 48 KiB pages, at most 64), `Mirror::exact_seq`/`apply_replay`, the engine's first repair step in `run_session` with the session as fallback; result accepted only if count and root fingerprint equal the owner's summary at the last replayed seq | net: small gap, paging, truncated by size and age, restart, silent change, reordering, differing mirror refused, malformed page, restart clears the exact point, frame fit, QUIC paging with session fallback; engine: log follows publishing, silent tick clears it | RESULTS 12.2: 100 k changes on 8 Mi keys 767 KiB / 22.6 ms against 26.1 MiB / 314 ms; 1 k: 8.2 KiB against 777 KiB |
+| P3.2 | Delta-log replay: `DeltaLog` (3 MiB, one repair's reach, and 10 minutes by default; memory counted by actual allocation; `CONSTELLATION_COOP_REPLAY_LOG_BYTES`, 0 = off), `ReplayRequest`/`ReplayReply` (signed postcard, 48 KiB pages, at most 64; a backlog beyond 64 pages is refused at once), `Mirror::exact_seq`/`apply_replay`, the engine's first repair step in `run_session` with the session as fallback; result accepted only if count and root fingerprint equal the owner's summary at the last replayed seq | net: small gap, paging, truncated by size and age, restart, silent change, reordering, differing mirror refused, malformed page, restart clears the exact point, frame fit, QUIC paging with session fallback; engine: log follows publishing, silent tick clears it | RESULTS 12.2: 100 k changes on 8 Mi keys 767 KiB / 22.6 ms against 26.1 MiB / 314 ms; 1 k: 8.2 KiB against 777 KiB |
 | P3.3 | Status: `replay_hits`, `replay_misses`, `replay_bytes`, `replay_log_bytes` (control schema re-blessed), `/metrics` `constellation_coop_replay_*`; harness `coop-churn` prints them | schema test | RESULTS 12.5: `replay_hits=2` over real nodes |
 | P3.4 | Bench: `product` repair method and `--plog` A/B in `bench/coop-digest`; the generic initiator is depth first too | | RESULTS 12.2-12.4 |
 
 Steady wire is byte-identical and publisher CPU within noise (RESULTS 12.3);
-the owner's log is 1.2 / 7.3 / 8.4 MB at 0.1 / 1 / 10 % churn per minute on
+the owner's log is 1.1 / 3.1 / 3.1 MB at 0.1 / 1 / 10 % churn per minute on
 8 Mi keys (12.4).
 
 ## 7. Exit criteria
@@ -169,20 +171,41 @@ the owner's log is 1.2 / 7.3 / 8.4 MB at 0.1 / 1 / 10 % churn per minute on
       No ADR: no candidate replaced the status quo.
 - [ ] P3 (the decision's two repair changes):
   - [x] implemented (depth-first sessions, delta-log replay); the P1 suite
-        shows the gain: RESULTS section 12.
+        shows the gain: RESULTS section 12, re-run after the review fixes
+        (12.5.1).
+  - [x] review fixes (2026-11-07): a backlog beyond one repair's reach (64
+        pages) is refused at once and the log default is that reach (3 MiB);
+        the new message variants are appended to `Payload`; a session cut at
+        the round cap does not mark the mirror fresh; the log counts its
+        memory by actual allocation (RESULTS 12.4). Fail-before: the
+        backlog and the confirmation tests fail with their fix removed.
   - [x] no regression on ext4, xfs, btrfs or tmpfs hosts: the change is in
         `net::reconcile`, `engine::coop`, the control status and the bench;
         no filesystem, cache-storage or read/write path code is touched, and
         steady wire and publisher CPU are unchanged within noise (12.3).
   - [x] harness coop scenarios green (`coop-cache-hit`, `coop-fallback`,
-        `coop-exact-churn`, `coop-digest-compare`; replay used by real nodes).
-  - [x] gates in debug and release: fmt, clippy `--workspace --all-targets
-        -D warnings`, net, engine and control tests (net 139, engine 954,
-        control 146), `cargo test --workspace`.
-  - [ ] pjdfstest 8798/8798, `tests/smoke.sh`, `tests/integration.sh` and the
-        full harness matrix of CONVENTIONS "Definition of done": **not run**
-        for P3 (the containerized lane and the full matrix were out of
-        the P3 brief). The diff does not touch what they exercise.
+        `coop-exact-churn`, `coop-digest-compare`): three rounds, 12 of 12;
+        replay used by real nodes.
+  - [x] gates (box, Linux 7.3, 2026-11-07): `cargo fmt --all -- --check` and
+        clippy `--workspace --all-targets -D warnings` clean;
+        `cargo test --workspace` release 5,044 passed, 0 failed; debug 5,046
+        passed, 1 failed (`handover::tests::a_log_tail_round_trips_through_a_memfd`,
+        passes alone 3 of 3: it closes a descriptor and expects `EBADF`, which
+        another test thread can reuse the number of; not this plan's code);
+        `tests/smoke.sh` and `tests/integration.sh` passed; pjdfstest 8798/8798
+        on the ring (`tests/compliance.sh`, baseline empty).
+  - [ ] the full harness matrix: 280 passed, 11 skipped, 5 failed (seed 42,
+        release, `harness run`). `csi-credential-revocation` needs `versitygw`
+        (not on the box). `writeback-fsync`, `git-under-flock-b2b` and
+        `git-under-flock-rounds` fail the same way on `origin/main`
+        (unchanged by this plan, open findings); `append-setattr-size` failed
+        in the matrix and once more alone (mount died at startup) and passed
+        on its second rerun, and on `origin/main` it failed with ENOSPC. None
+        touches `coop`.
+  - [ ] a load-induced failure of `crates/net/tests/addr_churn.rs` (the link
+        did not recover for 150 s after the selected address vanished): 0 of
+        50 alone, 1 of 10 and 1 of 3 more under load; it predates this plan
+        (the plan adds one trait method to `endpoint.rs`). Open; see PROGRESS.
   - [x] docs (feature reference, configuration, DESIGN, DECISION, RESULTS,
         PROGRESS) updated.
 

@@ -1147,15 +1147,17 @@ CPU of the session itself is unchanged: gap100k at 1 Mi keys 64.9 ms
 ### 12.2 Delta-log replay, then RBSR
 
 Design (`reconcile.rs`, `engine/src/coop/exact.rs`): the owner keeps its
-published `Delta`s in a `DeltaLog` (a contiguous run of `seq`, at most 8 MiB
-by default and at most 10 minutes old, newest always kept; a silent tick, in
+published `Delta`s in a `DeltaLog` (a contiguous run of `seq`, at most 3 MiB
+by default (one repair's reach: 64 pages of 48 KiB) and at most 10 minutes old, newest always kept; a silent tick, in
 which `seq` moves with no delta, empties it). A mirror remembers `exact_seq`,
 the owner `seq` at which it last equalled the owner exactly (an exact delta, a
 matching summary, a finished session or replay), and when it learns it is
 behind it sends `ReplayRequest { incarnation, after_seq: exact_seq }`; the
 owner answers `ReplayReply { summary, available, deltas }`, the consecutive
 deltas from `after_seq + 1` to its current `seq`, paged at 48 KiB of delta
-bytes (never fewer than one delta per page), at most 64 pages. The mirror
+bytes (never fewer than one delta per page), at most 64 pages; an owner whose
+backlog since `after_seq` is more than those 64 pages answers `unavailable` at
+once, so the mirror runs the session without spending 64 round trips first. The mirror
 applies them in order and takes the result as exact only if its count and root
 fingerprint equal the owner's summary at the last replayed `seq`; otherwise
 the session runs. Replay is not attempted for a restarted owner (the
@@ -1173,7 +1175,9 @@ in a way the log cannot explain is never accepted (`exact_seq` does not move);
 malformed pages refused without side effects; a restart clears the exact point;
 the largest replay page fits `MAX_FRAME`; paging over real QUIC with the session
 fallback over the same connection. Engine: the log follows publishing and a
-silent tick clears it.
+silent tick clears it. Review fixes: a backlog beyond 64 pages is refused up
+front; the log counts what a delta holds in memory; a session cut at the round
+cap does not mark the mirror fresh (`a_partly_repaired_mirror_is_not_confirmed`).
 
 Rows (`product` method: the daemon's flow, replay first and sessions when it
 cannot finish; bytes are signed-frame sizes for replay and postcard for
@@ -1220,20 +1224,31 @@ peer-minute (1 Mi, 1 %), 877 311 (1 Mi, 10 %), 715 014 (8 Mi, 1 %), 6 427 911
 apply and mirror memory are untouched (the receiver does nothing new until a
 repair).
 
-### 12.4 Log memory (10 simulated minutes, default 8 MiB cap, 10 min age bound)
+### 12.4 Log memory (10 simulated minutes, default 3 MiB cap, 10 min age bound)
+
+The first P3 build counted 96 B of overhead per logged delta and kept 8 MiB.
+The review found both off: one repair fetches at most 64 pages of 48 KiB
+(about 3 MiB), so a bigger log only held memory, and the 96 B understated what
+an entry holds. The log now counts the inline entry (timestamp and `Delta`,
+112 B) plus the capacity of its two key buffers and 16 B of allocator
+bookkeeping each, and its default is 3 MiB (`MAX_REPLAY_BACKLOG`). Re-run
+(`raw/p3c-log-memory.md`, box 2):
 
 | n | churn per minute | log, counted bytes | allocator-live | entries |
 |---|---|---|---|---|
-| 8 Mi | 0.1 % | 0.95 MB | 1.17 MB | 2 400 (10 min) |
-| 8 Mi | 1 % | 7.04 MB | 7.27 MB | 2 400 (10 min) |
-| 8 Mi | 10 % | 8.38 MB | 8.44 MB | 628 (size cap, 2.6 min) |
-| 1 Mi | 1 % | 1.12 MB | 1.35 MB | 2 400 (10 min) |
-| 1 Mi | 10 % | 8.39 MB | 8.62 MB | 2 323 (size cap) |
+| 8 Mi | 0.1 % | 1.06 MB | 1.17 MB | 2 400 (10 min) |
+| 8 Mi | 1 % | 3.14 MB | 3.22 MB | 1 054 (size cap, 4.4 min) |
+| 8 Mi | 10 % | 3.14 MB | 3.14 MB | 235 (size cap, 59 s) |
+| 1 Mi | 1 % | 1.24 MB | 1.35 MB | 2 400 (10 min) |
+| 1 Mi | 10 % | 3.14 MB | 3.13 MB | 859 (size cap, 3.6 min) |
 
-One log per node regardless of the number of peers. At the default cap a
-mirror that missed up to 10 minutes of 1 % churn on an 8 Mi-key peer, or about
-2.6 minutes of 10 %, is repaired by replay; older gaps fall back to a session
-(26 MiB at 100 k changes, 12 MiB at 30 k).
+Counted and allocator-live now agree within 3 % once the cap binds (before:
+0.95 against 1.17 MB at 0.1 %, 19 % under; the remaining 10 % there is the
+`VecDeque`'s spare capacity). One log per node regardless of the number of
+peers. A mirror that missed up to 4.4 minutes of 1 % churn on an 8 Mi-key peer,
+or about a minute of 10 %, is repaired by replay; older gaps fall back to a
+session (26 MiB at 100 k changes, 12 MiB at 30 k), which is also what the
+8 MiB log did for any backlog over 3 MiB after 64 round trips.
 
 ### 12.5 Real nodes
 
@@ -1242,6 +1257,16 @@ mirror that missed up to 10 minutes of 1 % churn on an 8 Mi-key peer, or about
 the daemons repaired two gaps by replay (`replay_hits=2`, `replay_misses=0`,
 874 wire bytes, `reconcile_failures=0`, zero false positives); in the other
 runs the sweep's liveness probes matched and nothing needed repair.
+
+### 12.5.1 Re-run after the review fixes (2026-11-07, box 2, release)
+
+The repair rows of 12.2 were re-run with the final code (`raw/p3c-repair-8m.md`,
+`raw/p3c-repair-1m.md`): bytes and rounds of every `real`, `rbsr`, `replay` and
+`product` row are identical to the first run (no gap in the table exceeds the
+3 MiB reach, so the up-front refusal changes none of them; CPU agrees within
+noise, for example gap100k product 27.1 ms against 21.6 ms, one run on a shared
+box against the timing box's median). `coop-cache-hit`, `coop-fallback`,
+`coop-exact-churn` and `coop-digest-compare` passed three times (seeds 42 to 44).
 
 ### 12.6 Reproducing P3
 

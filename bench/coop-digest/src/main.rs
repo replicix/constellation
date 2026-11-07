@@ -275,7 +275,10 @@ fn cmd_steady(a: &Args) {
     // Plan 47 P3: the product's bounded delta log, charged to the
     // publisher's time (A/B with `--plog 0`).
     let use_plog = a.num::<u32>("plog", 1) != 0;
-    let plog_cap: usize = a.num("plog-bytes", 8 << 20);
+    let plog_cap: usize = a.num(
+        "plog-bytes",
+        constellation_net::reconcile::MAX_REPLAY_BACKLOG,
+    );
     let mut plog = ProductLog::new(plog_cap, std::time::Duration::from_secs(600));
     let mut plog_peak = 0usize;
     let clock0 = Instant::now();

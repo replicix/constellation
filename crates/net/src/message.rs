@@ -277,16 +277,6 @@ pub enum Payload {
     ReconcileReply {
         reply: crate::reconcile::Reply,
     },
-    /// Plan 47 P3: "send me your deltas after `after_seq`" (the first
-    /// repair step, before a reconciliation session), sent directly to
-    /// the owner of the set being mirrored.
-    ReplayRequest {
-        incarnation: u64,
-        after_seq: u64,
-    },
-    ReplayReply {
-        reply: crate::reconcile::ReplayReply,
-    },
     /// Non-holder asks the lease holder to validate and journal `op`
     /// (postcard-encoded `MutateOp` from constellation-meta).
     MutateRequest {
@@ -868,6 +858,16 @@ pub enum Payload {
         from: u64,
         epoch: u64,
         through: u64,
+    },
+    /// Plan 47 P3: "send me your deltas after `after_seq`" (the first
+    /// repair step, before a reconciliation session), sent directly to
+    /// the owner of the set being mirrored.
+    ReplayRequest {
+        incarnation: u64,
+        after_seq: u64,
+    },
+    ReplayReply {
+        reply: crate::reconcile::ReplayReply,
     },
 }
 
