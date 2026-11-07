@@ -414,6 +414,11 @@ pub trait Replica {
     /// (`Meta::deleg_ended_at_gate`): the generation is never executed in
     /// here again.
     fn deleg_ended_at_gate(&self, gen: u64) -> bool;
+    /// Plan 46 M1.2 step 8b: the generations whose `DelegateNode` record this
+    /// replica holds only as a streamed entry the root's configuration did
+    /// not commit (`Meta::uncommitted_streamed_grants`). Such a grant is
+    /// not honoured until the log carries it.
+    fn deleg_grants_uncommitted(&self) -> Result<std::collections::BTreeSet<u64>, String>;
     /// The gate's re-append of its own rows under `gens` is done: their
     /// stream counters are the log's index of each, no hole
     /// (`Meta::end_own_streams_at_log`).
@@ -1491,6 +1496,10 @@ impl Replica for Meta {
             tracing::warn!(gen = %constellation_meta::delegation::GenLabel::of(gen), error = %e, "gate-ended mark unreadable; taking it as set");
             true
         })
+    }
+
+    fn deleg_grants_uncommitted(&self) -> Result<std::collections::BTreeSet<u64>, String> {
+        Meta::uncommitted_streamed_grants(self).map_err(|e| e.to_string())
     }
 
     fn end_own_streams_at_log(&self, gens: &[u64]) -> Result<(), String> {

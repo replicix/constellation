@@ -6328,6 +6328,37 @@ impl Meta {
         Ok(named)
     }
 
+    /// Plan 46 M1.2 step 8b (M1.0 answer 4): the generations whose
+    /// `DelegateNode` record this replica holds only as a streamed entry the
+    /// root did not stream as committed (`StreamAhead.committed` unset: its
+    /// configuration does not hold the row, a lone root's journal above all).
+    /// The table lists such a grant already, but it is not honoured: no
+    /// archive and no group holds it, and a root deposed meanwhile is
+    /// succeeded by a claimant that adopts the archive alone and ends the
+    /// number as an orphan. The segment that carries the row retires the
+    /// entry; the grant is committed from then on.
+    pub fn uncommitted_streamed_grants(
+        &self,
+    ) -> Result<std::collections::BTreeSet<u64>, MetaError> {
+        let r = self.db.read_tx();
+        let mut out = std::collections::BTreeSet::new();
+        for (seq, entry) in live_non_local(&r, self)? {
+            if !matches!(entry, LiveEntry::Streamed { gated: false, .. }) {
+                continue;
+            }
+            let Some(v) = r.get(&self.spec, seq_key(seq))? else {
+                continue;
+            };
+            let row: SpecRow = crate::record::from_bytes_exact(&v)?;
+            for rec in &row.records {
+                if let LogRecord::DelegateNode { gen, .. } = rec {
+                    out.insert(*gen);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// [`Self::speculatively_ended_generations`] under `r` (the read path
     /// takes it in the snapshot it reads the table in).
     pub(crate) fn speculatively_ended_generations_at(

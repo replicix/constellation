@@ -68234,3 +68234,36 @@ G1's p50 holds on every file system (ext4 rename and unlink over by 2 and 18 us)
 decision (D9) is re-taken against at M1.3's exit.
 
 **Gates**: fmt, clippy `--all-targets -D warnings` (authority), authority lib 1,076 (debug and release), release sim suite 420 passed, 0 failed, 12 ignored.
+
+### Plan 46 M1.2 step 8b: honour once committed (M1.0 answer 4)
+
+A delegate installs, renews and executes under a grant only once the root's configuration has committed its `DelegateNode` record. The delegate
+learns the commit from where its replica got the record: a record applied from the log (a segment, which is in the archive) is committed, the
+only commit a lone root has; a record the root streamed ahead of the log as committed (`StreamAhead.committed`: its group holds the row) is
+committed; a record it holds only as an uncommitted streamed entry (a lone root's journal under a continuation epoch's hold) is learned, since the
+table lists it, but not honoured. `Meta::uncommitted_streamed_grants` lists those generations (`Replica::deleg_grants_uncommitted`);
+`delegation_sync` parks such a generation (`dl.commit_waiting`, counter `deleg_install_waits_commit`): no `DelegState`, no renewal, so its ops
+forward to the root. The segment that carries the row retires the entry and runs the sync (the log's `DelegateNode`); the install retry timer
+covers a lost one. The wait is bounded by existing paths: the root hears no renewal and reclaims the generation at its first-renewal horizon,
+and a root that is gone leaves the number to ADR-43's orphan rule. This is the model's `sticky_answers_before_grant_committed` knob off.
+A growth of a live stream has no record before step 9 (one directory per generation): step 9's grown `DelegateNode` must park the same way
+(the check is per record, keyed by generation, and skips a generation already installed).
+
+Tests: `a_grant_the_root_has_not_committed_is_learned_but_not_honoured_until_the_log_carries_it` (fails on the parent: the delegate renews at once),
+`a_grant_the_roots_group_has_committed_is_honoured_before_the_log_carries_it`. The ADR-43 orphan tests that need a delegate which executed under an
+uncommitted grant honour one through a test-only switch (`dl.test_honour_uncommitted`). Sim: `SWEEP-XGEN-TOTALS` counts the installs put off for
+an uncommitted grant.
+
+Sweeps (`+commit`, seeds 0..1,999, release binary, parent against this branch): `long-delegated`, `delegated-root-crash`, `delegated-lone-s3-cut`,
+`placement-hot`: no failing seed on either side, oracle totals 0, identical `SWEEP-SIG` except two `placement-hot` seeds (167, 1811) whose
+signature differs by a segment (the rows' `time_ns` differ between two builds of the sim; the same binary twice is identical). Installs put off
+for an uncommitted grant: 0 in all 8,000 seeds: the sim never produces an uncommitted streamed grant (a lone root does not stream ahead; only an
+epoch hold does).
+
+Perf: the S3 wait per grant under a lone root is not new. The delegate of a lone root learns the grant through a shipped segment on the parent
+too (the root streams nothing ahead of the archive: `stream_ahead` returns at `durable_jseq() == u64::MAX`), so the step adds no wait to
+`placement-hot` (sim: installs put off 0, segments and waits per seed equal to the parent's). No bench was run: there is no code path that
+differs for a grant the log carries.
+
+Gates (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (lib and integration), authority lib (1,079), engine lib (953),
+control, release authority sim suite 421 passed, 0 failed, 12 ignored.

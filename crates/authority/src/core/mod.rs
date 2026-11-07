@@ -1035,6 +1035,9 @@ pub struct Stats {
     /// generation's rows were still in the journal, its end not yet
     /// applied from the log (path B).
     pub deleg_install_waits_end: u64,
+    /// Delegate: installs put off because the grant's `DelegateNode` record
+    /// is not committed yet (plan 46 M1.2 step 8b).
+    pub deleg_install_waits_commit: u64,
     /// ... and how long those installs waited in all and at most.
     pub deleg_install_wait_ms: u64,
     pub deleg_install_wait_max_ms: u64,

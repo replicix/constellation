@@ -652,6 +652,7 @@ impl DelegationState {
             ("dl_designating", self.designating.len()),
             ("dl_xgen_held_at", self.xgen_held_at.len()),
             ("dl_install_waiting", self.install_waiting.len()),
+            ("dl_commit_waiting", self.commit_waiting.len()),
         ]
     }
 }
@@ -754,6 +755,18 @@ pub(crate) struct DelegationState {
     /// generations (`None`: the journal could not be read), and when the
     /// last warning went out.
     pub(crate) install_waiting: BTreeMap<u64, InstallWait>,
+    /// Plan 46 M1.2 step 8b (M1.0 answer 4): the generations of this node
+    /// the table lists whose `DelegateNode` record the root's configuration
+    /// has not committed as far as this replica can tell (it holds the
+    /// record only as an uncommitted streamed entry), by generation: since
+    /// when. Not installed, so nothing executes and no renewal goes out,
+    /// until the log carries the record (the archive, for a lone root).
+    pub(crate) commit_waiting: BTreeMap<u64, WaitMs>,
+    /// Tests only: honour a grant the root has not committed, as before step
+    /// 8b, to pin what the orphan rule does for a delegate that executed
+    /// under one (the rule stays as the defence behind the honour rule).
+    #[cfg(test)]
+    pub(crate) test_honour_uncommitted: bool,
     /// The timer that runs `delegation_sync` again while an install waits
     /// (or a group could not be read): a segment's records are not the
     /// only way the wait ends.
@@ -1332,6 +1345,12 @@ impl Core {
         // applied from the log; the segment that applies it syncs again.
         let mut awaiting_end: Option<Option<Vec<u64>>> = None;
         let mut waiting_now: BTreeSet<u64> = BTreeSet::new();
+        let mut uncommitted: Option<Result<BTreeSet<u64>, String>> = None;
+        #[cfg(test)]
+        if self.dl.test_honour_uncommitted {
+            uncommitted = Some(Ok(BTreeSet::new()));
+        }
+        let mut commit_now: BTreeSet<u64> = BTreeSet::new();
         let mut retry = false;
         for d in table.iter().filter(|d| d.node == me) {
             if self.dl.mine.contains_key(&d.gen) || self.dl.epoch_active {
@@ -1347,6 +1366,39 @@ impl Core {
                 waiting_now.insert(d.gen);
                 retry = true;
                 continue;
+            }
+            // Plan 46 M1.2 step 8b (M1.0 answer 4): a grant is honoured once
+            // the root's configuration has committed its `DelegateNode`
+            // record: the archive for a lone root, its group otherwise. The
+            // root streams a row its group holds as committed
+            // (`StreamAhead.committed`) and a lone root's journal not at
+            // all, so a record this replica holds only as an uncommitted
+            // streamed entry is learned but not honoured: the delegate
+            // neither installs it nor renews it, and its ops forward to the
+            // root as for any generation it does not hold. The segment that
+            // carries the row retires the entry and syncs again (the log's
+            // `DelegateNode`); the retry timer covers a lost one. No wait is
+            // unbounded: the root, which hears no renewal, reclaims the
+            // generation at its first-renewal horizon, and a root that is
+            // gone leaves the number to ADR-43's orphan rule.
+            let uncommitted = uncommitted.get_or_insert_with(|| replica.deleg_grants_uncommitted());
+            match uncommitted {
+                Ok(set) if !set.contains(&d.gen) => {}
+                other => {
+                    if other.is_ok() && !self.dl.commit_waiting.contains_key(&d.gen) {
+                        self.stats.deleg_install_waits_commit += 1;
+                        tracing::debug!(
+                            node = me,
+                            dir = d.dir,
+                            gen = %constellation_meta::delegation::GenLabel::of(d.gen),
+                            "delegation not honoured yet: its DelegateNode record is not committed (waits for the log)"
+                        );
+                    }
+                    self.dl.commit_waiting.entry(d.gen).or_insert(now.wait);
+                    commit_now.insert(d.gen);
+                    retry = true;
+                    continue;
+                }
             }
             // A group that cannot be read is not "no record": installed at
             // a later sync (plan 43 C2e review), which the retry timer
@@ -1465,6 +1517,9 @@ impl Core {
         // With an epoch active nothing was looked at: the waits stand.
         if !self.dl.epoch_active {
             self.deleg_install_waits_settle(now, &waiting_now);
+        }
+        if !self.dl.epoch_active {
+            self.dl.commit_waiting.retain(|g, _| commit_now.contains(g));
         }
         if retry && self.dl.install_retry.is_none() {
             let t = self.set_timer_wait(

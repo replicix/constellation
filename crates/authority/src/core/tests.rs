@@ -16401,6 +16401,10 @@ mod locks {
         let mut h = Harness::new(3);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
+        // Since plan 46 M1.2 step 8b a delegate does not honour an
+        // uncommitted grant; the orphan rule behind that rule is pinned by
+        // honouring one here, as before.
+        h.core.dl.test_honour_uncommitted = !committed;
         h.meta
             .install_streamed_committed(
                 1,
@@ -38025,6 +38029,96 @@ fn delegate_with_first_renewal_out() -> (Harness, OpId, u64) {
     assert_eq!(to, 1);
     assert_eq!(round, round_of(&h, 7));
     (h, req, round)
+}
+
+/// A delegate (node 3, root node 1) whose replica holds the root's grant of
+/// `/d` (generation 7) as a transaction the root streamed ahead of the log,
+/// `committed` as the root's `StreamAhead` says. Returns the records (what
+/// the segment that carries the row applies) and the directory.
+fn delegate_learning_a_streamed_grant(
+    committed: bool,
+) -> (Harness, Vec<LogRecord>, constellation_fs_core::Ino) {
+    let mut h = Harness::new(3);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.lease.cached_holder = Some(1);
+    let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+    let records = vec![
+        LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: "d".into(),
+            ino: dir,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        },
+        LogRecord::delegate_one(3, 7, dir, constellation_meta::SubtreeKind::Placed),
+    ];
+    crate::replica::Replica::install_streamed(&h.meta, 1, 1, 1, 2, &records, committed, (0, 0))
+        .unwrap();
+    (h, records, dir)
+}
+
+/// Plan 46 M1.2 step 8b (M1.0 answer 4, `sticky_answers_before_grant_
+/// committed`): a grant is honoured once the root's configuration has
+/// committed its `DelegateNode`. A lone root's journal commits nothing
+/// beyond the archive, and its unshipped record reaches a delegate as a
+/// streamed entry the root did not stream as committed: the table lists
+/// the grant (the delegate learned it), but the delegate neither installs
+/// nor renews it, so nothing executes under it, until the segment that
+/// carries the row lands. Fails on the parent: the delegate installs the
+/// grant at once, renews it, and executes under the root's answer.
+#[test]
+fn a_grant_the_root_has_not_committed_is_learned_but_not_honoured_until_the_log_carries_it() {
+    let (mut h, records, dir) = delegate_learning_a_streamed_grant(false);
+    assert!(
+        h.meta.delegation_table().has_gen(7),
+        "the delegate did not learn the unshipped record"
+    );
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+    assert!(
+        renewal_sent(&out).is_none(),
+        "renewed a grant the root has not committed: {out:?}"
+    );
+    assert!(h.core.dl.mine.is_empty(), "installed an uncommitted grant");
+    assert_eq!(
+        h.core.dl.commit_waiting.keys().copied().collect::<Vec<_>>(),
+        vec![7]
+    );
+    // The wait is a retry, not a stall: the timer syncs again, still waiting.
+    assert!(h.core.dl.install_retry.is_some());
+    // Nothing executes under it meanwhile.
+    let out = create_in(&mut h, dir, 1);
+    assert_eq!(
+        h.core.dl.mine.get(&7).map_or(0, |d| d.executed),
+        0,
+        "{out:?}"
+    );
+    // The archive lands: the segment carries the row, and the grant is
+    // honoured from the sync it triggers.
+    crate::replica::Replica::apply_segment(&h.meta, 1, 1, 2, &[1], &[], &records).unwrap();
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+    let (to, req, _round) = renewal_sent(&out).expect("no renewal once the log carries the grant");
+    assert_eq!(to, 1);
+    assert!(h.core.dl.commit_waiting.is_empty());
+    h.step(renewed(&h, req, 7, 5_000));
+    let out = create_in(&mut h, dir, 2);
+    assert_eq!(h.core.dl.mine[&7].executed, 1, "{out:?}");
+}
+
+/// ... and a record the root streamed as committed (its group holds the
+/// row) is honoured at once: the group is the commit, not the archive.
+#[test]
+fn a_grant_the_roots_group_has_committed_is_honoured_before_the_log_carries_it() {
+    let (mut h, _records, _dir) = delegate_learning_a_streamed_grant(true);
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+    assert!(renewal_sent(&out).is_some(), "{out:?}");
+    assert!(h.core.dl.mine.contains_key(&7));
+    assert!(h.core.dl.commit_waiting.is_empty());
 }
 
 /// The off-core lane never makes a generation's first renewal: the root
