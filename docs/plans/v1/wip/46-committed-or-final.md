@@ -1106,6 +1106,18 @@ I1 is definitional for `Final` (the sticky guarantee rests on
 X1 has one writer (it composes faults, not concurrency). All stated in the
 `lib.rs` doc.
 
+*M1.4 step 4: open item for stage 2 (review, 2026-11-07).* When a node other
+than the member claims the lease, the member's strand queues its verbatim
+`Records` replay, and that replay runs after the claimant has opened its
+view, so it can land behind the claimant's new operations. Main had the same
+order for speculative copies; it falls short of Q4's "carry like a sealed
+tail". Stage 2, which deletes the replay paths, must carry the member's
+acknowledged rows into the claimant's re-ship instead. The three strand-and-
+replay paths step 4 added are stage-2 deletions with the rest of server-side
+replay: `LiveEntry::uncarried_by_takeover` (the takeover strand), the
+marker-proven no-tail rule and the same-tenure rule of `apply_segment_rows`
+(both in the segment strand's `strands` closure).
+
 ## 12. Exit criteria
 
 - [x] Stage 0 (complete 2026-11-05): C2g, C2g′ and C2h's scenarios landed with their

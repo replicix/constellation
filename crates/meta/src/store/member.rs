@@ -167,6 +167,42 @@ pub(crate) fn note_log_tail_tx(
     Ok(())
 }
 
+/// Plan 46 M1.4 step 4 (SHOULD-3): how far a re-ship of `epoch`'s own tail
+/// stands, as `(announced, reached)`: `TailFollowsThrough` said the sealed
+/// prefix reaches journal seq `announced`, and the log carries re-shipped
+/// transactions of the epoch through `reached` (a tail is re-journaled in
+/// order). A copy of a transaction at or below `announced` and past
+/// `reached` is still to be named: a segment that passes it without naming
+/// it is not the last word, the re-ship may span several segments (the
+/// shipper cuts them by count and bytes, and a re-journaled transaction sits
+/// after the old journal's seqs, so the first segment of the re-ship
+/// already passes the old rows). `records` is the segment being applied,
+/// whose facts are not in the store yet.
+pub(crate) fn reship_progress_tx(
+    r: &impl Readable,
+    meta: &Meta,
+    epoch: u64,
+    records: &[LogRecord],
+) -> Result<(Option<u64>, Option<u64>), MetaError> {
+    let mut announced = kv_u64(r, meta, &through_key(epoch))?;
+    let mut reached = kv_u64(r, meta, &reship_key(epoch))?;
+    for rec in records {
+        match rec {
+            LogRecord::TailFollowsThrough {
+                prev_epoch,
+                through,
+            } if *prev_epoch == epoch => {
+                announced = Some(announced.map_or(*through, |o| o.max(*through)));
+            }
+            LogRecord::TailOf { epoch: e, jseq } if *e == epoch => {
+                reached = Some(reached.map_or(*jseq, |o| o.max(*jseq)));
+            }
+            _ => {}
+        }
+    }
+    Ok((announced, reached))
+}
+
 /// Whether the log says a row of `epoch`'s tail needs no copy: it is carried
 /// (shipped by its own epoch, or named by a re-ship), or it was never
 /// committed (past the sealer's hold).

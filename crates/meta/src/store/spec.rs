@@ -5009,6 +5009,18 @@ impl Meta {
         } else {
             self.named_generations_tx(&tx)?
         };
+        // Plan 46 M1.4 step 4 (SHOULD-3): a re-ship of this epoch's own
+        // tail (a self-sealed holder re-claiming it) that the log announced
+        // and has not yet finished: the `TailOf` of a copy the segment
+        // passes may ride a later segment of the same re-ship, so the copy
+        // stays until its identity is named or the re-ship is past it.
+        let (reship_announced, reship_reached) =
+            super::member::reship_progress_tx(&tx, self, epoch, records)?;
+        let reship_pending = |ident: (u64, u64)| {
+            ident.0 == epoch
+                && reship_announced.is_some_and(|t| ident.1 <= t)
+                && reship_reached.is_none_or(|m| m < ident.1)
+        };
         let strands = |entry: &LiveEntry| {
             (entry.stranded_by(epoch)
                 && !matches!(entry, LiveEntry::Shadow { rid, .. } if completes.contains(rid)))
@@ -5048,12 +5060,14 @@ impl Meta {
                 // fetches it (a claim by TTL asks the lease's backups), and
                 // kept as committed it would wait for ever. Its rid replays.
                 || matches!(entry, LiveEntry::Streamed { epoch: e, gated: true, .. }
-                    if proof.no_tail.is_some_and(|p| *e <= p))
+                    if proof.no_tail.is_some_and(|p| *e == p))
                 || matches!(entry, LiveEntry::Streamed { epoch: e, last, gated, ident }
                     if *e == epoch
                         && through >= *last
                         && !rows.contains(last)
-                        && (!*gated || !tail_ids.contains(ident)))
+                        && (!*gated
+                            || !(tail_ids.contains(ident)
+                                || reship_pending(*ident))))
         };
         // Only a holder's own captured transactions (`gen` 0) among the
         // `Local` rows can strand here (`LiveEntry::stranded_by`); with
@@ -5890,8 +5904,13 @@ impl Meta {
         let mut part = StrandPart::default();
         if let Some(args) = strand {
             let tail_idents: HashSet<(u64, u64)> = match &tail {
+                // Only the transactions this takeover re-applies name a copy:
+                // a hole names nothing, and one past the sealed prefix
+                // (`bt.last > through`) is counted `tail_beyond_gap` and
+                // never re-applied.
                 Some(t) => txs
                     .iter()
+                    .filter(|bt| !bt.records.is_empty() && bt.last <= t.through)
                     .map(|bt| {
                         crate::store::member::tail_identity(&bt.records)
                             .unwrap_or((t.epoch, bt.first))

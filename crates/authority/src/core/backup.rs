@@ -5006,13 +5006,33 @@ impl Core {
             *hi = (*hi).max(tip);
         }
         self.stats.hold_resends += 1;
+        // Simulation: the knob uncommits the resent batches that carry a
+        // grant too (the same count as the first sends).
+        let mut knob_uncommitted = false;
+        if self.cfg.stream_ahead_uncommit_grant_every > 0
+            && txs.iter().any(|t| {
+                t.records
+                    .iter()
+                    .any(|r| matches!(r, constellation_meta::LogRecord::DelegateNode { .. }))
+            })
+        {
+            self.stats.stream_grant_batches += 1;
+            if self
+                .stats
+                .stream_grant_batches
+                .is_multiple_of(self.cfg.stream_ahead_uncommit_grant_every)
+            {
+                self.stats.stream_grants_uncommitted += 1;
+                knob_uncommitted = true;
+            }
+        }
         out.push(Action::Send {
             to: n,
             msg: PeerMsg::StreamAhead {
                 epoch,
                 base: self.ship.head_seq,
                 txs,
-                committed: self.hold_group(),
+                committed: !knob_uncommitted && self.hold_group(),
             },
         });
     }

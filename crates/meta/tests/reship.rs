@@ -449,3 +449,48 @@ fn a_member_row_a_tail_names_is_applied_once() {
     assert!(meta.pending_replays().unwrap().is_empty());
     assert!(meta.lookup(ROOT_INO, "held").unwrap().is_some());
 }
+
+/// Plan 46 M1.4 step 4 (review SHOULD-2): only the transactions the takeover
+/// re-applies name a member copy. One past the sealed prefix (`through`) is
+/// counted `tail_beyond_gap` and never applied, so a copy named only by it
+/// is the only one left: it strands and its rid replays.
+#[test]
+fn a_member_copy_named_only_by_a_tx_past_the_gap_survives_as_a_replay() {
+    let meta = Meta::open_in_memory().unwrap();
+    let first = vec![
+        create(ROOT_INO, "first", ino(1)),
+        LogRecord::Completed { rid: rid(1, 1) },
+    ];
+    let beyond = vec![
+        create(ROOT_INO, "beyond", ino(2)),
+        LogRecord::Completed { rid: rid(1, 2) },
+    ];
+    meta.install_streamed_committed(EPOCH_PREV, 1, 2, 2, &beyond, true, (0, 0))
+        .unwrap();
+    let txs = [tx(1, 1, first), tx(2, 2, beyond)];
+    assert!(meta.backup_append(EPOCH_PREV, &txs).is_ok());
+    let proof = Default::default();
+    let carried = Default::default();
+    let report = meta
+        .reship_at_takeover(
+            Some(constellation_meta::StrandArgs {
+                epoch: 2,
+                own_gens: &[],
+                abandoned: None,
+                carried: &carried,
+                proof: &proof,
+            }),
+            Some(constellation_meta::TailArgs {
+                epoch: EPOCH_PREV,
+                through: 1,
+                config_version: 3,
+                class: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(report.tail_applied, 1);
+    assert_eq!(report.tail_beyond_gap, 1);
+    let queued = meta.pending_replays().unwrap();
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert_eq!(queued[0].rid, rid(1, 2));
+}

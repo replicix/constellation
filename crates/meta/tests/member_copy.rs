@@ -1202,3 +1202,91 @@ fn an_uncommitted_rolled_back_record_retracts_nothing_until_the_log_carries_it()
     assert!(meta.lookup(ROOT_INO, "a").unwrap().is_none());
     assert!(!meta.member_copy_carries(rid(1)).unwrap());
 }
+
+fn streamed(meta: &Meta, epoch: u64, first: u64, last: u64, recs: &[LogRecord]) {
+    meta.install_streamed_committed(epoch, HOLDER, first, last, recs, true, (0, 0))
+        .unwrap();
+}
+
+/// Plan 46 M1.4 step 4 (review SHOULD-1): a claim that proves its
+/// predecessor's tenure has no tail proves it of *that epoch only*: an older
+/// epoch's committed copy may still ride a tail a later claim fetches (plan
+/// 43 D2), so it stays; the proven epoch's own copy is the only one left and
+/// strands.
+#[test]
+fn a_no_tail_proof_strands_only_the_epoch_it_names() {
+    let meta = Meta::open_in_memory().unwrap();
+    let old = vec![create("old", ino(1), 10), completed(rid(1))];
+    let proven = vec![create("proven", ino(2), 11), completed(rid(2))];
+    streamed(&meta, 1, 1, 1, &old);
+    streamed(&meta, 2, 1, 1, &proven);
+    let marker = [LogRecord::TailFollowsThrough {
+        prev_epoch: 2,
+        through: 0,
+    }];
+    meta.apply_segment_rows(1, 3, 0, &[], &[], &marker, &TouchSet::default())
+        .unwrap();
+    let queued = meta.pending_replays().unwrap();
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert_eq!(queued[0].rid, rid(2));
+    assert!(meta.lookup(ROOT_INO, "old").unwrap().is_some());
+    assert!(meta.lookup(ROOT_INO, "proven").unwrap().is_none());
+}
+
+/// Plan 46 M1.4 step 4 (review SHOULD-3): a self-sealed holder re-claiming
+/// its own epoch re-ships its tail over several segments. The copies the
+/// first segment passes without naming stay until the re-ship names them (a
+/// later segment's `TailOf`): rolled back at the first and re-applied at the
+/// second they would vanish for a while, and a copy without a `Completed`
+/// rid would never come back.
+#[test]
+fn a_reship_spanning_segments_keeps_the_copies_it_has_not_named_yet() {
+    let meta = Meta::open_in_memory().unwrap();
+    let a = vec![create("a", ino(1), 10), completed(rid(1))];
+    let b = vec![create("b", ino(2), 11), completed(rid(2))];
+    streamed(&meta, 2, 1, 1, &a);
+    streamed(&meta, 2, 2, 2, &b);
+    // First segment of the re-ship: the marker (the tail reaches seq 2) and
+    // the first transaction, behind the old journal's seqs.
+    let mut seg1 = vec![
+        LogRecord::TailFollowsThrough {
+            prev_epoch: 2,
+            through: 2,
+        },
+        LogRecord::TailOf { epoch: 2, jseq: 1 },
+    ];
+    seg1.extend(a.iter().cloned());
+    apply_rows(&meta, 1, 2, 3, &[3], &seg1);
+    assert!(meta.pending_replays().unwrap().is_empty());
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
+    assert!(meta.lookup(ROOT_INO, "b").unwrap().is_some());
+    let mut seg2 = vec![LogRecord::TailOf { epoch: 2, jseq: 2 }];
+    seg2.extend(b.iter().cloned());
+    apply_rows(&meta, 2, 2, 4, &[4], &seg2);
+    assert!(meta.pending_replays().unwrap().is_empty());
+    assert!(!meta.has_outstanding_speculation());
+    assert!(meta.lookup(ROOT_INO, "b").unwrap().is_some());
+}
+
+/// ... and a copy past what the marker announced (the sealed prefix) is not
+/// waited for.
+#[test]
+fn a_reship_does_not_wait_for_a_copy_past_the_sealed_prefix() {
+    let meta = Meta::open_in_memory().unwrap();
+    let a = vec![create("a", ino(1), 10), completed(rid(1))];
+    let b = vec![create("b", ino(2), 11), completed(rid(2))];
+    streamed(&meta, 2, 1, 1, &a);
+    streamed(&meta, 2, 2, 2, &b);
+    let mut seg1 = vec![
+        LogRecord::TailFollowsThrough {
+            prev_epoch: 2,
+            through: 1,
+        },
+        LogRecord::TailOf { epoch: 2, jseq: 1 },
+    ];
+    seg1.extend(a.iter().cloned());
+    apply_rows(&meta, 1, 2, 3, &[3], &seg1);
+    let queued = meta.pending_replays().unwrap();
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert_eq!(queued[0].rid, rid(2));
+}

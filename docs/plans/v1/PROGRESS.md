@@ -68569,3 +68569,28 @@ lost acknowledged hold row); none of the failures is a member's lost row. Harnes
 
 **Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (lib, integration), authority lib, engine lib, control, model
 `flex_epochs` (release), release authority sim suite 0 failed.
+
+### Plan 46 M1.4 step 4 fix (review)
+
+SHOULD-1: the marker-proven no-tail rule strands the committed copies of the proven epoch only (`==`, was `<=`), as `OrphanProof` documents: an older
+epoch's copy may still ride a tail a later claim fetches, and rolled back it vanished for a while (a row without a `Completed` rid was never queued).
+SHOULD-2: the takeover's `tail_idents` name only the transactions it re-applies (no holes, nothing past the sealed prefix): a member copy named only by a
+beyond-gap transaction is the only copy left, so it strands and its rid replays (it was superseded quietly). SHOULD-3: a re-ship can span segments (the
+shipper cuts by count and bytes, and the first re-journaled transaction already sits behind the old journal's seqs, so its segment passes every old
+row); the same-tenure rule keeps a copy while the log's announced re-ship (`TailFollowsThrough` of the epoch, `member::reship_progress_tx`) reaches it
+and no `TailOf` has reached it yet (this segment's records included); a copy past the announced prefix, or passed by the re-ship unnamed, strands as
+before. NIT: the hold's resend honours `AUTHORITY_SIM_UNCOMMIT_GRANTS` like the first send.
+Tests (fail before): `a_no_tail_proof_strands_only_the_epoch_it_names`, `a_member_copy_named_only_by_a_tx_past_the_gap_survives_as_a_replay`,
+`a_reship_spanning_segments_keeps_the_copies_it_has_not_named_yet` (+ `..._does_not_wait_for_a_copy_past_the_sealed_prefix`).
+
+**Open for stage 2 (review item 4).** When another node claims, the member's verbatim `Records` replay runs after the claimant opened its view, so it can
+land behind the claimant's new operations (main had the same order for speculative copies); this falls short of Q4's "carry like a sealed tail". Stage 2
+(which deletes the replay paths) must carry the acknowledged rows into the claimant's re-ship. Recorded in the plan 46 notes. The three strand-and-replay
+paths step 4 added are stage-2 deletions: `LiveEntry::uncarried_by_takeover`, the marker-proven no-tail rule, the same-tenure rule for gated entries.
+
+**Sweeps** (release, x2,000, `+commit`): every config's failing set is identical to the step 4 commit's before the rebase and to the rebased step 4 commit (no
+set grew, none is new): `delegated-epoch` 7, `flex` 7, `flex-crash` 7, `flex-tight` 9, `locks-blips` 11, `-tight` 10, `-tight-delegated` 3, `-faults` 3, `-in-doubt`
+10, `-long-lease` 6, `locks-core-stall-blips` 16, `locks-unlinked-delegated-blips` 3; `backup-crash`, `long-backup`, `delegated-holder-cut` (the reship path) 0.
+`flex-crash +durability` 274 before and after, the same set. **Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (lib,
+integration), engine lib, control, release authority sim suite 0 failed. The authority lib has one failure in both profiles, also on main without step 4:
+`step9_one_stream_per_node::a_grown_subtree_parks_until_its_record_is_committed_and_the_root_has_answered` (`d.dirs.len()` 1, expected 2) — a step 9 test.
