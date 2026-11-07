@@ -1101,10 +1101,8 @@ impl Meta {
             return Ok(());
         }
         let r = self.db.read_tx();
-        let listed: std::collections::BTreeSet<u64> = crate::delegation::read_table_tx(&r, self)?
-            .iter()
-            .map(|d| d.gen)
-            .collect();
+        let listed: std::collections::BTreeSet<u64> =
+            crate::delegation::read_table_tx(&r, self)?.gens().collect();
         for (gen, idx) in origins {
             if listed.contains(&gen) {
                 continue;

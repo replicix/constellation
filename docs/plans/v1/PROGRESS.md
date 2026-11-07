@@ -68148,3 +68148,7 @@ control, release authority sim suite 419 passed, 0 failed, 12 ignored. Sweeps: 4
 main against this branch: identical failing sets on every config. Perf (A/B, 10 rounds, 300 samples, pooled): topology 2 (delegated-relevant) holder and
 forward ops within 0.95..1.03 on ext4, xfs, btrfs, tmpfs; topology 1 (empty table, the walk never runs) small ops bimodal, 0.88..1.29 in both
 directions (an A/A control on ext4 shows 0.88..1.06); `vfs_bench` dispatch 5 ns direct, 89 ns observed, equal to main. The tmpfs A/A control did not run.
+
+### Plan 46 M1.2 step 8a fix: review SHOULDs
+
+Rebased on main (one PROGRESS conflict, both sides kept; no code on main wrote or read the old delegation records). A re-grant of a directory now drops the losing stream once its set is empty (the old fold did; the empty stream had flipped `is_empty`, `deleg_any` and the table's `stream` against `iter`). `DelegationTable::gens()` and `has_gen(gen)` enumerate live generations by stream, so a stream that released every subtree is still live; every reader that collected live generations through `iter()` (session void check, `Meta` restart seeding, the replay-origin check, the strand's listed sets, the authority's replay holds, the delegate's named/live sets, the jobs' listed set, client checks) and the strand's end check (which keyed by `(node, gen)` while the fold ends by gen alone) use them. One table test (the regrant loser, a released stream, the end by gen); the replica fixture's end record names node 4, the node it grants to.

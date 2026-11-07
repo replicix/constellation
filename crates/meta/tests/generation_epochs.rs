@@ -556,7 +556,7 @@ fn a_restart_then_a_strand_leaves_the_generation_live_and_unvoided() {
     )
     .unwrap();
     assert!(
-        meta.delegation_table().iter().any(|d| d.gen == h),
+        meta.delegation_table().has_gen(h),
         "the strand rolled the end back"
     );
     assert!(!meta.session().is_voided(h), "live, not voided");
@@ -683,7 +683,7 @@ fn an_abandon_ends_a_generation_whose_grant_never_reached_the_log() {
         let meta = Meta::open(&path).unwrap();
         meta.install_streamed_committed(1, 1, 1, 1, &[delegate(g)], true, (0, 0))
             .unwrap();
-        assert!(meta.delegation_table().iter().any(|d| d.gen == g));
+        assert!(meta.delegation_table().has_gen(g));
         delegate_create(&meta, g, rid, "x", ino);
         let live = std::collections::BTreeSet::from([g]);
         assert!(meta.deleg_gens_awaiting_end(&live).unwrap().is_empty());
@@ -764,7 +764,7 @@ fn an_abandon_leaves_a_generation_the_log_granted_alone() {
         &TouchSet::default(),
     )
     .unwrap();
-    assert!(meta.delegation_table().iter().any(|d| d.gen == g));
+    assert!(meta.delegation_table().has_gen(g));
     assert!(meta.lookup(ROOT_INO, "x").unwrap().is_some());
     assert!(!meta.session().is_voided(g));
     assert_eq!(meta.void_cut(g).unwrap(), None);
@@ -919,7 +919,7 @@ fn delegate_of_a_streamed_grant(g: u64, committed: bool) -> Meta {
     let meta = Meta::open_in_memory().unwrap();
     meta.install_streamed_committed(1, 1, 1, 1, &[delegate(g)], committed, (0, 0))
         .unwrap();
-    assert!(meta.delegation_table().iter().any(|d| d.gen == g));
+    assert!(meta.delegation_table().has_gen(g));
     delegate_create(&meta, g, RID, "x", (2u64 << 40) | 20);
     meta
 }
@@ -1042,7 +1042,7 @@ fn a_takeover_leaves_a_grant_that_may_still_ship_alone() {
     delegate_create(&meta, g, RID, "x", (2u64 << 40) | 20);
     meta.apply_segment_rows(2, 2, 0, &[], &[], &[no_tail(1, 0)], &TouchSet::default())
         .unwrap();
-    assert!(meta.delegation_table().iter().any(|d| d.gen == g));
+    assert!(meta.delegation_table().has_gen(g));
     unended(&meta);
     // And on a claimant that holds it: its row stays to ship.
     let meta = Meta::open_in_memory().unwrap();
@@ -1330,10 +1330,7 @@ fn a_claimant_without_a_tail_keeps_its_rows_of_a_generation_only_speculation_end
     let proof = constellation_meta::OrphanProof::of(&[no_tail(1, 0)]);
     meta.strand_for_takeover_carrying(2, &[], None, &Default::default(), &proof)
         .unwrap();
-    assert!(
-        meta.delegation_table().iter().any(|d| d.gen == g),
-        "the strand relisted it"
-    );
+    assert!(meta.delegation_table().has_gen(g), "the strand relisted it");
     assert!(
         ships_a_row_of(&meta, g),
         "its row ships under the log's grant"

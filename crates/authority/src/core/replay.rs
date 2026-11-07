@@ -353,7 +353,7 @@ impl Core {
             // stream's order, or the generation ends and the void rule
             // frees it (long-delegated seed 70075: the successor's replay
             // ran ahead of the delegate's earlier transactions).
-            if head.gen != 0 && replica.delegation_table().iter().any(|d| d.gen == head.gen) {
+            if head.gen != 0 && replica.delegation_table().has_gen(head.gen) {
                 self.stats.replays_held_for_stream += 1;
                 return;
             }
@@ -1344,12 +1344,7 @@ impl Core {
         // to this successor, in stream order; the drain tick frees it
         // once the generation ended) — never executed here ahead of the
         // delegate's earlier transactions (long-delegated seed 70075).
-        if queued.gen != 0
-            && replica
-                .delegation_table()
-                .iter()
-                .any(|d| d.gen == queued.gen)
-        {
+        if queued.gen != 0 && replica.delegation_table().has_gen(queued.gen) {
             held.hold();
             self.stats.replays_held_for_stream += 1;
             return Ok(());

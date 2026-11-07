@@ -1373,7 +1373,7 @@ impl Meta {
         table: &crate::delegation::DelegationTable,
         speculative: std::collections::BTreeSet<u64>,
     ) -> Result<(), MetaError> {
-        let mut live: std::collections::BTreeSet<u64> = table.iter().map(|d| d.gen).collect();
+        let mut live: std::collections::BTreeSet<u64> = table.gens().collect();
         // ADR-43 (the restart path): an end only outstanding speculation
         // carries is not an end yet (see `speculatively_ended_generations`).
         // `speculative` is read with `table` in one snapshot at the open;

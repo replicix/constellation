@@ -2078,7 +2078,7 @@ impl crate::store::Meta {
         };
         let max_gen = table.max_gen();
         let voided = self.session.void_ended_among(gens, |gen| {
-            gen <= max_gen && !table.iter().any(|d| d.gen == gen) && !speculative.contains(&gen)
+            gen <= max_gen && !table.has_gen(gen) && !speculative.contains(&gen)
         });
         if voided > 0 {
             tracing::info!(

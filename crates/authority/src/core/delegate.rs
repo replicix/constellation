@@ -1076,7 +1076,7 @@ impl Core {
             return;
         }
         let table = replica.delegation_table();
-        let named: BTreeSet<u64> = table.iter().map(|d| d.gen).collect();
+        let named: BTreeSet<u64> = table.gens().collect();
         let mut again = Vec::new();
         while let Some(&(at, gen)) = self.dl.forget_at.first() {
             if now.wait < at {
@@ -1338,7 +1338,7 @@ impl Core {
                 continue;
             }
             let awaiting = awaiting_end.get_or_insert_with(|| {
-                let live: BTreeSet<u64> = table.iter().map(|d| d.gen).collect();
+                let live: BTreeSet<u64> = table.gens().collect();
                 replica.deleg_gens_awaiting_end(&live)
             });
             if awaiting.as_ref().is_none_or(|gens| !gens.is_empty()) {
@@ -1480,7 +1480,7 @@ impl Core {
         let level = self.root_deleg_level(now);
         self.dl.root_synced = level;
         if level != RootSync::None {
-            let live: BTreeSet<u64> = table.iter().map(|d| d.gen).collect();
+            let live: BTreeSet<u64> = table.gens().collect();
             for d in table.iter() {
                 if self.dl.gens.contains_key(&d.gen) {
                     continue;

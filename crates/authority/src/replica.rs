@@ -2105,7 +2105,7 @@ mod tests {
                         constellation_meta::SubtreeKind::Placed,
                     ),
                     LogRecord::DelegateNodeEnded {
-                        node: 3,
+                        node: 4,
                         gen: g,
                         through: 0,
                     },

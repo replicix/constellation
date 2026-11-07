@@ -140,8 +140,15 @@ impl DelegationTable {
                     // lacked, as before).
                     if let Some((n, gn, _)) = self.by_dir.insert(g.dir, (node, gen, g.kind)) {
                         if (n, gn) != (node, gen) {
+                            // The stream that lost its last subtree to the
+                            // grant is gone, as the old fold dropped it (a
+                            // stream that *released* its set stays until
+                            // the root ends it).
                             if let Some(set) = self.streams.get_mut(&(n, gn)) {
                                 set.remove(&g.dir);
+                                if set.is_empty() {
+                                    self.streams.remove(&(n, gn));
+                                }
                             }
                         }
                     }
@@ -265,6 +272,21 @@ impl DelegationTable {
             gen,
             subtrees: set.iter().map(|(&d, &k)| (d, k)).collect(),
         })
+    }
+
+    /// Every live generation, ascending: a stream that released all its
+    /// subtrees is still listed (readers of "is this generation live" must
+    /// use this, not [`Self::iter`], which lists subtrees).
+    pub fn gens(&self) -> impl Iterator<Item = Gen> + '_ {
+        let mut v: Vec<Gen> = self.streams.keys().map(|&(_, g)| g).collect();
+        v.sort_unstable();
+        v.dedup();
+        v.into_iter()
+    }
+
+    /// Whether generation `gen` is live (the fold's end matches by `gen`).
+    pub fn has_gen(&self, gen: Gen) -> bool {
+        self.node_of_gen(gen).is_some()
     }
 
     /// The node that holds generation `gen` (`None`: not live).
@@ -1072,5 +1094,44 @@ mod tests {
         assert_eq!(sticky.kind, Sticky);
         assert!(!sticky.designated());
         assert_eq!(DelegationTable::decode(&t.encode()).unwrap(), t);
+    }
+
+    /// M1.2 step 8a fix: a re-grant of a directory to another stream drops
+    /// the losing stream once its set is empty (as the old fold did), so
+    /// `is_empty`, `stream` and the walk's `iter` agree; a stream that
+    /// *released* its set stays live, and the generation readers
+    /// (`gens`, `has_gen`) list it although `iter` lists none of its
+    /// subtrees.
+    #[test]
+    fn a_regrant_drops_the_empty_loser_and_a_released_stream_stays_live() {
+        use SubtreeKind::Placed;
+        let mut t = DelegationTable::default();
+        t.apply(grow(7, 5, &[(2, Placed)]));
+        t.apply(grow(8, 6, &[(2, Placed)]));
+        assert!(t.stream(7, 5).is_none(), "the loser is gone, not empty");
+        assert!(!t.has_gen(5));
+        assert_eq!(t.streams().count(), 1);
+        assert_eq!(t.gens().collect::<Vec<_>>(), vec![6]);
+        // A loser that still holds another subtree stays.
+        t.apply(grow(8, 6, &[(3, Placed)]));
+        t.apply(grow(9, 7, &[(3, Placed)]));
+        assert_eq!(t.stream(8, 6).unwrap().subtrees, vec![(2, Placed)]);
+        // Every subtree released one by one: the stream is live, empty.
+        t.apply(DelegationRecord::SubtreeReleased {
+            node: 8,
+            gen: 6,
+            dir: 2,
+        });
+        t.apply(DelegationRecord::StreamReleased { node: 9, gen: 7 });
+        assert!(t.iter().next().is_none(), "no subtree is held");
+        assert!(!t.is_empty());
+        assert_eq!(t.gens().collect::<Vec<_>>(), vec![6, 7]);
+        assert!(t.has_gen(6) && t.has_gen(7) && !t.has_gen(5));
+        // The end matches by generation alone: `has_gen` and the fold agree
+        // whatever node the record names.
+        t.apply(DelegationRecord::DelegateNodeEnded { node: 1, gen: 6 });
+        assert!(!t.has_gen(6));
+        assert!(t.stream(8, 6).is_none());
+        assert_eq!(t.gens().collect::<Vec<_>>(), vec![7]);
     }
 }

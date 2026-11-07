@@ -1639,8 +1639,7 @@ impl Core {
         // log ended is in `ended`, or its rows were stranded by the log's
         // recall): its rows are never appended, or the log would carry rows
         // of a generation it never granted. They are replayed by rid.
-        let listed: std::collections::BTreeSet<u64> =
-            replica.delegation_table().iter().map(|d| d.gen).collect();
+        let listed: std::collections::BTreeSet<u64> = replica.delegation_table().gens().collect();
         // The rows are journaled in this tenure's journal: stamped with the
         // configuration in force there (the lease this node holds now), as
         // the adopted tail's are (`apply_backup_tail`), not a version-0

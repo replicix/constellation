@@ -1662,11 +1662,8 @@ fn strand_local_tx(
         // row: the table here, rolled back or rebuilt from the log, no
         // longer lists it), it is live again, and the void is lifted once
         // this transaction commits (`Meta::stage_unvoid`).
-        if let LogRecord::DelegateNodeEnded { node, gen, .. } = rec {
-            if crate::delegation::read_table_tx(&*tx, meta)?
-                .stream(*node, *gen)
-                .is_some()
-            {
+        if let LogRecord::DelegateNodeEnded { gen, .. } = rec {
+            if crate::delegation::read_table_tx(&*tx, meta)?.has_gen(*gen) {
                 meta.stage_unvoid(*gen);
             }
         }
@@ -6058,8 +6055,7 @@ impl Meta {
         // (Plan 46 M0.4 MUST-1, below: the table before the strand.)
         let table_before: std::collections::BTreeSet<u64> =
             crate::delegation::read_table_tx(&*tx, self)?
-                .iter()
-                .map(|d| d.gen)
+                .gens()
                 .collect();
         let own = |entry: &LiveEntry| match entry {
             LiveEntry::Local { gen, .. } if *gen != 0 && own_gens.contains(gen) => Some(*gen),
@@ -6111,8 +6107,7 @@ impl Meta {
         let unlisted_own: Vec<u64> = {
             let listed: std::collections::BTreeSet<u64> =
                 crate::delegation::read_table_tx(&*tx, self)?
-                    .iter()
-                    .map(|d| d.gen)
+                    .gens()
                     .chain(table_before.iter().copied())
                     .collect();
             let mut out = Vec::new();
@@ -6269,10 +6264,8 @@ impl Meta {
         if proof.is_empty() {
             return Ok(Vec::new());
         }
-        let listed: std::collections::BTreeSet<u64> = crate::delegation::read_table_tx(tx, self)?
-            .iter()
-            .map(|d| d.gen)
-            .collect();
+        let listed: std::collections::BTreeSet<u64> =
+            crate::delegation::read_table_tx(tx, self)?.gens().collect();
         let mut candidates = listed_before.clone();
         candidates.extend(local::deleg_gens_awaiting_end_tx(tx, self, &listed)?);
         let candidates: Vec<u64> = candidates
@@ -6315,10 +6308,7 @@ impl Meta {
         tx: &SingleWriterWriteTx,
     ) -> Result<std::collections::BTreeSet<u64>, MetaError> {
         let mut named: std::collections::BTreeSet<u64> =
-            crate::delegation::read_table_tx(tx, self)?
-                .iter()
-                .map(|d| d.gen)
-                .collect();
+            crate::delegation::read_table_tx(tx, self)?.gens().collect();
         for (seq, entry) in live_non_local(tx, self)? {
             if let LiveEntry::Shadow { gen, .. } | LiveEntry::Hint { gen, .. } = entry {
                 if gen != 0 {

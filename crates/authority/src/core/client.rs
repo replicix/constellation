@@ -438,7 +438,7 @@ fn live_rows(streams: &Streams, replica: &dyn Replica) -> Streams {
     let table = replica.delegation_table();
     let mut live = Streams::NONE;
     for (gen, idx) in streams.iter() {
-        if idx > 0 && table.iter().any(|d| d.gen == gen) {
+        if idx > 0 && table.has_gen(gen) {
             live.raise(gen, idx);
         }
     }
@@ -1073,7 +1073,7 @@ impl Core {
             && !entry.is_await_retry()
             && !entry.foreign
             && !self.clients.contains_key(&entry.rid)
-            && (entry.gen == 0 || !table.iter().any(|d| d.gen == entry.gen))
+            && (entry.gen == 0 || !table.has_gen(entry.gen))
     }
 
     /// The rows of live generations the queue entry of `rid` recorded (its
