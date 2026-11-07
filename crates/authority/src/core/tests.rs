@@ -60127,7 +60127,7 @@ mod step9_one_stream_per_node {
     #[test]
     fn a_grown_subtree_parks_until_its_record_is_committed_and_the_root_has_answered() {
         // Generation 7 on `/d`, committed and honoured.
-        let (mut h, _records, a) = delegate_learning_a_streamed_grant(true);
+        let (mut h, records, a) = delegate_learning_a_streamed_grant(true);
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         let (_, req, _) = renewal_sent(&out).expect("no first renewal");
@@ -60163,8 +60163,12 @@ mod step9_one_stream_per_node {
         create_in(&mut h, a, 3);
         assert_eq!(h.core.dl.mine[&7].executed, 2);
         // The archive carries the growth: committed, still parked until a
-        // renewal sent after answers.
-        crate::replica::Replica::apply_segment(&h.meta, 2, 1, 4, &[3], &[], &grow).unwrap();
+        // renewal sent after answers. The segment is the log's prefix
+        // through it (the grant's own rows too: a segment that passes a
+        // committed streamed entry without naming it strands it).
+        let prefix: Vec<LogRecord> = records.iter().chain(grow.iter()).cloned().collect();
+        crate::replica::Replica::apply_segment(&h.meta, 2, 1, 4, &[1, 2, 3, 4], &[], &prefix)
+            .unwrap();
         h.advance(5);
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
