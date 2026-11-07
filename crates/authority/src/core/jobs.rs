@@ -1163,15 +1163,18 @@ impl Core {
         self.note_shipped(seqs, through);
         if !seqs.is_empty() {
             self.answer_shipped_barriers(replica, out);
-            // Plan 46 M0.3 (S5, ADR-42): inside a takeover gate
-            // `answer_awaiting_log` leaves an op whose outcome is still a
-            // row of the unshipped journal (the predecessor's tail the gate
-            // re-appended, a delegate's batch): these rows are the log's now,
-            // and nothing else would answer the op before the next segment,
-            // appended batch or inbox recheck.
-            if self.lease.gate.is_some() {
-                self.answer_awaiting_log(now, replica, out);
-            }
+            // Plan 46 M0.3 (S5, ADR-42): `answer_awaiting_log` leaves an op
+            // whose outcome is still a row of the unshipped journal (inside
+            // a takeover gate the predecessor's tail the gate re-appended;
+            // in any tenure a delegate's batch this node appended as the
+            // root, `holder_append_uncommitted`): these rows are the log's
+            // now, and nothing else would answer the op before the next
+            // segment, appended batch or inbox recheck. An open root too: its
+            // own op's reply can reach it before the delegate's batch, the
+            // batch finds the row unshipped, and with the delegate's turn
+            // waiting on that op no further batch came for 80 s, until the
+            // delegation's recall (`git-under-flock-b2b` under load).
+            self.answer_awaiting_log(now, replica, out);
         }
         tracing::debug!(
             target: "constellation_authority::stream",

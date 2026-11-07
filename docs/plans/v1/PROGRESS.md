@@ -68844,3 +68844,12 @@ release as a row (step 12), `repair abandon --node` (step 13).
   (plan §5.4, "The root never takes back; the one exception").
 - `undelegate` of a sticky grant with an unreachable holder: the event doc is corrected and the CLI points to `repair abandon`.
 - `delegate_dir` refuses a sticky grant to a node with a pending designation.
+## 2026-11-08 git-under-flock-b2b and -rounds: a lost wake-up of an open root
+
+`git-under-flock-b2b` and `-rounds` failed with one 80-90 s turn (limit 30 s), always an `edit` (a `SetManifest` of the open root's own client) and always ending at the
+placement's recall of the delegation. Cause: the reply of the delegate (`Accepted`, no base) reached the root 30 us before the delegate's stream batch carrying the op's row, so
+the op waited for the log (`ack.awaited_log` 1); the batch appended the row, `holder_append_uncommitted` kept the op waiting, the row shipped 6 ms later, and `ship_landed`
+called `answer_awaiting_log` only inside a takeover gate. With the git turn waiting on that op, no further batch came. `ship_landed` now calls it for every tenure. Evidence: with
+16 busy loops on the 16-core box, `git-under-flock-b2b` failed 4 of 4 before (seeds 44, 44, 44, 46; one run with heavy debug logging at seed 45 passed) and passed 3 of 3 after (44, 46, 47); `git-under-flock-rounds` seed 42 passed
+under the same load. Not reproducible without load (it passes on an idle box with the ordering the other way round). No unit test: a faithful one needs the root's own
+client op awaiting the log behind a backed tenure's unshipped append of a delegate row, which the core harness's `hold` turns into a parked answer instead.
