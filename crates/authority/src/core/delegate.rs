@@ -222,7 +222,9 @@ pub(crate) struct GenState {
     /// The read delegations (M8) this root granted on the subtree before
     /// it delegated it, being recalled (`Core::delegate_dir`): the
     /// delegate's writes recall only its own table's, so no renewal is
-    /// granted while one of these is live.
+    /// granted while one of these is live. Only a stream's first subtree has
+    /// any: a subtree that grows a live stream is journaled once they are
+    /// gone (`Core::delegate_dir`, [`DelegationState::growing`]).
     pub read_recalls: BTreeSet<u64>,
     /// The delegate's renewal that waits for `read_recalls`, answered
     /// when the last of them is gone.
@@ -726,6 +728,7 @@ impl DelegationState {
             ("dl_backing", self.backing.len()),
             ("dl_sealed", self.sealed.len()),
             ("dl_designating", self.designating.len()),
+            ("dl_growing", self.growing.len()),
             ("dl_xgen_held_at", self.xgen_held_at.len()),
             ("dl_install_waiting", self.install_waiting.len()),
             ("dl_commit_waiting", self.commit_waiting.len()),
@@ -792,6 +795,12 @@ pub(crate) struct DelegationState {
     /// directory → designee. No read delegation is granted under one
     /// meanwhile, so the next sync can journal it.
     pub designating: BTreeMap<Ino, NodeId>,
+    /// A grant that would grow a live stream, not journaled yet because this
+    /// root's read delegations under the directory were live: directory →
+    /// (delegate, until when the recalled grants have expired in any case).
+    /// No read delegation is granted under one meanwhile; the caller's next
+    /// attempt journals it. A stream's renewals never wait for them (step 9).
+    pub growing: BTreeMap<Ino, (NodeId, WaitMs)>,
     /// Whether a certificate is published (`Core::deleg_publish_root`).
     cert_set: bool,
     /// The generations this node is the delegate of.
@@ -1981,10 +1990,9 @@ impl Core {
             if d.grown.get(&dir) == Some(&None) {
                 d.grown.insert(dir, Some(after));
             }
-            let designated_dir = subtrees
-                .iter()
-                .any(|(x, k)| *x == dir && *k == SubtreeKind::Designated);
-            if designated_stream && designated_dir {
+            // A stream never mixes grant kinds: a designated stream grows
+            // by designations only, honoured once committed.
+            if designated_stream {
                 d.grown.remove(&dir);
                 d.dirs.insert(dir);
                 promoted += 1;
@@ -2153,6 +2161,26 @@ impl Core {
 
     // ----------------------------------------------------- the delegate
 
+    /// Plan 46 M1.2 step 9: some key lies in a subtree stream `gen` (this
+    /// node's) grew by that this node does not honour yet. Judged against the
+    /// table, not against what the last sync noted. The core and the lock
+    /// service leave such a key to the root, whatever the stream's renewal
+    /// says: the renewal covers the honoured subtrees only.
+    pub(crate) fn deleg_parked_for(
+        &self,
+        keys: &TouchSet,
+        gen: u64,
+        replica: &dyn Replica,
+    ) -> bool {
+        let Some(s) = self.dl.mine.get(&gen) else {
+            return false;
+        };
+        let honoured: Vec<Ino> = s.dirs.iter().copied().collect();
+        replica
+            .delegation_table()
+            .touches_unhonoured(replica.namespace(), keys, gen, &honoured)
+    }
+
     /// Whether `op` is this node's to execute as a delegate right now:
     /// the generation that owns every key, if it is one of this node's,
     /// not stopped, and its grant honoured.
@@ -2168,13 +2196,7 @@ impl Core {
                 // root's answer not here, or the sync that learns it not run)
                 // is the root's still: judged against the table, not against
                 // what the last sync noted.
-                let honoured: Vec<Ino> = s.dirs.iter().copied().collect();
-                if replica.delegation_table().touches_unhonoured(
-                    replica.namespace(),
-                    keys,
-                    d.gen,
-                    &honoured,
-                ) {
+                if self.deleg_parked_for(keys, d.gen, replica) {
                     return None;
                 }
                 // `stopped` follows the store's mark at the next event; a
@@ -4476,10 +4498,7 @@ impl Core {
         if sealed && !designated {
             // Every subtree of the stream, to the backup: the first grant
             // opens its stream, the rest grow it.
-            for (dir, kind) in dirs
-                .into_iter()
-                .filter(|(_, k)| *k != DelegKind::Designated)
-            {
+            for (dir, kind) in dirs {
                 match self.delegate_dir(now, dir, from, kind, replica, out) {
                     Ok(new_gen) => {
                         tracing::info!(
@@ -6222,8 +6241,6 @@ impl Core {
         let Some(g) = self.dl.gens.get(&gen) else {
             return false;
         };
-        // A grown subtree's read delegations are recalled before a renewal
-        // may be answered without the core (step 9).
         g.read_recalls.is_empty()
             && self.dl.answered_granting.contains(&gen)
             && self.lock_deleg_quiet(gen, &g.dir_list(), replica)
@@ -9137,6 +9154,56 @@ impl Core {
         if node == self.me() {
             return Err("cannot delegate to the root itself".into());
         }
+        // Plan 46 M1.2 step 9: a node holds one stream, and a stream never
+        // mixes grant kinds (maintainer decision 2026-11-07): it holds
+        // designations only (final, never reclaimed) or stealable grants
+        // only (group-committed, reclaimed whole). A grant to a node whose
+        // stream is live grows it (below); one to a node with none opens
+        // its stream. Checked before anything is touched, so a refusal
+        // costs nothing and the placement does not retry it every round.
+        let designating_kind = kind == DelegKind::Designated;
+        let live_stream = self
+            .dl
+            .gens
+            .iter()
+            .find(|(_, g)| g.node == node && !g.ended)
+            .map(|(gen, _)| *gen);
+        if let Some(gen) = live_stream {
+            let g = &self.dl.gens[&gen];
+            if g.designated() != designating_kind {
+                if !designating_kind {
+                    return Err(format!(
+                        "node {node} holds designated directories only; a grant that can be \
+                         reclaimed waits until they are released"
+                    ));
+                }
+                // A designation on a node with a stealable stream: that
+                // stream is recalled first, then the designation opens its
+                // own stream (the next designation sync). Nothing stealable
+                // is granted to the node meanwhile (`designating`).
+                self.dl.designating.insert(dir, node);
+                if g.recall == RecallPhase::None && !g.waiting_for_group && !g.prev_blocked {
+                    tracing::info!(
+                        node = self.me(),
+                        dir,
+                        designee = node,
+                        gen = %constellation_meta::delegation::GenLabel::of(gen),
+                        "a designation recalls the node's stealable stream first (a stream never mixes grant kinds)"
+                    );
+                    self.start_recall(now, gen, out);
+                }
+                return Err(format!(
+                    "node {node}'s stealable delegation is being recalled before the designation"
+                ));
+            }
+            if g.recall != RecallPhase::None || g.waiting_for_group || g.prev_blocked {
+                return Err(format!("node {node}'s delegation is being recalled"));
+            }
+        } else if !designating_kind && self.dl.designating.values().any(|n| *n == node) {
+            return Err(format!(
+                "a designation to node {node} is pending; nothing that can be reclaimed is granted to it"
+            ));
+        }
         // The delegate is another node: a root that still counts itself
         // alone starts the kernel drain now, so the first renewal (and a
         // designation) waits for it with the rest of the quarantine.
@@ -9147,27 +9214,6 @@ impl Core {
                 "directory {dir} is under delegation {} (gen {})",
                 d.dir, d.gen
             ));
-        }
-        // Plan 46 M1.2 step 9: a node holds one stream. A grant to a node
-        // whose stream is live grows it (below); one to a node with none
-        // opens its stream.
-        let live_stream = self
-            .dl
-            .gens
-            .iter()
-            .find(|(_, g)| g.node == node && !g.ended)
-            .map(|(gen, _)| *gen);
-        if let Some(gen) = live_stream {
-            let g = &self.dl.gens[&gen];
-            if g.designated() && kind != DelegKind::Designated {
-                return Err(format!(
-                    "node {node} holds designated directories only; a grant that can be \
-                     reclaimed waits until they are released"
-                ));
-            }
-            if g.recall != RecallPhase::None || g.waiting_for_group || g.prev_blocked {
-                return Err(format!("node {node}'s delegation is being recalled"));
-            }
         }
         // A delegation on a descendant of `dir` would be shadowed.
         if table
@@ -9191,15 +9237,33 @@ impl Core {
         // runs, the first renewal waits for it too, and a designation is
         // not journaled.
         let quarantine = self.first_renewal_quarantine(now, replica);
+        self.dl.growing.retain(|_, (_, until)| *until > now.wait);
         if live_stream.is_some() && kind != DelegKind::Designated {
             // A grown subtree has no first renewal to wait out the quarantine
-            // with: it is granted once the quarantine has passed.
+            // (or the read delegations) with, and the stream's renewals must
+            // not wait for them (they renew the honoured subtrees): it is
+            // granted once they are gone, as a designation is.
             if let Some(q) = quarantine {
                 return Err(format!(
                     "read delegations granted before this tenure may be honoured for {} ms",
                     q.since(now.wait)
                 ));
             }
+            if !read_grants.grants.is_empty() {
+                let n = read_grants.grants.len();
+                let until = read_grants
+                    .grants
+                    .iter()
+                    .map(|g| g.until)
+                    .max()
+                    .expect("non-empty");
+                self.dl.growing.insert(dir, (node, until));
+                self.start_recalls(now, read_grants, out);
+                return Err(format!(
+                    "{n} read delegations under directory {dir} are being recalled"
+                ));
+            }
+            self.dl.growing.remove(&dir);
         }
         if kind == DelegKind::Designated {
             if !read_grants.grants.is_empty() {
@@ -9220,7 +9284,7 @@ impl Core {
             self.dl.designating.remove(&dir);
         }
         if let Some(gen) = live_stream {
-            return self.grow_generation(now, gen, dir, kind, read_grants, replica, out);
+            return self.grow_generation(now, gen, dir, kind, replica, out);
         }
         // ADR-43: a generation is a stream's identity, minted by one
         // tenure in its own epoch's block (`epoch << 32 | n`), the epoch of
@@ -9331,21 +9395,19 @@ impl Core {
 
     /// Plan 46 M1.2 step 9: grant `dir` to the node that holds stream `gen`:
     /// the stream grows (`DelegateNode` again, the same generation; a window,
-    /// a cut and a group exist already). The root stops sequencing `dir` at
-    /// once. The delegate honours it once the record is committed and the
-    /// root has answered a renewal sent after that
+    /// a cut and a group exist already). The root's read delegations under
+    /// `dir` are gone already (`delegate_dir` recalls them first and refuses
+    /// meanwhile), so no renewal of the stream waits for any. The root stops
+    /// sequencing `dir` at once. The delegate honours it once the record is
+    /// committed and the root has answered a renewal sent after that
     /// ([`Self::deleg_unpark_grown`]): the answer carries the lock handoff of
-    /// the new subtree, and waits for the root's read delegations under it
-    /// (`read_recalls`; a renewal without the core is not answered meanwhile,
-    /// [`Self::deleg_settled`]).
-    #[allow(clippy::too_many_arguments)]
+    /// the new subtree.
     fn grow_generation(
         &mut self,
         now: Now,
         gen: u64,
         dir: Ino,
         kind: DelegKind,
-        read_grants: RecallNeed,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<u64, String> {
@@ -9366,15 +9428,10 @@ impl Core {
                 None,
             )
             .map_err(|e| e.to_string())?;
-        let read_recalls = self
-            .start_recalls(now, read_grants, out)
-            .map(|(ids, _)| ids)
-            .unwrap_or_default();
         let g = self.dl.gens.get_mut(&gen).expect("present");
         g.dirs.insert(dir, kind);
         g.grown_at = Some(now.wait);
         g.below_since = None;
-        g.read_recalls.extend(read_recalls);
         self.dw.unsettle(gen);
         // Plan 30 §M14: the new subtree's lock grants go with it (handed
         // over with the next granting renewal).
@@ -9433,13 +9490,22 @@ impl Core {
     /// Whether `ino` is under a designation waiting for this root's read
     /// delegations to be recalled ([`DelegationState::designating`]): no
     /// read delegation is granted on it.
-    pub(crate) fn under_pending_designation(&self, ino: Ino, replica: &dyn Replica) -> bool {
-        !self.dl.designating.is_empty()
-            && self
+    pub(crate) fn under_pending_designation(
+        &self,
+        now: Now,
+        ino: Ino,
+        replica: &dyn Replica,
+    ) -> bool {
+        let ns = replica.namespace();
+        self.dl
+            .designating
+            .keys()
+            .any(|dir| is_under(ns, ino, *dir))
+            || self
                 .dl
-                .designating
-                .keys()
-                .any(|dir| is_under(replica.namespace(), ino, *dir))
+                .growing
+                .iter()
+                .any(|(dir, (_, until))| *until > now.wait && is_under(ns, ino, *dir))
     }
 
     /// Until when this root's read-delegation quarantine runs, if it
@@ -9777,6 +9843,7 @@ impl Core {
         self.dl.answered_granting.clear();
         self.dl.floor_sent.clear();
         self.dl.designating.clear();
+        self.dl.growing.clear();
         self.dl.cert_set = false;
         self.dl.forget_at.clear();
         self.dl.forgot = false;

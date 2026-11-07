@@ -601,6 +601,7 @@ impl EngineControl {
                     place_recalled: stats.place_recalled,
                     place_skipped_cooldown: stats.place_skipped_cooldown,
                     place_skipped_unreachable: stats.place_skipped_unreachable,
+                    place_skipped_designated: stats.place_skipped_designated,
                     read_index_served: stats.deleg_read_index_served,
                     read_grants: stats.deleg_read_grants,
                     root_answers_off_core: core.delegation_root_answers_off_core,

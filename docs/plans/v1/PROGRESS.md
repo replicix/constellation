@@ -68515,3 +68515,19 @@ order of size).
 
 **Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (lib and integration), authority lib (1,084), engine lib (953), control
 (146, schema re-blessed), constellation CLI (95 and the integration tests), release authority sim suite 424 passed, 0 failed, 12 ignored.
+
+**Plan 46 M1.2 step 9 fix round (review of the step 9 commit; maintainer decision 2026-11-07).** MUST-1: a delegate's lock service routed a key to itself
+(`Route::Me`) by the whole stream's renewal, so a subtree the stream had grown by and that was still parked (record uncommitted, the root's handoff of the
+grants it moved and its grace not here) was served at once, over the root's holder. The route now takes the subtree's honour state (`deleg_parked_for`, the
+table's `touches_unhonoured` over the honoured set, as the core's `my_generation_for` and the engine's admission do): a parked key waits (`Route::Unknown`);
+`lock_handback`'s floor and barrier cover the parked subtrees too. `lock_delegated_here` is kept: a root's `NotOwner { 0 }` for a parked key is still that
+root declining to name the requester, and clearing the cached root would restart the delegate's stream round. MUST-2: a stream never mixes grant kinds. A
+designation on a node that holds a stealable stream recalls that stream first (the designation waits in `designating`, nothing stealable is granted to the node
+meanwhile) and then opens the node's own stream; a stealable grant to a node that holds designations only, or has a designation pending, is refused before
+anything is touched (`note_foreign` included), and the placement skips such a node (`place_skipped_designated`) instead of asking every round. The per-grant kind
+filters (the backup re-delegation, the designated-subtree promotion on the delegate) are gone: a stream is one kind. A designated stream is still never
+reclaimed by the TTL, the placement or a cross-subtree op. SHOULD-2: `grow_generation` no longer adds `read_recalls`, which held every renewal of the stream: a
+grant that grows a live stream recalls the root's read delegations under the new subtree first and is journaled when they are gone (`DelegationState::growing`,
+bounded by the recalled grants' expiry, no new read delegation under it meanwhile), as a designation is; renewals never wait for them. Tests: a parked
+subtree grants no lock (fails on the step 9 commit), a designation recalls a placed stream first, placement skips a designated-only node and leaves its stream
+alone, a grow waits for the recalls and no renewal of the stream does.

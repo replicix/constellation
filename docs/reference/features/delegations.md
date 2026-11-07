@@ -971,7 +971,12 @@ Since plan 46 M1.2 step 9 a node holds one stream: a grant to a node
 whose stream is live grows it in place (`DelegateNode` again, the same
 generation), so two subtrees of one node are one generation and a rename
 between them is an ordinary op of that stream. A node that holds only
-designations takes no grant the root can reclaim. The cross-generation
+designations takes no grant the root can reclaim, and designating on a
+node that holds a stealable stream recalls that stream first (a stream
+never mixes grant kinds; the placement skips a designated-only node). A
+grant that grows a live stream waits, as a designation does, for the
+root's read delegations under the new subtree to be recalled before it is
+journaled, so no renewal of the stream ever waits for them. The cross-generation
 rule below remains for the generations left from before (step 12 deletes
 it).
 
@@ -1108,8 +1113,9 @@ node's whole process was frozen) and `lapses_root_silent` with
 are classified: see "Grants, renewal and expiry",
 `redelegated`, `deps_overflow_to_root`, `refused_designated`, and the
 placement's `place_evaluations`, `place_delegated`, `place_recalled`,
-`place_skipped_cooldown` and
-`place_skipped_unreachable`.
+`place_skipped_cooldown`,
+`place_skipped_unreachable` and `place_skipped_designated` (a node that holds
+designations only, or has one pending, takes no placed grant).
 
 ## Compatibility
 
@@ -1124,8 +1130,8 @@ table of the old shape fails loudly instead of decoding as something else.
 
 Check `delegation.placement`: the writer needs 70% of the subtree's ops
 and the subtree at least 200 ops per 30 s window. It must be connected
-to the root over P2P and write-eligible, and must not already hold a
-whole delegation. A recently recalled directory waits out the cool-down
+to the root over P2P and write-eligible, and must not hold designations
+only (`place_skipped_designated`). A recently recalled directory waits out the cool-down
 (`place_skipped_cooldown`).
 
 ### A rename between two directories is slow

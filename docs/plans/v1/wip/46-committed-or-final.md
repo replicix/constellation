@@ -1004,8 +1004,14 @@ The M1.0 work breakdown's eight questions, each answered as recommended:
   implies the root has a peer in budget, so the root should have a
   backup). See the ADR draft note below.
 - **One commit rule per stream.** `Final` only when every grant of the
-  stream is non-stealable; a node with a group commits designated-subtree
-  rows by its group too; sticky and placed grants never mix in one stream.
+  stream is non-stealable; sticky and placed grants never mix in one stream.
+  A stream never mixes grant kinds (maintainer decision 2026-11-07): it
+  holds designations only (final, never reclaimed by the TTL, the placement
+  or a cross-subtree recall) or stealable grants only (group-committed,
+  reclaimed whole). Designating on a node that has a stealable stream first
+  recalls that stream, then the designation opens the node's own stream; a
+  stealable grant to a node that holds designations only (or has one pending)
+  is refused, and the placement skips such a node.
 - **A grant is honoured once its `DelegateNode` record is committed** by
   the root's configuration (the archive when the root has no group), for
   placed grants too: the premise ADR-43's no-tail rule needs.

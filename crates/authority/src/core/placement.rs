@@ -240,6 +240,17 @@ impl Core {
         false
     }
 
+    /// `node` holds a designated stream, or a designation to it is pending
+    /// (`DelegationState::designating`).
+    fn place_node_designated(&self, node: NodeId) -> bool {
+        self.dl.designating.values().any(|n| *n == node)
+            || self
+                .dl
+                .gens
+                .values()
+                .any(|g| !g.ended && g.node == node && g.designated())
+    }
+
     fn place_evaluate(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         self.stats.place_evaluations += 1;
         let per_dir = self.pl.per_dir();
@@ -373,6 +384,13 @@ impl Core {
                 .is_some_and(|until| *until > now.wait)
             {
                 self.stats.place_skipped_cooldown += 1;
+                continue;
+            }
+            // A node that holds designations only takes nothing a recall can
+            // reclaim (a stream never mixes grant kinds): skipped, not asked
+            // again every round; the same while a designation to it waits.
+            if self.place_node_designated(node) {
+                self.stats.place_skipped_designated += 1;
                 continue;
             }
             if !self.place_eligible(now, node, out) {

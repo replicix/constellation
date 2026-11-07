@@ -1356,6 +1356,9 @@ pub struct Stats {
     pub place_recalled: u64,
     pub place_skipped_cooldown: u64,
     pub place_skipped_unreachable: u64,
+    /// Placement: candidates skipped because the node holds designations
+    /// only, or one is pending (a stream never mixes grant kinds).
+    pub place_skipped_designated: u64,
     /// Delegate: ReadIndex answered for its subtree, read grants given.
     pub deleg_read_index_served: u64,
     pub deleg_read_grants: u64,

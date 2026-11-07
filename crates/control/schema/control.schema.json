@@ -1915,6 +1915,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "place_skipped_designated": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "place_skipped_unreachable": {
           "format": "uint64",
           "minimum": 0,
@@ -2207,6 +2212,7 @@
         "place_recalled",
         "place_skipped_cooldown",
         "place_skipped_unreachable",
+        "place_skipped_designated",
         "read_index_served",
         "read_grants"
       ],

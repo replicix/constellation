@@ -475,6 +475,7 @@ pub struct DelegationReport {
     pub place_recalled: u64,
     pub place_skipped_cooldown: u64,
     pub place_skipped_unreachable: u64,
+    pub place_skipped_designated: u64,
     pub read_index_served: u64,
     pub read_grants: u64,
     // ---- plan 41 R2 (appended) ----

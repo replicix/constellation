@@ -930,6 +930,13 @@ impl Core {
                 replica.resolve_ownership(&keys)
             {
                 if d.node == self.cfg.node_id {
+                    // A subtree the stream grew by that this node does not
+                    // honour yet (record uncommitted, handoff of the root's
+                    // grants and its grace not here): the root's still, and
+                    // the stream's renewal does not cover it. Wait a tick.
+                    if self.deleg_parked_for(&keys, d.gen, replica) {
+                        return Route::Unknown;
+                    }
                     return match self.deleg_mine_until(d.gen) {
                         Some(until) if now.honour < until => Route::Me {
                             cap_ms: until.since(now.honour) - self.lock_margin_ms(),
@@ -6736,11 +6743,15 @@ impl Core {
         gen: u64,
         replica: &dyn Replica,
     ) -> constellation_meta::locks::LockHandback {
-        let dirs = self
-            .dl
-            .mine
-            .get(&gen)
-            .map(|d| d.dirs.iter().copied().collect::<Vec<_>>());
+        // Honoured and parked subtrees alike: the floor of a parked one
+        // is the root's to keep, and joining it costs nothing.
+        let dirs = self.dl.mine.get(&gen).map(|d| {
+            d.dirs
+                .iter()
+                .chain(d.grown.keys())
+                .copied()
+                .collect::<Vec<_>>()
+        });
         // What a first recall took out of the table a repeated one hands back
         // again (L3: the root sends a recall again when its answer is lost;
         // it would otherwise end the generation by drain with no grants,

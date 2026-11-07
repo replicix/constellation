@@ -525,7 +525,7 @@ impl Core {
                     .get(ino)
                     .is_some_and(|until| *until > now.wait)
                     && self.deleg_read_owner(now, *ino, None, replica).is_none()
-                    && !self.under_pending_designation(*ino, replica)
+                    && !self.under_pending_designation(now, *ino, replica)
             })
             .collect();
         if inos.is_empty() {
@@ -566,7 +566,7 @@ impl Core {
             .blocked
             .get(&ino)
             .is_some_and(|until| *until > now.wait)
-            || self.under_pending_designation(ino, replica)
+            || self.under_pending_designation(now, ino, replica)
         {
             return None;
         }
