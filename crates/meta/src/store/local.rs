@@ -150,6 +150,12 @@ pub enum GroupOn {
     /// The delegation's group (C2): a recorded backup's tail, or the root's
     /// appended row.
     Delegate,
+    /// A continuation epoch's hold with two or more members (plan 46 M1.4):
+    /// the owner's journal and one member's store copy of the stream-ahead
+    /// (`StreamAheadAck`). The version is the continuation epoch's number:
+    /// no lease CAS moves a hold's membership, the epoch is the
+    /// configuration.
+    Hold,
 }
 
 /// Plan 46 M1.1 step 3 (§5.1): the commit rule a journal row was written
@@ -219,6 +225,17 @@ impl RowCommit {
 
     pub fn is_final(self) -> bool {
         matches!(self, RowCommit::Final)
+    }
+
+    /// A row of a multi-member epoch's hold (plan 46 M1.4).
+    pub fn is_hold(self) -> bool {
+        matches!(
+            self,
+            RowCommit::Group {
+                on: GroupOn::Hold,
+                ..
+            }
+        )
     }
 
     /// A group that waits for the archive alone (no member listed).
@@ -305,6 +322,10 @@ impl RowCommit {
                 on: GroupOn::Delegate,
             } => tag(3, config_version),
             RowCommit::Final => tag(4, 0),
+            RowCommit::Group {
+                config_version,
+                on: GroupOn::Hold,
+            } => tag(5, config_version),
         }
     }
 
@@ -316,6 +337,7 @@ impl RowCommit {
             2 => RowCommit::group(v, GroupOn::Root),
             3 => RowCommit::group(v, GroupOn::Delegate),
             4 => RowCommit::Final,
+            5 => RowCommit::group(v, GroupOn::Hold),
             tag => panic!("unknown row commit tag {tag} in {bits:#x}"),
         }
     }

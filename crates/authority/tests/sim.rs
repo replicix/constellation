@@ -6084,6 +6084,19 @@ fn sweep_config() {
                 core
             });
         }
+        // Plan 46 M1.4 step 2: `AUTHORITY_SIM_HOLD_ANSWERS_UNCOMMITTED=1` is
+        // the structural control of the hold's commit rule
+        // (`Config::hold_answers_uncommitted`): a hold answers from its
+        // owner's disk as before, and `strict_commit` must fail on the flex
+        // configurations.
+        if std::env::var("AUTHORITY_SIM_HOLD_ANSWERS_UNCOMMITTED").is_ok_and(|v| v == "1") {
+            let inner = c.core.clone();
+            c.core = std::sync::Arc::new(move |id, inc| {
+                let mut core = inner(id, inc);
+                core.hold_answers_uncommitted = true;
+                core
+            });
+        }
         // L3: `AUTHORITY_SIM_DROP_RECALLS=<n>` makes every node, as a root,
         // lose the first send of every nth recall it starts
         // (`Config::delegation_recall_drop_every`), and

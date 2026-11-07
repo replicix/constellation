@@ -959,6 +959,9 @@ fn row_is_class(row: constellation_meta::RowCommit, c: RowCommit) -> bool {
                 ..
             }
         ),
+        RowCommit::Group {
+            on: GroupOn::Hold, ..
+        } => row.is_hold(),
         RowCommit::Final => row.is_final(),
     }
 }
@@ -1282,7 +1285,27 @@ fn classify(
             return Some(Judged::Final);
         }
         if g == 0 && st.epoch_held {
-            detail.push("non-stealable: epoch hold owner".into());
+            // Plan 46 M1.4 step 2: the hold is a group of the owner and a
+            // member: committed once a member's store holds the row (as
+            // streamed speculation of the hold's epoch, through the row's
+            // last seq), not on the owner's disk alone.
+            let epoch = st.epoch.unwrap_or(0);
+            let member = o.stores.lock().unwrap().iter().find_map(|(n, m)| {
+                (*n != answerer
+                    && Replica::streamed_tip(&**m, epoch)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|tip| tip >= t.last))
+                .then_some(*n)
+            });
+            if let Some(n) = member {
+                detail.push(format!(
+                    "hold-group: node {n}'s store holds the hold's journal through {}",
+                    t.last
+                ));
+                return Some(Judged::Group);
+            }
+            detail.push("non-stealable: epoch hold owner, no member holds it".into());
             return Some(Judged::Final);
         }
     }
@@ -1612,12 +1635,22 @@ pub struct RowVersions {
     judged_class: BTreeMap<(NodeId, u64), constellation_meta::RowCommit>,
     /// Re-tags judged (plan 46 M1.1 review, SHOULD-1).
     pub retags: usize,
+    /// Plan 46 M1.4 step 2: the continuation epochs a node's core has held
+    /// as a hold. A hold's rows carry the epoch's number as their version
+    /// (the epoch is the configuration; no lease CAS moves a hold's
+    /// membership), so the hold's configuration is "an epoch some node held".
+    hold_epochs: std::collections::BTreeSet<u64>,
     pub checked: usize,
     pub unstamped: usize,
     pub violations: Vec<String>,
 }
 
 impl RowVersions {
+    /// `node`'s core holds the hold of continuation epoch `epoch`.
+    pub fn hold_held(&mut self, epoch: u64) {
+        self.hold_epochs.insert(epoch);
+    }
+
     pub fn lease_landed(&mut self, epoch: u64, version: u64) {
         self.lease_top.insert(epoch, version);
     }
@@ -1687,6 +1720,13 @@ impl RowVersions {
             self.retags += 1;
             self.judged_class.insert((node, row.first), row.class);
             match (before.config_version(), row.class.config_version()) {
+                // Plan 46 M1.4 step 2: a row answered in a hold is re-tagged
+                // the hold's (an older configuration's row answered by the
+                // hold's rule), and a hold's row answered after it ended is
+                // re-tagged by the node's rule then: the hold's epoch is a
+                // configuration of its own.
+                (Some(_), Some(_)) if before.is_hold() => {}
+                (Some(_), Some(_)) if row.class.is_hold() => rejudge.push(row.first),
                 (None, _) => rejudge.push(row.first),
                 (Some(was), Some(now)) if was == now => {}
                 (Some(_), None) => {}
@@ -1747,6 +1787,11 @@ impl RowVersions {
                     on: constellation_meta::GroupOn::Root,
                     ..
                 } => in_lease,
+                // The hold's configuration is its epoch's number.
+                constellation_meta::RowCommit::Group {
+                    on: constellation_meta::GroupOn::Hold,
+                    ..
+                } => self.hold_epochs.contains(&v),
                 // A delegate's archive row with no group: version 0.
                 constellation_meta::RowCommit::Group {
                     on: constellation_meta::GroupOn::Archive,

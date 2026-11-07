@@ -2877,6 +2877,9 @@ impl Driver {
             .held
             .as_ref()
             .map_or(lease.last_config_version, |(l, _)| l.config_version);
+        if let Some(epoch) = lease.epoch_hold() {
+            self.oracles.row_versions.lock().unwrap().hold_held(epoch);
+        }
         let tip = self.meta.journal_tip().unwrap_or(0);
         // A re-tag moves no tip: judge again when one changed a row.
         let retags = constellation_meta::Meta::reclass_changes();

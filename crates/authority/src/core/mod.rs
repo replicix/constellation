@@ -342,6 +342,17 @@ pub struct Config {
     /// Pre-S3 stream-ahead sends to a subscriber are at least this far
     /// apart; the rows that become durable meanwhile go in one batch.
     pub stream_ahead_holdoff_ms: u64,
+    /// Plan 46 M1.4 step 2: a batch of an epoch hold's stream-ahead that a
+    /// member has not acknowledged within this long is sent again, from the
+    /// member's acknowledged seq (the member's store takes it idempotently).
+    /// The hold's answers wait for a member's ack, so a batch lost on the
+    /// way must not park them for the epoch's life.
+    pub hold_resend_ms: u64,
+    /// Plan 46 M1.4 step 2's structural control, never set in production
+    /// (`AUTHORITY_SIM_HOLD_ANSWERS_UNCOMMITTED=1`): a hold answers from the
+    /// owner's disk as before (`Final`), without a member's copy. The
+    /// simulation's `strict_commit` must fail with it on the flex configs.
+    pub hold_answers_uncommitted: bool,
     /// `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` (default 1000): a backup
     /// that makes no acknowledgement progress for this long is removed by
     /// a lease CAS before the holder acknowledges anything further —
@@ -748,6 +759,8 @@ impl Config {
             delegation_backed_gens_max: usize::MAX,
             backup_max_inflight: 8,
             stream_ahead_holdoff_ms: 5,
+            hold_resend_ms: 250,
+            hold_answers_uncommitted: false,
             backup_ack_timeout_ms: 1_000,
             backup_slow_max_ms: 10_000,
             backup_takeover_ms: 1_500,
@@ -1784,6 +1797,9 @@ pub struct Stats {
     pub hold_acks: u64,
     pub hold_ack_wait_ms: u64,
     pub hold_acks_ignored: u64,
+    /// Plan 46 M1.4 step 2: batches of the hold's stream-ahead sent again
+    /// to a member that had not acknowledged them.
+    pub hold_resends: u64,
 }
 
 /// The log cursor and ship bookkeeping (`Shipper::PartState` + `SpoolInfo`).
@@ -1968,6 +1984,9 @@ enum Timer {
     /// Plan 30 §M9 round 2: the pre-S3 stream-ahead hold-off (batches
     /// the rows that became durable meanwhile into one send).
     StreamAhead,
+    /// Plan 46 M1.4 step 2: resend the hold's stream-ahead to a member
+    /// that has not acknowledged it.
+    HoldResend,
     PromiseWait,
     PromiseWatch,
     DelegExpiry(u64),
@@ -2035,6 +2054,7 @@ impl Timer {
             Timer::BackupTick => TimerKind::BackupTick,
             Timer::BackupWatch => TimerKind::BackupWatch,
             Timer::StreamAhead => TimerKind::BackupTick,
+            Timer::HoldResend => TimerKind::BackupTick,
             Timer::PromiseWait => TimerKind::PromiseWait,
             Timer::PromiseWatch => TimerKind::PromiseWatch,
             Timer::DelegExpiry(_) => TimerKind::DelegExpiry,
@@ -3314,6 +3334,7 @@ impl Core {
             Timer::StreamAhead => {
                 self.on_stream_ahead_timer(now, replica, out);
             }
+            Timer::HoldResend => self.on_hold_resend_timer(now, replica, out),
             Timer::BackupWatch => {
                 self.bk.watch_timer = None;
                 self.on_backup_watch(now, out);

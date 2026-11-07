@@ -68296,3 +68296,73 @@ out: a moved schedule, no install put off in it).
 
 Gates (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (lib and integration), authority lib (1,080), engine lib (953), control,
 release authority sim suite 422 passed, 0 failed, 12 ignored.
+
+### Plan 46 M1.4 step 2 (the epoch hold's commit rule)
+
+**What landed.** An epoch hold with two or more members is the group of its owner and one member: `root_rule` gives `Group { version: epoch, members: 1,
+on: GroupOn::Hold }` (new `GroupOn::Hold`, bits tag 5; the version is the continuation epoch's number, Q1). `durable_jseq_cfg` in such a hold is the
+highest `hold_acked` of the epoch the node owns; `park_durable`, the fast path's published durable (`lone_ok` false, so the path closes: `ack_gated`)
+and the remote answer's re-tag (`journaled_answer_class_for`: a row of an earlier configuration answered here is re-tagged the hold's) follow it. A
+one-member epoch stays `Final` and answers at once. `Config::hold_answers_uncommitted` (`AUTHORITY_SIM_HOLD_ANSWERS_UNCOMMITTED=1`) restores today's
+answer. Deleted: the hold's `Final` for multi-member epochs. `durable_jseq_cfg`'s `u64::MAX` branch stays for the one-member epoch and the knob.
+`config_committed_jseq` still counts the hold's journal for a delegate's row (step 3 moves it to the member-acked seq).
+
+**A hold's end.** The hold's acks are forgotten when it ends, so a row journaled before or in it that no member acknowledged must not be answered
+as a lone node's (the first sweep: hundreds of `flex` seeds, "claims a commit, judged singleton"). `hold_end_tip` (the journal tip when the hold
+ended, until the archive carries it) makes `park_durable` wait for the archive or the group of the configuration then in force
+(`left_by_hold`), and `settled_outcome` (the client deadline) does not take such a row in the journal for the log's outcome. Without the second
+a parked own answer was given at its deadline "from the log" (`flex-crash` 744).
+
+**Liveness (the step 1 addendum).** The owner streams each row once, so a member that dropped a batch never acked. `hold_resend_ms` (250 ms):
+a batch no member has acknowledged for that long is sent again from the member's acknowledged seq (one batch per member and round, timer
+`HoldResend`, re-armed while anything is unacknowledged; counter `stats.hold_resends`). The member side takes the resend after a lost
+cursor: in an open epoch a missing or older-epoch `ahead_next` restarts after what its store holds of the epoch (or at the batch's first row when
+the log carries the rows before it) instead of parking the batch for a segment that no hold ships. A member that never answers (partition) parks the
+hold's answers until the client's deadline or the hold's end, as the plan says; only latency degrades.
+
+**Oracle.** `row_version_matches_config` judges a `Hold` row's version as an epoch some node held (`hold_held`); a re-tag into or out of a hold is
+not a version change. `classify` judges a hold owner's answer `Group` when another node's store holds the hold's journal through the row's last
+seq (`streamed_tip`), `Final` otherwise.
+
+**Tests.** core `hold_ack`: `a_hold_with_a_member_answers_after_the_members_ack` (own and remote park until a member's ack; a node outside the
+epoch counts for nothing), `a_one_member_hold_answers_at_once`, `the_knob_restores_the_answer_from_the_owners_disk`,
+`a_batch_the_member_dropped_is_resent_and_the_answer_settles`, `a_member_with_a_lost_cursor_takes_the_resend_in_an_open_epoch`; two older core
+tests that assumed a hold answers locally now wait for a member (`a_backup_lease_is_carried_only_with_every_backup_a_member`,
+`an_outage_during_a_release_that_ends_kept_serves_writes`).
+
+**Fail-before** (release, ×2,000, `+commit`, same binary): with the knob `flex` fails 71 and `flex-crash` 39 seeds (the hold's `Final`, I1 "shadow
+installed for an answer not said to be committed"); without it `flex` 7 and `flex-crash` 7, none of them I1 hold.
+
+**Sweeps** (×2,000 `+commit`; failing seeds, base = this branch without the step; all remaining are the class claim "claims archive_waits, judged
+singleton" or the delegated I1 below):
+
+| configuration | base | step 2 | note |
+|---|---|---|---|
+| `flex` | 71 | 7 | class claim, all 7 also fail on base and with the knob |
+| `flex-crash` | 39 | 7 | class claim, same |
+| `flex-tight` | 57 | 11 | class claim (7 also on base; 623, 1323, 1359, 1655 shifted draws, same shape) |
+| `flex-backup`, `flex-taker-ahead`, `flex-promiser-restart-step-forward`, `flex-zero` | 72, 40, 113, 0 | 0, 0, 0, 0 | |
+| `delegated-epoch` | 57 | 6 | 5 class claim, 1 I1 (983: a delegate's answer counted the root's appended copy after the hold ended: step 3) |
+| `locks-unlinked-delegated-blips` | 5 | 2 | 1 class claim (159), 1 I1 (the delegated seed 351 shape, step 3) |
+
+The remaining class claims are not the hold's: a parked answer of a row journaled `Archive` (or a backed group) in an earlier tenure is released
+when the node takes its lease again, with the version of the replaced configuration (no downgrade: `cfg_seen` was cleared while the lease was
+not held, so the closed configuration's span is lost); no hold is open in their traces (flex 294, 696, 782). They are the lease-path
+configuration change of M1.1 step 5 / M1.3, not step 2, and the knob run fails the same seeds. `delegated-epoch` is therefore not clean: its
+`strict_commit` exemption stays until step 3.
+
+**Harness** (release, `--s3-backend docker`, build box): `continuation-epoch`, `epoch-member-lost` PASSED; `epoch-member-dies-with-chunk` seeds 42,
+43, 44 PASSED (46.4, 46.6, 46.7 s). The harness has no S3-outage own-op latency row.
+
+**Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (lib, integration), control, authority lib 1,082, engine lib
+953, release sim suite 421 passed, 0 failed, 12 ignored.
+
+**Perf** (quiet timing box, release builds of this branch without (A) and with (B) the step). `vfs-bench` (3 runs each, A B B A A B), dispatch
+overhead median ns A / B: mock getattr 102 / 107, lookup 103 / 99, read 97 / 98; observer getattr 84 / 84; view getattr 92 / 104, lookup 92 / 61,
+read 91 / 111; all far under the 1,000 ns limit, the spread is the run-to-run noise. `ack-latency` topology 1, ABBA, 16 rounds, 300 samples,
+median p50 / p90 us A / B, ext4: create 90 / 117, 87 / 105; write 3130 / 3997, 3123 / 3995; rename 81 / 111, 88 / 117; unlink 61 / 95, 64 / 94; chmod
+42 / 69, 36 / 63. xfs: create 87 / 107, 90 / 113; write 1954 / 2066, 1937 / 2058; rename 73 / 94, 75 / 99; unlink 58 / 90, 64 / 91; chmod 39 / 71,
+35 / 61. btrfs: create 88 / 118, 86 / 113; write 3085 / 3796, 3091 / 3777; rename 87 / 115, 85 / 105; unlink 69 / 99, 65 / 94; chmod 41 / 70, 40 / 68.
+tmpfs: create 90 / 112, 83 / 103; write 128 / 194, 125 / 188; rename 75 / 110, 73 / 106; unlink 59 / 96, 59 / 94; chmod 36 / 66, 34 / 61. Neutral
+on all four (a first 4-round pass showed B 20 to 25 us slower on xfs and tmpfs rename, unlink and chmod; 16 rounds do not: noise). The hold's own
+answers (+1 LAN round trip to a member) are not measured: the harness has no S3-outage own-op latency row, and topology 1 has no hold.

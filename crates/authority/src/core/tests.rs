@@ -7232,6 +7232,20 @@ fn submit_create(holder: &mut Harness, seq: u64, name: &str) {
     ));
 }
 
+/// A create whose answer may wait (a hold with members answers after a
+/// member's ack): the rid and what the step emitted.
+fn create_nowait(h: &mut Harness, seq: u64, name: &str) -> (Rid, Vec<Action>) {
+    let rid = h.rid(seq);
+    let op = h.create(name);
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+        tag: Default::default(),
+    });
+    (rid, out)
+}
+
 fn segment_frame(req: OpId, n: u64, seq: Seq, payload: Vec<u8>) -> PeerMsg {
     PeerMsg::LogStream {
         req,
@@ -10444,14 +10458,15 @@ mod epoch_rules {
             AckPolicy::Local,
             "an epoch acknowledges locally"
         );
-        // Plan 30 §M10 (rebase onto M9 round 2): and nothing gates it — not
-        // the held lease's backups, nor a candidate being brought up.
+        // Plan 30 §M10 (rebase onto M9 round 2): the held lease's backups and
+        // a candidate being brought up gate nothing. Plan 46 M1.4 step 2: the
+        // hold is a group of its own, so a member's copy gates it.
         h.core.ack.candidate = Some(3);
         assert!(h.core.lease.backups().is_empty());
-        assert_eq!(h.core.durable_jseq(), u64::MAX);
+        assert_eq!(h.core.durable_jseq(), 0, "no member holds a row yet");
         assert!(
-            !h.core.ack_gated(),
-            "the FUSE fast path is open in an epoch"
+            h.core.ack_gated(),
+            "the FUSE fast path is closed behind the hold's group"
         );
         let rid = h.rid(1);
         let op = h.create("in-epoch");
@@ -10461,12 +10476,22 @@ mod epoch_rules {
             op,
             tag: Default::default(),
         });
+        assert!(replies(&out).is_empty(), "parked for a member: {out:?}");
+        let epoch_no = h.core.lease.epoch().expect("the hold's epoch");
+        let tip = Replica::journal_tip(&h.meta);
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::StreamAheadAck {
+                epoch: epoch_no,
+                through: tip,
+            },
+        });
         assert!(
             matches!(
                 replies(&out).as_slice(),
                 [(_, ClientReply::Outcome(MutateOutcome::Accepted { .. }))]
             ),
-            "acknowledged at once: {out:?}"
+            "acknowledged by a member's copy: {out:?}"
         );
 
         let mut h = holder_with(AckPolicy::Local, Vec::new());
@@ -13358,7 +13383,8 @@ mod m10 {
         );
         assert_eq!(h.core.lease.epoch_hold(), Some(1));
         assert_eq!(h.meta.holder_epoch(), 1, "capture is on under the hold");
-        submit_create(&mut h, 1, "under-the-hold");
+        // (A hold with members answers after a member's ack: not here.)
+        create_nowait(&mut h, 1, "under-the-hold");
         let counts = h.meta.speculation_counts().unwrap();
         assert_eq!(counts.local, 1, "the epoch write is a captured Local row");
         assert_eq!(
@@ -35048,6 +35074,18 @@ fn an_outage_during_a_release_that_ends_kept_serves_writes() {
         rid,
         op,
         tag: Default::default(),
+    });
+    // Served, not refused: journaled, and (plan 46 M1.4 step 2) answered once a
+    // member holds the row.
+    assert!(replies(&out).is_empty(), "{out:?}");
+    let epoch_no = h.core.lease.epoch().expect("the hold's epoch");
+    let tip = Replica::journal_tip(&h.meta);
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::StreamAheadAck {
+            epoch: epoch_no,
+            through: tip,
+        },
     });
     assert!(
         replies(&out).iter().any(|(r, reply)| *r == rid
@@ -59220,16 +59258,58 @@ mod hold_ack {
             ..Default::default()
         };
         for i in 0..rows {
-            submit_create(&mut h, i + 1, &format!("f{i}"));
+            create_nowait(&mut h, i + 1, &format!("f{i}"));
         }
         h
     }
 
-    fn ack(h: &mut Harness, from: NodeId, epoch: Epoch, through: u64) {
+    fn accepted_to_client(out: &[Action], rid: Rid) -> bool {
+        replies(out).iter().any(|(r, reply)| {
+            *r == rid && matches!(reply, ClientReply::Outcome(MutateOutcome::Accepted { .. }))
+        })
+    }
+
+    fn remote_create(h: &mut Harness, node: NodeId, seq: u64, name: &str) -> (Rid, Vec<Action>) {
+        let rid = Rid {
+            node,
+            incarnation: 1,
+            seq,
+        };
+        let op = h.create(name);
+        let out = h.step(Event::Peer {
+            from: node,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(900 + seq),
+                rid,
+                op,
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: false,
+            },
+        });
+        (rid, out)
+    }
+
+    fn accepted_to_peer(out: &[Action], to: NodeId) -> bool {
+        sends(out).iter().any(|(n, m)| {
+            *n == to
+                && matches!(
+                    m,
+                    PeerMsg::MutateReply {
+                        outcome: MutateOutcome::Accepted { .. },
+                        ..
+                    }
+                )
+        })
+    }
+
+    fn ack(h: &mut Harness, from: NodeId, epoch: Epoch, through: u64) -> Vec<Action> {
         h.step(Event::Peer {
             from,
             msg: PeerMsg::StreamAheadAck { epoch, through },
-        });
+        })
     }
 
     fn tip(h: &Harness) -> u64 {
@@ -59409,5 +59489,157 @@ mod hold_ack {
         ack(&mut h, 3, 1, tip);
         assert_eq!(h.core.stats.hold_ack_wait_ms, 40 * n2 + 50 * n3);
         assert_eq!(h.core.stats.hold_acks, 2);
+    }
+
+    /// Plan 46 M1.4 step 2: a two-member epoch's answer, to its own client
+    /// and to another node, waits for a member's `StreamAheadAck`; a
+    /// one-member epoch answers at once; the knob restores today's answer.
+    #[test]
+    fn a_hold_with_a_member_answers_after_the_members_ack() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let mut h = owner(0);
+        h.core.pr.epoch_members = vec![1, 2];
+        assert_eq!(
+            h.core.root_rule(Asker::Own),
+            CommitRule::Group {
+                version: 1,
+                members: 1,
+                on: GroupOn::Hold
+            }
+        );
+        // Its own client: parked, with the fast path closed behind it.
+        assert!(h.core.ack_gated());
+        let (rid, out) = create_nowait(&mut h, 1, "own");
+        assert!(!accepted_to_client(&out, rid), "{out:?}");
+        assert_eq!(
+            Replica::journal_class_of_rid(&h.meta, rid).map(|(_, c)| c),
+            Some(RowCommit::group(1, GroupOn::Hold))
+        );
+        // Another node's op: parked too.
+        let (_, out) = remote_create(&mut h, 3, 1, "remote");
+        assert!(!accepted_to_peer(&out, 3), "{out:?}");
+        let tip = tip(&h);
+        // A node outside the epoch's ack counts for nothing.
+        let out = ack(&mut h, 4, 1, tip);
+        assert!(!accepted_to_client(&out, rid) && !accepted_to_peer(&out, 3));
+        // A member's ack through the first row answers the own client only.
+        let txs = Replica::journal_txs_from(&h.meta, 1, 100);
+        assert!(txs.len() >= 2, "{txs:?}");
+        let first = txs[0].last;
+        let out = ack(&mut h, 2, 1, first);
+        assert!(accepted_to_client(&out, rid), "{out:?}");
+        assert!(!accepted_to_peer(&out, 3), "{out:?}");
+        // The rest through the tip: the remote answer leaves.
+        let out = ack(&mut h, 2, 1, tip);
+        assert!(accepted_to_peer(&out, 3), "{out:?}");
+        assert!(h.core.stats.hold_acks >= 2);
+    }
+
+    #[test]
+    fn a_one_member_hold_answers_at_once() {
+        use constellation_meta::RowCommit;
+        let mut h = owner(0);
+        h.core.pr.epoch_members = vec![1];
+        assert_eq!(h.core.root_rule(Asker::Own), CommitRule::Final);
+        assert!(!h.core.ack_gated());
+        let (rid, out) = create_nowait(&mut h, 1, "own");
+        assert!(accepted_to_client(&out, rid), "{out:?}");
+        assert_eq!(
+            Replica::journal_class_of_rid(&h.meta, rid).map(|(_, c)| c),
+            Some(RowCommit::FINAL)
+        );
+        let (_, out) = remote_create(&mut h, 3, 1, "remote");
+        assert!(accepted_to_peer(&out, 3), "{out:?}");
+    }
+
+    #[test]
+    fn the_knob_restores_the_answer_from_the_owners_disk() {
+        let mut h = owner(0);
+        h.core.cfg.hold_answers_uncommitted = true;
+        h.core.pr.epoch_members = vec![1, 2];
+        assert_eq!(h.core.root_rule(Asker::Own), CommitRule::Final);
+        let (rid, out) = create_nowait(&mut h, 1, "own");
+        assert!(accepted_to_client(&out, rid), "{out:?}");
+        let (_, out) = remote_create(&mut h, 3, 1, "remote");
+        assert!(accepted_to_peer(&out, 3), "{out:?}");
+    }
+
+    /// A batch the member never got is sent again from what it
+    /// acknowledged, and the answer leaves with the ack of the resend.
+    #[test]
+    fn a_batch_the_member_dropped_is_resent_and_the_answer_settles() {
+        let mut h = owner(0);
+        h.core.pr.epoch_members = vec![1, 2];
+        let (rid, out) = create_nowait(&mut h, 1, "own");
+        let batches = |out: &[Action]| -> Vec<(NodeId, usize)> {
+            sends(out)
+                .into_iter()
+                .filter_map(|(to, m)| match m {
+                    PeerMsg::StreamAhead { txs, .. } => Some((to, txs.len())),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The stream-ahead went out (and is lost on the way).
+        let sent = batches(&out);
+        assert!(sent.iter().any(|(to, n)| *to == 2 && *n > 0), "{sent:?}");
+        let resend = h.core.ack.hold_resend_timer.expect("a resend is armed");
+        // Before the interval nothing is sent again.
+        h.advance(100);
+        let out = h.step(Event::Timer { id: resend });
+        assert!(batches(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.hold_resends, 0);
+        let resend = h.core.ack.hold_resend_timer.expect("re-armed");
+        h.advance(h.core.cfg.hold_resend_ms);
+        let out = h.step(Event::Timer { id: resend });
+        let again = batches(&out);
+        assert!(again.iter().any(|(to, n)| *to == 2 && *n > 0), "{again:?}");
+        assert_eq!(h.core.stats.hold_resends, 1);
+        assert!(!accepted_to_client(&out, rid));
+        assert!(h.core.ack.hold_resend_timer.is_some(), "until it is acked");
+        // The member holds it now: the ack answers, and nothing is resent.
+        let tip = tip(&h);
+        let out = ack(&mut h, 2, 1, tip);
+        assert!(accepted_to_client(&out, rid), "{out:?}");
+        assert!(h.core.ack.hold_sent[&2].is_empty());
+        assert_eq!(h.core.stats.hold_resends, 1);
+    }
+
+    /// A member whose cursor was lost (a dropped batch, a restart) takes the
+    /// resend: it restarts after what its store holds of the open epoch and
+    /// acknowledges, instead of parking the batch for a segment that no
+    /// hold ever ships.
+    #[test]
+    fn a_member_with_a_lost_cursor_takes_the_resend_in_an_open_epoch() {
+        let (mut owner, mut sub, req) = stream_pair();
+        submit_create(&mut owner, 1, "a");
+        let (p1, through) = holder_ship(&mut owner, 1, 100);
+        sub.step(Event::Peer {
+            from: 1,
+            msg: segment_frame(req, 1, 1, p1),
+        });
+        submit_create(&mut owner, 2, "b");
+        let txs = Replica::journal_txs_from(&owner.meta, through + 1, 100);
+        let last = txs.last().unwrap().last;
+        sub.core.ship.max_epoch = 1;
+        sub.core.epoch.open = true;
+        sub.core.bk.ahead_next = None;
+        let out = sub.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::StreamAhead {
+                epoch: 1,
+                base: 1,
+                txs,
+                committed: false,
+            },
+        });
+        let acked: Vec<u64> = sends(&out)
+            .into_iter()
+            .filter_map(|(_, m)| match m {
+                PeerMsg::StreamAheadAck { through, .. } => Some(*through),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(acked, vec![last], "{out:?}");
     }
 }

@@ -731,9 +731,20 @@ pub(crate) struct AckState {
     /// while it ran (sent when it fires).
     stream_ahead_timer: Option<TimerId>,
     stream_ahead_pending: bool,
+    /// Plan 46 M1.4 step 2: the timer that resends the hold's unacknowledged
+    /// batches ([`Core::on_hold_resend_timer`]).
+    pub(crate) hold_resend_timer: Option<TimerId>,
+    /// Plan 46 M1.4 step 2: an epoch hold was in force at the last event.
+    held_before: bool,
+    /// The journal tip when the last hold ended, until the archive carries
+    /// it: a row at or below it was journaled before or in the hold, and
+    /// answers by the archive or its group, never as a lone node's
+    /// ([`Core::park_durable`]); the hold's own acks are forgotten.
+    hold_end_tip: Option<u64>,
     /// Plan 46 M1.4 step 1, hold owner: the highest journal seq each epoch
     /// member acknowledged holding (`PeerMsg::StreamAheadAck`), for the
-    /// continuation epoch `hold_epoch`. Nothing reads it yet.
+    /// continuation epoch `hold_epoch`. The hold's commit rule reads it
+    /// (`durable_jseq_cfg`, step 2).
     pub(crate) hold_acked: BTreeMap<NodeId, u64>,
     hold_epoch: Option<Epoch>,
     /// Batches of the hold streamed to a member and not yet acknowledged:
@@ -1589,7 +1600,34 @@ impl Core {
         }
     }
 
+    /// Plan 46 M1.4 step 2: this node owns the hold of a continuation epoch
+    /// with at least one member besides itself, and answers by that group's
+    /// rule ([`CommitRule::Group`] on [`GroupOn::Hold`]). A one-member
+    /// epoch's hold is `Final`; `Config::hold_answers_uncommitted` keeps
+    /// today's answer from the owner's disk (the structural fail-before).
+    pub(crate) fn hold_group(&self) -> bool {
+        self.lease.epoch_held()
+            && !self.cfg.hold_answers_uncommitted
+            && self.pr.epoch_members.len() >= 2
+    }
+
+    /// The highest journal seq any member of the epoch has acknowledged
+    /// holding (`hold_acked`), of the epoch this node owns now.
+    fn hold_acked_through(&self) -> u64 {
+        if self.ack.hold_epoch != self.lease.epoch() {
+            return 0;
+        }
+        self.ack.hold_acked.values().copied().max().unwrap_or(0)
+    }
+
     fn durable_jseq_cfg(&self) -> u64 {
+        if self.hold_group() {
+            // Plan 46 M1.4 step 2: an epoch hold with two or more members
+            // is a group of the owner and one member: a row is committed
+            // once a member's store holds it (`StreamAheadAck`), the highest
+            // `hold_acked` of any member.
+            return self.hold_acked_through();
+        }
         if self.lease.epoch_held() {
             // Plan 30 §M10 (found by `node-leave` on M9's round 2): a
             // continuation epoch's hold acknowledges locally — nothing
@@ -1599,7 +1637,9 @@ impl Core {
             // here on the held lease's backups, a candidate or the
             // shipped watermark parked every acknowledgement for the
             // epoch's lifetime: the FUSE caller timed out, retried, and
-            // met its own first attempt (`EEXIST`).
+            // met its own first attempt (`EEXIST`). What is left of this
+            // branch is a one-member epoch's hold (`Final`: no member to
+            // wait for) and the knob `hold_answers_uncommitted`.
             return u64::MAX;
         }
         match self.lease.ack_policy() {
@@ -1642,10 +1682,16 @@ impl Core {
     /// `DelegateStreamAck.committed`): [`Self::durable_jseq`], except that a
     /// lone root's journal (`u64::MAX` outside an epoch hold) commits
     /// nothing beyond the archive (`shipped_through`). An epoch hold's
-    /// journal still counts until plan 46 M1.4 makes the hold a group.
+    /// journal still counts until plan 46 M1.4 step 3 counts it by the
+    /// member-acked seq.
     pub(crate) fn config_committed_jseq(&self) -> u64 {
+        if self.lease.epoch_held() {
+            // Still the journal's tip until step 3 counts a delegate's row
+            // by the member-acked seq.
+            return u64::MAX;
+        }
         match self.durable_jseq() {
-            u64::MAX if !self.lease.epoch_held() => self.ack.shipped_through,
+            u64::MAX => self.ack.shipped_through,
             d => d,
         }
     }
@@ -1871,16 +1917,24 @@ impl Core {
 
     /// Plan 43 C2 (§5.2): an answer resting on journal seq `jseq` may leave
     /// now. The archive carries it, or this node holds a continuation
-    /// epoch (never wait for S3 there: the hold is non-stealable, §11 Q3,
-    /// and S3 is what the epoch is without), or the gate is on and the
+    /// epoch with no member to wait for (never wait for S3 there: S3 is what
+    /// the epoch is without; with members the hold is a group, plan 46 M1.4,
+    /// and the row waits for a member's `StreamAheadAck`), or the gate is on and the
     /// group holds it. With the gate off the root is lone: its own client's
     /// answer leaves (as `Lone`), another node's (`remote`) waits for the
     /// archive — the lone shortcut is never taken for a remote, whatever
     /// class the row was parked under (a `RootGroup` row whose backup set
     /// emptied while it waited included).
     pub(crate) fn park_durable(&self, jseq: u64, remote: bool, shipped: u64) -> bool {
-        if self.archive_covers(jseq, shipped) || self.lease.epoch_held() {
+        if self.archive_covers(jseq, shipped) || (self.lease.epoch_held() && !self.hold_group()) {
             return true;
+        }
+        if !self.lease.epoch_held() && self.ack.hold_end_tip.is_some_and(|t| jseq <= t) {
+            // Plan 46 M1.4 step 2: journaled before or in a hold that has
+            // ended, and its acks are forgotten: the archive, or the group
+            // of the configuration in force, commits it. Never a lone
+            // node's answer on a row the hold left uncommitted.
+            return self.durable_jseq() != u64::MAX && self.durable_covers(jseq);
         }
         if self.durable_jseq() != u64::MAX {
             return self.durable_covers(jseq);
@@ -1945,6 +1999,14 @@ impl Core {
         }
     }
 
+    /// Plan 46 M1.4 step 2: journal seq `jseq` was journaled before or in a
+    /// hold that has ended and the archive has not carried it yet: its
+    /// answer waits for the archive or the group ([`Self::park_durable`]),
+    /// and the row in this node's journal is no outcome of the log.
+    pub(crate) fn left_by_hold(&self, jseq: u64) -> bool {
+        !self.lease.epoch_held() && self.ack.hold_end_tip.is_some_and(|t| jseq <= t)
+    }
+
     /// The `config_version` of the lease this node holds; while it holds none
     /// (a claim not yet adopted, a lease lost), of the one it last held (0:
     /// never).
@@ -1959,7 +2021,8 @@ impl Core {
 
     /// Plan 46 M1.1 step 2: the commit rule of this node's root
     /// configuration, for an answer to `asker`, looked up once. A
-    /// continuation epoch's hold is `Final`; under `ack=s3` the group has no
+    /// continuation epoch's hold with a member is the group of the owner and
+    /// one member (plan 46 M1.4), without one `Final`; under `ack=s3` the group has no
     /// member and the archive carries it; with a listed (or doubted) backup
     /// the group is the root's; while a backup is being had (a candidate, an
     /// eligible or not yet assessed peer) the archive; and otherwise nothing
@@ -1974,7 +2037,15 @@ impl Core {
             members: 0,
             on: GroupOn::Archive,
         };
-        if self.lease.epoch_held() {
+        if self.hold_group() {
+            // Plan 46 M1.4 step 2 (Q1): the epoch is the configuration, so
+            // its number is the version; one member's copy commits a row.
+            CommitRule::Group {
+                version: self.lease.epoch().unwrap_or(version),
+                members: 1,
+                on: GroupOn::Hold,
+            }
+        } else if self.lease.epoch_held() {
             CommitRule::Final
         } else if self.lease.ack_policy() == AckPolicy::S3 {
             archive
@@ -2085,7 +2156,9 @@ impl Core {
             // only if it is lone (the row re-tagged `Lone`, so its strand
             // follows the answer), from the archive otherwise (`flex-crash`
             // seed 39's shape, for the own client).
-            Some((first, class)) if class.is_final() && !self.lease.epoch_held() => {
+            Some((first, class))
+                if (class.is_final() || class.is_hold()) && !self.lease.epoch_held() =>
+            {
                 if self.root_lone() {
                     replica
                         .reclass_journal_tx(
@@ -2104,7 +2177,7 @@ impl Core {
                     constellation_meta::RowCommit::as_archive(class, self.root_config_version())
                 }
             }
-            Some((_, class)) if class.is_final() => class,
+            Some((_, class)) if class.is_final() || class.is_hold() => class,
             Some((
                 _,
                 constellation_meta::RowCommit::Group {
@@ -2120,7 +2193,7 @@ impl Core {
                 constellation_meta::RowCommit::Singleton { .. }
                 | constellation_meta::RowCommit::Final
                 | constellation_meta::RowCommit::Group {
-                    on: GroupOn::Archive,
+                    on: GroupOn::Archive | GroupOn::Hold,
                     ..
                 },
             )) => self.root_commit(Asker::Own),
@@ -2152,6 +2225,21 @@ impl Core {
         // vouches for it: non-stealable, whatever class the row was
         // journaled with before the hold, and the row re-tagged so (what a
         // deposition or `repair drop-held` does with it follows the answer).
+        if self.hold_group() {
+            // Plan 46 M1.4 step 2: the answer waits for a member's copy
+            // (`park_durable`); the row is the hold group's, tagged so (what
+            // a deposition does with it follows the answer). A row of an
+            // earlier configuration answered here is re-tagged to the hold's.
+            let want: constellation_meta::RowCommit = self.root_rule(asker).into();
+            if let Some((first, class)) = replica.journal_class_of_rid(rid) {
+                if class != want {
+                    replica.reclass_journal_tx(first, want).inspect_err(|error| {
+                        tracing::warn!(node = self.cfg.node_id, ?rid, %error, "could not re-tag a row answered in a hold: EIO");
+                    })?;
+                }
+            }
+            return Ok(want);
+        }
         if self.lease.epoch_held() {
             if let Some((first, class)) = replica.journal_class_of_rid(rid) {
                 if !class.is_final() {
@@ -2189,7 +2277,9 @@ impl Core {
             // held back behind a dead member's chunk, answered at a retry
             // after the hold as the hold's).
             Some((_, class)) if class.is_final() && self.lease.epoch_held() => class,
-            Some((_, class)) if class.is_final() => class.as_archive(self.root_config_version()),
+            Some((_, class)) if class.is_final() || class.is_hold() => {
+                class.as_archive(self.root_config_version())
+            }
             Some((
                 _,
                 constellation_meta::RowCommit::Group {
@@ -2204,7 +2294,7 @@ impl Core {
                 constellation_meta::RowCommit::Singleton { .. }
                 | constellation_meta::RowCommit::Final
                 | constellation_meta::RowCommit::Group {
-                    on: GroupOn::Archive,
+                    on: GroupOn::Archive | GroupOn::Hold,
                     ..
                 },
             )) => self.root_commit(asker),
@@ -2347,8 +2437,8 @@ impl Core {
         // no closed configuration still owes its end (`durable_jseq`: the
         // spans' caps): until the archive carries the journal through the
         // bump, a Singleton row waits like a gated one.
-        let lone_ok =
-            (self.root_lone() && self.durable_jseq() == u64::MAX) || self.lease.epoch_held();
+        let lone_ok = (self.root_lone() && self.durable_jseq() == u64::MAX)
+            || (self.lease.epoch_held() && !self.hold_group());
         if self.ack.reported != Some((gate, jseq, lost, class, lone_ok)) {
             self.ack.reported = Some((gate, jseq, lost, class, lone_ok));
             replica.set_durable(gate, jseq, lost, class, lone_ok);
@@ -3379,6 +3469,18 @@ impl Core {
         if self.stopped {
             return;
         }
+        if std::mem::replace(&mut self.ack.held_before, self.lease.epoch_held())
+            && !self.lease.epoch_held()
+        {
+            self.ack.hold_end_tip = Some(replica.journal_tip());
+        }
+        if self
+            .ack
+            .hold_end_tip
+            .is_some_and(|t| t <= self.ack.shipped_through)
+        {
+            self.ack.hold_end_tip = None;
+        }
         let holding = self.lease.ship_epoch(now, &self.cfg).is_some() && !self.lease.epoch_held();
         if !holding
             && self.lease.holds_unexpired(now, &self.cfg)
@@ -3430,6 +3532,11 @@ impl Core {
                 self.ack.hold_acked.clear();
                 self.ack.hold_epoch = None;
                 self.ack.hold_sent.clear();
+                if let Some(id) = self.ack.hold_resend_timer.take() {
+                    self.cancel_timer(id, out);
+                }
+            } else {
+                self.arm_hold_resend(now, out);
             }
             self.ack.acked_hwm = 0;
             self.report_durable(replica);
@@ -4749,6 +4856,87 @@ impl Core {
         if in_epoch {
             self.stats.epoch_streamed_ahead += sent;
         }
+    }
+
+    /// Plan 46 M1.4 step 2: arm the resend timer for the oldest batch no
+    /// member has acknowledged yet (once per batch; the timer re-arms itself
+    /// while anything is unacknowledged).
+    fn arm_hold_resend(&mut self, now: Now, out: &mut Vec<Action>) {
+        if self.ack.hold_resend_timer.is_some() || !self.hold_group() {
+            return;
+        }
+        let Some(oldest) = self
+            .ack
+            .hold_sent
+            .values()
+            .filter_map(|q| q.front().map(|&(_, at)| at))
+            .min()
+        else {
+            return;
+        };
+        let at = oldest.plus(self.cfg.hold_resend_ms.max(1));
+        let at = if at > now.wait {
+            at
+        } else {
+            now.wait.plus(self.cfg.hold_resend_ms.max(1))
+        };
+        let id = self.set_timer_wait(at, Timer::HoldResend, out);
+        self.ack.hold_resend_timer = Some(id);
+    }
+
+    /// Plan 46 M1.4 step 2: a member that has not acknowledged a batch for
+    /// `hold_resend_ms` gets the journal again from what it acknowledged
+    /// (one batch per member and round; the member installs it idempotently
+    /// and answers with its ack). Without it a batch lost in transit parked
+    /// every answer of the hold until the client's deadline: the owner
+    /// streams each row once, and the member that never held it never acks.
+    pub(crate) fn on_hold_resend_timer(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.ack.hold_resend_timer = None;
+        if !self.hold_group() || !self.epoch_streams_ahead() {
+            return;
+        }
+        let Some(epoch) = self.lease.epoch() else {
+            return;
+        };
+        let tip = replica.journal_tip();
+        let due = self.cfg.hold_resend_ms.max(1) as i64;
+        let members: Vec<NodeId> = self
+            .ack
+            .hold_sent
+            .iter()
+            .filter(|(_, q)| q.front().is_some_and(|&(_, at)| now.wait.since(at) >= due))
+            .map(|(n, _)| *n)
+            .collect();
+        for n in members {
+            let acked = self.ack.hold_acked.get(&n).copied().unwrap_or(0).min(tip);
+            let txs: Vec<BackupTx> = replica
+                .journal_txs_from(acked + 1, self.cfg.backup_batch_rows)
+                .into_iter()
+                .filter(|t| t.last <= tip)
+                .collect();
+            let q = self.ack.hold_sent.entry(n).or_default();
+            q.clear();
+            let Some(last) = txs.last().map(|t| t.last) else {
+                continue;
+            };
+            q.push_back((last, now.wait));
+            self.stats.hold_resends += 1;
+            out.push(Action::Send {
+                to: n,
+                msg: PeerMsg::StreamAhead {
+                    epoch,
+                    base: self.ship.head_seq,
+                    txs,
+                    committed: false,
+                },
+            });
+        }
+        self.arm_hold_resend(now, out);
     }
 
     /// Plan 46 M1.4 step 1, hold owner: a member holds this node's epoch
@@ -6115,6 +6303,26 @@ impl Core {
                 .ahead_waiting
                 .push_back((from, epoch, base, txs, committed));
             return;
+        }
+        // Plan 46 M1.4 step 2: in an open epoch the cursor is the store's,
+        // not a segment's: no segment will re-sync it while the hold lasts, and
+        // the owner's answers wait for this node's ack. A cursor lost to a
+        // dropped batch or a restart (or left at an older epoch) restarts
+        // after what the store holds of this epoch; the batch must still
+        // follow it (anything else is parked as before).
+        if self.epoch.open && self.bk.ahead_next.is_none_or(|(e, _)| e != epoch) {
+            let lo = replica
+                .streamed_tip(epoch)
+                .ok()
+                .flatten()
+                .map_or(1, |t| t + 1);
+            // The rows before the batch's first are in the log (a segment
+            // carries a prefix of an epoch's journal): the batch continues it.
+            let next = match txs.first() {
+                Some(t) if t.first > lo && replica.row_in_log(epoch, t.first - 1) => t.first,
+                _ => lo,
+            };
+            self.bk.ahead_next = Some((epoch, next));
         }
         let mut completed: Vec<(constellation_meta::Rid, constellation_meta::KeySet)> = Vec::new();
         // Plan 46 M1.4 step 1: the highest journal seq this call left

@@ -3731,9 +3731,14 @@ impl Core {
     pub(crate) fn settled_outcome(&self, rid: Rid, replica: &dyn Replica) -> Option<MutateOutcome> {
         let holds = self.lease.held.is_some() || self.lease.epoch_held();
         if !holds {
-            if self.lease.lost
-                && journal_carries_outcome(replica, rid)
-                && !replica.outcome_from_log(rid)
+            // Plan 46 M1.4 step 2: nor a row an ended hold left uncommitted
+            // (the member's copy was never acknowledged, the archive has not
+            // carried it): it is the journal's, not the log's.
+            let held_back = self.lease.lost
+                || replica
+                    .journal_class_of_rid(rid)
+                    .is_some_and(|(first, _)| self.left_by_hold(first));
+            if held_back && journal_carries_outcome(replica, rid) && !replica.outcome_from_log(rid)
             {
                 return None;
             }
