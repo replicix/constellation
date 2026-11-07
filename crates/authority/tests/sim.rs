@@ -9692,7 +9692,8 @@ fn recall_stall(report: &Report) -> String {
         .unwrap_or(0);
     format!(
         "sent {} dropped {} answers_dropped {} resent {} expired {} drained {} timed {} \
-         sum_ms {} max_ms {longest} over1s {} late_grants {}",
+         sum_ms {} max_ms {longest} over1s {} late_grants {} \
+         release_merged {} release_rowless_partial {} release_partial_resent {}",
         sum(|s| s.deleg_recalls_sent),
         sum(|s| s.deleg_recalls_dropped),
         sum(|s| s.deleg_recalleds_dropped),
@@ -9703,6 +9704,9 @@ fn recall_stall(report: &Report) -> String {
         sum(|s| s.deleg_recall_ms_sum),
         sum(|s| s.deleg_recall_over_1s),
         sum(|s| s.lock_returned_after_end),
+        sum(|s| s.deleg_release_merged),
+        sum(|s| s.deleg_release_rowless_partial),
+        sum(|s| s.deleg_release_partial_resent),
     )
 }
 

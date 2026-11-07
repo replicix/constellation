@@ -60684,34 +60684,42 @@ mod step9_one_stream_per_node {
 
     /// L3: a release request that was lost is sent again, under a new request
     /// id, until the row is here; a request for some subtrees only that got no
-    /// row within a request's timeout becomes a recall of the whole stream
-    /// (the delegate is slow, cut off or down: the recall closes the window
-    /// and the grant's expiry bounds the wait).
+    /// row after a few resends becomes a recall of the whole stream (the
+    /// delegate is slow, cut off or down: the recall closes the window and the
+    /// grant's expiry bounds the wait). Before, the first resend was already a
+    /// recall: the delegate that waited for read recalls lost its other
+    /// subtrees' window, and the resend of the partial request never went out.
     #[test]
-    fn l3_a_lost_release_request_is_sent_again() {
+    fn an_unanswered_partial_request_is_sent_again_before_it_becomes_a_recall() {
         let (mut h, d1, d2) = root_with_two_grants_and_a_file();
         let out = submit_move_out(&mut h, d1);
         let (first, gen, dirs) = release_request_to(&out, 3).expect("the request");
         assert_eq!(dirs, vec![d1]);
-        let timer = timers(&out, TimerKind::ReleaseResend);
+        let mut timer = timers(&out, TimerKind::ReleaseResend);
         assert_eq!(timer.len(), 1, "{out:?}");
-        h.advance(h.core.deleg_request_timeout_ms() + 1);
+        let mut last = first;
+        for n in 1..=super::super::delegate::PARTIAL_RESENDS_BEFORE_RECALL.max(1) {
+            let wait = h.core.dl.gens[&gen].recall_backoff_ms.max(1) + 1;
+            h.advance(wait);
+            let out = h.step(Event::Timer { id: timer[0] });
+            let (next, g2, dirs2) = release_request_to(&out, 3)
+                .unwrap_or_else(|| panic!("resend {n} not sent: {out:?}"));
+            assert_ne!(last, next);
+            assert_eq!(g2, gen);
+            assert_eq!(dirs2, vec![d1], "resend {n} is a recall of the stream");
+            assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::None);
+            last = next;
+            timer = timers(&out, TimerKind::ReleaseResend);
+            assert_eq!(timer.len(), 1, "{out:?}");
+        }
+        let wait = h.core.dl.gens[&gen].recall_backoff_ms.max(1) + 1;
+        h.advance(wait);
         let out = h.step(Event::Timer { id: timer[0] });
-        let (second, g2, dirs2) =
+        let (next, _, dirs3) =
             release_request_to(&out, 3).unwrap_or_else(|| panic!("not sent again: {out:?}"));
-        assert_ne!(first, second);
-        assert_eq!(g2, gen);
-        assert_eq!(dirs2, vec![d1, d2], "not a recall of the stream");
+        assert_ne!(last, next);
+        assert_eq!(dirs3, vec![d1, d2], "not a recall of the stream");
         assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::Sent);
-        // From there it is the stream's recall: sent again like any.
-        let timer = timers(&out, TimerKind::ReleaseResend);
-        assert_eq!(timer.len(), 1, "{out:?}");
-        h.advance(h.core.deleg_request_timeout_ms() * 2 + 1);
-        let out = h.step(Event::Timer { id: timer[0] });
-        let (third, _, dirs3) = release_request_to(&out, 3).expect("sent again");
-        assert_ne!(second, third);
-        assert_eq!(dirs3, vec![d1, d2]);
-        assert_eq!(h.core.stats.deleg_recalls_resent, 1);
     }
 
     /// A delegate (node 3, stream 7 over `d1` and `d2`, a lock grant under
@@ -60929,5 +60937,209 @@ mod step9_one_stream_per_node {
         );
         assert!(h.meta.delegation_table().get(d1).is_some());
         assert!(h.core.dl.mine[&7].release_pending.0.is_empty());
+    }
+    /// A delegate (node 3, stream 7 over `d1`, `d2` and `d3`, lock grants
+    /// under `d1` and `d2`, a read delegation of node 2 under `d1`).
+    fn delegate_of_three() -> (
+        Harness,
+        constellation_fs_core::Ino,
+        constellation_fs_core::Ino,
+        constellation_fs_core::Ino,
+        constellation_fs_core::Ino,
+        constellation_fs_core::Ino,
+    ) {
+        let (mut h, d1, d2, f1, f2) = delegate_of_two();
+        h.core.cfg.read_delegations = true;
+        let d3 = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let mk = LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: "d3".into(),
+            ino: d3,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        };
+        let grow = LogRecord::DelegateNode {
+            node: 3,
+            gen: 7,
+            dirs: vec![constellation_meta::SubtreeGrant {
+                dir: d3,
+                kind: SubtreeKind::Placed,
+            }],
+        };
+        crate::replica::Replica::apply_segment(&h.meta, 1, 1, 1, &[], &[], &[mk, grow]).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.dl.mine[&7].dirs.contains(&d3) || h.core.dl.mine[&7].grown.contains_key(&d3)
+        );
+        (h, d1, d2, d3, f1, f2)
+    }
+
+    fn release_request(
+        h: &mut Harness,
+        req: u64,
+        dirs: Vec<constellation_fs_core::Ino>,
+    ) -> Vec<Action> {
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReleaseRequest {
+                req: OpId(req),
+                gen: 7,
+                dirs,
+            },
+        })
+    }
+
+    /// A release the root has not acknowledged is never dropped for the next:
+    /// the request for `d1` journals a row and a note, the batch is given up
+    /// on, a request for `d1` and `d2` follows (`d1` still waits for its row
+    /// to be appended); the note that goes out carries the grants of both,
+    /// and the hold on the row waits for the read delegations under `d1`
+    /// still. Fails on the parent, where the second note replaced the first:
+    /// the root appends the row of `d1` without its grants, and a conflicting
+    /// lock is granted; and the row streams before the read delegations are
+    /// recalled.
+    #[test]
+    fn a_release_merges_into_one_the_root_has_not_acknowledged() {
+        let (mut h, d1, d2, d3, f1, f2) = delegate_of_three();
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, d1, until);
+        let out = release_request(&mut h, 5, vec![d1]);
+        // (The row is held back: no batch carries the note yet.)
+        let note1 = h.core.dl.mine[&7]
+            .release
+            .as_ref()
+            .expect("a release")
+            .note
+            .clone();
+        assert_eq!(note1.locks.grants.len(), 1);
+        let recall = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::DelegationRecall { req, .. } if to == 2 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the read delegation was not recalled: {out:?}"));
+        assert!(h.core.dl.mine[&7].release.as_ref().unwrap().held);
+        // The batch is lost; the root asks for `d1` and `d2`.
+        let out = release_request(&mut h, 6, vec![d1, d2]);
+        let r = h.core.dl.mine[&7].release.clone().expect("the release");
+        let ids: Vec<u64> = r.note.locks.grants.iter().map(|g| g.ino).collect();
+        assert!(
+            ids.contains(&f1) && ids.contains(&f2),
+            "the first note's grants were dropped: {ids:?}"
+        );
+        assert_eq!(r.note.dirs, {
+            let mut v = vec![d1, d2];
+            v.sort_unstable();
+            v
+        });
+        assert!(r.held, "the hold on the first row was dropped");
+        assert!(
+            h.core.dl.mine[&7].dirs.contains(&d3) || h.core.dl.mine[&7].grown.contains_key(&d3)
+        );
+        // The note that goes out (no batch while held: the next send after
+        // the recall) carries both.
+        let _ = out;
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: recall },
+        });
+        let _ = out;
+        let r = h.core.dl.mine[&7].release.clone().expect("the release");
+        let note = r.note_at(h.clk().wait);
+        assert_eq!(note.locks.grants.len(), 2);
+    }
+
+    /// A partial request that cannot journal a row (a row of the stream is
+    /// lost) still ends the whole stream at the cut: the lock grants of every
+    /// subtree go back with it. Fails on the parent, which handed back the
+    /// asked subtrees' only: with no row the root outwaits nothing (the
+    /// stream is drained), and the other subtrees' holders kept honouring
+    /// grants nobody had.
+    #[test]
+    fn a_partial_request_that_journals_no_row_hands_back_every_subtrees_locks() {
+        let (mut h, d1, d2, f1, f2) = delegate_of_two();
+        for n in 1..=2 {
+            let op = MutateOp::Create {
+                parent: d1,
+                name: format!("r{n}"),
+                ino: h.meta.allocate_ino(d1).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            };
+            let rid = Rid {
+                node: 3,
+                incarnation: 1,
+                seq: n,
+            };
+            let tag = constellation_meta::locks::LockTag::NONE;
+            let (_, idx) = h
+                .meta
+                .delegate_execute(&op, Some(rid), 7, Default::default(), &tag, Now::same(0))
+                .unwrap();
+            assert_eq!(idx, n);
+        }
+        h.core.dl.mine.get_mut(&7).unwrap().lost_from = Some(2);
+        let out = release_request(&mut h, 5, vec![d1]);
+        let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("no release: {out:?}"));
+        assert_eq!(note.end_at, Some(1), "{note:?}");
+        let back: Vec<u64> = note.locks.grants.iter().map(|g| g.ino).collect();
+        assert!(
+            back.contains(&f1) && back.contains(&f2),
+            "the other subtree's grants stayed: {back:?}"
+        );
+        assert!(
+            note.dirs.contains(&d1) && note.dirs.contains(&d2),
+            "{note:?}"
+        );
+        assert!(h.core.dl.mine[&7].stopped);
+        assert!(h.meta.locks().grants_snapshot().is_empty());
+    }
+
+    /// A request for a subtree this node has already released (the root sent
+    /// it again before it saw the row, or a late copy came) is not news: the
+    /// subtree is not one it has yet to learn. Fails on the parent, which
+    /// put it in `release_pending`: a later growth of the stream by the same
+    /// subtree was released unasked.
+    #[test]
+    fn a_repeated_request_for_a_released_subtree_is_not_one_to_learn() {
+        let (mut h, d1, _d2, _d3, _f1, _f2) = delegate_of_three();
+        release_request(&mut h, 5, vec![d1]);
+        release_request(&mut h, 6, vec![d1]);
+        assert!(
+            h.core.dl.mine[&7].release_pending.0.is_empty(),
+            "{:?}",
+            h.core.dl.mine[&7].release_pending
+        );
+        // Not either once the root has acknowledged the row.
+        h.core.dl.mine.get_mut(&7).unwrap().release = None;
+        release_request(&mut h, 7, vec![d1]);
+        assert!(h.core.dl.mine[&7].release_pending.0.is_empty());
+    }
+    /// The root's cut is as of the moment it heard a delegate's head, not of
+    /// the delegate's stamp when that clock runs ahead: a stamp later than
+    /// the root's now made the cut "as of now" on a head heard seconds ago,
+    /// and an outwait barrier settled by it let a grant go to a node whose
+    /// read lacked what the old holder had written under its lock through
+    /// that delegate (sim `locks-stall-step-delegated-ahead` seed 1686).
+    #[test]
+    fn a_cut_is_no_fresher_than_the_head_was_heard() {
+        let (mut h, d1, _d2) = root_with_two_grants_and_a_file();
+        let gen = h.meta.delegation_table().get(d1).unwrap().gen;
+        let now = h.clk();
+        h.core
+            .lock_note_delegate_head(now, 3, gen, 5, now.wall.0 + 3_000);
+        h.advance(2_000);
+        let now = h.clk();
+        let (at, _) = h.core.lock_cut_here(now, &h.meta);
+        assert!(
+            at <= now.wall.0 - 2_000,
+            "the cut claims {} ms of a head heard 2000 ms ago",
+            at - (now.wall.0 - 2_000)
+        );
     }
 }

@@ -68632,7 +68632,7 @@ that were clean on the base are clean (0 failing, oracle totals unchanged). The 
 claim ... archive_waits` of the root's own answers in `locks-blips-tight-delegated` 3 -> 5, `locks-unlinked-delegated-blips` 3 -> 4, `-partition` 3 -> 3; the
 `locks-writer-hold-delegated*` ratchets 86/37/136 -> 94/37/136, `-doubt` 138 -> 0, `-backup` 2 -> 0; `locks-delegated-partition-skew` 16 -> 14): the seeds differ
 (the schedule moved), the counts are within the sampling spread of rates of 0.2 % to 5 %; `locks-stall-step-delegated-ahead` 0 -> 1 (seed 1686, a stale read under
-a lock) is a latent failure of the base too (2 of seeds 2,000..5,999 on each side). I4 ceilings are not widened.
+a lock) is a latent failure of the base too (2 of seeds 2,000..5,999 on each side); its cause and fix are in the fix round below. I4 ceilings are not widened.
 
 **Latency** (the root's time from a release request to its row, `SWEEP-L3` over 2,000 seeds; ms): `placement-hot` mean 61 -> 58, max 2,827 -> 2,828;
 `delegated-two-dirs-one-backed` (partial releases now, timed too) mean 2,592 -> 1,823, max 8,834 -> 12,449 (the tail is the crashed delegate's: an unanswered
@@ -68642,3 +68642,30 @@ No steady-path change: the release is off it. The harness scenario `delegate-bac
 
 **Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta, authority lib (1,103), engine lib (953), net lib (128), control (146),
 release authority sim suite 0 failed.
+
+**Step 10 fix round** (review of the commit above). (1) A release the root has not acknowledged is never replaced by the next: `PendingRelease::merge` joins them (the
+subtrees, the lock grants once each with what is left of each measured again, the floors, the earliest row a hold keeps back from, the acknowledgement of the later
+row; the hold is let go when the last recall it waits for is done, `holds`). (2) A request for some subtrees that can journal no row ends the whole stream at the cut,
+so it hands back the locks of every subtree (the root, with no outwait grace after a drained stream, had lost the others'). (3) `released_dirs`: a subtree this node
+released is not one it has yet to learn; a repeated or late request for it no longer goes to `release_pending` (a later growth of the stream by the same subtree was
+released unasked). (4) A request for some subtrees is sent again `PARTIAL_RESENDS_BEFORE_RECALL` (3) times before it becomes a recall of the whole stream (it was a
+recall at its first resend: the partial resend never went out, and a delegate that waited for read recalls lost its other subtrees' window). Counters:
+`deleg_release_merged`, `deleg_release_rowless_partial`, `deleg_release_partial_resent` (`SWEEP-L3`). Tests (core, `step9_one_stream_per_node`; each fails with its fix
+removed): a release merges into one the root has not acknowledged (grants of both, the hold stands), a partial request that journals no row hands back every
+subtree's locks, a repeated request for a released subtree is not one to learn, an unanswered partial request is sent again before it becomes a recall.
+
+The sweeps' new failures were not these: the seeds `locks-blips-tight-delegated` 546/651/853, `locks-unlinked-delegated-blips` 610/853 and
+`locks-stall-step-delegated-ahead` 1686 fail on the unfixed step 10 commit too and pass or fail unchanged with each of the four fixes taken out; the counters are 0 in
+every configuration of them (`merged`, `rowless_partial` fire only in `delegated-two-dirs-one-backed`: 52 and 45 in 2,000 seeds, clean). Seed 1686 was a real
+lock-safety failure of the base, found with the grant's floor: `lock_cut_here` took a delegate's renewal stamp as the cut's "as of", and a delegate whose clock runs
+ahead stamps it later than the root's now, so a head heard 2.3 s earlier (a root stalled in between) settled an outwait barrier "as of now" and the next holder was
+granted without the old holder's rows (turn 7 written under its lock through the delegate). The cut is now no fresher than the moment the root heard the head
+(test `a_cut_is_no_fresher_than_the_head_was_heard`). The `class claim ... archive_waits` of the blips configurations is the S3-unreachable window of the root's own
+answers (the answer is released with the archive claimed while no segment holds the row), present in the base: over seeds 2,000..5,999 blips-tight fails 3 (base) against 1 and unlinked-blips 5 against 12, and over seeds 0..5,999 6 against 6 and
+8 against 16: the same signature, different seeds, not attributable to step 10.
+
+Sweeps again, `+commit`, 2,000 seeds, final binary, base = step 9 (configs not named are 0 = 0): `locks-stall-step-delegated-ahead` 0 -> 0, `locks-delegated-partition-skew`
+16 -> 2, `-doubt` 138 -> 0, `-backup` 2 -> 0, `locks-writer-hold-delegated` 86 -> 93 (all `I1 acked_implies_committed`, the step 15 family), `-group` 37 -> 37, `-unsettled`
+136 -> 135, `locks-blips-tight-delegated` 3 -> 5 and `locks-unlinked-delegated-blips` 3 -> 4 (the class claim above), `locks-unlinked-delegated-partition` 3 -> 3,
+`long-delegated-hysteresis-off` 29 -> 31 (negative control, same signature). Latency (`SWEEP-L3`, ms): `delegated-two-dirs-one-backed` mean 2,592 -> 1,818, max 8,834 ->
+12,449 (the crashed delegate's tail, as before this round); `placement-hot` 61 -> 58, max 2,827 -> 2,828; `long-delegated` 253 -> 309; `delegated-partition` 2,927 -> 2,926.

@@ -100,6 +100,12 @@ pub enum DelegKind {
     Designated,
 }
 
+/// Step 10: a request for some subtrees of a stream is sent this many times
+/// again (L3) before it becomes a recall of the whole stream: the delegate
+/// may be waiting for the read delegations it granted under them, and a
+/// recall closes the stream's window.
+pub(crate) const PARTIAL_RESENDS_BEFORE_RECALL: u32 = 3;
+
 /// The root's view of one generation.
 #[derive(Debug, Clone)]
 pub(crate) struct GenState {
@@ -218,6 +224,9 @@ pub(crate) struct GenState {
     pub recall_tries: Vec<OpId>,
     /// When the recall started (the stall `deleg_recall_ms_*` measures).
     pub recall_started: Option<WaitMs>,
+    /// Step 10: how often the request for some subtrees only was sent again
+    /// (a few resends before it becomes a recall of the stream).
+    pub release_resends: u32,
     /// The timer that sends the recall again while it is unanswered
     /// (`Core::on_release_resend`), and its current back-off.
     pub recall_resend: Option<TimerId>,
@@ -444,10 +453,17 @@ pub(crate) struct PendingRelease {
     pub note: constellation_meta::locks::ReleaseNote,
     /// The stream index of the release row (`None`: none was journaled).
     pub row: Option<u64>,
+    /// The first release row this note covers (a later release merged into
+    /// a note that was not acknowledged yet keeps the earlier row): what a
+    /// hold keeps back starts here.
+    pub first_row: Option<u64>,
     /// The row and everything after it are held back from the stream until
     /// the read delegations this node granted under the released subtrees
     /// are recalled (phase 2b).
     pub held: bool,
+    /// How many recalls the hold waits for (one per release merged in):
+    /// the hold is let go when the last is done.
+    pub holds: u32,
     /// When the note's lock `carry` was measured (wait clock): each send
     /// takes the time since off what is left of every record.
     pub left_at: WaitMs,
@@ -457,6 +473,58 @@ pub(crate) struct PendingRelease {
 }
 
 impl PendingRelease {
+    /// A later release joins this one, which the root has not acknowledged
+    /// yet: one note for both, never one dropped for the other. The subtrees
+    /// and the lock grants are the union (each grant once; what is left of
+    /// each is measured again), the floors join, and the hold stays until
+    /// every recall it waits for is done. The acknowledgement that covers the
+    /// later row covers the earlier.
+    pub(crate) fn merge(mut self, later: PendingRelease, now: WaitMs) -> PendingRelease {
+        let mut note = self.note_at(now);
+        let new = later.note_at(now);
+        for dir in new.dirs {
+            if !note.dirs.contains(&dir) {
+                note.dirs.push(dir);
+            }
+        }
+        note.dirs.sort_unstable();
+        note.end_at = match (note.end_at, new.end_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        for g in new.locks.grants {
+            if !note.locks.grants.iter().any(|x| x.id == g.id) {
+                note.locks.grants.push(g);
+            }
+        }
+        for (id, left) in new.locks.carry {
+            match note.locks.carry.iter_mut().find(|(x, _)| *x == id) {
+                Some((_, l)) => *l = (*l).min(left),
+                None => note.locks.carry.push((id, left)),
+            }
+        }
+        note.locks.floor =
+            constellation_meta::locks::floor_join(&note.locks.floor, &new.locks.floor);
+        note.locks.barrier = note.locks.barrier.max(new.locks.barrier);
+        self.note = note;
+        // A release that journaled no row ends the stream at its cut: the
+        // note is acknowledged by the batch that carries it.
+        self.row = if later.row.is_none() {
+            None
+        } else {
+            self.row.max(later.row)
+        };
+        self.first_row = match (self.first_row, later.first_row) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.held |= later.held;
+        self.holds += later.holds;
+        self.left_at = now;
+        self.to = later.to;
+        self
+    }
+
     /// The note as it goes out at `now`: what is left of each handed-back
     /// record is measured again.
     pub(crate) fn note_at(&self, now: WaitMs) -> constellation_meta::locks::ReleaseNote {
@@ -485,6 +553,11 @@ pub(crate) struct DelegateState {
     /// Plan 46 M1.2 step 10: this node released subtrees on the root's
     /// request and the root has not acknowledged the release row yet.
     pub release: Option<PendingRelease>,
+    /// Plan 46 M1.2 step 10: the subtrees this node released from the stream
+    /// (a repeated or late request for one is not news: it is not a subtree
+    /// the node has yet to learn). A subtree granted to the stream again
+    /// leaves the set once the node has learned it.
+    pub released_dirs: BTreeSet<Ino>,
     /// Plan 46 M1.2 step 10: subtrees the root asked this node to release
     /// that this node has not learned yet (the `DelegateNode` record that
     /// grew the stream is in a segment it has not applied): released once it
@@ -1616,6 +1689,7 @@ impl Core {
                     grown: BTreeMap::new(),
                     release: None,
                     release_pending: (BTreeSet::new(), 0),
+                    released_dirs: BTreeSet::new(),
                     core_answer_sent: None,
                     gen: d.gen,
                     until: HonourMs(0),
@@ -1893,6 +1967,7 @@ impl Core {
                         recall_req: None,
                         recall_tries: Vec::new(),
                         recall_started: None,
+                        release_resends: 0,
                         recall_resend: None,
                         recall_backoff_ms: 0,
                         controls: Vec::new(),
@@ -5480,7 +5555,7 @@ impl Core {
             // still being recalled keeps its row, and what follows it, back.
             if let Some(PendingRelease {
                 held: true,
-                row: Some(row),
+                first_row: Some(row),
                 ..
             }) = self.dl.mine.get(&gen).and_then(|d| d.release.as_ref())
             {
@@ -7378,7 +7453,19 @@ impl Core {
         };
         // A subtree this node has not learned yet waits for its record
         // (`release_pending`); the rest is released now.
-        let unknown: BTreeSet<Ino> = asked.difference(&held).copied().collect();
+        // A subtree this node released is not one it has yet to learn (the
+        // request for it is repeated, or came late): unless the stream was
+        // granted it again, which shows once the node holds it.
+        {
+            let d = self.dl.mine.get_mut(&gen).expect("present");
+            d.released_dirs.retain(|x| !held.contains(x));
+        }
+        let d = self.dl.mine.get(&gen).expect("present");
+        let unknown: BTreeSet<Ino> = asked
+            .difference(&held)
+            .filter(|x| !d.released_dirs.contains(x))
+            .copied()
+            .collect();
         let asked: BTreeSet<Ino> = asked.intersection(&held).copied().collect();
         // A repeated request for what is released already: the batch that
         // carries the note goes out again.
@@ -7434,6 +7521,17 @@ impl Core {
             cut = cut.min(lost - 1);
         }
         let rowless = cut < idx || self.dl.mine.get(&gen).is_some_and(|d| d.stopped);
+        // Without a row the stream ends at the cut, every subtree with it:
+        // the whole stream is handed back, its locks too (the others'
+        // holders keep honouring them until the root has them).
+        if rowless && !whole {
+            self.stats.deleg_release_rowless_partial += 1;
+        }
+        let (asked, whole) = if rowless {
+            (held.clone(), true)
+        } else {
+            (asked, whole)
+        };
         let mut row = None;
         if !rowless {
             let records: Vec<LogRecord> = if whole {
@@ -7500,12 +7598,24 @@ impl Core {
                 d.stream_after = None;
                 d.stream_backoff_ms = 0;
             }
-            d.release = Some(PendingRelease {
+            d.released_dirs.extend(asked.iter().copied());
+            let release = PendingRelease {
                 note,
                 row,
+                first_row: row,
                 held: false,
+                holds: 0,
                 left_at: now.wait,
                 to: from,
+            };
+            // A note the root has not acknowledged is never dropped for
+            // this one: the two are one.
+            d.release = Some(match d.release.take() {
+                Some(old) => {
+                    self.stats.deleg_release_merged += 1;
+                    old.merge(release, now.wait)
+                }
+                None => release,
             });
             std::mem::take(&mut d.parked)
         };
@@ -7553,6 +7663,7 @@ impl Core {
             if let Some(wait) = self.start_recalls(now, need, out) {
                 if let Some(r) = self.dl.mine.get_mut(&gen).and_then(|d| d.release.as_mut()) {
                     r.held = true;
+                    r.holds += 1;
                 }
                 self.park(
                     now,
@@ -7618,6 +7729,10 @@ impl Core {
             .get_mut(&gen)
             .and_then(|d| d.release.as_mut())
             .and_then(|r| {
+                r.holds = r.holds.saturating_sub(1);
+                if r.holds > 0 {
+                    return None;
+                }
                 r.held = false;
                 r.row.is_none().then(|| (r.to, r.note_at(now.wait)))
             });
@@ -8112,6 +8227,7 @@ impl Core {
             return;
         }
         if g.recall == RecallPhase::None
+            && g.release_resends >= PARTIAL_RESENDS_BEFORE_RECALL
             && g.recall_started
                 .is_some_and(|at| now.wait.since(at) >= patience as i64)
         {
@@ -8144,6 +8260,10 @@ impl Core {
             let g = self.dl.gens.get_mut(&gen).expect("present");
             g.recall_req = Some(req);
             g.recall_tries.push(req);
+            if g.recall == RecallPhase::None {
+                g.release_resends += 1;
+                self.stats.deleg_release_partial_resent += 1;
+            }
             self.dl.by_req.insert(req, (gen, ReqKind::Recall));
             self.stats.deleg_recalls_resent += 1;
             tracing::info!(
@@ -8217,6 +8337,7 @@ impl Core {
             let timer = g.recall_resend.take();
             // (A stream released whole is timed when it ends.)
             if end.is_none() {
+                g.release_resends = 0;
                 if let Some(at) = g.recall_started.take() {
                     let ms = now.wait.since(at).max(0) as u64;
                     self.stats.deleg_recalls_timed += 1;
@@ -9886,6 +10007,7 @@ impl Core {
                 recall_req: None,
                 recall_tries: Vec::new(),
                 recall_started: None,
+                release_resends: 0,
                 recall_resend: None,
                 recall_backoff_ms: 0,
                 controls: Vec::new(),

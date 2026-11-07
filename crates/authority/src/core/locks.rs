@@ -2691,7 +2691,11 @@ impl Core {
             match self.lk.heads.get(gen) {
                 Some((sent, head, heard)) => {
                     if !designated || now.wait.since(*heard) < online_ms {
-                        at = at.min(*sent);
+                        // (`sent` is the delegate's clock: one that runs
+                        // ahead stamps a renewal later than this root has
+                        // heard it. The head is no fresher than the moment
+                        // the root heard it, whatever the stamp says.)
+                        at = at.min(*sent).min(now.wall_of_wait(*heard).0);
                     }
                     let mut p = Position::ZERO;
                     if *head > 0 && p.streams.raise(*gen, *head) {

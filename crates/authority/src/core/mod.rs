@@ -1162,6 +1162,14 @@ pub struct Stats {
     /// classified ones above are a part of it.
     pub deleg_grants_lost: u64,
     pub deleg_recalls_received: u64,
+    /// Delegate (step 10): a release joined one the root had not acknowledged
+    /// yet, and one for a part of the stream that could journal no row (it
+    /// ended the whole stream at the cut).
+    pub deleg_release_merged: u64,
+    pub deleg_release_rowless_partial: u64,
+    /// Root (step 10): resends of a partial release request, and the
+    /// requests that became a recall of the stream after them.
+    pub deleg_release_partial_resent: u64,
     /// Root: delegations written, transactions appended, batches
     /// refused, batches refused for lacking their `deps` (the causal-cut
     /// assertion, below), cross-subtree ops, recalls sent / drained / expired,
