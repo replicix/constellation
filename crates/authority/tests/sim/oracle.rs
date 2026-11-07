@@ -123,7 +123,7 @@ pub struct Oracles {
     /// Plan 46 M1.3 step 4: the generations whose holder sent the root a
     /// release (a note on its stream: a row, or the cut a rowless release
     /// ends at; the latter leaves nothing in the log).
-    pub sticky_released: Mutex<BTreeSet<u64>>,
+    pub sticky_released: Mutex<BTreeMap<u64, super::sticky::SentRelease>>,
     /// The delegation table as the lease holder had it, each time it changed
     /// (`(at_ms, holder, table)`): the generation history (install, recall,
     /// end) that decides who owns an op's keys at each instant.
@@ -370,7 +370,7 @@ impl Oracles {
             ops: Mutex::new(HashMap::new()),
             unsettled: Mutex::new(Vec::new()),
             causal_cut: Mutex::new(Vec::new()),
-            sticky_released: Mutex::new(BTreeSet::new()),
+            sticky_released: Mutex::new(BTreeMap::new()),
             tables: Mutex::new(Vec::new()),
             bucket,
             stores: Mutex::new(BTreeMap::new()),

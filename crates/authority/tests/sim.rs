@@ -7821,7 +7821,7 @@ struct OracleTotals {
     /// abandon, unexcused; the core's counters (grants made, ended by
     /// reason: released, abandoned, other).
     sticky: [u64; 5],
-    sticky_core: [u64; 4],
+    sticky_core: [u64; 7],
     i4: usize,
     /// Plan 43 C2: of `i4`, settled `EIO`s whose rid completed.
     i4_settled: usize,
@@ -8224,7 +8224,7 @@ impl OracleTotals {
         );
         eprintln!(
             "SWEEP-STICKY-TOTALS {label} seeds {}/{seeds}: sticky streams in the log {} (ended by release {}, by abandon {}, by the holder's own claim {}, unexcused {}); \
-             core: grants made {}, ended released {}, abandoned {}, other {}",
+             core: grants made {}, ended released {}, abandoned {}, other {}, by undelegate {}, recalled {}; recalls by a continuation epoch {}",
             self.seeds,
             self.sticky[0],
             self.sticky[1],
@@ -8234,7 +8234,10 @@ impl OracleTotals {
             self.sticky_core[0],
             self.sticky_core[1],
             self.sticky_core[2],
-            self.sticky_core[3]
+            self.sticky_core[3],
+            self.sticky_core[4],
+            self.sticky_core[5],
+            self.sticky_core[6]
         );
         eprintln!(
             "SWEEP-UNSETTLED-CAUSES {label} seeds {}/{seeds}: {:?}",
@@ -17749,7 +17752,7 @@ fn sticky_grants_survive_the_ttl_and_end_by_the_holders_release() {
         );
         made += r.sticky_core[0];
         in_log += r.sticky_granted;
-        released += r.sticky_ended_released as u64 + r.sticky_core[1];
+        released += r.sticky_ended_released as u64 + r.sticky_core[1] + r.sticky_core[4];
     }
     assert!(made > 0 && in_log > 0, "no sticky grant was made");
     assert!(

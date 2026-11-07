@@ -3712,11 +3712,14 @@ impl Driver {
                     // grant, whether or not the log carries a row of it.
                     if let PeerMsg::DelegateStream {
                         gen,
-                        released: Some(_),
+                        released: Some(note),
                         ..
                     } = &msg
                     {
-                        self.oracles.sticky_released.lock().unwrap().insert(*gen);
+                        let mut sent = self.oracles.sticky_released.lock().unwrap();
+                        let e = sent.entry(*gen).or_default();
+                        e.whole |= note.end_at.is_some();
+                        e.dirs.extend(note.dirs.iter().copied());
                     }
                     // (`OpId(0)`: the core re-executing a parked request whose
                     // `Held` reply was sent already; that reply matches no

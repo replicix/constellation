@@ -1244,11 +1244,23 @@ pub struct Stats {
     pub deleg_designated: u64,
     /// Plan 46 M1.3 step 4: sticky grants made (a stream's first or a growth).
     pub deleg_sticky: u64,
-    /// Sticky streams the root ended: by the holder's release (its release
-    /// row reached the root), by an operator's abandon, or by anything else
-    /// (a TTL end, which the oracle `sticky_ends_only_by_holder_or_operator`
+    /// Sticky streams the root ended: by the holder's own release (no
+    /// recall of the root's; its release row reached the root), by the
+    /// operator's `undelegate` (`_operator`: the recall asks the holder to
+    /// release), after any other recall of the root's (`_recalled`: a
+    /// continuation epoch's, the one exception of plan 46 §5.4, or a
+    /// violation), by an operator's abandon, or by anything else (a TTL
+    /// end, which the oracle `sticky_ends_only_by_holder_or_operator`
     /// fails).
     pub deleg_sticky_ended_released: u64,
+    pub deleg_sticky_ended_operator: u64,
+    pub deleg_sticky_ended_recalled: u64,
+    /// Recalls of a sticky stream the root started: by a continuation epoch
+    /// (the exception) and by any other cause (a violation of "the root
+    /// never takes back": counted whole, or as a request for some of its
+    /// subtrees).
+    pub deleg_sticky_recalled_epoch: u64,
+    pub deleg_sticky_recalled_other: u64,
     pub deleg_sticky_ended_abandoned: u64,
     pub deleg_sticky_ended_other: u64,
     pub deleg_redelegated: u64,

@@ -77,6 +77,22 @@ pub(crate) fn wait_id(gen: u64) -> u64 {
     DELEG_WAIT_BASE + gen
 }
 
+/// Why the root recalled a stream (plan 46 M1.3 step 4 review: a sticky
+/// grant is recalled by the operator's `undelegate` and, as the one
+/// exception of §5.4, by a continuation epoch; any other cause is the
+/// root taking a non-stealable grant back).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallCause {
+    /// The operator's `undelegate`.
+    Undelegate,
+    /// A continuation epoch opened: the delegates stop and the hold
+    /// sequences (`recall_all`).
+    Epoch,
+    /// Placement, a cross-subtree op, a designation, a stalled partial
+    /// release: causes that never apply to a non-stealable grant.
+    Other,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecallPhase {
     None,
@@ -259,6 +275,9 @@ pub(crate) struct GenState {
     pub recall_tries: Vec<OpId>,
     /// When the recall started (the stall `deleg_recall_ms_*` measures).
     pub recall_started: Option<WaitMs>,
+    /// Why the root recalled the stream (`None`: it did not; the holder's
+    /// own release ended it).
+    pub recall_cause: Option<RecallCause>,
     /// Step 10: how often the request for some subtrees only was sent again
     /// (a few resends before it becomes a recall of the stream).
     pub release_resends: u32,
@@ -1998,6 +2017,7 @@ impl Core {
                         recall_req: None,
                         recall_tries: Vec::new(),
                         recall_started: None,
+                recall_cause: None,
                         release_resends: 0,
                         recall_resend: None,
                         recall_backoff_ms: 0,
@@ -8128,6 +8148,16 @@ impl Core {
     }
 
     pub(crate) fn start_recall(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
+        self.start_recall_for(now, gen, RecallCause::Other, out);
+    }
+
+    pub(crate) fn start_recall_for(
+        &mut self,
+        now: Now,
+        gen: u64,
+        cause: RecallCause,
+        out: &mut Vec<Action>,
+    ) {
         // Plan 46 M0.3 (S5, ADR-42), amended by ADR-44: a takeover gate
         // recalls only on demand (`gate_recall_on_demand`), once its journal
         // work is done, and only a generation of another node it took on.
@@ -8146,7 +8176,15 @@ impl Core {
             return;
         }
         g.recall = RecallPhase::Sent;
+        g.recall_cause = Some(cause);
         g.gate_recalled = gated;
+        if g.kind() == DelegKind::Sticky {
+            match cause {
+                RecallCause::Undelegate => {}
+                RecallCause::Epoch => self.stats.deleg_sticky_recalled_epoch += 1,
+                RecallCause::Other => self.stats.deleg_sticky_recalled_other += 1,
+            }
+        }
         // Every subtree of the stream (plan 46 M1.2 step 10: a recall of the
         // generation is a request for all of them).
         g.releasing = g.dirs.keys().copied().collect();
@@ -8181,6 +8219,9 @@ impl Core {
         // A takeover gate recalls whole generations only.
         if self.lease.gate.is_some() {
             return;
+        }
+        if g.kind() == DelegKind::Sticky {
+            self.stats.deleg_sticky_recalled_other += 1;
         }
         let outstanding = g.recall_resend.is_some();
         let new = dirs.iter().any(|d| g.releasing.insert(*d));
@@ -8482,7 +8523,7 @@ impl Core {
                 && self.lease.ship_epoch(now, &self.cfg).is_some())
     }
 
-    fn recall_all(&mut self, now: Now, out: &mut Vec<Action>) {
+    pub(crate) fn recall_all(&mut self, now: Now, out: &mut Vec<Action>) {
         let gens: Vec<u64> = self
             .dl
             .gens
@@ -8491,7 +8532,7 @@ impl Core {
             .map(|(g, _)| *g)
             .collect();
         for gen in gens {
-            self.start_recall(now, gen, out);
+            self.start_recall_for(now, gen, RecallCause::Epoch, out);
         }
     }
 
@@ -9321,7 +9362,11 @@ impl Core {
             if abandoned.is_some() {
                 self.stats.deleg_sticky_ended_abandoned += 1;
             } else if drained {
-                self.stats.deleg_sticky_ended_released += 1;
+                match g.recall_cause {
+                    None => self.stats.deleg_sticky_ended_released += 1,
+                    Some(RecallCause::Undelegate) => self.stats.deleg_sticky_ended_operator += 1,
+                    Some(_) => self.stats.deleg_sticky_ended_recalled += 1,
+                }
             } else {
                 self.stats.deleg_sticky_ended_other += 1;
             }
@@ -9923,9 +9968,13 @@ impl Core {
             if g.recall != RecallPhase::None || g.waiting_for_group || g.prev_blocked {
                 return Err(format!("node {node}'s delegation is being recalled"));
             }
-        } else if !kind.non_stealable() && self.dl.designating.values().any(|n| *n == node) {
+        } else if kind != DelegKind::Designated && self.dl.designating.values().any(|n| *n == node)
+        {
+            // Neither a stealable grant nor a sticky one: the designation's
+            // stream opens first (a stream never mixes grant kinds).
             return Err(format!(
-                "a designation to node {node} is pending; nothing that can be reclaimed is granted to it"
+                "a designation to node {node} is pending; no other kind of grant is made to it \
+                 until the designation's stream is open"
             ));
         }
         // The delegate is another node: a root that still counts itself
@@ -10093,6 +10142,7 @@ impl Core {
                 recall_req: None,
                 recall_tries: Vec::new(),
                 recall_started: None,
+                recall_cause: None,
                 release_resends: 0,
                 recall_resend: None,
                 recall_backoff_ms: 0,
@@ -10482,7 +10532,7 @@ impl Core {
             return;
         };
         for g in gens.iter().filter(|g| **g != gen) {
-            self.start_recall(now, *g, out);
+            self.start_recall_for(now, *g, RecallCause::Undelegate, out);
         }
         self.dl
             .gens
@@ -10490,7 +10540,7 @@ impl Core {
             .expect("present")
             .controls
             .push(op);
-        self.start_recall(now, gen, out);
+        self.start_recall_for(now, gen, RecallCause::Undelegate, out);
     }
 
     /// Plan 30 §M10: an epoch became active (or closed).

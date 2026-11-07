@@ -449,6 +449,10 @@ pub enum Control {
     },
     /// Plan 30 §M11: recall the delegation on `dir` (drained, or outwaited
     /// by its grant's expiry; answered `Text` once the generation ended).
+    /// A non-stealable grant (sticky or designated) has no expiry to
+    /// outwait: with its holder unreachable the control waits until the
+    /// holder returns, or the operator's abandon (plan 46 step 13) ends the
+    /// stream; the CLI says so.
     Undelegate { dir: Ino },
     /// Plan 30 §M11 phase 2b: the live write designations `(dir,
     /// designee)`; the root delegates the new ones (designated) and

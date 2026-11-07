@@ -61744,6 +61744,79 @@ mod step4_sticky {
         assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::Sent);
     }
 
+    /// Review of step 4: a pending designation to a node refuses a sticky
+    /// grant to it as it does a stealable one (the designation's stream
+    /// opens first; a stream never mixes grant kinds).
+    #[test]
+    fn a_pending_designation_refuses_a_sticky_grant() {
+        let (mut h, d1, d2) = root_with_two_dirs();
+        h.core.dl.designating.insert(d2, 3);
+        let (ok, out) = control_delegate(&mut h, 900, d1, 3, true);
+        assert!(!ok, "a sticky grant was made to a designee-to-be");
+        assert!(
+            out.iter().any(|a| matches!(a, Action::ControlDone { result: Err(why), .. } if why.contains("designation"))),
+            "{out:?}"
+        );
+        let (ok, _) = control_delegate(&mut h, 901, d1, 3, false);
+        assert!(!ok);
+        // Another node is not held back.
+        let (ok, _) = control_delegate(&mut h, 902, d1, 2, true);
+        assert!(ok);
+    }
+
+    /// Review of step 4: the causes of the root's recalls of a sticky
+    /// stream are counted apart. The operator's `undelegate` is the
+    /// allowed one, a continuation epoch's `recall_all` the one exception
+    /// (plan 46 §5.4), anything else the violation the sim's oracle flags.
+    #[test]
+    fn a_recall_of_a_sticky_stream_is_counted_by_its_cause() {
+        use crate::core::delegate::RecallCause;
+        let counts = |h: &Harness| {
+            (
+                h.core.stats.deleg_sticky_recalled_epoch,
+                h.core.stats.deleg_sticky_recalled_other,
+            )
+        };
+        // The operator's undelegate: neither.
+        let (mut h, d1, _d2) = root_with_two_dirs();
+        let (ok, _) = control_delegate(&mut h, 900, d1, 3, true);
+        assert!(ok);
+        let gen = sticky_gen_of(&h, d1);
+        h.step(Event::Control {
+            op: OpId(901),
+            req: Control::Undelegate { dir: d1 },
+        });
+        assert_eq!(counts(&h), (0, 0));
+        assert_eq!(
+            h.core.dl.gens[&gen].recall_cause,
+            Some(RecallCause::Undelegate)
+        );
+        // A continuation epoch's recall of everything: the exception.
+        let (mut h, d1, _d2) = root_with_two_dirs();
+        let (ok, _) = control_delegate(&mut h, 900, d1, 3, true);
+        assert!(ok);
+        let gen = sticky_gen_of(&h, d1);
+        let mut out = Vec::new();
+        h.core.recall_all(h.clk(), &mut out);
+        assert_eq!(counts(&h), (1, 0));
+        assert_eq!(h.core.dl.gens[&gen].recall_cause, Some(RecallCause::Epoch));
+        // Any other cause is counted as the violation.
+        let (mut h, d1, _d2) = root_with_two_dirs();
+        let (ok, _) = control_delegate(&mut h, 900, d1, 3, true);
+        assert!(ok);
+        let gen = sticky_gen_of(&h, d1);
+        let mut out = Vec::new();
+        h.core.start_recall(h.clk(), gen, &mut out);
+        assert_eq!(counts(&h), (0, 1));
+        // A stealable stream's recalls are not counted at all.
+        let (mut h, d1, _d2) = root_with_two_dirs();
+        let (ok, _) = control_delegate(&mut h, 900, d1, 3, false);
+        assert!(ok);
+        let gen = h.meta.delegation_table().get(d1).unwrap().gen;
+        h.core.start_recall(h.clk(), gen, &mut Vec::new());
+        assert_eq!(counts(&h), (0, 0));
+    }
+
     fn holder_of(
         committed: bool,
         grants: &[(SubtreeKind, &str)],

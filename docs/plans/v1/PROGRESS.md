@@ -68833,3 +68833,14 @@ is never recalled by it), `undelegate` (refuses a designation and recalls a stic
 
 Not in this step: the holder's release command and idle release (step 5/6), `status.delegation.sticky` and the docs of the kind (step 17), claim =
 release as a row (step 12), `repair abandon --node` (step 13).
+
+**Plan 46 M1.3 step 4 review fix round (branch m13s4).**
+- Sim oracle: a holder's release note is recorded with its subtrees and `end_at` (`SentRelease`); the oracle excuses an end by a note only when it has
+  `end_at` or names every granted subtree. Unit test: a partial note, then a TTL end, is a violation.
+- Root-side recalls: `start_recall_for` takes a `RecallCause` (`Undelegate`, `Epoch`, `Other`; `GenState::recall_cause`). The core counts recalls of a
+  sticky stream by cause (`deleg_sticky_recalled_{epoch,other}`; a request for some subtrees counts as other), and the sim fails any `other`. The
+  counters `deleg_sticky_ended_{released,operator,recalled}` now separate the holder's own release from the operator's `undelegate` and from a root recall.
+- `recall_all` at a continuation epoch is kept for non-stealable streams: the delegates stop and the hold sequences, so a stream cannot continue
+  (plan §5.4, "The root never takes back; the one exception").
+- `undelegate` of a sticky grant with an unreachable holder: the event doc is corrected and the CLI points to `repair abandon`.
+- `delegate_dir` refuses a sticky grant to a node with a pending designation.

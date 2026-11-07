@@ -1322,7 +1322,7 @@ pub struct Report {
     pub sticky_ended_unexcused: usize,
     /// Core counters, summed over the nodes: sticky grants made, and sticky
     /// streams ended by reason (released, abandoned, other).
-    pub sticky_core: [u64; 4],
+    pub sticky_core: [u64; 7],
     /// Of `acked_past_cut`, answers that were refusals.
     pub acked_past_cut_refusals: usize,
     /// I4: in-doubt rids that landed after an op invoked later.
@@ -5915,7 +5915,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         }
         at
     };
-    let found = super::oracle::end_of_run(
+    let mut found = super::oracle::end_of_run(
         &oracles,
         &oracle,
         &in_doubt_answers,
@@ -5984,13 +5984,27 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.sticky_ended_released = found.sticky_released;
     report.sticky_ended_abandoned = found.sticky_abandoned;
     report.sticky_ended_claimed = found.sticky_claimed;
-    report.sticky_ended_unexcused = found.sticky.len();
+    let mut sticky_recalled_other = 0u64;
     for s in report.stats.values() {
         report.sticky_core[0] += s.deleg_sticky;
         report.sticky_core[1] += s.deleg_sticky_ended_released;
         report.sticky_core[2] += s.deleg_sticky_ended_abandoned;
         report.sticky_core[3] += s.deleg_sticky_ended_other;
+        report.sticky_core[4] += s.deleg_sticky_ended_operator;
+        report.sticky_core[5] += s.deleg_sticky_ended_recalled;
+        report.sticky_core[6] += s.deleg_sticky_recalled_epoch;
+        sticky_recalled_other += s.deleg_sticky_recalled_other;
     }
+    // The root's recalls of a sticky stream (all but the operator's and a
+    // continuation epoch's are the root taking a grant back).
+    if sticky_recalled_other > 0 {
+        found.sticky.push(format!(
+            "sticky_ends_only_by_holder_or_operator: the root started {sticky_recalled_other} \
+             recall(s) of a sticky stream for a cause other than the operator's undelegate or \
+             a continuation epoch"
+        ));
+    }
+    report.sticky_ended_unexcused = found.sticky.len();
     report.acked_past_cut_refusals = found.cut_refusals;
     report.late_landings = found.i4.len();
     report.settled_landings = found.i4.iter().filter(|m| m.starts_with("I4: rid")).count();

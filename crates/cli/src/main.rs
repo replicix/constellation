@@ -419,7 +419,9 @@ enum Command {
         #[arg(long)]
         sticky: bool,
     },
-    /// Plan 30 §M11: recall the delegation on a directory.
+    /// Plan 30 §M11: recall the delegation on a directory (a sticky grant
+    /// ends when its holder releases it; `repair abandon` is the way out
+    /// when the holder is unreachable).
     Undelegate {
         target: String,
         #[arg(long)]
@@ -1883,6 +1885,7 @@ fn run() -> Result<()> {
             let (t, dir) = resolve_target(&target, state_dir)?;
             let path = target::effective_path(&t);
             ctl::<cm::DesignationUndelegate>(&rt, &dir, api::PathParams { path }, print_ack)
+                .map_err(|e| e.context(UNDELEGATE_STICKY_HINT))
         }
         Command::Delegations { target, state_dir } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
@@ -4133,6 +4136,13 @@ fn xattr_remove(path: &std::path::Path, name: &str) -> Result<()> {
 
 /// Run one control call against the daemon of `dir` and print its answer
 /// the way the CLI always has (plan 31 C5 kept every command's output).
+/// Plan 46 M1.3 step 4 review: what `undelegate` says when it fails or does
+/// not finish. A sticky grant is never outwaited (the root does not time it
+/// out): the call ends when the holder releases it.
+const UNDELEGATE_STICKY_HINT: &str = "undelegate recalls the grant and waits for the holder's release; \
+     a sticky grant is not outwaited, so if its holder is unreachable the wait does not end \
+     until it returns: `constellation repair abandon` ends the stream instead";
+
 fn ctl<M: constellation_control::Method>(
     rt: &tokio::runtime::Runtime,
     dir: &Path,

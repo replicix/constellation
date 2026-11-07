@@ -439,6 +439,22 @@ all in the engine's `sticky` module (`crates/engine/src/sticky.rs`, new):
   not released). It is a top-level command, distinct from
   `snapshot release`.
 
+**The root never takes back; the one exception.** The root starts a
+recall of a sticky stream for the operator's `undelegate` (and, when it is
+built, the cooperative handover above), and for nothing else: not the TTL,
+not a placement round, not a cross-subtree op, not a designation sync. One
+exception: when a continuation epoch (an S3 outage, ADR-22) opens, the root
+recalls every live stream, sticky and designated ones included
+(`recall_all`). It cannot leave them: inside an epoch the delegates stop
+(`stopped`, no op is accepted or answered by a delegate), no delegation is
+granted or renewed, and the epoch's hold sequences the whole namespace, so
+a stream continuing under the new epoch would be a second sequencer of its
+subtree. The holder releases (drains) as for any recall; the grant is made
+again after the epoch closes. The sim's oracle counts a recall of a sticky
+stream by cause (`deleg_sticky_recalled_{epoch,other}`) and fails any of
+the second kind; the epoch's is excused by naming it, not by the holder's
+release that follows.
+
 **A node lost mid-write.** Its subtree is blocked for other writers
 (`EROFS` at the root, `EXDEV` for cross-subtree ops, as under a
 designation) until it returns and releases or the operator runs
