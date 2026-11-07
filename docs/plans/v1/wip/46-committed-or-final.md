@@ -842,7 +842,7 @@ compares a claim with the rule of the row that carries the answer and judges by 
 `strict_commit_exempt` naming the plan item that closes each. The rows whose `row_version_matches_config` fails on `long-delegated-late-answers-lr` seed
 1793 and `long-delegated-backup-lr` seed 1938 are known and in triage elsewhere.
 
-M1.1 review (fable, 2026-11-06, cb4d8dd5): cleared with conditions — SHOULD-1 gated-row re-tags outside the hold, fixed <sha>; SHOULD-2 Leave-ends-grants not built, safety rests on the lone-root cap: re-check at M1.2 steps 13/14 (or land step 11 first); SHOULD-3 exemption closing items, fixed <sha>; NITs fixed.
+M1.1 review (fable, 2026-11-06, cb4d8dd5): cleared with conditions — SHOULD-1 gated-row re-tags outside the hold, fixed 33c7cd28; SHOULD-2 Leave-ends-grants not built, safety rests on the lone-root cap: re-check at M1.2 steps 13/14 (or land step 11 first); SHOULD-3 exemption closing items, fixed 33c7cd28; NITs fixed.
 
 *M1.1 review fixes (PROGRESS, "Plan 46 M1.1 review fix round"):* a gated row is re-tagged `Singleton` only under a continuation epoch's hold (ADR-33 step 5), in the version
 it carries; the sim oracle judges a re-tag. Each remaining `strict_commit` exemption has one closing item: `HELD_WRITE_ANSWERED_LATE` (the writer-hold sim artefact,

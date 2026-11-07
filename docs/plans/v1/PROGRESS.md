@@ -68108,3 +68108,16 @@ at both places (the lease has no per-position history to judge by, as a `DelegGr
 oracle exists without a new store history. (b) `crates/model/src/lib.rs`: the `config_version`-on-rows and singleton-bump gaps are closed (M1.1 steps 3 to 5), "one stream per node"
 is M1.2, Leave-ends-grants stays a product gap. (c) DESIGN "Local store": `GroupOn` is kept until M1.2, not removed in step 7. (d) Step 7's section above states that `deleg_lone`'s
 per-row decision remains until M1.2 step 13, so §12's "no per-row class decision site left" is not yet met.
+
+**Sweeps** (release, `+commit`, strict, box 2): ×2,000 `backup-departs`, `singleton-first-peer`, `long-delegated`, `delegated-group-switch`, `backup`, `long-backup`: 0 failing, 0 I1,
+0 row-version mismatch each. Every delegated configuration ×300 (46 names): the failing sets are the documented exceptions only, and identical to main's (same seeds on both
+binaries): `delegated-core-stall-root-lease6` [8, 11, 32, 154, 197], `delegated-epoch` [16, 73, 114, 152, 221, 227], `long-delegated-hysteresis-off` [88, 118, 134, 153, 218, 266],
+`long-delegated-lead-off` (by design); 0 row-version mismatch anywhere; `backup+commit` ×300 judged 6 re-tags (the oracle's new check is exercised).
+
+**Perf** (write_gate: the `Ungated` branch and one more field in `AckTarget`; box 3, release binaries of main and this tree, `ack-latency` topology 1, 300 samples, A/B/B/A ×2 on
+ext4, xfs, btrfs and tmpfs): pooled geometric mean of the medians, branch over main, p50 0.995 and p90 1.007 over the 20 (file system, op) cells (within the 3 % gate); `write`
+(the fsync'd op) -0.9 / -0.5 / +0.7 / +0.4 % on btrfs / ext4 / xfs / tmpfs; the 30 to 90 us ops swing both ways by file system (xfs +14 to +36 %, ext4 and btrfs -5 to -20 %) at a 2 to
+10 us difference, noise at that size. `vfs-bench`: dispatch overhead 58 to 100 ns/op (< 1 us), no extra allocation.
+
+**Gates** (debug and release): `fmt --check`, `clippy --workspace --all-targets -D warnings`; lib tests meta 411 / 409, authority 1,073, engine 953; meta integration (`--tests`) 636 debug,
+634 release; release authority sim suite 420 passed, 0 failed, 12 ignored.
