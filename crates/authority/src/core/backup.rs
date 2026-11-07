@@ -4690,6 +4690,26 @@ impl Core {
                 continue;
             }
             sent = sent.max(batch.len() as u64);
+            // Simulation: every Nth batch carrying a grant goes out as
+            // uncommitted, whatever the group holds.
+            let mut knob_uncommitted = false;
+            if self.cfg.stream_ahead_uncommit_grant_every > 0
+                && batch.iter().any(|t| {
+                    t.records
+                        .iter()
+                        .any(|r| matches!(r, constellation_meta::LogRecord::DelegateNode { .. }))
+                })
+            {
+                self.stats.stream_grant_batches += 1;
+                if self
+                    .stats
+                    .stream_grant_batches
+                    .is_multiple_of(self.cfg.stream_ahead_uncommit_grant_every)
+                {
+                    self.stats.stream_grants_uncommitted += 1;
+                    knob_uncommitted = true;
+                }
+            }
             if in_epoch {
                 if self.ack.hold_epoch != Some(epoch) {
                     self.ack.hold_acked.clear();
@@ -4713,6 +4733,7 @@ impl Core {
                     // archive — a hold's rows (non-stealable) and a lone
                     // node's streamed after the gate went off are not.
                     committed: !in_epoch
+                        && !knob_uncommitted
                         && batch.iter().all(|t| {
                             t.records.is_empty()
                                 || t.origin != (0, 0)

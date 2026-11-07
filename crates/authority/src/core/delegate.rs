@@ -1356,6 +1356,15 @@ impl Core {
             if self.dl.mine.contains_key(&d.gen) || self.dl.epoch_active {
                 continue;
             }
+            // A generation this node already answered a recall for (the
+            // grant was parked, or never installed, when the root took it
+            // back) is never installed afterwards: the root ended it in its
+            // own journal and refuses what would run under it. Its end may
+            // sit in a later segment than its `DelegateNode`; the sync that
+            // applies that one drops the `handed_back` entry.
+            if self.dl.handed_back.contains_key(&d.gen) {
+                continue;
+            }
             let awaiting = awaiting_end.get_or_insert_with(|| {
                 let live: BTreeSet<u64> = table.gens().collect();
                 replica.deleg_gens_awaiting_end(&live)

@@ -38038,6 +38038,13 @@ fn delegate_with_first_renewal_out() -> (Harness, OpId, u64) {
 fn delegate_learning_a_streamed_grant(
     committed: bool,
 ) -> (Harness, Vec<LogRecord>, constellation_fs_core::Ino) {
+    delegate_learning_a_streamed_grant_of(committed, constellation_meta::SubtreeKind::Placed)
+}
+
+fn delegate_learning_a_streamed_grant_of(
+    committed: bool,
+    kind: constellation_meta::SubtreeKind,
+) -> (Harness, Vec<LogRecord>, constellation_fs_core::Ino) {
     let mut h = Harness::new(3);
     h.core.cfg.delegation = true;
     h.core.cfg.p2p = true;
@@ -38053,7 +38060,7 @@ fn delegate_learning_a_streamed_grant(
             gid: 0,
             time_ns: 1,
         },
-        LogRecord::delegate_one(3, 7, dir, constellation_meta::SubtreeKind::Placed),
+        LogRecord::delegate_one(3, 7, dir, kind),
     ];
     crate::replica::Replica::install_streamed(&h.meta, 1, 1, 1, 2, &records, committed, (0, 0))
         .unwrap();
@@ -38062,13 +38069,19 @@ fn delegate_learning_a_streamed_grant(
 
 /// Plan 46 M1.2 step 8b (M1.0 answer 4, `sticky_answers_before_grant_
 /// committed`): a grant is honoured once the root's configuration has
-/// committed its `DelegateNode`. A lone root's journal commits nothing
-/// beyond the archive, and its unshipped record reaches a delegate as a
-/// streamed entry the root did not stream as committed: the table lists
-/// the grant (the delegate learned it), but the delegate neither installs
-/// nor renews it, so nothing executes under it, until the segment that
-/// carries the row lands. Fails on the parent: the delegate installs the
-/// grant at once, renews it, and executes under the root's answer.
+/// committed its `DelegateNode`. A delegate whose replica holds the record
+/// as a streamed entry the root did not stream as committed (`StreamAhead.
+/// committed` unset) has learned the grant, since the table lists it, but
+/// neither installs nor renews it, so nothing executes under it, until the
+/// segment that carries the row lands. A lone root never produces that
+/// stream on its own: it has no durability horizon to stream ahead of
+/// (`durable_jseq` is MAX, `stream_ahead` returns early), so its delegate
+/// learns every grant from a segment, which is the archive, and waits for
+/// it on the parent too. The producers are a mixed batch (one ungated row,
+/// a lone-to-group transition's, journaled `Lone`) and an epoch hold
+/// re-streaming unshipped pre-epoch rows. Fails on the parent: the delegate
+/// installs the grant at once, renews it, and executes under the root's
+/// answer.
 #[test]
 fn a_grant_the_root_has_not_committed_is_learned_but_not_honoured_until_the_log_carries_it() {
     let (mut h, records, dir) = delegate_learning_a_streamed_grant(false);
@@ -38107,6 +38120,68 @@ fn a_grant_the_root_has_not_committed_is_learned_but_not_honoured_until_the_log_
     h.step(renewed(&h, req, 7, 5_000));
     let out = create_in(&mut h, dir, 2);
     assert_eq!(h.core.dl.mine[&7].executed, 1, "{out:?}");
+}
+
+/// Step 8b review: a recall answered while the grant is parked (learned,
+/// not honoured) hands the generation back, and the `DelegateNode` record
+/// then arrives in a segment of its own, the `DelegateNodeEnded` in a later
+/// one. The generation is never installed in between: a designee installed
+/// there would hold `until = MAX` and execute rows the root, which ended the
+/// generation at the recall, refuses. Fails on the parent (installed).
+#[test]
+fn a_generation_recalled_while_parked_is_not_installed_when_its_record_reaches_the_log() {
+    for kind in [
+        constellation_meta::SubtreeKind::Placed,
+        constellation_meta::SubtreeKind::Designated,
+    ] {
+        let (mut h, records, dir) = delegate_learning_a_streamed_grant_of(false, kind);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine.is_empty() && h.core.dl.commit_waiting.contains_key(&7));
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegRecall {
+                req: OpId(5),
+                dir,
+                gen: 7,
+            },
+        });
+        assert_eq!(h.core.deleg_handed_back_to(7), Some(1), "{kind:?}");
+        // The segment with the `DelegateNode` and not its end.
+        crate::replica::Replica::apply_segment(&h.meta, 1, 1, 2, &[1], &[], &records).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.dl.mine.is_empty(),
+            "{kind:?}: installed a generation it handed back"
+        );
+        assert!(renewal_sent(&out).is_none(), "{kind:?}: {out:?}");
+        let out = create_in(&mut h, dir, 1);
+        assert_eq!(
+            h.core.dl.mine.get(&7).map_or(0, |d| d.executed),
+            0,
+            "{out:?}"
+        );
+        // Its end, in a later segment: the hand-back goes with the row.
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
+                gen: 7,
+                through: 0,
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.handed_back.is_empty(), "{kind:?}");
+        assert!(h.core.dl.mine.is_empty(), "{kind:?}");
+    }
 }
 
 /// ... and a record the root streamed as committed (its group holds the

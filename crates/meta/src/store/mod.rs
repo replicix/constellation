@@ -733,6 +733,11 @@ pub struct Meta {
     /// store, to hold a writer there.
     #[cfg(test)]
     pub(crate) horizon_write_hook: std::sync::Mutex<Option<HorizonWriteHook>>,
+    /// Plan 46 M1.2 step 8b review: the generations whose `DelegateNode` an
+    /// ungated streamed spec entry carries, by the entry's spec seq (an
+    /// entry is immutable and its seq never reused), so the retry tick of a
+    /// parked install decodes a row once ([`Meta::uncommitted_streamed_grants`]).
+    pub(crate) streamed_grant_gens: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<u64>>>,
     /// Simulation oracle: the highest `DelegateNodeGroup` version this replica ever
     /// applied per generation (the group row goes with the generation, so
     /// the store alone cannot say which version a row of an ended
@@ -1301,6 +1306,7 @@ impl Meta {
             horizon_written: Default::default(),
             #[cfg(test)]
             horizon_write_hook: std::sync::Mutex::new(None),
+            streamed_grant_gens: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             #[cfg(any(test, feature = "test-util"))]
             deleg_group_top: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             #[cfg(any(test, feature = "test-util"))]

@@ -68240,8 +68240,10 @@ decision (D9) is re-taken against at M1.3's exit.
 A delegate installs, renews and executes under a grant only once the root's configuration has committed its `DelegateNode` record. The delegate
 learns the commit from where its replica got the record: a record applied from the log (a segment, which is in the archive) is committed, the
 only commit a lone root has; a record the root streamed ahead of the log as committed (`StreamAhead.committed`: its group holds the row) is
-committed; a record it holds only as an uncommitted streamed entry (a lone root's journal under a continuation epoch's hold) is learned, since the
-table lists it, but not honoured. `Meta::uncommitted_streamed_grants` lists those generations (`Replica::deleg_grants_uncommitted`);
+committed; a record it holds only as an uncommitted streamed entry is learned, since the table lists it, but not honoured. A lone root does not
+produce one on its own (it has no durability horizon to stream ahead of: `durable_jseq` is MAX and `stream_ahead` returns early), so its delegate
+learns every grant from a segment; the producers are a mixed batch (one ungated row, e.g. a lone-to-group transition's, journaled `Lone`) and an
+epoch hold re-streaming unshipped pre-epoch rows. `Meta::uncommitted_streamed_grants` lists those generations (`Replica::deleg_grants_uncommitted`);
 `delegation_sync` parks such a generation (`dl.commit_waiting`, counter `deleg_install_waits_commit`): no `DelegState`, no renewal, so its ops
 forward to the root. The segment that carries the row retires the entry and runs the sync (the log's `DelegateNode`); the install retry timer
 covers a lost one. The wait is bounded by existing paths: the root hears no renewal and reclaims the generation at its first-renewal horizon,
@@ -68260,10 +68262,37 @@ signature differs by a segment (the rows' `time_ns` differ between two builds of
 for an uncommitted grant: 0 in all 8,000 seeds: the sim never produces an uncommitted streamed grant (a lone root does not stream ahead; only an
 epoch hold does).
 
-Perf: the S3 wait per grant under a lone root is not new. The delegate of a lone root learns the grant through a shipped segment on the parent
-too (the root streams nothing ahead of the archive: `stream_ahead` returns at `durable_jseq() == u64::MAX`), so the step adds no wait to
-`placement-hot` (sim: installs put off 0, segments and waits per seed equal to the parent's). No bench was run: there is no code path that
-differs for a grant the log carries.
+Perf: the S3 wait per grant under a lone root is not new: its delegate learns the grant through a shipped segment on the parent too (the root
+streams nothing ahead of the archive), so the step adds no wait to `placement-hot` (sim: installs put off 0, segments and waits per seed equal to
+the parent's). The step adds a wait only for the two producers above, and only until the segment lands. No bench was run: there is no code path
+that differs for a grant the log carries.
 
 Gates (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (lib and integration), authority lib (1,079), engine lib (953),
 control, release authority sim suite 421 passed, 0 failed, 12 ignored.
+
+### Plan 46 M1.2 step 8b fix: no install of a generation handed back, a knob for the uncommitted stream, a cached scan
+
+- A recall answered while the grant was parked (learned, not honoured) handed the generation back, and a `DelegateNode` that then reached the log in
+  a segment before the one with the `DelegateNodeEnded` installed it (a designee with `until` at its maximum), which executed rows the root, which
+  ended the generation at the recall, refuses. `delegation_sync` installs no generation in `dl.handed_back` (the entry goes with the table row).
+  Test `a_generation_recalled_while_parked_is_not_installed_when_its_record_reaches_the_log` (Placed and Designated; fails on the parent).
+- The premise of step 8b's perf note is corrected above (a lone root never streams a grant ahead; the producers are a mixed batch and an epoch hold).
+- Coverage: sim knob `AUTHORITY_SIM_UNCOMMIT_GRANTS=<n>` (`Config::stream_ahead_uncommit_grant_every`) sends `committed = false` on every nth batch
+  carrying a `DelegateNode` (errs only toward waiting longer); `SWEEP-XGEN-TOTALS` counts grant batches streamed and sent uncommitted.
+- `Meta::uncommitted_streamed_grants` decodes a streamed entry's row once (`streamed_grant_gens`, by spec seq, which is never reused).
+- `locks_writer_hold_delegated_without_the_settle_is_caught` is a seed-pinned negative control: the handed-back rule moved its trajectories (981, 2329 and
+  2462 show none), re-pinned to 1313, 2666 and 2955 (the three of seeds 0 to 6,000 that show it, unclocked, the settle clean on all 6,000).
+
+Sweeps (`+commit`, seeds 0..1,999, release, main against this branch): `long-delegated`, `delegated-root-crash`, `delegated-lone-s3-cut`, `placement-hot`,
+`delegated-designated`, `delegated-backup`, `long-delegated-backup`: 0 failing on both. With `AUTHORITY_SIM_UNCOMMIT_GRANTS=2`: `long-delegated`,
+`delegated-designated`, `delegated-root-crash`: 0 failing, and 0 grant batches streamed (those roots are lone; nothing streams a grant ahead of the
+log, which is the corrected premise above, so the knob has nothing to act on there); `delegated-backup` (group-backed root, grants streamed ahead):
+7,254 grant batches, 3,617 sent uncommitted, 648 installs put off for an uncommitted grant, 0 failing, oracles clean; `long-delegated-backup`: 4,258 batches,
+2,030 uncommitted, 406 installs put off, 0 failing. The third-party ops that bounce between the root (`NotHolder { delegate }`) and the parked delegate
+end with the unsettled-EIO oracles clean in all of them (a parked grant is bounded by the root's reclaim at its first-renewal horizon). The sim test
+`a_grant_streamed_as_uncommitted_makes_its_delegate_wait_for_the_log` (delegated-backup, knob 2, 30 seeds) asserts the counter. `delegated-epoch`
+(not in the list; I1 and class-claim failures on main already) fails 57 seeds on main and 59 here (same classes; 438, 773, 978 and 1688 in, 927 and 1739
+out: a moved schedule, no install put off in it).
+
+Gates (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (lib and integration), authority lib (1,080), engine lib (953), control,
+release authority sim suite 422 passed, 0 failed, 12 ignored.

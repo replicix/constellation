@@ -474,6 +474,12 @@ pub struct Config {
     /// Simulation only: the delegate loses the answer to the first recall of
     /// every Nth generation (`Core::on_deleg_recall`; 0: none) (L3).
     pub delegation_recalled_drop_every: u64,
+    /// Simulation only: the root streams every Nth batch that carries a
+    /// `DelegateNode` as uncommitted (`StreamAhead.committed = false`,
+    /// `Core::stream_ahead`; 0: none), so a delegate learns the grant and
+    /// waits for the log (plan 46 M1.2 step 8b). It errs only toward
+    /// waiting longer: the segment that carries the row commits it.
+    pub stream_ahead_uncommit_grant_every: u64,
     /// The root reclaims a grant nobody renewed (a crashed delegate).
     /// Always on in production; the simulation turns it off to pin the
     /// liveness it provides.
@@ -772,6 +778,7 @@ impl Config {
             delegation_push_drop_every: 0,
             delegation_recall_drop_every: 0,
             delegation_recalled_drop_every: 0,
+            stream_ahead_uncommit_grant_every: 0,
             delegation_reclaim_expired: true,
             placement: true,
             placement_window_ms: 30_000,
@@ -1038,6 +1045,11 @@ pub struct Stats {
     /// Delegate: installs put off because the grant's `DelegateNode` record
     /// is not committed yet (plan 46 M1.2 step 8b).
     pub deleg_install_waits_commit: u64,
+    /// Root, simulation only (`Config::stream_ahead_uncommit_grant_every`):
+    /// batches carrying a `DelegateNode` streamed ahead, and those sent
+    /// as uncommitted by the knob.
+    pub stream_grant_batches: u64,
+    pub stream_grants_uncommitted: u64,
     /// ... and how long those installs waited in all and at most.
     pub deleg_install_wait_ms: u64,
     pub deleg_install_wait_max_ms: u64,

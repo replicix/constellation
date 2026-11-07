@@ -6118,6 +6118,22 @@ fn sweep_config() {
                 });
             }
         }
+        // Plan 46 M1.2 step 8b: `AUTHORITY_SIM_UNCOMMIT_GRANTS=<n>` makes
+        // every root stream every nth batch carrying a `DelegateNode` as
+        // uncommitted (`Config::stream_ahead_uncommit_grant_every`): the
+        // delegate learns the grant and waits for the log to honour it.
+        if let Some(n) = std::env::var("AUTHORITY_SIM_UNCOMMIT_GRANTS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+        {
+            let inner = c.core.clone();
+            c.core = std::sync::Arc::new(move |id, inc| {
+                let mut core = inner(id, inc);
+                core.stream_ahead_uncommit_grant_every = n;
+                core
+            });
+        }
         // `AUTHORITY_SIM_READ_DELEGATIONS=0` turns the read delegations off
         // in every node of any configuration (the takeover floor's read part
         // is armed and persisted whatever that setting).
@@ -6851,6 +6867,41 @@ fn delegated_backup_config() -> SimConfig {
         core: std::sync::Arc::new(sim::run::deleg_backup_core_config),
         ..delegated_config()
     }
+}
+
+/// Plan 46 M1.2 step 8b: the sim's roots stream a grant ahead of the log only
+/// when a group backs them (a lone root streams nothing ahead), and then
+/// always as committed. With the knob (`Config::stream_ahead_uncommit_grant_every`)
+/// every second batch carrying a `DelegateNode` goes out uncommitted: the
+/// delegates that learn the grant that way wait for the log
+/// (`deleg_install_waits_commit`) and every oracle stays clean (the run
+/// fails otherwise).
+#[test]
+fn a_grant_streamed_as_uncommitted_makes_its_delegate_wait_for_the_log() {
+    let inner = delegated_backup_config().core;
+    let cfg = SimConfig {
+        core: std::sync::Arc::new(move |id, inc| {
+            let mut c = inner(id, inc);
+            c.stream_ahead_uncommit_grant_every = 2;
+            c
+        }),
+        ..delegated_backup_config()
+    };
+    let (mut waits, mut sent, mut batches) = (0, 0, 0);
+    for seed in 80_000..80_030 {
+        let report = run_seed(seed, cfg.clone())
+            .unwrap_or_else(|e| panic!("delegated-backup + uncommitted grants seed {seed}: {e}"));
+        for st in report.stats.values() {
+            waits += st.deleg_install_waits_commit;
+            sent += st.stream_grants_uncommitted;
+            batches += st.stream_grant_batches;
+        }
+    }
+    assert!(sent > 0 && sent < batches, "knob: {sent} of {batches}");
+    assert!(
+        waits > 0,
+        "no delegate waited ({sent} of {batches} uncommitted)"
+    );
 }
 
 /// Plan 46 M0.3 (plan 43 C2h): the 2026-10-16 acknowledged-write loss. Two
@@ -7741,7 +7792,7 @@ struct OracleTotals {
     /// holds (count, total ms, max ms), and the path-B and lost-dependency
     /// counters (installs put off, generations stopped, rows the root
     /// refused, answers that took nothing).
-    xgen: [u64; 19],
+    xgen: [u64; 21],
     /// Segments landed, their decompressed bytes, the delegate-stream
     /// dependency waits (`deleg_deps_waits`) and the segments' bytes as
     /// stored, over the sweep's seeds.
@@ -7840,6 +7891,8 @@ impl OracleTotals {
             self.xgen[16] += st.deleg_xdeps_log_reads;
             self.xgen[17] += st.deleg_xdeps_own_checks;
             self.xgen[18] += st.deleg_install_waits_commit;
+            self.xgen[19] += st.stream_grant_batches;
+            self.xgen[20] += st.stream_grants_uncommitted;
             self.seg[2] += st.deleg_deps_waits;
             self.parked[0] += st.deleg_stream_acks_released;
             self.parked[1] += st.deleg_stream_acks_by_log;
@@ -8120,7 +8173,7 @@ impl OracleTotals {
              ({} ms, max {} ms) of delegated acks released {} ({} ms waited); prefix holds {} \
              ({} ms, max {} ms); installs put off {} ({} ms, max {} ms), generations stopped at a lost dependency {}, \
              rows refused at the root {}, answers that took nothing {}; caps computed {} times, {} entries visited; xdeps store reads: log {} own-check {}; \
-             installs put off for an uncommitted grant {}",
+             installs put off for an uncommitted grant {} (grant batches streamed {}, sent uncommitted {})",
             self.seeds,
             self.xgen[0],
             self.xgen[1],
@@ -8140,7 +8193,9 @@ impl OracleTotals {
             self.xgen[15],
             self.xgen[16],
             self.xgen[17],
-            self.xgen[18]
+            self.xgen[18],
+            self.xgen[19],
+            self.xgen[20]
         );
         eprintln!(
             "SWEEP-SEGMENTS {label} seeds {}/{seeds}: segments landed {}, decompressed bytes {}, \
@@ -14004,7 +14059,11 @@ fn locks_writer_hold_delegated_without_the_settle_is_caught() {
     // (Plan 46 M1.1 step 5: a configuration's rows wait for their own rule
     // across a change; 2790, 3104 and 4268 show none, and 981, 2329 and 2462
     // are the first three of seeds 0 to 6 000 that do, unclocked.)
-    let seeds = [981, 2329, 2462];
+    // (Plan 46 M1.2 step 8b fix: a generation handed back is not installed
+    // again; 981, 2329 and 2462 show none, and 1313, 2666 and 2955 are the
+    // three of seeds 0 to 6 000 that do, unclocked, the settle clean on all
+    // 6 000.)
+    let seeds = [1313, 2666, 2955];
     let mut caught = 0;
     for seed in seeds {
         if let Err(e) = run_seed(seed, locks_writer_hold_delegated_unsettled_config()) {

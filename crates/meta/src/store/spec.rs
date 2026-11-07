@@ -6342,20 +6342,33 @@ impl Meta {
     ) -> Result<std::collections::BTreeSet<u64>, MetaError> {
         let r = self.db.read_tx();
         let mut out = std::collections::BTreeSet::new();
+        let mut cache = self.streamed_grant_gens.lock().unwrap();
+        let mut live = std::collections::BTreeSet::new();
         for (seq, entry) in live_non_local(&r, self)? {
             if !matches!(entry, LiveEntry::Streamed { gated: false, .. }) {
+                continue;
+            }
+            live.insert(seq);
+            if let Some(gens) = cache.get(&seq) {
+                out.extend(gens.iter().copied());
                 continue;
             }
             let Some(v) = r.get(&self.spec, seq_key(seq))? else {
                 continue;
             };
             let row: SpecRow = crate::record::from_bytes_exact(&v)?;
-            for rec in &row.records {
-                if let LogRecord::DelegateNode { gen, .. } = rec {
-                    out.insert(*gen);
-                }
-            }
+            let gens: Vec<u64> = row
+                .records
+                .iter()
+                .filter_map(|rec| match rec {
+                    LogRecord::DelegateNode { gen, .. } => Some(*gen),
+                    _ => None,
+                })
+                .collect();
+            out.extend(gens.iter().copied());
+            cache.insert(seq, gens);
         }
+        cache.retain(|seq, _| live.contains(seq));
         Ok(out)
     }
 
