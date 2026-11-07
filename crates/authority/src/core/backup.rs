@@ -740,6 +740,11 @@ pub(crate) struct AckState {
     /// it: a row at or below it was journaled before or in the hold, and
     /// answers by the archive or its group, never as a lone node's
     /// ([`Core::park_durable`]); the hold's own acks are forgotten.
+    /// Memory only, on purpose: it guards the answers parked (and the
+    /// retries answered by `settled_outcome`) in this process, and a restart
+    /// drops every parked answer and client entry and ends the tenure, so
+    /// the hold's rows are the startup recovery's (stranded, replayed by rid
+    /// through the next lease, plan 30 M3b), never answered from here.
     hold_end_tip: Option<u64>,
     /// Plan 46 M1.4 step 1, hold owner: the highest journal seq each epoch
     /// member acknowledged holding (`PeerMsg::StreamAheadAck`), for the
@@ -750,6 +755,13 @@ pub(crate) struct AckState {
     /// Batches of the hold streamed to a member and not yet acknowledged:
     /// `(last seq, sent at)`, oldest first (bounded; the wait statistic only).
     pub(crate) hold_sent: BTreeMap<NodeId, VecDeque<(u64, WaitMs)>>,
+    /// The highest journal seq streamed to each member in this hold, and the
+    /// members whose lost batches are being resent: a resend carries one
+    /// batch, and its ack sends the next until the member's ack reaches what
+    /// was streamed (a gap wider than a batch; no segment closes it while
+    /// the epoch is open).
+    pub(crate) hold_sent_hi: BTreeMap<NodeId, u64>,
+    pub(crate) hold_resending: std::collections::BTreeSet<NodeId>,
     /// The last run of the periodic backup bookkeeping (selection,
     /// timeouts, promotion): a few times per second is plenty, and the
     /// per-event path stays the append and the release.
@@ -1929,12 +1941,16 @@ impl Core {
         if self.archive_covers(jseq, shipped) || (self.lease.epoch_held() && !self.hold_group()) {
             return true;
         }
-        if !self.lease.epoch_held() && self.ack.hold_end_tip.is_some_and(|t| jseq <= t) {
+        if self.left_by_hold(jseq) {
             // Plan 46 M1.4 step 2: journaled before or in a hold that has
             // ended, and its acks are forgotten: the archive, or the group
             // of the configuration in force, commits it. Never a lone
-            // node's answer on a row the hold left uncommitted.
-            return self.durable_jseq() != u64::MAX && self.durable_covers(jseq);
+            // node's answer on a row the hold left uncommitted: a lone root
+            // has no group, and what a closed configuration still owes
+            // (`durable_jseq`) is not a second copy of it.
+            return !self.root_lone()
+                && self.durable_jseq() != u64::MAX
+                && self.durable_covers(jseq);
         }
         if self.durable_jseq() != u64::MAX {
             return self.durable_covers(jseq);
@@ -2159,7 +2175,10 @@ impl Core {
             Some((first, class))
                 if (class.is_final() || class.is_hold()) && !self.lease.epoch_held() =>
             {
-                if self.root_lone() {
+                // Plan 46 M1.4 step 2 fix: a row the ended hold left
+                // uncommitted waits for the archive or the group
+                // (`park_durable`), lone or not; its label is the wait's.
+                if self.root_lone() && !self.left_by_hold(first) {
                     replica
                         .reclass_journal_tx(
                             first,
@@ -3532,6 +3551,8 @@ impl Core {
                 self.ack.hold_acked.clear();
                 self.ack.hold_epoch = None;
                 self.ack.hold_sent.clear();
+                self.ack.hold_sent_hi.clear();
+                self.ack.hold_resending.clear();
                 if let Some(id) = self.ack.hold_resend_timer.take() {
                     self.cancel_timer(id, out);
                 }
@@ -4821,8 +4842,12 @@ impl Core {
                 if self.ack.hold_epoch != Some(epoch) {
                     self.ack.hold_acked.clear();
                     self.ack.hold_sent.clear();
+                    self.ack.hold_sent_hi.clear();
+                    self.ack.hold_resending.clear();
                     self.ack.hold_epoch = Some(epoch);
                 }
+                let hi = self.ack.hold_sent_hi.entry(n).or_insert(0);
+                *hi = (*hi).max(reached);
                 let q = self.ack.hold_sent.entry(n).or_default();
                 q.push_back((reached, now.wait));
                 while q.len() > HOLD_SENT_MAX {
@@ -4900,10 +4925,6 @@ impl Core {
         if !self.hold_group() || !self.epoch_streams_ahead() {
             return;
         }
-        let Some(epoch) = self.lease.epoch() else {
-            return;
-        };
-        let tip = replica.journal_tip();
         let due = self.cfg.hold_resend_ms.max(1) as i64;
         let members: Vec<NodeId> = self
             .ack
@@ -4913,30 +4934,54 @@ impl Core {
             .map(|(n, _)| *n)
             .collect();
         for n in members {
-            let acked = self.ack.hold_acked.get(&n).copied().unwrap_or(0).min(tip);
-            let txs: Vec<BackupTx> = replica
-                .journal_txs_from(acked + 1, self.cfg.backup_batch_rows)
-                .into_iter()
-                .filter(|t| t.last <= tip)
-                .collect();
-            let q = self.ack.hold_sent.entry(n).or_default();
-            q.clear();
-            let Some(last) = txs.last().map(|t| t.last) else {
-                continue;
-            };
-            q.push_back((last, now.wait));
-            self.stats.hold_resends += 1;
-            out.push(Action::Send {
-                to: n,
-                msg: PeerMsg::StreamAhead {
-                    epoch,
-                    base: self.ship.head_seq,
-                    txs,
-                    committed: false,
-                },
-            });
+            self.resend_hold_batch(n, now, replica, out);
         }
         self.arm_hold_resend(now, out);
+    }
+
+    /// One batch of the journal after what member `n` acknowledged, sent
+    /// again (and the member marked as being resent to).
+    fn resend_hold_batch(
+        &mut self,
+        n: NodeId,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(epoch) = self.lease.epoch() else {
+            return;
+        };
+        let tip = replica.journal_tip();
+        let acked = self.ack.hold_acked.get(&n).copied().unwrap_or(0).min(tip);
+        let txs: Vec<BackupTx> = replica
+            .journal_txs_from(acked + 1, self.cfg.backup_batch_rows)
+            .into_iter()
+            .filter(|t| t.last <= tip)
+            .collect();
+        let q = self.ack.hold_sent.entry(n).or_default();
+        q.clear();
+        let Some(last) = txs.last().map(|t| t.last) else {
+            self.ack.hold_resending.remove(&n);
+            return;
+        };
+        q.push_back((last, now.wait));
+        // The episode runs to the journal's tip as it stands (the rows
+        // the answers wait for), whatever was streamed before.
+        let hi = self.ack.hold_sent_hi.entry(n).or_insert(0);
+        *hi = (*hi).max(last);
+        if self.ack.hold_resending.insert(n) {
+            *hi = (*hi).max(tip);
+        }
+        self.stats.hold_resends += 1;
+        out.push(Action::Send {
+            to: n,
+            msg: PeerMsg::StreamAhead {
+                epoch,
+                base: self.ship.head_seq,
+                txs,
+                committed: false,
+            },
+        });
     }
 
     /// Plan 46 M1.4 step 1, hold owner: a member holds this node's epoch
@@ -4950,6 +4995,7 @@ impl Core {
         epoch: Epoch,
         through: u64,
         replica: &dyn Replica,
+        out: &mut Vec<Action>,
     ) {
         if !self.lease.epoch_held()
             || self.lease.epoch() != Some(epoch)
@@ -4962,6 +5008,8 @@ impl Core {
         if self.ack.hold_epoch != Some(epoch) {
             self.ack.hold_acked.clear();
             self.ack.hold_sent.clear();
+            self.ack.hold_sent_hi.clear();
+            self.ack.hold_resending.clear();
             self.ack.hold_epoch = Some(epoch);
         }
         // A member cannot hold more than the journal has.
@@ -4976,6 +5024,18 @@ impl Core {
                 }
                 self.stats.hold_ack_wait_ms += (now.wait.0 - sent.0).max(0) as u64;
                 q.pop_front();
+            }
+        }
+        // A resend carries one batch: while the member's ack is short of
+        // what was streamed to it, its ack of the resend asks for the next.
+        if self.ack.hold_resending.contains(&from) {
+            let hi = self.ack.hold_sent_hi.get(&from).copied().unwrap_or(0);
+            let acked = self.ack.hold_acked.get(&from).copied().unwrap_or(0);
+            if acked >= hi {
+                self.ack.hold_resending.remove(&from);
+            } else if self.ack.hold_sent.get(&from).is_none_or(|q| q.is_empty()) {
+                self.resend_hold_batch(from, now, replica, out);
+                self.arm_hold_resend(now, out);
             }
         }
     }
@@ -6340,6 +6400,12 @@ impl Core {
             if e != epoch || tx.first < next {
                 // Already in the log (or superseded): nothing to do.
                 if tx.first < next && e == epoch {
+                    // Plan 46 M1.4 step 2 fix: the cursor is past these rows
+                    // (an installed batch whose ack was lost: the owner
+                    // sends them again from what it saw acknowledged). They
+                    // are in the store, so the ack goes out again, or the
+                    // owner resends them forever.
+                    held_through = held_through.max(Some(tx.last.min(next - 1)));
                     continue;
                 }
                 self.stats.streamed_dropped += 1;

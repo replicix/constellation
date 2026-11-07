@@ -59642,4 +59642,147 @@ mod hold_ack {
             .collect();
         assert_eq!(acked, vec![last], "{out:?}");
     }
+
+    /// Plan 46 M1.4 step 2 fix (review MUST-1): a member that installed a
+    /// batch whose ack was lost gets it again from the owner (it resends
+    /// from what it saw acknowledged). Its cursor is past the rows; it
+    /// acknowledges them again, or the owner resends every interval for
+    /// good and the parked answers wait for a new write.
+    #[test]
+    fn a_member_acks_again_a_batch_it_installed_when_the_ack_was_lost() {
+        let (mut owner, mut sub, req) = stream_pair();
+        submit_create(&mut owner, 1, "a");
+        let (p1, through) = holder_ship(&mut owner, 1, 100);
+        sub.step(Event::Peer {
+            from: 1,
+            msg: segment_frame(req, 1, 1, p1),
+        });
+        submit_create(&mut owner, 2, "b");
+        let txs = Replica::journal_txs_from(&owner.meta, through + 1, 100);
+        let last = txs.last().unwrap().last;
+        sub.core.ship.max_epoch = 1;
+        sub.core.epoch.open = true;
+        let batch = |txs: Vec<_>| Event::Peer {
+            from: 1,
+            msg: PeerMsg::StreamAhead {
+                epoch: 1,
+                base: 1,
+                txs,
+                committed: false,
+            },
+        };
+        let acks = |out: &[Action]| -> Vec<u64> {
+            sends(out)
+                .into_iter()
+                .filter_map(|(_, m)| match m {
+                    PeerMsg::StreamAheadAck { through, .. } => Some(*through),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Installed; the ack it sends is lost.
+        let out = sub.step(batch(txs.clone()));
+        assert_eq!(acks(&out), vec![last], "{out:?}");
+        // The owner's resend: the same rows, the cursor past them.
+        let out = sub.step(batch(txs));
+        assert_eq!(acks(&out), vec![last], "{out:?}");
+    }
+
+    /// Plan 46 M1.4 step 2 fix (review SHOULD-1): the resend carries one
+    /// batch; a gap wider than that is closed by the acks of the resends
+    /// (no segment closes it while the epoch is open), each one asking for
+    /// the next, until the member's ack reaches what was streamed.
+    #[test]
+    fn a_gap_wider_than_a_batch_is_resent_until_the_member_holds_all_of_it() {
+        let mut h = owner(0);
+        h.core.pr.epoch_members = vec![1, 2];
+        h.core.cfg.backup_batch_rows = 1;
+        for i in 0..5 {
+            create_nowait(&mut h, i + 1, &format!("g{i}"));
+        }
+        let tip = tip(&h);
+        assert!(tip >= 5, "{tip}");
+        let resent = |out: &[Action]| -> Vec<u64> {
+            sends(out)
+                .into_iter()
+                .filter_map(|(to, m)| match (to, m) {
+                    (2, PeerMsg::StreamAhead { txs, .. }) => txs.last().map(|t| t.last),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Every streamed batch was lost; the first resend is one batch.
+        h.advance(h.core.cfg.hold_resend_ms);
+        let id = h.core.ack.hold_resend_timer.expect("armed");
+        let out = h.step(Event::Timer { id });
+        let mut last = resent(&out);
+        assert_eq!(last.len(), 1, "{out:?}");
+        let mut rounds = 1;
+        // Each ack of a resend is answered with the next batch, without
+        // waiting for the timer, until the member holds the tip.
+        while last[0] < tip {
+            let out = ack(&mut h, 2, 1, last[0]);
+            last = resent(&out);
+            assert_eq!(last.len(), 1, "no next batch at {out:?}");
+            rounds += 1;
+            assert!(rounds <= tip as usize + 1);
+        }
+        assert!(rounds >= 3, "{rounds}");
+        let out = ack(&mut h, 2, 1, tip);
+        assert!(resent(&out).is_empty(), "{out:?}");
+        assert!(h.core.ack.hold_resending.is_empty());
+    }
+
+    /// Plan 46 M1.4 step 2 fix (review SHOULD-2): a row an ended hold left
+    /// uncommitted is labelled as it is answered, lone node or not: it waits
+    /// for the archive or the group in every path (`park_durable`, the
+    /// holder's deadline path `settled_outcome`, the in-doubt resolution) and
+    /// its class is archive-bound, never `Singleton` (which names an answer
+    /// from this disk, and this one does not leave on it).
+    #[test]
+    fn a_row_an_ended_hold_left_is_labelled_as_it_is_answered() {
+        use constellation_meta::{GroupOn, RowCommit};
+        for lone in [false, true] {
+            let mut h = owner(0);
+            h.core.pr.epoch_members = vec![1, 2];
+            let (rid, out) = create_nowait(&mut h, 1, "left");
+            assert!(!accepted_to_client(&out, rid), "{out:?}");
+            // The hold ends with the member's ack outstanding; the node
+            // holds an ordinary lease.
+            h.core.pr.epoch_members = vec![1];
+            h.core.lease.release_local();
+            h.hold(1, None);
+            if !lone {
+                let (l, _) = h.core.lease.held.as_mut().expect("held");
+                l.backups = vec![2];
+                l.singleton = false;
+            }
+            let (now, mut out) = (h.clk(), Vec::new());
+            h.core.backup_after_event(now, &h.meta, &mut out);
+            assert!(!h.core.lease.epoch_held());
+            let first = Replica::journal_class_of_rid(&h.meta, rid).unwrap().0;
+            assert!(h.core.left_by_hold(first));
+            assert_eq!(h.core.root_lone(), lone);
+            let class = h.core.journaled_answer_class(&h.meta, rid).unwrap();
+            assert!(
+                matches!(
+                    class,
+                    RowCommit::Group {
+                        on: GroupOn::Archive,
+                        ..
+                    }
+                ),
+                "lone {lone}: {class:?}"
+            );
+            assert!(
+                !h.core.park_durable(first, false, 0),
+                "lone {lone}: the parked answer leaves before the archive carries the row"
+            );
+            assert_eq!(
+                h.core.settled_outcome(rid, &h.meta),
+                None,
+                "lone {lone}: the deadline path answers a row the archive does not carry"
+            );
+        }
+    }
 }

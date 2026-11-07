@@ -2899,7 +2899,7 @@ impl Core {
                 committed,
             } => self.on_stream_ahead(now, from, epoch, base, txs, committed, replica, out),
             PeerMsg::StreamAheadAck { epoch, through } => {
-                self.on_stream_ahead_ack(now, from, epoch, through, replica)
+                self.on_stream_ahead_ack(now, from, epoch, through, replica, out)
             }
             PeerMsg::BackupHold { epoch, for_ms } => self.on_backup_hold(now, from, epoch, for_ms),
             PeerMsg::PromiseRequest { req, key } => {

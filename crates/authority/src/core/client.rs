@@ -2468,7 +2468,7 @@ impl Core {
                     pending: replica.journal_position(epoch),
                     streams: Default::default(),
                 };
-                let durable = self.ack_need(&position);
+                let durable = self.ack_need_of(rid, &position, replica);
                 // Plan 41 P41-01: an acceptance found completed waits for the
                 // read-delegation quarantine as a fresh execution's does
                 // (`dedup_acceptance_wait`).
@@ -3770,7 +3770,31 @@ impl Core {
                 .is_none()
                 .then_some(outcome);
         }
-        self.ack_need(&position).is_none().then_some(outcome)
+        self.ack_need_of(rid, &position, replica)
+            .is_none()
+            .then_some(outcome)
+    }
+
+    /// Plan 46 M1.4 step 2 fix: [`Self::ack_need`] for the answer to `rid`'s
+    /// row. A row an ended hold left uncommitted waits as `park_durable`
+    /// makes it wait (the archive or the group, a lone node's disk
+    /// included); `ack_need` reads the group's coverage of the tip only and
+    /// ignores `hold_end_tip`: a deadline's or a retry's answer left on it
+    /// while the parked one waited, with the row labelled for the archive.
+    pub(crate) fn ack_need_of(
+        &self,
+        rid: Rid,
+        position: &Position,
+        replica: &dyn Replica,
+    ) -> Option<u64> {
+        if let Some((first, _)) = replica
+            .journal_class_of_rid(rid)
+            .filter(|(first, _)| self.left_by_hold(*first))
+        {
+            let shipped = replica.journal_acked_seq().unwrap_or(0);
+            return (!self.park_durable(first, false, shipped)).then_some(first);
+        }
+        self.ack_need(position)
     }
 
     /// Plan 41 P41-01: an acceptance `settled_outcome` found at a lease

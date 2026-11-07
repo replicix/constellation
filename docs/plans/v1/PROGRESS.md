@@ -68366,3 +68366,46 @@ median p50 / p90 us A / B, ext4: create 90 / 117, 87 / 105; write 3130 / 3997, 3
 tmpfs: create 90 / 112, 83 / 103; write 128 / 194, 125 / 188; rename 75 / 110, 73 / 106; unlink 59 / 96, 59 / 94; chmod 36 / 66, 34 / 61. Neutral
 on all four (a first 4-round pass showed B 20 to 25 us slower on xfs and tmpfs rename, unlink and chmod; 16 rounds do not: noise). The hold's own
 answers (+1 LAN round trip to a member) are not measured: the harness has no S3-outage own-op latency row, and topology 1 has no hold.
+
+### Plan 46 M1.4 step 2 fix round (fable review of the commit rule)
+
+**MUST-1, a lost ack.** A member that installed a batch and whose `StreamAheadAck` was lost got the owner's resend from `hold_acked + 1`; its cursor
+was past those rows, the `tx.first < next` branch `continue`d before anything raised `held_through`, no ack went out, and the owner resent every 250 ms
+for good (the parked answers waited for a new write or the deadline). The branch now raises `held_through` to `min(tx.last, next - 1)`: the rows are in
+the store, the ack goes out again. Test `a_member_acks_again_a_batch_it_installed_when_the_ack_was_lost` (fails on the commit under review).
+
+**SHOULD-1, a gap wider than a batch.** The resend sent one batch of `backup_batch_rows` and emptied the queue; gapped batches parked at the member are
+retried only after a segment, and none comes while the epoch is open. `resend_hold_batch` (shared by the timer and the ack) marks the member as being
+resent to (`hold_resending`, target `hold_sent_hi`: the highest streamed, raised to the journal tip when the episode starts); the member's ack of a
+resend that is short of the target sends the next batch at once (and re-arms the timer for a lost one), until the ack reaches the target. Test
+`a_gap_wider_than_a_batch_is_resent_until_the_member_holds_all_of_it` (five rows, one-row batches; fails on the commit under review).
+
+**SHOULD-2, the label and the wait.** A row an ended hold left (`left_by_hold`) waits for the archive or the group in `park_durable`; for a lone root
+it used to be re-tagged `Singleton` while it waited, and the holder's deadline path and `resolve_in_doubt_then_execute` took `ack_need`, which ignores
+`hold_end_tip`, and answered it from the disk (`flex-tight` 50, 592, `locks-blips` 644, `locks-blips-tight-faults` 716 once the label said archive).
+Decided as ADR-33 step 5 as amended and the step's own rule read together (a first try the other way, a lone node answering such a row as a singleton,
+brought the hold's I1 back: hundreds of `flex-backup` seeds): the row is **archive-bound** for a lone node as for any other, and so is its label
+(`journaled_answer_class` re-tags `Singleton` only a row the hold did not leave); `park_durable`'s hold-end branch is `!root_lone() && durable_jseq() != MAX
+&& durable_covers` (what a closed configuration still owes is not a second copy); `ack_need_of(rid, position)` replaces `ack_need` in `settled_outcome`
+and in the in-doubt resolution and follows `park_durable` for a left row. Test `a_row_an_ended_hold_left_is_labelled_as_it_is_answered` (the lone case
+fails on the commit under review: a lone node's row is labelled `Singleton` while it waits for the archive).
+
+**NIT.** `hold_end_tip` stays in memory, documented on the field: it guards the answers parked and the retries answered in this process; a restart drops
+every parked answer and client entry and ends the tenure, so the hold's rows are the startup recovery's (stranded, replayed by rid through the next
+lease, plan 30 M3b), never answered from here.
+
+**Sweeps** (release, ×2,000 `+commit`; base = the rebased commit under review, e1e75fdb's tree). Failing seeds, base to fix: `flex` 7 to 7 (same),
+`flex-crash` 7 to 7 (same), `flex-tight` 11 to 9 (1359 and 1655 pass; 623 and 1323 remain, the shape below), `flex-backup`, `flex-taker-ahead`,
+`flex-promiser-restart-step-forward`, `flex-zero`, `locks-blips-tight-single` 0 to 0, `delegated-epoch` 8 to 9 (+1711, the delegated I1 of 983's shape:
+step 3), `locks-blips-tight-faults` 4 to 3 (1384 passes), `locks-blips-tight-long-lease` 5 to 6 (+291), `locks-core-stall-blips` 15 to 16 (+904), every
+other `locks-*-blips` and `locks-unlinked-delegated-blips` unchanged. hold-I1 ("shadow installed for an answer not said to be committed"): 0 everywhere.
+The three seeds added are the draws a moved schedule shifts: 291 and 904 already fail on the base in a sibling configuration (`locks-blips-tight-in-doubt`
+291, `locks-blips` 904), all three are the class below.
+
+**Class claims left** (flex 7, flex-crash 7, flex-tight 9, delegated-epoch 7 + 2 I1: 983, 1711): all the one shape that no hold is open in: a parked
+answer of a row journaled `Archive` (or a backed group) in an earlier tenure is released the moment the node takes its lease again, with the version
+of the replaced configuration, while the archive does not carry the row yet (`cfg_seen` was cleared while the lease was not held). Owner: M1.1 step 5
+(the lease path's configuration change), carried to M1.3 with the `strict_commit` exemption; not the hold.
+
+**Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (lib, integration), authority lib 1,088, engine lib 953, control,
+release authority sim suite 422 passed, 0 failed, 12 ignored.
