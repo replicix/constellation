@@ -377,6 +377,8 @@ fn replay_seed() {
         Ok("delegated-group-switch") => delegated_group_switch_config(),
         Ok("delegated-backup-crash") => delegated_backup_crash_config(),
         Ok("delegated-two-dirs-one-backed") => delegated_two_dirs_one_backed_config(),
+        Ok("delegated-two-dirs-calm") => delegated_two_dirs_calm_config(),
+        Ok("delegated-two-dirs-uncommitted") => delegated_two_dirs_uncommitted_config(),
         Ok("delegated-designated") => delegated_designated_config(),
         Ok("delegated-placement") => delegated_placement_config(),
         Ok("delegated-strict") => delegated_strict_config(),
@@ -5774,6 +5776,8 @@ fn sweep_config() {
         "delegated-root-crash" => delegated_root_crash_config(),
         "shared-dir" => shared_dir_config(),
         "delegated-two-dirs-one-backed" => delegated_two_dirs_one_backed_config(),
+        "delegated-two-dirs-calm" => delegated_two_dirs_calm_config(),
+        "delegated-two-dirs-uncommitted" => delegated_two_dirs_uncommitted_config(),
         "delegated-root-gone" => delegated_root_gone_config(),
         "delegated-delegate-restart" => delegated_delegate_restart_config(),
         "long-delegated-backup" => long_delegated_backup_config(),
@@ -7068,6 +7072,7 @@ fn delegated_two_dirs_one_backed_config() -> SimConfig {
     SimConfig {
         core: std::sync::Arc::new(sim::run::deleg_one_backed_gen_core_config),
         delegations: vec![("d1".into(), 2), ("d2".into(), 2)],
+        serial_delegations: true,
         cross_ratio: 0.3,
         clients_per_node: 4,
         ops_per_client: 16,
@@ -8740,6 +8745,8 @@ struct M11Totals {
     redelegated: u64,
     refused_designated: u64,
     designated: u64,
+    grows: u64,
+    grows_honoured: u64,
     deleg_reads: u64,
     deleg_read_grants: u64,
     lapsed: u64,
@@ -8780,6 +8787,8 @@ impl M11Totals {
             self.redelegated += s.deleg_redelegated;
             self.refused_designated += s.deleg_refused_designated;
             self.designated += s.deleg_designated;
+            self.grows += s.deleg_grows;
+            self.grows_honoured += s.deleg_grows_honoured;
             self.deleg_reads += s.deleg_read_index_served;
             self.deleg_read_grants += s.deleg_read_grants;
             self.lapsed += s.deleg_lapsed;
@@ -9469,8 +9478,85 @@ fn delegated_delegate_crash_drains_the_backup() {
     assert!(t.sealed_drained > 0, "no sealed tail was drained: {t:?}");
 }
 
-/// Plan 46 M1.2 step 3: one node holds two whole subtrees (two generations
-/// on main) and loses the root; its backup's sealed tail is drained and no
+/// `delegated-two-dirs-one-backed` with no fault of any kind.
+fn delegated_two_dirs_calm_config() -> SimConfig {
+    SimConfig {
+        faults: Vec::new(),
+        clock_faults: false,
+        // Only the delegate's clients run: every op is in `d1` or `d2`, the
+        // delegate's, and the root has none of its own to cross them with.
+        client_plan: vec![(1, 0, 0), (3, 0, 0)],
+        ..delegated_two_dirs_one_backed_config()
+    }
+}
+
+/// `delegated-two-dirs-calm` with every grant batch streamed ahead as
+/// uncommitted (plan 46 M1.2 step 8b's knob): a growth the delegate learns
+/// waits for the log.
+fn delegated_two_dirs_uncommitted_config() -> SimConfig {
+    let inner = delegated_two_dirs_one_backed_config().core;
+    SimConfig {
+        core: std::sync::Arc::new(move |id, inc| {
+            let mut c = inner(id, inc);
+            c.stream_ahead_uncommit_grant_every = 1;
+            c
+        }),
+        ..delegated_two_dirs_calm_config()
+    }
+}
+
+/// Plan 46 M1.2 step 9: one node holds two subtrees in one generation and one
+/// stream; no fault, so every recall would be one the workload's renames
+/// between the two subtrees caused (all of its ops are in `d1` and `d2`).
+/// Nothing is recalled and no op is cross-subtree. On the parent the second
+/// grant is refused, `d2` stays the root's and each such rename recalls
+/// `d1`'s delegation.
+#[test]
+fn delegated_two_dirs_one_backed_is_one_stream_and_a_rename_between_them_recalls_nothing() {
+    let t = run_m11(
+        "delegated-two-dirs-calm",
+        delegated_two_dirs_calm_config(),
+        68_400..68_420,
+    );
+    assert_eq!(t.grows, t.seeds, "one growth per seed: {t:?}");
+    assert_eq!(t.installed, t.seeds, "one stream per seed: {t:?}");
+    assert_eq!(t.grows_honoured, t.seeds, "the growth was honoured: {t:?}");
+    assert_eq!(t.cross_subtree, 0, "a cross-subtree op: {t:?}");
+    assert_eq!(t.recalls_sent, 0, "a recall: {t:?}");
+    assert!(t.executed > 100, "the delegate rarely executed: {t:?}");
+}
+
+/// Plan 46 M1.2 step 9 (honoured once committed): the growth the root streams
+/// ahead of the log as uncommitted (the knob) is in the delegate's table from
+/// then on, before any sync honours it. Nothing executes under it meanwhile
+/// (the delegate leaves the keys to the root, `touches_unhonoured`) and every
+/// oracle stays clean; the growth is honoured once the log carries it and
+/// the root has answered. (The delegate runs its sync at a segment, so the
+/// install wait of `deleg_install_waits_commit` is not reached by the sim:
+/// the core tests pin that.)
+#[test]
+fn a_growth_streamed_as_uncommitted_is_not_executed_under_before_the_log_carries_it() {
+    let cfg = delegated_two_dirs_uncommitted_config();
+    let (mut sent, mut honoured, mut learned) = (0, 0, 0);
+    for seed in 68_500..68_540 {
+        let report = run_seed(seed, cfg.clone())
+            .unwrap_or_else(|e| panic!("two dirs + uncommitted growth seed {seed}: {e}"));
+        for st in report.stats.values() {
+            sent += st.stream_grants_uncommitted;
+            honoured += st.deleg_grows_honoured;
+            learned += st.deleg_grows_learned;
+        }
+    }
+    eprintln!("uncommitted batches {sent}, learned {learned}, honoured {honoured}");
+    assert!(sent > 0, "the knob never fired");
+    assert!(
+        honoured > 0 && honoured <= learned,
+        "growth honoured {honoured} of {learned} learned"
+    );
+}
+
+/// Plan 46 M1.2 step 3: one node holds two whole subtrees (one generation and
+/// one stream since step 9) and loses the root; its backup's sealed tail is drained and no
 /// acknowledged row is dropped. `acked_at_or_below_cut` runs in report mode.
 #[test]
 fn delegated_two_dirs_one_backed_keep_their_acknowledgements() {

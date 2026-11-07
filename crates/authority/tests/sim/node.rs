@@ -359,7 +359,7 @@ impl EventKind {
 
 /// The generations (dir, node, gen, recall, ended) the last delegation table
 /// kept was taken at.
-type GensSig = Vec<(u64, u64, u64, String, bool)>;
+type GensSig = Vec<(Vec<u64>, u64, u64, String, bool)>;
 
 pub struct NodeHandle {
     pub id: NodeId,
@@ -2665,7 +2665,7 @@ impl Driver {
                     .delegation
                     .gens
                     .iter()
-                    .map(|g| (g.0, g.1, g.2, g.5.clone(), g.6))
+                    .map(|g| (g.0.clone(), g.1, g.2, g.5.clone(), g.6))
                     .collect();
                 let mut last = self.deleg_sig.lock().unwrap();
                 let changed = sig != *last;

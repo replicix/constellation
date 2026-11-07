@@ -354,11 +354,7 @@ impl Core {
                     });
                     // (A designation is never recalled: its designee's own op
                     // is held as it was, and `deleg_recall_plan` refuses.)
-                    let designated = self
-                        .dl
-                        .gens
-                        .get(&d.gen)
-                        .is_some_and(|g| g.kind == super::delegate::DelegKind::Designated);
+                    let designated = self.dl.gens.get(&d.gen).is_some_and(|g| g.designated());
                     let disowned =
                         from == d.node && !designated && !self.grant_in_flight(now, d.gen);
                     if disowned && live.is_some_and(|g| g.recall == RecallPhase::None) {

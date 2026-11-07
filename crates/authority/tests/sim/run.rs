@@ -465,6 +465,11 @@ pub struct SimConfig {
     /// Plan 30 §M11: `(dir, node)` delegated by the initial holder
     /// (node 1) before the clients start.
     pub delegations: Vec<(String, NodeId)>,
+    /// Plan 46 M1.2 step 9: the setup waits, after each delegation, until its
+    /// delegate has installed and renewed it before it makes the next, so a
+    /// later grant to the same node grows a stream the delegate is already
+    /// honouring (otherwise the delegate learns both in its first install).
+    pub serial_delegations: bool,
     /// Plan 30 §M11 phase 2b: offline designations `(dir, designee)`,
     /// synced into the table by the root at setup.
     pub designations: Vec<(String, NodeId)>,
@@ -1021,6 +1026,7 @@ impl Default for SimConfig {
             upload_hold_ms: 0,
             dirs: Vec::new(),
             delegations: Vec::new(),
+            serial_delegations: false,
             designations: Vec::new(),
             shared_dir: false,
             cross_ratio: 0.0,
@@ -6136,6 +6142,21 @@ async fn setup_dirs(cluster: &Arc<Cluster>, cfg: &SimConfig, failures: &Arc<Mute
                 .unwrap()
                 .push(format!("setup: could not delegate {dir} to node {node}"));
             return;
+        }
+        if cfg.serial_delegations {
+            for _ in 0..400 {
+                let v = cluster.get(*node).view();
+                if v.delegation
+                    .mine
+                    .iter()
+                    .any(|(dirs, _, until, stopped, ..)| {
+                        dirs.contains(&ino) && !*stopped && *until > 0
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
     }
     // Plan 30 §M11 phase 2b: the designations, through the root's sync.

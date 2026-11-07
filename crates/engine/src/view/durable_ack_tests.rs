@@ -1577,7 +1577,16 @@ fn delegate_fs(
         .unwrap()
         .delegates
         .mirror(&constellation_authority::core::DelegView {
-            mine: vec![(dir, DELEG_GEN, i64::MAX, false, 0, 0, 0, String::new())],
+            mine: vec![(
+                vec![dir],
+                DELEG_GEN,
+                i64::MAX,
+                false,
+                0,
+                0,
+                0,
+                String::new(),
+            )],
             ..Default::default()
         });
     meta.session().set_deleg_durable(

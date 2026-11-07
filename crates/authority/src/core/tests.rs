@@ -21165,7 +21165,9 @@ mod locks {
     #[test]
     fn an_offline_designation_does_not_hold_an_outwait_barrier() {
         let (mut h, ino) = outwaited_beside_gen7();
-        h.core.dl.gens.get_mut(&7).unwrap().kind = super::super::delegate::DelegKind::Designated;
+        for k in h.core.dl.gens.get_mut(&7).unwrap().dirs.values_mut() {
+            *k = super::super::delegate::DelegKind::Designated;
+        }
         let out = request(&mut h, 4, 9, ino, X, true);
         let Some(position) = grant_to(&out, 4) else {
             panic!("a silent designation held the barrier: {out:?}")
@@ -21180,7 +21182,9 @@ mod locks {
     #[test]
     fn an_online_designation_holds_an_outwait_barrier() {
         let (mut h, ino) = outwaited_beside_gen7();
-        h.core.dl.gens.get_mut(&7).unwrap().kind = super::super::delegate::DelegKind::Designated;
+        for k in h.core.dl.gens.get_mut(&7).unwrap().dirs.values_mut() {
+            *k = super::super::delegate::DelegKind::Designated;
+        }
         let end = h.now.0;
         renew_gen7(&mut h, 91, 3, end - 1);
         let out = request(&mut h, 4, 9, ino, X, true);
@@ -33752,7 +33756,9 @@ mod s3_no_loops {
     fn a_designation_under_recall_is_not_refused() {
         let (mut h, dir, gen) = delegated_root();
         let g = h.core.dl.gens.get_mut(&gen).unwrap();
-        g.kind = crate::core::delegate::DelegKind::Designated;
+        for k in g.dirs.values_mut() {
+            *k = crate::core::delegate::DelegKind::Designated;
+        }
         g.delegate_heard = Some(w(h.now));
         g.recall = RecallPhase::Sent;
         let out = forward(&mut h, 3, 7, dir, false);
@@ -33837,7 +33843,9 @@ mod s3_no_loops {
     fn a_designees_own_op_is_still_held() {
         let (mut h, dir, gen) = delegated_root();
         let g = h.core.dl.gens.get_mut(&gen).unwrap();
-        g.kind = crate::core::delegate::DelegKind::Designated;
+        for k in g.dirs.values_mut() {
+            *k = crate::core::delegate::DelegKind::Designated;
+        }
         g.delegate_heard = Some(w(h.now));
         h.advance(5_000);
         let out = forward(&mut h, 3, 7, dir, false);
@@ -36868,7 +36876,7 @@ fn a_barrier_inside_a_delegated_subtree_does_not_reach_the_delegate() {
             .deleg_view()
             .gens
             .iter()
-            .any(|&(d, node, ..)| d == dir && node == 2),
+            .any(|(d, node, ..)| d == &vec![dir] && *node == 2),
         "the delegation is live at the root: {:?}",
         h.core.deleg_view()
     );
@@ -37329,7 +37337,7 @@ fn placement_re_reads_the_roster_for_a_connected_writer_it_does_not_list() {
             .dl
             .gens
             .values()
-            .map(|g| (g.dir, g.node))
+            .map(|g| (g.dir_list()[0], g.node))
             .collect::<Vec<_>>(),
         vec![(dir, 2)]
     );
@@ -43488,7 +43496,7 @@ mod recall_cut {
         assert!(!h.core.dl.mine.contains_key(&8), "installed: {out:?}");
         let view = h.core.deleg_view();
         assert!(
-            matches!(view.install_waiting.as_slice(), [(d, 8, _, ended)] if *d == dir && ended == &vec![7]),
+            matches!(view.install_waiting.as_slice(), [(d, 8, _, ended)] if *d == vec![dir] && ended == &vec![7]),
             "{:?}",
             view.install_waiting
         );
@@ -44616,7 +44624,7 @@ mod deleg_group {
             "the lower, unshipped row covered: {:?}",
             wait(&h, 1)
         );
-        let dir = h.core.dl.mine[&7].dir;
+        let dir = *h.core.dl.mine[&7].dirs.iter().next().unwrap();
         let out = h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::DelegRecall {
@@ -44641,7 +44649,7 @@ mod deleg_group {
     #[test]
     fn a_recall_answer_does_not_cut_past_an_uncommitted_re_appended_row() {
         let mut h = take_over_with_a_re_appended_row(true);
-        let dir = h.core.dl.mine[&7].dir;
+        let dir = *h.core.dl.mine[&7].dirs.iter().next().unwrap();
         let recalled = |out: &[Action]| {
             sends(out).into_iter().find_map(|(to, m)| match m {
                 PeerMsg::DelegRecalled {
@@ -50352,7 +50360,7 @@ mod deleg_windows_tests {
     #[test]
     fn a_barrier_noted_inside_a_step_unsettles_the_generation_at_once() {
         let mut h = root_with_delegate_backed_by(4);
-        let dir = h.core.dl.gens[&7].dir;
+        let dir = h.core.dl.gens[&7].dir_list()[0];
         assert!(h.core.dw.get(7).unwrap().settled);
         // A barrier under the subtree (the dir itself).
         h.core.lock_dir_barrier(dir, 5_000);
@@ -59815,5 +59823,252 @@ mod hold_ack {
                 "lone {lone}: the deadline path answers a row the archive does not carry"
             );
         }
+    }
+}
+
+/// Plan 46 M1.2 step 9: one stream per node. A grant to a node whose stream
+/// is live grows it (`DelegateNode` again, the same generation).
+mod step9_one_stream_per_node {
+    use super::*;
+    use constellation_meta::SubtreeKind;
+
+    fn mkdir(h: &Harness, name: &str) -> (constellation_fs_core::Ino, LogRecord) {
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        (
+            ino,
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: name.into(),
+                ino,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+        )
+    }
+
+    fn delegate(h: &mut Harness, op: u64, dir: constellation_fs_core::Ino, node: NodeId) -> bool {
+        let out = h.step(Event::Control {
+            op: OpId(op),
+            req: Control::Delegate { dir, node },
+        });
+        out.iter()
+            .any(|a| matches!(a, Action::ControlDone { op: o, result: Ok(_) } if *o == OpId(op)))
+    }
+
+    /// The root (node 1) with `d1` and `d2` delegated to node 3 in turn, the
+    /// peers' links up.
+    fn root_with_two_grants() -> (
+        Harness,
+        constellation_fs_core::Ino,
+        constellation_fs_core::Ino,
+    ) {
+        let (mut h, d1) = root_with_dir();
+        let (d2, rec) = mkdir(&h, "d2");
+        crate::replica::Replica::apply_segment(&h.meta, 2, 1, 0, &[], &[], &[rec]).unwrap();
+        assert!(delegate(&mut h, 900, d1, 3));
+        assert!(delegate(&mut h, 901, d2, 3), "the second grant was refused");
+        h.step(Event::Peers {
+            links: (2..=4)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: true,
+                    last_seen: Some(w(h.now)),
+                    rtt_ms: Some(1),
+                    since: Some(w(h.now)),
+                })
+                .collect(),
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+        (h, d1, d2)
+    }
+
+    /// Two subtrees granted to one node are one generation and one stream, and
+    /// a rename between them is an ordinary op of that stream: the root
+    /// forwards it to the delegate and recalls nothing. On the parent the
+    /// second grant is refused ("node 3 already holds a delegation"), so
+    /// `d2` stays the root's and the rename is a cross-subtree op: the
+    /// delegation is recalled.
+    #[test]
+    fn two_grants_to_one_node_are_one_stream_and_a_rename_between_them_recalls_nothing() {
+        let (mut h, d1, d2) = root_with_two_grants();
+        let table = h.meta.delegation_table();
+        let gens: Vec<u64> = table.gens().collect();
+        assert_eq!(gens.len(), 1, "one generation: {gens:?}");
+        assert_eq!(h.core.dl.gens.len(), 1);
+        assert_eq!(
+            table.stream(3, gens[0]).unwrap().subtrees.len(),
+            2,
+            "both subtrees in the stream"
+        );
+        assert_eq!(h.core.dl.gens[&gens[0]].dir_list().len(), 2);
+        assert_eq!(h.core.deleg_view().gens.len(), 1);
+        assert_eq!(h.core.deleg_view().gens[0].0.len(), 2);
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Rename {
+                parent: d1,
+                name: "x".into(),
+                new_parent: d2,
+                new_name: "y".into(),
+                noreplace: false,
+            },
+            tag: Default::default(),
+        });
+        assert!(
+            !sends(&out)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::DelegRecall { .. })),
+            "a rename inside one node's stream recalled it: {out:?}"
+        );
+        assert_eq!(h.core.stats.deleg_recalls_sent, 0);
+        assert_eq!(h.core.stats.deleg_cross_subtree, 0);
+        assert_eq!(h.core.stats.deleg_grows, 1);
+    }
+
+    /// A grant of a directory the node's live stream is being recalled for is
+    /// refused (the stream is going away); an all-designated stream takes no
+    /// grant that can be reclaimed.
+    #[test]
+    fn a_stream_being_recalled_or_designated_takes_no_stealable_grant() {
+        let (mut h, d1) = root_with_dir();
+        let (d2, rec) = mkdir(&h, "d2");
+        crate::replica::Replica::apply_segment(&h.meta, 2, 1, 0, &[], &[], &[rec]).unwrap();
+        assert!(delegate(&mut h, 900, d1, 3));
+        let gen = h.meta.delegation_table().get(d1).unwrap().gen;
+        h.core.start_recall(h.clk(), gen, &mut Vec::new());
+        assert!(!delegate(&mut h, 901, d2, 3), "a recalled stream grew");
+        // A designated stream.
+        let (mut h, d1) = root_with_dir();
+        let (d2, rec) = mkdir(&h, "d2");
+        crate::replica::Replica::apply_segment(&h.meta, 2, 1, 0, &[], &[], &[rec]).unwrap();
+        let mut out = Vec::new();
+        h.core
+            .delegate_dir(h.clk(), d1, 3, DelegKind::Designated, &h.meta, &mut out)
+            .unwrap();
+        assert!(
+            !delegate(&mut h, 901, d2, 3),
+            "a stealable grant joined a designated stream"
+        );
+        let mut out = Vec::new();
+        let gen = h
+            .core
+            .delegate_dir(h.clk(), d2, 3, DelegKind::Designated, &h.meta, &mut out)
+            .unwrap();
+        assert!(h.core.dl.gens[&gen].designated());
+        assert_eq!(h.core.dl.gens[&gen].dir_list().len(), 2);
+    }
+
+    /// A delegate whose stream was grown by a subtree does not honour it
+    /// until the record is committed (step 8b's rule for a growth) and the
+    /// root has answered a renewal sent after that: its ops there stay the
+    /// root's, those in the subtrees it held go on. Fails on a delegate that
+    /// honours a table entry at once: it executes under the grown subtree
+    /// while the record is only a streamed entry.
+    #[test]
+    fn a_grown_subtree_parks_until_its_record_is_committed_and_the_root_has_answered() {
+        // Generation 7 on `/d`, committed and honoured.
+        let (mut h, _records, a) = delegate_learning_a_streamed_grant(true);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (_, req, _) = renewal_sent(&out).expect("no first renewal");
+        h.step(renewed(&h, req, 7, 5_000));
+        create_in(&mut h, a, 1);
+        assert_eq!(h.core.dl.mine[&7].executed, 1);
+        // The root grows the stream by `/e`; its record reaches this replica
+        // as a streamed entry its group has not committed.
+        let (b, mk) = mkdir(&h, "e");
+        let grow = vec![mk, LogRecord::delegate_one(3, 7, b, SubtreeKind::Placed)];
+        crate::replica::Replica::install_streamed(&h.meta, 1, 1, 3, 4, &grow, false, (0, 0))
+            .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let d = &h.core.dl.mine[&7];
+        assert_eq!(d.dirs.iter().copied().collect::<Vec<_>>(), vec![a]);
+        assert_eq!(d.grown.keys().copied().collect::<Vec<_>>(), vec![b]);
+        assert_eq!(
+            h.core.dl.commit_waiting.keys().copied().collect::<Vec<_>>(),
+            vec![7]
+        );
+        assert!(h.core.dl.install_retry.is_some());
+        create_in(&mut h, b, 2);
+        assert_eq!(
+            h.core.dl.mine[&7].executed, 1,
+            "executed under a subtree whose growth is not committed"
+        );
+        assert_eq!(
+            h.core.dl.mine[&7].grown.keys().copied().collect::<Vec<_>>(),
+            vec![b]
+        );
+        // The subtree it already held is not touched by the wait.
+        create_in(&mut h, a, 3);
+        assert_eq!(h.core.dl.mine[&7].executed, 2);
+        // The archive carries the growth: committed, still parked until a
+        // renewal sent after answers.
+        crate::replica::Replica::apply_segment(&h.meta, 2, 1, 4, &[3], &[], &grow).unwrap();
+        h.advance(5);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (to, req, _) = renewal_sent(&out).expect("no renewal once the growth is committed");
+        assert_eq!(to, 1);
+        assert!(h.core.dl.commit_waiting.is_empty());
+        create_in(&mut h, b, 4);
+        assert_eq!(
+            h.core.dl.mine[&7].executed, 2,
+            "honoured before the root answered"
+        );
+        h.advance(5);
+        h.step(renewed(&h, req, 7, 5_000));
+        let d = &h.core.dl.mine[&7];
+        assert!(d.grown.is_empty(), "{:?}", d.grown);
+        assert_eq!(d.dirs.len(), 2);
+        create_in(&mut h, b, 5);
+        assert_eq!(h.core.dl.mine[&7].executed, 3);
+        assert_eq!(h.core.stats.deleg_grows_learned, 1);
+        assert_eq!(h.core.stats.deleg_grows_honoured, 1);
+    }
+
+    /// An answer to a renewal that was already in flight when the growth was
+    /// learned says nothing about it (the root may have sent it before it
+    /// journaled the growth): the subtree waits for the next one.
+    #[test]
+    fn a_renewal_in_flight_when_the_growth_is_learned_does_not_unlock_it() {
+        let (mut h, _records, a) = delegate_learning_a_streamed_grant(true);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (_, first, _) = renewal_sent(&out).expect("no first renewal");
+        h.step(renewed(&h, first, 7, 5_000));
+        h.advance(2_600);
+        // The periodic renewal goes out; the growth is learned while it is
+        // in flight.
+        let id = h.core.dl.mine[&7].renew_timer.expect("a renewal is armed");
+        let out = h.step(Event::Timer { id });
+        let (_, inflight, _) = renewal_sent(&out).expect("the periodic renewal");
+        let (b, mk) = mkdir(&h, "e");
+        let grow = vec![mk, LogRecord::delegate_one(3, 7, b, SubtreeKind::Placed)];
+        crate::replica::Replica::install_streamed(&h.meta, 1, 1, 3, 4, &grow, true, (0, 0))
+            .unwrap();
+        h.advance(1);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine[&7].grown.contains_key(&b));
+        h.advance(1);
+        let out = h.step(renewed(&h, inflight, 7, 5_000));
+        assert!(
+            h.core.dl.mine[&7].grown.contains_key(&b),
+            "the in-flight answer unlocked the growth"
+        );
+        // ... but it asks again at once, and that answer does.
+        let (_, next, _) = renewal_sent(&out).expect("no renewal after the in-flight answer");
+        h.advance(1);
+        h.step(renewed(&h, next, 7, 5_000));
+        assert!(h.core.dl.mine[&7].grown.is_empty());
+        create_in(&mut h, b, 6);
+        assert_eq!(h.core.dl.mine[&7].executed, 1);
+        let _ = a;
     }
 }

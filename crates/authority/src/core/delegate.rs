@@ -103,11 +103,12 @@ pub enum DelegKind {
 /// The root's view of one generation.
 #[derive(Debug, Clone)]
 pub(crate) struct GenState {
-    pub dir: Ino,
+    /// The subtrees the stream holds and why each was granted (phase 2b:
+    /// an operator, the placement, a designation). Plan 46 M1.2 step 9: one
+    /// stream per node, grown in place by a later grant (`DelegateNode`
+    /// again, the same generation).
+    pub dirs: BTreeMap<Ino, DelegKind>,
     pub node: NodeId,
-    /// Why it exists (phase 2b): an operator, the placement, a
-    /// designation.
-    pub kind: DelegKind,
     /// Plan 43 C2: the generation's configuration — the latest
     /// `DelegateNodeGroup` record this root journaled (seeded from its table
     /// for an inherited generation). The root drains its backup (seal)
@@ -122,6 +123,11 @@ pub(crate) struct GenState {
     /// Plan 46 M0.3 (S3): inherited from a predecessor root, never granted
     /// by this tenure (`granted` is when it was learned).
     pub inherited: bool,
+    /// When the root last grew the stream by a subtree (step 9): a forward
+    /// from the delegate for the new subtree is "sent before its table
+    /// carried the grant" for [`Core::grant_in_flight_ms`], as for a fresh
+    /// generation.
+    pub grown_at: Option<WaitMs>,
     /// ADR-44: the recall was started inside a shippable takeover gate, on
     /// demand (an op or a settle that needs this generation ended,
     /// [`Core::gate_recall_on_demand`]). Only such a recall is resent, has
@@ -221,6 +227,62 @@ pub(crate) struct GenState {
     /// The delegate's renewal that waits for `read_recalls`, answered
     /// when the last of them is gone.
     pub renew_waiting: Option<(NodeId, OpId, u64, RenewFrom)>,
+}
+
+/// An ended stream to grant again: its generation, subtrees and delegate.
+type Redelegation = (u64, Vec<(Ino, DelegKind)>, NodeId);
+
+/// One live stream of the table, as the sync reads it (the node, the
+/// generation and the subtrees it holds).
+pub(crate) struct StreamView {
+    pub gen: u64,
+    pub node: NodeId,
+    pub dirs: Vec<(Ino, SubtreeKind)>,
+}
+
+impl StreamView {
+    pub(crate) fn of(s: &constellation_meta::delegation::NodeStream) -> Self {
+        StreamView {
+            gen: s.gen,
+            node: s.node,
+            dirs: s.subtrees.clone(),
+        }
+    }
+
+    pub(crate) fn designated(&self) -> bool {
+        !self.dirs.is_empty() && self.dirs.iter().all(|(_, k)| *k == SubtreeKind::Designated)
+    }
+
+    pub(crate) fn dir_list(&self) -> Vec<Ino> {
+        self.dirs.iter().map(|(d, _)| *d).collect()
+    }
+}
+
+impl GenState {
+    /// Every grant of the stream is non-stealable (a designation): the one
+    /// rule of the stream is `Final`, and the TTL, the placement and a
+    /// recall by a cross-subtree op leave it alone. A stream with any
+    /// stealable grant has the group rule and is reclaimed whole.
+    pub(crate) fn designated(&self) -> bool {
+        !self.dirs.is_empty() && self.dirs.values().all(|k| *k == DelegKind::Designated)
+    }
+
+    /// The stream's kind: `Designated` when every grant is, `Manual` when an
+    /// operator granted any of its subtrees (the placement does not recall
+    /// it), otherwise `Placed`.
+    pub(crate) fn kind(&self) -> DelegKind {
+        if self.designated() {
+            DelegKind::Designated
+        } else if self.dirs.values().any(|k| *k == DelegKind::Manual) || self.dirs.is_empty() {
+            DelegKind::Manual
+        } else {
+            DelegKind::Placed
+        }
+    }
+
+    pub(crate) fn dir_list(&self) -> Vec<Ino> {
+        self.dirs.keys().copied().collect()
+    }
 }
 
 /// When the root last asked, lost the transport to, and heard from one
@@ -366,7 +428,21 @@ pub(crate) struct ParkedDeleg {
 /// This node as the delegate of one generation.
 #[derive(Debug, Clone)]
 pub(crate) struct DelegateState {
-    pub dir: Ino,
+    /// The subtrees this node honours under the generation.
+    pub dirs: BTreeSet<Ino>,
+    /// Plan 46 M1.2 step 9: subtrees a later `DelegateNode` of the live
+    /// stream added that this node learned but does not honour yet: each
+    /// waits for its record to be committed (`None`: not yet; step 8b's rule
+    /// for a growth) and then for a granting answer to a renewal sent after
+    /// that (`Some(after)`: a granting answer to a renewal sent after `after`
+    /// counts; it carries the lock handoff and has waited for the read
+    /// delegations under the new subtree).
+    pub grown: BTreeMap<Ino, Option<HonourMs>>,
+    /// The send time of the renewal whose granting answer the root's core
+    /// just gave (in time or late): the answer that carries the lock
+    /// handoff, grace and floor. Taken by the message arm that installs
+    /// them, which then lets the grown subtrees it covers in.
+    pub core_answer_sent: Option<HonourMs>,
     pub gen: u64,
     /// Honoured while this node's honour clock is below this (`HonourMs(0)`:
     /// not renewed yet; plan 43 C7-H1).
@@ -817,7 +893,7 @@ pub(crate) struct ReleaseWait {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WaitingGenView {
     pub gen: u64,
-    pub dir: Ino,
+    pub dirs: Vec<Ino>,
     pub delegate: NodeId,
     pub waited_ms: u64,
     /// When this root last heard from the delegate, ms ago: a renewal, a
@@ -849,27 +925,29 @@ pub struct WaitingMemberView {
 /// Plan 30 §M11's view for `status`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DelegView {
-    /// `(dir, gen, until, stopped, streamed_through, executed, parked,
-    /// class)`: `until` a reading of this node's honour clock (plan 43
+    /// `(dirs, gen, until, stopped, streamed_through, executed, parked,
+    /// class)`: one row per stream held (plan 46 M1.2 step 9: a node holds one
+    /// stream, whatever its subtrees), `dirs` the subtrees it honours;
+    /// `until` a reading of this node's honour clock (plan 43
     /// C7-H1; the engine's `DelegView` judges it on that clock); `class`
     /// the name of the class this node's own clients' answers wait for
     /// (plan 43 C2e: `commit_name`).
     #[allow(clippy::type_complexity)]
-    pub mine: Vec<(Ino, u64, i64, bool, u64, u64, usize, String)>,
-    /// `(dir, node, gen, cursor, until_ms (wall, for status), recall, ended,
+    pub mine: Vec<(Vec<Ino>, u64, i64, bool, u64, u64, usize, String)>,
+    /// `(dirs, node, gen, cursor, until_ms (wall, for status), recall, ended,
     /// waiting_for_group)`: the last says the generation cannot end because
     /// no member of its group has handed over the tail (plan 43 C2e).
     #[allow(clippy::type_complexity)]
-    pub gens: Vec<(Ino, NodeId, u64, u64, i64, String, bool, bool)>,
+    pub gens: Vec<(Vec<Ino>, NodeId, u64, u64, i64, String, bool, bool)>,
     /// Plan 43 C2e: the generations that cannot end for want of their
     /// group's tail, with what the root knows of each member (what
     /// `abandon-group --gen` is weighed by).
     pub waiting: Vec<WaitingGenView>,
-    /// Path B: `(dir, gen, waited_ms, ended)` for each generation of this
+    /// Path B: `(dirs, gen, waited_ms, ended)` for each generation of this
     /// node the table lists that is not installed yet, because an ended
     /// generation's rows still wait for its end in the log (`ended`
     /// empty: the journal could not be read).
-    pub install_waiting: Vec<(Ino, u64, u64, Vec<u64>)>,
+    pub install_waiting: Vec<(Vec<Ino>, u64, u64, Vec<u64>)>,
     pub pending_exec: usize,
     /// Phase 2b: per generation held here, `(gen, backup, backup_acked)`.
     pub backups: Vec<(u64, NodeId, u64)>,
@@ -881,7 +959,7 @@ pub struct DelegView {
 /// generation's end (`DelegationState::install_waiting`).
 #[derive(Debug, Clone)]
 pub(crate) struct InstallWait {
-    pub dir: Ino,
+    pub dirs: Vec<Ino>,
     pub since: WaitMs,
     pub ended: Option<Vec<u64>>,
     pub warned: Option<WaitMs>,
@@ -904,7 +982,7 @@ impl Core {
                 .iter()
                 .map(|(gen, g)| {
                     (
-                        g.dir,
+                        g.dir_list(),
                         g.node,
                         *gen,
                         g.cursor,
@@ -920,7 +998,7 @@ impl Core {
                 .dl
                 .gens
                 .iter()
-                .map(|(g, s)| (*g, format!("{:?}", s.kind), s.group.backup().unwrap_or(0)))
+                .map(|(g, s)| (*g, format!("{:?}", s.kind()), s.group.backup().unwrap_or(0)))
                 .collect(),
             waiting: self
                 .dl
@@ -956,7 +1034,7 @@ impl Core {
                         .collect();
                     WaitingGenView {
                         gen: *gen,
-                        dir: g.dir,
+                        dirs: g.dir_list(),
                         delegate: g.node,
                         waited_ms: ago(g.waiting_since).unwrap_or(0),
                         delegate_heard_ms: ago(self.deleg_delegate_heard(g)),
@@ -971,7 +1049,7 @@ impl Core {
                 .iter()
                 .map(|(gen, w)| {
                     (
-                        w.dir,
+                        w.dirs.clone(),
                         *gen,
                         self.clk.wait.since(w.since).max(0) as u64,
                         w.ended.clone().unwrap_or_default(),
@@ -997,7 +1075,7 @@ impl Core {
             .values()
             .map(|d| {
                 (
-                    d.dir,
+                    d.dirs.iter().copied().collect(),
                     d.gen,
                     d.until.0,
                     d.stopped,
@@ -1244,7 +1322,7 @@ impl Core {
             let Some(g) = self.dl.gens.get_mut(&gen) else {
                 continue;
             };
-            if g.ended || !g.inherited || g.node == me || g.kind == DelegKind::Designated {
+            if g.ended || !g.inherited || g.node == me || g.designated() {
                 continue;
             }
             if g.recall == RecallPhase::None {
@@ -1352,7 +1430,12 @@ impl Core {
         }
         let mut commit_now: BTreeSet<u64> = BTreeSet::new();
         let mut retry = false;
-        for d in table.iter().filter(|d| d.node == me) {
+        for st in table.streams().filter(|s| s.node == me) {
+            // A stream that released every subtree holds nothing to install.
+            if st.subtrees.is_empty() {
+                continue;
+            }
+            let d = StreamView::of(&st);
             if self.dl.mine.contains_key(&d.gen) || self.dl.epoch_active {
                 continue;
             }
@@ -1371,7 +1454,7 @@ impl Core {
             });
             if awaiting.as_ref().is_none_or(|gens| !gens.is_empty()) {
                 let ended = awaiting.clone();
-                self.deleg_note_install_wait(now, d.dir, d.gen, ended);
+                self.deleg_note_install_wait(now, d.dir_list(), d.gen, ended);
                 waiting_now.insert(d.gen);
                 retry = true;
                 continue;
@@ -1398,7 +1481,7 @@ impl Core {
                         self.stats.deleg_install_waits_commit += 1;
                         tracing::debug!(
                             node = me,
-                            dir = d.dir,
+                            dirs = ?d.dir_list(),
                             gen = %constellation_meta::delegation::GenLabel::of(d.gen),
                             "delegation not honoured yet: its DelegateNode record is not committed (waits for the log)"
                         );
@@ -1417,7 +1500,7 @@ impl Core {
                 continue;
             };
             let stream_round = self.deleg_new_round();
-            tracing::info!(node = me, dir = d.dir, gen = %constellation_meta::delegation::GenLabel::of(d.gen), "delegation installed");
+            tracing::info!(node = me, dirs = ?d.dir_list(), gen = %constellation_meta::delegation::GenLabel::of(d.gen), "delegation installed");
             self.stats.deleg_installed += 1;
             // Plan 43 C2e follow-up: a process that held this generation
             // before a reboot may have lost the unsynced end of its journal
@@ -1437,7 +1520,7 @@ impl Core {
                 self.stats.deleg_rebooted_holder += 1;
                 tracing::warn!(
                     node = me,
-                    dir = d.dir,
+                    dirs = ?d.dir_list(),
                     gen = %constellation_meta::delegation::GenLabel::of(d.gen),
                     "this node held the delegation before a reboot and may have lost rows it acknowledged: \
                      not taken up again; the root ends it by its group"
@@ -1455,7 +1538,9 @@ impl Core {
             self.dl.mine.insert(
                 d.gen,
                 DelegateState {
-                    dir: d.dir,
+                    dirs: d.dir_list().into_iter().collect(),
+                    grown: BTreeMap::new(),
+                    core_answer_sent: None,
                     gen: d.gen,
                     until: HonourMs(0),
                     // This node's takeover gate ended the generation
@@ -1523,6 +1608,39 @@ impl Core {
             self.deleg_renew_now(now, d.gen, out);
             self.arm_deleg_lapse(now, d.gen, out);
         }
+        // Plan 46 M1.2 step 9: a stream this node already holds may have
+        // grown (a later `DelegateNode` of the same generation).
+        if !self.dl.epoch_active {
+            let mut grown_streams: Vec<(u64, Vec<(Ino, SubtreeKind)>)> = Vec::new();
+            for st in table.streams().filter(|s| s.node == me) {
+                let differs = self.dl.mine.get(&st.gen).is_some_and(|d| {
+                    st.subtrees
+                        .iter()
+                        .any(|(dir, _)| !d.dirs.contains(dir) && !d.grown.contains_key(dir))
+                        || d.dirs
+                            .iter()
+                            .chain(d.grown.keys())
+                            .any(|dir| !st.subtrees.iter().any(|(x, _)| x == dir))
+                        || d.grown.values().any(|v| v.is_none())
+                });
+                if differs {
+                    grown_streams.push((st.gen, st.subtrees));
+                }
+            }
+            for (gen, subtrees) in grown_streams {
+                let uncommitted =
+                    uncommitted.get_or_insert_with(|| replica.deleg_grants_uncommitted());
+                let committed = match uncommitted {
+                    Ok(set) => !set.contains(&gen),
+                    Err(_) => false,
+                };
+                if !self.deleg_sync_growth(now, gen, &subtrees, committed, out) {
+                    self.dl.commit_waiting.entry(gen).or_insert(now.wait);
+                    commit_now.insert(gen);
+                    retry = true;
+                }
+            }
+        }
         // With an epoch active nothing was looked at: the waits stand.
         if !self.dl.epoch_active {
             self.deleg_install_waits_settle(now, &waiting_now);
@@ -1545,8 +1663,26 @@ impl Core {
         self.dl.root_synced = level;
         if level != RootSync::None {
             let live: BTreeSet<u64> = table.gens().collect();
-            for d in table.iter() {
-                if self.dl.gens.contains_key(&d.gen) {
+            for st in table.streams() {
+                let d = StreamView::of(&st);
+                if let Some(g) = self.dl.gens.get_mut(&d.gen) {
+                    // A growth the log carries that this tenure did not
+                    // journal (a predecessor's, applied late): the stream
+                    // holds it.
+                    for (dir, kind) in &d.dirs {
+                        g.dirs
+                            .entry(*dir)
+                            .or_insert(if *kind == SubtreeKind::Designated {
+                                DelegKind::Designated
+                            } else {
+                                DelegKind::Manual
+                            });
+                    }
+                    continue;
+                }
+                // A stream that released every subtree has none to inherit
+                // (step 10 gives it an end).
+                if d.dirs.is_empty() {
                     continue;
                 }
                 // Plan 46 M0.3 (S5, ADR-42): a gate whose journal work is
@@ -1585,7 +1721,7 @@ impl Core {
                 tracing::info!(
                     node = me,
                     gen = %constellation_meta::delegation::GenLabel::of(d.gen),
-                    dir = d.dir,
+                    dirs = ?d.dir_list(),
                     delegate = d.node,
                     cursor,
                     stream_applied = replica.stream_applied(d.gen),
@@ -1604,17 +1740,26 @@ impl Core {
                 self.dl.gens.insert(
                     d.gen,
                     GenState {
-                        dir: d.dir,
+                        dirs: d
+                            .dirs
+                            .iter()
+                            .map(|(dir, k)| {
+                                (
+                                    *dir,
+                                    if *k == SubtreeKind::Designated {
+                                        DelegKind::Designated
+                                    } else {
+                                        DelegKind::Manual
+                                    },
+                                )
+                            })
+                            .collect(),
                         node: d.node,
-                        kind: if d.designated() {
-                            DelegKind::Designated
-                        } else {
-                            DelegKind::Manual
-                        },
                         group: GroupState::of(group_row),
                         redelegate: false,
                         granted: now.wait,
                         inherited: true,
+                        grown_at: None,
                         gate_recalled: false,
                         below_since: None,
                         seal_reqs: BTreeMap::new(),
@@ -1699,19 +1844,25 @@ impl Core {
     /// the journal could not be read): counted, kept for `status`, and
     /// warned about once it waited [`INSTALL_WAIT_WARN_MS`], then every
     /// [`INSTALL_WAIT_WARN_EVERY_MS`].
-    fn deleg_note_install_wait(&mut self, now: Now, dir: Ino, gen: u64, ended: Option<Vec<u64>>) {
+    fn deleg_note_install_wait(
+        &mut self,
+        now: Now,
+        dirs: Vec<Ino>,
+        gen: u64,
+        ended: Option<Vec<u64>>,
+    ) {
         let me = self.me();
         let w = self.dl.install_waiting.entry(gen).or_insert_with(|| {
             self.stats.deleg_install_waits_end += 1;
             tracing::debug!(
                 node = me,
-                dir,
+                dirs = ?dirs,
                 gen = %constellation_meta::delegation::GenLabel::of(gen),
                 ended = ?ended,
                 "delegation not installed yet: an ended generation's rows wait for its end in the log"
             );
             InstallWait {
-                dir,
+                dirs: dirs.clone(),
                 since: now.wait,
                 ended: ended.clone(),
                 warned: None,
@@ -1726,7 +1877,7 @@ impl Core {
             w.warned = Some(now.wait);
             tracing::warn!(
                 node = me,
-                dir,
+                dirs = ?dirs,
                 gen = %constellation_meta::delegation::GenLabel::of(gen),
                 waited_ms = waited,
                 ended = ?w.ended,
@@ -1767,6 +1918,123 @@ impl Core {
         self.delegation_sync(now, replica, out);
     }
 
+    /// Plan 46 M1.2 step 9: the table lists stream `gen` of this node with
+    /// `subtrees`; bring the stream's honoured set (`dirs`) and its waiting
+    /// growth (`grown`) in line. A subtree the table no longer lists leaves
+    /// both. A new one waits for its `DelegateNode` record to be committed
+    /// (step 8b's rule: `committed` is false while this replica holds the
+    /// record only as an uncommitted streamed entry), and then for a
+    /// granting answer to a renewal sent after that
+    /// ([`Self::deleg_unpark_grown`]): the root's answer carries the lock
+    /// handoff of the new subtree and has waited for the read delegations
+    /// under it. An all-designated stream is honoured without any renewal,
+    /// so a designated subtree added to it is honoured once committed.
+    /// Returns false while a growth waits for its commit.
+    fn deleg_sync_growth(
+        &mut self,
+        now: Now,
+        gen: u64,
+        subtrees: &[(Ino, SubtreeKind)],
+        committed: bool,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return true;
+        };
+        let listed = |dir: &Ino| subtrees.iter().any(|(x, _)| x == dir);
+        d.dirs.retain(|dir| listed(dir));
+        d.grown.retain(|dir, _| listed(dir));
+        let mut learned = 0u64;
+        for (dir, _) in subtrees {
+            if !d.dirs.contains(dir) && !d.grown.contains_key(dir) {
+                d.grown.insert(*dir, None);
+                learned += 1;
+            }
+        }
+        self.stats.deleg_grows_learned += learned;
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return true;
+        };
+        if d.grown.is_empty() {
+            return true;
+        }
+        if !committed {
+            if d.grown.values().any(|v| v.is_none()) && learned > 0 {
+                self.stats.deleg_install_waits_commit += 1;
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
+                    "a grown subtree is not honoured yet: its DelegateNode record is not committed (waits for the log)"
+                );
+            }
+            return false;
+        }
+        let designated_stream = d.designated;
+        let mut promoted = 0u64;
+        // Only a renewal sent after this point counts: not one in flight,
+        // nor one answered or sent by the lane already.
+        let after = d
+            .last_renew_sent
+            .max(d.renew.map_or(HonourMs(-1), |(_, sent)| sent));
+        let dirs: Vec<Ino> = d.grown.keys().copied().collect();
+        for dir in dirs {
+            if d.grown.get(&dir) == Some(&None) {
+                d.grown.insert(dir, Some(after));
+            }
+            let designated_dir = subtrees
+                .iter()
+                .any(|(x, k)| *x == dir && *k == SubtreeKind::Designated);
+            if designated_stream && designated_dir {
+                d.grown.remove(&dir);
+                d.dirs.insert(dir);
+                promoted += 1;
+            }
+        }
+        self.stats.deleg_grows_honoured += promoted;
+        if self.dl.mine.get(&gen).is_some_and(|d| !d.grown.is_empty()) {
+            // The renewal that unlocks it: sent after this point.
+            self.deleg_renew_now(now, gen, out);
+        }
+        true
+    }
+
+    /// Plan 46 M1.2 step 9: the root's core answered a renewal of `gen` that
+    /// this node sent at `sent`, and its lock content is installed: every
+    /// grown subtree whose commit was learned before that send is honoured
+    /// from now on (returned). One still waiting asks again at once. Only
+    /// the core's answer counts: an answer without it carries no handoff,
+    /// grace or floor for the new subtree.
+    pub(crate) fn deleg_unpark_grown(
+        &mut self,
+        now: Now,
+        gen: u64,
+        sent: HonourMs,
+        out: &mut Vec<Action>,
+    ) -> Vec<Ino> {
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return Vec::new();
+        };
+        if d.grown.is_empty() {
+            return Vec::new();
+        }
+        let ready: Vec<Ino> = d
+            .grown
+            .iter()
+            .filter(|(_, v)| v.is_some_and(|t| t < sent))
+            .map(|(dir, _)| *dir)
+            .collect();
+        for dir in &ready {
+            d.grown.remove(dir);
+            d.dirs.insert(*dir);
+        }
+        self.stats.deleg_grows_honoured += ready.len() as u64;
+        let waiting = d.grown.values().any(|v| v.is_some());
+        if waiting {
+            self.deleg_renew_now(now, gen, out);
+        }
+        ready
+    }
+
     pub(crate) fn drop_delegate_state(
         &mut self,
         now: Now,
@@ -1787,7 +2055,7 @@ impl Core {
         let Some(d) = self.dl.mine.remove(&gen) else {
             return;
         };
-        tracing::info!(node = self.me(), dir = d.dir, gen = %constellation_meta::delegation::GenLabel::of(gen), "delegation ended here");
+        tracing::info!(node = self.me(), dirs = ?d.dirs, gen = %constellation_meta::delegation::GenLabel::of(gen), "delegation ended here");
         // Plan 43 C2 (D7): what waited for a row past the generation's cut
         // is never acknowledged (no cut known: every row of it).
         let through = replica.void_cut(gen).unwrap_or(0);
@@ -1895,6 +2163,20 @@ impl Core {
         match replica.resolve_ownership(keys) {
             Ownership::Delegated(d) if d.node == self.me() => {
                 let s = self.dl.mine.get(&d.gen)?;
+                // Plan 46 M1.2 step 9: a subtree the stream grew by and this
+                // node does not honour yet (its record not committed, or the
+                // root's answer not here, or the sync that learns it not run)
+                // is the root's still: judged against the table, not against
+                // what the last sync noted.
+                let honoured: Vec<Ino> = s.dirs.iter().copied().collect();
+                if replica.delegation_table().touches_unhonoured(
+                    replica.namespace(),
+                    keys,
+                    d.gen,
+                    &honoured,
+                ) {
+                    return None;
+                }
                 // `stopped` follows the store's mark at the next event; a
                 // generation a takeover's strand ended is refused at the
                 // write already (`Meta::begin_local`), so the core never
@@ -4146,7 +4428,7 @@ impl Core {
         if gs.ended {
             return;
         }
-        let (dir, kind) = (gs.dir, gs.kind);
+        let (dirs, designated) = (gs.dirs.clone(), gs.designated());
         let tail = gs.sealed_tail.clone();
         let ends_recall = self.root_ends_recall(now, gen);
         let mut sealed = false;
@@ -4191,20 +4473,32 @@ impl Core {
             }
         }
         self.end_generation(now, gen, None, replica, out);
-        if sealed && kind != DelegKind::Designated {
-            match self.delegate_dir(now, dir, from, kind, replica, out) {
-                Ok(new_gen) => {
-                    tracing::info!(
-                        node = self.me(),
-                        dir,
-                        delegate = from,
-                        gen = %constellation_meta::delegation::GenLabel::of(gen),
-                        new_gen = %constellation_meta::delegation::GenLabel::of(new_gen),
-                        "re-delegated to the backup"
-                    );
-                }
-                Err(why) => {
-                    tracing::debug!(node = self.me(), dir, why, "not re-delegated to the backup")
+        if sealed && !designated {
+            // Every subtree of the stream, to the backup: the first grant
+            // opens its stream, the rest grow it.
+            for (dir, kind) in dirs
+                .into_iter()
+                .filter(|(_, k)| *k != DelegKind::Designated)
+            {
+                match self.delegate_dir(now, dir, from, kind, replica, out) {
+                    Ok(new_gen) => {
+                        tracing::info!(
+                            node = self.me(),
+                            dir,
+                            delegate = from,
+                            gen = %constellation_meta::delegation::GenLabel::of(gen),
+                            new_gen = %constellation_meta::delegation::GenLabel::of(new_gen),
+                            "re-delegated to the backup"
+                        );
+                    }
+                    Err(why) => {
+                        tracing::debug!(
+                            node = self.me(),
+                            dir,
+                            why,
+                            "not re-delegated to the backup"
+                        )
+                    }
                 }
             }
         }
@@ -5925,11 +6219,14 @@ impl Core {
     /// waiting, no barrier is out and the subtree's floor is what that
     /// answer carried ([`Core::lock_deleg_quiet`]).
     pub(crate) fn deleg_settled(&self, gen: u64, replica: &dyn Replica) -> bool {
-        let Some(dir) = self.dl.gens.get(&gen).map(|g| g.dir) else {
+        let Some(g) = self.dl.gens.get(&gen) else {
             return false;
         };
-        self.dl.answered_granting.contains(&gen)
-            && self.lock_deleg_quiet(gen, dir, replica)
+        // A grown subtree's read delegations are recalled before a renewal
+        // may be answered without the core (step 9).
+        g.read_recalls.is_empty()
+            && self.dl.answered_granting.contains(&gen)
+            && self.lock_deleg_quiet(gen, &g.dir_list(), replica)
             && self.lock_floor_for_generation(gen)
                 == self.dl.floor_sent.get(&gen).copied().unwrap_or_default()
     }
@@ -5981,7 +6278,7 @@ impl Core {
                 .filter(|(gen, g)| {
                     !g.ended
                         && g.recall == RecallPhase::None
-                        && g.kind != DelegKind::Designated
+                        && !g.designated()
                         && self.deleg_settled(**gen, replica)
                 })
                 .map(|(gen, _)| *gen)
@@ -6152,12 +6449,12 @@ impl Core {
             self.arm_deleg_lapse(now, gen, out);
             return;
         }
-        let (dir, until_ms) = (d.dir, d.until.0);
+        let (dirs, until_ms) = (d.dirs.clone(), d.until.0);
         let (frozen, root_silent) = self.deleg_note_loss(gen, true);
         tracing::warn!(
             node = self.me(),
             gen = %constellation_meta::delegation::GenLabel::of(gen),
-            dir,
+            dirs = ?dirs,
             root = self.root_node().unwrap_or(0),
             until_ms,
             frozen,
@@ -6555,6 +6852,9 @@ impl Core {
         let Some((_, sent)) = d.renew.take() else {
             return true;
         };
+        if ttl_ms > 0 {
+            d.core_answer_sent = Some(sent);
+        }
         if let Some(t) = d.renew_timer.take() {
             // (A lapsed generation's retry.)
             self.cancel_timer(t, out);
@@ -6795,6 +7095,9 @@ impl Core {
         };
         if ttl_ms == 0 || late.to.is_none() || late.to != root {
             return;
+        }
+        if let Some(d) = self.dl.mine.get_mut(&gen) {
+            d.core_answer_sent = Some(late.sent);
         }
         self.deleg_extend_late(now, gen, late.sent, ttl_ms, replica, out);
     }
@@ -7107,7 +7410,7 @@ impl Core {
             self.dl
                 .gens
                 .get(g)
-                .is_some_and(|s| !s.ended && s.kind == DelegKind::Designated)
+                .is_some_and(|s| !s.ended && s.designated())
         });
         if designated {
             // Plans 03–05: only the designee writes under its path
@@ -7170,14 +7473,14 @@ impl Core {
         if !self.root_usable(now) {
             return;
         }
-        let again: Vec<(u64, Ino, NodeId, DelegKind)> = self
+        let again: Vec<Redelegation> = self
             .dl
             .gens
             .iter()
             .filter(|(_, g)| g.ended && g.redelegate)
-            .map(|(gen, g)| (*gen, g.dir, g.node, g.kind))
+            .map(|(gen, g)| (*gen, g.dirs.iter().map(|(d, k)| (*d, *k)).collect(), g.node))
             .collect();
-        for (gen, dir, node, kind) in again {
+        for (gen, dirs, node) in again {
             let gate_recalled = self.dl.gens.get(&gen).is_some_and(|g| g.gate_recalled);
             if let Some(g) = self.dl.gens.get_mut(&gen) {
                 g.redelegate = false;
@@ -7201,31 +7504,42 @@ impl Core {
                 }
                 continue;
             }
-            match self.delegate_dir(now, dir, node, kind, replica, out) {
-                Ok(new_gen) => {
-                    self.stats.deleg_redelegated += 1;
-                    // ADR-44: the subtree of a generation the gate recalled on
-                    // demand, re-granted at the open (the op's retry may
-                    // recall it once more).
-                    if gate_recalled {
-                        self.stats.deleg_gate_redelegated += 1;
+            // Every subtree again: the first grant opens the new stream and
+            // the rest grow it.
+            let mut results = Vec::new();
+            for (dir, kind) in &dirs {
+                results.push((
+                    *dir,
+                    self.delegate_dir(now, *dir, node, *kind, replica, out),
+                ));
+            }
+            for (dir, result) in results {
+                match result {
+                    Ok(new_gen) => {
+                        self.stats.deleg_redelegated += 1;
+                        // ADR-44: the subtree of a generation the gate recalled on
+                        // demand, re-granted at the open (the op's retry may
+                        // recall it once more).
+                        if gate_recalled {
+                            self.stats.deleg_gate_redelegated += 1;
+                        }
+                        tracing::info!(
+                            node = self.me(),
+                            dir,
+                            delegate = node,
+                            gen = %constellation_meta::delegation::GenLabel::of(gen),
+                            new_gen = %constellation_meta::delegation::GenLabel::of(new_gen),
+                            "re-delegated after a cross-subtree op"
+                        );
                     }
-                    tracing::info!(
+                    Err(why) => tracing::debug!(
                         node = self.me(),
                         dir,
                         delegate = node,
-                        gen = %constellation_meta::delegation::GenLabel::of(gen),
-                        new_gen = %constellation_meta::delegation::GenLabel::of(new_gen),
-                        "re-delegated after a cross-subtree op"
-                    );
+                        why,
+                        "not re-delegated"
+                    ),
                 }
-                Err(why) => tracing::debug!(
-                    node = self.me(),
-                    dir,
-                    delegate = node,
-                    why,
-                    "not re-delegated"
-                ),
             }
         }
     }
@@ -7240,9 +7554,11 @@ impl Core {
     /// it, not wait for it. An inherited generation was never granted here.
     pub(crate) fn grant_in_flight(&self, now: Now, gen: u64) -> bool {
         self.dl.gens.get(&gen).is_some_and(|g| {
-            !g.inherited
+            (!g.inherited
                 && g.delegate_heard.is_none()
-                && now.wait.since(g.granted) < self.grant_in_flight_ms()
+                && now.wait.since(g.granted) < self.grant_in_flight_ms())
+                || g.grown_at
+                    .is_some_and(|t| now.wait.since(t) < self.grant_in_flight_ms())
         })
     }
 
@@ -7289,7 +7605,7 @@ impl Core {
         // The slot closes at the transition, in this step (plan 41 R1,
         // rule 2): no renewal is granted from here, whoever answers it.
         self.dw.close_for_recall(gen);
-        let (to, dir) = (g.node, g.dir);
+        let (to, dir) = (g.node, g.dirs.keys().next().copied().unwrap_or(0));
         let req = self.op_id();
         let back_off = self.deleg_request_timeout_ms();
         let timer =
@@ -7339,8 +7655,12 @@ impl Core {
         if g.ended || g.recall != RecallPhase::Sent {
             return;
         }
-        let (to, dir, mut back_off, gate_recalled) =
-            (g.node, g.dir, g.recall_backoff_ms, g.gate_recalled);
+        let (to, dir, mut back_off, gate_recalled) = (
+            g.node,
+            g.dirs.keys().next().copied().unwrap_or(0),
+            g.recall_backoff_ms,
+            g.gate_recalled,
+        );
         let floor = self.deleg_request_timeout_ms();
         // ADR-44: a recall the gate started on demand is sent again inside
         // the gate too (L3); any other waits for the open.
@@ -7487,7 +7807,7 @@ impl Core {
         let Some(g) = self.dl.gens.get(&gen) else {
             return;
         };
-        if g.ended || g.kind == DelegKind::Designated {
+        if g.ended || g.designated() {
             // A designation never expires: `online` ends it (an
             // unreachable designee's stays until it returns, DESIGN.md
             // §5.2).
@@ -7885,7 +8205,7 @@ impl Core {
         // Plan 30 §M14: an outwaited delegate — the lock grants moved to
         // it may still be honoured with this root's windows: a grace on
         // the subtree (the seal path re-delegates; the grace stands).
-        let outwaited_dir = (g.recall != RecallPhase::Sealing).then_some(g.dir);
+        let outwaited_dirs = (g.recall != RecallPhase::Sealing).then(|| g.dir_list());
         // Plan 43 C2e (Q1, D3): the seal set. A generation whose latest
         // record names backups (the strict members) is not ended without
         // one member's tail — rows acknowledged through the group may be
@@ -7900,7 +8220,7 @@ impl Core {
         // appends, and their tails are drained if they come in time).
         let strict: Vec<NodeId> = g.group.strict().to_vec();
         let recorded = !strict.is_empty();
-        if let Some(dir) = outwaited_dir {
+        for dir in outwaited_dirs.into_iter().flatten() {
             self.lock_on_generation_outwaited(now, dir);
         }
         for member in g.group.best_effort() {
@@ -8327,7 +8647,7 @@ impl Core {
         // recall); closed here too, for every other way in.
         self.dw.close(gen);
         let node = g.node;
-        let dir = g.dir;
+        let dirs = g.dir_list();
         let cursor = g.cursor;
         let drained = matches!(g.recall, RecallPhase::Drained(_));
         // Plan 43 C2: the generation's end carries its cut: the rows this
@@ -8395,12 +8715,14 @@ impl Core {
         // generation also leaves a grace on the subtree (sim seed 96046).
         self.lock_on_generation_ended(now, gen, replica);
         if !drained {
-            self.lock_on_generation_outwaited(now, dir);
+            for dir in &dirs {
+                self.lock_on_generation_outwaited(now, *dir);
+            }
         }
         tracing::info!(
             node = self.me(),
             gen = %constellation_meta::delegation::GenLabel::of(gen),
-            dir,
+            ?dirs,
             cursor,
             "delegation generation ended"
         );
@@ -8826,16 +9148,33 @@ impl Core {
                 d.dir, d.gen
             ));
         }
+        // Plan 46 M1.2 step 9: a node holds one stream. A grant to a node
+        // whose stream is live grows it (below); one to a node with none
+        // opens its stream.
+        let live_stream = self
+            .dl
+            .gens
+            .iter()
+            .find(|(_, g)| g.node == node && !g.ended)
+            .map(|(gen, _)| *gen);
+        if let Some(gen) = live_stream {
+            let g = &self.dl.gens[&gen];
+            if g.designated() && kind != DelegKind::Designated {
+                return Err(format!(
+                    "node {node} holds designated directories only; a grant that can be \
+                     reclaimed waits until they are released"
+                ));
+            }
+            if g.recall != RecallPhase::None || g.waiting_for_group || g.prev_blocked {
+                return Err(format!("node {node}'s delegation is being recalled"));
+            }
+        }
         // A delegation on a descendant of `dir` would be shadowed.
         if table
             .iter()
             .any(|d| d.dir != dir && is_under(replica.namespace(), d.dir, dir))
         {
             return Err(format!("a directory under {dir} is already delegated"));
-        }
-        if kind != DelegKind::Designated && table.iter().any(|d| d.node == node && !d.designated())
-        {
-            return Err(format!("node {node} already holds a delegation"));
         }
         // Plan 30 §M8 under M11: the read delegations this root granted
         // under `dir` must be gone before the delegate executes, since its
@@ -8852,6 +9191,16 @@ impl Core {
         // runs, the first renewal waits for it too, and a designation is
         // not journaled.
         let quarantine = self.first_renewal_quarantine(now, replica);
+        if live_stream.is_some() && kind != DelegKind::Designated {
+            // A grown subtree has no first renewal to wait out the quarantine
+            // with: it is granted once the quarantine has passed.
+            if let Some(q) = quarantine {
+                return Err(format!(
+                    "read delegations granted before this tenure may be honoured for {} ms",
+                    q.since(now.wait)
+                ));
+            }
+        }
         if kind == DelegKind::Designated {
             if !read_grants.grants.is_empty() {
                 self.dl.designating.insert(dir, node);
@@ -8869,6 +9218,9 @@ impl Core {
                 ));
             }
             self.dl.designating.remove(&dir);
+        }
+        if let Some(gen) = live_stream {
+            return self.grow_generation(now, gen, dir, kind, read_grants, replica, out);
         }
         // ADR-43: a generation is a stream's identity, minted by one
         // tenure in its own epoch's block (`epoch << 32 | n`), the epoch of
@@ -8916,13 +9268,13 @@ impl Core {
         self.dl.gens.insert(
             gen,
             GenState {
-                dir,
+                dirs: BTreeMap::from([(dir, kind)]),
                 node,
-                kind,
                 group: GroupState::default(),
                 redelegate: false,
                 granted: now.wait,
                 inherited: false,
+                grown_at: None,
                 gate_recalled: false,
                 below_since: None,
                 seal_reqs: BTreeMap::new(),
@@ -8973,6 +9325,77 @@ impl Core {
             gen = %constellation_meta::delegation::GenLabel::of(gen),
             ?kind,
             "delegated"
+        );
+        Ok(gen)
+    }
+
+    /// Plan 46 M1.2 step 9: grant `dir` to the node that holds stream `gen`:
+    /// the stream grows (`DelegateNode` again, the same generation; a window,
+    /// a cut and a group exist already). The root stops sequencing `dir` at
+    /// once. The delegate honours it once the record is committed and the
+    /// root has answered a renewal sent after that
+    /// ([`Self::deleg_unpark_grown`]): the answer carries the lock handoff of
+    /// the new subtree, and waits for the root's read delegations under it
+    /// (`read_recalls`; a renewal without the core is not answered meanwhile,
+    /// [`Self::deleg_settled`]).
+    #[allow(clippy::too_many_arguments)]
+    fn grow_generation(
+        &mut self,
+        now: Now,
+        gen: u64,
+        dir: Ino,
+        kind: DelegKind,
+        read_grants: RecallNeed,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> Result<u64, String> {
+        let node = self.dl.gens[&gen].node;
+        let _class = self.journal_class();
+        replica
+            .apply_records_journaled(
+                &[LogRecord::delegate_one(
+                    node,
+                    gen,
+                    dir,
+                    if kind == DelegKind::Designated {
+                        SubtreeKind::Designated
+                    } else {
+                        SubtreeKind::Placed
+                    },
+                )],
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        let read_recalls = self
+            .start_recalls(now, read_grants, out)
+            .map(|(ids, _)| ids)
+            .unwrap_or_default();
+        let g = self.dl.gens.get_mut(&gen).expect("present");
+        g.dirs.insert(dir, kind);
+        g.grown_at = Some(now.wait);
+        g.below_since = None;
+        g.read_recalls.extend(read_recalls);
+        self.dw.unsettle(gen);
+        // Plan 30 §M14: the new subtree's lock grants go with it (handed
+        // over with the next granting renewal).
+        self.lock_on_delegated(gen, replica);
+        self.lock_reserve_all(now, replica, out);
+        self.stats.deleg_delegated += 1;
+        self.stats.deleg_grows += 1;
+        match kind {
+            DelegKind::Placed => self.stats.place_delegated += 1,
+            DelegKind::Designated => self.stats.deleg_designated += 1,
+            DelegKind::Manual => {}
+        }
+        self.lease.touch(now);
+        self.nudge(now, out);
+        tracing::info!(
+            node = self.me(),
+            dir,
+            delegate = node,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
+            ?kind,
+            "grew a delegation's stream by a subtree"
         );
         Ok(gen)
     }
@@ -9242,12 +9665,9 @@ impl Core {
         // see it re-delegated by the next designation sync, after
         // bouncing the designee's in-flight ops.
         if entries.iter().any(|d| d.designated())
-            || entries.iter().any(|d| {
-                self.dl
-                    .gens
-                    .get(&d.gen)
-                    .is_some_and(|g| g.kind == DelegKind::Designated)
-            })
+            || entries
+                .iter()
+                .any(|d| self.dl.gens.get(&d.gen).is_some_and(|g| g.designated()))
         {
             out.push(Action::ControlDone {
                 op,

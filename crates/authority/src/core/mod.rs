@@ -1058,6 +1058,12 @@ pub struct Stats {
     /// Delegate: installs put off because the grant's `DelegateNode` record
     /// is not committed yet (plan 46 M1.2 step 8b).
     pub deleg_install_waits_commit: u64,
+    /// Root: grants that grew a live stream instead of opening one (plan 46
+    /// M1.2 step 9). Delegate: grown subtrees learned from the table, and
+    /// those it came to honour (after the commit and a renewal's answer).
+    pub deleg_grows: u64,
+    pub deleg_grows_learned: u64,
+    pub deleg_grows_honoured: u64,
     /// Root, simulation only (`Config::stream_ahead_uncommit_grant_every`):
     /// batches carrying a `DelegateNode` streamed ahead, and those sent
     /// as uncommitted by the knob.
@@ -3032,6 +3038,22 @@ impl Core {
                 }
                 if ttl_ms > 0 && !locks.is_empty() {
                     self.lock_install_moved(now, gen, locks, &lock_carry, replica);
+                }
+                // Plan 46 M1.2 step 9: the subtrees the stream grew by, whose
+                // commit this node learned before it sent this renewal, are
+                // honoured with the lock content they came with.
+                if ttl_ms > 0 {
+                    let sent = self
+                        .dl
+                        .mine
+                        .get_mut(&gen)
+                        .and_then(|d| d.core_answer_sent.take());
+                    if let Some(sent) = sent {
+                        let unlocked = self.deleg_unpark_grown(now, gen, sent, out);
+                        if !unlocked.is_empty() {
+                            self.lock_take_grace_dirs(now, &unlocked, lock_grace_ms);
+                        }
+                    }
                 }
             }
             PeerMsg::DelegRecall { req, gen, .. } => {

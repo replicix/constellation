@@ -2680,7 +2680,7 @@ impl Core {
             if g.ended || g.node == me {
                 continue;
             }
-            let designated = g.kind == super::delegate::DelegKind::Designated;
+            let designated = g.designated();
             match self.lk.heads.get(gen) {
                 Some((sent, head, heard)) => {
                     if !designated || now.wait.since(*heard) < online_ms {
@@ -2744,12 +2744,14 @@ impl Core {
                 .copied()
                 .filter(|gen| {
                     self.dl.gens.get(gen).is_some_and(|g| {
-                        inos.iter().any(|ino| replica.is_under(*ino, g.dir))
-                            || dirs.iter().any(|d| {
-                                *d == constellation_fs_core::types::ROOT_INO
-                                    || replica.is_under(g.dir, *d)
-                                    || replica.is_under(*d, g.dir)
-                            })
+                        g.dirs.keys().any(|gd| {
+                            inos.iter().any(|ino| replica.is_under(*ino, *gd))
+                                || dirs.iter().any(|d| {
+                                    *d == constellation_fs_core::types::ROOT_INO
+                                        || replica.is_under(*gd, *d)
+                                        || replica.is_under(*d, *gd)
+                                })
+                        })
                     })
                 })
                 .collect();
@@ -2813,7 +2815,13 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         if barrier > 0 {
-            if let Some(dir) = self.dl.mine.get(&gen).map(|d| d.dir) {
+            let dirs: Vec<Ino> = self
+                .dl
+                .mine
+                .get(&gen)
+                .map(|d| d.dirs.iter().copied().collect())
+                .unwrap_or_default();
+            for dir in dirs {
                 self.lock_dir_barrier(dir, barrier);
             }
         }
@@ -2847,10 +2855,16 @@ impl Core {
         replica: &dyn Replica,
     ) -> (i64, Position, i64) {
         let (at, pos) = self.lock_cut_here(now, replica);
-        let barrier = match self.dl.gens.get(&gen).map(|g| g.dir) {
-            Some(dir) => self.lock_barrier_under(dir, replica),
-            None => 0,
-        };
+        let barrier = self
+            .dl
+            .gens
+            .get(&gen)
+            .map(|g| g.dir_list())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|dir| self.lock_barrier_under(dir, replica))
+            .max()
+            .unwrap_or(0);
         if !self.lk.barriers.is_empty() || !self.lk.dir_barriers.is_empty() {
             self.lock_settle_barriers(at, &pos, replica);
         }
@@ -6239,18 +6253,23 @@ impl Core {
         }
         // The subtree's lock floor goes with it (with every granting
         // renewal: a join, so a resend is harmless).
-        if let Some(dir) = self.dl.gens.get(&gen).map(|g| g.dir) {
-            let floor = self.lock_subtree_floor(
-                dir,
-                |ino| {
-                    let keys = Self::read_keys(ino, None);
-                    matches!(
-                        replica.resolve_ownership(&keys),
-                        constellation_meta::delegation::Ownership::Delegated(d) if d.gen == gen
-                    )
-                },
-                replica,
-            );
+        let dirs = self.dl.gens.get(&gen).map(|g| g.dir_list());
+        if let Some(dirs) = dirs {
+            let mut floor = Position::ZERO;
+            for dir in dirs {
+                let f = self.lock_subtree_floor(
+                    dir,
+                    |ino| {
+                        let keys = Self::read_keys(ino, None);
+                        matches!(
+                            replica.resolve_ownership(&keys),
+                            constellation_meta::delegation::Ownership::Delegated(d) if d.gen == gen
+                        )
+                    },
+                    replica,
+                );
+                floor = constellation_meta::locks::floor_join(&floor, &f);
+            }
             // (Unsettled only if it moved: the same floor again, as every
             // granting renewal re-computes it, leaves nothing behind.)
             if self.lk.handed_floor.insert(gen, floor) != Some(floor) {
@@ -6341,10 +6360,16 @@ impl Core {
         if inos.is_empty() {
             return Vec::new();
         }
-        let subtree = match self.dl.mine.get(&gen).map(|d| d.dir) {
-            Some(dir) => self.lock_barrier_under(dir, replica),
-            None => 0,
-        };
+        let subtree = self
+            .dl
+            .mine
+            .get(&gen)
+            .map(|d| d.dirs.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|dir| self.lock_barrier_under(dir, replica))
+            .max()
+            .unwrap_or(0);
         inos.into_iter()
             .filter_map(|ino| {
                 let at = self
@@ -6660,8 +6685,11 @@ impl Core {
     /// A barrier counts only if it applies under the generation's subtree
     /// `dir` (what a renewal's answer would carry, `lock_barrier_under`): one
     /// elsewhere in the tree does not take the lane away from this delegate.
-    pub(crate) fn lock_deleg_quiet(&self, gen: u64, dir: Ino, replica: &dyn Replica) -> bool {
-        !self.lk.handoff.contains_key(&gen) && self.lock_barrier_under(dir, replica) == 0
+    pub(crate) fn lock_deleg_quiet(&self, gen: u64, dirs: &[Ino], replica: &dyn Replica) -> bool {
+        !self.lk.handoff.contains_key(&gen)
+            && dirs
+                .iter()
+                .all(|dir| self.lock_barrier_under(*dir, replica) == 0)
     }
 
     /// A floor raised under `gen`'s subtree since the last answer (tests).
@@ -6680,10 +6708,17 @@ impl Core {
         if *floor == Position::ZERO {
             return;
         }
-        let Some(dir) = self.dl.mine.get(&gen).map(|d| d.dir) else {
+        let Some(dirs) = self
+            .dl
+            .mine
+            .get(&gen)
+            .map(|d| d.dirs.iter().copied().collect::<Vec<_>>())
+        else {
             return;
         };
-        self.lock_note_dir_floor(dir, floor);
+        for dir in dirs {
+            self.lock_note_dir_floor(dir, floor);
+        }
     }
 
     /// Delegate: the generation is recalled — its grants and its
@@ -6701,7 +6736,11 @@ impl Core {
         gen: u64,
         replica: &dyn Replica,
     ) -> constellation_meta::locks::LockHandback {
-        let dir = self.dl.mine.get(&gen).map(|d| d.dir);
+        let dirs = self
+            .dl
+            .mine
+            .get(&gen)
+            .map(|d| d.dirs.iter().copied().collect::<Vec<_>>());
         // What a first recall took out of the table a repeated one hands back
         // again (L3: the root sends a recall again when its answer is lost;
         // it would otherwise end the generation by drain with no grants,
@@ -6721,11 +6760,17 @@ impl Core {
             .map(|g| (g.id, Self::lock_left(now.wait, g)))
             .collect();
         let grants = grants.iter().map(|g| g.to_wire(now)).collect();
-        let (floor, barrier) = match dir {
-            Some(dir) => (
-                self.lock_subtree_floor(dir, |ino| replica.is_under(ino, dir), replica),
-                self.lock_barrier_under(dir, replica),
-            ),
+        let (floor, barrier) = match dirs {
+            Some(dirs) => {
+                let mut floor = Position::ZERO;
+                let mut barrier = 0;
+                for dir in dirs {
+                    let f = self.lock_subtree_floor(dir, |ino| replica.is_under(ino, dir), replica);
+                    floor = constellation_meta::locks::floor_join(&floor, &f);
+                    barrier = barrier.max(self.lock_barrier_under(dir, replica));
+                }
+                (floor, barrier)
+            }
             None => (Position::ZERO, 0),
         };
         constellation_meta::locks::LockHandback {
@@ -6845,9 +6890,10 @@ impl Core {
                 let outwaited = g.ended
                     || now.wait >= self.gen_until(gen)
                     || g.recall == super::delegate::RecallPhase::Sealing;
-                let dir = g.dir;
-                self.lock_note_dir_floor(dir, &floor);
-                self.lock_dir_barrier(dir, barrier);
+                for dir in g.dir_list() {
+                    self.lock_note_dir_floor(dir, &floor);
+                    self.lock_dir_barrier(dir, barrier);
+                }
                 !outwaited
             }
             None => false,
@@ -7127,20 +7173,39 @@ impl Core {
         gen: u64,
         replica: &dyn Replica,
     ) -> u64 {
-        let Some(dir) = self.dl.gens.get(&gen).map(|g| g.dir) else {
+        let Some(dirs) = self.dl.gens.get(&gen).map(|g| g.dir_list()) else {
             return 0;
         };
         self.lk.grace.retain(|(_, until)| *until > now.wait);
         let mut until = Self::lock_quarantine_until(replica);
         for (g, u) in &self.lk.grace {
             if *g == constellation_fs_core::types::ROOT_INO
-                || replica.is_under(dir, *g)
-                || replica.is_under(*g, dir)
+                || dirs
+                    .iter()
+                    .any(|dir| replica.is_under(*dir, *g) || replica.is_under(*g, *dir))
             {
                 until = until.max(*u);
             }
         }
         until.since(now.wait).max(0) as u64
+    }
+
+    /// Delegate: the root's core answer that let the grown subtrees `dirs` in
+    /// carried its remaining grace on the stream's subtrees: no new grant on
+    /// the new ones until it passes (as [`Self::lock_take_grace`] for a first
+    /// grant).
+    pub(crate) fn lock_take_grace_dirs(&mut self, now: Now, dirs: &[Ino], grace_ms: u64) {
+        if grace_ms == 0 {
+            return;
+        }
+        let until = now
+            .wait
+            .plus(grace_ms.saturating_add(self.lock_margin_ms().max(0) as u64));
+        for dir in dirs {
+            self.lk.grace.push((*dir, until));
+        }
+        self.stats.lock_grace_periods += 1;
+        self.stats.lock_graces_inherited += 1;
     }
 
     /// Delegate: generation `gen`'s first granting renewal carried the
@@ -7151,19 +7216,26 @@ impl Core {
         if grace_ms == 0 {
             return;
         }
-        let Some(dir) = self.dl.mine.get(&gen).map(|d| d.dir) else {
+        let Some(dirs) = self
+            .dl
+            .mine
+            .get(&gen)
+            .map(|d| d.dirs.iter().copied().collect::<Vec<_>>())
+        else {
             return;
         };
         let until = now
             .wait
             .plus(grace_ms.saturating_add(self.lock_margin_ms().max(0) as u64));
-        self.lk.grace.push((dir, until));
+        for dir in &dirs {
+            self.lk.grace.push((*dir, until));
+        }
         self.stats.lock_grace_periods += 1;
         self.stats.lock_graces_inherited += 1;
         tracing::info!(
             node = self.cfg.node_id,
             gen = %constellation_meta::delegation::GenLabel::of(gen),
-            dir,
+            ?dirs,
             grace_ms,
             "a delegation starts inside the root's lock grace; no new grants on the subtree until it passes"
         );

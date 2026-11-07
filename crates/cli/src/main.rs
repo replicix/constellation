@@ -4181,9 +4181,9 @@ fn render_waiting_generations(delegation: &api::DelegationReport) -> Vec<String>
                 })
                 .collect();
             let head = format!(
-                "delegation generation {} (directory inode {}, delegate node {}, heard {}) cannot end ({} s): members {}",
+                "delegation generation {} (directory inodes {:?}, delegate node {}, heard {}) cannot end ({} s): members {}",
                 gen_label(w.gen),
-                w.dir,
+                w.dirs,
                 w.delegate,
                 ago(w.delegate_heard_ms),
                 w.waited_ms / 1000,
@@ -4926,7 +4926,7 @@ mod parse_byte_size_tests {
         assert!(render_waiting_generations(&d).is_empty());
         d.waiting.push(api::WaitingGenerationStatus {
             gen: 10,
-            dir: 6,
+            dirs: vec![6],
             delegate: 3,
             waited_ms: 61_000,
             delegate_heard_ms: Some(70_000),
@@ -4943,7 +4943,7 @@ mod parse_byte_size_tests {
         });
         d.waiting.push(api::WaitingGenerationStatus {
             gen: 11,
-            dir: 7,
+            dirs: vec![7],
             delegate: 3,
             waited_ms: 5_000,
             delegate_heard_ms: None,

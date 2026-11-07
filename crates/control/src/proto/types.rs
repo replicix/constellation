@@ -233,7 +233,9 @@ pub struct DesignationStatus {
     pub read_only: bool,
 }
 
-/// Plan 30 §M11: one live delegation.
+/// Plan 30 §M11: one live delegation: a subtree grant (the rows of one
+/// node's stream share its `node` and `gen`; plan 46 M1.2 step 9: a node holds
+/// one stream, [`DelegationStreamStatus`]).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct DelegationStatus {
     pub dir: u64,
@@ -241,8 +243,18 @@ pub struct DelegationStatus {
     pub node: u64,
     pub gen: u64,
     /// Phase 2b: an offline designation (never recalled by TTL or
-    /// placement).
+    /// placement while every subtree of the stream is one).
     pub designated: bool,
+}
+
+/// Plan 46 M1.2 step 9: one node's stream with the subtrees it holds (a node
+/// holds one stream; a later grant to it grows the stream in place).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DelegationStreamStatus {
+    pub node: u64,
+    pub gen: u64,
+    /// The subtrees the stream holds, by directory.
+    pub dirs: Vec<DelegationStatus>,
 }
 
 /// A generation delegated to this node that is not installed yet: an
@@ -250,7 +262,7 @@ pub struct DelegationStatus {
 /// is not applied from the log yet (the strand of those rows comes first).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct InstallWaitingStatus {
-    pub dir: u64,
+    pub dirs: Vec<u64>,
     pub gen: u64,
     pub waited_ms: u64,
     /// The ended generations it waits for; empty when the journal could
@@ -263,8 +275,8 @@ pub struct InstallWaitingStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct WaitingGenerationStatus {
     pub gen: u64,
-    /// The delegated directory's inode.
-    pub dir: u64,
+    /// The stream's directories (inodes).
+    pub dirs: Vec<u64>,
     /// The (silent) delegate.
     pub delegate: u64,
     /// How long the generation has waited, ms.
@@ -314,21 +326,24 @@ pub struct WaitingMemberStatus {
 pub struct DelegationReport {
     /// `CONSTELLATION_DELEGATION` is on (and P2P).
     pub enabled: bool,
-    /// The live table.
+    /// The live table: one row per subtree grant.
     pub table: Vec<DelegationStatus>,
-    /// Delegations this node holds: `(dir, gen, until_ms, stopped,
+    /// The same, per node: one entry per stream (plan 46 M1.2 step 9).
+    #[serde(default)]
+    pub streams: Vec<DelegationStreamStatus>,
+    /// Delegations this node holds, one row per stream: `(dirs, gen, until_ms, stopped,
     /// streamed_through, executed, parked, class)`; `class` is what this
     /// node's own clients' answers wait for (`singleton`, `group`,
     /// `archive_waits`, `final`; plan 43 C2e, plan 46 M1.1 step 7).
     #[allow(clippy::type_complexity)]
-    pub mine: Vec<(u64, u64, i64, bool, u64, u64, usize, String)>,
-    /// As the root: `(dir, node, gen, cursor, until_ms, recall, ended,
+    pub mine: Vec<(Vec<u64>, u64, i64, bool, u64, u64, usize, String)>,
+    /// As the root, one row per stream: `(dirs, node, gen, cursor, until_ms, recall, ended,
     /// waiting_for_group)`. `waiting_for_group`: the generation cannot end
     /// because its delegate is silent and no member of its recorded backup
     /// group has handed over the tail; `constellation repair abandon-group
     /// --gen` ends it (rows only that group held are lost).
     #[allow(clippy::type_complexity)]
-    pub gens: Vec<(u64, u64, u64, u64, i64, String, bool, bool)>,
+    pub gens: Vec<(Vec<u64>, u64, u64, u64, i64, String, bool, bool)>,
     /// As the root: the generations that wait for their group's tail (the
     /// `gens` rows with `waiting_for_group`), with what this root knows of
     /// each member it asked to seal. Weigh `constellation repair
@@ -431,7 +446,7 @@ pub struct DelegationReport {
     pub backup_acks: u64,
     pub acks_parked: u64,
     /// Acknowledgements whose row its own group held but that waited for a
-    /// row of another generation this node delegates (a `DelegGroup`
+    /// row of another generation this node delegates (a `DelegateNodeGroup`
     /// acknowledgement waits for the row's dependencies on the node's other
     /// generations), with the total and the longest of those waits in ms.
     pub xgen_acks_delayed: u64,

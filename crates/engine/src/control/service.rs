@@ -490,25 +490,15 @@ impl EngineControl {
                 let v = &core.delegation;
                 api::DelegationReport {
                     enabled: core.delegation_enabled,
-                    table: self
-                        .meta
-                        .delegation_table()
-                        .iter()
-                        .map(|d| api::DelegationStatus {
-                            dir: d.dir,
-                            path: self.meta.path_of(d.dir).unwrap_or_default(),
-                            node: d.node,
-                            gen: d.gen,
-                            designated: d.designated(),
-                        })
-                        .collect(),
+                    table: self.list_delegations(),
+                    streams: self.list_delegation_streams(),
                     mine: v.mine.clone(),
                     gens: v.gens.clone(),
                     install_waiting: v
                         .install_waiting
                         .iter()
-                        .map(|(dir, gen, waited_ms, ended)| api::InstallWaitingStatus {
-                            dir: *dir,
+                        .map(|(dirs, gen, waited_ms, ended)| api::InstallWaitingStatus {
+                            dirs: dirs.clone(),
                             gen: *gen,
                             waited_ms: *waited_ms,
                             ended: ended.clone(),
@@ -522,7 +512,7 @@ impl EngineControl {
                         .iter()
                         .map(|w| api::WaitingGenerationStatus {
                             gen: w.gen,
-                            dir: w.dir,
+                            dirs: w.dirs.clone(),
                             delegate: w.delegate,
                             waited_ms: w.waited_ms,
                             delegate_heard_ms: w.delegate_heard_ms,
@@ -1127,12 +1117,46 @@ impl EngineControl {
         self.meta
             .delegation_table()
             .iter()
-            .map(|d| api::DelegationStatus {
-                dir: d.dir,
-                path: self.meta.path_of(d.dir).unwrap_or_default(),
-                node: d.node,
-                gen: d.gen,
-                designated: d.designated(),
+            .map(|d| self.delegation_row(d.dir, d.node, d.gen, d.designated()))
+            .collect()
+    }
+
+    fn delegation_row(
+        &self,
+        dir: u64,
+        node: u64,
+        gen: u64,
+        designated: bool,
+    ) -> api::DelegationStatus {
+        api::DelegationStatus {
+            dir,
+            path: self.meta.path_of(dir).unwrap_or_default(),
+            node,
+            gen,
+            designated,
+        }
+    }
+
+    /// The table per node: one entry per stream with its subtrees.
+    pub(crate) fn list_delegation_streams(&self) -> Vec<api::DelegationStreamStatus> {
+        self.meta
+            .delegation_table()
+            .streams()
+            .map(|st| api::DelegationStreamStatus {
+                node: st.node,
+                gen: st.gen,
+                dirs: st
+                    .subtrees
+                    .iter()
+                    .map(|(dir, kind)| {
+                        self.delegation_row(
+                            *dir,
+                            st.node,
+                            st.gen,
+                            *kind == constellation_meta::SubtreeKind::Designated,
+                        )
+                    })
+                    .collect(),
             })
             .collect()
     }

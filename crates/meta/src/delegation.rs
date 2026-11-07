@@ -97,9 +97,13 @@ impl Delegation {
 /// The live delegations, derived from the log prefix (plus, on the root,
 /// its unshipped journal): one [`NodeStream`] per `(node, gen)` with the
 /// subtree set folded from its records, and a `by_dir` index for the
-/// ownership walk. A node has one stream per generation, so a table keyed
-/// by node holds as many entries as the node has live generations (one, from
-/// step 9 on). Subtrees never overlap in one directory: the root writes a
+/// ownership walk. The key is `(node, gen)`, not the node alone: a generation
+/// names one node's stream for good (ADR-43: minted once, never reused), so the
+/// generation identifies the stream and the node is its redundancy (a
+/// `DelegateNodeEnded` is matched by generation). A node holds one live stream
+/// since plan 46 M1.2 step 9: the root grows it by a later `DelegateNode` of
+/// the same generation instead of opening a second one; a recalled stream is
+/// ended before the node's next grant opens another. Subtrees never overlap in one directory: the root writes a
 /// grant only for a directory no live grant contains, and only after every
 /// grant under it was recalled (plan 46 D5 deleted the hash-range splits).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -324,6 +328,37 @@ impl DelegationTable {
     /// `parent`'s containing subtree (`None`: the root).
     pub fn owner_of_dentry(&self, ns: &dyn Namespace, parent: Ino) -> Option<(NodeId, Gen)> {
         self.owner_of_dir(ns, parent)
+    }
+
+    /// Whether any key of `keys` lies in a subtree of stream `gen` that is not
+    /// among the `honoured` ones (plan 46 M1.2 step 9: a stream grown by a
+    /// subtree its delegate has not come to honour yet; the delegate leaves
+    /// such an op to the root). False without a look at the keys when the
+    /// stream holds nothing but honoured subtrees.
+    pub fn touches_unhonoured(
+        &self,
+        ns: &dyn Namespace,
+        keys: &TouchSet,
+        gen: Gen,
+        honoured: &[Ino],
+    ) -> bool {
+        let Some(set) = self
+            .streams
+            .iter()
+            .find(|((_, g), _)| *g == gen)
+            .map(|(_, set)| set)
+        else {
+            return false;
+        };
+        if set.keys().all(|d| honoured.contains(d)) {
+            return false;
+        }
+        let hit = |ino: Ino| {
+            self.covering(ns, ino)
+                .is_some_and(|d| d.gen == gen && !honoured.contains(&d.dir))
+        };
+        keys.dentries.iter().any(|(parent, _)| hit(*parent))
+            || keys.inos.iter().chain(keys.shared.iter()).any(|i| hit(*i))
     }
 
     /// Who executes an op touching `keys`.

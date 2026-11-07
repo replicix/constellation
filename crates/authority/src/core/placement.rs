@@ -266,23 +266,32 @@ impl Core {
         top.truncate(16);
         self.pl.top = top;
         // 1. Recalls of placed generations (hysteresis over the dwell).
-        let placed: Vec<(u64, Ino, NodeId)> = self
+        let placed: Vec<(u64, Vec<Ino>, NodeId)> = self
             .dl
             .gens
             .iter()
-            .filter(|(_, g)| !g.ended && g.kind == DelegKind::Placed)
-            .map(|(gen, g)| (*gen, g.dir, g.node))
+            .filter(|(_, g)| !g.ended && g.kind() == DelegKind::Placed)
+            .map(|(gen, g)| (*gen, g.dir_list(), g.node))
             .collect();
-        for (gen, dir, node) in placed {
-            let (share_ok, total) = match subtree.get(&dir) {
-                Some(by_node) => {
-                    let total: u64 = by_node.values().sum();
-                    let n = by_node.get(&node).copied().unwrap_or(0);
-                    (total > 0 && n * 100 >= total * leave, total)
-                }
-                None => (false, 0),
-            };
-            let rate_ok = total * 2 >= min_ops;
+        for (gen, dirs, node) in placed {
+            // A stream is recalled whole (step 9; a partial release is step
+            // 10): it stays while any of its subtrees keeps the delegate's
+            // share and rate.
+            let mut keep = false;
+            let mut total_all = 0u64;
+            for dir in &dirs {
+                let (share_ok, total) = match subtree.get(dir) {
+                    Some(by_node) => {
+                        let total: u64 = by_node.values().sum();
+                        let n = by_node.get(&node).copied().unwrap_or(0);
+                        (total > 0 && n * 100 >= total * leave, total)
+                    }
+                    None => (false, 0),
+                };
+                total_all += total;
+                keep |= share_ok && total * 2 >= min_ops;
+            }
+            let (share_ok, rate_ok, total) = (keep, true, total_all);
             let g = self.dl.gens.get_mut(&gen).expect("present");
             if share_ok && rate_ok {
                 g.below_since = None;
@@ -290,14 +299,21 @@ impl Core {
             }
             let since = *g.below_since.get_or_insert(now.wait);
             let dwell = self.cfg.placement_dwell_ms as i64;
-            if now.wait.since(since) >= dwell && now.wait.since(g.granted) >= dwell {
-                self.pl
-                    .cooldown
-                    .insert(dir, now.wait.plus(self.cfg.placement_cooldown_ms));
+            if now.wait.since(since) >= dwell
+                && now
+                    .wait
+                    .since(g.grown_at.map_or(g.granted, |t| t.max(g.granted)))
+                    >= dwell
+            {
+                for dir in &dirs {
+                    self.pl
+                        .cooldown
+                        .insert(*dir, now.wait.plus(self.cfg.placement_cooldown_ms));
+                }
                 self.stats.place_recalled += 1;
                 tracing::info!(
                     node = self.cfg.node_id,
-                    dir,
+                    dirs = ?dirs,
                     delegate = node,
                     gen = %constellation_meta::delegation::GenLabel::of(gen),
                     total,
@@ -347,9 +363,7 @@ impl Core {
             }
         }
         for (node, (dir, total)) in chosen {
-            if table.covering(ns, dir).is_some()
-                || table.iter().any(|d| d.node == node && !d.designated())
-            {
+            if table.covering(ns, dir).is_some() {
                 continue;
             }
             if self

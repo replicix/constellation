@@ -629,7 +629,7 @@ mod tests {
         }
         let view = DelegateView::default();
         view.mirror(&constellation_authority::core::DelegView {
-            mine: vec![(dir, 7, i64::MAX / 2, false, 0, 0, 0, String::new())],
+            mine: vec![(vec![dir], 7, i64::MAX / 2, false, 0, 0, 0, String::new())],
             ..Default::default()
         });
         let now = Now::same(0);
@@ -657,9 +657,11 @@ mod tests {
 /// round trip, and the core streams it from the journal.
 #[derive(Debug, Default)]
 pub struct DelegateView {
-    /// `(dir, gen, honoured until, stopped)`: `until` on this node's honour
-    /// clock (plan 43 C7-H1).
-    entries: std::sync::Mutex<Vec<(u64, u64, i64, bool)>>,
+    /// `(dirs, gen, honoured until, stopped)`: `dirs` the subtrees this node
+    /// honours under the stream (plan 46 M1.2 step 9: one the stream grew by
+    /// and this node does not honour yet is the core's); `until` on this
+    /// node's honour clock (plan 43 C7-H1).
+    entries: std::sync::Mutex<Vec<DelegateEntry>>,
     /// Ops the FUSE fast path executed here as the delegate (the core's
     /// `deleg_executed` counts the ones that went through it).
     executed: std::sync::atomic::AtomicU64,
@@ -686,6 +688,10 @@ pub struct DelegateView {
     /// for the store's writer lock (`Meta::begin_local`).
     fenced: std::sync::atomic::AtomicU64,
 }
+
+/// One stream this node holds, as the fast path reads it: its honoured
+/// subtrees, generation, honoured-until and stopped flag.
+type DelegateEntry = (Vec<u64>, u64, i64, bool);
 
 /// A fast-path execution admitted under a grant; dropped once the op is
 /// journaled (or refused), so a recall can wait for every admitted op.
@@ -798,8 +804,13 @@ impl DelegateView {
         let mut stopped = self.stopped.lock().unwrap();
         let mut g = self.entries.lock().unwrap();
         g.clear();
-        for (dir, gen, until, is_stopped, _, _, _, _) in &view.mine {
-            g.push((*dir, *gen, *until, *is_stopped || stopped.contains(gen)));
+        for (dirs, gen, until, is_stopped, _, _, _, _) in &view.mine {
+            g.push((
+                dirs.clone(),
+                *gen,
+                *until,
+                *is_stopped || stopped.contains(gen),
+            ));
         }
         // A generation the core dropped is over: forget the stop.
         stopped.retain(|gen| view.mine.iter().any(|m| m.1 == *gen));
@@ -827,7 +838,12 @@ impl DelegateView {
             &|p, n| meta.child_ino(p, n).ok().flatten(),
             &|i| meta.names_of_ino(i),
         );
-        let constellation_meta::delegation::Ownership::Delegated(d) = meta.resolve_ownership(&keys)
+        // One read of the table serves the owner and the honoured check.
+        let table = meta.delegation_table();
+        if table.is_empty() {
+            return None;
+        }
+        let constellation_meta::delegation::Ownership::Delegated(d) = table.resolve(meta, &keys)
         else {
             return None;
         };
@@ -836,10 +852,16 @@ impl DelegateView {
         // once `stop` returns, no new admission of that generation
         // exists and every earlier one is counted.
         let g = self.entries.lock().unwrap();
-        let gen = g
+        let (dirs, gen) = g
             .iter()
             .find(|(_, gen, until, stopped)| *gen == d.gen && !*stopped && now < *until)
-            .map(|(_, gen, _, _)| *gen)?;
+            .map(|(dirs, gen, _, _)| (dirs, *gen))?;
+        // A subtree the stream grew by and this node does not honour yet is
+        // the core's (parked until the record is committed and the root's
+        // answer is here).
+        if table.touches_unhonoured(meta, &keys, gen, dirs) {
+            return None;
+        }
         self.in_flight
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         drop(g);

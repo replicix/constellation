@@ -68436,3 +68436,82 @@ hold. The two exemptions go whole: the default release suite stays green with bo
 **Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (lib, integration), authority lib 1,089, engine lib 953, control,
 release authority sim suite 422 passed, 0 failed, 12 ignored. New tests: core `a_holds_committed_seq_for_a_delegate_is_the_member_acked_one`, oracle
 `i1_deleg_group_counts_a_hold_by_a_member_not_the_owners_journal`.
+
+### Plan 46 M1.2 step 9: one stream per node
+
+`GenState` and `DelegateState` carry a subtree set (`dirs`, one `DelegKind` per subtree on the root), and a node holds one stream. `delegate_dir`
+(manual, placement, designation, re-delegation, the re-grant to a sealed backup) grants to a node whose stream is live by **growing** it
+(`grow_generation`: `DelegateNode` again with the same generation; no new generation, window, cut or group) and opens a stream only for a node that
+has none. Main's check "node N already holds a delegation" is gone: it refused every second stealable grant to a node, so main's
+`delegated-two-dirs-one-backed` ran one generation with `d2` the root's (the step 3 comment and the plan said two generations; the sim counted one
+install). A grant is refused while the node's stream is being recalled, sealed or waiting for its group, and a stream of designations only takes no grant
+that can be reclaimed (the designation keeps its isolated-write guarantee; M1.3 decides the mix with sticky grants). A designation grown into a
+stealable stream joins its group rule: the designee loses isolated writes there (the plan's "a node with a group commits designated rows by it").
+
+**One rule per stream.** `GenState::designated()` / `DelegateState::designated` is true only when every grant of the stream is a designation; only then
+is the stream `Final`, never expired, never recalled by the placement and never taken in a cross-subtree op. Any stealable grant makes the whole stream
+group-committed and reclaimed whole (`kind()` is `Manual` when an operator granted any of it, otherwise `Placed`, so the placement recalls a stream of
+its own grants only). A recall, an expiry or a seal is of the whole stream until step 10 (a partial release); the placement keeps a stream while any
+of its subtrees is above the floors; the lock moves, graces, floors and barriers are per subtree and joined or maxed over the set.
+
+**Growth is honoured once committed** (step 8b's rule, per record). A delegate that learns a grown subtree (`delegation_sync` → `deleg_sync_growth`)
+holds it in `DelegateState::grown`, not `dirs`: it waits (1) for the record to be committed (not in `Meta::uncommitted_streamed_grants`; counter
+`deleg_install_waits_commit`) and (2) for a granting answer from the root's *core* to a renewal sent after that was learned (never one in flight or answered
+by the lane: the core's answer carries the handoff of the root's lock grants under the new subtree, the lock grace and floor, and has waited for the
+root's read delegations under it, `read_recalls`, which the lane's answer is held back for by `deleg_settled`). The stream's other subtrees run
+throughout. The ops of a parked subtree are the root's: the core (`my_generation_for`) and the FUSE fast path (`DelegateView::admit_for`, honoured subtrees
+in the mirror) both judge against the **table** (`DelegationTable::touches_unhonoured`), not against what the last sync noted, because a streamed record is in
+the table before any sync runs (a delegate runs its sync at a segment, a retry or a renewal, not at a stream-ahead install). The root's
+`grant_in_flight` covers a delegate's forward for a parked subtree for the in-flight window after a growth (`GenState::grown_at`), so the root does not
+read it as a disowned generation and recall the stream. Tests: `a_grown_subtree_parks_until_its_record_is_committed_and_the_root_has_answered` (fails
+with the table check off: executes under the uncommitted growth), `a_renewal_in_flight_when_the_growth_is_learned_does_not_unlock_it` (fails with the
+threshold off), sim `a_growth_streamed_as_uncommitted_is_not_executed_under_before_the_log_carries_it` (the knob; every oracle clean).
+
+**Status and API.** `status.delegation.streams` is one entry per node stream (`node`, `gen`, `dirs[{dir, path, node, gen, designated}]`); `table` stays one
+row per subtree grant (the harness scenarios and `designation.list_delegations` read it by path; the first perf run of this step caught a per-node `table`
+the harness could not read: topology 3's setup failed). `mine`, `gens`, `install_waiting` and `waiting` carry the subtree list (`dirs`) per stream. Schema
+re-blessed, no version bump; the control crate's stale `DelegGroup` doc comment names `DelegateNodeGroup` now. `DelegRecall` still names one directory
+(the stream's first; the delegate ignores it, step 10 replaces it with the set). The table keys by `(node, gen)`: a generation is unique (ADR-43) and a
+node has one live stream by construction, so the node key is the same thing; kept and documented in the table's doc comment.
+
+**Deleted.** The per-directory generation, window and stream for a second grant; `DelegView.mine/gens` rows per directory; the first-dir fields.
+
+**Fail-before.** `two_grants_to_one_node_are_one_stream_and_a_rename_between_them_recalls_nothing` (core): on main the second grant is refused ("the second
+grant was refused" at the test's `assert!`; main run at 13f9a891 with the test pared to main's API); on this branch one generation, one stream of two
+subtrees, and a rename between them is forwarded to the delegate: no `DelegRecall`, no cross-subtree op. Sim
+`delegated_two_dirs_one_backed_is_one_stream_and_a_rename_between_them_recalls_nothing` (`delegated-two-dirs-calm`: no fault, only the delegate's clients run,
+so every op is in `d1` or `d2`): zero recalls and cross-subtree ops, one install and one growth per seed; fails on main (the same test pared). The
+configuration `delegated-two-dirs-one-backed` delegates `d2` after `d1`'s install (`serial_delegations`), so the growth path runs in its sweeps.
+(In the other configurations a root's own op on an inode the delegate created and the root has not applied is still a cross-subtree op: the delegate's
+inode is unknown to the root's namespace. Not new.)
+
+**Sweeps** (`+commit`, seeds 0..1,999, release binary, main `13f9a891` against this branch): `delegated-two-dirs-one-backed`, `placement-hot`,
+`delegated-group-switch`, `long-delegated`: no failing seed on either side in any of the four, oracle totals 0 (I1, I2, I2c, I4, I5) everywhere, the cut
+oracle's report-mode count on `long-delegated` identical on both sides (192 in 41 seeds, the step 3 baseline), `acked_at_or_below_cut` 0 on the other three.
+`delegated-two-dirs-one-backed` changes shape, as it should: answered rows judged against a cut 38,648 on main and 130,172 here, delegate-served answers
+2,839 and 18,821 (main ran one generation with `d2` the root's; here both subtrees run at the delegate). `placement-hot` (the placement now grows a node's
+stream instead of skipping a node that holds one): rows judged 5,341 / 5,252. The sweep binary is the build before the status-shape fix below; that fix
+changes nothing the sim runs.
+
+**Perf** (the delegate fast path; box 3, quiet, release builds of main and this branch, `g1-abba.sh` order A B B A A B B A so 4 runs of each per file
+system pooled, 200 samples, topologies 2 and 3; medians over runs of p50 / p90 in us; G1 = topology 2's holder + 500 us; the first attempt failed at topology 3
+on the per-node `table` shape and was redone after the fix, runs not pooled). Holder = topology 2, delegate = topology 3:
+
+| fs | op | holder main | holder step 9 | delegate main | delegate step 9 | G1 step 9 |
+|---|---|---|---|---|---|---|
+| ext4 | create / write | 371 / 592, 3396 / 4348 | 374 / 596, 3401 / 4354 | 688 / 1036, 3757 / 4688 | 700 / 1163, 3774 / 4669 | p50 met; p90 over 67 on create |
+| ext4 | rename / unlink / chmod | 268 / 344, 248 / 379, 238 / 337 | 273 / 374, 265 / 378, 233 / 318 | 711 / 1660, 737 / 1631, 694 / 1212 | 752 / 1645, 760 / 1695, 694 / 1237 | p50 met; p90 over 771, 817, 419 (main 816, 752, 375) |
+| xfs | create / write | 360 / 470, 2207 / 2357 | 367 / 463, 2208 / 2349 | 686 / 811, 2570 / 2733 | 676 / 807, 2534 / 2703 | met; met |
+| xfs | rename / unlink / chmod | 283 / 361, 240 / 312, 232 / 310 | 280 / 363, 259 / 332, 229 / 295 | 732 / 924, 750 / 960, 705 / 1025 | 715 / 907, 710 / 933, 673 / 988 | p50 met; p90 over 44, 101, 193 (main 63, 148, 215; main's unlink p50 over by 10) |
+| btrfs | create / write | 365 / 462, 3313 / 3777 | 370 / 464, 3328 / 3794 | 700 / 817, 3687 / 3919 | 678 / 816, 3676 / 3882 | met; met |
+| btrfs | rename / unlink / chmod | 279 / 340, 257 / 317, 235 / 304 | 258 / 328, 236 / 314, 233 / 302 | 724 / 895, 709 / 947, 674 / 994 | 704 / 862, 730 / 950, 706 / 1026 | p50 met; p90 over 34, 136, 224 (main 55, 130, 190) |
+| tmpfs | create / write | 358 / 454, 382 / 502 | 357 / 460, 392 / 497 | 669 / 803, 723 / 878 | 682 / 814, 749 / 885 | met; met |
+| tmpfs | rename / unlink / chmod | 265 / 314, 243 / 321, 241 / 351 | 257 / 318, 253 / 316, 222 / 347 | 707 / 878, 704 / 939, 679 / 983 | 703 / 869, 687 / 919, 678 / 981 | p50 met; p90 over 51, 103, 134 (main 64, 118, 132) |
+
+G1's p50 holds on every file system and operation; the delegate's p50 moves between -3 % and +6 % of main's (the +6 % is ext4 rename, +3 % unlink, whose holder
+p50 moves +2 % and +7 % in the same runs: the spread of the shared disk, not a code path: the fast path reads the table once, as before, and its
+extra check returns before it looks at a key when the stream holds only honoured subtrees). The p90 over-budget counts match main's (same ops, same
+order of size).
+
+**Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (lib and integration), authority lib (1,084), engine lib (953), control
+(146, schema re-blessed), constellation CLI (95 and the integration tests), release authority sim suite 424 passed, 0 failed, 12 ignored.

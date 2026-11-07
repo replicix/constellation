@@ -1675,15 +1675,18 @@
           "type": "integer"
         },
         "gens": {
-          "description": "As the root: `(dir, node, gen, cursor, until_ms, recall, ended,\nwaiting_for_group)`. `waiting_for_group`: the generation cannot end\nbecause its delegate is silent and no member of its recorded backup\ngroup has handed over the tail; `constellation repair abandon-group\n--gen` ends it (rows only that group held are lost).",
+          "description": "As the root, one row per stream: `(dirs, node, gen, cursor, until_ms, recall, ended,\nwaiting_for_group)`. `waiting_for_group`: the generation cannot end\nbecause its delegate is silent and no member of its recorded backup\ngroup has handed over the tail; `constellation repair abandon-group\n--gen` ends it (rows only that group held are lost).",
           "items": {
             "maxItems": 8,
             "minItems": 8,
             "prefixItems": [
               {
-                "format": "uint64",
-                "minimum": 0,
-                "type": "integer"
+                "items": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": "array"
               },
               {
                 "format": "uint64",
@@ -1827,15 +1830,18 @@
           "type": "integer"
         },
         "mine": {
-          "description": "Delegations this node holds: `(dir, gen, until_ms, stopped,\nstreamed_through, executed, parked, class)`; `class` is what this\nnode's own clients' answers wait for (`singleton`, `group`,\n`archive_waits`, `final`; plan 43 C2e, plan 46 M1.1 step 7).",
+          "description": "Delegations this node holds, one row per stream: `(dirs, gen, until_ms, stopped,\nstreamed_through, executed, parked, class)`; `class` is what this\nnode's own clients' answers wait for (`singleton`, `group`,\n`archive_waits`, `final`; plan 43 C2e, plan 46 M1.1 step 7).",
           "items": {
             "maxItems": 8,
             "minItems": 8,
             "prefixItems": [
               {
-                "format": "uint64",
-                "minimum": 0,
-                "type": "integer"
+                "items": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": "array"
               },
               {
                 "format": "uint64",
@@ -2093,8 +2099,16 @@
           "minimum": 0,
           "type": "integer"
         },
+        "streams": {
+          "default": [],
+          "description": "The same, per node: one entry per stream (plan 46 M1.2 step 9).",
+          "items": {
+            "$ref": "#/$defs/DelegationStreamStatus"
+          },
+          "type": "array"
+        },
         "table": {
-          "description": "The live table.",
+          "description": "The live table: one row per subtree grant.",
           "items": {
             "$ref": "#/$defs/DelegationStatus"
           },
@@ -2119,7 +2133,7 @@
           "type": "integer"
         },
         "xgen_acks_delayed": {
-          "description": "Acknowledgements whose row its own group held but that waited for a\nrow of another generation this node delegates (a `DelegGroup`\nacknowledgement waits for the row's dependencies on the node's other\ngenerations), with the total and the longest of those waits in ms.",
+          "description": "Acknowledgements whose row its own group held but that waited for a\nrow of another generation this node delegates (a `DelegateNodeGroup`\nacknowledgement waits for the row's dependencies on the node's other\ngenerations), with the total and the longest of those waits in ms.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -2199,10 +2213,10 @@
       "type": "object"
     },
     "DelegationStatus": {
-      "description": "Plan 30 §M11: one live delegation.",
+      "description": "Plan 30 §M11: one live delegation: a subtree grant (the rows of one\nnode's stream share its `node` and `gen`; plan 46 M1.2 step 9: a node holds\none stream, [`DelegationStreamStatus`]).",
       "properties": {
         "designated": {
-          "description": "Phase 2b: an offline designation (never recalled by TTL or\nplacement).",
+          "description": "Phase 2b: an offline designation (never recalled by TTL or\nplacement while every subtree of the stream is one).",
           "type": "boolean"
         },
         "dir": {
@@ -2230,6 +2244,34 @@
         "node",
         "gen",
         "designated"
+      ],
+      "type": "object"
+    },
+    "DelegationStreamStatus": {
+      "description": "Plan 46 M1.2 step 9: one node's stream with the subtrees it holds (a node\nholds one stream; a later grant to it grows the stream in place).",
+      "properties": {
+        "dirs": {
+          "description": "The subtrees the stream holds, by directory.",
+          "items": {
+            "$ref": "#/$defs/DelegationStatus"
+          },
+          "type": "array"
+        },
+        "gen": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "node": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "node",
+        "gen",
+        "dirs"
       ],
       "type": "object"
     },
@@ -4439,10 +4481,13 @@
     "InstallWaitingStatus": {
       "description": "A generation delegated to this node that is not installed yet: an\nended generation of this node still has rows in its journal and its end\nis not applied from the log yet (the strand of those rows comes first).",
       "properties": {
-        "dir": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+        "dirs": {
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
         },
         "ended": {
           "description": "The ended generations it waits for; empty when the journal could\nnot be read.",
@@ -4465,7 +4510,7 @@
         }
       },
       "required": [
-        "dir",
+        "dirs",
         "gen",
         "waited_ms",
         "ended"
@@ -10606,11 +10651,14 @@
             "null"
           ]
         },
-        "dir": {
-          "description": "The delegated directory's inode.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+        "dirs": {
+          "description": "The stream's directories (inodes).",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
         },
         "gen": {
           "format": "uint64",
@@ -10643,7 +10691,7 @@
       },
       "required": [
         "gen",
-        "dir",
+        "dirs",
         "delegate",
         "waited_ms",
         "members"

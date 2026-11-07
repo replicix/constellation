@@ -814,7 +814,7 @@ impl Meta {
             // configuration, a `Singleton` one for `lone_ok`); the sim's
             // row-version oracle judges a root row by event for the same
             // reason, there being no per-position history of the lease to
-            // judge it by, as there is of a `DelegGroup`.)
+            // judge it by, as there is of a `DelegateNodeGroup`.)
             (None, None) => {
                 journal::note_from_session();
                 self.session().published_class()

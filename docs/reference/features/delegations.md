@@ -967,10 +967,13 @@ generation of its next link). A ends at a cut below that row of A (the
 root reclaims it at its cursor, or A's own sealed tail stops short), and
 the row strands and is replayed by rid after the end, or never.
 
-A node holds two generations when it holds a whole directory and a
-designation of another; the root refuses a second whole delegation to a node that
-holds one (`node N already holds a delegation`). The shape is the same
-in each.
+Since plan 46 M1.2 step 9 a node holds one stream: a grant to a node
+whose stream is live grows it in place (`DelegateNode` again, the same
+generation), so two subtrees of one node are one generation and a rename
+between them is an ordinary op of that stream. A node that holds only
+designations takes no grant the root can reclaim. The cross-generation
+rule below remains for the generations left from before (step 12 deletes
+it).
 
 **The rule.** A `DelegGroup` acknowledgement of row `(B, k)` waits until
 the group holds it **and** every row of B up to `k` has its dependencies
@@ -1046,7 +1049,7 @@ with the rule off, 40 of 200 seeds lost an acknowledged write) and
 
 | Command | Meaning |
 |---|---|
-| `constellation delegate TARGET --to NODE` | delegate the directory `TARGET` to node `NODE`. Run it on the root lease holder. Refused if the directory overlaps a live delegation, is the root, or `NODE` already holds a whole delegation |
+| `constellation delegate TARGET --to NODE` | delegate the directory `TARGET` to node `NODE`. Run it on the root lease holder. Refused if the directory overlaps a live delegation, is the root, or `NODE`'s stream is being recalled or holds designations only; a node that holds a delegation takes the directory into that stream (plan 46 M1.2 step 9) |
 | `constellation undelegate TARGET` | recall the delegation on a directory. Refused for a designation, which only `constellation online` releases |
 | `constellation delegations TARGET` | list the live table: directory, path, node, generation, designated |
 
