@@ -70,6 +70,13 @@
 //!   journal into the log, where the archive's rule answers it. Today's
 //!   behaviour (the knob) answers on the owner's disk in any epoch
 //!   (`NonStealable` to its members).
+//! - **Retire** ([`Action::Retire`], plan 46 M1.4 step 4, `max_retires`): the
+//!   operator retires a hold's owner. Its journal and node are gone, the
+//!   members abandon the epoch, the carrier's lease is fenced. A member
+//!   keeps the rows it acknowledged (`Node::kept`, committed) and ships them
+//!   with its own next claim of the lease; a one-member hold's `Final` rows
+//!   went with its owner (the operator's loss). Knob `retire_drops_acked`:
+//!   the member drops them (found by `hold_answered_rows_survive_retire`).
 //! - **Everything else is today's.** Renewal by CAS; a takeover ships its
 //!   epoch marker and tails to head; a holder that tails a higher marker
 //!   is deposed; a member of an open epoch does no S3 acquisition of any
@@ -291,6 +298,16 @@ pub struct FlexEpochs {
     /// a [`Action::StreamAhead`] and answers only then, except in a
     /// one-member epoch, whose hold is `Final`.
     pub hold_answers_uncommitted: bool,
+    /// Plan 46 M1.4 step 4 (Q4): the operator may retire a hold's owner
+    /// ([`Action::Retire`]) this many times (0: no retire, the older runs'
+    /// state space). The owner and its epoch journal are gone, its members
+    /// abandon the epoch, and the lease it carried is fenced.
+    pub max_retires: u8,
+    /// Plan 46 M1.4 step 4 knob: a member drops the rows it acknowledged
+    /// when the owner is retired (today's abandon: the stream-ahead rows were
+    /// speculation, stranded with the epoch). The design: the member keeps
+    /// them as committed, and ships them when it claims the lease.
+    pub retire_drops_acked: bool,
     // ---- plan 43 C7b ----
     /// What a promise says and how a taker counts it ([`PromiseRule`]).
     pub promise_rule: PromiseRule,
@@ -337,6 +354,8 @@ impl FlexEpochs {
             check_hold_owner: false,
             check_hold_answers: false,
             hold_answers_uncommitted: false,
+            max_retires: 0,
+            retire_drops_acked: false,
             promise_rule: PromiseRule::Expiry,
             lease_claim: crate::clk::ClaimRule::Wall,
         }
@@ -425,6 +444,12 @@ pub struct Node {
     /// indices; persisted); the owner's `StreamAheadAck` source. Dropped
     /// when the member leaves the epoch.
     pub copy: Vec<u8>,
+    /// Plan 46 M1.4 step 4: the rows a member acknowledged and kept when the
+    /// owner was retired (history indices; persisted): committed, and
+    /// shipped into the log by this node's next claim of the lease.
+    pub kept: Vec<u8>,
+    /// Plan 46 M1.4 step 4: retired by the operator: never restarts.
+    pub retired: bool,
     /// `on_demand`: the register's expiry as this node last read it.
     pub seen: i16,
     /// Plan 43 C7b (`Observed` claims, `Anchored` promises): the register
@@ -458,6 +483,13 @@ pub const SAW_HOLD_OWNER_DEPOSED: u16 = 64;
 pub const SAW_HOLD_MEMBER_ANSWER: u16 = 128;
 /// Plan 46 C10: a one-member epoch's hold answered (`Final`).
 pub const SAW_HOLD_FINAL_ANSWER: u16 = 256;
+/// Plan 46 M1.4 step 4: the operator retired a hold's owner.
+pub const SAW_RETIRE: u16 = 512;
+/// Plan 46 M1.4 step 4: a retired one-member hold's owner took rows answered
+/// `Final` (its disk alone) with it: the operator's loss, by the rule.
+pub const SAW_RETIRE_FINAL_LOSS: u16 = 1024;
+/// Plan 46 M1.4 step 4: a claim shipped rows a member kept at a retire.
+pub const SAW_RETIRE_CARRIED: u16 = 2048;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -478,6 +510,16 @@ pub struct State {
     /// (executed ops are answered at once outside a hold).
     pub answered: u16,
     pub saw: u16,
+    /// Plan 46 M1.4 step 4: owners retired so far.
+    pub retires: u8,
+    /// Rows (history indices) a retire took with its owner that no client
+    /// was told were committed (never answered; or answered `Final` by a
+    /// one-member hold: the operator's loss): out of the history for the
+    /// linearizability and convergence properties.
+    pub lost: u16,
+    /// Rows a retire dropped although the client was answered and a member
+    /// held them (only with the `retire_drops_acked` knob).
+    pub dropped: u16,
 }
 
 impl State {
@@ -628,6 +670,28 @@ impl State {
         });
         self.nodes[i].snap = None;
         self.nodes[i].known = epoch;
+        // Plan 46 M1.4 step 4: the rows this node kept at the owner's retire
+        // are committed (the owner answered them once it held them): the
+        // claim ships them behind its marker, verbatim.
+        // (Any member's: the claim fetches the group's tail from one member
+        // that has it, or the rid is replayed; the model orders them first.)
+        let mut kept: Vec<u8> = Vec::new();
+        for n in self.nodes.iter_mut() {
+            for k in std::mem::take(&mut n.kept) {
+                if !kept.contains(&k) {
+                    kept.push(k);
+                }
+            }
+        }
+        kept.sort_unstable();
+        for k in kept {
+            self.saw |= SAW_RETIRE_CARRIED;
+            if !self.log.contains(&Entry::Op(k)) {
+                self.log.push(Entry::Op(k));
+            }
+            self.answered |= 1 << k;
+        }
+        self.nodes[i].applied = self.log.len() as u8;
     }
 
     /// Collapse what no longer matters: expired values to [`PAST`], a
@@ -725,7 +789,43 @@ impl State {
     }
 
     fn all_ops_in_log(&self) -> bool {
-        (0..self.history.len()).all(|k| self.log.contains(&Entry::Op(k as u8)))
+        (0..self.history.len()).all(|k| {
+            self.log.contains(&Entry::Op(k as u8))
+                // After a retire: a row the owner never answered went with it
+                // (its client retries), and one a member kept waits in its
+                // store for the next claim.
+                || (self.lost | self.dropped) & (1 << k) != 0
+                || self.kept_by_a_node(k as u8)
+        })
+    }
+
+    fn kept_by_a_node(&self, k: u8) -> bool {
+        self.nodes.iter().any(|n| n.kept.contains(&k))
+    }
+
+    /// Plan 46 M1.4 step 4: every row the client was answered is in the
+    /// log, in an open epoch's owner journal, or kept by a member (shipped
+    /// by its claim). Not after a deposed owner's lost journal
+    /// (`SAW_HOLD_OWNER_DEPOSED`) or a retired `Final` hold's (the rule).
+    fn answered_rows_held(&self) -> bool {
+        if self.saw & SAW_HOLD_OWNER_DEPOSED != 0 {
+            return true;
+        }
+        if self.dropped != 0 {
+            return false;
+        }
+        (0..self.history.len()).all(|k| {
+            let bit = 1u16 << k;
+            self.answered & bit == 0
+                || self.lost & bit != 0
+                || self.log.contains(&Entry::Op(k as u8))
+                || self.kept_by_a_node(k as u8)
+                || self
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .any(|(i, n)| self.epoch_holder(i) && n.journal.contains(&(k as u8)))
+        })
     }
 }
 
@@ -759,6 +859,10 @@ pub enum Action {
     /// Plan 46 C10: this epoch owner receives a member's `StreamAheadAck`
     /// and answers every row of its journal that a member holds.
     AnswerHold(u8),
+    /// Plan 46 M1.4 step 4 (Q4): the operator retires this hold owner (admin
+    /// `leave`): its epoch journal is gone with it, its members abandon the
+    /// epoch, the lease it carried is fenced (claimable at once).
+    Retire(u8),
     /// `on_demand`: read the register (its expiry).
     Observe(u8),
     /// Plan 43 C7b: read the register; the first read showing its current
@@ -834,6 +938,8 @@ impl Model for FlexEpochs {
                     known: 1,
                     journal: Vec::new(),
                     copy: Vec::new(),
+                    kept: Vec::new(),
+                    retired: false,
                     seen: expires,
                     obs: None,
                     pending_key: None,
@@ -852,6 +958,9 @@ impl Model for FlexEpochs {
                 history: Vec::new(),
                 answered: 0,
                 saw: 0,
+                retires: 0,
+                lost: 0,
+                dropped: 0,
             });
         }
         out
@@ -870,7 +979,7 @@ impl Model for FlexEpochs {
                 actions.push(Action::Land(iu));
             }
             if !node.alive {
-                if self.restart {
+                if self.restart && !node.retired {
                     actions.push(Action::Restart(iu));
                 }
                 continue;
@@ -925,6 +1034,9 @@ impl Model for FlexEpochs {
                 }
                 if r.holder == iu && !r.closed {
                     actions.push(Action::Close(iu));
+                    if s.retires < self.max_retires {
+                        actions.push(Action::Retire(iu));
+                    }
                     if self.hold_waits() && s.hold_answerable(i) {
                         actions.push(Action::AnswerHold(iu));
                     }
@@ -1098,6 +1210,65 @@ impl Model for FlexEpochs {
                     s.saw |= SAW_CONFLICT | SAW_HOLD_OWNER_DEPOSED;
                 }
             }
+            Action::Retire(h) => {
+                let h = h as usize;
+                let idx = s.nodes[h].epoch? as usize;
+                let rec = s.epochs[idx].clone();
+                let final_hold = s.hold_final(h);
+                let mut survivors = 0u16;
+                for j in 0..self.nodes as usize {
+                    if j != h && s.nodes[j].epoch == Some(idx as u8) && !self.retire_drops_acked {
+                        for k in &s.nodes[j].copy {
+                            survivors |= 1 << k;
+                        }
+                    }
+                }
+                for k in s.nodes[h].journal.clone() {
+                    let bit = 1u16 << k;
+                    if survivors & bit != 0 {
+                        continue;
+                    }
+                    if s.answered & bit == 0 {
+                        s.lost |= bit;
+                    } else if final_hold {
+                        // `Final`: the owner's disk is the only copy, by the rule.
+                        s.lost |= bit;
+                        s.saw |= SAW_RETIRE_FINAL_LOSS;
+                    } else {
+                        s.dropped |= bit;
+                    }
+                }
+                s.epochs[idx].closed = true;
+                for j in 0..self.nodes as usize {
+                    if s.nodes[j].epoch != Some(idx as u8) {
+                        continue;
+                    }
+                    s.nodes[j].epoch = None;
+                    if j == h {
+                        s.nodes[j].journal.clear();
+                        s.nodes[j].alive = false;
+                        s.nodes[j].retired = true;
+                        s.nodes[j].lease = None;
+                        s.nodes[j].snap = None;
+                        s.nodes[j].pending = None;
+                    } else if !self.retire_drops_acked {
+                        let copy = std::mem::take(&mut s.nodes[j].copy);
+                        for k in copy {
+                            if !s.nodes[j].kept.contains(&k) {
+                                s.nodes[j].kept.push(k);
+                            }
+                        }
+                    }
+                    s.nodes[j].copy.clear();
+                }
+                if s.reg.version == rec.version && s.reg.holder == h as u8 {
+                    // The fence: the carrier's lease is claimable now.
+                    s.reg.expires = PAST;
+                    s.reg.version += 1;
+                }
+                s.retires += 1;
+                s.saw |= SAW_RETIRE;
+            }
             Action::Observe(i) => {
                 let e = s.reg.expires;
                 s.nodes[i as usize].seen = e;
@@ -1200,7 +1371,11 @@ impl Model for FlexEpochs {
             }),
             Property::always("linearizable", |_, s: &State| {
                 let mut spec = NamespaceSpec::default();
-                s.history.iter().all(|(op, ret)| spec.invoke(op) == *ret)
+                s.history
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| (s.lost | s.dropped) & (1 << k) == 0)
+                    .all(|(_, (op, ret))| spec.invoke(op) == *ret)
             }),
             Property::always("converged_at_quiescence", |_, s: &State| {
                 s.epochs.iter().any(|r| !r.closed) || s.all_ops_in_log()
@@ -1212,10 +1387,12 @@ impl Model for FlexEpochs {
         ];
         // Plan 43 C0 (§11 Q3, decided): an epoch's hold owner is not
         // stealable. Its epoch journal is dropped only by an operator's
-        // retire, or when its epoch carried no lease; the model has no
-        // retire action and every epoch is formed over a lease
-        // (`Form` converts a member's lease), so both exemptions are
-        // vacuous here: the register never moves under a hold owner.
+        // retire ([`Action::Retire`], plan 46 M1.4 step 4; off unless
+        // `max_retires` > 0), or when its epoch carried no lease (every
+        // epoch is formed over a lease: `Form` converts a member's lease):
+        // the register never moves under a hold owner. A retire is not a
+        // deposition (it sets no `SAW_HOLD_OWNER_DEPOSED`); what it loses is
+        // judged by `hold_answered_rows_survive_retire`.
         if self.check_hold_owner {
             props.push(Property::always(
                 "hold_owner_never_deposed_except_by_retire",
@@ -1252,6 +1429,22 @@ impl Model for FlexEpochs {
                     s.saw & SAW_HOLD_FINAL_ANSWER != 0
                 }));
             }
+        }
+        // Plan 46 M1.4 step 4 (Q4): the operator's retire of a hold's owner
+        // takes its epoch journal, but not what a member acknowledged: the
+        // member keeps it as committed and ships it when it claims.
+        if self.max_retires > 0 {
+            props.push(Property::always(
+                "hold_answered_rows_survive_retire",
+                |_, s: &State| s.answered_rows_held(),
+            ));
+            props.push(Property::sometimes("retire_happens", |_, s: &State| {
+                s.saw & SAW_RETIRE != 0
+            }));
+            props.push(Property::sometimes(
+                "retired_rows_carried_by_a_claim",
+                |_, s: &State| s.saw & SAW_RETIRE_CARRIED != 0,
+            ));
         }
         if self.min_members < self.nodes {
             props.push(Property::sometimes(

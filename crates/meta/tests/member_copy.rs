@@ -409,7 +409,9 @@ fn an_abandon_strands_a_committed_entry() {
 
 /// The takeover gate takes its own committed entries out without queueing
 /// them (the tail it re-applies carries the rows) — unless the group was
-/// abandoned.
+/// abandoned. A committed streamed transaction that no tail names (plan 46
+/// M1.4 step 4: a hold member's copy of what it acknowledged, the owner
+/// retired) is the only copy left: it is queued as a committed replay.
 #[test]
 fn the_takeover_gate_supersedes_a_committed_entry_without_queueing() {
     for abandoned in [None, Some(1)] {
@@ -441,9 +443,11 @@ fn the_takeover_gate_supersedes_a_committed_entry_without_queueing() {
         assert!(!meta.has_outstanding_speculation());
         match abandoned {
             None => {
-                assert_eq!(stranded.superseded, 2);
-                assert_eq!(stranded.committed_rolled_back, 0);
-                assert!(meta.pending_replays().unwrap().is_empty());
+                assert_eq!(stranded.superseded, 1);
+                assert_eq!(stranded.committed_rolled_back, 1);
+                let queued = meta.pending_replays().unwrap();
+                assert_eq!(queued.len(), 1, "{queued:?}");
+                assert_eq!(queued[0].rid, rid(3));
             }
             Some(_) => {
                 assert_eq!(stranded.superseded, 0);

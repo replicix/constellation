@@ -377,13 +377,38 @@ impl LiveEntry {
     /// delegate rows). One it does not carry stays: the delegate re-streams
     /// the row to this node, whose append takes the shadow out in its place
     /// (`unwind_shadow_for_append_tx`).
-    fn superseded_by_takeover(&self, epoch: u64, carried: &HashSet<Rid>) -> bool {
+    fn superseded_by_takeover(
+        &self,
+        epoch: u64,
+        carried: &HashSet<Rid>,
+        tail_idents: &HashSet<(u64, u64)>,
+    ) -> bool {
         match self {
             LiveEntry::Shadow { rid, gen, .. } if *gen != 0 => {
                 self.gated() && self.epoch() < epoch && carried.contains(rid)
             }
+            // Plan 46 M1.4 step 4: a committed streamed transaction the tail
+            // does not name is not taken out: nothing re-applies it (a hold
+            // member's copy of what it acknowledged, the owner retired:
+            // [`Self::uncarried_by_takeover`]).
+            LiveEntry::Streamed { ident, .. } => {
+                self.gated() && self.epoch() < epoch && tail_idents.contains(ident)
+            }
             _ => self.gated() && self.epoch() < epoch,
         }
+    }
+
+    /// Plan 46 M1.4 step 4: a committed streamed transaction of an earlier
+    /// tenure that no tail this takeover applies names. The node holds the
+    /// only copy it has (a hold member's, acknowledged to the owner), so
+    /// the strand rolls it back and queues it as a verbatim replay by rid,
+    /// as a committed row (`ROOT_GROUP`), and the claimant ships it as
+    /// its own; taken out silently, the rows the owner answered as held
+    /// were lost with it.
+    fn uncarried_by_takeover(&self, epoch: u64, tail_idents: &HashSet<(u64, u64)>) -> bool {
+        matches!(self, LiveEntry::Streamed { ident, .. } if self.gated()
+            && self.epoch() < epoch
+            && !tail_idents.contains(ident))
     }
 
     /// Plan 43 C1-4: the operator abandoned the group of root epoch `e`
@@ -5010,8 +5035,25 @@ impl Meta {
                 // own epoch numbers its journal on from the old one, so a
                 // later segment's `through` passes the committed rows without
                 // naming them, and they are in its re-ship.)
-                || matches!(entry, LiveEntry::Streamed { epoch: e, last, gated: false, .. }
-                    if *e == epoch && through >= *last && !rows.contains(last))
+                // Plan 46 M1.4 step 4: a hold member's copy of what it
+                // acknowledged is committed, and is no different once the
+                // segment passes it without naming its rows and no `TailOf`
+                // of this segment names it: nothing re-ships it (the owner
+                // dropped it, or restarted without it). It strands and its
+                // rid replays, as a speculative copy did; kept, it waited
+                // for a re-ship that never came.
+                // The same for a claim whose marker proves its predecessor's
+                // tenure has no tail (`TailFollowsThrough{through: 0}`): the
+                // member's copy of a hold row is the only one left, nobody
+                // fetches it (a claim by TTL asks the lease's backups), and
+                // kept as committed it would wait for ever. Its rid replays.
+                || matches!(entry, LiveEntry::Streamed { epoch: e, gated: true, .. }
+                    if proof.no_tail.is_some_and(|p| *e <= p))
+                || matches!(entry, LiveEntry::Streamed { epoch: e, last, gated, ident }
+                    if *e == epoch
+                        && through >= *last
+                        && !rows.contains(last)
+                        && (!*gated || !tail_ids.contains(ident)))
         };
         // Only a holder's own captured transactions (`gen` 0) among the
         // `Local` rows can strand here (`LiveEntry::stranded_by`); with
@@ -5847,7 +5889,17 @@ impl Meta {
         let mut report = ReshipReport::default();
         let mut part = StrandPart::default();
         if let Some(args) = strand {
-            part = self.strand_part_tx(&mut tx, &staged, args)?;
+            let tail_idents: HashSet<(u64, u64)> = match &tail {
+                Some(t) => txs
+                    .iter()
+                    .map(|bt| {
+                        crate::store::member::tail_identity(&bt.records)
+                            .unwrap_or((t.epoch, bt.first))
+                    })
+                    .collect(),
+                None => HashSet::new(),
+            };
+            part = self.strand_part_tx(&mut tx, &staged, args, &tail_idents)?;
             report.stranded = part.stranded;
         }
         let mut journaled: Vec<((u64, u64), local::JournaledTx)> = Vec::new();
@@ -6039,6 +6091,7 @@ impl Meta {
         tx: &mut SingleWriterWriteTx,
         staged: &UsageTracker,
         args: StrandArgs<'_>,
+        tail_idents: &HashSet<(u64, u64)>,
     ) -> Result<StrandPart, MetaError> {
         let StrandArgs {
             epoch,
@@ -6075,13 +6128,14 @@ impl Meta {
             |entry| {
                 entry.stranded_by_takeover(epoch)
                     || own(entry).is_some()
-                    || entry.superseded_by_takeover(epoch, carried)
+                    || entry.superseded_by_takeover(epoch, carried, tail_idents)
+                    || entry.uncarried_by_takeover(epoch, tail_idents)
                     || abandons(entry)
             },
             true,
             false,
             false,
-            |entry| entry.superseded_by_takeover(epoch, carried) && !abandons(entry),
+            |entry| entry.superseded_by_takeover(epoch, carried, tail_idents) && !abandons(entry),
         )?;
         // Plan 46 M0.4 (MUST-1): this node's own delegate rows of a
         // generation the table does not list are taken out whatever the

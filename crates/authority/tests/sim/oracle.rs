@@ -101,6 +101,11 @@ pub struct Oracles {
     /// member's copy that committed a delegate's row stays what committed it
     /// after the epoch ended and the copy was retired or stranded.
     pub streamed_seen: Mutex<BTreeMap<(NodeId, u64), u64>>,
+    /// Plan 46 M1.4 step 4: the members of each continuation epoch's hold,
+    /// as its owner's core named them (`Core::hold_roster`: the epoch's
+    /// members and the nodes that acknowledged its journal). Only a member's
+    /// store is a copy of the hold (the group is the owner and a member).
+    pub hold_members: Mutex<BTreeMap<u64, BTreeSet<NodeId>>>,
     /// Plan 46 M1.1 step 3: the row-version oracle (see [`RowVersions`]).
     pub row_versions: Arc<Mutex<RowVersions>>,
     /// Plan 46 M0.3: the run's reachability history (see `reach.rs`), the
@@ -380,6 +385,7 @@ impl Oracles {
             version_backups,
             epoch_holds: Mutex::new(BTreeSet::new()),
             streamed_seen: Mutex::new(BTreeMap::new()),
+            hold_members: Mutex::new(BTreeMap::new()),
             row_versions,
             acks_unsourced: AtomicU64::new(0),
         })
@@ -548,6 +554,16 @@ impl Oracles {
                 *t = (*t).max(tip);
             }
         }
+    }
+
+    /// The members of the hold `epoch`'s owner reports (`hold_members`).
+    pub fn note_hold_members(&self, epoch: u64, members: &[NodeId]) {
+        self.hold_members
+            .lock()
+            .unwrap()
+            .entry(epoch)
+            .or_default()
+            .extend(members.iter().copied());
     }
 
     /// The links `id`'s directory reported up, with their `since` (wait ms).
@@ -1472,21 +1488,27 @@ fn backups_hold(
     Ok(())
 }
 
-/// A node other than the hold's owner whose store held the hold's journal
-/// (the streamed speculation of one of `epochs`) through `last` at some
-/// event (`Oracles::note_streamed`).
+/// A member (other than the hold's owner) of the hold of one of `epochs`
+/// whose store held the hold's journal (its streamed copy) through `last` at
+/// some event (`Oracles::note_streamed`). A node outside the hold's epoch
+/// that streamed from the owner (a subscriber) is no member of its group.
 fn hold_member_streamed(
     o: &Oracles,
     holder: Option<NodeId>,
     epochs: &[u64],
     last: u64,
 ) -> Option<NodeId> {
+    let members = o.hold_members.lock().unwrap();
     o.streamed_seen
         .lock()
         .unwrap()
         .iter()
         .find_map(|((n, ep), tip)| {
-            (Some(*n) != holder && epochs.contains(ep) && *tip >= last).then_some(*n)
+            (Some(*n) != holder
+                && epochs.contains(ep)
+                && *tip >= last
+                && members.get(ep).is_some_and(|m| m.contains(n)))
+            .then_some(*n)
         })
 }
 
@@ -1595,7 +1617,16 @@ fn deleg_group(
                 ht.last
             ));
         }
-        if (held || hold_now) && t.node == answerer && Some(answerer) != holder {
+        // (The group of a hold is the owner and one member: two copies. The
+        // delegate's own journal is the second one only if it is a member of
+        // the hold's epoch; any other delegate's row is the root's alone.)
+        let delegate_member = {
+            let members = o.hold_members.lock().unwrap();
+            epochs
+                .iter()
+                .any(|ep| members.get(ep).is_some_and(|m| m.contains(&answerer)))
+        };
+        if (held || hold_now) && t.node == answerer && Some(answerer) != holder && delegate_member {
             return Ok(format!(
                 "no backup recorded; the root journal holds ({g},{i}) in an epoch hold \
                  and the delegate {answerer}, a member, holds the row in its own journal"
@@ -3818,14 +3849,21 @@ mod tests {
         let j = w.judge(2, &st, r);
         assert_eq!(j.class, None, "{}", j.detail);
         assert!(j.detail.contains("lone root's"), "{}", j.detail);
-        // Appended in a hold: the delegate that is a member holds its own row.
+        // Appended in a hold: the delegate that is a member holds its own
+        // row (owner + member: two copies); one that is no member of the
+        // hold's epoch does not.
         w.o.appended
             .lock()
             .unwrap()
             .insert((1, 1), (1, vec![], true));
+        w.o.note_hold_members(1, &[1, 3]);
+        let j = w.judge(2, &st, r);
+        assert_eq!(j.class, None, "a non-member delegate: {}", j.detail);
+        w.o.note_hold_members(1, &[2]);
         let j = w.judge(2, &st, r);
         assert_eq!(j.class, Some(Judged::Group), "{}", j.detail);
         assert!(j.detail.contains("own journal"), "{}", j.detail);
+        w.o.hold_members.lock().unwrap().clear();
         // The owner's journal alone is no member's copy, a streamed copy of
         // another epoch is none either, one of the hold's epoch through the
         // row is.
@@ -3840,6 +3878,10 @@ mod tests {
             .install_streamed(1, 1, t.first, t.last, &t.records)
             .unwrap();
         w.o.note_streamed_to(3, &w.metas[&3], 9);
+        // A subscriber of the owner's stream that is no member of the hold
+        // is not a copy of the group.
+        assert_eq!(hold_member_streamed(&w.o, Some(1), &[1], t.last), None);
+        w.o.note_hold_members(1, &[1, 3]);
         assert_eq!(hold_member_streamed(&w.o, Some(1), &[1], t.last), Some(3));
         assert_eq!(hold_member_streamed(&w.o, Some(3), &[1], t.last), None);
         // A hold that began after the append counts as well.

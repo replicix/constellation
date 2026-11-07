@@ -2215,6 +2215,9 @@ impl Driver {
                 let mut holds = self.oracles.epoch_holds.lock().unwrap();
                 if self.core.lease().epoch_held() {
                     holds.insert(self.id);
+                    if let Some((epoch, members)) = self.core.hold_roster() {
+                        self.oracles.note_hold_members(epoch, &members);
+                    }
                 } else {
                     holds.remove(&self.id);
                 }

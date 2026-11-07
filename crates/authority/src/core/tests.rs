@@ -59669,6 +59669,94 @@ mod hold_ack {
         assert!(accepted_to_peer(&out, 3), "{out:?}");
     }
 
+    /// Plan 46 M1.4 step 4: the hold's batch to a member of its epoch is
+    /// committed (the member's ack is what the owner's answers wait for), a
+    /// member that took it keeps it as committed, and when it claims the
+    /// lease after the owner's retire (no tail names the row) the strand
+    /// queues the row to ship as its own. On main the batch was streamed as
+    /// speculation: the claim rolled it back and the row was stranded with
+    /// the retired owner (the client replays it, if it is still there).
+    /// The knob that restores the uncommitted answer streams it as before.
+    #[test]
+    fn a_member_keeps_what_it_acked_and_ships_it_when_it_claims() {
+        let committed_to = |out: &[Action], to: NodeId| -> Vec<bool> {
+            sends(out)
+                .into_iter()
+                .filter_map(|(n, m)| match m {
+                    PeerMsg::StreamAhead { committed, .. } if n == to => Some(*committed),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (mut holder, mut sub, req) = stream_pair();
+        submit_create(&mut holder, 1, "a");
+        let (p1, _) = holder_ship(&mut holder, 1, 100);
+        sub.step(Event::Peer {
+            from: 1,
+            msg: segment_frame(req, 1, 1, p1),
+        });
+        holder.core.lease.adopt_epoch_hold(holder.clk(), 1);
+        holder.core.pr.epoch_members = vec![1, 2];
+        holder.core.epoch = EpochState {
+            open: true,
+            active: true,
+            ..Default::default()
+        };
+        let (_, out) = create_nowait(&mut holder, 2, "b");
+        let to_member = committed_to(&out, 2);
+        assert!(
+            !to_member.is_empty() && to_member.iter().all(|c| *c),
+            "{out:?}"
+        );
+        // The member takes it, acknowledges it, and keeps it as committed.
+        sub.core.ship.max_epoch = 1;
+        sub.core.epoch.open = true;
+        let batch = sends(&out)
+            .into_iter()
+            .find_map(|(n, m)| (n == 2).then(|| m.clone()))
+            .unwrap();
+        let out = sub.step(Event::Peer {
+            from: 1,
+            msg: batch,
+        });
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::StreamAheadAck { .. })),
+            "{out:?}"
+        );
+        assert!(sub
+            .meta
+            .lookup(constellation_fs_core::types::ROOT_INO, "b")
+            .unwrap()
+            .is_some());
+        // It claims epoch 2 with no tail: the row is queued, not dropped.
+        let proof = Default::default();
+        let carried = Default::default();
+        sub.meta
+            .reship_at_takeover(
+                Some(constellation_meta::StrandArgs {
+                    epoch: 2,
+                    own_gens: &[],
+                    abandoned: None,
+                    carried: &carried,
+                    proof: &proof,
+                }),
+                None,
+            )
+            .unwrap();
+        let queued = sub.meta.pending_replays().unwrap();
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0].rid, holder.rid(2));
+        // The knob: the hold answers as before, and streams as before.
+        let mut k = owner(0);
+        k.core.pr.epoch_members = vec![1, 2];
+        k.core.cfg.hold_answers_uncommitted = true;
+        let (_, out) = create_nowait(&mut k, 1, "k");
+        let c = committed_to(&out, 2);
+        assert!(!c.is_empty() && c.iter().all(|c| !*c), "{out:?}");
+    }
+
     /// A batch the member never got is sent again from what it
     /// acknowledged, and the answer leaves with the ack of the resend.
     #[test]

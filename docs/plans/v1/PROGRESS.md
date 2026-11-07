@@ -68531,3 +68531,41 @@ grant that grows a live stream recalls the root's read delegations under the new
 bounded by the recalled grants' expiry, no new read delegation under it meanwhile), as a designation is; renewals never wait for them. Tests: a parked
 subtree grants no lock (fails on the step 9 commit), a designation recalls a placed stream first, placement skips a designated-only node and leaves its stream
 alone, a grow waits for the recalls and no renewal of the stream does.
+
+### Plan 46 M1.4 step 4 (members keep what they acked)
+
+**Change.** The hold's stream-ahead to a member of its epoch (and its resend) goes out `committed: true` while the hold is a group (`stream_ahead`,
+`resend_hold_batch`): the member acknowledges it, the owner's answers wait for that ack, so the member's copy is a committed streamed transaction, not
+speculation. A subscriber outside the epoch still gets speculation. The strand (`Meta::reship_at_takeover`): a committed streamed transaction of an
+earlier tenure that no tail of the takeover names (`LiveEntry::uncarried_by_takeover`) is rolled back and queued as a committed replay by rid, to be
+shipped by the claimant as its own (it was silently taken out before: the member's copy was the only one left); and a segment whose marker proves the
+predecessor's tenure has no tail (`TailFollowsThrough { through: 0 }`) strands the committed streamed entries of epochs up to it, as does a later
+segment of the same tenure that passes a committed entry without naming its rows and without a `TailOf` of it (nothing re-ships it; kept, it waited for
+ever: `locks-blips-tight-faults` seed 7 stayed outstanding with it).
+Retire: an owner retired by the operator leaves its members with the acked rows as committed entries; whoever claims the lease next carries them (a
+member's claim ships them verbatim, as its own: the replay queue; another node's claim strands them on the members as above and the rid replays). No
+operator-loss counter was needed.
+
+**Deleted.** `committed: !in_epoch` in `stream_ahead`.
+
+**Oracle (step 3 review SHOULDs).** A node's streamed copy of a hold counts only if the node is a member of the hold's epoch (`Oracles::hold_members`,
+fed by the owner's core: `Core::hold_roster`, the epoch's members and the nodes that acked); case (b), the delegate's own journal, requires the delegate
+be an epoch member (a hold's rule is the owner plus one member: two copies). Re-run: no hidden I1 appears (hold-I1 0 in every config).
+
+**Model.** `flex.rs`: `Action::Retire` (the operator retires a hold's owner: its journal and node go, members abandon the epoch, the lease is fenced),
+`Node::kept` (rows a member acked, committed, shipped by the next claim of any node), knob `retire_drops_acked`; property
+`hold_answered_rows_survive_retire`; `hold_owner_never_deposed_except_by_retire` and `hold_answer_committed_or_final` hold with retire (9.9M states,
+exhaustive, `m14_retire_keeps_what_a_member_acked`); a one-member hold's `Final` rows are the operator's loss (excused); the knob is found
+(`m14_knob_member_drops_acked_rows_at_retire_is_found`).
+
+**Fail-before.** Core `a_member_keeps_what_it_acked_and_ships_it_when_it_claims` fails on main (the batch is streamed uncommitted); meta
+`the_takeover_gate_supersedes_a_committed_entry_without_queueing` changed to the new rule (a committed entry no tail names is queued).
+
+**Sweeps** (release, ×2,000, main f13997dc to step). `+commit`: no config's failing set grew; hold-I1 0 everywhere; `delegated-epoch` 7 to 2 and `flex`
+7 to 3 (the stuck class-claim seeds go), all others identical (`flex-crash` 7, `flex-tight` 9, `locks-blips` 11, `locks-blips-tight` 10,
+`locks-blips-tight-delegated` 3, `-faults` 3, `-in-doubt` 10, `-long-lease` 6, `locks-core-stall-blips` 16, `locks-unlinked-delegated-blips` 3). `flex-crash
++durability`: 274 failing seeds before and after, the same set, every one a `repair drop-held` rolled-back refusal (the operator's drop of held rows, not a
+lost acknowledged hold row); none of the failures is a member's lost row. Harness `epoch-member-dies-with-chunk` not run (needs the docker boxes).
+
+**Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (lib, integration), authority lib, engine lib, control, model
+`flex_epochs` (release), release authority sim suite 0 failed.

@@ -1623,6 +1623,23 @@ impl Core {
             && self.pr.epoch_members.len() >= 2
     }
 
+    /// Plan 46 M1.4 step 4 (the sim's oracle): the members of the epoch this
+    /// node holds now, with those that acknowledged part of its journal
+    /// (`hold_acked`): `(epoch, members)`. `None` outside a hold.
+    pub fn hold_roster(&self) -> Option<(Epoch, Vec<NodeId>)> {
+        if !self.lease.epoch_held() {
+            return None;
+        }
+        let epoch = self.lease.epoch()?;
+        let mut m = self.pr.epoch_members.clone();
+        if self.ack.hold_epoch == Some(epoch) {
+            m.extend(self.ack.hold_acked.keys().copied());
+        }
+        m.sort_unstable();
+        m.dedup();
+        Some((epoch, m))
+    }
+
     /// The highest journal seq any member of the epoch has acknowledged
     /// holding (`hold_acked`), of the epoch this node owns now.
     fn hold_acked_through(&self) -> u64 {
@@ -4792,6 +4809,8 @@ impl Core {
             self.ack.streamed_through
         };
         let base = self.ship.head_seq;
+        let hold_group = in_epoch && self.hold_group();
+        let members = self.pr.epoch_members.clone();
         let mut sent = 0u64;
         for n in subscribers {
             let cursor = self
@@ -4864,18 +4883,27 @@ impl Core {
                 msg: PeerMsg::StreamAhead {
                     epoch,
                     base,
-                    // Committed: held by the group (not an epoch hold's tip)
-                    // and every row of the root's own tenure in it was
-                    // journaled under a class that waits for a group or the
-                    // archive — a hold's rows (non-stealable) and a lone
-                    // node's streamed after the gate went off are not.
-                    committed: !in_epoch
-                        && !knob_uncommitted
-                        && batch.iter().all(|t| {
-                            t.records.is_empty()
-                                || t.origin != (0, 0)
-                                || replica.journal_tx_class(t.first).is_some_and(|c| c.gated())
-                        }),
+                    // Committed: held by the group, and every row of the
+                    // root's own tenure in it was journaled under a class
+                    // that waits for a group or the archive; a lone node's
+                    // rows streamed after the gate went off are not.
+                    // Plan 46 M1.4 step 4: a hold's batch to a member of its
+                    // epoch is committed: the member acknowledges it
+                    // (`StreamAheadAck`) once it is durable there, and the
+                    // owner's answers wait for that ack (the hold's group),
+                    // so the member keeps what it acknowledged and ships it
+                    // if it claims the lease. A subscriber outside the
+                    // epoch is not in the group: its copy stays speculation.
+                    committed: !knob_uncommitted
+                        && if in_epoch {
+                            hold_group && members.contains(&n)
+                        } else {
+                            batch.iter().all(|t| {
+                                t.records.is_empty()
+                                    || t.origin != (0, 0)
+                                    || replica.journal_tx_class(t.first).is_some_and(|c| c.gated())
+                            })
+                        },
                     txs: batch,
                 },
             });
@@ -4984,7 +5012,7 @@ impl Core {
                 epoch,
                 base: self.ship.head_seq,
                 txs,
-                committed: false,
+                committed: self.hold_group(),
             },
         });
     }

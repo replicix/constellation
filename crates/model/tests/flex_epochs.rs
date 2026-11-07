@@ -676,6 +676,67 @@ fn c10_knob_hold_answers_uncommitted_is_found() {
     assert_eq!(assert_violates("c10-knob", &m, HOLD), 6);
 }
 
+// ---- plan 46 M1.4 step 4: the operator's retire of a hold's owner (Q4) ----
+//
+// The owner's epoch journal goes with it; the members abandon the epoch. A row
+// the hold answered was held by a member (its `StreamAheadAck`), so the member
+// keeps it as committed and ships it with its claim of the fenced lease.
+
+const SURVIVE: &str = "hold_answered_rows_survive_retire";
+
+fn with_retire(m: FlexEpochs) -> FlexEpochs {
+    FlexEpochs {
+        max_retires: 1,
+        ..hold_group(m)
+    }
+}
+
+/// With the rule: no answered row is lost at a retire, the owner is never
+/// deposed except by it (the retire is not a deposition), the hold's answers
+/// stay committed; a retire happens and a member's claim ships what it kept.
+#[test]
+fn m14_retire_keeps_what_a_member_acked() {
+    assert_clean_checking(
+        "m14-retire",
+        &with_retire(full()),
+        &[
+            "retire_happens",
+            "retired_rows_carried_by_a_claim",
+            "hold_answered_by_member",
+            "all_ops_done",
+        ],
+        CAP,
+        &["hold_owner_never_deposed_except_by_retire", HOLD, SURVIVE],
+    );
+}
+
+/// A one-member epoch's hold is `Final`: its owner's retire takes the rows
+/// answered on its disk with it (the operator's loss, by the rule): the
+/// property excuses exactly that.
+#[test]
+fn m14_retire_of_a_one_member_hold_is_the_operators_loss() {
+    assert_clean_checking(
+        "m14-retire-one-member",
+        &with_retire(FlexEpochs::new(2, 1)),
+        &["retire_happens", "hold_final_answer"],
+        CAP,
+        &["hold_owner_never_deposed_except_by_retire", HOLD, SURVIVE],
+    );
+}
+
+/// The knob: a member drops the rows it acknowledged when the owner is
+/// retired (the stream-ahead was speculation): an answered row is in no
+/// store. Found by `hold_answered_rows_survive_retire`, path printed.
+#[test]
+fn m14_knob_member_drops_acked_rows_at_retire_is_found() {
+    let m = FlexEpochs {
+        retire_drops_acked: true,
+        ..with_retire(full())
+    };
+    let n = assert_violates("m14-knob", &m, SURVIVE);
+    println!("found in {n} actions");
+}
+
 // ---- plan 43 C7b: promises anchored to the claimed key (Appendix B row 3) ----
 //
 // A promise's `no_epoch_until` is an instant on the promiser's wall, which a

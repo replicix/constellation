@@ -396,3 +396,56 @@ fn reship_lock_hold_over_a_large_tail() {
         hold / rows as u32
     );
 }
+
+/// Plan 46 M1.4 step 4: a hold member's copy of what it acknowledged is a
+/// committed streamed transaction. When the member claims the lease after
+/// the owner's retire (no tail names the row: the owner is gone), the strand
+/// rolls the row back and queues it as a replay by rid, to ship as the
+/// member's own; taken out silently (the rule for a row a tail re-applies),
+/// the row the owner answered as held was lost with the owner.
+#[test]
+fn a_member_keeps_a_row_it_acknowledged_when_no_tail_names_it() {
+    let meta = Meta::open_in_memory().unwrap();
+    let recs = vec![
+        create(ROOT_INO, "held", ino(1)),
+        LogRecord::Completed { rid: rid(1, 1) },
+    ];
+    meta.install_streamed_committed(EPOCH_PREV, 1, 1, 1, &recs, true, (0, 0))
+        .unwrap();
+    assert!(meta.lookup(ROOT_INO, "held").unwrap().is_some());
+    let proof = Default::default();
+    let carried = Default::default();
+    meta.reship_at_takeover(
+        Some(constellation_meta::StrandArgs {
+            epoch: 2,
+            own_gens: &[],
+            abandoned: None,
+            carried: &carried,
+            proof: &proof,
+        }),
+        None,
+    )
+    .unwrap();
+    let queued = meta.pending_replays().unwrap();
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert_eq!(queued[0].rid, rid(1, 1));
+    assert!(queued[0].refused.is_none());
+    assert!(matches!(&queued[0].op, MutateOp::Records { records } if *records == recs));
+}
+
+/// The same row with a tail that names it: the tail re-applies it, the
+/// member's entry is taken out and nothing is queued (applied once).
+#[test]
+fn a_member_row_a_tail_names_is_applied_once() {
+    let meta = Meta::open_in_memory().unwrap();
+    let recs = vec![
+        create(ROOT_INO, "held", ino(1)),
+        LogRecord::Completed { rid: rid(1, 1) },
+    ];
+    meta.install_streamed_committed(EPOCH_PREV, 1, 1, 1, &recs, true, (0, 0))
+        .unwrap();
+    let report = reship(&meta, &[tx(1, 1, recs)]).unwrap();
+    assert_eq!(report.tail_applied, 1);
+    assert!(meta.pending_replays().unwrap().is_empty());
+    assert!(meta.lookup(ROOT_INO, "held").unwrap().is_some());
+}
