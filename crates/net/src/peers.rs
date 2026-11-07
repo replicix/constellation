@@ -1791,6 +1791,7 @@ async fn handle_stream<S: PeerService>(
                 lock_cut,
                 lock_barrier,
                 lock_carry,
+                sent_at,
             } => {
                 service.deleg_renewed(
                     from,
@@ -1805,6 +1806,7 @@ async fn handle_stream<S: PeerService>(
                     lock_cut,
                     lock_barrier,
                     lock_carry,
+                    sent_at,
                 );
                 Some(Payload::Ok { req_id })
             }

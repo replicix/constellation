@@ -598,8 +598,9 @@ pub(crate) struct LockState {
     /// [`LockState::barriers`].
     dir_barriers: Vec<(Ino, i64)>,
     /// Root: per live generation, the latest stream head its delegate's
-    /// renewals reported and when the delegate sent it, on its clock
-    /// (`DelegRenew::stream_head_at`): what a cut takes for the stream;
+    /// renewals reported and a moment of this root's clock that precedes
+    /// their send (`DelegRenew::stream_head_at`): what a cut takes for the
+    /// stream;
     /// and when the latest renewal arrived here (whether a designee is
     /// online, [`Core::lock_cut_here`]).
     heads: BTreeMap<u64, (i64, u64, WaitMs)>,
@@ -2492,8 +2493,11 @@ impl Core {
         true
     }
 
-    /// Root: a delegate renewed `gen` with its stream `head`, executed
-    /// by `at` on its clock; the renewal arrived `now`.
+    /// Root: a delegate renewed `gen` with its stream `head`; `at` is a
+    /// moment on this root's clock that precedes the renewal's send (the
+    /// send time of the answer the delegate had received then,
+    /// `DelegRenew::stream_head_at`), so everything executed anywhere
+    /// before `at` is under the head. The renewal arrived `now`.
     pub(crate) fn lock_note_delegate_head(
         &mut self,
         now: Now,
@@ -2691,10 +2695,13 @@ impl Core {
             match self.lk.heads.get(gen) {
                 Some((sent, head, heard)) => {
                     if !non_stealable || now.wait.since(*heard) < online_ms {
-                        // (`sent` is the delegate's clock: one that runs
-                        // ahead stamps a renewal later than this root has
-                        // heard it. The head is no fresher than the moment
-                        // the root heard it, whatever the stamp says.)
+                        // (`sent` is a moment of this root's clock that
+                        // precedes the renewal's send, not the delegate's
+                        // clock, which can run ahead, nor the moment the
+                        // root heard the renewal, which follows the send:
+                        // rows the delegate executed in between are not
+                        // under the head. The hearing still bounds it, were
+                        // this clock set back.)
                         at = at.min(*sent).min(now.wall_of_wait(*heard).0);
                     }
                     let mut p = Position::ZERO;

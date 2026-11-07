@@ -1076,6 +1076,14 @@ fn apply_one(
                 gen: *gen,
             });
             crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
+            // Plan 46 M1.2 step 11 (L1): the holder's release is the last row
+            // of its stream, and the log carries it only after every row the
+            // holder ordered before it: no `Local` row of the generation is
+            // left to order, as at its end. Only from the durable log, as the
+            // end's (a streamed-ahead install of the release may strand).
+            if durable {
+                crate::store::local::clear_deleg_streamed_tx(tx, &meta.local, *gen);
+            }
             Ok(Applied::Done)
         }
         // Plan 43 C2: the generation's end with its cut. Every replica

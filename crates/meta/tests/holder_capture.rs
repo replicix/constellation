@@ -2490,7 +2490,7 @@ fn a_refusal_landed_by_rid_supersedes_a_completed_append() {
 /// the append quietly, so the recall pass does not queue it (L2b (b)).
 /// Fails before: the recall pass queues the append for a replay by rid.
 #[test]
-fn an_outcome_and_a_recall_cut_in_one_segment_queue_nothing() {
+fn an_outcome_and_a_stream_end_in_one_segment_queue_nothing() {
     let meta = deposed_after_one_append("a");
     let records = [
         create_rec("a", (2 << 40) | 1),

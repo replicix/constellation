@@ -3519,9 +3519,13 @@ the pinned write before it reads its head.
 `locks-writer-hold-delegated` stays clean
 (`locks_writer_hold_delegated_settles_before_the_head`). Its twin
 `locks-writer-hold-delegated-unsettled` switches the settle off
-(`SimConfig::settle_tagged_writes`) and fails 7 of 2000 seeds. They are
-pinned in `locks_writer_hold_delegated_without_the_settle_is_caught`, and
-each passes with the settle. `locks-writer-hold-delegated-doubt` has the
+(`SimConfig::settle_tagged_writes`) and failed 7 of 2000 seeds while the
+root's lock cut was as of the delegate's own send time. Since plan 46 M1.2
+step 11 the cut is as of a moment of the root's clock that precedes the
+renewal, and no seed of 0 to 140 000 shows the held write inside the next
+holder's section any more; the three seeds that did stay pinned, clean, in
+`locks_writer_hold_delegated_without_the_settle_stays_clean_under_the_roots_cut`
+(they fail again with the cut taken from the delegate's clock). `locks-writer-hold-delegated-doubt` has the
 client give up on the held write (in doubt), so the recalled grant takes
 the doubt lapse (`locks_writer_hold_delegated_doubt_lapses_the_grant`).
 Its released twin cannot fail here, because a pinned commit ends at the

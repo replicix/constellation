@@ -444,7 +444,9 @@ enum Command {
     },
     /// Permanently leave the cluster (tombstone the registry record).
     /// Omit `--node-id` to leave this mount; pass `--node-id` to retire
-    /// a different (unreachable) member via a still-mounted peer.
+    /// a different (unreachable) member via a still-mounted peer. The
+    /// node's delegations are ended first (the admin form runs on the node
+    /// that holds the root lease).
     Leave {
         target: String,
         #[arg(long)]

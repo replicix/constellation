@@ -414,6 +414,7 @@ pub enum SyncRequest {
         lock_cut: Box<constellation_meta::Position>,
         lock_barrier: i64,
         lock_carry: Vec<(constellation_meta::locks::GrantId, u64)>,
+        sent_at: i64,
     },
     /// Plan 46 M1.2 step 10: the root asks this node to release subtrees of
     /// a stream it holds; the delegate answers in its stream.
@@ -462,6 +463,13 @@ pub enum SyncRequest {
     },
     Undelegate {
         dir: Ino,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// Plan 46 M1.2 step 11 ("Leave ends grants first"): before the
+    /// registry retires `node`, the root ends every delegation it holds
+    /// (answered once the log has).
+    EndGrantsOf {
+        node: u64,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     /// Plan 30 §M8: a peer's ReadIndex, to answer as the sequencer.

@@ -567,7 +567,7 @@ impl PendingRelease {
         }
         for (id, left) in new.locks.carry {
             match note.locks.carry.iter_mut().find(|(x, _)| *x == id) {
-                Some((_, l)) => *l = (*l).min(left),
+                Some((_, l)) => *l = (*l).max(left),
                 None => note.locks.carry.push((id, left)),
             }
         }
@@ -626,6 +626,10 @@ pub(crate) struct DelegateState {
     /// the node has yet to learn). A subtree granted to the stream again
     /// leaves the set once the node has learned it.
     pub released_dirs: BTreeSet<Ino>,
+    /// Plan 46 M1.2 step 11: the latest answer to a renewal this node
+    /// received, as `(root, when that root sent it, on its clock)`
+    /// ([`PeerMsg::DelegRenewed::sent_at`]); echoed in the next renewal.
+    pub root_answer: Option<(NodeId, i64)>,
     /// Plan 46 M1.2 step 10: subtrees the root asked this node to release
     /// that this node has not learned yet (the `DelegateNode` record that
     /// grew the stream is in a segment it has not applied): released once it
@@ -954,6 +958,26 @@ const HANDED_BACK_UNSEEN_MS: i64 = 60_000;
 /// How many freezes [`DelegationState::freezes`] keeps.
 const FREEZES_KEPT: usize = 8;
 
+/// Plan 46 M1.2 step 11 (maintainer decision 2026-11-06, "Leave ends grants
+/// first"): a node leaves the roster only once the log has ended every grant
+/// it holds. The holder that is alive releases them (`StreamReleased` rows,
+/// the root then journals `DelegateNodeEnded`: [`Core::on_control_release_grants`]);
+/// for a node that is gone, the root recalls them and ends them at the TTL
+/// ([`Core::on_control_end_grants_of`]). A holder's own leave is answered when
+/// every stream it held is stopped and the root's acknowledgement covers its
+/// release row (its own table is no witness: its journal applies the release
+/// at once); the root's, when no stream of the node is live in its table and
+/// its generations; either at the deadline with an error.
+#[derive(Debug)]
+pub(crate) struct LeaveWait {
+    pub op: OpId,
+    /// The leaving node (this one for a holder's own leave).
+    pub who: NodeId,
+    pub deadline: WaitMs,
+    /// The streams already asked to release (holder side), and when.
+    pub asked: BTreeMap<u64, WaitMs>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct DelegationState {
     /// The measurement of the acknowledgement rule (`Core::deleg_caps`):
@@ -1071,6 +1095,10 @@ pub(crate) struct DelegationState {
     /// never seen (the recall overtook the record naming this node) —
     /// after [`HANDED_BACK_UNSEEN_MS`].
     pub handed_back: BTreeMap<u64, (NodeId, WaitMs, bool)>,
+    /// Plan 46 M1.2 step 11: `Leave` ends grants first. The leaves waiting
+    /// for the grants of a node to end in the log (see [`LeaveWait`]).
+    pub leave_waits: Vec<LeaveWait>,
+    pub leave_timer: Option<TimerId>,
     /// The generations a release request reached this node for at least once
     /// (the simulation's loss of the first one, L3).
     pub release_first: BTreeSet<u64>,
@@ -1759,6 +1787,7 @@ impl Core {
                     release: None,
                     release_pending: (BTreeSet::new(), 0),
                     released_dirs: BTreeSet::new(),
+                    root_answer: None,
                     core_answer_sent: None,
                     gen: d.gen,
                     until: HonourMs(0),
@@ -2183,6 +2212,11 @@ impl Core {
         for (dir, _) in subtrees {
             if !d.dirs.contains(dir) && !d.grown.contains_key(dir) {
                 d.grown.insert(*dir, None);
+                // A subtree the root grants this stream again is one to
+                // release when it is asked for again: the release this node
+                // journaled of it earlier is not one a later request repeats
+                // (step 10 review).
+                d.released_dirs.remove(dir);
                 learned += 1;
             }
         }
@@ -4894,6 +4928,7 @@ impl Core {
             self.root_progress(now, replica, out);
         }
         self.deleg_forget_ended(now, replica);
+        self.deleg_leave_progress(now, replica, out);
         // Plan 43 C2e (D8): a strict member's sealed tail that the drain
         // stopped short of (a dependency the log brings, a root that could
         // not end the recall) is drained again; the generation ends once the
@@ -6075,6 +6110,22 @@ impl Core {
 
     // ----------------------------------------------------- renewals
 
+    /// An accepted answer to a renewal of `gen` from `root`, which the root
+    /// sent at `sent_at` on its clock: the next renewal echoes it
+    /// ([`PeerMsg::DelegRenew::stream_head_at`]). Only a later one replaces
+    /// it (the same root's clock), a different root's always does.
+    pub(crate) fn deleg_note_root_answer(&mut self, gen: u64, root: NodeId, sent_at: i64) {
+        if sent_at <= 0 {
+            return;
+        }
+        if let Some(d) = self.dl.mine.get_mut(&gen) {
+            match d.root_answer {
+                Some((r, at)) if r == root && at >= sent_at => {}
+                _ => d.root_answer = Some((root, sent_at)),
+            }
+        }
+    }
+
     pub(crate) fn deleg_renew_now(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
         let Some(root) = self.root_node() else {
             // Learn the holder, and try again after a tick: the first
@@ -6135,9 +6186,15 @@ impl Core {
                 round,
                 backup,
                 stream_head: 0,
-                // Row 9 (plan 43 Appendix B, C7b): the root compares it with
-                // its own clock; kept apart from the renewal's honour send.
-                stream_head_at: now.wall.0,
+                // Plan 46 M1.2 step 11 (step 10 review): a moment on the
+                // root's clock that precedes this send, not this node's.
+                stream_head_at: self
+                    .dl
+                    .mine
+                    .get(&gen)
+                    .and_then(|d| d.root_answer)
+                    .filter(|(from, _)| *from == root)
+                    .map_or(i64::MIN, |(_, at)| at),
                 first: ungranted,
             },
         });
@@ -6426,6 +6483,7 @@ impl Core {
             lock_cut,
             lock_barrier,
             lock_carry,
+            sent_at: now.wall.0,
         };
         self.deleg_answer_renewal(now, from, hold.filter(|_| ttl_ms > 0), msg, out);
     }
@@ -10541,6 +10599,236 @@ impl Core {
             .controls
             .push(op);
         self.start_recall_for(now, gen, RecallCause::Undelegate, out);
+    }
+
+    // ------------------------------------------- Leave ends grants first
+
+    /// How long a leave waits for the log to end the grants (the root's
+    /// outwait of a holder that does not answer is one TTL, and the root's
+    /// own recall of it a resend or two more).
+    fn leave_wait_ms(&self) -> i64 {
+        (self.cfg.delegation_ttl_ms as i64)
+            .saturating_mul(2)
+            .saturating_add(self.cfg.forward_timeout_ms as i64)
+            .saturating_add(5_000)
+    }
+
+    /// The streams the table lists for `node`, with a live generation here
+    /// (a root) or not.
+    fn leave_streams_of(&self, node: NodeId, replica: &dyn Replica) -> BTreeSet<u64> {
+        replica
+            .delegation_table()
+            .iter()
+            .filter(|t| t.node == node)
+            .map(|t| t.gen)
+            .collect()
+    }
+
+    fn leave_wait_arm(&mut self, now: Now, out: &mut Vec<Action>) {
+        if self.dl.leave_timer.is_some() || self.dl.leave_waits.is_empty() {
+            return;
+        }
+        let t = self.set_timer_wait(now.wait.plus(500), Timer::LeaveWait, out);
+        self.dl.leave_timer = Some(t);
+    }
+
+    pub(crate) fn on_leave_wait_timer(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.dl.leave_timer = None;
+        self.deleg_leave_progress(now, replica, out);
+        self.leave_wait_arm(now, out);
+    }
+
+    /// `Control::ReleaseGrants` (a holder's own leave, before it flushes and
+    /// retires its registry record): this node releases every stream it
+    /// holds, as if its root had asked for all of them. The release row goes
+    /// through the stream, the root journals `DelegateNodeEnded` once its
+    /// journal shows it, and the control is answered when the table lists
+    /// no stream of this node. A node that holds nothing is answered at once.
+    pub(crate) fn on_control_release_grants(
+        &mut self,
+        now: Now,
+        op: OpId,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let me = self.me();
+        self.dl.leave_waits.push(LeaveWait {
+            op,
+            who: me,
+            deadline: now.wait.plus(self.leave_wait_ms() as u64),
+            asked: BTreeMap::new(),
+        });
+        self.deleg_leave_progress(now, replica, out);
+        self.leave_wait_arm(now, out);
+    }
+
+    /// `Control::EndGrantsOf { node }` (the admin form of leave, for a node
+    /// that cannot release its own grants, or any node retired by an
+    /// operator): the root recalls every stream of `node` and ends it, by
+    /// the holder's release if it answers and else at the generation's
+    /// expiry (the root's TTL end), before the registry entry goes. Only the
+    /// root can: another node answers whether `node` holds anything, and
+    /// refuses if it does.
+    pub(crate) fn on_control_end_grants_of(
+        &mut self,
+        now: Now,
+        op: OpId,
+        node: NodeId,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if node == self.me() {
+            out.push(Action::ControlDone {
+                op,
+                result: Err("a node releases its own grants with a self-leave".into()),
+            });
+            return;
+        }
+        if self.leave_streams_of(node, replica).is_empty()
+            && !self.dl.gens.values().any(|g| g.node == node && !g.ended)
+        {
+            out.push(Action::ControlDone {
+                op,
+                result: Ok(ControlOk::Text(format!("node {node} holds no delegation"))),
+            });
+            return;
+        }
+        if !self.root_usable(now) {
+            out.push(Action::ControlDone {
+                op,
+                result: Err(format!(
+                    "node {node} still holds a delegation, which only the root can end \
+                     (run the leave on the node that holds the root lease{})",
+                    self.root_node()
+                        .map(|r| format!(", node {r}"))
+                        .unwrap_or_default()
+                )),
+            });
+            return;
+        }
+        self.dl.leave_waits.push(LeaveWait {
+            op,
+            who: node,
+            deadline: now.wait.plus(self.leave_wait_ms() as u64),
+            asked: BTreeMap::new(),
+        });
+        self.deleg_leave_progress(now, replica, out);
+        self.leave_wait_arm(now, out);
+    }
+
+    /// Every event and tick: ask what has to be asked, answer the leaves
+    /// that are over (the table lists no stream of the node, and none is
+    /// live here) or out of time.
+    pub(crate) fn deleg_leave_progress(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.dl.leave_waits.is_empty() {
+            return;
+        }
+        let me = self.me();
+        let resend = self.cfg.forward_timeout_ms.max(500);
+        let mut waits = std::mem::take(&mut self.dl.leave_waits);
+        let mut keep = Vec::new();
+        for mut w in waits.drain(..) {
+            let streams = self.leave_streams_of(w.who, replica);
+            let done = if w.who == me {
+                // (This node's own journal applies its release rows to its
+                // table at once, so the table is no witness: the root has
+                // appended the release row, which the acknowledgement of
+                // the batch that carried it says, and the stream is
+                // stopped. A stream this node never installed is listed
+                // until the root's end reaches the table.)
+                streams.iter().all(|g| self.dl.mine.contains_key(g))
+                    && self
+                        .dl
+                        .mine
+                        .values()
+                        .all(|d| d.stopped && d.release.is_none())
+            } else {
+                streams.is_empty() && !self.dl.gens.values().any(|g| g.node == w.who && !g.ended)
+            };
+            if done {
+                out.push(Action::ControlDone {
+                    op: w.op,
+                    result: Ok(ControlOk::Text(format!(
+                        "the delegations of node {} are ended",
+                        w.who
+                    ))),
+                });
+                continue;
+            }
+            if now.wait >= w.deadline {
+                out.push(Action::ControlDone {
+                    op: w.op,
+                    result: Err(format!(
+                        "the delegations of node {} are not ended yet (the log has not carried \
+                         their end); run the leave again",
+                        w.who
+                    )),
+                });
+                continue;
+            }
+            if w.who == me {
+                // Release what the table or this node's state lists, once
+                // and again every resend interval (the batch with the note
+                // goes out again; a lost request is the root's to resend, a
+                // lost release is ours).
+                let mut gens: BTreeSet<u64> = streams;
+                gens.extend(self.dl.mine.keys().copied());
+                for gen in gens {
+                    if self
+                        .dl
+                        .mine
+                        .get(&gen)
+                        .is_some_and(|d| d.stopped && d.release.is_none())
+                    {
+                        continue;
+                    }
+                    let due = w
+                        .asked
+                        .get(&gen)
+                        .is_none_or(|at| now.wait.since(*at) >= resend as i64);
+                    if !due {
+                        continue;
+                    }
+                    let root = self
+                        .dl
+                        .mine
+                        .get(&gen)
+                        .and_then(|d| d.last_root)
+                        .or_else(|| self.root_node());
+                    let Some(root) = root else {
+                        self.deleg_learn_root(now, out);
+                        continue;
+                    };
+                    w.asked.insert(gen, now.wait);
+                    let req = self.op_id();
+                    self.on_release_request(now, root, req, gen, Vec::new(), replica, out);
+                }
+            } else {
+                let gens: Vec<u64> = self
+                    .dl
+                    .gens
+                    .iter()
+                    .filter(|(_, g)| g.node == w.who && !g.ended)
+                    .map(|(gen, _)| *gen)
+                    .collect();
+                for gen in gens {
+                    self.start_recall(now, gen, out);
+                }
+            }
+            keep.push(w);
+        }
+        keep.append(&mut self.dl.leave_waits);
+        self.dl.leave_waits = keep;
     }
 
     /// Plan 30 §M10: an epoch became active (or closed).

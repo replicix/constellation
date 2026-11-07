@@ -21697,6 +21697,7 @@ mod locks {
                 lock_cut: Box::new(cut),
                 lock_barrier: 0,
                 lock_carry: Vec::new(),
+                sent_at: 0,
             },
         };
         let mut cut = Position::ZERO;
@@ -31885,6 +31886,7 @@ mod locks {
                 lock_cut: Box::default(),
                 lock_barrier: 0,
                 lock_carry,
+                sent_at: 0,
             },
         });
     }
@@ -37674,6 +37676,7 @@ fn renewed(h: &Harness, req: OpId, gen: u64, ttl_ms: u64) -> Event {
             lock_cut: Box::default(),
             lock_barrier: 0,
             lock_carry: Vec::new(),
+            sent_at: 0,
         },
     }
 }
@@ -38251,6 +38254,7 @@ fn a_root_change_mid_stream_drops_the_old_rounds_answers() {
             lock_cut: Default::default(),
             lock_barrier: 0,
             lock_carry: Vec::new(),
+            sent_at: 0,
         },
     });
     assert_eq!(
@@ -38314,6 +38318,7 @@ fn renewed_by(from: NodeId, req: OpId, gen: u64, round: u64, ttl_ms: u64) -> Eve
             lock_cut: Box::default(),
             lock_barrier: 0,
             lock_carry: Vec::new(),
+            sent_at: 0,
         },
     }
 }
@@ -39136,6 +39141,7 @@ fn a_late_answer_for_an_ended_generation_leaves_the_cut() {
             lock_cut: Default::default(),
             lock_barrier: 0,
             lock_carry: Vec::new(),
+            sent_at: 0,
         },
     });
     let (root, at, _) = h.core.lk.cut.expect("the cut is gone");
@@ -39180,6 +39186,7 @@ fn an_answer_to_a_previous_incarnation_does_not_count() {
             lock_cut: Default::default(),
             lock_barrier: 0,
             lock_carry: Vec::new(),
+            sent_at: 0,
         },
     });
     assert_eq!(
@@ -43401,7 +43408,7 @@ mod answer_sources {
 
 /// Plan 43 C2: a generation's end carries its cut, every replica reads it
 /// from the record, and what waited for a row past it is never answered.
-mod recall_cut {
+mod stream_end {
     use super::*;
     use crate::replica::Replica;
 
@@ -61631,6 +61638,385 @@ mod step9_one_stream_per_node {
             "the cut claims {} ms of a head heard 2000 ms ago",
             at - (now.wall.0 - 2_000)
         );
+    }
+
+    // ----------------------------------------------------- step 11
+
+    /// The answer to control `op` in `out`, if it was given.
+    fn control_answer(out: &[Action], op: u64) -> Option<Result<String, String>> {
+        out.iter().find_map(|a| match a {
+            Action::ControlDone { op: o, result } if *o == OpId(op) => {
+                Some(result.clone().map(|ok| match ok {
+                    crate::action::ControlOk::Text(t) => t,
+                    _ => "done".to_string(),
+                }))
+            }
+            _ => None,
+        })
+    }
+
+    /// Plan 46 M1.2 step 11, the TTL end: the delegate of a recorded backup
+    /// goes silent, the generation's expiry seals the backup, and the end
+    /// (`DelegateNodeEnded`) is journaled with the cut after the backup's
+    /// tail, not at the cursor the root had.
+    #[test]
+    fn the_ttl_end_of_a_backed_generation_cuts_after_the_seal() {
+        let mut h = root_with_delegate_backed_by(4);
+        h.core.dl.gens.get_mut(&7).unwrap().cursor = 3;
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let seal = sends(&out)
+            .iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::DelegSeal { req, .. } if *to == 4 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no seal: {out:?}"));
+        assert!(
+            !h.core.dl.gens[&7].ended,
+            "ended before the backup answered"
+        );
+        let journal = |h: &Harness| -> Vec<LogRecord> {
+            crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+                .into_iter()
+                .flat_map(|tx| tx.records)
+                .collect()
+        };
+        assert!(
+            !journal(&h)
+                .iter()
+                .any(|r| matches!(r, LogRecord::DelegateNodeEnded { .. })),
+            "an end was journaled before the seal was answered"
+        );
+        let row = |idx: u64| constellation_meta::DelegateTx {
+            idx,
+            rid: None,
+            records: Vec::new(),
+            deps: constellation_meta::Position::ZERO,
+        };
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegSealed {
+                req: seal,
+                gen: 7,
+                sealed: true,
+                txs: vec![row(1), row(2), row(3), row(4), row(5)],
+                prev_roots: Vec::new(),
+            },
+        });
+        assert!(h.core.dl.gens[&7].ended);
+        let ends: Vec<_> = journal(&h)
+            .into_iter()
+            .filter(|r| matches!(r, LogRecord::DelegateNodeEnded { .. }))
+            .collect();
+        assert_eq!(
+            ends,
+            vec![LogRecord::DelegateNodeEnded {
+                node: 3,
+                gen: 7,
+                through: 5
+            }]
+        );
+    }
+
+    /// The delegate side of Leave: a node that holds a stream releases it
+    /// (`StreamReleased`, as the next row of the stream) when it is
+    /// leaving, and its leave is not answered until the root has appended
+    /// the release row (it then ends the stream, whatever the roster says
+    /// of this node). On the parent the leave goes straight to the flush and
+    /// the registry, with the grant live (the roster-only singleton test
+    /// then sees a node off the roster that still holds one: M1.1 review
+    /// SHOULD-2).
+    #[test]
+    fn a_leaving_holder_releases_its_stream_and_is_answered_when_the_root_has_the_release() {
+        let (mut h, _records, a) = delegate_learning_a_streamed_grant(true);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (_, req, _) = renewal_sent(&out).expect("no first renewal");
+        h.step(renewed(&h, req, 7, 5_000));
+        create_in(&mut h, a, 1);
+        assert_eq!(h.core.dl.mine[&7].executed, 1);
+        let out = h.step(Event::Control {
+            op: OpId(77),
+            req: Control::ReleaseGrants,
+        });
+        let note = release_note_to(&out, 1).expect("the stream was not released toward the root");
+        assert_eq!(note.dirs, vec![a], "{out:?}");
+        assert!(
+            control_answer(&out, 77).is_none(),
+            "the leave was answered with the grant live: {out:?}"
+        );
+        assert!(h.core.dl.mine[&7].stopped, "the stream still executes");
+        let (batch, round, last) = sends(&out)
+            .into_iter()
+            .find_map(|(_, m)| match m {
+                PeerMsg::DelegateStream {
+                    req, round, txs, ..
+                } => Some((*req, *round, txs.last().map_or(0, |t| t.idx))),
+                _ => None,
+            })
+            .expect("no batch");
+        // The release row is the stream's last.
+        assert_eq!(last, 2);
+        // Time passes, the root has not answered: still waiting.
+        h.advance(300);
+        let out = h.step(Event::Slack { epoch_slack: 0 });
+        assert!(control_answer(&out, 77).is_none(), "{out:?}");
+        // The wait looks again on its timer, and arms the next.
+        let id = h.core.dl.leave_timer.expect("no timer for the leave");
+        h.advance(500);
+        let out = h.step(Event::Timer { id });
+        assert!(control_answer(&out, 77).is_none(), "{out:?}");
+        assert!(
+            h.core.dl.leave_timer.is_some_and(|next| next != id),
+            "the leave's timer was not armed again"
+        );
+        // The root appended the row: the leave may go on.
+        let out = h.step(stream_ack(1, batch, round, last));
+        let answer = control_answer(&out, 77).unwrap_or_else(|| panic!("not answered: {out:?}"));
+        assert!(answer.is_ok(), "{answer:?}");
+    }
+
+    /// A node that holds nothing leaves at once.
+    #[test]
+    fn a_leave_of_a_node_with_no_grant_is_answered_at_once() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let out = h.step(Event::Control {
+            op: OpId(5),
+            req: Control::ReleaseGrants,
+        });
+        assert!(matches!(control_answer(&out, 5), Some(Ok(_))), "{out:?}");
+    }
+
+    /// The root side of Leave: the node is gone (it never answers the
+    /// release request), the operator retires it. The root recalls its
+    /// stream and the retirement is answered only once the generation
+    /// expired and the root journaled its end. On the parent the registry
+    /// entry goes at once and the grant is left live off the roster.
+    #[test]
+    fn the_root_ends_a_dead_nodes_grants_before_its_roster_entry_goes() {
+        let (mut h, d1) = root_with_dir();
+        assert!(delegate(&mut h, 900, d1, 3));
+        let gen = h.meta.delegation_table().get(d1).unwrap().gen;
+        let out = h.step(Event::Control {
+            op: OpId(910),
+            req: Control::EndGrantsOf { node: 3 },
+        });
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::ReleaseRequest { .. })),
+            "the live grant was not recalled: {out:?}"
+        );
+        assert!(
+            control_answer(&out, 910).is_none(),
+            "retired with the grant live: {out:?}"
+        );
+        let out = h.step(Event::Slack { epoch_slack: 0 });
+        assert!(control_answer(&out, 910).is_none(), "{out:?}");
+        // The holder never answers: the expiry (the root's TTL end).
+        h.core.dw.set_until_for_tests(gen, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), gen, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&gen].ended, "not ended: {out:?}");
+        let out = h.step(Event::Slack { epoch_slack: 0 });
+        let answer = control_answer(&out, 910).unwrap_or_else(|| panic!("not answered: {out:?}"));
+        assert!(answer.is_ok(), "{answer:?}");
+        assert!(h.meta.delegation_table().get(d1).is_none());
+    }
+
+    /// A node that is not the root cannot end another node's grants: it
+    /// refuses the retirement of a node the table lists a stream for, and
+    /// lets one through that holds none.
+    #[test]
+    fn a_non_root_refuses_to_retire_a_node_that_holds_a_grant() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let _ = delegated_to_me(&h.meta, 3);
+        let out = h.step(Event::Control {
+            op: OpId(1),
+            req: Control::EndGrantsOf { node: 3 },
+        });
+        assert!(matches!(control_answer(&out, 1), Some(Err(_))), "{out:?}");
+        let out = h.step(Event::Control {
+            op: OpId(2),
+            req: Control::EndGrantsOf { node: 4 },
+        });
+        assert!(matches!(control_answer(&out, 2), Some(Ok(_))), "{out:?}");
+    }
+
+    /// Step 10 review SHOULD-1: a subtree this node released and the root
+    /// grants the stream again is one to learn afresh: the release it
+    /// journaled is not remembered against the new grant (a request for the
+    /// regrown subtree would be taken as a repeat of the old one).
+    #[test]
+    fn a_regrown_subtree_is_no_longer_marked_released() {
+        let (mut h, _records, a) = delegate_learning_a_streamed_grant(true);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (_, req, _) = renewal_sent(&out).expect("no first renewal");
+        h.step(renewed(&h, req, 7, 5_000));
+        let (b, mk) = mkdir(&h, "e");
+        let grow = vec![mk, LogRecord::delegate_one(3, 7, b, SubtreeKind::Placed)];
+        crate::replica::Replica::install_streamed(&h.meta, 1, 1, 3, 4, &grow, true, (0, 0))
+            .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine[&7].grown.contains_key(&b));
+        // The root asks for `b` back: released.
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReleaseRequest {
+                req: OpId(40),
+                gen: 7,
+                dirs: vec![b],
+            },
+        });
+        assert!(h.core.dl.mine[&7].released_dirs.contains(&b));
+        // The stream is granted `b` once more.
+        crate::replica::Replica::install_streamed(
+            &h.meta,
+            1,
+            1,
+            5,
+            5,
+            &[LogRecord::delegate_one(3, 7, b, SubtreeKind::Placed)],
+            true,
+            (0, 0),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let d = &h.core.dl.mine[&7];
+        assert!(d.grown.contains_key(&b), "{:?}", d.grown);
+        assert!(
+            !d.released_dirs.contains(&b),
+            "the regrown subtree is still marked released"
+        );
+        let _ = a;
+    }
+
+    /// Step 10 review NIT: two releases of one grant, merged, keep the
+    /// larger of what was left of its record.
+    #[test]
+    fn merged_releases_keep_the_larger_carry() {
+        use crate::core::delegate::PendingRelease;
+        use constellation_meta::locks::{GrantId, LockHandback, ReleaseNote};
+        let id = GrantId { node: 3, seq: 9 };
+        let pending = |left: u64| PendingRelease {
+            note: ReleaseNote {
+                dirs: vec![1],
+                end_at: None,
+                locks: LockHandback {
+                    grants: Vec::new(),
+                    carry: vec![(id, left)],
+                    floor: Default::default(),
+                    barrier: 0,
+                },
+            },
+            row: Some(4),
+            first_row: Some(4),
+            held: false,
+            holds: 0,
+            left_at: WaitMs(1_000),
+            to: 1,
+        };
+        let merged = pending(1_000).merge(pending(3_000), WaitMs(1_000));
+        assert_eq!(merged.note.locks.carry, vec![(id, 3_000)]);
+    }
+
+    /// Step 10 review SHOULD-2: a delegate's renewal tells the root a moment
+    /// of the root's clock that precedes its send (the latest answer it
+    /// received, by when that root sent it), never its own clock: the lock
+    /// cut is as of the earliest of these. None before any answer, and none
+    /// from another root.
+    #[test]
+    fn a_renewal_carries_the_roots_send_time_of_the_answer_it_follows() {
+        let (mut h, req, _round) = delegate_with_first_renewal_out();
+        let stamp = |out: &[Action]| -> Option<i64> {
+            sends(out).into_iter().find_map(|(_, m)| match m {
+                PeerMsg::DelegRenew {
+                    gen: 7,
+                    stream_head_at,
+                    ..
+                } => Some(*stream_head_at),
+                _ => None,
+            })
+        };
+        // The first renewal: nothing received yet, so no moment is claimed
+        // (on the parent: this node's own clock).
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.advance(10);
+        let ev = match renewed(&h, req, 7, 5_000) {
+            Event::Peer {
+                from,
+                msg:
+                    PeerMsg::DelegRenewed {
+                        req,
+                        gen,
+                        round,
+                        ttl_ms,
+                        locks,
+                        lock_grace_ms,
+                        lock_floor,
+                        lock_cut_at,
+                        lock_cut,
+                        lock_barrier,
+                        lock_carry,
+                        ..
+                    },
+            } => Event::Peer {
+                from,
+                msg: PeerMsg::DelegRenewed {
+                    req,
+                    gen,
+                    round,
+                    ttl_ms,
+                    locks,
+                    lock_grace_ms,
+                    lock_floor,
+                    lock_cut_at,
+                    lock_cut,
+                    lock_barrier,
+                    lock_carry,
+                    sent_at: 1_234,
+                },
+            },
+            _ => unreachable!(),
+        };
+        h.step(ev);
+        h.advance(2_600);
+        let id = h.core.dl.mine[&7].renew_timer.expect("a renewal is armed");
+        let out = h.step(Event::Timer { id });
+        assert_eq!(
+            stamp(&out),
+            Some(1_234),
+            "the renewal did not echo the root's send time: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_first_renewal_claims_no_moment() {
+        let (h, _req, _round) = delegate_with_first_renewal_out();
+        let _ = &h;
+        let mut h = h;
+        let mut out = Vec::new();
+        h.core.dl.mine.get_mut(&7).unwrap().renew = None;
+        h.core.deleg_renew_now(h.clk(), 7, &mut out);
+        let at = sends(&out).into_iter().find_map(|(_, m)| match m {
+            PeerMsg::DelegRenew {
+                gen: 7,
+                stream_head_at,
+                ..
+            } => Some(*stream_head_at),
+            _ => None,
+        });
+        assert_eq!(at, Some(i64::MIN), "{out:?}");
     }
 }
 

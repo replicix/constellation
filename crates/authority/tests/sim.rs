@@ -14202,7 +14202,7 @@ fn locks_writer_hold_delegated_settles_before_the_head() {
     assert_eq!(t.clients.stale_turn_reads, 0, "{t:?}");
 }
 
-/// F1 (review T1), the settle's fail-before: the seeds where, with
+/// F1 (review T1), the settle's fail-before (since plan 46 M1.2 step 11 a regression pin on the root's cut, see below): the seeds where, with
 /// `settle_tagged_writes` off, the delegate reported its stream head while
 /// its pinned write was still committing, the root granted on from it,
 /// and the write landed in the next holder's critical section (found by a
@@ -14212,7 +14212,7 @@ fn locks_writer_hold_delegated_settles_before_the_head() {
 /// parked op instead of a fenced one): of these four only 745 and 1081 failed
 /// on the parent in 0..2000 and here only 1282 does, so 1282 joins the list.
 #[test]
-fn locks_writer_hold_delegated_without_the_settle_is_caught() {
+fn locks_writer_hold_delegated_without_the_settle_stays_clean_under_the_roots_cut() {
     use pinned::run_seed;
     // (745, 1081, 1282, 2045 and 2369, whose trajectories plan 41 L2's lock
     // lane shifted to no held write inside the next holder's section, gave their
@@ -14240,26 +14240,28 @@ fn locks_writer_hold_delegated_without_the_settle_is_caught() {
     // (Plan 46 M1.2 step 10: the delegate's release rides its stream; 1313,
     // 2666 and 2955 show none, and 635, 3358 and 3403 are the first three of
     // seeds 0 to 6 000 that do, unclocked, the settle clean on each.)
+    // (Plan 46 M1.2 step 11: the lock cut is as of a moment of the root's own
+    // clock that precedes the delegate's renewal (`DelegRenew::stream_head_at`
+    // echoes the root's send time of the answer it had received), not of the
+    // delegate's send. A head reported while a pinned write is still
+    // committing is no longer claimed for writes that began after that
+    // moment, so the settle is not what keeps the held write out of the next
+    // holder's section here: 635, 3358 and 3403 show none, and no seed of
+    // 0 to 140 000 does, unclocked. The control is therefore a regression pin
+    // on the bound: these three seeds, which fail on the delegate's clock,
+    // must stay clean without the settle.)
     let seeds = [635, 3358, 3403];
-    let mut caught = 0;
     for seed in seeds {
         if let Err(e) = run_seed(seed, locks_writer_hold_delegated_unsettled_config()) {
-            eprintln!("seed {seed}: {}", e.lines().next().unwrap_or(""));
-            // The intended signature, not any error: the held write landed
-            // inside the next holder's critical section.
             assert!(
-                e.contains("held write") && e.contains("inside"),
-                "seed {seed}: another failure: {e}"
+                !(e.contains("held write") && e.contains("inside")),
+                "seed {seed}: the held write landed inside the next holder's section without the settle \
+                 (the cut is as of the delegate's clock?): {e}"
             );
-            caught += 1;
         }
         run_seed(seed, locks_writer_hold_delegated_config())
             .unwrap_or_else(|e| panic!("locks-writer-hold-delegated seed {seed}: {e}"));
     }
-    assert!(
-        caught > 0,
-        "no write landed under the next holder without the settle"
-    );
 }
 
 /// Plan 43 C2d: a delegate whose group is not itself (the root near, or a

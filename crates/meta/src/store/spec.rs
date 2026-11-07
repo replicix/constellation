@@ -4919,6 +4919,15 @@ impl Meta {
                 _ => None,
             })
             .collect();
+        // The generations whose stream this segment's records release (all
+        // the records, as for `recalled`).
+        let released: Vec<u64> = records
+            .iter()
+            .filter_map(|rec| match rec {
+                LogRecord::StreamReleased { gen, .. } => Some(*gen),
+                _ => None,
+            })
+            .collect();
         // The same records' cuts, all of them also: kept below, in this
         // transaction.
         let ends: Vec<(u64, u64)> = records
@@ -5603,6 +5612,14 @@ impl Meta {
                 };
                 tx.insert(&self.completed, rid.to_key(), row);
             }
+        }
+        // L1 (plan 46 M1.2 step 11): a holder's release is the last row of
+        // its stream, carried by the log only after the rows the holder
+        // ordered before it: its mark goes with it, as with the end. Here as
+        // well as in `replay::apply_one` (a streamed install of the release
+        // is among the rows skipped).
+        for gen in &released {
+            local::clear_deleg_streamed_tx(&mut tx, &self.local, *gen);
         }
         // Plan 43 C1-4: what the log delivered tells the member copies
         // (coverage, `TailFollowsThrough`, an abandon, a newer marker).

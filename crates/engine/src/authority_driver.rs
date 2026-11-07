@@ -552,6 +552,9 @@ enum ControlReply {
     ClaimOffer,
     Text(oneshot::Sender<std::result::Result<String, String>>),
     Leave(oneshot::Sender<std::result::Result<String, String>>),
+    /// A leave's first half: its grants released and ended. On success the
+    /// flush follows ([`ControlReply::Leave`]).
+    LeaveGrants(oneshot::Sender<std::result::Result<String, String>>),
     /// `repair drop-held`: what the core's drop did, in words.
     DropHeld(oneshot::Sender<std::result::Result<constellation_meta::DroppedHeld, String>>),
     /// Plan 30 §M8.
@@ -3742,6 +3745,7 @@ impl Driver {
                 lock_cut,
                 lock_barrier,
                 lock_carry,
+                sent_at,
             } => Some(Internal::Event(Event::Peer {
                 from,
                 msg: PeerMsg::DelegRenewed {
@@ -3756,6 +3760,7 @@ impl Driver {
                     lock_cut,
                     lock_barrier,
                     lock_carry,
+                    sent_at,
                 },
             })),
             SyncRequest::PeerReleaseRequest {
@@ -3843,6 +3848,9 @@ impl Driver {
             ),
             SyncRequest::Undelegate { dir, reply } => {
                 control(Control::Undelegate { dir }, ControlReply::Text(reply))
+            }
+            SyncRequest::EndGrantsOf { node, reply } => {
+                control(Control::EndGrantsOf { node }, ControlReply::Text(reply))
             }
             SyncRequest::Submit {
                 op,
@@ -4157,9 +4165,13 @@ impl Driver {
                 tokio::spawn(async move {
                     match upload.run(None).await {
                         Ok(_) => {
+                            // Leave ends grants first (plan 46 M1.2 step
+                            // 11): the grants this node holds are released
+                            // and ended in the log before the journal flush
+                            // and the registry's retirement.
                             let _ = tx.send(Internal::Control {
-                                req: Control::Flush,
-                                reply: ControlReply::Leave(reply),
+                                req: Control::ReleaseGrants,
+                                reply: ControlReply::LeaveGrants(reply),
                             });
                         }
                         Err(e) => {
@@ -4831,6 +4843,7 @@ impl Driver {
                 lock_cut,
                 lock_barrier,
                 lock_carry,
+                sent_at,
             } => {
                 let payload = Payload::DelegRenewed {
                     from: self.node_id,
@@ -4845,6 +4858,7 @@ impl Driver {
                     lock_cut: crate::locks::floor_wire(&lock_cut),
                     lock_barrier,
                     lock_carry: crate::locks::carry_wire(&lock_carry),
+                    sent_at,
                 };
                 self.one_way(to, payload);
             }
@@ -6403,6 +6417,17 @@ impl Driver {
                 }
                 Err(e) => {
                     let _ = tx.send(Err(e));
+                }
+            },
+            ControlReply::LeaveGrants(tx) => match result {
+                Ok(_) => {
+                    let _ = self.int_tx.send(Internal::Control {
+                        req: Control::Flush,
+                        reply: ControlReply::Leave(tx),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(format!("cannot leave: {e}")));
                 }
             },
             ControlReply::Leave(tx) => match result {

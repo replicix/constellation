@@ -772,6 +772,7 @@ impl constellation_net::PeerService for P2pBridge {
         lock_cut: Vec<u8>,
         lock_barrier: i64,
         lock_carry: Vec<u8>,
+        sent_at: i64,
     ) {
         if crate::fault::p2p_denied(from) {
             return;
@@ -798,6 +799,7 @@ impl constellation_net::PeerService for P2pBridge {
             lock_cut: Box::new(crate::locks::floor_of(&lock_cut)),
             lock_barrier,
             lock_carry: crate::locks::carry_of(&lock_carry),
+            sent_at,
         });
     }
 

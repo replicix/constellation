@@ -1215,6 +1215,23 @@ impl EngineControl {
     ) -> std::result::Result<String, String> {
         match node_id {
             Some(target) => {
+                // Leave ends grants first (plan 46 M1.2 step 11): the root
+                // ends every delegation of the node, by its release if it
+                // is alive, else at the expiry, before its registry entry
+                // goes (the roster-only singleton test must never see a
+                // live grant held off the roster).
+                let (reply, receive) = tokio::sync::oneshot::channel();
+                self.sync_tx
+                    .send(sync::SyncRequest::EndGrantsOf {
+                        node: target,
+                        reply,
+                    })
+                    .map_err(|_| "sync task is not running".to_string())?;
+                tokio::task::block_in_place(|| {
+                    self.rt
+                        .block_on(receive)
+                        .map_err(|_| "sync task stopped".to_string())?
+                })?;
                 let store = self.store.clone();
                 let designations = self.designations.clone();
                 let self_id = self.node_id;

@@ -2081,6 +2081,9 @@ enum Timer {
     /// A release's wait for the generations being recalled reached its
     /// bound (`Core::on_release_recall_bound`).
     ReleaseRecallBound,
+    /// Plan 46 M1.2 step 11: the leaves waiting for grants to end look
+    /// again (`Core::on_leave_wait_timer`).
+    LeaveWait,
 }
 
 impl Timer {
@@ -2131,7 +2134,7 @@ impl Timer {
             Timer::DelegLapse(_) => TimerKind::DelegLapse,
             Timer::DelegStream | Timer::DelegInstallRetry => TimerKind::DelegStream,
             Timer::Placement => TimerKind::Placement,
-            Timer::ReleaseRecallBound => TimerKind::DelegExpiry,
+            Timer::ReleaseRecallBound | Timer::LeaveWait => TimerKind::DelegExpiry,
         }
     }
 }
@@ -3068,6 +3071,7 @@ impl Core {
                 lock_cut,
                 lock_barrier,
                 lock_carry,
+                sent_at,
             } => {
                 // The renewal installs the generation's window first; the
                 // handoff is tagged with the generation itself. A grace
@@ -3079,6 +3083,7 @@ impl Core {
                 if !self.on_deleg_renewed(now, from, req, gen, round, ttl_ms, replica, out) {
                     return;
                 }
+                self.deleg_note_root_answer(gen, from, sent_at);
                 if ttl_ms > 0 && !serving {
                     self.lock_take_grace(now, gen, lock_grace_ms);
                 }
@@ -3438,6 +3443,7 @@ impl Core {
             Timer::DelegInstallRetry => self.on_deleg_install_retry(now, replica, out),
             Timer::Placement => self.on_placement_timer(now, replica, out),
             Timer::ReleaseRecallBound => self.on_release_recall_bound(now, replica, out),
+            Timer::LeaveWait => self.on_leave_wait_timer(now, replica, out),
         }
     }
 
@@ -3626,6 +3632,10 @@ impl Core {
                 self.on_control_delegate(now, op, dir, node, sticky, replica, out)
             }
             Control::Undelegate { dir } => self.on_control_undelegate(now, op, dir, replica, out),
+            Control::ReleaseGrants => self.on_control_release_grants(now, op, replica, out),
+            Control::EndGrantsOf { node } => {
+                self.on_control_end_grants_of(now, op, node, replica, out)
+            }
             Control::Retire => {
                 self.on_retire(now, replica, out);
                 out.push(Action::ControlDone {

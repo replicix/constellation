@@ -255,7 +255,7 @@ fn the_streamed_order_of_a_former_delegates_own_row_survives_a_restart() {
 }
 
 #[test]
-fn a_streamed_recall_cut_keeps_the_mark_and_the_durable_one_clears_it() {
+fn a_streamed_end_keeps_the_mark_and_the_durable_one_clears_it() {
     let fx = Fx::new(false);
     assert_eq!(fx.meta.deleg_streamed(GEN).unwrap(), None);
     // The root's append of the own row marks it, in the stream's epoch.
@@ -285,6 +285,53 @@ fn a_streamed_recall_cut_keeps_the_mark_and_the_durable_one_clears_it() {
     // The log's `DelegateNodeEnded` ends the generation: the mark goes.
     fx.apply_segment(Later::Unlink);
     assert_eq!(fx.meta.deleg_streamed(GEN).unwrap(), None);
+}
+
+/// Plan 46 M1.2 step 11 (L1): the mark goes with the stream's end or its
+/// release, from the log only. A streamed `StreamReleased` keeps it (the
+/// install may strand); the log's clears it, as the log's end does.
+#[test]
+fn a_streamed_stream_release_keeps_the_mark_and_the_durable_one_clears_it() {
+    let fx = Fx::new(false);
+    fx.meta
+        .install_streamed_committed(1, HOLDER, 1, 2, &fx.x_recs, true, (GEN, 1))
+        .unwrap();
+    assert_eq!(fx.meta.deleg_streamed(GEN).unwrap(), Some((1, 1)));
+    let release = LogRecord::StreamReleased {
+        node: 2,
+        gen: GEN,
+        through: 1,
+    };
+    fx.meta
+        .install_streamed_committed(
+            1,
+            HOLDER,
+            3,
+            3,
+            std::slice::from_ref(&release),
+            true,
+            (0, 0),
+        )
+        .unwrap();
+    assert_eq!(fx.meta.deleg_streamed(GEN).unwrap(), Some((1, 1)));
+    let mut records = fx.x_recs.clone();
+    records.push(release);
+    fx.meta
+        .apply_segment_rows(
+            2,
+            1,
+            3,
+            &[1, 2, 3],
+            &[(GEN, 1), (GEN, 1), (0, 0)],
+            &records,
+            &TouchSet::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        fx.meta.deleg_streamed(GEN).unwrap(),
+        None,
+        "the log's release left the mark standing"
+    );
 }
 
 /// Pins the mechanism, not a wanted state: `x` is present at the end, which

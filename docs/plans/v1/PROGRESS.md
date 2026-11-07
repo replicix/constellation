@@ -68868,3 +68868,42 @@ now calls it when the durable watermark rose; test `a_roots_op_awaiting_a_delega
 `release_exec_parks_completed` needs no such hook: it releases a park on the rid's outcome being in the journal (`completed_position`), which neither a ship nor an ack changes;
 the durability wait it hands to `complete_ready` is released by `backup_after_event`. `writeback-fsync` no longer covers an unbacked holder's close `Upload`; the `Unbacked` mode of
 `writeback-close-metered-nonowner` does (asserts `pending_uploads == 0`, chunk PUTs and the data readable), so no phase was added.
+
+**Plan 46 M1.2 step 11: ends; Leave ends grants first.** Most of the row's records were already in place after 8a and 10: `RecallCut` has no writer or reader left (only
+plan 43's text and two test names, renamed), the TTL end and the backup seal both journal `DelegateNodeEnded { through }` (`end_generation`; `deleg_end_sealed` drains the strict
+member's tail first, so the cut is after the seal; pinned by `the_ttl_end_of_a_backed_generation_cuts_after_the_seal`, which passes on main), and the L1 mark was cleared by
+the durable end alone. What this step adds:
+- **L1:** the durable apply of a `StreamReleased` clears the generation's mark too (`replay::apply_one` and the segment path, which must read the records before the already
+  streamed ones are skipped); a streamed one still does not.
+- **Leave ends grants first** (M1.1 review SHOULD-2, maintainer decision 2026-11-06), on both halves. *Holder alive* (self-leave): `SyncRequest::Leave` uploads, then
+  `Control::ReleaseGrants`, then the flush and `finish_leave`. The core releases every stream the node holds (`on_release_request` with the root as the asker, for the
+  streams in `dl.mine` and those the table lists for it), and answers when each is stopped and the root's acknowledgement covers its release row (the node's own journal
+  applies its release to its table at once, so the table is no witness); the root then ends the stream (`root_release_appended` -> `DelegateNodeEnded`). *Node gone* (admin
+  `leave --node-id`): `ControlService::leave` first sends `Control::EndGrantsOf { node }` to its core; the root recalls the node's streams (`start_recall`: the release
+  request, the L3 resends, the generation's expiry is the TTL end) and answers when none is live; a node that is not the root refuses if the table lists a stream for the node
+  (the operator runs it on the root), answers at once if it lists none. `LeaveWait` + `Timer::LeaveWait` (500 ms) drive both; the deadline is 2 TTL + forward timeout + 5 s, then
+  the leave answers an error and is run again. `--force` does not skip it (it only skips courtesy refusals). Only then `leave_node` and `fence_retired`. The lone-root cap is
+  no longer what keeps a retired node's grant from being answered by the root's disk alone.
+- **Step 10's SHOULDs:** (1) a subtree the stream is granted again leaves `released_dirs` when the node learns the grow; (2) the lock cut's "as of" for a delegate's head is
+  a moment of the root's own clock that precedes the renewal's send: `DelegRenewed.sent_at` (the root's clock when it built the answer) is echoed by the delegate in its next
+  `DelegRenew.stream_head_at` (the latest answer received from the current root; `i64::MIN` before one, and after a change of root), and `lock_cut_here` takes the earliest of
+  these (and still the hearing); it was the delegate's clock; (3) `PendingRelease::merge` keeps the larger `carry`.
+- **Tests, fail with the step removed:** core `a_leaving_holder_releases_its_stream_and_is_answered_when_the_root_has_the_release`,
+  `the_root_ends_a_dead_nodes_grants_before_its_roster_entry_goes`, `a_non_root_refuses_to_retire_a_node_that_holds_a_grant`, `a_regrown_subtree_is_no_longer_marked_released`,
+  `merged_releases_keep_the_larger_carry`, `a_renewal_carries_the_roots_send_time_of_the_answer_it_follows`, `a_first_renewal_claims_no_moment`; meta
+  `a_streamed_stream_release_keeps_the_mark_and_the_durable_one_clears_it`. They pass with the step.
+- **Sim:** the seed-pinned negative control `locks_writer_hold_delegated_without_the_settle_is_caught` (635, 3358, 3403) has no witness any more: with the cut as of the
+  root's own moment, no seed of 0 to 140,000 of `locks-writer-hold-delegated-unsettled+unclocked` lands the held write inside the next holder's section (main: 3 of 4,000). It
+  is now `..._without_the_settle_stays_clean_under_the_roots_cut`, a regression pin on the bound (the three seeds fail on the delegate's clock); the settle itself stays pinned by
+  its core test and by `locks_writer_hold_delegated_settles_before_the_head`.
+
+**Sweeps** (`+commit`, release binaries, base = main 6b4718e9). `delegated-holder-cut`, `delegated-crash`, `delegated-root-gone`, `delegated-backup-and-delegate-die`,
+`long-delegated`, `placement-hot` ×2,000 with `+cut` (`acked_at_or_below_cut`, I2c and `member_copies_drained` strict): identical failing sets on both sides (0, 94, 15, 0, 0, 43,
+the base's strict-I2c failures: 94/15/43 seeds are the same seeds), and `SWEEP-CUT-TOTALS` identical: 0 violations in 0 seeds, rows judged 3,665 / 26,453 / 42,554 / 35,729 /
+56,695 / 5,234. The 37 delegated and `locks-*` configurations ×1,000: every one identical (counts and seeds) except the three `locks-writer-hold-delegated*` ratchets, which
+move with the schedule inside the sampling spread and keep their one signature (`I1 acked_implies_committed`, the step 15 family): `locks-writer-hold-delegated` 47 -> 40,
+`-group` 23 -> 17, `-unsettled` 61 -> 68 (the negative control).
+
+**Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (645 / 643), authority lib (1,117), engine lib (953), net lib (128), store-s3 (238),
+cli (128), control (146), release authority sim suite 0 failed (424).
+

@@ -1248,6 +1248,13 @@ Operational rules:
   single crashed holder then blocks TTL failover until it returns or is
   retired with `constellation leave --node-id`, which also fences its
   leases.
+- A node that holds delegations leaves them first. A self-leave releases
+  the node's streams and waits until the root holds the release rows; the
+  admin form (`leave --node-id`) is run on the node that holds the root
+  lease, which recalls the retired node's streams and, if it does not answer,
+  ends them at the delegation TTL before the registry entry goes (another
+  node refuses a node the delegation table lists a stream for). A leave that
+  is not answered in time is run again.
 - Retiring a node gives up its unshipped journal: writes it acknowledged
   as holder or as an epoch's hold owner that never reached S3 (or the
   successor's backup tail) are lost, as they would be if its disk were

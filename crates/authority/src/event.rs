@@ -454,6 +454,16 @@ pub enum Control {
     /// holder returns, or the operator's abandon (plan 46 step 13) ends the
     /// stream; the CLI says so.
     Undelegate { dir: Ino },
+    /// Plan 46 M1.2 step 11 ("Leave ends grants first"): this node is
+    /// leaving the roster; release every stream it holds and answer (`Text`)
+    /// once the log has ended them.
+    ReleaseGrants,
+    /// Plan 46 M1.2 step 11: `node` is being retired by an operator; the
+    /// root recalls and ends every stream of it, by its release if it
+    /// answers, else at the expiry, and answers (`Text`) once the log has
+    /// ended them. A node that is not the root answers whether `node`
+    /// holds any.
+    EndGrantsOf { node: NodeId },
     /// Plan 30 §M11 phase 2b: the live write designations `(dir,
     /// designee)`; the root delegates the new ones (designated) and
     /// recalls the released ones. Answered `Done` at once.
@@ -818,9 +828,16 @@ pub enum PeerMsg {
         /// the previous tenure recorded may name a stream index the new
         /// root has not been re-streamed yet.
         stream_head: u64,
-        /// When the delegate sent this, on its clock: `stream_head` is
-        /// at least everything it executed before then. The root's lock
-        /// cut is as of the earliest of these (`Core::lock_cut_here`).
+        /// A moment, on the *root's* clock, that precedes this renewal's
+        /// send: when the root sent the latest answer
+        /// ([`PeerMsg::DelegRenewed::sent_at`]) the delegate had received
+        /// before it sent this (`i64::MIN`: none, or from another root).
+        /// `stream_head` is at least everything the delegate executed before
+        /// the send, so everything executed anywhere before this moment is
+        /// under it. The root's lock cut is as of the earliest of these
+        /// (`Core::lock_cut_here`). Never the delegate's own clock, which
+        /// can run ahead of the root's, and never the moment the root heard
+        /// the renewal, which follows the send.
         stream_head_at: i64,
         /// No renewal of `gen` has been granted to the delegate yet (it
         /// executes nothing until one is): a root that does not know
@@ -890,6 +907,12 @@ pub enum PeerMsg {
         /// restamp (`Core::lock_install_moved`); a grant not listed it
         /// restamps. A duration: no clock's absolute crosses nodes.
         lock_carry: Vec<(constellation_meta::locks::GrantId, u64)>,
+        /// Plan 46 M1.2 step 11: when the root sent this answer, on its
+        /// clock (unix ms; 0: not said). The delegate echoes the latest it
+        /// received in its next renewal (`DelegRenew::stream_head_at`): the
+        /// root's lock cut is as of the earliest of those, a moment the
+        /// root itself knows to precede the renewal's send.
+        sent_at: i64,
     },
     /// Plan 46 M1.2 step 10: the root asks the holder of stream `gen` to
     /// release the subtrees `dirs` (every one of the stream's: a recall of
