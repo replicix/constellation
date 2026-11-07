@@ -68747,8 +68747,14 @@ Three small changes on the lease and claim paths, one core test each (all fail o
   job slot for two more slow reads and kept ops from forwarding to a reachable holder: slow-read violations rose in `backup-two` 10 to 21,
   `delegated-group-switch` 27 to 100, `placement-hot` 6 to 18, `long-delegated` 32 to 61, `backup-crash` 7 to 12 (the C-only run reproduced them; the
   A- and O-only runs did not). Not done: carrying the verify read's body out of store-s3 with the conflict (the true fresh ETag) would save the second
-  read; it changes `CasFailure` and the driver. Test `an_op_whose_claim_lost_its_cas_to_a_registration_retries_at_once` (the retry timer 200 ms on
-  the parent, 100 ms now); counter `acquire_claims_lost_retried`.
+  read; it changes `CasFailure` and the driver. Only the first three claim losses in a row retry at the shortest backoff (`CLAIM_LOST_FAST_RETRIES`, reset by a won acquisition or a lease held
+  by another); a claimant that keeps losing falls back to the grown backoff. (Two failed to match the parent on `delegated-holder-cut` with the knob, seed 32;
+  three and four match it on the four configurations.) Tests `an_op_whose_claim_lost_its_cas_to_a_registration_retries_at_once` (the retry timer 200 ms on
+  the parent, 100 ms now) and `an_op_whose_claims_keep_losing_stops_retrying_at_the_shortest_backoff`; counter `acquire_claims_lost_retried`.
+  Review tests for A: `a_settle_on_the_lease_path_is_answered_by_the_gate_when_the_acquisition_ends` (`on_acquire_finished`) and
+  `a_settle_of_a_rid_that_took_effect_is_not_answered_by_the_gate_after_the_win` (the took-effect guard); each fails with its line disabled.
+  Re-sweep of `backup-crash`, `delegated-holder-cut`, `long-delegated`, `backup-two` (2,000 seeds, with and without the knob, plain and `+unsettled`):
+  failing seeds and violations equal to the numbers of the table below on every one.
 
 **Sweeps** (release, seeds 0..1,999, plain; violations of the I4 oracle, base main `126968b8` to this change; `K` is `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`):
 
@@ -68771,7 +68777,7 @@ Three small changes on the lease and claim paths, one core test each (all fail o
 
 By the oracle's verdict, summed over the 15 configurations (knob / no knob): the C verdict (`lease-path`) 64 to 44 / 1 to 1, the A verdict (`itself`) 76 to 53 /
 69 to 29, the O verdict (`root`) 324 to 248 / 35 to 35. The `+unsettled` failing sets (seeds): no knob, every configuration is a subset of main's except
-`long-delegated`, where seed 1127 is new (a `Delegate(3)` verdict; it passes with A off, a moved trajectory, not a new class: 2 seeds against 1); with the knob
+`long-delegated`, where seed 1127 is new (a `Delegate(3)` verdict; it passes with A off). Traced: `settled_by_gate` runs on the failing rid 16 times, each time `gate_settle` is `None` (no gate answers it), so A never acts on it; the schedule moved because A answered other ops earlier (a moved trajectory, not a new class: 2 seeds against 1); with the knob
 each configuration's set shrinks (`delegated-holder-cut` 62 to 39, `long-delegated-late-answers` 82 to 63, `long-delegated-backup` 42 to 28, `backup-strict` 28 to 22,
 `long-backup` 22 to 16) and a few seeds move in (for example `backup-crash` 205, `placement-hot` 1356). Allowed (isolated, none in time, tail) counts moved by at most
 a few: `backup-crash` 0 to 2, `backup-strict` 0 to 2 with the knob (violations that became "no sequencer in time"), `long-backup` 16 to 11. Seeds 0..99 without the knob

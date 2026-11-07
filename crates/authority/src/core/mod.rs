@@ -2177,6 +2177,10 @@ pub struct Core {
     /// for the lease is at that instant when it is sooner than the backoff
     /// (`schedule_acquire_retry`).
     acquire_retry_hint: Option<crate::ids::WaitMs>,
+    /// Plan 46 M1.3 step 3 (bucket C): claims lost in a row (reset by a
+    /// won acquisition or a lease held by another); only the first
+    /// `CLAIM_LOST_FAST_RETRIES` of them retry at the shortest backoff.
+    claims_lost_streak: u32,
     acked: client::AckTracker,
     replay: replay::ReplayState,
     /// Chunk metered-own-rows: an observed position's upload, repeated
@@ -2322,6 +2326,7 @@ impl Core {
             barriers: Vec::new(),
             acquire_waiters: Vec::new(),
             acquire_retry_hint: None,
+            claims_lost_streak: 0,
             acked: client::AckTracker::default(),
             replay: replay::ReplayState::default(),
             observed_upload: Default::default(),

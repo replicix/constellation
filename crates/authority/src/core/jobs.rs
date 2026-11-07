@@ -30,6 +30,10 @@ use constellation_types::Code;
 /// own, unreleased — and gives up on anything else.
 pub(crate) const READOPT_REASON: &str = "readopt-for-forward";
 
+/// Plan 46 M1.3 step 3 (bucket C): claims lost in a row whose waiting ops
+/// retry at the shortest backoff; later ones keep the grown backoff.
+const CLAIM_LOST_FAST_RETRIES: u32 = 3;
+
 /// How many whole sync rounds (each opening with a complete upload pass)
 /// a `Control::Barrier` may see end with its rows still unshipped before
 /// it fails. Its rows ship within one such round unless they cannot
@@ -3401,6 +3405,7 @@ impl Core {
                 // alone (a cold claimant must not poll S3 every 100 ms for
                 // a lease TTL).
                 self.acquire_retry_hint = retry_at;
+                self.claims_lost_streak = 0;
                 tracing::debug!(
                     node = self.cfg.node_id,
                     holder,
@@ -3780,6 +3785,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        self.claims_lost_streak = 0;
         let (prev, takeover, marker) = match plan {
             Plan::Claim {
                 prev,
@@ -5050,6 +5056,14 @@ impl Core {
                 ..
             })
         ) {
+            return;
+        }
+        // Bounded: the first losses in a row retry at once (the lease moved
+        // and its fresh read is what the ops need); a claimant that keeps
+        // losing falls back to the grown backoff instead of polling the
+        // lease object every `acquire_retry_min_ms` against a contender.
+        self.claims_lost_streak += 1;
+        if self.claims_lost_streak > CLAIM_LOST_FAST_RETRIES {
             return;
         }
         self.stats.acquire_claims_lost_retried += 1;

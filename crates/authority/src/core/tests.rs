@@ -13976,6 +13976,66 @@ fn an_op_whose_claim_lost_its_cas_to_a_registration_retries_at_once() {
     assert_eq!(h.core.stats.acquire_claims_lost_retried, 1);
 }
 
+/// Plan 46 M1.3 step 3 (bucket C), review: a claimant that keeps losing its
+/// claim CAS does not retry at the shortest backoff for ever: only the first
+/// losses in a row do, then the grown backoff applies.
+#[test]
+fn an_op_whose_claims_keep_losing_stops_retrying_at_the_shortest_backoff() {
+    let mut h = Harness::new(1);
+    h.core.cfg.takeover_promise_check = false;
+    let rid = h.rid(1);
+    let theirs = lease_of(3, 1, h.now.0 - 1);
+    let mut out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op: h.create("own"),
+        tag: Default::default(),
+    });
+    let mut delays = Vec::new();
+    for _ in 0..400 {
+        let retry = out.iter().find_map(|a| match a {
+            Action::SetTimer {
+                id,
+                kind: TimerKind::AcquireRetry,
+                after_ms,
+            } => Some((*id, *after_ms)),
+            _ => None,
+        });
+        if let Some((id, after)) = retry {
+            delays.push(after);
+            if delays.len() == 5 {
+                break;
+            }
+            out = h.step(Event::Timer { id });
+            continue;
+        }
+        let ops: Vec<_> = s3_ops(&out)
+            .into_iter()
+            .filter(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+            .collect();
+        let Some((op, req)) = ops.first().cloned() else {
+            panic!("stuck after {delays:?}: {out:?}");
+        };
+        let result = match req {
+            S3Op::LeaseGet => S3Result::LeaseGet(Ok(Some((theirs.clone(), tag())))),
+            S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+            S3Op::LeaseSwap { .. } => S3Result::LeasePut(Err(CasFailure::Conflict)),
+            _ => S3Result::SegmentGap(Ok(None)),
+        };
+        out = h.step(Event::S3 { op, result });
+    }
+    assert_eq!(delays.len(), 5, "{delays:?}");
+    let min = h.core.config().acquire_retry_min_ms;
+    // The first three losses retry at the shortest backoff; the later retries
+    // are not all at it (the grown backoff comes back).
+    assert_eq!(delays[2], min, "{delays:?}");
+    assert!(
+        delays[4] > min,
+        "persistent loss kept retrying at {min} ms: {delays:?}"
+    );
+    assert!(h.core.stats.acquire_claims_lost_retried <= 3);
+}
+
 /// Plan 43 C7b (row 28): a strict reader that learns the holder from the
 /// lease judges it live or run out by its own observation of the renewal key,
 /// never by the holder's wall expiry against its own clock. A body whose
@@ -55345,37 +55405,7 @@ mod c2g_settle {
     /// (the unsettled `EIO`).
     #[test]
     fn a_settle_waiting_for_the_lease_is_answered_by_the_gate_that_won_it() {
-        let mut h = Harness::new(1);
-        h.core.lease.cached_holder = Some(2);
-        let rid = h.rid(1);
-        h.step(Event::Submit {
-            policy: Policy::Client,
-            rid,
-            op: h.create("own"),
-            tag: Default::default(),
-        });
-        // The lease is won with the gate's journal work done.
-        h.hold(
-            2,
-            Some(PendingGate {
-                epoch: 2,
-                takeover: true,
-                marker_shipped: true,
-                drained: false,
-                fast_prev: false,
-                backup_tail_epoch: None,
-                shippable: true,
-            }),
-        );
-        h.core.ack.peers.clear();
-        h.core.ack.candidate = None;
-        h.core.ack.eligible = Some(false);
-        // The op's settle began earlier; it waits for its acquire retry.
-        let c = h.core.clients.get_mut(&rid).expect("in flight");
-        c.settle = true;
-        c.forwarded = true;
-        c.phase = client::Phase::AcquireRetry;
-        c.timer = None;
+        let (mut h, rid) = settle_waiting_in_a_won_gate(client::Phase::AcquireRetry);
         let mut out = Vec::new();
         h.core.on_acquire_retry(h.clk(), rid, &h.meta, &mut out);
         assert!(abandoned_row(&h, rid), "not settled by the gate: {out:?}");
@@ -55392,6 +55422,67 @@ mod c2g_settle {
             )),
             "{out:?}"
         );
+    }
+
+    /// The same settle, reached from an acquisition that ended unacquired
+    /// while it waited for the lease (`on_acquire_finished`).
+    #[test]
+    fn a_settle_on_the_lease_path_is_answered_by_the_gate_when_the_acquisition_ends() {
+        let (mut h, rid) = settle_waiting_in_a_won_gate(client::Phase::WaitingLease);
+        let mut out = Vec::new();
+        h.core
+            .on_acquire_finished(h.clk(), false, &h.meta, &mut out);
+        assert!(abandoned_row(&h, rid), "not settled by the gate: {out:?}");
+        assert_eq!(h.core.stats.gate_settles_after_win, 1);
+    }
+
+    /// A rid that took effect here is not answered by the gate (`Abandoned`
+    /// would deny a done op), and the helper does not recurse through the
+    /// lease path (a stack overflow in the sweep).
+    #[test]
+    fn a_settle_of_a_rid_that_took_effect_is_not_answered_by_the_gate_after_the_win() {
+        let (mut h, rid) = settle_waiting_in_a_won_gate(client::Phase::AcquireRetry);
+        let op = h.create("own");
+        constellation_meta::execute_mutate(&h.meta, &op, Some(rid)).unwrap();
+        let mut out = Vec::new();
+        h.core.on_acquire_retry(h.clk(), rid, &h.meta, &mut out);
+        assert!(!abandoned_row(&h, rid), "{out:?}");
+        assert_eq!(h.core.stats.gate_settles_after_win, 0);
+    }
+
+    /// A settle begun before this node won the lease, now in `phase`, with
+    /// the won gate's journal work done.
+    fn settle_waiting_in_a_won_gate(phase: client::Phase) -> (Harness, Rid) {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        let rid = h.rid(1);
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("own"),
+            tag: Default::default(),
+        });
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: None,
+                shippable: true,
+            }),
+        );
+        h.core.ack.peers.clear();
+        h.core.ack.candidate = None;
+        h.core.ack.eligible = Some(false);
+        let c = h.core.clients.get_mut(&rid).expect("in flight");
+        c.settle = true;
+        c.forwarded = true;
+        c.phase = phase;
+        c.timer = None;
+        (h, rid)
     }
 
     /// A settle in the acquire backoff whose holder is silent (its link down
