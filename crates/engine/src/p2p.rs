@@ -633,16 +633,26 @@ impl constellation_net::PeerService for P2pBridge {
         txs: Vec<u8>,
         leaving: Vec<u8>,
         leaving_barriers: Vec<u8>,
+        released: Vec<u8>,
     ) {
         if crate::fault::p2p_denied(from) {
             return;
         }
-        let (Ok(txs), Ok(leaving), Ok(leaving_barriers)) = (
+        let released = if released.is_empty() {
+            Ok(None)
+        } else {
+            constellation_meta::from_bytes_exact::<constellation_meta::locks::ReleaseNote>(
+                &released,
+            )
+            .map(Some)
+        };
+        let (Ok(txs), Ok(leaving), Ok(leaving_barriers), Ok(released)) = (
             constellation_meta::from_bytes_exact::<Vec<constellation_meta::DelegateTx>>(&txs),
             constellation_meta::from_bytes_exact::<Vec<constellation_meta::locks::GrantWire>>(
                 &leaving,
             ),
             constellation_meta::from_bytes_exact::<Vec<(u64, i64)>>(&leaving_barriers),
+            released,
         ) else {
             tracing::warn!(
                 from,
@@ -659,6 +669,7 @@ impl constellation_net::PeerService for P2pBridge {
             txs,
             leaving,
             leaving_barriers,
+            released,
         });
     }
 
@@ -781,40 +792,20 @@ impl constellation_net::PeerService for P2pBridge {
         });
     }
 
-    fn deleg_recall_requested(
-        &self,
-        root: u64,
-        req_id: u64,
-        dir: u64,
-        gen: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            let (through, locks) = if self
-                .nudge
-                .send(sync::SyncRequest::PeerDelegRecall {
-                    root,
-                    dir,
-                    gen,
-                    reply,
-                })
-                .is_ok()
-            {
-                receive.await.unwrap_or_default()
-            } else {
-                Default::default()
-            };
-            constellation_net::Payload::DelegRecalled {
-                req_id,
-                gen,
-                through,
-                locks: crate::locks::grants_wire(&locks.grants),
-                lock_floor: crate::locks::floor_wire(&locks.floor),
-                lock_barrier: locks.barrier,
-                lock_carry: crate::locks::carry_wire(&locks.carry),
-            }
-        })
+    fn release_requested(&self, root: u64, req_id: u64, gen: u64, dirs: Vec<u8>) {
+        if crate::fault::p2p_denied(root) {
+            return;
+        }
+        let Ok(dirs) = constellation_meta::from_bytes_exact::<Vec<u64>>(&dirs) else {
+            tracing::warn!(root, "dropping a release request that does not decode");
+            return;
+        };
+        let _ = self.nudge.send(sync::SyncRequest::PeerReleaseRequest {
+            root,
+            req_id,
+            gen,
+            dirs,
+        });
     }
 
     fn chunk_handoff_requested(

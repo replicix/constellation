@@ -293,6 +293,7 @@ pub enum SyncRequest {
         txs: Vec<constellation_meta::DelegateTx>,
         leaving: Vec<constellation_meta::locks::GrantWire>,
         leaving_barriers: Vec<(Ino, i64)>,
+        released: Option<constellation_meta::locks::ReleaseNote>,
     },
     /// Plan 30 §M11, one way: the root's acknowledgement of this
     /// delegate's stream.
@@ -414,14 +415,13 @@ pub enum SyncRequest {
         lock_barrier: i64,
         lock_carry: Vec<(constellation_meta::locks::GrantId, u64)>,
     },
-    /// Plan 30 §M11: the root recalls a generation this node holds;
-    /// answered with the highest stream index executed here (and, §M14,
-    /// the lock grants handed back).
-    PeerDelegRecall {
+    /// Plan 46 M1.2 step 10: the root asks this node to release subtrees of
+    /// a stream it holds; the delegate answers in its stream.
+    PeerReleaseRequest {
         root: u64,
-        dir: Ino,
+        req_id: u64,
         gen: u64,
-        reply: tokio::sync::oneshot::Sender<(u64, constellation_meta::locks::LockHandback)>,
+        dirs: Vec<Ino>,
     },
     /// Plan 30 §M11 phase 2b: a delegate's append to this backup;
     /// answered `(acked, sealed)`.

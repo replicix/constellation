@@ -183,16 +183,9 @@ pub(crate) enum ParkedWhat {
     /// Plan 30 §M11: a local op of this root, executed (and finished)
     /// once the recall is done and its `deps` are here.
     ExecuteLocal { rid: Rid },
-    /// Phase 2b: a delegate's answer to the root's recall, sent once the
-    /// read delegations it granted are recalled.
-    DelegRecalled {
-        to: NodeId,
-        req: OpId,
-        gen: u64,
-        through: u64,
-        /// Plan 30 §M14: the lock grants (and floor) handed back with it.
-        locks: constellation_meta::locks::LockHandback,
-    },
+    /// Phase 2b: a delegate's release of subtrees (plan 46 M1.2 step 10)
+    /// streams once the read delegations it granted under them are recalled.
+    ReleaseHeld { gen: u64 },
 }
 
 impl ParkedWhat {
@@ -1365,24 +1358,10 @@ impl Core {
                     }
                     self.retry_or_lease(now, rid, replica, out);
                 }
-                ParkedWhat::DelegRecalled {
-                    to,
-                    req,
-                    gen,
-                    through,
-                    locks,
-                } => {
-                    // Answered as it stands: the root outwaits the read
+                ParkedWhat::ReleaseHeld { gen } => {
+                    // Released as it stands: the root outwaits the read
                     // grants by its horizon anyway.
-                    out.push(Action::Send {
-                        to,
-                        msg: PeerMsg::DelegRecalled {
-                            req,
-                            gen,
-                            through,
-                            locks,
-                        },
-                    });
+                    self.deleg_release_unheld(now, gen, replica, out);
                 }
             }
         }
@@ -2301,22 +2280,10 @@ impl Core {
                         out,
                     );
                 }
-                ParkedWhat::DelegRecalled {
-                    to,
-                    req,
-                    gen,
-                    through,
-                    locks,
-                } => {
-                    out.push(Action::Send {
-                        to,
-                        msg: PeerMsg::DelegRecalled {
-                            req,
-                            gen,
-                            through,
-                            locks,
-                        },
-                    });
+                ParkedWhat::ReleaseHeld { gen } => {
+                    // Released as it stands: the root outwaits the read
+                    // grants by its horizon anyway.
+                    self.deleg_release_unheld(now, gen, replica, out);
                 }
                 ParkedWhat::ExecuteLocal { rid } => {
                     self.dl.pending_exec.remove(&rid);

@@ -68594,3 +68594,51 @@ set grew, none is new): `delegated-epoch` 7, `flex` 7, `flex-crash` 7, `flex-tig
 `flex-crash +durability` 274 before and after, the same set. **Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta (lib,
 integration), engine lib, control, release authority sim suite 0 failed. The authority lib has one failure in both profiles, also on main without step 4:
 `step9_one_stream_per_node::a_grown_subtree_parks_until_its_record_is_committed_and_the_root_has_answered` (`d.dirs.len()` 1, expected 2) — a step 9 test.
+
+### Plan 46 M1.2 step 10: recall as a request
+
+`PeerMsg::ReleaseRequest { req, gen, dirs }` (one way; `Payload::ReleaseRequest`) replaces `DelegRecall`; `DelegRecalled` is gone. The delegate
+(`Core::on_release_request`) stops executing under the subtrees, hands their lock grants back, and journals `SubtreeReleased { dir, at }` per subtree (or one
+`StreamReleased` when its set empties) as the next row of its own stream (`Meta::delegate_release`, `at` the stream's index then). The row is behind everything
+executed under the subtrees, so the root, which appends a stream in order, has appended through `at` when the row is in its log, and only then sequences them (its
+table forgets the subtrees with the row; `root_release_appended` wakes the ops that waited). A partial release does not end the stream (C11 MUST-1): the
+stream's window, renewals and other subtrees go on; a release of every subtree (`start_recall`: the placement, `undelegate`, an epoch, ADR-44's on-demand gate
+recall) drains to the `StreamReleased` row (`RecallPhase::Drained(cursor)`) and ends the generation as before. `deleg_recall_plan` asks only the subtrees an op
+touches (`request_release`; a request for all of a stream's is a recall); the redelegation after a cross-subtree op grants the released subtrees again
+(`GenState::redelegate_dirs`, growing the live stream). The L3 resend applies to the request (`ReleaseResend`); a request for some subtrees only that a
+request's timeout got no row for becomes a recall of the whole stream, so the grant's expiry bounds the wait as before. Locks are handed back per subtree
+(`lock_hand_back(dirs, whole)`, floors and barriers of the released dirs only): the grants ride every batch of the stream as `DelegateStream.released:
+ReleaseNote { dirs, end_at, locks }`, each send re-measuring what is left of their records, until the root's acknowledgement covers the row; the root installs
+them before it appends the batch's rows (`lock_install_returned(dirs)`, each grant once). A stream that cannot journal a row (one of its rows depends on a lost
+row, it is past what its own holder tenure committed, it never installed the grant) answers with the cut instead (`end_at`), straight to the asker. A batch in
+flight when the request arrives is taken as given up, so the row is not behind a late acknowledgement. A subtree the root names that the delegate has not
+learned yet (the record that grew the stream is in a segment not applied) is released when the record is applied (`release_pending`): a release journaled before
+it was undone by it, and the delegate held what the log had given back (the sweeps' "did not converge" in `locks-released-delegated`). Step 9's never-mix rule is
+untouched (a designated stream is refused by `deleg_recall_plan` and skipped by the placement). Engine: `DelegateView::stop_dirs` (the fast path admits nothing
+more under the subtrees; the rest of the stream stays admitted), `SyncRequest::PeerReleaseRequest`, `Payload::DelegateStream.released`. Deleted: `DelegRecall`,
+`DelegRecalled`, `on_deleg_recall`, `on_deleg_recalled`, `DelegationState::recall_grants`, `GenState::redelegate`.
+
+**Tests** (core, `step9_one_stream_per_node`; fail on the step 9 base, where the equivalent forms fail: the recall for an op ends the whole stream and `d2` comes back
+under a new generation, and the recall hands back both subtrees' grants): a release request leaves the other subtree of the stream live; an op in a released
+subtree runs only after the append through `at` (the row past a gap appends nothing); locks of the released subtree only are handed back; a release of every
+subtree is a `StreamReleased`; a lost request is sent again (L3) and becomes a recall; a subtree not learned yet is released when its record is applied. The
+tests that answered a recall with `DelegRecalled` answer with the delegate's row and note (`release_answer`, `release_note_only`, `release_cut_to`). Sim: the
+suite's seed-pinned witnesses moved with the schedule and were re-pinned from sweeps (`locks-writer-hold-delegated-unsettled` 635, 3358, 3403;
+`long-delegated-lead-off` 1, 3; the late-recall-answer guard 5, 24, 26 (a late answer's grants are counted at the refused batch); L3's lost request seed 18).
+
+**Sweeps** (`+commit`, 2,000 seeds, base = step 9, release binaries; the five named configs and 27 `locks-*delegated*` / designated configs): `placement-hot`,
+`delegated-group-switch`, `delegated-partition`, `delegated-two-dirs-one-backed`, `long-delegated`, `delegated-designated` and the 20 other `locks-*` configurations
+that were clean on the base are clean (0 failing, oracle totals unchanged). The configurations that fail on the base fail on the same signatures (the `class
+claim ... archive_waits` of the root's own answers in `locks-blips-tight-delegated` 3 -> 5, `locks-unlinked-delegated-blips` 3 -> 4, `-partition` 3 -> 3; the
+`locks-writer-hold-delegated*` ratchets 86/37/136 -> 94/37/136, `-doubt` 138 -> 0, `-backup` 2 -> 0; `locks-delegated-partition-skew` 16 -> 14): the seeds differ
+(the schedule moved), the counts are within the sampling spread of rates of 0.2 % to 5 %; `locks-stall-step-delegated-ahead` 0 -> 1 (seed 1686, a stale read under
+a lock) is a latent failure of the base too (2 of seeds 2,000..5,999 on each side). I4 ceilings are not widened.
+
+**Latency** (the root's time from a release request to its row, `SWEEP-L3` over 2,000 seeds; ms): `placement-hot` mean 61 -> 58, max 2,827 -> 2,828;
+`delegated-two-dirs-one-backed` (partial releases now, timed too) mean 2,592 -> 1,823, max 8,834 -> 12,449 (the tail is the crashed delegate's: an unanswered
+partial request becomes a recall after a request's timeout, and the window then runs out); `long-delegated` mean 253 -> 309, max 8,368 -> 9,089;
+`delegated-partition` mean 2,927 -> 2,927; `locks-delegated` 111 -> 115; `locks-unlinked-delegated` 134 -> 137; `locks-released-delegated` 189 -> 166.
+No steady-path change: the release is off it. The harness scenario `delegate-backup-handoff-failover` was not run (it needs the docker/floci/fuse harness).
+
+**Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta, authority lib (1,103), engine lib (953), net lib (128), control (146),
+release authority sim suite 0 failed.

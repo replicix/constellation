@@ -1425,6 +1425,22 @@ impl Meta {
         self.note_log_idx(gen, idx)
     }
 
+    /// Plan 46 M1.2 step 10: the delegate of `gen` journals `records` (a
+    /// `SubtreeReleased` per released subtree, or one `StreamReleased`) as
+    /// the next transaction of its stream, with no rid and no op: the root
+    /// appends it like any other row, and the table of every replica that
+    /// applies it forgets the subtrees. Returns the stream index.
+    pub fn delegate_release(
+        &self,
+        records: &[LogRecord],
+        gen: u64,
+        deps: crate::session::Position,
+    ) -> Result<u64, MetaError> {
+        let _d = journal::PendingDelegate::set(gen, None, deps);
+        self.apply_records_journaled_inner(records, None, Journaled::Plain)?;
+        self.delegate_idx(gen)
+    }
+
     /// Plan 30 §M11: a delegate's refusal of `rid` (plan 30 §M9's
     /// journaled `Refused` row), as the next transaction of stream
     /// `gen` — the root appends it like any other, so a retry by rid

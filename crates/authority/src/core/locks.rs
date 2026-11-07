@@ -6728,42 +6728,33 @@ impl Core {
         }
     }
 
-    /// Delegate: the generation is recalled — its grants and its
-    /// subtree's floor go back with the answer.
+    /// Delegate: the subtrees `dirs` of generation `gen` are released (all
+    /// of them when `whole`: the stream is recalled) — their grants and
+    /// their floor go back with the release note.
     ///
     /// Every grant goes back with what is left of its record
     /// (`LockHandback::carry`, measured here, in the step that takes it out
-    /// of the table and stops the generation: nothing here renews or
-    /// reclaims it after); the root records it from the receipt
-    /// (`Core::carried_until`). The grants that left the subtree are
-    /// restamped by the root.
+    /// of the table: nothing here renews or reclaims it after); the root
+    /// records it from the receipt (`Core::carried_until`). The grants that
+    /// left the subtree are restamped by the root. The note is kept until the
+    /// root has acknowledged the release row and rides every batch until
+    /// then, so a repeated request or a resent batch hands the same grants
+    /// back again.
     pub(crate) fn lock_hand_back(
         &mut self,
         now: Now,
         gen: u64,
+        dirs: &[Ino],
+        whole: bool,
         replica: &dyn Replica,
     ) -> constellation_meta::locks::LockHandback {
-        // Honoured and parked subtrees alike: the floor of a parked one
-        // is the root's to keep, and joining it costs nothing.
-        let dirs = self.dl.mine.get(&gen).map(|d| {
-            d.dirs
-                .iter()
-                .chain(d.grown.keys())
-                .copied()
-                .collect::<Vec<_>>()
-        });
-        // What a first recall took out of the table a repeated one hands back
-        // again (L3: the root sends a recall again when its answer is lost;
-        // it would otherwise end the generation by drain with no grants,
-        // and could grant a conflicting lock).
-        let mut grants = self.lock_take_generation(gen, replica);
-        let handed = self.dl.recall_grants.entry(gen).or_default();
-        for g in grants.drain(..) {
-            if !handed.iter().any(|h| h.id == g.id) {
-                handed.push(g);
-            }
-        }
-        let grants = handed.clone();
+        let grants = if whole {
+            self.lock_take_generation(gen, replica)
+        } else {
+            replica
+                .locks()
+                .take_where_outside(|ino| dirs.iter().any(|dir| replica.is_under(ino, *dir)))
+        };
         // What is left of each record is a duration on this node's wait
         // clock (plan 43 C7-H1): the wire carries no absolute.
         let carry: Vec<(GrantId, u64)> = grants
@@ -6771,19 +6762,15 @@ impl Core {
             .map(|g| (g.id, Self::lock_left(now.wait, g)))
             .collect();
         let grants = grants.iter().map(|g| g.to_wire(now)).collect();
-        let (floor, barrier) = match dirs {
-            Some(dirs) => {
-                let mut floor = Position::ZERO;
-                let mut barrier = 0;
-                for dir in dirs {
-                    let f = self.lock_subtree_floor(dir, |ino| replica.is_under(ino, dir), replica);
-                    floor = constellation_meta::locks::floor_join(&floor, &f);
-                    barrier = barrier.max(self.lock_barrier_under(dir, replica));
-                }
-                (floor, barrier)
-            }
-            None => (Position::ZERO, 0),
-        };
+        // Honoured and parked subtrees alike: the floor of a parked one
+        // is the root's to keep, and joining it costs nothing.
+        let mut floor = Position::ZERO;
+        let mut barrier = 0;
+        for dir in dirs {
+            let f = self.lock_subtree_floor(*dir, |ino| replica.is_under(ino, *dir), replica);
+            floor = constellation_meta::locks::floor_join(&floor, &f);
+            barrier = barrier.max(self.lock_barrier_under(*dir, replica));
+        }
         constellation_meta::locks::LockHandback {
             grants,
             carry,
@@ -6884,6 +6871,7 @@ impl Core {
         now: Now,
         gen: u64,
         back: constellation_meta::locks::LockHandback,
+        dirs: &[Ino],
         replica: &dyn Replica,
     ) {
         let constellation_meta::locks::LockHandback {
@@ -6901,9 +6889,9 @@ impl Core {
                 let outwaited = g.ended
                     || now.wait >= self.gen_until(gen)
                     || g.recall == super::delegate::RecallPhase::Sealing;
-                for dir in g.dir_list() {
-                    self.lock_note_dir_floor(dir, &floor);
-                    self.lock_dir_barrier(dir, barrier);
+                for dir in dirs {
+                    self.lock_note_dir_floor(*dir, &floor);
+                    self.lock_dir_barrier(*dir, barrier);
                 }
                 !outwaited
             }

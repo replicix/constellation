@@ -1181,6 +1181,7 @@ pub trait PeerService: Send + Sync + 'static {
         _txs: Vec<u8>,
         _leaving: Vec<u8>,
         _leaving_barriers: Vec<u8>,
+        _released: Vec<u8>,
     ) {
     }
     /// Plan 30 §M11, one way: the root's acknowledgement of a delegate's
@@ -1308,26 +1309,10 @@ pub trait PeerService: Send + Sync + 'static {
         _lock_carry: Vec<u8>,
     ) {
     }
-    /// Plan 30 §M11: the root's recall. Default: nothing executed.
-    fn deleg_recall_requested(
-        &self,
-        _root: u64,
-        req_id: u64,
-        _dir: u64,
-        gen: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
-        Box::pin(async move {
-            Payload::DelegRecalled {
-                req_id,
-                gen,
-                through: 0,
-                locks: Vec::new(),
-                lock_floor: Vec::new(),
-                lock_barrier: 0,
-                lock_carry: Vec::new(),
-            }
-        })
-    }
+    /// Plan 46 M1.2 step 10, one way: the root asks this node to release
+    /// subtrees of stream `gen` (`dirs`: postcard of `Vec<u64>`). Default:
+    /// ignored.
+    fn release_requested(&self, _root: u64, _req_id: u64, _gen: u64, _dirs: Vec<u8>) {}
     /// Plan 30 §M8: a strict reader's ReadIndex. Default: not the holder.
     #[allow(clippy::too_many_arguments)]
     fn read_index_requested(

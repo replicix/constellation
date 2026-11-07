@@ -345,6 +345,92 @@ fn sends(actions: &[Action]) -> Vec<(NodeId, &PeerMsg)> {
         .collect()
 }
 
+/// Plan 46 M1.2 step 10: the release a delegate sent to `to`: the note its
+/// stream batch carries.
+fn release_note_to(out: &[Action], to: NodeId) -> Option<constellation_meta::locks::ReleaseNote> {
+    sends(out).into_iter().find_map(|(n, m)| match m {
+        PeerMsg::DelegateStream {
+            released: Some(r), ..
+        } if n == to => Some(r.clone()),
+        _ => None,
+    })
+}
+
+/// The cut a delegate that could not journal a release row ended its
+/// stream at.
+fn release_cut_to(out: &[Action], to: NodeId) -> Option<u64> {
+    release_note_to(out, to).and_then(|n| n.end_at)
+}
+
+/// The batch of the stream `gen` (of `node`) a root receives: `txs` and the
+/// delegate's release note.
+fn deliver_stream(
+    h: &mut Harness,
+    node: NodeId,
+    gen: u64,
+    txs: Vec<constellation_meta::DelegateTx>,
+    released: Option<constellation_meta::locks::ReleaseNote>,
+) -> Vec<Action> {
+    h.step(Event::Peer {
+        from: node,
+        msg: PeerMsg::DelegateStream {
+            req: OpId(7_000_000 + txs.last().map_or(0, |t| t.idx)),
+            gen,
+            round: 0,
+            txs,
+            leaving: Vec::new(),
+            leaving_barriers: Vec::new(),
+            released,
+        },
+    })
+}
+
+/// The delegate `node`'s answer to the root's recall of its stream `gen`
+/// (a release of every subtree): its `StreamReleased` as the stream's next
+/// row, with the lock grants it hands back.
+fn release_answer(
+    h: &mut Harness,
+    node: NodeId,
+    gen: u64,
+    locks: constellation_meta::locks::LockHandback,
+) -> Vec<Action> {
+    let g = &h.core.dl.gens[&gen];
+    let (cursor, dirs) = (g.cursor, g.dirs.keys().copied().collect::<Vec<_>>());
+    let row = constellation_meta::DelegateTx {
+        idx: cursor + 1,
+        rid: None,
+        records: vec![LogRecord::StreamReleased {
+            node,
+            gen,
+            through: cursor,
+        }],
+        deps: constellation_meta::Position::ZERO,
+    };
+    let note = constellation_meta::locks::ReleaseNote {
+        dirs,
+        end_at: None,
+        locks,
+    };
+    deliver_stream(h, node, gen, vec![row], Some(note))
+}
+
+/// A release note without its row (the batch that carries the row has not
+/// arrived): the lock grants only.
+fn release_note_only(
+    h: &mut Harness,
+    node: NodeId,
+    gen: u64,
+    locks: constellation_meta::locks::LockHandback,
+) -> Vec<Action> {
+    let dirs = h.core.dl.gens[&gen].dirs.keys().copied().collect();
+    let note = constellation_meta::locks::ReleaseNote {
+        dirs,
+        end_at: None,
+        locks,
+    };
+    deliver_stream(h, node, gen, Vec::new(), Some(note))
+}
+
 fn s3_ops(actions: &[Action]) -> Vec<(OpId, &S3Op)> {
     actions
         .iter()
@@ -3060,22 +3146,13 @@ fn the_root_forgets_ended_generations() {
             op: OpId(1_001 + 2 * i),
             req: Control::Undelegate { dir },
         });
-        let req = sends(&out)
-            .into_iter()
-            .find_map(|(to, m)| match m {
-                PeerMsg::DelegRecall { req, gen: g, .. } if to == 3 && *g == gen => Some(*req),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("cycle {i}: no recall of {gen}: {out:?}"));
-        h.step(Event::Peer {
-            from: 3,
-            msg: PeerMsg::DelegRecalled {
-                req,
-                gen,
-                through: 0,
-                locks: Default::default(),
-            },
-        });
+        assert!(
+            sends(&out).into_iter().any(
+                |(to, m)| matches!(m, PeerMsg::ReleaseRequest { gen: g, .. } if to == 3 && *g == gen)
+            ),
+            "cycle {i}: no recall of {gen}: {out:?}"
+        );
+        release_answer(&mut h, 3, gen, Default::default());
         assert!(
             h.meta.delegation_table().is_empty(),
             "cycle {i}: {gen} live"
@@ -16081,17 +16158,17 @@ mod locks {
         assert!(h.core.dl.mine[&7].stopped, "re-adopted live");
         let out = h.step(Event::Peer {
             from: 1,
-            msg: PeerMsg::DelegRecall {
+            msg: PeerMsg::ReleaseRequest {
                 req: OpId(5),
-                dir,
                 gen: 7,
+                dirs: vec![dir],
             },
         });
         let want = h.meta.log_stream_idx(7).unwrap();
-        assert!(
-            sends(&out).iter().any(|(to, m)| *to == 1
-                && matches!(m, PeerMsg::DelegRecalled { gen: 7, through, .. } if *through == want)),
-            "no recall answer at the log's index {want}: {out:?}"
+        assert_eq!(
+            release_cut_to(&out, 1),
+            Some(want),
+            "no release at the log's index {want}: {out:?}"
         );
     }
 
@@ -16361,24 +16438,13 @@ mod locks {
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         let out = h.step(Event::Peer {
             from: 1,
-            msg: PeerMsg::DelegRecall {
+            msg: PeerMsg::ReleaseRequest {
                 req: OpId(5),
-                dir,
                 gen: 7,
+                dirs: vec![dir],
             },
         });
-        assert!(
-            sends(&out).iter().any(|(to, m)| *to == 1
-                && matches!(
-                    m,
-                    PeerMsg::DelegRecalled {
-                        gen: 7,
-                        through: 0,
-                        ..
-                    }
-                )),
-            "{out:?}"
-        );
+        assert_eq!(release_cut_to(&out, 1), Some(0), "{out:?}");
     }
 
     /// The gate on the same delegate with a tail that ends the generation
@@ -17162,6 +17228,7 @@ mod locks {
                     }],
                     leaving,
                     leaving_barriers: Vec::new(),
+                    released: None,
                 },
             });
             assert!(
@@ -17555,6 +17622,7 @@ mod locks {
                 }],
                 leaving: Vec::new(),
                 leaving_barriers: Vec::new(),
+                released: None,
             },
         });
         h.core.lock_on_generation_outwaited(h.clk(), dir);
@@ -17694,10 +17762,10 @@ mod locks {
             op: OpId(1 << 50),
             req: Control::Undelegate { dir },
         });
-        let recall = sends(&out)
+        let _recall = sends(&out)
             .into_iter()
             .find_map(|(to, m)| match m {
-                PeerMsg::DelegRecall { req, gen: 7, .. } if to == 3 => Some(*req),
+                PeerMsg::ReleaseRequest { req, gen: 7, .. } if to == 3 => Some(*req),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no recall sent: {out:?}"));
@@ -17722,25 +17790,24 @@ mod locks {
             settled: false,
             lapsed: false,
         };
-        h.step(Event::Peer {
-            from: 3,
-            msg: PeerMsg::DelegRecalled {
-                req: recall,
-                gen: 7,
-                through: 0,
-                locks: constellation_meta::locks::LockHandback {
-                    carry: Vec::new(),
-                    grants: vec![lapsed],
-                    floor: Position::ZERO,
-                    barrier: 0,
-                },
+        release_answer(
+            &mut h,
+            3,
+            7,
+            constellation_meta::locks::LockHandback {
+                carry: Vec::new(),
+                grants: vec![lapsed],
+                floor: Position::ZERO,
+                barrier: 0,
             },
-        });
+        );
         assert!(
             h.meta.locks().grants_snapshot().is_empty(),
             "a lapsed grant revived: {:?}",
             h.meta.locks().grants_snapshot()
         );
+        // (A batch of an ended generation is refused: its grants are counted,
+        // none is installed.)
         assert_eq!(h.core.stats.lock_returned_after_end, 1);
         // Another node is granted at once, and node 4 is not granted
         // over it on the strength of its old record.
@@ -17777,10 +17844,10 @@ mod locks {
             op: OpId(1 << 50),
             req: Control::Undelegate { dir },
         });
-        let recall = sends(&out)
+        let _recall = sends(&out)
             .into_iter()
             .find_map(|(to, m)| match m {
-                PeerMsg::DelegRecall { req, gen: 7, .. } if to == 3 => Some(*req),
+                PeerMsg::ReleaseRequest { req, gen: 7, .. } if to == 3 => Some(*req),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no recall sent: {out:?}"));
@@ -17799,20 +17866,17 @@ mod locks {
             settled: false,
             lapsed: false,
         };
-        h.step(Event::Peer {
-            from: 3,
-            msg: PeerMsg::DelegRecalled {
-                req: recall,
-                gen: 7,
-                through: 0,
-                locks: constellation_meta::locks::LockHandback {
-                    carry: Vec::new(),
-                    grants: vec![live],
-                    floor: Position::ZERO,
-                    barrier: 0,
-                },
+        release_answer(
+            &mut h,
+            3,
+            7,
+            constellation_meta::locks::LockHandback {
+                carry: Vec::new(),
+                grants: vec![live],
+                floor: Position::ZERO,
+                barrier: 0,
             },
-        });
+        );
         assert!(
             h.meta.locks().grants_snapshot().is_empty(),
             "a grant installed while sealing: {:?}",
@@ -17841,7 +17905,7 @@ mod locks {
         let recall = sends(&out)
             .into_iter()
             .find_map(|(to, m)| match m {
-                PeerMsg::DelegRecall { req, gen: 7, .. } if to == 3 => Some(*req),
+                PeerMsg::ReleaseRequest { req, gen: 7, .. } if to == 3 => Some(*req),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no recall sent: {out:?}"));
@@ -17881,7 +17945,7 @@ mod locks {
     /// ships, and then the lease goes.
     #[test]
     fn a_release_waits_for_a_recall_in_flight_and_journals_its_cut() {
-        let (mut h, recall, flush, f, d) = release_during_recall();
+        let (mut h, _recall, flush, f, d) = release_during_recall();
         assert!(!d.released, "released with a recall in flight");
         assert!(d.done.is_empty(), "the flush answered: {:?}", d.done);
         assert!(
@@ -17902,22 +17966,19 @@ mod locks {
             settled: false,
             lapsed: false,
         };
-        let out = h.step(Event::Peer {
-            from: 3,
-            msg: PeerMsg::DelegRecalled {
-                req: recall,
-                gen: 7,
-                through: 0,
-                locks: constellation_meta::locks::LockHandback {
-                    carry: Vec::new(),
-                    grants: vec![grant],
-                    floor: Position::ZERO,
-                    barrier: 0,
-                },
+        let out = release_answer(
+            &mut h,
+            3,
+            7,
+            constellation_meta::locks::LockHandback {
+                carry: Vec::new(),
+                grants: vec![grant],
+                floor: Position::ZERO,
+                barrier: 0,
             },
-        });
+        );
         assert!(h.core.dl.gens[&7].ended, "not ended: {out:?}");
-        assert_eq!(cuts_of_7(&h), vec![0], "the cut was not journaled");
+        assert_eq!(cuts_of_7(&h), vec![1], "the cut was not journaled");
         assert!(
             h.meta
                 .locks()
@@ -21562,6 +21623,7 @@ mod locks {
                 }],
                 leaving: Vec::new(),
                 leaving_barriers: vec![(f, at)],
+                released: None,
             },
         });
         let out = request(&mut r, 4, 9, f, X, false);
@@ -24450,10 +24512,10 @@ mod locks {
             }
             h.step(Event::Peer {
                 from: 1,
-                msg: PeerMsg::DelegRecall {
+                msg: PeerMsg::ReleaseRequest {
                     req: OpId(5),
-                    dir,
                     gen: 7,
+                    dirs: vec![dir],
                 },
             });
             assert_eq!(
@@ -31575,7 +31637,7 @@ mod locks {
         let recall = sends(&out)
             .into_iter()
             .find_map(|(to, m)| match m {
-                PeerMsg::DelegRecall { req, gen: 7, .. } if to == 3 => Some(*req),
+                PeerMsg::ReleaseRequest { req, gen: 7, .. } if to == 3 => Some(*req),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no recall sent: {out:?}"));
@@ -31611,32 +31673,24 @@ mod locks {
     ) -> constellation_meta::locks::LockHandback {
         let out = d.step(Event::Peer {
             from: 1,
-            msg: PeerMsg::DelegRecall { req, dir, gen: 7 },
+            msg: PeerMsg::ReleaseRequest {
+                req,
+                gen: 7,
+                dirs: vec![dir],
+            },
         });
-        sends(&out)
-            .into_iter()
-            .find_map(|(to, m)| match m {
-                PeerMsg::DelegRecalled { locks, .. } if to == 1 => Some(locks.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("no recall answer: {out:?}"))
+        release_note_to(&out, 1)
+            .map(|n| n.locks)
+            .unwrap_or_else(|| panic!("no release note: {out:?}"))
     }
 
     /// The delegate's answer to a recall, as the root receives it.
     fn recalled(
         r: &mut Harness,
-        recall: OpId,
+        _recall: OpId,
         locks: constellation_meta::locks::LockHandback,
     ) -> Vec<Action> {
-        r.step(Event::Peer {
-            from: 3,
-            msg: PeerMsg::DelegRecalled {
-                req: recall,
-                gen: 7,
-                through: 0,
-                locks,
-            },
-        })
+        release_answer(r, 3, 7, locks)
     }
 
     /// The root's granting renewal answer carrying `locks`, as the
@@ -31806,20 +31860,10 @@ mod locks {
         d.advance(1_000);
         let back = recall_answer(&mut d, dir, OpId(5));
         assert_eq!(back.grants.len(), 1, "{back:?}");
-        let (mut r, _, _, recall) = recalling_root(5_000);
+        let (mut r, _, _, _recall) = recalling_root(5_000);
         r.now = d.now;
         // The answer drains the delegate, but its stream is not here yet.
-        let answer = |r: &mut Harness| {
-            r.step(Event::Peer {
-                from: 3,
-                msg: PeerMsg::DelegRecalled {
-                    req: recall,
-                    gen: 7,
-                    through: 1_000_000,
-                    locks: back.clone(),
-                },
-            })
-        };
+        let answer = |r: &mut Harness| release_note_only(r, 3, 7, back.clone());
         answer(&mut r);
         let first = record_end(&r, g);
         assert_eq!(r.core.stats.lock_moved, 1);
@@ -31874,16 +31918,13 @@ mod locks {
         // nothing), then the answer to the registered one: moves nothing.
         let (mut r, _, _, recall) = recalling_root(5_000);
         r.now = d.now;
-        let other_try = OpId(recall.0 + 1);
-        recalled(&mut r, other_try, second.clone());
+        release_note_only(&mut r, 3, 7, second.clone());
         assert_eq!(r.core.stats.lock_moved, 1);
         recalled(&mut r, recall, first);
         assert_eq!(r.core.stats.lock_moved, 1);
         assert_eq!(r.core.stats.lock_returned_duplicates, 1);
         assert_eq!(r.meta.locks().grants_len(), 1);
         assert!(r.meta.locks().get(g).is_some());
-        // The cache goes with the `handed_back` entry.
-        assert!(d.core.dl.recall_grants.contains_key(&7));
     }
 
     /// L3 (review F1): a recall's hand-back is installed only where it is
@@ -33282,7 +33323,7 @@ fn undelegate_refuses_a_designation() {
     assert!(
         !sends(&out)
             .iter()
-            .any(|(_, m)| matches!(m, PeerMsg::DelegRecall { .. })),
+            .any(|(_, m)| matches!(m, PeerMsg::ReleaseRequest { .. })),
         "a designation was recalled: {out:?}"
     );
     let done: Vec<_> = out
@@ -33475,7 +33516,7 @@ fn a_write_into_a_fresh_delegation_is_recalled_until_the_root_sees_the_delegate(
     let recalled = |out: &[Action]| {
         sends(out)
             .iter()
-            .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::DelegRecall { .. }))
+            .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::ReleaseRequest { .. }))
     };
     let redirected = |out: &[Action]| {
         sends(out).iter().any(|(to, m)| {
@@ -33595,7 +33636,7 @@ mod s3_no_loops {
     fn recalls_sent(out: &[Action], to: NodeId) -> usize {
         sends(out)
             .iter()
-            .filter(|(n, m)| *n == to && matches!(m, PeerMsg::DelegRecall { .. }))
+            .filter(|(n, m)| *n == to && matches!(m, PeerMsg::ReleaseRequest { .. }))
             .count()
     }
 
@@ -33632,7 +33673,7 @@ mod s3_no_loops {
     /// The root's recall of `gen` as sent: the request id.
     fn recall_req_of(out: &[Action], to: NodeId) -> Option<OpId> {
         sends(out).into_iter().find_map(|(n, m)| match m {
-            PeerMsg::DelegRecall { req, .. } if n == to => Some(*req),
+            PeerMsg::ReleaseRequest { req, .. } if n == to => Some(*req),
             _ => None,
         })
     }
@@ -33645,7 +33686,7 @@ mod s3_no_loops {
         h.core.start_recall(h.clk(), gen, &mut lost);
         assert_eq!(recalls_sent(&lost, 3), 1);
         let req = recall_req_of(&lost, 3).unwrap();
-        (req, timer_of(&lost, TimerKind::DelegRecallResend))
+        (req, timer_of(&lost, TimerKind::ReleaseResend))
     }
 
     /// L3: a recall whose `DelegRecall` was lost is sent again once its
@@ -33682,7 +33723,7 @@ mod s3_no_loops {
             sent.push(recall_req_of(&out, 3).unwrap());
             want = (want * 2).min(2_000).max(floor);
             assert_eq!(h.core.dl.gens[&gen].recall_backoff_ms, want);
-            timer = timer_of(&out, TimerKind::DelegRecallResend);
+            timer = timer_of(&out, TimerKind::ReleaseResend);
             assert!(
                 out.iter().any(|a| matches!(
                     a,
@@ -33694,15 +33735,7 @@ mod s3_no_loops {
         assert!(want <= 2_000.max(floor));
         // The answer of the newest try drains it; the timer is cancelled
         // and the other tries are forgotten.
-        let out = h.step(Event::Peer {
-            from: 3,
-            msg: PeerMsg::DelegRecalled {
-                req: *sent.last().unwrap(),
-                gen,
-                through: 0,
-                locks: Default::default(),
-            },
-        });
+        let out = release_answer(&mut h, 3, gen, Default::default());
         assert!(
             out.iter()
                 .any(|a| matches!(a, Action::CancelTimer { id } if *id == timer)),
@@ -33741,7 +33774,7 @@ mod s3_no_loops {
         h.advance(h.core.deleg_request_timeout_ms() + 1);
         let out = h.step(Event::Timer { id: timer });
         assert_eq!(recalls_sent(&out, 3), 0, "sent inside a gate: {out:?}");
-        let timer = timer_of(&out, TimerKind::DelegRecallResend);
+        let timer = timer_of(&out, TimerKind::ReleaseResend);
         assert_eq!(h.core.stats.deleg_recalls_resent, 0);
         h.core.lease.gate = None;
         h.advance(h.core.deleg_request_timeout_ms() + 1);
@@ -33755,19 +33788,11 @@ mod s3_no_loops {
     #[test]
     fn l3_an_answer_to_the_first_try_drains_the_recall_after_a_resend() {
         let (mut h, _dir, gen) = delegated_root();
-        let (first, timer) = lost_recall(&mut h, gen);
+        let (_first, timer) = lost_recall(&mut h, gen);
         h.advance(h.core.deleg_request_timeout_ms() + 1);
         let out = h.step(Event::Timer { id: timer });
         assert_eq!(recalls_sent(&out, 3), 1);
-        h.step(Event::Peer {
-            from: 3,
-            msg: PeerMsg::DelegRecalled {
-                req: first,
-                gen,
-                through: 0,
-                locks: Default::default(),
-            },
-        });
+        release_answer(&mut h, 3, gen, Default::default());
         assert!(
             h.core.dl.gens[&gen].ended,
             "not ended by the first try's answer"
@@ -36483,6 +36508,7 @@ fn a_delegate_stream_to_a_restarted_root_readopts_its_own_lease() {
             txs: Vec::new(),
             leaving: Vec::new(),
             leaving_barriers: Vec::new(),
+            released: None,
         },
     };
     let refused = |out: &[Action]| {
@@ -38252,10 +38278,10 @@ fn a_generation_recalled_while_parked_is_not_installed_when_its_record_reaches_t
         assert!(h.core.dl.mine.is_empty() && h.core.dl.commit_waiting.contains_key(&7));
         h.step(Event::Peer {
             from: 1,
-            msg: PeerMsg::DelegRecall {
+            msg: PeerMsg::ReleaseRequest {
                 req: OpId(5),
-                dir,
                 gen: 7,
+                dirs: vec![dir],
             },
         });
         assert_eq!(h.core.deleg_handed_back_to(7), Some(1), "{kind:?}");
@@ -38628,10 +38654,10 @@ mod redelegated_to_the_requester {
     fn recalled(s: &mut Setup) {
         s.h.step(Event::Peer {
             from: 1,
-            msg: PeerMsg::DelegRecall {
+            msg: PeerMsg::ReleaseRequest {
                 req: OpId(5),
-                dir: s.dir,
                 gen: 7,
+                dirs: vec![s.dir],
             },
         });
         assert_eq!(s.h.core.deleg_handed_back_to(7), Some(1));
@@ -39040,6 +39066,7 @@ fn a_root_seals_a_delegate_only_on_real_silence() {
             }],
             leaving: Vec::new(),
             leaving_barriers: Vec::new(),
+            released: None,
         },
     };
     // Fire every delegation expiry that is due; whether one sealed.
@@ -43687,10 +43714,10 @@ mod recall_cut {
         // A recall drains at once, whatever the back-off.
         let out = h.step(Event::Peer {
             from: 1,
-            msg: PeerMsg::DelegRecall {
+            msg: PeerMsg::ReleaseRequest {
                 req: OpId(78),
-                dir,
                 gen: 7,
+                dirs: vec![dir],
             },
         });
         assert!(
@@ -43780,6 +43807,7 @@ mod recall_cut {
                 }],
                 leaving: Vec::new(),
                 leaving_barriers: Vec::new(),
+                released: None,
             },
         });
         assert_eq!(
@@ -43859,6 +43887,7 @@ mod recall_cut {
                 }],
                 leaving: Vec::new(),
                 leaving_barriers: Vec::new(),
+                released: None,
             },
         });
         assert_eq!(
@@ -44693,19 +44722,13 @@ mod deleg_group {
         let dir = *h.core.dl.mine[&7].dirs.iter().next().unwrap();
         let out = h.step(Event::Peer {
             from: 1,
-            msg: PeerMsg::DelegRecall {
+            msg: PeerMsg::ReleaseRequest {
                 req: OpId(78),
-                dir,
                 gen: 7,
+                dirs: vec![dir],
             },
         });
-        let cut = sends(&out).into_iter().find_map(|(to, m)| match m {
-            PeerMsg::DelegRecalled {
-                gen: 7, through, ..
-            } if to == 1 => Some(*through),
-            _ => None,
-        });
-        assert_eq!(cut, Some(0), "{out:?}");
+        assert_eq!(release_cut_to(&out, 1), Some(0), "{out:?}");
     }
 
     /// A recall of the stopped generation answered before the new tenure
@@ -44716,23 +44739,15 @@ mod deleg_group {
     fn a_recall_answer_does_not_cut_past_an_uncommitted_re_appended_row() {
         let mut h = take_over_with_a_re_appended_row(true);
         let dir = *h.core.dl.mine[&7].dirs.iter().next().unwrap();
-        let recalled = |out: &[Action]| {
-            sends(out).into_iter().find_map(|(to, m)| match m {
-                PeerMsg::DelegRecalled {
-                    gen: 7, through, ..
-                } if to == 1 => Some(*through),
-                _ => None,
-            })
-        };
         let out = h.step(Event::Peer {
             from: 1,
-            msg: PeerMsg::DelegRecall {
+            msg: PeerMsg::ReleaseRequest {
                 req: OpId(77),
-                dir,
                 gen: 7,
+                dirs: vec![dir],
             },
         });
-        assert_eq!(recalled(&out), Some(0), "{out:?}");
+        assert_eq!(release_cut_to(&out, 1), Some(0), "{out:?}");
     }
 
     /// The same takeover, the forward's park gone (its answer aborted, or a
@@ -45989,6 +46004,7 @@ mod deleg_group {
                 }],
                 leaving: Vec::new(),
                 leaving_barriers: Vec::new(),
+                released: None,
             },
         });
         assert!(
@@ -46121,6 +46137,7 @@ mod deleg_group {
                 }],
                 leaving: Vec::new(),
                 leaving_barriers: Vec::new(),
+                released: None,
             },
         })
     }
@@ -46279,6 +46296,7 @@ mod deleg_group {
                 }],
                 leaving: Vec::new(),
                 leaving_barriers: Vec::new(),
+                released: None,
             },
         })
     }
@@ -54809,6 +54827,7 @@ mod c2g_settle {
                 }],
                 leaving: Vec::new(),
                 leaving_barriers: Vec::new(),
+                released: None,
             },
         });
         assert_eq!(h.core.dl.gens[&7].cursor, 1, "appended");
@@ -55409,6 +55428,7 @@ mod c2g_settle {
                 }],
                 leaving: Vec::new(),
                 leaving_barriers: Vec::new(),
+                released: None,
             },
         }
     }
@@ -55893,7 +55913,7 @@ mod c2g_settle {
         assert!(
             sends(&out)
                 .iter()
-                .any(|(to, m)| *to == 4 && matches!(m, PeerMsg::DelegRecall { .. })),
+                .any(|(to, m)| *to == 4 && matches!(m, PeerMsg::ReleaseRequest { .. })),
             "an unlink in the delegation touches a file the root owns: {out:?}"
         );
         // The primary name leaving: X would belong to generation 7.
@@ -55943,7 +55963,7 @@ mod c2g_settle {
         assert!(
             sends(&out)
                 .iter()
-                .any(|(to, m)| *to == 4 && matches!(m, PeerMsg::DelegRecall { .. })),
+                .any(|(to, m)| *to == 4 && matches!(m, PeerMsg::ReleaseRequest { .. })),
             "the file moves into the delegation, recalled first: {out:?}"
         );
         assert!(
@@ -56001,29 +56021,20 @@ mod c2g_settle {
             .by_req
             .insert(OpId(77), (7, crate::core::delegate::ReqKind::Recall));
         let tip = h.meta.journal_tip().unwrap();
-        let out = h.step(Event::Peer {
-            from: 4,
-            msg: PeerMsg::DelegRecalled {
-                req: OpId(77),
-                gen: 7,
-                through: 0,
-                locks: Default::default(),
-            },
-        });
-        assert_eq!(
-            h.core.dl.gens[&7].recall,
-            RecallPhase::Drained(0),
-            "{out:?}"
-        );
+        // The delegate's release row is a row of its stream: a gate that is
+        // not shippable appends none, so the recall is not drained (and not
+        // ended) inside it.
+        let out = release_answer(&mut h, 4, 7, Default::default());
+        assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::Sent, "{out:?}");
         assert!(!h.core.dl.gens[&7].ended, "ended inside the gate");
         assert_eq!(h.core.stats.deleg_recalls_drained, 0);
         assert_eq!(h.meta.journal_tip().unwrap(), tip, "journaled: {out:?}");
         // A batch for a recalled generation is refused in the gate too.
         let out = h.step(batch_from_4(&h, _dir, 10, 1));
         assert_eq!(acks_to_4(&out), vec![(0, 0, true)], "{out:?}");
-        // The open ends it.
+        // The open takes the delegate's resend and ends the generation.
         h.core.lease.gate = None;
-        poke(&mut h);
+        release_answer(&mut h, 4, 7, Default::default());
         assert!(h.core.dl.gens[&7].ended, "not ended at the open");
         assert_eq!(h.core.stats.deleg_recalls_drained, 1);
     }
@@ -56033,7 +56044,7 @@ mod c2g_settle {
         sends(out)
             .into_iter()
             .filter_map(|(to, m)| match m {
-                PeerMsg::DelegRecall { req, gen: 7, .. } if to == 4 => Some(*req),
+                PeerMsg::ReleaseRequest { req, gen: 7, .. } if to == 4 => Some(*req),
                 _ => None,
             })
             .collect()
@@ -56109,15 +56120,7 @@ mod c2g_settle {
             Some((1, false)),
             "{out:?}"
         );
-        let out = h.step(Event::Peer {
-            from: 4,
-            msg: PeerMsg::DelegRecalled {
-                req: reqs[0],
-                gen: 7,
-                through: 1,
-                locks: Default::default(),
-            },
-        });
+        let out = release_answer(&mut h, 4, 7, Default::default());
         assert!(h.core.dl.gens[&7].ended, "not ended in the gate: {out:?}");
         assert!(h.core.lease.gate.is_some());
         assert!(
@@ -56164,17 +56167,10 @@ mod c2g_settle {
         let out = h.step(request(20, 1, op, false));
         let reqs = recalls_to_4(&out);
         assert_eq!(reqs.len(), 1, "{out:?}");
+        // (The delegate's release row was appended while the gate was
+        // shippable, and the gate paused before the end was journaled.)
         h.core.lease.gate.as_mut().unwrap().shippable = false;
-        h.step(Event::Peer {
-            from: 4,
-            msg: PeerMsg::DelegRecalled {
-                req: reqs[0],
-                gen: 7,
-                through: 0,
-                locks: Default::default(),
-            },
-        });
-        assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::Drained(0));
+        h.core.dl.gens.get_mut(&7).unwrap().recall = RecallPhase::Drained(0);
         assert!(!h.core.dl.gens[&7].ended, "ended in a gate not shippable");
         poke(&mut h);
         assert!(!h.core.dl.gens[&7].ended, "still not shippable");
@@ -56198,15 +56194,7 @@ mod c2g_settle {
         let reqs = recalls_to_4(&out);
         assert_eq!(reqs.len(), 1, "{out:?}");
         // A non-settle forward after the cut is still `Busy` (R3).
-        let out = h.step(Event::Peer {
-            from: 4,
-            msg: PeerMsg::DelegRecalled {
-                req: reqs[0],
-                gen: 7,
-                through: 0,
-                locks: Default::default(),
-            },
-        });
+        let out = release_answer(&mut h, 4, 7, Default::default());
         assert!(h.core.dl.gens[&7].ended, "{out:?}");
         assert!(h.meta.delegation_table().iter().all(|d| d.gen != 7));
         let out = h.step(request(21, 2, op.clone(), false));
@@ -56225,12 +56213,12 @@ mod c2g_settle {
             h.core
                 .timers
                 .values()
-                .all(|(t, _)| !matches!(t, Timer::DelegRecallResend(7))),
+                .all(|(t, _)| !matches!(t, Timer::ReleaseResend(7))),
             "a resend timer is left"
         );
         h.meta.strand_below_epoch(3).unwrap();
         assert!(
-            h.meta.delegation_table().iter().any(|d| d.gen == 7),
+            h.meta.delegation_table().has_gen(7),
             "the cut is not retracted: the table lacks generation 7"
         );
         // Another settle of rid 1 at this node: not answered `Abandoned`.
@@ -56773,7 +56761,7 @@ mod c2g_settle {
         assert!(
             sends(&out)
                 .iter()
-                .any(|(to, m)| *to == 4 && matches!(m, PeerMsg::DelegRecall { .. })),
+                .any(|(to, m)| *to == 4 && matches!(m, PeerMsg::ReleaseRequest { .. })),
             "{out:?}"
         );
         let g = h.core.dl.gens.get_mut(&7).unwrap();
@@ -60077,7 +60065,7 @@ mod step9_one_stream_per_node {
         assert!(
             !sends(&out)
                 .iter()
-                .any(|(_, m)| matches!(m, PeerMsg::DelegRecall { .. })),
+                .any(|(_, m)| matches!(m, PeerMsg::ReleaseRequest { .. })),
             "a rename inside one node's stream recalled it: {out:?}"
         );
         assert_eq!(h.core.stats.deleg_recalls_sent, 0);
@@ -60254,7 +60242,7 @@ mod step9_one_stream_per_node {
         assert!(why.contains("recalled before the designation"), "{why}");
         assert!(
             sends(&out).iter().any(|(to, m)| *to == 3
-                && matches!(m, PeerMsg::DelegRecall { gen, .. } if *gen == placed)),
+                && matches!(m, PeerMsg::ReleaseRequest { gen, .. } if *gen == placed)),
             "the stealable stream was not recalled: {out:?}"
         );
         assert_ne!(h.core.dl.gens[&placed].recall, RecallPhase::None);
@@ -60276,7 +60264,7 @@ mod step9_one_stream_per_node {
         assert!(
             !sends(&out)
                 .iter()
-                .any(|(_, m)| matches!(m, PeerMsg::DelegRecall { .. })),
+                .any(|(_, m)| matches!(m, PeerMsg::ReleaseRequest { .. })),
             "{out:?}"
         );
         assert_eq!(h.core.stats.deleg_recalls_sent, 1);
@@ -60478,5 +60466,468 @@ mod step9_one_stream_per_node {
         assert_eq!(h.core.dl.gens[&gen].dir_list().len(), 2);
         assert!(h.core.dl.growing.is_empty());
         assert_eq!(h.core.stats.deleg_grows, 1);
+    }
+
+    // ----------------------------------------------------- step 10
+
+    /// The release request `out` sends to `to`: its id, generation and
+    /// subtrees.
+    fn release_request_to(
+        out: &[Action],
+        to: NodeId,
+    ) -> Option<(OpId, u64, Vec<constellation_fs_core::Ino>)> {
+        sends(out).into_iter().find_map(|(n, m)| match m {
+            PeerMsg::ReleaseRequest { req, gen, dirs } if n == to => {
+                Some((*req, *gen, dirs.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    /// The root (node 1) with `d1` and `d2` delegated to node 3 (one stream),
+    /// a file `x` in `d1`, the peers' links up.
+    fn root_with_two_grants_and_a_file() -> (
+        Harness,
+        constellation_fs_core::Ino,
+        constellation_fs_core::Ino,
+    ) {
+        let (mut h, d1) = root_with_dir();
+        let (d2, rec) = mkdir(&h, "d2");
+        let x = h.meta.allocate_ino(d1).unwrap();
+        let file = LogRecord::Create {
+            parent: d1,
+            name: "x".into(),
+            ino: x,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        };
+        crate::replica::Replica::apply_segment(&h.meta, 2, 1, 0, &[], &[], &[rec, file]).unwrap();
+        assert!(delegate(&mut h, 900, d1, 3));
+        assert!(delegate(&mut h, 901, d2, 3), "the second grant was refused");
+        h.step(Event::Peers {
+            links: (2..=4)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: true,
+                    last_seen: Some(w(h.now)),
+                    rtt_ms: Some(1),
+                    since: Some(w(h.now)),
+                })
+                .collect(),
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+        (h, d1, d2)
+    }
+
+    /// The root's own rename of `d1/x` to the root directory (a cross-subtree
+    /// op: `d1` is the delegate's, the root directory is the root's),
+    /// submitted: the actions.
+    fn submit_move_out(h: &mut Harness, d1: constellation_fs_core::Ino) -> Vec<Action> {
+        let rid = h.rid(1);
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Rename {
+                parent: d1,
+                name: "x".into(),
+                new_parent: ROOT_INO,
+                new_name: "y".into(),
+                noreplace: false,
+            },
+            tag: Default::default(),
+        })
+    }
+
+    fn delegate_tx(idx: u64, records: Vec<LogRecord>) -> constellation_meta::DelegateTx {
+        constellation_meta::DelegateTx {
+            idx,
+            rid: None,
+            records,
+            deps: constellation_meta::Position::ZERO,
+        }
+    }
+
+    /// A release request asks for the subtrees an op needs and nothing else:
+    /// the stream's other subtree stays live (its window open, its table
+    /// entry and its set), and the op runs once the delegate's
+    /// `SubtreeReleased` row is in the log. Fails on the parent, which
+    /// recalls the whole generation for the op: both subtrees leave the
+    /// table.
+    #[test]
+    fn a_release_request_leaves_the_other_subtree_of_the_stream_live() {
+        let (mut h, d1, d2) = root_with_two_grants_and_a_file();
+        let gen = h.meta.delegation_table().get(d1).unwrap().gen;
+        let out = submit_move_out(&mut h, d1);
+        let (_, g, dirs) =
+            release_request_to(&out, 3).unwrap_or_else(|| panic!("no request: {out:?}"));
+        assert_eq!(
+            (g, dirs),
+            (gen, vec![d1]),
+            "asked for more than the op needs"
+        );
+        let st = &h.core.dl.gens[&gen];
+        assert_eq!(st.recall, RecallPhase::None, "the stream is being recalled");
+        assert_eq!(st.releasing.iter().copied().collect::<Vec<_>>(), vec![d1]);
+        assert!(
+            h.meta.lookup(ROOT_INO, "y").unwrap().is_none(),
+            "ran before the release"
+        );
+        // The delegate's row: nothing executed under d1, the release is the
+        // stream's first row.
+        let row = delegate_tx(
+            1,
+            vec![LogRecord::SubtreeReleased {
+                node: 3,
+                gen,
+                dir: d1,
+                at: 0,
+            }],
+        );
+        let note = constellation_meta::locks::ReleaseNote {
+            dirs: vec![d1],
+            end_at: None,
+            locks: Default::default(),
+        };
+        deliver_stream(&mut h, 3, gen, vec![row], Some(note));
+        assert!(
+            h.meta.lookup(ROOT_INO, "y").unwrap().is_some(),
+            "the op did not run"
+        );
+        let table = h.meta.delegation_table();
+        assert_eq!(
+            table.get(d2).map(|d| d.gen),
+            Some(gen),
+            "d2 left the stream"
+        );
+        let st = &h.core.dl.gens[&gen];
+        assert!(
+            !st.ended && st.recall == RecallPhase::None,
+            "the stream ended"
+        );
+        assert!(st.dirs.contains_key(&d2));
+        assert!(st.releasing.is_empty());
+        // The released subtree is granted to the node again once the op ran
+        // (a growth of the live stream, not a new one).
+        assert_eq!(
+            table.get(d1).map(|d| d.gen),
+            Some(gen),
+            "{:?}",
+            st.redelegate_dirs
+        );
+        assert_eq!(h.core.dl.gens.len(), 1);
+    }
+
+    /// The root sequences a released subtree only after it has appended the
+    /// stream through the release row (`at` and every row before it): the
+    /// row alone, past a gap, appends nothing and the op keeps waiting.
+    /// Fails on the parent, which has no release row (the op ran at the
+    /// recall's `through`).
+    #[test]
+    fn an_op_in_a_released_subtree_runs_only_after_the_append_through_at() {
+        let (mut h, d1, _d2) = root_with_two_grants_and_a_file();
+        let gen = h.meta.delegation_table().get(d1).unwrap().gen;
+        submit_move_out(&mut h, d1);
+        let r = h.meta.allocate_ino(d1).unwrap();
+        let executed = delegate_tx(
+            1,
+            vec![LogRecord::Create {
+                parent: d1,
+                name: "r".into(),
+                ino: r,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 5,
+            }],
+        );
+        let release = delegate_tx(
+            2,
+            vec![LogRecord::SubtreeReleased {
+                node: 3,
+                gen,
+                dir: d1,
+                at: 1,
+            }],
+        );
+        let note = constellation_meta::locks::ReleaseNote {
+            dirs: vec![d1],
+            end_at: None,
+            locks: Default::default(),
+        };
+        // The release row alone: the delegate's earlier row is missing (a
+        // batch lost), so nothing is appended.
+        deliver_stream(&mut h, 3, gen, vec![release.clone()], Some(note.clone()));
+        assert_eq!(h.core.dl.gens[&gen].cursor, 0);
+        assert!(
+            h.meta.delegation_table().get(d1).is_some(),
+            "released past a gap"
+        );
+        assert!(
+            h.meta.lookup(ROOT_INO, "y").unwrap().is_none(),
+            "ran before the append through at"
+        );
+        // Both rows, in order.
+        deliver_stream(&mut h, 3, gen, vec![executed, release], Some(note));
+        assert_eq!(h.core.dl.gens[&gen].cursor, 2);
+        assert!(
+            h.meta.lookup(d1, "r").unwrap().is_some(),
+            "the delegate's row"
+        );
+        assert!(
+            h.meta.lookup(ROOT_INO, "y").unwrap().is_some(),
+            "the op after the release"
+        );
+    }
+
+    /// L3: a release request that was lost is sent again, under a new request
+    /// id, until the row is here; a request for some subtrees only that got no
+    /// row within a request's timeout becomes a recall of the whole stream
+    /// (the delegate is slow, cut off or down: the recall closes the window
+    /// and the grant's expiry bounds the wait).
+    #[test]
+    fn l3_a_lost_release_request_is_sent_again() {
+        let (mut h, d1, d2) = root_with_two_grants_and_a_file();
+        let out = submit_move_out(&mut h, d1);
+        let (first, gen, dirs) = release_request_to(&out, 3).expect("the request");
+        assert_eq!(dirs, vec![d1]);
+        let timer = timers(&out, TimerKind::ReleaseResend);
+        assert_eq!(timer.len(), 1, "{out:?}");
+        h.advance(h.core.deleg_request_timeout_ms() + 1);
+        let out = h.step(Event::Timer { id: timer[0] });
+        let (second, g2, dirs2) =
+            release_request_to(&out, 3).unwrap_or_else(|| panic!("not sent again: {out:?}"));
+        assert_ne!(first, second);
+        assert_eq!(g2, gen);
+        assert_eq!(dirs2, vec![d1, d2], "not a recall of the stream");
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::Sent);
+        // From there it is the stream's recall: sent again like any.
+        let timer = timers(&out, TimerKind::ReleaseResend);
+        assert_eq!(timer.len(), 1, "{out:?}");
+        h.advance(h.core.deleg_request_timeout_ms() * 2 + 1);
+        let out = h.step(Event::Timer { id: timer[0] });
+        let (third, _, dirs3) = release_request_to(&out, 3).expect("sent again");
+        assert_ne!(second, third);
+        assert_eq!(dirs3, vec![d1, d2]);
+        assert_eq!(h.core.stats.deleg_recalls_resent, 1);
+    }
+
+    /// A delegate (node 3, stream 7 over `d1` and `d2`, a lock grant under
+    /// each) and the files.
+    fn delegate_of_two() -> (
+        Harness,
+        constellation_fs_core::Ino,
+        constellation_fs_core::Ino,
+        constellation_fs_core::Ino,
+        constellation_fs_core::Ino,
+    ) {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let d1 = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let d2 = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let f1 = h.meta.allocate_ino(d1).unwrap();
+        let f2 = h.meta.allocate_ino(d2).unwrap();
+        let mk = |parent, name: &str, ino| LogRecord::Mkdir {
+            parent,
+            name: name.into(),
+            ino,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        };
+        let cr = |parent, name: &str, ino| LogRecord::Create {
+            parent,
+            name: name.into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 2,
+        };
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                mk(ROOT_INO, "d1", d1),
+                mk(ROOT_INO, "d2", d2),
+                cr(d1, "f1", f1),
+                cr(d2, "f2", f2),
+                LogRecord::DelegateNode {
+                    node: 3,
+                    gen: 7,
+                    dirs: vec![
+                        constellation_meta::SubtreeGrant {
+                            dir: d1,
+                            kind: SubtreeKind::Placed,
+                        },
+                        constellation_meta::SubtreeGrant {
+                            dir: d2,
+                            kind: SubtreeKind::Placed,
+                        },
+                    ],
+                },
+            ],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.dl.mine[&7].dirs.len(), 2);
+        for (seq, ino) in [(1, f1), (2, f2)] {
+            h.meta.locks().install(constellation_meta::locks::Grant {
+                id: constellation_meta::locks::GrantId { node: 3, seq },
+                node: 4,
+                ino,
+                mode: constellation_meta::locks::LockMode::Exclusive,
+                until: WaitMs(h.now.0 + 60_000),
+                recalled: false,
+                gen: 7,
+                confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
+                settled: false,
+            });
+        }
+        (h, d1, d2, f1, f2)
+    }
+
+    /// Locks are handed back per subtree: the release of `d1` takes the
+    /// grants under `d1` out of the delegate's table and into the note, and
+    /// leaves those under `d2` where they are. Fails on the parent, which
+    /// hands the whole generation's grants back.
+    #[test]
+    fn a_release_hands_back_the_locks_of_the_released_subtree_only() {
+        let (mut h, d1, d2, f1, f2) = delegate_of_two();
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReleaseRequest {
+                req: OpId(5),
+                gen: 7,
+                dirs: vec![d1],
+            },
+        });
+        let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("no release: {out:?}"));
+        assert_eq!(note.dirs, vec![d1]);
+        assert_eq!(note.end_at, None);
+        let back: Vec<u64> = note.locks.grants.iter().map(|g| g.ino).collect();
+        assert_eq!(back, vec![f1], "handed back: {back:?}");
+        let left: Vec<u64> = h
+            .meta
+            .locks()
+            .grants_snapshot()
+            .iter()
+            .map(|g| g.ino)
+            .collect();
+        assert_eq!(left, vec![f2], "left in the delegate's table");
+        // The row: a SubtreeReleased of d1 behind everything executed; the
+        // stream and the other subtree live on.
+        let rows = crate::replica::Replica::delegate_txs_from(&h.meta, 7, 1, usize::MAX);
+        assert!(
+            matches!(
+                rows.last().map(|t| t.records.as_slice()),
+                Some([LogRecord::SubtreeReleased { gen: 7, dir, at: 0, .. }]) if *dir == d1
+            ),
+            "{rows:?}"
+        );
+        let d = &h.core.dl.mine[&7];
+        assert!(!d.stopped);
+        assert_eq!(d.dirs.iter().copied().collect::<Vec<_>>(), vec![d2]);
+        assert!(h.meta.delegation_table().get(d1).is_none());
+        assert_eq!(h.meta.delegation_table().get(d2).map(|t| t.gen), Some(7));
+    }
+
+    /// A release of every subtree the stream holds is one `StreamReleased`,
+    /// and the delegate stops.
+    #[test]
+    fn a_release_of_every_subtree_is_a_stream_released_row() {
+        let (mut h, d1, d2, _, _) = delegate_of_two();
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReleaseRequest {
+                req: OpId(5),
+                gen: 7,
+                dirs: vec![d1, d2],
+            },
+        });
+        let note = release_note_to(&out, 1).expect("the note");
+        assert_eq!(note.locks.grants.len(), 2);
+        let rows = crate::replica::Replica::delegate_txs_from(&h.meta, 7, 1, usize::MAX);
+        assert!(
+            matches!(
+                rows.last().map(|t| t.records.as_slice()),
+                Some([LogRecord::StreamReleased {
+                    gen: 7,
+                    through: 0,
+                    ..
+                }])
+            ),
+            "{rows:?}"
+        );
+        assert!(h.core.dl.mine[&7].stopped);
+        assert!(h.core.dl.mine[&7].dirs.is_empty());
+    }
+
+    /// A subtree the root asks for that this delegate has not learned yet (the
+    /// record that grew the stream is in a segment not applied here) is not
+    /// released at once: a release journaled first is undone by the record
+    /// when it arrives, and the delegate then holds what the log gave back
+    /// (the table here and the log-derived one differ for good). It is
+    /// released when the record is applied. Fails when the row is journaled
+    /// at the request: the table lists the subtree after the segment.
+    #[test]
+    fn a_subtree_the_delegate_has_not_learned_is_released_when_its_record_is_applied() {
+        let (mut h, d1, _d2, _, _) = delegate_of_two();
+        // A third subtree, grown by a record this replica has not applied.
+        let d3 = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let mk = LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: "d3".into(),
+            ino: d3,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        };
+        let grow = LogRecord::DelegateNode {
+            node: 3,
+            gen: 7,
+            dirs: vec![constellation_meta::SubtreeGrant {
+                dir: d3,
+                kind: SubtreeKind::Placed,
+            }],
+        };
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReleaseRequest {
+                req: OpId(5),
+                gen: 7,
+                dirs: vec![d3],
+            },
+        });
+        assert!(
+            release_note_to(&out, 1).is_none(),
+            "released what it has not learned: {out:?}"
+        );
+        let rows = crate::replica::Replica::delegate_txs_from(&h.meta, 7, 1, usize::MAX);
+        assert!(rows.is_empty(), "{rows:?}");
+        assert!(h.core.dl.mine[&7].release_pending.0.contains(&d3));
+        // The record arrives: the subtree is released, after it.
+        crate::replica::Replica::apply_segment(&h.meta, 1, 1, 1, &[], &[], &[mk, grow]).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("not released: {out:?}"));
+        assert_eq!(note.dirs, vec![d3]);
+        assert!(
+            h.meta.delegation_table().get(d3).is_none(),
+            "the table keeps the subtree"
+        );
+        assert!(h.meta.delegation_table().get(d1).is_some());
+        assert!(h.core.dl.mine[&7].release_pending.0.is_empty());
     }
 }

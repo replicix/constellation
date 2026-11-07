@@ -114,9 +114,14 @@ pub(crate) struct GenState {
     /// for an inherited generation). The root drains its backup (seal)
     /// when the delegate dies.
     pub group: GroupState,
-    /// Phase 2b: ended by a cross-subtree op: delegate the directory to
-    /// the same node again once the op executed.
-    pub redelegate: bool,
+    /// Phase 2b: subtrees a cross-subtree op released (or ended with the
+    /// stream): delegated to the same node again once the op executed.
+    pub redelegate_dirs: BTreeMap<Ino, DelegKind>,
+    /// Plan 46 M1.2 step 10: the subtrees a release request names and the
+    /// delegate's `SubtreeReleased` row has not yet reached the root's
+    /// log (a recall of the stream: all of its subtrees). While any is left
+    /// the request is sent again (L3).
+    pub releasing: BTreeSet<Ino>,
     /// When the root granted it (placement's dwell counts from here; the
     /// cut's designation-online check), on the wait clock.
     pub granted: WaitMs,
@@ -214,7 +219,7 @@ pub(crate) struct GenState {
     /// When the recall started (the stall `deleg_recall_ms_*` measures).
     pub recall_started: Option<WaitMs>,
     /// The timer that sends the recall again while it is unanswered
-    /// (`Core::on_deleg_recall_resend`), and its current back-off.
+    /// (`Core::on_release_resend`), and its current back-off.
     pub recall_resend: Option<TimerId>,
     pub recall_backoff_ms: u64,
     /// `Undelegate` controls answered when the generation ends.
@@ -230,6 +235,10 @@ pub(crate) struct GenState {
     /// when the last of them is gone.
     pub renew_waiting: Option<(NodeId, OpId, u64, RenewFrom)>,
 }
+
+/// The streams an op touches and the subtrees of each, with the kind each was
+/// granted as.
+type Involved = Vec<(u64, BTreeMap<Ino, DelegKind>)>;
 
 /// An ended stream to grant again: its generation, subtrees and delegate.
 type Redelegation = (u64, Vec<(Ino, DelegKind)>, NodeId);
@@ -427,6 +436,39 @@ pub(crate) struct ParkedDeleg {
     pub settle: bool,
 }
 
+/// Plan 46 M1.2 step 10: a release this delegate journaled (or could not,
+/// `ReleaseNote::end_at`) and has not seen acknowledged: its note rides
+/// every batch until the root's acknowledgement covers `row`.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingRelease {
+    pub note: constellation_meta::locks::ReleaseNote,
+    /// The stream index of the release row (`None`: none was journaled).
+    pub row: Option<u64>,
+    /// The row and everything after it are held back from the stream until
+    /// the read delegations this node granted under the released subtrees
+    /// are recalled (phase 2b).
+    pub held: bool,
+    /// When the note's lock `carry` was measured (wait clock): each send
+    /// takes the time since off what is left of every record.
+    pub left_at: WaitMs,
+    /// The root that asked: a release that journaled no row answers it
+    /// directly.
+    pub to: NodeId,
+}
+
+impl PendingRelease {
+    /// The note as it goes out at `now`: what is left of each handed-back
+    /// record is measured again.
+    pub(crate) fn note_at(&self, now: WaitMs) -> constellation_meta::locks::ReleaseNote {
+        let gone = now.since(self.left_at).max(0) as u64;
+        let mut note = self.note.clone();
+        for (_, left) in note.locks.carry.iter_mut() {
+            *left = left.saturating_sub(gone);
+        }
+        note
+    }
+}
+
 /// This node as the delegate of one generation.
 #[derive(Debug, Clone)]
 pub(crate) struct DelegateState {
@@ -440,6 +482,16 @@ pub(crate) struct DelegateState {
     /// counts; it carries the lock handoff and has waited for the read
     /// delegations under the new subtree).
     pub grown: BTreeMap<Ino, Option<HonourMs>>,
+    /// Plan 46 M1.2 step 10: this node released subtrees on the root's
+    /// request and the root has not acknowledged the release row yet.
+    pub release: Option<PendingRelease>,
+    /// Plan 46 M1.2 step 10: subtrees the root asked this node to release
+    /// that this node has not learned yet (the `DelegateNode` record that
+    /// grew the stream is in a segment it has not applied): released once it
+    /// has, never before: a release journaled first would be undone by that
+    /// record when it is applied, and the delegate would hold what the log
+    /// gave back. With the root that asked.
+    pub release_pending: (BTreeSet<Ino>, NodeId),
     /// The send time of the renewal whose granting answer the root's core
     /// just gave (in time or late): the answer that carries the lock
     /// handoff, grace and floor. Taken by the message arm that installs
@@ -877,11 +929,9 @@ pub(crate) struct DelegationState {
     /// never seen (the recall overtook the record naming this node) —
     /// after [`HANDED_BACK_UNSEEN_MS`].
     pub handed_back: BTreeMap<u64, (NodeId, WaitMs, bool)>,
-    /// The lock grants a recall's answer handed back, by generation: a
-    /// repeated recall (the root sends it again when the answer is lost)
-    /// answers with them again, the table having given them up. Kept as long
-    /// as the `handed_back` entry.
-    pub recall_grants: BTreeMap<u64, Vec<constellation_meta::locks::Grant>>,
+    /// The generations a release request reached this node for at least once
+    /// (the simulation's loss of the first one, L3).
+    pub release_first: BTreeSet<u64>,
     /// A lease release waiting for the generations whose recall was in
     /// flight when it was issued (`Core::release_recall_waits`).
     pub(crate) release_wait: Option<ReleaseWait>,
@@ -1189,7 +1239,10 @@ impl Core {
             if !g.ended {
                 continue;
             }
-            if g.redelegate || named.contains(&gen) || now.wait < self.gen_until(gen) {
+            if !g.redelegate_dirs.is_empty()
+                || named.contains(&gen)
+                || now.wait < self.gen_until(gen)
+            {
                 again.push((self.deleg_forget_due(now, gen), gen));
                 continue;
             }
@@ -1297,7 +1350,7 @@ impl Core {
             return false;
         }
         let me = self.me();
-        let (involved, cross): (Vec<u64>, bool) = match replica.resolve_ownership(keys) {
+        let (involved, cross): (Involved, bool) = match replica.resolve_ownership(keys) {
             Ownership::Root => return false,
             Ownership::Delegated(d) => {
                 if d.node == me {
@@ -1315,19 +1368,18 @@ impl Core {
                         return false;
                     }
                 }
-                (vec![d.gen], false)
+                (
+                    vec![(d.gen, BTreeMap::from([(d.dir, kind_of(d.kind))]))],
+                    false,
+                )
             }
             Ownership::CrossSubtree { involved, .. } => (
-                involved
-                    .iter()
-                    .filter(|d| d.node != me)
-                    .map(|d| d.gen)
-                    .collect(),
+                Self::group_by_gen(involved.iter().filter(|d| d.node != me)),
                 true,
             ),
         };
         let mut pending = false;
-        for gen in involved {
+        for (gen, dirs) in involved {
             let Some(g) = self.dl.gens.get_mut(&gen) else {
                 continue;
             };
@@ -1338,7 +1390,10 @@ impl Core {
                 if cross {
                     // As `deleg_recall_plan`: delegated again once the op
                     // ran (`deleg_redelegate_after_cross`, a usable root's).
-                    g.redelegate = true;
+                    for (d, k) in &dirs {
+                        let k = g.dirs.get(d).copied().unwrap_or(*k);
+                        g.redelegate_dirs.insert(*d, k);
+                    }
                 }
                 self.start_recall(now, gen, out);
                 if let Some(g) = self.dl.gens.get(&gen) {
@@ -1354,6 +1409,18 @@ impl Core {
                 .is_some_and(|g| !g.ended && g.gate_recalled && g.recall != RecallPhase::None);
         }
         pending
+    }
+
+    /// The subtrees `delegations` name, by the stream that holds them, with
+    /// the kind each was granted as.
+    fn group_by_gen<'a>(
+        delegations: impl Iterator<Item = &'a constellation_meta::delegation::Delegation>,
+    ) -> Involved {
+        let mut by: BTreeMap<u64, BTreeMap<Ino, DelegKind>> = BTreeMap::new();
+        for d in delegations {
+            by.entry(d.gen).or_default().insert(d.dir, kind_of(d.kind));
+        }
+        by.into_iter().collect()
     }
 
     /// What this node does as a root now, for the table's generations.
@@ -1414,10 +1481,8 @@ impl Core {
             }
             !*seen && now.wait.since(*at) < HANDED_BACK_UNSEEN_MS
         });
-        let kept = &self.dl.handed_back;
-        self.dl
-            .recall_grants
-            .retain(|gen, _| kept.contains_key(gen));
+        let live: BTreeSet<u64> = table.gens().collect();
+        self.dl.release_first.retain(|gen| live.contains(gen));
         // Path B: the table here can be ahead of the log (the root's stream
         // installs its records speculatively), and say that a generation of
         // this node ended and a new one began before the segment that ends
@@ -1549,6 +1614,8 @@ impl Core {
                 DelegateState {
                     dirs: d.dir_list().into_iter().collect(),
                     grown: BTreeMap::new(),
+                    release: None,
+                    release_pending: (BTreeSet::new(), 0),
                     core_answer_sent: None,
                     gen: d.gen,
                     until: HonourMs(0),
@@ -1650,6 +1717,32 @@ impl Core {
                 }
             }
         }
+        // Plan 46 M1.2 step 10: subtrees the root asked for that this node
+        // had not learned: released now that their records are here.
+        if !self.dl.epoch_active {
+            let ready: Vec<(u64, NodeId, Vec<Ino>)> = self
+                .dl
+                .mine
+                .iter_mut()
+                .filter(|(_, d)| !d.release_pending.0.is_empty())
+                .filter_map(|(gen, d)| {
+                    let known: Vec<Ino> = d
+                        .release_pending
+                        .0
+                        .iter()
+                        .copied()
+                        .filter(|x| d.dirs.contains(x) || d.grown.contains_key(x))
+                        .collect();
+                    for x in &known {
+                        d.release_pending.0.remove(x);
+                    }
+                    (!known.is_empty()).then_some((*gen, d.release_pending.1, known))
+                })
+                .collect();
+            for (gen, to, dirs) in ready {
+                self.on_release_request(now, to, OpId(0), gen, dirs, replica, out);
+            }
+        }
         // With an epoch active nothing was looked at: the waits stand.
         if !self.dl.epoch_active {
             self.deleg_install_waits_settle(now, &waiting_now);
@@ -1686,6 +1779,12 @@ impl Core {
                             } else {
                                 DelegKind::Manual
                             });
+                    }
+                    // And a release it did not append (a predecessor's row,
+                    // applied late): the stream no longer holds the subtree.
+                    if !g.ended && !d.dirs.is_empty() {
+                        g.dirs.retain(|dir, _| d.dirs.iter().any(|(x, _)| x == dir));
+                        g.releasing.retain(|dir| g.dirs.contains_key(dir));
                     }
                     continue;
                 }
@@ -1765,7 +1864,8 @@ impl Core {
                             .collect(),
                         node: d.node,
                         group: GroupState::of(group_row),
-                        redelegate: false,
+                        redelegate_dirs: BTreeMap::new(),
+                        releasing: BTreeSet::new(),
                         granted: now.wait,
                         inherited: true,
                         grown_at: None,
@@ -4649,7 +4749,7 @@ impl Core {
             self.place_arm(now, out);
             // M12: a re-delegation held back (the op still parked, the
             // delegate away) is tried again on the next event.
-            if self.dl.gens.values().any(|g| g.ended && g.redelegate) {
+            if self.dl.gens.values().any(|g| !g.redelegate_dirs.is_empty()) {
                 self.deleg_redelegate_after_cross(now, replica, out);
             }
         }
@@ -5276,6 +5376,7 @@ impl Core {
                 txs: Vec::new(),
                 leaving: Vec::new(),
                 leaving_barriers: Vec::new(),
+                released: None,
             },
         });
     }
@@ -5375,6 +5476,17 @@ impl Core {
                 txs.truncate(lost);
                 self.deleg_note_lost(gen, idx);
             }
+            // Plan 46 M1.2 step 10: a release whose read delegations are
+            // still being recalled keeps its row, and what follows it, back.
+            if let Some(PendingRelease {
+                held: true,
+                row: Some(row),
+                ..
+            }) = self.dl.mine.get(&gen).and_then(|d| d.release.as_ref())
+            {
+                let row = *row;
+                txs.retain(|t| t.idx < row);
+            }
             let d = self.dl.mine.get(&gen).expect("present");
             if txs.is_empty() {
                 if let Some(since) = awaited.get(&gen) {
@@ -5420,6 +5532,11 @@ impl Core {
             let round = d.stream_round;
             d.inflight = Some((req, last));
             d.inflight_at = now.wait;
+            let released = d
+                .release
+                .as_ref()
+                .filter(|r| !r.held)
+                .map(|r| r.note_at(now.wait));
             d.leaving = (!leaving.is_empty() || !leaving_barriers.is_empty()).then(|| {
                 let mut inos: Vec<Ino> = leaving.iter().map(|g| g.ino).collect();
                 inos.extend(leaving_barriers.iter().map(|(ino, _)| *ino));
@@ -5444,6 +5561,7 @@ impl Core {
                     txs,
                     leaving,
                     leaving_barriers,
+                    released,
                 },
             });
         }
@@ -5594,6 +5712,18 @@ impl Core {
             return;
         };
         let progressed = through > d.streamed_through;
+        // Plan 46 M1.2 step 10: the root appended the release row (its batch
+        // carried the note, which it handled before the rows), or
+        // acknowledged the batch of a release that journaled none.
+        if d.release.as_ref().is_some_and(|r| {
+            !r.held
+                && match r.row {
+                    Some(row) => through >= row,
+                    None => answers_inflight,
+                }
+        }) {
+            d.release = None;
+        }
         if !progressed && !answers_inflight {
             return;
         }
@@ -7171,15 +7301,123 @@ impl Core {
 
     // ----------------------------------------------------- recalls (delegate)
 
-    pub(crate) fn on_deleg_recall(
+    /// Plan 46 M1.2 step 10: the root asks this node to release `dirs` of
+    /// stream `gen` (every subtree it holds: a recall of the stream). This
+    /// node stops executing under them, hands their lock grants back, and
+    /// journals the release as the next row of its stream:
+    /// `SubtreeReleased { dir, at }` per subtree, or one `StreamReleased`
+    /// when nothing is left of its set. The row is behind everything
+    /// executed under the subtrees (`at` is the stream's index then), and
+    /// the root sequences them only after it has appended it, so no row of
+    /// the subtree is in the log after the root's own. The other subtrees of
+    /// the stream stay live. Idempotent: the root sends the request again
+    /// while it has not seen the row (L3).
+    ///
+    /// A stream that cannot release by a row (one of its rows depends on a
+    /// row its generation lost, `deleg_find_lost`; the stream is past what
+    /// this node's own holder tenure has committed, `holder_append_cap`; the
+    /// generation was never installed here) answers with the cut it ends at
+    /// instead (`ReleaseNote::end_at`): a recall is always safe.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn on_release_request(
         &mut self,
         now: Now,
         from: NodeId,
-        req: OpId,
+        _req: OpId,
         gen: u64,
+        dirs: Vec<Ino>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // Simulation (L3): the first release request of every Nth
+        // generation is lost on the way in; the root's repeated request is
+        // answered.
+        if self.dl.release_first.insert(gen) {
+            self.stats.deleg_recalls_first += 1;
+            let every = self.cfg.delegation_recalled_drop_every;
+            if every > 0 && self.stats.deleg_recalls_first.is_multiple_of(every) {
+                self.stats.deleg_recalleds_dropped += 1;
+                return;
+            }
+        }
+        let me = self.me();
+        let asked: BTreeSet<Ino> = dirs.into_iter().collect();
+        let Some(d) = self.dl.mine.get(&gen) else {
+            // Never installed here (the grant was parked, or not committed
+            // when the root took it back): never installed afterwards. The
+            // stream is the root's to end at the rows this node holds of it.
+            let seen = replica.delegation_table().stream(me, gen).is_some();
+            self.dl.handed_back.insert(gen, (from, now.wait, seen));
+            let cut = replica
+                .delegate_idx(gen)
+                .min(self.holder_append_cap(gen, replica));
+            let note = constellation_meta::locks::ReleaseNote {
+                dirs: asked.iter().copied().collect(),
+                end_at: Some(cut),
+                locks: Default::default(),
+            };
+            self.send_release_cut(gen, from, note, out);
+            self.lock_reserve_all(now, replica, out);
+            return;
+        };
+        // What this node holds under the stream: honoured and parked
+        // subtrees alike, and any the table lists for it that it has not
+        // learned yet.
+        let mut held: BTreeSet<Ino> = d.dirs.iter().chain(d.grown.keys()).copied().collect();
+        held.extend(
+            replica
+                .delegation_table()
+                .iter()
+                .filter(|t| t.gen == gen && t.node == me)
+                .map(|t| t.dir),
+        );
+        let asked: BTreeSet<Ino> = if asked.is_empty() {
+            held.clone()
+        } else {
+            asked
+        };
+        // A subtree this node has not learned yet waits for its record
+        // (`release_pending`); the rest is released now.
+        let unknown: BTreeSet<Ino> = asked.difference(&held).copied().collect();
+        let asked: BTreeSet<Ino> = asked.intersection(&held).copied().collect();
+        // A repeated request for what is released already: the batch that
+        // carries the note goes out again.
+        let repeated = d.release.as_ref().and_then(|r| {
+            asked
+                .iter()
+                .all(|x| r.note.dirs.contains(x))
+                .then(|| (r.row.is_none(), r.held, r.note_at(now.wait)))
+        });
+        if !unknown.is_empty() {
+            let d = self.dl.mine.get_mut(&gen).expect("present");
+            d.release_pending.0.extend(unknown);
+            d.release_pending.1 = from;
+        }
+        if let Some((rowless, held, note)) = repeated {
+            {
+                // (The request is sent again because the root has not seen
+                // the row: a batch in flight is taken as lost.)
+                if rowless {
+                    if !held {
+                        self.send_release_cut(gen, from, note, out);
+                    }
+                    return;
+                }
+                let d = self.dl.mine.get_mut(&gen).expect("present");
+                if let Some((r, _)) = d.inflight.take() {
+                    self.dl.by_req.remove(&r);
+                }
+                let d = self.dl.mine.get_mut(&gen).expect("present");
+                d.stream_after = None;
+                d.stream_backoff_ms = 0;
+                self.deleg_stream(now, replica, out);
+                return;
+            }
+        }
+        if asked.is_empty() {
+            return;
+        }
+        let whole = held.iter().all(|x| asked.contains(x));
         // The stream's counter is what its rows are: a generation this
         // node's takeover gate ended has the log's index of it (the rows
         // the gate re-appended counted, the others replayed by rid as root
@@ -7187,90 +7425,206 @@ impl Core {
         // node's own holder appends its tenure has not committed (a
         // takeover gate's re-append, unshipped, perhaps never: a node
         // deposed before its gate's segment ships): the next root's log
-        // would lack a row the cut covers.
-        let through = replica
-            .delegate_idx(gen)
-            .min(self.holder_append_cap(gen, replica));
-        // Plan 30 §M14: the subtree's lock grants go back with the answer;
-        // its waiters are told to ask the root.
-        let locks = self.lock_hand_back(now, gen, replica);
-        let seen = replica
-            .delegation_table()
-            .iter()
-            .any(|d| d.gen == gen && d.node == self.me());
-        // Simulation (L3): the answer to the first recall of every Nth
-        // generation is lost on the way; the root's repeated recall is
-        // answered again from what this one handed back.
-        let first = !self.dl.handed_back.contains_key(&gen);
-        let mut lose_answer = false;
-        if first {
-            self.stats.deleg_recalls_first += 1;
-            let every = self.cfg.delegation_recalled_drop_every;
-            lose_answer = every > 0 && self.stats.deleg_recalls_first.is_multiple_of(every);
-            if lose_answer {
-                self.stats.deleg_recalleds_dropped += 1;
+        // would lack a row the cut covers. Not past a row whose dependency
+        // was lost (`deleg_stream`, or the journal read here): it is never
+        // streamed, and the root ends the generation before it.
+        let idx = replica.delegate_idx(gen);
+        let mut cut = idx.min(self.holder_append_cap(gen, replica));
+        if let Some(lost) = self.deleg_find_lost(gen, replica) {
+            cut = cut.min(lost - 1);
+        }
+        let rowless = cut < idx || self.dl.mine.get(&gen).is_some_and(|d| d.stopped);
+        let mut row = None;
+        if !rowless {
+            let records: Vec<LogRecord> = if whole {
+                vec![LogRecord::StreamReleased {
+                    node: me,
+                    gen,
+                    through: idx,
+                }]
+            } else {
+                asked
+                    .iter()
+                    .map(|dir| LogRecord::SubtreeReleased {
+                        node: me,
+                        gen,
+                        dir: *dir,
+                        at: idx,
+                    })
+                    .collect()
+            };
+            // The row is stamped with the configuration in force when it is
+            // journaled (the version this replica has applied now); nobody is
+            // answered by it, so it is the stream's rule for a remote asker.
+            if let Some(d) = self.dl.mine.get_mut(&gen) {
+                Self::deleg_group_refresh_one(d, replica);
+            }
+            let rule = self.deleg_rule(gen, Asker::Remote, replica);
+            let _row_class =
+                constellation_meta::PendingClass::set(self.deleg_row_commit(gen, rule));
+            match replica.delegate_release(&records, gen, Position::ZERO) {
+                Ok(i) => row = Some(i),
+                Err(error) => {
+                    // The root's repeated request tries again.
+                    tracing::warn!(node = me, gen = %constellation_meta::delegation::GenLabel::of(gen), %error, "could not journal a release");
+                    return;
+                }
             }
         }
-        self.dl.handed_back.insert(gen, (from, now.wait, seen));
-        if let Some(d) = self.dl.mine.get_mut(&gen) {
-            d.stopped = true;
-            d.stream_after = None;
-            d.stream_backoff_ms = 0;
-            self.stats.deleg_recalls_received += 1;
-            let parked = std::mem::take(&mut d.parked);
-            for p in parked {
+        self.stats.deleg_recalls_received += 1;
+        // The subtrees' lock grants go back with the note; their waiters are
+        // told to ask the root.
+        let asked_list: Vec<Ino> = asked.iter().copied().collect();
+        let locks = self.lock_hand_back(now, gen, &asked_list, whole, replica);
+        if whole {
+            self.dl.handed_back.insert(
+                gen,
+                (
+                    from,
+                    now.wait,
+                    replica.delegation_table().stream(me, gen).is_some(),
+                ),
+            );
+        }
+        let note = constellation_meta::locks::ReleaseNote {
+            dirs: asked_list.clone(),
+            end_at: rowless.then_some(cut),
+            locks,
+        };
+        let parked = {
+            let d = self.dl.mine.get_mut(&gen).expect("present");
+            d.dirs.retain(|x| !asked.contains(x));
+            d.grown.retain(|x, _| !asked.contains(x));
+            if whole || rowless {
+                d.stopped = true;
+                d.stream_after = None;
+                d.stream_backoff_ms = 0;
+            }
+            d.release = Some(PendingRelease {
+                note,
+                row,
+                held: false,
+                left_at: now.wait,
+                to: from,
+            });
+            std::mem::take(&mut d.parked)
+        };
+        // Ops parked here for a subtree that is no longer this node's go to
+        // the root; the others stay parked.
+        let mut keep = Vec::new();
+        for p in parked {
+            let keys = super::holder::keys_of_op_in(&p.op, replica);
+            let mine = !whole
+                && matches!(
+                    replica.resolve_ownership(&keys),
+                    Ownership::Delegated(t) if t.gen == gen && t.node == me
+                );
+            if mine {
+                keep.push(p);
+            } else {
                 self.answer_not_owner(now, p, from, replica, out);
             }
-            // Drain: everything executed streams as usual, at once (a
-            // back-off of the stream was dropped above); the root waits for
-            // the cursor to reach `through`.
-            self.deleg_stream(now, replica, out);
         }
-        // Not past a row whose dependency was lost (`deleg_stream`, or the
-        // journal read here): it is never streamed, and the root ends the
-        // generation before it.
-        let through = match self.deleg_find_lost(gen, replica) {
-            Some(lost) => through.min(lost - 1),
-            None => through,
-        };
-        // Phase 2b (M8): the read delegations this delegate granted are
-        // recalled first; the root executes under the subtree only once
-        // they are gone (or, past the horizon, expired).
+        // The release row goes out at once: a batch in flight (its answer may
+        // be late, or lost) is taken as given up, the root's request is
+        // waiting for the row.
+        if let Some(d) = self.dl.mine.get_mut(&gen) {
+            d.parked = keep;
+            if let Some((r, _)) = d.inflight.take() {
+                self.dl.by_req.remove(&r);
+            }
+            let d = self.dl.mine.get_mut(&gen).expect("present");
+            d.stream_after = None;
+            d.stream_backoff_ms = 0;
+            d.refused = false;
+        }
+        // Phase 2b (M8): the read delegations this delegate granted under
+        // the released subtrees are recalled first; the root executes under
+        // them only once they are gone (or, past the horizon, expired).
+        // The release row and what follows it are held back from the
+        // stream until then.
         if self.cfg.read_delegations {
-            let need = replica.read_delegations().all_live(now.wait);
+            let mut need = replica.read_delegations().all_live(now.wait);
+            if !whole {
+                let ns = replica.namespace();
+                need.grants
+                    .retain(|g| asked.iter().any(|dir| is_under(ns, g.ino, *dir)));
+            }
             if let Some(wait) = self.start_recalls(now, need, out) {
-                if lose_answer {
-                    self.lock_reserve_all(now, replica, out);
-                    return;
+                if let Some(r) = self.dl.mine.get_mut(&gen).and_then(|d| d.release.as_mut()) {
+                    r.held = true;
                 }
                 self.park(
                     now,
                     wait,
                     None,
-                    super::readindex::ParkedWhat::DelegRecalled {
-                        to: from,
-                        req,
-                        gen,
-                        through,
-                        locks,
-                    },
+                    super::readindex::ParkedWhat::ReleaseHeld { gen },
                 );
-                self.lock_reserve_all(now, replica, out);
-                return;
             }
         }
-        if !lose_answer {
-            out.push(Action::Send {
-                to: from,
-                msg: PeerMsg::DelegRecalled {
-                    req,
-                    gen,
-                    through,
-                    locks,
-                },
-            });
+        if rowless {
+            let note = self
+                .dl
+                .mine
+                .get(&gen)
+                .and_then(|d| d.release.as_ref())
+                .filter(|r| !r.held)
+                .map(|r| r.note_at(now.wait));
+            if let Some(note) = note {
+                self.send_release_cut(gen, from, note, out);
+            }
         }
+        self.deleg_stream(now, replica, out);
         self.lock_reserve_all(now, replica, out);
+    }
+
+    /// A release that journaled no row (`ReleaseNote::end_at`) says so to the
+    /// root that asked, in a stream batch of no rows: the stream ends at the
+    /// cut, which is the root's to journal (`DelegateNodeEnded`).
+    fn send_release_cut(
+        &mut self,
+        gen: u64,
+        to: NodeId,
+        note: constellation_meta::locks::ReleaseNote,
+        out: &mut Vec<Action>,
+    ) {
+        let req = self.op_id();
+        let round = self.dl.mine.get(&gen).map_or(0, |d| d.stream_round);
+        out.push(Action::Send {
+            to,
+            msg: PeerMsg::DelegateStream {
+                req,
+                gen,
+                round,
+                txs: Vec::new(),
+                leaving: Vec::new(),
+                leaving_barriers: Vec::new(),
+                released: Some(note),
+            },
+        });
+    }
+
+    /// The read delegations a release waited for are gone: its row streams.
+    pub(crate) fn deleg_release_unheld(
+        &mut self,
+        now: Now,
+        gen: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let cut = self
+            .dl
+            .mine
+            .get_mut(&gen)
+            .and_then(|d| d.release.as_mut())
+            .and_then(|r| {
+                r.held = false;
+                r.row.is_none().then(|| (r.to, r.note_at(now.wait)))
+            });
+        if let Some((to, note)) = cut {
+            self.send_release_cut(gen, to, note, out);
+        }
+        self.deleg_stream(now, replica, out);
     }
 
     // ----------------------------------------------------- reads (M8)
@@ -7405,12 +7759,15 @@ impl Core {
         if !self.cfg.delegation || !self.deleg_known() {
             return RecallPlan::None;
         }
-        let (involved, cross): (Vec<u64>, bool) = match replica.resolve_ownership(keys) {
+        let (involved, cross): (Involved, bool) = match replica.resolve_ownership(keys) {
             Ownership::Root => return RecallPlan::None,
-            Ownership::Delegated(d) => (vec![d.gen], false),
+            Ownership::Delegated(d) => (
+                vec![(d.gen, BTreeMap::from([(d.dir, kind_of(d.kind))]))],
+                false,
+            ),
             Ownership::CrossSubtree { involved, .. } => {
                 self.stats.deleg_cross_subtree += 1;
-                (involved.iter().map(|d| d.gen).collect(), true)
+                (Self::group_by_gen(involved.iter()), true)
             }
         };
         // The gate never recalls (ADR-42): a generation it took on is the
@@ -7419,11 +7776,11 @@ impl Core {
         if self.lease.gate.is_some()
             && involved
                 .iter()
-                .any(|g| self.dl.gens.get(g).is_some_and(|s| !s.ended))
+                .any(|(g, _)| self.dl.gens.get(g).is_some_and(|s| !s.ended))
         {
             return RecallPlan::Gated;
         }
-        let designated = involved.iter().any(|g| {
+        let designated = involved.iter().any(|(g, _)| {
             self.dl
                 .gens
                 .get(g)
@@ -7446,18 +7803,24 @@ impl Core {
             });
         }
         let mut waiting = BTreeSet::new();
-        for gen in involved {
+        for (gen, dirs) in involved {
             if self.dl.gens.get(&gen).is_some_and(|g| g.ended) {
                 continue;
             }
             if cross {
                 if let Some(g) = self.dl.gens.get_mut(&gen) {
-                    // Ended by an op, not a decision: delegate it again
-                    // to the same node once the op ran (a known 2a gap).
-                    g.redelegate = true;
+                    // Released by an op, not a decision: delegate the
+                    // subtrees to the same node again once the op ran.
+                    for (d, k) in &dirs {
+                        let k = g.dirs.get(d).copied().unwrap_or(*k);
+                        g.redelegate_dirs.insert(*d, k);
+                    }
                 }
             }
-            self.start_recall(now, gen, out);
+            // Plan 46 M1.2 step 10: only the subtrees the op touches are
+            // asked for; the rest of the stream stays live.
+            let asked: BTreeSet<Ino> = dirs.keys().copied().collect();
+            self.request_release(now, gen, &asked, out);
             waiting.insert(wait_id(gen));
         }
         if waiting.is_empty() {
@@ -7490,35 +7853,54 @@ impl Core {
         if !self.root_usable(now) {
             return;
         }
+        // The subtrees an op released (or ended with its stream) are granted
+        // to the same node again; a stream still being recalled is waited
+        // for, and a subtree its stream still holds (the op did not need it
+        // after all) is dropped from the list.
         let again: Vec<Redelegation> = self
             .dl
             .gens
-            .iter()
-            .filter(|(_, g)| g.ended && g.redelegate)
-            .map(|(gen, g)| (*gen, g.dirs.iter().map(|(d, k)| (*d, *k)).collect(), g.node))
+            .iter_mut()
+            .filter(|(_, g)| {
+                !g.redelegate_dirs.is_empty() && (g.ended || g.recall == RecallPhase::None)
+            })
+            .map(|(gen, g)| {
+                let held = |d: &Ino| !g.ended && g.dirs.contains_key(d);
+                g.redelegate_dirs
+                    .retain(|d, _| !held(d) || g.releasing.contains(d));
+                let ready: Vec<(Ino, DelegKind)> = g
+                    .redelegate_dirs
+                    .iter()
+                    .filter(|(d, _)| !held(d))
+                    .map(|(d, k)| (*d, *k))
+                    .collect();
+                for (d, _) in &ready {
+                    g.redelegate_dirs.remove(d);
+                }
+                (*gen, ready, g.node)
+            })
+            .filter(|(_, ready, _)| !ready.is_empty())
             .collect();
         for (gen, dirs, node) in again {
             let gate_recalled = self.dl.gens.get(&gen).is_some_and(|g| g.gate_recalled);
-            if let Some(g) = self.dl.gens.get_mut(&gen) {
-                g.redelegate = false;
-            }
+            let later = |core: &mut Self| {
+                if let Some(g) = core.dl.gens.get_mut(&gen) {
+                    g.redelegate_dirs.extend(dirs.iter().copied());
+                }
+            };
             if !self.dl.pending_exec.is_empty()
                 || self.has_exec_parks()
                 || self.rd_has_recall_wait(gen)
                 || self.inbox_holds_redelegation(now)
             {
                 // The op that ended it has not run yet: next time.
-                if let Some(g) = self.dl.gens.get_mut(&gen) {
-                    g.redelegate = true;
-                }
+                later(self);
                 continue;
             }
             if !self.links.get(&node).is_some_and(|l| l.connected) {
                 // The delegate is away for the moment (reconnecting
                 // mid-recall): once it is back.
-                if let Some(g) = self.dl.gens.get_mut(&gen) {
-                    g.redelegate = true;
-                }
+                later(self);
                 continue;
             }
             // Every subtree again: the first grant opens the new stream and
@@ -7619,25 +8001,74 @@ impl Core {
         }
         g.recall = RecallPhase::Sent;
         g.gate_recalled = gated;
+        // Every subtree of the stream (plan 46 M1.2 step 10: a recall of the
+        // generation is a request for all of them).
+        g.releasing = g.dirs.keys().copied().collect();
         // The slot closes at the transition, in this step (plan 41 R1,
         // rule 2): no renewal is granted from here, whoever answers it.
         self.dw.close_for_recall(gen);
-        let (to, dir) = (g.node, g.dirs.keys().next().copied().unwrap_or(0));
+        self.send_release_request(now, gen, out);
+    }
+
+    /// Plan 46 M1.2 step 10: ask the holder of stream `gen` to release the
+    /// subtrees `dirs` only. The rest of the stream stays live: its slot
+    /// stays open and its renewals are granted. A stream asked for all of
+    /// its subtrees is recalled whole ([`Self::start_recall`]); one already
+    /// being recalled is not asked again, the caller waits for it.
+    pub(crate) fn request_release(
+        &mut self,
+        now: Now,
+        gen: u64,
+        dirs: &BTreeSet<Ino>,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(g) = self.dl.gens.get_mut(&gen) else {
+            return;
+        };
+        if g.ended || g.recall != RecallPhase::None {
+            return;
+        }
+        if g.dirs.keys().all(|d| dirs.contains(d)) {
+            self.start_recall(now, gen, out);
+            return;
+        }
+        // A takeover gate recalls whole generations only.
+        if self.lease.gate.is_some() {
+            return;
+        }
+        let outstanding = g.recall_resend.is_some();
+        let new = dirs.iter().any(|d| g.releasing.insert(*d));
+        if outstanding && !new {
+            return;
+        }
+        self.send_release_request(now, gen, out);
+    }
+
+    /// Send `gen`'s release request for its `releasing` subtrees: a new
+    /// attempt under a new request id, with its resend timer (L3).
+    fn send_release_request(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
+        let Some(g) = self.dl.gens.get_mut(&gen) else {
+            return;
+        };
+        let (to, dirs) = (g.node, g.releasing.iter().copied().collect::<Vec<_>>());
+        let had_timer = g.recall_resend.take();
         let req = self.op_id();
         let back_off = self.deleg_request_timeout_ms();
-        let timer =
-            self.set_timer_wait(now.wait.plus(back_off), Timer::DelegRecallResend(gen), out);
+        if let Some(t) = had_timer {
+            self.cancel_timer(t, out);
+        }
+        let timer = self.set_timer_wait(now.wait.plus(back_off), Timer::ReleaseResend(gen), out);
         let gs = self.dl.gens.get_mut(&gen).expect("present");
         gs.recall_req = Some(req);
         gs.recall_tries.push(req);
-        gs.recall_started = Some(now.wait);
+        gs.recall_started.get_or_insert(now.wait);
         gs.recall_backoff_ms = back_off;
         gs.recall_resend = Some(timer);
         self.dl.by_req.insert(req, (gen, ReqKind::Recall));
         self.stats.deleg_recalls_sent += 1;
         let every = self.cfg.delegation_recall_drop_every;
         if every > 0 && self.stats.deleg_recalls_sent.is_multiple_of(every) {
-            // Simulation: the recall is lost on the way (the loss a
+            // Simulation: the request is lost on the way (the loss a
             // request's timeout stands for in production).
             self.stats.deleg_recalls_dropped += 1;
             self.arm_gen_expiry(now, gen, out);
@@ -7646,35 +8077,60 @@ impl Core {
         tracing::info!(
             node = self.me(),
             gen = %constellation_meta::delegation::GenLabel::of(gen),
-            dir,
+            ?dirs,
             delegate = to,
-            "recalling a delegation"
+            "asking a delegate to release subtrees"
         );
         out.push(Action::Send {
             to,
-            msg: PeerMsg::DelegRecall { req, dir, gen },
+            msg: PeerMsg::ReleaseRequest { req, gen, dirs },
         });
         self.arm_gen_expiry(now, gen, out);
     }
 
-    /// The recall's resend timer: a recall nobody answered is sent again
-    /// (L3), each time under a new request id, with the delay doubling from
-    /// a request's timeout to 2 s, until the delegate answers (any attempt
-    /// counts) or the expiry outwaits the generation. Nothing goes out in
-    /// a takeover gate (ADR-42) unless the gate started the recall on demand
-    /// (ADR-44), or while this root is unusable; the timer
-    /// is armed again and the next firing tries once more.
-    pub(crate) fn on_deleg_recall_resend(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
+    /// The release request's resend timer: a request nobody answered (no
+    /// release row reached this log) is sent again (L3), each time under a
+    /// new request id, with the delay doubling from a request's timeout to
+    /// 2 s, until the row comes or the expiry outwaits the generation.
+    /// Nothing goes out in a takeover gate (ADR-42) unless the gate started
+    /// the recall on demand (ADR-44), or while this root is unusable; the
+    /// timer is armed again and the next firing tries once more. A request
+    /// for some subtrees only that a request's timeout did not get a row for
+    /// becomes a recall of the whole stream: the delegate is slow, cut off or
+    /// down, and the recall closes the stream's window, so the grant's expiry
+    /// bounds the wait as it always did.
+    pub(crate) fn on_release_resend(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
+        let patience = self.deleg_request_timeout_ms();
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return;
         };
         g.recall_resend = None;
-        if g.ended || g.recall != RecallPhase::Sent {
+        if g.ended
+            || g.releasing.is_empty()
+            || matches!(g.recall, RecallPhase::Drained(_) | RecallPhase::Sealing)
+        {
             return;
         }
-        let (to, dir, mut back_off, gate_recalled) = (
+        if g.recall == RecallPhase::None
+            && g.recall_started
+                .is_some_and(|at| now.wait.since(at) >= patience as i64)
+        {
+            self.start_recall(now, gen, out);
+            if self
+                .dl
+                .gens
+                .get(&gen)
+                .is_some_and(|g| g.recall != RecallPhase::None)
+            {
+                return;
+            }
+        }
+        let Some(g) = self.dl.gens.get_mut(&gen) else {
+            return;
+        };
+        let (to, dirs, mut back_off, gate_recalled) = (
             g.node,
-            g.dirs.keys().next().copied().unwrap_or(0),
+            g.releasing.iter().copied().collect::<Vec<_>>(),
             g.recall_backoff_ms,
             g.gate_recalled,
         );
@@ -7693,13 +8149,13 @@ impl Core {
             tracing::info!(
                 node = self.me(),
                 gen = %constellation_meta::delegation::GenLabel::of(gen),
-                dir,
+                ?dirs,
                 delegate = to,
-                "sending an unanswered recall again"
+                "sending an unanswered release request again"
             );
             out.push(Action::Send {
                 to,
-                msg: PeerMsg::DelegRecall { req, dir, gen },
+                msg: PeerMsg::ReleaseRequest { req, gen, dirs },
             });
         } else {
             tracing::debug!(
@@ -7707,13 +8163,80 @@ impl Core {
                 gen = %constellation_meta::delegation::GenLabel::of(gen),
                 gate_recalled,
                 gated = self.lease.gate.is_some(),
-                "an unanswered recall is not sent again now (this root is not usable, or its gate is not shippable)"
+                "an unanswered release request is not sent again now (this root is not usable, or its gate is not shippable)"
             );
         }
-        let t = self.set_timer_wait(now.wait.plus(back_off), Timer::DelegRecallResend(gen), out);
+        let t = self.set_timer_wait(now.wait.plus(back_off), Timer::ReleaseResend(gen), out);
         let g = self.dl.gens.get_mut(&gen).expect("present");
         g.recall_backoff_ms = back_off;
         g.recall_resend = Some(t);
+    }
+
+    /// Plan 46 M1.2 step 10: the delegate's release rows (or the cut a
+    /// stream that could not journal one ends at) reached this log. Each
+    /// released subtree leaves the stream's set and the request for it is
+    /// done; a stream released whole (`StreamReleased`, or a set that is
+    /// empty) has drained to the row and ends now. The ops that waited for
+    /// the subtrees run (the table of this replica forgot them with the
+    /// rows).
+    #[allow(clippy::too_many_arguments)]
+    fn root_release_appended(
+        &mut self,
+        now: Now,
+        gen: u64,
+        dirs: &[Ino],
+        whole: bool,
+        cut: Option<u64>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(g) = self.dl.gens.get_mut(&gen) else {
+            return;
+        };
+        if g.ended {
+            return;
+        }
+        for dir in dirs {
+            g.dirs.remove(dir);
+            g.releasing.remove(dir);
+        }
+        let cursor = g.cursor;
+        let end = cut.or_else(|| (whole || g.dirs.is_empty()).then_some(cursor));
+        if let Some(th) = end {
+            g.releasing.clear();
+            if matches!(g.recall, RecallPhase::None | RecallPhase::Sent) {
+                g.recall = RecallPhase::Drained(th);
+                // The slot closes: a stream released whole renews no more.
+                self.dw.close_for_recall(gen);
+            }
+        }
+        let g = self.dl.gens.get_mut(&gen).expect("present");
+        if g.releasing.is_empty() {
+            let tries = std::mem::take(&mut g.recall_tries);
+            g.recall_req = None;
+            let timer = g.recall_resend.take();
+            // (A stream released whole is timed when it ends.)
+            if end.is_none() {
+                if let Some(at) = g.recall_started.take() {
+                    let ms = now.wait.since(at).max(0) as u64;
+                    self.stats.deleg_recalls_timed += 1;
+                    self.stats.deleg_recall_ms_sum += ms;
+                    self.stats.deleg_recall_ms_max = self.stats.deleg_recall_ms_max.max(ms);
+                    if ms > 1_000 {
+                        self.stats.deleg_recall_over_1s += 1;
+                    }
+                }
+            }
+            for r in tries {
+                self.dl.by_req.remove(&r);
+            }
+            if let Some(t) = timer {
+                self.cancel_timer(t, out);
+            }
+        }
+        self.stats.deleg_releases_appended += 1;
+        self.deleg_wait_done(now, wait_id(gen), replica, out);
+        self.root_progress(now, replica, out);
     }
 
     /// A release lets another node take the lease over at once. A
@@ -8345,43 +8868,6 @@ impl Core {
         self.end_generation(now, gen, None, replica, out);
     }
 
-    pub(crate) fn on_deleg_recalled(
-        &mut self,
-        now: Now,
-        req: OpId,
-        gen: u64,
-        through: u64,
-        replica: &dyn Replica,
-        out: &mut Vec<Action>,
-    ) {
-        let Some((g, ReqKind::Recall)) = self.dl.by_req.remove(&req) else {
-            return;
-        };
-        if g != gen {
-            return;
-        }
-        let Some(gs) = self.dl.gens.get_mut(&gen) else {
-            return;
-        };
-        gs.recall_req = None;
-        // The answer to any attempt counts; the others, and the timer that
-        // would send one more, are not needed.
-        let tries = std::mem::take(&mut gs.recall_tries);
-        let timer = gs.recall_resend.take();
-        gs.delegate_heard = Some(now.wait);
-        for r in tries {
-            self.dl.by_req.remove(&r);
-        }
-        if let Some(t) = timer {
-            self.cancel_timer(t, out);
-        }
-        let gs = self.dl.gens.get_mut(&gen).expect("present");
-        if gs.recall == RecallPhase::Sent {
-            gs.recall = RecallPhase::Drained(through);
-        }
-        self.root_progress(now, replica, out);
-    }
-
     /// A drained recall whose stream caught up ends the generation.
     fn root_progress(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         // Plan 46 M1.2 step 7 (D6): the delegate answered the recall with
@@ -8896,6 +9382,7 @@ impl Core {
         txs: Vec<constellation_meta::DelegateTx>,
         leaving: Vec<constellation_meta::locks::GrantWire>,
         leaving_barriers: Vec<(Ino, i64)>,
+        released: Option<constellation_meta::locks::ReleaseNote>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -8939,6 +9426,18 @@ impl Core {
         };
         if !usable || g.ended || g.node != from {
             self.stats.deleg_stream_refusals += 1;
+            if g.ended
+                && released
+                    .as_ref()
+                    .is_some_and(|n| !n.locks.grants.is_empty())
+            {
+                // A delegate's lock grants that come after the generation
+                // ended: nobody honours them any more, and none is installed
+                // (`lock_returned_after_end` counted the late answer of a
+                // recall before the release rode the stream).
+                self.stats.lock_returned_after_end +=
+                    released.as_ref().map_or(0, |n| n.locks.grants.len() as u64);
+            }
             refuse(out, g.cursor);
             return;
         }
@@ -8960,6 +9459,15 @@ impl Core {
         let mut cursor = g.cursor;
         let mut appended = 0u64;
         let batch_last = txs.last().map(|t| t.idx).unwrap_or(0);
+        // Plan 46 M1.2 step 10: the lock grants of the subtrees the delegate
+        // released are back in this table before the root executes under
+        // them (each grant once, whichever batch brought it).
+        let mut released_rows: Vec<Ino> = Vec::new();
+        let mut released_all = false;
+        if let Some(note) = &released {
+            let dirs: Vec<Ino> = note.dirs.clone();
+            self.lock_install_returned(now, gen, note.locks.clone(), &dirs, replica);
+        }
         for tx in txs {
             if tx.idx <= cursor {
                 continue;
@@ -9020,6 +9528,13 @@ impl Core {
                     replica.note_foreign_executed(&tx.records);
                     cursor = tx.idx;
                     appended += 1;
+                    for r in &tx.records {
+                        match r {
+                            LogRecord::SubtreeReleased { dir, .. } => released_rows.push(*dir),
+                            LogRecord::StreamReleased { .. } => released_all = true,
+                            _ => {}
+                        }
+                    }
                     if self.cfg.placement {
                         // The op's origin, not the delegate that executed
                         // it: a forwarded op counts for its requester.
@@ -9037,6 +9552,13 @@ impl Core {
         }
         if let Some(g) = self.dl.gens.get_mut(&gen) {
             g.cursor = cursor;
+        }
+        // The delegate's release rows are in this log: the subtrees are
+        // sequenced here from now on (the table of this replica forgot them
+        // with the rows), and the ops that waited for them run.
+        let cut = released.as_ref().and_then(|n| n.end_at);
+        if !released_rows.is_empty() || released_all || cut.is_some() {
+            self.root_release_appended(now, gen, &released_rows, released_all, cut, replica, out);
         }
         // Grants on inodes the batch takes out of the subtree: this
         // table's from the step its rows are applied in.
@@ -9335,7 +9857,8 @@ impl Core {
                 dirs: BTreeMap::from([(dir, kind)]),
                 node,
                 group: GroupState::default(),
-                redelegate: false,
+                redelegate_dirs: BTreeMap::new(),
+                releasing: BTreeSet::new(),
                 granted: now.wait,
                 inherited: false,
                 grown_at: None,
@@ -9884,6 +10407,15 @@ pub(crate) enum RecallPlan {
     /// nothing, so the op waits for the gate to open (a `Busy` retry, an
     /// inbox batch left for the poll after it).
     Gated,
+}
+
+/// The kind a subtree was granted as, from the table's.
+fn kind_of(k: SubtreeKind) -> DelegKind {
+    if k == SubtreeKind::Designated {
+        DelegKind::Designated
+    } else {
+        DelegKind::Manual
+    }
 }
 
 /// Whether `dir` is `ancestor` or under it.

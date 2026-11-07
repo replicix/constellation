@@ -336,8 +336,8 @@ pub enum TimerKind {
     PromiseWatch,
     /// M11: the root outwaits a recalled (or unrenewed) generation.
     DelegExpiry,
-    /// L3: the root sends an unanswered recall again.
-    DelegRecallResend,
+    /// L3: the root sends an unanswered release request again.
+    ReleaseResend,
     /// M11: a delegate renews its grant.
     DelegRenew,
     /// M11: a delegate gives up a grant left unrenewed past the root's

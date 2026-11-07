@@ -669,6 +669,10 @@ pub struct DelegateView {
     /// in): the fast path admits nothing under them from that instant,
     /// so the `through` the core answers the recall with is final.
     stopped: std::sync::Mutex<std::collections::HashSet<u64>>,
+    /// Subtrees of a generation the driver released ahead of the core (a
+    /// release request came in): the mirror leaves them out until the core's
+    /// view no longer lists them.
+    stopped_dirs: std::sync::Mutex<std::collections::HashSet<(u64, u64)>>,
     /// Fast-path executions admitted and not yet journaled.
     in_flight: std::sync::atomic::AtomicU64,
     /// Plan 30 §M12: the keys of the ops the root's fast path executed
@@ -719,6 +723,24 @@ impl DelegateView {
                 e.3 = true;
             }
         }
+    }
+
+    /// Plan 46 M1.2 step 10: a release request for the subtrees `dirs` of
+    /// `gen` arrived: admit nothing more under them. The rest of the stream
+    /// stays admitted. The caller waits for `in_flight` to drain before the
+    /// core journals the release.
+    pub fn stop_dirs(&self, gen: u64, dirs: &[u64]) {
+        let mut g = self.entries.lock().unwrap();
+        let mut gone = self.stopped_dirs.lock().unwrap();
+        for e in g.iter_mut() {
+            if e.1 == gen {
+                e.0.retain(|d| !dirs.contains(d));
+                if e.0.is_empty() {
+                    e.3 = true;
+                }
+            }
+        }
+        gone.extend(dirs.iter().map(|d| (gen, *d)));
     }
 
     /// F1/F9: whether this node still honours its delegation `gen` now
@@ -802,18 +824,27 @@ impl DelegateView {
 
     pub fn mirror(&self, view: &constellation_authority::core::DelegView) {
         let mut stopped = self.stopped.lock().unwrap();
+        let mut gone = self.stopped_dirs.lock().unwrap();
         let mut g = self.entries.lock().unwrap();
         g.clear();
         for (dirs, gen, until, is_stopped, _, _, _, _) in &view.mine {
+            let kept: Vec<u64> = dirs
+                .iter()
+                .copied()
+                .filter(|d| !gone.contains(&(*gen, *d)))
+                .collect();
+            let all_gone = kept.is_empty() && !dirs.is_empty();
             g.push((
-                dirs.clone(),
+                kept,
                 *gen,
                 *until,
-                *is_stopped || stopped.contains(gen),
+                *is_stopped || stopped.contains(gen) || all_gone,
             ));
         }
-        // A generation the core dropped is over: forget the stop.
+        // A generation the core dropped is over: forget the stop. A subtree
+        // the core no longer honours is released: forget the stop of it.
         stopped.retain(|gen| view.mine.iter().any(|m| m.1 == *gen));
+        gone.retain(|(gen, dir)| view.mine.iter().any(|m| m.1 == *gen && m.0.contains(dir)));
     }
 
     /// The generation this node executes `op` under right now, if any:

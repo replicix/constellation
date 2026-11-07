@@ -800,7 +800,7 @@ fn gen_end_due(g: &Inner, q: &Question, node: NodeId, gen: u64, at: u64, since: 
     inherited.max((born + g.horizon_ms).max(by_grant)) + g.recall_ms
 }
 
-/// The longest the root's recall resend waits (`on_deleg_recall_resend`,
+/// The longest the root's recall resend waits (`on_release_resend`,
 /// delegate.rs: the delay doubles from a request's timeout up to 2 s).
 const RECALL_RESEND_CAP_MS: u64 = 2_000;
 

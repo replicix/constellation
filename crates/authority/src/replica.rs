@@ -332,6 +332,15 @@ pub trait Replica {
         tag: &LockTag,
         now: Now,
     ) -> Result<(Vec<LogRecord>, u64), MetaError>;
+    /// Plan 46 M1.2 step 10: the delegate journals its release of subtrees
+    /// (`SubtreeReleased` rows, or one `StreamReleased`) as the next
+    /// transaction of its stream; returns its index.
+    fn delegate_release(
+        &self,
+        records: &[LogRecord],
+        gen: u64,
+        deps: Position,
+    ) -> Result<u64, MetaError>;
     /// The root appends a delegate's transaction with its origin
     /// (`Ok(false)`: the rid was completed already).
     fn apply_delegate_tx(
@@ -1294,6 +1303,17 @@ impl Replica for Meta {
         let (records, idx) = Meta::delegate_execute(self, op, rid, gen, deps, tag, now)?;
         self.session().note_stream(gen, idx);
         Ok((records, idx))
+    }
+
+    fn delegate_release(
+        &self,
+        records: &[LogRecord],
+        gen: u64,
+        deps: Position,
+    ) -> Result<u64, MetaError> {
+        let idx = Meta::delegate_release(self, records, gen, deps)?;
+        self.session().note_stream(gen, idx);
+        Ok(idx)
     }
 
     fn apply_delegate_tx(

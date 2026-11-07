@@ -1503,7 +1503,7 @@ fn sender_node_id(inner: &Inner, hex: &str) -> Option<u64> {
 /// sends 0) and so is not listed — so a mismatch with the authenticated
 /// sender is a forgery, whatever the handler would do with it: a
 /// `BackupAppend` from a "holder" that is not the holder, a `LockRecall`
-/// from an "owner" that owns nothing, a `DelegRecall` from a "root".
+/// from an "owner" that owns nothing, a `ReleaseRequest` from a "root".
 /// Checked once in [`handle_stream`], where the sender's identity lives,
 /// rather than handler by handler.
 fn claimed_node_id(payload: &Payload) -> Option<u64> {
@@ -1532,7 +1532,7 @@ fn claimed_node_id(payload: &Payload) -> Option<u64> {
         | LockReleased { from, .. }
         | LockRenew { from, .. }
         | LockMirror { from, .. } => *from,
-        DelegRecall { root, .. } | DelegSeal { root, .. } => *root,
+        ReleaseRequest { root, .. } | DelegSeal { root, .. } => *root,
         SealTail { claimant, .. } => *claimant,
         // `BackupAppend::from` is a journal seq; `holder` is the sender.
         ReadRecall { holder, .. }
@@ -1707,8 +1707,18 @@ async fn handle_stream<S: PeerService>(
                 txs,
                 leaving,
                 leaving_barriers,
+                released,
             } => {
-                service.delegate_stream(from, req_id, gen, round, txs, leaving, leaving_barriers);
+                service.delegate_stream(
+                    from,
+                    req_id,
+                    gen,
+                    round,
+                    txs,
+                    leaving,
+                    leaving_barriers,
+                    released,
+                );
                 Some(Payload::Ok { req_id })
             }
             Payload::DelegateStreamAck {
@@ -1798,12 +1808,15 @@ async fn handle_stream<S: PeerService>(
                 );
                 Some(Payload::Ok { req_id })
             }
-            Payload::DelegRecall {
+            Payload::ReleaseRequest {
                 root,
                 req_id,
-                dir,
                 gen,
-            } => Some(service.deleg_recall_requested(root, req_id, dir, gen).await),
+                dirs,
+            } => {
+                service.release_requested(root, req_id, gen, dirs);
+                Some(Payload::Ok { req_id })
+            }
             Payload::LeaseOffer { part, epoch } => {
                 service.lease_offered(part, epoch);
                 None
@@ -2130,7 +2143,6 @@ async fn handle_stream<S: PeerService>(
             | Payload::MutateReply { .. }
             | Payload::ReadIndexReply { .. }
             | Payload::ReadRecalled { .. }
-            | Payload::DelegRecalled { .. }
             | Payload::DelegBackupAck { .. }
             | Payload::DelegSealed { .. }
             | Payload::SealedTail { .. }

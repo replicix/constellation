@@ -1185,6 +1185,9 @@ pub struct Stats {
     /// ADR-44: generations recalled in the gate that were re-granted.
     pub deleg_gate_redelegated: u64,
     pub deleg_recalls_drained: u64,
+    /// Plan 46 M1.2 step 10: batches whose release rows (or release cut) the
+    /// root appended.
+    pub deleg_releases_appended: u64,
     pub deleg_recalls_expired: u64,
     /// L3: recalls sent again, recalls ended (start to end) with their
     /// total and longest time in ms and those past a second, and the sends
@@ -1999,8 +2002,8 @@ enum Timer {
     PromiseWait,
     PromiseWatch,
     DelegExpiry(u64),
-    /// L3: an unanswered recall is sent again (`Core::on_deleg_recall_resend`).
-    DelegRecallResend(u64),
+    /// L3: an unanswered recall is sent again (`Core::on_release_resend`).
+    ReleaseResend(u64),
     DelegRenew(u64),
     DelegLapse(u64),
     /// M14.
@@ -2067,7 +2070,7 @@ impl Timer {
             Timer::PromiseWait => TimerKind::PromiseWait,
             Timer::PromiseWatch => TimerKind::PromiseWatch,
             Timer::DelegExpiry(_) => TimerKind::DelegExpiry,
-            Timer::DelegRecallResend(_) => TimerKind::DelegRecallResend,
+            Timer::ReleaseResend(_) => TimerKind::ReleaseResend,
             Timer::LockRequestTimeout(_) => TimerKind::LockRequestTimeout,
             Timer::LockRetry(_) => TimerKind::LockRetry,
             Timer::LockHeldReply(_) => TimerKind::LockHeldReply,
@@ -2926,6 +2929,7 @@ impl Core {
                 txs,
                 leaving,
                 leaving_barriers,
+                released,
             } => self.on_delegate_stream(
                 now,
                 from,
@@ -2935,6 +2939,7 @@ impl Core {
                 txs,
                 leaving,
                 leaving_barriers,
+                released,
                 replica,
                 out,
             ),
@@ -3059,8 +3064,8 @@ impl Core {
                     }
                 }
             }
-            PeerMsg::DelegRecall { req, gen, .. } => {
-                self.on_deleg_recall(now, from, req, gen, replica, out)
+            PeerMsg::ReleaseRequest { req, gen, dirs } => {
+                self.on_release_request(now, from, req, gen, dirs, replica, out)
             }
             PeerMsg::DelegBackupAppend { req, gen, txs } => {
                 self.on_deleg_backup_append(now, from, req, gen, txs, replica, out)
@@ -3114,16 +3119,6 @@ impl Core {
                 self.on_sealed_tail(
                     now, from, req, epoch, held, empty, txs, through, next, replica, out,
                 )
-            }
-            PeerMsg::DelegRecalled {
-                req,
-                gen,
-                through,
-                locks,
-            } => {
-                // Back in the root's table (tag 0).
-                self.lock_install_returned(now, gen, locks, replica);
-                self.on_deleg_recalled(now, req, gen, through, replica, out)
             }
             PeerMsg::LockRequest {
                 req,
@@ -3370,7 +3365,7 @@ impl Core {
                 self.on_promise_watch(now, out);
             }
             Timer::DelegExpiry(gen) => self.on_deleg_expiry(now, gen, replica, out),
-            Timer::DelegRecallResend(gen) => self.on_deleg_recall_resend(now, gen, out),
+            Timer::ReleaseResend(gen) => self.on_release_resend(now, gen, out),
             Timer::DelegRenew(gen) => self.on_deleg_renew_timer(now, gen, out),
             Timer::DelegLapse(gen) => self.on_deleg_lapse(now, gen, replica, out),
             Timer::LockRequestTimeout(req) => self.on_lock_request_timeout(now, req, replica, out),

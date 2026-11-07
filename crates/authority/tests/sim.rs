@@ -9692,7 +9692,7 @@ fn recall_stall(report: &Report) -> String {
         .unwrap_or(0);
     format!(
         "sent {} dropped {} answers_dropped {} resent {} expired {} drained {} timed {} \
-         sum_ms {} max_ms {longest} over1s {}",
+         sum_ms {} max_ms {longest} over1s {} late_grants {}",
         sum(|s| s.deleg_recalls_sent),
         sum(|s| s.deleg_recalls_dropped),
         sum(|s| s.deleg_recalleds_dropped),
@@ -9702,17 +9702,20 @@ fn recall_stall(report: &Report) -> String {
         sum(|s| s.deleg_recalls_timed),
         sum(|s| s.deleg_recall_ms_sum),
         sum(|s| s.deleg_recall_over_1s),
+        sum(|s| s.lock_returned_after_end),
     )
 }
 
 /// L3 (plan 46 M0.3): a recall sent once and lost left the root waiting
 /// for the grant to run out (5 to 11 s) — `long-delegated-late-answers`
 /// seed 310 stalled one for 8.3 s. The root sends it again until the
-/// delegate answers, so no recall of the run takes 2 s.
+/// delegate answers, so no recall of the run takes 2 s. (Plan 46 M1.2 step
+/// 10: seed 310 loses no request any more now that the delegate's answer
+/// rides its stream; seed 18 loses one, and it is sent again.)
 #[test]
 fn l3_a_lost_recall_is_sent_again_in_long_delegated_late_answers_seed_310() {
-    let report = run_seed(310, long_delegated_late_answers_config())
-        .unwrap_or_else(|e| panic!("long-delegated-late-answers seed 310: {e}"));
+    let report = run_seed(18, long_delegated_late_answers_config())
+        .unwrap_or_else(|e| panic!("long-delegated-late-answers seed 18: {e}"));
     let stall = recall_stall(&report);
     let sum = |f: fn(&constellation_authority::core::Stats) -> u64| {
         report.stats.values().map(f).sum::<u64>()
@@ -14159,7 +14162,10 @@ fn locks_writer_hold_delegated_without_the_settle_is_caught() {
     // again; 981, 2329 and 2462 show none, and 1313, 2666 and 2955 are the
     // three of seeds 0 to 6 000 that do, unclocked, the settle clean on all
     // 6 000.)
-    let seeds = [1313, 2666, 2955];
+    // (Plan 46 M1.2 step 10: the delegate's release rides its stream; 1313,
+    // 2666 and 2955 show none, and 635, 3358 and 3403 are the first three of
+    // seeds 0 to 6 000 that do, unclocked, the settle clean on each.)
+    let seeds = [635, 3358, 3403];
     let mut caught = 0;
     for seed in seeds {
         if let Err(e) = run_seed(seed, locks_writer_hold_delegated_unsettled_config()) {
@@ -15262,13 +15268,16 @@ fn regression_locks_unlinked_delegated_dcrash_pause_seed_558() {
 /// copy: both exclusive. Now a recall answer after its generation ended
 /// brings no grants back (`Core::lock_install_returned`). 7455 fails on
 /// `c465b07` and passes on later main by another trajectory (the outwait
-/// barriers move its timings); 1144, 1682 and 1945 take the late-answer
-/// path here, and the test asserts that some seed does.
+/// barriers move its timings); 1144, 1682 and 1945 took the late-answer
+/// path until a recall's answer rode the delegate's stream (plan 46 M1.2
+/// step 10: the batch of an ended generation is refused and its grants
+/// counted, not installed); 5, 24 and 26 take it now, and the test asserts
+/// that some seed does.
 #[test]
 fn regression_locks_unlinked_delegated_partition_late_recall_answer() {
     use pinned::run_seed;
     let mut late = 0;
-    for seed in [7_455, 1_144, 1_682, 1_945] {
+    for seed in [7_455, 5, 24, 26] {
         let report = run_seed(seed, locks_unlinked_partition_config()).unwrap_or_else(|e| {
             panic!(
                 "locks-unlinked-delegated-partition seed {seed}: {e}\n  replay with \
@@ -17588,7 +17597,8 @@ fn the_lone_lead_oracle_catches_a_disabled_lead_and_a_disabled_hysteresis() {
     // Seeds a sweep of 300 found each to trip (the hysteresis control needs
     // a gated row of its own and a `Lone` one after it, which is rarer; plan
     // 46 M1.1's trajectories: 0, 57 and 103 trip no more; M1.2 step 2's ask
-    // cadence moved 64 off the list for 88).
+    // cadence moved 64 off the list for 88; step 10's release rows moved 2
+    // off the list for 1).
     type Control = (
         &'static str,
         fn() -> SimConfig,
@@ -17600,7 +17610,7 @@ fn the_lone_lead_oracle_catches_a_disabled_lead_and_a_disabled_hysteresis() {
             "long-delegated-lead-off",
             long_delegated_lead_off_config,
             "more than the lead",
-            &[2, 3],
+            &[1, 3],
         ),
         (
             "long-delegated-hysteresis-off",

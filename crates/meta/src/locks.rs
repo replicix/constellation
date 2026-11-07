@@ -527,6 +527,23 @@ pub struct LockHandback {
     pub barrier: i64,
 }
 
+/// Plan 46 M1.2 step 10: a delegate's answer to a `ReleaseRequest`, carried
+/// by its stream batches until the root's acknowledgement covers the release
+/// row (the row itself, `SubtreeReleased` or `StreamReleased`, is the
+/// release; this is what rides beside it). Idempotent at the root.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseNote {
+    /// The subtrees released.
+    pub dirs: Vec<u64>,
+    /// `Some(through)`: no release row could be journaled (a row of the
+    /// stream is lost, the stream is past what the delegate's own tenure
+    /// committed, or the generation was never installed here): the stream
+    /// ends at `through`, the root's cut, and every subtree with it.
+    pub end_at: Option<u64>,
+    /// The lock grants of the released subtrees, handed back.
+    pub locks: LockHandback,
+}
+
 /// Join two lock floors (positions: watermarks, so the join is what both
 /// cover). Unlike [`Position::join`], a streams overflow does not drop
 /// the other side's streams wholesale: the newest generations are kept

@@ -418,6 +418,9 @@ pub enum Payload {
         txs: Vec<u8>,
         leaving: Vec<u8>,
         leaving_barriers: Vec<u8>,
+        /// Plan 46 M1.2 step 10: postcard of the delegate's
+        /// `constellation_meta::locks::ReleaseNote` (empty: none).
+        released: Vec<u8>,
     },
     /// Plan 30 §M11, one way: the root holds `gen`'s stream through
     /// `through` (cumulative), or `refused` the batch `req_id`.
@@ -480,30 +483,16 @@ pub enum Payload {
         /// of `locks` (empty: none) — see `PeerMsg::DelegRenewed::lock_carry`.
         lock_carry: Vec<u8>,
     },
-    /// Plan 30 §M11: the root recalls generation `gen` on `dir`; the
-    /// delegate stops and answers the highest stream index it executed.
-    DelegRecall {
+    /// Plan 46 M1.2 step 10, one way: the root asks the holder of stream
+    /// `gen` to release the subtrees `dirs` (postcard of `Vec<u64>`; all of
+    /// the stream's for a recall). The delegate answers in its stream: a
+    /// release row, and the lock grants of the subtrees in
+    /// [`Payload::DelegateStream::released`].
+    ReleaseRequest {
         root: u64,
         req_id: u64,
-        dir: u64,
         gen: u64,
-    },
-    DelegRecalled {
-        req_id: u64,
-        gen: u64,
-        through: u64,
-        /// Plan 30 §M14: postcard of the delegate's lock grants under the
-        /// subtree, handed back to the root.
-        locks: Vec<u8>,
-        /// Plan 30 §M14: postcard of the subtree's lock floor, and the
-        /// latest outwait barrier under it (0: none).
-        lock_floor: Vec<u8>,
-        lock_barrier: i64,
-        /// Postcard of `Vec<(GrantId, u64)>`: what is left (ms, on the
-        /// delegate's clock at the answer) of the record of each listed
-        /// grant of `locks` (empty: none) — see
-        /// `constellation_meta::locks::LockHandback::carry`.
-        lock_carry: Vec<u8>,
+        dirs: Vec<u8>,
     },
     /// Plan 30 §M11 phase 2b: a delegate's append to its backup (postcard
     /// `Vec<DelegateTx>`), and the backup's contiguous hold (or `sealed`).
@@ -1822,14 +1811,11 @@ mod tests {
                 lock_barrier: 8,
                 lock_carry: vec![9, 10],
             },
-            Payload::DelegRecalled {
+            Payload::ReleaseRequest {
+                root: 1,
                 req_id: 3,
                 gen: 2,
-                through: 5,
-                locks: vec![1, 2],
-                lock_floor: vec![3],
-                lock_barrier: 4,
-                lock_carry: vec![5, 6, 7],
+                dirs: vec![1, 2],
             },
         ] {
             let signed = Signed::new(&k, &payload).unwrap();

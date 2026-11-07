@@ -763,6 +763,12 @@ pub enum PeerMsg {
         /// keeps them once it has applied the batch
         /// (`Core::deleg_leaving_barriers`).
         leaving_barriers: Vec<(Ino, i64)>,
+        /// Plan 46 M1.2 step 10: the delegate's answer to a
+        /// [`PeerMsg::ReleaseRequest`] (its lock grants of the released
+        /// subtrees, or the cut a stream that cannot release by a row ends
+        /// at), carried by every batch until the root has acknowledged the
+        /// release row.
+        released: Option<constellation_meta::locks::ReleaseNote>,
     },
     /// Plan 30 §M11: the root appended the stream through `through`
     /// (cumulative: the delegate re-sends from there, whichever batch
@@ -876,23 +882,18 @@ pub enum PeerMsg {
         /// restamps. A duration: no clock's absolute crosses nodes.
         lock_carry: Vec<(constellation_meta::locks::GrantId, u64)>,
     },
-    /// Plan 30 §M11: the root recalls generation `gen` on `dir`; the
-    /// delegate stops executing under it and answers with the highest
-    /// stream index it executed (`through`), which the root waits for
-    /// (or outwaits by the grant's expiry).
-    DelegRecall {
+    /// Plan 46 M1.2 step 10: the root asks the holder of stream `gen` to
+    /// release the subtrees `dirs` (every one of the stream's: a recall of
+    /// the generation). One way. The delegate stops executing under them,
+    /// drains, and journals `SubtreeReleased { dir, at }` (or
+    /// `StreamReleased` when its set empties) as the next row of its stream;
+    /// the root sequences the subtree only after it has appended that row
+    /// (the lock grants of the subtrees ride the batch that carries it,
+    /// [`ReleaseNote`]), or outwaits the grant by its expiry.
+    ReleaseRequest {
         req: OpId,
-        dir: Ino,
         gen: u64,
-    },
-    DelegRecalled {
-        req: OpId,
-        gen: u64,
-        through: u64,
-        /// Plan 30 §M14: the delegate's lock grants under the subtree,
-        /// handed back (restamped by the root), and the subtree's lock
-        /// floor as the delegate knew it.
-        locks: constellation_meta::locks::LockHandback,
+        dirs: Vec<Ino>,
     },
     /// Phase 2b: a delegate appends its stream transactions to its
     /// backup before acknowledging them; the backup answers with what it
@@ -1105,8 +1106,7 @@ impl PeerMsg {
             PeerMsg::DelegRenewOffCore { .. } => "DelegRenewOffCore",
             PeerMsg::DelegRenewedOffCore { .. } => "DelegRenewedOffCore",
             PeerMsg::DelegRenewed { .. } => "DelegRenewed",
-            PeerMsg::DelegRecall { .. } => "DelegRecall",
-            PeerMsg::DelegRecalled { .. } => "DelegRecalled",
+            PeerMsg::ReleaseRequest { .. } => "ReleaseRequest",
             PeerMsg::DelegBackupAppend { .. } => "DelegBackupAppend",
             PeerMsg::DelegBackupAck { .. } => "DelegBackupAck",
             PeerMsg::DelegSeal { .. } => "DelegSeal",
@@ -1141,7 +1141,6 @@ impl PeerMsg {
             | PeerMsg::DelegateStreamAck { req, .. }
             | PeerMsg::DelegRenewed { req, .. }
             | PeerMsg::DelegRenewedOffCore { req, .. }
-            | PeerMsg::DelegRecalled { req, .. }
             | PeerMsg::DelegBackupAck { req, .. }
             | PeerMsg::DelegSealed { req, .. }
             | PeerMsg::LockReply { req, .. }
@@ -1167,7 +1166,7 @@ impl PeerMsg {
             | PeerMsg::DelegateStream { req, .. }
             | PeerMsg::DelegRenew { req, .. }
             | PeerMsg::DelegRenewOffCore { req, .. }
-            | PeerMsg::DelegRecall { req, .. }
+            | PeerMsg::ReleaseRequest { req, .. }
             | PeerMsg::DelegBackupAppend { req, .. }
             | PeerMsg::DelegSeal { req, .. }
             | PeerMsg::LockRequest { req, .. }

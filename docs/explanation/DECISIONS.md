@@ -2974,8 +2974,16 @@ answers with `SubtreeReleased`; the rule becomes "the subtrees the op needs
 released", the end the journaled release, and `GenState::gate_recalled` goes
 with `GenState`.
 
+*Amended by plan 46 M1.2 step 10:* the recall is a `ReleaseRequest { gen,
+dirs }`, one way; the delegate answers in its stream with a `StreamReleased`
+(or `SubtreeReleased`) row, and the gate ends the generation once it has
+appended that row (the drain `root_progress` waits for), the L3 resend
+applying to the request. The gate's on-demand recall asks for every subtree
+of the stream; a release of some subtrees only is the open root's
+(`request_release`), the gate sequences nothing it has not taken whole.
+
 See: `crates/authority/src/core/delegate.rs` (`gate_recall_on_demand`,
-`gated_takes_stream`, `start_recall`, `on_deleg_recall_resend`,
+`gated_takes_stream`, `start_recall`, `on_release_resend`,
 `root_progress`), `holder.rs` (`on_forward`'s fenced branch, `gate_settle`),
 `client.rs` (`route`, `on_forward_backoff`, `settle_route`,
 `ClientOp::gate_recall_wait`), `inbox.rs`; tests

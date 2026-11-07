@@ -905,11 +905,6 @@ pub struct Driver {
     /// driver minted for the core.
     read_index_replies: HashMap<OpId, oneshot::Sender<ReadIndexOutcome>>,
     recall_replies: HashMap<OpId, oneshot::Sender<()>>,
-    /// Plan 30 §M11: peers' delegation recalls this node is answering
-    /// (stream batches and renewals are one way, answered by the core's
-    /// own messages).
-    deleg_recall_replies:
-        HashMap<OpId, oneshot::Sender<(u64, constellation_meta::locks::LockHandback)>>,
     /// Plan 30 §M14: peers' lock requests, recalls, renewals and tests
     /// this node is answering.
     lock_request_replies: HashMap<OpId, oneshot::Sender<LockOutcome>>,
@@ -2650,7 +2645,6 @@ impl Driver {
             handoff_replies: HashMap::new(),
             read_index_replies: HashMap::new(),
             recall_replies: HashMap::new(),
-            deleg_recall_replies: HashMap::new(),
             lock_request_replies: HashMap::new(),
             lock_recall_replies: HashMap::new(),
             lock_renew_replies: HashMap::new(),
@@ -3605,6 +3599,7 @@ impl Driver {
                 txs,
                 leaving,
                 leaving_barriers,
+                released,
             } => Some(Internal::Event(Event::Peer {
                 from,
                 msg: PeerMsg::DelegateStream {
@@ -3614,6 +3609,7 @@ impl Driver {
                     txs,
                     leaving,
                     leaving_barriers,
+                    released,
                 },
             })),
             SyncRequest::PeerDelegateStreamAck {
@@ -3762,23 +3758,20 @@ impl Driver {
                     lock_carry,
                 },
             })),
-            SyncRequest::PeerDelegRecall {
+            SyncRequest::PeerReleaseRequest {
                 root,
-                dir,
+                req_id,
                 gen,
-                reply,
+                dirs,
             } => {
-                let req = self.control_id();
-                self.deleg_recall_replies.insert(req, reply);
-                // The fast path admits nothing more under `gen` from
-                // here; the core answers the recall (with the stream
-                // index it reads then) once every admitted op is
-                // journaled, so nothing lands past the `through` the
-                // root drains to (harness `cross-subtree-rename`: an op
-                // admitted in that window was refused by the root and
-                // rolled back here).
+                // The fast path admits nothing more under the subtrees from
+                // here; the core releases them (with the stream index it
+                // reads then) once every admitted op is journaled, so
+                // nothing lands past the release row the root drains to
+                // (harness `cross-subtree-rename`: an op admitted in that
+                // window was refused by the root and rolled back here).
                 let delegates = self.deps.delegates.clone();
-                delegates.stop(gen);
+                delegates.stop_dirs(gen, &dirs);
                 let tx = self.int_tx.clone();
                 tokio::spawn(async move {
                     let started = std::time::Instant::now();
@@ -3787,7 +3780,11 @@ impl Driver {
                     }
                     let _ = tx.send(Internal::Event(Event::Peer {
                         from: root,
-                        msg: PeerMsg::DelegRecall { req, dir, gen },
+                        msg: PeerMsg::ReleaseRequest {
+                            req: OpId(req_id),
+                            gen,
+                            dirs,
+                        },
                     }));
                 });
                 None
@@ -4845,16 +4842,6 @@ impl Driver {
                 };
                 self.one_way(to, payload);
             }
-            PeerMsg::DelegRecalled {
-                req,
-                through,
-                locks,
-                ..
-            } => {
-                if let Some(tx) = self.deleg_recall_replies.remove(&req) {
-                    let _ = tx.send((through, locks));
-                }
-            }
             PeerMsg::LockReply { req, outcome } => {
                 if let Some(tx) = self.lock_request_replies.remove(&req) {
                     let _ = tx.send(outcome);
@@ -5199,6 +5186,7 @@ impl Driver {
                 txs,
                 leaving,
                 leaving_barriers,
+                released,
             } => {
                 let payload = Payload::DelegateStream {
                     from: self.node_id,
@@ -5208,6 +5196,9 @@ impl Driver {
                     txs: postcard::to_allocvec(&txs).unwrap_or_default(),
                     leaving: postcard::to_allocvec(&leaving).unwrap_or_default(),
                     leaving_barriers: postcard::to_allocvec(&leaving_barriers).unwrap_or_default(),
+                    released: released
+                        .map(|n| postcard::to_allocvec(&n).unwrap_or_default())
+                        .unwrap_or_default(),
                 };
                 self.one_way_reported(to, req, payload);
             }
@@ -5240,62 +5231,18 @@ impl Driver {
                 };
                 self.one_way_reported(to, req, payload);
             }
-            PeerMsg::DelegRecall { req, dir, gen } => {
-                let tx = self.int_tx.clone();
-                let peers = self.deps.peers.clone();
-                let root = self.node_id;
-                // Unanswered: outwaited by the grant's expiry in the core.
-                let timeout = Duration::from_millis(
-                    self.core.config().delegation_ttl_ms + self.core.config().expiry_margin_ms,
-                );
+            PeerMsg::ReleaseRequest { req, gen, dirs } => {
                 if crate::fault::p2p_denied(to) {
-                    // Dropped: the recall is outwaited like an unanswered one.
+                    // Dropped: the request is sent again like an unanswered one.
                     return;
                 }
-                tokio::spawn(async move {
-                    let payload = Payload::DelegRecall {
-                        root,
-                        req_id: req.0,
-                        dir,
-                        gen,
-                    };
-                    let reply = tokio::time::timeout(
-                        timeout,
-                        peers.request_to_node_timeout(to, &payload, timeout),
-                    )
-                    .await;
-                    match reply {
-                        Ok(Ok(Payload::DelegRecalled {
-                            req_id,
-                            gen,
-                            through,
-                            locks,
-                            lock_floor,
-                            lock_barrier,
-                            lock_carry,
-                        })) if req_id == req.0 => {
-                            let _ = tx.send(Internal::Event(Event::Peer {
-                                from: to,
-                                msg: PeerMsg::DelegRecalled {
-                                    req,
-                                    gen,
-                                    through,
-                                    locks: constellation_meta::locks::LockHandback {
-                                        grants: crate::locks::grants_of(&locks),
-                                        carry: crate::locks::carry_of(&lock_carry),
-                                        floor: crate::locks::floor_of(&lock_floor),
-                                        barrier: lock_barrier,
-                                    },
-                                },
-                            }));
-                        }
-                        _ => {
-                            let outage =
-                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
-                            let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
-                        }
-                    }
-                });
+                let payload = Payload::ReleaseRequest {
+                    root: self.node_id,
+                    req_id: req.0,
+                    gen,
+                    dirs: postcard::to_allocvec(&dirs).unwrap_or_default(),
+                };
+                self.one_way_reported(to, req, payload);
             }
             PeerMsg::DelegationRecalled { req } => {
                 if let Some(tx) = self.recall_replies.remove(&req) {

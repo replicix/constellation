@@ -625,29 +625,42 @@ delegations, and `rmdir` or rename of a delegated root. So does any op
 the root receives for a key under a live delegation (for example, from a
 node with a stale table, or from the S3 inbox).
 
-Before executing such an op, the root **recalls** the involved
-generations:
+Before executing such an op, the root asks the holders of the involved
+streams to **release** the subtrees the op touches (and only those; the
+rest of each stream stays live):
 
-1. it sends `DelegRecall`, and sends it again, under a new request id,
-   until an answer to any of the sends arrives or the grant expires: the
-   first resend after a request's timeout, each next one twice as long
-   after the one before, up to 2 s (`DelegRecallResend`; none inside a
-   takeover gate, ADR-42);
-2. the delegate answers `DelegRecalled { through }` and stops executing; a
-   recall it gets again is answered the same way, with the lock grants the
-   first answer handed back (a lost answer is not a lost hand-back);
-3. the root waits for the stream to catch up to `through`, or, if the
-   delegate is unreachable, for the grant to expire (if the delegate
-   recorded a backup in its `DelegGroup` record, the root first asks the
-   backup to seal and does not end the generation until it has appended the
-   backup's whole tail; see "Failures");
-4. the root journals `RecallCut { dir, gen, through }`, which ends the
-   generation and carries its cut (below); later stream records of it are
-   refused.
+1. it sends `ReleaseRequest { gen, dirs }`, and sends it again, under a new
+   request id, until the release row is in its log or the grant expires:
+   the first resend after a request's timeout, each next one twice as long
+   after the one before, up to 2 s (`ReleaseResend`; none inside a takeover
+   gate, ADR-42). A request that waits past the grant's horizon becomes a
+   recall of the whole stream, which the grant's expiry bounds;
+2. the delegate stops executing under those subtrees, hands back their lock
+   grants, and journals `SubtreeReleased { dir, at }` per subtree (or one
+   `StreamReleased` when its set is empty) as the next row of its stream,
+   `at` being the stream's index then: behind everything it executed under
+   them. The grants ride the stream batches that carry the row (the release
+   note), each batch re-measuring what is left of their records, until the
+   root has acknowledged the row. A request it gets again is answered with
+   the same note (a lost batch is not a lost hand-back);
+3. the root appends the stream through the row, and only then sequences the
+   subtrees itself: its replica's table forgets them with the row. If the
+   delegate is unreachable, the root waits for the grant to expire (if the
+   delegate recorded a backup in its `DelegateNodeGroup` record, the root
+   first asks the backup to seal and does not end the generation until it
+   has appended the backup's whole tail; see "Failures"). A delegate that
+   cannot journal a row (a row of its stream lost a dependency, the stream
+   is past what its own holder tenure committed, or it never installed the
+   grant) says so in the note (`end_at`), and the stream ends at that cut;
+4. a release of every subtree of a stream (a recall: the placement, an
+   `undelegate`, an epoch, a takeover gate's on-demand recall) ends the
+   generation: the root journals `DelegateNodeEnded { through }`, which
+   carries its cut (below); later stream records of it are refused. A
+   release of some subtrees does not end the stream.
 
 The root then executes the op itself. There is no two-phase commit.
-After a cross-subtree op the root delegates the same subtrees again,
-under new generations.
+After a cross-subtree op the root delegates the released subtrees to the
+same node again (they grow its live stream, or open a new one if it ended).
 
 #### The generation's end and its cut
 
