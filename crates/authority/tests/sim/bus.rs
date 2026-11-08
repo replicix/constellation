@@ -71,6 +71,8 @@ pub struct Bus {
     reply_delay: Mutex<HashMap<NodeId, u64>>,
     /// `SimConfig::deleg_answer_delay`.
     deleg_answer_delay: Mutex<(u64, u64)>,
+    /// `SimConfig::seal_after_read_ms`.
+    seal_tail_delay_ms: Mutex<u64>,
     /// `SimConfig::request_delay_to`.
     request_delay_to: Mutex<Option<(NodeId, (u64, u64))>>,
     /// Plan 43 C7b: when each `(from, to)` pair last had a message
@@ -131,6 +133,7 @@ impl Bus {
             taps: Mutex::new(BTreeMap::new()),
             reply_delay: Mutex::new(HashMap::new()),
             deleg_answer_delay: Mutex::new((0, 0)),
+            seal_tail_delay_ms: Mutex::new(0),
             request_delay_to: Mutex::new(None),
             last_delivered: Mutex::new(HashMap::new()),
             sent: Mutex::new(0),
@@ -243,6 +246,10 @@ impl Bus {
         }
     }
 
+    pub fn set_seal_tail_delay_ms(&self, ms: u64) {
+        *self.seal_tail_delay_ms.lock().unwrap() = ms;
+    }
+
     pub fn set_deleg_answer_delay(&self, range: (u64, u64)) {
         *self.deleg_answer_delay.lock().unwrap() = range;
     }
@@ -332,6 +339,9 @@ impl Bus {
                 let extra = self.rng.lock().unwrap().random_range(lo..=hi);
                 delay += Duration::from_millis(extra);
             }
+        }
+        if matches!(msg, PeerMsg::SealTail { .. }) {
+            delay += Duration::from_millis(*self.seal_tail_delay_ms.lock().unwrap());
         }
         if matches!(
             msg,

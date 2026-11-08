@@ -4068,8 +4068,9 @@ to land before C0.
   (`SealTail.key`). (1) A holder whose renewal landed with a newer key than
   the claimant read refuses the seal. (2) A self-sealed holder records the
   keys its sealers read (memory only) and re-claims at once when the lease
-  sits at none of them: every sealer's CAS has failed, and nobody else may
-  claim for a TTL. The claim arms a floor to the end of the replaced window
+  sits at none of them: every CAS of a sealer it answered fails; any other
+  claimant races on the same tag and S3 (If-Match) decides, and nobody else
+  may claim for a TTL. The claim arms a floor to the end of the replaced window
   (the holder's own grants under it), and settles are answered once the gate
   can ship. (3) At a key a sealer read, the sealer that never claims (it
   crashed, or lost S3) now costs the holder `backup_claim_grace_ms` (twice

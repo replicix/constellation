@@ -630,8 +630,9 @@ impl LeaseState {
     /// an epoch this node sealed for a claimant, and its renewal key is none
     /// that a sealer read. Every sealer's claim CAS is conditioned on the tag
     /// of the key it read, so a lease at another key was written after those
-    /// reads: no sealer's CAS can land, and nobody else may claim it for a
-    /// whole TTL. The holder, fenced by its own seal, claims it at once (at
+    /// reads: every CAS of a sealer this holder answered fails. Any other
+    /// claimant races on the same tag and S3 (If-Match) decides; nobody
+    /// else may claim it for a whole TTL. The holder, fenced by its own seal, claims it at once (at
     /// the next epoch, as a takeover from its member copy: the sealed epoch
     /// is never revived). Without a recorded sealer key (a restart) the TTL
     /// rule stands.

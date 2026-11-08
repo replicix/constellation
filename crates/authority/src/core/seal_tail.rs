@@ -318,6 +318,7 @@ impl Core {
                 },
             });
         };
+        let stale_before = self.stats.seal_tail_stale_key;
         let Some((txs, through)) =
             self.seal_tail_hold(now, from, epoch, config_version, key, replica, out)
         else {
@@ -327,7 +328,10 @@ impl Core {
                 self.stats.seal_tail_unreadable += 1;
                 return;
             }
-            self.stats.seal_tail_refused += 1;
+            // A stale-key refusal is counted in `seal_tail_stale_key` only.
+            if self.stats.seal_tail_stale_key == stale_before {
+                self.stats.seal_tail_refused += 1;
+            }
             let empty = self.holds_nothing_of(epoch, replica);
             if empty {
                 self.stats.seal_tail_empty += 1;

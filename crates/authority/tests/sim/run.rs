@@ -597,6 +597,12 @@ pub struct SimConfig {
     /// the delegate's request timeout (`stress-ng-fs-nodes`). `(0, 0)`:
     /// none.
     pub deleg_answer_delay: (u64, u64),
+    /// The seal gap's witness: every `SealTail` a claimant sends is held
+    /// back this long, so a renewal of the holder that lands after the
+    /// claimant's lease read lands before the seal. (Test only; the
+    /// environment's `AUTHORITY_SIM_SEAL_AFTER_READ_MS` sets it when this is
+    /// 0.)
+    pub seal_after_read_ms: u64,
     /// Plan 43 C7b: every forwarded op (`MutateRequest`) that carries a lock
     /// token and is sent to this node is delayed by an extra seeded `(lo,
     /// hi)` ms: an op that leaves its sender inside the window of the lock
@@ -1061,6 +1067,7 @@ impl Default for SimConfig {
             lock_writes: false,
             lock_data_dir: None,
             deleg_answer_delay: (0, 0),
+            seal_after_read_ms: 0,
             request_delay_to: None,
             tag_check_at_write: true,
             strict_lock_turns: false,
@@ -4266,6 +4273,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     bus.set_beats_lost(cfg.beats_lost);
     bus.set_mirror_drop(cfg.lock_mirror_drop, cfg.lock_mirror_drop_from_ms);
     bus.set_deleg_answer_delay(cfg.deleg_answer_delay);
+    bus.set_seal_tail_delay_ms(match cfg.seal_after_read_ms {
+        0 => std::env::var("AUTHORITY_SIM_SEAL_AFTER_READ_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        ms => ms,
+    });
     bus.set_request_delay_to(cfg.request_delay_to);
     let commits: Arc<Mutex<Vec<CommitRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let in_doubt: super::node::InDoubtLog = Arc::new(Mutex::new(Vec::new()));

@@ -52412,6 +52412,42 @@ mod c1_tail_fetch {
         );
     }
 
+    /// The early re-claim delays mutations (the floor), not settles: once the
+    /// takeover's gate is shippable (marker landed, member copy re-shipped) a
+    /// settle on root keys is answered while the floor still runs. (Held
+    /// before the fix too, by the takeover gate; the test pins it for the
+    /// early claim.)
+    #[test]
+    fn a_settle_is_answered_in_the_early_reclaims_floor_once_the_gate_ships() {
+        let (mut h, _held, out) = self_sealed_reads(&[0], renewed_once_more, false);
+        let (op, _written) = claim_cas(&mut h, out).expect("no claim CAS");
+        h.step(Event::S3 {
+            op,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        assert_eq!(h.core.stats.sealed_own_early_claims, 1);
+        assert!(h.core.ack.pending_floor, "the floor is running");
+        let settle = h.create("s");
+        let now = h.clk();
+        assert!(
+            matches!(
+                h.core.gate_settle(now, 3, &settle, &h.meta),
+                Some(super::super::holder::GateSettle::Held)
+            ),
+            "not shippable yet: held"
+        );
+        h.core.lease.gate.as_mut().expect("gate").shippable = true;
+        let now = h.clk();
+        assert!(
+            matches!(
+                h.core.gate_settle(now, 3, &settle, &h.meta),
+                Some(super::super::holder::GateSettle::Answer(2))
+            ),
+            "answered while the floor runs"
+        );
+        assert!(h.core.ack.pending_floor, "the floor outlasts the answer");
+    }
+
     /// The residual of Q13, shortened: the lease sits at the key the sealer
     /// read, so the sealer's CAS can still land. The holder claims nothing
     /// until it has watched that key for the sealer's grace
@@ -52501,6 +52537,7 @@ mod c1_tail_fetch {
         assert!(!h.core.lease.lost && h.core.lease.held.is_some());
         assert_eq!(h.core.bk.sealed, 0);
         assert_eq!(h.core.stats.seal_tail_stale_key, 1);
+        assert_eq!(h.core.stats.seal_tail_refused, 0, "counted as stale only");
         // The key it holds is not stale.
         let out = seal_tail_keyed(&mut h, 3, 1, 2, 0, held.renewal_key());
         assert!(sealed(&out)[0].1, "{out:?}");

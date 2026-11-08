@@ -17009,6 +17009,39 @@ fn m03_a_reachable_sequencers_requester_is_not_isolated() {
     );
 }
 
+/// The seal gap's deterministic witness (`SimConfig::seal_after_read_ms`,
+/// env `AUTHORITY_SIM_SEAL_AFTER_READ_MS`): each claimant's `SealTail` is held
+/// back, so a renewal of the holder that landed after the claimant's lease
+/// read lands before the seal. The sealed holder re-claims at once
+/// (`sealed_own_early_claims`) and no requester ends unsettled (`+unsettled`,
+/// I4). Without the early re-claim (D7's TTL wait) the stat stays 0 and the
+/// strict form fails on these seeds.
+#[test]
+fn a_late_seal_after_the_holders_renewal_lets_it_reclaim_at_once() {
+    let mut early = 0;
+    for seed in SEAL_GAP_SEEDS {
+        let cfg = SimConfig {
+            seal_after_read_ms: SEAL_GAP_DELAY_MS,
+            ..strict(backup_strict_config(), "unsettled")
+        };
+        let r = run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!(
+                "backup-strict+unsettled seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_SEAL_AFTER_READ_MS={SEAL_GAP_DELAY_MS} AUTHORITY_SIM_CONFIG=backup-strict+unsettled"
+            )
+        });
+        early += r
+            .stats
+            .values()
+            .map(|s| s.sealed_own_early_claims)
+            .sum::<u64>();
+    }
+    assert!(early > 0, "no sealed holder re-claimed early");
+}
+
+const SEAL_GAP_DELAY_MS: u64 = 60;
+const SEAL_GAP_SEEDS: std::ops::Range<u64> = 0..300;
+
 /// Plan 46 M0.3: the isolated requesters of `flex-crash` (nodes cut from every
 /// other node and from S3 by an epoch outage) are allowed their unsettled
 /// `EIO`: seed 383 tells seven, every one of an isolated requester, and

@@ -500,3 +500,32 @@ fn a_sealed_holder_that_reclaims_loses_no_acknowledged_write() {
         &["sealed_holder_reclaimed", "tail_fetched"],
     );
 }
+
+/// The seed 3967 shape: a `Local` holder (no backups) whose lease carries an
+/// inherited tail re-claims after a claimant sealed it. The claim names only
+/// the holder's own group, so the older inherited group stops covering rows
+/// the log does not carry yet, and the holder's death loses an acknowledged
+/// write. The same gap is in D7's TTL re-claim on main (the shape was left
+/// out of the model); it is pinned here and is not closed by the seal-gap
+/// fix. When the claim keeps the older group covered, this test flips to
+/// `assert_clean`.
+#[test]
+#[should_panic(expected = "`acked_never_lost` violated")]
+fn a_sealed_local_holder_with_an_inherited_tail_loses_a_write_known_gap() {
+    let model = BackupModel {
+        commit_rule: true,
+        tail_fetch: true,
+        inherited_tail: true,
+        holder_reclaim: true,
+        reclaim_inherited: true,
+        initial_backups: vec![1, 2],
+        writers: 1,
+        reconfig: false,
+        max_crashes: 1,
+        max_epoch: 3,
+        max_tick: 2,
+        lease_ttl: 1,
+        ..BackupModel::backup(4, 1)
+    };
+    assert_clean("sealed-local-holder-inherited", &model, &[]);
+}

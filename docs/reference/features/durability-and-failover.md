@@ -309,7 +309,8 @@ lose them. So a claimant of a `Backup` lease first asks the group:
    and claims at the expiry; a holder that sealed itself never revives
    the epoch, it claims its own lease at the next epoch with its member copy
    as the tail: at once when the lease sits at no key a sealer read (every
-   sealer's CAS has failed), after the sealer's grace
+   CAS of a sealer it answered fails; any other claimant races on the same
+   tag, and S3's If-Match decides), after the sealer's grace
    (`backup_claim_grace_ms`) when it sits at one, after a TTL when the holder
    has restarted and forgot its sealers. A holder whose renewal has landed
    with a newer key than the claimant read refuses the seal.
