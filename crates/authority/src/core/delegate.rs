@@ -10388,6 +10388,29 @@ impl Core {
         // anything (its table may lag the root's): it never answers that
         // the node holds nothing.
         if !self.root_usable(now) {
+            // The node is the lease holder itself, as the lease object this
+            // node read names it (a dead or cut-off root; inside an epoch,
+            // the carrier): a root is no delegate (`on_prev_root_sealed`),
+            // so it holds no grant to end, and what it granted is the
+            // next tenure's to wait out, which the retirement's fencing of
+            // its leases lets begin. Refusing here would make the one node
+            // an operator must retire when the root is gone impossible to
+            // retire.
+            if self.root_node() == Some(node)
+                && self
+                    .lease
+                    .last_seen
+                    .as_ref()
+                    .is_some_and(|l| l.holder == node)
+            {
+                out.push(Action::ControlDone {
+                    op,
+                    result: Ok(ControlOk::Text(format!(
+                        "node {node} is the root and holds no delegation of its own"
+                    ))),
+                });
+                return;
+            }
             out.push(Action::ControlDone {
                 op,
                 result: Err(format!(

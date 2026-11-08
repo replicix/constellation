@@ -62734,6 +62734,29 @@ mod step9_one_stream_per_node {
         assert!(matches!(control_answer(&out, 2), Some(Err(_))), "{out:?}");
     }
 
+    /// The operator retires the root itself from another node (the root
+    /// is dead, or cut off in an epoch it carries): that node is the lease
+    /// holder as the lease object names it, and a root is no delegate, so
+    /// there is nothing to end and the retirement goes on. Another node
+    /// still is refused. Fails on the parent: "not the root".
+    #[test]
+    fn a_non_root_retires_the_root_itself_without_ending_grants() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.note_object(&Lease::granted("p0", 1, 1, 5_000));
+        let out = h.step(Event::Control {
+            op: OpId(1),
+            req: Control::EndGrantsOf { node: 1 },
+        });
+        assert!(matches!(control_answer(&out, 1), Some(Ok(_))), "{out:?}");
+        let out = h.step(Event::Control {
+            op: OpId(2),
+            req: Control::EndGrantsOf { node: 3 },
+        });
+        assert!(matches!(control_answer(&out, 2), Some(Err(_))), "{out:?}");
+    }
+
     /// Re-review MUST-1: the root that loses its lease while an operator's
     /// leave waits on the grants of a node fails that wait ("run it again on
     /// the root"). Its table lags and its generations are gone, so the done
