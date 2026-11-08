@@ -272,6 +272,37 @@ pub(crate) struct GenState {
     /// The phase a seal of the backup replaced: what an unanswered seal
     /// goes back to.
     pub recall_before_seal: RecallPhase,
+    /// Plan 46 M1.2 step 14 (L2b): the delegate's rowless release ended its
+    /// stream at this cut (`ReleaseNote::end_at`), and the latest record
+    /// names backups: the root seals the group before it ends the generation
+    /// (rows the delegate was answered through may sit on the backups above
+    /// the cut: the delegate-turned-root's unshipped appends of a re-ship).
+    /// Not persisted: a later root inherits the generation, recalls it again
+    /// and is answered again.
+    pub release_cut: Option<u64>,
+    /// The generation is `Sealing` because of that release: the seal is not
+    /// given up for the phase it replaced (a strict member's transport
+    /// failure, a renewal), the end waits for the cursor to reach
+    /// `release_cut` as well, and the stream is not re-delegated to the
+    /// backup (the cause of the recall stands).
+    pub release_seal: bool,
+    /// The retry of that wait (`Timer::DelegReleaseSeal`): `arm_gen_expiry`
+    /// arms nothing for a sticky or designated grant.
+    pub release_seal_timer: Option<TimerId>,
+    /// A strict member answered "holds nothing" (or a drained tail) before
+    /// the cursor reached `release_cut`: the end is tried again after every
+    /// event, as rows arrive.
+    pub release_answered: Option<NodeId>,
+    /// A strict member's answer (a tail, or "holds nothing") was taken for
+    /// the release (`end_generation` asserts it).
+    pub release_group_answered: bool,
+    /// The wait for the cursor to reach `release_cut` is over: a strict
+    /// member answered, and a whole window (`Timer::DelegReleaseSeal`) later
+    /// the stream still lacks rows up to the cut. The delegate may have let
+    /// go of its stream (it answered the release and dropped its state), and
+    /// a row of it that the group does not hold was never acknowledged: the
+    /// generation ends at the cursor.
+    pub release_cut_waived: bool,
     pub ended: bool,
     pub expiry: Option<TimerId>,
     pub recall_req: Option<OpId>,
@@ -2152,6 +2183,12 @@ impl Core {
                         committed_sent: 0,
                         recall: RecallPhase::None,
                         recall_before_seal: RecallPhase::None,
+                        release_cut: None,
+                        release_seal: false,
+                        release_seal_timer: None,
+                        release_answered: None,
+                        release_group_answered: false,
+                        release_cut_waived: false,
                         ended: false,
                         expiry: None,
                         recall_req: None,
@@ -4351,8 +4388,15 @@ impl Core {
             return;
         }
         let (dirs, non_stealable) = (gs.dirs.clone(), gs.non_stealable());
+        let (release_seal, release_cut, cut_waived) =
+            (gs.release_seal, gs.release_cut, gs.release_cut_waived);
         let tail = gs.sealed_tail.clone();
         let ends_recall = self.root_ends_recall(now, gen);
+        if release_seal {
+            if let Some(g) = self.dl.gens.get_mut(&gen) {
+                g.release_group_answered = true;
+            }
+        }
         let mut sealed = false;
         if let Some(tail) = tail {
             sealed = true;
@@ -4393,8 +4437,38 @@ impl Core {
                 return;
             }
         }
+        // Plan 46 M1.2 step 14 (L2b): a generation the delegate released
+        // ends once the root's cursor has reached the release's cut as well:
+        // "holds nothing" with rows still in flight on the stream would drop
+        // them. The rows come with the stream (or a tail), and the end is
+        // tried again after every event. A window later (the retry timer) the
+        // wait is waived: the rows the group does not hold were not
+        // acknowledged, and a delegate that let go of its stream sends no
+        // more.
+        if release_seal {
+            let cursor = self.dl.gens.get(&gen).map_or(0, |g| g.cursor);
+            if cursor < release_cut.unwrap_or(0) && !cut_waived {
+                if let Some(g) = self.dl.gens.get_mut(&gen) {
+                    g.release_answered = Some(from);
+                }
+                if first {
+                    self.stats.deleg_seal_waits += 1;
+                }
+                tracing::debug!(
+                    node = self.me(),
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
+                    member = from,
+                    cursor,
+                    cut = ?release_cut,
+                    "a released delegation's group has answered but the stream is not at the release's cut: the generation is not ended yet"
+                );
+                return;
+            }
+        }
         self.end_generation(now, gen, None, replica, out);
-        if sealed && !non_stealable {
+        // (Not a generation the delegate released: the cause of the recall
+        // stands, and the backup is no new delegate for it.)
+        if sealed && !non_stealable && !release_seal {
             // Every subtree of the stream, to the backup: the first grant
             // opens its stream, the rest grow it.
             for (dir, kind) in dirs {
@@ -4579,7 +4653,13 @@ impl Core {
             .gens
             .iter()
             .filter(|(_, g)| !g.ended)
-            .filter_map(|(gen, g)| g.sealed_tail.as_ref().map(|t| (*gen, t.from)))
+            .filter_map(|(gen, g)| {
+                g.sealed_tail
+                    .as_ref()
+                    .map(|t| t.from)
+                    .or(g.release_answered)
+                    .map(|from| (*gen, from))
+            })
             .collect();
         for (gen, from) in stalled {
             self.deleg_end_sealed(now, gen, from, false, replica, out);
@@ -5682,17 +5762,25 @@ impl Core {
                     };
                     if strict_failed && g.sealed_tail.is_none() && g.recall == RecallPhase::Sealing
                     {
-                        g.recall = match g.recall_before_seal {
-                            RecallPhase::Sealing => RecallPhase::None,
-                            before => before,
-                        };
+                        // Plan 46 M1.2 step 14: a seal asked for a delegate's
+                        // release goes back to nothing: the delegate stopped
+                        // at a cut below rows its group may hold, and the
+                        // phase before it was not the end of the stream.
+                        if !g.release_seal {
+                            g.recall = match g.recall_before_seal {
+                                RecallPhase::Sealing => RecallPhase::None,
+                                before => before,
+                            };
+                        }
                         granting = g.recall == RecallPhase::None && !g.ended;
                         // The member is unreachable (down, or cut from this
                         // root): the generation cannot end without its tail,
                         // and says so, as when the seal goes unanswered.
                         // The seals asked of the other strict members are of
                         // the seal that is over.
-                        g.seal_reqs.retain(|_, (_, strict)| !*strict);
+                        if !g.release_seal {
+                            g.seal_reqs.retain(|_, (_, strict)| !*strict);
+                        }
                         if !g.ended {
                             g.waiting_for_group = true;
                             g.waiting_since.get_or_insert(now.wait);
@@ -5948,6 +6036,7 @@ impl Core {
                     && g.recall == RecallPhase::Sealing
                     && g.waiting_for_group
                     && g.sealed_tail.is_none()
+                    && !g.release_seal
             });
             if revive {
                 if let Some(g) = self.dl.gens.get_mut(&gen) {
@@ -8229,9 +8318,28 @@ impl Core {
             && g.kind() == DelegKind::Sticky
             && !dirs.is_empty();
         let end = cut.or_else(|| (whole || g.dirs.is_empty() || knob).then_some(cursor));
+        // Plan 46 M1.2 step 14 (L2b): a rowless release ends the stream at a
+        // cut the delegate capped below its own unshipped holder appends
+        // (`holder_append_cap`). The premise that rows above the cap were
+        // never acknowledged holds for a lone tenure's appends, not for a
+        // C3 re-append: its acknowledgement was the delegate group's. So when
+        // the latest record names backups the group is sealed before the
+        // generation ends, as the model's `End` does (the recorded members'
+        // verbatim tail is appended first).
+        let release_seal = cut.is_some()
+            && !g.group.strict().is_empty()
+            && !matches!(g.recall, RecallPhase::Drained(_));
         if let Some(th) = end {
             g.releasing.clear();
-            if matches!(g.recall, RecallPhase::None | RecallPhase::Sent) {
+            if release_seal {
+                g.release_cut = Some(th);
+                g.release_seal = true;
+                if g.recall != RecallPhase::Sealing {
+                    g.recall_before_seal = g.recall;
+                    g.recall = RecallPhase::Sealing;
+                }
+                self.dw.close_for_recall(gen);
+            } else if matches!(g.recall, RecallPhase::None | RecallPhase::Sent) {
                 g.recall = RecallPhase::Drained(th);
                 // The slot closes: a stream released whole renews no more.
                 self.dw.close_for_recall(gen);
@@ -8263,8 +8371,173 @@ impl Core {
             }
         }
         self.stats.deleg_releases_appended += 1;
+        if release_seal {
+            self.deleg_release_seal_round(now, gen, true, replica, out);
+        }
         self.deleg_wait_done(now, wait_id(gen), replica, out);
         self.root_progress(now, replica, out);
+    }
+
+    /// Plan 46 M1.2 step 14 (L2b): one round of the wait a rowless release
+    /// of a recorded generation enters. `first`: the release has just been
+    /// appended (the seals go out to the strict members and, once, to the
+    /// best-effort ones); otherwise the retry (`Timer::DelegReleaseSeal`):
+    /// a tail in hand is drained again, else the strict members are asked
+    /// again, the wait is counted and shown (`waiting_for_group`), and the
+    /// timer re-armed. Liveness is C2e's: any one live strict member ends
+    /// the wait, and none reachable is the operator's `abandon-group`.
+    fn deleg_release_seal_round(
+        &mut self,
+        now: Now,
+        gen: u64,
+        first: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(g) = self.dl.gens.get(&gen) else {
+            return;
+        };
+        if g.ended || !g.release_seal || g.prev_blocked {
+            return;
+        }
+        let strict: Vec<NodeId> = g.group.strict().to_vec();
+        let best_effort = g.group.best_effort();
+        let in_hand = g
+            .sealed_tail
+            .as_ref()
+            .map(|t| t.from)
+            .or(g.release_answered);
+        if let Some(from) = in_hand {
+            if !first {
+                if let Some(g) = self.dl.gens.get_mut(&gen) {
+                    g.release_cut_waived |= g.release_answered.is_some();
+                }
+            }
+            // A tail in hand (or an answer waiting for the cursor): drained
+            // again, its rows or the stream's may have come.
+            self.deleg_end_sealed(now, gen, from, false, replica, out);
+            if self.dl.gens.get(&gen).is_none_or(|g| g.ended) {
+                return;
+            }
+        } else {
+            if first {
+                for member in best_effort {
+                    if member == self.me() {
+                        continue;
+                    }
+                    self.deleg_seal_member(now, gen, member, false, replica, out);
+                }
+            }
+            for member in strict {
+                self.deleg_seal_member(now, gen, member, true, replica, out);
+            }
+            if self.dl.gens.get(&gen).is_none_or(|g| g.ended) {
+                return;
+            }
+        }
+        if !first {
+            self.stats.deleg_seal_waits += 1;
+            let warn = {
+                let gs = self.dl.gens.get_mut(&gen).expect("present");
+                gs.waiting_for_group = true;
+                gs.waiting_since.get_or_insert(now.wait);
+                let due = gs
+                    .waiting_warned
+                    .is_none_or(|at| now.wait.since(at) >= 60_000);
+                if due {
+                    gs.waiting_warned = Some(now.wait);
+                }
+                due
+            };
+            if warn {
+                tracing::warn!(
+                    node = self.me(),
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
+                    "a delegate released its stream below rows its recorded backup may hold: the generation is not ended without the backup's tail \
+                     (`constellation repair abandon-group --gen {gen}` ends it at the root's cursor; rows only the group holds are lost)"
+                );
+            }
+        }
+        let again = now
+            .wait
+            .plus(self.cfg.backup_takeover_ms.max(self.cfg.forward_timeout_ms));
+        let old = self
+            .dl
+            .gens
+            .get_mut(&gen)
+            .and_then(|g| g.release_seal_timer.take());
+        if let Some(t) = old {
+            self.cancel_timer(t, out);
+        }
+        let t = self.set_timer_wait(again, Timer::DelegReleaseSeal(gen), out);
+        if let Some(g) = self.dl.gens.get_mut(&gen) {
+            g.release_seal_timer = Some(t);
+        }
+    }
+
+    /// The retry of [`Self::deleg_release_seal_round`].
+    pub(crate) fn on_deleg_release_seal(
+        &mut self,
+        now: Now,
+        gen: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if let Some(g) = self.dl.gens.get_mut(&gen) {
+            g.release_seal_timer = None;
+        }
+        self.deleg_release_seal_round(now, gen, false, replica, out);
+    }
+
+    /// [`Self::deleg_send_seal`], and a member that is this node itself (a
+    /// root that is its generation's backup) is served inline: the daemon
+    /// does not send a message to itself.
+    fn deleg_seal_member(
+        &mut self,
+        now: Now,
+        gen: u64,
+        member: NodeId,
+        strict: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let me = self.me();
+        if member != me {
+            self.deleg_send_seal(gen, member, strict, out);
+            return;
+        }
+        let before = out.len();
+        self.deleg_send_seal(gen, member, strict, out);
+        let sent: Vec<Action> = out.drain(before..).collect();
+        for action in sent {
+            let Action::Send {
+                msg: PeerMsg::DelegSeal { req, gen: g },
+                ..
+            } = action
+            else {
+                out.push(action);
+                continue;
+            };
+            let mut answer = Vec::new();
+            self.on_deleg_seal(now, me, req, g, replica, &mut answer);
+            for a in answer {
+                match a {
+                    Action::Send {
+                        msg:
+                            PeerMsg::DelegSealed {
+                                req,
+                                gen,
+                                sealed,
+                                txs,
+                                prev_roots,
+                            },
+                        ..
+                    } => self
+                        .on_deleg_sealed(now, me, req, gen, sealed, txs, prev_roots, replica, out),
+                    a => out.push(a),
+                }
+            }
+        }
     }
 
     /// A release lets another node take the lease over at once. A
@@ -9176,6 +9449,18 @@ impl Core {
             self.deleg_end_waits_for_prev_roots(now, gen, out);
             return;
         }
+        // Plan 46 M1.2 step 14 (L2b): a generation the delegate released
+        // below rows its group may hold ends after a strict member's answer
+        // (drained, or "holds nothing") with the cursor at the release's
+        // cut, or by an abandon.
+        debug_assert!(
+            abandoned.is_some()
+                || !g.release_seal
+                || g.group.strict().is_empty()
+                || (g.release_group_answered
+                    && (g.cursor >= g.release_cut.unwrap_or(0) || g.release_cut_waived)),
+            "a released recorded generation ends without its group's answer at the cut"
+        );
         if let Some(at) = g.recall_started {
             let ms = now.wait.since(at).max(0) as u64;
             self.stats.deleg_recalls_timed += 1;
@@ -9352,7 +9637,12 @@ impl Core {
         g.waiting_since = None;
         g.sealed_tail = None;
         g.seal_reqs.clear();
+        g.release_answered = None;
+        let release_timer = g.release_seal_timer.take();
         self.dw.close(gen);
+        if let Some(t) = release_timer {
+            self.cancel_timer(t, out);
+        }
         if first {
             let due = self.deleg_forget_due(now, gen);
             self.dl.forget_at.insert((due, gen));
@@ -9997,6 +10287,12 @@ impl Core {
                 committed_sent: 0,
                 recall: RecallPhase::None,
                 recall_before_seal: RecallPhase::None,
+                release_cut: None,
+                release_seal: false,
+                release_seal_timer: None,
+                release_answered: None,
+                release_group_answered: false,
+                release_cut_waived: false,
                 ended: false,
                 expiry: None,
                 recall_req: None,

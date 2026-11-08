@@ -943,11 +943,33 @@ fn gen_members(g: &Inner, at: u64, node: NodeId, gen: u64) -> Vec<NodeId> {
 /// tail elsewhere: the root ends it without one, so nothing can be missing.
 fn tail_reachable(g: &Inner, at: u64, r: NodeId, node: NodeId, gen: u64) -> bool {
     let members = gen_members(g, at, node, gen);
+    // Plan 46 M1.2 step 14: a delegate that was attached again since it
+    // installed the grant (a restart: it may have lost the unsynced end of its
+    // journal, and is not taken up again, `delegation_sync`) is not a holder of
+    // the tail the root can end the generation by. A release it answers
+    // rowless is sealed by the group (`Core::root_release_appended`), so the
+    // root needs a member.
+    let delegate_holds = delegate_attached_since_install(g, at, node, gen);
     members.is_empty()
-        || [node]
+        || delegate_holds
+            .then_some(node)
             .into_iter()
             .chain(members)
             .any(|h| running(g, at, h) && peer_up(g, at, r, h))
+}
+
+/// Whether `node` has been attached continuously since it first listed a grant
+/// of `gen` (no restart in between).
+fn delegate_attached_since_install(g: &Inner, at: u64, node: NodeId, gen: u64) -> bool {
+    let installed = g
+        .views
+        .get(&node)
+        .into_iter()
+        .flatten()
+        .filter(|v| v.at <= at && v.grants.iter().any(|(gn, _)| *gn == gen))
+        .map(|v| v.at)
+        .min();
+    installed.is_none_or(|t| attach_since(g, at, node) <= t)
 }
 
 /// The generations the root has to end before it executes `q`'s op at `at`

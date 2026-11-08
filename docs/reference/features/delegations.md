@@ -664,7 +664,14 @@ rest of each stream stays live):
    has appended the backup's whole tail; see "Failures"). A delegate that
    cannot journal a row (a row of its stream lost a dependency, the stream
    is past what its own holder tenure committed, or it never installed the
-   grant) says so in the note (`end_at`), and the stream ends at that cut;
+   grant) says so in the note (`end_at`), and the stream ends at that cut
+   when the generation has a recorded backup group the root seals the group
+   before it ends the generation at that cut (a rowless release is capped
+   below the delegate's own unshipped appends, and rows the group
+   acknowledged may sit above the cap): the end waits for one strict member's
+   answer (its tail appended verbatim, or "holds nothing") and for the
+   root's cursor to reach the cut, and the stream is not handed to the
+   backup again;
 4. a release of every subtree of a stream (a recall: the placement, an
    `undelegate`, an epoch, a takeover gate's on-demand recall) ends the
    generation: the root journals `DelegateNodeEnded { through }`, which
@@ -1155,8 +1162,12 @@ The subtree is designated offline to another node that is unreachable
 
 ### A generation is `waiting_for_group`
 
-The delegate is silent and no member of its recorded backup group has handed
-over the tail the root needs to end the generation (see "Failures"). Writes
+The delegate is silent, or it released its stream rowless (a sticky or
+designated holder's release included, for those grants have no expiry to end
+the wait), and no member of its recorded backup group has handed over the
+tail the root needs to end the generation (see "Failures"). A rowless
+release now waits for one live strict member of the group, asked again every
+backup-takeover window; with none reachable only `abandon-group` ends it. Writes
 under the subtree wait. Bring the delegate or its backup back (their disks
 hold the tail), or, if they are gone for good,
 `constellation repair abandon-group TARGET --gen G` on the root: rows only

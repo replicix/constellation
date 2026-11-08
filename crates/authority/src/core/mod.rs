@@ -2096,6 +2096,9 @@ enum Timer {
     DelegExpiry(u64),
     /// L3: an unanswered recall is sent again (`Core::on_release_resend`).
     ReleaseResend(u64),
+    /// Plan 46 M1.2 step 14: the wait of a released recorded generation for
+    /// its group (`Core::deleg_release_seal_round`).
+    DelegReleaseSeal(u64),
     DelegRenew(u64),
     DelegLapse(u64),
     /// M14.
@@ -2169,6 +2172,7 @@ impl Timer {
             Timer::PromiseWatch => TimerKind::PromiseWatch,
             Timer::DelegExpiry(_) => TimerKind::DelegExpiry,
             Timer::ReleaseResend(_) => TimerKind::ReleaseResend,
+            Timer::DelegReleaseSeal(_) => TimerKind::DelegReleaseSeal,
             Timer::LockRequestTimeout(_) => TimerKind::LockRequestTimeout,
             Timer::LockRetry(_) => TimerKind::LockRetry,
             Timer::LockHeldReply(_) => TimerKind::LockHeldReply,
@@ -3510,6 +3514,7 @@ impl Core {
             }
             Timer::DelegExpiry(gen) => self.on_deleg_expiry(now, gen, replica, out),
             Timer::ReleaseResend(gen) => self.on_release_resend(now, gen, out),
+            Timer::DelegReleaseSeal(gen) => self.on_deleg_release_seal(now, gen, replica, out),
             Timer::DelegRenew(gen) => self.on_deleg_renew_timer(now, gen, out),
             Timer::DelegLapse(gen) => self.on_deleg_lapse(now, gen, replica, out),
             Timer::LockRequestTimeout(req) => self.on_lock_request_timeout(now, req, replica, out),

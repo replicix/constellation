@@ -338,6 +338,9 @@ pub enum TimerKind {
     DelegExpiry,
     /// L3: the root sends an unanswered release request again.
     ReleaseResend,
+    /// Plan 46 M1.2 step 14: a released recorded generation's wait for its
+    /// group is retried.
+    DelegReleaseSeal,
     /// M11: a delegate renews its grant.
     DelegRenew,
     /// M11: a delegate gives up a grant left unrenewed past the root's

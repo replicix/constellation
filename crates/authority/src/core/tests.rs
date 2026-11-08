@@ -65692,3 +65692,255 @@ mod step5_sticky_release {
         let _: Option<TouchSet> = None;
     }
 }
+
+/// Plan 46 M1.2 step 14 (L2b, seeds 13907 and 15996): a delegate's rowless
+/// release of a recorded generation is sealed before the generation ends.
+mod step14_release_seal {
+    use super::*;
+    use crate::core::delegate::RecallPhase;
+    use crate::core::DelegKind;
+
+    fn row(idx: u64) -> constellation_meta::DelegateTx {
+        constellation_meta::DelegateTx {
+            idx,
+            rid: Some(Rid {
+                node: 3,
+                incarnation: 1,
+                seq: idx,
+            }),
+            records: vec![LogRecord::Completed {
+                rid: Rid {
+                    node: 3,
+                    incarnation: 1,
+                    seq: idx,
+                },
+            }],
+            deps: constellation_meta::Position::ZERO,
+        }
+    }
+
+    /// Node 3's rowless release of generation 7, ending its stream at `cut`.
+    fn rowless_release(h: &mut Harness, cut: u64) -> Vec<Action> {
+        let dirs = h.core.dl.gens[&7].dirs.keys().copied().collect();
+        let note = constellation_meta::locks::ReleaseNote {
+            dirs,
+            end_at: Some(cut),
+            locks: Default::default(),
+            leaving: false,
+        };
+        deliver_stream(h, 3, 7, Vec::new(), Some(note))
+    }
+
+    fn seal_reqs(out: &[Action], to: NodeId) -> Vec<OpId> {
+        sends(out)
+            .iter()
+            .filter_map(|(t, m)| match m {
+                PeerMsg::DelegSeal { req, .. } if *t == to => Some(*req),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sealed(req: OpId, txs: Vec<constellation_meta::DelegateTx>) -> Event {
+        Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegSealed {
+                req,
+                gen: 7,
+                sealed: !txs.is_empty(),
+                txs,
+                prev_roots: Vec::new(),
+            },
+        }
+    }
+
+    /// The root has appended rows 1 and 2 of the stream; the delegate releases
+    /// rowless at cut 2 (its row 3 was a holder append it had not shipped:
+    /// `holder_append_cap`), and the recorded backup 4 holds row 3.
+    fn released_below_the_backups_row() -> (Harness, OpId) {
+        let mut h = root_with_delegate_backed_by(4);
+        deliver_stream(&mut h, 3, 7, vec![row(1), row(2)], None);
+        assert_eq!(h.core.dl.gens[&7].cursor, 2);
+        let out = rowless_release(&mut h, 2);
+        let reqs = seal_reqs(&out, 4);
+        assert_eq!(reqs.len(), 1, "the strict backup is asked to seal: {out:?}");
+        (h, reqs[0])
+    }
+
+    /// Fail-before: the generation ended at `Drained(2)` at once, with row 3
+    /// held only by the backup (and the delegate's re-ship's unshipped append).
+    #[test]
+    fn a_rowless_release_of_a_recorded_generation_seals_the_group_and_appends_its_tail() {
+        let (mut h, req) = released_below_the_backups_row();
+        {
+            let g = &h.core.dl.gens[&7];
+            assert!(!g.ended, "ended below the group's row");
+            assert_eq!(g.recall, RecallPhase::Sealing);
+            assert!(g.release_seal);
+            assert_eq!(g.release_cut, Some(2));
+        }
+        // The root has no timer to wait on but the release's own.
+        h.step(sealed(req, vec![row(1), row(2), row(3)]));
+        let g = &h.core.dl.gens[&7];
+        assert!(g.ended, "the tail is drained: the generation ends");
+        assert_eq!(g.cursor, 3, "row 3 appended past the cut");
+        // Verbatim, under its origin.
+        assert_eq!(Replica::stream_applied(&h.meta, 7), 3);
+        // The cause of the recall stands: no stream is handed to the backup.
+        assert_eq!(h.core.stats.deleg_redelegated, 0);
+        assert!(
+            h.core.dl.gens.keys().all(|g| *g == 7),
+            "re-delegated: {:?}",
+            h.core.dl.gens.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// "Holds nothing" ends the generation at the cursor, which has reached
+    /// the cut.
+    #[test]
+    fn a_group_that_holds_nothing_ends_a_released_generation_at_its_cut() {
+        let (mut h, req) = released_below_the_backups_row();
+        h.step(sealed(req, Vec::new()));
+        let g = &h.core.dl.gens[&7];
+        assert!(g.ended);
+        assert_eq!(g.cursor, 2);
+    }
+
+    /// The end also needs the root's cursor at the cut: an answer that comes
+    /// before the stream's rows waits for them.
+    #[test]
+    fn the_end_waits_for_the_cursor_to_reach_the_release_cut() {
+        let mut h = root_with_delegate_backed_by(4);
+        deliver_stream(&mut h, 3, 7, vec![row(1)], None);
+        let out = rowless_release(&mut h, 2);
+        let req = seal_reqs(&out, 4)[0];
+        h.step(sealed(req, Vec::new()));
+        assert!(
+            !h.core.dl.gens[&7].ended,
+            "ended at cursor 1 with the stream's row 2 in flight"
+        );
+        deliver_stream(&mut h, 3, 7, vec![row(2)], None);
+        assert!(h.core.dl.gens[&7].ended, "row 2 arrived: the end follows");
+        assert_eq!(h.core.dl.gens[&7].cursor, 2);
+    }
+
+    /// The wait for the stream is bounded: a delegate that let go of its
+    /// stream sends the rows up to its cut no more, and a row the group does
+    /// not hold was never acknowledged. A window after the group's answer the
+    /// generation ends at the cursor (seed 1509 of `long-delegated-backup`:
+    /// row 14 only on the delegate, which dropped its state).
+    #[test]
+    fn a_cut_the_stream_never_reaches_is_waived_a_window_after_the_groups_answer() {
+        let mut h = root_with_delegate_backed_by(4);
+        deliver_stream(&mut h, 3, 7, vec![row(1)], None);
+        let out = rowless_release(&mut h, 2);
+        let req = seal_reqs(&out, 4)[0];
+        let timer = timers(&out, TimerKind::DelegReleaseSeal)[0];
+        h.step(sealed(req, Vec::new()));
+        assert!(!h.core.dl.gens[&7].ended);
+        h.advance(
+            h.core
+                .cfg
+                .backup_takeover_ms
+                .max(h.core.cfg.forward_timeout_ms)
+                + 10,
+        );
+        h.step(Event::Timer { id: timer });
+        let g = &h.core.dl.gens[&7];
+        assert!(g.ended, "still waiting for rows that never come");
+        assert_eq!(g.cursor, 1);
+    }
+
+    /// A strict seal that fails in transport does not fall back to the cut:
+    /// the generation stays `Sealing` and waits for its group.
+    #[test]
+    fn a_failed_strict_seal_does_not_restore_the_cut() {
+        let (mut h, req) = released_below_the_backups_row();
+        h.step(Event::PeerFailed {
+            req,
+            to: 4,
+            outage: true,
+        });
+        let g = &h.core.dl.gens[&7];
+        assert!(!g.ended);
+        assert_eq!(g.recall, RecallPhase::Sealing, "reverted to the cut");
+        assert!(g.waiting_for_group);
+        // A renewal from the delegate does not revive the grant either.
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(77),
+                gen: 7,
+                round: 1,
+                backup: Some(4),
+                stream_head: 2,
+                stream_head_at: 0,
+                first: false,
+            },
+        });
+        assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::Sealing);
+        assert!(!h.core.dl.gens[&7].ended);
+    }
+
+    /// A sticky (TTL-exempt) generation arms no expiry, so its wait is its
+    /// own timer: it asks the strict member again every window, shows the
+    /// wait, and a late answer to the first request ends it. The operator's
+    /// `abandon-group` ends it at the cursor.
+    #[test]
+    fn a_sticky_released_generation_asks_again_on_its_own_timer() {
+        let mut h = root_with_delegate_backed_by(4);
+        for k in h.core.dl.gens.get_mut(&7).unwrap().dirs.values_mut() {
+            *k = DelegKind::Sticky;
+        }
+        assert!(h.core.dl.gens[&7].non_stealable());
+        deliver_stream(&mut h, 3, 7, vec![row(1), row(2)], None);
+        let out = rowless_release(&mut h, 2);
+        let first = seal_reqs(&out, 4)[0];
+        let timer = timers(&out, TimerKind::DelegReleaseSeal);
+        assert_eq!(timer.len(), 1, "{out:?}");
+        assert!(timers(&out, TimerKind::DelegExpiry).is_empty());
+        let mut timer = timer[0];
+        for round in 1..=2 {
+            h.advance(
+                h.core
+                    .cfg
+                    .backup_takeover_ms
+                    .max(h.core.cfg.forward_timeout_ms)
+                    + 10,
+            );
+            let out = h.step(Event::Timer { id: timer });
+            let g = &h.core.dl.gens[&7];
+            assert!(!g.ended, "round {round}");
+            assert!(g.waiting_for_group);
+            assert_eq!(seal_reqs(&out, 4).len(), 1, "round {round}: {out:?}");
+            let t = timers(&out, TimerKind::DelegReleaseSeal);
+            assert_eq!(t.len(), 1, "round {round}: not re-armed: {out:?}");
+            timer = t[0];
+        }
+        assert_eq!(h.core.stats.deleg_seal_waits, 2);
+        // The first request's late answer is as good as the latest's.
+        h.step(sealed(first, vec![row(1), row(2), row(3)]));
+        assert!(h.core.dl.gens[&7].ended);
+        assert_eq!(h.core.dl.gens[&7].cursor, 3);
+    }
+
+    /// A root that is itself its generation's recorded backup serves its own
+    /// seal inline (the daemon sends no message to itself).
+    #[test]
+    fn a_root_that_is_the_backup_seals_itself_inline() {
+        let mut h = root_with_delegate_backed_by(1);
+        deliver_stream(&mut h, 3, 7, vec![row(1)], None);
+        let out = rowless_release(&mut h, 1);
+        assert!(
+            sends(&out)
+                .iter()
+                .all(|(to, m)| !(*to == 1 && matches!(m, PeerMsg::DelegSeal { .. }))),
+            "a seal addressed to itself: {out:?}"
+        );
+        assert_eq!(h.core.stats.deleg_seals_sent, 1, "sealed itself, inline");
+        assert!(
+            h.core.dl.gens[&7].ended,
+            "its own member copy holds nothing above the cursor: the generation ends"
+        );
+    }
+}
