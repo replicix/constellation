@@ -9531,20 +9531,23 @@ fn l2b_findings_a_committed_delegate_row_lands_with_its_identity() {
     );
 }
 
-/// L2b's other two witnesses, which plan 46 M1.2 step 7 does not close: seeds
+/// L2b's other two witnesses, which plan 46 M1.2 step 7 did not close: seeds
 /// 13907 and 15996 of `long-delegated-late-answers` (`+identity`, slow lease
-/// reads), I2c. The generation has a recorded backup (so no previous root is
-/// sealed: C2's seal set decides), its delegate (node 2) took the root over
-/// and re-appended its own rows at its gate, and its tenure never opened the
-/// gate (the read-delegation quarantine) before the next root claimed the
-/// lease. The next root recalls the delegate, which answers with the stream
-/// capped below its own unshipped holder appends (`holder_append_cap`, plan 43
-/// Q16): the generation ends below rows the group acknowledged, and the
-/// requester's shadow replay lands the row again by rid. Closed by the plan's
-/// removal of the cap and the lone-journal commit (steps 13/14), or by a seal
-/// of the recorded group at a recall's end; see PROGRESS.
+/// reads), I2c. The generation has a recorded backup, its delegate (node 2)
+/// took the root over and re-appended its own rows at its gate, and its
+/// tenure never opened the gate (the read-delegation quarantine) before the
+/// next root claimed the lease. The next root recalls the delegate, which
+/// answers with a rowless release capped below its own unshipped holder
+/// appends (`holder_append_cap`): the generation ended below rows the group
+/// acknowledged (the backup held row 11 of 1:1), and the requester's shadow
+/// replay landed the row again by rid.
+///
+/// Closed by plan 46 M1.2 step 14: a rowless release of a recorded generation
+/// seals the group before it ends (`root_release_appended`,
+/// `deleg_release_seal_round`), as the model's `End` does. (Only 15996 still
+/// witnesses on the step's parent; 13907 stopped failing when the root's own
+/// ops began recalling conflicting read grants.) See PROGRESS, "L2b".
 #[test]
-#[ignore = "L2b, open after plan 46 M1.2 step 7: seeds 13907 and 15996 (I2c) fail +identity under slow lease reads: a recorded-backup generation ended below rows its delegate-turned-root held (holder_append_cap)"]
 fn l2b_findings_a_recall_capped_by_the_delegates_unshipped_appends() {
     let cfg = strict(
         SimConfig {
@@ -17432,12 +17435,21 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         // group's tail now count their unsettled `EIO`s, every one of the
         // 26 a generation whose tail cannot be reached, the shape this
         // configuration is for; 467 such and 30 violations in 2,000 seeds,
-        // none of them in seeds 0..99.)
+        // none of them in seeds 0..99. Plan 46 M1.2 step 14: 26 to 190. A
+        // delegate that rebooted and answers the root's recall rowless (it
+        // does not take the grant up again: "the root ends it by its group")
+        // is no longer ended at its cut: the root seals the recorded group
+        // first, and with the backup dead for good it waits, as for any
+        // silent delegate, until the operator's `abandon-group` (the
+        // `-abandon` variant below stays at 0). The settles that waited
+        // were ended at the cut, with the group's acknowledged rows lost
+        // unseen. `reach.rs` counts the rebooted delegate as no holder of
+        // the tail.)
         (
             "delegated-backup-and-delegate-die",
             delegated_backup_and_delegate_die_config,
             0,
-            26,
+            190,
         ),
         (
             "delegated-backup-and-delegate-die-abandon",
