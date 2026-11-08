@@ -2305,9 +2305,11 @@ benchmark's recommendation); built.
 (plan 46 M1.2)**: with one stream per delegate node there is one total
 order and one group per node, so a dependency across generations of one
 node cannot exist; `deleg_caps`, `deleg_note_xdeps`, the xgen counters
-(`status.delegation.xgen_*`), plan 45's key move (an unlink moves the
-file's keys to its next link's generation) and its store half
-`gated_open_elsewhere_tx` were deleted in plan 46 M1.2 step 12. The rule
+(`status.delegation.xgen_*`) and the cross-generation handling of plan
+45's key move (the open-elsewhere clause and its store half
+`gated_open_elsewhere_tx`) were deleted in plan 46 M1.2 step 12. The key
+move itself stays: inode keys follow the owner of the primary link's
+parent, and an unlink that moves them is an ordinary single-owner op. The rule
 below is right for the state it was built for; the state is removed.
 (`SessionState::deleg_covered` stays: it is the fast path's
 covered-for-good watermark, not part of this rule.)
