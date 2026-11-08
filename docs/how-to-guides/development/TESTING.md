@@ -4535,21 +4535,11 @@ failing seed (`SWEEP-FAIL`), and fails at the end: `long-sessions`
 their writers by a 3 s metered hold, `SimConfig::upload_hold_ms`, across
 other nodes' ops and reads on the same names; the summary counts
 replies excusing own rows and chunks held back), `long-delegated`,
-`long-delegated-lead` (a stream batch of two records, so a lone delegate's
-own rows wait for the root whenever its journal is two transactions
-ahead of it, or an earlier row of its own node's clients still waits for
-it), `long-delegated-lead-off` and `long-delegated-hysteresis-off` (the
-negative controls of the `LoneLead` oracle, which fails every run in which a
-lone delegate's own `Lone` row is more than the lead past the committed
-prefix or behind an uncommitted gated row of its own, judging each row once,
-the step it first shows in the journal, against the prefix known then: they
-fail by design, `SWEEP-LONE-LEAD-TOTALS` counts the rows judged, the ops the
-gated mark alone held back from `Lone`; the store no longer classes a row again
-where it journals it: the fast path stamps the published rule only at the
-version the store records and, for `Singleton`, within the published horizon and
-behind no open gated row, else the op goes through the core; the core's own
-`Singleton` row behind an open gated row is stamped `Group` and the core waits
-for the group), and every
+`far-placement` (every pair out of the backup budget, the placement on:
+it delegates nothing, `place_skipped_far`, and `AUTHORITY_SIM_LONE_DELEGATE=1`
+is its negative control, with `long-delegated`'s: the deleted lone delegate,
+which must fail I1 and, `+lone`, I5),
+and every
 lock configuration of `long_locks` (`locks`, `locks-partition`, …,
 `locks-failover-backup-writes`). Use each long test's own start (its
 source) to sweep the same seeds.
@@ -4972,8 +4962,7 @@ configuration that cannot hold them yet carries
 (a sweep's `+commit` still makes it strict); each exception goes with that item.
 The exceptions on 2026-11-06: `delegated-epoch` and `delegated-designated` (plan 46 M1.4),
 `delegated-core-stall-root-lease6` (M1.3, the stale-clock re-check rule), `locks-writer-hold-delegated`
-(M1.2 step 15, harness and sim fixes), `long-delegated-lead-off` and
-`-hysteresis-off` (M1.2 step 13), and the configurations that drive the lock lane
+(M1.2 step 15, harness and sim fixes), and the configurations that drive the lock lane
 and delegate (`lock_files > 0`; M3.1). `drop-held-chain` and `-backed`
 (M2.2) and `metered-shared` (M1.2 step 16) are not delegated by configuration and stay
 strict under `+commit` only.

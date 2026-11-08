@@ -2490,6 +2490,22 @@ superseded; C2g, C2g′, C2h's scenarios, C4 and C7b-8 continue. ADR-19,
 ADR-21, ADR-23, ADR-33, ADR-38 and ADR-39 are amended or superseded in
 part as marked on each.
 
+**Landed, no lone delegate (plan 46 M1.2 step 13)**: no delegate answers
+from its disk alone. The root grants a placed or manual delegation only to a
+node with a group within `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (the root's
+own link to it within the budget, or a backup its stream records); a sticky
+or designated grant is final and needs none. A writer with neither is
+forwarded to the root (placement counts `place_skipped_far`) until a sticky
+grant (M1.3): its own ops cost the round trip to the root instead of the
+disk. The lead (`delegation_stream_rows` as a commit input and the
+published horizon), the lone↔group hysteresis (the gated mark and the
+store's demotion of a `Singleton` row), `deleg_lost_after_ack` and the
+`LoneLead` oracle are deleted; the batch size stays. The root cannot see a
+backup a far node could find among its own peers, so such a node is not
+delegated at first (a recorded backup does count). `Config::lone_delegate`
+(`AUTHORITY_SIM_LONE_DELEGATE=1`) is the negative control that grants and
+answers lone, as the model's `lone_delegate`.
+
 **Rejected**:
 - *Finish plan 43 as specified* (C3, C4, C5, C6, C7b-8): keeps five
   classes decided per row, the lead and the lone↔group flip, generations

@@ -2039,12 +2039,12 @@ impl Core {
     /// Plan 46 M1.1 step 2: the one lookup of the commit rule of `stream`'s
     /// configuration, for an answer to `asker`: from the configuration (the
     /// lease, or the generation's group), and for the singleton from the
-    /// event's own assessment ([`Self::root_lone`], [`Self::deleg_lone`]),
+    /// event's own assessment ([`Self::root_lone`]),
     /// never from what an earlier row was given.
-    pub fn rule_of(&self, stream: RuleStream, asker: Asker, replica: &dyn Replica) -> CommitRule {
+    pub fn rule_of(&self, stream: RuleStream, asker: Asker) -> CommitRule {
         match stream {
             RuleStream::Root => self.root_rule(asker),
-            RuleStream::Delegate(gen) => self.deleg_rule(gen, asker, replica),
+            RuleStream::Delegate(gen) => self.deleg_rule(gen, asker),
         }
     }
 

@@ -2756,7 +2756,7 @@ impl Core {
         // (A settle's refusal is never `Lone`: it waits for the group, also
         // for this node's own client — see `Core::settle_refusal`.)
         let class_asker = if settle { Asker::Remote } else { asker };
-        let rule = self.deleg_rule(gen, class_asker, replica);
+        let rule = self.deleg_rule(gen, class_asker);
         let mut class: constellation_meta::RowCommit = rule.into();
         let dedup = replica.recent_outcome(rid).is_some()
             || replica.completed_outcome(rid).ok().flatten().is_some();
@@ -2771,42 +2771,10 @@ impl Core {
                 (wait_gen, exec_idx) = (g, Some(idx));
             }
         }
-        if !dedup && asker == Asker::Own && !settle {
-            self.deleg_publish_rule(gen, self.deleg_row_commit(gen, rule), replica);
-        }
-        let _row_class = (!dedup).then(|| {
-            // The delegate's own node's rows are the ones its `Lone` rows
-            // follow ([`Self::deleg_lone_held_by_gated`]): the store marks
-            // a gated one. The row is stamped as decided here, from the
-            // configuration read now (the store never classes it again).
-            if asker == Asker::Own && self.cfg.delegation_lone_hysteresis {
-                constellation_meta::PendingClass::set_for_own_client(
-                    self.deleg_row_commit(gen, rule),
-                )
-            } else if asker == Asker::Own {
-                // The negative control (no hysteresis): the row is marked
-                // when gated, and the store keeps it `Singleton` where the
-                // core decided it.
-                constellation_meta::PendingClass::set_for_own_client_without_hysteresis(
-                    self.deleg_row_commit(gen, rule),
-                )
-            } else {
-                constellation_meta::PendingClass::set(self.deleg_row_commit(gen, rule))
-            }
-        });
-        if !dedup
-            && asker == Asker::Own
-            && matches!(
-                class,
-                constellation_meta::RowCommit::Group {
-                    on: GroupOn::Delegate,
-                    ..
-                }
-            )
-            && self.deleg_lone_held_by_gate_alone(gen, replica)
-        {
-            self.stats.deleg_lone_held_by_gate += 1;
-        }
+        // The row is stamped as decided here, from the configuration read
+        // now (the store never classes it again).
+        let _row_class = (!dedup)
+            .then(|| constellation_meta::PendingClass::set(self.deleg_row_commit(gen, rule)));
         constellation_meta::clear_last_journaled();
         let outcome = if let Some(records) = replica.recent_outcome(rid) {
             self.stats.forward_dedup_hits += 1;
@@ -2912,23 +2880,6 @@ impl Core {
                 }
             }
         };
-        // Plan 46 M1.1 step 4 (review, I2): the rule the row was journaled
-        // with is its rule. The store journals an own `Singleton` row as
-        // `Group` where a gated row of this node's own clients is open
-        // ahead of it (`Meta::finish_local`): the fast path's rows go in
-        // while this core waits for the writer lock, after it read the
-        // journal for its decision. The row then waits for its group (below)
-        // like a gated row the core decided itself.
-        if !dedup && exec_idx.is_some() && class.is_singleton() {
-            if let Some(row) = constellation_meta::take_last_journaled() {
-                if row.class.gated() {
-                    class = constellation_meta::RowCommit::group(
-                        class.config_version().unwrap_or(0),
-                        GroupOn::Delegate,
-                    );
-                }
-            }
-        }
         let position = Position {
             seq: replica.applied_seq().unwrap_or(0),
             pending: None,
@@ -3035,27 +2986,21 @@ impl Core {
     /// The rule stored with a row of generation `gen` this delegate
     /// journals (or publishes for its fast path): its configuration's, in
     /// the version of the group in force. With `Config::per_row_class` (the
-    /// negative control) a row journaled while the delegate assesses itself
-    /// lone carries a wrong version (`RowCommit::PER_ROW_SKEW` past its group's).
+    /// negative control) a row journaled while the delegate records no
+    /// backup carries a wrong version (`RowCommit::PER_ROW_SKEW` past its
+    /// group's).
     fn deleg_row_commit(&self, gen: u64, rule: CommitRule) -> constellation_meta::RowCommit {
         let commit = constellation_meta::RowCommit::from(rule);
-        // The negative control stamps a version close to the real one and
-        // in no history: the group's applied version plus a skew no run
-        // reaches.
-        let skewed =
-            |d: &DelegateState| d.group_version + constellation_meta::RowCommit::PER_ROW_SKEW;
         match (self.cfg.per_row_class, self.dl.mine.get(&gen), commit) {
             (true, Some(d), constellation_meta::RowCommit::Group { on, .. })
-                if self.deleg_lone(d) =>
+                if d.group_backups.is_empty() =>
             {
-                constellation_meta::RowCommit::group(skewed(d), on)
-            }
-            (true, Some(d), constellation_meta::RowCommit::Singleton { .. })
-                if self.deleg_lone(d) =>
-            {
-                constellation_meta::RowCommit::Singleton {
-                    config_version: skewed(d),
-                }
+                // A version close to the real one and in no history: the
+                // group's applied version plus a skew no run reaches.
+                constellation_meta::RowCommit::group(
+                    d.group_version + constellation_meta::RowCommit::PER_ROW_SKEW,
+                    on,
+                )
             }
             _ => commit,
         }
@@ -3064,10 +3009,13 @@ impl Core {
     /// Plan 46 M1.1 step 2: the commit rule of this node's delegate
     /// generation `gen`, for an answer to `asker`. Under `ack=s3`, or once the generation ended here
     /// (what is left of it is in the log), the group has no member and the
-    /// archive carries it; a designation is `Final`; a lone delegate's own
-    /// node's client is the singleton; otherwise the generation's group at
-    /// its applied `DelegateNodeGroup` version.
-    pub fn deleg_rule(&self, gen: u64, asker: Asker, replica: &dyn Replica) -> CommitRule {
+    /// archive carries it; a designation (or a sticky grant) is `Final`;
+    /// otherwise the generation's group at its applied `DelegateNodeGroup`
+    /// version. Plan 46 M1.2 step 13: no delegate answers on its disk alone
+    /// (the root grants only to a node whose group is within budget, or a
+    /// non-stealable grant); only the negative control
+    /// (`Config::lone_delegate`) does.
+    pub fn deleg_rule(&self, gen: u64, asker: Asker) -> CommitRule {
         let archive = CommitRule::Group {
             version: 0,
             members: 0,
@@ -3079,9 +3027,12 @@ impl Core {
         match self.dl.mine.get(&gen) {
             Some(d) if d.non_stealable => CommitRule::Final,
             Some(d)
-                if asker == Asker::Own
-                    && self.deleg_lone(d)
-                    && !self.deleg_lone_held(d, replica) =>
+                if self.cfg.lone_delegate
+                    && asker == Asker::Own
+                    && d.group_backups.is_empty()
+                    && d.group_requested.is_none()
+                    && d.backup.is_none()
+                    && !self.backup_could_be_had() =>
             {
                 CommitRule::Singleton {
                     version: d.group_version,
@@ -3102,15 +3053,15 @@ impl Core {
     /// delegate's own journal and uncommitted; the retry's answer then
     /// waits for it exactly as the first execution's did. A row of this
     /// generation that waits for its group (gated), or any row asked for by
-    /// another node, parks under `DelegateNodeGroup`: a remote must never be
-    /// answered a `Lone` row, and prefix commit makes the row committed once
-    /// the root's append (or the backup) holds a later index. This node's
-    /// own client, retrying a `Lone` row, is answered at once as `Lone`.
-    /// The row gone from the journal (the log carries it, or it was
+    /// another node, parks under `DelegateNodeGroup`: prefix commit makes
+    /// the row committed once the root's append (or the backup) holds a
+    /// later index. This node's own client, retrying a singleton row (only
+    /// the negative control `Config::lone_delegate` journals one), is
+    /// answered at once as such. The row gone from the journal (the log carries it, or it was
     /// shipped) is answered from the log. The row may be of another
-    /// generation of this node than `gen` (the rid's keys moved to it: a
-    /// second delegation here, the directory delegated here again before the
-    /// first generation's strand): the wait is then for that generation's
+    /// generation of this node than `gen` (the rid's keys moved to it: the
+    /// directory delegated here again before the first generation's
+    /// strand): the wait is then for that generation's
     /// row — `(generation, index)` — and a generation that ended here
     /// commits only through the log, or drops the row and aborts the wait.
     fn deleg_dedup_wait(
@@ -3146,94 +3097,6 @@ impl Core {
         }
     }
 
-    /// A lone delegate's journal of `d`'s generation is as many
-    /// transactions past its committed prefix (the root's cursor, or the
-    /// log) as a stream batch carries records (`delegation_stream_rows`:
-    /// one batch of single-record transactions, two of creates). Its own
-    /// node's rows, answered from its disk, are not held back by the
-    /// stream, which carries one batch per round trip to the root; another
-    /// node's forward is answered once the root holds its row, behind every
-    /// row journaled before it. Under its own node's load (a create loop at
-    /// 7,000 a second against a stream of 640, the root 60 ms away) the
-    /// journal ran ahead of the stream without bound, and every forward
-    /// waited for the backlog: 90,000 rows, minutes, until the client
-    /// deadline answered `EIO`. Past the lead its own rows wait for the root
-    /// too (`DelegateNodeGroup`), so its node's load is held to what the stream
-    /// carries and a forward waits for a bounded few batches.
-    fn deleg_lone_lead_full(
-        &self,
-        d: &DelegateState,
-        replica: &dyn Replica,
-        committed: u64,
-    ) -> bool {
-        self.cfg.delegation_lone_lead
-            && replica.delegate_idx(d.gen).saturating_sub(committed)
-                >= (self.cfg.delegation_stream_rows as u64).max(1)
-    }
-
-    /// The highest stream index a `Singleton` row of a generation may take:
-    /// the committed prefix plus the lead. The row that takes index `n` is
-    /// within the lead exactly when `n <= horizon`
-    /// ([`Self::deleg_lone_lead_full`] asked about the index before it).
-    /// Published with the rule ([`Self::report_deleg_durable`]) so the store
-    /// refuses a fast-path `Singleton` stamp past it under the writer lock,
-    /// where the journal has moved since the core's last step (the op goes
-    /// through the core, which decides it with the lead). Until step 6 takes
-    /// the lead out of the commit.
-    fn deleg_lone_horizon(&self, through: u64) -> u64 {
-        if self.cfg.delegation_lone_lead {
-            through.saturating_add((self.cfg.delegation_stream_rows as u64).max(1))
-        } else {
-            u64::MAX
-        }
-    }
-
-    /// A lone delegate's own row is not `Lone` now: its journal is a lead
-    /// ahead of the committed prefix ([`Self::deleg_lone_lead_full`]), or a
-    /// gated row of its own node's clients is uncommitted ahead of it
-    /// ([`Self::deleg_lone_held_by_gated`]).
-    pub(crate) fn deleg_lone_held(&self, d: &DelegateState, replica: &dyn Replica) -> bool {
-        let committed = self.deleg_committed_capped(d.gen, replica);
-        self.deleg_lone_lead_full(d, replica, committed)
-            || self.deleg_lone_held_by_gated(d, replica, committed)
-    }
-
-    /// The only thing that keeps a lone delegate's next own row from being
-    /// `Lone` is a gated row of its own that has not committed (not the
-    /// lead): for the counter that shows the rule was exercised.
-    fn deleg_lone_held_by_gate_alone(&self, gen: u64, replica: &dyn Replica) -> bool {
-        let Some(d) = self.dl.mine.get(&gen) else {
-            return false;
-        };
-        if self.cfg.ack_s3 || d.non_stealable || !self.deleg_lone(d) {
-            return false;
-        }
-        let committed = self.deleg_committed_capped(gen, replica);
-        !self.deleg_lone_lead_full(d, replica, committed)
-            && self.deleg_lone_held_by_gated(d, replica, committed)
-    }
-
-    /// An own `Lone` row of `d`'s generation would follow a gated row of
-    /// its own node's clients that has not committed. At a root crash the
-    /// strand drops the uncommitted gated row (its client was not answered
-    /// and retries by rid) and replays the `Lone` one after it, which then
-    /// runs without the effect it was answered on top of (a create of `f`,
-    /// then a rename of `f`: the rename fails). The lead flips a lone
-    /// delegate's class back and forth, and a delegate that turned lone
-    /// after journaling `DelegateNodeGroup` rows has such rows too: `Lone` returns
-    /// only once every one of them has committed. Another node's forward is
-    /// left out: I5 would allow rolling back a `Lone` answer behind it, and
-    /// counting it would hold a delegate that serves remote nodes back for
-    /// good, for cost.
-    fn deleg_lone_held_by_gated(
-        &self,
-        d: &DelegateState,
-        replica: &dyn Replica,
-        committed: u64,
-    ) -> bool {
-        self.cfg.delegation_lone_hysteresis && replica.delegate_gated_idx(d.gen) > committed
-    }
-
     /// The committed prefix of `gen`'s stream as this delegate knows it
     /// (`None`: not held here), for the simulation's oracles.
     pub fn deleg_committed_for_audit(&self, gen: u64, replica: &dyn Replica) -> Option<u64> {
@@ -3241,30 +3104,6 @@ impl Core {
             .mine
             .get(&gen)
             .map(|_| self.deleg_committed_capped(gen, replica))
-    }
-
-    /// Plan 43 C2 (§2.1): this delegate is lone for `d`'s generation: its
-    /// replica records no backup for it and none is requested, it appends
-    /// to none, and no backup could be had from any peer — the root
-    /// included ([`Self::backup_could_be_had`]: a roster peer linked within
-    /// the RTT budget, stable or not, and nothing known of the peers before
-    /// a directory snapshot taken after this node's last lapse). The group
-    /// is itself then, and its own node's client is answered from its disk.
-    ///
-    /// Before, this asked for a backup *candidate* (`backup_candidates`,
-    /// which also needs a link up for `backup_stable_ms`), as the root and
-    /// the oracle did until they dropped the stability term: a delegate
-    /// back from a reboot, its links younger than the window, answered its
-    /// own client `Lone` with the root linked and in budget (oracle I1,
-    /// `placement-hot` 383, `long-delegated-backup` 457), and one resumed
-    /// from a freeze answered on the directory it held before it. The
-    /// judgement now changes with events (links, roster, lapses) only,
-    /// never with the clock.
-    pub(crate) fn deleg_lone(&self, d: &DelegateState) -> bool {
-        d.group_backups.is_empty()
-            && d.group_requested.is_none()
-            && d.backup.is_none()
-            && !self.backup_could_be_had()
     }
 
     /// The backup this delegate tells the root it wants (`DelegRenew.backup`,
@@ -3658,9 +3497,7 @@ impl Core {
     }
 
     /// The committed prefix of `gen`'s stream ([`Self::deleg_committed_prefix`]):
-    /// what a `DelegateNodeGroup` answer waits for, and so what the `Lone`
-    /// lead and the hysteresis count as committed too (the own-op path asks
-    /// this on every row).
+    /// what a `DelegateNodeGroup` answer waits for.
     fn deleg_committed_capped(&self, gen: u64, replica: &dyn Replica) -> u64 {
         let log = replica.log_stream_idx(gen);
         match self.dl.mine.get(&gen) {
@@ -3700,7 +3537,7 @@ impl Core {
         let mut current = BTreeMap::new();
         let mut raised = Vec::new();
         for d in self.dl.mine.values() {
-            let rule = self.deleg_rule(d.gen, Asker::Own, replica);
+            let rule = self.deleg_rule(d.gen, Asker::Own);
             let through = self.deleg_committed_prefix(d, replica.log_stream_idx(d.gen));
             // The prefix is floored at the log's index, which this node's own
             // holder appends raise (a takeover gate's re-append): the fast
@@ -3711,15 +3548,14 @@ impl Core {
             let through = through.min(holder_caps.get(&d.gen).copied().unwrap_or(u64::MAX));
             // The fast path answers its own node's clients from the FUSE
             // thread, where the core does not see it: every index committed
-            // may have been answered — as a `DelegateNodeGroup` row journaled
-            // before the delegate turned lone is, whatever the class is
-            // now — so `deleg_group_maintain` lets go of none of them
-            // before the group that is left holds it (`acked_max`).
-            // For a lone delegate `through` is at most the root's committed
-            // prefix (`root_committed`) or the log's index, so the raise holds
-            // back an added backup only until it has caught up with what the
-            // root has committed and never blocks a removal
-            // (`acked_max <= root_committed.max(logged)`, ADR-41).
+            // may have been answered, so `deleg_group_maintain` lets go of
+            // none of them before the group that is left holds it
+            // (`acked_max`). With no backup recorded `through` is at most
+            // the root's committed prefix (`root_committed`) or the log's
+            // index, so the raise holds back an added backup only until it
+            // has caught up with what the root has committed and never
+            // blocks a removal (`acked_max <= root_committed.max(logged)`,
+            // ADR-41).
             if through > d.acked_max {
                 raised.push((d.gen, through));
             }
@@ -3728,7 +3564,6 @@ impl Core {
                 constellation_meta::DelegDurable {
                     commit: self.deleg_row_commit(d.gen, rule),
                     through,
-                    horizon: self.deleg_lone_horizon(through),
                     lost: d.stopped || d.lapsed || d.backup_sealed,
                 },
             );
@@ -3749,33 +3584,6 @@ impl Core {
             }
         }
         self.dl.reported = current;
-    }
-
-    /// Plan 46 M1.1 step 4: the rule this core is about to stamp on its own
-    /// node's row of `gen` is the one the fast path stamps from now: publish
-    /// it before the row is journaled (the prefix and the lost flag as last
-    /// reported; `report_deleg_durable` refreshes them at the end of the
-    /// step). The core decides, then waits for the store's writer lock, and
-    /// the fast path's rows go in meanwhile: with the previous step's rule
-    /// still published, a row of the old rule (a gated one, say, where the
-    /// core just decided `Lone`) would land ahead of the core's row, which
-    /// the store no longer classes again. A fast-path row journaled after
-    /// this reads the new rule under the writer lock; one journaled before
-    /// it is in the journal the core's decision read.
-    fn deleg_publish_rule(
-        &mut self,
-        gen: u64,
-        commit: constellation_meta::RowCommit,
-        replica: &dyn Replica,
-    ) {
-        let Some(reported) = self.dl.reported.get_mut(&gen) else {
-            return;
-        };
-        if reported.commit == commit {
-            return;
-        }
-        reported.commit = commit;
-        replica.set_deleg_durable(gen, Some(*reported));
     }
 
     /// Plan 43 C2 (§3.4, D7): where row `(gen, idx)` of a delegate's stream
@@ -5071,20 +4879,6 @@ impl Core {
         if d.lost_from.is_some_and(|l| l <= idx) {
             return;
         }
-        if idx <= d.acked_max {
-            // Must not happen: a row is read for a batch (and its lost
-            // dependency seen) before its group holds it, and nothing is
-            // appended at or past it. Ending the generation before the row
-            // drops an answered write.
-            self.stats.deleg_lost_after_ack += 1;
-            tracing::error!(
-                node = self.cfg.node_id,
-                gen = %constellation_meta::delegation::GenLabel::of(gen),
-                idx,
-                acked_max = d.acked_max,
-                "a row answered under the group depends on one its generation ended without"
-            );
-        }
         d.lost_from = Some(idx);
         d.stopped = true;
         self.stats.deleg_lost_deps_stopped += 1;
@@ -5302,12 +5096,14 @@ impl Core {
             if let Some(l) = self.dl.mine.get(&gen).and_then(|d| d.lost_from) {
                 txs.retain(|t| t.idx < l);
             }
-            // Plan 30 §M12: a node holds several generations (one per
-            // delegated subtree); a transaction of one may depend
-            // on this node's own execution under another (it reached it
-            // locally). The root must hold that first: the batch stops
-            // before a transaction whose own-generation deps the root has
-            // not acknowledged, and goes out once it has.
+            // Plan 30 §M12: a node holds one stream (plan 46 M1.2 step 9),
+            // but its journal can still hold rows of an earlier one (the
+            // directory delegated here again before the first generation's
+            // strand); a transaction may depend on this node's own
+            // execution under it (it reached it locally). The root must
+            // hold that first: the batch stops before a transaction whose
+            // own-generation deps the root has not acknowledged, and goes
+            // out once it has.
             // A row the log carries is the root's whatever it answered
             // (an acknowledgement lost, then the row retired here).
             let acked_here = |h: u64, i: u64, mine: &BTreeMap<u64, DelegateState>| -> bool {
@@ -6512,6 +6308,17 @@ impl Core {
         for p in parked {
             self.answer_not_owner(now, p, root, replica, out);
         }
+        // Plan 46 M1.2 step 13: no delegate answers on its disk alone, so an
+        // op of this node's own clients that waits for the root's append is
+        // waiting for a root that is silent past its earliest reclaim. It is
+        // in doubt from here (its row is journaled, its client not
+        // answered): the client takes the lease path under its rid, which is
+        // what takes a dead root over by TTL, and the answer comes from
+        // whichever sequencer holds the row. Before, such an op was answered
+        // from the disk and nothing waited on the root.
+        for id in self.stream_parks_of(gen) {
+            self.abort_park_busy(now, id, replica, out);
+        }
         self.deleg_renew_now(now, gen, out);
         self.deleg_lapsed_retry(now, gen, out);
         self.deleg_after_event(now, replica, out);
@@ -7378,7 +7185,7 @@ impl Core {
             if let Some(d) = self.dl.mine.get_mut(&gen) {
                 Self::deleg_group_refresh_one(d, replica);
             }
-            let rule = self.deleg_rule(gen, Asker::Remote, replica);
+            let rule = self.deleg_rule(gen, Asker::Remote);
             let _row_class =
                 constellation_meta::PendingClass::set(self.deleg_row_commit(gen, rule));
             match replica.delegate_release(&records, gen, Position::ZERO) {
@@ -9682,6 +9489,20 @@ impl Core {
         }
         if self.is_leaving(now, node) {
             return Err(format!("node {node} is leaving; nothing is granted to it"));
+        }
+        // Plan 46 M1.2 step 13: no lone delegate. A stealable grant goes
+        // only to a node with a group within budget (a peer within
+        // `CONSTELLATION_BACKUP_RTT_BUDGET_MS`, the root included); a sticky
+        // or designated one is final and needs none. A far writer's ops are
+        // forwarded to the root.
+        if !kind.non_stealable() && !self.delegate_group_in_budget(node) {
+            self.stats.place_skipped_far += 1;
+            return Err(format!(
+                "node {node} has no peer within the backup RTT budget ({} ms), the root \
+                 included; its ops are forwarded (a sticky grant answers there: \
+                 `delegate --sticky`)",
+                self.cfg.backup_rtt_budget_ms
+            ));
         }
         // Plan 46 M1.2 step 9: a node holds one stream, and a stream never
         // mixes grant kinds (maintainer decision 2026-11-07): it holds

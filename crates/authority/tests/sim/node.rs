@@ -740,10 +740,16 @@ impl NodeHandle {
         }
         cfg.clock_id = clock.id();
         cfg.clock_rate_budget_ppm = env.rate_budget_ppm;
+        // (A node with backups off has no peer in budget for the oracles:
+        // nobody could back it, `Core::backups_possible`.)
         env.oracles.register(
             id,
             meta.clone(),
-            cfg.backup_rtt_budget_ms,
+            if cfg.backups_max == 0 {
+                0
+            } else {
+                cfg.backup_rtt_budget_ms
+            },
             cfg.backup_stable_ms,
         );
         env.oracles.leases.register(
@@ -814,10 +820,8 @@ impl NodeHandle {
             beats_lost_in_lag: env.beats_lost_in_lag,
             oracles: env.oracles.clone(),
             forwards: HashMap::new(),
-            lone_audit_seen: BTreeMap::new(),
             versions_seen_tip: 0,
             versions_seen_retags: 0,
-            lone_stats_seen: None,
             rebuild_stub: env.rebuild_stub,
             plant_ungated_fast_path: env.plant_ungated_fast_path,
             plant_claim_root_group_on_lone: env.plant_claim_root_group_on_lone,
@@ -1136,17 +1140,10 @@ struct Driver {
     /// `MutateReply`'s emission.
     oracles: Arc<super::oracle::Oracles>,
     forwards: HashMap<(NodeId, OpId), Rid>,
-    /// Per generation this node is the delegate of: the journal tip and the
-    /// committed prefix the lone-lead oracle last judged, so a step that
-    /// changed neither is not judged again.
-    lone_audit_seen: BTreeMap<u64, (u64, u64)>,
     /// The journal tip the row-version oracle last judged (plan 46 M1.1
     /// step 3).
     versions_seen_tip: u64,
     versions_seen_retags: u64,
-    /// The counters of the lone-lead oracle's non-vacuity (`LoneLead`)
-    /// as this driver last read them: `held_by_gate`.
-    lone_stats_seen: Option<u64>,
     rebuild_stub: bool,
     plant_ungated_fast_path: bool,
     plant_claim_root_group_on_lone: bool,
@@ -2341,7 +2338,6 @@ impl Driver {
             self.note_rollbacks();
             self.note_journaled_refusals();
             self.note_identity();
-            self.note_lone_rows();
             self.note_row_versions();
             self.dispatch(actions);
             self.poll_fast_waits();
@@ -2929,42 +2925,6 @@ impl Driver {
         let group_at = move |gen: u64, first: u64| meta.deleg_group_at(gen, first);
         rv.judge(self.id, &rows, lease_now, &group_now, &group_max, &group_at);
         rv.tick(self.id, lease_now, &group_now);
-    }
-
-    /// The lone delegate's lead oracle ([`super::oracle::LoneLead`]): this
-    /// node's own `Lone` rows of each generation it is the delegate of, judged
-    /// against the prefix its core knows committed.
-    fn note_lone_rows(&mut self) {
-        let mut view = constellation_authority::core::DelegView::default();
-        self.core.deleg_view_local(&mut view);
-        let lead = (self.core.config().delegation_stream_rows as u64).max(1);
-        // The counters that show the rule was exercised: read as deltas (a
-        // restart brings a new core, whose counters start again).
-        let now = self.core.stats.deleg_lone_held_by_gate;
-        if let Some(seen) = self.lone_stats_seen {
-            let mut ll = self.oracles.lone_lead.lock().unwrap();
-            ll.held_by_gate += now.saturating_sub(seen);
-        }
-        self.lone_stats_seen = Some(now);
-        for m in &view.mine {
-            let gen = m.1;
-            let Some(committed) = self.core.deleg_committed_for_audit(gen, &*self.meta) else {
-                continue;
-            };
-            let tip = self.meta.journal_tip().unwrap_or(0);
-            if self.lone_audit_seen.get(&gen) == Some(&(tip, committed)) {
-                continue;
-            }
-            self.lone_audit_seen.insert(gen, (tip, committed));
-            let Ok(rows) = self.meta.delegate_rows_for_audit(gen) else {
-                continue;
-            };
-            self.oracles
-                .lone_lead
-                .lock()
-                .unwrap()
-                .judge(self.id, gen, &rows, committed, lead);
-        }
     }
 
     /// Plan 43 C0, I1: an answer leaves this node (a `MutateReply` to a

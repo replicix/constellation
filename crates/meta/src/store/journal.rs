@@ -112,18 +112,12 @@ impl Drop for PendingLocalOpGuard {
     }
 }
 
-/// `PENDING_OWN`: an own client's row whose gated rows are marked, and which
-/// (`OWN_HYSTERESIS`) also waits behind an open gated row when `Singleton`.
-const OWN_MARKS_ONLY: u8 = 1;
-const OWN_HYSTERESIS: u8 = 2;
-
 thread_local! {
     static PENDING_CLASS: std::cell::Cell<Option<crate::store::local::RowCommit>> =
         const { std::cell::Cell::new(None) };
     static LAST_JOURNALED: std::cell::Cell<Option<JournaledRow>> =
         const { std::cell::Cell::new(None) };
     static FROM_SESSION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static PENDING_OWN: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     static PENDING_STREAM_VERSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -153,7 +147,6 @@ impl PendingClass {
     pub fn set(class: crate::store::local::RowCommit) -> PendingClassGuard {
         PendingClassGuard {
             prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
-            prev_own: PENDING_OWN.with(|c| c.replace(0)),
             prev_stream: PENDING_STREAM_VERSION.with(|c| c.replace(false)),
         }
     }
@@ -165,7 +158,6 @@ impl PendingClass {
     pub(crate) fn set_stream_version(class: crate::store::local::RowCommit) -> PendingClassGuard {
         PendingClassGuard {
             prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
-            prev_own: PENDING_OWN.with(|c| c.replace(0)),
             prev_stream: PENDING_STREAM_VERSION.with(|c| c.replace(true)),
         }
     }
@@ -174,55 +166,13 @@ impl PendingClass {
         PENDING_STREAM_VERSION.with(|c| c.get())
     }
 
-    /// [`Self::set`] for a row of a delegate's own node's client, executed
-    /// by the delegate (not another node's forward). A gated one is
-    /// recorded against its generation (`Meta::delegate_gated_idx`): the
-    /// delegate's `Lone` rows wait for it to commit (the core's decision,
-    /// `Core::deleg_lone_held_by_gated`, until the lone lead leaves the
-    /// commit). The row is stamped as given: the store never classes it
-    /// again where it journals it.
-    pub fn set_for_own_client(class: crate::store::local::RowCommit) -> PendingClassGuard {
-        PendingClassGuard {
-            prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
-            prev_own: PENDING_OWN.with(|c| c.replace(OWN_HYSTERESIS)),
-            prev_stream: PENDING_STREAM_VERSION.with(|c| c.replace(false)),
-        }
-    }
-
-    /// [`Self::set_for_own_client`] for the simulation's negative control
-    /// (`Config::delegation_lone_hysteresis` off): the row is marked when
-    /// gated, but a `Singleton` stamp is kept behind an open gated row.
-    pub fn set_for_own_client_without_hysteresis(
-        class: crate::store::local::RowCommit,
-    ) -> PendingClassGuard {
-        PendingClassGuard {
-            prev: PENDING_CLASS.with(|c| c.replace(Some(class))),
-            prev_own: PENDING_OWN.with(|c| c.replace(OWN_MARKS_ONLY)),
-            prev_stream: PENDING_STREAM_VERSION.with(|c| c.replace(false)),
-        }
-    }
-
     pub(crate) fn current() -> Option<crate::store::local::RowCommit> {
         PENDING_CLASS.with(|c| c.get())
-    }
-
-    /// Set for a row of the delegate's own node's client.
-    pub(crate) fn own() -> bool {
-        PENDING_OWN.with(|c| c.get()) != 0
-    }
-
-    /// Set for a row of the delegate's own node's client, which a `Singleton`
-    /// stamp follows no open gated row of the node's own
-    /// ([`Self::set_for_own_client`]): not with
-    /// [`Self::set_for_own_client_without_hysteresis`].
-    pub(crate) fn follows_open_gated_rows() -> bool {
-        PENDING_OWN.with(|c| c.get()) == OWN_HYSTERESIS
     }
 }
 
 pub struct PendingClassGuard {
     prev: Option<crate::store::local::RowCommit>,
-    prev_own: u8,
     prev_stream: bool,
 }
 
@@ -267,7 +217,6 @@ impl Drop for ClassAtJournalGuard {
 impl Drop for PendingClassGuard {
     fn drop(&mut self) {
         PENDING_CLASS.with(|c| c.set(self.prev));
-        PENDING_OWN.with(|c| c.set(self.prev_own));
         PENDING_STREAM_VERSION.with(|c| c.set(self.prev_stream));
     }
 }
@@ -425,39 +374,6 @@ pub mod write_check_hook {
         let go = hook(at);
         HOOK.with(|h| *h.borrow_mut() = Some(hook));
         go
-    }
-}
-
-/// Tests only (`test-util`): a closure run once on the calling thread at the
-/// start of [`crate::Meta::delegate_execute`], before the op's transaction
-/// takes the writer lock: what another thread (the FUSE fast path) journals
-/// while a core-path op waits for the lock, between the class the core
-/// decided and the row's journaling. It runs with the core's pending class
-/// out of the way, as another thread would see it.
-#[cfg(any(test, feature = "test-util"))]
-pub mod before_delegate_write_hook {
-    use std::cell::RefCell;
-
-    type Hook = Box<dyn FnOnce(&crate::Meta)>;
-
-    thread_local! {
-        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
-    }
-
-    /// Install (or, `None`, remove) this thread's hook; it fires once.
-    pub fn set(hook: Option<Hook>) {
-        HOOK.with(|h| *h.borrow_mut() = hook);
-    }
-
-    pub(crate) fn fire(meta: &crate::Meta) {
-        let Some(hook) = HOOK.with(|h| h.borrow_mut().take()) else {
-            return;
-        };
-        let class = super::PENDING_CLASS.with(|c| c.take());
-        let own = super::PENDING_OWN.with(|c| c.take());
-        hook(meta);
-        super::PENDING_CLASS.with(|c| c.set(class));
-        super::PENDING_OWN.with(|c| c.set(own));
     }
 }
 

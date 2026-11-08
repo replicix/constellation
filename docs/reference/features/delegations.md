@@ -137,41 +137,20 @@ through the delegate. It then:
      for is recorded, an acknowledgement needs the members of both versions;
      and a backup leaves the record only once every index answered through it
      is at or below the root's cursor or in the log.
-   - A **lone** delegate — its table records no backup, none is requested or
-     appended to, and no peer, the root included, is a backup candidate
-     (linked, within `CONSTELLATION_BACKUP_RTT_BUDGET_MS`, stable for
-     `CONSTELLATION_BACKUP_STABLE_MS`) — answers its own node's client from
-     its disk (Layer A, the one speculation the design keeps); another node's
-     forward still waits for the root's append. Its own node's rows are
-     answered from its disk only while its journal is fewer transactions
-     past the root's cursor (or the log) than a stream batch carries records
-     (`delegation_stream_rows`, 256: two batches of creates); past that they
-     wait for the root's append too (`Core::deleg_lone_held`). The
-     stream carries one batch per round trip to the root, so without the
-     bound a busy delegate's own node ran its journal ahead of the stream
-     without limit and every forward, answered behind every earlier row,
-     waited for all of it. The lead is judged for each row by its own stream
-     index against the horizon the core publishes (the committed prefix plus
-     the lead), where the row is journaled and under the store's writer
-     lock, so the FUSE fast path cannot journal past it between two steps of
-     the core, nor can the core's own ops, which decide their class before
-     they wait for that lock: the store classes them again, and the core
-     answers by the class the row got. A row is also not answered from the disk while an
-     earlier row of its own node's clients still waits for the root (it was
-     journaled past the lead, or before the delegate turned lone): were the
-     root to crash, the earlier row would be dropped and the later one
-     replayed without the effect it rests on (a create, then a rename of it).
-     The rule spans every generation the node holds: one node can hold two
-     generations whose keys meet without either ending (a whole subtree and
-     a designation), since unlinking a
-     file's primary link moves the file's own keys to the generation of its
-     next link, and a takeover ends all of them together. While an own row
-     of one generation waits for the root, the own rows of the others wait
-     too (a `setxattr`, the unlink of the primary link, then a `removexattr`
-     under the other link's generation would otherwise be replayed alone).
-     Another node's forward does not count: I5 would allow holding the rows
-     behind it, and it is left out for cost (a delegate that serves remote
-     nodes always has one in flight).
+   - **No delegate answers from its disk alone** (plan 46 M1.2 step 13; the
+     lone delegate, its lead and its hysteresis are gone). The root grants a
+     placed or manual delegation only to a node with a group within budget:
+     a recorded backup, or the root itself when its link to the node is within
+     `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (a link not measured yet counts). A
+     writer with neither, a far writer (no peer, the root included, within the
+     budget), is not delegated: placement skips it
+     (`place_skipped_far`), `constellation delegate` without `--sticky`
+     refuses it, and its ops are forwarded to the root as a non-delegated
+     writer's are, until a sticky grant (plan 46 M1.3). Sticky and designated
+     grants are final and need no group. A delegate whose links later leave the
+     budget answers nothing until its group holds the row: only latency
+     degrades, never an acknowledged row. `delegation_stream_rows` (256) is
+     the size of a stream batch.
    - A designation's rows are non-stealable and answer at once; `ack=s3` waits
      for the log.
 
@@ -192,10 +171,9 @@ The delegate's own FUSE writes under its delegation take the local fast
 path whatever the delegation's group is (plan 43 C2d): the write runs on the
 FUSE thread and journals its row with the class the core has published for
 the generation by the time the row is journaled, under the store's writer
-lock, not when the op was admitted (`Core::report_deleg_durable`: `Lone`
-while the delegate is lone,
+lock, not when the op was admitted (`Core::report_deleg_durable`:
 `NonStealable` for a designation, otherwise `DelegGroup`, or `Archive` under
-`ack=s3`). A `Lone` or `NonStealable` row is answered at once; a row that
+`ack=s3`). A `NonStealable` row is answered at once; a row that
 waits is answered once the core's commit point for the generation covers its
 stream index (`Meta::session().wait_deleg_durable`: the log carries it, or
 every member of the group, and of a requested change, holds it — the same
@@ -204,16 +182,14 @@ after the generation is withdrawn). If the generation is stopped,
 lapsed, lost its backup or ended before that, or the wait runs out
 (the 30 s durability wait budget), the op is in doubt: it goes back
 through the core under its rid, which answers from the row's commit or
-re-executes it at the new owner. A delegate that turns lone after journaling
-a `DelegGroup` row still waits for that row. The indexes the group has
+re-executes it at the new owner. The indexes the group has
 committed, whatever the class is now, count as answered for the group's
 reconfiguration (`acked_max`): a backup leaves the record only once the
 root's cursor or the log covers them. Its journal rows retire when a root
 segment carries them. If
-the generation ends first, the rows past the cut are stranded: rolled back,
-and — a lone delegate's rows, answered on its disk — replayed by rid through
-the new owner, or — rows that waited for a group, whose clients were never
-answered — dropped, their clients retrying by rid
+the generation ends first, the rows past the cut are stranded: rolled back
+and — rows that waited for a group, whose clients were never answered —
+dropped, their clients retrying by rid
 (`speculation.deleg_dropped`). The strand runs when the segment carrying
 the generation's end is applied; the root's stream can install the end, and
 a new generation of the same node, ahead of it. A node does not install a
@@ -778,8 +754,6 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
   `ttl + margin` and ends the generation. Every row the delegate answered to
   another node is in the root's journal (the answer waited for the append);
   the clients of the rows it had not answered retry by rid through the root.
-  A lone delegate's own node's ops, answered on its disk, are replayed by
-  their rid.
 - **Delegate crashes, with a recorded backup**: the root has the backup seal,
   drains what it holds, and continues (`delegate-crash-backup`). The
   generation is **not ended before** a member of the latest recorded group
@@ -866,7 +840,7 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
 - **Delegate partitioned from the root**: it stops at `sent + ttl −
   margin`, before the root may reclaim; its unstreamed rows past the cut are
   stranded: the ones nobody was answered for are dropped (their clients retry
-  by rid), a lone delegate's own are replayed.
+  by rid).
 - **Delegate's core stalled behind a slow disk** (a store write that holds
   the writer lock for seconds on a loaded btrfs or network volume, a log
   write blocked the same way): the delegate keeps its grant for as long as

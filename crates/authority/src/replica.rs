@@ -403,10 +403,6 @@ pub trait Replica {
     /// its generations as their delegate (`Meta::delegate_idx` above 0).
     /// `None`: unreadable.
     fn delegate_assigned(&self, gen: u64) -> Option<bool>;
-    /// The highest stream index of `gen` this node, the delegate, journaled
-    /// for its own node's client with a class that waits for the group
-    /// (0: none).
-    fn delegate_gated_idx(&self, gen: u64) -> u64;
     /// F1: wait until every tagged write that passed its fencing-token
     /// check at the write here, under a grant no longer live in this
     /// node's table, has committed (`Meta::settle_tagged_writes`) — before
@@ -1490,10 +1486,6 @@ impl Replica for Meta {
 
     fn journal_own_gens(&self) -> Vec<u64> {
         Meta::journal_own_gens(self).unwrap_or_default()
-    }
-
-    fn delegate_gated_idx(&self, gen: u64) -> u64 {
-        Meta::delegate_gated_idx(self, gen).unwrap_or(0)
     }
 
     fn settle_tagged_writes(&self) -> bool {

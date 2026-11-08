@@ -757,11 +757,6 @@ pub struct SimConfig {
     /// was not of class Lone fails the run (`strict_durability` turns it
     /// on from C1).
     pub strict_lone: bool,
-    /// A lone delegate's own `Lone` rows are within the lead of the
-    /// committed prefix and behind no uncommitted gated row of its own
-    /// (`Core::deleg_lone_held`, oracle `LoneLead`): a run with one that is
-    /// not fails. On everywhere; counted either way.
-    pub strict_lone_lead: bool,
     /// I6 `no_ttl_claim_of_a_live_lease` (plan 43 C7b): a lease CAS that
     /// takes another node's unreleased, unfenced lease without a permit
     /// while the old holder's own process still honours it (its
@@ -987,7 +982,9 @@ impl SimConfig {
     /// A configuration with delegations: scheduled ones, or the placement engine
     /// that makes them.
     pub fn is_delegated(&self) -> bool {
-        !self.delegations.is_empty() || (self.core)(1, 0).placement
+        !self.delegations.is_empty()
+            || !self.sticky_delegations.is_empty()
+            || (self.core)(1, 0).placement
     }
 
     /// The documented reason this configuration does not run `strict_commit`
@@ -1105,7 +1102,6 @@ impl Default for SimConfig {
             strict_settle: false,
             strict_unsettled: false,
             strict_lone: false,
-            strict_lone_lead: true,
             strict_lease_claims: true,
             rebuild_stub: false,
             plant_ungated_fast_path: false,
@@ -1374,16 +1370,6 @@ pub struct Report {
     pub max_backups: usize,
     /// The first five violations of each oracle.
     pub oracle_examples: Vec<String>,
-    /// A lone delegate's own `Lone` rows more than the lead past the
-    /// committed prefix, and behind an uncommitted gated row of its own
-    /// (`LoneLead`); and the distinct own rows judged, `Lone` and gated.
-    pub lone_past_lead: usize,
-    pub lone_behind_gated: usize,
-    pub lone_rows_judged: usize,
-    pub gated_rows_judged: usize,
-    /// Non-vacuity of the gated mark: own ops it alone held back from
-    /// `Lone` at the core's decision.
-    pub lone_held_by_gate: u64,
 }
 
 pub struct Cluster {
@@ -4151,6 +4137,26 @@ pub fn run_seed(seed: u64, mut cfg: SimConfig) -> Result<Report, String> {
     if cfg.is_delegated() && cfg.strict_commit_exemption().is_none() {
         cfg.strict_commit = true;
     }
+    // Plan 46 M1.2 step 13: no lone delegate, so a delegation needs the
+    // root within the backup RTT budget of the delegate. The delegated
+    // configurations built on the plain core configuration (the production
+    // budget of 5 ms against the bus's 30 ms default round trip: nobody within
+    // budget, every delegate lone) are the unbacked family: the budget covers
+    // the bus's round trips and backups are off, so the root is each
+    // delegate's whole group and the root itself, with no backup possible,
+    // behaves as before (`backups_possible` is false either way).
+    if cfg.is_delegated() {
+        let inner = cfg.core.clone();
+        let plain = Config::defaults(1, 0).backup_rtt_budget_ms;
+        cfg.core = std::sync::Arc::new(move |id, inc| {
+            let mut c = inner(id, inc);
+            if c.backup_rtt_budget_ms == plain && c.backups_max > 0 {
+                c.backup_rtt_budget_ms = 50;
+                c.backups_max = 0;
+            }
+            c
+        });
+    }
     // `AUTHORITY_SIM_WATCHDOG=1`: an OS thread reports any event whose
     // handling has taken more than two seconds of real time.
     if std::env::var_os("AUTHORITY_SIM_WATCHDOG").is_some() {
@@ -5542,17 +5548,6 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         }
         report.stateright_checked = true;
     }
-    // Plan 30 §M11: the causal-cut assertion at the root (a delegate
-    // waited for its deps before executing, so the root never sees a
-    // batch whose deps it lacks), and no marker without its data.
-    for (id, stats) in &report.stats {
-        if stats.deleg_lost_after_ack > 0 {
-            return Err(format!(
-                "node {id} stopped a generation at {} rows it had answered under the group (a lost dependency)\n  stats: {:#?}",
-                stats.deleg_lost_after_ack, report.stats
-            ));
-        }
-    }
     // Plan 46 M1.2 step 4: the root appends a delegate's row verbatim; a
     // record its tolerant apply skipped is a divergence (any fails), except
     // under `speculate_on_stale_base`, the knob that installs replies on a
@@ -6031,15 +6026,6 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.seals_of_a_live_holder = oracles.leases.seals_of_a_live_holder.load(ord);
         report.permitted_claims = oracles.leases.permitted_claims.load(ord);
     }
-    let lone_lead_examples = {
-        let ll = oracles.lone_lead.lock().unwrap();
-        report.lone_past_lead = ll.past_lead.len();
-        report.lone_behind_gated = ll.behind_gated.len();
-        report.lone_rows_judged = ll.lone_rows_seen.len();
-        report.gated_rows_judged = ll.gated_rows_seen.len();
-        report.lone_held_by_gate = ll.held_by_gate;
-        ll.examples.clone()
-    };
     report.oracle_examples = found.examples();
     let counters = format!(
         "oracle counters: acks by class {:?}, uncommitted {:?}, unjournaled refusals {:?}, \
@@ -6095,7 +6081,6 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             &unsettled_violations,
         ),
         (cfg.strict_lone || cfg.strict_durability, "I5", &found.i5),
-        (cfg.strict_lone_lead, "lone lead", &lone_lead_examples),
         // Last: a seed that also fails another check reports that one, so
         // the failing seeds without the oracle are the ones it does not
         // head.

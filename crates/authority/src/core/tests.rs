@@ -14676,7 +14676,7 @@ mod backup_crash {
     #[test]
     fn the_roots_commit_rule_is_one_lookup_of_its_configuration() {
         use super::super::{CommitRule, GroupOn, RuleStream};
-        let rule = |h: &Harness, asker| h.core.rule_of(RuleStream::Root, asker, &h.meta);
+        let rule = |h: &Harness, asker| h.core.rule_of(RuleStream::Root, asker);
         // A singleton: its own client's rule is the singleton, another node's
         // the archive; both at the lease's version.
         let mut h = Harness::new(1);
@@ -37833,11 +37833,7 @@ fn a_restarted_delegate_readopts_its_delegation_at_start() {
             .any(|(_, m)| matches!(m, PeerMsg::MutateRequest { .. })),
         "forwarded instead of executed: {out:?}"
     );
-    assert!(
-        replies(&out).iter().any(|(r, _)| *r == rid),
-        "not answered: {out:?}"
-    );
-    assert_eq!(h.core.dl.mine[&7].executed, 1);
+    assert_eq!(h.core.dl.mine[&7].executed, 1, "not executed here: {out:?}");
 }
 
 /// overload-cascade-2 (`stress-ng-fs-nodes`): a root whose requests
@@ -39518,10 +39514,12 @@ fn a_lapsed_delegation_renewed_before_the_reclaim_executes_again() {
         tag: Default::default(),
     });
     assert!(
-        replies(&out).iter().any(|(r, _)| *r == rid),
-        "not executed here: {out:?}"
+        !sends(&out)
+            .iter()
+            .any(|(_, m)| matches!(m, PeerMsg::MutateRequest { .. })),
+        "forwarded instead of executed here: {out:?}"
     );
-    assert_eq!(h.core.dl.mine[&7].executed, 1);
+    assert_eq!(h.core.dl.mine[&7].executed, 1, "not executed here: {out:?}");
     // A fresh lapse watch, and a refusal after the next lapse stops it.
     let (mut h, _dir, _rid, lapse) = delegate_parked_on_a_silent_root();
     h.step(Event::Timer { id: lapse });
@@ -39629,10 +39627,12 @@ fn deleg_off_core_renewal_keeps_the_grant() {
         tag: Default::default(),
     });
     assert!(
-        replies(&out).iter().any(|(r, _)| *r == rid),
-        "not executed here: {out:?}"
+        !sends(&out)
+            .iter()
+            .any(|(_, m)| matches!(m, PeerMsg::MutateRequest { .. })),
+        "forwarded instead of executed here: {out:?}"
     );
-    assert_eq!(h.core.dl.mine[&7].executed, 1);
+    assert_eq!(h.core.dl.mine[&7].executed, 1, "not executed here: {out:?}");
 }
 
 /// The control of the test above, and what stock did: answers to requests
@@ -43715,7 +43715,7 @@ mod stream_end {
             },
             tag: Default::default(),
         });
-        assert!(replies(&out).iter().any(|(r, _)| *r == create), "{out:?}");
+        assert_eq!(h.core.dl.mine[&7].executed, 1, "{out:?}");
         assert_eq!(Replica::delegate_tx_pending(&h.meta, 7, 1), Some(true));
         let records = [
             LogRecord::DelegateNodeEnded {
@@ -43784,7 +43784,7 @@ mod stream_end {
             },
             tag: Default::default(),
         });
-        assert!(replies(&out).iter().any(|(r, _)| *r == rid), "{out:?}");
+        assert_eq!(h.core.dl.mine[&7].executed, 1, "{out:?}");
         let records = [
             end,
             LogRecord::delegate_one(3, 8, dir, constellation_meta::SubtreeKind::Placed),
@@ -44226,7 +44226,6 @@ mod deleg_group {
             lapses: 0,
             issued: WaitMs(i64::MAX),
         });
-        assert!(!h.core.deleg_lone(&h.core.dl.mine[&7]));
     }
 
     /// The batch to the root in `out`: `(req, round, last)`.
@@ -44442,14 +44441,13 @@ mod deleg_group {
         assert_eq!(h.core.stats.settled_local, 0);
     }
 
-    /// C2g's review, SHOULD 2: a lone delegate settling its own node's op
+    /// C2g's review, SHOULD 2: a delegate settling its own node's op
     /// journals the refusal for the group, never `Lone`, and answers it once
     /// the root's append holds it. Fails on the parent: journaled `Lone` and
     /// answered at once.
     #[test]
-    fn a_lone_delegates_own_settle_waits_for_its_group() {
+    fn a_delegates_own_settle_waits_for_its_group() {
         let (mut h, dir, _, _) = delegate_renewed_once();
-        assert!(h.core.deleg_lone(&h.core.dl.mine[&7]));
         // A client op of this node, not executed anywhere yet (sent to the
         // root for a name it owns), then settled here as the delegate.
         let rid = h.rid(1);
@@ -44507,21 +44505,25 @@ mod deleg_group {
     }
 
     /// Plan 46 M1.1 step 2: a delegate generation's rule is one lookup of
-    /// its group: the singleton for its own node's client while lone, the
-    /// group at the applied `DelegateNodeGroup` version for every other asker and
-    /// once the root is near.
+    /// its group: the group at the applied `DelegateNodeGroup` version for
+    /// every asker (plan 46 M1.2 step 13: no delegate answers on its disk
+    /// alone), the singleton only under the negative control
+    /// `Config::lone_delegate` while no peer is within the budget.
     #[test]
     fn a_delegates_commit_rule_is_one_lookup_of_its_group() {
         use super::super::{CommitRule, GroupOn, RuleStream};
         let (mut h, _dir, _, _) = delegate_renewed_once();
         let version = h.core.dl.mine[&7].group_version;
         let members = h.core.dl.mine[&7].group_backups.len();
-        let rule = |h: &Harness, asker| h.core.rule_of(RuleStream::Delegate(7), asker, &h.meta);
+        let rule = |h: &Harness, asker| h.core.rule_of(RuleStream::Delegate(7), asker);
         let group = CommitRule::Group {
             version,
             members,
             on: GroupOn::Delegate,
         };
+        assert_eq!(rule(&h, Asker::Own), group);
+        assert_eq!(rule(&h, Asker::Remote), group);
+        h.core.cfg.lone_delegate = true;
         assert_eq!(rule(&h, Asker::Own), CommitRule::Singleton { version });
         assert_eq!(rule(&h, Asker::Remote), group);
         root_is_near(&mut h);
@@ -44532,8 +44534,7 @@ mod deleg_group {
         );
         // A generation this node does not hold: what is left is in the log.
         assert_eq!(
-            h.core
-                .rule_of(RuleStream::Delegate(99), Asker::Own, &h.meta),
+            h.core.rule_of(RuleStream::Delegate(99), Asker::Own),
             CommitRule::Group {
                 version: 0,
                 members: 0,
@@ -44542,49 +44543,51 @@ mod deleg_group {
         );
     }
 
-    /// Lone: nobody within reach, no backup recorded. Its own client is
-    /// answered from its disk (`Lone`), other nodes' forwards wait for the
-    /// root. Not lone (the root within the budget): its own client waits for
-    /// the root too.
+    /// Plan 46 M1.2 step 13 (fail-before: its own client's row was answered
+    /// at once, `Lone`): nobody within reach, no backup recorded, and still
+    /// no delegate answers on its disk alone: its own client's row, like a
+    /// forward, waits for the root's append. Only the negative control
+    /// (`Config::lone_delegate`) answers its own client at once.
     #[test]
-    fn a_lone_delegate_acks_its_own_node_and_waits_for_the_root_for_others() {
+    fn a_delegate_with_nobody_within_reach_waits_for_the_root_for_everyone() {
         let (mut h, dir, _, _) = delegate_renewed_once();
-        assert!(h.core.deleg_lone(&h.core.dl.mine[&7]));
         assert_eq!(
-            RowCommit::from(h.core.deleg_rule(7, Asker::Own, &h.meta)).versionless(),
-            RowCommit::LONE,
-            "lone: its own client's row is answered at once"
+            RowCommit::from(h.core.deleg_rule(7, Asker::Own)).versionless(),
+            RowCommit::DELEG_GROUP
         );
+        let (rid, out) = own_create(&mut h, dir, 1);
+        assert!(client_answers(&out).is_empty(), "answered alone: {out:?}");
+        let (req, round, last) = batch(&out).expect("the row streams");
+        let out = root_acks(&mut h, req, round, last);
+        assert_eq!(
+            client_answers(&out),
+            vec![(rid, AnswerSource::Sequenced(RowCommit::DELEG_GROUP))],
+            "{out:?}"
+        );
+        let out = forward_create(&mut h, dir, 2, 501);
+        assert_eq!(answer_to_2(&out, 501), None, "{out:?}");
+        let (req, round, last) = batch(&out).expect("sent to the root");
+        let out = root_acks(&mut h, req, round, last);
+        assert!(answer_to_2(&out, 501).is_some(), "{out:?}");
+    }
+
+    /// The negative control `Config::lone_delegate` is the deleted lone
+    /// delegate: with nobody within reach its own client is answered from
+    /// its disk (`Lone`), and the root coming within the budget ends it.
+    #[test]
+    fn the_lone_delegate_control_answers_its_own_node_alone() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        h.core.cfg.lone_delegate = true;
+        h.core.report_deleg_durable(&h.meta);
         let (rid, out) = own_create(&mut h, dir, 1);
         assert_eq!(
             client_answers(&out),
             vec![(rid, AnswerSource::Sequenced(RowCommit::LONE))],
             "{out:?}"
         );
-        // (Its row streams to the root meanwhile.)
-        let (req, round, last) = batch(&out).expect("the lone row streams");
-        root_acks(&mut h, req, round, last);
-        let out = forward_create(&mut h, dir, 2, 501);
-        assert_eq!(answer_to_2(&out, 501), None, "{out:?}");
-        let (req, round, last) = batch(&out).expect("sent to the root");
-        let out = root_acks(&mut h, req, round, last);
-        assert!(answer_to_2(&out, 501).is_some(), "{out:?}");
-        // The root comes within the budget: the next own op waits.
         root_is_near(&mut h);
-        assert_eq!(
-            RowCommit::from(h.core.deleg_rule(7, Asker::Own, &h.meta)).versionless(),
-            RowCommit::DELEG_GROUP,
-            "not lone: its own client's row waits for the group"
-        );
-        let (rid, out) = own_create(&mut h, dir, 3);
+        let (_, out) = own_create(&mut h, dir, 2);
         assert!(client_answers(&out).is_empty(), "answered alone: {out:?}");
-        let (req, round, last) =
-            batch(&out).unwrap_or_else(|| panic!("not sent to the root: {out:?}"));
-        let out = root_acks(&mut h, req, round, last);
-        assert!(
-            client_answers(&out).contains(&(rid, AnswerSource::Sequenced(RowCommit::DELEG_GROUP))),
-            "{out:?}"
-        );
     }
 
     /// I1 (`placement-hot` 383, 472, 948, 1890; `long-delegated-backup` 92,
@@ -44596,7 +44599,7 @@ mod deleg_group {
     /// root's journal never held the row. Not lone now, stable or not; the
     /// own op parks until the root's acknowledgement. Fails before: `Lone`.
     #[test]
-    fn a_delegate_with_a_young_link_to_the_root_is_not_lone() {
+    fn a_delegate_with_a_young_link_to_the_root_waits_for_it() {
         let (mut h, dir, _, _) = delegate_renewed_once();
         h.core.cfg.backup_rtt_budget_ms = 50;
         h.core.cfg.backups_max = 1;
@@ -44619,9 +44622,8 @@ mod deleg_group {
             issued: WaitMs(i64::MAX),
         });
         assert!(h.core.backup_candidates(h.clk()).is_empty(), "no candidate");
-        assert!(!h.core.deleg_lone(&h.core.dl.mine[&7]), "a root to back it");
         assert_eq!(
-            RowCommit::from(h.core.deleg_rule(7, Asker::Own, &h.meta)).versionless(),
+            RowCommit::from(h.core.deleg_rule(7, Asker::Own)).versionless(),
             RowCommit::DELEG_GROUP
         );
         assert_eq!(
@@ -44638,137 +44640,6 @@ mod deleg_group {
             vec![(rid, AnswerSource::Sequenced(RowCommit::DELEG_GROUP))],
             "{out:?}"
         );
-    }
-
-    /// I1 class 2 for the delegate (the lapse rule of
-    /// `a_root_is_not_lone_across_its_own_lapse_until_a_later_directory`,
-    /// reached through [`Core::backup_could_be_had`]): the links a delegate
-    /// holds predate its own pause, and the directory snapshots queued
-    /// behind the event that resumed it are older than the lapse. It is lone
-    /// on a snapshot taken after the lapse was handed, and the class changes
-    /// with the event (`OwnLag`), not with a new snapshot or the clock.
-    /// Fails before: `Lone` throughout.
-    #[test]
-    fn a_delegate_is_not_lone_across_its_own_lapse_until_a_later_directory() {
-        let (mut h, _dir, _, _) = delegate_renewed_once();
-        h.core.cfg.backup_rtt_budget_ms = 50;
-        h.core.cfg.backups_max = 1;
-        h.core.cfg.backup_stable_ms = 200;
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3],
-            issued: WaitMs(i64::MAX),
-        });
-        let no_links = |h: &mut Harness, lapses| {
-            h.step(Event::Peers {
-                links: Vec::new(),
-                lapses,
-                issued: WaitMs(i64::MAX),
-            })
-        };
-        let class =
-            |h: &Harness| RowCommit::from(h.core.deleg_rule(7, Asker::Own, &h.meta)).versionless();
-        let published = |h: &Harness| h.meta.session().deleg_row_class(7);
-        no_links(&mut h, 0);
-        assert_eq!(class(&h), RowCommit::LONE, "nobody linked");
-        assert_eq!(published(&h), Some(constellation_meta::RowCommit::LONE));
-        // Paused for seconds: the lapse is handed with the next event.
-        h.step(Event::OwnLag {
-            from: w(h.now).minus(1),
-            until: w(h.now),
-        });
-        assert_eq!(
-            class(&h),
-            RowCommit::DELEG_GROUP,
-            "no snapshot since its lapse"
-        );
-        assert_eq!(
-            published(&h),
-            Some(constellation_meta::RowCommit::DELEG_GROUP),
-            "the lapse event publishes it"
-        );
-        // A snapshot taken before the lapse was handed does not restore it.
-        h.advance(100);
-        no_links(&mut h, 0);
-        assert_eq!(class(&h), RowCommit::DELEG_GROUP);
-        // One taken after does.
-        h.advance(100);
-        no_links(&mut h, 1);
-        assert_eq!(class(&h), RowCommit::LONE);
-        assert_eq!(published(&h), Some(constellation_meta::RowCommit::LONE));
-    }
-
-    /// A lone delegate answers its own node's rows from its disk only while
-    /// its journal is fewer transactions past what the root holds than a
-    /// stream batch carries records (`delegation_stream_rows`).
-    /// Before, its own node's load ran the journal ahead of the stream
-    /// without bound, and another node's forward, which waits for the root's
-    /// append, waited behind all of it (dirsplit-bench T4, the directory
-    /// delegated whole: 0 creates in 15 s on every other writer, `EIO` at
-    /// the client deadline).
-    #[test]
-    fn a_lone_delegate_holds_its_own_rows_once_a_batch_ahead_of_the_root() {
-        let (mut h, dir, _, _) = delegate_renewed_once();
-        h.core.cfg.delegation_stream_rows = 4;
-        assert!(h.core.deleg_lone(&h.core.dl.mine[&7]));
-        // Row 1 goes to the root at once; rows 2 to 4 wait for its ack.
-        let mut first = None;
-        for seq in 1..=4 {
-            let (rid, out) = own_create(&mut h, dir, seq);
-            assert_eq!(
-                client_answers(&out),
-                vec![(rid, AnswerSource::Sequenced(RowCommit::LONE))],
-                "row {seq}, within a batch of the root: {out:?}"
-            );
-            if seq == 1 {
-                first = batch(&out);
-            }
-        }
-        let (req, round, last) = first.expect("row 1 streams");
-        assert_eq!(last, 1);
-        // Four rows past the root's cursor: the next one waits for the root,
-        // and the fast path journals with that class too.
-        assert_eq!(
-            RowCommit::from(h.core.deleg_rule(7, Asker::Own, &h.meta)).versionless(),
-            RowCommit::DELEG_GROUP
-        );
-        assert_eq!(
-            h.meta.session().deleg_row_class(7),
-            Some(constellation_meta::RowCommit::DELEG_GROUP)
-        );
-        let (held, out) = own_create(&mut h, dir, 5);
-        assert!(client_answers(&out).is_empty(), "answered alone: {out:?}");
-        // Another node's forward lands behind it.
-        let out = forward_create(&mut h, dir, 6, 500);
-        assert_eq!(answer_to_2(&out, 500), None, "{out:?}");
-        // A batch carries four records, two creates: the root's acks of rows
-        // 1 and 3 send rows 2 and 3, then 4 and 5; its ack of 5 answers the
-        // held own row, and the next batch carries the forward's.
-        let out = root_acks(&mut h, req, round, last);
-        let (req, round, last) = batch(&out).expect("rows 2 and 3");
-        assert_eq!(last, 3);
-        let out = root_acks(&mut h, req, round, last);
-        assert!(client_answers(&out).is_empty(), "{out:?}");
-        let (req, round, last) = batch(&out).expect("rows 4 and 5");
-        assert_eq!(last, 5);
-        let out = root_acks(&mut h, req, round, last);
-        assert_eq!(
-            client_answers(&out),
-            vec![(held, AnswerSource::Sequenced(RowCommit::DELEG_GROUP))],
-            "{out:?}"
-        );
-        // Within a batch again: its own rows are answered at once.
-        assert_eq!(
-            RowCommit::from(h.core.deleg_rule(7, Asker::Own, &h.meta)).versionless(),
-            RowCommit::LONE
-        );
-        assert_eq!(
-            h.meta.session().deleg_row_class(7),
-            Some(constellation_meta::RowCommit::LONE)
-        );
-        let (req, round, last) = batch(&out).expect("the forward's row streams");
-        assert_eq!(last, 6);
-        let out = root_acks(&mut h, req, round, last);
-        assert!(answer_to_2(&out, 500).is_some(), "{out:?}");
     }
 
     /// A delegate whose root never acknowledged its row (7, 1) takes the root
@@ -45021,137 +44892,6 @@ mod deleg_group {
         );
     }
 
-    /// The delegate's own client renames `from` to `to` in `dir`.
-    fn own_rename(h: &mut Harness, dir: Ino, seq: u64, from: &str, to: &str) -> (Rid, Vec<Action>) {
-        let rid = h.rid(seq);
-        let out = h.step(Event::Submit {
-            policy: Policy::Client,
-            rid,
-            op: MutateOp::Rename {
-                parent: dir,
-                name: from.into(),
-                new_parent: dir,
-                new_name: to.into(),
-                noreplace: false,
-            },
-            tag: Default::default(),
-        });
-        (rid, out)
-    }
-
-    /// A create, then a rename of what it created, with the lead flipping
-    /// between them and the root crashing before the create commits:
-    /// returns the rename's answer (`None`: not answered), and what the end
-    /// of the generation (`DelegateNodeEnded` at the root's cursor) dropped and
-    /// queued for replay.
-    ///
-    /// A batch of two records (one create): rows 1 and 2 are `Lone` (within
-    /// the lead of the root's cursor), the create of `moved` (row 3) is
-    /// `DelegateNodeGroup` (two rows past it); the root's acks of rows 1 and 2
-    /// bring the lead back, with row 3 not yet committed.
-    fn create_then_rename_at_a_root_crash(
-        hysteresis: bool,
-    ) -> (Option<AnswerSource>, usize, Vec<Rid>, Rid) {
-        let (mut h, dir, _, _) = delegate_renewed_once();
-        h.core.cfg.delegation_stream_rows = 2;
-        h.core.cfg.delegation_lone_hysteresis = hysteresis;
-        let (_, out) = own_create(&mut h, dir, 1);
-        let (req, round, last) = batch(&out).expect("row 1 streams");
-        assert_eq!(last, 1);
-        let (_, out) = own_create(&mut h, dir, 2);
-        assert_eq!(
-            client_answers(&out)[0].1,
-            AnswerSource::Sequenced(RowCommit::LONE)
-        );
-        // Row 3 is two past the root's cursor: it waits for the root.
-        let ino = h.meta.allocate_ino(dir).unwrap();
-        let out = h.step(Event::Submit {
-            policy: Policy::Client,
-            rid: h.rid(3),
-            op: MutateOp::Create {
-                parent: dir,
-                name: "moved".into(),
-                ino,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-            },
-            tag: Default::default(),
-        });
-        assert!(client_answers(&out).is_empty(), "the create waits: {out:?}");
-        // The root's acks of rows 1 and 2: the lead is back (row 3 is one
-        // past the cursor), row 3 is not committed.
-        let out = root_acks(&mut h, req, round, last);
-        let (req, round, last) = batch(&out).expect("row 2 streams");
-        assert_eq!(last, 2);
-        let out = root_acks(&mut h, req, round, last);
-        assert!(batch(&out).is_some(), "row 3 streams: {out:?}");
-        let (rename, out) = own_rename(&mut h, dir, 4, "moved", "renamed");
-        let answered = client_answers(&out)
-            .into_iter()
-            .find(|(rid, _)| *rid == rename)
-            .map(|(_, source)| source);
-        // The root crashes before it appends row 3: the generation ends
-        // with the cut at the root's cursor.
-        let applied = Replica::apply_segment(
-            &h.meta,
-            2,
-            1,
-            0,
-            &[],
-            &[],
-            &[LogRecord::DelegateNodeEnded {
-                node: 3,
-                gen: 7,
-                through: 2,
-            }],
-        )
-        .unwrap();
-        // (Rows 1 and 2 are below the cut: the log carries them, in a real
-        // run; this segment does not, so they queue too and are left out.)
-        let queued: Vec<Rid> = h
-            .meta
-            .pending_replays()
-            .unwrap()
-            .into_iter()
-            .map(|q| q.rid)
-            .filter(|rid| rid.seq > 2)
-            .collect();
-        (answered, applied.stranded.deleg_dropped, queued, rename)
-    }
-
-    /// Review follow-up F2 (fail-before): with the lead flipping back, a
-    /// `Lone` row must not sit behind an uncommitted `DelegateNodeGroup` row of the
-    /// same generation. A create of `moved` waited for the root, and the
-    /// rename of `moved` that follows it, journaled once the lead is back,
-    /// was answered `Lone`: at a root crash the strand dropped the create
-    /// (its client was not answered) and replayed the rename, which then
-    /// failed on a name that was never created, after its client was told
-    /// it had succeeded. Now `Lone` returns once every gated row of the
-    /// generation has committed: the rename waits for the root like the
-    /// create, and both are dropped.
-    #[test]
-    fn a_lone_row_does_not_follow_an_uncommitted_gated_row_of_the_generation() {
-        let (answered, dropped, queued, _) = create_then_rename_at_a_root_crash(true);
-        assert_eq!(answered, None, "the rename waits for the root");
-        assert_eq!(dropped, 2, "the create and the rename are dropped");
-        assert!(queued.is_empty(), "nothing is replayed: {queued:?}");
-    }
-
-    /// The same without the hysteresis (`Config::delegation_lone_hysteresis`
-    /// off, the negative control of the simulation's oracle): the rename is
-    /// answered `Lone` behind the create, and replayed alone at the crash.
-    #[test]
-    fn without_the_hysteresis_the_rename_is_answered_lone_and_replayed_alone() {
-        let (answered, dropped, queued, rename) = create_then_rename_at_a_root_crash(false);
-        assert_eq!(
-            answered,
-            Some(crate::AnswerSource::Sequenced(RowCommit::LONE))
-        );
-        assert_eq!(dropped, 1, "the create is dropped");
-        assert_eq!(queued, vec![rename], "the rename is replayed alone");
-    }
-
     /// The delegate of [`delegate_renewed_once`] (granted on boot 1) as a new
     /// process on the same disk, on boot `boot`, 1 s later: what its
     /// install of the table's generations sent.
@@ -45229,225 +44969,6 @@ mod deleg_group {
         let (h, out) = delegate_restarted_on(h, 1);
         assert!(renew_req(&out, 7).is_none(), "{out:?}");
         assert!(h.core.dl.mine[&7].stopped);
-    }
-
-    /// The fast path's write of `name` in `dir` as the delegate's FUSE
-    /// thread does it: classed under the writer lock by what the core has
-    /// published ([`Meta::delegate_execute_admitted`]).
-    fn fast_create(meta: &Meta, now: Now, dir: Ino, seq: u64, name: &str) {
-        let ino = meta.allocate_ino(dir).unwrap();
-        let rid = Rid {
-            node: 3,
-            incarnation: 1,
-            seq,
-        };
-        meta.delegate_execute_admitted(
-            &MutateOp::Create {
-                parent: dir,
-                name: name.into(),
-                ino,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-            },
-            Some(rid),
-            7,
-            Default::default(),
-            &Default::default(),
-            now,
-            Box::new(|| true),
-        )
-        .unwrap();
-    }
-
-    /// What came of a core-path rename ([`core_rename_amid_fast_path_rows`]).
-    struct RenameRace {
-        /// The rename's answer (`None`: not answered).
-        answered: Option<AnswerSource>,
-        /// The journal's `(idx, class, rid)` rows of the generation.
-        rows: Vec<(u64, constellation_meta::RowCommit, Option<Rid>)>,
-        /// What the end of the generation at the root's cursor (row 1)
-        /// dropped, and the rids it queued for replay.
-        dropped: usize,
-        queued: Vec<Rid>,
-        rename: Rid,
-    }
-
-    impl RenameRace {
-        fn classes(&self) -> Vec<(u64, constellation_meta::RowCommit)> {
-            self.rows.iter().map(|(idx, c, _)| (*idx, *c)).collect()
-        }
-    }
-
-    /// A core-path rename of the delegate's own client while the fast path
-    /// journals rows between the core's decision of its class and the write
-    /// (the core waits for the store's writer lock): the lead is two rows,
-    /// row 1 is journaled and not committed, and `fast` runs right before
-    /// the rename's write, as the FUSE threads' writes do
-    /// (`before_delegate_write_hook`).
-    fn core_rename_amid_fast_path_rows(
-        lead: usize,
-        fast: impl FnOnce(&Meta, Now, Ino) + 'static,
-    ) -> RenameRace {
-        let (mut h, dir, _, _) = delegate_renewed_once();
-        h.core.cfg.delegation_stream_rows = lead;
-        let (_, out) = own_create(&mut h, dir, 1);
-        assert_eq!(
-            client_answers(&out)[0].1,
-            AnswerSource::Sequenced(RowCommit::LONE)
-        );
-        let now = h.clk();
-        constellation_meta::before_delegate_write_hook::set(Some(Box::new(move |meta| {
-            fast(meta, now, dir)
-        })));
-        let (rename, out) = own_rename(&mut h, dir, 4, "f", "g");
-        constellation_meta::before_delegate_write_hook::set(None);
-        let answered = client_answers(&out)
-            .into_iter()
-            .find(|(rid, _)| *rid == rename)
-            .map(|(_, source)| source);
-        let rows = h.meta.delegate_rows_for_audit(7).unwrap();
-        // The root crashes holding row 1: the generation ends with the cut
-        // there, and what is left of it strands.
-        let applied = Replica::apply_segment(
-            &h.meta,
-            2,
-            1,
-            0,
-            &[],
-            &[],
-            &[LogRecord::DelegateNodeEnded {
-                node: 3,
-                gen: 7,
-                through: 1,
-            }],
-        )
-        .unwrap();
-        let queued: Vec<Rid> = h
-            .meta
-            .pending_replays()
-            .unwrap()
-            .into_iter()
-            .map(|q| q.rid)
-            .filter(|rid| rid.seq > 1)
-            .collect();
-        RenameRace {
-            answered,
-            rows,
-            dropped: applied.stranded.deleg_dropped,
-            queued,
-            rename,
-        }
-    }
-
-    /// Review follow-up of F1/F2, plan 46 M1.1 step 4: the core decides an
-    /// own op's rule, then waits for the store's writer lock, and the fast
-    /// path journals meanwhile. The store no longer classes the core's row
-    /// again where it journals it: the core publishes the rule it stamps
-    /// before the write (`Core::deleg_publish_rule`), so the fast path's rows
-    /// that go in meanwhile are stamped with it too. Here the lead is three
-    /// rows past the root's cursor (nothing committed, row 1 journaled) and
-    /// the core decides the rename `Lone`; the fast path journals `x` and the
-    /// create of `f` (`Lone` as published, within the published horizon),
-    /// and the rename follows them. No row of the stream waits for its group, so nothing answered
-    /// `Lone` depends on a row the strand drops: at the root's crash every
-    /// row past the cursor is replayed in order, the rename after the create
-    /// it renames.
-    #[test]
-    fn a_core_path_rows_rule_is_the_one_the_fast_path_rows_around_it_carry() {
-        use constellation_meta::RowCommit;
-        let r = core_rename_amid_fast_path_rows(3, |meta, now, dir| {
-            assert_eq!(
-                meta.session().deleg_row_class(7),
-                Some(RowCommit::LONE),
-                "published before the core's row is journaled"
-            );
-            fast_create(meta, now, dir, 2, "x");
-            fast_create(meta, now, dir, 3, "f");
-        });
-        assert_eq!(
-            r.classes(),
-            vec![
-                (1, RowCommit::LONE),
-                (2, RowCommit::LONE),
-                (3, RowCommit::LONE),
-                (4, RowCommit::LONE),
-            ],
-            "{:?}",
-            r.rows
-        );
-        assert_eq!(
-            r.answered,
-            Some(AnswerSource::Sequenced(RowCommit::LONE)),
-            "the rename is answered from the disk"
-        );
-        assert_eq!(r.dropped, 0, "no gated row to drop");
-        assert_eq!(
-            r.queued.len(),
-            3,
-            "x, the create and the rename are replayed: {:?}",
-            r.queued
-        );
-        assert_eq!(r.queued.last(), Some(&r.rename), "in order");
-    }
-
-    /// Plan 46 M1.1 step 4 (review, I2; fail-before: the core's `Singleton` row
-    /// is stamped as decided): the core reads the journal, decides the
-    /// rename `Lone` (nothing of its node's own is gated), and waits for the
-    /// writer lock; meanwhile the fast path, under a group rule published
-    /// before the core's, journals the create of `f` as a gated row (it waits
-    /// for its group). The rename of `f` then follows an uncommitted gated
-    /// row: journaled and answered `Lone`, a root's crash drops the create
-    /// (its client was not answered) and replays the rename without it. The
-    /// store stamps the row `Group` where it journals it behind an open gated
-    /// row of the node's own, and the core reads that and waits for the group:
-    /// the rename is not answered, and both rows are dropped and replayed in
-    /// order.
-    #[test]
-    fn a_core_path_singleton_row_does_not_land_behind_an_open_gated_fast_path_row() {
-        use constellation_meta::RowCommit;
-        let r = core_rename_amid_fast_path_rows(2, |meta, now, dir| {
-            let lone = meta.session().deleg_row_class(7).unwrap();
-            assert_eq!(lone, RowCommit::LONE, "the core decided `Lone`");
-            // The group rule the fast path's rows follow, published before
-            // the core's own (nothing committed past row 0).
-            meta.session().set_deleg_durable(
-                7,
-                Some(constellation_meta::DelegDurable {
-                    commit: lone.demoted(),
-                    through: 0,
-                    horizon: u64::MAX,
-                    lost: false,
-                }),
-            );
-            fast_create(meta, now, dir, 2, "f");
-            meta.session().set_deleg_durable(
-                7,
-                Some(constellation_meta::DelegDurable {
-                    commit: lone,
-                    through: 0,
-                    horizon: u64::MAX,
-                    lost: false,
-                }),
-            );
-        });
-        assert_eq!(
-            r.classes(),
-            vec![
-                (1, RowCommit::LONE),
-                (2, RowCommit::DELEG_GROUP),
-                (3, RowCommit::DELEG_GROUP),
-            ],
-            "{:?}",
-            r.rows
-        );
-        assert_eq!(r.answered, None, "the rename waits for its group");
-        assert_eq!(r.dropped, 2, "the create and the rename are dropped");
-        assert!(
-            r.queued.is_empty(),
-            "neither was answered, nothing is replayed (the clients retry): {:?}",
-            r.queued
-        );
     }
 
     /// Plan 46 M1.1 step 4 (fail-before: the row is stamped with the
@@ -45716,16 +45237,16 @@ mod deleg_group {
 
     /// Plan 43 C2d: what the core tells the delegate's FUSE fast path —
     /// the class its own clients' rows are journaled with, and how far the
-    /// group has committed the stream. Lone: the row is `Lone`; the root
-    /// comes within reach: `DelegateNodeGroup`, committed on the root's append;
-    /// the generation ending here withdraws it.
+    /// group has committed the stream. The row waits for the group, nobody
+    /// within reach or the root near, committed on the root's append; the
+    /// generation ending here withdraws it.
     #[test]
     fn the_core_publishes_the_class_and_the_commit_point_to_the_fast_path() {
         let (mut h, dir, _, _) = delegate_renewed_once();
         // (Published by the steps the harness took.)
         assert_eq!(
             h.meta.session().deleg_row_class(7),
-            Some(constellation_meta::RowCommit::LONE)
+            Some(constellation_meta::RowCommit::DELEG_GROUP)
         );
         root_is_near(&mut h);
         assert_eq!(
@@ -45869,12 +45390,12 @@ mod deleg_group {
     }
 
     /// Review claim 2 (fail-before): a row journaled `DelegateNodeGroup` (root near)
-    /// and answered by the fast path after the delegate turned lone (root
-    /// out of its RTT budget) is an answered row all the same: a backup
+    /// and answered by the fast path once the root's append holds it (the
+    /// root since out of its RTT budget) is an answered row all the same: a backup
     /// candidate that holds none of it must not be put in the group record
     /// (`acked_max` is what `deleg_group_maintain` checks).
     #[test]
-    fn a_group_row_answered_after_the_delegate_turned_lone_keeps_acked_max() {
+    fn a_group_row_answered_by_the_fast_path_keeps_acked_max() {
         let (mut h, dir, _, _) = delegate_renewed_once();
         root_is_near(&mut h);
         // The FUSE thread's write, journaled DelegateNodeGroup (root near).
@@ -45906,7 +45427,7 @@ mod deleg_group {
             issued: WaitMs(i64::MAX),
         });
         let (req, round, last) = batch(&out).expect("streamed to the root");
-        // The root drifts out of the budget: the delegate is lone.
+        // The root drifts out of the budget.
         h.step(Event::Peers {
             links: vec![crate::event::PeerLink {
                 node: 1,
@@ -45918,10 +45439,10 @@ mod deleg_group {
             lapses: 0,
             issued: WaitMs(i64::MAX),
         });
-        assert!(h.core.deleg_lone(&h.core.dl.mine[&7]));
         assert_eq!(
             h.meta.session().deleg_row_class(7),
-            Some(constellation_meta::RowCommit::LONE)
+            Some(constellation_meta::RowCommit::DELEG_GROUP),
+            "no delegate answers alone, whatever its links"
         );
         // The root appends the row: the fast path's wait ends, it answers.
         root_acks(&mut h, req, round, last);
@@ -45959,7 +45480,7 @@ mod deleg_group {
         let d = &h.core.dl.mine[&7];
         assert!(
             acked_max == 1 && d.group_requested.is_none(),
-            "row 1 was answered by the fast path after the delegate turned lone, but acked_max = {acked_max} \
+            "row 1 was answered by the fast path, but acked_max = {acked_max} \
              and the candidate (backup {:?}, backup_acked {}) was put in the group record: group_requested = {:?}",
             d.backup,
             d.backup_acked,
@@ -48016,38 +47537,6 @@ mod deleg_group {
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         assert!(!h.core.has_stream_parks());
     }
-
-    /// A lone delegate's own client was answered from its disk: its row past
-    /// the cut is replayed by rid as before (the lone branch).
-    #[test]
-    fn a_recalled_delegates_lone_rows_are_still_replayed() {
-        let (mut h, dir, _, _) = delegate_renewed_once();
-        let (rid, out) = own_create(&mut h, dir, 1);
-        assert_eq!(client_answers(&out).len(), 1, "answered alone: {out:?}");
-        let applied = Replica::apply_segment(
-            &h.meta,
-            2,
-            1,
-            0,
-            &[],
-            &[],
-            &[LogRecord::DelegateNodeEnded {
-                node: 3,
-                gen: 7,
-                through: 0,
-            }],
-        )
-        .unwrap();
-        assert_eq!(applied.stranded.deleg_dropped, 0);
-        let queued: Vec<Rid> = h
-            .meta
-            .pending_replays()
-            .unwrap()
-            .into_iter()
-            .map(|q| q.rid)
-            .collect();
-        assert_eq!(queued, vec![rid]);
-    }
 }
 
 /// A designee's stream carries only rows its disk holds.
@@ -48124,7 +47613,12 @@ mod designee_stream {
             op,
             tag: Default::default(),
         });
-        assert!(replies(&out).iter().any(|(r, _)| *r == rid), "{out:?}");
+        assert!(
+            !sends(&out)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::MutateRequest { .. })),
+            "forwarded instead of executed: {out:?}"
+        );
         out
     }
 
@@ -61045,6 +60539,148 @@ mod step9_one_stream_per_node {
         assert!(h.core.dl.designating.is_empty());
     }
 
+    /// A root (node 1, the lease held) with a link to node 2 at `rtt_ms`, and
+    /// two directories `w1`, `w2`.
+    fn root_with_peer(rtt_ms: Option<u64>) -> (Harness, Vec<constellation_fs_core::Ino>) {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.placement = true;
+        h.core.cfg.placement_min_ops = 20;
+        h.hold(1, None);
+        let mut dirs = Vec::new();
+        for name in ["w1", "w2"] {
+            let (d, rec) = mkdir(&h, name);
+            crate::replica::Replica::apply_segment(
+                &h.meta,
+                dirs.len() as u64 + 1,
+                1,
+                0,
+                &[],
+                &[],
+                &[rec],
+            )
+            .unwrap();
+            dirs.push(d);
+        }
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2],
+            issued: WaitMs(i64::MAX),
+        });
+        link_to_2(&mut h, rtt_ms);
+        (h, dirs)
+    }
+
+    fn link_to_2(h: &mut Harness, rtt_ms: Option<u64>) {
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 2,
+                connected: true,
+                last_seen: Some(w(h.now)),
+                rtt_ms,
+                since: Some(w(h.now)),
+            }],
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+    }
+
+    /// Plan 46 M1.2 step 13, no lone delegate (fail-before: the grant was
+    /// made, and the delegate answered its own clients on its disk alone): a
+    /// stealable grant, manual or placed, goes only to a node with a group
+    /// within `backup_rtt_budget_ms`: the root's link to it within budget (an
+    /// unmeasured link counts), or a backup its stream records. A sticky or
+    /// designated grant is final and needs none.
+    #[test]
+    fn a_stealable_grant_to_a_node_with_no_group_within_budget_is_refused() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        assert_eq!(h.core.cfg.backup_rtt_budget_ms, 5);
+        for kind in [DelegKind::Manual, DelegKind::Placed] {
+            let mut out = Vec::new();
+            let why = h
+                .core
+                .delegate_dir(h.clk(), dirs[0], 2, kind, &h.meta, &mut out)
+                .expect_err("a far node was given a stealable grant");
+            assert!(
+                why.contains("no peer within the backup RTT budget"),
+                "{why}"
+            );
+        }
+        assert!(h.core.dl.gens.is_empty(), "nothing was journaled");
+        assert_eq!(h.core.stats.place_skipped_far, 2);
+        // A sticky grant is final: no group needed.
+        let mut out = Vec::new();
+        h.core
+            .delegate_dir(h.clk(), dirs[0], 2, DelegKind::Sticky, &h.meta, &mut out)
+            .expect("a sticky grant needs no group");
+        // The control's `lone_delegate` negative control grants anyway.
+        let (mut h, dirs) = root_with_peer(Some(500));
+        h.core.cfg.lone_delegate = true;
+        let mut out = Vec::new();
+        h.core
+            .delegate_dir(h.clk(), dirs[0], 2, DelegKind::Manual, &h.meta, &mut out)
+            .expect("the control grants lone");
+        // Within budget, or not measured yet: granted.
+        for rtt in [Some(5), Some(1), None] {
+            let (mut h, dirs) = root_with_peer(rtt);
+            let mut out = Vec::new();
+            h.core
+                .delegate_dir(h.clk(), dirs[0], 2, DelegKind::Manual, &h.meta, &mut out)
+                .unwrap_or_else(|e| panic!("rtt {rtt:?}: {e}"));
+        }
+        // The link drifts out of budget after the grant: the next grant to
+        // the node (it holds a live stream) is judged by its stream's group,
+        // which records no backup.
+        let (mut h, dirs) = root_with_peer(Some(1));
+        let mut out = Vec::new();
+        h.core
+            .delegate_dir(h.clk(), dirs[0], 2, DelegKind::Manual, &h.meta, &mut out)
+            .unwrap();
+        link_to_2(&mut h, Some(500));
+        assert!(!h.core.delegate_group_in_budget(2));
+        h.core.dl.gens.values_mut().next().unwrap().group.backups = vec![3];
+        assert!(
+            h.core.delegate_group_in_budget(2),
+            "a recorded backup is a group"
+        );
+    }
+
+    /// Plan 46 M1.2 step 13: the placement does not delegate a far writer
+    /// (its ops stay with the root, which sequences them as it does a
+    /// non-delegated writer's), counting the skip instead of asking every
+    /// round; the same writer is delegated once a peer is within budget.
+    #[test]
+    fn placement_skips_a_far_writer_and_delegates_it_once_it_is_near() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        let tick = |h: &mut Harness| {
+            let (now, mut out) = (h.now, Vec::new());
+            h.core
+                .on_placement_timer(Now::same(now.0), &h.meta, &mut out);
+        };
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        tick(&mut h);
+        assert_eq!(h.core.stats.place_skipped_far, 1);
+        assert_eq!(h.core.stats.place_delegated, 0);
+        assert!(h.core.dl.gens.is_empty());
+        assert!(
+            crate::replica::Replica::delegation_table(&h.meta)
+                .covering(crate::replica::Replica::namespace(&h.meta), dirs[1])
+                .is_none(),
+            "the root still owns the far writer's directory"
+        );
+        // A peer within budget: the next round places it.
+        link_to_2(&mut h, Some(2));
+        h.advance(400);
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        tick(&mut h);
+        assert_eq!(h.core.stats.place_skipped_far, 1);
+        assert_eq!(h.core.stats.place_delegated, 1);
+    }
+
     /// A placed (stealable) grant to a node that holds designations only is
     /// refused, and the placement skips the node instead of asking every
     /// round; a designated stream is not recalled by the placement.
@@ -63287,7 +62923,7 @@ mod step4_sticky {
             h.core.delegation_sync(h.clk(), &h.meta, &mut out);
             let d = &h.core.dl.mine[&7];
             assert_eq!(d.non_stealable, final_, "{grants:?}");
-            let rule = h.core.deleg_rule(7, Asker::Own, &h.meta);
+            let rule = h.core.deleg_rule(7, Asker::Own);
             assert_eq!(rule == CommitRule::Final, final_, "{grants:?}: {rule:?}");
             assert_eq!(
                 d.until.0 > 1_000_000_000_000,

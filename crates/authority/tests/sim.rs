@@ -295,6 +295,7 @@ fn replay_seed() {
         Ok("acks3") => ack_s3_config(),
         Ok("backup-far") | Ok("far") => far_config(),
         Ok("far-root-writes") => far_root_writes_config(),
+        Ok("far-placement") => far_placement_config(),
         Ok("sticky-idle-release") => sticky_idle_release_config(),
         Ok("sticky-handover-ping-pong") => sticky_handover_ping_pong_config(),
         Ok("sticky-holder-dies") => sticky_holder_dies_config(),
@@ -389,9 +390,6 @@ fn replay_seed() {
         Ok("delegated-fast-path-unchecked") => delegated_fast_path_unchecked_config(),
         Ok("long-delegated") => long_delegated_config(),
         Ok("long-delegated-backup") => long_delegated_backup_config(),
-        Ok("long-delegated-lead") => long_delegated_lead_config(),
-        Ok("long-delegated-lead-off") => long_delegated_lead_off_config(),
-        Ok("long-delegated-hysteresis-off") => long_delegated_hysteresis_off_config(),
         Ok("long-delegated-late-answers") => long_delegated_late_answers_config(),
         Ok("delegated-core-stall") => delegated_core_stall_config(),
         Ok("delegated-core-stall-lease6") => delegated_core_stall_lease6_config(),
@@ -1687,6 +1685,25 @@ fn far_config() -> SimConfig {
     }
 }
 
+/// Plan 46 M1.2 step 13: `far` with the placement on. Every pair is out of
+/// the budget, so no node has a group within budget and the placement
+/// delegates nothing (`place_skipped_far`): a far writer's ops are forwarded
+/// to the root. The negative control `Config::lone_delegate`
+/// (`AUTHORITY_SIM_LONE_DELEGATE=1`) delegates anyway, and the delegates
+/// answer their own clients on their disks alone: I1 and, when a root
+/// failover rolls such an answer back, I5 fail
+/// (`the_lone_delegate_control_fails_the_oracles`).
+fn far_placement_config() -> SimConfig {
+    SimConfig {
+        ops_per_client: 16,
+        dirs: vec!["d1".into(), "d2".into()],
+        cross_ratio: 0.0,
+        read_ratio: 0.3,
+        core: std::sync::Arc::new(sim::run::placement_backup_core_config),
+        ..far_config()
+    }
+}
+
 /// Plan 46 M1.3 step 0: `far`, with subtrees. Every pair is far (no
 /// backup), node 1 is the root and writes its own directory `d1` (and `/`),
 /// and nodes 2 and 3 hold `d2` and `d3` by grants. Today node 1's own ops
@@ -1705,7 +1722,7 @@ fn far_root_writes_config() -> SimConfig {
         names: 4,
         random_faults: 0,
         dirs: vec!["d1".into(), "d2".into(), "d3".into()],
-        delegations: vec![("d2".into(), 2), ("d3".into(), 3)],
+        sticky_delegations: vec![("d2".into(), 2), ("d3".into(), 3)],
         cross_ratio: 0.0,
         faults: vec![ScheduledFault {
             at_ms: 3_000,
@@ -1744,6 +1761,7 @@ fn sticky_handover_ping_pong_config() -> SimConfig {
             nodes: 2,
             dirs: vec!["shared".into()],
             delegations: Vec::new(),
+            sticky_delegations: Vec::new(),
             shared_dir: true,
             ..far_root_writes_config()
         }
@@ -5746,9 +5764,6 @@ fn sweep_config() {
         "delegated-holder-cut" => delegated_holder_cut_config(),
         "delegated-designated" => delegated_designated_config(),
         "long-delegated" => long_delegated_config(),
-        "long-delegated-lead" => long_delegated_lead_config(),
-        "long-delegated-lead-off" => long_delegated_lead_off_config(),
-        "long-delegated-hysteresis-off" => long_delegated_hysteresis_off_config(),
         "long-backup" => long_backup_config(),
         "backup-runtime-lag" => backup_runtime_lag_config(),
         "backup-lag-at-expiry" => backup_lag_at_expiry_config(false),
@@ -5772,6 +5787,7 @@ fn sweep_config() {
         "acks3" => ack_s3_config(),
         "far" | "backup-far" => far_config(),
         "far-root-writes" => far_root_writes_config(),
+        "far-placement" => far_placement_config(),
         "sticky-idle-release" => sticky_idle_release_config(),
         "sticky-handover-ping-pong" => sticky_handover_ping_pong_config(),
         "sticky-holder-dies" => sticky_holder_dies_config(),
@@ -6129,6 +6145,19 @@ fn sweep_config() {
                 core
             });
         }
+        // Plan 46 M1.2 step 13: `AUTHORITY_SIM_LONE_DELEGATE=1` is the
+        // negative control of the deleted lone delegate
+        // (`Config::lone_delegate`): the root grants to a node with no group
+        // within budget, and that delegate answers its own node's clients on
+        // its disk alone. I5 (`+lone`) must fail on `far` and `long-delegated`.
+        if std::env::var("AUTHORITY_SIM_LONE_DELEGATE").is_ok_and(|v| v == "1") {
+            let inner = c.core.clone();
+            c.core = std::sync::Arc::new(move |id, inc| {
+                let mut core = inner(id, inc);
+                core.lone_delegate = true;
+                core
+            });
+        }
         // Plan 46 M1.4 step 2: `AUTHORITY_SIM_HOLD_ANSWERS_UNCOMMITTED=1` is
         // the structural control of the hold's commit rule
         // (`Config::hold_answers_uncommitted`): a hold answers from its
@@ -6369,12 +6398,6 @@ fn sweep_config() {
                 Ok(report) => {
                     eprintln!("SWEEP-L3 {label} seed {seed}: {}", recall_stall(&report));
                     let ord = std::sync::atomic::Ordering::Relaxed;
-                    if report.lone_held_by_gate > 0 {
-                        eprintln!(
-                            "SWEEP-LONE-GATE {label} seed {seed}: held back by the gated mark {}",
-                            report.lone_held_by_gate
-                        );
-                    }
                     oracle_totals.lock().unwrap().add(&label, seed, &report);
                     for s in report.stats.values() {
                         streamed.fetch_add(s.awaited_log_streamed, ord);
@@ -7241,59 +7264,6 @@ fn long_delegated_config() -> SimConfig {
     }
 }
 
-/// `long-delegated` with a stream batch of two records: a lone delegate's
-/// own rows wait for the root once its journal is two transactions past
-/// the root's cursor (`Core::deleg_lone_lead_full`), so its own clients'
-/// rows move between `Lone` and `DelegateNodeGroup` as the stream catches up.
-fn long_delegated_lead_config() -> SimConfig {
-    SimConfig {
-        core: std::sync::Arc::new(|node, inc| {
-            let mut c = sim::run::sim_core_config(node, inc);
-            c.delegation_stream_rows = 2;
-            c
-        }),
-        ..long_delegated_config()
-    }
-}
-
-/// `long-delegated-lead` with the lead disabled
-/// (`Config::delegation_lone_lead`): the negative control of the oracle that
-/// counts a lone delegate's own `Lone` rows past the lead. It fails by
-/// design (`the_lone_lead_oracle_catches_a_disabled_lead`).
-fn long_delegated_lead_off_config() -> SimConfig {
-    SimConfig {
-        core: std::sync::Arc::new(|node, inc| {
-            let mut c = sim::run::sim_core_config(node, inc);
-            c.delegation_stream_rows = 2;
-            c.delegation_lone_lead = false;
-            c
-        }),
-        strict_commit_exempt: Some(
-            "plan 46 M1.2 step 13 (the lone delegate and its lead deleted with this configuration): the negative control fails by design",
-        ),
-        ..long_delegated_config()
-    }
-}
-
-/// `long-delegated-lead` with the hysteresis disabled
-/// (`Config::delegation_lone_hysteresis`): the negative control of the
-/// oracle that counts a lone delegate's own `Lone` rows behind an
-/// uncommitted gated row of its own. It fails by design.
-fn long_delegated_hysteresis_off_config() -> SimConfig {
-    SimConfig {
-        core: std::sync::Arc::new(|node, inc| {
-            let mut c = sim::run::sim_core_config(node, inc);
-            c.delegation_stream_rows = 2;
-            c.delegation_lone_hysteresis = false;
-            c
-        }),
-        strict_commit_exempt: Some(
-            "plan 46 M1.2 step 13 (the lone delegate and its hysteresis deleted with this configuration): the negative control fails by design",
-        ),
-        ..long_delegated_config()
-    }
-}
-
 /// `long-delegated` under `+commit` with a delegate that stamps each row
 /// from the mutable "peer in budget" assessment (`Config::per_row_class`):
 /// the negative control of the row-version oracle
@@ -7885,11 +7855,6 @@ struct OracleTotals {
     /// Plan 43 C7b: tokens judged exactly and by their window, per path.
     tokens_exact: [u64; 4],
     tokens_window: [u64; 4],
-    /// The lone delegate's lead oracle: [own `Lone` rows past the lead,
-    /// behind an uncommitted gated row of their own, own `Lone` rows judged,
-    /// own gated rows judged, ops the gated mark held back from `Lone`, `Lone`
-    /// decisions made `DelegateNodeGroup` where the row was journaled].
-    lone_lead: [u64; 5],
     /// Plan 46 M0.3: unsettled `EIO`s by isolated requesters (allowed) and
     /// by requesters that could reach a sequencer (I4 violations), and the
     /// seeds with a violation.
@@ -8051,15 +8016,6 @@ impl OracleTotals {
             for (c, n) in self.claimed.iter_mut().zip(st.ack_classes) {
                 *c += n;
             }
-        }
-        for (t, n) in self.lone_lead.iter_mut().zip([
-            r.lone_past_lead,
-            r.lone_behind_gated,
-            r.lone_rows_judged,
-            r.gated_rows_judged,
-            r.lone_held_by_gate as usize,
-        ]) {
-            *t += n as u64;
         }
         self.i2 += r.identity_copies;
         self.i2c += r.non_verbatim;
@@ -8235,17 +8191,6 @@ impl OracleTotals {
         eprintln!(
             "SWEEP-UNSETTLED-CAUSES {label} seeds {}/{seeds}: {:?}",
             self.seeds, self.unsettled_causes
-        );
-        eprintln!(
-            "SWEEP-LONE-LEAD-TOTALS {label} seeds {}/{seeds}: own Lone rows past the lead {}, \
-             behind an uncommitted gated row {}; own rows judged: Lone {}, gated {}; held back \
-             by the gated mark {}",
-            self.seeds,
-            self.lone_lead[0],
-            self.lone_lead[1],
-            self.lone_lead[2],
-            self.lone_lead[3],
-            self.lone_lead[4]
         );
         eprintln!(
             "SWEEP-STREAM-TOTALS {label} seeds {}/{seeds}: delegated acks released {} ({} ms waited); \
@@ -11085,7 +11030,11 @@ fn locks_writer_hold_delegated_group_config(backup: bool) -> SimConfig {
     SimConfig {
         core: std::sync::Arc::new(sim::run::backup_core_config),
         rtts: if backup {
-            vec![((1, 2), 80), ((1, 3), 80), ((2, 3), 10)]
+            // (The root is within the budget of the delegate: a delegation
+            // needs a group within budget, plan 46 M1.2 step 13, and the
+            // root cannot see the third node near the delegate. The backup
+            // is the nearest peer, node 3: the group is not the root.)
+            vec![((1, 2), 40), ((1, 3), 40), ((2, 3), 10)]
         } else {
             vec![((1, 2), 10), ((1, 3), 10), ((2, 3), 80)]
         },
@@ -14234,8 +14183,10 @@ fn locks_writer_hold_delegated_without_the_settle_stays_clean_under_the_roots_cu
     // holder's section here: 635, 3358 and 3403 show none, and no seed of
     // 0 to 140 000 does, unclocked. The control is therefore a regression pin
     // on the bound: these three seeds, which fail on the delegate's clock,
-    // must stay clean without the settle.)
-    let seeds = [635, 3358, 3403];
+    // must stay clean without the settle. Plan 46 M1.2 step 13: a delegate's
+    // own ops wait for the root, the trajectories moved, and 287 and 396 are
+    // the two of seeds 0 to 400 that fail on the delegate's clock.)
+    let seeds = [635, 3358, 3403, 287, 396];
     for seed in seeds {
         // (Strictly clean: any other error fails the pin as well. The settle
         // itself is controlled by `a_delegates_renewal_reports_a_pinned_write_once_its_window_is_over`
@@ -14279,7 +14230,7 @@ fn locks_writer_hold_delegated_unsettled_own_clock_config() -> SimConfig {
 fn locks_writer_hold_delegated_own_clock_without_the_settle_is_caught() {
     use pinned::run_seed;
     let mut witnessed = Vec::new();
-    for seed in [635, 3358, 3403] {
+    for seed in [287, 396] {
         if let Err(e) = run_seed(
             seed,
             locks_writer_hold_delegated_unsettled_own_clock_config(),
@@ -15388,13 +15339,14 @@ fn regression_locks_unlinked_delegated_dcrash_pause_seed_558() {
 /// barriers move its timings); 1144, 1682 and 1945 took the late-answer
 /// path until a recall's answer rode the delegate's stream (plan 46 M1.2
 /// step 10: the batch of an ended generation is refused and its grants
-/// counted, not installed); 5, 24 and 26 take it now, and the test asserts
-/// that some seed does.
+/// counted, not installed); 5, 24 and 26 took it after, until a delegate's
+/// own ops waited for the root (step 13); 32, 48 and 76 take it now, and the
+/// test asserts that some seed does.
 #[test]
 fn regression_locks_unlinked_delegated_partition_late_recall_answer() {
     use pinned::run_seed;
     let mut late = 0;
-    for seed in [7_455, 5, 24, 26] {
+    for seed in [7_455, 32, 48, 76] {
         let report = run_seed(seed, locks_unlinked_partition_config()).unwrap_or_else(|e| {
             panic!(
                 "locks-unlinked-delegated-partition seed {seed}: {e}\n  replay with \
@@ -16008,8 +15960,6 @@ fn strict_commit_is_the_default_of_a_delegated_configuration() {
         .is_none());
     for cfg in [
         delegated_core_stall_root_lease6_config(),
-        long_delegated_lead_off_config(),
-        long_delegated_hysteresis_off_config(),
         locks_writer_hold_delegated_config(),
         locks_writer_hold_delegated_doubt_config(),
         locks_writer_hold_delegated_group_config(false),
@@ -17201,7 +17151,11 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             0,
         ),
         ("flex-crash", flex_crash_config, 125, 9),
-        ("long-delegated", long_delegated_config, 0, 0),
+        // (Plan 46 M1.2 step 13: 3 allowed in seeds 0..99, seeds 29 and 47: a
+        // delegate's own op waits for the root now, so a settle window can pass
+        // inside the root's outwait of a silent generation, the cause the
+        // oracle allows; no violation.)
+        ("long-delegated", long_delegated_config, 0, 3),
         ("long-delegated-backup", long_delegated_backup_config, 0, 0),
         (
             "long-delegated-late-answers",
@@ -17677,49 +17631,6 @@ fn regression_delegated_backup_links_stalebase_seed_138() {
     });
 }
 
-/// The lone delegate's lead oracle (`LoneLead`): over seeds of
-/// `long-delegated-lead` (a stream batch of two records, so the class
-/// flips between `Lone` and `DelegateNodeGroup` as the stream catches up) a
-/// lone delegate's own `Lone` rows are never more than the lead past the
-/// committed prefix and never behind an uncommitted gated row of its own;
-/// the rule is exercised (own `Lone` and gated rows were judged).
-#[test]
-fn a_lone_delegates_own_lone_rows_stay_within_the_lead_and_behind_no_open_gated_row() {
-    let (mut lone, mut gated, mut held) = (0, 0, 0);
-    for seed in LONE_LEAD_SEEDS {
-        let r = run_seed(seed, long_delegated_lead_config()).unwrap_or_else(|e| {
-            panic!(
-                "long-delegated-lead seed {seed}: {e}\n  replay with \
-                 AUTHORITY_SIM_CONFIG=long-delegated-lead"
-            )
-        });
-        assert_eq!(
-            (r.lone_past_lead, r.lone_behind_gated),
-            (0, 0),
-            "seed {seed}"
-        );
-        lone += r.lone_rows_judged;
-        gated += r.gated_rows_judged;
-        held += r.lone_held_by_gate;
-    }
-    assert!(
-        lone > 0 && gated > 0,
-        "the oracle judged {lone} own Lone and {gated} own gated rows: the lead never flipped"
-    );
-    // Non-vacuity of the gated mark itself: an own op that a gated row of
-    // its own, uncommitted, held back from `Lone` while the lead had room.
-    assert!(
-        held > 0,
-        "no own op was held back from Lone by the gated mark alone: the hysteresis was never exercised"
-    );
-}
-
-/// (Seeds 64 and 118 hold an own op back from `Lone` for the gated mark alone,
-/// as do 13 others of the first 400: the non-vacuity of the hysteresis. Plan
-/// 46 M1.1 moved the trajectories: 57 and 103 hold none since a lone root's
-/// journal stopped counting as the delegate's second copy.)
-const LONE_LEAD_SEEDS: [u64; 8] = [1, 2, 3, 4, 5, 6, 64, 118];
-
 /// Plan 46 M1.1 step 3: a delegate that stamps its rows from the mutable
 /// assessment instead of the configuration's version
 /// (`Config::per_row_class`, `AUTHORITY_SIM_PER_ROW_CLASS=1`) fails
@@ -17741,46 +17652,112 @@ fn the_row_version_oracle_catches_a_per_row_class() {
     }
 }
 
-/// The oracle's negative controls: with the lead disabled
-/// (`Config::delegation_lone_lead`) a lone delegate journals `Lone` rows past
-/// it, and with the hysteresis disabled (`Config::delegation_lone_hysteresis`)
-/// behind an uncommitted gated row; the run fails with the oracle's message.
+/// `config` with only I5 strict (`+lone`): I1 is left to the run's counts
+/// (the documented exception), so a rolled-back answer that was not a
+/// singleton's is what fails it.
+fn only_i5_strict(config: SimConfig) -> SimConfig {
+    SimConfig {
+        strict_lone: true,
+        strict_commit: false,
+        strict_commit_exempt: Some(
+            "plan 46 M1.2 step 13 (a test that judges I5 alone: the lone-delegate control)",
+        ),
+        ..config
+    }
+}
+
+/// `config` with the negative control of the deleted lone delegate
+/// (`Config::lone_delegate`, `AUTHORITY_SIM_LONE_DELEGATE=1`).
+fn with_lone_delegates(config: SimConfig) -> SimConfig {
+    let inner = config.core.clone();
+    SimConfig {
+        core: std::sync::Arc::new(move |node, inc| {
+            let mut c = inner(node, inc);
+            c.lone_delegate = true;
+            c
+        }),
+        ..config
+    }
+}
+
+/// Plan 46 M1.2 step 13, fail-before: with the lone delegate back
+/// (`AUTHORITY_SIM_LONE_DELEGATE=1`: the root grants to a node with no group
+/// within budget, and the delegate answers its own clients on its disk alone)
+/// I1 fails on `far-placement` and `long-delegated` in every seed, and I5
+/// strict (an acknowledged answer that was not a singleton's, rolled back by a
+/// root failover) fails on the seeds below; the same seeds pass without the
+/// control, in `+commit` and in `+lone`.
 #[test]
-fn the_lone_lead_oracle_catches_a_disabled_lead_and_a_disabled_hysteresis() {
-    // Seeds a sweep of 300 found each to trip (the hysteresis control needs
-    // a gated row of its own and a `Lone` one after it, which is rarer; plan
-    // 46 M1.1's trajectories: 0, 57 and 103 trip no more; M1.2 step 2's ask
-    // cadence moved 64 off the list for 88; step 10's release rows moved 2
-    // off the list for 1).
-    type Control = (
+fn the_lone_delegate_control_fails_the_oracles() {
+    type Case = (
         &'static str,
         fn() -> SimConfig,
-        &'static str,
+        &'static [u64],
         &'static [u64],
     );
-    let controls: [Control; 2] = [
+    let cases: [Case; 2] = [
         (
-            "long-delegated-lead-off",
-            long_delegated_lead_off_config,
-            "more than the lead",
-            &[1, 3],
+            "far-placement",
+            far_placement_config,
+            &[3, 5, 6],
+            I5_FAR_PLACEMENT_SEEDS,
         ),
         (
-            "long-delegated-hysteresis-off",
-            long_delegated_hysteresis_off_config,
-            "follows own gated row",
-            &[88, 118],
+            "long-delegated",
+            long_delegated_config,
+            &[0, 3, 6],
+            I5_LONG_DELEGATED_SEEDS,
         ),
     ];
-    for (label, config, needle, seeds) in controls {
-        let tripped = seeds.iter().all(|&seed| {
-            run_seed(seed, config()).is_err_and(|e| e.contains("lone lead") && e.contains(needle))
-        });
-        assert!(
-            tripped,
-            "{label}: a seed of {seeds:?} did not trip the oracle ({needle})"
-        );
+    for (label, config, i1_seeds, i5_seeds) in cases {
+        for &seed in i1_seeds {
+            let err = run_seed(seed, with_lone_delegates(config()))
+                .expect_err("a lone delegate must fail I1");
+            assert!(
+                err.contains("I1 acked_implies_committed"),
+                "{label} seed {seed}: {err}"
+            );
+        }
+        for &seed in i5_seeds {
+            let err = run_seed(seed, only_i5_strict(with_lone_delegates(config())))
+                .expect_err("a lone delegate must fail I5");
+            assert!(
+                err.contains("I5 speculation_only_lone"),
+                "{label} seed {seed}: {err}"
+            );
+            // Without the control the same seed is clean under both.
+            run_seed(seed, only_i5_strict(config()))
+                .unwrap_or_else(|e| panic!("{label} seed {seed} (+lone): {e}"));
+            run_seed(seed, config())
+                .unwrap_or_else(|e| panic!("{label} seed {seed} (+commit): {e}"));
+        }
     }
+}
+
+/// (Seeds of 0 to 2,999 that do: 623, 767, 889, 939, 1128, 1247, ...)
+const I5_FAR_PLACEMENT_SEEDS: &[u64] = &[623, 767, 889];
+/// (Of 0 to 599: 151, 173, 291, 303, 338, 416, 467, 489, 496, 502.)
+const I5_LONG_DELEGATED_SEEDS: &[u64] = &[151, 173, 291];
+
+/// Plan 46 M1.2 step 13, fail-before for the placement: a far writer (every
+/// pair out of the backup budget) is not delegated and its ops are
+/// forwarded: the run completes with every answer committed, the placement
+/// skipped it, and no delegation was made. With the control it delegates.
+#[test]
+fn a_far_writer_is_forwarded_not_delegated() {
+    let mut skipped = 0;
+    for seed in [3, 5, 6] {
+        let r = run_seed(seed, far_placement_config())
+            .unwrap_or_else(|e| panic!("far-placement seed {seed}: {e}"));
+        for s in r.stats.values() {
+            assert_eq!(s.place_delegated, 0, "seed {seed}: delegated a far writer");
+            skipped += s.place_skipped_far;
+        }
+        assert!(r.converged_checked, "seed {seed} did not converge");
+        let lone = run_seed(seed, with_lone_delegates(far_placement_config()));
+        assert!(lone.is_err(), "seed {seed}: the control did not fail");
+    }
+    assert!(skipped > 0, "the placement never met a far writer");
 }
 
 /// Plan 46 M1.3 step 0: `far-root-writes` and the `sticky-*` stubs run in

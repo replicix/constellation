@@ -478,9 +478,9 @@ impl View {
             // when it is journaled, under the store's writer lock, with the
             // rule the core has published for the generation by then
             // (`Meta::delegate_execute_admitted`), provided the
-            // configuration version it names is the store's: `Singleton` or
-            // `Final` is answered at once, a rule that waits (`Group`) once
-            // the group holds the row. The check here only sends a
+            // configuration version it names is the store's: `Final` is
+            // answered at once, a rule that waits (`Group`) once the group
+            // holds the row. The check here only sends a
             // generation the core has not published yet through the core;
             // a version that changed before the journal is refused there.
             if let (Some(deps), Some(_)) = (
@@ -552,9 +552,7 @@ impl View {
                         // stream is committed, `wait_deleg_durable`). The
                         // generation lost or the budget out: in doubt, by
                         // rid through the core, which answers from the
-                        // row's commit or re-executes it at the new owner
-                        // (a delegate that turned lone meanwhile waits on:
-                        // the row is `DelegateNodeGroup`, never answered as lone).
+                        // row's commit or re-executes it at the new owner.
                         //
                         // The rule is the row's own (its `RowCommit`).
                         // An op that journaled no row of its own (nothing

@@ -243,6 +243,32 @@ impl Core {
         false
     }
 
+    /// Plan 46 M1.2 step 13 (no lone delegate): whether a stealable grant
+    /// (placed or manual) to `node` has a group within budget. A delegate's
+    /// group is its recorded backup and the root. The root counts when its
+    /// link to `node` is within `backup_rtt_budget_ms` (an unmeasured or
+    /// unknown link counts: what is not known to be far is not refused),
+    /// and so does a backup the node's live stream already records. A node
+    /// with neither would answer its own clients on its disk alone, which
+    /// no committed-or-final answer may do.
+    pub(crate) fn delegate_group_in_budget(&self, node: NodeId) -> bool {
+        if self.cfg.lone_delegate {
+            return true;
+        }
+        let budget = self.cfg.backup_rtt_budget_ms;
+        if self
+            .links
+            .get(&node)
+            .is_none_or(|l| l.rtt_ms.is_none_or(|rtt| rtt <= budget))
+        {
+            return true;
+        }
+        self.dl
+            .gens
+            .values()
+            .any(|g| !g.ended && g.node == node && !g.group.backups.is_empty())
+    }
+
     /// `node` holds a non-stealable stream (sticky or designated), or a
     /// designation to it is pending
     /// (`DelegationState::designating`).
@@ -399,6 +425,14 @@ impl Core {
             }
             if !self.place_eligible(now, node, out) {
                 self.stats.place_skipped_unreachable += 1;
+                continue;
+            }
+            // Plan 46 M1.2 step 13: no lone delegate. A writer with no peer
+            // within the backup RTT budget (the root included) would answer
+            // its own clients on its disk alone: it is forwarded instead
+            // (until a sticky grant, plan 46 M1.3).
+            if !self.delegate_group_in_budget(node) {
+                self.stats.place_skipped_far += 1;
                 continue;
             }
             match self.delegate_dir(now, dir, node, DelegKind::Placed, replica, out) {

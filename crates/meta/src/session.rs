@@ -771,21 +771,12 @@ pub enum DurableWait {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegDurable {
     /// The commit rule of a row the fast path journals under the generation
-    /// now (`Core::deleg_rule(.., Asker::Own)`): `Singleton` or `Final`
-    /// answer at once, `Group` waits.
+    /// now (`Core::deleg_rule`): `Final` answers at once, `Group` waits.
     pub commit: RowCommit,
     /// The highest stream index whose prefix is committed: the log carries
     /// it, or every member of the group (and of a requested change) holds
     /// it (`Core::deleg_committed_through`).
     pub through: u64,
-    /// The highest stream index a `Singleton` row may take: the committed
-    /// prefix plus the lead (`Core::deleg_lone_horizon`). The fast path
-    /// refuses a `Singleton` stamp past it under the writer lock (the op goes
-    /// through the core, which makes the row wait for its group): the journal
-    /// moves between the core's steps, and the lead is what holds a lone
-    /// delegate's own load to what its stream to the root carries (until step
-    /// 6 takes the lead out of the commit). `u64::MAX`: no limit.
-    pub horizon: u64,
     /// The generation is stopped, lapsed or lost its backup: nothing more
     /// will commit under it from here, the op's answer is in doubt.
     pub lost: bool,
@@ -1637,91 +1628,45 @@ impl SessionState {
     /// Plan 43 C2d: the commit rule a delegate's fast-path row of `gen` is
     /// journaled with now; `None`: the core has not published the
     /// generation (the op goes through the core).
-    ///
-    /// I1 class 2: a published `Singleton` is `Group` while the guard
-    /// ([`Self::set_lone_guard`]) says this node has a lapse its core has
-    /// not been handed: the rule was judged on links older than the lapse.
     pub fn deleg_row_class(&self, gen: u64) -> Option<RowCommit> {
-        let commit = self
-            .inner
+        self.inner
             .lock()
             .unwrap()
             .deleg_durable
             .get(&gen)
-            .map(|d| d.commit)?;
-        Some(self.guarded(commit))
+            .map(|d| d.commit)
     }
 
     /// Plan 46 M1.1 step 4: the rule the fast path stamps its row of `gen`
     /// with at the journaling, under the store's writer lock, given the
     /// version of the generation's configuration the store records there
-    /// (`store_version`: the latest `DelegateNodeGroup` record applied, 0 when none)
-    /// and the highest index of an own gated row journaled under the
-    /// generation (`gated`), and the stream index the row takes (`idx`).
-    /// `None`: the core has not published the
-    /// generation, or the state it published its rule on is not the store's
-    /// now: the rule was decided under another version (a record applied
-    /// since), or a `Singleton` rule predates an own gated row that the
-    /// published prefix does not cover (a row of this node's own clients
-    /// that waits for its group; a `Singleton` row journaled behind it would
-    /// be replayed without it at a root's crash). The op is not journaled
-    /// here, it goes through the core, which decides from the state it reads
-    /// then. The row is never classed again by its place in the stream.
+    /// (`store_version`: the latest `DelegateNodeGroup` record applied, 0 when none).
+    /// `None`: the core has not published the generation, or the state it
+    /// published its rule on is not the store's now: the rule was decided
+    /// under another version (a record applied since). The op is not
+    /// journaled here, it goes through the core, which decides from the
+    /// state it reads then. The row is never classed again by its place in
+    /// the stream.
     ///
-    /// Only a delegate generation's own group (`Group` on the delegate,
-    /// `Singleton`) names the applied version: the archive's rule (`ack=s3`)
-    /// and a designation's `Final` have none to compare.
-    pub fn deleg_commit_at_journal(
-        &self,
-        gen: u64,
-        store_version: u64,
-        gated: u64,
-        idx: u64,
-    ) -> Option<RowCommit> {
-        let (commit, through, horizon) = {
+    /// Only a delegate generation's own group (`Group` on the delegate)
+    /// names the applied version: the archive's rule (`ack=s3`) and a
+    /// designation's `Final` have none to compare.
+    pub fn deleg_commit_at_journal(&self, gen: u64, store_version: u64) -> Option<RowCommit> {
+        let commit = {
             let g = self.inner.lock().unwrap();
-            let d = g.deleg_durable.get(&gen)?;
-            (d.commit, d.through, d.horizon)
+            g.deleg_durable.get(&gen)?.commit
         };
-        let commit = self.guarded(commit);
         let names_applied = matches!(
             commit,
-            RowCommit::Singleton { .. }
-                | RowCommit::Group {
-                    on: crate::store::local::GroupOn::Delegate,
-                    ..
-                }
+            RowCommit::Group {
+                on: crate::store::local::GroupOn::Delegate,
+                ..
+            }
         );
         if names_applied && commit.config_version() != Some(store_version) {
             return None;
         }
-        // A `Singleton` row follows no open gated row of the node's own and
-        // stays within the published lead.
-        if commit.is_singleton() && (gated > through || idx > horizon) {
-            return None;
-        }
         Some(commit)
-    }
-
-    /// `Lone` is not a class to journal under while this node has a lapse
-    /// its core has not been handed ([`Self::set_lone_guard`]): the row
-    /// waits for the group like a `DelegateNodeGroup` one, and goes in doubt
-    /// through the core (D5) at the wait's budget. The guard reads atomics
-    /// only, and only a `Lone` class asks it.
-    fn guarded(&self, class: RowCommit) -> RowCommit {
-        if class.is_singleton() && self.lone_guard.get().is_some_and(|guard| guard()) {
-            class.demoted()
-        } else {
-            class
-        }
-    }
-
-    /// The highest stream index of `gen` the core published as committed
-    /// (`DelegDurable::through`, kept a while after the generation is
-    /// withdrawn; 0: none known). It only lags the truth.
-    pub(crate) fn deleg_covered(&self, gen: u64) -> u64 {
-        let g = self.inner.lock().unwrap();
-        g.deleg_covered.get(&gen).copied().unwrap_or(0)
     }
 
     /// Plan 43 C2d: the delegate fast path's wait for its group. The op
@@ -1734,9 +1679,9 @@ impl SessionState {
     /// generation is not held, is
     /// stopped, lapsed or lost its backup (the answer is in doubt: the core
     /// dedups the retry by rid and answers from the row's commit);
-    /// `TimedOut` at `budget`. Never `Ungated`: a delegate that turned
-    /// lone after it journaled a `DelegateNodeGroup` row still waits for that
-    /// row's commit (the root's append), as the core's own answer does.
+    /// `TimedOut` at `budget`. Never `Ungated`: a delegate's row waits for
+    /// its commit (the root's append, or the backup), as the core's own
+    /// answer does.
     pub fn wait_deleg_durable(&self, gen: u64, idx: u64, budget: Duration) -> DurableWait {
         let started = Instant::now();
         let mut g = self.inner.lock().unwrap();
@@ -1784,9 +1729,7 @@ impl SessionState {
     /// before it; its FUSE threads run before its driver can hand the lapse
     /// and a newer directory, and must not answer on the disk alone then. A
     /// row journaled `Lone` meanwhile waits like a gated one and takes the
-    /// in-doubt path through the core (D5). The same holds for a delegate's
-    /// fast path: a `Lone` class it has published is `DelegateNodeGroup` while the
-    /// guard fires ([`Self::deleg_row_class`]).
+    /// in-doubt path through the core (D5).
     ///
     /// Set once (the first guard stays), read on every fast-path operation
     /// without a lock; the guard must not take one either
@@ -2225,7 +2168,6 @@ mod tests {
         let published = |commit, through, lost| DelegDurable {
             commit,
             through,
-            horizon: u64::MAX,
             lost,
         };
         let wait = |gen, idx| s.wait_deleg_durable(gen, idx, Duration::ZERO);
@@ -2274,7 +2216,6 @@ mod tests {
         let published = |through| DelegDurable {
             commit: RowCommit::DELEG_GROUP,
             through,
-            horizon: u64::MAX,
             lost: false,
         };
         let wait = |gen, idx| s.wait_deleg_durable(gen, idx, Duration::ZERO);
@@ -2307,7 +2248,6 @@ mod tests {
             Some(DelegDurable {
                 commit: RowCommit::DELEG_GROUP,
                 through: 2,
-                horizon: u64::MAX,
                 lost: false,
             }),
         );
@@ -2334,101 +2274,24 @@ mod tests {
                 Some(DelegDurable {
                     commit,
                     through: 10,
-                    horizon: u64::MAX,
                     lost: false,
                 }),
             );
         };
-        assert_eq!(s.deleg_commit_at_journal(7, 0, 0, 1), None, "not published");
+        assert_eq!(s.deleg_commit_at_journal(7, 0), None, "not published");
         let group = |v| RowCommit::group(v, crate::store::local::GroupOn::Delegate);
         publish(group(3));
-        assert_eq!(s.deleg_commit_at_journal(7, 3, 0, 1), Some(group(3)));
+        assert_eq!(s.deleg_commit_at_journal(7, 3), Some(group(3)));
         assert_eq!(
-            s.deleg_commit_at_journal(7, 4, 0, 1),
+            s.deleg_commit_at_journal(7, 4),
             None,
             "a record applied since"
         );
-        assert_eq!(
-            s.deleg_commit_at_journal(7, 2, 0, 1),
-            None,
-            "the store is behind"
-        );
-        publish(RowCommit::Singleton { config_version: 3 });
-        assert_eq!(
-            s.deleg_commit_at_journal(7, 3, 0, 1),
-            Some(RowCommit::Singleton { config_version: 3 })
-        );
-        assert_eq!(s.deleg_commit_at_journal(7, 4, 0, 1), None);
-        // A `Singleton` rule behind an own gated row the published prefix
-        // (10) does not cover is no rule to stamp; one it covers is.
-        assert_eq!(s.deleg_commit_at_journal(7, 3, 11, 1), None);
-        assert_eq!(
-            s.deleg_commit_at_journal(7, 3, 10, 1),
-            Some(RowCommit::Singleton { config_version: 3 })
-        );
+        assert_eq!(s.deleg_commit_at_journal(7, 2), None, "the store is behind");
         publish(RowCommit::FINAL);
-        assert_eq!(
-            s.deleg_commit_at_journal(7, 9, 0, 1),
-            Some(RowCommit::FINAL)
-        );
+        assert_eq!(s.deleg_commit_at_journal(7, 9), Some(RowCommit::FINAL));
         publish(RowCommit::ARCHIVE);
-        assert_eq!(
-            s.deleg_commit_at_journal(7, 9, 0, 1),
-            Some(RowCommit::ARCHIVE)
-        );
-    }
-
-    /// I1 class 2 for the delegate's fast path: with `Lone` published and
-    /// the lone guard firing (a lapse the core has not been handed), the
-    /// class a row is journaled with is `DelegateNodeGroup`, by the row's place too;
-    /// a class that waits is never changed, and the word stands again when
-    /// the guard clears. Fails before: `Lone` throughout.
-    #[test]
-    fn a_published_lone_class_is_a_group_class_while_the_lone_guard_fires() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-        let s = SessionState::default();
-        let lapse = Arc::new(AtomicBool::new(false));
-        {
-            let lapse = lapse.clone();
-            s.set_lone_guard(Arc::new(move || lapse.load(Ordering::Relaxed)));
-        }
-        s.set_deleg_durable(
-            7,
-            Some(DelegDurable {
-                commit: RowCommit::LONE,
-                through: 10,
-                horizon: u64::MAX,
-                lost: false,
-            }),
-        );
-        assert_eq!(s.deleg_row_class(7), Some(RowCommit::LONE));
-        assert_eq!(s.deleg_commit_at_journal(7, 0, 0, 1), Some(RowCommit::LONE));
-        lapse.store(true, Ordering::Relaxed);
-        assert_eq!(s.deleg_row_class(7), Some(RowCommit::DELEG_GROUP));
-        assert_eq!(
-            s.deleg_commit_at_journal(7, 0, 0, 1),
-            Some(RowCommit::DELEG_GROUP)
-        );
-        assert_eq!(s.deleg_commit_at_journal(8, 0, 0, 1), None, "not published");
-        lapse.store(false, Ordering::Relaxed);
-        assert_eq!(s.deleg_row_class(7), Some(RowCommit::LONE));
-        assert_eq!(s.deleg_commit_at_journal(7, 0, 0, 1), Some(RowCommit::LONE));
-        // The classes that wait or never answer from the disk are untouched.
-        lapse.store(true, Ordering::Relaxed);
-        for commit in [RowCommit::DELEG_GROUP, RowCommit::FINAL] {
-            s.set_deleg_durable(
-                7,
-                Some(DelegDurable {
-                    commit,
-                    through: 10,
-                    horizon: u64::MAX,
-                    lost: false,
-                }),
-            );
-            assert_eq!(s.deleg_row_class(7), Some(commit));
-            assert_eq!(s.deleg_commit_at_journal(7, 0, 0, 1), Some(commit));
-        }
+        assert_eq!(s.deleg_commit_at_journal(7, 9), Some(RowCommit::ARCHIVE));
     }
 
     /// Plan 43 C1-2: the class the core publishes with the gate is what the

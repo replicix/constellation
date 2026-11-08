@@ -457,20 +457,15 @@ pub struct Config {
     pub lock_cache_idle_ms: u64,
     /// Rows per `DelegateStream` batch.
     pub delegation_stream_rows: usize,
-    /// A lone delegate's own rows are `Lone` only while its journal is
-    /// fewer transactions past the committed prefix than a stream batch
-    /// carries records (`Core::deleg_lone_lead_full`). Always on in
-    /// production; the simulation turns it off as the negative control of
-    /// the oracle that counts own `Lone` rows past the lead.
-    pub delegation_lone_lead: bool,
-    /// A lone delegate's own row is `Lone` only once every gated row of the
-    /// generation journaled for its own node's clients has committed
-    /// (`Core::deleg_lone_held_by_gated`). Always on in production; the
-    /// simulation turns it off as the negative control of the oracle that
-    /// counts own `Lone` rows behind an uncommitted gated one.
-    pub delegation_lone_hysteresis: bool,
+    /// Plan 46 M1.2 step 13's negative control, never set in production (the
+    /// simulation's `AUTHORITY_SIM_LONE_DELEGATE=1`): the root grants to a
+    /// node with no group within budget, and that delegate answers its own
+    /// node's clients on its disk alone (`Singleton`) while no peer is
+    /// linked within the budget: the deleted lone delegate. The oracles
+    /// (I1, I5) must fail with it.
+    pub lone_delegate: bool,
     /// Plan 46 M1.1 step 3's negative control, never set in production: a
-    /// delegate stamps a row journaled while it assesses itself lone with
+    /// delegate that records no backup stamps its rows with
     /// a version that is in no history (its group's plus
     /// `RowCommit::PER_ROW_SKEW`) instead of its configuration's — the journal-time class of the mutable "peer in
     /// budget" assessment that rows no longer carry. The simulation's
@@ -798,8 +793,7 @@ impl Config {
             lock_ttl_ms: 20_000,
             lock_cache_idle_ms: 30_000,
             delegation_stream_rows: 256,
-            delegation_lone_lead: true,
-            delegation_lone_hysteresis: true,
+            lone_delegate: false,
             per_row_class: false,
             delegation_stream_tick_ms: 50,
             delegation_push_drop_every: 0,
@@ -1096,9 +1090,6 @@ pub struct Stats {
     /// Delegate: generations stopped before a row whose dependency was
     /// lost with another generation (`DelegateState::lost_from`).
     pub deleg_lost_deps_stopped: u64,
-    /// Delegate: of those, a stop at or below a row already answered under
-    /// the group (must be 0: the simulation fails the run).
-    pub deleg_lost_after_ack: u64,
     /// Root: delegate rows not appended, a dependency lost with its
     /// generation.
     pub deleg_append_deps_lost: u64,
@@ -1355,10 +1346,6 @@ pub struct Stats {
     pub deleg_backup_appends: u64,
     pub deleg_backup_acks: u64,
     pub deleg_acks_parked: u64,
-    /// A lone delegate's own op that a gated row of its own, not committed,
-    /// kept from being `Lone` when its class was decided (not the lead:
-    /// `Core::deleg_lone_held_by_gated`).
-    pub deleg_lone_held_by_gate: u64,
     /// Plan 43 C2 (D7): parked delegate acknowledgements aborted because
     /// their row left the journal without the log carrying it.
     pub deleg_acks_dropped: u64,
@@ -1395,6 +1382,10 @@ pub struct Stats {
     /// Placement: candidates skipped because the node holds designations
     /// only, or one is pending (a stream never mixes grant kinds).
     pub place_skipped_designated: u64,
+    /// Plan 46 M1.2 step 13: candidates (and operator grants) refused
+    /// because the node has no group within the backup RTT budget: a far
+    /// writer is forwarded to the root.
+    pub place_skipped_far: u64,
     /// Delegate: ReadIndex answered for its subtree, read grants given.
     pub deleg_read_index_served: u64,
     pub deleg_read_grants: u64,

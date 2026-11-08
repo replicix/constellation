@@ -943,7 +943,7 @@ forwards waits for one S3 commit. §9 has the failover rules.
 a grant goes to a node and covers a set of subtrees under one stream
 (`DelegateNode`, `SubtreeReleased`, `DelegateNodeGroup`,
 `DelegateNodeEnded` replace `Delegate`, `Recall`, `RecallCut`,
-`DelegGroup`); the lone delegate and its bounded lead, (hash-range splits
+`DelegGroup`); the lone delegate and its bounded lead (gone, M1.2 step 13), (hash-range splits
 are already deleted), the cross-generation dependency rule
 ([ADR-39](DECISIONS.md#adr-39-a-delegates-group-acknowledgement-waits-for-the-rows-dependencies-on-its-other-generations))
 and the 30 s placement windows go; far writers hold sticky non-stealable
@@ -1013,34 +1013,23 @@ lease and one log
   ([ADR-39](DECISIONS.md#adr-39-a-delegates-group-acknowledgement-waits-for-the-rows-dependencies-on-its-other-generations)).
   The class of an answer
   is fixed when the row is journaled, and a retry of a rid whose row is
-  still uncommitted waits for the row like the first answer did. The one
-  speculation place is a *lone* delegate — no recorded backup and no peer,
-  the root included, within `CONSTELLATION_BACKUP_RTT_BUDGET_MS` — which
-  answers its own node's client from its disk while its journal is within a
-  bounded lead of the root's cursor (a stream batch's worth, applied to each
-  row by its own index where the row is journaled, the fast path's and the
-  core's alike; past it its own rows wait
-  for the root as well, so another node's forward, which waits for the root
-  behind every earlier row, waits a few batches at most) and no earlier row of
-  its own node's clients is still waiting for the root, in any generation
-  the node holds (a `Lone` row behind
-  an uncommitted `DelegGroup` row would be replayed alone, without its
-  effect, after a root crash dropped the row it rests on, and one node's
-  generations can share keys: an unlink of a file's primary link moves the
-  file's keys to the generation of its next link; another node's
-  forward does not count, which I5 would allow, to spare a delegate that
-  serves remote nodes the cost;
-  [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3));
-  another node's forward always waits for the root. The delegate's own FUSE fast path writes
+  still uncommitted waits for the row like the first answer did. No delegate
+  answers from its disk alone (plan 46 M1.2 step 13,
+  [ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)):
+  the root grants a placed or manual delegation only to a node with a group
+  within `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (a recorded backup, or the root
+  itself within the budget), so every answer of a delegate waits for its group
+  (the root's append, when no backup is recorded) and a writer with no peer in
+  budget is forwarded to the root until a sticky grant. A sticky or designated
+  grant is final. Another node's forward always waits for the root.
+  The delegate's own FUSE fast path writes
   first and waits for the group afterwards: it journals the row with the
   class the core has published for the generation at the moment the row is
   journaled, and returns once the
-  generation's commit point covers the row (a lone delegate's and a
-  designee's rows at once); a delegation lost meanwhile puts the op in doubt
+  generation's commit point covers the row (a designee's rows at once); a delegation lost meanwhile puts the op in doubt
   and it goes back through the core by rid. At the end of a generation the rows past its cut
   that nobody was answered for are dropped, not replayed (their clients retry
-  by rid at the new owner); a lone delegate's own rows are replayed as
-  before; and a generation whose latest record names a backup is not ended
+  by rid at the new owner); and a generation whose latest record names a backup is not ended
   before that backup answers its seal, since rows acknowledged through it
   may be nowhere else. A delegate whose journal may have lost its unsynced
   end (it held the generation before a reboot) does not take it up again,
@@ -1378,7 +1367,7 @@ op executes and is acknowledged; "EROFS" means it is refused at once.
 | Holder dies, `ack=s3` | — | write again in ≈ 1.5 s in the harness, not measured on EC2 (any peer takes over), nothing acknowledged lost |
 | Holder dies, no backup (`Local`) | — | write again after the lease TTL (60 s) plus margin; acknowledged forwards are replayed by their requesters; with `f > 0` the taker needs `f` promises |
 | Delegate dies | — | writes under its subtree wait for the root to reclaim it (TTL + margin ≈ 6 s), or for its recorded backup's seal and tail, which the root waits for without a bound: with the backup gone too, until a member answers or the operator ends the generation (`repair abandon-group --gen`, which loses the rows only that group held; [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)) |
-| Delegate cut from the root | stops sequencing at `sent + ttl − margin`; the rows past the cut that were never answered are dropped and their clients retry through the root (a lone delegate's own node's rows are replayed as before) | write through the root once it reclaims the subtree |
+| Delegate cut from the root | stops sequencing at `sent + ttl − margin`; the rows past the cut that were never answered are dropped and their clients retry through the root | write through the root once it reclaims the subtree |
 | Designee isolated | write | `EROFS` under the path |
 | S3 down, at least `N − f` write-eligible nodes connected | write (epoch) | write (epoch) |
 | S3 down, fewer than `N − f` connected | writes until its lease's TTL, then refuses | cannot acquire; reads work |
@@ -1887,8 +1876,8 @@ latency.
 *Being replaced in part by
 [plan 46](../plans/v1/wip/46-committed-or-final.md) stages 1–2
 ([ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)):
-there is no lone delegate, so nothing a delegate answered is replayed by
-rid; a sticky grant is never reclaimed by TTL (its holder releases, or
+there is no lone delegate (built, M1.2 step 13), so nothing a delegate
+answered is replayed by rid; a sticky grant is never reclaimed by TTL (its holder releases, or
 the operator abandons); the `Held` wait on an acknowledged-but-unappended
 dependency goes with the replay. This text changes with the code.*
 
@@ -1896,16 +1885,14 @@ dependency goes with the replay. This text changes with the code.*
   `ttl + margin` (≈ 6 s) and ends the generation; every row a delegate
   answered to another node is already in the root's journal (its answer
   waited for the append), and the clients of the rows it had not answered
-  retry by rid through the root. A lone delegate's own client's ops, answered
-  on its disk, are the one thing replayed by rid.
+  retry by rid through the root.
 - **Crash, with a recorded backup**: the root has the delegate's backup seal,
   drains what it holds, and continues; until the backup answers the
   generation is not ended (the seal is asked again every window).
 - **Partitioned from the root**: the delegate stops at
   `sent + ttl − margin`, before the root may reclaim; its unstreamed
   transactions past the cut are stranded: the ones nobody was answered for
-  are dropped (their clients retry by rid), a lone delegate's own are
-  replayed by rid.
+  are dropped (their clients retry by rid).
 - **Root fails over**: the new root inherits the live generations as soon as
   its takeover gate's journal work is done (`shippable`), not when the gate
   opens: it appends and acknowledges their streams, answers their renewals (a

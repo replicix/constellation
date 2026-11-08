@@ -849,6 +849,12 @@ operator) and `reship.tail_rid_done` (must stay 0).
 dropped from M1.1; **M1.2 step 13 closes them** (the lone delegate and its lead stay until then, and `long-delegated-lead`, `-lead-off`,
 `-hysteresis-off` and the `LoneLead` oracle with them). M1.1 exits after step 7.
 
+*M1.2 step 13 landed (2026-11-08; PROGRESS, "Plan 46 M1.2 step 13"):* no delegate answers from its disk alone. The root grants a placed or manual delegation only to a
+node whose link to the root is within `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (an unmeasured link counts) or whose stream records a backup; sticky and designated grants need
+neither. A far writer is forwarded (`place_skipped_far`). The lead, the lone-to-group hysteresis, `deleg_lost_after_ack`, the `LoneLead` oracle and the three sim
+configurations are gone; `Config::lone_delegate` (`AUTHORITY_SIM_LONE_DELEGATE=1`) is the negative control. The root cannot see a backup a far node could find among its own
+peers: such a node is forwarded until M1.3's sticky grant or a later advertisement of candidate backups.
+
 *M1.1 step 7 landed (2026-11-06; PROGRESS, "Plan 46 M1.1 step 7"):* `AckClass`, the step-2 wrappers (`root_ack_class`, `root_ack_class_for`,
 `deleg_ack_class`, `CommitRule::ack_class`) and the five class names are gone; `AnswerSource::Sequenced(RowCommit)`; `status.ack.classes` is
 `{group, final, singleton, archive_waits}` (`archive_waits` disjoint from `group`, Q7; the control schema re-blessed, no version bump); the sim oracle
