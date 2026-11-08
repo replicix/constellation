@@ -1322,6 +1322,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m11::delegate_crash,
     },
     Scenario {
+        name: "sticky-abandon",
+        desc: "plan 46 M1.3 step 13: the sticky holder of d1 (b) is killed with cto strict; c's writes into d1 fail EROFS for longer than the delegation TTL; `repair abandon --node b` is refused without --force within the TTL of the kill and, with it, ends the stream within the read wait (the read delegations b granted are recalled or waited out); c then writes d1/b-last and d1/x through the root and no read is served under b's old grant; b remounts and its acknowledged rows past the cut replay by rid (d1/b-last, now c's, becomes a conflict copy); b is granted again at a higher generation",
+        requires: &[],
+        caps: &[],
+        run: m11::sticky_abandon,
+    },
+    Scenario {
         name: "delegate-crash-default-ttl",
         desc: "overload-cascade: delegate-crash at the default grant TTL (the lock grant TTL, 20 s): the root reclaims the dead delegate's subtree about ttl + margin after its last renewal, so a third node's write into d1 waits more than the short test TTL's whole life and less than ttl + 10 s; then the same recovery as delegate-crash",
         requires: &[],
