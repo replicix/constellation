@@ -3645,6 +3645,15 @@ impl Core {
             }
             Control::Undelegate { dir } => self.on_control_undelegate(now, op, dir, replica, out),
             Control::ReleaseGrants => self.on_control_release_grants(now, op, replica, out),
+            Control::LeaveFailed => {
+                if self.dl.leave_self {
+                    self.leave_self_abort(now, out);
+                }
+                out.push(Action::ControlDone {
+                    op,
+                    result: Ok(ControlOk::Done),
+                });
+            }
             Control::EndGrantsOf { node } => {
                 self.on_control_end_grants_of(now, op, node, replica, out)
             }

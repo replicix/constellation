@@ -994,6 +994,10 @@ pub(crate) struct LeaveWait {
 /// generations are `epoch << 32 | n`, and never 0.
 pub(crate) const LEAVE_NOTE_GEN: u64 = 0;
 
+/// A root's mark of a node that said it leaves lapses when no note has come
+/// for this many resend intervals.
+const LEAVE_NOTE_LAPSE_RESENDS: u64 = 3;
+
 /// Why a node is marked leaving at its root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LeaveMark {
@@ -1144,6 +1148,10 @@ pub(crate) struct DelegationState {
     /// them from the moment their leave starts, so no grant is made between
     /// the end of their grants and the retirement of their registry entry.
     pub leaving: BTreeMap<NodeId, LeaveMark>,
+    /// The latest leave sequence (the request id of the note) of each node
+    /// that took its leave back: a leaving note of that sequence or an
+    /// older one (a delayed duplicate) marks nothing.
+    pub leave_taken_back: BTreeMap<NodeId, u64>,
     /// This node is leaving: its release notes say so to the root, and it
     /// installs no grant from here on.
     pub leave_self: bool,
@@ -9796,7 +9804,7 @@ impl Core {
         if let Some(g) = self.dl.gens.get_mut(&gen) {
             g.delegate_heard = Some(now.wait);
         }
-        if released.as_ref().is_some_and(|n| n.leaving) {
+        if released.as_ref().is_some_and(|n| n.leaving) && !self.leave_note_stale(from, req) {
             self.leave_mark(now, from, Some(req));
         }
         self.deleg_live_by_stream(now, gen);
@@ -10688,7 +10696,7 @@ impl Core {
     /// How long a leave waits for the log to end the grants (the root's
     /// outwait of a holder that does not answer is one TTL, and the root's
     /// own recall of it a resend or two more).
-    fn leave_wait_ms(&self) -> i64 {
+    pub(crate) fn leave_wait_ms(&self) -> i64 {
         (self.cfg.delegation_ttl_ms as i64)
             .saturating_mul(2)
             .saturating_add(self.cfg.forward_timeout_ms as i64)
@@ -10698,16 +10706,19 @@ impl Core {
     /// `node` is leaving: this root grants it nothing more, and a
     /// designation waiting to be journaled for it is dropped.
     ///
-    /// `note` is the request of the node's own note, which lapses with the
-    /// time a leave may take (a node that stays up, or comes back under the
-    /// same id, is granted again); `None` is an operator's leave, whose mark
-    /// goes with the leave that fails.
+    /// `note` is the request of the node's own note. The leaving node sends
+    /// it again every resend interval for as long as its leave lasts (also
+    /// after the core answered it, and to a new root), so the mark lapses
+    /// when no note has come for [`LEAVE_NOTE_LAPSE_RESENDS`] intervals (a
+    /// node that stays up, or comes back under the same id, is granted
+    /// again), not at a fixed time after the first one. `None` is an
+    /// operator's leave, whose mark goes with the leave that fails.
     fn leave_mark(&mut self, now: Now, node: NodeId, note: Option<OpId>) {
         let mark = match (self.dl.leaving.get(&node), note) {
             // (An operator's mark is not weakened by the node's note.)
             (Some(m), Some(_)) if m.until.is_none() => *m,
             (_, Some(req)) => LeaveMark {
-                until: Some(now.wait.plus(self.leave_wait_ms() as u64 + 5_000)),
+                until: Some(now.wait.plus(self.leave_note_lapse_ms())),
                 req: req.0,
             },
             (_, None) => LeaveMark {
@@ -10718,6 +10729,25 @@ impl Core {
         self.dl.leaving.insert(node, mark);
         self.dl.designating.retain(|_, n| *n != node);
         self.dl.growing.retain(|_, (n, _)| *n != node);
+    }
+
+    /// How often a leaving node sends its note again.
+    fn leave_resend_ms(&self) -> i64 {
+        self.cfg.forward_timeout_ms.max(500) as i64
+    }
+
+    /// How long the root's mark of a leaving node lasts without a note.
+    fn leave_note_lapse_ms(&self) -> u64 {
+        (self.leave_resend_ms() as u64).saturating_mul(LEAVE_NOTE_LAPSE_RESENDS)
+    }
+
+    /// Whether a leaving note of `req` from `node` is a delayed duplicate
+    /// of one a take-back came after.
+    fn leave_note_stale(&self, node: NodeId, req: OpId) -> bool {
+        self.dl
+            .leave_taken_back
+            .get(&node)
+            .is_some_and(|t| req.0 <= *t)
     }
 
     /// `node` is leaving (see [`DelegationState::leaving`]).
@@ -10740,8 +10770,13 @@ impl Core {
     }
 
     fn leave_wait_arm(&mut self, now: Now, out: &mut Vec<Action>) {
-        let taking_back = self.dl.leave_tell.is_some_and(|t| !t.leaving);
-        if self.dl.leave_timer.is_some() || (self.dl.leave_waits.is_empty() && !taking_back) {
+        // (A leaving node keeps telling its root for as long as it leaves.)
+        let telling = self.dl.leave_tell.is_some()
+            || (self.dl.leave_self
+                && self.cfg.delegation
+                && self.cfg.p2p
+                && !self.root_usable(now));
+        if self.dl.leave_timer.is_some() || (self.dl.leave_waits.is_empty() && !telling) {
             return;
         }
         let t = self.set_timer_wait(now.wait.plus(500), Timer::LeaveWait, out);
@@ -10847,7 +10882,7 @@ impl Core {
     /// This node's leave is known to the root it has now: that root
     /// acknowledged the leave note, or this node holds the lease itself (or
     /// nobody can grant: delegation is off).
-    fn leave_told_ok(&self, now: Now) -> bool {
+    pub(crate) fn leave_told_ok(&self, now: Now) -> bool {
         if !self.cfg.delegation || !self.cfg.p2p || self.root_usable(now) {
             return true;
         }
@@ -10855,38 +10890,44 @@ impl Core {
     }
 
     /// A leave note to the root: sent when the leave starts and again every
-    /// resend interval until the current root acknowledges it, and the note
-    /// taking it back after a failed leave until that is acknowledged or
-    /// out of time.
+    /// resend interval for as long as the leave lasts (the root's mark of
+    /// the node lapses without them, and a new root has to hear of the
+    /// leave), always to the root there is now; and the note taking it back
+    /// after a failed leave, to the root there is now too, until that is
+    /// acknowledged or out of time.
     fn leave_tell_progress(&mut self, now: Now, out: &mut Vec<Action>) {
-        let resend = self.cfg.forward_timeout_ms.max(500) as i64;
+        let resend = self.leave_resend_ms();
+        // This node is the root (or nobody grants): no root to tell.
+        if !self.cfg.delegation || !self.cfg.p2p || self.root_usable(now) {
+            self.dl.leave_tell = None;
+            return;
+        }
         let tell = match self.dl.leave_tell {
             Some(t) if !t.leaving && now.wait >= t.until => {
+                self.dl.leave_tell = None;
+                return;
+            }
+            // (A leaving note of a leave that is over.)
+            Some(t) if t.leaving && !self.dl.leave_self => {
                 self.dl.leave_tell = None;
                 return;
             }
             Some(t) => Some(t),
             None => None,
         };
-        let (leaving, to) = match tell {
-            Some(t) => (t.leaving, t.to),
-            None if self.dl.leave_self && !self.leave_told_ok(now) => {
-                let Some(root) = self.root_node() else {
-                    self.deleg_learn_root(now, out);
-                    return;
-                };
-                (true, root)
-            }
+        let leaving = match tell {
+            Some(t) => t.leaving,
+            None if self.dl.leave_self => true,
             None => return,
         };
-        // A leave note goes to the root there is now.
-        let to = if leaving {
-            match self.root_node() {
-                Some(root) => root,
-                None => return,
+        let to = match (self.root_node(), tell) {
+            (Some(root), _) => root,
+            (None, _) if leaving => {
+                self.deleg_learn_root(now, out);
+                return;
             }
-        } else {
-            to
+            (None, Some(t)) => t.to,
+            (None, None) => return,
         };
         if let Some(t) = tell {
             if t.to == to && t.sent.is_some_and(|at| now.wait.since(at) < resend) {
@@ -10930,9 +10971,14 @@ impl Core {
         if t.req != req || t.to != from || refused {
             return;
         }
-        self.dl.leave_tell = None;
-        if t.leaving && self.dl.leave_self {
-            self.dl.leave_told = Some(from);
+        if t.leaving {
+            // (The leave goes on: the note is sent again at the next
+            // resend, to this root and to a new one.)
+            if self.dl.leave_self {
+                self.dl.leave_told = Some(from);
+            }
+        } else {
+            self.dl.leave_tell = None;
         }
     }
 
@@ -10962,14 +11008,22 @@ impl Core {
         let ok = self.cfg.delegation && self.cfg.p2p && self.root_usable(now) && note.is_some();
         if ok {
             if note.as_ref().is_some_and(|n| n.leaving) {
-                self.leave_mark(now, from, Some(req));
-            } else if self
-                .dl
-                .leaving
-                .get(&from)
-                .is_some_and(|m| m.until.is_some() && m.req < req.0)
-            {
-                self.dl.leaving.remove(&from);
+                if !self.leave_note_stale(from, req) {
+                    self.leave_mark(now, from, Some(req));
+                }
+            } else {
+                // (Remembered also when nothing is marked: a delayed
+                // leaving note may still come.)
+                let t = self.dl.leave_taken_back.entry(from).or_insert(0);
+                *t = (*t).max(req.0);
+                if self
+                    .dl
+                    .leaving
+                    .get(&from)
+                    .is_some_and(|m| m.until.is_some() && m.req < req.0)
+                {
+                    self.dl.leaving.remove(&from);
+                }
             }
         }
         out.push(Action::Send {
@@ -10988,11 +11042,14 @@ impl Core {
 
     /// This node's own leave failed (out of time): it is not leaving, takes
     /// grants again, and tells the root so.
-    fn leave_self_abort(&mut self, now: Now, out: &mut Vec<Action>) {
+    pub(crate) fn leave_self_abort(&mut self, now: Now, out: &mut Vec<Action>) {
         let told = self.dl.leave_told.take();
         let pending = self.dl.leave_tell.take();
         self.dl.leave_self = false;
-        let Some(root) = told.or(pending.map(|t| t.to)).or_else(|| self.root_node()) else {
+        // The root there is now is told (the one that was told may have
+        // lost the lease; its mark went with it); the last one told when
+        // none is known.
+        let Some(root) = self.root_node().or(told).or(pending.map(|t| t.to)) else {
             return;
         };
         let req = self.op_id();
@@ -11204,6 +11261,7 @@ impl Core {
         self.dl.floor_sent.clear();
         self.dl.designating.clear();
         self.dl.leaving.clear();
+        self.dl.leave_taken_back.clear();
         // An operator's leave waits on this root's own state: a new root
         // does not know the node leaves, and the table here lags, so the
         // wait must not end as done. It is for the operator to run again on

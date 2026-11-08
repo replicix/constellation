@@ -458,6 +458,10 @@ pub enum Control {
     /// leaving the roster; release every stream it holds and answer (`Text`)
     /// once the log has ended them.
     ReleaseGrants,
+    /// The engine's leave failed after `ReleaseGrants` was answered (the
+    /// flush, or the registry's retirement): the node is not leaving any
+    /// more, takes grants again, and tells its root so. Answered `Done`.
+    LeaveFailed,
     /// Plan 46 M1.2 step 11: `node` is being retired by an operator; the
     /// root recalls and ends every stream of it, by its release if it
     /// answers, else at the expiry, and answers (`Text`) once the log has

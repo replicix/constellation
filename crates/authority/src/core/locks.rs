@@ -1295,6 +1295,7 @@ impl Core {
         {
             self.dl.leaving.remove(&from);
         }
+        self.dl.leave_taken_back.remove(&from);
         let mut inos = Vec::new();
         let mut dropped = 0u64;
         let mut i = 0;

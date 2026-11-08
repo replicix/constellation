@@ -62299,6 +62299,158 @@ mod step9_one_stream_per_node {
         assert!(h.core.dl.leave_tell.is_none());
     }
 
+    /// A node whose self-leave was told to `root` and acknowledged, and
+    /// answered (the engine flushes and retires it from here on).
+    fn leaving_node_told(root: NodeId) -> (Harness, OpId) {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(root);
+        let out = h.step(Event::Control {
+            op: OpId(5),
+            req: Control::ReleaseGrants,
+        });
+        let (req, _) = leave_note_req(&out, root).expect("no note");
+        let out = h.step(leave_note_ack(root, req, false));
+        assert!(matches!(control_answer(&out, 5), Some(Ok(_))), "{out:?}");
+        (h, req)
+    }
+
+    /// Fire the leave timer after `ms`, if one is armed.
+    fn leave_tick(h: &mut Harness, ms: u64) -> Vec<Action> {
+        h.advance(ms);
+        match h.core.dl.leave_timer {
+            Some(id) => h.step(Event::Timer { id }),
+            None => Vec::new(),
+        }
+    }
+
+    /// Re-review MUST: the mark at the root covers the whole leave. After
+    /// the core answered the self-leave, the engine still flushes and
+    /// retires the node with no time limit: the node keeps telling the root
+    /// it leaves (the same note every resend interval), and tells a new
+    /// root afterwards. Fails on the parent: the note is acknowledged once
+    /// and never sent again.
+    #[test]
+    fn a_leaving_node_keeps_telling_its_root_after_the_leave_was_answered() {
+        let (mut h, req) = leaving_node_told(1);
+        let mut notes = 0;
+        for _ in 0..120 {
+            let out = leave_tick(&mut h, 500);
+            if let Some((r, leaving)) = leave_note_req(&out, 1) {
+                assert!(leaving);
+                assert_eq!(r, req, "a new request to the same root");
+                notes += 1;
+                h.step(leave_note_ack(1, r, false));
+            }
+        }
+        assert!(notes >= 50, "{notes} notes in a minute");
+        // The root changes after the answer: the new root is told, and the
+        // note marks the node there.
+        h.core.lease.cached_holder = Some(4);
+        let out = leave_tick(&mut h, 500);
+        let (req4, leaving) =
+            leave_note_req(&out, 4).unwrap_or_else(|| panic!("the new root was not told: {out:?}"));
+        assert!(leaving);
+        assert!(!h.core.leave_told_ok(h.clk()), "the old root's ack counts");
+        let note = sends(&out)
+            .into_iter()
+            .find(|(n, _)| *n == 4)
+            .map(|(_, m)| m.clone())
+            .unwrap();
+        let (mut r, _d1) = root_with_dir();
+        r.step(Event::Peer { from: 3, msg: note });
+        assert!(r.core.is_leaving(r.clk(), 3), "the new root did not mark");
+        h.step(leave_note_ack(4, req4, false));
+        assert!(h.core.leave_told_ok(h.clk()));
+    }
+
+    /// Re-review MUST, the root's side: the mark of a node's own note lasts
+    /// while its notes keep coming, however long the leave takes, and lapses
+    /// a few resend intervals after they stop.
+    #[test]
+    fn a_leave_mark_lasts_while_the_notes_come_and_lapses_after_they_stop() {
+        let (mut r, _d1) = root_with_dir();
+        let long = r.core.leave_wait_ms() as u64 + 5_000;
+        let mut spent = 0;
+        while spent <= 3 * long {
+            // (The root keeps its lease.)
+            r.hold(2, None);
+            r.step(leave_note_from(3, 100, true));
+            assert!(r.core.is_leaving(r.clk(), 3), "lapsed at {spent} ms");
+            r.advance(400);
+            spent += 400;
+        }
+        assert!(r.core.is_leaving(r.clk(), 3));
+        r.advance(3_000);
+        assert!(
+            !r.core.is_leaving(r.clk(), 3),
+            "the mark outlasts the notes"
+        );
+    }
+
+    /// Re-review SHOULD 1: a leave that fails after the core answered it
+    /// (the flush, the retirement) is taken back: the node takes grants
+    /// again and tells the root. Fails on the parent: no such control, the
+    /// node refuses grants until it restarts.
+    #[test]
+    fn a_leave_that_fails_after_the_answer_is_taken_back() {
+        let (mut h, _req) = leaving_node_told(1);
+        assert!(h.core.dl.leave_self);
+        let out = h.step(Event::Control {
+            op: OpId(6),
+            req: Control::LeaveFailed,
+        });
+        assert!(matches!(control_answer(&out, 6), Some(Ok(_))), "{out:?}");
+        assert!(!h.core.dl.leave_self, "the node is still leaving");
+        let (back, leaving) =
+            leave_note_req(&out, 1).unwrap_or_else(|| panic!("the root was not told: {out:?}"));
+        assert!(!leaving);
+        h.step(leave_note_ack(1, back, false));
+        assert!(h.core.dl.leave_tell.is_none());
+        // (And a failure with no leave on is nothing.)
+        let out = h.step(Event::Control {
+            op: OpId(7),
+            req: Control::LeaveFailed,
+        });
+        assert!(leave_note_req(&out, 1).is_none(), "{out:?}");
+    }
+
+    /// Re-review SHOULD 2: a leaving note delayed past the take-back marks
+    /// nothing; a later leave (a newer sequence) does.
+    #[test]
+    fn a_delayed_leave_note_does_not_mark_the_node_again_after_the_take_back() {
+        let (mut r, _d1) = root_with_dir();
+        r.step(leave_note_from(3, 100, true));
+        r.step(leave_note_from(3, 101, false));
+        assert!(!r.core.is_leaving(r.clk(), 3));
+        let out = r.step(leave_note_from(3, 100, true));
+        assert_eq!(leave_ack_to(&out, 3), Some(false), "{out:?}");
+        assert!(!r.core.is_leaving(r.clk(), 3), "a delayed note re-marked");
+        r.step(leave_note_from(3, 102, true));
+        assert!(r.core.is_leaving(r.clk(), 3), "a new leave was ignored");
+        // (A take-back that came before any mark is remembered too.)
+        let (mut r, _d1) = root_with_dir();
+        r.step(leave_note_from(3, 201, false));
+        r.step(leave_note_from(3, 200, true));
+        assert!(!r.core.is_leaving(r.clk(), 3));
+    }
+
+    /// Re-review SHOULD 3: the take-back goes to the root there is now,
+    /// not the one that acknowledged the note. Fails on the parent: sent
+    /// to the old root.
+    #[test]
+    fn the_take_back_goes_to_the_current_root() {
+        let (mut h, _req) = leaving_node_told(1);
+        h.core.lease.cached_holder = Some(4);
+        let out = h.step(Event::Control {
+            op: OpId(6),
+            req: Control::LeaveFailed,
+        });
+        assert!(leave_note_req(&out, 4).is_some_and(|(_, l)| !l), "{out:?}");
+        assert!(leave_note_req(&out, 1).is_none(), "{out:?}");
+    }
+
     /// Step 10 review SHOULD-1: a subtree this node released and the root
     /// grants the stream again is one to learn afresh: the release it
     /// journaled is not remembered against the new grant (a request for the

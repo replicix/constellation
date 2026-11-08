@@ -6435,8 +6435,12 @@ impl Driver {
                     let store = self.deps.store_inner.clone();
                     let meta = self.deps.meta.clone();
                     let node_id = self.node_id;
+                    let int_tx = self.int_tx.clone();
                     tokio::spawn(async move {
                         let r = crate::leave::finish_leave(store, &meta, node_id).await;
+                        if r.is_err() {
+                            leave_failed(&int_tx);
+                        }
                         let _ = tx.send(
                             r.map(|_| {
                                 format!("left cluster as node {node_id}; registry record retired")
@@ -6446,6 +6450,7 @@ impl Driver {
                     });
                 }
                 Err(e) => {
+                    leave_failed(&self.int_tx);
                     let _ = tx.send(Err(format!(
                         "cannot flush before leave (is S3 reachable?): {e}"
                     )));
@@ -6453,6 +6458,15 @@ impl Driver {
             },
         }
     }
+}
+
+/// The leave failed after the core answered `ReleaseGrants`: the core stops
+/// refusing grants and tells the root the node is not leaving.
+fn leave_failed(tx: &mpsc::UnboundedSender<Internal>) {
+    let _ = tx.send(Internal::Control {
+        req: Control::LeaveFailed,
+        reply: ControlReply::None,
+    });
 }
 
 /// The inodes of the `SetManifest` ops in `batch` whose chunks are still
