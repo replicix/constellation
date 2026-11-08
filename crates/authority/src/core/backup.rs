@@ -92,7 +92,7 @@
 //!   itself a listed backup holding the tail seals first and claims with
 //!   it. **If no member answers the claim waits** (G4: no claim without the
 //!   tail, `status.lease.waiting_for_group`) until one does, or until the
-//!   operator abandons the group (`constellation repair abandon-group`,
+//!   operator abandons the group (`constellation repair abandon`,
 //!   `LogRecord::GroupAbandoned` in the claimant's marker). A holder that
 //!   sealed itself never revives its epoch: it re-claims its own lease at
 //!   the next epoch with its member copy as the tail, at once when the lease
@@ -123,7 +123,7 @@
 //!   C1-4 queues nothing it was told is committed for replay: those rows
 //!   are rolled back and kept as the member copy of their epoch (plan 30
 //!   §M3b's stranding and replay by rid remain for the rows of a lone
-//!   node, and for an operator's `abandon-group`). A backup that reads the
+//!   node, and for an operator's `abandon`). A backup that reads the
 //!   lease moved on to a *later epoch* keeps its tail the same way.
 //!
 //! # Why a backup-acknowledged row is committed (plan 43 C1)

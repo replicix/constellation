@@ -1181,19 +1181,16 @@ impl EngineControl {
         })
     }
 
-    /// `lease.abandon_group` (plan 43 C1-3): let the lease claim waiting for
-    /// `epoch`'s tail go on without it. The text or the core's refusal.
-    pub(crate) fn abandon_group(
-        &self,
-        epoch: u64,
-        gen: u64,
-        force: bool,
-    ) -> std::result::Result<String, String> {
+    /// `repair.abandon` (plan 43 C1-3, plan 46 M1.3 step 13): let the lease
+    /// claim waiting for an epoch's tail go on without it, or end the streams
+    /// of a generation or a node at the root's cursor. The text or the core's
+    /// refusal.
+    pub(crate) fn abandon(&self, p: api::AbandonParams) -> std::result::Result<String, String> {
+        let (target, force) = abandon_target(&p)?;
         let (reply, receive) = tokio::sync::oneshot::channel();
         self.sync_tx
-            .send(sync::SyncRequest::AbandonGroup {
-                epoch,
-                gen,
+            .send(sync::SyncRequest::Abandon {
+                target,
                 force,
                 reply,
             })
@@ -2135,5 +2132,75 @@ mod readdir_status_tests {
             ],
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         );
+    }
+}
+
+/// Map `repair.abandon`'s params to the core's target: exactly one of `epoch`,
+/// `gen`, `node` (`node` may come with `gen`); `force` does not go with `epoch`.
+pub(crate) fn abandon_target(
+    p: &api::AbandonParams,
+) -> std::result::Result<(constellation_authority::AbandonTarget, bool), String> {
+    use constellation_authority::AbandonTarget;
+    let target = match (p.epoch, p.gen, p.node) {
+        (Some(e), None, None) => {
+            if p.force {
+                return Err("--force does not go with --epoch".to_string());
+            }
+            AbandonTarget::Epoch(e)
+        }
+        (None, Some(g), None) => AbandonTarget::Gen(g),
+        (None, gen, Some(node)) => AbandonTarget::Node { node, gen },
+        _ => return Err("name exactly one of --epoch, --gen, --node [--gen]".to_string()),
+    };
+    Ok((target, p.force))
+}
+
+#[cfg(test)]
+mod abandon_target_tests {
+    use super::*;
+    use constellation_authority::AbandonTarget;
+
+    fn p(
+        epoch: Option<u64>,
+        gen: Option<u64>,
+        node: Option<u64>,
+        force: bool,
+    ) -> api::AbandonParams {
+        api::AbandonParams {
+            epoch,
+            gen,
+            node,
+            force,
+        }
+    }
+
+    #[test]
+    fn repair_abandon_params_map_to_targets_and_the_rest_is_refused() {
+        assert_eq!(
+            abandon_target(&p(Some(7), None, None, false)),
+            Ok((AbandonTarget::Epoch(7), false))
+        );
+        assert_eq!(
+            abandon_target(&p(None, Some(2), None, true)),
+            Ok((AbandonTarget::Gen(2), true))
+        );
+        assert_eq!(
+            abandon_target(&p(None, None, Some(3), false)),
+            Ok((AbandonTarget::Node { node: 3, gen: None }, false))
+        );
+        assert_eq!(
+            abandon_target(&p(None, Some(2), Some(3), true)),
+            Ok((
+                AbandonTarget::Node {
+                    node: 3,
+                    gen: Some(2)
+                },
+                true
+            ))
+        );
+        assert!(abandon_target(&p(None, None, None, false)).is_err());
+        assert!(abandon_target(&p(Some(7), Some(2), None, false)).is_err());
+        assert!(abandon_target(&p(Some(7), None, Some(3), false)).is_err());
+        assert!(abandon_target(&p(Some(7), None, None, true)).is_err());
     }
 }

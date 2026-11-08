@@ -1610,6 +1610,17 @@ pub trait PeerService: Send + Sync + 'static {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move { Payload::ReadRecalled { req_id } })
     }
+    /// Plan 46 M1.3 step 13: the root abandons stream `gen`; this node
+    /// stops honouring the read delegations its holder granted. The default
+    /// holds none, so it acks at once.
+    fn read_void_requested(
+        &self,
+        _root: u64,
+        req_id: u64,
+        _gen: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move { Payload::ReadRecalled { req_id } })
+    }
     /// Plan 30 §M9: the holder streams journal transactions to this node
     /// as its backup. Default: this node backs nobody (`sealed`, so the
     /// holder never counts it).

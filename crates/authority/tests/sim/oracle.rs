@@ -2188,6 +2188,10 @@ pub struct Findings {
     pub i2c: Vec<String>,
     pub i4: Vec<String>,
     pub i5: Vec<String>,
+    /// Plan 46 M1.3 step 13: I5's operator branch. A rolled-back row of a
+    /// stream the operator abandoned, past the cut the log gave it: the cost
+    /// the abandon says it has (counted, not a violation).
+    pub i5_operator: Vec<String>,
     /// I6 (plan 43 C7b): TTL claims of a live lease.
     pub i6: Vec<String>,
     /// Plan 46 M1.2 step 3, `acked_at_or_below_cut` (`cut.rs`): answers for a
@@ -2446,6 +2450,7 @@ pub fn end_of_run(
     // I5: acknowledged OK, not as a Lone answer, and rolled back after.
     // (A rollback before the answer is not of it: a lone node's row rolled
     // back by its deposition, then its replay answered by the group.)
+    let cuts = super::cut::StreamCuts::of_log(log);
     for (rid, at) in rolled_back {
         if non_lone_ok.get(rid).is_some_and(|t| t < at) {
             let Some(a) = acks.iter().rev().find(|a| {
@@ -2461,6 +2466,27 @@ pub fn end_of_run(
             };
             if survives(rid) {
                 continue;
+            }
+            // Plan 46 M1.3 step 13 (the operator's I5): a row of a stream
+            // the operator abandoned, past the cut the log gave it, is what
+            // the abandon costs; its holder's replay may be refused (a
+            // conflict copy). Counted, not judged.
+            if let Some((gen, idx)) = a
+                .judged
+                .as_ref()
+                .and_then(|j| j.tx.as_ref())
+                .map(|t| t.origin)
+            {
+                if gen != 0
+                    && cuts.abandoned.contains(&gen)
+                    && cuts.cut.get(&gen).is_some_and(|c| idx > *c)
+                {
+                    f.i5_operator.push(format!(
+                        "I5 operator: rid {rid:?} (row {idx} of abandoned generation {gen}, past its cut) \
+                         rolled back"
+                    ));
+                    continue;
+                }
             }
             // Plan 46 M0.2 (R7, variant 3 (i)): a non-stealable sequencer's
             // OK (an epoch hold's) is uncommitted by design, and its owner's
@@ -2494,8 +2520,9 @@ pub fn end_of_run(
         }
     }
     f.i5.sort();
+    f.i5_operator.sort();
     // Plan 46 M1.2 step 3: `acked_at_or_below_cut`.
-    let cut = super::cut::judge(&acks, &super::cut::StreamCuts::of_log(log));
+    let cut = super::cut::judge(&acks, &cuts);
     f.cut = cut.past_cut;
     f.cut_judged = cut.judged;
     f.cut_abandoned = cut.abandoned;
@@ -3163,6 +3190,71 @@ mod tests {
         // every answer.
         let f = findings_rolled_back(acks, &[], &HashMap::from([(r, u64::MAX)]));
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
+    }
+
+    /// Plan 46 M1.3 step 13: a rolled-back row of an abandoned stream past
+    /// its cut is the operator's I5 (counted), not a violation; the same row
+    /// at or below the cut, or of a stream nobody abandoned, still is one.
+    #[test]
+    fn i5_counts_a_rollback_past_an_abandoned_streams_cut_as_the_operators() {
+        let r = rid(1, 1);
+        let row = |idx: u64| AckEntry {
+            judged: Some(Judgement {
+                class: Some(Judged::Group),
+                expected: Expected::Class(Judged::Group),
+                tx: Some(TxRef {
+                    node: 2,
+                    first: idx,
+                    last: idx,
+                    origin: (7, idx),
+                    epoch: 1,
+                    records: Vec::new(),
+                }),
+                detail: String::new(),
+                mismatch: None,
+            }),
+            ..ack(2, r, 5, OutcomeKind::Ok, true)
+        };
+        let o = |records: Vec<LogRecord>| {
+            let mut s = seg(1, &[]);
+            s.records = records;
+            let oracles = Oracles::new(Bucket::new(1, (0, 0)));
+            (oracles, s)
+        };
+        let ended = LogRecord::DelegateNodeEnded {
+            node: 2,
+            gen: 7,
+            through: 3,
+        };
+        let abandoned = LogRecord::GroupAbandoned {
+            epoch: 0,
+            gen: 7,
+            through_known: 3,
+        };
+        let run = |records: Vec<LogRecord>, idx: u64| {
+            let (oracles, s) = o(records);
+            *oracles.acks.lock().unwrap() = vec![row(idx)];
+            end_of_run(
+                &oracles,
+                &log_with(s, &[]),
+                &[],
+                &HashMap::from([(r, 6)]),
+                &BTreeSet::new(),
+                true,
+            )
+        };
+        // Past the cut of an abandoned stream: the operator's.
+        let f = run(vec![ended.clone(), abandoned.clone()], 4);
+        assert!(f.i5.is_empty(), "{:?}", f.i5);
+        assert_eq!(f.i5_operator.len(), 1, "{:?}", f.i5_operator);
+        // At the cut: a violation.
+        let f = run(vec![ended.clone(), abandoned], 3);
+        assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
+        assert!(f.i5_operator.is_empty());
+        // The stream ended but nobody abandoned it: a violation.
+        let f = run(vec![ended], 4);
+        assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
+        assert!(f.i5_operator.is_empty());
     }
 
     /// Plan 46 M0.2 (R7): a non-stealable sequencer's OK (an epoch hold's)

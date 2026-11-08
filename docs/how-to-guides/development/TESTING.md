@@ -4994,7 +4994,7 @@ The tail fetch: `Stats::tail_fetches`, `tail_fetch_attempts`,
 `inherited_tail_fetches`, `groups_abandoned` and (must be 0 outside an
 abandon) `ttl_claims_without_tail`. `SimConfig::abandon_after_ms` has the
 operator abandon a group a claim has waited for that long
-(`repair abandon-group`); a run that ends with a claim still waiting
+(`repair abandon`); a run that ends with a claim still waiting
 (`Report::waiting_for_group`) skips the convergence checks and owes instead
 that every acknowledged rid is held somewhere (`acked_held_somewhere`: the
 log, a journal, a backup tail or a member copy). New configurations:
@@ -5009,7 +5009,7 @@ old group, `inherited_tail_fetches`).
 rolled back (must be 0 outside an abandon), committed entries a takeover
 gate's re-applied tail superseded, rows moved to a member copy, member rows
 retired by the log's identities, dropped as never committed, abandoned (queued
-by an operator's `repair abandon-group`), tails a backup kept when its holder's
+by an operator's `repair abandon`), tails a backup kept when its holder's
 lease moved on, tail rows past a gap not re-shipped, gated rows queued for
 replay (must be 0), the ungated I2 pairs, and nodes holding member rows at
 convergence (must be 0: `member_copies_drained`). `strict_durability` now means
@@ -5048,7 +5048,7 @@ and its backup, the only peer within budget, crash for good at 2 s) and
 `abandon_after_ms: 5000`). The first ends `waiting_for_group` (a root with a
 generation in `status.delegation.gens` that waits, `Report::waiting_for_group`)
 and owes that every acknowledged rid is held somewhere; the second has the
-operator run `repair abandon-group --gen G` on the root after 5 s
+operator run `repair abandon --gen G` on the root after 5 s
 (`GroupAbandoned` in the log), converges, and counts the acknowledged rows
 the dead group alone held as `Report::operator_lost`, judged tentative
 (only in a run where the operator acted). The core tests
@@ -5059,6 +5059,23 @@ for, older named backups sealed once and never waited for),
 and appended again after every event) pin the rule;
 `abandon_group_ends_a_waiting_generation_at_its_cursor_and_says_so_in_the_log`
 the escape.
+
+**Plan 46 M1.3 step 13: `repair abandon` of a sticky stream (`sticky-holder-dies`).**
+The holder of a sticky grant on `d2` crashes at 2.5 s (it returns at 11.5 s with
+its journal); node 3 is cut from the root from 3 to 5 s; the operator
+(`FaultKind::AbandonNode`, 1 s after the crash) runs `repair abandon --node 2
+--force` on the root once it has confirmed node 2 is down (the fault stops with
+a failure when it is not). The root voids its own copy of the read delegations
+the holder granted, asks the other nodes to void theirs (`DelegReadVoid`) and
+ends the stream on their answers or at `read_delegation_ttl_ms + expiry_margin_ms`.
+Oracles: `no_read_under_an_abandoned_stream` (strict on every configuration: no
+strict read is served under a read delegation of an abandoned stream after the
+abandon's answer; `Config::abandon_skips_read_recall`,
+`AUTHORITY_SIM_ABANDON_SKIPS_READ_RECALL=1`, is its negative control) and the
+operator's branch of I5 (`Report::i5_operator`: rows of the abandoned stream
+past its cut rolled back at the returned holder, counted, not a violation).
+`SWEEP-ABANDON-TOTALS` prints the abandon counters (commands, read waits,
+streams ended on the readers' answers or by the deadline, ended meanwhile).
 
 **Plan 46 M0.3: I4 strict, and the C2h configurations.** An unsettled `EIO`
 (`Stats::client_unsettled_eio`: the second deadline came and no sequencer had

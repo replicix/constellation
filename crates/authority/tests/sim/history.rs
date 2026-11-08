@@ -271,6 +271,9 @@ pub struct History {
     /// the clock reads share.
     ticks: Mutex<Vec<u64>>,
     reads: Mutex<Vec<ReadEvt>>,
+    /// Plan 46 M1.3 step 13: strict reads served under a stream holder's read
+    /// delegation `(node, gen, true elapsed ms)`.
+    deleg_reads: Mutex<Vec<(u64, u64, u64)>>,
     clock: std::sync::atomic::AtomicU64,
 }
 
@@ -280,6 +283,16 @@ impl History {
         let mut events = self.events.lock().unwrap();
         events.push(e);
         self.ticks.lock().unwrap().push(tick);
+    }
+
+    /// A strict read on `node` was served under a read delegation of stream
+    /// `gen`'s holder at `ms`.
+    pub fn deleg_read(&self, node: u64, gen: u64, ms: u64) {
+        self.deleg_reads.lock().unwrap().push((node, gen, ms));
+    }
+
+    pub fn deleg_reads(&self) -> Vec<(u64, u64, u64)> {
+        self.deleg_reads.lock().unwrap().clone()
     }
 
     /// The next tick of the shared real-time order.

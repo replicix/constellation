@@ -1226,7 +1226,7 @@ impl Replica for Meta {
             // Phase 2b: the read delegations its delegate granted,
             // and the tail its backup held, are over.
             self.read_delegations()
-                .void_epoch(crate::core::DELEG_READ_EPOCH_BASE + gen);
+                .void_gen_epoch(crate::core::DELEG_READ_EPOCH_BASE + gen);
             let _ = Meta::deleg_backup_clear(self, gen);
         }
         // Plan 30 §M8: a newer epoch voids the delegations an older

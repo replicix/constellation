@@ -340,14 +340,14 @@ pub struct DelegationReport {
     /// As the root, one row per stream: `(dirs, node, gen, cursor, until_ms, recall, ended,
     /// waiting_for_group)`. `waiting_for_group`: the generation cannot end
     /// because its delegate is silent and no member of its recorded backup
-    /// group has handed over the tail; `constellation repair abandon-group
+    /// group has handed over the tail; `constellation repair abandon
     /// --gen` ends it (rows only that group held are lost).
     #[allow(clippy::type_complexity)]
     pub gens: Vec<(Vec<u64>, u64, u64, u64, i64, String, bool, bool)>,
     /// As the root: the generations that wait for their group's tail (the
     /// `gens` rows with `waiting_for_group`), with what this root knows of
     /// each member it asked to seal. Weigh `constellation repair
-    /// abandon-group --gen` by it: a member heard from lately is not gone.
+    /// abandon --gen` by it: a member heard from lately is not gone.
     #[serde(default)]
     pub waiting: Vec<WaitingGenerationStatus>,
     /// Generations delegated to this node that wait to be installed
@@ -1637,7 +1637,7 @@ pub struct SpeculationStatus {
     pub refused_settles_stalled: u64,
     /// Plan 43 C1-4: committed entries (answered or streamed as held by the
     /// group or the archive) rolled back and replayed, since start. Only an
-    /// operator's `repair abandon-group` may raise it.
+    /// operator's `repair abandon` may raise it.
     pub committed_rolled_back: u64,
     /// Plan 43 C1-4: this node's committed unshipped transactions moved to a
     /// member copy instead of replayed, since start.
@@ -2567,7 +2567,7 @@ pub struct LeaseStatus {
     pub lost: bool,
     /// A claim of the lease waits for the tail of an old group (plan 43
     /// C1-3); `null` when nothing waits. `constellation repair
-    /// abandon-group --epoch E` lets it go on without the tail.
+    /// abandon --epoch E` lets it go on without the tail.
     #[serde(default)]
     pub waiting_for_group: Option<WaitingForGroupStatus>,
 }
@@ -3263,19 +3263,27 @@ pub struct DropHeldParams {
     pub remote: bool,
 }
 
-/// `lease.abandon_group` (plan 43 C1-3, C2e): the lease claim that waits for
-/// the tail of `epoch`'s backup group goes on without it (`gen` 0), or the
-/// root ends delegation generation `gen` (`epoch` 0), which waits for its
-/// group's tail, at its cursor. Rows only that group held are lost; the log
-/// records the decision.
+/// `repair.abandon` (plan 46 M1.3 step 13): exactly one of `epoch`, `gen`,
+/// `node` (`node` may come with `gen`). `epoch`: the lease claim that waits
+/// for the tail of that epoch's backup group goes on without it. `gen`: the
+/// root ends that delegation generation (one that waits for its group's
+/// tail, or a sticky or designated stream whose holder is gone) at its
+/// cursor. `node`: the root ends every such stream of that node (only `gen`
+/// of them with `gen`). Rows only the group or the holder held may be lost to
+/// the log; the log records the decision.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct AbandonGroupParams {
-    pub epoch: u64,
+pub struct AbandonParams {
     #[serde(default)]
-    pub gen: u64,
-    /// A delegation's group even though the root heard from its delegate or
-    /// a strict member within `delegation_ttl_ms` (refused otherwise: such a
-    /// node may be alive and cut from the root only).
+    pub epoch: Option<u64>,
+    #[serde(default)]
+    pub gen: Option<u64>,
+    #[serde(default)]
+    pub node: Option<u64>,
+    /// Even though the root heard from the holder, its delegate or a strict
+    /// member within `delegation_ttl_ms` (refused otherwise: such a node may
+    /// be alive and cut from the root only). The operator confirms from
+    /// elsewhere that it is down; a live holder cut off from the root may
+    /// still answer readers that did not get the void request.
     #[serde(default)]
     pub force: bool,
 }

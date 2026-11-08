@@ -491,6 +491,13 @@ pub enum SyncRequest {
         grant: u64,
         reply: tokio::sync::oneshot::Sender<()>,
     },
+    /// Plan 46 M1.3 step 13: the root abandons stream `gen`; answered once
+    /// this node no longer honours the read delegations its holder granted.
+    PeerReadVoid {
+        root: u64,
+        gen: u64,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
     /// Plan 30 §M9: the holder streams journal transactions to this
     /// node as its backup; answered with `(acked through, sealed, fresh)`.
     PeerBackupAppend {
@@ -585,13 +592,13 @@ pub enum SyncRequest {
     /// Run the deposition recovery now (the control API, or automatically
     /// after mounting a persisted deposed state dir).
     Reintegrate(tokio::sync::oneshot::Sender<Result<String, String>>),
-    /// Plan 43 C1-3, `repair abandon-group`: let the lease claim that waits
-    /// for `epoch`'s tail go on without it (`gen` 0 is the root group).
-    AbandonGroup {
-        epoch: u64,
-        gen: u64,
-        /// A delegation's group even though its delegate or a strict member
-        /// was heard from within `delegation_ttl_ms` (`--force`).
+    /// Plan 43 C1-3 and plan 46 M1.3 step 13, `repair abandon`: let the lease
+    /// claim that waits for an epoch's tail go on without it, or end the
+    /// streams of a generation or a node at the root's cursor.
+    Abandon {
+        target: constellation_authority::AbandonTarget,
+        /// Even though a delegate or a strict member was heard from within
+        /// `delegation_ttl_ms` (`--force`).
         force: bool,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },

@@ -1277,6 +1277,13 @@ without TTL expiry, never recalled by placement or by a cross-subtree op.
   cross-subtree op involving one with `EXDEV`. The designee keeps writing
   indefinitely, with or without S3 (its claim cannot be stolen), and its
   stream reaches the root when it reconnects.
+- **Designee gone for good → the operator ends the stream.** `constellation
+  repair abandon <fs> --node N` (on the root) ends a designated or sticky
+  stream at the root's cursor, after it has recalled, else waited out, the
+  read delegations the holder granted (no read is served under an ended
+  stream's grant; plan 46 Q5, C11). The rows only the designee held, past the
+  cursor, are lost to the log, and replay by rid, refused ones becoming
+  conflict copies, if the designee returns.
 - `offline --ro` grants a read guarantee (a pin) without write authority
   and creates no delegation.
 
@@ -1378,7 +1385,7 @@ op executes and is acknowledged; "EROFS" means it is refused at once.
 | Holder dies, a backup within the RTT budget | — | write again in ≈ 1.5 s in the harness, 2.3–4.7 s on EC2 (seal-based takeover), nothing acknowledged lost |
 | Holder dies, `ack=s3` | — | write again in ≈ 1.5 s in the harness, not measured on EC2 (any peer takes over), nothing acknowledged lost |
 | Holder dies, no backup (`Local`) | — | write again after the lease TTL (60 s) plus margin; acknowledged forwards are replayed by their requesters; with `f > 0` the taker needs `f` promises |
-| Delegate dies | — | writes under its subtree wait for the root to reclaim it (TTL + margin ≈ 6 s), or for its recorded backup's seal and tail, which the root waits for without a bound: with the backup gone too, until a member answers or the operator ends the generation (`repair abandon-group --gen`, which loses the rows only that group held; [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)) |
+| Delegate dies | — | writes under its subtree wait for the root to reclaim it (TTL + margin ≈ 6 s), or for its recorded backup's seal and tail, which the root waits for without a bound: with the backup gone too, until a member answers or the operator ends the generation (`repair abandon --gen`, which loses the rows only that group held; [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)) |
 | Delegate cut from the root | stops sequencing at `sent + ttl − margin`; the rows past the cut that were never answered are dropped and their clients retry through the root | write through the root once it reclaims the subtree |
 | Designee isolated | write | `EROFS` under the path |
 | S3 down, at least `N − f` write-eligible nodes connected | write (epoch) | write (epoch) |
@@ -1843,7 +1850,7 @@ claimant of a `Backup` lease first asks the holder and every listed
 backup for their sealed tail (`SealTail`; the member persists a seal
 before it answers, so its group commits nothing more of the epoch),
 re-ships the first answer as a seal takeover would, and waits while no
-member answers; only `constellation repair abandon-group` lets it go on
+member answers; only `constellation repair abandon` lets it go on
 without. A tenure that re-ships a predecessor's tail names the old group
 in its lease (`inherited_tail`) until its journal shipped through the
 rows, so a successor that dies first does not take the last copies of
@@ -1949,7 +1956,7 @@ successor, bounded (§6, Failover), and a blocking one keeps retrying.
 | node crash | journal, speculation, backup tail, seals, promises and epoch state reload from the local store; stranded ops replay by rid; dirty chunks re-upload; the lease is re-acquired or expires |
 | forward times out (holder slow or gone) | same-rid retries, then the inbox (no P2P path) or the lease path; resolved exactly once; `EIO` at the client deadline (2 × TTL), never a re-execution |
 | holder deposed (it lost the lease while alive) | it rolls its unshipped journal back. Rows its clients were told are committed (the group or the archive held them) are kept as a member copy of the epoch and are *not* replayed: the successor re-ships them from the group, and their clients' retries by rid find them done (plan 43 C1-4); the rows of a lone node replay by rid through the new holder, and only true overlaps become conflict copies. (A holder asked for its tail by a claimant of its expired lease deposes itself first and keeps the rows as a member copy, plan 43 C1-3.) |
-| holder and its backup both down past the lease's end | the claim of the lease waits (`status.lease.waiting_for_group`) until one of them answers a `SealTail`; the operator may abandon the group (`repair abandon-group`), and the rows it acknowledged are then lost |
+| holder and its backup both down past the lease's end | the claim of the lease waits (`status.lease.waiting_for_group`) until one of them answers a `SealTail`; the operator may abandon the group (`repair abandon`), and the rows it acknowledged are then lost |
 | P2P down, S3 up | everything works through the lease path and the S3 inbox, minus backups, delegations, strict ReadIndex, cluster locks and fast takeover |
 | clock skew | rate: each node's oscillator within its budget (0.1 % by default, C7a: paid by the honour and wait readings, so every local window is exact); offset: unconstrained for the lease (a claimant's own observation of the holder's renewals), the seal watch (the holder's durations on the backup's wait clock), promises (made for the claimed key, counted per key), delegation, read-delegation and lock windows (each a duration on one node's clock) and the tokens of the S3 inbox and the replay queue (exact or refused); the exceptions are the lock cut and barriers between a root and a delegate (rows 9 and 30: offset below the margin, until the root-anchored cut) and the non-minting token check (offset below the margin, or the op's one-way delay below `2 × margin`, either alone); correctness otherwise relies on CAS ordering, never wall clocks; steps: none (C7-H1: holders measure on the honour clock, waiters on the wait clock) |
 | cache disk full | evict clean → throttle → ENOSPC (reads still stream uncached) |

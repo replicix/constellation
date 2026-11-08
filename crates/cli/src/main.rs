@@ -582,26 +582,36 @@ enum RepairCommand {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
-    /// Let a lease claim that waits for the tail of a lost group go on
-    /// without it (`status.lease.waiting_for_group`, `--epoch`), or the
-    /// root end a delegation whose group has not handed over its tail
-    /// (`status.delegation.gens[].waiting_for_group`, `--gen`, on the root).
-    /// Rows that group acknowledged may be lost: the clients were told they
-    /// were committed. The log records the decision.
-    AbandonGroup {
+    /// End what the cluster cannot end by itself: a lease claim's wait for a
+    /// lost group (--epoch), a generation waiting for its lost group or a
+    /// sticky/designated stream whose holder is gone (--gen, on the root),
+    /// or every such stream of a node (--node, on the root). Rows only that
+    /// group or holder held may be lost to the log; a returned holder
+    /// replays its copies by rid (refused ones become conflict copies). The
+    /// log records the decision. A sticky or designated stream is ended
+    /// after the read delegations its holder granted are recalled, or
+    /// waited out (read_delegation_ttl_ms + the expiry margin).
+    #[command(group(clap::ArgGroup::new("what").required(true).multiple(true).args(["epoch", "gen", "node"])))]
+    Abandon {
         target: String,
         /// The epoch `status.lease.waiting_for_group` names.
-        #[arg(long, conflicts_with = "gen", required_unless_present = "gen")]
+        #[arg(long, conflicts_with_all = ["gen", "node", "force"])]
         epoch: Option<u64>,
-        /// The delegation generation `status.delegation.gens` lists as
-        /// waiting for its group; run it on that status's node (the root).
-        #[arg(long, conflicts_with = "epoch", required_unless_present = "epoch")]
+        /// The delegation generation `status.delegation.gens` lists; run it
+        /// on that status's node (the root). With --node: only this one of
+        /// the node's streams (checked to be its).
+        #[arg(long)]
         gen: Option<u64>,
-        /// With `--gen`: abandon the group although the root heard from its
-        /// delegate or a member within the delegation's ttl (refused
-        /// otherwise). Confirm from elsewhere that those nodes are down
-        /// first: a node cut from the root only may hold the rows.
-        #[arg(long, conflicts_with = "epoch")]
+        /// Every live stream the root lists for this node.
+        #[arg(long)]
+        node: Option<u64>,
+        /// Abandon although the root heard from the holder, its delegate or
+        /// a member within the delegation's ttl (refused otherwise), or a
+        /// previous root is unsettled. Confirm from elsewhere that those
+        /// nodes are down first: a node cut from the root only may hold the
+        /// rows, and may still answer readers that did not get the root's
+        /// request to drop its read delegations.
+        #[arg(long)]
         force: bool,
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -1913,21 +1923,23 @@ fn run() -> Result<()> {
         }
         Command::Repair {
             command:
-                RepairCommand::AbandonGroup {
+                RepairCommand::Abandon {
                     target,
                     epoch,
                     gen,
+                    node,
                     force,
                     state_dir,
                 },
         } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
-            ctl::<cm::LeaseAbandonGroup>(
+            ctl::<cm::RepairAbandon>(
                 &rt,
                 &dir,
-                api::AbandonGroupParams {
-                    epoch: epoch.unwrap_or(0),
-                    gen: gen.unwrap_or(0),
+                api::AbandonParams {
+                    epoch,
+                    gen,
+                    node,
                     force,
                 },
                 print_ack,
@@ -4162,7 +4174,7 @@ fn render_waiting_for_group(lease: &api::LeaseStatus) -> Option<String> {
     let sources: Vec<String> = w.sources.iter().map(u64::to_string).collect();
     Some(format!(
         "lease claim waits for the tail of epoch {}'s group (asked node(s) {}, {} s so far); \
-         `constellation repair abandon-group --epoch {}` lets it go on without it, and rows \
+         `constellation repair abandon --epoch {}` lets it go on without it, and rows \
          that group acknowledged may be lost",
         w.epoch,
         sources.join(", "),
@@ -4219,7 +4231,7 @@ fn render_waiting_generations(delegation: &api::DelegationReport) -> Vec<String>
                     t.from, t.cursor, t.end
                 ),
                 None => format!(
-                    "{head}. If every member is gone for good, `constellation repair abandon-group --gen {}` (on this node) \
+                    "{head}. If every member is gone for good, `constellation repair abandon --gen {}` (on this node) \
                      ends it at the root's cursor; rows only that group held, acknowledged to their clients, are lost. \
                      A node that is reachable or was heard from lately is not gone: confirm from another node that the \
                      delegate and the members are down (it is refused, without --force, while one of them was heard from \
@@ -4903,38 +4915,46 @@ mod parse_byte_size_tests {
     }
 
     #[test]
-    fn repair_abandon_group_parses() {
+    fn repair_abandon_parses() {
         let parse = |extra: &[&str]| {
-            let mut args = vec!["constellation", "repair", "abandon-group", "fs"];
+            let mut args = vec!["constellation", "repair", "abandon", "fs"];
             args.extend_from_slice(extra);
             Cli::try_parse_from(args)
         };
-        match parse(&["--epoch", "7"]).unwrap().command {
-            Command::Repair {
-                command: RepairCommand::AbandonGroup { epoch, gen, .. },
-            } => assert_eq!((epoch, gen), (Some(7), None)),
-            _ => panic!("expected repair abandon-group"),
-        }
-        match parse(&["--gen", "2"]).unwrap().command {
+        let fields = |extra: &[&str]| match parse(extra).unwrap().command {
             Command::Repair {
                 command:
-                    RepairCommand::AbandonGroup {
-                        epoch, gen, force, ..
+                    RepairCommand::Abandon {
+                        epoch,
+                        gen,
+                        node,
+                        force,
+                        ..
                     },
-            } => assert_eq!((epoch, gen, force), (None, Some(2), false)),
-            _ => panic!("expected repair abandon-group"),
-        }
-        match parse(&["--gen", "2", "--force"]).unwrap().command {
-            Command::Repair {
-                command: RepairCommand::AbandonGroup { gen, force, .. },
-            } => assert_eq!((gen, force), (Some(2), true)),
-            _ => panic!("expected repair abandon-group"),
-        }
-        // `--force` is for a delegation's group.
+            } => (epoch, gen, node, force),
+            _ => panic!("expected repair abandon"),
+        };
+        assert_eq!(fields(&["--epoch", "7"]), (Some(7), None, None, false));
+        assert_eq!(fields(&["--gen", "2"]), (None, Some(2), None, false));
+        assert_eq!(
+            fields(&["--gen", "2", "--force"]),
+            (None, Some(2), None, true)
+        );
+        assert_eq!(fields(&["--node", "3"]), (None, None, Some(3), false));
+        assert_eq!(
+            fields(&["--node", "3", "--gen", "2", "--force"]),
+            (None, Some(2), Some(3), true)
+        );
+        // `--force` is for a stream.
         assert!(parse(&["--epoch", "7", "--force"]).is_err());
-        // Exactly one of them: a lease claim's group or a delegation's.
+        // One of the three; a lease claim's group does not go with a stream.
         assert!(parse(&[]).is_err());
         assert!(parse(&["--epoch", "7", "--gen", "2"]).is_err());
+        assert!(parse(&["--epoch", "7", "--node", "3"]).is_err());
+        // The old name is gone (no alias).
+        let mut old = vec!["constellation", "repair", "abandon-group", "fs"];
+        old.extend_from_slice(&["--epoch", "7"]);
+        assert!(Cli::try_parse_from(old).is_err());
     }
 
     #[test]
@@ -4979,7 +4999,7 @@ mod parse_byte_size_tests {
         });
         let lines = render_waiting_generations(&d);
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[0].contains("abandon-group --gen 10"), "{}", lines[0]);
+        assert!(lines[0].contains("abandon --gen 10"), "{}", lines[0]);
         assert!(lines[0].contains("answered never"), "{}", lines[0]);
         assert!(lines[0].contains("unreachable 2 s ago"), "{}", lines[0]);
         assert!(
@@ -4994,7 +5014,7 @@ mod parse_byte_size_tests {
             lines[0]
         );
         // A tail in hand is no lost group: no command offered.
-        assert!(!lines[1].contains("abandon-group"), "{}", lines[1]);
+        assert!(!lines[1].contains("repair abandon"), "{}", lines[1]);
         assert!(lines[1].contains("appended through 3 of 9"), "{}", lines[1]);
     }
 
@@ -5011,7 +5031,7 @@ mod parse_byte_size_tests {
         assert!(line.contains("epoch 4"), "{line}");
         assert!(line.contains("2, 3"), "{line}");
         assert!(line.contains("12 s"), "{line}");
-        assert!(line.contains("abandon-group --epoch 4"), "{line}");
+        assert!(line.contains("abandon --epoch 4"), "{line}");
     }
 
     #[test]

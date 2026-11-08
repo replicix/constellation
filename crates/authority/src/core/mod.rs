@@ -158,6 +158,13 @@ pub struct Config {
     /// `partial_release_ends_stream`). The sim's
     /// `sticky_ends_only_by_holder_or_operator` must then fail the run.
     pub partial_release_ends_stream: bool,
+    /// Fault injection for the simulation's negative control (never set by
+    /// the engine): the operator's abandon of a non-stealable stream ends it
+    /// at once, without recalling or waiting out the read delegations its
+    /// holder granted (plan 46 M1.3 step 13, C11, the model's
+    /// `abandon_skips_read_recall`). The sim's `no_read_under_an_abandoned_stream`
+    /// (and close-to-open) must then fail the run.
+    pub abandon_skips_read_recall: bool,
     pub ttl_ms: u64,
     /// `lease::EXPIRY_MARGIN_MS`: a lease is usable only with this much
     /// left.
@@ -719,6 +726,7 @@ impl Config {
             holder_releases_before_drain: false,
             refuse_forwarded_designation_ops: false,
             partial_release_ends_stream: false,
+            abandon_skips_read_recall: false,
             ttl_ms,
             expiry_margin_ms: 1_000,
             idle_release_ms: 30_000,
@@ -1311,6 +1319,16 @@ pub struct Stats {
     pub deleg_sticky_release_held: u64,
     pub deleg_sticky_releases_given_up: u64,
     pub deleg_sticky_ended_abandoned: u64,
+    /// Plan 46 M1.3 step 13: `repair abandon` of non-stealable streams:
+    /// commands accepted, those that waited for read delegations, streams
+    /// whose readers all answered the void, streams that waited the
+    /// delegations out (the deadline), streams their holder's release ended
+    /// meanwhile.
+    pub deleg_abandons: u64,
+    pub deleg_abandon_read_waits: u64,
+    pub deleg_abandon_reads_recalled: u64,
+    pub deleg_abandon_reads_expired: u64,
+    pub deleg_abandon_superseded: u64,
     pub deleg_sticky_ended_other: u64,
     pub deleg_redelegated: u64,
     pub deleg_seals_sent: u64,
@@ -2164,6 +2182,9 @@ enum Timer {
     /// Plan 46 M1.3 step 5: the holder's releases in progress look again
     /// (`Core::on_sticky_release_timer`).
     StickyRelease,
+    /// Plan 46 M1.3 step 13: an abandon's wait for the read delegations of
+    /// the streams it ends reached its deadline (`Core::on_abandon_timer`).
+    AbandonWait,
 }
 
 impl Timer {
@@ -2215,7 +2236,7 @@ impl Timer {
             Timer::DelegLapse(_) => TimerKind::DelegLapse,
             Timer::DelegStream | Timer::DelegInstallRetry => TimerKind::DelegStream,
             Timer::Placement => TimerKind::Placement,
-            Timer::ReleaseRecallBound | Timer::LeaveWait | Timer::StickyRelease => {
+            Timer::ReleaseRecallBound | Timer::LeaveWait | Timer::StickyRelease | Timer::AbandonWait => {
                 TimerKind::DelegExpiry
             }
         }
@@ -2374,7 +2395,7 @@ pub struct Core {
     /// When this node last heard from each peer (a message, or the driver's
     /// `PeerLink::last_seen`), on its wait clock. Kept across the link
     /// table's replacement (`Event::Peers`), which drops a link's last
-    /// exchange once it disconnects: `repair abandon-group` weighs a node
+    /// exchange once it disconnects: `repair abandon` weighs a node
     /// cut from this one only by it (plan 43 C2e review).
     peer_heard: BTreeMap<NodeId, WaitMs>,
     /// EC2 campaign 8 A-1: this node's own S3 path (`Event::OwnS3`).
@@ -3041,6 +3062,9 @@ impl Core {
             PeerMsg::DelegationRecalled { req } => {
                 self.on_delegation_recalled(now, req, replica, out)
             }
+            PeerMsg::DelegReadVoid { req, gen } => {
+                self.on_deleg_read_void(from, req, gen, replica, out)
+            }
             PeerMsg::BackupAppend {
                 req,
                 epoch,
@@ -3566,6 +3590,7 @@ impl Core {
             Timer::ReleaseRecallBound => self.on_release_recall_bound(now, replica, out),
             Timer::LeaveWait => self.on_leave_wait_timer(now, replica, out),
             Timer::StickyRelease => self.on_sticky_release_timer(now, replica, out),
+            Timer::AbandonWait => self.on_abandon_timer(now, replica, out),
         }
     }
 
@@ -3613,8 +3638,8 @@ impl Core {
                 self.round_waiters.push((op, req));
                 self.nudge(now, out);
             }
-            Control::AbandonGroup { epoch, gen, force } => {
-                self.on_control_abandon_group(now, op, epoch, gen, force, replica, out)
+            Control::Abandon { target, force } => {
+                self.on_control_abandon(now, op, target, force, replica, out)
             }
             Control::DropHeld {
                 ino,
