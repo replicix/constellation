@@ -240,13 +240,6 @@ pub struct BackupModel {
     /// the early re-claim (the lease moved off every key a sealer read) and
     /// the one after the sealer's grace.
     pub holder_reclaim: bool,
-    /// With `holder_reclaim`, a holder with no backups and an inherited tail
-    /// (the seed 3967 shape: a `Local` lease from a seal takeover) re-claims
-    /// too. The claim names only the holder's own group, so the older
-    /// inherited group stops covering rows the log does not carry yet: the
-    /// checker finds `acked_never_lost` violated (a gap of D7's path on main
-    /// too, pinned by `a_sealed_local_holder_with_an_inherited_tail_...`).
-    pub reclaim_inherited: bool,
 }
 
 impl BackupModel {
@@ -273,7 +266,6 @@ impl BackupModel {
             inherited_tail: false,
             drop_member_at_tail_follows: false,
             holder_reclaim: false,
-            reclaim_inherited: false,
         }
     }
 
@@ -653,7 +645,12 @@ impl State {
                             .filter(|id| !self.in_log(*id))
                             .collect();
                         for id in keep {
-                            if !self.nodes[i].member.iter().any(|(_, w, _)| *w == id) {
+                            // (The product keys member copies by epoch.)
+                            if !self.nodes[i]
+                                .member
+                                .iter()
+                                .any(|(e, w, _)| *e == be && *w == id)
+                            {
                                 self.nodes[i].member.push((be, id, Class::RootGroup));
                             }
                         }
@@ -876,8 +873,7 @@ impl Model for BackupModel {
             if self.holder_reclaim
                 && s.is_holder(i)
                 && s.reg.policy == Policy::Backup
-                && (!s.reg.backups.is_empty()
-                    || (self.reclaim_inherited && s.reg.inherited.is_some()))
+                && (!s.reg.backups.is_empty() || s.reg.inherited.is_some())
                 && s.reg.epoch < self.max_epoch
             {
                 actions.push(Action::ReclaimSealed(iu));
@@ -1022,13 +1018,19 @@ impl Model for BackupModel {
             }
             Action::ReclaimSealed(h) => {
                 let hu = h as usize;
-                if !s.is_holder(hu)
-                    || (s.reg.backups.is_empty()
-                        && !(self.reclaim_inherited && s.reg.inherited.is_some()))
-                {
+                if !s.is_holder(hu) || (s.reg.backups.is_empty() && s.reg.inherited.is_none()) {
                     return None;
                 }
                 let epoch = s.reg.epoch;
+                // A `Local` lease that inherited an older group's tail: the
+                // claim keeps naming that group (with the holder among its
+                // members) until the log carries the rows, as the code's
+                // `keep_older_group` does.
+                let older = s
+                    .reg
+                    .inherited
+                    .clone()
+                    .filter(|(ie, _)| s.reg.backups.is_empty() && *ie < epoch);
                 let mut members = s.reg.backups.clone();
                 members.push(h);
                 members.sort();
@@ -1047,6 +1049,12 @@ impl Model for BackupModel {
                 };
                 s.saw |= SAW_HOLDER_RECLAIM;
                 takeover_from(self, &mut s, hu, Some((hu, g)));
+                if let (Some((ie, mut ms)), true) = (older, s.reg.inherited.is_some()) {
+                    ms.push(h);
+                    ms.sort();
+                    ms.dedup();
+                    s.reg.inherited = Some((ie, ms));
+                }
             }
             Action::RemoveDecide(h, b) => {
                 let h = h as usize;

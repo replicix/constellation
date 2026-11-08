@@ -18,12 +18,20 @@ use std::time::{Duration, Instant};
 const CAP: (usize, Duration) = (30_000_000, Duration::from_secs(55));
 
 fn run(label: &str, model: &BackupModel) -> impl Checker<BackupModel> {
+    run_capped(label, model, CAP)
+}
+
+fn run_capped(
+    label: &str,
+    model: &BackupModel,
+    cap: (usize, Duration),
+) -> impl Checker<BackupModel> {
     let started = Instant::now();
     let checker = model
         .clone()
         .checker()
-        .target_state_count(CAP.0)
-        .timeout(CAP.1)
+        .target_state_count(cap.0)
+        .timeout(cap.1)
         .spawn_bfs()
         .join();
     println!(
@@ -50,9 +58,18 @@ fn assert_violates(label: &str, model: &BackupModel, property: &'static str) {
 }
 
 fn assert_clean(label: &str, model: &BackupModel, sometimes: &[&'static str]) {
-    let checker = run(label, model);
+    assert_clean_capped(label, model, sometimes, CAP);
+}
+
+fn assert_clean_capped(
+    label: &str,
+    model: &BackupModel,
+    sometimes: &[&'static str],
+    cap: (usize, Duration),
+) {
+    let checker = run_capped(label, model, cap);
     assert!(
-        checker.is_done() && checker.state_count() < CAP.0,
+        checker.is_done() && checker.state_count() < cap.0,
         "{label}: expected exhaustive exploration within budget"
     );
     let mut props = vec!["acked_never_lost", "ack_order_is_log_order"];
@@ -502,22 +519,18 @@ fn a_sealed_holder_that_reclaims_loses_no_acknowledged_write() {
 }
 
 /// The seed 3967 shape: a `Local` holder (no backups) whose lease carries an
-/// inherited tail re-claims after a claimant sealed it. The claim names only
-/// the holder's own group, so the older inherited group stops covering rows
-/// the log does not carry yet, and the holder's death loses an acknowledged
-/// write. The same gap is in D7's TTL re-claim on main (the shape was left
-/// out of the model); it is pinned here and is not closed by the seal-gap
-/// fix. When the claim keeps the older group covered, this test flips to
-/// `assert_clean`.
+/// inherited tail re-claims after a claimant sealed it. The claim keeps
+/// naming the older inherited group (with the holder added) until the log
+/// carries the rows, so the holder's death loses nothing. (Before the fix
+/// the claim named the holder's own group alone and an acknowledged write
+/// was lost; the same gap was in D7's TTL re-claim.)
 #[test]
-#[should_panic(expected = "`acked_never_lost` violated")]
-fn a_sealed_local_holder_with_an_inherited_tail_loses_a_write_known_gap() {
+fn a_sealed_local_holder_with_an_inherited_tail_loses_nothing() {
     let model = BackupModel {
         commit_rule: true,
         tail_fetch: true,
         inherited_tail: true,
         holder_reclaim: true,
-        reclaim_inherited: true,
         initial_backups: vec![1, 2],
         writers: 1,
         reconfig: false,
@@ -528,4 +541,33 @@ fn a_sealed_local_holder_with_an_inherited_tail_loses_a_write_known_gap() {
         ..BackupModel::backup(4, 1)
     };
     assert_clean("sealed-local-holder-inherited", &model, &[]);
+}
+
+/// The same shape with reconfiguration on (`Add`/`Remove`, one): a backup
+/// added after the takeover holds member copies of two epochs of the same
+/// write (member copies are keyed by epoch, as the store keys them).
+#[test]
+#[ignore = "heavy (~32M states): cargo test -p constellation-model --release -- --include-ignored"]
+fn a_sealed_local_holder_with_an_inherited_tail_loses_nothing_with_reconfig() {
+    let model = BackupModel {
+        commit_rule: true,
+        tail_fetch: true,
+        inherited_tail: true,
+        holder_reclaim: true,
+        initial_backups: vec![1, 2],
+        writers: 1,
+        reconfig: true,
+        max_reconfigs: 1,
+        max_crashes: 1,
+        max_epoch: 3,
+        max_tick: 2,
+        lease_ttl: 1,
+        ..BackupModel::backup(4, 1)
+    };
+    assert_clean_capped(
+        "sealed-local-holder-inherited-reconfig",
+        &model,
+        &[],
+        (400_000_000, Duration::from_secs(3000)),
+    );
 }

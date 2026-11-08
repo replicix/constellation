@@ -318,6 +318,7 @@ fn replay_seed() {
         Ok("backup-group-cut-ttl-holder-only") => backup_group_cut_ttl_config(GroupCut::HolderOnly),
         Ok("backup-group-cut-ttl-backup-only") => backup_group_cut_ttl_config(GroupCut::BackupOnly),
         Ok("backup-chain-ttl") => backup_chain_ttl_config(),
+        Ok("backup-reclaim-lost") => backup_reclaim_lost_config(),
         Ok("backup-partition") => backup_partition_config(),
         Ok("backup-reconfig-doubt") => backup_reconfig_doubt_config(),
         Ok("long-backup") => long_backup_config(),
@@ -2019,6 +2020,94 @@ fn backup_chain_ttl_config() -> SimConfig {
         ..backup_config()
     }
 }
+
+/// Seal gap, mgap (`backup-reclaim-lost`): `backup-chain-ttl`'s start (holder
+/// 1 is cut, 2 seal-takes its epoch over and holds the re-shipped tail, its
+/// log PUTs fail), then 2 loses S3 so that node 3 seals it, and 3's claim
+/// CAS fails (the rule on its lease PUTs). 2 recovers sealed, re-claims its
+/// own `Local` lease by TTL, re-shipping its member copy, and its disk is
+/// lost for good before the tail ships. The re-claim must keep naming the
+/// older group (node 1 holds the rows), which node 3 then fetches from;
+/// otherwise the lease names node 2 alone and the operator's abandon loses
+/// rows the run acknowledged.
+fn backup_reclaim_lost_config() -> SimConfig {
+    SimConfig {
+        nodes: 3,
+        clients_per_node: 2,
+        ops_per_client: 400,
+        random_faults: 0,
+        join_fresh: false,
+        // (Node 2 acknowledges lone, `Local`, from its takeover to its loss:
+        // those rows are not durable promises, and the strict check would
+        // count them.)
+        strict_durability: false,
+        abandon_after_ms: Some(8_000),
+        rtts: vec![((1, 3), 120), ((2, 3), 120)],
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::CutS3 {
+                    node: 1,
+                    for_ms: 60_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 2,
+                    for_ms: 60_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 2_000,
+                kind: FaultKind::S3RuleFor {
+                    rule: Rule::new(
+                        Some(2),
+                        OpKind::Put,
+                        "log/",
+                        When::From(2),
+                        Fault::Status(500),
+                    ),
+                    for_ms: 60_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: REC_CUT_MS,
+                kind: FaultKind::CutS3 {
+                    node: 2,
+                    for_ms: REC_BACK_MS - REC_CUT_MS,
+                },
+            },
+            ScheduledFault {
+                at_ms: REC_CUT_MS,
+                kind: FaultKind::S3RuleFor {
+                    rule: Rule::new(
+                        Some(3),
+                        OpKind::Put,
+                        "leases/",
+                        When::From(1),
+                        Fault::Status(500),
+                    ),
+                    for_ms: REC_LOST_MS + 1_500 - REC_CUT_MS,
+                },
+            },
+            ScheduledFault {
+                at_ms: REC_LOST_MS,
+                kind: FaultKind::CrashNode {
+                    node: 2,
+                    restart_ms: None,
+                    keep_journal: false,
+                },
+            },
+        ],
+        clock_faults: false,
+        ..backup_config()
+    }
+}
+const REC_CUT_MS: u64 = 3_000;
+const REC_BACK_MS: u64 = 17_000;
+const REC_LOST_MS: u64 = 25_000;
 
 /// Plan 46 M1.1 step 5: one node, a singleton answering its clients on its
 /// own disk; a peer joins mid-run (a fresh node, which the roster and the
@@ -4254,6 +4343,42 @@ fn a_backup_paused_while_its_holder_is_cut_from_s3_waits_for_the_group() {
     }
 }
 
+/// Seal gap, mgap (`backup-reclaim-lost`): a sealed holder re-claiming its
+/// `Local` lease keeps naming the older group whose rows the lease inherited
+/// (`inherited_tail`), so that when the re-claimer is lost for good node 3
+/// fetches them from node 1 and nobody has to abandon the group. Fails on
+/// the parent: the lease named node 2 alone, the claim waited for it and
+/// the operator's `abandon-group` gave the rows up.
+#[test]
+fn a_sealed_holders_reclaim_keeps_the_older_group_named() {
+    let mut fetched = 0u64;
+    // (Seeds where node 2's lone, `Local` acknowledgements between its
+    // takeover and its loss leave no trace the oracle objects to; the other
+    // seeds fail its generic checks with or without the fix.)
+    for seed in [1u64, 20, 24, 29] {
+        let r = run_seed(seed, backup_reclaim_lost_config()).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=backup-reclaim-lost")
+        });
+        let sum = |f: fn(&constellation_authority::Stats) -> u64| -> u64 {
+            r.stats.values().map(f).sum()
+        };
+        assert_eq!(
+            sum(|s| s.groups_abandoned),
+            0,
+            "seed {seed}: the operator had to abandon a group the lease no longer named"
+        );
+        assert!(
+            !r.waiting_for_group,
+            "seed {seed}: a claim waits for its group"
+        );
+        fetched += sum(|s| s.tail_fetches);
+    }
+    assert!(
+        fetched > 0,
+        "no claim fetched a tail: the shape was not reached"
+    );
+}
+
 /// 2026-10-16 `snapsched` under host load: the holder's runtime is held
 /// up across a renewal (2.3-2.6 s from 6.0 s; the lease here is 6 s, its
 /// margin 0.5 s and the renewal due 3 s before the expiry), so the expiry
@@ -5798,6 +5923,7 @@ fn sweep_config() {
         "backup-group-cut-ttl-holder-only" => backup_group_cut_ttl_config(GroupCut::HolderOnly),
         "backup-group-cut-ttl-backup-only" => backup_group_cut_ttl_config(GroupCut::BackupOnly),
         "backup-chain-ttl" => backup_chain_ttl_config(),
+        "backup-reclaim-lost" => backup_reclaim_lost_config(),
         "backup-partition" => backup_partition_config(),
         "backup-reconfig-doubt" => backup_reconfig_doubt_config(),
         "backup-two" => backup_two_config(),

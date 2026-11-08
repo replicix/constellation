@@ -4092,6 +4092,13 @@ to land before C0.
   the backups' silence window) from the last seal it answered, not a TTL; S3
   arbitrates with a sealer that is merely slow. After a restart the keys are
   forgotten and the TTL rule stands.
+  **Tail named by the re-claim (2026-11-08).** The re-claim's CAS names the
+  member copy's group (`[me]` for a `Local` lease) as the inherited tail,
+  except when the lease it replaces lists no backup and inherits an older
+  group's tail the log does not carry yet: it then keeps naming that group,
+  with this node among the members, as the unsealed re-adoption does
+  (`keep_older_group`). Otherwise the older group's copies would not be
+  asked for, and a loss of the re-claimer would lose rows they still hold.
 - **Q14 — Catch-up at a `DelegGroup` backup switch: decided** (M3). The
   delegate requests a removal only under its `removal_safe`; the root's
   generation end seals every backup any record of the generation named.

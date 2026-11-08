@@ -3706,7 +3706,9 @@ impl Core {
                     .map(Box::new)
                     .or_else(|| prev.inherited_tail.clone())
             } else {
-                self.tail_to_inherit(prev, replica).map(Box::new)
+                self.tail_to_inherit(prev, replica)
+                    .map(Box::new)
+                    .map(|own| self.keep_older_group(prev, own))
             };
         // Plan 43 C7a (commit 4): a takeover of a tenure that granted may arm
         // a floor when its marker lands (`acquire_won` decides; the permit

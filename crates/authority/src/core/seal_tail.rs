@@ -900,6 +900,42 @@ impl Core {
         })
     }
 
+    /// A self-sealed holder's re-claim of a lease that lists no backup, and
+    /// that inherited a tail of an older epoch the log does not carry yet:
+    /// the rows of that older group are re-shipped by this tenure (they are
+    /// in the member copy the claim takes), but held by that group's members
+    /// as well. The claim keeps naming it, with this node among the
+    /// members, as the unsealed re-adoption does; `own` (this tenure's copy
+    /// alone, `[me]`) would drop the group while the rows are unshipped, and
+    /// a loss of this node would lose acknowledged rows the older members
+    /// still hold. With listed backups `own` is right: they were streamed
+    /// the whole unshipped journal.
+    pub(crate) fn keep_older_group(
+        &self,
+        prev: &Lease,
+        own: Box<InheritedTail>,
+    ) -> Box<InheritedTail> {
+        let me = self.cfg.node_id;
+        let Some(older) = prev
+            .inherited_tail
+            .as_ref()
+            .filter(|t| t.epoch < prev.epoch)
+            .filter(|_| {
+                prev.holder == me
+                    && !prev.released
+                    && self.bk.sealed >= prev.epoch
+                    && prev.backups.is_empty()
+            })
+        else {
+            return own;
+        };
+        let mut kept: InheritedTail = (**older).clone();
+        kept.members.push(me);
+        kept.members.sort_unstable();
+        kept.members.dedup();
+        Box::new(kept)
+    }
+
     /// A re-adoption of this node's own `Backup` lease (a restart, or a CAS
     /// whose reply was lost): the configuration its CAS writes lists no
     /// backup (`granted_lease`), but the rows its tenure acknowledged and
