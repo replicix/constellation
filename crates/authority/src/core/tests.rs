@@ -52291,6 +52291,60 @@ mod c1_tail_fetch {
         );
     }
 
+    /// A restart re-adopted this node's `Backup` lease at the same epoch,
+    /// wrote no backups and named `own_group_tail` (that epoch, holder and
+    /// both backups); a claimant sealed the holder and its CAS failed; the
+    /// holder re-claims. The claim keeps naming that epoch's group with this
+    /// node added: the backups hold rows acknowledged at that epoch that the
+    /// log does not carry yet. Fails with the `<` filter: the claim named
+    /// `[me]` alone.
+    #[test]
+    fn a_self_sealed_holder_reclaiming_after_a_readoption_keeps_its_own_epochs_group() {
+        let (mut h, _) = listed_holder();
+        h.core.cfg.takeover_promise_check = false;
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(2),
+            op: h.create("r"),
+            tag: Default::default(),
+        });
+        seal_tail(&mut h, 3, 1, 2, 0);
+        assert!(h.core.lease.lost);
+        h.meta.strand_below_epoch(2).unwrap();
+        h.meta.set_holder_epoch(0);
+        h.core.lease.clear_lost();
+        h.meta.persist_lost(false).unwrap();
+        // Its own lease, expired: no backup listed, the tail of an older
+        // group inherited.
+        let lease = Lease {
+            inherited_tail: Some(Box::new(constellation_store_s3::InheritedTail {
+                epoch: 1,
+                config_version: 1,
+                members: vec![1, 3, 4],
+                through: 7,
+            })),
+            ..lease_of(1, 1, h.now.0 - 1)
+        };
+        h.watch(&lease);
+        let out = h.step(Event::Control {
+            op: OpId(700),
+            req: Control::Acquire,
+        });
+        let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((lease, tag())))),
+        });
+        let (_, written) = claim_cas(&mut h, out).expect("a claim");
+        assert_eq!(written.epoch, 2);
+        let t = written.inherited_tail.expect("the tail is named");
+        assert_eq!(
+            (t.epoch, t.config_version, t.members, t.through),
+            (1, 1, vec![1, 3, 4], 7),
+            "the epoch's own group stays named, with this node among its members"
+        );
+    }
+
     /// A holder (node 1, epoch 1, backup 2) that sealed for claimants that
     /// read the keys of the lease it held, offset by `sealers` ms of
     /// `holder_wait_ms` (the first answered while it held; the later ones

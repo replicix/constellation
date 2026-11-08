@@ -901,7 +901,9 @@ impl Core {
     }
 
     /// A self-sealed holder's re-claim of a lease that lists no backup, and
-    /// that inherited a tail of an older epoch the log does not carry yet:
+    /// that inherited a tail of an older epoch, or of its own epoch (a
+    /// re-adoption named the group `own_group_tail` found), the log does not
+    /// carry yet:
     /// the rows of that older group are re-shipped by this tenure (they are
     /// in the member copy the claim takes), but held by that group's members
     /// as well. The claim keeps naming it, with this node among the
@@ -919,7 +921,7 @@ impl Core {
         let Some(older) = prev
             .inherited_tail
             .as_ref()
-            .filter(|t| t.epoch < prev.epoch)
+            .filter(|t| t.epoch <= prev.epoch)
             .filter(|_| {
                 prev.holder == me
                     && !prev.released
@@ -931,8 +933,14 @@ impl Core {
         };
         let mut kept: InheritedTail = (**older).clone();
         kept.members.push(me);
+        kept.members.extend(own.members.iter().copied());
         kept.members.sort_unstable();
         kept.members.dedup();
+        if kept.epoch == own.epoch {
+            // (A re-adoption named this epoch's own group, and `own` is its
+            // member copy: the group's members and the larger tip stay.)
+            kept.through = kept.through.max(own.through);
+        }
         Box::new(kept)
     }
 

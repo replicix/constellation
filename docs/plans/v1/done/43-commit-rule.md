@@ -4099,6 +4099,9 @@ to land before C0.
   with this node among the members, as the unsealed re-adoption does
   (`keep_older_group`). Otherwise the older group's copies would not be
   asked for, and a loss of the re-claimer would lose rows they still hold.
+  The same holds for the group a restart's re-adoption named for the lease's
+  own epoch. Liveness: the fix only names more nodes; a claim is stuck only
+  when every named member is gone, which already needed an abandon before.
 - **Q14 — Catch-up at a `DelegGroup` backup switch: decided** (M3). The
   delegate requests a removal only under its `removal_safe`; the root's
   generation end seals every backup any record of the generation named.

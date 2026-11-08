@@ -4371,11 +4371,11 @@ fn a_sealed_holders_reclaim_keeps_the_older_group_named() {
             !r.waiting_for_group,
             "seed {seed}: a claim waits for its group"
         );
-        fetched += sum(|s| s.tail_fetches);
+        fetched += sum(|s| s.inherited_tail_fetches);
     }
     assert!(
         fetched > 0,
-        "no claim fetched a tail: the shape was not reached"
+        "no claim fetched the older group's tail: the shape was not reached"
     );
 }
 
