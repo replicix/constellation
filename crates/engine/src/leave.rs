@@ -194,6 +194,27 @@ pub async fn finish_leave(
     Ok(())
 }
 
+/// Whether a self-leave's retirement landed although `finish_leave` did not
+/// report it (a timeout after the registry's PUT, an answer lost): the
+/// registry names the node retired. Then the leave is done, and the same
+/// flag `finish_leave` persists is persisted here; otherwise nothing
+/// changed and the leave failed.
+pub async fn complete_if_retired(
+    store: Arc<dyn ObjectStore>,
+    meta: &Meta,
+    node_id: u64,
+) -> Result<bool, LeaveError> {
+    let record = constellation_store_s3::get_node(store, node_id)
+        .await
+        .map_err(|e| LeaveError::Other(format!("reading node {node_id}'s record: {e}")))?;
+    if !record.is_some_and(|r| r.retired) {
+        return Ok(false);
+    }
+    meta.kv_set("left", "1")
+        .map_err(|e| LeaveError::Other(format!("persisting left flag: {e}")))?;
+    Ok(true)
+}
+
 /// Refuse self-leave while an epoch promise is open (not forceable).
 pub fn refuse_open_epoch(epochs: &EpochManager) -> Result<(), LeaveError> {
     if epochs.is_open() {
@@ -240,6 +261,29 @@ mod tests {
         assert_eq!(write_eligible_roster(store.clone()).await.unwrap(), [a]);
         assert!(get_node(store, b).await.unwrap().unwrap().retired);
         assert_eq!(meta.kv_get("left").unwrap().as_deref(), Some("1"));
+    }
+
+    /// A retirement that landed without being reported (the registry's PUT
+    /// went through, the answer or the caller's bound did not) completes the
+    /// leave: the node is retired in the registry and the left flag is
+    /// persisted. A node the registry still lists live is not.
+    #[tokio::test]
+    async fn a_retirement_that_landed_unreported_completes_the_leave() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let a = claim_node_id(store.clone()).await.unwrap();
+        let b = claim_node_id(store.clone()).await.unwrap();
+        let meta = open_meta();
+        assert!(!complete_if_retired(store.clone(), &meta, b).await.unwrap());
+        assert_eq!(meta.kv_get("left").unwrap(), None);
+        // The PUT lands; `finish_leave` never reports it.
+        constellation_store_s3::leave_node(store.clone(), b)
+            .await
+            .unwrap();
+        assert_eq!(meta.kv_get("left").unwrap(), None, "not persisted yet");
+        assert!(complete_if_retired(store.clone(), &meta, b).await.unwrap());
+        assert_eq!(meta.kv_get("left").unwrap().as_deref(), Some("1"));
+        // (Another node's record is untouched.)
+        assert!(!get_node(store, a).await.unwrap().unwrap().retired);
     }
 
     #[tokio::test]

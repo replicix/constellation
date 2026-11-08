@@ -6441,16 +6441,39 @@ impl Driver {
                     let meta = self.deps.meta.clone();
                     let node_id = self.node_id;
                     let int_tx = self.int_tx.clone();
+                    let upload = self.deps.upload.clone();
                     tokio::spawn(async move {
-                        let retire = async move {
-                            crate::leave::finish_leave(store, &meta, node_id)
+                        // What moves while the flush works: rows shipped
+                        // (the acknowledged watermark) and S3 answering
+                        // (chunk PUTs, the ship, the publish).
+                        let progress = {
+                            let meta = meta.clone();
+                            move || {
+                                (
+                                    meta.journal_acked_seq().unwrap_or(0),
+                                    upload.s3_waits().answered_ms,
+                                )
+                            }
+                        };
+                        let retire = {
+                            let (store, meta) = (store.clone(), meta.clone());
+                            async move {
+                                crate::leave::finish_leave(store, &meta, node_id)
+                                    .await
+                                    .map_err(|e| e.to_string())
+                            }
+                        };
+                        let recheck = async move {
+                            crate::leave::complete_if_retired(store, &meta, node_id)
                                 .await
                                 .map_err(|e| e.to_string())
                         };
                         run_leave_tail(
                             frx,
+                            progress,
                             retire,
-                            LEAVE_FLUSH_BOUND,
+                            recheck,
+                            LEAVE_NO_PROGRESS_BOUND,
                             LEAVE_RETIRE_BOUND,
                             &int_tx,
                             tx,
@@ -6470,45 +6493,91 @@ impl Driver {
     }
 }
 
-/// How long a self-leave waits for the core's journal flush, and for the
-/// registry's retirement after it. Past either the leave fails and the core
-/// takes it back ([`leave_failed`]): the operator runs it again. Without a
-/// bound a flush stuck behind an unreachable store kept the node marked
-/// leaving at its root for as long as it ran.
-const LEAVE_FLUSH_BOUND: Duration = Duration::from_secs(300);
+/// How long a self-leave's journal flush may go without progress, and how
+/// long the registry's retirement may take. Past either the leave fails and
+/// the core takes it back ([`leave_failed`]): the operator runs it again.
+/// The flush is bounded by its progress, not by its length: a flush of a
+/// large backlog under load takes as long as it takes (only latency may
+/// degrade), while one stuck behind an unreachable store, which kept the
+/// node marked leaving at its root for as long as it ran, fails once
+/// nothing moved for the bound.
+const LEAVE_NO_PROGRESS_BOUND: Duration = Duration::from_secs(120);
 const LEAVE_RETIRE_BOUND: Duration = Duration::from_secs(120);
+/// How long the registry is asked whether a retirement landed after all.
+const LEAVE_RECHECK_BOUND: Duration = Duration::from_secs(30);
 
 /// A self-leave's second half, after the core released the node's grants:
-/// wait for the journal flush (`flushed`), then run `retire`, each within
-/// its bound. Whatever fails — the flush, the retirement, a bound — takes the
-/// leave back ([`leave_failed`]) and answers `reply` with the error; a leave
-/// that passed answers `done`.
-async fn run_leave_tail<R>(
-    flushed: oneshot::Receiver<std::result::Result<(), String>>,
+/// wait for the journal flush (`flushed`), then run `retire`. The flush
+/// fails only when `progress` (a token that changes while the flush works:
+/// rows shipped, S3 answering) did not change for `no_progress`; the
+/// retirement within `retire_bound`. A retirement that failed or timed out
+/// may have landed (the registry's PUT went through, its answer did not):
+/// `recheck` asks the registry, and a node it names retired has left, the
+/// leave not failed. Whatever else fails takes the leave back
+/// ([`leave_failed`]) and answers `reply` with the error; a leave that
+/// passed answers `done`.
+#[allow(clippy::too_many_arguments)]
+async fn run_leave_tail<R, C, P, T>(
+    mut flushed: oneshot::Receiver<std::result::Result<(), String>>,
+    mut progress: P,
     retire: R,
-    flush_bound: Duration,
+    recheck: C,
+    no_progress: Duration,
     retire_bound: Duration,
     int_tx: &mpsc::UnboundedSender<Internal>,
     reply: oneshot::Sender<std::result::Result<String, String>>,
     done: String,
 ) where
     R: std::future::Future<Output = std::result::Result<(), String>>,
+    C: std::future::Future<Output = std::result::Result<bool, String>>,
+    P: FnMut() -> T,
+    T: PartialEq,
 {
-    let result = match tokio::time::timeout(flush_bound, flushed).await {
-        Ok(Ok(Ok(()))) => match tokio::time::timeout(retire_bound, retire).await {
-            Ok(Ok(())) => Ok(done),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(format!(
-                "the registry's retirement took longer than {} s; run the leave again",
-                retire_bound.as_secs()
-            )),
-        },
-        Ok(Ok(Err(e))) => Err(format!("cannot flush before leave (is S3 reachable?): {e}")),
-        Ok(Err(_)) => Err("the flush before leave was dropped; run the leave again".into()),
-        Err(_) => Err(format!(
-            "the flush before leave took longer than {} s (is S3 reachable?); \
+    let poll = (no_progress / 4).clamp(Duration::from_millis(5), Duration::from_secs(5));
+    let mut last = progress();
+    let mut since = Instant::now();
+    let flush = loop {
+        tokio::select! {
+            r = &mut flushed => break Some(r),
+            _ = tokio::time::sleep(poll) => {
+                let now = progress();
+                if now != last {
+                    last = now;
+                    since = Instant::now();
+                } else if since.elapsed() >= no_progress {
+                    break None;
+                }
+            }
+        }
+    };
+    let result = match flush {
+        Some(Ok(Ok(()))) => {
+            let retired = match tokio::time::timeout(retire_bound, retire).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(format!(
+                    "the registry's retirement took longer than {} s; run the leave again",
+                    retire_bound.as_secs()
+                )),
+            };
+            match retired {
+                Ok(()) => Ok(done),
+                // (The PUT may have landed whatever the caller was told.)
+                Err(e) => {
+                    match tokio::time::timeout(LEAVE_RECHECK_BOUND.min(retire_bound), recheck).await
+                    {
+                        Ok(Ok(true)) => Ok(done),
+                        _ => Err(e),
+                    }
+                }
+            }
+        }
+        Some(Ok(Err(e))) => Err(format!("cannot flush before leave (is S3 reachable?): {e}")),
+        Some(Err(_)) => Err("the flush before leave was dropped; run the leave again".into()),
+        None => Err(format!(
+            "the flush before leave made no progress for {} s (is S3 reachable?); \
              run the leave again",
-            flush_bound.as_secs()
+            no_progress.as_secs().max(1)
         )),
     };
     if result.is_err() {
@@ -7891,15 +7960,18 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Step 11 re-review 3: a self-leave whose journal flush never answers
-    /// (a store that cannot be reached) fails at its bound and takes the
-    /// leave back with `Control::LeaveFailed`; so does a retirement that
-    /// hangs, and one that errors. A leave that passes answers and takes
-    /// nothing back. Before, the flush was waited for without a bound.
+    /// Step 11 re-review 3 and step 13: a self-leave whose journal flush makes
+    /// no progress (a store that cannot be reached) fails at its bound and
+    /// takes the leave back with `Control::LeaveFailed`; a flush that keeps
+    /// progressing is waited for however long it takes (load: only latency
+    /// may degrade); a retirement that hangs or errors fails it, unless the
+    /// registry names the node retired after all (the PUT landed). A leave
+    /// that passes answers and takes nothing back.
     #[tokio::test]
-    async fn a_leave_whose_flush_or_retirement_hangs_fails_and_is_taken_back() {
+    async fn a_leave_fails_on_no_progress_and_a_landed_retirement_is_not_a_failure() {
+        use std::sync::atomic::{AtomicU64, Ordering};
         use tokio::sync::{mpsc, oneshot};
-        let bound = Duration::from_millis(50);
+        let bound = Duration::from_millis(100);
         let taken_back = |rx: &mut mpsc::UnboundedReceiver<super::Internal>| {
             matches!(
                 rx.try_recv(),
@@ -7909,27 +7981,121 @@ mod tests {
                 })
             )
         };
-        // The flush never answers.
+        let retired = |yes: bool| async move { Ok::<bool, String>(yes) };
+        // The flush never answers and nothing moves: it fails.
         let (itx, mut irx) = mpsc::unbounded_channel();
         let (rtx, rrx) = oneshot::channel();
         let (_ftx, frx) = oneshot::channel();
-        super::run_leave_tail(frx, async { Ok(()) }, bound, bound, &itx, rtx, "ok".into()).await;
+        super::run_leave_tail(
+            frx,
+            || 0u64,
+            async { Ok(()) },
+            retired(false),
+            bound,
+            bound,
+            &itx,
+            rtx,
+            "ok".into(),
+        )
+        .await;
         let e = rrx.await.unwrap().unwrap_err();
-        assert!(e.contains("took longer"), "{e}");
+        assert!(e.contains("no progress"), "{e}");
         assert!(taken_back(&mut irx), "the leave was not taken back");
-        // The retirement hangs.
+        // A flush that takes five times the bound but moves all along
+        // passes (fail-before: a fixed bound failed it).
+        let moved = std::sync::Arc::new(AtomicU64::new(0));
+        let (rtx, rrx) = oneshot::channel();
+        let (ftx, frx) = oneshot::channel();
+        let worker = {
+            let moved = moved.clone();
+            tokio::spawn(async move {
+                for _ in 0..25 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    moved.fetch_add(1, Ordering::Relaxed);
+                }
+                let _ = ftx.send(Ok(()));
+            })
+        };
+        let seen = moved.clone();
+        super::run_leave_tail(
+            frx,
+            move || seen.load(Ordering::Relaxed),
+            async { Ok(()) },
+            retired(false),
+            bound,
+            bound,
+            &itx,
+            rtx,
+            "ok".into(),
+        )
+        .await;
+        worker.await.unwrap();
+        assert_eq!(rrx.await.unwrap().unwrap(), "ok");
+        assert!(!taken_back(&mut irx));
+        // The retirement hangs and the registry does not name the node
+        // retired: it fails.
         let (rtx, rrx) = oneshot::channel();
         let (ftx, frx) = oneshot::channel();
         ftx.send(Ok(())).unwrap();
         let hang = std::future::pending::<Result<(), String>>();
-        super::run_leave_tail(frx, hang, bound, bound, &itx, rtx, "ok".into()).await;
+        super::run_leave_tail(
+            frx,
+            || 0u64,
+            hang,
+            retired(false),
+            bound,
+            bound,
+            &itx,
+            rtx,
+            "ok".into(),
+        )
+        .await;
         assert!(rrx.await.unwrap().unwrap_err().contains("retirement"));
         assert!(taken_back(&mut irx));
+        // The retirement hangs (or errors) after its PUT landed: the registry
+        // names the node retired, the leave is done and nothing is taken back.
+        for lost in [true, false] {
+            let (rtx, rrx) = oneshot::channel();
+            let (ftx, frx) = oneshot::channel();
+            ftx.send(Ok(())).unwrap();
+            let retire = async move {
+                if lost {
+                    std::future::pending::<Result<(), String>>().await
+                } else {
+                    Err("answer lost".to_string())
+                }
+            };
+            super::run_leave_tail(
+                frx,
+                || 0u64,
+                retire,
+                retired(true),
+                bound,
+                bound,
+                &itx,
+                rtx,
+                "left".into(),
+            )
+            .await;
+            assert_eq!(rrx.await.unwrap().unwrap(), "left");
+            assert!(!taken_back(&mut irx), "lost={lost}");
+        }
         // The flush failed.
         let (rtx, rrx) = oneshot::channel();
         let (ftx, frx) = oneshot::channel();
         ftx.send(Err("s3 down".into())).unwrap();
-        super::run_leave_tail(frx, async { Ok(()) }, bound, bound, &itx, rtx, "ok".into()).await;
+        super::run_leave_tail(
+            frx,
+            || 0u64,
+            async { Ok(()) },
+            retired(false),
+            bound,
+            bound,
+            &itx,
+            rtx,
+            "ok".into(),
+        )
+        .await;
         assert!(rrx.await.unwrap().unwrap_err().contains("s3 down"));
         assert!(taken_back(&mut irx));
         // Everything passes: answered, nothing taken back.
@@ -7938,7 +8104,9 @@ mod tests {
         ftx.send(Ok(())).unwrap();
         super::run_leave_tail(
             frx,
+            || 0u64,
             async { Ok(()) },
+            retired(false),
             bound,
             bound,
             &itx,
