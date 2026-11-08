@@ -8974,6 +8974,112 @@ mod cto {
         assert_eq!(h.core.parked_exec_ops().count(), 0);
     }
 
+    /// Review S1: the root's own op on a granted inode is not *executed*
+    /// (no row, no outcome) until the recall is answered, or the grant is
+    /// outwaited.
+    #[test]
+    fn a_local_write_on_a_granted_inode_executes_only_after_the_recall() {
+        let (mut h, ino) = holder_with_file();
+        let before = mode_of(&h, ino);
+        assert_ne!(before, 0o600);
+        grant_of(&ask(&mut h, 2, 7, ino));
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            rid,
+            op: setattr(ino),
+            policy: Policy::Client,
+            tag: Default::default(),
+        });
+        assert!(replies(&out).is_empty(), "{out:?}");
+        let rs = recalls(&out);
+        let [(2, recall, _, _)] = rs.as_slice() else {
+            panic!("expected one recall to node 2: {out:?}")
+        };
+        let recall = *recall;
+        assert_eq!(mode_of(&h, ino), before, "not executed while granted");
+        assert!(h.meta.recent_outcome(rid).is_none());
+        assert!(h.meta.completed_outcome(rid).unwrap().is_none());
+        assert_eq!(h.core.stats.local_recalls_first, 1);
+        // New grants on the inode are refused until it ran.
+        assert!(
+            !matches!(
+                ask(&mut h, 4, 8, ino),
+                ReadIndexOutcome::Ok { grant: Some(_), .. }
+            ),
+            "no new grant on it until it ran"
+        );
+        h.step_archived(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: recall },
+        });
+        assert_eq!(mode_of(&h, ino), 0o600);
+    }
+
+    /// The same when the recall goes unanswered: executed once outwaited.
+    #[test]
+    fn a_local_write_on_a_granted_inode_executes_only_once_the_grant_expired() {
+        let (mut h, ino) = holder_with_file();
+        let before = mode_of(&h, ino);
+        let granted_at = h.now;
+        grant_of(&ask(&mut h, 2, 7, ino));
+        let out = h.step(Event::Submit {
+            rid: h.rid(1),
+            op: setattr(ino),
+            policy: Policy::Client,
+            tag: Default::default(),
+        });
+        let expiry = timer_of(&out, TimerKind::GrantExpiry);
+        h.advance(3_000);
+        assert_eq!(mode_of(&h, ino), before);
+        h.now = granted_at.plus(6_000);
+        h.step_archived(Event::Timer { id: expiry });
+        assert_eq!(mode_of(&h, ino), 0o600);
+    }
+
+    /// An op of the root's own that touches no granted inode executes at once.
+    #[test]
+    fn a_local_write_on_an_ungranted_inode_executes_at_once() {
+        let (mut h, ino) = holder_with_file();
+        let other = h.create("g");
+        let MutateOp::Create { ino: g, .. } = other else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &other, None).unwrap();
+        grant_of(&ask(&mut h, 2, 7, ino));
+        let out = h.step(Event::Submit {
+            rid: h.rid(1),
+            op: setattr(g),
+            policy: Policy::Client,
+            tag: Default::default(),
+        });
+        assert!(recalls(&out).is_empty(), "{out:?}");
+        assert_eq!(mode_of(&h, g), 0o600);
+        assert_eq!(h.core.stats.local_recalls_first, 0);
+    }
+
+    /// The grant quarantine holds back a forwarded op's execution but not
+    /// the root's own: that one is answered after the quarantine anyway.
+    #[test]
+    fn a_local_write_inside_the_grant_quarantine_executes_at_once() {
+        let (mut h, ino) = holder_with_file();
+        h.meta
+            .read_delegations()
+            .set_quarantine(h.clk().wait.plus(5_000));
+        let out = h.step(Event::Submit {
+            rid: h.rid(1),
+            op: setattr(ino),
+            policy: Policy::Client,
+            tag: Default::default(),
+        });
+        assert!(recalls(&out).is_empty(), "{out:?}");
+        assert_eq!(mode_of(&h, ino), 0o600);
+        assert_eq!(h.core.stats.local_recalls_first, 0);
+        assert!(
+            replies(&out).is_empty(),
+            "its reply waits for the quarantine"
+        );
+    }
+
     /// The sequencer's own writes (the core's local execution) recall too.
     #[test]
     fn a_local_write_recalls_before_its_reply() {
@@ -9863,15 +9969,17 @@ mod cto {
         ));
     }
 
-    /// Review S3: a local write parked for durability and for a grant's
-    /// recall, whose deadline gave the durability park up, is settled at
-    /// that deadline by the same rid (as its retry would be) and found
-    /// completed: that answer still waits for the recall, not only for
-    /// durability and the quarantine (none here), once the row is durable.
+    /// A local write parked (unexecuted) for a grant's recall, whose
+    /// deadline arrives first, is settled `Abandoned` and never executes:
+    /// not at the deadline, and not once the recall is answered. (Before
+    /// review S1 the op executed first, and the retry found it completed and
+    /// still had to wait for the recall: `aborted_recalls`, which now only
+    /// serves an inode the pre-check did not name.)
     #[test]
-    fn a_dedup_after_an_aborted_park_still_waits_for_the_recall() {
+    fn a_local_write_parked_for_a_recall_is_abandoned_at_its_deadline_unexecuted() {
         let (mut h, ino) = holder_with_file();
-        let grant = grant_of(&ask(&mut h, 2, 7, ino));
+        let before = mode_of(&h, ino);
+        grant_of(&ask(&mut h, 2, 7, ino));
         h.core.lease.held.as_mut().expect("held").0.ack_policy =
             constellation_store_s3::AckPolicy::S3;
         let rid = h.rid(1);
@@ -9883,34 +9991,23 @@ mod cto {
         });
         assert!(replies(&out).is_empty(), "parked: {out:?}");
         let rs = recalls(&out);
-        let [(2, recall, _, g)] = rs.as_slice() else {
+        let [(2, recall, _, _)] = rs.as_slice() else {
             panic!("expected one recall to node 2: {out:?}")
         };
-        assert_eq!(*g, grant.id);
         let deadline = timers(&out, TimerKind::ClientDeadline)[0];
-        // The deadline drops the durability park and settles the rid: found
-        // completed, answered again once durable (and recalled).
         let out = h.step(Event::Timer { id: deadline });
-        assert!(replies(&out).is_empty(), "{out:?}");
-        let tip = h.meta.journal_tip().unwrap();
-        let seqs: Vec<u64> = (1..=tip).collect();
-        h.meta.ack_journal_rows_at(&seqs, 1).unwrap();
-        let out = activity(&mut h);
-        assert!(
-            replies(&out).is_empty(),
-            "acknowledged with the recall out: {out:?}"
-        );
-        assert!(recalls(&out).is_empty(), "the recall is not sent twice");
-        let out = h.step(Event::Peer {
-            from: 2,
-            msg: PeerMsg::DelegationRecalled { req: *recall },
-        });
         let r = replies(&out);
         assert_eq!(r.len(), 1, "{out:?}");
         assert!(matches!(
             r[0].1,
-            ClientReply::Outcome(MutateOutcome::Accepted { .. })
+            ClientReply::Outcome(MutateOutcome::Abandoned)
         ));
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: *recall },
+        });
+        assert_eq!(mode_of(&h, ino), before, "never executed");
+        assert!(h.meta.completed_outcome(rid).unwrap().is_none());
     }
 
     fn renewal(req: u64, gen: u64, first: bool) -> Event {

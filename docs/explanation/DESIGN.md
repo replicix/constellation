@@ -1429,7 +1429,8 @@ cost when the node is idle
   mutation that touches a delegated inode (including an unlinked or
   replaced one), the sequencer recalls the delegation or outwaits it. A
   forwarded or inbox op waits for that (and for the grant quarantine)
-  *before* it executes, so its row never reaches the log while a
+  *before* it executes (the sequencer's own op waits for the grants that
+  miss it, not for the quarantine), so its row never reaches the log while a
   delegation that misses it is live: whoever answers its requester from
   the log later answers after the delegation ended. A forward held longer
   than half its timeout is answered `Held` and retried by rid. The sequencer persists a grant horizon before it

@@ -280,15 +280,16 @@ inode leaves the sequencer, every delegation on it held by a node other
 than the writer is recalled (`ReadRecall`, answered `ReadRecalled`) or
 outwaited (it is live until `granted + ttl + margin` on the
 sequencer's clock). This covers a forwarded op (recalled before it
-executes), a local op's reply, the FUSE fast path, an inbox op (recalled
-before it executes), and a release of the lease. An op recalled before it
+executes), a local op (recalled before it executes), the FUSE fast path, an
+inbox op (recalled before it executes), and a release of the lease. An op recalled before it
 executes leaves no row in the log while a delegation that misses it is
 live, so no node can answer its requester from the log early (after the
 sequencer crashed, say); new delegations on what it touches wait until it
 has executed (or, if it never does — a lost lease, a settle — until the
-block lapses, twice `ttl + margin` later). The sequencer's own (local)
-ops and a takeover's replay of its queue still execute first and recall
-after. A change to a dentry also recalls the
+block lapses, twice `ttl + margin` later). The sequencer's own op waits only
+for the grants that miss it (not the quarantine, which its acknowledgement
+waits for after the execution). A takeover's replay of its queue still
+executes first and recalls after. A change to a dentry also recalls the
 parent directory's delegation, and an `unlink`, `rmdir` or `rename`
 also recalls the inodes it changes that its records do not name: the
 unlinked (or replaced) inode, whose `nlink` and `ctime` change or which

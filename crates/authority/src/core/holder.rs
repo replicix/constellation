@@ -553,7 +553,9 @@ impl Core {
                 Vec::new()
             };
             if !touched.is_empty() {
-                if let Some(wait) = self.recall_before_execute(now, from, &touched, replica, out) {
+                if let Some(wait) =
+                    self.recall_before_execute(now, from, &touched, true, replica, out)
+                {
                     self.stats.forward_recalls_first += 1;
                     if req != OpId(0) {
                         self.park_exec_reply(

@@ -2678,6 +2678,7 @@ impl Core {
             && self.queue_gate_blocks(rid, &op, replica)
         {
             self.stats.ops_parked_behind_queue += 1;
+            self.stats.deleg_exec_parked += 1;
             self.park_exec_local(now, Default::default(), None, rid, true);
             return MutateOutcome::Busy;
         }
@@ -2726,7 +2727,37 @@ impl Core {
                     applied = ?replica.applied_position(),
                     "root parks a local execution"
                 );
-                self.park_exec_local(now, wait, deps_wait, rid, false);
+                self.stats.deleg_exec_parked += 1;
+                self.park_exec_local(now, (wait, None), deps_wait, rid, false);
+                return MutateOutcome::Busy;
+            }
+        }
+        // Plan 30 §M8, option (c) (review S1): the root's own op recalls
+        // every read delegation that misses it *before* it executes, as a
+        // forwarded one does (`holder.rs`, `recall_before_execute`): a root
+        // deposed while its honour still runs (a seal of a live holder)
+        // must not answer its own client from a row that reached the log
+        // while a grant of this root still serves the old state. Not for a
+        // settle (it executes nothing). A retry the dedup answers never gets
+        // here (`resolve_in_doubt_then_execute`). Parked as a delegation
+        // recall's execution is (`ExecuteLocal`): re-run once the recall is
+        // acked or the grant outwaited, or the lease path if it is lost.
+        // Only the grants that miss it, not the quarantine: the op's own
+        // acknowledgement waits for that after the execution, and no other
+        // node answers this node's rid from the log (the backup-strict
+        // seeds 892, 894 of `+unsettled` settled `EIO` otherwise: parked
+        // through a long quarantine, past the client's settle window).
+        let touched = if !settle && self.cfg.recall_before_ack {
+            replica.recall_inos_of_op(&op)
+        } else {
+            Vec::new()
+        };
+        if !touched.is_empty() {
+            let me = self.cfg.node_id;
+            if let Some(wait) = self.recall_before_execute(now, me, &touched, false, replica, out) {
+                self.stats.local_recalls_first += 1;
+                self.stats.deleg_exec_parked += 1;
+                self.park_exec_local(now, wait, None, rid, false);
                 return MutateOutcome::Busy;
             }
         }
@@ -2750,9 +2781,13 @@ impl Core {
                 }
             }
         } else {
-            match constellation_meta::locks::TokenPath::Local
-                .scope(|| replica.execute(&op, Some(rid), &tag, now))
-            {
+            let executed = constellation_meta::locks::TokenPath::Local
+                .scope(|| replica.execute(&op, Some(rid), &tag, now));
+            // The op ran (or was refused): grants on its inodes may resume.
+            if !touched.is_empty() {
+                self.recall_unblock(now, &touched);
+            }
+            match executed {
                 Ok(records) => {
                     if policy == Policy::Client {
                         self.lease.touch(now);

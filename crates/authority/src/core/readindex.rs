@@ -1039,23 +1039,16 @@ impl Core {
     pub(crate) fn park_exec_local(
         &mut self,
         now: Now,
-        wait: BTreeSet<u64>,
+        wait: RecallWait,
         deps: Option<Position>,
         rid: Rid,
         queue_gated: bool,
     ) {
-        self.stats.deleg_exec_parked += 1;
         self.dl.pending_exec.insert(rid);
         if let Some(c) = self.clients.get_mut(&rid) {
             c.phase = ClientPhase::Recalling;
         }
-        let id = self.park_with_deps(
-            now,
-            (wait, None),
-            None,
-            deps,
-            ParkedWhat::ExecuteLocal { rid },
-        );
+        let id = self.park_with_deps(now, wait, None, deps, ParkedWhat::ExecuteLocal { rid });
         if let Some(p) = self.rd.parked.get_mut(&id) {
             p.queue_gated = queue_gated;
         }
@@ -1863,15 +1856,29 @@ impl Core {
     /// still serve reads: then whoever answers the requester from the
     /// `Completed` row (a non-root's `inbox_enqueue` shortcut after the
     /// root crashed, say) answers after every such grant ended.
+    ///
+    /// `quarantine`: also wait out the table's quarantine (predecessor
+    /// grants, the kernel drain). Not for an op whose requester is this
+    /// node itself: its own acknowledgement waits for the quarantine after
+    /// the execution (`recall_needed` again), and no other node answers its
+    /// rid from the log; holding its execution too would only delay the
+    /// op past its client's settle window under a long quarantine.
     pub(crate) fn recall_before_execute(
         &mut self,
         now: Now,
         requester: NodeId,
         inos: &[Ino],
+        quarantine: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Option<RecallWait> {
-        let wait = self.recall_needed(now, inos, Some(requester), replica, out)?;
+        let mut wait = self.recall_needed(now, inos, Some(requester), replica, out)?;
+        if !quarantine {
+            wait.1 = None;
+            if wait.0.is_empty() {
+                return None;
+            }
+        }
         let until = now
             .wait
             .plus(2 * (self.cfg.read_delegation_ttl_ms + self.cfg.expiry_margin_ms));
@@ -1891,7 +1898,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> bool {
-        let Some(wait) = self.recall_before_execute(now, node, inos, replica, out) else {
+        let Some(wait) = self.recall_before_execute(now, node, inos, true, replica, out) else {
             return false;
         };
         self.park(now, wait, None, ParkedWhat::InboxRepoll { node });

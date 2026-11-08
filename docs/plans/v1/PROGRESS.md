@@ -69014,3 +69014,33 @@ The review of the fix round left one MUST, the `long-delegated` allowed-unsettle
 **SHOULDs.** (S1) A generation of this node's that lapses during the settle is seen at the second deadline: it moves to the root's end of it plus a window, capped (`a_generation_that_lapses_during_the_settle_extends_the_second_deadline`; `settles_extended_for_lapsed_gen`). (S2) The far-measured placed grant is recalled only when the measurement has held for a placement tick (`Gen::far_since`; one inflated sample resets on the next in-budget one), and a gen already recalling is not counted or cooled down again (`placement_recalls_a_grant_to_a_node_measured_far_afterwards`). (S3) The leave flush's progress token is the acknowledged watermark and this node's own `UploadRuntime` last chunk PUT (per instance, not the process's S3 clock): `the_leave_progress_token_moves_with_this_nodes_chunk_uploads`. Chunk PUTs do not advance the acknowledged seq. Every new test fails with its fix removed (mutation run on the box).
 
 **Sweeps** (release, 2,000 seeds unless noted, main = feeadcdc, prev = 8738fd92 rebased, new = this round). Allowed unsettled `EIO`s (all "no sequencer in time"), main / prev / new: `long-delegated` +commit/+settle 60 / 30 / 2, +unsettled 53 / 27 / 1; `long-delegated+settle` 0..12,000 286 / 224 / 6 (generation outwait 216 / 173 / 2; violations 18 / 10 / 2; I1/I2/I4/I5 0 on all three); `long-delegated-backup` 47 (main) / 41 (new), `long-delegated-late-answers` 35 / 35, `delegated-holder-cut` 2 / 2, `delegated-root-crash` 1 / 0, `delegated-crash`, `delegated-root-gone`, `placement-hot`, `far-placement` (not on main) 0 / 0. `+unsettled` failing seeds: `long-delegated` 4 / 2 / 1 (the one left, 737, an I4 with the requester's own core busy for 13 ms at the end of its window, fails on prev too), `long-delegated-backup` 25 / 25, `long-delegated-late-answers` 16 / 16. `delegated-root-gone+commit` 0..12,000: main 1 failing (11978), new 0, `lone_rolled_back` seen. No i1/i2/i4/i5 rose in any configuration. The settle duration is not measured by the sweep (it prints no distribution): the bound above is the cost.
+
+## Plan 46 M1.3 step 2: the root's own ops recall read delegations before they execute (S1 from `rbe2`; 2026-11-08)
+
+- Ported `rbe2`'s S1 (review S1 of the forwarded-op change) onto main by understanding, not by cherry-pick; the code hunks
+  applied unchanged (`client.rs`, `holder.rs`, `readindex.rs`, `mod.rs`). `execute_local_outcome` calls
+  `Core::recall_before_execute` with the op's `recall_inos_of_op` (not for a settle) and parks the op unexecuted as
+  `ExecuteLocal` until the recall is answered or the grant outwaited; grants only, no quarantine
+  (`recall_before_execute(.., quarantine: false)`: the op's own acknowledgement waits for the quarantine after the
+  execution, and no other node answers this node's rid from the log). New stat `local_recalls_first`.
+- The 2 unsettled `EIO`s (`backup-strict+unsettled` 892, 894) need no further code: the fix the plan names (a gated
+  root's settle goes to `gate_settle`, not the lease path) is on main already, as `settle_route`'s gate branch
+  (M0.3 S1) and `Core::settled_by_gate` (step 3, bucket A). With the port, 892 and 894 pass.
+- Tests (core): `a_local_write_on_a_granted_inode_executes_only_after_the_recall`, `..._only_once_the_grant_expired` and
+  `a_local_write_parked_for_a_recall_is_abandoned_at_its_deadline_unexecuted` fail with the recall disabled (the last
+  replaces the S3 dedup test, whose premise is gone); `..._on_an_ungranted_inode_executes_at_once` and
+  `..._inside_the_grant_quarantine_executes_at_once` pass either way.
+- Sweeps (release), main versus this: the 17 strict configs x 300, failing sets identical (the
+  `strict-isolated-reader-skewed-credited` negative control fails the same 31 seeds on both). `backup-strict+unsettled`
+  (unsettled `EIO` is the check): 0..5000 main 0, this 1 (seed 3967); 5000..13000 main 0, this 0. Seed 3967: a gated
+  root's settle was answered (refused) at 9551 ms, then a claimant sealed that root's tail; the deposition rolled the refusal
+  back, and the settle, with no row to replay, retried through a stale cached holder (itself) until it went in doubt. It
+  is the existing deposed-gated-root class (the port shifts the timeline into it; main reaches the same state on other
+  seeds historically, 5 of 4,000 before M0.3); not fixed here.
+- Strict failover first ack (`SWEEP-FAILOVER`, p50/p90 ms, main to this): `backup-strict` 8 173/10 793 to 8 165/11 054,
+  `backup-strict-inbox-off` 1 187/8 144 to 1 160/8 129, `long-strict` 4 776/6 833 to 4 637/6 695, `strict-claimant-ahead`
+  4 691/6 597 to 4 760/6 721, `strict-reader-ahead` 5 411/6 867 to 5 072/6 920, `strict-skew-60s` 4 353/6 298 to
+  4 367/6 267; the others within 1 %.
+- Model: `settle_after_reads_recalled` already checks the root's own op and settle against the read recall of a released
+  stream (`check_reads`). The root's own S1 case (a read grant the root itself issued on its own directory) needs the
+  model to carry root-issued read delegations; not added.
