@@ -1083,6 +1083,12 @@ pub enum PeerMsg {
         epoch: Epoch,
         config_version: u64,
         from: u64,
+        /// The lease's renewal key the claimant read (the one its claim
+        /// CAS is conditioned on). A holder asked for its own epoch notes
+        /// it (the claim of that read can still land) and refuses a
+        /// seal whose key is older than its own landed renewal (that CAS
+        /// can no longer land).
+        key: constellation_store_s3::RenewalKey,
     },
     /// The answer, in batches of `backup_batch_rows` (`next`: ask again
     /// from there). `held: false`: this node holds no tail of `epoch` (it

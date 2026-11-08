@@ -2059,9 +2059,10 @@ async fn handle_stream<S: PeerService>(
                 epoch,
                 config_version,
                 from_seq,
+                key,
             } => Some(
                 service
-                    .seal_tail_requested(claimant, req_id, epoch, config_version, from_seq)
+                    .seal_tail_requested(claimant, req_id, epoch, config_version, from_seq, key)
                     .await,
             ),
             Payload::LockRequest {

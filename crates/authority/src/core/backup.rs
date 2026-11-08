@@ -94,8 +94,10 @@
 //!   tail, `status.lease.waiting_for_group`) until one does, or until the
 //!   operator abandons the group (`constellation repair abandon-group`,
 //!   `LogRecord::GroupAbandoned` in the claimant's marker). A holder that
-//!   sealed itself never revives its epoch: it re-claims its own expired
-//!   lease at the next epoch with its member copy as the tail (D7).
+//!   sealed itself never revives its epoch: it re-claims its own lease at
+//!   the next epoch with its member copy as the tail, at once when the lease
+//!   has moved off every key a sealer read (that sealer's CAS cannot land),
+//!   otherwise once it expired (D7).
 //! - **The inherited tail (D2).** A takeover that re-ships a predecessor's
 //!   tail journals the committed rows as its own, and until their segments
 //!   are in the log they rest on its disk and in the old group's copies.
@@ -683,7 +685,7 @@ pub(crate) struct AckState {
     /// pending floor (`Core::beat_cap`, an instant of this node's wait
     /// clock); `None`: no usable beats, or the predecessor's guard was
     /// unknown.
-    pending_cap: Option<WaitMs>,
+    pub(crate) pending_cap: Option<WaitMs>,
     /// Plan 43 C7-F F-a (review F1): the latest end, on this node's wait
     /// clock, of a lock or
     /// delegation grant this node answered under a continuation epoch's
@@ -814,6 +816,15 @@ pub(crate) struct BackupState {
     pub last_heard: WaitMs,
     /// The highest epoch sealed (persisted by the replica too).
     pub sealed: Epoch,
+    /// The lease renewal keys the claimants that sealed this node's own
+    /// epoch (`sealed`) read, as their `SealTail`s named them (memory only:
+    /// a restart forgets them, and the TTL rule of D7 then applies). A
+    /// claimant's CAS is conditioned on the key it read, so a lease that
+    /// moved off every one of them can no longer be claimed by a sealer
+    /// (`LeaseState::sealer_doomed`).
+    pub sealer_keys: Vec<constellation_store_s3::RenewalKey>,
+    /// The wait-clock instant the last such seal was answered.
+    pub sealer_at: WaitMs,
     /// The persisted seal could not be read at start: `sealed` is not
     /// known, and nothing is acknowledged or answered until a read succeeds
     /// ([`Core::backup_sealed_known`]; plan 43 C2e review).

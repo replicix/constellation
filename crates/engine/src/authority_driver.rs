@@ -3813,6 +3813,7 @@ impl Driver {
                 epoch,
                 config_version,
                 from_seq,
+                key,
                 reply,
             } => {
                 let req = self.control_id();
@@ -3824,6 +3825,7 @@ impl Driver {
                         epoch,
                         config_version,
                         from: from_seq,
+                        key,
                     },
                 }))
             }
@@ -5053,6 +5055,7 @@ impl Driver {
                 epoch,
                 config_version,
                 from: from_seq,
+                key,
             } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
@@ -5073,6 +5076,13 @@ impl Driver {
                         epoch,
                         config_version,
                         from_seq,
+                        key: constellation_net::LeaseKeyWire {
+                            holder: key.holder,
+                            epoch: key.epoch,
+                            holder_clock: key.holder_clock,
+                            holder_wait_ms: key.holder_wait_ms,
+                            released: key.released,
+                        },
                     };
                     let reply = tokio::time::timeout(
                         timeout,

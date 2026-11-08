@@ -33,8 +33,12 @@
 //! it answers it seals first. A *holder* that is asked deposes itself (it
 //! never acknowledges the epoch again; its unshipped rows are kept as a
 //! member copy before its recovery strands them) and re-claims its own
-//! expired lease at the next epoch if nobody else does (D7). A *backup*
-//! seals its role and answers its contiguous tail.
+//! lease at the next epoch (D7, amended: at once when the lease has moved
+//! off every key a sealer read, whose claim CAS cannot land any more;
+//! otherwise once it expired by TTL, if nobody else claims it). The message
+//! names the lease key the claimant read; a holder whose own renewal landed
+//! with a newer key refuses the seal (its claim could not land either). A
+//! *backup* seals its role and answers its contiguous tail.
 //!
 //! The claim CAS is conditioned on the lease read that named the group, so
 //! a holder that renewed (or reconfigured) meanwhile fails it and the
@@ -46,7 +50,7 @@ use crate::event::PeerMsg;
 use crate::ids::{Epoch, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_meta::{BackupRole, BackupTx};
-use constellation_store_s3::{AckPolicy, InheritedTail, Lease, LeaseTag};
+use constellation_store_s3::{AckPolicy, InheritedTail, Lease, LeaseTag, RenewalKey};
 use std::collections::BTreeMap;
 
 /// One attempt of a claim to fetch the group's sealed tail.
@@ -147,12 +151,14 @@ impl Core {
     /// not a member of that epoch's group (or the seal could not be
     /// persisted: the claimant retries). A store that could not be read sets
     /// `bk.seal_unreadable`: no answer at all is sent then.
+    #[allow(clippy::too_many_arguments)]
     fn seal_tail_hold(
         &mut self,
         now: Now,
         from: NodeId,
         epoch: Epoch,
         config_version: u64,
+        key: RenewalKey,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Option<(Vec<BackupTx>, u64)> {
@@ -183,7 +189,24 @@ impl Core {
                 }
             },
         };
+        // The claimant read the lease of this node at this epoch.
+        let own_key = key.holder == self.cfg.node_id && key.epoch == epoch;
         if holds_rows {
+            // A renewal of ours has landed since the key the claimant read:
+            // its claim CAS (on that key's tag) can no longer land. Sealing
+            // would depose a holder for nothing, and leave its lease naming
+            // a node that does not sequence. Refused; the claimant reads the
+            // lease again and watches the new key.
+            if own_key
+                && self.lease.held.as_ref().is_some_and(|(l, _)| {
+                    l.epoch == epoch
+                        && l.holder_clock == key.holder_clock
+                        && l.holder_wait_ms > key.holder_wait_ms
+                })
+            {
+                self.stats.seal_tail_stale_key += 1;
+                return None;
+            }
             if !replica.backup_seal(epoch) {
                 return None;
             }
@@ -194,6 +217,9 @@ impl Core {
             let txs = replica.member_copy_put_journal(epoch, config_version, first)?;
             if !self.bk.member_epochs.contains(&epoch) {
                 self.bk.member_epochs.push(epoch);
+            }
+            if own_key {
+                self.note_sealer_key(now, key);
             }
             self.stats.seal_tail_holder += 1;
             tracing::warn!(
@@ -237,7 +263,24 @@ impl Core {
         // claimant is told again): idempotent.
         let (_, txs) = replica.member_copy(epoch)?;
         let through = txs.iter().map(|t| t.last).max().unwrap_or(0);
+        // (A re-ask of the holder's own sealed epoch: this claimant's CAS
+        // can land too, whichever key it read.)
+        if own_key && self.bk.sealed >= epoch {
+            self.note_sealer_key(now, key);
+        }
         Some((txs, through))
+    }
+
+    /// A claimant that read `key` of this node's own lease at an epoch this
+    /// node sealed was answered: its claim CAS can land while the lease sits
+    /// at `key` (`LeaseState::sealer_doomed`). Only the keys of the sealed
+    /// epoch are kept.
+    fn note_sealer_key(&mut self, now: Now, key: RenewalKey) {
+        self.bk.sealer_at = now.wait;
+        self.bk.sealer_keys.retain(|k| k.epoch == key.epoch);
+        if !self.bk.sealer_keys.contains(&key) {
+            self.bk.sealer_keys.push(key);
+        }
     }
 
     /// `SealTail`: a claimant of a lease by TTL asks for the tail of
@@ -252,6 +295,7 @@ impl Core {
         epoch: Epoch,
         config_version: u64,
         from_seq: u64,
+        key: RenewalKey,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -275,7 +319,7 @@ impl Core {
             });
         };
         let Some((txs, through)) =
-            self.seal_tail_hold(now, from, epoch, config_version, replica, out)
+            self.seal_tail_hold(now, from, epoch, config_version, key, replica, out)
         else {
             if std::mem::take(&mut self.bk.seal_unreadable) {
                 // Not "I hold nothing": nothing at all (the claimant asks
@@ -341,6 +385,7 @@ impl Core {
                 self.cancel_timer(t, out);
             }
         }
+        let prev_key = prev.renewal_key();
         let mut tf = TailFetch {
             prev,
             tag,
@@ -360,7 +405,8 @@ impl Core {
             if node == self.cfg.node_id {
                 // This node's own copy (a member copy of the inherited
                 // epoch, a role of it): asked in place.
-                let own = self.seal_tail_hold(now, node, epoch, config_version, replica, out);
+                let own =
+                    self.seal_tail_hold(now, node, epoch, config_version, prev_key, replica, out);
                 // (Unreadable: not chosen; the other members are asked.)
                 let unreadable = std::mem::take(&mut self.bk.seal_unreadable);
                 if own.is_none() && (unreadable || !self.holds_nothing_of(epoch, replica)) {
@@ -396,6 +442,7 @@ impl Core {
                     epoch,
                     config_version,
                     from: 0,
+                    key: prev_key,
                 },
             });
         }
@@ -542,6 +589,7 @@ impl Core {
                     return;
                 };
                 tf.timer = Some(timer);
+                let key = tf.prev.renewal_key();
                 let Some(ch) = tf.chosen.as_mut() else {
                     return;
                 };
@@ -553,6 +601,7 @@ impl Core {
                         epoch: ch.epoch,
                         config_version: ch.config_version,
                         from: from_seq,
+                        key,
                     },
                 });
             }

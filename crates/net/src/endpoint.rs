@@ -1500,6 +1500,7 @@ pub trait PeerService: Send + Sync + 'static {
         epoch: u64,
         _config_version: u64,
         _from_seq: u64,
+        _key: crate::LeaseKeyWire,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::SealedTail {

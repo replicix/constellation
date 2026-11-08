@@ -7732,6 +7732,8 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "seal_tail_holder",
             "seal_tail_backup",
             "seal_tail_refused",
+            "seal_tail_stale_key",
+            "sealed_own_early_claims",
             "claim_seals",
             "tail_fetch_attempts",
             "tail_fetches",
@@ -7868,7 +7870,7 @@ struct OracleTotals {
     /// Plan 43 C1-3: attempts to fetch a group's tail, fetches completed (of
     /// them, of an inherited tail), claims that carried no tail (must be 0
     /// outside an abandon), groups abandoned, runs that ended waiting.
-    tail: [u64; 6],
+    tail: [u64; 8],
     /// Plan 43 C1-4: [committed entries rolled back, superseded by a
     /// takeover's tail, rows moved to a member copy, member rows retired,
     /// dropped, abandoned, tails kept by a backup, tail rows past a gap,
@@ -7969,6 +7971,8 @@ impl OracleTotals {
             self.tail[2] += st.inherited_tail_fetches;
             self.tail[3] += st.ttl_claims_without_tail;
             self.tail[4] += st.groups_abandoned;
+            self.tail[6] += st.sealed_own_early_claims;
+            self.tail[7] += st.seal_tail_stale_key;
         }
         self.tail[5] += u64::from(r.waiting_for_group);
         for st in r.stats.values() {
@@ -8322,7 +8326,8 @@ impl OracleTotals {
             "SWEEP-CLAIM-TOTALS {label} seeds {}/{seeds}: class-claim-mismatch={} in {} seeds, \
              acks-downgraded-lone={}, journal-class-from-session={}; tail fetch attempts {}, \
              fetches {} (inherited {}), claims without a tail {}, groups abandoned {}, runs \
-             ending waiting {}; claim mismatch in seeds {:?}",
+             ending waiting {}; early re-claims of a self-sealed holder {}, seals refused as stale \
+             {}; claim mismatch in seeds {:?}",
             self.seeds,
             self.class_claim.0,
             self.class_claim.1,
@@ -8334,6 +8339,8 @@ impl OracleTotals {
             self.tail[3],
             self.tail[4],
             self.tail[5],
+            self.tail[6],
+            self.tail[7],
             self.class_claim_seeds
         );
         eprintln!(

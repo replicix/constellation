@@ -1740,6 +1740,12 @@ pub struct Stats {
     pub backup_seal_unread_reads: u64,
     pub seal_tail_backup: u64,
     pub seal_tail_refused: u64,
+    /// Seals refused because this holder's renewal had landed with a newer
+    /// key than the claimant read (its claim CAS could not land).
+    pub seal_tail_stale_key: u64,
+    /// A self-sealed holder claimed its own lease at once, because the lease
+    /// had moved off every key a sealer read (D7 amended).
+    pub sealed_own_early_claims: u64,
     /// Plan 46 M0.3 (G): of those, refusals that proved this node holds
     /// nothing of the epoch (`SealedTail::empty`).
     pub seal_tail_empty: u64,
@@ -3136,6 +3142,7 @@ impl Core {
                 epoch,
                 config_version,
                 from: from_seq,
+                key,
             } => self.on_seal_tail(
                 now,
                 from,
@@ -3143,6 +3150,7 @@ impl Core {
                 epoch,
                 config_version,
                 from_seq,
+                key,
                 replica,
                 out,
             ),

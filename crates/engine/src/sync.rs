@@ -446,6 +446,7 @@ pub enum SyncRequest {
         epoch: u64,
         config_version: u64,
         from_seq: u64,
+        key: constellation_store_s3::RenewalKey,
         reply: tokio::sync::oneshot::Sender<SealTailAnswer>,
     },
     /// Plan 30 §M11 phase 2b: the live write designations `(dir,

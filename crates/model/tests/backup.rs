@@ -472,3 +472,31 @@ fn commit_rule_s3_is_clean() {
         &["s3_fast_takeover", "all_acked_and_in_log"],
     );
 }
+
+/// The seal gap (D7 amended, ADR-33): a holder that a claimant sealed
+/// re-claims its own lease at the next epoch with its member copy as the
+/// tail, while the register still names it, alone or chained with another
+/// holder's crash. Acknowledged writes are never lost, rolled back or
+/// reordered.
+#[test]
+fn a_sealed_holder_that_reclaims_loses_no_acknowledged_write() {
+    let model = BackupModel {
+        commit_rule: true,
+        tail_fetch: true,
+        inherited_tail: true,
+        holder_reclaim: true,
+        initial_backups: vec![1, 2],
+        writers: 1,
+        reconfig: false,
+        max_crashes: 1,
+        max_epoch: 3,
+        max_tick: 2,
+        lease_ttl: 1,
+        ..BackupModel::backup(4, 1)
+    };
+    assert_clean(
+        "sealed-holder-reclaim",
+        &model,
+        &["sealed_holder_reclaimed", "tail_fetched"],
+    );
+}

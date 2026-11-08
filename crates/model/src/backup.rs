@@ -100,6 +100,7 @@
 //! | `Seal(b)` / `Takeover(b)` | `on_backup_watch` (read the register) → `on_takeover_get` (listed? persist the seal; unlisted: give the role up, unsealed) → `Acquire` with the permit → marker → `apply_backup_tail` |
 //! | `TakeoverS3(i)` | `watch_s3_holder` → the permit → `classify` |
 //! | `TakeoverFetch(i, m)` | `LeaseState::classify` `Plan::FetchTail` → `on_seal_tail` (the member seals and answers) → the claim CAS with `inherited_tail` (`Lease.inherited_tail`) |
+//! | `ReclaimSealed(h)` | `LeaseState::classify` `sealer_doomed` / `sealer_overdue` → `Plan::Claim` from the holder's own member copy (`tail_held (self, epoch)`) |
 //! | `Unlist(b)` | `on_takeover_get` with the register at the backup's own epoch and the backup unlisted: the tail is discarded (a newer epoch moves it to a member copy instead) |
 //! | `Remove(h, b)` / `Add(h, b)` | `drop_backup` / `backup_promote` → `issue_reconfig` (a CAS on the object's version) |
 //! | `Crash(i)` | fail-stop; the sim's `CrashHolder` |
@@ -231,6 +232,14 @@ pub struct BackupModel {
     /// rows it re-ships are then held by the successor alone. `false` is the
     /// design.
     pub drop_member_at_tail_follows: bool,
+    /// The seal gap (D7 amended, ADR-33): a live holder that a claimant
+    /// sealed — it answered with its member copy and acknowledges nothing of
+    /// its epoch again — re-claims its own lease at the next epoch while the
+    /// register still names it, its member copy as the tail
+    /// ([`Action::ReclaimSealed`]). The model is untimed: this covers both
+    /// the early re-claim (the lease moved off every key a sealer read) and
+    /// the one after the sealer's grace.
+    pub holder_reclaim: bool,
 }
 
 impl BackupModel {
@@ -256,6 +265,7 @@ impl BackupModel {
             tail_fetch: false,
             inherited_tail: false,
             drop_member_at_tail_follows: false,
+            holder_reclaim: false,
         }
     }
 
@@ -386,6 +396,7 @@ pub const SAW_INHERITED_FETCHED: u16 = 64;
 pub const SAW_MEMBER_COPY: u16 = 128;
 pub const SAW_MEMBER_FETCHED: u16 = 256;
 pub const SAW_MEMBER_RETIRED: u16 = 512;
+pub const SAW_HOLDER_RECLAIM: u16 = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -706,6 +717,11 @@ pub enum Action {
     /// fetching the tail of member `.1` of the lease's group (the member
     /// seals).
     TakeoverFetch(u8, u8),
+    /// The seal gap (`holder_reclaim`): the live holder, sealed by a claimant
+    /// (deposed: its gated journal rows are its member copy), claims the
+    /// register that still names it at the next epoch, its member copy as the
+    /// tail.
+    ReclaimSealed(u8),
     /// The holder decides to remove a backup (an ack timeout), then CASes
     /// the register. With `wait_for_reconfig` the acknowledgements that
     /// needed it wait for the CAS; without, they leave at the decision.
@@ -848,6 +864,15 @@ impl Model for BackupModel {
                     }
                 }
             }
+            // The seal gap: a live holder sealed by a claimant re-claims.
+            if self.holder_reclaim
+                && s.is_holder(i)
+                && s.reg.policy == Policy::Backup
+                && !s.reg.backups.is_empty()
+                && s.reg.epoch < self.max_epoch
+            {
+                actions.push(Action::ReclaimSealed(iu));
+            }
             // Reconfiguration by the holder.
             if self.reconfig && s.is_holder(i) {
                 match s.pending_remove {
@@ -985,6 +1010,31 @@ impl Model for BackupModel {
                     s.saw |= SAW_INHERITED_FETCHED;
                 }
                 takeover_from(self, &mut s, i as usize, Some((m as usize, g)));
+            }
+            Action::ReclaimSealed(h) => {
+                let hu = h as usize;
+                if !s.is_holder(hu) || s.reg.backups.is_empty() {
+                    return None;
+                }
+                let epoch = s.reg.epoch;
+                let mut members = s.reg.backups.clone();
+                members.push(h);
+                members.sort();
+                // The seal: nothing of `epoch` is acknowledged again, the
+                // journal's gated rows are the member copy (served as the
+                // tail), and the node is deposed.
+                s.nodes[hu].sealed = s.nodes[hu].sealed.max(epoch);
+                s.nodes[hu].lease = None;
+                s.strand(self, hu, epoch);
+                s.nodes[hu].putting.clear();
+                let g = FetchGroup {
+                    epoch,
+                    members,
+                    candidates: vec![h],
+                    inherited: false,
+                };
+                s.saw |= SAW_HOLDER_RECLAIM;
+                takeover_from(self, &mut s, hu, Some((hu, g)));
             }
             Action::RemoveDecide(h, b) => {
                 let h = h as usize;
@@ -1139,6 +1189,12 @@ impl Model for BackupModel {
                     |_, s: &State| s.saw & SAW_MEMBER_FETCHED != 0,
                 ));
             }
+        }
+        if self.holder_reclaim {
+            props.push(Property::sometimes(
+                "sealed_holder_reclaimed",
+                |_, s: &State| s.saw & SAW_HOLDER_RECLAIM != 0,
+            ));
         }
         if self.reconfig {
             props.push(Property::sometimes("backup_removed", |_, s: &State| {

@@ -51348,6 +51348,7 @@ mod c1_tail_fetch {
                     epoch,
                     config_version,
                     from,
+                    ..
                 } => Some((to, *req, *epoch, *config_version, *from)),
                 _ => None,
             })
@@ -51386,7 +51387,27 @@ mod c1_tail_fetch {
         }
     }
 
+    /// A claimant's seal; it read the lease this node holds (the key of
+    /// the held lease, else the epoch's of node 1).
     fn seal_tail(h: &mut Harness, from: NodeId, epoch: Epoch, cv: u64, at: u64) -> Vec<Action> {
+        let key = h
+            .core
+            .lease
+            .held
+            .as_ref()
+            .map(|(l, _)| l.renewal_key())
+            .unwrap_or_else(|| lease_of(1, epoch, 0).renewal_key());
+        seal_tail_keyed(h, from, epoch, cv, at, key)
+    }
+
+    fn seal_tail_keyed(
+        h: &mut Harness,
+        from: NodeId,
+        epoch: Epoch,
+        cv: u64,
+        at: u64,
+        key: constellation_store_s3::RenewalKey,
+    ) -> Vec<Action> {
         h.step(Event::Peer {
             from,
             msg: PeerMsg::SealTail {
@@ -51394,6 +51415,7 @@ mod c1_tail_fetch {
                 epoch,
                 config_version: cv,
                 from: at,
+                key,
             },
         })
     }
@@ -52255,6 +52277,234 @@ mod c1_tail_fetch {
             2.max(h.meta.backup_tail(1).unwrap().len())
         );
         assert!(!h.meta.backup_tail(1).unwrap().is_empty());
+    }
+
+    /// A holder (node 1, epoch 1, backup 2) that sealed for claimants that
+    /// read the keys of the lease it held, offset by `sealers` ms of
+    /// `holder_wait_ms` (the first answered while it held; the later ones
+    /// re-asks, answered from its member copy), recovered, and read its own
+    /// lease: `object(held)`, `watched` for a long time or not. Returns the
+    /// harness, the lease it held and the actions of that read.
+    fn self_sealed_reads(
+        sealers: &[i64],
+        object: impl Fn(&Lease) -> Lease,
+        watched: bool,
+    ) -> (Harness, Lease, Vec<Action>) {
+        let (mut h, held) = self_sealed_recovered(sealers);
+        let object = object(&held);
+        if watched {
+            h.watch(&object);
+        }
+        let out = read_own(&mut h, &object);
+        (h, held, out)
+    }
+
+    /// [`self_sealed_reads`] up to the read: sealed, recovered.
+    fn self_sealed_recovered(sealers: &[i64]) -> (Harness, Lease) {
+        let (mut h, _) = listed_holder();
+        h.core.cfg.takeover_promise_check = false;
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(2),
+            op: h.create("r"),
+            tag: Default::default(),
+        });
+        let held = h.core.lease.held.as_ref().unwrap().0.clone();
+        for (i, off) in sealers.iter().enumerate() {
+            let mut key = held.renewal_key();
+            key.holder_wait_ms += off;
+            let out = seal_tail_keyed(&mut h, 3, 1, 2, i as u64, key);
+            assert_eq!(sealed(&out).len(), 1, "answered: {out:?}");
+            assert!(sealed(&out)[0].1, "held: {out:?}");
+        }
+        assert!(h.core.lease.lost);
+        h.meta.strand_below_epoch(2).unwrap();
+        h.meta.set_holder_epoch(0);
+        h.core.lease.clear_lost();
+        h.meta.persist_lost(false).unwrap();
+        (h, held)
+    }
+
+    /// The core acquires and reads `object` as the lease.
+    fn read_own(h: &mut Harness, object: &Lease) -> Vec<Action> {
+        let out = h.step(Event::Control {
+            op: OpId(700),
+            req: Control::Acquire,
+        });
+        let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+        let mut out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((object.clone(), tag())))),
+        });
+        // A node that cannot claim registers in `wanted_by` (an edit of the
+        // same epoch) before it gives the attempt up: answered.
+        let edit = s3_ops(&out).into_iter().find_map(|(op, r)| match r {
+            S3Op::LeaseSwap { lease, .. } if lease.epoch == object.epoch => Some(op),
+            _ => None,
+        });
+        if let Some(op) = edit {
+            out.extend(h.step(Event::S3 {
+                op,
+                result: S3Result::LeasePut(Ok(tag())),
+            }));
+        }
+        out
+    }
+
+    /// The attempt went on to a claim (the tail check, the CAS).
+    fn claimed(out: &[Action]) -> bool {
+        s3_ops(out).iter().any(|(_, r)| {
+            matches!(r, S3Op::SegmentRun { .. })
+                || matches!(r, S3Op::LeaseSwap { lease, .. } if lease.epoch > 1)
+        })
+    }
+
+    /// The claim's tail check and CAS: the CAS's op and body.
+    fn claim_cas(h: &mut Harness, out: Vec<Action>) -> Option<(OpId, Lease)> {
+        let tail = find_s3(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        let out = at_head(h, out);
+        s3_ops(&out).into_iter().find_map(|(op, r)| match r {
+            S3Op::LeaseSwap { lease, .. } => Some((op, lease.clone())),
+            _ => None,
+        })
+    }
+
+    /// `held`, renewed once more (a later `holder_wait_ms`), still in its
+    /// window.
+    fn renewed_once_more(held: &Lease) -> Lease {
+        let mut l = held.clone();
+        l.holder_wait_ms += 700;
+        l.holder_expires_ms += 700;
+        l.expires_unix_ms += 700;
+        l
+    }
+
+    /// Q13 amended (seal gap, sim `backup-strict+unsettled` 3967): the
+    /// claimant read key K1 and sealed this holder; the lease then moved to
+    /// K2 (this holder's renewal was in flight). The sealer's CAS on K1's
+    /// tag cannot land, and nobody else may claim the lease for a TTL: the
+    /// fenced holder re-claims at once, at the next epoch with its member
+    /// copy as the tail, and its still-open window arms a floor capped by
+    /// that window's end. Fails on the parent: it watched K2 for a whole TTL.
+    #[test]
+    fn a_self_sealed_holder_whose_lease_moved_off_the_sealers_key_reclaims_at_once() {
+        let (mut h, held, out) = self_sealed_reads(&[0], renewed_once_more, false);
+        assert!(seal_tails(&out).is_empty(), "its own copy: {out:?}");
+        let (op, written) = claim_cas(&mut h, out).expect("no claim CAS");
+        assert_eq!(written.epoch, 2, "never the epoch it sealed");
+        let t = written.inherited_tail.clone().expect("re-ships its tail");
+        assert_eq!((t.epoch, t.members), (1, vec![1, 2]));
+        h.step(Event::S3 {
+            op,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        assert_eq!(h.core.stats.sealed_own_early_claims, 1);
+        let gate = h.core.lease.gate.as_ref().expect("the takeover's gate");
+        assert!((gate.epoch, gate.takeover) == (2, true), "{gate:?}");
+        assert!(h.core.ack.pending_floor, "its window was still open");
+        assert_eq!(
+            h.core.ack.pending_cap,
+            Some(WaitMs(renewed_once_more(&held).holder_wait_ms))
+        );
+    }
+
+    /// The residual of Q13, shortened: the lease sits at the key the sealer
+    /// read, so the sealer's CAS can still land. The holder claims nothing
+    /// until it has watched that key for the sealer's grace
+    /// (`backup_claim_grace_ms`, twice the backups' silence window), not a
+    /// whole TTL; then the claim goes out (S3 arbitrates with a slow
+    /// sealer). Fails on the parent: a TTL.
+    #[test]
+    fn a_self_sealed_holder_at_the_sealers_key_waits_the_grace_not_the_ttl() {
+        let (mut h, held, out) = self_sealed_reads(&[0], Clone::clone, false);
+        assert!(!claimed(&out), "the sealer's CAS can still land: {out:?}");
+        let grace = super::super::lease::backup_claim_grace_ms(&h.core.cfg);
+        assert!(
+            (grace as u64) < h.core.cfg.ttl_ms,
+            "the harness's grace {grace} is under its TTL"
+        );
+        h.advance(grace as u64 - 1);
+        let out = read_own(&mut h, &held);
+        assert!(!claimed(&out), "a ms short of the grace: {out:?}");
+        h.advance(1);
+        let out = read_own(&mut h, &held);
+        assert!(claimed(&out), "the grace is over: {out:?}");
+        assert!(claim_cas(&mut h, out).is_some());
+    }
+
+    /// A holder with no sealer key (it restarted since, or sealed its epoch
+    /// in an earlier life) cannot tell whether the lease is at a key a
+    /// sealer read: the TTL rule (D7) stands.
+    #[test]
+    fn a_self_sealed_holder_that_restarted_falls_back_to_the_ttl() {
+        let (mut h2, held2) = self_sealed_recovered(&[0]);
+        // (The restart forgot the keys.)
+        h2.core.bk.sealer_keys.clear();
+        let mut object = renewed_once_more(&held2);
+        object.ttl_ms = h2.core.cfg.ttl_ms;
+        let out = read_own(&mut h2, &object);
+        assert!(!claimed(&out), "unknown sealer keys: {out:?}");
+        h2.advance(h2.core.cfg.ttl_ms - 1);
+        let out = read_own(&mut h2, &object);
+        assert!(!claimed(&out), "a ms short of the TTL: {out:?}");
+        h2.advance(1);
+        let out = read_own(&mut h2, &object);
+        assert!(claimed(&out), "the TTL is over: {out:?}");
+    }
+
+    /// Two claimants sealed it, one having read the older key K1 and one K2:
+    /// both CASes can land while the lease sits at either, so it waits at
+    /// both, and claims at once only off both.
+    #[test]
+    fn a_self_sealed_holder_waits_while_any_sealers_claim_can_land() {
+        for at in [0i64, 300] {
+            let (_, _, out) = self_sealed_reads(
+                &[0, 300],
+                |l| {
+                    let mut o = l.clone();
+                    o.holder_wait_ms += at;
+                    o
+                },
+                false,
+            );
+            assert!(!claimed(&out), "at +{at}: {out:?}");
+        }
+        let (_, _, out) = self_sealed_reads(
+            &[0, 300],
+            |l| {
+                let mut o = l.clone();
+                o.holder_wait_ms += 600;
+                o
+            },
+            false,
+        );
+        assert!(claimed(&out), "off both: {out:?}");
+    }
+
+    /// Seal gap, holder side: the claimant read K0, but this holder's
+    /// renewal has landed since (K1): its CAS on K0's tag cannot land. The
+    /// holder refuses the seal (no deposition, no rolled-back refusals, and
+    /// the lease keeps naming a node that sequences). Fails on the parent:
+    /// it sealed and deposed itself.
+    #[test]
+    fn a_holder_refuses_a_seal_from_a_stale_lease_read() {
+        let (mut h, _) = listed_holder();
+        let held = h.core.lease.held.as_ref().unwrap().0.clone();
+        let mut stale = held.renewal_key();
+        stale.holder_wait_ms -= 1;
+        let out = seal_tail_keyed(&mut h, 3, 1, 2, 0, stale);
+        assert_eq!(sealed(&out), vec![(3, false, 0, 0, None)], "{out:?}");
+        assert!(!h.core.lease.lost && h.core.lease.held.is_some());
+        assert_eq!(h.core.bk.sealed, 0);
+        assert_eq!(h.core.stats.seal_tail_stale_key, 1);
+        // The key it holds is not stale.
+        let out = seal_tail_keyed(&mut h, 3, 1, 2, 0, held.renewal_key());
+        assert!(sealed(&out)[0].1, "{out:?}");
+        assert!(h.core.lease.lost);
     }
 
     /// D2: a lease whose tenure re-ships a predecessor's tail (and lists no

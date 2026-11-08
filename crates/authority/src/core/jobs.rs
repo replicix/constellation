@@ -12,7 +12,7 @@
 //! are the same slot, and a forwarded or local mutation never needs the
 //! slot at all (see the module doc of `core`).
 
-use super::lease::{PendingGate, Plan};
+use super::lease::{honour_end_of, wait_end_of, PendingGate, Plan};
 use super::{Core, S3For};
 use crate::action::{Action, ControlOk, S3Op};
 use crate::event::{CasFailure, Control, PeerMsg, S3Failure, S3Result, UploadResult};
@@ -3333,6 +3333,8 @@ impl Core {
         // Plan 43 C1-3: what this node holds of the group's tail, and the
         // epoch it sealed, are what the classification decides a claim by.
         self.lease.sealed_own = self.bk.sealed;
+        self.lease.sealer_keys = self.bk.sealer_keys.clone();
+        self.lease.sealer_at = self.bk.sealer_at;
         self.lease.tail_held.clear();
         if let Some(r) = self.bk.role {
             self.lease.tail_held.push((r.holder, r.epoch));
@@ -3874,9 +3876,38 @@ impl Core {
         // permitted was proved expired by this node's own observation of the
         // lease (`LeaseState::classify`): the old holder's window is over in
         // true time, and no floor is needed.
-        let fast_prev = prev
-            .as_ref()
-            .is_some_and(|p| takeover && !p.released && permitted && p.holder != self.cfg.node_id);
+        // Amends D7 (ADR-33): a self-sealed holder that claims its own lease
+        // while that lease's window is still open (it moved off every key a
+        // sealer read, `LeaseState::sealer_doomed`) replaces a body whose
+        // grants it may have made itself (its delegations and lock grants
+        // under the sealed epoch, capped by that window): a floor, to the
+        // body's end on this node's wait clock. Under the TTL path that end
+        // has passed and this is a no-op.
+        let early_own = prev.as_ref().is_some_and(|p| {
+            takeover
+                && !p.released
+                && p.holder == self.cfg.node_id
+                && self.bk.sealed >= p.epoch
+                && honour_end_of(p, &self.cfg).is_some_and(|h| now.honour < h)
+        });
+        if early_own {
+            if let Some(p) = prev.as_ref() {
+                self.stats.sealed_own_early_claims += 1;
+                tracing::warn!(
+                    node = self.cfg.node_id,
+                    epoch,
+                    sealed_epoch = p.epoch,
+                    object_key = ?p.renewal_key(),
+                    sealer_keys = ?self.bk.sealer_keys,
+                    "a self-sealed holder claims its own lease with its window still open: no \
+                     sealer's claim can land on this key, or none came in time"
+                );
+            }
+        }
+        let fast_prev = early_own
+            || prev.as_ref().is_some_and(|p| {
+                takeover && !p.released && permitted && p.holder != self.cfg.node_id
+            });
         self.dl.inherit_slack_ms = 0;
         // Plan 43 C7-F F-c: the lease body a fast takeover replaced is this
         // takeover's alone; a value left by an earlier takeover whose gate
@@ -3895,7 +3926,11 @@ impl Core {
                     && self.ack.floor_mark == Some(epoch)
             });
         if let Some(p) = prev.as_ref().filter(|_| fast_prev) {
-            let cap = self.beat_cap(p);
+            let cap = if early_own {
+                wait_end_of(p, &self.cfg)
+            } else {
+                self.beat_cap(p)
+            };
             self.note_fast_takeover(p, cap);
         } else if floor_restart {
             tracing::info!(

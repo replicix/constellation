@@ -1570,6 +1570,10 @@ logging never blocks a daemon thread (plan 44)";
 
 ## ADR-33: Commit is the configured group's acknowledgement (Vertical Paxos over S3)
 
+**Amended 2026-11-08** (plan 43 Q13): a self-sealed holder whose sealer's
+claim cannot land re-claims at once, at the next epoch from its member copy;
+one whose sealer's claim can still land waits the sealer's grace, not a TTL.
+
 **Amended by [ADR-41](#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16)
 (2026-11-02)**: the root's copy in the group `{delegate, root}` counts only
 through the rows its own tenure has committed, not its journaled cursor.

@@ -837,6 +837,8 @@ pub enum Payload {
         epoch: u64,
         config_version: u64,
         from_seq: u64,
+        /// The renewal key of the lease the claimant read.
+        key: LeaseKeyWire,
     },
     /// The member's answer: `txs` is postcard of `Vec<BackupTx>` (a batch
     /// of `backup_batch_rows`; `next`: ask again from there), `through`

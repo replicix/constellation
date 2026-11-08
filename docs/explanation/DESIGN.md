@@ -1846,7 +1846,10 @@ without. A tenure that re-ships a predecessor's tail names the old group
 in its lease (`inherited_tail`) until its journal shipped through the
 rows, so a successor that dies first does not take the last copies of
 acknowledged rows with it. A holder that sealed itself keeps its rows as
-a member copy and re-claims at the next epoch.
+a member copy and re-claims at the next epoch: at once when the claim that
+sealed it can no longer land, after the sealer's grace when it can, and
+after a TTL when it has forgotten who sealed it
+([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)).
 
 A fast successor (seal or `ack=s3`) waits out the previous tenure's
 read-delegation and lock grants before it acknowledges a mutation or

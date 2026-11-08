@@ -136,9 +136,18 @@ pub struct LeaseState {
     /// Plan 43 C1-3: the highest epoch this node sealed (set by the core
     /// before it classifies: `BackupState::sealed`). A node that sealed its
     /// own epoch (a holder asked for its tail by a claimant) never revives
-    /// it: it claims its own expired lease as a takeover, at the next epoch
-    /// (D7).
+    /// it: it claims its own lease as a takeover, at the next epoch: at once
+    /// when the lease has moved off every key a sealer read (that claim can
+    /// no longer land, `sealer_doomed`), otherwise once it can be claimed
+    /// like another node's, by TTL (D7).
     pub sealed_own: Epoch,
+    /// The renewal keys the claimants that sealed this node's own epoch
+    /// read (`BackupState::sealer_keys`, set with `sealed_own`); empty after
+    /// a restart.
+    pub sealer_keys: Vec<RenewalKey>,
+    /// When (this node's wait clock) it last answered such a seal
+    /// (`BackupState::sealer_at`).
+    pub sealer_at: WaitMs,
     /// Plan 43 C1-3: the group's tails this node holds a copy of, as
     /// `(holder, epoch)`: its backup role's, and `(this node, epoch)` for
     /// each member copy it keeps (set by the core before it classifies). A
@@ -460,8 +469,12 @@ impl LeaseState {
         // Plan 43 C1-3 (D7): this node's own lease whose epoch this node
         // sealed (it was asked for its tail and gave it): the epoch is
         // never revived; the lease is claimed like another node's, once it
-        // can be, as a takeover at the next epoch.
+        // can be (or at once, `sealer_doomed`), as a takeover at the next
+        // epoch.
         let sealed_own = prev.holder == cfg.node_id && self.sealed_own >= prev.epoch;
+        // Amends D7 (plan 43 Q13, ADR-33): a self-sealed holder whose lease
+        // moved off every key a sealer read claims at once.
+        let sealer_doomed = self.sealer_doomed(&prev, cfg) || self.sealer_overdue(&prev, now, cfg);
         if prev.holder == cfg.node_id && !prev.released && !sealed_own {
             // Plan 43 C7b: the own body's end is on this node's honour
             // clock (a mixed compare of the body's wall stamp is gone).
@@ -504,6 +517,7 @@ impl LeaseState {
         // claimant) is not, until it has.
         let own = prev.holder == cfg.node_id && !sealed_own;
         let claimable = own
+            || sealer_doomed
             || prev.holder == 0
             || prev.released
             || prev.is_fenced()
@@ -610,6 +624,45 @@ impl LeaseState {
             takeover,
             marker,
         }
+    }
+
+    /// Amends D7 (plan 43 Q13, ADR-33): `prev` is this node's own lease at
+    /// an epoch this node sealed for a claimant, and its renewal key is none
+    /// that a sealer read. Every sealer's claim CAS is conditioned on the tag
+    /// of the key it read, so a lease at another key was written after those
+    /// reads: no sealer's CAS can land, and nobody else may claim it for a
+    /// whole TTL. The holder, fenced by its own seal, claims it at once (at
+    /// the next epoch, as a takeover from its member copy: the sealed epoch
+    /// is never revived). Without a recorded sealer key (a restart) the TTL
+    /// rule stands.
+    pub fn sealer_doomed(&self, prev: &Lease, cfg: &Config) -> bool {
+        prev.holder == cfg.node_id
+            && !prev.released
+            && self.sealed_own >= prev.epoch
+            && self
+                .sealer_keys
+                .iter()
+                .any(|k| k.epoch == prev.epoch && k.holder == cfg.node_id)
+            && !self.sealer_keys.contains(&prev.renewal_key())
+    }
+
+    /// Amends D7 (plan 43 Q13, ADR-33): `prev` is this node's own lease at
+    /// an epoch it sealed, still at a key a sealer read, and the last seal
+    /// it answered is [`backup_claim_grace_ms`] old (twice the backups'
+    /// silence window: a sealer that was answered claims within a pull of
+    /// the tail and one CAS). The sealer that read the current key and never
+    /// claimed (it crashed, or lost S3) cost the holder a whole TTL; now it
+    /// costs this. A sealer that is merely slow still has its CAS: the
+    /// claim of either lands, S3 decides, and the loser re-reads. No
+    /// recorded sealer key (a restart): the TTL rule. (Counted from the
+    /// seal, not from this node's first sight of the key: it wrote that key
+    /// itself, long before.)
+    pub fn sealer_overdue(&self, prev: &Lease, now: Now, cfg: &Config) -> bool {
+        prev.holder == cfg.node_id
+            && !prev.released
+            && self.sealed_own >= prev.epoch
+            && self.sealer_keys.contains(&prev.renewal_key())
+            && now.wait >= self.sealer_at.plus(backup_claim_grace_ms(cfg) as u64)
     }
 
     /// The lease object a `Plan::Create`/`Plan::Claim` CAS writes
@@ -1109,9 +1162,16 @@ impl LeaseState {
     /// `ack=s3` permit's window (when this node holds the permit).
     fn retry_at_for(&self, prev: &Lease, cfg: &Config) -> Option<WaitMs> {
         let o = self.obs_for(prev)?;
-        let ttl_at = o
+        let mut ttl_at = o
             .since
             .plus(Self::ttl_of(&o.body, cfg) + Self::claim_grace_ms(&o.body, cfg));
+        // A self-sealed holder at a sealer's key claims after the grace.
+        if prev.holder == cfg.node_id
+            && self.sealed_own >= prev.epoch
+            && self.sealer_keys.contains(&prev.renewal_key())
+        {
+            ttl_at = ttl_at.min(self.sealer_at.plus(backup_claim_grace_ms(cfg) as u64));
+        }
         let permit_at = self
             .takeover_permit
             .filter(|(epoch, holder)| {

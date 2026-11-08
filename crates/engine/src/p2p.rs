@@ -302,6 +302,7 @@ impl constellation_net::PeerService for P2pBridge {
         epoch: u64,
         config_version: u64,
         from_seq: u64,
+        key: constellation_net::LeaseKeyWire,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -322,6 +323,13 @@ impl constellation_net::PeerService for P2pBridge {
                     epoch,
                     config_version,
                     from_seq,
+                    key: constellation_store_s3::RenewalKey {
+                        holder: key.holder,
+                        epoch: key.epoch,
+                        holder_clock: key.holder_clock,
+                        holder_wait_ms: key.holder_wait_ms,
+                        released: key.released,
+                    },
                     reply,
                 })
                 .is_err()

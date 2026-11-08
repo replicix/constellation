@@ -307,8 +307,12 @@ lose them. So a claimant of a `Backup` lease first asks the group:
    reconfigured meanwhile fails the CAS, and the claim starts over;
 4. a listed backup that holds the tail needs no fetch: it seals its role
    and claims at the expiry; a holder that sealed itself never revives
-   the epoch, it claims its own expired lease at the next epoch with its
-   member copy as the tail.
+   the epoch, it claims its own lease at the next epoch with its member copy
+   as the tail: at once when the lease sits at no key a sealer read (every
+   sealer's CAS has failed), after the sealer's grace
+   (`backup_claim_grace_ms`) when it sits at one, after a TTL when the holder
+   has restarted and forgot its sealers. A holder whose renewal has landed
+   with a newer key than the claimant read refuses the seal.
 
 A member whose store cannot be read (what it holds, its tail, its seal, or
 whether its journal holds rows of the epoch) does not answer a seal at all.

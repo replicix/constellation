@@ -4059,6 +4059,23 @@ to land before C0.
   a self-sealed holder recovers at once and claims its own lease once
   expired, so a claimer that never claims costs at most a TTL.
   *Blocks C1* only if overturned.
+  **Amended 2026-11-08 (maintainer; the seal gap, sim
+  `backup-strict+unsettled` seed 3967;
+  [ADR-33](../../../explanation/DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)).**
+  "Never revive the sealed epoch" stands: the re-claim is at the next epoch,
+  from the member copy. The wait for expiry does not. A claimant's CAS is
+  conditioned on the key it read, and the seal names that key
+  (`SealTail.key`). (1) A holder whose renewal landed with a newer key than
+  the claimant read refuses the seal. (2) A self-sealed holder records the
+  keys its sealers read (memory only) and re-claims at once when the lease
+  sits at none of them: every sealer's CAS has failed, and nobody else may
+  claim for a TTL. The claim arms a floor to the end of the replaced window
+  (the holder's own grants under it), and settles are answered once the gate
+  can ship. (3) At a key a sealer read, the sealer that never claims (it
+  crashed, or lost S3) now costs the holder `backup_claim_grace_ms` (twice
+  the backups' silence window) from the last seal it answered, not a TTL; S3
+  arbitrates with a sealer that is merely slow. After a restart the keys are
+  forgotten and the TTL rule stands.
 - **Q14 — Catch-up at a `DelegGroup` backup switch: decided** (M3). The
   delegate requests a removal only under its `removal_safe`; the root's
   generation end seals every backup any record of the generation named.
