@@ -350,8 +350,10 @@ fn sends(actions: &[Action]) -> Vec<(NodeId, &PeerMsg)> {
 fn release_note_to(out: &[Action], to: NodeId) -> Option<constellation_meta::locks::ReleaseNote> {
     sends(out).into_iter().find_map(|(n, m)| match m {
         PeerMsg::DelegateStream {
-            released: Some(r), ..
-        } if n == to => Some(r.clone()),
+            gen,
+            released: Some(r),
+            ..
+        } if n == to && *gen != 0 => Some(r.clone()),
         _ => None,
     })
 }
@@ -61768,6 +61770,7 @@ mod step9_one_stream_per_node {
             control_answer(&out, 77).is_none(),
             "the leave was answered with the grant live: {out:?}"
         );
+        let (note_req, _) = leave_note_req(&out, 1).expect("the root was not told");
         assert!(h.core.dl.mine[&7].stopped, "the stream still executes");
         let (batch, round, last) = sends(&out)
             .into_iter()
@@ -61793,22 +61796,122 @@ mod step9_one_stream_per_node {
             h.core.dl.leave_timer.is_some_and(|next| next != id),
             "the leave's timer was not armed again"
         );
-        // The root appended the row: the leave may go on.
+        // The root appended the row, but has not said it heard the node
+        // leaves: the leave may not go on.
         let out = h.step(stream_ack(1, batch, round, last));
+        assert!(control_answer(&out, 77).is_none(), "{out:?}");
+        let out = h.step(leave_note_ack(1, note_req, false));
         let answer = control_answer(&out, 77).unwrap_or_else(|| panic!("not answered: {out:?}"));
         assert!(answer.is_ok(), "{answer:?}");
     }
 
-    /// A node that holds nothing leaves at once.
+    /// A leave note (`gen` 0 of a `DelegateStream`) in `out` to `to`: its
+    /// request and whether it says leaving.
+    fn leave_note_req(out: &[Action], to: NodeId) -> Option<(OpId, bool)> {
+        sends(out).into_iter().find_map(|(n, m)| match m {
+            PeerMsg::DelegateStream {
+                req,
+                gen: 0,
+                released: Some(r),
+                ..
+            } if n == to => Some((*req, r.leaving)),
+            _ => None,
+        })
+    }
+
+    /// The root `from`'s answer to a leave note.
+    fn leave_note_ack(from: NodeId, req: OpId, refused: bool) -> Event {
+        Event::Peer {
+            from,
+            msg: PeerMsg::DelegateStreamAck {
+                req,
+                gen: 0,
+                round: 0,
+                through: 0,
+                committed: 0,
+                refused,
+                archive_bound: false,
+            },
+        }
+    }
+
+    /// A leave note from `node` to a root.
+    fn leave_note_from(node: NodeId, req: u64, leaving: bool) -> Event {
+        Event::Peer {
+            from: node,
+            msg: PeerMsg::DelegateStream {
+                req: OpId(req),
+                gen: 0,
+                round: 0,
+                txs: Vec::new(),
+                leaving: Vec::new(),
+                leaving_barriers: Vec::new(),
+                released: Some(constellation_meta::locks::ReleaseNote {
+                    leaving,
+                    ..Default::default()
+                }),
+            },
+        }
+    }
+
+    /// A node that holds nothing still tells the root it leaves, and its
+    /// leave is answered only once that root has acknowledged the note:
+    /// before, it sent nothing, its done check was vacuously true, and the
+    /// root could grant to it until the registry retired it. Fails on the
+    /// parent: answered at once, with no note.
     #[test]
-    fn a_leave_of_a_node_with_no_grant_is_answered_at_once() {
+    fn a_leave_of_a_node_with_no_grant_is_answered_when_the_root_has_heard_it() {
         let mut h = Harness::new(3);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
         let out = h.step(Event::Control {
             op: OpId(5),
             req: Control::ReleaseGrants,
         });
+        let (req, leaving) = leave_note_req(&out, 1)
+            .unwrap_or_else(|| panic!("the root was not told the node leaves: {out:?}"));
+        assert!(leaving);
+        assert!(control_answer(&out, 5).is_none(), "{out:?}");
+        // Another request's answer, and a refusal, are no acknowledgement.
+        let out = h.step(leave_note_ack(1, OpId(req.0 + 1), false));
+        assert!(control_answer(&out, 5).is_none(), "{out:?}");
+        let out = h.step(leave_note_ack(1, req, true));
+        assert!(control_answer(&out, 5).is_none(), "{out:?}");
+        let out = h.step(leave_note_ack(1, req, false));
+        assert!(matches!(control_answer(&out, 5), Some(Ok(_))), "{out:?}");
+    }
+
+    /// The note is sent again until it is acknowledged, and an
+    /// acknowledgement of a root that has since changed is no
+    /// acknowledgement of the new one.
+    #[test]
+    fn a_leave_note_goes_to_the_root_there_is_now() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let out = h.step(Event::Control {
+            op: OpId(5),
+            req: Control::ReleaseGrants,
+        });
+        let (req, _) = leave_note_req(&out, 1).expect("no note");
+        // Unanswered: sent again at the next resend.
+        h.advance(2_000);
+        let id = h.core.dl.leave_timer.expect("no timer");
+        let out = h.step(Event::Timer { id });
+        assert!(leave_note_req(&out, 1).is_some(), "not sent again: {out:?}");
+        // The root changed before the answer came.
+        h.core.lease.cached_holder = Some(4);
+        let out = h.step(leave_note_ack(1, req, false));
+        assert!(control_answer(&out, 5).is_none(), "{out:?}");
+        h.advance(2_000);
+        let id = h.core.dl.leave_timer.expect("no timer");
+        let out = h.step(Event::Timer { id });
+        let (req4, _) =
+            leave_note_req(&out, 4).unwrap_or_else(|| panic!("the new root was not told: {out:?}"));
+        assert!(control_answer(&out, 5).is_none(), "{out:?}");
+        let out = h.step(leave_note_ack(4, req4, false));
         assert!(matches!(control_answer(&out, 5), Some(Ok(_))), "{out:?}");
     }
 
@@ -61939,6 +62042,8 @@ mod step9_one_stream_per_node {
             control_answer(&out, 77).is_none(),
             "the leave was answered with a live, unended stream: {out:?}"
         );
+        let (note_req, _) = leave_note_req(&out, 1).expect("the root was not told");
+        h.step(leave_note_ack(1, note_req, false));
         h.advance(600);
         let out = h.step(Event::Slack { epoch_slack: 0 });
         assert!(control_answer(&out, 77).is_none(), "{out:?}");
@@ -61987,6 +62092,211 @@ mod step9_one_stream_per_node {
             req: Control::EndGrantsOf { node: 4 },
         });
         assert!(matches!(control_answer(&out, 2), Some(Err(_))), "{out:?}");
+    }
+
+    /// Re-review MUST-1: the root that loses its lease while an operator's
+    /// leave waits on the grants of a node fails that wait ("run it again on
+    /// the root"). Its table lags and its generations are gone, so the done
+    /// check would pass, and a new root, which does not know the node
+    /// leaves, may grant to it. Fails on the parent: no answer at the loss,
+    /// then `Ok` once the table catches up.
+    #[test]
+    fn a_lost_lease_fails_an_admin_leave_instead_of_answering_it() {
+        let (mut h, d1) = root_with_dir();
+        assert!(delegate(&mut h, 900, d1, 3));
+        let gen = h.meta.delegation_table().get(d1).unwrap().gen;
+        let out = h.step(Event::Control {
+            op: OpId(910),
+            req: Control::EndGrantsOf { node: 3 },
+        });
+        assert!(control_answer(&out, 910).is_none(), "{out:?}");
+        let mut out = Vec::new();
+        h.core.deleg_on_lease_gone(h.clk(), &h.meta, &mut out);
+        let answer = control_answer(&out, 910)
+            .unwrap_or_else(|| panic!("the wait survived the lease: {out:?}"));
+        assert!(
+            answer
+                .as_ref()
+                .is_err_and(|e| e.contains("run the leave again")),
+            "{answer:?}"
+        );
+        // The table catches up with the log: nothing answers the leave again.
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
+                gen,
+                through: 0,
+            }],
+        )
+        .unwrap();
+        for _ in 0..3 {
+            h.advance(600);
+            let out = h.step(Event::Slack { epoch_slack: 0 });
+            assert!(
+                control_answer(&out, 910).is_none(),
+                "answered again: {out:?}"
+            );
+        }
+    }
+
+    /// Re-review MUST-2: a node that is leaving installs no grant, so one
+    /// that reached it before the root heard the leave is not taken up.
+    #[test]
+    fn a_leaving_node_installs_no_grant() {
+        let (mut h, _records, _a) = delegate_learning_a_streamed_grant(true);
+        h.core.dl.leave_self = true;
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine.is_empty(), "a leaving node took a grant up");
+        assert!(renewal_sent(&out).is_none(), "{out:?}");
+        h.core.dl.leave_self = false;
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine.contains_key(&7));
+    }
+
+    /// The ack of a leave note in `out` to `to`: refused or not.
+    fn leave_ack_to(out: &[Action], to: NodeId) -> Option<bool> {
+        sends(out).into_iter().find_map(|(n, m)| match m {
+            PeerMsg::DelegateStreamAck {
+                gen: 0, refused, ..
+            } if n == to => Some(*refused),
+            _ => None,
+        })
+    }
+
+    /// Re-review MUST-2, the root's side: a leave note marks the node leaving
+    /// before it is acknowledged, and nothing is granted to it. A node that
+    /// holds no stream is marked all the same. A root without the lease
+    /// refuses the note, and marks nothing.
+    #[test]
+    fn a_leave_note_marks_the_node_at_the_root() {
+        let (mut r, d1) = root_with_dir();
+        let out = r.step(leave_note_from(3, 100, true));
+        assert_eq!(leave_ack_to(&out, 3), Some(false), "{out:?}");
+        let out = r.step(Event::Control {
+            op: OpId(920),
+            req: Control::Delegate { dir: d1, node: 3 },
+        });
+        let answer = control_answer(&out, 920).expect("no answer");
+        assert!(
+            answer.as_ref().is_err_and(|e| e.contains("leaving")),
+            "{answer:?}"
+        );
+        // A root that does not hold the lease marks nothing.
+        let mut n = Harness::new(1);
+        n.core.cfg.delegation = true;
+        n.core.cfg.p2p = true;
+        let out = n.step(leave_note_from(3, 100, true));
+        assert_eq!(leave_ack_to(&out, 3), Some(true), "{out:?}");
+        assert!(!n.core.is_leaving(n.clk(), 3));
+    }
+
+    /// Re-review MUST-3, the root's side: the mark of a node's own note is
+    /// taken back by a later note of the node, not by an older one, lapses
+    /// with the time a leave may take, and goes when the node comes back
+    /// under a new incarnation (it restarted, same id). An operator's mark
+    /// stays through all of that.
+    #[test]
+    fn a_nodes_own_leave_mark_ends_when_it_is_taken_back_lapses_or_it_restarts() {
+        use constellation_meta::locks::LockMode;
+        // Taken back; an older take-back is none.
+        let (mut r, _d1) = root_with_dir();
+        r.step(leave_note_from(3, 100, true));
+        assert!(r.core.is_leaving(r.clk(), 3));
+        r.step(leave_note_from(3, 50, false));
+        assert!(r.core.is_leaving(r.clk(), 3), "an older note took it back");
+        let out = r.step(leave_note_from(3, 101, false));
+        assert_eq!(leave_ack_to(&out, 3), Some(false), "{out:?}");
+        assert!(!r.core.is_leaving(r.clk(), 3), "the take-back did not");
+        // Lapses.
+        r.step(leave_note_from(3, 200, true));
+        assert!(r.core.is_leaving(r.clk(), 3));
+        r.advance(300_000);
+        assert!(!r.core.is_leaving(r.clk(), 3), "the mark does not lapse");
+        // A restart: the node's lock requests carry a new incarnation.
+        let lock = |r: &mut Harness, incarnation: u32, req: u64| {
+            let sent = r.honour();
+            r.step(Event::Peer {
+                from: 3,
+                msg: PeerMsg::LockRequest {
+                    req: OpId(req),
+                    ino: ROOT_INO,
+                    mode: LockMode::Exclusive,
+                    blocking: false,
+                    sent,
+                    incarnation,
+                    waited_ms: 0,
+                },
+            })
+        };
+        let (mut r, _d1) = root_with_dir();
+        lock(&mut r, 1, 1);
+        r.step(leave_note_from(3, 300, true));
+        lock(&mut r, 1, 2);
+        assert!(r.core.is_leaving(r.clk(), 3));
+        lock(&mut r, 2, 3);
+        assert!(
+            !r.core.is_leaving(r.clk(), 3),
+            "a restarted node stays marked"
+        );
+        // An operator's mark: neither a take-back nor a restart clears it.
+        let (mut r, _d1) = root_with_dir();
+        lock(&mut r, 1, 1);
+        r.step(Event::Control {
+            op: OpId(910),
+            req: Control::EndGrantsOf { node: 3 },
+        });
+        assert!(r.core.is_leaving(r.clk(), 3));
+        r.step(leave_note_from(3, 400, true));
+        r.step(leave_note_from(3, 401, false));
+        lock(&mut r, 2, 2);
+        assert!(r.core.is_leaving(r.clk(), 3), "an operator's mark went");
+    }
+
+    /// Re-review MUST-3, the node's side: a self-leave that runs out of time
+    /// is over. The node takes grants again, and tells the root it is no
+    /// longer leaving, again until the root acknowledges it. Fails on the
+    /// parent: the node stays leaving (it installs nothing; the root
+    /// grants it nothing) after the leave failed.
+    #[test]
+    fn a_self_leave_that_fails_ends_the_leave_and_tells_the_root() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let out = h.step(Event::Control {
+            op: OpId(5),
+            req: Control::ReleaseGrants,
+        });
+        let (note, _) = leave_note_req(&out, 1).expect("no note");
+        assert!(h.core.dl.leave_self);
+        // The root never answers.
+        h.advance(120_000);
+        let id = h.core.dl.leave_timer.expect("no timer");
+        let out = h.step(Event::Timer { id });
+        let answer = control_answer(&out, 5).unwrap_or_else(|| panic!("not failed: {out:?}"));
+        assert!(answer.is_err(), "{answer:?}");
+        assert!(!h.core.dl.leave_self, "the node is still leaving");
+        let (back, leaving) = leave_note_req(&out, 1)
+            .unwrap_or_else(|| panic!("the root was not told the leave is off: {out:?}"));
+        assert!(!leaving);
+        // The late answer of the old note changes nothing; the take-back is
+        // sent again until acknowledged.
+        h.step(leave_note_ack(1, note, false));
+        assert!(h.core.dl.leave_tell.is_some());
+        h.advance(2_000);
+        let id = h.core.dl.leave_timer.expect("no timer for the take-back");
+        let out = h.step(Event::Timer { id });
+        assert_eq!(leave_note_req(&out, 1), Some((back, false)), "{out:?}");
+        h.step(leave_note_ack(1, back, false));
+        assert!(h.core.dl.leave_tell.is_none());
     }
 
     /// Step 10 review SHOULD-1: a subtree this node released and the root

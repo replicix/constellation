@@ -14267,6 +14267,58 @@ fn locks_writer_hold_delegated_without_the_settle_stays_clean_under_the_roots_cu
     }
 }
 
+/// [`locks_writer_hold_delegated_unsettled_config`] with the renewal's
+/// stream head stamped by the delegate's own clock, as before plan 46 M1.2
+/// step 11 (`Config::deleg_head_at_own_clock`).
+fn locks_writer_hold_delegated_unsettled_own_clock_config() -> SimConfig {
+    let base = locks_writer_hold_delegated_unsettled_config();
+    let inner = base.core.clone();
+    SimConfig {
+        core: std::sync::Arc::new(move |node, inc| {
+            let mut c = inner(node, inc);
+            c.deleg_head_at_own_clock = true;
+            c
+        }),
+        ..base
+    }
+}
+
+/// The negative control of the landing check (`LockGhost::check_landings`):
+/// with the settle off and the head stamped by the delegate's clock, a head
+/// is reported while a pinned write is still committing and claimed for it,
+/// the root grants on, and the write lands inside the next holder's critical
+/// section: the oracle reports "held write ... inside". These seeds did so
+/// before the root's clock bound (see the pin above); with the check
+/// disabled none of them fails, and this test with it.
+#[test]
+fn locks_writer_hold_delegated_own_clock_without_the_settle_is_caught() {
+    use pinned::run_seed;
+    let mut witnessed = Vec::new();
+    for seed in [635, 3358, 3403] {
+        if let Err(e) = run_seed(
+            seed,
+            locks_writer_hold_delegated_unsettled_own_clock_config(),
+        ) {
+            if e.contains("held write") && e.contains("inside") {
+                witnessed.push(seed);
+            }
+        }
+        // The settle keeps the write out of the section on the same clock.
+        run_seed(
+            seed,
+            SimConfig {
+                settle_tagged_writes: true,
+                ..locks_writer_hold_delegated_unsettled_own_clock_config()
+            },
+        )
+        .unwrap_or_else(|e| panic!("seed {seed}: the settled run is not clean: {e}"));
+    }
+    assert!(
+        !witnessed.is_empty(),
+        "no seed showed a held write landing inside the next holder's section"
+    );
+}
+
 /// Plan 43 C2d: a delegate whose group is not itself (the root near, or a
 /// backup) writes on its fast path and waits for the group: the held writes
 /// of the fault are answered once the group holds their rows, and the oracle

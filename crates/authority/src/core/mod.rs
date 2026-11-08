@@ -490,6 +490,14 @@ pub struct Config {
     /// Simulation only: the delegate loses the answer to the first recall of
     /// every Nth generation (`Core::on_deleg_recall`; 0: none) (L3).
     pub delegation_recalled_drop_every: u64,
+    /// Simulation only (a negative control): the renewal's stream head is
+    /// stamped with this node's own clock at the send, as before plan 46
+    /// M1.2 step 11, not with the root's send time of the answer received
+    /// (`DelegRenew::stream_head_at`). With the settle off
+    /// (`Meta::settle_tagged_writes`) a head reported while a pinned write
+    /// is still committing is then claimed for it, and the next holder's
+    /// section sees it land.
+    pub deleg_head_at_own_clock: bool,
     /// Simulation only: the root streams every Nth batch that carries a
     /// `DelegateNode` as uncommitted (`StreamAhead.committed = false`,
     /// `Core::stream_ahead`; 0: none), so a delegate learns the grant and
@@ -797,6 +805,7 @@ impl Config {
             delegation_push_drop_every: 0,
             delegation_recall_drop_every: 0,
             delegation_recalled_drop_every: 0,
+            deleg_head_at_own_clock: false,
             stream_ahead_uncommit_grant_every: 0,
             delegation_reclaim_expired: true,
             placement: true,
@@ -3248,6 +3257,9 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        if self.on_leave_note_failed(req) {
+            return;
+        }
         if self.on_stream_failed(now, req, out) {
             return;
         }

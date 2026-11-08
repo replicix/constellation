@@ -1285,6 +1285,16 @@ impl Core {
         let Some(previous) = seen else {
             return true;
         };
+        // A node back under a new incarnation is not the one whose leave
+        // note marked it: it is granted again. (An operator's mark stays.)
+        if self
+            .dl
+            .leaving
+            .get(&from)
+            .is_some_and(|m| m.until.is_some())
+        {
+            self.dl.leaving.remove(&from);
+        }
         let mut inos = Vec::new();
         let mut dropped = 0u64;
         let mut i = 0;

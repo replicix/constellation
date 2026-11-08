@@ -121,6 +121,16 @@ pub async fn admin_leave(
             });
         }
     }
+    if force {
+        // A designation the node made after `prepare_admin_leave` (before
+        // the root marked it leaving) would outlive its retirement: dropped
+        // again, from a fresh read, now that its grants are ended.
+        designations.refresh().await;
+        designations
+            .release_of(target)
+            .await
+            .map_err(|e| LeaveError::Other(format!("releasing designations of {target}: {e}")))?;
+    }
     constellation_store_s3::leave_node(store.clone(), target)
         .await
         .map_err(|e| LeaveError::Other(format!("retiring node {target}: {e}")))?;
@@ -401,6 +411,34 @@ mod tests {
         assert_eq!(designations_held_by(&designations, b).len(), 1);
         prepare_admin_leave(&designations, b, true).await.unwrap();
         assert!(designations_held_by(&designations, b).is_empty());
+    }
+
+    /// A designation the node makes between `prepare_admin_leave` and the
+    /// retirement is dropped by the forced leave too (it would outlive the
+    /// registry entry).
+    #[tokio::test]
+    async fn a_designation_made_after_the_prepare_does_not_outlive_a_forced_leave() {
+        use constellation_store_s3::designation::Designation;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let a = claim_node_id(store.clone()).await.unwrap();
+        let b = claim_node_id(store.clone()).await.unwrap();
+        let ds = DesignationStore::new(store.clone(), DesignationMode::Cas);
+        let designations = DesignationManager::new(ds, open_meta(), Peers::disabled(), a);
+        designations.refresh().await;
+        prepare_admin_leave(&designations, b, true).await.unwrap();
+        // The node designates a path after that, through the store.
+        let ds = DesignationStore::new(store.clone(), DesignationMode::Cas);
+        ds.create(&Designation::new("/late", b, false))
+            .await
+            .unwrap();
+        admin_leave(store.clone(), &designations, a, b, true)
+            .await
+            .unwrap();
+        designations.refresh().await;
+        assert!(
+            designations_held_by(&designations, b).is_empty(),
+            "a designation outlived the retirement"
+        );
     }
 
     #[test]
