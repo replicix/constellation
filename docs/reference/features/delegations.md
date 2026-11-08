@@ -149,7 +149,10 @@ through the delegate. It then:
      writer's are, until a sticky grant (plan 46 M1.3). Sticky and designated
      grants are final and need no group. A delegate whose links later leave the
      budget answers nothing until its group holds the row: only latency
-     degrades, never an acknowledged row. `delegation_stream_rows` (256) is
+     degrades, never an acknowledged row. A placed grant to a node measured
+     far after the grant is recalled once the measurement has held for a
+     placement tick (one round-trip sample inflated by load does not recall
+     it), and the recall is counted once. `delegation_stream_rows` (256) is
      the size of a stream batch.
 
      What a far writer pays until a sticky grant: its own creates cost a
@@ -604,7 +607,16 @@ delegated directory do not wait for its ship either. Status:
   the op takes the lease path. An op of this node's own in doubt in a
   lapsed generation settles no earlier than that point and a settle
   window; the root's own settle, parked for a generation it outwaits, is
-  held until the outwait ends. It keeps asking for a renewal
+  held until the outwait ends (at most the settle's cap, below). A requester's
+  settle parked at the root for such a generation is answered `Held` with
+  the outwait that is left (`outwait_ms`) and the requester's second deadline
+  moves to that end plus a settle window, never earlier, never past the
+  settle's start plus two settle windows, one reclaim horizon and two forward
+  timeouts. The settle window is therefore the least a client waits for the
+  unsettled `EIO`: with the defaults (lease TTL 60 s) the worst case is 67 s
+  after the settle began instead of 30 s (37 s more), and only while a live root
+  reports holding the settle; an isolated requester keeps the plain window.
+  It keeps asking for a renewal
   every request timeout: a link that recovers before the root reclaims
   gets the grant back, and only a refusal or the log ends the
   generation. Status: `lapsed`. A lapse is always safe: it only gives up

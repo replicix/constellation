@@ -1071,11 +1071,22 @@ impl Core {
     /// waits on no generation. The root outwaits a silent delegate once its
     /// window runs out, so that is the latest the park waits.
     pub(crate) fn exec_local_park_outwait(&self, rid: Rid) -> Option<WaitMs> {
-        let p = self
+        let id = self
             .rd
             .parked
-            .values()
-            .find(|p| matches!(p.what, ParkedWhat::ExecuteLocal { rid: r } if r == rid))?;
+            .iter()
+            .find(|(_, p)| matches!(p.what, ParkedWhat::ExecuteLocal { rid: r } if r == rid))
+            .map(|(id, _)| *id)?;
+        self.park_outwait_end(id)
+    }
+
+    /// When the latest live generation window ends (the root's wait clock)
+    /// that parked continuation `id` waits on the recall of; `None` if it
+    /// waits on no live generation. Shared by the root's own parked op (held
+    /// past its deadline) and the `Held` a parked settle sends its requester
+    /// (`outwait_ms`).
+    pub(crate) fn park_outwait_end(&self, id: u64) -> Option<WaitMs> {
+        let p = self.rd.parked.get(&id)?;
         p.waiting
             .iter()
             .filter(|w| **w >= super::delegate::DELEG_WAIT_BASE)
@@ -1088,6 +1099,20 @@ impl Core {
                     .map(|_| self.gen_until(gen))
             })
             .max()
+    }
+
+    /// A test's: the first parked continuation's id, and a generation it is
+    /// made to wait on as well.
+    #[cfg(test)]
+    pub(crate) fn first_park_for_tests(&self) -> Option<u64> {
+        self.rd.parked.keys().next().copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn park_waits_on_gen_for_tests(&mut self, id: u64, gen: u64) {
+        if let Some(p) = self.rd.parked.get_mut(&id) {
+            p.waiting.insert(super::delegate::DELEG_WAIT_BASE + gen);
+        }
     }
 
     /// Phase 2b round 2: a local op parked on a recall (`ExecuteLocal`)
@@ -1569,6 +1594,7 @@ impl Core {
                 req,
                 outcome: MutateOutcome::Held {
                     retry_ms: self.cfg.held_retry_ms,
+                    outwait_ms: None,
                 },
                 base: None,
                 position: Position::ZERO,
@@ -1651,6 +1677,18 @@ impl Core {
         // requester caches no holder from it. Plan 43 C2g's sweeps: a
         // requester settling at a delegate cut from its dead root took the
         // delegate for the root and never took the lease over.)
+        // Plan 46 M1.2 step 13: a settle this root holds for the end of a
+        // generation it outwaits says how long (relative, so no clock is
+        // shared): the settling client moves its second deadline past it.
+        let outwait_ms = match self.rd.parked.get(&id) {
+            Some(Parked {
+                what: ParkedWhat::ExecuteReply { settle: true, .. },
+                ..
+            }) => self
+                .park_outwait_end(id)
+                .map(|end| (end.0 - now.wait.0).max(0) as u64),
+            _ => None,
+        };
         let (to, req, held_timer, durable, gen) = match self.rd.parked.get_mut(&id) {
             Some(Parked {
                 what:
@@ -1692,7 +1730,10 @@ impl Core {
                 to: *to,
                 msg: PeerMsg::MutateReply {
                     req,
-                    outcome: MutateOutcome::Held { retry_ms },
+                    outcome: MutateOutcome::Held {
+                        retry_ms,
+                        outwait_ms,
+                    },
                     base: None,
                     position: Position::ZERO,
                     gen,

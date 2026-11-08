@@ -198,6 +198,11 @@ pub(crate) struct GenState {
     /// Placement: since when the delegate's share has been below the
     /// leave threshold (`None`: it is not).
     pub below_since: Option<WaitMs>,
+    /// Plan 46 M1.2 step 13 (review): since when the link to the delegate
+    /// has measured out of the backup RTT budget (`None`: it has not). A
+    /// placed grant is recalled for it only once the measurement persists
+    /// for a placement tick.
+    pub far_since: Option<WaitMs>,
     /// Plan 43 C2e (§3.7): the seals asked of the group's members, by request
     /// id: `(member, strict)`. A *strict* member is one of the latest
     /// `DelegateNodeGroup` version (the end waits for one of them); a best-effort
@@ -2041,6 +2046,7 @@ impl Core {
                         grown_at: None,
                         gate_recalled: false,
                         below_since: None,
+                        far_since: None,
                         seal_reqs: BTreeMap::new(),
                         sealed_tail: None,
                         waiting_for_group: false,
@@ -2708,6 +2714,7 @@ impl Core {
                         req,
                         outcome: MutateOutcome::Held {
                             retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
+                            outwait_ms: None,
                         },
                         base: None,
                         position: Position::ZERO,
@@ -9790,6 +9797,7 @@ impl Core {
                 grown_at: None,
                 gate_recalled: false,
                 below_since: None,
+                far_since: None,
                 seal_reqs: BTreeMap::new(),
                 sealed_tail: None,
                 waiting_for_group: false,

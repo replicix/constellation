@@ -5371,19 +5371,36 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         // (Plan 43 C2: a settled op is no acknowledgement of an effect —
         // settled at its own node it has no row anywhere — and that it never
         // lands is the exactly-once and I4 checks'.)
-        let nowhere: Vec<Rid> = history
-            .returned()
-            .into_iter()
-            .filter(|(_, ret)| *ret != NsRet::Abandoned)
-            .map(|(rid, _)| rid)
-            .filter(|rid| !oracle.completed_at.contains_key(rid))
-            .filter(|rid| {
-                !cluster
+        let nowhere = acked_nowhere(
+            history.returned(),
+            |rid| oracle.completed_at.contains_key(&rid),
+            |rid| {
+                cluster
                     .ids()
                     .into_iter()
-                    .any(|id| super::node::meta_holds_rid(&cluster.get(id).meta, *rid))
-            })
-            .collect();
+                    .any(|id| super::node::meta_holds_rid(&cluster.get(id).meta, rid))
+            },
+            // Plan 46 M1.2 step 13 (`delegated-root-gone+commit` seed 1732): a
+            // lone root's own client was answered on the root's disk alone and
+            // a peer took the lease over by its TTL while the root was down:
+            // the returned root rolled the unshipped answer back. The main
+            // end-of-run path excuses exactly these (above); this one does
+            // too, and no wider.
+            |rid| {
+                lone_answered.contains(&rid)
+                    && cluster.ids().into_iter().any(|id| {
+                        cluster
+                            .get(id)
+                            .shared
+                            .tentative
+                            .lock()
+                            .unwrap()
+                            .contains(&rid)
+                    })
+            },
+        );
+        report.acked_rolled_back = rolled_back_acked;
+        report.lone_rolled_back = rolled_back_lone;
         if !nowhere.is_empty() {
             return Err(format!(
                 "acked_held_somewhere: {} acknowledged rid(s) are in no log, journal, backup tail \
@@ -6574,6 +6591,72 @@ impl tracing_subscriber::fmt::time::FormatTime for SimTime {
             }
             _ => write!(w, "t=?"),
         }
+    }
+}
+
+/// The acknowledged rids a run that ends with a claim waiting for a group's
+/// tail finds in no log, journal, backup tail or member copy (plan 43 C1-3,
+/// `acked_held_somewhere`): not an `Abandoned` answer (no row anywhere, by
+/// the settle), not one the run's oracle saw complete, not one a node holds,
+/// and not a lone root's singleton answer a takeover rolled back
+/// (`lone_rolled_back`).
+fn acked_nowhere(
+    returned: Vec<(Rid, NsRet)>,
+    completed: impl Fn(Rid) -> bool,
+    held: impl Fn(Rid) -> bool,
+    lone_rolled_back: impl Fn(Rid) -> bool,
+) -> Vec<Rid> {
+    returned
+        .into_iter()
+        .filter(|(_, ret)| *ret != NsRet::Abandoned)
+        .map(|(rid, _)| rid)
+        .filter(|rid| !completed(*rid))
+        .filter(|rid| !held(*rid))
+        .filter(|rid| !lone_rolled_back(*rid))
+        .collect()
+}
+
+#[cfg(test)]
+mod acked_nowhere_tests {
+    use super::*;
+
+    fn rid(seq: u64) -> Rid {
+        Rid {
+            node: 1,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    /// The negative control of the `waiting_for_group` check: a singleton
+    /// answer a takeover rolled back is excused, an acked rid that nothing
+    /// excuses (a group-judged answer, an archive-judged one: not
+    /// `lone_answered`, or `lone_answered` but never rolled back) still
+    /// fails, and so does one a node merely lacks.
+    #[test]
+    fn only_a_rolled_back_singleton_answer_is_excused() {
+        let returned = vec![
+            (rid(1), NsRet::Eexist),
+            (rid(2), NsRet::Ok),
+            (rid(3), NsRet::Ok),
+            (rid(4), NsRet::Abandoned),
+            (rid(5), NsRet::Ok),
+            (rid(6), NsRet::Ok),
+        ];
+        let lone: HashSet<Rid> = [rid(1), rid(3)].into_iter().collect();
+        let rolled_back: HashSet<Rid> = [rid(1), rid(2)].into_iter().collect();
+        let held: HashSet<Rid> = [rid(5)].into_iter().collect();
+        let completed: HashSet<Rid> = [rid(6)].into_iter().collect();
+        let nowhere = acked_nowhere(
+            returned,
+            |r| completed.contains(&r),
+            |r| held.contains(&r),
+            |r| lone.contains(&r) && rolled_back.contains(&r),
+        );
+        // 1: lone and rolled back (excused); 2: rolled back but judged by a
+        // group (fails); 3: lone but never rolled back (fails); 4: settled
+        // abandoned; 5: held; 6: completed.
+        assert_eq!(nowhere, vec![rid(2), rid(3)]);
     }
 }
 

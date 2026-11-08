@@ -182,6 +182,13 @@ pub(crate) struct ClientOp {
     /// lease-path execution of it from now on asks for the rid's outcome,
     /// or for its refusal for good, instead of executing it.
     pub settle: bool,
+    /// Plan 46 M1.2 step 13: while `settle`, when the settle's second
+    /// deadline fires (the wait clock), and the latest it may be moved to
+    /// (`settle_cap`: one reclaim horizon, a seal window and a settle window
+    /// past the settle's start). Zero for a settle that started as one (a
+    /// placeholder's): those are never moved.
+    pub settle_until: WaitMs,
+    pub settle_cap: WaitMs,
     /// ADR-44: this settle waits in `Backoff` for a recall this node's
     /// shippable gate sent on demand; the backoff routes it as a settle
     /// again (`settle_route`), where the gate answers it after the cut.
@@ -640,6 +647,8 @@ impl Core {
                 excused: Vec::new(),
                 answered_by: None,
                 settle: false,
+                settle_until: WaitMs(0),
+                settle_cap: WaitMs(0),
                 gate_recall_wait: false,
                 tag,
             },
@@ -1601,12 +1610,33 @@ impl Core {
                 }
             }
             MutateOutcome::Busy => self.retry_or_lease(now, rid, replica, out),
-            MutateOutcome::Held { retry_ms } => {
+            MutateOutcome::Held {
+                retry_ms,
+                outwait_ms,
+            } => {
                 // Plan 30 §M8: executed; the holder is recalling read
                 // delegations before it acknowledges. Ask again (same
                 // rid, no attempt spent) — the holder answers from its
                 // dedup, or holds the retry until the recalls are done.
                 self.stats.held_retries += 1;
+                // Plan 46 M1.2 step 13: the sequencer holds this settle for
+                // the end of a generation it outwaits: its rows land when
+                // that ends and the settle then finds them. The second
+                // deadline moves past it (never earlier), at most to the
+                // settle's cap.
+                if let Some(d) = outwait_ms {
+                    let window = self.cfg.settle_window();
+                    let want = self
+                        .clients
+                        .get(&rid)
+                        .filter(|c| c.settle && c.settle_cap > WaitMs(0))
+                        .map(|c| now.wait.plus(d).plus(window).min(c.settle_cap));
+                    if let Some(want) = want {
+                        if self.extend_settle_deadline(rid, want, None, out) {
+                            self.stats.settles_extended_for_outwait += 1;
+                        }
+                    }
+                }
                 // Plan 46 M0.2 review: a holder answering `Held` is alive
                 // and holding the op by design (behind its replay queue, up
                 // to the placeholder's bound, or for a recall): a replay it
@@ -2578,7 +2608,10 @@ impl Core {
         // (A settle has no effect to order after this node's replays.)
         if !settle && self.hold_for_lost_deps(now, rid, replica, out) {
             // Held (`finish` leaves a held op alone).
-            return MutateOutcome::Held { retry_ms: 0 };
+            return MutateOutcome::Held {
+                retry_ms: 0,
+                outwait_ms: None,
+            };
         }
         self.execute_local(now, rid, epoch, replica, out)
     }
@@ -3503,6 +3536,22 @@ impl Core {
     /// the client hears the unsettled `EIO` (in doubt, retryable by rid:
     /// the rid stays in `in_doubt_rids`; `client_unsettled_eio`).
     ///
+    /// Plan 46 M1.2 step 13: "a settle window later" is the least. Later
+    /// only while a live sequencer says it holds the settle for the end of a
+    /// generation it outwaits (`Held::outwait_ms`: a silent delegate's window,
+    /// which the lease argument forbids cutting short), or while a lapsed
+    /// generation of this node's holding the op's row is ended by the root
+    /// (`own_gen_end_due`): the deadline then moves to that end and a settle
+    /// window, never earlier, and never past `settle_cap`: the settle's start
+    /// plus two settle windows, one reclaim horizon (no renewal is granted
+    /// once a recall starts, so every outwait ends within it) and two forward
+    /// timeouts (a seal window). With the defaults (lease TTL 60 s: a 30 s
+    /// window; 5 s grant TTL, 1 s margin, 0.5 s forward timeout) the worst
+    /// case adds one settle window, the horizon and a seal window: 37 s more to
+    /// the unsettled `EIO`, and only for a settle a live sequencer reports
+    /// holding. An isolated requester, which hears no `Held`, keeps the
+    /// plain window.
+    ///
     /// Why a settled `EIO` means "did not, and will not, happen": the
     /// refusal is a committed row of the sequencer in force for the op's
     /// keys, and every other copy of the op can execute only at a sequencer
@@ -3539,24 +3588,41 @@ impl Core {
             return;
         };
         let second = c.settle;
+        let (recalling, settle_cap) = (c.phase == Phase::Recalling, c.settle_cap);
         // Plan 46 M1.2 step 13 (review): a settle of this node's own op, parked
         // here as the root for the recall of a generation the root outwaits
         // (a silent delegate, an inherited generation), is kept until the
         // outwait ends: the generation's rows, the op's among them, land when
         // it does, and the settle then finds them; a client told `EIO`
-        // before would see the row land after (I4). The window is finite
-        // (the grant's), so this holds the client past its deadline only
-        // once and only by that.
-        if second && c.phase == Phase::Recalling {
+        // before would see the row land after (I4). A `Sealing` generation
+        // resets its end at every expiry pass, so the hold is capped at the
+        // settle's cap: a silent delegate and backups end it in doubt there.
+        if second && recalling && now.wait < settle_cap {
             if let Some(end) = self.exec_local_park_outwait(rid) {
                 if now.wait <= end {
-                    let at = end.plus(self.deleg_request_timeout_ms());
-                    let old = c.deadline;
-                    self.cancel_timer(old, out);
-                    let deadline = self.set_timer_wait(at, Timer::ClientDeadline(rid), out);
-                    self.clients.get_mut(&rid).expect("present").deadline = deadline;
-                    self.stats.settles_held_for_outwait += 1;
-                    return;
+                    let at = end.plus(self.deleg_request_timeout_ms()).min(settle_cap);
+                    if self.extend_settle_deadline(rid, at, Some(now.wait), out) {
+                        self.stats.settles_held_for_outwait += 1;
+                        return;
+                    }
+                }
+            }
+        }
+        // The generation of this node's an op in doubt sits in lapsed after
+        // the first deadline (an acquire deadline short against the grant's
+        // ttl): the root ends it by `deleg_end_due` and the row lands then.
+        if second && settle_cap > WaitMs(0) {
+            if let Some(due) = self.own_gen_end_due(rid, replica) {
+                if due > now.honour {
+                    let rest = due.0.saturating_sub(now.honour.0).max(0) as u64;
+                    let want = now
+                        .wait
+                        .plus(rest + self.cfg.settle_window())
+                        .min(settle_cap);
+                    if self.extend_settle_deadline(rid, want, Some(now.wait), out) {
+                        self.stats.settles_extended_for_lapsed_gen += 1;
+                        return;
+                    }
                 }
             }
         }
@@ -3567,8 +3633,8 @@ impl Core {
         // its deadline. A delegate's park kept the op, deadline spent,
         // and let it go to the lease path with none (the delegate-restart
         // wedge's op was re-sent for 540 s, never in doubt).
-        let unexecuted = c.phase == Phase::Recalling
-            && (self.abort_exec_local_park(rid) || self.abort_deleg_own_park(rid));
+        let unexecuted =
+            recalling && (self.abort_exec_local_park(rid) || self.abort_deleg_own_park(rid));
         let Some(c) = self.clients.get(&rid) else {
             return;
         };
@@ -3679,11 +3745,22 @@ impl Core {
             let rest = due.0.saturating_sub(now.honour.0).max(0) as u64;
             until = until.max(now.wait.plus(rest + window));
         }
+        // The settle may be moved later (the sequencer holding it for a
+        // generation it outwaits, a lapsed generation of this node's), but
+        // never past one reclaim horizon (no renewal after a recall starts),
+        // a seal window and a settle window from here.
+        let cap =
+            until
+                .max(now.wait.plus(
+                    2 * window + self.reclaim_horizon_ms() + 2 * self.cfg.forward_timeout_ms,
+                ));
         let old = c.deadline;
         self.cancel_timer(old, out);
         let deadline = self.set_timer_wait(until, Timer::ClientDeadline(rid), out);
         let c = self.clients.get_mut(&rid).expect("present");
         c.deadline = deadline;
+        c.settle_until = until;
+        c.settle_cap = cap;
         c.settle = true;
         c.attempts = 0;
         c.redirected = 0;
@@ -3695,6 +3772,36 @@ impl Core {
             "deadline: settling the op"
         );
         self.settle_route(now, rid, replica, out);
+    }
+
+    /// Move a settle's second deadline to `at` (the wait clock): cancels the
+    /// armed one and records the new one in `settle_until`. `false` (nothing changed) if the op is
+    /// gone or `at` is not later than the deadline in force: a deadline is
+    /// never shortened.
+    ///
+    /// `fired`: the deadline in force has just fired (at that reading of
+    /// the wait clock), so the new one only has to lie after that; `None`:
+    /// it is still armed, and the new one has to lie after it.
+    fn extend_settle_deadline(
+        &mut self,
+        rid: Rid,
+        at: WaitMs,
+        fired: Option<WaitMs>,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        let Some(c) = self.clients.get(&rid) else {
+            return false;
+        };
+        if at <= fired.unwrap_or(c.settle_until) {
+            return false;
+        }
+        let old = c.deadline;
+        self.cancel_timer(old, out);
+        let deadline = self.set_timer_wait(at, Timer::ClientDeadline(rid), out);
+        let c = self.clients.get_mut(&rid).expect("present");
+        c.deadline = deadline;
+        c.settle_until = at;
+        true
     }
 
     /// When the root ends the lapsed generations of this node's that may

@@ -16934,6 +16934,55 @@ fn a_settle_waiting_for_a_generations_outwait_is_held_and_never_lands_late() {
     }
 }
 
+/// Plan 46 M1.2 step 13 (`long-delegated` seeds 29 and 47): a client's settle
+/// at a root that outwaits the generation of a delegate silent behind a
+/// partition outlasts the outwait (`Held::outwait_ms` moves the client's
+/// second deadline) and is answered, not told an unsettled `EIO` a second or
+/// two before the generation ends. Fails on the parent: two unsettled `EIO`s
+/// per seed ("no sequencer in time").
+#[test]
+fn long_delegated_settles_outlast_the_roots_outwait() {
+    for seed in [29, 47] {
+        let r = run_seed(seed, strict(long_delegated_config(), "unsettled"))
+            .unwrap_or_else(|e| panic!("long-delegated+unsettled seed {seed}: {e}"));
+        assert!(
+            r.stats
+                .values()
+                .map(|s| s.settles_extended_for_outwait)
+                .sum::<u64>()
+                > 0,
+            "seed {seed}: no settle was extended; the seed no longer exercises the path"
+        );
+        assert_eq!(
+            r.unsettled_isolated
+                + r.unsettled_no_sequencer_in_time
+                + r.unsettled_generation_tail_unreachable,
+            0,
+            "seed {seed}: an unsettled EIO was told ({:?})",
+            r.unsettled_causes
+        );
+    }
+}
+
+/// Plan 46 M1.2 step 13 (`delegated-root-gone+commit` seeds 1732, 7363): a
+/// lone root answered its own client on its disk alone (a singleton, plan 46
+/// D3/Q6) and a peer took the lease over by TTL while it was down; the
+/// returned root rolled the answer back and the run ended with the
+/// delegation's seal still waiting. The `waiting_for_group` check called the
+/// rolled-back rid "acked, in no log" though the main end-of-run path excuses
+/// exactly that (`lone_rolled_back`). Fails on the parent: `acked_held_somewhere`.
+#[test]
+fn delegated_root_gone_commit_excuses_a_rolled_back_singleton_answer() {
+    for seed in [1732, 7363] {
+        let r = run_seed(seed, strict(delegated_root_gone_config(), "commit"))
+            .unwrap_or_else(|e| panic!("delegated-root-gone+commit seed {seed}: {e}"));
+        assert!(
+            r.waiting_for_group && r.lone_rolled_back > 0,
+            "seed {seed}: no longer the rolled-back singleton under a waiting seal"
+        );
+    }
+}
+
 /// Plan 43 C2 (D11): `delegated-long-delegation-prod` runs `strict_settle`
 /// clean on a few seeds (the sweeps run 2,000).
 #[test]
@@ -17175,15 +17224,13 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             0,
         ),
         ("flex-crash", flex_crash_config, 125, 9),
-        // (Plan 46 M1.2 step 13: 3 allowed in seeds 0..99, seeds 29 and 47
-        // among them, against 0 on its parent: a client's settle sent to a
-        // root that outwaits the generation of a delegate silent behind a
-        // partition (a cross-subtree op needs both generations recalled)
-        // runs out its window a second or two before the root ends the
-        // generation; the cause the oracle allows, no violation, and no late
-        // landing: `+settle` holds. Not the lapse of a delegate's own grant
-        // (that one is kept, `a_lapsed_grants_own_op_waits_for_the_roots_end_of_the_generation`).)
-        ("long-delegated", long_delegated_config, 0, 3),
+        // (Plan 46 M1.2 step 13: a client's settle sent to a root that
+        // outwaits the generation of a delegate silent behind a partition
+        // used to run out its window a second or two before the root ended
+        // the generation (seeds 29 and 47): the root now says how long it
+        // holds the settle (`Held::outwait_ms`) and the client waits for it,
+        // `long_delegated_settles_outlast_the_roots_outwait`.)
+        ("long-delegated", long_delegated_config, 0, 0),
         ("long-delegated-backup", long_delegated_backup_config, 0, 0),
         (
             "long-delegated-late-answers",

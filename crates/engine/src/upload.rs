@@ -385,6 +385,20 @@ impl UploadRuntime {
         self.s3_waits().stall_in(now_ms, for_ms)
     }
 
+    /// When a chunk PUT (or existence probe) last completed on this node
+    /// (wait-clock ms; 0: none yet): a token that changes while this
+    /// instance uploads. Per instance, not the process's S3 clock.
+    pub(crate) fn last_put_stamp(&self) -> i64 {
+        self.last_put_ms.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A test's stand-in for a chunk PUT completing.
+    #[cfg(test)]
+    pub(crate) fn note_put_for_test(&self, at: i64) {
+        self.last_put_ms
+            .store(at, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The S3 path's waits, a successful chunk PUT counting as an answer.
     pub(crate) fn s3_waits(&self) -> backend::S3Waits {
         backend::S3Waits::now()

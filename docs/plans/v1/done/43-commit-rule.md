@@ -815,6 +815,21 @@ fast-path answer) are C2's.
      `Abandon` until 2 × TTL, then the unsettled `EIO` (§11 Q9, decided
      in favour of keeping the user-visible bound at 2 × TTL; the
      alternative, a second full deadline, would make it 240 s).
+     *Amended (plan 46 M1.2 step 13, 2026-11-08): the second deadline is "a
+     settle window later" at the least. A sequencer that parks the settle for
+     the end of a generation it outwaits (a silent delegate's window: the lease
+     argument forbids cutting it short) says so in its `Held`
+     (`outwait_ms`), and the client moves the deadline to that end plus a
+     settle window; a lapsed generation of the client's own node holding the
+     op's row does the same. The deadline never moves earlier and never past
+     the settle's start plus two settle windows, one reclaim horizon (no
+     renewal is granted once a recall starts) and two forward timeouts (a seal
+     window): with the defaults the unsettled `EIO` of such a settle comes at
+     most 67 s after the settle began instead of 30 s (lease TTL 60 s: 37 s more), and
+     an isolated requester, which hears no `Held`, keeps the plain window.
+     The invariants are unchanged: no answer or commit rule moves, and the
+     rows of the generation land at its end, before the parked settle resumes
+     and dedups on them.*
    - **Shape** (§11 Q15, open): a `settle: bool` flag on
      `PeerMsg::MutateRequest`, the inbox entry and the lease-path submit
      instead of a `MutateOp::Abandon` variant (an op "executed by rid

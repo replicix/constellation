@@ -5808,7 +5808,8 @@ mod own_chunks {
         assert_eq!(
             outcome,
             &MutateOutcome::Held {
-                retry_ms: holder.core.cfg.held_retry_ms
+                retry_ms: holder.core.cfg.held_retry_ms,
+                outwait_ms: None,
             },
             "{reply:?}"
         );
@@ -5902,7 +5903,8 @@ mod own_chunks {
         assert_eq!(
             outcome,
             &MutateOutcome::Held {
-                retry_ms: holder.core.cfg.held_retry_ms
+                retry_ms: holder.core.cfg.held_retry_ms,
+                outwait_ms: None,
             }
         );
         assert_eq!(own, OwnChunks::Upload(vec![ino]));
@@ -5969,7 +5971,10 @@ mod own_chunks {
             from: 1,
             msg: PeerMsg::MutateReply {
                 req: *req,
-                outcome: MutateOutcome::Held { retry_ms: 50 },
+                outcome: MutateOutcome::Held {
+                    retry_ms: 50,
+                    outwait_ms: None,
+                },
                 base: None,
                 position: constellation_meta::Position::ZERO,
                 gen: 0,
@@ -13732,7 +13737,10 @@ fn a_held_forward_executes_locally_once_the_delegation_installs() {
         from: 2,
         msg: PeerMsg::MutateReply {
             req,
-            outcome: MutateOutcome::Held { retry_ms: 50 },
+            outcome: MutateOutcome::Held {
+                retry_ms: 50,
+                outwait_ms: None,
+            },
             base: None,
             position: constellation_meta::Position::ZERO,
             gen: 0,
@@ -13811,7 +13819,10 @@ fn an_op_held_by_the_root_is_asked_again_there() {
         from: 2,
         msg: PeerMsg::MutateReply {
             req,
-            outcome: MutateOutcome::Held { retry_ms: 50 },
+            outcome: MutateOutcome::Held {
+                retry_ms: 50,
+                outwait_ms: None,
+            },
             base: None,
             position: constellation_meta::Position::ZERO,
             gen: 0,
@@ -33890,6 +33901,95 @@ mod s3_no_loops {
         );
     }
 
+    /// Plan 46 M1.2 step 13: the root's `Held` to a settle it parks for the
+    /// recall of a generation it outwaits says how long it holds it
+    /// (`outwait_ms`, the generation's window left); with two generations
+    /// the later one. Fails on the parent: no such field (`None`).
+    #[test]
+    fn a_parked_settles_held_says_how_long_the_root_outwaits() {
+        let (mut h, dir, gen) = delegated_root();
+        h.core.start_recall(h.clk(), gen, &mut Vec::new());
+        let out = forward(&mut h, 2, 7, dir, true);
+        assert!(h.core.has_exec_parks(), "not parked: {out:?}");
+        let timer = timers(&out, TimerKind::HeldReply)[0];
+        let out = h.step(Event::Timer { id: timer });
+        let left = h.core.gen_until(gen).since(h.clk().wait) as u64;
+        assert!(left > 0);
+        assert!(
+            matches!(
+                reply_to(&out, 2, 7),
+                Some(MutateOutcome::Held { outwait_ms: Some(ms), .. }) if ms == left
+            ),
+            "{out:?}"
+        );
+        // A second generation the park waits on, ending later: the max.
+        let id = h.core.first_park_for_tests().expect("parked");
+        let mut g2 = h.core.dl.gens[&gen].clone();
+        g2.ended = false;
+        h.core.dl.gens.insert(gen + 100, g2);
+        h.core
+            .dw
+            .insert(gen + 100, 3, h.clk().wait.plus(9_000), h.clk().wait, false);
+        h.core.park_waits_on_gen_for_tests(id, gen + 100);
+        assert_eq!(
+            h.core.park_outwait_end(id),
+            Some(h.clk().wait.plus(9_000).max(h.core.gen_until(gen)))
+        );
+    }
+
+    /// Plan 46 M1.2 step 13 (review MUST): the root's own settle parked on a
+    /// `Sealing` generation, whose end the expiry pass moves again at every
+    /// pass, is held only up to the settle's cap and then told in doubt. Fails
+    /// on the parent: held for ever.
+    #[test]
+    fn a_settle_held_for_a_sealing_generation_ends_at_the_cap() {
+        let (mut h, dir, gen) = delegated_root();
+        let rid = h.rid(1);
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Create {
+                parent: dir,
+                name: "own".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            tag: Default::default(),
+        });
+        h.core.start_recall(h.clk(), gen, &mut Vec::new());
+        let deadline = h.core.clients[&rid].deadline;
+        h.step(Event::Timer { id: deadline });
+        assert!(h.core.exec_local_park_outwait(rid).is_some());
+        h.core.dl.gens.get_mut(&gen).unwrap().recall = RecallPhase::Sealing;
+        let cap = h.core.clients[&rid].settle_cap;
+        let seal = h.core.cfg.forward_timeout_ms * 2;
+        let mut told = false;
+        for _ in 0..200 {
+            let until = h.core.clients[&rid].settle_until;
+            h.advance(until.since(h.clk().wait).max(0) as u64);
+            // The expiry pass moves the end again.
+            h.core.dw.set_until_for_tests(gen, h.clk().wait.plus(seal));
+            let id = h.core.clients[&rid].deadline;
+            let out = h.step(Event::Timer { id });
+            if replies(&out)
+                .iter()
+                .any(|(r, a)| *r == rid && matches!(a, ClientReply::InDoubt))
+            {
+                told = true;
+                break;
+            }
+        }
+        assert!(told, "held for ever");
+        assert!(
+            h.clk().wait <= cap.plus(1),
+            "{:?} past {cap:?}",
+            h.clk().wait
+        );
+    }
+
     fn reply_to(out: &[Action], to: NodeId, req: u64) -> Option<MutateOutcome> {
         sends(out).into_iter().find_map(|(n, m)| match m {
             PeerMsg::MutateReply {
@@ -44618,6 +44718,53 @@ mod deleg_group {
         );
     }
 
+    /// Plan 46 M1.2 step 13 (review SHOULD): a generation that lapses during
+    /// the settle (after the first deadline) is seen at the second: the
+    /// deadline moves to the root's end of it and a settle window instead of
+    /// telling the client `EIO` before the row lands. Fails on the parent:
+    /// told in doubt at the second deadline.
+    #[test]
+    fn a_generation_that_lapses_during_the_settle_extends_the_second_deadline() {
+        let (mut h, rid, lapse_at, end_due) = lapse_with_a_parked_own_op();
+        h.now = Ms(lapse_at.0 - 10);
+        let ids = h.core.stream_parks_of(7);
+        let mut out = Vec::new();
+        h.core.abort_park_busy(h.clk(), ids[0], &h.meta, &mut out);
+        let deadline = h.core.clients[&rid].deadline;
+        h.step(Event::Timer { id: deadline });
+        assert!(h.core.clients[&rid].settle, "not settling");
+        h.now = lapse_at;
+        let id = h.core.dl.mine[&7].lapse_timer.expect("the lapse watch");
+        h.step(Event::Timer { id });
+        h.now = Ms(lapse_at.0 + 10);
+        let deadline = h.core.clients[&rid].deadline;
+        let out = h.step(Event::Timer { id: deadline });
+        assert!(
+            !replies(&out)
+                .iter()
+                .any(|(r, a)| *r == rid && matches!(a, ClientReply::InDoubt)),
+            "told in doubt before the root ends the generation: {out:?}"
+        );
+        let window = h.core.cfg.settle_window();
+        let after = out
+            .iter()
+            .find_map(|a| match a {
+                Action::SetTimer {
+                    after_ms,
+                    kind: TimerKind::ClientDeadline,
+                    ..
+                } => Some(*after_ms),
+                _ => None,
+            })
+            .expect("the settle's deadline moved");
+        assert!(
+            after >= end_due.0 as u64 - h.now.0 as u64 + window,
+            "deadline in {after} ms; the generation ends in {} and the window is {window}",
+            end_due.0 - h.now.0
+        );
+        assert_eq!(h.core.stats.settles_extended_for_lapsed_gen, 1);
+    }
+
     /// C2g's review, SHOULD 2: a delegate settling its own node's op
     /// journals the refusal for the group, never `Lone`, and answers it once
     /// the root's append holds it. Fails on the parent: journaled `Lone` and
@@ -54841,6 +54988,90 @@ mod c2g_settle {
         })
     }
 
+    /// Plan 46 M1.2 step 13 (`long-delegated` seeds 29 and 47): a settle the
+    /// sequencer says it holds for the end of a generation it outwaits
+    /// (`Held { outwait_ms }`) moves the client's second deadline past that
+    /// end and a settle window (never earlier, never past the settle's cap);
+    /// a `Held` without it leaves the deadline. Fails on the parent: the
+    /// client hears in doubt at the old deadline, 1-2 s before the root ends
+    /// the generation.
+    #[test]
+    fn a_held_settle_with_an_outwait_moves_the_second_deadline() {
+        let settling = || {
+            let (_holder, mut requester) = pair();
+            let rid = requester.rid(1);
+            let out = requester.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op: requester.create("x"),
+                tag: Default::default(),
+            });
+            let first = deadline_timer(&requester, &out);
+            let cfg = requester.core.config().clone();
+            requester.advance(cfg.acquire_deadline_ms - cfg.settle_window());
+            let out = requester.step(Event::Timer { id: first });
+            let Some(PeerMsg::MutateRequest {
+                req, settle: true, ..
+            }) = forward_to_1(&out)
+            else {
+                panic!("no settle: {out:?}");
+            };
+            (requester, rid, req)
+        };
+        let held = |req: OpId, outwait_ms: Option<u64>| Event::Peer {
+            from: 1,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Held {
+                    retry_ms: 10,
+                    outwait_ms,
+                },
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+            },
+        };
+        // 4 s of outwait: the deadline moves to now + 4 s + a window.
+        let (mut r, rid, req) = settling();
+        let window = r.core.config().settle_window();
+        let old = r.core.clients[&rid].deadline;
+        let first_until = r.core.clients[&rid].settle_until;
+        r.step(held(req, Some(4_000)));
+        let c = &r.core.clients[&rid];
+        assert!(c.settle_until >= r.clk().wait.plus(4_000 + window), "{c:?}");
+        assert!(c.settle_until <= c.settle_cap);
+        assert_ne!(c.deadline, old, "the deadline was not re-armed");
+        assert_eq!(r.core.stats.settles_extended_for_outwait, 1);
+        // At the old deadline nothing is answered.
+        r.advance(first_until.since(r.clk().wait).max(0) as u64);
+        let out = r.step(Event::Timer { id: old });
+        assert!(replies(&out).is_empty(), "{out:?}");
+        let until = r.core.clients[&rid].settle_until;
+        r.advance(until.since(r.clk().wait).max(0) as u64);
+        let id = r.core.clients[&rid].deadline;
+        let out = r.step(Event::Timer { id });
+        assert!(
+            replies(&out)
+                .iter()
+                .any(|(x, a)| *x == rid && matches!(a, ClientReply::InDoubt)),
+            "{out:?}"
+        );
+        // An endless outwait lands at the cap.
+        let (mut r, rid, req) = settling();
+        r.step(held(req, Some(10_000_000)));
+        let c = &r.core.clients[&rid];
+        assert_eq!(c.settle_until, c.settle_cap);
+        // None: the deadline stays.
+        let (mut r, rid, req) = settling();
+        let old = r.core.clients[&rid].deadline;
+        r.step(held(req, None));
+        assert_eq!(r.core.clients[&rid].deadline, old);
+        assert_eq!(r.core.stats.settles_extended_for_outwait, 0);
+    }
+
     /// A forward whose holder never answered (the request lost): at the
     /// deadline, a settle window before the old one, the requester settles
     /// the rid instead of answering in doubt — one settle, under the same
@@ -55433,7 +55664,8 @@ mod c2g_settle {
         assert_eq!(
             reply_to_3(&out, 7),
             Some(MutateOutcome::Held {
-                retry_ms: h.core.cfg.recall_hold_ms.max(50)
+                retry_ms: h.core.cfg.recall_hold_ms.max(50),
+                outwait_ms: None,
             }),
             "{out:?}"
         );
@@ -57314,7 +57546,10 @@ fn a_delegates_held_answer_is_not_the_roots() {
         from: 3,
         msg: PeerMsg::MutateReply {
             req,
-            outcome: MutateOutcome::Held { retry_ms: 10 },
+            outcome: MutateOutcome::Held {
+                retry_ms: 10,
+                outwait_ms: None,
+            },
             base: None,
             position: constellation_meta::Position::ZERO,
             gen: 7,
@@ -59228,7 +59463,10 @@ mod await_retry {
             from: 1,
             msg: PeerMsg::MutateReply {
                 req,
-                outcome: MutateOutcome::Held { retry_ms: 100 },
+                outcome: MutateOutcome::Held {
+                    retry_ms: 100,
+                    outwait_ms: None,
+                },
                 base: None,
                 position: constellation_meta::Position::ZERO,
                 gen: 0,
@@ -60861,8 +61099,11 @@ mod step9_one_stream_per_node {
     /// Plan 46 M1.2 step 13 (review SHOULD): a node granted while its link
     /// to the root was not measured (an unmeasured link counts as in budget)
     /// that is measured far afterwards has no group within budget: the
-    /// placement recalls its grant and does not grant it again. Fails on the
-    /// parent: the far node kept the grant and answered on its disk alone.
+    /// placement recalls its grant and does not grant it again, once the
+    /// measurement has held for a placement tick (one sample does not
+    /// recall) and counting the recall once. Fails on the parent: the first
+    /// far sample recalled, and every evaluation of the recalling grant
+    /// counted again.
     #[test]
     fn placement_recalls_a_grant_to_a_node_measured_far_afterwards() {
         let (mut h, dirs) = root_with_peer(None);
@@ -60878,12 +61119,35 @@ mod step9_one_stream_per_node {
         tick(&mut h);
         assert_eq!(h.core.stats.place_delegated, 1);
         assert_eq!(h.core.stats.place_recalled, 0);
-        // The link is measured: far.
+        // The link is measured far by one sample: no recall yet (a round
+        // trip inflated by load), and a sample back in budget forgets it.
+        let tick_ms = (h.core.cfg.placement_window_ms / 10).max(100);
         link_to_2(&mut h, Some(500));
         h.advance(400);
         for _ in 0..40 {
             h.core.place_note(2, [dirs[1]]);
         }
+        let out = tick(&mut h);
+        assert_eq!(h.core.stats.place_recalled, 0, "{out:?}");
+        link_to_2(&mut h, Some(1));
+        h.advance(tick_ms + 1);
+        tick(&mut h);
+        assert_eq!(h.core.stats.place_recalled, 0);
+        assert!(h.core.dl.gens.values().all(|g| g.far_since.is_none()));
+        // Far again, and still far a placement tick later: recalled, once.
+        link_to_2(&mut h, Some(500));
+        h.advance(400);
+        tick(&mut h);
+        assert_eq!(h.core.stats.place_recalled, 0);
+        h.advance(tick_ms + 1);
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        let out = tick(&mut h);
+        assert_eq!(h.core.stats.place_recalled, 1, "{out:?}");
+        assert_eq!(h.core.stats.deleg_recalls_sent, 1, "{out:?}");
+        // The recall under way is neither counted nor sent again.
+        h.advance(tick_ms + 1);
         let out = tick(&mut h);
         assert_eq!(h.core.stats.place_recalled, 1, "{out:?}");
         assert_eq!(h.core.stats.deleg_recalls_sent, 1, "{out:?}");

@@ -318,24 +318,38 @@ impl Core {
             // Plan 46 M1.2 step 13: a node granted while its link to the root
             // was not measured (what is not known to be far is not refused)
             // that is measured far now has no group within budget: its
-            // grant is recalled at once (no dwell: it answers its clients
-            // on a disk no group backs), and the placement does not grant it
-            // again while it stays far.
-            if !self.delegate_group_in_budget(node) {
-                for dir in &dirs {
-                    self.pl
-                        .cooldown
-                        .insert(*dir, now.wait.plus(self.cfg.placement_cooldown_ms));
+            // grant is recalled, and the placement does not grant it again
+            // while it stays far. One sample over budget (a round trip
+            // inflated by load) does not recall: the measurement must still
+            // hold a placement tick later, and a recall already under way is
+            // neither counted nor its cooldown pushed again. (The delegate's
+            // answers wait for its group meanwhile; none is given on its
+            // disk alone.)
+            let in_budget = self.delegate_group_in_budget(node);
+            let g = self.dl.gens.get_mut(&gen).expect("present");
+            if in_budget {
+                g.far_since = None;
+            } else {
+                let since = *g.far_since.get_or_insert(now.wait);
+                if g.recall != crate::core::delegate::RecallPhase::None {
+                    continue;
                 }
-                self.stats.place_recalled += 1;
-                tracing::info!(
-                    node = self.cfg.node_id,
-                    dirs = ?dirs,
-                    delegate = node,
-                    gen = %constellation_meta::delegation::GenLabel::of(gen),
-                    "placement recalls a delegation (its link is measured out of the backup budget)"
-                );
-                self.start_recall(now, gen, out);
+                if now.wait.since(since) >= self.placement_tick_ms() as i64 {
+                    for dir in &dirs {
+                        self.pl
+                            .cooldown
+                            .insert(*dir, now.wait.plus(self.cfg.placement_cooldown_ms));
+                    }
+                    self.stats.place_recalled += 1;
+                    tracing::info!(
+                        node = self.cfg.node_id,
+                        dirs = ?dirs,
+                        delegate = node,
+                        gen = %constellation_meta::delegation::GenLabel::of(gen),
+                        "placement recalls a delegation (its link is measured out of the backup budget)"
+                    );
+                    self.start_recall(now, gen, out);
+                }
                 continue;
             }
             // A stream is recalled whole (step 9; a partial release is step

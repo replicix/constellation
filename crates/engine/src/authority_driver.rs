@@ -6439,17 +6439,21 @@ impl Driver {
                     });
                     let store = self.deps.store_inner.clone();
                     let meta = self.deps.meta.clone();
+                    let upload = self.deps.upload.clone();
                     let node_id = self.node_id;
                     let int_tx = self.int_tx.clone();
                     tokio::spawn(async move {
                         // What moves while the flush works: this node's rows
-                        // shipped (the acknowledged watermark). Not S3
-                        // answering: that clock is the process's, and other
-                        // traffic through it would keep a flush stuck behind
-                        // this node's own unreachable store looking alive.
+                        // shipped (the acknowledged watermark) and its own
+                        // chunk uploads completing (a flush of a large
+                        // backlog spends minutes uploading before any row
+                        // acks). Not S3 answering: that clock is the
+                        // process's, and other traffic through it would
+                        // keep a flush stuck behind this node's own
+                        // unreachable store looking alive.
                         let progress = {
-                            let meta = meta.clone();
-                            move || meta.journal_acked_seq().unwrap_or(0)
+                            let (meta, upload) = (meta.clone(), upload.clone());
+                            move || leave_progress(&meta, &upload)
                         };
                         let retire = {
                             let (store, meta) = (store.clone(), meta.clone());
@@ -6488,6 +6492,16 @@ impl Driver {
             }
         }
     }
+}
+
+/// What moves while a self-leave's journal flush works: the acknowledged
+/// watermark, and when this node's own uploader (this instance, not the
+/// process's S3 clock) last completed a chunk PUT.
+fn leave_progress(meta: &Meta, upload: &crate::upload::UploadRuntime) -> (u64, i64) {
+    (
+        meta.journal_acked_seq().unwrap_or(0),
+        upload.last_put_stamp(),
+    )
 }
 
 /// How long a self-leave's journal flush may go without progress, and how
@@ -7970,6 +7984,26 @@ mod tests {
     use super::{LeaseMode, LeaseStore, PARTITION};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// Step 13 review: a leave's flush that spends minutes uploading dirty
+    /// chunks before any row acks is making progress: the token moves with
+    /// this node's own uploader (this instance), not only with the
+    /// acknowledged watermark. Fails on the parent: the token is the
+    /// watermark alone and does not change while chunks go up.
+    #[test]
+    fn the_leave_progress_token_moves_with_this_nodes_chunk_uploads() {
+        let meta = constellation_meta::Meta::open_in_memory().unwrap();
+        let upload = crate::upload::UploadRuntime::for_test(true);
+        let before = super::leave_progress(&meta, &upload);
+        assert_eq!(super::leave_progress(&meta, &upload), before);
+        upload.note_put_for_test(1_234);
+        assert_ne!(super::leave_progress(&meta, &upload), before);
+        // Another instance's uploads do not move it.
+        let other = crate::upload::UploadRuntime::for_test(true);
+        let mine = super::leave_progress(&meta, &upload);
+        other.note_put_for_test(9_999);
+        assert_eq!(super::leave_progress(&meta, &upload), mine);
+    }
 
     /// Step 11 re-review 3 and step 13: a self-leave whose journal flush makes
     /// no progress (a store that cannot be reached) fails at its bound and

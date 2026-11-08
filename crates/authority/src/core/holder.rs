@@ -180,6 +180,7 @@ impl Core {
                         req,
                         outcome: MutateOutcome::Held {
                             retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
+                            outwait_ms: None,
                         },
                         base: None,
                         position: Position::ZERO,
@@ -221,6 +222,7 @@ impl Core {
                             req,
                             outcome: MutateOutcome::Held {
                                 retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
+                                outwait_ms: None,
                             },
                             base: None,
                             position: Position::ZERO,
@@ -248,6 +250,7 @@ impl Core {
                     self.stats.gate_settles_held += 1;
                     MutateOutcome::Held {
                         retry_ms: self.cfg.recall_hold_ms.max(50),
+                        outwait_ms: None,
                     }
                 }
                 GateSettle::Redirect(holder) => {
@@ -279,6 +282,7 @@ impl Core {
                     self.stats.gate_settles_held_executed += 1;
                     MutateOutcome::Held {
                         retry_ms: self.cfg.recall_hold_ms.max(50),
+                        outwait_ms: None,
                     }
                 }
                 GateSettle::Answer(epoch) => {
@@ -321,6 +325,7 @@ impl Core {
                 self.stats.gate_settles_held += 1;
                 MutateOutcome::Held {
                     retry_ms: self.cfg.recall_hold_ms.max(50),
+                    outwait_ms: None,
                 }
             } else if !self.lease.releasing && req != OpId(0) && self.readopting() {
                 // A-1: the gate of a re-adoption started for a forward;
@@ -329,6 +334,7 @@ impl Core {
                 self.stats.readopt_for_forward += 1;
                 MutateOutcome::Held {
                     retry_ms: self.cfg.recall_hold_ms.max(50),
+                    outwait_ms: None,
                 }
             } else {
                 MutateOutcome::Busy
@@ -387,6 +393,7 @@ impl Core {
                         let outcome = if from == d.node {
                             MutateOutcome::Held {
                                 retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
+                                outwait_ms: None,
                             }
                         } else {
                             MutateOutcome::NotHolder { holder: d.node }
@@ -602,6 +609,7 @@ impl Core {
             self.stats.readopt_for_forward += 1;
             MutateOutcome::Held {
                 retry_ms: self.cfg.recall_hold_ms.max(50),
+                outwait_ms: None,
             }
         } else {
             let holder = self.lease.cached_holder.unwrap_or(0);

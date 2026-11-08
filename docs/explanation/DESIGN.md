@@ -798,6 +798,11 @@ Only when no
 sequencer answers within the rest of the deadline (twice
 the lease TTL: an isolated requester) does the client hear the *unsettled*
 `EIO`, retryable by rid, which may still land (`client_unsettled_eio`). The
+settle window is the least: a root that holds the settle for the end of a
+generation it outwaits says so (`Held`'s `outwait_ms`) and the client waits for
+it, at most two settle windows, a reclaim horizon and a seal window past the
+settle's start (67 s after it with the defaults instead of 30 s;
+[ADR-18](DECISIONS.md#adr-18-exactly-once-forwarding-with-request-ids)). The
 same identity makes replays, backup re-shipping, inbox drains and delegate
 streams exactly-once without further machinery
 ([ADR-18](DECISIONS.md#adr-18-exactly-once-forwarding-with-request-ids),

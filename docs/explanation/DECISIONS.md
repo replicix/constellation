@@ -350,6 +350,11 @@ delegation's drained stream). No answer within the window is the unsettled
 `EIO` (in doubt, as before; counted). An op that never left its node is
 settled there at once. An answer in a continuation epoch's hold is the
 hold's, uncommitted (C2f): its settled `EIO` is as strong as the hold.
+*Amended (plan 46 M1.2 step 13)*: the window is the least. A root that holds
+the settle for a generation's outwait says how long (`Held { outwait_ms }`)
+and the client moves its second deadline past it, capped at the settle's
+start plus two windows, a reclaim horizon and a seal window (67 s after it
+with the defaults instead of 30 s: 37 s more).
 Rejected: a second full deadline for the settle (240 s to an `EIO`), and a
 `MutateOp::Abandon` (it would reach the fast path, the replay queue and the
 inbox format).
