@@ -4587,6 +4587,14 @@ impl Core {
         if after > before && self.lease.ack_policy() == AckPolicy::Backup {
             self.stream_ahead_soon(now, replica, out);
         }
+        if after > before {
+            // Rows became committed: an op awaiting the log whose outcome
+            // is a delegate's row this node appended (`holder_append_
+            // uncommitted`) is answerable now, as it is when a segment lands
+            // (`ship_landed`); nothing else re-checks it before the next
+            // ship or batch.
+            self.answer_awaiting_log(now, replica, out);
+        }
         // `backup_after_event` streams the next batch and releases the
         // parked acknowledgements.
     }

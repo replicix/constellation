@@ -46198,19 +46198,164 @@ mod deleg_group {
         let mut out = Vec::new();
         h.core.answer_awaiting_log(h.clk(), &h.meta, &mut out);
         assert!(client_answers(&out).is_empty(), "{out:?}");
-        // The row ships: the log carries it, and the client hears it.
-        let batch = Replica::take_journal(&h.meta, 100).unwrap();
-        let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
-        Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
-        h.core.note_shipped(&seqs, 0);
-        assert!(h.core.completed_row_settled(rid, &h.meta));
-        let mut out = Vec::new();
-        h.core.answer_awaiting_log(h.clk(), &h.meta, &mut out);
+        // The row ships (a round, as the node runs it): the segment's
+        // landing is what answers the client, with no other event after it.
+        let landed = ship_one_segment(&mut h);
         assert_eq!(
-            client_answers(&out),
+            client_answers(&landed),
             vec![(rid, AnswerSource::Sequenced(RowCommit::ARCHIVE))],
-            "{out:?}"
+            "{landed:?}"
         );
+    }
+
+    /// Runs the node's next round up to its first `SegmentPut`, answers that
+    /// put, and returns what the landing alone produced (nothing answers the
+    /// round's other requests but a plain success).
+    fn ship_one_segment(h: &mut Harness) -> Vec<Action> {
+        let mut out = Vec::new();
+        h.core.start(h.clk(), &h.meta, &mut out);
+        let poll = timers(&out, TimerKind::Poll)[0];
+        let mut acts = h.step(Event::Timer { id: poll });
+        for _ in 0..20 {
+            if let Some(upload) = acts.iter().find_map(|a| match a {
+                Action::UploadDirtyChunks { op, .. } => Some(*op),
+                _ => None,
+            }) {
+                acts = h.step(Event::UploadsDone {
+                    op: upload,
+                    result: UploadResult::Done { held: 0 },
+                });
+                continue;
+            }
+            let Some((op, req)) = s3_ops(&acts)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+                .map(|(o, r)| (o, r.clone()))
+            else {
+                break;
+            };
+            let result = match req {
+                S3Op::SegmentPut { .. } => {
+                    return h.step(Event::S3 {
+                        op,
+                        result: S3Result::SegmentPut(Ok(())),
+                    });
+                }
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+                S3Op::LeaseSwap { .. } => S3Result::LeasePut(Ok(tag())),
+                other => panic!("unexpected S3 op before the segment: {other:?}"),
+            };
+            acts = h.step(Event::S3 { op, result });
+        }
+        panic!("the round never put a segment: {acts:?}");
+    }
+
+    /// The same lost wake-up through the backup (plan 46 M0.3): a backed
+    /// root's own forwarded op, whose reply came before the delegate's
+    /// batch, waits for the appended row to commit, and the commit is the
+    /// backup's acknowledgement (`durable_jseq` rises), not a ship. The ack
+    /// answers the op at once; before, nothing re-ran `answer_awaiting_log`
+    /// until the next segment landed or the next batch came.
+    /// Fails before: no answer at the backup's acknowledgement.
+    #[test]
+    fn a_roots_op_awaiting_a_delegates_row_is_answered_when_the_backups_ack_commits_it() {
+        let mut h = root_backed_by_node_2();
+        let dir = delegated_to_me(&h.meta, 3);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(1),
+                gen: 7,
+                round: 1,
+                backup: None,
+                stream_head: 0,
+                stream_head_at: 0,
+                first: false,
+            },
+        });
+        let rid = h.rid(1);
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Create {
+                parent: dir,
+                name: "f".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            tag: Default::default(),
+        });
+        if let Some(t) = h.core.clients.get_mut(&rid).unwrap().timer.take() {
+            h.core.timers.remove(&t);
+        }
+        // The op is in flight to the delegate (its reply came without the
+        // base): no local execution parked behind a recall.
+        h.core.rd.parked_local.remove(&rid);
+        h.core.dl.pending_exec.remove(&rid);
+        h.core.clients.get_mut(&rid).unwrap().phase = client::Phase::AwaitingLog {
+            epoch: 1,
+            position: constellation_meta::Position::ZERO,
+        };
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegateStream {
+                req: OpId(10),
+                gen: 7,
+                round: 1,
+                txs: vec![constellation_meta::DelegateTx {
+                    idx: 1,
+                    rid: Some(rid),
+                    records: vec![
+                        LogRecord::Create {
+                            parent: dir,
+                            name: "f".into(),
+                            ino,
+                            mode: 0o644,
+                            uid: 0,
+                            gid: 0,
+                            time_ns: 1,
+                        },
+                        LogRecord::Completed { rid },
+                    ],
+                    deps: Default::default(),
+                }],
+                leaving: Vec::new(),
+                leaving_barriers: Vec::new(),
+                released: None,
+            },
+        });
+        assert!(h.core.holder_append_uncommitted(7, 1, &h.meta));
+        assert!(client_answers(&out).is_empty(), "{out:?}");
+        let (breq, tip) = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::BackupAppend { req, txs, .. } if to == 2 => {
+                    Some((*req, txs.last().map_or(0, |t| t.last)))
+                }
+                _ => None,
+            })
+            .expect("the append is not sent to the backup");
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::BackupAck {
+                req: breq,
+                epoch: 1,
+                acked: tip,
+                sealed: false,
+                fresh: false,
+            },
+        });
+        assert!(!h.core.holder_append_uncommitted(7, 1, &h.meta));
+        let answers = client_answers(&out);
+        assert_eq!(answers.len(), 1, "{out:?}");
+        assert_eq!(answers[0].0, rid);
     }
 
     /// A root's lease with node 2 as its one backup, held at epoch 1: its

@@ -68851,11 +68851,20 @@ placement's recall of the delegation. Cause: the reply of the delegate (`Accepte
 the op waited for the log (`ack.awaited_log` 1); the batch appended the row, `holder_append_uncommitted` kept the op waiting, the row shipped 6 ms later, and `ship_landed`
 called `answer_awaiting_log` only inside a takeover gate. With the git turn waiting on that op, no further batch came. `ship_landed` now calls it for every tenure. Evidence: with
 16 busy loops on the 16-core box, `git-under-flock-b2b` failed 4 of 4 before (seeds 44, 44, 44, 46; one run with heavy debug logging at seed 45 passed) and passed 3 of 3 after (44, 46, 47); `git-under-flock-rounds` seed 42 passed
-under the same load. Not reproducible without load (it passes on an idle box with the ordering the other way round). No unit test: a faithful one needs the root's own
-client op awaiting the log behind a backed tenure's unshipped append of a delegate row, which the core harness's `hold` turns into a parked answer instead.
+under the same load. Not reproducible without load (it passes on an idle box with the ordering the other way round). Core tests follow in the next entry.
 
 ## 2026-11-08 writeback-fsync: phase 2 waits for the holder's backup
 
 `writeback-fsync` phase 2 asserted "the back close left nothing queued on A" before B had a backup. An unbacked holder answers a non-owner's close `Upload` (31a461cd), so A
 uploaded at once and nothing was queued. The scenario now waits for B's backup first (`m9::wait_for_backup`); passes at seeds 42, 43, 44 (failed at 42 before). No data was lost:
 phase 1 (the fsynced prefix after kill -9) and phase 2 (B reads A's fsynced content with A dead) both held.
+
+## 2026-11-08 Fail-before tests for the ship wake-up; the same wake-up at a backup's acknowledgement
+
+`a_root_does_not_answer_its_own_forwarded_op_from_its_unshipped_append_of_a_delegates_row` now ends with a real round: the root's next segment is put and its landing alone
+answers the client (`Sequenced(ARCHIVE)`); with the `ship_landed` call gated by the takeover gate again, the landing produces nothing. The same lost wake-up existed when a
+backup's acknowledgement commits the appended row (`durable_jseq` rises in `on_backup_ack`): nothing re-ran `answer_awaiting_log` until the next ship or batch. `on_backup_ack`
+now calls it when the durable watermark rose; test `a_roots_op_awaiting_a_delegates_row_is_answered_when_the_backups_ack_commits_it` (fails before: no answer at the ack).
+`release_exec_parks_completed` needs no such hook: it releases a park on the rid's outcome being in the journal (`completed_position`), which neither a ship nor an ack changes;
+the durability wait it hands to `complete_ready` is released by `backup_after_event`. `writeback-fsync` no longer covers an unbacked holder's close `Upload`; the `Unbacked` mode of
+`writeback-close-metered-nonowner` does (asserts `pending_uploads == 0`, chunk PUTs and the data readable), so no phase was added.
