@@ -1030,6 +1030,208 @@ fn delegate_crash_with(scenario: &'static str, default_ttl: Option<u64>) -> Resu
     result
 }
 
+/// Plan 46 M1.3 step 13: the sticky holder of `d1` is killed; its subtree
+/// blocks (`EROFS`) for longer than the delegation TTL (a sticky grant is not
+/// TTL-ended); `repair abandon --node b` is refused without `--force` within
+/// the TTL of the kill, and with it ends the stream after the read
+/// delegations `b` granted are recalled (or waited out). Then `c` writes
+/// through the root, no read is served under `b`'s old grant, `b` returns with
+/// its journal and its acknowledged rows past the cut replay by rid (a name
+/// the root gave to `c` meanwhile becomes a `.constellation-conflict/` copy),
+/// and `b` can be granted again at a higher generation.
+pub fn sticky_abandon(_seed: u64) -> Result<()> {
+    const SCENARIO: &str = "sticky-abandon";
+    // `CONSTELLATION_READ_DELEGATION_TTL_MS` (default) plus the expiry margin.
+    const READ_WAIT_MS: u64 = 5_000 + 1_000;
+    let (_env, _root, mut clients, _) = cluster(
+        SCENARIO,
+        &["a", "b", "c"],
+        &[("CONSTELLATION_CTO", "strict")],
+        0,
+    )?;
+    let result = (|| -> Result<()> {
+        let a = &clients[0];
+        let b = &clients[1];
+        let c = &clients[2];
+        let b_id = node_id(b)?;
+        std::fs::create_dir(a.mnt.join("d1"))?;
+        for x in [b, c] {
+            eventually("dir visible", Duration::from_secs(20), || {
+                anyhow::ensure!(x.mnt.join("d1").is_dir());
+                Ok(())
+            })?;
+        }
+        a.control(
+            "designation.delegate",
+            serde_json::json!({"path": "/d1", "node": b_id, "sticky": true}),
+        )
+        .context("delegating --sticky /d1 to b")?;
+        let gen = wait_installed(b, "/d1", Duration::from_secs(20))?;
+        // b writes 40 files, `x` (c will read it under a read delegation of
+        // b) and `b-last`, killed right after its ack (it may not have
+        // streamed).
+        let (names_b, _) = write_files(b, "d1", "b", 40)?;
+        write_timed(&b.mnt.join("d1/x"), b"old")?;
+        eventually("x visible on c", Duration::from_secs(20), || {
+            anyhow::ensure!(std::fs::read(c.mnt.join("d1/x"))? == b"old");
+            Ok(())
+        })?;
+        // The second and later strict opens of x on c are served under a read
+        // delegation b granted.
+        for _ in 0..5 {
+            anyhow::ensure!(std::fs::read(c.mnt.join("d1/x"))? == b"old");
+        }
+        let cto = c.control_status()?["cto"].clone();
+        anyhow::ensure!(
+            n(&cto, "delegation_local") >= 1,
+            "c served no read under a read delegation: {cto}"
+        );
+        eprintln!(
+            "    {SCENARIO}: c's reads under a read delegation before the kill: {}",
+            n(&cto, "delegation_local")
+        );
+        let last = "d1/b-last".to_string();
+        write_timed(&b.mnt.join(&last), last.as_bytes())?;
+        let killed = Instant::now();
+        clients[1].kill9()?;
+        let a = &clients[0];
+        let c = &clients[2];
+        // Without --force, within the delegation TTL of the kill: refused,
+        // and it names --force (the root heard from b lately).
+        let refused = a.control("repair.abandon", serde_json::json!({"node": b_id}));
+        let refused = match refused {
+            Err(e) => format!("{e:#}"),
+            Ok(v) => anyhow::bail!("the abandon without --force was accepted: {v}"),
+        };
+        anyhow::ensure!(
+            refused.contains("--force"),
+            "the refusal does not name --force: {refused}"
+        );
+        eprintln!("    {SCENARIO}: the abandon without --force was refused: {refused}");
+        // c's write into d1 fails EROFS for longer than the delegation TTL:
+        // the sticky grant is not TTL-ended.
+        let blocked = "d1/c-blocked";
+        let mut erofs = 0;
+        while killed.elapsed() < Duration::from_millis(DELEG_TTL_MS * 2 + 2_000) {
+            match std::fs::write(c.mnt.join(blocked), b"c") {
+                Ok(()) => anyhow::bail!(
+                    "c's write into the dead sticky holder's subtree succeeded {:?} after the kill",
+                    killed.elapsed()
+                ),
+                Err(e) if e.raw_os_error() == Some(30) => erofs += 1,
+                Err(e) => anyhow::bail!("c's write into d1 failed with {e}, not EROFS"),
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        eprintln!(
+            "    {SCENARIO}: c's writes into d1 failed EROFS {erofs} times over {:?} \
+             (delegation TTL {DELEG_TTL_MS} ms): the sticky grant is not TTL-ended",
+            killed.elapsed()
+        );
+        // The operator confirmed b is down: forced.
+        let t = Instant::now();
+        let answer = a
+            .control(
+                "repair.abandon",
+                serde_json::json!({"node": b_id, "force": true}),
+            )
+            .context("repair abandon --node b --force")?;
+        let took = t.elapsed();
+        eprintln!("    {SCENARIO}: repair abandon --force returned after {took:?}: {answer}");
+        anyhow::ensure!(
+            took < Duration::from_millis(READ_WAIT_MS + 2_000),
+            "the abandon took {took:?}, more than the read wait {READ_WAIT_MS} ms + 2 s"
+        );
+        let da = deleg_of(a)?;
+        print_deleg(SCENARIO, "a", &da);
+        // c writes b-last (different content) and x: through the root.
+        let new_last = b"c took this name";
+        write_timed(&c.mnt.join(&last), new_last).context("c writing d1/b-last")?;
+        write_timed(&c.mnt.join("d1/x"), b"new").context("c writing d1/x")?;
+        anyhow::ensure!(
+            std::fs::read(c.mnt.join("d1/x"))? == b"new",
+            "c's next strict open of d1/x does not see its own write"
+        );
+        anyhow::ensure!(
+            std::fs::read(a.mnt.join("d1/x"))? == b"new",
+            "a's strict open of d1/x does not see c's write (a read was served under b's old grant)"
+        );
+        // b returns with its state dir: its acknowledged writes past the cut
+        // replay by rid; d1/b-last, now c's, becomes a conflict copy.
+        clients[1].mount()?;
+        let a = &clients[0];
+        let b = &clients[1];
+        let c = &clients[2];
+        for x in [a, b, c] {
+            all_visible(x, &names_b, Duration::from_secs(60))?;
+        }
+        eventually(
+            "every node shows c's d1/b-last and d1/x",
+            Duration::from_secs(60),
+            || {
+                for x in [a, b, c] {
+                    anyhow::ensure!(
+                        std::fs::read(x.mnt.join(&last))? == new_last,
+                        "{} shows another d1/b-last",
+                        x.name
+                    );
+                    anyhow::ensure!(
+                        std::fs::read(x.mnt.join("d1/x"))? == b"new",
+                        "{} shows another d1/x",
+                        x.name
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        let sb = b.control_status()?["speculation"].clone();
+        eprintln!(
+            "    {SCENARIO}: after b's return: rows replayed by rid on b {}, replays refused (conflict \
+             copies) {}, conflict copies on (a, c) {:?}; streams ended on a {}",
+            n(&sb, "stranded_replayed"),
+            n(&sb, "replay_conflicts"),
+            [conflicts_total(a), conflicts_total(c)],
+            n(&deleg_of(a)?, "ended")
+        );
+        let db = deleg_of(b)?;
+        anyhow::ensure!(
+            db["mine"].as_array().is_some_and(|m| m.is_empty()),
+            "the remounted holder still holds a grant: {db}"
+        );
+        // b can be granted again, at a higher generation.
+        // (Refused while the read delegations under d1 are being recalled.)
+        eventually(
+            "d1 is delegated to b again",
+            Duration::from_secs(30),
+            || {
+                a.control(
+                    "designation.delegate",
+                    serde_json::json!({"path": "/d1", "node": b_id, "sticky": true}),
+                )
+                .context("delegating --sticky /d1 to b again")?;
+                Ok(())
+            },
+        )?;
+        let gen2 = wait_installed(b, "/d1", Duration::from_secs(30))?;
+        anyhow::ensure!(gen2 > gen, "generation did not advance: {gen} -> {gen2}");
+        let (again, _) = write_files(b, "d1", "again", 10)?;
+        for x in [a, b, c] {
+            all_visible(x, &again, Duration::from_secs(30))?;
+        }
+        Ok(())
+    })();
+    dump_logs_on_failure(SCENARIO, &clients, &result);
+    unmount_all(&mut clients);
+    result
+}
+
+/// How many conflict copies `c` has created (`status.spool.conflicts`).
+fn conflicts_total(c: &Client) -> u64 {
+    c.control_status()
+        .map(|s| s["spool"]["conflicts"].as_u64().unwrap_or(0))
+        .unwrap_or(u64::MAX)
+}
+
 /// Data in one delegated subtree, a marker in another, written in that
 /// order by one client: no node ever shows the marker without its data
 /// (the marker's `deps` carry the data's stream position; the marker's
