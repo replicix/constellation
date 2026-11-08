@@ -611,7 +611,7 @@ pub struct Meta {
     /// queued for replay instead).
     pub(crate) holder_epoch: Arc<AtomicU64>,
     /// Plan 43 C3: at least the last journal seq of any delegation row this
-    /// node journaled as a lease holder (a root's append, a takeover gate's
+    /// node journaled as a root (`appended`: a root's append, a takeover gate's
     /// re-applied tail or re-append), 0 when it never did since the open
     /// and its journal held none then. A cheap gate for
     /// [`Self::holder_append_of`]: a plain delegate never pays its seek.
@@ -788,6 +788,10 @@ pub struct Meta {
     /// Scans of a generation's unshipped holder appends
     /// ([`Meta::holder_scans`]).
     holder_scans: AtomicU64,
+    /// Plan 46 M1.2 step 14's negative control, never set in production
+    /// (`Config::deleg_append_replay`): a stranding pass queues a root's
+    /// append of a delegate's row for replay.
+    deleg_append_replay: std::sync::atomic::AtomicBool,
     /// Plan 46 M1.2 step 4: records of a delegate's transaction the root's
     /// append journaled but could not apply (a tolerant apply; the sim
     /// fails a seed that has any), not yet taken by the core
@@ -1321,6 +1325,7 @@ impl Meta {
             local_rows_read: AtomicU64::new(0),
             dirty_probes: AtomicU64::new(0),
             holder_scans: AtomicU64::new(0),
+            deleg_append_replay: std::sync::atomic::AtomicBool::new(false),
             deleg_append_skipped: AtomicU64::new(0),
             deleg_append_uncompleted: AtomicU64::new(0),
             dentries_read: AtomicU64::new(0),
@@ -1548,6 +1553,13 @@ impl Meta {
     pub fn node_prefix(&self) -> Result<u64, MetaError> {
         let r = self.db.read_tx();
         prefix_of(&r, &self.local)
+    }
+
+    /// Plan 46 M1.2 step 14's negative control: see
+    /// [`Self::deleg_append_replay`].
+    pub fn set_deleg_append_replay(&self, on: bool) {
+        self.deleg_append_replay
+            .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn set_node_prefix(&self, prefix: u64) -> Result<(), MetaError> {

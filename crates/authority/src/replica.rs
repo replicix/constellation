@@ -180,9 +180,9 @@ pub trait Replica {
     fn strand_below_epoch(&self, epoch: Epoch) -> Result<Stranded, MetaError>;
     /// A deposition's strand (plan 46 M1.2 step 7, `Meta::strand_deposed`):
     /// [`Self::strand_below_epoch`], and the delegates' rows this node
-    /// appended as the root (a generation not in `own_gens`) are kept as a
-    /// member copy of their generation instead of being rebuilt and replayed.
-    fn strand_deposed(&self, floor: Epoch, own_gens: &[u64]) -> Result<Stranded, MetaError>;
+    /// appended as the root are kept as a member copy of their generation
+    /// instead of being rebuilt and replayed.
+    fn strand_deposed(&self, floor: Epoch) -> Result<Stranded, MetaError>;
     /// Unshipped journal rows without before-images (`Meta::uncaptured_tx_count`):
     /// the only rows a strand cannot roll back.
     fn uncaptured_tx_count(&self) -> Result<u64, MetaError>;
@@ -1026,8 +1026,8 @@ impl Replica for Meta {
         Meta::has_outstanding_speculation(self)
     }
 
-    fn strand_deposed(&self, floor: Epoch, own_gens: &[u64]) -> Result<Stranded, MetaError> {
-        Meta::strand_deposed(self, floor, own_gens)
+    fn strand_deposed(&self, floor: Epoch) -> Result<Stranded, MetaError> {
+        Meta::strand_deposed(self, floor)
     }
 
     fn uncaptured_tx_count(&self) -> Result<u64, MetaError> {

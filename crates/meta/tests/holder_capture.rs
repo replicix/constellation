@@ -2281,12 +2281,14 @@ fn root_own_lone(meta: &Meta, name: &str, ino: u64, seq: u64) {
 /// generation's rows, which the delegate re-streams and another node (the
 /// asker, the predecessor's members) holds a copy of: the rebuild rolls them
 /// back and queues nothing, so the deposed root holds no executable copy of
-/// a rid someone else retries (I2). An append still `Lone` keeps today's
-/// rule (queued), as does the root's own gated row (to the member copy of
-/// its epoch). Fails before the fix: the two gated appends are queued, with
-/// their gated class.
+/// a rid someone else retries (I2). Plan 46 M1.2 step 14: the class says
+/// nothing of whether the append committed (a lone root's journal commits
+/// nothing for a delegate), so an append still `Lone` is not queued either:
+/// every append is kept as a member copy of its generation (the delegate
+/// re-streams it, or the next root's seal reads it), and the root's own
+/// gated row goes to the member copy of its epoch.
 #[test]
-fn a_rebuild_queues_no_gated_append_of_a_delegates_row() {
+fn a_rebuild_queues_no_append_of_a_delegates_row() {
     use constellation_meta::{PendingClass, RowCommit};
     let gen = 5;
     let meta = Meta::open_in_memory().unwrap();
@@ -2324,16 +2326,23 @@ fn a_rebuild_queues_no_gated_append_of_a_delegates_row() {
     meta.replace_ns_from_rebuilt(&Meta::open_in_memory().unwrap(), &Default::default())
         .unwrap();
     assert_eq!(meta.journal_len().unwrap(), 0);
+    // Plan 46 M1.2 step 14: no root append is queued, whatever its class (a
+    // `Lone` one too: the lone journal commits nothing for a delegate); all
+    // three are the generation's, kept verbatim as its member copy.
     let queued: Vec<(Rid, RowCommit)> = meta
         .pending_replays()
         .unwrap()
         .into_iter()
         .map(|q| (q.rid, q.class))
         .collect();
+    assert_eq!(queued, vec![], "no append of a delegate's row is queued");
     assert_eq!(
-        queued,
-        vec![(delegate_rid(3), RowCommit::LONE)],
-        "only the lone append is queued; the gated appends are their generation's"
+        meta.deleg_backup_tail(gen)
+            .unwrap()
+            .iter()
+            .map(|t| t.idx)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
     );
     for seq in [1, 2] {
         assert_eq!(
@@ -2585,7 +2594,7 @@ fn a_rebuild_keeps_the_stream_deps_of_the_roots_own_replays() {
     meta.reclass_journal_tx(last_seq(&meta), RowCommit::ARCHIVE)
         .unwrap();
     root_own_lone(&meta, "m1", (3 << 40) | 1, 8);
-    // Idx 2: still `Lone`: queued.
+    // Idx 2: still `Lone`: kept as a member copy too (step 14).
     root_appends(&meta, gen, 2, "b");
     root_own_lone(&meta, "m2", (3 << 40) | 2, 9);
     meta.set_holder_epoch(0);
@@ -2611,6 +2620,12 @@ fn a_rebuild_keeps_the_stream_deps_of_the_roots_own_replays() {
         Some(1),
         "the first marker waits for the dropped row to reach the log"
     );
-    assert_eq!(deps(delegate_rid(2)).get(gen), Some(1));
+    assert!(
+        meta.pending_replays()
+            .unwrap()
+            .iter()
+            .all(|q| q.rid != delegate_rid(2)),
+        "the lone append is a member copy, not queued"
+    );
     assert_eq!(deps(rid(9)).get(gen), Some(2));
 }

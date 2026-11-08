@@ -1908,17 +1908,9 @@ impl Core {
         let mut rolled = 0u64;
         replica.clear_streamed();
         // Plan 46 M1.2 step 7 (c3-spec §6.2): the delegates' rows this node
-        // appended as the root go to the member copy of their generation; its
-        // own rows as a delegate stay (its live stream), unless the gate
-        // ended the generation (what it re-appended is appended rows now).
-        let own_gens: Vec<u64> = self
-            .own_journaled_gens(replica)
-            .into_iter()
-            .filter(|g| !replica.deleg_ended_at_gate(*g))
-            .collect();
-        let stranded = replica
-            .strand_deposed(floor, &own_gens)
-            .map_err(|e| e.to_string())?;
+        // appended as the root go to the member copy of their generation
+        // (`JournalTx::appended`); its own rows as a delegate stay.
+        let stranded = replica.strand_deposed(floor).map_err(|e| e.to_string())?;
         rolled += (stranded.locals + stranded.member_copied + stranded.deleg_member_copied) as u64;
         self.stats.speculation_rolled_back += (stranded.shadows + stranded.hints) as u64;
         self.note_committed_stranded(&stranded);

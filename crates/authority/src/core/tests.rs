@@ -32290,6 +32290,9 @@ mod locks {
         d2.now = t2;
         handoff_to(&mut d2, req, grants, carry);
         assert_eq!(record_end(&d2, g), until + 2 * margin);
+        // Plan 46 M1.2 step 14: the segment's end of generation 7 queued no
+        // root append of a delegate's row for replay.
+        assert!(r.meta.pending_replays().unwrap().is_empty());
         // A waiter behind it: the grant is outwaited at its record's end.
         let out = request(&mut d2, 5, 30, f, X, true);
         let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
@@ -57804,6 +57807,19 @@ mod c2g_settle {
             .replace_ns_from_rebuilt(&side, &Default::default())
             .unwrap();
         assert!(h.meta.holder_appends(7).unwrap().is_empty());
+        // Plan 46 M1.2 step 14: the rebuild keeps the root's appends of the
+        // delegate's rows as a member copy of the generation; nothing is
+        // queued for replay.
+        assert!(h.meta.pending_replays().unwrap().is_empty());
+        assert_eq!(
+            h.meta
+                .deleg_backup_tail(7)
+                .unwrap()
+                .iter()
+                .map(|t| t.idx)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         assert_eq!(Replica::max_journal_seq(&h.meta), Some(0));
         assert!(
             h.meta.holder_append_tip() > Replica::journal_acked_seq(&h.meta).unwrap(),
@@ -57828,7 +57844,8 @@ mod c2g_settle {
             PeerMsg::DelegBackupAck { acked, .. } => Some(*acked),
             _ => None,
         });
-        assert_eq!(acked, Some(1), "{out:?}");
+        // (Rows 1 and 2 are held as the member copy.)
+        assert_eq!(acked, Some(2), "{out:?}");
         let scans = h.meta.holder_scans() - before;
         assert_eq!(scans, 0, "the backup append scanned the appends {scans}x");
     }
