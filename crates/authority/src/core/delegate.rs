@@ -10419,7 +10419,16 @@ impl Core {
         if !self.cfg.delegation || !self.cfg.p2p || self.root_usable(now) {
             return true;
         }
-        self.dl.leave_told.is_some() && self.dl.leave_told == self.root_node()
+        // (No root to tell: the lease as this node read it is released. A
+        // leaving node takes no grant, so nothing new is granted to it, and
+        // whatever it holds is released or lapses, which the leave waits
+        // for separately; an idle cluster's leave is not stuck on a root
+        // that is nobody.)
+        self.lease
+            .last_seen
+            .as_ref()
+            .is_some_and(|l| l.released || l.holder == 0)
+            || (self.dl.leave_told.is_some() && self.dl.leave_told == self.root_node())
     }
 
     /// A leave note to the root: sent when the leave starts and again every

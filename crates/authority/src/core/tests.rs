@@ -62487,6 +62487,33 @@ mod step9_one_stream_per_node {
         assert!(matches!(control_answer(&out, 5), Some(Ok(_))), "{out:?}");
     }
 
+    /// A node leaves while nobody holds the lease (the root released it
+    /// when the cluster went idle): there is no root to hear the note, and
+    /// the leave is not stuck on one. A refusing non-root and a held lease
+    /// are still no acknowledgement.
+    #[test]
+    fn a_self_leave_with_a_released_lease_is_answered_without_a_root() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let mut lease = Lease::granted("p0", 1, 1, 5_000);
+        h.core.lease.note_object(&lease);
+        let out = h.step(Event::Control {
+            op: OpId(5),
+            req: Control::ReleaseGrants,
+        });
+        let (req, _) = leave_note_req(&out, 1).expect("no note");
+        // A lease that is held: the root's refusal is no answer.
+        let out = h.step(leave_note_ack(1, req, true));
+        assert!(control_answer(&out, 5).is_none(), "{out:?}");
+        // The lease is read again, released.
+        lease = lease.released();
+        h.core.lease.note_object(&lease);
+        let out = leave_tick(&mut h, 600);
+        assert!(matches!(control_answer(&out, 5), Some(Ok(_))), "{out:?}");
+    }
+
     /// The note is sent again until it is acknowledged, and an
     /// acknowledgement of a root that has since changed is no
     /// acknowledgement of the new one.
