@@ -448,6 +448,10 @@ pub struct NodeEnv {
     pub skip_deleg_dep_wait: bool,
     /// See `SimConfig::ttl_reclaims_sticky`.
     pub ttl_reclaims_sticky: bool,
+    /// See `SimConfig::holder_releases_before_drain`.
+    pub holder_releases_before_drain: bool,
+    /// See `SimConfig::partial_release_ends_stream`.
+    pub partial_release_ends_stream: bool,
     /// See `SimConfig::plant_claim_root_group_on_lone`.
     pub plant_claim_root_group_on_lone: bool,
 }
@@ -731,6 +735,8 @@ impl NodeHandle {
         let mut cfg = (env.config)(id, incarnation);
         cfg.skip_deleg_dep_wait = env.skip_deleg_dep_wait;
         cfg.ttl_reclaims_sticky = env.ttl_reclaims_sticky;
+        cfg.holder_releases_before_drain = env.holder_releases_before_drain;
+        cfg.partial_release_ends_stream = env.partial_release_ends_stream;
         // Plan 43 C2g: the simulation's settle window scales with its lease
         // TTL as production's does (half a TTL: 30 s of 60 s), unless a
         // configuration sets one (`sim_core_config` leaves it unset), and is

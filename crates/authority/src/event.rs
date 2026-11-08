@@ -458,6 +458,17 @@ pub enum Control {
     /// leaving the roster; release every stream it holds and answer (`Text`)
     /// once the log has ended them.
     ReleaseGrants,
+    /// Plan 46 M1.3 step 5, the holder's release: this node releases the
+    /// sticky subtrees `dirs` (empty: every sticky grant it holds). It
+    /// drains its in-flight ops there, waits until the root has appended
+    /// through the last row of the stream, then journals `SubtreeReleased`
+    /// (some of the stream's subtrees) or `StreamReleased` (all of them);
+    /// its read delegations there are recalled first, else waited out. A
+    /// partial release never ends the stream. With `wait` the control is
+    /// answered (`Text`) once the root has appended the release row (and
+    /// so ended the stream, or shrunk it), else at once. A named directory
+    /// that is no sticky grant of this node is an error.
+    StickyRelease { dirs: Vec<Ino>, wait: bool },
     /// The engine's leave failed after `ReleaseGrants` was answered (the
     /// flush, or the registry's retirement): the node is not leaving any
     /// more, takes grants again, and tells its root so. Answered `Done`.

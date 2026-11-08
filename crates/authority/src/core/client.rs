@@ -2708,6 +2708,35 @@ impl Core {
                     super::delegate::RecallPlan::None => Default::default(),
                     super::delegate::RecallPlan::Wait(w) => w,
                     super::delegate::RecallPlan::Refuse(code) => {
+                        // An op already sent on (a forward to the holder
+                        // whose answer did not come) may have run there: a
+                        // refusal for good would tell the application it did
+                        // not. It waits for the holder's word instead: its row
+                        // (the rid's completion, which ends the wait), its
+                        // release or the stream's end; else the client's
+                        // deadline answers it in doubt.
+                        if self
+                            .clients
+                            .get(&rid)
+                            .is_some_and(|c| c.forwarded || c.attempts > 0)
+                        {
+                            let gens: Vec<u64> = match replica.resolve_ownership(&keys) {
+                                constellation_meta::delegation::Ownership::Delegated(d) => {
+                                    vec![d.gen]
+                                }
+                                constellation_meta::delegation::Ownership::CrossSubtree {
+                                    involved,
+                                    ..
+                                } => involved.iter().map(|d| d.gen).collect(),
+                                constellation_meta::delegation::Ownership::Root => Vec::new(),
+                            };
+                            let wait: BTreeSet<u64> =
+                                gens.into_iter().map(super::delegate::wait_id).collect();
+                            if !wait.is_empty() {
+                                self.park_exec_local(now, wait, None, rid, false);
+                                return MutateOutcome::Busy;
+                            }
+                        }
                         return MutateOutcome::Errno(code);
                     }
                     // The gate recalls nothing (ADR-42): retried once it opens.

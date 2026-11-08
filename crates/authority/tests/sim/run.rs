@@ -486,6 +486,27 @@ pub struct SimConfig {
     /// on every configuration; `sticky_ends_only_by_holder_or_operator` must
     /// then fail the run.
     pub ttl_reclaims_sticky: bool,
+    /// Negative control (`Config::holder_releases_before_drain`): a holder's
+    /// release journals its row at once, without the drain.
+    /// `AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN=1` sets it on every
+    /// configuration; a run that released before the drain fails.
+    pub holder_releases_before_drain: bool,
+    /// Negative control (`Config::partial_release_ends_stream`): the root
+    /// ends a sticky stream at the holder's release of some of its
+    /// subtrees (MUST-1). `AUTHORITY_SIM_PARTIAL_RELEASE_ENDS_STREAM=1` sets
+    /// it on every configuration; `sticky_ends_only_by_holder_or_operator`
+    /// must fail the run.
+    pub partial_release_ends_stream: bool,
+    /// Plan 46 M1.3 step 5: the sim's idle tracker, standing for the
+    /// engine's (step 6): a sticky holder that has not run an op in a
+    /// sticky subtree for this many ms releases it (`Control::StickyRelease`,
+    /// alternately with and without `wait`); when the node writes there
+    /// again the operator makes the grant anew. A holder with several
+    /// subtrees releases them one by one: a partial release.
+    pub sticky_idle_ms: Option<u64>,
+    /// Plan 46 M1.3 step 5: clients pause now and then (`Step::Delay`), so
+    /// that subtrees go idle.
+    pub idle_gaps: bool,
     /// Plan 30 §M12: every client writes in `dirs[0]` with names of its
     /// own (`<dir>/n<node>-f<i>`): a hot shared directory with no
     /// colliding names.
@@ -1047,6 +1068,16 @@ impl Default for SimConfig {
             sticky_delegations: Vec::new(),
             ttl_reclaims_sticky: std::env::var_os("AUTHORITY_SIM_TTL_RECLAIMS_STICKY")
                 .is_some_and(|v| v == "1"),
+            holder_releases_before_drain: std::env::var_os(
+                "AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN",
+            )
+            .is_some_and(|v| v == "1"),
+            partial_release_ends_stream: std::env::var_os(
+                "AUTHORITY_SIM_PARTIAL_RELEASE_ENDS_STREAM",
+            )
+            .is_some_and(|v| v == "1"),
+            sticky_idle_ms: None,
+            idle_gaps: false,
             shared_dir: false,
             cross_ratio: 0.0,
             marker_pairs: 0,
@@ -1325,7 +1356,10 @@ pub struct Report {
     pub sticky_ended_unexcused: usize,
     /// Core counters, summed over the nodes: sticky grants made, and sticky
     /// streams ended by reason (released, abandoned, other).
-    pub sticky_core: [u64; 7],
+    pub sticky_core: [u64; 11],
+    /// Plan 46 M1.3 step 5, the idle tracker's releases: requested, answered
+    /// (`wait`), unanswered or refused (`wait`), granted again.
+    pub sticky_driver: [u64; 4],
     /// Of `acked_past_cut`, answers that were refusals.
     pub acked_past_cut_refusals: usize,
     /// I4: in-doubt rids that landed after an op invoked later.
@@ -1408,6 +1442,12 @@ pub struct Cluster {
     /// Plan 46 M0.3: every overwrite the clients attempted
     /// (`Step::TruncCommit`), in order.
     pub trunc: Mutex<Vec<super::history::TruncRec>>,
+    /// Plan 46 M1.3 step 5: when each node last ran an op in each directory
+    /// (simulated ms): the idle tracker's input (`SimConfig::sticky_idle_ms`).
+    pub activity: Mutex<BTreeMap<(NodeId, String), u64>>,
+    /// The idle tracker's releases: requested, answered (`wait`), refused or
+    /// unanswered (`wait`), granted again.
+    pub sticky_driver: Mutex<[u64; 4]>,
 }
 
 impl Cluster {
@@ -2043,6 +2083,32 @@ async fn client_thread(
                 return;
             }
         }
+        // Plan 46 M1.3 step 5: the idle tracker's input.
+        {
+            let mut names: Vec<&String> = Vec::new();
+            match (&op, &write) {
+                (Some(NsOp::Create(n) | NsOp::Unlink(n) | NsOp::Put(n)), _) => names.push(n),
+                (
+                    Some(
+                        NsOp::Rename(a, b)
+                        | NsOp::Link(a, b)
+                        | NsOp::Exchange(a, b)
+                        | NsOp::Same(a, b),
+                    ),
+                    _,
+                ) => {
+                    names.push(a);
+                    names.push(b);
+                }
+                (None, Some(n)) => names.push(n),
+                _ => {}
+            }
+            let at = cluster.env.clock.elapsed_ms();
+            let mut act = cluster.activity.lock().unwrap();
+            for n in names {
+                act.insert((node, dir_of(n).to_string()), at);
+            }
+        }
         let handle = cluster.get(node);
         let mut rid = handle.next_rid();
         let mut mop = match (&op, &write) {
@@ -2162,6 +2228,117 @@ async fn client_thread(
                 }
             }
             break;
+        }
+    }
+}
+
+/// Plan 46 M1.3 step 5: the sim's stand-in for the engine's idle tracker
+/// (step 6). A sticky holder that has run no op in a sticky subtree for
+/// `idle_ms` releases it (`Control::StickyRelease`, with `wait` and without,
+/// alternately); a holder with several subtrees releases them one by one
+/// (a partial release). When the node writes there again, the operator makes
+/// the grant anew through the lease holder (the placement's sticky proposal
+/// is a later step).
+async fn sticky_idle_driver(
+    cluster: Arc<Cluster>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    fault_log: Arc<Mutex<Vec<String>>>,
+    grants: Vec<(String, NodeId)>,
+    idle_ms: u64,
+) {
+    use constellation_authority::Control;
+    let start = cluster.env.clock.elapsed_ms();
+    // Directory -> when the driver released it (`None`: held), and since
+    // when it has been held.
+    let mut released: BTreeMap<String, Option<u64>> =
+        grants.iter().map(|(d, _)| (d.clone(), None)).collect();
+    let mut held_since: BTreeMap<String, u64> =
+        grants.iter().map(|(d, _)| (d.clone(), start)).collect();
+    let mut releases = 0u64;
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = cluster.env.clock.elapsed_ms();
+        for (dir, node) in &grants {
+            let last = cluster
+                .activity
+                .lock()
+                .unwrap()
+                .get(&(*node, dir.clone()))
+                .copied()
+                .unwrap_or(0);
+            match released[dir] {
+                None => {
+                    if now.saturating_sub(last.max(held_since[dir])) < idle_ms {
+                        continue;
+                    }
+                    let h = cluster.get(*node);
+                    if !h.alive() {
+                        continue;
+                    }
+                    let Some(ino) = h.meta.child_ino(ROOT_INO, dir).ok().flatten() else {
+                        continue;
+                    };
+                    let wait = releases.is_multiple_of(2);
+                    releases += 1;
+                    fault_log.lock().unwrap().push(format!(
+                        "t={now} node {node}: sticky release of {dir} (idle; wait {wait})"
+                    ));
+                    cluster.sticky_driver.lock().unwrap()[0] += 1;
+                    released.insert(dir.clone(), Some(now));
+                    let c = cluster.clone();
+                    tokio::spawn(async move {
+                        let r = tokio::time::timeout(
+                            Duration::from_secs(40),
+                            h.control(Control::StickyRelease {
+                                dirs: vec![ino],
+                                wait,
+                            }),
+                        )
+                        .await;
+                        if wait {
+                            let slot = if matches!(r, Ok(Ok(Ok(_)))) { 1 } else { 2 };
+                            c.sticky_driver.lock().unwrap()[slot] += 1;
+                        }
+                    });
+                }
+                Some(at) => {
+                    if last <= at {
+                        continue;
+                    }
+                    let holder = read_lease(&cluster.env.bucket)
+                        .await
+                        .map(|l| l.holder)
+                        .filter(|h| {
+                            *h != 0 && cluster.ids().contains(h) && cluster.get(*h).alive()
+                        });
+                    let Some(holder) = holder else { continue };
+                    let h = cluster.get(holder);
+                    let Some(ino) = h.meta.child_ino(ROOT_INO, dir).ok().flatten() else {
+                        continue;
+                    };
+                    let r = tokio::time::timeout(
+                        Duration::from_millis(500),
+                        h.control(Control::Delegate {
+                            dir: ino,
+                            node: *node,
+                            sticky: true,
+                        }),
+                    )
+                    .await;
+                    match r {
+                        Ok(Ok(Ok(_))) => {
+                            cluster.sticky_driver.lock().unwrap()[3] += 1;
+                            released.insert(dir.clone(), None);
+                            held_since.insert(dir.clone(), cluster.env.clock.elapsed_ms());
+                        }
+                        Ok(Ok(Err(e))) if e.contains("already holds") => {
+                            released.insert(dir.clone(), None);
+                            held_since.insert(dir.clone(), cluster.env.clock.elapsed_ms());
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 }
@@ -4355,6 +4532,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         plant_ungated_fast_path: cfg.plant_ungated_fast_path,
         skip_deleg_dep_wait: cfg.skip_deleg_dep_wait,
         ttl_reclaims_sticky: cfg.ttl_reclaims_sticky,
+        holder_releases_before_drain: cfg.holder_releases_before_drain,
+        partial_release_ends_stream: cfg.partial_release_ends_stream,
         plant_claim_root_group_on_lone: cfg.plant_claim_root_group_on_lone,
     };
     env.world
@@ -4366,6 +4545,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         failovers: Mutex::new(Vec::new()),
         longest_submit_ms: Default::default(),
         trunc: Mutex::new(Vec::new()),
+        activity: Mutex::new(BTreeMap::new()),
+        sticky_driver: Mutex::new([0; 4]),
         budget_exceeded: Mutex::new(Vec::new()),
         down: Mutex::new(BTreeMap::new()),
         s3_cut: Mutex::new(BTreeMap::new()),
@@ -4491,6 +4672,19 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             };
             if let Some((_, start, _)) = plan {
                 steps.insert(0, Step::Delay(*start));
+            }
+            if cfg.idle_gaps {
+                // (Its own generator: the other configurations' schedules
+                // are what they were.)
+                let mut gap_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x1d1e);
+                let mut gapped = Vec::with_capacity(steps.len() + 8);
+                for step in steps {
+                    if matches!(step, Step::Op(_)) && gap_rng.random_bool(0.2) {
+                        gapped.push(Step::Delay(gap_rng.random_range(1_500..4_000)));
+                    }
+                    gapped.push(step);
+                }
+                steps = gapped;
             }
             clients.push(tokio::spawn(client_thread(
                 cluster.clone(),
@@ -4676,6 +4870,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 }
             }
         });
+    }
+    if let Some(idle_ms) = cfg.sticky_idle_ms {
+        tokio::spawn(sticky_idle_driver(
+            cluster.clone(),
+            sampler_stop.clone(),
+            fault_log.clone(),
+            cfg.sticky_delegations.clone(),
+            idle_ms,
+        ));
     }
     if cfg.chunk_writes > 0.0 {
         let (cluster, stop, violations) = (
@@ -6025,6 +6228,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.sticky_ended_abandoned = found.sticky_abandoned;
     report.sticky_ended_claimed = found.sticky_claimed;
     let mut sticky_recalled_other = 0u64;
+    let mut sticky_release_undrained = 0u64;
     for s in report.stats.values() {
         report.sticky_core[0] += s.deleg_sticky;
         report.sticky_core[1] += s.deleg_sticky_ended_released;
@@ -6033,7 +6237,21 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.sticky_core[4] += s.deleg_sticky_ended_operator;
         report.sticky_core[5] += s.deleg_sticky_ended_recalled;
         report.sticky_core[6] += s.deleg_sticky_recalled_epoch;
+        report.sticky_core[7] += s.deleg_sticky_releases;
+        report.sticky_core[8] += s.deleg_sticky_releases_partial;
+        report.sticky_core[9] += s.deleg_sticky_release_held;
+        report.sticky_core[10] += s.deleg_sticky_releases_given_up;
         sticky_recalled_other += s.deleg_sticky_recalled_other;
+        sticky_release_undrained += s.deleg_sticky_release_undrained;
+    }
+    report.sticky_driver = *cluster.sticky_driver.lock().unwrap();
+    // The holder's release waits for its drain (plan 46 M1.3 step 5).
+    if sticky_release_undrained > 0 {
+        found.sticky.push(format!(
+            "sticky_release_after_drain: {sticky_release_undrained} release(s) of sticky \
+             subtrees journaled before the holder had drained its in-flight ops and the root \
+             had appended through the last row of the stream"
+        ));
     }
     // The root's recalls of a sticky stream (all but the operator's and a
     // continuation epoch's are the root taking a grant back).

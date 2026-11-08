@@ -138,6 +138,19 @@ pub struct Config {
     /// placed one (plan 46 M1.3 step 4, `ttl_reclaims_sticky`). The sim's
     /// `sticky_ends_only_by_holder_or_operator` must then fail the run.
     pub ttl_reclaims_sticky: bool,
+    /// Fault injection for the simulation's negative control (never set by
+    /// the engine): a holder's release of sticky subtrees journals its row
+    /// at once, without draining its in-flight ops there and waiting for
+    /// the root to append through its last row (plan 46 M1.3 step 5,
+    /// `holder_releases_before_drain`). The sim fails the run on a release
+    /// journaled before the drain (`deleg_sticky_release_undrained`).
+    pub holder_releases_before_drain: bool,
+    /// Fault injection for the simulation's negative control (never set by
+    /// the engine): the root ends a sticky stream when the holder releases
+    /// some of its subtrees (plan 46 M1.3 step 5, MUST-1,
+    /// `partial_release_ends_stream`). The sim's
+    /// `sticky_ends_only_by_holder_or_operator` must then fail the run.
+    pub partial_release_ends_stream: bool,
     pub ttl_ms: u64,
     /// `lease::EXPIRY_MARGIN_MS`: a lease is usable only with this much
     /// left.
@@ -689,6 +702,8 @@ impl Config {
             single_writer: false,
             skip_deleg_dep_wait: false,
             ttl_reclaims_sticky: false,
+            holder_releases_before_drain: false,
+            partial_release_ends_stream: false,
             ttl_ms,
             expiry_margin_ms: 1_000,
             idle_release_ms: 30_000,
@@ -1249,6 +1264,17 @@ pub struct Stats {
     /// subtrees).
     pub deleg_sticky_recalled_epoch: u64,
     pub deleg_sticky_recalled_other: u64,
+    /// Plan 46 M1.3 step 5, the holder's release (`Control::StickyRelease`):
+    /// releases journaled (`_partial`: of some of the stream's subtrees
+    /// only; the stream lives on), releases journaled before the drain
+    /// (`_undrained`: the knob `holder_releases_before_drain`; any is a
+    /// violation), ops held at the holder while a release drains
+    /// (`_held`), and releases given up (`_given_up`: out of time).
+    pub deleg_sticky_releases: u64,
+    pub deleg_sticky_releases_partial: u64,
+    pub deleg_sticky_release_undrained: u64,
+    pub deleg_sticky_release_held: u64,
+    pub deleg_sticky_releases_given_up: u64,
     pub deleg_sticky_ended_abandoned: u64,
     pub deleg_sticky_ended_other: u64,
     pub deleg_redelegated: u64,
@@ -2089,6 +2115,9 @@ enum Timer {
     /// Plan 46 M1.2 step 11: the leaves waiting for grants to end look
     /// again (`Core::on_leave_wait_timer`).
     LeaveWait,
+    /// Plan 46 M1.3 step 5: the holder's releases in progress look again
+    /// (`Core::on_sticky_release_timer`).
+    StickyRelease,
 }
 
 impl Timer {
@@ -2139,7 +2168,9 @@ impl Timer {
             Timer::DelegLapse(_) => TimerKind::DelegLapse,
             Timer::DelegStream | Timer::DelegInstallRetry => TimerKind::DelegStream,
             Timer::Placement => TimerKind::Placement,
-            Timer::ReleaseRecallBound | Timer::LeaveWait => TimerKind::DelegExpiry,
+            Timer::ReleaseRecallBound | Timer::LeaveWait | Timer::StickyRelease => {
+                TimerKind::DelegExpiry
+            }
         }
     }
 }
@@ -3458,6 +3489,7 @@ impl Core {
             Timer::Placement => self.on_placement_timer(now, replica, out),
             Timer::ReleaseRecallBound => self.on_release_recall_bound(now, replica, out),
             Timer::LeaveWait => self.on_leave_wait_timer(now, replica, out),
+            Timer::StickyRelease => self.on_sticky_release_timer(now, replica, out),
         }
     }
 
@@ -3647,6 +3679,9 @@ impl Core {
             }
             Control::Undelegate { dir } => self.on_control_undelegate(now, op, dir, replica, out),
             Control::ReleaseGrants => self.on_control_release_grants(now, op, replica, out),
+            Control::StickyRelease { dirs, wait } => {
+                self.on_control_sticky_release(now, op, dirs, wait, replica, out)
+            }
             Control::LeaveFailed => {
                 if self.dl.leave_self {
                     self.leave_self_abort(now, out);

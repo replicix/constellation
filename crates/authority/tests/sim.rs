@@ -1736,16 +1736,27 @@ fn far_root_writes_config() -> SimConfig {
     }
 }
 
-/// Plan 46 M1.3 step 0, a stub (report mode: counted, never failing). Once
-/// step 4 lands: a sticky holder writes, goes idle past the idle release
-/// (about 60 s in production, scaled in the sim) and releases with
-/// `SubtreeReleased`; the next write forwards, then the placement grants
-/// again. Today: the far writers' placed grants and the TTL.
+/// Plan 46 M1.3 step 5: sticky grants released by their holder after idle
+/// periods (the sim's idle tracker stands for the engine's, step 6;
+/// `Control::StickyRelease`, alternately with and without `wait`). Node 2
+/// holds two subtrees in one stream, so its releases are partial (the stream
+/// must live on: MUST-1) until both are gone; node 3's one subtree ends its
+/// stream. A holder that writes again gets the grant anew. Strict:
+/// `acked_at_or_below_cut`, `sticky_ends_only_by_holder_or_operator` and the
+/// release after the drain (the other oracles as `far-root-writes`).
 fn sticky_idle_release_config() -> SimConfig {
     SimConfig {
-        core: std::sync::Arc::new(sim::run::placement_core_config),
+        dirs: vec!["d1".into(), "d2".into(), "d3".into()],
         delegations: Vec::new(),
+        // Node 2 holds two subtrees in one stream (so a release of one is
+        // partial), node 3 one.
+        sticky_delegations: vec![("d1".into(), 2), ("d2".into(), 2), ("d3".into(), 3)],
+        cross_ratio: 0.1,
         ops_per_client: 16,
+        idle_gaps: true,
+        sticky_idle_ms: Some(1_200),
+        faults: Vec::new(),
+        cut_mode: sim::cut::CutMode::Strict,
         ..far_root_writes_config()
     }
 }
@@ -7927,7 +7938,8 @@ struct OracleTotals {
     /// abandon, unexcused; the core's counters (grants made, ended by
     /// reason: released, abandoned, other).
     sticky: [u64; 5],
-    sticky_core: [u64; 7],
+    sticky_core: [u64; 11],
+    sticky_driver: [u64; 4],
     i4: usize,
     /// Plan 43 C2: of `i4`, settled `EIO`s whose rid completed.
     i4_settled: usize,
@@ -8166,6 +8178,9 @@ impl OracleTotals {
         for (t, c) in self.sticky_core.iter_mut().zip(r.sticky_core) {
             *t += c;
         }
+        for (t, c) in self.sticky_driver.iter_mut().zip(r.sticky_driver) {
+            *t += c;
+        }
         self.i4 += r.late_landings;
         self.i4_settled += r.settled_landings;
         self.i5 += r.non_lone_rollbacks;
@@ -8307,7 +8322,8 @@ impl OracleTotals {
         );
         eprintln!(
             "SWEEP-STICKY-TOTALS {label} seeds {}/{seeds}: sticky streams in the log {} (ended by release {}, by abandon {}, by the holder's own claim {}, unexcused {}); \
-             core: grants made {}, ended released {}, abandoned {}, other {}, by undelegate {}, recalled {}; recalls by a continuation epoch {}",
+             core: grants made {}, ended released {}, abandoned {}, other {}, by undelegate {}, recalled {}; recalls by a continuation epoch {}; \
+             holder's releases journaled {} (of some subtrees {}), ops held by a drain {}, given up {}; idle tracker: requested {}, answered {}, unanswered {}, granted again {}",
             self.seeds,
             self.sticky[0],
             self.sticky[1],
@@ -8320,7 +8336,15 @@ impl OracleTotals {
             self.sticky_core[3],
             self.sticky_core[4],
             self.sticky_core[5],
-            self.sticky_core[6]
+            self.sticky_core[6],
+            self.sticky_core[7],
+            self.sticky_core[8],
+            self.sticky_core[9],
+            self.sticky_core[10],
+            self.sticky_driver[0],
+            self.sticky_driver[1],
+            self.sticky_driver[2],
+            self.sticky_driver[3]
         );
         eprintln!(
             "SWEEP-UNSETTLED-CAUSES {label} seeds {}/{seeds}: {:?}",
@@ -18091,6 +18115,78 @@ fn sticky_grants_survive_the_ttl_and_end_by_the_holders_release() {
         released > 0,
         "no sticky grant ended by its holder's release"
     );
+}
+
+/// Plan 46 M1.3 step 5: sticky grants released by their holders after idle
+/// periods (`sticky-idle-release`; the sim's idle tracker, `Control::StickyRelease`
+/// with and without `wait`), some of them partial, the holder granted again
+/// when it writes. Strict: `acked_at_or_below_cut`,
+/// `sticky_ends_only_by_holder_or_operator` and the release after the drain
+/// (`sticky_release_after_drain`). The coverage counters are non-zero: the
+/// holders released (of some subtrees only too), the `wait` was answered,
+/// ops were held by a drain, grants were made again.
+#[test]
+fn sticky_idle_release_is_released_by_the_holder_and_a_partial_release_keeps_the_stream() {
+    let (mut released, mut partial, mut answered, mut again, mut held) = (0, 0, 0, 0, 0);
+    for seed in 0..40 {
+        let r = run_seed(seed, sticky_idle_release_config()).unwrap_or_else(|e| {
+            panic!(
+                "sticky-idle-release seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=sticky-idle-release"
+            )
+        });
+        assert_eq!(r.sticky_ended_unexcused, 0, "seed {seed}");
+        assert_eq!(r.acked_past_cut, 0, "seed {seed}");
+        released += r.sticky_core[7];
+        partial += r.sticky_core[8];
+        held += r.sticky_core[9];
+        answered += r.sticky_driver[1];
+        again += r.sticky_driver[3];
+    }
+    assert!(released > 0, "no holder released a sticky grant");
+    assert!(partial > 0, "no release was of some subtrees only");
+    assert!(answered > 0, "no `wait` release was answered");
+    assert!(again > 0, "no grant was made again after a release");
+    assert!(held > 0, "no op was held by a drain");
+}
+
+/// The knob `holder_releases_before_drain`
+/// (`AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN=1`): the holder journals its
+/// release without draining and waiting for the root's append through its
+/// last row; the run fails on fixed seeds.
+#[test]
+fn a_release_before_the_drain_fails_the_run() {
+    let config = SimConfig {
+        holder_releases_before_drain: true,
+        ..sticky_idle_release_config()
+    };
+    for seed in [0u64, 3, 6] {
+        let e = run_seed(seed, config.clone())
+            .expect_err("a holder released before its drain and no oracle noticed");
+        assert!(e.contains("sticky_release_after_drain"), "seed {seed}: {e}");
+    }
+}
+
+/// The knob `partial_release_ends_stream`
+/// (`AUTHORITY_SIM_PARTIAL_RELEASE_ENDS_STREAM=1`, MUST-1): the root ends a
+/// sticky stream at the holder's release of some of its subtrees. The sticky
+/// oracle (or the cut oracle, for the rows the holder goes on answering)
+/// fails the run on fixed seeds.
+#[test]
+fn a_partial_release_that_ends_the_stream_fails_the_oracles() {
+    let config = SimConfig {
+        partial_release_ends_stream: true,
+        ..sticky_idle_release_config()
+    };
+    for seed in [0u64, 1, 6] {
+        let e = run_seed(seed, config.clone())
+            .expect_err("a partial release ended the stream and no oracle noticed");
+        assert!(
+            e.contains("sticky_ends_only_by_holder_or_operator")
+                || e.contains("acked_at_or_below_cut"),
+            "seed {seed}: {e}"
+        );
+    }
 }
 
 /// The oracle's negative control: with the TTL taking sticky grants back

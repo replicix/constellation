@@ -63802,3 +63802,554 @@ mod step4_sticky {
         assert_eq!(h.core.dl.mine[&7].executed, 1);
     }
 }
+
+/// Plan 46 M1.3 step 5: the holder's release (`Control::StickyRelease`).
+mod step5_sticky_release {
+    use super::*;
+    use crate::core::delegate::RecallPhase;
+    use crate::core::{DelegKind, Timer};
+    use crate::replica::Replica;
+    use constellation_meta::{SubtreeKind, TouchSet};
+
+    fn mkdir(h: &Harness, name: &str) -> (constellation_fs_core::Ino, LogRecord) {
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        (
+            ino,
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: name.into(),
+                ino,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+        )
+    }
+
+    /// The holder (node 3) of stream 7 over sticky subtrees named `names`,
+    /// installed and honoured; the root is node 1.
+    fn sticky_holder(names: &[&str]) -> (Harness, Vec<constellation_fs_core::Ino>) {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let mut records = Vec::new();
+        let mut dirs = Vec::new();
+        for name in names {
+            let (d, rec) = mkdir(&h, name);
+            records.push(rec);
+            dirs.push(d);
+        }
+        records.push(LogRecord::DelegateNode {
+            node: 3,
+            gen: 7,
+            dirs: dirs
+                .iter()
+                .map(|dir| constellation_meta::SubtreeGrant {
+                    dir: *dir,
+                    kind: SubtreeKind::Sticky,
+                })
+                .collect(),
+        });
+        let n = records.len() as u64;
+        Replica::install_streamed(&h.meta, 1, 1, 1, n, &records, true, (0, 0)).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine[&7].non_stealable);
+        (h, dirs)
+    }
+
+    fn release(
+        h: &mut Harness,
+        op: u64,
+        dirs: Vec<constellation_fs_core::Ino>,
+        wait: bool,
+    ) -> Vec<Action> {
+        h.step(Event::Control {
+            op: OpId(op),
+            req: Control::StickyRelease { dirs, wait },
+        })
+    }
+
+    fn answer(out: &[Action], op: u64) -> Option<Result<String, String>> {
+        out.iter().find_map(|a| match a {
+            Action::ControlDone { op: o, result } if *o == OpId(op) => {
+                Some(result.clone().map(|ok| match ok {
+                    crate::action::ControlOk::Text(t) => t,
+                    _ => "done".to_string(),
+                }))
+            }
+            _ => None,
+        })
+    }
+
+    /// The batch of stream 7 in `out`: its request, round and last row.
+    fn batch(out: &[Action]) -> Option<(OpId, u64, u64)> {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegateStream {
+                req,
+                round,
+                txs,
+                gen: 7,
+                ..
+            } if to == 1 && !txs.is_empty() => Some((*req, *round, txs.last().unwrap().idx)),
+            _ => None,
+        })
+    }
+
+    /// The driver's part of a holder that syncs its rows before they
+    /// stream: the sync `out` asks for is done and reported; the actions
+    /// of that report (the batch).
+    fn flush(h: &mut Harness, out: &[Action]) -> Vec<Action> {
+        let through = out
+            .iter()
+            .filter_map(|a| match a {
+                Action::SyncDelegStream { gen: 7, through } => Some(*through),
+                _ => None,
+            })
+            .max()
+            .unwrap_or_else(|| panic!("no sync asked: {out:?}"));
+        h.meta.sync().unwrap();
+        h.step(Event::DelegStreamSynced {
+            gen: 7,
+            through,
+            ok: true,
+        })
+    }
+
+    fn rows(h: &Harness) -> Vec<constellation_meta::DelegateTx> {
+        Replica::delegate_txs_from(&h.meta, 7, 1, usize::MAX)
+    }
+
+    fn last_is_release(h: &Harness) -> bool {
+        rows(h).last().is_some_and(|t| {
+            matches!(
+                t.records.as_slice(),
+                [LogRecord::SubtreeReleased { .. }] | [LogRecord::StreamReleased { .. }]
+            )
+        })
+    }
+
+    fn control_delegate(
+        h: &mut Harness,
+        op: u64,
+        dir: constellation_fs_core::Ino,
+        node: NodeId,
+        sticky: bool,
+    ) -> (bool, Vec<Action>) {
+        let out = h.step(Event::Control {
+            op: OpId(op),
+            req: Control::Delegate { dir, node, sticky },
+        });
+        let ok = matches!(answer(&out, op), Some(Ok(_)));
+        (ok, out)
+    }
+
+    fn root_with_two_dirs() -> (
+        Harness,
+        constellation_fs_core::Ino,
+        constellation_fs_core::Ino,
+    ) {
+        let (h, d1) = root_with_dir();
+        let (d2, rec) = mkdir(&h, "d2");
+        Replica::apply_segment(&h.meta, 2, 1, 0, &[], &[], &[rec]).unwrap();
+        (h, d1, d2)
+    }
+
+    fn sticky_gen_of(h: &Harness, dir: constellation_fs_core::Ino) -> u64 {
+        let d = h.meta.delegation_table().get(dir).expect("granted");
+        assert_eq!(d.kind, SubtreeKind::Sticky, "{d:?}");
+        d.gen
+    }
+
+    fn delegate_tx(idx: u64, records: Vec<LogRecord>) -> constellation_meta::DelegateTx {
+        constellation_meta::DelegateTx {
+            idx,
+            rid: None,
+            records,
+            deps: constellation_meta::Position::ZERO,
+        }
+    }
+
+    /// A holder with a row the root has not appended does not journal its
+    /// release: it waits until the root has appended through the last row
+    /// (the drain), then journals the row, and a `wait` is answered only when
+    /// the root has appended that row. Fails on the knob
+    /// (`holder_releases_before_drain`): the row is journaled at once.
+    #[test]
+    fn a_release_before_the_drain_is_refused() {
+        for knob in [false, true] {
+            let (mut h, dirs) = sticky_holder(&["a"]);
+            h.core.cfg.holder_releases_before_drain = knob;
+            let out = create_in(&mut h, dirs[0], 1);
+            let out = flush(&mut h, &out);
+            let (req, round, last) = batch(&out).expect("the op's row was not streamed");
+            assert_eq!(last, 1);
+            let out = release(&mut h, 50, Vec::new(), true);
+            assert!(answer(&out, 50).is_none(), "{out:?}");
+            if knob {
+                assert!(last_is_release(&h), "the knob did not release at once");
+                assert_eq!(h.core.stats.deleg_sticky_release_undrained, 1);
+                continue;
+            }
+            assert!(!last_is_release(&h), "released before the drain");
+            assert_eq!(h.core.stats.deleg_sticky_release_undrained, 0);
+            // The root appends the row: the drain is over, the release goes.
+            let ack = h.step(stream_ack(1, req, round, last));
+            assert!(last_is_release(&h), "not released after the drain: {ack:?}");
+            let out = flush(&mut h, &ack);
+            assert!(
+                matches!(
+                    rows(&h).last().unwrap().records.as_slice(),
+                    [LogRecord::StreamReleased {
+                        gen: 7,
+                        through: 1,
+                        ..
+                    }]
+                ),
+                "{:?}",
+                rows(&h)
+            );
+            assert!(
+                answer(&out, 50).is_none(),
+                "answered before the root has the row"
+            );
+            let (req, round, last) = batch(&out).expect("the release row was not sent");
+            assert_eq!(last, 2);
+            let out = h.step(stream_ack(1, req, round, last));
+            let a = answer(&out, 50).unwrap_or_else(|| panic!("not answered: {out:?}"));
+            assert!(a.is_ok(), "{a:?}");
+            assert_eq!(h.core.stats.deleg_sticky_releases, 1);
+        }
+    }
+
+    /// An op that arrives while a release drains is held, and goes to the
+    /// root when the row is journaled; it does not run (that would move the
+    /// last row the drain waits for).
+    #[test]
+    fn an_op_that_arrives_while_the_release_drains_is_held_and_sent_to_the_root() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        let out = create_in(&mut h, dirs[0], 1);
+        let out = flush(&mut h, &out);
+        let (req, round, last) = batch(&out).unwrap();
+        release(&mut h, 50, Vec::new(), false);
+        assert_eq!(h.core.dl.mine[&7].executed, 1);
+        let out = create_in(&mut h, dirs[0], 2);
+        assert_eq!(h.core.dl.mine[&7].executed, 1, "an op ran during the drain");
+        assert_eq!(h.core.dl.mine[&7].parked.len(), 1);
+        assert!(h.core.dl.mine[&7].parked[0].held);
+        assert_eq!(h.core.stats.deleg_sticky_release_held, 1);
+        let _ = out;
+        // The drain ends with the root's append; the held op goes to the
+        // root, which owns the subtree now.
+        let out = h.step(stream_ack(1, req, round, last));
+        assert!(last_is_release(&h));
+        assert!(h.core.dl.mine[&7].parked.is_empty());
+        // (Back on the ordinary route: the root's lease is looked up, the
+        // op goes to the root.)
+        assert!(
+            out.iter().any(|a| matches!(a, Action::S3 { .. }))
+                || sends(&out)
+                    .iter()
+                    .any(|(to, m)| *to == 1 && matches!(m, PeerMsg::MutateRequest { .. })),
+            "the held op was not routed to the root: {out:?}"
+        );
+        assert_eq!(h.core.dl.mine[&7].executed, 1);
+    }
+
+    /// A hold is bounded: past it the op runs and the release goes on
+    /// waiting.
+    #[test]
+    fn the_hold_on_new_ops_lifts_after_its_bound() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        create_in(&mut h, dirs[0], 1);
+        release(&mut h, 50, Vec::new(), false);
+        h.advance(crate::core::delegate::STICKY_HOLD_MAX_MS as u64 + 1);
+        create_in(&mut h, dirs[0], 2);
+        assert_eq!(h.core.dl.mine[&7].executed, 2, "the hold did not lift");
+    }
+
+    /// A release of some of a stream's subtrees is a `SubtreeReleased`; the
+    /// stream stays and executes under the others (MUST-1: a partial release
+    /// never ends it). A name that is no sticky grant of the node is
+    /// refused.
+    #[test]
+    fn a_partial_release_journals_a_subtree_row_and_keeps_the_stream() {
+        let (mut h, dirs) = sticky_holder(&["a", "b"]);
+        let out = release(&mut h, 50, vec![dirs[0]], false);
+        assert!(answer(&out, 50).is_some_and(|r| r.is_ok()), "{out:?}");
+        assert!(matches!(
+            rows(&h).last().unwrap().records.as_slice(),
+            [LogRecord::SubtreeReleased { gen: 7, dir, .. }] if *dir == dirs[0]
+        ));
+        let d = &h.core.dl.mine[&7];
+        assert!(!d.stopped);
+        assert_eq!(d.dirs.iter().copied().collect::<Vec<_>>(), vec![dirs[1]]);
+        assert_eq!(h.core.stats.deleg_sticky_releases_partial, 1);
+        // Still executing under `b`.
+        create_in(&mut h, dirs[1], 1);
+        assert_eq!(h.core.dl.mine[&7].executed, 1);
+        // Naming a directory it does not hold is an error.
+        let out = release(&mut h, 51, vec![ROOT_INO], false);
+        assert!(answer(&out, 51).is_some_and(|r| r.is_err()), "{out:?}");
+        // Releasing the rest ends the stream's set: one `StreamReleased`.
+        release(&mut h, 52, vec![dirs[1]], false);
+        let _ = h.step(Event::Slack { epoch_slack: 0 });
+    }
+
+    /// The read delegations of the subtree are recalled before the release
+    /// row is streamed; the release (and a `wait` for it) goes on when they
+    /// are gone.
+    #[test]
+    fn the_read_delegations_of_the_subtree_are_recalled_before_the_row_streams() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        h.core.cfg.read_delegations = true;
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, dirs[0], until);
+        let out = release(&mut h, 50, Vec::new(), true);
+        let recall = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::DelegationRecall { req, .. } if to == 2 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the read delegation was not recalled: {out:?}"));
+        assert!(last_is_release(&h));
+        assert!(
+            batch(&out).is_none(),
+            "the row streamed before the recall: {out:?}"
+        );
+        assert!(h.core.dl.mine[&7].release.as_ref().unwrap().held);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: recall },
+        });
+        let out = flush(&mut h, &out);
+        let (req, round, last) =
+            batch(&out).unwrap_or_else(|| panic!("no row after the recall: {out:?}"));
+        assert!(answer(&out, 50).is_none());
+        let out = h.step(stream_ack(1, req, round, last));
+        assert!(answer(&out, 50).is_some_and(|r| r.is_ok()), "{out:?}");
+    }
+
+    /// The commands give up when the root never has the row: `wait` is
+    /// answered with an error.
+    #[test]
+    fn a_release_the_root_never_answers_is_given_up() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        create_in(&mut h, dirs[0], 1);
+        let out = release(&mut h, 50, Vec::new(), true);
+        assert!(answer(&out, 50).is_none());
+        let id = h.core.dl.sticky_timer.expect("no timer for the release");
+        h.advance(h.core.leave_wait_ms() as u64 + 1);
+        let out = h.step(Event::Timer { id });
+        assert!(answer(&out, 50).is_some_and(|r| r.is_err()), "{out:?}");
+        assert_eq!(h.core.stats.deleg_sticky_releases_given_up, 1);
+        assert!(h.core.dl.sticky_cmds.is_empty());
+        // The hold is gone with it.
+        create_in(&mut h, dirs[0], 2);
+        assert_eq!(h.core.dl.mine[&7].executed, 2);
+        let _ = Timer::StickyRelease;
+    }
+
+    /// The release row is the holder's own journal row, and its table
+    /// forgets the stream with it: the sync that follows (any segment of the
+    /// root's) must not drop the stream's state before the root has
+    /// appended the row, or the row is never streamed.
+    #[test]
+    fn a_sync_before_the_roots_ack_does_not_drop_the_released_stream() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        let out = release(&mut h, 50, Vec::new(), false);
+        assert!(last_is_release(&h), "{out:?}");
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.dl.mine.contains_key(&7),
+            "the stream was dropped before its release row was appended"
+        );
+        // Its own state, with the note (the hand-back of the subtrees' locks
+        // rides it), not a remnant rebuilt from the journal.
+        assert_eq!(
+            h.core.dl.mine[&7]
+                .release
+                .as_ref()
+                .map(|r| r.note.dirs.clone()),
+            Some(dirs.clone())
+        );
+    }
+
+    /// A restart between the release row and the root's append leaves the row
+    /// in the journal of a stream the table lists no subtree of: it is
+    /// installed again, stopped, holding the release, and ships the row.
+    /// Fails without the remnant's install: nothing sends the row, the root
+    /// holds the stream for good.
+    #[test]
+    fn a_restart_before_the_roots_append_ships_the_release_row_again() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        release(&mut h, 50, Vec::new(), false);
+        assert!(last_is_release(&h));
+        // The restart: the core's memory is gone, the journal stays.
+        h.core.dl.mine.remove(&7);
+        h.core.dl.installed_gens.clear();
+        h.core.dl.sticky_cmds.clear();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let d = &h.core.dl.mine[&7];
+        assert!(d.stopped && d.release.is_some() && d.dirs.is_empty());
+        let (req, round, last) =
+            batch(&out).unwrap_or_else(|| panic!("the row was not sent: {out:?}"));
+        assert_eq!(last, 1);
+        h.step(stream_ack(1, req, round, last));
+        assert!(h.core.dl.mine[&7].release.is_none());
+    }
+
+    /// The root refuses an op under a sticky grant whose holder is out of
+    /// reach (`EROFS`) only when it never sent the op on: one in doubt (a
+    /// forward whose answer did not come, resubmitted) may have run at the
+    /// holder, and a refusal for good would tell the application it did
+    /// not. It waits for the holder's word. Fails on the parent: `EROFS`
+    /// for both.
+    #[test]
+    fn an_op_in_doubt_under_a_sticky_grant_is_not_refused_for_good() {
+        let (mut h, d1, _d2) = root_with_two_dirs();
+        let (ok, out) = control_delegate(&mut h, 900, d1, 3, true);
+        assert!(ok, "{out:?}");
+        let gen = sticky_gen_of(&h, d1);
+        let op = |h: &Harness, n: u64| MutateOp::Create {
+            parent: d1,
+            name: format!("f{n}"),
+            ino: h.meta.allocate_ino(d1).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        // A fresh op goes to the holder; its answer does not come.
+        let rid = h.rid(1);
+        let o = op(&h, 1);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: o,
+            tag: Default::default(),
+        });
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::MutateRequest { .. })),
+            "not forwarded to the holder: {out:?}"
+        );
+        let mut out = out;
+        for _ in 0..8 {
+            if replies(&out).iter().any(|(r, _)| *r == rid) || h.core.dl.pending_exec.contains(&rid)
+            {
+                break;
+            }
+            let t = timers(&out, TimerKind::ForwardTimeout)
+                .into_iter()
+                .chain(timers(&out, TimerKind::ForwardBackoff))
+                .next_back()
+                .expect("no retry timer");
+            h.advance(h.core.cfg.forward_timeout_ms + 1);
+            out = h.step(Event::Timer { id: t });
+        }
+        // The retry finds the holder out of reach and the op in doubt: it is
+        // not refused for good (it may have run there); it waits.
+        assert!(
+            !replies(&out).iter().any(|(r, _)| *r == rid),
+            "answered: {out:?}"
+        );
+        assert!(h.core.dl.pending_exec.contains(&rid), "{out:?}");
+        let _ = gen;
+    }
+
+    /// The root answers a sticky holder's renewal "no" (ttl 0) while it
+    /// cannot grant, and that does not stop the stream: only the holder's
+    /// release or an operator's action ends a sticky grant. Fails on the
+    /// parent: the stream is stopped, and the holder can never release it.
+    #[test]
+    fn a_refused_renewal_does_not_stop_a_sticky_stream() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        // (The install sent the stream's first renewal.)
+        let (req, _) = h.core.dl.mine[&7].renew.expect("no renewal in flight");
+        h.step(renewed(&h, req, 7, 0));
+        assert!(
+            !h.core.dl.mine[&7].stopped,
+            "the refusal stopped the stream"
+        );
+        assert_eq!(h.core.stats.deleg_renewals_refused, 1);
+    }
+
+    /// A node that holds no sticky grant is told so.
+    #[test]
+    fn a_node_without_sticky_grants_has_nothing_to_release() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let out = release(&mut h, 50, Vec::new(), true);
+        assert!(answer(&out, 50).is_some_and(|r| r.is_ok()), "{out:?}");
+    }
+
+    /// The root's side: a partial release of a sticky stream shrinks it (the
+    /// same generation, the other subtree live) and does not end it; the
+    /// release of what is left ends it. Fails on the knob
+    /// (`partial_release_ends_stream`), which ends it at the first row.
+    #[test]
+    fn a_partial_release_keeps_the_stream_at_the_root() {
+        for knob in [false, true] {
+            let (mut h, d1, d2) = root_with_two_dirs();
+            h.core.cfg.partial_release_ends_stream = knob;
+            let (ok, out) = control_delegate(&mut h, 900, d1, 3, true);
+            assert!(ok, "{out:?}");
+            let (ok, out) = control_delegate(&mut h, 901, d2, 3, true);
+            assert!(ok, "{out:?}");
+            let gen = sticky_gen_of(&h, d1);
+            assert_eq!(h.core.dl.gens[&gen].kind(), DelegKind::Sticky);
+            let row = delegate_tx(
+                1,
+                vec![LogRecord::SubtreeReleased {
+                    node: 3,
+                    gen,
+                    dir: d1,
+                    at: 0,
+                }],
+            );
+            let note = constellation_meta::locks::ReleaseNote {
+                dirs: vec![d1],
+                ..Default::default()
+            };
+            deliver_stream(&mut h, 3, gen, vec![row], Some(note));
+            let g = &h.core.dl.gens[&gen];
+            if knob {
+                assert!(
+                    g.ended || matches!(g.recall, RecallPhase::Drained(_)),
+                    "the knob did not end the stream"
+                );
+                continue;
+            }
+            assert!(!g.ended);
+            assert_eq!(g.recall, RecallPhase::None);
+            assert_eq!(g.dir_list(), vec![d2]);
+            assert!(h.meta.delegation_table().get(d1).is_none());
+            assert_eq!(h.meta.delegation_table().get(d2).map(|t| t.gen), Some(gen));
+            assert_eq!(h.core.stats.deleg_sticky_ended_released, 0);
+            let row = delegate_tx(
+                2,
+                vec![LogRecord::StreamReleased {
+                    node: 3,
+                    gen,
+                    through: 1,
+                }],
+            );
+            let note = constellation_meta::locks::ReleaseNote {
+                dirs: vec![d2],
+                ..Default::default()
+            };
+            deliver_stream(&mut h, 3, gen, vec![row], Some(note));
+            assert!(h.core.dl.gens[&gen].ended, "the stream was not ended");
+            assert_eq!(h.core.stats.deleg_sticky_ended_released, 1);
+            assert_eq!(h.core.stats.deleg_sticky_recalled_other, 0);
+        }
+        let _: Option<TouchSet> = None;
+    }
+}

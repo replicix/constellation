@@ -488,6 +488,10 @@ pub(crate) struct ParkedDeleg {
     pub tag: LockTag,
     /// Plan 43 C2: a settle of the rid, not an execution.
     pub settle: bool,
+    /// Plan 46 M1.3 step 5: parked because a release of the subtree is
+    /// draining (`Core::sticky_holds`): it runs again when the hold lifts,
+    /// and is sent to the root when the release row is journaled.
+    pub held: bool,
 }
 
 /// Plan 46 M1.2 step 10: a release this delegate journaled (or could not,
@@ -933,6 +937,32 @@ const HANDED_BACK_UNSEEN_MS: i64 = 60_000;
 /// How many freezes [`DelegationState::freezes`] keeps.
 const FREEZES_KEPT: usize = 8;
 
+/// Plan 46 M1.3 step 5: one `Control::StickyRelease` in progress. Per
+/// stream it names, the subtrees it releases; each part is released when the
+/// holder has drained (no op of the subtrees in flight here, the root has
+/// appended through the last row of the stream), and the command is done
+/// when the root has appended the release rows. Until a part's row is
+/// journaled (and at most [`STICKY_HOLD_MAX_MS`] from the start) new ops
+/// under its subtrees are held, so that the drain does not chase a stream
+/// that never stops.
+#[derive(Debug)]
+pub(crate) struct StickyReleaseCmd {
+    /// The control to answer once done (`wait`).
+    pub op: Option<OpId>,
+    pub started: WaitMs,
+    pub deadline: WaitMs,
+    /// Generation -> the subtrees to release.
+    pub parts: BTreeMap<u64, BTreeSet<Ino>>,
+}
+
+/// How long a draining release holds the new ops of its subtrees at most
+/// (a stalled drain, a root that does not answer, must not stop the
+/// holder's clients: past it the ops run and the release goes on waiting).
+pub(crate) const STICKY_HOLD_MAX_MS: i64 = 5_000;
+
+/// How often the holder's releases in progress look again with no event.
+const STICKY_RELEASE_TICK_MS: i64 = 200;
+
 /// Plan 46 M1.2 step 11 (maintainer decision 2026-11-06, "Leave ends grants
 /// first"): a node leaves the roster only once the log has ended every grant
 /// it holds. The holder that is alive releases them (`StreamReleased` rows,
@@ -1108,6 +1138,15 @@ pub(crate) struct DelegationState {
     /// for the grants of a node to end in the log (see [`LeaveWait`]).
     pub leave_waits: Vec<LeaveWait>,
     pub leave_timer: Option<TimerId>,
+    /// Plan 46 M1.3 step 5: the holder's releases of sticky subtrees in
+    /// progress (see [`StickyReleaseCmd`]).
+    pub sticky_cmds: Vec<StickyReleaseCmd>,
+    pub sticky_timer: Option<TimerId>,
+    /// Plan 46 M1.3 step 5: the generations this process installed and the
+    /// table still lists. A stream of this node that released every subtree
+    /// and is not among them lost its state with a restart
+    /// (`delegation_sync` installs a remnant to ship the release row).
+    pub installed_gens: BTreeSet<u64>,
     /// The nodes leaving (this node is their root): nothing is granted to
     /// them from the moment their leave starts, so no grant is made between
     /// the end of their grants and the retirement of their registry entry.
@@ -1660,12 +1699,28 @@ impl Core {
             .filter(|d| d.node == me)
             .map(|d| d.gen)
             .collect();
+        // A stream whose every subtree this node released is no entry of
+        // `table.iter()` (its own journal applied the release row), but it
+        // is live in the table until the root ends it. Until the root has
+        // appended the release row the state of a non-stealable stream stays:
+        // the row is shipped by it (plan 46 M1.3 step 5; a sync between the
+        // row and the root's acknowledgement dropped the state, and the row
+        // was never streamed: a sticky holder's answers are final, so its
+        // rows are the root's only copy). A stealable stream's recall is
+        // outwaited by the root's expiry whatever its row did, and is left
+        // as it was.
+        let streams_mine: BTreeSet<u64> = table
+            .streams()
+            .filter(|s| s.node == me)
+            .map(|s| s.gen)
+            .collect();
         let ended: Vec<u64> = self
             .dl
             .mine
-            .keys()
-            .copied()
-            .filter(|g| !live_mine.contains(g))
+            .iter()
+            .filter(|(g, _)| !live_mine.contains(g))
+            .filter(|(g, d)| !(d.non_stealable && d.release.is_some() && streams_mine.contains(g)))
+            .map(|(g, _)| *g)
             .collect();
         for gen in ended {
             self.drop_delegate_state(now, gen, replica, out);
@@ -1679,6 +1734,7 @@ impl Core {
         });
         let live: BTreeSet<u64> = table.gens().collect();
         self.dl.release_first.retain(|gen| live.contains(gen));
+        self.dl.installed_gens.retain(|gen| live.contains(gen));
         // Path B: the table here can be ahead of the log (the root's stream
         // installs its records speculatively), and say that a generation of
         // this node ended and a new one began before the segment that ends
@@ -1701,8 +1757,19 @@ impl Core {
         let mut commit_now: BTreeSet<u64> = BTreeSet::new();
         let mut retry = false;
         for st in table.streams().filter(|s| s.node == me) {
-            // A stream that released every subtree holds nothing to install.
-            if st.subtrees.is_empty() {
+            // A stream that released every subtree holds nothing to install,
+            // unless its release row is still to ship: a restart between the
+            // row and the root's append (plan 46 M1.3 step 5) left it in the
+            // journal, and nothing else would send it. The remnant is
+            // installed stopped, holding the release.
+            // Only after a restart: a stream this process installed and
+            // dropped is not one whose state was lost (a recall's answer is
+            // outwaited by the root whatever its row did).
+            let remnant = st.subtrees.is_empty();
+            if remnant
+                && (self.dl.installed_gens.contains(&st.gen)
+                    || replica.delegate_idx(st.gen) <= replica.log_stream_idx(st.gen))
+            {
                 continue;
             }
             let d = StreamView::of(&st);
@@ -1807,12 +1874,25 @@ impl Core {
             // replica without them (chaos-soak-4 seed 42, `wf293`). The
             // floor covers everything applied so far.
             self.shipped_floor = self.shipped_floor.max(replica.applied_seq().unwrap_or(0));
+            self.dl.installed_gens.insert(d.gen);
             self.dl.mine.insert(
                 d.gen,
                 DelegateState {
                     dirs: d.dir_list().into_iter().collect(),
                     grown: BTreeMap::new(),
-                    release: None,
+                    release: remnant.then(|| PendingRelease {
+                        note: constellation_meta::locks::ReleaseNote {
+                            leaving: self.dl.leave_self,
+                            ..Default::default()
+                        },
+                        row: Some(replica.delegate_idx(d.gen)),
+                        first_row: Some(replica.delegate_idx(d.gen)),
+                        held: false,
+                        holds: 0,
+                        left_at: now.wait,
+                        to: self.root_node().unwrap_or(0),
+                        ends: true,
+                    }),
                     release_acked: false,
                     release_pending: (BTreeSet::new(), 0),
                     released_dirs: BTreeSet::new(),
@@ -1823,7 +1903,7 @@ impl Core {
                     // This node's takeover gate ended the generation
                     // (`Meta::strand_for_takeover`): it ends at what the
                     // log holds of it; nothing more executes here.
-                    stopped: replica.deleg_ended_at_gate(d.gen) || rebooted,
+                    stopped: replica.deleg_ended_at_gate(d.gen) || rebooted || remnant,
                     stream_after: None,
                     stream_backoff_ms: 0,
                     refused: false,
@@ -1874,6 +1954,10 @@ impl Core {
                     lost_from: None,
                 },
             );
+            if remnant {
+                self.arm_stream_tick(now, out);
+                continue;
+            }
             if d.non_stealable() {
                 // Honoured whatever the root says or the clock does
                 // (DESIGN.md §5.2: the designee writes while isolated).
@@ -2580,6 +2664,10 @@ impl Core {
             && honoured
             && reaches
             && self.deleg_read_recall_pending(now, from, op, replica, out);
+        // Plan 46 M1.3 step 5: a release of the subtree is draining; the op
+        // waits for its row (it goes to the root then) or for the hold to
+        // lift.
+        let holding = !settle && self.sticky_holds(now, gen, &keys, replica);
         // Plan 46 M0.2 (review): behind the replay queue on its keys, as at
         // the root (R3); under `ack=s3` a delegate's rows for other nodes
         // are `Archive` and become placeholders too. The parked op is
@@ -2588,7 +2676,7 @@ impl Core {
         if queued {
             self.stats.ops_parked_behind_queue += 1;
         }
-        if !honoured || !reaches || recalling || queued {
+        if !honoured || !reaches || recalling || queued || holding {
             tracing::debug!(
                 node = self.me(),
                 gen = %constellation_meta::delegation::GenLabel::of(gen),
@@ -2604,6 +2692,8 @@ impl Core {
                 self.stats.deleg_deps_waits += 1;
             } else if !honoured {
                 self.stats.deleg_parked_expired += 1;
+            } else if holding {
+                self.stats.deleg_sticky_release_held += 1;
             } else {
                 self.stats.recall_waits += 1;
             }
@@ -2617,6 +2707,7 @@ impl Core {
                 acked_through,
                 tag: tag.clone(),
                 settle,
+                held: holding,
             });
             if from == 0 {
                 if let Some(c) = self.clients.get_mut(&rid) {
@@ -4478,6 +4569,7 @@ impl Core {
         }
         self.deleg_forget_ended(now, replica);
         self.deleg_leave_progress(now, replica, out);
+        self.sticky_release_progress(now, replica, out);
         // Plan 43 C2e (D8): a strict member's sealed tail that the drain
         // stopped short of (a dependency the log brings, a root that could
         // not end the recall) is drained again; the generation ends once the
@@ -4613,7 +4705,14 @@ impl Core {
                 .filter(|(_, p)| {
                     p.settle
                         || (replica.reaches(&p.deps)
-                            && !self.gated_by_queue(p.from, p.rid, &p.op, replica))
+                            && !self.gated_by_queue(p.from, p.rid, &p.op, replica)
+                            && !(p.held
+                                && self.sticky_holds(
+                                    now,
+                                    gen,
+                                    &super::holder::keys_of_op_in(&p.op, replica),
+                                    replica,
+                                )))
                 })
                 .map(|(i, p)| (i, p.from, p.op.clone(), p.settle))
                 .collect();
@@ -6814,6 +6913,15 @@ impl Core {
             return;
         };
         self.stats.deleg_renewals_refused += 1;
+        // A non-stealable grant is not ended by a renewal's answer: the root
+        // never takes it back by itself (a sticky grant ends by its holder's
+        // release, plan 46 §5.4), and answers "no" while it cannot grant
+        // (it is not usable, its window is closed). The holder goes on; a
+        // stream it stopped here was never released, and its subtree stayed
+        // the root's to refuse for good (plan 46 M1.3 step 5).
+        if d.non_stealable {
+            return;
+        }
         let ran_out = !d.lapsed && now.honour >= self.deleg_lapse_at(d);
         if ran_out {
             // (The root answered: it cannot have been silent.)
@@ -7121,6 +7229,22 @@ impl Core {
                 return;
             }
         }
+        self.release_subtrees(now, from, gen, dirs, replica, out);
+    }
+
+    /// The release itself (see [`Self::on_release_request`]): `from` is the
+    /// root the note goes to. Also the holder's own, once it has drained
+    /// ([`Self::sticky_release_progress`]).
+    #[allow(clippy::too_many_arguments)]
+    fn release_subtrees(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        gen: u64,
+        dirs: Vec<Ino>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         let me = self.me();
         let asked: BTreeSet<Ino> = dirs.into_iter().collect();
         let Some(d) = self.dl.mine.get(&gen) else {
@@ -7228,6 +7352,17 @@ impl Core {
             cut = cut.min(lost - 1);
         }
         let rowless = cut < idx || self.dl.mine.get(&gen).is_some_and(|d| d.stopped);
+        tracing::debug!(
+            node = me,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
+            ?asked,
+            ?held,
+            whole,
+            rowless,
+            idx,
+            cut,
+            "releasing subtrees"
+        );
         // Without a row the stream ends at the cut, every subtree with it:
         // the whole stream is handed back, its locks too (the others'
         // holders keep honouring them until the root has them).
@@ -8051,7 +8186,12 @@ impl Core {
             g.releasing.remove(dir);
         }
         let cursor = g.cursor;
-        let end = cut.or_else(|| (whole || g.dirs.is_empty()).then_some(cursor));
+        // (The knob `partial_release_ends_stream`: a sticky stream ends at
+        // any release row of its holder.)
+        let knob = self.cfg.partial_release_ends_stream
+            && g.kind() == DelegKind::Sticky
+            && !dirs.is_empty();
+        let end = cut.or_else(|| (whole || g.dirs.is_empty() || knob).then_some(cursor));
         if let Some(th) = end {
             g.releasing.clear();
             if matches!(g.recall, RecallPhase::None | RecallPhase::Sent) {
@@ -10357,6 +10497,304 @@ impl Core {
         });
         self.deleg_leave_progress(now, replica, out);
         self.leave_wait_arm(now, out);
+    }
+
+    // ------------------------------------------- the holder's own release
+
+    /// The sticky subtrees of stream `gen` this node holds and honours.
+    fn sticky_held(&self, gen: u64, replica: &dyn Replica) -> BTreeSet<Ino> {
+        let me = self.me();
+        let Some(d) = self.dl.mine.get(&gen) else {
+            return BTreeSet::new();
+        };
+        let table = replica.delegation_table();
+        d.dirs
+            .iter()
+            .copied()
+            .filter(|dir| {
+                table
+                    .get(*dir)
+                    .is_some_and(|t| t.node == me && t.gen == gen && t.kind == SubtreeKind::Sticky)
+            })
+            .collect()
+    }
+
+    /// Whether a release of this node's is draining the subtree the keys lie
+    /// in (stream `gen`): the op waits (`ParkedDeleg::held`) for the release
+    /// row, which sends it to the root, or for the hold to lift. A hold lasts
+    /// [`STICKY_HOLD_MAX_MS`] at most.
+    pub(crate) fn sticky_holds(
+        &self,
+        now: Now,
+        gen: u64,
+        keys: &TouchSet,
+        replica: &dyn Replica,
+    ) -> bool {
+        if self.dl.sticky_cmds.is_empty() || self.cfg.holder_releases_before_drain {
+            return false;
+        }
+        let mut live = self
+            .dl
+            .sticky_cmds
+            .iter()
+            .filter(|c| now.wait.since(c.started) < STICKY_HOLD_MAX_MS)
+            .filter_map(|c| c.parts.get(&gen))
+            .peekable();
+        if live.peek().is_none() {
+            return false;
+        }
+        match replica.resolve_ownership(keys) {
+            Ownership::Delegated(t) if t.node == self.me() && t.gen == gen => {
+                live.any(|dirs| dirs.contains(&t.dir))
+            }
+            _ => false,
+        }
+    }
+
+    /// `Control::StickyRelease` (plan 46 M1.3 step 5): the holder releases
+    /// sticky subtrees by its own decision (idle, unmount, suspend, by
+    /// hand). The command is the request; [`Self::sticky_release_progress`]
+    /// does the release once the holder has drained. The root's side is the
+    /// one of a recall's release: it appends the row, then ends the stream
+    /// (`DelegateNodeEnded`) when nothing is left of it, or lets it live on
+    /// without the released subtrees (the same generation).
+    pub(crate) fn on_control_sticky_release(
+        &mut self,
+        now: Now,
+        op: OpId,
+        dirs: Vec<Ino>,
+        wait: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let asked: BTreeSet<Ino> = dirs.into_iter().collect();
+        let mut parts: BTreeMap<u64, BTreeSet<Ino>> = BTreeMap::new();
+        let mut found: BTreeSet<Ino> = BTreeSet::new();
+        let gens: Vec<u64> = self.dl.mine.keys().copied().collect();
+        for gen in gens {
+            let mut pool = self.sticky_held(gen, replica);
+            // (Subtrees a release in progress has named count: the command
+            // is repeated, and waits for the same rows.)
+            for c in &self.dl.sticky_cmds {
+                if let Some(p) = c.parts.get(&gen) {
+                    pool.extend(p.iter().copied());
+                }
+            }
+            let pick: BTreeSet<Ino> = if asked.is_empty() {
+                pool
+            } else {
+                pool.intersection(&asked).copied().collect()
+            };
+            found.extend(pick.iter().copied());
+            if !pick.is_empty() {
+                parts.insert(gen, pick);
+            }
+        }
+        let unknown: Vec<Ino> = asked.difference(&found).copied().collect();
+        if !unknown.is_empty() {
+            out.push(Action::ControlDone {
+                op,
+                result: Err(format!(
+                    "not a sticky grant of this node: {}",
+                    unknown
+                        .iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            });
+            return;
+        }
+        if parts.is_empty() {
+            out.push(Action::ControlDone {
+                op,
+                result: Ok(ControlOk::Text("this node holds no sticky grant".into())),
+            });
+            return;
+        }
+        let n: usize = parts.values().map(|p| p.len()).sum();
+        if !wait {
+            out.push(Action::ControlDone {
+                op,
+                result: Ok(ControlOk::Text(format!("releasing {n} sticky subtree(s)"))),
+            });
+        }
+        self.dl.sticky_cmds.push(StickyReleaseCmd {
+            op: wait.then_some(op),
+            started: now.wait,
+            deadline: now.wait.plus(self.leave_wait_ms() as u64),
+            parts,
+        });
+        self.sticky_release_progress(now, replica, out);
+    }
+
+    /// Every event and tick: release what has drained, answer the commands
+    /// that are done, give up on the ones out of time.
+    pub(crate) fn sticky_release_progress(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.dl.sticky_cmds.is_empty() {
+            return;
+        }
+        let mut cmds = std::mem::take(&mut self.dl.sticky_cmds);
+        let mut keep = Vec::new();
+        for mut c in cmds.drain(..) {
+            let gens: Vec<u64> = c.parts.keys().copied().collect();
+            for gen in gens {
+                let mut dirs = c.parts.remove(&gen).expect("present");
+                if !self.sticky_part_progress(now, gen, &mut dirs, replica, out) {
+                    c.parts.insert(gen, dirs);
+                }
+            }
+            if c.parts.is_empty() {
+                if let Some(op) = c.op {
+                    out.push(Action::ControlDone {
+                        op,
+                        result: Ok(ControlOk::Text("the sticky subtrees are released".into())),
+                    });
+                }
+                continue;
+            }
+            if now.wait >= c.deadline {
+                self.stats.deleg_sticky_releases_given_up += 1;
+                tracing::warn!(
+                    node = self.me(),
+                    "a release of sticky subtrees did not complete in time; the grants stay"
+                );
+                if let Some(op) = c.op {
+                    out.push(Action::ControlDone {
+                        op,
+                        result: Err("the sticky subtrees are not released yet (the holder \
+                                     has not drained, or the root has not appended the \
+                                     release); run the release again"
+                            .into()),
+                    });
+                }
+                continue;
+            }
+            keep.push(c);
+        }
+        keep.append(&mut self.dl.sticky_cmds);
+        self.dl.sticky_cmds = keep;
+        self.sticky_release_arm(now, out);
+    }
+
+    /// One part of a command: stream `gen`'s subtrees `dirs`. `true`: done.
+    fn sticky_part_progress(
+        &mut self,
+        now: Now,
+        gen: u64,
+        dirs: &mut BTreeSet<Ino>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        let me = self.me();
+        // The log ended the stream: the root has the release (or ended it).
+        let Some(d) = self.dl.mine.get(&gen) else {
+            return true;
+        };
+        let still: Vec<Ino> = dirs
+            .iter()
+            .copied()
+            .filter(|x| d.dirs.contains(x))
+            .collect();
+        // Released (by this command's row, or a recall's): done once the
+        // root has appended the row (the note is not pending any more).
+        if still.is_empty() {
+            return d.release.is_none();
+        }
+        // The ops of the subtrees that are in flight here: parked for their
+        // dependencies or a read recall, not the ones this release holds.
+        let busy = d.parked.iter().any(|p| {
+            !p.held
+                && matches!(
+                    replica.resolve_ownership(&super::holder::keys_of_op_in(&p.op, replica)),
+                    Ownership::Delegated(t)
+                        if t.node == me && t.gen == gen && still.contains(&t.dir)
+                )
+        });
+        let (inflight, stopped, refused, streamed) = (
+            d.inflight.is_some(),
+            d.stopped,
+            d.refused,
+            d.streamed_through,
+        );
+        let root = d.last_root.or_else(|| self.root_node());
+        let idx = replica.delegate_idx(gen);
+        // A stream that cannot release by a row (a lost dependency, rows its
+        // tenure has not committed) would end whole at a cut: never for a
+        // release of some subtrees. It waits.
+        let cap = self.holder_append_cap(gen, replica);
+        let lost = self.deleg_find_lost(gen, replica);
+        let Some(root) = root else {
+            self.deleg_learn_root(now, out);
+            return false;
+        };
+        if stopped || idx > cap || lost.is_some() {
+            tracing::debug!(
+                node = me,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
+                stopped,
+                idx,
+                cap,
+                lost = ?lost,
+                "a sticky release waits: the stream cannot release by a row now"
+            );
+            return false;
+        }
+        let drained = !busy && !inflight && !refused && streamed >= idx;
+        if !drained {
+            tracing::debug!(
+                node = me,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
+                busy,
+                inflight,
+                refused,
+                streamed,
+                idx,
+                "a sticky release waits for the drain"
+            );
+            if !self.cfg.holder_releases_before_drain {
+                return false;
+            }
+            self.stats.deleg_sticky_release_undrained += 1;
+        }
+        self.release_subtrees(now, root, gen, still, replica, out);
+        if let Some(d) = self.dl.mine.get(&gen) {
+            if dirs.iter().all(|x| !d.dirs.contains(x)) {
+                self.stats.deleg_sticky_releases += 1;
+                if !d.stopped {
+                    // (The stream lives on: MUST-1.)
+                    self.stats.deleg_sticky_releases_partial += 1;
+                }
+            }
+        }
+        false
+    }
+
+    fn sticky_release_arm(&mut self, now: Now, out: &mut Vec<Action>) {
+        if self.dl.sticky_timer.is_some() || self.dl.sticky_cmds.is_empty() {
+            return;
+        }
+        let t = self.set_timer_wait(
+            now.wait.plus(STICKY_RELEASE_TICK_MS as u64),
+            Timer::StickyRelease,
+            out,
+        );
+        self.dl.sticky_timer = Some(t);
+    }
+
+    pub(crate) fn on_sticky_release_timer(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.dl.sticky_timer = None;
+        self.sticky_release_progress(now, replica, out);
     }
 
     /// `Control::EndGrantsOf { node }` (the admin form of leave, for a node
