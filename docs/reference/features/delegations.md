@@ -592,9 +592,19 @@ delegated directory do not wait for its ship either. Status:
   one-way delay), or the reclaim horizon (`ttl + margin`) after the
   install for a grant it never got renewed. The root is then dead or
   cut off. Lapsed, the generation executes and parks nothing (it still
-  streams what it holds), and its ops, the parked ones first, take the
-  ordinary route: to a live root, which recalls the generation first,
-  else the inbox and the lease path. It keeps asking for a renewal
+  streams what it holds), and its ops, the ones parked on a renewal
+  first, take the ordinary route: to a live root, which recalls the
+  generation first, else the inbox and the lease path. An op of this
+  node's own that already executed and waits for the root's append stays
+  parked until the root's end of the generation (the lapse point and a
+  few round trips of the link, a request timeout at most): a root alive
+  behind a slow link outwaits the generation, then commits the row with
+  the tail, and an op sent down the lease path meanwhile would hear `EIO`
+  before its row landed. Past that point the root is silent for good and
+  the op takes the lease path. An op of this node's own in doubt in a
+  lapsed generation settles no earlier than that point and a settle
+  window; the root's own settle, parked for a generation it outwaits, is
+  held until the outwait ends. It keeps asking for a renewal
   every request timeout: a link that recovers before the root reclaims
   gets the grant back, and only a refusal or the log ends the
   generation. Status: `lapsed`. A lapse is always safe: it only gives up

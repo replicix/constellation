@@ -1066,6 +1066,30 @@ impl Core {
         self.rd.parked.values().any(|p| p.deps.is_some())
     }
 
+    /// When the latest live generation window ends (the root's wait clock)
+    /// that `rid`'s local execution is parked on the recall of; `None` if it
+    /// waits on no generation. The root outwaits a silent delegate once its
+    /// window runs out, so that is the latest the park waits.
+    pub(crate) fn exec_local_park_outwait(&self, rid: Rid) -> Option<WaitMs> {
+        let p = self
+            .rd
+            .parked
+            .values()
+            .find(|p| matches!(p.what, ParkedWhat::ExecuteLocal { rid: r } if r == rid))?;
+        p.waiting
+            .iter()
+            .filter(|w| **w >= super::delegate::DELEG_WAIT_BASE)
+            .filter_map(|w| {
+                let gen = w - super::delegate::DELEG_WAIT_BASE;
+                self.dl
+                    .gens
+                    .get(&gen)
+                    .filter(|g| !g.ended)
+                    .map(|_| self.gen_until(gen))
+            })
+            .max()
+    }
+
     /// Phase 2b round 2: a local op parked on a recall (`ExecuteLocal`)
     /// reached its client deadline: the park is dropped (the op never
     /// ran; the client hears in doubt and retries by rid).

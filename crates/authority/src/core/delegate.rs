@@ -6279,7 +6279,12 @@ impl Core {
             return;
         };
         d.lapse_timer = None;
-        if d.non_stealable || d.stopped || d.lapsed {
+        if d.non_stealable || d.stopped {
+            return;
+        }
+        if d.lapsed {
+            // The watch armed for the parked ops' give-up point.
+            self.deleg_give_up_parks(now, gen, replica, out);
             return;
         }
         let d = self.dl.mine.get(&gen).expect("present");
@@ -6309,19 +6314,81 @@ impl Core {
             self.answer_not_owner(now, p, root, replica, out);
         }
         // Plan 46 M1.2 step 13: no delegate answers on its disk alone, so an
-        // op of this node's own clients that waits for the root's append is
-        // waiting for a root that is silent past its earliest reclaim. It is
-        // in doubt from here (its row is journaled, its client not
-        // answered): the client takes the lease path under its rid, which is
-        // what takes a dead root over by TTL, and the answer comes from
-        // whichever sequencer holds the row. Before, such an op was answered
-        // from the disk and nothing waited on the root.
-        for id in self.stream_parks_of(gen) {
-            self.abort_park_busy(now, id, replica, out);
+        // op of this node's own clients waits for the root's append, and
+        // the lapse does not take it away: a root alive behind a slow link
+        // outwaits the generation until `deleg_end_due`, fetches the row
+        // with the tail and commits it, and an op sent down the lease path
+        // meanwhile (the root refuses it until the generation has ended)
+        // would hear `EIO` before its row landed (I4). A root that renews
+        // appends the row and releases the park. The give-up is at the
+        // root's end of the generation: if the generation is still here
+        // and nothing ended it, the root is dead, and the client takes the
+        // lease path under its rid, which takes a dead root over by TTL.
+        if !self.stream_parks_of(gen).is_empty() {
+            self.arm_deleg_give_up(now, gen, out);
         }
         self.deleg_renew_now(now, gen, out);
         self.deleg_lapsed_retry(now, gen, out);
         self.deleg_after_event(now, replica, out);
+    }
+
+    /// When a root alive behind the link has ended generation `d` for
+    /// want of a renewal: the root's earliest reclaim
+    /// ([`Core::deleg_lapse_at`]) and the recall that fetches the tail
+    /// (a few round trips of the link to the root, at most one request
+    /// timeout; a link not measured, the whole timeout).
+    pub(crate) fn deleg_end_due(&self, d: &DelegateState) -> HonourMs {
+        let timeout = self.deleg_request_timeout_ms();
+        let recall = self
+            .root_node()
+            .and_then(|r| self.links.get(&r))
+            .and_then(|l| l.rtt_ms)
+            .map_or(timeout, |rtt| rtt.saturating_mul(4).min(timeout));
+        self.deleg_lapse_at(d).plus(recall)
+    }
+
+    fn arm_deleg_give_up(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
+        let Some(d) = self.dl.mine.get(&gen) else {
+            return;
+        };
+        let at = self.deleg_end_due(d).max(now.honour.plus(1));
+        let old = self
+            .dl
+            .mine
+            .get_mut(&gen)
+            .expect("present")
+            .lapse_timer
+            .take();
+        if let Some(t) = old {
+            self.cancel_timer(t, out);
+        }
+        let t = self.set_timer_honour(at, Timer::DelegLapse(gen), out);
+        self.dl.mine.get_mut(&gen).expect("present").lapse_timer = Some(t);
+    }
+
+    /// The give-up point of a lapsed generation's parked ops: the root's
+    /// end of the generation has passed and nothing ended it here, so the
+    /// root is silent for good ([`Core::on_deleg_lapse`]).
+    fn deleg_give_up_parks(
+        &mut self,
+        now: Now,
+        gen: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(d) = self.dl.mine.get(&gen) else {
+            return;
+        };
+        if now.honour < self.deleg_end_due(d) {
+            self.arm_deleg_give_up(now, gen, out);
+            return;
+        }
+        tracing::warn!(
+            node = self.me(),
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
+            "the lapsed delegation outlived the root's reclaim: its parked ops take the lease path"
+        );
+        self.deleg_abort_stream_parks(now, gen, replica, out);
     }
 
     /// A lapsed generation asks for a renewal again every request

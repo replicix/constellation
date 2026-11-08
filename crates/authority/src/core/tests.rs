@@ -33824,6 +33824,72 @@ mod s3_no_loops {
         })
     }
 
+    /// Plan 46 M1.2 step 13 (review, `long-delegated+settle` seeds 1694 and
+    /// 8929): the root's own op, settling, parked for the recall of a
+    /// generation the root outwaits is held until the outwait ends, not
+    /// dropped at the client's second deadline: the delegate's rows land
+    /// when the generation ends, and a client told `EIO` before sees its
+    /// row land after (I4). Once the outwait is over the deadline acts as
+    /// before. Fails on the parent: the park is dropped and the client told
+    /// in doubt at the deadline.
+    #[test]
+    fn a_settle_parked_for_a_generations_outwait_is_held_until_it_ends() {
+        let (mut h, dir, gen) = delegated_root();
+        let rid = h.rid(1);
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Create {
+                parent: dir,
+                name: "own".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            tag: Default::default(),
+        });
+        assert!(replies(&out).is_empty(), "{out:?}");
+        // The delegate is being recalled (a silent one): the settle is the
+        // root's own, parked for the recall.
+        let mut out = Vec::new();
+        h.core.start_recall(h.clk(), gen, &mut out);
+        // The first deadline: the op settles.
+        let deadline = h.core.clients[&rid].deadline;
+        let out = h.step(Event::Timer { id: deadline });
+        let end = h
+            .core
+            .exec_local_park_outwait(rid)
+            .unwrap_or_else(|| panic!("not parked for the recall: {out:?}"));
+        assert_eq!(end, h.core.gen_until(gen));
+        // The second deadline, inside the generation's window.
+        let deadline = h.core.clients[&rid].deadline;
+        let out = h.step(Event::Timer { id: deadline });
+        assert!(
+            !replies(&out)
+                .iter()
+                .any(|(r, a)| *r == rid && matches!(a, ClientReply::InDoubt)),
+            "told in doubt while the root outwaits the generation: {out:?}"
+        );
+        assert_eq!(h.core.stats.settles_held_for_outwait, 1);
+        assert!(
+            h.core.exec_local_park_outwait(rid).is_some(),
+            "park dropped"
+        );
+        // Past the window the deadline acts as before.
+        h.advance(end.since(h.clk().wait) as u64 + 1);
+        let deadline = h.core.clients[&rid].deadline;
+        let out = h.step(Event::Timer { id: deadline });
+        assert_eq!(h.core.stats.settles_held_for_outwait, 1);
+        assert!(
+            replies(&out)
+                .iter()
+                .any(|(r, a)| *r == rid && matches!(a, ClientReply::InDoubt)),
+            "{out:?}"
+        );
+    }
+
     fn reply_to(out: &[Action], to: NodeId, req: u64) -> Option<MutateOutcome> {
         sends(out).into_iter().find_map(|(n, m)| match m {
             PeerMsg::MutateReply {
@@ -44439,6 +44505,117 @@ mod deleg_group {
             "answered Abandoned for an op that took effect: {out:?}"
         );
         assert_eq!(h.core.stats.settled_local, 0);
+    }
+
+    /// The delegate of [`delegate_renewed_once`] with one op of its own node
+    /// parked for the root's append, the root 250 ms away (the recall
+    /// allowance after the lapse is four round trips: a second): the
+    /// harness, the op's rid and the two points, the grant's lapse and the
+    /// root's end of the generation.
+    fn lapse_with_a_parked_own_op() -> (Harness, Rid, Ms, Ms) {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        root_is_near(&mut h);
+        h.core.links.get_mut(&1).expect("link").rtt_ms = Some(250);
+        let rid = h.rid(1);
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Create {
+                parent: dir,
+                name: "own".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            tag: Default::default(),
+        });
+        assert!(
+            client_answers(&out).is_empty(),
+            "waits for the root: {out:?}"
+        );
+        assert_eq!(h.core.stream_parks_of(7).len(), 1);
+        let end_due = h.core.deleg_end_due(&h.core.dl.mine[&7]);
+        let slack = 1_000.min(h.core.deleg_request_timeout_ms()) as i64;
+        let lapse_at = Ms(end_due.0 - slack);
+        (h, rid, lapse_at, Ms(end_due.0))
+    }
+
+    /// Plan 46 M1.2 step 13 (review MUST): a lapsed grant takes nothing from
+    /// the delegate's own op that waits for the root's append until the
+    /// root has ended the generation: a root alive behind a slow link
+    /// outwaits it, fetches the row with the tail and commits it, and the op
+    /// sent down the lease path meanwhile heard `EIO` before its row landed
+    /// (`long-delegated+settle` seed 1694's mechanism, I4). Past the root's
+    /// end of the generation nothing ended it, the root is silent for good
+    /// and the op takes the lease path. Fails on the parent: the park is
+    /// aborted at the lapse.
+    #[test]
+    fn a_lapsed_grants_own_op_waits_for_the_roots_end_of_the_generation() {
+        let (mut h, rid, lapse_at, end_due) = lapse_with_a_parked_own_op();
+        h.now = lapse_at;
+        let id = h.core.dl.mine[&7].lapse_timer.expect("the lapse watch");
+        h.step(Event::Timer { id });
+        assert!(h.core.dl.mine[&7].lapsed);
+        assert_eq!(
+            h.core.stream_parks_of(7).len(),
+            1,
+            "the lapse took the op away from a root that may be alive"
+        );
+        assert!(!h.core.clients[&rid].forwarded);
+        // The give-up is armed for the root's end of the generation.
+        let id = h.core.dl.mine[&7].lapse_timer.expect("the give-up watch");
+        h.now = Ms(end_due.0 - 1);
+        h.step(Event::Timer { id });
+        assert_eq!(h.core.stream_parks_of(7).len(), 1, "given up too early");
+        let id = h.core.dl.mine[&7].lapse_timer.expect("re-armed");
+        h.now = end_due;
+        h.step(Event::Timer { id });
+        assert!(h.core.stream_parks_of(7).is_empty(), "never given up");
+        assert!(
+            h.core.clients[&rid].forwarded,
+            "the op is in doubt on the lease path"
+        );
+    }
+
+    /// Plan 46 M1.2 step 13 (review MUST): an op in doubt in a lapsed
+    /// generation of its own node is not settled before the root has ended
+    /// the generation and could commit its row (the end of the generation
+    /// and a settle window): its row lands then, and `EIO` before it is a
+    /// late landing. Fails on the parent: the settle window runs from the
+    /// deadline alone.
+    #[test]
+    fn an_op_in_doubt_in_a_lapsed_generation_settles_past_the_roots_end_of_it() {
+        let (mut h, rid, lapse_at, end_due) = lapse_with_a_parked_own_op();
+        h.now = lapse_at;
+        let id = h.core.dl.mine[&7].lapse_timer.expect("the lapse watch");
+        h.step(Event::Timer { id });
+        // The op was taken off its park meanwhile (a backup sealed, say): it
+        // is in doubt in the lapsed generation, its row journaled here.
+        let ids = h.core.stream_parks_of(7);
+        let mut out = Vec::new();
+        h.core.abort_park_busy(h.clk(), ids[0], &h.meta, &mut out);
+        h.now = Ms(lapse_at.0 + 10);
+        let deadline = h.core.clients[&rid].deadline;
+        let out = h.step(Event::Timer { id: deadline });
+        let window = h.core.cfg.settle_window();
+        let after = out
+            .iter()
+            .find_map(|a| match a {
+                Action::SetTimer {
+                    after_ms,
+                    kind: TimerKind::ClientDeadline,
+                    ..
+                } => Some(*after_ms),
+                _ => None,
+            })
+            .expect("the settle's deadline");
+        assert!(
+            after >= end_due.0 as u64 - h.now.0 as u64 + window,
+            "settle deadline in {after} ms; the root ends the generation in {} and the window is {window}",
+            end_due.0 - h.now.0
+        );
     }
 
     /// C2g's review, SHOULD 2: a delegate settling its own node's op
@@ -60679,6 +60856,37 @@ mod step9_one_stream_per_node {
         tick(&mut h);
         assert_eq!(h.core.stats.place_skipped_far, 1);
         assert_eq!(h.core.stats.place_delegated, 1);
+    }
+
+    /// Plan 46 M1.2 step 13 (review SHOULD): a node granted while its link
+    /// to the root was not measured (an unmeasured link counts as in budget)
+    /// that is measured far afterwards has no group within budget: the
+    /// placement recalls its grant and does not grant it again. Fails on the
+    /// parent: the far node kept the grant and answered on its disk alone.
+    #[test]
+    fn placement_recalls_a_grant_to_a_node_measured_far_afterwards() {
+        let (mut h, dirs) = root_with_peer(None);
+        let tick = |h: &mut Harness| {
+            let (now, mut out) = (h.now, Vec::new());
+            h.core
+                .on_placement_timer(Now::same(now.0), &h.meta, &mut out);
+            out
+        };
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        tick(&mut h);
+        assert_eq!(h.core.stats.place_delegated, 1);
+        assert_eq!(h.core.stats.place_recalled, 0);
+        // The link is measured: far.
+        link_to_2(&mut h, Some(500));
+        h.advance(400);
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        let out = tick(&mut h);
+        assert_eq!(h.core.stats.place_recalled, 1, "{out:?}");
+        assert_eq!(h.core.stats.deleg_recalls_sent, 1, "{out:?}");
     }
 
     /// A placed (stealable) grant to a node that holds designations only is

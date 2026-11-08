@@ -16910,6 +16910,30 @@ fn c2_a_settled_eio_never_lands_late() {
     }
 }
 
+/// Plan 46 M1.2 step 13 (review): no delegate answers on its disk alone, so
+/// the root's own op, settling, waits for the recall of a generation it
+/// outwaits (the previous root down, the delegate silent). The second
+/// deadline dropped it and the delegate's row landed when the generation
+/// ended: `long-delegated+settle` failed I4 on 1694 and 8929 of 12,000 seeds
+/// (none on the parent of step 13). The settle is held until the outwait
+/// ends (`settles_held_for_outwait`). Fails on the parent: each seed's
+/// `+settle` run fails with I4.
+#[test]
+fn a_settle_waiting_for_a_generations_outwait_is_held_and_never_lands_late() {
+    for seed in [1694, 8929] {
+        let r = run_seed(seed, strict(long_delegated_config(), "settle"))
+            .unwrap_or_else(|e| panic!("long-delegated+settle seed {seed}: {e}"));
+        assert!(
+            r.stats
+                .values()
+                .map(|s| s.settles_held_for_outwait)
+                .sum::<u64>()
+                > 0,
+            "seed {seed}: no settle was held; the seed no longer exercises the path"
+        );
+    }
+}
+
 /// Plan 43 C2 (D11): `delegated-long-delegation-prod` runs `strict_settle`
 /// clean on a few seeds (the sweeps run 2,000).
 #[test]
@@ -17151,10 +17175,14 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             0,
         ),
         ("flex-crash", flex_crash_config, 125, 9),
-        // (Plan 46 M1.2 step 13: 3 allowed in seeds 0..99, seeds 29 and 47: a
-        // delegate's own op waits for the root now, so a settle window can pass
-        // inside the root's outwait of a silent generation, the cause the
-        // oracle allows; no violation.)
+        // (Plan 46 M1.2 step 13: 3 allowed in seeds 0..99, seeds 29 and 47
+        // among them, against 0 on its parent: a client's settle sent to a
+        // root that outwaits the generation of a delegate silent behind a
+        // partition (a cross-subtree op needs both generations recalled)
+        // runs out its window a second or two before the root ends the
+        // generation; the cause the oracle allows, no violation, and no late
+        // landing: `+settle` holds. Not the lapse of a delegate's own grant
+        // (that one is kept, `a_lapsed_grants_own_op_waits_for_the_roots_end_of_the_generation`).)
         ("long-delegated", long_delegated_config, 0, 3),
         ("long-delegated-backup", long_delegated_backup_config, 0, 0),
         (

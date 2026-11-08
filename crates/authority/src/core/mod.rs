@@ -1656,6 +1656,10 @@ pub struct Stats {
     /// and unexecuted parks of a rid's earlier attempt a settle dropped.
     pub settles_refused: u64,
     pub settle_dropped_parks: u64,
+    /// Plan 46 M1.2 step 13: second deadlines of this node's own op, parked
+    /// as the root for a generation's recall, held until the root's outwait
+    /// of that generation ends (`client_deadline`).
+    pub settles_held_for_outwait: u64,
     /// Plan 46 M0.3 (S1): settles a takeover gate answered on the keys it
     /// owns (a refusal journaled, or a dedup'd outcome), settles it left
     /// `Held` because its journal work was not done yet, and settles of a

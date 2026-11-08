@@ -14,7 +14,7 @@ use super::backup::is_answer;
 use super::{ack_counter, Core, S3For, Timer};
 use crate::action::{Action, AnswerSource, ClientReply, S3Op};
 use crate::event::{PeerMsg, Policy, S3Result};
-use crate::ids::{Epoch, NodeId, Now, OpId, WaitMs};
+use crate::ids::{Epoch, HonourMs, NodeId, Now, OpId, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::Ownership;
@@ -3539,6 +3539,27 @@ impl Core {
             return;
         };
         let second = c.settle;
+        // Plan 46 M1.2 step 13 (review): a settle of this node's own op, parked
+        // here as the root for the recall of a generation the root outwaits
+        // (a silent delegate, an inherited generation), is kept until the
+        // outwait ends: the generation's rows, the op's among them, land when
+        // it does, and the settle then finds them; a client told `EIO`
+        // before would see the row land after (I4). The window is finite
+        // (the grant's), so this holds the client past its deadline only
+        // once and only by that.
+        if second && c.phase == Phase::Recalling {
+            if let Some(end) = self.exec_local_park_outwait(rid) {
+                if now.wait <= end {
+                    let at = end.plus(self.deleg_request_timeout_ms());
+                    let old = c.deadline;
+                    self.cancel_timer(old, out);
+                    let deadline = self.set_timer_wait(at, Timer::ClientDeadline(rid), out);
+                    self.clients.get_mut(&rid).expect("present").deadline = deadline;
+                    self.stats.settles_held_for_outwait += 1;
+                    return;
+                }
+            }
+        }
         // Phase 2b round 2: parked *before* executing (the root waits
         // for a delegation's recall, or this node, the op's delegate,
         // for its grant's renewal or the op's deps): nothing ran, the
@@ -3649,6 +3670,15 @@ impl Core {
         } else if full > until {
             until = full;
         }
+        // An op in doubt in a generation of this node's that lapsed: its row
+        // is journaled here and lands when the root ends the generation and
+        // fetches the tail, which it does by `deleg_end_due` and a recall
+        // later. A settle that expired before would end the op unsettled
+        // and its row land after (I4).
+        if let Some(due) = self.own_gen_end_due(rid, replica) {
+            let rest = due.0.saturating_sub(now.honour.0).max(0) as u64;
+            until = until.max(now.wait.plus(rest + window));
+        }
         let old = c.deadline;
         self.cancel_timer(old, out);
         let deadline = self.set_timer_wait(until, Timer::ClientDeadline(rid), out);
@@ -3665,6 +3695,21 @@ impl Core {
             "deadline: settling the op"
         );
         self.settle_route(now, rid, replica, out);
+    }
+
+    /// When the root ends the lapsed generations of this node's that may
+    /// hold `rid`'s row (journaled here, not acknowledged): the latest
+    /// [`Core::deleg_end_due`] of them; `None` if the journal carries no
+    /// row of the rid or no generation of this node's has lapsed.
+    fn own_gen_end_due(&self, rid: Rid, replica: &dyn Replica) -> Option<HonourMs> {
+        let due = self
+            .dl
+            .mine
+            .values()
+            .filter(|d| d.lapsed && !d.stopped)
+            .map(|d| self.deleg_end_due(d))
+            .max()?;
+        journal_carries_outcome(replica, rid).then_some(due)
     }
 
     /// Plan 43 C2 (§5.3 item 5): send a settle of `rid` the way the op itself

@@ -315,6 +315,29 @@ impl Core {
             .map(|(gen, g)| (*gen, g.dir_list(), g.node))
             .collect();
         for (gen, dirs, node) in placed {
+            // Plan 46 M1.2 step 13: a node granted while its link to the root
+            // was not measured (what is not known to be far is not refused)
+            // that is measured far now has no group within budget: its
+            // grant is recalled at once (no dwell: it answers its clients
+            // on a disk no group backs), and the placement does not grant it
+            // again while it stays far.
+            if !self.delegate_group_in_budget(node) {
+                for dir in &dirs {
+                    self.pl
+                        .cooldown
+                        .insert(*dir, now.wait.plus(self.cfg.placement_cooldown_ms));
+                }
+                self.stats.place_recalled += 1;
+                tracing::info!(
+                    node = self.cfg.node_id,
+                    dirs = ?dirs,
+                    delegate = node,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
+                    "placement recalls a delegation (its link is measured out of the backup budget)"
+                );
+                self.start_recall(now, gen, out);
+                continue;
+            }
             // A stream is recalled whole (step 9; a partial release is step
             // 10): it stays while any of its subtrees keeps the delegate's
             // share and rate.

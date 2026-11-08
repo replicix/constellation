@@ -4148,6 +4148,22 @@ pub fn run_seed(seed: u64, mut cfg: SimConfig) -> Result<Report, String> {
     if cfg.is_delegated() {
         let inner = cfg.core.clone();
         let plain = Config::defaults(1, 0).backup_rtt_budget_ms;
+        // The override is for the unbacked family: a configuration it
+        // catches reports every link at or above the plain budget (the
+        // default two maximum delays, and its `rtts`), so the plain core
+        // configuration had no backup in budget either. One with a link
+        // inside the plain budget wants its backups, and sets its own core
+        // configuration; it is not caught.
+        let probe = inner(1, 1);
+        if probe.backup_rtt_budget_ms == plain && probe.backups_max > 0 {
+            assert!(
+                2 * cfg.p2p_delay.1 >= plain && cfg.rtts.iter().all(|(_, ms)| *ms >= plain),
+                "seed {seed}: a configuration with a link inside the plain backup budget \
+                 ({plain} ms) runs the plain core configuration, which the delegated \
+                 topology override (budget 50, no backups) would silently re-shape: give it \
+                 its own core configuration"
+            );
+        }
         cfg.core = std::sync::Arc::new(move |id, inc| {
             let mut c = inner(id, inc);
             if c.backup_rtt_budget_ms == plain && c.backups_max > 0 {

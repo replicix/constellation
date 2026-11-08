@@ -6441,19 +6441,15 @@ impl Driver {
                     let meta = self.deps.meta.clone();
                     let node_id = self.node_id;
                     let int_tx = self.int_tx.clone();
-                    let upload = self.deps.upload.clone();
                     tokio::spawn(async move {
-                        // What moves while the flush works: rows shipped
-                        // (the acknowledged watermark) and S3 answering
-                        // (chunk PUTs, the ship, the publish).
+                        // What moves while the flush works: this node's rows
+                        // shipped (the acknowledged watermark). Not S3
+                        // answering: that clock is the process's, and other
+                        // traffic through it would keep a flush stuck behind
+                        // this node's own unreachable store looking alive.
                         let progress = {
                             let meta = meta.clone();
-                            move || {
-                                (
-                                    meta.journal_acked_seq().unwrap_or(0),
-                                    upload.s3_waits().answered_ms,
-                                )
-                            }
+                            move || meta.journal_acked_seq().unwrap_or(0)
                         };
                         let retire = {
                             let (store, meta) = (store.clone(), meta.clone());
@@ -6474,6 +6470,7 @@ impl Driver {
                             retire,
                             recheck,
                             LEAVE_NO_PROGRESS_BOUND,
+                            LEAVE_TOTAL_BOUND,
                             LEAVE_RETIRE_BOUND,
                             &int_tx,
                             tx,
@@ -6502,6 +6499,9 @@ impl Driver {
 /// node marked leaving at its root for as long as it ran, fails once
 /// nothing moved for the bound.
 const LEAVE_NO_PROGRESS_BOUND: Duration = Duration::from_secs(120);
+/// The flush's overall cap, however it progresses: a flush that moves but
+/// never finishes still ends the leave (the operator runs it again).
+const LEAVE_TOTAL_BOUND: Duration = Duration::from_secs(30 * 60);
 const LEAVE_RETIRE_BOUND: Duration = Duration::from_secs(120);
 /// How long the registry is asked whether a retirement landed after all.
 const LEAVE_RECHECK_BOUND: Duration = Duration::from_secs(30);
@@ -6523,6 +6523,7 @@ async fn run_leave_tail<R, C, P, T>(
     retire: R,
     recheck: C,
     no_progress: Duration,
+    total: Duration,
     retire_bound: Duration,
     int_tx: &mpsc::UnboundedSender<Internal>,
     reply: oneshot::Sender<std::result::Result<String, String>>,
@@ -6535,7 +6536,9 @@ async fn run_leave_tail<R, C, P, T>(
 {
     let poll = (no_progress / 4).clamp(Duration::from_millis(5), Duration::from_secs(5));
     let mut last = progress();
-    let mut since = Instant::now();
+    let started = Instant::now();
+    let mut since = started;
+    let mut capped = false;
     let flush = loop {
         tokio::select! {
             r = &mut flushed => break Some(r),
@@ -6545,6 +6548,10 @@ async fn run_leave_tail<R, C, P, T>(
                     last = now;
                     since = Instant::now();
                 } else if since.elapsed() >= no_progress {
+                    break None;
+                }
+                if started.elapsed() >= total {
+                    capped = true;
                     break None;
                 }
             }
@@ -6574,6 +6581,10 @@ async fn run_leave_tail<R, C, P, T>(
         }
         Some(Ok(Err(e))) => Err(format!("cannot flush before leave (is S3 reachable?): {e}")),
         Some(Err(_)) => Err("the flush before leave was dropped; run the leave again".into()),
+        None if capped => Err(format!(
+            "the flush before leave did not finish within {} s; run the leave again",
+            total.as_secs().max(1)
+        )),
         None => Err(format!(
             "the flush before leave made no progress for {} s (is S3 reachable?); \
              run the leave again",
@@ -7972,6 +7983,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         use tokio::sync::{mpsc, oneshot};
         let bound = Duration::from_millis(100);
+        let total = Duration::from_secs(60);
         let taken_back = |rx: &mut mpsc::UnboundedReceiver<super::Internal>| {
             matches!(
                 rx.try_recv(),
@@ -7992,6 +8004,7 @@ mod tests {
             async { Ok(()) },
             retired(false),
             bound,
+            total,
             bound,
             &itx,
             rtx,
@@ -8023,6 +8036,7 @@ mod tests {
             async { Ok(()) },
             retired(false),
             bound,
+            total,
             bound,
             &itx,
             rtx,
@@ -8032,6 +8046,39 @@ mod tests {
         worker.await.unwrap();
         assert_eq!(rrx.await.unwrap().unwrap(), "ok");
         assert!(!taken_back(&mut irx));
+        // A flush that moves all along but never finishes is cut by the
+        // overall cap (fail-before: it waited for ever). Another process's
+        // traffic is not this node's progress, only its own rows are.
+        let moved = std::sync::Arc::new(AtomicU64::new(0));
+        let (rtx, rrx) = oneshot::channel();
+        let (_ftx, frx) = oneshot::channel();
+        let ticker = {
+            let moved = moved.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    moved.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        let seen = moved.clone();
+        super::run_leave_tail(
+            frx,
+            move || seen.load(Ordering::Relaxed),
+            async { Ok(()) },
+            retired(false),
+            bound,
+            Duration::from_millis(400),
+            bound,
+            &itx,
+            rtx,
+            "ok".into(),
+        )
+        .await;
+        ticker.abort();
+        let e = rrx.await.unwrap().unwrap_err();
+        assert!(e.contains("did not finish"), "{e}");
+        assert!(taken_back(&mut irx));
         // The retirement hangs and the registry does not name the node
         // retired: it fails.
         let (rtx, rrx) = oneshot::channel();
@@ -8044,6 +8091,7 @@ mod tests {
             hang,
             retired(false),
             bound,
+            total,
             bound,
             &itx,
             rtx,
@@ -8071,6 +8119,7 @@ mod tests {
                 retire,
                 retired(true),
                 bound,
+                total,
                 bound,
                 &itx,
                 rtx,
@@ -8090,6 +8139,7 @@ mod tests {
             async { Ok(()) },
             retired(false),
             bound,
+            total,
             bound,
             &itx,
             rtx,
@@ -8108,6 +8158,7 @@ mod tests {
             async { Ok(()) },
             retired(false),
             bound,
+            total,
             bound,
             &itx,
             rtx,
