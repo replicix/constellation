@@ -445,13 +445,6 @@ pub struct DelegationReport {
     pub backup_appends: u64,
     pub backup_acks: u64,
     pub acks_parked: u64,
-    /// Acknowledgements whose row its own group held but that waited for a
-    /// row of another generation this node delegates (a `DelegateNodeGroup`
-    /// acknowledgement waits for the row's dependencies on the node's other
-    /// generations), with the total and the longest of those waits in ms.
-    pub xgen_acks_delayed: u64,
-    pub xgen_ack_delay_ms: u64,
-    pub xgen_ack_delay_max_ms: u64,
     /// Generations stopped before a row whose dependency was lost with
     /// another generation; rows the root did not append for such a
     /// dependency (a stream's or a sealed tail's); stops of a sealed

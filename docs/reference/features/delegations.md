@@ -963,69 +963,34 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
 - While any generation is live, the root does not release its lease when
   idle and declines a cooperative handoff.
 
-#### A row whose cause was lost with another generation
+#### A row whose cause was lost with its generation
 
-Status: fixed 2026-10-30 (was a known gap, documented the same day). See
-[ADR-39](../../explanation/DECISIONS.md#adr-39-a-delegates-group-acknowledgement-waits-for-the-rows-dependencies-on-its-other-generations).
+Status: the cross-generation acknowledgement rule of
+[ADR-39](../../explanation/DECISIONS.md#adr-39-a-delegates-group-acknowledgement-waits-for-the-rows-dependencies-on-its-other-generations)
+was deleted in plan 46 M1.2 step 12.
 
-**The case.** One node holds two live generations, A and B. Every op of
-the node carries the node's whole session as its `deps`
-(`Core::fresh_deps`, `SessionState::deps`), its own rows in every
-generation it holds included, so a row of B names A's latest row even
-when the two writes are unrelated, and depends on it for real when the
-later write read the earlier one's effect (a process saw `/a/x` on the
-delegate before it committed, then wrote `/b/marker`) or when the keys
-meet (an unlink of a file's primary link moves the file's keys to the
-generation of its next link). A ends at a cut below that row of A (the
-root reclaims it at its cursor, or A's own sealed tail stops short), and
-the row strands and is replayed by rid after the end, or never.
-
-Since plan 46 M1.2 step 9 a node holds one stream: a grant to a node
-whose stream is live grows it in place (`DelegateNode` again, the same
-generation), so two subtrees of one node are one generation and a rename
-between them is an ordinary op of that stream. A node that holds only
-designations takes no grant the root can reclaim, and designating on a
-node that holds a stealable stream recalls that stream first (a stream
-never mixes grant kinds; the placement skips a designated-only node). A
-grant that grows a live stream waits, as a designation does, for the
-root's read delegations under the new subtree to be recalled before it is
-journaled, so no renewal of the stream ever waits for them. The cross-generation
-rule below remains for the generations left from before (step 12 deletes
-it).
-
-**The rule.** A `DelegGroup` acknowledgement of row `(B, k)` waits until
-the group holds it **and** every row of B up to `k` has its dependencies
-on the node's other generations committed, by the same rule
-(`Core::deleg_caps`, a prefix rule computed to a fixpoint over the
-node's generations; the FUSE fast path waits on the same watermark,
-`DelegDurable::through`). The delegate records each row's dependencies
-on rows of its other generations that are not committed yet when the row
-is read for a batch (the root's stream or the backup's append), which
-every row is before its group can hold it: a generation it holds, and
-one it no longer holds that was its own (it assigned stream indices in
-it: one read per generation and batch) past the log's index, whose end it
-has not applied yet (the table installed ahead of the log, or the end
-applied and the row read only later); such a dependency is committed once
-the log carries it. A dependency on another node's generation was reached
-when the op executed and waits for nothing. A row whose dependency is lost
-already when it is read (`deps_lost`: its generation ended below it)
-stops the generation before it there, before any member holds it
+A node holds one stream (since step 9 a grant to a node whose stream is
+live grows it in place: two subtrees of one node are one generation, and a
+rename between them is an ordinary op of that stream; a node that holds only
+designations takes no grant the root can reclaim, and designating on a node
+that holds a stealable stream recalls that stream first, a stream never
+mixing grant kinds). Every row of the node's ops is therefore in one total
+order with one group, and nothing is acknowledged past the stream's cut
+without being in the sealed tail: a row has no dependency on an uncommitted
+row of another stream of its node, so the acknowledgement waits for its own
+group only (`Core::deleg_committed_prefix`; the FUSE fast path waits on the
+same watermark, `DelegDurable::through`). What is left is a dependency on a
+generation of another node, or on one that ended: a row whose dependency is
+lost already when it is read for a batch (`deps_lost`: its generation ended
+below it) stops the generation before it there, before any member holds it
 (nothing at or past it goes to the backup or the root), and one lost
 later aborts the acknowledgement (`Busy`, the requester retries by rid)
 and stops the generation before the row (`deleg_lost_deps_stopped`). A
 stop at or below a row already answered under the group would drop an
 answered write: it must not happen, and is logged as an error and counted
-(`deleg_lost_after_ack`, which the simulation asserts to be 0). `Lone`
-rows are not affected: they are answered from the delegate's disk, and a
-strand replays them by rid; the `Lone` lead and the rule that a `Lone`
-row never follows an uncommitted gated row count the same capped prefix
-as committed.
+(`deleg_lost_after_ack`, which the simulation asserts to be 0).
 
-So an acknowledged row's dependencies are committed, and a committed
-row is at or below its generation's cut: A's end waits for its group's
-tail, and without a backup it ends at the root's cursor, which a
-committed row is under. Every row from the first with a lost dependency
-on was never acknowledged, and both ends of B stop there:
+Both ends of the generation stop at such a row:
 
 - The live path: the delegate never streams such a row, and its recall
   answers the row before it (read from the journal when the stream has
@@ -1033,29 +998,16 @@ on was never acknowledged, and both ends of B stop there:
   append one either (`deleg_append_deps_lost`; the delegate backs off 4
   stream ticks, `deleg_stream_no_progress`, and a recall drains at once
   whatever the back-off).
-- The sealed tail: when B's delegate is gone too and the root ends B by
-  its backup's tail, the drain stops at the first row with a lost
-  dependency (`deleg_append_deps_lost`) and ends the generation there.
+- The sealed tail: when the delegate is gone too and the root ends the
+  generation by its backup's tail, the drain stops at the first row with a
+  lost dependency (`deleg_append_deps_lost`) and ends the generation there.
   A dependency that is only not here yet (its generation not ended)
   still waits (`deleg_drain_deps_waits`).
 
-**Cost.** An acknowledgement waits only when its row depends on a row of
-another generation of the same node that is not committed yet. A client
-that issues its writes one after another already waited for the earlier
-write's acknowledgement and pays nothing; concurrent writers in two
-generations of one node wait for the slower of the two groups.
-`status.delegation` counts the acknowledgements that waited
-(`xgen_acks_delayed`) and how long (`xgen_ack_delay_ms`,
-`xgen_ack_delay_max_ms`). The measurement is in
-[ADR-39](../../explanation/DECISIONS.md#adr-39-a-delegates-group-acknowledgement-waits-for-the-rows-dependencies-on-its-other-generations).
-
 **Tests.** Core `deleg_windows_tests::a_sealed_tail_never_appends_a_row_whose_dependency_was_lost`
-(the drain) and `recall_cut::a_group_acknowledgement_waits_for_the_rows_other_generation_dependencies`
-(the acknowledgement, and its abort); the simulation's
-`delegated-two-gens-one-backed` (one node holds a backed and an
-unbacked generation, writes in both at once, loses the root and dies:
-with the rule off, 40 of 200 seeds lost an acknowledged write) and
-`delegated-two-gens-backed` (the cost, no fault).
+(the drain); the simulation's `delegated-two-dirs-one-backed` (one node
+holds two subtrees backed, writes in both at once, loses the root and
+dies: no acknowledged write is lost) and the causal-cut oracle.
 
 ### What stays with the root
 

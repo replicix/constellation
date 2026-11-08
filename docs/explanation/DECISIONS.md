@@ -2304,9 +2304,13 @@ benchmark's recommendation); built.
 **Superseded by [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
 (plan 46 M1.2)**: with one stream per delegate node there is one total
 order and one group per node, so a dependency across generations of one
-node cannot exist; `deleg_caps`, `deleg_note_xdeps`, `deleg_covered` and
-the xgen counters go. The rule below is right for the state it was built
-for; the state is removed.
+node cannot exist; `deleg_caps`, `deleg_note_xdeps`, the xgen counters
+(`status.delegation.xgen_*`), plan 45's key move (an unlink moves the
+file's keys to its next link's generation) and its store half
+`gated_open_elsewhere_tx` were deleted in plan 46 M1.2 step 12. The rule
+below is right for the state it was built for; the state is removed.
+(`SessionState::deleg_covered` stays: it is the fast path's
+covered-for-good watermark, not part of this rule.)
 
 **Context**: one node can hold two generations (the ranges of a split
 directory, or a whole directory beside a range of another), and every op

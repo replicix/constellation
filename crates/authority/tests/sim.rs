@@ -7847,13 +7847,12 @@ struct OracleTotals {
     row_version_seeds: Vec<u64>,
     downgraded_lone: u64,
     class_from_session: u64,
-    /// The cross-generation acknowledgement rule: acknowledgements that
-    /// waited for another generation's row (count, total ms, max ms), all
-    /// delegated acknowledgements released (count, total wait ms), prefix
-    /// holds (count, total ms, max ms), and the path-B and lost-dependency
-    /// counters (installs put off, generations stopped, rows the root
-    /// refused, answers that took nothing).
-    xgen: [u64; 21],
+    /// The stream counters: delegated acknowledgements released (count,
+    /// total wait ms), the install waits and the lost-dependency counters
+    /// (installs put off, generations stopped, rows the root refused,
+    /// answers that took nothing), the install waits' ms and longest, and
+    /// the grant batches.
+    stream: [u64; 11],
     /// Segments landed, their decompressed bytes, the delegate-stream
     /// dependency waits (`deleg_deps_waits`) and the segments' bytes as
     /// stored, over the sweep's seeds.
@@ -7933,27 +7932,17 @@ impl OracleTotals {
             self.row_version_seeds.push(seed);
         }
         for st in r.stats.values() {
-            self.xgen[0] += st.deleg_xgen_acks_delayed;
-            self.xgen[1] += st.deleg_xgen_ack_delay_ms;
-            self.xgen[2] = self.xgen[2].max(st.deleg_xgen_ack_delay_max_ms);
-            self.xgen[3] += st.deleg_stream_acks_released;
-            self.xgen[4] += st.deleg_stream_ack_wait_ms;
-            self.xgen[5] += st.deleg_xgen_holds;
-            self.xgen[6] += st.deleg_xgen_hold_ms;
-            self.xgen[7] = self.xgen[7].max(st.deleg_xgen_hold_max_ms);
-            self.xgen[8] += st.deleg_install_waits_end;
-            self.xgen[9] += st.deleg_lost_deps_stopped;
-            self.xgen[10] += st.deleg_append_deps_lost;
-            self.xgen[11] += st.deleg_stream_no_progress;
-            self.xgen[12] += st.deleg_install_wait_ms;
-            self.xgen[13] = self.xgen[13].max(st.deleg_install_wait_max_ms);
-            self.xgen[14] += st.deleg_caps_calls;
-            self.xgen[15] += st.deleg_caps_walked;
-            self.xgen[16] += st.deleg_xdeps_log_reads;
-            self.xgen[17] += st.deleg_xdeps_own_checks;
-            self.xgen[18] += st.deleg_install_waits_commit;
-            self.xgen[19] += st.stream_grant_batches;
-            self.xgen[20] += st.stream_grants_uncommitted;
+            self.stream[0] += st.deleg_stream_acks_released;
+            self.stream[1] += st.deleg_stream_ack_wait_ms;
+            self.stream[2] += st.deleg_install_waits_end;
+            self.stream[3] += st.deleg_lost_deps_stopped;
+            self.stream[4] += st.deleg_append_deps_lost;
+            self.stream[5] += st.deleg_stream_no_progress;
+            self.stream[6] += st.deleg_install_wait_ms;
+            self.stream[7] = self.stream[7].max(st.deleg_install_wait_max_ms);
+            self.stream[8] += st.deleg_install_waits_commit;
+            self.stream[9] += st.stream_grant_batches;
+            self.stream[10] += st.stream_grants_uncommitted;
             self.seg[2] += st.deleg_deps_waits;
             self.parked[0] += st.deleg_stream_acks_released;
             self.parked[1] += st.deleg_stream_acks_by_log;
@@ -8255,33 +8244,22 @@ impl OracleTotals {
             self.lone_lead[4]
         );
         eprintln!(
-            "SWEEP-XGEN-TOTALS {label} seeds {}/{seeds}: acks waiting on another generation {} \
-             ({} ms, max {} ms) of delegated acks released {} ({} ms waited); prefix holds {} \
-             ({} ms, max {} ms); installs put off {} ({} ms, max {} ms), generations stopped at a lost dependency {}, \
-             rows refused at the root {}, answers that took nothing {}; caps computed {} times, {} entries visited; xdeps store reads: log {} own-check {}; \
+            "SWEEP-STREAM-TOTALS {label} seeds {}/{seeds}: delegated acks released {} ({} ms waited); \
+             installs put off {} ({} ms, max {} ms), generations stopped at a lost dependency {}, \
+             rows refused at the root {}, answers that took nothing {}; \
              installs put off for an uncommitted grant {} (grant batches streamed {}, sent uncommitted {})",
             self.seeds,
-            self.xgen[0],
-            self.xgen[1],
-            self.xgen[2],
-            self.xgen[3],
-            self.xgen[4],
-            self.xgen[5],
-            self.xgen[6],
-            self.xgen[7],
-            self.xgen[8],
-            self.xgen[12],
-            self.xgen[13],
-            self.xgen[9],
-            self.xgen[10],
-            self.xgen[11],
-            self.xgen[14],
-            self.xgen[15],
-            self.xgen[16],
-            self.xgen[17],
-            self.xgen[18],
-            self.xgen[19],
-            self.xgen[20]
+            self.stream[0],
+            self.stream[1],
+            self.stream[2],
+            self.stream[6],
+            self.stream[7],
+            self.stream[3],
+            self.stream[4],
+            self.stream[5],
+            self.stream[8],
+            self.stream[9],
+            self.stream[10]
         );
         eprintln!(
             "SWEEP-SEGMENTS {label} seeds {}/{seeds}: segments landed {}, decompressed bytes {}, \

@@ -44859,7 +44859,7 @@ mod deleg_group {
     #[test]
     fn the_fast_paths_watermark_does_not_cover_a_re_appended_row_before_its_commit() {
         let mut h = take_over_with_a_re_appended_row(true);
-        h.core.report_deleg_durable(h.clk(), &h.meta);
+        h.core.report_deleg_durable(&h.meta);
         let w = h
             .meta
             .session()
@@ -44872,7 +44872,7 @@ mod deleg_group {
             .ack
             .shipped_rows
             .insert(h.meta.journal_tip().unwrap());
-        h.core.report_deleg_durable(h.clk(), &h.meta);
+        h.core.report_deleg_durable(&h.meta);
         let w = h
             .meta
             .session()
@@ -44914,7 +44914,7 @@ mod deleg_group {
         let (last1, last2) = (last(&h, 1), last(&h, 2));
         assert!(last1 < last2);
         h.core.ack.shipped_rows.insert(last2);
-        h.core.report_deleg_durable(h.clk(), &h.meta);
+        h.core.report_deleg_durable(&h.meta);
         let wait = |h: &Harness, idx| {
             h.meta
                 .session()
@@ -47751,44 +47751,6 @@ mod deleg_group {
         let mut out = Vec::new();
         h.core.deleg_after_event(h.clk(), &h.meta, &mut out);
         assert_eq!(h.core.dl.mine[&7].group_requested, Some(vec![]), "{out:?}");
-    }
-
-    /// An answer of one generation held by a dependency on another
-    /// generation's row (`deleg_caps`) waits on that generation's commit: the
-    /// ask goes to the generation whose commit is awaited, not to the answer's.
-    /// Fails before: only the generation of the parked row was asked about.
-    #[test]
-    fn a_delegate_asks_for_the_commit_of_the_generation_an_answer_is_held_by() {
-        let (mut h, dir, _, _) = delegate_renewed_once();
-        let out = forward_create(&mut h, dir, 1, 500);
-        let (req, round, last) = batch(&out).expect("sent to the root");
-        // Generation 8 of this node: its root has appended its row 1 and not
-        // committed it. Generation 7's row 1 depends on it.
-        let mut b = h.core.dl.mine[&7].clone();
-        b.gen = 8;
-        b.streamed_through = 1;
-        b.root_committed = 0;
-        b.xrec = 1;
-        b.inflight = None;
-        let a = h.core.dl.mine.get_mut(&7).unwrap();
-        a.xdeps.entry(8).or_default().insert(1, 1);
-        h.core.dl.mine.insert(8, b);
-        // The root has committed generation 7's row: the answer is held by the
-        // dependency alone.
-        let out = h.step(stream_ack_committed(1, req, round, last, last));
-        assert_eq!(answer_to_2(&out, 500), None, "released past its dependency");
-        assert!(h.core.has_stream_parks());
-        h.advance(h.core.cfg.delegation_stream_tick_ms);
-        let mut out = Vec::new();
-        if let Some(id) = h.core.dl.stream_timer {
-            out.extend(h.step(Event::Timer { id }));
-        }
-        out.extend(poke(&mut h));
-        assert_eq!(root_ask_of(&out, 7), None, "{out:?}");
-        assert!(
-            root_ask_of(&out, 8).is_some(),
-            "the commit of the generation the answer is held by was not asked: {out:?}"
-        );
     }
 
     /// The delegate's removal of a backup the record names asks only once

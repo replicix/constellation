@@ -733,14 +733,6 @@ impl Meta {
                     .session()
                     .deleg_commit_at_journal(d.gen, version, gated, idx)
                     .ok_or(MetaError::NotAdmitted)?;
-                // The same across this node's generations (a takeover's
-                // strand ends every own generation together; the keys of one
-                // generation's gated row can be another's by the time a
-                // later row touches them): a `Singleton` rule behind an open
-                // gated row of another generation is not stamped either.
-                if commit.is_singleton() && gated_open_elsewhere_tx(tx, self, d.gen, true)? {
-                    return Err(MetaError::NotAdmitted);
-                }
                 Some(commit)
             }
             _ => None,
@@ -842,7 +834,7 @@ impl Meta {
         let class = if gen != 0
             && journal::PendingClass::follows_open_gated_rows()
             && class.is_singleton()
-            && (gated_mark_open(&*tx, self, gen)? || gated_open_elsewhere_tx(tx, self, gen, true)?)
+            && gated_mark_open(&*tx, self, gen)?
         {
             class.demoted()
         } else {
@@ -861,10 +853,6 @@ impl Meta {
                 .unwrap_or(0);
             if idx > held {
                 kv_set_tx(tx, &self.local, &key, &idx.to_string());
-                // (The marks found closed leave the open list here: it stays
-                // a few entries.)
-                gated_open_elsewhere_tx(tx, self, gen, true)?;
-                note_gated_open_tx(tx, self, gen)?;
             }
         }
         journal::note_journaled(journal::JournaledRow {
@@ -1175,15 +1163,6 @@ impl Meta {
         Ok(kv_get_tx(&r, &self.local, &deleg_gated_key(gen))?
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0))
-    }
-
-    /// Plan 43 C2 (hysteresis across generations): a gated row of this
-    /// node's own clients is open — journaled, not known committed, still in
-    /// the journal — in a generation of this node other than `gen`, so an
-    /// own row of `gen` is not `Lone` now ([`gated_open_elsewhere_tx`]).
-    pub fn delegate_gated_open_elsewhere(&self, gen: u64) -> Result<bool, MetaError> {
-        let r = self.db.read_tx();
-        gated_open_elsewhere_r(&r, self, gen).map(|(open, _)| open)
     }
 
     /// Testing only (the simulation's oracles): every unretired journal row
@@ -3034,46 +3013,6 @@ mod root_substitution_tests {
         assert_eq!(journal(RowCommit::LONE, true), (6, RowCommit::LONE));
     }
 
-    /// The same across this node's generations: an own `Singleton` row of
-    /// generation 6 behind an open gated row of generation 5.
-    #[test]
-    fn an_own_singleton_row_behind_an_open_gated_row_of_another_generation_waits_too() {
-        use crate::store::journal::{clear_last_journaled, take_last_journaled, PendingClass};
-        let meta = Meta::open_in_memory().unwrap();
-        let mut n = 0;
-        let mut journal = |gen: u64, class: RowCommit| -> RowCommit {
-            n += 1;
-            let _class = PendingClass::set_for_own_client(class);
-            clear_last_journaled();
-            meta.delegate_execute(
-                &MutateOp::Create {
-                    parent: ROOT_INO,
-                    name: format!("f{n}"),
-                    ino: (3 << 40) | n,
-                    mode: 0o644,
-                    uid: 0,
-                    gid: 0,
-                },
-                Some(Rid {
-                    node: 3,
-                    incarnation: 1,
-                    seq: n,
-                }),
-                gen,
-                Default::default(),
-                &crate::locks::LockTag::NONE,
-                Now::same(0),
-            )
-            .unwrap();
-            take_last_journaled().unwrap().class
-        };
-        assert_eq!(journal(5, RowCommit::DELEG_GROUP), RowCommit::DELEG_GROUP);
-        assert_eq!(
-            journal(6, RowCommit::LONE),
-            RowCommit::group(0, GroupOn::Delegate)
-        );
-    }
-
     /// Plan 46 M1.1 step 4 (fail-before: the row is stamped with the
     /// published version whatever the store records): the delegate fast path
     /// stamps the rule the core published, and only while the version it names
@@ -3280,95 +3219,6 @@ mod root_substitution_tests {
         );
     }
 
-    /// The gated mark spans this node's generations: an own gated row of
-    /// one generation is open (above the prefix the core published as
-    /// committed, and still in the journal) for every other generation's
-    /// decision (`Meta::delegate_gated_open_elsewhere`, the core's
-    /// hysteresis); the open list forgets a generation once its mark is
-    /// committed or its row left the journal.
-    #[test]
-    fn a_gated_mark_is_open_to_the_other_generations_until_it_commits() {
-        use crate::session::DelegDurable;
-        use crate::store::journal::{clear_last_journaled, take_last_journaled, PendingClass};
-        let meta = Meta::open_in_memory().unwrap();
-        let mut n = 0;
-        let mut journal = |gen: u64, class: RowCommit| -> (u64, RowCommit) {
-            n += 1;
-            let _class = PendingClass::set_for_own_client(class);
-            clear_last_journaled();
-            let (_, idx) = meta
-                .delegate_execute(
-                    &MutateOp::Create {
-                        parent: ROOT_INO,
-                        name: format!("f{n}"),
-                        ino: (3 << 40) | n,
-                        mode: 0o644,
-                        uid: 0,
-                        gid: 0,
-                    },
-                    Some(Rid {
-                        node: 3,
-                        incarnation: 1,
-                        seq: n,
-                    }),
-                    gen,
-                    Default::default(),
-                    &crate::locks::LockTag::NONE,
-                    Now::same(0),
-                )
-                .unwrap();
-            (idx, take_last_journaled().unwrap().class)
-        };
-        // Generation 5's row 1 is gated, open.
-        assert_eq!(
-            journal(5, RowCommit::DELEG_GROUP),
-            (1, RowCommit::DELEG_GROUP)
-        );
-        assert!(meta.delegate_gated_open_elsewhere(6).unwrap());
-        assert!(
-            !meta.delegate_gated_open_elsewhere(5).unwrap(),
-            "not its own"
-        );
-        // The core publishes generation 5's row 1 committed: it is closed,
-        // and 5 leaves the open list when the next gated row is marked.
-        meta.session().set_deleg_durable(
-            5,
-            Some(DelegDurable {
-                commit: RowCommit::LONE,
-                through: 1,
-                horizon: u64::MAX,
-                lost: false,
-            }),
-        );
-        assert!(!meta.delegate_gated_open_elsewhere(6).unwrap());
-        assert_eq!(
-            journal(6, RowCommit::DELEG_GROUP),
-            (1, RowCommit::DELEG_GROUP)
-        );
-        let r = meta.db.read_tx();
-        assert_eq!(read_gated_open(&r, &meta).unwrap(), vec![6]);
-        drop(r);
-        // A mark whose row left the journal (stranded with its generation's
-        // end, or retired by the log) is not open either.
-        assert_eq!(
-            journal(5, RowCommit::DELEG_GROUP),
-            (2, RowCommit::DELEG_GROUP)
-        );
-        assert!(meta.delegate_gated_open_elsewhere(6).unwrap());
-        let r = meta.db.read_tx();
-        let first = journal_origins_from(&r, &meta, 5, 2)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .1;
-        drop(r);
-        let mut tx = meta.db.write_tx();
-        remove_journal_origin(&mut tx, &meta, 5, 2, first);
-        tx.commit().unwrap();
-        assert!(!meta.delegate_gated_open_elsewhere(6).unwrap());
-    }
-
     /// A takeover's strand of this node's own delegate rows takes them out
     /// of the journal and sets the stream counter to the log's index (no
     /// hole: step 6); every generation this node holds is marked in the
@@ -3528,42 +3378,6 @@ fn deleg_gated_key(gen: u64) -> String {
     format!("deleg_gated:{gen}")
 }
 
-/// `local` kv: the generations whose gated mark ([`deleg_gated_key`]) may
-/// still be open, comma-separated: added when a mark is set, taken out when
-/// the mark is found committed or its row gone from the journal
-/// ([`gated_open_elsewhere_tx`]). A few entries at most (the generations
-/// this node holds), so a `Lone` row reads it in one point read.
-const KV_DELEG_GATED_OPEN: &str = "deleg_gated_open";
-
-fn read_gated_open(r: &impl Readable, meta: &Meta) -> Result<Vec<u64>, MetaError> {
-    Ok(kv_get_tx(r, &meta.local, KV_DELEG_GATED_OPEN)?
-        .map(|v| v.split(',').filter_map(|g| g.parse::<u64>().ok()).collect())
-        .unwrap_or_default())
-}
-
-fn write_gated_open(tx: &mut SingleWriterWriteTx, meta: &Meta, gens: &[u64]) {
-    if gens.is_empty() {
-        tx.remove(&meta.local, KV_DELEG_GATED_OPEN.as_bytes().to_vec());
-    } else {
-        let v: Vec<String> = gens.iter().map(u64::to_string).collect();
-        kv_set_tx(tx, &meta.local, KV_DELEG_GATED_OPEN, &v.join(","));
-    }
-}
-
-/// `gen`'s gated mark was set: it may be open.
-fn note_gated_open_tx(
-    tx: &mut SingleWriterWriteTx,
-    meta: &Meta,
-    gen: u64,
-) -> Result<(), MetaError> {
-    let mut open = read_gated_open(&*tx, meta)?;
-    if !open.contains(&gen) {
-        open.push(gen);
-        write_gated_open(tx, meta, &open);
-    }
-    Ok(())
-}
-
 /// Whether generation `h`'s gated mark is open: above the prefix of `h`
 /// the core last published as committed (`SessionState::deleg_covered`,
 /// which only lags), and the marked row still in the journal. A mark at or
@@ -3583,53 +3397,6 @@ fn gated_mark_open(r: &impl Readable, meta: &Meta, h: u64) -> Result<bool, MetaE
         Some(Err(e)) => Err(e),
         None => Ok(false),
     }
-}
-
-/// [`Meta::delegate_gated_open_elsewhere`]'s read, and the entries found
-/// closed.
-fn gated_open_elsewhere_r(
-    r: &impl Readable,
-    meta: &Meta,
-    gen: u64,
-) -> Result<(bool, Vec<u64>), MetaError> {
-    let mut closed = Vec::new();
-    for h in read_gated_open(r, meta)? {
-        if h == gen {
-            continue;
-        }
-        if gated_mark_open(r, meta, h)? {
-            return Ok((true, closed));
-        }
-        closed.push(h);
-    }
-    Ok((false, closed))
-}
-
-/// Plan 43 C2 (hysteresis across generations): whether an own row of `gen`
-/// follows an open gated row of another generation of this node, under the
-/// writer lock (the store only prunes the open list with it now; the core
-/// decides from [`Meta::delegate_gated_open_elsewhere`]). At a takeover's strand every own generation ends together:
-/// the uncommitted gated row is dropped (its client was not answered) and a
-/// later `Lone` row of the other generation is replayed without it (a
-/// `setxattr` of a file, its primary link unlinked, then a `removexattr`
-/// under the next link's generation: the replay fails after its client was
-/// told it succeeded). `prune`: the entries found closed for good are taken
-/// out of the open list.
-fn gated_open_elsewhere_tx(
-    tx: &mut SingleWriterWriteTx,
-    meta: &Meta,
-    gen: u64,
-    prune: bool,
-) -> Result<bool, MetaError> {
-    let (open, closed) = gated_open_elsewhere_r(&*tx, meta, gen)?;
-    if prune && !closed.is_empty() {
-        let left: Vec<u64> = read_gated_open(&*tx, meta)?
-            .into_iter()
-            .filter(|g| !closed.contains(g))
-            .collect();
-        write_gated_open(tx, meta, &left);
-    }
-    Ok(open)
 }
 
 /// The `local` key prefixes of [`deleg_log_idx_key`] and [`deleg_void_cut_key`]:

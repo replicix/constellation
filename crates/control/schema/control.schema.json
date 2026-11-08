@@ -2156,22 +2156,6 @@
             "$ref": "#/$defs/WaitingGenerationStatus"
           },
           "type": "array"
-        },
-        "xgen_ack_delay_max_ms": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "xgen_ack_delay_ms": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "xgen_acks_delayed": {
-          "description": "Acknowledgements whose row its own group held but that waited for a\nrow of another generation this node delegates (a `DelegateNodeGroup`\nacknowledgement waits for the row's dependencies on the node's other\ngenerations), with the total and the longest of those waits in ms.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
         }
       },
       "required": [
@@ -2225,9 +2209,6 @@
         "backup_appends",
         "backup_acks",
         "acks_parked",
-        "xgen_acks_delayed",
-        "xgen_ack_delay_ms",
-        "xgen_ack_delay_max_ms",
         "lost_deps_stopped",
         "append_deps_lost",
         "append_skipped",

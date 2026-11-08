@@ -1117,27 +1117,6 @@ pub struct Stats {
     /// Delegate: stream acknowledgements that took none of the batch (the
     /// root lacks, or lost, a dependency): the stream backs off.
     pub deleg_stream_no_progress: u64,
-    /// Delegate: times a generation's committed prefix was held below its
-    /// group's by a dependency on another generation's uncommitted row,
-    /// their total and longest duration (the acknowledgement rule's cost).
-    pub deleg_xgen_holds: u64,
-    pub deleg_xgen_hold_ms: u64,
-    pub deleg_xgen_hold_max_ms: u64,
-    /// The acknowledgement rule's own cost: computations of the committed
-    /// prefixes and the dependency entries they visited.
-    pub deleg_caps_calls: u64,
-    pub deleg_caps_walked: u64,
-    /// The store reads `deleg_note_xdeps` makes for dependencies on
-    /// generations not held here, once per generation and batch: the log's
-    /// index of one, and whether this node assigned stream indices in it.
-    pub deleg_xdeps_log_reads: u64,
-    pub deleg_xdeps_own_checks: u64,
-    /// Delegate: parked acknowledgements whose row its own group held but
-    /// that waited for another generation's row, how long in all and at
-    /// most (from when the own group held it to the release).
-    pub deleg_xgen_acks_delayed: u64,
-    pub deleg_xgen_ack_delay_ms: u64,
-    pub deleg_xgen_ack_delay_max_ms: u64,
     /// Delegate: parked acknowledgements of a delegated row released, and
     /// how long they waited in all (the base the delay compares with).
     pub deleg_stream_acks_released: u64,
@@ -2803,7 +2782,7 @@ impl Core {
         self.renew_after_own_cas(now, &mut out);
         self.promise_after_event(now, replica, &mut out);
         self.deleg_after_event(now, replica, &mut out);
-        self.report_deleg_durable(now, replica);
+        self.report_deleg_durable(replica);
         if self.cfg.delegation {
             self.withdraw_lost_deps_inbox_ops(now, replica, &mut out);
         }
