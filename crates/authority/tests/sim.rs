@@ -12433,7 +12433,8 @@ fn run_m14(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> M14Total
 /// The per-seed watchdog of `run_m14`: a thread that, every second, compares
 /// the running seed's wall time with ten times the median of the seeds this
 /// configuration has finished (60 s before it has eight; never under 10 s) and
-/// once per seed prints a gdb backtrace of every thread of the process.
+/// once per seed reports it; the first report of the process also prints a
+/// gdb backtrace of every thread (bounded to 120 s).
 struct SeedWatch {
     state: std::sync::Arc<std::sync::Mutex<WatchState>>,
     stop: std::sync::mpsc::Sender<()>,
@@ -12470,14 +12471,30 @@ impl SeedWatch {
                 }
                 s.reported = true;
                 drop(s);
+                // One gdb dump per process: with the suite's tests in
+                // parallel on a loaded box, a gdb per slow test (each
+                // stopping every thread of the process) stalled the run.
+                static DUMPED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                let dump = !DUMPED.swap(true, std::sync::atomic::Ordering::SeqCst);
                 eprintln!(
                     "[watchdog] {label} seed {seed}: running {:?} (limit {limit:?}); \
                      replay with AUTHORITY_SIM_CONFIG={label} AUTHORITY_SIM_START={seed} \
-                     AUTHORITY_SIM_SEEDS=1; thread backtraces follow",
-                    since.elapsed()
+                     AUTHORITY_SIM_SEEDS=1{}",
+                    since.elapsed(),
+                    if dump {
+                        "; thread backtraces follow"
+                    } else {
+                        " (backtraces were dumped once already)"
+                    }
                 );
-                let out = std::process::Command::new("gdb")
-                    .args(["-batch", "-p", &std::process::id().to_string()])
+                if !dump {
+                    continue;
+                }
+                // Bounded: gdb on a process of many threads can take minutes.
+                let out = std::process::Command::new("timeout")
+                    .args(["-s", "KILL", "120", "gdb", "-batch", "-p"])
+                    .arg(std::process::id().to_string())
                     .args(["-ex", "thread apply all bt"])
                     .output();
                 match out {
