@@ -956,7 +956,9 @@ pub(crate) struct LeaveWait {
 pub(crate) const LEAVE_NOTE_GEN: u64 = 0;
 
 /// A root's mark of a node that said it leaves lapses when no note has come
-/// for this many resend intervals.
+/// for this many resend intervals, or for twice the delegation TTL if that
+/// is longer (the node's grants and its stream outlive a missed note by
+/// the TTL; a mark that lapsed earlier would grant it again).
 const LEAVE_NOTE_LAPSE_RESENDS: u64 = 3;
 
 /// Why a node is marked leaving at its root.
@@ -10341,9 +10343,10 @@ impl Core {
     /// `note` is the request of the node's own note. The leaving node sends
     /// it again every resend interval for as long as its leave lasts (also
     /// after the core answered it, and to a new root), so the mark lapses
-    /// when no note has come for [`LEAVE_NOTE_LAPSE_RESENDS`] intervals (a
-    /// node that stays up, or comes back under the same id, is granted
-    /// again), not at a fixed time after the first one. `None` is an
+    /// when no note has come for [`LEAVE_NOTE_LAPSE_RESENDS`] intervals or
+    /// twice the delegation TTL, whichever is longer (a node that stays up,
+    /// or comes back under the same id, is granted again), not at a fixed
+    /// time after the first one. `None` is an
     /// operator's leave, whose mark goes with the leave that fails.
     fn leave_mark(&mut self, now: Now, node: NodeId, note: Option<OpId>) {
         let mark = match (self.dl.leaving.get(&node), note) {
@@ -10370,7 +10373,9 @@ impl Core {
 
     /// How long the root's mark of a leaving node lasts without a note.
     fn leave_note_lapse_ms(&self) -> u64 {
-        (self.leave_resend_ms() as u64).saturating_mul(LEAVE_NOTE_LAPSE_RESENDS)
+        (self.leave_resend_ms() as u64)
+            .saturating_mul(LEAVE_NOTE_LAPSE_RESENDS)
+            .max(self.cfg.delegation_ttl_ms.saturating_mul(2))
     }
 
     /// Whether a leaving note of `req` from `node` is a delayed duplicate

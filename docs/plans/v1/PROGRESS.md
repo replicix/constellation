@@ -68932,3 +68932,8 @@ One stream per node (step 9) means a row has no dependency on an uncommitted row
 **Perf** (the sim's delegate batch path, 600 seeds, 4 threads, quiet box, ABBA ×3 per config, mean user CPU s base -> new): `placement-hot+commit` 59.48 -> 59.17, `long-delegated+commit` 44.95 -> 44.20, `delegated-two-dirs-one-backed+commit` 77.19 -> 75.95 (-0.5 to -1.7 %, wall the same). The base computed the caps 0.3 to 3.2 million times per 2,000 seeds with 0 entries visited (a node with one stream records no cross-generation dependency, so the walk was already empty: what goes is the per-call map building).
 
 **Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, meta, net, control, `-p constellation`, authority lib (1,148 / 2 ignored), engine lib, release authority sim suite 429 passed.
+
+## 2026-11-08 Step 11's re-review SHOULDs: the leave mark lapse, the bounded flush
+
+- The root's mark of a node's own leave note lapses after max(3 resend intervals, 2 x `delegation_ttl_ms`) without a note (was 3 x max(forward_timeout, 500) = 1.5 s: a note late by a TTL let the root grant the leaving node again). Test `a_leave_mark_outlasts_twice_the_delegation_ttl` (fails before: the mark was gone at 1.5 s).
+- The engine's leave (`authority_driver.rs`): the journal flush and the registry's retirement are bounded (300 s, 120 s); past a bound, or on either error, `Control::LeaveFailed` is sent and the leave answers an error ("run the leave again"). The flush reply is now `ControlReply::LeaveFlush` and `run_leave_tail` waits for it. Test `a_leave_whose_flush_or_retirement_hangs_fails_and_is_taken_back` (the old path waited for ever; it has no way to be called with a hung flush).

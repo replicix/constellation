@@ -62172,6 +62172,26 @@ mod step9_one_stream_per_node {
         assert!(!n.core.is_leaving(n.clk(), 3));
     }
 
+    /// Step 11 re-review 3 (SHOULD): the root's mark of a node's own note
+    /// lasts the longer of three resend intervals and twice the delegation
+    /// TTL, not three resend intervals (about 1.5 s) alone: a leaving node's
+    /// note may be late by a TTL, and a mark that lapsed first would grant
+    /// the node again. Fails before: the mark was gone at 1.5 s.
+    #[test]
+    fn a_leave_mark_outlasts_twice_the_delegation_ttl() {
+        let (mut r, _d1) = root_with_dir();
+        r.core.cfg.delegation_ttl_ms = 10_000;
+        r.core.cfg.forward_timeout_ms = 500;
+        r.step(leave_note_from(3, 100, true));
+        r.advance(15_000);
+        assert!(
+            r.core.is_leaving(r.clk(), 3),
+            "the mark lapsed before twice the TTL"
+        );
+        r.advance(6_000);
+        assert!(!r.core.is_leaving(r.clk(), 3), "the mark does not lapse");
+    }
+
     /// Re-review MUST-3, the root's side: the mark of a node's own note is
     /// taken back by a later note of the node, not by an older one, lapses
     /// with the time a leave may take, and goes when the node comes back
@@ -62341,7 +62361,7 @@ mod step9_one_stream_per_node {
 
     /// Re-review MUST, the root's side: the mark of a node's own note lasts
     /// while its notes keep coming, however long the leave takes, and lapses
-    /// a few resend intervals after they stop.
+    /// a few resend intervals, or twice the delegation TTL, after they stop.
     #[test]
     fn a_leave_mark_lasts_while_the_notes_come_and_lapses_after_they_stop() {
         let (mut r, _d1) = root_with_dir();
@@ -62356,7 +62376,7 @@ mod step9_one_stream_per_node {
             spent += 400;
         }
         assert!(r.core.is_leaving(r.clk(), 3));
-        r.advance(3_000);
+        r.advance(2 * r.core.cfg.delegation_ttl_ms + 3_000);
         assert!(
             !r.core.is_leaving(r.clk(), 3),
             "the mark outlasts the notes"
