@@ -2111,7 +2111,7 @@ impl Core {
                         recall_req: None,
                         recall_tries: Vec::new(),
                         recall_started: None,
-                recall_cause: None,
+                        recall_cause: None,
                         release_resends: 0,
                         recall_resend: None,
                         recall_backoff_ms: 0,

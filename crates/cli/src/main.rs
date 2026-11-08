@@ -4141,7 +4141,8 @@ fn xattr_remove(path: &std::path::Path, name: &str) -> Result<()> {
 /// Plan 46 M1.3 step 4 review: what `undelegate` says when it fails or does
 /// not finish. A sticky grant is never outwaited (the root does not time it
 /// out): the call ends when the holder releases it.
-const UNDELEGATE_STICKY_HINT: &str = "undelegate recalls the grant and waits for the holder's release; \
+const UNDELEGATE_STICKY_HINT: &str =
+    "undelegate recalls the grant and waits for the holder's release; \
      a sticky grant is not outwaited, so if its holder is unreachable the wait does not end \
      until it returns: `constellation repair abandon` ends the stream instead";
 

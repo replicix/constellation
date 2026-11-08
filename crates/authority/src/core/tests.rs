@@ -61970,7 +61970,11 @@ mod step9_one_stream_per_node {
         );
         let out = h.step(Event::Control {
             op: OpId(911),
-            req: Control::Delegate { dir: d1, node: 3 },
+            req: Control::Delegate {
+                dir: d1,
+                node: 3,
+                sticky: false,
+            },
         });
         let answer = control_answer(&out, 911).expect("no answer");
         assert!(
@@ -62013,7 +62017,11 @@ mod step9_one_stream_per_node {
         deliver_stream(&mut r, 3, gen, Vec::new(), Some(note));
         let out = r.step(Event::Control {
             op: OpId(920),
-            req: Control::Delegate { dir: d2, node: 3 },
+            req: Control::Delegate {
+                dir: d2,
+                node: 3,
+                sticky: false,
+            },
         });
         let answer = control_answer(&out, 920).expect("no answer");
         assert!(
@@ -62182,7 +62190,11 @@ mod step9_one_stream_per_node {
         assert_eq!(leave_ack_to(&out, 3), Some(false), "{out:?}");
         let out = r.step(Event::Control {
             op: OpId(920),
-            req: Control::Delegate { dir: d1, node: 3 },
+            req: Control::Delegate {
+                dir: d1,
+                node: 3,
+                sticky: false,
+            },
         });
         let answer = control_answer(&out, 920).expect("no answer");
         assert!(
