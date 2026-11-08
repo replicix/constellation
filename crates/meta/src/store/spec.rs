@@ -294,7 +294,14 @@ enum LiveEntry {
     },
     /// Plan 30 §M11: `gen` is the delegation stream the transaction
     /// belongs to (0: this node's own row as a holder).
-    Local { first: u64, epoch: u64, gen: u64 },
+    /// `appended`: the root's append of a delegate's stream row (not an
+    /// execution of this node's own; `JournalTx::appended`).
+    Local {
+        first: u64,
+        epoch: u64,
+        gen: u64,
+        appended: bool,
+    },
 }
 
 impl LiveEntry {
@@ -769,6 +776,11 @@ pub struct Stranded {
     /// copy of its generation (`backup_tail[DELEG_BACKUP_BASE + gen]`), never
     /// queued. Not in `locals`.
     pub deleg_member_copied: usize,
+    /// Plan 46 M1.2 step 14: a root's append of a delegate's row (`gen` !=
+    /// 0, `JournalTx::appended`) that a pass queued for replay. Must stay 0:
+    /// an appended row is dropped or kept as a member copy, never replayed
+    /// (a debug build asserts).
+    pub deleg_append_queued: usize,
 }
 
 impl Stranded {
@@ -863,6 +875,9 @@ enum Stranding {
     /// Plan 46 M1.2 step 7: a delegate's row this root appended, moved to
     /// the member copy of its generation (`Stranded::deleg_member_copied`).
     DelegMember,
+    /// A root's append of a delegate's row queued for replay
+    /// (`Stranded::deleg_append_queued`; cannot arise).
+    AppendQueued,
     /// A gated row queued for replay in a pass that must not (counted,
     /// `Stranded::gated_queued`; a debug build asserts).
     GatedQueued,
@@ -890,24 +905,6 @@ struct Strand<'a> {
     /// row was answered on the delegate's disk alone and is replayed as
     /// before.
     recall: bool,
-    /// L2: the pass is a rebuild of the namespace from the log
-    /// (`reset_for_rebuilt_ns_tx`): a deposed node's (`recover_deposed`)
-    /// and a replica the log was pruned past (the retention rebuild, jobs.rs
-    /// `after_gap_check`: a node behind the log's retained tail is no
-    /// current root, so what it still journals is a past tenure's, as in a
-    /// deposition). A root's append of a delegate's row (`gen` != 0,
-    /// journaled under the root's lease epoch) of a gated class is dropped,
-    /// not queued. The class is not the append's ADR-41 commit: a root
-    /// journals such an append `Lone`, and it turns gated only when another
-    /// node re-asks the rid (the answer is journaled `Archive`) or a
-    /// predecessor's tail is adopted at a takeover (`RootGroup`). Either way
-    /// another copy exists: the asker retries the rid by itself, the
-    /// predecessor's members hold the tail, and the delegate re-streams the
-    /// row to the successor root. A queued copy would be a second
-    /// executable copy of a rid (I2). A `Lone` append is queued as before.
-    /// (A third source of a gated root append is C3's re-append at a
-    /// delegate's takeover gate, `RootGroup`; see L2b in `strand_local_tx`.)
-    rebuild: bool,
     /// A committed row the pass moves to the member copy holds reads of its
     /// keys until the re-ship lands (`Meta::member_copy_touches`): a
     /// segment's apply, and `strand_below_epoch` (a deposition's recovery
@@ -928,12 +925,6 @@ struct Strand<'a> {
     /// stranded row, then dropped. Set per row by `redo_row_tx` for a
     /// `Local` entry of the pass's `quiet` set.
     superseded: bool,
-    /// Plan 46 M1.2 step 7 (c3-spec §6.1): a deposition's pass. A `Local` row
-    /// of another node's generation (`gen` != 0, a lease epoch, `gen` not in
-    /// this set: the root's append of a delegate's row) is rolled back and kept
-    /// as a member copy of that generation, never queued. The set is this
-    /// node's own generations as a delegate.
-    deleg_copy: Option<&'a HashSet<u64>>,
 }
 
 impl Strand<'static> {
@@ -942,11 +933,9 @@ impl Strand<'static> {
         member: false,
         quiet: None,
         recall: false,
-        rebuild: false,
         hold: false,
         deps_of: None,
         superseded: false,
-        deleg_copy: None,
     };
 }
 
@@ -1069,6 +1058,7 @@ fn read_live(r: &impl Readable, meta: &Meta) -> Result<Vec<(u64, LiveEntry)>, Me
                     first,
                     epoch: row.epoch,
                     gen: row.gen,
+                    appended: row.appended,
                 },
             ));
         }
@@ -1693,29 +1683,40 @@ fn strand_local_tx(
             }
         }
     }
-    // Plan 46 M1.2 step 7 (c3-spec §6.1, D12): a delegate's row this node
-    // appended as the root (`gen` != 0 under a lease epoch, not one of its own
-    // generations as a delegate) is another node's stream's row. It was rolled
-    // back above (journal rows, `completed`, the generation's log index); it
-    // is not this node's to re-execute and is never queued: the delegate's
-    // answer waits for a group that may include this node's append, so the
-    // row is kept verbatim as a member copy of its generation, which the next
-    // root's seal of the generation reads (`DelegSeal`, `deleg_backup_tail`).
-    if let Some(own) = strand.deleg_copy {
-        if row.gen != 0 && row.epoch > 0 && !own.contains(&row.gen) {
-            super::backup::deleg_member_copy_put_tx(
-                tx,
-                meta,
-                row.gen,
-                &super::DelegateTx {
-                    idx: row.idx,
-                    rid: row.rid,
-                    records,
-                    deps: row.deps,
-                },
-            )?;
-            return Ok(Stranding::DelegMember);
+    // Plan 46 M1.2 step 14: a delegate's row this node journaled as the root
+    // (`appended`: `apply_delegate_tx`, or the origin-keeping re-ship/re-append)
+    // is another node's stream's row, not this node's to re-execute, and is
+    // never queued. It was rolled back above (journal rows, `completed`, the
+    // generation's log index). A pass past the generation's end (a recall) or
+    // that the log answers already (the outcomes a later tenure's segment
+    // carries under another identity: `superseded`) drops it: the log, or the
+    // successor's seal, carries the row. Any other pass (a deposition, a
+    // rebuild, the takeover gate) keeps it verbatim as a member copy of its
+    // generation (`DelegSeal`, `deleg_backup_tail`): the delegate's answer
+    // waits for a group that may include this node's append. (Not the lease
+    // epoch: a delegate's own execution between acquiring the lease and the
+    // gate's strand carries the epoch too.)
+    if row.gen != 0
+        && row.appended
+        && !meta
+            .deleg_append_replay
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        if strand.recall || strand.superseded {
+            return Ok(Stranding::Dropped);
         }
+        super::backup::deleg_member_copy_put_tx(
+            tx,
+            meta,
+            row.gen,
+            &super::DelegateTx {
+                idx: row.idx,
+                rid: row.rid,
+                records,
+                deps: row.deps,
+            },
+        )?;
+        return Ok(Stranding::DelegMember);
     }
     // Plan 43 C1-4 (§5.2 item 2, §5.6): a row this node's client was told
     // is committed (its group or the archive held it) is not this node's to
@@ -1751,81 +1752,13 @@ fn strand_local_tx(
         }
         return Ok(Stranding::Member);
     }
-    // Plan 43 C2 (§3.8): a delegate's row whose client was told nothing
+    // Plan 43 C2 (§3.8): a delegate's own row whose client was told nothing
     // (gated: the answer waits for the row's commit) and which the log's
     // cut leaves out is dropped: rolled back above, nothing queued. The
     // client retries by rid at the generation's new owner; the park that
     // waited for the row was aborted at the end (`drop_delegate_state`).
-    // (A row with a lease epoch is a root's append of a delegate's row, not
-    // this node's own execution as the delegate: it keeps today's rule. A
-    // root append past the recall's cut is queued whatever its class: the
-    // class is not the append's commit, and a lone tenure counts its appends
-    // at once, so the queued copy can be the row's last server-side copy
-    // (L2b, below).)
-    //
-    // L2b (known, deferred to plan 46 M1.2; PROGRESS, "L2b"). Two paths queue
-    // a copy of another node's rid that the class gates, and both are kept:
-    // (a) a delegate that takes the root strands its own rows (`gen` != 0,
-    // `epoch` == 0, `member`, neither `recall` nor `rebuild`) at its takeover
-    // gate: the gate's own call restores the committed ones from the tail
-    // (the replay finds them completed) and re-appends (C3) the ones that
-    // continue the stream, so what is left replays by rid through the
-    // sequencer, which dedups any other copy. It is not dropped as the
-    // recall drop above does: a `DelegateNodeGroup` row committed by the delegate's
-    // own backups is answered and in no root tail, and a halted one would be
-    // lost with the generation the gate ends. (b) the recall pass queues the
-    // root appends past the cut (`recall`, `!member`, `epoch` > 0) with their
-    // class, for the reason in the preceding parenthesis. Neither executes
-    // twice (the sequencer answers the second copy from `completed`), but (b)
-    // can sit beside the owner's own replay of the same rid, which the I2
-    // ledger judges (long-delegated-backup seed 13016 under slow lease reads).
-    // The defect is upstream: a committed delegate row that exists verbatim
-    // only in the journal of a delegate-turned-root's lone tenure, which ends
-    // unshipped below the next root's cut, so every copy left is a rescue by
-    // rid. M1.2's member copies close it, and with it the pair.
-    if recall && row.class.gated() && row.gen != 0 && row.epoch == 0 {
-        return Ok(Stranding::Dropped);
-    }
-    // L2: a rebuild strands a root's appends of a delegate's rows (`gen`
-    // != 0, `epoch` > 0): see `Strand::rebuild`. They are rolled back above
-    // (journal rows, `completed`, the generation's log index); a gated one
-    // is not queued. The class does not say the append committed: a root
-    // journals a delegate's row `Lone` (`Meta::finish_local`; no class is
-    // set around `apply_delegate_tx` in `on_delegate_stream`), whatever
-    // ADR-41 counted for the delegate. Only two things make it gated, and
-    // both leave another copy:
-    // - another node's re-ask of the rid, answered from this journal
-    //   (`journaled_answer_class_for` re-tags it `Archive`, and the answer
-    //   waits for the archive): the asker holds an unanswered, executable
-    //   copy and retries it by rid at the successor (this would be a second
-    //   one, I2);
-    // - a predecessor's tail adopted at a takeover
-    //   (`apply_adopted_records_from`, `RootGroup` by default): its group
-    //   committed it, and its members keep it as a member copy until the log
-    //   carries it.
-    // A third source is C3's re-append at a delegate's own takeover gate
-    // (`reappend_own_delegate_rows` -> `apply_adopted_records_from`, class
-    // `RootGroup`): it is the source in every L2b witness. The drop is safe
-    // for it only while the requester holds the other copy (a persisted gated
-    // shadow, a live retry or an in-doubt op); a requester restarted without
-    // its journal leaves the recall pass's queued copy as the last one.
-    // In both the delegate also re-streams the row while it holds it. An
-    // append still `Lone` keeps today's rule (queued): for a lone tenure
-    // (ADR-41 counts its journal at once) it is the row's last copy once the
-    // delegate's is gone. Latent hazard: a change that journals a root's
-    // appends with a gated class (`journal_class_for`: a lone root classes
-    // another node's op `Archive`) would make ADR-41 count the append at
-    // once, and this drop would lose an answered row.
-    if strand.rebuild && row.class.gated() && row.gen != 0 && row.epoch > 0 {
-        return Ok(Stranding::Dropped);
-    }
-    // Seed 2560: a root's append of a delegate's row (`gen` != 0, `epoch`
-    // > 0) whose every outcome a segment of a later tenure carries under
-    // another identity ([`superseded_root_appends_tx`]). Rolled back above
-    // (journal rows, `completed`, the generation's log index); the
-    // segment's own records apply in its place. Not queued: the log has the
-    // rid's outcome, so a replay could only be answered from the dedup.
-    if strand.superseded && row.gen != 0 && row.epoch > 0 {
+    // (A root's append is `appended`, handled above.)
+    if recall && row.class.gated() && row.gen != 0 {
         return Ok(Stranding::Dropped);
     }
     // (A gated row of this node's own tenure that a deposition queues for
@@ -1838,10 +1771,20 @@ fn strand_local_tx(
         None => derive_replay_op(&records),
     };
     if let Some(op) = op {
+        debug_assert!(
+            row.gen == 0
+                || !row.appended
+                || meta
+                    .deleg_append_replay
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            "a root's append of a delegate's row is queued for replay"
+        );
         enqueue_replay_as_tx(tx, meta, key, rid, op, row.lock_tag, None, 0, deps, before)?;
         mark_queued_class_tx(tx, meta, key, row.class)?;
     }
-    Ok(if gated_queue {
+    Ok(if row.gen != 0 && row.appended {
+        Stranding::AppendQueued
+    } else if gated_queue {
         Stranding::GatedQueued
     } else {
         Stranding::Queued
@@ -2220,6 +2163,10 @@ fn redo_row_tx(
                     Stranding::GatedQueued => {
                         out.locals += 1;
                         out.gated_queued += 1;
+                    }
+                    Stranding::AppendQueued => {
+                        out.locals += 1;
+                        out.deleg_append_queued += 1;
                     }
                     Stranding::Dropped => out.deleg_dropped += 1,
                 }
@@ -3277,22 +3224,6 @@ fn strand_tx(
     hold: bool,
     quiet: impl Fn(&LiveEntry) -> bool,
 ) -> Result<Stranded, MetaError> {
-    strand_tx_deleg(tx, meta, staged, strands, member, recall, hold, quiet, None)
-}
-
-/// [`strand_tx`] with `deleg_copy` ([`Strand::deleg_copy`]).
-#[allow(clippy::too_many_arguments)]
-fn strand_tx_deleg(
-    tx: &mut SingleWriterWriteTx,
-    meta: &Meta,
-    staged: &UsageTracker,
-    strands: impl Fn(&LiveEntry) -> bool,
-    member: bool,
-    recall: bool,
-    hold: bool,
-    quiet: impl Fn(&LiveEntry) -> bool,
-    deleg_copy: Option<&HashSet<u64>>,
-) -> Result<Stranded, MetaError> {
     let live: HashMap<u64, LiveEntry> = read_live(tx, meta)?.into_iter().collect();
     let stranded: HashSet<u64> = live
         .iter()
@@ -3311,11 +3242,9 @@ fn strand_tx_deleg(
         member,
         quiet: Some(&quiet),
         recall,
-        rebuild: false,
         hold,
         deps_of: None,
         superseded: false,
-        deleg_copy,
     };
     Ok(rewind_tx(tx, meta, staged, &live, &stranded, cutoff, strand, None)?.0)
 }
@@ -3820,11 +3749,9 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
                 member: true,
                 quiet: None,
                 recall: false,
-                rebuild: true,
                 hold: false,
                 deps_of: Some(&deps_of),
                 superseded: false,
-                deleg_copy: None,
             },
         )?;
     }
@@ -5581,6 +5508,7 @@ impl Meta {
             stranded.hints += more.hints;
             stranded.locals += more.locals;
             stranded.deleg_dropped += more.deleg_dropped;
+            stranded.deleg_append_queued += more.deleg_append_queued;
             // L1: the log ended these generations, so no `Local` row of
             // them is left to order (`local::note_deleg_streamed_tx`). Here
             // as well as in `replay::apply_one`: a `DelegateNodeEnded` the stream
@@ -5713,20 +5641,18 @@ impl Meta {
 
     /// Plan 46 M1.2 step 7 (c3-spec §6.1): a deposition's strand.
     /// [`Self::strand_below_epoch`]'s fates, and a delegate's row this node
-    /// appended as the root (a `Local` row of a generation not in `own_gens`,
-    /// journaled under a lease epoch below `floor`) is rolled back from its
-    /// before-images, leaves the journal (and the generation's log index
-    /// retracts) and is kept verbatim as a member copy of its generation
-    /// (`backup_tail[DELEG_BACKUP_BASE + gen]`, key `idx`), in the same
-    /// transaction. Never queued: the delegate holds the row until the log
-    /// carries it and the next root's `DelegSeal` of a backup-less generation
-    /// reads this copy. `own_gens` are the generations this node is the
-    /// delegate of (their rows are its live stream: left alone).
-    pub fn strand_deposed(&self, floor: u64, own_gens: &[u64]) -> Result<Stranded, MetaError> {
-        let own: HashSet<u64> = own_gens.iter().copied().collect();
+    /// appended as the root (`Local`, `appended`, journaled under a lease
+    /// epoch below `floor`) is rolled back from its before-images, leaves the
+    /// journal (and the generation's log index retracts) and is kept verbatim
+    /// as a member copy of its generation (`backup_tail[DELEG_BACKUP_BASE +
+    /// gen]`, key `idx`), in the same transaction. Never queued: the delegate
+    /// holds the row until the log carries it and the next root's `DelegSeal`
+    /// of a backup-less generation reads this copy. This node's own rows as a
+    /// delegate are not appended rows: left alone (its live stream).
+    pub fn strand_deposed(&self, floor: u64) -> Result<Stranded, MetaError> {
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
-        let stranded = strand_tx_deleg(
+        let stranded = strand_tx(
             &mut tx,
             self,
             &staged,
@@ -5734,15 +5660,14 @@ impl Meta {
                 entry.stranded_by_takeover(floor)
                     || matches!(
                         entry,
-                        LiveEntry::Local { epoch, gen, .. }
-                            if *gen != 0 && *epoch != 0 && *epoch < floor && !own.contains(gen)
+                        LiveEntry::Local { epoch, gen, appended: true, .. }
+                            if *gen != 0 && *epoch < floor
                     )
             },
             true,
             false,
             true,
             |_| false,
-            Some(&own),
         )?;
         if !stranded.any() {
             return Ok(stranded);
@@ -6224,6 +6149,8 @@ impl Meta {
             stranded.hints += more.hints;
             stranded.locals += more.locals;
             stranded.member_copied += more.member_copied;
+            stranded.deleg_member_copied += more.deleg_member_copied;
+            stranded.deleg_append_queued += more.deleg_append_queued;
             stranded.superseded += more.superseded;
             stranded.committed_rolled_back += more.committed_rolled_back;
             stranded.gated_queued += more.gated_queued;
@@ -6262,6 +6189,7 @@ impl Meta {
             stranded.hints += more.hints;
             stranded.locals += more.locals;
             stranded.deleg_dropped += more.deleg_dropped;
+            stranded.deleg_append_queued += more.deleg_append_queued;
             for gen in &orphaned {
                 local::clear_deleg_streamed_tx(tx, &self.local, *gen);
             }

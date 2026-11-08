@@ -490,6 +490,12 @@ pub struct Config {
     /// linked within the budget: the deleted lone delegate. The oracles
     /// (I1, I5) must fail with it.
     pub lone_delegate: bool,
+    /// Plan 46 M1.2 step 14's negative control, never set in production (the
+    /// simulation's `AUTHORITY_SIM_DELEG_APPEND_REPLAY=1`): a stranding pass
+    /// queues a root's append of a delegate's row for replay again, as it did
+    /// when the lease epoch stood for "a root's append". The sim fails on
+    /// `Stats::deleg_append_queued` and on the rows that land past a seal.
+    pub deleg_append_replay: bool,
     /// Plan 46 M1.1 step 3's negative control, never set in production: a
     /// delegate that records no backup stamps its rows with
     /// a version that is in no history (its group's plus
@@ -824,6 +830,7 @@ impl Config {
             lock_cache_idle_ms: 30_000,
             delegation_stream_rows: 256,
             lone_delegate: false,
+            deleg_append_replay: false,
             per_row_class: false,
             delegation_stream_tick_ms: 50,
             delegation_push_drop_every: 0,
@@ -1838,6 +1845,10 @@ pub struct Stats {
     /// Plan 43 C1-4: a gated `Local` row put in the replay queue. Must stay
     /// 0 (a debug assertion backs it).
     pub replay_gated_enqueued: u64,
+    /// Plan 46 M1.2 step 14: a root's append of a delegate's row put in the
+    /// replay queue by a stranding pass (`Stranded::deleg_append_queued`).
+    /// Must stay 0: an appended row is dropped or kept as a member copy.
+    pub deleg_append_queued: u64,
     /// Plan 43 C1-4: tail transactions past a gap, not re-shipped (never
     /// acknowledged; their clients retry by rid).
     pub tail_beyond_gap_dropped: u64,

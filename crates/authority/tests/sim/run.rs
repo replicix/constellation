@@ -5822,6 +5822,17 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             ));
         }
     }
+    // Plan 46 M1.2 step 14: a root's append of a delegate's row is dropped or
+    // kept as a member copy by every stranding pass, never queued for replay
+    // (`Stranded::deleg_append_queued`, also a debug assertion). Any fails.
+    for (id, stats) in &report.stats {
+        if stats.deleg_append_queued > 0 {
+            return Err(format!(
+                "node {id}: {} root append(s) of a delegate's row queued for replay\n  stats: {:#?}",
+                stats.deleg_append_queued, report.stats
+            ));
+        }
+    }
     // Plan 46 M1.2 step 5 (c3-spec D3): a successor re-ships its sealed
     // tail verbatim; a record that does not apply is a broken premise and a
     // closed gate (`TailDiverged`), never a skip. Any fails the seed.

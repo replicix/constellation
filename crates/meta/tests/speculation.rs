@@ -2667,7 +2667,7 @@ fn a_deposed_root_keeps_appended_delegate_rows_as_a_member_copy() {
         .unwrap();
     }
     assert_eq!(meta.log_stream_idx(5).unwrap(), 2);
-    let stranded = meta.strand_deposed(2, &[]).unwrap();
+    let stranded = meta.strand_deposed(2).unwrap();
     assert_eq!(stranded.deleg_member_copied, 2);
     assert_eq!(stranded.locals, 0, "nothing is queued");
     assert_eq!(meta.journal_len().unwrap(), 0);
@@ -2691,12 +2691,38 @@ fn a_deposed_root_keeps_appended_delegate_rows_as_a_member_copy() {
     assert!(meta.deleg_backup_holds_any(5).unwrap());
 }
 
-/// The same journal, with generation 5 among the node's own (it is the
-/// delegate of it): the rows are its live stream, never a copy.
+/// The delegate's own execution of generation 5 under a lease epoch (it
+/// acquired the lease before the gate's strand: `begin_local` stamps the
+/// holder epoch) is not an appended row: its live stream, never a copy.
 #[test]
 fn a_deposed_root_leaves_its_own_delegates_rows_where_they_are() {
     let meta = Meta::open_in_memory().unwrap();
     meta.set_holder_epoch(1);
+    meta.delegate_execute(
+        &create_op("a", ino(1)),
+        Some(rid(1)),
+        5,
+        Position::ZERO,
+        &Default::default(),
+        constellation_types::clock::Now::same(0),
+    )
+    .unwrap();
+    let rows = meta.journal_len().unwrap();
+    let stranded = meta.strand_deposed(2).unwrap();
+    assert_eq!(stranded.deleg_member_copied, 0);
+    assert_eq!(meta.journal_len().unwrap(), rows);
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
+    assert!(!meta.deleg_backup_holds_any(5).unwrap());
+}
+
+/// Plan 46 M1.2 step 14 ("cannot arise"): a root's append of a delegate's row
+/// (`JournalTx::appended`) is never queued for replay by a stranding pass,
+/// whatever the lease epoch it carries and whatever its class. It is kept as
+/// a member copy of its generation (a deposition, a rebuild) or dropped (the
+/// generation's end by a segment, a later tenure's segment carrying the
+/// outcome under another identity). The pass counters say which.
+fn root_append(meta: &Meta, epoch: u64) {
+    meta.set_holder_epoch(epoch);
     meta.apply_delegate_tx(
         &[create("a", ino(1), 11), completed(rid(1))],
         Some(rid(1)),
@@ -2705,10 +2731,72 @@ fn a_deposed_root_leaves_its_own_delegates_rows_where_they_are() {
         Position::ZERO,
     )
     .unwrap();
-    let rows = meta.journal_len().unwrap();
-    let stranded = meta.strand_deposed(2, &[5]).unwrap();
-    assert_eq!(stranded.deleg_member_copied, 0);
-    assert_eq!(meta.journal_len().unwrap(), rows);
-    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
+    meta.set_holder_epoch(0);
+    assert_eq!(meta.log_stream_idx(5).unwrap(), 1);
+}
+
+#[test]
+fn a_root_append_is_kept_as_a_member_copy_by_a_deposition_and_a_rebuild() {
+    // Deposition.
+    let meta = Meta::open_in_memory().unwrap();
+    root_append(&meta, 1);
+    let s = meta.strand_deposed(2).unwrap();
+    assert_eq!(
+        (s.deleg_member_copied, s.locals, s.deleg_append_queued),
+        (1, 0, 0)
+    );
+    assert!(meta.pending_replays().unwrap().is_empty());
+    assert_eq!(meta.deleg_backup_tail(5).unwrap().len(), 1);
+    // Rebuild (a deposed node's recovery, a retention rebuild).
+    let meta = Meta::open_in_memory().unwrap();
+    root_append(&meta, 1);
+    let side = Meta::open_in_memory().unwrap();
+    meta.replace_ns_from_rebuilt(&side, &Default::default())
+        .unwrap();
+    assert!(meta.pending_replays().unwrap().is_empty());
+    assert_eq!(meta.deleg_backup_tail(5).unwrap().len(), 1);
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_none());
+}
+
+#[test]
+fn a_root_append_is_dropped_by_a_generations_end_and_by_a_superseding_segment() {
+    // The generation's end (a recall) with the append past the cut.
+    let meta = Meta::open_in_memory().unwrap();
+    root_append(&meta, 1);
+    let ended = [LogRecord::DelegateNodeEnded {
+        node: 2,
+        gen: 5,
+        through: 0,
+    }];
+    let applied = meta
+        .apply_segment_rows(1, 1, 1, &[], &[], &ended, &TouchSet::default())
+        .unwrap();
+    assert_eq!(applied.stranded.deleg_dropped, 1);
+    assert_eq!(applied.stranded.deleg_append_queued, 0);
+    assert!(meta.pending_replays().unwrap().is_empty());
     assert!(!meta.deleg_backup_holds_any(5).unwrap());
+    // A later tenure's segment carries the rid's outcome under another
+    // identity.
+    let meta = Meta::open_in_memory().unwrap();
+    root_append(&meta, 1);
+    let carried = [create("a", ino(1), 11), completed(rid(1))];
+    let applied = meta
+        .apply_segment_rows(1, 2, 2, &[], &[], &carried, &TouchSet::default())
+        .unwrap();
+    assert_eq!(applied.stranded.deleg_append_queued, 0);
+    assert_eq!(applied.stranded.locals, 0);
+    assert_eq!(applied.stranded.deleg_dropped, 1, "superseded: dropped");
+    assert!(meta.pending_replays().unwrap().is_empty());
+}
+
+/// Non-vacuity: the negative control (`Meta::set_deleg_append_replay`) puts
+/// the append in the replay queue again, and the pass counts it.
+#[test]
+fn the_negative_control_queues_a_root_append_and_is_counted() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_deleg_append_replay(true);
+    root_append(&meta, 1);
+    let s = meta.strand_deposed(2).unwrap();
+    assert_eq!((s.deleg_member_copied, s.deleg_append_queued), (0, 1));
+    assert_eq!(meta.pending_replays().unwrap().len(), 1);
 }

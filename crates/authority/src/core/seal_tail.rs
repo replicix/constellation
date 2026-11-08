@@ -1094,6 +1094,7 @@ impl Core {
         self.stats.committed_superseded += s.superseded as u64;
         self.stats.committed_rolled_back += s.committed_rolled_back as u64;
         self.stats.replay_gated_enqueued += s.gated_queued as u64;
+        self.stats.deleg_append_queued += s.deleg_append_queued as u64;
         self.stats.deleg_dropped += s.deleg_dropped as u64;
     }
 }

@@ -537,6 +537,8 @@ impl NodeHandle {
             None => {
                 let m = Meta::open_in_memory().expect("meta");
                 m.set_node_prefix(id).expect("prefix");
+                // Plan 46 M1.2 step 14's negative control.
+                m.set_deleg_append_replay((env.config)(id, 0).deleg_append_replay);
                 // A restart without the journal keeps no queue either.
                 env.oracles.identity.lock().unwrap().wipe(id);
                 Arc::new(m)

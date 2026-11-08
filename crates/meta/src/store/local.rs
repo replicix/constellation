@@ -366,6 +366,14 @@ pub(crate) struct JournalTx {
     /// under another identity: `spec::superseded_root_appends_tx`).
     pub gen: u64,
     pub idx: u64,
+    /// Plan 46 M1.2 step 14: this node journaled the row as the root's
+    /// append of a delegate's stream row (`apply_delegate_tx`, the
+    /// origin-keeping `apply_adopted_records_from`), not as an execution
+    /// of its own (a delegate's own row, or a holder's, of any epoch).
+    /// A root's append is never replayed: past its generation's end it is
+    /// dropped, otherwise it is copied to the member copy
+    /// (`spec::strand_local_tx`).
+    pub appended: bool,
     /// Plan 43 C1-2: the class the row was journaled under
     /// (`journal::PendingClass`, else the session's published class). It
     /// sits right after `idx`, before `rid`, so that [`JournalTxHead`]
@@ -407,6 +415,7 @@ pub(crate) struct JournalTxHead {
     pub epoch: u64,
     pub gen: u64,
     pub idx: u64,
+    pub appended: bool,
     pub class: RowCommit,
 }
 
@@ -744,8 +753,9 @@ impl Meta {
         // restart continues the stream); the root records the index the
         // delegate assigned.
         let delegated = journal::PendingDelegate::peek().is_some();
-        let (gen, idx, deps) = match journal::PendingDelegate::take() {
+        let (gen, idx, deps, appended) = match journal::PendingDelegate::take() {
             Some(d) => {
+                let appended = d.idx.is_some();
                 let idx = match d.idx {
                     Some(i) => i,
                     None => {
@@ -758,9 +768,9 @@ impl Meta {
                         next
                     }
                 };
-                (d.gen, idx, d.deps)
+                (d.gen, idx, d.deps, appended)
             }
-            None => (0, 0, crate::session::Position::ZERO),
+            None => (0, 0, crate::session::Position::ZERO, false),
         };
         // The only captured row of a delegation origin in this view: what
         // `spec::DelegRows` holds is of rows gone since (it is never
@@ -817,6 +827,7 @@ impl Meta {
                 epoch: local.epoch,
                 gen,
                 idx,
+                appended,
                 class,
                 rid,
                 op,
@@ -826,7 +837,7 @@ impl Meta {
             },
         )?;
         put_journal_origin(tx, self, gen, idx, local.start);
-        if gen != 0 && local.epoch != 0 {
+        if appended {
             // (Raised before the commit: an over-estimate only costs a seek.)
             self.holder_append_tip
                 .fetch_max(end - 1, std::sync::atomic::Ordering::SeqCst);
@@ -1554,7 +1565,7 @@ impl Meta {
     }
 
     /// Plan 43 C3: this node's unshipped transactions of delegation origin
-    /// `gen` journaled as a lease holder, as `(idx, last journal seq)` in
+    /// `gen` journaled as a root (`appended`), as `(idx, last journal seq)` in
     /// index order: one range read over `journal_origin`, a head per row.
     pub fn holder_appends(&self, gen: u64) -> Result<Vec<(u64, u64)>, MetaError> {
         self.holder_appends_from(gen, 0)
@@ -1574,7 +1585,7 @@ impl Meta {
         for found in journal_origins_from(&r, self, gen, from)? {
             let (idx, first) = found?;
             if let Some(head) = get_journal_tx_head(&r, self, first)? {
-                if head.epoch != 0 {
+                if head.appended {
                     out.push((idx, head.last));
                 }
             }
@@ -1587,7 +1598,7 @@ impl Meta {
         let r = self.db.read_tx();
         let tip = read_journal_tx_heads(&r, self)?
             .into_iter()
-            .filter(|(_, h)| h.gen != 0 && h.epoch != 0)
+            .filter(|(_, h)| h.gen != 0 && h.appended)
             .map(|(_, h)| h.last)
             .max()
             .unwrap_or(0);
@@ -1598,7 +1609,7 @@ impl Meta {
 
     /// Plan 43 C3: the last journal seq of this node's unshipped
     /// transaction of delegation origin `(gen, idx)` that it journaled as a
-    /// lease holder (`epoch` set: the root's append of the row, a takeover
+    /// root (`appended`: the root's append of the row, a takeover
     /// gate's re-applied tail or re-append of its own rows), if any. Such a
     /// row raised [`Meta::log_stream_idx`] here without the log or the
     /// delegation's group holding it: what commits it is this node's root
@@ -1614,7 +1625,7 @@ impl Meta {
                 break;
             }
             if let Some(head) = get_journal_tx_head(&r, self, first)? {
-                if head.epoch != 0 {
+                if head.appended {
                     return Ok(Some(head.last));
                 }
             }

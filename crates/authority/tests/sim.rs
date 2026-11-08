@@ -6282,6 +6282,17 @@ fn sweep_config() {
                 core
             });
         }
+        // Plan 46 M1.2 step 14: `AUTHORITY_SIM_DELEG_APPEND_REPLAY=1` queues a
+        // root's append of a delegate's row for replay again
+        // (`Config::deleg_append_replay`); the run must fail.
+        if std::env::var("AUTHORITY_SIM_DELEG_APPEND_REPLAY").is_ok_and(|v| v == "1") {
+            let inner = c.core.clone();
+            c.core = std::sync::Arc::new(move |id, inc| {
+                let mut core = inner(id, inc);
+                core.deleg_append_replay = true;
+                core
+            });
+        }
         // Plan 46 M1.2 step 13: `AUTHORITY_SIM_LONE_DELEGATE=1` is the
         // negative control of the deleted lone delegate
         // (`Config::lone_delegate`): the root grants to a node with no group
@@ -7863,6 +7874,7 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "committed_superseded",
             "committed_rolled_back",
             "replay_gated_enqueued",
+            "deleg_append_queued",
             "tail_beyond_gap_dropped",
             "inherited_tails_cleared",
             "ttl_claims_without_tail",
@@ -9617,6 +9629,32 @@ fn a_deposed_roots_appended_delegate_row_never_lands_past_its_generations_seal()
         failures.len(),
         seeds.len(),
         failures.join("\n")
+    );
+}
+
+/// Plan 46 M1.2 step 14, fail-before: with the root's appends of a delegate's
+/// rows queued for replay again (`Config::deleg_append_replay`,
+/// `AUTHORITY_SIM_DELEG_APPEND_REPLAY=1`) the pinned seeds above fail: on
+/// `Stats::deleg_append_queued` (any queued root append fails the run), or on
+/// the oracle that finds the replayed row landing past its generation's seal.
+#[test]
+fn the_deleg_append_replay_control_fails_the_sealed_root_seeds() {
+    let cfg = with_deleg_append_replay(strict(
+        SimConfig {
+            lease_reads: SLOW_LEASE_READS,
+            ..delegated_core_stall_root_sealed_config()
+        },
+        "commit",
+    ));
+    let seeds = [182u64, 552, 773, 783, 885, 1_032, 1_098, 1_713, 1_795];
+    let failed = seeds
+        .iter()
+        .filter(|&&seed| run_seed(seed, cfg.clone()).is_err())
+        .count();
+    assert!(
+        failed >= seeds.len() / 2,
+        "the control failed {failed} of {} seeds",
+        seeds.len()
     );
 }
 
@@ -17991,6 +18029,21 @@ fn only_i5_strict(config: SimConfig) -> SimConfig {
         strict_commit_exempt: Some(
             "plan 46 M1.2 step 13 (a test that judges I5 alone: the lone-delegate control)",
         ),
+        ..config
+    }
+}
+
+/// `config` with the negative control of step 14 (`Config::deleg_append_replay`,
+/// `AUTHORITY_SIM_DELEG_APPEND_REPLAY=1`): a root's append of a delegate's row
+/// is queued for replay again.
+fn with_deleg_append_replay(config: SimConfig) -> SimConfig {
+    let inner = config.core.clone();
+    SimConfig {
+        core: std::sync::Arc::new(move |node, inc| {
+            let mut c = inner(node, inc);
+            c.deleg_append_replay = true;
+            c
+        }),
         ..config
     }
 }
