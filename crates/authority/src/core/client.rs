@@ -656,8 +656,16 @@ impl Core {
         if settle {
             // Plan 46 M0.2 (R5): settled from the start; nothing of the
             // op's own is ever routed.
+            // It gets the same window and cap as a settle that began at a
+            // deadline, so the outwait hold applies to it too (I4).
+            let window = self.cfg.settle_window();
+            let cap = now
+                .wait
+                .plus(2 * window + self.reclaim_horizon_ms() + 2 * self.cfg.forward_timeout_ms);
             if let Some(c) = self.clients.get_mut(&rid) {
                 c.settle = true;
+                c.settle_until = now.wait.plus(window);
+                c.settle_cap = cap;
             }
             self.settle_route(now, rid, replica, out);
             return;

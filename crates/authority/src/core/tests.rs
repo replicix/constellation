@@ -33901,6 +33901,50 @@ mod s3_no_loops {
         );
     }
 
+    /// Plan 46 M1.2 step 13 (review round 3): an op settled from the start
+    /// (the R5 placeholder's settle) parked at the root for the recall of a
+    /// generation the root outwaits is held past its first window, up to the
+    /// settle's cap, like a settle that began at a deadline (I4). Fails on
+    /// the parent: such an op has `settle_cap = 0`, the hold never applies
+    /// and the client is told in doubt at its first deadline.
+    #[test]
+    fn a_settle_from_the_start_is_held_for_a_generations_outwait() {
+        let (mut h, dir, gen) = delegated_root();
+        let rid = h.rid(1);
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        h.core.start_recall(h.clk(), gen, &mut Vec::new());
+        let mut out = Vec::new();
+        h.core.submit_settle(
+            h.clk(),
+            (rid, 1),
+            MutateOp::Create {
+                parent: dir,
+                name: "own".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            &h.meta,
+            &mut out,
+        );
+        let c = &h.core.clients[&rid];
+        assert!(c.settle && c.settle_cap > c.settle_until, "{c:?}");
+        assert!(
+            h.core.exec_local_park_outwait(rid).is_some(),
+            "not parked for the recall: {out:?}"
+        );
+        let deadline = h.core.clients[&rid].deadline;
+        let out = h.step(Event::Timer { id: deadline });
+        assert!(
+            !replies(&out)
+                .iter()
+                .any(|(r, a)| *r == rid && matches!(a, ClientReply::InDoubt)),
+            "told in doubt while the root outwaits the generation: {out:?}"
+        );
+        assert_eq!(h.core.stats.settles_held_for_outwait, 1);
+    }
+
     /// Plan 46 M1.2 step 13: the root's `Held` to a settle it parks for the
     /// recall of a generation it outwaits says how long it holds it
     /// (`outwait_ms`, the generation's window left); with two generations

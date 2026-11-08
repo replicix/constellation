@@ -5399,8 +5399,6 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     })
             },
         );
-        report.acked_rolled_back = rolled_back_acked;
-        report.lone_rolled_back = rolled_back_lone;
         if !nowhere.is_empty() {
             return Err(format!(
                 "acked_held_somewhere: {} acknowledged rid(s) are in no log, journal, backup tail \
