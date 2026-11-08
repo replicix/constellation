@@ -3943,6 +3943,14 @@ impl Driver {
                     msg: PeerMsg::DelegationRecall { req, ino, grant },
                 }))
             }
+            SyncRequest::PeerReadVoid { root, gen, reply } => {
+                let req = self.control_id();
+                self.recall_replies.insert(req, reply);
+                Some(Internal::Event(Event::Peer {
+                    from: root,
+                    msg: PeerMsg::DelegReadVoid { req, gen },
+                }))
+            }
             SyncRequest::PeerBackupAppend {
                 holder,
                 epoch,
@@ -4127,13 +4135,12 @@ impl Driver {
                     .store(true, Ordering::Relaxed);
                 control(Control::Reintegrate, ControlReply::Text(reply))
             }
-            SyncRequest::AbandonGroup {
-                epoch,
-                gen,
+            SyncRequest::Abandon {
+                target,
                 force,
                 reply,
             } => control(
-                Control::AbandonGroup { epoch, gen, force },
+                Control::Abandon { target, force },
                 ControlReply::Text(reply),
             ),
             SyncRequest::DropHeld {
@@ -5402,6 +5409,50 @@ impl Driver {
                     if denied {
                         // Fault injection: the link to this peer is cut —
                         // a connection failure, at once.
+                        let _ = tx.send(Internal::Event(Event::PeerFailed {
+                            req,
+                            to,
+                            outage: true,
+                        }));
+                        return;
+                    }
+                    let reply = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
+                    match reply {
+                        Ok(Ok(Payload::ReadRecalled { req_id })) if req_id == req.0 => {
+                            let _ = tx.send(Internal::Event(Event::Peer {
+                                from: to,
+                                msg: PeerMsg::DelegationRecalled { req },
+                            }));
+                        }
+                        _ => {
+                            let outage =
+                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
+                            let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                        }
+                    }
+                });
+            }
+            PeerMsg::DelegReadVoid { req, gen } => {
+                let tx = self.int_tx.clone();
+                let peers = self.deps.peers.clone();
+                let root = self.node_id;
+                // A request that goes unanswered is outwaited by the abandon's
+                // deadline in the core; this only bounds the RPC.
+                let timeout = Duration::from_millis(
+                    self.core.config().read_delegation_ttl_ms + self.core.config().expiry_margin_ms,
+                );
+                let denied = crate::fault::p2p_denied(to);
+                tokio::spawn(async move {
+                    let payload = Payload::ReadVoidGen {
+                        root,
+                        req_id: req.0,
+                        gen,
+                    };
+                    if denied {
                         let _ = tx.send(Internal::Event(Event::PeerFailed {
                             req,
                             to,

@@ -1924,6 +1924,11 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // Plan 46 M1.3 step 13: the answer to an abandon's void request.
+        if self.deleg_abandon_acked(req) {
+            self.abandon_progress(now, replica, out);
+            return;
+        }
         let Some(id) = self.rd.recall_by_req.remove(&req) else {
             return;
         };
@@ -2396,6 +2401,26 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         replica.read_delegations().recall(Some(ino));
+        out.push(Action::Send {
+            to: from,
+            msg: PeerMsg::DelegationRecalled { req },
+        });
+    }
+
+    /// Plan 46 M1.3 step 13 (C11): the root abandons stream `gen`. This
+    /// node stops honouring the read delegations the stream's holder granted
+    /// it, refuses any later one, then acks.
+    pub(crate) fn on_deleg_read_void(
+        &mut self,
+        from: NodeId,
+        req: OpId,
+        gen: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        replica
+            .read_delegations()
+            .void_gen_epoch(super::DELEG_READ_EPOCH_BASE + gen);
         out.push(Action::Send {
             to: from,
             msg: PeerMsg::DelegationRecalled { req },

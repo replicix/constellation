@@ -869,7 +869,7 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
   the members are gone for good, the operator ends the generation:
 
   ```
-  constellation repair abandon-group TARGET --gen G
+  constellation repair abandon TARGET --gen G
   ```
 
   Run it on the **root** (the node whose `status` lists the generation under
@@ -887,7 +887,7 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
   counted (`groups_abandoned_forced`):
 
   ```
-  constellation repair abandon-group TARGET --gen G --force
+  constellation repair abandon TARGET --gen G --force
   ```
 
   Weigh it by `delegation.waiting` in any case: a member heard from lately,
@@ -898,6 +898,32 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
   clients were told it was committed. They are not replayed, and a delegate
   that comes back drops them (its recall strand). Use it only when no member
   can ever come back; wait for one if it can.
+- **A sticky or designated holder that is gone**: its grant is never taken
+  back by a TTL, so its subtree stays `EROFS` (at the root) and `EXDEV`
+  (across it) until the holder returns or the operator ends the stream on
+  the root:
+
+  ```
+  constellation repair abandon TARGET --node N [--gen G] [--force]
+  ```
+
+  (`--gen G` alone names one stream; `--node N` every live stream the root
+  lists for node N, and a placed one that is not waiting for its group is
+  left to its TTL and named in the answer.) The refusals and `--force` are
+  those of a generation waiting for its group, and it is refused for the
+  node it runs on (`constellation release` is that). Before it ends the
+  stream, the root recalls, else waits out, the read delegations the holder
+  granted (plan 46 Q5, C11: no read is served under a stream's grant after
+  its end): it tells every other node to drop them and ends the stream once
+  they answered, or `read_delegation_ttl_ms` plus the expiry margin after the
+  command (6 s at the defaults), so the command answers after that at the
+  latest. Then it ends the stream at the root's cursor and journals
+  `GroupAbandoned { gen }`. **Consequence:** rows only the holder held, past
+  the cursor, are lost to the log; a holder that comes back replays them by
+  rid, and the ones the log refuses (the name is someone else's now) become
+  `.constellation-conflict/` copies. With `--force`, a holder that is alive
+  but cut off from the root may still answer readers that did not get the
+  request: confirm that it is down.
 - **A backup that says it holds nothing**: it is sealed, and the generation
   ends at the root's cursor, because with write-all a member that holds
   nothing proves nothing was acknowledged through the group. The exceptions
@@ -1177,7 +1203,7 @@ member of the group, which is asked again every backup-takeover window, and
 with none reachable only the operator's `abandon-group` (below) ends it. Writes
 under the subtree wait. Bring the delegate or its backup back (their disks
 hold the tail), or, if they are gone for good,
-`constellation repair abandon-group TARGET --gen G` on the root: rows only
+`constellation repair abandon TARGET --gen G` on the root: rows only
 that group held are lost. It is refused while the root heard from the delegate
 or a member within the delegation's ttl; confirm from another node that they
 are down, then add `--force`.

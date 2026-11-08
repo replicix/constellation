@@ -40564,6 +40564,17 @@ fn deleg_renew_cert_before_the_first_answer_and_after_a_core_renewal() {
     assert_eq!((c.next_due, c.period_ms), (hm(t0.plus(5_000)), 2_500));
 }
 
+/// The old `(epoch, gen)` pair of the operator's abandon as its target: a
+/// generation alone is `Gen`, anything with an epoch is that epoch's group
+/// (a stream does not go with an epoch).
+fn abandon_target_of(epoch: u64, gen: u64) -> crate::AbandonTarget {
+    if epoch == 0 && gen != 0 {
+        crate::AbandonTarget::Gen(gen)
+    } else {
+        crate::AbandonTarget::Epoch(epoch)
+    }
+}
+
 /// The root of generation 7 (node 3 its delegate), granted its first
 /// renewal naming backup `backup`.
 fn root_with_delegate_backed_by(backup: NodeId) -> Harness {
@@ -49968,8 +49979,14 @@ mod deleg_windows_tests {
         assert!(h.core.dl.gens[&7].waiting_for_group);
         assert!(h.core.stats.deleg_prev_root_waits >= 3);
         let mut out = Vec::new();
-        h.core
-            .on_control_abandon_generation(h.clk(), OpId(77), 0, 7, true, &h.meta, &mut out);
+        h.core.on_control_abandon_streams(
+            h.clk(),
+            OpId(77),
+            crate::core::delegate::AbandonSel::Gen(7),
+            true,
+            &h.meta,
+            &mut out,
+        );
         assert!(h.core.dl.gens[&7].ended, "abandoned: {out:?}");
         assert!(h.meta.deleg_prev_roots(7).unwrap().is_empty());
     }
@@ -50154,8 +50171,14 @@ mod deleg_windows_tests {
             waiting.members
         );
         let mut out = Vec::new();
-        h.core
-            .on_control_abandon_generation(h.clk(), OpId(77), 0, 7, false, &h.meta, &mut out);
+        h.core.on_control_abandon_streams(
+            h.clk(),
+            OpId(77),
+            crate::core::delegate::AbandonSel::Gen(7),
+            false,
+            &h.meta,
+            &mut out,
+        );
         assert!(
             out.iter()
                 .any(|a| matches!(a, Action::ControlDone { result: Err(_), .. })),
@@ -50163,8 +50186,14 @@ mod deleg_windows_tests {
         );
         assert!(!h.core.dl.gens[&7].ended);
         let mut out = Vec::new();
-        h.core
-            .on_control_abandon_generation(h.clk(), OpId(78), 0, 7, true, &h.meta, &mut out);
+        h.core.on_control_abandon_streams(
+            h.clk(),
+            OpId(78),
+            crate::core::delegate::AbandonSel::Gen(7),
+            true,
+            &h.meta,
+            &mut out,
+        );
         assert!(h.core.dl.gens[&7].ended, "forced: {out:?}");
     }
 
@@ -50303,9 +50332,8 @@ mod deleg_windows_tests {
         let ask = |h: &mut Harness, op: u64, force: bool| {
             let out = h.step(Event::Control {
                 op: OpId(op),
-                req: Control::AbandonGroup {
-                    epoch: 0,
-                    gen: 7,
+                req: Control::Abandon {
+                    target: abandon_target_of(0, 7),
                     force,
                 },
             });
@@ -50392,9 +50420,8 @@ mod deleg_windows_tests {
         let ask = |h: &mut Harness, op: u64, epoch: u64, gen: u64| {
             let out = h.step(Event::Control {
                 op: OpId(op),
-                req: Control::AbandonGroup {
-                    epoch,
-                    gen,
+                req: Control::Abandon {
+                    target: abandon_target_of(epoch, gen),
                     force: false,
                 },
             });
@@ -50623,9 +50650,8 @@ mod deleg_windows_tests {
         assert_eq!(view.waiting[0].tail, Some((4, 1, 2)));
         let out = h.step(Event::Control {
             op: OpId(910),
-            req: Control::AbandonGroup {
-                epoch: 0,
-                gen: 7,
+            req: Control::Abandon {
+                target: abandon_target_of(0, 7),
                 force: false,
             },
         });
@@ -50859,9 +50885,8 @@ mod deleg_windows_tests {
         h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
         let out = h.step(Event::Control {
             op: OpId(920),
-            req: Control::AbandonGroup {
-                epoch: 0,
-                gen: 7,
+            req: Control::Abandon {
+                target: abandon_target_of(0, 7),
                 force: false,
             },
         });
@@ -51967,9 +51992,8 @@ mod c1_tail_fetch {
         // The operator: the group is gone for good.
         let out = h.step(Event::Control {
             op: OpId(800),
-            req: Control::AbandonGroup {
-                epoch: 1,
-                gen: 0,
+            req: Control::Abandon {
+                target: abandon_target_of(1, 0),
                 force: false,
             },
         });
@@ -52045,9 +52069,8 @@ mod c1_tail_fetch {
         assert_eq!(seal_tails(&out).len(), 2);
         let out = h.step(Event::Control {
             op: OpId(800),
-            req: Control::AbandonGroup {
-                epoch: 1,
-                gen: 0,
+            req: Control::Abandon {
+                target: abandon_target_of(1, 0),
                 force: false,
             },
         });
@@ -52155,31 +52178,28 @@ mod c1_tail_fetch {
         };
         let out = h.step(Event::Control {
             op: OpId(800),
-            req: Control::AbandonGroup {
-                epoch: 1,
-                gen: 0,
+            req: Control::Abandon {
+                target: abandon_target_of(1, 0),
                 force: false,
             },
         });
         assert!(refused(&out), "{out:?}");
         // Waiting for epoch 1's group: another epoch is refused, and a
-        // delegation's generation is named by `--gen` alone.
+        // generation (a delegation's stream) is not this claim's.
         let lease = expired(&h, vec![2]);
         let (mut h, _) = claimant(3, &lease);
         let out = h.step(Event::Control {
             op: OpId(801),
-            req: Control::AbandonGroup {
-                epoch: 2,
-                gen: 0,
+            req: Control::Abandon {
+                target: abandon_target_of(2, 0),
                 force: false,
             },
         });
         assert!(refused(&out), "{out:?}");
         let out = h.step(Event::Control {
             op: OpId(802),
-            req: Control::AbandonGroup {
-                epoch: 1,
-                gen: 3,
+            req: Control::Abandon {
+                target: crate::AbandonTarget::Gen(3),
                 force: false,
             },
         });
@@ -64218,6 +64238,388 @@ mod step4_sticky {
             tag: Default::default(),
         });
         assert_eq!(h.core.dl.mine[&7].executed, 1);
+    }
+
+    // ---- plan 46 M1.3 step 13: `repair abandon` ----
+
+    fn abandon_node(
+        h: &mut Harness,
+        op: u64,
+        node: NodeId,
+        gen: Option<u64>,
+        force: bool,
+    ) -> Vec<Action> {
+        h.step(Event::Control {
+            op: OpId(op),
+            req: Control::Abandon {
+                target: crate::AbandonTarget::Node { node, gen },
+                force,
+            },
+        })
+    }
+
+    fn answer_of(out: &[Action], op: u64) -> Option<Result<ControlOk, String>> {
+        out.iter().find_map(|a| match a {
+            Action::ControlDone { op: o, result } if *o == OpId(op) => Some(result.clone()),
+            _ => None,
+        })
+    }
+
+    fn void_reqs(out: &[Action]) -> Vec<(NodeId, OpId, u64)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::DelegReadVoid { req, gen } => Some((to, *req, *gen)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn all_records(h: &Harness) -> Vec<LogRecord> {
+        Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+            .into_iter()
+            .flat_map(|tx| tx.records)
+            .collect()
+    }
+
+    /// The root with a sticky grant of `d1` to node 3, nodes 2 and 3 on the
+    /// roster and node 2's link up (a reader), the holder silent past
+    /// `delegation_ttl_ms`.
+    fn root_with_a_silent_sticky_holder() -> (Harness, u64) {
+        let (mut h, d1, _d2) = root_with_two_dirs();
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3],
+            issued: WaitMs(i64::MAX),
+        });
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 2,
+                connected: true,
+                last_seen: Some(w(h.now)),
+                rtt_ms: Some(1),
+                since: Some(w(h.now)),
+            }],
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+        let (ok, out) = control_delegate(&mut h, 900, d1, 3, true);
+        assert!(ok, "{out:?}");
+        let gen = sticky_gen_of(&h, d1);
+        h.advance(h.core.cfg.delegation_ttl_ms + 1);
+        (h, gen)
+    }
+
+    /// C11: abandon = recall, else expire. A sticky stream whose holder is
+    /// gone ends only once the readers dropped the read delegations the
+    /// holder granted them: the void request goes to the reader (not to the
+    /// holder), the stream stays live meanwhile, and the reader's answer ends
+    /// it at the cursor. Fails on main (`AbandonGroup` refuses a sticky stream
+    /// that does not wait for its group). The knob is the code without the
+    /// wait: the same command ends it in the same step.
+    #[test]
+    fn an_abandon_with_a_live_read_grant_waits() {
+        let (mut h, gen) = root_with_a_silent_sticky_holder();
+        let out = abandon_node(&mut h, 910, 3, None, false);
+        let voids = void_reqs(&out);
+        assert_eq!(voids.len(), 1, "{out:?}");
+        assert_eq!((voids[0].0, voids[0].2), (2, gen), "{out:?}");
+        assert!(answer_of(&out, 910).is_none(), "answered early: {out:?}");
+        assert!(!h.core.dl.gens[&gen].ended);
+        assert!(!all_records(&h)
+            .iter()
+            .any(|r| matches!(r, LogRecord::DelegateNodeEnded { .. })));
+        // The reader drops its grants and answers.
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: voids[0].1 },
+        });
+        let answer = answer_of(&out, 910).expect("answered");
+        let text = match answer {
+            Ok(ControlOk::Text(t)) => t,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            text.contains("sticky") && text.contains("recalled from 1"),
+            "{text}"
+        );
+        assert!(h.core.dl.gens[&gen].ended);
+        let records = all_records(&h);
+        assert!(
+            records.iter().any(|r| matches!(
+                r,
+                LogRecord::DelegateNodeEnded { node: 3, gen: g, .. } if *g == gen
+            )),
+            "{records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(r, LogRecord::GroupAbandoned { gen: g, .. } if *g == gen)),
+            "{records:?}"
+        );
+        assert_eq!(h.core.stats.deleg_abandon_reads_recalled, 1);
+        assert_eq!(h.core.stats.deleg_abandon_reads_expired, 0);
+        assert_eq!(h.core.stats.deleg_sticky_ended_abandoned, 1);
+        // The negative control: the code without the read recall.
+        let (mut h, gen) = root_with_a_silent_sticky_holder();
+        h.core.cfg.abandon_skips_read_recall = true;
+        let out = abandon_node(&mut h, 910, 3, None, false);
+        assert!(void_reqs(&out).is_empty(), "{out:?}");
+        assert!(matches!(answer_of(&out, 910), Some(Ok(_))), "{out:?}");
+        assert!(h.core.dl.gens[&gen].ended);
+    }
+
+    /// A reader that never answers (cut off, down): the root waits the read
+    /// delegations out, `read_delegation_ttl_ms + expiry_margin_ms` after the
+    /// command, and a failed void request changes nothing.
+    #[test]
+    fn a_dead_holders_read_grant_is_waited_out() {
+        let (mut h, gen) = root_with_a_silent_sticky_holder();
+        let out = abandon_node(&mut h, 910, 3, None, false);
+        let voids = void_reqs(&out);
+        assert_eq!(voids.len(), 1, "{out:?}");
+        let wait = h.core.cfg.read_delegation_ttl_ms + h.core.cfg.expiry_margin_ms;
+        let timer = timers(&out, TimerKind::DelegExpiry);
+        assert!(!timer.is_empty(), "no deadline timer: {out:?}");
+        // The request fails: still waiting.
+        let out = h.step(Event::PeerFailed {
+            req: voids[0].1,
+            to: 2,
+            outage: true,
+        });
+        assert!(answer_of(&out, 910).is_none(), "{out:?}");
+        h.advance(wait - 1_000);
+        h.hold(2, None);
+        let out = h.step(Event::Peers {
+            links: Vec::new(),
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+        assert!(answer_of(&out, 910).is_none(), "{out:?}");
+        assert!(!h.core.dl.gens[&gen].ended);
+        h.advance(1_000);
+        h.hold(2, None);
+        let mut out = Vec::new();
+        h.core.on_abandon_timer(h.clk(), &h.meta, &mut out);
+        assert!(matches!(answer_of(&out, 910), Some(Ok(_))), "{out:?}");
+        assert!(h.core.dl.gens[&gen].ended);
+        assert_eq!(h.core.stats.deleg_abandon_reads_expired, 1);
+        assert_eq!(h.core.stats.deleg_abandon_reads_recalled, 0);
+    }
+
+    /// Within `delegation_ttl_ms` of the holder's last word the abandon is
+    /// refused unless forced (`--force`), and a forced one is counted.
+    #[test]
+    fn an_abandon_of_a_sticky_stream_heard_lately_needs_force() {
+        let (mut h, d1, _d2) = root_with_two_dirs();
+        let (ok, out) = control_delegate(&mut h, 900, d1, 3, true);
+        assert!(ok, "{out:?}");
+        let gen = sticky_gen_of(&h, d1);
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegationRecalled { req: OpId(77) },
+        });
+        h.advance(500);
+        let out = abandon_node(&mut h, 910, 3, None, false);
+        let refused = answer_of(&out, 910).expect("answered");
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.contains("node 3") && e.contains("--force")),
+            "{refused:?}"
+        );
+        assert!(!h.core.dl.gens[&gen].ended);
+        let started = abandon_node(&mut h, 911, 3, None, true);
+        // It starts, and waits for the readers' answers.
+        assert!(answer_of(&started, 911).is_none(), "{started:?}");
+        let mut out = Vec::new();
+        for (from, req, _) in void_reqs(&started) {
+            out = h.step(Event::Peer {
+                from,
+                msg: PeerMsg::DelegationRecalled { req },
+            });
+        }
+        assert!(matches!(answer_of(&out, 911), Some(Ok(_))), "{out:?}");
+        assert!(h.core.dl.gens[&gen].ended);
+        assert_eq!(h.core.stats.groups_abandoned_forced, 1);
+        assert_eq!(h.core.stats.groups_abandoned, 1);
+    }
+
+    /// The refusals of the node and generation forms.
+    #[test]
+    fn abandon_refuses_this_node_a_node_without_a_stream_and_a_gen_of_another_node() {
+        let (mut h, gen) = root_with_a_silent_sticky_holder();
+        let refused = |out: &[Action], op: u64| match answer_of(out, op) {
+            Some(Err(e)) => e,
+            other => panic!("{other:?}"),
+        };
+        let out = abandon_node(&mut h, 910, 1, None, false);
+        assert!(refused(&out, 910).contains("constellation release"));
+        let out = abandon_node(&mut h, 911, 2, None, false);
+        assert!(refused(&out, 911).contains("no live stream of node 2"));
+        let out = abandon_node(&mut h, 912, 2, Some(gen), false);
+        assert!(refused(&out, 912).contains("node 3's stream"));
+        // A generation that is not here.
+        let out = abandon_node(&mut h, 913, 3, Some(gen + 99), false);
+        assert!(refused(&out, 913).contains("not the root of generation"));
+        let out = h.step(Event::Control {
+            op: OpId(914),
+            req: Control::Abandon {
+                target: crate::AbandonTarget::Gen(gen + 99),
+                force: false,
+            },
+        });
+        assert!(refused(&out, 914).contains("not the root of generation"));
+        assert!(!h.core.dl.gens[&gen].ended);
+        assert!(h.core.dl.abandons.is_empty());
+        // The right pair starts; a second abandon of the same stream is refused.
+        let out = abandon_node(&mut h, 915, 3, Some(gen), false);
+        assert!(answer_of(&out, 915).is_none(), "{out:?}");
+        let out = abandon_node(&mut h, 916, 3, None, false);
+        assert!(refused(&out, 916).contains("already waiting"));
+    }
+
+    /// The holder comes back and its release ends the stream during the
+    /// wait: the abandon says so and journals no `GroupAbandoned`.
+    #[test]
+    fn a_release_during_the_abandon_wait_ends_the_stream_as_released() {
+        let (mut h, gen) = root_with_a_silent_sticky_holder();
+        let out = abandon_node(&mut h, 910, 3, None, false);
+        assert!(answer_of(&out, 910).is_none());
+        // The holder's own release ends it in the log (not an abandon's end).
+        h.core.dl.gens.get_mut(&gen).unwrap().ended = true;
+        let mut out = Vec::new();
+        h.core.on_abandon_timer(h.clk(), &h.meta, &mut out);
+        let text = match answer_of(&out, 910) {
+            Some(Ok(ControlOk::Text(t))) => t,
+            other => panic!("{other:?}\n{out:?}"),
+        };
+        assert!(text.contains("ended meanwhile"), "{text}");
+        assert_eq!(h.core.stats.deleg_abandon_superseded, 1);
+        assert_eq!(h.core.stats.groups_abandoned, 0);
+        assert!(!all_records(&h)
+            .iter()
+            .any(|r| matches!(r, LogRecord::GroupAbandoned { .. })));
+    }
+
+    /// The root loses its lease during the wait: refused, nothing journaled;
+    /// the operator runs it again on the new root.
+    #[test]
+    fn an_abandon_waiting_when_the_root_loses_its_lease_is_refused() {
+        let (mut h, gen) = root_with_a_silent_sticky_holder();
+        let out = abandon_node(&mut h, 910, 3, None, false);
+        assert!(answer_of(&out, 910).is_none());
+        // Lease long past: this node is no usable root.
+        h.advance(10 * h.core.cfg.ttl_ms);
+        let mut out = Vec::new();
+        h.core.on_abandon_timer(h.clk(), &h.meta, &mut out);
+        match answer_of(&out, 910) {
+            Some(Err(e)) => assert!(e.contains("no longer the root"), "{e}"),
+            other => panic!("{other:?}\n{out:?}"),
+        }
+        assert!(!h.core.dl.gens[&gen].ended);
+        assert!(h.core.dl.abandons.is_empty());
+        assert!(!all_records(&h)
+            .iter()
+            .any(|r| matches!(r, LogRecord::GroupAbandoned { .. })));
+    }
+
+    /// A reader voids an abandoned stream's grants and refuses a late one.
+    #[test]
+    fn a_reader_voids_an_abandoned_streams_grants_and_refuses_a_late_one() {
+        let mut h = Harness::new(2);
+        let epoch = crate::core::DELEG_READ_EPOCH_BASE + 7;
+        let held = |epoch: u64| constellation_meta::HeldDelegation {
+            until: HonourMs(i64::MAX / 2),
+            position: constellation_meta::Position::ZERO,
+            epoch,
+            holder: 3,
+            grant: 1,
+            renew_at: HonourMs(i64::MAX / 2),
+        };
+        fn rd(h: &Harness) -> &constellation_meta::ReadDelegations {
+            Replica::read_delegations(&h.meta)
+        }
+        assert!(rd(&h).install(5, held(epoch), rd(&h).recall_gen()));
+        assert_eq!(rd(&h).held_count(), 1);
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegReadVoid {
+                req: OpId(9),
+                gen: 7,
+            },
+        });
+        assert_eq!(rd(&h).held_count(), 0);
+        assert!(
+            sends(&out).iter().any(|(to, m)| *to == 1
+                && matches!(m, PeerMsg::DelegationRecalled { req } if *req == OpId(9))),
+            "{out:?}"
+        );
+        assert!(
+            !rd(&h).install(5, held(epoch), rd(&h).recall_gen()),
+            "a late grant"
+        );
+        assert!(
+            rd(&h).install(5, held(epoch + 1), rd(&h).recall_gen()),
+            "another stream's"
+        );
+    }
+
+    /// A reader that applies the log's end of a stream refuses a late read
+    /// delegation of it (C11: no read grant on an ended stream), also one sent by
+    /// a holder that did not know its stream ended. Fails when the end only
+    /// drops the grants held (the parent's `void_epoch`).
+    #[test]
+    fn a_reader_that_learned_a_streams_end_refuses_a_late_grant() {
+        let mut h = Harness::new(2);
+        let epoch = crate::core::DELEG_READ_EPOCH_BASE + 7;
+        let held = |epoch: u64| constellation_meta::HeldDelegation {
+            until: HonourMs(i64::MAX / 2),
+            position: constellation_meta::Position::ZERO,
+            epoch,
+            holder: 3,
+            grant: 1,
+            renew_at: HonourMs(i64::MAX / 2),
+        };
+        fn rd(h: &Harness) -> &constellation_meta::ReadDelegations {
+            Replica::read_delegations(&h.meta)
+        }
+        let before = rd(&h).recall_gen();
+        assert!(rd(&h).install(5, held(epoch), before));
+        let end = LogRecord::DelegateNodeEnded {
+            node: 3,
+            gen: 7,
+            through: 0,
+        };
+        Replica::apply_segment(&h.meta, 2, 1, 0, &[], &[], &[end]).unwrap();
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2],
+            issued: WaitMs(i64::MAX),
+        });
+        assert_eq!(rd(&h).held_count(), 0, "the grant held is void");
+        assert!(
+            !rd(&h).install(5, held(epoch), rd(&h).recall_gen()),
+            "a late grant of the ended stream was installed"
+        );
+        assert!(rd(&h).install(5, held(epoch + 1), rd(&h).recall_gen()));
+    }
+
+    /// The holder answers no strict read (so grants no read delegation) once
+    /// the log ended its stream, though `mine` still holds it.
+    #[test]
+    fn a_holder_grants_no_read_under_a_stream_the_log_ended() {
+        let (mut h, dirs) = holder_of(true, &[(SubtreeKind::Sticky, "a")]);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine.contains_key(&7));
+        let ask = |h: &mut Harness| {
+            h.core
+                .deleg_read_index(h.clk(), 2, dirs[0], Some("x"), &h.meta)
+        };
+        assert!(ask(&mut h).is_some(), "served before the end");
+        Replica::void_stream(&h.meta, 7, 0);
+        Replica::note_void_cut(&h.meta, 7, 0);
+        assert!(ask(&mut h).is_none(), "served under an ended stream");
     }
 }
 

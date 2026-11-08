@@ -1643,12 +1643,12 @@ root lease by TTL carries the tail of the old group or waits for it
 member seals the epoch before it answers, so the group commits nothing
 more of it) and the first member's answer is the tail it re-ships. Where
 no member answers the claim waits, and only the operator's `repair
-abandon-group` lets it go on without. The end of a delegation is the same
+abandon` lets it go on without. The end of a delegation is the same
 case (C2e): a generation whose latest `DelegGroup` record names backups is
 ended only once one of them has sealed and the root has appended its whole
 tail (older versions' backups are sealed once, never waited for), and when
 none can answer it waits, `waiting_for_group`, until the operator's `repair
-abandon-group --gen` ends it at the root's cursor and writes `GroupAbandoned`
+abandon --gen` ends it at the root's cursor and writes `GroupAbandoned`
 into the log. A tenure that re-ships a tail names
 the old group in its lease (`inherited_tail`) until the log carries the
 rows, so that a successor's death does not take the last copies of rows
@@ -1667,7 +1667,7 @@ the sealer's hold did not reach it (never committed), or, for the rows
 nobody acknowledged, at the first marker of a newer epoch that announces no
 tail of theirs. A requester's shadow or hint answered as committed and a
 subscriber's transaction streamed as committed survive a takeover of their
-epoch and retire by the re-ship; only `repair abandon-group` strands them and
+epoch and retire by the re-ship; only `repair abandon` strands them and
 queues the copy, the one re-execution of a committed row. Rejected: replaying
 the committed rows from the deposed holder and relying on the dedup by rid
 (the replay races the retry of the same rid and the ops invoked between: two
@@ -3260,7 +3260,7 @@ protected only by `at_least` from the log: the same class as a lost journal.
   either errors (aborting the `backup_append` or strand transaction) or yields
   garbage that matches no identity. Moving the delegate's slots to `1 << 62` and
   stopping the pass and `backup_clear` at the member copies' base fixes it.
-- The CLI's abandon-group wait line shows a number as `epoch:n (number)` and the
+- The CLI's abandon wait line shows a number as `epoch:n (number)` and the
   daemon's log lines as `epoch:n` (`GenLabel`); `--gen` takes the number, and the
   daemon's control replies print the number alone.
 

@@ -1661,7 +1661,7 @@ fn claimed_node_id(payload: &Payload) -> Option<u64> {
         | LockReleased { from, .. }
         | LockRenew { from, .. }
         | LockMirror { from, .. } => *from,
-        ReleaseRequest { root, .. } | DelegSeal { root, .. } => *root,
+        ReleaseRequest { root, .. } | DelegSeal { root, .. } | ReadVoidGen { root, .. } => *root,
         SealTail { claimant, .. } => *claimant,
         // `BackupAppend::from` is a journal seq; `holder` is the sender.
         ReadRecall { holder, .. }
@@ -1980,6 +1980,9 @@ async fn handle_stream<S: PeerService>(
                     .read_recall_requested(holder, req_id, ino, grant)
                     .await,
             ),
+            Payload::ReadVoidGen { root, req_id, gen } => {
+                Some(service.read_void_requested(root, req_id, gen).await)
+            }
             Payload::PeerRtts { node_id, rtts } => {
                 service.peer_rtts(node_id, rtts);
                 None

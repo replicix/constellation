@@ -324,12 +324,17 @@ succeeds.
 **If no member answers, the claim waits** rather than claim without the
 tail (`status.lease.waiting_for_group`; a warning once a minute; the
 writes behind it wait for the lease). An operator who knows the group is
-gone for good ends the wait with `constellation repair abandon-group
+gone for good ends the wait with `constellation repair abandon
 --epoch E`: the claim goes on without the tail and its marker carries
 `GroupAbandoned`. The rows that group acknowledged are then lost. A
 generation of a delegation whose delegate and recorded backup are both gone
 waits the same way, and ends only by a member's tail or by
-`abandon-group --gen G` on the root (see [Delegations](delegations.md#failures)).
+`abandon --gen G` on the root (see [Delegations](delegations.md#failures)).
+The same command ends the streams of a sticky or designated holder that is
+gone for good (`abandon --node N`): after the read delegations that holder
+granted are recalled from the other nodes, or waited out
+(`read_delegation_ttl_ms` plus the expiry margin), the root ends them at its
+cursor.
 
 **An inherited tail stays reachable.** A takeover that re-ships a
 predecessor's tail journals its rows as its own, and until their segments
@@ -355,7 +360,7 @@ hold them (a marker that reaches only through *n* drops the copy's rows past
 subscriber was streamed as committed, are not rolled back when the tenure
 ends: they retire when the re-ship reaches them
 (`status.speculation.committed_rolled_back` stays 0). Only an operator's
-`repair abandon-group` strands them and hands the member copy to the replay
+`repair abandon` strands them and hands the member copy to the replay
 queue, the one way a committed row is re-executed.
 
 The 1.5 s window does not adapt to S3 latency, and does not need to:
@@ -1626,7 +1631,7 @@ See [Configuration](../configuration.md) for parsing rules.
 backups, and this node, claiming it, has not yet heard from any of them
 (`sources`) with the tail they acknowledged. The claim keeps asking; it
 goes on by itself as soon as one answers. If those members are gone for
-good, `constellation repair abandon-group myfs --epoch E` (admin) lets
+good, `constellation repair abandon myfs --epoch E` (admin) lets
 the claim go on without the tail. Rows that group acknowledged and no
 other copy holds are lost; the command refuses unless a claim waits for
 exactly that epoch's group.
@@ -1634,7 +1639,7 @@ exactly that epoch's group.
 The same wait exists for a delegation: a root that cannot end the
 generation of a silent delegate without the tail of its recorded backup
 shows `status.delegation.gens[].waiting_for_group`, and
-`constellation repair abandon-group myfs --gen G` (on the root) ends it at the
+`constellation repair abandon myfs --gen G` (on the root) ends it at the
 root's cursor, with `GroupAbandoned` in the log and the same cost: rows only
 that group held are lost. While the root has heard from the delegate or a
 member within the delegation's ttl, it is refused without `--force`: confirm

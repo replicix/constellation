@@ -1988,6 +1988,85 @@ fn a_recalled_delegates_gated_rows_are_dropped_and_its_lone_rows_replayed() {
     assert_eq!(meta.speculation_counts().unwrap().local, 0);
 }
 
+/// Plan 46 M1.3 step 13 (D6): the returned holder of an abandoned sticky
+/// stream. Its `Final` rows past the abandon's cut (`DelegateNodeEnded` plus
+/// `GroupAbandoned`) are queued for replay by rid, never dropped: the drop is
+/// for the rows that waited for a group. Passes on the parent; guards the
+/// operator's "a returned holder replays its copies by rid".
+#[test]
+fn a_sticky_holders_final_rows_past_an_abandon_cut_are_queued_for_replay() {
+    use constellation_meta::{PendingClass, RowCommit};
+    let meta = Meta::open_in_memory().unwrap();
+    let d = (2 << 40) | 1;
+    meta.apply_segment(
+        1,
+        1,
+        &[LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: "d".into(),
+            ino: d,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        }],
+        &TouchSet::default(),
+    )
+    .unwrap();
+    let gen = 7;
+    for seq in 1..=5u64 {
+        let _class = PendingClass::set(RowCommit::FINAL);
+        let op = MutateOp::Create {
+            parent: d,
+            name: format!("f{seq}"),
+            ino: (2 << 40) | (10 + seq),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        meta.delegate_execute(
+            &op,
+            Some(rid(seq)),
+            gen,
+            Default::default(),
+            &Default::default(),
+            Now::same(0),
+        )
+        .unwrap();
+        meta.session().note_stream(gen, seq);
+    }
+    let end = vec![
+        LogRecord::DelegateNodeEnded {
+            node: 2,
+            gen,
+            through: 3,
+        },
+        LogRecord::GroupAbandoned {
+            epoch: 0,
+            gen,
+            through_known: 3,
+        },
+    ];
+    let applied = meta
+        .apply_segment(2, 1, &end, &TouchSet::default())
+        .unwrap();
+    assert_eq!(
+        applied.stranded.deleg_dropped, 0,
+        "a Final row is never dropped"
+    );
+    let queued: std::collections::BTreeSet<_> = meta
+        .pending_replays()
+        .unwrap()
+        .into_iter()
+        .map(|q| q.rid)
+        .collect();
+    assert!(
+        queued.contains(&rid(4)) && queued.contains(&rid(5)),
+        "rows past the cut are replayed: {queued:?} ({:?})",
+        applied.stranded
+    );
+}
+
 /// xcheckfs two-node runs, the delegate's other walks of its outstanding
 /// stream: each stream or backup batch (`delegate_txs_from`) read every
 /// one of its transactions, ops and all; each parked acknowledgement check

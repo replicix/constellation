@@ -313,6 +313,17 @@ pub struct PeerLink {
     pub since: Option<WaitMs>,
 }
 
+/// What `constellation repair abandon` gives up (plan 46 M1.3 step 13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbandonTarget {
+    /// A lease claim's wait for `epoch`'s backup group (`--epoch`).
+    Epoch(Epoch),
+    /// Generation `gen`, on its root (`--gen`).
+    Gen(u64),
+    /// Every live stream of `node`, or only `gen` (checked to be node's).
+    Node { node: NodeId, gen: Option<u64> },
+}
+
 /// Control-plane requests (`SyncRequest`'s non-mutation arms).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Control {
@@ -337,19 +348,13 @@ pub enum Control {
     /// Run the deposition recovery now, if this node was deposed, and
     /// report what it did (`reintegrate`).
     Reintegrate,
-    /// Plan 43 C1-3 (§5.8, Q1): the operator accepts that the group of
-    /// `epoch` (generation `gen` 0, the root group) is gone for good: the
-    /// claim that waits for its tail proceeds without it; or, with `gen`
-    /// != 0 (and `epoch` 0), that of a delegation generation: the root,
-    /// which cannot end it without the tail (`waiting_for_group`), ends it
-    /// at its cursor and journals `GroupAbandoned` (C2e)
-    /// (`constellation repair abandon-group`). Answered with
-    /// `ControlOk::Text`; refused unless a claim, or a generation, is
-    /// waiting for that group. A generation's is also refused, unless
-    /// `force`, while this root has heard from its delegate or a strict
-    /// member of its group within `delegation_ttl_ms`: such a node may not be
-    /// gone.
-    AbandonGroup { epoch: Epoch, gen: u64, force: bool },
+    /// `constellation repair abandon` (plan 46 M1.3 step 13, Q5): see
+    /// [`AbandonTarget`]. Answered `Text` once done (a stream's abandon may
+    /// wait for the read delegations its holder granted); refused with the
+    /// reason otherwise. A generation's (or a node's) is refused, unless
+    /// `force`, while this root has heard from its delegate or a strict member
+    /// of its group within `delegation_ttl_ms`: such a node may not be gone.
+    Abandon { target: AbandonTarget, force: bool },
     /// `constellation repair drop-held <ino> [--remote]` (plan 46 M0.2
     /// review): the drop runs in the core, which knows which answers of
     /// the dropped rows are still parked: such a row of another node
@@ -686,6 +691,14 @@ pub enum PeerMsg {
     },
     DelegationRecalled {
         req: OpId,
+    },
+    /// Plan 46 M1.3 step 13: the root abandons stream `gen`: the reader stops
+    /// honouring every read delegation that stream's holder granted it
+    /// (epoch `DELEG_READ_EPOCH_BASE + gen`), refuses any later one, then acks
+    /// with `DelegationRecalled { req }`.
+    DelegReadVoid {
+        req: OpId,
+        gen: u64,
     },
     /// Plan 30 §M9: the holder streams its journal to a backup: whole
     /// transactions from journal seq `from` (the seq after what the
@@ -1152,6 +1165,7 @@ impl PeerMsg {
             PeerMsg::ReadIndexReply { .. } => "ReadIndexReply",
             PeerMsg::DelegationRecall { .. } => "DelegationRecall",
             PeerMsg::DelegationRecalled { .. } => "DelegationRecalled",
+            PeerMsg::DelegReadVoid { .. } => "DelegReadVoid",
             PeerMsg::BackupAppend { .. } => "BackupAppend",
             PeerMsg::BackupAck { .. } => "BackupAck",
             PeerMsg::StreamAhead { .. } => "StreamAhead",
@@ -1219,6 +1233,7 @@ impl PeerMsg {
             | PeerMsg::LogSubscribe { req, .. }
             | PeerMsg::ReadIndex { req, .. }
             | PeerMsg::DelegationRecall { req, .. }
+            | PeerMsg::DelegReadVoid { req, .. }
             | PeerMsg::BackupAppend { req, .. }
             | PeerMsg::PromiseRequest { req, .. }
             | PeerMsg::DelegateStream { req, .. }

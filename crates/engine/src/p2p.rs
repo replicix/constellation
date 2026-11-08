@@ -1319,6 +1319,31 @@ impl constellation_net::PeerService for P2pBridge {
         })
     }
 
+    fn read_void_requested(
+        &self,
+        root: u64,
+        req_id: u64,
+        gen: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            if self
+                .nudge
+                .send(sync::SyncRequest::PeerReadVoid { root, gen, reply })
+                .is_ok()
+            {
+                // Acked only once the stream's grants are no longer honoured;
+                // a dropped reply (daemon shutting down) acks nothing.
+                if receive.await.is_err() {
+                    return constellation_net::Payload::ReadRecalled { req_id: 0 };
+                }
+                return constellation_net::Payload::ReadRecalled { req_id };
+            }
+            constellation_net::Payload::ReadRecalled { req_id: 0 }
+        })
+    }
+
     fn lease_offered(&self, _part: String, epoch: u64) {
         // Only while this node writes: see `Placement::writing_now`.
         if !self.placement.writing_now() {

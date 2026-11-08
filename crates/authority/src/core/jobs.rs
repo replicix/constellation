@@ -5654,7 +5654,7 @@ impl Core {
 /// observations waiting past the marker.
 ///
 /// Plan 43 C1-3: a claim the operator made without the tail of a group no
-/// member of which answered (`constellation repair abandon-group`) says so
+/// member of which answered (`constellation repair abandon`) says so
 /// instead: `LogRecord::GroupAbandoned`, the log's permanent record that
 /// rows that group acknowledged are not re-shipped by this tenure.
 ///

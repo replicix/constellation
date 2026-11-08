@@ -454,6 +454,8 @@ pub struct NodeEnv {
     pub refuse_forwarded_designation_ops: bool,
     /// See `SimConfig::partial_release_ends_stream`.
     pub partial_release_ends_stream: bool,
+    /// See `SimConfig::abandon_skips_read_recall`.
+    pub abandon_skips_read_recall: bool,
     /// See `SimConfig::plant_claim_root_group_on_lone`.
     pub plant_claim_root_group_on_lone: bool,
 }
@@ -742,6 +744,7 @@ impl NodeHandle {
         cfg.holder_releases_before_drain = env.holder_releases_before_drain;
         cfg.refuse_forwarded_designation_ops = env.refuse_forwarded_designation_ops;
         cfg.partial_release_ends_stream = env.partial_release_ends_stream;
+        cfg.abandon_skips_read_recall = env.abandon_skips_read_recall;
         // Plan 43 C2g: the simulation's settle window scales with its lease
         // TTL as production's does (half a TTL: 30 s of 60 s), unless a
         // configuration sets one (`sim_core_config` leaves it unset), and is

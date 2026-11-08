@@ -46,7 +46,7 @@
 
 use crate::session::Position;
 use constellation_types::clock::{HonourMs, Now, WaitMs};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -186,6 +186,9 @@ pub struct CtoStats {
     pub grants: u64,
     pub fuse_writes_recalled: u64,
     pub fuse_recall_wait_ms_total: u64,
+    /// Plan 46 M1.3 step 13: grants refused because their stream was
+    /// ended or abandoned (see [`ReadDelegations::void_gen_epoch`]).
+    pub delegations_voided: u64,
 }
 
 #[derive(Default)]
@@ -201,7 +204,15 @@ struct Inner {
     recall_gen: u64,
     /// Renewals in flight (one per ino).
     renewing: HashMap<u64, HonourMs>,
+    /// Plan 46 M1.3 step 13: the epochs of streams that ended or were
+    /// abandoned, oldest first, at most [`VOIDED_EPOCHS`] (a stream's ids
+    /// are not assumed monotonic): no grant of these is installed.
+    voided: VecDeque<u64>,
+    voided_set: BTreeSet<u64>,
 }
+
+/// How many voided epochs a reader remembers.
+pub const VOIDED_EPOCHS: usize = 256;
 
 /// Both sides' tables (see the module doc).
 pub struct ReadDelegations {
@@ -468,6 +479,11 @@ impl ReadDelegations {
     pub fn install(&self, ino: u64, held: HeldDelegation, gen_at_send: u64) -> bool {
         let mut g = self.inner.lock().unwrap();
         g.renewing.remove(&ino);
+        if g.voided_set.contains(&held.epoch) {
+            drop(g);
+            self.stats.lock().unwrap().delegations_voided += 1;
+            return false;
+        }
         if g.recall_gen != gen_at_send {
             drop(g);
             self.stats.lock().unwrap().delegations_raced += 1;
@@ -549,6 +565,25 @@ impl ReadDelegations {
     pub fn void_epoch(&self, epoch: u64) {
         let mut g = self.inner.lock().unwrap();
         g.held.retain(|_, h| h.epoch != epoch);
+    }
+
+    /// Plan 46 M1.3 step 13 (C11: no read grant on an ended stream): as
+    /// [`Self::void_epoch`], and the epoch is remembered, so a grant of it
+    /// that is still on its way (or sent by a holder that does not know its
+    /// stream ended) is not installed; the recall generation is bumped, so an
+    /// install racing this call fails as for a recall.
+    pub fn void_gen_epoch(&self, epoch: u64) {
+        let mut g = self.inner.lock().unwrap();
+        g.held.retain(|_, h| h.epoch != epoch);
+        g.recall_gen += 1;
+        if g.voided_set.insert(epoch) {
+            g.voided.push_back(epoch);
+            while g.voided.len() > VOIDED_EPOCHS {
+                if let Some(old) = g.voided.pop_front() {
+                    g.voided_set.remove(&old);
+                }
+            }
+        }
     }
 
     pub fn held_count(&self) -> usize {
@@ -1073,6 +1108,35 @@ mod tests {
         assert!(t.install(5, held(1_000), gen));
         assert!(t.valid(5, HonourMs(0)).is_some());
         assert_eq!(t.stats().delegations_raced, 1);
+    }
+
+    #[test]
+    fn void_gen_epoch_bumps_the_recall_gen_refuses_installs_and_keeps_256_fifo() {
+        let t = ReadDelegations::default();
+        let mut h = held(1_000);
+        h.epoch = 7;
+        let gen = t.recall_gen();
+        assert!(t.install(5, h, gen));
+        assert!(t.valid(5, HonourMs(0)).is_some());
+        t.void_gen_epoch(7);
+        assert!(t.valid(5, HonourMs(0)).is_none(), "the held grant is gone");
+        // An install that raced the void fails (the recall generation moved)...
+        assert!(!t.install(5, h, gen));
+        // ...and so does a later one of the same epoch, with a fresh generation.
+        assert!(!t.install(5, h, t.recall_gen()));
+        assert_eq!(t.stats().delegations_voided, 2);
+        // Another epoch is installed.
+        let mut other = held(1_000);
+        other.epoch = 8;
+        assert!(t.install(6, other, t.recall_gen()));
+        // 256 epochs are remembered; the oldest is forgotten first.
+        for e in 1_000..1_000 + VOIDED_EPOCHS as u64 {
+            t.void_gen_epoch(e);
+        }
+        assert!(t.install(5, h, t.recall_gen()), "epoch 7 was pushed out");
+        let mut newest = held(1_000);
+        newest.epoch = 1_000 + VOIDED_EPOCHS as u64 - 1;
+        assert!(!t.install(5, newest, t.recall_gen()));
     }
 
     #[test]

@@ -39,7 +39,7 @@
 //! |---|---|---|
 //! | reads, listings, browsing | viewer | `node.ping/status/logs.tail/logs.flush/ops`, `*.list*`, `snapshot.refs/resolve/reclaim/space`, `snapshot.policy.check/simulate/list/show`, `snapshot.sched.status`, `quota.get`, `browse.readdir/inspect/stat/read`, `view.stats`, `peers.list`, `stats.subscribe`, `events.subscribe` |
 //! | node-local mutation (and probes that write to the backend) | operator | `pin.add/remove`, `designation.offline/online/delegate/undelegate`, `node.reintegrate/set_write_mode/doctor`, `snapshot.create`, `snapshot.hold`, `snapshot.space.verify` (a heavy read-only probe), `clone.create`, `cache.prune`, `browse.write/mkdir/rename/xattr`, `fs.doctor` |
-//! | destructive or cluster-wide | admin | `node.leave/handoff/lifecycle`, `prune.run`, `gc.run`, `fsck.run`, `snapshot.delete/delete_many`, `snapshot.policy.set/remove/pause`, `snapshot.sched.run`, `locks.*`, `lease.abandon_group`, `quota.set`, `view.mount/unmount`, `browse.delete`, `fs.create/import/export/passwd/unlock` |
+//! | destructive or cluster-wide | admin | `node.leave/handoff/lifecycle`, `prune.run`, `gc.run`, `fsck.run`, `snapshot.delete/delete_many`, `snapshot.policy.set/remove/pause`, `snapshot.sched.run`, `locks.*`, `repair.abandon`, `quota.set`, `view.mount/unmount`, `browse.delete`, `fs.create/import/export/passwd/unlock` |
 //!
 //! `fsck.run` is admin although a dry run only reads: one method, one role,
 //! and the same method repairs and force-releases. `browse.xattr` is
@@ -413,10 +413,12 @@ define_methods! {
     /// Let the lease claim that waits for the tail of a lost backup group
     /// (`status.lease.waiting_for_group`) go on without it (plan 43 C1-3), or
     /// the root end a delegation generation whose group has not handed over
-    /// its tail (`status.delegation.gens[].waiting_for_group`, C2e). Rows
-    /// that group acknowledged may be lost.
-    LeaseAbandonGroup { name: "lease.abandon_group", role: Admin, mutating: true, stream: None,
-        params: AbandonGroupParams, result: Ack }
+    /// its tail (`status.delegation.gens[].waiting_for_group`, C2e), or a
+    /// sticky or designated stream whose holder is gone, after recalling or
+    /// waiting out the read delegations it granted (plan 46 M1.3 step 13).
+    /// Rows that group or holder acknowledged may be lost.
+    RepairAbandon { name: "repair.abandon", role: Admin, mutating: true, stream: None,
+        params: AbandonParams, result: Ack }
 
     // ---- cache / quota --------------------------------------------------
     CacheList { name: "cache.list", role: Viewer, mutating: false, stream: None,
@@ -583,7 +585,7 @@ mod tests {
             "36 old methods + 21 new ones + snapshot.hold + snapshot.policy.check/simulate \
              + snapshot.policy.list/show/set/remove/pause \
              + snapshot.resolve/delete_many + snapshot.sched.status/run \
-             + snapshot.reclaim/space/space.verify + node.logs.flush + lease.abandon_group"
+             + snapshot.reclaim/space/space.verify + node.logs.flush + repair.abandon"
         );
         for m in METHODS {
             assert!(
@@ -689,7 +691,7 @@ mod tests {
             "fsck.run",
             "locks.force_release",
             "locks.drop_held",
-            "lease.abandon_group",
+            "repair.abandon",
             "gc.run",
             "prune.run",
             "fs.create",

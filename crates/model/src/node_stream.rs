@@ -168,7 +168,7 @@
 //!   in one step (the verbatim tail) and journals `DelegateNodeEnded {
 //!   through }` at its cursor. A stream whose configuration names backups
 //!   ends only once one of them is live to seal (plan 43 C2e; with none the
-//!   end waits for the group, and the operator's `abandon-group` is not
+//!   end waits for the group, and the operator's `abandon` is not
 //!   modeled). The directories return to the root; rows
 //!   past the cut are void (the delegate strands them; their requesters
 //!   retry, and the root dedups a rid it finds appended).
@@ -2924,7 +2924,7 @@ impl Model for NodeStreamModel {
             }
             // C2e: a stream whose configuration names backups ends only
             // after one of them seals; with none live it waits for the
-            // group (the operator's `abandon-group`, not modeled).
+            // group (the operator's `abandon`, not modeled).
             let group = st.cfgs.last().unwrap().backups;
             let sealable = group == 0 || bits(group).any(|b| s.live(b as u8));
             if end.is_none() && self.ends(stream) && (st.stopped || !s.live(exec)) && sealable {

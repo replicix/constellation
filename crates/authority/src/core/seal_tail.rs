@@ -25,7 +25,7 @@
 //!   attempt ends, the lease path of the ops behind it retries every
 //!   `backup_takeover_ms`, `status.lease.waiting_for_group` says for what.
 //!   A group whose members are all gone for good is the operator's to
-//!   abandon (`constellation repair abandon-group`, [`Control::AbandonGroup`]):
+//!   abandon (`constellation repair abandon --epoch`, [`Control::Abandon`]):
 //!   the claim then proceeds without the tail and its marker says so
 //!   (`LogRecord::GroupAbandoned`).
 //!
@@ -681,7 +681,7 @@ impl Core {
                     sources = ?w.sources,
                     waited_ms = waited,
                     "the claim of the lease waits for the tail of its group: no member answered \
-                     (the operator may abandon the group: `repair abandon-group`)"
+                     (the operator may abandon the group: `repair abandon --epoch`)"
                 );
             } else {
                 tracing::debug!(
@@ -808,25 +808,43 @@ impl Core {
         self.claim_with_tail(now, prev, tag, replica, out);
     }
 
-    /// `Control::AbandonGroup`: valid while a claim waits for `epoch`'s
-    /// group and none of its members has answered. With `gen != 0` it
-    /// abandons a delegation's group instead (C2e,
-    /// [`Core::on_control_abandon_generation`]).
+    /// `Control::Abandon` (plan 46 M1.3 step 13, Q5): `Epoch(e)` is valid
+    /// while a claim waits for `e`'s group and none of its members has
+    /// answered (a lease claim's wait for a backup group's tail: no stream,
+    /// no read delegations of a holder to recall; the claim's own takeover
+    /// quarantine covers the old holder's grants). `Gen` and `Node` abandon
+    /// delegation streams ([`Core::on_control_abandon_streams`]).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn on_control_abandon_group(
+    pub(crate) fn on_control_abandon(
         &mut self,
         now: Now,
         op: OpId,
-        epoch: Epoch,
-        gen: u64,
+        target: crate::event::AbandonTarget,
         force: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        if gen != 0 {
-            self.on_control_abandon_generation(now, op, epoch, gen, force, replica, out);
-            return;
-        }
+        use crate::event::AbandonTarget;
+        let epoch = match target {
+            AbandonTarget::Epoch(e) => e,
+            AbandonTarget::Gen(g) => {
+                use super::delegate::AbandonSel;
+                self.on_control_abandon_streams(now, op, AbandonSel::Gen(g), force, replica, out);
+                return;
+            }
+            AbandonTarget::Node { node, gen } => {
+                use super::delegate::AbandonSel;
+                self.on_control_abandon_streams(
+                    now,
+                    op,
+                    AbandonSel::Node(node, gen),
+                    force,
+                    replica,
+                    out,
+                );
+                return;
+            }
+        };
         let waiting = self.bk.group_wait.as_ref().map(|w| w.epoch);
         let chosen = self.bk.tf.as_ref().is_some_and(|t| t.chosen.is_some());
         let result = if waiting != Some(epoch) || chosen {

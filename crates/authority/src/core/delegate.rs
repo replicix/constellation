@@ -57,7 +57,7 @@ use super::backup::{FreshHold, FreshVerdict};
 use super::{Asker, CommitRule, Core, GroupOn, Timer};
 use crate::action::{Action, AnswerSource, ControlOk};
 use crate::event::PeerMsg;
-use crate::ids::{Epoch, HonourMs, NodeId, Now, OpId, TimerId, WaitMs};
+use crate::ids::{HonourMs, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::Ownership;
@@ -221,14 +221,14 @@ pub(crate) struct GenState {
     /// does not, and none has answered its seal with a tail drained to its
     /// end. Asked again every window until one does (counted in
     /// `Stats::deleg_seal_waits`), `status.delegation.gens[].waiting_for_group`;
-    /// `constellation repair abandon-group --gen` ends it at the cursor.
+    /// `constellation repair abandon --gen` ends it at the cursor.
     pub waiting_for_group: bool,
     /// The last WARN about the wait (once a minute).
     pub waiting_warned: Option<WaitMs>,
     /// Since when the generation has been `waiting_for_group` (status).
     pub waiting_since: Option<WaitMs>,
     /// What this root knows of each member it asked to seal (status: the
-    /// operator weighs `abandon-group` by it).
+    /// operator weighs `abandon` by it).
     pub member_notes: BTreeMap<NodeId, MemberNote>,
     /// Plan 46 M1.2 step 7 (c3-spec D6): the previous roots this root still
     /// has to seal, for a generation it inherited with no recorded backup (its
@@ -1023,6 +1023,49 @@ pub(crate) struct LeaveWait {
     pub asked: BTreeMap<u64, WaitMs>,
 }
 
+/// Plan 46 M1.3 step 13: which streams `repair abandon --gen/--node` names.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AbandonSel {
+    Gen(u64),
+    Node(NodeId, Option<u64>),
+}
+
+/// What a validated abandon will do (all of it checked before any is started).
+#[derive(Debug, Default)]
+pub(crate) struct AbandonPlan {
+    /// Placed generations waiting for their group: ended at once.
+    pub placed: Vec<u64>,
+    /// Placed generations not waiting: left to their TTL (`--node` only).
+    pub placed_left: Vec<u64>,
+    /// Non-stealable streams: end after their read delegations are done.
+    pub streams: Vec<u64>,
+    /// `--force` overrode a heard-lately refusal: who was heard, and when.
+    pub forced: BTreeMap<u64, (NodeId, &'static str, u64)>,
+}
+
+/// Plan 46 M1.3 step 13: one `repair abandon` of non-stealable streams
+/// waiting for the read delegations their holders granted (C11: recall,
+/// else expire).
+#[derive(Debug)]
+pub(crate) struct AbandonWait {
+    pub op: OpId,
+    /// The streams; each ends (`end_generation(.., Some(known))`) once its
+    /// reads are done.
+    pub gens: BTreeSet<u64>,
+    /// Void requests not answered yet: req -> (reader, gen).
+    pub asked: BTreeMap<OpId, (NodeId, u64)>,
+    /// How many void requests each stream's broadcast sent.
+    pub sent: BTreeMap<u64, usize>,
+    /// `command time + read_delegation_ttl_ms + expiry_margin_ms` (the root's wait
+    /// clock): a holder's read grant ran `ttl` from the reader's send, and
+    /// the holder, gone at the command, granted none after it.
+    pub deadline: WaitMs,
+    /// `--force` overrode a heard-lately refusal, per stream (the audit).
+    pub forced: BTreeMap<u64, (NodeId, &'static str, u64)>,
+    /// What the answer reports.
+    pub lines: Vec<String>,
+}
+
 /// The generation number of a [`PeerMsg::DelegateStream`] that is no stream:
 /// a node tells the root it is leaving (or no longer is) with a batch of no
 /// rows and a [`constellation_meta::locks::ReleaseNote`] saying so. The
@@ -1187,6 +1230,11 @@ pub(crate) struct DelegationState {
     /// and is not among them lost its state with a restart
     /// (`delegation_sync` installs a remnant to ship the release row).
     pub installed_gens: BTreeSet<u64>,
+    /// Plan 46 M1.3 step 13: the `repair abandon` commands waiting for read
+    /// delegations (see [`AbandonWait`]), and the timer of their earliest
+    /// deadline.
+    pub abandons: Vec<AbandonWait>,
+    pub abandon_timer: Option<TimerId>,
     /// The nodes leaving (this node is their root): nothing is granted to
     /// them from the moment their leave starts, so no grant is made between
     /// the end of their grants and the retirement of their registry entry.
@@ -1275,7 +1323,7 @@ pub struct DelegView {
     pub gens: Vec<(Vec<Ino>, NodeId, u64, u64, i64, String, bool, bool)>,
     /// Plan 43 C2e: the generations that cannot end for want of their
     /// group's tail, with what the root knows of each member (what
-    /// `abandon-group --gen` is weighed by).
+    /// `abandon --gen` is weighed by).
     pub waiting: Vec<WaitingGenView>,
     /// Path B: `(dirs, gen, waited_ms, ended)` for each generation of this
     /// node the table lists that is not installed yet, because an ended
@@ -4672,6 +4720,7 @@ impl Core {
         self.deleg_forget_ended(now, replica);
         self.deleg_leave_progress(now, replica, out);
         self.sticky_release_progress(now, replica, out);
+        self.abandon_progress(now, replica, out);
         // Plan 43 C2e (D8): a strict member's sealed tail that the drain
         // stopped short of (a dependency the log brings, a root that could
         // not end the recall) is drained again; the generation ends once the
@@ -5826,7 +5875,7 @@ impl Core {
                         node = self.cfg.node_id,
                         gen = %constellation_meta::delegation::GenLabel::of(gen),
                         "a delegation's recorded backup cannot be reached for its seal: the generation is not ended without its tail \
-                         (`constellation repair abandon-group --gen {gen}` ends it at the root's cursor; rows only the group holds are lost)"
+                         (`constellation repair abandon --gen {gen}` ends it at the root's cursor; rows only the group holds are lost)"
                     );
                 }
                 if granting && !self.dl.epoch_active {
@@ -7808,6 +7857,13 @@ impl Core {
         if now.honour >= d.until {
             return None;
         }
+        // Plan 46 M1.3 step 13 (C11): the log ended this stream (the
+        // root's abandon, say); `mine` still holds it until the table
+        // sync drops it. It answers no strict read, so grants no read
+        // delegation.
+        if replica.void_cut(gen).is_some() {
+            return None;
+        }
         let epoch = super::DELEG_READ_EPOCH_BASE + gen;
         let grant = if self.cfg.read_delegations && from != self.cfg.node_id {
             let margin = self.cfg.expiry_margin_ms as i64;
@@ -9289,7 +9345,7 @@ impl Core {
                         node = self.me(),
                         gen = %constellation_meta::delegation::GenLabel::of(gen),
                         "a delegation's recorded backup has not answered its seal: the generation is not ended without its tail \
-                         (`constellation repair abandon-group --gen {gen}` ends it at the root's cursor; rows only the group holds are lost)"
+                         (`constellation repair abandon --gen {gen}` ends it at the root's cursor; rows only the group holds are lost)"
                     );
                 }
                 self.dw.close(gen);
@@ -9364,128 +9420,453 @@ impl Core {
         }
     }
 
-    /// Plan 43 C2e (Q1, `constellation repair abandon-group --gen G`): the
-    /// operator accepts that the group of generation `gen` is gone for good.
-    /// Valid on the root of a generation that waits for its group
-    /// (`status.delegation.gens[].waiting_for_group`): it is ended at the
-    /// cursor now, with `LogRecord::GroupAbandoned` journaled with the cut
-    /// (the audit), and the rows only the group held — acknowledged to
-    /// their clients — are lost (the delegate's, if it comes back, are
-    /// dropped by the recall's strand).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn on_control_abandon_generation(
+    /// Plan 43 C2e (Q1) and plan 46 M1.3 step 13 (Q5, C11): `constellation
+    /// repair abandon --gen G | --node N [--gen G]`. The operator accepts
+    /// that the holder (and, for a placed generation, the group) of the
+    /// streams is gone for good; each stream is ended at the root's cursor
+    /// with `LogRecord::GroupAbandoned` journaled with the cut (the audit),
+    /// and the rows only the holder or its group held, acknowledged to their
+    /// clients, are lost to the log (a holder that returns replays its
+    /// copies by rid; refused ones become conflict copies).
+    ///
+    /// * A **placed** generation is abandoned only while it waits for its
+    ///   group (`waiting_for_group`), i.e. after the root outwaited its
+    ///   recall or TTL end; its delegate's read grants are capped by its own
+    ///   `until - margin`, which that outwait covered. It ends at once, with
+    ///   no read wait (plan 46 step 13 D4).
+    /// * A **non-stealable** stream (sticky, designated) is never TTL-ended
+    ///   and its holder's read grants are not capped by its `until`: C11,
+    ///   "abandon = recall, else expire". The root voids its own copy of the
+    ///   grants, asks every other node to void theirs
+    ///   ([`PeerMsg::DelegReadVoid`]) and ends the stream once they answered,
+    ///   or `read_delegation_ttl_ms + expiry_margin_ms` after the command (the
+    ///   holder is gone, so every grant was sent before it): no read is
+    ///   served under the stream after its end is journaled. During the wait
+    ///   the stream stays live (its subtree still blocks), and a forced,
+    ///   still-streaming holder's rows keep being appended: the cut is the
+    ///   cursor when the end is journaled.
+    ///
+    /// All the streams are validated before any is started.
+    pub(crate) fn on_control_abandon_streams(
         &mut self,
         now: Now,
         op: OpId,
-        epoch: Epoch,
-        gen: u64,
+        sel: AbandonSel,
         force: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let heard = self
-            .dl
-            .gens
-            .get(&gen)
-            .and_then(|g| self.deleg_group_heard_lately(now, g));
-        let result = match self.dl.gens.get(&gen) {
-            _ if epoch != 0 => Err(
-                "a delegation's group is named by --gen alone (no --epoch)".to_string(),
-            ),
-            None => Err(format!(
-                "this node is not the root of generation {gen} (run it on the node whose `status` lists it under delegation.gens)"
-            )),
-            Some(g) if g.ended => Err(format!("generation {gen} has ended already")),
-            Some(g) if !g.waiting_for_group => Err(format!(
-                "generation {gen} is not waiting for its group (delegation.gens[].waiting_for_group)"
-            )),
+        match self.abandon_validate(now, sel, force) {
+            Err(error) => out.push(Action::ControlDone {
+                op,
+                result: Err(error),
+            }),
+            Ok(plan) => self.abandon_start(now, op, plan, replica, out),
+        }
+    }
+
+    fn abandon_validate(
+        &self,
+        now: Now,
+        sel: AbandonSel,
+        force: bool,
+    ) -> Result<AbandonPlan, String> {
+        let by_node = match sel {
+            AbandonSel::Node(n, _) => Some(n),
+            AbandonSel::Gen(_) => None,
+        };
+        let gens: Vec<u64> = match sel {
+            AbandonSel::Gen(g) => vec![g],
+            AbandonSel::Node(n, _) if n == self.me() => {
+                return Err(format!(
+                    "node {n} is this node: release your own grants with `constellation release`"
+                ));
+            }
+            AbandonSel::Node(n, Some(g)) => match self.dl.gens.get(&g) {
+                Some(s) if s.node == n => vec![g],
+                Some(s) => {
+                    return Err(format!(
+                        "generation {g} is node {}'s stream, not node {n}'s",
+                        s.node
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "this node is not the root of generation {g} (run it on the node whose `status` lists it under delegation.gens)"
+                    ));
+                }
+            },
+            AbandonSel::Node(n, None) => {
+                let gens: Vec<u64> = self
+                    .dl
+                    .gens
+                    .iter()
+                    .filter(|(_, g)| g.node == n && !g.ended)
+                    .map(|(g, _)| *g)
+                    .collect();
+                if gens.is_empty() {
+                    return Err(format!("this root lists no live stream of node {n}"));
+                }
+                gens
+            }
+        };
+        let mut plan = AbandonPlan::default();
+        for gen in gens {
+            if self.dl.abandons.iter().any(|w| w.gens.contains(&gen)) {
+                return Err(format!(
+                    "an abandon of generation {gen} is already waiting for its read delegations"
+                ));
+            }
+            let heard = self
+                .dl
+                .gens
+                .get(&gen)
+                .and_then(|g| self.deleg_group_heard_lately(now, g));
+            let g = match self.dl.gens.get(&gen) {
+                None => {
+                    return Err(format!(
+                        "this node is not the root of generation {gen} (run it on the node whose `status` lists it under delegation.gens)"
+                    ));
+                }
+                Some(g) => g,
+            };
+            if g.ended {
+                return Err(format!("generation {gen} has ended already"));
+            }
+            let stream = g.non_stealable();
+            if !stream && !g.waiting_for_group {
+                if by_node.is_some() {
+                    plan.placed_left.push(gen);
+                    continue;
+                }
+                return Err(format!(
+                    "generation {gen} is not waiting for its group (delegation.gens[].waiting_for_group); \
+                     a placed stream ends by its TTL, nothing to abandon"
+                ));
+            }
             // A member answered: its tail is here, the group is not lost.
             // The root appends it as its dependencies allow; ending the
             // generation now would drop the rows past the cursor that the
             // group acknowledged and that are in this very tail.
-            Some(g) if g.sealed_tail.is_some() => {
-                let t = g.sealed_tail.as_ref().expect("checked");
-                Err(format!(
+            if let Some(t) = g.sealed_tail.as_ref() {
+                return Err(format!(
                     "node {}'s tail of generation {gen} is in hand (appended through {} of {}) and is appended as soon as its \
                      dependencies are here; this group is not lost, so it is not abandoned (see delegation.waiting)",
                     t.from, g.cursor, t.end
-                ))
+                ));
             }
             // Plan 46 M1.2 step 7 (c3-spec D6): a previous root whose tail is
             // in hand or not yet answered may hold rows its clients were told
             // are committed, that no other member has: not given up without
             // `--force` (which the operator gives after confirming it is gone).
-            Some(g) if !force && (!g.prev_roots.is_empty() || !g.prev_tails.is_empty()) => {
-                Err(format!(
+            if !force && (!g.prev_roots.is_empty() || !g.prev_tails.is_empty()) {
+                return Err(format!(
                     "generation {gen} still waits for the tail of previous root(s) {:?} ({} tail(s) in hand): rows only a previous \
                      root held, acknowledged to their clients, would be lost. Confirm from elsewhere that they are down, then run \
                      the command again with --force",
                     g.prev_roots,
                     g.prev_tails.len()
-                ))
+                ));
             }
             // The discriminator (C2e follow-up): a delegate or a strict
             // member this root heard from within a grant's ttl may be alive
             // and cut from it only; its tail, or the delegate's rows, are not
             // lost. The operator confirms from elsewhere that the nodes are
             // down, and forces.
-            Some(_) if !force && heard.is_some() => {
-                let (node, role, ago) = heard.expect("checked");
-                Err(format!(
+            if let (false, Some((node, role, ago))) = (force, heard) {
+                return Err(format!(
                     "this root heard from node {node} ({role} of generation {gen}) {ago} ms ago, within \
                      delegation_ttl_ms ({} ms): it may be alive and cut from this node only, holding rows its \
                      clients were told are committed. Confirm from elsewhere that the delegate and the members \
                      of its group are down, then run the command again with --force",
                     self.cfg.delegation_ttl_ms
-                ))
+                ));
             }
-            Some(_) if !self.root_ends_recall(now, gen) => Err(format!(
-                "this node cannot end generation {gen} now (it is not a usable root)"
-            )),
-            Some(g) => {
-                let known = g
-                    .sealed_tail
-                    .iter()
-                    .map(|t| t.end)
-                    .chain(g.prev_tails.values().map(|t| t.end))
-                    .fold(g.cursor, u64::max);
-                let cursor = g.cursor;
-                let forced = force && heard.is_some();
-                // The audit of `--force`: who was heard from, and when.
-                let (heard_node, heard_role, heard_ms) = heard.unwrap_or((0, "", 0));
-                tracing::warn!(
-                    node = self.me(),
-                    gen = %constellation_meta::delegation::GenLabel::of(gen),
-                    cursor,
-                    known,
-                    forced,
-                    heard_node,
-                    heard_role,
-                    heard_ms,
-                    "the operator abandoned the group of a delegation{}: ending it at the root's cursor; rows only its group held are lost",
-                    if forced {
-                        " with --force, although this root heard from that node within delegation_ttl_ms"
-                    } else {
-                        ""
-                    }
-                );
-                self.end_generation(now, gen, Some(known), replica, out);
-                if self.dl.gens.get(&gen).is_some_and(|g| g.ended) {
-                    self.stats.groups_abandoned += 1;
-                    if forced {
-                        self.stats.groups_abandoned_forced += 1;
-                    }
-                    Ok(ControlOk::Text(format!(
-                        "generation {gen} ended at index {cursor}; rows past it that only its group held are lost"
-                    )))
-                } else {
-                    Err(format!(
-                        "could not journal the end of generation {gen}; try again"
-                    ))
+            if !self.root_ends_recall(now, gen) {
+                return Err(format!(
+                    "this node cannot end generation {gen} now (it is not a usable root)"
+                ));
+            }
+            if let Some(h) = heard {
+                plan.forced.insert(gen, h);
+            }
+            if stream {
+                plan.streams.push(gen);
+            } else {
+                plan.placed.push(gen);
+            }
+        }
+        if plan.streams.is_empty() && plan.placed.is_empty() {
+            return Err(format!(
+                "generations {:?} are placed streams that are not waiting for their group: nothing the cluster cannot end by itself \
+                 (they end by their TTL)",
+                plan.placed_left
+            ));
+        }
+        Ok(plan)
+    }
+
+    fn abandon_start(
+        &mut self,
+        now: Now,
+        op: OpId,
+        plan: AbandonPlan,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.stats.deleg_abandons += 1;
+        let mut lines = Vec::new();
+        let mut failed = None;
+        for gen in &plan.placed {
+            match self.abandon_end_now(now, *gen, plan.forced.get(gen).copied(), replica, out) {
+                Ok(cursor) => lines.push(format!(
+                    "generation {gen} (placed) ended at index {cursor}; rows past it that only its group held are lost"
+                )),
+                Err(e) => failed = Some(e),
+            }
+        }
+        for gen in &plan.placed_left {
+            lines.push(format!(
+                "generation {gen} (placed) is not waiting for its group: left to its TTL"
+            ));
+        }
+        if let Some(e) = failed {
+            out.push(Action::ControlDone { op, result: Err(e) });
+            return;
+        }
+        if plan.streams.is_empty() {
+            out.push(Action::ControlDone {
+                op,
+                result: Ok(ControlOk::Text(lines.join("\n"))),
+            });
+            return;
+        }
+        let me = self.me();
+        let mut w = AbandonWait {
+            op,
+            gens: plan.streams.iter().copied().collect(),
+            asked: BTreeMap::new(),
+            sent: BTreeMap::new(),
+            deadline: now
+                .wait
+                .plus(self.cfg.read_delegation_ttl_ms + self.cfg.expiry_margin_ms),
+            forced: plan.forced.clone(),
+            lines,
+        };
+        let waits = self.cfg.read_delegations && !self.cfg.abandon_skips_read_recall;
+        if waits {
+            // This node's own copy of the grants, then every other node's.
+            let mut peers: BTreeSet<NodeId> = self.roster.iter().copied().collect();
+            peers.extend(self.links.keys().copied());
+            peers.remove(&me);
+            for gen in &plan.streams {
+                replica
+                    .read_delegations()
+                    .void_gen_epoch(super::DELEG_READ_EPOCH_BASE + *gen);
+                let holder = self.dl.gens.get(gen).map(|g| g.node);
+                for p in peers.iter().filter(|p| Some(**p) != holder) {
+                    let req = self.op_id();
+                    w.asked.insert(req, (*p, *gen));
+                    *w.sent.entry(*gen).or_default() += 1;
+                    out.push(Action::Send {
+                        to: *p,
+                        msg: PeerMsg::DelegReadVoid { req, gen: *gen },
+                    });
                 }
             }
+            self.stats.deleg_abandon_read_waits += 1;
+        }
+        tracing::warn!(
+            node = me,
+            gens = ?plan.streams,
+            deadline = w.deadline.0,
+            waiting = waits,
+            "the operator abandons non-stealable stream(s): recalling their read delegations, else waiting them out"
+        );
+        self.dl.abandons.push(w);
+        self.abandon_progress(now, replica, out);
+    }
+
+    /// End `gen` at the root's cursor for an abandon (`GroupAbandoned`
+    /// journaled), returning the cursor. `forced`: `--force` overrode the
+    /// heard-lately refusal; who was heard, for the audit.
+    fn abandon_end_now(
+        &mut self,
+        now: Now,
+        gen: u64,
+        forced: Option<(NodeId, &'static str, u64)>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> Result<u64, String> {
+        let Some(g) = self.dl.gens.get(&gen) else {
+            return Err(format!("generation {gen} is gone"));
         };
-        out.push(Action::ControlDone { op, result });
+        let known = g
+            .sealed_tail
+            .iter()
+            .map(|t| t.end)
+            .chain(g.prev_tails.values().map(|t| t.end))
+            .fold(g.cursor, u64::max);
+        let cursor = g.cursor;
+        let (heard_node, heard_role, heard_ms) = forced.unwrap_or((0, "", 0));
+        tracing::warn!(
+            node = self.me(),
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
+            cursor,
+            known,
+            forced = forced.is_some(),
+            heard_node,
+            heard_role,
+            heard_ms,
+            "the operator abandoned a delegation{}: ending it at the root's cursor; rows only its holder or group held are lost",
+            if forced.is_some() {
+                " with --force, although this root heard from that node within delegation_ttl_ms"
+            } else {
+                ""
+            }
+        );
+        self.end_generation(now, gen, Some(known), replica, out);
+        if self.dl.gens.get(&gen).is_some_and(|g| g.ended) {
+            self.stats.groups_abandoned += 1;
+            if forced.is_some() {
+                self.stats.groups_abandoned_forced += 1;
+            }
+            Ok(cursor)
+        } else {
+            Err(format!(
+                "could not journal the end of generation {gen}; try again"
+            ))
+        }
+    }
+
+    /// `req` was a void request of an abandon: forget it. Whether it was.
+    pub(crate) fn deleg_abandon_acked(&mut self, req: OpId) -> bool {
+        self.dl
+            .abandons
+            .iter_mut()
+            .any(|w| w.asked.remove(&req).is_some())
+    }
+
+    /// Every event, every answer to a void request and the deadline: end the
+    /// streams whose read delegations are recalled or waited out, answer the
+    /// commands that are done.
+    pub(crate) fn abandon_progress(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.dl.abandons.is_empty() {
+            return;
+        }
+        let mut waits = std::mem::take(&mut self.dl.abandons);
+        let mut keep = Vec::new();
+        for mut w in waits.drain(..) {
+            let mut failed = None;
+            for gen in w.gens.clone() {
+                let ended = self.dl.gens.get(&gen).is_none_or(|g| g.ended);
+                if ended {
+                    // The holder came back and released, or the log ended
+                    // the stream otherwise: not ours.
+                    w.gens.remove(&gen);
+                    w.asked.retain(|_, (_, g)| *g != gen);
+                    self.stats.deleg_abandon_superseded += 1;
+                    w.lines.push(format!(
+                        "generation {gen} ended meanwhile (by its holder's release or otherwise); nothing abandoned"
+                    ));
+                    continue;
+                }
+                if !self.root_ends_recall(now, gen) {
+                    failed = Some(
+                        "this node is no longer the root; run the command again on the root"
+                            .to_string(),
+                    );
+                    break;
+                }
+                let pending = w.asked.values().filter(|(_, g)| *g == gen).count();
+                if pending > 0 && now.wait < w.deadline {
+                    continue;
+                }
+                if pending > 0 {
+                    self.stats.deleg_abandon_reads_expired += 1;
+                } else {
+                    self.stats.deleg_abandon_reads_recalled += 1;
+                }
+                let sent = w.sent.get(&gen).copied().unwrap_or(0);
+                let label = match self.dl.gens.get(&gen).map(|g| (g.kind(), g.node)) {
+                    Some((DelegKind::Designated, n)) => ("designated", n),
+                    Some((_, n)) => ("sticky", n),
+                    None => ("", 0),
+                };
+                match self.abandon_end_now(now, gen, w.forced.get(&gen).copied(), replica, out) {
+                    Ok(cursor) => {
+                        w.gens.remove(&gen);
+                        w.asked.retain(|_, (_, g)| *g != gen);
+                        w.lines.push(format!(
+                            "generation {gen} ({}) of node {} ended at index {cursor}; rows past it that only node {} held are lost \
+                             to the log; node {} replays them by rid when it returns, refused ones become conflict copies; \
+                             read delegations: recalled from {} node(s), waited out for {pending}",
+                            label.0,
+                            label.1,
+                            label.1,
+                            label.1,
+                            sent - pending
+                        ));
+                    }
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = failed {
+                let done = w.lines.join("; ");
+                out.push(Action::ControlDone {
+                    op: w.op,
+                    result: Err(if done.is_empty() {
+                        e
+                    } else {
+                        format!("{e} (already done: {done})")
+                    }),
+                });
+            } else if w.gens.is_empty() {
+                out.push(Action::ControlDone {
+                    op: w.op,
+                    result: Ok(ControlOk::Text(w.lines.join("\n"))),
+                });
+            } else {
+                keep.push(w);
+            }
+        }
+        keep.append(&mut self.dl.abandons);
+        self.dl.abandons = keep;
+        self.abandon_arm(now, out);
+    }
+
+    /// The timer of the earliest deadline of a wait; none when no wait is left.
+    fn abandon_arm(&mut self, now: Now, out: &mut Vec<Action>) {
+        let next = self.dl.abandons.iter().map(|w| w.deadline).min();
+        match (next, self.dl.abandon_timer) {
+            (None, Some(t)) => {
+                self.cancel_timer(t, out);
+                self.dl.abandon_timer = None;
+            }
+            (Some(at), None) => {
+                let t = self.set_timer_wait(at.max(now.wait), Timer::AbandonWait, out);
+                self.dl.abandon_timer = Some(t);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn on_abandon_timer(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.dl.abandon_timer = None;
+        self.abandon_progress(now, replica, out);
     }
 
     /// When this root last heard from `node`: a message from it, or a
@@ -9519,7 +9900,7 @@ impl Core {
             .max(self.link_heard(member))
     }
 
-    /// Plan 43 C2e follow-up (`repair abandon-group` without `--force`): the
+    /// Plan 43 C2e follow-up (`repair abandon` without `--force`): the
     /// node of `g`'s group this root heard from within `delegation_ttl_ms`
     /// most lately — the delegate, or a strict member — as `(node, role, ms
     /// ago)`.
@@ -9554,7 +9935,7 @@ impl Core {
     /// parked execution waiting on it released.
     ///
     /// `abandoned`: the operator gave the generation's group up
-    /// (`constellation repair abandon-group --gen`): the end is journaled
+    /// (`constellation repair abandon --gen`): the end is journaled
     /// with a [`LogRecord::GroupAbandoned`] (`through_known`: the highest
     /// index of the group the root knew of), the log's permanent record that
     /// rows the group may have acknowledged past the cut are lost.
@@ -9573,7 +9954,7 @@ impl Core {
             return;
         }
         // Plan 46 M1.2 step 7 (c3-spec D6): not while a previous root's tail
-        // may hold rows past the cursor (`abandon-group` is the operator's
+        // may hold rows past the cursor (`abandon` is the operator's
         // way out: `abandoned`).
         if abandoned.is_none() && !g.prev_roots.is_empty() {
             self.deleg_end_waits_for_prev_roots(now, gen, out);
@@ -9731,7 +10112,7 @@ impl Core {
                 node = self.me(),
                 gen = %constellation_meta::delegation::GenLabel::of(gen),
                 "a delegation's previous root has not answered its seal: the generation is not ended without its tail \
-                 (`constellation repair abandon-group --gen {gen}` ends it at the root's cursor; rows only it held are lost)"
+                 (`constellation repair abandon --gen {gen}` ends it at the root's cursor; rows only it held are lost)"
             );
         }
         self.dw.close(gen);

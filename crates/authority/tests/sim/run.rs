@@ -45,6 +45,15 @@ pub enum FaultKind {
     /// (by name under the root), through the lease holder, retried for
     /// `within_ms`. A sticky grant ends by it: the holder releases.
     UndelegateDir { dir: String, within_ms: u64 },
+    /// Plan 46 M1.3 step 13: the operator's `repair abandon --node N
+    /// [--force]` on the root, retried for `within_ms`. `force`: the
+    /// operator has confirmed that `node` is down (the fault stops with a
+    /// failure when it is not).
+    AbandonNode {
+        node: NodeId,
+        force: bool,
+        within_ms: u64,
+    },
     CrashNode {
         node: NodeId,
         restart_ms: Option<u64>,
@@ -512,6 +521,13 @@ pub struct SimConfig {
     /// Plan 46 M1.3 step 5: clients pause now and then (`Step::Delay`), so
     /// that subtrees go idle.
     pub idle_gaps: bool,
+    /// Negative control (`Config::abandon_skips_read_recall`): the operator's
+    /// abandon of a sticky stream ends it without recalling or waiting out
+    /// the read delegations its holder granted.
+    /// `AUTHORITY_SIM_ABANDON_SKIPS_READ_RECALL=1` sets it on every
+    /// configuration; `no_read_under_an_abandoned_stream` must then fail the
+    /// run.
+    pub abandon_skips_read_recall: bool,
     /// Plan 30 §M12: every client writes in `dirs[0]` with names of its
     /// own (`<dir>/n<node>-f<i>`): a hot shared directory with no
     /// colliding names.
@@ -1096,6 +1112,8 @@ impl Default for SimConfig {
             .is_some_and(|v| v == "1"),
             sticky_idle_ms: None,
             idle_gaps: false,
+            abandon_skips_read_recall: std::env::var_os("AUTHORITY_SIM_ABANDON_SKIPS_READ_RECALL")
+                .is_some_and(|v| v == "1"),
             shared_dir: false,
             cross_ratio: 0.0,
             marker_pairs: 0,
@@ -1374,7 +1392,7 @@ pub struct Report {
     pub sticky_ended_unexcused: usize,
     /// Core counters, summed over the nodes: sticky grants made, and sticky
     /// streams ended by reason (released, abandoned, other).
-    pub sticky_core: [u64; 11],
+    pub sticky_core: [u64; 16],
     /// Plan 46 M1.3 step 5, the idle tracker's releases: requested, answered
     /// (`wait`), unanswered or refused (`wait`), granted again.
     pub sticky_driver: [u64; 4],
@@ -1415,6 +1433,8 @@ pub struct Report {
     pub unsettled_all: Vec<String>,
     /// I5: acknowledged, rolled-back ops whose answer was not Lone.
     pub non_lone_rollbacks: usize,
+    /// Plan 46 M1.3 step 13: I5's operator branch (see `Findings::i5_operator`).
+    pub i5_operator: usize,
     /// Plan 43 C2 (§5.3): shadows and hints installed for an answer not
     /// said to be committed by a sequencer that is not non-stealable
     /// (`Stats::ungated_shadows`, over every incarnation of every node).
@@ -1473,6 +1493,11 @@ pub struct Cluster {
     /// The idle tracker's releases: requested, answered (`wait`), refused or
     /// unanswered (`wait`), granted again.
     pub sticky_driver: Mutex<[u64; 4]>,
+    /// Plan 46 M1.3 step 13: when each generation's abandon was answered
+    /// (true elapsed ms), by `FaultKind::AbandonNode`.
+    pub abandoned_at: Mutex<BTreeMap<u64, u64>>,
+    /// The operator's abandons that went wrong (a seed failure).
+    pub operator_failures: Mutex<Vec<String>>,
 }
 
 impl Cluster {
@@ -1975,6 +2000,13 @@ async fn client_read(
         match handle.meta.read_delegations().valid(parent, now) {
             Some((held, renew)) => {
                 floor = held.position;
+                if held.epoch >= constellation_authority::DELEG_READ_EPOCH_BASE {
+                    history.deleg_read(
+                        handle.id,
+                        held.epoch - constellation_authority::DELEG_READ_EPOCH_BASE,
+                        handle.clock.elapsed_ms(),
+                    );
+                }
                 if renew {
                     drop(ask(handle));
                 }
@@ -3278,6 +3310,135 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             }
             note(format!("t={} could not undelegate {dir}", fault.at_ms));
         }
+        FaultKind::AbandonNode {
+            node,
+            force,
+            within_ms,
+        } => {
+            let t0 = cluster.env.clock.elapsed_ms();
+            let mut seen: BTreeSet<u64> = BTreeSet::new();
+            if force && cluster.get(node).alive() {
+                // The precondition of a forced abandon (the operator has
+                // confirmed the node is down) does not hold: a random fault
+                // got in the way of the configuration's crash. Not an abandon.
+                note(format!(
+                    "t={t0} node {node} is alive: the operator does not force the abandon"
+                ));
+                return;
+            }
+            while cluster.env.clock.elapsed_ms() < t0 + within_ms {
+                let root = read_lease(&cluster.env.bucket)
+                    .await
+                    .map(|l| l.holder)
+                    .filter(|h| *h != 0 && cluster.ids().contains(h) && cluster.get(*h).alive());
+                if let Some(root) = root.filter(|r| *r != node) {
+                    let h = cluster.get(root);
+                    let gens: Vec<u64> = h
+                        .view()
+                        .delegation
+                        .gens
+                        .iter()
+                        .filter(|g| g.1 == node && !g.6)
+                        .map(|g| g.2)
+                        .collect();
+                    seen.extend(gens.iter().copied());
+                    if force && cluster.get(node).alive() {
+                        // The root could not act while the node was down (a
+                        // restarted root is no usable root for a while): the
+                        // node is back, and the operator, who forces only a
+                        // node it confirmed down, does not abandon it.
+                        note(format!(
+                            "t={} node {node} is alive again: the operator does not force the abandon",
+                            cluster.env.clock.elapsed_ms()
+                        ));
+                        return;
+                    }
+                    if !gens.is_empty() {
+                        let r = tokio::time::timeout(
+                            Duration::from_secs(15),
+                            h.control(constellation_authority::Control::Abandon {
+                                target: constellation_authority::AbandonTarget::Node {
+                                    node,
+                                    gen: None,
+                                },
+                                force,
+                            }),
+                        )
+                        .await;
+                        match r {
+                            Ok(Ok(Ok(answer))) => {
+                                let at = cluster.env.clock.elapsed_ms();
+                                {
+                                    let mut m = cluster.abandoned_at.lock().unwrap();
+                                    for g in &gens {
+                                        m.insert(*g, at);
+                                    }
+                                }
+                                note(format!(
+                                    "t={at} repair abandon --node {node}{} on {root}: {answer:?}",
+                                    if force { " --force" } else { "" }
+                                ));
+                                return;
+                            }
+                            // Refused for the heard-lately window: the
+                            // operator waits and asks again.
+                            Ok(Ok(Err(e))) if e.contains("--force") && !force => {
+                                note(format!(
+                                    "t={} repair abandon --node {node} on {root} refused (asking again): {e}",
+                                    cluster.env.clock.elapsed_ms()
+                                ));
+                            }
+                            // The node that answered is not (or no longer)
+                            // the usable root: the operator asks the root
+                            // there is now.
+                            Ok(Ok(Err(e)))
+                                if e.contains("usable root")
+                                    || e.contains("no longer the root")
+                                    || e.contains("not the root of generation") =>
+                            {
+                                note(format!(
+                                    "t={} repair abandon --node {node} on {root} refused (asking again): {e}",
+                                    cluster.env.clock.elapsed_ms()
+                                ));
+                            }
+                            // The root restarted (the control's reply was
+                            // dropped) or did not answer in time: the
+                            // operator asks again.
+                            Ok(Err(_)) | Err(_) => {
+                                note(format!(
+                                    "t={} repair abandon --node {node} on {root}: no answer (asking again)",
+                                    cluster.env.clock.elapsed_ms()
+                                ));
+                            }
+                            // The stream ended meanwhile (its holder's
+                            // release, or an earlier try of this command
+                            // whose answer was lost): nothing left to abandon.
+                            // (The end is dated by this answer at the latest.)
+                            Ok(Ok(Err(e))) if e.contains("no live stream") => {
+                                let at = cluster.env.clock.elapsed_ms();
+                                let mut m = cluster.abandoned_at.lock().unwrap();
+                                for g in &seen {
+                                    m.entry(*g).or_insert(at);
+                                }
+                                return;
+                            }
+                            other => {
+                                cluster.operator_failures.lock().unwrap().push(format!(
+                                    "t={} repair abandon --node {node} on {root} refused: {other:?}",
+                                    cluster.env.clock.elapsed_ms()
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            note(format!(
+                "t={} could not abandon node {node}'s streams",
+                fault.at_ms
+            ));
+        }
         FaultKind::CrashHolder {
             restart_ms,
             keep_journal,
@@ -4563,6 +4724,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         holder_releases_before_drain: cfg.holder_releases_before_drain,
         refuse_forwarded_designation_ops: cfg.refuse_forwarded_designation_ops,
         partial_release_ends_stream: cfg.partial_release_ends_stream,
+        abandon_skips_read_recall: cfg.abandon_skips_read_recall,
         plant_claim_root_group_on_lone: cfg.plant_claim_root_group_on_lone,
     };
     env.world
@@ -4576,6 +4738,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         trunc: Mutex::new(Vec::new()),
         activity: Mutex::new(BTreeMap::new()),
         sticky_driver: Mutex::new([0; 4]),
+        abandoned_at: Mutex::new(BTreeMap::new()),
+        operator_failures: Mutex::new(Vec::new()),
         budget_exceeded: Mutex::new(Vec::new()),
         down: Mutex::new(BTreeMap::new()),
         s3_cut: Mutex::new(BTreeMap::new()),
@@ -4810,12 +4974,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     if let Some(w) = view.ack.waiting_for_group {
                         if w.waited_ms >= after_ms && done.insert((id, w.epoch)) {
                             fault_log.lock().unwrap().push(format!(
-                                "t={now_ms} node {id}: repair abandon-group --epoch {}",
+                                "t={now_ms} node {id}: repair abandon --epoch {}",
                                 w.epoch
                             ));
-                            drop(n.control(constellation_authority::Control::AbandonGroup {
-                                epoch: w.epoch,
-                                gen: 0,
+                            drop(n.control(constellation_authority::Control::Abandon {
+                                target: constellation_authority::AbandonTarget::Epoch(w.epoch),
                                 force: false,
                             }));
                         }
@@ -4832,13 +4995,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                         if now_ms.saturating_sub(since) < after_ms || !done.insert((id, gen)) {
                             continue;
                         }
-                        fault_log.lock().unwrap().push(format!(
-                            "t={now_ms} node {id}: repair abandon-group --gen {gen}"
-                        ));
+                        fault_log
+                            .lock()
+                            .unwrap()
+                            .push(format!("t={now_ms} node {id}: repair abandon --gen {gen}"));
                         let answer = |force| {
-                            n.control(constellation_authority::Control::AbandonGroup {
-                                epoch: 0,
-                                gen,
+                            n.control(constellation_authority::Control::Abandon {
+                                target: constellation_authority::AbandonTarget::Gen(gen),
                                 force,
                             })
                         };
@@ -4876,14 +5039,14 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                                     .all(|m| dead(m.node));
                                 if !(delegate_gone && members_dead) {
                                     operator_failures.lock().unwrap().push(format!(
-                                        "t={now_ms} node {id}: abandon-group --gen {gen} refused while the group \
+                                        "t={now_ms} node {id}: abandon --gen {gen} refused while the group \
                                          is not gone (delegate {delegate} gone: {delegate_gone}, strict members \
                                          dead: {members_dead}): {e}"
                                     ));
                                     continue;
                                 }
                                 fault_log.lock().unwrap().push(format!(
-                                    "t={now_ms} node {id}: repair abandon-group --gen {gen} --force (refused: {e})"
+                                    "t={now_ms} node {id}: repair abandon --gen {gen} --force (refused: {e})"
                                 ));
                                 match wait(answer(true)).await {
                                     Ok(Ok(r)) => r,
@@ -4912,7 +5075,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                                 }
                             }
                             Err(e) => operator_failures.lock().unwrap().push(format!(
-                                "t={now_ms} node {id}: abandon-group --gen {gen} refused: {e}"
+                                "t={now_ms} node {id}: abandon --gen {gen} refused: {e}"
                             )),
                         }
                     }
@@ -5676,13 +5839,14 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         return Ok(report);
     }
     // Plan 43 C2e: the operator ended a delegation generation whose group
-    // had not handed over its tail (`abandon-group --gen`): the rows only
+    // had not handed over its tail (`abandon --gen`): the rows only
     // that group held were acknowledged and are not in the log. That is what
     // the command costs, and what it says it costs; these runs count them
     // (`operator_lost`) and judge them tentative. Only runs the operator
     // acted in get the allowance.
     {
-        let failures = operator_failures.lock().unwrap();
+        let mut failures = operator_failures.lock().unwrap().clone();
+        failures.extend(cluster.operator_failures.lock().unwrap().iter().cloned());
         if !failures.is_empty() {
             return Err(format!(
                 "operator_abandon: {failures:?}\n  faults: {:?}",
@@ -5691,7 +5855,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         }
     }
     let mut operator_lost_rids: BTreeSet<Rid> = BTreeSet::new();
-    if !operator_abandoned.lock().unwrap().is_empty() {
+    if !operator_abandoned.lock().unwrap().is_empty()
+        || !cluster.abandoned_at.lock().unwrap().is_empty()
+    {
         let lost: Vec<Rid> = history
             .returned()
             .into_iter()
@@ -6312,6 +6478,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.sticky_core[8] += s.deleg_sticky_releases_partial;
         report.sticky_core[9] += s.deleg_sticky_release_held;
         report.sticky_core[10] += s.deleg_sticky_releases_given_up;
+        report.sticky_core[11] += s.deleg_abandons;
+        report.sticky_core[12] += s.deleg_abandon_read_waits;
+        report.sticky_core[13] += s.deleg_abandon_reads_recalled;
+        report.sticky_core[14] += s.deleg_abandon_reads_expired;
+        report.sticky_core[15] += s.deleg_abandon_superseded;
         sticky_recalled_other += s.deleg_sticky_recalled_other;
     }
     report.sticky_driver = *cluster.sticky_driver.lock().unwrap();
@@ -6347,6 +6518,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.settled_landings = found.i4.iter().filter(|m| m.starts_with("I4: rid")).count();
     let unsettled_violations = count_unsettled(&oracles, &mut report);
     report.non_lone_rollbacks = found.i5.len();
+    report.i5_operator = found.i5_operator.len();
     {
         let ord = std::sync::atomic::Ordering::Relaxed;
         report.lease_ttl_claims = oracles.leases.ttl_claims.load(ord);
@@ -6370,7 +6542,33 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.non_lone_rollbacks,
         report.sticky_core
     );
+    // Plan 46 M1.3 step 13 (C11): no read is served under a read delegation
+    // of a stream after the operator's abandon ended it. A strict read of a
+    // reader that served under `held` (epoch DELEG_READ_EPOCH_BASE + gen) at
+    // `ms` after the answer of the abandon of `gen` at `t0` is a violation.
+    let abandoned_at = cluster.abandoned_at.lock().unwrap().clone();
+    let read_violations: Vec<String> = history
+        .deleg_reads()
+        .into_iter()
+        .filter_map(|(node, gen, ms)| {
+            let t0 = *abandoned_at.get(&gen)?;
+            (ms > t0).then(|| {
+                format!(
+                    "no_read_under_an_abandoned_stream: a read on node {node} was served at t={ms} ms \
+                     under a read delegation of abandoned generation {gen}, after the abandon ended \
+                     it at t={t0} ms"
+                )
+            })
+        })
+        .collect();
+    if std::env::var_os("AUTHORITY_SIM_ORACLE_DEBUG").is_some() {
+        eprintln!(
+            "ORACLE-READS strict reads under a stream holder's read delegation: {:?}; abandoned at {abandoned_at:?}",
+            history.deleg_reads()
+        );
+    }
     for (strict, what, list) in [
+        (true, "no_read_under_an_abandoned_stream", &read_violations),
         (cfg.strict_commit, "I1", &found.i1),
         (cfg.strict_commit, "class claim", &found.class_claim),
         (cfg.strict_commit, "row version", &found.row_version),
