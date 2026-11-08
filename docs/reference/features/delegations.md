@@ -151,6 +151,21 @@ through the delegate. It then:
      budget answers nothing until its group holds the row: only latency
      degrades, never an acknowledged row. `delegation_stream_rows` (256) is
      the size of a stream batch.
+
+     What a far writer pays until a sticky grant: its own creates cost a
+     forward to the root, one WAN round trip (`harness run ack-latency`
+     topology 5, `CONSTELLATION_HARNESS_LOAD=net-wan`: create p50 122 ms, p90
+     145 ms; its other ops are answered from the requester's speculation as any
+     forward's, tens of microseconds, and `write` + `fsync` 3.1 ms), where the
+     deleted lone delegate answered them from its own disk in microseconds.
+     Topologies 1, 3 and 5 of the harness do not delegate to a far node (3's
+     delegate has the root within the budget and already waited for the
+     root's append; 5 runs with the placement off), so their numbers did not
+     move: 3's delegate create p50 693 to 672 us, rename 752 to 764 us, write
+     3.74 to 3.75 ms (btrfs), 672 to 667 us create, 796 to 790 us write
+     (tmpfs); topology 1's single-node ops are 30 to 130 us and vary by up to
+     45 % between two runs of the same binary (its `write` + `fsync` p50 3.12
+     to 3.11 ms on btrfs, 122 to 129 us on tmpfs).
    - A designation's rows are non-stealable and answer at once; `ack=s3` waits
      for the log.
 
