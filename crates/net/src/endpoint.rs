@@ -76,6 +76,13 @@ fn path_idle_timeout() -> Duration {
         .clamp(Duration::from_millis(300), PATH_IDLE_MAX)
 }
 
+/// How long a dial may run before the connections to its peer that hold
+/// none of iroh's selected path are closed (see [`Pool::unstick`]). A dial
+/// takes milliseconds (tens under load); one that is still going before
+/// QUIC retransmits its first packet (about 1 s) is stuck behind them, and
+/// closing them first lets that retransmission through.
+const DIAL_STUCK_AFTER: Duration = Duration::from_millis(600);
+
 /// `CONSTELLATION_P2P_DIAL_TIMEOUT_MS`, else [`DIAL_TIMEOUT`]; at least
 /// 500 ms.
 fn dial_timeout() -> Duration {
@@ -243,6 +250,11 @@ struct TestDial {
     /// The next `rejoin_fail` gossip rejoins fail; `rejoins` counts them.
     rejoin_fail: std::sync::atomic::AtomicUsize,
     rejoins: std::sync::atomic::AtomicUsize,
+    /// Overrides [`DIAL_STUCK_AFTER`].
+    stuck_after: Mutex<Option<Duration>>,
+    /// While set, only the connection with this stable id holds iroh's
+    /// selected path.
+    selected_only: Mutex<Option<usize>>,
 }
 
 #[cfg(test)]
@@ -261,6 +273,8 @@ impl Default for TestDial {
             fail: Default::default(),
             rejoin_fail: Default::default(),
             rejoins: Default::default(),
+            stuck_after: Mutex::default(),
+            selected_only: Mutex::default(),
         }
     }
 }
@@ -316,6 +330,16 @@ impl DialEntry {
 impl Drop for DialEntry {
     fn drop(&mut self) {
         self.remove();
+    }
+}
+
+/// The timer that closes what a dial is stuck behind; stopped with the
+/// dial, however it ends.
+struct StuckTimer(tokio::task::JoinHandle<()>);
+
+impl Drop for StuckTimer {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -601,6 +625,59 @@ impl Pool {
             list.push(conn.weak_handle());
         }
         !known
+    }
+
+    /// A dial to `id` has run too long: close its open connections that
+    /// hold none of iroh's selected path, and run the evict hook (the
+    /// gossip link among them is re-formed). iroh keeps one selected path
+    /// per peer and sends the first packets of every new connection to it
+    /// alone. It re-selects when a connection is added or a path event
+    /// arrives, not when one is closed. After `reset_using` closed the
+    /// connections that used a lost address, the selection can still be
+    /// that address while the ones left (gossip's, say) run over others:
+    /// they gave neither event, every dial to the peer timed out, and
+    /// nothing changed for as long as they lived (130 s and more in
+    /// `tests/addr_churn.rs` under load). With none left iroh drops the
+    /// selection and the dial's next retransmission goes to every address.
+    /// A connection that holds the selected path shows the selection is
+    /// a live one, and stays; so does one the peer's own re-dial added
+    /// since (the selection is re-made on its arrival), which is why this
+    /// waits for the dial to run long instead of closing them at once in
+    /// `reset_using`: the peer resets within a moment of us, and closing
+    /// what it dialed in between left it with a connection we had dropped.
+    fn unstick(
+        &self,
+        id: iroh::EndpointId,
+        selected: impl Fn(&iroh::endpoint::Connection) -> bool,
+    ) -> usize {
+        let stuck: Vec<iroh::endpoint::Connection> = self
+            .tracked
+            .lock()
+            .unwrap()
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .filter_map(|weak| weak.upgrade())
+            .filter(|conn| conn.close_reason().is_none() && !selected(conn))
+            .collect();
+        for conn in &stuck {
+            conn.close(
+                iroh::endpoint::VarInt::from_u32(0),
+                b"a dial to the peer is stuck behind this connection",
+            );
+        }
+        if !stuck.is_empty() {
+            tracing::info!(
+                peer = %id.fmt_short(),
+                closed = stuck.len(),
+                "a dial is stuck behind connections that lack iroh's selected path; closed them"
+            );
+            let hook = self.on_evict.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook(id);
+            }
+        }
+        stuck.len()
     }
 
     /// Plan 31 C8: close every pooled and tracked connection.
@@ -2457,6 +2534,14 @@ impl P2p {
         let limit = self.dial_timeout;
         #[cfg(test)]
         let test_dial = self.test_dial.clone();
+        #[cfg(test)]
+        let stuck_after = test_dial
+            .stuck_after
+            .lock()
+            .unwrap()
+            .unwrap_or(DIAL_STUCK_AFTER);
+        #[cfg(not(test))]
+        let stuck_after = DIAL_STUCK_AFTER;
         tokio::spawn(async move {
             // Out of the map however this task ends, a panic included.
             let mut entry = DialEntry {
@@ -2464,6 +2549,21 @@ impl P2p {
                 id: peer.id,
                 armed: true,
             };
+            let _stuck = StuckTimer(tokio::spawn({
+                let (pool, id) = (pool.clone(), peer.id);
+                #[cfg(test)]
+                let test_dial = test_dial.clone();
+                async move {
+                    tokio::time::sleep(stuck_after).await;
+                    pool.unstick(id, |conn| {
+                        #[cfg(test)]
+                        if let Some(only) = *test_dial.selected_only.lock().unwrap() {
+                            return conn.stable_id() == only;
+                        }
+                        conn.paths().iter().any(|path| path.is_selected())
+                    });
+                }
+            }));
             let dial = async {
                 #[cfg(test)]
                 test_dial.before().await?;
@@ -2647,6 +2747,25 @@ impl P2p {
     #[cfg(test)]
     pub(crate) async fn reset_using_for_test(&self) -> (usize, usize) {
         self.pool.reset_using(&HashSet::new(), "test reset").await
+    }
+
+    /// Make a dial that runs for `after` close the connections to its
+    /// peer other than `selected_only` (a stable id), which stands for
+    /// the one that holds iroh's selected path. For tests.
+    #[cfg(test)]
+    pub(crate) fn stick_dials_after(&self, after: Duration, selected_only: usize) {
+        *self.test_dial.stuck_after.lock().unwrap() = Some(after);
+        *self.test_dial.selected_only.lock().unwrap() = Some(selected_only);
+    }
+
+    /// A connection to `addr` dialed outside the pool (the handshake hook
+    /// still tracks it), for tests.
+    #[cfg(test)]
+    pub(crate) async fn connect_for_test(
+        &self,
+        addr: EndpointAddr,
+    ) -> Result<iroh::endpoint::Connection> {
+        Ok(self.endpoint.connect(addr, ALPN).await?)
     }
 
     /// Whether the pool holds a connection for `peer`, open or not.

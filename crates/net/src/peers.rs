@@ -3450,6 +3450,76 @@ mod tests {
         assert_eq!(inner.p2p.dialing_entries(), 0);
     }
 
+    /// A dial that runs long closes the peer's connections that hold no
+    /// iroh-selected path, and only those. iroh sends the first packets of
+    /// a new connection to the peer's one selected path and re-selects it
+    /// when a connection is added or a path event arrives, not when one is
+    /// closed. After a lost address the connections left open (gossip's)
+    /// could hold none of it while it was the lost address: every dial to
+    /// the peer timed out for as long as they lived (`tests/addr_churn.rs`,
+    /// 130 s and more under load).
+    #[tokio::test]
+    async fn a_dial_stuck_behind_connections_without_the_selected_path_closes_them() {
+        let topic = crate::topic_for(Some(&[3u8; 32]), "fs");
+        let holder = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        // Not enrolled with the holder through `Peers`, so the dialer
+        // learns no address of the holder but the one dialed here.
+        let dialer = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let holder_id = holder.addr().id;
+        let port = holder
+            .addr()
+            .addrs
+            .iter()
+            .find_map(|a| match a {
+                iroh::TransportAddr::Ip(sa) => Some(sa.port()),
+                _ => None,
+            })
+            .expect("the holder is bound");
+        let holder = Peers::new(holder, 1);
+        holder.refresh_registry(vec![(
+            2,
+            dialer.pubkey_hex(),
+            serde_json::to_value(dialer.addr()).unwrap(),
+        )]);
+        let serving = holder.clone();
+        tokio::spawn(async move { serving.serve(Arc::new(Recorder::default())).await });
+        let holder_addr = iroh::EndpointAddr {
+            id: holder_id,
+            addrs: [iroh::TransportAddr::Ip(
+                format!("127.0.0.1:{port}").parse().unwrap(),
+            )]
+            .into(),
+        };
+        // Two connections the dial did not make; one stands for the one
+        // that holds the selected path.
+        let selected = dialer.connect_for_test(holder_addr.clone()).await.unwrap();
+        let unselected = dialer.connect_for_test(holder_addr.clone()).await.unwrap();
+        dialer.stick_dials_after(Duration::from_millis(100), selected.stable_id());
+        // The dial is slower than that (and the test reads the outcome
+        // of the stuck timer, not of the dial).
+        dialer.inject_dial(Duration::from_millis(600), 0);
+        let ping = Payload::Ping { node_id: 2 };
+        let asked = dialer.request(holder_addr, &ping);
+        let (answer, closed) = tokio::join!(asked, async {
+            tokio::time::timeout(Duration::from_secs(5), unselected.closed())
+                .await
+                .is_ok()
+        });
+        assert!(answer.is_ok(), "the dial did not complete: {answer:?}");
+        assert!(
+            closed,
+            "the connection without the selected path stayed open under a stuck dial"
+        );
+        assert!(
+            selected.close_reason().is_none(),
+            "the connection that holds the selected path was closed"
+        );
+    }
+
     /// The same for `close_all` (a goodbye or a suspension).
     #[tokio::test]
     async fn a_close_all_during_a_dial_discards_the_connection() {
