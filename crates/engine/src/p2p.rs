@@ -895,7 +895,7 @@ impl constellation_net::PeerService for P2pBridge {
                 constellation_authority::ReadIndexOutcome::Busy
             };
             use constellation_authority::ReadIndexOutcome as O;
-            let (status, holder, position, grant, ahead_grants) = match outcome {
+            let (status, holder, gen, position, grant, ahead_grants) = match outcome {
                 O::Ok {
                     position,
                     grant,
@@ -903,19 +903,26 @@ impl constellation_net::PeerService for P2pBridge {
                 } => (
                     0,
                     0,
+                    0,
                     position,
                     grant.map(|g| (g.id, g.ttl_ms, g.epoch)),
                     ahead.map(|a| (a.ttl_ms, a.epoch, a.grants)),
                 ),
-                O::NotHolder { holder } => {
-                    (1, holder, constellation_meta::Position::ZERO, None, None)
-                }
-                O::Busy => (2, 0, constellation_meta::Position::ZERO, None, None),
+                O::NotHolder { holder, gen } => (
+                    1,
+                    holder,
+                    gen,
+                    constellation_meta::Position::ZERO,
+                    None,
+                    None,
+                ),
+                O::Busy => (2, 0, 0, constellation_meta::Position::ZERO, None, None),
             };
             constellation_net::Payload::ReadIndexReply {
                 req_id,
                 status,
                 holder,
+                gen,
                 position_seq: position.seq,
                 position_pending: position.pending.map(|p| (p.epoch, p.jseq)),
                 grant,

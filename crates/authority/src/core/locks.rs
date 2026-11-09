@@ -757,7 +757,11 @@ enum Route {
         cap_ms: i64,
         gen: u64,
     },
-    Node(NodeId),
+    /// Another node owns it: where to ask, and the generation of the
+    /// delegation it is the delegate of (0: the lease holder, the root).
+    /// A delegate is a route, never the holder of the lease: an answer
+    /// naming one carries the generation, so the asker does not cache it.
+    Node(NodeId, u64),
     Unknown,
 }
 
@@ -885,7 +889,7 @@ impl Core {
         renewal: bool,
     ) -> Route {
         match self.lock_route_for(now, ino, replica, renewal) {
-            Route::Node(n) if n == from => Route::Unknown,
+            Route::Node(n, _) if n == from => Route::Unknown,
             route => route,
         }
     }
@@ -948,7 +952,7 @@ impl Core {
                         // its own table (its journal ended the generation
                         // before this table hears of it).
                         _ => match self.deleg_handed_back_to(d.gen) {
-                            Some(root) => Route::Node(root),
+                            Some(root) => Route::Node(root, 0),
                             // Not installed or renewed yet: a request here
                             // would be answered `NotOwner{me}`; wait a tick.
                             None => Route::Unknown,
@@ -956,9 +960,9 @@ impl Core {
                     };
                 }
                 if let Some(&to) = self.lk.deleg_moved.get(&d.gen) {
-                    return Route::Node(to);
+                    return Route::Node(to, d.gen);
                 }
-                return Route::Node(d.node);
+                return Route::Node(d.node, d.gen);
             }
         }
         if self.lease.usable(now, &self.cfg)
@@ -992,7 +996,7 @@ impl Core {
             .cached_holder
             .filter(|h| *h != 0 && *h != self.cfg.node_id)
         {
-            Some(h) => Route::Node(h),
+            Some(h) => Route::Node(h, 0),
             None => Route::Unknown,
         }
     }
@@ -1684,7 +1688,7 @@ impl Core {
             PeerMsg::LockRenewed { results, .. } => {
                 for (_, _, r) in results.iter_mut() {
                     if matches!(r, LockRenewResult::Ok { .. }) {
-                        *r = LockRenewResult::NotOwner { owner: 0 };
+                        *r = LockRenewResult::NotOwner { owner: 0, gen: 0 };
                     }
                 }
                 true
@@ -1712,7 +1716,7 @@ impl Core {
     ) -> Served {
         let (cap_ms, gen) = match self.lock_route_answering(now, ino, replica, from, false) {
             Route::Me { cap_ms, gen } => (cap_ms, gen),
-            Route::Node(n) => return Served::Outcome(LockOutcome::NotOwner { owner: n }),
+            Route::Node(n, gen) => return Served::Outcome(LockOutcome::NotOwner { owner: n, gen }),
             Route::Unknown if self.lock_owner_resuming(now) => {
                 // This node is the owner again in a moment (an epoch's
                 // close re-claims the lease it let go, or the gate of the
@@ -1748,7 +1752,7 @@ impl Core {
                     grace: false,
                 });
             }
-            Route::Unknown => return Served::Outcome(LockOutcome::NotOwner { owner: 0 }),
+            Route::Unknown => return Served::Outcome(LockOutcome::NotOwner { owner: 0, gen: 0 }),
         };
         // Plan 30 §M9: a tenure that may be taken over before its lease
         // expires grants only with fresh S3 liveness, and only once the
@@ -3444,8 +3448,8 @@ impl Core {
     ) -> Again {
         let (cap_ms, gen) = match self.lock_route_answering(now, ino, replica, from, false) {
             Route::Me { cap_ms, gen } => (cap_ms, gen),
-            Route::Node(n) => return Again::Answer(LockOutcome::NotOwner { owner: n }),
-            Route::Unknown => return Again::Answer(LockOutcome::NotOwner { owner: 0 }),
+            Route::Node(n, gen) => return Again::Answer(LockOutcome::NotOwner { owner: n, gen }),
+            Route::Unknown => return Again::Answer(LockOutcome::NotOwner { owner: 0, gen: 0 }),
         };
         let root_owned = self.lock_route_is_root(now, ino, replica);
         if root_owned
@@ -3742,12 +3746,12 @@ impl Core {
         self.lock_peer_heard(from, false);
         let (cap_ms, gen) = match self.lock_route_answering(now, ino, replica, from, true) {
             Route::Me { cap_ms, gen } => (cap_ms, gen),
-            Route::Node(n) => return LockRenewResult::NotOwner { owner: n },
-            Route::Unknown => return LockRenewResult::NotOwner { owner: 0 },
+            Route::Node(n, gen) => return LockRenewResult::NotOwner { owner: n, gen },
+            Route::Unknown => return LockRenewResult::NotOwner { owner: 0, gen: 0 },
         };
         let ttl = self.lock_ttl_ms().min(cap_ms);
         if ttl <= 0 {
-            return LockRenewResult::NotOwner { owner: 0 };
+            return LockRenewResult::NotOwner { owner: 0, gen: 0 };
         }
         // A release that let the lease go unmarked told its taker that
         // this tenure leaves no grant behind, and the taker grants at once
@@ -3759,7 +3763,7 @@ impl Core {
         // release, beside the taker's grants. The holder relearns the
         // owner.
         if gen == 0 && self.release_unmarked_in_flight() {
-            return LockRenewResult::NotOwner { owner: 0 };
+            return LockRenewResult::NotOwner { owner: 0, gen: 0 };
         }
         // Plan 41 L0: the root extends a window only as far as a fresh
         // owner may promise one. A tenure that can be taken over before
@@ -3791,7 +3795,7 @@ impl Core {
                 // The final mirror of this lease went: nothing is added
                 // under it, and a late admission is an add.
                 self.stats.lock_late_refused += 1;
-                return LockRenewResult::NotOwner { owner: 0 };
+                return LockRenewResult::NotOwner { owner: 0, gen: 0 };
             }
             let waiter = self
                 .lk
@@ -3958,7 +3962,7 @@ impl Core {
                     None => LockTestOutcome::Free,
                 }
             }
-            Route::Node(n) => LockTestOutcome::NotOwner { owner: n },
+            Route::Node(n, _) => LockTestOutcome::NotOwner { owner: n },
             Route::Unknown => LockTestOutcome::NotOwner { owner: 0 },
         };
         out.push(Action::Send {
@@ -3995,7 +3999,7 @@ impl Core {
                     result: Ok(ControlOk::LockTest(answer)),
                 });
             }
-            Route::Node(n) if self.cfg.p2p && self.reaches(now, n) => {
+            Route::Node(n, _) if self.cfg.p2p && self.reaches(now, n) => {
                 let req = self.op_id();
                 self.lk.tests.insert(op, req);
                 self.lk.test_by_req.insert(req, op);
@@ -4172,7 +4176,7 @@ impl Core {
         let mut route = self.lock_route(now, ino, replica);
         // The table's route led to a dead end last time: ask the lease, as
         // for an unknown owner (`lock_delegated_dead_end`).
-        if let (Route::Node(_), Some(o)) = (&route, self.lk.ops.get_mut(&op)) {
+        if let (Route::Node(..), Some(o)) = (&route, self.lk.ops.get_mut(&op)) {
             if std::mem::take(&mut o.ask_lease) {
                 route = Route::Unknown;
             }
@@ -4207,7 +4211,7 @@ impl Core {
                     Served::Parked => {}
                 }
             }
-            Route::Node(n) => {
+            Route::Node(n, _) => {
                 if !self.cfg.p2p || !self.reaches(now, n) {
                     if !self.lock_reread_holder(now, op, replica, out) {
                         self.lock_op_unreachable(now, op, replica, out);
@@ -5138,7 +5142,7 @@ impl Core {
                     result: Ok(ControlOk::Lock(LockAnswer::WouldBlock)),
                 });
             }
-            LockOutcome::NotOwner { owner } => {
+            LockOutcome::NotOwner { owner, gen } => {
                 let ino = o.ino;
                 // Two nodes that each name the other (`from` names the
                 // node that sent this op to `from`): neither holds the
@@ -5159,7 +5163,12 @@ impl Core {
                 }
                 self.lock_note_not_owner(from, ino, owner, replica);
                 if owner != 0 && owner != from && owner != self.cfg.node_id {
-                    let names_delegate = replica.delegation_table().iter().any(|e| e.node == owner);
+                    // A delegate is a route, not the lease holder; an answer
+                    // that carries a generation names one even when this
+                    // node's table lags (cached, later ops would go to a
+                    // designee unmarked: I1).
+                    let names_delegate =
+                        gen != 0 || replica.delegation_table().iter().any(|e| e.node == owner);
                     if !names_delegate {
                         self.lease.cached_holder = Some(owner);
                     }
@@ -5417,7 +5426,7 @@ impl Core {
                     }
                     self.lock_renew_authority(now, out);
                 }
-                Route::Node(n) if self.cfg.p2p && self.reaches(now, n) => {
+                Route::Node(n, _) if self.cfg.p2p && self.reaches(now, n) => {
                     by_owner.entry(n).or_default().push((ino, h, late));
                 }
                 route => {
@@ -5429,7 +5438,7 @@ impl Core {
                     tracing::debug!(
                         node = self.cfg.node_id,
                         ino,
-                        unreachable = matches!(route, Route::Node(_)),
+                        unreachable = matches!(route, Route::Node(..)),
                         "lock renewal: no reachable owner; relearning"
                     );
                     replica.locks().renewal_failed(ino, h.id);
@@ -5542,6 +5551,7 @@ impl Core {
     fn lock_ask_again(&self) -> LockRenewResult {
         LockRenewResult::NotOwner {
             owner: self.cfg.node_id,
+            gen: 0,
         }
     }
 
@@ -5706,8 +5716,9 @@ impl Core {
                     replica.locks().renewal_failed(ino, id);
                 }
             }
-            LockRenewResult::NotOwner { owner } => {
-                let names_delegate = replica.delegation_table().iter().any(|e| e.node == owner);
+            LockRenewResult::NotOwner { owner, gen } => {
+                let names_delegate =
+                    gen != 0 || replica.delegation_table().iter().any(|e| e.node == owner);
                 if owner != 0 && owner != self.cfg.node_id && !names_delegate {
                     self.lease.cached_holder = Some(owner);
                 } else if owner == 0
@@ -6144,7 +6155,7 @@ impl Core {
                 let me = self.cfg.node_id;
                 self.on_lock_released(now, me, ino, grant, position, replica, out);
             }
-            Route::Node(n) => out.push(Action::Send {
+            Route::Node(n, _) => out.push(Action::Send {
                 to: n,
                 msg: PeerMsg::LockReleased {
                     ino,
@@ -7570,7 +7581,7 @@ impl Core {
                 grace: false,
             }
         } else {
-            LockOutcome::NotOwner { owner: 0 }
+            LockOutcome::NotOwner { owner: 0, gen: 0 }
         };
         let waiters = std::mem::take(&mut self.lk.waiters);
         for w in waiters {

@@ -1460,7 +1460,7 @@ mod tests {
             at(2_100),
             LaneEvent::Answered {
                 req: *req,
-                results: vec![(8, id, LockRenewResult::NotOwner { owner: 5 })],
+                results: vec![(8, id, LockRenewResult::NotOwner { owner: 5, gen: 0 })],
             },
             &t,
             &f,
@@ -1468,7 +1468,7 @@ mod tests {
         assert_eq!(t.held(8).unwrap().until, before, "nothing extended");
         assert!(
             matches!(out.as_slice(), [LaneAction::Renewed { results, .. }]
-            if matches!(results[0].2, LockRenewResult::NotOwner { owner: 5 }))
+            if matches!(results[0].2, LockRenewResult::NotOwner { owner: 5, gen: 0 }))
         );
         // (The core clears the mark when it applies the result; if it does
         // not get to it, the mark goes stale and the lane asks again.)

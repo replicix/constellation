@@ -1250,7 +1250,10 @@ pub enum ReadIndexOutcome {
         ahead: Option<Box<AheadGrants>>,
     },
     /// Not the holder (`holder`: whom it believes holds, 0 unknown).
-    NotHolder { holder: NodeId },
+    /// `gen` is the generation of the delegation `holder` is the delegate
+    /// of, when the answer is the root naming a delegate (0: the lease
+    /// holder): that node is a route, never to be cached as the holder.
+    NotHolder { holder: NodeId, gen: u64 },
     /// The holder, but fenced (its takeover gate, or a release in
     /// progress): ask again shortly.
     Busy,
@@ -1365,8 +1368,11 @@ pub enum LockOutcome {
     /// A conflicting grant is held elsewhere (recalled now); a
     /// non-blocking request.
     WouldBlock,
-    /// Ask `owner` (0: unknown; read the lease).
-    NotOwner { owner: NodeId },
+    /// Ask `owner` (0: unknown; read the lease). `gen`: the generation of
+    /// the delegation `owner` is the delegate of, when the answer names a
+    /// delegate (0: the lease holder): a route, never to be cached as the
+    /// holder.
+    NotOwner { owner: NodeId, gen: u64 },
     /// Try again shortly (the owner is between tenures, or probing).
     Busy,
 }
@@ -1413,9 +1419,8 @@ pub enum LockRenewResult {
     /// The owner does not know it (and no grace admits a reclaim): it is
     /// lost; I/O under it is fenced.
     Lost,
-    NotOwner {
-        owner: NodeId,
-    },
+    /// `gen`: as [`LockOutcome::NotOwner`].
+    NotOwner { owner: NodeId, gen: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

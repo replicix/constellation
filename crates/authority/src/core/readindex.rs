@@ -357,13 +357,16 @@ impl Core {
         // Phase 2b: keys under another node's live delegation have that
         // delegate's index, not the holder's (a stale requester's table):
         // send it there, and never grant a read delegation over them.
-        if let Some(n) = self.deleg_read_owner(now, ino, name.as_deref(), replica) {
+        if let Some((n, gen)) = self.deleg_read_owner_gen(now, ino, name.as_deref(), replica) {
             if n != self.cfg.node_id {
+                // The redirect carries the delegation's generation: the
+                // requester's table may not list the delegate yet, and a
+                // delegate is a route, never the lease holder.
                 out.push(Action::Send {
                     to: from,
                     msg: PeerMsg::ReadIndexReply {
                         req,
-                        outcome: ReadIndexOutcome::NotHolder { holder: n },
+                        outcome: ReadIndexOutcome::NotHolder { holder: n, gen },
                     },
                 });
                 return;
@@ -376,7 +379,7 @@ impl Core {
                 .cached_holder
                 .filter(|h| *h != self.cfg.node_id)
                 .unwrap_or(0);
-            ReadIndexOutcome::NotHolder { holder }
+            ReadIndexOutcome::NotHolder { holder, gen: 0 }
         } else if self.lease.fenced() {
             self.stats.read_index_refused += 1;
             ReadIndexOutcome::Busy
@@ -2658,12 +2661,15 @@ impl Core {
                     out,
                 );
             }
-            ReadIndexOutcome::NotHolder { holder } => {
+            ReadIndexOutcome::NotHolder { holder, gen } => {
                 let redirect = holder != 0 && holder != from && holder != self.cfg.node_id;
                 // Phase 2b: a redirect to a delegate is a route, not the
-                // lease holder.
-                let names_delegate =
-                    holder != 0 && replica.delegation_table().iter().any(|e| e.node == holder);
+                // lease holder. One that carries a generation is the root
+                // naming a delegation even when this node's table lags:
+                // cached, it would route later ops to a designee unmarked
+                // (I1).
+                let names_delegate = holder != 0
+                    && (gen != 0 || replica.delegation_table().iter().any(|e| e.node == holder));
                 if redirect && !r.redirected {
                     r.redirected = true;
                     // Whoever answers after a redirect answers the plain read.

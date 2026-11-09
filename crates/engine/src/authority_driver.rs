@@ -5337,6 +5337,7 @@ impl Driver {
                             req_id,
                             status,
                             holder,
+                            gen,
                             position_seq,
                             position_pending,
                             grant,
@@ -5366,7 +5367,7 @@ impl Driver {
                                     }),
                                 },
                                 2 => ReadIndexOutcome::Busy,
-                                _ => ReadIndexOutcome::NotHolder { holder },
+                                _ => ReadIndexOutcome::NotHolder { holder, gen },
                             };
                             let _ = tx.send(Internal::Event(Event::Peer {
                                 from: to,

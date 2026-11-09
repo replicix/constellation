@@ -8519,7 +8519,7 @@ mod cto {
             from: 1,
             msg: PeerMsg::ReadIndexReply {
                 req: first,
-                outcome: ReadIndexOutcome::NotHolder { holder: 3 },
+                outcome: ReadIndexOutcome::NotHolder { holder: 3, gen: 0 },
             },
         });
         let second = match sends(&out).as_slice() {
@@ -9245,6 +9245,45 @@ mod cto {
 
     // ---- the reader ----
 
+    /// A strict read's redirect to a delegate that carries a generation (the
+    /// root naming a designation) is followed but not cached as the lease
+    /// holder, even when this node's table does not list the delegate: the
+    /// next op would go to the designee unmarked (I1). Fails without the
+    /// generation check: the cache names node 3.
+    #[test]
+    fn a_read_index_redirect_to_a_designee_is_not_cached_as_the_lease_holder() {
+        let mut r = reader();
+        let req = read_control(&mut r, 50, 42);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReadIndexReply {
+                req,
+                outcome: ReadIndexOutcome::NotHolder { holder: 3, gen: 7 },
+            },
+        });
+        assert!(
+            matches!(sends(&out).as_slice(), [(3, PeerMsg::ReadIndex { .. })]),
+            "the read was not redirected to the designee: {out:?}"
+        );
+        assert_eq!(r.core.lease.cached_holder, Some(1));
+    }
+
+    /// A redirect without a generation names the lease holder (a deposed
+    /// root naming the new one): cached, as before.
+    #[test]
+    fn a_read_index_redirect_to_the_lease_holder_is_cached() {
+        let mut r = reader();
+        let req = read_control(&mut r, 50, 42);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReadIndexReply {
+                req,
+                outcome: ReadIndexOutcome::NotHolder { holder: 3, gen: 0 },
+            },
+        });
+        assert_eq!(r.core.lease.cached_holder, Some(3));
+    }
+
     fn reader() -> Harness {
         let mut r = Harness::new(2);
         r.core.lease.cached_holder = Some(1);
@@ -9620,7 +9659,7 @@ mod cto {
         assert!(
             matches!(
                 ask(&mut h, 2, 40, file),
-                ReadIndexOutcome::NotHolder { holder: 3 }
+                ReadIndexOutcome::NotHolder { holder: 3, gen: g } if g == gen
             ),
             "the root answered for the delegated file"
         );
@@ -17531,7 +17570,7 @@ mod locks {
         assert!(
             matches!(
                 renew(&mut h, f).as_slice(),
-                [(_, _, LockRenewResult::NotOwner { owner: 3 })]
+                [(_, _, LockRenewResult::NotOwner { owner: 3, gen: 7 })]
             ),
             "renewed by the root inside a delegated subtree"
         );
@@ -20370,7 +20409,7 @@ mod locks {
         let out = renew(&mut h, 3, 41, ino, unknown);
         assert_eq!(
             renewed(&out, 3),
-            Some(vec![LockRenewResult::NotOwner { owner: 1 }]),
+            Some(vec![LockRenewResult::NotOwner { owner: 1, gen: 0 }]),
             "{out:?}"
         );
     }
@@ -20559,7 +20598,7 @@ mod locks {
         assert!(
             matches!(
                 renewed(&out, 2).as_deref(),
-                Some([LockRenewResult::NotOwner { owner: 0 }])
+                Some([LockRenewResult::NotOwner { owner: 0, gen: 0 }])
             ),
             "{out:?}"
         );
@@ -24245,6 +24284,77 @@ mod locks {
 
     // ---- the node side ----
 
+    /// A lock request's `NotOwner` naming a delegate (it carries the
+    /// delegation's generation) is followed but not cached as the lease
+    /// holder, even when this node's table does not list the delegate: the
+    /// next op would go to the designee unmarked (I1). Fails without the
+    /// generation check: the cache names node 3.
+    #[test]
+    fn a_lock_not_owner_naming_a_designee_is_not_cached_as_the_lease_holder() {
+        let mut r = requester();
+        let req = lock_control(&mut r, 51, 43, false);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: LockOutcome::NotOwner { owner: 3, gen: 7 },
+            },
+        });
+        assert_eq!(r.core.lease.cached_holder, Some(1));
+        let retry = timer_of(&out, TimerKind::LockRetry);
+        let out = r.step(Event::Timer { id: retry });
+        assert!(
+            sends(&out)
+                .iter()
+                .all(|(to, m)| !matches!(m, PeerMsg::LockRequest { .. }) || *to != 3),
+            "the retry went to the designee: {out:?}"
+        );
+    }
+
+    /// The same for a renewal's `NotOwner`: with a generation it names a
+    /// delegate, not cached; without, the lease holder, cached.
+    #[test]
+    fn a_renewal_not_owner_naming_a_designee_is_not_cached_as_the_lease_holder() {
+        for (gen, cached) in [(7, Some(1)), (0, Some(3))] {
+            let mut r = requester();
+            let req = lock_control(&mut r, 50, 42, true);
+            r.advance(10);
+            let out = r.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::LockReply {
+                    req,
+                    outcome: grant_msg(1),
+                },
+            });
+            assert!(matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }));
+            let mut tick = timer_of(&out, TimerKind::LockRenewTick);
+            let renew = loop {
+                r.now = r.core.timer_ms(tick).expect("armed");
+                let out = r.step(Event::Timer { id: tick });
+                if let Some(req) = sends(&out).into_iter().find_map(|(to, m)| match m {
+                    PeerMsg::LockRenew { req, .. } if to == 1 => Some(*req),
+                    _ => None,
+                }) {
+                    break req;
+                }
+                tick = timer_of(&out, TimerKind::LockRenewTick);
+            };
+            r.advance(5);
+            r.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::LockRenewed {
+                    req: renew,
+                    results: vec![(
+                        42,
+                        GrantId { node: 1, seq: 1 },
+                        LockRenewResult::NotOwner { owner: 3, gen },
+                    )],
+                },
+            });
+            assert_eq!(r.core.lease.cached_holder, cached, "gen {gen}");
+        }
+    }
+
     fn requester() -> Harness {
         let mut r = Harness::new(2);
         r.core.lease.cached_holder = Some(1);
@@ -24808,7 +24918,10 @@ mod locks {
                 results[0].2
             };
             if !installed {
-                assert_eq!(renew(&mut h), LockRenewResult::NotOwner { owner: 0 });
+                assert_eq!(
+                    renew(&mut h),
+                    LockRenewResult::NotOwner { owner: 0, gen: 0 }
+                );
             }
             h.step(Event::Peer {
                 from: 1,
@@ -24820,14 +24933,14 @@ mod locks {
             });
             assert_eq!(
                 renew(&mut h),
-                LockRenewResult::NotOwner { owner: 1 },
+                LockRenewResult::NotOwner { owner: 1, gen: 0 },
                 "installed {installed}"
             );
             let out = request(&mut h, 2, 9, f, X, true);
             assert!(
                 matches!(
                     lock_replies(&out).as_slice(),
-                    [(2, OpId(9), LockOutcome::NotOwner { owner: 1 })]
+                    [(2, OpId(9), LockOutcome::NotOwner { owner: 1, gen: 0 })]
                 ),
                 "installed {installed}: {out:?}"
             );
@@ -24930,11 +25043,21 @@ mod locks {
             id: GrantId { node: 3, seq: 1 },
             mode: X,
         };
-        tick = renew_at(&mut r, tick, 3, LockRenewResult::NotOwner { owner: 1 });
+        tick = renew_at(
+            &mut r,
+            tick,
+            3,
+            LockRenewResult::NotOwner { owner: 1, gen: 0 },
+        );
         tick = renew_at(&mut r, tick, 1, ok());
         let until = r.meta.locks().held(f).expect("held").until.0;
         assert!(until > r.now.0 + 3_000, "not renewed by the root");
-        tick = renew_at(&mut r, tick, 1, LockRenewResult::NotOwner { owner: 3 });
+        tick = renew_at(
+            &mut r,
+            tick,
+            1,
+            LockRenewResult::NotOwner { owner: 3, gen: 0 },
+        );
         renew_at(&mut r, tick, 3, ok());
     }
 
@@ -26169,7 +26292,10 @@ mod locks {
         let out = renew(&mut h, 2, 20, ino, GrantId { node: 5, seq: 9 });
         let results = renewed(&out, 2).expect("no answer");
         assert!(
-            matches!(results.as_slice(), [LockRenewResult::NotOwner { owner: 0 }]),
+            matches!(
+                results.as_slice(),
+                [LockRenewResult::NotOwner { owner: 0, gen: 0 }]
+            ),
             "renewed under an unmarked release: {results:?}"
         );
         assert_eq!(h.meta.locks().grants_len(), 0, "reclaimed");
@@ -27381,7 +27507,7 @@ mod locks {
             from: 1,
             msg: PeerMsg::LockReply {
                 req,
-                outcome: LockOutcome::NotOwner { owner: 3 },
+                outcome: LockOutcome::NotOwner { owner: 3, gen: 0 },
             },
         });
         assert_eq!(r.core.lease.cached_holder, Some(3));
@@ -27494,7 +27620,7 @@ mod locks {
             from: 1,
             msg: PeerMsg::LockReply {
                 req,
-                outcome: LockOutcome::NotOwner { owner: 3 },
+                outcome: LockOutcome::NotOwner { owner: 3, gen: 0 },
             },
         });
         assert_eq!(r.core.lease.cached_holder, Some(3));
@@ -27508,7 +27634,7 @@ mod locks {
             from: 3,
             msg: PeerMsg::LockReply {
                 req,
-                outcome: LockOutcome::NotOwner { owner: 1 },
+                outcome: LockOutcome::NotOwner { owner: 1, gen: 0 },
             },
         });
         assert_eq!(r.core.stats.lock_not_owner_bounces, 1);
@@ -27977,7 +28103,8 @@ mod locks {
         let mut h = requester();
         h.core.lease.cached_holder = Some(3);
         let out = request(&mut h, 3, 7, 42, X, true);
-        let [(3, OpId(7), LockOutcome::NotOwner { owner: 0 })] = lock_replies(&out).as_slice()
+        let [(3, OpId(7), LockOutcome::NotOwner { owner: 0, gen: 0 })] =
+            lock_replies(&out).as_slice()
         else {
             panic!("named the requester as the owner: {out:?}")
         };
@@ -27988,7 +28115,7 @@ mod locks {
             from: 1,
             msg: PeerMsg::LockReply {
                 req,
-                outcome: LockOutcome::NotOwner { owner: 2 },
+                outcome: LockOutcome::NotOwner { owner: 2, gen: 0 },
             },
         });
         assert_eq!(r.core.lease.cached_holder, None, "kept the stale holder");
@@ -28400,7 +28527,7 @@ mod locks {
         assert!(
             matches!(
                 renewed.as_slice(),
-                [(_, _, LockRenewResult::NotOwner { owner: 0 })]
+                [(_, _, LockRenewResult::NotOwner { owner: 0, gen: 0 })]
             ),
             "{renewed:?}"
         );
@@ -29131,7 +29258,7 @@ mod locks {
         assert!(
             matches!(
                 lock_replies(&out).as_slice(),
-                [(3, OpId(30), LockOutcome::NotOwner { owner: 0 })]
+                [(3, OpId(30), LockOutcome::NotOwner { owner: 0, gen: 0 })]
             ),
             "{out:?}"
         );
@@ -31169,7 +31296,7 @@ mod locks {
                 results: vec![(
                     42,
                     GrantId { node: 1, seq: 1 },
-                    LockRenewResult::NotOwner { owner: 0 },
+                    LockRenewResult::NotOwner { owner: 0, gen: 0 },
                 )],
             },
         });
@@ -31230,7 +31357,7 @@ mod locks {
                 results: vec![(
                     42,
                     GrantId { node: 1, seq: 1 },
-                    LockRenewResult::NotOwner { owner: 1 },
+                    LockRenewResult::NotOwner { owner: 1, gen: 0 },
                 )],
             },
         });
@@ -31504,7 +31631,7 @@ mod locks {
         let out = answer_probe(&mut h, probe, Some(4));
         assert_eq!(
             renewed_of(&out, 2).as_deref(),
-            Some(&[(ino, g2, LockRenewResult::NotOwner { owner: 0 })][..]),
+            Some(&[(ino, g2, LockRenewResult::NotOwner { owner: 0, gen: 0 })][..]),
             "{out:?}"
         );
         assert!(h.core.lease.lost, "deposed by the read");
@@ -39159,7 +39286,11 @@ mod redelegated_to_the_requester {
             from: 1,
             msg: PeerMsg::LockRenewed {
                 req: s.renew,
-                results: vec![(s.target, GRANT, LockRenewResult::NotOwner { owner: 0 })],
+                results: vec![(
+                    s.target,
+                    GRANT,
+                    LockRenewResult::NotOwner { owner: 0, gen: 0 },
+                )],
             },
         })
     }
@@ -39171,7 +39302,7 @@ mod redelegated_to_the_requester {
             from: 1,
             msg: PeerMsg::LockReply {
                 req: s.lock_req,
-                outcome: LockOutcome::NotOwner { owner: 0 },
+                outcome: LockOutcome::NotOwner { owner: 0, gen: 0 },
             },
         })
     }
@@ -39373,7 +39504,7 @@ mod delegated_lock_dead_end {
             from,
             msg: PeerMsg::LockReply {
                 req,
-                outcome: LockOutcome::NotOwner { owner },
+                outcome: LockOutcome::NotOwner { owner, gen: 0 },
             },
         });
         let t = timers(&out, TimerKind::LockRetry)[0];
@@ -51303,7 +51434,7 @@ mod lock_lane_core_tests {
         h.step(Event::LaneRenewed {
             from: 3,
             sent,
-            results: vec![(7, id, crate::LockRenewResult::NotOwner { owner: 0 })],
+            results: vec![(7, id, crate::LockRenewResult::NotOwner { owner: 0, gen: 0 })],
         });
         assert_eq!(h.core.stats.lock_lane_results, 1);
         // The core's `NotOwner { 0 }` path ran: the owner it had cached for a
@@ -64827,6 +64958,48 @@ mod step5_sticky_release {
             vec![1],
             "the second op was not sent to the root: {out:?}"
         );
+    }
+
+    /// Whatever named the target (any cache setter), a fresh rid forwarded
+    /// to a node other than the holder the lease object names is marked as
+    /// possibly sent to a designee, so the root's refusal is held, not
+    /// final (I1); one forwarded to the lease holder is not. Fails without
+    /// the guard in `send_forward`: the table does not list node 3.
+    #[test]
+    fn a_rid_forwarded_to_a_node_the_lease_does_not_name_is_marked() {
+        for (cached, marked) in [(3, true), (1, false)] {
+            let mut h = Harness::new(2);
+            h.core.cfg.delegation = true;
+            h.core.cfg.p2p = true;
+            h.core.cfg.inbox = true;
+            h.step(links_event(&[1, 3]));
+            h.core.lease.last_seen = Some(lease_of(1, 1, h.now.0 + 600_000));
+            h.core.lease.cached_holder = Some(cached);
+            let (dir, rec) = mkdir(&h, "a");
+            Replica::install_streamed(&h.meta, 1, 1, 1, 1, &[rec], true, (0, 0)).unwrap();
+            let rid = h.rid(1);
+            let op = MutateOp::Create {
+                parent: dir,
+                name: "f".into(),
+                ino: h.meta.allocate_ino(dir).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            };
+            let out = h.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op,
+                tag: Default::default(),
+            });
+            assert!(
+                sends(&out)
+                    .iter()
+                    .any(|(to, m)| *to == cached && matches!(m, PeerMsg::MutateRequest { .. })),
+                "not sent to node {cached}: {out:?}"
+            );
+            assert_eq!(h.core.clients[&rid].sent_to_delegate, marked, "{cached}");
+        }
     }
 
     /// A redirect to the lease holder (a deposed root naming the new one:

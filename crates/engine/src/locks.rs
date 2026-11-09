@@ -2505,7 +2505,10 @@ pub fn outcome_wire(o: &LockOutcome) -> LockOutcomeWire {
             grace: *grace,
         },
         LockOutcome::WouldBlock => LockOutcomeWire::WouldBlock,
-        LockOutcome::NotOwner { owner } => LockOutcomeWire::NotOwner { owner: *owner },
+        LockOutcome::NotOwner { owner, gen } => LockOutcomeWire::NotOwner {
+            owner: *owner,
+            gen: *gen,
+        },
         LockOutcome::Busy => LockOutcomeWire::Busy,
     }
 }
@@ -2532,7 +2535,7 @@ pub fn outcome_of(w: LockOutcomeWire) -> LockOutcome {
         },
         LockOutcomeWire::Waiting { retry_ms, grace } => LockOutcome::Waiting { retry_ms, grace },
         LockOutcomeWire::WouldBlock => LockOutcome::WouldBlock,
-        LockOutcomeWire::NotOwner { owner } => LockOutcome::NotOwner { owner },
+        LockOutcomeWire::NotOwner { owner, gen } => LockOutcome::NotOwner { owner, gen },
         LockOutcomeWire::Busy => LockOutcome::Busy,
     }
 }
@@ -2587,7 +2590,9 @@ pub fn renew_results_wire(
                     exclusive: exclusive(mode),
                 },
                 LockRenewResult::Lost => LockRenewResultWire::Lost,
-                LockRenewResult::NotOwner { owner } => LockRenewResultWire::NotOwner { owner },
+                LockRenewResult::NotOwner { owner, gen } => {
+                    LockRenewResultWire::NotOwner { owner, gen }
+                }
             };
             (*ino, grant_wire(*id), r)
         })
@@ -2613,7 +2618,9 @@ pub fn renew_results_of(
                     mode: mode_of(exclusive),
                 },
                 LockRenewResultWire::Lost => LockRenewResult::Lost,
-                LockRenewResultWire::NotOwner { owner } => LockRenewResult::NotOwner { owner },
+                LockRenewResultWire::NotOwner { owner, gen } => {
+                    LockRenewResult::NotOwner { owner, gen }
+                }
             };
             (ino, grant_of(id), r)
         })
@@ -2732,7 +2739,7 @@ mod tests {
                 grace: false,
             },
             LockOutcome::WouldBlock,
-            LockOutcome::NotOwner { owner: 4 },
+            LockOutcome::NotOwner { owner: 4, gen: 6 },
             LockOutcome::Busy,
         ] {
             assert_eq!(outcome_of(outcome_wire(&o)), o);
@@ -2759,7 +2766,7 @@ mod tests {
             (
                 7,
                 GrantId { node: 1, seq: 4 },
-                LockRenewResult::NotOwner { owner: 8 },
+                LockRenewResult::NotOwner { owner: 8, gen: 6 },
             ),
         ];
         assert_eq!(renew_results_of(renew_results_wire(&results)), results);

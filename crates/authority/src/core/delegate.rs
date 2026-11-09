@@ -7688,6 +7688,20 @@ impl Core {
         name: Option<&str>,
         replica: &dyn Replica,
     ) -> Option<NodeId> {
+        self.deleg_read_owner_gen(now, ino, name, replica)
+            .map(|(node, _)| node)
+    }
+
+    /// [`Self::deleg_read_owner`] with the generation of the delegation
+    /// that owns the keys, which a redirect names (a designee is no lease
+    /// holder: the requester must not cache it).
+    pub(crate) fn deleg_read_owner_gen(
+        &self,
+        now: Now,
+        ino: Ino,
+        name: Option<&str>,
+        replica: &dyn Replica,
+    ) -> Option<(NodeId, u64)> {
         if !self.cfg.delegation || replica.delegation_table().is_empty() {
             return None;
         }
@@ -7700,9 +7714,9 @@ impl Core {
                         .mine
                         .get(&d.gen)
                         .is_some_and(|m| now.honour < m.until && !m.stopped);
-                    honoured.then_some(d.node)
+                    honoured.then_some((d.node, d.gen))
                 } else {
-                    Some(d.node)
+                    Some((d.node, d.gen))
                 }
             }
             _ => None,

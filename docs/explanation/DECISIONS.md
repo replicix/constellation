@@ -3311,6 +3311,18 @@ holder's redirect (a deposed root naming the new one, a delegate naming the
 root) does not. A root's own client op under a sticky grant whose holder is out of
 reach waits on the grant instead of being refused.
 
+A designee is never cached as the lease holder (`cached_holder`), by any
+redirect: the mutation, strict-read and lock redirects each carry the
+delegation's generation (`NotHolder.gen`, `ReadIndexOutcome::NotHolder.gen`,
+`NotOwner.gen`) when the root names a delegate, and a requester that sees one
+does not cache the target, even when its table does not list it. As a
+structural guard that does not depend on every setter, `send_forward` marks an
+op sent to any node other than the holder the lease object this node last read
+names (the table's listing is no longer the only test). The guard
+over-marks while the lease object lags (an op forwarded to a new holder before
+the next lease read): the op's refusal by that holder is held and the op ends
+in doubt where it would have ended with the holder's errno.
+
 **Consequences**: an op under an unreachable non-stealable holder ends in doubt
 where it ended `EROFS`: more `EIO`, later, for ops that may have run, and no
 false `EROFS`. Ops that were never sent to the holder are refused as before. The
@@ -3328,5 +3340,8 @@ requester's mark with the holder's row-driven answer.
 See: `crates/authority/src/core/client.rs` (`sent_to_designation`,
 `on_holder_learned`, `on_mutate_reply`), tests
 `an_op_redirected_to_a_designee_the_table_lacks_is_not_put_in_the_inbox`,
+`a_read_index_redirect_to_a_designee_is_not_cached_as_the_lease_holder`,
+`a_lock_not_owner_naming_a_designee_is_not_cached_as_the_lease_holder`,
+`a_rid_forwarded_to_a_node_the_lease_does_not_name_is_marked`,
 `the_roots_refusal_is_held_when_the_root_is_listed_as_a_delegate`,
 [delegations](../reference/features/delegations.md).

@@ -386,10 +386,13 @@ pub enum Payload {
     /// The sequencer's answer: `status` 0 = the position (and maybe a
     /// read delegation `(id, ttl_ms, epoch)`), 1 = not the holder
     /// (`holder`: whom it believes holds, 0 unknown), 2 = busy (fenced).
+    /// `gen`: the generation of the delegation `holder` is the delegate
+    /// of when the root names a delegate (0: the lease holder).
     ReadIndexReply {
         req_id: u64,
         status: u8,
         holder: u64,
+        gen: u64,
         position_seq: u64,
         position_pending: Option<(u64, u64)>,
         grant: Option<(u64, u64, u64)>,
@@ -948,8 +951,11 @@ pub enum LockOutcomeWire {
         grace: bool,
     },
     WouldBlock,
+    /// `gen`: the generation of the delegation `owner` is the delegate of
+    /// (0: the lease holder).
     NotOwner {
         owner: u64,
+        gen: u64,
     },
     Busy,
 }
@@ -976,8 +982,11 @@ pub enum LockRenewResultWire {
         exclusive: bool,
     },
     Lost,
+    /// `gen`: the generation of the delegation `owner` is the delegate of
+    /// (0: the lease holder).
     NotOwner {
         owner: u64,
+        gen: u64,
     },
 }
 

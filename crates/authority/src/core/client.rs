@@ -1378,7 +1378,19 @@ impl Core {
             out,
         );
         let acked_through = self.acked.floor();
-        let to_delegate = replica.delegation_table().iter().any(|e| e.node == holder);
+        // A node other than the holder the lease object names (the last
+        // one this node read) may be a designee: the table here lags the
+        // root's, and any cache setter may have named one. The op is marked,
+        // so its refusal by the root is held, not final (I1). A structural
+        // guard: it does not depend on how the target came to be cached.
+        // (Without a lease object read there is nothing to compare with.)
+        let to_delegate = replica.delegation_table().iter().any(|e| e.node == holder)
+            || (holder != 0
+                && self
+                    .lease
+                    .last_seen
+                    .as_ref()
+                    .is_some_and(|l| l.holder != holder));
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };

@@ -1590,6 +1590,7 @@ pub trait PeerService: Send + Sync + 'static {
                 req_id,
                 status: 1,
                 holder: 0,
+                gen: 0,
                 position_seq: 0,
                 position_pending: None,
                 grant: None,
@@ -1708,7 +1709,7 @@ pub trait PeerService: Send + Sync + 'static {
                         (
                             e.ino,
                             e.grant,
-                            crate::message::LockRenewResultWire::NotOwner { owner: 0 },
+                            crate::message::LockRenewResultWire::NotOwner { owner: 0, gen: 0 },
                         )
                     })
                     .collect(),
