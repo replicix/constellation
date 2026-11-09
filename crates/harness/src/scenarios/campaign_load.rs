@@ -1027,7 +1027,11 @@ pub(super) fn delegate_paused_across_ttl(_seed: u64) -> Result<()> {
     let (env, _root, mut clients, _) = super::m11::cluster(
         NAME,
         &["a", "b"],
-        &[("CONSTELLATION_DELEGATION_TTL_MS", &ttl)],
+        &[
+            ("CONSTELLATION_DELEGATION_TTL_MS", &ttl),
+            ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "500"),
+            ("CONSTELLATION_BACKUPS", "0"),
+        ],
         0,
     )?;
     let result = (|| -> Result<()> {

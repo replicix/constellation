@@ -82,7 +82,7 @@ pub fn lock_grant_dead_generation(_seed: u64) -> Result<()> {
         // root-to-delegate round trip measures 0 whole milliseconds, so
         // under load the delegation was refused. A real budget makes the
         // root a group member whatever the load.
-        &[("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "50")],
+        &[("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "500")],
         0,
     )?;
     let result = (|| -> Result<()> {
