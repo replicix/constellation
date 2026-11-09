@@ -73,7 +73,18 @@ fn session_of(c: &Client) -> Result<serde_json::Value> {
 pub fn lock_grant_dead_generation(_seed: u64) -> Result<()> {
     const NAME: &str = "lock-grant-dead-generation";
     const FILES: usize = 20;
-    let (_env, _root, mut clients, _proxies) = cluster(NAME, &["a", "b", "c"], &[], 0)?;
+    let (_env, _root, mut clients, _proxies) = cluster(
+        NAME,
+        &["a", "b", "c"],
+        // The M11 cluster pins the backup budget to 0 (no backup peer).
+        // Since plan 46 step 13 a manual delegate needs a group within the
+        // budget, the root included; at 0 ms that holds only while the
+        // root-to-delegate round trip measures 0 whole milliseconds, so
+        // under load the delegation was refused. A real budget makes the
+        // root a group member whatever the load.
+        &[("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "50")],
+        0,
+    )?;
     let result = (|| -> Result<()> {
         let c_id = node_id(&clients[2])?;
         // b's write into d1 must go to the delegate c. A node's authority
