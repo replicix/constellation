@@ -3275,3 +3275,51 @@ See: `crates/meta/src/delegation.rs` (`next_delegation_gen`, `GEN_MAX_EPOCH`,
 `crates/meta/tests/generation_epochs.rs`, sim
 `regression_no_generation_number_is_minted_twice`;
 [plan 46](../plans/v1/wip/46-committed-or-final.md) M0.3, §5.2; PROGRESS "ADR-43".
+
+
+## ADR-45: An op sent to a non-stealable holder is never refused for good
+
+**Status**: decided by the maintainer on 2026-11-09 (plan 46 M1.3 step 5, the
+`sticky-ttl` I1 finding). Amends invariant I4 ("an `EIO` told means the op did
+not and will not happen") for one case, and the refusal rules of
+[ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
+for a non-stealable grant.
+
+**Context**: the holder of a sticky grant or a designation is final for its
+keys and is never recalled to execute an op (a refusal stands in for the
+recall: `EROFS`, or `EXDEV` across subtrees, nothing journaled; the inbox drain
+journals `Refused`). A requester that sent an op to the holder and heard no
+answer cannot tell whether the holder ran it. The root, or the drain of its
+inbox, then refused the same rid for good, and the holder's row reached the log
+later: `Refused` and `Completed` for one rid (I1), found by `sticky-ttl` in 8 of
+2,000 seeds (110, 624, 772, ...). The refuser cannot know the op was sent on;
+only the requester can.
+
+**Decision**: the requester remembers that it sent an op to a designee (its
+table lists the target, or the root redirected the op to it, the table listing
+it or not) and does not accept such a refusal as the answer: the root's
+unjournaled `EROFS`/`EXDEV` is asked again like a `Held`, and the op is not put
+in the inbox when the root is out of reach. It ends by the holder's row (dedup),
+the root's answer once the holder is reachable or its stream has ended, or, at
+the op's deadlines, in doubt (the settle's unsettled `EIO`, bounded by
+`settle_cap`). The sim counts that `EIO` apart (`unsettled_nonstealable_holder`,
+named by rid) and does not treat it as an I4 violation; the late-landing oracles
+are unchanged. A resubmission of a rid that went in doubt carries the
+mark over. A root's own client op under a sticky grant whose holder is out of
+reach waits on the grant instead of being refused.
+
+**Consequences**: an op under an unreachable non-stealable holder ends in doubt
+where it ended `EROFS`: more `EIO`, later, for ops that may have run, and no
+false `EROFS`. Ops that were never sent to the holder are refused as before. The
+over-marking (a send to a holder that did not receive it) costs the errno, not
+safety. The knob `refuse_forwarded_designation_ops` (test-only) restores the old
+behaviour; `sticky-ttl` fails with it.
+
+**May revert**: never as a whole; plan 46 M1.3's later steps may replace the
+requester's mark with the holder's row-driven answer.
+
+See: `crates/authority/src/core/client.rs` (`sent_to_designation`,
+`on_holder_learned`, `on_mutate_reply`), tests
+`an_op_redirected_to_a_designee_the_table_lacks_is_not_put_in_the_inbox`,
+`the_roots_refusal_is_held_when_the_root_is_listed_as_a_delegate`,
+[delegations](../reference/features/delegations.md).

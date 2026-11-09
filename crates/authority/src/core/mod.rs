@@ -2212,6 +2212,9 @@ pub struct Core {
     clients: BTreeMap<Rid, client::ClientOp>,
     /// Rids answered `InDoubt` and not yet resubmitted.
     in_doubt_rids: std::collections::BTreeSet<Rid>,
+    /// Rids whose unsettled `EIO` was counted in `unsettled_nonstealable_holder`,
+    /// until the driver takes them (`take_unsettled_designation`).
+    unsettled_designation_rids: std::collections::BTreeSet<Rid>,
     /// M13/M5: the durable inbox batch an in-doubt rid left behind, so
     /// its resubmission withdraws it before any P2P forward.
     in_doubt_batches: std::collections::BTreeMap<Rid, Vec<InboxKey>>,
@@ -2389,6 +2392,7 @@ impl Core {
             flush_floor_timer: None,
             clients: BTreeMap::new(),
             in_doubt_rids: std::collections::BTreeSet::new(),
+            unsettled_designation_rids: std::collections::BTreeSet::new(),
             in_doubt_batches: std::collections::BTreeMap::new(),
             shipped_touches: std::collections::VecDeque::new(),
             shipped_floor: 0,

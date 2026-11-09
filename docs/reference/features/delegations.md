@@ -788,7 +788,7 @@ non-stealable holder: if the holder ran the op, its row lands after the
 `EIO`. Without it the client would be told `EROFS` for an op that ran
 (I1). The simulation counts these separately
 (`SWEEP-NONSTEALABLE-IN-DOUBT`, `unsettled_nonstealable_holder`) and
-never as a violation.
+never as a violation ([ADR-45](../../explanation/DECISIONS.md#adr-45-an-op-sent-to-a-non-stealable-holder-is-never-refused-for-good)).
 
 A sticky holder's release is its own decision (`Control::StickyRelease`):
 it holds new ops under the subtree for at most 5 s while it drains, waits

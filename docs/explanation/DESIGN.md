@@ -797,7 +797,14 @@ cut is journaled and then answered as the gate's own
 Only when no
 sequencer answers within the rest of the deadline (twice
 the lease TTL: an isolated requester) does the client hear the *unsettled*
-`EIO`, retryable by rid, which may still land (`client_unsettled_eio`). The
+`EIO`, retryable by rid, which may still land (`client_unsettled_eio`); there
+is one more such case: an op sent to a non-stealable holder (a sticky grant or
+a designation) that did not answer is never refused for good by anyone else (the
+root's unjournaled `EROFS`/`EXDEV`, the inbox drain's refusal), since the holder
+may have run it and its row lands late, so its refusal is held and the client
+hears the unsettled `EIO` at the deadlines, counted apart
+(`unsettled_nonstealable_holder`;
+[ADR-45](DECISIONS.md#adr-45-an-op-sent-to-a-non-stealable-holder-is-never-refused-for-good)). The
 settle window is the least: a root that holds the settle for the end of a
 generation it outwaits says so (`Held`'s `outwait_ms`) and the client waits for
 it, at most two settle windows, a reclaim horizon and a seal window past the

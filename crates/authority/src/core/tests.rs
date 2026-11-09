@@ -64470,6 +64470,262 @@ mod step5_sticky_release {
         assert_eq!(h.core.stats.designation_refusals_held, 1);
     }
 
+    /// The peers event of the node's links: those of `nodes`, up.
+    fn links_event(nodes: &[NodeId]) -> Event {
+        Event::Peers {
+            links: nodes
+                .iter()
+                .map(|&node| crate::event::PeerLink {
+                    node,
+                    connected: false,
+                    last_seen: None,
+                    rtt_ms: None,
+                    since: None,
+                })
+                .collect(),
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        }
+    }
+
+    /// The requester's table lags the root's journal: it does not list the
+    /// designee yet, so the root's `NotHolder` redirect is the only word of
+    /// it. The op is sent on, the designee runs it and its answer is lost,
+    /// the root is then out of reach, and the lease read finds it the
+    /// holder: the op is not put in the inbox (the drain would refuse it
+    /// for good, I1 against the designee's row), whatever the table says of
+    /// the keys. Fails on the parent: the op goes to the inbox.
+    #[test]
+    fn an_op_redirected_to_a_designee_the_table_lacks_is_not_put_in_the_inbox() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.inbox = true;
+        h.core.lease.cached_holder = Some(1);
+        h.step(links_event(&[1, 3]));
+        let (dir, rec) = mkdir(&h, "a");
+        // (No `DelegateNode`: the grant is not applied here yet.)
+        Replica::install_streamed(&h.meta, 1, 1, 1, 1, &[rec], true, (0, 0)).unwrap();
+        let rid = h.rid(1);
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest { req, .. } if to == 1 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("not sent to the root: {out:?}"));
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::NotHolder { holder: 3 },
+                base: None,
+                position: Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+            },
+        });
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::MutateRequest { .. })),
+            "not redirected to the designee: {out:?}"
+        );
+        assert!(h.core.clients[&rid].sent_to_delegate);
+        // The designee's answer is lost, and the requester is cut off.
+        h.step(links_event(&[]));
+        let mut out = out;
+        let mut get = None;
+        for _ in 0..12 {
+            if let Some(a) = out.iter().find_map(|a| match a {
+                Action::S3 {
+                    op,
+                    req: S3Op::LeaseGet,
+                } => Some(*op),
+                _ => None,
+            }) {
+                get = Some(a);
+                break;
+            }
+            let Some(t) = timers(&out, TimerKind::ForwardTimeout)
+                .into_iter()
+                .chain(timers(&out, TimerKind::ForwardBackoff))
+                .next_back()
+            else {
+                break;
+            };
+            h.advance(h.core.cfg.forward_timeout_ms + 1);
+            out = h.step(Event::Timer { id: t });
+        }
+        let get = get.expect("the op never read the lease");
+        let body = Lease {
+            ttl_ms: 600_000,
+            ..lease_of(1, 1, h.now.0 + 600_000)
+        };
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((body, tag())))),
+        });
+        assert!(
+            !out.iter().any(|a| matches!(
+                a,
+                Action::S3 {
+                    req: S3Op::InboxPut { .. } | S3Op::InboxLastN { .. },
+                    ..
+                }
+            )),
+            "the op was put in the inbox: {out:?}"
+        );
+        assert!(
+            !timers(&out, TimerKind::ForwardBackoff).is_empty(),
+            "no retry: {out:?}"
+        );
+        assert_eq!(h.core.stats.designation_refusals_held, 1);
+    }
+
+    /// The root's refusal of an op sent to a designee is not taken for the
+    /// answer when the root is itself listed as a delegate (of other keys):
+    /// the reply is the root's, not the designee's, whatever the table lists.
+    /// Fails on the parent: the application is told `EROFS`.
+    #[test]
+    fn the_roots_refusal_is_held_when_the_root_is_listed_as_a_delegate() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        h.step(links_event(&[1, 3]));
+        let (a, rec_a) = mkdir(&h, "a");
+        let (b, rec_b) = mkdir(&h, "b");
+        let records = vec![
+            rec_a,
+            rec_b,
+            LogRecord::DelegateNode {
+                node: 3,
+                gen: 7,
+                dirs: vec![constellation_meta::SubtreeGrant {
+                    dir: a,
+                    kind: SubtreeKind::Sticky,
+                }],
+            },
+            LogRecord::DelegateNode {
+                node: 1,
+                gen: 8,
+                dirs: vec![constellation_meta::SubtreeGrant {
+                    dir: b,
+                    kind: SubtreeKind::Sticky,
+                }],
+            },
+        ];
+        Replica::install_streamed(&h.meta, 1, 1, 1, 4, &records, true, (0, 0)).unwrap();
+        let rid = h.rid(1);
+        let op = MutateOp::Create {
+            parent: a,
+            name: "f".into(),
+            ino: h.meta.allocate_ino(a).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest { req, .. } if to == 3 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("not sent to the designee: {out:?}"));
+        // (The designee's answer is lost; the root's refusal arrives.)
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Errno(Code::ReadOnly),
+                base: None,
+                position: Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+            },
+        });
+        assert!(
+            !replies(&out).iter().any(|(r, _)| *r == rid),
+            "answered: {out:?}"
+        );
+        assert_eq!(h.core.stats.designation_refusals_held, 1);
+    }
+
+    /// A refusal held for a designee counts as I4's exception only when the
+    /// op ended in an unsettled `EIO`, and the core names the rid: an op in
+    /// doubt without a settle (the policy does not settle) leaves no mark
+    /// that a later, genuine unsettled `EIO` could be mistaken for.
+    #[test]
+    fn a_held_op_in_doubt_without_a_settle_is_not_counted_as_the_exception() {
+        let mut h = Harness::new(2);
+        let (held, plain) = (h.rid(1), h.rid(2));
+        for rid in [held, plain] {
+            let op = h.create(&format!("f{}", rid.seq));
+            h.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op,
+                tag: Default::default(),
+            });
+        }
+        h.core.clients.get_mut(&held).unwrap().designation_held = true;
+        {
+            let c = h.core.clients.get_mut(&plain).unwrap();
+            c.settle = true;
+        }
+        let mut out = Vec::new();
+        h.core.finish_in_doubt(h.clk(), held, &h.meta, &mut out);
+        assert_eq!(h.core.stats.unsettled_nonstealable_holder, 0);
+        h.core.finish_in_doubt(h.clk(), plain, &h.meta, &mut out);
+        assert_eq!(h.core.stats.client_unsettled_eio, 1);
+        assert_eq!(h.core.stats.unsettled_nonstealable_holder, 0);
+        assert!(!h.core.take_unsettled_designation(plain));
+        // A settling op whose refusal was held: counted, by its rid, once.
+        let both = h.rid(3);
+        let op = h.create("f3");
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: both,
+            op,
+            tag: Default::default(),
+        });
+        {
+            let c = h.core.clients.get_mut(&both).unwrap();
+            c.settle = true;
+            c.designation_held = true;
+        }
+        h.core.finish_in_doubt(h.clk(), both, &h.meta, &mut out);
+        assert_eq!(h.core.stats.unsettled_nonstealable_holder, 1);
+        assert!(h.core.take_unsettled_designation(both));
+        assert!(!h.core.take_unsettled_designation(both));
+        assert!(!h.core.take_unsettled_designation(held));
+    }
+
     /// The mark "sent to a delegate" is a record's; a resubmission of a rid
     /// that went in doubt (a fresh record) carries it over, a fresh rid does
     /// not, and a replay (the queue's own entry, executed here) does not.

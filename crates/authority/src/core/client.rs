@@ -115,6 +115,10 @@ pub(crate) struct ClientOp {
     /// the owner of the op's keys, or the root redirected the op to it): it
     /// may have run there, whatever the root says later.
     pub sent_to_delegate: bool,
+    /// The root redirected the op to a node this node's table does not list
+    /// as a delegate (the table lags the root's journal): the op was sent to
+    /// a designee all the same, whatever the keys resolve to here.
+    pub redirected_to_designee: bool,
     /// A non-stealable holder's refusal was held back for this op (it was
     /// sent on, so it may have run): its in-doubt end is I4's exception for
     /// an unreachable non-stealable holder (`unsettled_nonstealable_holder`).
@@ -622,8 +626,11 @@ impl Core {
         // doubt, ran it again: refused `EEXIST`, the rid's second outcome
         // in the log, and the answer the client heard).
         // A resubmission of a rid that went in doubt may have been sent to a
-        // holder by the earlier record: the mark carries over (a replay's is
-        // the queue's own, executed here, never sent to a holder).
+        // holder by the earlier record: the mark carries over. A replay's
+        // starts unmarked: it is the queue's own entry, and its refusals are
+        // held by the inbox hold (`on_holder_learned`), not by the reply
+        // hold, which is the client's (`Origin::Client`); a replay that
+        // `send_forward` sends to a designee is marked from then on, as any.
         let resubmitted =
             !matches!(origin, Origin::Replay { .. }) && self.in_doubt_rids.remove(&rid);
         let in_doubt = matches!(origin, Origin::Replay { .. }) || resubmitted;
@@ -664,6 +671,7 @@ impl Core {
                 settle_cap: WaitMs(0),
                 gate_recall_wait: false,
                 sent_to_delegate: resubmitted,
+                redirected_to_designee: false,
                 designation_held: false,
                 tag,
             },
@@ -1244,6 +1252,22 @@ impl Core {
             Ownership::CrossSubtree { involved, .. } => involved
                 .iter()
                 .any(|d| d.kind != constellation_meta::SubtreeKind::Placed),
+            // A table that lags the root's journal resolves the keys to the
+            // root after a redirect to the designee: still sent to it.
+            Ownership::Root => c.redirected_to_designee,
+        }
+    }
+
+    /// Whether `node` owns (holds a grant of) any of `rid`'s keys in this
+    /// replica's table.
+    fn owns_keys_of(&self, rid: Rid, node: NodeId, replica: &dyn Replica) -> bool {
+        let Some(c) = self.clients.get(&rid) else {
+            return false;
+        };
+        let keys = super::holder::keys_of_op_in(&c.op, replica);
+        match replica.resolve_ownership(&keys) {
+            Ownership::Delegated(d) => d.node == node,
+            Ownership::CrossSubtree { involved, .. } => involved.iter().any(|d| d.node == node),
             Ownership::Root => false,
         }
     }
@@ -1550,7 +1574,10 @@ impl Core {
                 .clients
                 .get(&rid)
                 .is_some_and(|c| c.sent_to_delegate && c.origin == Origin::Client)
-            && !replica.delegation_table().iter().any(|e| e.node == from)
+            // (The refusal is the root's, not the designee's own: the root
+            // may be listed as a delegate of other keys, so the table's
+            // listing says nothing; whose grant the op's keys are does.)
+            && !self.owns_keys_of(rid, from, replica)
         {
             self.stats.designation_refusals_held += 1;
             if let Some(c) = self.clients.get_mut(&rid) {
@@ -1763,6 +1790,15 @@ impl Core {
                 }
             }
             MutateOutcome::NotHolder { holder } => {
+                // A redirect to a node that is not the lease holder is the
+                // root naming a designee (a delegate's `NotHolder` names the
+                // root): the op is sent to a designee even when this node's
+                // table does not list it yet.
+                let to_designee = holder != 0
+                    && holder != from
+                    && holder != self.cfg.node_id
+                    && self.lease.cached_holder != Some(holder)
+                    && self.lease.live_holder_seen(now, &self.cfg).map(|(h, _)| h) != Some(holder);
                 // Plan 30 §M11: the root's `NotHolder` names a delegate
                 // (the op is wholly the delegate's); that is a route, not
                 // the lease holder, so the cache keeps the root.
@@ -1802,6 +1838,10 @@ impl Core {
                 let c = self.clients.get_mut(&rid).expect("present");
                 if holder != 0 && holder != from && holder != self.cfg.node_id && c.redirected < 2 {
                     c.redirected += 1;
+                    if to_designee {
+                        c.sent_to_delegate = true;
+                        c.redirected_to_designee = true;
+                    }
                     self.stats.forward_redirects += 1;
                     self.send_forward(now, rid, holder, replica, out);
                 } else {
@@ -2826,7 +2866,7 @@ impl Core {
                                 if let Some(c) = self.clients.get_mut(&rid) {
                                     c.designation_held = true;
                                 }
-                                self.park_exec_local(now, wait, None, rid, false);
+                                self.park_exec_local(now, (wait, None), None, rid, false);
                                 return MutateOutcome::Busy;
                             }
                         }
@@ -4222,6 +4262,12 @@ impl Core {
         }
     }
 
+    /// Whether `rid`'s unsettled `EIO` was one whose refusal was held back
+    /// for a designee (`Stats::unsettled_nonstealable_holder`); taken once.
+    pub fn take_unsettled_designation(&mut self, rid: Rid) -> bool {
+        self.unsettled_designation_rids.remove(&rid)
+    }
+
     /// The op is neither executed here nor answered by anyone: the client
     /// hears `InDoubt` (`EIO`; retryable by the same rid), the replay
     /// drain leaves it queued.
@@ -4239,9 +4285,21 @@ impl Core {
             // Plan 43 C2: no sequencer answered the settle (I4's one
             // exception: an isolated requester).
             self.stats.client_unsettled_eio += 1;
-        }
-        if c.designation_held && matches!(c.origin, Origin::Client) {
-            self.stats.unsettled_nonstealable_holder += 1;
+            // Of those, the op whose refusal was held back for a designee
+            // (the op was sent to it, or its keys are waited on): only an
+            // unsettled `EIO` is I4's exception, by rid.
+            if c.designation_held {
+                self.stats.unsettled_nonstealable_holder += 1;
+                self.unsettled_designation_rids.insert(rid);
+                while self.unsettled_designation_rids.len() > MAX_IN_DOUBT_RIDS {
+                    let first = *self
+                        .unsettled_designation_rids
+                        .iter()
+                        .next()
+                        .expect("non-empty");
+                    self.unsettled_designation_rids.remove(&first);
+                }
+            }
         }
         self.log_if_slow(now, rid, &c, "in doubt", replica);
         self.cancel_timer(c.deadline, out);

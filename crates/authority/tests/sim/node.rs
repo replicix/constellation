@@ -816,7 +816,6 @@ impl NodeHandle {
             freeze_handed: (0, 0),
             own_lapse: None,
             unsettled_seen: 0,
-            designation_seen: 0,
             releases_seen: 0,
             deps_refused_seen: 0,
             deleg_rows_from: 0,
@@ -1124,8 +1123,6 @@ struct Driver {
     /// Plan 46 M0.3: the unsettled `EIO`s of this incarnation's core
     /// (`Stats::client_unsettled_eio`) already classified.
     unsettled_seen: u64,
-    /// `Stats::unsettled_nonstealable_holder` as last seen.
-    designation_seen: u64,
     /// `Stats::deleg_sticky_releases` as last seen.
     releases_seen: u64,
     /// `Stats::deleg_deps_refused` already judged (the causal-cut oracle).
@@ -3673,10 +3670,7 @@ impl Driver {
                                 let started = self
                                     .step_timer
                                     .and_then(|t| self.deadline_armed.get(&t).copied());
-                                let held = self.core.stats.unsettled_nonstealable_holder
-                                    > self.designation_seen;
-                                self.designation_seen =
-                                    self.core.stats.unsettled_nonstealable_holder;
+                                let held = self.core.take_unsettled_designation(rid);
                                 self.oracles.note_unsettled(
                                     self.id,
                                     rid,

@@ -744,6 +744,14 @@ impl Core {
                         self.stats.inbox_unavailable += 1;
                         self.lease_path(now, rid, replica, out);
                     } else {
+                        // No hold for a designee here (`on_holder_learned`
+                        // has one): an op is `InboxWaiting` only after it
+                        // passed that hold, and nothing marks it sent to a
+                        // designee while it stays in the inbox (`send_forward`
+                        // withdraws the batch first, then the mark is set and
+                        // the op leaves this phase). A drain may have read
+                        // the old-epoch batch already, which a guard here
+                        // could not undo either.
                         self.inbox_enqueue(now, rid, new_epoch, replica, out);
                     }
                 }
