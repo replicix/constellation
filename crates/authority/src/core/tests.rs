@@ -34142,6 +34142,13 @@ mod s3_no_loops {
         })
     }
 
+    fn reply_gen_to(out: &[Action], to: NodeId, req: u64) -> Option<u64> {
+        sends(out).into_iter().find_map(|(n, m)| match m {
+            PeerMsg::MutateReply { req: r, gen, .. } if n == to && *r == OpId(req) => Some(*gen),
+            _ => None,
+        })
+    }
+
     fn recalls_sent(out: &[Action], to: NodeId) -> usize {
         sends(out)
             .iter()
@@ -34344,6 +34351,11 @@ mod s3_no_loops {
             Some(MutateOutcome::NotHolder { holder: 3 }),
             "{out:?}"
         );
+        assert_eq!(
+            reply_gen_to(&out, 2, 7),
+            Some(gen),
+            "the redirect does not carry the designee's generation"
+        );
         assert!(!h.core.has_exec_parks(), "parked");
     }
 
@@ -34393,6 +34405,7 @@ mod s3_no_loops {
             matches!(reply_to(&out, 3, 7), Some(MutateOutcome::Held { .. })),
             "{out:?}"
         );
+        assert_eq!(reply_gen_to(&out, 3, 7), Some(0), "the delegate's own op");
         assert_eq!(recalls_sent(&out, 3), 0, "{out:?}");
         assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::None);
         let out = forward(&mut h, 2, 8, dir, false);
@@ -34401,6 +34414,7 @@ mod s3_no_loops {
             Some(MutateOutcome::NotHolder { holder: 3 }),
             "{out:?}"
         );
+        assert_eq!(reply_gen_to(&out, 2, 8), Some(gen), "owner redirect gen");
     }
 
     /// The window in which a delegate's own op is still "before its table
@@ -55907,6 +55921,13 @@ mod c2g_settle {
         })
     }
 
+    fn reply_gen_to_3(out: &[Action], req: u64) -> Option<u64> {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::MutateReply { req: r, gen, .. } if to == 3 && *r == OpId(req) => Some(*gen),
+            _ => None,
+        })
+    }
+
     fn abandoned_row(h: &Harness, rid: Rid) -> bool {
         matches!(
             h.meta.completed_outcome(rid),
@@ -56488,6 +56509,11 @@ mod c2g_settle {
             reply_to_3(&out, 12),
             Some(MutateOutcome::NotHolder { holder: 4 }),
             "{out:?}"
+        );
+        assert_eq!(
+            reply_gen_to_3(&out, 12),
+            Some(7),
+            "the settle redirect does not carry the designee's generation"
         );
         assert_eq!(h.meta.completed_outcome(rid3(1)).unwrap(), None);
         assert!(h.core.lease.gate.is_some(), "the gate is still pending");
@@ -64338,12 +64364,13 @@ mod step5_sticky_release {
                         // The designee ran the op; its answer is lost.
                         continue;
                     }
-                    let outcome = if redirected {
+                    // The root's designee redirect carries the generation.
+                    let (outcome, gen) = if redirected {
                         refusals += 1;
-                        MutateOutcome::Errno(Code::ReadOnly)
+                        (MutateOutcome::Errno(Code::ReadOnly), 0)
                     } else {
                         redirected = true;
-                        MutateOutcome::NotHolder { holder: 3 }
+                        (MutateOutcome::NotHolder { holder: 3 }, 7)
                     };
                     queue.push_back(h.step(Event::Peer {
                         from: 1,
@@ -64352,7 +64379,7 @@ mod step5_sticky_release {
                             outcome,
                             base: None,
                             position: Position::ZERO,
-                            gen: 0,
+                            gen,
                             own_chunks: OwnChunks::None,
                             own_rows: None,
                             committed: false,
@@ -64735,9 +64762,8 @@ mod step5_sticky_release {
         );
     }
 
-    /// An op that was not redirected to a designee leaves no designee mark
-    /// behind for its resubmission, and the mark follows the in-doubt rids'
-    /// eviction.
+    /// The designee mark of an in-doubt rid follows the in-doubt rids'
+    /// eviction (`note_in_doubt`).
     #[test]
     fn the_designee_mark_of_an_in_doubt_rid_follows_its_eviction() {
         let (mut h, rid, _) = redirected_op(7);
@@ -64753,6 +64779,54 @@ mod step5_sticky_release {
         }
         assert!(!h.core.in_doubt_rids.contains(&rid));
         assert!(!h.core.in_doubt_designee_rids.contains(&rid));
+    }
+
+    /// `finish_in_doubt` records the mark only of an op that was redirected
+    /// to a designee: an op that was not leaves none.
+    #[test]
+    fn an_op_that_was_not_redirected_to_a_designee_leaves_no_mark() {
+        let (mut h, rid, _) = redirected_op(0);
+        let mut out = Vec::new();
+        h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
+        assert!(h.core.in_doubt_rids.contains(&rid));
+        assert!(!h.core.in_doubt_designee_rids.contains(&rid));
+    }
+
+    /// A designee redirect (a generation on the wire) does not make the
+    /// designee the cached lease holder, even when this node's table does not
+    /// list it: a new op on another rid goes to the root, not unmarked to the
+    /// designee (I1: a lost answer and the root's refusal would then be a
+    /// `Refused` beside a `Completed`). Fails on the parent: the cache names
+    /// node 3 and the second op is sent there.
+    #[test]
+    fn a_designee_redirect_is_not_cached_as_the_lease_holder() {
+        let (mut h, _rid, _) = redirected_op(7);
+        assert_eq!(h.core.lease.cached_holder, Some(1));
+        let (dir, _) = mkdir(&h, "a");
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "g".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(2),
+            op,
+            tag: Default::default(),
+        });
+        let to: Vec<NodeId> = sends(&out)
+            .into_iter()
+            .filter(|(_, m)| matches!(m, PeerMsg::MutateRequest { .. }))
+            .map(|(to, _)| to)
+            .collect();
+        assert_eq!(
+            to,
+            vec![1],
+            "the second op was not sent to the root: {out:?}"
+        );
     }
 
     /// A redirect to the lease holder (a deposed root naming the new one:

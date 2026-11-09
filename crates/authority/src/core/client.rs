@@ -1805,9 +1805,12 @@ impl Core {
                     gen != 0 && holder != 0 && holder != from && holder != self.cfg.node_id;
                 // Plan 30 §M11: the root's `NotHolder` names a delegate
                 // (the op is wholly the delegate's); that is a route, not
-                // the lease holder, so the cache keeps the root.
-                let names_delegate =
-                    holder != 0 && replica.delegation_table().iter().any(|e| e.node == holder);
+                // the lease holder, so the cache keeps the root. A redirect that
+                // carries a generation is the root naming a designee even when
+                // this node's table lags: caching it would route other rids
+                // to the designee unmarked (I1).
+                let names_delegate = holder != 0
+                    && (gen != 0 || replica.delegation_table().iter().any(|e| e.node == holder));
                 if holder != 0 && !names_delegate {
                     self.lease.cached_holder = Some(holder);
                 }
