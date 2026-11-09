@@ -1198,6 +1198,11 @@ pub struct Stats {
     /// two ask the root to seal the group (`ReleaseNote::seal`).
     pub deleg_release_rowless_capped: u64,
     pub deleg_release_rowless_unseen: u64,
+    /// Of the never-installed ones, those that asked for the seal (this node
+    /// holds rows of the generation, or held it on another boot), and the
+    /// releases of a stream this node restarted after a reboot.
+    pub deleg_release_rowless_unseen_sealed: u64,
+    pub deleg_release_rowless_rebooted: u64,
     pub deleg_release_rowless_lost_dep: u64,
     pub deleg_release_rowless_plain: u64,
     /// Root (plan 46 M1.2 step 14): rowless releases that began a seal of the

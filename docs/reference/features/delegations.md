@@ -1167,8 +1167,9 @@ The subtree is designated offline to another node that is unreachable
 ### A generation is `waiting_for_group`
 
 The delegate is silent, or it released its stream rowless asking for the
-group's seal (capped below its unshipped appends, or not installed or
-restarted without; a sticky or designated holder's release included: those
+group's seal (capped below its unshipped appends, held on another boot and not
+installed again, or restarted after a reboot; a generation the delegate never
+held ends at its cut with no seal; a sticky or designated holder's release included: those
 grants have no expiry to end the wait), and no member of its recorded backup
 group has handed over the tail the root needs to end the generation (see
 "Failures"). The wait for the seal has no time bound: it needs one live strict
@@ -1180,6 +1181,15 @@ hold the tail), or, if they are gone for good,
 that group held are lost. It is refused while the root heard from the delegate
 or a member within the delegation's ttl; confirm from another node that they
 are down, then add `--force`.
+
+The wait that remains is inherent: a delegate that rebooted since its grant
+acknowledged rows through its group before its journal was synced, so rows
+above its journal may exist only on the group. When its strict backup is down
+too, the outcome of an operation on that generation is unknown until the backup
+returns or the operator acts, and a client waiting on it gets an `EIO` once its
+settle deadline passes. After a member has answered, the root waits one
+`forward_timeout_ms` for the delegate's stream to reach the release's cut
+(none when the delegate never installed the generation).
 
 ### The root lease never moves
 

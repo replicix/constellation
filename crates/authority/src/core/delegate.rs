@@ -594,6 +594,7 @@ impl PendingRelease {
         note.locks.barrier = note.locks.barrier.max(new.locks.barrier);
         note.leaving |= new.leaving;
         note.seal |= new.seal;
+        note.no_stream &= new.no_stream;
         self.note = note;
         // A release that journaled no row ends the stream at its cut: the
         // note is acknowledged by the batch that carries it.
@@ -4468,7 +4469,7 @@ impl Core {
             });
             if cursor < release_cut.unwrap_or(0) && !cut_waived {
                 if fresh {
-                    let at = now.wait.plus(self.release_seal_window());
+                    let at = now.wait.plus(self.release_stream_window());
                     self.arm_release_seal_timer(gen, at, out);
                 }
                 if first {
@@ -7392,17 +7393,27 @@ impl Core {
             {
                 self.stats.deleg_release_rowless_unseen += 1;
             }
-            let cut = replica
-                .delegate_idx(gen)
-                .min(self.holder_append_cap(gen, replica));
-            // (The rows this node holds of a stream it never took up sit at
-            // its journal's end; the group may hold more: sealed.)
+            let idx = replica.delegate_idx(gen);
+            let cut = idx.min(self.holder_append_cap(gen, replica));
+            // A stream this node never took up (on this boot) will not be
+            // streamed by it: the rows it holds of it sit at its journal's end
+            // and never reach the root's cursor, and the group may hold more
+            // than the journal does. So the cut is exact only when this node
+            // holds no row of the generation at all (`idx == 0`) and never
+            // executed under it on another boot (`deleg_note_held` syncs the
+            // record before the first row, so no record means no row was
+            // executed). Anything else asks for the seal.
+            let seal = idx > 0 || replica.deleg_held_on_another_boot(gen, now.boot.id);
+            if seal {
+                self.stats.deleg_release_rowless_unseen_sealed += 1;
+            }
             let note = constellation_meta::locks::ReleaseNote {
                 dirs: asked.iter().copied().collect(),
                 end_at: Some(cut),
                 locks: Default::default(),
                 leaving: self.dl.leave_self,
-                seal: true,
+                seal,
+                no_stream: seal,
             };
             self.send_release_cut(gen, from, note, out);
             self.lock_reserve_all(now, replica, out);
@@ -7517,7 +7528,7 @@ impl Core {
             if capped {
                 self.stats.deleg_release_rowless_capped += 1;
             } else if rebooted {
-                self.stats.deleg_release_rowless_unseen += 1;
+                self.stats.deleg_release_rowless_rebooted += 1;
             } else if cut < idx {
                 self.stats.deleg_release_rowless_lost_dep += 1;
             } else {
@@ -7593,6 +7604,7 @@ impl Core {
             locks,
             leaving: self.dl.leave_self,
             seal,
+            no_stream: false,
         };
         let parked = {
             let d = self.dl.mine.get_mut(&gen).expect("present");
@@ -8347,7 +8359,7 @@ impl Core {
         gen: u64,
         dirs: &[Ino],
         whole: bool,
-        cut: Option<(u64, bool)>,
+        cut: Option<(u64, bool, bool)>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -8357,9 +8369,9 @@ impl Core {
         if g.ended {
             return;
         }
-        let (cut, seal) = match cut {
-            Some((cut, seal)) => (Some(cut), seal),
-            None => (None, false),
+        let (cut, seal, no_stream) = match cut {
+            Some((cut, seal, no_stream)) => (Some(cut), seal, no_stream),
+            None => (None, false, false),
         };
         for dir in dirs {
             g.dirs.remove(dir);
@@ -8395,6 +8407,9 @@ impl Core {
                 self.stats.deleg_release_seals += 1;
                 g.release_cut = Some(th);
                 g.release_seal = true;
+                // A releasing node with no stream sends no row up to the
+                // cut: nothing to wait for after the group's answer.
+                g.release_cut_waived |= no_stream;
                 if g.recall != RecallPhase::Sealing {
                     g.recall_before_seal = g.recall;
                     g.recall = RecallPhase::Sealing;
@@ -8471,6 +8486,7 @@ impl Core {
             return;
         }
         let window = self.release_seal_window();
+        let stream_window = self.release_stream_window();
         let strict: Vec<NodeId> = g.group.strict().to_vec();
         let best_effort = g.group.best_effort();
         let in_hand = g
@@ -8484,7 +8500,7 @@ impl Core {
                 if let Some(g) = self.dl.gens.get_mut(&gen) {
                     let due = g
                         .release_answered_at
-                        .is_some_and(|at| now.wait.since(at) >= window as i64);
+                        .is_some_and(|at| now.wait.since(at) >= stream_window as i64);
                     g.release_cut_waived |= g.release_answered.is_some() && due;
                 }
             }
@@ -8538,15 +8554,22 @@ impl Core {
         let mut again = now.wait.plus(window);
         if let Some(g) = self.dl.gens.get(&gen) {
             if let (Some(at), false) = (g.release_answered_at, g.release_cut_waived) {
-                again = again.min(at.plus(window)).max(now.wait);
+                again = again.min(at.plus(stream_window)).max(now.wait);
             }
         }
         self.arm_release_seal_timer(gen, again, out);
     }
 
-    /// The window of the release seal's retry and of the wait for the stream.
+    /// The window of the release seal's retry.
     fn release_seal_window(&self) -> u64 {
         self.cfg.backup_takeover_ms.max(self.cfg.forward_timeout_ms)
+    }
+
+    /// The wait for the delegate's stream to reach a released cut after the
+    /// group has answered: the rows in flight on the stream are one round
+    /// trip away.
+    fn release_stream_window(&self) -> u64 {
+        self.cfg.forward_timeout_ms
     }
 
     /// (Re)arm `Timer::DelegReleaseSeal(gen)` at `at`.
@@ -10009,13 +10032,14 @@ impl Core {
         // with the rows), and the ops that waited for them run.
         let cut = released.as_ref().and_then(|n| n.end_at);
         let seal = released.as_ref().is_some_and(|n| n.seal);
+        let no_stream = released.as_ref().is_some_and(|n| n.seal && n.no_stream);
         if !released_rows.is_empty() || released_all || cut.is_some() {
             self.root_release_appended(
                 now,
                 gen,
                 &released_rows,
                 released_all,
-                cut.map(|c| (c, seal)),
+                cut.map(|c| (c, seal, no_stream)),
                 replica,
                 out,
             );
