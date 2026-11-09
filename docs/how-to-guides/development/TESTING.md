@@ -2342,7 +2342,9 @@ relay of its own so requests can be attributed per role):
     a clean remount after the holder is gone serves everything.
 - **Plan 30 M11 scenarios** (`crates/harness/src/scenarios/m11.rs`):
   delegated sub-sequencers, one log. Every mount has a 20 s lease TTL,
-  idle release off, no backup peer (`CONSTELLATION_BACKUP_RTT_BUDGET_MS=0`),
+  idle release off, no backup peer (`CONSTELLATION_BACKUP_RTT_BUDGET_MS=0`; the
+  scenarios that delegate add a real budget and `CONSTELLATION_BACKUPS=0`, since a
+  budget of 0 admits no peer and refuses a stealable delegation),
   a 3 s grant TTL (`CONSTELLATION_DELEGATION_TTL_MS=3000`) and a handoff
   grace of 10 minutes (`CONSTELLATION_LEASE_WANTED_GRACE_MS=600000`: the
   root keeps its lease through the bursts of forwarded writes the

@@ -61635,6 +61635,31 @@ mod step9_one_stream_per_node {
         );
     }
 
+    /// A budget of 0 admits no peer: a stealable grant is refused whatever
+    /// the link measures, a 0 ms round trip and an unmeasured link included
+    /// (fail-before: a link measured at exactly 0 ms passed, so the outcome
+    /// depended on load). A sticky grant still goes through.
+    #[test]
+    fn a_zero_budget_admits_no_peer_whatever_the_link_measures() {
+        for rtt in [Some(0), Some(1), None] {
+            let (mut h, dirs) = root_with_peer(rtt);
+            h.core.cfg.backup_rtt_budget_ms = 0;
+            assert!(!h.core.delegate_group_in_budget(2), "rtt {rtt:?}");
+            let mut out = Vec::new();
+            let why = h
+                .core
+                .delegate_dir(h.clk(), dirs[0], 2, DelegKind::Manual, &h.meta, &mut out)
+                .expect_err("a zero budget granted a stealable delegation");
+            assert!(
+                why.contains("no peer within the backup RTT budget"),
+                "{why}"
+            );
+            h.core
+                .delegate_dir(h.clk(), dirs[1], 2, DelegKind::Sticky, &h.meta, &mut out)
+                .expect("a sticky grant needs no group");
+        }
+    }
+
     /// Plan 46 M1.2 step 13: the placement does not delegate a far writer
     /// (its ops stay with the root, which sequences them as it does a
     /// non-delegated writer's), counting the skip instead of asking every

@@ -350,7 +350,8 @@ pub struct Config {
     pub ack_s3: bool,
     /// `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (default 5): a peer is a
     /// backup candidate only while its measured RTT is within this. 0
-    /// means no backup ever (today's behaviour).
+    /// means no backup ever, and no peer is within budget: a stealable
+    /// delegation (placed or manual) is refused whatever the link measures.
     pub backup_rtt_budget_ms: u64,
     /// `CONSTELLATION_BACKUPS` (default 1): at most this many backups.
     pub backups_max: usize,

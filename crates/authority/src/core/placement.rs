@@ -248,7 +248,11 @@ impl Core {
     /// group is its recorded backup and the root. The root counts when its
     /// link to `node` is within `backup_rtt_budget_ms` (an unmeasured or
     /// unknown link counts: what is not known to be far is not refused),
-    /// and so does a backup the node's live stream already records. A node
+    /// and so does a backup the node's live stream already records. A budget
+    /// of 0 admits no peer (no backup is ever selected, and no link is
+    /// "within" it, a 0 ms measurement included), so it refuses every node
+    /// whatever the measured link: the outcome never depends on whether a
+    /// round trip rounded to 0 ms. A node
     /// with neither would answer its own clients on its disk alone, which
     /// no committed-or-final answer may do.
     pub(crate) fn delegate_group_in_budget(&self, node: NodeId) -> bool {
@@ -256,6 +260,9 @@ impl Core {
             return true;
         }
         let budget = self.cfg.backup_rtt_budget_ms;
+        if budget == 0 {
+            return false;
+        }
         if self
             .links
             .get(&node)
