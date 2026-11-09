@@ -1785,7 +1785,7 @@ pub fn lock_contention_delegated(_seed: u64) -> Result<()> {
     let (_env, _root, mut clients, _) = super::m11::cluster_with_deleg_ttl(
         NAME,
         &["a", "b", "c"],
-        &[],
+        super::m11::DELEGATES_UNBACKED,
         0,
         (!at_default).then_some(DELEG_TTL_MS),
     )?;
@@ -1961,8 +1961,13 @@ pub fn lock_contention_delegated_moves(_seed: u64) -> Result<()> {
     // A grant capped at 3 s and its margin, two moves' margins, and the
     // handoff itself; a restamp is 21 s per move.
     const MAX_GAP: Duration = Duration::from_millis(9_000);
-    let (_env, _root, mut clients, _) =
-        super::m11::cluster_with_deleg_ttl(NAME, &["a", "b", "c"], &[], 0, Some(DELEG_TTL_MS))?;
+    let (_env, _root, mut clients, _) = super::m11::cluster_with_deleg_ttl(
+        NAME,
+        &["a", "b", "c"],
+        super::m11::DELEGATES_UNBACKED,
+        0,
+        Some(DELEG_TTL_MS),
+    )?;
     let result = (|| -> Result<()> {
         let b_id = node_id(&clients[1])?;
         std::fs::create_dir(clients[0].mnt.join("d1"))?;

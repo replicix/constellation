@@ -259,7 +259,8 @@ pub(super) fn dist(v: &[Duration]) -> String {
 }
 
 /// Two nodes, `/d1` delegated to `b`; `b` the root's backup when
-/// `backed`, else no backup at all (`CONSTELLATION_BACKUP_RTT_BUDGET_MS=0`)
+/// `backed`, else no backup at all (`CONSTELLATION_BACKUPS=0`; the budget
+/// stays real, since a budget of 0 admits no peer and refuses the delegation)
 /// and a 20 s root lease, so the TTL takeover fits a scenario.
 fn delegated_pair(
     name: &str,
@@ -279,7 +280,8 @@ pub(super) fn delegated_pair_with(
     if !backed {
         // (A caller's own value for either wins.)
         for (k, v) in [
-            ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"),
+            ("CONSTELLATION_BACKUPS", "0"),
+            ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "500"),
             ("CONSTELLATION_LEASE_TTL_MS", "20000"),
         ] {
             if !extra.iter().any(|(e, _)| *e == k) {
@@ -396,7 +398,8 @@ fn ttl_bound(lease_ttl: Duration) -> Duration {
 fn pair_timings(backed: bool) -> Timings {
     let mut env: Vec<(&str, &str)> = ENV.to_vec();
     if !backed {
-        env.push(("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"));
+        env.push(("CONSTELLATION_BACKUPS", "0"));
+        env.push(("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "500"));
         env.push(("CONSTELLATION_LEASE_TTL_MS", "20000"));
     }
     Timings::from_pairs(&env)

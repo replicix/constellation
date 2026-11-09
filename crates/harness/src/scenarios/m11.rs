@@ -98,6 +98,17 @@ type Cluster = (
     Vec<CountingProxy>,
 );
 
+/// The extras of a scenario that delegates by hand (or by the placement)
+/// and wants no backup. The cluster pins the budget to 0 (no peer), and
+/// since plan 46 step 13 a budget of 0 admits no peer, so no stealable
+/// delegation is granted at all. A real budget lets the root be the
+/// delegate's group, whatever the load; `CONSTELLATION_BACKUPS=0` keeps
+/// every node from picking a backup, as the pin did.
+pub(super) const DELEGATES_UNBACKED: &[(&str, &str)] = &[
+    ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "500"),
+    ("CONSTELLATION_BACKUPS", "0"),
+];
+
 /// `names` nodes on a fresh filesystem with `extra` env on every mount;
 /// node 0 holds the lease, `f` exists everywhere. The first `counting`
 /// nodes reach S3 through a counting proxy each (returned in order).
@@ -279,12 +290,27 @@ fn tail_lines(path: &std::path::Path, n: usize) -> String {
 
 /// `constellation delegate <path> --to <node>` through the root's
 /// control socket.
+///
+/// A refusal for want of a peer within the backup budget is retried for a
+/// while: the root's latest round-trip sample to the node (a node that has
+/// just rejoined, on a loaded host) can be far over the budget for a moment,
+/// and the next samples are not.
 pub(super) fn delegate(root: &Client, path: &str, node: u64) -> Result<serde_json::Value> {
-    root.control(
-        "designation.delegate",
-        serde_json::json!({"path": path, "node": node}),
-    )
-    .with_context(|| format!("delegating {path} to {node} on {}", root.name))
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match root.control(
+            "designation.delegate",
+            serde_json::json!({"path": path, "node": node}),
+        ) {
+            Err(e)
+                if Instant::now() < deadline
+                    && format!("{e:#}").contains("no peer within the backup RTT budget") =>
+            {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            r => return r.with_context(|| format!("delegating {path} to {node} on {}", root.name)),
+        }
+    }
 }
 
 /// `constellation undelegate <path>`.
@@ -489,7 +515,8 @@ fn puts_of(p: &CountingProxy, prefix: &str) -> usize {
 pub fn delegated_subtrees(_seed: u64) -> Result<()> {
     const NAME: &str = "delegated-subtrees";
     const FILES: usize = 100;
-    let (_env, _root, mut clients, proxies) = cluster(NAME, &["a", "b", "c"], &[], 3)?;
+    let (_env, _root, mut clients, proxies) =
+        cluster(NAME, &["a", "b", "c"], DELEGATES_UNBACKED, 3)?;
     let result = (|| -> Result<()> {
         let a = &clients[0];
         let b = &clients[1];
@@ -742,7 +769,7 @@ pub fn delegated_subtrees(_seed: u64) -> Result<()> {
 /// the subtrees can be delegated again.
 pub fn cross_subtree_rename(_seed: u64) -> Result<()> {
     const NAME: &str = "cross-subtree-rename";
-    let (_env, _root, mut clients, _) = cluster(NAME, &["a", "b", "c"], &[], 0)?;
+    let (_env, _root, mut clients, _) = cluster(NAME, &["a", "b", "c"], DELEGATES_UNBACKED, 0)?;
     let result = (|| -> Result<()> {
         let a = &clients[0];
         let b = &clients[1];
@@ -905,7 +932,7 @@ fn delegate_crash_with(scenario: &'static str, default_ttl: Option<u64>) -> Resu
     let (_env, _root, mut clients, _) = cluster_with_deleg_ttl(
         scenario,
         &["a", "b", "c"],
-        &[],
+        DELEGATES_UNBACKED,
         0,
         default_ttl.is_none().then_some(DELEG_TTL_MS),
     )?;
@@ -1025,7 +1052,7 @@ fn delegate_crash_with(scenario: &'static str, default_ttl: Option<u64>) -> Resu
 pub fn marker_order(_seed: u64) -> Result<()> {
     const NAME: &str = "marker-order";
     const SECS: u64 = 12;
-    let (_env, _root, mut clients, _) = cluster(NAME, &["a", "b", "c"], &[], 0)?;
+    let (_env, _root, mut clients, _) = cluster(NAME, &["a", "b", "c"], DELEGATES_UNBACKED, 0)?;
     let result = (|| -> Result<()> {
         let a = &clients[0];
         let b = &clients[1];
@@ -1159,7 +1186,7 @@ pub fn marker_order(_seed: u64) -> Result<()> {
 /// conflict, and `d1` can be delegated again.
 pub fn delegate_partition(_seed: u64) -> Result<()> {
     const NAME: &str = "delegate-partition";
-    let (_env, root, mut clients, _) = cluster(NAME, &["a", "b", "c"], &[], 0)?;
+    let (_env, root, mut clients, _) = cluster(NAME, &["a", "b", "c"], DELEGATES_UNBACKED, 0)?;
     let result = (|| -> Result<()> {
         let a = &clients[0];
         let b = &clients[1];
@@ -1591,6 +1618,8 @@ pub fn auto_placement(_seed: u64) -> Result<()> {
             ("CONSTELLATION_DELEGATION_MIN_OPS", "20"),
             ("CONSTELLATION_DELEGATION_DWELL_MS", "4000"),
             ("CONSTELLATION_DELEGATION_COOLDOWN_MS", "2000"),
+            ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "500"),
+            ("CONSTELLATION_BACKUPS", "0"),
         ],
         0,
     )?;
