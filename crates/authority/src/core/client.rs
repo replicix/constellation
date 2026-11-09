@@ -131,7 +131,7 @@ pub(crate) struct ClientOp {
     /// generation): what the op still lacks is the commit of the delegate's
     /// rows through the root (it awaits the log). The sim judges its
     /// unsettled `EIO` against a root, not against the delegate it already
-    /// heard (`Stats::unsettled_accepted_by_delegate`).
+    /// heard (`Core::take_unsettled_accepted`).
     pub accepted_by_delegate: bool,
     /// Plan 46 M0.3 (B): the root that last answered this op `Held` (it is
     /// alive and holds the op by design): the backoff retry goes back to
@@ -1612,9 +1612,11 @@ impl Core {
         } else {
             outcome
         };
-        if gen != 0 && matches!(&outcome, MutateOutcome::Accepted { .. }) {
+        if matches!(&outcome, MutateOutcome::Accepted { .. }) {
+            // The latest acceptance decides: a root's after a delegate's
+            // leaves the op awaiting the root's log, not a delegate's rows.
             if let Some(c) = self.clients.get_mut(&rid) {
-                c.accepted_by_delegate = true;
+                c.accepted_by_delegate = gen != 0;
             }
         }
         match outcome {
@@ -3686,6 +3688,9 @@ impl Core {
             );
             let c = self.clients.get_mut(&rid).expect("present");
             c.phase = Phase::WaitingLease;
+            // No longer awaiting the accepting delegate's rows: a live
+            // delegate may settle the op afresh, without a root.
+            c.accepted_by_delegate = false;
             if let Some(t) = c.timer.take() {
                 self.cancel_timer(t, out);
             }

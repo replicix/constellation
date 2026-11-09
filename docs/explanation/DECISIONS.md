@@ -3357,7 +3357,9 @@ refusals: the failing ops were never refused. A delegate had executed and
 answered each, and the requester awaited the log for its rows, which could not
 reach a root that had restarted and not yet re-adopted its lease. In seed 907
 the root did not hold the lease before the settle ran out at all (a restarted
-node is a cold claimant for a TTL): no root existed to commit the rows. The sim
+node claims its own untracked lease at once only when the process that went
+down still held it; one that was deposed or sealed before the restart is a cold
+claimant for a TTL): no root existed to commit the rows. The sim
 therefore judges the unsettled `EIO` of an op a delegate had answered
 (`ClientOp::accepted_by_delegate`, named by rid) against a root, not against
 the delegate the requester had already heard; a root in force that could take

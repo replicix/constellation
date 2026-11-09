@@ -5581,6 +5581,35 @@ fn an_op_awaiting_a_dead_epochs_log_is_not_rerouted_only_after_the_replays_behin
     assert_eq!(requester.core.stats.awaiting_log_rerouted, 1);
 }
 
+/// An op a delegate accepted and that the log has since moved past is asked
+/// of the new holder again: it no longer awaits the accepting delegate's
+/// rows (a live delegate may settle it without a root), so its unsettled
+/// `EIO` is not named as one of an op a delegate answered, for the sim to
+/// judge against a root. Fails on the parent: the mark stayed set.
+#[test]
+fn a_rerouted_op_is_not_named_as_accepted_by_a_delegate_at_its_unsettled_eio() {
+    let (mut requester, rid, _) = awaiting_log_forward("v");
+    requester.core.track_unsettled_designation();
+    {
+        let c = requester.core.clients.get_mut(&rid).unwrap();
+        c.settle = true;
+        c.accepted_by_delegate = true;
+    }
+    crate::replica::Replica::apply_segment(&requester.meta, 1, 2, 0, &[], &[], &[]).unwrap();
+    requester.core.ship.max_epoch = 2;
+    requester.core.ship.next_seq = 2;
+    requester.core.lease.cached_holder = Some(3);
+    let _ = activity(&mut requester);
+    assert_eq!(requester.core.stats.awaiting_log_rerouted, 1);
+    assert!(!requester.core.clients[&rid].accepted_by_delegate);
+    let mut out = Vec::new();
+    let now = requester.clk();
+    requester
+        .core
+        .finish_in_doubt(now, rid, &requester.meta, &mut out);
+    assert!(!requester.core.take_unsettled_accepted(rid));
+}
+
 /// Not moot: the acceptance was under the epoch this node holds (a
 /// delegate's stream, or a lease this node re-took at the same epoch) —
 /// the log carries it; and a continuation-epoch hold (S3 away:
