@@ -4432,7 +4432,14 @@ impl Core {
                      the generation ends before it"
                 );
             }
-            if !ends_recall || (drained_to < tail.end && !lost) {
+            // A tail the root's cursor already covers has nothing to append,
+            // so a generation the delegate released (plan 46 M1.2 step 14)
+            // does not wait for a root that cannot append yet (a takeover
+            // gate waiting out the read-delegation quarantine): ending it
+            // appends nothing, as an unsealed release ends at once, and the
+            // delegate's parked ops would otherwise wait the quarantine out.
+            let nothing_to_append = release_seal && tail.end <= drained_to;
+            if (!ends_recall && !nothing_to_append) || (drained_to < tail.end && !lost) {
                 if first {
                     self.stats.deleg_seal_waits += 1;
                 }
