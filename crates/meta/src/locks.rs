@@ -552,6 +552,11 @@ pub struct ReleaseNote {
     /// answers for a stream it never installed or restarted without. A cut
     /// that is exact (a lost dependency, a plain stop) leaves it clear.
     pub seal: bool,
+    /// With `seal`: the releasing node has no stream for the generation (it
+    /// never installed it) and sends no row after this answer, so the root
+    /// does not wait for the stream to reach the cut once a strict member
+    /// has answered.
+    pub no_stream: bool,
 }
 
 /// Join two lock floors (positions: watermarks, so the join is what both

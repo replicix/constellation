@@ -414,6 +414,7 @@ fn release_answer(
         locks,
         leaving: false,
         seal: false,
+        no_stream: false,
     };
     deliver_stream(h, node, gen, vec![row], Some(note))
 }
@@ -433,6 +434,7 @@ fn release_note_only(
         locks,
         leaving: false,
         seal: false,
+        no_stream: false,
     };
     deliver_stream(h, node, gen, Vec::new(), Some(note))
 }
@@ -44700,7 +44702,7 @@ mod deleg_group {
     }
 
     /// Node 2 forwards a create in `dir` to the delegate (`req`).
-    fn forward_create(h: &mut Harness, dir: Ino, seq: u64, req: u64) -> Vec<Action> {
+    pub(super) fn forward_create(h: &mut Harness, dir: Ino, seq: u64, req: u64) -> Vec<Action> {
         let ino = h.meta.allocate_ino(dir).unwrap();
         h.step(Event::Peer {
             from: 2,
@@ -45700,7 +45702,8 @@ mod deleg_group {
         });
         let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("no release: {out:?}"));
         assert!(note.end_at.is_some() && note.seal, "{note:?}");
-        assert_eq!(h.core.stats.deleg_release_rowless_unseen, 1);
+        assert_eq!(h.core.stats.deleg_release_rowless_rebooted, 1);
+        assert_eq!(h.core.stats.deleg_release_rowless_unseen, 0);
         assert_eq!(h.core.stats.deleg_release_rowless_plain, 0);
     }
 
@@ -62172,6 +62175,7 @@ mod step9_one_stream_per_node {
             locks: Default::default(),
             leaving: false,
             seal: false,
+            no_stream: false,
         };
         deliver_stream(&mut h, 3, gen, vec![row], Some(note));
         assert!(
@@ -62240,6 +62244,7 @@ mod step9_one_stream_per_node {
             locks: Default::default(),
             leaving: false,
             seal: false,
+            no_stream: false,
         };
         // The release row alone: the delegate's earlier row is missing (a
         // batch lost), so nothing is appended.
@@ -63109,6 +63114,7 @@ mod step9_one_stream_per_node {
             locks: Default::default(),
             leaving: true,
             seal: false,
+            no_stream: false,
         };
         deliver_stream(&mut r, 3, gen, Vec::new(), Some(note));
         let out = r.step(Event::Control {
@@ -63672,6 +63678,7 @@ mod step9_one_stream_per_node {
                 },
                 leaving: false,
                 seal: false,
+                no_stream: false,
             },
             row: Some(4),
             first_row: Some(4),
@@ -65787,6 +65794,7 @@ mod step14_release_seal {
             locks: Default::default(),
             leaving: false,
             seal,
+            no_stream: false,
         };
         deliver_stream(h, 3, 7, Vec::new(), Some(note))
     }
@@ -65965,24 +65973,126 @@ mod step14_release_seal {
         assert_eq!(h.core.stats.deleg_release_seals, 0);
     }
 
-    /// A stream this node never installed answers a release rowless and asks
-    /// for the seal: the rows it holds of it are not the group's.
-    #[test]
-    fn a_release_of_a_stream_never_installed_asks_for_the_seal() {
-        let mut h = Harness::new(3);
+    fn never_installed_release(h: &mut Harness) -> Vec<Action> {
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
-        let out = h.step(Event::Peer {
+        h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
                 req: OpId(5),
                 gen: 7,
                 dirs: Vec::new(),
             },
-        });
+        })
+    }
+
+    /// A stream this node never installed and never held (R1): it executed no
+    /// row of it, the group holds no row it acknowledged, and the cut is
+    /// exact. No seal. Fails before the fix (the answer sealed
+    /// unconditionally).
+    #[test]
+    fn a_release_of_a_stream_never_held_here_ends_at_its_cut_without_the_seal() {
+        let mut h = Harness::new(3);
+        let out = never_installed_release(&mut h);
         let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("no release: {out:?}"));
-        assert!(note.end_at.is_some() && note.seal, "{note:?}");
+        assert!(
+            note.end_at.is_some() && !note.seal && !note.no_stream,
+            "{note:?}"
+        );
         assert_eq!(h.core.stats.deleg_release_rowless_unseen, 1);
+        assert_eq!(h.core.stats.deleg_release_rowless_unseen_sealed, 0);
+        // The root ends it at its cut as `Drained`, no seal.
+        let mut r = root_with_delegate_backed_by(4);
+        deliver_stream(&mut r, 3, 7, vec![row(1), row(2)], None);
+        let out = rowless_note(&mut r, 2, note.seal);
+        assert!(seal_reqs(&out, 4).is_empty(), "sealed: {out:?}");
+        assert_eq!(r.core.dl.gens[&7].recall, RecallPhase::Drained(2));
+    }
+
+    /// A stream this node never installed but held on another boot (its grant
+    /// record names a boot that is not this one): the rows it executed sit in
+    /// a journal that may lack them, and the group may hold them. Seal. The
+    /// answer says it has no stream (nothing to wait for).
+    #[test]
+    fn a_release_of_a_stream_held_here_on_another_boot_asks_for_the_seal() {
+        let mut h = Harness::new(3);
+        h.meta.deleg_note_held(7, 99).unwrap();
+        let out = never_installed_release(&mut h);
+        let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("no release: {out:?}"));
+        assert!(
+            note.end_at.is_some() && note.seal && note.no_stream,
+            "{note:?}"
+        );
+        assert_eq!(h.core.stats.deleg_release_rowless_unseen, 1);
+        assert_eq!(h.core.stats.deleg_release_rowless_unseen_sealed, 1);
+    }
+
+    /// A stream this node holds rows of but will not stream (a restart on the
+    /// same boot that did not take the generation up again): its rows never
+    /// reach the root's cursor, so the cut is not exact and the group is
+    /// sealed (seeds 387, 497 of `long-delegated-backup+commit`: ending at
+    /// `Drained(cut)` waited for rows that never came).
+    #[test]
+    fn a_release_of_a_stream_with_rows_in_the_journal_not_taken_up_asks_for_the_seal() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let _ = super::deleg_group::forward_create(&mut h, dir, 1, 500);
+        assert!(Replica::delegate_idx(&h.meta, 7) > 0);
+        h.core.dl.mine.remove(&7);
+        let out = never_installed_release(&mut h);
+        let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("no release: {out:?}"));
+        assert!(
+            note.end_at.is_some() && note.seal && note.no_stream,
+            "{note:?}"
+        );
+        assert_eq!(h.core.stats.deleg_release_rowless_unseen_sealed, 1);
+    }
+
+    /// R4: the answer of a releasing node that has no stream is not waited
+    /// past: once the group has answered, the generation ends at the cursor
+    /// at once, with no window. Fails before (it waited for the cursor to
+    /// reach the cut).
+    #[test]
+    fn a_release_without_a_stream_ends_when_the_group_has_answered() {
+        let mut h = root_with_delegate_backed_by(4);
+        deliver_stream(&mut h, 3, 7, vec![row(1)], None);
+        let dirs = h.core.dl.gens[&7].dirs.keys().copied().collect();
+        let note = constellation_meta::locks::ReleaseNote {
+            dirs,
+            end_at: Some(3),
+            locks: Default::default(),
+            leaving: false,
+            seal: true,
+            no_stream: true,
+        };
+        let out = deliver_stream(&mut h, 3, 7, Vec::new(), Some(note));
+        let req = seal_reqs(&out, 4)[0];
+        assert!(!h.core.dl.gens[&7].ended);
+        h.step(sealed(req, Vec::new()));
+        let g = &h.core.dl.gens[&7];
+        assert!(g.ended, "waited for a stream that is not coming");
+        assert_eq!(g.cursor, 1);
+    }
+
+    /// R4: with a stream the wait for its rows is one stream round trip
+    /// (`forward_timeout_ms`) after the answer, not `backup_takeover_ms`.
+    /// Fails before (waited the longer of the two).
+    #[test]
+    fn the_wait_for_the_stream_after_the_answer_is_a_forward_timeout() {
+        let mut h = root_with_delegate_backed_by(4);
+        assert!(h.core.cfg.backup_takeover_ms > h.core.cfg.forward_timeout_ms);
+        deliver_stream(&mut h, 3, 7, vec![row(1)], None);
+        let out = rowless_release(&mut h, 2);
+        let req = seal_reqs(&out, 4)[0];
+        let out = h.step(sealed(req, Vec::new()));
+        let answer_timer = timers(&out, TimerKind::DelegReleaseSeal);
+        assert_eq!(answer_timer.len(), 1, "{out:?}");
+        h.advance(h.core.cfg.forward_timeout_ms + 10);
+        h.step(Event::Timer {
+            id: answer_timer[0],
+        });
+        let g = &h.core.dl.gens[&7];
+        assert!(g.ended, "still waiting past the forward timeout");
+        assert_eq!(g.cursor, 1);
     }
 
     /// A root whose generation's end waits for a previous root asks the group

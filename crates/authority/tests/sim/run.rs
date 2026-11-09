@@ -833,6 +833,15 @@ pub enum FastPath {
 }
 
 /// Core tunables scaled down for simulation (seconds, not minutes).
+/// How long (simulated) the operator tries an abandon the root answers "cannot
+/// end now" / "try again" before the seed fails with the last answer.
+pub const OPERATOR_RETRY_CAP_MS: u64 = 30_000;
+
+/// Whether the operator tries again: the first refusal was less than the cap ago.
+pub fn operator_retries(first_refusal_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(first_refusal_ms) < OPERATOR_RETRY_CAP_MS
+}
+
 pub fn sim_core_config(node_id: NodeId, incarnation: u32) -> Config {
     let mut c = Config::defaults(node_id, incarnation);
     c.ttl_ms = 6_000;
@@ -4784,6 +4793,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             // The generations the operator saw waiting on the root, and
             // since when (C2e).
             let mut gen_since: BTreeMap<(NodeId, u64), u64> = BTreeMap::new();
+            // Since when each generation's abandon has been answered "try
+            // again" / "cannot end now": a root that never becomes usable
+            // would otherwise keep the operator, and the seed, waiting for
+            // ever.
+            let mut retrying_since: BTreeMap<(NodeId, u64), u64> = BTreeMap::new();
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 for id in cluster.ids() {
@@ -4886,7 +4900,16 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                             // gate is open, or the end could not be journaled):
                             // the command says try again, and the operator does.
                             Err(e) if e.contains("cannot end") || e.contains("try again") => {
-                                done.remove(&(id, gen));
+                                let first = *retrying_since.entry((id, gen)).or_insert(now_ms);
+                                if !operator_retries(first, now_ms) {
+                                    operator_failures.lock().unwrap().push(format!(
+                                        "t={now_ms} node {id}: abandon-group --gen {gen} still refused \
+                                         {} s after the first try (the root never became usable): {e}",
+                                        OPERATOR_RETRY_CAP_MS / 1_000
+                                    ));
+                                } else {
+                                    done.remove(&(id, gen));
+                                }
                             }
                             Err(e) => operator_failures.lock().unwrap().push(format!(
                                 "t={now_ms} node {id}: abandon-group --gen {gen} refused: {e}"

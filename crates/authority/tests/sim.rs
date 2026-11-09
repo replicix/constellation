@@ -108,6 +108,14 @@ fn run_shard(shard: u64) {
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
+/// R3: the operator's retries after "cannot end now" are bounded.
+#[test]
+fn the_operators_retry_of_an_abandon_is_bounded() {
+    assert!(sim::run::operator_retries(1_000, 1_250));
+    assert!(sim::run::operator_retries(1_000, 30_999));
+    assert!(!sim::run::operator_retries(1_000, 31_000));
+}
+
 #[test]
 fn seeds_shard_0() {
     run_shard(0);
@@ -8030,7 +8038,7 @@ struct OracleTotals {
     /// Plan 46 M1.2 step 14: rowless releases by reason (capped, never
     /// installed or rebooted, lost dependency, plain stop), the releases the
     /// root sealed the group for, and the seal waits.
-    rowless: [u64; 7],
+    rowless: [u64; 9],
     unsettled_causes: std::collections::BTreeMap<String, u64>,
 }
 
@@ -8166,6 +8174,8 @@ impl OracleTotals {
                 st.deleg_seal_waits,
                 st.deleg_redelegated,
                 st.deleg_release_seals,
+                st.deleg_release_rowless_unseen_sealed,
+                st.deleg_release_rowless_rebooted,
             ]) {
                 *c += n;
             }
@@ -8415,11 +8425,13 @@ impl OracleTotals {
         );
         eprintln!(
             "SWEEP-ROWLESS {label} seeds {}/{seeds}: rowless releases by reason: capped {}, never \
-             installed or rebooted {}, lost dependency {}, plain stop {}; seal waits {}, \
-             re-delegated {}, group seals for a release {}",
+             installed {} (of which sealed: rows held or held on another boot {}), rebooted {}, lost dependency {}, \
+             plain stop {}; seal waits {}, re-delegated {}, group seals for a release {}",
             self.seeds,
             self.rowless[0],
             self.rowless[1],
+            self.rowless[7],
+            self.rowless[8],
             self.rowless[2],
             self.rowless[3],
             self.rowless[4],
