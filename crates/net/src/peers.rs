@@ -791,11 +791,15 @@ impl Peers {
             return;
         };
         if let Some(p) = inner.peers.lock().unwrap().get_mut(&node_id) {
-            if std::mem::replace(&mut p.connected, ok) != ok {
+            let was_up = std::mem::replace(&mut p.connected, ok);
+            if was_up != ok {
                 inner.links_changed();
             }
             if ok {
-                if !took.is_zero() {
+                // The first exchange after the link was down (or never
+                // measured) includes dialling the connection: it is not
+                // the link's round trip.
+                if !took.is_zero() && was_up {
                     p.rtt_ms = Some(took.as_millis() as u64);
                 }
                 if path != PathKind::Unknown {
@@ -2784,7 +2788,9 @@ mod tests {
             service.lease_asks.lock().unwrap().as_slice(),
             [("p0".to_string(), 2)]
         );
-        // RTT is recorded for status output.
+        // RTT is recorded for status output, from the second exchange: the
+        // first one dialled the connection.
+        let _ = asker.request_lease("p0", None).await;
         let peer = asker
             .snapshot()
             .into_iter()

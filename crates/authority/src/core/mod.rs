@@ -2321,6 +2321,13 @@ pub struct Core {
     /// older read may predate the requester's registration and lack it.
     peer_requesters: BTreeMap<NodeId, WaitMs>,
     links: BTreeMap<NodeId, PeerLink>,
+    /// Each connected peer's measured round trips in the last placement
+    /// tick (one per directory snapshot), for the delegation group's
+    /// admission ([`Self::delegate_group_in_budget`]): a link is judged by
+    /// its best recent sample, so a single slow one (load, a rejoin) does
+    /// not refuse it, as one sample over budget does not recall a grant.
+    /// Cleared when the link goes down or is not measured.
+    rtt_recent: BTreeMap<NodeId, VecDeque<(WaitMs, u64)>>,
     /// I1 class 2: `Event::OwnLag` events this core has handled, and the
     /// highest count of them the driver had handed when it took the
     /// directory snapshot `links` was last set from (`Event::Peers`'s
@@ -2445,6 +2452,7 @@ impl Core {
             roster: Vec::new(),
             peer_requesters: Default::default(),
             links: BTreeMap::new(),
+            rtt_recent: BTreeMap::new(),
             lapses_seen: 0,
             peers_lapses: 0,
             peers_seen: false,
@@ -2776,6 +2784,7 @@ impl Core {
                         self.note_peer_heard(l.node, at);
                     }
                 }
+                self.note_rtt_samples(now.wait, &links);
                 self.links = links.into_iter().map(|l| (l.node, l)).collect();
                 // The directory now shows every requester it knows: the
                 // links are the truth from here on.

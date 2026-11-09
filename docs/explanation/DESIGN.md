@@ -1030,7 +1030,7 @@ lease and one log
   [ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)):
   the root grants a placed or manual delegation only to a node with a group
   within `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (a recorded backup, or the root
-  itself within the budget; a budget of 0 admits no peer), so every answer of a delegate waits for its group
+  itself within the budget; a budget of 0 admits no peer; the link is judged by its best round trip over the last placement tick, not its latest sample), so every answer of a delegate waits for its group
   (the root's append, when no backup is recorded) and a writer with no peer in
   budget is forwarded to the root until a sticky grant. A sticky or designated
   grant is final. Another node's forward always waits for the root.
