@@ -112,6 +112,9 @@ pub struct Oracles {
     pub reach: Arc<super::reach::Reach>,
     pub ops: Mutex<HashMap<Rid, constellation_meta::MutateOp>>,
     pub unsettled: Mutex<Vec<Unsettled>>,
+    /// The holder's release after its drain, judged from the root's side
+    /// (`Oracles::note_release_rows`), independent of the core's own counter.
+    pub release_drain: Mutex<ReleaseDrain>,
     /// The causal cut (plan 30 M11): a delegate waited for an op's deps
     /// before executing, so a root refuses a stream batch for lacking them
     /// only when it was deposed without knowing it. Each refusal at the
@@ -134,6 +137,15 @@ pub struct Oracles {
     >,
 }
 
+/// The holder's release rows seen, and those journaled before the root had
+/// appended the rows before them (`Oracles::note_release_rows`).
+#[derive(Default)]
+pub struct ReleaseDrain {
+    pub checked: BTreeMap<(NodeId, u64), u64>,
+    pub rows: u64,
+    pub violations: Vec<String>,
+}
+
 /// An unsettled `EIO` (the client was told in doubt after its settle went
 /// unanswered), and whether its requester was isolated (plan 46 M0.3).
 #[derive(Debug, Clone)]
@@ -143,6 +155,11 @@ pub struct Unsettled {
     pub at_ms: u64,
     pub window_ms: u64,
     pub verdict: super::reach::Verdict,
+    /// A non-stealable holder's refusal was held back for the op (it may
+    /// have run there): I4's exception for an unreachable non-stealable
+    /// holder, counted apart from the reachability classes and never a
+    /// violation (`Stats::unsettled_nonstealable_holder`).
+    pub designation_held: bool,
 }
 
 impl Unsettled {
@@ -274,6 +291,7 @@ impl Oracles {
             reach,
             ops: Mutex::new(HashMap::new()),
             unsettled: Mutex::new(Vec::new()),
+            release_drain: Mutex::new(ReleaseDrain::default()),
             causal_cut: Mutex::new(Vec::new()),
             sticky_released: Mutex::new(BTreeMap::new()),
             tables: Mutex::new(Vec::new()),
@@ -419,7 +437,14 @@ impl Oracles {
     /// end of its settle window (`window_ms`, the core's `settle_window`).
     /// Classified from the reachability history, never from a node's log:
     /// isolated (no sequencer reachable in the whole window) or not.
-    pub fn note_unsettled(&self, node: NodeId, rid: Rid, window_ms: u64, started: Option<u64>) {
+    pub fn note_unsettled(
+        &self,
+        node: NodeId,
+        rid: Rid,
+        window_ms: u64,
+        started: Option<u64>,
+        designation_held: bool,
+    ) {
         let at = self.reach.now_ms();
         // (A settle lasts at least a window; one whose deadline was extended
         // lasts from the arming of its second deadline.)
@@ -438,7 +463,68 @@ impl Oracles {
             at_ms: at,
             window_ms: window_ms.max(at.saturating_sub(started.unwrap_or(at))),
             verdict,
+            designation_held,
         });
+    }
+
+    /// Plan 46 M1.3 step 5: a holder journals the release row of a sticky
+    /// subtree by its own command (`judge`: this step journaled one) only once the root has appended every row of the stream
+    /// before it (the drain), or an acknowledged op of the subtree would be
+    /// unstreamed when the root takes the subtree back. Judged from the
+    /// stores, after each event of `node`: a new `SubtreeReleased` /
+    /// `StreamReleased` row of one of its streams at index `R` while no
+    /// store holds the stream appended through `R - 1` from the log is a
+    /// finding. Independent of the core's counter of the same defect
+    /// (`Stats::deleg_sticky_release_undrained`, which only the knob's own
+    /// branch increments).
+    pub fn note_release_rows(&self, node: NodeId, meta: &Meta, judge: bool) {
+        let table = meta.delegation_table();
+        let gens: Vec<u64> = table
+            .streams()
+            .filter(|s| s.node == node)
+            .map(|s| s.gen)
+            .collect();
+        for gen in gens {
+            let top = Replica::delegate_idx(meta, gen);
+            let from = {
+                let seen = self.release_drain.lock().unwrap();
+                seen.checked.get(&(node, gen)).copied().unwrap_or(0)
+            };
+            if top <= from {
+                continue;
+            }
+            let mut releases = Vec::new();
+            for tx in Replica::delegate_txs_from(meta, gen, from + 1, usize::MAX) {
+                if tx.records.iter().any(|r| {
+                    matches!(
+                        r,
+                        LogRecord::SubtreeReleased { node: n, .. }
+                            | LogRecord::StreamReleased { node: n, .. } if *n == node
+                    )
+                }) {
+                    releases.push(tx.idx);
+                }
+            }
+            let appended = self
+                .stores
+                .lock()
+                .unwrap()
+                .values()
+                .map(|m| Replica::log_stream_idx(&**m, gen))
+                .max()
+                .unwrap_or(0);
+            let mut seen = self.release_drain.lock().unwrap();
+            seen.checked.insert((node, gen), top);
+            for idx in releases.into_iter().filter(|_| judge) {
+                seen.rows += 1;
+                if appended + 1 < idx {
+                    seen.violations.push(format!(
+                        "node {node} journaled the release row {idx} of stream {gen} while the \
+                         root had appended it only through {appended}"
+                    ));
+                }
+            }
+        }
     }
 
     pub fn register(&self, id: NodeId, meta: Arc<Meta>, budget_ms: u64, stable_ms: u64) {
@@ -489,6 +575,10 @@ impl Oracles {
 // The archive index.
 // ---------------------------------------------------------------------
 
+/// A rid with both a completion and a refusal in the log: the rid, then the
+/// first outcome's and the contradicting one's segment and code.
+type Conflict = (Rid, (Seq, Option<Code>), (Seq, Option<Code>));
+
 /// What the bucket's log carries, kept synchronously: `Bucket` notes each
 /// segment as it lands (`NodeStore::put_opts`), and the index answers over
 /// the contiguous prefix from 1 with epoch fencing exactly as
@@ -510,6 +600,10 @@ struct ArchiveInner {
     /// applied, unfenced segment: (seq, record index, the outcome's code:
     /// `None` for `Completed`, `Some(code)` for `Refused`).
     outcomes: HashMap<Rid, (Seq, usize, Option<Code>)>,
+    /// Rids that have both a `Completed` and a `Refused` in applied, unfenced
+    /// segments: (rid, the first outcome's seq and code, the contradicting
+    /// one's seq and code).
+    conflicts: Vec<Conflict>,
     /// How many segments landed, their decompressed bytes and their bytes as
     /// stored (each seq once): the size of the log the run wrote, for the
     /// sweeps' comparison of two builds (`SWEEP-SEGMENTS`).
@@ -564,13 +658,42 @@ impl ArchiveIndex {
             } else {
                 for (i, rec) in seg.records.iter().enumerate() {
                     if let Some((rid, code)) = record_outcome(rec) {
-                        g.outcomes.entry(rid).or_insert((seq, i, code));
+                        match g.outcomes.get(&rid).copied() {
+                            None => {
+                                g.outcomes.insert(rid, (seq, i, code));
+                            }
+                            Some((s0, _, c0)) if c0.is_some() != code.is_some() => {
+                                if !g.conflicts.iter().any(|(r, _, _)| *r == rid) {
+                                    g.conflicts.push((rid, (s0, c0), (seq, code)));
+                                }
+                            }
+                            Some(_) => {}
+                        }
                     }
                 }
                 g.max_epoch = g.max_epoch.max(seg.epoch);
             }
             g.prefix = seq;
         }
+    }
+
+    /// Rids the applied log carries both a refusal and a completion of
+    /// (plan 46 M1.3 step 5: a refusal journaled for an op the sticky holder
+    /// ran): one description each.
+    pub fn conflicting_outcomes(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .conflicts
+            .iter()
+            .map(|(rid, (s0, c0), (s1, c1))| {
+                format!(
+                    "refused_and_completed: rid {rid:?} has both a refusal and a completion in the log: {} in segment {s0}, then {} in segment {s1}",
+                    c0.map_or("Completed".to_string(), |c| format!("Refused({c:?})")),
+                    c1.map_or("Completed".to_string(), |c| format!("Refused({c:?})")),
+                )
+            })
+            .collect()
     }
 
     /// Where the rid's outcome (`Completed { rid }` or `Refused { rid, .. }`)

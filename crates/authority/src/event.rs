@@ -928,6 +928,11 @@ pub enum PeerMsg {
         /// root's lock cut is as of the earliest of those, a moment the
         /// root itself knows to precede the renewal's send.
         sent_at: i64,
+        /// A refusal (`ttl_ms` 0) for good: the root is usable and says the
+        /// generation is not served (ended, recalled, unknown), against one
+        /// it gives only because it cannot grant now (no lease, a window
+        /// closed). A non-stealable stream stops on the first only.
+        ends: bool,
     },
     /// Plan 46 M1.2 step 10: the root asks the holder of stream `gen` to
     /// release the subtrees `dirs` (every one of the stream's: a recall of

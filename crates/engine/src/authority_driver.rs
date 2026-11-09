@@ -3747,6 +3747,7 @@ impl Driver {
                 lock_barrier,
                 lock_carry,
                 sent_at,
+                ends,
             } => Some(Internal::Event(Event::Peer {
                 from,
                 msg: PeerMsg::DelegRenewed {
@@ -3762,6 +3763,7 @@ impl Driver {
                     lock_barrier,
                     lock_carry,
                     sent_at,
+                    ends,
                 },
             })),
             SyncRequest::PeerReleaseRequest {
@@ -4847,6 +4849,7 @@ impl Driver {
                 lock_barrier,
                 lock_carry,
                 sent_at,
+                ends,
             } => {
                 let payload = Payload::DelegRenewed {
                     from: self.node_id,
@@ -4862,6 +4865,7 @@ impl Driver {
                     lock_barrier,
                     lock_carry: crate::locks::carry_wire(&lock_carry),
                     sent_at,
+                    ends,
                 };
                 self.one_way(to, payload);
             }

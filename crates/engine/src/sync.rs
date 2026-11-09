@@ -415,6 +415,7 @@ pub enum SyncRequest {
         lock_barrier: i64,
         lock_carry: Vec<(constellation_meta::locks::GrantId, u64)>,
         sent_at: i64,
+        ends: bool,
     },
     /// Plan 46 M1.2 step 10: the root asks this node to release subtrees of
     /// a stream it holds; the delegate answers in its stream.

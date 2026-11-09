@@ -21827,6 +21827,7 @@ mod locks {
                 lock_barrier: 0,
                 lock_carry: Vec::new(),
                 sent_at: 0,
+                ends: true,
             },
         };
         let mut cut = Position::ZERO;
@@ -32016,6 +32017,7 @@ mod locks {
                 lock_barrier: 0,
                 lock_carry,
                 sent_at: 0,
+                ends: true,
             },
         });
     }
@@ -38005,6 +38007,7 @@ fn renewed(h: &Harness, req: OpId, gen: u64, ttl_ms: u64) -> Event {
             lock_barrier: 0,
             lock_carry: Vec::new(),
             sent_at: 0,
+            ends: true,
         },
     }
 }
@@ -38579,6 +38582,7 @@ fn a_root_change_mid_stream_drops_the_old_rounds_answers() {
             lock_barrier: 0,
             lock_carry: Vec::new(),
             sent_at: 0,
+            ends: true,
         },
     });
     assert_eq!(
@@ -38643,6 +38647,7 @@ fn renewed_by(from: NodeId, req: OpId, gen: u64, round: u64, ttl_ms: u64) -> Eve
             lock_barrier: 0,
             lock_carry: Vec::new(),
             sent_at: 0,
+            ends: true,
         },
     }
 }
@@ -39466,6 +39471,7 @@ fn a_late_answer_for_an_ended_generation_leaves_the_cut() {
             lock_barrier: 0,
             lock_carry: Vec::new(),
             sent_at: 0,
+            ends: true,
         },
     });
     let (root, at, _) = h.core.lk.cut.expect("the cut is gone");
@@ -39511,6 +39517,7 @@ fn an_answer_to_a_previous_incarnation_does_not_count() {
             lock_barrier: 0,
             lock_carry: Vec::new(),
             sent_at: 0,
+            ends: true,
         },
     });
     assert_eq!(
@@ -63331,6 +63338,7 @@ mod step9_one_stream_per_node {
                     lock_barrier,
                     lock_carry,
                     sent_at: 1_234,
+                    ends: true,
                 },
             },
             _ => unreachable!(),
@@ -63809,7 +63817,7 @@ mod step5_sticky_release {
     use crate::core::delegate::RecallPhase;
     use crate::core::{DelegKind, Timer};
     use crate::replica::Replica;
-    use constellation_meta::{SubtreeKind, TouchSet};
+    use constellation_meta::{Position, SubtreeKind, TouchSet};
 
     fn mkdir(h: &Harness, name: &str) -> (constellation_fs_core::Ino, LogRecord) {
         let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
@@ -63830,6 +63838,11 @@ mod step5_sticky_release {
     /// The holder (node 3) of stream 7 over sticky subtrees named `names`,
     /// installed and honoured; the root is node 1.
     fn sticky_holder(names: &[&str]) -> (Harness, Vec<constellation_fs_core::Ino>) {
+        holder_of(names, SubtreeKind::Sticky)
+    }
+
+    /// As [`sticky_holder`], with grants of `kind`.
+    fn holder_of(names: &[&str], kind: SubtreeKind) -> (Harness, Vec<constellation_fs_core::Ino>) {
         let mut h = Harness::new(3);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
@@ -63846,17 +63859,17 @@ mod step5_sticky_release {
             gen: 7,
             dirs: dirs
                 .iter()
-                .map(|dir| constellation_meta::SubtreeGrant {
-                    dir: *dir,
-                    kind: SubtreeKind::Sticky,
-                })
+                .map(|dir| constellation_meta::SubtreeGrant { dir: *dir, kind })
                 .collect(),
         });
         let n = records.len() as u64;
         Replica::install_streamed(&h.meta, 1, 1, 1, n, &records, true, (0, 0)).unwrap();
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        assert!(h.core.dl.mine[&7].non_stealable);
+        assert_eq!(
+            h.core.dl.mine[&7].non_stealable,
+            kind != SubtreeKind::Placed
+        );
         (h, dirs)
     }
 
@@ -64204,6 +64217,284 @@ mod step5_sticky_release {
         assert!(h.core.dl.mine[&7].release.is_none());
     }
 
+    /// The remnant is not limited to non-stealable streams (a stream that
+    /// released everything has no subtree left to tell its kind by): a placed
+    /// stream a root's request made release, restarted between the row and
+    /// the root's append, ships the row again too. The root dedups a row it
+    /// has, and a cut drops one past it, so the shipped row is harmless.
+    #[test]
+    fn a_placed_stream_restarted_before_the_roots_append_ships_the_release_row_again() {
+        let (mut h, dirs) = holder_of(&["a"], SubtreeKind::Placed);
+        let mut dirs_wire = Vec::new();
+        for d in &dirs {
+            dirs_wire.push(*d);
+        }
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReleaseRequest {
+                req: OpId(60),
+                gen: 7,
+                dirs: dirs_wire,
+            },
+        });
+        assert!(last_is_release(&h), "the root's request did not release");
+        h.core.dl.mine.remove(&7);
+        h.core.dl.installed_gens.clear();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let d = &h.core.dl.mine[&7];
+        assert!(d.stopped && d.release.is_some() && d.dirs.is_empty());
+        let (req, round, last) =
+            batch(&out).unwrap_or_else(|| panic!("the row was not sent: {out:?}"));
+        assert_eq!(last, 1);
+        h.step(stream_ack(1, req, round, last));
+        assert!(h.core.dl.mine[&7].release.is_none());
+    }
+
+    /// A remote requester that was redirected to the designee (the root's
+    /// `NotHolder`) and then came back to the root, which found the designee
+    /// out of reach and refused for good (`EROFS`, the designation's, not
+    /// journaled): the root cannot know the op went to the designee, which
+    /// may have run it. The requester does not take the refusal for the
+    /// answer: it asks again, and its deadlines end the op in doubt (the
+    /// unsettled `EIO`, I4's exception for an unreachable non-stealable
+    /// holder). Reachable: the root answers `NotHolder` only while it reaches
+    /// the designee, and refuses once it does not. Fails on the parent: the
+    /// application is told `EROFS`.
+    #[test]
+    fn a_designations_refusal_of_an_op_sent_to_the_designee_is_not_final() {
+        use std::collections::BTreeMap;
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        h.step(Event::Peers {
+            links: [1, 3]
+                .into_iter()
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: false,
+                    last_seen: None,
+                    rtt_ms: None,
+                    since: None,
+                })
+                .collect(),
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+        let (dir, rec) = mkdir(&h, "a");
+        let records = vec![
+            rec,
+            LogRecord::DelegateNode {
+                node: 3,
+                gen: 7,
+                dirs: vec![constellation_meta::SubtreeGrant {
+                    dir,
+                    kind: SubtreeKind::Sticky,
+                }],
+            },
+        ];
+        Replica::install_streamed(&h.meta, 1, 1, 1, 2, &records, true, (0, 0)).unwrap();
+        let rid = h.rid(1);
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        }));
+        let mut pending: BTreeMap<TimerId, u64> = BTreeMap::new();
+        let (mut redirected, mut refusals) = (false, 0);
+        let mut told = None;
+        for _ in 0..5000 {
+            while let Some(out) = queue.pop_front() {
+                for a in &out {
+                    match a {
+                        Action::SetTimer { id, after_ms, .. } => {
+                            pending.insert(*id, h.now.0 as u64 + after_ms);
+                        }
+                        Action::CancelTimer { id } => {
+                            pending.remove(id);
+                        }
+                        Action::Reply { rid: r, reply, .. } if *r == rid => {
+                            told = Some(reply.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                for (to, m) in sends(&out) {
+                    let PeerMsg::MutateRequest { req, .. } = m else {
+                        continue;
+                    };
+                    if to != 1 {
+                        // The designee ran the op; its answer is lost.
+                        continue;
+                    }
+                    let outcome = if redirected {
+                        refusals += 1;
+                        MutateOutcome::Errno(Code::ReadOnly)
+                    } else {
+                        redirected = true;
+                        MutateOutcome::NotHolder { holder: 3 }
+                    };
+                    queue.push_back(h.step(Event::Peer {
+                        from: 1,
+                        msg: PeerMsg::MutateReply {
+                            req: *req,
+                            outcome,
+                            base: None,
+                            position: Position::ZERO,
+                            gen: 0,
+                            own_chunks: OwnChunks::None,
+                            own_rows: None,
+                            committed: false,
+                        },
+                    }));
+                }
+            }
+            if told.is_some() {
+                break;
+            }
+            let Some((&id, &due)) = pending.iter().min_by_key(|(_, due)| **due) else {
+                break;
+            };
+            pending.remove(&id);
+            let now = h.now.0 as u64;
+            h.advance(due.saturating_sub(now));
+            queue.push_back(h.step(Event::Timer { id }));
+        }
+        assert!(redirected && refusals > 0, "the scenario did not arise");
+        assert!(
+            matches!(told, Some(ClientReply::InDoubt)),
+            "the application was told {told:?} after {refusals} refusal(s)"
+        );
+        assert_eq!(h.core.stats.unsettled_nonstealable_holder, 1);
+        assert!(h.core.stats.designation_refusals_held > 0);
+    }
+
+    /// An op sent to a designee is not put in the inbox when the root is out
+    /// of reach: the drain refuses an op under a designation for good
+    /// (journaled), which would contradict the designee's answer if it ran
+    /// the op (I1; sim `sticky-ttl` seed 1208). It waits. Fails on the
+    /// parent: the op is put in the inbox.
+    #[test]
+    fn an_op_sent_to_a_designee_is_not_put_in_the_inbox() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.inbox = true;
+        h.core.lease.cached_holder = None;
+        let (dir, rec) = mkdir(&h, "a");
+        let records = vec![
+            rec,
+            LogRecord::DelegateNode {
+                node: 3,
+                gen: 7,
+                dirs: vec![constellation_meta::SubtreeGrant {
+                    dir,
+                    kind: SubtreeKind::Sticky,
+                }],
+            },
+        ];
+        Replica::install_streamed(&h.meta, 1, 1, 1, 2, &records, true, (0, 0)).unwrap();
+        let rid = h.rid(1);
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let mut out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        // Sent to the designee (the table names it); then its answer does not
+        // come, and the retries find the root unreachable: the lease is read.
+        let mut get = None;
+        for _ in 0..12 {
+            if let Some(a) = out.iter().find_map(|a| match a {
+                Action::S3 {
+                    op,
+                    req: S3Op::LeaseGet,
+                } => Some(*op),
+                _ => None,
+            }) {
+                get = Some(a);
+                break;
+            }
+            let Some(t) = timers(&out, TimerKind::ForwardTimeout)
+                .into_iter()
+                .chain(timers(&out, TimerKind::ForwardBackoff))
+                .next_back()
+            else {
+                break;
+            };
+            h.advance(h.core.cfg.forward_timeout_ms + 1);
+            out = h.step(Event::Timer { id: t });
+        }
+        let get = get.expect("the op never read the lease");
+        let body = Lease {
+            ttl_ms: 30_000,
+            ..lease_of(1, 1, h.now.0 + 30_000)
+        };
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((body, tag())))),
+        });
+        assert!(
+            !out.iter().any(|a| matches!(
+                a,
+                Action::S3 {
+                    req: S3Op::InboxPut { .. },
+                    ..
+                }
+            )),
+            "the op was put in the inbox: {out:?}"
+        );
+        assert!(
+            !timers(&out, TimerKind::ForwardBackoff).is_empty(),
+            "no retry: {out:?}"
+        );
+        assert_eq!(h.core.stats.designation_refusals_held, 1);
+    }
+
+    /// The mark "sent to a delegate" is a record's; a resubmission of a rid
+    /// that went in doubt (a fresh record) carries it over, a fresh rid does
+    /// not, and a replay (the queue's own entry, executed here) does not.
+    /// Fails on the parent: the mark starts false.
+    #[test]
+    fn a_resubmitted_rid_keeps_the_mark_of_having_been_sent_to_a_delegate() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let marked = h.rid(1);
+        let fresh = h.rid(2);
+        h.core.note_in_doubt(marked);
+        for rid in [marked, fresh] {
+            let op = h.create(&format!("f{}", rid.seq));
+            h.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op,
+                tag: Default::default(),
+            });
+        }
+        assert!(h.core.clients[&marked].sent_to_delegate);
+        assert!(!h.core.clients[&fresh].sent_to_delegate);
+    }
+
     /// The root refuses an op under a sticky grant whose holder is out of
     /// reach (`EROFS`) only when it never sent the op on: one in doubt (a
     /// forward whose answer did not come, resubmitted) may have run at the
@@ -64272,12 +64563,63 @@ mod step5_sticky_release {
         let (mut h, _dirs) = sticky_holder(&["a"]);
         // (The install sent the stream's first renewal.)
         let (req, _) = h.core.dl.mine[&7].renew.expect("no renewal in flight");
-        h.step(renewed(&h, req, 7, 0));
+        h.step(refusal(&h, req, 7, false));
         assert!(
             !h.core.dl.mine[&7].stopped,
             "the refusal stopped the stream"
         );
         assert_eq!(h.core.stats.deleg_renewals_refused, 1);
+    }
+
+    /// A refusal that is for good (the usable root says the generation is
+    /// not served: an operator's abandon, a recall) stops a sticky stream
+    /// all the same: it goes on acknowledging rows of an abandoned
+    /// generation otherwise. Fails on the parent (any refusal is ignored).
+    #[test]
+    fn a_refusal_that_ends_the_generation_stops_a_sticky_stream() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        let (req, _) = h.core.dl.mine[&7].renew.expect("no renewal in flight");
+        h.step(refusal(&h, req, 7, true));
+        assert!(h.core.dl.mine[&7].stopped, "the refusal did not stop it");
+    }
+
+    /// The root's side of it: a usable root marks the refusal of a
+    /// generation it does not serve (ended here: an abandon) as for good.
+    #[test]
+    fn the_root_marks_a_refusal_of_an_ended_generation() {
+        let (mut h, d1, _d2) = root_with_two_dirs();
+        let (ok, out) = control_delegate(&mut h, 900, d1, 3, true);
+        assert!(ok, "{out:?}");
+        let gen = sticky_gen_of(&h, d1);
+        h.core.dl.gens.get_mut(&gen).unwrap().ended = true;
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(31),
+                gen,
+                round: 0,
+                backup: None,
+                stream_head: 0,
+                stream_head_at: 0,
+                first: false,
+            },
+        });
+        let refusal = sends(&out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegRenewed { ttl_ms, ends, .. } if to == 3 => Some((*ttl_ms, *ends)),
+            _ => None,
+        });
+        assert_eq!(refusal, Some((0, true)), "{out:?}");
+    }
+
+    /// The root's answer to `h`'s renewal `req`: a refusal, `ends` for good.
+    fn refusal(h: &Harness, req: OpId, gen: u64, ends: bool) -> Event {
+        let Event::Peer { from, mut msg } = renewed(h, req, gen, 0) else {
+            unreachable!()
+        };
+        if let PeerMsg::DelegRenewed { ends: e, .. } = &mut msg {
+            *e = ends;
+        }
+        Event::Peer { from, msg }
     }
 
     /// A node that holds no sticky grant is told so.

@@ -446,6 +446,13 @@ impl Core {
                         return;
                     }
                     super::delegate::RecallPlan::Refuse(code) => {
+                        // (This refusal is final here: the root cannot know
+                        // whether the requester sent the op to the designee
+                        // before. The requester knows, and does not take an
+                        // uncommitted `EROFS`/`EXDEV` of the root as the
+                        // answer for an op it sent to a delegate: it asks
+                        // again until the holder's word or its deadlines,
+                        // `Core::on_mutate_reply`, plan 46 M1.3 step 5.)
                         if req != OpId(0) {
                             // Plan 43 C2f review: nothing is journaled for
                             // this refusal; it is the designation's (a

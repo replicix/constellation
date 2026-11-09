@@ -771,6 +771,37 @@ root is refused with `EROFS`, and a cross-subtree op involving one with
 `EXDEV`; a designation is never recalled to execute one. `--ro`
 designations create no delegation.
 
+The same holds for a sticky grant (plan 46 M1.3), with one exception to
+"an unreachable holder only ever refuses". An op that was already sent to
+the holder (the requester's table named it, or the root redirected there)
+and whose answer did not come may have run there. When the requester then
+reaches the root and the root finds the holder out of reach, the refusal
+is not the answer: the root cannot know the op was sent on, and the
+holder's row may land when it returns. The requester (or the root, for its
+own clients) asks again and waits for the holder's word (its row for the
+rid, its release or the end of its stream; it is not put in the inbox
+meanwhile, whose drain would refuse it for good); at the op's deadlines the
+client hears the unsettled `EIO` ("in doubt", retryable by rid), bounded
+by the settle's cap. This is an exception to "an `EIO` told means the op
+did not and will not happen" (invariant I4) for an unreachable
+non-stealable holder: if the holder ran the op, its row lands after the
+`EIO`. Without it the client would be told `EROFS` for an op that ran
+(I1). The simulation counts these separately
+(`SWEEP-NONSTEALABLE-IN-DOUBT`, `unsettled_nonstealable_holder`) and
+never as a violation.
+
+A sticky holder's release is its own decision (`Control::StickyRelease`):
+it holds new ops under the subtree for at most 5 s while it drains, waits
+until the root has appended through its last row, then journals the
+release row. On a hot subtree the drain may not finish; the command then
+gives up at its wait limit with an error and the grants stay, and a
+reissued command starts a new hold. A stream the holder's reboot stopped
+cannot be released by a row: every release of it times out until the
+operator ends the stream (`undelegate`) or abandons it. A refusal of a
+renewal that the usable root marks as for good (an abandon, a recall, the
+end of the stream) stops a sticky stream like any other; one that only
+says the root cannot grant now (it is not usable) does not.
+
 A designee answers its rows at once, and its commits reach the OS, not
 the disk, so a power loss can drop the end of its journal. Nothing ends
 the designation then (it renews nothing and the root never reclaims it):

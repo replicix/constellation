@@ -5905,6 +5905,7 @@ impl Core {
         }
         let mut ttl_ms = 0u64;
         let mut hold = None;
+        let mut ends = false;
         let mut group_change: Option<Vec<NodeId>> = None;
         // Plan 46 M0.3 (S5, ADR-42): a takeover gate whose journal work is
         // done answers the renewals of a generation it has taken on
@@ -5914,6 +5915,7 @@ impl Core {
         // answered only after it.
         let gated_serves = self.gated_serves(now, gen);
         if (self.root_usable(now) || gated_serves) && !self.dl.epoch_active {
+            ends = true;
             // Plan 41 L0: as a lock renewal (`lock_renew_one`), the
             // root extends a delegation only as far as a fresh owner may:
             // under a tenure that can be taken over before its lease
@@ -6102,6 +6104,7 @@ impl Core {
             lock_barrier,
             lock_carry,
             sent_at: now.wall.0,
+            ends: ends && ttl_ms == 0,
         };
         self.deleg_answer_renewal(now, from, hold.filter(|_| ttl_ms > 0), msg, out);
     }
@@ -6815,6 +6818,7 @@ impl Core {
         gen: u64,
         round: u64,
         ttl_ms: u64,
+        ends: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> bool {
@@ -6860,7 +6864,7 @@ impl Core {
             {
                 self.dl.late.remove(&req);
                 if self.dl.mine.get(&gen).is_some_and(|d| !d.stopped) {
-                    self.deleg_renewal_refused(now, gen, replica, out);
+                    self.deleg_renewal_refused(now, gen, ends, replica, out);
                 }
                 return true;
             }
@@ -6890,7 +6894,7 @@ impl Core {
             return true;
         }
         if ttl_ms == 0 {
-            self.deleg_renewal_refused(now, gen, replica, out);
+            self.deleg_renewal_refused(now, gen, ends, replica, out);
             return true;
         }
         self.deleg_granted(now, gen, sent, ttl_ms, replica, out);
@@ -6906,6 +6910,7 @@ impl Core {
         &mut self,
         now: Now,
         gen: u64,
+        ends: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -6913,13 +6918,16 @@ impl Core {
             return;
         };
         self.stats.deleg_renewals_refused += 1;
-        // A non-stealable grant is not ended by a renewal's answer: the root
-        // never takes it back by itself (a sticky grant ends by its holder's
-        // release, plan 46 §5.4), and answers "no" while it cannot grant
-        // (it is not usable, its window is closed). The holder goes on; a
-        // stream it stopped here was never released, and its subtree stayed
-        // the root's to refuse for good (plan 46 M1.3 step 5).
-        if d.non_stealable {
+        // A non-stealable grant is not ended by a renewal's answer that only
+        // says the root cannot grant now (it is not usable, its window is
+        // closed: `ends` false): the root never takes it back by itself (a
+        // sticky grant ends by its holder's release, plan 46 §5.4). The
+        // holder goes on; a stream it stopped here was never released, and
+        // its subtree stayed the root's to refuse for good (plan 46 M1.3
+        // step 5). A usable root that says the generation is not served
+        // (`ends`: an operator's abandon, a recall, the end of the stream)
+        // stops it, as for any other.
+        if d.non_stealable && !ends {
             return;
         }
         let ran_out = !d.lapsed && now.honour >= self.deleg_lapse_at(d);

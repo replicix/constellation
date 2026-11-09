@@ -450,6 +450,8 @@ pub struct NodeEnv {
     pub ttl_reclaims_sticky: bool,
     /// See `SimConfig::holder_releases_before_drain`.
     pub holder_releases_before_drain: bool,
+    /// See `SimConfig::refuse_forwarded_designation_ops`.
+    pub refuse_forwarded_designation_ops: bool,
     /// See `SimConfig::partial_release_ends_stream`.
     pub partial_release_ends_stream: bool,
     /// See `SimConfig::plant_claim_root_group_on_lone`.
@@ -736,6 +738,7 @@ impl NodeHandle {
         cfg.skip_deleg_dep_wait = env.skip_deleg_dep_wait;
         cfg.ttl_reclaims_sticky = env.ttl_reclaims_sticky;
         cfg.holder_releases_before_drain = env.holder_releases_before_drain;
+        cfg.refuse_forwarded_designation_ops = env.refuse_forwarded_designation_ops;
         cfg.partial_release_ends_stream = env.partial_release_ends_stream;
         // Plan 43 C2g: the simulation's settle window scales with its lease
         // TTL as production's does (half a TTL: 30 s of 60 s), unless a
@@ -813,6 +816,8 @@ impl NodeHandle {
             freeze_handed: (0, 0),
             own_lapse: None,
             unsettled_seen: 0,
+            designation_seen: 0,
+            releases_seen: 0,
             deps_refused_seen: 0,
             deleg_rows_from: 0,
             deleg_sig: Mutex::new(Vec::new()),
@@ -1119,6 +1124,10 @@ struct Driver {
     /// Plan 46 M0.3: the unsettled `EIO`s of this incarnation's core
     /// (`Stats::client_unsettled_eio`) already classified.
     unsettled_seen: u64,
+    /// `Stats::unsettled_nonstealable_holder` as last seen.
+    designation_seen: u64,
+    /// `Stats::deleg_sticky_releases` as last seen.
+    releases_seen: u64,
     /// `Stats::deleg_deps_refused` already judged (the causal-cut oracle).
     deps_refused_seen: u64,
     /// The next journal seq to scan for a delegate's rows the root appended
@@ -2218,6 +2227,13 @@ impl Driver {
                 self.record_deleg_rows(is_stream, &drained);
             }
             self.oracles.note_streamed(self.id, &self.meta);
+            // (Only the releases this node's own command journaled in this
+            // step are judged: a root's request releases without the holder
+            // waiting for the root's append, which the root drains itself.)
+            let own_releases = self.core.stats.deleg_sticky_releases;
+            self.oracles
+                .note_release_rows(self.id, &self.meta, own_releases > self.releases_seen);
+            self.releases_seen = own_releases;
             {
                 let mut holds = self.oracles.epoch_holds.lock().unwrap();
                 if self.core.lease().epoch_held() {
@@ -3657,11 +3673,16 @@ impl Driver {
                                 let started = self
                                     .step_timer
                                     .and_then(|t| self.deadline_armed.get(&t).copied());
+                                let held = self.core.stats.unsettled_nonstealable_holder
+                                    > self.designation_seen;
+                                self.designation_seen =
+                                    self.core.stats.unsettled_nonstealable_holder;
                                 self.oracles.note_unsettled(
                                     self.id,
                                     rid,
                                     self.core.config().settle_window(),
                                     started,
+                                    held,
                                 );
                             }
                         }

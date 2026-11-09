@@ -491,6 +491,11 @@ pub struct SimConfig {
     /// `AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN=1` sets it on every
     /// configuration; a run that released before the drain fails.
     pub holder_releases_before_drain: bool,
+    /// Negative control (`Config::refuse_forwarded_designation_ops`): the
+    /// holds of an op sent to a non-stealable holder are off.
+    /// `AUTHORITY_SIM_REFUSE_FORWARDED_DESIGNATION_OPS=1` sets it on every
+    /// configuration; `sticky-ttl` then fails (`refused_and_completed`, I1).
+    pub refuse_forwarded_designation_ops: bool,
     /// Negative control (`Config::partial_release_ends_stream`): the root
     /// ends a sticky stream at the holder's release of some of its
     /// subtrees (MUST-1). `AUTHORITY_SIM_PARTIAL_RELEASE_ENDS_STREAM=1` sets
@@ -1072,6 +1077,10 @@ impl Default for SimConfig {
                 "AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN",
             )
             .is_some_and(|v| v == "1"),
+            refuse_forwarded_designation_ops: std::env::var_os(
+                "AUTHORITY_SIM_REFUSE_FORWARDED_DESIGNATION_OPS",
+            )
+            .is_some_and(|v| v == "1"),
             partial_release_ends_stream: std::env::var_os(
                 "AUTHORITY_SIM_PARTIAL_RELEASE_ENDS_STREAM",
             )
@@ -1360,6 +1369,9 @@ pub struct Report {
     /// Plan 46 M1.3 step 5, the idle tracker's releases: requested, answered
     /// (`wait`), unanswered or refused (`wait`), granted again.
     pub sticky_driver: [u64; 4],
+    /// Release rows of holders the drain oracle judged against the root's
+    /// appended index (`Oracles::note_release_rows`).
+    pub sticky_release_rows_judged: u64,
     /// Of `acked_past_cut`, answers that were refusals.
     pub acked_past_cut_refusals: usize,
     /// I4: in-doubt rids that landed after an op invoked later.
@@ -1382,6 +1394,10 @@ pub struct Report {
     /// but could reach no holder of its tail (`generation_tail_unreachable`).
     pub unsettled_generation_tail_unreachable: usize,
     pub unsettled_violations: usize,
+    /// Unsettled `EIO`s of ops a non-stealable holder's refusal was held back
+    /// for (the holder may have run them): I4's exception for an unreachable
+    /// non-stealable holder, allowed and counted apart from the classes above.
+    pub unsettled_nonstealable_holder: usize,
     pub unsettled_examples: Vec<String>,
     pub unsettled_causes: BTreeMap<String, usize>,
     /// Every unsettled `EIO`, its cause and description, kept only with
@@ -4277,7 +4293,10 @@ async fn operator_drop_hopeless(
 /// every run that reaches its end checks, the ones that end with a claim
 /// waiting for a group's tail included.
 fn count_unsettled(oracles: &super::oracle::Oracles, report: &mut Report) -> Vec<String> {
-    let all = oracles.unsettled.lock().unwrap();
+    let everything = oracles.unsettled.lock().unwrap();
+    report.unsettled_nonstealable_holder = everything.iter().filter(|u| u.designation_held).count();
+    let all: Vec<&super::oracle::Unsettled> =
+        everything.iter().filter(|u| !u.designation_held).collect();
     report.unsettled_isolated = all.iter().filter(|u| u.verdict.isolated()).count();
     report.unsettled_no_sequencer_in_time = all
         .iter()
@@ -4533,6 +4552,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         skip_deleg_dep_wait: cfg.skip_deleg_dep_wait,
         ttl_reclaims_sticky: cfg.ttl_reclaims_sticky,
         holder_releases_before_drain: cfg.holder_releases_before_drain,
+        refuse_forwarded_designation_ops: cfg.refuse_forwarded_designation_ops,
         partial_release_ends_stream: cfg.partial_release_ends_stream,
         plant_claim_root_group_on_lone: cfg.plant_claim_root_group_on_lone,
     };
@@ -6166,6 +6186,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         &world.dropped_rids.lock().unwrap().clone(),
         converged_checkable,
     );
+    let outcome_conflicts = bucket.archive.conflicting_outcomes();
     // `AUTHORITY_SIM_ORACLE_DEBUG=1`: what the end of the run found (the
     // relays no judged answer backs, the unjournaled refusals that landed).
     if std::env::var_os("AUTHORITY_SIM_ORACLE_DEBUG").is_some() {
@@ -6228,7 +6249,6 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.sticky_ended_abandoned = found.sticky_abandoned;
     report.sticky_ended_claimed = found.sticky_claimed;
     let mut sticky_recalled_other = 0u64;
-    let mut sticky_release_undrained = 0u64;
     for s in report.stats.values() {
         report.sticky_core[0] += s.deleg_sticky;
         report.sticky_core[1] += s.deleg_sticky_ended_released;
@@ -6242,16 +6262,24 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.sticky_core[9] += s.deleg_sticky_release_held;
         report.sticky_core[10] += s.deleg_sticky_releases_given_up;
         sticky_recalled_other += s.deleg_sticky_recalled_other;
-        sticky_release_undrained += s.deleg_sticky_release_undrained;
     }
     report.sticky_driver = *cluster.sticky_driver.lock().unwrap();
-    // The holder's release waits for its drain (plan 46 M1.3 step 5).
-    if sticky_release_undrained > 0 {
-        found.sticky.push(format!(
-            "sticky_release_after_drain: {sticky_release_undrained} release(s) of sticky \
-             subtrees journaled before the holder had drained its in-flight ops and the root \
-             had appended through the last row of the stream"
-        ));
+    // The holder's release waits for its drain (plan 46 M1.3 step 5), judged
+    // from the root's side: the root had appended the stream through the row
+    // before the release row when the holder journaled it
+    // (`Oracles::note_release_rows`), not from the core's own counter
+    // (`deleg_sticky_release_undrained`, which only the knob's branch bumps).
+    {
+        let drain = oracles.release_drain.lock().unwrap();
+        report.sticky_release_rows_judged = drain.rows;
+        if !drain.violations.is_empty() {
+            found.sticky.push(format!(
+                "sticky_release_after_drain: {} release row(s) journaled before the root had \
+                 appended the rows of the stream before them, e.g. {}",
+                drain.violations.len(),
+                drain.violations[0]
+            ));
+        }
     }
     // The root's recalls of a sticky stream (all but the operator's and a
     // continuation epoch's are the root taking a grant back).
@@ -6322,6 +6350,10 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             "sticky_ends_only_by_holder_or_operator",
             &found.sticky,
         ),
+        // Plan 46 M1.3 step 5: strict on every configuration. A refusal
+        // journaled for an op that another sequencer ran (an inbox refusal
+        // beside the sticky holder's row), whatever answer the client heard.
+        (true, "refused_and_completed", &outcome_conflicts),
         (cfg.strict_settle, "I4", &found.i4),
         (cfg.strict_settle, "I4", &found.unjournaled_landed),
         (

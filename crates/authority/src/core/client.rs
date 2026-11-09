@@ -111,6 +111,14 @@ pub(crate) struct ClientOp {
     /// `NotHolder` redirects followed (plan 30 §M11: two, since a
     /// delegate's names the root and the root's a delegate).
     pub redirected: u32,
+    /// The op was sent to a node that holds a delegation (the table named it
+    /// the owner of the op's keys, or the root redirected the op to it): it
+    /// may have run there, whatever the root says later.
+    pub sent_to_delegate: bool,
+    /// A non-stealable holder's refusal was held back for this op (it was
+    /// sent on, so it may have run): its in-doubt end is I4's exception for
+    /// an unreachable non-stealable holder (`unsettled_nonstealable_holder`).
+    pub designation_held: bool,
     /// Plan 46 M0.3 (B): the root that last answered this op `Held` (it is
     /// alive and holds the op by design): the backoff retry goes back to
     /// it when this node's cached holder was dropped meanwhile.
@@ -613,7 +621,12 @@ impl Core {
         // completed it, and the client's resubmission by rid, not in
         // doubt, ran it again: refused `EEXIST`, the rid's second outcome
         // in the log, and the answer the client heard).
-        let in_doubt = matches!(origin, Origin::Replay { .. }) || self.in_doubt_rids.remove(&rid);
+        // A resubmission of a rid that went in doubt may have been sent to a
+        // holder by the earlier record: the mark carries over (a replay's is
+        // the queue's own, executed here, never sent to a holder).
+        let resubmitted =
+            !matches!(origin, Origin::Replay { .. }) && self.in_doubt_rids.remove(&rid);
+        let in_doubt = matches!(origin, Origin::Replay { .. }) || resubmitted;
         let inbox_keys = self.in_doubt_batches.remove(&rid).unwrap_or_default();
         self.next_client_order += 1;
         self.clients.insert(
@@ -650,6 +663,8 @@ impl Core {
                 settle_until: WaitMs(0),
                 settle_cap: WaitMs(0),
                 gate_recall_wait: false,
+                sent_to_delegate: resubmitted,
+                designation_held: false,
                 tag,
             },
         );
@@ -1216,6 +1231,23 @@ impl Core {
         }
     }
 
+    /// Whether `rid`'s op was sent to a node holding a non-stealable grant
+    /// (a sticky grant or a designation) of its keys: it may have run there,
+    /// and a final refusal by anyone else would contradict it.
+    fn sent_to_designation(&self, rid: Rid, replica: &dyn Replica) -> bool {
+        let Some(c) = self.clients.get(&rid).filter(|c| c.sent_to_delegate) else {
+            return false;
+        };
+        let keys = super::holder::keys_of_op_in(&c.op, replica);
+        match replica.resolve_ownership(&keys) {
+            Ownership::Delegated(d) => d.kind != constellation_meta::SubtreeKind::Placed,
+            Ownership::CrossSubtree { involved, .. } => involved
+                .iter()
+                .any(|d| d.kind != constellation_meta::SubtreeKind::Placed),
+            Ownership::Root => false,
+        }
+    }
+
     pub(crate) fn on_holder_learned(
         &mut self,
         now: Now,
@@ -1265,6 +1297,27 @@ impl Core {
                 );
                 if reaches {
                     self.send_forward(now, rid, holder, replica, out);
+                } else if self.cfg.inbox
+                    && !self.cfg.refuse_forwarded_designation_ops
+                    && self.sent_to_designation(rid, replica)
+                {
+                    // The inbox drain refuses an op under a designation for
+                    // good (journaled, `Refused`), and an op sent to the
+                    // designee may have run there: the refusal would
+                    // contradict the designee's answer (I1). It waits, as
+                    // for the root's refusal (`on_mutate_reply`), until the
+                    // holder's word or its deadlines.
+                    self.stats.designation_refusals_held += 1;
+                    let timer = self.set_timer_wait(
+                        now.wait.plus(self.cfg.forward_timeout_ms.max(10)),
+                        Timer::ForwardBackoff(rid),
+                        out,
+                    );
+                    if let Some(c) = self.clients.get_mut(&rid) {
+                        c.phase = Phase::Backoff;
+                        c.timer = Some(timer);
+                        c.designation_held = true;
+                    }
                 } else if self.cfg.inbox {
                     self.inbox_enqueue(now, rid, epoch, replica, out);
                 } else {
@@ -1295,9 +1348,11 @@ impl Core {
             out,
         );
         let acked_through = self.acked.floor();
+        let to_delegate = replica.delegation_table().iter().any(|e| e.node == holder);
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
+        c.sent_to_delegate |= to_delegate;
         if let Some(&key) = c.inbox_keys.first() {
             // Withdraw the durable batches (one at a time, every one the
             // rid was submitted in) before the holder can see the op
@@ -1474,6 +1529,40 @@ impl Core {
             ?outcome,
             "forward reply"
         );
+        // A designation's refusal (the root's `EROFS`/`EXDEV`: nothing is
+        // journaled for it, no generation named) of an op this node sent to
+        // the designee (its table named it, or the root redirected there)
+        // before: the root cannot know that, and
+        // the designee may have run the op, so the refusal would tell the
+        // application it did not (I1). It is asked again, like a `Held`: if
+        // the designee's row reached the root the answer is the rid's
+        // outcome, else the op's deadlines end it in doubt (the settle's
+        // unsettled `EIO`, bounded by `settle_cap`: I4's exception for an
+        // unreachable non-stealable holder).
+        let outcome = if gen == 0
+            && !self.cfg.refuse_forwarded_designation_ops
+            && !committed
+            && matches!(
+                &outcome,
+                MutateOutcome::Errno(Code::ReadOnly | Code::CrossDevice)
+            )
+            && self
+                .clients
+                .get(&rid)
+                .is_some_and(|c| c.sent_to_delegate && c.origin == Origin::Client)
+            && !replica.delegation_table().iter().any(|e| e.node == from)
+        {
+            self.stats.designation_refusals_held += 1;
+            if let Some(c) = self.clients.get_mut(&rid) {
+                c.designation_held = true;
+            }
+            MutateOutcome::Held {
+                retry_ms: self.cfg.forward_timeout_ms.max(10),
+                outwait_ms: None,
+            }
+        } else {
+            outcome
+        };
         match outcome {
             MutateOutcome::Accepted { epoch, records } if !base_ok || records.is_empty() => {
                 // The holder evaluated the op against state this replica
@@ -2715,10 +2804,11 @@ impl Core {
                         // (the rid's completion, which ends the wait), its
                         // release or the stream's end; else the client's
                         // deadline answers it in doubt.
-                        if self
-                            .clients
-                            .get(&rid)
-                            .is_some_and(|c| c.forwarded || c.attempts > 0)
+                        if !self.cfg.refuse_forwarded_designation_ops
+                            && self
+                                .clients
+                                .get(&rid)
+                                .is_some_and(|c| c.forwarded || c.attempts > 0)
                         {
                             let gens: Vec<u64> = match replica.resolve_ownership(&keys) {
                                 constellation_meta::delegation::Ownership::Delegated(d) => {
@@ -2733,6 +2823,9 @@ impl Core {
                             let wait: BTreeSet<u64> =
                                 gens.into_iter().map(super::delegate::wait_id).collect();
                             if !wait.is_empty() {
+                                if let Some(c) = self.clients.get_mut(&rid) {
+                                    c.designation_held = true;
+                                }
                                 self.park_exec_local(now, wait, None, rid, false);
                                 return MutateOutcome::Busy;
                             }
@@ -4146,6 +4239,9 @@ impl Core {
             // Plan 43 C2: no sequencer answered the settle (I4's one
             // exception: an isolated requester).
             self.stats.client_unsettled_eio += 1;
+        }
+        if c.designation_held && matches!(c.origin, Origin::Client) {
+            self.stats.unsettled_nonstealable_holder += 1;
         }
         self.log_if_slow(now, rid, &c, "in doubt", replica);
         self.cancel_timer(c.deadline, out);

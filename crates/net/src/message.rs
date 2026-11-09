@@ -485,6 +485,8 @@ pub enum Payload {
         /// When the root sent this answer (its clock, unix ms; 0: not said)
         /// — see `PeerMsg::DelegRenewed::sent_at`.
         sent_at: i64,
+        /// See `PeerMsg::DelegRenewed::ends`.
+        ends: bool,
     },
     /// Plan 46 M1.2 step 10, one way: the root asks the holder of stream
     /// `gen` to release the subtrees `dirs` (postcard of `Vec<u64>`; all of
@@ -1877,6 +1879,7 @@ mod tests {
                 lock_barrier: 8,
                 lock_carry: vec![9, 10],
                 sent_at: 11,
+                ends: true,
             },
             Payload::ReleaseRequest {
                 root: 1,

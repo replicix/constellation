@@ -7940,6 +7940,7 @@ struct OracleTotals {
     sticky: [u64; 5],
     sticky_core: [u64; 11],
     sticky_driver: [u64; 4],
+    sticky_release_rows_judged: u64,
     i4: usize,
     /// Plan 43 C2: of `i4`, settled `EIO`s whose rid completed.
     i4_settled: usize,
@@ -8006,6 +8007,10 @@ struct OracleTotals {
     /// seeds with a violation.
     unsettled_class: [u64; 4],
     unsettled_seeds: u64,
+    /// I4's exception for an unreachable non-stealable holder: unsettled
+    /// `EIO`s of ops its refusal was held back for, and the seeds with one
+    /// (`SWEEP-NONSTEALABLE-IN-DOUBT`). Allowed, never a violation.
+    nonstealable_in_doubt: (u64, u64),
     /// Plan 46 M0.3 S5 (ADR-42), `SWEEP-S5-GATE`: generations a shippable
     /// takeover gate took on, renewals it granted, transactions it appended,
     /// settles it redirected.
@@ -8134,6 +8139,8 @@ impl OracleTotals {
         self.unsettled_class[2] += r.unsettled_no_sequencer_in_time as u64;
         self.unsettled_class[3] += r.unsettled_generation_tail_unreachable as u64;
         self.unsettled_seeds += u64::from(r.unsettled_violations > 0);
+        self.nonstealable_in_doubt.0 += r.unsettled_nonstealable_holder as u64;
+        self.nonstealable_in_doubt.1 += u64::from(r.unsettled_nonstealable_holder > 0);
         for st in r.stats.values() {
             for (c, n) in self.s5_gate.iter_mut().zip([
                 st.deleg_gated_inherited,
@@ -8178,6 +8185,7 @@ impl OracleTotals {
         for (t, c) in self.sticky_core.iter_mut().zip(r.sticky_core) {
             *t += c;
         }
+        self.sticky_release_rows_judged += r.sticky_release_rows_judged;
         for (t, c) in self.sticky_driver.iter_mut().zip(r.sticky_driver) {
             *t += c;
         }
@@ -8312,6 +8320,10 @@ impl OracleTotals {
             constellation_authority::core::ACK_COUNTERS.iter().zip(self.claimed).collect::<Vec<_>>()
         );
         eprintln!(
+            "SWEEP-NONSTEALABLE-IN-DOUBT {label} seeds {}/{seeds}: unsettled EIOs of ops a non-stealable holder's refusal was held back for (allowed: the holder may have run them, its row lands late) {} (in {} seeds)",
+            self.seeds, self.nonstealable_in_doubt.0, self.nonstealable_in_doubt.1
+        );
+        eprintln!(
             "SWEEP-ROLLBACKS {label} seeds {}/{seeds}: acknowledged rids rolled back {} (non-Lone {}), of them judged Lone {} (in {} seeds)",
             self.seeds, self.rolled_back.0, self.i5, self.rolled_back.1, self.rolled_back.2
         );
@@ -8323,7 +8335,7 @@ impl OracleTotals {
         eprintln!(
             "SWEEP-STICKY-TOTALS {label} seeds {}/{seeds}: sticky streams in the log {} (ended by release {}, by abandon {}, by the holder's own claim {}, unexcused {}); \
              core: grants made {}, ended released {}, abandoned {}, other {}, by undelegate {}, recalled {}; recalls by a continuation epoch {}; \
-             holder's releases journaled {} (of some subtrees {}), ops held by a drain {}, given up {}; idle tracker: requested {}, answered {}, unanswered {}, granted again {}",
+             holder's releases journaled {} (of some subtrees {}), ops held by a drain {}, given up {}; idle tracker: requested {}, answered {}, unanswered {}, granted again {}; release rows judged against the root's append {}",
             self.seeds,
             self.sticky[0],
             self.sticky[1],
@@ -8344,7 +8356,8 @@ impl OracleTotals {
             self.sticky_driver[0],
             self.sticky_driver[1],
             self.sticky_driver[2],
-            self.sticky_driver[3]
+            self.sticky_driver[3],
+            self.sticky_release_rows_judged
         );
         eprintln!(
             "SWEEP-UNSETTLED-CAUSES {label} seeds {}/{seeds}: {:?}",
@@ -18128,6 +18141,7 @@ fn sticky_grants_survive_the_ttl_and_end_by_the_holders_release() {
 #[test]
 fn sticky_idle_release_is_released_by_the_holder_and_a_partial_release_keeps_the_stream() {
     let (mut released, mut partial, mut answered, mut again, mut held) = (0, 0, 0, 0, 0);
+    let mut judged = 0;
     for seed in 0..40 {
         let r = run_seed(seed, sticky_idle_release_config()).unwrap_or_else(|e| {
             panic!(
@@ -18142,7 +18156,12 @@ fn sticky_idle_release_is_released_by_the_holder_and_a_partial_release_keeps_the
         held += r.sticky_core[9];
         answered += r.sticky_driver[1];
         again += r.sticky_driver[3];
+        judged += r.sticky_release_rows_judged;
     }
+    assert!(
+        judged > 0,
+        "no release row was judged against the root's append"
+    );
     assert!(released > 0, "no holder released a sticky grant");
     assert!(partial > 0, "no release was of some subtrees only");
     assert!(answered > 0, "no `wait` release was answered");
@@ -18153,17 +18172,49 @@ fn sticky_idle_release_is_released_by_the_holder_and_a_partial_release_keeps_the
 /// The knob `holder_releases_before_drain`
 /// (`AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN=1`): the holder journals its
 /// release without draining and waiting for the root's append through its
-/// last row; the run fails on fixed seeds.
+/// last row; the run fails on fixed seeds, by the drain oracle that reads the
+/// root's appended index from the stores (`Oracles::note_release_rows`), not
+/// by the core's own counter of the knob's branch
+/// (`deleg_sticky_release_undrained`, which the oracle does not consult).
 #[test]
 fn a_release_before_the_drain_fails_the_run() {
     let config = SimConfig {
         holder_releases_before_drain: true,
         ..sticky_idle_release_config()
     };
-    for seed in [0u64, 3, 6] {
+    for seed in [3u64, 6, 7] {
         let e = run_seed(seed, config.clone())
             .expect_err("a holder released before its drain and no oracle noticed");
-        assert!(e.contains("sticky_release_after_drain"), "seed {seed}: {e}");
+        assert!(
+            e.contains("sticky_release_after_drain")
+                && e.contains("before the root had appended the rows"),
+            "seed {seed}: {e}"
+        );
+    }
+}
+
+/// The knob `refuse_forwarded_designation_ops`
+/// (`AUTHORITY_SIM_REFUSE_FORWARDED_DESIGNATION_OPS=1`): the holds of an op
+/// sent to a non-stealable holder are off (main's behaviour). `sticky-ttl`
+/// fails on the seeds main failed on, by the log oracle that finds a refusal
+/// and a completion of one rid (`refused_and_completed`) and by I1.
+#[test]
+fn the_holds_of_an_op_sent_to_a_sticky_holder_are_needed() {
+    let config = SimConfig {
+        refuse_forwarded_designation_ops: true,
+        ..sticky_ttl_config()
+    };
+    for seed in [110u64, 624, 772] {
+        let e = run_seed(seed, config.clone())
+            .expect_err("a refusal beside the holder's row and no oracle noticed");
+        assert!(
+            e.contains("refused_and_completed") || e.contains("acked_implies_committed"),
+            "seed {seed}: {e}"
+        );
+    }
+    // With the holds (the default) the same seeds pass.
+    for seed in [110u64, 624, 772, 863, 996, 1199, 1736, 1811] {
+        run_seed(seed, sticky_ttl_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
     }
 }
 

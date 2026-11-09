@@ -146,6 +146,13 @@ pub struct Config {
     /// journaled before the drain (`deleg_sticky_release_undrained`).
     pub holder_releases_before_drain: bool,
     /// Fault injection for the simulation's negative control (never set by
+    /// the engine): the requester and the root do not hold an op that was
+    /// sent to a non-stealable holder (plan 46 M1.3 step 5): the root's
+    /// `EROFS`/`EXDEV` is the answer, the inbox takes the op when the root is
+    /// out of reach, and the root's own client op is refused. The rid then
+    /// has a journaled refusal beside the holder's row (`sticky-ttl` I1).
+    pub refuse_forwarded_designation_ops: bool,
+    /// Fault injection for the simulation's negative control (never set by
     /// the engine): the root ends a sticky stream when the holder releases
     /// some of its subtrees (plan 46 M1.3 step 5, MUST-1,
     /// `partial_release_ends_stream`). The sim's
@@ -703,6 +710,7 @@ impl Config {
             skip_deleg_dep_wait: false,
             ttl_reclaims_sticky: false,
             holder_releases_before_drain: false,
+            refuse_forwarded_designation_ops: false,
             partial_release_ends_stream: false,
             ttl_ms,
             expiry_margin_ms: 1_000,
@@ -1244,6 +1252,9 @@ pub struct Stats {
     /// transactions drained from it.
     pub deleg_inherited: u64,
     pub deleg_refused_designated: u64,
+    /// A designation's refusal of an op this node had sent to the
+    /// designee, asked again instead of answered (the op was sent to the designee, it may have run).
+    pub designation_refusals_held: u64,
     pub deleg_designated: u64,
     /// Plan 46 M1.3 step 4: sticky grants made (a stream's first or a growth).
     pub deleg_sticky: u64,
@@ -1732,6 +1743,10 @@ pub struct Stats {
     pub settled_late_success: u64,
     pub settled_local: u64,
     pub client_unsettled_eio: u64,
+    /// Of those, the ones whose op a non-stealable holder's refusal was held
+    /// back for (I4's exception for an unreachable non-stealable holder: the
+    /// holder may have run the op, and its row lands late).
+    pub unsettled_nonstealable_holder: u64,
     /// Plan 30 §M14 phase 2: ops answered `LockLapsed` — refused here
     /// (as executor) or by the executor that answered this node's
     /// forward, because a cluster-lock grant they were issued under had
@@ -3112,6 +3127,7 @@ impl Core {
                 lock_barrier,
                 lock_carry,
                 sent_at,
+                ends,
             } => {
                 // The renewal installs the generation's window first; the
                 // handoff is tagged with the generation itself. A grace
@@ -3120,7 +3136,7 @@ impl Core {
                 // or for a generation no longer this node's, carries
                 // nothing (its cut would replace the current root's).
                 let serving = self.deleg_mine_until(gen).is_some();
-                if !self.on_deleg_renewed(now, from, req, gen, round, ttl_ms, replica, out) {
+                if !self.on_deleg_renewed(now, from, req, gen, round, ttl_ms, ends, replica, out) {
                     return;
                 }
                 self.deleg_note_root_answer(gen, from, sent_at);
