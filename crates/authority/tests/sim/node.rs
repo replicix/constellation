@@ -783,6 +783,7 @@ impl NodeHandle {
                 windows.set_clock(Arc::new(move || clock.now()));
                 core.set_deleg_windows(windows);
                 core.set_lane_cell(lane_cell.clone());
+                core.track_unsettled_designation();
                 core
             },
             store: env.bucket.handle(id),

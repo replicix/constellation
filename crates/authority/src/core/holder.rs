@@ -253,7 +253,7 @@ impl Core {
                         outwait_ms: None,
                     }
                 }
-                GateSettle::Redirect(holder) => {
+                GateSettle::Redirect(holder, redirect_gen) => {
                     // Plan 46 M0.3 (S5, ADR-42): the key belongs to a live
                     // generation of another node, which the gate keeps
                     // renewed: its delegate answers the settle (as `Busy`
@@ -267,7 +267,7 @@ impl Core {
                             outcome: MutateOutcome::NotHolder { holder },
                             base: None,
                             position: Position::ZERO,
-                            gen: 0,
+                            gen: redirect_gen,
                             own_chunks: OwnChunks::None,
                             own_rows: None,
                             committed: false,
@@ -390,6 +390,7 @@ impl Core {
                         // op, sent before its table carried the grant, is
                         // held for a retry instead of a redirect to itself.
                         self.stats.deleg_not_owner += 1;
+                        let redirect_gen = if from == d.node { 0 } else { d.gen };
                         let outcome = if from == d.node {
                             MutateOutcome::Held {
                                 retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
@@ -405,7 +406,7 @@ impl Core {
                                 outcome,
                                 base: None,
                                 position: Position::ZERO,
-                                gen: 0,
+                                gen: redirect_gen,
                                 own_chunks: OwnChunks::None,
                                 own_rows: None,
                                 committed: false,
@@ -1405,7 +1406,7 @@ pub(crate) enum GateSettle {
     /// Plan 46 M0.3 (S5, ADR-42): the keys belong to a live generation of
     /// this node it took on (`delegation_sync` at `RootSync::Gated`),
     /// whose delegate this node reaches: the requester settles there.
-    Redirect(NodeId),
+    Redirect(NodeId, u64),
 }
 
 /// Whether `rid` took effect on this replica (a recorded outcome, or an
@@ -1486,7 +1487,7 @@ impl Core {
                     // back and forth. Held, the requester retries until the
                     // first renewal is granted.
                     return Some(if self.dl.answered_granting.contains(&d.gen) {
-                        GateSettle::Redirect(d.node)
+                        GateSettle::Redirect(d.node, d.gen)
                     } else {
                         GateSettle::Held
                     });

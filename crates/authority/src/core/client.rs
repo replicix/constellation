@@ -27,6 +27,10 @@ use constellation_types::Code;
 use std::collections::BTreeSet;
 
 /// How many `InDoubt` rids the core remembers for their resubmission.
+/// Known I1 limit: a rid evicted past this bound is resubmitted without the
+/// marks it carried (`sent_to_delegate`, `redirected_to_designee`), so a
+/// refusal of an op a designee ran is no longer held (ADR-45); the same
+/// eviction already allows a second execution of an ordinary in-doubt rid.
 pub(super) const MAX_IN_DOUBT_RIDS: usize = 10_000;
 
 /// Who submitted the op and therefore where its outcome goes.
@@ -504,6 +508,7 @@ impl Core {
             let first = *self.in_doubt_rids.iter().next().expect("non-empty");
             self.in_doubt_rids.remove(&first);
             self.in_doubt_batches.remove(&first);
+            self.in_doubt_designee_rids.remove(&first);
         }
     }
 
@@ -633,6 +638,7 @@ impl Core {
         // `send_forward` sends to a designee is marked from then on, as any.
         let resubmitted =
             !matches!(origin, Origin::Replay { .. }) && self.in_doubt_rids.remove(&rid);
+        let redirected_to_designee = resubmitted && self.in_doubt_designee_rids.remove(&rid);
         let in_doubt = matches!(origin, Origin::Replay { .. }) || resubmitted;
         let inbox_keys = self.in_doubt_batches.remove(&rid).unwrap_or_default();
         self.next_client_order += 1;
@@ -671,7 +677,7 @@ impl Core {
                 settle_cap: WaitMs(0),
                 gate_recall_wait: false,
                 sent_to_delegate: resubmitted,
-                redirected_to_designee: false,
+                redirected_to_designee,
                 designation_held: false,
                 tag,
             },
@@ -1790,15 +1796,13 @@ impl Core {
                 }
             }
             MutateOutcome::NotHolder { holder } => {
-                // A redirect to a node that is not the lease holder is the
-                // root naming a designee (a delegate's `NotHolder` names the
-                // root): the op is sent to a designee even when this node's
-                // table does not list it yet.
-                let to_designee = holder != 0
-                    && holder != from
-                    && holder != self.cfg.node_id
-                    && self.lease.cached_holder != Some(holder)
-                    && self.lease.live_holder_seen(now, &self.cfg).map(|(h, _)| h) != Some(holder);
+                // The root's redirect to a designee carries the designee's
+                // generation (`gen`); a lease holder's redirect (a deposed
+                // root naming the new one, a delegate naming the root) does
+                // not. Only the first marks the op as sent to a designee, even
+                // when this node's table does not list it yet.
+                let to_designee =
+                    gen != 0 && holder != 0 && holder != from && holder != self.cfg.node_id;
                 // Plan 30 §M11: the root's `NotHolder` names a delegate
                 // (the op is wholly the delegate's); that is a route, not
                 // the lease holder, so the cache keeps the root.
@@ -4262,6 +4266,12 @@ impl Core {
         }
     }
 
+    /// Starts recording the rids of unsettled `EIO`s whose refusal was held
+    /// back for a designee, for `take_unsettled_designation` (the sim driver).
+    pub fn track_unsettled_designation(&mut self) {
+        self.track_unsettled_designation = true;
+    }
+
     /// Whether `rid`'s unsettled `EIO` was one whose refusal was held back
     /// for a designee (`Stats::unsettled_nonstealable_holder`); taken once.
     pub fn take_unsettled_designation(&mut self, rid: Rid) -> bool {
@@ -4290,7 +4300,11 @@ impl Core {
             // unsettled `EIO` is I4's exception, by rid.
             if c.designation_held {
                 self.stats.unsettled_nonstealable_holder += 1;
-                self.unsettled_designation_rids.insert(rid);
+                // (Recorded only when a consumer takes them: the sim
+                // driver. A production core would never drain the set.)
+                if self.track_unsettled_designation {
+                    self.unsettled_designation_rids.insert(rid);
+                }
                 while self.unsettled_designation_rids.len() > MAX_IN_DOUBT_RIDS {
                     let first = *self
                         .unsettled_designation_rids
@@ -4321,6 +4335,10 @@ impl Core {
                         let first = *self.in_doubt_rids.iter().next().expect("non-empty");
                         self.in_doubt_rids.remove(&first);
                         self.in_doubt_batches.remove(&first);
+                        self.in_doubt_designee_rids.remove(&first);
+                    }
+                    if c.redirected_to_designee {
+                        self.in_doubt_designee_rids.insert(rid);
                     }
                     if !c.inbox_keys.is_empty() {
                         self.in_doubt_batches.insert(rid, c.inbox_keys);

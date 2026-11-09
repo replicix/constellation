@@ -2215,6 +2215,14 @@ pub struct Core {
     /// Rids whose unsettled `EIO` was counted in `unsettled_nonstealable_holder`,
     /// until the driver takes them (`take_unsettled_designation`).
     unsettled_designation_rids: std::collections::BTreeSet<Rid>,
+    /// Whether `unsettled_designation_rids` is filled (a consumer calls
+    /// `track_unsettled_designation`; production cores do not, since nothing
+    /// would drain it).
+    track_unsettled_designation: bool,
+    /// Rids in `in_doubt_rids` whose op had been redirected to a designee:
+    /// the mark that keeps a resubmission out of the inbox (I1). Evicted
+    /// with `in_doubt_rids` (`MAX_IN_DOUBT_RIDS`, a known I1 bound).
+    in_doubt_designee_rids: std::collections::BTreeSet<Rid>,
     /// M13/M5: the durable inbox batch an in-doubt rid left behind, so
     /// its resubmission withdraws it before any P2P forward.
     in_doubt_batches: std::collections::BTreeMap<Rid, Vec<InboxKey>>,
@@ -2393,6 +2401,8 @@ impl Core {
             clients: BTreeMap::new(),
             in_doubt_rids: std::collections::BTreeSet::new(),
             unsettled_designation_rids: std::collections::BTreeSet::new(),
+            track_unsettled_designation: false,
+            in_doubt_designee_rids: std::collections::BTreeSet::new(),
             in_doubt_batches: std::collections::BTreeMap::new(),
             shipped_touches: std::collections::VecDeque::new(),
             shipped_floor: 0,

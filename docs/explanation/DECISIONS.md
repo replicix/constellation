@@ -3304,15 +3304,22 @@ the root's answer once the holder is reachable or its stream has ended, or, at
 the op's deadlines, in doubt (the settle's unsettled `EIO`, bounded by
 `settle_cap`). The sim counts that `EIO` apart (`unsettled_nonstealable_holder`,
 named by rid) and does not treat it as an I4 violation; the late-landing oracles
-are unchanged. A resubmission of a rid that went in doubt carries the
-mark over. A root's own client op under a sticky grant whose holder is out of
+are unchanged. A resubmission of a rid that went in doubt carries both
+marks over (sent to a designee, redirected to one), per rid. Only the root's
+designee redirect, which names the designee's generation, marks an op; a lease
+holder's redirect (a deposed root naming the new one, a delegate naming the
+root) does not. A root's own client op under a sticky grant whose holder is out of
 reach waits on the grant instead of being refused.
 
 **Consequences**: an op under an unreachable non-stealable holder ends in doubt
 where it ended `EROFS`: more `EIO`, later, for ops that may have run, and no
 false `EROFS`. Ops that were never sent to the holder are refused as before. The
 over-marking (a send to a holder that did not receive it) costs the errno, not
-safety. The knob `refuse_forwarded_designation_ops` (test-only) restores the old
+safety. Known I1 limit: the marks are kept with the in-doubt rids, which the
+core bounds (`MAX_IN_DOUBT_RIDS`, 10,000 per node); a rid evicted beyond that
+is resubmitted unmarked, and a refusal of an op a designee ran is then not
+held (the same eviction already allows a second execution of an ordinary
+in-doubt rid). The knob `refuse_forwarded_designation_ops` (test-only) restores the old
 behaviour; `sticky-ttl` fails with it.
 
 **May revert**: never as a whole; plan 46 M1.3's later steps may replace the
