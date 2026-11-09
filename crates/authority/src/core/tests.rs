@@ -64526,11 +64526,13 @@ mod step4_sticky {
         assert!(refused(&out, 914).contains("not the root of generation"));
         assert!(!h.core.dl.gens[&gen].ended);
         assert!(h.core.dl.abandons.is_empty());
-        // The right pair starts; a second abandon of the same stream is refused.
+        // The right pair starts; a second abandon of the same stream takes
+        // the wait over (see `a_repeated_abandon_takes_over_the_wait`).
         let out = abandon_node(&mut h, 915, 3, Some(gen), false);
         assert!(answer_of(&out, 915).is_none(), "{out:?}");
         let out = abandon_node(&mut h, 916, 3, None, false);
-        assert!(refused(&out, 916).contains("already waiting"));
+        assert!(refused(&out, 915).contains("taken over"));
+        assert!(answer_of(&out, 916).is_none(), "{out:?}");
     }
 
     /// The holder comes back and its release ends the stream during the
@@ -64631,6 +64633,58 @@ mod step4_sticky {
         let mut out = Vec::new();
         h.core.on_abandon_timer(h.clk(), &h.meta, &mut out);
         assert!(matches!(answer_of(&out, 910), Some(Ok(_))), "{out:?}");
+        assert!(h.core.dl.gens[&gen].ended);
+    }
+
+    /// The wait for a usable root has an end: once the lease the root holds
+    /// expired on its own clock, the command is answered "no longer the
+    /// root" (the operator runs it on the root there is). Fails without the
+    /// bound: the command retries every 200 ms for good.
+    #[test]
+    fn an_abandon_past_its_deadline_gives_up_once_the_roots_lease_expired() {
+        let (mut h, gen) = root_with_a_silent_sticky_holder();
+        h.core.cfg.read_delegation_ttl_ms = 0;
+        let out = abandon_node(&mut h, 910, 3, None, false);
+        assert!(answer_of(&out, 910).is_none());
+        h.advance(h.core.cfg.expiry_margin_ms + 1);
+        h.core.lease.releasing = true;
+        let mut out = Vec::new();
+        h.core.on_abandon_timer(h.clk(), &h.meta, &mut out);
+        assert!(answer_of(&out, 910).is_none(), "{out:?}");
+        // The lease lapses with the root still unusable.
+        h.advance(10 * 60 * 1000);
+        let mut out = Vec::new();
+        h.core.on_abandon_timer(h.clk(), &h.meta, &mut out);
+        match answer_of(&out, 910) {
+            Some(Err(e)) => assert!(e.contains("no longer the root"), "{e}"),
+            other => panic!("{other:?}\n{out:?}"),
+        }
+        assert!(!h.core.dl.gens[&gen].ended);
+        assert!(h.core.dl.abandons.is_empty());
+    }
+
+    /// An operator that gave up and asks again for streams a wait covers
+    /// takes the wait over: the old command is told so, the new one gets the
+    /// answer. Fails when the repeat is refused as "already waiting".
+    #[test]
+    fn a_repeated_abandon_takes_over_the_wait() {
+        let (mut h, gen) = root_with_a_silent_sticky_holder();
+        let out = abandon_node(&mut h, 910, 3, None, false);
+        let voids = void_reqs(&out);
+        assert!(answer_of(&out, 910).is_none());
+        let out = abandon_node(&mut h, 911, 3, None, false);
+        assert!(
+            matches!(answer_of(&out, 910), Some(Err(e)) if e.contains("taken over")),
+            "{out:?}"
+        );
+        assert!(answer_of(&out, 911).is_none(), "{out:?}");
+        assert_eq!(h.core.dl.abandons.len(), 1);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: voids[0].1 },
+        });
+        assert!(matches!(answer_of(&out, 911), Some(Ok(_))), "{out:?}");
+        assert!(answer_of(&out, 910).is_none(), "{out:?}");
         assert!(h.core.dl.gens[&gen].ended);
     }
 

@@ -2457,6 +2457,15 @@ pub fn end_of_run(
     // (A rollback before the answer is not of it: a lone node's row rolled
     // back by its deposition, then its replay answered by the group.)
     let cuts = super::cut::StreamCuts::of_log(log);
+    let refused_rids: HashSet<Rid> = log
+        .unfenced
+        .values()
+        .flat_map(|seg| seg.records.iter())
+        .filter_map(|rec| match rec {
+            LogRecord::Refused { rid, .. } => Some(*rid),
+            _ => None,
+        })
+        .collect();
     for (rid, at) in rolled_back {
         if non_lone_ok.get(rid).is_some_and(|t| t < at) {
             let Some(a) = acks.iter().rev().find(|a| {
@@ -2488,6 +2497,26 @@ pub fn end_of_run(
                     && cuts.cut.get(&gen).is_some_and(|c| idx > *c)
                 {
                     if abandoned_at.get(&gen).is_some_and(|t0| a.at_ms > *t0) {
+                        // A returned holder's row the log completed by its
+                        // rid was replayed, as the contract says: not lost.
+                        if a.judged
+                            .as_ref()
+                            .is_some_and(|j| j.class == Some(Judged::Final))
+                            && log.completed_at.contains_key(rid)
+                        {
+                            continue;
+                        }
+                        // No record of the rid at all: the row vanished,
+                        // neither replayed nor refused.
+                        if !log.completed_at.contains_key(rid) && !refused_rids.contains(rid) {
+                            f.i5.push(format!(
+                                "I5 after the end: rid {rid:?} (row {idx} of abandoned generation {gen}, past its cut) \
+                                 answered at t={} ms, after the abandon was answered at t={} ms, rolled back, \
+                                 and the log has neither its completion nor a refusal of it",
+                                a.at_ms, abandoned_at[&gen]
+                            ));
+                            continue;
+                        }
                         f.i5_after_end.push(format!(
                             "I5 after the end: rid {rid:?} (row {idx} of abandoned generation {gen}, past its cut) \
                              answered at t={} ms, after the abandon was answered at t={} ms, rolled back",
@@ -3214,10 +3243,10 @@ mod tests {
     #[test]
     fn i5_counts_a_rollback_past_an_abandoned_streams_cut_as_the_operators() {
         let r = rid(1, 1);
-        let row = |idx: u64| AckEntry {
+        let row_of = |idx: u64, class: Judged| AckEntry {
             judged: Some(Judgement {
-                class: Some(Judged::Group),
-                expected: Expected::Class(Judged::Group),
+                class: Some(class),
+                expected: Expected::Class(class),
                 tx: Some(TxRef {
                     node: 2,
                     first: idx,
@@ -3231,6 +3260,7 @@ mod tests {
             }),
             ..ack(2, r, 5, OutcomeKind::Ok, true)
         };
+        let row = |idx: u64| row_of(idx, Judged::Group);
         let o = |records: Vec<LogRecord>| {
             let mut s = seg(1, &[]);
             s.records = records;
@@ -3276,13 +3306,43 @@ mod tests {
         // A row answered after the abandon was answered (the row is acked at
         // t=5): not the cost the operator accepted, counted apart. One
         // answered at the same instant or before is the operator's.
+        let refusal = LogRecord::Refused {
+            rid: r,
+            code: constellation_authority::ABANDONED_CODE,
+        };
         let f = run(
-            vec![ended.clone(), abandoned.clone()],
+            vec![ended.clone(), abandoned.clone(), refusal],
             4,
             BTreeMap::from([(7, 4)]),
         );
         assert!(f.i5.is_empty() && f.i5_operator.is_empty(), "{:?}", f.i5);
         assert_eq!(f.i5_after_end.len(), 1, "{:?}", f.i5_after_end);
+        // A returned holder's row the log completed by its rid (class
+        // Final) was replayed: counted nowhere.
+        let (oracles, s) = o(vec![ended.clone(), abandoned.clone()]);
+        *oracles.acks.lock().unwrap() = vec![row_of(4, Judged::Final)];
+        let f = end_of_run(
+            &oracles,
+            &log_with(s, &[(r, (1, 0))]),
+            &[],
+            &HashMap::from([(r, 6)]),
+            &BTreeSet::new(),
+            &BTreeMap::from([(7, 4)]),
+            true,
+        );
+        assert!(
+            f.i5.is_empty() && f.i5_after_end.is_empty() && f.i5_operator.is_empty(),
+            "{:?}",
+            f.i5
+        );
+        // No record of the rid at all: the row vanished, a violation.
+        let f = run(
+            vec![ended.clone(), abandoned.clone()],
+            4,
+            BTreeMap::from([(7, 4)]),
+        );
+        assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
+        assert!(f.i5_after_end.is_empty() && f.i5_operator.is_empty());
         let f = run(vec![ended, abandoned], 4, BTreeMap::from([(7, 5)]));
         assert_eq!(f.i5_operator.len(), 1);
         assert!(f.i5_after_end.is_empty());
