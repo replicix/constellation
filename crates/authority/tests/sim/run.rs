@@ -4882,6 +4882,12 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                             // The run-wide allowance: only an abandon that
                             // ended the generation.
                             Ok(_) => operator_abandoned.lock().unwrap().push(gen),
+                            // The root cannot end it now (not usable yet: its
+                            // gate is open, or the end could not be journaled):
+                            // the command says try again, and the operator does.
+                            Err(e) if e.contains("cannot end") || e.contains("try again") => {
+                                done.remove(&(id, gen));
+                            }
                             Err(e) => operator_failures.lock().unwrap().push(format!(
                                 "t={now_ms} node {id}: abandon-group --gen {gen} refused: {e}"
                             )),

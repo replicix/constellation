@@ -413,6 +413,7 @@ fn release_answer(
         end_at: None,
         locks,
         leaving: false,
+        seal: false,
     };
     deliver_stream(h, node, gen, vec![row], Some(note))
 }
@@ -431,6 +432,7 @@ fn release_note_only(
         end_at: None,
         locks,
         leaving: false,
+        seal: false,
     };
     deliver_stream(h, node, gen, Vec::new(), Some(note))
 }
@@ -16515,6 +16517,9 @@ mod locks {
             Some(want),
             "no release at the log's index {want}: {out:?}"
         );
+        // A plain stop cuts exactly: the root does not seal the group for it.
+        assert!(!release_note_to(&out, 1).unwrap().seal);
+        assert_eq!(h.core.stats.deleg_release_rowless_plain, 1);
     }
 
     /// strand-takeover-quiescence: the takeover gate's strand of the
@@ -16790,6 +16795,8 @@ mod locks {
             },
         });
         assert_eq!(release_cut_to(&out, 1), Some(0), "{out:?}");
+        assert!(!release_note_to(&out, 1).unwrap().seal, "{out:?}");
+        assert_eq!(h.core.stats.deleg_release_rowless_plain, 1);
     }
 
     /// The gate on the same delegate with a tail that ends the generation
@@ -45534,6 +45541,10 @@ mod deleg_group {
             },
         });
         assert_eq!(release_cut_to(&out, 1), Some(0), "{out:?}");
+        // Capped below the delegate's unshipped appends: the group may hold
+        // rows above the cut, the root seals it.
+        assert!(release_note_to(&out, 1).unwrap().seal, "{out:?}");
+        assert_eq!(h.core.stats.deleg_release_rowless_capped, 1);
     }
 
     /// A recall of the stopped generation answered before the new tenure
@@ -45553,6 +45564,8 @@ mod deleg_group {
             },
         });
         assert_eq!(release_cut_to(&out, 1), Some(0), "{out:?}");
+        assert!(release_note_to(&out, 1).unwrap().seal, "{out:?}");
+        assert_eq!(h.core.stats.deleg_release_rowless_capped, 1);
     }
 
     /// The same takeover, the forward's park gone (its answer aborted, or a
@@ -45673,6 +45686,22 @@ mod deleg_group {
             "(renewed, stopped) after a reboot: {out:?}"
         );
         assert_eq!(h.core.stats.deleg_rebooted_holder, 1);
+        // Its release is rowless, and asks the root to seal the group: it
+        // does not re-stream, and the group may hold rows above its journal.
+        let mut h = h;
+        let dir = *h.core.dl.mine[&7].dirs.iter().next().unwrap();
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReleaseRequest {
+                req: OpId(5),
+                gen: 7,
+                dirs: vec![dir],
+            },
+        });
+        let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("no release: {out:?}"));
+        assert!(note.end_at.is_some() && note.seal, "{note:?}");
+        assert_eq!(h.core.stats.deleg_release_rowless_unseen, 1);
+        assert_eq!(h.core.stats.deleg_release_rowless_plain, 0);
     }
 
     /// Review follow-up (fail-before): a boot that cannot be named (id 0: no
@@ -62142,6 +62171,7 @@ mod step9_one_stream_per_node {
             end_at: None,
             locks: Default::default(),
             leaving: false,
+            seal: false,
         };
         deliver_stream(&mut h, 3, gen, vec![row], Some(note));
         assert!(
@@ -62209,6 +62239,7 @@ mod step9_one_stream_per_node {
             end_at: None,
             locks: Default::default(),
             leaving: false,
+            seal: false,
         };
         // The release row alone: the delegate's earlier row is missing (a
         // batch lost), so nothing is appended.
@@ -62640,6 +62671,10 @@ mod step9_one_stream_per_node {
         let out = release_request(&mut h, 5, vec![d1]);
         let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("no release: {out:?}"));
         assert_eq!(note.end_at, Some(1), "{note:?}");
+        // The cut is exact (rows after a lost dependency were never
+        // acknowledged): no seal of the group.
+        assert!(!note.seal, "{note:?}");
+        assert_eq!(h.core.stats.deleg_release_rowless_lost_dep, 1);
         let back: Vec<u64> = note.locks.grants.iter().map(|g| g.ino).collect();
         assert!(
             back.contains(&f1) && back.contains(&f2),
@@ -63073,6 +63108,7 @@ mod step9_one_stream_per_node {
             end_at: None,
             locks: Default::default(),
             leaving: true,
+            seal: false,
         };
         deliver_stream(&mut r, 3, gen, Vec::new(), Some(note));
         let out = r.step(Event::Control {
@@ -63635,6 +63671,7 @@ mod step9_one_stream_per_node {
                     barrier: 0,
                 },
                 leaving: false,
+                seal: false,
             },
             row: Some(4),
             first_row: Some(4),
@@ -65736,14 +65773,20 @@ mod step14_release_seal {
         }
     }
 
-    /// Node 3's rowless release of generation 7, ending its stream at `cut`.
+    /// Node 3's rowless release of generation 7, ending its stream at `cut`
+    /// and asking for the group's seal (capped, or not installed).
     fn rowless_release(h: &mut Harness, cut: u64) -> Vec<Action> {
+        rowless_note(h, cut, true)
+    }
+
+    fn rowless_note(h: &mut Harness, cut: u64, seal: bool) -> Vec<Action> {
         let dirs = h.core.dl.gens[&7].dirs.keys().copied().collect();
         let note = constellation_meta::locks::ReleaseNote {
             dirs,
             end_at: Some(cut),
             locks: Default::default(),
             leaving: false,
+            seal,
         };
         deliver_stream(h, 3, 7, Vec::new(), Some(note))
     }
@@ -65843,18 +65886,152 @@ mod step14_release_seal {
 
     /// The wait for the stream is bounded: a delegate that let go of its
     /// stream sends the rows up to its cut no more, and a row the group does
-    /// not hold was never acknowledged. A window after the group's answer the
-    /// generation ends at the cursor (seed 1509 of `long-delegated-backup`:
-    /// row 14 only on the delegate, which dropped its state).
+    /// not hold was never acknowledged. A whole window after the group's
+    /// answer (not after the release) the generation ends at the cursor (seed
+    /// 1509 of `long-delegated-backup`: row 14 only on the delegate, which
+    /// dropped its state).
     #[test]
     fn a_cut_the_stream_never_reaches_is_waived_a_window_after_the_groups_answer() {
         let mut h = root_with_delegate_backed_by(4);
         deliver_stream(&mut h, 3, 7, vec![row(1)], None);
         let out = rowless_release(&mut h, 2);
         let req = seal_reqs(&out, 4)[0];
-        let timer = timers(&out, TimerKind::DelegReleaseSeal)[0];
-        h.step(sealed(req, Vec::new()));
+        let release_timer = timers(&out, TimerKind::DelegReleaseSeal)[0];
+        let window = h
+            .core
+            .cfg
+            .backup_takeover_ms
+            .max(h.core.cfg.forward_timeout_ms);
+        // The group answers late: just before the release's own timer.
+        h.advance(window - 100);
+        let out = h.step(sealed(req, Vec::new()));
         assert!(!h.core.dl.gens[&7].ended);
+        let answer_timer = timers(&out, TimerKind::DelegReleaseSeal);
+        assert_eq!(answer_timer.len(), 1, "no timer for the answer: {out:?}");
+        // The release's own timer (a window after the release) is not the
+        // waiver's: the answer is 100 ms old.
+        h.advance(110);
+        h.step(Event::Timer { id: release_timer });
+        assert!(
+            !h.core.dl.gens[&7].ended && !h.core.dl.gens[&7].release_cut_waived,
+            "waived 110 ms after the answer"
+        );
+        // A window after the answer, it is.
+        h.advance(window);
+        h.step(Event::Timer {
+            id: answer_timer[0],
+        });
+        let g = &h.core.dl.gens[&7];
+        assert!(g.ended, "still waiting for rows that never come");
+        assert_eq!(g.cursor, 1);
+    }
+
+    /// The note rides every batch until acknowledged: a batch that repeats it
+    /// does not ask the group again, does not re-arm the retry (the waiver's
+    /// clock is not pushed out), and only lowers the cut.
+    #[test]
+    fn a_repeated_release_note_neither_reseals_nor_rearms_the_timer() {
+        let (mut h, _req) = released_below_the_backups_row();
+        let sent = h.core.stats.deleg_seals_sent;
+        let timer = h.core.dl.gens[&7].release_seal_timer;
+        assert!(timer.is_some());
+        let out = rowless_release(&mut h, 2);
+        assert!(seal_reqs(&out, 4).is_empty(), "sealed again: {out:?}");
+        assert!(
+            timers(&out, TimerKind::DelegReleaseSeal).is_empty(),
+            "re-armed: {out:?}"
+        );
+        assert_eq!(h.core.stats.deleg_seals_sent, sent);
+        assert_eq!(h.core.dl.gens[&7].release_seal_timer, timer);
+        assert_eq!(h.core.stats.deleg_release_seals, 1);
+        // A lower cut (a merged release) lowers it.
+        rowless_release(&mut h, 1);
+        assert_eq!(h.core.dl.gens[&7].release_cut, Some(1));
+        rowless_release(&mut h, 2);
+        assert_eq!(h.core.dl.gens[&7].release_cut, Some(1));
+    }
+
+    /// A rowless release that does not ask for the seal (a lost dependency, a
+    /// plain stop: the cut is exact) ends the stream at its cut as before.
+    #[test]
+    fn a_rowless_release_without_the_seal_bit_ends_at_its_cut() {
+        let mut h = root_with_delegate_backed_by(4);
+        deliver_stream(&mut h, 3, 7, vec![row(1), row(2)], None);
+        let out = rowless_note(&mut h, 2, false);
+        assert!(seal_reqs(&out, 4).is_empty(), "sealed: {out:?}");
+        let g = &h.core.dl.gens[&7];
+        assert!(!g.release_seal);
+        assert_eq!(g.recall, RecallPhase::Drained(2));
+        assert_eq!(h.core.stats.deleg_release_seals, 0);
+    }
+
+    /// A stream this node never installed answers a release rowless and asks
+    /// for the seal: the rows it holds of it are not the group's.
+    #[test]
+    fn a_release_of_a_stream_never_installed_asks_for_the_seal() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReleaseRequest {
+                req: OpId(5),
+                gen: 7,
+                dirs: Vec::new(),
+            },
+        });
+        let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("no release: {out:?}"));
+        assert!(note.end_at.is_some() && note.seal, "{note:?}");
+        assert_eq!(h.core.stats.deleg_release_rowless_unseen, 1);
+    }
+
+    /// A root whose generation's end waits for a previous root asks the group
+    /// when the previous root settles, and keeps its retry timer meanwhile:
+    /// a sticky generation arms no expiry, and the hang was the group's
+    /// answer lost with nothing left to ask again.
+    #[test]
+    fn a_release_seal_blocked_on_a_previous_root_is_not_left_without_a_timer() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.delegation_ttl_ms = 1_000;
+        h.hold(1, None);
+        h.core.lease.prev_holder = Some(2);
+        let _ = delegated_to_me(&h.meta, 3);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let prev_seal = sends(&out)
+            .iter()
+            .find_map(|(n, m)| match m {
+                PeerMsg::DelegSeal { req, gen: 7 } if *n == 2 => Some(*req),
+                _ => None,
+            })
+            .expect("the previous root is asked");
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(1),
+                gen: 7,
+                round: 1,
+                backup: Some(4),
+                stream_head: 5,
+                stream_head_at: 0,
+                first: false,
+            },
+        });
+        for k in h.core.dl.gens.get_mut(&7).unwrap().dirs.values_mut() {
+            *k = DelegKind::Sticky;
+        }
+        assert!(h.core.dl.gens[&7].non_stealable());
+        assert!(!h.core.dl.gens[&7].prev_roots.is_empty());
+        let out = rowless_release(&mut h, 0);
+        let req = seal_reqs(&out, 4)[0];
+        let timer = timers(&out, TimerKind::DelegReleaseSeal)[0];
+        // The group holds nothing; the end waits for the previous root.
+        h.step(sealed(req, Vec::new()));
+        assert!(h.core.dl.gens[&7].prev_blocked);
+        assert!(!h.core.dl.gens[&7].ended);
+        // The retry fires while blocked: it keeps itself armed.
         h.advance(
             h.core
                 .cfg
@@ -65862,10 +66039,93 @@ mod step14_release_seal {
                 .max(h.core.cfg.forward_timeout_ms)
                 + 10,
         );
-        h.step(Event::Timer { id: timer });
-        let g = &h.core.dl.gens[&7];
-        assert!(g.ended, "still waiting for rows that never come");
-        assert_eq!(g.cursor, 1);
+        let out = h.step(Event::Timer { id: timer });
+        assert_eq!(
+            timers(&out, TimerKind::DelegReleaseSeal).len(),
+            1,
+            "the retry died while blocked: {out:?}"
+        );
+        // The previous root settles: the generation ends.
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegSealed {
+                req: prev_seal,
+                gen: 7,
+                sealed: false,
+                txs: Vec::new(),
+                prev_roots: Vec::new(),
+            },
+        });
+        assert!(
+            h.core.dl.gens[&7].ended,
+            "hung in Sealing: {:?}",
+            h.core.dl.gens[&7].recall
+        );
+    }
+
+    /// The release arrives while the end is already blocked on a previous
+    /// root: no seal can go out yet, but the retry timer is armed, and the
+    /// group is asked when the previous root settles.
+    #[test]
+    fn a_release_that_arrives_while_blocked_arms_its_timer_and_asks_when_unblocked() {
+        let (mut h, _) = {
+            let mut h = Harness::new(1);
+            h.core.cfg.delegation = true;
+            h.core.cfg.p2p = true;
+            h.core.cfg.delegation_ttl_ms = 1_000;
+            h.hold(1, None);
+            h.core.lease.prev_holder = Some(2);
+            let _ = delegated_to_me(&h.meta, 3);
+            let mut out = Vec::new();
+            h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+            (h, out)
+        };
+        let prev_seal = h
+            .core
+            .dl
+            .gens
+            .get(&7)
+            .and_then(|g| g.prev_reqs.keys().next().copied())
+            .expect("a previous root's seal request");
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(1),
+                gen: 7,
+                round: 1,
+                backup: Some(4),
+                stream_head: 5,
+                stream_head_at: 0,
+                first: false,
+            },
+        });
+        for k in h.core.dl.gens.get_mut(&7).unwrap().dirs.values_mut() {
+            *k = DelegKind::Sticky;
+        }
+        // (The end was asked for earlier and is blocked.)
+        h.core.dl.gens.get_mut(&7).unwrap().prev_blocked = true;
+        let out = rowless_release(&mut h, 0);
+        assert!(seal_reqs(&out, 4).is_empty());
+        assert_eq!(
+            timers(&out, TimerKind::DelegReleaseSeal).len(),
+            1,
+            "no timer while blocked: {out:?}"
+        );
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegSealed {
+                req: prev_seal,
+                gen: 7,
+                sealed: false,
+                txs: Vec::new(),
+                prev_roots: Vec::new(),
+            },
+        });
+        assert_eq!(
+            seal_reqs(&out, 4).len(),
+            1,
+            "the group is not asked: {out:?}"
+        );
     }
 
     /// A strict seal that fails in transport does not fall back to the cut:

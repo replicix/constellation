@@ -8027,6 +8027,10 @@ struct OracleTotals {
     /// takeover gate took on, renewals it granted, transactions it appended,
     /// settles it redirected.
     s5_gate: [u64; 4],
+    /// Plan 46 M1.2 step 14: rowless releases by reason (capped, never
+    /// installed or rebooted, lost dependency, plain stop), the releases the
+    /// root sealed the group for, and the seal waits.
+    rowless: [u64; 7],
     unsettled_causes: std::collections::BTreeMap<String, u64>,
 }
 
@@ -8154,6 +8158,17 @@ impl OracleTotals {
         self.nonstealable_in_doubt.0 += r.unsettled_nonstealable_holder as u64;
         self.nonstealable_in_doubt.1 += u64::from(r.unsettled_nonstealable_holder > 0);
         for st in r.stats.values() {
+            for (c, n) in self.rowless.iter_mut().zip([
+                st.deleg_release_rowless_capped,
+                st.deleg_release_rowless_unseen,
+                st.deleg_release_rowless_lost_dep,
+                st.deleg_release_rowless_plain,
+                st.deleg_seal_waits,
+                st.deleg_redelegated,
+                st.deleg_release_seals,
+            ]) {
+                *c += n;
+            }
             for (c, n) in self.s5_gate.iter_mut().zip([
                 st.deleg_gated_inherited,
                 st.deleg_renewals_gated,
@@ -8397,6 +8412,19 @@ impl OracleTotals {
             "SWEEP-SEGMENTS {label} seeds {}/{seeds}: segments landed {}, decompressed bytes {}, \
              delegate-stream dependency waits {}, bytes as stored {}",
             self.seeds, self.seg[0], self.seg[1], self.seg[2], self.seg[3]
+        );
+        eprintln!(
+            "SWEEP-ROWLESS {label} seeds {}/{seeds}: rowless releases by reason: capped {}, never \
+             installed or rebooted {}, lost dependency {}, plain stop {}; seal waits {}, \
+             re-delegated {}, group seals for a release {}",
+            self.seeds,
+            self.rowless[0],
+            self.rowless[1],
+            self.rowless[2],
+            self.rowless[3],
+            self.rowless[4],
+            self.rowless[5],
+            self.rowless[6]
         );
         eprintln!(
             "SWEEP-S5-GATE {label} seeds {}/{seeds}: generations taken on by a shippable gate {}, \
