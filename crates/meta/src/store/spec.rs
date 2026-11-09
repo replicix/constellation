@@ -3102,8 +3102,8 @@ fn log_carries(r: &impl Readable, meta: &Meta, rid: &Rid) -> Result<bool, MetaEr
 /// [`rewind_tx`]).
 /// Seed 2560 (long-delegated-late-answers): the journal transactions (by
 /// first journal seq) that are this node's appends, as the root of an
-/// earlier tenure, of a delegate's rows (`gen` != 0, `epoch` > 0 and below
-/// `epoch`, the tenure of the segment being applied) whose every outcome
+/// earlier tenure, of a delegate's rows (`gen` != 0, `appended`, and an
+/// `epoch` below `epoch`, the tenure of the segment being applied) whose every outcome
 /// (`Completed`, `Refused`) the segment carries (`completes`, `refused`)
 /// under an identity other than the row's: not by its origin (`origins`;
 /// a segment that carries the origin carries the row, and retires it as
@@ -3169,7 +3169,7 @@ fn superseded_root_appends_tx(
         let head: local::JournalTxHead = postcard::from_bytes(&v)?;
         if head.last < position
             || head.gen == 0
-            || head.epoch == 0
+            || !head.appended
             || head.epoch >= epoch
             || head.spec_seq.is_none()
             || origins.contains(&(head.gen, head.idx))

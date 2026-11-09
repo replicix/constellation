@@ -2800,3 +2800,36 @@ fn the_negative_control_queues_a_root_append_and_is_counted() {
     assert_eq!((s.deleg_member_copied, s.deleg_append_queued), (0, 1));
     assert_eq!(meta.pending_replays().unwrap().len(), 1);
 }
+
+/// Plan 46 M1.2 step 14 (review S1): a delegate's own execution between
+/// acquiring the lease and the takeover gate's strand carries the lease epoch
+/// but is not a root's append (`JournalTx::appended` is false). A later
+/// tenure's segment that carries its rid's outcome under another identity
+/// does not pick it as a superseded append: it stays in the journal, as
+/// before the epoch test was replaced.
+#[test]
+fn a_delegates_own_row_under_a_lease_epoch_is_not_a_superseded_append() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    meta.delegate_execute(
+        &create_op("a", ino(1)),
+        Some(rid(1)),
+        5,
+        Position::ZERO,
+        &Default::default(),
+        constellation_types::clock::Now::same(0),
+    )
+    .unwrap();
+    meta.set_holder_epoch(0);
+    let rows = meta.journal_len().unwrap();
+    // (The outcome alone: a record that touched the row's keys would roll it
+    // back as a conflict, which is not the pass under test.)
+    let carried = [completed(rid(1))];
+    let applied = meta
+        .apply_segment_rows(1, 2, 2, &[], &[], &carried, &TouchSet::default())
+        .unwrap();
+    assert_eq!(applied.stranded.deleg_dropped, 0);
+    assert_eq!(applied.stranded.locals, 0, "not stranded, not queued");
+    assert!(meta.pending_replays().unwrap().is_empty());
+    assert_eq!(meta.journal_len().unwrap(), rows, "the own row stays");
+}

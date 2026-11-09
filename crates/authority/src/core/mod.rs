@@ -1192,6 +1192,17 @@ pub struct Stats {
     /// ended the whole stream at the cut).
     pub deleg_release_merged: u64,
     pub deleg_release_rowless_partial: u64,
+    /// Delegate (plan 46 M1.2 step 14): rowless releases by reason: the cut
+    /// capped below the delegate's holder appends, a stream never installed
+    /// here or restarted without, a lost dependency, a plain stop. The first
+    /// two ask the root to seal the group (`ReleaseNote::seal`).
+    pub deleg_release_rowless_capped: u64,
+    pub deleg_release_rowless_unseen: u64,
+    pub deleg_release_rowless_lost_dep: u64,
+    pub deleg_release_rowless_plain: u64,
+    /// Root (plan 46 M1.2 step 14): rowless releases that began a seal of the
+    /// group (`ReleaseNote::seal`).
+    pub deleg_release_seals: u64,
     /// Root (step 10): resends of a partial release request, and the
     /// requests that became a recall of the stream after them.
     pub deleg_release_partial_resent: u64,

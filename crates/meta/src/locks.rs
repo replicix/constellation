@@ -545,6 +545,13 @@ pub struct ReleaseNote {
     /// The releasing node is leaving: the root grants it nothing more.
     #[serde(default)]
     pub leaving: bool,
+    /// Plan 46 M1.2 step 14 (L2b): with `end_at`, the cut may sit below rows
+    /// the generation's recorded group acknowledged, so the root seals the
+    /// group before it ends the generation. Set when the delegate capped the
+    /// cut below its own unshipped holder appends (`holder_append_cap`), or
+    /// answers for a stream it never installed or restarted without. A cut
+    /// that is exact (a lost dependency, a plain stop) leaves it clear.
+    pub seal: bool,
 }
 
 /// Join two lock floors (positions: watermarks, so the join is what both
