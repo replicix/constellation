@@ -66311,6 +66311,41 @@ mod step14_release_seal {
         assert_eq!(h.core.dl.gens[&7].cursor, 3);
     }
 
+    /// Seeds 1950 (`long-delegated-late-answers+commit`) with slow lease
+    /// reads: the root, a new tenure in its takeover gate, got the rowless
+    /// release of a generation whose group holds nothing past its cursor and
+    /// kept it open for the whole quarantine, so the delegate's parked ops
+    /// ran out of time. Fails before: the generation is not ended.
+    #[test]
+    fn a_released_generation_with_nothing_to_append_ends_while_the_root_cannot_append() {
+        let mut h = root_with_delegate_backed_by(4);
+        deliver_stream(&mut h, 3, 7, vec![row(1)], None);
+        let out = rowless_release(&mut h, 1);
+        let req = seal_reqs(&out, 4)[0];
+        // The root is a new tenure in its takeover gate by the time the
+        // backup answers, waiting out the quarantine: it cannot append.
+        h.hold(
+            1,
+            Some(PendingGate {
+                epoch: 1,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: None,
+                shippable: true,
+            }),
+        );
+        assert!(!h.core.root_usable(h.clk()));
+        h.step(sealed(req, vec![row(1)]));
+        let g = &h.core.dl.gens[&7];
+        assert!(
+            g.ended,
+            "the tail is at the cursor: nothing waits for a root that can append ({:?} {})",
+            g.recall, g.cursor
+        );
+    }
+
     /// A root that is itself its generation's recorded backup serves its own
     /// seal inline (the daemon sends no message to itself).
     #[test]
