@@ -49965,7 +49965,7 @@ mod deleg_windows_tests {
     }
 
     /// The end waits for the predecessor, status says so, and the operator's
-    /// `abandon-group --gen` is the way out.
+    /// `abandon --gen` is the way out.
     #[test]
     fn the_generation_end_waits_for_the_predecessor_until_abandoned() {
         let (mut h, _) = root_inheriting_a_backup_less_generation(2);
@@ -50152,7 +50152,7 @@ mod deleg_windows_tests {
     }
 
     /// Items 3 and 4: a previous root being waited on is listed in the
-    /// waiting view, and `abandon-group` without `--force` refuses while one is
+    /// waiting view, and `abandon` without `--force` refuses while one is
     /// unanswered or its tail is held; with `--force` it ends the generation.
     #[test]
     fn a_waited_on_previous_root_is_listed_and_guards_abandon_group() {
@@ -50299,7 +50299,7 @@ mod deleg_windows_tests {
         assert!(h.core.dl.gens[&7].ended, "{out:?}");
     }
 
-    /// C2e follow-up (fail-before): `abandon-group --gen` loses the rows only
+    /// C2e follow-up (fail-before): `abandon --gen` loses the rows only
     /// the group held, and a node cut from the root only (the delegate, or a
     /// member) may be alive and hold them. While this root has heard from
     /// the delegate or a strict member within `delegation_ttl_ms` it is
@@ -50411,7 +50411,7 @@ mod deleg_windows_tests {
 
     /// Plan 43 C2e (Q1): the escape. A generation that waits for its group
     /// is ended at the root's cursor by the operator's
-    /// `abandon-group --gen`, which journals `GroupAbandoned` with the cut;
+    /// `abandon --gen`, which journals `GroupAbandoned` with the cut;
     /// it is refused for a generation that does not wait, for an unknown or
     /// an ended one, and when an `--epoch` is given with it.
     #[test]
@@ -50620,7 +50620,7 @@ mod deleg_windows_tests {
     }
 
     /// A strict member's tail in hand, not appendable yet: the group is
-    /// not lost and `abandon-group` is refused (it would end the generation
+    /// not lost and `abandon` is refused (it would end the generation
     /// at the cursor and drop the rows of that very tail).
     #[test]
     fn abandon_group_is_refused_while_a_tail_is_in_hand() {
@@ -50666,6 +50666,60 @@ mod deleg_windows_tests {
         assert!(why.contains("in hand"), "{why}");
         assert!(!h.core.dl.gens[&7].ended);
         assert_eq!(h.core.stats.groups_abandoned, 0);
+    }
+
+    /// `repair abandon --node` on a node whose only generation is a placed
+    /// one: one that waits for its group ends at once, with no void sent to
+    /// any reader; one that does not is "nothing the cluster cannot end".
+    #[test]
+    fn abandon_by_node_ends_a_placed_generation_that_waits_and_names_one_that_does_not() {
+        let abandon = |h: &mut Harness, op: u64| {
+            h.step(Event::Control {
+                op: OpId(op),
+                req: Control::Abandon {
+                    target: crate::AbandonTarget::Node { node: 3, gen: None },
+                    force: true,
+                },
+            })
+        };
+        let answer = |out: &[Action], op: u64| {
+            out.iter().find_map(|a| match a {
+                Action::ControlDone { op: o, result } if *o == OpId(op) => Some(result.clone()),
+                _ => None,
+            })
+        };
+        // Not waiting: refused, nothing ended.
+        let mut h = root_with_delegate_backed_by(4);
+        let out = abandon(&mut h, 910);
+        match answer(&out, 910) {
+            Some(Err(e)) => assert!(
+                e.contains("nothing the cluster cannot end") && e.contains("[7]"),
+                "{e}"
+            ),
+            other => panic!("{other:?}\n{out:?}"),
+        }
+        assert!(!h.core.dl.gens[&7].ended);
+        assert_eq!(h.core.stats.groups_abandoned, 0);
+        // Waiting for its group: ended at once, no read void sent.
+        h.core.dl.gens.get_mut(&7).unwrap().waiting_for_group = true;
+        let out = abandon(&mut h, 911);
+        match answer(&out, 911) {
+            Some(Ok(ControlOk::Text(t))) => assert!(t.contains("(placed) ended at index"), "{t}"),
+            other => panic!("{other:?}\n{out:?}"),
+        }
+        assert!(h.core.dl.gens[&7].ended);
+        assert_eq!(h.core.stats.groups_abandoned, 1);
+        assert!(
+            !out.iter().any(|a| matches!(
+                a,
+                Action::Send {
+                    msg: PeerMsg::DelegReadVoid { .. },
+                    ..
+                }
+            )),
+            "{out:?}"
+        );
+        assert!(h.core.dl.abandons.is_empty());
     }
 
     /// What status says of a waiting generation: its members and when each
@@ -64486,15 +64540,17 @@ mod step4_sticky {
         let (mut h, gen) = root_with_a_silent_sticky_holder();
         let out = abandon_node(&mut h, 910, 3, None, false);
         assert!(answer_of(&out, 910).is_none());
-        // The holder's own release ends it in the log (not an abandon's end).
-        h.core.dl.gens.get_mut(&gen).unwrap().ended = true;
-        let mut out = Vec::new();
+        // The holder's own release row reaches the root and ends the stream
+        // (not an abandon's end).
+        let mut out = release_answer(&mut h, 3, gen, Default::default());
         h.core.on_abandon_timer(h.clk(), &h.meta, &mut out);
         let text = match answer_of(&out, 910) {
             Some(Ok(ControlOk::Text(t))) => t,
             other => panic!("{other:?}\n{out:?}"),
         };
         assert!(text.contains("ended meanwhile"), "{text}");
+        assert!(h.core.dl.gens[&gen].ended);
+        assert_eq!(h.core.stats.deleg_sticky_ended_released, 1);
         assert_eq!(h.core.stats.deleg_abandon_superseded, 1);
         assert_eq!(h.core.stats.groups_abandoned, 0);
         assert!(!all_records(&h)
@@ -64509,8 +64565,8 @@ mod step4_sticky {
         let (mut h, gen) = root_with_a_silent_sticky_holder();
         let out = abandon_node(&mut h, 910, 3, None, false);
         assert!(answer_of(&out, 910).is_none());
-        // Lease long past: this node is no usable root.
-        h.advance(10 * h.core.cfg.ttl_ms);
+        // Deposed: the lease is lost.
+        h.core.lease.lost = true;
         let mut out = Vec::new();
         h.core.on_abandon_timer(h.clk(), &h.meta, &mut out);
         match answer_of(&out, 910) {
@@ -64522,6 +64578,97 @@ mod step4_sticky {
         assert!(!all_records(&h)
             .iter()
             .any(|r| matches!(r, LogRecord::GroupAbandoned { .. })));
+    }
+
+    /// A root that is not usable for a moment (a lease renewal late under
+    /// load) does not drop the command: only a deposition does. The end is
+    /// journaled once the root is usable again. Fails when the first tick
+    /// without a usable root answers "no longer the root".
+    #[test]
+    fn an_abandon_waits_out_a_root_that_is_not_usable_for_a_moment() {
+        let (mut h, gen) = root_with_a_silent_sticky_holder();
+        // The root is fenced when the reader's answer comes.
+        let out = abandon_node(&mut h, 910, 3, None, false);
+        let voids = void_reqs(&out);
+        h.core.lease.releasing = true;
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: voids[0].1 },
+        });
+        assert!(answer_of(&out, 910).is_none(), "{out:?}");
+        let mut out = Vec::new();
+        h.core.on_abandon_timer(h.clk(), &h.meta, &mut out);
+        assert!(answer_of(&out, 910).is_none(), "{out:?}");
+        assert!(!h.core.dl.gens[&gen].ended);
+        assert_eq!(h.core.dl.abandons.len(), 1);
+        h.core.lease.releasing = false;
+        let mut out = Vec::new();
+        h.core.on_abandon_timer(h.clk(), &h.meta, &mut out);
+        assert!(matches!(answer_of(&out, 910), Some(Ok(_))), "{out:?}");
+        assert!(h.core.dl.gens[&gen].ended);
+    }
+
+    /// The deadline passed and the root is not usable: the command waits and
+    /// looks again later, it neither fails nor spins on an immediate timer.
+    #[test]
+    fn an_abandon_past_its_deadline_waits_for_a_usable_root() {
+        let (mut h, gen) = root_with_a_silent_sticky_holder();
+        // A short wait, so that the lease outlasts the deadline.
+        h.core.cfg.read_delegation_ttl_ms = 0;
+        let out = abandon_node(&mut h, 910, 3, None, false);
+        assert!(answer_of(&out, 910).is_none());
+        h.advance(h.core.cfg.expiry_margin_ms + 1);
+        h.core.lease.releasing = true;
+        let mut out = Vec::new();
+        h.core.on_abandon_timer(h.clk(), &h.meta, &mut out);
+        assert!(answer_of(&out, 910).is_none(), "{out:?}");
+        let after = out.iter().find_map(|a| match a {
+            Action::SetTimer { after_ms, .. } => Some(*after_ms),
+            _ => None,
+        });
+        assert!(after.is_some_and(|ms| ms > 0), "re-armed at once: {out:?}");
+        h.core.lease.releasing = false;
+        let mut out = Vec::new();
+        h.core.on_abandon_timer(h.clk(), &h.meta, &mut out);
+        assert!(matches!(answer_of(&out, 910), Some(Ok(_))), "{out:?}");
+        assert!(h.core.dl.gens[&gen].ended);
+    }
+
+    /// During an abandon's wait the root refuses the stream's renewals (with
+    /// `ends`): the deadline assumes the holder grants nothing after the
+    /// command. Fails without the refusal: the renewal is granted.
+    #[test]
+    fn the_root_refuses_a_renewal_of_a_stream_in_an_abandon_wait() {
+        let (mut h, gen) = root_with_a_silent_sticky_holder();
+        let renew = |h: &mut Harness, req: u64| {
+            h.step(Event::Peer {
+                from: 3,
+                msg: PeerMsg::DelegRenew {
+                    req: OpId(req),
+                    gen,
+                    round: 0,
+                    backup: None,
+                    stream_head: 0,
+                    stream_head_at: 0,
+                    first: false,
+                },
+            })
+        };
+        let ttl = |out: &[Action]| {
+            sends(out).into_iter().find_map(|(to, m)| match m {
+                PeerMsg::DelegRenewed { ttl_ms, ends, .. } if to == 3 => Some((*ttl_ms, *ends)),
+                _ => None,
+            })
+        };
+        let out = renew(&mut h, 800);
+        assert!(
+            ttl(&out).is_some_and(|(t, _)| t > 0),
+            "granted before: {out:?}"
+        );
+        let out = abandon_node(&mut h, 910, 3, None, true);
+        assert!(answer_of(&out, 910).is_none());
+        let out = renew(&mut h, 801);
+        assert_eq!(ttl(&out), Some((0, true)), "{out:?}");
     }
 
     /// A reader voids an abandoned stream's grants and refuses a late one.
@@ -64620,6 +64767,33 @@ mod step4_sticky {
         Replica::void_stream(&h.meta, 7, 0);
         Replica::note_void_cut(&h.meta, 7, 0);
         assert!(ask(&mut h).is_none(), "served under an ended stream");
+    }
+
+    /// A restarted non-stealable holder is honoured from its install, so it
+    /// grants no read delegation until the root granted a renewal sent after
+    /// the install (S1: during an operator's abandon the root refuses it,
+    /// and the readers the void did not reach would get a grant that
+    /// outlives the end). Fails without the gate: the grant is made at once.
+    #[test]
+    fn a_non_stealable_holder_grants_no_read_before_the_root_renewed_it() {
+        let (mut h, dirs) = holder_of(true, &[(SubtreeKind::Sticky, "a")]);
+        h.core.cfg.read_delegations = true;
+        h.advance(10);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine[&7].non_stealable);
+        let grant =
+            |h: &mut Harness| match h
+                .core
+                .deleg_read_index(h.clk(), 2, dirs[0], Some("x"), &h.meta)
+            {
+                Some(crate::event::ReadIndexOutcome::Ok { grant, .. }) => grant,
+                other => panic!("{other:?}"),
+            };
+        assert!(grant(&mut h).is_none(), "granted before a renewal");
+        // The root granted a renewal sent after the install.
+        h.core.dl.mine.get_mut(&7).unwrap().answered_sent = h.clk().honour;
+        assert!(grant(&mut h).is_some(), "no grant after a renewal");
     }
 }
 

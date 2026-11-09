@@ -2236,9 +2236,10 @@ impl Timer {
             Timer::DelegLapse(_) => TimerKind::DelegLapse,
             Timer::DelegStream | Timer::DelegInstallRetry => TimerKind::DelegStream,
             Timer::Placement => TimerKind::Placement,
-            Timer::ReleaseRecallBound | Timer::LeaveWait | Timer::StickyRelease | Timer::AbandonWait => {
-                TimerKind::DelegExpiry
-            }
+            Timer::ReleaseRecallBound
+            | Timer::LeaveWait
+            | Timer::StickyRelease
+            | Timer::AbandonWait => TimerKind::DelegExpiry,
         }
     }
 }

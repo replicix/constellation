@@ -820,7 +820,7 @@ pub struct SimConfig {
     pub skip_deleg_dep_wait: bool,
     /// Plan 43 C1-3 (§5.8, Q1): the operator abandons the group a claim has
     /// waited for this long (simulated ms), as `constellation repair
-    /// abandon-group --epoch E` does (`Control::AbandonGroup` on the node
+    /// abandon --epoch E` does (`Control::Abandon` on the node
     /// that waits); C2e: and the group of a delegation generation the root
     /// cannot end (`--gen G`, on the root). `None`: nobody does; a claim or a
     /// generation whose group is gone for good then ends the run
@@ -1435,6 +1435,9 @@ pub struct Report {
     pub non_lone_rollbacks: usize,
     /// Plan 46 M1.3 step 13: I5's operator branch (see `Findings::i5_operator`).
     pub i5_operator: usize,
+    /// The same rows answered after the abandon was answered
+    /// (`Findings::i5_after_end`).
+    pub i5_after_end: usize,
     /// Plan 43 C2 (§5.3): shadows and hints installed for an answer not
     /// said to be committed by a sequencer that is not non-stealable
     /// (`Stats::ungated_shadows`, over every incarnation of every node).
@@ -6395,6 +6398,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         &rolled_back_at,
         &world.dropped_rids.lock().unwrap().clone(),
         &operator_lost_rids,
+        &cluster.abandoned_at.lock().unwrap().clone(),
         converged_checkable,
     );
     let outcome_conflicts = bucket.archive.conflicting_outcomes();
@@ -6519,6 +6523,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let unsettled_violations = count_unsettled(&oracles, &mut report);
     report.non_lone_rollbacks = found.i5.len();
     report.i5_operator = found.i5_operator.len();
+    report.i5_after_end = found.i5_after_end.len();
     {
         let ord = std::sync::atomic::Ordering::Relaxed;
         report.lease_ttl_claims = oracles.leases.ttl_claims.load(ord);

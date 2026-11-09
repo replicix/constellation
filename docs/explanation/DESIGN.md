@@ -1281,7 +1281,9 @@ without TTL expiry, never recalled by placement or by a cross-subtree op.
   repair abandon <fs> --node N` (on the root) ends a designated or sticky
   stream at the root's cursor, after it has recalled, else waited out, the
   read delegations the holder granted (no read is served under an ended
-  stream's grant; plan 46 Q5, C11). The rows only the designee held, past the
+  stream's grant; plan 46 Q5, C11; the root refuses the stream's renewals
+  while it waits, and a returned holder grants no read before a renewal is
+  granted, so the wait's deadline holds). The rows only the designee held, past the
   cursor, are lost to the log, and replay by rid, refused ones becoming
   conflict copies, if the designee returns.
 - `offline --ro` grants a read guarantee (a pin) without write authority

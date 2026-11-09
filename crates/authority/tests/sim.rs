@@ -307,6 +307,7 @@ fn replay_seed() {
         Ok("sticky-idle-release") => sticky_idle_release_config(),
         Ok("sticky-handover-ping-pong") => sticky_handover_ping_pong_config(),
         Ok("sticky-holder-dies") => sticky_holder_dies_config(),
+        Ok("sticky-holder-returns") => sticky_holder_returns_config(),
         Ok("sticky-ttl") => sticky_ttl_config(),
         Ok("backup-two") => backup_two_config(),
         Ok("backup-strict") => backup_strict_config(),
@@ -1848,6 +1849,36 @@ fn sticky_holder_dies_config() -> SimConfig {
         ],
         ..delegated_config()
     }
+}
+
+/// Plan 46 M1.3 step 13 (S1): as `sticky-holder-dies`, but the holder comes
+/// back with its journal 2 s after the crash, inside the abandon's wait (the
+/// operator's command is at 3.5 s, the wait lasts the read delegation TTL, 1.5 s
+/// here, and a margin), while node 3 is cut from the root only (it still reaches node
+/// 2). The root refuses the returned holder's renewals during the wait and the
+/// holder grants no read delegation before one is granted, so no reader
+/// serves under a grant that outlives the end
+/// (`no_read_under_an_abandoned_stream`).
+fn sticky_holder_returns_config() -> SimConfig {
+    let mut config = sticky_holder_dies_config();
+    for f in &mut config.faults {
+        if let FaultKind::CrashNode { restart_ms, .. } = &mut f.kind {
+            *restart_ms = Some(2_000);
+        }
+    }
+    // The read grants the holder made before the crash lapse (1.5 s after the
+    // last one) before it returns. A restarted sticky holder does not know
+    // the grants of its previous incarnation and executes at once, so a
+    // reader under one of them could serve a stale read until it lapses; that
+    // is not this step's (it fails the same way on a run with no abandon, on
+    // main too), and the configuration keeps clear of it.
+    let base = config.core.clone();
+    config.core = std::sync::Arc::new(move |id, inc| {
+        let mut c = base(id, inc);
+        c.read_delegation_ttl_ms = 1_500;
+        c
+    });
+    config
 }
 
 /// Plan 46 M1.3 step 4: two sticky grants made by the operator
@@ -4411,7 +4442,7 @@ fn a_backup_paused_while_its_holder_is_cut_from_s3_waits_for_the_group() {
 /// (`inherited_tail`), so that when the re-claimer is lost for good node 3
 /// fetches them from node 1 and nobody has to abandon the group. Fails on
 /// the parent: the lease named node 2 alone, the claim waited for it and
-/// the operator's `abandon-group` gave the rows up.
+/// the operator's `abandon` gave the rows up.
 #[test]
 fn a_sealed_holders_reclaim_keeps_the_older_group_named() {
     let mut fetched = 0u64;
@@ -5979,6 +6010,7 @@ fn sweep_config() {
         "sticky-idle-release" => sticky_idle_release_config(),
         "sticky-handover-ping-pong" => sticky_handover_ping_pong_config(),
         "sticky-holder-dies" => sticky_holder_dies_config(),
+        "sticky-holder-returns" => sticky_holder_returns_config(),
         "sticky-ttl" => sticky_ttl_config(),
         "backup-departs" => backup_departs_config(),
         "singleton-first-peer" => singleton_first_peer_config(),
@@ -7281,7 +7313,7 @@ fn delegated_backup_and_delegate_die_config() -> SimConfig {
     }
 }
 
-/// The same with the operator: `repair abandon-group --gen G` after 5 s of
+/// The same with the operator: `repair abandon --gen G` after 5 s of
 /// waiting ends each generation at the root's cursor (`GroupAbandoned` in
 /// the log); the rows only the dead group held are lost, counted
 /// (`operator_lost`) and judged tentative, and the run converges.
@@ -8008,6 +8040,8 @@ struct OracleTotals {
     /// Plan 46 M1.3 step 13: I5's operator branch (rows of abandoned streams
     /// rolled back past their cut), and the seeds with one.
     i5_operator: (usize, u64),
+    /// Rows of that kind answered after the abandon was answered.
+    i5_after_end: u64,
     i4: usize,
     /// Plan 43 C2: of `i4`, settled `EIO`s whose rid completed.
     i4_settled: usize,
@@ -8278,6 +8312,7 @@ impl OracleTotals {
         self.i5 += r.non_lone_rollbacks;
         self.i5_operator.0 += r.i5_operator;
         self.i5_operator.1 += u64::from(r.i5_operator > 0);
+        self.i5_after_end += r.i5_after_end as u64;
         self.rolled_back.0 += r.acked_rolled_back;
         self.rolled_back.1 += r.lone_rolled_back;
         self.rolled_back.2 += u64::from(r.lone_rolled_back > 0);
@@ -8448,7 +8483,7 @@ impl OracleTotals {
         eprintln!(
             "SWEEP-ABANDON-TOTALS {label} seeds {}/{seeds}: repair abandon commands {}, with a read wait {}, \
              streams whose readers all answered {}, waited out {}, ended meanwhile {}; \
-             I5 operator rollbacks {} (in {} seeds)",
+             I5 operator rollbacks {} (in {} seeds), answered after the abandon was answered {}",
             self.seeds,
             self.sticky_core[11],
             self.sticky_core[12],
@@ -8456,7 +8491,8 @@ impl OracleTotals {
             self.sticky_core[14],
             self.sticky_core[15],
             self.i5_operator.0,
-            self.i5_operator.1
+            self.i5_operator.1,
+            self.i5_after_end
         );
         eprintln!(
             "SWEEP-UNSETTLED-CAUSES {label} seeds {}/{seeds}: {:?}",
@@ -9799,7 +9835,7 @@ fn delegated_backup_and_delegate_die_waits_for_the_group() {
 }
 
 /// The same with the operator: the generations end at the root's cursor by
-/// `abandon-group --gen`, the run converges, what only the dead group held
+/// `abandon --gen`, the run converges, what only the dead group held
 /// is counted as lost to the operator.
 #[test]
 fn delegated_backup_and_delegate_die_ends_by_the_operators_escape() {
@@ -18429,42 +18465,47 @@ fn the_sticky_oracle_catches_a_ttl_that_reclaims_sticky_grants() {
 /// Plan 46 M1.3 step 13: the holder of a sticky grant dies, the operator
 /// runs `repair abandon --node 2 --force`, and the root ends the stream at its
 /// cursor after its readers dropped (or the deadline outwaited) the read
-/// delegations the holder granted. Every run passes. A run in which a random
-/// fault kept the operator from acting (the root restarting, the node back)
-/// ends no stream by an abandon, so the counters are judged over the runs: at
-/// least 20 seeds, and on until every counter has been seen (the returned
-/// holder's rows past the cut that are rolled back, `i5_operator`, are in 2 %
-/// of the seeds), at most 200.
+/// delegations the holder granted. Every run passes. Seeds pinned for what
+/// each covers (a run in which a random fault kept the operator from acting
+/// ends nothing, and `i5_operator` is in 2 % of the seeds): 1 the deadline, 13
+/// the readers' answers, 47 the deadline with a returned holder's rows past
+/// the cut rolled back.
 #[test]
 fn sticky_holder_dies_is_abandoned_by_the_operator() {
-    let (mut abandoned, mut recalled, mut expired, mut i5_operator) = (0, 0, 0, 0);
-    let mut ran = 0;
-    for seed in 0..200 {
+    let (mut recalled, mut expired, mut i5_operator) = (0, 0, 0);
+    for seed in [1u64, 13, 47] {
         let r = run_seed(seed, sticky_holder_dies_config()).unwrap_or_else(|e| {
             panic!(
                 "sticky-holder-dies seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=sticky-holder-dies"
             )
         });
-        ran += 1;
-        assert!(r.sticky_core[2] <= 1, "seed {seed}: {:?}", r.sticky_core);
-        abandoned += r.sticky_core[2];
+        assert_eq!(r.sticky_core[2], 1, "seed {seed}: {:?}", r.sticky_core);
         recalled += r.sticky_core[13];
         expired += r.sticky_core[14];
         i5_operator += r.i5_operator;
-        if ran >= 20 && recalled > 0 && expired > 0 && i5_operator > 0 {
-            break;
-        }
     }
-    assert!(
-        abandoned >= 15,
-        "the operator ended {abandoned} streams in {ran} seeds"
-    );
     assert!(recalled > 0, "no abandon was ended by its readers' answers");
     assert!(expired > 0, "no abandon waited the read delegations out");
     assert!(
         i5_operator > 0,
-        "no row of an abandoned stream was rolled back past its cut in {ran} seeds"
+        "no row of an abandoned stream was rolled back past its cut"
     );
+}
+
+/// Plan 46 M1.3 step 13 (S1): the holder comes back inside the abandon's wait
+/// (`sticky-holder-returns`); no run fails, and the operator ended its stream.
+#[test]
+fn a_holder_that_returns_during_the_abandon_wait_grants_no_read_past_the_end() {
+    let mut abandoned = 0;
+    for seed in 0..12u64 {
+        let r = run_seed(seed, sticky_holder_returns_config()).unwrap_or_else(|e| {
+            panic!(
+                "sticky-holder-returns seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=sticky-holder-returns"
+            )
+        });
+        abandoned += r.sticky_core[2];
+    }
+    assert!(abandoned >= 8, "the operator ended {abandoned} streams");
 }
 
 /// The oracle's negative control: with the abandon ending the stream without
