@@ -993,6 +993,10 @@ pub(crate) struct LeaveTell {
 
 #[derive(Debug, Default)]
 pub(crate) struct DelegationState {
+    /// The `(gen, idx)` rows `deleg_drain_tail` appended since the last
+    /// [`Core::take_drained_rows`]: the simulation's oracle judges a row
+    /// drained from a sealed tail by the tenure that drained it.
+    pub(crate) drained_rows: Vec<(u64, u64)>,
     /// Plan 41 L0: this tenure took an unexpired lease over (a seal, or
     /// `ack=s3`; `note_fast_takeover`), so a predecessor's last delegation
     /// renewal may have been decided up to `backup_takeover_ms` after its
@@ -4389,6 +4393,7 @@ impl Core {
                     replica.note_foreign_executed(&tx.records);
                     cursor = tx.idx;
                     drained += 1;
+                    self.dl.drained_rows.push((gen, tx.idx));
                 }
                 Err(error) => {
                     tracing::warn!(node = self.me(), gen = %constellation_meta::delegation::GenLabel::of(gen), idx = tx.idx, %error, "could not append a sealed transaction");

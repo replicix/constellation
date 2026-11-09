@@ -780,6 +780,7 @@ impl Core {
             Some(row) if row.gen == 0 => {
                 (!self.park_durable(row.jseq, true, shipped)).then_some(row.jseq)
             }
+            Some(_) if self.cfg.dedup_deleg_rows_unawaited => None,
             Some(_) => self.answer_need(position, class, super::Asker::Remote, shipped),
             None => None,
         }

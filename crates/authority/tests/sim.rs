@@ -6289,6 +6289,14 @@ fn sweep_config() {
         // (`Config::hold_answers_uncommitted`): a hold answers from its
         // owner's disk as before, and `strict_commit` must fail on the flex
         // configurations.
+        if std::env::var("AUTHORITY_SIM_DEDUP_DELEG_UNAWAITED").is_ok_and(|v| v == "1") {
+            let inner = c.core.clone();
+            c.core = std::sync::Arc::new(move |id, inc| {
+                let mut core = inner(id, inc);
+                core.dedup_deleg_rows_unawaited = true;
+                core
+            });
+        }
         if std::env::var("AUTHORITY_SIM_HOLD_ANSWERS_UNCOMMITTED").is_ok_and(|v| v == "1") {
             let inner = c.core.clone();
             c.core = std::sync::Arc::new(move |id, inc| {
@@ -9383,6 +9391,60 @@ fn a_marker_is_never_seen_without_the_data_a_deposition_moved_to_the_member_copy
             "long-delegated-late-answers seed 31041 (AUTHORITY_SIM_LEASE_READS=0:0:800:1000): {e}"
         );
     }
+}
+
+/// `long-delegated-late-answers+commit` seed 265 with slow lease reads:
+/// delegate 3 (gen 1:4, backup 2) executed a rename refused ENOENT; node 2
+/// took a lone epoch 2 and appended gen 1:4's rows off node 3's stream (the
+/// oracle records epoch 2, no backups), then crashed without shipping them.
+/// Node 1's epoch 3 inherited the generation, sealed the backup and drained
+/// its tail (rows 1..4) into its own epoch-3 journal, then answered the
+/// parked forward once its listed backup acknowledged the tip. The oracle
+/// kept epoch 2's stale lone record for the drained rows (a non-stream event
+/// was taken for a re-journal) and reported I1 falsely. Rows drained from a
+/// sealed tail are the draining tenure's.
+#[test]
+fn a_delegate_row_drained_from_a_sealed_backup_is_judged_by_the_draining_tenure() {
+    let cfg = strict(
+        SimConfig {
+            lease_reads: SLOW_LEASE_READS,
+            ..long_delegated_late_answers_config()
+        },
+        "commit",
+    );
+    if let Err(e) = run_seed(265, cfg) {
+        panic!("long-delegated-late-answers+commit seed 265 (slow lease reads): {e}");
+    }
+}
+
+/// The negative control of the test above: with the root answering a
+/// delegate's row without waiting for its own append to be acknowledged
+/// (`Config::dedup_deleg_rows_unawaited`), seed 265 is a real I1, and the
+/// oracle names the draining tenure's missing commit.
+#[test]
+fn an_unawaited_root_copy_of_a_drained_delegate_row_is_still_an_i1() {
+    let cfg = strict(
+        SimConfig {
+            lease_reads: SLOW_LEASE_READS,
+            core: {
+                let base = long_delegated_late_answers_config().core;
+                std::sync::Arc::new(move |id, inc| {
+                    let mut core = base(id, inc);
+                    core.dedup_deleg_rows_unawaited = true;
+                    core
+                })
+            },
+            ..long_delegated_late_answers_config()
+        },
+        "commit",
+    );
+    let e = run_seed(265, cfg).expect_err("the unawaited copy must fail I1");
+    let e = e.to_string();
+    assert!(
+        e.contains("I1 acked_implies_committed")
+            && e.contains("tenure of epoch 3 did not commit it"),
+        "{e}"
+    );
 }
 
 /// Plan 46 M0.3: L2b, a known I2 gap, pinned. `long-delegated-backup` seed

@@ -76,7 +76,9 @@ pub struct Oracles {
     /// Plan 46 M1.1: the tenure each delegate row `(gen, idx)` was appended
     /// in at a root, `(epoch, backups, epoch hold in force)`, recorded when
     /// the root appended it (the latest append wins: a successor's re-append
-    /// of an unretired row is its own tenure's).
+    /// of an unretired row is its own tenure's). A row off a delegate's
+    /// stream or drained from a sealed tail is the appending tenure's; a row
+    /// journaled by any other event is a re-journal and keeps its record.
     pub appended: Mutex<HashMap<(u64, u64), AppendTenure>>,
     /// The latest lease configuration landed in each epoch (`epoch ->
     /// backups`): a lone root that adds a backup later in its epoch commits

@@ -358,6 +358,11 @@ pub struct Config {
     /// owner's disk as before (`Final`), without a member's copy. The
     /// simulation's `strict_commit` must fail with it on the flex configs.
     pub hold_answers_uncommitted: bool,
+    /// A negative control for the simulation's oracle, never set in
+    /// production (`AUTHORITY_SIM_DEDUP_DELEG_UNAWAITED=1`): the root answers
+    /// from a delegate's row it appended without waiting for the append to
+    /// be acknowledged. `strict_commit` must fail with it.
+    pub dedup_deleg_rows_unawaited: bool,
     /// `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` (default 1000): a backup
     /// that makes no acknowledgement progress for this long is removed by
     /// a lease CAS before the holder acknowledges anything further —
@@ -770,6 +775,7 @@ impl Config {
             stream_ahead_holdoff_ms: 5,
             hold_resend_ms: 250,
             hold_answers_uncommitted: false,
+            dedup_deleg_rows_unawaited: false,
             backup_ack_timeout_ms: 1_000,
             backup_slow_max_ms: 10_000,
             backup_takeover_ms: 1_500,
@@ -2441,6 +2447,10 @@ impl Core {
     /// Use `cell` as this core's certificate cell (before the first event).
     pub fn set_lane_cell(&mut self, cell: std::sync::Arc<crate::lane::LaneCell>) {
         self.lane_cell = cell;
+    }
+
+    pub fn take_drained_rows(&mut self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut self.dl.drained_rows)
     }
 
     pub fn lease(&self) -> &LeaseState {

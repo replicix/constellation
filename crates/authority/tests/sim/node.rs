@@ -2207,8 +2207,9 @@ impl Driver {
             };
             let is_stream = EventKind::DelegateStream.matches(&event);
             let actions = self.core.handle(now, event, &*self.meta);
+            let drained = self.core.take_drained_rows();
             if self.core.lease().epoch().is_some() {
-                self.record_deleg_rows(is_stream);
+                self.record_deleg_rows(is_stream, &drained);
             }
             self.oracles.note_streamed(self.id, &self.meta);
             {
@@ -3941,11 +3942,12 @@ impl Driver {
     /// record the tenure (epoch, backups, epoch hold) each was appended in,
     /// for the oracle's judgement of the root's copy.
     ///
-    /// A row the root took off a delegate's stream (`stream`) is this
-    /// tenure's append; a row that shows up otherwise is a successor's
-    /// re-journal of a row an earlier tenure appended, which keeps its
-    /// record.
-    fn record_deleg_rows(&mut self, stream: bool) {
+    /// A row the root took off a delegate's stream (`stream`), or drained
+    /// from a sealed tail (`drained`: the core waits for this tenure's
+    /// commit of it before it answers), is this tenure's append; a row that
+    /// shows up otherwise is a successor's re-journal of a row an earlier
+    /// tenure appended, which keeps its record.
+    fn record_deleg_rows(&mut self, stream: bool, drained: &[(u64, u64)]) {
         let txs = Replica::journal_txs_from(&*self.meta, self.deleg_rows_from, usize::MAX);
         let lease = self.core.lease();
         let tenure = (
@@ -3956,7 +3958,7 @@ impl Driver {
         let mut appended = self.oracles.appended.lock().unwrap();
         for t in &txs {
             if t.origin != (0, 0) {
-                if stream {
+                if stream || drained.contains(&t.origin) {
                     appended.insert(t.origin, tenure.clone());
                 } else {
                     appended.entry(t.origin).or_insert_with(|| tenure.clone());

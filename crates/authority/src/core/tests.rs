@@ -49395,6 +49395,61 @@ mod deleg_windows_tests {
         );
     }
 
+    /// A seal reply's drain lists the `(gen, idx)` rows it appended, once:
+    /// the simulation's oracle judges them by the draining tenure.
+    #[test]
+    fn a_sealed_tail_drain_lists_the_rows_it_appended() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.delegation_ttl_ms = 1_000;
+        h.hold(1, None);
+        let _ = delegated_to_me(&h.meta, 3);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(1),
+                gen: 7,
+                round: 1,
+                backup: Some(5),
+                stream_head: 0,
+                stream_head_at: 0,
+                first: false,
+            },
+        });
+        assert!(h.core.take_drained_rows().is_empty());
+        h.core.dw.set_until_for_tests(7, w(h.now));
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.clk(), 7, &h.meta, &mut out);
+        let seal = sends(&out)
+            .iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::DelegSeal { req, gen: 7 } if *to == 5 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no seal: {out:?}"));
+        let row = |idx: u64| constellation_meta::DelegateTx {
+            idx,
+            rid: None,
+            records: Vec::new(),
+            deps: constellation_meta::Position::ZERO,
+        };
+        h.step(Event::Peer {
+            from: 5,
+            msg: PeerMsg::DelegSealed {
+                req: seal,
+                gen: 7,
+                sealed: true,
+                txs: vec![row(1), row(2)],
+                prev_roots: Vec::new(),
+            },
+        });
+        assert_eq!(h.core.take_drained_rows(), vec![(7, 1), (7, 2)]);
+        assert!(h.core.take_drained_rows().is_empty());
+    }
+
     /// A root (node 1) that claimed the lease of node `prev` and inherited
     /// generation 7, delegated to node 3 with no recorded backup.
     fn root_inheriting_a_backup_less_generation(prev: NodeId) -> (Harness, Vec<Action>) {
