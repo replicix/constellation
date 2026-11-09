@@ -582,7 +582,7 @@ impl Core {
         sub.head = sub.head.max(head);
         self.stream.retry_ms = self.cfg.stream_retry_min_ms;
         if epoch >= self.ship.max_epoch {
-            self.lease.cached_holder = Some(from);
+            self.lease.name_holder(from);
         }
         if let Some((seq, payload)) = segment {
             tracing::debug!(

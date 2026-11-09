@@ -38489,6 +38489,85 @@ fn a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited() {
     assert_eq!(h.core.dl.mine[&7].streamed_through, last);
 }
 
+/// A root that refused the delegate's stream (restarted or re-adopting
+/// after a slow lease read: it does not know the generation yet) and then
+/// grants its renewal serves the generation now: the stream's refusal
+/// back-off (up to two seconds) ends with the grant, and the rows go at
+/// once. `sticky-ttl` with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, seeds
+/// 532 and 1705: the root re-adopted just after a refused batch, the next
+/// batch came a back-off later, and the op awaiting those rows' commit ran
+/// out its settle. Fails on the parent: no batch until the back-off ends.
+#[test]
+fn a_granted_renewal_ends_the_streams_refusal_backoff() {
+    let mut h = Harness::new(3);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.lease.cached_holder = Some(1);
+    let dir = delegated_to_me(&h.meta, 3);
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+    let req = renew_req(&out, 7).expect("no renewal on install");
+    let ttl = 5_000;
+    let out = h.step(renewed(&h, req, 7, ttl));
+    let renew_timer = timers(&out, TimerKind::DelegRenew);
+    assert_eq!(renew_timer.len(), 1, "{out:?}");
+    let batch = |out: &[Action]| {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegateStream {
+                req, gen: 7, txs, ..
+            } if to == 1 => Some((*req, txs.last().map(|t| t.idx).unwrap_or(0))),
+            _ => None,
+        })
+    };
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: h.rid(1),
+        op: MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+        tag: Default::default(),
+    });
+    let (sreq, last) = batch(&out).expect("no batch streamed");
+    assert!(last > 0);
+    h.advance(50);
+    let out = h.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::DelegateStreamAck {
+            req: sreq,
+            gen: 7,
+            round: round_of(&h, 7),
+            through: 0,
+            committed: 0,
+            refused: true,
+            archive_bound: false,
+        },
+    });
+    assert!(batch(&out).is_none(), "re-sent at once: {out:?}");
+    assert_eq!(h.core.stats.deleg_stream_refused, 1);
+    h.advance(100);
+    let out = h.step(Event::Activity {
+        last_write: WaitMs(0),
+        acked_seqs: Vec::new(),
+    });
+    assert!(
+        batch(&out).is_none(),
+        "re-sent inside the back-off: {out:?}"
+    );
+    // The renewal is granted: the root serves the generation.
+    let out = h.step(Event::Timer { id: renew_timer[0] });
+    let req = renew_req(&out, 7).expect("no renewal");
+    let out = h.step(renewed(&h, req, 7, ttl));
+    assert!(
+        batch(&out).is_some(),
+        "the rows waited for the back-off after the grant: {out:?}"
+    );
+}
+
 /// delegate-stream-acks: a delegate of `/d` (generation 7, root node 1)
 /// whose first renewal was granted. `stream_one` executes a create under
 /// it and returns the batch that went out (`(req, round, last)`).
@@ -64973,7 +65052,7 @@ mod step5_sticky_release {
             h.core.cfg.p2p = true;
             h.core.cfg.inbox = true;
             h.step(links_event(&[1, 3]));
-            h.core.lease.last_seen = Some(lease_of(1, 1, h.now.0 + 600_000));
+            h.core.lease.note_object(&lease_of(1, 1, h.now.0 + 600_000));
             h.core.lease.cached_holder = Some(cached);
             let (dir, rec) = mkdir(&h, "a");
             Replica::install_streamed(&h.meta, 1, 1, 1, 1, &[rec], true, (0, 0)).unwrap();
@@ -65000,6 +65079,72 @@ mod step5_sticky_release {
             );
             assert_eq!(h.core.clients[&rid].sent_to_delegate, marked, "{cached}");
         }
+    }
+
+    /// S6 (plan 46 M1.3 step 5 re-review 5): the last lease object this node
+    /// read names the node itself (it was the holder); a deposition then
+    /// names the new holder (`mark_lost`, as the seal tail and a log segment
+    /// do) without a lease read. A fresh rid forwarded to the new holder is
+    /// not marked as sent to a designee, so its gen-0 `EROFS` is the answer
+    /// and not held to an unsettled `EIO`. Fails on the parent: the guard
+    /// compares the target with the stale lease object's holder.
+    #[test]
+    fn a_forward_to_the_holder_a_deposition_named_is_not_marked() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.inbox = true;
+        h.step(links_event(&[1, 3]));
+        h.core.lease.last_seen = Some(lease_of(2, 1, h.now.0 + 600_000));
+        h.core.lease.mark_lost(1, 2, 1);
+        assert_eq!(h.core.lease.cached_holder, Some(1));
+        let (dir, rec) = mkdir(&h, "a");
+        Replica::install_streamed(&h.meta, 1, 1, 1, 1, &[rec], true, (0, 0)).unwrap();
+        let rid = h.rid(1);
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest { req, .. } if to == 1 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("not sent to the new holder: {out:?}"));
+        assert!(!h.core.clients[&rid].sent_to_delegate);
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Errno(Code::ReadOnly),
+                base: None,
+                position: Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+            },
+        });
+        assert!(
+            replies(&out).iter().any(|(r, rep)| *r == rid
+                && matches!(
+                    rep,
+                    ClientReply::Outcome(MutateOutcome::Errno(Code::ReadOnly))
+                )),
+            "the refusal was not the answer: {out:?}"
+        );
+        assert_eq!(h.core.stats.designation_refusals_held, 0);
     }
 
     /// A redirect to the lease holder (a deposed root naming the new one:
@@ -65175,6 +65320,38 @@ mod step5_sticky_release {
         assert!(h.core.take_unsettled_designation(both));
         assert!(!h.core.take_unsettled_designation(both));
         assert!(!h.core.take_unsettled_designation(held));
+    }
+
+    /// An unsettled `EIO` of an op a delegate had executed and answered is
+    /// named by its rid, once, for the sim to judge against a root (the
+    /// delegate's rows lacked the root's commit); one without a settle, or of
+    /// an op no delegate answered, is not.
+    #[test]
+    fn an_unsettled_eio_of_an_op_a_delegate_accepted_is_named() {
+        let mut h = Harness::new(2);
+        h.core.track_unsettled_designation();
+        let mut out = Vec::new();
+        for (i, (settle, accepted)) in [(true, true), (true, false), (false, true)]
+            .into_iter()
+            .enumerate()
+        {
+            let rid = h.rid(i as u64 + 1);
+            let op = h.create(&format!("f{i}"));
+            h.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op,
+                tag: Default::default(),
+            });
+            {
+                let c = h.core.clients.get_mut(&rid).unwrap();
+                c.settle = settle;
+                c.accepted_by_delegate = accepted;
+            }
+            h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
+            assert_eq!(h.core.take_unsettled_accepted(rid), settle && accepted);
+            assert!(!h.core.take_unsettled_accepted(rid));
+        }
     }
 
     /// The mark "sent to a delegate" is a record's; a resubmission of a rid

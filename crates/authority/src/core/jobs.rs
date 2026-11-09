@@ -889,7 +889,7 @@ impl Core {
                 }
             }
             if seg.node != 0 && seg.epoch >= self.ship.max_epoch {
-                self.lease.cached_holder = Some(seg.node);
+                self.lease.name_holder(seg.node);
             }
             // Plan 30 §M9: a backup's tail is trimmed by the log itself;
             // the pre-S3 stream cursor follows the log.

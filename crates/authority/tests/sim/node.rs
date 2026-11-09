@@ -3672,12 +3672,14 @@ impl Driver {
                                     .step_timer
                                     .and_then(|t| self.deadline_armed.get(&t).copied());
                                 let held = self.core.take_unsettled_designation(rid);
+                                let accepted = self.core.take_unsettled_accepted(rid);
                                 self.oracles.note_unsettled(
                                     self.id,
                                     rid,
                                     self.core.config().settle_window(),
                                     started,
                                     held,
+                                    accepted,
                                 );
                             }
                         }

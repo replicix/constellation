@@ -1400,7 +1400,7 @@ impl Core {
                     self.bk.role = Some(role);
                     self.bk.acked = replica.backup_acked(role.epoch).unwrap_or(0);
                     self.bk.restarted = true;
-                    self.lease.cached_holder = Some(role.holder);
+                    self.lease.name_holder(role.holder);
                 }
                 true
             }
@@ -1473,7 +1473,7 @@ impl Core {
             self.bk.acked = replica.backup_acked(role.epoch).unwrap_or(0);
             self.bk.last_heard = now.wait;
             self.bk.restarted = true;
-            self.lease.cached_holder = Some(role.holder);
+            self.lease.name_holder(role.holder);
             self.arm_backup_watch(now, out);
         }
     }
@@ -5234,7 +5234,7 @@ impl Core {
         }
         self.bk.last_heard = now.wait;
         self.bk.restarted = false;
-        self.lease.cached_holder = Some(holder);
+        self.lease.name_holder(holder);
         self.bk.holder_silent_since = None;
         // Where the lease ends, as this append says it (plan 43 C7b, row
         // 24): the holder's readings when it built it, placed on this node's

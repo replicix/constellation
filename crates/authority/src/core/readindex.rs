@@ -2604,7 +2604,7 @@ impl Core {
                 // Phase 2b: a delegate's answer (its position names its
                 // stream) says nothing about the lease.
                 if position.streams.is_empty() {
-                    self.lease.cached_holder = Some(from);
+                    self.lease.name_holder(from);
                 }
                 let Some(r) = self.rd.reads.remove(&op) else {
                     return;
@@ -2675,7 +2675,7 @@ impl Core {
                     // Whoever answers after a redirect answers the plain read.
                     r.ahead = ReadAhead::None;
                     if !names_delegate {
-                        self.lease.cached_holder = Some(holder);
+                        self.lease.name_holder(holder);
                     }
                     self.send_read_index(now, op, holder, replica, out);
                 } else {

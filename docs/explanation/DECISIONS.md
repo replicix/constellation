@@ -3317,11 +3317,13 @@ delegation's generation (`NotHolder.gen`, `ReadIndexOutcome::NotHolder.gen`,
 `NotOwner.gen`) when the root names a delegate, and a requester that sees one
 does not cache the target, even when its table does not list it. As a
 structural guard that does not depend on every setter, `send_forward` marks an
-op sent to any node other than the holder the lease object this node last read
-names (the table's listing is no longer the only test). The guard
-over-marks while the lease object lags (an op forwarded to a new holder before
-the next lease read): the op's refusal by that holder is held and the op ends
-in doubt where it would have ended with the holder's errno.
+op sent to any node other than the holder the holder signals last named
+(`LeaseState::named_holder`: the lease objects read or won, a deposition's
+successor, a log stream frame, the holder's own gen-0 replies and redirects;
+the table's listing is no longer the only test). It is not the last lease
+object read, which a deposition or a stream frame leaves behind: a node
+deposed by B, or that learned B from a frame, forwards to B unmarked, so B's
+designation refusal is its errno and not an unsettled `EIO`.
 
 **Consequences**: an op under an unreachable non-stealable holder ends in doubt
 where it ended `EROFS`: more `EIO`, later, for ops that may have run, and no
@@ -3331,8 +3333,35 @@ safety. Known I1 limit: the marks are kept with the in-doubt rids, which the
 core bounds (`MAX_IN_DOUBT_RIDS`, 10,000 per node); a rid evicted beyond that
 is resubmitted unmarked, and a refusal of an op a designee ran is then not
 held (the same eviction already allows a second execution of an ordinary
-in-doubt rid). The knob `refuse_forwarded_designation_ops` (test-only) restores the old
+in-doubt rid). A second known I1 limit (multi-fault, older than this decision):
+a requester whose holder signals still name Y, a former holder that B has since
+made a designee (the requester idle, its S3 stalled, no frame or redirect since),
+routes a fresh rid to Y by that cache and does not mark it; if Y ran it as the
+designee and the reply was lost, B's later refusal of the rid under the
+designation is final. Closing it needs the forward to carry the generation it
+was routed by, and a designee to refuse to run a generation-0 forward for its
+designated keys (reply so the requester re-routes, nothing journaled). That is
+a wire change to `MutateRequest` and a new refusal path through every forward
+site; it is left for the later steps of M1.3 (the holder's row-driven answer
+replaces the requester's mark) rather than added here. The knob `refuse_forwarded_designation_ops` (test-only) restores the old
 behaviour; `sticky-ttl` fails with it.
+
+A delegate's stream that the root refused (the root restarted or is
+re-adopting after a slow lease read, and does not know the generation yet)
+backs off for up to two seconds; the root's grant of the delegate's next
+renewal ends the back-off and the rows go at once. Without it an op that a
+delegate accepted, awaiting the commit of those rows, ran out its settle
+(`sticky-ttl` with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, seeds 532, 1705;
+main fails 532 as well). The three seeds that surfaced it were not held
+refusals: the failing ops were never refused. A delegate had executed and
+answered each, and the requester awaited the log for its rows, which could not
+reach a root that had restarted and not yet re-adopted its lease. In seed 907
+the root did not hold the lease before the settle ran out at all (a restarted
+node is a cold claimant for a TTL): no root existed to commit the rows. The sim
+therefore judges the unsettled `EIO` of an op a delegate had answered
+(`ClientOp::accepted_by_delegate`, named by rid) against a root, not against
+the delegate the requester had already heard; a root in force that could take
+the rows is still a violation.
 
 **May revert**: never as a whole; plan 46 M1.3's later steps may replace the
 requester's mark with the holder's row-driven answer.
@@ -3343,5 +3372,8 @@ See: `crates/authority/src/core/client.rs` (`sent_to_designation`,
 `a_read_index_redirect_to_a_designee_is_not_cached_as_the_lease_holder`,
 `a_lock_not_owner_naming_a_designee_is_not_cached_as_the_lease_holder`,
 `a_rid_forwarded_to_a_node_the_lease_does_not_name_is_marked`,
+`a_forward_to_the_holder_a_deposition_named_is_not_marked`,
+`a_granted_renewal_ends_the_streams_refusal_backoff`,
+`an_unsettled_eio_of_an_op_a_delegate_accepted_is_named`,
 `the_roots_refusal_is_held_when_the_root_is_listed_as_a_delegate`,
 [delegations](../reference/features/delegations.md).

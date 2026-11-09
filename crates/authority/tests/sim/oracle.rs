@@ -444,12 +444,24 @@ impl Oracles {
         window_ms: u64,
         started: Option<u64>,
         designation_held: bool,
+        accepted_by_delegate: bool,
     ) {
         let at = self.reach.now_ms();
         // (A settle lasts at least a window; one whose deadline was extended
         // lasts from the arming of its second deadline.)
         let from_ms = started.unwrap_or(at).min(at.saturating_sub(window_ms));
-        let (owners, born) = self.owner_timeline(node, rid, from_ms, at);
+        let (owners, born) = if accepted_by_delegate {
+            // A delegate executed the op and answered it: what the requester
+            // still lacked was the commit of that delegate's rows (it awaited
+            // the log), which only a root gives. The sequencer to reach is a
+            // root (or a claimant the lease path yields), not the delegate it
+            // had heard: a restarted root that holds nothing until its lease
+            // runs out leaves none (`sticky-ttl` with slow lease reads, seed
+            // 907).
+            (vec![(0, super::reach::Owner::Root)], Default::default())
+        } else {
+            self.owner_timeline(node, rid, from_ms, at)
+        };
         let verdict = self.reach.classify(super::reach::Question {
             requester: node,
             from_ms,

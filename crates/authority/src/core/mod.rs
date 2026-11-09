@@ -2215,6 +2215,9 @@ pub struct Core {
     /// Rids whose unsettled `EIO` was counted in `unsettled_nonstealable_holder`,
     /// until the driver takes them (`take_unsettled_designation`).
     unsettled_designation_rids: std::collections::BTreeSet<Rid>,
+    /// The same for the unsettled `EIO`s of ops a delegate had executed
+    /// (`ClientOp::accepted_by_delegate`; `take_unsettled_accepted`).
+    unsettled_accepted_rids: std::collections::BTreeSet<Rid>,
     /// Whether `unsettled_designation_rids` is filled (a consumer calls
     /// `track_unsettled_designation`; production cores do not, since nothing
     /// would drain it).
@@ -2401,6 +2404,7 @@ impl Core {
             clients: BTreeMap::new(),
             in_doubt_rids: std::collections::BTreeSet::new(),
             unsettled_designation_rids: std::collections::BTreeSet::new(),
+            unsettled_accepted_rids: std::collections::BTreeSet::new(),
             track_unsettled_designation: false,
             in_doubt_designee_rids: std::collections::BTreeSet::new(),
             in_doubt_batches: std::collections::BTreeMap::new(),

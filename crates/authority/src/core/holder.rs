@@ -1345,7 +1345,7 @@ impl Core {
             let epoch = self.lease.epoch().unwrap_or(1);
             self.lease.release_local();
             // The hold owner now: this node follows its log stream.
-            self.lease.cached_holder = Some(from);
+            self.lease.name_holder(from);
             self.deleg_on_lease_gone(now, replica, out);
             self.clear_holder_epoch(replica);
             self.stats.handoffs_served += 1;
@@ -1384,7 +1384,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         if from != 0 && epoch >= self.ship.max_epoch {
-            self.lease.cached_holder = Some(from);
+            self.lease.name_holder(from);
         }
         if seq < self.ship.next_seq || self.stream_delivers_from(from) {
             return;

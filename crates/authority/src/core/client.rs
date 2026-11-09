@@ -127,6 +127,12 @@ pub(crate) struct ClientOp {
     /// sent on, so it may have run): its in-doubt end is I4's exception for
     /// an unreachable non-stealable holder (`unsettled_nonstealable_holder`).
     pub designation_held: bool,
+    /// A delegate executed the op and said so (`Accepted` with its
+    /// generation): what the op still lacks is the commit of the delegate's
+    /// rows through the root (it awaits the log). The sim judges its
+    /// unsettled `EIO` against a root, not against the delegate it already
+    /// heard (`Stats::unsettled_accepted_by_delegate`).
+    pub accepted_by_delegate: bool,
     /// Plan 46 M0.3 (B): the root that last answered this op `Held` (it is
     /// alive and holds the op by design): the backoff retry goes back to
     /// it when this node's cached holder was dropped meanwhile.
@@ -679,6 +685,7 @@ impl Core {
                 sent_to_delegate: resubmitted,
                 redirected_to_designee,
                 designation_held: false,
+                accepted_by_delegate: false,
                 tag,
             },
         );
@@ -1378,19 +1385,16 @@ impl Core {
             out,
         );
         let acked_through = self.acked.floor();
-        // A node other than the holder the lease object names (the last
-        // one this node read) may be a designee: the table here lags the
-        // root's, and any cache setter may have named one. The op is marked,
-        // so its refusal by the root is held, not final (I1). A structural
-        // guard: it does not depend on how the target came to be cached.
-        // (Without a lease object read there is nothing to compare with.)
+        // A node other than the holder the holder signals last named
+        // (`LeaseState::named_holder`: lease objects, depositions, stream
+        // frames, the holder's own replies; not only the last lease object
+        // read, which they leave behind) may be a designee: the table here
+        // lags the root's, and any cache setter may have named one. The op
+        // is marked, so its refusal by the root is held, not final (I1). A
+        // structural guard: it does not depend on how the target came to be
+        // cached. (Without a signal there is nothing to compare with.)
         let to_delegate = replica.delegation_table().iter().any(|e| e.node == holder)
-            || (holder != 0
-                && self
-                    .lease
-                    .last_seen
-                    .as_ref()
-                    .is_some_and(|l| l.holder != holder));
+            || (holder != 0 && self.lease.named_holder.is_some_and(|named| named != holder));
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
@@ -1555,7 +1559,7 @@ impl Core {
             // an S3 cut (`locks-blips-tight-delegated` seed 3117: two
             // former delegates each sent the other their renewals until
             // the grant lapsed under its I/O; chunk delegate-fenced-io).
-            self.lease.cached_holder = Some(from);
+            self.lease.name_holder(from);
         }
         let applied = replica.applied_seq().unwrap_or(0);
         let base_ok = self.cfg.speculate_on_stale_base || base.is_some_and(|b| applied >= b);
@@ -1608,6 +1612,11 @@ impl Core {
         } else {
             outcome
         };
+        if gen != 0 && matches!(&outcome, MutateOutcome::Accepted { .. }) {
+            if let Some(c) = self.clients.get_mut(&rid) {
+                c.accepted_by_delegate = true;
+            }
+        }
         match outcome {
             MutateOutcome::Accepted { epoch, records } if !base_ok || records.is_empty() => {
                 // The holder evaluated the op against state this replica
@@ -1824,7 +1833,7 @@ impl Core {
                 let names_delegate = holder != 0
                     && (gen != 0 || replica.delegation_table().iter().any(|e| e.node == holder));
                 if holder != 0 && !names_delegate {
-                    self.lease.cached_holder = Some(holder);
+                    self.lease.name_holder(holder);
                 }
                 // M12 round 2: this node's table names `from` the owner of
                 // the op's keys (a subtree just delegated to it) but `from` answered `NotHolder` — its own table has
@@ -4293,6 +4302,12 @@ impl Core {
         self.unsettled_designation_rids.remove(&rid)
     }
 
+    /// Whether `rid`'s unsettled `EIO` was one of an op a delegate had
+    /// executed and answered (`ClientOp::accepted_by_delegate`); taken once.
+    pub fn take_unsettled_accepted(&mut self, rid: Rid) -> bool {
+        self.unsettled_accepted_rids.remove(&rid)
+    }
+
     /// The op is neither executed here nor answered by anyone: the client
     /// hears `InDoubt` (`EIO`; retryable by the same rid), the replay
     /// drain leaves it queued.
@@ -4313,6 +4328,17 @@ impl Core {
             // Of those, the op whose refusal was held back for a designee
             // (the op was sent to it, or its keys are waited on): only an
             // unsettled `EIO` is I4's exception, by rid.
+            if c.accepted_by_delegate && self.track_unsettled_designation {
+                self.unsettled_accepted_rids.insert(rid);
+                while self.unsettled_accepted_rids.len() > MAX_IN_DOUBT_RIDS {
+                    let first = *self
+                        .unsettled_accepted_rids
+                        .iter()
+                        .next()
+                        .expect("non-empty");
+                    self.unsettled_accepted_rids.remove(&first);
+                }
+            }
             if c.designation_held {
                 self.stats.unsettled_nonstealable_holder += 1;
                 // (Recorded only when a consumer takes them: the sim

@@ -6996,10 +6996,25 @@ impl Core {
         }
         self.arm_deleg_lapse(now, gen, out);
         let d = self.dl.mine.get_mut(&gen).expect("present");
+        // The root granted the renewal: it serves this generation now. A
+        // stream refusal just before it (a root restarted or re-adopting
+        // after a slow lease read, not yet knowing the generation) left the
+        // stream backing off for up to two seconds, so rows the root could
+        // take now waited for the back-off, and an op awaiting their commit
+        // ran out its settle first (`sticky-ttl` with slow lease reads,
+        // seeds 532, 1705). The batch goes now.
+        let resume_stream = d.inflight.is_none() && d.stream_after.is_some();
+        if resume_stream {
+            d.stream_after = None;
+            d.stream_backoff_ms = 0;
+        }
         if d.group_requested.is_some() && d.renew_backup != Self::deleg_requested_backup(d) {
             // Plan 43 C2: the root journals the group change when it learns
             // the request — tell it now, not at the next timer.
             self.deleg_renew_now(now, gen, out);
+        }
+        if resume_stream {
+            self.deleg_stream(now, replica, out);
         }
         self.deleg_after_event(now, replica, out);
     }

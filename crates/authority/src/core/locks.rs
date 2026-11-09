@@ -4497,7 +4497,7 @@ impl Core {
                 && !self.lease.claimable_observed(now, &self.cfg)
                 && lease.holder != self.cfg.node_id
             {
-                self.lease.cached_holder = Some(lease.holder);
+                self.lease.name_holder(lease.holder);
                 self.lock_route_op(now, op, replica, out);
                 return;
             }
@@ -4510,7 +4510,7 @@ impl Core {
         }
         if matches!(read, HolderRead::Failed) {
             if let Some(owner) = self.lock_owner_without_s3(now) {
-                self.lease.cached_holder = Some(owner);
+                self.lease.name_holder(owner);
                 self.lock_route_op(now, op, replica, out);
                 return;
             }
@@ -5170,7 +5170,7 @@ impl Core {
                     let names_delegate =
                         gen != 0 || replica.delegation_table().iter().any(|e| e.node == owner);
                     if !names_delegate {
-                        self.lease.cached_holder = Some(owner);
+                        self.lease.name_holder(owner);
                     }
                 } else if from != self.cfg.node_id
                     && (owner == 0 || self.lease.cached_holder == Some(from))
@@ -5617,11 +5617,11 @@ impl Core {
                 && !self.lease.claimable_observed(now, &self.cfg)
                 && lease.holder != self.cfg.node_id
             {
-                self.lease.cached_holder = Some(lease.holder);
+                self.lease.name_holder(lease.holder);
             }
         } else if matches!(&result, crate::event::S3Result::LeaseGet(Err(_))) {
             if let Some(owner) = self.lock_owner_without_s3(now) {
-                self.lease.cached_holder = Some(owner);
+                self.lease.name_holder(owner);
             }
         }
         // Renew at once with what was learned.
@@ -5720,7 +5720,7 @@ impl Core {
                 let names_delegate =
                     gen != 0 || replica.delegation_table().iter().any(|e| e.node == owner);
                 if owner != 0 && owner != self.cfg.node_id && !names_delegate {
-                    self.lease.cached_holder = Some(owner);
+                    self.lease.name_holder(owner);
                 } else if owner == 0
                     && from != self.cfg.node_id
                     && self.lease.cached_holder == Some(from)

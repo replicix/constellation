@@ -158,6 +158,14 @@ pub struct LeaseState {
     /// `ForwardState::cached_holder` (from `NotHolder` redirects and
     /// lease reads).
     pub cached_holder: Option<NodeId>,
+    /// The node every authoritative holder signal last named (a lease
+    /// object, a deposition's successor, a log stream frame, a holder's own
+    /// reply or redirect without a generation): `cached_holder` as the
+    /// signals set it, where `last_seen` is only the last lease *object*,
+    /// which a deposition or a stream frame leaves behind (plan 46 M1.3
+    /// step 5, S6). A forward to any other node is a forward to a node the
+    /// holder signals do not name: it may be a designee.
+    pub named_holder: Option<NodeId>,
     /// The last lease object read from S3, for `AcquireProgress`-style
     /// progress detection and the cached holder (what `obs.body` holds,
     /// plus whatever `note_object` cached without an observation).
@@ -795,6 +803,7 @@ impl LeaseState {
         self.held_since = Some(now.wait);
         self.last_write = now.wait;
         self.last_seen = Some(lease.clone());
+        self.named_holder = Some(lease.holder);
         self.observe_own(now, &lease, &tag);
         self.cached_holder = Some(lease.holder);
         self.last_config_version = lease.config_version;
@@ -842,6 +851,7 @@ impl LeaseState {
             self.wanted_since = Some(now.wait);
         }
         self.last_seen = Some(lease.clone());
+        self.named_holder = Some(lease.holder);
         self.observe_own(now, &lease, &tag);
         // A read that carries the held tag is the held version again: if a
         // reconfiguration CAS of ours was answered lost, the read may have
@@ -940,6 +950,7 @@ impl LeaseState {
         self.releasing = false;
         self.lost = true;
         self.cached_holder = (holder != 0).then_some(holder);
+        self.named_holder = self.cached_holder;
         self.lost_floor = epoch.max(my_epoch.saturating_add(1));
     }
 
@@ -977,6 +988,14 @@ impl LeaseState {
             self.cached_holder = Some(lease.holder);
         }
         self.last_seen = Some(lease.clone());
+        self.named_holder = Some(lease.holder);
+    }
+
+    /// A holder signal other than a lease object named `holder` (a stream
+    /// frame, a reply or redirect of the holder, a deposition's successor).
+    pub fn name_holder(&mut self, holder: NodeId) {
+        self.cached_holder = Some(holder);
+        self.named_holder = Some(holder);
     }
 
     // ---- plan 43 C7b: the observation rule ----
