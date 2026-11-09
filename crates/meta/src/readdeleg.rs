@@ -570,12 +570,13 @@ impl ReadDelegations {
     /// Plan 46 M1.3 step 13 (C11: no read grant on an ended stream): as
     /// [`Self::void_epoch`], and the epoch is remembered, so a grant of it
     /// that is still on its way (or sent by a holder that does not know its
-    /// stream ended) is not installed; the recall generation is bumped, so an
-    /// install racing this call fails as for a recall.
+    /// stream ended) is not installed, whenever it was sent. The recall
+    /// generation is not bumped: the remembered epoch already refuses a racing
+    /// install of it, and a bump would fail every other node's in-flight
+    /// install (an extra read-index round trip each) on every ended stream.
     pub fn void_gen_epoch(&self, epoch: u64) {
         let mut g = self.inner.lock().unwrap();
         g.held.retain(|_, h| h.epoch != epoch);
-        g.recall_gen += 1;
         if g.voided_set.insert(epoch) {
             g.voided.push_back(epoch);
             while g.voided.len() > VOIDED_EPOCHS {
@@ -1111,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn void_gen_epoch_bumps_the_recall_gen_refuses_installs_and_keeps_256_fifo() {
+    fn void_gen_epoch_refuses_installs_leaves_the_recall_gen_and_keeps_256_fifo() {
         let t = ReadDelegations::default();
         let mut h = held(1_000);
         h.epoch = 7;
@@ -1120,7 +1121,13 @@ mod tests {
         assert!(t.valid(5, HonourMs(0)).is_some());
         t.void_gen_epoch(7);
         assert!(t.valid(5, HonourMs(0)).is_none(), "the held grant is gone");
-        // An install that raced the void fails (the recall generation moved)...
+        // The recall generation does not move: another stream's install in
+        // flight is not failed by it.
+        assert_eq!(t.recall_gen(), gen);
+        let mut other_in_flight = held(1_000);
+        other_in_flight.epoch = 9;
+        assert!(t.install(6, other_in_flight, gen));
+        // An install of the voided epoch that raced the void fails...
         assert!(!t.install(5, h, gen));
         // ...and so does a later one of the same epoch, with a fresh generation.
         assert!(!t.install(5, h, t.recall_gen()));

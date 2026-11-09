@@ -1184,6 +1184,20 @@ pub fn sticky_abandon(_seed: u64) -> Result<()> {
                 Ok(())
             },
         )?;
+        // The replay of b's write past the cut is refused: the name is c's now.
+        eventually(
+            "b's replay of d1/b-last is refused as a conflict copy",
+            Duration::from_secs(30),
+            || {
+                let sb = b.control_status()?["speculation"].clone();
+                anyhow::ensure!(
+                    n(&sb, "replay_conflicts") >= 1,
+                    "b's replay of its row past the cut was not refused (replay_conflicts {})",
+                    n(&sb, "replay_conflicts")
+                );
+                Ok(())
+            },
+        )?;
         let sb = b.control_status()?["speculation"].clone();
         eprintln!(
             "    {SCENARIO}: after b's return: rows replayed by rid on b {}, replays refused (conflict \

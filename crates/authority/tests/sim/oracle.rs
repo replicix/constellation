@@ -2192,6 +2192,11 @@ pub struct Findings {
     /// stream the operator abandoned, past the cut the log gave it: the cost
     /// the abandon says it has (counted, not a violation).
     pub i5_operator: Vec<String>,
+    /// The same rows when their answer was given after the abandon was
+    /// answered (a holder that came back and had not learned the end): not
+    /// the cost the operator accepted, counted apart from `i5_operator` (the
+    /// holder's `Final` rows are queued for replay by rid, never dropped).
+    pub i5_after_end: Vec<String>,
     /// I6 (plan 43 C7b): TTL claims of a live lease.
     pub i6: Vec<String>,
     /// Plan 46 M1.2 step 3, `acked_at_or_below_cut` (`cut.rs`): answers for a
@@ -2292,6 +2297,7 @@ pub fn end_of_run(
     rolled_back: &HashMap<Rid, u64>,
     dropped: &BTreeSet<Rid>,
     operator_lost: &BTreeSet<Rid>,
+    abandoned_at: &BTreeMap<u64, u64>,
     converged: bool,
 ) -> Findings {
     // `repair drop-held` is the operator's action: it rolls back what
@@ -2481,6 +2487,14 @@ pub fn end_of_run(
                     && cuts.abandoned.contains(&gen)
                     && cuts.cut.get(&gen).is_some_and(|c| idx > *c)
                 {
+                    if abandoned_at.get(&gen).is_some_and(|t0| a.at_ms > *t0) {
+                        f.i5_after_end.push(format!(
+                            "I5 after the end: rid {rid:?} (row {idx} of abandoned generation {gen}, past its cut) \
+                             answered at t={} ms, after the abandon was answered at t={} ms, rolled back",
+                            a.at_ms, abandoned_at[&gen]
+                        ));
+                        continue;
+                    }
                     f.i5_operator.push(format!(
                         "I5 operator: rid {rid:?} (row {idx} of abandoned generation {gen}, past its cut) \
                          rolled back"
@@ -2521,6 +2535,7 @@ pub fn end_of_run(
     }
     f.i5.sort();
     f.i5_operator.sort();
+    f.i5_after_end.sort();
     // Plan 46 M1.2 step 3: `acked_at_or_below_cut`.
     let cut = super::cut::judge(&acks, &cuts);
     f.cut = cut.past_cut;
@@ -3134,6 +3149,7 @@ mod tests {
             rolled_back,
             dropped,
             &BTreeSet::new(),
+            &BTreeMap::new(),
             true,
         )
     }
@@ -3231,7 +3247,7 @@ mod tests {
             gen: 7,
             through_known: 3,
         };
-        let run = |records: Vec<LogRecord>, idx: u64| {
+        let run = |records: Vec<LogRecord>, idx: u64, at: BTreeMap<u64, u64>| {
             let (oracles, s) = o(records);
             *oracles.acks.lock().unwrap() = vec![row(idx)];
             end_of_run(
@@ -3240,21 +3256,36 @@ mod tests {
                 &[],
                 &HashMap::from([(r, 6)]),
                 &BTreeSet::new(),
+                &BTreeSet::new(),
+                &at,
                 true,
             )
         };
         // Past the cut of an abandoned stream: the operator's.
-        let f = run(vec![ended.clone(), abandoned.clone()], 4);
+        let f = run(vec![ended.clone(), abandoned.clone()], 4, BTreeMap::new());
         assert!(f.i5.is_empty(), "{:?}", f.i5);
         assert_eq!(f.i5_operator.len(), 1, "{:?}", f.i5_operator);
         // At the cut: a violation.
-        let f = run(vec![ended.clone(), abandoned], 3);
+        let f = run(vec![ended.clone(), abandoned.clone()], 3, BTreeMap::new());
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
         assert!(f.i5_operator.is_empty());
         // The stream ended but nobody abandoned it: a violation.
-        let f = run(vec![ended], 4);
+        let f = run(vec![ended.clone()], 4, BTreeMap::new());
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
         assert!(f.i5_operator.is_empty());
+        // A row answered after the abandon was answered (the row is acked at
+        // t=5): not the cost the operator accepted, counted apart. One
+        // answered at the same instant or before is the operator's.
+        let f = run(
+            vec![ended.clone(), abandoned.clone()],
+            4,
+            BTreeMap::from([(7, 4)]),
+        );
+        assert!(f.i5.is_empty() && f.i5_operator.is_empty(), "{:?}", f.i5);
+        assert_eq!(f.i5_after_end.len(), 1, "{:?}", f.i5_after_end);
+        let f = run(vec![ended, abandoned], 4, BTreeMap::from([(7, 5)]));
+        assert_eq!(f.i5_operator.len(), 1);
+        assert!(f.i5_after_end.is_empty());
     }
 
     /// Plan 46 M0.2 (R7): a non-stealable sequencer's OK (an epoch hold's)
@@ -3333,15 +3364,15 @@ mod tests {
         let o = Oracles::new(Bucket::new(1, (0, 0)));
         *o.acks.lock().unwrap() = acks;
         let log = log_with(refused_seg(1, r, Code::Io), &[(other, (3, 1))]);
-        let f = end_of_run(&o, &log, &[], &rolled, &dropped, &BTreeSet::new(), true);
+        let f = end_of_run(&o, &log, &[], &rolled, &dropped, &BTreeSet::new(), &BTreeMap::new(), true);
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
         // Its replay refused: the outcome is the log's.
         let log = log_with(refused_seg(1, r, Code::NotFound), &[(other, (3, 1))]);
-        let f = end_of_run(&o, &log, &[], &rolled, &dropped, &BTreeSet::new(), true);
+        let f = end_of_run(&o, &log, &[], &rolled, &dropped, &BTreeSet::new(), &BTreeMap::new(), true);
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
         // A refusal of a rid the drop did not roll back excuses nothing.
         let log = log_with(refused_seg(1, other, Code::NotFound), &[(r, (3, 0))]);
-        let f = end_of_run(&o, &log, &[], &rolled, &dropped, &BTreeSet::new(), true);
+        let f = end_of_run(&o, &log, &[], &rolled, &dropped, &BTreeSet::new(), &BTreeMap::new(), true);
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
         assert!(f.i5[0].contains(&format!("{other:?}")), "{:?}", f.i5);
     }
@@ -4350,7 +4381,7 @@ mod tests {
             let o = Oracles::new(Bucket::new(1, (0, 0)));
             *o.acks.lock().unwrap() = acks.clone();
             let log = log_with(seg(1, &[]), &[]);
-            end_of_run(&o, &log, &[], &HashMap::new(), &BTreeSet::new(), lost, true)
+            end_of_run(&o, &log, &[], &HashMap::new(), &BTreeSet::new(), lost, &BTreeMap::new(), true)
         };
         // Neither is in the set: both are absent.
         let f = run(&BTreeSet::new());

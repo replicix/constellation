@@ -69189,7 +69189,7 @@ being appended during the wait.
   reader that learned the end refuses a late grant from a holder that did not (256 epochs remembered, FIFO; `delegations_voided`).
   The holder answers no strict read, so grants no read delegation, once `void_cut(gen)` is set.
 - **Knob and stats.** `Config::abandon_skips_read_recall` (`AUTHORITY_SIM_ABANDON_SKIPS_READ_RECALL=1`); `deleg_abandons`,
-  `deleg_abandon_read_waits`, `_reads_recalled`, `_reads_expired`, `deleg_abandon_superseded`; `sticky_core` is `[u64; 12]`.
+  `deleg_abandon_read_waits`, `_reads_recalled`, `_reads_expired`, `deleg_abandon_superseded`; `sticky_core` is `[u64; 16]` after step 5.
 - **Sim.** `FaultKind::AbandonNode`; oracle `no_read_under_an_abandoned_stream` (strict on every configuration: a strict read
   served at `t` under a read delegation of generation `g` after the abandon of `g` was answered at `t0 < t`); I5's operator branch
   (`Report::i5_operator`: a rolled-back row of an abandoned stream past its cut is counted, not a violation; unit test
@@ -69235,10 +69235,55 @@ being appended during the wait.
   a reader-only node (`reader_nodes`, `client_plan`) and runs 40 ops per client: a reader that is connected learns the end
   from the log within milliseconds, so without them no read was ever served after the end and the knob failed no seed. (2) The
   fault does not force an abandon of a node that is alive again (a restarted root may be unusable for seconds; it keeps asking
-  and gives up without a failure) and asks again on "not a usable root", "no longer the root" and a dropped answer. (3) The
-  step-5 knobs and `sticky_core: [u64; 11]` are not on main yet: `sticky_core` is `[u64; 12]` here (7 + 5); rebase onto step 5
-  extends it. (4) `Report::i5_operator` and `SWEEP-ABANDON-TOTALS` print the operator counters.
+  and gives up without a failure) and asks again on "not a usable root", "no longer the root" and a dropped answer. (3) Rebased
+  onto step 5: `sticky_core` is `[u64; 16]` (step 5's 7..=10, then this step's 11..=15). (4) `Report::i5_operator` and `SWEEP-ABANDON-TOTALS` print the operator counters.
 - **Open.** Seed 74 of an earlier version of the configuration (before the S3 cut) failed I1: the root's S3 inbox journaled
   `Refused(EROFS)` for node 3's op while the dead sticky holder's stream was live, the sim client retried the same rid, and the op
   completed after the abandon. The same class fails `sticky-ttl` seed 110 on main. It looks like an artefact of the sim client retrying a journaled
   `EROFS` under one rid (an application issues a new operation); not investigated further and not touched.
+
+### Step 13 review round (fix round on 313f6159 / 72b07ccd, rebased onto b9dc1ce0)
+
+The rebase over step 5 took both sides everywhere (`Config` knobs, `Timer`, `Dl` fields, the sim env and report); `sticky_core`
+is `[u64; 16]`: step 5's 7..=10, this step's 11..=15. `abandon_progress` runs after `sticky_release_progress`. Each behaviour
+change has a test that fails with only that fix reverted (on the box).
+
+- **S1, a returned holder breaks the deadline's premise.** The root refuses the renewals of a stream in `dl.abandons` (`ends`, so a
+  holder that came back stops); a non-stealable holder grants no read delegation until a renewal sent after its install was granted
+  (`answered_sent >= installed`). Tests: `the_root_refuses_a_renewal_of_a_stream_in_an_abandon_wait`,
+  `a_non_stealable_holder_grants_no_read_before_the_root_renewed_it`. Sim: `sticky-holder-returns` (the holder returns 2 s after the
+  crash, inside the wait; node 3 cut from the root only; `read_delegation_ttl_ms` 1.5 s so the grants of the first incarnation lapse
+  before it returns, see Open). With both halves reverted 16 of 300 seeds fail `no_read_under_an_abandoned_stream`
+  (`a_holder_that_returns_during_the_abandon_wait_grants_no_read_past_the_end` runs 12 seeds).
+- **S2, the I5 excuse.** `end_of_run` takes the abandon answer times; a rolled-back row past the cut that was answered after the abandon
+  was answered is `Findings::i5_after_end` (`Report::i5_after_end`, printed in `SWEEP-ABANDON-TOTALS`), not `i5_operator`. Counted, not a
+  violation: such a row is a returned holder's `Final` write before it learned the end, queued for replay by rid (Q6). Test: extended
+  `i5_counts_a_rollback_past_an_abandoned_streams_cut_as_the_operators`.
+- **S3, a transient loss of `root_usable` aborted the command.** Only a lost lease or a different lease epoch ends the wait with
+  "no longer the root"; otherwise the tick is skipped and the end is journaled once the root is usable (a passed deadline retries every
+  200 ms). Tests: `an_abandon_waits_out_a_root_that_is_not_usable_for_a_moment`, `an_abandon_past_its_deadline_waits_for_a_usable_root`;
+  `an_abandon_waiting_when_the_root_loses_its_lease_is_refused` now sets `lease.lost`.
+- **S4, `--node` on placed generations.** Test `abandon_by_node_ends_a_placed_generation_that_waits_and_names_one_that_does_not` (coverage
+  of existing behaviour; passes before the fix round).
+- **S5, rebase.** Done as above.
+- **N1.** `ReadDelegations::void_gen_epoch` no longer bumps `recall_gen` (the voided set refuses a racing install); the meta test asserts
+  the generation does not move and another epoch's in-flight install succeeds.
+- **N2.** A placed-gen failure reports the gens already ended ("already done") and counts the command only if one ended. No test: no way
+  to make `end_generation` fail after validation in the core harness.
+- **N3.** `sticky_holder_dies_is_abandoned_by_the_operator` pins seeds 1 (deadline), 13 (readers' answers), 47 (deadline and an
+  `i5_operator` row) instead of up to 200 seeds.
+- **N4.** Confirmed in the review, nothing to do. **N5.** The supersede test applies the holder's `StreamReleased` row. **N6.** Stale
+  text fixed (`configuration.md`, comments). **N7.** The harness `sticky-abandon` now asserts `replay_conflicts >= 1` on the returned
+  holder (not run in this round); the "old name exits non-zero" check stays in the CLI unit test. **N8.** No change (only matters with S1).
+- **Sweeps** (release, x2,000, 2 at a time, 8 threads): `sticky-holder-dies` 0 failed (1,717 commands, 91 ended on the readers' answers,
+  1,626 by the deadline; `i5_operator` 160 rows in 50 seeds; 3 rows answered after the abandon was answered); `sticky-holder-returns`
+  0 failed (1,646 commands, 24 + 1,622; 5 rollbacks in 2 seeds); `delegated-backup-and-delegate-die-abandon` 0 failed;
+  `delegated-backup-and-delegate-die` 0 failed; `sticky-ttl` 0 failed; `acked_at_or_below_cut` 0 everywhere. Knob
+  `abandon_skips_read_recall` on `sticky-holder-dies`, x200: 70 fail, all `no_read_under_an_abandoned_stream`.
+- **Open (not this step).** A restarted sticky holder does not know the read delegations its previous incarnation granted, and executes
+  at once: a reader under one of them serves a stale read until it lapses (`close-to-open`). The first version of `sticky-holder-returns`
+  (restart 2 s after the crash, 5 s read TTL) failed 2 of 2,000 seeds this way, in runs where the operator did not abandon; main fails the
+  same class on a run of the same faults with no abandon (8 of 1,500 seeds, a temporary configuration). It was masked before this round
+  when the new incarnation happened to grant the reader a new delegation, which replaced the old one in the reader's table. A fix needs a
+  quarantine of the restarted holder's writes for `read_delegation_ttl_ms` plus the margin (a design decision).
+

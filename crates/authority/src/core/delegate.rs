@@ -1064,7 +1064,15 @@ pub(crate) struct AbandonWait {
     pub forced: BTreeMap<u64, (NodeId, &'static str, u64)>,
     /// What the answer reports.
     pub lines: Vec<String>,
+    /// The lease epoch this root held at the command: a different one, or a
+    /// lost lease, means the root was deposed and the command is refused;
+    /// a lease that is merely not usable for a moment is waited out.
+    pub epoch: Option<crate::Epoch>,
 }
+
+/// How soon an abandon whose deadline passed looks again when the root is
+/// not usable (the end is journaled once it is).
+const ABANDON_RETRY_MS: u64 = 200;
 
 /// The generation number of a [`PeerMsg::DelegateStream`] that is no stream:
 /// a node tells the root it is leaving (or no longer is) with a batch of no
@@ -6127,8 +6135,12 @@ impl Core {
                     }
                 }
             }
+            // Plan 46 M1.3 step 13: an abandon in its wait has no holder
+            // grant anything after the command (the deadline's premise): the
+            // renewal is refused, and the holder stops.
+            let abandoning = self.dl.abandons.iter().any(|w| w.gens.contains(&gen));
             if let Some(g) = self.dl.gens.get_mut(&gen) {
-                if g.node == from && !g.ended && g.recall == RecallPhase::None {
+                if g.node == from && !g.ended && g.recall == RecallPhase::None && !abandoning {
                     ttl_ms = self.cfg.delegation_ttl_ms.min(cap);
                     if ttl_ms > 0 {
                         // The delegate is alive after all: nothing waits
@@ -7870,7 +7882,14 @@ impl Core {
             // A delegate's read grant is capped by its own honour end.
             let cap = d.until.since(now.honour) - margin;
             let ttl = (self.cfg.read_delegation_ttl_ms as i64).min(cap);
+            // A non-stealable stream is honoured from its install (whatever
+            // the root says), so its read grants need the root's word: one
+            // renewal sent after the install was granted. A holder that came
+            // back with its journal during an operator's abandon is not
+            // renewed (the root refuses it), and grants no read meanwhile.
+            let renewed = !d.non_stealable || d.answered_sent >= d.installed;
             if ttl > 0
+                && renewed
                 && !self
                     .rd
                     .blocked
@@ -9614,7 +9633,6 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        self.stats.deleg_abandons += 1;
         let mut lines = Vec::new();
         let mut failed = None;
         for gen in &plan.placed {
@@ -9631,9 +9649,29 @@ impl Core {
             ));
         }
         if let Some(e) = failed {
-            out.push(Action::ControlDone { op, result: Err(e) });
+            // What was ended before the failure is reported (it stays ended).
+            let done: Vec<&String> = lines.iter().filter(|l| l.contains("ended at")).collect();
+            if !done.is_empty() {
+                self.stats.deleg_abandons += 1;
+            }
+            let result = if done.is_empty() {
+                e
+            } else {
+                format!(
+                    "{e} (already done: {})",
+                    done.iter()
+                        .map(|l| l.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            };
+            out.push(Action::ControlDone {
+                op,
+                result: Err(result),
+            });
             return;
         }
+        self.stats.deleg_abandons += 1;
         if plan.streams.is_empty() {
             out.push(Action::ControlDone {
                 op,
@@ -9652,6 +9690,7 @@ impl Core {
                 .plus(self.cfg.read_delegation_ttl_ms + self.cfg.expiry_margin_ms),
             forced: plan.forced.clone(),
             lines,
+            epoch: self.lease.epoch(),
         };
         let waits = self.cfg.read_delegations && !self.cfg.abandon_skips_read_recall;
         if waits {
@@ -9776,7 +9815,10 @@ impl Core {
                     ));
                     continue;
                 }
-                if !self.root_ends_recall(now, gen) {
+                // Only a deposition ends the command: a lease renewal that is
+                // late (the root is not usable for a moment) is waited out,
+                // the end is journaled once the root is usable again.
+                if self.lease.lost || self.lease.epoch() != w.epoch {
                     failed = Some(
                         "this node is no longer the root; run the command again on the root"
                             .to_string(),
@@ -9785,6 +9827,9 @@ impl Core {
                 }
                 let pending = w.asked.values().filter(|(_, g)| *g == gen).count();
                 if pending > 0 && now.wait < w.deadline {
+                    continue;
+                }
+                if !self.root_ends_recall(now, gen) {
                     continue;
                 }
                 if pending > 0 {
@@ -9852,7 +9897,14 @@ impl Core {
                 self.dl.abandon_timer = None;
             }
             (Some(at), None) => {
-                let t = self.set_timer_wait(at.max(now.wait), Timer::AbandonWait, out);
+                // A deadline that has passed while the root is not usable:
+                // look again soon, not at once.
+                let at = if at > now.wait {
+                    at
+                } else {
+                    now.wait.plus(ABANDON_RETRY_MS)
+                };
+                let t = self.set_timer_wait(at, Timer::AbandonWait, out);
                 self.dl.abandon_timer = Some(t);
             }
             _ => {}

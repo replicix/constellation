@@ -917,7 +917,12 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
   its end): it tells every other node to drop them and ends the stream once
   they answered, or `read_delegation_ttl_ms` plus the expiry margin after the
   command (6 s at the defaults), so the command answers after that at the
-  latest. Then it ends the stream at the root's cursor and journals
+  latest. The wait rests on the holder granting nothing after the command:
+  the root refuses the stream's renewals meanwhile (a holder that comes back
+  stops), and a returned sticky or designated holder grants no read
+  delegation until the root has granted a renewal sent after its install.
+  A root that is not usable for a moment (a late lease renewal) keeps the
+  command waiting; only losing the lease ends it with an error. Then it ends the stream at the root's cursor and journals
   `GroupAbandoned { gen }`. **Consequence:** rows only the holder held, past
   the cursor, are lost to the log; a holder that comes back replays them by
   rid, and the ones the log refuses (the name is someone else's now) become
