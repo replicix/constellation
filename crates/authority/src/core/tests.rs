@@ -61627,12 +61627,71 @@ mod step9_one_stream_per_node {
             .delegate_dir(h.clk(), dirs[0], 2, DelegKind::Manual, &h.meta, &mut out)
             .unwrap();
         link_to_2(&mut h, Some(500));
+        h.advance(h.core.placement_tick_ms() + 1);
+        link_to_2(&mut h, Some(500));
         assert!(!h.core.delegate_group_in_budget(2));
         h.core.dl.gens.values_mut().next().unwrap().group.backups = vec![3];
         assert!(
             h.core.delegate_group_in_budget(2),
             "a recorded backup is a group"
         );
+    }
+
+    /// Admission judges the link by its best round trip of the last
+    /// placement tick, not by the latest sample (fail-before: one slow
+    /// sample, from load or a rejoin, refused a healthy link). A link slow
+    /// throughout the window is still refused, and a budget of 0 refuses
+    /// whatever the history.
+    #[test]
+    fn one_slow_sample_does_not_refuse_a_healthy_link() {
+        let (mut h, _dirs) = root_with_peer(Some(5));
+        let tick = h.core.placement_tick_ms();
+        h.advance(tick / 4);
+        link_to_2(&mut h, Some(5));
+        h.advance(tick / 4);
+        link_to_2(&mut h, Some(900));
+        assert!(
+            h.core.delegate_group_in_budget(2),
+            "one slow sample over a healthy window"
+        );
+        // Slow for longer than the window: the healthy samples age out.
+        for _ in 0..4 {
+            h.advance(tick / 2 + 1);
+            link_to_2(&mut h, Some(900));
+        }
+        assert!(
+            !h.core.delegate_group_in_budget(2),
+            "a sustained slow link is refused"
+        );
+        // A link that went down starts its window anew.
+        let (mut h, _dirs) = root_with_peer(Some(5));
+        h.advance(10);
+        h.step(Event::Peers {
+            links: vec![],
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+        h.advance(10);
+        link_to_2(&mut h, Some(900));
+        assert!(
+            !h.core.delegate_group_in_budget(2),
+            "no history across a break"
+        );
+        // A zero budget refuses whatever the history.
+        let (mut h, _dirs) = root_with_peer(Some(5));
+        h.core.cfg.backup_rtt_budget_ms = 0;
+        assert!(!h.core.delegate_group_in_budget(2));
+    }
+
+    /// A set size of 0 selects no backup, so none "could be had" whatever
+    /// the budget and the links.
+    #[test]
+    fn no_backup_could_be_had_with_a_set_size_of_zero() {
+        let (mut h, _dirs) = root_with_peer(Some(5));
+        h.core.cfg.backups_max = 1;
+        assert!(h.core.backup_could_be_had());
+        h.core.cfg.backups_max = 0;
+        assert!(!h.core.backup_could_be_had());
     }
 
     /// A budget of 0 admits no peer: a stealable grant is refused whatever

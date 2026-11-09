@@ -141,7 +141,7 @@ through the delegate. It then:
      lone delegate, its lead and its hysteresis are gone). The root grants a
      placed or manual delegation only to a node with a group within budget:
      a recorded backup, or the root itself when its link to the node is within
-     `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (a link not measured yet counts; a budget of 0 admits no peer, whatever the link measures). A
+     `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (judged by the link's best round trip over the last placement tick, so one slow sample from load or a rejoin does not refuse it, while a link slow throughout does; the first exchange after a link comes up, which dials the connection, is not a sample; a link not measured yet counts; a budget of 0 admits no peer, whatever the link measures). A
      writer with neither, a far writer (no peer, the root included, within the
      budget), is not delegated: placement skips it
      (`place_skipped_far`), `constellation delegate` without `--sticky`

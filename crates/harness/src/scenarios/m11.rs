@@ -290,27 +290,12 @@ fn tail_lines(path: &std::path::Path, n: usize) -> String {
 
 /// `constellation delegate <path> --to <node>` through the root's
 /// control socket.
-///
-/// A refusal for want of a peer within the backup budget is retried for a
-/// while: the root's latest round-trip sample to the node (a node that has
-/// just rejoined, on a loaded host) can be far over the budget for a moment,
-/// and the next samples are not.
 pub(super) fn delegate(root: &Client, path: &str, node: u64) -> Result<serde_json::Value> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match root.control(
-            "designation.delegate",
-            serde_json::json!({"path": path, "node": node}),
-        ) {
-            Err(e)
-                if Instant::now() < deadline
-                    && format!("{e:#}").contains("no peer within the backup RTT budget") =>
-            {
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            r => return r.with_context(|| format!("delegating {path} to {node} on {}", root.name)),
-        }
-    }
+    root.control(
+        "designation.delegate",
+        serde_json::json!({"path": path, "node": node}),
+    )
+    .with_context(|| format!("delegating {path} to {node} on {}", root.name))
 }
 
 /// `constellation undelegate <path>`.

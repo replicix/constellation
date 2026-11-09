@@ -32,6 +32,7 @@
 use super::delegate::DelegKind;
 use super::{Core, Timer};
 use crate::action::Action;
+use crate::event::PeerLink;
 use crate::ids::{NodeId, Now, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::types::ROOT_INO;
@@ -129,7 +130,7 @@ fn dominant(by_node: &HashMap<NodeId, u64>, pct: u64) -> (Option<NodeId>, u64) {
 }
 
 impl Core {
-    fn placement_tick_ms(&self) -> u64 {
+    pub(crate) fn placement_tick_ms(&self) -> u64 {
         (self.cfg.placement_window_ms / 10).max(100)
     }
 
@@ -246,8 +247,11 @@ impl Core {
     /// Plan 46 M1.2 step 13 (no lone delegate): whether a stealable grant
     /// (placed or manual) to `node` has a group within budget. A delegate's
     /// group is its recorded backup and the root. The root counts when its
-    /// link to `node` is within `backup_rtt_budget_ms` (an unmeasured or
-    /// unknown link counts: what is not known to be far is not refused),
+    /// link to `node` is within `backup_rtt_budget_ms` by its best round
+    /// trip of the last placement tick ([`Self::link_rtt_ms`]: one slow
+    /// sample, from load or a rejoin, does not refuse a healthy link; a
+    /// link slow throughout the window does), an unmeasured or
+    /// unknown link counts: what is not known to be far is not refused,
     /// and so does a backup the node's live stream already records. A budget
     /// of 0 admits no peer (no backup is ever selected, and no link is
     /// "within" it, a 0 ms measurement included), so it refuses every node
@@ -266,7 +270,7 @@ impl Core {
         if self
             .links
             .get(&node)
-            .is_none_or(|l| l.rtt_ms.is_none_or(|rtt| rtt <= budget))
+            .is_none_or(|l| self.link_rtt_ms(l).is_none_or(|rtt| rtt <= budget))
         {
             return true;
         }
@@ -274,6 +278,39 @@ impl Core {
             .gens
             .values()
             .any(|g| !g.ended && g.node == node && !g.group.backups.is_empty())
+    }
+
+    /// Records the round trips of a directory snapshot (see
+    /// `Core::rtt_recent`): the window is the placement tick, the time a
+    /// far link must hold before a placed grant is recalled.
+    pub(crate) fn note_rtt_samples(&mut self, at: WaitMs, links: &[PeerLink]) {
+        let window = self.placement_tick_ms() as i64;
+        self.rtt_recent
+            .retain(|n, _| links.iter().any(|l| l.node == *n && l.connected));
+        for l in links {
+            let (true, Some(rtt)) = (l.connected, l.rtt_ms) else {
+                self.rtt_recent.remove(&l.node);
+                continue;
+            };
+            let q = self.rtt_recent.entry(l.node).or_default();
+            q.push_back((at, rtt));
+            while q.len() > 1 && q.front().is_some_and(|(t, _)| at.since(*t) > window) {
+                q.pop_front();
+            }
+        }
+    }
+
+    /// The round trip to a peer as admission judges it: the best of the
+    /// samples of the last placement tick (the latest alone when the
+    /// window holds no other). `None`: not measured.
+    pub(crate) fn link_rtt_ms(&self, l: &PeerLink) -> Option<u64> {
+        let latest = l.rtt_ms?;
+        Some(
+            self.rtt_recent
+                .get(&l.node)
+                .and_then(|q| q.iter().map(|(_, r)| *r).min())
+                .map_or(latest, |m| m.min(latest)),
+        )
     }
 
     /// `node` holds a non-stealable stream (sticky or designated), or a
