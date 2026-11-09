@@ -9475,6 +9475,35 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // A repeated request for streams a wait already covers (the operator
+        // gave up waiting and asks again) takes over that wait: the answer
+        // goes to the new command, the old one is told it was superseded.
+        let asked: Vec<u64> = match sel {
+            AbandonSel::Gen(g) | AbandonSel::Node(_, Some(g)) => vec![g],
+            AbandonSel::Node(n, None) => self
+                .dl
+                .gens
+                .iter()
+                .filter(|(_, g)| g.node == n && !g.ended)
+                .map(|(g, _)| *g)
+                .collect(),
+        };
+        let covering = if asked.is_empty() {
+            None
+        } else {
+            self.dl
+                .abandons
+                .iter_mut()
+                .find(|w| asked.iter().all(|g| w.gens.contains(g)))
+        };
+        if let Some(w) = covering {
+            let old = std::mem::replace(&mut w.op, op);
+            out.push(Action::ControlDone {
+                op: old,
+                result: Err("taken over by a repeated command for the same streams".to_string()),
+            });
+            return;
+        }
         match self.abandon_validate(now, sel, force) {
             Err(error) => out.push(Action::ControlDone {
                 op,
@@ -9828,6 +9857,19 @@ impl Core {
                 let pending = w.asked.values().filter(|(_, g)| *g == gen).count();
                 if pending > 0 && now.wait < w.deadline {
                     continue;
+                }
+                // The wait for a usable root is bounded: once the lease this
+                // root holds has expired on its own clock, another node may
+                // be the root, and the operator is told so.
+                if now.wait >= w.deadline
+                    && !self.root_ends_recall(now, gen)
+                    && !self.lease.holds_unexpired(now, &self.cfg)
+                {
+                    failed = Some(
+                        "this node is no longer the root (its lease expired); run the command again on the root"
+                            .to_string(),
+                    );
+                    break;
                 }
                 if !self.root_ends_recall(now, gen) {
                     continue;

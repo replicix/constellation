@@ -18494,10 +18494,12 @@ fn sticky_holder_dies_is_abandoned_by_the_operator() {
 
 /// Plan 46 M1.3 step 13 (S1): the holder comes back inside the abandon's wait
 /// (`sticky-holder-returns`); no run fails, and the operator ended its stream.
+/// Seeds 46, 102 and 159 are three of the six of the first 600 that fail
+/// without the gate on a returned holder's read grants (about 1 %).
 #[test]
 fn a_holder_that_returns_during_the_abandon_wait_grants_no_read_past_the_end() {
     let mut abandoned = 0;
-    for seed in 0..12u64 {
+    for seed in [46u64, 102, 159] {
         let r = run_seed(seed, sticky_holder_returns_config()).unwrap_or_else(|e| {
             panic!(
                 "sticky-holder-returns seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=sticky-holder-returns"
@@ -18505,7 +18507,7 @@ fn a_holder_that_returns_during_the_abandon_wait_grants_no_read_past_the_end() {
         });
         abandoned += r.sticky_core[2];
     }
-    assert!(abandoned >= 8, "the operator ended {abandoned} streams");
+    assert!(abandoned >= 2, "the operator ended {abandoned} streams");
 }
 
 /// The oracle's negative control: with the abandon ending the stream without
