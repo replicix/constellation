@@ -500,6 +500,8 @@ pub enum SyncRequest {
     PeerReadVoid {
         root: u64,
         gen: u64,
+        /// The holder's own void after a restart (ADR-46).
+        restart: bool,
         reply: tokio::sync::oneshot::Sender<()>,
     },
     /// Plan 30 §M9: the holder streams journal transactions to this

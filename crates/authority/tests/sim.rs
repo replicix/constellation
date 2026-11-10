@@ -309,6 +309,7 @@ fn replay_seed() {
         Ok("sticky-holder-dies") => sticky_holder_dies_config(),
         Ok("sticky-holder-returns") => sticky_holder_returns_config(),
         Ok("sticky-holder-restarts") => sticky_holder_restarts_config(),
+        Ok("sticky-holder-fresh") => sticky_holder_fresh_config(),
         Ok("sticky-ttl") => sticky_ttl_config(),
         Ok("sticky-stale-route") => sticky_stale_route_config(),
         Ok("backup-two") => backup_two_config(),
@@ -1864,12 +1865,15 @@ fn sticky_holder_dies_config() -> SimConfig {
 
 /// Plan 46 M1.3 step 13 (S1): as `sticky-holder-dies`, but the holder comes
 /// back with its journal 2 s after the crash, inside the abandon's wait (the
-/// operator's command is at 3.5 s, the wait lasts the read delegation TTL, 1.5 s
-/// here, and a margin), while node 3 is cut from the root only (it still reaches node
-/// 2). The root refuses the returned holder's renewals during the wait and the
+/// operator's command is at 3.5 s, the wait lasts the read delegation TTL and a
+/// margin), while node 3 is cut from the root only (it still reaches node 2).
+/// The root refuses the returned holder's renewals during the wait and the
 /// holder grants no read delegation before one is granted, so no reader
 /// serves under a grant that outlives the end
-/// (`no_read_under_an_abandoned_stream`).
+/// (`no_read_under_an_abandoned_stream`). At the default read TTL the
+/// returned holder is also quarantined (ADR-46): it executes nothing while the
+/// grants of its previous process may be live, so no reader serves a stale
+/// read before the end either (`check_cto`).
 fn sticky_holder_returns_config() -> SimConfig {
     let mut config = sticky_holder_dies_config();
     for f in &mut config.faults {
@@ -1877,18 +1881,6 @@ fn sticky_holder_returns_config() -> SimConfig {
             *restart_ms = Some(2_000);
         }
     }
-    // The read grants the holder made before the crash lapse (1.5 s after the
-    // last one) before it returns. A restarted sticky holder does not know
-    // the grants of its previous incarnation and executes at once, so a
-    // reader under one of them could serve a stale read until it lapses; that
-    // is not this step's (it fails the same way on a run with no abandon, on
-    // main too), and the configuration keeps clear of it.
-    let base = config.core.clone();
-    config.core = std::sync::Arc::new(move |id, inc| {
-        let mut c = base(id, inc);
-        c.read_delegation_ttl_ms = 1_500;
-        c
-    });
     config
 }
 
@@ -1938,6 +1930,18 @@ fn sticky_holder_restarts_config() -> SimConfig {
             },
         ],
         ..delegated_config()
+    }
+}
+
+/// ADR-46: `sticky-holder-restarts`, and no node records at its first start
+/// that it has granted nothing (the daemon does, for a node id it has just
+/// claimed): the delegate read-grant horizon is absent, which is a full span,
+/// so every node quarantines the generations it installs in its first seconds
+/// as well. Correctness must not depend on the record.
+fn sticky_holder_fresh_config() -> SimConfig {
+    SimConfig {
+        first_start_unsettled: true,
+        ..sticky_holder_restarts_config()
     }
 }
 
@@ -6173,6 +6177,7 @@ fn sweep_config() {
         "sticky-holder-dies" => sticky_holder_dies_config(),
         "sticky-holder-returns" => sticky_holder_returns_config(),
         "sticky-holder-restarts" => sticky_holder_restarts_config(),
+        "sticky-holder-fresh" => sticky_holder_fresh_config(),
         "sticky-ttl" => sticky_ttl_config(),
         "sticky-stale-route" => sticky_stale_route_config(),
         "backup-departs" => backup_departs_config(),
@@ -8256,7 +8261,7 @@ struct OracleTotals {
     /// reason: released, abandoned, other).
     sticky: [u64; 5],
     sticky_core: [u64; 16],
-    quarantine_core: [u64; 5],
+    quarantine_core: [u64; 6],
     sticky_driver: [u64; 4],
     sticky_release_rows_judged: u64,
     /// Plan 46 M1.3 step 13: I5's operator branch (rows of abandoned streams
@@ -8737,13 +8742,14 @@ impl OracleTotals {
         );
         eprintln!(
             "QUARANTINE-TOTALS {label} seeds {}/{seeds}: restart quarantines {}, own writes parked {}, forwards answered Held {}, \
-             waited out {}, read grants withheld {}",
+             waited out {}, read grants withheld {}, ended early by the void {}",
             self.seeds,
             self.quarantine_core[0],
             self.quarantine_core[1],
             self.quarantine_core[2],
             self.quarantine_core[3],
-            self.quarantine_core[4]
+            self.quarantine_core[4],
+            self.quarantine_core[5]
         );
         eprintln!(
             "SWEEP-UNSETTLED-CAUSES {label} seeds {}/{seeds}: {:?}",
@@ -18929,6 +18935,40 @@ fn a_restarted_sticky_holder_serves_no_stale_read() {
         quarantined += r.quarantine_core[0];
     }
     assert!(quarantined > 0, "no restarted holder was quarantined");
+}
+
+/// ADR-46 (S3): a fresh node without the first-start record
+/// (`sticky-holder-fresh`) waits a full span for grants nobody made, and no
+/// run fails. Without scheduled faults (the counters are the surviving
+/// cores', so a crash would hide the first incarnation's), a node without the
+/// record quarantines its first generation, one with it does not.
+#[test]
+fn a_fresh_node_without_the_first_start_record_stays_correct_and_waits() {
+    let (mut settled, mut fresh) = (0, 0);
+    for seed in [156u64, 159, 728] {
+        let quiet = |first_start_unsettled| SimConfig {
+            faults: Vec::new(),
+            first_start_unsettled,
+            ..sticky_holder_restarts_config()
+        };
+        let a = run_seed(seed, quiet(false))
+            .unwrap_or_else(|e| panic!("sticky-holder-restarts seed {seed}: {e}"));
+        let b = run_seed(seed, quiet(true))
+            .unwrap_or_else(|e| panic!("fresh node without the record, seed {seed}: {e}"));
+        settled += a.quarantine_core[0];
+        fresh += b.quarantine_core[0];
+        // And with the crash: no stale read either way.
+        run_seed(seed, sticky_holder_fresh_config()).unwrap_or_else(|e| {
+            panic!(
+                "sticky-holder-fresh seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=sticky-holder-fresh"
+            )
+        });
+    }
+    assert!(
+        fresh > settled,
+        "a fresh node without the record quarantined no more ({fresh} <= {settled})"
+    );
 }
 
 /// The oracle's negative control: with `Config::restart_skips_write_quarantine`

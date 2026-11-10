@@ -587,6 +587,19 @@ impl ReadDelegations {
         }
     }
 
+    /// ADR-46: the holder of a stream restarted and voids the read
+    /// delegations its previous process granted. The held ones of `epoch`
+    /// are dropped, and the recall generation is bumped so that an install
+    /// racing this call (a reply of the dead process still on its way, for
+    /// a read sent before) fails. Unlike [`Self::void_gen_epoch`] the epoch
+    /// is not remembered: the restarted holder grants under the same one
+    /// afterwards, and those grants are good.
+    pub fn void_restart(&self, epoch: u64) {
+        let mut g = self.inner.lock().unwrap();
+        g.held.retain(|_, h| h.epoch != epoch);
+        g.recall_gen += 1;
+    }
+
     pub fn held_count(&self) -> usize {
         self.inner.lock().unwrap().held.len()
     }
@@ -674,6 +687,18 @@ pub(crate) const KV_DELEG_READ_GRANT_HORIZON: &str = "deleg_read_grant_horizon_m
 /// The value of [`KV_DELEG_READ_GRANT_HORIZON`] that says every grant made
 /// before it was written has passed.
 pub(crate) const DELEG_HORIZON_NONE: &str = "none";
+
+/// What [`crate::store::Meta::takeover_floor_mark`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorMark {
+    /// No mark: no fast claim of this node is waiting for its floor.
+    None,
+    /// The epoch of a claim CAS that is to arm a floor.
+    Epoch(u64),
+    /// A mark is there (or may be) and cannot be read: the floor may be
+    /// owed.
+    Unreadable,
+}
 
 /// What [`crate::store::Meta::load_deleg_grant_quarantine`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -825,7 +850,9 @@ impl crate::store::Meta {
             // What is stored, or on its way: another writer may have moved
             // it since `known` was read.
             let stored = (*written).max(self.known_horizon(key));
-            let value = if until <= stored {
+            let unverified = self.horizon_unverified[Self::horizon_index(key)]
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let value = if until <= stored && !unverified {
                 stored
             } else {
                 // Round up so continuous granting writes about once a second.
@@ -847,6 +874,8 @@ impl crate::store::Meta {
                     key,
                     &crate::store::horizon::format_stamp(&now.stamp_of_wait(value)),
                 )?;
+                self.horizon_unverified[Self::horizon_index(key)]
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
                 value
             };
             *written = value;
@@ -874,13 +903,31 @@ impl crate::store::Meta {
 
     /// The writer lock of `key` ([`Meta::horizon_written`]).
     fn horizon_writer(&self, key: &str) -> &std::sync::Mutex<WaitMs> {
-        &self.horizon_written[match key {
+        &self.horizon_written[Self::horizon_index(key)]
+    }
+
+    fn horizon_index(key: &str) -> usize {
+        match key {
             KV_READ_GRANT_HORIZON => 0,
             KV_LOCK_GRANT_HORIZON => 1,
             KV_TAKEOVER_FLOOR => 2,
             KV_DELEG_READ_GRANT_HORIZON => 3,
             _ => unreachable!("not a horizon key: {key}"),
-        }]
+        }
+    }
+
+    /// The stored value of `key` could not be read at start: the caller
+    /// waits `fallback` instead. Nothing the key could say is known, so no
+    /// later write may store less than `fallback` (a floor armed during the
+    /// fallback and written lower would, after a second crash, be waited
+    /// out short of what the unreadable value required): `written` takes
+    /// `fallback` and the next write stores at least that
+    /// ([`Self::note_horizon`]).
+    fn horizon_unreadable(&self, key: &'static str, fallback: WaitMs) {
+        let mut written = self.horizon_writer(key).lock().unwrap();
+        *written = (*written).max(fallback);
+        self.horizon_unverified[Self::horizon_index(key)]
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Persist that this tenure's takeover floor ends at `until` (on this
@@ -906,6 +953,8 @@ impl crate::store::Meta {
         let mut written = self.horizon_writer(KV_TAKEOVER_FLOOR).lock().unwrap();
         self.horizon_wait.lock().unwrap().remove(KV_TAKEOVER_FLOOR);
         *written = WaitMs(0);
+        self.horizon_unverified[Self::horizon_index(KV_TAKEOVER_FLOOR)]
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.kv_del(KV_TAKEOVER_FLOOR)
     }
 
@@ -918,10 +967,35 @@ impl crate::store::Meta {
     }
 
     /// The epoch [`Self::set_takeover_floor_pending`] named, if its mark is
-    /// still there (a value that does not start with a number is none).
+    /// still there and readable (see [`Self::takeover_floor_mark`]).
     pub fn takeover_floor_pending(&self) -> Option<u64> {
-        let v = self.kv_get(KV_TAKEOVER_FLOOR_PENDING).ok().flatten()?;
-        v.split_whitespace().next()?.parse().ok()
+        match self.takeover_floor_mark() {
+            FloorMark::Epoch(e) => Some(e),
+            FloorMark::None | FloorMark::Unreadable => None,
+        }
+    }
+
+    /// The claim mark as a restart must read it: the epoch it names, none,
+    /// or **unreadable** (the read failed, or the value does not start with
+    /// a number). An unreadable mark may be the mark of a claim whose floor
+    /// is owed, so the caller treats it as one (fail closed), never as no
+    /// mark.
+    pub fn takeover_floor_mark(&self) -> FloorMark {
+        let v = match self.kv_get(KV_TAKEOVER_FLOOR_PENDING) {
+            Ok(Some(v)) => v,
+            Ok(None) => return FloorMark::None,
+            Err(error) => {
+                tracing::warn!(%error, "the takeover floor's claim mark could not be read");
+                return FloorMark::Unreadable;
+            }
+        };
+        match v.split_whitespace().next().and_then(|t| t.parse().ok()) {
+            Some(e) => FloorMark::Epoch(e),
+            None => {
+                tracing::warn!(value = v, "the takeover floor's claim mark is not an epoch");
+                FloorMark::Unreadable
+            }
+        }
     }
 
     /// The floor's horizons are durable (or the CAS did not arm one): the
@@ -958,7 +1032,7 @@ impl crate::store::Meta {
 
     /// The stored value of a horizon key. A read error is the caller's to
     /// treat as "unknown", never as "nothing granted".
-    fn read_horizon_value(&self, key: &str) -> Result<Option<String>, crate::MetaError> {
+    pub(crate) fn read_horizon_value(&self, key: &str) -> Result<Option<String>, crate::MetaError> {
         #[cfg(any(test, feature = "test-util"))]
         if horizon_fault::take_read() {
             return Err(crate::MetaError::Io(std::io::Error::other(
@@ -981,7 +1055,9 @@ impl crate::store::Meta {
                     %error, key,
                     "a persisted horizon could not be read; waiting its default span"
                 );
-                return Some(now.wait.plus(default_span_ms.max(0) as u64));
+                let fallback = now.wait.plus(default_span_ms.max(0) as u64);
+                self.horizon_unreadable(key, fallback);
+                return Some(fallback);
             }
         };
         let stamp = crate::store::horizon::parse_stamp(&stored, default_span_ms);
@@ -1010,6 +1086,10 @@ impl crate::store::Meta {
                 tracing::warn!(
                     %error,
                     "the delegate read-grant horizon could not be read"
+                );
+                self.horizon_unreadable(
+                    KV_DELEG_READ_GRANT_HORIZON,
+                    now.wait.plus(default_span_ms.max(0) as u64),
                 );
                 return DelegHorizon::Unknown;
             }
@@ -1099,6 +1179,8 @@ impl crate::store::Meta {
                 }
                 self.horizon_wait.lock().unwrap().remove(key);
                 *written = WaitMs(0);
+                self.horizon_unverified[Self::horizon_index(key)]
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
                 cleared = true;
             }
         }
@@ -1739,6 +1821,129 @@ mod boot_stamped_horizon_tests {
         assert_eq!(
             meta.load_grant_quarantine(now, READ_SPAN),
             Some(WaitMs(5_000 + READ_SPAN))
+        );
+    }
+
+    /// The text of `key`'s stored horizon on the wait clock of `now`.
+    fn stored_until(meta: &Meta, key: &str, now: Now, default_span: i64) -> WaitMs {
+        let v = meta.kv_get(key).unwrap().expect("nothing stored");
+        now.wait_of_stamp(&crate::store::horizon::parse_stamp(&v, default_span))
+            .expect("a passed stamp")
+    }
+
+    /// Expectation (fail-before: the next write stored a lower value than the
+    /// fallback the unreadable one was waited out as): after a read error at
+    /// start, a write of a horizon key stores at least the fallback, for the
+    /// read, lock, floor and delegate keys, so a second crash does not
+    /// under-wait what the unreadable value may have said.
+    #[test]
+    fn a_write_after_an_unreadable_horizon_never_stores_less_than_the_fallback() {
+        let now = at(7, 100_000, 5_000, WALL);
+        for key in [
+            KV_READ_GRANT_HORIZON,
+            KV_LOCK_GRANT_HORIZON,
+            KV_TAKEOVER_FLOOR,
+            KV_DELEG_READ_GRANT_HORIZON,
+        ] {
+            let meta = Meta::open_in_memory().unwrap();
+            meta.kv_set(
+                key,
+                &crate::store::horizon::format_stamp(&now.stamp_of_wait(WaitMs(40_000))),
+            )
+            .unwrap();
+            fail_horizon_reads_on_this_thread_for_tests(1);
+            let fallback = WaitMs(5_000 + 10_000);
+            match key {
+                KV_READ_GRANT_HORIZON => {
+                    assert_eq!(meta.load_grant_quarantine(now, 10_000), Some(fallback))
+                }
+                KV_LOCK_GRANT_HORIZON => {
+                    assert_eq!(meta.load_lock_quarantine(now, 10_000), Some(fallback))
+                }
+                KV_TAKEOVER_FLOOR => {
+                    assert_eq!(meta.load_takeover_floor(now, 10_000), Some(fallback))
+                }
+                _ => assert_eq!(
+                    meta.load_deleg_grant_quarantine(now, 10_000),
+                    DelegHorizon::Unknown
+                ),
+            }
+            // A grant (or a floor) below the fallback.
+            let low = WaitMs(6_000);
+            match key {
+                KV_READ_GRANT_HORIZON => meta.note_grant_horizon(low, now).map(|_| ()),
+                KV_LOCK_GRANT_HORIZON => meta.note_lock_grant_horizon(low, now).map(|_| ()),
+                KV_TAKEOVER_FLOOR => meta.note_takeover_floor(low, now),
+                _ => meta.note_deleg_grant_horizon(low, now).map(|_| ()),
+            }
+            .unwrap();
+            assert!(
+                stored_until(&meta, key, now, 10_000) >= fallback,
+                "{key}: stored {:?}",
+                meta.kv_get(key).unwrap()
+            );
+        }
+    }
+
+    /// Expectation (fail-before: an unreadable promise was "none issued"): a
+    /// promise that cannot be read holds the join gate for the default span,
+    /// and the next promise stores at least that.
+    #[test]
+    fn an_unreadable_promise_holds_the_join_gate_and_is_not_lowered() {
+        let meta = Meta::open_in_memory().unwrap();
+        let now = at(7, 100_000, 5_000, WALL);
+        // A promise that ended at wait 4 000: the gate would be open.
+        let mut stamp = at(7, 99_000, 4_000, WALL - 1_000).stamp_of_wait(WaitMs(4_000));
+        stamp.wall = Ms(WALL - 1_000);
+        meta.kv_set(
+            "epoch_promise_issued_ms",
+            &crate::store::horizon::format_stamp(&stamp),
+        )
+        .unwrap();
+        fail_horizon_reads_on_this_thread_for_tests(1);
+        assert_eq!(meta.load_promise_issued(now, 60_000), Some(WaitMs(65_000)));
+        assert!(!meta.promise_join_begin(now).unwrap(), "the gate opened");
+        assert!(meta.promise_issue(1_000, now).unwrap());
+        let v = meta.kv_get("epoch_promise_issued_ms").unwrap().unwrap();
+        let end = now
+            .wait_of_stamp(&crate::store::horizon::parse_stamp(&v, 60_000))
+            .unwrap();
+        assert!(end >= WaitMs(65_000), "{v}: {end:?}");
+        assert!(!meta.promise_join_begin(now).unwrap(), "the gate opened");
+    }
+
+    /// Expectation (fail-before: a mark that cannot be read was "no mark"): a
+    /// claim mark that is unreadable is reported as such, an absent one as
+    /// none, and a readable one as its epoch.
+    #[test]
+    fn an_unreadable_claim_mark_is_not_no_mark() {
+        let meta = Meta::open_in_memory().unwrap();
+        assert_eq!(meta.takeover_floor_mark(), FloorMark::None);
+        meta.set_takeover_floor_pending(7).unwrap();
+        assert_eq!(meta.takeover_floor_mark(), FloorMark::Epoch(7));
+        meta.kv_set(KV_TAKEOVER_FLOOR_PENDING, "garbage").unwrap();
+        assert_eq!(meta.takeover_floor_mark(), FloorMark::Unreadable);
+    }
+
+    /// Expectation: a delegate stamp carries its own span, so a restart under
+    /// a shorter configured TTL still waits the span the previous process
+    /// granted for (the default only stands in for an absent or corrupt
+    /// value, which has no span to read).
+    #[test]
+    fn a_stamp_written_under_a_longer_ttl_is_waited_out_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let meta = Meta::open(dir.path()).unwrap();
+            let then = at(7, 100_000, 5_000, WALL);
+            meta.note_deleg_grant_horizon(WaitMs(65_000), then).unwrap();
+        }
+        let meta = Meta::open(dir.path()).unwrap();
+        let now = at(8, 3_000, 50, WALL + 1_000);
+        // The span is 61 000 (the grant's 60 000 and the second); this
+        // process's default is 7 500.
+        assert_eq!(
+            meta.load_deleg_grant_quarantine(now, READ_SPAN),
+            DelegHorizon::Until(WaitMs(50 + 61_000))
         );
     }
 

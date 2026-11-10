@@ -1691,6 +1691,7 @@ pub trait PeerService: Send + Sync + 'static {
         _root: u64,
         req_id: u64,
         _gen: u64,
+        _restart: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move { Payload::ReadRecalled { req_id } })
     }

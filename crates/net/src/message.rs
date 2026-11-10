@@ -555,10 +555,16 @@ pub enum Payload {
     /// Plan 46 M1.3 step 13: the root abandons stream `gen`: the reader stops
     /// honouring every read delegation that stream's holder granted it,
     /// refuses any later one, then answers [`Payload::ReadRecalled`].
+    ///
+    /// `restart`: the sender is the stream's holder, restarted, and voids
+    /// what its previous process granted (ADR-46): the reader drops the
+    /// held ones and fails the installs racing this message, but a later
+    /// grant of the same stream is fine.
     ReadVoidGen {
         root: u64,
         req_id: u64,
         gen: u64,
+        restart: bool,
     },
     /// Plan 30 §M9: the holder streams whole journal transactions to a
     /// backup (`constellation_authority`'s `PeerMsg::BackupAppend`).

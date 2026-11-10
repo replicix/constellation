@@ -51,7 +51,7 @@ pub use core::{
 pub use event::{
     AbandonTarget, AheadGrants, Carrier, CasFailure, Control, Event, LeaseKey, LockOutcome,
     LockRenewEntry, LockRenewResult, LockTestOutcome, PeerLink, PeerMsg, Policy, ReadAhead,
-    ReadGrantMsg, ReadIndexOutcome, S3Failure, S3Result, UploadResult,
+    ReadGrantMsg, ReadIndexOutcome, S3Failure, S3Result, UploadResult, VoidScope,
 };
 pub use ids::{Epoch, HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 pub use replica::Replica;

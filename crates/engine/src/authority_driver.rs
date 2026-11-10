@@ -33,7 +33,7 @@ use constellation_authority::{
     Action, CasFailure, ClientReply, Config, Control, Core, EpochState, Event, HonourMs, InboxView,
     LockAnswer, LockOutcome, LockRenewResult, LockTestAnswer, LockTestOutcome, NodeId, Now, OpId,
     PeerLink, PeerMsg, Policy, ReadAnswer, ReadGrantMsg, ReadIndexOutcome, S3Failure, S3Op,
-    S3Result, ShipState, Stats, TimerId, TimerKind, UploadResult, WaitMs,
+    S3Result, ShipState, Stats, TimerId, TimerKind, UploadResult, VoidScope, WaitMs,
 };
 use constellation_fs_core::cache::DiskCache;
 use constellation_meta::locks::GrantId;
@@ -3947,12 +3947,25 @@ impl Driver {
                     msg: PeerMsg::DelegationRecall { req, ino, grant },
                 }))
             }
-            SyncRequest::PeerReadVoid { root, gen, reply } => {
+            SyncRequest::PeerReadVoid {
+                root,
+                gen,
+                restart,
+                reply,
+            } => {
                 let req = self.control_id();
                 self.recall_replies.insert(req, reply);
                 Some(Internal::Event(Event::Peer {
                     from: root,
-                    msg: PeerMsg::DelegReadVoid { req, gen },
+                    msg: PeerMsg::DelegReadVoid {
+                        req,
+                        gen,
+                        scope: if restart {
+                            VoidScope::Restart
+                        } else {
+                            VoidScope::Ended
+                        },
+                    },
                 }))
             }
             SyncRequest::PeerBackupAppend {
@@ -5440,7 +5453,7 @@ impl Driver {
                     }
                 });
             }
-            PeerMsg::DelegReadVoid { req, gen } => {
+            PeerMsg::DelegReadVoid { req, gen, scope } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
                 let root = self.node_id;
@@ -5455,6 +5468,7 @@ impl Driver {
                         root,
                         req_id: req.0,
                         gen,
+                        restart: scope == VoidScope::Restart,
                     };
                     if denied {
                         let _ = tx.send(Internal::Event(Event::PeerFailed {

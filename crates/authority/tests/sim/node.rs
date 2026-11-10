@@ -453,6 +453,8 @@ pub struct NodeEnv {
     pub ttl_reclaims_sticky: bool,
     /// See `SimConfig::restart_skips_write_quarantine`.
     pub restart_skips_write_quarantine: bool,
+    /// See `SimConfig::first_start_unsettled`.
+    pub first_start_unsettled: bool,
     /// See `SimConfig::holder_releases_before_drain`.
     pub holder_releases_before_drain: bool,
     /// See `SimConfig::refuse_forwarded_designation_ops`.
@@ -557,11 +559,11 @@ impl NodeHandle {
         // One clock for the incarnation: the driver, the meta's token check,
         // the beat and lane threads and the handle all read it.
         let clock = env.clock_of(id, incarnation);
-        // A node's first start has granted nothing: record it, as a node
-        // that has run for a while would have (an absent delegate horizon is
-        // a full span, ADR-46). A disk wiped at a restart is not a first
-        // start: its key stays absent.
-        if incarnation == 1 {
+        // A node's first start (a new mount: the daemon claims a new node
+        // id for it) has granted nothing: record it, as the daemon does
+        // (`first_mount`). With `first_start_unsettled` the key stays
+        // absent, a full span (ADR-46).
+        if incarnation == 1 && !env.first_start_unsettled {
             meta.settle_deleg_grant_horizon(clock.now())
                 .expect("delegate horizon");
         }

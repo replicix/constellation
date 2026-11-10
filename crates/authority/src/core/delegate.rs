@@ -543,6 +543,13 @@ pub(crate) struct RestartQuarantine {
     /// The timer that ends it (`Timer::DelegRestartQuarantine`); `None`
     /// once it has fired.
     pub timer: Option<TimerId>,
+    /// The void requests of the early exit not answered yet: req -> reader.
+    pub asked: BTreeMap<OpId, NodeId>,
+    /// The void round went out (every audience node was asked).
+    pub round_sent: bool,
+    /// Every node answered the void: no reader honours a grant of the
+    /// previous process, and the quarantine is over before `until`.
+    pub voided: bool,
 }
 
 /// Plan 46 M1.2 step 10: a release this delegate journaled (or could not,
@@ -1090,6 +1097,9 @@ pub(crate) struct AbandonWait {
     /// lost lease, means the root was deposed and the command is refused;
     /// a lease that is merely not usable for a moment is waited out.
     pub epoch: Option<crate::Epoch>,
+    /// The peers were not known when the void went out (no roster or no
+    /// peer snapshot yet): nothing was asked, and the deadline decides.
+    pub audience_unknown: bool,
 }
 
 /// How soon an abandon whose deadline passed looks again when the root is
@@ -1269,9 +1279,10 @@ pub(crate) struct DelegationState {
     /// may last to, loaded at start (`Core::deleg_restart_start`); `None`:
     /// nothing is left of them.
     pub restart_horizon: Option<WaitMs>,
-    /// The persisted horizon said nothing was granted: the first install of
-    /// this process records that (`settle_deleg_grant_horizon`) once.
-    pub restart_horizon_was_none: bool,
+    /// The process-level timer at `restart_horizon` (a
+    /// `Timer::DelegRestartQuarantine(0)`): it records that the previous
+    /// process's grants are gone whether or not a generation was installed.
+    pub restart_settle_timer: Option<TimerId>,
     /// The nodes leaving (this node is their root): nothing is granted to
     /// them from the moment their leave starts, so no grant is made between
     /// the end of their grants and the retirement of their registry entry.
@@ -1500,7 +1511,10 @@ impl Core {
                     // A generation inside its restart quarantine is not
                     // admitted by the engine's fast path: the op goes to
                     // the core and parks.
-                    d.stopped || d.restart_q.as_ref().is_some_and(|q| q.timer.is_some()),
+                    d.stopped
+                        || d.restart_q
+                            .as_ref()
+                            .is_some_and(|q| q.timer.is_some() && !q.voided),
                     d.streamed_through,
                     d.executed,
                     d.parked.len(),
@@ -2022,15 +2036,11 @@ impl Core {
                     RestartQuarantine {
                         until,
                         timer: Some(timer),
+                        asked: BTreeMap::new(),
+                        round_sent: false,
+                        voided: false,
                     }
                 });
-            if self.dl.restart_horizon_was_none {
-                // Nothing is left of the previous process's grants: record
-                // it, so that a crash before this process grants anything
-                // finds "none" rather than an absent key. Once.
-                self.dl.restart_horizon_was_none = false;
-                replica.settle_deleg_grant_horizon(now);
-            }
             self.dl.mine.insert(
                 d.gen,
                 DelegateState {
@@ -4914,6 +4924,7 @@ impl Core {
         self.deleg_leave_progress(now, replica, out);
         self.sticky_release_progress(now, replica, out);
         self.abandon_progress(now, replica, out);
+        self.deleg_restart_void_round(now, replica, out);
         // Plan 43 C2e (D8): a strict member's sealed tail that the drain
         // stopped short of (a dependency the log brings, a root that could
         // not end the recall) is drained again; the generation ends once the
@@ -7941,7 +7952,7 @@ impl Core {
                 .mine
                 .get(&gen)
                 .and_then(|d| d.restart_q.as_ref())
-                .filter(|q| q.timer.is_some() && q.until > now.wait)
+                .filter(|q| q.timer.is_some() && !q.voided && q.until > now.wait)
             {
                 need.quarantine_until =
                     Some(need.quarantine_until.map_or(q.until, |u| u.max(q.until)));
@@ -8051,12 +8062,24 @@ impl Core {
 
     /// At start: where the read grants the previous process's delegates made
     /// may last to (ADR-46). A missing or unreadable key is a full span.
-    pub(crate) fn deleg_restart_start(&mut self, now: Now, replica: &dyn Replica) {
+    ///
+    /// The key is settled (`none`) as soon as nothing of the previous
+    /// process's grants is left, installed generation or not: at once when
+    /// the load found none, from a timer at the horizon otherwise. A node
+    /// that rarely grants would else keep a passed stamp (or no key), and
+    /// its next crash and reboot would pay a full span for grants nobody
+    /// made.
+    pub(crate) fn deleg_restart_start(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         use constellation_meta::readdeleg::DelegHorizon;
         let span = self.cfg.read_horizon_span_ms();
         let horizon = match replica.load_deleg_grant_quarantine(now, span) {
             DelegHorizon::None => {
-                self.dl.restart_horizon_was_none = true;
+                replica.settle_deleg_grant_horizon(now);
                 None
             }
             DelegHorizon::Until(t) => Some(t).filter(|t| *t > now.wait),
@@ -8071,6 +8094,10 @@ impl Core {
             }
         };
         self.dl.restart_horizon = horizon;
+        if let Some(t) = horizon {
+            let id = self.set_timer_wait(t, Timer::DelegRestartQuarantine(0), out);
+            self.dl.restart_settle_timer = Some(id);
+        }
     }
 
     /// Whether `gen` is inside its restart quarantine: installed while the
@@ -8081,11 +8108,146 @@ impl Core {
             .mine
             .get(&gen)
             .and_then(|d| d.restart_q.as_ref())
-            .is_some_and(|q| now.wait < q.until)
+            .is_some_and(|q| !q.voided && now.wait < q.until)
     }
 
-    /// The restart quarantine's horizon has passed: record that the
-    /// previous process's grants are gone, and run what it parked.
+    /// The nodes that may hold a read delegation of this node's delegates:
+    /// the roster and the links without this node, once both a roster and a
+    /// peer snapshot have arrived (until then the set is not known, and an
+    /// empty one would read as "nobody holds any").
+    pub(crate) fn void_audience(&self) -> Option<BTreeSet<NodeId>> {
+        if !(self.roster_seen && self.peers_seen) {
+            return None;
+        }
+        let mut peers: BTreeSet<NodeId> = self.roster.iter().copied().collect();
+        peers.extend(self.links.keys().copied());
+        peers.remove(&self.cfg.node_id);
+        Some(peers)
+    }
+
+    /// The early exit of the restart quarantine (ADR-46, D6): every
+    /// quarantined generation asks every node that may hold a read
+    /// delegation of its previous process to drop them
+    /// ([`PeerMsg::DelegReadVoid`], scope `Restart`). Once all answered, no
+    /// reader honours a grant of the dead process, and the quarantine is
+    /// over before its horizon. A node that does not answer (down, cut off)
+    /// leaves the horizon to decide, as before. Runs at install and at the
+    /// first event that completes the audience; a generation is asked once.
+    pub(crate) fn deleg_restart_void_round(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if !self.cfg.read_delegations {
+            return;
+        }
+        let todo: Vec<u64> = self
+            .dl
+            .mine
+            .iter()
+            .filter(|(g, d)| {
+                d.restart_q
+                    .as_ref()
+                    .is_some_and(|q| !q.round_sent && !q.voided)
+                    && self.deleg_restart_quarantined(now, **g)
+            })
+            .map(|(g, _)| *g)
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        let Some(audience) = self.void_audience() else {
+            return;
+        };
+        for gen in todo {
+            let mut asked = BTreeMap::new();
+            for p in &audience {
+                let req = self.op_id();
+                asked.insert(req, *p);
+                out.push(Action::Send {
+                    to: *p,
+                    msg: PeerMsg::DelegReadVoid {
+                        req,
+                        gen,
+                        scope: crate::event::VoidScope::Restart,
+                    },
+                });
+            }
+            let done = asked.is_empty();
+            if let Some(q) = self
+                .dl
+                .mine
+                .get_mut(&gen)
+                .and_then(|d| d.restart_q.as_mut())
+            {
+                q.asked = asked;
+                q.round_sent = true;
+            }
+            if done {
+                self.deleg_restart_voided(now, gen, replica, out);
+            }
+        }
+    }
+
+    /// `req` was a void request of the early exit: it is answered. Whether
+    /// it was.
+    pub(crate) fn deleg_restart_void_acked(&mut self, req: OpId) -> bool {
+        let Some(gen) = self.dl.mine.iter_mut().find_map(|(g, d)| {
+            d.restart_q
+                .as_mut()
+                .and_then(|q| q.asked.remove(&req))
+                .map(|_| *g)
+        }) else {
+            return false;
+        };
+        let all = self
+            .dl
+            .mine
+            .get(&gen)
+            .and_then(|d| d.restart_q.as_ref())
+            .is_some_and(|q| q.round_sent && q.asked.is_empty());
+        if all {
+            self.deleg_restart_voided_flag(gen);
+        }
+        true
+    }
+
+    fn deleg_restart_voided_flag(&mut self, gen: u64) {
+        if let Some(q) = self
+            .dl
+            .mine
+            .get_mut(&gen)
+            .and_then(|d| d.restart_q.as_mut())
+            .filter(|q| !q.voided)
+        {
+            q.voided = true;
+            self.stats.deleg_restart_q_voided += 1;
+            tracing::info!(
+                node = self.cfg.node_id,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
+                "every node dropped the read delegations this node's previous process \
+                 granted; its writes run"
+            );
+        }
+    }
+
+    fn deleg_restart_voided(
+        &mut self,
+        now: Now,
+        gen: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.deleg_restart_voided_flag(gen);
+        self.complete_ready(now, replica, out);
+    }
+
+    /// A restart quarantine timer fired. `gen` 0 is the process-level one:
+    /// it settles the persisted key at the horizon. Otherwise the generation's
+    /// quarantine is over and what it parked runs. A timer that fires before
+    /// its time (the event carries a stale clock, M1.3 step 11) arms itself
+    /// again: the generation must not stay stopped for the rest of its life.
     pub(crate) fn on_deleg_restart_quarantine(
         &mut self,
         now: Now,
@@ -8093,21 +8255,54 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        if gen == 0 {
+            self.dl.restart_settle_timer = None;
+            if let Some(h) = self.dl.restart_horizon {
+                if now.wait < h {
+                    let id = self.set_timer_wait(h, Timer::DelegRestartQuarantine(0), out);
+                    self.dl.restart_settle_timer = Some(id);
+                } else {
+                    replica.settle_deleg_grant_horizon(now);
+                }
+            }
+            return;
+        }
+        let early = self
+            .dl
+            .mine
+            .get(&gen)
+            .and_then(|d| d.restart_q.as_ref())
+            .filter(|q| q.timer.is_some() && !q.voided && now.wait < q.until)
+            .map(|q| q.until);
+        if let Some(until) = early {
+            let id = self.set_timer_wait(until, Timer::DelegRestartQuarantine(gen), out);
+            if let Some(q) = self
+                .dl
+                .mine
+                .get_mut(&gen)
+                .and_then(|d| d.restart_q.as_mut())
+            {
+                q.timer = Some(id);
+            }
+            return;
+        }
         if let Some(q) = self
             .dl
             .mine
             .get_mut(&gen)
             .and_then(|d| d.restart_q.as_mut())
-            .filter(|q| now.wait >= q.until)
+            .filter(|q| q.timer.is_some() && now.wait >= q.until)
         {
             q.timer = None;
-            self.stats.deleg_restart_q_waited_out += 1;
-            tracing::info!(
-                node = self.cfg.node_id,
-                gen = %constellation_meta::delegation::GenLabel::of(gen),
-                "the read delegations this node's previous process granted have expired; \
-                 its writes run"
-            );
+            if !q.voided {
+                self.stats.deleg_restart_q_waited_out += 1;
+                tracing::info!(
+                    node = self.cfg.node_id,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
+                    "the read delegations this node's previous process granted have expired; \
+                     its writes run"
+                );
+            }
         }
         if self.dl.restart_horizon.is_some_and(|h| now.wait >= h) {
             replica.settle_deleg_grant_horizon(now);
@@ -10000,13 +10195,17 @@ impl Core {
             forced: plan.forced.clone(),
             lines,
             epoch: self.lease.epoch(),
+            audience_unknown: false,
         };
         let waits = self.cfg.read_delegations && !self.cfg.abandon_skips_read_recall;
         if waits {
             // This node's own copy of the grants, then every other node's.
-            let mut peers: BTreeSet<NodeId> = self.roster.iter().copied().collect();
-            peers.extend(self.links.keys().copied());
-            peers.remove(&me);
+            // Until the directory has shown the peers, nobody can be asked
+            // and the deadline decides (an empty set would read as "every
+            // reader answered").
+            let known = self.void_audience();
+            w.audience_unknown = known.is_none();
+            let peers = known.unwrap_or_default();
             for gen in &plan.streams {
                 replica
                     .read_delegations()
@@ -10018,7 +10217,11 @@ impl Core {
                     *w.sent.entry(*gen).or_default() += 1;
                     out.push(Action::Send {
                         to: *p,
-                        msg: PeerMsg::DelegReadVoid { req, gen: *gen },
+                        msg: PeerMsg::DelegReadVoid {
+                            req,
+                            gen: *gen,
+                            scope: crate::event::VoidScope::Ended,
+                        },
                     });
                 }
             }
@@ -10135,7 +10338,8 @@ impl Core {
                     break;
                 }
                 let pending = w.asked.values().filter(|(_, g)| *g == gen).count();
-                if pending > 0 && now.wait < w.deadline {
+                let blind = w.audience_unknown;
+                if (pending > 0 || blind) && now.wait < w.deadline {
                     continue;
                 }
                 // The wait for a usable root is bounded: once the lease this
@@ -10154,7 +10358,7 @@ impl Core {
                 if !self.root_ends_recall(now, gen) {
                     continue;
                 }
-                if pending > 0 {
+                if pending > 0 || blind {
                     self.stats.deleg_abandon_reads_expired += 1;
                 } else {
                     self.stats.deleg_abandon_reads_recalled += 1;
