@@ -140,7 +140,13 @@ impl Core {
             let dirs = Core::dirs_of_keys(&keys_of_op(&op), replica);
             self.place_note(from, dirs);
         }
-        if settle && req != OpId(0) && self.drop_unexecuted_park(rid, out) {
+        // (A settle the delegate fence turns back leaves the matching
+        // attempt's park alone: it is not the attempt's replacement.)
+        if settle
+            && req != OpId(0)
+            && !self.fenced_at_delegate(from, &op, fence, replica)
+            && self.drop_unexecuted_park(rid, out)
+        {
             self.stats.settle_dropped_parks += 1;
         }
         // Plan 30 §M8: a retry of an op whose reply waits for recalls

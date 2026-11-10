@@ -1467,7 +1467,9 @@ impl Core {
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
-        c.sent_to_delegate |= to_delegate;
+        // (A send routed by a generation is to a delegate, whatever the
+        // table here lists.)
+        c.sent_to_delegate |= to_delegate || routed_gen != 0;
         // ADR-47: the rid is touched by the generation this send is routed
         // by from here on, whether the send leaves now or after the batch
         // withdrawal below; the value travels with it.

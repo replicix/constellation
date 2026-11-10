@@ -2753,6 +2753,9 @@ impl Core {
         let Some(gen) = self.my_generation_for(&keys, replica) else {
             return false;
         };
+        if self.fence_forward(from, req, gen, fence, out) {
+            return true;
+        }
         // ADR-47: this node's own op, offered to its generation, is touched
         // by it from here on (parked or executed), before anything else can
         // send the rid on.
@@ -2850,6 +2853,64 @@ impl Core {
             out,
         );
         true
+    }
+
+    /// ADR-47, the delegate fence: whether a forward from a peer is
+    /// answered `Fenced` instead of being run or parked under `gen`, the
+    /// generation this node holds its keys under, because it was not routed
+    /// by `gen`. Nothing is parked or journaled. The one place the rule is
+    /// decided; it runs before every other gate of `delegate_try_execute`.
+    /// Any node, the root and a placed generation included.
+    fn fence_forward(
+        &mut self,
+        from: NodeId,
+        req: Option<OpId>,
+        gen: u64,
+        fence: super::holder::Fence,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        if !self.forward_is_fenced(from, gen, fence) {
+            return false;
+        }
+        self.stats.deleg_fenced_forwards += 1;
+        if let Some(req) = req.filter(|r| *r != OpId(0)) {
+            out.push(Action::Send {
+                to: from,
+                msg: PeerMsg::MutateReply {
+                    req,
+                    outcome: MutateOutcome::Fenced { gen },
+                    base: None,
+                    position: Position::ZERO,
+                    gen,
+                    own_chunks: OwnChunks::None,
+                    own_rows: None,
+                    committed: false,
+                },
+            });
+        }
+        true
+    }
+
+    /// Whether `delegate_try_execute` would fence this forward: its keys are
+    /// this node's under a generation the forward was not routed by.
+    pub(crate) fn fenced_at_delegate(
+        &self,
+        from: NodeId,
+        op: &MutateOp,
+        fence: super::holder::Fence,
+        replica: &dyn Replica,
+    ) -> bool {
+        self.cfg.delegation
+            && self
+                .my_generation_for(&super::holder::keys_of_op_in(op, replica), replica)
+                .is_some_and(|gen| self.forward_is_fenced(from, gen, fence))
+    }
+
+    /// Whether a forward from `from` that was routed by `fence.routed_gen`
+    /// does not match `gen`, the generation this node holds its keys under.
+    /// The node's own ops (`from == 0`) are never fenced.
+    fn forward_is_fenced(&self, from: NodeId, gen: u64, fence: super::holder::Fence) -> bool {
+        from != 0 && fence.routed_gen != gen && !self.cfg.fence_accepts_unrouted
     }
 
     /// Phase 2b (M8 under M11): a write this delegate executes must not
