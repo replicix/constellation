@@ -522,6 +522,12 @@ pub struct SimConfig {
     /// on every configuration; `sticky_ends_only_by_holder_or_operator` must
     /// then fail the run.
     pub ttl_reclaims_sticky: bool,
+    /// Negative control (`Config::kept_fetch_skipped`, ADR-51): a takeover
+    /// never collects the kept rows of the tenure it ends.
+    /// `AUTHORITY_SIM_KEPT_FETCH_SKIPPED=1` sets it on every configuration;
+    /// the identity oracle must then fail `flex-tight+identity` seeds 809 and
+    /// 1489.
+    pub kept_fetch_skipped: bool,
     /// Negative control (`Config::restart_skips_write_quarantine`): a
     /// restarted holder executes writes and grants read delegations at once.
     /// `AUTHORITY_SIM_RESTART_SKIPS_WRITE_QUARANTINE=1` sets it on every
@@ -1171,6 +1177,8 @@ impl Default for SimConfig {
             designations: Vec::new(),
             sticky_delegations: Vec::new(),
             ttl_reclaims_sticky: std::env::var_os("AUTHORITY_SIM_TTL_RECLAIMS_STICKY")
+                .is_some_and(|v| v == "1"),
+            kept_fetch_skipped: std::env::var_os("AUTHORITY_SIM_KEPT_FETCH_SKIPPED")
                 .is_some_and(|v| v == "1"),
             restart_skips_write_quarantine: std::env::var_os(
                 "AUTHORITY_SIM_RESTART_SKIPS_WRITE_QUARANTINE",
@@ -4928,6 +4936,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         plant_ungated_fast_path: cfg.plant_ungated_fast_path,
         skip_deleg_dep_wait: cfg.skip_deleg_dep_wait,
         ttl_reclaims_sticky: cfg.ttl_reclaims_sticky,
+        kept_fetch_skipped: cfg.kept_fetch_skipped,
         restart_skips_write_quarantine: cfg.restart_skips_write_quarantine,
         first_start_unsettled: cfg.first_start_unsettled,
         holder_releases_before_drain: cfg.holder_releases_before_drain,

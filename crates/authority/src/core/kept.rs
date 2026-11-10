@@ -1,0 +1,879 @@
+//! ADR-51: a takeover carries every kept row of the tenure it ends.
+//!
+//! An epoch member's `StreamAheadAck` makes its copy of the hold owner's row
+//! committed: the owner answered its client on it. When another node takes
+//! the tenure over (a TTL takeover by promise check, a retirement fence), the
+//! member's copy would be carried only if that member claimed. So every
+//! marker takeover runs one more phase, **after its promise check** and
+//! before its tail to head: [`Core::begin_kept_fetch`] asks the previous
+//! holder and every write-eligible, linked or heard peer for the committed
+//! rows they keep of the tenure's hold streams (`SealTail { kept }`, member
+//! side [`Core::seal_kept_hold`]), sealing those streams at each member, and
+//! completes when
+//!
+//! - **R1:** every node that any answer names as a member of an epoch that
+//!   carried the tenure has answered, and
+//! - **R2:** the previous holder answered (it is a member of every epoch
+//!   carrying its tenure, so its `members` is the whole evidence), or the
+//!   answerers that the roster lists (and this node) number `f + 1`, `f`
+//!   being the promise check's effective slack (an epoch carrying the tenure
+//!   has at least `N - f` members: the M10 intersection argument), or every
+//!   source answered.
+//!
+//! A member that is down makes the claim wait (the rows were acknowledged):
+//! the attempt ends, the ops behind it retry, `waiting_for_group` names the
+//! sources. The operator abandons the rest (`repair abandon --epoch`, the
+//! claim carries what answered and its marker says so) or retires the member.
+//!
+//! The union is merged per epoch, by journal seq and identity, **after** the
+//! claim read the log to head ([`Core::kept_install`]), written as a sealed
+//! backup tail of the tenure, and re-shipped by the takeover gate verbatim,
+//! before the claimant's first write. A lease that names the union
+//! (`InheritedTail::kept`) is collected the same way by a later claimant,
+//! from every member it names.
+
+use super::seal_tail::{FetchedTail, KeptFields, KeptSeal};
+use super::Core;
+use crate::action::{Action, S3Op};
+use crate::event::{PeerMsg, SealRefusal};
+use crate::ids::{Epoch, NodeId, Now, OpId, TimerId};
+use crate::replica::Replica;
+use constellation_meta::{BackupRole, BackupTx};
+use constellation_store_s3::Lease;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// One source's answer about one stream epoch, batch by batch.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct KeptAnswer {
+    pub txs: Vec<BackupTx>,
+    pub through: u64,
+    pub members: Vec<Vec<NodeId>>,
+    pub sealed: Vec<(Epoch, NodeId)>,
+    /// The last batch is in.
+    pub done: bool,
+}
+
+/// A group of rows a claim must carry: the hold streams of one tenure.
+#[derive(Debug, Clone)]
+pub(crate) struct Target {
+    /// The tenure `(holder, lease epoch)`.
+    pub tenure: (NodeId, Epoch),
+    /// The union a lease names (`InheritedTail::kept`): its members and
+    /// `through`. `None`: the previous holder's own tenure.
+    pub union: Option<(Vec<NodeId>, u64)>,
+}
+
+impl Target {
+    /// The stream epochs collected for the tenure: its own.
+    pub(crate) fn epochs(&self) -> Vec<Epoch> {
+        vec![self.tenure.1]
+    }
+
+    /// The epochs a node's answer must cover: the previous holder is asked
+    /// for its own journal of the tenure's epoch only.
+    fn required(&self, ti: usize, node: NodeId) -> Vec<Epoch> {
+        if ti == 0 && node == self.tenure.0 {
+            vec![self.tenure.1]
+        } else {
+            self.epochs()
+        }
+    }
+}
+
+/// One attempt of a claim to collect the kept rows.
+#[derive(Debug)]
+pub(crate) struct KeptFetch {
+    pub prev: Lease,
+    pub targets: Vec<Target>,
+    /// Everyone asked with `kept: true` (not the previous holder, which is
+    /// asked plainly; not this node, not a retired one).
+    pub sources: BTreeSet<NodeId>,
+    /// Requests in flight (a first request or a next batch), by id:
+    /// `(target, node, epoch)`.
+    pub asked: BTreeMap<OpId, (usize, NodeId, Epoch)>,
+    pub answers: BTreeMap<(usize, NodeId, Epoch), KeptAnswer>,
+    /// `f`, from the promise check or a heartbeat read of its own (`None`:
+    /// not known).
+    pub slack: Option<u32>,
+    /// The operator abandoned the sources that have not answered: the fetch
+    /// completes with what answered, once this node's own copy is in.
+    pub abandon: bool,
+    /// `--force`: two sources that kept different transactions at one seq
+    /// are resolved by the longest.
+    pub force: bool,
+    pub timer: Option<TimerId>,
+}
+
+/// A completed fetch awaiting the log read to head and the merge.
+#[derive(Debug)]
+pub(crate) struct KeptUnion {
+    pub prev: Lease,
+    pub targets: Vec<Target>,
+    pub answers: BTreeMap<(usize, NodeId, Epoch), KeptAnswer>,
+    pub partial: bool,
+    pub force: bool,
+}
+
+impl Core {
+    /// Whether a marker takeover of `prev` runs the kept phase. Not for the
+    /// claim of a lease nobody held or that was released (a release follows
+    /// a flush), this node's own lease (its rows are in its journal: the
+    /// hold owner's own re-claim, a restart's re-adoption), the negative
+    /// control, the re-claim of the hold owner that closed the epoch, and a union already installed by an earlier pass of this
+    /// claim (the promise re-check).
+    pub(crate) fn kept_needed(&self, prev: &Lease) -> bool {
+        !self.cfg.kept_fetch_skipped
+            && prev.holder != 0
+            && prev.holder != self.cfg.node_id
+            && !prev.released
+            && !self.owner_reclaims(prev)
+            && !self.bk.kept_ready
+    }
+
+    /// The targets of a claim of `prev`: the hold streams of its own tenure
+    /// (a fence names the tenure it ended), and the union its lease names.
+    fn kept_targets(prev: &Lease) -> Vec<Target> {
+        let mut out = vec![Target {
+            tenure: (prev.holder, prev.retired_tenure().unwrap_or(prev.epoch)),
+            union: None,
+        }];
+        if let Some(t) = prev.inherited_tail.as_ref().filter(|t| t.kept) {
+            out.push(Target {
+                tenure: (t.holder, t.epoch),
+                union: Some((t.members.clone(), t.through)),
+            });
+        }
+        out
+    }
+
+    /// Begin an attempt to collect the kept rows (the promise check passed,
+    /// or none was needed). Ends in the claim's tail to head.
+    pub(crate) fn begin_kept_fetch(
+        &mut self,
+        now: Now,
+        prev: Lease,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let me = self.cfg.node_id;
+        // The roster must be a complete read issued after this node first
+        // saw `prev` at its current key: every member registered before its
+        // epoch formed, and the epoch formed before the lease expired or was
+        // fenced, so such a read lists every member.
+        let seen = match self.lease.observed_since(&prev) {
+            Some(at) => at,
+            None => match self.bk.kept_seen {
+                Some((e, at)) if e == prev.epoch => at,
+                _ => {
+                    self.bk.kept_seen = Some((prev.epoch, now.wait));
+                    now.wait
+                }
+            },
+        };
+        if !self.roster.fresh_since(seen) {
+            out.push(Action::RefreshRoster);
+            self.acquire_retry_hint = Some(now.wait.plus(self.cfg.sync_interval_ms.max(1)));
+            self.end_acquire_attempt(now, replica, out);
+            return;
+        }
+        let targets = Self::kept_targets(&prev);
+        let mut sources: BTreeSet<NodeId> = self.roster.kept_sources(me);
+        for t in &targets {
+            if let Some((members, _)) = &t.union {
+                sources.extend(members.iter().copied());
+            }
+        }
+        sources.retain(|n| *n != me && *n != prev.holder && !prev.retired.contains(n));
+        let abandon = self
+            .bk
+            .abandon
+            .is_some_and(|e| targets.iter().any(|t| t.tenure.1 == e) || e == prev.epoch);
+        let force = std::mem::take(&mut self.bk.kept_force);
+        self.open_group_wait(now, &prev, sources.iter().copied().collect());
+        let tenure_epoch = targets[0].tenure.1;
+        if let Some(w) = self.bk.group_wait.as_mut() {
+            w.kept = Some(tenure_epoch);
+        }
+        let slack = self.pr.check_slack.take();
+        let mut k = KeptFetch {
+            prev: prev.clone(),
+            targets,
+            sources,
+            asked: BTreeMap::new(),
+            answers: BTreeMap::new(),
+            slack,
+            abandon,
+            force,
+            timer: None,
+        };
+        // This node's own copy, answered in place (it seals the streams).
+        let key = prev.renewal_key();
+        for (ti, t) in k.targets.iter().enumerate() {
+            for e in t.epochs() {
+                match self.seal_kept_hold(t.tenure, e, &key, replica) {
+                    KeptSeal::Held {
+                        txs,
+                        through,
+                        members,
+                        sealed,
+                    } => {
+                        k.answers.insert(
+                            (ti, me, e),
+                            KeptAnswer {
+                                txs,
+                                through,
+                                members,
+                                sealed,
+                                done: true,
+                            },
+                        );
+                    }
+                    KeptSeal::Refused(why) => {
+                        match why {
+                            SealRefusal::EpochOpen => self.stats.seal_kept_refused_epoch_open += 1,
+                            SealRefusal::StaleKey => self.stats.seal_kept_refused_stale_key += 1,
+                        }
+                        self.bk.seal_unreadable = false;
+                        self.end_acquire_attempt(now, replica, out);
+                        return;
+                    }
+                    KeptSeal::Unreadable => {
+                        // (This node cannot answer yet; the attempt waits out
+                        // its window and asks again.)
+                        self.bk.seal_unreadable = false;
+                        self.stats.seal_tail_unreadable += 1;
+                    }
+                }
+            }
+        }
+        self.stats.kept_fetches += 1;
+        self.bk.kept = Some(k);
+        // Nothing to ask when this node's own rows already satisfy the rules
+        // (no epoch ever carried the tenure and `f` is known): no round trip.
+        if self.kept_complete() {
+            self.kept_finish(now, replica, out);
+            return;
+        }
+        self.kept_rearm(now, out);
+        self.stats.tail_fetch_attempts += 1;
+        self.tail_fetch_phase();
+        let k = self.bk.kept.as_ref().expect("set above");
+        let mut asks: Vec<(usize, NodeId, Epoch, bool)> = Vec::new();
+        let holder_asked = !prev.retired.contains(&prev.holder);
+        for (ti, t) in k.targets.iter().enumerate() {
+            if ti == 0 && holder_asked {
+                asks.push((ti, prev.holder, t.tenure.1, false));
+            }
+            let nodes: BTreeSet<NodeId> = match &t.union {
+                // The union's members, the previous holder (the claimant that
+                // wrote it) among them.
+                Some((members, _)) => members
+                    .iter()
+                    .copied()
+                    .filter(|n| *n != me && !prev.retired.contains(n))
+                    .collect(),
+                None => k.sources.clone(),
+            };
+            for n in nodes {
+                for e in t.epochs() {
+                    asks.push((ti, n, e, true));
+                }
+            }
+        }
+        let needs_slack = k.slack.is_none() && !self.cfg.kept_fetch_skipped;
+        for (ti, node, e, kept) in asks {
+            self.kept_ask(ti, node, e, kept, 0, out);
+        }
+        if needs_slack {
+            // No promise check ran: one heartbeat read of its own for `f`.
+            self.issue_s3(S3Op::HeartbeatRead, super::S3For::KeptSlack, out);
+        }
+    }
+
+    /// One request of the fetch. `kept`: a member's (sealing); else the
+    /// previous holder's plain seal.
+    fn kept_ask(
+        &mut self,
+        target: usize,
+        node: NodeId,
+        epoch: Epoch,
+        kept: bool,
+        from: u64,
+        out: &mut Vec<Action>,
+    ) {
+        let req = self.op_id();
+        let Some(k) = self.bk.kept.as_mut() else {
+            return;
+        };
+        k.asked.insert(req, (target, node, epoch));
+        let tenure = if kept {
+            k.targets[target].tenure
+        } else {
+            (0, 0)
+        };
+        out.push(Action::Send {
+            to: node,
+            msg: PeerMsg::SealTail {
+                req,
+                epoch,
+                config_version: k.prev.config_version,
+                from,
+                key: k.prev.renewal_key(),
+                kept,
+                tenure,
+            },
+        });
+    }
+
+    /// The heartbeat read of a fetch that ran no promise check: the
+    /// effective slack `f`.
+    pub(crate) fn on_kept_heartbeats(
+        &mut self,
+        now: Now,
+        result: crate::S3Result,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(k) = self.bk.kept.as_mut() else {
+            return;
+        };
+        if let crate::S3Result::Heartbeats(Ok(hb)) = &result {
+            k.slack = Some(constellation_store_s3::heartbeat::effective_slack(
+                self.cfg.epoch_slack,
+                self.roster.write_eligible(),
+                hb,
+            ));
+        }
+        self.kept_progress(now, replica, out);
+    }
+
+    /// A member's (or the previous holder's) batch of a kept fetch. `true`:
+    /// it was one.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn on_kept_sealed_tail(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        req: OpId,
+        epoch: Epoch,
+        (held, empty): (bool, bool),
+        (txs, through, next): (Vec<BackupTx>, u64, Option<u64>),
+        KeptFields {
+            members,
+            sealed,
+            refused,
+        }: KeptFields,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        let Some(k) = self.bk.kept.as_mut() else {
+            return false;
+        };
+        let Some((ti, node, e)) = k.asked.remove(&req) else {
+            return true;
+        };
+        if node != from || epoch != e {
+            // (Not an answer of the asked node about the asked epoch: it
+            // counts for nothing; the window ends the attempt.)
+            return true;
+        }
+        if let Some(why) = refused {
+            // A refusal ends the attempt (the member's epoch carries the
+            // tenure, or a renewal it saw makes the claim moot); the ops
+            // retry and the promise check refuses first while the epoch lives.
+            match why {
+                SealRefusal::EpochOpen => tracing::warn!(
+                    node = self.cfg.node_id,
+                    from,
+                    "a member's open epoch carries the tenure: the claim ends and retries"
+                ),
+                SealRefusal::StaleKey => tracing::debug!(
+                    node = self.cfg.node_id,
+                    from,
+                    "a member saw a newer renewal of the lease: the claim ends and retries"
+                ),
+            }
+            self.end_tail_fetch_attempt(now, replica, out);
+            return true;
+        }
+        // The previous holder: a node that holds nothing (`empty`) is an
+        // answer of no rows, whose members still count as evidence.
+        let plain_none = !held && empty && node == k.prev.holder;
+        if !held && !plain_none {
+            return true;
+        }
+        let a = k.answers.entry((ti, from, e)).or_default();
+        a.txs.extend(txs);
+        a.through = a.through.max(through);
+        if a.members.is_empty() {
+            a.members = members;
+        }
+        a.sealed.extend(sealed);
+        match next {
+            Some(n) if !plain_none => {
+                // Each batch of a member that answers gets a window of its
+                // own.
+                let kept = node != k.prev.holder;
+                self.kept_ask(ti, from, epoch, kept, n, out);
+                self.kept_rearm(now, out);
+            }
+            _ => {
+                a.done = true;
+                self.kept_rearm(now, out);
+                self.kept_progress(now, replica, out);
+            }
+        }
+        true
+    }
+
+    fn kept_rearm(&mut self, now: Now, out: &mut Vec<Action>) {
+        let old = self.bk.kept.as_mut().and_then(|k| k.timer.take());
+        if let Some(t) = old {
+            self.cancel_timer(t, out);
+        }
+        let round = self.op_id();
+        let at = now.wait.plus(self.cfg.backup_takeover_ms.max(1));
+        let timer = self.set_timer_wait(at, super::Timer::JobRequestTimeout(round), out);
+        self.bk.tf_round = Some(round);
+        if let Some(k) = self.bk.kept.as_mut() {
+            k.timer = Some(timer);
+        }
+    }
+
+    /// The nodes whose answers are all in, for target `ti`.
+    fn kept_done(k: &KeptFetch, ti: usize) -> BTreeSet<NodeId> {
+        let t = &k.targets[ti];
+        let mut nodes: BTreeSet<NodeId> = k.answers.keys().map(|(_, n, _)| *n).collect();
+        nodes.retain(|n| {
+            t.required(ti, *n)
+                .iter()
+                .all(|e| k.answers.get(&(ti, *n, *e)).is_some_and(|a| a.done))
+        });
+        nodes
+    }
+
+    /// Whether the fetch holds everything the rules ask for.
+    fn kept_complete(&self) -> bool {
+        let Some(k) = self.bk.kept.as_ref() else {
+            return false;
+        };
+        let me = self.cfg.node_id;
+        let prev = &k.prev;
+        (0..k.targets.len()).all(|ti| {
+            let t = &k.targets[ti];
+            let done = Self::kept_done(k, ti);
+            if !done.contains(&me) {
+                return false;
+            }
+            if let Some((members, through)) = &t.union {
+                // The union a lease names: every named member, or this
+                // node's own copy through what the lease says it holds.
+                let mine = k
+                    .answers
+                    .get(&(ti, me, t.tenure.1))
+                    .map_or(0, |a| a.through);
+                return members
+                    .iter()
+                    .filter(|n| **n != me && !prev.retired.contains(n))
+                    .all(|n| done.contains(n))
+                    || (*through > 0 && mine >= *through);
+            }
+            // R1: everyone the answers name has answered (but the tenure's
+            // holder: a committed row sits on a member that acknowledged it,
+            // never only on the holder; its own answer is R2's shortcut).
+            let named: BTreeSet<NodeId> = k
+                .answers
+                .iter()
+                .filter(|((i, _, _), _)| *i == ti)
+                .flat_map(|(_, a)| a.members.iter().flatten().copied())
+                .filter(|n| *n != me && *n != t.tenure.0 && !prev.retired.contains(n))
+                .collect();
+            if !named.iter().all(|n| done.contains(n)) {
+                return false;
+            }
+            // R2: the carrier answered, or the answerers intersect every
+            // possible epoch, or every source answered.
+            let holder_in = !prev.retired.contains(&prev.holder) && done.contains(&prev.holder);
+            let all_sources = k.sources.iter().all(|n| done.contains(n))
+                && (prev.retired.contains(&prev.holder) || done.contains(&prev.holder));
+            let q = done
+                .iter()
+                .filter(|n| **n == me || self.roster.lists(**n))
+                .filter(|n| !prev.retired.contains(n))
+                .count();
+            holder_in || all_sources || k.slack.is_some_and(|f| q > f as usize)
+        })
+    }
+
+    /// Ask the members the answers name that this fetch has not asked, and
+    /// finish once everything is in.
+    fn kept_progress(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        let me = self.cfg.node_id;
+        let Some(k) = self.bk.kept.as_mut() else {
+            return;
+        };
+        // Members the answers name that are not sources yet.
+        let more: Vec<(usize, NodeId)> = k
+            .answers
+            .iter()
+            .flat_map(|((ti, _, _), a)| a.members.iter().flatten().map(move |n| (*ti, *n)))
+            .filter(|(ti, n)| {
+                *n != me
+                    && *n != k.prev.holder
+                    && !k.prev.retired.contains(n)
+                    && k.targets[*ti].union.is_none()
+                    && !k.sources.contains(n)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let epochs: Vec<(usize, Vec<Epoch>)> = k
+            .targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i, t.epochs()))
+            .collect();
+        for (_, n) in &more {
+            k.sources.insert(*n);
+        }
+        // The waiting claim names whom it still waits for.
+        let waiting: Vec<NodeId> = k
+            .sources
+            .iter()
+            .copied()
+            .filter(|n| {
+                !(0..k.targets.len()).all(|ti| {
+                    Self::kept_done(k, ti).contains(n)
+                        || k.targets[ti]
+                            .union
+                            .as_ref()
+                            .is_some_and(|(m, _)| !m.contains(n))
+                })
+            })
+            .collect();
+        let asked_nodes: BTreeSet<NodeId> = more.iter().map(|(_, n)| *n).collect();
+        for n in asked_nodes {
+            for (ti, es) in &epochs {
+                if self
+                    .bk
+                    .kept
+                    .as_ref()
+                    .is_some_and(|k| k.targets[*ti].union.is_none())
+                {
+                    for e in es {
+                        self.kept_ask(*ti, n, *e, true, 0, out);
+                    }
+                }
+            }
+        }
+        if let Some(w) = self.bk.group_wait.as_mut() {
+            w.sources = waiting;
+        }
+        if self.kept_complete() {
+            self.kept_finish(now, replica, out);
+        }
+    }
+
+    /// Every rule holds (or the operator abandoned the rest): the claim goes
+    /// on to read the log to head, and merges after it.
+    fn kept_finish(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        let Some(k) = self.bk.kept.take() else {
+            return;
+        };
+        if let Some(t) = k.timer {
+            self.cancel_timer(t, out);
+        }
+        self.bk.tf_round = None;
+        let partial = k.abandon && {
+            let me_done = |ti: usize| Self::kept_done(&k, ti);
+            k.sources.iter().any(|n| {
+                (0..k.targets.len()).any(|ti| {
+                    k.targets[ti]
+                        .union
+                        .as_ref()
+                        .is_none_or(|(m, _)| m.contains(n))
+                        && !me_done(ti).contains(n)
+                })
+            })
+        };
+        let waited = self
+            .bk
+            .group_wait
+            .take()
+            .map_or(0, |w| now.wait.since(w.since).max(0));
+        tracing::info!(
+            node = self.cfg.node_id,
+            tenure = ?k.targets[0].tenure,
+            sources = k.sources.len(),
+            waited_ms = waited,
+            partial,
+            "collected the kept rows of the tenure: the claim carries them"
+        );
+        let _ = replica;
+        self.bk.kept_union = Some(KeptUnion {
+            prev: k.prev,
+            targets: k.targets,
+            answers: k.answers,
+            partial,
+            force: k.force,
+        });
+        self.kept_to_tail(out);
+    }
+
+    /// The operator abandoned the sources still unanswered (`Control::Abandon`
+    /// while a kept fetch waits): complete with what answered.
+    pub(crate) fn kept_abandon_now(
+        &mut self,
+        now: Now,
+        force: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let me = self.cfg.node_id;
+        let Some(k) = self.bk.kept.as_mut() else {
+            return;
+        };
+        k.abandon = true;
+        k.force |= force;
+        // This node's own copy must be in: it is the one source that cannot
+        // be abandoned.
+        let mine = (0..k.targets.len()).all(|ti| Self::kept_done(k, ti).contains(&me));
+        if mine {
+            self.kept_finish(now, replica, out);
+        }
+    }
+
+    /// The window of the fetch ran out: an abandoned one completes with what
+    /// answered; the others end the attempt (the ops behind the claim retry).
+    pub(crate) fn on_kept_window_ended(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let me = self.cfg.node_id;
+        let Some(k) = self.bk.kept.as_mut() else {
+            return;
+        };
+        k.timer = None;
+        let mine = (0..k.targets.len()).all(|ti| Self::kept_done(k, ti).contains(&me));
+        if k.abandon && mine {
+            self.kept_finish(now, replica, out);
+        } else {
+            self.end_tail_fetch_attempt(now, replica, out);
+        }
+    }
+
+    /// No answer from this source: nothing to do until the window ends.
+    pub(crate) fn on_kept_failed(&mut self, req: OpId) -> bool {
+        self.bk
+            .kept
+            .as_mut()
+            .is_some_and(|k| k.asked.remove(&req).is_some())
+    }
+
+    /// The claim read the log to head: merge the union per epoch, write it as
+    /// a sealed backup tail of the tenure, and name it for the gate. `false`:
+    /// the attempt ended (two sources kept different transactions at one seq;
+    /// the store could not be written).
+    pub(crate) fn kept_install(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        let Some(u) = self.bk.kept_union.take() else {
+            return true;
+        };
+        let me = self.cfg.node_id;
+        // Per epoch: every answer's transactions, by their first seq.
+        let mut epochs: BTreeSet<Epoch> = BTreeSet::new();
+        for t in &u.targets {
+            epochs.extend(t.epochs());
+        }
+        let mut merged_by_epoch: BTreeMap<Epoch, Vec<BackupTx>> = BTreeMap::new();
+        let mut owner_of: BTreeMap<Epoch, NodeId> = BTreeMap::new();
+        let mut keepers: BTreeMap<Epoch, BTreeSet<NodeId>> = BTreeMap::new();
+        let mut past_gap = 0usize;
+        for e in &epochs {
+            let mut all: BTreeMap<u64, &BackupTx> = BTreeMap::new();
+            for (ti, t) in u.targets.iter().enumerate() {
+                if !t.epochs().contains(e) {
+                    continue;
+                }
+                owner_of.entry(*e).or_insert(t.tenure.0);
+                for ((i, node, ae), a) in &u.answers {
+                    if *i != ti || ae != e {
+                        continue;
+                    }
+                    if !a.txs.is_empty() {
+                        keepers.entry(*e).or_default().insert(*node);
+                    }
+                    for tx in &a.txs {
+                        match all.get(&tx.first) {
+                            Some(old) if old.last != tx.last || old.origin != tx.origin => {
+                                if u.force {
+                                    self.stats.kept_forced += 1;
+                                    if tx.last > old.last {
+                                        all.insert(tx.first, tx);
+                                    }
+                                    continue;
+                                }
+                                self.stats.kept_diverged += 1;
+                                tracing::error!(
+                                    node = me,
+                                    from = node,
+                                    epoch = e,
+                                    first = tx.first,
+                                    "two sources kept different transactions at the same journal \
+                                     seq: the claim does not complete (operator: `repair abandon \
+                                     --epoch --force` takes the longest)"
+                                );
+                                self.bk.kept_force_wanted = Some(u.targets[0].tenure.1);
+                                self.end_tail_fetch_attempt(now, replica, out);
+                                return false;
+                            }
+                            Some(_) => {}
+                            None => {
+                                all.insert(tx.first, tx);
+                            }
+                        }
+                    }
+                }
+            }
+            // The rows past the log, from the lowest seq of the epoch the log
+            // lacks, in order, up to the first seq no answer covers.
+            let mut merged: Vec<BackupTx> = Vec::new();
+            let mut next: Option<u64> = None;
+            let mut gap = false;
+            for (first, tx) in all {
+                if gap {
+                    past_gap += 1;
+                    continue;
+                }
+                if replica.row_in_log(*e, tx.last) {
+                    next = Some(tx.last + 1);
+                    continue;
+                }
+                match next {
+                    None => {}
+                    Some(n) if first <= n => {
+                        if first < n {
+                            continue;
+                        }
+                    }
+                    Some(_) if first > 0 && replica.row_in_log(*e, first - 1) => {}
+                    Some(_) => {
+                        gap = true;
+                        past_gap += 1;
+                        continue;
+                    }
+                }
+                next = Some(tx.last + 1);
+                merged.push(tx.clone());
+            }
+            merged_by_epoch.insert(*e, merged);
+        }
+        // The source of a stream with rows owns its epoch's tail (a hold
+        // handed to a transferee journaled under the epoch above the
+        // tenure's, as the transferee's stream); and the claim lands above
+        // every epoch a hold journaled under.
+        let mut floor = 0;
+        for a in u.answers.values() {
+            for (e, s) in &a.sealed {
+                floor = floor.max(*e);
+                if *e != u.targets[0].tenure.1 {
+                    let o = owner_of.entry(*e).or_insert(*s);
+                    *o = (*o).min(*s);
+                }
+            }
+        }
+        let _ = floor;
+        debug_assert_eq!(past_gap, 0, "a kept copy lies past a gap");
+        if past_gap > 0 {
+            self.stats.kept_past_gap += past_gap as u64;
+            tracing::warn!(
+                node = me,
+                rows = past_gap,
+                "kept rows lie past a seq no source covers: not carried"
+            );
+        }
+        let prev = u.prev;
+        // One entry per epoch with rows; with none anywhere, the tenure's
+        // own epoch, empty (the marker then says that no tail follows it).
+        merged_by_epoch.retain(|_, m| !m.is_empty());
+        if merged_by_epoch.is_empty() {
+            merged_by_epoch.insert(u.targets[0].tenure.1, Vec::new());
+            owner_of
+                .entry(u.targets[0].tenure.1)
+                .or_insert(u.targets[0].tenure.0);
+        }
+        let mut fetched: Vec<FetchedTail> = Vec::new();
+        for (e, merged) in &merged_by_epoch {
+            if !replica.backup_append(*e, merged) {
+                self.end_acquire_attempt(now, replica, out);
+                return false;
+            }
+            let holder = owner_of.get(e).copied().unwrap_or(prev.holder);
+            let role = BackupRole {
+                holder,
+                epoch: *e,
+                config_version: prev.config_version,
+            };
+            if let Err(error) = replica.set_backup_role(role) {
+                tracing::error!(node = me, %error, "the kept tail's role could not be persisted: the claim ends");
+                self.end_acquire_attempt(now, replica, out);
+                return false;
+            }
+            if !merged.is_empty() {
+                if !replica.backup_seal(*e) {
+                    self.end_acquire_attempt(now, replica, out);
+                    return false;
+                }
+                self.bk.sealed = self.bk.sealed.max(*e);
+            }
+            self.bk.role = Some(role);
+            self.bk.acked = replica.backup_acked(*e).unwrap_or(0);
+            // The union is held by every node that kept a row of it, and by
+            // this one from here on; a later claimant asks them all.
+            let mut members: Vec<NodeId> = keepers
+                .get(e)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+            members.push(me);
+            members.sort_unstable();
+            members.dedup();
+            fetched.push(FetchedTail {
+                epoch: *e,
+                config_version: prev.config_version,
+                members,
+                through: replica.backup_acked(*e).unwrap_or(self.bk.acked),
+                kept_owner: Some(holder),
+            });
+            self.stats.kept_rows_carried += merged.len() as u64;
+        }
+        self.bk.held.clear();
+        self.bk.fetched = fetched;
+        self.stats.tail_fetches += 1;
+        self.stats.kept_fetches_completed += 1;
+        if prev.inherited_tail.is_some() {
+            self.stats.inherited_tail_fetches += 1;
+        }
+        if u.partial {
+            let e = u.targets[0].tenure.1;
+            self.stats.kept_abandoned += 1;
+            self.stats.groups_abandoned += 1;
+            self.bk.abandoned_claim = Some(e);
+            self.bk.abandoned_through = self.bk.acked;
+            tracing::warn!(
+                node = me,
+                epoch = e,
+                "the operator abandoned the sources of a kept fetch that had not answered: \
+                 the claim carries what answered"
+            );
+        }
+        self.bk.abandon = None;
+        self.bk.kept_ready = true;
+        true
+    }
+}

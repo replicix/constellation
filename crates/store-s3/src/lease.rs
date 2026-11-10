@@ -206,6 +206,15 @@ pub struct InheritedTail {
     /// The last journal seq of the tail as the claimant took it (the
     /// source's contiguous hold).
     pub through: u64,
+    /// ADR-51: the tail is the union of the committed rows an epoch's
+    /// members kept of `holder`'s tenure at `epoch`, as one claimant fetched
+    /// them (`members`: the nodes that kept rows of it). No single member
+    /// holds all of it: a later claimant of this lease asks every member
+    /// (the kept phase), not the first that answers.
+    pub kept: bool,
+    /// ADR-51 (with `kept`): the node whose tenure `epoch` was, which the
+    /// members' copies are of.
+    pub holder: u64,
 }
 
 /// Plan 30 §M9: what an acknowledgement means under a tenure.
@@ -433,6 +442,13 @@ impl Lease {
     /// never by the retired node. Derived: no body field.
     pub fn is_fenced(&self) -> bool {
         self.retired.contains(&self.holder)
+    }
+
+    /// ADR-51: the epoch of the tenure a retirement fence ended (`Some`
+    /// iff [`Self::is_fenced`]). The fence bumps the epoch exactly once
+    /// (`with_retired`, a second retirement on the same lease, does not).
+    pub fn retired_tenure(&self) -> Option<u64> {
+        self.is_fenced().then(|| self.epoch.saturating_sub(1))
     }
 
     /// Plan 43 C7b: the renewal key. It changes exactly when the holder's

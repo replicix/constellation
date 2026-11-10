@@ -187,6 +187,10 @@ pub(crate) struct PromiseState {
     pub retired: bool,
     /// The running takeover check.
     pub check: Option<Check>,
+    /// ADR-51: the effective slack `f` the last passed check computed, for
+    /// the kept fetch that follows it (taken by it), and when it passed.
+    pub check_slack: Option<u32>,
+    pub check_passed_at: Option<WaitMs>,
     pub watch_timer: Option<TimerId>,
     /// The epoch hold as last persisted, and the one found at start (a
     /// restarted hold owner re-adopts it when its epoch is reported
@@ -1342,15 +1346,31 @@ impl Core {
         if permitted && !self.lease.obs_passed_for(prev, now, &self.cfg, 0) {
             return false;
         }
-        if self.pr.carried.is_some_and(|c| {
-            c.node == prev.holder
-                && c.epoch == prev.epoch
-                && c.expires_unix_ms == prev.expires_unix_ms
-        }) {
+        // (ADR-51, Q6: no exemption for a member claimant of a lease its epoch
+        // carried: it needs the proof that no live epoch still holds the
+        // tenure, as any other taker. Only the node that closed the epoch as
+        // its hold owner owes the re-claim.)
+        if self.owner_reclaims(prev) {
             self.stats.promise_flush_exempt += 1;
             return false;
         }
         true
+    }
+
+    /// ADR-51 (E1): this node closed the epoch as its hold owner and the
+    /// lease `prev` is the one that epoch carried: it owes that lease's move
+    /// and its rows are in its journal. The promise check and the kept phase
+    /// exempt exactly this re-claim; a member that never held the epoch does
+    /// not match (its `hold_ended` is empty or another's).
+    pub(crate) fn owner_reclaims(&self, prev: &Lease) -> bool {
+        self.pr
+            .hold_ended
+            .is_some_and(|h| h == (prev.epoch, prev.expires_unix_ms, true))
+            && self.pr.carried.is_some_and(|c| {
+                c.node == prev.holder
+                    && c.epoch == prev.epoch
+                    && c.expires_unix_ms == prev.expires_unix_ms
+            })
     }
 
     /// Begin the check for `prev` (the job is in `Phase::PromiseCheck`).
@@ -1543,6 +1563,8 @@ impl Core {
         let check = self.pr.check.as_ref().expect("checked above");
         let settled = check.asked.is_empty() || check.timed_out;
         if verdict.allows() {
+            self.pr.check_slack = Some(slack);
+            self.pr.check_passed_at = Some(now.wait);
             tracing::info!(
                 node = self.cfg.node_id,
                 slack,

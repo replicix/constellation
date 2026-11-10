@@ -248,6 +248,35 @@ impl Roster {
         !self.peers_seen || self.peers_lapses < self.lapses_seen || self.last_incomplete.is_some()
     }
 
+    /// ADR-51: a complete registry read issued after `seen` is installed, no
+    /// incomplete read is newer, and no lapse of this node's is newer than
+    /// it. Every member registered before its epoch formed and the epoch
+    /// formed before a lease expired or was fenced, so such a read lists
+    /// every node that can keep a row of a tenure this node first saw at
+    /// `seen`.
+    pub(crate) fn fresh_since(&self, seen: WaitMs) -> bool {
+        self.installed
+            .is_some_and(|i| i.issued > seen && i.lapses >= self.lapses_seen)
+            && self.last_incomplete.is_none()
+    }
+
+    /// ADR-51: the nodes a kept fetch asks (other than `me`): the
+    /// write-eligible roster, every connected link that is not read-only, and
+    /// every node that asked this one for something since the directory
+    /// showed it.
+    pub(crate) fn kept_sources(&self, me: NodeId) -> BTreeSet<NodeId> {
+        let mut out: BTreeSet<NodeId> = self.write_peers(me).collect();
+        out.extend(
+            self.links
+                .values()
+                .filter(|l| l.connected && !self.read_only.contains(&l.node))
+                .map(|l| l.node),
+        );
+        out.extend(self.heard.keys().copied());
+        out.remove(&me);
+        out
+    }
+
     /// A node asked this one for something since the directory last showed
     /// it: a peer, whatever the reads in hand say.
     pub(crate) fn has_heard(&self) -> bool {
