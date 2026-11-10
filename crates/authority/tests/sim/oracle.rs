@@ -116,6 +116,10 @@ pub struct Oracles {
     pub reach: Arc<super::reach::Reach>,
     pub ops: Mutex<HashMap<Rid, constellation_meta::MutateOp>>,
     pub unsettled: Mutex<Vec<Unsettled>>,
+    /// Late-landing U1(a): rids whose in-doubt answer followed a failed
+    /// tombstone with S3 cut at the requester over the withdraw window; a
+    /// landing of one is `isolated-from-s3`, not an I4 violation.
+    pub isolated_from_s3_rids: Mutex<BTreeSet<Rid>>,
     /// The holder's release after its drain, judged from the root's side
     /// (`Oracles::note_release_rows`), independent of the core's own counter.
     pub release_drain: Mutex<ReleaseDrain>,
@@ -168,12 +172,20 @@ pub struct Unsettled {
     /// not reach, whether a strict member was silent before the delegate
     /// went down (`Reach::silence_class`).
     pub silence: Option<String>,
+    /// Late-landing U1(a), `isolated-from-s3`: the settle could not write a
+    /// tombstone over the op's inbox batch, and the requester's path to S3
+    /// was cut over the whole withdraw window. The op may land after the
+    /// `EIO`: allowed, counted apart from every reachability class.
+    pub isolated_from_s3: bool,
 }
 
 impl Unsettled {
     /// A key for counting the causes: `isolated`, or how a sequencer was
     /// reachable and what its core was busy with.
     pub fn cause(&self) -> String {
+        if self.isolated_from_s3 {
+            return "isolated-from-s3".into();
+        }
         match &self.verdict {
             super::reach::Verdict::Isolated { why } if why.starts_with("requester") => {
                 "isolated/requester stopped".into()
@@ -299,6 +311,7 @@ impl Oracles {
             reach,
             ops: Mutex::new(HashMap::new()),
             unsettled: Mutex::new(Vec::new()),
+            isolated_from_s3_rids: Mutex::new(BTreeSet::new()),
             release_drain: Mutex::new(ReleaseDrain::default()),
             causal_cut: Mutex::new(Vec::new()),
             sticky_released: Mutex::new(BTreeMap::new()),
@@ -471,6 +484,7 @@ impl Oracles {
     /// end of its settle window (`window_ms`, the core's `settle_window`).
     /// Classified from the reachability history, never from a node's log:
     /// isolated (no sequencer reachable in the whole window) or not.
+    #[allow(clippy::too_many_arguments)]
     pub fn note_unsettled(
         &self,
         node: NodeId,
@@ -479,6 +493,7 @@ impl Oracles {
         started: Option<u64>,
         designation_held: bool,
         accepted_by_delegate: bool,
+        withdraw_failed: bool,
     ) {
         let at = self.reach.now_ms();
         // ADR-47 (§8.3): the requester's label is its own word. It counts as
@@ -534,7 +549,22 @@ impl Oracles {
         };
         let verdict = self.reach.classify(question.clone());
         let silence = self.reach.silence_class(&question, &verdict);
+        // Late-landing U1(a): a settle that could not write its tombstones
+        // for a whole window (`w` before it went on without the inbox) was
+        // cut from S3 over that window, or the label does not apply and the
+        // verdict stands.
+        let s3_cut = withdraw_failed && {
+            let end = started.unwrap_or(at);
+            self.reach
+                .s3_cut_throughout(node, end.saturating_sub(window_ms), end)
+        };
+        let isolated_from_s3 = s3_cut && !verdict.allowed();
+        if s3_cut {
+            // (Whatever the verdict, a landing of the op is U1(a)'s.)
+            self.isolated_from_s3_rids.lock().unwrap().insert(rid);
+        }
         self.unsettled.lock().unwrap().push(Unsettled {
+            isolated_from_s3,
             node,
             rid,
             at_ms: at,
@@ -2221,6 +2251,9 @@ impl IdentityLedger {
 /// them fail it).
 #[derive(Debug, Default)]
 pub struct Findings {
+    /// Late-landing U1(a): I4 landings of rids labelled `isolated-from-s3`
+    /// (allowed, counted apart).
+    pub i4_isolated_from_s3: usize,
     pub acks_by_class: BTreeMap<String, usize>,
     pub uncommitted_acks: BTreeMap<String, usize>,
     /// I2 (c) answers the operator's `abandon-group` gave up on purpose (the
@@ -2529,7 +2562,16 @@ pub fn end_of_run(
     }
     // I4.
     let invokes = o.invokes.lock().unwrap().clone();
-    f.i4 = super::check::no_late_landing(in_doubt, &invokes, &audit.submits, log).1;
+    // (Late-landing U1(a): the in-doubt answers that followed a failed
+    // tombstone with S3 cut are judged apart, `isolated-from-s3`.)
+    let labelled = o.isolated_from_s3_rids.lock().unwrap().clone();
+    let (labelled_in_doubt, in_doubt): (Vec<_>, Vec<_>) = in_doubt
+        .iter()
+        .cloned()
+        .partition(|(_, rid, _, _)| labelled.contains(rid));
+    f.i4 = super::check::no_late_landing(&in_doubt, &invokes, &audit.submits, log).1;
+    f.i4_isolated_from_s3 =
+        super::check::no_late_landing(&labelled_in_doubt, &invokes, &audit.submits, log).0;
     // Plan 43 C2 (§7.1 item 6): a settled answer promises the op never
     // takes effect: no completion of the rid in the log, wherever it lands.
     f.i4.extend(super::check::no_settled_landing(&acks, log));
@@ -3270,10 +3312,44 @@ mod tests {
     #[test]
     fn an_unbacked_designation_label_is_dropped() {
         let o = Oracles::new(Bucket::new(1, (0, 0)));
-        o.note_unsettled(3, rid(3, 1), 1_000, None, true, false);
+        o.note_unsettled(3, rid(3, 1), 1_000, None, true, false, false);
         let u = o.unsettled.lock().unwrap();
         assert_eq!(u.len(), 1);
         assert!(!u[0].designation_held, "{:?}", u[0]);
+    }
+
+    /// Late-landing U1(a): an in-doubt answer after a failed tombstone, with
+    /// the requester's S3 cut over the withdraw window, is `isolated-from-s3`:
+    /// its landing is counted apart, not an I4 violation. With S3 up it stays
+    /// one.
+    #[test]
+    fn a_landing_after_a_failed_tombstone_is_isolated_from_s3_only_if_s3_was_cut() {
+        let (r1, r2) = (rid(3, 1), rid(3, 2));
+        let landing = |cut: bool| {
+            let o = Oracles::new(Bucket::new(1, (0, 0)));
+            if cut {
+                o.reach.s3_cut_at(0, 3, true);
+            }
+            o.note_unsettled(3, r1, 1_000, None, false, false, true);
+            *o.invokes.lock().unwrap() = vec![(r1, 5), (r2, 11)];
+            let in_doubt = [(3u64, r1, 0u64, 10u64)];
+            end_of_run(
+                &o,
+                &log_with(seg(1, &[]), &[(r1, (5, 0)), (r2, (3, 0))]),
+                &in_doubt,
+                &HashMap::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                true,
+            )
+        };
+        let f = landing(true);
+        assert!(f.i4.is_empty(), "{:?}", f.i4);
+        assert_eq!(f.i4_isolated_from_s3, 1);
+        let f = landing(false);
+        assert_eq!(f.i4.len(), 1, "{:?}", f.i4);
+        assert_eq!(f.i4_isolated_from_s3, 0);
     }
 
     /// ADR-47, check 1: findings of an audit over a log that completes `r`.

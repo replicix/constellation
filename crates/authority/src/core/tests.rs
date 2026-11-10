@@ -5383,13 +5383,20 @@ fn a_retired_nodes_stranded_journal_is_not_replayed() {
         assert_eq!(queued.len(), 1, "{queued:?}");
         assert!(queued[0].foreign);
         assert_eq!(queued[0].source, Some(source));
-        let mut lease = lease_of(3, 3, h.now.plus(10_000).0);
+        let mut lease = lease_of(3, 3, h.now.plus(60_000).0);
         lease.retired = retired.into_iter().collect();
         let now = h.now;
         h.core.lease.note_object(&lease);
         let mut out = Vec::new();
         h.core.on_drain_tick(Now::same(now.0), &h.meta, &mut out);
         let case = (requester, source, retired);
+        if !dropped {
+            // (A foreign row is settled once its requester's attempts are
+            // over: the first tick only notes it.)
+            h.advance(h.core.dl_t().attempts + 1);
+            out.clear();
+            h.core.on_drain_tick(Now::same(h.now.0), &h.meta, &mut out);
+        }
         if dropped {
             assert!(h.meta.pending_replays().unwrap().is_empty(), "{case:?}");
             assert!(
@@ -5516,11 +5523,15 @@ fn a_retired_hold_owners_acked_row_is_replayed() {
     assert_eq!(queued.len(), 1, "{queued:?}");
     assert_eq!((queued[0].foreign, queued[0].source), (true, Some(1)));
     assert!(queued[0].class.gated(), "{queued:?}");
-    let lease = lease_of(3, 3, h.now.plus(10_000).0).with_retired(1);
+    let lease = lease_of(3, 3, h.now.plus(60_000).0).with_retired(1);
     let now = h.now;
     h.core.lease.note_object(&lease);
     let mut out = Vec::new();
     h.core.on_drain_tick(Now::same(now.0), &h.meta, &mut out);
+    // (A foreign row is settled once its requester's attempts are over.)
+    h.advance(h.core.dl_t().attempts + 1);
+    out.clear();
+    h.core.on_drain_tick(Now::same(h.now.0), &h.meta, &mut out);
     assert_eq!(h.core.stats.replays_of_retired_dropped, 0);
     assert_eq!(h.meta.pending_replays().unwrap().len(), 1);
     assert!(
@@ -71345,6 +71356,242 @@ mod late_landing_inbox {
         assert_eq!(inbox_deletes(&out), vec![(1, 2, 0)]);
         assert!(h.core.inbox.leftover.is_none());
     }
+
+    /// Node 1's op `a`, queued for the submitter with the batch PUT in
+    /// flight (not acknowledged). Returns the rid and the PUT's op id.
+    fn put_in_flight_op() -> (Harness, Rid, OpId) {
+        let mut h = Harness::new(1);
+        let rid = h.rid(1);
+        h.core.lease.cached_holder = Some(2);
+        let mut out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("a"),
+            tag: Default::default(),
+        });
+        h.core.inbox_enqueue(h.clk(), rid, 1, &h.meta, &mut out);
+        let last_n = s3_ops(&out)
+            .into_iter()
+            .find(|(_, r)| matches!(r, S3Op::InboxLastN { .. }))
+            .map(|(o, _)| o)
+            .expect("numbering resumed first");
+        let out = h.step(Event::S3 {
+            op: last_n,
+            result: S3Result::InboxLastN(Ok(None)),
+        });
+        let put = s3_ops(&out)
+            .into_iter()
+            .find(|(_, r)| matches!(r, S3Op::InboxPut { .. }))
+            .map(|(o, _)| o)
+            .expect("the batch PUT is issued");
+        (h, rid, put)
+    }
+
+    fn tombstoned_keys(out: &[Action]) -> Vec<InboxKey> {
+        s3_ops(out)
+            .into_iter()
+            .filter_map(|(_, r)| match r {
+                S3Op::InboxTombstone { batch } => Some(batch.key()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// MUST-2: a batch PUT in flight when the settle starts may land at any
+    /// moment (a slow or timed-out PUT), so the settle withdraws its key
+    /// first. Fails on the parent: no tombstone, the settle went by P2P and
+    /// the batch landed later, unwithdrawn.
+    #[test]
+    fn a_batch_put_in_flight_when_the_settle_starts_is_withdrawn() {
+        let (mut h, rid, put) = put_in_flight_op();
+        let key = InboxKey {
+            epoch: 1,
+            node: 1,
+            n: 0,
+        };
+        h.advance(h.core.dl_t().attempts + 1);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        assert_eq!(
+            tombstoned_keys(&out),
+            vec![key],
+            "the settle did not withdraw the batch in flight: {out:?}"
+        );
+        assert!(sends(&out).is_empty(), "no settle before the withdrawal");
+        // The PUT lands after all: the op is no longer queued, so the
+        // acknowledgement moves nothing.
+        h.step(Event::S3 {
+            op: put,
+            result: S3Result::InboxPut(Ok(())),
+        });
+        assert_eq!(h.core.clients.get(&rid).unwrap().inbox_keys, vec![key]);
+        assert!(!h.core.inbox.pending.contains_key(&rid));
+    }
+
+    /// MUST-2 (SHOULD-2): a PUT that timed out may have landed: the key is
+    /// kept, so the settle withdraws it whichever way the retry goes.
+    #[test]
+    fn a_batch_put_that_failed_ambiguously_keeps_its_key_for_the_settle() {
+        let (mut h, rid, put) = put_in_flight_op();
+        h.step(Event::S3 {
+            op: put,
+            result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
+        });
+        let key = InboxKey {
+            epoch: 1,
+            node: 1,
+            n: 0,
+        };
+        assert_eq!(h.core.clients.get(&rid).unwrap().inbox_keys, vec![key]);
+    }
+
+    /// A conflict says the key is someone else's: not the op's to withdraw.
+    #[test]
+    fn a_batch_put_that_conflicted_leaves_no_key_to_withdraw() {
+        let (mut h, rid, put) = put_in_flight_op();
+        h.step(Event::S3 {
+            op: put,
+            result: S3Result::InboxPut(Err(CasFailure::Conflict)),
+        });
+        assert!(h.core.clients.get(&rid).unwrap().inbox_keys.is_empty());
+    }
+
+    /// SHOULD-1: a tombstone written twice (the forward's withdrawal still
+    /// in flight when the settle begins) is acknowledged twice; the second
+    /// acknowledgement of the first key must not remove the second key.
+    /// Fails on the parent: the second key was removed unwritten.
+    #[test]
+    fn a_duplicate_tombstone_acknowledgement_removes_no_other_key() {
+        let (mut h, rid) = waiting_inbox_op();
+        let k1 = h.core.clients.get(&rid).unwrap().inbox_keys[0];
+        let k2 = InboxKey { n: k1.n + 1, ..k1 };
+        h.core.clients.get_mut(&rid).unwrap().inbox_keys.push(k2);
+        h.advance(h.core.dl_t().attempts + 1);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        let first = tombstone_op(&out).expect("withdrawn first");
+        // The same key's tombstone written once more.
+        let mut dup = Vec::new();
+        h.core.issue_tombstone(h.clk(), rid, k1, &mut dup);
+        let second = tombstone_op(&dup).expect("a duplicate");
+        let out = h.step(Event::S3 {
+            op: first,
+            result: S3Result::InboxTombstone(Ok(())),
+        });
+        assert_eq!(tombstoned_keys(&out), vec![k2]);
+        let out = h.step(Event::S3 {
+            op: second,
+            result: S3Result::InboxTombstone(Ok(())),
+        });
+        assert!(tombstoned_keys(&out).is_empty(), "{out:?}");
+        assert_eq!(
+            h.core.clients.get(&rid).unwrap().inbox_keys,
+            vec![k2],
+            "k2 is still to be withdrawn"
+        );
+    }
+
+    /// SHOULD-1: a settle that finds the forward's withdrawal under way does
+    /// not write its tombstone again.
+    #[test]
+    fn a_settle_does_not_rewrite_a_tombstone_in_flight() {
+        let (mut h, rid) = waiting_inbox_op();
+        // The forward's withdrawal: the phase and the tombstone.
+        let key = h.core.clients.get(&rid).unwrap().inbox_keys[0];
+        h.core.clients.get_mut(&rid).unwrap().phase = client::Phase::InboxWithdraw {
+            holder: 2,
+            gen: 0,
+            then: client::AfterWithdraw::Forward,
+        };
+        h.advance(h.core.dl_t().attempts + 1);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        assert!(tombstoned_keys(&out).is_empty(), "written twice: {out:?}");
+        assert!(matches!(
+            h.core.clients.get(&rid).unwrap().phase,
+            client::Phase::InboxWithdraw {
+                then: client::AfterWithdraw::Settle,
+                ..
+            }
+        ));
+        assert_eq!(h.core.clients.get(&rid).unwrap().inbox_keys, vec![key]);
+    }
+
+    /// MUST-3 (U1(a)): the in-doubt answer of an op whose settle gave up on
+    /// a tombstone is labelled for the sim oracle (`isolated-from-s3`).
+    #[test]
+    fn a_failed_tombstone_labels_the_in_doubt_answer() {
+        let (mut h, rid) = waiting_inbox_op();
+        h.core.track_unsettled_designation();
+        h.advance(h.core.dl_t().attempts + 1);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        let op = tombstone_op(&out).expect("withdrawn first");
+        h.step(Event::S3 {
+            op,
+            result: S3Result::InboxTombstone(Err(crate::event::S3Failure("boom".into()))),
+        });
+        let c = h.core.clients.get(&rid).unwrap();
+        let (deadline, until) = (c.deadline, c.settle_until);
+        h.now = Ms(until.0 - h.wait_off);
+        h.step(Event::Timer { id: deadline });
+        let mut out = Vec::new();
+        h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
+        assert!(h.core.take_withdraw_failed(rid), "{out:?}");
+        assert!(!h.core.take_withdraw_failed(rid), "taken once");
+    }
+
+    /// S1 (MUST-1): the result of a poll issued under an earlier holder
+    /// state (the requester entry was rebuilt since) has no issue time of its
+    /// own: it executes nothing; the new poll's result runs. Fails on the
+    /// parent: the old result took the rebuilt entry's issue time and ran.
+    #[test]
+    fn a_poll_result_of_an_earlier_holder_state_executes_nothing() {
+        let (mut h, _) = root_with_dir();
+        h.core.cfg.inbox = true;
+        poke(&mut h);
+        h.core.note_demand(h.clk(), 2, true);
+        let f = h.core.dl_t().inbox_read_fresh;
+        let polls = |h: &Harness| -> Vec<OpId> {
+            h.core
+                .s3
+                .iter()
+                .filter_map(|(op, fr)| matches!(fr, S3For::InboxPoll(2)).then_some(*op))
+                .collect()
+        };
+        h.advance(h.core.cfg.sync_interval_ms.max(1) + 1);
+        let mut out = Vec::new();
+        h.core.inbox_holder_tick(h.clk(), &h.meta, &mut out);
+        let a = *polls(&h).first().expect("poll A issued");
+        // The holder state is rebuilt (a fence that lifted, a re-acquire).
+        h.advance(f + 10);
+        h.core.inbox.holder = None;
+        let mut out = Vec::new();
+        h.core.inbox_holder_tick(h.clk(), &h.meta, &mut out);
+        let b = *polls(&h)
+            .iter()
+            .find(|op| **op != a)
+            .expect("poll B issued");
+        let batch = super::inbox_batch(2, 0, 1, &h.create("x"));
+        let out = h.step(Event::S3 {
+            op: a,
+            result: S3Result::InboxRun(Ok(vec![batch.clone()])),
+        });
+        assert!(
+            h.meta.child_ino(ROOT_INO, "x").unwrap().is_none(),
+            "A's bytes were read before the rebuild and ran: {out:?}"
+        );
+        // B is still the poll in flight, and its result runs.
+        h.step(Event::S3 {
+            op: b,
+            result: S3Result::InboxRun(Ok(vec![batch])),
+        });
+        assert!(h.meta.child_ino(ROOT_INO, "x").unwrap().is_some());
+    }
 }
 
 /// Late-landing S2: an unacknowledged or foreign stranded row only settles
@@ -71419,6 +71666,10 @@ mod late_landing_replay {
         let queued = h.meta.pending_replays().unwrap();
         h.meta.mark_replay_unacked(queued[0].queue_seq).unwrap();
         let mut out = Vec::new();
+        h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
+        // (Its remote requester's attempts are waited out first.)
+        h.advance(h.core.dl_t().attempts + 1);
+        h.hold(1, None);
         h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
         out.extend(h.archive_lands());
         h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
@@ -71555,5 +71806,58 @@ mod late_landing_replay {
         h.core.complete_ready(h.clk(), &h.meta, &mut out);
         assert!(h.meta.lookup(ROOT_INO, "p").unwrap().is_some(), "{out:?}");
         assert_eq!(h.core.stats.stale_parks_dropped, 0);
+    }
+
+    /// SHOULD-4: a foreign row's settle waits out the remote requester's own
+    /// attempts: its retry is the executing copy, and a settle sooner would
+    /// make it dedup to `Abandoned`. Fails on the parent: settled at once.
+    #[test]
+    fn a_foreign_replay_waits_for_its_requesters_attempts_before_it_settles() {
+        let rid = rid3(11);
+        let mut h = root_with_queued(rid, "w");
+        let queued = h.meta.pending_replays().unwrap();
+        h.meta.mark_replay_unacked(queued[0].queue_seq).unwrap();
+        let mut out = Vec::new();
+        h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
+        out.extend(h.archive_lands());
+        h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.stats.unacked_replay_settles_sent, 0, "{out:?}");
+        assert!(!settled_as_abandoned(&h, rid));
+        assert!(h.core.stats.foreign_settles_deferred > 0);
+        h.advance(h.core.dl_t().attempts + 1);
+        h.hold(1, None);
+        h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
+        out.extend(h.archive_lands());
+        h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.stats.unacked_replay_settles_sent, 1, "{out:?}");
+        assert!(settled_as_abandoned(&h, rid), "{out:?}");
+    }
+
+    /// SHOULD-3: a forced loss (`Reintegrate` of a persisted deposition)
+    /// drops the unexecuted forward parks as a deposition does. Fails on the
+    /// parent: the park stayed.
+    #[test]
+    fn a_forced_loss_drops_the_unexecuted_forward_parks() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let op = h.create("p");
+        h.step(forward_with_deps(1, op));
+        assert!(h.core.has_deps_parks(), "parked for its deps");
+        crate::replica::Replica::persist_lost(&h.meta, true).unwrap();
+        let out = h.step(Event::Control {
+            op: OpId(77),
+            req: Control::Reintegrate,
+        });
+        assert!(!h.core.has_deps_parks(), "the park survived: {out:?}");
+        assert!(
+            sends(&out).iter().any(|(to, m)| *to == 3
+                && matches!(
+                    m,
+                    PeerMsg::MutateReply { req, outcome: MutateOutcome::Busy, .. } if *req == OpId(1)
+                )),
+            "the requester is told to retry: {out:?}"
+        );
     }
 }

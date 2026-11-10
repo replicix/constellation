@@ -517,6 +517,17 @@ impl Reach {
         self.inner.lock().unwrap().s3.push((at, node, cut));
     }
 
+    /// Late-landing U1(a): whether `node`'s path to S3 was cut at every
+    /// instant of `[from, to]` (cut at `from`, and no cut lifted after).
+    pub fn s3_cut_throughout(&self, node: NodeId, from: u64, to: u64) -> bool {
+        let g = self.inner.lock().unwrap();
+        !s3_up(&g, from, node)
+            && !g
+                .s3
+                .iter()
+                .any(|(t, n, cut)| *n == node && !*cut && *t > from && *t <= to)
+    }
+
     /// A lease body of `epoch` landed in the bucket (`inherited_epoch`: the
     /// epoch of the tail it inherited, 0 for none).
     #[allow(clippy::too_many_arguments)]

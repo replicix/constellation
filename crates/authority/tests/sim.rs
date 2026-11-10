@@ -1213,6 +1213,11 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
     // Late-landing S1 (a drain reads inbox bytes fresh, a settle withdraws
     // its batches first) shifted the schedules again: over 10000–13999 the
     // finder gives 10446, 10794, 10803, 11298 and 11466, twice each.
+    // (Witnesses that the path is reached, not detectors: with the forward
+    // withdrawing only the newest batch, and with the settle's too, no
+    // long-configuration seed of 10000–29999 fails on this tree, 10446 and
+    // 10794 included. The guard is the core test
+    // `every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward`.)
     for seed in [10446, 10794] {
         let report = run_seed(seed, long_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let multi: u64 = report
@@ -1226,6 +1231,32 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
         );
         assert!(report.converged_checked, "seed {seed} did not converge");
     }
+}
+
+/// Late-landing U1(a) (MUST-3): the requester's S3 path is cut across the
+/// settle's first window, so its tombstone cannot be written and the settle
+/// goes on by P2P alone; the `EIO` it ends in (and any later landing of the
+/// op) is `isolated-from-s3`: allowed, and counted apart from the
+/// reachability classes. Seed 393 of `long-backup` with S3 cut at node 2 over
+/// 5–21 s and slow lease reads tells one; without the label it is an I4
+/// violation.
+#[test]
+fn a_failed_tombstone_with_s3_cut_is_labelled_isolated_from_s3() {
+    let mut cfg = config_variant(base_config("long-backup"), "cuts32@5000:16000");
+    cfg.lease_reads = sim::store::SlowReads {
+        before: (0, 0),
+        reply: (800, 1_000),
+    };
+    let r = run_seed(393, cfg).unwrap_or_else(|e| panic!("seed 393: {e}"));
+    let failed: u64 = r.stats.values().map(|s| s.settle_withdraw_failed).sum();
+    assert!(failed >= 1, "no settle gave up its tombstone ({failed})");
+    assert!(
+        r.unsettled_isolated_from_s3 >= 1,
+        "the EIO after the failed tombstone was not labelled: {:?}",
+        r.unsettled_causes
+    );
+    assert_eq!(r.unsettled_violations, 0, "{:?}", r.unsettled_examples);
+    assert_eq!(r.late_landings, 0);
 }
 
 /// Re-pin helper for `regression_every_inbox_batch_of_a_rid_is_withdrawn`:
@@ -1245,15 +1276,23 @@ fn find_multi_batch_withdraw_seeds() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1_000);
     for seed in start..start + seeds {
-        if let Ok(report) = run_seed(seed, long_config()) {
-            let multi: u64 = report
-                .stats
-                .values()
-                .map(|s| s.inbox_multi_batch_withdrawals)
-                .sum();
-            if multi > 0 {
-                eprintln!("multi-batch withdraw: seed {seed} ({multi})");
+        match run_seed(seed, long_config()) {
+            Ok(report) => {
+                let multi: u64 = report
+                    .stats
+                    .values()
+                    .map(|s| s.inbox_multi_batch_withdrawals)
+                    .sum();
+                if multi > 0 {
+                    eprintln!("multi-batch withdraw: seed {seed} ({multi})");
+                }
             }
+            // (On a tree whose forward withdraws only the newest batch, the
+            // seeds that fail are the ones that discriminate.)
+            Err(e) => eprintln!(
+                "failing seed {seed}: {}",
+                e.lines().next().unwrap_or_default()
+            ),
         }
     }
 }
@@ -8393,6 +8432,7 @@ struct OracleTotals {
     /// reason: released, abandoned, other).
     sticky: [u64; 5],
     sticky_core: [u64; 16],
+    ll_core: [u64; 11],
     quarantine_core: [u64; 6],
     sticky_driver: [u64; 4],
     sticky_release_rows_judged: u64,
@@ -8404,6 +8444,8 @@ struct OracleTotals {
     i4: usize,
     /// Plan 43 C2: of `i4`, settled `EIO`s whose rid completed.
     i4_settled: usize,
+    /// Late-landing U1(a): landings and unsettled EIOs labelled `isolated-from-s3`.
+    isolated_s3: [usize; 2],
     i5: usize,
     /// Plan 46 M1.3 step 0: acknowledged rids rolled back (`acked_rolled_back`), of them
     /// the `Lone` ones, and the seeds with a `Lone` one.
@@ -8707,6 +8749,9 @@ impl OracleTotals {
         self.sticky[2] += r.sticky_ended_abandoned as u64;
         self.sticky[3] += r.sticky_ended_unexcused as u64;
         self.sticky[4] += r.sticky_ended_claimed as u64;
+        for (t, c) in self.ll_core.iter_mut().zip(r.ll_core) {
+            *t += c;
+        }
         for (t, c) in self.sticky_core.iter_mut().zip(r.sticky_core) {
             *t += c;
         }
@@ -8719,6 +8764,8 @@ impl OracleTotals {
         }
         self.i4 += r.late_landings;
         self.i4_settled += r.settled_landings;
+        self.isolated_s3[0] += r.landings_isolated_from_s3;
+        self.isolated_s3[1] += r.unsettled_isolated_from_s3;
         self.i5 += r.non_lone_rollbacks;
         self.i5_operator.0 += r.i5_operator;
         self.i5_operator.1 += u64::from(r.i5_operator > 0);
@@ -8815,7 +8862,7 @@ impl OracleTotals {
              i1-mismatched={mismatched} {:?} (in {} seeds) unverified-relays={} (in {} seeds) \
              version-mismatch={} unsourced={} unjournaled-landed={}; settles \
              (sent/abandoned/late-success/local/unsettled-eio) {:?} i4-settled={}; unsettled EIO \
-             isolated={} violations={} (in {} seeds) no-sequencer-in-time={} generation-tail-unreachable={}; cores' sequenced answers by class {:?}",
+             isolated={} violations={} (in {} seeds) no-sequencer-in-time={} generation-tail-unreachable={}; isolated-from-s3 (landings, unsettled EIOs) {:?}; cores' sequenced answers by class {:?}",
             self.seeds,
             self.uncommitted,
             self.seeds_with[0],
@@ -8848,7 +8895,12 @@ impl OracleTotals {
             self.unsettled_seeds,
             self.unsettled_class[2],
             self.unsettled_class[3],
+            self.isolated_s3,
             constellation_authority::core::ACK_COUNTERS.iter().zip(self.claimed).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "SWEEP-LL-STATS {label} seeds {}/{seeds}: [withdrawn-first, resubmitted-ops, stale-reads, stale-relists, stale-parks, unacked-settles, foreign-deferred, withdraw-failed, bg-dropped, multi-batch, withdrawn-ops] {:?}",
+            self.seeds, self.ll_core
         );
         eprintln!(
             "SWEEP-NONSTEALABLE-IN-DOUBT {label} seeds {}/{seeds}: unsettled EIOs of ops a non-stealable holder's refusal was held back for (allowed: the holder may have run them, its row lands late) {} (in {} seeds)",

@@ -3776,6 +3776,7 @@ impl Driver {
                                     .and_then(|t| self.deadline_armed.get(&t).copied());
                                 let held = self.core.take_unsettled_designation(rid);
                                 let accepted = self.core.take_unsettled_accepted(rid);
+                                let withdraw_failed = self.core.take_withdraw_failed(rid);
                                 self.oracles.note_unsettled(
                                     self.id,
                                     rid,
@@ -3783,6 +3784,7 @@ impl Driver {
                                     started,
                                     held,
                                     accepted,
+                                    withdraw_failed,
                                 );
                             }
                         }
