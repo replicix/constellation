@@ -139,6 +139,12 @@ pub struct Config {
     /// `sticky_ends_only_by_holder_or_operator` must then fail the run.
     pub ttl_reclaims_sticky: bool,
     /// Fault injection for the simulation's negative control (never set by
+    /// the engine): a restarted holder executes writes and grants read
+    /// delegations at once, without waiting for the read delegations its
+    /// previous process granted (ADR-46, `Core::deleg_restart_quarantined`).
+    /// The sim's close-to-open oracle must then fail the run.
+    pub restart_skips_write_quarantine: bool,
+    /// Fault injection for the simulation's negative control (never set by
     /// the engine): a holder's release of sticky subtrees journals its row
     /// at once, without draining its in-flight ops there and waiting for
     /// the root to append through its last row (plan 46 M1.3 step 5,
@@ -593,6 +599,7 @@ impl Config {
             single_writer: false,
             skip_deleg_dep_wait: false,
             ttl_reclaims_sticky: false,
+            restart_skips_write_quarantine: false,
             holder_releases_before_drain: false,
             refuse_forwarded_designation_ops: false,
             partial_release_ends_stream: false,
@@ -982,6 +989,19 @@ pub struct Stats {
     /// again (plan 43 C2e follow-up: the journal may lack rows it
     /// acknowledged).
     pub deleg_rebooted_holder: u64,
+    /// Delegate: generations installed while the delegate read grants the
+    /// previous process made may still be honoured, whose writes and read
+    /// grants wait until they have expired (`Core::deleg_restart_quarantined`).
+    pub deleg_restart_quarantines: u64,
+    /// Delegate: own writes parked by that quarantine.
+    pub deleg_restart_q_parks: u64,
+    /// Delegate: forwarded writes answered `Held` by that quarantine.
+    pub deleg_restart_q_held: u64,
+    /// Delegate: quarantines that ran to their horizon.
+    pub deleg_restart_q_waited_out: u64,
+    /// Delegate: read grants not made because of that quarantine (the
+    /// position is answered).
+    pub deleg_read_grants_quarantined: u64,
     /// Delegate: installs of a generation put off because an ended
     /// generation's rows were still in the journal, its end not yet
     /// applied from the log (path B).
@@ -2006,6 +2026,9 @@ enum Timer {
     StreamWatchdog,
     GrantExpiry(u64),
     GrantQuarantine,
+    /// The write quarantine of a restarted holder's generation ends
+    /// (`Core::on_deleg_restart_quarantine`).
+    DelegRestartQuarantine(u64),
     /// Plan 43 C7-H2: `Core::service_pending_flushes`.
     FlushFloor,
     HeldReply(u64),
@@ -2118,7 +2141,9 @@ impl Timer {
             Timer::LockTestTimeout(_) => TimerKind::LockTestTimeout,
             Timer::DelegRenew(_) => TimerKind::DelegRenew,
             Timer::DelegLapse(_) => TimerKind::DelegLapse,
-            Timer::DelegStream | Timer::DelegInstallRetry => TimerKind::DelegStream,
+            Timer::DelegStream | Timer::DelegInstallRetry | Timer::DelegRestartQuarantine(_) => {
+                TimerKind::DelegStream
+            }
             Timer::Placement => TimerKind::Placement,
             Timer::ReleaseRecallBound
             | Timer::LeaveWait
@@ -2605,6 +2630,7 @@ impl Core {
         self.arm_drain(now, out);
         self.floor_start(now, replica);
         self.read_start(now, replica, out);
+        self.deleg_restart_start(now, replica);
         self.locks_start(now, replica);
         self.backup_start(now, replica, out);
         self.promise_start(now, replica, out);
@@ -3502,6 +3528,9 @@ impl Core {
             Timer::LockRenewTimeout(req) => self.on_lock_renew_timeout(req, replica, out),
             Timer::LockTestTimeout(req) => self.on_lock_test_timeout(req, out),
             Timer::DelegStream => self.on_deleg_stream_timer(now, replica, out),
+            Timer::DelegRestartQuarantine(gen) => {
+                self.on_deleg_restart_quarantine(now, gen, replica, out)
+            }
             Timer::DelegInstallRetry => self.on_deleg_install_retry(now, replica, out),
             Timer::Placement => self.on_placement_timer(now, replica, out),
             Timer::ReleaseRecallBound => self.on_release_recall_bound(now, replica, out),

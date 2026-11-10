@@ -532,6 +532,19 @@ pub(crate) struct ParkedDeleg {
     pub held: bool,
 }
 
+/// A generation installed while the read grants a previous process of this
+/// node made may still be honoured (ADR-46): its writes and read grants wait
+/// for `until`.
+#[derive(Debug, Clone)]
+pub(crate) struct RestartQuarantine {
+    /// When the persisted delegate read-grant horizon ends, on the wait
+    /// clock.
+    pub until: WaitMs,
+    /// The timer that ends it (`Timer::DelegRestartQuarantine`); `None`
+    /// once it has fired.
+    pub timer: Option<TimerId>,
+}
+
 /// Plan 46 M1.2 step 10: a release this delegate journaled (or could not,
 /// `ReleaseNote::end_at`) and has not seen acknowledged: its note rides
 /// every batch until the root's acknowledgement covers `row`.
@@ -681,6 +694,11 @@ pub(crate) struct DelegateState {
     /// re-streams): its rowless release may sit below rows the group
     /// acknowledged (`ReleaseNote::seal`).
     pub rebooted: bool,
+    /// Installed while the previous process's read grants may be live: no
+    /// write executes and no read delegation is granted until `until`
+    /// ([`Core::deleg_restart_quarantined`]). Set for every kind of
+    /// generation.
+    pub restart_q: Option<RestartQuarantine>,
     /// The stream's next attempt is not before this (a failed send backs
     /// off; the root unreachable must not mean a send per event).
     pub stream_after: Option<WaitMs>,
@@ -1247,6 +1265,13 @@ pub(crate) struct DelegationState {
     /// deadline.
     pub abandons: Vec<AbandonWait>,
     pub abandon_timer: Option<TimerId>,
+    /// ADR-46: where the read grants the previous process's delegates made
+    /// may last to, loaded at start (`Core::deleg_restart_start`); `None`:
+    /// nothing is left of them.
+    pub restart_horizon: Option<WaitMs>,
+    /// The persisted horizon said nothing was granted: the first install of
+    /// this process records that (`settle_deleg_grant_horizon`) once.
+    pub restart_horizon_was_none: bool,
     /// The nodes leaving (this node is their root): nothing is granted to
     /// them from the moment their leave starts, so no grant is made between
     /// the end of their grants and the retirement of their registry entry.
@@ -1472,7 +1497,10 @@ impl Core {
                     d.dirs.iter().copied().collect(),
                     d.gen,
                     d.until.0,
-                    d.stopped,
+                    // A generation inside its restart quarantine is not
+                    // admitted by the engine's fast path: the op goes to
+                    // the core and parks.
+                    d.stopped || d.restart_q.as_ref().is_some_and(|q| q.timer.is_some()),
                     d.streamed_through,
                     d.executed,
                     d.parked.len(),
@@ -1975,6 +2003,34 @@ impl Core {
             // floor covers everything applied so far.
             self.shipped_floor = self.shipped_floor.max(replica.applied_seq().unwrap_or(0));
             self.dl.installed_gens.insert(d.gen);
+            let restart_q = self
+                .dl
+                .restart_horizon
+                .filter(|until| *until > now.wait && !self.cfg.restart_skips_write_quarantine)
+                .map(|until| {
+                    let timer =
+                        self.set_timer_wait(until, Timer::DelegRestartQuarantine(d.gen), out);
+                    self.stats.deleg_restart_quarantines += 1;
+                    tracing::info!(
+                        node = me,
+                        dirs = ?d.dir_list(),
+                        gen = %constellation_meta::delegation::GenLabel::of(d.gen),
+                        wait_ms = until.since(now.wait),
+                        "this node held delegations before a restart; its writes wait until \
+                         the read delegations its previous process granted have expired"
+                    );
+                    RestartQuarantine {
+                        until,
+                        timer: Some(timer),
+                    }
+                });
+            if self.dl.restart_horizon_was_none {
+                // Nothing is left of the previous process's grants: record
+                // it, so that a crash before this process grants anything
+                // finds "none" rather than an absent key. Once.
+                self.dl.restart_horizon_was_none = false;
+                replica.settle_deleg_grant_horizon(now);
+            }
             self.dl.mine.insert(
                 d.gen,
                 DelegateState {
@@ -2005,6 +2061,7 @@ impl Core {
                     // log holds of it; nothing more executes here.
                     stopped: replica.deleg_ended_at_gate(d.gen) || rebooted || remnant,
                     rebooted,
+                    restart_q,
                     stream_after: None,
                     stream_backoff_ms: 0,
                     refused: false,
@@ -2776,6 +2833,42 @@ impl Core {
             .mine
             .get(&gen)
             .is_some_and(|d| now.honour < d.until || d.non_stealable);
+        // ADR-46: a restarted holder executes nothing while the read grants
+        // its previous process made may be live. A settle passes: its
+        // refusal has no effect a reader sees.
+        let quarantined = honoured && !settle && self.deleg_restart_quarantined(now, gen);
+        if quarantined && from != 0 {
+            if let Some(req) = req {
+                // Not parked: a retry would park a duplicate, and a silent
+                // park makes the requester spend its attempts. `Held` costs
+                // it none (DESIGN §6).
+                let left = self
+                    .dl
+                    .mine
+                    .get(&gen)
+                    .and_then(|d| d.restart_q.as_ref())
+                    .map_or(0, |q| q.until.since(now.wait).max(0) as u64);
+                self.stats.deleg_restart_q_held += 1;
+                out.push(Action::Send {
+                    to: from,
+                    msg: PeerMsg::MutateReply {
+                        req,
+                        outcome: MutateOutcome::Held {
+                            retry_ms: left.min(self.cfg.forward_timeout_ms).max(1),
+                            outwait_ms: None,
+                        },
+                        base: None,
+                        position: Position::ZERO,
+                        // A delegate's: no lease holder to cache from it.
+                        gen,
+                        own_chunks: OwnChunks::None,
+                        own_rows: None,
+                        committed: false,
+                    },
+                });
+                return true;
+            }
+        }
         // The model's rule 1: the delegate waits for `deps` too.
         let reaches = settle || self.cfg.skip_deleg_dep_wait || replica.reaches(&deps);
         // Phase 2b (M8): the read delegations this delegate granted on
@@ -2783,6 +2876,7 @@ impl Core {
         let recalling = !settle
             && honoured
             && reaches
+            && !quarantined
             && self.deleg_read_recall_pending(now, from, op, replica, out);
         // Plan 46 M1.3 step 5: a release of the subtree is draining; the op
         // waits for its row (it goes to the root then) or for the hold to
@@ -2796,7 +2890,7 @@ impl Core {
         if queued {
             self.stats.ops_parked_behind_queue += 1;
         }
-        if !honoured || !reaches || recalling || queued || holding {
+        if !honoured || !reaches || recalling || queued || holding || quarantined {
             tracing::debug!(
                 node = self.me(),
                 gen = %constellation_meta::delegation::GenLabel::of(gen),
@@ -2814,6 +2908,8 @@ impl Core {
                 self.stats.deleg_parked_expired += 1;
             } else if holding {
                 self.stats.deleg_sticky_release_held += 1;
+            } else if quarantined {
+                self.stats.deleg_restart_q_parks += 1;
             } else {
                 self.stats.recall_waits += 1;
             }
@@ -4952,13 +5048,16 @@ impl Core {
             if !honoured {
                 continue;
             }
+            // ADR-46: only settles run inside the restart quarantine.
+            let quarantined = self.deleg_restart_quarantined(now, gen);
             let candidates: Vec<(usize, NodeId, MutateOp, bool)> = d
                 .parked
                 .iter()
                 .enumerate()
                 .filter(|(_, p)| {
                     p.settle
-                        || (replica.reaches(&p.deps)
+                        || (!quarantined
+                            && replica.reaches(&p.deps)
                             && !self.gated_by_queue(p.from, p.rid, &p.op, replica)
                             && !(p.held
                                 && self.sticky_holds(
@@ -7835,6 +7934,18 @@ impl Core {
                 need.grants
                     .retain(|g| asked.iter().any(|dir| is_under(ns, g.ino, *dir)));
             }
+            // ADR-46: the read grants of a previous process are not in the
+            // table; the release row waits for them to expire too.
+            if let Some(q) = self
+                .dl
+                .mine
+                .get(&gen)
+                .and_then(|d| d.restart_q.as_ref())
+                .filter(|q| q.timer.is_some() && q.until > now.wait)
+            {
+                need.quarantine_until =
+                    Some(need.quarantine_until.map_or(q.until, |u| u.max(q.until)));
+            }
             if let Some(wait) = self.start_recalls(now, need, out) {
                 if let Some(r) = self.dl.mine.get_mut(&gen).and_then(|d| d.release.as_mut()) {
                     r.held = true;
@@ -7938,6 +8049,74 @@ impl Core {
         keys
     }
 
+    /// At start: where the read grants the previous process's delegates made
+    /// may last to (ADR-46). A missing or unreadable key is a full span.
+    pub(crate) fn deleg_restart_start(&mut self, now: Now, replica: &dyn Replica) {
+        use constellation_meta::readdeleg::DelegHorizon;
+        let span = self.cfg.read_horizon_span_ms();
+        let horizon = match replica.load_deleg_grant_quarantine(now, span) {
+            DelegHorizon::None => {
+                self.dl.restart_horizon_was_none = true;
+                None
+            }
+            DelegHorizon::Until(t) => Some(t).filter(|t| *t > now.wait),
+            DelegHorizon::Unknown => {
+                tracing::warn!(
+                    node = self.cfg.node_id,
+                    wait_ms = span,
+                    "the delegate read-grant horizon is missing or unreadable; \
+                     waiting a full read TTL before executing"
+                );
+                Some(now.wait.plus(span.max(0) as u64))
+            }
+        };
+        self.dl.restart_horizon = horizon;
+    }
+
+    /// Whether `gen` is inside its restart quarantine: installed while the
+    /// previous process's read grants may be live, and `until` has not
+    /// passed (ADR-46).
+    pub(crate) fn deleg_restart_quarantined(&self, now: Now, gen: u64) -> bool {
+        self.dl
+            .mine
+            .get(&gen)
+            .and_then(|d| d.restart_q.as_ref())
+            .is_some_and(|q| now.wait < q.until)
+    }
+
+    /// The restart quarantine's horizon has passed: record that the
+    /// previous process's grants are gone, and run what it parked.
+    pub(crate) fn on_deleg_restart_quarantine(
+        &mut self,
+        now: Now,
+        gen: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if let Some(q) = self
+            .dl
+            .mine
+            .get_mut(&gen)
+            .and_then(|d| d.restart_q.as_mut())
+            .filter(|q| now.wait >= q.until)
+        {
+            q.timer = None;
+            self.stats.deleg_restart_q_waited_out += 1;
+            tracing::info!(
+                node = self.cfg.node_id,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
+                "the read delegations this node's previous process granted have expired; \
+                 its writes run"
+            );
+        }
+        if self.dl.restart_horizon.is_some_and(|h| now.wait >= h) {
+            replica.settle_deleg_grant_horizon(now);
+        }
+        // The parked ops run from `deleg_after_event`; a release row held
+        // for the quarantine is completed here.
+        self.complete_ready(now, replica, out);
+    }
+
     /// Phase 2b: answer a strict read for this delegate's subtree, if it
     /// is: the position is this replica's plus the stream index, and a
     /// read delegation capped by the grant.
@@ -7966,6 +8145,10 @@ impl Core {
             return None;
         }
         let epoch = super::DELEG_READ_EPOCH_BASE + gen;
+        // ADR-46: the position is current (no write executes meanwhile),
+        // but a grant now would join the previous process's, which this
+        // node's table has forgotten.
+        let quarantined = self.deleg_restart_quarantined(now, gen);
         let grant = if self.cfg.read_delegations && from != self.cfg.node_id {
             let margin = self.cfg.expiry_margin_ms as i64;
             // A delegate's read grant is capped by its own honour end.
@@ -7986,13 +8169,21 @@ impl Core {
                     .is_some_and(|until| *until > now.wait)
             {
                 let until = now.wait.plus((ttl + margin) as u64);
-                let id = replica.read_delegations().grant(from, ino, until);
-                self.stats.deleg_read_grants += 1;
-                Some(crate::event::ReadGrantMsg {
-                    id,
-                    ttl_ms: ttl as u64,
-                    epoch,
-                })
+                if quarantined {
+                    self.stats.deleg_read_grants_quarantined += 1;
+                    None
+                } else if !replica.note_deleg_grant_horizon(until, now) {
+                    // Not persisted: not granted (as the root's).
+                    None
+                } else {
+                    let id = replica.read_delegations().grant(from, ino, until);
+                    self.stats.deleg_read_grants += 1;
+                    Some(crate::event::ReadGrantMsg {
+                        id,
+                        ttl_ms: ttl as u64,
+                        epoch,
+                    })
+                }
             } else {
                 None
             }
