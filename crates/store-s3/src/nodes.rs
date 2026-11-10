@@ -274,8 +274,12 @@ impl RegistryScan {
                          write-eligible roster from an incomplete registry"
                     )))
                 }
-                // Not a node's record (see `registry_scan`): no entry.
-                RecordRead::Mismatch => {}
+                RecordRead::Mismatch => {
+                    return Err(StoreError::Registry(format!(
+                        "node record {key} names another node than its key; refusing to \
+                         derive a write-eligible roster from an incomplete registry"
+                    )))
+                }
             }
         }
         out.sort_unstable();
@@ -564,8 +568,10 @@ mod tests {
     /// A torn registry GET (see `crate::control`) is re-read: it must not
     /// drop a live peer from `list_nodes`, fail the fail-closed roster,
     /// or make `publish_p2p` refuse.
-    /// A registry object whose body claims another node's id is ignored:
-    /// only the record at `nodes/<id>.json` speaks for node `id`.
+    /// A registry object whose body claims another node's id is not that
+    /// node's record (the peer directory ignores it: only the record at
+    /// `nodes/<id>.json` speaks for node `id`), but the scan is incomplete
+    /// for it (`roster_refuses_a_record_naming_another_node`).
     #[tokio::test]
     async fn a_record_claiming_another_nodes_id_is_ignored() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -578,10 +584,7 @@ mod tests {
             .put(&forged, object_store::PutPayload::from(body))
             .await
             .unwrap();
-        assert_eq!(
-            write_eligible_roster(store.clone()).await.unwrap(),
-            vec![id]
-        );
+        assert!(write_eligible_roster(store.clone()).await.is_err());
         assert_eq!(list_nodes(store.clone()).await.unwrap().len(), 1);
         // The scan skipped a listed record: it is not complete, so a
         // directory built from it vouches for no audience.
@@ -744,6 +747,40 @@ mod tests {
             matches!(err, StoreError::Registry(_)),
             "unexpected error: {err}"
         );
+    }
+
+    /// A record whose body names another node than its key is not skipped
+    /// silently: the node it names may be real, so the roster would leave
+    /// it out. The scan is incomplete (fails closed).
+    #[tokio::test]
+    async fn roster_refuses_a_record_naming_another_node() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let good = claim_node_id(store.clone()).await.unwrap();
+        let bytes = store
+            .get(&node_key(good))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let mut body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        body["node_id"] = serde_json::json!(good + 1);
+        store
+            .put(
+                &node_key(good + 7),
+                PutPayload::from(serde_json::to_vec(&body).unwrap()),
+            )
+            .await
+            .unwrap();
+        let err = write_eligible_roster(store.clone())
+            .await
+            .expect_err("a mismatched record must make the scan incomplete");
+        assert!(
+            matches!(err, StoreError::Registry(_)),
+            "unexpected error: {err}"
+        );
+        // The tolerant listing still leaves it out.
+        assert_eq!(list_nodes(store).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -1445,25 +1445,9 @@ impl Engine {
                         let scan =
                             crate::p2p::refresh_peers(&peers, store_inner.clone(), Some(&epochs))
                                 .await;
-                        // A scan that answered but could not read every
-                        // record empties the epoch roster (fail closed for
-                        // epochs); the core must not take that for "no
-                        // peers" (it would answer Singleton with peers
-                        // linked): it keeps its last complete roster.
-                        let unread = scan.as_ref().is_some_and(|s| {
-                            matches!(
-                                s.roster(),
-                                Err(constellation_store_s3::StoreError::Registry(_))
-                            )
-                        });
-                        let _ = sync_tx.send(if unread {
-                            crate::sync::SyncRequest::RosterUnread { issued }
-                        } else {
-                            crate::sync::SyncRequest::Roster {
-                                roster: epochs.roster(),
-                                issued,
-                            }
-                        });
+                        if let Some(req) = roster_request(scan.as_ref(), issued) {
+                            let _ = sync_tx.send(req);
+                        }
                         peers.probe_all().await;
                         tick += 1;
                         if tick.is_multiple_of(SLACK_REREAD_TICKS) {
@@ -3128,8 +3112,62 @@ fn remove_live_subtree(meta: &Meta, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// What the registry poll tells the core about the roster. A complete
+/// scan is the roster; one that answered but could not read every record
+/// (the epoch roster is emptied then: fail closed for epochs) is
+/// "unknown", never "no peers" (the core would answer Singleton with
+/// peers linked); a scan that failed altogether says nothing, so the core
+/// keeps what it knew (the epoch roster may be empty from an earlier
+/// unread scan and must not be sent).
+fn roster_request(
+    scan: Option<&constellation_store_s3::RegistryScan>,
+    issued: constellation_authority::WaitMs,
+) -> Option<crate::sync::SyncRequest> {
+    match scan?.roster() {
+        Ok(roster) => Some(crate::sync::SyncRequest::Roster { roster, issued }),
+        Err(constellation_store_s3::StoreError::Registry(_)) => {
+            Some(crate::sync::SyncRequest::RosterUnread { issued })
+        }
+        Err(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use constellation_store_s3::{RecordRead, RegistryScan};
+
+    /// The registry poll's word to the core: a complete scan is the
+    /// roster, an unread one is "unknown", and a failed scan (after an
+    /// unread one emptied the epoch roster) says nothing, so the core
+    /// keeps waiting instead of hearing "no peers".
+    #[test]
+    fn a_failed_scan_after_an_unread_one_does_not_empty_the_core_roster() {
+        let issued = constellation_authority::WaitMs(1);
+        let unread = RegistryScan {
+            records: vec![("nodes/0.json".into(), RecordRead::Missing)],
+        };
+        assert!(matches!(
+            roster_request(Some(&unread), issued),
+            Some(crate::sync::SyncRequest::RosterUnread { .. })
+        ));
+        assert!(
+            roster_request(None, issued).is_none(),
+            "a scan that failed must send nothing (not an empty roster)"
+        );
+        let complete = RegistryScan::default();
+        assert!(matches!(
+            roster_request(Some(&complete), issued),
+            Some(crate::sync::SyncRequest::Roster { roster, .. }) if roster.is_empty()
+        ));
+        let mismatch = RegistryScan {
+            records: vec![("nodes/1.json".into(), RecordRead::Mismatch)],
+        };
+        assert!(matches!(
+            roster_request(Some(&mismatch), issued),
+            Some(crate::sync::SyncRequest::RosterUnread { .. })
+        ));
+    }
+
     use super::*;
     use crate::{EngineHost, EngineProfile, FsId, P2pMode, ResourceBudget, ViewQos};
     use constellation_fs_core::types::ROOT_INO;
