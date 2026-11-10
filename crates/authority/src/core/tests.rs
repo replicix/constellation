@@ -14971,6 +14971,63 @@ mod backup_crash {
         }
     }
 
+    /// A roster read that could not be completed (one record vanished or
+    /// unparseable) never turns a root with a linked, in-budget peer into
+    /// a singleton: the core keeps the last complete roster and counts the
+    /// unknown peer set as peers until a complete read.
+    #[test]
+    fn an_unread_roster_does_not_make_the_root_a_singleton() {
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1, 2]);
+        link_2(&mut h, true, Some(5), 0);
+        h.hold(1, None);
+        assert!(h.core.backup_could_be_had());
+        h.step(Event::RosterUnread {
+            issued: WaitMs(i64::MAX),
+        });
+        assert!(h.core.backup_could_be_had(), "peers linked, roster unread");
+        h.core.ack.eligible = Some(h.core.backup_could_be_had());
+        assert!(!h.core.root_lone(), "must not answer alone");
+        // Even with the peer not on the kept roster, an unread roster is
+        // unknown, not empty.
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1]);
+        link_2(&mut h, true, Some(5), 0);
+        h.hold(1, None);
+        h.step(Event::RosterUnread {
+            issued: WaitMs(i64::MAX),
+        });
+        assert!(h.core.backup_could_be_had());
+        // A complete read clears it.
+        h.step(Event::Roster {
+            write_eligible: vec![1],
+            issued: WaitMs(i64::MAX),
+        });
+        assert!(!h.core.backup_could_be_had());
+    }
+
+    /// An older roster read that arrives after a newer one does not
+    /// replace it.
+    #[test]
+    fn an_older_roster_read_does_not_replace_a_newer_one() {
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1, 2]);
+        h.step(Event::Roster {
+            write_eligible: vec![1],
+            issued: WaitMs(i64::MAX - 1_000),
+        });
+        assert_eq!(h.core.roster, vec![1, 2]);
+        h.step(Event::RosterUnread {
+            issued: WaitMs(i64::MAX - 500),
+        });
+        assert!(!h.core.roster_unread, "an older unread is stale too");
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3],
+            issued: WaitMs(i64::MAX),
+        });
+        assert_eq!(h.core.roster, vec![1, 2, 3]);
+    }
+
     /// Plan 46 M1.1 step 2: the root's rule is one lookup of its
     /// configuration (the lease's version and members; the singleton test
     /// of the event), and the answer classes are its maps.
@@ -61177,6 +61234,9 @@ mod m11_step5 {
         }
         let mut h = Harness::new(1);
         backup_node(&mut h, vec![1]);
+        // `backup_node`'s read is stamped at the end of time; the reads
+        // below are issued by the clock.
+        h.core.roster_issued = WaitMs(i64::MIN);
         h.hold(1, None);
         h.core.ack.eligible = Some(h.core.backup_could_be_had());
         assert!(h.core.root_lone());

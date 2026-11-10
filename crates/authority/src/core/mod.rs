@@ -2315,6 +2315,14 @@ pub struct Core {
     /// An `Event::Roster` has arrived: `roster` is the directory's, not the
     /// empty start value (`void_audience`).
     roster_seen: bool,
+    /// The wait clock of the newest roster read taken (`Event::Roster` or
+    /// `Event::RosterUnread`); a read issued before it is a stale arrival
+    /// and is ignored.
+    roster_issued: WaitMs,
+    /// The newest roster read could not be completed (a record vanished or
+    /// would not parse): `roster` is the last complete one, and the peer
+    /// set is unknown, which counts as peers (fail safe: wait).
+    roster_unread: bool,
     /// Plan 46 M1.1 step 5 (C8 condition 3): nodes that sent this node a
     /// request (a forward, a settle, an inbox batch) since the directory
     /// last showed them: a request from a peer is a singleton-test event,
@@ -2472,6 +2480,8 @@ impl Core {
             last_recovery: None,
             roster: Vec::new(),
             roster_seen: false,
+            roster_issued: WaitMs(i64::MIN),
+            roster_unread: false,
             peer_requesters: Default::default(),
             links: BTreeMap::new(),
             rtt_recent: BTreeMap::new(),
@@ -2787,6 +2797,11 @@ impl Core {
                 write_eligible,
                 issued,
             } => {
+                if issued < self.roster_issued {
+                    return out;
+                }
+                self.roster_issued = issued;
+                self.roster_unread = false;
                 if write_eligible.iter().any(|n| *n != self.cfg.node_id) {
                     self.note_foreign(now, replica, &mut out);
                 }
@@ -2804,6 +2819,14 @@ impl Core {
                 if self.inbox.holder.is_some() {
                     self.inbox_holder_tick(now, replica, &mut out);
                 }
+            }
+            Event::RosterUnread { issued } => {
+                if issued < self.roster_issued {
+                    return out;
+                }
+                self.roster_issued = issued;
+                self.roster_unread = true;
+                self.refresh_backup_eligibility();
             }
             Event::Peers {
                 registry_complete,

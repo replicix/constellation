@@ -258,6 +258,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::GrantHorizonPersisted { .. } => "GrantHorizonPersisted",
         Event::DelegStreamSynced { .. } => "DelegStreamSynced",
         Event::Roster { .. } => "Roster",
+        Event::RosterUnread { .. } => "RosterUnread",
         Event::Slack { .. } => "Slack",
         Event::Peers { .. } => "Peers",
         Event::OwnS3 { .. } => "OwnS3",
@@ -3368,6 +3369,9 @@ impl Driver {
                 write_eligible: roster,
                 issued,
             })),
+            SyncRequest::RosterUnread { issued } => {
+                Some(Internal::Event(Event::RosterUnread { issued }))
+            }
             SyncRequest::EpochChanged => {
                 self.report_epoch(false);
                 None

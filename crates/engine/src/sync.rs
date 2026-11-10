@@ -132,6 +132,11 @@ pub enum SyncRequest {
         roster: Vec<u64>,
         issued: constellation_authority::WaitMs,
     },
+    /// The registry poll could not read every node record: the roster is
+    /// unknown, not empty (`Event::RosterUnread`).
+    RosterUnread {
+        issued: constellation_authority::WaitMs,
+    },
     /// The continuation-epoch machine changed state (the driver
     /// re-reports it to the core).
     EpochChanged,

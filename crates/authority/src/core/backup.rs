@@ -3907,6 +3907,11 @@ impl Core {
         if !self.peers_seen || self.peers_lapses < self.lapses_seen {
             return true;
         }
+        // The newest roster read was partial: who the peers are is unknown,
+        // and unknown counts as peers.
+        if self.roster_unread {
+            return true;
+        }
         // Plan 46 M1.1 step 5 (C8 condition 3): a node that asked this one
         // for something is a linked peer until the directory says
         // otherwise.
