@@ -138,12 +138,13 @@ pub fn check_cto(
             continue;
         }
         report.violations.push(format!(
-            "node {} read {:?} as {} at tick {}, but {:?} (rid {:?}, from node {}) \
+            "node {} read {:?} as {} at tick {} (floor from: {}), but {:?} (rid {:?}, from node {}) \
              completed before the read began and every state from it on has {}",
             r.node,
             r.name,
             if r.present { "present" } else { "absent" },
             r.inv,
+            r.path,
             invoke[&rid].1,
             rid,
             rid.node,

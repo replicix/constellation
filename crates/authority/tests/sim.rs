@@ -308,6 +308,7 @@ fn replay_seed() {
         Ok("sticky-handover-ping-pong") => sticky_handover_ping_pong_config(),
         Ok("sticky-holder-dies") => sticky_holder_dies_config(),
         Ok("sticky-holder-returns") => sticky_holder_returns_config(),
+        Ok("sticky-holder-restarts") => sticky_holder_restarts_config(),
         Ok("sticky-ttl") => sticky_ttl_config(),
         Ok("sticky-stale-route") => sticky_stale_route_config(),
         Ok("backup-two") => backup_two_config(),
@@ -1889,6 +1890,55 @@ fn sticky_holder_returns_config() -> SimConfig {
         c
     });
     config
+}
+
+/// ADR-46: the holder of a sticky grant crashes and returns with its journal
+/// 2 s later, with no abandon, at the default read TTL. Node 3 only reads,
+/// holding read delegations from the holder when it crashes, and is cut from
+/// the root and from S3 for 2 s from 3 s, so it keeps serving under them
+/// until they lapse or it hears from the returned holder. A returned holder
+/// that executes at once (it has forgotten its grants) lets node 3 serve a
+/// state older than a write whose client had its `Ok`: the close-to-open
+/// oracle (`check_cto`) fails the run.
+fn sticky_holder_restarts_config() -> SimConfig {
+    SimConfig {
+        nodes: 3,
+        strict: true,
+        read_ratio: 0.5,
+        reader_nodes: vec![3],
+        client_plan: vec![(3, 500, 40)],
+        dirs: vec!["d1".into(), "d2".into()],
+        delegations: Vec::new(),
+        sticky_delegations: vec![("d2".into(), 2)],
+        cross_ratio: 0.1,
+        ops_per_client: 40,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 2_500,
+                kind: FaultKind::CrashNode {
+                    node: 2,
+                    restart_ms: Some(2_000),
+                    keep_journal: true,
+                },
+            },
+            ScheduledFault {
+                at_ms: 3_000,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 3,
+                    for_ms: 2_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 3_000,
+                kind: FaultKind::CutS3 {
+                    node: 3,
+                    for_ms: 2_000,
+                },
+            },
+        ],
+        ..delegated_config()
+    }
 }
 
 /// Plan 46 M1.3 step 4: two sticky grants made by the operator
@@ -6122,6 +6172,7 @@ fn sweep_config() {
         "sticky-handover-ping-pong" => sticky_handover_ping_pong_config(),
         "sticky-holder-dies" => sticky_holder_dies_config(),
         "sticky-holder-returns" => sticky_holder_returns_config(),
+        "sticky-holder-restarts" => sticky_holder_restarts_config(),
         "sticky-ttl" => sticky_ttl_config(),
         "sticky-stale-route" => sticky_stale_route_config(),
         "backup-departs" => backup_departs_config(),
@@ -8205,6 +8256,7 @@ struct OracleTotals {
     /// reason: released, abandoned, other).
     sticky: [u64; 5],
     sticky_core: [u64; 16],
+    quarantine_core: [u64; 5],
     sticky_driver: [u64; 4],
     sticky_release_rows_judged: u64,
     /// Plan 46 M1.3 step 13: I5's operator branch (rows of abandoned streams
@@ -8489,6 +8541,9 @@ impl OracleTotals {
         for (t, c) in self.sticky_core.iter_mut().zip(r.sticky_core) {
             *t += c;
         }
+        for (t, c) in self.quarantine_core.iter_mut().zip(r.quarantine_core) {
+            *t += c;
+        }
         self.sticky_release_rows_judged += r.sticky_release_rows_judged;
         for (t, c) in self.sticky_driver.iter_mut().zip(r.sticky_driver) {
             *t += c;
@@ -8679,6 +8734,16 @@ impl OracleTotals {
             self.i5_operator.0,
             self.i5_operator.1,
             self.i5_after_end
+        );
+        eprintln!(
+            "QUARANTINE-TOTALS {label} seeds {}/{seeds}: restart quarantines {}, own writes parked {}, forwards answered Held {}, \
+             waited out {}, read grants withheld {}",
+            self.seeds,
+            self.quarantine_core[0],
+            self.quarantine_core[1],
+            self.quarantine_core[2],
+            self.quarantine_core[3],
+            self.quarantine_core[4]
         );
         eprintln!(
             "SWEEP-UNSETTLED-CAUSES {label} seeds {}/{seeds}: {:?}",
@@ -18839,6 +18904,48 @@ fn the_read_oracle_catches_an_abandon_that_skips_the_read_recall() {
             .expect_err("the abandon skipped the read recall and no oracle noticed");
         assert!(
             e.contains("no_read_under_an_abandoned_stream"),
+            "seed {seed}: {e}"
+        );
+    }
+}
+
+/// ADR-46: the holder of a sticky grant crashes and returns with its journal
+/// (`sticky-holder-restarts`, no abandon, default read TTL). Its table of read
+/// delegations is gone, but node 3 still honours the ones it made: a holder
+/// that executed at once let node 3 serve a read older than a completed
+/// write (8 of the first 1,500 seeds before the quarantine; 156, 159 and 728
+/// among them). The restarted holder now executes and grants nothing until
+/// the persisted delegate horizon has passed.
+#[test]
+fn a_restarted_sticky_holder_serves_no_stale_read() {
+    let mut quarantined = 0;
+    for seed in [156u64, 159, 728] {
+        let r = run_seed(seed, sticky_holder_restarts_config()).unwrap_or_else(|e| {
+            panic!(
+                "sticky-holder-restarts seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=sticky-holder-restarts"
+            )
+        });
+        quarantined += r.quarantine_core[0];
+    }
+    assert!(quarantined > 0, "no restarted holder was quarantined");
+}
+
+/// The oracle's negative control: with `Config::restart_skips_write_quarantine`
+/// (`AUTHORITY_SIM_RESTART_SKIPS_WRITE_QUARANTINE=1`) the restarted holder
+/// executes at once, and the close-to-open oracle fails the run on a read
+/// served under a held read delegation of the dead process.
+#[test]
+fn the_cto_oracle_catches_a_restart_that_skips_the_write_quarantine() {
+    let config = SimConfig {
+        restart_skips_write_quarantine: true,
+        ..sticky_holder_restarts_config()
+    };
+    for seed in [156u64, 159, 728] {
+        let e = run_seed(seed, config.clone())
+            .expect_err("the holder skipped the quarantine and no oracle noticed");
+        assert!(
+            e.contains("close-to-open violated") && e.contains("held read delegation"),
             "seed {seed}: {e}"
         );
     }

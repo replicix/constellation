@@ -262,6 +262,9 @@ pub struct ReadEvt {
     pub ret: u64,
     /// The session wait ran out and the read answered degraded.
     pub timed_out: bool,
+    /// How the read's floor was obtained: a read delegation the node held,
+    /// a ReadIndex answer, a degraded one, or none (a bounded mount).
+    pub path: &'static str,
 }
 
 #[derive(Default)]
