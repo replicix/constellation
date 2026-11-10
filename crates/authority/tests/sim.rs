@@ -1218,7 +1218,10 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
     // long-configuration seed of 10000–29999 fails on this tree, 10446 and
     // 10794 included. The guard is the core test
     // `every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward`.)
-    for seed in [10446, 10794] {
+    // The settle's tombstones written beside it, a freshness bound late,
+    // moved them again: over 10000-13999 the finder gives 10794 and 11298
+    // twice each, and 13997 once.
+    for seed in [10794, 11298] {
         let report = run_seed(seed, long_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let multi: u64 = report
             .stats
@@ -1237,9 +1240,10 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
 /// settle's first window, so its tombstone cannot be written and the settle
 /// goes on by P2P alone; the `EIO` it ends in (and any later landing of the
 /// op) is `isolated-from-s3`: allowed, and counted apart from the
-/// reachability classes. Seed 393 of `long-backup` with S3 cut at node 2 over
-/// 5–21 s and slow lease reads tells one; without the label it is an I4
-/// violation.
+/// reachability classes. Seed 41 of `long-backup` with S3 cut at node 2 over
+/// 5–21 s and slow lease reads tells one (twice); without the label it is an
+/// I4 violation. (Seeds 207, 263, 271, 358 and 408 do the same; seed 393
+/// did, before the tombstones were written beside the settle.)
 #[test]
 fn a_failed_tombstone_with_s3_cut_is_labelled_isolated_from_s3() {
     let mut cfg = config_variant(base_config("long-backup"), "cuts32@5000:16000");
@@ -1247,7 +1251,7 @@ fn a_failed_tombstone_with_s3_cut_is_labelled_isolated_from_s3() {
         before: (0, 0),
         reply: (800, 1_000),
     };
-    let r = run_seed(393, cfg).unwrap_or_else(|e| panic!("seed 393: {e}"));
+    let r = run_seed(41, cfg).unwrap_or_else(|e| panic!("seed 41: {e}"));
     let failed: u64 = r.stats.values().map(|s| s.settle_withdraw_failed).sum();
     assert!(failed >= 1, "no settle gave up its tombstone ({failed})");
     assert!(
