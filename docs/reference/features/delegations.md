@@ -1211,6 +1211,23 @@ share (only for its rate), `DOMINANCE=0` gives a subtree to its top
 writer whatever the share, and `MIN_OPS=0` drops the rate floor. See
 [Configuration](../configuration.md#delegation-and-placement).
 
+## Roster and the singleton (ADR-50)
+
+A root answers its own node's clients from its disk alone only when its
+**roster object** lists no write-eligible node but itself
+([ADR-50](../../explanation/DECISIONS.md#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer)).
+A root with any registered write-eligible peer, however far, unlinked or
+unmounted, waits for the archive (or its backup's copy) for every op of its
+own, the ops under its own subtrees included, until plan 46 M1.3 step 9
+lets it answer those by delegation. A node that is registered and will not be
+mounted again is retired with `leave`: until then the root stays off the
+singleton path (`constellation status` shows `roster.write_eligible`,
+`roster.heard`, whether the read is `complete` and the verdict
+`roster.singleton`, and `ack.classes.archive_waits` counts the waits). A root
+that holds a live generation for another node is no singleton either, and its
+`DelegateStreamAck` is archive-bound when no backup is listed. The cost is
+latency only: the archive wait of one S3 PUT per op batch.
+
 ## Status
 
 `constellation status` (JSON, under `delegation`) shows `enabled`, the
