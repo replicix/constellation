@@ -222,10 +222,10 @@ impl Core {
         if self.is_leaving(now, node) {
             return false;
         }
-        if !self.links.get(&node).is_some_and(|l| l.connected) {
+        if !self.roster.links().get(&node).is_some_and(|l| l.connected) {
             return false;
         }
-        if self.roster.contains(&node) {
+        if self.roster.lists(node) {
             return true;
         }
         if self
@@ -268,7 +268,8 @@ impl Core {
             return false;
         }
         if self
-            .links
+            .roster
+            .links()
             .get(&node)
             .is_none_or(|l| self.link_rtt_ms(l).is_none_or(|rtt| rtt <= budget))
         {

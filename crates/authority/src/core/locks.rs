@@ -2078,7 +2078,8 @@ impl Core {
     fn lock_ask_again_wait_ms(&self, node: NodeId) -> i64 {
         let base = self.lock_unreachable_wait_ms();
         let rtt = self
-            .links
+            .roster
+            .links()
             .get(&node)
             .and_then(|l| l.rtt_ms)
             .unwrap_or(0)

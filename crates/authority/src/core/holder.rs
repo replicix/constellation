@@ -424,7 +424,11 @@ impl Core {
                     let live = self.dl.gens.get(&d.gen).filter(|g| {
                         !g.ended
                             && now.wait < self.gen_until(d.gen)
-                            && self.links.get(&d.node).is_some_and(|l| l.connected)
+                            && self
+                                .roster
+                                .links()
+                                .get(&d.node)
+                                .is_some_and(|l| l.connected)
                     });
                     // (A non-stealable grant is never recalled: its designee's own op
                     // is held as it was, and `deleg_recall_plan` refuses.)
@@ -1622,7 +1626,11 @@ impl Core {
                                 && s.recall == RecallPhase::None
                         })
                         && now.wait < self.gen_until(d.gen)
-                        && self.links.get(&d.node).is_some_and(|l| l.connected);
+                        && self
+                            .roster
+                            .links()
+                            .get(&d.node)
+                            .is_some_and(|l| l.connected);
                     if !live {
                         return None;
                     }
