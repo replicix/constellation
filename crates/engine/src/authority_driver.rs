@@ -705,14 +705,24 @@ pub fn load_config(
     // the mount's `--locks` (`crate::locks::cluster_effective`).
     c.locks = p2p;
     c.lock_ttl_ms = crate::locks::lock_ttl_ms(c.lock_ttl_ms);
-    if !constellation_authority::deadlines::Deadlines::new(&c).lock_grace_fits_lease() {
+    // Deadline D8: a lock grace (the lock TTL and two margins) must fit in
+    // one lease TTL, or a TTL successor of a tenure that inherited it may
+    // grant over a grant of the tenure before it. Cut the lock TTL to fit.
+    let fitted = constellation_authority::deadlines::lock_ttl_fitting_lease(
+        c.lock_ttl_ms,
+        c.ttl_ms,
+        c.expiry_margin_ms,
+    );
+    if fitted != c.lock_ttl_ms {
         tracing::warn!(
-            lock_ttl_ms = c.lock_ttl_ms,
+            configured_lock_ttl_ms = c.lock_ttl_ms,
+            lock_ttl_ms = fitted,
             expiry_margin_ms = c.expiry_margin_ms,
             lease_ttl_ms = c.ttl_ms,
-            "the lock TTL plus two margins exceeds the lease TTL: a TTL successor of a tenure \
-             that inherited a lock grace may grant over a grant of the tenure before it"
+            "the lock TTL plus two margins exceeds the lease TTL: running with the lock TTL cut to \
+             the lease TTL less two margins"
         );
+        c.lock_ttl_ms = fitted;
     }
     c.lock_cache_idle_ms = crate::locks::lock_cache_idle_ms(c.lock_cache_idle_ms);
     c.read_index_deadline_ms = crate::cto::read_index_budget_ms();

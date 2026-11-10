@@ -198,6 +198,16 @@ pub fn default_delegation_ttl(lock_ttl_ms: u64) -> u64 {
     lock_ttl_ms.max(5_000)
 }
 
+/// The lock TTL a daemon runs with: the configured one, cut to what D8
+/// allows, `lease_ttl - 2 * margin` ([`Deadlines::lock_grace_fits_lease`]),
+/// and at least 1 ms. A shorter grant only costs more renewals; a longer one
+/// would outlive the lease that a TTL successor waits out.
+pub fn lock_ttl_fitting_lease(lock_ttl_ms: u64, lease_ttl_ms: u64, margin_ms: u64) -> u64 {
+    lock_ttl_ms
+        .min(lease_ttl_ms.saturating_sub(2 * margin_ms))
+        .max(1)
+}
+
 /// The lock lane's tick: a quarter of the forward timeout, between 50 and
 /// 250 ms. The engine's lane loop and the simulation's both read it.
 pub fn lane_tick_ms(forward_timeout_ms: u64) -> u64 {
@@ -417,7 +427,9 @@ impl Deadlines {
     /// its taker first saw the release, and a TTL successor of a tenure that
     /// inherited it arms no floor of its own: the grace must fit inside one
     /// lease TTL for that successor to find every grant of the old tenure
-    /// over.
+    /// over. Else the successor may grant a lock the old tenure's holder
+    /// still honours: two holders of one lock. The daemon cuts its lock TTL
+    /// to fit ([`lock_ttl_fitting_lease`]).
     pub fn lock_grace_fits_lease(&self) -> bool {
         self.base.lock_ttl + 2 * self.base.margin <= self.base.lease_ttl
     }
@@ -1227,6 +1239,18 @@ mod tests {
         let mut c = Config::defaults(1, 1);
         c.ttl_ms = 10_000;
         assert!(has(&Deadlines::new(&c), "D8"));
+        // The daemon's cut makes it hold, whatever the lease.
+        for lease in [200, 1_000, 10_000, 20_000, 22_000, 60_000] {
+            let mut c = Config::defaults(1, 1);
+            c.ttl_ms = lease;
+            c.expiry_margin_ms = 1_000.min(lease / 4);
+            c.lock_ttl_ms = lock_ttl_fitting_lease(20_000, c.ttl_ms, c.expiry_margin_ms);
+            assert!(!has(&Deadlines::new(&c), "D8"), "lease {lease}");
+        }
+        assert_eq!(lock_ttl_fitting_lease(20_000, 60_000, 1_000), 20_000);
+        assert_eq!(lock_ttl_fitting_lease(20_000, 20_000, 1_000), 18_000);
+        assert_eq!(lock_ttl_fitting_lease(3_000, 20_000, 1_000), 3_000);
+        assert_eq!(lock_ttl_fitting_lease(20_000, 200, 50), 100);
         let mut c = Config::defaults(1, 1);
         c.backup_heartbeat_ms = 600;
         assert!(has(&Deadlines::new(&c), "D9"));

@@ -41,7 +41,10 @@ impl Timings {
         };
         let lease_ttl = knob("CONSTELLATION_LEASE_TTL_MS", 60_000);
         let margin = 1_000u64.min(lease_ttl / 4);
-        let lock_ttl = knob("CONSTELLATION_LOCK_TTL_MS", 20_000);
+        // Cut to the lease TTL less two margins (deadline D8).
+        let lock_ttl = knob("CONSTELLATION_LOCK_TTL_MS", 20_000)
+            .min(lease_ttl.saturating_sub(2 * margin))
+            .max(1);
         let delegation_ttl = knob("CONSTELLATION_DELEGATION_TTL_MS", lock_ttl.max(5_000));
         let read_delegation_ttl = get("CONSTELLATION_READ_DELEGATION_TTL_MS")
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -187,6 +190,15 @@ mod tests {
         assert_eq!(t.reclaim_horizon(), ms(6_000));
         assert_eq!(t.ack_floor_wait(true), ms(14_500));
         assert_eq!(t.ack_floor_wait(false), ms(8_500));
+    }
+
+    #[test]
+    fn the_lock_ttl_is_cut_to_fit_the_lease() {
+        let t = Timings::from_pairs(&[("CONSTELLATION_LEASE_TTL_MS", "20000")]);
+        assert_eq!(t.lock_ttl, ms(18_000));
+        assert_eq!(t.delegation_ttl, ms(18_000));
+        let t = Timings::from_pairs(&[("CONSTELLATION_LEASE_TTL_MS", "22000")]);
+        assert_eq!(t.lock_ttl, ms(20_000));
     }
 
     #[test]
