@@ -1452,7 +1452,12 @@ cost when the node is idle
   than half its timeout is answered `Held` and retried by rid. The sequencer persists a grant horizon before it
   answers, so it grants nothing new after a restart until earlier grants
   have expired, and a fast successor waits the horizon out before it
-  acknowledges anything. Kernel caches have a zero TTL under strict,
+  acknowledges anything. A delegate does the same
+  for the read delegations it grants under its subtree (its own persisted
+  horizon), and a restarted holder executes nothing and grants nothing
+  until those have expired or every node has dropped them: its own writes
+  park, a forward is answered `Held`
+  ([ADR-46](DECISIONS.md#adr-46-a-restarted-holders-writes-wait-for-the-read-delegations-its-previous-process-granted)). Kernel caches have a zero TTL under strict,
   except on a sequencer that has not yet seen another node.
 
 Strict costs nothing on a single node, about one round trip for a first
