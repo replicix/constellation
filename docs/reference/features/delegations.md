@@ -848,6 +848,19 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
   usually a dead one. A recorded backup that holds nothing of the generation
   (chosen before the delegate appended anything) answers so, and the
   generation ends at the root's cursor.
+- **Delegate reboots or dies with its strict backup (a double fault)**: a
+  delegate that went down after its strict backup went silent, or before it
+  could have noticed, leaves the operations on its generation unsettled: the
+  client hears the unsettled `EIO` (in doubt, retryable by rid) until a member
+  of the group answers or the operator ends the generation. There is no
+  "sync on a strict backup's silence" (the delegate would flush its rows to
+  the log when the backup goes quiet): it was weighed and not built, and this
+  `EIO` is the documented cost of the double fault. The simulation measures
+  it (`unsettled_silence`, `SWEEP-UNSETTLED-SILENCE`, by whether a member went
+  silent before the delegate went down, and for how long) in the
+  configurations `delegated-backup-dies-then-delegate-reboots` and its
+  `-early` and `-mid` variants. Their ceilings in the ratchet
+  (`m03_the_configurations_at_zero_violations_stay_there`) may only go down.
 - **Delegate and its recorded backup both gone**: the generation cannot end,
   and the writes under its subtree wait for it (the root recalls before it
   executes in a subtree; nothing is answered from the missing tail).
