@@ -457,8 +457,6 @@ pub struct NodeEnv {
     pub first_start_unsettled: bool,
     /// See `SimConfig::holder_releases_before_drain`.
     pub holder_releases_before_drain: bool,
-    /// See `SimConfig::refuse_forwarded_designation_ops`.
-    pub refuse_forwarded_designation_ops: bool,
     /// See `SimConfig::fence_accepts_unrouted`.
     pub fence_accepts_unrouted: bool,
     /// See `SimConfig::root_ignores_touched`.
@@ -774,13 +772,9 @@ impl NodeHandle {
         cfg.ttl_reclaims_sticky = env.ttl_reclaims_sticky;
         cfg.restart_skips_write_quarantine = env.restart_skips_write_quarantine;
         cfg.holder_releases_before_drain = env.holder_releases_before_drain;
-        cfg.refuse_forwarded_designation_ops = env.refuse_forwarded_designation_ops;
         cfg.fence_accepts_unrouted = env.fence_accepts_unrouted;
         cfg.root_ignores_touched = env.root_ignores_touched;
         cfg.inbox_ignores_touched = env.inbox_ignores_touched;
-        // (The requester's marks hold the refusal of an op sent to a
-        // designee as well: off, or the control is vacuous.)
-        cfg.refuse_forwarded_designation_ops |= env.root_ignores_touched;
         cfg.partial_release_ends_stream = env.partial_release_ends_stream;
         cfg.abandon_skips_read_recall = env.abandon_skips_read_recall;
         let mut cfg = driver_config(cfg);

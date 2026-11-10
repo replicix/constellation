@@ -529,11 +529,6 @@ pub struct SimConfig {
     /// `AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN=1` sets it on every
     /// configuration; a run that released before the drain fails.
     pub holder_releases_before_drain: bool,
-    /// Negative control (`Config::refuse_forwarded_designation_ops`): the
-    /// holds of an op sent to a non-stealable holder are off.
-    /// `AUTHORITY_SIM_REFUSE_FORWARDED_DESIGNATION_OPS=1` sets it on every
-    /// configuration; `sticky-ttl` then fails (`refused_and_completed`, I1).
-    pub refuse_forwarded_designation_ops: bool,
     /// Negative control (`Config::fence_accepts_unrouted`): a node runs a
     /// forward under its generation whatever generation it was routed by (no
     /// delegate fence). `AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED=1` sets it on
@@ -541,9 +536,7 @@ pub struct SimConfig {
     pub fence_accepts_unrouted: bool,
     /// Negative control (`Config::root_ignores_touched`): the root and the
     /// inbox drain refuse an op under an unreachable non-stealable grant for
-    /// good whatever it touched (main before ADR-47's root rule; the
-    /// requester's marks are off with it until they are deleted, else they
-    /// hold the refusal and the control is vacuous).
+    /// good whatever it touched (main before ADR-47's root rule).
     /// `AUTHORITY_SIM_ROOT_IGNORES_TOUCHED=1` sets it on every configuration.
     pub root_ignores_touched: bool,
     /// `Config::inbox_ignores_touched`: no requester hold for an inbox op
@@ -1156,10 +1149,6 @@ impl Default for SimConfig {
                 .is_some_and(|v| v == "1"),
             holder_releases_before_drain: std::env::var_os(
                 "AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN",
-            )
-            .is_some_and(|v| v == "1"),
-            refuse_forwarded_designation_ops: std::env::var_os(
-                "AUTHORITY_SIM_REFUSE_FORWARDED_DESIGNATION_OPS",
             )
             .is_some_and(|v| v == "1"),
             fence_accepts_unrouted: std::env::var_os("AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED")
@@ -4827,7 +4816,6 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         restart_skips_write_quarantine: cfg.restart_skips_write_quarantine,
         first_start_unsettled: cfg.first_start_unsettled,
         holder_releases_before_drain: cfg.holder_releases_before_drain,
-        refuse_forwarded_designation_ops: cfg.refuse_forwarded_designation_ops,
         fence_accepts_unrouted: cfg.fence_accepts_unrouted,
         root_ignores_touched: cfg.root_ignores_touched,
         inbox_ignores_touched: cfg.inbox_ignores_touched,

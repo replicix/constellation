@@ -152,13 +152,6 @@ pub struct Config {
     /// journaled before the drain (`deleg_sticky_release_undrained`).
     pub holder_releases_before_drain: bool,
     /// Fault injection for the simulation's negative control (never set by
-    /// the engine): the requester and the root do not hold an op that was
-    /// sent to a non-stealable holder (plan 46 M1.3 step 5): the root's
-    /// `EROFS`/`EXDEV` is the answer, the inbox takes the op when the root is
-    /// out of reach, and the root's own client op is refused. The rid then
-    /// has a journaled refusal beside the holder's row (`sticky-ttl` I1).
-    pub refuse_forwarded_designation_ops: bool,
-    /// Fault injection for the simulation's negative control (never set by
     /// the engine): the root ends a sticky stream when the holder releases
     /// some of its subtrees (plan 46 M1.3 step 5, MUST-1,
     /// `partial_release_ends_stream`). The sim's
@@ -603,7 +596,6 @@ impl Config {
             ttl_reclaims_sticky: false,
             restart_skips_write_quarantine: false,
             holder_releases_before_drain: false,
-            refuse_forwarded_designation_ops: false,
             partial_release_ends_stream: false,
             fence_accepts_unrouted: false,
             root_ignores_touched: false,
@@ -2258,10 +2250,6 @@ pub struct Core {
     pub(crate) emission_hold_expected: bool,
     final_nonholder_refusals: Vec<(Rid, Code, bool)>,
     nonstealable_executions: Vec<(Rid, u64)>,
-    /// Rids in `in_doubt_rids` whose op had been redirected to a designee:
-    /// the mark that keeps a resubmission out of the inbox (I1). Evicted
-    /// with `in_doubt_rids` (`MAX_IN_DOUBT_RIDS`, a known I1 bound).
-    in_doubt_designee_rids: std::collections::BTreeSet<Rid>,
     /// ADR-47: the `touched_gen` of the rids in `in_doubt_rids` (non-zero
     /// values only); a resubmission starts from it.
     in_doubt_touched: std::collections::BTreeMap<Rid, u64>,
@@ -2479,7 +2467,6 @@ impl Core {
             emission_hold_expected: false,
             final_nonholder_refusals: Vec::new(),
             nonstealable_executions: Vec::new(),
-            in_doubt_designee_rids: std::collections::BTreeSet::new(),
             in_doubt_touched: std::collections::BTreeMap::new(),
             in_doubt_evicted_max: None,
             in_doubt_batches: std::collections::BTreeMap::new(),
