@@ -3295,7 +3295,9 @@ later: `Refused` and `Completed` for one rid (I1), found by `sticky-ttl` in 8 of
 2,000 seeds (110, 624, 772, ...). The refuser cannot know the op was sent on;
 only the requester can.
 
-**Decision**: the requester remembers that it sent an op to a designee (its
+**Decision** (the requester-side mechanism below is replaced by ADR-47's
+executor-side route fencing; it is kept as the history of the change):
+the requester remembers that it sent an op to a designee (its
 table lists the target, or the root redirected the op to it, the table listing
 it or not) and does not accept such a refusal as the answer: the root's
 unjournaled `EROFS`/`EXDEV` is asked again like a `Held`, and the op is not put
@@ -3329,22 +3331,21 @@ designation refusal is its errno and not an unsettled `EIO`.
 where it ended `EROFS`: more `EIO`, later, for ops that may have run, and no
 false `EROFS`. Ops that were never sent to the holder are refused as before. The
 over-marking (a send to a holder that did not receive it) costs the errno, not
-safety. Known I1 limit: the marks are kept with the in-doubt rids, which the
-core bounds (`MAX_IN_DOUBT_RIDS`, 10,000 per node); a rid evicted beyond that
-is resubmitted unmarked, and a refusal of an op a designee ran is then not
-held (the same eviction already allows a second execution of an ordinary
-in-doubt rid). A second known I1 limit (multi-fault, older than this decision):
-a requester whose holder signals still name Y, a former holder that B has since
-made a designee (the requester idle, its S3 stalled, no frame or redirect since),
-routes a fresh rid to Y by that cache and does not mark it; if Y ran it as the
-designee and the reply was lost, B's later refusal of the rid under the
-designation is final. Closing it needs the forward to carry the generation it
-was routed by, and a designee to refuse to run a generation-0 forward for its
-designated keys (reply so the requester re-routes, nothing journaled). That is
-a wire change to `MutateRequest` and a new refusal path through every forward
-site; it is left for the later steps of M1.3 (the holder's row-driven answer
-replaces the requester's mark) rather than added here. The knob `refuse_forwarded_designation_ops` (test-only) restores the old
-behaviour; `sticky-ttl` fails with it.
+safety. Both known I1 limits of this decision are closed by ADR-47: the marks
+kept with the in-doubt rids, which the core bounds (`MAX_IN_DOUBT_RIDS`, 10,000
+per node), could be evicted, so that a refusal of an op a designee ran was no
+longer held; and a requester whose route cache named Y, a former holder that B
+had since made a designee (the idle requester, its S3 stalled, no frame or
+redirect since), routed a fresh rid to Y unmarked, and B's later refusal of the
+rid under the designation was final if Y ran it and the reply was lost (S7).
+ADR-47 replaces the requester's marks with what the executors check: a forward
+carries the generation it was routed by and the highest generation the rid ever
+touched; a designee runs it only under the generation it was routed by, and the
+root refuses for good only a rid that touched none. An evicted rid is
+resubmitted with an unknown history, which only holds. The requester-side
+machinery of this decision (the marks, `named_holder`, the reply hold, the
+knob `refuse_forwarded_designation_ops`) is deleted; the negative controls are
+now ADR-47's (`fence_accepts_unrouted`, `root_ignores_touched`).
 
 A delegate's stream that the root refused (the root restarted or is
 re-adopting after a slow lease read, and does not know the generation yet)
@@ -3365,19 +3366,16 @@ therefore judges the unsettled `EIO` of an op a delegate had answered
 the delegate the requester had already heard; a root in force that could take
 the rows is still a violation.
 
-**May revert**: never as a whole; plan 46 M1.3's later steps may replace the
-requester's mark with the holder's row-driven answer.
+**May revert**: never as a whole; ADR-47 has replaced the requester's mark
+with the executors' checks.
 
-See: `crates/authority/src/core/client.rs` (`sent_to_designation`,
-`on_holder_learned`, `on_mutate_reply`), tests
+See: `crates/authority/src/core/client.rs` (`on_holder_learned`,
+`on_mutate_reply`), tests
 `an_op_redirected_to_a_designee_the_table_lacks_is_not_put_in_the_inbox`,
 `a_read_index_redirect_to_a_designee_is_not_cached_as_the_lease_holder`,
 `a_lock_not_owner_naming_a_designee_is_not_cached_as_the_lease_holder`,
-`a_rid_forwarded_to_a_node_the_lease_does_not_name_is_marked`,
-`a_forward_to_the_holder_a_deposition_named_is_not_marked`,
 `a_granted_renewal_ends_the_streams_refusal_backoff`,
 `an_unsettled_eio_of_an_op_a_delegate_accepted_is_named`,
-`the_roots_refusal_is_held_when_the_root_is_listed_as_a_delegate`,
 [delegations](../reference/features/delegations.md).
 
 ## ADR-46: A restarted holder's writes wait for the read delegations its previous process granted

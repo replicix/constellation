@@ -27,10 +27,9 @@ use constellation_meta::{
 use constellation_types::Code;
 use std::collections::BTreeSet;
 
-/// How many `InDoubt` rids the core remembers for their resubmission.
-/// Known I1 limit: a rid evicted past this bound is resubmitted without the
-/// marks it carried (`sent_to_delegate`, `redirected_to_designee`), so a
-/// refusal of an op a designee ran is no longer held (ADR-45); the same
+/// How many `InDoubt` rids the core remembers for their resubmission. A rid
+/// evicted past this bound is resubmitted with an unknown send history
+/// (`TOUCHED_UNKNOWN`, ADR-47), which only ever holds a refusal; the same
 /// eviction already allows a second execution of an ordinary in-doubt rid.
 pub(super) const MAX_IN_DOUBT_RIDS: usize = 10_000;
 
@@ -116,14 +115,6 @@ pub(crate) struct ClientOp {
     /// `NotHolder` redirects followed (plan 30 §M11: two, since a
     /// delegate's names the root and the root's a delegate).
     pub redirected: u32,
-    /// The op was sent to a node that holds a delegation (the table named it
-    /// the owner of the op's keys, or the root redirected the op to it): it
-    /// may have run there, whatever the root says later.
-    pub sent_to_delegate: bool,
-    /// The root redirected the op to a node this node's table does not list
-    /// as a delegate (the table lags the root's journal): the op was sent to
-    /// a designee all the same, whatever the keys resolve to here.
-    pub redirected_to_designee: bool,
     /// A non-stealable holder's refusal was held back for this op (it was
     /// sent on, so it may have run): its in-doubt end is I4's exception for
     /// an unreachable non-stealable holder (`unsettled_nonstealable_holder`).
@@ -546,7 +537,6 @@ impl Core {
             let first = *self.in_doubt_rids.iter().next().expect("non-empty");
             self.in_doubt_rids.remove(&first);
             self.in_doubt_batches.remove(&first);
-            self.in_doubt_designee_rids.remove(&first);
             self.in_doubt_touched.remove(&first);
             if first.node == self.cfg.node_id {
                 self.in_doubt_evicted_max = self.in_doubt_evicted_max.max(Some(first));
@@ -680,7 +670,6 @@ impl Core {
         // `send_forward` sends to a designee is marked from then on, as any.
         let resubmitted =
             !matches!(origin, Origin::Replay { .. }) && self.in_doubt_rids.remove(&rid);
-        let redirected_to_designee = resubmitted && self.in_doubt_designee_rids.remove(&rid);
         let in_doubt = matches!(origin, Origin::Replay { .. }) || resubmitted;
         // An entry, even with no keys left, says the rid was in an inbox.
         let in_doubt_batch = self.in_doubt_batches.remove(&rid);
@@ -749,8 +738,6 @@ impl Core {
                 settle_until: WaitMs(0),
                 settle_cap: WaitMs(0),
                 gate_recall_wait: false,
-                sent_to_delegate: resubmitted,
-                redirected_to_designee,
                 designation_held: false,
                 accepted_by_delegate: false,
                 tag,
@@ -1402,20 +1389,6 @@ impl Core {
             .expect("reason") += 1;
     }
 
-    /// Whether `node` owns (holds a grant of) any of `rid`'s keys in this
-    /// replica's table.
-    fn owns_keys_of(&self, rid: Rid, node: NodeId, replica: &dyn Replica) -> bool {
-        let Some(c) = self.clients.get(&rid) else {
-            return false;
-        };
-        let keys = super::holder::keys_of_op_in(&c.op, replica);
-        match replica.resolve_ownership(&keys) {
-            Ownership::Delegated(d) => d.node == node,
-            Ownership::CrossSubtree { involved, .. } => involved.iter().any(|d| d.node == node),
-            Ownership::Root => false,
-        }
-    }
-
     pub(crate) fn on_holder_learned(
         &mut self,
         now: Now,
@@ -1465,8 +1438,9 @@ impl Core {
                 );
                 if reaches {
                     self.send_forward(now, rid, holder, 0, replica, out);
-                } else if let Some(hold) = (self.cfg.inbox
-                    && !self.cfg.refuse_forwarded_designation_ops)
+                } else if let Some(hold) = self
+                    .cfg
+                    .inbox
                     .then(|| self.inbox_hold(rid, replica))
                     .flatten()
                 {
@@ -1475,8 +1449,8 @@ impl Core {
                     // good (journaled, `Refused`), and an op sent to the
                     // designee may have run there: the refusal would
                     // contradict the designee's answer (I1). It waits, as
-                    // for the root's refusal (`on_mutate_reply`), until the
-                    // holder's word or its deadlines.
+                    // for the root's `HolderUnreachable` (`on_mutate_reply`),
+                    // until the holder's word or its deadlines.
                     self.stats.designation_refusals_held += 1;
                     let timer = self.set_timer_wait(
                         now.wait.plus(self.cfg.forward_timeout_ms.max(10)),
@@ -1519,29 +1493,9 @@ impl Core {
             out,
         );
         let acked_through = self.acked.floor();
-        // A node other than the holder the holder signals last named
-        // (`LeaseState::named_holder`: lease objects, depositions, stream
-        // frames, the holder's own replies; not only the last lease object
-        // read, which they leave behind) may be a designee: the table here
-        // lags the root's, and any cache setter may have named one. The op
-        // is marked, so its refusal by the root is held, not final (I1). A
-        // structural guard: it does not depend on how the target came to be
-        // cached. (Without a signal there is nothing to compare with.)
-        let to_delegate = replica.delegation_table().iter().any(|e| e.node == holder)
-            || (holder != 0 && self.lease.named_holder.is_some_and(|named| named != holder));
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
-        // (A send routed by a generation is to a delegate, whatever the
-        // table here lists.)
-        c.sent_to_delegate |= to_delegate || routed_gen != 0;
-        // (Nor does a table that lags tell where the generation's op went:
-        // a send routed by a generation went to its designee, and the
-        // inbox hold (`inbox_ok`) must cover it as it covers a
-        // redirect.)
-        if routed_gen != 0 {
-            c.redirected_to_designee = true;
-        }
         // ADR-47: the rid is touched by the generation this send is routed
         // by from here on, whether the send leaves now or after the batch
         // withdrawal below; the value travels with it.
@@ -1728,43 +1682,6 @@ impl Core {
             ?outcome,
             "forward reply"
         );
-        // A designation's refusal (the root's `EROFS`/`EXDEV`: nothing is
-        // journaled for it, no generation named) of an op this node sent to
-        // the designee (its table named it, or the root redirected there)
-        // before: the root cannot know that, and
-        // the designee may have run the op, so the refusal would tell the
-        // application it did not (I1). It is asked again, like a `Held`: if
-        // the designee's row reached the root the answer is the rid's
-        // outcome, else the op's deadlines end it in doubt (the settle's
-        // unsettled `EIO`, bounded by `settle_cap`: I4's exception for an
-        // unreachable non-stealable holder).
-        let outcome = if gen == 0
-            && !self.cfg.refuse_forwarded_designation_ops
-            && !committed
-            && matches!(
-                &outcome,
-                MutateOutcome::Errno(Code::ReadOnly | Code::CrossDevice)
-            )
-            && self
-                .clients
-                .get(&rid)
-                .is_some_and(|c| c.sent_to_delegate && c.origin == Origin::Client)
-            // (The refusal is the root's, not the designee's own: the root
-            // may be listed as a delegate of other keys, so the table's
-            // listing says nothing; whose grant the op's keys are does.)
-            && !self.owns_keys_of(rid, from, replica)
-        {
-            self.stats.designation_refusals_held += 1;
-            if let Some(c) = self.clients.get_mut(&rid) {
-                c.designation_held = true;
-            }
-            MutateOutcome::Held {
-                retry_ms: self.cfg.forward_timeout_ms.max(10),
-                outwait_ms: None,
-            }
-        } else {
-            outcome
-        };
         if matches!(&outcome, MutateOutcome::Accepted { .. }) {
             // The latest acceptance decides: a root's after a delegate's
             // leaves the op awaiting the root's log, not a delegate's rows.
@@ -2047,10 +1964,7 @@ impl Core {
                 // The root's redirect to a designee carries the designee's
                 // generation (`gen`); a lease holder's redirect (a deposed
                 // root naming the new one, a delegate naming the root) does
-                // not. Only the first marks the op as sent to a designee, even
-                // when this node's table does not list it yet.
-                let to_designee =
-                    gen != 0 && holder != 0 && holder != from && holder != self.cfg.node_id;
+                // not.
                 // Plan 30 §M11: the root's `NotHolder` names a delegate
                 // (the op is wholly the delegate's); that is a route, not
                 // the lease holder, so the cache keeps the root. A redirect that
@@ -2101,10 +2015,6 @@ impl Core {
                     && !inbox_only
                 {
                     c.redirected += 1;
-                    if to_designee {
-                        c.sent_to_delegate = true;
-                        c.redirected_to_designee = true;
-                    }
                     self.stats.forward_redirects += 1;
                     self.send_forward(now, rid, holder, gen, replica, out);
                 } else {
@@ -3132,8 +3042,6 @@ impl Core {
                         // is set before a send or a local offer to a
                         // generation, `UNKNOWN` for a replay or an in-doubt
                         // resubmission; `EXDEV` is final.)
-                        // (Only `root_holds_touched` gates this rule, not the
-                        // requester marks' knob.)
                         if self.root_holds_touched(
                             code,
                             self.clients
@@ -4755,9 +4663,6 @@ impl Core {
                         self.in_doubt_touched.insert(rid, c.touched_gen);
                     }
                     self.evict_in_doubt();
-                    if c.redirected_to_designee {
-                        self.in_doubt_designee_rids.insert(rid);
-                    }
                     if c.inbox_ever || !c.inbox_keys.is_empty() {
                         self.in_doubt_batches.insert(rid, c.inbox_keys);
                     }

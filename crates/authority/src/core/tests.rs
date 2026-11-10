@@ -47204,6 +47204,7 @@ mod deleg_group {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         })
     }
@@ -66478,16 +66479,15 @@ mod step5_sticky_release {
 
     /// A remote requester that was redirected to the designee (the root's
     /// `NotHolder`) and then came back to the root, which found the designee
-    /// out of reach and refused for good (`EROFS`, the designation's, not
-    /// journaled): the root cannot know the op went to the designee, which
-    /// may have run it. The requester does not take the refusal for the
-    /// answer: it asks again, and its deadlines end the op in doubt (the
-    /// unsettled `EIO`, I4's exception for an unreachable non-stealable
-    /// holder). Reachable: the root answers `NotHolder` only while it reaches
-    /// the designee, and refuses once it does not. Fails on the parent: the
-    /// application is told `EROFS`.
+    /// out of reach. The op was sent under the designee's generation (its
+    /// `touched_gen` says so), so the root answers `HolderUnreachable`, not a
+    /// refusal for good: the designee may have run it. The requester asks
+    /// again, and its deadlines end the op in doubt (the unsettled `EIO`,
+    /// I4's exception for an unreachable non-stealable holder). Reachable:
+    /// the root answers `NotHolder` only while it reaches the designee, and
+    /// holds once it does not.
     #[test]
-    fn a_designations_refusal_of_an_op_sent_to_the_designee_is_not_final() {
+    fn a_roots_hold_of_an_op_sent_to_the_designee_is_not_final() {
         use std::collections::BTreeMap;
         let mut h = Harness::new(2);
         h.core.cfg.delegation = true;
@@ -66567,7 +66567,13 @@ mod step5_sticky_release {
                     // The root's designee redirect carries the generation.
                     let (outcome, gen) = if redirected {
                         refusals += 1;
-                        (MutateOutcome::Errno(Code::ReadOnly), 0)
+                        (
+                            MutateOutcome::HolderUnreachable {
+                                gen: 7,
+                                retry_ms: 100,
+                            },
+                            0,
+                        )
                     } else {
                         redirected = true;
                         (MutateOutcome::NotHolder { holder: 3 }, 7)
@@ -66775,7 +66781,7 @@ mod step5_sticky_release {
                 .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::MutateRequest { .. })),
             "not redirected to the designee: {out:?}"
         );
-        assert!(h.core.clients[&rid].sent_to_delegate);
+        assert_eq!(h.core.clients[&rid].touched_gen, 7);
         // The designee's answer is lost, and the requester is cut off.
         h.step(links_event(&[]));
         let mut out = out;
@@ -66994,14 +67000,14 @@ mod step5_sticky_release {
     }
 
     /// An op redirected to a designee and left in doubt (its answer lost, no
-    /// sequencer's answer to the settle) keeps the mark when the client
-    /// resubmits the rid while the table still resolves the root: the
-    /// resubmission is not put in the inbox (I1). Fails on the parent: the
-    /// resubmission starts unmarked and goes to the inbox.
+    /// sequencer's answer to the settle) resubmits with the generation it
+    /// touched (`touched_gen`, ADR-47) when the client resubmits the rid
+    /// while the table still resolves the root: the resubmission is not put
+    /// in the inbox (I1).
     #[test]
-    fn a_resubmitted_in_doubt_rid_redirected_to_a_designee_is_not_put_in_the_inbox() {
+    fn a_resubmitted_in_doubt_rid_that_touched_a_designee_is_not_put_in_the_inbox() {
         let (mut h, rid, _) = redirected_op(7);
-        assert!(h.core.clients[&rid].redirected_to_designee);
+        assert_eq!(h.core.clients[&rid].touched_gen, 7);
         let mut out = Vec::new();
         h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
         assert!(h.core.in_doubt_rids.contains(&rid));
@@ -67022,9 +67028,8 @@ mod step5_sticky_release {
             op,
             tag: Default::default(),
         });
-        assert!(h.core.clients[&rid].sent_to_delegate);
-        assert!(h.core.clients[&rid].redirected_to_designee);
-        assert!(h.core.in_doubt_designee_rids.is_empty());
+        assert_eq!(h.core.clients[&rid].touched_gen, 7);
+        assert!(!h.core.in_doubt_touched.contains_key(&rid));
         let mut get = None;
         for _ in 0..12 {
             assert!(
@@ -67078,34 +67083,32 @@ mod step5_sticky_release {
         );
     }
 
-    /// The designee mark of an in-doubt rid follows the in-doubt rids'
-    /// eviction (`note_in_doubt`).
+    /// `finish_in_doubt` records a send history only for an op that touched
+    /// a generation: an op that did not resubmits with `touched_gen == 0`.
     #[test]
-    fn the_designee_mark_of_an_in_doubt_rid_follows_its_eviction() {
-        let (mut h, rid, _) = redirected_op(7);
-        let mut out = Vec::new();
-        h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
-        assert!(h.core.in_doubt_designee_rids.contains(&rid));
-        for seq in 0..crate::core::client::MAX_IN_DOUBT_RIDS as u64 + 1 {
-            h.core.note_in_doubt(Rid {
-                node: 9,
-                incarnation: 1,
-                seq,
-            });
-        }
-        assert!(!h.core.in_doubt_rids.contains(&rid));
-        assert!(!h.core.in_doubt_designee_rids.contains(&rid));
-    }
-
-    /// `finish_in_doubt` records the mark only of an op that was redirected
-    /// to a designee: an op that was not leaves none.
-    #[test]
-    fn an_op_that_was_not_redirected_to_a_designee_leaves_no_mark() {
+    fn an_op_that_touched_no_generation_resubmits_untouched() {
         let (mut h, rid, _) = redirected_op(0);
+        assert_eq!(h.core.clients[&rid].touched_gen, 0);
         let mut out = Vec::new();
         h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
         assert!(h.core.in_doubt_rids.contains(&rid));
-        assert!(!h.core.in_doubt_designee_rids.contains(&rid));
+        assert!(!h.core.in_doubt_touched.contains_key(&rid));
+        let (dir, _) = mkdir(&h, "a");
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        assert_eq!(h.core.clients[&rid].touched_gen, 0);
     }
 
     /// A designee redirect (a generation on the wire) does not make the
@@ -67145,130 +67148,25 @@ mod step5_sticky_release {
         );
     }
 
-    /// Whatever named the target (any cache setter), a fresh rid forwarded
-    /// to a node other than the holder the lease object names is marked as
-    /// possibly sent to a designee, so the root's refusal is held, not
-    /// final (I1); one forwarded to the lease holder is not. Fails without
-    /// the guard in `send_forward`: the table does not list node 3.
-    #[test]
-    fn a_rid_forwarded_to_a_node_the_lease_does_not_name_is_marked() {
-        for (cached, marked) in [(3, true), (1, false)] {
-            let mut h = Harness::new(2);
-            h.core.cfg.delegation = true;
-            h.core.cfg.p2p = true;
-            h.core.cfg.inbox = true;
-            h.step(links_event(&[1, 3]));
-            h.core.lease.note_object(&lease_of(1, 1, h.now.0 + 600_000));
-            h.core.lease.cached_holder = Some(cached);
-            let (dir, rec) = mkdir(&h, "a");
-            Replica::install_streamed(&h.meta, 1, 1, 1, 1, &[rec], true, (0, 0)).unwrap();
-            let rid = h.rid(1);
-            let op = MutateOp::Create {
-                parent: dir,
-                name: "f".into(),
-                ino: h.meta.allocate_ino(dir).unwrap(),
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-            };
-            let out = h.step(Event::Submit {
-                policy: Policy::Client,
-                rid,
-                op,
-                tag: Default::default(),
-            });
-            assert!(
-                sends(&out)
-                    .iter()
-                    .any(|(to, m)| *to == cached && matches!(m, PeerMsg::MutateRequest { .. })),
-                "not sent to node {cached}: {out:?}"
-            );
-            assert_eq!(h.core.clients[&rid].sent_to_delegate, marked, "{cached}");
-        }
-    }
-
-    /// S6 (plan 46 M1.3 step 5 re-review 5): the last lease object this node
-    /// read names the node itself (it was the holder); a deposition then
-    /// names the new holder (`mark_lost`, as the seal tail and a log segment
-    /// do) without a lease read. A fresh rid forwarded to the new holder is
-    /// not marked as sent to a designee, so its gen-0 `EROFS` is the answer
-    /// and not held to an unsettled `EIO`. Fails on the parent: the guard
-    /// compares the target with the stale lease object's holder.
-    #[test]
-    fn a_forward_to_the_holder_a_deposition_named_is_not_marked() {
-        let mut h = Harness::new(2);
-        h.core.cfg.delegation = true;
-        h.core.cfg.p2p = true;
-        h.core.cfg.inbox = true;
-        h.step(links_event(&[1, 3]));
-        h.core.lease.last_seen = Some(lease_of(2, 1, h.now.0 + 600_000));
-        h.core.lease.mark_lost(1, 2, 1);
-        assert_eq!(h.core.lease.cached_holder, Some(1));
-        let (dir, rec) = mkdir(&h, "a");
-        Replica::install_streamed(&h.meta, 1, 1, 1, 1, &[rec], true, (0, 0)).unwrap();
-        let rid = h.rid(1);
-        let op = MutateOp::Create {
-            parent: dir,
-            name: "f".into(),
-            ino: h.meta.allocate_ino(dir).unwrap(),
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-        };
-        let out = h.step(Event::Submit {
-            policy: Policy::Client,
-            rid,
-            op,
-            tag: Default::default(),
-        });
-        let req = sends(&out)
-            .into_iter()
-            .find_map(|(to, m)| match m {
-                PeerMsg::MutateRequest { req, .. } if to == 1 => Some(*req),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("not sent to the new holder: {out:?}"));
-        assert!(!h.core.clients[&rid].sent_to_delegate);
-        let out = h.step(Event::Peer {
-            from: 1,
-            msg: PeerMsg::MutateReply {
-                req,
-                outcome: MutateOutcome::Errno(Code::ReadOnly),
-                base: None,
-                position: Position::ZERO,
-                gen: 0,
-                own_chunks: OwnChunks::None,
-                own_rows: None,
-                committed: false,
-            },
-        });
-        assert!(
-            replies(&out).iter().any(|(r, rep)| *r == rid
-                && matches!(
-                    rep,
-                    ClientReply::Outcome(MutateOutcome::Errno(Code::ReadOnly))
-                )),
-            "the refusal was not the answer: {out:?}"
-        );
-        assert_eq!(h.core.stats.designation_refusals_held, 0);
-    }
-
     /// A redirect to the lease holder (a deposed root naming the new one:
-    /// no designee generation) does not mark the op as sent to a designee:
-    /// the new root's refusal is the answer. Fails on the parent: the
-    /// redirect to a node other than the cached holder marks the op, and the
-    /// refusal is held.
+    /// no designee generation) is sent routed by no generation and touches
+    /// none: the new root's refusal is the answer, not held.
     #[test]
-    fn a_lease_holder_redirect_does_not_mark_the_op_as_sent_to_a_designee() {
+    fn a_lease_holder_redirect_is_routed_by_no_generation() {
         let (mut h, rid, out) = redirected_op(0);
         assert!(
-            sends(&out)
-                .iter()
-                .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::MutateRequest { .. })),
-            "not redirected to the new root: {out:?}"
+            sends(&out).iter().any(|(to, m)| *to == 3
+                && matches!(
+                    m,
+                    PeerMsg::MutateRequest {
+                        routed_gen: 0,
+                        touched_gen: 0,
+                        ..
+                    }
+                )),
+            "not redirected to the new root, routed by no generation: {out:?}"
         );
-        assert!(!h.core.clients[&rid].sent_to_delegate);
-        assert!(!h.core.clients[&rid].redirected_to_designee);
+        assert_eq!(h.core.clients[&rid].touched_gen, 0);
         let req = sends(&out)
             .into_iter()
             .find_map(|(to, m)| match m {
@@ -67298,83 +67196,6 @@ mod step5_sticky_release {
             "the refusal was not the answer: {out:?}"
         );
         assert_eq!(h.core.stats.designation_refusals_held, 0);
-    }
-
-    /// The root's refusal of an op sent to a designee is not taken for the
-    /// answer when the root is itself listed as a delegate (of other keys):
-    /// the reply is the root's, not the designee's, whatever the table lists.
-    /// Fails on the parent: the application is told `EROFS`.
-    #[test]
-    fn the_roots_refusal_is_held_when_the_root_is_listed_as_a_delegate() {
-        let mut h = Harness::new(2);
-        h.core.cfg.delegation = true;
-        h.core.cfg.p2p = true;
-        h.core.lease.cached_holder = Some(1);
-        h.step(links_event(&[1, 3]));
-        let (a, rec_a) = mkdir(&h, "a");
-        let (b, rec_b) = mkdir(&h, "b");
-        let records = vec![
-            rec_a,
-            rec_b,
-            LogRecord::DelegateNode {
-                node: 3,
-                gen: 7,
-                dirs: vec![constellation_meta::SubtreeGrant {
-                    dir: a,
-                    kind: SubtreeKind::Sticky,
-                }],
-            },
-            LogRecord::DelegateNode {
-                node: 1,
-                gen: 8,
-                dirs: vec![constellation_meta::SubtreeGrant {
-                    dir: b,
-                    kind: SubtreeKind::Sticky,
-                }],
-            },
-        ];
-        Replica::install_streamed(&h.meta, 1, 1, 1, 4, &records, true, (0, 0)).unwrap();
-        let rid = h.rid(1);
-        let op = MutateOp::Create {
-            parent: a,
-            name: "f".into(),
-            ino: h.meta.allocate_ino(a).unwrap(),
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-        };
-        let out = h.step(Event::Submit {
-            policy: Policy::Client,
-            rid,
-            op,
-            tag: Default::default(),
-        });
-        let req = sends(&out)
-            .into_iter()
-            .find_map(|(to, m)| match m {
-                PeerMsg::MutateRequest { req, .. } if to == 3 => Some(*req),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("not sent to the designee: {out:?}"));
-        // (The designee's answer is lost; the root's refusal arrives.)
-        let out = h.step(Event::Peer {
-            from: 1,
-            msg: PeerMsg::MutateReply {
-                req,
-                outcome: MutateOutcome::Errno(Code::ReadOnly),
-                base: None,
-                position: Position::ZERO,
-                gen: 0,
-                own_chunks: OwnChunks::None,
-                own_rows: None,
-                committed: false,
-            },
-        });
-        assert!(
-            !replies(&out).iter().any(|(r, _)| *r == rid),
-            "answered: {out:?}"
-        );
-        assert_eq!(h.core.stats.designation_refusals_held, 1);
     }
 
     /// A refusal held for a designee counts as I4's exception only when the
@@ -67460,12 +67281,11 @@ mod step5_sticky_release {
         }
     }
 
-    /// The mark "sent to a delegate" is a record's; a resubmission of a rid
-    /// that went in doubt (a fresh record) carries it over, a fresh rid does
-    /// not, and a replay (the queue's own entry, executed here) does not.
-    /// Fails on the parent: the mark starts false.
+    /// The send history is a record's; a resubmission of a rid that went in
+    /// doubt without one (`note_in_doubt`: nothing known) starts unknown, a
+    /// fresh rid untouched.
     #[test]
-    fn a_resubmitted_rid_keeps_the_mark_of_having_been_sent_to_a_delegate() {
+    fn a_resubmitted_rid_of_unknown_history_starts_touched_unknown() {
         let mut h = Harness::new(2);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
@@ -67481,8 +67301,11 @@ mod step5_sticky_release {
                 tag: Default::default(),
             });
         }
-        assert!(h.core.clients[&marked].sent_to_delegate);
-        assert!(!h.core.clients[&fresh].sent_to_delegate);
+        assert_eq!(
+            h.core.clients[&marked].touched_gen,
+            crate::core::holder::TOUCHED_UNKNOWN
+        );
+        assert_eq!(h.core.clients[&fresh].touched_gen, 0);
     }
 
     /// The root refuses an op under a sticky grant whose holder is out of
@@ -70255,12 +70078,16 @@ mod route_fence_executor {
             })
             .expect("resent");
         assert_eq!((to, routed, touched), (3, 7, 7), "{out:?}");
-        assert!(h.core.clients[&rid].sent_to_delegate);
-        // The root's refusal of the retry is not the client's answer.
+        assert_eq!(h.core.clients[&rid].touched_gen, 7);
+        // The root, out of reach of the designee, holds the retry (the rid
+        // touched generation 7): not the client's answer.
         let out = h.step(reply(
             1,
             req,
-            MutateOutcome::Errno(constellation_types::Code::ReadOnly),
+            MutateOutcome::HolderUnreachable {
+                gen: 7,
+                retry_ms: 100,
+            },
             0,
         ));
         assert!(replies(&out).is_empty(), "{out:?}");
