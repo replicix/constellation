@@ -1453,6 +1453,7 @@ pub trait PeerService: Send + Sync + 'static {
         _settle: bool,
         _routed_gen: u64,
         _touched_gen: u64,
+        _inbox_ever: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::MutateReply {

@@ -1104,6 +1104,7 @@ fn a_peers_forward_is_busy_while_fenced_and_executes_once_the_gate_opens() {
         settle: false,
         routed_gen: 0,
         touched_gen: 0,
+        inbox_ever: false,
     };
     let out = h.step(Event::Peer {
         from: 2,
@@ -1196,6 +1197,7 @@ fn a_reply_base_names_the_unshipped_overlap() {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         match sends(&out)[0].1 {
@@ -1260,6 +1262,7 @@ fn a_reply_base_counts_an_unshipped_link_of_the_inode_a_name_leaves() {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         match sends(&out)[0].1 {
@@ -3573,6 +3576,7 @@ fn a_reply_base_is_the_last_shipped_touch_not_the_head() {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         match sends(&out)[0].1 {
@@ -4220,6 +4224,7 @@ fn replay_copy_at(h: &mut Harness, from: NodeId, rid: Rid, op: MutateOp) -> Muta
             settle: false,
             routed_gen: 7,
             touched_gen: 0,
+            inbox_ever: false,
         },
     });
     if let Some(outcome) = reply_in(&out) {
@@ -6497,6 +6502,7 @@ mod own_chunks {
                     settle: false,
                     routed_gen: 0,
                     touched_gen: 0,
+                    inbox_ever: false,
                 },
             });
             let [(2, reply @ PeerMsg::MutateReply { base, .. })] = sends(&out)[..] else {
@@ -6605,6 +6611,7 @@ mod own_chunks {
             settle: false,
             routed_gen: 0,
             touched_gen: 0,
+            inbox_ever: false,
         };
         let tick = |holder: &mut Harness, ms: u64| {
             let out = holder.step(Event::Peer {
@@ -7085,6 +7092,7 @@ mod own_chunks {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             }
         }
 
@@ -8381,6 +8389,7 @@ mod cto {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         })
     }
@@ -10017,6 +10026,7 @@ mod cto {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         let answered = |out: &[Action]| {
@@ -12336,6 +12346,7 @@ mod refusal_outcomes {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         })
     }
@@ -29637,6 +29648,7 @@ mod locks {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         })
     }
@@ -34079,6 +34091,7 @@ fn a_forward_refused_by_a_journaled_designation_refusal_waits_for_its_row() {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         })
     };
@@ -34192,6 +34205,7 @@ fn a_write_into_a_fresh_delegation_is_recalled_until_the_root_sees_the_delegate(
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         })
     }
@@ -34309,6 +34323,7 @@ mod s3_no_loops {
                 settle,
                 routed_gen: 7,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         })
     }
@@ -35010,21 +35025,23 @@ fn inbox_batch(
     }
 }
 
-/// ADR-47: the holder tick re-reads the takeover drain's leftovers from
-/// storage; answer that read (found in `tick_out`) with `batches`, the
-/// bucket's content now.
+/// ADR-47: the holder tick re-reads a waiting requester's leftovers from
+/// storage (`InboxRun` from its first remembered key); answer that read with
+/// `batches`, the run the bucket holds now.
 fn answer_leftover_read(
     h: &mut Harness,
-    tick_out: &[Action],
+    _tick_out: &[Action],
     batches: Vec<constellation_store_s3::inbox::InboxBatch>,
 ) -> Vec<Action> {
-    let (op, _) = s3_ops(tick_out)
-        .into_iter()
-        .find(|(_, r)| matches!(r, S3Op::InboxDrain { .. }))
+    let op = h
+        .core
+        .s3
+        .iter()
+        .find_map(|(op, f)| matches!(f, S3For::InboxLeftover(_)).then_some(*op))
         .expect("the tick re-reads the leftovers");
     h.step(Event::S3 {
         op,
-        result: S3Result::InboxDrain(Ok(batches)),
+        result: S3Result::InboxRun(Ok(batches)),
     })
 }
 
@@ -35118,7 +35135,8 @@ fn the_takeover_drain_defers_only_the_delegated_requester() {
     h.core.delegation_sync(h.clk(), &h.meta, &mut out);
     let mut out = Vec::new();
     h.core.inbox_holder_tick(h.clk(), &h.meta, &mut out);
-    let out = answer_leftover_read(&mut h, &out, batches);
+    // (Requester 2's run: its two batches, from the first remembered key.)
+    let out = answer_leftover_read(&mut h, &out, batches[..2].to_vec());
     assert!(h.meta.child_ino(dir, "a").unwrap().is_some());
     assert!(h.meta.child_ino(ROOT_INO, "b").unwrap().is_some());
     assert_eq!(inbox_deletes(&out), vec![(1, 2, 0), (1, 2, 1)]);
@@ -35287,6 +35305,7 @@ fn a_delegate_reply_base_covers_what_it_applied_before_the_grant_and_streamed_st
                 settle: false,
                 routed_gen: 1,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         match sends(&out).first().map(|(_, m)| *m) {
@@ -37243,6 +37262,7 @@ fn a_forward_to_a_restarted_holder_readopts_its_own_lease() {
         settle: false,
         routed_gen: 0,
         touched_gen: 0,
+        inbox_ever: false,
     };
     let out = h.step(Event::Peer {
         from: 2,
@@ -37328,6 +37348,7 @@ fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         let (get, _) = s3_ops(&out)
@@ -37367,6 +37388,7 @@ fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         assert!(
@@ -37413,6 +37435,7 @@ fn a_released_lease_is_not_readopted_for_a_forward() {
             settle: false,
             routed_gen: 0,
             touched_gen: 0,
+            inbox_ever: false,
         },
     });
     assert!(
@@ -44366,6 +44389,7 @@ mod answer_sources {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         assert!(matches!(
@@ -44409,6 +44433,7 @@ mod answer_sources {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         assert_eq!(h.core.stats.ack_classes, before);
@@ -44543,6 +44568,7 @@ mod stream_end {
                 settle: false,
                 routed_gen: 7,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         assert!(
@@ -45135,6 +45161,7 @@ mod deleg_group {
                 settle: false,
                 routed_gen: 7,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         })
     }
@@ -45339,6 +45366,7 @@ mod deleg_group {
                     settle: true,
                     routed_gen: 7,
                     touched_gen: 0,
+                    inbox_ever: false,
                 },
             })
         };
@@ -46713,6 +46741,7 @@ mod deleg_group {
                     settle: false,
                     routed_gen: 7,
                     touched_gen: 0,
+                    inbox_ever: false,
                 },
             })
         };
@@ -46805,6 +46834,7 @@ mod deleg_group {
                 settle: false,
                 routed_gen: 8,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         assert_eq!(
@@ -54512,6 +54542,7 @@ mod c1_class {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         assert!(sends(&out).iter().all(|(_, m)| !matches!(
@@ -54672,6 +54703,7 @@ mod c1_class {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         };
         let replies = |out: &[Action]| {
@@ -54756,6 +54788,7 @@ mod c1_class {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         };
         let committed = |out: &[Action]| {
@@ -55715,6 +55748,7 @@ mod c2f_lone_root {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         }
     }
@@ -56069,6 +56103,7 @@ mod c2f_lone_root {
                     settle,
                     routed_gen: 0,
                     touched_gen: 0,
+                    inbox_ever: false,
                 },
             });
             assert!(answers(&out).is_empty(), "waits for the archive: {out:?}");
@@ -56303,6 +56338,7 @@ mod c2g_settle {
                 settle,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         }
     }
@@ -56432,6 +56468,7 @@ mod c2g_settle {
                 settle,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         };
         let op = h.create("p");
@@ -57005,6 +57042,7 @@ mod c2g_settle {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         let reply = sends(&out).into_iter().find_map(|(to, m)| match m {
@@ -58943,6 +58981,7 @@ mod c2g_settle {
                 settle: true,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         assert!(
@@ -59053,6 +59092,7 @@ fn a_delegates_held_answer_is_not_the_roots() {
             settle: false,
             routed_gen: 0,
             touched_gen: 0,
+            inbox_ever: false,
         },
     });
     let held = sends(&out).into_iter().find_map(|(to, m)| match m {
@@ -59238,6 +59278,7 @@ mod await_retry {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         })
     }
@@ -59606,6 +59647,7 @@ mod await_retry {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         assert_eq!(
@@ -59696,6 +59738,7 @@ mod await_retry {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         })
     }
@@ -60936,6 +60979,7 @@ mod await_retry {
                     settle: false,
                     routed_gen: 7,
                     touched_gen: 0,
+                    inbox_ever: false,
                 },
             })
         };
@@ -61293,6 +61337,7 @@ mod m11_step5 {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         assert!(!h.core.root_lone(), "a peer asked: no singleton any more");
@@ -61363,6 +61408,7 @@ mod m11_step5 {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         assert!(swap_lease(&out).is_some_and(|l| !l.singleton), "{out:?}");
@@ -61587,6 +61633,7 @@ mod hold_ack {
                 settle: false,
                 routed_gen: 0,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         (rid, out)
@@ -69554,6 +69601,7 @@ mod route_fence_executor {
                 settle,
                 routed_gen,
                 touched_gen,
+                inbox_ever: false,
             },
         })
     }
@@ -69626,15 +69674,72 @@ mod route_fence_executor {
         let by = |routed_gen| Fence {
             routed_gen,
             touched_gen: routed_gen,
+            inbox_ever: false,
         };
+        let now = h.clk();
         assert!(
-            h.core.fenced_at_delegate(2, &op, by(0), &h.meta),
+            h.core
+                .fenced_at_delegate(now, 2, &op, (by(0), false), &h.meta),
             "the lease holder runs a forward routed 0 for its own generation"
         );
-        assert!(h.core.fenced_at_delegate(2, &op, by(5), &h.meta));
-        assert!(!h.core.fenced_at_delegate(2, &op, by(7), &h.meta));
+        assert!(h
+            .core
+            .fenced_at_delegate(now, 2, &op, (by(5), false), &h.meta));
+        assert!(!h
+            .core
+            .fenced_at_delegate(now, 2, &op, (by(7), false), &h.meta));
         // (Its own ops are never fenced.)
-        assert!(!h.core.fenced_at_delegate(0, &op, by(0), &h.meta));
+        assert!(!h
+            .core
+            .fenced_at_delegate(now, 0, &op, (by(0), false), &h.meta));
+    }
+
+    /// The inbox rule at the designee: a forward of a rid that was ever in an
+    /// inbox is fenced whatever generation it is routed by (the lease
+    /// holder's drain may hold its batch). A settle keeps the route rule.
+    /// The lease holder, designee of its own generation, runs it (its drain
+    /// and this path are one node). Fails on the parent: the routed forward
+    /// runs.
+    #[test]
+    fn a_designee_fences_an_inbox_ever_forward_whatever_its_route() {
+        use crate::core::holder::Fence;
+        let (mut h, d1) = designee();
+        let op = MutateOp::Create {
+            parent: d1,
+            name: "x".into(),
+            ino: h.meta.allocate_ino(d1).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let by = |routed_gen| Fence {
+            routed_gen,
+            touched_gen: routed_gen,
+            inbox_ever: true,
+        };
+        let now = h.clk();
+        for routed in [0, 7] {
+            assert!(
+                h.core
+                    .fenced_at_delegate(now, 2, &op, (by(routed), false), &h.meta),
+                "routed {routed}"
+            );
+            assert_eq!(
+                h.core
+                    .fenced_at_delegate(now, 2, &op, (by(routed), true), &h.meta),
+                routed != 7,
+                "a settle keeps the route rule (routed {routed})"
+            );
+        }
+        h.hold(5, None);
+        let now = h.clk();
+        for routed in [0, 7] {
+            assert!(
+                !h.core
+                    .fenced_at_delegate(now, 2, &op, (by(routed), false), &h.meta),
+                "the lease holder runs it (routed {routed})"
+            );
+        }
     }
 
     /// The negative control: without the fence (`fence_accepts_unrouted`) the
@@ -69797,6 +69902,200 @@ mod route_fence_executor {
         assert!(replies(&out).is_empty(), "{out:?}");
         assert!(h.core.clients[&rid].designation_held);
     }
+
+    /// MUST-2: a rid that was ever in an inbox, sent to a node its cache
+    /// names that turns out to be a designee, comes back `Fenced`. It is not
+    /// resent to the designee routed by the generation (the designee would
+    /// run it beside a drain that still holds the batch, which then refuses
+    /// it): the cache entry is dropped and the rid is routed afresh, to the
+    /// lease holder. Fails on the parent: sent to node 3 routed by 7.
+    #[test]
+    fn a_fenced_inbox_ever_rid_is_routed_through_the_lease_holder_not_resent() {
+        let mut h = Harness::new(2);
+        h.core.cfg.inbox = true;
+        h.core.lease.cached_holder = Some(3);
+        let rid = h.rid(1);
+        h.core.in_doubt_rids.insert(rid);
+        h.core.in_doubt_batches.insert(
+            rid,
+            vec![constellation_store_s3::inbox::InboxKey {
+                epoch: 1,
+                node: 2,
+                n: 0,
+            }],
+        );
+        let op = h.create("a");
+        let mut out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        // (The batch is withdrawn first; the forward follows.)
+        let (tomb, _) = s3_ops(&out)
+            .into_iter()
+            .find(|(_, r)| matches!(r, S3Op::InboxTombstone { .. }))
+            .expect("withdrawn first");
+        out = h.step(Event::S3 {
+            op: tomb,
+            result: S3Result::InboxTombstone(Ok(())),
+        });
+        let (to, req, ever) = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest {
+                    req, inbox_ever, ..
+                } => Some((to, *req, *inbox_ever)),
+                _ => None,
+            })
+            .expect("forwarded");
+        assert_eq!((to, ever), (3, true));
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Fenced { gen: 7 },
+                base: None,
+                position: Position::ZERO,
+                gen: 7,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+            },
+        });
+        assert!(
+            !sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::MutateRequest { .. })),
+            "resent to the designee: {out:?}"
+        );
+        assert_ne!(h.core.lease.cached_holder, Some(3));
+        assert_eq!(h.core.stats.inbox_ever_rerouted, 1);
+        assert_eq!(h.core.stats.fenced_resends, 0);
+    }
+
+    /// MUST-1 (the requester's own generation): an own op whose batch is
+    /// still in the holder's inbox is not run under the node's own
+    /// generation until the batch is withdrawn (the tombstone), then it is
+    /// offered again. Fails on the parent: it runs at once.
+    #[test]
+    fn an_own_inbox_ever_op_withdraws_its_batch_before_it_runs_locally() {
+        let (mut h, d1) = designee();
+        let rid = h.rid(1);
+        h.core.in_doubt_rids.insert(rid);
+        h.core.in_doubt_batches.insert(
+            rid,
+            vec![constellation_store_s3::inbox::InboxKey {
+                epoch: 1,
+                node: 3,
+                n: 0,
+            }],
+        );
+        let op = MutateOp::Create {
+            parent: d1,
+            name: "x".into(),
+            ino: h.meta.allocate_ino(d1).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        assert!(
+            s3_ops(&out)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::InboxTombstone { .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.core.dl.mine[&7].executed, 0, "ran before the withdrawal");
+        assert_eq!(h.core.stats.inbox_local_withdrawals, 1);
+    }
+
+    /// SHOULD-1: the requester's inbox hold is narrow. Held: keys of a
+    /// stealable grant, and a root-resolved op whose routed generation the
+    /// table has not applied. Put in the inbox: unknown history or a
+    /// table that shows the generation ended, a placed grant.
+    #[test]
+    fn the_inbox_hold_is_narrow() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.forwarding = true;
+        h.core.lease.cached_holder = Some(1);
+        let d1 = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let records = vec![
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "d1".into(),
+                ino: d1,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+            LogRecord::DelegateNode {
+                node: 3,
+                gen: 7,
+                dirs: vec![constellation_meta::SubtreeGrant {
+                    dir: d1,
+                    kind: SubtreeKind::Sticky,
+                }],
+            },
+        ];
+        Replica::install_streamed(&h.meta, 1, 1, 1, 2, &records, true, (0, 0)).unwrap();
+        let submit = |h: &mut Harness, seq: u64, op: MutateOp| {
+            let rid = h.rid(seq);
+            h.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op,
+                tag: Default::default(),
+            });
+            rid
+        };
+        let under = MutateOp::Create {
+            parent: d1,
+            name: "x".into(),
+            ino: h.meta.allocate_ino(d1).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let sticky = submit(&mut h, 1, under);
+        let at_root = h.create("y");
+        let root = submit(&mut h, 2, at_root);
+        let set = |h: &mut Harness, rid: Rid, touched: u64, local: bool| {
+            let c = h.core.clients.get_mut(&rid).expect("live");
+            c.touched_gen = touched;
+            c.touched_local = local;
+        };
+        // A sticky grant: held when touched, by how it touched.
+        set(&mut h, sticky, 0, false);
+        assert_eq!(h.core.inbox_hold(sticky, &h.meta), None, "untouched");
+        for (touched, local, want) in [
+            (7, false, (1, 1)),
+            (7, true, (1, 2)),
+            (u64::MAX, false, (1, 0)),
+        ] {
+            set(&mut h, sticky, touched, local);
+            assert_eq!(h.core.inbox_hold(sticky, &h.meta), Some(want));
+        }
+        h.core.cfg.inbox_ignores_touched = true;
+        assert_eq!(h.core.inbox_hold(sticky, &h.meta), None, "the sim's knob");
+        h.core.cfg.inbox_ignores_touched = false;
+        // Resolved to the root: held only when the table lags the routed
+        // generation.
+        let max = h.meta.delegation_table().max_gen();
+        assert!(max >= 1);
+        for (touched, want) in [(max, None), (max + 1, Some((0, 1))), (u64::MAX, None)] {
+            set(&mut h, root, touched, false);
+            assert_eq!(h.core.inbox_hold(root, &h.meta), want, "touched {touched}");
+        }
+    }
 }
 
 /// A measurement, not a test: what the persist-before-grant rule costs the
@@ -69957,13 +70256,18 @@ mod route_fence_root {
     /// generation `gen`, node 3 not reached; node 2's link is down (its
     /// inbox is polled).
     fn sticky_root() -> (Harness, Ino, u64) {
+        sticky_root_to(3)
+    }
+
+    /// As [`sticky_root`], granted to `node`.
+    fn sticky_root_to(node: NodeId) -> (Harness, Ino, u64) {
         let (mut h, d1) = root_with_dir();
         h.core.cfg.inbox = true;
         let out = h.step(Event::Control {
             op: OpId(900),
             req: Control::Delegate {
                 dir: d1,
-                node: 3,
+                node,
                 sticky: true,
             },
         });
@@ -70053,7 +70357,21 @@ mod route_fence_root {
         seq: u64,
         op: MutateOp,
         settle: bool,
+        fence: (u64, u64),
+    ) -> Vec<Action> {
+        forward_ever(h, from, req, seq, op, settle, fence, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_ever(
+        h: &mut Harness,
+        from: NodeId,
+        req: u64,
+        seq: u64,
+        op: MutateOp,
+        settle: bool,
         (routed_gen, touched_gen): (u64, u64),
+        inbox_ever: bool,
     ) -> Vec<Action> {
         h.step(Event::Peer {
             from,
@@ -70068,6 +70386,7 @@ mod route_fence_root {
                 settle,
                 routed_gen,
                 touched_gen,
+                inbox_ever,
             },
         })
     }
@@ -70247,60 +70566,54 @@ mod route_fence_root {
         assert_eq!(h.core.stats.inbox_refused_ops, 0);
     }
 
-    /// A read issued before this root redirected the rid to the designee
-    /// may carry it with the `touched_gen` it was enqueued with (the
-    /// requester withdrew the batch and sent the op there): the drain
-    /// halts it. A read issued after refuses as before. Fails on the
-    /// parent: `Refused`.
+    /// MUST-1 (the drain, the requester's own grant): a batch whose
+    /// requester holds the op's keys under a non-stealable grant is halted,
+    /// not refused, whatever its `touched_gen`: that node may run the op
+    /// locally at any moment (it withdrew the batch, or never recorded the
+    /// grant at enqueue, and the read that returned the batch predates the
+    /// tombstone), and a journaled refusal would be followed by its
+    /// `Completed`. Fails on the parent: `Refused`.
     #[test]
-    fn a_drain_read_before_a_redirect_does_not_refuse_the_rid() {
+    fn the_drain_halts_an_op_under_its_requesters_own_grant() {
+        let (mut h, d1, _gen) = sticky_root_to(2);
+        let op = create_in(&h, d1, "f");
+        drain_poll(&mut h, batch_of(&op, 1, 0, false));
+        assert_eq!(h.core.stats.inbox_refused_ops, 0);
+        assert_eq!(h.core.stats.inbox_own_grant_halts, 1);
+        assert!(!has_outcome(&h, 2, 1));
+        // Another requester's op under the same grant is refused as ever.
         let (mut h, d1, _gen) = sticky_root();
         let op = create_in(&h, d1, "f");
-        let poll = poll_of_2(&mut h);
-        peers(&mut h, Some(true));
-        h.advance(5);
-        // The requester's forward, routed 0 (an inbox-ever rid): redirected.
-        let out = forward(&mut h, 2, 1, 1, op.clone(), false, (0, 0));
-        assert_eq!(
-            outcome_to(&out, 2),
-            Some(MutateOutcome::NotHolder { holder: 3 }),
-            "{out:?}"
-        );
-        // The earlier read comes back with the rid, touched 0.
-        h.step(Event::S3 {
-            op: poll,
-            result: S3Result::InboxRun(Ok(vec![batch_of(&op, 1, 0, false)])),
-        });
-        assert_eq!(h.core.stats.inbox_refused_ops, 0);
-        assert_eq!(h.core.stats.inbox_touched_halts, 1);
-        assert!(!has_outcome(&h, 2, 1));
-        // A read issued after the redirect carries what is still there.
         drain_poll(&mut h, batch_of(&op, 1, 0, false));
         assert_eq!(h.core.stats.inbox_refused_ops, 1);
+        assert_eq!(h.core.stats.inbox_own_grant_halts, 0);
     }
 
-    /// The redirect records are dropped once no read issued before them is
-    /// in flight.
+    /// The inbox rule at the root: a rid that was ever in an inbox is not
+    /// redirected to a designee (its drain may still hold the batch and
+    /// decide otherwise); it is decided here as the drain decides it. A rid
+    /// that never was is redirected as ever. Fails on the parent:
+    /// `NotHolder` for both.
     #[test]
-    fn redirect_records_do_not_outlive_the_reads_in_flight() {
-        let (mut h, d1, _gen) = sticky_root();
-        let op = create_in(&h, d1, "f");
-        let poll = poll_of_2(&mut h);
+    fn the_root_does_not_redirect_an_inbox_ever_rid() {
+        let (mut h, d1, gen) = sticky_root();
         peers(&mut h, Some(true));
         h.advance(5);
-        forward(&mut h, 2, 1, 1, op.clone(), false, (0, 0));
-        assert_eq!(h.core.redirected_at.len(), 1, "a read is in flight");
-        h.step(Event::S3 {
-            op: poll,
-            result: S3Result::InboxRun(Ok(Vec::new())),
-        });
-        // The next poll was issued after the redirect.
-        assert!(h.core.redirected_at.is_empty());
-        forward(&mut h, 2, 2, 2, op, false, (0, 0));
-        assert!(
-            h.core.redirected_at.is_empty(),
-            "no read in flight to keep it for"
-        );
+        for (seq, ever, touched) in [(1, true, 0), (2, true, gen), (3, false, 0)] {
+            let op = create_in(&h, d1, &format!("f{seq}"));
+            let out = forward_ever(&mut h, 2, seq, seq, op, false, (0, touched), ever);
+            let got = outcome_to(&out, 2);
+            match (ever, touched) {
+                (true, 0) => assert_eq!(got, Some(MutateOutcome::Errno(Code::ReadOnly)), "{out:?}"),
+                (true, _) => assert!(
+                    matches!(got, Some(MutateOutcome::HolderUnreachable { .. })),
+                    "{out:?}"
+                ),
+                (false, _) => {
+                    assert_eq!(got, Some(MutateOutcome::NotHolder { holder: 3 }), "{out:?}")
+                }
+            }
+        }
     }
 
     /// Row 4: a rid that has its outcome here is answered from it, not

@@ -211,6 +211,8 @@ pub struct Bucket {
     /// How much slower the lease GETs of every node's handle are than the
     /// bucket's latency (`SimConfig::lease_reads`).
     lease_reads: Mutex<SlowReads>,
+    /// The same for the inbox batches' GETs (`SimConfig::inbox_reads`).
+    inbox_reads: Mutex<SlowReads>,
     /// Plan 46 M0.3: the run's reachability history (the cuts of a node's
     /// path to S3 and the lease bodies that land are recorded here; the bus
     /// and the nodes record the rest).
@@ -232,6 +234,7 @@ impl Bucket {
             taken_over: Mutex::new(std::collections::HashMap::new()),
             probe_late: Mutex::new(Vec::new()),
             lease_reads: Mutex::new(SlowReads::default()),
+            inbox_reads: Mutex::new(SlowReads::default()),
             reach: Arc::new(super::reach::Reach::default()),
         })
     }
@@ -244,6 +247,11 @@ impl Bucket {
     /// Slow the lease GETs of every node's handle by `reads`.
     pub fn set_lease_reads(&self, reads: SlowReads) {
         *self.lease_reads.lock().unwrap() = reads;
+    }
+
+    /// Slow the inbox batch GETs of every node's handle by `reads`.
+    pub fn set_inbox_reads(&self, reads: SlowReads) {
+        *self.inbox_reads.lock().unwrap() = reads;
     }
 
     /// The backing store, for the checkers (never faulted).
@@ -532,6 +540,8 @@ impl ObjectStore for NodeStore {
         let sent_at = self.bucket.reach.now_ms();
         let reads = if self.reads == SlowReads::default() && location.as_ref() == "leases/p0.json" {
             *self.bucket.lease_reads.lock().unwrap()
+        } else if self.reads == SlowReads::default() && location.as_ref().starts_with("inbox/") {
+            *self.bucket.inbox_reads.lock().unwrap()
         } else {
             self.reads
         };

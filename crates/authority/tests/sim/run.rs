@@ -546,6 +546,15 @@ pub struct SimConfig {
     /// hold the refusal and the control is vacuous).
     /// `AUTHORITY_SIM_ROOT_IGNORES_TOUCHED=1` sets it on every configuration.
     pub root_ignores_touched: bool,
+    /// `Config::inbox_ignores_touched`: no requester hold for an inbox op
+    /// (the drain alone carries safety). `AUTHORITY_SIM_INBOX_IGNORES_TOUCHED=1`
+    /// sets it on every configuration; the sweeps then expect no violation
+    /// and `inbox_touched_halts > 0`.
+    pub inbox_ignores_touched: bool,
+    /// Slow inbox GETs (the holder's polls and the takeover re-reads), as
+    /// `lease_reads`: a read served before a requester's tombstone and
+    /// processed after it. `AUTHORITY_SIM_INBOX_READS=lo:hi:lo:hi` sets it.
+    pub inbox_reads: super::store::SlowReads,
     /// Negative control (`Config::partial_release_ends_stream`): the root
     /// ends a sticky stream at the holder's release of some of its
     /// subtrees (MUST-1). `AUTHORITY_SIM_PARTIAL_RELEASE_ENDS_STREAM=1` sets
@@ -1157,6 +1166,9 @@ impl Default for SimConfig {
                 .is_some_and(|v| v == "1"),
             root_ignores_touched: std::env::var_os("AUTHORITY_SIM_ROOT_IGNORES_TOUCHED")
                 .is_some_and(|v| v == "1"),
+            inbox_ignores_touched: std::env::var_os("AUTHORITY_SIM_INBOX_IGNORES_TOUCHED")
+                .is_some_and(|v| v == "1"),
+            inbox_reads: super::store::SlowReads::default(),
             partial_release_ends_stream: std::env::var_os(
                 "AUTHORITY_SIM_PARTIAL_RELEASE_ENDS_STREAM",
             )
@@ -4727,6 +4739,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     SIM_START.with(|t| t.set(Some(tokio::time::Instant::now())));
     let bucket = Bucket::new(seed, cfg.s3_latency);
     bucket.set_lease_reads(cfg.lease_reads);
+    bucket.set_inbox_reads(cfg.inbox_reads);
     let bus = Bus::new(seed, cfg.p2p_delay, cfg.p2p_drop);
     bus.set_reach(bucket.reach());
     {
@@ -4817,6 +4830,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         refuse_forwarded_designation_ops: cfg.refuse_forwarded_designation_ops,
         fence_accepts_unrouted: cfg.fence_accepts_unrouted,
         root_ignores_touched: cfg.root_ignores_touched,
+        inbox_ignores_touched: cfg.inbox_ignores_touched,
         partial_release_ends_stream: cfg.partial_release_ends_stream,
         abandon_skips_read_recall: cfg.abandon_skips_read_recall,
         plant_claim_root_group_on_lone: cfg.plant_claim_root_group_on_lone,

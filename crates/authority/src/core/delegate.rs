@@ -2820,7 +2820,22 @@ impl Core {
         let Some(gen) = self.my_generation_for(&keys, replica) else {
             return false;
         };
-        if self.fence_forward(from, req, gen, fence, out) {
+        // ADR-47 (the inbox rule): a rid whose batch is still in the holder's
+        // inbox is not run here. Its batches are withdrawn first (the
+        // tombstone; liveness): a drain read that predates it is halted, not
+        // refused, because this node holds the grant (`inbox_halts_touched`).
+        // The op is offered again once the withdrawal landed.
+        if from == 0
+            && self
+                .clients
+                .get(&rid)
+                .is_some_and(|c| c.inbox_ever && !c.inbox_keys.is_empty())
+        {
+            self.stats.inbox_local_withdrawals += 1;
+            self.send_forward(now, rid, 0, 0, replica, out);
+            return true;
+        }
+        if self.fence_forward(now, from, req, gen, (fence, settle), out) {
             return true;
         }
         // ADR-47: this node's own op, offered to its generation, is touched
@@ -2829,6 +2844,7 @@ impl Core {
         if from == 0 {
             if let Some(c) = self.clients.get_mut(&rid) {
                 c.touched_gen = c.touched_gen.max(gen);
+                c.touched_local = true;
             }
         }
         if settle {
@@ -2969,16 +2985,20 @@ impl Core {
     /// Any node, the root and a placed generation included.
     fn fence_forward(
         &mut self,
+        now: Now,
         from: NodeId,
         req: Option<OpId>,
         gen: u64,
-        fence: super::holder::Fence,
+        (fence, settle): (super::holder::Fence, bool),
         out: &mut Vec<Action>,
     ) -> bool {
-        if !self.forward_is_fenced(from, gen, fence) {
+        if !self.forward_is_fenced(now, from, gen, fence, settle) {
             return false;
         }
         self.stats.deleg_fenced_forwards += 1;
+        if fence.inbox_ever && !settle {
+            self.stats.inbox_ever_fenced += 1;
+        }
         if let Some(req) = req.filter(|r| *r != OpId(0)) {
             out.push(Action::Send {
                 to: from,
@@ -3001,22 +3021,46 @@ impl Core {
     /// this node's under a generation the forward was not routed by.
     pub(crate) fn fenced_at_delegate(
         &self,
+        now: Now,
         from: NodeId,
         op: &MutateOp,
-        fence: super::holder::Fence,
+        (fence, settle): (super::holder::Fence, bool),
         replica: &dyn Replica,
     ) -> bool {
         self.cfg.delegation
             && self
                 .my_generation_for(&super::holder::keys_of_op_in(op, replica), replica)
-                .is_some_and(|gen| self.forward_is_fenced(from, gen, fence))
+                .is_some_and(|gen| self.forward_is_fenced(now, from, gen, fence, settle))
     }
 
-    /// Whether a forward from `from` that was routed by `fence.routed_gen`
-    /// does not match `gen`, the generation this node holds its keys under.
+    /// Whether a forward from `from` is not for this node's generation `gen`
+    /// to run. Two rules, one per kind of rid:
+    /// - an ordinary rid must have been routed by `gen` (`fence.routed_gen`);
+    /// - a rid that was ever in an inbox (`fence.inbox_ever`) is run only
+    ///   through the lease holder (its drain decides such a rid, and a
+    ///   batch it still holds can be refused after a designee ran it): a
+    ///   designee answers `Fenced` whatever the route. The lease holder
+    ///   itself, as a designee of its own generation, runs it: its drain
+    ///   and this path are one node, and the rid's outcome is the dedup
+    ///   between them.
+    ///
     /// The node's own ops (`from == 0`) are never fenced.
-    fn forward_is_fenced(&self, from: NodeId, gen: u64, fence: super::holder::Fence) -> bool {
-        from != 0 && fence.routed_gen != gen && !self.cfg.fence_accepts_unrouted
+    fn forward_is_fenced(
+        &self,
+        now: Now,
+        from: NodeId,
+        gen: u64,
+        fence: super::holder::Fence,
+        settle: bool,
+    ) -> bool {
+        if from == 0 || self.cfg.fence_accepts_unrouted {
+            return false;
+        }
+        // (A settle executes nothing: it keeps the route rule.)
+        if fence.inbox_ever && !settle {
+            return !self.lease.holds_unexpired(now, &self.cfg);
+        }
+        fence.routed_gen != gen
     }
 
     /// Phase 2b (M8 under M11): a write this delegate executes must not

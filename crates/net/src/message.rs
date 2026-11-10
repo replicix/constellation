@@ -333,6 +333,8 @@ pub enum Payload {
         /// ADR-47: the highest generation the rid was ever sent under
         /// (`PeerMsg::MutateRequest::touched_gen`).
         touched_gen: u64,
+        /// ADR-47: `PeerMsg::MutateRequest::inbox_ever`.
+        inbox_ever: bool,
     },
     /// Holder's answer: postcard-encoded `MutateOutcome`.
     MutateReply {
@@ -1835,6 +1837,7 @@ mod tests {
                 settle,
                 routed_gen: 7,
                 touched_gen: u64::MAX,
+                inbox_ever: true,
             };
             let signed = Signed::new(&k, &payload).unwrap();
             let frame = signed.encode().unwrap();
@@ -1842,7 +1845,7 @@ mod tests {
             let (_, got) = back.verify().unwrap();
             assert!(matches!(
                 got,
-                Payload::MutateRequest { settle: s, routed_gen: 7, touched_gen: u64::MAX, .. }
+                Payload::MutateRequest { settle: s, routed_gen: 7, touched_gen: u64::MAX, inbox_ever: true, .. }
                     if s == settle
             ));
         }

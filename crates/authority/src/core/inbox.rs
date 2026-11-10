@@ -155,21 +155,23 @@ pub(crate) struct InboxState {
 }
 
 /// The takeover drain's batches that wait for the holder tick (see
-/// `InboxState::leftover`).
+/// `InboxState::leftover`), per requester.
 #[derive(Debug)]
 pub(crate) struct Leftover {
-    /// The gate's epoch: batches of every epoch below it are listed again.
-    below_epoch: Epoch,
-    /// The halted batches, as the gate saw them (their number is what the
-    /// status counts; the bytes are never run).
+    waiting: BTreeMap<NodeId, LeftoverNode>,
+}
+
+/// One requester's halted batches.
+#[derive(Debug)]
+pub(crate) struct LeftoverNode {
+    /// Its halted batches, as the gate saw them, in key order (their number
+    /// is what the status counts; the bytes are never run). The re-read
+    /// starts at the first.
     keys: Vec<InboxKey>,
-    /// The requesters those batches are of: not polled under the new epoch
-    /// until their older batches ran.
-    nodes: std::collections::BTreeSet<NodeId>,
-    /// The re-read in flight and when it was issued.
-    read: Option<(OpId, WaitMs)>,
+    /// The re-read in flight.
+    read: Option<OpId>,
     /// The earliest the next re-read may be issued (a halted batch is not
-    /// listed again at every round).
+    /// read again at every round).
     next_read_at: WaitMs,
 }
 
@@ -177,7 +179,9 @@ impl InboxState {
     /// The number of takeover-drain batches still waiting to be re-read.
     #[cfg(test)]
     pub(crate) fn leftover_batches(&self) -> usize {
-        self.leftover.as_ref().map_or(0, |l| l.keys.len())
+        self.leftover
+            .as_ref()
+            .map_or(0, |l| l.waiting.values().map(|n| n.keys.len()).sum())
     }
 }
 
@@ -1205,7 +1209,6 @@ impl Core {
                 rp.issued_at = now.wait;
             }
         }
-        self.prune_redirected();
         if let Some(at) = next_due {
             self.arm_inbox_poll(at, out);
         }
@@ -1228,8 +1231,6 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.inbox_poll_result(now, node, result, replica, out);
-        // (After the result is processed no read it came from is in flight.)
-        self.prune_redirected();
     }
 
     fn inbox_poll_result(
@@ -1247,7 +1248,6 @@ impl Core {
             return;
         };
         rp.in_flight = None;
-        let read_at = rp.issued_at;
         let run = match result {
             S3Result::InboxRun(Ok(run)) => run,
             other => {
@@ -1310,7 +1310,7 @@ impl Core {
             if batch.wants_lease {
                 self.lease.note_wanted(now, batch.node);
             }
-            match self.execute_inbox_batch(now, batch, true, read_at, replica, out) {
+            match self.execute_inbox_batch(now, batch, true, replica, out) {
                 Ok(seq) => {
                     let holder = self.inbox.holder.as_mut().expect("holding");
                     holder.executed.push((batch.key(), seq));
@@ -1502,13 +1502,11 @@ impl Core {
     /// is the poll path (through the lease view like every other local
     /// mutation); the takeover gate passes `false` (the view is
     /// deliberately closed and the gate itself is the authority).
-    /// `read_at` is when the read that returned `batch` was issued.
     fn execute_inbox_batch(
         &mut self,
         now: Now,
         batch: &InboxBatch,
         admitted: bool,
-        read_at: WaitMs,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<u64, Halt> {
@@ -1669,7 +1667,13 @@ impl Core {
                             return Err(Halt::Recall);
                         }
                         super::delegate::RecallPlan::Refuse(code)
-                            if self.inbox_halts_touched(rid, code, op_touched_gen, read_at) =>
+                            if self.inbox_halts_touched(
+                                batch.node,
+                                code,
+                                op_touched_gen,
+                                &keys,
+                                replica,
+                            ) =>
                         {
                             return Err(Halt::Recall);
                         }
@@ -1796,24 +1800,12 @@ impl Core {
         let mut drained = 0u64;
         let mut stopped: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
         let mut keys = Vec::new();
-        let below_epoch = self
-            .lease
-            .gate
-            .map(|g| g.epoch)
-            .or_else(|| {
-                batches
-                    .iter()
-                    .map(|b| b.epoch)
-                    .max()
-                    .map(|e| e.saturating_add(1))
-            })
-            .unwrap_or_default();
         for batch in batches {
             if stopped.contains(&batch.node) {
                 keys.push(batch.key());
                 continue;
             }
-            match self.execute_inbox_batch(now, &batch, false, now.wait, replica, out) {
+            match self.execute_inbox_batch(now, &batch, false, replica, out) {
                 Ok(_) => {}
                 Err(Halt::Fenced) => unreachable!("no view admission inside the gate"),
                 Err(Halt::Recall) => {
@@ -1852,20 +1844,28 @@ impl Core {
         self.stats.inbox_drained_ops += ops;
         // The poll state, if any, belongs to the previous tenure.
         self.inbox.holder = None;
-        self.inbox.leftover = (!stopped.is_empty()).then_some(Leftover {
-            below_epoch,
-            keys,
-            nodes: stopped,
-            read: None,
-            next_read_at: now.wait,
-        });
+        let mut waiting: BTreeMap<NodeId, LeftoverNode> = BTreeMap::new();
+        for key in keys {
+            waiting
+                .entry(key.node)
+                .or_insert_with(|| LeftoverNode {
+                    keys: Vec::new(),
+                    read: None,
+                    next_read_at: now.wait,
+                })
+                .keys
+                .push(key);
+        }
+        self.inbox.leftover = (!waiting.is_empty()).then_some(Leftover { waiting });
         Ok(())
     }
 
-    /// ADR-47: the takeover drain's leftovers, from the holder tick: read
-    /// them again from storage (a batch its requester withdrew since is
-    /// gone) and run what is read through the admitted path (the recalls a
-    /// delegated op needs are started and waited for there; see
+    /// ADR-47: the takeover drain's leftovers, from the holder tick: per
+    /// requester that still waits, read its batches again from storage
+    /// (`InboxRun` from its first remembered key, at the poll width: a
+    /// batch its requester withdrew since is gone, and nothing else is
+    /// listed or read) and run what is read through the admitted path (the
+    /// recalls a delegated op needs are started and waited for there; see
     /// `on_inbox_leftover_read`). Returns the requesters that still have
     /// leftovers: they are not polled under the new epoch until these ran.
     fn inbox_run_leftovers(
@@ -1873,97 +1873,122 @@ impl Core {
         now: Now,
         out: &mut Vec<Action>,
     ) -> std::collections::BTreeSet<NodeId> {
+        let width = self.cfg.inbox_poll_width.max(1);
         let Some(l) = self.inbox.leftover.as_ref() else {
             return Default::default();
         };
-        let (below_epoch, nodes) = (l.below_epoch, l.nodes.clone());
-        if l.read.is_none() && now.wait >= l.next_read_at {
-            let op = self.issue_s3(S3Op::InboxDrain { below_epoch }, S3For::InboxLeftover, out);
-            if let Some(l) = self.inbox.leftover.as_mut() {
-                l.read = Some((op, now.wait));
+        let due: Vec<(NodeId, InboxKey)> = l
+            .waiting
+            .iter()
+            .filter(|(_, n)| n.read.is_none() && now.wait >= n.next_read_at)
+            .filter_map(|(node, n)| n.keys.first().map(|k| (*node, *k)))
+            .collect();
+        let nodes = l.waiting.keys().copied().collect();
+        for (node, first) in due {
+            let op = self.issue_s3(
+                S3Op::InboxRun {
+                    epoch: first.epoch,
+                    node,
+                    from: first.n,
+                    width,
+                },
+                S3For::InboxLeftover(node),
+                out,
+            );
+            if let Some(n) = self
+                .inbox
+                .leftover
+                .as_mut()
+                .and_then(|l| l.waiting.get_mut(&node))
+            {
+                n.read = Some(op);
             }
         }
         nodes
     }
 
-    /// The re-read of the takeover drain's leftovers came back: run, per
-    /// requester and in order, the batches of the requesters that still
-    /// wait; a requester whose batches are all gone (withdrawn, deleted)
-    /// or ran is done. What halts again stays for the next tick's re-read.
+    /// The re-read of one requester's leftover batches came back: run them
+    /// in order. A batch that is gone (withdrawn, deleted) or ran is done;
+    /// what halts again stays for the next tick's re-read. A requester
+    /// whose batches are all done is released.
     pub(crate) fn on_inbox_leftover_read(
         &mut self,
         now: Now,
+        node: NodeId,
         op: OpId,
         result: S3Result,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let Some(l) = self.inbox.leftover.as_mut() else {
+        let hold = self.cfg.recall_hold_ms.max(50);
+        let me = self.cfg.node_id;
+        let Some(n) = self
+            .inbox
+            .leftover
+            .as_mut()
+            .and_then(|l| l.waiting.get_mut(&node))
+        else {
             return;
         };
-        let Some((read, read_at)) = l.read else {
-            return;
-        };
-        if read != op {
+        if n.read != Some(op) {
             return;
         }
-        l.read = None;
-        l.next_read_at = now.wait.plus(self.cfg.recall_hold_ms.max(50));
-        let batches = match result {
-            S3Result::InboxDrain(Ok(batches)) => batches,
+        n.read = None;
+        n.next_read_at = now.wait.plus(hold);
+        let run = match result {
+            S3Result::InboxRun(Ok(run)) => run,
             other => {
                 tracing::warn!(
-                    node = self.cfg.node_id,
+                    node = me,
+                    requester = node,
                     ?other,
                     "inbox: re-reading the takeover drain's leftovers failed; retried"
                 );
                 return;
             }
         };
-        let nodes = l.nodes.clone();
-        let mut waiting = std::collections::BTreeSet::new();
-        let mut keys = Vec::new();
         let mut executed = false;
-        for batch in batches {
-            if !nodes.contains(&batch.node) {
-                continue;
-            }
-            if waiting.contains(&batch.node) {
-                keys.push(batch.key());
-                continue;
-            }
-            match self.execute_inbox_batch(now, &batch, true, read_at, replica, out) {
+        if run.is_empty() {
+            // Its first remembered batch is gone: the requester withdrew it
+            // or another drain removed it.
+            n.keys.remove(0);
+            n.next_read_at = now.wait;
+        }
+        for batch in run {
+            match self.execute_inbox_batch(now, &batch, true, replica, out) {
                 Ok(_) => {
                     executed = true;
                     self.stats.inbox_drained_batches += 1;
                     self.stats.inbox_drained_ops += batch.ops.len() as u64;
                     let key = batch.key();
+                    if let Some(n) = self
+                        .inbox
+                        .leftover
+                        .as_mut()
+                        .and_then(|l| l.waiting.get_mut(&node))
+                    {
+                        n.keys.retain(|k| *k != key);
+                        n.next_read_at = now.wait;
+                    }
                     self.issue_s3(S3Op::InboxDelete { key }, S3For::InboxGc(key), out);
                 }
-                Err(Halt::Fenced) | Err(Halt::Recall) => {
-                    waiting.insert(batch.node);
-                    keys.push(batch.key());
-                }
+                Err(Halt::Fenced) | Err(Halt::Recall) => break,
                 Err(Halt::Meta(error)) => {
                     tracing::warn!(
                         node = self.cfg.node_id,
                         %error,
                         "executing a leftover inbox batch"
                     );
-                    waiting.insert(batch.node);
-                    keys.push(batch.key());
+                    break;
                 }
             }
         }
         if let Some(l) = self.inbox.leftover.as_mut() {
-            if waiting.is_empty() {
+            l.waiting.retain(|_, n| !n.keys.is_empty());
+            if l.waiting.is_empty() {
                 self.inbox.leftover = None;
-            } else {
-                l.nodes = waiting;
-                l.keys = keys;
             }
         }
-        self.prune_redirected();
         if executed {
             self.nudge(now, out);
         }
@@ -1972,55 +1997,40 @@ impl Core {
     /// ADR-47 (the drain's halt, rule 3): whether an inbox op the drain
     /// would refuse (`code`: a non-stealable grant it does not reach) is
     /// held instead, its batch kept and polled again (it runs once the
-    /// grant ends, with dedup). `EROFS` of an op whose requester recorded
-    /// a generation at enqueue (`touched_gen`), or that this root
-    /// redirected to a designee after the read that returned it was
-    /// issued (the requester withdrew the batch and sent the op there; the
-    /// run may predate the tombstone). `EXDEV` stays a journaled refusal.
+    /// grant ends, with dedup). `EROFS` of an op
+    /// - whose requester recorded a generation at enqueue (`touched_gen`,
+    ///   `UNKNOWN` included): it may have run there; or
+    /// - whose keys are a non-stealable grant of its own requester: that node
+    ///   may run the op locally at any moment (a batch it withdrew may still
+    ///   be in a read in flight), so the grant's holder is not refused.
+    ///
+    /// `EXDEV` stays a journaled refusal. A rid that was ever in an inbox is
+    /// never run by a designee otherwise (the inbox rule: the designee
+    /// fences it, the root does not redirect it), so these are the only
+    /// ways a drain's refusal could contradict an execution.
     fn inbox_halts_touched(
         &mut self,
-        rid: Rid,
+        requester: NodeId,
         code: Code,
         touched_gen: u64,
-        read_at: WaitMs,
+        keys: &constellation_meta::TouchSet,
+        replica: &dyn Replica,
     ) -> bool {
         if self.cfg.root_ignores_touched || code != Code::ReadOnly {
             return false;
         }
-        let redirected = self.redirected_at.get(&rid).is_some_and(|t| *t >= read_at);
-        if touched_gen == 0 && !redirected {
-            return false;
+        if touched_gen != 0 {
+            self.stats.inbox_touched_halts += 1;
+            return true;
         }
-        self.stats.inbox_touched_halts += 1;
-        true
-    }
-
-    /// Drop the redirect records no read in flight can still carry: those
-    /// older than the oldest poll or leftover re-read in flight (none in
-    /// flight: all). "In flight" lasts until the result is processed,
-    /// which happens within one event.
-    pub(crate) fn prune_redirected(&mut self) {
-        if self.redirected_at.is_empty() {
-            return;
+        let own_grant = matches!(
+            replica.resolve_ownership(keys),
+            constellation_meta::delegation::Ownership::Delegated(d) if d.node == requester
+        );
+        if own_grant {
+            self.stats.inbox_own_grant_halts += 1;
         }
-        let polls = self
-            .inbox
-            .holder
-            .as_ref()
-            .into_iter()
-            .flat_map(|h| h.requesters.values())
-            .filter(|rp| rp.in_flight.is_some())
-            .map(|rp| rp.issued_at);
-        let rereads = self
-            .inbox
-            .leftover
-            .as_ref()
-            .and_then(|l| l.read)
-            .map(|(_, at)| at);
-        match polls.chain(rereads).min() {
-            Some(oldest) => self.redirected_at.retain(|_, at| *at >= oldest),
-            None => self.redirected_at.clear(),
-        }
+        own_grant
     }
 }
 
