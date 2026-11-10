@@ -310,6 +310,7 @@ fn replay_seed() {
         Ok("sticky-holder-returns") => sticky_holder_returns_config(),
         Ok("sticky-holder-restarts") => sticky_holder_restarts_config(),
         Ok("sticky-holder-fresh") => sticky_holder_fresh_config(),
+        Ok("sticky-holder-restarts-cut") => sticky_holder_restarts_cut_config(),
         Ok("sticky-ttl") => sticky_ttl_config(),
         Ok("sticky-stale-route") => sticky_stale_route_config(),
         Ok("backup-two") => backup_two_config(),
@@ -1931,6 +1932,23 @@ fn sticky_holder_restarts_config() -> SimConfig {
         ],
         ..delegated_config()
     }
+}
+
+/// ADR-46: `sticky-holder-restarts`, and the reader is also cut from the
+/// returned holder (from 4.4 s for 3 s, the holder returns at 4.5 s), so the
+/// void round cannot reach it and the quarantine runs to the persisted
+/// horizon: the path the void shortens in the other configurations.
+fn sticky_holder_restarts_cut_config() -> SimConfig {
+    let mut config = sticky_holder_restarts_config();
+    config.faults.push(ScheduledFault {
+        at_ms: 4_400,
+        kind: FaultKind::Partition {
+            a: 2,
+            b: 3,
+            for_ms: 3_000,
+        },
+    });
+    config
 }
 
 /// ADR-46: `sticky-holder-restarts`, and no node records at its first start
@@ -6178,6 +6196,7 @@ fn sweep_config() {
         "sticky-holder-returns" => sticky_holder_returns_config(),
         "sticky-holder-restarts" => sticky_holder_restarts_config(),
         "sticky-holder-fresh" => sticky_holder_fresh_config(),
+        "sticky-holder-restarts-cut" => sticky_holder_restarts_cut_config(),
         "sticky-ttl" => sticky_ttl_config(),
         "sticky-stale-route" => sticky_stale_route_config(),
         "backup-departs" => backup_departs_config(),
@@ -18935,6 +18954,24 @@ fn a_restarted_sticky_holder_serves_no_stale_read() {
         quarantined += r.quarantine_core[0];
     }
     assert!(quarantined > 0, "no restarted holder was quarantined");
+}
+
+/// ADR-46: a reader that cannot be reached by the void leaves the persisted
+/// horizon in charge: the restarted holder's quarantine is waited out, not
+/// ended early, and no run serves a stale read.
+#[test]
+fn a_reader_the_void_cannot_reach_leaves_the_horizon_in_charge() {
+    let mut waited = 0;
+    for seed in [156u64, 159, 728, 1, 2, 3, 4, 5] {
+        let r = run_seed(seed, sticky_holder_restarts_cut_config()).unwrap_or_else(|e| {
+            panic!(
+                "sticky-holder-restarts-cut seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=sticky-holder-restarts-cut"
+            )
+        });
+        waited += r.quarantine_core[3];
+    }
+    assert!(waited > 0, "no quarantine was waited out to its horizon");
 }
 
 /// ADR-46 (S3): a fresh node without the first-start record
