@@ -1235,7 +1235,7 @@ impl Core {
             }
         }
         if bk.gate_tails_kept {
-            if let Some(lo) = v.first().map(|t| t.0) {
+            if let Some(lo) = v.first().map(|t| t.0.min(bk.gate_tails_from)) {
                 for e in lo..gate.epoch {
                     if !v.iter().any(|t| t.0 == e) {
                         v.push((e, 0));
@@ -4364,7 +4364,7 @@ impl Core {
             .fetched
             .iter()
             .filter(|f| f.kept_owner.is_some())
-            .map(|f| (f.epoch, replica.backup_acked(f.epoch).unwrap_or(0)))
+            .map(|f| (f.epoch, f.through))
             .collect();
         let backup_tail_epoch = kept_tails.first().map(|t| t.0).or(backup_tail_epoch);
         if takeover
@@ -4491,7 +4491,7 @@ impl Core {
             self.cancel_timer(t, out);
         }
         self.bk.kept_union = None;
-        self.bk.kept_ready = false;
+        self.bk.kept_ready = None;
         self.bk.kept_floor = 0;
         self.lease.claim_floor = 0;
         self.pr.check_slack = None;
@@ -5610,7 +5610,7 @@ impl Core {
                 }
                 // A fetch that outlasted the promise window checks again
                 // before its CAS (the seals stay: they are idempotent).
-                if self.bk.kept_ready
+                if self.bk.kept_ready.is_some()
                     && self
                         .pr
                         .check_passed_at

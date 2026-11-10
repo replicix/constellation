@@ -64,9 +64,10 @@ pub(crate) struct Target {
 }
 
 impl Target {
-    /// The stream epochs collected for the tenure: its own.
+    /// The stream epochs collected for the tenure: its own, and the one a
+    /// hold handed to a transferee journals under (`epoch_hold_epoch_for`).
     pub(crate) fn epochs(&self) -> Vec<Epoch> {
-        vec![self.tenure.1]
+        vec![self.tenure.1, self.tenure.1 + 1]
     }
 
     /// The epochs a node's answer must cover: the previous holder is asked
@@ -127,7 +128,7 @@ impl Core {
             && prev.holder != self.cfg.node_id
             && !prev.released
             && !self.owner_reclaims(prev)
-            && !self.bk.kept_ready
+            && self.bk.kept_ready != Some(prev.renewal_key())
     }
 
     /// The targets of a claim of `prev`: the hold streams of its own tenure
@@ -599,7 +600,7 @@ impl Core {
         let waited = self
             .bk
             .group_wait
-            .take()
+            .as_ref()
             .map_or(0, |w| now.wait.since(w.since).max(0));
         tracing::info!(
             node = self.cfg.node_id,
@@ -695,6 +696,7 @@ impl Core {
         let mut owner_of: BTreeMap<Epoch, NodeId> = BTreeMap::new();
         let mut keepers: BTreeMap<Epoch, BTreeSet<NodeId>> = BTreeMap::new();
         let mut past_gap = 0usize;
+        let mut forced = false;
         for e in &epochs {
             let mut all: BTreeMap<u64, &BackupTx> = BTreeMap::new();
             for (ti, t) in u.targets.iter().enumerate() {
@@ -713,6 +715,7 @@ impl Core {
                         match all.get(&tx.first) {
                             Some(old) if old.last != tx.last || old.origin != tx.origin => {
                                 if u.force {
+                                    forced = true;
                                     self.stats.kept_forced += 1;
                                     if tx.last > old.last {
                                         all.insert(tx.first, tx);
@@ -788,7 +791,8 @@ impl Core {
                 }
             }
         }
-        let _ = floor;
+        self.bk.kept_floor = floor;
+        self.bk.gate_tails_from = u.targets.iter().map(|t| t.tenure.1).min().unwrap_or(0);
         debug_assert_eq!(past_gap, 0, "a kept copy lies past a gap");
         if past_gap > 0 {
             self.stats.kept_past_gap += past_gap as u64;
@@ -799,15 +803,10 @@ impl Core {
             );
         }
         let prev = u.prev;
-        // One entry per epoch with rows; with none anywhere, the tenure's
-        // own epoch, empty (the marker then says that no tail follows it).
+        // One entry per epoch with rows; with none anywhere nothing is
+        // installed (the claim goes on as one with no tail to carry: its
+        // marker says so, as before the ADR).
         merged_by_epoch.retain(|_, m| !m.is_empty());
-        if merged_by_epoch.is_empty() {
-            merged_by_epoch.insert(u.targets[0].tenure.1, Vec::new());
-            owner_of
-                .entry(u.targets[0].tenure.1)
-                .or_insert(u.targets[0].tenure.0);
-        }
         let mut fetched: Vec<FetchedTail> = Vec::new();
         for (e, merged) in &merged_by_epoch {
             if !replica.backup_append(*e, merged) {
@@ -847,24 +846,36 @@ impl Core {
                 epoch: *e,
                 config_version: prev.config_version,
                 members,
-                through: replica.backup_acked(*e).unwrap_or(self.bk.acked),
+                // The end of the merged prefix: the rows the log already
+                // carries make the tail contiguous across them, which the
+                // store's own count of it (from the oldest row held) is not.
+                through: merged.last().map_or(0, |t| t.last),
                 kept_owner: Some(holder),
             });
             self.stats.kept_rows_carried += merged.len() as u64;
         }
-        self.bk.held.clear();
-        self.bk.fetched = fetched;
-        self.stats.tail_fetches += 1;
-        self.stats.kept_fetches_completed += 1;
-        if prev.inherited_tail.is_some() {
-            self.stats.inherited_tail_fetches += 1;
+        if !fetched.is_empty() {
+            self.bk.held.clear();
+            self.bk.fetched = fetched;
+            self.stats.tail_fetches += 1;
+            if prev.inherited_tail.is_some() {
+                self.stats.inherited_tail_fetches += 1;
+            }
         }
-        if u.partial {
+        self.stats.kept_fetches_completed += 1;
+        if u.partial || forced {
             let e = u.targets[0].tenure.1;
             self.stats.kept_abandoned += 1;
             self.stats.groups_abandoned += 1;
             self.bk.abandoned_claim = Some(e);
-            self.bk.abandoned_through = self.bk.acked;
+            // What the claim carries of the abandoned epoch: a copy at or
+            // below it retires on carry, the ones past it replay by rid.
+            self.bk.abandoned_through = self
+                .bk
+                .fetched
+                .iter()
+                .find(|f| f.epoch == e)
+                .map_or(0, |f| f.through);
             tracing::warn!(
                 node = me,
                 epoch = e,
@@ -873,7 +884,8 @@ impl Core {
             );
         }
         self.bk.abandon = None;
-        self.bk.kept_ready = true;
+        self.bk.group_wait = None;
+        self.bk.kept_ready = Some(prev.renewal_key());
         true
     }
 }
