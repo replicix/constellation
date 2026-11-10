@@ -931,7 +931,7 @@ pub(crate) struct BackupState {
     /// operator's `--force` for a divergence.
     pub(crate) kept: Option<super::kept::KeptFetch>,
     pub(crate) kept_union: Option<super::kept::KeptUnion>,
-    pub(crate) kept_ready: bool,
+    pub(crate) kept_ready: Option<constellation_store_s3::RenewalKey>,
     pub(crate) kept_seen: Option<(Epoch, WaitMs)>,
     pub(crate) kept_force: bool,
     pub(crate) kept_force_wanted: Option<Epoch>,
@@ -958,6 +958,9 @@ pub(crate) struct BackupState {
     /// one below the claim's, `tail_through` being the first's).
     pub(crate) gate_tails: Vec<(Epoch, u64)>,
     pub(crate) gate_tails_kept: bool,
+    /// With `gate_tails_kept`: the lowest tenure epoch of the fetch (the
+    /// marker names every epoch from it).
+    pub(crate) gate_tails_from: Epoch,
     /// ADR-51: the claim must land above every epoch a hold journaled under
     /// (the streams the members sealed with rows): the claim's epoch is at
     /// least this plus one.
@@ -6657,6 +6660,7 @@ impl Core {
         self.bk.tail_through = 0;
         self.bk.gate_tails.clear();
         self.bk.gate_tails_kept = false;
+        self.bk.gate_tails_from = 0;
     }
 
     /// The tail alone, as before the strand joined it (the core tests that

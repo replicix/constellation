@@ -63529,8 +63529,8 @@ mod kept_fetch {
         }
         // The retired owner is not asked; the roster's other node is.
         let a = asks(&out);
-        assert_eq!(a.len(), 1, "{out:?}");
-        assert_eq!((a[0].0, a[0].2), (2, 1));
+        assert_eq!(a.len(), 2, "its own epoch and the one above: {out:?}");
+        assert_eq!((a[0].0, a[0].2, a[1].2), (2, 1, 2));
         assert!(plain_asks(&out).is_empty(), "{out:?}");
         let txs = rows(2);
         let out = win(&mut h, out, &fenced());
@@ -63815,7 +63815,7 @@ mod kept_fetch {
         h.step(roster_ev(vec![1, 2, 3], h.clk().wait));
         h.advance(10);
         let out = acquire(&mut h, &lease);
-        assert_eq!(asks(&out).len(), 1, "a read after the sight: {out:?}");
+        assert_eq!(asks(&out).len(), 2, "a read after the sight: {out:?}");
     }
 
     // ---- the promise window ----
@@ -63914,6 +63914,383 @@ mod kept_fetch {
     #[test]
     fn a_claim_does_not_check_again_under_the_control() {
         assert_eq!(recheck(true, 20_000), (1, true));
+    }
+
+    // ---- V4: the merge after the tail, the epochs, the gate ----
+
+    /// `n` transactions of node 1's epoch 1 named `<prefix>1..`, as they sit
+    /// in the journal (two journal seqs each).
+    fn named_rows(prefix: &str, n: u64) -> Vec<BackupTx> {
+        let holder = Harness::new(1);
+        holder.meta.set_holder_epoch(1);
+        // (Each set under rids of its own: a rid the log or the journal
+        // carries already is skipped, never re-shipped.)
+        let base = 1_000 * u64::from(prefix.as_bytes()[0]);
+        for i in 1..=n {
+            let mut create = holder.create(&format!("{prefix}{i}"));
+            if let MutateOp::Create { ino, .. } = &mut create {
+                *ino = (1 << 40) | (base + i);
+            }
+            let rid = Rid {
+                node: 1,
+                incarnation: 1,
+                seq: base + i,
+            };
+            constellation_meta::execute_mutate(&holder.meta, &create, Some(rid)).unwrap();
+        }
+        holder.meta.journal_txs_from(1, 1000).unwrap()
+    }
+
+    /// The `TailFollowsThrough` records of the markers a claim shipped.
+    fn marker_tails(all: &[Action]) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        for (_, r) in s3_ops(all) {
+            if let S3Op::SegmentPut { payload, .. } = r {
+                if let Ok(seg) = crate::segment::decode(payload) {
+                    for rec in seg.records {
+                        if let LogRecord::TailFollowsThrough {
+                            prev_epoch,
+                            through,
+                        } = rec
+                        {
+                            out.push((prev_epoch, through));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// T4: two members kept prefixes of different length: each transaction is
+    /// carried once.
+    fn t4(skipped: bool) -> usize {
+        let (mut h, out) = start(3, &fenced(), &[1, 2, 3, 4], 1, skipped);
+        if skipped {
+            finish(&mut h, out, &fenced());
+            return reshipped(&h).len();
+        }
+        let a = asks(&out);
+        let _ = win(&mut h, out, &fenced());
+        let txs = rows(5);
+        answer_all(&mut h, &a, 2, 1, txs[..3].to_vec(), vec![vec![1, 2, 4]]);
+        let out = answer_all(&mut h, &a, 4, 1, txs.clone(), vec![vec![1, 2, 4]]);
+        assert!(finish(&mut h, out, &fenced()).is_some());
+        assert_eq!(h.core.stats.kept_rows_carried, 5);
+        reshipped(&h).len()
+    }
+
+    #[test]
+    fn two_members_kept_prefixes_are_journaled_once() {
+        assert_eq!(t4(false), 5);
+    }
+
+    #[test]
+    fn two_members_kept_prefixes_are_not_carried_under_the_control() {
+        assert_eq!(t4(true), 0);
+    }
+
+    /// T6: a delegate's append inside the kept set keeps its origin, and is
+    /// re-shipped rather than queued as a replay.
+    fn t6(skipped: bool) -> (usize, u64) {
+        let (mut h, out) = start(3, &fenced(), &[1, 2, 3], 1, skipped);
+        if skipped {
+            finish(&mut h, out, &fenced());
+            return (reshipped(&h).len(), h.core.stats.deleg_append_queued);
+        }
+        let a = asks(&out);
+        let _ = win(&mut h, out, &fenced());
+        let mut txs = rows(2);
+        txs[1].origin = (7, 3);
+        let out = answer_all(&mut h, &a, 2, 1, txs, vec![vec![1, 2]]);
+        assert!(finish(&mut h, out, &fenced()).is_some());
+        (reshipped(&h).len(), h.core.stats.deleg_append_queued)
+    }
+
+    #[test]
+    fn a_delegate_append_in_the_kept_set_is_reshipped_not_replayed() {
+        assert_eq!(t6(false), (2, 0));
+    }
+
+    #[test]
+    fn a_delegate_append_in_the_kept_set_is_not_carried_under_the_control() {
+        assert_eq!(t6(true), (0, 0));
+    }
+
+    /// S1: the claimant is behind the log's head when it asks. Member `B`
+    /// kept transactions the log carries already (they reach it in the tail
+    /// that follows the fetch), `D` kept the ones after them: the merge, run
+    /// after that tail, carries `D`'s and not `B`'s again. Merged before the
+    /// tail, `B`'s rows lay past the log's head and went in twice.
+    fn s1(skipped: bool) -> (Vec<(u64, u64)>, u64) {
+        // Node 1's journal: six transactions; the first four reach the log.
+        let mut owner = Harness::with(1, true);
+        owner.hold(1, None);
+        for i in 1..=6 {
+            let rid = owner.rid(i);
+            let op = owner.create(&format!("s{i}"));
+            owner.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op,
+                tag: Default::default(),
+            });
+        }
+        let txs = Replica::journal_txs_from(&owner.meta, 1, 1000);
+        assert_eq!(txs.len(), 6);
+        let through = txs[3].last;
+        let batch = Replica::take_journal(&owner.meta, 100).unwrap();
+        let shipped: Vec<_> = batch.iter().filter(|(s, _)| *s <= through).collect();
+        let records: Vec<_> = shipped.iter().map(|(_, r)| r.clone()).collect();
+        let rows: Vec<u64> = shipped.iter().map(|(s, _)| *s).collect();
+        let payload = crate::segment::encode(1, 1, through, &rows, &[], &records).unwrap();
+        let (mut h, out) = start(3, &fenced(), &[1, 2, 3, 4], 1, skipped);
+        if skipped {
+            return (Vec::new(), 0);
+        }
+        let a = asks(&out);
+        let _ = win(&mut h, out, &fenced());
+        // B: the third and fourth (in the log by the time the tail is read);
+        // D: the fifth and sixth.
+        answer_all(&mut h, &a, 2, 1, txs[2..4].to_vec(), vec![vec![1, 2, 4]]);
+        let out = answer_all(&mut h, &a, 4, 1, txs[4..].to_vec(), vec![vec![1, 2, 4]]);
+        // The tail to head reads the segment with the first four.
+        let run = s3_ops(&out)
+            .into_iter()
+            .find(|(_, r)| matches!(r, S3Op::SegmentRun { .. }))
+            .map(|(op, _)| op)
+            .expect("the tail follows the fetch");
+        let out = h.step(Event::S3 {
+            op: run,
+            result: S3Result::SegmentRun(Ok(vec![(1, payload)])),
+        });
+        let all = win(&mut h, out, &fenced());
+        assert!(cas(&all).is_some(), "the claim lands: {all:?}");
+        (reshipped(&h), h.core.stats.kept_rows_carried)
+    }
+
+    #[test]
+    fn a_claimant_behind_head_merges_after_its_tail() {
+        let (idents, carried) = s1(false);
+        assert_eq!(carried, 2, "only the rows the log lacks");
+        assert_eq!(idents.len(), 2, "{idents:?}");
+        assert!(idents.iter().all(|(e, f)| *e == 1 && *f >= 9), "{idents:?}");
+    }
+
+    #[test]
+    fn a_claimant_behind_head_carries_nothing_under_the_control() {
+        assert_eq!(s1(true), (Vec::new(), 0));
+    }
+
+    /// S2: two members kept different transactions at one journal seq: the
+    /// attempt ends and the claim waits for the operator; `repair abandon
+    /// --epoch --force` completes it with the longest answer.
+    fn s2(skipped: bool) -> (bool, bool, u64, bool) {
+        let (mut h, out) = start(3, &fenced(), &[1, 2, 3, 4], 1, skipped);
+        if skipped {
+            let landed = finish(&mut h, out, &fenced()).is_some();
+            return (landed, false, 0, false);
+        }
+        let a = asks(&out);
+        let _ = win(&mut h, out, &fenced());
+        let txs = rows(3);
+        // Node 4 kept a longer transaction at the same first seq.
+        let mut longer = txs[..2].to_vec();
+        longer[1].last += 5;
+        answer_all(&mut h, &a, 2, 1, txs[..2].to_vec(), vec![vec![1, 2, 4]]);
+        let out = answer_all(&mut h, &a, 4, 1, longer, vec![vec![1, 2, 4]]);
+        let first = finish(&mut h, out, &fenced());
+        let diverged = h.core.stats.kept_diverged;
+        assert_eq!(diverged, 1);
+        assert!(first.is_none(), "the claim does not land on a divergence");
+        // The operator forces it; the next attempt asks again.
+        h.step(Event::Control {
+            op: OpId(702),
+            req: Control::Abandon {
+                target: crate::event::AbandonTarget::Epoch(1),
+                force: true,
+            },
+        });
+        h.advance(10);
+        let out = acquire(&mut h, &fenced());
+        let a = asks(&out);
+        let _ = win(&mut h, out, &fenced());
+        let mut longer = txs[..2].to_vec();
+        longer[1].last += 5;
+        answer_all(&mut h, &a, 2, 1, txs[..2].to_vec(), vec![vec![1, 2, 4]]);
+        let out = answer_all(&mut h, &a, 4, 1, longer, vec![vec![1, 2, 4]]);
+        let all = win(&mut h, out, &fenced());
+        (
+            true,
+            cas(&all).is_some(),
+            h.core.stats.kept_forced,
+            marker_abandons(&all),
+        )
+    }
+
+    /// Whether a marker in `all` carries a `GroupAbandoned`.
+    fn marker_abandons(all: &[Action]) -> bool {
+        s3_ops(all).into_iter().any(|(_, r)| match r {
+            S3Op::SegmentPut { payload, .. } => crate::segment::decode(payload)
+                .map(|seg| {
+                    seg.records
+                        .iter()
+                        .any(|rec| matches!(rec, LogRecord::GroupAbandoned { .. }))
+                })
+                .unwrap_or(false),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn two_sources_that_diverge_end_the_attempt_and_force_completes_it() {
+        let (_, landed, forced, abandoned) = s2(false);
+        assert!(landed, "the forced claim lands");
+        assert_eq!(forced, 1);
+        assert!(abandoned, "the marker says the operator forced it");
+    }
+
+    #[test]
+    fn a_divergence_is_never_seen_under_the_control() {
+        let (landed, ..) = s2(true);
+        assert!(landed, "the claim lands without looking");
+    }
+
+    /// M4: a tenure that inherited a union (epoch 1, node 1's) and formed a
+    /// hold of its own (epoch 3, node 6's): both are collected, re-shipped in
+    /// epoch order, and no identity twice.
+    fn m4(skipped: bool) -> Vec<(u64, u64)> {
+        let mut lease = lease_of(6, 3, 0);
+        lease.inherited_tail = Some(Box::new(InheritedTail {
+            epoch: 1,
+            config_version: 1,
+            members: vec![2, 6],
+            through: 4,
+            kept: true,
+            holder: 1,
+        }));
+        let (mut h, out) = start(5, &lease, &[2, 5, 6], 1, skipped);
+        if skipped {
+            finish(&mut h, out, &lease);
+            return reshipped(&h);
+        }
+        let a = asks(&out);
+        let _ = win(&mut h, out, &lease);
+        let union = named_rows("u", 2);
+        let hold = named_rows("h", 2);
+        // Node 2 kept both the union's rows (epoch 1) and the hold's (epoch 3).
+        let mut last = Vec::new();
+        for (n, req, e) in a.iter().filter(|x| x.0 == 2) {
+            let rows = match *e {
+                1 => union.clone(),
+                3 => hold.clone(),
+                _ => Vec::new(),
+            };
+            last = h.step(answer_at(*n, *req, *e, rows, vec![vec![2, 5, 6]]));
+        }
+        let out = answer_all(&mut h, &a, 6, 1, union, Vec::new());
+        drop(last);
+        let all = win(&mut h, out, &lease);
+        assert!(cas(&all).is_some(), "the claim lands: {all:?}");
+        reshipped(&h)
+    }
+
+    #[test]
+    fn a_tenure_that_inherited_a_union_and_formed_a_hold_is_fetched_for_both() {
+        assert_eq!(
+            m4(false),
+            vec![(1, 1), (1, 3), (3, 1), (3, 3)],
+            "union first, the hold's after it"
+        );
+    }
+
+    #[test]
+    fn a_tenure_that_inherited_a_union_is_not_collected_under_the_control() {
+        assert!(m4(true).is_empty());
+    }
+
+    /// Journal identities `(epoch, first seq)`.
+    type Idents = Vec<(u64, u64)>;
+
+    /// M3: a hold handed to a transferee (node 4) journaled under the epoch
+    /// above the tenure's. The member's answer for that stream carries the
+    /// rows and says the stream was sealed; the claim lands two epochs up
+    /// and its marker names both epochs.
+    fn m3(skipped: bool) -> (Option<u64>, Idents, Idents) {
+        let mut h = Harness::new(1);
+        h.core.cfg.kept_fetch_skipped = skipped;
+        h.core.cfg.takeover_promise_check = false;
+        h.core.cfg.epoch_slack = 1;
+        let lease = lease_of(2, 3, h.now.0 - 1_000);
+        h.watch(&lease);
+        h.step(roster_ev(vec![1, 2, 3, 4], h.clk().wait));
+        h.advance(10);
+        let out = acquire(&mut h, &lease);
+        if skipped {
+            let all = win(&mut h, out, &lease);
+            return (
+                cas(&all).map(|l| l.epoch),
+                reshipped(&h),
+                marker_tails(&all),
+            );
+        }
+        let a = asks(&out);
+        let _ = win(&mut h, out, &lease);
+        let rows4 = named_rows("t", 2);
+        let mut last = Vec::new();
+        for (n, req, e) in a.iter().filter(|x| x.0 == 3) {
+            let (rows, sealed) = if *e == 4 {
+                (rows4.clone(), vec![(4, 4)])
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            let through = rows.iter().map(|t| t.last).max().unwrap_or(0);
+            last = h.step(Event::Peer {
+                from: *n,
+                msg: PeerMsg::SealedTail {
+                    req: *req,
+                    epoch: *e,
+                    held: true,
+                    empty: false,
+                    txs: rows,
+                    through,
+                    next: None,
+                    members: vec![vec![2, 3, 4]],
+                    sealed,
+                    refused: None,
+                },
+            });
+        }
+        // Node 4, the transferee, kept no copy of its own stream.
+        drop(last);
+        let out = answer_all(&mut h, &a, 4, 4, Vec::new(), vec![vec![2, 3, 4]]);
+        let all = win(&mut h, out, &lease);
+        (
+            cas(&all).map(|l| l.epoch),
+            reshipped(&h),
+            marker_tails(&all),
+        )
+    }
+
+    #[test]
+    fn a_claim_over_a_handed_over_hold_lands_two_epochs_up() {
+        let (epoch, idents, tails) = m3(false);
+        assert_eq!(
+            epoch,
+            Some(5),
+            "above the epoch the transferee journaled under"
+        );
+        assert_eq!(idents, vec![(4, 1), (4, 3)]);
+        assert_eq!(tails.len(), 2, "{tails:?}");
+        assert!(tails.iter().any(|t| t.0 == 3 && t.1 == 0), "{tails:?}");
+        assert!(tails.iter().any(|t| t.0 == 4 && t.1 > 0), "{tails:?}");
+    }
+
+    #[test]
+    fn a_claim_over_a_handed_over_hold_lands_one_epoch_up_under_the_control() {
+        let (epoch, idents, _) = m3(true);
+        assert_eq!(epoch, Some(4));
+        assert!(idents.is_empty());
     }
 
     // ---- T10 ----
