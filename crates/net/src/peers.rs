@@ -3528,27 +3528,35 @@ mod tests {
     #[tokio::test]
     async fn a_dial_stuck_behind_connections_without_the_selected_path_closes_them() {
         let (dialer, holder_addr, first, second) = stuck_dial_setup().await;
-        // None of them holds the selection.
-        dialer.stick_dials_after(Duration::from_millis(100), None);
-        // The dial is slower than that (and the test reads the outcome
-        // of the stuck timer, not of the dial).
-        dialer.inject_dial(Duration::from_millis(600), 0);
+        let dialer = Arc::new(dialer);
+        // None of them holds the selection; the dial is held and the
+        // timer looks when told, so no clock is raced.
+        dialer.stick_dials_by_hand(None);
+        dialer.hold_dials();
         let ping = Payload::Ping { node_id: 2 };
-        let asked = dialer.request(holder_addr, &ping);
-        let (answer, closed) = tokio::join!(asked, async {
-            let both = async {
-                first.closed().await;
-                second.closed().await;
-            };
-            tokio::time::timeout(Duration::from_secs(5), both)
-                .await
-                .is_ok()
+        let asked = tokio::spawn({
+            let dialer = dialer.clone();
+            async move { dialer.request(holder_addr, &ping).await }
         });
-        assert!(answer.is_ok(), "the dial did not complete: {answer:?}");
+        assert!(wait_for(10, || dialer.dials_started() == 1).await);
+        // A look can land on a datagram still in flight from the setup
+        // (that connection is live, then); a quiet one is closed at the
+        // next.
+        let mut looks = 0;
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(30)
+            && !(first.close_reason().is_some() && second.close_reason().is_some())
+        {
+            dialer.stuck_look();
+            looks += 1;
+            assert!(wait_for(10, || dialer.stuck_looks() == looks).await);
+        }
         assert!(
-            closed,
+            first.close_reason().is_some() && second.close_reason().is_some(),
             "connections without the selected path stayed open under a stuck dial"
         );
+        dialer.release_dials(1);
+        let _ = asked.await;
     }
 
     /// A slow dial while one connection holds the selected path closes
@@ -3573,31 +3581,78 @@ mod tests {
 
     /// A connection that comes up while the dial runs (the peer's own dial
     /// to us, which is what makes ours slow on a loaded host) may not hold
-    /// the selected path yet, and is not what the dial is stuck behind:
-    /// the stuck timer closes nothing then. It used to close it, and the
-    /// requests on it failed (`a_slow_peer_keeps_its_pooled_connection`,
-    /// under load).
+    /// the selected path yet: the look that first sees it closes nothing
+    /// (`a_slow_peer_keeps_its_pooled_connection`, under load). One that
+    /// then stays silent is closed at a later look, without waiting for
+    /// the dial to end.
     #[tokio::test]
-    async fn a_connection_made_during_a_slow_dial_is_not_closed_as_stuck() {
+    async fn a_connection_made_during_a_slow_dial_is_judged_at_a_later_look() {
         let (dialer, holder_addr, first, second) = stuck_dial_setup().await;
-        // None of them holds the selection.
-        dialer.stick_dials_after(Duration::from_millis(100), None);
-        dialer.inject_dial(Duration::from_millis(600), 0);
+        let dialer = Arc::new(dialer);
+        dialer.stick_dials_by_hand(None);
+        dialer.hold_dials();
         let ping = Payload::Ping { node_id: 2 };
-        let asked = dialer.request(holder_addr.clone(), &ping);
-        let (answer, during) = tokio::join!(asked, async {
-            assert!(wait_for(10, || dialer.dials_started() == 1).await);
-            dialer.connect_for_test(holder_addr.clone()).await.unwrap()
+        let asked = tokio::spawn({
+            let dialer = dialer.clone();
+            let holder_addr = holder_addr.clone();
+            async move { dialer.request(holder_addr, &ping).await }
         });
-        assert!(answer.is_ok(), "the dial did not complete: {answer:?}");
-        // The stuck timer fired long ago (100 ms against a 600 ms dial).
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(wait_for(10, || dialer.dials_started() == 1).await);
+        let during = dialer.connect_for_test(holder_addr.clone()).await.unwrap();
+        dialer.stuck_look();
+        assert!(wait_for(10, || dialer.stuck_looks() == 1).await);
         assert!(
             during.close_reason().is_none()
                 && first.close_reason().is_none()
                 && second.close_reason().is_none(),
-            "a connection was closed as stuck though one came up during the dial"
+            "a connection was closed at the look that first saw one come up"
         );
+        // Silent from here on: closed at a later look, the dial still held.
+        let mut looks = 1;
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(30) && during.close_reason().is_none() {
+            dialer.stuck_look();
+            looks += 1;
+            assert!(wait_for(10, || dialer.stuck_looks() == looks).await);
+        }
+        assert!(
+            during.close_reason().is_some(),
+            "a silent connection that came up during the dial was never judged"
+        );
+        assert_eq!(dialer.dials_started(), 1);
+        dialer.release_dials(1);
+        let _ = asked.await;
+    }
+
+    /// A connection that received datagrams since the dial began is live
+    /// and is kept, though it was open before the dial and holds no
+    /// selected path.
+    #[tokio::test]
+    async fn a_connection_that_receives_during_a_slow_dial_is_not_closed_as_stuck() {
+        let (dialer, holder_addr, first, _second) = stuck_dial_setup().await;
+        let dialer = Arc::new(dialer);
+        dialer.stick_dials_by_hand(None);
+        dialer.hold_dials();
+        let ping = Payload::Ping { node_id: 2 };
+        let asked = tokio::spawn({
+            let dialer = dialer.clone();
+            async move { dialer.request(holder_addr, &ping).await }
+        });
+        assert!(wait_for(10, || dialer.dials_started() == 1).await);
+        let rx = || first.stats().udp_rx.datagrams;
+        let rx0 = rx();
+        // The holder acknowledges this.
+        let (mut send, _recv) = first.open_bi().await.unwrap();
+        send.write_all(b"x").await.unwrap();
+        assert!(wait_for(10, || rx() > rx0).await);
+        dialer.stuck_look();
+        assert!(wait_for(10, || dialer.stuck_looks() == 1).await);
+        assert!(
+            first.close_reason().is_none(),
+            "a connection that received datagrams during the dial was closed as stuck"
+        );
+        dialer.release_dials(1);
+        let _ = asked.await;
     }
 
     /// The same with iroh's real `paths()` / `is_selected()` check and no

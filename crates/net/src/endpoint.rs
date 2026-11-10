@@ -260,6 +260,10 @@ struct TestDial {
     /// When set, only the connection with this stable id (`None`: none)
     /// holds iroh's selected path.
     selected_only: Mutex<Option<Option<usize>>>,
+    /// When set, the stuck timer looks once per permit instead of every
+    /// [`DIAL_STUCK_AFTER`]; `stuck_looks` counts the looks done.
+    stuck_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    stuck_looks: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -280,6 +284,8 @@ impl Default for TestDial {
             rejoins: Default::default(),
             stuck_after: Mutex::default(),
             selected_only: Mutex::default(),
+            stuck_gate: Mutex::default(),
+            stuck_looks: Default::default(),
         }
     }
 }
@@ -348,12 +354,32 @@ impl Drop for StuckTimer {
     }
 }
 
+/// A tracked connection: a weak handle and the sequence number `track`
+/// gave it. `stable_id` is an address that can be reused once the
+/// connection is freed, so it cannot tell an old connection from a new one.
+struct TrackedConn {
+    seq: u64,
+    weak: iroh::endpoint::WeakConnectionHandle,
+}
+
+impl TrackedConn {
+    fn upgrade(&self) -> Option<iroh::endpoint::Connection> {
+        self.weak.upgrade()
+    }
+}
+
+/// What a dial's stuck timer has seen of a peer's connections: sequence
+/// number to datagrams received, at the previous look (or at dial start).
+type StuckSeen = HashMap<u64, u64>;
+
 struct Pool {
     connections: Mutex<HashMap<iroh::EndpointId, ConnectionSlot>>,
     /// Every connection the endpoint completed a handshake for, either
     /// side, any ALPN, by remote — weak handles, so this never keeps one
     /// alive. What [`Pool::evict`] closes.
-    tracked: Mutex<HashMap<iroh::EndpointId, Vec<iroh::endpoint::WeakConnectionHandle>>>,
+    tracked: Mutex<HashMap<iroh::EndpointId, Vec<TrackedConn>>>,
+    /// Last sequence number [`Pool::track`] handed out; never reused.
+    track_seq: std::sync::atomic::AtomicU64,
     /// Peers with a probe in flight. Single-flight per peer: a slow peer
     /// times out many requests at once, and one probe answers for all
     /// of them (a probe of a live connection ends at its first received
@@ -393,6 +419,7 @@ impl Pool {
         Self {
             connections: Mutex::new(HashMap::new()),
             tracked: Mutex::new(HashMap::new()),
+            track_seq: std::sync::atomic::AtomicU64::new(0),
             probing: Mutex::new(HashSet::new()),
             probes: std::sync::atomic::AtomicUsize::new(0),
             dialing: Mutex::new(HashMap::new()),
@@ -627,29 +654,38 @@ impl Pool {
             })
         });
         if !known {
-            list.push(conn.weak_handle());
+            let seq = self
+                .track_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            list.push(TrackedConn {
+                seq,
+                weak: conn.weak_handle(),
+            });
         }
         !known
     }
 
-    /// The open connections to `id` the pool tracks.
-    fn live_connections(&self, id: iroh::EndpointId) -> Vec<iroh::endpoint::Connection> {
+    /// The open connections to `id` the pool tracks, with their sequence
+    /// numbers.
+    fn live_connections(&self, id: iroh::EndpointId) -> Vec<(u64, iroh::endpoint::Connection)> {
         self.tracked
             .lock()
             .unwrap()
             .get(&id)
             .into_iter()
             .flatten()
-            .filter_map(|weak| weak.upgrade())
-            .filter(|conn| conn.close_reason().is_none())
+            .filter_map(|t| t.upgrade().map(|conn| (t.seq, conn)))
+            .filter(|(_, conn)| conn.close_reason().is_none())
             .collect()
     }
 
-    /// Stable ids of the connections [`Self::live_connections`] finds.
-    fn live_ids(&self, id: iroh::EndpointId) -> HashSet<usize> {
+    /// What a dial's stuck timer starts from: the connections open now and
+    /// their received-datagram counts.
+    fn stuck_seen(&self, id: iroh::EndpointId) -> StuckSeen {
         self.live_connections(id)
-            .iter()
-            .map(|conn| conn.stable_id())
+            .into_iter()
+            .map(|(seq, conn)| (seq, conn.stats().udp_rx.datagrams))
             .collect()
     }
 
@@ -669,9 +705,16 @@ impl Pool {
     /// drops the selection and the dial's next retransmission goes to
     /// every address. This can go once iroh re-selects on a close.
     ///
-    /// Only what was open when the dial began (`before_dial`) can be what
-    /// it is stuck behind: if any connection to the peer came up since,
-    /// nothing is closed.
+    /// Only a silent connection is what the dial is stuck behind: one
+    /// that received a datagram since the previous look (`seen`; the
+    /// dial's timer calls this every interval, starting from the
+    /// connections open when the dial began) is live, whether it came up
+    /// before the dial or during it, and is kept. A connection seen for
+    /// the first time (the peer's own dial to us, which is what makes a
+    /// dial of ours slow under load) proves the peer reachable, and iroh
+    /// re-selects the path when one is added: nothing is closed at that
+    /// look, and if the new connection then stays silent without the
+    /// selection it is closed at the next.
     ///
     /// If any live connection holds the selection it is a valid one and
     /// the dial is merely slow: nothing is closed, since `request` does
@@ -683,26 +726,25 @@ impl Pool {
     fn unstick(
         &self,
         id: iroh::EndpointId,
-        before_dial: &HashSet<usize>,
+        seen: &mut StuckSeen,
         selected: impl Fn(&iroh::endpoint::Connection) -> bool,
     ) -> usize {
         let live = self.live_connections(id);
-        if live.iter().any(selected) {
+        let before = std::mem::take(seen);
+        let mut came_up = false;
+        let mut stuck = Vec::new();
+        for (seq, conn) in &live {
+            let rx = conn.stats().udp_rx.datagrams;
+            match before.get(seq) {
+                None => came_up = true,
+                Some(&was) if rx <= was => stuck.push(conn.clone()),
+                Some(_) => {}
+            }
+            seen.insert(*seq, rx);
+        }
+        if came_up || live.iter().any(|(_, conn)| selected(conn)) {
             return 0;
         }
-        // A connection that came up after the dial began (the peer's own
-        // dial to us, say, which is what makes a dial of ours slow under
-        // load) is proof the peer is reachable, and iroh re-selects the
-        // path when one is added. It may not hold the selection yet; it
-        // is not what the dial is stuck behind, and closing it failed
-        // the requests already on it.
-        if live
-            .iter()
-            .any(|conn| !before_dial.contains(&conn.stable_id()))
-        {
-            return 0;
-        }
-        let stuck = live;
         for conn in &stuck {
             conn.close(
                 iroh::endpoint::VarInt::from_u32(0),
@@ -2601,7 +2643,9 @@ impl P2p {
             .unwrap_or(DIAL_STUCK_AFTER);
         #[cfg(not(test))]
         let stuck_after = DIAL_STUCK_AFTER;
-        let before_dial = pool.live_ids(peer.id);
+        let mut seen = pool.stuck_seen(peer.id);
+        #[cfg(test)]
+        let stuck_gate = test_dial.stuck_gate.lock().unwrap().clone();
         tokio::spawn(async move {
             // Out of the map however this task ends, a panic included.
             let mut entry = DialEntry {
@@ -2614,14 +2658,29 @@ impl P2p {
                 #[cfg(test)]
                 let test_dial = test_dial.clone();
                 async move {
-                    tokio::time::sleep(stuck_after).await;
-                    pool.unstick(id, &before_dial, |conn| {
+                    // Look every interval for as long as the dial runs: a
+                    // connection that comes up during it is judged at a
+                    // later look, not exempt for the whole dial.
+                    loop {
                         #[cfg(test)]
-                        if let Some(only) = *test_dial.selected_only.lock().unwrap() {
-                            return Some(conn.stable_id()) == only;
+                        match &stuck_gate {
+                            Some(gate) => gate.acquire().await.unwrap().forget(),
+                            None => tokio::time::sleep(stuck_after).await,
                         }
-                        has_selected_path(conn)
-                    });
+                        #[cfg(not(test))]
+                        tokio::time::sleep(stuck_after).await;
+                        pool.unstick(id, &mut seen, |conn| {
+                            #[cfg(test)]
+                            if let Some(only) = *test_dial.selected_only.lock().unwrap() {
+                                return Some(conn.stable_id()) == only;
+                            }
+                            has_selected_path(conn)
+                        });
+                        #[cfg(test)]
+                        test_dial
+                            .stuck_looks
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
             }));
             let dial = async {
@@ -2809,6 +2868,32 @@ impl P2p {
         self.pool.reset_using(&HashSet::new(), "test reset").await
     }
 
+    /// Make the stuck timer of dials look only when [`Self::stuck_look`]
+    /// says so, with `selected_only` as in [`Self::stick_dials_after`].
+    /// For tests that must not race the clock.
+    #[cfg(test)]
+    pub(crate) fn stick_dials_by_hand(&self, selected_only: Option<usize>) {
+        *self.test_dial.stuck_gate.lock().unwrap() = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+        *self.test_dial.selected_only.lock().unwrap() = Some(selected_only);
+    }
+
+    /// Let the stuck timer of a dial look once (see
+    /// [`Self::stick_dials_by_hand`]).
+    #[cfg(test)]
+    pub(crate) fn stuck_look(&self) {
+        if let Some(gate) = &*self.test_dial.stuck_gate.lock().unwrap() {
+            gate.add_permits(1);
+        }
+    }
+
+    /// How many looks the stuck timers have finished.
+    #[cfg(test)]
+    pub(crate) fn stuck_looks(&self) -> usize {
+        self.test_dial
+            .stuck_looks
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Make a dial that runs for `after` check for the stall, with
     /// `selected_only` (a stable id; `None`: none) standing for the
     /// connection that holds iroh's selected path. For tests.
@@ -2821,8 +2906,8 @@ impl P2p {
     /// [`Pool::unstick`] with iroh's real selected-path check, for tests.
     #[cfg(test)]
     pub(crate) fn unstick_for_test(&self, id: iroh::EndpointId) -> usize {
-        let before = self.pool.live_ids(id);
-        self.pool.unstick(id, &before, has_selected_path)
+        let mut seen = self.pool.stuck_seen(id);
+        self.pool.unstick(id, &mut seen, has_selected_path)
     }
 
     /// A connection to `addr` dialed outside the pool (the handshake hook
