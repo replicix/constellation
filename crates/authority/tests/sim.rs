@@ -6833,6 +6833,11 @@ fn sweep_config() {
                 }
                 Ok(report) => {
                     eprintln!("SWEEP-L3 {label} seed {seed}: {}", recall_stall(&report));
+                    eprintln!(
+                        "SWEEP-RG {label} seed {seed}: {} {}",
+                        report.stats.values().map(|s| s.read_grants).sum::<u64>(),
+                        report.stats.values().map(|s| s.deleg_read_grants).sum::<u64>()
+                    );
                     let ord = std::sync::atomic::Ordering::Relaxed;
                     oracle_totals.lock().unwrap().add(&label, seed, &report);
                     for s in report.stats.values() {

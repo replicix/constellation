@@ -224,6 +224,10 @@ pub enum RecordRead {
     Missing,
     /// Listed but not parseable (a corrupt or future-format record).
     Unparseable(String),
+    /// Listed and parsed, but its body names another node than its key: not
+    /// that node's record, so no roster or directory entry. A scan that has
+    /// one is not complete (the id its key names has no record read).
+    Mismatch,
 }
 
 /// One LIST of `nodes/` and every node record under it — the membership
@@ -270,6 +274,8 @@ impl RegistryScan {
                          write-eligible roster from an incomplete registry"
                     )))
                 }
+                // Not a node's record (see `registry_scan`): no entry.
+                RecordRead::Mismatch => {}
             }
         }
         out.sort_unstable();
@@ -383,6 +389,7 @@ pub async fn registry_scan(store: &dyn ObjectStore) -> Result<RegistryScan, Stor
                     claimed = info.node_id,
                     "ignoring a registry record whose node id does not match its key"
                 );
+                records.push((key, RecordRead::Mismatch));
                 continue;
             }
             Ok(Some((info, meta))) => {
@@ -576,6 +583,9 @@ mod tests {
             vec![id]
         );
         assert_eq!(list_nodes(store.clone()).await.unwrap().len(), 1);
+        // The scan skipped a listed record: it is not complete, so a
+        // directory built from it vouches for no audience.
+        assert!(!registry_scan(store.as_ref()).await.unwrap().is_complete());
     }
 
     #[tokio::test]

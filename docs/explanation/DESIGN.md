@@ -1283,7 +1283,9 @@ without TTL expiry, never recalled by placement or by a cross-subtree op.
   read delegations the holder granted (no read is served under an ended
   stream's grant; plan 46 Q5, C11; the root refuses the stream's renewals
   while it waits, and a returned holder grants no read before a renewal is
-  granted, so the wait's deadline holds). The rows only the designee held, past the
+  granted, so the wait's deadline holds; the holder grants only to readers
+  the void reaches, the roster and the directory's links, and a reader the
+  core has not heard of yet reads through with no grant). The rows only the designee held, past the
   cursor, are lost to the log, and replay by rid, refused ones becoming
   conflict copies, if the designee returns.
 - `offline --ro` grants a read guarantee (a pin) without write authority

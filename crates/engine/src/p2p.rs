@@ -1590,11 +1590,17 @@ pub async fn refresh_peers(
                     })
                 })
                 .collect();
+            // A scan that read every record sets the flag after the refresh,
+            // one that did not clears it before, so a reader that sees the
+            // flag around a snapshot sees a complete scan's directory
+            // (`Peers::registry_complete`).
+            let complete = scan.as_ref().is_some_and(|scan| scan.is_complete());
+            if !complete {
+                peers.set_registry_complete(false);
+            }
             peers.refresh_registry(records);
-            // After the refresh, so a reader that sees the flag sees the
-            // directory (`Peers::registry_complete`).
-            if scan.as_ref().is_some_and(|scan| scan.is_complete()) {
-                peers.mark_registry_complete();
+            if complete {
+                peers.set_registry_complete(true);
             }
         }
         Err(()) => {

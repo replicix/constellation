@@ -90,6 +90,9 @@ impl Harness {
             },
             &meta,
         );
+        // An established node: it has read the roster (the audience of a
+        // void is known; tests of the unknown audience clear this).
+        core.roster_seen = true;
         Self {
             core,
             meta,
@@ -64571,6 +64574,8 @@ mod step4_sticky {
         let mut h = Harness::new(3);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
+        h.core.roster = vec![1, 2, 3];
+        h.core.roster_seen = true;
         h.core.lease.cached_holder = Some(1);
         let mut records = Vec::new();
         let mut dirs = Vec::new();
@@ -64739,6 +64744,10 @@ mod step4_sticky {
             lapses: 0,
             issued: WaitMs(i64::MAX),
         });
+        // This cluster is nodes 1 to 3: the harness's first directory
+        // (2 to 4) is not part of it.
+        h.core.audience.clear();
+        h.core.note_audience();
         let (ok, out) = control_delegate(&mut h, 900, d1, 3, true);
         assert!(ok, "{out:?}");
         let gen = sticky_gen_of(&h, d1);
@@ -65227,6 +65236,54 @@ mod step4_sticky {
         Replica::void_stream(&h.meta, 7, 0);
         Replica::note_void_cut(&h.meta, 7, 0);
         assert!(ask(&mut h).is_none(), "served under an ended stream");
+    }
+
+    /// A delegate grants a read delegation only to a reader in the roster or
+    /// the links: the abandon's void goes to those, so a grant to any other
+    /// node (net admission lets one in before the core hears of it) could
+    /// outlive the stream's end. The unknown reader gets the position
+    /// without a grant, and a grant once the directory shows it. Fails
+    /// without the membership check: the unknown reader is granted.
+    #[test]
+    fn a_holder_grants_no_read_to_a_reader_the_void_would_not_reach() {
+        let (mut h, dirs) = holder_of(true, &[(SubtreeKind::Sticky, "a")]);
+        h.core.cfg.read_delegations = true;
+        h.advance(10);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.core.dl.mine.get_mut(&7).unwrap().answered_sent = h.clk().honour;
+        let ask = |h: &mut Harness, from| match h.deleg_read_index(
+            h.clk(),
+            from,
+            dirs[0],
+            Some("x"),
+        ) {
+            Some(crate::event::ReadIndexOutcome::Ok { grant, .. }) => grant,
+            other => panic!("{other:?}"),
+        };
+        assert!(ask(&mut h, 2).is_some(), "a roster node is granted");
+        assert!(ask(&mut h, 9).is_none(), "an unknown reader was granted");
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3, 9],
+            issued: WaitMs(i64::MAX),
+        });
+        assert!(ask(&mut h, 9).is_some(), "a known reader is not granted");
+        // The audience never shrinks: a later complete scan that lost 9
+        // (its record unreadable) leaves it asked by a void, so it is still
+        // granted; the grant and the void use the one audience.
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3],
+            issued: WaitMs(i64::MAX),
+        });
+        h.step(Event::Peers {
+            registry_complete: true,
+            links: Vec::new(),
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+        assert!(h.core.void_audience().unwrap().contains(&9));
+        assert!(ask(&mut h, 9).is_some(), "the audience shrank");
+        assert!(ask(&mut h, 11).is_none(), "an unknown reader was granted");
     }
 
     /// A restarted non-stealable holder is honoured from its install, so it
@@ -67249,6 +67306,9 @@ mod step5_sticky_release {
         let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
         let (mut r, dirs, out) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
         renew_holder(&mut r, &out);
+        // The roster is read (no void round is the subject here): a reader
+        // the directory names is granted but for the quarantine.
+        r.core.roster_seen = true;
         let now = r.clk();
         let outcome = r.deleg_read_index(now, 2, dirs[0], None);
         assert!(
@@ -67531,6 +67591,8 @@ mod step5_sticky_release {
         renew_holder(&mut r, &out);
         assert!(r.core.dl.mine[&7].restart_q.is_none(), "quarantined");
         assert_eq!(r.core.stats.deleg_restart_quarantines, 0);
+        // A restarted node grants to the readers it knows: the roster is read.
+        r.step(roster_event());
         create_in(&mut r, dirs[0], 1);
         assert_eq!(r.core.dl.mine[&7].executed, 1);
         let now = r.clk();
@@ -67739,6 +67801,49 @@ mod step5_sticky_release {
         });
         assert_eq!(r.core.stats.deleg_restart_q_voided, 1);
         assert_eq!(r.core.dl.mine[&7].executed, 1);
+    }
+
+    /// Expectation (fail-before: the audience was the latest directory, so
+    /// a later scan that lost read-only member 9 left it out): the audience
+    /// is every node seen since the first complete snapshot. Member 9 is in
+    /// the first complete directory, drops out of a later one (its record
+    /// was unreadable), and the roster arrives only then: the round still
+    /// asks 9, and 9's answer is awaited.
+    #[test]
+    fn a_member_that_drops_out_of_a_later_scan_is_still_asked() {
+        let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
+        let (mut r, _) = restart_bare(&h, 2_000, true);
+        r.core.peers_complete = false;
+        let (dirs, out) = install_holder(&mut r, &["d"], SubtreeKind::Sticky);
+        assert!(restart_void_reqs(&out).is_empty(), "{out:?}");
+        create_in(&mut r, dirs[0], 1);
+        for links in [vec![link(2), link(4), link(9)], vec![link(2), link(4)]] {
+            let out = r.step(Event::Peers {
+                registry_complete: true,
+                links,
+                lapses: 0,
+                issued: WaitMs(i64::MAX),
+            });
+            assert!(restart_void_reqs(&out).is_empty(), "no roster yet: {out:?}");
+        }
+        let out = r.step(roster_event());
+        let asked = restart_void_reqs(&out);
+        assert_eq!(
+            asked
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([1, 2, 4, 9]),
+            "{out:?}"
+        );
+        for (from, req) in asked.iter().filter(|(n, _)| *n != 9) {
+            r.step(Event::Peer {
+                from: *from,
+                msg: PeerMsg::DelegationRecalled { req: *req },
+            });
+        }
+        assert_eq!(r.core.stats.deleg_restart_q_voided, 0, "9 had not answered");
+        assert_eq!(r.core.dl.mine[&7].executed, 0);
     }
 
     /// Expectation (the reader's side of the void): a `Restart` void drops
@@ -69334,10 +69439,11 @@ mod grant_horizon_bench {
         );
         let amax = *arrival_us.last().unwrap();
         eprintln!(
-            "BENCH mode={mode} load={load} dir={} reads={n} grants={grants} uncovered={uncovered} \
+            "BENCH mode={mode} load={load} dir={} reads={n} grants={grants} uncovered={uncovered} uncovered_pct={:.3} \
              core_call_us p50/p99/p99.9/max={c50}/{c99}/{c999}/{cmax} calls_over_1ms={over1} stall_ms={stall_ms} \
              read_latency_us p50/p99/p99.9/max={a50}/{a99}/{a999}/{amax}",
-            dir.display()
+            dir.display(),
+            100.0 * uncovered as f64 / n as f64
         );
         drop(meta);
         let _ = std::fs::remove_dir_all(&path);
