@@ -4730,6 +4730,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             delegation_ttl_ms: core.delegation_ttl_ms,
             expiry_margin_ms: core.expiry_margin_ms,
             backup_takeover_ms: core.backup_takeover_ms,
+            recall_backoff_max_ms: constellation_authority::deadlines::Deadlines::new(&core)
+                .recall_backoff_max,
         });
     }
     bus.set_stream_faults(cfg.stream_faults.clone());

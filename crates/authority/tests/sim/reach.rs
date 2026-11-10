@@ -51,7 +51,8 @@
 //! product's lack of progress, never the requester's isolation. Keys across
 //! generations whose grants live are recalled, not outwaited, while the root
 //! reaches their delegates: the allowance is then one recall round trip plus
-//! the recall's resend back-off (2 s) from the stretch in which it does.
+//! the recall's resend back-off (`Deadlines::recall_backoff_max`, 2 s unless
+//! the forward timeout is longer) from the stretch in which it does.
 //!
 //! A sequencer counts only if it can commit: a root with S3 cut and no
 //! backup reachable cannot commit a refusal.
@@ -368,6 +369,8 @@ struct Inner {
     /// tail (P2P there and back) and records the generation's end (an S3 put:
     /// the slowest request there and back).
     recall_ms: u64,
+    /// The longest the root's recall resend waits.
+    recall_backoff_max_ms: u64,
 }
 
 /// The constants of the sim's configuration the classifier derives its
@@ -398,6 +401,10 @@ pub struct ReachConfig {
     /// `Config::backup_takeover_ms`: a root's slack on the windows of the
     /// generations it inherits after a fast takeover.
     pub backup_takeover_ms: u64,
+    /// The longest the root's recall resend waits: the product's cap of
+    /// its back-off, lifted to the request timeout
+    /// (`Deadlines::recall_backoff_max`).
+    pub recall_backoff_max_ms: u64,
 }
 
 /// The run's reachability history (see the module doc).
@@ -446,6 +453,7 @@ impl Reach {
         g.horizon_ms = c.delegation_ttl_ms + c.expiry_margin_ms;
         g.inherit_slack_ms = c.backup_takeover_ms;
         g.recall_ms = 2 * c.p2p_delay_hi_ms + 2 * c.s3_latency_hi_ms;
+        g.recall_backoff_max_ms = c.recall_backoff_max_ms;
     }
 
     /// The bucket served `node` a lease GET at `served_ms`; the answer reached
@@ -842,10 +850,6 @@ fn gen_end_due(g: &Inner, q: &Question, node: NodeId, gen: u64, at: u64, since: 
     inherited.max((born + g.horizon_ms).max(by_grant)) + g.recall_ms
 }
 
-/// The longest the root's recall resend waits (`on_release_resend`,
-/// delegate.rs: the delay doubles from a request's timeout up to 2 s).
-const RECALL_RESEND_CAP_MS: u64 = 2_000;
-
 /// When the root is due to have recalled keys across generations: it ends
 /// every involved generation, so the last of their allowances. Each is
 /// anchored on its own grant's end, birth or tenure, never on the window or
@@ -853,7 +857,8 @@ const RECALL_RESEND_CAP_MS: u64 = 2_000;
 ///
 /// A generation whose grant lives and whose delegate the root reaches is not
 /// outwaited: the root recalls it, and the delegate answers within a round
-/// trip (L3 resends an unanswered recall, the delay doubling up to 2 s). So
+/// trip (L3 resends an unanswered recall, the delay doubling up to
+/// `recall_backoff_max_ms`). So
 /// its allowance is at most one recall round trip plus that back-off past
 /// the start of the stretch (from `since` on) in which a root was in force,
 /// could commit, was reached by the requester and reached every such
@@ -888,7 +893,7 @@ fn blocked_due(g: &Inner, q: &Question, gens: &[(NodeId, u64)], at: u64, since: 
                     && live.iter().all(|(node, _)| peer_up(g, t, r, *node))
             };
             let anchor = stable_since(g, since, at, recalls)?;
-            let recalled = anchor + g.recall_ms + RECALL_RESEND_CAP_MS;
+            let recalled = anchor + g.recall_ms + g.recall_backoff_max_ms;
             gens.iter()
                 .map(|(node, gen)| {
                     let due = outwait(*node, *gen);
@@ -1875,6 +1880,7 @@ mod tests {
             delegation_ttl_ms: 500,
             expiry_margin_ms: 100,
             backup_takeover_ms: 0,
+            recall_backoff_max_ms: 2_000,
         }
     }
 
@@ -3397,6 +3403,44 @@ mod tests {
         r.partition_at(3_100, 3, 1, true);
         let v = r.classify(blocked());
         assert!(v.isolated(), "{v:?}");
+    }
+
+    /// The classifier's resend back-off is the product's, not a copy of its
+    /// 2 s: with a 3 s forward timeout the request timeout is 3 s and the
+    /// product never resends sooner, so the recall is due 3 s (not 2 s) past
+    /// its round trip. A cap shorter than the product's makes an unsettled
+    /// `EIO` that the product legitimately answers a violation.
+    #[test]
+    fn the_recall_due_waits_the_products_backoff_cap_not_a_copy_of_it() {
+        let mut slow_forward = sim_core_like();
+        slow_forward.forward_timeout_ms = 3_000;
+        let cap =
+            constellation_authority::deadlines::Deadlines::new(&slow_forward).recall_backoff_max;
+        assert_eq!(cap, 3_000);
+        let r = Reach::default();
+        r.configure(ReachConfig {
+            recall_backoff_max_ms: cap,
+            ..cfg(0, 0)
+        });
+        for n in 1..=4 {
+            r.attached_at(0, n, true);
+        }
+        r.lease_landed_at(0, 1, 1_000, false);
+        r.note_view_at(0, 1, Held::Lease, vec![], vec![], 0);
+        r.lease_landed_at(3_500, 1, 9_000, false);
+        r.note_view_at(1_000, 2, Held::No, vec![(7, 9_000)], vec![], 0);
+        r.note_view_at(1_000, 4, Held::No, vec![(8, 9_000)], vec![], 0);
+        // As above with the cap lifted: the recall is due at 4 000 + 100 +
+        // 3 000 = 7 100, past the window's end (7 000): no sequencer in time,
+        // allowed. With the copied 2 s cap it was due at 6 100 and the
+        // product's legitimate unsettled `EIO` a violation.
+        let v = r.classify(blocked());
+        assert!(v.no_sequencer_in_time(), "{v:?}");
+    }
+
+    /// `sim_core_config`'s forward-side knobs, for a bound that reads them.
+    fn sim_core_like() -> constellation_authority::Config {
+        constellation_authority::Config::defaults(1, 1)
     }
 
     /// Plan 46 M0.4 review, SHOULD-3: a holder restarted inside its lease
