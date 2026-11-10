@@ -890,7 +890,7 @@ pub(crate) fn member_rules_tx(
     let mut tail_ids: BTreeSet<(u64, u64)> = BTreeSet::new();
     let mut through_of: std::collections::BTreeMap<u64, u64> = Default::default();
     let mut follows: BTreeSet<u64> = BTreeSet::new();
-    let mut abandoned: BTreeSet<u64> = BTreeSet::new();
+    let mut abandoned: std::collections::BTreeMap<u64, u64> = Default::default();
     for rec in f.records {
         match rec {
             LogRecord::TailOf { epoch, jseq } => {
@@ -906,8 +906,12 @@ pub(crate) fn member_rules_tx(
             LogRecord::TailFollows { prev_epoch } => {
                 follows.insert(*prev_epoch);
             }
-            LogRecord::GroupAbandoned { epoch, gen: 0, .. } => {
-                abandoned.insert(*epoch);
+            LogRecord::GroupAbandoned {
+                epoch,
+                gen: 0,
+                through_known,
+            } => {
+                abandoned.insert(*epoch, *through_known);
             }
             _ => {}
         }
@@ -938,7 +942,14 @@ pub(crate) fn member_rules_tx(
                 left += 1;
                 continue;
             }
-            if abandoned.contains(&e) {
+            if let Some(known) = abandoned.get(&e) {
+                // ADR-51 (M5): a copy at or below what the claim carried is
+                // in the tail the segments that follow name: it stays and
+                // retires on carry; only a copy past it replays by rid.
+                if ident.0 == e && ident.1 <= *known {
+                    left += 1;
+                    continue;
+                }
                 if !row.class.is_singleton() && super::spec::queue_abandoned_tx(tx, meta, e, &row)?
                 {
                     out.abandoned += 1;

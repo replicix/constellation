@@ -225,6 +225,10 @@ pub enum SpecKind {
         /// tip). Not stranded by a takeover of its epoch; retires when a
         /// segment carries the row (or, re-shipped, its `TailOf`).
         gated: bool,
+        /// The transaction's delegation origin `(gen, idx)` (`(0, 0)`: the
+        /// source's own), kept so that a claimant fetching this copy re-ships
+        /// it under it (ADR-51, [`Meta::kept_streamed`]).
+        origin: (u64, u64),
         /// Plan 30 §M9: this node's own op. A requester subscribed to the
         /// holder's stream sees its op twice — on the stream and in its
         /// reply — and keeps *one* entry, this kind, whichever arrived
@@ -417,14 +421,32 @@ impl LiveEntry {
     }
 
     /// Plan 43 C1-4: the operator abandoned the group of root epoch `e`
-    /// (`LogRecord::GroupAbandoned`): no successor re-ships its rows, so
-    /// even a committed entry of epoch `e` or older strands, and its rid
-    /// replays (the only way a committed entry is rolled back).
-    fn stranded_by_abandon(&self, e: u64) -> bool {
+    /// (`LogRecord::GroupAbandoned`): no successor re-ships what it did not
+    /// carry, so a committed entry of an older epoch, or of epoch `e` past
+    /// `through_known`, strands, and its rid replays (the only way a
+    /// committed entry is rolled back).
+    ///
+    /// ADR-51 (M5): the one predicate every strand site uses. A streamed
+    /// copy at or below `through_known` is in the carried tail (the claim
+    /// re-journaled it, its `TailOf` may ride a later segment): it retires
+    /// on carry and never strands, nor does one the tail names.
+    fn stranded_by_abandon(
+        &self,
+        e: u64,
+        through_known: u64,
+        tail_idents: &HashSet<(u64, u64)>,
+    ) -> bool {
         match self {
-            LiveEntry::Shadow { gen: 0, epoch, .. }
-            | LiveEntry::Hint { gen: 0, epoch, .. }
-            | LiveEntry::Streamed { epoch, .. } => *epoch <= e,
+            LiveEntry::Shadow { gen: 0, epoch, .. } | LiveEntry::Hint { gen: 0, epoch, .. } => {
+                *epoch <= e
+            }
+            LiveEntry::Streamed { epoch, ident, .. } => {
+                if tail_idents.contains(ident) {
+                    return false;
+                }
+                let first = if ident.0 == *epoch { ident.1 } else { u64::MAX };
+                *epoch < e || (*epoch == e && first > through_known)
+            }
             _ => false,
         }
     }
@@ -819,19 +841,28 @@ impl Stranded {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OrphanProof {
     pub upto: Option<u64>,
+    /// ADR-51: the `through_known` of the abandon record that named `upto`
+    /// (the highest journal seq of the group the claimant carried): a copy
+    /// at or below it is in the carried tail and retires on carry.
+    pub upto_through: u64,
     pub no_tail: Option<u64>,
 }
 
 impl OrphanProof {
     /// What the marker records `records` prove.
     pub fn of(records: &[LogRecord]) -> Self {
-        let upto = records
+        let (upto, upto_through) = records
             .iter()
             .filter_map(|rec| match rec {
-                LogRecord::GroupAbandoned { epoch, gen: 0, .. } => Some(*epoch),
+                LogRecord::GroupAbandoned {
+                    epoch,
+                    gen: 0,
+                    through_known,
+                } => Some((*epoch, *through_known)),
                 _ => None,
             })
-            .max();
+            .max()
+            .map_or((None, 0), |(e, t)| (Some(e), t));
         let tail = records.iter().any(|rec| {
             matches!(
                 rec,
@@ -849,7 +880,11 @@ impl OrphanProof {
                 _ => None,
             })
         };
-        OrphanProof { upto, no_tail }
+        OrphanProof {
+            upto,
+            upto_through,
+            no_tail,
+        }
     }
 
     /// Whether it proves nothing.
@@ -2328,6 +2363,7 @@ struct StreamedTx<'a> {
     adopt: Option<(u64, Rid, MutateOp, LockTag)>,
     /// Plan 43 C1-4: see [`SpecKind::Streamed::gated`].
     gated: bool,
+    origin: (u64, u64),
 }
 
 /// Whether a row stays ahead of a transaction the stream delivers now: a
@@ -2820,6 +2856,7 @@ fn insert_streamed_tx(
                 last: t.last,
                 source: t.source,
                 gated: t.gated || matches!(row.kind, SpecKind::Shadow { gated: true, .. }),
+                origin: t.origin,
                 own: Some((rid, op, tag)),
             };
             // The transaction's records are what the redo applies: the
@@ -2878,6 +2915,7 @@ fn insert_streamed_tx(
                     last: t.last,
                     source: t.source,
                     gated: t.gated,
+                    origin: t.origin,
                     own: None,
                 },
                 applied,
@@ -4570,6 +4608,58 @@ impl Meta {
         Ok(promoted)
     }
 
+    /// ADR-51: the committed (`gated`) streamed transactions of `epoch` that
+    /// node `source` streamed and this replica still holds ahead of the log,
+    /// in journal order: the rows an epoch member kept after its hold owner's
+    /// retirement, and what a claimant of the fence re-ships. Each is a
+    /// [`crate::BackupTx`] with the records as stored (a re-shipped one begins with
+    /// its `TailOf`) and the delegation origin it arrived with. Speculative
+    /// copies and other sources' are not listed.
+    pub fn kept_streamed(
+        &self,
+        epoch: u64,
+        source: u64,
+    ) -> Result<Vec<crate::BackupTx>, MetaError> {
+        let r = self.db.read_tx();
+        let mut out = Vec::new();
+        for (seq, entry) in read_live(&r, self)? {
+            let LiveEntry::Streamed {
+                epoch: e,
+                gated: true,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            if e != epoch {
+                continue;
+            }
+            let Some(v) = r.get(&self.spec, seq_key(seq))? else {
+                continue;
+            };
+            let row: SpecRow = crate::record::from_bytes_exact(&v)?;
+            if let SpecKind::Streamed {
+                first,
+                last,
+                source: src,
+                origin,
+                ..
+            } = row.kind
+            {
+                if src == source {
+                    out.push(crate::BackupTx {
+                        first,
+                        last,
+                        records: row.records,
+                        origin,
+                    });
+                }
+            }
+        }
+        out.sort_by_key(|t| t.first);
+        Ok(out)
+    }
+
     /// Plan 30 §M9: install one of the holder's backup-acked journal
     /// transactions (rows `first..=last` of its tenure at `epoch`, streamed
     /// by node `source`) ahead of the log, as a `Streamed` entry (see
@@ -4734,6 +4824,7 @@ impl Meta {
                     records,
                     adopt,
                     gated: committed,
+                    origin,
                 },
             )?;
             let (bytes, files) = staged.raw_delta();
@@ -4753,6 +4844,7 @@ impl Meta {
                     last,
                     source,
                     gated,
+                    origin,
                     own: Some((rid, op, tag)),
                 };
                 put_row(&mut tx, &self.spec, seq, &row)?;
@@ -4783,6 +4875,7 @@ impl Meta {
                 last,
                 source,
                 gated: committed,
+                origin,
                 own: None,
             },
             records,
@@ -4976,10 +5069,14 @@ impl Meta {
                 _ => None,
             })
             .collect();
-        let abandoned: Vec<u64> = records
+        let abandoned: Vec<(u64, u64)> = records
             .iter()
             .filter_map(|rec| match rec {
-                LogRecord::GroupAbandoned { epoch, gen: 0, .. } => Some(*epoch),
+                LogRecord::GroupAbandoned {
+                    epoch,
+                    gen: 0,
+                    through_known,
+                } => Some((*epoch, *through_known)),
                 _ => None,
             })
             .collect();
@@ -5030,7 +5127,9 @@ impl Meta {
         let strands = |entry: &LiveEntry| {
             (entry.stranded_by(epoch)
                 && !matches!(entry, LiveEntry::Shadow { rid, .. } if completes.contains(rid)))
-                || abandoned.iter().any(|a| entry.stranded_by_abandon(*a))
+                || abandoned
+                    .iter()
+                    .any(|(a, known)| entry.stranded_by_abandon(*a, *known, &tail_ids))
                 || matches!(entry, LiveEntry::Shadow { rid, .. } if refused.contains(rid))
                 || matches!(entry, LiveEntry::Streamed { ident, .. } if rolled.contains(ident))
                 || matches!(entry, LiveEntry::Local { first, .. } if superseded_appends.contains(first))
@@ -5809,6 +5908,7 @@ impl Meta {
     ) -> Result<Stranded, MetaError> {
         let proof = OrphanProof {
             upto: abandoned,
+            upto_through: 0,
             no_tail: None,
         };
         self.strand_for_takeover_carrying(epoch, own_gens, abandoned, &HashSet::new(), &proof)
@@ -6151,7 +6251,9 @@ impl Meta {
         // predecessor's tail, which carries the row, so the entry would
         // apply it twice. Not queued — unless the operator abandoned the
         // group, whose rows no one re-ships.
-        let abandons = |entry: &LiveEntry| abandoned.is_some_and(|a| entry.stranded_by_abandon(a));
+        let abandons = |entry: &LiveEntry| {
+            abandoned.is_some_and(|a| entry.stranded_by_abandon(a, proof.upto_through, tail_idents))
+        };
         let stranded = strand_tx(
             tx,
             self,

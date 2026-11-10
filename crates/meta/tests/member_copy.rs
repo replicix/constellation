@@ -855,7 +855,7 @@ fn an_abandoned_rid_less_row_is_queued_under_one_rid_on_every_member() {
         let marker = vec![LogRecord::GroupAbandoned {
             epoch,
             gen: 0,
-            through_known: 3,
+            through_known: 0,
         }];
         let applied = meta
             .apply_segment_rows(1, epoch + 1, 0, &[], &[], &marker, &TouchSet::default())
@@ -909,7 +909,7 @@ fn group_abandoned_moves_the_member_copy_to_the_replay_queue() {
     let marker = vec![LogRecord::GroupAbandoned {
         epoch: 1,
         gen: 0,
-        through_known: 4,
+        through_known: 0,
     }];
     let applied = meta
         .apply_segment_rows(1, 2, 0, &[], &[], &marker, &TouchSet::default())

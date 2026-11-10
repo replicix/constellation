@@ -635,8 +635,8 @@ struct EpochRowEnc {
     state: String,
     /// ADR-51: the lease tenure `(holder, lease epoch)` the epoch's
     /// activation resolved as its carrier. `None`: not recorded (not
-    /// activated yet, or it resolved no carrier), which counts as possibly
-    /// carrying any tenure ([`Meta::epochs_possibly_carrying`]).
+    /// activated yet, or it resolved no carrier): it carried no tenure, and
+    /// is no evidence for one ([`Meta::epochs_possibly_carrying`]).
     carrier: Option<(u64, u64)>,
 }
 
@@ -687,8 +687,9 @@ impl Meta {
     /// ADR-51 (membership evidence): the member sets of the persisted epoch
     /// rows that may have carried the lease tenure `(holder, lease_epoch)`:
     /// rows whose members contain `holder` and whose recorded carrier is
-    /// that tenure or is not recorded. Rows are never pruned, so a node
-    /// that joined an epoch before it formed reports it whatever it holds.
+    /// that tenure exactly (a row with no carrier carried nothing and
+    /// blocks nothing). Rows are never pruned, so a node that joined an
+    /// epoch before it formed reports it whatever it holds.
     pub fn epochs_possibly_carrying(
         &self,
         holder: u64,
@@ -699,9 +700,7 @@ impl Meta {
         for guard in r.iter(&self.epochs) {
             let (_, v) = guard.into_inner()?;
             let row: EpochRowEnc = postcard::from_bytes(&v)?;
-            if row.members.contains(&holder)
-                && row.carrier.is_none_or(|c| c == (holder, lease_epoch))
-            {
+            if row.members.contains(&holder) && row.carrier == Some((holder, lease_epoch)) {
                 let mut members = row.members;
                 members.sort_unstable();
                 out.push(members);
