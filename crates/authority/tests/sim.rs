@@ -18923,8 +18923,8 @@ fn the_read_oracle_catches_an_abandon_that_skips_the_read_recall() {
         abandon_skips_read_recall: true,
         ..sticky_holder_dies_config()
     };
-    // 39 of the first 100 seeds fail (pinned: 0, 4, 7).
-    for seed in [0u64, 4, 7] {
+    // 37 of the first 100 seeds fail (pinned: 0, 4, 8).
+    for seed in [0u64, 4, 8] {
         let e = run_seed(seed, config.clone())
             .expect_err("the abandon skipped the read recall and no oracle noticed");
         assert!(
@@ -19018,7 +19018,8 @@ fn the_cto_oracle_catches_a_restart_that_skips_the_write_quarantine() {
         restart_skips_write_quarantine: true,
         ..sticky_holder_restarts_config()
     };
-    for seed in [156u64, 159, 728] {
+    // 15 of the first 2,000 seeds fail (pinned: 156, 159, 659).
+    for seed in [156u64, 159, 659] {
         let e = run_seed(seed, config.clone())
             .expect_err("the holder skipped the quarantine and no oracle noticed");
         assert!(
