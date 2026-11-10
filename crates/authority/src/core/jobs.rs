@@ -1222,6 +1222,31 @@ impl Core {
         Ok(())
     }
 
+    /// The `TailFollowsThrough` epochs the gate's marker names, ascending,
+    /// each with the contiguous hold its tail reaches. A kept fetch's union
+    /// names every epoch from its first to the one below the claim's (zero
+    /// where the union has nothing: the fetch is complete, so a copy that is
+    /// not in it does not exist).
+    fn marker_tails(bk: &super::backup::BackupState, gate: &PendingGate) -> Vec<(Epoch, u64)> {
+        let mut v = bk.gate_tails.clone();
+        if v.is_empty() {
+            if let Some(e) = gate.backup_tail_epoch {
+                v.push((e, bk.tail_through));
+            }
+        }
+        if bk.gate_tails_kept {
+            if let Some(lo) = v.first().map(|t| t.0) {
+                for e in lo..gate.epoch {
+                    if !v.iter().any(|t| t.0 == e) {
+                        v.push((e, 0));
+                    }
+                }
+                v.sort_unstable();
+            }
+        }
+        v
+    }
+
     pub(super) fn issue_marker(
         &mut self,
         now: Now,
@@ -1237,8 +1262,10 @@ impl Core {
         let through = replica.journal_acked_seq().unwrap_or(0);
         let records = marker_records(
             &gate,
-            self.bk.gate_abandoned,
-            self.bk.tail_through,
+            self.bk
+                .gate_abandoned
+                .map(|e| (e, self.bk.gate_abandoned_through)),
+            &Self::marker_tails(&self.bk, &gate),
             self.bk.gate_names_tail,
         );
         // ADR-43 (orphan grants): the claim's proof is on disk before its
@@ -1577,19 +1604,30 @@ impl Core {
         // store transaction (`Meta::reship_at_takeover`), which also clears
         // the tail: what the gate needs of it afterwards (the delegate rows
         // it carries, its contiguous prefix) is read now.
-        let tail_rows: Option<Vec<constellation_meta::BackupTx>> = match gate.backup_tail_epoch {
-            Some(e) => match replica.backup_tail(e) {
-                Some(rows) => Some(rows),
-                None => {
-                    return GateStep::Failed(format!(
-                        "the backup tail of epoch {e} could not be read"
-                    ))
-                }
-            },
-            None => None,
+        let tails: Vec<constellation_meta::TailArgs> = if gate.backup_tail_epoch.is_some() {
+            self.gate_tail_args(&gate)
+        } else {
+            Vec::new()
         };
-        let tail_through = self.bk.tail_through;
-        let tail_args = gate.backup_tail_epoch.map(|e| self.tail_args(e));
+        // (Each epoch's rows up to the contiguous hold its tail reaches.)
+        let tail_rows: Option<Vec<constellation_meta::BackupTx>> = if tails.is_empty() {
+            None
+        } else {
+            let mut rows = Vec::new();
+            for t in &tails {
+                match replica.backup_tail(t.epoch) {
+                    Some(r) => rows.extend(r.into_iter().filter(|x| x.last <= t.through)),
+                    None => {
+                        return GateStep::Failed(format!(
+                            "the backup tail of epoch {} could not be read",
+                            t.epoch
+                        ))
+                    }
+                }
+            }
+            Some(rows)
+        };
+        let tail_through = u64::MAX;
         let mut reshipped = false;
         if gate.takeover {
             // With a predecessor's backup tail to re-apply, this node's
@@ -1641,7 +1679,7 @@ impl Core {
                 .as_deref()
                 .unwrap_or_default()
                 .iter()
-                .filter(|t| t.origin.0 != 0 && t.last <= self.bk.tail_through)
+                .filter(|t| t.origin.0 != 0 && t.last <= tail_through)
                 .flat_map(|t| t.records.iter())
                 .filter_map(|r| match r {
                     constellation_meta::LogRecord::Completed { rid }
@@ -1659,15 +1697,17 @@ impl Core {
                 _ => {
                     let proof = constellation_meta::OrphanProof::of(&marker_records(
                         &gate,
-                        self.bk.gate_abandoned,
-                        self.bk.tail_through,
+                        self.bk
+                            .gate_abandoned
+                            .map(|e| (e, self.bk.gate_abandoned_through)),
+                        &Self::marker_tails(&self.bk, &gate),
                         self.bk.gate_names_tail,
                     ));
                     self.bk.gate_orphan_proof = Some((gate.epoch, proof));
                     proof
                 }
             };
-            match replica.reship_at_takeover(
+            match replica.reship_epochs_at_takeover(
                 Some(constellation_meta::StrandArgs {
                     epoch: gate.epoch,
                     own_gens: &own_gens,
@@ -1675,13 +1715,13 @@ impl Core {
                     carried: &carried,
                     proof: &proof,
                 }),
-                tail_args,
+                &tails,
             ) {
                 Ok(report) => {
                     self.bk.tail_diverged_logged = None;
                     let stranded = report.stranded;
-                    if let Some(args) = tail_args {
-                        self.tail_reshipped(args, &report, replica);
+                    if let Some(args) = tails.first() {
+                        self.tail_reshipped(*args, &report, replica);
                         reshipped = true;
                     }
                     self.lock_note_replay_pins(now, replica);
@@ -1724,9 +1764,9 @@ impl Core {
         // of anything stranded, so the replay finds it completed. (Done by
         // the strand's transaction above for a takeover; alone for a gate
         // that is not one.)
-        if let (Some(args), false) = (tail_args, reshipped) {
-            match replica.reship_at_takeover(None, Some(args)) {
-                Ok(report) => self.tail_reshipped(args, &report, replica),
+        if let (Some(args), false) = (tails.first(), reshipped) {
+            match replica.reship_epochs_at_takeover(None, &tails) {
+                Ok(report) => self.tail_reshipped(*args, &report, replica),
                 Err(e) => return self.reship_failed(now, e),
             }
         }
@@ -2002,8 +2042,10 @@ impl Core {
         self.stats.epoch_markers += 1;
         let records = marker_records(
             gate,
-            self.bk.gate_abandoned,
-            self.bk.tail_through,
+            self.bk
+                .gate_abandoned
+                .map(|e| (e, self.bk.gate_abandoned_through)),
+            &Self::marker_tails(&self.bk, gate),
             self.bk.gate_names_tail,
         );
         let payload = segment::encode(self.cfg.node_id, epoch, through, &[], &[], &records)
@@ -3777,18 +3819,49 @@ impl Core {
                     return;
                 }
             }
-            self.set_phase(
-                Phase::Tail {
-                    then: TailThen::Takeover,
-                },
-                None,
-            );
             // Stash the plan for after the tail.
             self.pending_plan = Some(plan);
-            self.issue_tail(out);
+            self.pr.check_slack = None;
+            self.pr.check_passed_at = None;
+            self.claim_after_check(now, replica, out);
             return;
         }
         self.acquire_cas(now, plan, replica, out);
+    }
+
+    /// The promise check passed (or none was needed): a marker takeover
+    /// collects the kept rows of the tenure it ends, then reads the log to
+    /// head (ADR-51: the seal comes after the check, never before).
+    fn claim_after_check(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        if let Some(Plan::Claim {
+            prev, marker: true, ..
+        }) = &self.pending_plan
+        {
+            if self.kept_needed(prev) {
+                let prev = prev.clone();
+                self.begin_kept_fetch(now, prev, replica, out);
+                return;
+            }
+        }
+        self.set_phase(
+            Phase::Tail {
+                then: TailThen::Takeover,
+            },
+            None,
+        );
+        self.issue_tail(out);
+    }
+
+    /// ADR-51: the kept fetch completed: the claim reads the log to head,
+    /// and merges after it.
+    pub(super) fn kept_to_tail(&mut self, out: &mut Vec<Action>) {
+        self.set_phase(
+            Phase::Tail {
+                then: TailThen::Takeover,
+            },
+            None,
+        );
+        self.issue_tail(out);
     }
 
     /// Plan 43 C1-3: the sealed tail is in hand (or the group abandoned):
@@ -3848,13 +3921,7 @@ impl Core {
             self.finish_acquire(now, false, replica, out);
             return;
         }
-        self.set_phase(
-            Phase::Tail {
-                then: TailThen::Takeover,
-            },
-            None,
-        );
-        self.issue_tail(out);
+        self.claim_after_check(now, replica, out);
     }
 
     /// A continuation epoch opened while this acquisition's lease read
@@ -3943,6 +4010,7 @@ impl Core {
             self.finish_acquire(now, false, replica, out);
             return;
         }
+        self.lease.claim_floor = if *takeover { self.bk.kept_floor } else { 0 };
         let mut lease = self.lease.granted_lease(
             now,
             &self.cfg,
@@ -4049,7 +4117,7 @@ impl Core {
                     .map(|(_, proof)| proof)
                     .unwrap_or(constellation_meta::OrphanProof {
                         upto: self.bk.gate_abandoned,
-                        upto_through: 0,
+                        upto_through: self.bk.gate_abandoned_through,
                         no_tail: None,
                     });
                 (epoch, proof)
@@ -4280,7 +4348,7 @@ impl Core {
                         // inherited tail's).
                         takeover
                             && ((r.epoch == p.epoch && r.holder == p.holder)
-                                || self.bk.fetched.as_ref().is_some_and(|f| f.epoch == r.epoch))
+                                || self.bk.fetched.iter().any(|f| f.epoch == r.epoch))
                     } else {
                         // (A self-sealed holder's own claim: its member
                         // copy is the tail, at the epoch it sealed.)
@@ -4290,6 +4358,15 @@ impl Core {
                 })
             })
             .map(|r| r.epoch);
+        // ADR-51: the union a kept fetch brought, one tail per epoch with rows.
+        let kept_tails: Vec<(Epoch, u64)> = self
+            .bk
+            .fetched
+            .iter()
+            .filter(|f| f.kept_owner.is_some())
+            .map(|f| (f.epoch, replica.backup_acked(f.epoch).unwrap_or(0)))
+            .collect();
+        let backup_tail_epoch = kept_tails.first().map(|t| t.0).or(backup_tail_epoch);
         if takeover
             && backup_tail_epoch.is_none()
             && self.bk.abandoned_claim.is_none()
@@ -4307,7 +4384,7 @@ impl Core {
                 "claimed a lease whose group may hold acknowledged rows without a tail"
             );
         }
-        self.bk.fetched = None;
+        self.bk.fetched.clear();
         // Plan 43 C1-4: what this gate re-ships reaches `through` (the
         // sealed tail's contiguous hold: its marker says so), and the group
         // the operator gave up, if any, strands its committed entries too.
@@ -4315,7 +4392,17 @@ impl Core {
         // epoch in memory, the same quantity.)
         self.bk.tail_through =
             backup_tail_epoch.map_or(0, |e| replica.backup_acked(e).unwrap_or(self.bk.acked));
+        self.bk.gate_tails_kept = !kept_tails.is_empty();
+        self.bk.gate_tails = if kept_tails.is_empty() {
+            backup_tail_epoch
+                .map(|e| (e, self.bk.tail_through))
+                .into_iter()
+                .collect()
+        } else {
+            kept_tails
+        };
         self.bk.gate_abandoned = self.bk.abandoned_claim.take();
+        self.bk.gate_abandoned_through = std::mem::take(&mut self.bk.abandoned_through);
         self.bk.gate_names_tail = prev.as_ref().is_some_and(|p| {
             p.holder == self.cfg.node_id && p.epoch == epoch && p.inherited_tail.is_some()
         });
@@ -4400,14 +4487,24 @@ impl Core {
     ) {
         self.pending_plan = None;
         self.promise_check_abandon(out);
+        if let Some(t) = self.bk.kept.take().and_then(|k| k.timer) {
+            self.cancel_timer(t, out);
+        }
+        self.bk.kept_union = None;
+        self.bk.kept_ready = false;
+        self.bk.kept_floor = 0;
+        self.lease.claim_floor = 0;
+        self.pr.check_slack = None;
+        self.pr.check_passed_at = None;
         if !acquired {
             // Plan 43 C1-3: a tail fetched for a claim that did not happen
             // is not carried by the next, whatever it is; nor is an abandon
             // the operator made for it (the next claim's marker would record
             // `GroupAbandoned` for a group nobody abandoned it for, and its
             // `ttl_claims_without_tail` check would skip it).
-            self.bk.fetched = None;
+            self.bk.fetched.clear();
             self.bk.abandoned_claim = None;
+            self.bk.abandoned_through = 0;
         }
         let Some(job) = self.job.take() else {
             return;
@@ -5506,6 +5603,30 @@ impl Core {
                 if self.acquire_overtaken_by_epoch(now, replica, out) {
                     return;
                 }
+                // ADR-51: the union of the kept rows, merged now that the
+                // log is at head.
+                if !self.kept_install(now, replica, out) {
+                    return;
+                }
+                // A fetch that outlasted the promise window checks again
+                // before its CAS (the seals stay: they are idempotent).
+                if self.bk.kept_ready
+                    && self
+                        .pr
+                        .check_passed_at
+                        .is_some_and(|at| now.wait.since(at) > self.cfg.promise_ttl_ms as i64)
+                {
+                    if let Plan::Claim { prev, .. } = &plan {
+                        if self.promise_check_needed(now, prev) {
+                            let prev = prev.clone();
+                            self.pr.check_passed_at = None;
+                            self.set_phase(Phase::PromiseCheck, None);
+                            self.pending_plan = Some(plan);
+                            self.promise_check_begin(now, &prev, out);
+                            return;
+                        }
+                    }
+                }
                 self.acquire_cas(now, plan, replica, out);
             }
             TailThen::CatchUp => {
@@ -5928,8 +6049,8 @@ impl Core {
 /// crash — drops them: they were never committed.
 fn marker_records(
     gate: &PendingGate,
-    abandoned: Option<Epoch>,
-    through: u64,
+    abandoned: Option<(Epoch, u64)>,
+    tails: &[(Epoch, u64)],
     names_tail: bool,
 ) -> Vec<LogRecord> {
     // (`names_tail`: a re-adopted lease that still names a tail its tenure
@@ -5944,17 +6065,19 @@ fn marker_records(
             prev_epoch: gate.epoch - 1,
             through: 0,
         });
-    gate.backup_tail_epoch
-        .map(|prev_epoch| LogRecord::TailFollowsThrough {
-            prev_epoch,
-            through,
+    tails
+        .iter()
+        .map(|(prev_epoch, through)| LogRecord::TailFollowsThrough {
+            prev_epoch: *prev_epoch,
+            through: *through,
         })
-        .into_iter()
         .chain(no_tail)
-        .chain(abandoned.map(|epoch| LogRecord::GroupAbandoned {
-            epoch,
-            gen: 0,
-            through_known: 0,
-        }))
+        .chain(
+            abandoned.map(|(epoch, through_known)| LogRecord::GroupAbandoned {
+                epoch,
+                gen: 0,
+                through_known,
+            }),
+        )
         .collect()
 }

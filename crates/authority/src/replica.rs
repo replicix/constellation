@@ -203,6 +203,13 @@ pub trait Replica {
         strand: Option<constellation_meta::StrandArgs<'_>>,
         tail: Option<constellation_meta::TailArgs>,
     ) -> Result<constellation_meta::ReshipReport, MetaError>;
+    /// [`Self::reship_at_takeover`] for the tails of several epochs,
+    /// ascending (ADR-51), in the one store transaction.
+    fn reship_epochs_at_takeover(
+        &self,
+        strand: Option<constellation_meta::StrandArgs<'_>>,
+        tails: &[constellation_meta::TailArgs],
+    ) -> Result<constellation_meta::ReshipReport, MetaError>;
     /// The pre-S3 stream installed the holder's journal through `pos`
     /// (`SessionState::note_streamed`).
     fn note_streamed(&self, pos: JournalPos);
@@ -1088,6 +1095,14 @@ impl Replica for Meta {
         tail: Option<constellation_meta::TailArgs>,
     ) -> Result<constellation_meta::ReshipReport, MetaError> {
         Meta::reship_at_takeover(self, strand, tail)
+    }
+
+    fn reship_epochs_at_takeover(
+        &self,
+        strand: Option<constellation_meta::StrandArgs<'_>>,
+        tails: &[constellation_meta::TailArgs],
+    ) -> Result<constellation_meta::ReshipReport, MetaError> {
+        Meta::reship_epochs_at_takeover(self, strand, tails)
     }
 
     fn strand_recalled_speculation(&self, gen: u64) -> Result<Stranded, MetaError> {

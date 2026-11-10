@@ -924,7 +924,22 @@ pub(crate) struct BackupState {
     /// keeps a member copy of.
     pub(crate) tf: Option<super::seal_tail::TailFetch>,
     pub(crate) tf_round: Option<OpId>,
-    pub(crate) fetched: Option<super::seal_tail::FetchedTail>,
+    /// ADR-51: the kept fetch of the running claim, the union it completed
+    /// (awaiting the log read to head and the merge), whether the union is
+    /// installed (the claim's promise re-check does not collect it again),
+    /// when this node first saw the lease the fetch is for, and the
+    /// operator's `--force` for a divergence.
+    pub(crate) kept: Option<super::kept::KeptFetch>,
+    pub(crate) kept_union: Option<super::kept::KeptUnion>,
+    pub(crate) kept_ready: bool,
+    pub(crate) kept_seen: Option<(Epoch, WaitMs)>,
+    pub(crate) kept_force: bool,
+    pub(crate) kept_force_wanted: Option<Epoch>,
+    /// The `through_known` of an abandon this claim made after partial
+    /// answers (what its union carries of the abandoned epoch).
+    pub(crate) abandoned_through: u64,
+    pub(crate) gate_abandoned_through: u64,
+    pub(crate) fetched: Vec<super::seal_tail::FetchedTail>,
     pub(crate) group_wait: Option<super::seal_tail::GroupWait>,
     pub(crate) abandon: Option<Epoch>,
     pub(crate) abandoned_claim: Option<Epoch>,
@@ -937,6 +952,16 @@ pub(crate) struct BackupState {
     /// Plan 43 C1-4: the extent of the tail the open gate re-ships (its
     /// marker's `TailFollowsThrough.through`).
     pub(crate) tail_through: u64,
+    /// ADR-51: the tails the takeover gate re-ships, ascending by epoch, each
+    /// with the contiguous hold it reaches; and whether they are a kept
+    /// fetch's union (its marker then names every epoch from the first to the
+    /// one below the claim's, `tail_through` being the first's).
+    pub(crate) gate_tails: Vec<(Epoch, u64)>,
+    pub(crate) gate_tails_kept: bool,
+    /// ADR-51: the claim must land above every epoch a hold journaled under
+    /// (the streams the members sealed with rows): the claim's epoch is at
+    /// least this plus one.
+    pub(crate) kept_floor: Epoch,
     /// ADR-43 (orphan grants): what the open gate's marker proves the log
     /// will never grant, with the gate's epoch: worked out at the gate's
     /// first strand, from the marker's records as they were shipped (a later
@@ -6125,8 +6150,10 @@ impl Core {
             // Plan 43 C1-3: a claim that fetched a group's tail holds it as
             // a sealed backup's until its gate applies it; the seal watch
             // must not read the lease and discard it as "not listed".
-            || self.bk.fetched.is_some()
+            || !self.bk.fetched.is_empty()
             || self.bk.tf.is_some()
+            || self.bk.kept.is_some()
+            || self.bk.kept_union.is_some()
         {
             // (`epoch.open`: rule (b) — a member of an open epoch never
             // seals; `backup_watch_after_epoch` resumes the watch.)
@@ -6550,15 +6577,40 @@ impl Core {
     /// not name. The old ∪ new reconfiguration rule and the replay must not
     /// read these versions as the rows' commit configurations.
     pub(crate) fn tail_args(&self, prev_epoch: Epoch) -> constellation_meta::TailArgs {
+        self.tail_args_through(prev_epoch, self.bk.tail_through)
+    }
+
+    /// [`Self::tail_args`] for a tail that reaches `through`.
+    fn tail_args_through(&self, prev_epoch: Epoch, through: u64) -> constellation_meta::TailArgs {
         constellation_meta::TailArgs {
             epoch: prev_epoch,
-            through: self.bk.tail_through,
+            through,
             config_version: self.bk.role.map_or(0, |r| r.config_version),
             class: Some(constellation_meta::RowCommit::group(
                 self.root_config_version(),
                 GroupOn::Root,
             )),
         }
+    }
+
+    /// The tails the gate re-ships, ascending by epoch (ADR-51: a kept
+    /// fetch's union has one per epoch with rows; any other claim one).
+    pub(crate) fn gate_tail_args(
+        &self,
+        gate: &super::lease::PendingGate,
+    ) -> Vec<constellation_meta::TailArgs> {
+        if self.bk.gate_tails.is_empty() {
+            return gate
+                .backup_tail_epoch
+                .map(|e| self.tail_args(e))
+                .into_iter()
+                .collect();
+        }
+        self.bk
+            .gate_tails
+            .iter()
+            .map(|(e, through)| self.tail_args_through(*e, *through))
+            .collect()
     }
 
     /// The takeover's re-ship of the predecessor's tail committed
@@ -6603,6 +6655,8 @@ impl Core {
         self.bk.role = None;
         self.bk.acked = 0;
         self.bk.tail_through = 0;
+        self.bk.gate_tails.clear();
+        self.bk.gate_tails_kept = false;
     }
 
     /// The tail alone, as before the strand joined it (the core tests that

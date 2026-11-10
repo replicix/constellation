@@ -93,6 +93,9 @@ pub(crate) struct FetchedTail {
     pub config_version: u64,
     pub members: Vec<NodeId>,
     pub through: u64,
+    /// ADR-51: the tail is a kept fetch's union of the committed rows of
+    /// this node's tenure (the lease the claim writes names it `kept`).
+    pub kept_owner: Option<NodeId>,
 }
 
 /// What `status.lease.waiting_for_group` reports.
@@ -121,14 +124,17 @@ pub(crate) struct GroupWait {
     /// The lease the wait is for, as the claimant watches it: a read that
     /// shows another key (a renewal, another claim) ends the wait.
     pub key: constellation_store_s3::lease::RenewalKey,
+    /// ADR-51: the wait is a kept fetch's, for the rows of the tenure of this
+    /// epoch (`Control::Abandon` names either).
+    pub kept: Option<Epoch>,
 }
 
 /// ADR-51: the fields of a `SealedTail` that only a kept request fills.
 #[derive(Default)]
-struct KeptFields {
-    members: Vec<Vec<NodeId>>,
-    sealed: Vec<(Epoch, NodeId)>,
-    refused: Option<SealRefusal>,
+pub(crate) struct KeptFields {
+    pub(crate) members: Vec<Vec<NodeId>>,
+    pub(crate) sealed: Vec<(Epoch, NodeId)>,
+    pub(crate) refused: Option<SealRefusal>,
 }
 
 /// ADR-51: what [`Core::seal_kept_hold`] decided.
@@ -608,29 +614,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let wait = self
-            .bk
-            .group_wait
-            .get_or_insert_with(|| super::seal_tail::GroupWait {
-                epoch: prev.epoch,
-                since: now.wait,
-                sources: Vec::new(),
-                warned: now.wait,
-                last_attempt: now.wait,
-                key: prev.renewal_key(),
-            });
-        if wait.epoch != prev.epoch {
-            *wait = GroupWait {
-                epoch: prev.epoch,
-                since: now.wait,
-                sources: Vec::new(),
-                warned: now.wait,
-                last_attempt: now.wait,
-                key: prev.renewal_key(),
-            };
-        }
-        wait.last_attempt = now.wait;
-        wait.sources = sources.iter().map(|s| s.0).collect();
+        self.open_group_wait(now, &prev, sources.iter().map(|s| s.0).collect());
         // The operator said the group is gone: no wait.
         if self.bk.abandon == Some(prev.epoch) {
             self.claim_without_tail(now, prev, tag, replica, out);
@@ -755,14 +739,26 @@ impl Core {
         from: NodeId,
         req: OpId,
         epoch: Epoch,
-        held: bool,
-        empty: bool,
-        txs: Vec<BackupTx>,
-        through: u64,
-        next: Option<u64>,
+        (held, empty): (bool, bool),
+        (txs, through, next): (Vec<BackupTx>, u64, Option<u64>),
+        kept: KeptFields,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        if self.bk.kept.is_some() {
+            self.on_kept_sealed_tail(
+                now,
+                from,
+                req,
+                epoch,
+                (held, empty),
+                (txs, through, next),
+                kept,
+                replica,
+                out,
+            );
+            return;
+        }
         let Some(tf) = self.bk.tf.as_mut() else {
             return;
         };
@@ -883,6 +879,9 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> bool {
+        if self.on_kept_failed(req) {
+            return true;
+        }
         let Some(tf) = self.bk.tf.as_mut() else {
             return false;
         };
@@ -912,6 +911,11 @@ impl Core {
         if self.bk.tf_round != Some(req) {
             return false;
         }
+        if self.bk.kept.is_some() {
+            self.bk.tf_round = None;
+            self.on_kept_window_ended(now, replica, out);
+            return true;
+        }
         self.bk.tf_round = None;
         if let Some(tf) = self.bk.tf.as_mut() {
             tf.timer = None;
@@ -920,11 +924,19 @@ impl Core {
         true
     }
 
-    fn end_tail_fetch_attempt(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(super) fn end_tail_fetch_attempt(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         if let Some(tf) = self.bk.tf.take() {
             if let Some(t) = tf.timer {
                 self.cancel_timer(t, out);
             }
+        }
+        if let Some(t) = self.bk.kept.take().and_then(|k| k.timer) {
+            self.cancel_timer(t, out);
         }
         self.bk.tf_round = None;
         if let Some(w) = self.bk.group_wait.as_mut() {
@@ -1019,12 +1031,13 @@ impl Core {
         members.push(self.cfg.node_id);
         members.sort_unstable();
         members.dedup();
-        self.bk.fetched = Some(FetchedTail {
+        self.bk.fetched = vec![FetchedTail {
             epoch: ch.epoch,
             config_version: ch.config_version,
             members,
             through: ch.through,
-        });
+            kept_owner: None,
+        }];
         self.stats.tail_fetches += 1;
         if prev.inherited_tail.is_some() {
             self.stats.inherited_tail_fetches += 1;
@@ -1103,7 +1116,12 @@ impl Core {
         };
         let waiting = self.bk.group_wait.as_ref().map(|w| w.epoch);
         let chosen = self.bk.tf.as_ref().is_some_and(|t| t.chosen.is_some());
-        let result = if waiting != Some(epoch) || chosen {
+        // ADR-51: a kept fetch is abandoned by the lease epoch it waits for
+        // (`waiting_for_group.epoch`) or by the tenure epoch whose rows it
+        // collects, even after some sources answered: the claim goes on with
+        // what answered.
+        let kept_epoch = self.bk.group_wait.as_ref().and_then(|w| w.kept);
+        let result = if (waiting != Some(epoch) && kept_epoch != Some(epoch)) || chosen {
             Err(format!("not waiting for epoch {epoch}'s group"))
         } else {
             Ok(crate::action::ControlOk::Text(format!(
@@ -1115,6 +1133,11 @@ impl Core {
         if !ok {
             return;
         }
+        if self.bk.kept.is_some() {
+            self.kept_abandon_now(now, force, replica, out);
+            return;
+        }
+        self.bk.kept_force |= force && kept_epoch == Some(epoch);
         self.bk.abandon = Some(epoch);
         match self.bk.tf.take() {
             // An attempt is out: its claim goes on at once.
@@ -1148,12 +1171,14 @@ impl Core {
                 .backup_tail(epoch)
                 .is_none_or(|tail| tail.iter().any(|t| !t.records.is_empty()))
         };
-        if let Some(f) = self.bk.fetched.as_ref().filter(|f| carried(f.epoch)) {
+        if let Some(f) = self.bk.fetched.iter().find(|f| carried(f.epoch)) {
             return Some(InheritedTail {
                 epoch: f.epoch,
                 config_version: f.config_version,
                 members: f.members.clone(),
                 through: f.through,
+                kept: f.kept_owner.is_some(),
+                holder: f.kept_owner.unwrap_or(0),
             });
         }
         let role = self
@@ -1171,6 +1196,8 @@ impl Core {
             config_version: prev.config_version,
             members,
             through: self.bk.acked,
+            kept: false,
+            holder: 0,
         })
     }
 
@@ -1249,6 +1276,8 @@ impl Core {
             config_version: prev.config_version,
             members,
             through: replica.journal_tip(),
+            kept: false,
+            holder: 0,
         })
     }
 
@@ -1264,12 +1293,7 @@ impl Core {
         let me = self.cfg.node_id;
         if prev.holder == me && self.bk.sealed >= prev.epoch {
             // Self-sealed: the copy of the epoch is the tail.
-            if self
-                .bk
-                .fetched
-                .as_ref()
-                .is_some_and(|f| f.epoch == prev.epoch)
-            {
+            if self.bk.fetched.iter().any(|f| f.epoch == prev.epoch) {
                 return true;
             }
             let Some((cv, txs)) = replica.member_copy(prev.epoch) else {
@@ -1297,12 +1321,13 @@ impl Core {
                 members.push(me);
                 members.sort_unstable();
                 members.dedup();
-                self.bk.fetched = Some(FetchedTail {
+                self.bk.fetched = vec![FetchedTail {
                     epoch: prev.epoch,
                     config_version: cv,
                     members,
                     through: txs.iter().map(|t| t.last).max().unwrap_or(0),
-                });
+                    kept_owner: None,
+                }];
             }
             return true;
         }
@@ -1326,12 +1351,33 @@ impl Core {
         true
     }
 
+    /// The wait of a claim for `prev`'s group (`status.lease.waiting_for_group`)
+    /// as this attempt sees it: kept across attempts for the same epoch.
+    pub(super) fn open_group_wait(&mut self, now: Now, prev: &Lease, sources: Vec<NodeId>) {
+        let fresh = || GroupWait {
+            epoch: prev.epoch,
+            since: now.wait,
+            sources: Vec::new(),
+            warned: now.wait,
+            last_attempt: now.wait,
+            key: prev.renewal_key(),
+            kept: None,
+        };
+        let wait = self.bk.group_wait.get_or_insert_with(fresh);
+        if wait.epoch != prev.epoch {
+            *wait = fresh();
+        }
+        wait.last_attempt = now.wait;
+        wait.sources = sources;
+    }
+
     /// The report of a waiting claim, for `status`.
     pub fn waiting_for_group(&self, now: Now) -> Option<WaitingForGroup> {
         let stale_after = (4 * self.cfg.backup_takeover_ms).max(10_000) as i64;
         // Waiting means somebody needs the claim: an attempt is out, or an op
         // of this node waits for the lease (or retries for it).
         let needed = self.bk.tf.is_some()
+            || self.bk.kept.is_some()
             || self.clients.values().any(|c| {
                 matches!(
                     c.phase,

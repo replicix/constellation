@@ -142,6 +142,10 @@ pub struct LeaseState {
     /// no longer land, `sealer_doomed`), otherwise once it can be claimed
     /// like another node's, by TTL (D7).
     pub sealed_own: Epoch,
+    /// ADR-51: the claim in hand lands above this epoch (an epoch a hold
+    /// journaled under the tenure it takes over): set by the claim before it
+    /// grants itself a lease, 0 otherwise.
+    pub claim_floor: Epoch,
     /// The renewal keys the claimants that sealed this node's own epoch
     /// read (`BackupState::sealer_keys`, set with `sealed_own`); empty after
     /// a restart.
@@ -583,7 +587,12 @@ impl LeaseState {
             && prev.holder != 0
             && !permitted
             && ((prev.ack_policy == AckPolicy::Backup && !prev.backups.is_empty())
-                || prev.inherited_tail.is_some());
+                // ADR-51: a union of kept rows is collected by the kept phase
+                // from every member it names, not from one `held` member.
+                || prev
+                    .inherited_tail
+                    .as_ref()
+                    .is_some_and(|t| cfg.kept_fetch_skipped || !t.kept));
         if group_may_hold {
             let has_own = if sealed_own {
                 self.tail_held.contains(&(cfg.node_id, prev.epoch))
@@ -698,7 +707,11 @@ impl LeaseState {
         let epoch = match prev {
             None => 1,
             Some(prev) if own.is_some() => prev.epoch.max(1),
-            Some(prev) => prev.epoch + 1,
+            // ADR-51: above every epoch a hold journaled under the tenure it
+            // ends (a hold handed to a transferee journals under the epoch
+            // above): the successor's identities `(epoch, seq)` must not
+            // collide with the rows the members keep of them.
+            Some(prev) => prev.epoch.max(self.claim_floor) + 1,
         };
         Lease {
             v: LEASE_VERSION,
@@ -1064,6 +1077,12 @@ impl LeaseState {
     }
 
     /// The observation, if it is of `prev`'s key.
+    /// ADR-51: the wait-clock instant this node first saw `prev`'s renewal
+    /// key (`None`: it has not watched it).
+    pub fn observed_since(&self, prev: &Lease) -> Option<WaitMs> {
+        self.obs_for(prev).map(|o| o.since)
+    }
+
     fn obs_for(&self, prev: &Lease) -> Option<&LeaseObs> {
         let key = prev.renewal_key();
         self.obs.as_ref().filter(|o| o.key == key)

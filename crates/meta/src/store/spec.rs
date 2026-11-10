@@ -5989,10 +5989,26 @@ impl Meta {
         strand: Option<StrandArgs<'_>>,
         tail: Option<TailArgs>,
     ) -> Result<ReshipReport, MetaError> {
-        let txs: Vec<crate::BackupTx> = match &tail {
-            Some(t) => self.backup_tail(t.epoch)?,
-            None => Vec::new(),
-        };
+        self.reship_epochs_at_takeover(strand, tail.as_slice())
+    }
+
+    /// [`Self::reship_at_takeover`] for the tails of several epochs, ascending
+    /// (ADR-51: a claim that took the rows a hold journaled under the
+    /// tenure's epoch and under the one a handover moved it to): the strand
+    /// runs once and each epoch's tail is re-journaled in order, in the one
+    /// transaction. A transaction whose identity an earlier epoch's tail
+    /// already re-journaled is skipped (a union of a later epoch may carry
+    /// the re-ship of an earlier one's rows).
+    pub fn reship_epochs_at_takeover(
+        &self,
+        strand: Option<StrandArgs<'_>>,
+        tails: &[TailArgs],
+    ) -> Result<ReshipReport, MetaError> {
+        let mut tail_txs: Vec<(TailArgs, Vec<crate::BackupTx>)> = Vec::new();
+        for t in tails {
+            tail_txs.push((*t, self.backup_tail(t.epoch)?));
+        }
+        let txs: Vec<&crate::BackupTx> = tail_txs.iter().flat_map(|(_, v)| v.iter()).collect();
         // Plan 30 §M12: a grant or a recall changes who may execute what;
         // the fast path checks that under the shared side. Taken before the
         // write transaction (the fast path's order: gate, then database).
@@ -6015,29 +6031,30 @@ impl Meta {
         let mut report = ReshipReport::default();
         let mut part = StrandPart::default();
         if let Some(args) = strand {
-            let tail_idents: HashSet<(u64, u64)> = match &tail {
-                // Only the transactions this takeover re-applies name a copy:
-                // a hole names nothing, and one past the sealed prefix
-                // (`bt.last > through`) is counted `tail_beyond_gap` and
-                // never re-applied.
-                Some(t) => txs
-                    .iter()
-                    .filter(|bt| !bt.records.is_empty() && bt.last <= t.through)
-                    .map(|bt| {
-                        crate::store::member::tail_identity(&bt.records)
-                            .unwrap_or((t.epoch, bt.first))
-                    })
-                    .collect(),
-                None => HashSet::new(),
-            };
+            // Only the transactions this takeover re-applies name a copy:
+            // a hole names nothing, and one past the sealed prefix
+            // (`bt.last > through`) is counted `tail_beyond_gap` and never
+            // re-applied.
+            let tail_idents: HashSet<(u64, u64)> = tail_txs
+                .iter()
+                .flat_map(|(t, v)| {
+                    v.iter()
+                        .filter(|bt| !bt.records.is_empty() && bt.last <= t.through)
+                        .map(|bt| {
+                            crate::store::member::tail_identity(&bt.records)
+                                .unwrap_or((t.epoch, bt.first))
+                        })
+                })
+                .collect();
             part = self.strand_part_tx(&mut tx, &staged, args, &tail_idents)?;
             report.stranded = part.stranded;
         }
         let mut journaled: Vec<((u64, u64), local::JournaledTx)> = Vec::new();
-        if let Some(t) = &tail {
+        let mut seen: HashSet<(u64, u64)> = HashSet::new();
+        for (t, txs) in &tail_txs {
             let _class = t.class.map(crate::store::journal::PendingClass::set);
             let mut moved: Vec<crate::BackupTx> = Vec::new();
-            for bt in &txs {
+            for bt in txs {
                 if bt.records.is_empty() {
                     // A hole: rows the holder had shipped (or rolled back)
                     // before it streamed past them; nothing to re-apply.
@@ -6045,6 +6062,14 @@ impl Meta {
                 }
                 if bt.last > t.through {
                     report.tail_beyond_gap += 1;
+                    continue;
+                }
+                // ADR-51: an identity an earlier epoch's tail re-journaled
+                // already is not journaled twice.
+                let ident =
+                    crate::store::member::tail_identity(&bt.records).unwrap_or((t.epoch, bt.first));
+                if !seen.insert(ident) {
+                    report.tail_done += 1;
                     continue;
                 }
                 let rid = bt.records.iter().find_map(|r| match r {
@@ -6133,8 +6158,10 @@ impl Meta {
                     &moved,
                 )?;
             }
+            report.tail_moved += moved.len();
+        }
+        if !tails.is_empty() {
             report.tail_applied = journaled.len();
-            report.tail_moved = moved.len();
             crate::store::backup::backup_clear_tx(&mut tx, self)?;
         }
         // The streams this gate ended hold what the log holds of them from
@@ -6143,7 +6170,7 @@ impl Meta {
         for gen in &part.ended {
             local::settle_deleg_idx_at_log_tx(&mut tx, &self.local, *gen)?;
         }
-        if !part.work && tail.is_none() {
+        if !part.work && tails.is_empty() {
             // Nothing to strand and no tail: nothing to commit.
             return Ok(report);
         }
@@ -6164,7 +6191,7 @@ impl Meta {
         }
         self.report_rolled_back();
         staged.drain_into(self.usage_tracker());
-        if tail.is_some() {
+        if !tails.is_empty() {
             *self.backup_tail_floor.lock().unwrap() = None;
             for ((gen, idx), one) in journaled {
                 one.staged.drain_into(self.usage_tracker());

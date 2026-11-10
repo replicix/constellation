@@ -53,6 +53,7 @@ mod delegate;
 mod holder;
 mod inbox;
 mod jobs;
+mod kept;
 mod lease;
 mod locks;
 mod mode;
@@ -492,6 +493,9 @@ pub struct Config {
     /// `meta.json`'s `epoch_slack` (`f`): a continuation epoch may form
     /// with up to `f` write-eligible nodes missing. 0: today's rule.
     pub epoch_slack: u32,
+    /// ADR-51 negative control: a takeover never collects the kept rows of
+    /// the tenure it ends (the claim proceeds as before the ADR).
+    pub kept_fetch_skipped: bool,
     /// `CONSTELLATION_PROMISE_TTL_S` (default 15 s = lease TTL / 4): how
     /// long a heartbeat promise binds its writer.
     pub promise_ttl_ms: u64,
@@ -732,6 +736,7 @@ impl Config {
             fast_takeover: true,
             strict_mounts: false,
             epoch_slack: 0,
+            kept_fetch_skipped: false,
             promise_ttl_ms: 15_000,
             promise_wait_ms: 1_000,
             promise_watch_ms: 5_000,
@@ -1871,6 +1876,22 @@ pub struct Stats {
     /// of their epoch had sealed their stream.
     pub stream_ahead_sealed_refused: u64,
     pub hold_ended_sealed: u64,
+    /// ADR-51: kept fetches begun and completed; those the operator's abandon
+    /// completed with a source unanswered.
+    pub kept_fetches: u64,
+    pub kept_fetches_completed: u64,
+    pub kept_abandoned: u64,
+    /// ADR-51: transactions a completed fetch carried (once each), those it
+    /// found past a gap no source covers (must stay 0), fetches that did not
+    /// complete because two sources kept different transactions at one
+    /// seq, ones completed by the operator's `--force`, and kept rows that a
+    /// claim's takeover gate still queued as foreign replays (must stay 0
+    /// but after an abandon).
+    pub kept_rows_carried: u64,
+    pub kept_past_gap: u64,
+    pub kept_diverged: u64,
+    pub kept_forced: u64,
+    pub kept_uncarried_replayed: u64,
     /// Reads of the persisted backup seal that failed after a start that
     /// could not read it (`status.ack.sealed_unread` while it lasts).
     pub backup_seal_unread_reads: u64,
@@ -2081,6 +2102,9 @@ pub struct EpochState {
 /// What an outstanding S3 request was for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum S3For {
+    /// ADR-51: a kept fetch reading the heartbeats for the slack `f` (no
+    /// promise check ran).
+    KeptSlack,
     /// A job step (`jobs.rs`); the job that issued it is the current one.
     Job,
     /// A client op reading the lease to learn the holder.
@@ -3411,14 +3435,28 @@ impl Core {
                 txs,
                 through,
                 next,
-                ..
+                members,
+                sealed,
+                refused,
             } => {
                 // Plan 46 M0.3 (G): a member that answers is up. A restarted
                 // holder heard from here is reachable again for this node's
                 // forwards and settles (which make it re-adopt its lease).
                 self.note_p2p_result(now, from, true);
                 self.on_sealed_tail(
-                    now, from, req, epoch, held, empty, txs, through, next, replica, out,
+                    now,
+                    from,
+                    req,
+                    epoch,
+                    (held, empty),
+                    (txs, through, next),
+                    seal_tail::KeptFields {
+                        members,
+                        sealed,
+                        refused,
+                    },
+                    replica,
+                    out,
                 )
             }
             PeerMsg::LockRequest {
@@ -3592,6 +3630,7 @@ impl Core {
             S3For::ClearMark => self.on_clear_mark_put(now, op, result, out),
             S3For::ClearMarkReread => self.on_clear_mark_reread(now, op, result, replica, out),
             S3For::Heartbeats => self.on_heartbeats(now, result, replica, out),
+            S3For::KeptSlack => self.on_kept_heartbeats(now, result, replica, out),
             S3For::HeartbeatPut(slack) => self.on_heartbeat_put(slack, result),
             S3For::PromiseWatch => {
                 if let S3Result::LeaseGet(Ok(Some((lease, _)))) = result {

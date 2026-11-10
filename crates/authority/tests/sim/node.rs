@@ -465,6 +465,8 @@ pub struct NodeEnv {
     pub skip_deleg_dep_wait: bool,
     /// See `SimConfig::ttl_reclaims_sticky`.
     pub ttl_reclaims_sticky: bool,
+    /// See `SimConfig::kept_fetch_skipped`.
+    pub kept_fetch_skipped: bool,
     /// See `SimConfig::restart_skips_write_quarantine`.
     pub restart_skips_write_quarantine: bool,
     /// See `SimConfig::first_start_unsettled`.
@@ -791,6 +793,7 @@ impl NodeHandle {
         let mut cfg = (env.config)(id, incarnation);
         cfg.skip_deleg_dep_wait = env.skip_deleg_dep_wait;
         cfg.ttl_reclaims_sticky = env.ttl_reclaims_sticky;
+        cfg.kept_fetch_skipped = env.kept_fetch_skipped;
         cfg.restart_skips_write_quarantine = env.restart_skips_write_quarantine;
         cfg.holder_releases_before_drain = env.holder_releases_before_drain;
         cfg.fence_accepts_unrouted = env.fence_accepts_unrouted;
