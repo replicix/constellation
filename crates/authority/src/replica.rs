@@ -780,6 +780,16 @@ pub trait Replica {
         source: NodeId,
         through: u64,
     ) -> Result<usize, MetaError>;
+    /// ADR-51: the committed streamed transactions of `epoch` that `source`
+    /// streamed and this replica holds ahead of the log, in journal order
+    /// (`Meta::kept_streamed`).
+    fn kept_streamed(&self, epoch: Epoch, source: NodeId) -> Result<Vec<BackupTx>, MetaError>;
+    /// ADR-51: the streams `(epoch, source)` this node sealed for a
+    /// claimant's kept fetch (`None`: the store could not be read).
+    fn sealed_streams(&self) -> Option<Vec<(Epoch, NodeId)>>;
+    /// ADR-51: seal the streams, persisted and synced before it returns
+    /// `true`.
+    fn seal_streams(&self, streams: &[(Epoch, NodeId)]) -> bool;
     /// The holder's durability watermark for its own reads
     /// (`Meta::durability_pending`). `lone_ok` (plan 43 C2, §5.4): with the
     /// gate off, the node may answer its own clients on its disk alone.
@@ -2013,6 +2023,18 @@ impl Replica for Meta {
         through: u64,
     ) -> Result<usize, MetaError> {
         Meta::promote_streamed(self, epoch, source, through)
+    }
+
+    fn kept_streamed(&self, epoch: Epoch, source: NodeId) -> Result<Vec<BackupTx>, MetaError> {
+        Meta::kept_streamed(self, epoch, source)
+    }
+
+    fn sealed_streams(&self) -> Option<Vec<(Epoch, NodeId)>> {
+        Meta::sealed_streams(self).ok()
+    }
+
+    fn seal_streams(&self, streams: &[(Epoch, NodeId)]) -> bool {
+        Meta::seal_streams(self, streams).is_ok()
     }
 
     fn set_durable(

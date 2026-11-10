@@ -1860,6 +1860,17 @@ pub struct Stats {
     /// Seals of a claimant left unanswered: this node's store could not be
     /// read (plan 43 C2e review: not an empty tail, not "I hold nothing").
     pub seal_tail_unreadable: u64,
+    /// ADR-51: `SealTail { kept }` requests this node answered (it sealed the
+    /// hold streams of the tenure and reported its kept rows), and the ones
+    /// it refused (its own epoch carries the tenure; a newer renewal seen).
+    pub seal_tail_kept: u64,
+    pub seal_kept_refused_epoch_open: u64,
+    pub seal_kept_refused_stale_key: u64,
+    /// ADR-51 (K4): `StreamAhead` batches of a stream this node had sealed,
+    /// refused; and holds that ended as deposed because every other member
+    /// of their epoch had sealed their stream.
+    pub stream_ahead_sealed_refused: u64,
+    pub hold_ended_sealed: u64,
     /// Reads of the persisted backup seal that failed after a start that
     /// could not read it (`status.ack.sealed_unread` while it lasts).
     pub backup_seal_unread_reads: u64,
@@ -3190,6 +3201,9 @@ impl Core {
                 txs,
                 committed,
             } => self.on_stream_ahead(now, from, epoch, base, txs, committed, replica, out),
+            PeerMsg::StreamAheadRefused { epoch, sealed } => {
+                self.on_stream_ahead_refused(now, from, epoch, sealed, replica, out)
+            }
             PeerMsg::StreamAheadAck { epoch, through } => {
                 self.on_stream_ahead_ack(now, from, epoch, through, replica, out)
             }
@@ -3377,14 +3391,15 @@ impl Core {
                 config_version,
                 from: from_seq,
                 key,
+                kept,
+                tenure,
             } => self.on_seal_tail(
                 now,
                 from,
                 req,
-                epoch,
-                config_version,
-                from_seq,
+                (epoch, config_version, from_seq),
                 key,
+                (kept, tenure),
                 replica,
                 out,
             ),
@@ -3396,6 +3411,7 @@ impl Core {
                 txs,
                 through,
                 next,
+                ..
             } => {
                 // Plan 46 M0.3 (G): a member that answers is up. A restarted
                 // holder heard from here is reachable again for this node's

@@ -17657,8 +17657,8 @@ mod locks {
         crate::replica::Replica::set_backup_role(&h.meta, role).unwrap();
         h.core = Core::new(h.core.cfg.clone());
         let mut out = Vec::new();
-        // (The seal's read goes first and passes.)
-        constellation_meta::fail_store_reads_after_on_this_thread_for_tests(1, 1);
+        // (The seal's reads, the epoch and its streams, go first and pass.)
+        constellation_meta::fail_store_reads_after_on_this_thread_for_tests(2, 1);
         h.core.backup_start(h.clk(), &h.meta, &mut out);
         constellation_meta::fail_store_reads_after_on_this_thread_for_tests(0, 0);
         assert!(h.core.bk.role_unread && !h.core.bk.sealed_unread);
@@ -53208,6 +53208,9 @@ mod c1_tail_fetch {
                 txs,
                 through,
                 next: None,
+                members: Vec::new(),
+                sealed: Vec::new(),
+                refused: None,
             },
         }
     }
@@ -53241,6 +53244,8 @@ mod c1_tail_fetch {
                 config_version: cv,
                 from: at,
                 key,
+                kept: false,
+                tenure: (0, 0),
             },
         })
     }
@@ -53902,6 +53907,9 @@ mod c1_tail_fetch {
                 txs: first.to_vec(),
                 through: txs.last().unwrap().last,
                 next: Some(rest[0].first),
+                members: Vec::new(),
+                sealed: Vec::new(),
+                refused: None,
             },
         });
         let more = seal_tails(&out);
@@ -53922,6 +53930,9 @@ mod c1_tail_fetch {
                 txs: rest.to_vec(),
                 through: txs.last().unwrap().last,
                 next: None,
+                members: Vec::new(),
+                sealed: Vec::new(),
+                refused: None,
             },
         });
         assert_eq!(c.core.stats.tail_fetches, 1);
@@ -53955,6 +53966,9 @@ mod c1_tail_fetch {
                 txs: txs.to_vec(),
                 through,
                 next,
+                members: Vec::new(),
+                sealed: Vec::new(),
+                refused: None,
             },
         };
         // Each batch arrives late in its window, but within it; the window
@@ -54873,6 +54887,9 @@ mod c1_tail_fetch {
                 txs: Vec::new(),
                 through: 0,
                 next: None,
+                members: Vec::new(),
+                sealed: Vec::new(),
+                refused: None,
             },
         }
     }
@@ -63273,6 +63290,334 @@ mod hold_ack {
                 "lone {lone}: the deadline path answers a row the archive does not carry"
             );
         }
+    }
+}
+
+/// ADR-51: the member side of a claimant's kept fetch: what an epoch
+/// member seals and answers when another node takes the tenure its hold
+/// carried over.
+mod kept_member {
+    use super::*;
+    use crate::event::{Carrier, SealRefusal};
+    use constellation_meta::BackupTx;
+
+    /// The committed rows of node 1's journal (`n` creates), as a hold owner
+    /// streams them.
+    fn owner_rows(n: u64) -> Vec<BackupTx> {
+        let mut owner = Harness::with(1, true);
+        owner.hold(1, None);
+        for i in 0..n {
+            submit_create(&mut owner, i + 1, &format!("k{i}"));
+        }
+        Replica::journal_txs_from(&owner.meta, 1, 100)
+    }
+
+    /// Node 2 as a member of the epoch `members`, which carried the tenure
+    /// `(holder, lease_epoch)`, holding `txs` of stream `(epoch, source)`
+    /// as committed copies.
+    fn member_with(
+        members: &[NodeId],
+        carrier: (NodeId, Epoch),
+        kept: &[(Epoch, NodeId, &[BackupTx])],
+    ) -> Harness {
+        let h = Harness::with(2, true);
+        h.meta
+            .persist_epoch(
+                "e1",
+                members,
+                &Default::default(),
+                7,
+                "closed",
+                Some(carrier),
+            )
+            .unwrap();
+        for (epoch, source, txs) in kept {
+            for t in txs.iter() {
+                h.meta
+                    .install_streamed_committed(
+                        *epoch, *source, t.first, t.last, &t.records, true, t.origin,
+                    )
+                    .unwrap();
+            }
+        }
+        h
+    }
+
+    fn kept_seal(
+        h: &mut Harness,
+        from: NodeId,
+        epoch: Epoch,
+        tenure: (NodeId, Epoch),
+        key: constellation_store_s3::RenewalKey,
+    ) -> Vec<Action> {
+        h.step(Event::Peer {
+            from,
+            msg: PeerMsg::SealTail {
+                req: OpId(70),
+                epoch,
+                config_version: 1,
+                from: 0,
+                key,
+                kept: true,
+                tenure,
+            },
+        })
+    }
+
+    type KeptAnswer = (
+        bool,
+        Vec<BackupTx>,
+        Vec<Vec<NodeId>>,
+        Vec<(Epoch, NodeId)>,
+        Option<SealRefusal>,
+    );
+
+    fn answer(out: &[Action]) -> Option<KeptAnswer> {
+        sends(out).into_iter().find_map(|(_, m)| match m {
+            PeerMsg::SealedTail {
+                held,
+                txs,
+                members,
+                sealed,
+                refused,
+                ..
+            } => Some((
+                *held,
+                txs.clone(),
+                members.clone(),
+                sealed.clone(),
+                *refused,
+            )),
+            _ => None,
+        })
+    }
+
+    fn refusals(out: &[Action]) -> Vec<(NodeId, Epoch)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::StreamAheadRefused {
+                    epoch,
+                    sealed: true,
+                } => Some((to, *epoch)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn batch(epoch: Epoch, txs: Vec<BackupTx>) -> PeerMsg {
+        PeerMsg::StreamAhead {
+            epoch,
+            base: 0,
+            txs,
+            committed: true,
+        }
+    }
+
+    /// K4, per stream: a member that answered a kept fetch installs and
+    /// acknowledges nothing more of the sealed stream `(epoch, source)`, and
+    /// tells the source; a stream of a later epoch from the same source is
+    /// not sealed. Fails on the parent: only the epoch ever sealed.
+    #[test]
+    fn a_member_sealed_for_a_kept_fetch_acks_nothing_more() {
+        let txs = owner_rows(3);
+        let mut h = member_with(&[1, 2, 3], (1, 1), &[(1, 1, &txs[..2])]);
+        h.core.lease.cached_holder = Some(1);
+        let key = lease_of(1, 1, 0).renewal_key();
+        let out = kept_seal(&mut h, 3, 1, (1, 1), key);
+        let (held, got, members, sealed, refused) = answer(&out).expect("answered");
+        assert!(held && refused.is_none());
+        assert_eq!(got.len(), 2);
+        assert_eq!(members, vec![vec![1, 2, 3]]);
+        assert_eq!(sealed, vec![(1, 1)]);
+        assert_eq!(h.core.stats.seal_tail_kept, 1);
+        // The sealed stream: a new batch of it is refused, not installed.
+        h.core.ship.max_epoch = 1;
+        h.core.epoch.open = true;
+        h.core.bk.ahead_next = Some((1, txs[2].first));
+        let installed = h.core.stats.streamed_installed;
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: batch(1, vec![txs[2].clone()]),
+        });
+        assert_eq!(refusals(&out), vec![(1, 1)], "{out:?}");
+        assert!(
+            !sends(&out)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::StreamAheadAck { .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.streamed_installed, installed);
+        assert_eq!(h.core.stats.stream_ahead_sealed_refused, 1);
+        assert_eq!(
+            Replica::streamed_tip(&h.meta, 1).unwrap(),
+            Some(txs[1].last)
+        );
+        // A later epoch of the same source (the successor's own tenure, if it
+        // were a member) is not sealed; neither is the sealed epoch's other source.
+        h.core.ship.max_epoch = 3;
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: batch(3, vec![txs[0].clone()]),
+        });
+        assert!(refusals(&out).is_empty(), "{out:?}");
+        let out = h.step(Event::Peer {
+            from: 4,
+            msg: batch(1, vec![txs[0].clone()]),
+        });
+        assert!(refusals(&out).is_empty(), "{out:?}");
+        // The seal is persisted: a restart keeps it.
+        assert_eq!(
+            Replica::sealed_streams(&h.meta).unwrap(),
+            vec![(1, 1), (1, 3), (2, 1), (2, 3)]
+        );
+    }
+
+    /// M1: a member whose own open epoch carries the tenure is a live hold:
+    /// it refuses the seal and seals nothing.
+    #[test]
+    fn a_member_refuses_a_kept_seal_while_its_epoch_carries_the_tenure() {
+        let txs = owner_rows(2);
+        let mut h = member_with(&[1, 2, 3], (1, 1), &[(1, 1, &txs)]);
+        h.core.epoch.open = true;
+        h.core.pr.carried = Some(Carrier {
+            node: 1,
+            epoch: 1,
+            expires_unix_ms: 9,
+        });
+        let key = lease_of(1, 1, 0).renewal_key();
+        let out = kept_seal(&mut h, 3, 1, (1, 1), key);
+        let (held, got, _, sealed, refused) = answer(&out).expect("answered");
+        assert!(!held && got.is_empty() && sealed.is_empty());
+        assert_eq!(refused, Some(SealRefusal::EpochOpen));
+        assert_eq!(h.core.stats.seal_kept_refused_epoch_open, 1);
+        assert!(Replica::sealed_streams(&h.meta).unwrap().is_empty());
+        // The epoch closes (the carried lease moved on): the same ask is answered.
+        h.core.epoch.open = false;
+        let out = kept_seal(&mut h, 3, 1, (1, 1), key);
+        let (held, got, ..) = answer(&out).expect("answered");
+        assert!(held);
+        assert_eq!(got.len(), 2);
+    }
+
+    /// M1 (stale key): a member that saw a renewal of the tenure's lease newer
+    /// than the claimant's key refuses: the claim's CAS cannot land, and
+    /// sealing would stall a healthy holder's stream.
+    #[test]
+    fn a_member_refuses_a_kept_seal_behind_a_newer_renewal_it_saw() {
+        let txs = owner_rows(1);
+        let mut h = member_with(&[1, 2, 3], (1, 1), &[(1, 1, &txs)]);
+        let seen = Lease {
+            holder_wait_ms: 500,
+            ..lease_of(1, 1, 500)
+        };
+        h.core.lease.last_seen = Some(seen.clone());
+        let stale = Lease {
+            holder_wait_ms: 100,
+            ..lease_of(1, 1, 100)
+        }
+        .renewal_key();
+        let out = kept_seal(&mut h, 3, 1, (1, 1), stale);
+        let (held, _, _, sealed, refused) = answer(&out).expect("answered");
+        assert!(!held && sealed.is_empty());
+        assert_eq!(refused, Some(SealRefusal::StaleKey));
+        assert_eq!(h.core.stats.seal_kept_refused_stale_key, 1);
+        assert!(Replica::sealed_streams(&h.meta).unwrap().is_empty());
+        let out = kept_seal(&mut h, 3, 1, (1, 1), seen.renewal_key());
+        assert!(answer(&out).is_some_and(|a| a.0));
+    }
+
+    /// M3: a hold handed to a transferee journaled under the epoch above the
+    /// tenure's, as the transferee's stream. The member lists it by the epoch
+    /// row's recorded carrier, and seals it; a stream of a node no carrying
+    /// row names, and one of an epoch whose carrier is another tenure, are
+    /// neither listed nor sealed. Fails on the parent: a member copy and the
+    /// role tail were the only things listed, by epoch.
+    #[test]
+    fn a_handed_over_holds_rows_are_listed_by_carrier() {
+        let a = owner_rows(2);
+        let mut h = member_with(
+            &[1, 2, 3],
+            (1, 5),
+            &[(5, 1, &a[..1]), (6, 3, &a[1..]), (6, 9, &a[..1])],
+        );
+        // Another tenure of node 1 (epoch 4), carried by another epoch.
+        h.meta
+            .persist_epoch(
+                "e0",
+                &[1, 2, 7],
+                &Default::default(),
+                3,
+                "closed",
+                Some((1, 4)),
+            )
+            .unwrap();
+        let key = lease_of(1, 5, 0).renewal_key();
+        let at5 = answer(&kept_seal(&mut h, 4, 5, (1, 5), key)).expect("answered");
+        assert_eq!(
+            at5.1.iter().map(|t| t.first).collect::<Vec<_>>(),
+            vec![a[0].first]
+        );
+        assert_eq!(at5.2, vec![vec![1, 2, 3]], "the carrying row only");
+        assert_eq!(at5.3, vec![(5, 1), (6, 3)], "streams with rows, by carrier");
+        let at6 = answer(&kept_seal(&mut h, 4, 6, (1, 5), key)).expect("answered");
+        assert_eq!(
+            at6.1.iter().map(|t| t.first).collect::<Vec<_>>(),
+            vec![a[1].first]
+        );
+        let sealed = Replica::sealed_streams(&h.meta).unwrap();
+        assert!(sealed.contains(&(6, 3)) && sealed.contains(&(5, 3)) && sealed.contains(&(6, 1)));
+        assert!(
+            !sealed.iter().any(|(_, s)| *s == 9 || *s == 7),
+            "not a member of a carrying row: {sealed:?}"
+        );
+    }
+
+    /// M1 (NAK): a hold owner that hears every other member of its epoch seal
+    /// its stream can no longer commit anything: it ends as deposed (parked
+    /// answers abort); while one member can still acknowledge it goes on.
+    #[test]
+    fn a_hold_owner_hears_a_sealed_member_and_ends_its_hold() {
+        let mut h = Harness::with(1, true);
+        h.hold(1, None);
+        h.core.lease.adopt_epoch_hold(h.clk(), 1);
+        h.core.pr.epoch_members = vec![1, 2, 3];
+        h.core.epoch = EpochState {
+            open: true,
+            active: true,
+            ..Default::default()
+        };
+        let (rid, out) = create_nowait(&mut h, 1, "f");
+        assert!(
+            replies(&out).is_empty(),
+            "the answer waits for a member: {out:?}"
+        );
+        let refuse = |h: &mut Harness, from: NodeId, epoch: Epoch, sealed: bool| {
+            h.step(Event::Peer {
+                from,
+                msg: PeerMsg::StreamAheadRefused { epoch, sealed },
+            })
+        };
+        // Ignored: not sealed, another epoch, not a member.
+        refuse(&mut h, 2, 1, false);
+        refuse(&mut h, 2, 9, true);
+        refuse(&mut h, 8, 1, true);
+        assert!(h.core.lease.epoch_held());
+        refuse(&mut h, 2, 1, true);
+        assert!(h.core.lease.epoch_held(), "member 3 can still acknowledge");
+        let out = refuse(&mut h, 3, 1, true);
+        assert!(!h.core.lease.epoch_held() && h.core.lease.lost);
+        assert_eq!(h.core.stats.hold_ended_sealed, 1);
+        // The epoch is sealed here, as a claimant's seal of it would: the node
+        // claims the lease again at the epoch above, from its journal's copy.
+        assert_eq!(h.core.bk.sealed, 1);
+        assert_eq!(h.meta.backup_sealed_epoch().unwrap(), 1);
+        let answered = replies(&out);
+        assert!(
+            answered.iter().all(|(r, rep)| *r != rid
+                || !matches!(rep, ClientReply::Outcome(MutateOutcome::Accepted { .. }))),
+            "the parked answer is not given: {out:?}"
+        );
     }
 }
 

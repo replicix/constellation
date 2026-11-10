@@ -1571,10 +1571,9 @@ pub trait PeerService: Send + Sync + 'static {
         &self,
         _claimant: u64,
         req_id: u64,
-        epoch: u64,
-        _config_version: u64,
-        _from_seq: u64,
+        (epoch, _config_version, _from_seq): (u64, u64, u64),
         _key: crate::LeaseKeyWire,
+        _kept: (bool, (u64, u64)),
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::SealedTail {
@@ -1585,6 +1584,9 @@ pub trait PeerService: Send + Sync + 'static {
                 txs: Vec::new(),
                 through: 0,
                 next: None,
+                members: Vec::new(),
+                sealed: Vec::new(),
+                refused: 0,
             }
         })
     }
@@ -1727,6 +1729,9 @@ pub trait PeerService: Send + Sync + 'static {
     /// Plan 46 M1.4 step 1: an epoch member holds the hold owner's journal
     /// through `through`. Default ignores it.
     fn stream_ahead_ack(&self, _from: u64, _epoch: u64, _through: u64) {}
+    /// ADR-51: an epoch member sealed the hold owner's stream for a
+    /// claimant and refuses its batches. Default ignores it.
+    fn stream_ahead_refused(&self, _from: u64, _epoch: u64, _sealed: bool) {}
     /// Plan 37 §8: the holder this node backs is being replaced on its
     /// own state dir; hold the seal watch (`Payload::BackupHold`).
     /// Default ignores it.

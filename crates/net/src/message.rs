@@ -866,6 +866,11 @@ pub enum Payload {
         from_seq: u64,
         /// The renewal key of the lease the claimant read.
         key: LeaseKeyWire,
+        /// ADR-51: a kept fetch (the claimant collects the committed rows
+        /// the member kept of the hold streams of tenure `tenure`).
+        kept: bool,
+        /// ADR-51: the tenure `(holder, lease epoch)` a kept fetch is for.
+        tenure: (u64, u64),
     },
     /// The member's answer: `txs` is postcard of `Vec<BackupTx>` (a batch
     /// of `backup_batch_rows`; `next`: ask again from there), `through`
@@ -881,6 +886,15 @@ pub enum Payload {
         txs: Vec<u8>,
         through: u64,
         next: Option<u64>,
+        /// ADR-51: the member sets of the epochs this node belonged to that
+        /// carried the tenure (a kept request's answer).
+        members: Vec<Vec<u64>>,
+        /// ADR-51: the streams `(epoch, source)` this node sealed.
+        sealed: Vec<(u64, u64)>,
+        /// ADR-51: why a kept request was refused (0: not refused; 1: the
+        /// member's own epoch carries the tenure; 2: the claimant's key is
+        /// older than a renewal the member saw).
+        refused: u8,
     },
     /// Plan 46 M1.4 step 1: an epoch member tells the hold owner it holds
     /// the owner's journal of `epoch` through `through` (its store
@@ -900,6 +914,14 @@ pub enum Payload {
     },
     ReplayReply {
         reply: crate::reconcile::ReplayReply,
+    },
+    /// ADR-51: an epoch member refuses the hold owner's `StreamAhead`
+    /// batches of `epoch`: it sealed the stream for a claimant (`sealed`),
+    /// installs nothing more of it and acknowledges nothing. One-way.
+    StreamAheadRefused {
+        from: u64,
+        epoch: u64,
+        sealed: bool,
     },
 }
 

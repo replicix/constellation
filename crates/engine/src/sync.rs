@@ -108,13 +108,18 @@ impl From<SyncFailure> for String {
 /// the tail, whether it proved it holds nothing of the epoch (plan 46 M0.3
 /// G), a batch of it, the last journal seq of its contiguous hold, and
 /// where the next batch starts.
-pub type SealTailAnswer = (
-    bool,
-    bool,
-    Vec<constellation_meta::BackupTx>,
-    u64,
-    Option<u64>,
-);
+#[derive(Debug, Default)]
+pub struct SealTailAnswer {
+    pub held: bool,
+    pub empty: bool,
+    pub txs: Vec<constellation_meta::BackupTx>,
+    pub through: u64,
+    pub next: Option<u64>,
+    /// ADR-51 (a kept request's answer).
+    pub members: Vec<Vec<u64>>,
+    pub sealed: Vec<(u64, u64)>,
+    pub refused: u8,
+}
 
 /// A delegation backup's answer to a seal: `(sealed, tail, previous roots still
 /// owed)`.
@@ -485,6 +490,8 @@ pub enum SyncRequest {
         config_version: u64,
         from_seq: u64,
         key: constellation_store_s3::RenewalKey,
+        kept: bool,
+        tenure: (u64, u64),
         reply: tokio::sync::oneshot::Sender<SealTailAnswer>,
     },
     /// Plan 30 §M11 phase 2b: the live write designations `(dir,
@@ -581,6 +588,12 @@ pub enum SyncRequest {
         from: u64,
         epoch: u64,
         through: u64,
+    },
+    /// ADR-51: an epoch member sealed the hold owner's stream.
+    PeerStreamAheadRefused {
+        from: u64,
+        epoch: u64,
+        sealed: bool,
     },
     /// The lease holder's off-core liveness heartbeat, stamped with its
     /// arrival (this node's wait clock, ms): `Event::HolderAlive`, with the beat's number
