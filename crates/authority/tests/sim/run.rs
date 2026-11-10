@@ -1432,6 +1432,9 @@ pub struct Report {
     pub unsettled_nonstealable_holder: usize,
     pub unsettled_examples: Vec<String>,
     pub unsettled_causes: BTreeMap<String, usize>,
+    /// Sync-on-silence C1: the unsettled `EIO`s whose generation tail the
+    /// root could not reach, by the class `Reach::silence_class` gives.
+    pub unsettled_silence: BTreeMap<String, usize>,
     /// Every unsettled `EIO`, its cause and description, kept only with
     /// `AUTHORITY_SIM_UNSETTLED_ALL` (a sweep prints them, to compare the
     /// verdicts of two classifiers EIO by EIO).
@@ -4496,6 +4499,9 @@ fn count_unsettled(oracles: &super::oracle::Oracles, report: &mut Report) -> Vec
     report.unsettled_violations = bad.len();
     for u in all.iter() {
         *report.unsettled_causes.entry(u.cause()).or_default() += 1;
+        if let Some(c) = &u.silence {
+            *report.unsettled_silence.entry(c.clone()).or_default() += 1;
+        }
     }
     report.unsettled_examples = bad.iter().take(5).cloned().collect();
     if std::env::var_os("AUTHORITY_SIM_UNSETTLED_ALL").is_some() {

@@ -164,6 +164,10 @@ pub struct Unsettled {
     /// holder, counted apart from the reachability classes and never a
     /// violation (`Stats::unsettled_nonstealable_holder`).
     pub designation_held: bool,
+    /// Sync-on-silence C1: for an EIO of a generation tail the root could
+    /// not reach, whether a strict member was silent before the delegate
+    /// went down (`Reach::silence_class`).
+    pub silence: Option<String>,
 }
 
 impl Unsettled {
@@ -492,13 +496,15 @@ impl Oracles {
         } else {
             self.owner_timeline(node, rid, from_ms, at)
         };
-        let verdict = self.reach.classify(super::reach::Question {
+        let question = super::reach::Question {
             requester: node,
             from_ms,
             to_ms: at,
             owners,
             born,
-        });
+        };
+        let verdict = self.reach.classify(question.clone());
+        let silence = self.reach.silence_class(&question, &verdict);
         self.unsettled.lock().unwrap().push(Unsettled {
             node,
             rid,
@@ -506,6 +512,7 @@ impl Oracles {
             window_ms: window_ms.max(at.saturating_sub(started.unwrap_or(at))),
             verdict,
             designation_held,
+            silence,
         });
     }
 
