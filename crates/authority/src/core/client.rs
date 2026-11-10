@@ -48,7 +48,8 @@ pub(crate) enum Origin {
 
 /// Late-landing F1: a settle's withdrawal of the rid's inbox batches. The
 /// tombstones are written one at a time alongside the settle, which leaves at
-/// once; only the unsettled `EIO` and the inbox route wait for them.
+/// once, after a freshness bound (`Deadlines::inbox_read_fresh`); only the
+/// unsettled `EIO` and the inbox route wait for them.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SettleWithdraw {
     /// The batch whose tombstone is being written.
@@ -64,6 +65,9 @@ pub(crate) struct SettleWithdraw {
     /// The settle's route reached the inbox (the epoch of the holder it
     /// learned, and the holder) and waits for the last acknowledgement.
     pub route_waiting: Option<(Epoch, NodeId)>,
+    /// The first tombstone has been issued (`Deadlines::inbox_read_fresh`
+    /// after `T_d`, unless the forward's was in flight already).
+    pub started: bool,
 }
 
 impl SettleWithdraw {
@@ -1501,7 +1505,7 @@ impl Core {
                     && self
                         .clients
                         .get(&rid)
-                        .is_some_and(|c| c.withdraw.is_some_and(|w| w.unacked()))
+                        .is_some_and(|c| c.withdraw.is_some_and(|w| w.unacked() && w.started))
                 {
                     // A settle's inbox route waits for its tombstones (U1):
                     // the last acknowledgement sends it on
@@ -4287,10 +4291,15 @@ impl Core {
     /// the batch. A settled answer needs no tombstone (the refusal is a
     /// committed row the batch's drain dedups on), so the settle itself leaves
     /// at once; only the inbox route, which puts a new batch beside the old
-    /// ones, waits for the acknowledgements. Until `T_d` plus a window a
-    /// failing tombstone is tried again.
+    /// ones, waits for the acknowledgements. The first tombstone is written
+    /// a freshness bound after the first deadline, not at it: until then the
+    /// batch is still the op's quickest way to a sequencer (a holder reached
+    /// only through S3 runs it, and the settle finds the outcome), and a
+    /// tombstone over it turns that outcome into a refusal the settle has
+    /// to fetch from scratch. The window of the tombstones counts from there.
+    /// A failing tombstone is tried again until a window after the first.
     fn settle_withdraw_first(&mut self, now: Now, rid: Rid, out: &mut Vec<Action>) {
-        let window = self.dl_t().settle_window;
+        let (window, f) = (self.dl_t().settle_window, self.dl_t().inbox_read_fresh);
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
@@ -4304,18 +4313,25 @@ impl Core {
             c.phase = Phase::Backoff;
         }
         let several = c.inbox_keys.len() > 1;
-        let deadline = now.wait.plus(window);
+        // (The forward's tombstone, in flight already, is not held back.)
+        let delay = if under_way { 0 } else { f };
+        let deadline = now.wait.plus(delay + window);
         c.withdraw = Some(SettleWithdraw {
             in_flight: key,
             deadline,
             acked_at: None,
             retry: None,
             route_waiting: None,
+            started: delay == 0,
         });
         self.inbox.pending.remove(&rid);
         self.stats.settles_withdrawn_first += 1;
         if several {
             self.stats.settle_multi_batch_withdrawals += 1;
+        }
+        if delay > 0 {
+            self.arm_withdraw_timer(rid, now.wait.plus(delay), out);
+            return;
         }
         self.arm_withdraw_timer(rid, deadline, out);
         if !under_way {
@@ -4455,6 +4471,12 @@ impl Core {
             return;
         }
         let (key, deadline) = (w.in_flight, w.deadline);
+        if !w.started {
+            w.started = true;
+            self.arm_withdraw_timer(rid, deadline, out);
+            self.issue_tombstone(now, rid, key, out);
+            return;
+        }
         if now.wait >= deadline {
             self.settle_withdraw_gave_up(now, rid, replica, out);
             return;
