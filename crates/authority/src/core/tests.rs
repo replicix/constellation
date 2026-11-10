@@ -46462,6 +46462,59 @@ mod deleg_group {
         assert!(answer_to_2(&out, 501).is_some(), "{out:?}");
     }
 
+    /// The same once this node holds the lease: a delegate whose own
+    /// client's row the root never acknowledged takes the root over as a
+    /// lone root (nothing gates its root rows), and the op's deadline
+    /// fires before or after the takeover gate re-appends the row. The
+    /// holder's `settled_outcome` answered from the root journal's
+    /// position, which a lone root's `ack_need` never gates: the row on
+    /// this disk alone (`long-delegated` seeds 255 and 865 under slow lease
+    /// reads, I1). Settled once the new tenure ships the row. Fails before:
+    /// answered in both cases.
+    #[test]
+    fn a_holders_settled_outcome_does_not_answer_its_own_uncommitted_delegate_row() {
+        for gate_done in [false, true] {
+            let (mut h, dir, _, _) = delegate_renewed_once();
+            root_is_near(&mut h);
+            let (rid, out) = own_create(&mut h, dir, 1);
+            assert!(client_answers(&out).is_empty(), "{out:?}");
+            assert!(batch(&out).is_some(), "the row streams to the root");
+            h.hold(
+                2,
+                Some(PendingGate {
+                    epoch: 2,
+                    takeover: true,
+                    marker_shipped: true,
+                    drained: false,
+                    fast_prev: false,
+                    backup_tail_epoch: Some(1),
+                    shippable: true,
+                }),
+            );
+            h.core.ack.eligible = Some(false);
+            assert_eq!(h.core.durable_jseq(), u64::MAX, "a lone root gates nothing");
+            if gate_done {
+                let mut out = Vec::new();
+                h.core.complete_gate(h.clk(), &h.meta, &mut out);
+                assert_eq!(h.core.stats.own_deleg_rows_reappended, 1);
+            }
+            assert!(
+                h.core.settled_outcome(rid, &h.meta).is_none(),
+                "(gate done {gate_done}) settled from a row only this disk holds"
+            );
+            if gate_done {
+                h.core
+                    .ack
+                    .shipped_rows
+                    .insert(h.meta.journal_tip().unwrap());
+                assert!(
+                    h.core.settled_outcome(rid, &h.meta).is_some(),
+                    "settled once the new tenure shipped the row"
+                );
+            }
+        }
+    }
+
     /// The requester's deadline settles a rid from the delegate's own
     /// journal only when its row is committed: an uncommitted `DelegateNodeGroup`
     /// row is not an outcome the generation's end will keep (D6).
