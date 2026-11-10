@@ -159,6 +159,12 @@ pub struct Config {
     /// `sticky_ends_only_by_holder_or_operator` must then fail the run.
     pub partial_release_ends_stream: bool,
     /// Fault injection for the simulation's negative control (never set by
+    /// the engine): a node runs a forward under one of its generations
+    /// whatever generation the forward was routed by (ADR-47 without the
+    /// delegate fence). The sim's `nonholder_refused_a_designee_ran` must
+    /// then fail `sticky-stale-route`.
+    pub fence_accepts_unrouted: bool,
+    /// Fault injection for the simulation's negative control (never set by
     /// the engine): the operator's abandon of a non-stealable stream ends it
     /// at once, without recalling or waiting out the read delegations its
     /// holder granted (plan 46 M1.3 step 13, C11, the model's
@@ -590,6 +596,7 @@ impl Config {
             holder_releases_before_drain: false,
             refuse_forwarded_designation_ops: false,
             partial_release_ends_stream: false,
+            fence_accepts_unrouted: false,
             abandon_skips_read_recall: false,
             ttl_ms,
             expiry_margin_ms: 1_000,
@@ -950,6 +957,9 @@ pub struct Stats {
     /// delegate, parked for `deps` / an unrenewed grant, and answered
     /// `NotHolder` because the delegation ended.
     pub deleg_executed: u64,
+    /// ADR-47: forwards a delegate answered `Fenced` (not routed by the
+    /// generation it holds the keys under; nothing parked or journaled).
+    pub deleg_fenced_forwards: u64,
     pub deleg_forwarded: u64,
     pub deleg_deps_waits: u64,
     pub deleg_parked_expired: u64,

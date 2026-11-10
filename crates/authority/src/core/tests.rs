@@ -4141,7 +4141,7 @@ fn replay_copy_at(h: &mut Harness, from: NodeId, rid: Rid, op: MutateOp) -> Muta
             applied: 0,
             tag: Default::default(),
             settle: false,
-            routed_gen: 0,
+            routed_gen: 7,
             touched_gen: 0,
         },
     });
@@ -34130,7 +34130,7 @@ mod s3_no_loops {
                 applied: 0,
                 tag: Default::default(),
                 settle,
-                routed_gen: 0,
+                routed_gen: 7,
                 touched_gen: 0,
             },
         })
@@ -35015,7 +35015,7 @@ fn a_delegate_reply_base_covers_what_it_applied_before_the_grant_and_streamed_st
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
-                routed_gen: 0,
+                routed_gen: 1,
                 touched_gen: 0,
             },
         });
@@ -44192,7 +44192,7 @@ mod stream_end {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
-                routed_gen: 0,
+                routed_gen: 7,
                 touched_gen: 0,
             },
         });
@@ -44784,7 +44784,7 @@ mod deleg_group {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
-                routed_gen: 0,
+                routed_gen: 7,
                 touched_gen: 0,
             },
         })
@@ -44987,7 +44987,7 @@ mod deleg_group {
                     applied: 0,
                     tag: Default::default(),
                     settle: true,
-                    routed_gen: 0,
+                    routed_gen: 7,
                     touched_gen: 0,
                 },
             })
@@ -46357,7 +46357,7 @@ mod deleg_group {
                     applied: 0,
                     tag: Default::default(),
                     settle: false,
-                    routed_gen: 0,
+                    routed_gen: 7,
                     touched_gen: 0,
                 },
             })
@@ -46449,7 +46449,7 @@ mod deleg_group {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
-                routed_gen: 0,
+                routed_gen: 8,
                 touched_gen: 0,
             },
         });
@@ -60226,7 +60226,7 @@ mod await_retry {
                     applied: 0,
                     tag: Default::default(),
                     settle: false,
-                    routed_gen: 0,
+                    routed_gen: 7,
                     touched_gen: 0,
                 },
             })
@@ -67560,5 +67560,292 @@ mod route_fence_carriage {
             });
         }
         assert_eq!(h.core.in_doubt_evicted_max, None);
+    }
+}
+
+/// ADR-47, the delegate fence: a node runs (or parks) a forward under one
+/// of its generations only if the forward was routed by that generation.
+mod route_fence_executor {
+    use super::*;
+    use crate::replica::Replica;
+    use constellation_meta::{Position, SubtreeKind};
+
+    /// Node 3, the designee of sticky generation 7 over `/d1`, installed and
+    /// honoured; the lease holder is node 1.
+    fn designee() -> (Harness, constellation_fs_core::Ino) {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let records = vec![
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "d1".into(),
+                ino,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+            LogRecord::DelegateNode {
+                node: 3,
+                gen: 7,
+                dirs: vec![constellation_meta::SubtreeGrant {
+                    dir: ino,
+                    kind: SubtreeKind::Sticky,
+                }],
+            },
+        ];
+        Replica::install_streamed(&h.meta, 1, 1, 1, 2, &records, true, (0, 0)).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine[&7].non_stealable);
+        (h, ino)
+    }
+
+    /// A create in `dir` from `from`, forwarded as request `req`.
+    fn forward(
+        h: &mut Harness,
+        dir: constellation_fs_core::Ino,
+        from: NodeId,
+        req: u64,
+        (seq, settle): (u64, bool),
+        (routed_gen, touched_gen): (u64, u64),
+        deps: Position,
+    ) -> Vec<Action> {
+        let op = MutateOp::Create {
+            parent: dir,
+            name: format!("f{seq}"),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        h.step(Event::Peer {
+            from,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: Rid {
+                    node: from,
+                    incarnation: 1,
+                    seq,
+                },
+                op,
+                acked_through: 0,
+                deps,
+                applied: 0,
+                tag: Default::default(),
+                settle,
+                routed_gen,
+                touched_gen,
+            },
+        })
+    }
+
+    fn outcome_to(out: &[Action], to: NodeId) -> Option<MutateOutcome> {
+        sends(out).into_iter().find_map(|(t, m)| match m {
+            PeerMsg::MutateReply { outcome, .. } if t == to => Some(outcome.clone()),
+            _ => None,
+        })
+    }
+
+    fn ran(h: &Harness, from: NodeId, seq: u64) -> bool {
+        let rid = Rid {
+            node: from,
+            incarnation: 1,
+            seq,
+        };
+        h.meta.recent_outcome(rid).is_some()
+            || h.meta.completed_outcome(rid).ok().flatten().is_some()
+    }
+
+    /// S7 at the designee: a requester whose route cache names the former
+    /// lease holder, now the designee, forwards routed by no generation. The
+    /// designee does not run it (a run whose answer is lost is a rid the
+    /// root later refuses for good): `Fenced`, nothing journaled. Fails on
+    /// the parent: the designee runs it.
+    #[test]
+    fn a_designee_fences_a_forward_routed_by_the_lease_holder() {
+        let (mut h, d1) = designee();
+        let out = forward(&mut h, d1, 2, 1, (1, false), (0, 0), Position::ZERO);
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Fenced { gen: 7 }),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.deleg_fenced_forwards, 1);
+        assert_eq!(h.core.dl.mine[&7].executed, 0);
+        assert!(h.core.dl.mine[&7].parked.is_empty());
+        assert!(!ran(&h, 2, 1), "the designee ran the unrouted forward");
+        // Routed by its generation, the same forward runs.
+        let out = forward(&mut h, d1, 2, 2, (1, false), (7, 7), Position::ZERO);
+        assert!(
+            matches!(outcome_to(&out, 2), Some(MutateOutcome::Accepted { .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.core.dl.mine[&7].executed, 1);
+        assert_eq!(h.core.stats.deleg_fenced_forwards, 1);
+    }
+
+    /// The negative control: without the fence (`fence_accepts_unrouted`) the
+    /// designee runs the unrouted forward, which is S7's first half.
+    #[test]
+    fn an_unfenced_designee_runs_the_forward_the_lease_holder_routed() {
+        let (mut h, d1) = designee();
+        h.core.cfg.fence_accepts_unrouted = true;
+        let out = forward(&mut h, d1, 2, 1, (1, false), (0, 0), Position::ZERO);
+        assert!(
+            matches!(outcome_to(&out, 2), Some(MutateOutcome::Accepted { .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.core.dl.mine[&7].executed, 1);
+        assert_eq!(h.core.stats.deleg_fenced_forwards, 0);
+    }
+
+    /// A forward routed by an older generation is fenced too, and one
+    /// routed by a generation of another range.
+    #[test]
+    fn a_designee_fences_a_forward_routed_by_an_older_generation() {
+        let (mut h, d1) = designee();
+        for (req, routed) in [(1, 5), (2, 8)] {
+            let out = forward(
+                &mut h,
+                d1,
+                2,
+                req,
+                (req, false),
+                (routed, routed),
+                Position::ZERO,
+            );
+            assert_eq!(
+                outcome_to(&out, 2),
+                Some(MutateOutcome::Fenced { gen: 7 }),
+                "{out:?}"
+            );
+        }
+        assert_eq!(h.core.stats.deleg_fenced_forwards, 2);
+        assert_eq!(h.core.dl.mine[&7].executed, 0);
+    }
+
+    /// A settle routed by another generation is fenced before the
+    /// settle-drops-the-attempt's-park step: the matching attempt's park
+    /// stays.
+    #[test]
+    fn a_fenced_settle_keeps_the_matching_attempts_park() {
+        let (mut h, d1) = designee();
+        // An attempt routed by 7 whose dependencies this node has not reached
+        // parks.
+        let ahead = Position {
+            seq: 99,
+            ..Position::ZERO
+        };
+        let out = forward(&mut h, d1, 2, 1, (1, false), (7, 7), ahead);
+        assert!(outcome_to(&out, 2).is_none(), "{out:?}");
+        assert_eq!(h.core.dl.mine[&7].parked.len(), 1);
+        // Its settle, routed 0: fenced, the park untouched.
+        let out = forward(&mut h, d1, 2, 2, (1, true), (0, 7), Position::ZERO);
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Fenced { gen: 7 }),
+            "{out:?}"
+        );
+        assert_eq!(h.core.dl.mine[&7].parked.len(), 1);
+        assert_eq!(h.core.stats.settle_dropped_parks, 0);
+        // The settle routed by 7 drops it, as before.
+        forward(&mut h, d1, 2, 3, (1, true), (7, 7), Position::ZERO);
+        assert!(h.core.dl.mine[&7].parked.is_empty());
+        assert_eq!(h.core.stats.settle_dropped_parks, 1);
+    }
+
+    /// The delegate's own ops are never fenced.
+    #[test]
+    fn a_designees_own_op_is_not_fenced() {
+        let (mut h, d1) = designee();
+        let rid = h.rid(1);
+        let op = MutateOp::Create {
+            parent: d1,
+            name: "own".into(),
+            ino: h.meta.allocate_ino(d1).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        assert_eq!(h.core.stats.deleg_fenced_forwards, 0);
+        assert_eq!(h.core.dl.mine[&7].executed, 1);
+    }
+
+    /// S7 at the requester: its cache names the designee (its table lags),
+    /// the forward routed 0 comes back `Fenced`; it is sent again routed by
+    /// the generation, which touches the rid. If the answer to that is lost
+    /// and the root, which cannot reach the designee, refuses the retry,
+    /// the refusal is held, not the client's answer: the designee may have
+    /// run it. Fails on the parent: the resend is not known to be a send
+    /// to a designee, and the client hears `EROFS`.
+    #[test]
+    fn a_stale_cache_forward_is_resent_by_the_generation_and_never_refused_for_good() {
+        let mut h = Harness::new(2);
+        h.core.lease.cached_holder = Some(3);
+        let rid = h.rid(1);
+        let op = h.create("a");
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        let (to, req, routed) = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest {
+                    req, routed_gen, ..
+                } => Some((to, *req, *routed_gen)),
+                _ => None,
+            })
+            .expect("forwarded");
+        assert_eq!((to, routed), (3, 0));
+        let reply = |from: NodeId, req: OpId, outcome: MutateOutcome, gen: u64| Event::Peer {
+            from,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome,
+                base: None,
+                position: Position::ZERO,
+                gen,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+            },
+        };
+        let out = h.step(reply(3, req, MutateOutcome::Fenced { gen: 7 }, 7));
+        let (to, req, routed, touched) = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest {
+                    req,
+                    routed_gen,
+                    touched_gen,
+                    ..
+                } => Some((to, *req, *routed_gen, *touched_gen)),
+                _ => None,
+            })
+            .expect("resent");
+        assert_eq!((to, routed, touched), (3, 7, 7), "{out:?}");
+        assert!(h.core.clients[&rid].sent_to_delegate);
+        // The root's refusal of the retry is not the client's answer.
+        let out = h.step(reply(
+            1,
+            req,
+            MutateOutcome::Errno(constellation_types::Code::ReadOnly),
+            0,
+        ));
+        assert!(replies(&out).is_empty(), "{out:?}");
+        assert!(h.core.clients[&rid].designation_held);
     }
 }

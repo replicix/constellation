@@ -1998,7 +1998,6 @@ fn sticky_stale_route_config() -> SimConfig {
 /// ADR-47: S7's shape passes only once an executor fences an unrouted
 /// forward (C4).
 #[test]
-#[ignore = "fence C4"]
 fn sticky_stale_route_passes_with_the_fence() {
     for seed in 0..25 {
         run_seed(seed, sticky_stale_route_config()).unwrap_or_else(|e| {
@@ -8113,6 +8112,7 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "inherited_tails_cleared",
             "ttl_claims_without_tail",
             "touched_unknown_submits",
+            "deleg_fenced_forwards",
         ],
     );
     blake3::hash(text.as_bytes()).to_hex().to_string()[..16].to_string()
@@ -8378,6 +8378,15 @@ impl OracleTotals {
             r.segments_landed.1,
             r.segments_landed.2,
             r.stats.values().map(|s| s.deleg_deps_waits).sum::<u64>()
+        );
+        // ADR-47: the delegate fence's counters, per seed (`SWEEP-FENCE`).
+        eprintln!(
+            "SWEEP-FENCE {label} seed {seed}: fenced {} resends {} bounce-limit {} held {} unsettled-eio {}",
+            r.stats.values().map(|s| s.deleg_fenced_forwards).sum::<u64>(),
+            r.stats.values().map(|s| s.fenced_resends).sum::<u64>(),
+            r.stats.values().map(|s| s.fence_bounce_limit).sum::<u64>(),
+            r.stats.values().map(|s| s.designation_refusals_held).sum::<u64>(),
+            r.stats.values().map(|s| s.client_unsettled_eio).sum::<u64>()
         );
         self.unsourced += r.acks_unsourced;
         self.unjournaled_landed += r.unjournaled_landed;

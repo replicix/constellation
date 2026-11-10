@@ -510,6 +510,11 @@ pub struct SimConfig {
     /// `AUTHORITY_SIM_REFUSE_FORWARDED_DESIGNATION_OPS=1` sets it on every
     /// configuration; `sticky-ttl` then fails (`refused_and_completed`, I1).
     pub refuse_forwarded_designation_ops: bool,
+    /// Negative control (`Config::fence_accepts_unrouted`): a node runs a
+    /// forward under its generation whatever generation it was routed by (no
+    /// delegate fence). `AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED=1` sets it on
+    /// every configuration.
+    pub fence_accepts_unrouted: bool,
     /// Negative control (`Config::partial_release_ends_stream`): the root
     /// ends a sticky stream at the holder's release of some of its
     /// subtrees (MUST-1). `AUTHORITY_SIM_PARTIAL_RELEASE_ENDS_STREAM=1` sets
@@ -1111,6 +1116,8 @@ impl Default for SimConfig {
                 "AUTHORITY_SIM_REFUSE_FORWARDED_DESIGNATION_OPS",
             )
             .is_some_and(|v| v == "1"),
+            fence_accepts_unrouted: std::env::var_os("AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED")
+                .is_some_and(|v| v == "1"),
             partial_release_ends_stream: std::env::var_os(
                 "AUTHORITY_SIM_PARTIAL_RELEASE_ENDS_STREAM",
             )
@@ -4741,6 +4748,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         ttl_reclaims_sticky: cfg.ttl_reclaims_sticky,
         holder_releases_before_drain: cfg.holder_releases_before_drain,
         refuse_forwarded_designation_ops: cfg.refuse_forwarded_designation_ops,
+        fence_accepts_unrouted: cfg.fence_accepts_unrouted,
         partial_release_ends_stream: cfg.partial_release_ends_stream,
         abandon_skips_read_recall: cfg.abandon_skips_read_recall,
         plant_claim_root_group_on_lone: cfg.plant_claim_root_group_on_lone,

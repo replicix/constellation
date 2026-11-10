@@ -452,6 +452,8 @@ pub struct NodeEnv {
     pub holder_releases_before_drain: bool,
     /// See `SimConfig::refuse_forwarded_designation_ops`.
     pub refuse_forwarded_designation_ops: bool,
+    /// See `SimConfig::fence_accepts_unrouted`.
+    pub fence_accepts_unrouted: bool,
     /// See `SimConfig::partial_release_ends_stream`.
     pub partial_release_ends_stream: bool,
     /// See `SimConfig::abandon_skips_read_recall`.
@@ -743,6 +745,7 @@ impl NodeHandle {
         cfg.ttl_reclaims_sticky = env.ttl_reclaims_sticky;
         cfg.holder_releases_before_drain = env.holder_releases_before_drain;
         cfg.refuse_forwarded_designation_ops = env.refuse_forwarded_designation_ops;
+        cfg.fence_accepts_unrouted = env.fence_accepts_unrouted;
         cfg.partial_release_ends_stream = env.partial_release_ends_stream;
         cfg.abandon_skips_read_recall = env.abandon_skips_read_recall;
         // Plan 43 C2g: the simulation's settle window scales with its lease
