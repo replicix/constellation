@@ -15348,6 +15348,52 @@ mod backup_crash {
         assert_eq!(h.core.roster.write_eligible(), [1, 2, 3], "it adds");
     }
 
+    /// `epoch-holder-retired`: the holder read its roster ({self}) and
+    /// claimed as a singleton before node 2 registered; node 2 linked
+    /// afterwards, and the roster refresh fell with S3 cut, so node 2 never
+    /// entered the roster in hand. A link up after the roster was read is a
+    /// peer the roster cannot speak for: the holder is not lone, acks
+    /// nothing on its disk alone, and the node is a backup candidate. A link
+    /// up before the read that the read does not list is no peer. (Fails
+    /// before: `Lone`, `None`, no candidate.)
+    #[test]
+    fn a_link_up_after_the_roster_read_is_a_peer_the_roster_does_not_list() {
+        let pos = pos_5();
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1]);
+        // The read is issued at the harness clock; the claim's assessment
+        // finds nobody linked: lone.
+        h.step(roster_ev(vec![1], w(h.now)));
+        h.hold(1, None);
+        link_2(&mut h, false, None, 0);
+        h.core.ack.eligible = Some(h.core.backup_could_be_had());
+        assert_eq!(h.core.ack_need(&pos), None, "lone before the link");
+        assert!(h.core.root_lone());
+        // Node 2 links, 1 s after the read; the roster is not read again.
+        h.advance(1_000);
+        link_2(&mut h, true, Some(5), 0);
+        assert!(h.core.backup_could_be_had(), "linked, not on the roster");
+        assert_eq!(h.core.ack_need(&pos), Some(5), "not answered alone");
+        assert_ne!(
+            h.core.root_commit(Asker::Own).versionless(),
+            RowCommit::LONE
+        );
+        assert!(!h.core.root_lone());
+        // Once stable it is a backup candidate too.
+        h.advance(300);
+        assert_eq!(h.core.backup_candidates(h.clk()), vec![2]);
+        // A read issued after the link that does not list it: no peer.
+        h.advance(10);
+        h.core.ack.eligible = Some(false);
+        h.step(roster_ev(vec![1], w(h.now)));
+        assert!(!h.core.backup_could_be_had(), "read after the link");
+        assert!(h.core.backup_candidates(h.clk()).is_empty());
+        // And one that lists it: a peer again.
+        h.step(roster_ev(vec![1, 2], w(h.now)));
+        assert!(h.core.backup_could_be_had());
+        assert_eq!(h.core.backup_candidates(h.clk()), vec![2]);
+    }
+
     /// Plan 46 M1.1 step 2: the root's rule is one lookup of its
     /// configuration (the lease's version and members; the singleton test
     /// of the event), and the answer classes are its maps.

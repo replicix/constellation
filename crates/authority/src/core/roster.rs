@@ -53,6 +53,8 @@ pub(crate) struct RosterRead {
 struct ReadStamp {
     seq: u64,
     lapses: u64,
+    /// The wait clock the read was issued at (before its LIST).
+    issued: WaitMs,
 }
 
 /// See the module doc.
@@ -124,6 +126,7 @@ impl Roster {
         let stamp = ReadStamp {
             seq: read.seq,
             lapses: read.lapses,
+            issued: read.issued,
         };
         if self.installed.is_some_and(|i| read.seq <= i.seq) {
             return false;
@@ -256,6 +259,28 @@ impl Roster {
         Some(peers)
     }
 
+    /// Whether `l` is a link to a peer of `me`, for the questions of who
+    /// could back it or take over from it: a connected link to another node
+    /// that the last complete read lists as write-eligible, or that the read
+    /// cannot speak for. A read speaks only for the links up before it was
+    /// issued (a node registers before it links), so a node linked since
+    /// after the read (or whose link has no start), or any link when no
+    /// read is installed, counts as a peer, listed or not: the next read
+    /// may fail (S3 cut) and the node never enter the roster in hand. A
+    /// node the read lists as read-only, or omits although it was linked
+    /// before the read was issued, is none (it cannot take the lease, or it
+    /// left).
+    pub(crate) fn link_is_peer(&self, me: NodeId, l: &PeerLink) -> bool {
+        if l.node == me || !l.connected || self.read_only.contains(&l.node) {
+            return false;
+        }
+        if self.lists(l.node) {
+            return true;
+        }
+        let issued = self.installed.map_or(WaitMs(i64::MIN), |i| i.issued);
+        l.since.is_none_or(|since| issued < since)
+    }
+
     /// Whether `me` knows that no other node could write (ADR-50, S10-I1
     /// and S10-I3): a complete read is installed, no incomplete read is
     /// newer, no lapse of this node's is newer than the installed read, the
@@ -283,7 +308,11 @@ impl Roster {
 
     #[cfg(test)]
     pub(crate) fn mark_seen_for_test(&mut self, seen: bool) {
-        self.installed = seen.then_some(ReadStamp { seq: 0, lapses: 0 });
+        self.installed = seen.then_some(ReadStamp {
+            seq: 0,
+            lapses: 0,
+            issued: WaitMs(0),
+        });
     }
 
     #[cfg(test)]

@@ -3906,7 +3906,8 @@ impl Core {
     }
 
     /// The peers that could back this node now, listed ones included:
-    /// linked, on the roster, within the RTT budget and up for the
+    /// linked and a peer by the roster's rule ([`Roster::link_is_peer`]: a
+    /// node linked after the last read is one, listed or not), within the RTT budget and up for the
     /// stability window, oldest link first ([`Self::backup_candidates`]
     /// leaves the listed ones out).
     fn backup_peers_in_budget(&self, now: Now) -> impl Iterator<Item = NodeId> {
@@ -3917,8 +3918,7 @@ impl Core {
                 self.roster
                     .links()
                     .values()
-                    .filter(|l| l.node != self.cfg.node_id && l.connected)
-                    .filter(|l| self.roster.lists(l.node))
+                    .filter(|l| self.roster.link_is_peer(self.cfg.node_id, l))
                     .filter(|l| {
                         l.rtt_ms
                             .is_some_and(|rtt| rtt <= self.cfg.backup_rtt_budget_ms)
@@ -3936,8 +3936,9 @@ impl Core {
     }
 
     /// Whether a backup could be had (`ack.eligible`, the gate of an empty
-    /// set in `durable_jseq_held`): a roster peer linked within the RTT
-    /// budget, listed or not. One that sealed the epoch counts too (it is no
+    /// set in `durable_jseq_held`): a peer linked within the RTT budget
+    /// ([`Roster::link_is_peer`]: a roster node, or a node linked after the
+    /// roster read in hand), listed or not. One that sealed the epoch counts too (it is no
     /// candidate, `backup_select`, but it takes over with its tail, and what
     /// is acknowledged on this disk alone meanwhile is not in it; the
     /// acknowledgements wait for the archive then). A listed one
@@ -3988,9 +3989,7 @@ impl Core {
             return true;
         }
         self.roster.links().values().any(|l| {
-            l.node != self.cfg.node_id
-                && l.connected
-                && self.roster.lists(l.node)
+            self.roster.link_is_peer(self.cfg.node_id, l)
                 && l.rtt_ms
                     .is_none_or(|rtt| rtt <= self.cfg.backup_rtt_budget_ms)
         })
