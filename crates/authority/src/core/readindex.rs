@@ -232,6 +232,12 @@ struct Parked {
     /// — it executes once no entry ahead of it overlaps its keys
     /// (`Core::queue_gate_blocks`), re-read at every release.
     queue_gated: bool,
+    /// ADR-52: a singleton's answer held because a fresh clock read found
+    /// the lease unusable. `durable` is its row; it leaves when the archive
+    /// carries the row or a fresh read finds the lease usable again
+    /// (`Core::complete_ready`), and a deposition ends it in doubt
+    /// (`Core::abort_durable_parks`).
+    stale_lease: bool,
     since: WaitMs,
     what: ParkedWhat,
 }
@@ -827,6 +833,7 @@ impl Core {
                 deps,
                 stream_need: None,
                 queue_gated: false,
+                stale_lease: false,
                 since: now.wait,
                 what,
             },
@@ -858,6 +865,7 @@ impl Core {
                 deps: None,
                 stream_need: Some((gen, idx)),
                 queue_gated: false,
+                stale_lease: false,
                 since: now.wait,
                 what,
             },
@@ -2172,6 +2180,14 @@ impl Core {
                     && p.quarantine.is_none_or(|q| q <= now.wait)
                     && p.durable
                         .is_none_or(|j| self.park_released(&p.what, j, shipped, replica))
+                    // ADR-52: a singleton's answer held for a stale lease
+                    // leaves when the archive carries its row or a fresh
+                    // read finds the lease usable again (a renewal landed);
+                    // `park_durable` alone would release a lone root's own
+                    // answer at once.
+                    && (!p.stale_lease
+                        || p.durable.is_some_and(|j| self.archive_covers(j, shipped))
+                        || self.lease.usable(self.fresh_now(), &self.cfg))
                     && p.deps.as_ref().is_none_or(|d| replica.reaches_streams(d))
                     && (!p.queue_gated
                         || match &p.what {
@@ -2332,6 +2348,12 @@ impl Core {
                     }
                     _ => false,
                 };
+            // ADR-52: a singleton's answer held for a stale lease and
+            // released because the log carries its row is the archive's
+            // answer; released by a usable lease it is the singleton's it
+            // was.
+            let by_archive =
+                p.stale_lease && p.durable.is_some_and(|j| self.archive_covers(j, shipped));
             // A re-tag the store fails leaves the row gated-class: the
             // answer can claim neither that class (nothing committed the
             // row) nor `Lone` (not recorded), so the op is answered `EIO`
@@ -2401,7 +2423,9 @@ impl Core {
                     completed: _,
                     class,
                 } => {
-                    let class = if downgraded {
+                    let class = if by_archive {
+                        constellation_meta::RowCommit::ARCHIVE
+                    } else if downgraded {
                         // The row's own version (never the placeholder 0).
                         class.as_singleton(self.root_config_version())
                     } else if held_for_remote {
@@ -2448,7 +2472,9 @@ impl Core {
                     now,
                     rid,
                     outcome,
-                    AnswerSource::Sequenced(if downgraded {
+                    AnswerSource::Sequenced(if by_archive {
+                        constellation_meta::RowCommit::ARCHIVE
+                    } else if downgraded {
                         class.as_singleton(self.root_config_version())
                     } else {
                         class
@@ -2554,6 +2580,92 @@ impl Core {
                 }
             }
         }
+    }
+
+    /// ADR-52: whether any answer is held for a lease a fresh clock read
+    /// found unusable (a renewal that lands releases them).
+    pub(crate) fn has_stale_lease_parks(&self) -> bool {
+        self.rd.parked.values().any(|p| p.stale_lease)
+    }
+
+    /// ADR-52: `finish` found `rid`'s singleton answer reaches the point it
+    /// leaves on a lease a fresh clock read finds unusable: park it on its
+    /// row `seq`. A rid already held stays held (one park). Deposed
+    /// already: in doubt at once.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn park_stale_lease(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        seq: u64,
+        outcome: MutateOutcome,
+        class: constellation_meta::RowCommit,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.rd.parked.values().any(|p| {
+            p.stale_lease && matches!(&p.what, ParkedWhat::Finish { rid: r, .. } if *r == rid)
+        }) {
+            return;
+        }
+        if let Some(c) = self.clients.get_mut(&rid) {
+            c.phase = ClientPhase::Recalling;
+        }
+        let id = self.park(
+            now,
+            Default::default(),
+            Some(seq),
+            ParkedWhat::Finish {
+                rid,
+                outcome,
+                class,
+            },
+        );
+        if let Some(p) = self.rd.parked.get_mut(&id) {
+            p.stale_lease = true;
+        }
+        if self.lease.lost {
+            // The deposition ran before: nothing else would end this park.
+            self.abort_park_busy(now, id, replica, out);
+        }
+    }
+
+    /// ADR-52: [`Self::park_reply`] for a peer's singleton answer held for
+    /// a lease a fresh clock read finds unusable; returns the park.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn park_stale_reply(
+        &mut self,
+        now: Now,
+        seq: u64,
+        to: NodeId,
+        req: OpId,
+        rid: Rid,
+        outcome: MutateOutcome,
+        base: Option<Seq>,
+        position: Position,
+        gen: u64,
+        class: constellation_meta::RowCommit,
+        out: &mut Vec<Action>,
+    ) -> u64 {
+        self.park_reply(
+            now,
+            Default::default(),
+            Some(seq),
+            to,
+            req,
+            rid,
+            outcome,
+            base,
+            position,
+            gen,
+            class,
+            out,
+        );
+        let id = self.rd.parked_rids[&rid];
+        if let Some(p) = self.rd.parked.get_mut(&id) {
+            p.stale_lease = true;
+        }
+        id
     }
 
     /// `finish` found this op's local execution needs recalls (or

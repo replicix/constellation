@@ -75210,6 +75210,189 @@ mod stale_lease {
             .collect()
     }
 
+    /// A singleton lease of 10 s, the harness's clock `ms` past the step's
+    /// reading from now on (a step that stalled after its clock read).
+    fn stalled(ms: i64) -> Harness {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        h.core.set_clock(clock_ahead(&h, ms));
+        h
+    }
+
+    fn held(h: &Harness) -> u64 {
+        h.core.stats.answers_held_stale_lease
+    }
+
+    fn release(h: &mut Harness) -> Vec<Action> {
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        out
+    }
+
+    /// An own client's Create answered on a lease a fresh reading finds
+    /// over leaves nowhere: the step read its clock before it stalled
+    /// (lease6 triage F1). Fails before: replied `Singleton`.
+    #[test]
+    fn a_stalled_singletons_own_answer_waits_for_a_fresh_lease() {
+        let mut h = stalled(20_000);
+        let (rid, out) = submit(&mut h, 1, "a");
+        assert!(answers(&out).is_empty(), "{out:?}");
+        assert_eq!(held(&h), 1);
+        assert_eq!(h.core.stats.held_stale_lease_finish, 1);
+        assert_eq!(h.core.stats.answers_held_at_emission, 0);
+        assert!(h.core.has_stale_lease_parks());
+        assert!(matches!(
+            h.core.clients().next(),
+            Some((r, ClientPhase::Recalling)) if r == rid
+        ));
+        // Nothing releases it while the reading is stale.
+        assert!(answers(&release(&mut h)).is_empty());
+        assert_eq!(held(&h), 1, "one hold, no churn");
+    }
+
+    /// The same for a refusal (the holder journals EEXIST as a row too).
+    #[test]
+    fn a_stalled_singletons_refusal_too() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let (_, out) = submit(&mut h, 1, "a");
+        assert_eq!(answers(&out).len(), 1);
+        h.core.set_clock(clock_ahead(&h, 20_000));
+        let (rid, out) = submit(&mut h, 2, "a");
+        assert!(answers(&out).is_empty(), "{out:?}");
+        assert_eq!(held(&h), 1);
+        assert_eq!(
+            h.meta.journal_classes_of_rid(rid).unwrap().len(),
+            1,
+            "the refusal is a journaled row"
+        );
+    }
+
+    /// A renewal that landed (a later reading finds the lease usable)
+    /// releases it, the singleton's answer it was.
+    #[test]
+    fn a_stalled_singletons_answer_is_released_by_a_renewal() {
+        let mut h = stalled(20_000);
+        let (rid, out) = submit(&mut h, 1, "a");
+        assert!(answers(&out).is_empty());
+        h.set_lease_end(h.now.plus(60_000));
+        let out = release(&mut h);
+        let got = answers(&out);
+        assert_eq!(got.len(), 1, "{out:?}");
+        assert_eq!(got[0].0, rid);
+        assert!(
+            matches!(got[0].1, AnswerSource::Sequenced(c) if c.is_singleton()),
+            "{got:?}"
+        );
+        assert!(!h.core.has_stale_lease_parks());
+        assert_eq!(held(&h), 1);
+    }
+
+    /// Deposed while it waits: in doubt (the client retries by rid at the
+    /// successor), never answered.
+    #[test]
+    fn a_stalled_singletons_answer_is_in_doubt_after_a_deposition() {
+        let mut h = stalled(20_000);
+        let (rid, out) = submit(&mut h, 1, "a");
+        assert!(answers(&out).is_empty());
+        let mut out = Vec::new();
+        h.core.deposed(h.clk(), 2, 2, 1, &h.meta, &mut out);
+        assert!(answers(&out).is_empty(), "{out:?}");
+        assert!(!h.core.has_stale_lease_parks());
+        // (Not answered: in doubt, the client goes on by the lease path.)
+        assert!(matches!(
+            h.core.clients().next(),
+            Some((r, p)) if r == rid && !matches!(p, ClientPhase::Recalling)
+        ));
+        assert!(h.core.replay.unacked.contains(&rid));
+        // And a hold after the deposition is in doubt at once.
+        let (rid2, out) = submit(&mut h, 2, "b");
+        assert!(answers(&out).is_empty(), "{out:?}");
+        assert!(!h.core.has_stale_lease_parks());
+        let _ = rid2;
+    }
+
+    /// The log carries the row while it waits: the archive's answer.
+    #[test]
+    fn a_stalled_singletons_answer_is_released_by_the_archive() {
+        let mut h = stalled(20_000);
+        let (rid, out) = submit(&mut h, 1, "a");
+        assert!(answers(&out).is_empty());
+        let out = h.archive_lands();
+        let got = answers(&out);
+        assert_eq!(got.len(), 1, "{out:?}");
+        assert_eq!(got[0].0, rid);
+        assert_eq!(
+            got[0].1,
+            AnswerSource::Sequenced(constellation_meta::RowCommit::ARCHIVE)
+        );
+    }
+
+    /// A reading inside the lease answers at once, as before.
+    #[test]
+    fn a_fresh_lease_answers_a_singleton_at_once() {
+        let mut h = stalled(1_000);
+        let (rid, out) = submit(&mut h, 1, "a");
+        let got = answers(&out);
+        assert_eq!(got.len(), 1, "{out:?}");
+        assert_eq!(got[0].0, rid);
+        assert!(matches!(got[0].1, AnswerSource::Sequenced(c) if c.is_singleton()));
+        assert_eq!(held(&h), 0);
+    }
+
+    /// `send_answer`: a peer's reply of class `Singleton` is held under a
+    /// stale reading too, and leaves with the archive.
+    #[test]
+    fn a_peer_reply_of_a_singleton_is_held_under_a_stale_clock() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let (rid, _) = submit(&mut h, 1, "a");
+        h.core.set_clock(clock_ahead(&h, 20_000));
+        let reply = |req: u64| PeerMsg::MutateReply {
+            req: OpId(req),
+            outcome: MutateOutcome::Accepted {
+                epoch: 1,
+                records: Vec::new(),
+            },
+            base: None,
+            position: constellation_meta::Position::ZERO,
+            gen: 0,
+            own_chunks: constellation_meta::OwnChunks::None,
+            own_rows: None,
+            committed: false,
+        };
+        let sent = |out: &[Action]| {
+            out.iter()
+                .filter(|a| {
+                    matches!(
+                        a,
+                        Action::Send {
+                            to: 2,
+                            msg: PeerMsg::MutateReply { .. }
+                        }
+                    )
+                })
+                .count()
+        };
+        let mut out = Vec::new();
+        h.core.send_answer(
+            h.clk(),
+            rid,
+            super::super::backup::EmissionPath::HolderReply,
+            2,
+            reply(77),
+            constellation_meta::RowCommit::LONE,
+            &h.meta,
+            &mut out,
+        );
+        assert_eq!(sent(&out), 0, "{out:?}");
+        assert_eq!(held(&h), 1);
+        assert_eq!(h.core.stats.held_stale_lease_holder_reply, 1);
+        assert_eq!(h.core.stats.answers_held_at_emission, 0);
+        assert_eq!(sent(&release(&mut h)), 0, "a remote waits for the archive");
+        assert_eq!(sent(&h.archive_lands()), 1);
+    }
+
     /// A core with no clock judges on the step's `now`: the answer of a
     /// singleton leaves at its step, whatever the real time is (the core
     /// unit tests are unchanged by the re-check).

@@ -1272,6 +1272,18 @@ pub(crate) enum EmissionPath {
     Release,
 }
 
+/// Why the emission gate holds an answer ([`Core::emission_hold_of`]); the
+/// journal seq it waits on.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum EmissionHold {
+    /// It rests on a delegation row its group or the log does not hold.
+    Unsettled(u64),
+    /// ADR-52: a singleton's answer, and a fresh clock read finds the lease
+    /// unusable: it waits for the archive to carry its row or a usable
+    /// lease.
+    StaleLease(u64),
+}
+
 pub(crate) fn is_answer(outcome: &MutateOutcome) -> bool {
     matches!(
         outcome,
@@ -2521,13 +2533,51 @@ impl Core {
         }))
     }
 
-    /// The I1 emission gate's test: the journal seq to park `rid`'s answer
-    /// on when it rests on a delegation row (`gen != 0`) its group or the
-    /// log does not hold ([`Self::unsettled_delegate_row`]), `None` when it
-    /// may leave. Every answer path decides this itself
-    /// ([`Self::answer_need_of`]); this is asked again where the answer
-    /// leaves, so that no path can emit it unsettled.
-    pub(crate) fn emission_hold_of(&self, rid: Rid, replica: &dyn Replica) -> Option<u64> {
+    /// The emission gate's test (I1, and ADR-52): why `rid`'s answer of
+    /// class `class` may not leave now, `None` when it may. Every answer
+    /// path decides this itself ([`Self::answer_need_of`]); this is asked
+    /// again where the answer leaves, so that no path can emit it
+    /// unsettled or on a lease it no longer holds.
+    ///
+    /// First ADR-52: an answer of class `Singleton` (committed by this
+    /// node's disk alone under a time-bounded lease) leaves only if a clock
+    /// read taken here finds the lease usable with the margin; the step
+    /// that produced it may have read its `now` long ago (a stalled
+    /// process, a slow store write) and the lease been taken over since.
+    /// The read is taken only for a `Singleton`: nothing else pays it. Then
+    /// [`Self::unsettled_hold_of`].
+    pub(crate) fn emission_hold_of(
+        &self,
+        rid: Rid,
+        class: constellation_meta::RowCommit,
+        replica: &dyn Replica,
+    ) -> Option<EmissionHold> {
+        // (`lone_delegate`, the negative control of the retired lone
+        // delegate, answers on no root lease at all by design.)
+        if class.is_singleton()
+            && !self.lease.epoch_held()
+            && !self.cfg.lone_delegate
+            && !self.lease.usable(self.fresh_now(), &self.cfg)
+        {
+            // What it holds is the rid's own journaled row: an answer with
+            // none (a refusal nothing executed, an `EIO`) commits nothing
+            // and leaves as it is. A row the log carries is committed
+            // whatever the lease says.
+            if let Some((seq, _)) = replica.journal_class_of_rid(rid) {
+                if !self.archive_covers(seq, replica.journal_acked_seq().unwrap_or(0)) {
+                    return Some(EmissionHold::StaleLease(seq));
+                }
+            }
+        }
+        self.unsettled_hold_of(rid, replica)
+            .map(EmissionHold::Unsettled)
+    }
+
+    /// The I1 emission gate's delegation half: the journal seq to park
+    /// `rid`'s answer on when it rests on a delegation row (`gen != 0`) its
+    /// group or the log does not hold ([`Self::unsettled_delegate_row`]),
+    /// `None` when it may leave.
+    pub(crate) fn unsettled_hold_of(&self, rid: Rid, replica: &dyn Replica) -> Option<u64> {
         // Plan 46 M1.4 step 6a (ADR-53): and a row of this node's own root
         // journal that an earlier tenure left, which only the archive
         // commits. Decided by the row's own state, not by how it came here.
@@ -2599,6 +2649,27 @@ impl Core {
             return None;
         }
         self.unsettled_root_row(rid, replica)
+    }
+
+    /// Count an answer the emission gate held for a lease a fresh clock read
+    /// finds unusable (`Stats::answers_held_stale_lease`). An expected
+    /// runtime outcome of a stalled step, unlike
+    /// [`Self::note_held_at_emission`]: no assertion.
+    pub(crate) fn note_held_stale_lease(&mut self, path: EmissionPath, rid: Rid) {
+        self.stats.answers_held_stale_lease += 1;
+        match path {
+            EmissionPath::Finish => self.stats.held_stale_lease_finish += 1,
+            EmissionPath::DelegExec => self.stats.held_stale_lease_deleg_exec += 1,
+            EmissionPath::HolderReply => self.stats.held_stale_lease_holder_reply += 1,
+            EmissionPath::Designation => self.stats.held_stale_lease_designation += 1,
+            EmissionPath::Release => self.stats.held_stale_lease_release += 1,
+        }
+        tracing::warn!(
+            node = self.cfg.node_id,
+            ?rid,
+            ?path,
+            "a singleton answer reached the point it leaves on a lease no longer usable: held"
+        );
     }
 
     /// Count an answer the emission gate held (`Stats::answers_held_at_emission`).
@@ -2680,7 +2751,31 @@ impl Core {
         } = &mut msg
         {
             if is_answer(outcome) {
-                if let Some(seq) = self.emission_hold_of(rid, replica) {
+                let hold = self.emission_hold_of(rid, class, replica);
+                if let Some(EmissionHold::StaleLease(seq)) = hold {
+                    self.note_held_stale_lease(path, rid);
+                    let id = self.park_stale_reply(
+                        now,
+                        seq,
+                        to,
+                        *req,
+                        rid,
+                        outcome.clone(),
+                        *base,
+                        *position,
+                        *gen,
+                        class,
+                        out,
+                    );
+                    self.keep_parked_completed(rid, replica);
+                    if self.lease.lost {
+                        // Deposed already: nothing else would release or
+                        // abort it; the requester retries by rid.
+                        self.abort_park_busy(now, id, replica, out);
+                    }
+                    return;
+                }
+                if let Some(EmissionHold::Unsettled(seq)) = hold {
                     self.note_held_at_emission(path, rid, replica);
                     self.park_reply(
                         now,

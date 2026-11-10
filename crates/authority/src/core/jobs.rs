@@ -2622,6 +2622,12 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // ADR-52: a renewal that landed proves nobody took over: the
+        // singleton answers held for a stale lease are asked again now, not
+        // at the next shipping tick.
+        if self.has_stale_lease_parks() {
+            self.complete_ready(now, replica, out);
+        }
         if mid_ship {
             self.round_ship(now, 0, replica, out);
         } else {
