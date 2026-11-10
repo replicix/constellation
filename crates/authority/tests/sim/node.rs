@@ -827,6 +827,10 @@ impl NodeHandle {
             meta: meta.clone(),
             core: {
                 let mut core = Core::new(cfg);
+                {
+                    let clock = clock.clone();
+                    core.set_clock(Arc::new(move || clock.now()));
+                }
                 // The window table decides on this node's clock (plan 41 R1).
                 let clock = clock.clone();
                 windows.set_clock(Arc::new(move || clock.now()));

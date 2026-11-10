@@ -2645,6 +2645,20 @@ fn drain_queued(
     Drained::All
 }
 
+/// The daemon's core: its shared tables and the protocol clock.
+fn daemon_core(config: Config, off_core: &OffCore) -> Core {
+    let mut core = Core::new(config);
+    // The root's delegation windows are decided on the table's own clock
+    // inside its guard (plan 41 R1): the protocol clock, the one every
+    // other reading of the node's time comes from.
+    core.set_deleg_windows(off_core.deleg_windows.clone());
+    core.set_lane_cell(off_core.lane_cell.clone());
+    core.deleg_windows().set_clock(Arc::new(crate::locks::now));
+    // ADR-52: and the clock an answer reads where it leaves.
+    core.set_clock(Arc::new(crate::locks::now));
+    core
+}
+
 impl Driver {
     /// Build the driver; `run` drives it. `sync_tx` is what the rest of
     /// the daemon sends `SyncRequest`s on.
@@ -2655,13 +2669,7 @@ impl Driver {
     ) -> Self {
         let urgent_rx = deps.urgent_rx.take();
         let node_id = deps.config.node_id;
-        let mut core = Core::new(deps.config.clone());
-        // The root's delegation windows are decided on the table's own clock
-        // inside its guard (plan 41 R1): the protocol clock, the one every
-        // other reading of the node's time comes from.
-        core.set_deleg_windows(deps.off_core.deleg_windows.clone());
-        core.set_lane_cell(deps.off_core.lane_cell.clone());
-        core.deleg_windows().set_clock(Arc::new(crate::locks::now));
+        let core = daemon_core(deps.config.clone(), &deps.off_core);
         let leases = LeaseStore::new(deps.store_inner.clone(), PARTITION, deps.lease_mode);
         deps.off_core.set_leases(leases.clone());
         let inbox = match &deps.e2e {
@@ -7839,6 +7847,7 @@ impl Standalone {
         cfg.locks = false;
         cfg.ttl_ms = crate::lease::lease_ttl_ms();
         let mut core = Core::new(cfg);
+        core.set_clock(Arc::new(crate::locks::now));
         let mut out = Vec::new();
         let now_at = Instant::now();
         core.start(now(), &*meta, &mut out);
@@ -8749,6 +8758,21 @@ mod tests {
             alive_tick(Some(&t), (30_000, HonourMs(30_000)), (29_000, 0, 0), 15_000),
             beats
         );
+    }
+
+    /// ADR-52: both drivers' cores read a fresh clock where an answer
+    /// leaves.
+    #[test]
+    fn both_drivers_give_their_core_a_clock() {
+        use super::{daemon_core, OffCore, Standalone};
+        use constellation_authority::Config;
+        use constellation_store_s3::LeaseMode;
+        let off = OffCore::new(1_000);
+        assert!(daemon_core(Config::defaults(1, 0), &off).has_clock());
+        let meta = std::sync::Arc::new(super::Meta::open_in_memory().unwrap());
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let standalone = Standalone::new(meta, store, 1, LeaseMode::Cas);
+        assert!(standalone.core.has_clock());
     }
 
     /// The lag probe's view: a wake-up at least the threshold (an eighth
