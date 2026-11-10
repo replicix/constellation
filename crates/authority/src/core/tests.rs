@@ -71346,3 +71346,214 @@ mod late_landing_inbox {
         assert!(h.core.inbox.leftover.is_none());
     }
 }
+
+/// Late-landing S2: an unacknowledged or foreign stranded row only settles
+/// (never executes), and an unexecuted forwarded park is dropped at the end
+/// of its tenure and executes only from a fresh arrival.
+mod late_landing_replay {
+    use super::*;
+
+    fn rid3(seq: u64) -> Rid {
+        Rid {
+            node: 3,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    /// `(rid, queue entry)` of an op of `rid` queued for replay on a root
+    /// that holds its lease.
+    fn root_with_queued(rid: Rid, name: &str) -> Harness {
+        let mut h = Harness::new(1);
+        let op = h.create(name);
+        h.meta.queue_replay(rid, &op, &Default::default()).unwrap();
+        h.hold(1, None);
+        h
+    }
+
+    fn settled_as_abandoned(h: &Harness, rid: Rid) -> bool {
+        h.meta.completed_outcome(rid).unwrap()
+            == Some(constellation_meta::CompletedOutcome::Refused {
+                code: crate::ABANDONED_CODE,
+            })
+    }
+
+    /// An own row of a deposed tenure whose reply never left (`unacked`): its
+    /// client heard in doubt. The drain settles it: the sequencer journals
+    /// the rid's refusal, and the entry ends without the op ever running.
+    /// An acknowledged-looking row (not marked) is executed, as ever.
+    #[test]
+    fn an_unacked_replay_settles_instead_of_executing() {
+        let mut h = Harness::new(1);
+        let rid = h.rid(5);
+        let mut h2 = root_with_queued(rid, "x");
+        std::mem::swap(&mut h, &mut h2);
+        h.core.replay.unacked.insert(rid);
+        let mut out = Vec::new();
+        h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
+        out.extend(h.archive_lands());
+        h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.meta.lookup(ROOT_INO, "x").unwrap().is_none(),
+            "the op ran: {out:?}"
+        );
+        assert_eq!(h.core.stats.unacked_replay_settles_sent, 1);
+        assert!(settled_as_abandoned(&h, rid), "{out:?}");
+        assert!(h.meta.pending_replays().unwrap().is_empty());
+        // An own row nobody marked is an acknowledged one: executed.
+        let rid = h.rid(6);
+        let op = h.create("y");
+        h.meta.queue_replay(rid, &op, &Default::default()).unwrap();
+        let mut out = Vec::new();
+        h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
+        assert!(h.meta.lookup(ROOT_INO, "y").unwrap().is_some(), "{out:?}");
+    }
+
+    /// A row another node's op left here (`foreign`, persisted): its remote
+    /// client may have heard `EIO`, and the replayer cannot see it. Settled,
+    /// never executed.
+    #[test]
+    fn a_foreign_replay_never_executes() {
+        let rid = rid3(7);
+        let mut h = root_with_queued(rid, "z");
+        let queued = h.meta.pending_replays().unwrap();
+        h.meta.mark_replay_unacked(queued[0].queue_seq).unwrap();
+        let mut out = Vec::new();
+        h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
+        out.extend(h.archive_lands());
+        h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.meta.lookup(ROOT_INO, "z").unwrap().is_none(),
+            "the op ran: {out:?}"
+        );
+        assert_eq!(h.core.stats.unacked_replay_settles_sent, 1);
+        assert!(settled_as_abandoned(&h, rid), "{out:?}");
+        let _ = &mut h;
+    }
+
+    /// The takeover gate's local replay obeys the same rule: an unacked or
+    /// foreign row stays queued, unexecuted, for the drain to settle.
+    #[test]
+    fn the_gates_local_replay_leaves_unacked_and_foreign_rows_to_the_drain() {
+        let rid = rid3(8);
+        let mut h = root_with_queued(rid, "g");
+        let queued = h.meta.pending_replays().unwrap();
+        h.meta.mark_replay_unacked(queued[0].queue_seq).unwrap();
+        let own = h.rid(9);
+        h.core.replay.unacked.insert(own);
+        let op = h.create("u");
+        h.meta.queue_replay(own, &op, &Default::default()).unwrap();
+        let mut out = Vec::new();
+        h.core
+            .replay_queue_locally(h.clk(), &h.meta, &mut out)
+            .unwrap();
+        assert!(h.meta.lookup(ROOT_INO, "g").unwrap().is_none(), "{out:?}");
+        assert!(h.meta.lookup(ROOT_INO, "u").unwrap().is_none(), "{out:?}");
+        assert_eq!(h.meta.pending_replays().unwrap().len(), 2);
+    }
+
+    fn deps_on_stream_5() -> constellation_meta::Position {
+        let mut deps = constellation_meta::Position::ZERO;
+        assert!(deps.streams.raise(5, 3));
+        deps
+    }
+
+    fn forward_with_deps(req: u64, op: MutateOp) -> Event {
+        Event::Peer {
+            from: 3,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: rid3(1),
+                op,
+                acked_through: 0,
+                deps: deps_on_stream_5(),
+                applied: 0,
+                tag: Default::default(),
+                settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
+                inbox_ever: false,
+            },
+        }
+    }
+
+    /// A forward parked unexecuted at a root (waiting for its `deps`) is
+    /// dropped when the tenure ends: it must not run if the node regains the
+    /// lease and the wait ends. Fails on the parent: it stayed parked and ran.
+    #[test]
+    fn a_deposed_roots_forward_park_never_executes() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let op = h.create("p");
+        h.step(forward_with_deps(1, op));
+        assert!(h.core.has_deps_parks(), "parked for its deps");
+        let mut out = Vec::new();
+        h.core.deposed(h.clk(), 2, 2, 1, &h.meta, &mut out);
+        assert!(!h.core.has_deps_parks(), "the park survived the deposition");
+        assert!(
+            sends(&out).iter().any(|(to, m)| *to == 3
+                && matches!(
+                    m,
+                    PeerMsg::MutateReply { req, outcome: MutateOutcome::Busy, .. } if *req == OpId(1)
+                )),
+            "the requester is told to retry: {out:?}"
+        );
+        // The node regains the lease and the dependency arrives.
+        h.hold(3, None);
+        crate::replica::Replica::note_stream(&h.meta, 5, 3);
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert!(h.meta.lookup(ROOT_INO, "p").unwrap().is_none());
+    }
+
+    /// The executor's freshness rule for a parked forward: its latest
+    /// message must have arrived less than `f` ago. Older: `Held`, dropped,
+    /// not executed. A retry re-attaching within `f` keeps it fresh.
+    #[test]
+    fn a_stale_forward_park_answers_held() {
+        let f = Deadlines::new(&Harness::new(1).core.cfg).inbox_read_fresh;
+        // Stale.
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let op = h.create("p");
+        h.step(forward_with_deps(1, op.clone()));
+        assert!(h.core.has_deps_parks());
+        h.advance(f);
+        h.hold(1, None);
+        crate::replica::Replica::note_stream(&h.meta, 5, 3);
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert!(h.meta.lookup(ROOT_INO, "p").unwrap().is_none(), "{out:?}");
+        assert_eq!(h.core.stats.stale_parks_dropped, 1);
+        assert!(
+            sends(&out).iter().any(|(to, m)| *to == 3
+                && matches!(
+                    m,
+                    PeerMsg::MutateReply { req, outcome: MutateOutcome::Held { .. }, .. } if *req == OpId(1)
+                )),
+            "{out:?}"
+        );
+        assert!(!h.core.has_deps_parks());
+        // Fresh: the retry re-attached 200 ms before the wait ended.
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let op = h.create("p");
+        h.step(forward_with_deps(1, op.clone()));
+        h.advance(f - 100);
+        h.hold(1, None);
+        h.step(forward_with_deps(2, op));
+        h.advance(200);
+        h.hold(1, None);
+        crate::replica::Replica::note_stream(&h.meta, 5, 3);
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert!(h.meta.lookup(ROOT_INO, "p").unwrap().is_some(), "{out:?}");
+        assert_eq!(h.core.stats.stale_parks_dropped, 0);
+    }
+}
