@@ -1329,6 +1329,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m11::sticky_abandon,
     },
     Scenario {
+        name: "sticky-holder-restart",
+        desc: "ADR-46: the sticky holder of d1 (b) is killed with kill -9 while c holds read delegations it granted (read TTL 30 s) and remounted with its journal inside their lifetime; a's write of d1/x goes to the returned holder and must not be acknowledged while c can serve the old content: c's next strict open of d1/x shows the new content",
+        requires: &[],
+        caps: &[],
+        run: m11::sticky_holder_restart,
+    },
+    Scenario {
         name: "delegate-crash-default-ttl",
         desc: "overload-cascade: delegate-crash at the default grant TTL (the lock grant TTL, 20 s): the root reclaims the dead delegate's subtree about ttl + margin after its last renewal, so a third node's write into d1 waits more than the short test TTL's whole life and less than ttl + 10 s; then the same recovery as delegate-crash",
         requires: &[],
