@@ -5690,6 +5690,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             ));
         }
     }
+    let mut operator_lost_rids: BTreeSet<Rid> = BTreeSet::new();
     if !operator_abandoned.lock().unwrap().is_empty() {
         let lost: Vec<Rid> = history
             .returned()
@@ -5698,6 +5699,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             .filter(|rid| !oracle.completed_at.contains_key(rid))
             .collect();
         report.operator_lost = lost.len();
+        operator_lost_rids.extend(lost.iter().copied());
+        // Rows a dead delegate group held that no client saw return.
+        operator_lost_rids.extend(super::oracle::unlogged_delegate_rows(&oracles, &oracle));
         tentative.extend(lost);
     }
     report.segments = oracle.segments;
@@ -6224,12 +6228,19 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         &in_doubt_answers,
         &rolled_back_at,
         &world.dropped_rids.lock().unwrap().clone(),
+        &operator_lost_rids,
         converged_checkable,
     );
     let outcome_conflicts = bucket.archive.conflicting_outcomes();
     // `AUTHORITY_SIM_ORACLE_DEBUG=1`: what the end of the run found (the
     // relays no judged answer backs, the unjournaled refusals that landed).
     if std::env::var_os("AUTHORITY_SIM_ORACLE_DEBUG").is_some() {
+        if found.i2c_operator_lost > 0 {
+            eprintln!(
+                "ORACLE-END i2c operator-lost exempt: {}",
+                found.i2c_operator_lost
+            );
+        }
         for text in found
             .i1
             .iter()

@@ -2157,6 +2157,9 @@ impl IdentityLedger {
 pub struct Findings {
     pub acks_by_class: BTreeMap<String, usize>,
     pub uncommitted_acks: BTreeMap<String, usize>,
+    /// I2 (c) answers the operator's `abandon-group` gave up on purpose (the
+    /// rid is in the operator-lost set): counted here, not judged.
+    pub i2c_operator_lost: usize,
     pub unjournaled_refusals: BTreeMap<String, usize>,
     /// Plan 43 C2a, I1: answers whose rid a transaction carries with
     /// another outcome (by answer kind), and relays with no judged answer
@@ -2248,10 +2251,34 @@ pub fn survivors_of_drop(log: &super::check::Oracle, dropped: &BTreeSet<Rid>) ->
         .collect()
 }
 
+/// The rids a run's operator abandon gave up beyond those a client saw
+/// return: OK answers under a group class whose transaction is a delegate's
+/// stream row (`origin` other than the holder's own `(0, 0)`) that the log
+/// never completed. Only a dead delegate group held such a row; a row a
+/// live group committed is in the log, and the holder's own rows are never
+/// in this set.
+pub fn unlogged_delegate_rows(o: &Oracles, log: &super::check::Oracle) -> BTreeSet<Rid> {
+    o.acks
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|a| a.kind == OutcomeKind::Ok && !a.is_relay())
+        .filter(|a| {
+            a.judged.as_ref().is_some_and(|j| {
+                j.class == Some(Judged::Group) && j.tx.as_ref().is_some_and(|t| t.origin.0 != 0)
+            })
+        })
+        .filter(|a| !log.completed_at.contains_key(&a.rid))
+        .map(|a| a.rid)
+        .collect()
+}
+
 /// Tally the run's answers and run the end-of-run oracles: I2 (c) over the
 /// answers' transactions and the log, I4 over the in-doubt answers and the
 /// invocations, I5 over the rolled-back set (each rid with the tick of its
 /// latest rollback: only an answer given before it was rolled back).
+/// `operator_lost`: the rids the operator's `abandon-group` gave up (exempt
+/// from I2 (c), counted in `i2c_operator_lost`).
 /// `converged`: the run reached quiescence, so a group-answered rid the log
 /// never completed is absent for good.
 pub fn end_of_run(
@@ -2260,6 +2287,7 @@ pub fn end_of_run(
     in_doubt: &[(NodeId, Rid, u64, u64)],
     rolled_back: &HashMap<Rid, u64>,
     dropped: &BTreeSet<Rid>,
+    operator_lost: &BTreeSet<Rid>,
     converged: bool,
 ) -> Findings {
     // `repair drop-held` is the operator's action: it rolls back what
@@ -2287,6 +2315,7 @@ pub fn end_of_run(
     // Each rid's first OK answer judged other than `Lone` (its tick).
     let mut non_lone_ok: BTreeMap<Rid, u64> = BTreeMap::new();
     let mut verbatim: BTreeMap<Rid, String> = BTreeMap::new();
+    let mut verbatim_seen: HashSet<Rid> = HashSet::new();
     for a in acks.iter().filter(|a| !a.is_relay()) {
         let Some(j) = &a.judged else { continue };
         let class = j.class.map_or("none", |c| c.name());
@@ -2335,7 +2364,13 @@ pub fn end_of_run(
         // the log must carry as it was committed.
         if a.kind == OutcomeKind::Ok && j.class == Some(Judged::Group) {
             if let Some(t) = &j.tx {
-                if let Some(why) =
+                if operator_lost.contains(&a.rid) {
+                    // Given up on purpose by the operator's `abandon-group`
+                    // (only that group held the row): exactly these rids.
+                    if verbatim_seen.insert(a.rid) {
+                        f.i2c_operator_lost += 1;
+                    }
+                } else if let Some(why) =
                     not_verbatim(log, a.rid, t, converged).filter(|_| !survives(&a.rid))
                 {
                     verbatim.entry(a.rid).or_insert_with(|| {
@@ -3071,6 +3106,7 @@ mod tests {
             &[],
             rolled_back,
             dropped,
+            &BTreeSet::new(),
             true,
         )
     }
@@ -3205,15 +3241,15 @@ mod tests {
         let o = Oracles::new(Bucket::new(1, (0, 0)));
         *o.acks.lock().unwrap() = acks;
         let log = log_with(refused_seg(1, r, Code::Io), &[(other, (3, 1))]);
-        let f = end_of_run(&o, &log, &[], &rolled, &dropped, true);
+        let f = end_of_run(&o, &log, &[], &rolled, &dropped, &BTreeSet::new(), true);
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
         // Its replay refused: the outcome is the log's.
         let log = log_with(refused_seg(1, r, Code::NotFound), &[(other, (3, 1))]);
-        let f = end_of_run(&o, &log, &[], &rolled, &dropped, true);
+        let f = end_of_run(&o, &log, &[], &rolled, &dropped, &BTreeSet::new(), true);
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
         // A refusal of a rid the drop did not roll back excuses nothing.
         let log = log_with(refused_seg(1, other, Code::NotFound), &[(r, (3, 0))]);
-        let f = end_of_run(&o, &log, &[], &rolled, &dropped, true);
+        let f = end_of_run(&o, &log, &[], &rolled, &dropped, &BTreeSet::new(), true);
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
         assert!(f.i5[0].contains(&format!("{other:?}")), "{:?}", f.i5);
     }
@@ -4181,6 +4217,72 @@ mod tests {
             unfenced,
             describe: Vec::new(),
         }
+    }
+
+    /// The operator's `abandon-group` gives up the rows only the dead group
+    /// held: an OK answered under a group class whose rid the log never
+    /// completed is exempt from I2 (c) exactly when it is in the
+    /// operator-lost set (counted, not silently dropped); the same lost row
+    /// outside the set still fails.
+    #[test]
+    fn i2c_exempts_exactly_the_operator_lost_rids() {
+        let (r, other) = (rid(1, 1), rid(1, 2));
+        let tx = |first: u64| TxRef {
+            node: 1,
+            first,
+            last: first,
+            origin: (0, 0),
+            epoch: 1,
+            records: vec![LogRecord::Completed { rid: r }],
+        };
+        let judged = |first: u64| {
+            Some(Judgement {
+                class: Some(Judged::Group),
+                expected: Expected::Class(Judged::Group),
+                tx: Some(tx(first)),
+                detail: String::new(),
+                mismatch: None,
+            })
+        };
+        let acks = vec![
+            AckEntry {
+                judged: judged(5),
+                ..ack(2, r, 5, OutcomeKind::Ok, true)
+            },
+            AckEntry {
+                judged: judged(6),
+                ..ack(2, other, 5, OutcomeKind::Ok, true)
+            },
+        ];
+        let run = |lost: &BTreeSet<Rid>| {
+            let o = Oracles::new(Bucket::new(1, (0, 0)));
+            *o.acks.lock().unwrap() = acks.clone();
+            let log = log_with(seg(1, &[]), &[]);
+            end_of_run(&o, &log, &[], &HashMap::new(), &BTreeSet::new(), lost, true)
+        };
+        // Neither is in the set: both are absent.
+        let f = run(&BTreeSet::new());
+        assert_eq!(f.i2c.len(), 2, "{:?}", f.i2c);
+        assert_eq!(f.i2c_operator_lost, 0);
+        // Only `r` was given up: `other` (a lost row the operator did not
+        // abandon) still fails.
+        let f = run(&BTreeSet::from([r]));
+        assert_eq!(f.i2c.len(), 1, "{:?}", f.i2c);
+        assert!(f.i2c[0].contains(&format!("{other:?}")), "{:?}", f.i2c);
+        assert_eq!(f.i2c_operator_lost, 1);
+        // The unlogged-delegate-row set: the holder's own row `(0, 0)` and a
+        // completed delegate row are not in it.
+        let mut acks = acks;
+        for a in &mut acks {
+            a.judged.as_mut().unwrap().tx.as_mut().unwrap().origin =
+                if a.rid == r { (2, 7) } else { (0, 0) };
+        }
+        let o = Oracles::new(Bucket::new(1, (0, 0)));
+        *o.acks.lock().unwrap() = acks;
+        let lost = unlogged_delegate_rows(&o, &log_with(seg(1, &[]), &[]));
+        assert_eq!(lost, BTreeSet::from([r]));
+        let lost = unlogged_delegate_rows(&o, &log_with(seg(1, &[]), &[(r, (1, 0))]));
+        assert!(lost.is_empty(), "{lost:?}");
     }
 
     #[test]
