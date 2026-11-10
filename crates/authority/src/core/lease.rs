@@ -128,7 +128,8 @@ pub struct LeaseState {
     /// After a deposition, the epoch below which own unshipped work is
     /// stranded (`u64::MAX` when unknown: a persisted deposition).
     pub lost_floor: Epoch,
-    /// `Core::begin_handoff_pause`: new local mutations closed until here (wait clock).
+    /// `Core::begin_handoff_pause`: new local mutations and acquisitions closed until here (wait
+    /// clock); shipping under a held lease is not.
     pub pause_until: WaitMs,
     /// A release/handoff is in its final flush + CAS section.
     pub releasing: bool,
