@@ -2972,6 +2972,7 @@ impl Core {
                                 return MutateOutcome::Busy;
                             }
                         }
+                        self.note_final_nonholder_refusal(rid, code, false);
                         return MutateOutcome::Errno(code);
                     }
                     // The gate recalls nothing (ADR-42): retried once it opens.
@@ -4384,6 +4385,32 @@ impl Core {
     /// back for a designee, for `take_unsettled_designation` (the sim driver).
     pub fn track_unsettled_designation(&mut self) {
         self.track_unsettled_designation = true;
+    }
+
+    /// ADR-47: starts recording the root's decisions to refuse an op under a
+    /// non-stealable grant and the executions of this node's non-stealable
+    /// generations (`take_final_nonholder_refusals`,
+    /// `take_nonstealable_executions`; the sim driver).
+    pub fn track_fence_audit(&mut self) {
+        self.track_fence_audit = true;
+    }
+
+    /// The refusals decided since the last call: `(rid, code, drain)`, the
+    /// last flag set for the inbox drain's journaled `Refused`.
+    pub fn take_final_nonholder_refusals(&mut self) -> Vec<(Rid, Code, bool)> {
+        std::mem::take(&mut self.final_nonholder_refusals)
+    }
+
+    /// The `(rid, gen)` executed under a non-stealable generation of this
+    /// node since the last call.
+    pub fn take_nonstealable_executions(&mut self) -> Vec<(Rid, u64)> {
+        std::mem::take(&mut self.nonstealable_executions)
+    }
+
+    pub(crate) fn note_final_nonholder_refusal(&mut self, rid: Rid, code: Code, drain: bool) {
+        if self.track_fence_audit {
+            self.final_nonholder_refusals.push((rid, code, drain));
+        }
     }
 
     /// Whether `rid`'s unsettled `EIO` was one whose refusal was held back

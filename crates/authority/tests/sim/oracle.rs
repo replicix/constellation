@@ -65,6 +65,10 @@ pub struct Oracles {
     /// Descriptions of I1 violations, in order (judged at emission, failed
     /// at the end of the run).
     pub i1_violations: Mutex<Vec<String>>,
+    /// ADR-47, check 1: the root's refusals of ops under a non-stealable
+    /// grant, the executions of non-stealable generations and every client
+    /// submission, each with the tick it happened at.
+    pub fence_audit: Mutex<FenceAudit>,
     /// Plan 43 C1-2: answers whose claim of a commit the judgement or the
     /// answering row's own class does not bear out (`check_claim`).
     pub claim_violations: Mutex<Vec<String>>,
@@ -306,6 +310,7 @@ impl Oracles {
             tick: AtomicU64::new(1),
             acks_unmapped: AtomicU64::new(0),
             i1_violations: Mutex::new(Vec::new()),
+            fence_audit: Mutex::new(FenceAudit::default()),
             claim_violations: Mutex::new(Vec::new()),
             appended: Mutex::new(HashMap::new()),
             epoch_backups,
@@ -320,6 +325,31 @@ impl Oracles {
 
     pub fn next_tick(&self) -> u64 {
         self.tick.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// ADR-47: the core's audit of one step (`Core::take_final_nonholder_refusals`,
+    /// `Core::take_nonstealable_executions`), stamped with the step's tick.
+    pub fn note_fence_audit(
+        &self,
+        node: NodeId,
+        refusals: Vec<(Rid, Code, bool)>,
+        execs: Vec<(Rid, u64)>,
+    ) {
+        if refusals.is_empty() && execs.is_empty() {
+            return;
+        }
+        let tick = self.next_tick();
+        let mut a = self.fence_audit.lock().unwrap();
+        a.refusals
+            .extend(refusals.into_iter().map(|(r, c, d)| (r, c, d, tick, node)));
+        a.execs
+            .extend(execs.into_iter().map(|(r, g)| (r, g, tick, node)));
+    }
+
+    /// ADR-47: a client submitted `rid` (the first time or again).
+    pub fn note_submit(&self, rid: Rid) {
+        let tick = self.next_tick();
+        self.fence_audit.lock().unwrap().submits.push((rid, tick));
     }
 
     /// A client's first submission of `rid` (a resubmission adds nothing).
@@ -2192,6 +2222,11 @@ pub struct Findings {
     /// stream the operator abandoned, past the cut the log gave it: the cost
     /// the abandon says it has (counted, not a violation).
     pub i5_operator: Vec<String>,
+    /// ADR-47, check 1 (`nonholder_refused_a_designee_ran`): a rid the root
+    /// refused for good under a non-stealable grant that a non-stealable
+    /// generation executed and the log completes, with no client submission
+    /// of it after the refusal.
+    pub fence: Vec<String>,
     /// The same rows when their answer was given after the abandon was
     /// answered (a holder that came back and had not learned the end): not
     /// the cost the operator accepted, counted apart from `i5_operator` (the
@@ -2323,6 +2358,8 @@ pub fn end_of_run(
         f.i2_foreign_gated = ledger.foreign_gated.values().cloned().collect();
     }
     let acks = o.acks.lock().unwrap();
+    let audit = o.fence_audit.lock().unwrap();
+    f.fence = fence_findings(&audit, &acks, log);
     // Each rid's first OK answer judged other than `Lone` (its tick).
     let mut non_lone_ok: BTreeMap<Rid, u64> = BTreeMap::new();
     let mut verbatim: BTreeMap<Rid, String> = BTreeMap::new();
@@ -2342,7 +2379,13 @@ pub fn end_of_run(
                 // `EROFS` (a frozen epoch's refusal) is not final: the
                 // caller retries the op, the sim's client under the same
                 // rid, and the op then runs.
-                let retried = a.kind == OutcomeKind::Refused(Code::ReadOnly);
+                // (ADR-47: a designation's refusal that reached the client
+                // is final, unless the client submitted the rid again; a
+                // forward's reply the requester may hold back is not.)
+                let retried = a.kind == OutcomeKind::Refused(Code::ReadOnly)
+                    && (a.reply
+                        || !audit.refusals.iter().any(|r| r.0 == a.rid && !r.2)
+                        || audit.submits.iter().any(|s| s.0 == a.rid && s.1 > a.tick));
                 if let Some((seq, i)) = log.completed_at.get(&a.rid).filter(|_| !retried) {
                     f.unjournaled_landed.push(format!(
                         "I4 unjournaled_then_landed: rid {:?} was refused ({}) by node {} at t={} ms \
@@ -3182,6 +3225,49 @@ mod tests {
             &BTreeMap::new(),
             true,
         )
+    }
+
+    /// ADR-47, check 1: findings of an audit over a log that completes `r`.
+    fn fence_of(audit: FenceAudit, acks: Vec<AckEntry>, r: Rid) -> Vec<String> {
+        let o = Oracles::new(Bucket::new(1, (0, 0)));
+        *o.acks.lock().unwrap() = acks;
+        *o.fence_audit.lock().unwrap() = audit;
+        end_of_run(
+            &o,
+            &log_with(seg(1, &[]), &[(r, (1, 0))]),
+            &[],
+            &HashMap::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            true,
+        )
+        .fence
+    }
+
+    /// A rid the designee ran before the root's refusal reached the client
+    /// is I1; one the client submitted again after hearing the refusal, or
+    /// whose refusal the requester held back, is not.
+    #[test]
+    fn check_1_judges_a_refusal_of_an_op_a_designee_ran() {
+        let r = rid(3, 1);
+        let refused = |tick| ack(3, r, tick, OutcomeKind::Refused(Code::ReadOnly), false);
+        let audit = |exec_tick: u64, submits: &[u64]| FenceAudit {
+            refusals: vec![(r, Code::ReadOnly, false, 5, 2)],
+            execs: vec![(r, 7, exec_tick, 1)],
+            submits: submits.iter().map(|t| (r, *t)).collect(),
+        };
+        // The designee ran it first.
+        let f = fence_of(audit(3, &[1]), vec![refused(6)], r);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].contains("nonholder_refused_a_designee_ran"), "{f:?}");
+        // It ran after the refusal with no new submission: still I1.
+        assert_eq!(fence_of(audit(9, &[1]), vec![refused(6)], r).len(), 1);
+        // The client submitted again after hearing the refusal.
+        assert!(fence_of(audit(9, &[1, 8]), vec![refused(6)], r).is_empty());
+        // The requester held the root's refusal back: no client heard it.
+        let reply = ack(2, r, 6, OutcomeKind::Refused(Code::ReadOnly), true);
+        assert!(fence_of(audit(3, &[1]), vec![reply], r).is_empty());
     }
 
     /// A rollback is dated by the queue entry: a rid queued, answered, gone
@@ -4671,4 +4757,80 @@ mod tests {
         l.update(3, [r].into(), [r].into(), BTreeSet::new(), 3);
         assert!(!l.violations.contains_key(&r), "the requester's own queue");
     }
+}
+
+/// ADR-47's audit: what the root decided to refuse for good under a
+/// non-stealable grant, what its generations executed, and the clients'
+/// submissions, with ticks.
+#[derive(Default)]
+pub struct FenceAudit {
+    /// `(rid, code, by the inbox drain, tick, node)`.
+    pub refusals: Vec<(Rid, Code, bool, u64, NodeId)>,
+    /// `(rid, generation, tick, node)`.
+    pub execs: Vec<(Rid, u64, u64, NodeId)>,
+    /// `(rid, tick)`.
+    pub submits: Vec<(Rid, u64)>,
+}
+
+/// Check 1, `nonholder_refused_a_designee_ran` (I1, non-stealable arm): a
+/// rid the root decided to refuse for good and a non-stealable generation
+/// executed, whose `Completed` the log carries. The refusal is final when a
+/// client heard it (an `EROFS`/`EXDEV` answered to its own client, not a
+/// forward's reply, which the requester may hold) or
+/// the inbox drain journaled it; a root's refusal the requester held back
+/// is not. A client that submitted the rid again after the refusal may run
+/// it legitimately.
+fn fence_findings(
+    audit: &FenceAudit,
+    acks: &[AckEntry],
+    log: &super::check::Oracle,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for &(rid, code, drain, t_label, node) in &audit.refusals {
+        let heard = acks
+            .iter()
+            .filter(|a| {
+                !a.is_relay()
+                    && !a.reply
+                    && a.rid == rid
+                    && matches!(
+                        a.kind,
+                        OutcomeKind::Refused(Code::ReadOnly | Code::CrossDevice)
+                    )
+            })
+            .map(|a| a.tick)
+            .min();
+        let Some(t_ref) = heard.or(drain.then_some(t_label)) else {
+            continue;
+        };
+        if !log.completed_at.contains_key(&rid) {
+            continue;
+        }
+        for &(r, gen, t_exec, exec_node) in audit.execs.iter().filter(|e| e.0 == rid) {
+            let resubmitted = audit
+                .submits
+                .iter()
+                .any(|&(s, t)| s == rid && t > t_ref && t < t_exec);
+            if t_exec < t_ref || !resubmitted {
+                out.push(format!(
+                    "nonholder_refused_a_designee_ran: rid {r:?} was refused for good ({code:?}, \
+                     {}) by node {node} at tick {t_ref}, and node {exec_node} executed it under \
+                     non-stealable generation {gen} at tick {t_exec}; the log completes it \
+                     (the client submitted it at ticks {:?}; answers at {:?})",
+                    if drain { "the inbox drain" } else { "the root" },
+                    audit
+                        .submits
+                        .iter()
+                        .filter(|s| s.0 == rid)
+                        .map(|s| s.1)
+                        .collect::<Vec<_>>(),
+                    acks.iter()
+                        .filter(|a| !a.is_relay() && a.rid == rid)
+                        .map(|a| (a.tick, a.kind.name()))
+                        .collect::<Vec<_>>(),
+                ));
+            }
+        }
+    }
+    out
 }
