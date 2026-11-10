@@ -426,6 +426,22 @@ fn try_form(cluster: &Cluster, cut: &[NodeId]) -> Formation {
         }
         n.report_epoch();
     }
+    // ADR-51: the daemon's epoch row (`EpochManager::sync_flags`): the
+    // members and, once activated, the carrier the claims resolved. Each
+    // member persists it before it acts on the epoch.
+    let epoch_id = format!("sim-{}", cluster.epochs.lock().unwrap().len());
+    for n in &nodes {
+        n.meta
+            .persist_epoch(
+                &epoch_id,
+                &members,
+                &Default::default(),
+                0,
+                "active",
+                carrier.map(|c| (c.node, c.epoch)),
+            )
+            .expect("persist the epoch row");
+    }
     for n in &nodes {
         {
             let mut e = n.shared.epoch.lock().unwrap();

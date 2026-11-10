@@ -165,9 +165,20 @@ impl EpochManager {
                 constellation_net::EpochState::Frozen => "frozen",
                 constellation_net::EpochState::Closed => "closed",
             };
-            let _ = self
-                .meta
-                .persist_epoch(&p.epoch_id, &p.members, &p.base, p.promised_at, state);
+            // ADR-51: the carrier belongs to the activation: a promised
+            // epoch has none yet (`self.carrier` is the previous one's).
+            let carrier = (state != "promised")
+                .then(|| self.carrier().0)
+                .flatten()
+                .map(|c| (c.node, c.epoch));
+            let _ = self.meta.persist_epoch(
+                &p.epoch_id,
+                &p.members,
+                &p.base,
+                p.promised_at,
+                state,
+                carrier,
+            );
         }
         if !m.is_open() {
             // Plan 30 §M10: in no open epoch, promises may be issued again.

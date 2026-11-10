@@ -633,9 +633,17 @@ struct EpochRowEnc {
     base: std::collections::BTreeMap<String, u64>,
     promised_at: i64,
     state: String,
+    /// ADR-51: the lease tenure `(holder, lease epoch)` the epoch's
+    /// activation resolved as its carrier. `None`: not recorded (not
+    /// activated yet, or it resolved no carrier), which counts as possibly
+    /// carrying any tenure ([`Meta::epochs_possibly_carrying`]).
+    carrier: Option<(u64, u64)>,
 }
 
 impl Meta {
+    /// Persist the epoch row `epoch_id`. `carrier` is recorded once the
+    /// activation resolved it; `None` keeps what the row already records
+    /// (a state change after the activation does not forget it).
     pub fn persist_epoch(
         &self,
         epoch_id: &str,
@@ -643,12 +651,21 @@ impl Meta {
         base: &std::collections::BTreeMap<String, u64>,
         promised_at: i64,
         state: &str,
+        carrier: Option<(u64, u64)>,
     ) -> Result<(), MetaError> {
+        let carrier = match carrier {
+            Some(c) => Some(c),
+            None => match self.epochs.get(epoch_id.as_bytes())? {
+                Some(v) => postcard::from_bytes::<EpochRowEnc>(&v)?.carrier,
+                None => None,
+            },
+        };
         let row = EpochRowEnc {
             members: members.to_vec(),
             base: base.clone(),
             promised_at,
             state: state.to_string(),
+            carrier,
         };
         let bytes = postcard::to_allocvec(&row)?;
         // Called after every epoch-machine step: write (and sync) only a
@@ -665,6 +682,34 @@ impl Meta {
         }
         self.epochs.insert(epoch_id.as_bytes(), bytes)?;
         self.sync()
+    }
+
+    /// ADR-51 (membership evidence): the member sets of the persisted epoch
+    /// rows that may have carried the lease tenure `(holder, lease_epoch)`:
+    /// rows whose members contain `holder` and whose recorded carrier is
+    /// that tenure or is not recorded. Rows are never pruned, so a node
+    /// that joined an epoch before it formed reports it whatever it holds.
+    pub fn epochs_possibly_carrying(
+        &self,
+        holder: u64,
+        lease_epoch: u64,
+    ) -> Result<Vec<Vec<u64>>, MetaError> {
+        let r = self.db.read_tx();
+        let mut out = Vec::new();
+        for guard in r.iter(&self.epochs) {
+            let (_, v) = guard.into_inner()?;
+            let row: EpochRowEnc = postcard::from_bytes(&v)?;
+            if row.members.contains(&holder)
+                && row.carrier.is_none_or(|c| c == (holder, lease_epoch))
+            {
+                let mut members = row.members;
+                members.sort_unstable();
+                out.push(members);
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     pub fn load_open_epoch(&self) -> Result<Option<EpochRow>, MetaError> {
