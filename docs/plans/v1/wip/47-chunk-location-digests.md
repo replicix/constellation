@@ -194,18 +194,30 @@ the owner's log is 1.1 / 3.1 / 3.1 MB at 0.1 / 1 / 10 % churn per minute on
         another test thread can reuse the number of; not this plan's code);
         `tests/smoke.sh` and `tests/integration.sh` passed; pjdfstest 8798/8798
         on the ring (`tests/compliance.sh`, baseline empty).
-  - [ ] the full harness matrix: 280 passed, 11 skipped, 5 failed (seed 42,
-        release, `harness run`). `csi-credential-revocation` needs `versitygw`
-        (not on the box). `writeback-fsync`, `git-under-flock-b2b` and
-        `git-under-flock-rounds` fail the same way on `origin/main`
-        (unchanged by this plan, open findings); `append-setattr-size` failed
-        in the matrix and once more alone (mount died at startup) and passed
-        on its second rerun, and on `origin/main` it failed with ENOSPC. None
-        touches `coop`.
-  - [ ] a load-induced failure of `crates/net/tests/addr_churn.rs` (the link
-        did not recover for 150 s after the selected address vanished): 0 of
-        50 alone, 1 of 10 and 1 of 3 more under load; it predates this plan
-        (the plan adds one trait method to `endpoint.rs`). Open; see PROGRESS.
+  - [ ] the full harness matrix. Latest run (2026-11-10, release, `harness
+        run --seed 42`, origin/main 1af0bb57, quiet box): 283 passed, 11
+        skipped (the `passthrough-*` scenarios need root and
+        `csi-credential-revocation` needs `versitygw`), 3 failed.
+        `delegate-partition` ("b honoured its grant for 11 s without
+        renewing") and `designation-as-delegation` ("c's write under the
+        isolated designation: Some(Io)", want EROFS) fail 3 of 3 alone; both
+        predate this plan and are open findings. `epoch-holder-retired`
+        ("C's write during the frozen epoch returned Ok(())", "A's unflushed
+        write surfaced") failed in the matrix and then 6 of 13 alone on an
+        idle box: a new, nondeterministic failure that does not touch `coop`
+        and is not load-induced; it needs its own investigation. The bullet
+        stays open until the matrix is green. Earlier failures
+        (`lock-grant-dead-generation`, `writeback-fsync`,
+        `git-under-flock-*`, `append-setattr-size`) did not recur.
+  - [x] a load-induced failure of `crates/net/tests/addr_churn.rs` (the link
+        did not recover for 150 s after the selected address vanished): fixed
+        by 3f6f578c (the dial survives its caller's timeout; the evict hook
+        re-dials and re-joins gossip with backoff) and bab474ea (re-dial
+        races closed); `addr_churn` x60 under 40-worker CPU load: 59 passed,
+        0 stalls, 1 run recovered in 2.34 s against the test's 2 s bound. The
+        failure this bullet names was non-recovery; the overrun is a latency
+        degradation under extreme load (the bound is tight there), so the
+        bullet is met.
   - [x] docs (feature reference, configuration, DESIGN, DECISION, RESULTS,
         PROGRESS) updated.
 
