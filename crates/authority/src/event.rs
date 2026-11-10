@@ -543,6 +543,16 @@ pub enum PeerMsg {
         /// journals `Refused { rid, ABANDONED_CODE }` and answers
         /// `MutateOutcome::Abandoned` once that row is committed.
         settle: bool,
+        /// ADR-47: the generation this send was routed by (`0`: to the
+        /// lease holder). A node executes a forward under one of its
+        /// generations `g` only if `routed_gen == g`, else it answers
+        /// `MutateOutcome::Fenced`.
+        routed_gen: u64,
+        /// ADR-47: the highest non-zero generation this rid was ever sent
+        /// under or offered to locally by its requester (`0`: never;
+        /// `u64::MAX`: cannot know). The root refuses for good, under a
+        /// non-stealable grant it cannot reach, only a rid with `0`.
+        touched_gen: u64,
     },
     /// The holder's answer. `base` is the first form of plan 30 §M6's
     /// position on replies: the log position the requester must have

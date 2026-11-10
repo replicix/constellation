@@ -11,6 +11,7 @@
 //! never to a client.
 
 use super::backup::is_answer;
+use super::holder::Fence;
 use super::{ack_counter, Core, S3For, Timer};
 use crate::action::{Action, AnswerSource, ClientReply, S3Op};
 use crate::event::{PeerMsg, Policy, S3Result};
@@ -137,6 +138,10 @@ pub(crate) struct ClientOp {
     /// alive and holds the op by design): the backoff retry goes back to
     /// it when this node's cached holder was dropped meanwhile.
     pub held_by: Option<NodeId>,
+    /// ADR-47: `Fenced` answers followed with a resend routed by the
+    /// answering generation, since the last reset of `attempts`; past two
+    /// the op is routed afresh.
+    pub fence_bounces: u32,
     /// Sent to a holder at least once (or into an inbox): it may have
     /// taken effect there, so every later local execution first checks
     /// `completed`.
@@ -660,6 +665,7 @@ impl Core {
                 attempts: 0,
                 redirected: 0,
                 held_by: None,
+                fence_bounces: 0,
                 forwarded: in_doubt,
                 acquire_retries: 0,
                 deadline,
@@ -722,7 +728,18 @@ impl Core {
                 .map(|c| (c.op.clone(), c.tag.clone()))
                 .expect("present");
             if self.delegate_try_execute(
-                now, 0, None, rid, &op_ref, deps, 0, &tag, false, replica, out,
+                now,
+                0,
+                None,
+                rid,
+                &op_ref,
+                deps,
+                0,
+                &tag,
+                false,
+                Fence::default(),
+                replica,
+                out,
             ) {
                 return;
             }
@@ -735,7 +752,7 @@ impl Core {
                             self.stats.deps_overflow_to_root += 1;
                         } else if self.reaches(now, d.node) {
                             self.stats.deleg_forwarded += 1;
-                            self.send_forward(now, rid, d.node, replica, out);
+                            self.send_forward(now, rid, d.node, 0, replica, out);
                             return;
                         }
                     }
@@ -1170,7 +1187,7 @@ impl Core {
             if let Some(t) = self.clients.get_mut(&rid).and_then(|c| c.timer.take()) {
                 self.cancel_timer(t, out);
             }
-            self.send_forward(now, rid, 0, replica, out);
+            self.send_forward(now, rid, 0, 0, replica, out);
         }
     }
 
@@ -1227,7 +1244,7 @@ impl Core {
         let cached = self.lease.cached_holder.filter(|h| *h != self.cfg.node_id);
         match cached {
             Some(holder) if self.reaches(now, holder) => {
-                self.send_forward(now, rid, holder, replica, out)
+                self.send_forward(now, rid, holder, 0, replica, out)
             }
             // A cache naming this node is not trustworthy on its own
             // (nothing invalidates it when the lease is lost); re-read.
@@ -1333,7 +1350,7 @@ impl Core {
                     "holder learned from the lease"
                 );
                 if reaches {
-                    self.send_forward(now, rid, holder, replica, out);
+                    self.send_forward(now, rid, holder, 0, replica, out);
                 } else if self.cfg.inbox
                     && !self.cfg.refuse_forwarded_designation_ops
                     && self.sent_to_designation(rid, replica)
@@ -1375,6 +1392,7 @@ impl Core {
         now: Now,
         rid: Rid,
         holder: NodeId,
+        routed_gen: u64,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1456,6 +1474,9 @@ impl Core {
                 applied: replica.applied_seq().unwrap_or(0),
                 tag: c.tag.clone(),
                 settle: c.settle,
+                routed_gen,
+                // (Carried from the send history by a later chunk.)
+                touched_gen: 0,
             },
         });
     }
@@ -1763,6 +1784,45 @@ impl Core {
                 }
             }
             MutateOutcome::Busy => self.retry_or_lease(now, rid, replica, out),
+            // ADR-47: the answering node holds the keys under `fenced` and
+            // was not routed by it; nothing ran. Not an attempt, and not a
+            // holder to cache. Sent again routed by that generation, at most
+            // twice; past that the op is routed afresh (table, cache, lease).
+            MutateOutcome::Fenced { gen: fenced } => {
+                let bounced = self.clients.get_mut(&rid).map(|c| {
+                    c.fence_bounces += 1;
+                    c.fence_bounces
+                });
+                if bounced.is_some_and(|n| n <= 2) {
+                    self.stats.fenced_resends += 1;
+                    self.send_forward(now, rid, from, fenced, replica, out);
+                } else {
+                    self.stats.fence_bounce_limit += 1;
+                    self.route(now, rid, replica, out);
+                }
+            }
+            // ADR-47: the root holds an op that touched a non-stealable
+            // generation whose holder it does not reach (nothing journaled).
+            // Held like a `Held`: asked again, no attempt spent; the op ends
+            // by the root's later answer or in doubt at its deadlines.
+            MutateOutcome::HolderUnreachable { retry_ms, .. } => {
+                self.stats.designation_refusals_held += 1;
+                if self
+                    .clients
+                    .get(&rid)
+                    .is_some_and(|c| matches!(c.origin, Origin::Replay { .. }))
+                {
+                    self.replay.stuck_since = None;
+                }
+                let timer =
+                    self.set_timer_wait(now.wait.plus(retry_ms), Timer::ForwardBackoff(rid), out);
+                if let Some(c) = self.clients.get_mut(&rid) {
+                    c.phase = Phase::Backoff;
+                    c.timer = Some(timer);
+                    c.designation_held = true;
+                    c.held_by = Some(from);
+                }
+            }
             MutateOutcome::Held {
                 retry_ms,
                 outwait_ms,
@@ -1873,7 +1933,7 @@ impl Core {
                         c.redirected_to_designee = true;
                     }
                     self.stats.forward_redirects += 1;
-                    self.send_forward(now, rid, holder, replica, out);
+                    self.send_forward(now, rid, holder, 0, replica, out);
                 } else {
                     self.lease_path(now, rid, replica, out);
                 }
@@ -2108,7 +2168,18 @@ impl Core {
                     .map(|c| c.tag.clone())
                     .unwrap_or_default();
                 if self.delegate_try_execute(
-                    now, 0, None, rid, &op, deps, 0, &tag, settle, replica, out,
+                    now,
+                    0,
+                    None,
+                    rid,
+                    &op,
+                    deps,
+                    0,
+                    &tag,
+                    settle,
+                    Fence::default(),
+                    replica,
+                    out,
                 ) {
                     self.stats.deleg_retry_executed += 1;
                     return;
@@ -2130,7 +2201,7 @@ impl Core {
             .filter(|h| *h != self.cfg.node_id);
         match cached {
             Some(holder) if self.reaches(now, holder) => {
-                self.send_forward(now, rid, holder, replica, out)
+                self.send_forward(now, rid, holder, 0, replica, out)
             }
             _ => self.route(now, rid, replica, out),
         }
@@ -2267,7 +2338,7 @@ impl Core {
                 "S3 stalled: forwarding the op again instead of waiting on the lease path"
             );
             self.stats.s3_less_forwards += 1;
-            self.send_forward(now, rid, holder, replica, out);
+            self.send_forward(now, rid, holder, 0, replica, out);
         }
     }
 
@@ -2624,8 +2695,9 @@ impl Core {
                 if holder != self.cfg.node_id && self.reaches(now, holder) {
                     let c = self.clients.get_mut(&rid).expect("present");
                     c.attempts = 0;
+                    c.fence_bounces = 0;
                     c.redirected = 0;
-                    self.send_forward(now, rid, holder, replica, out);
+                    self.send_forward(now, rid, holder, 0, replica, out);
                     return;
                 }
             }
@@ -4001,6 +4073,7 @@ impl Core {
         c.settle_cap = cap;
         c.settle = true;
         c.attempts = 0;
+        c.fence_bounces = 0;
         c.redirected = 0;
         self.stats.settles_sent += 1;
         tracing::debug!(
@@ -4075,8 +4148,20 @@ impl Core {
             return;
         };
         if self.cfg.delegation {
-            if self.delegate_try_execute(now, 0, None, rid, &op, deps, 0, &tag, true, replica, out)
-            {
+            if self.delegate_try_execute(
+                now,
+                0,
+                None,
+                rid,
+                &op,
+                deps,
+                0,
+                &tag,
+                true,
+                Fence::default(),
+                replica,
+                out,
+            ) {
                 return;
             }
             if self.cfg.forwarding && self.cfg.p2p {
@@ -4094,7 +4179,7 @@ impl Core {
                         .get(&d.gen)
                         .is_some_and(|g| g.recall != super::delegate::RecallPhase::None);
                     if d.node != self.cfg.node_id && self.reaches(now, d.node) && !recalling {
-                        self.send_forward(now, rid, d.node, replica, out);
+                        self.send_forward(now, rid, d.node, 0, replica, out);
                         return;
                     }
                 }
@@ -4134,7 +4219,7 @@ impl Core {
         let cached = self.lease.cached_holder.filter(|h| *h != self.cfg.node_id);
         match cached {
             Some(holder) if self.reaches(now, holder) && self.cfg.forwarding => {
-                self.send_forward(now, rid, holder, replica, out)
+                self.send_forward(now, rid, holder, 0, replica, out)
             }
             _ => self.route(now, rid, replica, out),
         }

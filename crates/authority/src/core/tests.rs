@@ -1025,6 +1025,8 @@ fn a_peers_forward_is_busy_while_fenced_and_executes_once_the_gate_opens() {
         applied: 0,
         tag: Default::default(),
         settle: false,
+        routed_gen: 0,
+        touched_gen: 0,
     };
     let out = h.step(Event::Peer {
         from: 2,
@@ -1115,6 +1117,8 @@ fn a_reply_base_names_the_unshipped_overlap() {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         match sends(&out)[0].1 {
@@ -1177,6 +1181,8 @@ fn a_reply_base_counts_an_unshipped_link_of_the_inode_a_name_leaves() {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         match sends(&out)[0].1 {
@@ -3488,6 +3494,8 @@ fn a_reply_base_is_the_last_shipped_touch_not_the_head() {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         match sends(&out)[0].1 {
@@ -4132,6 +4140,8 @@ fn replay_copy_at(h: &mut Harness, from: NodeId, rid: Rid, op: MutateOp) -> Muta
             applied: 0,
             tag: Default::default(),
             settle: false,
+            routed_gen: 0,
+            touched_gen: 0,
         },
     });
     if let Some(outcome) = reply_in(&out) {
@@ -6407,6 +6417,8 @@ mod own_chunks {
                     applied,
                     tag: Default::default(),
                     settle: false,
+                    routed_gen: 0,
+                    touched_gen: 0,
                 },
             });
             let [(2, reply @ PeerMsg::MutateReply { base, .. })] = sends(&out)[..] else {
@@ -6513,6 +6525,8 @@ mod own_chunks {
             applied: 0,
             tag: Default::default(),
             settle: false,
+            routed_gen: 0,
+            touched_gen: 0,
         };
         let tick = |holder: &mut Harness, ms: u64| {
             let out = holder.step(Event::Peer {
@@ -6990,6 +7004,8 @@ mod own_chunks {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             }
         }
 
@@ -8279,6 +8295,8 @@ mod cto {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         })
     }
@@ -9912,6 +9930,8 @@ mod cto {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         let answered = |out: &[Action]| {
@@ -12227,6 +12247,8 @@ mod refusal_outcomes {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         })
     }
@@ -29437,6 +29459,8 @@ mod locks {
                 tag,
                 applied: 0,
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         })
     }
@@ -33874,6 +33898,8 @@ fn a_forward_refused_by_a_journaled_designation_refusal_waits_for_its_row() {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         })
     };
@@ -33984,6 +34010,8 @@ fn a_write_into_a_fresh_delegation_is_recalled_until_the_root_sees_the_delegate(
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         })
     }
@@ -34098,6 +34126,8 @@ mod s3_no_loops {
                 applied: 0,
                 tag: Default::default(),
                 settle,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         })
     }
@@ -34722,6 +34752,7 @@ fn inbox_batch(
             deps: Vec::new(),
             lock_tag: Vec::new(),
             settle: false,
+            touched_gen: 0,
         }],
         wants_lease: false,
     }
@@ -34980,6 +35011,8 @@ fn a_delegate_reply_base_covers_what_it_applied_before_the_grant_and_streamed_st
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         match sends(&out).first().map(|(_, m)| *m) {
@@ -36543,7 +36576,7 @@ fn a_withdrawn_inbox_batch_leaves_a_tombstone_and_its_other_ops_are_resubmitted(
 
     // a finds a P2P path (or must be held back): withdrawn first.
     let mut out = Vec::new();
-    h.core.send_forward(h.clk(), a, 2, &h.meta, &mut out);
+    h.core.send_forward(h.clk(), a, 2, 0, &h.meta, &mut out);
     let (op, req) = s3_ops(&out)[0];
     match req {
         S3Op::InboxTombstone { batch } => {
@@ -36927,6 +36960,8 @@ fn a_forward_to_a_restarted_holder_readopts_its_own_lease() {
         applied: 0,
         tag: Default::default(),
         settle: false,
+        routed_gen: 0,
+        touched_gen: 0,
     };
     let out = h.step(Event::Peer {
         from: 2,
@@ -37010,6 +37045,8 @@ fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         let (get, _) = s3_ops(&out)
@@ -37047,6 +37084,8 @@ fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         assert!(
@@ -37091,6 +37130,8 @@ fn a_released_lease_is_not_readopted_for_a_forward() {
             applied: 0,
             tag: Default::default(),
             settle: false,
+            routed_gen: 0,
+            touched_gen: 0,
         },
     });
     assert!(
@@ -43970,6 +44011,8 @@ mod answer_sources {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         assert!(matches!(
@@ -44011,6 +44054,8 @@ mod answer_sources {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         assert_eq!(h.core.stats.ack_classes, before);
@@ -44143,6 +44188,8 @@ mod stream_end {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         assert!(
@@ -44733,6 +44780,8 @@ mod deleg_group {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         })
     }
@@ -44934,6 +44983,8 @@ mod deleg_group {
                     applied: 0,
                     tag: Default::default(),
                     settle: true,
+                    routed_gen: 0,
+                    touched_gen: 0,
                 },
             })
         };
@@ -45229,6 +45280,7 @@ mod deleg_group {
             0,
             &tag,
             true,
+            crate::core::holder::Fence::default(),
             &h.meta,
             &mut out,
         ));
@@ -46301,6 +46353,8 @@ mod deleg_group {
                     applied: 0,
                     tag: Default::default(),
                     settle: false,
+                    routed_gen: 0,
+                    touched_gen: 0,
                 },
             })
         };
@@ -46391,6 +46445,8 @@ mod deleg_group {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         assert_eq!(
@@ -53704,6 +53760,8 @@ mod c1_class {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         assert!(sends(&out).iter().all(|(_, m)| !matches!(
@@ -53862,6 +53920,8 @@ mod c1_class {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         };
         let replies = |out: &[Action]| {
@@ -53944,6 +54004,8 @@ mod c1_class {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         };
         let committed = |out: &[Action]| {
@@ -54900,6 +54962,8 @@ mod c2f_lone_root {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         }
     }
@@ -55252,6 +55316,8 @@ mod c2f_lone_root {
                     applied: 0,
                     tag: Default::default(),
                     settle,
+                    routed_gen: 0,
+                    touched_gen: 0,
                 },
             });
             assert!(answers(&out).is_empty(), "waits for the archive: {out:?}");
@@ -55484,6 +55550,8 @@ mod c2g_settle {
                 applied: 0,
                 tag: Default::default(),
                 settle,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         }
     }
@@ -55611,6 +55679,8 @@ mod c2g_settle {
                 applied: 0,
                 tag: Default::default(),
                 settle,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         };
         let op = h.create("p");
@@ -56175,6 +56245,8 @@ mod c2g_settle {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         let reply = sends(&out).into_iter().find_map(|(to, m)| match m {
@@ -58104,6 +58176,8 @@ mod c2g_settle {
                 applied: 0,
                 tag: Default::default(),
                 settle: true,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         assert!(
@@ -58212,6 +58286,8 @@ fn a_delegates_held_answer_is_not_the_roots() {
             applied: 0,
             tag: Default::default(),
             settle: false,
+            routed_gen: 0,
+            touched_gen: 0,
         },
     });
     let held = sends(&out).into_iter().find_map(|(to, m)| match m {
@@ -58395,6 +58471,8 @@ mod await_retry {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         })
     }
@@ -58761,6 +58839,8 @@ mod await_retry {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         assert_eq!(
@@ -58849,6 +58929,8 @@ mod await_retry {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         })
     }
@@ -60074,6 +60156,8 @@ mod await_retry {
                     applied: 0,
                     tag: Default::default(),
                     settle: false,
+                    routed_gen: 0,
+                    touched_gen: 0,
                 },
             })
         };
@@ -60429,6 +60513,8 @@ mod m11_step5 {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         assert!(!h.core.root_lone(), "a peer asked: no singleton any more");
@@ -60493,6 +60579,8 @@ mod m11_step5 {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         assert!(swap_lease(&out).is_some_and(|l| !l.singleton), "{out:?}");
@@ -60715,6 +60803,8 @@ mod hold_ack {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
             },
         });
         (rid, out)
@@ -66993,6 +67083,118 @@ mod step14_release_seal {
         assert!(
             h.core.dl.gens[&7].ended,
             "its own member copy holds nothing above the cursor: the generation ends"
+        );
+    }
+}
+
+/// ADR-47, the requester's side of the fence on the wire: the forward's
+/// fence fields, a `Fenced` answer's resend and a `HolderUnreachable` hold.
+mod route_fence_wire {
+    use super::*;
+
+    /// Node 1 forwards a create to the cached holder, node 2; returns the
+    /// harness and the forward's request id.
+    fn forwarded() -> (Harness, Rid, OpId) {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        let rid = h.rid(1);
+        let op = h.create("a");
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        let sent = sends(&out);
+        assert_eq!(sent.len(), 1);
+        let PeerMsg::MutateRequest {
+            req,
+            routed_gen,
+            touched_gen,
+            ..
+        } = sent[0].1
+        else {
+            panic!("{:?}", sent[0].1);
+        };
+        // A forward to the cached lease holder is routed by no generation.
+        assert_eq!((*routed_gen, *touched_gen), (0, 0));
+        (h, rid, *req)
+    }
+
+    fn reply(req: OpId, outcome: MutateOutcome, gen: u64) -> Event {
+        Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome,
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+            },
+        }
+    }
+
+    fn forward_routed_by(out: &[Action]) -> Option<(NodeId, OpId, u64)> {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::MutateRequest {
+                req, routed_gen, ..
+            } => Some((to, *req, *routed_gen)),
+            _ => None,
+        })
+    }
+
+    /// A `Fenced` answer is not an attempt: the op goes back to the node
+    /// that fenced it, routed by the generation it named; past two resends
+    /// it is routed afresh.
+    #[test]
+    fn a_fenced_answer_is_resent_routed_by_its_generation() {
+        let (mut h, rid, mut req) = forwarded();
+        for n in 1..=2u64 {
+            let out = h.step(reply(req, MutateOutcome::Fenced { gen: 7 }, 7));
+            let (to, next, routed) = forward_routed_by(&out).expect("resent");
+            assert_eq!((to, routed), (2, 7), "{out:?}");
+            assert_ne!(next, req, "a fresh correlation id");
+            assert_eq!(h.core.stats.fenced_resends, n);
+            assert_eq!(h.core.clients[&rid].attempts, 0, "not an attempt");
+            req = next;
+        }
+        let out = h.step(reply(req, MutateOutcome::Fenced { gen: 7 }, 7));
+        assert_eq!(h.core.stats.fenced_resends, 2);
+        assert_eq!(h.core.stats.fence_bounce_limit, 1);
+        assert!(
+            forward_routed_by(&out).is_none_or(|(_, _, routed)| routed == 0),
+            "routed afresh, not by the generation again: {out:?}"
+        );
+        // The designee is not cached as the lease holder.
+        assert_eq!(h.core.lease.cached_holder, Some(2));
+    }
+
+    /// A `HolderUnreachable` answer holds the op: no send, a backoff timer
+    /// at `retry_ms`, no attempt spent, and the hold is the exception's
+    /// label (`designation_held`).
+    #[test]
+    fn a_holder_unreachable_answer_holds_the_op() {
+        let (mut h, rid, req) = forwarded();
+        let out = h.step(reply(
+            req,
+            MutateOutcome::HolderUnreachable {
+                gen: 7,
+                retry_ms: 300,
+            },
+            0,
+        ));
+        assert!(sends(&out).is_empty(), "{out:?}");
+        assert_eq!(timers(&out, TimerKind::ForwardBackoff).len(), 1);
+        let c = &h.core.clients[&rid];
+        assert_eq!(c.attempts, 0);
+        assert!(c.designation_held);
+        assert_eq!(h.core.stats.designation_refusals_held, 1);
+        assert!(
+            replies(&out).is_empty(),
+            "never reaches the client: {out:?}"
         );
     }
 }

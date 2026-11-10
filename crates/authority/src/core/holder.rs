@@ -18,6 +18,22 @@ use constellation_meta::{
 };
 use constellation_types::Code;
 
+/// ADR-47: what a forward carries about the route it was sent by, both
+/// numbers computed by its requester from its own send history only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Fence {
+    /// The generation this send was routed by (`0`: to the lease holder).
+    pub routed_gen: u64,
+    /// The highest non-zero generation the rid was ever sent under or
+    /// offered to locally (`0`: never; [`TOUCHED_UNKNOWN`]: cannot know).
+    pub touched_gen: u64,
+}
+
+/// `Fence::touched_gen` of a rid whose send history is not known here (a
+/// replay, a fast-path in-doubt resubmission, an evicted record).
+#[allow(dead_code)]
+pub(crate) const TOUCHED_UNKNOWN: u64 = u64::MAX;
+
 /// The keys `op` reads or writes, before it runs (a refusal touches
 /// nothing but is evaluated against them), as the replica's unshipped
 /// set keeps them.
@@ -72,6 +88,7 @@ impl Core {
         deps_applied: (Position, Seq),
         tag: LockTag,
         settle: bool,
+        fence: Fence,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -85,6 +102,7 @@ impl Core {
             deps_applied,
             tag,
             settle,
+            fence,
             replica,
             out,
         );
@@ -108,6 +126,7 @@ impl Core {
         (deps, applied): (Position, Seq),
         tag: LockTag,
         settle: bool,
+        fence: Fence,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -145,6 +164,7 @@ impl Core {
                 acked_through,
                 &tag,
                 settle,
+                fence,
                 replica,
                 out,
             )
@@ -491,7 +511,7 @@ impl Core {
                             (wait, None),
                             deps_wait,
                             from,
-                            (req, rid, op, acked_through, tag, settle),
+                            (req, rid, op, acked_through, tag, settle, fence),
                             false,
                             out,
                         );
@@ -507,7 +527,7 @@ impl Core {
                         Default::default(),
                         Some(deps),
                         from,
-                        (req, rid, op, acked_through, tag, settle),
+                        (req, rid, op, acked_through, tag, settle, fence),
                         false,
                         out,
                     );
@@ -529,7 +549,7 @@ impl Core {
                         Default::default(),
                         None,
                         from,
-                        (req, rid, op, acked_through, tag, settle),
+                        (req, rid, op, acked_through, tag, settle, fence),
                         true,
                         out,
                     );
@@ -571,7 +591,7 @@ impl Core {
                             wait,
                             None,
                             from,
-                            (req, rid, op, acked_through, tag, settle),
+                            (req, rid, op, acked_through, tag, settle, fence),
                             false,
                             out,
                         );

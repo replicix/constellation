@@ -1367,6 +1367,8 @@ pub async fn run_gossip<S: PeerService>(
                 applied,
                 lock_tag,
                 settle,
+                routed_gen,
+                touched_gen,
             } => {
                 // The request carries `rid`/`acked_through`, which mutate
                 // per-requester exactly-once dedup state: an enrolled peer
@@ -1390,6 +1392,7 @@ pub async fn run_gossip<S: PeerService>(
                         *applied,
                         *settle,
                     );
+                    let (routed_gen, touched_gen) = (*routed_gen, *touched_gen);
                     let (part, op, deps, pending, lock_tag) = (
                         part.clone(),
                         op.clone(),
@@ -1412,6 +1415,8 @@ pub async fn run_gossip<S: PeerService>(
                                 applied,
                                 lock_tag,
                                 settle,
+                                routed_gen,
+                                touched_gen,
                             )
                             .await;
                     });
@@ -1772,6 +1777,8 @@ async fn handle_stream<S: PeerService>(
                 applied,
                 lock_tag,
                 settle,
+                routed_gen,
+                touched_gen,
             } => {
                 // The request carries `rid`/`acked_through`, which mutate
                 // per-requester exactly-once dedup state: only the node that
@@ -1793,6 +1800,8 @@ async fn handle_stream<S: PeerService>(
                                 applied,
                                 lock_tag,
                                 settle,
+                                routed_gen,
+                                touched_gen,
                             )
                             .await,
                     )

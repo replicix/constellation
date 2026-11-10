@@ -1103,7 +1103,9 @@ impl Core {
                 None
                 | Some(MutateOutcome::Busy)
                 | Some(MutateOutcome::NotHolder { .. })
-                | Some(MutateOutcome::Held { .. }) => {}
+                | Some(MutateOutcome::Held { .. })
+                | Some(MutateOutcome::Fenced { .. })
+                | Some(MutateOutcome::HolderUnreachable { .. }) => {}
                 Some(outcome) => {
                     if outcome == MutateOutcome::Abandoned {
                         self.stats.await_retry_settled += 1;
@@ -1125,7 +1127,9 @@ impl Core {
                 None
                 | Some(MutateOutcome::Busy)
                 | Some(MutateOutcome::NotHolder { .. })
-                | Some(MutateOutcome::Held { .. }) => {}
+                | Some(MutateOutcome::Held { .. })
+                | Some(MutateOutcome::Fenced { .. })
+                | Some(MutateOutcome::HolderUnreachable { .. }) => {}
                 Some(MutateOutcome::Accepted { .. }) => {
                     self.stats.refused_entries_survived += 1;
                     let _ = replica.forget_replay(queue_seq);
@@ -1179,7 +1183,9 @@ impl Core {
             None
             | Some(MutateOutcome::Busy)
             | Some(MutateOutcome::NotHolder { .. })
-            | Some(MutateOutcome::Held { .. }) => return,
+            | Some(MutateOutcome::Held { .. })
+            | Some(MutateOutcome::Fenced { .. })
+            | Some(MutateOutcome::HolderUnreachable { .. }) => return,
             Some(MutateOutcome::Errno(code)) if refusal_is_satisfied(&queued.op, code) => {
                 self.stats.stranded_replayed += 1;
                 let _ = replica.forget_replay(queue_seq);
