@@ -1334,10 +1334,15 @@ pub fn sticky_holder_restart(_seed: u64) -> Result<()> {
             "b came back after {:?}: the old read delegations may have lapsed, the scenario proves nothing",
             killed.elapsed()
         );
-        // The other nodes' pooled connections to the dead process are
-        // evicted after a short window (2 s); an op sent into one is in
-        // doubt (EIO) for tens of seconds. Wait it out: the read
-        // delegations (30 s) are still live.
+        // KNOWN WORKAROUND (open bug, logged in TRIAGE.md, not fixed here):
+        // an op sent into a pooled connection to the killed process
+        // surfaces to the client as EIO for tens of seconds. Under the
+        // load-robustness rule a peer's crash must cost latency, never a
+        // client-visible error, so this sleep hides a harness-visible bug.
+        // It stays only until that bug is fixed; the scenario must then
+        // run without it. The other nodes evict their pooled connections to
+        // the dead process after a short window (2 s). The read delegations
+        // (30 s) are still live meanwhile.
         std::thread::sleep(Duration::from_millis(3_500));
         anyhow::ensure!(
             killed.elapsed() < Duration::from_secs(25),

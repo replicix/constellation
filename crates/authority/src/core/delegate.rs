@@ -8076,7 +8076,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         use constellation_meta::readdeleg::DelegHorizon;
-        let span = self.cfg.read_horizon_span_ms();
+        let span = self.dl_t().read_span as i64;
         let horizon = match replica.load_deleg_grant_quarantine(now, span) {
             DelegHorizon::None => {
                 replica.settle_deleg_grant_horizon(now);
@@ -8111,12 +8111,24 @@ impl Core {
             .is_some_and(|q| !q.voided && now.wait < q.until)
     }
 
-    /// The nodes that may hold a read delegation of this node's delegates:
-    /// the roster and the links without this node, once both a roster and a
-    /// peer snapshot have arrived (until then the set is not known, and an
-    /// empty one would read as "nobody holds any").
+    /// The nodes that may hold a read delegation of this node's delegates,
+    /// or `None` while that set is not known. The early exit of a
+    /// restart quarantine and the abandon of a stream end a wait because
+    /// every node of this set has dropped its grants, so the set is a
+    /// safety boundary: it must contain every node that can hold a grant
+    /// of the previous process, read-only members included.
+    ///
+    /// Invariant relied on: the peer directory behind `links` was filled
+    /// by a registry scan that read every record without an error
+    /// (`Event::Peers::registry_complete`), so it lists every live node,
+    /// read-only ones too, and a node enrolled later cannot hold a grant
+    /// of a process that is already gone. The roster (write-eligible
+    /// nodes) alone never names read-only members. Until the roster and
+    /// such a snapshot have arrived the set is not known (and an empty
+    /// one would read as "nobody holds any"); then the horizon decides.
+    /// This is the one place that builds the audience.
     pub(crate) fn void_audience(&self) -> Option<BTreeSet<NodeId>> {
-        if !(self.roster_seen && self.peers_seen) {
+        if !(self.roster_seen && self.peers_seen && self.peers_complete) {
             return None;
         }
         let mut peers: BTreeSet<NodeId> = self.roster.iter().copied().collect();
@@ -8373,8 +8385,15 @@ impl Core {
                 if quarantined {
                     self.stats.deleg_read_grants_quarantined += 1;
                     None
-                } else if !replica.note_deleg_grant_horizon(until, now) {
-                    // Not persisted: not granted (as the root's).
+                } else if !self.grant_horizon_covers(
+                    constellation_meta::readdeleg::GrantHorizon::Deleg,
+                    now,
+                    until,
+                    replica,
+                ) {
+                    // Not durable yet: not granted (as the root's); the
+                    // read is answered with its position, and the horizon
+                    // is being written ahead.
                     None
                 } else {
                     let id = replica.read_delegations().grant(from, ino, until);

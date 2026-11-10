@@ -91,6 +91,13 @@ pub enum Event {
         until: WaitMs,
         durable: Option<WaitMs>,
     },
+    /// `Action::PersistGrantHorizon { kind, until }` finished: `durable`
+    /// is the horizon now on disk, `None` if the write failed.
+    GrantHorizonPersisted {
+        kind: constellation_meta::readdeleg::GrantHorizon,
+        until: WaitMs,
+        durable: Option<WaitMs>,
+    },
     /// `Action::SyncDelegStream { gen, through }` finished: `ok` the sync
     /// succeeded (the rows through `through` are on the disk).
     DelegStreamSynced { gen: u64, through: u64, ok: bool },
@@ -114,8 +121,14 @@ pub enum Event {
     /// (read before it, never after): the core is lone on it only if no
     /// lapse of its own was handed since (`Core::backup_could_be_had`).
     /// `issued`: the wait clock before the snapshot was taken, as for
-    /// [`Event::Roster`].
+    /// [`Event::Roster`]. `registry_complete`: the directory behind the
+    /// snapshot was filled by a registry scan that read every record
+    /// (live nodes of both kinds, read-only members included) after this
+    /// process started, and the flag was read before the snapshot. Only
+    /// then do the links name everyone who may hold a read delegation
+    /// (`Core::void_audience`).
     Peers {
+        registry_complete: bool,
         links: Vec<PeerLink>,
         lapses: u64,
         issued: WaitMs,

@@ -3961,7 +3961,19 @@ impl Core {
                  the floor is armed again"
             );
             self.note_floor_restart();
-            self.ack.floor_mark_unreadable = false;
+            // The floor is owed for this epoch: the mark names it now, so
+            // that the floor's coverage clears the key on disk (an
+            // unreadable value would otherwise arm the floor at every
+            // restart that re-adopts the lease).
+            self.ack.floor_mark = Some(epoch);
+        }
+        // The start-time adoption is decided: an unreadable mark was
+        // either taken for this epoch's above, or is not this lease's
+        // (another holder, a TTL takeover, a claim of its own that wrote
+        // a mark anew). It goes, and no later adoption of this process
+        // arms a floor for it.
+        if std::mem::take(&mut self.ack.floor_mark_unreadable) && self.ack.floor_mark.is_none() {
+            replica.clear_takeover_floor_pending();
         }
         if !self.ack.pending_floor && self.ack.floor_mark.take().is_some() {
             // The claim armed no floor (a TTL takeover, or an unmarked

@@ -1487,6 +1487,12 @@ pub struct Stats {
     pub lock_horizon_held: u64,
     pub lock_horizon_writes: u64,
     pub lock_horizon_failed: u64,
+    /// The read-grant horizons' write-ahead lane (`Action::PersistGrantHorizon`):
+    /// the writes issued, the ones that failed, and the reads answered
+    /// with no grant because no durable horizon covered it yet.
+    pub grant_horizon_writes: u64,
+    pub grant_horizon_failed: u64,
+    pub read_grants_uncovered: u64,
     /// Plan 41 L0: renewal answers (lock grants, own and peers', and
     /// delegations) held because the tenure's S3 liveness was stale or
     /// it was not marked as granting; the lease reads issued for them;
@@ -2322,6 +2328,10 @@ pub struct Core {
     lapses_seen: u64,
     peers_lapses: u64,
     peers_seen: bool,
+    /// A snapshot has arrived whose directory a complete registry scan
+    /// filled (`Event::Peers::registry_complete`); it stays set, for the
+    /// directory keeps its cached peers when a later scan fails.
+    peers_complete: bool,
     /// When this node last heard from each peer (a message, or the driver's
     /// `PeerLink::last_seen`), on its wait clock. Kept across the link
     /// table's replacement (`Event::Peers`), which drops a link's last
@@ -2444,6 +2454,7 @@ impl Core {
             lapses_seen: 0,
             peers_lapses: 0,
             peers_seen: false,
+            peers_complete: false,
             peer_heard: BTreeMap::new(),
             own_s3: OwnS3::default(),
             readopt_refused_until: WaitMs(0),
@@ -2726,6 +2737,11 @@ impl Core {
             Event::DelegStreamSynced { gen, through, ok } => {
                 self.on_deleg_stream_synced(now, gen, through, ok, replica, &mut out)
             }
+            Event::GrantHorizonPersisted {
+                kind,
+                until,
+                durable,
+            } => self.on_grant_horizon_persisted(kind, until, durable),
             Event::LockHorizonPersisted { until, durable } => {
                 self.on_lock_horizon_persisted(now, until, durable, replica, &mut out)
             }
@@ -2764,6 +2780,7 @@ impl Core {
                 }
             }
             Event::Peers {
+                registry_complete,
                 links,
                 lapses,
                 issued,
@@ -2789,6 +2806,7 @@ impl Core {
                 self.peer_requesters
                     .retain(|n, at| !links.contains_key(n) || issued <= *at);
                 self.peers_seen = true;
+                self.peers_complete |= registry_complete;
                 self.peers_lapses = self.peers_lapses.max(lapses);
                 self.refresh_backup_eligibility();
                 self.stream_on_peers(now);
@@ -2864,6 +2882,7 @@ impl Core {
             Event::Slack { epoch_slack } => self.on_slack(now, epoch_slack, replica, &mut out),
             Event::Control { op, req } => self.on_control(now, op, req, replica, &mut out),
         }
+        self.grant_horizon_after_event(replica, &mut out);
         self.deleg_root_sync_due(now, replica, &mut out);
         self.resolve_moot_waits(now, replica, &mut out);
         self.reroute_ended_epoch_waits(now, replica, &mut out);

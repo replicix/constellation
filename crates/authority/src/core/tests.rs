@@ -39,6 +39,10 @@ struct Harness {
     /// `step` leaves `Action::PersistLockHorizon` to the test (a slow
     /// write); otherwise it completes it at once, as the driver would.
     manual_horizon: bool,
+    /// The read-grant horizons are not written ahead before a read: the
+    /// first grant finds nothing durable (`Core::grant_horizon_covers`).
+    /// Otherwise a read finds the lane warm, as steady reading does.
+    cold_horizon: bool,
 }
 
 impl Harness {
@@ -71,6 +75,7 @@ impl Harness {
         core.handle(
             Now::same(now.0),
             Event::Peers {
+                registry_complete: true,
                 links: (2..=4)
                     .map(|node| crate::event::PeerLink {
                         node,
@@ -92,10 +97,56 @@ impl Harness {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            cold_horizon: false,
         }
     }
 
+    /// The write-ahead of the read-grant horizons has landed (unless the
+    /// test is `cold_horizon`): both are durable a grant's lifetime and a
+    /// second ahead, as a node that has been reading for a second finds
+    /// them. A read after this is granted in its own step.
+    fn warm_grant_horizons(&mut self) {
+        for kind in constellation_meta::readdeleg::GrantHorizon::ALL {
+            self.warm_grant_horizon(kind);
+        }
+    }
+
+    fn warm_grant_horizon(&mut self, kind: constellation_meta::readdeleg::GrantHorizon) {
+        if self.cold_horizon {
+            return;
+        }
+        let span = (self.core.cfg.read_delegation_ttl_ms + self.core.cfg.expiry_margin_ms) as u64;
+        let until = self.clk().wait.plus(span + 1_000);
+        self.meta
+            .persist_grant_horizon(kind, until, self.clk())
+            .unwrap();
+    }
+
+    /// [`Core::deleg_read_index`] on a warm lane.
+    fn deleg_read_index(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        ino: constellation_fs_core::Ino,
+        name: Option<&str>,
+    ) -> Option<crate::event::ReadIndexOutcome> {
+        self.warm_grant_horizon(constellation_meta::readdeleg::GrantHorizon::Deleg);
+        self.core.deleg_read_index(now, from, ino, name, &self.meta)
+    }
+
     fn step(&mut self, event: Event) -> Vec<Action> {
+        if matches!(
+            &event,
+            Event::Peer {
+                msg: PeerMsg::ReadIndex { .. },
+                ..
+            } | Event::Control {
+                req: Control::ReadIndex { .. },
+                ..
+            }
+        ) {
+            self.warm_grant_horizons();
+        }
         // Plan 43 C7b: a test that hands the core a foreign lease whose
         // expiry has passed means a lease its claimant has watched run out
         // (a claim is judged by the claimant's own observation, not by the
@@ -131,6 +182,27 @@ impl Harness {
         let mut i = 0;
         let mut writes = 0;
         while i < out.len() {
+            if let Action::PersistGrantHorizon { kind, until } = out[i] {
+                writes += 1;
+                assert!(
+                    writes <= 16,
+                    "the grant horizon write never covers what it was asked for"
+                );
+                let durable = self
+                    .meta
+                    .persist_grant_horizon(kind, until, self.clk())
+                    .ok();
+                let more = self.core.handle(
+                    self.clk(),
+                    Event::GrantHorizonPersisted {
+                        kind,
+                        until,
+                        durable,
+                    },
+                    &self.meta,
+                );
+                out.extend(more);
+            }
             if let Action::PersistLockHorizon { until } = out[i] {
                 // A core that asks again for every write it is answered
                 // would loop here for ever: a regression must fail, not
@@ -3755,6 +3827,7 @@ fn pair() -> (Harness, Harness) {
     holder.hold(1, None);
     let mut requester = Harness::new(2);
     requester.step(Event::Peers {
+        registry_complete: true,
         links: [1, 3]
             .into_iter()
             .map(|node| crate::event::PeerLink {
@@ -6875,6 +6948,7 @@ mod own_chunks {
                     .core
                     .start(requester.clk(), &requester.meta, &mut out);
                 requester.step(Event::Peers {
+                    registry_complete: true,
                     links: [1, 3]
                         .into_iter()
                         .map(|node| crate::event::PeerLink {
@@ -7238,6 +7312,7 @@ fn stream_pair() -> (Harness, Harness, OpId) {
     let mut sub = Harness::with(2, true);
     sub.core.lease.cached_holder = Some(1);
     let out = sub.step(Event::Peers {
+        registry_complete: true,
         links: Vec::new(),
         lapses: 0,
         issued: WaitMs(i64::MAX),
@@ -8090,6 +8165,7 @@ fn serving_follows_the_lease() {
     let (mut holder, _sub, req) = stream_pair();
     holder.core.lease.released();
     let out = holder.step(Event::Peers {
+        registry_complete: true,
         links: Vec::new(),
         lapses: 0,
         issued: WaitMs(i64::MAX),
@@ -8134,6 +8210,7 @@ fn a_parked_holder_is_asked_again_once_a_hint_shows_the_log_moved() {
     // Parked: past every backoff, nothing new in the log, no resubscribe.
     sub.advance(sub.core.config().stream_retry_max_ms + 1);
     let out = sub.step(Event::Peers {
+        registry_complete: true,
         links: Vec::new(),
         lapses: 0,
         issued: WaitMs(i64::MAX),
@@ -8162,6 +8239,7 @@ fn a_lone_node_never_subscribes() {
     let mut solo = Harness::with(1, true);
     solo.hold(1, None);
     let out = solo.step(Event::Peers {
+        registry_complete: true,
         links: Vec::new(),
         lapses: 0,
         issued: WaitMs(i64::MAX),
@@ -8170,6 +8248,7 @@ fn a_lone_node_never_subscribes() {
     solo.core.lease.released();
     solo.core.lease.cached_holder = Some(1);
     let out = solo.step(Event::Peers {
+        registry_complete: true,
         links: Vec::new(),
         lapses: 0,
         issued: WaitMs(i64::MAX),
@@ -9268,6 +9347,7 @@ mod cto {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            cold_horizon: false,
         };
         h.hold(1, None);
         let out = forward(&mut h, 3, 9, 1, setattr(ino));
@@ -10585,6 +10665,7 @@ mod epoch_rules {
         let mut h = Harness::new(2);
         h.core.lease.cached_holder = Some(1);
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 1,
                 connected: true,
@@ -10639,6 +10720,7 @@ mod epoch_rules {
             let mut h = Harness::new(2);
             h.core.lease.cached_holder = Some(1);
             h.step(Event::Peers {
+                registry_complete: true,
                 links: vec![crate::event::PeerLink {
                     node: 1,
                     connected: true,
@@ -12639,6 +12721,7 @@ mod pipelined_appends {
         };
         // Node 2's link is the older one: it is preferred.
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![link(2, 0), link(3, 1)],
             lapses: 0,
             issued: WaitMs(i64::MAX),
@@ -12665,6 +12748,7 @@ mod pipelined_appends {
             if h.now.since(start) % 1_000 == 0 {
                 // The driver's directory refresh, every second.
                 h.step(Event::Peers {
+                    registry_complete: true,
                     links: vec![link(2, 0), link(3, 1)],
                     lapses: 0,
                     issued: WaitMs(i64::MAX),
@@ -13475,6 +13559,7 @@ mod m10 {
         // An observed expiry does not make it promise either.
         h.seen_expired(&lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers {
+            registry_complete: true,
             links: Vec::new(),
             lapses: 0,
             issued: WaitMs(i64::MAX),
@@ -13489,6 +13574,7 @@ mod m10 {
         let mut h = flex(1);
         h.seen_expired(&lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers {
+            registry_complete: true,
             links: Vec::new(),
             lapses: 0,
             issued: WaitMs(i64::MAX),
@@ -13507,6 +13593,7 @@ mod m10 {
             "the heartbeat names the key observed: {out:?}"
         );
         let out = h.step(Event::Peers {
+            registry_complete: true,
             links: Vec::new(),
             lapses: 0,
             issued: WaitMs(i64::MAX),
@@ -13520,6 +13607,7 @@ mod m10 {
         // P2P up: takers ask; an observed expiry alone promises nothing.
         let mut h = flex(1);
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 2,
                 connected: true,
@@ -13532,6 +13620,7 @@ mod m10 {
         });
         h.seen_expired(&lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 2,
                 connected: true,
@@ -13547,6 +13636,7 @@ mod m10 {
         let mut h = flex(0);
         h.seen_expired(&lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers {
+            registry_complete: true,
             links: Vec::new(),
             lapses: 0,
             issued: WaitMs(i64::MAX),
@@ -13726,6 +13816,7 @@ mod m10 {
             issued: WaitMs(i64::MAX),
         });
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 1,
                 connected: true,
@@ -14761,6 +14852,7 @@ mod backup_crash {
     ) -> Vec<Action> {
         let since = w(h.now).minus(age);
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 2,
                 connected,
@@ -15410,6 +15502,7 @@ mod backup_crash {
             issued: WaitMs(i64::MAX),
         });
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 2,
                 connected: true,
@@ -15426,6 +15519,7 @@ mod backup_crash {
         // A selection pass with node 2 listed.
         h.advance(1_000);
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 2,
                 connected: true,
@@ -15946,6 +16040,7 @@ mod backup_crash {
             .core
             .start(requester.clk(), &requester.meta, &mut out);
         requester.step(Event::Peers {
+            registry_complete: true,
             links: [1, 3]
                 .into_iter()
                 .map(|node| crate::event::PeerLink {
@@ -16211,11 +16306,13 @@ mod backup_crash {
                 honour_off: 0,
                 wait_off: 0,
                 manual_horizon: false,
+                cold_horizon: false,
             };
             let mut out = Vec::new();
             core.start(h.clk(), &h.meta, &mut out);
             h.core = core;
             let links = |connected: bool| Event::Peers {
+                registry_complete: true,
                 links: vec![crate::event::PeerLink {
                     node: 1,
                     connected,
@@ -20205,6 +20302,7 @@ mod locks {
                 honour_off: 0,
                 wait_off: 0,
                 manual_horizon: false,
+                cold_horizon: false,
             };
             h.hold(2, None);
             h
@@ -20301,6 +20399,7 @@ mod locks {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            cold_horizon: false,
         };
         h.hold(2, None);
         let out = request(&mut h, 3, 30, ino, X, false);
@@ -20359,6 +20458,7 @@ mod locks {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            cold_horizon: false,
         };
         h.step_wall(3_600_000);
         h.core.start(h.clk(), &h.meta, &mut Vec::new());
@@ -23585,6 +23685,7 @@ mod locks {
         h.core.cfg.lock_ttl_ms = 20_000;
         uncap(&mut h);
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 3,
                 connected: true,
@@ -24423,6 +24524,7 @@ mod locks {
         let mut r = Harness::new(2);
         r.core.lease.cached_holder = Some(1);
         r.step(Event::Peers {
+            registry_complete: true,
             links: (1..=4)
                 .map(|node| crate::event::PeerLink {
                     node,
@@ -25987,6 +26089,7 @@ mod locks {
         r.core.handle(
             r.clk(),
             Event::Peers {
+                registry_complete: true,
                 links: (1..=4)
                     .filter(|n| *n != h.core.node_id())
                     .map(|node| crate::event::PeerLink {
@@ -27734,6 +27837,7 @@ mod locks {
         let mut r = requester();
         // Node 1, the cached holder, is gone.
         r.step(Event::Peers {
+            registry_complete: true,
             links: (2..=4)
                 .map(|node| crate::event::PeerLink {
                     node,
@@ -27816,6 +27920,7 @@ mod locks {
         let mut r = requester();
         // Node 1, the cached holder, is gone.
         r.step(Event::Peers {
+            registry_complete: true,
             links: (2..=4)
                 .map(|node| crate::event::PeerLink {
                     node,
@@ -27942,6 +28047,7 @@ mod locks {
     fn a_reused_lease_read_is_no_sighting_of_the_lease() {
         let mut r = requester();
         r.step(Event::Peers {
+            registry_complete: true,
             links: (2..=4)
                 .map(|node| crate::event::PeerLink {
                     node,
@@ -28012,6 +28118,7 @@ mod locks {
     fn a_shared_lease_read_serves_the_requests_that_waited_when_the_first_is_gone() {
         let mut r = requester();
         r.step(Event::Peers {
+            registry_complete: true,
             links: (2..=4)
                 .map(|node| crate::event::PeerLink {
                     node,
@@ -33987,6 +34094,7 @@ fn a_write_into_a_fresh_delegation_is_recalled_until_the_root_sees_the_delegate(
         );
         if c_connected {
             h.step(Event::Peers {
+                registry_complete: true,
                 links: (2..=4)
                     .map(|node| crate::event::PeerLink {
                         node,
@@ -34093,6 +34201,7 @@ mod s3_no_loops {
             "not delegated: {out:?}"
         );
         h.step(Event::Peers {
+            registry_complete: true,
             links: (2..=4)
                 .map(|node| crate::event::PeerLink {
                     node,
@@ -34704,6 +34813,7 @@ mod s3_no_loops {
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         assert!(h.core.dl.gens.contains_key(&7));
         h.step(Event::Peers {
+            registry_complete: true,
             links: (2..=4)
                 .map(|node| crate::event::PeerLink {
                     node,
@@ -35060,6 +35170,7 @@ fn a_delegate_reply_base_covers_what_it_applied_before_the_grant_and_streamed_st
 fn a_wanter_across_a_p2p_partition_does_not_take_the_lease_from_its_users() {
     fn links(h: &mut Harness, connected: &[NodeId]) {
         h.step(Event::Peers {
+            registry_complete: true,
             links: (2..=4)
                 .map(|node| crate::event::PeerLink {
                     node,
@@ -36088,6 +36199,7 @@ fn a_candidate_that_sealed_the_epoch_is_not_reinvited() {
         issued: WaitMs(i64::MAX),
     });
     h.step(Event::Peers {
+        registry_complete: true,
         links: vec![crate::event::PeerLink {
             node: 2,
             connected: true,
@@ -36196,6 +36308,7 @@ fn an_inbox_op_is_forwarded_once_the_holder_is_reachable() {
     );
     // The link to the holder comes up; the recheck reads the lease.
     h.step(Event::Peers {
+        registry_complete: true,
         links: vec![crate::event::PeerLink {
             node: 2,
             connected: true,
@@ -36272,6 +36385,7 @@ fn an_inbox_op_is_forwarded_once_the_holder_is_reachable() {
 fn a_flapping_p2p_link_never_polls_an_idle_requester_faster_than_its_backoff() {
     fn links(h: &mut Harness, up: bool) {
         h.step(Event::Peers {
+            registry_complete: true,
             links: (2..=4)
                 .map(|node| crate::event::PeerLink {
                     node,
@@ -36405,6 +36519,7 @@ fn an_inbox_poll_is_one_get_until_it_hits() {
     // Node 2 wrote over P2P a moment ago, and its link is down now.
     h.core.note_demand(h.clk(), 2, true);
     h.step(Event::Peers {
+        registry_complete: true,
         links: vec![crate::event::PeerLink {
             node: 2,
             connected: false,
@@ -36469,6 +36584,7 @@ fn an_inbox_poll_landing_in_a_release_journals_nothing() {
     h.hold(1, None);
     h.core.note_demand(h.clk(), 2, true);
     h.step(Event::Peers {
+        registry_complete: true,
         links: vec![crate::event::PeerLink {
             node: 2,
             connected: false,
@@ -36658,6 +36774,7 @@ fn a_holder_steps_past_a_withdrawn_batch_to_the_requesters_next_one() {
     h.hold(1, None);
     h.core.note_demand(h.clk(), 2, true);
     h.step(Event::Peers {
+        registry_complete: true,
         links: vec![crate::event::PeerLink {
             node: 2,
             connected: false,
@@ -38130,6 +38247,7 @@ fn placement_re_reads_the_roster_for_a_connected_writer_it_does_not_list() {
         issued: WaitMs(i64::MAX),
     });
     h.step(Event::Peers {
+        registry_complete: true,
         links: vec![crate::event::PeerLink {
             node: 2,
             connected: true,
@@ -38344,6 +38462,7 @@ fn a_restarted_delegate_readopts_its_delegation_at_start() {
         honour_off: 0,
         wait_off: 0,
         manual_horizon: false,
+        cold_horizon: false,
     };
     h.advance(2);
     h.step(renewed(&h, req, 7, 5_000));
@@ -38356,6 +38475,7 @@ fn a_restarted_delegate_readopts_its_delegation_at_start() {
     // lone test is the root's, `backup_could_be_had`). The test is about
     // re-adoption, not about being lone.
     h.step(Event::Peers {
+        registry_complete: true,
         links: Vec::new(),
         lapses: 0,
         issued: WaitMs(i64::MAX),
@@ -39327,6 +39447,7 @@ mod redelegated_to_the_requester {
         h.core.cfg.p2p = true;
         h.core.lease.cached_holder = Some(1);
         h.step(Event::Peers {
+            registry_complete: true,
             links: (1..=4)
                 .map(|node| crate::event::PeerLink {
                     node,
@@ -39608,6 +39729,7 @@ mod delegated_lock_dead_end {
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
         h.step(Event::Peers {
+            registry_complete: true,
             links: (1..=3)
                 .map(|node| crate::event::PeerLink {
                     node,
@@ -43539,6 +43661,7 @@ mod persisted_floor {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            cold_horizon: false,
         };
         let mut out = Vec::new();
         h.core.start(h.clk(), &h.meta, &mut out);
@@ -43805,6 +43928,50 @@ mod persisted_floor {
         );
         finish_gate(&mut r, won);
         assert!(r.core.in_takeover_floor(r.clk()));
+    }
+
+    /// Expectation (fail-before: the unreadable value was never removed, so
+    /// every restart that re-adopted the lease armed the floor again): once
+    /// the floor it stood for is durable the unreadable claim mark is gone
+    /// from disk, and so is the in-memory flag; a restart owes nothing.
+    #[test]
+    fn an_unreadable_claim_mark_is_removed_once_its_floor_is_durable() {
+        let mut h = successor();
+        let prev = predecessor(&h);
+        let (claimed, _won) = claim_over_with(&mut h, &prev, true, false);
+        h.meta.kv_set("takeover_floor_pending", "garbage").unwrap();
+        let mut r = restart(h, 300);
+        let (_, won) = claim_over_with(&mut r, &claimed, false, false);
+        assert!(r.core.ack.pending_floor);
+        finish_gate(&mut r, won);
+        assert!(r.core.in_takeover_floor(r.clk()));
+        assert!(!r.core.ack.floor_mark_unreadable);
+        assert_eq!(
+            r.meta.kv_get("takeover_floor_pending").unwrap(),
+            None,
+            "the unreadable claim mark is still on disk"
+        );
+    }
+
+    /// Expectation (fail-before: the flag outlived the first acquire and
+    /// the value stayed on disk): an unreadable claim mark whose first
+    /// acquire after start is not a re-adoption of the node's own lease
+    /// (another holder's expired lease) is decided there: removed, and no
+    /// later own re-adoption of this process arms a floor for it.
+    #[test]
+    fn an_unreadable_claim_mark_is_dropped_by_an_acquire_that_is_no_re_adoption() {
+        let h = successor();
+        h.meta.kv_set("takeover_floor_pending", "garbage").unwrap();
+        let mut r = restart(h, 300);
+        assert!(r.core.ack.floor_mark_unreadable);
+        let mut prev = predecessor(&r);
+        // A TTL takeover of a tenure that granted nothing: no claim mark
+        // of its own overwrites the unreadable one.
+        prev.granted_delegations = false;
+        prev.expires_unix_ms = r.now.0 - 1;
+        let (_, _won) = claim_over_with(&mut r, &prev, false, false);
+        assert!(!r.core.ack.floor_mark_unreadable);
+        assert_eq!(r.meta.kv_get("takeover_floor_pending").unwrap(), None);
     }
 
     /// Expectation (fail-before: any completed lock-horizon write removed
@@ -44891,6 +45058,7 @@ mod deleg_group {
             issued: WaitMs(i64::MAX),
         });
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 1,
                 connected: true,
@@ -45447,6 +45615,7 @@ mod deleg_group {
         // The root linked just now, in budget: younger than the window.
         let since = w(h.now);
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 1,
                 connected: true,
@@ -45745,6 +45914,7 @@ mod deleg_group {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            cold_horizon: false,
         };
         r.core.lease.cached_holder = Some(1);
         let mut now = r.clk();
@@ -46288,6 +46458,7 @@ mod deleg_group {
         let (req, round, last) = batch(&out).expect("streamed to the root");
         // The root drifts out of the budget.
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 1,
                 connected: true,
@@ -46315,6 +46486,7 @@ mod deleg_group {
         let acked_max = h.core.dl.mine[&7].acked_max;
         // A backup candidate comes up; it holds nothing (`backup_acked` 0).
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![
                 crate::event::PeerLink {
                     node: 1,
@@ -46863,6 +47035,7 @@ mod deleg_group {
         h.core.cfg.backup_rtt_budget_ms = 50;
         h.core.cfg.backups_max = 1;
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 2,
                 connected: true,
@@ -49340,6 +49513,7 @@ mod c1_counted {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            cold_horizon: false,
         };
         let mut out = Vec::new();
         h.core.start(h.clk(), &h.meta, &mut out);
@@ -50464,6 +50638,7 @@ mod deleg_windows_tests {
         // Member 4 answered on its link 200 ms ago (the seal itself is lost).
         let heard = WaitMs(h.clk().wait.0 - 200);
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 4,
                 connected: true,
@@ -50508,6 +50683,7 @@ mod deleg_windows_tests {
         // The link drops (member 4 is cut from the root only): the driver's
         // directory forgets its last exchange, this root does not.
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 4,
                 connected: false,
@@ -52022,6 +52198,7 @@ mod c1_tail_fetch {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            cold_horizon: false,
         };
         constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1);
         let mut out = Vec::new();
@@ -54992,6 +55169,7 @@ mod deleg_root_read {
         for _ in 0..ms {
             h.advance(1);
             let out = h.step(Event::Peers {
+                registry_complete: true,
                 links: Vec::new(),
                 lapses: 0,
                 issued: WaitMs(i64::MAX),
@@ -56878,6 +57056,7 @@ mod c2g_settle {
     /// The directory table: node 4 connected, nodes 2 and 3 not.
     fn connect_4(h: &mut Harness) -> Vec<Action> {
         h.step(Event::Peers {
+            registry_complete: true,
             links: (2..=4)
                 .map(|node| crate::event::PeerLink {
                     node,
@@ -60647,6 +60826,7 @@ mod m11_step5 {
         }
         fn peers_read(h: &mut Harness, issued: WaitMs) {
             h.step(Event::Peers {
+                registry_complete: true,
                 links: vec![crate::event::PeerLink {
                     node: 2,
                     connected: false,
@@ -61575,6 +61755,7 @@ mod step9_one_stream_per_node {
         assert!(delegate(&mut h, 900, d1, 3));
         assert!(delegate(&mut h, 901, d2, 3), "the second grant was refused");
         h.step(Event::Peers {
+            registry_complete: true,
             links: (2..=4)
                 .map(|node| crate::event::PeerLink {
                     node,
@@ -61878,6 +62059,7 @@ mod step9_one_stream_per_node {
 
     fn link_to_2(h: &mut Harness, rtt_ms: Option<u64>) {
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 2,
                 connected: true,
@@ -61982,6 +62164,7 @@ mod step9_one_stream_per_node {
         let (mut h, _dirs) = root_with_peer(Some(5));
         h.advance(10);
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![],
             lapses: 0,
             issued: WaitMs(i64::MAX),
@@ -62158,6 +62341,7 @@ mod step9_one_stream_per_node {
             issued: WaitMs(i64::MAX),
         });
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 2,
                 connected: true,
@@ -62356,6 +62540,7 @@ mod step9_one_stream_per_node {
         assert!(delegate(&mut h, 900, d1, 3));
         assert!(delegate(&mut h, 901, d2, 3), "the second grant was refused");
         h.step(Event::Peers {
+            registry_complete: true,
             links: (2..=4)
                 .map(|node| crate::event::PeerLink {
                     node,
@@ -64168,6 +64353,7 @@ mod step4_sticky {
             issued: WaitMs(i64::MAX),
         });
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 2,
                 connected: true,
@@ -64542,6 +64728,7 @@ mod step4_sticky {
             issued: WaitMs(i64::MAX),
         });
         h.step(Event::Peers {
+            registry_complete: true,
             links: vec![crate::event::PeerLink {
                 node: 2,
                 connected: true,
@@ -64641,6 +64828,7 @@ mod step4_sticky {
         h.advance(wait - 1_000);
         h.hold(2, None);
         let out = h.step(Event::Peers {
+            registry_complete: true,
             links: Vec::new(),
             lapses: 0,
             issued: WaitMs(i64::MAX),
@@ -65034,10 +65222,7 @@ mod step4_sticky {
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         assert!(h.core.dl.mine.contains_key(&7));
-        let ask = |h: &mut Harness| {
-            h.core
-                .deleg_read_index(h.clk(), 2, dirs[0], Some("x"), &h.meta)
-        };
+        let ask = |h: &mut Harness| h.deleg_read_index(h.clk(), 2, dirs[0], Some("x"));
         assert!(ask(&mut h).is_some(), "served before the end");
         Replica::void_stream(&h.meta, 7, 0);
         Replica::note_void_cut(&h.meta, 7, 0);
@@ -65057,14 +65242,10 @@ mod step4_sticky {
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         assert!(h.core.dl.mine[&7].non_stealable);
-        let grant =
-            |h: &mut Harness| match h
-                .core
-                .deleg_read_index(h.clk(), 2, dirs[0], Some("x"), &h.meta)
-            {
-                Some(crate::event::ReadIndexOutcome::Ok { grant, .. }) => grant,
-                other => panic!("{other:?}"),
-            };
+        let grant = |h: &mut Harness| match h.deleg_read_index(h.clk(), 2, dirs[0], Some("x")) {
+            Some(crate::event::ReadIndexOutcome::Ok { grant, .. }) => grant,
+            other => panic!("{other:?}"),
+        };
         assert!(grant(&mut h).is_none(), "granted before a renewal");
         // The root granted a renewal sent after the install.
         h.core.dl.mine.get_mut(&7).unwrap().answered_sent = h.clk().honour;
@@ -65530,6 +65711,7 @@ mod step5_sticky_release {
         h.core.cfg.p2p = true;
         h.core.lease.cached_holder = Some(1);
         h.step(Event::Peers {
+            registry_complete: true,
             links: [1, 3]
                 .into_iter()
                 .map(|node| crate::event::PeerLink {
@@ -65735,6 +65917,7 @@ mod step5_sticky_release {
     /// The peers event of the node's links: those of `nodes`, up.
     fn links_event(nodes: &[NodeId]) -> Event {
         Event::Peers {
+            registry_complete: true,
             links: nodes
                 .iter()
                 .map(|&node| crate::event::PeerLink {
@@ -66768,7 +66951,7 @@ mod step5_sticky_release {
         let (dirs, out) = install_holder(&mut h, &["d"], kind);
         renew_holder(&mut h, &out);
         let now = h.clk();
-        let outcome = h.core.deleg_read_index(now, 2, dirs[0], None, &h.meta);
+        let outcome = h.deleg_read_index(now, 2, dirs[0], None);
         assert!(
             matches!(
                 outcome,
@@ -66802,6 +66985,7 @@ mod step5_sticky_release {
         let mut out = Vec::new();
         r.core.start(r.clk(), &r.meta, &mut out);
         r.step(Event::Peers {
+            registry_complete: true,
             links: (2..=4)
                 .map(|node| crate::event::PeerLink {
                     node,
@@ -66863,6 +67047,8 @@ mod step5_sticky_release {
                 applied: 0,
                 tag: Default::default(),
                 settle: false,
+                routed_gen: 7,
+                touched_gen: 0,
             },
         })
     }
@@ -66896,6 +67082,7 @@ mod step5_sticky_release {
         let id = restart_timer(&r);
         r.advance(until.since(r.clk().wait) as u64 - 1);
         r.step(Event::Peers {
+            registry_complete: true,
             links: Vec::new(),
             lapses: 0,
             issued: WaitMs(i64::MAX),
@@ -66947,36 +67134,112 @@ mod step5_sticky_release {
         assert_eq!(r.core.dl.mine[&7].executed, 1);
     }
 
-    /// Expectation (fail-before: the key was absent): a delegate's read grant
-    /// persists its horizon, covering the grant, before it is answered.
+    /// The write-ahead lane as the driver runs it, after a read answered
+    /// straight to the core: the writes it asked for are made (off the
+    /// core, so after the read) and reported. Returns the kinds written.
+    fn run_horizon_lane(
+        h: &mut Harness,
+        fail: bool,
+    ) -> Vec<constellation_meta::readdeleg::GrantHorizon> {
+        let mut out = Vec::new();
+        h.core.grant_horizon_after_event(&h.meta, &mut out);
+        let mut kinds = Vec::new();
+        for a in out {
+            let Action::PersistGrantHorizon { kind, until } = a else {
+                continue;
+            };
+            if fail {
+                constellation_meta::fail_horizon_writes_on_this_thread_for_tests(1);
+            }
+            let durable = h.meta.persist_grant_horizon(kind, until, h.clk()).ok();
+            constellation_meta::fail_horizon_writes_on_this_thread_for_tests(0);
+            assert_eq!(durable.is_some(), !fail);
+            h.core.handle(
+                h.clk(),
+                Event::GrantHorizonPersisted {
+                    kind,
+                    until,
+                    durable,
+                },
+                &h.meta,
+            );
+            kinds.push(kind);
+        }
+        kinds
+    }
+
+    fn deleg_grant_of(
+        outcome: Option<crate::event::ReadIndexOutcome>,
+    ) -> Option<crate::event::ReadGrantMsg> {
+        match outcome {
+            Some(crate::event::ReadIndexOutcome::Ok { grant, .. }) => grant,
+            other => panic!("not a served read: {other:?}"),
+        }
+    }
+
+    /// Expectation (fail-before: the delegate synced the horizon on the core
+    /// before the grant): a delegate's read grant is made only up to the
+    /// horizon known durable, and the horizon is written ahead off the core.
+    /// The first read of a cold lane is answered with its position and no
+    /// grant, and asks for the write; after it, and for as long as the
+    /// reading goes on, every read is granted with no read waiting for a
+    /// write, and no grant ends beyond the durable horizon.
     #[test]
-    fn a_delegate_read_grant_persists_its_horizon_before_it_is_answered() {
+    fn a_delegate_read_grant_never_exceeds_the_durable_horizon() {
+        use constellation_meta::readdeleg::GrantHorizon;
         let mut h = Harness::new(3);
+        h.cold_horizon = true;
         let (dirs, out) = install_holder(&mut h, &["d"], SubtreeKind::Sticky);
         renew_holder(&mut h, &out);
         let now = h.clk();
-        let Some(crate::event::ReadIndexOutcome::Ok {
-            grant: Some(grant), ..
-        }) = h.core.deleg_read_index(now, 2, dirs[0], None, &h.meta)
-        else {
-            panic!("no grant");
-        };
-        let stored = h
-            .meta
-            .kv_get("deleg_read_grant_horizon_ms")
-            .unwrap()
-            .expect("the horizon was not persisted");
-        assert_ne!(stored, "none");
-        let ends = now.wait.plus(grant.ttl_ms);
+        let first = h.deleg_read_index(now, 2, dirs[0], None);
         assert!(
-            matches!(
-                h.meta.load_deleg_grant_quarantine(now, 100_000),
-                constellation_meta::readdeleg::DelegHorizon::Until(t) if t >= ends
-            ),
-            "the horizon does not cover the grant: {stored}"
+            deleg_grant_of(first).is_none(),
+            "granted with nothing durable"
         );
+        assert_eq!(h.core.stats.read_grants_uncovered, 1);
+        assert!(h.meta.grant_horizon_known(GrantHorizon::Deleg) <= now.wait);
+        assert_eq!(
+            h.meta
+                .kv_get("deleg_read_grant_horizon_ms")
+                .unwrap()
+                .as_deref(),
+            Some("none")
+        );
+        // The core asked for the write; it is made off the core.
+        assert_eq!(run_horizon_lane(&mut h, false), vec![GrantHorizon::Deleg]);
         // The root's key is untouched.
         assert_eq!(h.meta.kv_get("read_grant_horizon_ms").unwrap(), None);
+        let span = (h.core.cfg.read_delegation_ttl_ms + h.core.cfg.expiry_margin_ms) as u64;
+        assert!(h.meta.grant_horizon_known(GrantHorizon::Deleg) >= now.wait.plus(span + 1_000));
+        // Steady reading, twice a second for a minute: a grant each time,
+        // never beyond the durable horizon, and the lane keeps ahead (one
+        // write every second or two, none waited for).
+        let mut granted = 0;
+        for _ in 0..120 {
+            h.advance(500);
+            let now = h.clk();
+            let g = deleg_grant_of(h.deleg_read_index(now, 2, dirs[0], None))
+                .expect("a read of a warm lane was not granted");
+            granted += 1;
+            let ends = now.wait.plus(g.ttl_ms);
+            let durable = h.meta.grant_horizon_known(GrantHorizon::Deleg);
+            assert!(ends <= durable, "grant to {ends:?}, durable {durable:?}");
+            run_horizon_lane(&mut h, false);
+        }
+        assert_eq!(granted, 120);
+        assert_eq!(h.core.stats.read_grants_uncovered, 1);
+        assert!(
+            (38..=44).contains(&h.core.stats.grant_horizon_writes),
+            "{}",
+            h.core.stats.grant_horizon_writes
+        );
+        // The stored horizon covers the last grant.
+        assert!(matches!(
+            h.meta.load_deleg_grant_quarantine(h.clk(), 100_000),
+            constellation_meta::readdeleg::DelegHorizon::Until(t)
+                if t >= h.clk().wait.plus(span)
+        ));
     }
 
     /// Expectation (fail-before: a grant was made): inside the quarantine a
@@ -66987,7 +67250,7 @@ mod step5_sticky_release {
         let (mut r, dirs, out) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
         renew_holder(&mut r, &out);
         let now = r.clk();
-        let outcome = r.core.deleg_read_index(now, 2, dirs[0], None, &r.meta);
+        let outcome = r.deleg_read_index(now, 2, dirs[0], None);
         assert!(
             matches!(
                 outcome,
@@ -67002,7 +67265,7 @@ mod step5_sticky_release {
         r.advance(until.since(r.clk().wait) as u64);
         r.step(Event::Timer { id });
         let now = r.clk();
-        let outcome = r.core.deleg_read_index(now, 2, dirs[0], None, &r.meta);
+        let outcome = r.deleg_read_index(now, 2, dirs[0], None);
         assert!(
             matches!(
                 outcome,
@@ -67041,6 +67304,8 @@ mod step5_sticky_release {
                 applied: 0,
                 tag: Default::default(),
                 settle: true,
+                routed_gen: 7,
+                touched_gen: 0,
             },
         });
         assert_eq!(r.core.stats.settles_refused, 1);
@@ -67054,7 +67319,7 @@ mod step5_sticky_release {
     fn a_restart_with_no_delegate_horizon_waits_a_full_span() {
         let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
         let (mut r, dirs, _) = restart_holder(&h, 2_000, SubtreeKind::Sticky, false);
-        let span = r.core.cfg.read_horizon_span_ms();
+        let span = r.core.dl_t().read_span as i64;
         let q = r.core.dl.mine[&7]
             .restart_q
             .clone()
@@ -67109,7 +67374,7 @@ mod step5_sticky_release {
         let (h, _) = holder_with_a_grant(SubtreeKind::Placed);
         let (mut r, dirs, out) = restart_holder(&h, 2_000, SubtreeKind::Placed, true);
         let req = renew_req(&out, 7).expect("no renewal");
-        r.step(renewed(&r, req, 7, 5_000));
+        r.step(renewed(&r, req, 7, 9_000));
         assert!(r.core.dl.mine[&7].until > r.honour(), "not honoured");
         create_in(&mut r, dirs[0], 1);
         assert_eq!(
@@ -67218,39 +67483,40 @@ mod step5_sticky_release {
         );
     }
 
-    /// Expectation (the only enforcement of persist-before-grant on failure):
-    /// when the horizon cannot be written, the read is answered with its
-    /// position and no grant; the next one, once it can, is granted.
+    /// Expectation: when the horizon cannot be written, the read is answered
+    /// with its position and no grant, and so is every one until a write
+    /// succeeds; the next read after that is granted.
     #[test]
     fn a_failed_horizon_write_gives_no_delegate_grant() {
         let mut h = Harness::new(3);
+        h.cold_horizon = true;
         let (dirs, out) = install_holder(&mut h, &["d"], SubtreeKind::Sticky);
         renew_holder(&mut h, &out);
-        let now = h.clk();
-        constellation_meta::fail_horizon_writes_on_this_thread_for_tests(1);
-        let outcome = h.core.deleg_read_index(now, 2, dirs[0], None, &h.meta);
-        constellation_meta::fail_horizon_writes_on_this_thread_for_tests(0);
-        assert!(
-            matches!(
-                outcome,
-                Some(crate::event::ReadIndexOutcome::Ok { grant: None, .. })
-            ),
-            "{outcome:?}"
-        );
+        for _ in 0..2 {
+            let now = h.clk();
+            let outcome = h.deleg_read_index(now, 2, dirs[0], None);
+            assert!(deleg_grant_of(outcome).is_none());
+            assert_eq!(run_horizon_lane(&mut h, true).len(), 1);
+        }
         assert_eq!(h.core.stats.deleg_read_grants, 0);
+        assert_eq!(h.core.stats.grant_horizon_failed, 2);
         assert_eq!(
-            h.meta.read_delegations().all_live(now.wait).grants.len(),
+            h.meta
+                .read_delegations()
+                .all_live(h.clk().wait)
+                .grants
+                .len(),
             0,
             "a grant was recorded"
         );
-        let outcome = h.core.deleg_read_index(now, 2, dirs[0], None, &h.meta);
-        assert!(
-            matches!(
-                outcome,
-                Some(crate::event::ReadIndexOutcome::Ok { grant: Some(_), .. })
-            ),
-            "{outcome:?}"
-        );
+        // Not stuck: the lane is free again, and a write that works covers
+        // the next read.
+        let now = h.clk();
+        let outcome = h.deleg_read_index(now, 2, dirs[0], None);
+        assert!(deleg_grant_of(outcome).is_none());
+        assert_eq!(run_horizon_lane(&mut h, false).len(), 1);
+        let outcome = h.deleg_read_index(now, 2, dirs[0], None);
+        assert!(deleg_grant_of(outcome).is_some());
     }
 
     /// Expectation: a generation installed after the persisted horizon has
@@ -67268,7 +67534,7 @@ mod step5_sticky_release {
         create_in(&mut r, dirs[0], 1);
         assert_eq!(r.core.dl.mine[&7].executed, 1);
         let now = r.clk();
-        let outcome = r.core.deleg_read_index(now, 2, dirs[0], None, &r.meta);
+        let outcome = r.deleg_read_index(now, 2, dirs[0], None);
         assert!(
             matches!(
                 outcome,
@@ -67389,6 +67655,7 @@ mod step5_sticky_release {
         let until = r.core.dl.mine[&7].restart_q.as_ref().unwrap().until;
         r.advance(until.since(r.clk().wait) as u64 - 1);
         r.step(Event::Peers {
+            registry_complete: true,
             links: Vec::new(),
             lapses: 0,
             issued: WaitMs(i64::MAX),
@@ -67399,6 +67666,79 @@ mod step5_sticky_release {
         assert_eq!(r.core.dl.mine[&7].executed, 1);
         assert_eq!(r.core.stats.deleg_restart_q_voided, 0);
         assert_eq!(r.core.stats.deleg_restart_q_waited_out, 1);
+    }
+
+    fn link(node: NodeId) -> crate::event::PeerLink {
+        crate::event::PeerLink {
+            node,
+            connected: true,
+            last_seen: None,
+            rtt_ms: None,
+            since: None,
+        }
+    }
+
+    /// Expectation (fail-before: the quarantine was voided by the write-
+    /// eligible roster alone, while read-only member 9 held an old grant):
+    /// the early exit needs the peer directory of a registry scan that read
+    /// every record. Until one arrives nobody is asked, so a failed or
+    /// partial first scan cannot void the generation behind a reader it
+    /// missed; the horizon decides. Once the complete directory names 9,
+    /// the void waits for 9's answer too.
+    #[test]
+    fn a_partial_registry_scan_does_not_end_the_quarantine_early() {
+        let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
+        let (mut r, _) = restart_bare(&h, 2_000, true);
+        // The first scan failed: the directory is the cached (empty) one.
+        r.core.peers_complete = false;
+        let (dirs, out) = install_holder(&mut r, &["d"], SubtreeKind::Sticky);
+        assert!(restart_void_reqs(&out).is_empty(), "{out:?}");
+        create_in(&mut r, dirs[0], 1);
+        // The roster is known, and every write-eligible peer is in the
+        // directory, but the scan was not complete (member 9 is read-only
+        // and missing from it).
+        let out = r.step(roster_event());
+        assert!(restart_void_reqs(&out).is_empty(), "{out:?}");
+        let out = r.step(Event::Peers {
+            registry_complete: false,
+            links: vec![link(2), link(4)],
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+        assert!(restart_void_reqs(&out).is_empty(), "{out:?}");
+        assert_eq!(r.core.dl.mine[&7].executed, 0);
+        assert_eq!(r.core.stats.deleg_restart_q_voided, 0);
+        // A later complete scan lists the read-only member.
+        let out = r.step(Event::Peers {
+            registry_complete: true,
+            links: vec![link(2), link(4), link(9)],
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+        let asked = restart_void_reqs(&out);
+        assert_eq!(
+            asked
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([1, 2, 4, 9]),
+            "{out:?}"
+        );
+        for (from, req) in asked.iter().filter(|(n, _)| *n != 9) {
+            r.step(Event::Peer {
+                from: *from,
+                msg: PeerMsg::DelegationRecalled { req: *req },
+            });
+        }
+        assert_eq!(r.core.stats.deleg_restart_q_voided, 0, "9 had not answered");
+        assert_eq!(r.core.dl.mine[&7].executed, 0);
+        let nine = asked.iter().find(|(n, _)| *n == 9).unwrap().1;
+        r.step(Event::Peer {
+            from: 9,
+            msg: PeerMsg::DelegationRecalled { req: nine },
+        });
+        assert_eq!(r.core.stats.deleg_restart_q_voided, 1);
+        assert_eq!(r.core.dl.mine[&7].executed, 1);
     }
 
     /// Expectation (the reader's side of the void): a `Restart` void drops
@@ -68858,5 +69198,148 @@ mod route_fence_executor {
         ));
         assert!(replies(&out).is_empty(), "{out:?}");
         assert!(h.core.clients[&rid].designation_held);
+    }
+}
+
+/// A measurement, not a test: what the persist-before-grant rule costs the
+/// core thread under steady strict reading, by how the read-grant horizon
+/// is made durable. `sync`: the horizon is written and synced on the
+/// calling thread when a grant needs it (the way the core did it before the
+/// write-ahead lane). `lane`: `Core::grant_horizon_covers` and a writer
+/// thread. Run with
+/// `BENCH_DIR=<dir on the file system> BENCH_MODE=sync|lane [BENCH_SECS=40]
+/// [BENCH_RATE=1000] [BENCH_LOAD=0|1] cargo test --release -p
+/// constellation-authority --lib grant_horizon_stall_bench -- --ignored
+/// --nocapture`. `BENCH_LOAD=1` adds a thread that makes small durable
+/// writes every 10 ms (a shipper's and a journal's syncs on the same disk).
+#[cfg(test)]
+mod grant_horizon_bench {
+    use super::*;
+    use constellation_meta::readdeleg::GrantHorizon;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    #[ignore]
+    fn grant_horizon_stall_bench() {
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        let dir = std::path::PathBuf::from(env("BENCH_DIR", "/tmp"));
+        let mode = env("BENCH_MODE", "lane");
+        let secs: u64 = env("BENCH_SECS", "40").parse().unwrap();
+        let rate: u64 = env("BENCH_RATE", "1000").parse().unwrap();
+        let load = env("BENCH_LOAD", "0") == "1";
+        let path = dir.join(format!("bench-meta-{mode}-{}", std::process::id()));
+        let meta = Arc::new(Meta::open(&path).unwrap());
+        meta.set_node_prefix(1).unwrap();
+        let mut core = Core::new(Config::defaults(1, 1));
+        let span = (core.cfg.read_delegation_ttl_ms + core.cfg.expiry_margin_ms) as u64;
+        let t0 = Instant::now();
+        let now_at =
+            move |t: Instant| Now::same(1_000_000 + t.duration_since(t0).as_millis() as i64);
+        meta.settle_deleg_grant_horizon(now_at(Instant::now()))
+            .unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let loader = load.then(|| {
+            let meta = meta.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    n += 1;
+                    let _ = meta.kv_set_durable("bench_load", &n.to_string());
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        });
+        let (work_tx, work_rx) = std::sync::mpsc::channel::<(GrantHorizon, WaitMs)>();
+        let (done_tx, done_rx) =
+            std::sync::mpsc::channel::<(GrantHorizon, WaitMs, Option<WaitMs>)>();
+        let writer = {
+            let meta = meta.clone();
+            std::thread::spawn(move || {
+                while let Ok((kind, until)) = work_rx.recv() {
+                    let now = now_at(Instant::now());
+                    let durable = meta.persist_grant_horizon(kind, until, now).ok();
+                    let _ = done_tx.send((kind, until, durable));
+                }
+            })
+        };
+        let mut call_us: Vec<u64> = Vec::new();
+        let mut arrival_us: Vec<u64> = Vec::new();
+        let (mut grants, mut uncovered) = (0u64, 0u64);
+        let step = Duration::from_nanos(1_000_000_000 / rate);
+        let mut i = 0u32;
+        loop {
+            let due = t0 + step * i;
+            if due.duration_since(t0) > Duration::from_secs(secs) {
+                break;
+            }
+            while Instant::now() < due {
+                if due.saturating_duration_since(Instant::now()) > Duration::from_micros(300) {
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            }
+            i += 1;
+            let started = Instant::now();
+            let now = now_at(started);
+            let until = now.wait.plus(span);
+            let granted = if mode == "sync" {
+                meta.note_grant_horizon(until, now).is_ok()
+            } else {
+                while let Ok((kind, until, durable)) = done_rx.try_recv() {
+                    core.on_grant_horizon_persisted(kind, until, durable);
+                }
+                let covered = core.grant_horizon_covers(GrantHorizon::Root, now, until, &*meta);
+                let mut out = Vec::new();
+                core.grant_horizon_after_event(&*meta, &mut out);
+                for a in out {
+                    if let Action::PersistGrantHorizon { kind, until } = a {
+                        work_tx.send((kind, until)).unwrap();
+                    }
+                }
+                covered
+            };
+            let finished = Instant::now();
+            if granted {
+                grants += 1;
+            } else {
+                uncovered += 1;
+            }
+            call_us.push(finished.duration_since(started).as_micros() as u64);
+            arrival_us.push(finished.duration_since(due).as_micros() as u64);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(work_tx);
+        writer.join().unwrap();
+        if let Some(l) = loader {
+            l.join().unwrap();
+        }
+        let pct = |v: &mut Vec<u64>, p: f64| {
+            v.sort_unstable();
+            v[(((v.len() - 1) as f64) * p) as usize]
+        };
+        let stall_ms: u64 = call_us.iter().filter(|u| **u > 1_000).sum::<u64>() / 1_000;
+        let over1: usize = call_us.iter().filter(|u| **u > 1_000).count();
+        let n = call_us.len();
+        let (c50, c99, c999) = (
+            pct(&mut call_us, 0.5),
+            pct(&mut call_us, 0.99),
+            pct(&mut call_us, 0.999),
+        );
+        let cmax = *call_us.last().unwrap();
+        let (a50, a99, a999) = (
+            pct(&mut arrival_us, 0.5),
+            pct(&mut arrival_us, 0.99),
+            pct(&mut arrival_us, 0.999),
+        );
+        let amax = *arrival_us.last().unwrap();
+        eprintln!(
+            "BENCH mode={mode} load={load} dir={} reads={n} grants={grants} uncovered={uncovered} \
+             core_call_us p50/p99/p99.9/max={c50}/{c99}/{c999}/{cmax} calls_over_1ms={over1} stall_ms={stall_ms} \
+             read_latency_us p50/p99/p99.9/max={a50}/{a99}/{a999}/{amax}",
+            dir.display()
+        );
+        drop(meta);
+        let _ = std::fs::remove_dir_all(&path);
     }
 }

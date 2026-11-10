@@ -119,8 +119,9 @@ pub struct Deadlines {
     pub leave_note_lapse: u64,
     pub read_block: u64,
     /// The longest a persisted read-grant horizon leads the write that makes
-    /// it: a read delegation's TTL, the margin the owner outwaits it by, and
-    /// the second the write rounds up by.
+    /// it: a read delegation's TTL, the margin the owner outwaits it by, a
+    /// second of write-ahead (`Core::grant_horizon_covers`) and the second
+    /// the write rounds up by.
     pub read_span: u64,
     /// The same for the lock-grant horizon: the longest grant (a lock's TTL,
     /// or a delegation's), its margin, the quarter TTL a renewal's write
@@ -235,7 +236,7 @@ impl Deadlines {
                 .saturating_mul(LEAVE_NOTE_LAPSE_RESENDS)
                 .max(d.saturating_mul(2)),
             read_block: 2 * (r + m),
-            read_span: r + m + 1_000,
+            read_span: r + m + 2_000,
             lock_span: lock_ttl + lock_ttl / 4 + m + 1_000,
             floor_span: t + longest_grant + d + 3 * m + 1_000,
             promise_span: b.promise_ttl + 1_000,
@@ -537,7 +538,7 @@ impl Deadlines {
                 "max(3 * leave_resend, 2D)",
             ),
             ("read_block", self.read_block, "2 (R + m)"),
-            ("read_span", self.read_span, "R + m + 1000"),
+            ("read_span", self.read_span, "R + m + 2000"),
             ("lock_span", self.lock_span, "max(K, D) * 5/4 + m + 1000"),
             (
                 "floor_span",
@@ -704,7 +705,7 @@ mod tests {
                 // 2 * (5000 + 1000).
                 ("read_block", 12_000),
                 // 5000 + 1000 + 1000.
-                ("read_span", 7_000),
+                ("read_span", 8_000),
                 // ttl = max(20000, 5000); 20000 + 5000 + 1000 + 1000.
                 ("lock_span", 27_000),
                 // 1500 + max(5000, 20000) + 5000 + 3*1000 + 1000.
@@ -768,7 +769,7 @@ mod tests {
                 // max(1500, 40000).
                 ("leave_note_lapse", 40_000),
                 ("read_block", 12_000),
-                ("read_span", 7_000),
+                ("read_span", 8_000),
                 // ttl = max(20000, 20000).
                 ("lock_span", 27_000),
                 // 1500 + 20000 + 20000 + 3000 + 1000.
@@ -829,7 +830,7 @@ mod tests {
                 // 2 * 5500.
                 ("read_block", 11_000),
                 // 5000 + 500 + 1000.
-                ("read_span", 6_500),
+                ("read_span", 7_500),
                 // ttl = max(1500, 5000); 5000 + 1250 + 500 + 1000.
                 ("lock_span", 7_750),
                 // 1500 + 5000 + 5000 + 1500 + 1000.
@@ -895,7 +896,7 @@ mod tests {
                 ("leave_resend", 500),
                 ("leave_note_lapse", 40_000),
                 ("read_block", 11_000),
-                ("read_span", 6_500),
+                ("read_span", 7_500),
                 // ttl = 20000; 20000 + 5000 + 500 + 1000.
                 ("lock_span", 26_500),
                 // 1500 + 5000 + 20000 + 1500 + 1000.
@@ -949,7 +950,7 @@ mod tests {
                 ("leave_resend", 500),
                 ("leave_note_lapse", 10_000),
                 ("read_block", 11_000),
-                ("read_span", 6_500),
+                ("read_span", 7_500),
                 ("lock_span", 7_750),
                 // 1000 + 5000 + 5000 + 1500 + 1000.
                 ("floor_span", 13_500),
@@ -1013,7 +1014,7 @@ mod tests {
                 // max(9000, 100).
                 ("leave_note_lapse", 9_000),
                 ("read_block", 200),
-                ("read_span", 1_100),
+                ("read_span", 2_100),
                 // ttl = max(10, 50); 50 + 12 + 0 + 1000.
                 ("lock_span", 1_062),
                 // 8 + 100 + 50 + 0 + 1000.

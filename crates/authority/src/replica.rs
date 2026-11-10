@@ -577,10 +577,9 @@ pub trait Replica {
     /// that no grant of this node asks for (`Core::acquire_cas`: the grace
     /// of a released takeover). `false`: not persisted.
     fn note_lock_grant_horizon(&self, until: WaitMs, now: Now) -> bool;
-    /// [`Replica::note_grant_horizon`] for a read grant a delegate makes
-    /// (`Meta::note_deleg_grant_horizon`, its own key). `false`: not
-    /// persisted, and the grant must not be made.
-    fn note_deleg_grant_horizon(&self, until: WaitMs, now: Now) -> bool;
+    /// The read-grant horizon of `kind` known durable
+    /// (`Meta::grant_horizon_known`): a grant may be made only up to it.
+    fn grant_horizon_known(&self, kind: constellation_meta::readdeleg::GrantHorizon) -> WaitMs;
     /// At start: what the previous process's delegates may still have
     /// granted (`Meta::load_deleg_grant_quarantine`); `Unknown` for an
     /// absent or unreadable key, which the caller treats as a full span.
@@ -1683,14 +1682,8 @@ impl Replica for Meta {
         }
     }
 
-    fn note_deleg_grant_horizon(&self, until: WaitMs, now: Now) -> bool {
-        match Meta::note_deleg_grant_horizon(self, until, now) {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::warn!(%error, "persisting the delegate read-grant horizon failed; not granting");
-                false
-            }
-        }
+    fn grant_horizon_known(&self, kind: constellation_meta::readdeleg::GrantHorizon) -> WaitMs {
+        Meta::grant_horizon_known(self, kind)
     }
 
     fn load_deleg_grant_quarantine(

@@ -3402,9 +3402,10 @@ abandon fences the end of a stream, not a holder that returns before it.
 and a restarted holder executes nothing, and grants nothing, until what its
 previous process granted is gone.
 
-- A delegate's read grant writes the horizon `deleg_read_grant_horizon_ms` (a
-  boot stamp, synced, rounded up a second) before the grant is recorded; when
-  the write fails the read is answered with its position and no grant. The key
+- A delegate's read grant is made only up to the horizon `deleg_read_grant_horizon_ms`
+  (a boot stamp, synced) known durable; the write is made off the core, ahead
+  of the grants (below). A read whose grant the durable horizon does not cover
+  is answered with its position and no grant. The key
   is the root's `read_grant_horizon_ms` kept apart: the root's feeds every
   acknowledgement and the takeover gate, and a sticky holder's grants must not
   delay its node's root role.
@@ -3426,15 +3427,32 @@ previous process granted is gone.
   grant of an id that did not exist. Rebuilding a store under an old id is not
   that: its key is absent and costs a span.
 - **Early exit.** A quarantined generation asks every node that may hold one of
-  its grants (roster and links, once both were read) to drop them
-  (`DelegReadVoid`, scope `Restart`; the reader drops the held ones of the
-  stream's epoch and bumps its recall generation, so a reply of the dead
-  process still in flight is not installed, but remembers nothing, because the
-  same stream grants again). When all answered the quarantine is over before
-  the horizon; one that does not answer (down, cut off) leaves the horizon in
-  charge. The horizon alone is the safety: the void only shortens the wait.
-  Step 13's abandon uses the same audience and no longer reads an unknown one as
-  "every reader answered".
+  its grants to drop them (`DelegReadVoid`, scope `Restart`; the reader drops
+  the held ones of the stream's epoch and bumps its recall generation, so a
+  reply of the dead process still in flight is not installed, but remembers
+  nothing, because the same stream grants again). When all answered the
+  quarantine is over before the horizon; one that does not answer (down, cut
+  off) leaves the horizon in charge. **The audience is a safety boundary**: a
+  reader the void misses keeps serving its old grant after the quarantine ended.
+  It is the roster and the peer directory, and the directory counts only when
+  a registry scan that read every record has filled it (read-only members are
+  in the registry, not in the roster); until then nobody is asked and the
+  horizon decides. Both Step 13's abandon and the early exit take it from the
+  one function `Core::void_audience`, and an unknown audience makes the abandon
+  wait its deadline instead of reading as "every reader answered".
+- **The horizons are written ahead, off the core.** The sync of a horizon is
+  not made on the core thread (on a loaded disk it takes seconds; locks moved
+  off-core for that). A grant is made only up to the horizon known durable.
+  Whenever the durable horizon is less than a grant's lifetime and a second
+  ahead, the core asks (`Action::PersistGrantHorizon`, one in flight per kind,
+  later needs coalesced) for a write of now, the lifetime, a second, and the
+  second the write rounds up by (`Meta::persist_grant_horizon`); the next
+  grants find it covered, so under continuous reading no read waits and the
+  core never syncs. A read whose grant is not covered (the first of a cold
+  node, a failed write) is answered with its position and no grant: persist
+  before grant holds because the check reads the durable value only. A
+  restart after reading stops waits at most about two seconds more than the
+  last grant needs.
 - **Fallbacks fail closed.** After a read error a later write of a horizon
   (read, lock, floor, delegate) stores at least the fallback the caller waited
   for, and an unreadable promise holds the join gate and is not stored lower; an
@@ -3455,10 +3473,12 @@ compatibility shim). The persisted stamp carries the span it was written with,
 so lowering the read TTL across a restart does not shorten the wait for a
 stamp; an absent or corrupt key has no span to read and uses the new process's
 (an absent key is a store that never granted under this build). A grant costs
-one synced write per second of continuous strict reading, on the core thread as
-the root's does: measured 3 to 6 ms on ext4 and btrfs (about 2 microseconds on
-tmpfs), so under one percent of operations wait for it and the p90 is
-unchanged; it is not moved off-core. `sticky-holder-returns` runs at the default
+no synced write on the core: the horizon is written ahead on a lane (above).
+Measured per 30 s of strict reading at 1000 reads/s, with and without a
+writer syncing every 10 ms on the same disk, on ext4, xfs and btrfs: the
+synchronous version stalled the core 30 times (6 to 12 ms each, once 1.9 s),
+the lane never (largest call 26 microseconds); tmpfs, no difference.
+`sticky-holder-returns` runs at the default
 read TTL again.
 
 **Rejected**: persisting every grant (an fsync per grant, not per second);

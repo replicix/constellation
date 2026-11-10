@@ -255,6 +255,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::RebuildDone { .. } => "RebuildDone",
         Event::LockFlushed { .. } => "LockFlushed",
         Event::LockHorizonPersisted { .. } => "LockHorizonPersisted",
+        Event::GrantHorizonPersisted { .. } => "GrantHorizonPersisted",
         Event::DelegStreamSynced { .. } => "DelegStreamSynced",
         Event::Roster { .. } => "Roster",
         Event::Slack { .. } => "Slack",
@@ -311,6 +312,7 @@ fn action_kind(action: &Action) -> &'static str {
         Action::RebuildReplica { .. } => "RebuildReplica",
         Action::LockFlush { .. } => "LockFlush",
         Action::PersistLockHorizon { .. } => "PersistLockHorizon",
+        Action::PersistGrantHorizon { .. } => "PersistGrantHorizon",
         Action::SyncDelegStream { .. } => "SyncDelegStream",
         Action::RoundDone { .. } => "RoundDone",
         Action::RefreshRoster => "RefreshRoster",
@@ -4704,6 +4706,30 @@ impl Driver {
                         }));
                     });
                 }
+                Action::PersistGrantHorizon { kind, until } => {
+                    // A durable write (seconds on a loaded disk): on the
+                    // blocking pool, never the driver loop. The core grants
+                    // only up to the horizon known durable.
+                    let tx = self.int_tx.clone();
+                    let meta = self.deps.meta.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let durable = match meta.persist_grant_horizon(kind, until, now()) {
+                            Ok(d) => Some(d),
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "persisting a read-grant horizon failed; no grants beyond the durable one"
+                                );
+                                None
+                            }
+                        };
+                        let _ = tx.send(Internal::Event(Event::GrantHorizonPersisted {
+                            kind,
+                            until,
+                            durable,
+                        }));
+                    });
+                }
                 Action::SyncDelegStream { gen, through } => {
                     // A full flush of the store (seconds on a loaded disk):
                     // on the blocking pool, never the driver loop or the
@@ -7039,9 +7065,12 @@ async fn peer_links_task(
         // its last lapse was handed.
         let handed = lapses.handed();
         let issued = WaitMs(wait_now_ms());
+        // Before the snapshot, for the same reason.
+        let registry_complete = peers.registry_complete();
         let links = peer_links(&peers, &mut since);
         if tx
             .send(Internal::Event(Event::Peers {
+                registry_complete,
                 links,
                 lapses: handed,
                 issued,
@@ -8035,6 +8064,14 @@ impl Standalone {
                     self.queue.push_back(Event::LockHorizonPersisted {
                         until,
                         durable: Some(until),
+                    })
+                }
+                Action::PersistGrantHorizon { kind, until } => {
+                    let durable = self.meta.persist_grant_horizon(kind, until, now()).ok();
+                    self.queue.push_back(Event::GrantHorizonPersisted {
+                        kind,
+                        until,
+                        durable,
                     })
                 }
                 Action::SyncDelegStream { gen, through } => {
