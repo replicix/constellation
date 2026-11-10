@@ -1273,6 +1273,92 @@ pub fn sticky_abandon(_seed: u64) -> Result<()> {
     result
 }
 
+/// ADR-46: the sticky holder `b` of `d1` is killed with `kill -9` while `c`
+/// holds read delegations it granted, and remounted with its journal inside
+/// their lifetime (the read TTL is 30 s here, so the delegations outlive the
+/// remount). `a`'s write of `d1/x` goes to the returned holder: it must not
+/// be acknowledged while `c` can still serve the old content, so `c`'s next
+/// strict open of `d1/x` shows the new content. A holder that forgets its
+/// grants executes at once and `c` serves the old content.
+pub fn sticky_holder_restart(_seed: u64) -> Result<()> {
+    const SCENARIO: &str = "sticky-holder-restart";
+    let (_env, _root, mut clients, _) = cluster(
+        SCENARIO,
+        &["a", "b", "c"],
+        &[
+            ("CONSTELLATION_CTO", "strict"),
+            ("CONSTELLATION_READ_DELEGATION_TTL_MS", "30000"),
+        ],
+        0,
+    )?;
+    let result = (|| -> Result<()> {
+        let a = &clients[0];
+        let b = &clients[1];
+        let c = &clients[2];
+        let b_id = node_id(b)?;
+        std::fs::create_dir(a.mnt.join("d1"))?;
+        for x in [b, c] {
+            eventually("dir visible", Duration::from_secs(20), || {
+                anyhow::ensure!(x.mnt.join("d1").is_dir());
+                Ok(())
+            })?;
+        }
+        a.control(
+            "designation.delegate",
+            serde_json::json!({"path": "/d1", "node": b_id, "sticky": true}),
+        )
+        .context("delegating --sticky /d1 to b")?;
+        wait_installed(b, "/d1", Duration::from_secs(20))?;
+        write_timed(&b.mnt.join("d1/x"), b"old")?;
+        eventually("x visible on c", Duration::from_secs(20), || {
+            anyhow::ensure!(std::fs::read(c.mnt.join("d1/x"))? == b"old");
+            Ok(())
+        })?;
+        for _ in 0..5 {
+            anyhow::ensure!(std::fs::read(c.mnt.join("d1/x"))? == b"old");
+        }
+        let cto = c.control_status()?["cto"].clone();
+        anyhow::ensure!(
+            n(&cto, "delegation_local") >= 1,
+            "c served no read under a read delegation: {cto}"
+        );
+        let killed = Instant::now();
+        clients[1].kill9()?;
+        clients[1].mount()?;
+        eprintln!(
+            "    {SCENARIO}: b remounted {:?} after the kill (read TTL 30 s)",
+            killed.elapsed()
+        );
+        anyhow::ensure!(
+            killed.elapsed() < Duration::from_secs(25),
+            "b came back after {:?}: the old read delegations may have lapsed, the scenario proves nothing",
+            killed.elapsed()
+        );
+        let a = &clients[0];
+        let c = &clients[2];
+        let t = Instant::now();
+        write_timed(&a.mnt.join("d1/x"), b"new")
+            .context("a writing d1/x at the returned holder")?;
+        eprintln!(
+            "    {SCENARIO}: a's write of d1/x was acknowledged {:?} after it was sent",
+            t.elapsed()
+        );
+        anyhow::ensure!(
+            std::fs::read(c.mnt.join("d1/x"))? == b"new",
+            "c's strict open of d1/x shows the old content after a's acknowledged write \
+             (a read was served under a grant of b's previous process)"
+        );
+        anyhow::ensure!(
+            std::fs::read(a.mnt.join("d1/x"))? == b"new",
+            "a does not see its own write"
+        );
+        Ok(())
+    })();
+    dump_logs_on_failure(SCENARIO, &clients, &result);
+    unmount_all(&mut clients);
+    result
+}
+
 /// How many conflict copies `c` has created (`status.spool.conflicts`).
 fn conflicts_total(c: &Client) -> u64 {
     c.control_status()
