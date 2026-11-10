@@ -2674,10 +2674,23 @@ impl Core {
         // gate: `locks-blips-tight-faults` seed 5379 reaches that one, and
         // there the release is the epoch's design.
         let fast_gate = self.lease.gate.as_ref().is_some_and(|g| g.fast_prev);
+        // And a takeover of another node's lease: its gate strands what the
+        // previous tenure acknowledged to its clients but never shipped, and
+        // replays it (`flex-tight` seed 485: a member took an epoch holder's
+        // lease over while its own epoch flush was pending; the flush
+        // released the lease before the marker landed, so the gate never
+        // ran, and the next claim, a plain one, found nothing to strand: the
+        // holder's acknowledged ops were lost).
+        let foreign_takeover = self
+            .lease
+            .gate
+            .as_ref()
+            .is_some_and(|g| g.takeover && self.lease.prev_holder.is_some());
         if flushed
             && (replica.locks().live_grants_len(now.wait) > 0
                 || self.in_takeover_floor(now)
-                || fast_gate)
+                || fast_gate
+                || foreign_takeover)
         {
             out.push(Action::EpochFlushed);
         } else if flushed {
