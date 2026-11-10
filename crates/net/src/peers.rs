@@ -136,8 +136,8 @@ struct Inner {
     refresher: Mutex<Option<Refresher>>,
     /// One-shot latch for the shared-node-key misconfiguration warning.
     warned_shared_key: std::sync::atomic::AtomicBool,
-    /// Set once a registry scan that read every record has filled the
-    /// directory ([`Peers::mark_registry_complete`]); never cleared.
+    /// Whether the registry scan that last filled the directory read every
+    /// record ([`Peers::set_registry_complete`]).
     registry_complete: std::sync::atomic::AtomicBool,
     /// Bumped whenever a peer enters or leaves the directory or its
     /// `connected` flag flips (see [`Peers::links_changed`]).
@@ -366,21 +366,23 @@ impl Peers {
         inner.p2p.join(bootstrap).await
     }
 
-    /// The directory was filled from a registry scan that read every record
-    /// (the caller says so after [`Peers::refresh_registry`] with that
-    /// scan's records): it then lists every live node, read-only members
-    /// included. A failed or partial scan never sets it.
-    pub fn mark_registry_complete(&self) {
+    /// Whether the registry scan that is about to fill the directory (or
+    /// has just filled it) read every record: it then lists every live
+    /// node, read-only members included. The caller clears it BEFORE
+    /// [`Peers::refresh_registry`] with a scan that did not, and sets it
+    /// after one that did, so a reader that sees it set around a snapshot
+    /// (see [`Peers::registry_complete`]) saw a complete scan's directory.
+    pub fn set_registry_complete(&self, complete: bool) {
         if let Some(inner) = self.inner.as_ref() {
             inner
                 .registry_complete
-                .store(true, std::sync::atomic::Ordering::Release);
+                .store(complete, std::sync::atomic::Ordering::Release);
         }
     }
 
-    /// Whether [`Peers::mark_registry_complete`] was called. Read it
-    /// before [`Peers::snapshot`]: if it is set, the snapshot lists the
-    /// whole scan.
+    /// Whether the last registry scan was complete
+    /// ([`Peers::set_registry_complete`]). Read it before and after
+    /// [`Peers::snapshot`] and trust the snapshot only if both say so.
     pub fn registry_complete(&self) -> bool {
         self.inner.as_ref().is_some_and(|inner| {
             inner

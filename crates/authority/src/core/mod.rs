@@ -74,7 +74,7 @@ use crate::replica::Replica;
 use constellation_meta::Rid;
 use constellation_store_s3::inbox::InboxKey;
 use constellation_types::Code;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub use backup::{
     ack_counter, beat_sent_ms, commit_name, liveness_fresh, AckView, Asker, CommitRule, GroupOn,
@@ -2329,9 +2329,14 @@ pub struct Core {
     peers_lapses: u64,
     peers_seen: bool,
     /// A snapshot has arrived whose directory a complete registry scan
-    /// filled (`Event::Peers::registry_complete`); it stays set, for the
-    /// directory keeps its cached peers when a later scan fails.
+    /// filled (`Event::Peers::registry_complete`); it stays set.
     peers_complete: bool,
+    /// Every node that was on the roster or in the directory since the
+    /// first complete snapshot: the readers that may hold a read grant of
+    /// this node's delegates (`Core::void_audience`). It only grows: a
+    /// later scan that lost a record (corrupt, deleted, not read) cannot
+    /// take a node out of it while a grant of it may be outstanding.
+    audience: BTreeSet<NodeId>,
     /// When this node last heard from each peer (a message, or the driver's
     /// `PeerLink::last_seen`), on its wait clock. Kept across the link
     /// table's replacement (`Event::Peers`), which drops a link's last
@@ -2455,6 +2460,7 @@ impl Core {
             peers_lapses: 0,
             peers_seen: false,
             peers_complete: false,
+            audience: BTreeSet::new(),
             peer_heard: BTreeMap::new(),
             own_s3: OwnS3::default(),
             readopt_refused_until: WaitMs(0),
@@ -2767,6 +2773,7 @@ impl Core {
                 }
                 self.roster = write_eligible;
                 self.roster_seen = true;
+                self.note_audience();
                 // The roster read is the authority on who is a peer: a
                 // requester it does not list is none.
                 let roster = &self.roster;
@@ -2807,6 +2814,7 @@ impl Core {
                     .retain(|n, at| !links.contains_key(n) || issued <= *at);
                 self.peers_seen = true;
                 self.peers_complete |= registry_complete;
+                self.note_audience();
                 self.peers_lapses = self.peers_lapses.max(lapses);
                 self.refresh_backup_eligibility();
                 self.stream_on_peers(now);

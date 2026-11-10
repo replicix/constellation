@@ -7065,9 +7065,11 @@ async fn peer_links_task(
         // its last lapse was handed.
         let handed = lapses.handed();
         let issued = WaitMs(wait_now_ms());
-        // Before the snapshot, for the same reason.
-        let registry_complete = peers.registry_complete();
+        // Before and after the snapshot: only a directory a complete scan
+        // filled throughout is vouched for.
+        let complete_before = peers.registry_complete();
         let links = peer_links(&peers, &mut since);
+        let registry_complete = complete_before && peers.registry_complete();
         if tx
             .send(Internal::Event(Event::Peers {
                 registry_complete,

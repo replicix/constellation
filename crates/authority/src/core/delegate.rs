@@ -8123,7 +8123,12 @@ impl Core {
     /// (`Event::Peers::registry_complete`), so it lists every live node,
     /// read-only ones too, and a node enrolled later cannot hold a grant
     /// of a process that is already gone. The roster (write-eligible
-    /// nodes) alone never names read-only members. Until the roster and
+    /// nodes) alone never names read-only members. The set is the union
+    /// of the roster and the links seen since that first complete
+    /// snapshot: a later scan that lost a record cannot shrink it. A
+    /// delegate grants a read delegation only to a member of this set
+    /// (`deleg_read_index`), so every holder of a grant is asked, and a
+    /// reader the set does not yet name reads through. Until the roster and
     /// such a snapshot have arrived the set is not known (and an empty
     /// one would read as "nobody holds any"); then the horizon decides.
     /// This is the one place that builds the audience.
@@ -8131,10 +8136,21 @@ impl Core {
         if !(self.roster_seen && self.peers_seen && self.peers_complete) {
             return None;
         }
-        let mut peers: BTreeSet<NodeId> = self.roster.iter().copied().collect();
+        let mut peers = self.audience.clone();
+        peers.extend(self.roster.iter().copied());
         peers.extend(self.links.keys().copied());
         peers.remove(&self.cfg.node_id);
         Some(peers)
+    }
+
+    /// Grow the audience by the roster and the directory's links, once a
+    /// complete snapshot has arrived (the roster may follow it) (and from then on at each roster and
+    /// peers event). The one place it grows; it never shrinks.
+    pub(super) fn note_audience(&mut self) {
+        if self.peers_seen && self.peers_complete {
+            self.audience.extend(self.roster.iter().copied());
+            self.audience.extend(self.links.keys().copied());
+        }
     }
 
     /// The early exit of the restart quarantine (ADR-46, D6): every
@@ -8362,7 +8378,13 @@ impl Core {
         // but a grant now would join the previous process's, which this
         // node's table has forgotten.
         let quarantined = self.deleg_restart_quarantined(now, gen);
-        let grant = if self.cfg.read_delegations && from != self.cfg.node_id {
+        // Only a reader the stream's void reaches (`void_audience`) gets a
+        // grant: one the directory has not shown this core yet reads
+        // through, and gets one on a later read, once it is known.
+        let grant = if self.cfg.read_delegations
+            && from != self.cfg.node_id
+            && self.void_audience().is_some_and(|a| a.contains(&from))
+        {
             let margin = self.cfg.expiry_margin_ms as i64;
             // A delegate's read grant is capped by its own honour end.
             let cap = d.until.since(now.honour) - margin;
