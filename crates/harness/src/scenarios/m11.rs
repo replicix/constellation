@@ -1446,7 +1446,27 @@ pub fn delegate_partition(_seed: u64) -> Result<()> {
         eprintln!("    {NAME}: a <-> b cut; b holds gen {gen} for at most {DELEG_TTL_MS} ms");
         // b's writes inside the grant are still local; they reach the
         // root only after the heal (S3 carries nothing of a delegate).
-        let (names_b_cut, lat_cut) = write_files(b, "d1", "cut", 10)?;
+        //
+        // They run on a thread: a write that meets the end of the grant
+        // (one parked near its expiry, then sent on to the root) goes through
+        // the root's inbox poll, which polls a requester it saw no demand
+        // from at the cold interval (`inbox_cold_max_ms`, 10 s). That
+        // latency is the inbox's, not the grant's, so it must not count in
+        // the time b took to stop honouring the grant, which is measured
+        // here from b's status while the writes are in flight.
+        let writer = {
+            let (mnt, names): (_, Vec<String>) = (
+                b.mnt.clone(),
+                (0..10).map(|i| format!("d1/cut-{i}")).collect(),
+            );
+            std::thread::spawn(move || -> Result<(Vec<String>, Vec<Duration>)> {
+                let mut lat = Vec::new();
+                for name in &names {
+                    lat.push(write_timed(&mnt.join(name), name.as_bytes())?);
+                }
+                Ok((names, lat))
+            })
+        };
         // b stops on its own clock once it cannot renew.
         eventually("b stops", Duration::from_millis(3 * DELEG_TTL_MS), || {
             let d = deleg_of(b)?;
@@ -1458,6 +1478,9 @@ pub fn delegate_partition(_seed: u64) -> Result<()> {
             Ok(())
         })?;
         let stopped_after = cut.elapsed();
+        let (names_b_cut, lat_cut) = writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("b's writer thread panicked"))??;
         // c's write into d1: the delegate is stopped (it says so), the
         // root recalls, cannot reach b, outwaits the grant, executes.
         let t = Instant::now();
@@ -1970,7 +1993,8 @@ pub fn auto_placement(_seed: u64) -> Result<()> {
 /// for b; c's writes under it are forwarded to b; the root's own client
 /// forwards too. b cut from everyone keeps writing locally (its grant
 /// never lapses) while c's writes under the path are refused `EROFS`
-/// (the root will not sequence a designated subtree); after the heal
+/// (the root will not sequence a designated subtree; the first one c sent
+/// to b ends in doubt, `EIO`, as it may have run there); after the heal
 /// everything converges, and `online` on b recalls it: c's writes go
 /// through the root again.
 pub fn designation_as_delegation(_seed: u64) -> Result<()> {
@@ -2055,6 +2079,21 @@ pub fn designation_as_delegation(_seed: u64) -> Result<()> {
             },
         )?;
         let (names_cut, lat_cut) = write_files(b, "site", "cut", 10)?;
+        // The first op c sends after the cut is sent to b: c's link to b has
+        // not failed yet and the table names b the designee. It may have run
+        // there (b could be alive and cut from the others only, as it is),
+        // so the root's EROFS for it is held, not final (plan 46 M1.3
+        // step 5, ADR-45, I1), and it ends in doubt (EIO) at its settle cap.
+        // That is the design, not a fault (the same as `sticky-abandon`'s
+        // first write after the kill): this sacrificial write takes it, and
+        // fails with EIO or EROFS, never succeeds. The next write is sent
+        // after c's forward to b failed, so it never reached the designee
+        // and the root refuses it for good (EROFS).
+        let sacrifice = std::fs::write(c.mnt.join("site/c-sacrifice"), b"x");
+        anyhow::ensure!(
+            matches!(&sacrifice, Err(e) if matches!(e.raw_os_error(), Some(5 | 30))),
+            "c's write sent to the cut designee: {sacrifice:?} (want EIO or EROFS, never success)"
+        );
         let refused = match std::fs::write(c.mnt.join("site/c-during-cut"), b"x") {
             Err(e) => Code::from_os_error(&e),
             Ok(()) => None,
