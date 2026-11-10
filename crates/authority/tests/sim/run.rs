@@ -39,8 +39,13 @@ pub enum FaultKind {
     ShutdownHolder { restart_ms: u64 },
     /// Plan 30 §M14: delegate directory `dir` (by name under the root)
     /// to the lowest live node that is not the lease holder, through the
-    /// holder, retrying until it answers (up to `within_ms`).
-    DelegateDir { dir: String, within_ms: u64 },
+    /// holder, retrying until it answers (up to `within_ms`). `sticky`:
+    /// the operator's sticky grant (`constellation delegate --sticky`).
+    DelegateDir {
+        dir: String,
+        within_ms: u64,
+        sticky: bool,
+    },
     /// Plan 46 M1.3 step 4: the operator's `undelegate` of directory `dir`
     /// (by name under the root), through the lease holder, retried for
     /// `within_ms`. A sticky grant ends by it: the holder releases.
@@ -3248,7 +3253,11 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             tokio::time::sleep(Duration::from_millis(restart_ms)).await;
             cluster.restart(holder, Some(meta));
         }
-        FaultKind::DelegateDir { dir, within_ms } => {
+        FaultKind::DelegateDir {
+            dir,
+            within_ms,
+            sticky,
+        } => {
             let t0 = cluster.env.clock.elapsed_ms();
             while cluster.env.clock.elapsed_ms() < t0 + within_ms {
                 let holder = read_lease(&cluster.env.bucket)
@@ -3268,7 +3277,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                             h.control(constellation_authority::Control::Delegate {
                                 dir: ino,
                                 node: to,
-                                sticky: false,
+                                sticky,
                             }),
                         )
                         .await;
@@ -6608,6 +6617,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         // journaled for an op that another sequencer ran (an inbox refusal
         // beside the sticky holder's row), whatever answer the client heard.
         (true, "refused_and_completed", &outcome_conflicts),
+        // ADR-47, check 1: strict on every configuration (it judges nothing
+        // without a refusal under a non-stealable grant).
+        (true, "nonholder_refused_a_designee_ran", &found.fence),
         (cfg.strict_settle, "I4", &found.i4),
         (cfg.strict_settle, "I4", &found.unjournaled_landed),
         (

@@ -309,6 +309,7 @@ fn replay_seed() {
         Ok("sticky-holder-dies") => sticky_holder_dies_config(),
         Ok("sticky-holder-returns") => sticky_holder_returns_config(),
         Ok("sticky-ttl") => sticky_ttl_config(),
+        Ok("sticky-stale-route") => sticky_stale_route_config(),
         Ok("backup-two") => backup_two_config(),
         Ok("backup-strict") => backup_strict_config(),
         Ok("backup-strict-inbox-off") => backup_strict_inbox_off_config(),
@@ -1914,6 +1915,89 @@ fn sticky_ttl_config() -> SimConfig {
             },
         ],
         ..delegated_config()
+    }
+}
+
+/// ADR-47 (S7's shape): a requester's route cache names a former lease
+/// holder that is now a designee. Four nodes; node 1 holds the lease first
+/// and is shut down at 1 s (it restarts at 3.5 s), a successor takes the
+/// lease; node 3, whose clients write in `d1`, is paused across the change
+/// and keeps node 1 cached as the holder. At 3.7 s the operator grants `d1`
+/// sticky through the new root to the lowest live node that is not the
+/// root, node 1. Node 3 resumes and writes `d1` by its stale cache; node 1
+/// is then cut from the root and from node 3, so the answer is lost and the
+/// root cannot reach the designee. An unrouted forward that the designee
+/// runs, followed by the root's refusal of the retry, is I1
+/// (`nonholder_refused_a_designee_ran`).
+fn sticky_stale_route_config() -> SimConfig {
+    SimConfig {
+        nodes: 4,
+        dirs: vec!["d2".into(), "d3".into(), "d1".into(), "d3".into()],
+        delegations: Vec::new(),
+        sticky_delegations: Vec::new(),
+        cross_ratio: 0.2,
+        ops_per_client: 14,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 800,
+                kind: FaultKind::Pause {
+                    node: 3,
+                    for_ms: 3_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_000,
+                kind: FaultKind::ShutdownHolder { restart_ms: 2_500 },
+            },
+            ScheduledFault {
+                at_ms: 3_700,
+                kind: FaultKind::DelegateDir {
+                    dir: "d1".into(),
+                    within_ms: 2_000,
+                    sticky: true,
+                },
+            },
+            ScheduledFault {
+                at_ms: 3_900,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 3,
+                    for_ms: 4_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 3_950,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 2,
+                    for_ms: 4_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 3_950,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 4,
+                    for_ms: 4_000,
+                },
+            },
+        ],
+        ..delegated_config()
+    }
+}
+
+/// ADR-47: S7's shape passes only once an executor fences an unrouted
+/// forward (C4).
+#[test]
+#[ignore = "fence C4"]
+fn sticky_stale_route_passes_with_the_fence() {
+    for seed in 0..25 {
+        run_seed(seed, sticky_stale_route_config()).unwrap_or_else(|e| {
+            panic!(
+                "sticky-stale-route seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=sticky-stale-route"
+            )
+        });
     }
 }
 
@@ -6012,6 +6096,7 @@ fn sweep_config() {
         "sticky-holder-dies" => sticky_holder_dies_config(),
         "sticky-holder-returns" => sticky_holder_returns_config(),
         "sticky-ttl" => sticky_ttl_config(),
+        "sticky-stale-route" => sticky_stale_route_config(),
         "backup-departs" => backup_departs_config(),
         "singleton-first-peer" => singleton_first_peer_config(),
         "backup-group-cut-ttl" => backup_group_cut_ttl_config(GroupCut::Both),
@@ -12478,6 +12563,7 @@ fn locks_released_delegated_config() -> SimConfig {
                 kind: FaultKind::DelegateDir {
                     dir: "d1".into(),
                     within_ms: 3_000,
+                    sticky: false,
                 },
             },
         ],

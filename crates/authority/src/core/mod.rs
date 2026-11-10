@@ -2280,6 +2280,14 @@ pub struct Core {
     /// `track_unsettled_designation`; production cores do not, since nothing
     /// would drain it).
     track_unsettled_designation: bool,
+    /// ADR-47 audit (the sim driver; `track_fence_audit`): refusals the root
+    /// decided for an op under a non-stealable grant it does not reach (the
+    /// forward's `EROFS`/`EXDEV`, its own op's, a drain's journaled
+    /// `Refused`; the flag: the drain's), and the ops a non-stealable
+    /// generation of this node executed. Filled only when tracked.
+    track_fence_audit: bool,
+    final_nonholder_refusals: Vec<(Rid, Code, bool)>,
+    nonstealable_executions: Vec<(Rid, u64)>,
     /// Rids in `in_doubt_rids` whose op had been redirected to a designee:
     /// the mark that keeps a resubmission out of the inbox (I1). Evicted
     /// with `in_doubt_rids` (`MAX_IN_DOUBT_RIDS`, a known I1 bound).
@@ -2471,6 +2479,9 @@ impl Core {
             unsettled_designation_rids: std::collections::BTreeSet::new(),
             unsettled_accepted_rids: std::collections::BTreeSet::new(),
             track_unsettled_designation: false,
+            track_fence_audit: false,
+            final_nonholder_refusals: Vec::new(),
+            nonstealable_executions: Vec::new(),
             in_doubt_designee_rids: std::collections::BTreeSet::new(),
             in_doubt_batches: std::collections::BTreeMap::new(),
             shipped_touches: std::collections::VecDeque::new(),

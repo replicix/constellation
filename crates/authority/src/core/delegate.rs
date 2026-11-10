@@ -3048,6 +3048,9 @@ impl Core {
                     self.stats.deleg_executed += 1;
                     if let Some(d) = self.dl.mine.get_mut(&gen) {
                         d.executed += 1;
+                        if self.track_fence_audit && d.non_stealable {
+                            self.nonstealable_executions.push((rid, gen));
+                        }
                     }
                     exec_idx = Some(idx);
                     MutateOutcome::Accepted { epoch, records }

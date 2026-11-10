@@ -474,6 +474,7 @@ impl Core {
                         // answer for an op it sent to a delegate: it asks
                         // again until the holder's word or its deadlines,
                         // `Core::on_mutate_reply`, plan 46 M1.3 step 5.)
+                        self.note_final_nonholder_refusal(rid, code, false);
                         if req != OpId(0) {
                             // Plan 43 C2f review: nothing is journaled for
                             // this refusal; it is the designation's (a

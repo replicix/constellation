@@ -789,6 +789,7 @@ impl NodeHandle {
                 core.set_deleg_windows(windows);
                 core.set_lane_cell(lane_cell.clone());
                 core.track_unsettled_designation();
+                core.track_fence_audit();
                 core
             },
             store: env.bucket.handle(id),
@@ -923,6 +924,7 @@ impl NodeHandle {
             return rx;
         }
         self.oracles.note_invoke(rid);
+        self.oracles.note_submit(rid);
         self.oracles.note_op(rid, &op);
         self.shared.replies.lock().unwrap().insert(rid, tx);
         let _ = self.tx.send(Event::Submit {
@@ -2226,6 +2228,11 @@ impl Driver {
             let is_stream = EventKind::DelegateStream.matches(&event);
             let actions = self.core.handle(now, event, &*self.meta);
             let drained = self.core.take_drained_rows();
+            self.oracles.note_fence_audit(
+                self.id,
+                self.core.take_final_nonholder_refusals(),
+                self.core.take_nonstealable_executions(),
+            );
             if self.core.lease().epoch().is_some() {
                 self.record_deleg_rows(is_stream, &drained);
             }

@@ -1619,6 +1619,7 @@ impl Core {
                         super::delegate::RecallPlan::Refuse(code) => {
                             // Phase 2b: a designation is involved.
                             replica.journal_inbox_refusal(rid, code, ack, decoded.as_ref().ok())?;
+                            self.note_final_nonholder_refusal(rid, code, true);
                             self.stats.inbox_refused_ops += 1;
                             continue;
                         }
