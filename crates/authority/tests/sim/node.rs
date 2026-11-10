@@ -525,6 +525,15 @@ impl NodeEnv {
     }
 }
 
+/// The configuration a node's core starts with, from a simulation
+/// configuration's: the derivations the daemon applies to its own
+/// (`deadlines::normalize`), so the simulation runs the derived
+/// configuration that ships.
+pub fn driver_config(mut cfg: Config) -> Config {
+    constellation_authority::deadlines::normalize(&mut cfg);
+    cfg
+}
+
 impl NodeHandle {
     /// Start (or restart) node `id` over `meta`. A fresh `Meta` is a node
     /// with no durable state (a new mount); an existing one is a restart
@@ -772,6 +781,7 @@ impl NodeHandle {
         if cfg.settle_window_ms == 0 {
             cfg.settle_window_ms = cfg.ttl_ms / 2;
         }
+        let mut cfg = driver_config(cfg);
         cfg.clock_id = clock.id();
         cfg.clock_rate_budget_ppm = env.rate_budget_ppm;
         // (A node with backups off has no peer in budget for the oracles:
@@ -796,7 +806,7 @@ impl NodeHandle {
         env.oracles.leases.set_bus(env.bus.clone());
         let beat_every_ms = cfg.backup_heartbeat_ms.max(1);
         let (cfg_locks, lane_timeout_ms) = (cfg.locks, cfg.forward_timeout_ms);
-        let lane_tick_ms = (cfg.forward_timeout_ms / 4).clamp(50, 250);
+        let lane_tick_ms = constellation_authority::deadlines::lane_tick_ms(cfg.forward_timeout_ms);
         let lane = env.deleg_lane && cfg.delegation && cfg.p2p;
         let driver = Driver {
             id,

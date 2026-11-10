@@ -697,7 +697,6 @@ pub fn load_config(
     c.read_delegation_ttl_ms = crate::cto::read_delegation_ttl_ms();
     c.read_ahead_grants = crate::cto::read_ahead_grants();
     c.read_grants_per_node = crate::cto::read_grants_per_node();
-    c.recall_hold_ms = (c.forward_timeout_ms / 2).max(1);
     // How long a forwarded `back` close may wait on the holder for its
     // own record before its held chunks go up (`Action::UploadAwaited`;
     // 0: never).
@@ -750,10 +749,8 @@ pub fn load_config(
     // behind compactions against ~2.3 s grants) and 10 s passed 2 of 2 at
     // load 35-65: a candidate for the default, kept at the lock TTL until
     // it is measured under heavier load.
-    c.delegation_ttl_ms = env_ms(
-        "CONSTELLATION_DELEGATION_TTL_MS",
-        constellation_authority::Config::default_delegation_ttl_ms(c.lock_ttl_ms),
-    );
+    // (`0`: unset; `deadlines::normalize` derives it from the lock TTL.)
+    c.delegation_ttl_ms = env_ms("CONSTELLATION_DELEGATION_TTL_MS", 0);
     // Plan 30 §M11 phase 2b: the placement's knobs.
     // Plan 30 §M12: on by default (a dominant writer's subtree moves to
     // it); `CONSTELLATION_DELEGATION_PLACEMENT=off` pins the single
@@ -796,15 +793,10 @@ pub fn load_config(
     c.backup_ack_timeout_ms = env_ms(
         "CONSTELLATION_BACKUP_ACK_TIMEOUT_MS",
         c.backup_ack_timeout_ms,
-    )
-    .max(1);
-    c.backup_slow_max_ms = env_ms("CONSTELLATION_BACKUP_SLOW_MAX_MS", c.backup_slow_max_ms)
-        .max(c.backup_ack_timeout_ms);
-    c.backup_takeover_ms = env_ms("CONSTELLATION_BACKUP_TAKEOVER_MS", c.backup_takeover_ms).max(1);
-    c.backup_heartbeat_ms = env_ms("CONSTELLATION_BACKUP_HEARTBEAT_MS", c.backup_heartbeat_ms)
-        .max(1)
-        .min(c.backup_takeover_ms / 3)
-        .max(1);
+    );
+    c.backup_slow_max_ms = env_ms("CONSTELLATION_BACKUP_SLOW_MAX_MS", c.backup_slow_max_ms);
+    c.backup_takeover_ms = env_ms("CONSTELLATION_BACKUP_TAKEOVER_MS", c.backup_takeover_ms);
+    c.backup_heartbeat_ms = env_ms("CONSTELLATION_BACKUP_HEARTBEAT_MS", c.backup_heartbeat_ms);
     c.pre_s3_streaming = p2p
         && !matches!(
             std::env::var("CONSTELLATION_PRE_S3_STREAMING")
@@ -814,6 +806,8 @@ pub fn load_config(
                 .as_str(),
             "0" | "off" | "false"
         );
+    // The derivations the simulation's driver applies the same way.
+    constellation_authority::deadlines::normalize(&mut c);
     c
 }
 

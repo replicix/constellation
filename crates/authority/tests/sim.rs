@@ -19069,3 +19069,23 @@ fn the_cto_oracle_catches_a_restart_that_skips_the_write_quarantine() {
         );
     }
 }
+
+/// The simulation's driver starts a node's core with the derivations the
+/// daemon applies to its own configuration (`deadlines::normalize`): a
+/// forwarded reply held for recalls answers `Held` at half the forward
+/// timeout, as it does in production (the sim kept the 250 ms of
+/// `Config::defaults`, 400 ms against a 200 ms hold).
+#[test]
+fn sim_driver_config_matches_engine_normalisation() {
+    let started = sim::node::driver_config(sim::run::sim_core_config(1, 1));
+    assert_eq!(started.forward_timeout_ms, 400);
+    assert_eq!(started.recall_hold_ms, started.forward_timeout_ms / 2);
+    let backup = sim::node::driver_config(sim::run::backup_core_config(1, 1));
+    assert!(backup.backup_heartbeat_ms <= backup.backup_takeover_ms / 3);
+    assert!(backup.backup_slow_max_ms >= backup.backup_ack_timeout_ms);
+    // An unset delegation TTL takes the lock TTL's default, as the daemon's.
+    let mut unset = sim::run::sim_core_config(1, 1);
+    unset.delegation_ttl_ms = 0;
+    unset.lock_ttl_ms = 20_000;
+    assert_eq!(sim::node::driver_config(unset).delegation_ttl_ms, 20_000);
+}
