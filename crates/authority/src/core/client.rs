@@ -4315,6 +4315,17 @@ impl Core {
         if !journal_carries_outcome(replica, rid) {
             return Some(outcome);
         }
+        // A delegation row in this journal (this node's own row of its
+        // generation, or this tenure's append of it) commits by its group
+        // or the log, not by the root journal's position below: a lone
+        // root's `ack_need` gates nothing (`long-delegated` seeds 255 and
+        // 865 under slow lease reads: a delegate took the root over, and
+        // its own client's row, which the restarted root never
+        // acknowledged, was answered at the deadline inside the takeover
+        // gate on this disk alone).
+        if !self.completed_row_settled(rid, replica) {
+            return None;
+        }
         let position = Position {
             seq: self.ship.head_seq,
             pending: replica.journal_position(epoch),
