@@ -682,7 +682,10 @@ impl Core {
             !matches!(origin, Origin::Replay { .. }) && self.in_doubt_rids.remove(&rid);
         let redirected_to_designee = resubmitted && self.in_doubt_designee_rids.remove(&rid);
         let in_doubt = matches!(origin, Origin::Replay { .. }) || resubmitted;
-        let inbox_keys = self.in_doubt_batches.remove(&rid).unwrap_or_default();
+        // An entry, even with no keys left, says the rid was in an inbox.
+        let in_doubt_batch = self.in_doubt_batches.remove(&rid);
+        let was_in_inbox = in_doubt_batch.is_some();
+        let inbox_keys = in_doubt_batch.unwrap_or_default();
         // ADR-47: the send history this node can vouch for. Whatever may
         // have lost it reads as unknown, which only ever holds a refusal.
         let touched_gen = if matches!(origin, Origin::Replay { .. }) {
@@ -703,7 +706,10 @@ impl Core {
         if touched_gen == TOUCHED_UNKNOWN {
             self.stats.touched_unknown_submits += 1;
         }
-        let inbox_ever = !inbox_keys.is_empty();
+        // ADR-47: an unknown send history may include an inbox (a replay,
+        // an older incarnation, an evicted rid, a fast-path in-doubt op):
+        // the fail-safe reading is "was in an inbox".
+        let inbox_ever = was_in_inbox || !inbox_keys.is_empty() || touched_gen == TOUCHED_UNKNOWN;
         self.next_client_order += 1;
         self.clients.insert(
             rid,
@@ -4752,7 +4758,7 @@ impl Core {
                     if c.redirected_to_designee {
                         self.in_doubt_designee_rids.insert(rid);
                     }
-                    if !c.inbox_keys.is_empty() {
+                    if c.inbox_ever || !c.inbox_keys.is_empty() {
                         self.in_doubt_batches.insert(rid, c.inbox_keys);
                     }
                 }

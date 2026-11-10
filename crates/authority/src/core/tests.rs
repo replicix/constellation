@@ -67646,6 +67646,7 @@ mod step5_sticky_release {
                 settle: false,
                 routed_gen: 7,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         })
     }
@@ -67906,6 +67907,7 @@ mod step5_sticky_release {
                 settle: true,
                 routed_gen: 7,
                 touched_gen: 0,
+                inbox_ever: false,
             },
         });
         assert_eq!(r.core.stats.settles_refused, 1);
@@ -69510,6 +69512,111 @@ mod route_fence_carriage {
         assert_eq!(fence_of(&out), Some((2, 0, 0)), "{out:?}");
     }
 
+    /// ADR-47: an unknown send history may include an inbox, so `inbox_ever`
+    /// (the forward's flag) is set whenever the history is unknown, and an
+    /// in-doubt op remembers an inbox it had left (its keys withdrawn).
+    /// Fails on the parent: only a rid with keys left in `in_doubt_batches`
+    /// was flagged.
+    #[test]
+    fn an_unknown_send_history_reads_as_ever_in_an_inbox() {
+        fn flag(out: &[Action]) -> bool {
+            sends(out)
+                .into_iter()
+                .find_map(|(_, m)| match m {
+                    PeerMsg::MutateRequest { inbox_ever, .. } => Some(*inbox_ever),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no forward: {out:?}"))
+        }
+        // A fresh rid: not flagged.
+        let mut h = requester();
+        let rid = h.rid(1);
+        let out = submit(&mut h, rid);
+        assert!(!flag(&out), "a fresh rid");
+        assert!(!h.core.clients[&rid].inbox_ever);
+
+        // A replay.
+        let mut h = requester();
+        let rid = h.rid(2);
+        let op = h.create("r");
+        let mut out = Vec::new();
+        h.core.submit(
+            h.clk(),
+            rid,
+            op,
+            Policy::Client,
+            Default::default(),
+            client::Origin::Replay {
+                queue_seq: 1,
+                deps: Default::default(),
+            },
+            &h.meta,
+            &mut out,
+        );
+        assert!(h.core.clients[&rid].inbox_ever, "a replay");
+
+        // An older incarnation of this node.
+        let mut h = requester();
+        let old = Rid {
+            node: 1,
+            incarnation: h.core.cfg.incarnation.wrapping_sub(1),
+            seq: 5,
+        };
+        let out = submit(&mut h, old);
+        assert!(flag(&out), "an older incarnation: {out:?}");
+
+        // A rid past the eviction watermark.
+        let mut h = requester();
+        let rid = h.rid(1);
+        let out = submit(&mut h, rid);
+        h.step(reply_from(
+            2,
+            req_of(&out),
+            MutateOutcome::NotHolder { holder: 3 },
+            7,
+        ));
+        let mut out = Vec::new();
+        h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
+        for seq in 0..crate::core::client::MAX_IN_DOUBT_RIDS as u64 + 1 {
+            h.core.note_in_doubt(h.rid(10 + seq));
+        }
+        let out = submit(&mut h, rid);
+        assert!(flag(&out), "an evicted rid: {out:?}");
+
+        // A fast-path in-doubt resubmission.
+        let mut h = requester();
+        let rid = h.rid(1);
+        let op = h.create("a");
+        let out = h.step(Event::SubmitInDoubt {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        assert!(flag(&out), "SubmitInDoubt: {out:?}");
+
+        // An op that was in an inbox, its keys withdrawn, then went in doubt.
+        let mut h = requester();
+        let rid = h.rid(1);
+        let out = submit(&mut h, rid);
+        h.step(reply_from(
+            2,
+            req_of(&out),
+            MutateOutcome::NotHolder { holder: 3 },
+            0,
+        ));
+        {
+            let c = h.core.clients.get_mut(&rid).unwrap();
+            c.inbox_ever = true;
+            c.inbox_keys.clear();
+        }
+        let mut out = Vec::new();
+        h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
+        assert!(h.core.in_doubt_rids.contains(&rid));
+        let out = submit(&mut h, rid);
+        assert!(flag(&out), "keys withdrawn before the doubt: {out:?}");
+    }
+
     /// A foreign rid evicted does not raise the watermark for own rids.
     #[test]
     fn a_foreign_rid_does_not_raise_the_eviction_watermark() {
@@ -69740,6 +69847,77 @@ mod route_fence_executor {
                 "the lease holder runs it (routed {routed})"
             );
         }
+    }
+
+    /// The lease holder, designee of its own generation, parks an
+    /// inbox-ever forward of `x` (its dependencies not reached): `x` has no
+    /// outcome yet, so the drain may decide it first (here: a journaled
+    /// refusal). The unparked run dedups to that outcome: one outcome in the
+    /// journal, one answer to the requester, nothing executed twice.
+    #[test]
+    fn a_parked_inbox_ever_run_dedups_to_the_drains_outcome() {
+        let (mut h, d1) = designee();
+        // (The fence lets the holder's own run of an inbox-ever rid through;
+        // `fence_accepts_unrouted` stands for that here, the park and the
+        // dedup being the same code.)
+        h.core.cfg.fence_accepts_unrouted = true;
+        let op = MutateOp::Create {
+            parent: d1,
+            name: "x".into(),
+            ino: h.meta.allocate_ino(d1).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let rid = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 1,
+        };
+        let ahead = Position {
+            seq: 99,
+            ..Position::ZERO
+        };
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(1),
+                rid,
+                op: op.clone(),
+                acked_through: 0,
+                deps: ahead,
+                applied: 0,
+                tag: Default::default(),
+                settle: false,
+                routed_gen: 7,
+                touched_gen: 7,
+                inbox_ever: true,
+            },
+        });
+        assert!(outcome_to(&out, 2).is_none(), "{out:?}");
+        assert_eq!(h.core.dl.mine[&7].parked.len(), 1, "parked");
+        assert!(!ran(&h, 2, 1));
+        // The drain decides `x` first.
+        crate::replica::Replica::journal_refusal(&h.meta, rid, Code::ReadOnly, Some(&op)).unwrap();
+        // Its dependencies arrive; the park is released.
+        h.core
+            .dl
+            .mine
+            .get_mut(&7)
+            .unwrap()
+            .parked
+            .iter_mut()
+            .for_each(|p| p.deps = Position::ZERO);
+        let mut out = Vec::new();
+        h.core.deleg_after_event(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine[&7].parked.is_empty());
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Errno(Code::ReadOnly)),
+            "{out:?}"
+        );
+        assert_eq!(journaled_outcomes(&h, rid), vec![true], "one outcome");
+        assert_eq!(h.core.dl.mine[&7].executed, 0, "not executed");
     }
 
     /// The negative control: without the fence (`fence_accepts_unrouted`) the
@@ -70295,6 +70473,7 @@ mod route_fence_root {
         let mut links = vec![link(2, false)];
         links.extend(node3.map(|up| link(3, up)));
         h.step(Event::Peers {
+            registry_complete: true,
             links,
             lapses: 0,
             issued: WaitMs(i64::MAX),
@@ -70723,6 +70902,7 @@ mod route_fence_root {
             ];
             Replica::install_streamed(&h.meta, 1, 1, 1, 2, &records, true, (0, 0)).unwrap();
             h.step(Event::Peers {
+                registry_complete: true,
                 links: [1, 3]
                     .into_iter()
                     .map(|node| crate::event::PeerLink {
