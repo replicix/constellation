@@ -115,7 +115,7 @@ impl Harness {
         if self.cold_horizon {
             return;
         }
-        let span = (self.core.cfg.read_delegation_ttl_ms + self.core.cfg.expiry_margin_ms) as u64;
+        let span = self.core.cfg.read_delegation_ttl_ms + self.core.cfg.expiry_margin_ms;
         let until = self.clk().wait.plus(span + 1_000);
         self.meta
             .persist_grant_horizon(kind, until, self.clk())
@@ -67210,7 +67210,7 @@ mod step5_sticky_release {
         assert_eq!(run_horizon_lane(&mut h, false), vec![GrantHorizon::Deleg]);
         // The root's key is untouched.
         assert_eq!(h.meta.kv_get("read_grant_horizon_ms").unwrap(), None);
-        let span = (h.core.cfg.read_delegation_ttl_ms + h.core.cfg.expiry_margin_ms) as u64;
+        let span = h.core.cfg.read_delegation_ttl_ms + h.core.cfg.expiry_margin_ms;
         assert!(h.meta.grant_horizon_known(GrantHorizon::Deleg) >= now.wait.plus(span + 1_000));
         // Steady reading, twice a second for a minute: a grant each time,
         // never beyond the durable horizon, and the lane keeps ahead (one
@@ -69232,7 +69232,7 @@ mod grant_horizon_bench {
         let meta = Arc::new(Meta::open(&path).unwrap());
         meta.set_node_prefix(1).unwrap();
         let mut core = Core::new(Config::defaults(1, 1));
-        let span = (core.cfg.read_delegation_ttl_ms + core.cfg.expiry_margin_ms) as u64;
+        let span = core.cfg.read_delegation_ttl_ms + core.cfg.expiry_margin_ms;
         let t0 = Instant::now();
         let now_at =
             move |t: Instant| Now::same(1_000_000 + t.duration_since(t0).as_millis() as i64);
