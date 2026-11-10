@@ -1402,6 +1402,30 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> u64 {
+        self.abort_parks(now, false, replica, out)
+    }
+
+    /// Late-landing S2b: the tenure ends without a deposition (a release
+    /// landed or was given up in doubt, a forced loss): a forward parked
+    /// unexecuted is dropped as a deposition drops it, or a requester that
+    /// keeps retrying keeps it fresh and it runs if this node holds the
+    /// lease again. Parked answers are left as they are.
+    pub(crate) fn drop_unexecuted_parks(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.abort_parks(now, true, replica, out);
+    }
+
+    fn abort_parks(
+        &mut self,
+        now: Now,
+        only_unexecuted: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> u64 {
         let ids: Vec<u64> = self
             .rd
             .parked
@@ -1413,9 +1437,8 @@ impl Core {
             // if this node regained the lease and the recall ended; its
             // requester retries by rid at the new holder.
             .filter(|(_, p)| {
-                p.durable.is_some()
-                    || p.queue_gated
-                    || matches!(p.what, ParkedWhat::ExecuteReply { .. })
+                matches!(p.what, ParkedWhat::ExecuteReply { .. })
+                    || (!only_unexecuted && (p.durable.is_some() || p.queue_gated))
             })
             .map(|(id, _)| *id)
             .collect();

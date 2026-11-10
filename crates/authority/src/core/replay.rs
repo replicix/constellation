@@ -56,6 +56,12 @@ pub(crate) struct ReplayState {
     /// not while the epoch refuses writes, and the tick that last counted.
     awaiting: BTreeMap<u64, u64>,
     awaiting_tick: Option<WaitMs>,
+    /// Late-landing S2a (SHOULD-4): when the drain first met each foreign
+    /// entry (by `queue_seq`) on this node's wait clock. Its settle waits
+    /// out the requester's own attempts, or it would make the sequencer
+    /// journal `Refused { ABANDONED }` for an op the remote requester's
+    /// retry would still have executed.
+    foreign_seen: BTreeMap<u64, WaitMs>,
 }
 
 impl ReplayState {
@@ -511,6 +517,20 @@ impl Core {
         if self.clients.contains_key(&entry.rid) || self.epoch_refuses_writes() {
             return;
         }
+        // A foreign entry's requester is another node's client: it retries
+        // by rid for as long as its attempts last (`Deadlines::attempts`), and
+        // that retry is the executing copy. The settle comes after.
+        if entry.foreign && !self.replay.unacked.contains(&entry.rid) {
+            let seen = *self
+                .replay
+                .foreign_seen
+                .entry(entry.queue_seq)
+                .or_insert(now.wait);
+            if now.wait.since(seen) < self.dl_t().attempts as i64 {
+                self.stats.foreign_settles_deferred += 1;
+                return;
+            }
+        }
         if !self.settle_backed_off(
             now,
             entry,
@@ -827,6 +847,10 @@ impl Core {
             .map(|q| q.queue_seq)
             .collect();
         self.replay.awaiting.retain(|seq, _| live.contains(seq));
+        let queued: std::collections::BTreeSet<u64> = queue.iter().map(|q| q.queue_seq).collect();
+        self.replay
+            .foreign_seen
+            .retain(|seq, _| queued.contains(seq));
         for q in queue {
             let Some(placeholder) = &q.await_retry else {
                 continue;

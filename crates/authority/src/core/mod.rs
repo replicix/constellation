@@ -927,7 +927,13 @@ pub struct Stats {
     /// inbox batches, and those whose tombstone could not be written within
     /// the first window (the settle then goes on without the inbox route).
     pub settles_withdrawn_first: u64,
+    /// Of those, the settles that withdrew more than one batch of the rid
+    /// (the forward's counterpart is `inbox_multi_batch_withdrawals`).
+    pub settle_multi_batch_withdrawals: u64,
     pub settle_withdraw_failed: u64,
+    /// Late-landing S2a: a foreign queue entry's settle held back while its
+    /// requester's own attempts may still run.
+    pub foreign_settles_deferred: u64,
     /// U1(a): tombstones the settle gave up on, written later in the
     /// background, and those dropped after the bounded tries.
     pub bg_tombstones_written: u64,
@@ -2042,7 +2048,7 @@ pub(crate) enum S3For {
     InboxLeftover(NodeId),
     /// M13: a requester deleting its own durable batch before forwarding
     /// the op over P2P instead.
-    InboxWithdraw(Rid),
+    InboxWithdraw(Rid, constellation_store_s3::inbox::InboxKey),
     /// M8: a strict read learning who holds the lease.
     ReadHolder(OpId),
     /// M14: a lock request learning the holder; renewals relearning it.
@@ -2265,6 +2271,10 @@ pub struct Core {
     /// The same for the unsettled `EIO`s of ops a delegate had executed
     /// (`ClientOp::accepted_by_delegate`; `take_unsettled_accepted`).
     unsettled_accepted_rids: std::collections::BTreeSet<Rid>,
+    /// And those of ops whose settle gave up on a tombstone
+    /// (`ClientOp::settle_withdraw_failed`; `take_withdraw_failed`): the
+    /// late-landing U1(a) label `isolated-from-s3`, for the sim oracle.
+    withdraw_failed_rids: std::collections::BTreeSet<Rid>,
     /// Whether `unsettled_designation_rids` is filled (a consumer calls
     /// `track_unsettled_designation`; production cores do not, since nothing
     /// would drain it).
@@ -2450,6 +2460,7 @@ impl Core {
             in_doubt_rids: std::collections::BTreeSet::new(),
             unsettled_designation_rids: std::collections::BTreeSet::new(),
             unsettled_accepted_rids: std::collections::BTreeSet::new(),
+            withdraw_failed_rids: std::collections::BTreeSet::new(),
             track_unsettled_designation: false,
             track_fence_audit: false,
             emission_hold_expected: false,
@@ -3479,14 +3490,16 @@ impl Core {
             S3For::RegisterWanted => {}
             S3For::InboxPut => self.on_inbox_put(now, result, replica, out),
             S3For::InboxLastN => self.on_inbox_last_n(now, result, replica, out),
-            S3For::InboxPoll(node) => self.on_inbox_polled(now, node, result, replica, out),
+            S3For::InboxPoll(node) => self.on_inbox_polled(now, node, op, result, replica, out),
             S3For::InboxRecheck => self.on_inbox_recheck(now, result, replica, out),
             S3For::InboxGc(key) => self.on_inbox_gc(now, key, result),
             S3For::InboxTombstoneBg(key) => self.on_bg_tombstone(now, key, result, out),
             S3For::InboxLeftover(node) => {
                 self.on_inbox_leftover_read(now, node, op, result, replica, out)
             }
-            S3For::InboxWithdraw(rid) => self.on_inbox_withdrawn(now, rid, result, replica, out),
+            S3For::InboxWithdraw(rid, key) => {
+                self.on_inbox_withdrawn(now, rid, key, result, replica, out)
+            }
             S3For::ReadHolder(op) => self.on_read_holder_learned(now, op, result, replica, out),
             S3For::LockHolder(op) => self.on_lock_holder_learned(now, op, result, replica, out),
             S3For::LockRenewHolder => self.on_lock_renew_holder(now, result, out),
@@ -3680,6 +3693,7 @@ impl Core {
                     // replica stops being the holder's.
                     self.clear_holder_epoch(replica);
                     self.fail_barriers(out);
+                    self.drop_unexecuted_parks(now, replica, out);
                     self.deleg_on_lease_gone(now, replica, out);
                 }
                 if !self.lease.lost {

@@ -4268,14 +4268,27 @@ impl Core {
         let Some(&key) = c.inbox_keys.first() else {
             return;
         };
-        c.phase = Phase::InboxWithdraw {
-            holder: 0,
-            gen: 0,
-            then: AfterWithdraw::Settle,
-        };
+        // A withdrawal already under way (the forward's) has its tombstone
+        // in flight: the settle takes it over without writing it twice.
+        let under_way = matches!(c.phase, Phase::InboxWithdraw { .. });
+        if let Phase::InboxWithdraw { then, .. } = &mut c.phase {
+            *then = AfterWithdraw::Settle;
+        } else {
+            c.phase = Phase::InboxWithdraw {
+                holder: 0,
+                gen: 0,
+                then: AfterWithdraw::Settle,
+            };
+        }
+        let several = c.inbox_keys.len() > 1;
         self.inbox.pending.remove(&rid);
         self.stats.settles_withdrawn_first += 1;
-        self.issue_tombstone(now, rid, key, out);
+        if several {
+            self.stats.settle_multi_batch_withdrawals += 1;
+        }
+        if !under_way {
+            self.issue_tombstone(now, rid, key, out);
+        }
     }
 
     /// The PUT of a tombstone over `key` (the withdrawal of `rid`'s batch).
@@ -4293,7 +4306,7 @@ impl Core {
         );
         self.issue_s3(
             S3Op::InboxTombstone { batch },
-            super::S3For::InboxWithdraw(rid),
+            super::S3For::InboxWithdraw(rid, key),
             out,
         );
     }
@@ -4795,6 +4808,14 @@ impl Core {
         self.unsettled_accepted_rids.remove(&rid)
     }
 
+    /// Late-landing U1(a): whether `rid`'s in-doubt answer was one of an op
+    /// whose settle could not write a tombstone over its inbox batch
+    /// (`ClientOp::settle_withdraw_failed`): the batch may still be drained,
+    /// so the op may land after the `EIO`. Taken once.
+    pub fn take_withdraw_failed(&mut self, rid: Rid) -> bool {
+        self.withdraw_failed_rids.remove(&rid)
+    }
+
     /// The op is neither executed here nor answered by anyone: the client
     /// hears `InDoubt` (`EIO`; retryable by the same rid), the replay
     /// drain leaves it queued.
@@ -4808,6 +4829,13 @@ impl Core {
         let Some(c) = self.clients.remove(&rid) else {
             return;
         };
+        if c.settle_withdraw_failed && self.track_unsettled_designation {
+            self.withdraw_failed_rids.insert(rid);
+            while self.withdraw_failed_rids.len() > MAX_IN_DOUBT_RIDS {
+                let first = *self.withdraw_failed_rids.iter().next().expect("non-empty");
+                self.withdraw_failed_rids.remove(&first);
+            }
+        }
         if c.settle && matches!(c.origin, Origin::Client) {
             // Plan 43 C2: no sequencer answered the settle (I4's one
             // exception: an isolated requester).

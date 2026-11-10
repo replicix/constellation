@@ -1445,6 +1445,12 @@ pub struct Report {
     /// Core counters, summed over the nodes: sticky grants made, and sticky
     /// streams ended by reason (released, abandoned, other).
     pub sticky_core: [u64; 16],
+    /// Late-landing cores' counters, summed over the nodes (`SWEEP-LL-STATS`):
+    /// settles withdrawn first, ops resubmitted by a tombstone, stale reads
+    /// discarded, stale relists, stale parks dropped, unacked replay settles,
+    /// foreign settles deferred, settles whose tombstone failed, background
+    /// tombstones dropped, multi-batch withdrawals, ops withdrawn.
+    pub ll_core: [u64; 11],
     /// Core counters, summed over the nodes, of the restart write
     /// quarantine (ADR-46): generations quarantined, own writes parked,
     /// forwards answered `Held`, quarantines waited out, read grants
@@ -1464,6 +1470,12 @@ pub struct Report {
     /// (`check::no_settled_landing`); the rest are unsettled ones landing
     /// late (I4's isolated-requester exception when it is one).
     pub settled_landings: usize,
+    /// Late-landing U1(a): landings after an `isolated-from-s3` `EIO` (a
+    /// failed tombstone with S3 cut at the requester): allowed, counted apart.
+    pub landings_isolated_from_s3: usize,
+    /// And those unsettled `EIO`s themselves (a verdict that would have been
+    /// a violation, labelled instead).
+    pub unsettled_isolated_from_s3: usize,
     /// Plan 46 M0.3: unsettled `EIO`s told by an isolated requester (allowed)
     /// and by one that could reach a sequencer (I4 violations: the settle
     /// failed although a sequencer was there); the violations described
@@ -4551,8 +4563,14 @@ async fn operator_drop_hopeless(
 fn count_unsettled(oracles: &super::oracle::Oracles, report: &mut Report) -> Vec<String> {
     let everything = oracles.unsettled.lock().unwrap();
     report.unsettled_nonstealable_holder = everything.iter().filter(|u| u.designation_held).count();
-    let all: Vec<&super::oracle::Unsettled> =
-        everything.iter().filter(|u| !u.designation_held).collect();
+    report.unsettled_isolated_from_s3 = everything
+        .iter()
+        .filter(|u| !u.designation_held && u.isolated_from_s3)
+        .count();
+    let all: Vec<&super::oracle::Unsettled> = everything
+        .iter()
+        .filter(|u| !u.designation_held && !u.isolated_from_s3)
+        .collect();
     report.unsettled_isolated = all.iter().filter(|u| u.verdict.isolated()).count();
     report.unsettled_no_sequencer_in_time = all
         .iter()
@@ -4576,8 +4594,9 @@ fn count_unsettled(oracles: &super::oracle::Oracles, report: &mut Report) -> Vec
     }
     report.unsettled_examples = bad.iter().take(5).cloned().collect();
     if std::env::var_os("AUTHORITY_SIM_UNSETTLED_ALL").is_some() {
-        report.unsettled_all = all
+        report.unsettled_all = everything
             .iter()
+            .filter(|u| !u.designation_held)
             .map(|u| format!("{} | {}", u.cause(), u.describe()))
             .collect();
     }
@@ -6575,6 +6594,21 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.sticky_ended_claimed = found.sticky_claimed;
     let mut sticky_recalled_other = 0u64;
     for s in report.stats.values() {
+        for (t, v) in report.ll_core.iter_mut().zip([
+            s.settles_withdrawn_first,
+            s.inbox_resubmitted_ops,
+            s.inbox_stale_reads_discarded,
+            s.inbox_stale_relists,
+            s.stale_parks_dropped,
+            s.unacked_replay_settles_sent,
+            s.foreign_settles_deferred,
+            s.settle_withdraw_failed,
+            s.bg_tombstones_dropped,
+            s.inbox_multi_batch_withdrawals,
+            s.inbox_withdrawn_ops,
+        ]) {
+            *t += v;
+        }
         report.sticky_core[0] += s.deleg_sticky;
         report.sticky_core[1] += s.deleg_sticky_ended_released;
         report.sticky_core[2] += s.deleg_sticky_ended_abandoned;
@@ -6630,6 +6664,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.acked_past_cut_refusals = found.cut_refusals;
     report.late_landings = found.i4.len();
     report.settled_landings = found.i4.iter().filter(|m| m.starts_with("I4: rid")).count();
+    report.landings_isolated_from_s3 = found.i4_isolated_from_s3;
     let unsettled_violations = count_unsettled(&oracles, &mut report);
     report.non_lone_rollbacks = found.i5.len();
     report.i5_operator = found.i5_operator.len();

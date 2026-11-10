@@ -74,10 +74,9 @@ struct RequesterPoll {
     backoff: PollBackoff,
     next_n: u64,
     due_at: WaitMs,
-    in_flight: Option<OpId>,
-    /// When the poll in flight was issued (ADR-47: a rid this root
+    /// The poll in flight and when it was issued (ADR-47: a rid this root
     /// redirected after that moment may still be in the run it returns).
-    issued_at: WaitMs,
+    in_flight: Option<(OpId, WaitMs)>,
     /// The width of the poll in flight (or of the last one).
     width: usize,
     /// The last poll found batches: the next one fetches a full-width
@@ -568,6 +567,23 @@ impl Core {
             wants_lease,
         };
         let op = self.issue_s3(S3Op::InboxPut { batch }, S3For::InboxPut, out);
+        // Late-landing (MUST-2): the batch may become durable at any moment
+        // from here on, whatever its acknowledgement says (or whether one
+        // ever comes: a timed-out PUT can land), so each op's settle or
+        // forward withdraws the key from now. A tombstone over a key never
+        // written is harmless (`InboxStore::put_tombstone`).
+        let key = InboxKey {
+            epoch,
+            node: self.cfg.node_id,
+            n,
+        };
+        for rid in &rids {
+            if let Some(c) = self.clients.get_mut(rid) {
+                if !c.inbox_keys.contains(&key) {
+                    c.inbox_keys.push(key);
+                }
+            }
+        }
         self.inbox.submitting = Some(Submitting {
             op,
             epoch,
@@ -656,7 +672,18 @@ impl Core {
             }
             S3Result::InboxPut(Err(CasFailure::Conflict)) => {
                 // The key is taken by something that is not this batch
-                // (a stale numbering): resync and retry.
+                // (a stale numbering): resync and retry. Not ours, so not
+                // ours to withdraw either.
+                let key = InboxKey {
+                    epoch: sub.epoch,
+                    node: self.cfg.node_id,
+                    n: sub.n,
+                };
+                for rid in &sub.rids {
+                    if let Some(c) = self.clients.get_mut(rid) {
+                        c.inbox_keys.retain(|k| *k != key);
+                    }
+                }
                 self.inbox.next_n = None;
                 self.inbox_requeue_front(&sub.rids, sub.epoch);
                 self.inbox_retry(now, sub.attempt, replica, out);
@@ -1147,7 +1174,6 @@ impl Core {
                     next_n: 0,
                     due_at: now.wait,
                     in_flight: None,
-                    issued_at: now.wait,
                     width: 1,
                     full: false,
                     active: true,
@@ -1221,8 +1247,7 @@ impl Core {
                 .as_mut()
                 .and_then(|h| h.requesters.get_mut(&node))
             {
-                rp.in_flight = Some(op);
-                rp.issued_at = now.wait;
+                rp.in_flight = Some((op, now.wait));
             }
         }
         if let Some(at) = next_due {
@@ -1242,17 +1267,19 @@ impl Core {
         &mut self,
         now: Now,
         node: NodeId,
+        op: OpId,
         result: S3Result,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        self.inbox_poll_result(now, node, result, replica, out);
+        self.inbox_poll_result(now, node, op, result, replica, out);
     }
 
     fn inbox_poll_result(
         &mut self,
         now: Now,
         node: NodeId,
+        op: OpId,
         result: S3Result,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1263,8 +1290,16 @@ impl Core {
         let Some(rp) = holder.requesters.get_mut(&node) else {
             return;
         };
+        // Late-landing S1: the freshness check needs this read's own issue
+        // time. A poll of an earlier holder state (the requester was
+        // rebuilt, or a newer poll is in flight) has none: drop it.
+        let Some((flying, read_at)) = rp.in_flight else {
+            return;
+        };
+        if flying != op {
+            return;
+        }
         rp.in_flight = None;
-        let read_at = rp.issued_at;
         let run = match result {
             S3Result::InboxRun(Ok(run)) => run,
             other => {
@@ -1430,6 +1465,7 @@ impl Core {
         &mut self,
         now: Now,
         rid: Rid,
+        key: InboxKey,
         result: S3Result,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1440,16 +1476,19 @@ impl Core {
         let Phase::InboxWithdraw { holder, gen, then } = c.phase else {
             return;
         };
+        // An answer for a key this rid no longer holds is a duplicate of one
+        // already handled (a tombstone written twice): it moves nothing.
+        if !c.inbox_keys.contains(&key) {
+            return;
+        }
         match result {
             S3Result::InboxTombstone(Ok(())) => {
                 // `send_forward` withdraws the next batch, if any, before
                 // it forwards.
-                let key = (!c.inbox_keys.is_empty()).then(|| c.inbox_keys.remove(0));
+                c.inbox_keys.retain(|k| *k != key);
                 self.stats.inbox_withdrawn_ops += 1;
-                if let Some(key) = key {
-                    self.inbox_forget_leftover(key);
-                    self.inbox_resubmit_cobatched(now, key, replica, out);
-                }
+                self.inbox_forget_leftover(key);
+                self.inbox_resubmit_cobatched(now, key, replica, out);
                 match then {
                     AfterWithdraw::Forward => {
                         self.send_forward(now, rid, holder, gen, replica, out)

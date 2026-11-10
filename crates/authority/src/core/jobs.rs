@@ -5071,6 +5071,7 @@ impl Core {
                         self.pr.given_up = self.pr.released;
                         self.lease.released();
                         self.owe_given_up_move(carried_mine, replica);
+                        self.drop_unexecuted_parks(now, replica, out);
                         self.deleg_on_lease_gone(now, replica, out);
                         self.clear_holder_epoch(replica);
                         self.inbox.holder = None;
@@ -5366,6 +5367,7 @@ impl Core {
             self.pr.released = Some((l.epoch, l.expires_unix_ms));
         }
         self.lease.released();
+        self.drop_unexecuted_parks(now, replica, out);
         self.deleg_on_lease_gone(now, replica, out);
         self.clear_holder_epoch(replica);
         self.stats.releases += 1;
