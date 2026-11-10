@@ -7764,6 +7764,21 @@ impl Standalone {
         let mut out = Vec::new();
         let now_at = Instant::now();
         core.start(now(), &*meta, &mut out);
+        // No registry and no peers: the roster is this node alone, a
+        // complete read (ADR-50: unknown is not alone, so a driver with no
+        // registry says what it knows).
+        out.extend(core.handle(
+            now(),
+            Event::Roster {
+                seq: 0,
+                write_eligible: vec![node_id],
+                read_only: Vec::new(),
+                complete: true,
+                lapses: 0,
+                issued: now().wait,
+            },
+            &*meta,
+        ));
         let mut this = Self {
             core,
             meta,

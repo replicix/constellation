@@ -2807,7 +2807,6 @@ impl Core {
             return out;
         }
         self.clk = now;
-        self.refresh_backup_eligibility();
         // A lease change that landed since the last event closes the old
         // configuration before any row of this one is journaled.
         self.sync_cfg_spans(replica);
@@ -2830,6 +2829,9 @@ impl Core {
             }
             Event::Peer { from, msg } => {
                 self.note_peer_heard(from, now.wait);
+                // ADR-50: every message kind from a node counts, here,
+                // before any row of it is journaled.
+                self.note_heard(now, from, replica);
                 self.on_peer(now, from, msg, replica, &mut out)
             }
             Event::PeerFailed { req, to, outage } => {
@@ -2890,7 +2892,6 @@ impl Core {
                 if foreign {
                     self.note_foreign(now, replica, &mut out);
                 }
-                self.refresh_backup_eligibility();
                 // A holder polls a requester it has just learned of at
                 // once (M13 round 2), not at its next round's end.
                 if self.inbox.holder.is_some() {
@@ -2919,7 +2920,6 @@ impl Core {
                 self.note_rtt_samples(now.wait, &links);
                 self.roster
                     .install_links(links, registry_complete, lapses, issued);
-                self.refresh_backup_eligibility();
                 self.stream_on_peers(now);
             }
             Event::OwnS3 {
@@ -2962,11 +2962,10 @@ impl Core {
                 self.roster.note_lapse();
                 self.on_own_lag(from, until);
                 // The directory this node holds may predate the lapse: not
-                // lone again until a snapshot taken after it arrives (a
+                // a singleton again until a read issued after it arrives (a
                 // parked ack waits, or is released by the log, not by the
                 // lone test: backup-crash-slow seed 1416 released one
                 // `Lone` inside this very event).
-                self.refresh_backup_eligibility();
             }
             Event::OwnFreeze { from, until } => self.on_own_freeze(from, until),
             Event::DelegRenewSentOffCore {

@@ -783,11 +783,6 @@ pub(crate) struct AckState {
     last_housekeeping: WaitMs,
     /// The tick fired since the last bookkeeping run.
     tick_fired: bool,
-    /// Whether a peer in budget is eligible as a backup right now (the
-    /// last selection pass saw one); `None` until this tenure's first
-    /// selection pass ran, which gates like `Some(true)` (see
-    /// `durable_jseq`).
-    pub eligible: Option<bool>,
     /// When each node was last dropped or removed (not re-added within
     /// `backup_reconfig_min_ms`).
     last_dropped: BTreeMap<NodeId, WaitMs>,
@@ -1778,11 +1773,13 @@ impl Core {
     }
 
     /// Plan 46 M1.2: this root's configuration commits by the archive alone
-    /// (a lone root, outside an epoch hold): a delegate's rows it appended
-    /// commit at its next ship, not as an acknowledgement comes in
-    /// (`DelegateStreamAck.archive_bound`).
+    /// (no backup is listed, outside an epoch hold): a delegate's rows it
+    /// appended commit at its next ship, not as an acknowledgement comes in
+    /// (`DelegateStreamAck.archive_bound`). A root with a live delegate
+    /// generation is no singleton (ADR-50, S10-I4), so this is the archive
+    /// wait of a root with peers and no backup, not only a singleton's.
     pub(crate) fn config_archive_bound(&self) -> bool {
-        self.durable_jseq() == u64::MAX && !self.lease.epoch_held()
+        self.lease.backups().is_empty() && !self.lease.epoch_held()
     }
 
     /// Plan 46 M1.1 step 5: the lease this node holds records a singleton's
@@ -1794,38 +1791,37 @@ impl Core {
             .is_some_and(|(l, _)| l.singleton && l.ack_policy == AckPolicy::Local)
     }
 
-    /// The event-time singleton test (plan 46 D3, M1.1's test until M2.3
-    /// replaces it with the roster's): no candidate being brought up, no
-    /// roster peer linked within the budget (`ack.eligible`, raised at
-    /// every event and lowered by the selection pass), and not yet
-    /// unassessed. What triggers a bump of the lease's configuration, and
-    /// one of the two conditions of answering alone.
-    pub(crate) fn lone_by_event(&self) -> bool {
-        let unassessed = self.ack.eligible.is_none() && self.backups_possible();
-        self.ack.candidate.is_none() && self.ack.eligible != Some(true) && !unassessed
+    /// The singleton test (plan 46 D3, ADR-50): this node answers its own
+    /// clients from its disk alone only if it is no peer's lease holder to
+    /// be: no candidate is being brought up, its roster object says no
+    /// other node could write ([`Roster::singleton`]: a complete read lists
+    /// nobody else, nothing newer is incomplete, no lapse is newer than the
+    /// read, nobody unlisted has messaged or linked), and no other node
+    /// holds a live generation of this root's (S10-I4: such a node is a
+    /// peer whatever the roster says, and it takes over with its tail).
+    /// Judged as of the current event from the inputs the core received,
+    /// never from a cache: it is what triggers a bump of the lease's
+    /// configuration, what the claim stamps, and one of the two conditions
+    /// of answering alone.
+    pub(crate) fn singleton_now(&self) -> bool {
+        self.ack.candidate.is_none()
+            && self.roster.singleton(self.cfg.node_id)
+            && !self
+                .dl
+                .gens
+                .values()
+                .any(|g| g.node != self.cfg.node_id && !g.ended)
     }
 
-    /// The test a claim CAS stamps its lease with: assessed now, from the
-    /// links and the roster as they are (the lease's flag starts a tenure's
-    /// configuration; the bump moves it).
-    pub(crate) fn singleton_test(&self) -> bool {
-        self.ack.candidate.is_none() && !self.backup_could_be_had()
-    }
-
-    /// Plan 46 M1.1 step 5 (C8 conditions 1 and 3): a request from `node`
-    /// (a forward, a settle, an inbox batch) is a singleton-test event: a
-    /// node that asks this root for something is a peer, linked, whatever
-    /// the roster read in hand says. Counted at once, before any later row
-    /// is journaled; the lease's bump follows in the same event.
-    pub(crate) fn note_peer_request(&mut self, now: Now, node: NodeId) {
-        // (Only the root's: a delegate's requesters are no peer of the
-        // root's configuration.)
-        if self.lease.held.is_some()
-            && node != self.cfg.node_id
-            && node != 0
-            && self.roster.note_heard(node, now.wait)
-        {
-            self.refresh_backup_eligibility();
+    /// Plan 46 M1.1 step 5 (C8 conditions 1 and 3), ADR-50: a message from
+    /// `node` is a singleton-test event, whatever its kind: a node that
+    /// writes to this one is a peer, linked, whatever the roster read in
+    /// hand says. Called at the one door every peer message passes, before
+    /// any row of the message is journaled; the lease's bump follows in the
+    /// same event.
+    pub(crate) fn note_heard(&mut self, now: Now, node: NodeId, replica: &dyn Replica) {
+        if node != self.cfg.node_id && node != 0 && self.roster.note_heard(node, now.wait) {
+            self.singleton_maintain(replica);
         }
     }
 
@@ -1838,7 +1834,7 @@ impl Core {
             && !self.lease.epoch_held()
             && self.held_singleton()
             && self.lease.backups().is_empty()
-            && !self.lone_by_event()
+            && !self.singleton_now()
         {
             self.ack.flip_tip = Some(replica.journal_tip());
         }
@@ -1862,7 +1858,7 @@ impl Core {
         {
             return;
         }
-        if self.lone_by_event() != lease.singleton {
+        if self.singleton_now() != lease.singleton {
             self.ack.reconfig_wanted = Some(Vec::new());
         }
     }
@@ -1870,34 +1866,26 @@ impl Core {
     fn durable_jseq_held(&self) -> u64 {
         let committed = self.lease.backups();
         if committed.is_empty() {
-            // While a backup could be had — a candidate is being brought
-            // up, or a peer in budget is eligible — nothing is acknowledged
-            // under `Local`: such an acknowledgement would rest on nobody's
-            // disk but ours, and the candidate could not take over (it is
-            // not listed). The wait ends with the CAS that lists it, or
-            // once no peer is in budget after all (today's behaviour).
-            //
-            // Not yet known counts as could-be (backup-crash-slow seed
-            // 603322): the ops queued behind an acquisition run in the
-            // acquisition's own event, before the tenure's first selection
-            // pass, and were acknowledged at once on this disk alone.
-            //
-            // Nor is a peer linked but not yet stable or measured a reason
-            // to answer alone (i1-592): `eligible` is the lone test
-            // (`backup_could_be_had`), raised at every event and never
-            // stale in the unsafe direction. Only a node with no roster
-            // peer linked within the budget — a singleton, a peer measured
-            // out of budget — is lone. A peer that sealed the epoch counts as
-            // linked: it is no candidate, but it takes over with its tail, so
-            // the acknowledgements wait for the archive (`shipped_through`)
-            // instead of leaving on this disk.
+            // Nothing is acknowledged on this disk alone unless the node is
+            // a singleton (ADR-50): its roster object lists no
+            // write-eligible node but itself and nothing contradicts it
+            // (`singleton_now`: no incomplete read, no lapse newer than the
+            // read, no unlisted node that messaged or linked, no live
+            // foreign generation, no candidate). Such an acknowledgement
+            // would rest on nobody's disk but ours, and a peer that takes
+            // the lease over would not have it. A node with any
+            // write-eligible peer, near, far, unlinked, partitioned or
+            // unmounted, waits for the archive (`shipped_through`) or its
+            // group instead. Unknown never means alone: before the first
+            // complete read, after a read that could not be completed and
+            // across the node's own lapse it is no singleton.
             //
             // Plan 46 M1.1 step 5: and the configuration the lease records
             // must be a singleton's. The test above is the event's; the
             // rule changes only at the lease's bump, which commits under
             // old and new (`sync_cfg_spans`): a peer that left does not make
             // the next row lone before the bump has landed.
-            return if self.lone_by_event() && self.held_singleton() {
+            return if self.singleton_now() && self.held_singleton() {
                 u64::MAX
             } else {
                 self.ack.shipped_through
@@ -2075,15 +2063,14 @@ impl Core {
     /// Plan 43 C2 (§2.1): this node holds the root lease, usably, as a lone
     /// sequencer: not lost, no continuation epoch, not under `ack=s3`, and
     /// nothing gates its answers (`durable_jseq` is `u64::MAX`: no listed or
-    /// doubted backup, no candidate, no eligible or unassessed peer). Its
+    /// doubted backup, and the node is a singleton). Its
     /// own node's clients are answered from its disk (`Lone`), every other
     /// node from the archive.
     ///
-    /// Lone means no roster peer is linked within the RTT budget, judged as
-    /// of the current event (plan 46 D3: no node with peers answers from its
-    /// disk alone; a singleton still may). A peer that is linked but not yet
-    /// stable or not yet measured counts as one a backup could be had from
-    /// ([`Self::backup_could_be_had`]).
+    /// Lone means the node is a singleton ([`Self::singleton_now`], ADR-50):
+    /// its roster lists no write-eligible node but itself, judged as of the
+    /// current event. A node with any write-eligible peer, however far or
+    /// unlinked, answers under a group or the archive.
     pub(crate) fn root_lone(&self) -> bool {
         self.lease.held.is_some()
             && !self.lease.lost
@@ -2135,9 +2122,9 @@ impl Core {
     /// continuation epoch's hold with a member is the group of the owner and
     /// one member (plan 46 M1.4), without one `Final`; under `ack=s3` the group has no
     /// member and the archive carries it; with a listed (or doubted) backup
-    /// the group is the root's; while a backup is being had (a candidate, an
-    /// eligible or not yet assessed peer) the archive; and otherwise nothing
-    /// but this node's disk: the singleton, to its own node's client. A
+    /// the group is the root's; while the node is no singleton (a candidate, or any write-eligible peer,
+    /// ADR-50) the archive; and otherwise nothing
+    /// but this node's disk: the singleton (a node whose roster lists no write-eligible peer), to its own node's client. A
     /// lone root answers another node's forward from the archive: a remote
     /// is never answered on the lone root's disk alone (§5.1's table, the
     /// `Remote` column).
@@ -3774,11 +3761,6 @@ impl Core {
                 self.ack.reconfig = None;
                 self.ack.reconfig_wanted = None;
             }
-            if self.lease.held.is_none() {
-                // (Assessed again by the next tenure's acquisition; a
-                // held lease whose gate is still closed keeps it.)
-                self.ack.eligible = None;
-            }
             if self.ack.shipped_through != 0 || !self.ack.shipped_rows.is_empty() {
                 self.ack.shipped_through = 0;
                 self.ack.shipped_rows.clear();
@@ -3935,31 +3917,23 @@ impl Core {
         eligible.into_iter().map(|(_, n)| n)
     }
 
-    /// Whether a backup could be had (`ack.eligible`, the gate of an empty
-    /// set in `durable_jseq_held`): a peer linked within the RTT budget
-    /// ([`Roster::link_is_peer`]: a roster node, or a node linked after the
-    /// roster read in hand), listed or not. One that sealed the epoch counts too (it is no
-    /// candidate, `backup_select`, but it takes over with its tail, and what
-    /// is acknowledged on this disk alone meanwhile is not in it; the
-    /// acknowledgements wait for the archive then). A listed one
-    /// counts: the assessment must still hold once a removal CAS empties
-    /// the set, before the next selection pass (`backup_select`) or the
-    /// tenure's first (`acquire_won`) assesses it again.
+    /// Whether a backup could be had from a peer linked within the RTT
+    /// budget ([`Roster::link_is_peer`]: a roster node, or a node linked
+    /// after the roster read in hand), listed or not. One that sealed the
+    /// epoch counts too (it is no candidate, `backup_select`, but it takes
+    /// over with its tail). Unknown counts as could-be: before the first
+    /// directory snapshot, across this node's own lapse, after a registry
+    /// read that could not be completed, and while a node that is not on
+    /// the roster has messaged.
     ///
-    /// This is the lone test: a node with a peer to back it is never
-    /// answered on its disk alone (plan 46 D3; only a singleton is). So it
-    /// asks less than candidate selection does ([`Self::backup_candidates`]):
-    /// a link that is not yet up for the stability window, or whose RTT is
-    /// not yet measured, counts as a peer a backup could be had from — the
-    /// root then waits for the archive, or brings the backup up, but never
-    /// answers alone with a peer linked (i1-592: the links of a tenure's
-    /// first 200 ms were younger than the window, the assessment said no,
-    /// and the own ops queued behind the acquisition were answered on the
-    /// disk alone). A peer measured out of budget does not count. Stability
-    /// is a matter of time, not of an event, and the engine's fast path
-    /// answers between events from the published `lone_ok`, so the
-    /// assessment must not change with the clock alone: it changes with
-    /// the links and the roster ([`Self::refresh_backup_eligibility`]).
+    /// This is no longer the root's lone test: that is
+    /// [`Self::singleton_now`], which a peer out of budget or unlinked does
+    /// not satisfy. It remains the delegate's (`deleg_rule`), whose peers
+    /// are those of the whole filesystem.
+    ///
+    /// Stability is a matter of time, not of an event: a link that is not
+    /// yet up for the stability window, or whose RTT is not yet measured,
+    /// counts (candidate selection, [`Self::backup_candidates`], asks more).
     pub(crate) fn backup_could_be_had(&self) -> bool {
         if !self.backups_possible() {
             return false;
@@ -3985,7 +3959,9 @@ impl Core {
         // Plan 46 M1.1 step 5 (C8 condition 3): a node that asked this one
         // for something is a linked peer until the directory says
         // otherwise.
-        if self.roster.has_heard() {
+        // (Only the root's: a delegate's requesters are no peer of the root's
+        // configuration.)
+        if self.lease.held.is_some() && self.roster.has_heard() {
             return true;
         }
         self.roster.links().values().any(|l| {
@@ -3993,22 +3969,6 @@ impl Core {
                 && l.rtt_ms
                     .is_none_or(|rtt| rtt <= self.cfg.backup_rtt_budget_ms)
         })
-    }
-
-    /// The cached assessment ([`Self::backup_could_be_had`]) is raised at
-    /// every event, never lowered: a holder that found no peer (or only a
-    /// stale link) and is told of one — by a `Peers` or `Roster` event, or
-    /// by the next event of any kind — must not answer on its disk alone
-    /// in that event. Lowering stays with the selection pass
-    /// (`backup_select`), which is conservative: a stale `Some(true)` only
-    /// waits for the archive.
-    pub(crate) fn refresh_backup_eligibility(&mut self) {
-        if self.lease.held.is_some()
-            && self.ack.eligible == Some(false)
-            && self.backup_could_be_had()
-        {
-            self.ack.eligible = Some(true);
-        }
     }
 
     fn backup_select(&mut self, now: Now, _replica: &dyn Replica, _out: &mut Vec<Action>) {
@@ -4023,17 +3983,6 @@ impl Core {
             .into_iter()
             .filter(|n| !self.ack.refused_epoch.contains_key(n))
             .collect();
-        // Whether a backup could be had counts the listed ones too: it
-        // must still be right once a removal CAS empties the set, before
-        // the next selection pass assesses it again (`durable_jseq_held`).
-        // Assessed while the backup being removed was still listed, it
-        // said no, and the moment the removal landed the ops it held were
-        // acknowledged on this disk alone (`Lone`) with that peer linked
-        // within the budget (long-backup seed 586 under slow lease reads:
-        // the holder, paused past its backup's acknowledgement timeout,
-        // removed it on waking; it crashed 100 ms later, and the successor
-        // took over without the acknowledged create).
-        self.ack.eligible = Some(self.backup_could_be_had());
         if self.ack.candidate.is_some()
             || self.ack.reconfig.is_some()
             || self.lease.backups().len() >= self.cfg.backups_max
@@ -4442,7 +4391,7 @@ impl Core {
         // Plan 46 M1.1 step 5: the singleton flag follows the event's test
         // (a set with a backup is a peer's configuration). A change that
         // moves neither the set nor the flag is no change.
-        new.singleton = backups.is_empty() && policy == AckPolicy::Local && self.lone_by_event();
+        new.singleton = backups.is_empty() && policy == AckPolicy::Local && self.singleton_now();
         if new.backups == lease.backups
             && new.ack_policy == lease.ack_policy
             && new.singleton == lease.singleton
