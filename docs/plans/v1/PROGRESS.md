@@ -69326,8 +69326,19 @@ go down.
 - **fsync on the core thread.** One synced write of the horizon per second of continuous strict reading: 3 ms (btrfs) to 6 ms (ext4 on
   a loop file) per write, 2 microseconds on tmpfs (300 writes each, p99 6.7 ms ext4, 3.1 to 6.6 ms btrfs in two runs, max 81 ms once on btrfs). Under
   1 % of operations can meet it and the p90 does not move; not moved off the core (the root's grants do the same).
+  **Superseded** by the fix round 2 below: both horizons are written ahead on a lane.
 - **Early exit.** `void_audience` (roster and links, once both were read) is shared with the abandon, which no longer reads an unknown
   audience as "every reader answered". Wire: `restart` on `Payload::ReadVoidGen`, `scope` on `PeerMsg::DelegReadVoid`.
   `sticky-holder-returns` runs at the default read TTL (step 13's 1.5 s override is gone). `sticky-holder-restarts-cut` cuts the
   reader from the returned holder so the horizon decides.
 - **Harness.** `sticky-holder-restart` (scenarios/m11.rs).
+- **Fix round 2 (ADR-46).** M1: `void_audience` (roster and links) now needs a peer directory a registry scan that read every
+  record filled (`Event::Peers::registry_complete`, `RegistryScan::is_complete`, `Peers::mark_registry_complete`), read-only
+  members included; until then nobody is asked and the horizon decides, for the early exit and the abandon alike
+  (`a_partial_registry_scan_does_not_end_the_quarantine_early`). The branch that fixes grants to readers outside roster and
+  links changes only this function. S2: an unreadable claim mark is removed by the first acquire after start (or by the floor's
+  coverage when the lease is re-adopted), and the in-memory flag goes with it. S1: the root's and the delegate's horizons are
+  written ahead on a lane (`Action::PersistGrantHorizon`, `Core::grant_horizon_covers`); core-thread stall per 30 s of
+  strict reading at 1000 reads/s: ext4, xfs, btrfs 30 syncs of 6 to 12 ms (once 1.9 s) before, none after (largest call
+  26 microseconds), with and without a 10 ms writer on the disk; tmpfs unchanged (`grant_horizon_stall_bench`, ignored).
+  S3: the harness's 3.5 s sleep stays, marked as a known workaround of an open bug.

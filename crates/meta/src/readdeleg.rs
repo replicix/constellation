@@ -688,6 +688,32 @@ pub(crate) const KV_DELEG_READ_GRANT_HORIZON: &str = "deleg_read_grant_horizon_m
 /// before it was written has passed.
 pub(crate) const DELEG_HORIZON_NONE: &str = "none";
 
+/// Which read-grant horizon a grant is persisted under: the root's
+/// ([`KV_READ_GRANT_HORIZON`]) or a delegate's ([`KV_DELEG_READ_GRANT_HORIZON`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GrantHorizon {
+    Root,
+    Deleg,
+}
+
+impl GrantHorizon {
+    pub const ALL: [GrantHorizon; 2] = [GrantHorizon::Root, GrantHorizon::Deleg];
+
+    pub fn index(self) -> usize {
+        match self {
+            GrantHorizon::Root => 0,
+            GrantHorizon::Deleg => 1,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            GrantHorizon::Root => KV_READ_GRANT_HORIZON,
+            GrantHorizon::Deleg => KV_DELEG_READ_GRANT_HORIZON,
+        }
+    }
+}
+
 /// What [`crate::store::Meta::takeover_floor_mark`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FloorMark {
@@ -803,6 +829,29 @@ impl crate::store::Meta {
     ) -> Result<(), crate::MetaError> {
         self.note_horizon(KV_DELEG_READ_GRANT_HORIZON, until, now)
             .map(|_| ())
+    }
+
+    /// What a read grant under `kind` may rely on: the horizon known
+    /// durable (loaded at start, or written and synced by this process), on
+    /// this process's wait clock. A grant whose `until` is beyond it must
+    /// not be made ([`Self::persist_grant_horizon`] first).
+    pub fn grant_horizon_known(&self, kind: GrantHorizon) -> WaitMs {
+        self.known_horizon(kind.key())
+    }
+
+    /// Writes and syncs `kind`'s horizon to cover `until` (the stored value
+    /// is `until` rounded up a second) and returns the horizon now durable
+    /// (>= `until`). Called off the authority core
+    /// (`Action::PersistGrantHorizon`): the sync can take seconds on a
+    /// loaded disk. The core asks for `now + span + 1 s` ahead of the grant
+    /// that needs it, so that steady granting finds each one covered.
+    pub fn persist_grant_horizon(
+        &self,
+        kind: GrantHorizon,
+        until: WaitMs,
+        now: Now,
+    ) -> Result<WaitMs, crate::MetaError> {
+        self.note_horizon(kind.key(), until, now)
     }
 
     /// [`Self::note_grant_horizon`] for a lock grant (and a renewal): a

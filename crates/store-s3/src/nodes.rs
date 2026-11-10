@@ -276,6 +276,16 @@ impl RegistryScan {
         Ok(out)
     }
 
+    /// Whether every object under `nodes/` was read and parsed (retired
+    /// tombstones included): the scan then names every node, so a caller
+    /// that needs the whole membership (read-only members too) can rely on
+    /// [`RegistryScan::live`].
+    pub fn is_complete(&self) -> bool {
+        self.records
+            .iter()
+            .all(|(_, read)| matches!(read, RecordRead::Info(_)))
+    }
+
     /// Whether the scan read `id`'s record as live (listed, parsed, not
     /// retired). `false` says nothing for sure — absent from a LIST, or
     /// unreadable — so a caller that acts on a missing or retired record

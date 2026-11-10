@@ -138,6 +138,17 @@ pub enum Action {
     /// action is internal, never serialised); the store stamps it with the
     /// boot.
     PersistLockHorizon { until: WaitMs },
+    /// Persist a read-grant horizon (`Meta::persist_grant_horizon`, a
+    /// durable write) off the core up to `until`, then report
+    /// `Event::GrantHorizonPersisted`. The core grants only up to the
+    /// horizon known durable and asks for this ahead of the grants that
+    /// need it (`Core::grant_horizon_covers`); a read that finds it not
+    /// covered is answered with its position and no grant. At most one is
+    /// in flight per kind.
+    PersistGrantHorizon {
+        kind: constellation_meta::readdeleg::GrantHorizon,
+        until: WaitMs,
+    },
     /// A designee's stream sends a row only once its disk holds it: sync
     /// the store (`Meta::sync`) off the core, then report
     /// `Event::DelegStreamSynced`. Every row of `gen` through `through`

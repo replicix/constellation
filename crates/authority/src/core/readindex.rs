@@ -78,6 +78,7 @@ use crate::event::{PeerMsg, ReadAhead, ReadGrantMsg, ReadIndexOutcome, S3Result}
 use crate::ids::{HonourMs, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
+use constellation_meta::readdeleg::GrantHorizon;
 use constellation_meta::{
     HeldDelegation, MutateOp, MutateOutcome, OwnChunks, Position, RecallNeed, Rid,
 };
@@ -272,6 +273,22 @@ pub(crate) struct ReadState {
     pub(crate) read_tail_open: Option<OpId>,
     pub(crate) read_tails: BTreeMap<OpId, Vec<OpId>>,
     quarantine_timer: Option<TimerId>,
+    /// The write-ahead lanes of the read-grant horizons, by
+    /// [`GrantHorizon::index`].
+    horizon: [HorizonLane; 2],
+}
+
+/// One read-grant horizon's write-ahead lane (`Core::grant_horizon_covers`).
+#[derive(Debug, Default)]
+struct HorizonLane {
+    /// A grant found the durable horizon short of what steady granting
+    /// needs: `want` is to be written (`grant_horizon_after_event`).
+    pending: bool,
+    /// The horizon to ask for, an `until` of `Meta::persist_grant_horizon`.
+    want: WaitMs,
+    /// The write in flight (its `until`), if any: one at a time, later
+    /// needs coalesce into the next, which carries the highest.
+    writing: Option<WaitMs>,
 }
 
 /// Plan 30 §M8's view for `status`.
@@ -283,6 +300,78 @@ pub struct ReadView {
 }
 
 impl Core {
+    /// Whether a read grant of `kind` up to `until` may be made: only up to
+    /// the horizon known durable, so the persist-before-grant rule holds
+    /// without a sync on the core. When the durable horizon is less than a
+    /// grant's lifetime and a second ahead, a write of `now + span + 1 s`
+    /// (stored a second more) is asked for off the core
+    /// (`Action::PersistGrantHorizon`, from `grant_horizon_after_event`),
+    /// whether or not this grant is covered: in steady reading the next
+    /// grants always find the horizon ahead of them and no read waits for a
+    /// write. A grant that is not covered is not made; its read is answered
+    /// with the position alone.
+    pub(crate) fn grant_horizon_covers(
+        &mut self,
+        kind: GrantHorizon,
+        now: Now,
+        until: WaitMs,
+        replica: &dyn Replica,
+    ) -> bool {
+        let durable = replica.grant_horizon_known(kind);
+        let span = (self.cfg.read_delegation_ttl_ms + self.cfg.expiry_margin_ms) as u64;
+        let ahead = now.wait.plus(span + 1_000);
+        if durable < ahead {
+            let lane = &mut self.rd.horizon[kind.index()];
+            lane.want = lane.want.max(ahead);
+            lane.pending = true;
+        }
+        let covered = until <= durable;
+        if !covered {
+            self.stats.read_grants_uncovered += 1;
+        }
+        covered
+    }
+
+    /// Issues the write-ahead a grant asked for, if none is in flight.
+    pub(crate) fn grant_horizon_after_event(
+        &mut self,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        for kind in GrantHorizon::ALL {
+            let lane = &mut self.rd.horizon[kind.index()];
+            if !lane.pending || lane.writing.is_some() {
+                continue;
+            }
+            lane.pending = false;
+            if lane.want <= replica.grant_horizon_known(kind) {
+                continue;
+            }
+            let until = lane.want;
+            lane.writing = Some(until);
+            self.stats.grant_horizon_writes += 1;
+            out.push(Action::PersistGrantHorizon { kind, until });
+        }
+    }
+
+    /// `Action::PersistGrantHorizon` finished. The horizon's new value is
+    /// read from the replica when a grant next asks; a failure only counts
+    /// (the next grant asks again).
+    pub(crate) fn on_grant_horizon_persisted(
+        &mut self,
+        kind: GrantHorizon,
+        until: WaitMs,
+        durable: Option<WaitMs>,
+    ) {
+        let lane = &mut self.rd.horizon[kind.index()];
+        if lane.writing == Some(until) {
+            lane.writing = None;
+        }
+        if durable.is_none() {
+            self.stats.grant_horizon_failed += 1;
+        }
+    }
+
     pub fn read_view(&self) -> ReadView {
         ReadView {
             reads_in_flight: self.rd.reads.len(),
@@ -532,7 +621,7 @@ impl Core {
             return None;
         }
         let until = now.wait.plus((ttl + margin) as u64);
-        if !replica.note_grant_horizon(until, now) {
+        if !self.grant_horizon_covers(GrantHorizon::Root, now, until, replica) {
             return None;
         }
         let grants = replica
@@ -582,7 +671,7 @@ impl Core {
         // The grant's record runs on this node's wait clock; the restart
         // horizon is persisted as a boot stamp of it (plan 43 C7a).
         let until = now.wait.plus((ttl + margin) as u64);
-        if !replica.note_grant_horizon(until, now) {
+        if !self.grant_horizon_covers(GrantHorizon::Root, now, until, replica) {
             return None;
         }
         let id = replica.read_delegations().grant(to, ino, until);

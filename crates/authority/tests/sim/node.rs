@@ -2015,6 +2015,7 @@ impl Driver {
                     );
                     if tx
                         .send(Event::Peers {
+                            registry_complete: true,
                             links,
                             lapses,
                             issued,
@@ -3923,6 +3924,19 @@ impl Driver {
                         .note_lock_grant_horizon(until, self.clock.now())
                         .ok();
                     let _ = self.tx.send(Event::LockHorizonPersisted { until, durable });
+                }
+                Action::PersistGrantHorizon { kind, until } => {
+                    // As the lock horizon's: written here, answered as an
+                    // event, so the horizon covers grants one event later.
+                    let durable = self
+                        .meta
+                        .persist_grant_horizon(kind, until, self.clock.now())
+                        .ok();
+                    let _ = self.tx.send(Event::GrantHorizonPersisted {
+                        kind,
+                        until,
+                        durable,
+                    });
                 }
                 Action::SyncDelegStream { gen, through } => {
                     // Synced here, answered as an event: the rows it covers

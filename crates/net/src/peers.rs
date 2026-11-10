@@ -136,6 +136,9 @@ struct Inner {
     refresher: Mutex<Option<Refresher>>,
     /// One-shot latch for the shared-node-key misconfiguration warning.
     warned_shared_key: std::sync::atomic::AtomicBool,
+    /// Set once a registry scan that read every record has filled the
+    /// directory ([`Peers::mark_registry_complete`]); never cleared.
+    registry_complete: std::sync::atomic::AtomicBool,
     /// Bumped whenever a peer enters or leaves the directory or its
     /// `connected` flag flips (see [`Peers::links_changed`]).
     links: tokio::sync::watch::Sender<u64>,
@@ -185,6 +188,7 @@ impl Peers {
             ids: Mutex::new(HashMap::new()),
             refresher: Mutex::new(None),
             warned_shared_key: std::sync::atomic::AtomicBool::new(false),
+            registry_complete: std::sync::atomic::AtomicBool::new(false),
             links: tokio::sync::watch::Sender::new(0),
             redialing: Mutex::new(std::collections::HashSet::new()),
             gossip_up: Mutex::new(std::collections::HashSet::new()),
@@ -360,6 +364,29 @@ impl Peers {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("P2P disabled"))?;
         inner.p2p.join(bootstrap).await
+    }
+
+    /// The directory was filled from a registry scan that read every record
+    /// (the caller says so after [`Peers::refresh_registry`] with that
+    /// scan's records): it then lists every live node, read-only members
+    /// included. A failed or partial scan never sets it.
+    pub fn mark_registry_complete(&self) {
+        if let Some(inner) = self.inner.as_ref() {
+            inner
+                .registry_complete
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Whether [`Peers::mark_registry_complete`] was called. Read it
+    /// before [`Peers::snapshot`]: if it is set, the snapshot lists the
+    /// whole scan.
+    pub fn registry_complete(&self) -> bool {
+        self.inner.as_ref().is_some_and(|inner| {
+            inner
+                .registry_complete
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
     }
 
     /// Refresh the peer directory and the accept-time allowlist from the

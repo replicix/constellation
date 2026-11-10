@@ -1591,6 +1591,11 @@ pub async fn refresh_peers(
                 })
                 .collect();
             peers.refresh_registry(records);
+            // After the refresh, so a reader that sees the flag sees the
+            // directory (`Peers::registry_complete`).
+            if scan.as_ref().is_some_and(|scan| scan.is_complete()) {
+                peers.mark_registry_complete();
+            }
         }
         Err(()) => {
             tracing::debug!("registry refresh failed; keeping the cached peer set")
