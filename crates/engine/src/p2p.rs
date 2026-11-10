@@ -1328,13 +1328,19 @@ impl constellation_net::PeerService for P2pBridge {
         root: u64,
         req_id: u64,
         gen: u64,
+        restart: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
             let (reply, receive) = tokio::sync::oneshot::channel();
             if self
                 .nudge
-                .send(sync::SyncRequest::PeerReadVoid { root, gen, reply })
+                .send(sync::SyncRequest::PeerReadVoid {
+                    root,
+                    gen,
+                    restart,
+                    reply,
+                })
                 .is_ok()
             {
                 // Acked only once the stream's grants are no longer honoured;

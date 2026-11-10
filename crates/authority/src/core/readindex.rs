@@ -1935,6 +1935,11 @@ impl Core {
             self.abandon_progress(now, replica, out);
             return;
         }
+        // ADR-46: the answer to this holder's own void after a restart.
+        if self.deleg_restart_void_acked(req) {
+            self.complete_ready(now, replica, out);
+            return;
+        }
         let Some(id) = self.rd.recall_by_req.remove(&req) else {
             return;
         };
@@ -2423,12 +2428,15 @@ impl Core {
         from: NodeId,
         req: OpId,
         gen: u64,
+        scope: crate::event::VoidScope,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        replica
-            .read_delegations()
-            .void_gen_epoch(super::DELEG_READ_EPOCH_BASE + gen);
+        let epoch = super::DELEG_READ_EPOCH_BASE + gen;
+        match scope {
+            crate::event::VoidScope::Ended => replica.read_delegations().void_gen_epoch(epoch),
+            crate::event::VoidScope::Restart => replica.read_delegations().void_restart(epoch),
+        }
         out.push(Action::Send {
             to: from,
             msg: PeerMsg::DelegationRecalled { req },

@@ -33796,6 +33796,9 @@ fn root_with_dir() -> (Harness, constellation_fs_core::Ino) {
     )
     .unwrap();
     h.hold(2, None);
+    // The directory has been read (the links are the harness's peers): an
+    // abandon asks them (`void_audience`).
+    h.core.roster_seen = true;
     (h, dir)
 }
 
@@ -43782,6 +43785,26 @@ mod persisted_floor {
             None,
             "the floor is durable"
         );
+    }
+
+    /// Expectation (fail-before: a mark that cannot be read was no mark, and
+    /// the re-adoption owed no floor): the claim mark is unreadable at the
+    /// restart, so the floor may be owed, and the re-adoption of the node's
+    /// own lease arms it.
+    #[test]
+    fn an_unreadable_claim_mark_arms_the_floor_of_a_re_adopted_lease() {
+        let mut h = successor();
+        let prev = predecessor(&h);
+        let (claimed, _won) = claim_over_with(&mut h, &prev, true, false);
+        h.meta.kv_set("takeover_floor_pending", "garbage").unwrap();
+        let mut r = restart(h, 300);
+        let (_, won) = claim_over_with(&mut r, &claimed, false, false);
+        assert!(
+            r.core.ack.pending_floor,
+            "the re-adoption owes no floor though its claim mark is unreadable"
+        );
+        finish_gate(&mut r, won);
+        assert!(r.core.in_takeover_floor(r.clk()));
     }
 
     /// Expectation (fail-before: any completed lock-horizon write removed
@@ -64492,7 +64515,11 @@ mod step4_sticky {
         sends(out)
             .into_iter()
             .filter_map(|(to, m)| match m {
-                PeerMsg::DelegReadVoid { req, gen } => Some((to, *req, *gen)),
+                PeerMsg::DelegReadVoid {
+                    req,
+                    gen,
+                    scope: crate::event::VoidScope::Ended,
+                } => Some((to, *req, *gen)),
                 _ => None,
             })
             .collect()
@@ -64628,6 +64655,30 @@ mod step4_sticky {
         assert!(h.core.dl.gens[&gen].ended);
         assert_eq!(h.core.stats.deleg_abandon_reads_expired, 1);
         assert_eq!(h.core.stats.deleg_abandon_reads_recalled, 0);
+    }
+
+    /// Hardening: an abandon issued before any roster has been read asks
+    /// nobody (an empty audience is not "every reader answered") and the
+    /// deadline decides. Fails before: the stream ended in the same step.
+    #[test]
+    fn an_abandon_before_the_directory_is_known_waits_the_deadline() {
+        let (mut h, gen) = root_with_a_silent_sticky_holder();
+        h.core.roster_seen = false;
+        let out = abandon_node(&mut h, 910, 3, None, false);
+        assert!(void_reqs(&out).is_empty(), "{out:?}");
+        assert!(
+            answer_of(&out, 910).is_none(),
+            "ended with nobody asked: {out:?}"
+        );
+        assert!(!h.core.dl.gens[&gen].ended);
+        let wait = h.core.cfg.read_delegation_ttl_ms + h.core.cfg.expiry_margin_ms;
+        h.advance(wait);
+        h.hold(2, None);
+        let mut out = Vec::new();
+        h.core.on_abandon_timer(h.clk(), &h.meta, &mut out);
+        assert!(matches!(answer_of(&out, 910), Some(Ok(_))), "{out:?}");
+        assert!(h.core.dl.gens[&gen].ended);
+        assert_eq!(h.core.stats.deleg_abandon_reads_expired, 1);
     }
 
     /// Within `delegation_ttl_ms` of the holder's last word the abandon is
@@ -64917,6 +64968,7 @@ mod step4_sticky {
             msg: PeerMsg::DelegReadVoid {
                 req: OpId(9),
                 gen: 7,
+                scope: crate::event::VoidScope::Ended,
             },
         });
         assert_eq!(rd(&h).held_count(), 0);
@@ -66702,15 +66754,19 @@ mod step5_sticky_release {
         (dirs, out)
     }
 
+    /// The root answers stream 7's renewal the install asked (a read grant
+    /// of a non-stealable stream needs one, M1.3 step 13).
+    fn renew_holder(h: &mut Harness, out: &[Action]) {
+        let req = renew_req(out, 7).expect("no renewal");
+        h.step(renewed(h, req, 7, 5_000));
+    }
+
     /// A holder (node 3) of stream 7, kind `kind`, and the read grant it
     /// made to node 2 on its first directory.
     fn holder_with_a_grant(kind: SubtreeKind) -> (Harness, Vec<constellation_fs_core::Ino>) {
         let mut h = Harness::new(3);
         let (dirs, out) = install_holder(&mut h, &["d"], kind);
-        if kind == SubtreeKind::Placed {
-            let req = renew_req(&out, 7).expect("no renewal");
-            h.step(renewed(&h, req, 7, 5_000));
-        }
+        renew_holder(&mut h, &out);
         let now = h.clk();
         let outcome = h.core.deleg_read_index(now, 2, dirs[0], None, &h.meta);
         assert!(
@@ -66723,15 +66779,10 @@ mod step5_sticky_release {
         (h, dirs)
     }
 
-    /// A new process of `h`'s node `after_ms` later over the same disk: the
-    /// persisted horizons are the old process's, the read-delegation table is
-    /// empty, and the delegation is installed again from the journal.
-    fn restart_holder(
-        h: &Harness,
-        after_ms: u64,
-        kind: SubtreeKind,
-        keep_horizon: bool,
-    ) -> (Harness, Vec<constellation_fs_core::Ino>, Vec<Action>) {
+    /// A new process of `h`'s node `after_ms` later over the same disk, just
+    /// started: the persisted horizons are the old process's and nothing is
+    /// installed yet. What the start asked of the driver comes with it.
+    fn restart_bare(h: &Harness, after_ms: u64, keep_horizon: bool) -> (Harness, Vec<Action>) {
         let mut r = Harness::new(3);
         r.core = Core::new(h.core.cfg.clone());
         r.now = h.now.plus(after_ms);
@@ -66763,6 +66814,19 @@ mod step5_sticky_release {
             lapses: 0,
             issued: WaitMs(i64::MAX),
         });
+        (r, out)
+    }
+
+    /// A new process of `h`'s node `after_ms` later over the same disk: the
+    /// persisted horizons are the old process's, the read-delegation table is
+    /// empty, and the delegation is installed again from the journal.
+    fn restart_holder(
+        h: &Harness,
+        after_ms: u64,
+        kind: SubtreeKind,
+        keep_horizon: bool,
+    ) -> (Harness, Vec<constellation_fs_core::Ino>, Vec<Action>) {
+        let (mut r, _) = restart_bare(h, after_ms, keep_horizon);
         let (dirs, out) = install_holder(&mut r, &["d"], kind);
         (r, dirs, out)
     }
@@ -66888,7 +66952,8 @@ mod step5_sticky_release {
     #[test]
     fn a_delegate_read_grant_persists_its_horizon_before_it_is_answered() {
         let mut h = Harness::new(3);
-        let (dirs, _) = install_holder(&mut h, &["d"], SubtreeKind::Sticky);
+        let (dirs, out) = install_holder(&mut h, &["d"], SubtreeKind::Sticky);
+        renew_holder(&mut h, &out);
         let now = h.clk();
         let Some(crate::event::ReadIndexOutcome::Ok {
             grant: Some(grant), ..
@@ -66919,7 +66984,8 @@ mod step5_sticky_release {
     #[test]
     fn a_restarted_holder_grants_no_read_delegation_during_the_quarantine() {
         let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
-        let (mut r, dirs, _) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
+        let (mut r, dirs, out) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
+        renew_holder(&mut r, &out);
         let now = r.clk();
         let outcome = r.core.deleg_read_index(now, 2, dirs[0], None, &r.meta);
         assert!(
@@ -67072,6 +67138,312 @@ mod step5_sticky_release {
         r.step(Event::Timer { id });
         r.core.deleg_view_local(&mut view);
         assert!(!view.mine[0].3, "still stopped");
+    }
+
+    /// Expectation (fail-before: the timer stayed armed and the generation
+    /// stopped): a quarantine timer that fires before its time (an event with
+    /// a stale clock) arms itself again at the horizon, and the generation
+    /// runs once that one fires.
+    #[test]
+    fn an_early_quarantine_timer_arms_itself_again() {
+        let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
+        let (mut r, dirs, _) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
+        create_in(&mut r, dirs[0], 1);
+        assert_eq!(r.core.dl.mine[&7].parked.len(), 1);
+        let first = restart_timer(&r);
+        let until = r.core.dl.mine[&7].restart_q.as_ref().unwrap().until;
+        // 1 ms early.
+        r.advance(until.since(r.clk().wait) as u64 - 1);
+        let out = r.step(Event::Timer { id: first });
+        let again = timers(&out, TimerKind::DelegStream);
+        assert_eq!(again.len(), 1, "not armed again: {out:?}");
+        assert_eq!(restart_timer(&r), again[0], "the new timer is not kept");
+        assert_eq!(r.core.dl.mine[&7].executed, 0);
+        assert_eq!(r.core.stats.deleg_restart_q_waited_out, 0);
+        r.advance(1);
+        r.step(Event::Timer { id: again[0] });
+        assert_eq!(r.core.dl.mine[&7].executed, 1);
+        assert_eq!(r.core.stats.deleg_restart_q_waited_out, 1);
+        let mut view = crate::core::DelegView::default();
+        r.core.deleg_view_local(&mut view);
+        assert!(!view.mine[0].3, "still published as stopped");
+    }
+
+    /// Expectation (fail-before: the key stayed a stamp): the key is settled
+    /// when the horizon passes though no generation was ever installed, so
+    /// that the next crash and reboot do not pay a span for grants nobody
+    /// made. A start that finds nothing to wait for settles at once.
+    #[test]
+    fn the_key_is_settled_without_an_installed_generation() {
+        let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
+        let (mut r, out) = restart_bare(&h, 2_000, true);
+        let timer = timers(&out, TimerKind::DelegStream);
+        assert_eq!(timer.len(), 1, "no timer at the horizon: {out:?}");
+        let stored = r.meta.kv_get("deleg_read_grant_horizon_ms").unwrap();
+        assert_ne!(stored.as_deref(), Some("none"));
+        let Some(TimerAt::Wait(at)) = r.core.timer_at(timer[0]) else {
+            panic!("not a wait timer");
+        };
+        // Early: armed again, nothing written.
+        r.advance(at.since(r.clk().wait) as u64 - 1);
+        let out = r.step(Event::Timer { id: timer[0] });
+        let again = timers(&out, TimerKind::DelegStream);
+        assert_eq!(again.len(), 1, "{out:?}");
+        assert_ne!(
+            r.meta
+                .kv_get("deleg_read_grant_horizon_ms")
+                .unwrap()
+                .as_deref(),
+            Some("none")
+        );
+        r.advance(1);
+        r.step(Event::Timer { id: again[0] });
+        assert_eq!(
+            r.meta
+                .kv_get("deleg_read_grant_horizon_ms")
+                .unwrap()
+                .as_deref(),
+            Some("none"),
+            "not settled"
+        );
+        // A restart long after the horizon found it passed: settled at start.
+        let (late, out) = restart_bare(&h, 60_000, true);
+        assert!(timers(&out, TimerKind::DelegStream).is_empty(), "{out:?}");
+        assert_eq!(
+            late.meta
+                .kv_get("deleg_read_grant_horizon_ms")
+                .unwrap()
+                .as_deref(),
+            Some("none")
+        );
+    }
+
+    /// Expectation (the only enforcement of persist-before-grant on failure):
+    /// when the horizon cannot be written, the read is answered with its
+    /// position and no grant; the next one, once it can, is granted.
+    #[test]
+    fn a_failed_horizon_write_gives_no_delegate_grant() {
+        let mut h = Harness::new(3);
+        let (dirs, out) = install_holder(&mut h, &["d"], SubtreeKind::Sticky);
+        renew_holder(&mut h, &out);
+        let now = h.clk();
+        constellation_meta::fail_horizon_writes_on_this_thread_for_tests(1);
+        let outcome = h.core.deleg_read_index(now, 2, dirs[0], None, &h.meta);
+        constellation_meta::fail_horizon_writes_on_this_thread_for_tests(0);
+        assert!(
+            matches!(
+                outcome,
+                Some(crate::event::ReadIndexOutcome::Ok { grant: None, .. })
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(h.core.stats.deleg_read_grants, 0);
+        assert_eq!(
+            h.meta.read_delegations().all_live(now.wait).grants.len(),
+            0,
+            "a grant was recorded"
+        );
+        let outcome = h.core.deleg_read_index(now, 2, dirs[0], None, &h.meta);
+        assert!(
+            matches!(
+                outcome,
+                Some(crate::event::ReadIndexOutcome::Ok { grant: Some(_), .. })
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    /// Expectation: a generation installed after the persisted horizon has
+    /// passed is not quarantined: it executes and grants at once.
+    #[test]
+    fn a_generation_installed_after_the_horizon_is_not_quarantined() {
+        let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
+        let (mut r, _) = restart_bare(&h, 2_000, true);
+        let until = r.core.dl.restart_horizon.expect("no horizon loaded");
+        r.advance(until.since(r.clk().wait) as u64 + 1);
+        let (dirs, out) = install_holder(&mut r, &["d"], SubtreeKind::Sticky);
+        renew_holder(&mut r, &out);
+        assert!(r.core.dl.mine[&7].restart_q.is_none(), "quarantined");
+        assert_eq!(r.core.stats.deleg_restart_quarantines, 0);
+        create_in(&mut r, dirs[0], 1);
+        assert_eq!(r.core.dl.mine[&7].executed, 1);
+        let now = r.clk();
+        let outcome = r.core.deleg_read_index(now, 2, dirs[0], None, &r.meta);
+        assert!(
+            matches!(
+                outcome,
+                Some(crate::event::ReadIndexOutcome::Ok { grant: Some(_), .. })
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    /// The restart void round: every node of the roster and the links is
+    /// asked (scope `Restart`) once the roster and the peers are known.
+    fn restart_void_reqs(out: &[Action]) -> Vec<(NodeId, OpId)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::DelegReadVoid {
+                    req,
+                    scope: crate::event::VoidScope::Restart,
+                    ..
+                } => Some((to, *req)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn roster_event() -> Event {
+        Event::Roster {
+            write_eligible: vec![1, 2, 3, 4],
+            issued: WaitMs(i64::MAX),
+        }
+    }
+
+    /// Expectation (fail-before: the quarantine ran to the horizon): once
+    /// every node answered the restarted holder's void, its quarantine is
+    /// over before the horizon: the parked write runs, the engine is
+    /// admitted again, reads are granted. A node that does not answer leaves
+    /// the horizon to decide.
+    #[test]
+    fn a_restarted_holder_runs_once_every_node_dropped_its_old_grants() {
+        let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
+        let (mut r, dirs, out) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
+        // Roster not read yet: nobody is asked (no empty audience).
+        assert!(restart_void_reqs(&out).is_empty(), "{out:?}");
+        create_in(&mut r, dirs[0], 1);
+        assert_eq!(r.core.dl.mine[&7].parked.len(), 1);
+        let out = r.step(roster_event());
+        let asked = restart_void_reqs(&out);
+        assert_eq!(
+            asked
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([1, 2, 4]),
+            "{out:?}"
+        );
+        // Two answers of three: still quarantined.
+        let mut out = Vec::new();
+        for (from, req) in &asked[..2] {
+            out = r.step(Event::Peer {
+                from: *from,
+                msg: PeerMsg::DelegationRecalled { req: *req },
+            });
+        }
+        assert_eq!(r.core.dl.mine[&7].executed, 0, "{out:?}");
+        assert_eq!(r.core.stats.deleg_restart_q_voided, 0);
+        // A failed request changes nothing.
+        r.step(Event::PeerFailed {
+            req: asked[2].1,
+            to: asked[2].0,
+            outage: true,
+        });
+        assert_eq!(r.core.dl.mine[&7].executed, 0);
+        // The last answer ends it.
+        r.step(Event::Peer {
+            from: asked[2].0,
+            msg: PeerMsg::DelegationRecalled { req: asked[2].1 },
+        });
+        assert_eq!(r.core.stats.deleg_restart_q_voided, 1);
+        assert_eq!(
+            r.core.dl.mine[&7].executed, 1,
+            "the parked write did not run"
+        );
+        let mut view = crate::core::DelegView::default();
+        r.core.deleg_view_local(&mut view);
+        assert!(!view.mine[0].3, "still published as stopped");
+        // A forward is no longer held, and a read is granted again.
+        let out = forward_create(&mut r, dirs[0], 2);
+        assert!(
+            !matches!(reply_outcome(&out, 502), Some(MutateOutcome::Held { .. })),
+            "{out:?}"
+        );
+        assert_eq!(r.core.stats.deleg_restart_q_held, 0);
+        // The horizon's timer finds nothing to count, and settles the key.
+        let id = restart_timer(&r);
+        let until = r.core.dl.mine[&7].restart_q.as_ref().unwrap().until;
+        r.advance(until.since(r.clk().wait) as u64);
+        r.step(Event::Timer { id });
+        assert_eq!(r.core.stats.deleg_restart_q_waited_out, 0);
+    }
+
+    /// Expectation: a node that never answers (down, cut off) leaves the
+    /// horizon in charge: the write stays parked until it.
+    #[test]
+    fn a_node_that_does_not_answer_the_void_leaves_the_horizon_in_charge() {
+        let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
+        let (mut r, dirs, _) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
+        create_in(&mut r, dirs[0], 1);
+        let out = r.step(roster_event());
+        let asked = restart_void_reqs(&out);
+        assert_eq!(asked.len(), 3);
+        for (from, req) in &asked[..2] {
+            r.step(Event::Peer {
+                from: *from,
+                msg: PeerMsg::DelegationRecalled { req: *req },
+            });
+        }
+        let id = restart_timer(&r);
+        let until = r.core.dl.mine[&7].restart_q.as_ref().unwrap().until;
+        r.advance(until.since(r.clk().wait) as u64 - 1);
+        r.step(Event::Peers {
+            links: Vec::new(),
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+        assert_eq!(r.core.dl.mine[&7].executed, 0);
+        r.advance(1);
+        r.step(Event::Timer { id });
+        assert_eq!(r.core.dl.mine[&7].executed, 1);
+        assert_eq!(r.core.stats.deleg_restart_q_voided, 0);
+        assert_eq!(r.core.stats.deleg_restart_q_waited_out, 1);
+    }
+
+    /// Expectation (the reader's side of the void): a `Restart` void drops
+    /// the held delegations of the stream, fails an install racing it, and
+    /// does not remember the epoch: the restarted holder's later grants are
+    /// installed. (`Ended` remembers it, which is the difference.)
+    #[test]
+    fn a_restart_void_drops_the_old_grants_and_not_the_later_ones() {
+        let mut h = Harness::new(2);
+        let epoch = crate::core::DELEG_READ_EPOCH_BASE + 7;
+        let held = |epoch| constellation_meta::HeldDelegation {
+            until: HonourMs(i64::MAX / 2),
+            position: Position::ZERO,
+            epoch,
+            holder: 3,
+            grant: 1,
+            renew_at: HonourMs(i64::MAX / 2),
+        };
+        fn table(h: &Harness) -> &constellation_meta::ReadDelegations {
+            Replica::read_delegations(&h.meta)
+        }
+        let racing = table(&h).recall_gen();
+        assert!(table(&h).install(5, held(epoch), table(&h).recall_gen()));
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegReadVoid {
+                req: OpId(9),
+                gen: 7,
+                scope: crate::event::VoidScope::Restart,
+            },
+        });
+        assert_eq!(table(&h).held_count(), 0);
+        assert!(
+            sends(&out).iter().any(|(to, m)| *to == 3
+                && matches!(m, PeerMsg::DelegationRecalled { req } if *req == OpId(9))),
+            "{out:?}"
+        );
+        assert!(
+            !table(&h).install(6, held(epoch), racing),
+            "an install racing the void was accepted"
+        );
+        assert!(
+            table(&h).install(6, held(epoch), table(&h).recall_gen()),
+            "a later grant of the restarted holder was refused"
+        );
     }
 
     /// The negative control: with `restart_skips_write_quarantine` the

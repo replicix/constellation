@@ -504,6 +504,18 @@ pub struct Carrier {
     pub expires_unix_ms: i64,
 }
 
+/// Why a node is asked to void the read delegations of a delegate stream
+/// ([`PeerMsg::DelegReadVoid`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoidScope {
+    /// The stream ended or is abandoned (plan 46 step 13): its epoch is
+    /// remembered, and no grant of it is installed any more.
+    Ended,
+    /// The stream's holder restarted (ADR-46): the grants of its previous
+    /// process are void, those of the new one are not.
+    Restart,
+}
+
 /// Messages between cores. The driver maps these to and from
 /// `constellation_net::Payload`; the core never sees the wire format.
 /// Variants for later milestones are declared now so their arrival needs
@@ -706,9 +718,13 @@ pub enum PeerMsg {
     /// honouring every read delegation that stream's holder granted it
     /// (epoch `DELEG_READ_EPOCH_BASE + gen`), refuses any later one, then acks
     /// with `DelegationRecalled { req }`.
+    ///
+    /// `scope`: [`VoidScope::Restart`] when the sender is the stream's holder,
+    /// restarted, which voids what its previous process granted (ADR-46).
     DelegReadVoid {
         req: OpId,
         gen: u64,
+        scope: VoidScope,
     },
     /// Plan 30 §M9: the holder streams its journal to a backup: whole
     /// transactions from journal seq `from` (the seq after what the

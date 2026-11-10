@@ -999,6 +999,9 @@ pub struct Stats {
     pub deleg_restart_q_held: u64,
     /// Delegate: quarantines that ran to their horizon.
     pub deleg_restart_q_waited_out: u64,
+    /// ... ended before the horizon because every node dropped the read
+    /// delegations of the previous process (`DelegReadVoid`, scope `Restart`).
+    pub deleg_restart_q_voided: u64,
     /// Delegate: read grants not made because of that quarantine (the
     /// position is answered).
     pub deleg_read_grants_quarantined: u64,
@@ -2285,6 +2288,9 @@ pub struct Core {
     /// What the last deposition recovery did (`Control::Reintegrate`).
     last_recovery: Option<String>,
     roster: Vec<NodeId>,
+    /// An `Event::Roster` has arrived: `roster` is the directory's, not the
+    /// empty start value (`void_audience`).
+    roster_seen: bool,
     /// Plan 46 M1.1 step 5 (C8 condition 3): nodes that sent this node a
     /// request (a forward, a settle, an inbox batch) since the directory
     /// last showed them: a request from a peer is a singleton-test event,
@@ -2431,6 +2437,7 @@ impl Core {
             epoch_replacing: false,
             last_recovery: None,
             roster: Vec::new(),
+            roster_seen: false,
             peer_requesters: Default::default(),
             links: BTreeMap::new(),
             rtt_recent: BTreeMap::new(),
@@ -2630,7 +2637,7 @@ impl Core {
         self.arm_drain(now, out);
         self.floor_start(now, replica);
         self.read_start(now, replica, out);
-        self.deleg_restart_start(now, replica);
+        self.deleg_restart_start(now, replica, out);
         self.locks_start(now, replica);
         self.backup_start(now, replica, out);
         self.promise_start(now, replica, out);
@@ -2743,6 +2750,7 @@ impl Core {
                     self.note_foreign(now, replica, &mut out);
                 }
                 self.roster = write_eligible;
+                self.roster_seen = true;
                 // The roster read is the authority on who is a peer: a
                 // requester it does not list is none.
                 let roster = &self.roster;
@@ -3005,8 +3013,8 @@ impl Core {
             PeerMsg::DelegationRecalled { req } => {
                 self.on_delegation_recalled(now, req, replica, out)
             }
-            PeerMsg::DelegReadVoid { req, gen } => {
-                self.on_deleg_read_void(from, req, gen, replica, out)
+            PeerMsg::DelegReadVoid { req, gen, scope } => {
+                self.on_deleg_read_void(from, req, gen, scope, replica, out)
             }
             PeerMsg::BackupAppend {
                 req,

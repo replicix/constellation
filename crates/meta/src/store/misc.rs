@@ -727,7 +727,21 @@ impl Meta {
     /// older build wrote). Never lowers what is known. `None`: nothing
     /// issued, or nothing left of it.
     pub fn load_promise_issued(&self, now: Now, default_span_ms: i64) -> Option<WaitMs> {
-        let stored = self.kv_get(PROMISE_ISSUED).ok().flatten()?;
+        let stored = match self.read_horizon_value(PROMISE_ISSUED) {
+            Ok(v) => v?,
+            Err(error) => {
+                // Not "nothing issued": the join gate waits the longest a
+                // promise lives, and the next promise stores at least that
+                // ([`Meta::promise_issue`]).
+                tracing::warn!(%error, "the last promise could not be read; waiting its default span");
+                let fallback = now.wait.plus(default_span_ms.max(0) as u64);
+                let mut twin = self.promise_issued_wait.lock().unwrap();
+                *twin = Some((*twin).unwrap_or(WaitMs(0)).max(fallback));
+                self.promise_unverified
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return Some(fallback);
+            }
+        };
         let stamp = crate::store::horizon::parse_stamp(&stored, default_span_ms);
         let end = now.wait_of_stamp(&stamp);
         let mut twin = self.promise_issued_wait.lock().unwrap();
@@ -764,10 +778,20 @@ impl Meta {
         }
         let end = now.wait.plus(span_ms);
         let known = *self.promise_issued_wait.lock().unwrap();
-        let extends = known.is_none_or(|known| end > known);
+        let unverified = self
+            .promise_unverified
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let extends = unverified || known.is_none_or(|known| end > known);
+        // An unreadable stored promise (the fallback in `known`) is not
+        // lowered: this one stores at least that end.
+        let end = if unverified {
+            end.max(known.unwrap_or(end))
+        } else {
+            end
+        };
         if extends {
             let mut stamp = now.stamp_of_wait(end);
-            stamp.wall = now.wall.plus(span_ms);
+            stamp.wall = now.wall.plus(end.since(now.wait).max(0) as u64);
             kv_set_tx(
                 &mut tx,
                 &self.local,
@@ -782,6 +806,8 @@ impl Meta {
         if extends {
             self.sync()?;
             *self.promise_issued_wait.lock().unwrap() = Some(end);
+            self.promise_unverified
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
         Ok(true)
     }

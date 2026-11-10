@@ -621,8 +621,9 @@ pub trait Replica {
     /// may arm a takeover floor when its marker lands. `false`: not
     /// recorded, and the CAS must not go out.
     fn set_takeover_floor_pending(&self, epoch: u64) -> bool;
-    /// At start: the epoch of the claim CAS that recorded it (see above).
-    fn takeover_floor_pending(&self) -> Option<u64>;
+    /// At start: the epoch of the claim CAS that recorded it (see above), or
+    /// that the mark cannot be read (the floor may be owed).
+    fn takeover_floor_pending(&self) -> constellation_meta::readdeleg::FloorMark;
     /// The floor's horizons are durable, or the CAS armed none.
     fn clear_takeover_floor_pending(&self);
     /// At start: the previous incarnation's last promise, on this node's
@@ -1758,8 +1759,8 @@ impl Replica for Meta {
         }
     }
 
-    fn takeover_floor_pending(&self) -> Option<u64> {
-        Meta::takeover_floor_pending(self)
+    fn takeover_floor_pending(&self) -> constellation_meta::readdeleg::FloorMark {
+        Meta::takeover_floor_mark(self)
     }
 
     fn clear_takeover_floor_pending(&self) {

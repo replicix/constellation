@@ -514,6 +514,12 @@ pub struct SimConfig {
     /// `AUTHORITY_SIM_RESTART_SKIPS_WRITE_QUARANTINE=1` sets it on every
     /// configuration; the close-to-open oracle must then fail the run.
     pub restart_skips_write_quarantine: bool,
+    /// A node's first start does not record that it has granted nothing
+    /// (the daemon does, for a node id it has just claimed): the delegate
+    /// read-grant horizon is absent, which is a full span (ADR-46).
+    /// `AUTHORITY_SIM_FIRST_START_UNSETTLED=1` sets it on every
+    /// configuration.
+    pub first_start_unsettled: bool,
     /// Negative control (`Config::holder_releases_before_drain`): a holder's
     /// release journals its row at once, without the drain.
     /// `AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN=1` sets it on every
@@ -1126,6 +1132,8 @@ impl Default for SimConfig {
                 "AUTHORITY_SIM_RESTART_SKIPS_WRITE_QUARANTINE",
             )
             .is_some_and(|v| v == "1"),
+            first_start_unsettled: std::env::var_os("AUTHORITY_SIM_FIRST_START_UNSETTLED")
+                .is_some_and(|v| v == "1"),
             holder_releases_before_drain: std::env::var_os(
                 "AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN",
             )
@@ -1426,8 +1434,8 @@ pub struct Report {
     /// Core counters, summed over the nodes, of the restart write
     /// quarantine (ADR-46): generations quarantined, own writes parked,
     /// forwards answered `Held`, quarantines waited out, read grants
-    /// withheld.
-    pub quarantine_core: [u64; 5],
+    /// withheld, quarantines ended early by the void round.
+    pub quarantine_core: [u64; 6],
     /// Plan 46 M1.3 step 5, the idle tracker's releases: requested, answered
     /// (`wait`), unanswered or refused (`wait`), granted again.
     pub sticky_driver: [u64; 4],
@@ -4789,6 +4797,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         skip_deleg_dep_wait: cfg.skip_deleg_dep_wait,
         ttl_reclaims_sticky: cfg.ttl_reclaims_sticky,
         restart_skips_write_quarantine: cfg.restart_skips_write_quarantine,
+        first_start_unsettled: cfg.first_start_unsettled,
         holder_releases_before_drain: cfg.holder_releases_before_drain,
         refuse_forwarded_designation_ops: cfg.refuse_forwarded_designation_ops,
         fence_accepts_unrouted: cfg.fence_accepts_unrouted,
@@ -6558,6 +6567,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.quarantine_core[2] += s.deleg_restart_q_held;
         report.quarantine_core[3] += s.deleg_restart_q_waited_out;
         report.quarantine_core[4] += s.deleg_read_grants_quarantined;
+        report.quarantine_core[5] += s.deleg_restart_q_voided;
         sticky_recalled_other += s.deleg_sticky_recalled_other;
     }
     report.sticky_driver = *cluster.sticky_driver.lock().unwrap();

@@ -709,6 +709,11 @@ pub(crate) struct AckState {
     /// not yet durable. A restart that re-adopts its own lease at this epoch
     /// arms the floor again, counted from its own marker (`acquire_won`).
     pub(crate) floor_mark: Option<Epoch>,
+    /// The claim mark could not be read at start (`floor_start`): the
+    /// re-adoption of this node's own lease owes the floor as if the mark
+    /// named its epoch. Gone once a floor was armed for it, or the mark
+    /// was written again.
+    pub(crate) floor_mark_unreadable: bool,
     /// Set once the floor the mark stands for is armed and its ends written
     /// on the core are durable (`persist_floor`): the lock-grant horizon the
     /// mark still waits for (`on_lock_horizon_persisted` removes the mark
@@ -3167,7 +3172,15 @@ impl Core {
     /// quarantines of `read_start` and `locks_start`), and the claim mark a
     /// fast takeover left is read for `acquire_won`.
     pub(crate) fn floor_start(&mut self, now: Now, replica: &dyn Replica) {
-        self.ack.floor_mark = replica.takeover_floor_pending();
+        use constellation_meta::readdeleg::FloorMark;
+        let mark = replica.takeover_floor_pending();
+        self.ack.floor_mark = match mark {
+            FloorMark::Epoch(e) => Some(e),
+            FloorMark::None | FloorMark::Unreadable => None,
+        };
+        // A mark that cannot be read may be a claim's whose floor is owed:
+        // the re-adoption of this node's own lease arms it (fail closed).
+        self.ack.floor_mark_unreadable = mark == FloorMark::Unreadable;
         if let Some(until) = replica.load_takeover_floor(now, self.dl_t().floor_span as i64) {
             tracing::info!(
                 node = self.cfg.node_id,

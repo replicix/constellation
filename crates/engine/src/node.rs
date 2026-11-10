@@ -659,6 +659,17 @@ impl Engine {
         // incarnation never repeats, so the pair never does either.
         let incarnation = meta.bump_incarnation()?;
         tracing::info!(node_id, incarnation, "node incarnation");
+        if first_mount {
+            // A node id claimed by this very process has granted nothing:
+            // nobody holds a read delegation from it, so the delegate
+            // read-grant horizon is settled (ADR-46) rather than left
+            // absent, which a restart reads as a full span. A state
+            // directory that was not created here (an existing id) never
+            // gets this: its key, absent or not, is what the previous
+            // process left.
+            meta.settle_deleg_grant_horizon(crate::locks::now())
+                .context("recording that a new node has granted nothing")?;
+        }
         // F1: the fencing token is checked again once an op's transaction
         // holds the store's writer lock, on this clock read there — the
         // one every other lock decision of this node reads.

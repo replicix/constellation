@@ -3747,6 +3747,7 @@ impl Core {
                 return;
             }
             self.ack.floor_mark = Some(lease.epoch);
+            self.ack.floor_mark_unreadable = false;
             // Nothing durable covers this claim's floor yet.
             self.ack.floor_mark_locks = None;
         }
@@ -3943,7 +3944,7 @@ impl Core {
                 p.holder == self.cfg.node_id
                     && !p.released
                     && p.epoch == epoch
-                    && self.ack.floor_mark == Some(epoch)
+                    && (self.ack.floor_mark == Some(epoch) || self.ack.floor_mark_unreadable)
             });
         if let Some(p) = prev.as_ref().filter(|_| fast_prev) {
             let cap = if early_own {
@@ -3960,6 +3961,7 @@ impl Core {
                  the floor is armed again"
             );
             self.note_floor_restart();
+            self.ack.floor_mark_unreadable = false;
         }
         if !self.ack.pending_floor && self.ack.floor_mark.take().is_some() {
             // The claim armed no floor (a TTL takeover, or an unmarked

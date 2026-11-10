@@ -1989,9 +1989,16 @@ async fn handle_stream<S: PeerService>(
                     .read_recall_requested(holder, req_id, ino, grant)
                     .await,
             ),
-            Payload::ReadVoidGen { root, req_id, gen } => {
-                Some(service.read_void_requested(root, req_id, gen).await)
-            }
+            Payload::ReadVoidGen {
+                root,
+                req_id,
+                gen,
+                restart,
+            } => Some(
+                service
+                    .read_void_requested(root, req_id, gen, restart)
+                    .await,
+            ),
             Payload::PeerRtts { node_id, rtts } => {
                 service.peer_rtts(node_id, rtts);
                 None

@@ -729,6 +729,14 @@ pub struct Meta {
     /// that value, the `kv_set` and the update, so writes of one key reach
     /// the store in value order whichever threads make them ([`Meta::note_horizon`]).
     pub(crate) horizon_written: [std::sync::Mutex<constellation_types::clock::WaitMs>; 4],
+    /// Per horizon key (same order): its stored value could not be read at
+    /// start, so `horizon_written` holds the fallback the caller waits
+    /// instead and nothing of it is on disk. The next write of the key
+    /// stores at least that fallback ([`Meta::note_horizon`]), so that no
+    /// write lowers what the unreadable value may have said.
+    pub(crate) horizon_unverified: [std::sync::atomic::AtomicBool; 4],
+    /// The same for the promise ([`Meta::load_promise_issued`]).
+    pub(crate) promise_unverified: std::sync::atomic::AtomicBool,
     /// Tests: told `(key, value)` just before a horizon write reaches the
     /// store, to hold a writer there.
     #[cfg(test)]
@@ -1308,6 +1316,8 @@ impl Meta {
             promise_issued_wait: std::sync::Mutex::new(None),
             horizon_wait: std::sync::Mutex::new(std::collections::HashMap::new()),
             horizon_written: Default::default(),
+            horizon_unverified: Default::default(),
+            promise_unverified: Default::default(),
             #[cfg(test)]
             horizon_write_hook: std::sync::Mutex::new(None),
             streamed_grant_gens: std::sync::Mutex::new(std::collections::BTreeMap::new()),
