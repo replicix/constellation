@@ -690,6 +690,7 @@ mod tests {
 
     fn read(node: u64, name: &str, present: bool, inv: u64, ret: u64) -> ReadEvt {
         ReadEvt {
+            path: "test",
             node,
             incarnation: 1,
             thread: node * 16,

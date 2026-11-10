@@ -509,6 +509,11 @@ pub struct SimConfig {
     /// on every configuration; `sticky_ends_only_by_holder_or_operator` must
     /// then fail the run.
     pub ttl_reclaims_sticky: bool,
+    /// Negative control (`Config::restart_skips_write_quarantine`): a
+    /// restarted holder executes writes and grants read delegations at once.
+    /// `AUTHORITY_SIM_RESTART_SKIPS_WRITE_QUARANTINE=1` sets it on every
+    /// configuration; the close-to-open oracle must then fail the run.
+    pub restart_skips_write_quarantine: bool,
     /// Negative control (`Config::holder_releases_before_drain`): a holder's
     /// release journals its row at once, without the drain.
     /// `AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN=1` sets it on every
@@ -1117,6 +1122,10 @@ impl Default for SimConfig {
             sticky_delegations: Vec::new(),
             ttl_reclaims_sticky: std::env::var_os("AUTHORITY_SIM_TTL_RECLAIMS_STICKY")
                 .is_some_and(|v| v == "1"),
+            restart_skips_write_quarantine: std::env::var_os(
+                "AUTHORITY_SIM_RESTART_SKIPS_WRITE_QUARANTINE",
+            )
+            .is_some_and(|v| v == "1"),
             holder_releases_before_drain: std::env::var_os(
                 "AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN",
             )
@@ -1414,6 +1423,11 @@ pub struct Report {
     /// Core counters, summed over the nodes: sticky grants made, and sticky
     /// streams ended by reason (released, abandoned, other).
     pub sticky_core: [u64; 16],
+    /// Core counters, summed over the nodes, of the restart write
+    /// quarantine (ADR-46): generations quarantined, own writes parked,
+    /// forwards answered `Held`, quarantines waited out, read grants
+    /// withheld.
+    pub quarantine_core: [u64; 5],
     /// Plan 46 M1.3 step 5, the idle tracker's releases: requested, answered
     /// (`wait`), unanswered or refused (`wait`), granted again.
     pub sticky_driver: [u64; 4],
@@ -2011,6 +2025,7 @@ async fn client_read(
     // directory, else a ReadIndex through the core (answered `Holder` on
     // the sequencer) — then the session wait at the answer's position.
     let mut floor = constellation_meta::Position::ZERO;
+    let mut path = "local";
     if strict {
         let now = handle.clock.honour();
         let ask = |handle: &NodeHandle| {
@@ -2026,6 +2041,7 @@ async fn client_read(
         };
         match handle.meta.read_delegations().valid(parent, now) {
             Some((held, renew)) => {
+                path = "held read delegation";
                 floor = held.position;
                 if held.epoch >= constellation_authority::DELEG_READ_EPOCH_BASE {
                     history.deleg_read(
@@ -2041,14 +2057,20 @@ async fn client_read(
             None => match ask(handle).await {
                 Ok(Ok(constellation_authority::ControlOk::ReadIndex(
                     constellation_authority::ReadAnswer::Position { position, .. },
-                ))) => floor = position,
+                ))) => {
+                    path = "ReadIndex position";
+                    floor = position
+                }
                 Ok(Ok(constellation_authority::ControlOk::ReadIndex(
                     constellation_authority::ReadAnswer::Degraded,
                 )))
                 | Ok(Err(_))
-                | Err(_) => timed_out = true,
+                | Err(_) => {
+                    path = "degraded ReadIndex";
+                    timed_out = true
+                }
                 // The sequencer's own replica, or tailed to head.
-                Ok(Ok(_)) => {}
+                Ok(Ok(_)) => path = "sequencer's own replica",
             },
         }
     }
@@ -2094,6 +2116,7 @@ async fn client_read(
         inv,
         ret: history.tick(),
         timed_out,
+        path,
     });
 }
 
@@ -4765,6 +4788,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         plant_ungated_fast_path: cfg.plant_ungated_fast_path,
         skip_deleg_dep_wait: cfg.skip_deleg_dep_wait,
         ttl_reclaims_sticky: cfg.ttl_reclaims_sticky,
+        restart_skips_write_quarantine: cfg.restart_skips_write_quarantine,
         holder_releases_before_drain: cfg.holder_releases_before_drain,
         refuse_forwarded_designation_ops: cfg.refuse_forwarded_designation_ops,
         fence_accepts_unrouted: cfg.fence_accepts_unrouted,
@@ -6529,6 +6553,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.sticky_core[13] += s.deleg_abandon_reads_recalled;
         report.sticky_core[14] += s.deleg_abandon_reads_expired;
         report.sticky_core[15] += s.deleg_abandon_superseded;
+        report.quarantine_core[0] += s.deleg_restart_quarantines;
+        report.quarantine_core[1] += s.deleg_restart_q_parks;
+        report.quarantine_core[2] += s.deleg_restart_q_held;
+        report.quarantine_core[3] += s.deleg_restart_q_waited_out;
+        report.quarantine_core[4] += s.deleg_read_grants_quarantined;
         sticky_recalled_other += s.deleg_sticky_recalled_other;
     }
     report.sticky_driver = *cluster.sticky_driver.lock().unwrap();
