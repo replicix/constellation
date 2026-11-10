@@ -1728,6 +1728,21 @@ pub struct Stats {
     /// while they waited (`repair drop-held`), aborted instead of released
     /// when the log covered the seq they waited for.
     pub acks_row_gone: u64,
+    /// I1 emission gate (`Core::hold_unsettled_answer`): answers resting on
+    /// a delegation row (`gen != 0`) its group or the log does not hold,
+    /// which a path let reach the point where an answer leaves, and which
+    /// were parked there instead. Non-zero means a path bypassed
+    /// `Core::answer_need_of` (a debug build asserts).
+    pub answers_held_at_emission: u64,
+    /// `answers_held_at_emission` by the path that hit the gate: a local
+    /// client's `finish`, a delegate's own execution's reply, the holder's
+    /// executed-or-dedup reply, its designation refusal, and a parked
+    /// reply's release.
+    pub held_at_emission_finish: u64,
+    pub held_at_emission_deleg_exec: u64,
+    pub held_at_emission_holder_reply: u64,
+    pub held_at_emission_designation: u64,
+    pub held_at_emission_release: u64,
     /// Plan 43 C1-3: the tail fetch. `SealTail`s answered by this node as a
     /// holder (it sealed its own epoch), as a backup, and refused;
     /// attempts of a claim to fetch, fetches completed (of those, of a
@@ -2200,6 +2215,9 @@ pub struct Core {
     /// `Refused`; the flag: the drain's), and the ops a non-stealable
     /// generation of this node executed. Filled only when tracked.
     track_fence_audit: bool,
+    /// Tests of the I1 emission gate only: an answer held at emission is
+    /// expected (no debug assertion).
+    pub(crate) emission_hold_expected: bool,
     final_nonholder_refusals: Vec<(Rid, Code, bool)>,
     nonstealable_executions: Vec<(Rid, u64)>,
     /// Rids in `in_doubt_rids` whose op had been redirected to a designee:
@@ -2412,6 +2430,7 @@ impl Core {
             unsettled_accepted_rids: std::collections::BTreeSet::new(),
             track_unsettled_designation: false,
             track_fence_audit: false,
+            emission_hold_expected: false,
             final_nonholder_refusals: Vec::new(),
             nonstealable_executions: Vec::new(),
             in_doubt_designee_rids: std::collections::BTreeSet::new(),

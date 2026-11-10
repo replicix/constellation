@@ -46830,6 +46830,182 @@ mod deleg_group {
         assert_eq!(client_answers(&out).len(), 1, "{out:?}");
     }
 
+    /// A lone root that re-appended its own delegate rows at the gate (R,
+    /// the first, and a later one; R's shipping deferred, a chunk it waits
+    /// for), the later row's segment landed first (`shipped_rows` holds the
+    /// tip, not R). Returns the harness, R's rid and R's journal seq.
+    fn lone_root_with_deferred_row_and_later_shipped_tip() -> (Harness, Rid, u64) {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        root_is_near(&mut h);
+        let (rid, out) = own_create(&mut h, dir, 1);
+        assert!(batch(&out).is_some(), "the row streams to the root");
+        let _ = own_create(&mut h, dir, 2);
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: true,
+            }),
+        );
+        h.core.ack.eligible = Some(false);
+        assert_eq!(h.core.durable_jseq(), u64::MAX, "a lone root gates nothing");
+        let mut out = Vec::new();
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.stats.own_deleg_rows_reappended, 2);
+        // The gate is done (its view open): the root serves forwards.
+        h.core.lease.gate = None;
+        let last = |h: &Harness, idx| h.meta.holder_append_of(7, idx).unwrap().expect("appended");
+        let (r, tip) = (last(&h, 1), last(&h, 2));
+        assert!(tip > r, "a later row ({tip} <= {r})");
+        // (A first request of a root's takeover journals its bookkeeping
+        // rows: one for another rid, so that the next retry's position is
+        // the tip that lands out of order below.)
+        let rid2 = h.rid(2);
+        let _ = remote_retry_of_own_row(&mut h, rid2, 899);
+        h.core.ack.eligible = Some(false);
+        let tip = h.meta.journal_tip().unwrap();
+        assert!(tip > r, "a later row ({tip} <= {r})");
+        h.core.ack.shipped_rows.insert(tip);
+        (h, rid, r)
+    }
+
+    /// The ship plan lands `rid`'s row (journal seqs from its first through
+    /// `last`), out of order.
+    fn ship_row(h: &mut Harness, rid: Rid, last: u64) {
+        let (first, _) = h.meta.journal_class_of_rid(rid).expect("unshipped row");
+        for seq in first..=last {
+            h.core.ack.shipped_rows.insert(seq);
+        }
+    }
+
+    fn remote_retry_of_own_row(h: &mut Harness, rid: Rid, req: u64) -> Vec<Action> {
+        let dir = constellation_fs_core::types::ROOT_INO;
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid,
+                op: MutateOp::Create {
+                    parent: dir,
+                    name: "own1".into(),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
+            },
+        })
+    }
+
+    /// I1 (review 2, MUST-1): a remote's retry of a rid whose row is the lone
+    /// root's own re-appended delegate row R, R deferred and a later tip
+    /// shipped out of order. The dedup answered from the journal's tip
+    /// (`archive_covers(tip)`), a `MutateReply Accepted` with R on this disk
+    /// alone. Waits on the row, and leaves once R ships. Fails before:
+    /// answered at the retry.
+    #[test]
+    fn a_remote_retry_does_not_answer_a_lone_roots_deferred_delegate_row() {
+        let (mut h, rid, r) = lone_root_with_deferred_row_and_later_shipped_tip();
+        let out = remote_retry_of_own_row(&mut h, rid, 901);
+        assert_eq!(
+            answer_to_2(&out, 901),
+            None,
+            "answered from a row only this disk holds: {out:?}"
+        );
+        assert_eq!(
+            h.core.stats.answers_held_at_emission, 0,
+            "the predicate decides first"
+        );
+        ship_row(&mut h, rid, r);
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert!(answer_to_2(&out, 901).is_some(), "{out:?}");
+    }
+
+    /// The emission gate itself (not the per-path predicate): an answer that
+    /// reaches `send_answer` for an unsettled delegation row is parked there,
+    /// counted, and leaves once the row is settled. Fails before: sent.
+    #[test]
+    fn the_emission_gate_parks_an_answer_on_an_unsettled_delegate_row() {
+        let (mut h, rid, r) = lone_root_with_deferred_row_and_later_shipped_tip();
+        h.core.emission_hold_expected = true;
+        let mut out = Vec::new();
+        let msg = PeerMsg::MutateReply {
+            req: OpId(902),
+            outcome: MutateOutcome::Accepted {
+                epoch: 2,
+                records: Vec::new(),
+            },
+            base: None,
+            position: constellation_meta::Position::ZERO,
+            gen: 0,
+            own_chunks: constellation_meta::OwnChunks::None,
+            own_rows: None,
+            committed: false,
+        };
+        h.core.send_answer(
+            h.clk(),
+            rid,
+            super::super::backup::EmissionPath::HolderReply,
+            2,
+            msg,
+            constellation_meta::RowCommit::ARCHIVE,
+            &h.meta,
+            &mut out,
+        );
+        assert_eq!(answer_to_2(&out, 902), None, "{out:?}");
+        assert_eq!(h.core.stats.answers_held_at_emission, 1);
+        assert_eq!(h.core.stats.held_at_emission_holder_reply, 1);
+        ship_row(&mut h, rid, r);
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert!(answer_to_2(&out, 902).is_some(), "{out:?}");
+        assert_eq!(h.core.stats.answers_held_at_emission, 1);
+    }
+
+    /// The emission gate for a local client: `finish` of an answer on an
+    /// unsettled delegation row parks it, wherever the outcome came from.
+    #[test]
+    fn the_emission_gate_parks_a_local_answer_on_an_unsettled_delegate_row() {
+        let (mut h, _dir, rid) = lone_root_with_own_delegate_row(true);
+        h.core.emission_hold_expected = true;
+        h.core.clients.get_mut(&rid).expect("in flight").answered_by =
+            Some(AnswerSource::Sequenced(constellation_meta::RowCommit::LONE));
+        let mut out = Vec::new();
+        h.core.finish(
+            h.clk(),
+            rid,
+            MutateOutcome::Accepted {
+                epoch: 2,
+                records: Vec::new(),
+            },
+            &h.meta,
+            &mut out,
+        );
+        assert!(client_answers(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.held_at_emission_finish, 1);
+        h.core
+            .ack
+            .shipped_rows
+            .insert(h.meta.journal_tip().unwrap());
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert_eq!(client_answers(&out).len(), 1, "{out:?}");
+    }
+
     /// The requester's deadline settles a rid from the delegate's own
     /// journal only when its row is committed: an uncommitted `DelegateNodeGroup`
     /// row is not an outcome the generation's end will keep (D6).

@@ -8186,6 +8186,12 @@ fn fingerprint(result: &Result<Report, String>) -> String {
         &text,
         &[
             "acks_downgraded_lone",
+            "answers_held_at_emission",
+            "held_at_emission_finish",
+            "held_at_emission_deleg_exec",
+            "held_at_emission_holder_reply",
+            "held_at_emission_designation",
+            "held_at_emission_release",
             "journal_class_from_session",
             "seal_tail_holder",
             "seal_tail_backup",
@@ -8318,6 +8324,11 @@ struct OracleTotals {
     row_version_seeds: Vec<u64>,
     downgraded_lone: u64,
     class_from_session: u64,
+    /// I1 emission gate: answers held at emission in total and by path
+    /// (finish, deleg_exec, holder_reply, designation, release), and the
+    /// seeds with one (must be none).
+    held_emission: [u64; 6],
+    held_emission_seeds: Vec<u64>,
     /// The stream counters: delegated acknowledgements released (count,
     /// total wait ms), the install waits and the lost-dependency counters
     /// (installs put off, generations stopped, rows the root refused,
@@ -8442,6 +8453,15 @@ impl OracleTotals {
         for st in r.stats.values() {
             self.downgraded_lone += st.acks_downgraded_lone;
             self.class_from_session += st.journal_class_from_session;
+            if st.answers_held_at_emission > 0 && !self.held_emission_seeds.contains(&seed) {
+                self.held_emission_seeds.push(seed);
+            }
+            self.held_emission[0] += st.answers_held_at_emission;
+            self.held_emission[1] += st.held_at_emission_finish;
+            self.held_emission[2] += st.held_at_emission_deleg_exec;
+            self.held_emission[3] += st.held_at_emission_holder_reply;
+            self.held_emission[4] += st.held_at_emission_designation;
+            self.held_emission[5] += st.held_at_emission_release;
             self.tail[0] += st.tail_fetch_attempts;
             self.tail[1] += st.tail_fetches;
             self.tail[2] += st.inherited_tail_fetches;
@@ -8863,6 +8883,18 @@ impl OracleTotals {
                 self.pokes_archive_bound
             );
         }
+        eprintln!(
+            "SWEEP-HELD-AT-EMISSION {label} seeds {}/{seeds}: answers held at emission {} \
+             (finish {}, deleg_exec {}, holder_reply {}, designation {}, release {}) in seeds {:?}",
+            self.seeds,
+            self.held_emission[0],
+            self.held_emission[1],
+            self.held_emission[2],
+            self.held_emission[3],
+            self.held_emission[4],
+            self.held_emission[5],
+            self.held_emission_seeds
+        );
         eprintln!(
             "SWEEP-ROWVERSION-TOTALS {label} seeds {}/{seeds}: row-version-mismatch={} in {} seeds, \
              rows judged {} (re-tags judged {}); mismatch in seeds {:?}",

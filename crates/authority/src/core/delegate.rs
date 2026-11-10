@@ -3364,6 +3364,9 @@ impl Core {
         }
         if let Some(req) = req {
             self.send_answer(
+                now,
+                rid,
+                super::backup::EmissionPath::DelegExec,
                 from,
                 PeerMsg::MutateReply {
                     req,
@@ -3379,6 +3382,7 @@ impl Core {
                     committed: false,
                 },
                 class,
+                replica,
                 out,
             );
         }

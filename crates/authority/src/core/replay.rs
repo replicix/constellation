@@ -1395,6 +1395,13 @@ impl Core {
             return Ok(());
         }
         if let Some(outcome) = completed_as_outcome(replica, queued.rid, 0) {
+            // (Forgotten also when the rid's row is a delegation row not
+            // settled yet: keeping the entry, with or without a hold of its
+            // keys, replays an op the delegate's group had acknowledged as a
+            // conflict copy once the row is stranded, I5,
+            // `c2_a_delegates_committed_answer_is_never_rolled_back` seed 5.
+            // A tenure deposed before the row ships strands it and queues
+            // its op by rid again, `Core::finish_recovery`.)
             if folded {
                 if !matches!(outcome, MutateOutcome::Accepted { .. }) {
                     self.note_unacked_refused(queued);
