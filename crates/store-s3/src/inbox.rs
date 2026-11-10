@@ -163,6 +163,13 @@ pub struct InboxOp {
     /// `Refused { rid, ABANDONED_CODE }`. Appended last, `INBOX_VERSION`
     /// unchanged (§11 Q21 (e): a batch from an older binary is not read).
     pub settle: bool,
+    /// ADR-47: the highest non-zero generation the rid was ever sent under
+    /// by its requester when the batch was written (`0`: never; `u64::MAX`:
+    /// cannot know). The drain refuses the op for good, under a non-stealable
+    /// grant, only at `0`. Appended last, `INBOX_VERSION` unchanged: a batch
+    /// written by an older binary does not decode (operators drain inboxes
+    /// before a rolling restart; its ops end at their requesters' deadlines).
+    pub touched_gen: u64,
 }
 
 /// One batch object. `epoch`, `node` and `n` are also the key; they are
@@ -1055,6 +1062,7 @@ mod tests {
             deps: Vec::new(),
             lock_tag: Vec::new(),
             settle: false,
+            touched_gen: 0,
         }
     }
 
@@ -1086,6 +1094,22 @@ mod tests {
         assert_eq!(
             back.ops.iter().map(|o| o.settle).collect::<Vec<_>>(),
             vec![false, true]
+        );
+    }
+
+    /// ADR-47: the highest generation the rid was sent under rides the op.
+    #[test]
+    fn a_touched_gen_round_trips() {
+        let mut touched = op(7, 1);
+        touched.touched_gen = 9;
+        let mut unknown = op(7, 2);
+        unknown.touched_gen = u64::MAX;
+        let b = batch(3, 7, 2, vec![op(7, 0), touched, unknown]);
+        let back = InboxBatch::decode(&b.encode().unwrap()).unwrap();
+        assert_eq!(back, b);
+        assert_eq!(
+            back.ops.iter().map(|o| o.touched_gen).collect::<Vec<_>>(),
+            vec![0, 9, u64::MAX]
         );
     }
 
@@ -1146,6 +1170,7 @@ mod tests {
                     deps: Vec::new(),
                     lock_tag: Vec::new(),
                     settle: false,
+                    touched_gen: 0,
                 })
                 .collect(),
             wants_lease: false,
@@ -1494,6 +1519,7 @@ mod tests {
                             deps: Vec::new(),
                             lock_tag: Vec::new(),
                             settle: false,
+                            touched_gen: 0,
                         }],
                         1,
                     )
@@ -1519,6 +1545,7 @@ mod tests {
                             deps: Vec::new(),
                             lock_tag: Vec::new(),
                             settle: false,
+                            touched_gen: 0,
                         }],
                         1,
                     )
@@ -1826,6 +1853,7 @@ mod tests {
                 deps: Vec::new(),
                 lock_tag: Vec::new(),
                 settle: false,
+                touched_gen: 0,
             }],
         );
         s.put_batch(&b).await.unwrap();

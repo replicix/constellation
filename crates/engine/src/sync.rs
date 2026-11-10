@@ -235,6 +235,10 @@ pub enum SyncRequest {
         /// Plan 43 C2: a settle of `rid`, not an execution
         /// (`PeerMsg::MutateRequest::settle`).
         settle: bool,
+        /// ADR-47: `PeerMsg::MutateRequest::routed_gen`.
+        routed_gen: u64,
+        /// ADR-47: `PeerMsg::MutateRequest::touched_gen`.
+        touched_gen: u64,
         reply: tokio::sync::oneshot::Sender<crate::authority_driver::MutateReplyParts>,
     },
     /// `from` reports chunks it forwarded as pending durable in S3: ack

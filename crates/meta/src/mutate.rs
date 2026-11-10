@@ -262,6 +262,22 @@ pub enum MutateOutcome {
     /// outcome, never retried; the engine answers `EIO`. Appended last: a
     /// peer too old to decode it falls back to `Busy`.
     Abandoned,
+    /// ADR-47: the receiver holds the op's keys under generation `gen` and
+    /// was not routed by it (`routed_gen != gen`); nothing ran and nothing
+    /// was journaled. The requester sends the op again routed by `gen`.
+    /// Never reaches a client. Appended last: a peer too old to decode it
+    /// falls back to `Busy`.
+    Fenced {
+        gen: u64,
+    },
+    /// ADR-47: the root holds an op that touched a non-stealable generation
+    /// `gen` whose holder it does not reach: nothing was journaled; the
+    /// requester asks again after `retry_ms` (the holder's row or the
+    /// generation's end will settle the rid). Never reaches a client.
+    HolderUnreachable {
+        gen: u64,
+        retry_ms: u64,
+    },
 }
 
 /// What a forwarded op's transaction waits for from the node that

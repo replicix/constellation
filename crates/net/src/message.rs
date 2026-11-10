@@ -327,6 +327,12 @@ pub enum Payload {
         /// Plan 43 C2: a settle of `rid` (answer its outcome, or refuse it
         /// for good), not an execution (`PeerMsg::MutateRequest::settle`).
         settle: bool,
+        /// ADR-47: the generation this send was routed by (0: the lease
+        /// holder) (`PeerMsg::MutateRequest::routed_gen`).
+        routed_gen: u64,
+        /// ADR-47: the highest generation the rid was ever sent under
+        /// (`PeerMsg::MutateRequest::touched_gen`).
+        touched_gen: u64,
     },
     /// Holder's answer: postcard-encoded `MutateOutcome`.
     MutateReply {
@@ -1821,12 +1827,18 @@ mod tests {
                 applied: 4,
                 lock_tag: Vec::new(),
                 settle,
+                routed_gen: 7,
+                touched_gen: u64::MAX,
             };
             let signed = Signed::new(&k, &payload).unwrap();
             let frame = signed.encode().unwrap();
             let back = Signed::decode(&frame[4..]).unwrap();
             let (_, got) = back.verify().unwrap();
-            assert!(matches!(got, Payload::MutateRequest { settle: s, .. } if s == settle));
+            assert!(matches!(
+                got,
+                Payload::MutateRequest { settle: s, routed_gen: 7, touched_gen: u64::MAX, .. }
+                    if s == settle
+            ));
         }
     }
 

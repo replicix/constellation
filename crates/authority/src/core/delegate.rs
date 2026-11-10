@@ -522,6 +522,10 @@ pub(crate) struct ParkedDeleg {
     pub tag: LockTag,
     /// Plan 43 C2: a settle of the rid, not an execution.
     pub settle: bool,
+    /// ADR-47: the forward's fence (checked at admission; kept so a
+    /// re-entry through `answer_not_owner` carries it).
+    #[allow(dead_code)]
+    pub fence: super::holder::Fence,
     /// Plan 46 M1.3 step 5: parked because a release of the subtree is
     /// draining (`Core::sticky_holds`): it runs again when the hold lifts,
     /// and is sent to the root when the release row is journaled.
@@ -2741,6 +2745,7 @@ impl Core {
         acked_through: u64,
         tag: &LockTag,
         settle: bool,
+        fence: super::holder::Fence,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> bool {
@@ -2811,6 +2816,7 @@ impl Core {
                 acked_through,
                 tag: tag.clone(),
                 settle,
+                fence,
                 held: holding,
             });
             if from == 0 {
@@ -2894,7 +2900,18 @@ impl Core {
                 let fresh = self.clients.get(&rid).map(|c| c.deps);
                 if let Some(fresh) = fresh.filter(|d| !replica.deps_lost(d)) {
                     self.delegate_try_execute(
-                        now, 0, None, rid, op, fresh, 0, tag, false, replica, out,
+                        now,
+                        0,
+                        None,
+                        rid,
+                        op,
+                        fresh,
+                        0,
+                        tag,
+                        false,
+                        super::holder::Fence::default(),
+                        replica,
+                        out,
                     );
                 }
                 return;

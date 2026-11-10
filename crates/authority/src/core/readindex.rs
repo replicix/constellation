@@ -179,6 +179,10 @@ pub(crate) enum ParkedWhat {
         tag: constellation_meta::locks::LockTag,
         /// Plan 43 C2: a settle of the rid (`PeerMsg::MutateRequest::settle`).
         settle: bool,
+        /// ADR-47: the forward's fence; the wake passes it back to
+        /// `on_mutate_request`, so it is checked against the generation
+        /// current then.
+        fence: super::holder::Fence,
     },
     /// Plan 30 §M11: a local op of this root, executed (and finished)
     /// once the recall is done and its `deps` are here.
@@ -962,13 +966,14 @@ impl Core {
         wait: RecallWait,
         deps: Option<Position>,
         from: NodeId,
-        (req, rid, op, acked_through, tag, settle): (
+        (req, rid, op, acked_through, tag, settle, fence): (
             OpId,
             Rid,
             MutateOp,
             u64,
             constellation_meta::locks::LockTag,
             bool,
+            super::holder::Fence,
         ),
         queue_gated: bool,
         out: &mut Vec<Action>,
@@ -988,6 +993,7 @@ impl Core {
                 held_timer: None,
                 tag,
                 settle,
+                fence,
             },
         );
         self.rd.parked_rids.insert(rid, id);
@@ -2310,6 +2316,7 @@ impl Core {
                     held_timer,
                     tag,
                     settle,
+                    fence,
                 } => {
                     self.rd.parked_rids.remove(&rid);
                     if let Some(t) = held_timer {
@@ -2331,6 +2338,7 @@ impl Core {
                         (deps, 0),
                         tag,
                         settle,
+                        fence,
                         replica,
                         out,
                     );

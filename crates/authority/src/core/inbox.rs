@@ -504,6 +504,8 @@ impl Core {
                     deps: c.deps.to_postcard(),
                     lock_tag: c.tag.to_wire(now.honour),
                     settle: c.settle,
+                    // (Carried from the send history by a later chunk.)
+                    touched_gen: 0,
                 })
             })
             .collect();
@@ -785,9 +787,10 @@ impl Core {
                     );
                     if let Some(c) = self.clients.get_mut(&rid) {
                         c.attempts = 0;
+                        c.fence_bounces = 0;
                         c.redirected = 0;
                     }
-                    self.send_forward(now, rid, l.holder, replica, out);
+                    self.send_forward(now, rid, l.holder, 0, replica, out);
                 }
                 Some(_) if self.lease.claimable_observed(now, &self.cfg) => {
                     // The holder is gone; whoever takes over drains the
@@ -1370,7 +1373,7 @@ impl Core {
                 if let Some(key) = key {
                     self.inbox_resubmit_cobatched(now, key, replica, out);
                 }
-                self.send_forward(now, rid, holder, replica, out);
+                self.send_forward(now, rid, holder, 0, replica, out);
             }
             other => {
                 tracing::debug!(

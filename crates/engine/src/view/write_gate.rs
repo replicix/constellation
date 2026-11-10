@@ -875,8 +875,12 @@ impl View {
                     ));
                     Err(MutateFail::Errno(Code::Io))
                 }
+                // Never a client outcome (the core resends or holds them);
+                // defensive: in doubt, like `Busy`.
                 constellation_meta::MutateOutcome::Busy
-                | constellation_meta::MutateOutcome::NotHolder { .. } => {
+                | constellation_meta::MutateOutcome::NotHolder { .. }
+                | constellation_meta::MutateOutcome::Fenced { .. }
+                | constellation_meta::MutateOutcome::HolderUnreachable { .. } => {
                     crate::locks::note_tag_in_doubt(Some(rid));
                     crate::fsync_wait::note(crate::fsync_wait::Failure::Transient(
                         "no sequencer answered the metadata commit".into(),

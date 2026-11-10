@@ -1287,6 +1287,10 @@ pub struct Stats {
     /// A designation's refusal of an op this node had sent to the
     /// designee, asked again instead of answered (the op was sent to the designee, it may have run).
     pub designation_refusals_held: u64,
+    /// ADR-47: requester: `Fenced` answers resent routed by the answering
+    /// generation, and ops routed afresh past the resend limit.
+    pub fenced_resends: u64,
+    pub fence_bounce_limit: u64,
     pub deleg_designated: u64,
     /// Plan 46 M1.3 step 4: sticky grants made (a stream's first or a growth).
     pub deleg_sticky: u64,
@@ -2988,6 +2992,8 @@ impl Core {
                 applied,
                 tag,
                 settle,
+                routed_gen,
+                touched_gen,
             } => self.on_mutate_request(
                 now,
                 from,
@@ -2998,6 +3004,10 @@ impl Core {
                 (deps, applied),
                 tag,
                 settle,
+                holder::Fence {
+                    routed_gen,
+                    touched_gen,
+                },
                 replica,
                 out,
             ),
