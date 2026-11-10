@@ -4500,6 +4500,69 @@ impl Meta {
         streamed_tip_tx(&r, self, epoch)
     }
 
+    /// Plan 46 M1.4 step 4 (ADR-51): promote this replica's speculative
+    /// streamed transactions of `epoch` that node `source` streamed, rows
+    /// up to journal seq `through`, to committed (`gated`). An epoch
+    /// member acknowledges a hold owner's batch by its highest held seq;
+    /// the owner answers its clients on that ack, so every copy the ack
+    /// covers is the group's committed copy, whether it arrived in the
+    /// batch or earlier as a subscriber's uncommitted stream-ahead (a row
+    /// streamed before the hold formed, which the hold does not send
+    /// again). Both rows of the entry change in one transaction. Returns
+    /// how many entries were promoted.
+    pub fn promote_streamed(
+        &self,
+        epoch: u64,
+        source: u64,
+        through: u64,
+    ) -> Result<usize, MetaError> {
+        let mut tx = self.db.write_tx();
+        if counter_get(&tx, &self.local, KV_SPEC_LIVE_COUNT)? == 0 {
+            return Ok(0);
+        }
+        let mut promoted = 0;
+        for (seq, entry) in read_live(&tx, self)? {
+            let LiveEntry::Streamed {
+                epoch: e,
+                ident,
+                last,
+                gated: false,
+            } = entry
+            else {
+                continue;
+            };
+            if e != epoch || last > through {
+                continue;
+            }
+            let Some(v) = tx.get(&self.spec, seq_key(seq))? else {
+                continue;
+            };
+            let mut row: SpecRow = crate::record::from_bytes_exact(&v)?;
+            match &mut row.kind {
+                SpecKind::Streamed {
+                    source: src, gated, ..
+                } if *src == source && !*gated => *gated = true,
+                _ => continue,
+            }
+            put_row(&mut tx, &self.spec, seq, &row)?;
+            tx.insert(
+                &self.spec_live,
+                seq_key(seq),
+                postcard::to_allocvec(&LiveEntry::Streamed {
+                    epoch,
+                    ident,
+                    last,
+                    gated: true,
+                })?,
+            );
+            promoted += 1;
+        }
+        if promoted > 0 {
+            tx.commit()?;
+        }
+        Ok(promoted)
+    }
+
     /// Plan 30 §M9: install one of the holder's backup-acked journal
     /// transactions (rows `first..=last` of its tenure at `epoch`, streamed
     /// by node `source`) ahead of the log, as a `Streamed` entry (see

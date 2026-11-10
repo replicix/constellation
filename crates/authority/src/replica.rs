@@ -771,6 +771,15 @@ pub trait Replica {
     /// speculation (`Meta::streamed_tip`): a stream-ahead below it is
     /// already here.
     fn streamed_tip(&self, epoch: Epoch) -> Result<Option<u64>, MetaError>;
+    /// An epoch member's acknowledgement of `source`'s committed hold batch
+    /// covers its earlier speculative streamed copies of `epoch` through
+    /// `through`: they become committed (`Meta::promote_streamed`).
+    fn promote_streamed(
+        &self,
+        epoch: Epoch,
+        source: NodeId,
+        through: u64,
+    ) -> Result<usize, MetaError>;
     /// The holder's durability watermark for its own reads
     /// (`Meta::durability_pending`). `lone_ok` (plan 43 C2, §5.4): with the
     /// gate off, the node may answer its own clients on its disk alone.
@@ -1986,6 +1995,15 @@ impl Replica for Meta {
 
     fn streamed_tip(&self, epoch: Epoch) -> Result<Option<u64>, MetaError> {
         Meta::streamed_tip(self, epoch)
+    }
+
+    fn promote_streamed(
+        &self,
+        epoch: Epoch,
+        source: NodeId,
+        through: u64,
+    ) -> Result<usize, MetaError> {
+        Meta::promote_streamed(self, epoch, source, through)
     }
 
     fn set_durable(

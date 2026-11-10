@@ -6767,10 +6767,33 @@ impl Core {
         // The batch is in this node's store: tell the hold owner how far
         // (the group's rule waits for it; step 2).
         if let (true, Some(through)) = (self.epoch.open, held_through) {
-            out.push(Action::Send {
-                to: from,
-                msg: PeerMsg::StreamAheadAck { epoch, through },
-            });
+            // ADR-51 (review SHOULD 1): the ack covers every copy through
+            // `through`, and the owner answers on it. A copy this member
+            // streamed earlier as speculation (before the hold formed; the
+            // hold does not send it again) is the group's committed copy
+            // from here on: promoted before the ack leaves, or it would be
+            // dropped as speculation after the owner's retirement.
+            let promoted = if committed {
+                match replica.promote_streamed(epoch, from, through) {
+                    Ok(n) => {
+                        self.stats.streamed_promoted += n as u64;
+                        true
+                    }
+                    Err(error) => {
+                        // Unpromoted, the copy is not the group's: no ack.
+                        tracing::warn!(node = self.cfg.node_id, %error, "streamed copy not promoted");
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            if promoted {
+                out.push(Action::Send {
+                    to: from,
+                    msg: PeerMsg::StreamAheadAck { epoch, through },
+                });
+            }
         }
         // This node's own ops among them that wait for the log have their
         // effect here now.

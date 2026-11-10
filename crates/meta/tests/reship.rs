@@ -433,6 +433,57 @@ fn a_member_keeps_a_row_it_acknowledged_when_no_tail_names_it() {
     assert!(matches!(&queued[0].op, MutateOp::Records { records } if *records == recs));
 }
 
+/// ADR-51: `promote_streamed` makes the speculative streamed copies of one
+/// source's epoch, through a seq, committed in both rows of the entry. A
+/// takeover then queues a promoted copy as a committed replay and a copy
+/// that stayed speculative as a plain one; another source's, another
+/// epoch's and a later row's copies stay speculative.
+#[test]
+fn promote_streamed_flips_gated_in_both_rows() {
+    let meta = Meta::open_in_memory().unwrap();
+    let row = |n: u64| {
+        vec![
+            create(ROOT_INO, &format!("r{n}"), ino(n)),
+            LogRecord::Completed { rid: rid(1, n) },
+        ]
+    };
+    meta.install_streamed_committed(EPOCH_PREV, 1, 1, 1, &row(1), false, (0, 0))
+        .unwrap();
+    meta.install_streamed_committed(EPOCH_PREV, 1, 2, 2, &row(2), false, (0, 0))
+        .unwrap();
+    meta.install_streamed_committed(EPOCH_PREV + 1, 1, 1, 1, &row(3), false, (0, 0))
+        .unwrap();
+    // Another source's copy of the same epoch.
+    meta.install_streamed_committed(EPOCH_PREV, 9, 3, 3, &row(4), false, (0, 0))
+        .unwrap();
+    assert_eq!(meta.promote_streamed(EPOCH_PREV, 1, 1).unwrap(), 1);
+    assert_eq!(meta.promote_streamed(EPOCH_PREV, 1, 1).unwrap(), 0, "once");
+    let proof = Default::default();
+    let carried = Default::default();
+    meta.reship_at_takeover(
+        Some(constellation_meta::StrandArgs {
+            epoch: EPOCH_PREV + 2,
+            own_gens: &[],
+            abandoned: None,
+            carried: &carried,
+            proof: &proof,
+        }),
+        None,
+    )
+    .unwrap();
+    let queued = meta.pending_replays().unwrap();
+    let gated = |n: u64| {
+        queued
+            .iter()
+            .find(|q| q.rid == rid(1, n))
+            .map(|q| q.class.gated())
+    };
+    assert_eq!(gated(1), Some(true), "{queued:?}");
+    assert_eq!(gated(2), Some(false), "{queued:?}");
+    assert_eq!(gated(3), Some(false), "{queued:?}");
+    assert_eq!(gated(4), Some(false), "{queued:?}");
+}
+
 /// The same row with a tail that names it: the tail re-applies it, the
 /// member's entry is taken out and nothing is queued (applied once).
 #[test]

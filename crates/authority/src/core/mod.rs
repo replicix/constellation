@@ -1644,6 +1644,9 @@ pub struct Stats {
     /// Stream-ahead transactions this replica held already (a restarted
     /// subscriber, or the holder streaming from its start again).
     pub streamed_held_already: u64,
+    /// ADR-51: speculative streamed copies an epoch member's ack promoted
+    /// to committed (`Replica::promote_streamed`).
+    pub streamed_promoted: u64,
     /// Backup: appends persisted, epochs sealed, takeovers completed by
     /// seal, and how many transactions a takeover re-applied.
     pub backup_persisted: u64,

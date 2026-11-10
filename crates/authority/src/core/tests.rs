@@ -61810,6 +61810,71 @@ mod hold_ack {
         assert_eq!(sub.core.stats.streamed_installed, installed);
     }
 
+    /// ADR-51 (ehr2 review SHOULD 1): rows a member streamed as uncommitted
+    /// before the hold formed are not sent again by the hold, but the
+    /// member's ack of the hold's committed batch covers them and the owner
+    /// answers on it. The member promotes them before the ack leaves: a
+    /// takeover of the epoch does not strand them (they are the group's
+    /// committed copy, re-shipped by the claim or replayed), where
+    /// speculation would be rolled back.
+    #[test]
+    fn a_row_streamed_before_the_hold_is_promoted_when_the_hold_acks_it() {
+        let (mut owner, mut sub, req) = stream_pair();
+        submit_create(&mut owner, 1, "a");
+        let (p1, through) = holder_ship(&mut owner, 1, 100);
+        sub.step(Event::Peer {
+            from: 1,
+            msg: segment_frame(req, 1, 1, p1),
+        });
+        submit_create(&mut owner, 2, "b");
+        submit_create(&mut owner, 3, "c");
+        let txs = Replica::journal_txs_from(&owner.meta, through + 1, 100);
+        assert_eq!(txs.len(), 2);
+        let last = txs[1].last;
+        let batch = |committed: bool| PeerMsg::StreamAhead {
+            epoch: 1,
+            base: 1,
+            txs: txs.clone(),
+            committed,
+        };
+        sub.core.ship.max_epoch = 1;
+        // Before the hold: a subscriber's uncommitted stream-ahead.
+        let out = sub.step(Event::Peer {
+            from: 1,
+            msg: batch(false),
+        });
+        assert!(
+            !sends(&out)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::StreamAheadAck { .. })),
+            "{out:?}"
+        );
+        assert_eq!(sub.core.stats.streamed_installed, 2);
+        // The hold forms and sends the batch as committed: held already.
+        sub.core.epoch.open = true;
+        let out = sub.step(Event::Peer {
+            from: 1,
+            msg: batch(true),
+        });
+        let acked: Vec<u64> = sends(&out)
+            .into_iter()
+            .filter_map(|(_, m)| match m {
+                PeerMsg::StreamAheadAck { through, .. } => Some(*through),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(acked, vec![last], "{out:?}");
+        assert_eq!(sub.core.stats.streamed_promoted, 2);
+        assert_eq!(sub.core.stats.streamed_installed, 2, "not installed again");
+        // A later tenure's takeover does not roll the acknowledged copy back.
+        sub.meta.strand_below_epoch(2).unwrap();
+        assert!(sub.meta.pending_replays().unwrap().is_empty());
+        assert_eq!(Replica::streamed_tip(&sub.meta, 1).unwrap(), Some(last));
+        assert!(MetaStore::lookup(&sub.meta, ROOT_INO, "c")
+            .unwrap()
+            .is_some());
+    }
+
     /// The owner keeps the highest `through` each member acknowledged, never
     /// lowering it, and not above its own journal.
     #[test]
