@@ -8705,9 +8705,6 @@ fn delegated_core_stall_root_unlaned_config() -> SimConfig {
 fn delegated_core_stall_root_lease6_config() -> SimConfig {
     SimConfig {
         core: std::sync::Arc::new(sim::run::sim_core_config),
-        strict_commit_exempt: Some(
-            "plan 46 M1.3 (the stale-clock re-check rule: an answer committed on this node's disk under a lease is given only after a fresh clock read finds the lease usable): a stalled root's singleton answers are rolled back by its successor",
-        ),
         ..delegated_core_stall_root_config()
     }
 }
@@ -17662,6 +17659,29 @@ fn c0_count(map: &std::collections::BTreeMap<String, usize>, key: &str) -> usize
     map.get(key).copied().unwrap_or(0)
 }
 
+/// ADR-52 (lease6 triage F1), fail-before the stale-lease hold: a root
+/// stalled after its clock read answered its own client from its disk after
+/// a successor took the lease over (seeds 4 and 13: I1, "expected singleton,
+/// committed by none"; 23 the same shape). Its answers are now held for the
+/// archive or a usable lease, and in doubt once deposed.
+#[test]
+fn a_stalled_root_does_not_answer_after_its_lease_was_taken_over() {
+    let mut held = 0;
+    for seed in [4u64, 13, 23] {
+        let r = c0_run(
+            "delegated-core-stall-root-lease6+commit",
+            seed,
+            strict(delegated_core_stall_root_lease6_config(), "commit"),
+        );
+        held += r
+            .stats
+            .values()
+            .map(|s| s.answers_held_stale_lease)
+            .sum::<u64>();
+    }
+    assert!(held > 0, "the replays never held an answer: vacuous");
+}
+
 /// Plan 46 M1.1 step 7: `strict_commit` is the default of a delegated
 /// configuration; the exceptions are documented ones, each naming the plan
 /// item that closes it.
@@ -17680,8 +17700,12 @@ fn strict_commit_is_the_default_of_a_delegated_configuration() {
     assert!(locks_unlinked_blips_config()
         .strict_commit_exemption()
         .is_none());
+    // ADR-52: a singleton's answer is given only on a fresh reading of a
+    // usable lease, so a stalled root is strict too.
+    assert!(delegated_core_stall_root_lease6_config()
+        .strict_commit_exemption()
+        .is_none());
     for cfg in [
-        delegated_core_stall_root_lease6_config(),
         locks_writer_hold_delegated_config(),
         locks_writer_hold_delegated_doubt_config(),
         locks_writer_hold_delegated_group_config(false),
@@ -17696,10 +17720,6 @@ fn strict_commit_is_the_default_of_a_delegated_configuration() {
         let why = cfg.strict_commit_exemption().expect("an exception");
         assert!(why.starts_with(&format!("plan 46 {item}")), "{why}");
     };
-    closes(
-        delegated_core_stall_root_lease6_config(),
-        "M1.3 (the stale-clock re-check rule",
-    );
     for cfg in [
         locks_writer_hold_delegated_config(),
         locks_writer_hold_delegated_doubt_config(),

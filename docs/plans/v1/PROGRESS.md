@@ -66776,6 +66776,16 @@ own-subtree answers and the singleton's commit on the node's disk too. M1.3 carr
 
 This config's `+commit` 0/2,000 is an M1.3 exit. Landing it before M1.3 is a fallback if M1.3 slips.
 
+**Closed (2026-11-10, plan 46 M1.3, [ADR-52](../../explanation/DECISIONS.md#adr-52-a-singleton-answer-leaves-only-on-a-fresh-reading-of-a-usable-lease)).**
+A singleton's answer leaves only if a clock read taken where it leaves (`finish`, `send_answer*`, the engine fast
+path's acknowledgement and its sim copy) finds the lease usable with the margin; otherwise it waits on its row for the
+archive or a renewal, and is in doubt if the node is deposed. Execution on the stale clock is not re-checked (S3 fences
+it). The replayed mechanism (seeds 4 and 13): the stalled step admitted on its old `now`, journaled the row `Singleton`
+and replied in the same step; nothing between admission and reply read a clock. Fail-before: seeds 4, 13, 23 of
+`delegated-core-stall-root-lease6+commit` (I1, "expected singleton, committed by none"); core tests in
+`core::tests::stale_lease`; engine `a_singleton_row_whose_lease_ran_out_under_the_commit_is_in_doubt`. The exemption of
+`delegated-core-stall-root-lease6` is removed: `+commit` 0 of 2,000 seeds.
+
 ## Plan 46 M1.1 step 1: a lone root's journal is no second copy (2026-11-05)
 
 ADR-41's lone-journal branch removed (plan 46 §11, "M1.0 answers"; ADR-41's amendment, ADR-42's correction and DESIGN land with this step, in the review round below). A root's
