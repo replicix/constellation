@@ -250,6 +250,12 @@ fn assert_finds_within(
 /// Stateright's path is valid but not always the shortest one. A knob whose
 /// label is missing here fails, so no knob goes unrecorded.
 const TRACES: &[(&str, &str, usize)] = &[
+    ("f1-stale+unfenced_forward", "refused_never_completes", 8),
+    (
+        "f1-stale+root_ignores_touched",
+        "refused_never_completes",
+        10,
+    ),
     (
         "c7-t1-crash+reads+abandon_skips_read_recall",
         "settle_after_reads_recalled",
@@ -1798,5 +1804,71 @@ fn r1_knob_leave_keeps_grants_is_found() {
         &m,
         "no_live_grant_off_roster",
         CAP_LARGE,
+    );
+}
+
+// ================ route fencing (ADR-47): an executor runs a forward only
+// under the generation it was routed by
+
+/// F1: node 1 holds `/D1` sticky; node 2's route cache is stale (its first
+/// send goes to the holder routed `0`, its later ones to the lease holder).
+/// One crash: the holder, with its disk kept, stands for one the root does
+/// not reach.
+fn f1_stale() -> NodeStreamModel {
+    let mut m = NodeStreamModel::design(vec![vec![], vec![], vec![create(D1A)]])
+        .with_grant(sticky(1, D1))
+        .with_faults(1, 0);
+    m.route_fence = true;
+    m.stale_routes = true;
+    m
+}
+
+/// F1b: the requester's table is current (it routes by the grant), so the
+/// forward arrives routed and touched; a second writer in the subtree.
+fn f1_current() -> NodeStreamModel {
+    let mut m = NodeStreamModel::design(vec![vec![], vec![create(D1B)], vec![create(D1A)]])
+        .with_grant(sticky(1, D1))
+        .with_faults(1, 0);
+    m.route_fence = true;
+    m
+}
+
+#[test]
+fn f1_design_a_stale_route_is_fenced_and_never_refused_for_good() {
+    assert_clean_within("f1-stale", &f1_stale(), CAP_FAULTS);
+}
+
+#[test]
+fn f1_design_a_current_route_passes_the_fence() {
+    assert_clean_within("f1-current", &f1_current(), CAP_FAULTS);
+}
+
+/// The executor runs a forward whatever it was routed by: the op runs at the
+/// holder, which is lost before it answers; the retry reaches the root with
+/// `touched == 0`, which refuses it for good while the holder's row lives.
+#[test]
+fn f1_knob_unfenced_forward_is_found() {
+    let mut m = f1_stale();
+    m.unfenced_forward = true;
+    assert_finds_within(
+        "f1-stale+unfenced_forward",
+        &m,
+        "refused_never_completes",
+        CAP_FAULTS,
+    );
+}
+
+/// The root refuses whatever the rid touched (the behaviour before the
+/// fence): the fenced resend ran at the holder, and the root refuses the
+/// retry.
+#[test]
+fn f1_knob_root_ignores_touched_is_found() {
+    let mut m = f1_stale();
+    m.root_ignores_touched = true;
+    assert_finds_within(
+        "f1-stale+root_ignores_touched",
+        &m,
+        "refused_never_completes",
+        CAP_FAULTS,
     );
 }
