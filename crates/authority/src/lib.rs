@@ -30,6 +30,7 @@
 
 pub mod action;
 pub mod core;
+pub mod deadlines;
 pub mod deleg_lane;
 pub mod event;
 pub mod ids;
