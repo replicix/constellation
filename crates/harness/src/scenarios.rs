@@ -1217,6 +1217,20 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m9::single_node_unchanged,
     },
     Scenario {
+        name: "singleton-peer-join",
+        desc: "ADR-50 (plan 46 M1.3 step 10): A writes alone (singleton answers); B mounts and does nothing: within a registry poll A's status.roster lists B, A is no singleton and its singleton class stops growing; A is killed, B claims after the TTL and holds every file A acknowledged after its roster listed B",
+        requires: &[],
+        caps: &[],
+        run: m9::singleton_peer_join,
+    },
+    Scenario {
+        name: "registered-peer-down",
+        desc: "ADR-50 (plan 46 M1.3 step 10): B mounts and is killed without leave: A's writes still succeed, counted archive_waits, and A is no singleton; after A retires B (leave --node-id) it answers alone again",
+        requires: &[],
+        caps: &[],
+        run: m9::registered_peer_down,
+    },
+    Scenario {
         name: "backup-failover-with-delegation",
         desc: "plan 30 M9 (strict): a reader holds a read delegation from the holder, which dies; the backup takes over inside the lease and its first write of that file is acknowledged only past the delegation horizon: no read the reader starts after the acknowledgement is stale, and no strict read degrades",
         requires: &[],

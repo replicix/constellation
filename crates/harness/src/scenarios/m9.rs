@@ -27,6 +27,11 @@ pub(super) fn n(v: &serde_json::Value, key: &str) -> u64 {
     v[key].as_u64().unwrap_or(0)
 }
 
+/// `status.roster` of `c` (ADR-50).
+fn roster_of(c: &Client) -> Result<serde_json::Value> {
+    Ok(c.control_status()?["roster"].clone())
+}
+
 pub(super) fn node_id(c: &Client) -> Result<u64> {
     c.control_status()?["node_id"]
         .as_u64()
@@ -106,6 +111,24 @@ pub(super) fn cluster(
     Vec<Client>,
     Vec<CountingProxy>,
 )> {
+    cluster_mounted(scenario, names, extra, counting, names.len())
+}
+
+/// [`cluster`] with only the first `mounted` of `names` mounted: the
+/// others are built and left for the scenario to mount (a node that joins
+/// later).
+pub(super) fn cluster_mounted(
+    scenario: &str,
+    names: &[&str],
+    extra: &[(&str, &str)],
+    counting: usize,
+    mounted: usize,
+) -> Result<(
+    crate::s3env::S3Env,
+    tempfile::TempDir,
+    Vec<Client>,
+    Vec<CountingProxy>,
+)> {
     let (env, root) = setup(scenario)?;
     let backend = format!("s3://{BUCKET}/{scenario}-{}", ts());
     let ttl = TTL_MS.to_string();
@@ -139,11 +162,11 @@ pub(super) fn cluster(
         clients.push(c);
     }
     clients[0].fs_create()?;
-    for c in clients.iter_mut() {
+    for c in clients.iter_mut().take(mounted) {
         c.mount()?;
     }
-    if clients.len() > 1 {
-        let refs: Vec<&Client> = clients.iter().collect();
+    if mounted > 1 {
+        let refs: Vec<&Client> = clients.iter().take(mounted).collect();
         wait_for_p2p(&refs)?;
     }
     std::fs::write(clients[0].mnt.join("f"), b"initial")?;
@@ -152,7 +175,7 @@ pub(super) fn cluster(
         anyhow::ensure!(lease["held"] == true, "node 0 does not hold: {lease}");
         Ok(())
     })?;
-    for c in &clients[1..] {
+    for c in clients[1..mounted].iter() {
         eventually("f visible everywhere", Duration::from_secs(30), || {
             anyhow::ensure!(
                 std::fs::read(c.mnt.join("f")).ok().as_deref() == Some(&b"initial"[..]),
@@ -1019,6 +1042,107 @@ pub fn backup_partition(_seed: u64) -> Result<()> {
         for c in &clients {
             print_ack(NAME, &c.name, &ack_of(c)?);
         }
+        Ok(())
+    })();
+    unmount_all(&mut clients);
+    result
+}
+
+/// ADR-50 (plan 46 M1.3 step 10): A writes alone and its fast path is open
+/// (`singleton`); B mounts and does nothing. Within a registry poll A's
+/// `status.roster` lists B, A is no singleton, and its acknowledgements are
+/// gated (they wait for the archive). Then A is killed (`kill -9`) and B
+/// claims after the TTL: every file A acknowledged after its roster listed B
+/// is on B.
+pub fn singleton_peer_join(_seed: u64) -> Result<()> {
+    const NAME: &str = "singleton-peer-join";
+    let (_env, _root, mut clients, _) = cluster_mounted(NAME, &["a", "b"], &[], 0, 1)?;
+    let result = (|| -> Result<()> {
+        let (before, _) = write_files(&clients[0], "alone", 20)?;
+        let r = roster_of(&clients[0])?;
+        anyhow::ensure!(r["singleton"] == true, "A alone is no singleton: {r}");
+        anyhow::ensure!(
+            ack_of(&clients[0])?["gated"] == false,
+            "A alone is gated: {}",
+            ack_of(&clients[0])?
+        );
+        clients[1].mount()?;
+        let b = node_id(&clients[1])?;
+        eventually("A's roster lists B", Duration::from_secs(20), || {
+            let r = roster_of(&clients[0])?;
+            anyhow::ensure!(
+                r["write_eligible"]
+                    .as_array()
+                    .is_some_and(|l| l.iter().any(|n| n.as_u64() == Some(b)))
+                    && r["singleton"] == false,
+                "A's roster does not list B yet: {r}"
+            );
+            Ok(())
+        })?;
+        let (after, _) = write_files(&clients[0], "joined", 30)?;
+        anyhow::ensure!(
+            ack_of(&clients[0])?["gated"] == true,
+            "A answered ungated after its roster listed B: {}",
+            ack_of(&clients[0])?
+        );
+        print_ack(NAME, "A", &ack_of(&clients[0])?);
+        clients[0].kill9()?;
+        eventually("B holds the lease", Duration::from_secs(90), || {
+            let l = lease_of(&clients[1])?;
+            anyhow::ensure!(l["held"] == true, "B does not hold: {l}");
+            Ok(())
+        })?;
+        all_visible(&clients[1], &after, Duration::from_secs(30))?;
+        // (What A answered alone before its roster listed B is on B or comes
+        // back as a conflict copy when A returns: the singleton's accepted
+        // death-then-join window, counted rather than required.)
+        let missing = before
+            .iter()
+            .filter(|n| !clients[1].mnt.join(n).exists())
+            .count();
+        eprintln!(
+            "    {NAME}: {missing} of {} early files are not on B",
+            before.len()
+        );
+        Ok(())
+    })();
+    unmount_all(&mut clients);
+    result
+}
+
+/// ADR-50: B mounts and is killed without `leave`. A's writes still
+/// succeed, its roster lists B and its acknowledgements are gated (they wait
+/// for the archive). After A retires B (`leave --node-id`), A shows
+/// `singleton` again and its fast path opens.
+pub fn registered_peer_down(_seed: u64) -> Result<()> {
+    const NAME: &str = "registered-peer-down";
+    let (_env, _root, mut clients, _) = cluster(NAME, &["a", "b"], &[], 0)?;
+    let result = (|| -> Result<()> {
+        let b = node_id(&clients[1])?;
+        clients[1].kill9()?;
+        write_files(&clients[0], "down", 30)?;
+        let r = roster_of(&clients[0])?;
+        anyhow::ensure!(
+            r["singleton"] == false,
+            "A is a singleton with B registered: {r}"
+        );
+        anyhow::ensure!(
+            ack_of(&clients[0])?["gated"] == true,
+            "A's acknowledgements are not gated: {}",
+            ack_of(&clients[0])?
+        );
+        clients[0].leave(Some(b), true)?;
+        eventually("A is a singleton again", Duration::from_secs(40), || {
+            let r = roster_of(&clients[0])?;
+            anyhow::ensure!(r["singleton"] == true, "A still has peers: {r}");
+            Ok(())
+        })?;
+        write_files(&clients[0], "retired", 30)?;
+        eventually("A's fast path opens", Duration::from_secs(40), || {
+            let a = ack_of(&clients[0])?;
+            anyhow::ensure!(a["gated"] == false, "A is still gated: {a}");
+            Ok(())
+        })?;
         Ok(())
     })();
     unmount_all(&mut clients);
