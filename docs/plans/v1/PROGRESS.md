@@ -69342,3 +69342,26 @@ go down.
   strict reading at 1000 reads/s: ext4, xfs, btrfs 30 syncs of 6 to 12 ms (once 1.9 s) before, none after (largest call
   26 microseconds), with and without a 10 ms writer on the disk; tmpfs unchanged (`grant_horizon_stall_bench`, ignored).
   S3: the harness's 3.5 s sleep stays, marked as a known workaround of an open bug.
+
+## 2026-11-10 i1-809 follow-up: the lone re-claim gap evaluated, dropped
+
+A restarted root whose delegate generations are stopped does not reclaim its lease on its own. The first client deadline
+(42bcf265) settles the delegate's parked own op, and that settle forward re-adopts the lease; the op is answered from the log
+after about one deadline. No invariant is at stake (I1, I2, I4 hold); the cost is latency.
+
+| config (2000 seeds each, 0 failing) | restarts with lease naming root and foreign streams | stopped-generation parks given up at the deadline |
+|---|---|---|
+| long-delegated + slow lease reads | 1720 | 15 |
+| long-delegated | 1386 | 3 |
+| delegated-epoch | 155 | 9 |
+| delegated-long-delegation | 253 | 0 |
+| delegated-no-backup-root-near | 112 | 0 |
+
+- **Startup re-adopt dropped.** It covers only the restart shape (not `delegated-epoch` 1355, where the lease was released),
+  fires on far more restarts than the ones that suffer, and moves claim timing, takeover gates and quarantines for a gain of
+  one deadline.
+- **Poke extension dropped.** Prototype: `deleg_awaited_commits` also asks for a stopped generation's parks. It moved the
+  re-adoption in 1576 from t=16124 to t=15240, but acquisition under slow lease reads still ended after the deadline;
+  give-ups went 15 to 18 (long-delegated + slow reads) and 9 to 8 (delegated-epoch). No gain.
+- **Reopen only if** a stopped-generation give-up ends in an unsettled `EIO`, or hangs past the second deadline; then build
+  on the delegate side, not a root-side startup claim.

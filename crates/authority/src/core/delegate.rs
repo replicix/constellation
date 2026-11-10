@@ -5457,6 +5457,16 @@ impl Core {
     ///
     /// Empty (without a scan of the parks) while no generation has appended
     /// rows left uncommitted.
+    ///
+    /// A stopped generation is not asked, so a restarted root whose delegate
+    /// generations are stopped does not re-adopt its lease on its own. Its
+    /// parked own answers are settled at their first client deadline
+    /// (`client_deadline`, 42bcf265), and that settle is the demand that
+    /// re-adopts a restarted root's lease or claims a released one; the op is
+    /// answered from the log, after about one deadline. Measured shapes:
+    /// `long-delegated` seed 1576 (slow lease reads) and `delegated-epoch`
+    /// seed 1355. A proactive re-claim was evaluated and dropped: latency
+    /// only, no invariant at stake.
     fn deleg_awaited_commits(&self, replica: &dyn Replica) -> BTreeMap<u64, WaitMs> {
         let open =
             |d: &DelegateState| !d.stopped && !d.lapsed && d.root_committed < d.streamed_through;
@@ -5516,6 +5526,11 @@ impl Core {
     /// rows. A refusal, a failure or a timeout of the ask backs the asking
     /// off as the stream's back-off does (`poke_backoff_ms`), and nothing
     /// else.
+    ///
+    /// A stopped generation is never poked, even for a root restarted since
+    /// its batch: its parked own answers are settled at their first client
+    /// deadline (`client_deadline`, 42bcf265), which supplies the demand that
+    /// re-adopts the root's lease (see [`Self::deleg_awaited_commits`]).
     fn deleg_poke_root(
         &mut self,
         now: Now,
