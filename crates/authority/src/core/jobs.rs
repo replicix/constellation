@@ -3548,12 +3548,6 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        // The classification's snapshot of the epoch this node sealed is
-        // older than this claim's tail fetch when the fetch asked this node
-        // (an own lease whose window lapsed, listing backups) and it sealed
-        // its own epoch: the claim is then the takeover at the next epoch
-        // (D7), never a revival of the sealed one at the same epoch.
-        self.lease.sealed_own = self.bk.sealed;
         let plan = Plan::Claim {
             prev,
             tag,
@@ -3639,9 +3633,25 @@ impl Core {
     }
 
     fn acquire_cas(&mut self, now: Now, plan: Plan, replica: &dyn Replica, out: &mut Vec<Action>) {
-        let Plan::Claim { prev, tag, .. } = &plan else {
+        let Plan::Claim {
+            prev,
+            tag,
+            takeover,
+            ..
+        } = &plan
+        else {
             return;
         };
+        // A takeover's classification snapshot of the epoch this node sealed
+        // is older than the claim's asynchronous gap (a promise check, the
+        // tail to head) in which a peer claimant's seal can land on this
+        // node's own epoch (a restart's re-adoption): the claim is then the
+        // takeover at the next epoch (D7), never a revival of the sealed
+        // one. (A plain claim has no gap between its classification and
+        // this CAS.)
+        if *takeover {
+            self.lease.sealed_own = self.bk.sealed;
+        }
         // Plan 43 C7-F F-a0: a takeover that will wait out what its
         // predecessor granted (a seal of a tenure that granted: the floor
         // `acquire_won` arms; a released lease whose tenure left lock
@@ -3686,6 +3696,16 @@ impl Core {
             Some(prev),
             inherits_duty,
             self.singleton_test(),
+        );
+        let rewrites_sealed = prev.holder == self.cfg.node_id
+            && lease.epoch == prev.epoch
+            && self.bk.sealed >= lease.epoch;
+        if rewrites_sealed {
+            self.stats.sealed_own_epoch_rewrites += 1;
+        }
+        debug_assert!(
+            !rewrites_sealed,
+            "a node never writes its own sealed epoch again"
         );
         // Plan 43 C1-3: the claim's tail. A listed backup that claims at
         // expiry seals its role first, a self-sealed holder takes its own

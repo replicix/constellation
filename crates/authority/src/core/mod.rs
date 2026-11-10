@@ -1708,6 +1708,9 @@ pub struct Stats {
     /// A self-sealed holder claimed its own lease at once, because the lease
     /// had moved off every key a sealer read (D7 amended).
     pub sealed_own_early_claims: u64,
+    /// A claim CAS that wrote this node's own epoch although the node had
+    /// sealed it (never: D7 makes it the takeover at the next epoch).
+    pub sealed_own_epoch_rewrites: u64,
     /// Plan 46 M0.3 (G): of those, refusals that proved this node holds
     /// nothing of the epoch (`SealedTail::empty`).
     pub seal_tail_empty: u64,

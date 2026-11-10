@@ -17672,6 +17672,7 @@ fn m03_a_reachable_sequencers_requester_is_not_isolated() {
 #[test]
 fn a_late_seal_after_the_holders_renewal_lets_it_reclaim_at_once() {
     let mut early = 0;
+    let mut early_of_pinned = 0;
     for seed in SEAL_GAP_SEEDS {
         let cfg = SimConfig {
             seal_after_read_ms: SEAL_GAP_DELAY_MS,
@@ -17683,20 +17684,61 @@ fn a_late_seal_after_the_holders_renewal_lets_it_reclaim_at_once() {
                  AUTHORITY_SIM_SEAL_AFTER_READ_MS={SEAL_GAP_DELAY_MS} AUTHORITY_SIM_CONFIG=backup-strict+unsettled"
             )
         });
-        early += r
+        let n = r
             .stats
             .values()
             .map(|s| s.sealed_own_early_claims)
             .sum::<u64>();
+        assert_eq!(
+            r.stats
+                .values()
+                .map(|s| s.sealed_own_epoch_rewrites)
+                .sum::<u64>(),
+            0,
+            "seed {seed}: a node wrote its own sealed epoch again"
+        );
+        early += n;
+        if seed == SEAL_GAP_PINNED_SEED {
+            early_of_pinned = n;
+        }
     }
     assert!(early > 0, "no sealed holder re-claimed early");
+    assert!(
+        early_of_pinned > 0,
+        "seed {SEAL_GAP_PINNED_SEED} (holder 1 sealed by peer claimant 2, re-claims epoch 3 early) no longer shows the early re-claim"
+    );
 }
 
-// (400 ms: a peer claimant's seal lands after the holder's renewal. At 60 ms
-// the early re-claims of these seeds were the holder's own claim sealing its
-// own epoch and reviving it at the same epoch, the defect
-// `a_claim_whose_tail_fetch_sealed_the_own_epoch_takes_the_next_epoch` pins.)
+/// The same seeds with the seal held back only 60 ms: the seal lands before
+/// the holder's renewal, so no sealed holder re-claims early (every early
+/// re-claim at this delay was the holder's own claim sealing its own epoch
+/// and reviving it, the defect fixed by the takeover refresh of
+/// `Core::acquire_cas`), and no node ever writes its own sealed epoch again.
+#[test]
+fn a_seal_before_the_holders_renewal_never_revives_a_sealed_epoch() {
+    for seed in SEAL_GAP_SEEDS {
+        let cfg = SimConfig {
+            seal_after_read_ms: 60,
+            ..strict(backup_strict_config(), "unsettled")
+        };
+        let r = run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!(
+                "backup-strict+unsettled seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_SEAL_AFTER_READ_MS=60 AUTHORITY_SIM_CONFIG=backup-strict+unsettled"
+            )
+        });
+        let sum = |f: fn(&constellation_authority::core::Stats) -> u64| {
+            r.stats.values().map(f).sum::<u64>()
+        };
+        assert_eq!(sum(|s| s.sealed_own_early_claims), 0, "seed {seed}");
+        assert_eq!(sum(|s| s.sealed_own_epoch_rewrites), 0, "seed {seed}");
+    }
+}
+
+// (400 ms: a peer claimant's seal lands after the holder's renewal; seed 79
+// is the one early re-claim in 300 seeds, pinned.)
 const SEAL_GAP_DELAY_MS: u64 = 400;
+const SEAL_GAP_PINNED_SEED: u64 = 79;
 const SEAL_GAP_SEEDS: std::ops::Range<u64> = 0..300;
 
 /// Plan 46 M0.3: the isolated requesters of `flex-crash` (nodes cut from every
