@@ -46,13 +46,30 @@ pub(crate) enum Origin {
     },
 }
 
-/// What follows the withdrawal of an op's inbox batches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AfterWithdraw {
-    /// The forward (`send_forward`) the withdrawal precedes.
-    Forward,
-    /// The settle's route (`settle_route`).
-    Settle,
+/// Late-landing F1: a settle's withdrawal of the rid's inbox batches. The
+/// tombstones are written one at a time alongside the settle, which leaves at
+/// once; only the unsettled `EIO` and the inbox route wait for them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SettleWithdraw {
+    /// The batch whose tombstone is being written.
+    pub in_flight: constellation_store_s3::inbox::InboxKey,
+    /// `T_d` plus a settle window: a tombstone not acknowledged by then is
+    /// given up on (`settle_withdraw_gave_up`).
+    pub deadline: WaitMs,
+    /// `T0`, when the last tombstone was acknowledged. No unsettled `EIO`
+    /// before `T0` plus a settle window.
+    pub acked_at: Option<WaitMs>,
+    /// The retry of a failed tombstone, or else the timer at `deadline`.
+    pub retry: Option<crate::ids::TimerId>,
+    /// The settle's route reached the inbox (the epoch of the holder it
+    /// learned, and the holder) and waits for the last acknowledgement.
+    pub route_waiting: Option<(Epoch, NodeId)>,
+}
+
+impl SettleWithdraw {
+    pub(crate) fn unacked(&self) -> bool {
+        self.acked_at.is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,15 +93,7 @@ pub(crate) enum Phase {
     /// is about to be forwarded to `holder`; the batch is being deleted
     /// first, so no later takeover drain can execute it a second time
     /// (a P2P refusal leaves no `completed` witness to dedup against).
-    ///
-    /// Late-landing F1: a settle begins the same way (`AfterWithdraw::Settle`):
-    /// every batch of the rid is a tombstone, acknowledged, before the settle
-    /// leaves, and its window starts at the last acknowledgement.
-    InboxWithdraw {
-        holder: NodeId,
-        gen: u64,
-        then: AfterWithdraw,
-    },
+    InboxWithdraw { holder: NodeId, gen: u64 },
     /// Waiting for the acquire job to give this node the lease.
     WaitingLease,
     /// The acquire job answered busy; retrying after a backoff.
@@ -247,6 +256,9 @@ pub(crate) struct ClientOp {
     /// be written within a window. The settle goes on without the inbox
     /// route, and an unsettled end is counted (`settle_withdraw_failed`).
     pub settle_withdraw_failed: bool,
+    /// Late-landing F1: the tombstones of the rid's inbox batches a settle
+    /// writes alongside itself (`SettleWithdraw`).
+    pub withdraw: Option<SettleWithdraw>,
 }
 
 /// Chunk metered-own-rows: an observed position's pending upload
@@ -762,6 +774,7 @@ impl Core {
                 designation_held: false,
                 accepted_by_delegate: false,
                 settle_withdraw_failed: false,
+                withdraw: None,
                 tag,
             },
         );
@@ -1485,6 +1498,22 @@ impl Core {
                         c.designation_held = true;
                     }
                 } else if self.cfg.inbox
+                    && self
+                        .clients
+                        .get(&rid)
+                        .is_some_and(|c| c.withdraw.is_some_and(|w| w.unacked()))
+                {
+                    // A settle's inbox route waits for its tombstones (U1):
+                    // the last acknowledgement sends it on
+                    // (`on_settle_withdrawn`), or the first window's end
+                    // takes the inbox away (`settle_withdraw_gave_up`).
+                    if let Some(c) = self.clients.get_mut(&rid) {
+                        c.phase = Phase::Backoff;
+                        if let Some(w) = c.withdraw.as_mut() {
+                            w.route_waiting = Some((epoch, holder));
+                        }
+                    }
+                } else if self.cfg.inbox
                     && !self
                         .clients
                         .get(&rid)
@@ -1527,7 +1556,10 @@ impl Core {
         // by from here on, whether the send leaves now or after the batch
         // withdrawal below; the value travels with it.
         c.touched_gen = c.touched_gen.max(routed_gen);
-        if let Some(&key) = c.inbox_keys.first() {
+        // (A settle's tombstones are written alongside it, by its own
+        // withdrawal: it executes nothing, so the batch needs none first.)
+        let settle_withdrawing = c.settle && c.withdraw.is_some();
+        if let Some(&key) = c.inbox_keys.first().filter(|_| !settle_withdrawing) {
             // Withdraw the durable batches (one at a time, every one the
             // rid was submitted in) before the holder can see the op
             // twice: a drain that read one later would find no
@@ -1543,7 +1575,6 @@ impl Core {
             c.phase = Phase::InboxWithdraw {
                 holder,
                 gen: routed_gen,
-                then: AfterWithdraw::Forward,
             };
             self.cancel_timer(timer, out);
             self.inbox.pending.remove(&rid);
@@ -2209,16 +2240,6 @@ impl Core {
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
-        if matches!(
-            c.phase,
-            Phase::InboxWithdraw {
-                then: AfterWithdraw::Settle,
-                ..
-            }
-        ) {
-            self.settle_withdraw_again(now, rid, out);
-            return;
-        }
         if c.phase != Phase::Backoff {
             return;
         }
@@ -4035,20 +4056,26 @@ impl Core {
         let Some(c) = self.clients.get(&rid) else {
             return;
         };
-        // Late-landing F1: the settle's tombstones could not all be written
-        // within the first window. It goes on without the inbox route.
-        if c.settle
-            && matches!(
-                c.phase,
-                Phase::InboxWithdraw {
-                    then: AfterWithdraw::Settle,
-                    ..
-                }
-            )
-        {
-            self.settle_withdraw_gave_up(now, rid, replica, out);
-            return;
+        // Late-landing F1: the settle's tombstones are written alongside it.
+        // Not all acknowledged by `T_d` plus a window: the settle goes on
+        // without the inbox route (`settle_withdraw_gave_up`). Until then, and
+        // until a window after the last acknowledgement, no unsettled `EIO`:
+        // the deadline moves.
+        if let Some(w) = c.withdraw.filter(|_| c.settle) {
+            let window = self.dl_t().settle_window;
+            if w.unacked() && now.wait >= w.deadline {
+                self.settle_withdraw_gave_up(now, rid, replica, out);
+                return;
+            }
+            let allowed = w.acked_at.map_or(w.deadline, |t| t.plus(window));
+            if now.wait < allowed && self.extend_settle_deadline(rid, allowed, Some(now.wait), out)
+            {
+                return;
+            }
         }
+        let Some(c) = self.clients.get(&rid) else {
+            return;
+        };
         let second = c.settle;
         let (recalling, settle_cap) = (c.phase == Phase::Recalling, c.settle_cap);
         // Plan 46 M1.2 step 13 (review): a settle of this node's own op, parked
@@ -4248,20 +4275,22 @@ impl Core {
             .is_some_and(|c| !c.inbox_keys.is_empty())
         {
             self.settle_withdraw_first(now, rid, out);
-            return;
         }
         self.settle_route(now, rid, replica, out);
     }
 
-    /// Late-landing F1: a settle of an op with durable inbox batches begins by
-    /// writing a tombstone over each, one at a time. Whatever read a batch
-    /// before its tombstone runs only inside the executor's freshness bound
-    /// (`Deadlines::inbox_read_fresh`, S1), so by the time the client may
-    /// hear an unsettled `EIO`, a full window after the last acknowledgement,
-    /// no drain executes it. The settle's window and cap start at that
-    /// acknowledgement (`settle_withdrawn_next`); until then `settle_until`
-    /// is the time by which a failing tombstone gives up.
+    /// Late-landing F1: a settle of an op with durable inbox batches writes a
+    /// tombstone over each, one at a time, alongside itself. Whatever read a
+    /// batch before its tombstone runs only inside the executor's freshness
+    /// bound (`Deadlines::inbox_read_fresh`, S1), so an unsettled `EIO` waits
+    /// for a window after the last acknowledgement: by then no drain executes
+    /// the batch. A settled answer needs no tombstone (the refusal is a
+    /// committed row the batch's drain dedups on), so the settle itself leaves
+    /// at once; only the inbox route, which puts a new batch beside the old
+    /// ones, waits for the acknowledgements. Until `T_d` plus a window a
+    /// failing tombstone is tried again.
     fn settle_withdraw_first(&mut self, now: Now, rid: Rid, out: &mut Vec<Action>) {
+        let window = self.dl_t().settle_window;
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
@@ -4271,23 +4300,43 @@ impl Core {
         // A withdrawal already under way (the forward's) has its tombstone
         // in flight: the settle takes it over without writing it twice.
         let under_way = matches!(c.phase, Phase::InboxWithdraw { .. });
-        if let Phase::InboxWithdraw { then, .. } = &mut c.phase {
-            *then = AfterWithdraw::Settle;
-        } else {
-            c.phase = Phase::InboxWithdraw {
-                holder: 0,
-                gen: 0,
-                then: AfterWithdraw::Settle,
-            };
+        if under_way {
+            c.phase = Phase::Backoff;
         }
         let several = c.inbox_keys.len() > 1;
+        let deadline = now.wait.plus(window);
+        c.withdraw = Some(SettleWithdraw {
+            in_flight: key,
+            deadline,
+            acked_at: None,
+            retry: None,
+            route_waiting: None,
+        });
         self.inbox.pending.remove(&rid);
         self.stats.settles_withdrawn_first += 1;
         if several {
             self.stats.settle_multi_batch_withdrawals += 1;
         }
+        self.arm_withdraw_timer(rid, deadline, out);
         if !under_way {
             self.issue_tombstone(now, rid, key, out);
+        }
+    }
+
+    /// (Re)arm the settle withdrawal's timer: a failed tombstone's retry, or
+    /// the end of its first window.
+    fn arm_withdraw_timer(&mut self, rid: Rid, at: WaitMs, out: &mut Vec<Action>) {
+        let old = self
+            .clients
+            .get_mut(&rid)
+            .and_then(|c| c.withdraw.as_mut())
+            .and_then(|w| w.retry.take());
+        if let Some(t) = old {
+            self.cancel_timer(t, out);
+        }
+        let t = self.set_timer_wait(at, Timer::WithdrawRetry(rid), out);
+        if let Some(w) = self.clients.get_mut(&rid).and_then(|c| c.withdraw.as_mut()) {
+            w.retry = Some(t);
         }
     }
 
@@ -4311,78 +4360,114 @@ impl Core {
         );
     }
 
-    /// A tombstone of a settle's withdrawal was acknowledged: the next batch's,
-    /// or, with the last, the settle's start `T_s`: its window and cap count
-    /// from now (never earlier than the first deadline gave them), and it
-    /// goes the ordinary route.
-    pub(crate) fn settle_withdrawn_next(
+    /// A tombstone of a settle's withdrawal was answered. Acknowledged: the
+    /// next batch's, or, with the last, `T0`: the unsettled `EIO` is not
+    /// given before a window after it (not capped by `settle_cap`: the wait is
+    /// for safety, not liveness), and a settle that waited for the inbox
+    /// route goes on. Failed: tried again a moment later, until `T_d` plus a
+    /// window.
+    pub(crate) fn on_settle_withdrawn(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        key: constellation_store_s3::inbox::InboxKey,
+        result: S3Result,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(c) = self.clients.get_mut(&rid) else {
+            return;
+        };
+        let Some(w) = c.withdraw.as_mut() else {
+            return;
+        };
+        // An answer for a key no longer in flight is a duplicate of one
+        // already handled (a tombstone written twice): it moves nothing.
+        if w.in_flight != key || !w.unacked() || !c.inbox_keys.contains(&key) {
+            return;
+        }
+        let deadline = w.deadline;
+        if !matches!(result, S3Result::InboxTombstone(Ok(()))) {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                ?rid,
+                "inbox: withdrawing the batch for a settle failed; retried"
+            );
+            if now.wait < deadline {
+                let at = now.wait.plus(self.cfg.recall_hold_ms.max(50)).min(deadline);
+                self.arm_withdraw_timer(rid, at, out);
+            }
+            return;
+        }
+        c.inbox_keys.retain(|k| *k != key);
+        self.stats.inbox_withdrawn_ops += 1;
+        self.inbox_forget_leftover(key);
+        self.inbox_resubmit_cobatched(now, key, replica, out);
+        let window = self.dl_t().settle_window;
+        let Some(c) = self.clients.get_mut(&rid) else {
+            return;
+        };
+        if let Some(&next) = c.inbox_keys.first() {
+            if let Some(w) = c.withdraw.as_mut() {
+                w.in_flight = next;
+            }
+            self.issue_tombstone(now, rid, next, out);
+            return;
+        }
+        let at = now.wait.plus(window);
+        let w = c.withdraw.as_mut().expect("present");
+        w.acked_at = Some(now.wait);
+        let waiting = w.route_waiting.take();
+        let timer = w.retry.take();
+        c.settle_cap = c.settle_cap.max(at);
+        if let Some(t) = timer {
+            self.cancel_timer(t, out);
+        }
+        self.extend_settle_deadline(rid, at, None, out);
+        // The route goes on from what it had learned, without reading the
+        // lease again.
+        if let Some((epoch, holder)) = waiting {
+            if self.cfg.forwarding && self.reaches(now, holder) {
+                self.send_forward(now, rid, holder, 0, replica, out);
+            } else {
+                self.inbox_enqueue(now, rid, epoch, replica, out);
+            }
+        }
+    }
+
+    /// The withdrawal's timer: the retry of a failed tombstone, or the end of
+    /// the first window.
+    pub(crate) fn on_withdraw_timer(
         &mut self,
         now: Now,
         rid: Rid,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let Some(c) = self.clients.get(&rid) else {
-            return;
-        };
-        if let Some(&key) = c.inbox_keys.first() {
-            self.issue_tombstone(now, rid, key, out);
-            return;
-        }
-        let (window, span) = (self.dl_t().settle_window, self.dl_t().settle_cap_span);
-        let until = c.settle_until.max(now.wait.plus(window));
-        let cap = until.max(now.wait.plus(span));
-        let old = c.deadline;
-        let timer = c.timer;
-        self.cancel_timer(old, out);
-        if let Some(t) = timer {
-            self.cancel_timer(t, out);
-        }
-        let deadline = self.set_timer_wait(until, Timer::ClientDeadline(rid), out);
-        let c = self.clients.get_mut(&rid).expect("present");
-        c.deadline = deadline;
-        c.timer = None;
-        c.settle_until = until;
-        c.settle_cap = cap;
-        c.phase = Phase::Backoff;
-        self.settle_route(now, rid, replica, out);
-    }
-
-    /// A tombstone of a settle's withdrawal failed: tried again a moment
-    /// later, until the first window is spent.
-    pub(crate) fn settle_withdraw_retry(&mut self, now: Now, rid: Rid, out: &mut Vec<Action>) {
-        let Some(c) = self.clients.get(&rid) else {
-            return;
-        };
-        if now.wait >= c.settle_until {
-            // (The deadline fires and gives up.)
-            return;
-        }
-        let at = now
-            .wait
-            .plus(self.cfg.recall_hold_ms.max(50))
-            .min(c.settle_until);
-        let t = self.set_timer_wait(at, Timer::ForwardBackoff(rid), out);
-        if let Some(c) = self.clients.get_mut(&rid) {
-            c.timer = Some(t);
-        }
-    }
-
-    /// The retry timer of a failed withdrawal tombstone.
-    pub(crate) fn settle_withdraw_again(&mut self, now: Now, rid: Rid, out: &mut Vec<Action>) {
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
-        c.timer = None;
-        if let Some(&key) = c.inbox_keys.first() {
-            self.issue_tombstone(now, rid, key, out);
+        let Some(w) = c.withdraw.as_mut() else {
+            return;
+        };
+        w.retry = None;
+        if !w.unacked() {
+            return;
         }
+        let (key, deadline) = (w.in_flight, w.deadline);
+        if now.wait >= deadline {
+            self.settle_withdraw_gave_up(now, rid, replica, out);
+            return;
+        }
+        self.arm_withdraw_timer(rid, deadline, out);
+        self.issue_tombstone(now, rid, key, out);
     }
 
     /// The first window ended with a tombstone still unwritten (S3 is down
-    /// or throttled for this node). The settle starts all the same, by P2P
-    /// and the lease path and never the inbox, and its unsettled end is
-    /// counted (`settle_withdraw_failed`): the batch may still be drained.
+    /// or throttled for this node). The settle goes on, by P2P and the lease
+    /// path and never the inbox, with a window of its own from now, and its
+    /// unsettled end is counted (`settle_withdraw_failed`): the batch may
+    /// still be drained. The tombstones go on in the background.
     fn settle_withdraw_gave_up(
         &mut self,
         now: Now,
@@ -4391,28 +4476,29 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let (window, span) = (self.dl_t().settle_window, self.dl_t().settle_cap_span);
-        let Some(c) = self.clients.get(&rid) else {
+        let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
-        let (old, timer) = (c.deadline, c.timer);
-        self.cancel_timer(old, out);
-        if let Some(t) = timer {
-            self.cancel_timer(t, out);
-        }
+        let Some(w) = c.withdraw.take() else {
+            return;
+        };
+        let old = c.deadline;
         let until = now.wait.plus(window);
-        let deadline = self.set_timer_wait(until, Timer::ClientDeadline(rid), out);
-        let c = self.clients.get_mut(&rid).expect("present");
-        c.deadline = deadline;
-        c.timer = None;
         c.settle_until = until;
-        c.settle_cap = until.max(now.wait.plus(span));
+        c.settle_cap = c.settle_cap.max(until.max(now.wait.plus(span)));
         c.settle_withdraw_failed = true;
         let keys = std::mem::take(&mut c.inbox_keys);
+        if let Some(t) = w.retry {
+            self.cancel_timer(t, out);
+        }
+        self.cancel_timer(old, out);
+        let deadline = self.set_timer_wait(until, Timer::ClientDeadline(rid), out);
+        self.clients.get_mut(&rid).expect("present").deadline = deadline;
         self.bg_tombstones_add(now, keys, out);
-        let c = self.clients.get_mut(&rid).expect("present");
-        c.phase = Phase::Backoff;
         self.stats.settle_withdraw_failed += 1;
-        self.settle_route(now, rid, replica, out);
+        if w.route_waiting.is_some() {
+            self.settle_route(now, rid, replica, out);
+        }
     }
 
     /// Move a settle's second deadline to `at` (the wait clock): cancels the
@@ -4826,9 +4912,25 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // Late-landing F1: no unsettled `EIO` before the settle's tombstones
+        // have stood a window (`settle_withdraw_first`); the deadline moves
+        // there, and answers then.
+        if let Some(c) = self.clients.get(&rid).filter(|c| c.settle) {
+            if let Some(w) = c.withdraw {
+                let window = self.dl_t().settle_window;
+                let allowed = w.acked_at.map_or(w.deadline, |t| t.plus(window));
+                if now.wait < allowed {
+                    self.extend_settle_deadline(rid, allowed, None, out);
+                    return;
+                }
+            }
+        }
         let Some(c) = self.clients.remove(&rid) else {
             return;
         };
+        if let Some(t) = c.withdraw.and_then(|w| w.retry) {
+            self.cancel_timer(t, out);
+        }
         if c.settle_withdraw_failed && self.track_unsettled_designation {
             self.withdraw_failed_rids.insert(rid);
             while self.withdraw_failed_rids.len() > MAX_IN_DOUBT_RIDS {
@@ -5025,6 +5127,9 @@ impl Core {
         self.log_if_slow(now, rid, &c, &format!("{outcome:?}"), replica);
         self.cancel_timer(c.deadline, out);
         if let Some(t) = c.timer {
+            self.cancel_timer(t, out);
+        }
+        if let Some(t) = c.withdraw.and_then(|w| w.retry) {
             self.cancel_timer(t, out);
         }
         if let Some(t) = c.own_record_timer {
