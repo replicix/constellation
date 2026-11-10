@@ -10175,6 +10175,11 @@ impl Core {
         if g.kind() == DelegKind::Sticky {
             if abandoned.is_some() {
                 self.stats.deleg_sticky_ended_abandoned += 1;
+            } else if g.node == self.cfg.node_id {
+                // The holder itself took the lease (`delegation_sync`): it
+                // executes the subtree as the root, which is its own end of
+                // the grant, a holder's.
+                self.stats.deleg_sticky_ended_released += 1;
             } else if drained {
                 match g.recall_cause {
                     None => self.stats.deleg_sticky_ended_released += 1,

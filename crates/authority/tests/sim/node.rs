@@ -266,6 +266,9 @@ pub struct Shared {
     /// F1 (`DelegateWriteHold`): cut this delegate from `(.0)` (the root)
     /// for `(.1)` ms once its held write is pinned.
     hold_partition: Mutex<Option<(NodeId, u64)>>,
+    /// ADR-47 (`FaultKind::CutOnAnswer`): cut this node from `(.0)` for
+    /// `(.1)` ms as it sends that node the answer of an executed forward.
+    cut_on_answer: Mutex<Option<(NodeId, u64, HashSet<Rid>)>>,
     /// F1: every held write that landed (executed), `(rid, simulated ms)`,
     /// for the ghost's check that none landed inside another node's
     /// critical section (`LockGhost::check_landings`).
@@ -601,6 +604,7 @@ impl NodeHandle {
             fast_answered: AtomicU64::new(0),
             held_ctl: Mutex::new(None),
             hold_partition: Mutex::new(None),
+            cut_on_answer: Mutex::new(None),
             landed: Mutex::new(Vec::new()),
             busy_since: AtomicI64::new(0),
             beat_due: AtomicI64::new(0),
@@ -1031,6 +1035,11 @@ impl NodeHandle {
     /// F1 (`WriterLockHold`): see `Shared::hold_next`.
     pub fn hold_next_tagged_write(&self, core_ms: u64, write_ms: u64) {
         *self.shared.hold_next.lock().unwrap() = Some((core_ms, write_ms));
+    }
+
+    /// ADR-47 (`FaultKind::CutOnAnswer`): see `Shared::cut_on_answer`.
+    pub fn cut_on_answer(&self, peer: NodeId, for_ms: u64) {
+        *self.shared.cut_on_answer.lock().unwrap() = Some((peer, for_ms, HashSet::new()));
     }
 
     /// F1 (`DelegateWriteHold`): the next tagged write this delegate
@@ -2229,7 +2238,58 @@ impl Driver {
                 _ => None,
             };
             let is_stream = EventKind::DelegateStream.matches(&event);
+            let forward_of = match &event {
+                Event::Peer {
+                    msg:
+                        PeerMsg::MutateRequest {
+                            rid, routed_gen, ..
+                        },
+                    ..
+                } => Some((*rid, *routed_gen)),
+                _ => None,
+            };
             let actions = self.core.handle(now, event, &*self.meta);
+            // ADR-47 (`CutOnAnswer`): the answer of an op that ran from a
+            // stale route goes out after the cut, so it is lost; the op ran.
+            // The op is a forward of the peer routed by no generation that
+            // the node ran (no fence), or a resend routed by a generation
+            // after the node fenced the forward.
+            if let Some((rid, routed)) = forward_of {
+                let mut armed = self.shared.cut_on_answer.lock().unwrap();
+                if let Some((peer, ms, fenced)) = armed.as_mut() {
+                    let (peer, ms) = (*peer, *ms);
+                    let to_peer = |want: &dyn Fn(&MutateOutcome) -> bool| {
+                        actions.iter().any(|a| {
+                            matches!(
+                                a,
+                                Action::Send {
+                                    to,
+                                    msg: PeerMsg::MutateReply { outcome, .. },
+                                } if *to == peer && want(outcome)
+                            )
+                        })
+                    };
+                    let accepted = |o: &MutateOutcome| matches!(o, MutateOutcome::Accepted { .. });
+                    if routed == 0 && to_peer(&|o| matches!(o, MutateOutcome::Fenced { .. })) {
+                        fenced.insert(rid);
+                    }
+                    let cut = if routed == 0 {
+                        to_peer(&accepted)
+                    } else {
+                        fenced.contains(&rid) && to_peer(&accepted)
+                    };
+                    if cut {
+                        *armed = None;
+                        let me = self.id;
+                        self.bus.set_partition(me, peer, true);
+                        let bus = self.bus.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                            bus.set_partition(me, peer, false);
+                        });
+                    }
+                }
+            }
             let drained = self.core.take_drained_rows();
             self.oracles.note_fence_audit(
                 self.id,
