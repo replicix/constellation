@@ -2446,6 +2446,54 @@ fn an_epoch_flush_holds_for_a_fast_or_foreign_takeovers_gate_only() {
     }
 }
 
+/// The handoff pause closes acquisitions too: a node that gave its lease up
+/// does not claim it back inside the pause, journal or not (that is what the
+/// pause is for: the successor needs its S3 round trips to claim it, and a
+/// claim by the old holder in between is a flip and a flop). Shipping under a
+/// lease the node still holds is not paused (`LeaseState::ship_epoch`).
+#[test]
+fn a_handoff_pause_holds_off_an_acquisition_and_then_lets_it_through() {
+    let mut h = Harness::new(1);
+    h.core.begin_handoff_pause(h.clk());
+    let mut out = Vec::new();
+    h.core.enqueue_job(
+        h.clk(),
+        super::jobs::JobReq::Acquire {
+            reason: "test",
+            ask_handoff: false,
+        },
+        &h.meta,
+        &mut out,
+    );
+    assert!(
+        s3_ops(&out).is_empty(),
+        "no claim inside the pause: {out:?}"
+    );
+    assert!(h.core.job().is_none(), "the acquire job let go of the slot");
+    h.advance(h.core.config().handoff_pause_ms + 1);
+    let mut out = Vec::new();
+    h.core.enqueue_job(
+        h.clk(),
+        super::jobs::JobReq::Acquire {
+            reason: "test",
+            ask_handoff: false,
+        },
+        &h.meta,
+        &mut out,
+    );
+    let (get, _) = s3_ops(&out)[0];
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(None)),
+    });
+    assert!(
+        s3_ops(&out)
+            .iter()
+            .any(|(_, op)| matches!(op, S3Op::LeaseCreate { .. })),
+        "the claim goes once the pause is over: {out:?}"
+    );
+}
+
 /// Plan 43 C7-H2 (review S3): a peer's handoff request inside the takeover
 /// floor is declined, with the inbox off too (the gate waits out the read
 /// quarantine only with the inbox on, and not the lock grace at all). The

@@ -3150,7 +3150,9 @@ impl Core {
     /// whose own writes retried acquisition before that took the lease
     /// straight back through S3 at slow S3 (a flip and a flop, several
     /// seconds of stalled writes on both nodes). So the pause is at least
-    /// `handoff_pause_ms` and eight observed S3 round trips.
+    /// `handoff_pause_ms` and eight observed S3 round trips. It closes
+    /// acquisitions as well (a `ship-pending-journal` one included, which
+    /// waits the pause out); shipping under a lease still held goes on.
     pub(crate) fn begin_handoff_pause(&mut self, now: Now) {
         let ms = self
             .cfg
@@ -3230,6 +3232,11 @@ impl Core {
             self.finish_acquire(now, false, replica, out);
             return;
         }
+        // (The pause holds off the `ship-pending-journal` acquisition too,
+        // by design: a node that gave the lease up claiming it back inside
+        // the pause is the flip-flop the pause prevents. The journal waits
+        // at most `pause_until`; shipping under a lease still held is not
+        // paused.)
         if self.lease.is_paused_for_handoff(now) {
             self.finish_acquire(now, false, replica, out);
             return;
