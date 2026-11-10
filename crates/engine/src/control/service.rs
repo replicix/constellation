@@ -392,6 +392,16 @@ impl EngineControl {
                     voided_ended: s.voided_ended,
                 }
             },
+            roster: {
+                let r = &core.roster;
+                api::RosterStatus {
+                    seq: r.seq,
+                    complete: r.complete,
+                    write_eligible: r.write_eligible.clone(),
+                    heard: r.heard.clone(),
+                    singleton: r.singleton,
+                }
+            },
             ack: {
                 let a = &core.ack;
                 let s = self.meta.session().stats();

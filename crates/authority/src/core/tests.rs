@@ -62223,8 +62223,14 @@ mod m11_step5 {
         h.core.roster.make_singleton_for_test(1);
         assert!(h.core.dl.gens[&gen].node != 1 && !h.core.dl.gens[&gen].ended);
         assert!(!h.core.singleton_now(), "a live generation of node 3");
+        let view = h.core.roster_view();
+        assert!(!view.singleton && view.complete, "{view:?}");
         h.core.dl.gens.get_mut(&gen).unwrap().ended = true;
         assert!(h.core.singleton_now());
+        let view = h.core.roster_view();
+        assert!(view.singleton, "{view:?}");
+        assert_eq!(view.write_eligible, [1]);
+        assert!(view.heard.is_empty());
     }
 
     /// ADR-50 S10-I5: the flip is a configuration change in the event that

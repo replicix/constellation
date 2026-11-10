@@ -623,6 +623,9 @@ pub struct StatusReport {
     pub locks: LockStatus,
     /// Plan 30 §M9: acknowledgement policy, backups, seals.
     pub ack: AckStatus,
+    /// ADR-50: what this node's roster object knows of the other nodes, and
+    /// why it is or is not a singleton.
+    pub roster: RosterStatus,
     /// Cooperative cache (phase 5, DESIGN.md §7).
     pub coop: CoopStatus,
     /// Adaptive sequential and directory readahead.
@@ -2335,6 +2338,24 @@ pub struct SealStatus {
     pub attentive_ms: i64,
     pub window_ms: i64,
     pub at_unix_ms: i64,
+}
+
+/// ADR-50: the node's roster object.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct RosterStatus {
+    /// The number of the registry read installed (the last complete one);
+    /// 0 before the first.
+    pub seq: u64,
+    /// A complete read is installed and no incomplete one is newer: who the
+    /// peers are is known.
+    pub complete: bool,
+    /// The write-eligible nodes known (this node included when registered).
+    pub write_eligible: Vec<u64>,
+    /// Nodes that messaged this node and the installed read does not list.
+    pub heard: Vec<u64>,
+    /// No write-eligible node but this one is known, and nothing contradicts
+    /// it: the node answers its own clients from its disk alone.
+    pub singleton: bool,
 }
 
 /// Plan 30 §M9: the acknowledgement policy, backups and seals.

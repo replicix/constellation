@@ -86,6 +86,7 @@ pub use deleg_windows::{
     decide, DelegWindows, Refusal, RootLease, Window, WindowStats, WindowsClock,
 };
 pub use delegate::{DelegKind, DelegRenewCert, DelegView, RecallPhase};
+pub use roster::RosterView;
 pub use seal_tail::WaitingForGroup;
 
 /// Plan 30 §M11 phase 2b: read delegations a *delegate* grants carry
