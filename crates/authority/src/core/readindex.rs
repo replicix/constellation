@@ -2111,9 +2111,8 @@ impl Core {
             .filter(|(id, p)| {
                 let ready = p.waiting.is_empty()
                     && p.quarantine.is_none_or(|q| q <= now.wait)
-                    && p.durable.is_none_or(|j| {
-                        self.park_durable(j, p.what.to_remote(self.cfg.node_id), shipped)
-                    })
+                    && p.durable
+                        .is_none_or(|j| self.park_released(&p.what, j, shipped, replica))
                     && p.deps.as_ref().is_none_or(|d| replica.reaches_streams(d))
                     && (!p.queue_gated
                         || match &p.what {
