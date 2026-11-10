@@ -860,7 +860,7 @@ impl Core {
         // (`Core::send_answer`) behind it.
         let durable = durable.or_else(|| {
             super::backup::is_answer(&outcome)
-                .then(|| self.emission_hold_of(rid, replica))
+                .then(|| self.unsettled_hold_of(rid, replica))
                 .flatten()
         });
         if wait.is_some() || durable.is_some() {

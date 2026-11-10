@@ -1861,6 +1861,16 @@ pub struct Stats {
     /// the archive. Expected zero where every path decides it first
     /// (`Core::answer_need_of`, `Core::completed_row_settled`).
     pub held_at_emission_root_row: u64,
+    /// ADR-52: singleton answers the emission gate held because a fresh
+    /// clock read found the lease unusable (a stalled step), and the same
+    /// by [`backup::EmissionPath`]. They wait for the archive or a usable
+    /// lease, and are in doubt once the node is deposed.
+    pub answers_held_stale_lease: u64,
+    pub held_stale_lease_finish: u64,
+    pub held_stale_lease_deleg_exec: u64,
+    pub held_stale_lease_holder_reply: u64,
+    pub held_stale_lease_designation: u64,
+    pub held_stale_lease_release: u64,
     /// Plan 43 C1-3: the tail fetch. `SealTail`s answered by this node as a
     /// holder (it sealed its own epoch), as a backup, and refused;
     /// attempts of a claim to fetch, fetches completed (of those, of a

@@ -10,7 +10,7 @@
 //! and gets the same retries, but its outcome goes to the replay drain,
 //! never to a client.
 
-use super::backup::is_answer;
+use super::backup::{is_answer, EmissionHold, EmissionPath};
 use super::holder::{Fence, TOUCHED_UNKNOWN};
 use super::{ack_counter, Core, S3For, Timer};
 use crate::action::{Action, AnswerSource, ClientReply, S3Op};
@@ -5269,21 +5269,28 @@ impl Core {
                     matches!(c.origin, Origin::Client)
                         || matches!(c.origin, Origin::Replay { .. }) && c.also_client,
                 ) {
-                    if let Some(seq) = self.emission_hold_of(rid, replica) {
-                        self.note_held_at_emission(
-                            super::backup::EmissionPath::Finish,
-                            rid,
-                            replica,
-                        );
-                        self.park_finish(
-                            now,
-                            rid,
-                            (Default::default(), None),
-                            Some(seq),
-                            outcome,
-                            class,
-                        );
-                        return;
+                    match self.emission_hold_of(rid, class, replica) {
+                        // ADR-52: the lease is no longer usable on a fresh
+                        // reading: the singleton's answer waits for the
+                        // archive or a usable lease, in doubt if deposed.
+                        Some(EmissionHold::StaleLease(seq)) => {
+                            self.note_held_stale_lease(EmissionPath::Finish, rid);
+                            self.park_stale_lease(now, rid, seq, outcome, class, replica, out);
+                            return;
+                        }
+                        Some(EmissionHold::Unsettled(seq)) => {
+                            self.note_held_at_emission(EmissionPath::Finish, rid, replica);
+                            self.park_finish(
+                                now,
+                                rid,
+                                (Default::default(), None),
+                                Some(seq),
+                                outcome,
+                                class,
+                            );
+                            return;
+                        }
+                        None => {}
                     }
                 }
             }

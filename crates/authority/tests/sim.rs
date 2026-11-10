@@ -8928,6 +8928,12 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "held_at_emission_designation",
             "held_at_emission_release",
             "held_at_emission_root_row",
+            "answers_held_stale_lease",
+            "held_stale_lease_finish",
+            "held_stale_lease_deleg_exec",
+            "held_stale_lease_holder_reply",
+            "held_stale_lease_designation",
+            "held_stale_lease_release",
             "journal_class_from_session",
             "seal_tail_holder",
             "seal_tail_backup",
@@ -9085,6 +9091,10 @@ struct OracleTotals {
     held_emission: [u64; 6],
     held_emission_seeds: Vec<u64>,
     held_root_row: u64,
+    /// ADR-52: singleton answers held for a lease a fresh clock read found
+    /// unusable, in total and by path (finish, deleg_exec, holder_reply,
+    /// designation, release).
+    held_stale_lease: [u64; 6],
     /// The stream counters: delegated acknowledgements released (count,
     /// total wait ms), the install waits and the lost-dependency counters
     /// (installs put off, generations stopped, rows the root refused,
@@ -9219,6 +9229,12 @@ impl OracleTotals {
             self.held_emission[4] += st.held_at_emission_designation;
             self.held_emission[5] += st.held_at_emission_release;
             self.held_root_row += st.held_at_emission_root_row;
+            self.held_stale_lease[0] += st.answers_held_stale_lease;
+            self.held_stale_lease[1] += st.held_stale_lease_finish;
+            self.held_stale_lease[2] += st.held_stale_lease_deleg_exec;
+            self.held_stale_lease[3] += st.held_stale_lease_holder_reply;
+            self.held_stale_lease[4] += st.held_stale_lease_designation;
+            self.held_stale_lease[5] += st.held_stale_lease_release;
             self.tail[0] += st.tail_fetch_attempts;
             self.tail[1] += st.tail_fetches;
             self.tail[2] += st.inherited_tail_fetches;
@@ -9680,6 +9696,17 @@ impl OracleTotals {
             self.held_emission[5],
             self.held_root_row,
             self.held_emission_seeds
+        );
+        eprintln!(
+            "SWEEP-HELD-STALE-LEASE {label} seeds {}/{seeds}: singleton answers held for a stale lease {} \
+             (finish {}, deleg_exec {}, holder_reply {}, designation {}, release {})",
+            self.seeds,
+            self.held_stale_lease[0],
+            self.held_stale_lease[1],
+            self.held_stale_lease[2],
+            self.held_stale_lease[3],
+            self.held_stale_lease[4],
+            self.held_stale_lease[5],
         );
         eprintln!(
             "SWEEP-ROWVERSION-TOTALS {label} seeds {}/{seeds}: row-version-mismatch={} in {} seeds, \
