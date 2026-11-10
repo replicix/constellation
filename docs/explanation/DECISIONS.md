@@ -3280,7 +3280,11 @@ See: `crates/meta/src/delegation.rs` (`next_delegation_gen`, `GEN_MAX_EPOCH`,
 ## ADR-45: An op sent to a non-stealable holder is never refused for good
 
 **Status**: decided by the maintainer on 2026-11-09 (plan 46 M1.3 step 5, the
-`sticky-ttl` I1 finding). Amends invariant I4 ("an `EIO` told means the op did
+`sticky-ttl` I1 finding). Amended by
+[ADR-47](#adr-47-an-executor-runs-a-forward-only-under-the-generation-it-was-routed-by):
+the requester-side mechanism of the Decision and both known limits are
+replaced; the I4 exception, the renewal back-off and `accepted_by_delegate`
+stay. Amends invariant I4 ("an `EIO` told means the op did
 not and will not happen") for one case, and the refusal rules of
 [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
 for a non-stealable grant.
@@ -3495,4 +3499,142 @@ See: `crates/authority/src/core/delegate.rs` (`deleg_restart_start`,
 `on_deleg_restart_quarantine`, `deleg_read_index`),
 `crates/meta/src/readdeleg.rs` (`note_deleg_grant_horizon`,
 `load_deleg_grant_quarantine`, `settle_deleg_grant_horizon`, `void_restart`),
+[delegations](../reference/features/delegations.md).
+
+## ADR-47: An executor runs a forward only under the generation it was routed by
+
+**Status**: decided by the maintainer on 2026-11-10 (architecture review
+2026-11-10, design change 1; plan 46 M1.3). Supersedes the Decision of
+[ADR-45](#adr-45-an-op-sent-to-a-non-stealable-holder-is-never-refused-for-good)
+(the requester's marks) and both of its known I1 limits. ADR-45's exception to
+I4, its renewal back-off and its `accepted_by_delegate` accounting stay.
+Complements [ADR-46](#adr-46-a-restarted-holders-writes-wait-for-the-read-delegations-its-previous-process-granted):
+a forward that passes the fence and meets a quarantined generation is answered
+`Held` as ADR-46 says; a forward that fails the fence is answered `Fenced`
+first, so the requester does not retry a wrong route for a whole quarantine.
+
+**Context**: ADR-45 kept I1 (no rid both refused for good and executed) by
+making the requester remember where it had sent a rid and disbelieve a refusal
+of such a rid. That memory lives in the wrong place. It is bounded (the marks of
+in-doubt rids are evicted past 10,000 per node, and an evicted rid's refusal
+was final again), and it cannot cover a send the requester routed by a stale
+table: an idle requester whose route cache named Y, a former holder that B had
+since made a designee, sent a fresh rid to Y unmarked; Y ran it as a designee,
+the reply was lost, and B's later refusal under the designation was final
+(S7). Both limits are the same defect: the fact that decides whether a refusal
+may be final was not available to the nodes that refuse or execute.
+
+**Decision**: every forward carries two numbers, computed by the requester
+from its own send history only, and the executors decide.
+
+- `routed_gen`: the generation this send was routed by (0: to the lease
+  holder).
+- `touched_gen`: the highest non-zero generation the rid was ever sent under,
+  or offered to locally under, on its node (0: never). It is monotone over the
+  rid's life, raised before the message leaves, and kept across retries,
+  redirects, settles, `Fenced` resends and the inbox's withdraw-then-forward.
+  `TOUCHED_UNKNOWN` (`u64::MAX`) says it cannot be known.
+
+The rules:
+
+1. **Executor-side fence (`fence_forward`).** A node executes, or parks for
+   execution, a forward under one of its generations `g` only if
+   `routed_gen == g`; otherwise it answers `Fenced { gen: g }` and journals
+   nothing. The rule is uniform: every generation kind (placed included), and
+   the root's own generation: a root that is also a designee fences an
+   unrouted forward like any delegate. The fence runs first among the
+   delegate's gates, before the settle's park-drop and before ADR-46's
+   `Held`, and again at every re-entry of a parked forward. The requester
+   re-sends routed by the named generation (at most twice, then it decides the
+   route afresh); a `Fenced` answer is not an attempt.
+2. **The root refuses for good only an untouched rid.** For keys under a
+   non-stealable generation whose holder it cannot reach, the root answers
+   `EROFS` (unjournaled, final) only at `touched_gen == 0`. With
+   `touched_gen != 0`, which includes `TOUCHED_UNKNOWN`, it answers
+   `HolderUnreachable { gen }`: not final, nothing journaled; the requester
+   asks again, and the op ends by the holder's row (dedup), by the root's later
+   answer once the holder is reachable or its stream has ended, or, at the
+   op's deadlines, in doubt (the settle's unsettled `EIO`, ADR-45's I4
+   exception, now decided by the root from the request). The root's own client
+   ops under such a grant follow the same rule. `EXDEV` for a cross-subtree op
+   stays final: a non-stealable range shrinks only by the holder's own release
+   or an end that appended its rows (so a run rid has an outcome at the root),
+   or by the operator's abandon (operator I5, not I1).
+3. **Inbox-ever rids run only through the lease holder.** A rid that was ever
+   enqueued in the inbox is forwarded only to the lease holder, never by the
+   table to a delegate; it may still follow a root's redirect. This closes a
+   race that predates ADR-45: a drain that read the batch before the
+   requester's tombstone processed it afterwards and journaled `Refused`
+   while the designee ran the direct forward.
+4. **The drain halts.** The drain applies rule 2 to the op's own `touched_gen`
+   (carried in the batch, appended last) and to the redirects its root
+   recorded: an op under a non-stealable grant that is touched, or that the
+   root redirected to a designee after the drain's read was issued, halts the
+   batch (`Halt::Recall`, re-polled at the halted cadence, run when the
+   generation ends, with dedup). It never journals `Refused`. The takeover
+   gate's leftover batches are re-read from storage after the gate, not
+   processed from the bytes kept across it.
+5. **History that cannot be known counts as touched, and as inbox-ever.** A
+   replay (the queue's entry carries no send history), an op resubmitted
+   after the fast path left it in doubt, a rid of this node's earlier
+   incarnation, and a rid at or below the watermark of an evicted in-doubt
+   record carry `TOUCHED_UNKNOWN`; a rid of unknown send history reads as ever
+   in an inbox. An unknown can only hold (an `EROFS` becomes an unsettled
+   `EIO`); it can never make a refusal final. The watermark is kept only for
+   this node's own rids.
+
+**What this replaces in ADR-45**: the requester's marks (`sent_to_delegate`,
+`redirected_to_designee`), `named_holder` and the reply hold, the in-doubt
+designee set, and the knob `refuse_forwarded_designation_ops` are deleted;
+the requester no longer remembers routes to disbelieve answers, it carries what
+it sent. Of ADR-45's two known limits, S7 is closed by rule 1 (the stale
+route reaches a node that was not routed by its generation and is fenced) and
+the eviction limit by rule 5 (an evicted rid is resubmitted with an unknown
+history, which only holds). The ADR-45 consequences on I4 remain: an op under
+an unreachable non-stealable holder ends in doubt where it once ended `EROFS`.
+
+**Argument**: no rid is both executed under a non-stealable generation `g`
+and finally refused by a non-holder, unless the client resubmitted it after
+hearing the refusal. A designee journals the rid only from a forward routed by
+`g`, from its own client op (whose `touched_gen` was raised to `g` before
+admission), or from a replay or fast-path resubmission (unknown). Only the
+rid's own node sends it, and its `touched_gen` is a max over every send and
+every local offer, so a send under `g` is never followed by a final refusal.
+The sim oracle judges this directly: a refusal of an op a non-stealable
+generation ran is a violation (check 1), and `EXDEV` is judged too.
+
+**Known limit (until C9)**: a drain read issued before the requester's
+tombstone, while a deposed root (clock skew beyond the lease margin) still
+redirects the rid to the designee, can still refuse it. The follow-up (C9) has
+the reachable holder journal a refusal of an op it will not run in its own
+stream, after which neither the root nor the drain refuses an op under a
+non-stealable grant for good except `EXDEV`.
+
+**Consequences**: the cost is latency and errno, never safety. A forward
+whose requester's table lags costs one `Fenced` hop. Ops touched, replayed or
+of unknown history under an unreachable designation wait and then end in doubt
+where they ended `EROFS`; the share of replays that become conflict copies
+quickly may shift. A halted batch blocks that requester's later batches until
+the generation ends or is abandoned. Two `u64` per forward and one per inbox
+op. **Operator note**: the inbox op gained a field with the inbox version
+unchanged (no compatibility shim), so a batch written by the previous binary is
+undecodable; drain the inboxes (quiet the writers) before a rolling restart,
+or the ops in them end at their requesters' deadlines. Forwards on the wire
+carry two new fields without an ALPN bump; mixed-version clusters do not
+interoperate.
+
+**Rejected**: keeping the requester's marks and adding a persisted record of
+them (the memory would still be missing for a stale route, and for any node
+other than the requester); refusing at the executor by the requester's
+claimed history alone (the fence needs only the generation the executor owns).
+
+**May revert**: no. The negative controls `fence_accepts_unrouted` (a delegate
+runs an unrouted forward) and `root_ignores_touched` (the root and the drain
+refuse a touched op) restore the old behaviour; the sim's check 1 or
+`refused_and_completed` fails with each.
+
+See: `crates/authority/src/core/delegate.rs` (`delegate_try_execute`),
+`crates/authority/src/core/holder.rs` (`mutate_request`),
+`crates/authority/src/core/client.rs` (`send_forward`, `on_mutate_reply`),
+`crates/authority/src/core/inbox.rs`,
 [delegations](../reference/features/delegations.md).

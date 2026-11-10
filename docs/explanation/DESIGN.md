@@ -800,10 +800,18 @@ the lease TTL: an isolated requester) does the client hear the *unsettled*
 `EIO`, retryable by rid, which may still land (`client_unsettled_eio`); there
 is one more such case: an op sent to a non-stealable holder (a sticky grant or
 a designation) that did not answer is never refused for good by anyone else (the
-root's unjournaled `EROFS`/`EXDEV`, the inbox drain's refusal), since the holder
-may have run it and its row lands late, so its refusal is held and the client
-hears the unsettled `EIO` at the deadlines, counted apart
+root's unjournaled `EROFS`, the inbox drain's refusal), since the holder may
+have run it and its row lands late. The executors decide this, not the
+requester's memory: a forward carries the generation it was routed by and the
+highest generation the rid ever touched; a designee runs it only under the
+generation it was routed by (else `Fenced`), and the root refuses for good (`EROFS`)
+only a rid that touched none, otherwise it answers `HolderUnreachable` and
+holds; a cross-subtree `EXDEV` stays final. The drain halts such a batch
+instead of refusing it, and a rid of unknown history counts as touched. The
+client hears the unsettled `EIO` at the deadlines, counted apart
 (`unsettled_nonstealable_holder`;
+[ADR-47](DECISIONS.md#adr-47-an-executor-runs-a-forward-only-under-the-generation-it-was-routed-by),
+which replaced the requester's marks of
 [ADR-45](DECISIONS.md#adr-45-an-op-sent-to-a-non-stealable-holder-is-never-refused-for-good)). The
 settle window is the least: a root that holds the settle for the end of a
 generation it outwaits says so (`Held`'s `outwait_ms`) and the client waits for
@@ -1274,8 +1282,11 @@ without TTL expiry, never recalled by placement or by a cross-subtree op.
   holds every change under the path, so its offline writes are always
   linear continuations.
 - **Designee unreachable → others cannot write under the path.** An op
-  under a designation that reaches the root is refused with `EROFS`; a
-  cross-subtree op involving one with `EXDEV`. The designee keeps writing
+  under a designation that reaches the root is refused with `EROFS` if it
+  was never sent to the designee (a rid that may have run there is held and
+  ends in doubt instead,
+  [ADR-47](DECISIONS.md#adr-47-an-executor-runs-a-forward-only-under-the-generation-it-was-routed-by));
+  a cross-subtree op involving one with `EXDEV`. The designee keeps writing
   indefinitely, with or without S3 (its claim cannot be stolen), and its
   stream reaches the root when it reconnects.
 - **Designee gone for good → the operator ends the stream.** `constellation
