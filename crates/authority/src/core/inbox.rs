@@ -409,6 +409,7 @@ impl Core {
         };
         c.phase = Phase::InboxQueued { epoch };
         c.forwarded = true;
+        c.inbox_ever = true;
         // (A settle keeps the deadline it was given: the settle window's
         // end, plan 43 C2.)
         if c.inbox_since.is_none() && !c.settle {
@@ -500,8 +501,7 @@ impl Core {
                     deps: c.deps.to_postcard(),
                     lock_tag: c.tag.to_wire(now.honour),
                     settle: c.settle,
-                    // (Carried from the send history by a later chunk.)
-                    touched_gen: 0,
+                    touched_gen: c.touched_gen,
                 })
             })
             .collect();
@@ -1357,7 +1357,7 @@ impl Core {
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
-        let Phase::InboxWithdraw { holder } = c.phase else {
+        let Phase::InboxWithdraw { holder, gen } = c.phase else {
             return;
         };
         match result {
@@ -1369,7 +1369,7 @@ impl Core {
                 if let Some(key) = key {
                     self.inbox_resubmit_cobatched(now, key, replica, out);
                 }
-                self.send_forward(now, rid, holder, 0, replica, out);
+                self.send_forward(now, rid, holder, gen, replica, out);
             }
             other => {
                 tracing::debug!(

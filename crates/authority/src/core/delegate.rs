@@ -2753,6 +2753,14 @@ impl Core {
         let Some(gen) = self.my_generation_for(&keys, replica) else {
             return false;
         };
+        // ADR-47: this node's own op, offered to its generation, is touched
+        // by it from here on (parked or executed), before anything else can
+        // send the rid on.
+        if from == 0 {
+            if let Some(c) = self.clients.get_mut(&rid) {
+                c.touched_gen = c.touched_gen.max(gen);
+            }
+        }
         if settle {
             for d in self.dl.mine.values_mut() {
                 let before = d.parked.len();

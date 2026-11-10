@@ -67268,3 +67268,297 @@ mod route_fence_wire {
         );
     }
 }
+
+/// ADR-47, the requester's send history: `touched_gen` is the highest
+/// generation a rid was ever sent under or offered to locally, carried on
+/// every forward and across an in-doubt end.
+mod route_fence_carriage {
+    use super::*;
+
+    fn fence_of(out: &[Action]) -> Option<(NodeId, u64, u64)> {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::MutateRequest {
+                routed_gen,
+                touched_gen,
+                ..
+            } => Some((to, *routed_gen, *touched_gen)),
+            _ => None,
+        })
+    }
+
+    fn reply_from(from: NodeId, req: OpId, outcome: MutateOutcome, gen: u64) -> Event {
+        Event::Peer {
+            from,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome,
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+            },
+        }
+    }
+
+    fn req_of(out: &[Action]) -> OpId {
+        sends(out)
+            .into_iter()
+            .find_map(|(_, m)| match m {
+                PeerMsg::MutateRequest { req, .. } => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no forward: {out:?}"))
+    }
+
+    fn submit(h: &mut Harness, rid: Rid) -> Vec<Action> {
+        let op = h.create(&format!("f{}", rid.seq));
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        })
+    }
+
+    /// Node 1 with the root (node 2) cached.
+    fn requester() -> Harness {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        h
+    }
+
+    /// A rid that has not been sent anywhere under a generation is
+    /// untouched; the forward to the lease holder says so.
+    #[test]
+    fn a_forward_to_the_lease_holder_is_routed_by_no_generation() {
+        let mut h = requester();
+        let rid = h.rid(1);
+        let out = submit(&mut h, rid);
+        assert_eq!(fence_of(&out), Some((2, 0, 0)), "{out:?}");
+        assert_eq!(h.core.clients[&rid].touched_gen, 0);
+    }
+
+    /// A forward the table routes to a delegate is routed by its generation
+    /// and touches the rid with it.
+    #[test]
+    fn a_forward_by_the_table_is_routed_by_the_generation() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let dir = delegated_to_me(&h.meta, 3);
+        let rid = h.rid(1);
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        assert_eq!(fence_of(&out), Some((3, 7, 7)), "{out:?}");
+        assert_eq!(h.core.clients[&rid].touched_gen, 7);
+    }
+
+    /// The root's redirect to a designee (it names the designee's
+    /// generation) is followed routed by that generation, which touches the
+    /// rid; a lease holder's redirect (no generation) is routed by none.
+    #[test]
+    fn a_redirect_raises_touched_gen() {
+        for (gen, routed, touched) in [(7, 7, 7), (0, 0, 0)] {
+            let mut h = requester();
+            let rid = h.rid(1);
+            let out = submit(&mut h, rid);
+            assert_eq!(fence_of(&out), Some((2, 0, 0)));
+            let req = req_of(&out);
+            let out = h.step(reply_from(
+                2,
+                req,
+                MutateOutcome::NotHolder { holder: 3 },
+                gen,
+            ));
+            assert_eq!(fence_of(&out), Some((3, routed, touched)), "{out:?}");
+            assert_eq!(h.core.clients[&rid].touched_gen, touched);
+        }
+    }
+
+    /// A `Fenced` resend routes by the generation and so raises it.
+    #[test]
+    fn a_fenced_resend_raises_touched_gen() {
+        let mut h = requester();
+        let rid = h.rid(1);
+        let out = submit(&mut h, rid);
+        let out = h.step(reply_from(
+            2,
+            req_of(&out),
+            MutateOutcome::Fenced { gen: 9 },
+            9,
+        ));
+        assert_eq!(fence_of(&out), Some((2, 9, 9)), "{out:?}");
+    }
+
+    /// The touched generation outlives the attempt: a later send of the
+    /// rid, routed by no generation, still carries it.
+    #[test]
+    fn touched_gen_is_monotone_over_later_sends() {
+        let mut h = requester();
+        let rid = h.rid(1);
+        let out = submit(&mut h, rid);
+        let out = h.step(reply_from(
+            2,
+            req_of(&out),
+            MutateOutcome::NotHolder { holder: 3 },
+            7,
+        ));
+        // The designee says the holder is the root's after all.
+        let out = h.step(reply_from(
+            3,
+            req_of(&out),
+            MutateOutcome::NotHolder { holder: 2 },
+            0,
+        ));
+        assert_eq!(fence_of(&out), Some((2, 0, 7)), "{out:?}");
+    }
+
+    /// A delegate's own op offered to its generation is touched by it,
+    /// parked or executed.
+    #[test]
+    fn a_delegates_own_op_is_touched_by_its_generation() {
+        let (h, _dir, rid, _lapse) = delegate_parked_on_a_silent_root();
+        assert_eq!(h.core.clients[&rid].touched_gen, 7);
+    }
+
+    /// An in-doubt end keeps what the rid touched; its resubmission starts
+    /// from it, and the forward says so.
+    #[test]
+    fn a_resubmitted_in_doubt_rid_keeps_its_touched_gen() {
+        let mut h = requester();
+        let rid = h.rid(1);
+        let out = submit(&mut h, rid);
+        h.step(reply_from(
+            2,
+            req_of(&out),
+            MutateOutcome::NotHolder { holder: 3 },
+            7,
+        ));
+        let mut out = Vec::new();
+        h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
+        assert_eq!(h.core.in_doubt_touched.get(&rid), Some(&7));
+        let out = submit(&mut h, rid);
+        assert_eq!(h.core.clients[&rid].touched_gen, 7);
+        assert!(h.core.in_doubt_touched.is_empty());
+        assert_eq!(fence_of(&out), Some((2, 0, 7)), "{out:?}");
+    }
+
+    /// An untouched rid resubmits untouched.
+    #[test]
+    fn an_untouched_in_doubt_rid_resubmits_with_zero() {
+        let mut h = requester();
+        let rid = h.rid(1);
+        submit(&mut h, rid);
+        let mut out = Vec::new();
+        h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
+        assert!(h.core.in_doubt_rids.contains(&rid));
+        assert!(h.core.in_doubt_touched.is_empty());
+        let out = submit(&mut h, rid);
+        assert_eq!(fence_of(&out), Some((2, 0, 0)), "{out:?}");
+    }
+
+    /// A fast-path in-doubt resubmission and a replay cannot know what the
+    /// rid was sent under: both start unknown, which only ever holds a
+    /// refusal.
+    #[test]
+    fn submit_in_doubt_and_replays_start_touched_unknown() {
+        let mut h = requester();
+        let rid = h.rid(1);
+        let op = h.create("a");
+        let out = h.step(Event::SubmitInDoubt {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        assert_eq!(fence_of(&out), Some((2, 0, u64::MAX)), "{out:?}");
+        assert_eq!(h.core.stats.touched_unknown_submits, 1);
+
+        let rid = h.rid(2);
+        let op = h.create("b");
+        let mut out = Vec::new();
+        h.core.submit(
+            h.clk(),
+            rid,
+            op,
+            Policy::Client,
+            Default::default(),
+            client::Origin::Replay {
+                queue_seq: 1,
+                deps: Default::default(),
+            },
+            &h.meta,
+            &mut out,
+        );
+        assert_eq!(h.core.clients[&rid].touched_gen, u64::MAX);
+        assert_eq!(h.core.stats.touched_unknown_submits, 2);
+    }
+
+    /// A live op the fast path resubmits is unknown from then on.
+    #[test]
+    fn submit_in_doubt_of_a_live_op_makes_it_unknown() {
+        let mut h = requester();
+        let rid = h.rid(1);
+        submit(&mut h, rid);
+        h.core.note_in_doubt(rid);
+        assert_eq!(h.core.clients[&rid].touched_gen, u64::MAX);
+    }
+
+    /// Fails on the parent: the evicted rid resubmits with an empty history.
+    /// A rid evicted from the in-doubt record is resubmitted unknown (the
+    /// watermark), a younger one is not.
+    #[test]
+    fn an_evicted_in_doubt_rid_is_resubmitted_touched_unknown() {
+        let mut h = requester();
+        let rid = h.rid(1);
+        let out = submit(&mut h, rid);
+        h.step(reply_from(
+            2,
+            req_of(&out),
+            MutateOutcome::NotHolder { holder: 3 },
+            7,
+        ));
+        let mut out = Vec::new();
+        h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
+        for seq in 0..crate::core::client::MAX_IN_DOUBT_RIDS as u64 + 1 {
+            h.core.note_in_doubt(h.rid(10 + seq));
+        }
+        assert!(!h.core.in_doubt_rids.contains(&rid));
+        assert!(!h.core.in_doubt_touched.contains_key(&rid));
+        let out = submit(&mut h, rid);
+        assert_eq!(fence_of(&out), Some((2, 0, u64::MAX)), "{out:?}");
+        // A rid above the watermark is not affected.
+        let young = h.rid(1_000_000);
+        let out = submit(&mut h, young);
+        assert_eq!(fence_of(&out), Some((2, 0, 0)), "{out:?}");
+    }
+
+    /// A foreign rid evicted does not raise the watermark for own rids.
+    #[test]
+    fn a_foreign_rid_does_not_raise_the_eviction_watermark() {
+        let mut h = requester();
+        for seq in 0..crate::core::client::MAX_IN_DOUBT_RIDS as u64 + 1 {
+            h.core.note_in_doubt(Rid {
+                node: 9,
+                incarnation: 1,
+                seq,
+            });
+        }
+        assert_eq!(h.core.in_doubt_evicted_max, None);
+    }
+}
