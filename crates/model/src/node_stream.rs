@@ -345,8 +345,33 @@
 //! - `one_executable_copy` (chunk 9, I2(b)): at most one executable copy of
 //!   a rid's op (a forward to a live sequencer, or a parked op).
 //!
+//! - `refused_never_completes` (executor-side route fencing, ADR-47, I1): a rid
+//!   the root refused for good (a non-stealable grant it cannot reach) never
+//!   has a live row in a node stream.
+//!
+//! # Route fencing (ADR-47)
+//!
+//! With [`NodeStreamModel::route_fence`] a forward carries `routed` (the
+//! stream it was routed by, `0` = to the lease holder) and `touched` (the
+//! highest stream the rid was ever sent under, [`NONE`] = cannot know), both
+//! computed by the requester from its own sends. A node executing under its
+//! own grant `g` runs a forward only if `routed == g`, else answers
+//! `Fenced { gen: g }` and the requester resends routed by `g`. The root,
+//! asked for keys of a non-stealable stream whose holder it does not reach,
+//! refuses for good only a rid with `touched == 0`, else holds it.
+//! [`NodeStreamModel::stale_routes`]: a requester's first send goes to the
+//! stream's sequencer routed `0` (a stale cache) and its later sends to the
+//! lease holder, until a hint (`NotOwner`, `Fenced`) corrects its table.
+//! A holder that is down stands for an unreachable one (its disk is kept).
+//!
 //! # Knobs (each a planted bug the checker must find)
 //!
+//! - `unfenced_forward` (ADR-47): the executor runs a forward whatever it was
+//!   routed by (`touched` stays honest), so a stale-routed op runs at the
+//!   holder, the reply is lost, and the root, told `touched == 0`, refuses
+//!   it for good.
+//! - `root_ignores_touched` (ADR-47): the root refuses for good whatever the
+//!   rid touched (the behaviour before the fence).
 //! - `lone_delegate`: a placed delegate answers from its own disk (the
 //!   deleted `Lone` class of a delegate with peers).
 //! - `root_journal_counts`: the root reports its appended copy of a
@@ -597,6 +622,10 @@ pub enum Msg {
         rid: Rid,
         op: WriteOp,
         deps: Deps,
+        /// The stream this send was routed by (`0`: to the lease holder).
+        routed: u8,
+        /// The requester's `touched` at this send.
+        touched: u8,
     },
     /// The answer, with the answered row's origin.
     Reply {
@@ -613,10 +642,23 @@ pub enum Msg {
     Settle { to: u8, rid: Rid, op: WriteOp },
     /// The receiver does not hold a key of the settle: re-resolve.
     SettleNotOwner { rid: Rid, from: u8 },
+    /// Route fencing: the receiver holds the keys under stream `gen` and
+    /// was not routed by it; nothing ran. The requester resends routed by it.
+    Fenced { rid: Rid, gen: u8, from: u8 },
+    /// The root's final refusal (`EROFS`) of a rid under a non-stealable
+    /// grant it does not reach.
+    Refused { rid: Rid },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Node {
+    /// Route fencing: the highest stream the outstanding op was sent under
+    /// or offered to ([`NONE`]: unknown); `0`: never.
+    pub touched: u8,
+    /// The outstanding op was sent at least once.
+    pub resent: bool,
+    /// The requester's table is current (a hint corrected the stale cache).
+    pub hinted: bool,
     /// The script index of the next op to start.
     pub next: u8,
     pub outstanding: bool,
@@ -726,6 +768,12 @@ pub const SAW_LEAVE_ENDED_GRANT: u64 = 1 << 42;
 /// M1.0 review: a lease claim's release came after its read delegation was
 /// granted and recalled (or expired).
 pub const SAW_CLAIM_AFTER_READ: u64 = 1 << 43;
+/// ADR-47: a designee answered `Fenced`.
+pub const SAW_FENCED: u64 = 1 << 44;
+/// ADR-47: the root refused a rid for good (it touched no generation).
+pub const SAW_ROOT_REFUSED: u64 = 1 << 45;
+/// ADR-47: the root held a touched rid under an unreachable grant.
+pub const SAW_ROOT_HELD: u64 = 1 << 46;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -789,6 +837,8 @@ pub struct State {
     pub settling: u8,
     /// Rids answered `EIO`, settled (I4). Sorted.
     pub eio: Vec<Rid>,
+    /// Rids the root refused for good (ADR-47). Sorted.
+    pub refused: Vec<Rid>,
     pub deadlines: u8,
 }
 
@@ -976,6 +1026,15 @@ pub struct NodeStreamModel {
     pub cut_before_read_recall: bool,
     pub server_replay_queue: bool,
     pub singleton_serves_forwards: bool,
+    /// ADR-47: forwards carry `routed`/`touched`; the executor fences and
+    /// the root refuses for good only a rid that touched no generation.
+    pub route_fence: bool,
+    /// ADR-47: requesters start with a stale route cache.
+    pub stale_routes: bool,
+    /// ADR-47, the knob: the executor does not fence.
+    pub unfenced_forward: bool,
+    /// ADR-47, the knob: the root's refusal ignores `touched`.
+    pub root_ignores_touched: bool,
 }
 
 /// Where a received op stands at a sequencer.
@@ -1052,6 +1111,10 @@ impl NodeStreamModel {
             cut_before_read_recall: false,
             server_replay_queue: false,
             singleton_serves_forwards: false,
+            route_fence: false,
+            stale_routes: false,
+            unfenced_forward: false,
+            root_ignores_touched: false,
         }
     }
 
@@ -1990,21 +2053,30 @@ pub fn orphan_rule_never_ends_an_answering_grant(s: &State) -> bool {
         .all(|&(_, _, g, _)| g == ROOT || s.orphaned & (1 << g) == 0)
 }
 
+/// I1 under route fencing (ADR-47): a rid the root refused for good never
+/// has a live row, in the root's journal or a node stream below its cut.
+pub fn refused_never_completes(s: &State) -> bool {
+    s.refused.iter().all(|&rid| !has_live_row(s, rid))
+}
+
+/// A live `Op` row of `rid`: the root's own, or a node stream's below its cut.
+fn has_live_row(s: &State, rid: Rid) -> bool {
+    let root = s.streams[ROOT as usize]
+        .rows
+        .iter()
+        .any(|r| r.stream == ROOT && r.kind == RowKind::Op && r.rid == rid);
+    let deleg = s.streams[1..].iter().enumerate().any(|(k, st)| {
+        st.rows
+            .iter()
+            .any(|r| r.kind == RowKind::Op && r.rid == rid && !void_row(s, k as u8 + 1, r.idx))
+    });
+    root || deleg
+}
+
 /// I4 (chunk 9): a rid answered `EIO`, settled, never has a live row (the
 /// root's own, or a node stream's below its cut).
 pub fn eio_never_lands_late(s: &State) -> bool {
-    s.eio.iter().all(|&rid| {
-        let root = s.streams[ROOT as usize]
-            .rows
-            .iter()
-            .any(|r| r.stream == ROOT && r.kind == RowKind::Op && r.rid == rid);
-        let deleg = s.streams[1..].iter().enumerate().any(|(k, st)| {
-            st.rows
-                .iter()
-                .any(|r| r.kind == RowKind::Op && r.rid == rid && !void_row(s, k as u8 + 1, r.idx))
-        });
-        !root && !deleg
-    })
+    s.eio.iter().all(|&rid| !has_live_row(s, rid))
 }
 
 /// I2(b) (chunk 9): no server-side queue: at most one executable copy of a
@@ -2538,7 +2610,18 @@ fn execute(
 
 /// Sequencer candidate `at` receives `rid`: completed-dedup, else execute,
 /// park, or answer `NotOwner`.
-fn receive(m: &NodeStreamModel, s: &mut State, at: u8, rid: Rid, op: WriteOp, deps: Deps) {
+///
+/// `fence`: the forward's `(routed, touched)` (ADR-47; `None`: an own op, or
+/// one already admitted, which the fence does not look at again).
+fn receive(
+    m: &NodeStreamModel,
+    s: &mut State,
+    at: u8,
+    rid: Rid,
+    op: WriteOp,
+    deps: Deps,
+    fence: Option<(u8, u8)>,
+) {
     note_requester(m, s, at, rid.node);
     if !m.no_dedup {
         if let Some((stream, idx)) = find_rid(m, s, at, rid) {
@@ -2555,6 +2638,43 @@ fn receive(m: &NodeStreamModel, s: &mut State, at: u8, rid: Rid, op: WriteOp, de
         .any(|w| w.node == at && w.rid == rid && !w.settle)
     {
         return;
+    }
+    if let Some((routed, touched)) = fence {
+        if let Some(g) = own_gen(m, s, at, op) {
+            // The executor runs a forward only under the stream it was
+            // routed by.
+            if routed != g && !m.unfenced_forward {
+                s.saw |= SAW_FENCED;
+                s.net.push(Msg::Fenced {
+                    rid,
+                    gen: g,
+                    from: at,
+                });
+                return;
+            }
+        } else if at == s.root {
+            let r = route(m, s, op);
+            let holder = m.executor(s, r);
+            if r != ROOT
+                && m.non_stealable(r)
+                && holder != at
+                && (!s.live(holder) || s.streams[r as usize].stopped)
+            {
+                if touched != 0 && !m.root_ignores_touched {
+                    // A rid that touched a generation may have run there:
+                    // held, never refused for good.
+                    s.saw |= SAW_ROOT_HELD;
+                } else {
+                    s.saw |= SAW_ROOT_REFUSED;
+                    if !s.refused.contains(&rid) {
+                        s.refused.push(rid);
+                        s.refused.sort_unstable();
+                    }
+                    s.net.push(Msg::Refused { rid });
+                }
+                return;
+            }
+        }
     }
     match status(m, s, at, op, &deps) {
         Status::Run(g) => execute(m, s, at, g, rid, op, deps),
@@ -2665,16 +2785,68 @@ fn submit_settle(m: &NodeStreamModel, s: &mut State, i: u8, rid: Rid, op: WriteO
     }
 }
 
-/// Node `i` sends `rid` to the sequencer of its stream by the root's table.
-fn submit(m: &NodeStreamModel, s: &mut State, i: u8, rid: Rid, op: WriteOp) {
+/// Where node `i` sends its outstanding op, and the stream it routes it by
+/// (`0`: to the lease holder). The root's table, except a requester with a
+/// stale cache (ADR-47): its first send goes to the stream's sequencer
+/// routed `0`, its later ones to the lease holder. A retry after a send
+/// that timed out also goes to the lease holder, routed `0`.
+fn target(m: &NodeStreamModel, s: &State, i: u8, op: WriteOp) -> (u8, u8) {
     let stream = route(m, s, op);
-    let to = m.executor(s, stream);
+    let n = &s.nodes[i as usize];
+    if m.route_fence && n.resent && (!s.live(n.sent_to) || m.stopped_node(s, n.sent_to)) {
+        // The send timed out: the retry goes to the lease holder.
+        return (s.root, 0);
+    }
+    if m.route_fence && m.stale_routes && !n.hinted {
+        return (
+            if n.resent {
+                s.root
+            } else {
+                m.executor(s, stream)
+            },
+            0,
+        );
+    }
+    (
+        m.executor(s, stream),
+        if m.route_fence { stream } else { 0 },
+    )
+}
+
+/// The stream `at` executes `op` under by its own grant (ADR-47's `gen`).
+fn own_gen(m: &NodeStreamModel, s: &State, at: u8, op: WriteOp) -> Option<u8> {
+    let g = m
+        .stream_of_node(at)
+        .filter(|&g| !s.streams[g as usize].stopped)?;
+    bits(op_dirs(op))
+        .all(|d| deleg_owns(m, s, g, d))
+        .then_some(g)
+}
+
+/// Node `i` sends `rid` to the sequencer of its stream by its table.
+fn submit(m: &NodeStreamModel, s: &mut State, i: u8, rid: Rid, op: WriteOp) {
+    let (to, routed) = target(m, s, i, op);
     let deps = s.nodes[i as usize].observed;
+    if m.route_fence {
+        // `touched` is raised before the op leaves (or is offered locally).
+        let stream = route(m, s, op);
+        let n = &mut s.nodes[i as usize];
+        n.resent = true;
+        n.touched = n.touched.max(if to == i { stream } else { routed });
+    }
+    let touched = s.nodes[i as usize].touched;
     s.nodes[i as usize].sent_to = to;
     if to == i {
-        receive(m, s, i, rid, op, deps);
+        receive(m, s, i, rid, op, deps, None);
     } else {
-        s.net.push(Msg::Fwd { to, rid, op, deps });
+        s.net.push(Msg::Fwd {
+            to,
+            rid,
+            op,
+            deps,
+            routed,
+            touched,
+        });
     }
 }
 
@@ -2696,6 +2868,9 @@ impl Model for NodeStreamModel {
         vec![State {
             nodes: vec![
                 Node {
+                    touched: 0,
+                    resent: false,
+                    hinted: false,
                     next: 0,
                     outstanding: false,
                     sent_to: 0,
@@ -2760,6 +2935,7 @@ impl Model for NodeStreamModel {
             reads_granted: 0,
             settling: 0,
             eio: Vec::new(),
+            refused: Vec::new(),
             deadlines: 0,
         }]
     }
@@ -2785,6 +2961,8 @@ impl Model for NodeStreamModel {
                     let op = self.scripts[i as usize][node.next as usize - 1];
                     let to = if s.settling & (1 << i) != 0 && self.settle_unowned {
                         s.root
+                    } else if s.settling & (1 << i) == 0 {
+                        target(self, s, i, op).0
                     } else {
                         self.executor(s, route(self, s, op))
                     };
@@ -3075,6 +3253,11 @@ impl Model for NodeStreamModel {
                 };
                 node.next += 1;
                 node.outstanding = true;
+                if self.route_fence {
+                    node.touched = 0;
+                    node.resent = false;
+                    node.hinted = !self.stale_routes;
+                }
                 if self.history {
                     invoke(&mut s, i, rid, op);
                 }
@@ -3103,15 +3286,60 @@ impl Model for NodeStreamModel {
                 })?;
                 let op = self.scripts[i as usize][rid.seq as usize];
                 s.rescued = true;
+                if self.route_fence {
+                    // A replay: its history is not known here.
+                    s.nodes[i as usize].touched = NONE;
+                    s.nodes[i as usize].hinted = true;
+                }
                 submit(self, &mut s, i, rid, op);
             }
             Action::Deliver(k) => match s.net.remove(k) {
-                Msg::Fwd { to, rid, op, deps } => {
+                Msg::Fwd {
+                    to,
+                    rid,
+                    op,
+                    deps,
+                    routed,
+                    touched,
+                } => {
                     // A message to a node that is down, or that stopped
                     // honouring (unreachable), is lost; the requester
                     // retries.
                     if s.live(to) && !self.stopped_node(&s, to) {
-                        receive(self, &mut s, to, rid, op, deps);
+                        let fence = self.route_fence.then_some((routed, touched));
+                        receive(self, &mut s, to, rid, op, deps, fence);
+                    }
+                }
+                Msg::Fenced { rid, gen, from } => {
+                    let node = s.nodes[rid.node as usize];
+                    if s.live(rid.node)
+                        && node.outstanding
+                        && node.next == rid.seq + 1
+                        && node.sent_to == from
+                        && s.settling & (1 << rid.node) == 0
+                    {
+                        let op = self.scripts[rid.node as usize][rid.seq as usize];
+                        let n = &mut s.nodes[rid.node as usize];
+                        n.hinted = true;
+                        n.resent = true;
+                        // Raised before the resend leaves.
+                        n.touched = n.touched.max(gen);
+                        let (deps, touched) = (n.observed, n.touched);
+                        s.net.push(Msg::Fwd {
+                            to: from,
+                            rid,
+                            op,
+                            deps,
+                            routed: gen,
+                            touched,
+                        });
+                    }
+                }
+                Msg::Refused { rid } => {
+                    let node = s.nodes[rid.node as usize];
+                    if s.live(rid.node) && node.outstanding && node.next == rid.seq + 1 {
+                        s.nodes[rid.node as usize].outstanding = false;
+                        s.settling &= !(1 << rid.node);
                     }
                 }
                 Msg::Reply {
@@ -3130,6 +3358,10 @@ impl Model for NodeStreamModel {
                         && s.settling & (1 << rid.node) == 0
                     {
                         let op = self.scripts[rid.node as usize][rid.seq as usize];
+                        // The bounce corrects the requester's table.
+                        if self.route_fence {
+                            s.nodes[rid.node as usize].hinted = true;
+                        }
                         submit(self, &mut s, rid.node, rid, op);
                     }
                 }
@@ -3160,7 +3392,7 @@ impl Model for NodeStreamModel {
                     receive_settle(self, &mut s, w.node, w.rid, w.op);
                 } else {
                     match status(self, &s, w.node, w.op, &w.deps) {
-                        Status::Run(_) => receive(self, &mut s, w.node, w.rid, w.op, w.deps),
+                        Status::Run(_) => receive(self, &mut s, w.node, w.rid, w.op, w.deps, None),
                         Status::Bounce => {
                             s.saw |= SAW_NOT_OWNER;
                             s.net.push(Msg::NotOwner {
@@ -3786,6 +4018,9 @@ impl Model for NodeStreamModel {
             Property::always("eio_never_lands_late", |_, s: &State| {
                 eio_never_lands_late(s)
             }),
+            Property::always("refused_never_completes", |_, s: &State| {
+                refused_never_completes(s)
+            }),
             Property::always("one_executable_copy", |m: &NodeStreamModel, s: &State| {
                 one_executable_copy(m, s)
             }),
@@ -4070,6 +4305,13 @@ impl NodeStreamModel {
             && !self.claim_skips_read_recall
         {
             w!("claim_after_read_recall", SAW_CLAIM_AFTER_READ);
+        }
+        if self.route_fence && self.stale_routes && !self.unfenced_forward {
+            w!("fenced", SAW_FENCED);
+            if self.max_crashes > 0 {
+                w!("root_held", SAW_ROOT_HELD);
+                w!("root_refused", SAW_ROOT_REFUSED);
+            }
         }
         let cuts = !self.stream_releases.is_empty()
             || self.scripts.iter().flatten().any(|&op| self.spans(op));
