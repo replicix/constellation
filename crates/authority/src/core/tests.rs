@@ -5379,6 +5379,68 @@ fn a_retired_former_roots_committed_stream_is_not_dropped() {
     }
 }
 
+/// `epoch-holder-retired` (plan 46 M1.4 step 4): an epoch hold's owner
+/// streamed a row to this member as committed (its answer waited for the
+/// member's ack) and was retired. The next claim (here a takeover at epoch
+/// 2 that names no tail) queues the member's copy as a committed replay
+/// with the retired owner as its source. The retirement drop forgets only a
+/// source's speculation: the committed row replays, or the client's
+/// acknowledged write is lost (the flex model's `retire_drops_acked`).
+#[test]
+fn a_retired_hold_owners_acked_row_is_replayed() {
+    let mut h = Harness::new(2);
+    h.core.lease.cached_holder = Some(3);
+    let rid = Rid {
+        node: 1,
+        incarnation: 1,
+        seq: 4,
+    };
+    let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+    let records = [
+        LogRecord::Create {
+            parent: ROOT_INO,
+            name: "acked-by-the-member".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 3,
+        },
+        LogRecord::Completed { rid },
+    ];
+    h.meta
+        .install_streamed_committed(1, 1, 2, 3, &records, true, (0, 0))
+        .unwrap();
+    let (proof, carried) = (Default::default(), Default::default());
+    h.meta
+        .reship_at_takeover(
+            Some(constellation_meta::StrandArgs {
+                epoch: 2,
+                own_gens: &[],
+                abandoned: None,
+                carried: &carried,
+                proof: &proof,
+            }),
+            None,
+        )
+        .unwrap();
+    let queued = h.meta.pending_replays().unwrap();
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert_eq!((queued[0].foreign, queued[0].source), (true, Some(1)));
+    assert!(queued[0].class.gated(), "{queued:?}");
+    let lease = lease_of(3, 3, h.now.plus(10_000).0).with_retired(1);
+    let now = h.now;
+    h.core.lease.note_object(&lease);
+    let mut out = Vec::new();
+    h.core.on_drain_tick(Now::same(now.0), &h.meta, &mut out);
+    assert_eq!(h.core.stats.replays_of_retired_dropped, 0);
+    assert_eq!(h.meta.pending_replays().unwrap().len(), 1);
+    assert!(
+        h.core.clients().any(|(r, _)| r == rid),
+        "the acknowledged row was not replayed: {out:?}"
+    );
+}
+
 /// Read-your-writes across a stranding: while one of this node's own ops
 /// is queued for replay (rolled back), reads of its keys wait even on the
 /// fast path; other keys do not.
