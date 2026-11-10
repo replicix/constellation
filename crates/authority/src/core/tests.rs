@@ -2399,10 +2399,16 @@ fn a_flush_waits_out_a_floor_longer_than_its_cap() {
 /// (`locks-blips-tight-faults` seed 5379). It holds for the gate of a
 /// takeover of another node's lease too, fast or not: that gate strands
 /// and replays what the previous tenure acknowledged and never shipped
-/// (`flex-tight` seed 485).
+/// (`flex-tight` seed 485). A self-claim whose gate still re-applies a
+/// sealed backup's tail holds as well: the release would strand the rows.
 #[test]
 fn an_epoch_flush_holds_for_a_fast_or_foreign_takeovers_gate_only() {
-    for (fast, foreign) in [(true, false), (false, false), (false, true)] {
+    for (fast, foreign, tail) in [
+        (true, false, false),
+        (false, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
         let mut h = Harness::new(1);
         h.hold(
             1,
@@ -2412,7 +2418,7 @@ fn an_epoch_flush_holds_for_a_fast_or_foreign_takeovers_gate_only() {
                 marker_shipped: false,
                 drained: false,
                 fast_prev: fast,
-                backup_tail_epoch: None,
+                backup_tail_epoch: tail.then_some(1),
                 shippable: false,
             }),
         );
@@ -2434,8 +2440,8 @@ fn an_epoch_flush_holds_for_a_fast_or_foreign_takeovers_gate_only() {
         h.core.round_release(h.clk(), &h.meta, &mut out);
         assert_eq!(
             h.core.lease.releasing,
-            !(fast || foreign),
-            "the epoch's flush release with a gate pending (fast takeover: {fast}, foreign: {foreign})"
+            !(fast || foreign || tail),
+            "the epoch's flush release with a gate pending (fast takeover: {fast}, foreign: {foreign}, tail: {tail})"
         );
     }
 }

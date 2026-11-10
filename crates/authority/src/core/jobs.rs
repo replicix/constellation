@@ -2681,11 +2681,11 @@ impl Core {
         // released the lease before the marker landed, so the gate never
         // ran, and the next claim, a plain one, found nothing to strand: the
         // holder's acknowledged ops were lost).
-        let foreign_takeover = self
-            .lease
-            .gate
-            .as_ref()
-            .is_some_and(|g| g.takeover && self.lease.prev_holder.is_some());
+        // And a gate that still re-applies a sealed backup's tail (a
+        // self-claim's too): the release would strand those rows.
+        let foreign_takeover = self.lease.gate.as_ref().is_some_and(|g| {
+            (g.takeover && self.lease.prev_holder.is_some()) || g.backup_tail_epoch.is_some()
+        });
         if flushed
             && (replica.locks().live_grants_len(now.wait) > 0
                 || self.in_takeover_floor(now)
@@ -3999,7 +3999,8 @@ impl Core {
         // landed but its gate never ran (it crashed or restarted inside
         // it, backup-crash-slow seed 601692; its CAS reported failure
         // although it applied, 603631). The tail and the role are on
-        // disk; nobody else can have held in between.
+        // disk; nobody else can have held in between, since an epoch's
+        // flush release waits for a gate that still has a tail to re-apply.
         let sealed = self.bk.sealed;
         // An epoch's close kept its tenure's lock grants: they stand if
         // this CAS replaced exactly the lease the close let go.
