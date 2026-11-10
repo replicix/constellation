@@ -916,6 +916,13 @@ pub struct Stats {
     /// re-reads that followed from a gate drain or a leftover re-read.
     pub inbox_stale_reads_discarded: u64,
     pub inbox_stale_relists: u64,
+    /// Late-landing S2b: forwarded attempts parked unexecuted (at the root or
+    /// a delegate) that were dropped at their wait's end because their latest
+    /// message was older than `Deadlines::inbox_read_fresh`.
+    pub stale_parks_dropped: u64,
+    /// Late-landing S2a: settles sent for a stranded replay entry that is
+    /// foreign or unacknowledged (never executed).
+    pub unacked_replay_settles_sent: u64,
     /// Late-landing F1: settles that began with the withdrawal of the rid's
     /// inbox batches, and those whose tombstone could not be written within
     /// the first window (the settle then goes on without the inbox route).

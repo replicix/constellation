@@ -530,6 +530,10 @@ pub(crate) struct ParkedDeleg {
     /// draining (`Core::sticky_holds`): it runs again when the hold lifts,
     /// and is sent to the root when the release row is journaled.
     pub held: bool,
+    /// Late-landing S2b: when it arrived, on this node's wait clock. A
+    /// forwarded attempt (`from != 0`, not a settle) older than
+    /// `Deadlines::inbox_read_fresh` is not executed when its wait ends.
+    pub arrived: WaitMs,
 }
 
 /// A generation installed while the read grants a previous process of this
@@ -2955,6 +2959,7 @@ impl Core {
                 settle,
                 fence,
                 held: holding,
+                arrived: now.wait,
             });
             if from == 0 {
                 if let Some(c) = self.clients.get_mut(&rid) {
@@ -5149,6 +5154,34 @@ impl Core {
             taken.reverse();
             for p in taken {
                 if p.from == 0 && !self.clients.contains_key(&p.rid) {
+                    continue;
+                }
+                // Late-landing S2b: an attempt that waited longer than the
+                // bound is not executed (its requester sends it again if it
+                // is still waiting; that arrival executes).
+                if p.from != 0
+                    && !p.settle
+                    && now.wait.since(p.arrived) >= self.dl_t().inbox_read_fresh as i64
+                {
+                    self.stats.stale_parks_dropped += 1;
+                    if let Some(req) = p.req {
+                        out.push(Action::Send {
+                            to: p.from,
+                            msg: PeerMsg::MutateReply {
+                                req,
+                                outcome: MutateOutcome::Held {
+                                    retry_ms: self.cfg.recall_hold_ms.max(50),
+                                    outwait_ms: None,
+                                },
+                                base: None,
+                                position: Position::ZERO,
+                                gen,
+                                own_chunks: OwnChunks::None,
+                                own_rows: None,
+                                committed: false,
+                            },
+                        });
+                    }
                     continue;
                 }
                 self.delegate_execute_now(

@@ -377,6 +377,20 @@ impl Core {
                 self.replay.stuck_since = None;
                 return;
             }
+            // Late-landing S2a: an entry nobody acknowledged (an own row of a
+            // deposed tenure whose reply never left, marked `unacked`) or
+            // that another node's op left here (`foreign`) is never
+            // executed by the drain. Its client may have heard `EIO`; the
+            // settle finds the rid's outcome or makes the sequencer in force
+            // journal `Refused { ABANDONED }`, after which every copy
+            // dedups. With no sequencer reachable it stays queued. (It is
+            // not stuck: it asks for no lease, whose gate would run it.) An
+            // acknowledged own row is executed below, as ever (I5).
+            if head.foreign || self.replay.unacked.contains(&head.rid) {
+                self.settle_unexecuted_entry(now, head, replica, out);
+                absorb_keys(&mut behind, &entry_keys(head, replica));
+                continue;
+            }
             let stuck_for = self.replay.stuck_since.get_or_insert(now.wait).to_owned();
             if now.wait.since(stuck_for) >= self.cfg.replay_lease_fallback_ms as i64
                 && self.lease.ship_epoch(now, &self.cfg).is_none()
@@ -468,15 +482,60 @@ impl Core {
         if self.clients.contains_key(&entry.rid) || self.epoch_refuses_writes() {
             return;
         }
-        // Backed off: with no sequencer reachable a settle ends in doubt
-        // after its window, and asking again once per tick is a storm.
+        if !self.settle_backed_off(
+            now,
+            entry,
+            "settling the rid of a dropped row before its conflict copy; no outcome yet",
+        ) {
+            return;
+        }
+        self.stats.refused_entry_settles_sent += 1;
+        self.submit_settle(
+            now,
+            (entry.rid, entry.queue_seq),
+            super::client::dropped_settle_op(entry.rid),
+            replica,
+            out,
+        );
+    }
+
+    /// Late-landing S2a: settle the rid of a queue entry that must not
+    /// execute (see `drain_tick`).
+    fn settle_unexecuted_entry(
+        &mut self,
+        now: Now,
+        entry: &StrandedOp,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.clients.contains_key(&entry.rid) || self.epoch_refuses_writes() {
+            return;
+        }
+        if !self.settle_backed_off(
+            now,
+            entry,
+            "settling the rid of an unacknowledged stranded row, which is never executed; no outcome yet",
+        ) {
+            return;
+        }
+        self.stats.unacked_replay_settles_sent += 1;
+        let inert = MutateOp::Records {
+            records: Vec::new(),
+        };
+        self.submit_settle(now, (entry.rid, entry.queue_seq), inert, replica, out);
+    }
+
+    /// Whether a settle of `entry`'s rid may go out now, recording the
+    /// attempt: backed off, because with no sequencer reachable a settle ends
+    /// in doubt after its window, and asking again once per tick is a storm.
+    fn settle_backed_off(&mut self, now: Now, entry: &StrandedOp, warn: &str) -> bool {
         if self
             .replay
             .settles
             .get(&entry.queue_seq)
             .is_some_and(|retry| now.wait < retry.next_at)
         {
-            return;
+            return false;
         }
         let retry = self
             .replay
@@ -494,17 +553,11 @@ impl Core {
                 node = self.cfg.node_id,
                 rid = ?entry.rid,
                 attempts = retry.attempts,
-                "settling the rid of a dropped row before its conflict copy; no outcome yet"
+                "{}",
+                warn
             );
         }
-        self.stats.refused_entry_settles_sent += 1;
-        self.submit_settle(
-            now,
-            (entry.rid, entry.queue_seq),
-            super::client::dropped_settle_op(entry.rid),
-            replica,
-            out,
-        );
+        true
     }
 
     /// Plan 46 M0.2 (R3): whether an op arriving at this sequencer from
@@ -1338,6 +1391,18 @@ impl Core {
         out: &mut Vec<Action>,
     ) -> Result<(), constellation_meta::MetaError> {
         if queued.refused.is_some() || self.drop_retired_origin(queued, replica) {
+            return Ok(());
+        }
+        // Late-landing S2a, at the gate too: an entry nobody acknowledged
+        // (`unacked`) or another node's (`foreign`) is never executed, its
+        // client may have heard `EIO`. It stays queued, holding the later
+        // entries on its keys, for the drain to settle (an entry the log
+        // already settled is forgotten below).
+        if (queued.foreign || self.replay.unacked.contains(&queued.rid))
+            && completed_as_outcome(replica, queued.rid, 0).is_none()
+        {
+            held.hold();
+            self.stats.replays_held_for_stream += 1;
             return Ok(());
         }
         // Per-key order: behind an earlier entry left to the drain, the

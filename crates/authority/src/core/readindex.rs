@@ -184,6 +184,11 @@ pub(crate) enum ParkedWhat {
         /// `on_mutate_request`, so it is checked against the generation
         /// current then.
         fence: super::holder::Fence,
+        /// Late-landing S2b: when the latest message of this rid from its
+        /// requester arrived (the attempt, or a retry re-attaching to it),
+        /// on this node's wait clock. The park executes on completion only
+        /// if that was less than `Deadlines::inbox_read_fresh` ago.
+        arrived: WaitMs,
     },
     /// Plan 30 §M11: a local op of this root, executed (and finished)
     /// once the recall is done and its `deps` are here.
@@ -1083,6 +1088,7 @@ impl Core {
                 tag,
                 settle,
                 fence,
+                arrived: now.wait,
             },
         );
         self.rd.parked_rids.insert(rid, id);
@@ -1403,7 +1409,14 @@ impl Core {
             // (Plan 46 M0.2 review: an op parked behind the replay queue
             // waits for this node's queue, which a lost lease hands to the
             // recovery; its requester retries at the new holder.)
-            .filter(|(_, p)| p.durable.is_some() || p.queue_gated)
+            // Late-landing S2b: nor an unexecuted forward, which would run
+            // if this node regained the lease and the recall ended; its
+            // requester retries by rid at the new holder.
+            .filter(|(_, p)| {
+                p.durable.is_some()
+                    || p.queue_gated
+                    || matches!(p.what, ParkedWhat::ExecuteReply { .. })
+            })
             .map(|(id, _)| *id)
             .collect();
         let mut n = 0;
@@ -1632,10 +1645,15 @@ impl Core {
                         from,
                         req: r,
                         held_timer,
+                        arrived,
                         ..
                     },
                 ..
-            }) => (from, r, held_timer),
+            }) => {
+                // (The retry is a fresh arrival of the rid's latest message.)
+                *arrived = now.wait;
+                (from, r, held_timer)
+            }
             _ => return false,
         };
         *to = from;
@@ -2421,10 +2439,39 @@ impl Core {
                     tag,
                     settle,
                     fence,
+                    arrived,
                 } => {
                     self.rd.parked_rids.remove(&rid);
                     if let Some(t) = held_timer {
                         self.cancel_timer(t, out);
+                    }
+                    // Late-landing S2b (the executor's freshness rule): an
+                    // attempt whose latest message is older than the bound
+                    // is not executed. Its requester is told to send it
+                    // again (`Held`) if it is still waiting; that fresh
+                    // arrival executes. One that went in doubt has no
+                    // attempt to answer, and the reply is ignored.
+                    if !settle && now.wait.since(arrived) >= self.dl_t().inbox_read_fresh as i64 {
+                        self.stats.stale_parks_dropped += 1;
+                        if let Some(req) = req {
+                            out.push(Action::Send {
+                                to: from,
+                                msg: PeerMsg::MutateReply {
+                                    req,
+                                    outcome: MutateOutcome::Held {
+                                        retry_ms: self.cfg.recall_hold_ms.max(50),
+                                        outwait_ms: None,
+                                    },
+                                    base: None,
+                                    position: Position::ZERO,
+                                    gen: 0,
+                                    own_chunks: OwnChunks::None,
+                                    own_rows: None,
+                                    committed: false,
+                                },
+                            });
+                        }
+                        continue;
                     }
                     // Executes now (the recall ended, `deps` are here); a
                     // retry answered `Held` meanwhile is answered from the

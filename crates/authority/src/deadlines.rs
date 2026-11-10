@@ -447,6 +447,16 @@ impl Deadlines {
                 self.inbox_read_fresh, b.s3_request_timeout
             ),
         );
+        fail(
+            "D15",
+            Class::Warn,
+            self.recall_hold + f <= self.inbox_read_fresh,
+            format!(
+                "recall hold {} ms and the forward timeout ({f}) exceed the inbox read freshness \
+                 ({}): a parked forward could go stale before its requester's retry reaches it",
+                self.recall_hold, self.inbox_read_fresh
+            ),
+        );
         v
     }
 
