@@ -1346,13 +1346,20 @@ impl Core {
     /// can; the client's retry by rid finds it completed). `false` when
     /// `rid` is not parked for durability (a recall park: bounded by the
     /// grant's TTL, so the deadline lets it be).
-    pub(crate) fn abort_durable_park_of(&mut self, rid: Rid, out: &mut Vec<Action>) -> bool {
+    pub(crate) fn abort_durable_park_of(
+        &mut self,
+        rid: Rid,
+        stopped_gens: &BTreeSet<u64>,
+        out: &mut Vec<Action>,
+    ) -> bool {
         let id = self
             .rd
             .parked
             .iter()
             .find(|(_, p)| {
-                p.durable.is_some()
+                (p.durable.is_some()
+                    || p.stream_need
+                        .is_some_and(|(g, _)| stopped_gens.contains(&g)))
                     && matches!(p.what, ParkedWhat::Finish { rid: r, .. } if r == rid)
             })
             .map(|(id, _)| *id);

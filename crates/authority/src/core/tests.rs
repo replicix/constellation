@@ -47024,6 +47024,56 @@ mod deleg_group {
         assert!(h.core.settled_outcome(rid, &h.meta).is_some());
     }
 
+    /// A delegate's own client op, executed and parked until its row is on
+    /// the group (`park_stream_need`), is not held past its deadlines once
+    /// its delegation stopped (renewal refused); while the delegation runs it
+    /// waits for the root's acknowledgement (the unsettled-EIO ceilings of
+    /// `m03` count the rest). The root never acknowledges the row (long-delegated seed 1576 under slow
+    /// lease reads: the lone root died, its delegate's unlink waited 540 s,
+    /// never answered). The client hears in doubt and retries by rid.
+    /// Fails before: `abort_durable_park_of` knew only parks with a journal
+    /// seq, the deadline returned and nothing re-armed.
+    #[test]
+    fn a_delegates_own_op_parked_on_its_stream_row_hears_in_doubt_at_its_deadline() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        root_is_near(&mut h);
+        let (rid, out) = own_create(&mut h, dir, 1);
+        assert!(client_answers(&out).is_empty());
+        let mut answered = Vec::new();
+        for _ in 0..4 {
+            h.advance(120_000);
+            let mut out = Vec::new();
+            h.core
+                .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+            answered.extend(out.into_iter().filter_map(|a| match a {
+                Action::Reply { rid: r, reply, .. } if r == rid => Some(reply),
+                _ => None,
+            }));
+        }
+        assert!(
+            answered.is_empty(),
+            "a running delegation waits: {answered:?}"
+        );
+        h.core.dl.mine.get_mut(&7).expect("generation 7").stopped = true;
+        for _ in 0..4 {
+            h.advance(120_000);
+            let mut out = Vec::new();
+            h.core
+                .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+            answered.extend(out.into_iter().filter_map(|a| match a {
+                Action::Reply { rid: r, reply, .. } if r == rid => Some(reply),
+                _ => None,
+            }));
+            if !answered.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            matches!(answered.as_slice(), [ClientReply::InDoubt]),
+            "{answered:?}"
+        );
+    }
+
     /// I1 (`placement-hot` 1659 under slow lease reads; `long-delegated-late-
     /// answers` 542, 992, `+commit`): the root's own client op, forwarded to
     /// the delegate, is answered from the root's own append of the
