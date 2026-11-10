@@ -182,8 +182,12 @@ impl Roster {
 
     /// A request from `node` reached this node (the one door every peer
     /// message passes). `true` if the node was not heard from since the
-    /// directory last showed it.
+    /// directory last showed it. A node the installed read lists as
+    /// read-only is not evidence: it cannot take the lease over.
     pub(crate) fn note_heard(&mut self, node: NodeId, at: WaitMs) -> bool {
+        if self.read_only.contains(&node) {
+            return false;
+        }
         self.heard.insert(node, at).is_none()
     }
 
@@ -285,11 +289,12 @@ impl Roster {
     /// and S10-I3): a complete read is installed, no incomplete read is
     /// newer, no lapse of this node's is newer than the installed read, the
     /// read lists nobody but `me` as write-eligible, nobody has messaged
-    /// this node since the directory last showed them, and no connected
-    /// link names a node the read does not list as read-only.
+    /// this node since the directory last showed them, and no link is a
+    /// peer's that the read cannot speak for ([`Self::link_is_peer`]: a
+    /// node linked since after the read was issued, or with no known start,
+    /// that the read does not list as read-only).
     ///
-    /// Read by the root's singleton test (step 10, C4).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Read by the root's singleton test (`Core::singleton_now`).
     pub(crate) fn singleton(&self, me: NodeId) -> bool {
         let Some(installed) = self.installed else {
             return false;
@@ -298,10 +303,7 @@ impl Roster {
             && installed.lapses >= self.lapses_seen
             && self.write_eligible.iter().all(|n| *n == me)
             && self.heard.is_empty()
-            && !self
-                .links
-                .values()
-                .any(|l| l.connected && l.node != me && !self.read_only.contains(&l.node))
+            && !self.links.values().any(|l| self.link_is_peer(me, l))
     }
 
     // ------------------------------------------------------- test hooks
@@ -327,6 +329,7 @@ impl Roster {
 
     #[cfg(test)]
     pub(crate) fn set_write_eligible_for_test(&mut self, nodes: Vec<NodeId>) {
+        self.read_only.retain(|n| !nodes.contains(n));
         self.listed = nodes.iter().copied().collect();
         self.write_eligible = nodes;
     }
@@ -336,6 +339,29 @@ impl Roster {
     pub(crate) fn forget_reads_for_test(&mut self) {
         self.installed = None;
         self.last_incomplete = None;
+    }
+
+    /// Make `me` a singleton as a complete read would: only `me` listed,
+    /// nobody heard from, nothing incomplete, no lapse newer than the
+    /// read. The links stay as they are (a test that links a node sets it
+    /// up after, or clears them with `clear_links_for_test`).
+    #[cfg(test)]
+    pub(crate) fn make_singleton_for_test(&mut self, me: NodeId) {
+        self.listed = BTreeSet::from([me]);
+        self.added.clear();
+        self.write_eligible = vec![me];
+        self.heard.clear();
+        self.last_incomplete = None;
+        self.installed = Some(ReadStamp {
+            seq: self.installed.map_or(0, |i| i.seq),
+            lapses: self.lapses_seen,
+            issued: WaitMs(i64::MAX),
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_read_only_for_test(&mut self, nodes: BTreeSet<NodeId>) {
+        self.read_only = nodes;
     }
 
     #[cfg(test)]

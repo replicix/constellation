@@ -24,6 +24,20 @@ fn roster_ev(nodes: Vec<NodeId>, issued: WaitMs) -> Event {
     roster_ev_seq(next_roster_seq(), nodes, true, issued)
 }
 
+/// A complete registry read listing `nodes` as write-eligible and
+/// `read_only` as read-only mounts (ADR-50: the latter are no peers of a
+/// singleton).
+fn roster_ro_ev(nodes: Vec<NodeId>, read_only: Vec<NodeId>, issued: WaitMs) -> Event {
+    Event::Roster {
+        seq: next_roster_seq(),
+        write_eligible: nodes,
+        read_only,
+        complete: true,
+        lapses: 0,
+        issued,
+    }
+}
+
 /// A registry read that could not be completed and listed nobody it read.
 fn roster_unread_ev(issued: WaitMs) -> Event {
     roster_ev_seq(next_roster_seq(), Vec::new(), false, issued)
@@ -54,6 +68,16 @@ fn versionless(source: crate::AnswerSource) -> crate::AnswerSource {
 /// unless a test sets `wait_off`).
 fn w(ms: Ms) -> WaitMs {
     WaitMs(ms.0)
+}
+
+/// A node whose roster lists a write-eligible peer (`peer`), or only itself
+/// (a singleton: nobody heard, nothing linked).
+fn peers_on_roster(h: &mut Harness, peer: bool) {
+    let me = h.core.cfg.node_id;
+    h.core.roster.make_singleton_for_test(me);
+    if peer {
+        h.core.roster.set_write_eligible_for_test(vec![me, 2]);
+    }
 }
 
 struct Harness {
@@ -119,9 +143,16 @@ impl Harness {
             },
             &meta,
         );
-        // An established node: it has read the roster (the audience of a
-        // void is known; tests of the unknown audience clear this).
-        core.roster.mark_seen_for_test(true);
+        // An established node: it has read the roster, which lists it alone
+        // (a singleton; the audience of a void is known; tests of the
+        // unknown audience clear this).
+        core.roster.make_singleton_for_test(node_id);
+        // Nodes 1..=8 are the harness's other mounts: read-only ones, whose
+        // messages (these tests drive forwards, reads and streams between
+        // harnesses) are no evidence of a writer; a test about peers lists
+        // them.
+        core.roster
+            .set_read_only_for_test((1..=8).filter(|n| *n != node_id).collect());
         Self {
             core,
             meta,
@@ -5819,6 +5850,9 @@ fn an_awaiting_log_forward_is_answered_from_completed_once_this_node_holds() {
 #[test]
 fn an_awaiting_log_forward_that_never_landed_executes_here_once_this_node_holds() {
     let (mut requester, rid, _) = awaiting_log_forward("b");
+    // (Node 1, the stalled holder, has left the roster: this node is the
+    // only writer, a singleton.)
+    requester.core.roster.make_singleton_for_test(2);
     requester.hold(2, None);
     let out = activity(&mut requester);
     let r = replies(&out);
@@ -6060,7 +6094,7 @@ mod own_chunks {
             ..lease_of(1, 1, holder.now.plus(10_000).0)
         };
         holder.core.lease.adopt(holder.clk(), lease, tag(), None);
-        holder.core.ack.eligible = Some(false);
+        holder.core.roster.make_singleton_for_test(1);
         (holder, requester)
     }
 
@@ -15104,19 +15138,20 @@ mod backup_crash {
         };
         assert_eq!(h.core.lease.ack_policy(), AckPolicy::Local);
         assert!(h.core.ack.candidate.is_none());
-        // Not yet assessed this tenure: gated.
-        assert_eq!(h.core.ack.eligible, None);
+        // No complete roster read yet: unknown is not alone, gated.
+        h.core.roster.forget_reads_for_test();
         assert_eq!(h.core.ack_need(&pos), Some(5));
-        // A peer in budget, no candidate yet: gated.
-        h.core.ack.eligible = Some(true);
+        // A write-eligible peer, no candidate yet: gated.
+        peers_on_roster(&mut h, true);
         assert_eq!(h.core.ack_need(&pos), Some(5));
-        // Nobody in budget: today's `Local`.
-        h.core.ack.eligible = Some(false);
+        // The roster lists nobody else: a singleton, today's `Local`.
+        peers_on_roster(&mut h, false);
         assert_eq!(h.core.ack_need(&pos), None);
-        // A configuration that never selects a backup never gates.
-        h.core.ack.eligible = None;
+        // A peer measured out of budget (or none linked) gates as well
+        // (ADR-50): the budget no longer decides who answers alone.
+        peers_on_roster(&mut h, true);
         h.core.cfg.backup_rtt_budget_ms = 0;
-        assert_eq!(h.core.ack_need(&pos), None);
+        assert_eq!(h.core.ack_need(&pos), Some(5));
     }
 
     /// The configuration of the backup-sim configs: a backup within 50 ms,
@@ -15196,15 +15231,16 @@ mod backup_crash {
             (Some(5), 5_000, true), // stable
             (None, 0, true),        // not yet measured
             (None, 5_000, true),
-            (Some(80), 0, false), // measured out of budget
-            (Some(80), 5_000, false),
+            // Measured out of budget: still a peer that takes over (ADR-50;
+            // `a_far_peer_ends_the_singleton`).
+            (Some(80), 0, true),
+            (Some(80), 5_000, true),
         ] {
             let mut h = Harness::new(1);
             backup_node(&mut h, vec![1, 2]);
             link_2(&mut h, true, rtt, age);
             h.hold(1, None);
             // As `acquire_won` assesses it.
-            h.core.ack.eligible = Some(h.core.backup_could_be_had());
             let what = format!("(rtt {rtt:?}, link up {age} ms)");
             if gated {
                 assert_eq!(h.core.ack_need(&pos), Some(5), "{what}");
@@ -15231,6 +15267,10 @@ mod backup_crash {
         link_2(&mut h, true, Some(5), 0);
         h.hold(1, None);
         assert!(!h.core.backup_could_be_had(), "not on the roster");
+        assert!(
+            h.core.singleton_now(),
+            "linked before the read that does not list it: it left"
+        );
         h.step(roster_ev(vec![1, 2], WaitMs(i64::MAX)));
         assert!(h.core.backup_could_be_had());
         // One that sealed the epoch is no candidate but still a peer that
@@ -15242,17 +15282,18 @@ mod backup_crash {
         assert!(!h.core.backup_could_be_had(), "not connected");
     }
 
-    /// A true singleton (nobody else on the roster, or no one linked) is
-    /// still answered at once on its disk: plan 46 D3 keeps the exemption.
+    /// A true singleton (nobody else on the roster; a node linked before
+    /// the read that does not list it has left) is still answered at once
+    /// on its disk: plan 46 D3 keeps the exemption. A roster peer that is not
+    /// linked is no singleton's peer (`an_unlinked_roster_peer_ends_the_singleton`).
     #[test]
     fn a_singleton_still_answers_alone() {
         let pos = pos_5();
-        for (roster, linked) in [(vec![1], false), (vec![1, 2], false), (vec![1], true)] {
+        for (roster, linked) in [(vec![1], false), (vec![1], true)] {
             let mut h = Harness::new(1);
             backup_node(&mut h, roster.clone());
             link_2(&mut h, linked, Some(5), 0);
             h.hold(1, None);
-            h.core.ack.eligible = Some(h.core.backup_could_be_had());
             let what = format!("(roster {roster:?}, node 2 linked {linked})");
             assert_eq!(h.core.ack_need(&pos), None, "{what}");
             assert_eq!(
@@ -15277,7 +15318,6 @@ mod backup_crash {
         assert!(h.core.backup_could_be_had());
         h.step(roster_unread_ev(WaitMs(i64::MAX)));
         assert!(h.core.backup_could_be_had(), "peers linked, roster unread");
-        h.core.ack.eligible = Some(h.core.backup_could_be_had());
         assert!(!h.core.root_lone(), "must not answer alone");
         // Even with the peer not on the kept roster, an unread roster is
         // unknown, not empty.
@@ -15337,7 +15377,6 @@ mod backup_crash {
             WaitMs(i64::MAX),
         ));
         assert_eq!(h.core.roster.write_eligible(), [1, 2], "none is removed");
-        h.core.ack.eligible = Some(h.core.backup_could_be_had());
         assert!(!h.core.root_lone(), "must not answer alone");
         h.step(roster_ev_seq(
             next_roster_seq(),
@@ -15366,7 +15405,6 @@ mod backup_crash {
         h.step(roster_ev(vec![1], w(h.now)));
         h.hold(1, None);
         link_2(&mut h, false, None, 0);
-        h.core.ack.eligible = Some(h.core.backup_could_be_had());
         assert_eq!(h.core.ack_need(&pos), None, "lone before the link");
         assert!(h.core.root_lone());
         // Node 2 links, 1 s after the read; the roster is not read again.
@@ -15384,7 +15422,7 @@ mod backup_crash {
         assert_eq!(h.core.backup_candidates(h.clk()), vec![2]);
         // A read issued after the link that does not list it: no peer.
         h.advance(10);
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         h.step(roster_ev(vec![1], w(h.now)));
         assert!(!h.core.backup_could_be_had(), "read after the link");
         assert!(h.core.backup_candidates(h.clk()).is_empty());
@@ -15406,7 +15444,6 @@ mod backup_crash {
         let mut h = Harness::new(1);
         backup_node(&mut h, vec![1]);
         h.hold(1, None);
-        h.core.ack.eligible = Some(h.core.backup_could_be_had());
         let v = h.core.lease.held.as_ref().unwrap().0.config_version;
         assert_eq!(rule(&h, Asker::Own), CommitRule::Singleton { version: v });
         assert_eq!(
@@ -15441,22 +15478,28 @@ mod backup_crash {
     }
 
     /// I1 class 2 (backup+commit seed 578, long-backup 1942 under slow
-    /// reads): a root resumed from a pause answered alone on the directory
-    /// it held before it. Node 2 came up meanwhile; its link was in the
-    /// snapshots queued behind the event that resumed the root. Knowledge
-    /// older than the node's own lapse is not knowledge at answer time: the
-    /// root is lone again only on a snapshot taken after the lapse was
-    /// handed (`Event::Peers`'s `lapses`), counted, not timed: the wait
+    /// reads), ADR-50: a root resumed from a pause answered alone on what it
+    /// knew before it. A node registered meanwhile. Knowledge older than the
+    /// node's own lapse is not knowledge at answer time: the root is a
+    /// singleton again only on a registry read issued after the lapse was
+    /// handed (`Event::Roster`'s `lapses`), counted, not timed: the wait
     /// clock does not count a suspend. Fails before: lone throughout.
     #[test]
     fn a_root_is_not_lone_across_its_own_lapse_until_a_later_directory() {
         let pos = pos_5();
+        let read = |h: &mut Harness, lapses: u64| {
+            h.step(Event::Roster {
+                seq: next_roster_seq(),
+                write_eligible: vec![1],
+                read_only: Vec::new(),
+                complete: true,
+                lapses,
+                issued: WaitMs(i64::MAX),
+            })
+        };
         let mut h = Harness::new(1);
-        backup_node(&mut h, vec![1, 2]);
-        // Genuinely lone: node 2 is on the roster, not linked.
-        link_2(&mut h, false, None, 0);
+        backup_node(&mut h, vec![1]);
         h.hold(1, None);
-        h.core.ack.eligible = Some(h.core.backup_could_be_had());
         assert_eq!(h.core.ack_need(&pos), None);
         assert!(h.core.root_lone());
         // Paused for seconds (the wait clock moved 1 ms), the lapse is
@@ -15464,26 +15507,25 @@ mod backup_crash {
         own_lapse(&mut h, 1);
         assert!(
             h.core.ack_need(&pos).is_some(),
-            "answered alone on a directory older than its lapse"
+            "answered alone on a roster older than its lapse"
         );
         assert!(!h.core.root_lone());
         assert_ne!(
             h.core.root_commit(Asker::Own).versionless(),
             RowCommit::LONE
         );
-        // The snapshots queued during the pause were taken before the lapse
-        // was handed: they show where the peers were, not that none is.
+        // The reads queued during the pause were issued before the lapse was
+        // handed: they show who was there, not that none is.
         h.advance(10);
-        link_2_after(&mut h, false, None, 0, 0);
-        assert!(!h.core.root_lone(), "a snapshot from before the lapse");
-        // Housekeeping does not lower it on that directory either.
+        read(&mut h, 0);
+        assert!(!h.core.root_lone(), "a read from before the lapse");
         h.advance(100);
-        link_2_after(&mut h, false, None, 0, 0);
+        read(&mut h, 0);
         assert!(h.core.ack_need(&pos).is_some());
-        // A snapshot taken after the lapse was handed: lone again, once the
-        // selection pass assesses it (housekeeping lowers it, never an event).
+        // A read issued after the lapse was handed: a singleton again, once
+        // the bump has landed.
         h.advance(10);
-        link_2_after(&mut h, false, None, 0, 1);
+        read(&mut h, 1);
         h.advance(100);
         h.step(Event::Activity {
             last_write: WaitMs(0),
@@ -15492,15 +15534,15 @@ mod backup_crash {
         settle_singleton(&mut h);
         assert_eq!(h.core.ack_need(&pos), None, "a singleton waits for ever");
         assert!(h.core.root_lone());
-        // Another lapse: not lone until the next snapshot after it; and a
-        // snapshot taken during the lapse (it carries the count before it)
-        // does not restore it.
+        // Another lapse: not lone until the next read after it; and a read
+        // issued during the lapse (it carries the count before it) does not
+        // restore it.
         own_lapse(&mut h, 1);
         assert!(!h.core.root_lone());
-        link_2_after(&mut h, false, None, 0, 1);
-        assert!(!h.core.root_lone(), "a snapshot taken during the lapse");
+        read(&mut h, 1);
+        assert!(!h.core.root_lone(), "a read taken during the lapse");
         h.advance(100);
-        link_2_after(&mut h, false, None, 0, 2);
+        read(&mut h, 2);
         h.step(Event::Activity {
             last_write: WaitMs(0),
             acked_seqs: Vec::new(),
@@ -15608,66 +15650,58 @@ mod backup_crash {
         assert_eq!(replies(&out).len(), 1, "{out:?}");
     }
 
-    /// i1-592: the assessment is cached, and a peer that becomes linked
-    /// after it must be counted by the event that tells of it, not by the
-    /// next housekeeping pass (`HOUSEKEEPING_MS` later): the answer given
-    /// in between rested on this disk alone. (Fails before: `None`, `Lone`.)
+    /// i1-592 (ADR-50): the singleton test is judged from the inputs of the
+    /// event, never from a cache, so a peer that appears - linked, listed,
+    /// or heard from - is counted by the event that tells of it: an answer
+    /// given in between would rest on this disk alone. (Fails before, with
+    /// the cache: `None`, `Lone`.)
     #[test]
     fn a_lone_assessment_is_upgraded_by_the_event_that_changes_the_links() {
         let pos = pos_5();
+        // A singleton: the roster lists only this node.
         let mut h = Harness::new(1);
-        backup_node(&mut h, vec![1, 2]);
+        backup_node(&mut h, vec![1]);
+        h.step(roster_ev(vec![1], w(h.now)));
         h.hold(1, None);
-        // Housekeeping runs with nobody linked: assessed, lone.
         link_2(&mut h, false, None, 0);
-        assert_eq!(h.core.ack.eligible, Some(false));
         assert_eq!(h.core.ack_need(&pos), None);
-        // Less than a housekeeping period later, the peer is linked.
+        // Less than a housekeeping period later, the peer is linked (since
+        // after the roster read, which cannot speak for it).
         h.advance(10);
-        link_2(&mut h, true, Some(5), 1_000);
+        link_2(&mut h, true, Some(5), 0);
         assert_eq!(h.core.ack_need(&pos), Some(5), "answered alone");
         assert_ne!(
             h.core.root_commit(Asker::Own).versionless(),
             RowCommit::LONE
         );
 
-        // The roster is what changed: node 2 was linked but not listed.
+        // The roster is what changed: node 2 registered and is not linked.
         let mut h = Harness::new(1);
         backup_node(&mut h, vec![1]);
-        link_2(&mut h, true, Some(5), 1_000);
         h.hold(1, None);
-        link_2(&mut h, true, Some(5), 1_000);
-        assert_eq!(h.core.ack.eligible, Some(false));
+        assert_eq!(h.core.ack_need(&pos), None);
         h.advance(10);
         h.step(roster_ev(vec![1, 2], WaitMs(i64::MAX)));
         assert_eq!(h.core.ack_need(&pos), Some(5), "answered alone");
 
-        // Any event raises it: the clock alone does not change what a link
-        // is, but a link that was not counted at the assessment is.
+        // Any event: a link that was not counted before is.
         let mut h = Harness::new(1);
         backup_node(&mut h, vec![1, 2]);
         h.hold(1, None);
         link_2(&mut h, false, None, 0);
         h.core.roster.link_mut_for_test(2).unwrap().connected = true;
         h.core.roster.link_mut_for_test(2).unwrap().rtt_ms = Some(5);
-        assert_eq!(h.core.ack_need(&pos), None, "(no event yet)");
-        h.advance(1);
-        h.step(Event::Activity {
-            last_write: WaitMs(0),
-            acked_seqs: Vec::new(),
-        });
-        assert_eq!(h.core.ack_need(&pos), Some(5));
+        assert_eq!(h.core.ack_need(&pos), Some(5), "listed: never alone");
 
-        // Never lowered by it: a link that went down waits for the
-        // selection pass.
+        // Never lowered by a link going down: the peer is on the roster.
         let mut h = Harness::new(1);
         backup_node(&mut h, vec![1, 2]);
         h.hold(1, None);
         link_2(&mut h, true, Some(5), 1_000);
-        assert_eq!(h.core.ack.eligible, Some(true));
+        assert!(!h.core.singleton_now());
         h.advance(10);
         link_2(&mut h, false, Some(5), 0);
-        assert_eq!(h.core.ack.eligible, Some(true), "lowered by a link event");
+        assert!(!h.core.singleton_now(), "a peer that is unlinked is a peer");
     }
 
     /// i1-592, the seed's shape: an own op queued behind an acquisition runs
@@ -15768,7 +15802,6 @@ mod backup_crash {
         // (Not yet stable: no candidate is brought up.)
         link_2(&mut h, true, Some(5), 0);
         h.hold(1, None);
-        h.core.ack.eligible = Some(h.core.backup_could_be_had());
         assert_eq!(
             h.core.root_commit(Asker::Own).versionless(),
             RowCommit::ARCHIVE
@@ -15803,12 +15836,12 @@ mod backup_crash {
             tag: Default::default(),
         });
         assert!(replies(&out).is_empty(), "answered at once: {out:?}");
-        // The peer goes away; the next selection pass finds nobody in
-        // budget. Plan 46 M1.1 step 5: the rule does not change until the
-        // lease's singleton bump has landed and the log carries the
-        // journal through it, and the row keeps its class (Archive).
+        // The peer leaves the roster (ADR-50). Plan 46 M1.1 step 5: the rule
+        // does not change until the lease's singleton bump has landed and
+        // the log carries the journal through it, and the row keeps its
+        // class (Archive).
         h.advance(100);
-        let out = link_2(&mut h, false, None, 0);
+        let out = h.step(roster_ev(vec![1], WaitMs(i64::MAX)));
         assert!(
             replies(&out).is_empty(),
             "answered before the bump: {out:?}"
@@ -15850,7 +15883,6 @@ mod backup_crash {
         // (Not yet stable: no candidate is brought up.)
         link_2(&mut h, true, Some(5), 0);
         h.hold(1, None);
-        h.core.ack.eligible = Some(h.core.backup_could_be_had());
         let (rid1, rid2) = (h.rid(1), h.rid(2));
         let (op1, op2) = (h.create("a"), h.create("b"));
         {
@@ -16039,7 +16071,7 @@ mod backup_crash {
         let alone = |h: &mut Harness| {
             h.core.ack.candidate = None;
             h.core.ack.peers.remove(&2);
-            h.core.ack.eligible = Some(false);
+            h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         };
 
         let (mut h, _, _) = in_doubt();
@@ -16096,7 +16128,7 @@ mod backup_crash {
         // The candidate dropped (`backup_timeouts`), nobody in budget.
         h.core.ack.candidate = None;
         h.core.ack.peers.remove(&2);
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         assert_eq!(
             h.core.ack_need(&pos(5)),
             Some(5),
@@ -27667,7 +27699,9 @@ mod locks {
         l.expires_unix_ms = end;
         l.holder_expires_ms = end;
         l.holder_wait_ms = wait_end;
-        let out = h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
+        // (Nodes 1 and 3 are read-only mounts here: a bump to a non-singleton
+        // configuration is not what this test is about.)
+        let out = h.step(roster_ro_ev(vec![2], vec![1, 3], WaitMs(i64::MAX)));
         lease_swaps(&out)
             .into_iter()
             .find(|(_, l)| !l.granted_delegations && !l.released && l.holder == 2)
@@ -30418,7 +30452,7 @@ mod locks {
             token(GrantId { node: 1, seq: 1 }, h.now.0 - 1).to_wire(HonourMs(0));
         // A lone root (the seed's; as `lone_singleton_root`): its own op's
         // row is a singleton row.
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         {
             let lease = &mut h.core.lease.held.as_mut().unwrap().0;
             lease.ack_policy = constellation_store_s3::AckPolicy::Local;
@@ -32436,6 +32470,13 @@ mod locks {
             delegated_file(&h.meta);
             let mut out = Vec::new();
             h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+            // (A live generation of node 3 ends the singleton, S10-I4: the
+            // configuration change it asks for has landed.)
+            h.step(Event::Activity {
+                last_write: WaitMs(0),
+                acked_seqs: Vec::new(),
+            });
+            super::land_reconfig(&mut h);
             h
         };
         // 4.7 s of the lease left (its renewal is due at 3 s): the answer
@@ -34600,7 +34641,7 @@ mod s3_no_loops {
 
     /// Root node 1 with `d1` delegated to node 3 (generation 1 here) a
     /// moment ago, every peer's link up.
-    fn delegated_root() -> (Harness, constellation_fs_core::Ino, u64) {
+    pub(super) fn delegated_root() -> (Harness, constellation_fs_core::Ino, u64) {
         let (mut h, dir) = root_with_dir();
         let out = h.step(Event::Control {
             op: OpId(900),
@@ -36987,11 +37028,7 @@ fn a_candidate_that_sealed_the_epoch_is_not_reinvited() {
     assert!(sealed_answers >= 1, "the candidate was never streamed to");
     assert_eq!(invited, 1, "re-invited a backup that sealed the epoch");
     assert_eq!(h.core.ack.candidate, None);
-    assert_eq!(
-        h.core.ack.eligible,
-        Some(true),
-        "a linked sealer is no lone peer"
-    );
+    assert!(!h.core.singleton_now(), "a linked sealer is no lone peer");
     assert_eq!(
         h.core.root_commit(Asker::Own).versionless(),
         RowCommit::ARCHIVE
@@ -44816,10 +44853,9 @@ mod answer_sources {
             op: h.create("a"),
             tag: Default::default(),
         });
-        // (Parked as the archive's while the first assessment of peers was
-        // out, released when it found none: the answer a lone node gives,
-        // so it says `Lone` and its row is re-tagged, plan 43 C1-2 D4.)
-        assert_eq!(class, RowCommit::ARCHIVE);
+        // (A singleton from the start, ADR-50: its roster lists nobody else,
+        // so the answer says `Lone`.)
+        assert_eq!(class, RowCommit::LONE);
         assert_eq!(
             sources(&out),
             vec![(h.rid(1), AnswerSource::Sequenced(RowCommit::LONE))]
@@ -44940,7 +44976,7 @@ mod answer_sources {
     fn a_forwarded_answer_is_counted_by_the_class_it_waited_for() {
         let mut h = Harness::new(1);
         h.hold(1, None);
-        let class = h.core.root_commit(Asker::Own).versionless();
+        let class = h.core.root_commit(Asker::Remote).versionless();
         let out = h.step_archived(Event::Peer {
             from: 2,
             msg: PeerMsg::MutateRequest {
@@ -46410,7 +46446,7 @@ mod deleg_group {
                 shippable: true,
             }),
         );
-        h.core.ack.eligible = Some(eligible);
+        peers_on_roster(&mut h, eligible);
         let mut out = Vec::new();
         h.core.complete_gate(h.clk(), &h.meta, &mut out);
         assert_eq!(h.core.stats.own_deleg_rows_reappended, 1);
@@ -46522,7 +46558,7 @@ mod deleg_group {
                 shippable: true,
             }),
         );
-        h.core.ack.eligible = Some(true);
+        peers_on_roster(&mut h, true);
         let mut out = Vec::new();
         h.core.complete_gate(h.clk(), &h.meta, &mut out);
         assert_eq!(h.core.stats.own_deleg_rows_reappended, 2);
@@ -46609,7 +46645,7 @@ mod deleg_group {
                 shippable: true,
             }),
         );
-        h.core.ack.eligible = Some(true);
+        peers_on_roster(&mut h, true);
         h.core.complete_gate(h.clk(), &h.meta, &mut out);
         assert_eq!(h.core.stats.own_deleg_rows_reappended, 1);
         assert_eq!(h.meta.log_stream_idx(7).unwrap(), 1);
@@ -47426,7 +47462,7 @@ mod deleg_group {
                     shippable: true,
                 }),
             );
-            h.core.ack.eligible = Some(false);
+            h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
             assert_eq!(h.core.durable_jseq(), u64::MAX, "a lone root gates nothing");
             if gate_done {
                 let mut out = Vec::new();
@@ -47472,7 +47508,7 @@ mod deleg_group {
                 shippable: true,
             }),
         );
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         assert_eq!(h.core.durable_jseq(), u64::MAX, "a lone root gates nothing");
         if gate_done {
             let mut out = Vec::new();
@@ -47580,7 +47616,7 @@ mod deleg_group {
                 shippable: true,
             }),
         );
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         assert_eq!(h.core.durable_jseq(), u64::MAX, "a lone root gates nothing");
         let mut out = Vec::new();
         h.core.complete_gate(h.clk(), &h.meta, &mut out);
@@ -47595,7 +47631,7 @@ mod deleg_group {
         // the tip that lands out of order below.)
         let rid2 = h.rid(2);
         let _ = remote_retry_of_own_row(&mut h, rid2, 899);
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         let tip = h.meta.journal_tip().unwrap();
         assert!(tip > r, "a later row ({tip} <= {r})");
         h.core.ack.shipped_rows.insert(tip);
@@ -48077,7 +48113,7 @@ mod deleg_group {
             ..lease_of(1, 1, h.now.plus(10_000).0)
         };
         h.core.lease.adopt(h.clk(), lease, tag(), None);
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         let now = w(h.now);
         h.core.ack.peers.insert(
             2,
@@ -48254,7 +48290,7 @@ mod deleg_group {
         h.core.cfg.p2p = true;
         h.core.cfg.delegation_ttl_ms = 1_000;
         h.hold(1, None);
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         // The bump that records the singleton landed and is committed.
         h.core.lease.held.as_mut().unwrap().0.singleton = true;
         h.core.lease.held.as_mut().unwrap().0.ack_policy = constellation_store_s3::AckPolicy::Local;
@@ -48950,21 +48986,22 @@ mod deleg_group {
         assert_eq!(d.core.stats.deleg_root_pokes, 0);
     }
 
-    /// A lone root (no backup, none to be had; its configuration commits by
-    /// the archive alone), as in `a_lone_root_acks_a_delegates_row_as_committed_only_once_it_ships`.
+    /// A root whose configuration commits by the archive alone (no backup
+    /// listed; with a live generation of node 3 it is no singleton, ADR-50),
+    /// as in `a_lone_root_acks_a_delegates_row_as_committed_only_once_it_ships`.
     fn lone_singleton_root() -> Harness {
         let mut h = Harness::new(1);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
         h.core.cfg.delegation_ttl_ms = 1_000;
         h.hold(1, None);
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         h.core.lease.held.as_mut().unwrap().0.singleton = true;
         h.core.lease.held.as_mut().unwrap().0.ack_policy = constellation_store_s3::AckPolicy::Local;
         h.core.ack.cfg_seen = None;
         h.core.ack.spans.clear();
         h.core.sync_cfg_spans(&h.meta);
-        assert_eq!(h.core.durable_jseq(), u64::MAX);
+        assert!(h.core.config_archive_bound());
         h
     }
 
@@ -50101,7 +50138,7 @@ mod c1_counted {
         // backup is safe to issue (`removal_safe`).
         h.core.note_shipped(&[tip1], tip1);
         // Nobody else in budget: `Local` after the removal.
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         (h, tip1)
     }
 
@@ -54979,7 +55016,7 @@ mod c1_class {
         h.core.lease.held.as_mut().unwrap().0.backups.clear();
         h.core.ack.peers.clear();
         h.core.ack.candidate = None;
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         // The bump that records the singleton landed and is committed.
         h.core.lease.held.as_mut().unwrap().0.singleton = true;
         h.core.lease.held.as_mut().unwrap().0.ack_policy = constellation_store_s3::AckPolicy::Local;
@@ -56308,7 +56345,7 @@ mod c2f_lone_root {
         h.core.lease.held.as_mut().unwrap().0.backups.clear();
         h.core.ack.peers.clear();
         h.core.ack.candidate = None;
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         // The bump that records the singleton landed and is committed.
         h.core.lease.held.as_mut().unwrap().0.singleton = true;
         h.core.lease.held.as_mut().unwrap().0.ack_policy = constellation_store_s3::AckPolicy::Local;
@@ -56336,7 +56373,7 @@ mod c2f_lone_root {
     /// says otherwise): the root is a singleton again.
     fn forget_requesters(h: &mut Harness) {
         h.core.roster.clear_heard_for_test();
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
     }
 
     /// The log carries everything journaled so far.
@@ -57458,7 +57495,7 @@ mod c2g_settle {
         h.hold(1, None);
         h.core.ack.peers.clear();
         h.core.ack.candidate = None;
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         assert!(h.core.root_lone());
         let deadline = h.core.clients[&rid].deadline;
         let out = h.step(Event::Timer { id: deadline });
@@ -57506,7 +57543,7 @@ mod c2g_settle {
         h.hold(1, None);
         h.core.ack.peers.clear();
         h.core.ack.candidate = None;
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         assert!(h.core.root_lone());
         let deadline = h.core.clients[&rid].deadline;
         let out = h.step(Event::Timer { id: deadline });
@@ -57528,7 +57565,7 @@ mod c2g_settle {
         h.hold(1, None);
         h.core.ack.peers.clear();
         h.core.ack.candidate = None;
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         assert!(h.core.root_lone());
         let op = h.create("i");
         let mut batch = inbox_batch(1, 0, 1, &op);
@@ -57839,7 +57876,7 @@ mod c2g_settle {
         );
         h.core.ack.peers.clear();
         h.core.ack.candidate = None;
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         let deadline = h.core.clients[&rid].deadline;
         let out = h.step(Event::Timer { id: deadline });
         assert!(
@@ -57941,7 +57978,7 @@ mod c2g_settle {
         );
         h.core.ack.peers.clear();
         h.core.ack.candidate = None;
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         let c = h.core.clients.get_mut(&rid).expect("in flight");
         c.settle = true;
         c.forwarded = true;
@@ -58562,7 +58599,7 @@ mod c2g_settle {
         );
         h.core.ack.peers.clear();
         h.core.ack.candidate = None;
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
         crate::replica::Replica::apply_segment(
@@ -60238,7 +60275,7 @@ mod await_retry {
             ..lease_of(1, 1, h.now.plus(10_000).0)
         };
         h.core.lease.adopt(h.clk(), lease, tag(), None);
-        h.core.ack.eligible = Some(false);
+        h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         let now = w(h.now);
         h.core.ack.peers.insert(
             3,
@@ -61906,7 +61943,6 @@ mod m11_step5 {
         let mut h = Harness::new(1);
         backup_node(&mut h, vec![1]);
         h.hold(1, None);
-        h.core.ack.eligible = Some(h.core.backup_could_be_had());
         assert!(h.core.root_lone(), "a singleton");
         let before = h.core.stats.reconfig_cas;
         let out = h.step(Event::Peer {
@@ -61971,8 +62007,9 @@ mod m11_step5 {
         // `backup_node`'s read is stamped at the end of time; the reads
         // below are issued by the clock.
         h.core.roster.forget_reads_for_test();
+        let at = h.clk().wait;
+        roster_read(&mut h, vec![1], at);
         h.hold(1, None);
-        h.core.ack.eligible = Some(h.core.backup_could_be_had());
         assert!(h.core.root_lone());
         h.advance(100);
         let before = h.clk().wait;
@@ -62011,7 +62048,7 @@ mod m11_step5 {
             !swap_lease(&out).is_some_and(|l| l.singleton),
             "a stale read undid the singleton test: the root bumps back to a singleton with a peer live: {out:?}"
         );
-        assert!(!h.core.lone_by_event());
+        assert!(!h.core.singleton_now());
         // A read issued after the request is the truth.
         h.advance(100);
         let issued = h.clk().wait;
@@ -62026,23 +62063,21 @@ mod m11_step5 {
     #[test]
     fn the_singleton_bump_commits_under_old_and_new_in_both_directions() {
         let mut h = Harness::new(1);
-        backup_node(&mut h, vec![1, 2]);
-        link_2(&mut h, false, None, 0);
+        backup_node(&mut h, vec![1]);
         h.hold(1, None);
-        h.core.ack.eligible = Some(h.core.backup_could_be_had());
         assert!(h.core.root_lone());
-        // A peer links: the event flips the test; the bump is issued.
-        let out = link_2(&mut h, true, Some(5), 0);
+        // A peer registers: the event flips the test; the bump is issued.
+        let out = h.step(roster_ev(vec![1, 2], WaitMs(i64::MAX)));
         assert!(!h.core.root_lone());
         assert!(swap_lease(&out).is_some_and(|l| !l.singleton), "{out:?}");
         let (r1, out) = submit(&mut h, 1, "r1");
         assert!(replies(&out).is_empty(), "{out:?}");
         super::land_reconfig(&mut h);
         assert!(!h.core.lease.held.as_ref().unwrap().0.singleton);
-        // The peer goes away: the next selection pass lowers the test, and
-        // the bump back to a singleton is issued, then lands.
+        // The peer leaves the roster: the test is lowered, and the bump back
+        // to a singleton is issued, then lands.
         h.advance(100);
-        link_2(&mut h, false, None, 0);
+        h.step(roster_ev(vec![1], WaitMs(i64::MAX)));
         h.advance(400);
         let out = activity(&mut h);
         assert!(swap_lease(&out).is_some_and(|l| l.singleton), "{out:?}");
@@ -62077,17 +62112,15 @@ mod m11_step5 {
     #[test]
     fn lone_ok_is_not_published_while_a_closed_configuration_is_uncommitted() {
         let mut h = Harness::new(1);
-        backup_node(&mut h, vec![1, 2]);
-        link_2(&mut h, false, None, 0);
+        backup_node(&mut h, vec![1]);
         h.hold(1, None);
-        h.core.ack.eligible = Some(h.core.backup_could_be_had());
-        let out = link_2(&mut h, true, Some(5), 0);
+        let out = h.step(roster_ev(vec![1, 2], WaitMs(i64::MAX)));
         assert!(swap_lease(&out).is_some_and(|l| !l.singleton), "{out:?}");
         let (_r1, out) = submit(&mut h, 1, "r1");
         assert!(replies(&out).is_empty(), "{out:?}");
         super::land_reconfig(&mut h);
         h.advance(100);
-        link_2(&mut h, false, None, 0);
+        h.step(roster_ev(vec![1], WaitMs(i64::MAX)));
         h.advance(400);
         let out = activity(&mut h);
         assert!(swap_lease(&out).is_some_and(|l| l.singleton), "{out:?}");
@@ -62104,6 +62137,120 @@ mod m11_step5 {
         assert!(h.meta.session().durable_lone_ok());
     }
 
+    /// ADR-50: a root with a write-eligible peer measured far out of the
+    /// RTT budget is no singleton: a takeover by that peer would roll back
+    /// what the root answered alone (`far-root-writes`). It waits for the
+    /// archive. (Fails before: `Lone`.)
+    #[test]
+    fn a_far_peer_ends_the_singleton() {
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1, 2]);
+        h.core.cfg.backup_rtt_budget_ms = 5;
+        link_2(&mut h, true, Some(120), 5_000);
+        h.hold(1, None);
+        assert!(!h.core.singleton_now());
+        assert!(!h.core.root_lone());
+        assert_eq!(
+            h.core.root_commit(Asker::Own).versionless(),
+            RowCommit::ARCHIVE
+        );
+    }
+
+    /// ADR-50: a registered peer that is not linked at all (not mounted,
+    /// partitioned) is a peer that can claim the lease after its TTL.
+    /// (Fails before: `Lone`.)
+    #[test]
+    fn an_unlinked_roster_peer_ends_the_singleton() {
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1, 2]);
+        link_2(&mut h, false, None, 0);
+        h.hold(1, None);
+        assert!(!h.core.singleton_now());
+        assert!(!h.core.root_lone());
+        assert_eq!(
+            h.core.root_commit(Asker::Own).versionless(),
+            RowCommit::ARCHIVE
+        );
+    }
+
+    /// ADR-50: every message kind from a node the roster does not list is
+    /// evidence of a peer (main counted only a `MutateRequest` and an inbox
+    /// batch), at the one door, and the lease's bump follows in the same
+    /// event. A read-only node's is none. (Fails before: stays singleton.)
+    #[test]
+    fn a_read_index_from_an_unknown_node_ends_the_singleton() {
+        let ask = |h: &mut Harness, from: NodeId| {
+            h.step(Event::Peer {
+                from,
+                msg: PeerMsg::ReadIndex {
+                    req: OpId(1),
+                    ino: ROOT_INO,
+                    dir: false,
+                    name: None,
+                    ahead: crate::event::ReadAhead::None,
+                },
+            })
+        };
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1]);
+        h.step(Event::Roster {
+            seq: next_roster_seq(),
+            write_eligible: vec![1],
+            read_only: vec![3],
+            complete: true,
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+        h.hold(1, None);
+        assert!(h.core.singleton_now());
+        // (Node 3 is a read-only mount here.)
+        let out = ask(&mut h, 3);
+        assert!(h.core.singleton_now(), "a read-only node is no peer");
+        assert!(swap_lease(&out).is_none(), "{out:?}");
+        let out = ask(&mut h, 20);
+        assert!(!h.core.singleton_now());
+        assert!(!h.core.root_lone());
+        assert!(swap_lease(&out).is_some_and(|l| !l.singleton), "{out:?}");
+    }
+
+    /// ADR-50 S10-I4: a live generation another node holds ends the
+    /// singleton whatever the roster says (that node takes over with its
+    /// tail); once it has ended, the root is one again. (Fails before:
+    /// roster [1] is lone.)
+    #[test]
+    fn a_live_foreign_generation_ends_the_singleton() {
+        let (mut h, _dir, gen) = super::s3_no_loops::delegated_root();
+        h.core.roster.make_singleton_for_test(1);
+        assert!(h.core.dl.gens[&gen].node != 1 && !h.core.dl.gens[&gen].ended);
+        assert!(!h.core.singleton_now(), "a live generation of node 3");
+        h.core.dl.gens.get_mut(&gen).unwrap().ended = true;
+        assert!(h.core.singleton_now());
+    }
+
+    /// ADR-50 S10-I5: the flip is a configuration change in the event that
+    /// brings the peer: the engine's fast path stops answering alone in
+    /// the same event (the published `lone_ok`). (Fails before: published
+    /// until the next selection pass.)
+    #[test]
+    fn the_flip_lowers_lone_ok_in_the_same_event() {
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1]);
+        h.hold(1, None);
+        activity(&mut h);
+        assert!(h.meta.session().durable_lone_ok());
+        h.step(Event::Peer {
+            from: 20,
+            msg: PeerMsg::ReadIndex {
+                req: OpId(1),
+                ino: ROOT_INO,
+                dir: false,
+                name: None,
+                ahead: crate::event::ReadAhead::None,
+            },
+        });
+        assert!(!h.meta.session().durable_lone_ok());
+    }
+
     /// Perf: the steady path takes no lease CAS: a singleton and a backed
     /// root answer a run of rows without a configuration change.
     #[test]
@@ -62111,7 +62258,6 @@ mod m11_step5 {
         let mut h = Harness::new(1);
         backup_node(&mut h, vec![1]);
         h.hold(1, None);
-        h.core.ack.eligible = Some(h.core.backup_could_be_had());
         for i in 0..50 {
             let (_, out) = submit(&mut h, 10 + i, &format!("f{i}"));
             assert_eq!(replies(&out).len(), 1, "{out:?}");

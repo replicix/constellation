@@ -3627,7 +3627,7 @@ impl Core {
             Plan::Create => {
                 let lease =
                     self.lease
-                        .granted_lease(now, &self.cfg, None, false, self.singleton_test());
+                        .granted_lease(now, &self.cfg, None, false, self.singleton_now());
                 let op = self.issue_s3(
                     S3Op::LeaseCreate {
                         lease: lease.clone(),
@@ -3948,7 +3948,7 @@ impl Core {
             &self.cfg,
             Some(prev),
             inherits_duty,
-            self.singleton_test(),
+            self.singleton_now(),
         );
         let rewrites_sealed = prev.holder == self.cfg.node_id
             && lease.epoch == prev.epoch
@@ -4121,17 +4121,6 @@ impl Core {
             "acquired the lease"
         );
         replica.set_holder_epoch(epoch);
-        // Plan 30 §M9: assess now whether a backup could be had — the
-        // ops queued behind this acquisition run before the tenure's first
-        // selection pass, and an unassessed tenure holds their
-        // acknowledgements until it (`durable_jseq`). A linked peer counts
-        // whether or not it is yet stable or measured (it is the lone
-        // test, not candidate selection): the links of a fresh tenure are
-        // often younger than the stability window, and an op answered on
-        // this disk alone here was never held by the backup that came up
-        // a moment later (i1-592). Raised, never lowered, by every event
-        // (`refresh_backup_eligibility`).
-        self.ack.eligible = Some(self.backup_could_be_had());
         // Plan 30 §M9: a takeover of an unexpired lease (a seal, or
         // `ack=s3`) is what the permit allowed; the predecessor's
         // strict-read horizon becomes this tenure's acknowledgement floor
