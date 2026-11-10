@@ -71093,10 +71093,10 @@ mod late_landing_inbox {
     }
 
     /// F1 (the bypassing route): the requester that is the root settles its
-    /// own op locally. Before: the settle executed it at once, with the
-    /// batch durable. Now the batch is a tombstone first.
+    /// own op locally. The tombstone is written alongside the settle, which
+    /// does not wait for it: a settled answer needs none.
     #[test]
-    fn a_settle_withdraws_the_rids_inbox_batches_first() {
+    fn a_settle_withdraws_the_rids_inbox_batches_alongside_it() {
         let (mut h, rid) = waiting_inbox_op();
         h.advance(h.core.dl_t().attempts + 1);
         h.hold(1, None);
@@ -71104,38 +71104,164 @@ mod late_landing_inbox {
         h.core
             .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
         let op = tombstone_op(&out)
-            .unwrap_or_else(|| panic!("the settle did not withdraw the batch first: {out:?}"));
+            .unwrap_or_else(|| panic!("the settle did not withdraw the batch: {out:?}"));
         let ran = |h: &Harness| {
             h.meta.recent_outcome(rid).is_some()
                 || h.meta.completed_outcome(rid).ok().flatten().is_some()
         };
         assert!(
-            !ran(&h),
-            "nothing is executed before the tombstone is acknowledged"
+            ran(&h),
+            "the settle did not wait for the tombstone: {out:?}"
         );
-        assert!(replies(&out).is_empty());
-        let out = h.step(Event::S3 {
+        h.step(Event::S3 {
             op,
             result: S3Result::InboxTombstone(Ok(())),
         });
-        assert!(ran(&h), "executed once withdrawn: {out:?}");
         assert_eq!(h.core.stats.settles_withdrawn_first, 1);
         assert!(!h.core.in_doubt_batches.contains_key(&rid));
     }
 
-    /// F1 (SHOULD-4a): the settle's window and cap count from the last
-    /// acknowledgement, not from the first deadline. A failed tombstone is
-    /// retried; once the first window is spent the settle goes on without
-    /// the inbox route and is counted.
+    /// Withdraw-first (a): the first deadline of an op with inbox batches
+    /// emits the tombstone and the settle to the known holder in one step.
     #[test]
-    fn a_settles_window_starts_at_the_tombstone_acknowledgement() {
+    fn the_first_deadline_sends_the_tombstone_and_the_settle_together() {
+        let (mut h, rid) = waiting_inbox_op();
+        h.advance(h.core.dl_t().attempts + 1);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        assert!(tombstone_op(&out).is_some(), "{out:?}");
+        assert!(
+            sends(&out).iter().any(|(to, m)| *to == 2
+                && matches!(m, PeerMsg::MutateRequest { settle: true, .. })),
+            "the settle did not leave with the tombstone: {out:?}"
+        );
+    }
+
+    /// Withdraw-first (b): the holder is silent and the last tombstone is
+    /// acknowledged a hair before `T_d + w`. No unsettled `EIO` at `T_d + w`
+    /// (a window after the acknowledgement is not out), and one at
+    /// `T0 + w`.
+    #[test]
+    fn no_unsettled_eio_before_a_window_after_the_last_tombstone_ack() {
+        let (mut h, rid) = waiting_inbox_op();
+        h.advance(h.core.dl_t().attempts + 1);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        let t_d = h.clk().wait;
+        let w = h.core.dl_t().settle_window;
+        let op = tombstone_op(&out).expect("withdrawn");
+        h.advance(w - 100);
+        let out = h.step(Event::S3 {
+            op,
+            result: S3Result::InboxTombstone(Ok(())),
+        });
+        assert!(replies(&out).is_empty(), "{out:?}");
+        h.advance(100);
+        assert_eq!(h.clk().wait, t_d.plus(w));
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        assert!(replies(&out).is_empty(), "an EIO at T_d + w: {out:?}");
+        h.advance(w - 100);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        assert!(
+            matches!(replies(&out).as_slice(), [(r, ClientReply::InDoubt)] if *r == rid),
+            "{out:?}"
+        );
+    }
+
+    /// Withdraw-first (c): a tombstone that never acknowledges is given up
+    /// at `T_d + w`: counted, flagged, and queued for the background.
+    #[test]
+    fn a_tombstone_never_acknowledged_is_given_up_at_the_first_window() {
+        let (mut h, rid) = waiting_inbox_op();
+        h.advance(h.core.dl_t().attempts + 1);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        assert!(tombstone_op(&out).is_some());
+        h.advance(h.core.dl_t().settle_window);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        assert!(replies(&out).is_empty(), "{out:?}");
+        let c = h.core.clients.get(&rid).unwrap();
+        assert!(c.settle_withdraw_failed);
+        assert!(c.inbox_keys.is_empty());
+        assert_eq!(h.core.stats.settle_withdraw_failed, 1);
+        assert!(h.core.inbox.bg_timer.is_some(), "background tombstones");
+    }
+
+    /// Withdraw-first (d): the holder answers the settle `Abandoned` before
+    /// the tombstone is acknowledged. The client is answered at once; the
+    /// tombstone's acknowledgement afterwards is dropped.
+    #[test]
+    fn a_settled_answer_does_not_wait_for_the_tombstone() {
+        let (mut h, rid) = waiting_inbox_op();
+        h.advance(h.core.dl_t().attempts + 1);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        let op = tombstone_op(&out).expect("withdrawn");
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest {
+                    req, settle: true, ..
+                } if to == 2 => Some(*req),
+                _ => None,
+            })
+            .expect("the settle");
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Abandoned,
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: true,
+            },
+        });
+        assert!(
+            replies(&out)
+                .iter()
+                .any(|(r, a)| *r == rid
+                    && matches!(a, ClientReply::Outcome(MutateOutcome::Abandoned))),
+            "{out:?}"
+        );
+        let out = h.step(Event::S3 {
+            op,
+            result: S3Result::InboxTombstone(Ok(())),
+        });
+        assert!(replies(&out).is_empty());
+    }
+
+    /// F1 (SHOULD-4a): the settle leaves at the first deadline; its window
+    /// and cap are extended to a window after the last acknowledgement. A
+    /// failed tombstone is retried.
+    #[test]
+    fn a_settles_window_reaches_a_window_past_the_tombstone_acknowledgement() {
         let (mut h, rid) = waiting_inbox_op();
         h.advance(h.core.dl_t().attempts + 1);
         let mut out = Vec::new();
         h.core
             .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
         let first = h.clk().wait;
-        let op = tombstone_op(&out).expect("withdrawn first");
+        let op = tombstone_op(&out).expect("withdrawn");
+        assert!(
+            matches!(
+                sends(&out).first(),
+                Some((2, PeerMsg::MutateRequest { settle: true, .. }))
+            ),
+            "the settle leaves with the tombstone: {out:?}"
+        );
         let w = h.core.dl_t().settle_window;
         // The PUT fails once, and is tried again.
         let out = h.step(Event::S3 {
@@ -71149,13 +71275,14 @@ mod late_landing_inbox {
             .clients
             .get(&rid)
             .unwrap()
-            .timer
+            .withdraw
+            .and_then(|w| w.retry)
             .expect("a retry timer");
         let out = h.step(Event::Timer { id });
         let op = tombstone_op(&out).expect("the tombstone is tried again");
         h.advance(w / 2);
         let acked = h.clk().wait;
-        let out = h.step(Event::S3 {
+        h.step(Event::S3 {
             op,
             result: S3Result::InboxTombstone(Ok(())),
         });
@@ -71166,14 +71293,7 @@ mod late_landing_inbox {
             c.settle_until
         );
         assert!(c.settle_until > first.plus(w));
-        assert!(c.settle_cap >= acked.plus(h.core.dl_t().settle_cap_span));
-        assert!(
-            matches!(
-                sends(&out).first(),
-                Some((2, PeerMsg::MutateRequest { settle: true, .. }))
-            ),
-            "the settle leaves after the last acknowledgement: {out:?}"
-        );
+        assert!(c.settle_cap >= acked.plus(w));
         assert_eq!(h.core.stats.settle_withdraw_failed, 0);
     }
 
@@ -71418,7 +71538,6 @@ mod late_landing_inbox {
             vec![key],
             "the settle did not withdraw the batch in flight: {out:?}"
         );
-        assert!(sends(&out).is_empty(), "no settle before the withdrawal");
         // The PUT lands after all: the op is no longer queued, so the
         // acknowledgement moves nothing.
         h.step(Event::S3 {
@@ -71500,23 +71619,16 @@ mod late_landing_inbox {
         let (mut h, rid) = waiting_inbox_op();
         // The forward's withdrawal: the phase and the tombstone.
         let key = h.core.clients.get(&rid).unwrap().inbox_keys[0];
-        h.core.clients.get_mut(&rid).unwrap().phase = client::Phase::InboxWithdraw {
-            holder: 2,
-            gen: 0,
-            then: client::AfterWithdraw::Forward,
-        };
+        h.core.clients.get_mut(&rid).unwrap().phase =
+            client::Phase::InboxWithdraw { holder: 2, gen: 0 };
         h.advance(h.core.dl_t().attempts + 1);
         let mut out = Vec::new();
         h.core
             .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
         assert!(tombstoned_keys(&out).is_empty(), "written twice: {out:?}");
-        assert!(matches!(
-            h.core.clients.get(&rid).unwrap().phase,
-            client::Phase::InboxWithdraw {
-                then: client::AfterWithdraw::Settle,
-                ..
-            }
-        ));
+        let c = h.core.clients.get(&rid).unwrap();
+        assert!(!matches!(c.phase, client::Phase::InboxWithdraw { .. }));
+        assert_eq!(c.withdraw.map(|w| w.in_flight), Some(key));
         assert_eq!(h.core.clients.get(&rid).unwrap().inbox_keys, vec![key]);
     }
 

@@ -2097,6 +2097,9 @@ enum Timer {
     Poll,
     ForwardTimeout(Rid),
     ForwardBackoff(Rid),
+    /// A settle's tombstone retry, or the end of its first window
+    /// (`Core::on_withdraw_timer`).
+    WithdrawRetry(Rid),
     /// `Core::await_own_records`'s safety timer for the op ran out.
     OwnRecordWait(Rid),
     /// `Core::repeat_observed_upload`'s timer.
@@ -2189,6 +2192,7 @@ impl Timer {
             Timer::Poll => TimerKind::Poll,
             Timer::ForwardTimeout(_) => TimerKind::ForwardTimeout,
             Timer::ForwardBackoff(_) => TimerKind::ForwardBackoff,
+            Timer::WithdrawRetry(_) => TimerKind::WithdrawRetry,
             Timer::OwnRecordWait(_) => TimerKind::OwnRecordWait,
             Timer::ObservedUpload => TimerKind::ObservedUpload,
             Timer::AcquireRetry(_) => TimerKind::AcquireRetry,
@@ -3533,6 +3537,7 @@ impl Core {
             }
             Timer::ForwardTimeout(rid) => self.on_forward_timeout(now, rid, replica, out),
             Timer::ForwardBackoff(rid) => self.on_forward_backoff(now, rid, replica, out),
+            Timer::WithdrawRetry(rid) => self.on_withdraw_timer(now, rid, replica, out),
             Timer::OwnRecordWait(rid) => self.on_own_record_wait(now, rid, out),
             Timer::ObservedUpload => self.on_observed_upload(now, replica, out),
             Timer::AcquireRetry(rid) => self.on_acquire_retry(now, rid, replica, out),

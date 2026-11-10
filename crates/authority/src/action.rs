@@ -273,6 +273,8 @@ pub enum TimerKind {
     ForwardTimeout,
     /// Backoff before the same-rid retry of a forward.
     ForwardBackoff,
+    /// A settle's tombstone retry, or the end of its first window.
+    WithdrawRetry,
     /// A forwarded op still waits for its own records past
     /// `own_record_wait_ms`: upload the chunks they wait for.
     OwnRecordWait,

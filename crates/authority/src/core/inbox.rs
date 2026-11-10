@@ -29,7 +29,7 @@
 //! all but each requester's newest. A takeover drains every older epoch's
 //! batches inside its gate, before the new holder's view opens.
 
-use super::client::{AfterWithdraw, Phase};
+use super::client::Phase;
 use super::{Core, S3For, Timer, TimerAt};
 use crate::action::{Action, S3Op};
 use crate::event::{CasFailure, S3Result};
@@ -1473,7 +1473,13 @@ impl Core {
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
-        let Phase::InboxWithdraw { holder, gen, then } = c.phase else {
+        // A settle's own tombstones (`ClientOp::withdraw`) run beside it,
+        // whatever its phase is.
+        if c.withdraw.is_some() {
+            self.on_settle_withdrawn(now, rid, key, result, replica, out);
+            return;
+        }
+        let Phase::InboxWithdraw { holder, gen } = c.phase else {
             return;
         };
         // An answer for a key this rid no longer holds is a duplicate of one
@@ -1489,33 +1495,17 @@ impl Core {
                 self.stats.inbox_withdrawn_ops += 1;
                 self.inbox_forget_leftover(key);
                 self.inbox_resubmit_cobatched(now, key, replica, out);
-                match then {
-                    AfterWithdraw::Forward => {
-                        self.send_forward(now, rid, holder, gen, replica, out)
-                    }
-                    AfterWithdraw::Settle => self.settle_withdrawn_next(now, rid, replica, out),
-                }
+                self.send_forward(now, rid, holder, gen, replica, out);
             }
-            other => match then {
-                AfterWithdraw::Forward => {
-                    tracing::debug!(
-                        node = self.cfg.node_id,
-                        ?rid,
-                        ?other,
-                        "inbox: withdrawing the batch failed; the op takes the lease path"
-                    );
-                    self.lease_path(now, rid, replica, out);
-                }
-                AfterWithdraw::Settle => {
-                    tracing::debug!(
-                        node = self.cfg.node_id,
-                        ?rid,
-                        ?other,
-                        "inbox: withdrawing the batch for a settle failed; retried"
-                    );
-                    self.settle_withdraw_retry(now, rid, out);
-                }
-            },
+            other => {
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    ?rid,
+                    ?other,
+                    "inbox: withdrawing the batch failed; the op takes the lease path"
+                );
+                self.lease_path(now, rid, replica, out);
+            }
         }
     }
 
@@ -1591,7 +1581,7 @@ impl Core {
     /// of this node's own that the takeover drain left for a re-read is not
     /// read again. A shortcut: the freshness rule (S1) is what keeps an
     /// older read from running it.
-    fn inbox_forget_leftover(&mut self, key: InboxKey) {
+    pub(crate) fn inbox_forget_leftover(&mut self, key: InboxKey) {
         let Some(l) = self.inbox.leftover.as_mut() else {
             return;
         };
@@ -1608,7 +1598,7 @@ impl Core {
     /// back to the front of the submission queue (see
     /// `on_inbox_withdrawn`). An op being withdrawn itself, or waiting on
     /// a later batch too, only forgets the key.
-    fn inbox_resubmit_cobatched(
+    pub(crate) fn inbox_resubmit_cobatched(
         &mut self,
         now: Now,
         key: InboxKey,
@@ -1617,7 +1607,10 @@ impl Core {
     ) {
         let mut again: Vec<(u64, Rid)> = Vec::new();
         for (rid, c) in self.clients.iter_mut() {
-            if !c.inbox_keys.contains(&key) || matches!(c.phase, Phase::InboxWithdraw { .. }) {
+            if !c.inbox_keys.contains(&key)
+                || c.withdraw.is_some()
+                || matches!(c.phase, Phase::InboxWithdraw { .. })
+            {
                 continue;
             }
             c.inbox_keys.retain(|k| *k != key);
