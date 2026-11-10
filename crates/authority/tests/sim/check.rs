@@ -384,13 +384,18 @@ pub fn no_settled_landing(acks: &[super::oracle::AckEntry], oracle: &Oracle) -> 
 /// yet". Returns the number of distinct rids that landed late and a
 /// description of each.
 ///
-/// The sim's client resubmits an in-doubt rid up to `MAX_RESUBMITS` times;
-/// production answers `EIO` at once and the application moves on. The
-/// first `InDoubt` answer is the one the application sees, so it is the
-/// one judged.
+/// The first `InDoubt` answer is the one the application sees (production
+/// answers `EIO` at once and the application moves on), so it is the one
+/// judged. The sim's `marker_writer` instead submits an in-doubt rid again
+/// (the I2(b) dedup probe), and the resubmission's execution is the
+/// client's own retry, not a late landing of the original: a rid the same
+/// client submitted again after its first in-doubt answer (`submits`:
+/// `(rid, tick)` of every client submission) is exempt. The unsettled `EIO`
+/// itself stays counted by the sim's other checks.
 pub fn no_late_landing(
     in_doubt: &[(u64, Rid, Seq, u64)],
     invokes: &[(Rid, u64)],
+    submits: &[(Rid, u64)],
     oracle: &Oracle,
 ) -> (usize, Vec<String>) {
     // The first in-doubt answer of each rid.
@@ -406,6 +411,9 @@ pub fn no_late_landing(
         let Some(p) = oracle.completed_at.get(r) else {
             continue;
         };
+        if submits.iter().any(|(s, ts)| s == r && *ts > *t) {
+            continue;
+        }
         let after = invokes
             .iter()
             .filter(|(r2, t2)| r2.node == *n && r2 != r && *t2 > *t)

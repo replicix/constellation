@@ -9675,7 +9675,8 @@ const CAUSAL_CUT_SEEDS: u64 = 40;
 /// client resubmitted an in-doubt rid, as production never does (the
 /// application retries with a new operation, a fresh rid), and the
 /// resubmission's execution landed after a later op: I4 took it for a late
-/// landing of the original. The client now retries under a fresh rid.
+/// landing of the original. The oracle now exempts a rid the same client
+/// submitted again after its first in-doubt answer.
 #[test]
 fn regression_the_sims_resubmission_is_no_late_landing_seed_1525() {
     let cfg = SimConfig {
