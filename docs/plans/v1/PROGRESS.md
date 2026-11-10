@@ -69303,3 +69303,31 @@ delegate's crash, delegate up 3,363; delegate not restarted 457; silent first 28
 The three configurations are in the ratchet with these seeds 0..99 counts as their ceilings (0, 978, 14, plus the usual margin). They may only
 go down.
 
+
+### ADR-46: the restart write quarantine (plan 46 M1.3)
+
+- **What.** A delegate persists the horizon of its read grants (`deleg_read_grant_horizon_ms`, synced before the grant is answered); a
+  restarted holder whose horizon has not passed is quarantined per generation (own writes park, forwards get `Held`, no read grant, the
+  engine's fast path is closed, a release row waits), and ends the quarantine early when every node of the roster and the links dropped
+  the previous process's grants (`DelegReadVoid`, scope `Restart`). Decision and consequences: ADR-46. Negative control:
+  `restart_skips_write_quarantine`.
+- **Review round (S1 to S4, notes).** S1: a quarantine timer that fires before its time arms itself again
+  (`an_early_quarantine_timer_arms_itself_again`). S2: the key is settled by a process-level timer at the horizon, or at start when
+  nothing is left, whether or not a generation is installed (`the_key_is_settled_without_an_installed_generation`). S3: a node id
+  claimed by the starting process (`first_mount`) settles the key; the sim does the same at a node's first start, and
+  `sticky-holder-fresh` (`first_start_unsettled`) runs a first start without the record. S4: a failed horizon write gives no grant
+  (`a_failed_horizon_write_gives_no_delegate_grant`), an early timer, a generation installed after the horizon is not quarantined
+  (coverage of existing behaviour, they pass before the round except the timer). The spec's T11 (the engine's `admit_for` refuses a
+  quarantined entry) was replaced by the core view test `a_quarantined_generation_is_published_as_stopped`: `DelegateView::mirror`
+  ORs `is_stopped`, so the view is what the engine reads. Notes: after a read error a later write of a horizon stores at least the
+  fallback, an unreadable promise holds the join gate, an unreadable claim mark arms the floor of a re-adopted lease. A stamp carries
+  its own span, so a TTL lowered across a restart does not shorten the wait for a stamp (`a_stamp_written_under_a_longer_ttl_is_waited_out_whole`);
+  an absent or corrupt key has no span and uses the new process's.
+- **fsync on the core thread.** One synced write of the horizon per second of continuous strict reading: 3 ms (btrfs) to 6 ms (ext4 on
+  a loop file) per write, 2 microseconds on tmpfs (300 writes each, p99 6.7 ms ext4, 3.1 to 6.6 ms btrfs in two runs, max 81 ms once on btrfs). Under
+  1 % of operations can meet it and the p90 does not move; not moved off the core (the root's grants do the same).
+- **Early exit.** `void_audience` (roster and links, once both were read) is shared with the abandon, which no longer reads an unknown
+  audience as "every reader answered". Wire: `restart` on `Payload::ReadVoidGen`, `scope` on `PeerMsg::DelegReadVoid`.
+  `sticky-holder-returns` runs at the default read TTL (step 13's 1.5 s override is gone). `sticky-holder-restarts-cut` cuts the
+  reader from the returned holder so the horizon decides.
+- **Harness.** `sticky-holder-restart` (scenarios/m11.rs).

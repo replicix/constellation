@@ -3379,3 +3379,102 @@ See: `crates/authority/src/core/client.rs` (`sent_to_designation`,
 `an_unsettled_eio_of_an_op_a_delegate_accepted_is_named`,
 `the_roots_refusal_is_held_when_the_root_is_listed_as_a_delegate`,
 [delegations](../reference/features/delegations.md).
+
+## ADR-46: A restarted holder's writes wait for the read delegations its previous process granted
+
+**Status**: decided by the maintainer on 2026-11-10 (architecture review
+2026-11-10, design change 2; plan 46 M1.3). Amends the restart rules of
+[ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
+and the grant quarantine of the root (plan 30 M16) for the holder of a
+delegation.
+
+**Context**: a delegate (a sticky or designated holder, or a placed delegate)
+grants read delegations for its subtree, in memory only. A restart loses the
+table. The new process installs the node's streams from the replica's table,
+and a non-stealable stream is honoured from the install, so its first write
+executed and was acknowledged at once, while a reader still honoured a grant of
+the previous process (up to the read TTL on its own clock) and served the older
+state: a close-to-open violation, found by `check_cto` in 8 of 1,500 seeds of
+the `sticky-holder-restarts` schedule on main (156, 159, 728, ...). Step 13's
+abandon fences the end of a stream, not a holder that returns before it.
+
+**Decision**: the holder's read grants are persisted before they are answered,
+and a restarted holder executes nothing, and grants nothing, until what its
+previous process granted is gone.
+
+- A delegate's read grant writes the horizon `deleg_read_grant_horizon_ms` (a
+  boot stamp, synced, rounded up a second) before the grant is recorded; when
+  the write fails the read is answered with its position and no grant. The key
+  is the root's `read_grant_horizon_ms` kept apart: the root's feeds every
+  acknowledgement and the takeover gate, and a sticky holder's grants must not
+  delay its node's root role.
+- Every generation a restarted node installs while the loaded horizon has not
+  passed is quarantined, whatever its kind (placed included: its predecessor's
+  grants are capped only by the old `until`). Own writes park, as a recall
+  wait; a forward is answered `Held` and journals nothing (the requester spends
+  no attempt, DESIGN section 6); a settle passes; a strict read is answered
+  with the position and no grant; the engine's fast path is closed (the view
+  publishes the generation stopped); a release row waits too, so the root does
+  not execute under a grant the end would not void. Nothing is refused: the
+  cost is latency, at most one span (read TTL, margin and a second).
+- A missing or unreadable key is a full span from the start. The sentinel
+  `none` says every earlier grant passed; it is written by a graceful shutdown,
+  at start when nothing is left, and by a timer at the horizon, whether or not
+  a generation was installed (a node that rarely grants would otherwise pay a
+  span at every reboot for grants nobody made). A node id claimed by the
+  starting process (`first_mount`) settles the key at once: nobody can hold a
+  grant of an id that did not exist. Rebuilding a store under an old id is not
+  that: its key is absent and costs a span.
+- **Early exit.** A quarantined generation asks every node that may hold one of
+  its grants (roster and links, once both were read) to drop them
+  (`DelegReadVoid`, scope `Restart`; the reader drops the held ones of the
+  stream's epoch and bumps its recall generation, so a reply of the dead
+  process still in flight is not installed, but remembers nothing, because the
+  same stream grants again). When all answered the quarantine is over before
+  the horizon; one that does not answer (down, cut off) leaves the horizon in
+  charge. The horizon alone is the safety: the void only shortens the wait.
+  Step 13's abandon uses the same audience and no longer reads an unknown one as
+  "every reader answered".
+- **Fallbacks fail closed.** After a read error a later write of a horizon
+  (read, lock, floor, delegate) stores at least the fallback the caller waited
+  for, and an unreadable promise holds the join gate and is not stored lower; an
+  unreadable or malformed takeover claim mark arms the floor of the node's
+  re-adopted lease.
+- A timer that fires before its time (an event with a stale clock, plan 46
+  M1.3 step 11) arms itself again; a stale `now` is earlier than real time, so
+  the quarantine looks longer: the conservative direction.
+
+**Consequences**: a crash of a holder with readers costs those readers one round
+trip per open for as long as the void takes (milliseconds with all nodes up),
+at most a span otherwise, and its own clients a parked write for the same time.
+**A graceful upgrade pays too**: `daemon --upgrade` or a handoff of a holder
+with strict readers in the last span keeps an unpassed stamp, so the new
+process is quarantined for up to a span unless the void completes. The first
+start of a node with a store from before this decision pays one span (no
+compatibility shim). The persisted stamp carries the span it was written with,
+so lowering the read TTL across a restart does not shorten the wait for a
+stamp; an absent or corrupt key has no span to read and uses the new process's
+(an absent key is a store that never granted under this build). A grant costs
+one synced write per second of continuous strict reading, on the core thread as
+the root's does: measured 3 to 6 ms on ext4 and btrfs (about 2 microseconds on
+tmpfs), so under one percent of operations wait for it and the p90 is
+unchanged; it is not moved off-core. `sticky-holder-returns` runs at the default
+read TTL again.
+
+**Rejected**: persisting every grant (an fsync per grant, not per second);
+bumping the epoch alone (the readers' grants are capped by the lease, not by
+the epoch of a delegate); one key for root and delegates (the root's
+acknowledgements would wait on a sticky holder's grants, and the early exit
+cannot end the root's quarantine).
+
+**May revert**: no. The negative-control knob `restart_skips_write_quarantine`
+(`AUTHORITY_SIM_RESTART_SKIPS_WRITE_QUARANTINE=1`) restores the old behaviour;
+`sticky-holder-restarts` fails with it (`check_cto`), and `sticky-holder-fresh`
+runs the first-start path without the record.
+
+See: `crates/authority/src/core/delegate.rs` (`deleg_restart_start`,
+`deleg_restart_quarantined`, `deleg_restart_void_round`,
+`on_deleg_restart_quarantine`, `deleg_read_index`),
+`crates/meta/src/readdeleg.rs` (`note_deleg_grant_horizon`,
+`load_deleg_grant_quarantine`, `settle_deleg_grant_horizon`, `void_restart`),
+[delegations](../reference/features/delegations.md).

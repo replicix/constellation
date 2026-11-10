@@ -833,6 +833,25 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
   `ttl + margin` and ends the generation. Every row the delegate answered to
   another node is in the root's journal (the answer waited for the append);
   the clients of the rows it had not answered retry by rid through the root.
+- **Delegate or holder restarts (crash or upgrade), and returns**: the
+  read delegations its previous process granted live on in the readers, up to
+  the read TTL, and the new process has forgotten them. A delegate persists a
+  horizon for its read grants (`deleg_read_grant_horizon_ms`, synced before the
+  grant is answered, so about one write per second of continuous strict
+  reading), and a restarted holder whose horizon has not passed is
+  **quarantined** ([ADR-46](../../explanation/DECISIONS.md#adr-46-a-restarted-holders-writes-wait-for-the-read-delegations-its-previous-process-granted)):
+  its own writes wait, a forward is answered `Held` (the requester retries
+  and spends no attempt), a strict read gets its position and no grant, and a
+  release row waits. It ends when every node it asked has dropped the grants
+  of the previous process (a `DelegReadVoid` with scope `Restart`, a few
+  round trips with all nodes up), or when the horizon passes: one read TTL, the
+  expiry margin and a second (6 s at the defaults) at most. A graceful upgrade
+  of a holder with readers pays the same. A store without the key (a node from
+  before this decision, a rebuilt store under an old id) waits that span once;
+  a node that claimed its id at this start does not. The wait is measured from
+  the stamp the previous process wrote, which carries the span it was written
+  with, so lowering `CONSTELLATION_READ_DELEGATION_TTL_MS` across a restart
+  does not shorten it.
 - **Delegate crashes, with a recorded backup**: the root has the backup seal,
   drains what it holds, and continues (`delegate-crash-backup`). The
   generation is **not ended before** a member of the latest recorded group
