@@ -72,8 +72,8 @@ impl Timings {
         })
     }
 
-    /// The client op deadline (`acquire_deadline_ms`, twice the lease
-    /// TTL): an op still in doubt then answers `EIO`.
+    /// The client op deadline (`Deadlines::client_deadline`, twice
+    /// the lease TTL): an op still in doubt then answers `EIO`.
     pub fn client_deadline(&self) -> Duration {
         2 * self.lease_ttl
     }

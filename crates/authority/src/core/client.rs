@@ -639,9 +639,9 @@ impl Core {
             // it ends in doubt and the drain settles again.)
             self.dl_t().settle_window
         } else if Self::settles(origin, policy) {
-            self.cfg.acquire_deadline_ms - self.dl_t().settle_window
+            self.dl_t().client_deadline - self.dl_t().settle_window
         } else {
-            self.cfg.acquire_deadline_ms
+            self.dl_t().client_deadline
         };
         let deadline =
             self.set_timer_wait(now.wait.plus(tries_for), Timer::ClientDeadline(rid), out);
@@ -2305,7 +2305,7 @@ impl Core {
     ///   retry budget (30 s) per attempt;
     /// - a client op not answered `s3_less_deadline_ms` after its
     ///   submission fails (`InDoubt`: `EIO`, retryable by rid) instead of
-    ///   waiting out `acquire_deadline_ms` (2 × TTL, 120 s) — unless the
+    ///   waiting out the client deadline (2 × TTL, 120 s) — unless the
     ///   peers answered that none of them reaches S3 either (a bucket
     ///   outage, which the continuation epoch serves).
     pub(crate) fn on_own_s3(
@@ -2463,7 +2463,7 @@ impl Core {
             // the ordinary one from here.
             self.cancel_timer(old_deadline, out);
             let deadline = self.set_timer_wait(
-                now.wait.plus(self.cfg.acquire_deadline_ms),
+                now.wait.plus(self.dl_t().client_deadline),
                 Timer::ClientDeadline(rid),
                 out,
             );
@@ -2800,7 +2800,7 @@ impl Core {
                 .clients
                 .get(&rid)
                 .filter(|c| c.settle)
-                .map(|c| c.submitted.plus(self.cfg.acquire_deadline_ms));
+                .map(|c| c.submitted.plus(self.dl_t().client_deadline));
             let settle_claims = until.is_some_and(|until| {
                 self.lease
                     .claim_due(&self.cfg)
@@ -3856,7 +3856,7 @@ impl Core {
     /// `Timer::ClientDeadline`. Plan 43 C7b: an op still waiting for the
     /// lease whose node may claim it only after the deadline — a cold claim
     /// waits one *holder's* TTL from its first read (plus the backups' claim
-    /// grace for a non-backup of a `Backup` lease), and `acquire_deadline_ms`
+    /// grace for a non-backup of a `Backup` lease), and the client deadline
     /// is two of this node's own TTLs: a holder with a longer TTL, or a short
     /// TTL under a long grace, outlasts it — gets until then (plus one
     /// retry backoff), once, instead of failing in doubt before its claim
@@ -4128,7 +4128,7 @@ impl Core {
         // op's own attempts end early by the inbox's deadline: its settle
         // still has the rest of the client's.)
         let window = self.dl_t().settle_window;
-        let full = c.submitted.plus(self.cfg.acquire_deadline_ms);
+        let full = c.submitted.plus(self.dl_t().client_deadline);
         let mut until = now.wait.plus(window);
         if s3_less {
             if full > now.wait {

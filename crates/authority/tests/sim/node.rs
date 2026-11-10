@@ -774,13 +774,6 @@ impl NodeHandle {
         cfg.fence_accepts_unrouted = env.fence_accepts_unrouted;
         cfg.partial_release_ends_stream = env.partial_release_ends_stream;
         cfg.abandon_skips_read_recall = env.abandon_skips_read_recall;
-        // Plan 43 C2g: the simulation's settle window scales with its lease
-        // TTL as production's does (half a TTL: 30 s of 60 s), unless a
-        // configuration sets one (`sim_core_config` leaves it unset), and is
-        // never more than half the client deadline (`Config::settle_window`).
-        if cfg.settle_window_ms == 0 {
-            cfg.settle_window_ms = cfg.ttl_ms / 2;
-        }
         let mut cfg = driver_config(cfg);
         cfg.clock_id = clock.id();
         cfg.clock_rate_budget_ppm = env.rate_budget_ppm;
