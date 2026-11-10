@@ -3571,6 +3571,35 @@ mod tests {
         );
     }
 
+    /// A connection that comes up while the dial runs (the peer's own dial
+    /// to us, which is what makes ours slow on a loaded host) may not hold
+    /// the selected path yet, and is not what the dial is stuck behind:
+    /// the stuck timer closes nothing then. It used to close it, and the
+    /// requests on it failed (`a_slow_peer_keeps_its_pooled_connection`,
+    /// under load).
+    #[tokio::test]
+    async fn a_connection_made_during_a_slow_dial_is_not_closed_as_stuck() {
+        let (dialer, holder_addr, first, second) = stuck_dial_setup().await;
+        // None of them holds the selection.
+        dialer.stick_dials_after(Duration::from_millis(100), None);
+        dialer.inject_dial(Duration::from_millis(600), 0);
+        let ping = Payload::Ping { node_id: 2 };
+        let asked = dialer.request(holder_addr.clone(), &ping);
+        let (answer, during) = tokio::join!(asked, async {
+            assert!(wait_for(10, || dialer.dials_started() == 1).await);
+            dialer.connect_for_test(holder_addr.clone()).await.unwrap()
+        });
+        assert!(answer.is_ok(), "the dial did not complete: {answer:?}");
+        // The stuck timer fired long ago (100 ms against a 600 ms dial).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            during.close_reason().is_none()
+                && first.close_reason().is_none()
+                && second.close_reason().is_none(),
+            "a connection was closed as stuck though one came up during the dial"
+        );
+    }
+
     /// The same with iroh's real `paths()` / `is_selected()` check and no
     /// seam: two real endpoints, connections that are up over loopback
     /// have a selected path, and `unstick` closes none of them.
