@@ -69287,3 +69287,19 @@ change has a test that fails with only that fix reverted (on the box).
   when the new incarnation happened to grant the reader a new delegation, which replaced the old one in the reader's table. A fix needs a
   quarantine of the restarted holder's writes for `read_delegation_ttl_ms` plus the margin (a design decision).
 
+## 2026-11-10 Plan 46 M1.2 step 14: no sync on a strict backup's silence; the unsettled EIO of a double fault is measured
+
+Decision: "sync on strict-backup silence" (design #3) is not built. A delegate that reboots or dies together with its strict backup leaves the
+unsettled `EIO` of step 14 on its generation; that is a documented double-fault cost (`delegations.md`, "Failures"). The simulation
+counts it by cause (`unsettled_silence`, `SWEEP-UNSETTLED-SILENCE`: whether a strict member went silent before the delegate went down, and
+for how long), and the three configurations `delegated-backup-dies-then-delegate-reboots` (reboot at 3.5 s), `-early` (2.1 s, before the
+delegate can have noticed) and `-mid` (2.8 s) pin it.
+
+Sweeps (release, seeds 0 to 1,999, allowed unsettled `EIO`s, all with 0 violations and I1, I2, I2c, I4, I5 at 0): `...-reboots` 0,
+`...-early` 22,286 (silent under 0.6 s, delegate up: 22,251; no recorded member: 35), `...-mid` 28 (silent first, 0.6 to 3.5 s). Seeds 0 to 99:
+0, 978 and 14. `delegated-backup-and-delegate-die`: 3,907 generation-tail-unreachable, equal to main (the new classes: member live at the
+delegate's crash, delegate up 3,363; delegate not restarted 457; silent first 28). `sticky-ttl` equals main (889 non-stealable in doubt).
+
+The three configurations are in the ratchet with these seeds 0..99 counts as their ceilings (0, 978, 14, plus the usual margin). They may only
+go down.
+

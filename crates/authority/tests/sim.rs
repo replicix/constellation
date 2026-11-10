@@ -17766,7 +17766,7 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     // in seeds 0..99); never raised for a count the ceiling already saw:
     // delegated-backup-and-delegate-die's allowed ceiling was set while its
     // runs that end waiting for a group's tail counted nothing)
-    let ceilings: [(&str, Config, usize, usize); 14] = [
+    let ceilings: [(&str, Config, usize, usize); 17] = [
         ("backup-strict", backup_strict_config, 0, 0),
         ("backup-two", backup_two_config, 0, 0),
         // (Allowed 0 to 26: the runs that end with a root waiting for a
@@ -17796,6 +17796,32 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             0,
         ),
         ("delegated-backup", delegated_backup_config, 0, 0),
+        // (Sync-on-silence C1, measured 2026-11-10 in seeds 0..99. The
+        // decision is not to build "sync on a strict backup's silence": a
+        // delegate that reboots or dies together with its strict backup
+        // leaves the unsettled `EIO` of step 14, a documented double-fault
+        // cost. These three measure it, by when the delegate goes down
+        // after the backup died (`unsettled_silence`): at 3.5 s 0 (in
+        // 2,000 seeds: 0), at 2.1 s, before it can have noticed, 978
+        // (22,286), at 2.8 s 14 (28). The ceilings may only go down.)
+        (
+            "delegated-backup-dies-then-delegate-reboots",
+            delegated_backup_dies_then_delegate_reboots_config,
+            0,
+            0,
+        ),
+        (
+            "delegated-backup-dies-then-delegate-reboots-early",
+            delegated_backup_dies_then_delegate_reboots_early_config,
+            0,
+            978,
+        ),
+        (
+            "delegated-backup-dies-then-delegate-reboots-mid",
+            delegated_backup_dies_then_delegate_reboots_mid_config,
+            0,
+            14,
+        ),
         (
             "delegated-group-switch",
             delegated_group_switch_config,
