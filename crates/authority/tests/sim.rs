@@ -9741,6 +9741,31 @@ fn a_marker_is_never_seen_without_the_data_a_deposition_moved_to_the_member_copy
     }
 }
 
+/// `delegated-root-deposed-delegate-dies` seed 718 under slow lease reads
+/// (I2c, and I5 under `+lone`): the root's own lease, its renewal window
+/// lapsed under the slow reads, was claimed by a tail fetch that asked this
+/// very node, which sealed its own epoch (2). The claim then ran at epoch 2
+/// again, from a `sealed_own` read before the seal, and the tenure answered
+/// rows (43..=44) on a sealed epoch; its own early re-claim at epoch 3
+/// stranded them and replayed their rid under another identity. A claim
+/// whose tail fetch sealed this node's epoch is the takeover at the next
+/// epoch (D7).
+#[test]
+fn a_claim_whose_tail_fetch_sealed_the_own_epoch_takes_the_next_epoch() {
+    let cfg = strict(
+        SimConfig {
+            lease_reads: SLOW_LEASE_READS,
+            ..delegated_root_deposed_delegate_dies_config()
+        },
+        "identity+lone",
+    );
+    if let Err(e) = run_seed(718, cfg) {
+        panic!(
+            "delegated-root-deposed-delegate-dies seed 718 (AUTHORITY_SIM_LEASE_READS=0:0:800:1000): {e}"
+        );
+    }
+}
+
 /// `long-delegated-late-answers+commit` seed 265 with slow lease reads:
 /// delegate 3 (gen 1:4, backup 2) executed a rename refused ENOENT; node 2
 /// took a lone epoch 2 and appended gen 1:4's rows off node 3's stream (the
@@ -17581,6 +17606,28 @@ fn c2_delegated_long_delegation_prod_settles_every_eio() {
     }
 }
 
+/// `delegated-backup-and-delegate-die`: a requester whose op a delegate had
+/// accepted, and whose root (it may be the requester itself) cannot commit
+/// the delegate's rows because the delegate and its backup are gone, is told
+/// `EIO` unsettled for want of the generation's tail, the one allowed label
+/// of the strict wait. The oracle took the requester's own root for a
+/// sequencer of the op (seeds 13, 140, 302, 413, 665, 670, 754, 1193, 1283,
+/// 1586, 1709 and 1740 were counted as I4 violations).
+#[test]
+fn an_unsettled_eio_of_an_op_a_dead_delegate_accepted_is_the_generations_tail() {
+    let seeds = [
+        13u64, 140, 302, 413, 665, 670, 754, 1193, 1283, 1586, 1709, 1740,
+    ];
+    let bad: Vec<String> = seeds
+        .iter()
+        .filter_map(|&seed| {
+            let r = run_seed(seed, delegated_backup_and_delegate_die_config()).ok()?;
+            (r.unsettled_violations > 0).then(|| format!("seed {seed}: {:?}", r.unsettled_examples))
+        })
+        .collect();
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 /// Plan 46 M0.3, I4 strict: an unsettled `EIO` is allowed only for a
 /// requester that could reach no sequencer in its whole settle window
 /// (`reach.rs`). `long-delegated-late-answers` seed 1: node 3 tells a client
@@ -17645,7 +17692,11 @@ fn a_late_seal_after_the_holders_renewal_lets_it_reclaim_at_once() {
     assert!(early > 0, "no sealed holder re-claimed early");
 }
 
-const SEAL_GAP_DELAY_MS: u64 = 60;
+// (400 ms: a peer claimant's seal lands after the holder's renewal. At 60 ms
+// the early re-claims of these seeds were the holder's own claim sealing its
+// own epoch and reviving it at the same epoch, the defect
+// `a_claim_whose_tail_fetch_sealed_the_own_epoch_takes_the_next_epoch` pins.)
+const SEAL_GAP_DELAY_MS: u64 = 400;
 const SEAL_GAP_SEEDS: std::ops::Range<u64> = 0..300;
 
 /// Plan 46 M0.3: the isolated requesters of `flex-crash` (nodes cut from every

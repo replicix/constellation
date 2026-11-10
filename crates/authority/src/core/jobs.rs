@@ -3548,6 +3548,12 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // The classification's snapshot of the epoch this node sealed is
+        // older than this claim's tail fetch when the fetch asked this node
+        // (an own lease whose window lapsed, listing backups) and it sealed
+        // its own epoch: the claim is then the takeover at the next epoch
+        // (D7), never a revival of the sealed one at the same epoch.
+        self.lease.sealed_own = self.bk.sealed;
         let plan = Plan::Claim {
             prev,
             tag,

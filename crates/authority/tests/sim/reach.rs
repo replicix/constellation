@@ -254,6 +254,10 @@ pub struct Question {
     /// start of the root's window of a generation its delegate never
     /// installed. One that is absent is taken to be born at the window's start.
     pub born: std::collections::BTreeMap<u64, u64>,
+    /// Generations whose rows the op's answer rests on although its keys are
+    /// the root's by now (a delegate accepted the op): the root commits those
+    /// rows only with a holder of each one's tail it reaches ([`root_path`]).
+    pub awaiting: Vec<(NodeId, u64)>,
 }
 
 impl Question {
@@ -265,7 +269,14 @@ impl Question {
             to_ms,
             owners: vec![(0, Owner::Root)],
             born: Default::default(),
+            awaiting: Vec::new(),
         }
+    }
+
+    /// The op's answer rests on the rows of generation `gen` of `node`.
+    pub fn awaiting(mut self, node: NodeId, gen: u64) -> Self {
+        self.awaiting.push((node, gen));
+        self
     }
 
     /// Generation `gen` first showed in the root's table at `at`.
@@ -1018,6 +1029,9 @@ fn silence_class(g: &Inner, q: &Question) -> String {
             Owner::Blocked(v) => gens.extend(v.iter().copied()),
         }
     }
+    // The generations a delegate-accepted op awaits (its keys are the root's
+    // by now): the same ones `gens_to_end` makes the root end.
+    gens.extend(q.awaiting.iter().copied());
     gens.sort_unstable();
     gens.dedup();
     if gens.is_empty() {
@@ -1090,7 +1104,7 @@ fn delegate_attached_since_install(g: &Inner, at: u64, node: NodeId, gen: u64) -
 /// None when the keys are the root's, or a live delegate's.
 fn gens_to_end(g: &Inner, q: &Question, at: u64) -> Vec<(NodeId, u64)> {
     match q.owner_at(at).1 {
-        Owner::Root => Vec::new(),
+        Owner::Root => q.awaiting.clone(),
         Owner::Delegate { node, gen } if delegate_in_force(g, at, node, gen) => Vec::new(),
         Owner::Delegate { node, gen } => vec![(node, gen)],
         Owner::Blocked(gens) => gens,
@@ -1171,7 +1185,7 @@ fn reach_at(g: &Inner, q: &Question, at: u64) -> Seg {
     }
     let (since, owner) = q.owner_at(at);
     match owner {
-        Owner::Root => root_path(g, me, at, &[]),
+        Owner::Root => root_path(g, me, at, &q.awaiting),
         // The generation's delegate alone while its grant lives: the root
         // redirects or parks the op.
         Owner::Delegate { node, gen } => {
@@ -2526,6 +2540,29 @@ mod tests {
         let r = expired(3_000, vec![]);
         r.s3_cut_at(3_000, 1, true);
         assert!(r.classify(q(3).delegated(2, 7)).isolated());
+    }
+
+    #[test]
+    fn an_op_a_delegate_accepted_rests_on_the_generations_tail_at_the_root() {
+        // The delegate accepted the op and is gone with its backup: the
+        // requester is the root, but it cannot commit the delegate's rows
+        // (`delegated-backup-and-delegate-die` seed 140), so the root is no
+        // sequencer for the op. With the tail in reach it is.
+        let r = expired(3_000, vec![(7, 4)]);
+        r.partition_at(3_100, 1, 2, true);
+        r.partition_at(3_100, 1, 4, true);
+        let v = r.classify(q(1).awaiting(2, 7));
+        let Verdict::GenerationTailUnreachable { why } = v else {
+            panic!("{v:?}")
+        };
+        assert!(why.contains("generation 7"), "{why}");
+        assert!(matches!(q(1).awaiting(2, 7).owners[0].1, Owner::Root));
+        let r = expired(3_000, vec![(7, 4)]);
+        r.partition_at(3_100, 1, 2, true);
+        assert!(matches!(
+            r.classify(q(1).awaiting(2, 7)),
+            Verdict::Reachable { .. }
+        ));
     }
 
     #[test]

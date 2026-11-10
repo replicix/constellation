@@ -484,6 +484,7 @@ impl Oracles {
         // (A settle lasts at least a window; one whose deadline was extended
         // lasts from the arming of its second deadline.)
         let from_ms = started.unwrap_or(at).min(at.saturating_sub(window_ms));
+        let mut awaiting: Vec<(NodeId, u64)> = Vec::new();
         let (owners, born) = if accepted_by_delegate {
             // A delegate executed the op and answered it: what the requester
             // still lacked was the commit of that delegate's rows (it awaited
@@ -492,6 +493,19 @@ impl Oracles {
             // had heard: a restarted root that holds nothing until its lease
             // runs out leaves none (`sticky-ttl` with slow lease reads, seed
             // 907).
+            // (Its rows are those of the generation that owned the op's keys
+            // last: the root commits them only with a holder of that tail
+            // it reaches, as it ends any generation, `Question::awaiting`.)
+            let (history, _) = self.owner_timeline(node, rid, 0, at);
+            awaiting = history
+                .iter()
+                .rev()
+                .find_map(|(_, o)| match o {
+                    super::reach::Owner::Delegate { node, gen } => Some(vec![(*node, *gen)]),
+                    super::reach::Owner::Blocked(gens) => Some(gens.clone()),
+                    super::reach::Owner::Root => None,
+                })
+                .unwrap_or_default();
             (vec![(0, super::reach::Owner::Root)], Default::default())
         } else {
             self.owner_timeline(node, rid, from_ms, at)
@@ -502,6 +516,7 @@ impl Oracles {
             to_ms: at,
             owners,
             born,
+            awaiting,
         };
         let verdict = self.reach.classify(question.clone());
         let silence = self.reach.silence_class(&question, &verdict);
