@@ -1292,7 +1292,7 @@ impl View {
                 self.commit_manifest_local(ino, &ws, base, manifest_bytes, dirty_hashes);
             let target = match (&committed, &self.sync) {
                 (Ok(()), Some(h)) => self.fast_ack_target(h),
-                _ => None,
+                _ => super::write_gate::FastAck::Now,
             };
             drop(owned);
             drop(admitted);
@@ -1302,8 +1302,19 @@ impl View {
                     ws: Some(Box::new(ws)),
                 });
             }
-            if let (Some(h), Some(target)) = (&self.sync, target) {
-                let acked = match self.local_ack_durable(h, target) {
+            if let (Some(h), false) = (
+                &self.sync,
+                matches!(target, super::write_gate::FastAck::Now),
+            ) {
+                let waited = match target {
+                    super::write_gate::FastAck::Wait(target) => self.local_ack_durable(h, target),
+                    // ADR-52: the lease ran out under the commit: in doubt.
+                    _ => {
+                        self.meta.session().count_fast_ack_stale_lease();
+                        Ok(false)
+                    }
+                };
+                let acked = match waited {
                     Ok(acked) => acked,
                     // Plan 43 C1-2 (D4): the gate went off and the row
                     // could not be re-tagged `Lone`: not acknowledged (the

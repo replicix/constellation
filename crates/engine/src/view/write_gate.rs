@@ -16,6 +16,20 @@ pub(super) struct AckTarget {
     pub(super) version: Option<u64>,
 }
 
+/// What the fast path's acknowledgement of the op that just executed on
+/// this thread does ([`View::fast_ack_target`]).
+#[derive(Clone, Copy, Debug)]
+pub(super) enum FastAck {
+    /// Answered at once.
+    Now,
+    /// Answered once the row is durable.
+    Wait(AckTarget),
+    /// ADR-52: a singleton row whose lease a fresh reading finds unusable
+    /// (the commit stalled past it): not answered; resubmitted in doubt
+    /// through the core, which dedups the rid.
+    InDoubt,
+}
+
 /// A cheap, non-cryptographic random value in `[0, 1)`, fresh per call.
 /// `RandomState::new()` draws its keys from the OS RNG each time it is
 /// constructed, so hashing nothing still yields a value that varies
@@ -627,10 +641,10 @@ impl View {
             // class decide it (`fast_ack_target`), not the journal's tip
             // and the gate as it stands after the execution: what the row
             // is tagged with and what the answer waits for must agree.
-            let jseq = if result.is_ok() {
+            let ack = if result.is_ok() {
                 self.fast_ack_target(h)
             } else {
-                None
+                FastAck::Now
             };
             // The row is journaled: a release's quiescence wait need not
             // wait on the recall below (it recalls every grant itself).
@@ -641,9 +655,16 @@ impl View {
             return match result {
                 Ok(records) => {
                     h.lease.touch(now.wait);
-                    if let Some(target) = jseq {
-                        if let Some(outcome) = self.ack_when_durable(h, rid, op, &tag, target) {
-                            return outcome;
+                    match ack {
+                        FastAck::Now => {}
+                        FastAck::Wait(target) => {
+                            if let Some(outcome) = self.ack_when_durable(h, rid, op, &tag, target) {
+                                return outcome;
+                            }
+                        }
+                        FastAck::InDoubt => {
+                            self.meta.session().count_fast_ack_stale_lease();
+                            return self.submit_to_core(h, op, rid, &tag, true);
                         }
                     }
                     self.recall_after_local_write(h, &records, now.wait);
@@ -782,11 +803,17 @@ impl View {
 
     /// Plan 43 C1-2: what the fast path's acknowledgement of the op that
     /// just executed on this thread waits for: its own journal row, when
-    /// the row's class is a gated one. `None`: nothing to wait for (the row
+    /// the row's class is a gated one. `Now`: nothing to wait for (the row
     /// is `Lone` or non-stealable: the gate was off when it was journaled).
     /// An op that journaled nothing waits for the journal's tip while the
     /// gate is on (its answer may rest on rows not yet durable).
-    pub(super) fn fast_ack_target(&self, h: &SyncHandle) -> Option<AckTarget> {
+    ///
+    /// ADR-52: a `Singleton` row is answered at once only while the lease
+    /// is still usable on a reading taken now. The in-lock check of
+    /// `execute_admitted` precedes the commit; a commit that stalled (an
+    /// fsync, a slow writer) is after it, and the lease may have been taken
+    /// over meanwhile: the row is then in doubt.
+    pub(super) fn fast_ack_target(&self, h: &SyncHandle) -> FastAck {
         match constellation_meta::take_last_journaled() {
             // Plan 43 C2f review (D5): a row journaled `Lone` or
             // non-stealable is answered at once only while the core says the
@@ -796,20 +823,30 @@ impl View {
             // like a gated row: for the group, or in doubt
             // (`DurableWait::Unexpected`) with the gate off.
             Some(row) => {
-                (row.class.gated() || !self.meta.session().durable_lone_ok()).then_some(AckTarget {
-                    first: row.first,
-                    last: row.last,
-                    version: row.class.config_version(),
-                })
-            }
-            None => h.lease.ack_gated().then(|| {
-                let tip = self.meta.journal_tip().unwrap_or(u64::MAX);
-                AckTarget {
-                    first: tip,
-                    last: tip,
-                    version: None,
+                if row.class.gated() || !self.meta.session().durable_lone_ok() {
+                    FastAck::Wait(AckTarget {
+                        first: row.first,
+                        last: row.last,
+                        version: row.class.config_version(),
+                    })
+                } else if row.class.is_singleton() && !h.lease.usable() {
+                    FastAck::InDoubt
+                } else {
+                    FastAck::Now
                 }
-            }),
+            }
+            None => {
+                if h.lease.ack_gated() {
+                    let tip = self.meta.journal_tip().unwrap_or(u64::MAX);
+                    FastAck::Wait(AckTarget {
+                        first: tip,
+                        last: tip,
+                        version: None,
+                    })
+                } else {
+                    FastAck::Now
+                }
+            }
         }
     }
 
