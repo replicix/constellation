@@ -494,6 +494,8 @@ pub const SKIPPED: &[(&str, Skip)] = &[
         Skip::Local(&[STOP, "creates the filesystem with CONSTELLATION_ACK=s3", NODES3]),
     ),
     ("single-node-unchanged", Skip::Local(&[COUNT])),
+    ("singleton-peer-join", Skip::Local(&[KILL])),
+    ("registered-peer-down", Skip::Local(&[KILL])),
     ("backup-failover-with-delegation", Skip::Local(&[KILL, CTO_STRICT, NODES3])),
     ("upgrade-after-a-seal", Skip::Local(&[KILL, CTO_STRICT, UPGRADE, NODES3])),
     ("unmount-inside-the-takeover-floor", Skip::Local(&[KILL, CTO_STRICT, NODES3])),

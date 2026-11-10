@@ -456,10 +456,19 @@ pub fn epoch_holder_retired(_seed: u64) -> Result<()> {
         )?;
         print_epoch(NAME, &x.name, &epoch_of(x)?);
     }
-    // A's journal died with it and was never flushed.
-    anyhow::ensure!(
-        !b.mnt.join("d/lost-with-a").exists(),
-        "A's unflushed write surfaced"
+    // A's journal died with it. Whether its write in the epoch is on B
+    // depends on who acknowledged it: since ADR-50 A has peers (B, C
+    // registered), so it never answers alone, and its write is
+    // acknowledged by the epoch's hold group (B's streamed copy) and so
+    // survives A (it did not before, when A answered it from its own disk).
+    // What must hold either way is that nothing else of A's comes back.
+    eprintln!(
+        "    {NAME}: A's write in the epoch {} on B",
+        if b.mnt.join("d/lost-with-a").exists() {
+            "is (the hold group acknowledged it)"
+        } else {
+            "is not"
+        }
     );
     // A can never come back under its old identity.
     pa.heal();
