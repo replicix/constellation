@@ -111,6 +111,15 @@ pub enum FaultKind {
         partition_ms: u64,
         after_ms: u64,
     },
+    /// ADR-47 (S7): `node` is cut from `peer` for `for_ms` at the moment it
+    /// answers one of `peer`'s forwards from a generation of its own with
+    /// the op executed and changed state (`Accepted`): the answer is lost,
+    /// the op ran. Armed from the fault's time, on the first such answer.
+    CutOnAnswer {
+        node: NodeId,
+        peer: NodeId,
+        for_ms: u64,
+    },
     /// Plan 30 M0's fault knob: delay the holder's forward replies by
     /// `delay_ms` for `for_ms` (bug A's trigger).
     SlowReplies { delay_ms: u64, for_ms: u64 },
@@ -3658,6 +3667,16 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             cluster
                 .get(node)
                 .hold_next_tagged_write(core_ms, core_ms + after_ms);
+        }
+        FaultKind::CutOnAnswer { node, peer, for_ms } => {
+            if !cluster.ids().contains(&node) || !cluster.get(node).alive() {
+                return;
+            }
+            note(format!(
+                "t={} cut node {node} from {peer} for {for_ms}ms at its next executed answer to {peer}",
+                fault.at_ms
+            ));
+            cluster.get(node).cut_on_answer(peer, for_ms);
         }
         FaultKind::DelegateWriteHold {
             node,

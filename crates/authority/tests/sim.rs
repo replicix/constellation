@@ -1931,13 +1931,17 @@ fn sticky_ttl_config() -> SimConfig {
 /// holder that is now a designee. Four nodes; node 1 holds the lease first
 /// and is shut down at 1 s (it restarts at 3.5 s), a successor takes the
 /// lease; node 3, whose clients write in `d1`, is paused across the change
-/// and keeps node 1 cached as the holder. At 3.7 s the operator grants `d1`
-/// sticky through the new root to the lowest live node that is not the
-/// root, node 1. Node 3 resumes and writes `d1` by its stale cache; node 1
-/// is then cut from the root and from node 3, so the answer is lost and the
-/// root cannot reach the designee. An unrouted forward that the designee
-/// runs, followed by the root's refusal of the retry, is I1
-/// (`nonholder_refused_a_designee_ran`).
+/// (until 5 s) and keeps node 1 cached as the holder. At 3.7 s the operator
+/// grants `d1` sticky through the new root to the lowest live node that is
+/// not the root, node 1. Node 1 is cut from nodes 2 and 4 at 4.8 s, so the
+/// root cannot reach the designee. Node 3 resumes at 5 s and writes `d1` by
+/// its stale cache; the first answer node 1 sends it for an op it ran from
+/// its generation is lost (`CutOnAnswer`, armed at 4.9 s: no timing race
+/// with the round trip). An unrouted forward that the designee runs,
+/// followed by the root's refusal of the retry, is I1
+/// (`nonholder_refused_a_designee_ran`); with the fence the designee
+/// answers `Fenced`, the resend routed by its generation runs and its lost
+/// answer leaves the retry's refusal held.
 fn sticky_stale_route_config() -> SimConfig {
     SimConfig {
         nodes: 4,
@@ -1951,7 +1955,7 @@ fn sticky_stale_route_config() -> SimConfig {
                 at_ms: 800,
                 kind: FaultKind::Pause {
                     node: 3,
-                    for_ms: 3_000,
+                    for_ms: 4_200,
                 },
             },
             ScheduledFault {
@@ -1962,51 +1966,66 @@ fn sticky_stale_route_config() -> SimConfig {
                 at_ms: 3_700,
                 kind: FaultKind::DelegateDir {
                     dir: "d1".into(),
-                    within_ms: 2_000,
+                    within_ms: 1_000,
                     sticky: true,
                 },
             },
             ScheduledFault {
-                at_ms: 3_900,
-                kind: FaultKind::Partition {
-                    a: 1,
-                    b: 3,
-                    for_ms: 4_000,
-                },
-            },
-            ScheduledFault {
-                at_ms: 3_950,
+                at_ms: 4_800,
                 kind: FaultKind::Partition {
                     a: 1,
                     b: 2,
-                    for_ms: 4_000,
+                    for_ms: 6_000,
                 },
             },
             ScheduledFault {
-                at_ms: 3_950,
+                at_ms: 4_800,
                 kind: FaultKind::Partition {
                     a: 1,
                     b: 4,
-                    for_ms: 4_000,
+                    for_ms: 6_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 4_900,
+                kind: FaultKind::CutOnAnswer {
+                    node: 1,
+                    peer: 3,
+                    for_ms: 5_000,
                 },
             },
         ],
+
         ..delegated_config()
     }
 }
 
 /// ADR-47: S7's shape passes only once an executor fences an unrouted
-/// forward (C4).
+/// forward (C4), and the fence is reached: forwards fenced at a designee and
+/// resent by their generation, summed over the seeds (a seed that misses the
+/// shape shows as missing coverage, not as a pass).
 #[test]
 fn sticky_stale_route_passes_with_the_fence() {
+    let (mut fenced, mut resends) = (0, 0);
     for seed in 0..25 {
-        run_seed(seed, sticky_stale_route_config()).unwrap_or_else(|e| {
+        let r = run_seed(seed, sticky_stale_route_config()).unwrap_or_else(|e| {
             panic!(
                 "sticky-stale-route seed {seed}: {e}\n  replay with \
                  AUTHORITY_SIM_CONFIG=sticky-stale-route"
             )
         });
+        fenced += r
+            .stats
+            .values()
+            .map(|s| s.deleg_fenced_forwards)
+            .sum::<u64>();
+        resends += r.stats.values().map(|s| s.fenced_resends).sum::<u64>();
     }
+    assert!(fenced > 0, "no forward was fenced: the shape was missed");
+    assert!(
+        resends > 0,
+        "no fenced forward was resent by its generation"
+    );
 }
 
 /// A holder crash mid-burst with the backup configuration: the backup

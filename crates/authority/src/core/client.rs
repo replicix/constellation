@@ -1470,6 +1470,13 @@ impl Core {
         // (A send routed by a generation is to a delegate, whatever the
         // table here lists.)
         c.sent_to_delegate |= to_delegate || routed_gen != 0;
+        // (Nor does a table that lags tell where the generation's op went:
+        // a send routed by a generation went to its designee, and the
+        // inbox hold (`sent_to_designation`) must cover it as it covers a
+        // redirect.)
+        if routed_gen != 0 {
+            c.redirected_to_designee = true;
+        }
         // ADR-47: the rid is touched by the generation this send is routed
         // by from here on, whether the send leaves now or after the batch
         // withdrawal below; the value travels with it.
@@ -1856,8 +1863,15 @@ impl Core {
                     self.stats.fenced_resends += 1;
                     self.send_forward(now, rid, from, fenced, replica, out);
                 } else {
+                    // Past the limit the op waits (an attempt spent, the
+                    // backoff, then the lease path when they run out) and is
+                    // sent again by the latest generation heard of, not
+                    // routed 0 to the same stale cache with no delay.
                     self.stats.fence_bounce_limit += 1;
-                    self.route(now, rid, replica, out);
+                    if let Some(c) = self.clients.get_mut(&rid) {
+                        c.held_by = Some((from, fenced));
+                    }
+                    self.retry_or_lease(now, rid, replica, out);
                 }
             }
             // ADR-47: the root holds an op that touched a non-stealable
@@ -2253,12 +2267,16 @@ impl Core {
         // the root, reachable all along, answered every other node's
         // (`backup-strict` 1551 with slow lease reads). The rid is the same:
         // the root answers it from its dedup, or holds it again.
-        let cached = self
-            .lease
-            .cached_holder
-            .map(|h| (h, 0))
-            .or(held_by)
-            .filter(|(h, _)| *h != self.cfg.node_id);
+        // A delegate's `Held` (or a fence) names the node and the generation
+        // that ran or fenced the op. When the cache names that same node (it
+        // may be stale: the node is a designee now) the retry goes routed by
+        // the generation, not routed 0, which it would fence again.
+        let me = self.cfg.node_id;
+        let cached = match (self.lease.cached_holder, held_by) {
+            (Some(c), Some((h, g))) if g != 0 && h == c => Some((h, g)),
+            (c, held) => c.map(|h| (h, 0)).or(held),
+        }
+        .filter(|(h, _)| *h != me);
         match cached {
             Some((holder, routed)) if self.reaches(now, holder) => {
                 self.send_forward(now, rid, holder, routed, replica, out)

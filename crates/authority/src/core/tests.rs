@@ -65800,6 +65800,121 @@ mod step5_sticky_release {
         assert_eq!(h.core.stats.designation_refusals_held, 1);
     }
 
+    /// ADR-47 review SHOULD-1: the hold covers a `Fenced` resend too. The
+    /// requester's table lags and its cache names the designee; the forward
+    /// routed 0 is fenced, the resend routed by the generation goes out, its
+    /// answer is lost, the requester is cut off and the lease read finds the
+    /// root: the op is not put in the inbox (the drain would refuse it for
+    /// good, against the designee's run). Fails on the parent: the resend
+    /// never marks the op as redirected, and the op goes to the inbox.
+    #[test]
+    fn a_fenced_resend_is_not_put_in_the_inbox() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.inbox = true;
+        h.core.lease.cached_holder = Some(3);
+        h.step(links_event(&[3]));
+        let (dir, rec) = mkdir(&h, "a");
+        // (No `DelegateNode`: the grant is not applied here yet.)
+        Replica::install_streamed(&h.meta, 1, 1, 1, 1, &[rec], true, (0, 0)).unwrap();
+        let rid = h.rid(1);
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest {
+                    req, routed_gen, ..
+                } if to == 3 => {
+                    assert_eq!(*routed_gen, 0);
+                    Some(*req)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("not sent to the cached node: {out:?}"));
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Fenced { gen: 7 },
+                base: None,
+                position: Position::ZERO,
+                gen: 7,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+            },
+        });
+        assert!(
+            sends(&out).iter().any(
+                |(to, m)| *to == 3 && matches!(m, PeerMsg::MutateRequest { routed_gen: 7, .. })
+            ),
+            "not resent by the generation: {out:?}"
+        );
+        // The resend's answer is lost, and the requester is cut off.
+        h.step(links_event(&[]));
+        let mut out = out;
+        let mut get = None;
+        for _ in 0..12 {
+            if let Some(a) = out.iter().find_map(|a| match a {
+                Action::S3 {
+                    op,
+                    req: S3Op::LeaseGet,
+                } => Some(*op),
+                _ => None,
+            }) {
+                get = Some(a);
+                break;
+            }
+            let Some(t) = timers(&out, TimerKind::ForwardTimeout)
+                .into_iter()
+                .chain(timers(&out, TimerKind::ForwardBackoff))
+                .next_back()
+            else {
+                break;
+            };
+            h.advance(h.core.cfg.forward_timeout_ms + 1);
+            out = h.step(Event::Timer { id: t });
+        }
+        let get = get.expect("the op never read the lease");
+        let body = Lease {
+            ttl_ms: 600_000,
+            ..lease_of(1, 1, h.now.0 + 600_000)
+        };
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((body, tag())))),
+        });
+        assert!(
+            !out.iter().any(|a| matches!(
+                a,
+                Action::S3 {
+                    req: S3Op::InboxPut { .. } | S3Op::InboxLastN { .. },
+                    ..
+                }
+            )),
+            "the op was put in the inbox: {out:?}"
+        );
+        assert!(
+            !timers(&out, TimerKind::ForwardBackoff).is_empty(),
+            "no retry: {out:?}"
+        );
+        assert_eq!(h.core.stats.designation_refusals_held, 1);
+    }
+
     /// An op submitted to the root (node 1) whose table lacks the designee;
     /// the root's `NotHolder { 3 }` arrives with `gen` (the designee's
     /// generation for a designee redirect, 0 for a lease holder's). Returns
@@ -67234,12 +67349,74 @@ mod route_fence_wire {
         let out = h.step(reply(req, MutateOutcome::Fenced { gen: 7 }, 7));
         assert_eq!(h.core.stats.fenced_resends, 2);
         assert_eq!(h.core.stats.fence_bounce_limit, 1);
-        assert!(
-            forward_routed_by(&out).is_none_or(|(_, _, routed)| routed == 0),
-            "routed afresh, not by the generation again: {out:?}"
-        );
+        // Past the limit the op waits: no send now (not routed 0 to the
+        // same cache again), an attempt spent, a backoff timer.
+        assert!(forward_routed_by(&out).is_none(), "{out:?}");
+        assert_eq!(h.core.clients[&rid].attempts, 1);
+        let backoff = timers(&out, TimerKind::ForwardBackoff);
+        assert_eq!(backoff.len(), 1, "{out:?}");
         // The designee is not cached as the lease holder.
         assert_eq!(h.core.lease.cached_holder, Some(2));
+        // The backoff sends it again by the generation last heard of.
+        h.advance(h.core.cfg.forward_backoff_ms + 1);
+        let out = h.step(Event::Timer { id: backoff[0] });
+        let (to, _, routed) = forward_routed_by(&out).expect("sent after the backoff");
+        assert_eq!((to, routed), (2, 7), "{out:?}");
+    }
+
+    /// ADR-47 review SHOULD-2: a node that keeps fencing the op does not
+    /// make it ping-pong until the client deadline. Each round past the limit
+    /// spends an attempt and waits; when they run out the op leaves the
+    /// forward path. Fails on the parent: routed 0 again, at once, forever.
+    #[test]
+    fn a_node_that_keeps_fencing_ends_the_forward_path() {
+        let (mut h, _rid, mut req) = forwarded();
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            assert!(rounds < 30, "the op keeps being sent to the fencing node");
+            let mut out = h.step(reply(req, MutateOutcome::Fenced { gen: 7 }, 7));
+            if forward_routed_by(&out).is_none() {
+                let Some(t) = timers(&out, TimerKind::ForwardBackoff).first().copied() else {
+                    // Out of the forward path (the lease read).
+                    break;
+                };
+                h.advance(h.core.cfg.forward_backoff_ms * 10);
+                out = h.step(Event::Timer { id: t });
+            }
+            match forward_routed_by(&out) {
+                Some((_, next, _)) => req = next,
+                None => break,
+            }
+        }
+        // Two resends, then `forward_retries` backed-off rounds.
+        assert!(
+            rounds <= 2 + h.core.cfg.forward_retries as usize + 2,
+            "{rounds}"
+        );
+    }
+
+    /// ADR-47 review SHOULD-3: a delegate's `Held` names the generation that
+    /// ran the op; the backoff sends it there routed by it, not routed 0 by
+    /// a cache that may be stale (which would be fenced again). Fails on the
+    /// parent: routed 0.
+    #[test]
+    fn a_held_answer_from_a_delegate_is_retried_routed_by_its_generation() {
+        let (mut h, _rid, req) = forwarded();
+        let out = h.step(reply(
+            req,
+            MutateOutcome::Held {
+                retry_ms: 100,
+                outwait_ms: None,
+            },
+            7,
+        ));
+        let backoff = timers(&out, TimerKind::ForwardBackoff);
+        assert_eq!(backoff.len(), 1, "{out:?}");
+        h.advance(101);
+        let out = h.step(Event::Timer { id: backoff[0] });
+        let (to, _, routed) = forward_routed_by(&out).expect("asked again");
+        assert_eq!((to, routed), (2, 7), "{out:?}");
     }
 
     /// A `HolderUnreachable` answer holds the op: no send, a backoff timer
@@ -67686,6 +67863,40 @@ mod route_fence_executor {
         );
         assert_eq!(h.core.dl.mine[&7].executed, 1);
         assert_eq!(h.core.stats.deleg_fenced_forwards, 1);
+    }
+
+    /// ADR-47 Q4: the fence holds for the root's own generation. A node that
+    /// is the lease holder and also the designee of `g` (it was granted
+    /// `g` and then took the lease over) answers a forward routed 0 with
+    /// `Fenced { g }`, not by running it as the holder: a requester's cache
+    /// names it as the lease holder, which is what routing 0 means, and
+    /// `g`'s rows are the ones a later refusal would contradict. The forward
+    /// routed by `g` runs.
+    #[test]
+    fn the_lease_holder_fences_a_forward_for_its_own_generation() {
+        use crate::core::holder::Fence;
+        let (mut h, d1) = designee();
+        h.hold(5, None);
+        let op = MutateOp::Create {
+            parent: d1,
+            name: "x".into(),
+            ino: h.meta.allocate_ino(d1).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let by = |routed_gen| Fence {
+            routed_gen,
+            touched_gen: routed_gen,
+        };
+        assert!(
+            h.core.fenced_at_delegate(2, &op, by(0), &h.meta),
+            "the lease holder runs a forward routed 0 for its own generation"
+        );
+        assert!(h.core.fenced_at_delegate(2, &op, by(5), &h.meta));
+        assert!(!h.core.fenced_at_delegate(2, &op, by(7), &h.meta));
+        // (Its own ops are never fenced.)
+        assert!(!h.core.fenced_at_delegate(0, &op, by(0), &h.meta));
     }
 
     /// The negative control: without the fence (`fence_accepts_unrouted`) the
