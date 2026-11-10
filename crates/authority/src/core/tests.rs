@@ -46722,6 +46722,114 @@ mod deleg_group {
         }
     }
 
+    /// A lone root that took over from a delegate: the harness at the
+    /// takeover gate (`gate_done`: re-appended) with the delegate's own
+    /// client row `rid` that the root never acknowledged. Nothing gates its
+    /// root rows.
+    fn lone_root_with_own_delegate_row(gate_done: bool) -> (Harness, Ino, Rid) {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        root_is_near(&mut h);
+        let (rid, out) = own_create(&mut h, dir, 1);
+        assert!(client_answers(&out).is_empty(), "{out:?}");
+        assert!(batch(&out).is_some(), "the row streams to the root");
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: true,
+            }),
+        );
+        h.core.ack.eligible = Some(false);
+        assert_eq!(h.core.durable_jseq(), u64::MAX, "a lone root gates nothing");
+        if gate_done {
+            let mut out = Vec::new();
+            h.core.complete_gate(h.clk(), &h.meta, &mut out);
+            assert_eq!(h.core.stats.own_deleg_rows_reappended, 1);
+        }
+        (h, dir, rid)
+    }
+
+    /// The retry of the same op (`on_backoff`, `release_gated`, the fast
+    /// path: `resolve_in_doubt_then_execute`) finds its `completed` row in
+    /// this lone root's journal: a delegate's own row the root never
+    /// acknowledged. The answer waited on the root journal's position only,
+    /// which a lone root never gates, and the own-client shortcut released
+    /// it at once: the row on this disk alone (`long-delegated` seeds 255
+    /// and 865's window between the takeover gate and the ship, I1). It
+    /// waits for the stream, and leaves once the new tenure ships the row.
+    /// Fails before: answered at the retry.
+    #[test]
+    fn a_retry_does_not_answer_a_lone_roots_own_uncommitted_delegate_row() {
+        for gate_done in [false, true] {
+            let (mut h, _dir, rid) = lone_root_with_own_delegate_row(gate_done);
+            h.core.clients.get_mut(&rid).expect("in flight").forwarded = true;
+            let mut out = Vec::new();
+            let outcome = h
+                .core
+                .resolve_in_doubt_then_execute(h.clk(), rid, 2, &h.meta, &mut out);
+            assert!(
+                matches!(outcome, MutateOutcome::Accepted { .. }),
+                "(gate done {gate_done}) {outcome:?}"
+            );
+            h.core.finish(h.clk(), rid, outcome, &h.meta, &mut out);
+            assert!(
+                client_answers(&out).is_empty(),
+                "(gate done {gate_done}) answered from a row only this disk holds: {out:?}"
+            );
+            if gate_done {
+                h.core
+                    .ack
+                    .shipped_rows
+                    .insert(h.meta.journal_tip().unwrap());
+                let mut out = Vec::new();
+                h.core.complete_ready(h.clk(), &h.meta, &mut out);
+                assert_eq!(
+                    client_answers(&out).len(),
+                    1,
+                    "answered once the new tenure shipped the row: {out:?}"
+                );
+            }
+        }
+    }
+
+    /// A parked answer (`park_durable`'s own-client shortcut for a lone
+    /// root) whose row is a delegation row the group or the log does not
+    /// hold is not released by the journal seq alone: the release asks the
+    /// same predicate (`park_released`). Fails before: released at once.
+    #[test]
+    fn a_parked_own_answer_on_a_delegate_row_waits_for_the_row_not_the_lone_shortcut() {
+        let (mut h, _dir, rid) = lone_root_with_own_delegate_row(true);
+        let tip = h.meta.journal_tip().unwrap();
+        h.core.clients.get_mut(&rid).expect("in flight").forwarded = true;
+        let class = constellation_meta::RowCommit::LONE;
+        h.core.park_finish(
+            h.clk(),
+            rid,
+            Default::default(),
+            Some(tip),
+            MutateOutcome::Accepted {
+                epoch: 2,
+                records: Vec::new(),
+            },
+            class,
+        );
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert!(
+            client_answers(&out).is_empty(),
+            "released by the lone shortcut: {out:?}"
+        );
+        h.core.ack.shipped_rows.insert(tip);
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert_eq!(client_answers(&out).len(), 1, "{out:?}");
+    }
+
     /// The requester's deadline settles a rid from the delegate's own
     /// journal only when its row is committed: an uncommitted `DelegateNodeGroup`
     /// row is not an outcome the generation's end will keep (D6).

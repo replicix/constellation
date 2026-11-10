@@ -1996,6 +1996,32 @@ impl Core {
         !remote
     }
 
+    /// [`Self::park_durable`] for a parked answer: the journal seq `jseq` is
+    /// durable *and*, when the answer rests on a delegation row (`gen != 0`),
+    /// that row is committed by its group or the log
+    /// ([`Self::completed_row_settled`]). `park_durable` knows a journal seq
+    /// only, and a lone root's own client shortcut (`!remote`) would
+    /// release at once an answer resting on a delegate's row this disk
+    /// alone holds (the I1 class of `Core::answer_need_of`).
+    pub(crate) fn park_released(
+        &self,
+        what: &super::readindex::ParkedWhat,
+        jseq: u64,
+        shipped: u64,
+        replica: &dyn Replica,
+    ) -> bool {
+        if !self.park_durable(jseq, what.to_remote(self.cfg.node_id), shipped) {
+            return false;
+        }
+        match what {
+            super::readindex::ParkedWhat::Reply { rid, .. }
+            | super::readindex::ParkedWhat::Finish { rid, .. } => {
+                self.completed_row_settled(*rid, replica)
+            }
+            _ => true,
+        }
+    }
+
     /// Plan 43 C2 (§5.1): the journal seq an answer of class `class` to
     /// `asker`, evaluated at `position`, must wait for, or `None` when it may
     /// leave now: [`Self::ack_need`] for this node's own client, and for

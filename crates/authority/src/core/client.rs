@@ -2899,7 +2899,7 @@ impl Core {
                     pending: replica.journal_position(epoch),
                     streams: Default::default(),
                 };
-                let durable = self.ack_need_of(rid, &position, replica);
+                let durable = self.answer_need_of(rid, &position, replica);
                 // Plan 41 P41-01: an acceptance found completed waits for the
                 // read-delegation quarantine as a fresh execution's does
                 // (`dedup_acceptance_wait`).
@@ -4322,13 +4322,25 @@ impl Core {
     /// 1659, `long-delegated-late-answers` 542, 992: answered `Archive`,
     /// the root then sealed by its backup).
     pub(crate) fn completed_row_settled(&self, rid: Rid, replica: &dyn Replica) -> bool {
+        self.unsettled_delegate_row(rid, replica).is_none()
+    }
+
+    /// `(gen, idx)` of `rid`'s `completed` row when it is a delegation row
+    /// (`gen != 0`) its group or the log does not hold yet; `None`: not a
+    /// delegation row, or committed ([`Self::completed_row_settled`]).
+    pub(crate) fn unsettled_delegate_row(
+        &self,
+        rid: Rid,
+        replica: &dyn Replica,
+    ) -> Option<(u64, u64)> {
         replica
             .outcome_row(rid)
             .filter(|r| r.gen != 0)
-            .is_none_or(|r| {
-                (!r.class.gated() || self.deleg_stream_durable(r.gen, r.idx, replica))
-                    && !self.holder_append_uncommitted(r.gen, r.idx, replica)
+            .filter(|r| {
+                !((!r.class.gated() || self.deleg_stream_durable(r.gen, r.idx, replica))
+                    && !self.holder_append_uncommitted(r.gen, r.idx, replica))
             })
+            .map(|r| (r.gen, r.idx))
     }
 
     /// What this replica can answer for `rid` without running it, at a
@@ -4401,9 +4413,6 @@ impl Core {
         // its own client's row, which the restarted root never
         // acknowledged, was answered at the deadline inside the takeover
         // gate on this disk alone).
-        if !self.completed_row_settled(rid, replica) {
-            return None;
-        }
         let position = Position {
             seq: self.ship.head_seq,
             pending: replica.journal_position(epoch),
@@ -4412,6 +4421,9 @@ impl Core {
         if outcome == MutateOutcome::Abandoned {
             // A settle's refusal: answered once committed, as another
             // node's answer (never the lone shortcut, `Core::settle_refusal`).
+            if !self.completed_row_settled(rid, replica) {
+                return None;
+            }
             let shipped = replica.journal_acked_seq().unwrap_or(0);
             let class = self.root_commit(super::Asker::Remote);
             return self
@@ -4419,27 +4431,45 @@ impl Core {
                 .is_none()
                 .then_some(outcome);
         }
-        self.ack_need_of(rid, &position, replica)
+        self.answer_need_of(rid, &position, replica)
             .is_none()
             .then_some(outcome)
     }
 
-    /// Plan 46 M1.4 step 2 fix: [`Self::ack_need`] for the answer to `rid`'s
-    /// row. A row an ended hold left uncommitted waits as `park_durable`
-    /// makes it wait (the archive or the group, a lone node's disk
-    /// included); `ack_need` reads the group's coverage of the tip only and
-    /// ignores `hold_end_tip`: a deadline's or a retry's answer left on it
-    /// while the parked one waited, with the row labelled for the archive.
-    pub(crate) fn ack_need_of(
+    /// The one durability predicate of an answer to `rid`'s `completed` row at
+    /// a node that holds the lease: the journal seq the answer must wait
+    /// for, or `None` when the row may be answered as committed now. Every
+    /// holder-side answer of a `completed` row goes through it
+    /// (`settled_outcome`, so the deadline, and
+    /// `resolve_in_doubt_then_execute`, so the retries, the gate's
+    /// re-submissions and the fast path), and a parked answer is released by
+    /// the same rule ([`Self::park_released`]).
+    ///
+    /// - A delegation row (`gen != 0`: this node's own row of its generation,
+    ///   its tenure's append of a delegate's row, or the takeover gate's
+    ///   re-append) is committed only by its group or the log
+    ///   ([`Self::unsettled_delegate_row`]), whatever the root journal
+    ///   gates: a lone root's `durable_jseq` is `u64::MAX` and its own
+    ///   client's shortcut (`park_durable`) leaves at once, so the root
+    ///   journal's position says nothing about it (`long-delegated` seeds
+    ///   255 and 865, I1). The answer waits on the row's own seq, and its
+    ///   release asks the row again (`park_released`).
+    /// - A root row (`gen == 0`) waits as [`Self::ack_need`] says (a row keeps
+    ///   the rule it was journaled under: the configuration's caps are in
+    ///   `durable_jseq`); a row an ended hold left uncommitted waits as
+    ///   `park_durable` makes it wait (the archive or the group, a lone
+    ///   node's disk included; plan 46 M1.4 step 2 fix).
+    pub(crate) fn answer_need_of(
         &self,
         rid: Rid,
         position: &Position,
         replica: &dyn Replica,
     ) -> Option<u64> {
-        if let Some((first, _)) = replica
-            .journal_class_of_rid(rid)
-            .filter(|(first, _)| self.left_by_hold(*first))
-        {
+        let first = replica.journal_class_of_rid(rid).map(|(first, _)| first);
+        if self.unsettled_delegate_row(rid, replica).is_some() {
+            return Some(first.or(position.pending.map(|p| p.jseq)).unwrap_or(0));
+        }
+        if let Some(first) = first.filter(|first| self.left_by_hold(*first)) {
             let shipped = replica.journal_acked_seq().unwrap_or(0);
             return (!self.park_durable(first, false, shipped)).then_some(first);
         }
