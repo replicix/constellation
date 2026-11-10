@@ -497,15 +497,7 @@ impl Oracles {
             // last: the root commits them only with a holder of that tail
             // it reaches, as it ends any generation, `Question::awaiting`.)
             let (history, _) = self.owner_timeline(node, rid, 0, at);
-            awaiting = history
-                .iter()
-                .rev()
-                .find_map(|(_, o)| match o {
-                    super::reach::Owner::Delegate { node, gen } => Some(vec![(*node, *gen)]),
-                    super::reach::Owner::Blocked(gens) => Some(gens.clone()),
-                    super::reach::Owner::Root => None,
-                })
-                .unwrap_or_default();
+            awaiting = super::reach::Question::awaiting_of(&history);
             (vec![(0, super::reach::Owner::Root)], Default::default())
         } else {
             self.owner_timeline(node, rid, from_ms, at)

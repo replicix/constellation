@@ -279,6 +279,18 @@ impl Question {
         self
     }
 
+    /// The generations an op's answer rests on, from its owner history up to
+    /// the unsettled `EIO`: those of the owner at the end (a delegate or a
+    /// blocked set). A history that ends at the root rests on none: the
+    /// generation the root ended has had its rows appended.
+    pub fn awaiting_of(history: &[(u64, Owner)]) -> Vec<(NodeId, u64)> {
+        match history.last() {
+            Some((_, Owner::Delegate { node, gen })) => vec![(*node, *gen)],
+            Some((_, Owner::Blocked(gens))) => gens.clone(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Generation `gen` first showed in the root's table at `at`.
     pub fn born_at(mut self, gen: u64, at: u64) -> Self {
         self.born.insert(gen, at);
@@ -2563,6 +2575,33 @@ mod tests {
             r.classify(q(1).awaiting(2, 7)),
             Verdict::Reachable { .. }
         ));
+    }
+
+    #[test]
+    fn a_generation_the_root_ended_is_not_awaited() {
+        // The op's keys were a delegate's and are the root's again (the
+        // generation ended, its rows are appended): the delegate and its
+        // backup being gone does not make the root's answer wait for them.
+        let history = vec![
+            (0, Owner::Root),
+            (1_000, Owner::Delegate { node: 2, gen: 7 }),
+            (2_000, Owner::Root),
+        ];
+        let awaiting = Question::awaiting_of(&history);
+        assert!(awaiting.is_empty(), "{awaiting:?}");
+        let live = vec![
+            (0, Owner::Root),
+            (1_000, Owner::Delegate { node: 2, gen: 7 }),
+        ];
+        assert_eq!(Question::awaiting_of(&live), vec![(2, 7)]);
+        let blocked = vec![(1_000, Owner::Blocked(vec![(2, 7), (3, 8)]))];
+        assert_eq!(Question::awaiting_of(&blocked), vec![(2, 7), (3, 8)]);
+        let r = expired(3_000, vec![(7, 4)]);
+        r.partition_at(3_100, 1, 2, true);
+        r.partition_at(3_100, 1, 4, true);
+        let mut question = q(1);
+        question.awaiting = awaiting;
+        assert!(matches!(r.classify(question), Verdict::Reachable { .. }));
     }
 
     #[test]
