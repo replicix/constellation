@@ -2113,6 +2113,57 @@ fn sticky_stale_route_passes_with_the_fence() {
     );
 }
 
+/// ADR-47's negative control for the delegate fence
+/// (`Config::fence_accepts_unrouted`, `AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED=1`):
+/// a designee that runs a forward routed by the lease holder, while the
+/// requester's `touched_gen` stays honest, runs the op the root then refuses
+/// for good. The log oracle that finds a refusal beside a non-stealable
+/// execution of one rid fails the run (`nonholder_refused_a_designee_ran`),
+/// not the knob's own counter. The same seeds pass with the fence.
+#[test]
+fn an_unfenced_designee_fails_the_stale_route_config() {
+    let config = SimConfig {
+        fence_accepts_unrouted: true,
+        ..sticky_stale_route_config()
+    };
+    for seed in [4u64, 6, 12] {
+        let e = run_seed(seed, config.clone())
+            .expect_err("a designee ran an unrouted forward and no oracle noticed");
+        assert!(
+            e.contains("nonholder_refused_a_designee_ran") || e.contains("refused_and_completed"),
+            "seed {seed}: {e}"
+        );
+        run_seed(seed, sticky_stale_route_config())
+            .unwrap_or_else(|e| panic!("seed {seed} with the fence: {e}"));
+    }
+}
+
+/// ADR-47's negative control for the root's rule
+/// (`Config::root_ignores_touched`, `AUTHORITY_SIM_ROOT_IGNORES_TOUCHED=1`):
+/// the root and its inbox drain refuse an op under an unreachable
+/// non-stealable grant for good whatever the op touched. `sticky-ttl` then
+/// fails on the seeds main failed on, by the log oracles (not the knob's
+/// counter). The same seeds pass with the rule.
+#[test]
+fn a_root_that_ignores_touched_fails_sticky_ttl() {
+    let config = SimConfig {
+        root_ignores_touched: true,
+        ..sticky_ttl_config()
+    };
+    for seed in [110u64, 624, 772] {
+        let e = run_seed(seed, config.clone())
+            .expect_err("a refusal beside the holder's row and no oracle noticed");
+        assert!(
+            e.contains("nonholder_refused_a_designee_ran")
+                || e.contains("refused_and_completed")
+                || e.contains("acked_implies_committed"),
+            "seed {seed}: {e}"
+        );
+        run_seed(seed, sticky_ttl_config())
+            .unwrap_or_else(|e| panic!("seed {seed} with the rule: {e}"));
+    }
+}
+
 /// A holder crash mid-burst with the backup configuration: the backup
 /// seals and takes over.
 fn backup_crash_config() -> SimConfig {

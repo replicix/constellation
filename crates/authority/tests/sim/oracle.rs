@@ -481,6 +481,28 @@ impl Oracles {
         accepted_by_delegate: bool,
     ) {
         let at = self.reach.now_ms();
+        // ADR-47 (§8.3): the requester's label is its own word. It counts as
+        // I4's exception only if global truth agrees: some non-stealable
+        // generation owned the op's keys at the root while the op lived.
+        // Otherwise the `EIO` is judged by reachability like any other (a
+        // hold with no grant behind it would mask a stall).
+        let designation_held = designation_held && {
+            let non_stealable: std::collections::BTreeSet<u64> = self
+                .tables
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|(_, _, table)| table.iter().filter(|d| d.non_stealable()).map(|d| d.gen))
+                .collect();
+            let (history, _) = self.owner_timeline(node, rid, 0, at);
+            history.iter().any(|(_, owner)| match owner {
+                super::reach::Owner::Delegate { gen, .. } => non_stealable.contains(gen),
+                super::reach::Owner::Blocked(involved) => {
+                    involved.iter().any(|(_, gen)| non_stealable.contains(gen))
+                }
+                super::reach::Owner::Root => false,
+            })
+        };
         // (A settle lasts at least a window; one whose deadline was extended
         // lasts from the arming of its second deadline.)
         let from_ms = started.unwrap_or(at).min(at.saturating_sub(window_ms));
@@ -3241,6 +3263,19 @@ mod tests {
         )
     }
 
+    /// ADR-47 (§8.3): a requester's designation label counts as I4's
+    /// exception only if a non-stealable generation owned the op's keys at
+    /// the root. With none in the run, the `EIO` is judged by reachability
+    /// like any other.
+    #[test]
+    fn an_unbacked_designation_label_is_dropped() {
+        let o = Oracles::new(Bucket::new(1, (0, 0)));
+        o.note_unsettled(3, rid(3, 1), 1_000, None, true, false);
+        let u = o.unsettled.lock().unwrap();
+        assert_eq!(u.len(), 1);
+        assert!(!u[0].designation_held, "{:?}", u[0]);
+    }
+
     /// ADR-47, check 1: findings of an audit over a log that completes `r`.
     fn fence_of(audit: FenceAudit, acks: Vec<AckEntry>, r: Rid) -> Vec<String> {
         let o = Oracles::new(Bucket::new(1, (0, 0)));
@@ -3282,6 +3317,10 @@ mod tests {
         // The requester held the root's refusal back: no client heard it.
         let reply = ack(2, r, 6, OutcomeKind::Refused(Code::ReadOnly), true);
         assert!(fence_of(audit(3, &[1]), vec![reply], r).is_empty());
+        // The requester passed the root's refusal on to its client (the
+        // stale-route shape): the client heard it.
+        let passed_on = relay(3, 2, r, 7, OutcomeKind::Refused(Code::ReadOnly));
+        assert_eq!(fence_of(audit(3, &[1]), vec![passed_on], r).len(), 1);
     }
 
     /// A rollback is dated by the queue entry: a rid queued, answered, gone
@@ -4807,7 +4846,8 @@ pub struct FenceAudit {
 /// Check 1, `nonholder_refused_a_designee_ran` (I1, non-stealable arm): a
 /// rid the root decided to refuse for good and a non-stealable generation
 /// executed, whose `Completed` the log carries. The refusal is final when a
-/// client heard it (an `EROFS`/`EXDEV` answered to its own client, not a
+/// client heard it (an `EROFS`/`EXDEV` answered to a client, the requester's
+/// relay of the root's included: that is the stale-route shape; not a
 /// forward's reply, which the requester may hold) or
 /// the inbox drain journaled it; a root's refusal the requester held back
 /// is not. A client that submitted the rid again after the refusal may run
@@ -4822,8 +4862,7 @@ fn fence_findings(
         let heard = acks
             .iter()
             .filter(|a| {
-                !a.is_relay()
-                    && !a.reply
+                !a.reply
                     && a.rid == rid
                     && matches!(
                         a.kind,
