@@ -285,8 +285,46 @@
 //! - **No server queue**: a deposed root's parked ops die with its tenure;
 //!   the requester's retry is the only source of another copy.
 //!
+//! ## Chunk 12: the roster object and stale views (plan 46 M1.3 step 10, ADR-50)
+//!
+//! - **Reads** ([`Action::SeeRoster`], [`Action::SeeOldRoster`],
+//!   [`Action::SeePartialRoster`]): the root's view
+//!   ([`State::view_roster`]) is the nodes of the latest complete read plus
+//!   the nodes it heard from. A complete read replaces it; a read older than
+//!   the installed one ([`State::roster_seq`], [`State::view_seq`]) is
+//!   ignored; an incomplete read (a scan that lost a record) only adds and
+//!   sets [`State::view_partial`] until the next complete read. The root's
+//!   **singleton test** is "the view lists no write-eligible peer, the latest
+//!   read was complete, and no other node holds a live generation"
+//!   (`quiet`). When it flips the root journals the `config_version` bump
+//!   (chunk 8).
+//! - **Messages** ([`Msg::Fwd`]'s `lane`, [`NodeStreamModel::stale_root_cache`]):
+//!   every message the root receives from a node is evidence that the node is
+//!   a peer: a first direct forward, a resend, a settle, and an op drained
+//!   from the inbox. A joining node's first send of each op follows a stale
+//!   cache of the lease holder: to a node that is not the root, which answers
+//!   `NotOwner` and executes nothing, or (no holder cached) by the inbox.
+//! - **The oracle** ([`State::known`], [`State::known_partial`]) is separate
+//!   code from the view: the nodes of the latest complete read, plus (with
+//!   [`NodeStreamModel::told_messages`]) every node the root served a message
+//!   from, and a flag that the latest read was incomplete. A root row
+//!   journaled while the oracle said "may have a peer" ([`Row::told`]) is
+//!   never answered from the disk alone (`no_lone_answer_with_peer`), and a
+//!   singleton's rollback exempts only rows journaled while it said "no peer"
+//!   (`rollback_only_singleton_or_operator`). The earlier chunks run with
+//!   `told_messages` off, so their knobs behave as before.
+//! - The roster's generation and the read sequence are abstractions: reads
+//!   are atomic, an old read is by construction older than the installed
+//!   one, and the driver's per-read sequence number, `issued` stamp and
+//!   `lapses` count are the product's way of knowing it.
+//!
 //! # Properties
 //!
+//! - `roster_view_monotone` (chunk 12, S10-I2): every node the oracle
+//!   recorded is in the root's view until a newer complete read omits it.
+//! - `no_singleton_with_live_foreign_grant` (chunk 12, S10-I4): the root's
+//!   configuration is a singleton's only while no other node holds a live
+//!   generation.
 //! - `ack_implies_committed_by_config` (I1, plan 46 §5.9): at the moment a
 //!   sequencer emits a definitive answer, the row is committed by the
 //!   configuration in force at its journal position, judged from the
@@ -440,6 +478,19 @@
 //!   read delegation outstanding.
 //! - `server_replay_queue` (chunk 9): a deposed root's parked ops are handed
 //!   to the claimant.
+//! - `roster_installs_old_read` (chunk 12): a read older than the installed
+//!   one replaces the view, which forgets a joiner the root had read.
+//! - `roster_partial_shrinks` (chunk 12): an incomplete read replaces the
+//!   view and counts as a complete one (the core's roster before step 10,
+//!   where a scan with an unparseable record emptied it).
+//! - `singleton_while_partial` (chunk 12): the singleton test ignores that
+//!   the latest read was incomplete.
+//! - `evidence_only_on_forward` (chunk 12): only a first direct forward is
+//!   evidence of a peer; a settle, a resend and an op drained from the inbox
+//!   are not.
+//! - `singleton_with_foreign_grant` (chunk 12): the singleton test ignores a
+//!   live generation another node holds (`check_foreign_grant = false` shows
+//!   the harm: `ack_implies_committed_by_config`).
 
 use crate::delegation::{dir_of, eval, force, HEvt, Key, KeyOp, KeySpec, Ret, Rid, View, WriteOp};
 use stateright::semantics::{ConsistencyTester, LinearizabilityTester};
@@ -453,6 +504,17 @@ pub const RECORD_NODE: u8 = 0xFF;
 pub const LONE: u8 = 0xFE;
 /// Streams: the root's journal and at most two node streams.
 pub const MAXS: usize = 3;
+/// A first send straight to the executor.
+pub const LANE_DIRECT: u8 = 0;
+/// An op the root drains from its inbox (the sender had no link).
+pub const LANE_INBOX: u8 = 1;
+/// A later send of the same op (a retry, or a `Fenced` resend).
+pub const LANE_RESEND: u8 = 2;
+/// A settle.
+pub const LANE_SETTLE: u8 = 3;
+/// Chunk 12, [`NodeStreamModel::cache_holder`]: the stale cache names no
+/// holder, so the op goes by the root's inbox.
+pub const CACHE_INBOX: u8 = 0xFE;
 /// Directories (bits of a directory mask).
 const DIRS: usize = 8;
 
@@ -546,6 +608,11 @@ pub struct Row {
     /// A root row journaled while the root's roster view showed no
     /// write-eligible peer (chunk 8's oracle; `false` elsewhere).
     pub alone: bool,
+    /// Chunk 12's oracle: a root row journaled when what the root had been
+    /// told (an installed complete read, a message from a node, an
+    /// incomplete read) said that it may have a peer
+    /// ([`State::known`], [`State::known_partial`]). `false` elsewhere.
+    pub told: bool,
 }
 
 impl Row {
@@ -626,6 +693,9 @@ pub enum Msg {
         routed: u8,
         /// The requester's `touched` at this send.
         touched: u8,
+        /// How it was sent (chunk 12): [`LANE_DIRECT`], [`LANE_INBOX`] or
+        /// [`LANE_RESEND`].
+        lane: u8,
     },
     /// The answer, with the answered row's origin.
     Reply {
@@ -659,6 +729,8 @@ pub struct Node {
     pub resent: bool,
     /// The requester's table is current (a hint corrected the stale cache).
     pub hinted: bool,
+    /// The outstanding op has been sent (chunk 12: a later send is a resend).
+    pub sent: bool,
     /// The script index of the next op to start.
     pub next: u8,
     pub outstanding: bool,
@@ -774,6 +846,19 @@ pub const SAW_FENCED: u64 = 1 << 44;
 pub const SAW_ROOT_REFUSED: u64 = 1 << 45;
 /// ADR-47: the root held a touched rid under an unreachable grant.
 pub const SAW_ROOT_HELD: u64 = 1 << 46;
+/// Chunk 12: an older roster read reached the root after a newer one and
+/// was ignored.
+pub const SAW_OLD_READ_IGNORED: u64 = 1 << 47;
+/// Chunk 12: an incomplete roster read added to the root's view.
+pub const SAW_PARTIAL_READ: u64 = 1 << 48;
+/// Chunk 12: the root learned of a node from an op that came by the inbox.
+pub const SAW_INBOX_EVIDENCE: u64 = 1 << 49;
+/// Chunk 12: a stale cache sent a node's first op to a node that is not the
+/// root (it bounced).
+pub const SAW_STALE_CACHE: u64 = 1 << 50;
+/// Chunk 12: the root answered under a live foreign grant (non-singleton
+/// by the grant alone).
+pub const SAW_GRANT_BLOCKS_SINGLETON: u64 = 1 << 51;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -840,6 +925,28 @@ pub struct State {
     /// Rids the root refused for good (ADR-47). Sorted.
     pub refused: Vec<Rid>,
     pub deadlines: u8,
+    /// Chunk 12: the roster's generation, bumped by every `Join`/`Leave`
+    /// (the model's stand-in for the driver's per-read sequence number).
+    pub roster_seq: u8,
+    /// The generation of the latest complete read the root installed.
+    pub view_seq: u8,
+    /// The root's latest read was incomplete: it knows the nodes it lists,
+    /// not that it knows them all (no singleton until a complete read).
+    pub view_partial: bool,
+    /// The roster before the last `Join`/`Leave` (what an old read lists).
+    pub prev_roster: u8,
+    /// The old read of the last change has been delivered (once).
+    pub old_used: bool,
+    /// Bitmask over nodes: members an incomplete read has lacked (once each).
+    pub partial_used: u8,
+    /// The oracle's record of the root's inputs: the nodes of the latest
+    /// complete read it installed, plus (with
+    /// [`NodeStreamModel::told_messages`]) every node it served a message
+    /// from. Computed apart from [`State::view_roster`] and judged against
+    /// it (`roster_view_monotone`, `no_lone_answer_with_peer`).
+    pub known: u8,
+    /// The oracle's record that the root's latest read was incomplete.
+    pub known_partial: bool,
 }
 
 impl State {
@@ -914,6 +1021,12 @@ pub enum Action {
     /// Chunk 8: the root reads the roster (and journals the singleton
     /// bump when its singleton test flips).
     SeeRoster,
+    /// Chunk 12: a read issued before the last change reaches the root
+    /// after a newer one (at most once per change).
+    SeeOldRoster,
+    /// Chunk 12: a read that lacks member `i` and is flagged incomplete
+    /// (at most once per member).
+    SeePartialRoster(u8),
     /// Chunk 9: node `i`'s deadline passes; it settles its op.
     Deadline(u8),
     /// Chunk 9: the holder of stream `g` grants a read delegation.
@@ -1035,6 +1148,40 @@ pub struct NodeStreamModel {
     pub unfenced_forward: bool,
     /// ADR-47, the knob: the root's refusal ignores `touched`.
     pub root_ignores_touched: bool,
+    /// Chunk 12: the root's roster reads may arrive stale (an older read
+    /// after a newer one, [`Action::SeeOldRoster`]).
+    pub old_reads: bool,
+    /// Chunk 12: the root's roster reads may be incomplete
+    /// ([`Action::SeePartialRoster`]).
+    pub partial_reads: bool,
+    /// Chunk 12: the oracle counts every message the root receives as
+    /// something it was told (`known`); off in the earlier chunks, whose
+    /// knob `singleton_serves_forwards` shows the same harm by I5.
+    pub told_messages: bool,
+    /// Chunk 12: bitmask over nodes whose first send of each op uses a
+    /// stale cache of the lease holder ([`Self::cache_holder`]).
+    pub stale_root_cache: u8,
+    /// Chunk 12: what the stale cache names: a node (the op bounces there,
+    /// nothing runs) or [`CACHE_INBOX`] (no holder: the op goes by the
+    /// root's inbox).
+    pub cache_holder: u8,
+    /// Chunk 12's `no_singleton_with_live_foreign_grant` oracle (off only
+    /// to show a knob's harm).
+    pub check_foreign_grant: bool,
+    /// Chunk 12, the knob: a read older than the installed one replaces it.
+    pub roster_installs_old_read: bool,
+    /// Chunk 12, the knob: an incomplete read replaces the view and counts
+    /// as a complete one (the core's roster before step 10: F1).
+    pub roster_partial_shrinks: bool,
+    /// Chunk 12, the knob: the singleton test ignores that the latest read
+    /// was incomplete.
+    pub singleton_while_partial: bool,
+    /// Chunk 12, the knob: only a first direct forward is evidence of a
+    /// peer; a settle, a resend and an op drained from the inbox are not.
+    pub evidence_only_on_forward: bool,
+    /// Chunk 12, the knob: the singleton test ignores a live generation
+    /// another node holds.
+    pub singleton_with_foreign_grant: bool,
 }
 
 /// Where a received op stands at a sequencer.
@@ -1115,6 +1262,17 @@ impl NodeStreamModel {
             stale_routes: false,
             unfenced_forward: false,
             root_ignores_touched: false,
+            old_reads: false,
+            partial_reads: false,
+            told_messages: false,
+            stale_root_cache: 0,
+            cache_holder: CACHE_INBOX,
+            check_foreign_grant: true,
+            roster_installs_old_read: false,
+            roster_partial_shrinks: false,
+            singleton_while_partial: false,
+            evidence_only_on_forward: false,
+            singleton_with_foreign_grant: false,
         }
     }
 
@@ -1663,15 +1821,43 @@ fn find_rid(m: &NodeStreamModel, s: &State, node: u8, rid: Rid) -> Option<(u8, u
     })
 }
 
-/// The root's roster view becomes `view`; when its singleton test flips
-/// it journals the lease's `config_version` bump at once (M1.0 answer 5;
-/// the `singleton_after_join` knob keeps answering alone on a join).
-fn set_roster_view(m: &NodeStreamModel, s: &mut State, view: u8) {
-    let had = has_peer(s, s.view_roster);
-    let has = has_peer(s, view);
+/// Chunk 12: a node other than the root holds a live generation (minted,
+/// not ended), so the root is no singleton (S10-I4).
+fn foreign_grant_live(m: &NodeStreamModel, s: &State) -> bool {
+    m.grants
+        .iter()
+        .any(|g| g.node != s.root && live_grant(m, s, g.node))
+}
+
+/// The root's singleton test over a roster view (ADR-50): the view lists no
+/// write-eligible peer, the latest read was complete, and no other node
+/// holds a live generation. The knobs drop the last two clauses.
+fn quiet(m: &NodeStreamModel, s: &State, view: u8, partial: bool) -> bool {
+    !has_peer(s, view)
+        && (!partial || m.singleton_while_partial)
+        && (m.singleton_with_foreign_grant || !foreign_grant_live(m, s))
+}
+
+/// What the root has been told says it may have a peer: the oracle's side
+/// of the singleton test, from `known` and `known_partial` alone.
+fn told_peer(s: &State) -> bool {
+    has_peer(s, s.known) || s.known_partial
+}
+
+/// The root's roster view becomes `view` (`partial`: its latest read was
+/// incomplete); when its singleton test flips it journals the lease's
+/// `config_version` bump at once (M1.0 answer 5; the `singleton_after_join`
+/// knob keeps answering alone on a join).
+fn set_roster_view(m: &NodeStreamModel, s: &mut State, view: u8, partial: bool) {
+    let had = !quiet(m, s, s.view_roster, s.view_partial);
+    let has = !quiet(m, s, view, partial);
     s.view_roster = view;
+    s.view_partial = partial;
     if had == has || (m.singleton_after_join && has) {
         return;
+    }
+    if has && foreign_grant_live(m, s) {
+        s.saw |= SAW_GRANT_BLOCKS_SINGLETON;
     }
     s.saw |= if has { SAW_JOIN_BUMP } else { SAW_LEAVE_BUMP };
     let root = &mut s.streams[ROOT as usize];
@@ -1697,18 +1883,30 @@ fn set_roster_view(m: &NodeStreamModel, s: &mut State, view: u8) {
         kind: RowKind::Cfg,
         deps: [0; MAXS],
         alone: !has,
+        told: false,
     });
 }
 
-/// The root serves a request of `from`: a node that forwards is a linked
-/// peer, so the root is no singleton from here on (the event that raises
-/// the singleton test, before the op is journaled). The
-/// `singleton_serves_forwards` knob waits for the roster read.
-fn note_requester(m: &NodeStreamModel, s: &mut State, at: u8, from: u8) {
-    if at == s.root && from != at && !m.singleton_serves_forwards {
-        let view = s.view_roster | (1 << from);
-        set_roster_view(m, s, view);
+/// The root serves a message of `from` (`lane`: how it came): a node that
+/// sends one is a peer, so the root is no singleton from here on (the event
+/// that raises the singleton test, before the op is journaled). The
+/// `singleton_serves_forwards` knob waits for the roster read; the
+/// `evidence_only_on_forward` knob counts only a first direct forward.
+fn note_requester(m: &NodeStreamModel, s: &mut State, at: u8, from: u8, lane: u8) {
+    if at != s.root || from == at {
+        return;
     }
+    if m.told_messages {
+        s.known |= 1 << from;
+    }
+    if m.singleton_serves_forwards || (m.evidence_only_on_forward && lane != LANE_DIRECT) {
+        return;
+    }
+    let view = s.view_roster | (1 << from);
+    if lane == LANE_INBOX && view != s.view_roster {
+        s.saw |= SAW_INBOX_EVIDENCE;
+    }
+    set_roster_view(m, s, view, s.view_partial);
 }
 
 /// `mask` names a write-eligible peer of the root.
@@ -2043,6 +2241,21 @@ pub fn no_live_grant_off_roster(m: &NodeStreamModel, s: &State) -> bool {
     m.grants
         .iter()
         .all(|g| s.roster & (1 << g.node) != 0 || !live_grant(m, s, g.node))
+}
+
+/// Chunk 12, S10-I2 (`roster_view_monotone`): the root's view lists every
+/// node the oracle recorded as told (an installed complete read, a message),
+/// until a newer complete read omits it: an old read, or a partial one,
+/// never shrinks it.
+pub fn roster_view_monotone(s: &State) -> bool {
+    s.known & !s.view_roster == 0
+}
+
+/// Chunk 12, S10-I4 (`no_singleton_with_live_foreign_grant`): the root's
+/// current configuration is no singleton's while another node holds a live
+/// generation.
+pub fn no_singleton_with_live_foreign_grant(m: &NodeStreamModel, s: &State) -> bool {
+    !(s.streams[ROOT as usize].cfgs.last().unwrap().singleton && foreign_grant_live(m, s))
 }
 
 /// ADR-43 against sticky grants (chunk 7): a number the orphan rule ends
@@ -2534,6 +2747,7 @@ fn end_stream_at(m: &NodeStreamModel, s: &mut State, g: u8, through: u8) {
         kind: RowKind::Ended { stream: g, through },
         deps: [0; MAXS],
         alone: false,
+        told: false,
     });
     if m.drop_member_copy {
         for h in s.streams[g as usize].held.iter_mut() {
@@ -2580,7 +2794,8 @@ fn execute(
     s.view = (s.view & !mask) | (after & mask);
     let executor = at;
     let lone = m.per_row_class && stream != ROOT && !s.peer_in_budget;
-    let alone = stream == ROOT && !has_peer(s, s.view_roster);
+    let alone = stream == ROOT && quiet(m, s, s.view_roster, s.view_partial);
+    let told = stream == ROOT && told_peer(s);
     let st = &mut s.streams[stream as usize];
     let row = Row {
         stream,
@@ -2596,6 +2811,7 @@ fn execute(
         kind: RowKind::Op,
         deps,
         alone,
+        told,
     };
     st.rows.push(row);
     if m.replicas && stream != ROOT {
@@ -2608,11 +2824,18 @@ fn execute(
     });
 }
 
+/// How a forward reached its sequencer.
+#[derive(Clone, Copy)]
+struct Via {
+    /// The forward's `(routed, touched)` (ADR-47; `None`: an own op, or one
+    /// already admitted, which the fence does not look at again).
+    fence: Option<(u8, u8)>,
+    /// [`LANE_DIRECT`], [`LANE_INBOX`] or [`LANE_RESEND`] (chunk 12).
+    lane: u8,
+}
+
 /// Sequencer candidate `at` receives `rid`: completed-dedup, else execute,
 /// park, or answer `NotOwner`.
-///
-/// `fence`: the forward's `(routed, touched)` (ADR-47; `None`: an own op, or
-/// one already admitted, which the fence does not look at again).
 fn receive(
     m: &NodeStreamModel,
     s: &mut State,
@@ -2620,9 +2843,10 @@ fn receive(
     rid: Rid,
     op: WriteOp,
     deps: Deps,
-    fence: Option<(u8, u8)>,
+    via: Via,
 ) {
-    note_requester(m, s, at, rid.node);
+    let fence = via.fence;
+    note_requester(m, s, at, rid.node, via.lane);
     if !m.no_dedup {
         if let Some((stream, idx)) = find_rid(m, s, at, rid) {
             s.saw |= SAW_DEDUP;
@@ -2715,7 +2939,7 @@ fn park_answer(s: &mut State, at: u8, stream: u8, idx: u8) {
 /// holds parks the settle and requests the release (ADR-44 as
 /// `SubtreeReleased`); a candidate that holds no key answers `NotOwner`.
 fn receive_settle(m: &NodeStreamModel, s: &mut State, at: u8, rid: Rid, op: WriteOp) {
-    note_requester(m, s, at, rid.node);
+    note_requester(m, s, at, rid.node, LANE_SETTLE);
     if let Some((stream, idx)) = find_rid(m, s, at, rid) {
         s.saw |= SAW_SETTLE_OUTCOME;
         park_answer(s, at, stream, idx);
@@ -2750,7 +2974,8 @@ fn refuse(m: &NodeStreamModel, s: &mut State, at: u8, stream: u8, rid: Rid, op: 
         s.saw |= SAW_SETTLE_RELEASE;
         check_reads(m, s, dirs, rid, idx);
     }
-    let alone = stream == ROOT && !has_peer(s, s.view_roster);
+    let alone = stream == ROOT && quiet(m, s, s.view_roster, s.view_partial);
+    let told = stream == ROOT && told_peer(s);
     let st = &mut s.streams[stream as usize];
     let version = (st.cfgs.len() - 1) as u8;
     st.rows.push(Row {
@@ -2763,6 +2988,7 @@ fn refuse(m: &NodeStreamModel, s: &mut State, at: u8, stream: u8, rid: Rid, op: 
         kind: RowKind::Refused,
         deps: [0; MAXS],
         alone,
+        told,
     });
     s.waiting
         .retain(|w| !(w.node == at && w.rid == rid && !w.settle));
@@ -2825,7 +3051,26 @@ fn own_gen(m: &NodeStreamModel, s: &State, at: u8, op: WriteOp) -> Option<u8> {
 
 /// Node `i` sends `rid` to the sequencer of its stream by its table.
 fn submit(m: &NodeStreamModel, s: &mut State, i: u8, rid: Rid, op: WriteOp) {
-    let (to, routed) = target(m, s, i, op);
+    let (mut to, mut routed) = target(m, s, i, op);
+    let mut lane = if s.nodes[i as usize].sent {
+        LANE_RESEND
+    } else {
+        LANE_DIRECT
+    };
+    // Chunk 12: a joiner's first send follows a stale cache of the lease
+    // holder: to a node that is not the root (it answers `NotOwner`, nothing
+    // runs), or, with no holder cached, by the root's inbox.
+    if lane == LANE_DIRECT && m.stale_root_cache & (1 << i) != 0 && i != s.root {
+        routed = 0;
+        if m.cache_holder == CACHE_INBOX {
+            to = s.root;
+            lane = LANE_INBOX;
+        } else {
+            to = m.cache_holder;
+            s.saw |= SAW_STALE_CACHE;
+        }
+    }
+    s.nodes[i as usize].sent = true;
     let deps = s.nodes[i as usize].observed;
     if m.route_fence {
         // `touched` is raised before the op leaves (or is offered locally).
@@ -2837,7 +3082,11 @@ fn submit(m: &NodeStreamModel, s: &mut State, i: u8, rid: Rid, op: WriteOp) {
     let touched = s.nodes[i as usize].touched;
     s.nodes[i as usize].sent_to = to;
     if to == i {
-        receive(m, s, i, rid, op, deps, None);
+        let via = Via {
+            fence: None,
+            lane: LANE_DIRECT,
+        };
+        receive(m, s, i, rid, op, deps, via);
     } else {
         s.net.push(Msg::Fwd {
             to,
@@ -2846,6 +3095,7 @@ fn submit(m: &NodeStreamModel, s: &mut State, i: u8, rid: Rid, op: WriteOp) {
             deps,
             routed,
             touched,
+            lane,
         });
     }
 }
@@ -2871,6 +3121,7 @@ impl Model for NodeStreamModel {
                     touched: 0,
                     resent: false,
                     hinted: false,
+                    sent: false,
                     next: 0,
                     outstanding: false,
                     sent_to: 0,
@@ -2937,6 +3188,14 @@ impl Model for NodeStreamModel {
             eio: Vec::new(),
             refused: Vec::new(),
             deadlines: 0,
+            roster_seq: 0,
+            view_seq: 0,
+            view_partial: false,
+            prev_roster: roster,
+            old_used: false,
+            partial_used: 0,
+            known: roster,
+            known_partial: false,
         }]
     }
 
@@ -3220,8 +3479,21 @@ impl Model for NodeStreamModel {
                 actions.push(Action::Leave(i));
             }
         }
-        if s.view_roster != s.roster {
+        if s.view_roster != s.roster || s.view_partial {
             actions.push(Action::SeeRoster);
+        }
+        // Chunk 12: stale and incomplete reads reach a live root.
+        if s.live(s.root) {
+            if self.old_reads && s.roster_seq >= 1 && s.view_seq == s.roster_seq && !s.old_used {
+                actions.push(Action::SeeOldRoster);
+            }
+            if self.partial_reads {
+                for i in bits(s.roster).map(|b| b as u8) {
+                    if i != s.root && s.partial_used & (1 << i) == 0 {
+                        actions.push(Action::SeePartialRoster(i));
+                    }
+                }
+            }
         }
         if self.shadow_replay && !s.rescued {
             for &(rid, _, g, idx) in &s.acked {
@@ -3253,6 +3525,7 @@ impl Model for NodeStreamModel {
                 };
                 node.next += 1;
                 node.outstanding = true;
+                node.sent = false;
                 if self.route_fence {
                     node.touched = 0;
                     node.resent = false;
@@ -3301,13 +3574,14 @@ impl Model for NodeStreamModel {
                     deps,
                     routed,
                     touched,
+                    lane,
                 } => {
                     // A message to a node that is down, or that stopped
                     // honouring (unreachable), is lost; the requester
                     // retries.
                     if s.live(to) && !self.stopped_node(&s, to) {
                         let fence = self.route_fence.then_some((routed, touched));
-                        receive(self, &mut s, to, rid, op, deps, fence);
+                        receive(self, &mut s, to, rid, op, deps, Via { fence, lane });
                     }
                 }
                 Msg::Fenced { rid, gen, from } => {
@@ -3332,6 +3606,7 @@ impl Model for NodeStreamModel {
                             deps,
                             routed: gen,
                             touched,
+                            lane: LANE_RESEND,
                         });
                     }
                 }
@@ -3392,7 +3667,13 @@ impl Model for NodeStreamModel {
                     receive_settle(self, &mut s, w.node, w.rid, w.op);
                 } else {
                     match status(self, &s, w.node, w.op, &w.deps) {
-                        Status::Run(_) => receive(self, &mut s, w.node, w.rid, w.op, w.deps, None),
+                        Status::Run(_) => {
+                            let via = Via {
+                                fence: None,
+                                lane: LANE_RESEND,
+                            };
+                            receive(self, &mut s, w.node, w.rid, w.op, w.deps, via)
+                        }
                         Status::Bounce => {
                             s.saw |= SAW_NOT_OWNER;
                             s.net.push(Msg::NotOwner {
@@ -3461,6 +3742,9 @@ impl Model for NodeStreamModel {
                 export_void(&mut s, g);
             }
             Action::Join(i) => {
+                s.prev_roster = s.roster;
+                s.old_used = false;
+                s.roster_seq += 1;
                 s.roster |= 1 << i;
                 s.joins |= 1 << i;
             }
@@ -3468,12 +3752,46 @@ impl Model for NodeStreamModel {
                 if self.grants.iter().any(|g| g.node == i) {
                     s.saw |= SAW_LEAVE_ENDED_GRANT;
                 }
+                s.prev_roster = s.roster;
+                s.old_used = false;
+                s.roster_seq += 1;
                 s.roster &= !(1 << i);
                 s.leaves |= 1 << i;
             }
             Action::SeeRoster => {
+                // A complete read, issued after every change so far.
                 let view = s.roster;
-                set_roster_view(self, &mut s, view);
+                set_roster_view(self, &mut s, view, false);
+                s.view_seq = s.roster_seq;
+                s.known = s.roster;
+                s.known_partial = false;
+            }
+            Action::SeeOldRoster => {
+                // Issued before the last change, delivered after a newer
+                // read: the install rule ignores it. The oracle does too.
+                s.old_used = true;
+                if self.roster_installs_old_read {
+                    let view = s.prev_roster;
+                    set_roster_view(self, &mut s, view, false);
+                    s.view_seq = s.roster_seq - 1;
+                } else {
+                    s.saw |= SAW_OLD_READ_IGNORED;
+                }
+            }
+            Action::SeePartialRoster(i) => {
+                // A current read of a scan that lost member `i`: the root
+                // learns of the others, and that it may not know them all.
+                s.partial_used |= 1 << i;
+                let listed = s.roster & !(1 << i);
+                if self.roster_partial_shrinks {
+                    set_roster_view(self, &mut s, listed, false);
+                    s.view_seq = s.roster_seq;
+                } else {
+                    let view = s.view_roster | listed;
+                    set_roster_view(self, &mut s, view, true);
+                    s.saw |= SAW_PARTIAL_READ;
+                }
+                s.known_partial = true;
             }
             Action::GrantRead(g) => {
                 s.reads |= 1 << g;
@@ -3507,6 +3825,7 @@ impl Model for NodeStreamModel {
                     kind: RowKind::Grow { stream: g, dirs },
                     deps: [0; MAXS],
                     alone: false,
+                    told: false,
                 });
             }
             Action::Stop(g) => {
@@ -3644,7 +3963,7 @@ impl Model for NodeStreamModel {
                     let c = root.cfgs[cfg_at(&root.cfgs, p.idx)];
                     let group = c.backups != 0 && bits(c.backups).all(|b| root.held[b] > p.idx);
                     let lone = p.idx >= s.shipped && !group;
-                    if lone && !row.alone && self.check_lone {
+                    if lone && (!row.alone || row.told) && self.check_lone {
                         s.violate("no_lone_answer_with_peer", row.rid, ROOT, p.idx);
                     }
                 }
@@ -3758,6 +4077,13 @@ impl Model for NodeStreamModel {
                 s.down |= 1 << old;
                 s.depositions += 1;
                 let shipped = s.shipped;
+                // The claimant's own singleton test (chunk 12): no other
+                // roster member, and no live generation of another node.
+                let foreign_live = !self.singleton_with_foreign_grant
+                    && self
+                        .grants
+                        .iter()
+                        .any(|g| g.node != claimant && live_grant(self, &s, g.node));
                 let st = &mut s.streams[ROOT as usize];
                 let backups = st.cfgs.last().unwrap().backups;
                 // The seal: a backup's held prefix, or the archive alone.
@@ -3792,7 +4118,7 @@ impl Model for NodeStreamModel {
                     start: len,
                     backups: nb,
                     record: false,
-                    singleton: s.roster & !(1 << claimant) == 0,
+                    singleton: s.roster & !(1 << claimant) == 0 && !foreign_live,
                 });
                 for r in lost {
                     if !s.acked.iter().any(|a| a.0 == r.rid) {
@@ -3800,7 +4126,7 @@ impl Model for NodeStreamModel {
                     }
                     // A singleton's own client's row; a peer's op means a
                     // linked peer, so no singleton.
-                    if r.alone && r.rid.node == old {
+                    if r.alone && !r.told && r.rid.node == old {
                         s.exported.push(r.rid);
                         s.saw |= SAW_SINGLETON_EXPORT;
                     } else {
@@ -3810,6 +4136,10 @@ impl Model for NodeStreamModel {
                 let prev_epoch = s.epoch;
                 s.epoch += 1;
                 s.view_roster = s.roster;
+                s.view_partial = false;
+                s.view_seq = s.roster_seq;
+                s.known = s.roster;
+                s.known_partial = false;
                 s.root = claimant;
                 s.inherited = if self.max_depositions >= 2 && nb == 0 {
                     len
@@ -3940,6 +4270,7 @@ impl Model for NodeStreamModel {
                     kind: RowKind::Cfg,
                     deps: [0; MAXS],
                     alone: false,
+                    told: false,
                 });
                 st.reconfigured = true;
             }
@@ -4014,6 +4345,16 @@ impl Model for NodeStreamModel {
                 s.violation
                     .is_none_or(|v| v.property != "no_lone_answer_with_peer")
             }),
+            // Chunk 12.
+            Property::always("roster_view_monotone", |_, s: &State| {
+                roster_view_monotone(s)
+            }),
+            Property::always(
+                "no_singleton_with_live_foreign_grant",
+                |m: &NodeStreamModel, s: &State| {
+                    !m.check_foreign_grant || no_singleton_with_live_foreign_grant(m, s)
+                },
+            ),
             // Chunk 9.
             Property::always("eio_never_lands_late", |_, s: &State| {
                 eio_never_lands_late(s)
@@ -4225,6 +4566,7 @@ impl Model for NodeStreamModel {
             ));
         }
         self.witnesses_c7_c9(&mut props);
+        self.witnesses_c12(&mut props);
         props
     }
 }
@@ -4321,6 +4663,34 @@ impl NodeStreamModel {
     }
 }
 
+impl NodeStreamModel {
+    /// Chunk 12's `sometimes` witnesses: the stale and incomplete reads and
+    /// the stale cache are reached (non-vacuity), unless a knob changes what
+    /// they do.
+    fn witnesses_c12(&self, props: &mut Vec<Property<Self>>) {
+        macro_rules! w {
+            ($name:expr, $bit:expr) => {
+                props.push(Property::sometimes($name, |_, s: &State| s.saw & $bit != 0))
+            };
+        }
+        if self.old_reads && !self.roster_installs_old_read {
+            w!("old_read_ignored", SAW_OLD_READ_IGNORED);
+        }
+        if self.partial_reads && !self.roster_partial_shrinks {
+            w!("partial_read_adds", SAW_PARTIAL_READ);
+        }
+        if self.stale_root_cache != 0 {
+            if self.cache_holder == CACHE_INBOX {
+                if !self.evidence_only_on_forward && !self.singleton_serves_forwards {
+                    w!("inbox_evidence", SAW_INBOX_EVIDENCE);
+                }
+            } else {
+                w!("stale_cache_bounce", SAW_STALE_CACHE);
+            }
+        }
+    }
+}
+
 /// The end of every step: the witnesses read off the new state, and the
 /// unordered collections sorted (their order is not state).
 fn finish(m: &NodeStreamModel, mut s: State) -> State {
@@ -4387,5 +4757,6 @@ fn push_release(s: &mut State, g: u8, dirs: u8) {
         kind: RowKind::Released { dirs, at },
         deps: [0; MAXS],
         alone: false,
+        told: false,
     });
 }
