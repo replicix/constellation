@@ -2507,7 +2507,7 @@ pub fn end_of_run(
     }
     // I4.
     let invokes = o.invokes.lock().unwrap().clone();
-    f.i4 = super::check::no_late_landing(in_doubt, &invokes, log).1;
+    f.i4 = super::check::no_late_landing(in_doubt, &invokes, &audit.submits, log).1;
     // Plan 43 C2 (§7.1 item 6): a settled answer promises the op never
     // takes effect: no completion of the rid in the log, wherever it lands.
     f.i4.extend(super::check::no_settled_landing(&acks, log));
@@ -4661,7 +4661,7 @@ mod tests {
         // r1 (answered in doubt at tick 10) lands at (5, 0); r2, invoked
         // afterwards by the same node, landed first at (3, 0): late.
         let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (r2, (3, 0))]);
-        let (n, why) = super::super::check::no_late_landing(&in_doubt, &invokes, &log);
+        let (n, why) = super::super::check::no_late_landing(&in_doubt, &invokes, &[], &log);
         assert_eq!(n, 1, "{why:?}");
         assert!(
             why[0].contains("I4 unacked_fails_never_lands_late"),
@@ -4670,16 +4670,34 @@ mod tests {
         // r1 landing before the later op is clean.
         let log = log_with(seg(1, &[]), &[(r1, (2, 0)), (r2, (3, 0))]);
         assert_eq!(
-            super::super::check::no_late_landing(&in_doubt, &invokes, &log).0,
+            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &log).0,
             0
         );
         // An op another node invoked is not this node's client's.
         let invokes = [(r1, 5u64), (rid(2, 1), 11)];
         let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (rid(2, 1), (3, 0))]);
         assert_eq!(
-            super::super::check::no_late_landing(&in_doubt, &invokes, &log).0,
+            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &log).0,
             0
         );
+    }
+
+    /// The sim's same-rid resubmission after an `InDoubt` answer (the I2(b)
+    /// dedup probe) is the client's own retry: its landing is no late
+    /// landing of the original. Without the exemption the landing is flagged.
+    #[test]
+    fn a_resubmitted_rid_landing_is_not_late() {
+        let (r1, r2) = (rid(1, 1), rid(1, 2));
+        let in_doubt = [(1u64, r1, 0u64, 10u64)];
+        let invokes = [(r1, 5u64), (r2, 11)];
+        let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (r2, (3, 0))]);
+        let check = super::super::check::no_late_landing;
+        // Submitted at 5 (before the answer) and 12 (after it).
+        assert_eq!(check(&in_doubt, &invokes, &[(r1, 5), (r1, 12)], &log).0, 0);
+        // Only the first submission, before the in-doubt answer: late.
+        assert_eq!(check(&in_doubt, &invokes, &[(r1, 5)], &log).0, 1);
+        // Another rid's resubmission exempts nothing.
+        assert_eq!(check(&in_doubt, &invokes, &[(r1, 5), (r2, 12)], &log).0, 1);
     }
 
     /// Plan 43 C2 (§7.1 item 6): a settled answer (`Abandoned`, to a client)
