@@ -4582,7 +4582,7 @@ fn a_backup_paused_while_its_holder_is_cut_from_s3_waits_for_the_group() {
         // renewals: the backup's seal then landed 13 ms later, inside the
         // pause, and the takeover the case needs to see ran after it. 7250
         // is the same case, the seal and the takeover before the pause.)
-        ("backup-lag-in-margin-cut", 277, "pause2@7250:3000", true),
+        ("backup-lag-in-margin-cut", 1, "pause2@7250:3000", true),
         // The third node; the cut holder itself.
         (
             "backup-lag-at-expiry-beats-lost",
@@ -4633,8 +4633,9 @@ fn a_sealed_holders_reclaim_keeps_the_older_group_named() {
     let mut fetched = 0u64;
     // (Seeds where node 2's lone, `Local` acknowledgements between its
     // takeover and its loss leave no trace the oracle objects to; the other
-    // seeds fail its generic checks with or without the fix.)
-    for seed in [1u64, 20, 24, 29] {
+    // seeds fail its generic checks with or without the fix; without the
+    // fix each of these abandons a group, `groups_abandoned` 1.)
+    for seed in [1u64, 20, 29, 62] {
         let r = run_seed(seed, backup_reclaim_lost_config()).unwrap_or_else(|e| {
             panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=backup-reclaim-lost")
         });
@@ -9909,7 +9910,10 @@ fn a_marker_is_never_seen_without_the_data_a_deposition_moved_to_the_member_copy
 /// rows (43..=44) on a sealed epoch; its own early re-claim at epoch 3
 /// stranded them and replayed their rid under another identity. A claim
 /// whose tail fetch sealed this node's epoch is the takeover at the next
-/// epoch (D7).
+/// epoch (D7). (The sim's recall hold became half the forward timeout, as the
+/// daemon's: seed 718 now ends in a benign overlap of the sealed tail that the
+/// strict identity check fails with the fix too; seed 251 is clean with it and
+/// fails the same I2c without it, a claim at the sealed epoch.)
 #[test]
 fn a_claim_whose_tail_fetch_sealed_the_own_epoch_takes_the_next_epoch() {
     let cfg = strict(
@@ -9919,9 +9923,9 @@ fn a_claim_whose_tail_fetch_sealed_the_own_epoch_takes_the_next_epoch() {
         },
         "identity+lone",
     );
-    if let Err(e) = run_seed(718, cfg) {
+    if let Err(e) = run_seed(251, cfg) {
         panic!(
-            "delegated-root-deposed-delegate-dies seed 718 (AUTHORITY_SIM_LEASE_READS=0:0:800:1000): {e}"
+            "delegated-root-deposed-delegate-dies seed 251 (AUTHORITY_SIM_LEASE_READS=0:0:800:1000): {e}"
         );
     }
 }
@@ -13790,11 +13794,14 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
 /// older failure (fixed by plan 43 C7b's observation rule:
 /// `regression_skewed_successor_second_failover`), so the
 /// control also requires the violation to be inside the first failover's
-/// floor window, where the cap ends the floor early.
+/// floor window, where the cap ends the floor early. (The sim's recall hold
+/// became half the forward timeout, as the daemon's, and moved the schedules
+/// again: 193943 and 194714 no longer fail; 193262 and 195192 take their
+/// place, 195424 stays.)
 #[test]
 fn a_credited_arrival_cap_splits() {
     use pinned::run_seed;
-    for seed in [193_943, 194_714, 195_424] {
+    for seed in [193_262, 195_192, 195_424] {
         let e = run_seed(
             seed,
             fixed_lane(fast_takeover_skewed_successor_credited_config()),
@@ -14236,11 +14243,13 @@ fn a_locker_keeps_its_grant_across_a_seal_and_a_forward_step() {
 /// 43 C1-1's listed-acknowledgement count, 28 later; 27 once blocking lock
 /// requests queue behind older waiters, which moved 203 to no violation: 34,
 /// 76, 98, 106, 113, 202, 318 and 336 were pinned; i1-592's lone test moved
-/// 76, 98, 113 and 318 to no violation: 12, 18, 20 and 43 took their places).
+/// 76, 98, 113 and 318 to no violation: 12, 18, 20 and 43 took their places;
+/// the sim's recall hold, now half the forward timeout as the daemon's, moved
+/// 15, 18 and 202 to no violation: 60, 98 and 130 took their places).
 #[test]
 fn a_late_renewal_against_a_stale_mirror_is_refused_and_the_naive_successor_violates() {
     use pinned::run_seed;
-    for seed in [15u64, 18, 20, 34, 43, 106, 202, 234] {
+    for seed in [20u64, 34, 43, 60, 98, 106, 130, 234] {
         run_seed(seed, fixed_lane(locks_late_stale_mirror_config()))
             .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let e = run_seed(seed, fixed_lane(locks_late_stale_mirror_naive_config()))
@@ -14879,7 +14888,7 @@ fn locks_writer_hold_refuses_the_held_write() {
     let t = run_m14(
         "locks-writer-hold",
         locks_writer_hold_config(),
-        230_000..230_060,
+        230_000..230_080,
     );
     assert!(t.held_writes > 60, "writes were rarely held: {t:?}");
     assert!(
@@ -15003,7 +15012,7 @@ fn locks_writer_hold_delegated_unsettled_own_clock_config() -> SimConfig {
 fn locks_writer_hold_delegated_own_clock_without_the_settle_is_caught() {
     use pinned::run_seed;
     let mut witnessed = Vec::new();
-    for seed in [287, 396] {
+    for seed in 555u64..556 {
         if let Err(e) = run_seed(
             seed,
             locks_writer_hold_delegated_unsettled_own_clock_config(),
@@ -15134,14 +15143,15 @@ fn locks_survive_stalled_steps() {
 /// renewals before a sealing successor's floor (0 of 200 seeds fail); on a
 /// 30 s lease the rule is what keeps them inside it: a lane that ignores it
 /// renews the stalled holder's grant through the successor's grant (seed 44,
-/// found by the sweep of 200), and the design is clean on the same seed.
+/// found by the sweep of 200; 107 since the sim's recall hold became half the
+/// forward timeout, as the daemon's), and the design is clean on the same seed.
 #[test]
 fn the_lanes_freshness_rule_is_load_bearing_on_a_long_lease() {
-    let e = run_seed(44, locks_core_stall_backup_long_unfresh_config())
-        .expect_err("locks-core-stall-backup-long-unfresh seed 44 must fail");
-    assert!(e.contains("mutual exclusion violated"), "seed 44: {e}");
-    run_seed(44, locks_core_stall_backup_long_config())
-        .unwrap_or_else(|e| panic!("locks-core-stall-backup-long seed 44: {e}"));
+    let e = run_seed(107, locks_core_stall_backup_long_unfresh_config())
+        .expect_err("locks-core-stall-backup-long-unfresh seed 107 must fail");
+    assert!(e.contains("mutual exclusion violated"), "seed 107: {e}");
+    run_seed(107, locks_core_stall_backup_long_config())
+        .unwrap_or_else(|e| panic!("locks-core-stall-backup-long seed 107: {e}"));
 }
 
 /// A run leaves nothing behind: its bus, and with it every node's `Meta`
@@ -15194,10 +15204,11 @@ fn a_backed_lock_root_stuck_in_a_step_keeps_its_own_grants() {
 /// 79 of 0 to 100; i1-592 moved 79, and 21, 236 and 277 of 0 to 300 were
 /// pinned: two nodes in I/O under conflicting locks; plan 46 M0.3's settle
 /// fixes moved 236 and 277 and kept 21, so 21, 290 and 366 of 0 to 400, which
-/// fail before and after, are pinned).
+/// fail before and after, are pinned; the sim's recall hold, now half the
+/// forward timeout as the daemon's, kept 21 and 91 and moved 132 to 72).
 #[test]
 fn a_probe_that_ignores_what_it_reads_is_caught() {
-    for seed in [21u64, 91, 132] {
+    for seed in [21u64, 91, 72] {
         run_seed(seed, fixed_lane(locks_core_stall_backup_long_config()))
             .unwrap_or_else(|e| panic!("locks-core-stall-backup-long seed {seed}: {e}"));
         let e = run_seed(
@@ -15225,12 +15236,14 @@ fn a_probe_that_ignores_what_it_reads_is_caught() {
 /// the schedules; 40, 78 and 80 among them earlier, with one read per
 /// window: overlapping reads see a successor's CAS sooner, and the epoch's
 /// answers end there, mutant or not; 373 and 828 again before i1-592's lone
-/// test moved them: 54 too; 193, 247, 277 and 871 are pinned.) (Mutual exclusion does not fail with the mutant, even in
+/// test moved them: 54 too; 193, 247, 277 and 871 are pinned; the sim's
+/// recall hold, now half the forward timeout as the daemon's, moved them
+/// again: 51 and 467 of 0 to 600 fail with the mutant and are pinned.) (Mutual exclusion does not fail with the mutant, even in
 /// 22,000 seeds: the successor's floor and the grant caps carry `3 x expiry
 /// margin` beyond the window.)
 #[test]
 fn a_proof_dated_at_the_return_of_the_read_is_caught() {
-    for seed in [115u64, 193, 216, 300] {
+    for seed in [51u64, 467] {
         run_seed(
             seed,
             fixed_lane(locks_core_stall_backup_long_slow_reads_config()),
@@ -17809,10 +17822,13 @@ fn an_unsettled_eio_of_an_op_a_dead_delegate_accepted_is_the_generations_tail() 
 /// waited), and seed 1774 is the one that stays: root 4, in its takeover
 /// gate and floor, reachable for the last 2.4 s of the window.) Fails on any
 /// build before the classification: no counter.
+/// (The witness seed became `locks-blips-tight-long-lease` 0: with the sim's
+/// recall hold at half the forward timeout, as the daemon's, no seed of
+/// `long-delegated-late-answers` in 0..36,000 tells such an `EIO`.)
 #[test]
 fn m03_a_reachable_sequencers_requester_is_not_isolated() {
-    let cfg = long_delegated_late_answers_config;
-    let seed = 1774;
+    let cfg = locks_blips_tight_long_lease_config;
+    let seed = 0;
     let r = run_seed(seed, cfg()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
     assert!(
         r.unsettled_violations > 0,
