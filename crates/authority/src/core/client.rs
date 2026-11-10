@@ -4436,6 +4436,16 @@ impl Core {
             .then_some(outcome)
     }
 
+    /// **This is the fast path, not the guarantee.** The guarantee is the
+    /// emission gate where an answer leaves (`Core::send_answer` for a
+    /// `MutateReply`, `Core::finish` for a local client): an answer resting
+    /// on a delegation row (`gen != 0`) that is not settled
+    /// ([`Self::unsettled_delegate_row`]) is parked there whatever path
+    /// produced it, and released only by [`Self::park_released`]
+    /// (`Stats::answers_held_at_emission` counts the answers a path let
+    /// through to the gate, and a debug build asserts). The release check,
+    /// not the seq this returns, is what holds a delegation row's answer.
+    ///
     /// The one durability predicate of an answer to `rid`'s `completed` row at
     /// a node that holds the lease: the journal seq the answer must wait
     /// for, or `None` when the row may be answered as committed now. Every
@@ -4713,6 +4723,34 @@ impl Core {
                 };
                 self.park_finish(now, rid, wait, durable, outcome, class);
                 return;
+            }
+        }
+        // The I1 emission gate: an answer to a client of this node resting
+        // on a delegation row its group or the log does not hold is parked
+        // here, whatever path brought it (`Core::emission_hold_of`); its
+        // release asks the row again (`Core::park_released`).
+        // (Only this node's own decision: another sequencer's answer passed
+        // on, `Relayed`, rests on that node's row, judged where it left.)
+        if is_answer(&outcome) {
+            if let Some(c) = self.clients.get(&rid) {
+                if let (Some(AnswerSource::Sequenced(class)), true) = (
+                    c.answered_by,
+                    matches!(c.origin, Origin::Client)
+                        || matches!(c.origin, Origin::Replay { .. }) && c.also_client,
+                ) {
+                    if let Some(seq) = self.emission_hold_of(rid, replica) {
+                        self.note_held_at_emission(super::backup::EmissionPath::Finish, rid);
+                        self.park_finish(
+                            now,
+                            rid,
+                            (Default::default(), None),
+                            Some(seq),
+                            outcome,
+                            class,
+                        );
+                        return;
+                    }
+                }
             }
         }
         let Some(c) = self.clients.remove(&rid) else {

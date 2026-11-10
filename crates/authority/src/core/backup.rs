@@ -1215,6 +1215,17 @@ impl From<CommitRule> for constellation_meta::RowCommit {
 
 /// Whether a holder's reply is a definitive answer (the outcome of the op,
 /// accepted or refused) as opposed to a redirect, a retry or a hold.
+/// The path of an answer that reached the I1 emission gate
+/// ([`Core::send_answer`], [`Core::finish`]), for the held counters.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum EmissionPath {
+    Finish,
+    DelegExec,
+    HolderReply,
+    Designation,
+    Release,
+}
+
 pub(crate) fn is_answer(outcome: &MutateOutcome) -> bool {
     matches!(
         outcome,
@@ -2449,33 +2460,120 @@ impl Core {
         }))
     }
 
+    /// The I1 emission gate's test: the journal seq to park `rid`'s answer
+    /// on when it rests on a delegation row (`gen != 0`) its group or the
+    /// log does not hold ([`Self::unsettled_delegate_row`]), `None` when it
+    /// may leave. Every answer path decides this itself
+    /// ([`Self::answer_need_of`]); this is asked again where the answer
+    /// leaves, so that no path can emit it unsettled.
+    pub(crate) fn emission_hold_of(&self, rid: Rid, replica: &dyn Replica) -> Option<u64> {
+        // Rows of generations exist only on a node with a delegation (as the
+        // delegate, or the root that appended a delegate's rows): the rest
+        // pays nothing.
+        if (self.dl.mine.is_empty() && replica.holder_append_tip() == 0)
+            || self.cfg.dedup_deleg_rows_unawaited
+        {
+            return None;
+        }
+        self.unsettled_delegate_row(rid, replica)?;
+        Some(
+            replica
+                .journal_class_of_rid(rid)
+                .map(|(first, _)| first)
+                .unwrap_or(0),
+        )
+    }
+
+    /// Count an answer the emission gate held (`Stats::answers_held_at_emission`).
+    pub(crate) fn note_held_at_emission(&mut self, path: EmissionPath, rid: Rid) {
+        self.stats.answers_held_at_emission += 1;
+        match path {
+            EmissionPath::Finish => self.stats.held_at_emission_finish += 1,
+            EmissionPath::DelegExec => self.stats.held_at_emission_deleg_exec += 1,
+            EmissionPath::HolderReply => self.stats.held_at_emission_holder_reply += 1,
+            EmissionPath::Designation => self.stats.held_at_emission_designation += 1,
+            EmissionPath::Release => self.stats.held_at_emission_release += 1,
+        }
+        tracing::warn!(
+            node = self.cfg.node_id,
+            ?rid,
+            ?path,
+            "an answer resting on an unsettled delegation row reached the point it leaves: held"
+        );
+        debug_assert!(
+            self.emission_hold_expected,
+            "an answer on an unsettled delegation row reached emission ({path:?}, {rid:?})"
+        );
+    }
+
     /// Send a message to a peer; a `MutateReply` carrying a definitive
     /// outcome is counted under `class` (`Stats::ack_classes`).
+    ///
+    /// The emission gate (I1, acked implies committed): an answer for `rid`
+    /// resting on a delegation row (`gen != 0`) its group or the log does
+    /// not hold is parked, not sent, whatever path brought it here
+    /// ([`Self::emission_hold_of`]); the release asks the row again
+    /// ([`Self::park_released`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn send_answer(
         &mut self,
+        now: Now,
+        rid: Rid,
+        path: EmissionPath,
         to: NodeId,
         msg: PeerMsg,
         class: constellation_meta::RowCommit,
+        replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        self.send_answer_committed(to, msg, class, class.gated(), out)
+        self.send_answer_committed(now, rid, path, to, msg, class, class.gated(), replica, out)
     }
 
     /// [`Self::send_answer`], with whether the answer says it is committed
     /// given: a gated answer released with the gate off says it is not.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn send_answer_committed(
         &mut self,
+        now: Now,
+        rid: Rid,
+        path: EmissionPath,
         to: NodeId,
         mut msg: PeerMsg,
         class: constellation_meta::RowCommit,
         says_committed: bool,
+        replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         if let PeerMsg::MutateReply {
-            outcome, committed, ..
+            req,
+            outcome,
+            base,
+            position,
+            gen,
+            committed,
+            ..
         } = &mut msg
         {
             if is_answer(outcome) {
+                if let Some(seq) = self.emission_hold_of(rid, replica) {
+                    self.note_held_at_emission(path, rid);
+                    self.park_reply(
+                        now,
+                        Default::default(),
+                        Some(seq),
+                        to,
+                        *req,
+                        rid,
+                        outcome.clone(),
+                        *base,
+                        *position,
+                        *gen,
+                        class,
+                        out,
+                    );
+                    self.keep_parked_completed(rid, replica);
+                    return;
+                }
                 self.stats.ack_classes[ack_counter(class)] += 1;
                 // Plan 43 C1-2: a gated answer is a commit; the requester's
                 // shadow of it is not speculation (C1-4).

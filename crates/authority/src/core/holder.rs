@@ -487,6 +487,9 @@ impl Core {
                             // answer the archive carries.
                             let class = constellation_meta::RowCommit::FINAL;
                             self.send_answer(
+                                now,
+                                rid,
+                                super::backup::EmissionPath::Designation,
                                 from,
                                 PeerMsg::MutateReply {
                                     req,
@@ -499,6 +502,7 @@ impl Core {
                                     committed: false,
                                 },
                                 class,
+                                replica,
                                 out,
                             );
                         }
@@ -713,6 +717,18 @@ impl Core {
             } else {
                 self.dedup_answer_need(rid, &position, class, shipped, replica)
             };
+        // An answer resting on a delegation row (`gen != 0`) its group or the
+        // log does not hold waits on the row, whatever the journal's tip
+        // says: a dedup answer (the remote asker, and `from == self`, which
+        // the transport does not deliver but this code tolerates) decides
+        // from the tip, a lone root's `Own` one from its disk. The same
+        // test as `Core::answer_need_of`'s, and the emission gate's
+        // (`Core::send_answer`) behind it.
+        let durable = durable.or_else(|| {
+            super::backup::is_answer(&outcome)
+                .then(|| self.emission_hold_of(rid, replica))
+                .flatten()
+        });
         if wait.is_some() || durable.is_some() {
             // Only an acknowledgement's wait for durability says now what
             // it waits for (`held_for_upload`); the rest is worked out
@@ -774,6 +790,9 @@ impl Core {
             self.own_reply_parts(from, rid, &outcome, (0, &position), replica)
         };
         self.send_answer(
+            now,
+            rid,
+            super::backup::EmissionPath::HolderReply,
             from,
             PeerMsg::MutateReply {
                 req,
@@ -786,6 +805,7 @@ impl Core {
                 committed: false,
             },
             class,
+            replica,
             out,
         );
     }

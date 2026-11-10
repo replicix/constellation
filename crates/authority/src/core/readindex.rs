@@ -2358,6 +2358,9 @@ impl Core {
                         let (own_chunks, own_rows) =
                             self.own_reply_parts(to, rid, &outcome, (gen, &position), replica);
                         self.send_answer_committed(
+                            now,
+                            rid,
+                            super::backup::EmissionPath::Release,
                             to,
                             PeerMsg::MutateReply {
                                 req,
@@ -2371,6 +2374,7 @@ impl Core {
                             },
                             class,
                             class.gated(),
+                            replica,
                             out,
                         );
                     }
