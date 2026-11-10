@@ -4733,6 +4733,17 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     bus.set_reach(bucket.reach());
     {
         let core = (cfg.core)(1, 1);
+        // Late-landing S1 (R2, decision U2): the proofs of I4 assume a P2P
+        // message crosses in under half a settle window; the simulation
+        // asserts it for every configuration it runs.
+        let fresh = constellation_authority::deadlines::Deadlines::new(&core).inbox_read_fresh;
+        if cfg.p2p_delay.1 >= fresh {
+            return Err(format!(
+                "the configuration's longest P2P delay ({} ms) is not below half a settle \
+                 window ({fresh} ms): the I4 argument for a message in transit does not hold",
+                cfg.p2p_delay.1
+            ));
+        }
         bucket.reach().configure(super::reach::ReachConfig {
             p2p_delay_hi_ms: cfg.p2p_delay.1,
             s3_latency_hi_ms: cfg.s3_latency.1,

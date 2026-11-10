@@ -293,6 +293,9 @@ pub enum TimerKind {
     InboxPoll,
     /// M13: a waiting requester's next lease re-read.
     InboxRecheck,
+    /// Late-landing U1(a): the next background try of the tombstones a
+    /// settle gave up on.
+    InboxTombstoneBg,
     /// M13: backoff before the submitter retries a batch PUT.
     InboxSubmitRetry,
     /// M13 round 3b: the escalator's tick while demand is sustained.

@@ -29,7 +29,7 @@
 //! all but each requester's newest. A takeover drains every older epoch's
 //! batches inside its gate, before the new holder's view opens.
 
-use super::client::Phase;
+use super::client::{AfterWithdraw, Phase};
 use super::{Core, S3For, Timer, TimerAt};
 use crate::action::{Action, S3Op};
 use crate::event::{CasFailure, S3Result};
@@ -102,6 +102,9 @@ pub(crate) struct HolderPoll {
     executed: Vec<ExecutedBatch>,
 }
 
+/// Late-landing U1(a): tries of a background tombstone before it is dropped.
+const BG_TOMBSTONE_TRIES: u32 = 6;
+
 #[derive(Debug, Default)]
 pub(crate) struct InboxState {
     // ---- requester ----
@@ -118,6 +121,10 @@ pub(crate) struct InboxState {
     kept_logged_at: Option<WaitMs>,
     pub(crate) recheck_timer: Option<TimerId>,
     pub(crate) retry_timer: Option<TimerId>,
+    /// Late-landing U1(a): the tombstones a settle gave up on, with the
+    /// tries made; a timer writes them again, a bounded number of times.
+    bg_tombstones: BTreeMap<InboxKey, u32>,
+    pub(crate) bg_timer: Option<TimerId>,
     // ---- escalation (round 3b) ----
     /// `(answered_at, round_trip_ms)` of inbox-answered ops, oldest
     /// first, pruned to the window.
@@ -168,8 +175,8 @@ pub(crate) struct LeftoverNode {
     /// is what the status counts; the bytes are never run). The re-read
     /// starts at the first.
     keys: Vec<InboxKey>,
-    /// The re-read in flight.
-    read: Option<OpId>,
+    /// The re-read in flight, and when it was issued (wait clock).
+    read: Option<(OpId, WaitMs)>,
     /// The earliest the next re-read may be issued (a halted batch is not
     /// read again at every round).
     next_read_at: WaitMs,
@@ -270,6 +277,10 @@ enum Halt {
     /// held back per op, so it is not executed until they are recalled;
     /// the requester is polled again then.
     Recall,
+    /// The bytes were read at least `Deadlines::inbox_read_fresh` ago on this
+    /// node's wait clock: nothing is executed or journaled from them, the key
+    /// is read again (late-landing S1: the I4-safety rule of the inbox path).
+    Stale,
     Meta(MetaError),
 }
 
@@ -1253,6 +1264,7 @@ impl Core {
             return;
         };
         rp.in_flight = None;
+        let read_at = rp.issued_at;
         let run = match result {
             S3Result::InboxRun(Ok(run)) => run,
             other => {
@@ -1302,6 +1314,7 @@ impl Core {
         }
         let saturated = run.len() >= width;
         let mut halted = false;
+        let mut stale = false;
         // Plan 30 §M8: another node's ops — the lone-node kernel latch.
         self.note_foreign(now, replica, out);
         for batch in &run {
@@ -1315,7 +1328,7 @@ impl Core {
             if batch.wants_lease {
                 self.lease.note_wanted(now, batch.node);
             }
-            match self.execute_inbox_batch(now, batch, true, replica, out) {
+            match self.execute_inbox_batch(now, batch, read_at, true, replica, out) {
                 Ok(seq) => {
                     let holder = self.inbox.holder.as_mut().expect("holding");
                     holder.executed.push((batch.key(), seq));
@@ -1333,6 +1346,13 @@ impl Core {
                     halted = true;
                     break;
                 }
+                Err(Halt::Stale) => {
+                    // The rest of the run is as old: discarded, read again
+                    // at once.
+                    halted = true;
+                    stale = true;
+                    break;
+                }
                 Err(Halt::Meta(error)) => {
                     tracing::warn!(node = self.cfg.node_id, %error, "executing an inbox batch");
                     halted = true;
@@ -1348,7 +1368,9 @@ impl Core {
             .as_mut()
             .and_then(|h| h.requesters.get_mut(&node))
         {
-            rp.due_at = if halted {
+            rp.due_at = if stale {
+                now.wait
+            } else if halted {
                 now.wait.plus(base)
             } else if saturated {
                 now.wait
@@ -1415,7 +1437,7 @@ impl Core {
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
-        let Phase::InboxWithdraw { holder, gen } = c.phase else {
+        let Phase::InboxWithdraw { holder, gen, then } = c.phase else {
             return;
         };
         match result {
@@ -1425,19 +1447,121 @@ impl Core {
                 let key = (!c.inbox_keys.is_empty()).then(|| c.inbox_keys.remove(0));
                 self.stats.inbox_withdrawn_ops += 1;
                 if let Some(key) = key {
+                    self.inbox_forget_leftover(key);
                     self.inbox_resubmit_cobatched(now, key, replica, out);
                 }
-                self.send_forward(now, rid, holder, gen, replica, out);
+                match then {
+                    AfterWithdraw::Forward => {
+                        self.send_forward(now, rid, holder, gen, replica, out)
+                    }
+                    AfterWithdraw::Settle => self.settle_withdrawn_next(now, rid, replica, out),
+                }
             }
-            other => {
-                tracing::debug!(
-                    node = self.cfg.node_id,
-                    ?rid,
-                    ?other,
-                    "inbox: withdrawing the batch failed; the op takes the lease path"
-                );
-                self.lease_path(now, rid, replica, out);
+            other => match then {
+                AfterWithdraw::Forward => {
+                    tracing::debug!(
+                        node = self.cfg.node_id,
+                        ?rid,
+                        ?other,
+                        "inbox: withdrawing the batch failed; the op takes the lease path"
+                    );
+                    self.lease_path(now, rid, replica, out);
+                }
+                AfterWithdraw::Settle => {
+                    tracing::debug!(
+                        node = self.cfg.node_id,
+                        ?rid,
+                        ?other,
+                        "inbox: withdrawing the batch for a settle failed; retried"
+                    );
+                    self.settle_withdraw_retry(now, rid, out);
+                }
+            },
+        }
+    }
+
+    /// Late-landing U1(a): the settle gave up on these batches' tombstones
+    /// (its client hears the unsettled `EIO`); keep writing them in the
+    /// background, `BG_TOMBSTONE_TRIES` times, so a batch no drain read yet
+    /// is not left to be executed later.
+    pub(crate) fn bg_tombstones_add(
+        &mut self,
+        now: Now,
+        keys: Vec<InboxKey>,
+        out: &mut Vec<Action>,
+    ) {
+        for key in keys {
+            self.inbox.bg_tombstones.entry(key).or_insert(0);
+        }
+        self.arm_bg_tombstone(now, 0, out);
+    }
+
+    fn arm_bg_tombstone(&mut self, now: Now, tries: u32, out: &mut Vec<Action>) {
+        if self.inbox.bg_timer.is_some() || self.inbox.bg_tombstones.is_empty() {
+            return;
+        }
+        let base = self.dl_t().settle_window.max(100);
+        let delay = base << tries.min(4);
+        let id = self.set_timer_wait(now.wait.plus(delay), Timer::InboxTombstoneBg, out);
+        self.inbox.bg_timer = Some(id);
+    }
+
+    pub(crate) fn on_bg_tombstone_tick(&mut self, now: Now, out: &mut Vec<Action>) {
+        let keys: Vec<InboxKey> = self.inbox.bg_tombstones.keys().copied().collect();
+        for key in keys {
+            let batch = constellation_store_s3::inbox::InboxBatch::tombstone(
+                key,
+                self.cfg.incarnation,
+                now.wall.0,
+            );
+            self.issue_s3(
+                S3Op::InboxTombstone { batch },
+                S3For::InboxTombstoneBg(key),
+                out,
+            );
+        }
+    }
+
+    pub(crate) fn on_bg_tombstone(
+        &mut self,
+        now: Now,
+        key: InboxKey,
+        result: S3Result,
+        out: &mut Vec<Action>,
+    ) {
+        if matches!(result, S3Result::InboxTombstone(Ok(()))) {
+            if self.inbox.bg_tombstones.remove(&key).is_some() {
+                self.stats.bg_tombstones_written += 1;
             }
+            return;
+        }
+        let Some(tries) = self.inbox.bg_tombstones.get_mut(&key) else {
+            return;
+        };
+        *tries += 1;
+        let tries = *tries;
+        if tries >= BG_TOMBSTONE_TRIES {
+            self.inbox.bg_tombstones.remove(&key);
+            self.stats.bg_tombstones_dropped += 1;
+            return;
+        }
+        self.arm_bg_tombstone(now, tries, out);
+    }
+
+    /// Late-landing F1 (the own purge): `key` is a tombstone now, so a batch
+    /// of this node's own that the takeover drain left for a re-read is not
+    /// read again. A shortcut: the freshness rule (S1) is what keeps an
+    /// older read from running it.
+    fn inbox_forget_leftover(&mut self, key: InboxKey) {
+        let Some(l) = self.inbox.leftover.as_mut() else {
+            return;
+        };
+        if let Some(n) = l.waiting.get_mut(&key.node) {
+            n.keys.retain(|k| *k != key);
+        }
+        l.waiting.retain(|_, n| !n.keys.is_empty());
+        if l.waiting.is_empty() {
+            self.inbox.leftover = None;
         }
     }
 
@@ -1502,7 +1626,8 @@ impl Core {
         }
     }
 
-    /// Execute every op of `batch` in order; returns the journal seq its
+    /// Execute every op of `batch` in order (`read_at`: when the GET that
+    /// returned it was issued, on the wait clock); returns the journal seq its
     /// last row landed at (for GC), or where it had to stop. `admitted`
     /// is the poll path (through the lease view like every other local
     /// mutation); the takeover gate passes `false` (the view is
@@ -1511,10 +1636,22 @@ impl Core {
         &mut self,
         now: Now,
         batch: &InboxBatch,
+        read_at: WaitMs,
         admitted: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<u64, Halt> {
+        // The executor's freshness rule (late-landing S1): an inbox op runs
+        // only from a GET this node issued less than `f` ago on its own wait
+        // clock. This is synchronous, so a batch that passes here runs
+        // wholly inside the window. A requester that settled has its batch
+        // tombstoned a full window before the client may hear an unsettled
+        // `EIO`; a read older than half that window is the only one that
+        // could have seen the batch before the tombstone.
+        if now.wait.since(read_at) >= self.dl_t().inbox_read_fresh as i64 {
+            self.stats.inbox_stale_reads_discarded += 1;
+            return Err(Halt::Stale);
+        }
         // Plan 43 C1-2: every row of the batch is journaled under the class
         // the answers to the batch's node wait for now. Plan 43 C2 (§2.1):
         // another node's — its requester learns the outcome from the log, and
@@ -1798,6 +1935,7 @@ impl Core {
         &mut self,
         now: Now,
         batches: Vec<InboxBatch>,
+        read_at: WaitMs,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<(), MetaError> {
@@ -1810,9 +1948,18 @@ impl Core {
                 keys.push(batch.key());
                 continue;
             }
-            match self.execute_inbox_batch(now, &batch, false, replica, out) {
+            match self.execute_inbox_batch(now, &batch, read_at, false, replica, out) {
                 Ok(_) => {}
                 Err(Halt::Fenced) => unreachable!("no view admission inside the gate"),
+                Err(Halt::Stale) => {
+                    // The drain's read is too old to run from: this
+                    // requester's batches (and every later one of the
+                    // round) go to the re-read, which lists them again.
+                    self.stats.inbox_stale_relists += 1;
+                    stopped.insert(batch.node);
+                    keys.push(batch.key());
+                    continue;
+                }
                 Err(Halt::Recall) => {
                     // Phase 2b: an op under an inherited delegation: the
                     // recall runs first; this requester's batches wait
@@ -1906,7 +2053,7 @@ impl Core {
                 .as_mut()
                 .and_then(|l| l.waiting.get_mut(&node))
             {
-                n.read = Some(op);
+                n.read = Some((op, now.wait));
             }
         }
         nodes
@@ -1935,9 +2082,9 @@ impl Core {
         else {
             return;
         };
-        if n.read != Some(op) {
+        let Some(read_at) = n.read.filter(|(id, _)| *id == op).map(|(_, at)| at) else {
             return;
-        }
+        };
         n.read = None;
         n.next_read_at = now.wait.plus(hold);
         let run = match result {
@@ -1960,7 +2107,7 @@ impl Core {
             n.next_read_at = now.wait;
         }
         for batch in run {
-            match self.execute_inbox_batch(now, &batch, true, replica, out) {
+            match self.execute_inbox_batch(now, &batch, read_at, true, replica, out) {
                 Ok(_) => {
                     executed = true;
                     self.stats.inbox_drained_batches += 1;
@@ -1978,6 +2125,19 @@ impl Core {
                     self.issue_s3(S3Op::InboxDelete { key }, S3For::InboxGc(key), out);
                 }
                 Err(Halt::Fenced) | Err(Halt::Recall) => break,
+                Err(Halt::Stale) => {
+                    // Read again at once (the keys are still remembered).
+                    self.stats.inbox_stale_relists += 1;
+                    if let Some(n) = self
+                        .inbox
+                        .leftover
+                        .as_mut()
+                        .and_then(|l| l.waiting.get_mut(&node))
+                    {
+                        n.next_read_at = now.wait;
+                    }
+                    break;
+                }
                 Err(Halt::Meta(error)) => {
                     tracing::warn!(
                         node = self.cfg.node_id,
