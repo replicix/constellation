@@ -724,11 +724,11 @@ pub struct Meta {
         std::collections::HashMap<&'static str, constellation_types::clock::WaitMs>,
     >,
     /// The writer of each persisted horizon key (the read-grant, lock-grant
-    /// and takeover-floor keys, in [`Meta::horizon_writer`]'s order): the
+    /// takeover-floor and delegate read-grant keys, in [`Meta::horizon_writer`]'s order): the
     /// highest value written to it and not cleared, held across the read of
     /// that value, the `kv_set` and the update, so writes of one key reach
     /// the store in value order whichever threads make them ([`Meta::note_horizon`]).
-    pub(crate) horizon_written: [std::sync::Mutex<constellation_types::clock::WaitMs>; 3],
+    pub(crate) horizon_written: [std::sync::Mutex<constellation_types::clock::WaitMs>; 4],
     /// Tests: told `(key, value)` just before a horizon write reaches the
     /// store, to hold a writer there.
     #[cfg(test)]
