@@ -8161,6 +8161,12 @@ impl Core {
             return;
         };
         for gen in todo {
+            tracing::info!(
+                node = self.cfg.node_id,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
+                nodes = ?audience,
+                "asking every node to drop the read delegations this node's previous process granted"
+            );
             let mut asked = BTreeMap::new();
             for p in &audience {
                 let req = self.op_id();
