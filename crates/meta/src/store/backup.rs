@@ -46,6 +46,9 @@ use serde::{Deserialize, Serialize};
 
 const KV_BACKUP_ROLE: &str = "backup_role";
 const KV_BACKUP_SEALED: &str = "backup_sealed";
+/// ADR-51: the `(epoch, source)` streams this node sealed for a claimant's
+/// kept fetch, as `epoch:source` pairs joined by commas.
+const KV_SEALED_STREAMS: &str = "sealed_streams";
 
 /// One holder journal transaction as streamed to a backup: its rows
 /// `first..=last` and their records, in order. Whole transactions only
@@ -462,6 +465,45 @@ impl Meta {
             .unwrap_or(0))
     }
 
+    /// ADR-51: the streams `(epoch, source)` this node sealed for a
+    /// claimant's kept fetch, ascending.
+    pub fn sealed_streams(&self) -> Result<Vec<(u64, u64)>, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        read_fault::check()?;
+        let r = self.db.read_tx();
+        Ok(parse_sealed_streams(
+            kv_get_tx(&r, &self.local, KV_SEALED_STREAMS)?.as_deref(),
+        ))
+    }
+
+    /// ADR-51: whether stream `(epoch, source)` is sealed here.
+    pub fn stream_sealed(&self, epoch: u64, source: u64) -> Result<bool, MetaError> {
+        Ok(self.sealed_streams()?.contains(&(epoch, source)))
+    }
+
+    /// ADR-51: seal the streams `(epoch, source)`: persisted and synced
+    /// before the caller answers the claimant (K4, per stream: a later epoch
+    /// of the same source is not affected).
+    pub fn seal_streams(&self, streams: &[(u64, u64)]) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        let mut all =
+            parse_sealed_streams(kv_get_tx(&tx, &self.local, KV_SEALED_STREAMS)?.as_deref());
+        let before = all.len();
+        all.extend_from_slice(streams);
+        all.sort_unstable();
+        all.dedup();
+        let grows = all.len() > before;
+        if grows {
+            let text: Vec<String> = all.iter().map(|(e, s)| format!("{e}:{s}")).collect();
+            kv_set_tx(&mut tx, &self.local, KV_SEALED_STREAMS, &text.join(","));
+        }
+        tx.commit()?;
+        if grows {
+            self.sync()?;
+        }
+        Ok(())
+    }
+
     /// Seal `epoch`: persisted before the caller refuses its first append.
     pub fn backup_seal(&self, epoch: u64) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
@@ -484,6 +526,16 @@ impl Meta {
 }
 
 // ------------------------------------------- plan 30 §M11 phase 2b: delegate backups
+
+fn parse_sealed_streams(text: Option<&str>) -> Vec<(u64, u64)> {
+    text.unwrap_or("")
+        .split(',')
+        .filter_map(|p| {
+            let (e, s) = p.split_once(':')?;
+            Some((e.parse().ok()?, s.parse().ok()?))
+        })
+        .collect()
+}
 
 /// The `backup_tail` key space of a delegate's stream: `epoch` slots
 /// above this base hold generation `epoch - base` (the M9 tail keys are
@@ -1152,13 +1204,10 @@ mod durability_tests {
     fn an_epoch_row_records_its_carrier_and_is_selected_by_it() {
         let meta = Meta::open_in_memory().unwrap();
         let base = std::collections::BTreeMap::new();
-        // Promised: no carrier yet; counts as possibly carrying anything.
+        // Promised: no carrier yet; no evidence for any tenure (S5).
         meta.persist_epoch("e1", &[1, 2, 3], &base, 7, "promised", None)
             .unwrap();
-        assert_eq!(
-            meta.epochs_possibly_carrying(1, 5).unwrap(),
-            vec![vec![1, 2, 3]]
-        );
+        assert!(meta.epochs_possibly_carrying(1, 5).unwrap().is_empty());
         // Activated: carries (1, 5).
         meta.persist_epoch("e1", &[1, 2, 3], &base, 7, "active", Some((1, 5)))
             .unwrap();
@@ -1178,13 +1227,56 @@ mod durability_tests {
             .unwrap();
         assert_eq!(
             meta.epochs_possibly_carrying(4, 9).unwrap(),
-            vec![vec![2, 4], vec![3, 4]]
+            vec![vec![3, 4]],
+            "e3 records no carrier: it carried nothing"
         );
+        assert!(meta.epochs_possibly_carrying(4, 8).unwrap().is_empty());
+    }
+
+    /// ADR-51 (S5): an epoch row with no recorded carrier (promised only, or
+    /// activated carrying nothing) is no evidence for any tenure of its
+    /// holder: it never names a member a kept fetch has to wait for. Fails
+    /// on the parent: such a row counts as possibly carrying any tenure.
+    #[test]
+    fn a_carrierless_epoch_row_is_no_evidence() {
+        let meta = Meta::open_in_memory().unwrap();
+        let base = std::collections::BTreeMap::new();
+        meta.persist_epoch("e1", &[1, 2, 3], &base, 7, "promised", None)
+            .unwrap();
+        meta.persist_epoch("e2", &[1, 4], &base, 8, "closed", None)
+            .unwrap();
+        for epoch in 0..8 {
+            assert!(
+                meta.epochs_possibly_carrying(1, epoch).unwrap().is_empty(),
+                "tenure epoch {epoch}"
+            );
+        }
+        meta.persist_epoch("e2", &[1, 4], &base, 8, "active", Some((1, 3)))
+            .unwrap();
         assert_eq!(
-            meta.epochs_possibly_carrying(4, 8).unwrap(),
-            vec![vec![2, 4]],
-            "e2 carried another tenure; e3 records none"
+            meta.epochs_possibly_carrying(1, 3).unwrap(),
+            vec![vec![1, 4]]
         );
+    }
+
+    /// ADR-51 (K4 per stream): a sealed stream is persisted and listed; a
+    /// later epoch from the same node, and the same epoch from another, are
+    /// not sealed. Fails on the parent: there is no per-stream seal.
+    #[test]
+    fn a_sealed_stream_is_listed_and_a_later_epoch_from_the_same_node_is_not() {
+        let meta = Meta::open_in_memory().unwrap();
+        assert!(meta.sealed_streams().unwrap().is_empty());
+        meta.seal_streams(&[(5, 2), (6, 3), (5, 2)]).unwrap();
+        assert_eq!(meta.sealed_streams().unwrap(), vec![(5, 2), (6, 3)]);
+        assert!(meta.stream_sealed(5, 2).unwrap());
+        assert!(meta.stream_sealed(6, 3).unwrap());
+        assert!(
+            !meta.stream_sealed(6, 2).unwrap(),
+            "a later epoch of node 2"
+        );
+        assert!(!meta.stream_sealed(5, 3).unwrap(), "another node's epoch 5");
+        // The role seal is separate.
+        assert_eq!(meta.backup_sealed_epoch().unwrap(), 0);
     }
 
     /// Plan 43 C7-H1 (R9): a promiser waits its promise out on its wait

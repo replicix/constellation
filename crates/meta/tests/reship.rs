@@ -484,6 +484,84 @@ fn promote_streamed_flips_gated_in_both_rows() {
     assert_eq!(gated(4), Some(false), "{queued:?}");
 }
 
+/// ADR-51: `kept_streamed` lists the committed (gated) streamed copies of one
+/// epoch from one source, in journal order, with the delegation origin each
+/// arrived with; speculative copies, other sources' and other epochs' are not
+/// listed.
+#[test]
+fn kept_streamed_lists_committed_copies_of_a_source() {
+    let meta = Meta::open_in_memory().unwrap();
+    let row = |n: u64| {
+        vec![
+            create(ROOT_INO, &format!("k{n}"), ino(n)),
+            LogRecord::Completed { rid: rid(1, n) },
+        ]
+    };
+    meta.install_streamed_committed(EPOCH_PREV, 1, 1, 1, &row(1), true, (0, 0))
+        .unwrap();
+    meta.install_streamed_committed(EPOCH_PREV, 1, 2, 2, &row(2), true, (7, 3))
+        .unwrap();
+    // Speculative, then a committed one past it.
+    meta.install_streamed_committed(EPOCH_PREV, 1, 3, 3, &row(3), false, (0, 0))
+        .unwrap();
+    // Another source's, another epoch's.
+    meta.install_streamed_committed(EPOCH_PREV, 9, 4, 4, &row(4), true, (0, 0))
+        .unwrap();
+    meta.install_streamed_committed(EPOCH_PREV + 1, 1, 1, 1, &row(5), true, (0, 0))
+        .unwrap();
+    let kept = meta.kept_streamed(EPOCH_PREV, 1).unwrap();
+    let shape: Vec<_> = kept.iter().map(|t| (t.first, t.last, t.origin)).collect();
+    assert_eq!(shape, vec![(1, 1, (0, 0)), (2, 2, (7, 3))]);
+    assert_eq!(kept[0].records, row(1));
+    assert!(meta.kept_streamed(EPOCH_PREV, 5).unwrap().is_empty());
+}
+
+/// ADR-51: the operator abandoned the sources of a kept fetch that had not
+/// answered. A committed copy the carried tail names retires on carry and is
+/// never queued; a copy past the tail strands and replays by rid.
+#[test]
+fn an_abandon_after_partial_answers_queues_only_what_the_tail_does_not_name() {
+    let meta = Meta::open_in_memory().unwrap();
+    let row = |n: u64| {
+        vec![
+            create(ROOT_INO, &format!("a{n}"), ino(n)),
+            LogRecord::Completed { rid: rid(1, n) },
+        ]
+    };
+    meta.install_streamed_committed(EPOCH_PREV, 1, 1, 1, &row(1), true, (0, 0))
+        .unwrap();
+    meta.install_streamed_committed(EPOCH_PREV, 1, 2, 2, &row(2), true, (0, 0))
+        .unwrap();
+    // The claim carried the first row only (what answered).
+    meta.backup_append(EPOCH_PREV, &[tx(1, 1, row(1))]).unwrap();
+    let proof = constellation_meta::OrphanProof {
+        upto: Some(EPOCH_PREV),
+        upto_through: 1,
+        no_tail: None,
+    };
+    let carried = Default::default();
+    meta.reship_at_takeover(
+        Some(constellation_meta::StrandArgs {
+            epoch: EPOCH_PREV + 1,
+            own_gens: &[],
+            abandoned: Some(EPOCH_PREV),
+            carried: &carried,
+            proof: &proof,
+        }),
+        Some(constellation_meta::TailArgs {
+            epoch: EPOCH_PREV,
+            through: 1,
+            config_version: 3,
+            class: None,
+        }),
+    )
+    .unwrap();
+    let queued = meta.pending_replays().unwrap();
+    let rids: Vec<_> = queued.iter().map(|q| q.rid).collect();
+    assert_eq!(rids, vec![rid(1, 2)], "{queued:?}");
+    assert!(meta.lookup(ROOT_INO, "a1").unwrap().is_some());
+}
+
 /// The same row with a tail that names it: the tail re-applies it, the
 /// member's entry is taken out and nothing is queued (applied once).
 #[test]
@@ -544,4 +622,61 @@ fn a_member_copy_named_only_by_a_tx_past_the_gap_survives_as_a_replay() {
     let queued = meta.pending_replays().unwrap();
     assert_eq!(queued.len(), 1, "{queued:?}");
     assert_eq!(queued[0].rid, rid(1, 2));
+}
+
+/// ADR-51 (M5): a member that is not the claimant applies the marker segment
+/// of a partial abandon before the segments that carry the tail's rows. The
+/// copies at or below the record's `through_known` are in the carried tail
+/// and stay (they retire on carry); the ones past it strand and replay by
+/// rid. Fails on the parent: the record's `through_known` was never read, so
+/// every copy of the epoch stranded and replayed while the claim carried it.
+#[test]
+fn a_returning_member_keeps_tail_named_copies_after_a_partial_abandon() {
+    let meta = Meta::open_in_memory().unwrap();
+    let row = |n: u64| {
+        vec![
+            create(ROOT_INO, &format!("m{n}"), ino(n)),
+            LogRecord::Completed { rid: rid(1, n) },
+        ]
+    };
+    for n in 1..=5 {
+        meta.install_streamed_committed(EPOCH_PREV, 1, n, n, &row(n), true, (0, 0))
+            .unwrap();
+    }
+    // The claim carried rows 1..=3 and the operator abandoned the rest.
+    let marker = vec![
+        LogRecord::TailFollowsThrough {
+            prev_epoch: EPOCH_PREV,
+            through: 3,
+        },
+        LogRecord::GroupAbandoned {
+            epoch: EPOCH_PREV,
+            gen: 0,
+            through_known: 3,
+        },
+    ];
+    meta.apply_segment_rows(1, EPOCH_PREV + 1, 0, &[], &[], &marker, &Default::default())
+        .unwrap();
+    let rids: Vec<_> = meta
+        .pending_replays()
+        .unwrap()
+        .iter()
+        .map(|q| q.rid)
+        .collect();
+    assert_eq!(
+        rids,
+        vec![rid(1, 4), rid(1, 5)],
+        "only the uncarried replay"
+    );
+    let kept: Vec<_> = meta
+        .kept_streamed(EPOCH_PREV, 1)
+        .unwrap()
+        .iter()
+        .map(|t| t.first)
+        .collect();
+    assert_eq!(
+        kept,
+        vec![1, 2, 3],
+        "the carried copies wait for their tail"
+    );
 }

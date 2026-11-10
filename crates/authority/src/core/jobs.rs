@@ -4049,6 +4049,7 @@ impl Core {
                     .map(|(_, proof)| proof)
                     .unwrap_or(constellation_meta::OrphanProof {
                         upto: self.bk.gate_abandoned,
+                        upto_through: 0,
                         no_tail: None,
                     });
                 (epoch, proof)

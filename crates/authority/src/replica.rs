@@ -2139,10 +2139,12 @@ impl Replica for Meta {
         let epoch: Epoch = parts.next()?.parse().ok()?;
         let upto: u64 = parts.next()?.parse().ok()?;
         let no_tail: u64 = parts.next()?.parse().ok()?;
+        let upto_through: u64 = parts.next()?.parse().ok()?;
         Some((
             epoch,
             constellation_meta::OrphanProof {
                 upto: (upto != 0).then_some(upto),
+                upto_through,
                 no_tail: (no_tail != 0).then_some(no_tail),
             },
         ))
@@ -2153,7 +2155,14 @@ impl Replica for Meta {
         proof: Option<(Epoch, constellation_meta::OrphanProof)>,
     ) -> Result<(), MetaError> {
         let v = proof
-            .map(|(e, p)| format!("{e}:{}:{}", p.upto.unwrap_or(0), p.no_tail.unwrap_or(0)))
+            .map(|(e, p)| {
+                format!(
+                    "{e}:{}:{}:{}",
+                    p.upto.unwrap_or(0),
+                    p.no_tail.unwrap_or(0),
+                    p.upto_through
+                )
+            })
             .unwrap_or_default();
         Meta::kv_set_durable(self, "gate_orphan_proof", &v)
     }

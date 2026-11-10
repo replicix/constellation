@@ -17689,6 +17689,7 @@ mod locks {
         h.core.issue_marker(h.clk(), 0, &h.meta, &mut out);
         let want = constellation_meta::OrphanProof {
             upto: None,
+            upto_through: 0,
             no_tail: Some(1),
         };
         assert_eq!(
@@ -17806,6 +17807,7 @@ mod locks {
         let mut h = Harness::new(3);
         let proof = constellation_meta::OrphanProof {
             upto: Some(1),
+            upto_through: 0,
             no_tail: Some(1),
         };
         crate::replica::Replica::persist_gate_orphan_proof(&h.meta, Some((2, proof))).unwrap();
