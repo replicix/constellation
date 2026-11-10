@@ -2290,6 +2290,7 @@ pub fn unlogged_delegate_rows(o: &Oracles, log: &super::check::Oracle) -> BTreeS
 /// from I2 (c), counted in `i2c_operator_lost`).
 /// `converged`: the run reached quiescence, so a group-answered rid the log
 /// never completed is absent for good.
+#[allow(clippy::too_many_arguments)]
 pub fn end_of_run(
     o: &Oracles,
     log: &super::check::Oracle,
@@ -3327,6 +3328,7 @@ mod tests {
             &[],
             &HashMap::from([(r, 6)]),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &BTreeMap::from([(7, 4)]),
             true,
         );
@@ -3424,15 +3426,42 @@ mod tests {
         let o = Oracles::new(Bucket::new(1, (0, 0)));
         *o.acks.lock().unwrap() = acks;
         let log = log_with(refused_seg(1, r, Code::Io), &[(other, (3, 1))]);
-        let f = end_of_run(&o, &log, &[], &rolled, &dropped, &BTreeSet::new(), &BTreeMap::new(), true);
+        let f = end_of_run(
+            &o,
+            &log,
+            &[],
+            &rolled,
+            &dropped,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            true,
+        );
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
         // Its replay refused: the outcome is the log's.
         let log = log_with(refused_seg(1, r, Code::NotFound), &[(other, (3, 1))]);
-        let f = end_of_run(&o, &log, &[], &rolled, &dropped, &BTreeSet::new(), &BTreeMap::new(), true);
+        let f = end_of_run(
+            &o,
+            &log,
+            &[],
+            &rolled,
+            &dropped,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            true,
+        );
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
         // A refusal of a rid the drop did not roll back excuses nothing.
         let log = log_with(refused_seg(1, other, Code::NotFound), &[(r, (3, 0))]);
-        let f = end_of_run(&o, &log, &[], &rolled, &dropped, &BTreeSet::new(), &BTreeMap::new(), true);
+        let f = end_of_run(
+            &o,
+            &log,
+            &[],
+            &rolled,
+            &dropped,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            true,
+        );
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
         assert!(f.i5[0].contains(&format!("{other:?}")), "{:?}", f.i5);
     }
@@ -4441,7 +4470,16 @@ mod tests {
             let o = Oracles::new(Bucket::new(1, (0, 0)));
             *o.acks.lock().unwrap() = acks.clone();
             let log = log_with(seg(1, &[]), &[]);
-            end_of_run(&o, &log, &[], &HashMap::new(), &BTreeSet::new(), lost, &BTreeMap::new(), true)
+            end_of_run(
+                &o,
+                &log,
+                &[],
+                &HashMap::new(),
+                &BTreeSet::new(),
+                lost,
+                &BTreeMap::new(),
+                true,
+            )
         };
         // Neither is in the set: both are absent.
         let f = run(&BTreeSet::new());

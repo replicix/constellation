@@ -1108,6 +1108,20 @@ pub fn sticky_abandon(_seed: u64) -> Result<()> {
             "the refusal does not name --force: {refused}"
         );
         eprintln!("    {SCENARIO}: the abandon without --force was refused: {refused}");
+        // The first op c sends after the kill is sent to b: c's link to b has
+        // not failed yet, and the op's keys are b's sticky grant. It may have
+        // run there (b could be alive and cut from the root only), so the
+        // root's EROFS for it is held, not final (plan 46 M1.3 step 5, I1),
+        // and it ends in doubt (EIO) at its settle cap, tens of seconds on.
+        // That is the design, not a fault: this sacrificial write takes it,
+        // and fails with EIO or EROFS, never succeeds. The writes of the loop
+        // below are sent after c's forward to b timed out, so they are
+        // refused for good by the root (EROFS); in practice the first of
+        // them returns only when the sacrificial one has (the same
+        // directory), tens of seconds after the kill.
+        let sacrifice_path = c.mnt.join("d1/c-sacrifice");
+        let sacrifice = std::thread::spawn(move || std::fs::write(sacrifice_path, b"c"));
+        std::thread::sleep(Duration::from_millis(2_000));
         // c's write into d1 fails EROFS for longer than the delegation TTL:
         // the sticky grant is not TTL-ended.
         let blocked = "d1/c-blocked";
@@ -1144,6 +1158,15 @@ pub fn sticky_abandon(_seed: u64) -> Result<()> {
         );
         let da = deleg_of(a)?;
         print_deleg(SCENARIO, "a", &da);
+        // The sacrificial write ended in doubt (or refused), never succeeded.
+        match sacrifice
+            .join()
+            .map_err(|_| anyhow::anyhow!("the sacrificial writer panicked"))?
+        {
+            Ok(()) => anyhow::bail!("c's write sent to the dead sticky holder succeeded"),
+            Err(e) if matches!(e.raw_os_error(), Some(5 | 30)) => {}
+            Err(e) => anyhow::bail!("c's write sent to the dead sticky holder failed with {e}"),
+        }
         // c writes b-last (different content) and x: through the root.
         let new_last = b"c took this name";
         write_timed(&c.mnt.join(&last), new_last).context("c writing d1/b-last")?;
