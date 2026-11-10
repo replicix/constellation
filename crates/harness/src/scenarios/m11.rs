@@ -1043,7 +1043,7 @@ pub fn sticky_abandon(_seed: u64) -> Result<()> {
     const SCENARIO: &str = "sticky-abandon";
     // `CONSTELLATION_READ_DELEGATION_TTL_MS` (default) plus the expiry margin.
     const READ_WAIT_MS: u64 = 5_000 + 1_000;
-    let (_env, _root, mut clients, _) = cluster(
+    let (_env, root, mut clients, _) = cluster(
         SCENARIO,
         &["a", "b", "c"],
         &[("CONSTELLATION_CTO", "strict")],
@@ -1090,6 +1090,14 @@ pub fn sticky_abandon(_seed: u64) -> Result<()> {
             "    {SCENARIO}: c's reads under a read delegation before the kill: {}",
             n(&cto, "delegation_local")
         );
+        // b is cut from the root, so `b-last` is acknowledged by the
+        // sticky holder but cannot stream: the row past the cut exists at
+        // the kill, not depending on how fast the stream ships it (it would
+        // else sometimes be in the log before the abandon, and nothing is
+        // left to replay). The root heard from b within the TTL just before.
+        let a_id = node_id(a)?;
+        std::fs::write(deny_path(root.path(), &a.name), format!("{b_id}\n"))?;
+        std::fs::write(deny_path(root.path(), &b.name), format!("{a_id}\n"))?;
         let last = "d1/b-last".to_string();
         write_timed(&b.mnt.join(&last), last.as_bytes())?;
         let killed = Instant::now();
@@ -1181,6 +1189,9 @@ pub fn sticky_abandon(_seed: u64) -> Result<()> {
         );
         // b returns with its state dir: its acknowledged writes past the cut
         // replay by rid; d1/b-last, now c's, becomes a conflict copy.
+        for x in [&clients[0], &clients[1]] {
+            let _ = std::fs::remove_file(deny_path(root.path(), &x.name));
+        }
         clients[1].mount()?;
         let a = &clients[0];
         let b = &clients[1];
