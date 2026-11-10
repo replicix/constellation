@@ -1445,9 +1445,24 @@ impl Engine {
                         let scan =
                             crate::p2p::refresh_peers(&peers, store_inner.clone(), Some(&epochs))
                                 .await;
-                        let _ = sync_tx.send(crate::sync::SyncRequest::Roster {
-                            roster: epochs.roster(),
-                            issued,
+                        // A scan that answered but could not read every
+                        // record empties the epoch roster (fail closed for
+                        // epochs); the core must not take that for "no
+                        // peers" (it would answer Singleton with peers
+                        // linked): it keeps its last complete roster.
+                        let unread = scan.as_ref().is_some_and(|s| {
+                            matches!(
+                                s.roster(),
+                                Err(constellation_store_s3::StoreError::Registry(_))
+                            )
+                        });
+                        let _ = sync_tx.send(if unread {
+                            crate::sync::SyncRequest::RosterUnread { issued }
+                        } else {
+                            crate::sync::SyncRequest::Roster {
+                                roster: epochs.roster(),
+                                issued,
+                            }
                         });
                         peers.probe_all().await;
                         tick += 1;

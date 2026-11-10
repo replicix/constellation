@@ -111,6 +111,11 @@ pub enum Event {
         write_eligible: Vec<NodeId>,
         issued: WaitMs,
     },
+    /// A roster read that could not be completed (a record vanished or
+    /// would not parse). The core keeps the last complete roster and
+    /// treats the peer set as unknown (a peer could exist) until the next
+    /// complete [`Event::Roster`]. `issued` as for [`Event::Roster`].
+    RosterUnread { issued: WaitMs },
     /// Plan 30 §M10: the filesystem's `epoch_slack` as `meta.json` now
     /// says (the driver re-reads it with the roster).
     Slack { epoch_slack: u32 },
