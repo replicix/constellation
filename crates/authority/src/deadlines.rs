@@ -82,7 +82,11 @@ pub struct Deadlines {
     /// A client op's own attempts end this long after its submit: `A - w`.
     pub attempts: u64,
     pub inbox_attempts: u64,
-    /// The span of the settle cap past a settle's start.
+    /// The span of the settle cap past a settle's start: two settle windows,
+    /// the reclaim horizon, the takeover window (an inherited generation's
+    /// outwait ends a horizon and the window past the tenure's start), the
+    /// longer of two forward timeouts and the release seal window, and the
+    /// request timeout the outwait hold adds.
     pub settle_cap_span: u64,
     /// The bound a placeholder waits for its requester's retry:
     /// `drop_held_await_ms`, else the cap, and never more than the cap,
@@ -238,6 +242,7 @@ impl Deadlines {
         };
         let drt = f.max(tick * 4).max(1);
         let h = d + m;
+        let seal = t.max(f);
         let drop_cap = a.saturating_sub(2 * w).max(w);
         let longest_grant = r.max(k);
         let lock_ttl = k.max(d);
@@ -249,7 +254,7 @@ impl Deadlines {
             settle_window: w,
             attempts: a - w,
             inbox_attempts: b.inbox_deadline.saturating_sub(w).max(b.inbox_deadline / 2),
-            settle_cap_span: 2 * w + h + 2 * f,
+            settle_cap_span: 2 * w + h + t + (2 * f).max(seal) + drt,
             drop_held_await: match b.drop_held_await_knob {
                 0 => drop_cap,
                 ms => ms.min(drop_cap),
@@ -264,7 +269,7 @@ impl Deadlines {
             deleg_resend: crate::deleg_lane::stuck_threshold_ms(d / 2) as u64
                 + crate::deleg_lane::DELEG_RESEND_SLACK_MS as u64,
             recall_backoff_max: RECALL_BACKOFF_CAP_MS.max(drt),
-            release_seal_window: t.max(f),
+            release_seal_window: seal,
             release_stream_window: f,
             inherit_slack: t,
             abandon_read_wait: r + m,
@@ -533,7 +538,11 @@ impl Deadlines {
                 self.inbox_attempts,
                 "max(inbox_deadline - w, inbox_deadline/2)",
             ),
-            ("settle_cap_span", self.settle_cap_span, "2w + H + 2F"),
+            (
+                "settle_cap_span",
+                self.settle_cap_span,
+                "2w + H + T + max(2F, max(T, F)) + DRT",
+            ),
             (
                 "drop_held_await",
                 self.drop_held_await,
@@ -711,9 +720,9 @@ mod tests {
                 // max(120000 - 30000, 60000).
                 ("inbox_attempts", 90_000),
                 // DRT = max(500, 4*50, 1) = 500; H = 5000 + 1000 = 6000;
-                // DRT = max(500, 4*50, 1) = 500; H = 5000 + 1000 = 6000;
-                // 2*30000 + 6000 + 2*500.
-                ("settle_cap_span", 67_000),
+                // seal = max(1500, 500) = 1500; 2*30000 + 6000 + 1500 (T)
+                // + max(2*500, 1500) + 500.
+                ("settle_cap_span", 69_500),
                 ("deleg_request_timeout", 500),
                 ("reclaim_horizon", 6_000),
                 // cap = max(120000 - 60000, 30000).
@@ -782,8 +791,8 @@ mod tests {
                 ("settle_window", 30_000),
                 ("attempts", 90_000),
                 ("inbox_attempts", 90_000),
-                // H = 20000 + 1000; 60000 + 21000 + 1000.
-                ("settle_cap_span", 82_000),
+                // H = 20000 + 1000; 60000 + 21000 + 1500 + max(1000, 1500) + 500.
+                ("settle_cap_span", 84_500),
                 ("deleg_request_timeout", 500),
                 ("reclaim_horizon", 21_000),
                 ("drop_held_await", 60_000),
@@ -840,8 +849,9 @@ mod tests {
                 ("attempts", 9_000),
                 // max(8000 - 3000, 4000).
                 ("inbox_attempts", 5_000),
-                // DRT = max(400, 200, 1) = 400; H = 5500; 6000 + 5500 + 800.
-                ("settle_cap_span", 12_300),
+                // DRT = max(400, 200, 1) = 400; H = 5500; seal = 1500;
+                // 6000 + 5500 + 1500 (T) + max(800, 1500) + 400.
+                ("settle_cap_span", 14_900),
                 ("deleg_request_timeout", 400),
                 ("reclaim_horizon", 5_500),
                 // max(12000 - 6000, 3000).
@@ -911,8 +921,8 @@ mod tests {
                 ("attempts", 45_000),
                 // max(8000 - 15000 floored at 0, 4000).
                 ("inbox_attempts", 4_000),
-                // H = 20500; 2 * 15000 + 20500 + 800.
-                ("settle_cap_span", 51_300),
+                // H = 20500; 2 * 15000 + 20500 + 1500 (T) + max(800, 1500) + 400.
+                ("settle_cap_span", 53_900),
                 ("deleg_request_timeout", 400),
                 ("reclaim_horizon", 20_500),
                 // max(60000 - 30000, 15000).
@@ -968,7 +978,9 @@ mod tests {
                 ("settle_window", 3_000),
                 ("attempts", 9_000),
                 ("inbox_attempts", 5_000),
-                ("settle_cap_span", 12_300),
+                // T = 1000, seal = max(1000, 400) = 1000, DRT 400:
+                // 6000 + 5500 + 1000 + max(800, 1000) + 400.
+                ("settle_cap_span", 13_900),
                 ("deleg_request_timeout", 400),
                 ("reclaim_horizon", 5_500),
                 ("drop_held_await", 6_000),
@@ -1025,8 +1037,9 @@ mod tests {
                 ("attempts", 1_500),
                 // max(100 - 500 -> 0, 50).
                 ("inbox_attempts", 50),
-                // DRT = max(3000, 4, 1) = 3000; H = 50; 1000 + 50 + 6000.
-                ("settle_cap_span", 7_050),
+                // DRT = max(3000, 4, 1) = 3000; H = 50; T = 8; seal = 3000;
+                // 1000 + 50 + 8 + max(6000, 3000) + 3000.
+                ("settle_cap_span", 10_058),
                 ("deleg_request_timeout", 3_000),
                 ("reclaim_horizon", 50),
                 // max(2000 - 1000, 500).
@@ -1108,8 +1121,8 @@ mod tests {
     #[test]
     fn pinned_runtime_functions() {
         let d = Deadlines::new(&Config::defaults(1, 1));
-        // max(until, start + 67000).
-        assert_eq!(d.settle_cap(1_000, 500), 68_000);
+        // max(until, start + 69500).
+        assert_eq!(d.settle_cap(1_000, 500), 70_500);
         assert_eq!(d.settle_cap(1_000, 100_000), 100_000);
         // renewed 0: installed + H.
         assert_eq!(d.deleg_lapse_at(0, 10_000), 16_000);
@@ -1176,8 +1189,8 @@ mod tests {
         assert_eq!(e.deleg_lapse_at(0, 0), 50);
     }
 
-    /// One failing configuration per invariant (D5 on a takeover window
-    /// the cap does not cover).
+    /// One failing configuration per invariant (D5, which holds by
+    /// construction, on a hand-made cap).
     #[test]
     fn each_invariant_has_a_failing_configuration() {
         let ids = |d: &Deadlines| d.check().into_iter().map(|v| v.id).collect::<Vec<_>>();
@@ -1197,10 +1210,14 @@ mod tests {
         c.ttl_ms = 2_000;
         assert!(has(&Deadlines::new(&c), "D4"));
         assert!(!has(&Deadlines::new(&sim_long()), "D4"));
+        // (The span covers the takeover window by construction: a cap
+        // shorter than the waits it caps is a hand-made one.)
         let mut c = Config::defaults(1, 1);
         c.backup_takeover_ms = 40_000;
-        assert!(has(&Deadlines::new(&c), "D5"));
-        assert!(!has(&Deadlines::new(&Config::defaults(1, 1)), "D5"));
+        assert!(!has(&Deadlines::new(&c), "D5"));
+        let mut d = Deadlines::new(&Config::defaults(1, 1));
+        d.settle_cap_span = d.reclaim_horizon;
+        assert!(has(&d, "D5"));
         let mut d = Deadlines::new(&Config::defaults(1, 1));
         d.abandon_heard_window = 4_999;
         assert!(has(&d, "D6"));

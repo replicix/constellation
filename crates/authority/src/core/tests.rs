@@ -34423,6 +34423,76 @@ mod s3_no_loops {
         assert_eq!(h.core.stats.settles_held_for_outwait, 1);
     }
 
+    /// The settle's cap covers what it caps (deadlines I3): a root that
+    /// inherited a generation after a fast takeover outwaits it to the
+    /// tenure's start plus the reclaim horizon and the takeover window, and
+    /// its settle holds that long and the lane's request timeout more. With
+    /// a small settle window the second window the cap used to carry no
+    /// longer hides the takeover window and the request timeout. Fails on the
+    /// parent: the cap is cut at `start + 2w + H + 2F`, short of the
+    /// outwait's end, and the client is told in doubt before the
+    /// generation's rows can land.
+    #[test]
+    fn a_settle_cap_outlasts_an_inherited_generations_outwait_and_the_request_timeout() {
+        let (mut h, dir, gen) = delegated_root();
+        // A short client deadline (twice the TTL) and a small settle window:
+        // the settle's first deadline is a few hundred ms past its start.
+        h.core.cfg.ttl_ms = 200;
+        h.core.cfg.settle_window_ms = 200;
+        let dl = Deadlines::new(&h.core.cfg);
+        let rid = h.rid(1);
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Create {
+                parent: dir,
+                name: "own".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            tag: Default::default(),
+        });
+        // The root inherited the generation at this instant: its outwait
+        // ends a horizon and the takeover window from now.
+        let outwait_end = h.clk().wait.plus(dl.reclaim_horizon + dl.inherit_slack);
+        h.core.dw.set_until_for_tests(gen, outwait_end);
+        h.core.start_recall(h.clk(), gen, &mut Vec::new());
+        // The op's own attempts end; the settle starts, parked for the recall.
+        let deadline = h.core.clients[&rid].deadline;
+        let out = h.step(Event::Timer { id: deadline });
+        assert!(
+            h.core.exec_local_park_outwait(rid).is_some(),
+            "not parked for the recall: {out:?}"
+        );
+        let cap = h.core.clients[&rid].settle_cap;
+        assert!(
+            cap >= outwait_end.plus(dl.deleg_request_timeout),
+            "the cap {cap:?} ends before the outwait {outwait_end:?} and the request timeout"
+        );
+        let mut told_at = None;
+        for _ in 0..200 {
+            let until = h.core.clients[&rid].settle_until;
+            h.advance(until.since(h.clk().wait).max(0) as u64);
+            let id = h.core.clients[&rid].deadline;
+            let out = h.step(Event::Timer { id });
+            if replies(&out)
+                .iter()
+                .any(|(r, a)| *r == rid && matches!(a, ClientReply::InDoubt))
+            {
+                told_at = Some(h.clk().wait);
+                break;
+            }
+        }
+        let told_at = told_at.expect("held for ever");
+        assert!(
+            told_at >= outwait_end,
+            "told in doubt at {told_at:?}, before the generation's end at {outwait_end:?}"
+        );
+    }
+
     /// Plan 46 M1.2 step 13: the root's `Held` to a settle it parks for the
     /// recall of a generation it outwaits says how long it holds it
     /// (`outwait_ms`, the generation's window left); with two generations

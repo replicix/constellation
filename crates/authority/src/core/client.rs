@@ -223,9 +223,9 @@ pub(crate) struct ClientOp {
     pub settle: bool,
     /// Plan 46 M1.2 step 13: while `settle`, when the settle's second
     /// deadline fires (the wait clock), and the latest it may be moved to
-    /// (`settle_cap`: one reclaim horizon, a seal window and a settle window
-    /// past the settle's start). Zero for a settle that started as one (a
-    /// placeholder's): those are never moved.
+    /// (`settle_cap`: `Deadlines::settle_cap_span` past the settle's start, or
+    /// the settle's first deadline if that is later). Zero for a settle that
+    /// started as one (a placeholder's): those are never moved.
     pub settle_until: WaitMs,
     pub settle_cap: WaitMs,
     /// ADR-44: this settle waits in `Backoff` for a recall this node's
@@ -752,9 +752,7 @@ impl Core {
             // It gets the same window and cap as a settle that began at a
             // deadline, so the outwait hold applies to it too (I4).
             let window = self.dl_t().settle_window;
-            let cap = now
-                .wait
-                .plus(2 * window + self.reclaim_horizon_ms() + 2 * self.cfg.forward_timeout_ms);
+            let cap = now.wait.plus(self.dl_t().settle_cap_span);
             if let Some(c) = self.clients.get_mut(&rid) {
                 c.settle = true;
                 c.settle_until = now.wait.plus(window);
@@ -3932,14 +3930,26 @@ impl Core {
     /// generation of this node's holding the op's row is ended by the root
     /// (`own_gen_end_due`): the deadline then moves to that end and a settle
     /// window, never earlier, and never past `settle_cap`: the settle's start
-    /// plus two settle windows, one reclaim horizon (no renewal is granted
-    /// once a recall starts, so every outwait ends within it) and two forward
-    /// timeouts (a seal window). With the defaults (lease TTL 60 s: a 30 s
-    /// window; 5 s grant TTL, 1 s margin, 0.5 s forward timeout) the worst
-    /// case adds one settle window, the horizon and a seal window: 37 s more to
-    /// the unsettled `EIO`, and only for a settle a live sequencer reports
-    /// holding. An isolated requester, which hears no `Held`, keeps the
-    /// plain window.
+    /// plus `Deadlines::settle_cap_span`, which covers the waits a hold is
+    /// for, one after the other:
+    ///
+    /// - one reclaim horizon (no renewal is granted once a recall starts, so
+    ///   every outwait of a generation ends within it);
+    /// - the takeover window, for a generation inherited after a fast
+    ///   takeover (its outwait ends a horizon and the takeover window past
+    ///   the tenure's start);
+    /// - a seal window: the longer of two forward timeouts and the release
+    ///   seal's retry (`max(T, F)`);
+    /// - the delegation lane's request timeout, which the outwait hold adds
+    ///   to the outwait's end;
+    /// - two settle windows (the first deadline's and the last answer's).
+    ///
+    /// With the defaults (lease TTL 60 s: a 30 s window; 5 s grant TTL, 1 s
+    /// margin, 0.5 s forward timeout, 1.5 s takeover window) the worst case
+    /// adds one settle window, the horizon, the takeover window, a seal window
+    /// and the request timeout: 39.5 s more to the unsettled `EIO`, and only
+    /// for a settle a live sequencer reports holding. An isolated requester,
+    /// which hears no `Held`, keeps the plain window.
     ///
     /// Why a settled `EIO` means "did not, and will not, happen": the
     /// refusal is a committed row of the sequencer in force for the op's
@@ -4148,13 +4158,9 @@ impl Core {
         }
         // The settle may be moved later (the sequencer holding it for a
         // generation it outwaits, a lapsed generation of this node's), but
-        // never past one reclaim horizon (no renewal after a recall starts),
-        // a seal window and a settle window from here.
-        let cap =
-            until
-                .max(now.wait.plus(
-                    2 * window + self.reclaim_horizon_ms() + 2 * self.cfg.forward_timeout_ms,
-                ));
+        // never past `Deadlines::settle_cap_span` from here: the waits it
+        // holds for, in the order they can follow each other.
+        let cap = until.max(now.wait.plus(self.dl_t().settle_cap_span));
         let old = c.deadline;
         self.cancel_timer(old, out);
         let deadline = self.set_timer_wait(until, Timer::ClientDeadline(rid), out);

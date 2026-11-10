@@ -807,8 +807,9 @@ hears the unsettled `EIO` at the deadlines, counted apart
 [ADR-45](DECISIONS.md#adr-45-an-op-sent-to-a-non-stealable-holder-is-never-refused-for-good)). The
 settle window is the least: a root that holds the settle for the end of a
 generation it outwaits says so (`Held`'s `outwait_ms`) and the client waits for
-it, at most two settle windows, a reclaim horizon and a seal window past the
-settle's start (67 s after it with the defaults instead of 30 s;
+it, at most two settle windows, a reclaim horizon, a takeover window, a seal
+window and a delegation request timeout past the settle's start (69.5 s after
+it with the defaults instead of 30 s;
 [ADR-18](DECISIONS.md#adr-18-exactly-once-forwarding-with-request-ids)). The
 same identity makes replays, backup re-shipping, inbox drains and delegate
 streams exactly-once without further machinery
