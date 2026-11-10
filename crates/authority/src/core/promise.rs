@@ -286,7 +286,7 @@ impl Core {
         // The promise the previous process issued, on this clock, for the
         // join gate (plan 43 C7a).
         self.pr.issued = replica
-            .load_promise_issued(now, self.cfg.promise_horizon_span_ms())
+            .load_promise_issued(now, self.dl_t().promise_span as i64)
             .unwrap_or(WaitMs(0));
         self.pr.restored_hold = replica.epoch_hold_persisted();
         self.pr.persisted_hold = self.pr.restored_hold;

@@ -79,13 +79,28 @@ pub struct Deadlines {
     /// A, the client deadline.
     pub client_deadline: u64,
     /// w: the settle window.
+    /// w: the settle window actually used: a quarter of the client deadline
+    /// unless a knob is set, and never more than half of it.
     pub settle_window: u64,
     /// A client op's own attempts end this long after its submit: `A - w`.
     pub attempts: u64,
     pub inbox_attempts: u64,
     /// The span of the settle cap past a settle's start.
     pub settle_cap_span: u64,
+    /// The bound a placeholder waits for its requester's retry:
+    /// `drop_held_await_ms`, else the cap, and never more than the cap,
+    /// `A - 2w` floored at one settle window (a settle window of half the
+    /// deadline would make the cap 0, and a placeholder would be settled on
+    /// the first tick, before its requester could retry). An own op on a
+    /// placeholder's keys waits behind it, then for the settle's row to
+    /// commit (one settle window), and must still execute inside its own
+    /// window, `A - w`.
     pub drop_held_await: u64,
+    /// How long a requester's shadow of a non-stealable answer may wait for
+    /// its rid's outcome in the log, by the wall clock, before it is rolled
+    /// back and replayed: `drop_held_await_ms`, else the client deadline.
+    /// Not the placeholder bound's cap: the shadow's owner may hold its row
+    /// for a whole client deadline.
     pub stale_shadow_after: u64,
     /// DRT: the request timeout of the delegation lane.
     pub deleg_request_timeout: u64,
@@ -103,16 +118,38 @@ pub struct Deadlines {
     pub leave_resend: u64,
     pub leave_note_lapse: u64,
     pub read_block: u64,
+    /// The longest a persisted read-grant horizon leads the write that makes
+    /// it: a read delegation's TTL, the margin the owner outwaits it by, and
+    /// the second the write rounds up by.
     pub read_span: u64,
+    /// The same for the lock-grant horizon: the longest grant (a lock's TTL,
+    /// or a delegation's), its margin, the quarter TTL a renewal's write
+    /// rounds up by and the second the write rounds up by.
     pub lock_span: u64,
+    /// The same for the takeover floor a successor persists: the takeover
+    /// window, the longer of a read delegation's and a lock's TTL, the
+    /// write-delegation TTL, three margins and the second the write rounds
+    /// up by.
     pub floor_span: u64,
+    /// The same for the last promise this node issued.
     pub promise_span: u64,
     /// The takeover ack floor without the reclaim horizon term
     /// ([`Deadlines::ack_floor`] adds it).
     pub ack_floor_reads: u64,
     pub ack_floor_locks: u64,
+    /// The longest bound a lock owner that cannot grant yet can have (a fast
+    /// successor's floor: the takeover window, the longest grant, the
+    /// delegations' reclaim horizon and the two margins), and the bound an
+    /// op without its sequencer has on top, for the failover before it.
     pub lock_grace_wait_max: u64,
+    /// The one bound of every wait a non-blocking lock request takes for an
+    /// owner that cannot grant yet, from the request's start: a stale owner's
+    /// lease (just renewed, plus the margin skew may add), its backup's
+    /// acquisition, and the successor's grace. Finite for every
+    /// configuration.
     pub lock_owner_wait_max: u64,
+    /// How soon a non-blocking lock request told to wait for an owner that
+    /// cannot say when it may grant asks again, the first time.
     pub lock_poll: u64,
     pub lock_min_grant: u64,
     pub lock_renew_gap: u64,

@@ -3688,7 +3688,7 @@ impl Driver {
                                 self.oracles.note_unsettled(
                                     self.id,
                                     rid,
-                                    self.core.config().settle_window(),
+                                    self.core.dl_t().settle_window,
                                     started,
                                     held,
                                     accepted,

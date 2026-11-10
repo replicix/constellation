@@ -419,11 +419,7 @@ impl Core {
             let old = c.deadline;
             self.cancel_timer(old, out);
             // Plan 43 C2: the op's own attempts end a settle window early.
-            let tries_for = self
-                .cfg
-                .inbox_deadline_ms
-                .saturating_sub(self.cfg.settle_window())
-                .max(self.cfg.inbox_deadline_ms / 2);
+            let tries_for = self.dl_t().inbox_attempts;
             let deadline =
                 self.set_timer_wait(now.wait.plus(tries_for), Timer::ClientDeadline(rid), out);
             self.clients.get_mut(&rid).expect("present").deadline = deadline;

@@ -3168,7 +3168,7 @@ impl Core {
     /// fast takeover left is read for `acquire_won`.
     pub(crate) fn floor_start(&mut self, now: Now, replica: &dyn Replica) {
         self.ack.floor_mark = replica.takeover_floor_pending();
-        if let Some(until) = replica.load_takeover_floor(now, self.cfg.floor_horizon_span_ms()) {
+        if let Some(until) = replica.load_takeover_floor(now, self.dl_t().floor_span as i64) {
             tracing::info!(
                 node = self.cfg.node_id,
                 wait_ms = until.since(now.wait),

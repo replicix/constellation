@@ -609,9 +609,9 @@ impl Core {
         let tries_for = if settle {
             // (A placeholder's settle runs for one settle window; unanswered,
             // it ends in doubt and the drain settles again.)
-            self.cfg.settle_window()
+            self.dl_t().settle_window
         } else if Self::settles(origin, policy) {
-            self.cfg.acquire_deadline_ms - self.cfg.settle_window()
+            self.cfg.acquire_deadline_ms - self.dl_t().settle_window
         } else {
             self.cfg.acquire_deadline_ms
         };
@@ -700,7 +700,7 @@ impl Core {
             // op's own is ever routed.
             // It gets the same window and cap as a settle that began at a
             // deadline, so the outwait hold applies to it too (I4).
-            let window = self.cfg.settle_window();
+            let window = self.dl_t().settle_window;
             let cap = now
                 .wait
                 .plus(2 * window + self.reclaim_horizon_ms() + 2 * self.cfg.forward_timeout_ms);
@@ -1838,7 +1838,7 @@ impl Core {
                 // deadline moves past it (never earlier), at most to the
                 // settle's cap.
                 if let Some(d) = outwait_ms {
-                    let window = self.cfg.settle_window();
+                    let window = self.dl_t().settle_window;
                     let want = self
                         .clients
                         .get(&rid)
@@ -3928,7 +3928,7 @@ impl Core {
                     let rest = due.0.saturating_sub(now.honour.0).max(0) as u64;
                     let want = now
                         .wait
-                        .plus(rest + self.cfg.settle_window())
+                        .plus(rest + self.dl_t().settle_window)
                         .min(settle_cap);
                     if self.extend_settle_deadline(rid, want, Some(now.wait), out) {
                         self.stats.settles_extended_for_lapsed_gen += 1;
@@ -4037,7 +4037,7 @@ impl Core {
         // full deadline when the early S3-less one started it. (An inbox
         // op's own attempts end early by the inbox's deadline: its settle
         // still has the rest of the client's.)
-        let window = self.cfg.settle_window();
+        let window = self.dl_t().settle_window;
         let full = c.submitted.plus(self.cfg.acquire_deadline_ms);
         let mut until = now.wait.plus(window);
         if s3_less {

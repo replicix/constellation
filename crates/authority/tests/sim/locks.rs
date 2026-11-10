@@ -84,7 +84,7 @@ pub struct LockCounters {
     /// again after `retry_ms`.
     pub grace_waits: u64,
     /// A non-blocking request that waited past the engine's bound
-    /// (`Config::lock_owner_wait_max_ms`) and gave up, `EAGAIN` in the
+    /// (`Deadlines::lock_owner_wait_max`) and gave up, `EAGAIN` in the
     /// engine.
     pub wait_gave_up: u64,
     pub unavailable: u64,
@@ -1021,9 +1021,10 @@ pub async fn client_lock(
     let deadline = t0 + LOCK_WAIT_CAP_MS;
     // A non-blocking request told to wait gives up at the engine's bound
     // (`ClusterLocks::owner_wait_max`), inside the cap.
-    let nb_bound = (cluster.env.config)(node, inc)
-        .lock_owner_wait_max_ms()
-        .min(LOCK_WAIT_CAP_MS - 1_000);
+    let nb_bound =
+        constellation_authority::deadlines::Deadlines::new(&(cluster.env.config)(node, inc))
+            .lock_owner_wait_max
+            .min(LOCK_WAIT_CAP_MS - 1_000);
     let stuck = |h: &NodeHandle| {
         format!(
             "lock client t{thread} on node {node}: {:?} lock on {name} ({ino:#x}) not \
@@ -1309,7 +1310,11 @@ pub async fn client_lock(
                     );
                 }
             }
-            let cap = (cluster.env.config)(node, inc).lock_owner_wait_max_ms() + PARK_CAP_SLACK_MS;
+            let cap = constellation_authority::deadlines::Deadlines::new(&(cluster.env.config)(
+                node, inc,
+            ))
+            .lock_owner_wait_max
+                + PARK_CAP_SLACK_MS;
             if clock.elapsed_ms() > started + cap {
                 failures.lock().unwrap().push(format!(
                     "lock client t{thread} on node {node}: parked on {ino:#x} since t={started} \

@@ -340,8 +340,8 @@ pub struct Engine {
     /// for a recalled grant.
     locks_cluster: bool,
     /// Plan 43 F-b: how long a non-blocking lock request waits for an
-    /// owner that cannot grant yet (`Config::lock_owner_wait_max_ms`), and
-    /// how often it first asks again (`Config::lock_poll_ms`).
+    /// owner that cannot grant yet (`Deadlines::lock_owner_wait_max`), and
+    /// how often it first asks again (`Deadlines::lock_poll`).
     lock_owner_wait_max_ms: u64,
     lock_poll_ms: u64,
     lock_flushers: Arc<crate::locks::LockFlushers>,
@@ -1097,8 +1097,10 @@ impl Engine {
         // Plan 30 §M14: cluster locks need a P2P path to the sequencer.
         let locks_cluster = crate::locks::cluster_effective(locks, peers.is_enabled())?;
         core_config.locks = locks_cluster;
-        let lock_owner_wait_max_ms = core_config.lock_owner_wait_max_ms();
-        let lock_poll_ms = core_config.lock_poll_ms();
+        let lock_owner_wait_max_ms =
+            constellation_authority::deadlines::Deadlines::new(&core_config).lock_owner_wait_max;
+        let lock_poll_ms =
+            constellation_authority::deadlines::Deadlines::new(&core_config).lock_poll;
         tracing::info!(
             locks = if locks_cluster { "cluster" } else { "local" },
             "file locks"
