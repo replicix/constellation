@@ -8112,6 +8112,7 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "tail_beyond_gap_dropped",
             "inherited_tails_cleared",
             "ttl_claims_without_tail",
+            "touched_unknown_submits",
         ],
     );
     blake3::hash(text.as_bytes()).to_hex().to_string()[..16].to_string()

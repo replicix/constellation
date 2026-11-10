@@ -31,7 +31,6 @@ pub(crate) struct Fence {
 
 /// `Fence::touched_gen` of a rid whose send history is not known here (a
 /// replay, a fast-path in-doubt resubmission, an evicted record).
-#[allow(dead_code)]
 pub(crate) const TOUCHED_UNKNOWN: u64 = u64::MAX;
 
 /// The keys `op` reads or writes, before it runs (a refusal touches

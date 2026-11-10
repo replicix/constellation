@@ -1155,6 +1155,9 @@ pub struct Stats {
     /// generation, and ops routed afresh past the resend limit.
     pub fenced_resends: u64,
     pub fence_bounce_limit: u64,
+    /// ADR-47: submissions whose send history is unknown (a replay, a
+    /// fast-path in-doubt resubmission, an evicted or older-incarnation rid).
+    pub touched_unknown_submits: u64,
     pub deleg_designated: u64,
     /// Plan 46 M1.3 step 4: sticky grants made (a stream's first or a growth).
     pub deleg_sticky: u64,
@@ -2159,6 +2162,12 @@ pub struct Core {
     /// the mark that keeps a resubmission out of the inbox (I1). Evicted
     /// with `in_doubt_rids` (`MAX_IN_DOUBT_RIDS`, a known I1 bound).
     in_doubt_designee_rids: std::collections::BTreeSet<Rid>,
+    /// ADR-47: the `touched_gen` of the rids in `in_doubt_rids` (non-zero
+    /// values only); a resubmission starts from it.
+    in_doubt_touched: std::collections::BTreeMap<Rid, u64>,
+    /// ADR-47: the highest own rid evicted from `in_doubt_rids`; an own rid
+    /// at or below it is submitted with an unknown send history.
+    in_doubt_evicted_max: Option<Rid>,
     /// M13/M5: the durable inbox batch an in-doubt rid left behind, so
     /// its resubmission withdraws it before any P2P forward.
     in_doubt_batches: std::collections::BTreeMap<Rid, Vec<InboxKey>>,
@@ -2350,6 +2359,8 @@ impl Core {
             final_nonholder_refusals: Vec::new(),
             nonstealable_executions: Vec::new(),
             in_doubt_designee_rids: std::collections::BTreeSet::new(),
+            in_doubt_touched: std::collections::BTreeMap::new(),
+            in_doubt_evicted_max: None,
             in_doubt_batches: std::collections::BTreeMap::new(),
             shipped_touches: std::collections::VecDeque::new(),
             shipped_floor: 0,

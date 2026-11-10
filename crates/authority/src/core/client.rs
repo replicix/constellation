@@ -11,7 +11,7 @@
 //! never to a client.
 
 use super::backup::is_answer;
-use super::holder::Fence;
+use super::holder::{Fence, TOUCHED_UNKNOWN};
 use super::{ack_counter, Core, S3For, Timer};
 use crate::action::{Action, AnswerSource, ClientReply, S3Op};
 use crate::event::{PeerMsg, Policy, S3Result};
@@ -68,7 +68,7 @@ pub(crate) enum Phase {
     /// is about to be forwarded to `holder`; the batch is being deleted
     /// first, so no later takeover drain can execute it a second time
     /// (a P2P refusal leaves no `completed` witness to dedup against).
-    InboxWithdraw { holder: NodeId },
+    InboxWithdraw { holder: NodeId, gen: u64 },
     /// Waiting for the acquire job to give this node the lease.
     WaitingLease,
     /// The acquire job answered busy; retrying after a backoff.
@@ -137,7 +137,19 @@ pub(crate) struct ClientOp {
     /// Plan 46 M0.3 (B): the root that last answered this op `Held` (it is
     /// alive and holds the op by design): the backoff retry goes back to
     /// it when this node's cached holder was dropped meanwhile.
-    pub held_by: Option<NodeId>,
+    /// (ADR-47: with the generation to route the retry by; `0`: the lease
+    /// holder.)
+    pub held_by: Option<(NodeId, u64)>,
+    /// ADR-47: the highest non-zero generation this rid was ever sent under
+    /// or offered to locally (`0`: never; `TOUCHED_UNKNOWN`: cannot know),
+    /// monotone over the rid's life on this node; raised before the send or
+    /// the admission it describes, carried on every forward and into the
+    /// inbox batch.
+    pub touched_gen: u64,
+    /// ADR-47: the rid was queued for an inbox batch at some point (or a
+    /// resubmission of a rid that was).
+    #[allow(dead_code)]
+    pub inbox_ever: bool,
     /// ADR-47: `Fenced` answers followed with a resend routed by the
     /// answering generation, since the last reset of `attempts`; past two
     /// the op is routed afresh.
@@ -510,16 +522,32 @@ impl Core {
     /// (`EEXIST`, `ENOENT`), journaled as the rid's second outcome and
     /// answered to the application.
     pub(crate) fn note_in_doubt(&mut self, rid: Rid) {
+        // ADR-47: executed locally under no generation this node can name
+        // (the fast path): its send history is unknown.
         if let Some(c) = self.clients.get_mut(&rid) {
             c.forwarded = true;
+            c.touched_gen = TOUCHED_UNKNOWN;
             return;
         }
         self.in_doubt_rids.insert(rid);
+        self.in_doubt_touched.insert(rid, TOUCHED_UNKNOWN);
+        self.evict_in_doubt();
+    }
+
+    /// Keeps `in_doubt_rids` within `MAX_IN_DOUBT_RIDS`: the lowest rid goes,
+    /// with what was remembered of it. An own rid evicted raises the
+    /// watermark (ADR-47): every own rid at or below it is submitted with an
+    /// unknown send history from then on.
+    fn evict_in_doubt(&mut self) {
         while self.in_doubt_rids.len() > MAX_IN_DOUBT_RIDS {
             let first = *self.in_doubt_rids.iter().next().expect("non-empty");
             self.in_doubt_rids.remove(&first);
             self.in_doubt_batches.remove(&first);
             self.in_doubt_designee_rids.remove(&first);
+            self.in_doubt_touched.remove(&first);
+            if first.node == self.cfg.node_id {
+                self.in_doubt_evicted_max = self.in_doubt_evicted_max.max(Some(first));
+            }
         }
     }
 
@@ -652,6 +680,27 @@ impl Core {
         let redirected_to_designee = resubmitted && self.in_doubt_designee_rids.remove(&rid);
         let in_doubt = matches!(origin, Origin::Replay { .. }) || resubmitted;
         let inbox_keys = self.in_doubt_batches.remove(&rid).unwrap_or_default();
+        // ADR-47: the send history this node can vouch for. Whatever may
+        // have lost it reads as unknown, which only ever holds a refusal.
+        let touched_gen = if matches!(origin, Origin::Replay { .. }) {
+            // The queue entry: its history is not known here.
+            TOUCHED_UNKNOWN
+        } else if resubmitted {
+            // (A fast-path in-doubt resubmission, `Event::SubmitInDoubt`,
+            // put `TOUCHED_UNKNOWN` there itself.)
+            self.in_doubt_touched.remove(&rid).unwrap_or(0)
+        } else if rid.node == self.cfg.node_id
+            && (rid.incarnation < self.cfg.incarnation
+                || self.in_doubt_evicted_max.is_some_and(|m| rid <= m))
+        {
+            TOUCHED_UNKNOWN
+        } else {
+            0
+        };
+        if touched_gen == TOUCHED_UNKNOWN {
+            self.stats.touched_unknown_submits += 1;
+        }
+        let inbox_ever = !inbox_keys.is_empty();
         self.next_client_order += 1;
         self.clients.insert(
             rid,
@@ -665,6 +714,8 @@ impl Core {
                 attempts: 0,
                 redirected: 0,
                 held_by: None,
+                touched_gen,
+                inbox_ever,
                 fence_bounces: 0,
                 forwarded: in_doubt,
                 acquire_retries: 0,
@@ -752,7 +803,7 @@ impl Core {
                             self.stats.deps_overflow_to_root += 1;
                         } else if self.reaches(now, d.node) {
                             self.stats.deleg_forwarded += 1;
-                            self.send_forward(now, rid, d.node, 0, replica, out);
+                            self.send_forward(now, rid, d.node, d.gen, replica, out);
                             return;
                         }
                     }
@@ -1417,6 +1468,10 @@ impl Core {
             return;
         };
         c.sent_to_delegate |= to_delegate;
+        // ADR-47: the rid is touched by the generation this send is routed
+        // by from here on, whether the send leaves now or after the batch
+        // withdrawal below; the value travels with it.
+        c.touched_gen = c.touched_gen.max(routed_gen);
         if let Some(&key) = c.inbox_keys.first() {
             // Withdraw the durable batches (one at a time, every one the
             // rid was submitted in) before the holder can see the op
@@ -1430,7 +1485,10 @@ impl Core {
             // past it to this node's later batches instead of stopping at
             // a hole (co-batched ops are re-submitted by
             // `on_inbox_withdrawn`).
-            c.phase = Phase::InboxWithdraw { holder };
+            c.phase = Phase::InboxWithdraw {
+                holder,
+                gen: routed_gen,
+            };
             self.cancel_timer(timer, out);
             self.inbox.pending.remove(&rid);
             let batch = constellation_store_s3::inbox::InboxBatch::tombstone(
@@ -1475,8 +1533,7 @@ impl Core {
                 tag: c.tag.clone(),
                 settle: c.settle,
                 routed_gen,
-                // (Carried from the send history by a later chunk.)
-                touched_gen: 0,
+                touched_gen: c.touched_gen,
             },
         });
     }
@@ -1820,7 +1877,7 @@ impl Core {
                     c.phase = Phase::Backoff;
                     c.timer = Some(timer);
                     c.designation_held = true;
-                    c.held_by = Some(from);
+                    c.held_by = Some((from, 0));
                 }
             }
             MutateOutcome::Held {
@@ -1867,9 +1924,9 @@ impl Core {
                 if let Some(c) = self.clients.get_mut(&rid) {
                     c.phase = Phase::Backoff;
                     c.timer = Some(timer);
-                    // (A delegate's `Held` names no root: `gen == 0` only,
-                    // as for the cached holder above.)
-                    c.held_by = (gen == 0).then_some(from);
+                    // (A delegate's `Held` names its generation: the retry
+                    // goes back to it routed by that.)
+                    c.held_by = Some((from, gen));
                 }
                 // Only an acknowledgement waiting for durability that
                 // needs this node's chunks says `Upload`; a recall's, a
@@ -1933,7 +1990,7 @@ impl Core {
                         c.redirected_to_designee = true;
                     }
                     self.stats.forward_redirects += 1;
-                    self.send_forward(now, rid, holder, 0, replica, out);
+                    self.send_forward(now, rid, holder, gen, replica, out);
                 } else {
                     self.lease_path(now, rid, replica, out);
                 }
@@ -2197,11 +2254,12 @@ impl Core {
         let cached = self
             .lease
             .cached_holder
+            .map(|h| (h, 0))
             .or(held_by)
-            .filter(|h| *h != self.cfg.node_id);
+            .filter(|(h, _)| *h != self.cfg.node_id);
         match cached {
-            Some(holder) if self.reaches(now, holder) => {
-                self.send_forward(now, rid, holder, 0, replica, out)
+            Some((holder, routed)) if self.reaches(now, holder) => {
+                self.send_forward(now, rid, holder, routed, replica, out)
             }
             _ => self.route(now, rid, replica, out),
         }
@@ -4180,7 +4238,7 @@ impl Core {
                         .get(&d.gen)
                         .is_some_and(|g| g.recall != super::delegate::RecallPhase::None);
                     if d.node != self.cfg.node_id && self.reaches(now, d.node) && !recalling {
-                        self.send_forward(now, rid, d.node, 0, replica, out);
+                        self.send_forward(now, rid, d.node, d.gen, replica, out);
                         return;
                     }
                 }
@@ -4500,12 +4558,10 @@ impl Core {
                 }
                 if c.forwarded || c.attempts > 0 {
                     self.in_doubt_rids.insert(rid);
-                    while self.in_doubt_rids.len() > MAX_IN_DOUBT_RIDS {
-                        let first = *self.in_doubt_rids.iter().next().expect("non-empty");
-                        self.in_doubt_rids.remove(&first);
-                        self.in_doubt_batches.remove(&first);
-                        self.in_doubt_designee_rids.remove(&first);
+                    if c.touched_gen != 0 {
+                        self.in_doubt_touched.insert(rid, c.touched_gen);
                     }
+                    self.evict_in_doubt();
                     if c.redirected_to_designee {
                         self.in_doubt_designee_rids.insert(rid);
                     }
