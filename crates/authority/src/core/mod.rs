@@ -239,7 +239,7 @@ pub struct Config {
     /// back another node's unanswered row; `StrandedOp::await_retry`)
     /// waits for its requester's retry before the sequencer in force
     /// settles the rid (`Refused { rid, ABANDONED }`). `0` (the default) is
-    /// the cap, `acquire_deadline_ms - 2 * settle_window()` (60 s at the
+    /// the cap, `acquire_deadline_ms - 2 * settle_window` (60 s at the
     /// defaults): a larger value is clamped to it
     /// ([`Config::drop_held_await`]) so that an own op on the placeholder's
     /// keys still has its window left when the requester is dead. The clock
@@ -563,142 +563,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Plan 43 C7b (D6): a lock grace after a released lease ends `lock_ttl
-    /// + 2 margins` after its taker first saw the release
-    /// (`Core::lock_on_released_takeover`), and a TTL successor of a tenure
-    /// that inherited it arms no floor of its own: the grace must fit inside
-    /// one lease TTL for that successor to find every grant of the old
-    /// tenure over. `load_config` warns when it does not.
-    pub fn lock_grace_fits_lease(&self) -> bool {
-        self.lock_ttl_ms + 2 * self.expiry_margin_ms <= self.ttl_ms
-    }
-
-    /// How long a non-blocking lock request may wait for an owner that
-    /// cannot grant yet (plan 43 F-b) before it gives up with `EAGAIN`:
-    /// the longest bound such an owner can have (a fast successor's
-    /// floor: the takeover window, the longest grant, the delegations'
-    /// reclaim horizon and the two margins), and the bound an op without
-    /// its sequencer has on top, for the failover that precedes it.
-    pub fn lock_grace_wait_max_ms(&self) -> u64 {
-        self.backup_takeover_ms
-            + self.read_delegation_ttl_ms.max(self.lock_ttl_ms)
-            + (self.delegation_ttl_ms + self.expiry_margin_ms)
-            + 2 * self.expiry_margin_ms
-            + self.s3_less_deadline_ms
-    }
-
-    /// Plan 46 M0.2 (R5): the bound a placeholder waits for its requester's
-    /// retry: `drop_held_await_ms`, else the cap -- and never more than the
-    /// cap, `acquire_deadline_ms - 2 * settle_window()` (60 s at the
-    /// defaults, 6 s in the simulation). An own op on a placeholder's keys
-    /// waits behind it, then for the settle's row to commit (one settle
-    /// window), and must still execute inside its own window,
-    /// `acquire_deadline_ms - settle_window()` (`Core::submit_as`): with a
-    /// bound at the whole client deadline it never could, and with the
-    /// requester gone every such op ended in `EIO`. A live requester is
-    /// nudged at once (R4's `Busy`) and retries within its forward backoff;
-    /// one partitioned for longer than the bound meets the settled refusal.
-    pub fn drop_held_await(&self) -> u64 {
-        // (Floored at one settle window: a settle window of half the
-        // deadline would make the cap 0, and a placeholder would be settled
-        // on the first tick, before its requester could retry.)
-        let cap = self
-            .acquire_deadline_ms
-            .saturating_sub(2 * self.settle_window())
-            .max(self.settle_window());
-        match self.drop_held_await_ms {
-            0 => cap,
-            ms => ms.min(cap),
-        }
-    }
-
-    /// Plan 46 M0.2 review (R7): how long a requester's shadow of a
-    /// non-stealable answer may wait for its rid's outcome in the log, by
-    /// the wall clock, before it is rolled back and replayed
-    /// (`Meta::strand_stale_shadows`): `drop_held_await_ms`, else the client
-    /// deadline. Not the placeholder bound's cap ([`Self::drop_held_await`],
-    /// which the follow-up halved): the shadow's owner may hold its row for a
-    /// whole client deadline, and cutting the wait in half would roll back
-    /// shadows whose rows are still on their way.
-    pub fn stale_shadow_after(&self) -> u64 {
-        match self.drop_held_await_ms {
-            0 => self.acquire_deadline_ms,
-            ms => ms,
-        }
-    }
-
-    /// Plan 43 C2 (§5.3 item 5): the settle window actually used: a quarter
-    /// of the client deadline unless one is set, and never more than half
-    /// of it.
-    pub fn settle_window(&self) -> u64 {
-        match self.settle_window_ms {
-            0 => self.acquire_deadline_ms / 4,
-            ms => ms.min(self.acquire_deadline_ms / 2),
-        }
-    }
-
-    /// Plan 43 C7a: the longest a persisted read-grant horizon leads the
-    /// write that makes it, ms: a read delegation's TTL, the margin the owner
-    /// outwaits it by, and the second the write rounds up by. What a horizon
-    /// an older build wrote (which carries no span) is waited out for at
-    /// start; a span beyond twice it is waited out up to
-    /// `meta::store::horizon::MAX_SPAN_MS` (a longer TTL before the restart
-    /// is legitimate; only a corrupt value is cut).
-    pub fn read_horizon_span_ms(&self) -> i64 {
-        (self.read_delegation_ttl_ms + self.expiry_margin_ms + 1_000) as i64
-    }
-
-    /// The same for the lock-grant horizon: the longest grant (a lock's TTL,
-    /// or a delegation's, which a delegation carry can install as a lock
-    /// grant), its margin, the quarter TTL a renewal's write rounds up by and
-    /// the second the write rounds up by.
-    pub fn lock_horizon_span_ms(&self) -> i64 {
-        let ttl = self.lock_ttl_ms.max(self.delegation_ttl_ms);
-        (ttl + ttl / 4 + self.expiry_margin_ms + 1_000) as i64
-    }
-
-    /// The same for the takeover floor a successor persists (plan 43 C7a,
-    /// commit 4): the floor's bound at its longest (the takeover window, the
-    /// longer of a read delegation's and a lock's TTL, the write-delegation
-    /// reclaim horizon, two margins) and the second the write rounds up by.
-    /// Only read for a value without a boot (the key is new: none exists).
-    pub fn floor_horizon_span_ms(&self) -> i64 {
-        (self.backup_takeover_ms
-            + self.read_delegation_ttl_ms.max(self.lock_ttl_ms)
-            + self.delegation_ttl_ms
-            + 3 * self.expiry_margin_ms
-            + 1_000) as i64
-    }
-
-    /// The same for the last promise this node issued.
-    pub fn promise_horizon_span_ms(&self) -> i64 {
-        (self.promise_ttl_ms + 1_000) as i64
-    }
-
-    /// The one bound of every wait a non-blocking lock request takes for an
-    /// owner that cannot grant yet, from the request's start (plan 43 F-b):
-    /// a grace, a tenure's floor, a stale or an unreachable owner. A stale
-    /// owner is the lease holder cut from S3, whose lease may have just been
-    /// renewed (`ttl_ms`, and the margin that clock skew may add to its
-    /// expiry), until its backup seals and acquires (`acquire_retry_max_ms`
-    /// at most), and then its successor's grace ([`Self::lock_grace_wait_max_ms`]).
-    /// Finite for every configuration, so a wait never lasts for ever,
-    /// not even one for a continuation epoch with no successor.
-    pub fn lock_owner_wait_max_ms(&self) -> u64 {
-        self.ttl_ms
-            + self.expiry_margin_ms
-            + self.acquire_retry_max_ms
-            + self.lock_grace_wait_max_ms()
-    }
-
-    /// How soon a non-blocking lock request told to wait for an owner that
-    /// cannot say when it may grant (a floor, a barrier, a stale or an
-    /// unreachable owner) asks again, the first time; the engine backs off
-    /// from there to a second.
-    pub fn lock_poll_ms(&self) -> u64 {
-        (self.forward_backoff_ms / 4).max(10)
-    }
-
     /// The delegation TTL a deployment gets when it sets none: the lock
     /// TTL, and at least the core's own 5 s. One rule for every host of the
     /// core: the daemon's default (`CONSTELLATION_DELEGATION_TTL_MS` unset)
@@ -2553,6 +2417,13 @@ impl Core {
 
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// The bounds derived from this core's configuration (computed on use,
+    /// not held: the configuration can still change under a core, as the
+    /// promise TTL does when a promise clamps it).
+    pub fn dl_t(&self) -> crate::deadlines::Deadlines {
+        crate::deadlines::Deadlines::new(&self.cfg)
     }
 
     pub fn node_id(&self) -> NodeId {

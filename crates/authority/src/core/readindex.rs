@@ -296,7 +296,7 @@ impl Core {
         // Not gated on `read_delegations`: the horizon is also the takeover
         // floor's read part (`persist_floor`), which is armed whatever that
         // setting, and acknowledgements wait on it as on a grant's.
-        if let Some(until) = replica.load_grant_quarantine(now, self.cfg.read_horizon_span_ms()) {
+        if let Some(until) = replica.load_grant_quarantine(now, self.dl_t().read_span as i64) {
             tracing::info!(
                 node = self.cfg.node_id,
                 wait_ms = until.since(now.wait),
@@ -2766,11 +2766,12 @@ impl Core {
     }
 
     fn read_retry(&mut self, now: Now, op: OpId, out: &mut Vec<Action>) {
+        let poll = self.dl_t().lock_poll;
         let Some(r) = self.rd.reads.get_mut(&op) else {
             return;
         };
         r.attempts += 1;
-        let delay = (self.cfg.forward_backoff_ms / 4).max(10) * u64::from(r.attempts.min(8));
+        let delay = poll * u64::from(r.attempts.min(8));
         self.set_timer_wait(now.wait.plus(delay), Timer::ReadIndexRetry(op), out);
     }
 

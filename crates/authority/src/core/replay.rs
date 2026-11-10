@@ -200,7 +200,7 @@ impl Core {
         // owner's row never does, it is rolled back and replayed after the
         // bound (`drop_held_await_ms`).
         if replica.has_outstanding_speculation() {
-            let cutoff = now.wall.0 - self.cfg.stale_shadow_after() as i64;
+            let cutoff = now.wall.0 - self.dl_t().stale_shadow_after as i64;
             if let Ok(stranded) = replica.strand_stale_shadows(cutoff) {
                 if stranded.any() {
                     self.stats.speculation_rolled_back +=
@@ -816,7 +816,7 @@ impl Core {
             .get(&entry.queue_seq)
             .copied()
             .unwrap_or(0);
-        if waited < self.cfg.drop_held_await()
+        if waited < self.dl_t().drop_held_await
             || self.epoch_refuses_writes()
             || self.clients.contains_key(&entry.rid)
         {

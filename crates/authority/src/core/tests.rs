@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::action::{ClientReply, S3Op};
+use crate::deadlines::Deadlines;
 use crate::event::{CasFailure, PeerMsg, Policy, S3Result, UploadResult};
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::{
@@ -697,7 +698,7 @@ fn a_cold_claim_of_a_longer_lived_lease_is_not_cut_off_by_the_client_deadline() 
         "{out:?}"
     );
     let last = timers(&out, TimerKind::ClientDeadline)[0];
-    h.advance(h.core.cfg.settle_window());
+    h.advance(h.core.dl_t().settle_window);
     let out = h.step(Event::Timer { id: last });
     assert_eq!(replies(&out).len(), 1, "{out:?}");
 }
@@ -20188,7 +20189,7 @@ mod locks {
         assert!(matches!(lock(&mut h, 5, ino), LockAnswer::Granted { .. }));
         assert_eq!(
             h.meta
-                .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms()),
+                .load_lock_quarantine(h.clk(), h.core.dl_t().lock_span as i64),
             None
         );
         let restart = |h: Harness| {
@@ -20254,7 +20255,7 @@ mod locks {
         let (g2, _) = granted(&lock_replies(&out)[0].2);
         let granted_horizon = h
             .meta
-            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms())
+            .load_lock_quarantine(h.clk(), h.core.dl_t().lock_span as i64)
             .unwrap()
             .0;
         let ttl = h.core.lock_ttl_ms();
@@ -20318,7 +20319,7 @@ mod locks {
         );
         let horizon = h
             .meta
-            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms())
+            .load_lock_quarantine(h.clk(), h.core.dl_t().lock_span as i64)
             .unwrap()
             .0;
         assert!(horizon >= renewed_until, "{horizon} < {renewed_until}");
@@ -20592,7 +20593,7 @@ mod locks {
         // node 2 was told of.
         let horizon = h
             .meta
-            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms())
+            .load_lock_quarantine(h.clk(), h.core.dl_t().lock_span as i64)
             .expect("quarantined")
             .0;
         assert!(horizon >= answered, "{horizon} < {answered}");
@@ -20614,7 +20615,7 @@ mod locks {
         assert!(renewed_until > answered);
         let horizon = h
             .meta
-            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms())
+            .load_lock_quarantine(h.clk(), h.core.dl_t().lock_span as i64)
             .expect("quarantined")
             .0;
         assert!(horizon >= renewed_until, "{horizon} < {renewed_until}");
@@ -21747,7 +21748,7 @@ mod locks {
             .unwrap();
         let until = h
             .meta
-            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms())
+            .load_lock_quarantine(h.clk(), h.core.dl_t().lock_span as i64)
             .expect("quarantined")
             .0;
         let now = h.now;
@@ -22551,7 +22552,7 @@ mod locks {
 
     /// How long an asked waiter's turn is held (`lock_ask_again_wait_ms`).
     fn ask_wait(h: &Harness) -> u64 {
-        2 * (h.core.cfg.recall_hold_ms + h.core.cfg.lock_poll_ms())
+        2 * (h.core.cfg.recall_hold_ms + h.core.dl_t().lock_poll)
     }
 
     /// Fire the waiter tick `tick` and return the one it armed.
@@ -23999,7 +24000,7 @@ mod locks {
             .unwrap();
         let until = h
             .meta
-            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms())
+            .load_lock_quarantine(h.clk(), h.core.dl_t().lock_span as i64)
             .expect("quarantined")
             .0;
         let now = h.now;
@@ -26846,7 +26847,7 @@ mod locks {
             .unwrap();
         let until = h
             .meta
-            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms());
+            .load_lock_quarantine(h.clk(), h.core.dl_t().lock_span as i64);
         assert!(until.is_some(), "no quarantine from the persisted horizon");
         let now = h.now;
         h.core.locks_start(Now::same(now.0), &h.meta);
@@ -27607,12 +27608,15 @@ mod locks {
     #[test]
     fn the_owner_wait_bound_covers_a_stale_owner_and_its_successors_grace() {
         let mut cfg = Config::defaults(1, 1);
-        assert_eq!(cfg.lock_grace_wait_max_ms(), 49_500);
-        assert_eq!(cfg.lock_owner_wait_max_ms(), 112_500);
+        assert_eq!(Deadlines::new(&cfg).lock_grace_wait_max, 49_500);
+        assert_eq!(Deadlines::new(&cfg).lock_owner_wait_max, 112_500);
         cfg.ttl_ms = 20_000;
-        assert_eq!(cfg.lock_owner_wait_max_ms(), 72_500);
-        assert!(cfg.lock_owner_wait_max_ms() > cfg.ttl_ms + cfg.lock_grace_wait_max_ms());
-        assert_eq!(cfg.lock_poll_ms(), cfg.forward_backoff_ms / 4);
+        assert_eq!(Deadlines::new(&cfg).lock_owner_wait_max, 72_500);
+        assert!(
+            Deadlines::new(&cfg).lock_owner_wait_max
+                > cfg.ttl_ms + Deadlines::new(&cfg).lock_grace_wait_max
+        );
+        assert_eq!(Deadlines::new(&cfg).lock_poll, cfg.forward_backoff_ms / 4);
     }
 
     /// A non-blocking request whose owner cannot be reached (over P2P) is
@@ -31009,7 +31013,7 @@ mod locks {
         h.core.start(Now::same(now.0), &h.meta, &mut Vec::new());
         let horizon = h
             .meta
-            .load_lock_quarantine(h.clk(), h.core.cfg.lock_horizon_span_ms())
+            .load_lock_quarantine(h.clk(), h.core.dl_t().lock_span as i64)
             .expect("quarantined by the renewal")
             .0;
         assert!(horizon >= record, "{horizon} < {record}");
@@ -33043,7 +33047,7 @@ mod locks {
         let stored = h.meta.kv_get("lock_grant_horizon_ms").unwrap().unwrap();
         let stamp = constellation_meta::store::horizon::parse_stamp(
             &stored,
-            h.core.cfg.lock_horizon_span_ms(),
+            h.core.dl_t().lock_span as i64,
         );
         assert_eq!(stamp.wall, h.clk().wall_of_wait(until_wait.plus(1_000)));
         assert_eq!((stamp.span_ms, stamp.boot_id), (left, 1));
@@ -33060,7 +33064,7 @@ mod locks {
                 budget_ppm: 0,
             },
         };
-        let span = h.core.cfg.lock_horizon_span_ms();
+        let span = h.core.dl_t().lock_span as i64;
         assert_eq!(
             h.meta.load_lock_quarantine(restarted, span),
             Some(WaitMs(9 + left))
@@ -33554,7 +33558,7 @@ mod locks {
                 assert_eq!(r.meta.locks().stats().lapse_parks_refused, 1);
             } else {
                 // Past the bound, the tick gives up.
-                let bound = r.core.cfg.lock_owner_wait_max_ms();
+                let bound = r.core.dl_t().lock_owner_wait_max;
                 r.now = Ms(r.now.0 + bound as i64 + 1);
                 let mut tick = timers(&out, TimerKind::LockRenewTick);
                 let id = tick.pop().expect("re-armed");
@@ -36732,7 +36736,7 @@ fn settles_then_in_doubt(h: &mut Harness, out: &[Action], rid: Rid) -> Vec<Actio
     );
     let at = timers(out, TimerKind::ClientDeadline);
     assert_eq!(at.len(), 1, "{out:?}");
-    h.advance(h.core.cfg.settle_window());
+    h.advance(h.core.dl_t().settle_window);
     let out = h.step(Event::Timer { id: at[0] });
     assert!(
         matches!(replies(&out).as_slice(), [(r, ClientReply::InDoubt)] if *r == rid),
@@ -45174,7 +45178,7 @@ mod deleg_group {
         h.now = Ms(lapse_at.0 + 10);
         let deadline = h.core.clients[&rid].deadline;
         let out = h.step(Event::Timer { id: deadline });
-        let window = h.core.cfg.settle_window();
+        let window = h.core.dl_t().settle_window;
         let after = out
             .iter()
             .find_map(|a| match a {
@@ -45220,7 +45224,7 @@ mod deleg_group {
                 .any(|(r, a)| *r == rid && matches!(a, ClientReply::InDoubt)),
             "told in doubt before the root ends the generation: {out:?}"
         );
-        let window = h.core.cfg.settle_window();
+        let window = h.core.dl_t().settle_window;
         let after = out
             .iter()
             .find_map(|a| match a {
@@ -55750,7 +55754,7 @@ mod c2g_settle {
             });
             let first = deadline_timer(&requester, &out);
             let cfg = requester.core.config().clone();
-            requester.advance(cfg.acquire_deadline_ms - cfg.settle_window());
+            requester.advance(cfg.acquire_deadline_ms - Deadlines::new(&cfg).settle_window);
             let out = requester.step(Event::Timer { id: first });
             let Some(PeerMsg::MutateRequest {
                 req, settle: true, ..
@@ -55778,7 +55782,7 @@ mod c2g_settle {
         };
         // 4 s of outwait: the deadline moves to now + 4 s + a window.
         let (mut r, rid, req) = settling();
-        let window = r.core.config().settle_window();
+        let window = r.core.dl_t().settle_window;
         let old = r.core.clients[&rid].deadline;
         let first_until = r.core.clients[&rid].settle_until;
         r.step(held(req, Some(4_000)));
@@ -55839,8 +55843,11 @@ mod c2g_settle {
         let lost = forward_to_1(&out).expect("forwarded");
         let deadline = deadline_timer(&requester, &out);
         let cfg = requester.core.config().clone();
-        assert_eq!(cfg.settle_window(), cfg.acquire_deadline_ms / 4);
-        requester.advance(cfg.acquire_deadline_ms - cfg.settle_window());
+        assert_eq!(
+            Deadlines::new(&cfg).settle_window,
+            cfg.acquire_deadline_ms / 4
+        );
+        requester.advance(cfg.acquire_deadline_ms - Deadlines::new(&cfg).settle_window);
         let out = requester.step(Event::Timer { id: deadline });
         assert!(
             replies(&out).is_empty(),
@@ -55920,7 +55927,7 @@ mod c2g_settle {
         });
         assert!(holder.meta.lookup(ROOT_INO, "y").unwrap().is_some());
         let cfg = requester.core.config().clone();
-        requester.advance(cfg.acquire_deadline_ms - cfg.settle_window());
+        requester.advance(cfg.acquire_deadline_ms - Deadlines::new(&cfg).settle_window);
         let out = requester.step(Event::Timer { id: deadline });
         let settle = forward_to_1(&out).expect("the settle is forwarded");
         // A successor whose log carries the rid's transaction answers it.
@@ -56005,7 +56012,7 @@ mod c2g_settle {
             ClientPhase::Gated
         );
         let cfg = requester.core.config().clone();
-        requester.advance(cfg.acquire_deadline_ms - cfg.settle_window());
+        requester.advance(cfg.acquire_deadline_ms - Deadlines::new(&cfg).settle_window);
         // The gated one: never sent, abandoned here.
         let out = requester.step(Event::Timer { id: d2 });
         assert_eq!(
@@ -56020,7 +56027,7 @@ mod c2g_settle {
         assert_eq!(requester.core.clients.len(), 1);
         let again = timers(&out, TimerKind::ClientDeadline);
         assert_eq!(again.len(), 1, "the settle window's deadline: {out:?}");
-        requester.advance(cfg.settle_window());
+        requester.advance(Deadlines::new(&cfg).settle_window);
         let out = requester.step(Event::Timer { id: again[0] });
         assert_eq!(
             replies(&out),
@@ -56179,7 +56186,7 @@ mod c2g_settle {
         let out = h.step(Event::Timer { id: deadline });
         assert!(replies(&out).is_empty(), "{out:?}");
         let second = h.core.clients[&rid].deadline;
-        h.advance(h.core.cfg.settle_window());
+        h.advance(h.core.dl_t().settle_window);
         let out = h.step(Event::Timer { id: second });
         assert_eq!(replies(&out), vec![(rid, &ClientReply::InDoubt)], "{out:?}");
         assert_eq!(h.core.stats.client_unsettled_eio, 1);
@@ -57688,7 +57695,7 @@ mod c2g_settle {
             l.holder_expires_ms += 1_000_000;
             l.holder_wait_ms += 1_000_000;
         }
-        h.advance(cfg.acquire_deadline_ms - cfg.settle_window());
+        h.advance(cfg.acquire_deadline_ms - Deadlines::new(&cfg).settle_window);
         connect_4(&mut h);
         let id = timers(&submitted, TimerKind::ClientDeadline)[0];
         let out = h.step(Event::Timer { id });
@@ -60014,7 +60021,7 @@ mod await_retry {
         exec_as(&h, RowCommit::ARCHIVE, p, &rename_in_root("broken", "a"));
         drop_held(&h, broken);
         let cfg = h.core.config().clone();
-        let window = cfg.acquire_deadline_ms - cfg.settle_window();
+        let window = cfg.acquire_deadline_ms - Deadlines::new(&cfg).settle_window;
 
         let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
         let mine = h.rid(9);
@@ -60046,10 +60053,10 @@ mod await_retry {
         assert_eq!(h.core.stats.await_retry_settled, 1, "the bound settled p");
         // The arithmetic behind it: the bound, then the settle's commit.
         assert!(
-            cfg.drop_held_await() + cfg.settle_window() <= window,
+            Deadlines::new(&cfg).drop_held_await + Deadlines::new(&cfg).settle_window <= window,
             "bound {} + settle window {} must fit the own op's window {window}",
-            cfg.drop_held_await(),
-            cfg.settle_window()
+            Deadlines::new(&cfg).drop_held_await,
+            Deadlines::new(&cfg).settle_window
         );
     }
 
@@ -60057,29 +60064,39 @@ mod await_retry {
     #[test]
     fn a_configured_bound_above_the_cap_is_clamped() {
         let mut cfg = Config::defaults(1, 1);
-        let cap = cfg.acquire_deadline_ms - 2 * cfg.settle_window();
-        assert_eq!(cfg.drop_held_await(), cap, "the default is the cap");
+        let cap = cfg.acquire_deadline_ms - 2 * Deadlines::new(&cfg).settle_window;
+        assert_eq!(
+            Deadlines::new(&cfg).drop_held_await,
+            cap,
+            "the default is the cap"
+        );
         cfg.drop_held_await_ms = cap * 4;
-        assert_eq!(cfg.drop_held_await(), cap);
+        assert_eq!(Deadlines::new(&cfg).drop_held_await, cap);
         cfg.drop_held_await_ms = cap / 2;
-        assert_eq!(cfg.drop_held_await(), cap / 2);
+        assert_eq!(Deadlines::new(&cfg).drop_held_await, cap / 2);
         // A settle window of half the deadline would make the cap 0: it is
         // floored at one settle window.
         cfg.drop_held_await_ms = 0;
         cfg.settle_window_ms = cfg.acquire_deadline_ms / 2;
-        assert_eq!(cfg.drop_held_await(), cfg.settle_window());
-        assert!(cfg.drop_held_await() > 0);
+        assert_eq!(
+            Deadlines::new(&cfg).drop_held_await,
+            Deadlines::new(&cfg).settle_window
+        );
+        assert!(Deadlines::new(&cfg).drop_held_await > 0);
         // R7's wall-clock cutoff for a non-stealable shadow is not the cap:
         // it keeps its former value, the whole client deadline.
         let prod = Config::defaults(1, 1);
-        assert_eq!(prod.drop_held_await(), 60_000);
-        assert_eq!(prod.stale_shadow_after(), 120_000);
+        assert_eq!(Deadlines::new(&prod).drop_held_await, 60_000);
+        assert_eq!(Deadlines::new(&prod).stale_shadow_after, 120_000);
         let mut set = Config::defaults(1, 1);
         set.drop_held_await_ms = 5_000;
-        assert_eq!(set.stale_shadow_after(), 5_000);
+        assert_eq!(Deadlines::new(&set).stale_shadow_after, 5_000);
         // The production defaults: 120 s deadline, 30 s settle window.
         assert_eq!(Config::defaults(1, 1).acquire_deadline_ms, 120_000);
-        assert_eq!(Config::defaults(1, 1).drop_held_await(), 60_000);
+        assert_eq!(
+            Deadlines::new(&Config::defaults(1, 1)).drop_held_await,
+            60_000
+        );
     }
 
     /// Review MUST 1 (b): with delegation on, an own op was held for every

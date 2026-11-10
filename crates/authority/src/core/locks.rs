@@ -2057,7 +2057,7 @@ impl Core {
     /// How soon a request waiting for this node to own the root again
     /// (`lock_owner_resuming`) asks again.
     pub(crate) fn lock_resume_retry_ms(&self) -> u64 {
-        self.cfg.lock_poll_ms()
+        self.dl_t().lock_poll
     }
 
     /// How long the queue waits for an unreachable waiter's next request
@@ -4416,7 +4416,7 @@ impl Core {
             self.lock_give_up(op, out);
             return;
         }
-        let delay = (self.cfg.forward_backoff_ms / 4).max(10) * u64::from(o.attempts.clamp(1, 8));
+        let delay = self.dl_t().lock_poll * u64::from(o.attempts.clamp(1, 8));
         self.set_timer_wait(now.wait.plus(delay), Timer::LockRetry(op), out);
     }
 
@@ -5309,7 +5309,7 @@ impl Core {
         // Plan 43 C7-F F-c: a lapsing grant asks for its late renewal again
         // until it is answered or gives up, at the owner-poll cadence.
         if replica.locks().lapsing_any() {
-            at = at.min(now.honour.plus(self.cfg.lock_poll_ms().clamp(1, 1_000)));
+            at = at.min(now.honour.plus(self.dl_t().lock_poll.clamp(1, 1_000)));
         }
         at = at.max(self.lock_relearn_floor(now));
         if let Some((t, armed)) = self.lk.renew_timer.zip(self.lk.renew_at) {
@@ -7478,8 +7478,8 @@ impl Core {
         // Plan 43 C7-F F-c: how long a lapsing grant parks its I/O.
         replica
             .locks()
-            .set_lapse_park_ms(self.cfg.lock_owner_wait_max_ms() as i64);
-        if let Some(until) = replica.load_lock_quarantine(now, self.cfg.lock_horizon_span_ms()) {
+            .set_lapse_park_ms(self.dl_t().lock_owner_wait_max as i64);
+        if let Some(until) = replica.load_lock_quarantine(now, self.dl_t().lock_span as i64) {
             tracing::info!(
                 node = self.cfg.node_id,
                 wait_ms = until.since(now.wait),

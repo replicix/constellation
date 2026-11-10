@@ -494,13 +494,13 @@ pub struct ClusterLocks {
     pub lineage: Mutex<LineageCache>,
     /// How long a non-blocking request waits for an owner that cannot
     /// grant yet before it fails `EAGAIN`
-    /// (`constellation_authority::Config::lock_owner_wait_max_ms`): one
+    /// (`constellation_authority::deadlines::Deadlines::lock_owner_wait_max`): one
     /// bound, from the request's start, for every wait on an owner (a
     /// grace, a floor, a stale or an unreachable owner).
     pub owner_wait_max: Duration,
     /// The retry interval an owner hints for a wait it cannot time (a
     /// floor, a barrier, a stale or an unreachable owner:
-    /// `Config::lock_poll_ms`). A request told so again and again asks
+    /// `Deadlines::lock_poll`). A request told so again and again asks
     /// less and less often (twice the last interval, up to a second): a
     /// hundred requests waiting forty seconds for a stale owner would
     /// otherwise ask it two thousand times a second. A hint longer than

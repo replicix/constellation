@@ -704,7 +704,7 @@ pub fn load_config(
     // the mount's `--locks` (`crate::locks::cluster_effective`).
     c.locks = p2p;
     c.lock_ttl_ms = crate::locks::lock_ttl_ms(c.lock_ttl_ms);
-    if !c.lock_grace_fits_lease() {
+    if !constellation_authority::deadlines::Deadlines::new(&c).lock_grace_fits_lease() {
         tracing::warn!(
             lock_ttl_ms = c.lock_ttl_ms,
             expiry_margin_ms = c.expiry_margin_ms,

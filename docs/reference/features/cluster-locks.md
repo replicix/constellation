@@ -1315,7 +1315,7 @@ How it ends:
   on an owner: a stale owner's lease (it may have just been renewed) and
   the margin on its expiry, its backup's acquisition
   (`acquire_retry_max_ms` at most), and the successor's grace with the
-  bound an operation has without a sequencer (`lock_grace_wait_max_ms`:
+  bound an operation has without a sequencer (`lock_grace_wait_max`:
   the takeover window, the longest grant, the delegations' reclaim horizon
   and the two margins, plus 20 s; 49.5 s at the defaults): 112.5 s with the
   defaults, 72.5 s at a 20 s lease. Computed from the node's
