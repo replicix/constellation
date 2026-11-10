@@ -9169,9 +9169,16 @@ mod cto {
         // The requester retries the same rid: re-attached, no answer yet.
         let out = forward(&mut h, 3, 10, 1, setattr(ino));
         assert!(mutate_replies(&out).is_empty(), "{out:?}");
+        // (A waiting requester keeps retrying; a park whose latest message
+        // is older than the freshness bound is not executed.)
+        for (i, at) in [2_000, 4_000, 5_500].into_iter().enumerate() {
+            h.now = granted_at.plus(at);
+            let out = forward(&mut h, 3, 11 + i as u64, 1, setattr(ino));
+            assert!(mutate_replies(&out).is_empty(), "{out:?}");
+        }
         h.now = granted_at.plus(6_000);
         let out = h.step_archived(Event::Timer { id: expiry });
-        let [(3, OpId(10), MutateOutcome::Accepted { .. })] = mutate_replies(&out).as_slice()
+        let [(3, OpId(13), MutateOutcome::Accepted { .. })] = mutate_replies(&out).as_slice()
         else {
             panic!("expected the reply to the retry: {out:?}")
         };
@@ -9237,9 +9244,16 @@ mod cto {
         let expiry = timer_of(&out, TimerKind::GrantExpiry);
         h.advance(3_000);
         assert_eq!(mode_of(&h, ino), before);
+        // (The requester retries, re-attaching: the park stays fresh.)
+        for (i, at) in [4_000, 5_500].into_iter().enumerate() {
+            h.now = granted_at.plus(at);
+            let out = forward(&mut h, 3, 10 + i as u64, 1, setattr(ino));
+            assert!(mutate_replies(&out).is_empty(), "{out:?}");
+        }
         h.now = granted_at.plus(6_000);
         let out = h.step_archived(Event::Timer { id: expiry });
-        let [(3, OpId(9), MutateOutcome::Accepted { .. })] = mutate_replies(&out).as_slice() else {
+        let [(3, OpId(11), MutateOutcome::Accepted { .. })] = mutate_replies(&out).as_slice()
+        else {
             panic!("expected the reply once executed: {out:?}")
         };
         assert_eq!(mode_of(&h, ino), 0o600);
@@ -30235,7 +30249,7 @@ mod locks {
         assert!(h.core.root_lone());
         let mut out = Vec::new();
         h.core
-            .inbox_drain(h.clk(), vec![batch], &h.meta, &mut out)
+            .inbox_drain(h.clk(), vec![batch], h.clk().wait, &h.meta, &mut out)
             .unwrap();
         assert_eq!(h.core.stats.lock_lapsed_refusals, 1);
         assert_eq!(
@@ -31529,7 +31543,7 @@ mod locks {
         batch.ops[0].lock_tag = token(g2, window2).to_wire(HonourMs(0));
         let mut out = Vec::new();
         h.core
-            .inbox_drain(h.clk(), vec![batch], &h.meta, &mut out)
+            .inbox_drain(h.clk(), vec![batch], h.clk().wait, &h.meta, &mut out)
             .unwrap();
         assert_eq!(mtime(&h, ino), before, "the stale op did not execute");
         assert_eq!(h.meta.locks().stats().token_rejections, 1);
@@ -35254,7 +35268,7 @@ fn the_takeover_drain_defers_only_the_delegated_requester() {
     ];
     let mut out = Vec::new();
     h.core
-        .inbox_drain(h.clk(), batches.clone(), &h.meta, &mut out)
+        .inbox_drain(h.clk(), batches.clone(), h.clk().wait, &h.meta, &mut out)
         .unwrap();
     assert!(
         h.meta.child_ino(ROOT_INO, "c").unwrap().is_some(),
@@ -35330,7 +35344,13 @@ fn an_inbox_op_waits_for_its_deps() {
         .to_postcard();
     let mut out = Vec::new();
     h.core
-        .inbox_drain(h.clk(), vec![batch.clone()], &h.meta, &mut out)
+        .inbox_drain(
+            h.clk(),
+            vec![batch.clone()],
+            h.clk().wait,
+            &h.meta,
+            &mut out,
+        )
         .unwrap();
     assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_none());
     assert_eq!(h.core.inbox.leftover_batches(), 1, "deferred by the drain");
@@ -57100,7 +57120,7 @@ mod c2g_settle {
         batch.ops[0].settle = true;
         let mut out = Vec::new();
         h.core
-            .inbox_drain(h.clk(), vec![batch], &h.meta, &mut out)
+            .inbox_drain(h.clk(), vec![batch], h.clk().wait, &h.meta, &mut out)
             .unwrap();
         assert_eq!(
             h.meta
@@ -57193,7 +57213,7 @@ mod c2g_settle {
         batch.ops[0].settle = true;
         let mut out = Vec::new();
         h.core
-            .inbox_drain(h.clk(), vec![batch], &h.meta, &mut out)
+            .inbox_drain(h.clk(), vec![batch], h.clk().wait, &h.meta, &mut out)
             .unwrap();
         assert!(
             h.meta.lookup(ROOT_INO, "i").unwrap().is_none(),
@@ -57353,7 +57373,13 @@ mod c2g_settle {
         assert_eq!(answer(&out, 7).map(|a| a.0), Some(MutateOutcome::Abandoned));
         let mut out = Vec::new();
         h.core
-            .inbox_drain(h.clk(), vec![inbox_batch(3, 0, 1, &op)], &h.meta, &mut out)
+            .inbox_drain(
+                h.clk(),
+                vec![inbox_batch(3, 0, 1, &op)],
+                h.clk().wait,
+                &h.meta,
+                &mut out,
+            )
             .unwrap();
         assert!(
             h.meta.lookup(ROOT_INO, "i").unwrap().is_none(),
@@ -58634,6 +58660,7 @@ mod c2g_settle {
             .inbox_drain(
                 h.clk(),
                 vec![super::inbox_batch(3, 0, 1, &op)],
+                h.clk().wait,
                 &h.meta,
                 &mut out,
             )
@@ -58657,6 +58684,7 @@ mod c2g_settle {
             .inbox_drain(
                 g.clk(),
                 vec![super::inbox_batch(3, 0, 1, &op)],
+                g.clk().wait,
                 &g.meta,
                 &mut out,
             )
@@ -61267,7 +61295,13 @@ mod await_retry {
         let batch = inbox_batch(3, 0, 1, &create_in(ROOT_INO, "moved", ino));
         let mut out = Vec::new();
         h.core
-            .inbox_drain(h.clk(), vec![batch.clone()], &h.meta, &mut out)
+            .inbox_drain(
+                h.clk(),
+                vec![batch.clone()],
+                h.clk().wait,
+                &h.meta,
+                &mut out,
+            )
             .unwrap();
         assert_eq!(h.core.stats.inbox_halted, 1);
         assert!(h.meta.lookup(ROOT_INO, "moved").unwrap().is_none());
@@ -61276,7 +61310,7 @@ mod await_retry {
         forward_of(&mut h, 2, 80, p, &rename_in_root("broken", "moved"));
         ticks(&mut h, 4);
         h.core
-            .inbox_drain(h.clk(), vec![batch], &h.meta, &mut out)
+            .inbox_drain(h.clk(), vec![batch], h.clk().wait, &h.meta, &mut out)
             .unwrap();
         assert!(h.meta.lookup(ROOT_INO, "moved").unwrap().is_some());
         assert_eq!(h.core.stats.inbox_halted, 1);
@@ -70955,7 +70989,7 @@ mod route_fence_root {
         let batch = super::inbox_batch(2, 0, 1, &op);
         let mut out = Vec::new();
         h.core
-            .inbox_drain(h.clk(), vec![batch], &h.meta, &mut out)
+            .inbox_drain(h.clk(), vec![batch], h.clk().wait, &h.meta, &mut out)
             .unwrap();
         assert_eq!(h.core.inbox.leftover_batches(), 1);
         // The delegation ends; the requester has withdrawn its batch.
@@ -70989,5 +71023,326 @@ mod route_fence_root {
 
     fn inbox_deletes_of(out: &[Action]) -> Vec<(u64, u64, u64)> {
         super::inbox_deletes(out)
+    }
+}
+
+/// Late-landing S1 and F1: an inbox op runs only from a read the executor
+/// issued less than `Deadlines::inbox_read_fresh` ago, and a settle begins by
+/// withdrawing the rid's batches, its window counting from the last
+/// acknowledgement.
+mod late_landing_inbox {
+    use super::*;
+    use constellation_store_s3::inbox::InboxKey;
+
+    /// Node 1's op `a`, durable in an inbox batch (key `{1, 1, 0}`) and
+    /// waiting on it, the holder (node 2) not reachable. Returns the rid.
+    fn waiting_inbox_op() -> (Harness, Rid) {
+        let mut h = Harness::new(1);
+        let rid = h.rid(1);
+        h.core.lease.cached_holder = Some(2);
+        let mut out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("a"),
+            tag: Default::default(),
+        });
+        h.core.inbox_enqueue(h.clk(), rid, 1, &h.meta, &mut out);
+        for _ in 0..6 {
+            let ops: Vec<(OpId, S3Op)> = s3_ops(&out)
+                .into_iter()
+                .map(|(o, r)| (o, r.clone()))
+                .collect();
+            let mut next = Vec::new();
+            for (op, req) in ops {
+                let result = match req {
+                    S3Op::InboxLastN { .. } => S3Result::InboxLastN(Ok(None)),
+                    S3Op::InboxPut { .. } => S3Result::InboxPut(Ok(())),
+                    _ => continue,
+                };
+                next.extend(h.step(Event::S3 { op, result }));
+            }
+            if next.is_empty() {
+                break;
+            }
+            out = next;
+        }
+        assert!(matches!(
+            h.core.clients().next(),
+            Some((_, ClientPhase::InboxWaiting))
+        ));
+        assert_eq!(h.core.clients.get(&rid).unwrap().inbox_keys.len(), 1);
+        (h, rid)
+    }
+
+    fn tombstone_op(out: &[Action]) -> Option<OpId> {
+        s3_ops(out)
+            .into_iter()
+            .find(|(_, r)| matches!(r, S3Op::InboxTombstone { .. }))
+            .map(|(op, _)| op)
+    }
+
+    /// F1 (the bypassing route): the requester that is the root settles its
+    /// own op locally. Before: the settle executed it at once, with the
+    /// batch durable. Now the batch is a tombstone first.
+    #[test]
+    fn a_settle_withdraws_the_rids_inbox_batches_first() {
+        let (mut h, rid) = waiting_inbox_op();
+        h.advance(h.core.dl_t().attempts + 1);
+        h.hold(1, None);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        let op = tombstone_op(&out)
+            .unwrap_or_else(|| panic!("the settle did not withdraw the batch first: {out:?}"));
+        let ran = |h: &Harness| {
+            h.meta.recent_outcome(rid).is_some()
+                || h.meta.completed_outcome(rid).ok().flatten().is_some()
+        };
+        assert!(
+            !ran(&h),
+            "nothing is executed before the tombstone is acknowledged"
+        );
+        assert!(replies(&out).is_empty());
+        let out = h.step(Event::S3 {
+            op,
+            result: S3Result::InboxTombstone(Ok(())),
+        });
+        assert!(ran(&h), "executed once withdrawn: {out:?}");
+        assert_eq!(h.core.stats.settles_withdrawn_first, 1);
+        assert!(!h.core.in_doubt_batches.contains_key(&rid));
+    }
+
+    /// F1 (SHOULD-4a): the settle's window and cap count from the last
+    /// acknowledgement, not from the first deadline. A failed tombstone is
+    /// retried; once the first window is spent the settle goes on without
+    /// the inbox route and is counted.
+    #[test]
+    fn a_settles_window_starts_at_the_tombstone_acknowledgement() {
+        let (mut h, rid) = waiting_inbox_op();
+        h.advance(h.core.dl_t().attempts + 1);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        let first = h.clk().wait;
+        let op = tombstone_op(&out).expect("withdrawn first");
+        let w = h.core.dl_t().settle_window;
+        // The PUT fails once, and is tried again.
+        let out = h.step(Event::S3 {
+            op,
+            result: S3Result::InboxTombstone(Err(crate::event::S3Failure("boom".into()))),
+        });
+        assert!(tombstone_op(&out).is_none());
+        h.advance(h.core.cfg.recall_hold_ms.max(50));
+        let id = h
+            .core
+            .clients
+            .get(&rid)
+            .unwrap()
+            .timer
+            .expect("a retry timer");
+        let out = h.step(Event::Timer { id });
+        let op = tombstone_op(&out).expect("the tombstone is tried again");
+        h.advance(w / 2);
+        let acked = h.clk().wait;
+        let out = h.step(Event::S3 {
+            op,
+            result: S3Result::InboxTombstone(Ok(())),
+        });
+        let c = h.core.clients.get(&rid).unwrap();
+        assert!(
+            c.settle_until >= acked.plus(w),
+            "{:?} {acked:?}",
+            c.settle_until
+        );
+        assert!(c.settle_until > first.plus(w));
+        assert!(c.settle_cap >= acked.plus(h.core.dl_t().settle_cap_span));
+        assert!(
+            matches!(
+                sends(&out).first(),
+                Some((2, PeerMsg::MutateRequest { settle: true, .. }))
+            ),
+            "the settle leaves after the last acknowledgement: {out:?}"
+        );
+        assert_eq!(h.core.stats.settle_withdraw_failed, 0);
+    }
+
+    #[test]
+    fn a_failing_tombstone_gives_the_settle_up_to_the_other_routes_after_a_window() {
+        let (mut h, rid) = waiting_inbox_op();
+        h.advance(h.core.dl_t().attempts + 1);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        let op = tombstone_op(&out).expect("withdrawn first");
+        h.step(Event::S3 {
+            op,
+            result: S3Result::InboxTombstone(Err(crate::event::S3Failure("boom".into()))),
+        });
+        let c = h.core.clients.get(&rid).unwrap();
+        let (deadline, until) = (c.deadline, c.settle_until);
+        h.now = Ms(until.0 - h.wait_off);
+        let out = h.step(Event::Timer { id: deadline });
+        assert_eq!(h.core.stats.settle_withdraw_failed, 1);
+        let c = h.core.clients.get(&rid).unwrap();
+        assert!(c.settle_withdraw_failed);
+        assert!(c.settle_until > until);
+        let _ = out;
+    }
+
+    /// U1(a): the tombstone a settle gave up on is written in the
+    /// background, a bounded number of times, then dropped.
+    #[test]
+    fn a_given_up_tombstone_is_retried_in_the_background_a_bounded_number_of_times() {
+        let (mut h, rid) = waiting_inbox_op();
+        h.advance(h.core.dl_t().attempts + 1);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        let op = tombstone_op(&out).expect("withdrawn first");
+        let boom = || S3Result::InboxTombstone(Err(crate::event::S3Failure("boom".into())));
+        h.step(Event::S3 { op, result: boom() });
+        let c = h.core.clients.get(&rid).unwrap();
+        let (deadline, until) = (c.deadline, c.settle_until);
+        h.now = Ms(until.0 - h.wait_off);
+        h.step(Event::Timer { id: deadline });
+        assert!(h.core.clients.get(&rid).unwrap().inbox_keys.is_empty());
+        let mut tries = 0;
+        while let Some(id) = h.core.inbox.bg_timer {
+            h.advance(1_000_000);
+            let out = h.step(Event::Timer { id });
+            let op = tombstone_op(&out).expect("a background try");
+            tries += 1;
+            h.step(Event::S3 { op, result: boom() });
+            assert!(tries < 50, "unbounded");
+        }
+        assert!(tries >= 2);
+        assert_eq!(h.core.stats.bg_tombstones_dropped, 1);
+        assert_eq!(h.core.stats.bg_tombstones_written, 0);
+    }
+
+    /// F1 (the own purge): a batch of the root's own that the takeover
+    /// drain left for a re-read is not read again once withdrawn.
+    #[test]
+    fn the_roots_own_settle_purges_its_leftover_copy() {
+        let (mut h, rid) = waiting_inbox_op();
+        let key = h.core.clients.get(&rid).unwrap().inbox_keys[0];
+        h.hold(1, None);
+        h.core.cfg.inbox = true;
+        let batch = super::inbox_batch(1, key.n, 1, &h.create("a"));
+        // The gate drain's read is too old: the batch is left for a re-read.
+        let mut out = Vec::new();
+        let old = h.clk().wait.plus(0);
+        h.advance(h.core.dl_t().inbox_read_fresh);
+        h.core
+            .inbox_drain(h.clk(), vec![batch], old, &h.meta, &mut out)
+            .unwrap();
+        assert_eq!(h.core.inbox.leftover_batches(), 1);
+        h.advance(h.core.dl_t().attempts);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        let op = tombstone_op(&out).expect("withdrawn");
+        h.step(Event::S3 {
+            op,
+            result: S3Result::InboxTombstone(Ok(())),
+        });
+        assert_eq!(h.core.inbox.leftover_batches(), 0);
+        assert!(h.core.inbox.leftover.is_none());
+        let _ = InboxKey {
+            epoch: 1,
+            node: 1,
+            n: 0,
+        };
+    }
+
+    /// S1: a poll's result processed `f` after it was issued executes
+    /// nothing and the requester is read again; a fresh one runs.
+    #[test]
+    fn a_drain_read_older_than_half_a_window_is_not_executed() {
+        let (mut h, _) = root_with_dir();
+        h.core.cfg.inbox = true;
+        poke(&mut h);
+        h.core.note_demand(h.clk(), 2, true);
+        let f = h.core.dl_t().inbox_read_fresh;
+        assert!(f > 0);
+        let poll = |h: &mut Harness| {
+            let in_flight = |h: &Harness| {
+                h.core
+                    .s3
+                    .iter()
+                    .find_map(|(op, fr)| matches!(fr, S3For::InboxPoll(2)).then_some(*op))
+            };
+            if let Some(op) = in_flight(h) {
+                return op;
+            }
+            h.advance(h.core.cfg.sync_interval_ms.max(1) + 1);
+            let mut out = Vec::new();
+            h.core.inbox_holder_tick(h.clk(), &h.meta, &mut out);
+            in_flight(h).expect("node 2's inbox is polled")
+        };
+        let op = h.create("x");
+        let batch = super::inbox_batch(2, 0, 1, &op);
+        let issued = poll(&mut h);
+        h.advance(f);
+        let out = h.step(Event::S3 {
+            op: issued,
+            result: S3Result::InboxRun(Ok(vec![batch.clone()])),
+        });
+        assert!(
+            h.meta.child_ino(ROOT_INO, "x").unwrap().is_none(),
+            "a read of age f is not executed: {out:?}"
+        );
+        assert_eq!(h.core.stats.inbox_stale_reads_discarded, 1);
+        assert!(inbox_deletes(&out).is_empty());
+        // Read again at once, and fresh.
+        let again = poll(&mut h);
+        assert_ne!(again, issued);
+        h.advance(f - 1);
+        h.step(Event::S3 {
+            op: again,
+            result: S3Result::InboxRun(Ok(vec![batch.clone()])),
+        });
+        assert!(
+            h.meta.child_ino(ROOT_INO, "x").unwrap().is_some(),
+            "a read younger than f runs"
+        );
+        assert_eq!(h.core.stats.inbox_stale_reads_discarded, 1);
+    }
+
+    /// S1 (the gate): a drain read older than `f`, and a leftover re-read
+    /// answered after `f`, go to the re-list; neither is kept as bytes.
+    #[test]
+    fn a_stale_gate_drain_batch_goes_to_the_relist() {
+        let (mut h, _) = root_with_dir();
+        h.core.cfg.inbox = true;
+        let f = h.core.dl_t().inbox_read_fresh;
+        let x = h.create("x");
+        let batch = super::inbox_batch(2, 0, 1, &x);
+        let mut out = Vec::new();
+        let issued = h.clk().wait;
+        h.advance(f);
+        h.core
+            .inbox_drain(h.clk(), vec![batch.clone()], issued, &h.meta, &mut out)
+            .unwrap();
+        assert!(h.meta.child_ino(ROOT_INO, "x").unwrap().is_none());
+        assert!(inbox_deletes(&out).is_empty());
+        assert_eq!(h.core.inbox.leftover_batches(), 1);
+        assert_eq!(h.core.stats.inbox_stale_relists, 1);
+        // The tick re-reads; the answer is late: again nothing runs.
+        let mut out = Vec::new();
+        h.core.inbox_holder_tick(h.clk(), &h.meta, &mut out);
+        h.advance(f);
+        let out = answer_leftover_read(&mut h, &out, vec![batch.clone()]);
+        assert!(h.meta.child_ino(ROOT_INO, "x").unwrap().is_none());
+        assert!(inbox_deletes(&out).is_empty());
+        assert_eq!(h.core.inbox.leftover_batches(), 1);
+        // A timely answer runs it.
+        let mut out = Vec::new();
+        h.core.inbox_holder_tick(h.clk(), &h.meta, &mut out);
+        h.advance(f - 1);
+        let out = answer_leftover_read(&mut h, &out, vec![batch]);
+        assert!(h.meta.child_ino(ROOT_INO, "x").unwrap().is_some());
+        assert_eq!(inbox_deletes(&out), vec![(1, 2, 0)]);
+        assert!(h.core.inbox.leftover.is_none());
     }
 }

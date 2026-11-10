@@ -185,8 +185,9 @@ enum Phase {
     },
     /// The gate's epoch-marker `SegmentPut` outstanding.
     Marker { attempts: u32 },
-    /// M13: the gate's `InboxDrain` outstanding.
-    InboxDrain,
+    /// M13: the gate's `InboxDrain` outstanding, issued at `issued` (the
+    /// wait clock: the freshness bound of what it returns).
+    InboxDrain { issued: WaitMs },
     /// A segment `SegmentPut` outstanding.
     Ship {
         seqs: Vec<u64>,
@@ -1270,7 +1271,7 @@ impl Core {
         self.set_phase(Phase::Marker { attempts }, Some(op));
     }
 
-    fn issue_drain(&mut self, out: &mut Vec<Action>) {
+    fn issue_drain(&mut self, now: Now, out: &mut Vec<Action>) {
         let Some(gate) = self.lease.gate else {
             return;
         };
@@ -1281,7 +1282,7 @@ impl Core {
             S3For::Job,
             out,
         );
-        self.set_phase(Phase::InboxDrain, Some(op));
+        self.set_phase(Phase::InboxDrain { issued: now.wait }, Some(op));
     }
 
     /// The generations this node's journal holds rows of as their
@@ -2402,7 +2403,7 @@ impl Core {
                     return;
                 }
                 GateStep::NeedDrain => {
-                    self.issue_drain(out);
+                    self.issue_drain(now, out);
                     return;
                 }
                 GateStep::Failed(error) => {
@@ -4156,7 +4157,7 @@ impl Core {
         match self.complete_gate(now, replica, out) {
             GateStep::Done => self.finish_acquire(now, true, replica, out),
             GateStep::NeedMarker => self.issue_marker(now, 0, replica, out),
-            GateStep::NeedDrain => self.issue_drain(out),
+            GateStep::NeedDrain => self.issue_drain(now, out),
             GateStep::Failed(error) => {
                 tracing::error!(%error, node = self.cfg.node_id, "takeover gate failed; the view stays closed");
                 self.finish_acquire(now, false, replica, out);
@@ -4866,8 +4867,8 @@ impl Core {
                 }
             }
             // ---- the gate's inbox drain ----
-            (Phase::InboxDrain, S3Result::InboxDrain(Ok(batches))) => {
-                match self.inbox_drain(now, batches, replica, out) {
+            (Phase::InboxDrain { issued }, S3Result::InboxDrain(Ok(batches))) => {
+                match self.inbox_drain(now, batches, issued, replica, out) {
                     Ok(()) => {
                         if let Some(gate) = self.lease.gate.as_mut() {
                             gate.drained = true;
@@ -4886,7 +4887,7 @@ impl Core {
                     }
                 }
             }
-            (Phase::InboxDrain, S3Result::InboxDrain(Err(e))) => {
+            (Phase::InboxDrain { .. }, S3Result::InboxDrain(Err(e))) => {
                 tracing::warn!(node = self.cfg.node_id, error = %e.0, "takeover gate: inbox drain LIST failed; the gate stays pending");
                 match kind {
                     JobKind::Acquire => self.finish_acquire(now, false, replica, out),

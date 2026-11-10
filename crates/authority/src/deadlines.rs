@@ -42,6 +42,8 @@ pub struct Base {
     pub backup_heartbeat: u64,
     pub backup_ack_timeout: u64,
     pub backup_slow_max: u64,
+    /// The store's request timeout (`0`: not known; D13 and D14 are then skipped).
+    pub s3_request_timeout: u64,
 }
 
 impl Base {
@@ -65,6 +67,7 @@ impl Base {
             backup_heartbeat: cfg.backup_heartbeat_ms,
             backup_ack_timeout: cfg.backup_ack_timeout_ms,
             backup_slow_max: cfg.backup_slow_max_ms,
+            s3_request_timeout: cfg.s3_request_timeout_ms,
         }
     }
 }
@@ -79,6 +82,10 @@ pub struct Deadlines {
     /// w: the settle window actually used: a quarter of the client deadline
     /// unless a knob is set, and never more than half of it.
     pub settle_window: u64,
+    /// f: how old the read an inbox op executes from may be, on the executing
+    /// node's own wait clock: half a settle window. A drain discards older
+    /// bytes and reads the key again (the I4-safety rule of the inbox path).
+    pub inbox_read_fresh: u64,
     /// A client op's own attempts end this long after its submit: `A - w`.
     pub attempts: u64,
     pub inbox_attempts: u64,
@@ -262,6 +269,7 @@ impl Deadlines {
             base: b,
             client_deadline: a,
             settle_window: w,
+            inbox_read_fresh: w / 2,
             attempts: a - w,
             inbox_attempts: b.inbox_deadline.saturating_sub(w).max(b.inbox_deadline / 2),
             settle_cap_span: 2 * w + h + t + (2 * f).max(seal) + drt,
@@ -420,6 +428,25 @@ impl Deadlines {
                 self.settle_cap_span, self.read_span
             ),
         );
+        fail(
+            "D13",
+            Class::Warn,
+            b.s3_request_timeout == 0 || w >= 4 * b.s3_request_timeout,
+            format!(
+                "settle window {w} ms is below four store request timeouts ({})",
+                b.s3_request_timeout
+            ),
+        );
+        fail(
+            "D14",
+            Class::Warn,
+            b.s3_request_timeout == 0 || self.inbox_read_fresh >= 4 * b.s3_request_timeout,
+            format!(
+                "inbox read freshness {} ms is below four store request timeouts ({}): an \
+                 ordinary inbox poll could be stale",
+                self.inbox_read_fresh, b.s3_request_timeout
+            ),
+        );
         v
     }
 
@@ -544,6 +571,7 @@ impl Deadlines {
                 self.settle_window,
                 "A/4, or the knob clamped to A/2",
             ),
+            ("inbox_read_fresh", self.inbox_read_fresh, "w/2"),
             ("attempts", self.attempts, "A - w"),
             (
                 "inbox_attempts",
@@ -717,6 +745,28 @@ mod tests {
         assert_eq!(table.len(), expected.len(), "a bound is not pinned");
     }
 
+    /// D13 and D14 (late-landing S1): the settle window and the inbox read
+    /// freshness hold four store request timeouts, so that an ordinary poll
+    /// is never stale. Both are skipped while the timeout is unknown.
+    #[test]
+    fn d13_and_d14_warn_when_the_store_is_slower_than_the_window() {
+        let mut c = Config::defaults(1, 1);
+        assert!(Deadlines::new(&c).check().is_empty());
+        // w = 30 s, f = 15 s.
+        c.s3_request_timeout_ms = 3_750;
+        assert!(Deadlines::new(&c).check().is_empty(), "f = 4 timeouts");
+        c.s3_request_timeout_ms = 3_751;
+        let v = Deadlines::new(&c).check();
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!((v[0].id, v[0].class), ("D14", Class::Warn));
+        c.s3_request_timeout_ms = 7_501;
+        let v = Deadlines::new(&c).check();
+        assert_eq!(
+            v.iter().map(|v| v.id).collect::<Vec<_>>(),
+            vec!["D13", "D14"]
+        );
+    }
+
     /// The production defaults of `Config::defaults`: L 60 s, m 1 s, R 5 s,
     /// D 5 s, K 20 s, F 500 ms, T 1.5 s, k 50 ms, A 120 s.
     #[test]
@@ -727,6 +777,7 @@ mod tests {
                 ("client_deadline", 120_000),
                 // A/4.
                 ("settle_window", 30_000),
+                ("inbox_read_fresh", 15_000),
                 // 120000 - 30000.
                 ("attempts", 90_000),
                 // max(120000 - 30000, 60000).
@@ -801,6 +852,7 @@ mod tests {
             &[
                 ("client_deadline", 120_000),
                 ("settle_window", 30_000),
+                ("inbox_read_fresh", 15_000),
                 ("attempts", 90_000),
                 ("inbox_attempts", 90_000),
                 // H = 20000 + 1000; 60000 + 21000 + 1500 + max(1000, 1500) + 500.
@@ -858,6 +910,7 @@ mod tests {
                 ("client_deadline", 12_000),
                 // 12000/4.
                 ("settle_window", 3_000),
+                ("inbox_read_fresh", 1_500),
                 ("attempts", 9_000),
                 // max(8000 - 3000, 4000).
                 ("inbox_attempts", 5_000),
@@ -929,6 +982,7 @@ mod tests {
                 ("client_deadline", 60_000),
                 // 60000/4.
                 ("settle_window", 15_000),
+                ("inbox_read_fresh", 7_500),
                 // 60000 - 15000.
                 ("attempts", 45_000),
                 // max(8000 - 15000 floored at 0, 4000).
@@ -988,6 +1042,7 @@ mod tests {
             &[
                 ("client_deadline", 12_000),
                 ("settle_window", 3_000),
+                ("inbox_read_fresh", 1_500),
                 ("attempts", 9_000),
                 ("inbox_attempts", 5_000),
                 // T = 1000, seal = max(1000, 400) = 1000, DRT 400:
@@ -1046,6 +1101,7 @@ mod tests {
                 ("client_deadline", 2_000),
                 // 2000/4.
                 ("settle_window", 500),
+                ("inbox_read_fresh", 250),
                 ("attempts", 1_500),
                 // max(100 - 500 -> 0, 50).
                 ("inbox_attempts", 50),

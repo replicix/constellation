@@ -216,6 +216,9 @@ pub struct Config {
     /// simulation's override) is capped at half the deadline
     /// (`Deadlines::settle_window`).
     pub settle_window_ms: u64,
+    /// The store's request timeout (`0`: not known). Only the deadlines
+    /// checks D13 and D14 read it.
+    pub s3_request_timeout_ms: u64,
     pub acquire_retry_min_ms: u64,
     pub acquire_retry_max_ms: u64,
     /// EC2 campaign 8 A-1: while this node's own S3 path is stalled
@@ -616,6 +619,7 @@ impl Config {
             forward_retries: 3,
             forward_backoff_ms: 200,
             settle_window_ms: 0,
+            s3_request_timeout_ms: 0,
             acquire_retry_min_ms: 100,
             acquire_retry_max_ms: 2_000,
             s3_less_deadline_ms: 20_000,
@@ -907,6 +911,20 @@ pub struct Stats {
     pub inbox_deduped_ops: u64,
     pub inbox_drained_batches: u64,
     pub inbox_drained_ops: u64,
+    /// Late-landing S1: inbox reads a drain discarded as older than
+    /// `Deadlines::inbox_read_fresh` (nothing executed from them), and the
+    /// re-reads that followed from a gate drain or a leftover re-read.
+    pub inbox_stale_reads_discarded: u64,
+    pub inbox_stale_relists: u64,
+    /// Late-landing F1: settles that began with the withdrawal of the rid's
+    /// inbox batches, and those whose tombstone could not be written within
+    /// the first window (the settle then goes on without the inbox route).
+    pub settles_withdrawn_first: u64,
+    pub settle_withdraw_failed: u64,
+    /// U1(a): tombstones the settle gave up on, written later in the
+    /// background, and those dropped after the bounded tries.
+    pub bg_tombstones_written: u64,
+    pub bg_tombstones_dropped: u64,
     pub inbox_polls: u64,
     pub inbox_poll_hits: u64,
     pub inbox_gc_deleted: u64,
@@ -2011,6 +2029,8 @@ pub(crate) enum S3For {
     InboxRecheck,
     /// M13: a GC or drain delete (result only logged).
     InboxGc(InboxKey),
+    /// Late-landing U1(a): a background try of a tombstone a settle gave up on.
+    InboxTombstoneBg(InboxKey),
     /// ADR-47: the holder re-reading the takeover drain's leftovers.
     InboxLeftover(NodeId),
     /// M13: a requester deleting its own durable batch before forwarding
@@ -2075,6 +2095,7 @@ enum Timer {
     JobRequestTimeout(OpId),
     InboxPoll,
     InboxRecheck,
+    InboxTombstoneBg,
     InboxSubmitRetry,
     EscalateTick,
     StreamHeartbeat,
@@ -2163,6 +2184,7 @@ impl Timer {
             Timer::JobRequestTimeout(_) => TimerKind::JobRequestTimeout,
             Timer::InboxPoll => TimerKind::InboxPoll,
             Timer::InboxRecheck => TimerKind::InboxRecheck,
+            Timer::InboxTombstoneBg => TimerKind::InboxTombstoneBg,
             Timer::InboxSubmitRetry => TimerKind::InboxSubmitRetry,
             Timer::EscalateTick => TimerKind::EscalateTick,
             Timer::StreamHeartbeat => TimerKind::StreamHeartbeat,
@@ -3453,6 +3475,7 @@ impl Core {
             S3For::InboxPoll(node) => self.on_inbox_polled(now, node, result, replica, out),
             S3For::InboxRecheck => self.on_inbox_recheck(now, result, replica, out),
             S3For::InboxGc(key) => self.on_inbox_gc(now, key, result),
+            S3For::InboxTombstoneBg(key) => self.on_bg_tombstone(now, key, result, out),
             S3For::InboxLeftover(node) => {
                 self.on_inbox_leftover_read(now, node, op, result, replica, out)
             }
@@ -3517,6 +3540,10 @@ impl Core {
             Timer::InboxRecheck => {
                 self.inbox.recheck_timer = None;
                 self.on_inbox_recheck_tick(now, replica, out);
+            }
+            Timer::InboxTombstoneBg => {
+                self.inbox.bg_timer = None;
+                self.on_bg_tombstone_tick(now, out);
             }
             Timer::InboxSubmitRetry => {
                 self.inbox.retry_timer = None;

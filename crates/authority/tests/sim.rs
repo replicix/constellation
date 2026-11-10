@@ -1210,7 +1210,10 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
     // reach it four times each now (10729 and 11608 no longer do).
     // Plan 46 M1.3 step 3 (the retry of a claim that lost its CAS, the
     // settle that claims): 10294 and 10498 reach it four times each.
-    for seed in [10294, 10498] {
+    // Late-landing S1 (a drain reads inbox bytes fresh, a settle withdraws
+    // its batches first) shifted the schedules again: over 10000–13999 the
+    // finder gives 10446, 10794, 10803, 11298 and 11466, twice each.
+    for seed in [10446, 10794] {
         let report = run_seed(seed, long_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let multi: u64 = report
             .stats
@@ -1232,6 +1235,7 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
 #[test]
 #[ignore]
 fn find_multi_batch_withdraw_seeds() {
+    use pinned::run_seed;
     let start: u64 = std::env::var("AUTHORITY_SIM_START")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -10039,6 +10043,34 @@ fn a_claim_whose_tail_fetch_sealed_the_own_epoch_takes_the_next_epoch() {
         panic!(
             "delegated-root-deposed-delegate-dies seed 251 (AUTHORITY_SIM_LEASE_READS=0:0:800:1000): {e}"
         );
+    }
+}
+
+/// Late-landing S1 (the inbox I4 rule): `delegated-root-deposed-delegate-dies`
+/// seed 1480 with slow lease reads. The deposed root's own op went in doubt
+/// at its settle's end, and the successor's gate drain read the op's batch
+/// (it had been left there, durable) and ran it later, from bytes it had
+/// held for 2.8 s: the op landed after the client heard the unsettled `EIO`
+/// (a hard I4). A drain executes an inbox op only from a read it issued
+/// less than half a settle window ago, and a settle withdraws the rid's
+/// batches first, so the old bytes are discarded and the read again sees
+/// the tombstone.
+#[test]
+fn an_unsettled_eio_never_lands_from_the_inbox() {
+    for variant in ["", "commit"] {
+        let cfg = strict(
+            SimConfig {
+                lease_reads: SLOW_LEASE_READS,
+                ..delegated_root_deposed_delegate_dies_config()
+            },
+            variant,
+        );
+        if let Err(e) = run_seed(1_480, cfg) {
+            panic!(
+                "delegated-root-deposed-delegate-dies+{variant} seed 1480 \
+                 (AUTHORITY_SIM_LEASE_READS=0:0:800:1000): {e}"
+            );
+        }
     }
 }
 
