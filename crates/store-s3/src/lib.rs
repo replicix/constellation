@@ -73,7 +73,7 @@ pub use mark::{live_set, mark, CatalogPack, LiveSet, Mark, PackCatalog};
 pub use node_cache::{NodeCache, NodeCacheStats, NodeLocation, PeerNodeSource};
 pub use nodes::{
     claim_node_id, get_node, leave_node, list_node_ids, list_nodes, publish_p2p, publish_ro,
-    registry_scan, write_eligible_roster, NodeInfo, RecordRead, RegistryScan,
+    registry_scan, write_eligible_roster, NodeInfo, RecordRead, RegistryScan, RosterRead,
 };
 pub use packs::{
     build_packs, build_packs_concurrent, BuiltPack, PackEntry, PackHash, PackIndex, PackNode,

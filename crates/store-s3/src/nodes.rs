@@ -230,6 +230,19 @@ pub enum RecordRead {
     Mismatch,
 }
 
+/// What one registry scan says about the roster ([`RegistryScan::roster_read`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterRead {
+    /// The live nodes the scan read that may write.
+    pub write_eligible: Vec<u64>,
+    /// The live read-only members the scan read.
+    pub read_only: Vec<u64>,
+    /// Every object under `nodes/` was read and parsed: the two lists are
+    /// the whole membership. Otherwise they are what was read, and a node
+    /// missing from them may be a member.
+    pub complete: bool,
+}
+
 /// One LIST of `nodes/` and every node record under it — the membership
 /// and peer-directory polls' shared read ([`registry_scan`]).
 #[derive(Debug, Clone, Default)]
@@ -284,6 +297,33 @@ impl RegistryScan {
         }
         out.sort_unstable();
         Ok(out)
+    }
+
+    /// What this scan says about the roster, for the authority core's
+    /// roster object (ADR-50). Unlike [`RegistryScan::roster`] it never
+    /// fails: a scan that could not read every record says so
+    /// (`complete: false`) and still lists the nodes it did read, so the
+    /// reader can learn of a peer from it and cannot conclude from it that
+    /// a node is gone.
+    pub fn roster_read(&self) -> RosterRead {
+        let mut write_eligible = Vec::new();
+        let mut read_only = Vec::new();
+        for (_, read) in &self.records {
+            if let RecordRead::Info(info) = read {
+                if info.is_write_eligible() {
+                    write_eligible.push(info.node_id);
+                } else if info.is_live() {
+                    read_only.push(info.node_id);
+                }
+            }
+        }
+        write_eligible.sort_unstable();
+        read_only.sort_unstable();
+        RosterRead {
+            write_eligible,
+            read_only,
+            complete: self.is_complete(),
+        }
     }
 
     /// Whether every object under `nodes/` was read and parsed (retired
@@ -781,6 +821,52 @@ mod tests {
         );
         // The tolerant listing still leaves it out.
         assert_eq!(list_nodes(store).await.unwrap().len(), 1);
+    }
+
+    /// An incomplete scan still lists what it read, flagged incomplete: the
+    /// core's roster learns of those nodes and does not conclude that the
+    /// ones it did not read are gone (ADR-50).
+    #[tokio::test]
+    async fn an_incomplete_scan_still_lists_the_nodes_it_read() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let writer = claim_node_id(store.clone()).await.unwrap();
+        let reader = claim_node_id(store.clone()).await.unwrap();
+        publish_ro(store.clone(), reader, true).await.unwrap();
+        let complete = registry_scan(store.as_ref()).await.unwrap().roster_read();
+        assert_eq!(
+            complete,
+            RosterRead {
+                write_eligible: vec![writer],
+                read_only: vec![reader],
+                complete: true,
+            }
+        );
+        store
+            .put(&node_key(99), PutPayload::from(b"{ truncated".to_vec()))
+            .await
+            .unwrap();
+        let incomplete = registry_scan(store.as_ref()).await.unwrap().roster_read();
+        assert_eq!(
+            incomplete,
+            RosterRead {
+                write_eligible: vec![writer],
+                read_only: vec![reader],
+                complete: false,
+            }
+        );
+    }
+
+    /// A retired node is in neither list.
+    #[tokio::test]
+    async fn a_retired_node_is_in_no_roster_list() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let kept = claim_node_id(store.clone()).await.unwrap();
+        let gone = claim_node_id(store.clone()).await.unwrap();
+        leave_node(store.clone(), gone).await.unwrap();
+        let read = registry_scan(store.as_ref()).await.unwrap().roster_read();
+        assert_eq!(read.write_eligible, vec![kept]);
+        assert!(read.read_only.is_empty());
+        assert!(read.complete);
     }
 
     #[tokio::test]

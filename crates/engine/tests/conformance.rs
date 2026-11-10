@@ -148,18 +148,23 @@ impl Node {
     /// polling (`quick_inbox_polling`).
     fn learn_roster(&self) {
         let engine = self.engine();
-        let roster = engine
+        let scan = engine
             .runtime()
-            .block_on(constellation_engine::epoch::refresh_roster(
+            .block_on(constellation_engine::epoch::poll_registry(
                 engine.epochs(),
                 engine.store().inner().clone(),
             ))
-            .expect("the registry's roster");
+            .expect("the registry's scan");
         engine
             .sync_tx()
             .send(SyncRequest::Roster {
-                roster,
-                issued: constellation_authority::WaitMs(i64::MAX),
+                // Newer than any read the engine's own poll issues.
+                stamp: constellation_engine::sync::RosterStamp {
+                    seq: u64::MAX,
+                    lapses: 0,
+                    issued: constellation_authority::WaitMs(i64::MAX),
+                },
+                read: scan.roster_read(),
             })
             .expect("the sync task runs");
     }

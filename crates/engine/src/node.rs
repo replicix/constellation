@@ -1003,13 +1003,19 @@ impl Engine {
             peers.clone(),
         ));
         let lost_on_mount = matches!(meta.kv_get("lease_lost")?.as_deref(), Some("1"));
-        let roster = rt
-            .block_on(constellation_store_s3::write_eligible_roster(
-                store.inner().clone(),
+        // The startup read: the mount fails on an incomplete registry
+        // (`RegistryScan::roster`); it reaches the core as read number 0, so
+        // every later read is newer.
+        let startup_scan = rt
+            .block_on(constellation_store_s3::registry_scan(
+                store.inner().as_ref(),
             ))
             .context("loading write-eligible roster")?;
-        epochs.set_roster(roster.clone());
-        let initial_roster = roster;
+        let roster = startup_scan
+            .roster()
+            .context("loading write-eligible roster")?;
+        epochs.set_roster(roster);
+        let initial_roster = startup_scan.roster_read();
 
         let designations = Arc::new(designation::DesignationManager::new(
             constellation_store_s3::designation::DesignationStore::new(
@@ -1328,8 +1334,12 @@ impl Engine {
         }
         // (Read before the core ran: no requester can predate it.)
         let _ = sync_tx.send(crate::sync::SyncRequest::Roster {
-            roster: initial_roster,
-            issued: constellation_authority::WaitMs(i64::MIN),
+            stamp: crate::sync::RosterStamp {
+                seq: 0,
+                lapses: 0,
+                issued: constellation_authority::WaitMs(i64::MIN),
+            },
+            read: initial_roster,
         });
         if !read_only_member {
             phase(&on_phase, "adopting the root directory owner");
@@ -1424,7 +1434,7 @@ impl Engine {
             // dialable and enrolled without a remount. Also detect our own
             // record vanishing or being retired (admin leave under us).
             {
-                let (peers, store_inner, epochs, departed, node_id, meta, sync_tx) = (
+                let (peers, store_inner, epochs, departed, node_id, meta, sync_tx, off_core) = (
                     peers.clone(),
                     store.inner().clone(),
                     epochs.clone(),
@@ -1432,6 +1442,7 @@ impl Engine {
                     node_id,
                     meta.clone(),
                     sync_tx.clone(),
+                    off_core.clone(),
                 );
                 let version = version.clone();
                 let background = background.clone();
@@ -1440,12 +1451,12 @@ impl Engine {
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         background.wait_active().await;
-                        let issued =
-                            constellation_authority::WaitMs(crate::authority_driver::wait_now_ms());
+                        // Stamped before the LIST (the scan below is it).
+                        let stamp = off_core.roster_stamp();
                         let scan =
                             crate::p2p::refresh_peers(&peers, store_inner.clone(), Some(&epochs))
                                 .await;
-                        if let Some(req) = roster_request(scan.as_ref(), issued) {
+                        if let Some(req) = crate::sync::roster_request(scan.as_ref(), stamp) {
                             let _ = sync_tx.send(req);
                         }
                         peers.probe_all().await;
@@ -1500,12 +1511,13 @@ impl Engine {
             }
         } else {
             // P2P off: still refresh the epoch roster and watch our own record.
-            let (store_inner, epochs, departed, node_id, meta) = (
+            let (store_inner, epochs, departed, node_id, meta, off_core) = (
                 store.inner().clone(),
                 epochs.clone(),
                 departed.clone(),
                 node_id,
                 meta.clone(),
+                off_core.clone(),
             );
             let sync_tx_roster = sync_tx.clone();
             let background = background.clone();
@@ -1518,16 +1530,14 @@ impl Engine {
                     if tick.is_multiple_of(SLACK_REREAD_TICKS) {
                         reread_slack(&store_inner, &sync_tx_roster).await;
                     }
-                    let issued =
-                        constellation_authority::WaitMs(crate::authority_driver::wait_now_ms());
-                    if let Some(roster) =
-                        crate::epoch::refresh_roster(&epochs, store_inner.clone()).await
-                    {
+                    // Stamped before the LIST (the scan below is it).
+                    let stamp = off_core.roster_stamp();
+                    let scan = crate::epoch::poll_registry(&epochs, store_inner.clone()).await;
+                    if let Some(req) = crate::sync::roster_request(scan.as_ref(), stamp) {
                         // A requester this holder has not polled yet (a
                         // node that mounted after our last read): the core
                         // polls it at once (plan 30 M13 round 2).
-                        let _ = sync_tx_roster
-                            .send(crate::sync::SyncRequest::Roster { roster, issued });
+                        let _ = sync_tx_roster.send(req);
                     }
                     match constellation_store_s3::get_node(store_inner.clone(), node_id).await {
                         Ok(None) => {
@@ -3112,62 +3122,8 @@ fn remove_live_subtree(meta: &Meta, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// What the registry poll tells the core about the roster. A complete
-/// scan is the roster; one that answered but could not read every record
-/// (the epoch roster is emptied then: fail closed for epochs) is
-/// "unknown", never "no peers" (the core would answer Singleton with
-/// peers linked); a scan that failed altogether says nothing, so the core
-/// keeps what it knew (the epoch roster may be empty from an earlier
-/// unread scan and must not be sent).
-fn roster_request(
-    scan: Option<&constellation_store_s3::RegistryScan>,
-    issued: constellation_authority::WaitMs,
-) -> Option<crate::sync::SyncRequest> {
-    match scan?.roster() {
-        Ok(roster) => Some(crate::sync::SyncRequest::Roster { roster, issued }),
-        Err(constellation_store_s3::StoreError::Registry(_)) => {
-            Some(crate::sync::SyncRequest::RosterUnread { issued })
-        }
-        Err(_) => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use constellation_store_s3::{RecordRead, RegistryScan};
-
-    /// The registry poll's word to the core: a complete scan is the
-    /// roster, an unread one is "unknown", and a failed scan (after an
-    /// unread one emptied the epoch roster) says nothing, so the core
-    /// keeps waiting instead of hearing "no peers".
-    #[test]
-    fn a_failed_scan_after_an_unread_one_does_not_empty_the_core_roster() {
-        let issued = constellation_authority::WaitMs(1);
-        let unread = RegistryScan {
-            records: vec![("nodes/0.json".into(), RecordRead::Missing)],
-        };
-        assert!(matches!(
-            roster_request(Some(&unread), issued),
-            Some(crate::sync::SyncRequest::RosterUnread { .. })
-        ));
-        assert!(
-            roster_request(None, issued).is_none(),
-            "a scan that failed must send nothing (not an empty roster)"
-        );
-        let complete = RegistryScan::default();
-        assert!(matches!(
-            roster_request(Some(&complete), issued),
-            Some(crate::sync::SyncRequest::Roster { roster, .. }) if roster.is_empty()
-        ));
-        let mismatch = RegistryScan {
-            records: vec![("nodes/1.json".into(), RecordRead::Mismatch)],
-        };
-        assert!(matches!(
-            roster_request(Some(&mismatch), issued),
-            Some(crate::sync::SyncRequest::RosterUnread { .. })
-        ));
-    }
-
     use super::*;
     use crate::{EngineHost, EngineProfile, FsId, P2pMode, ResourceBudget, ViewQos};
     use constellation_fs_core::types::ROOT_INO;

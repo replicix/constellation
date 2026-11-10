@@ -2770,11 +2770,23 @@ impl Core {
             }
             Event::RebuildDone { op, ok } => self.on_rebuild_done(now, op, ok, replica, &mut out),
             Event::Roster {
+                seq,
                 write_eligible,
+                read_only,
+                complete,
+                lapses,
                 issued,
             } => {
                 let foreign = write_eligible.iter().any(|n| *n != self.cfg.node_id);
-                if !self.roster.install_read(write_eligible, issued) {
+                let read = roster::RosterRead {
+                    seq,
+                    write_eligible,
+                    read_only,
+                    complete,
+                    lapses,
+                    issued,
+                };
+                if !self.roster.install_read(read) {
                     return out;
                 }
                 if foreign {
@@ -2786,12 +2798,6 @@ impl Core {
                 if self.inbox.holder.is_some() {
                     self.inbox_holder_tick(now, replica, &mut out);
                 }
-            }
-            Event::RosterUnread { issued } => {
-                if !self.roster.install_unread(issued) {
-                    return out;
-                }
-                self.refresh_backup_eligibility();
             }
             Event::Peers {
                 registry_complete,

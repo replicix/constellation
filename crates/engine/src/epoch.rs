@@ -807,8 +807,10 @@ impl EpochManager {
     }
 }
 
-/// Refresh the epoch coordinator's write-eligible roster from the
-/// registry; the roster read on success.
+/// Refresh the epoch coordinator's write-eligible roster from one LIST of
+/// the registry, and hand back the scan so that the authority core's roster
+/// object is fed from the same read (ADR-50); `None` when the registry was
+/// unreachable.
 ///
 /// Fail-closed where it matters: a registry that answers but cannot be
 /// fully parsed clears the roster (an empty roster never satisfies a
@@ -818,16 +820,25 @@ impl EpochManager {
 /// continuation epoch race the next 5 s refresh after the outage began,
 /// since the outage is exactly when an epoch forms. The kept roster is
 /// as stale as it would be between two refreshes; a node enrolled during
-/// the outage is plan 30 §M10's known gap (see PROGRESS.md).
-pub async fn refresh_roster(
+/// the outage is plan 30 §M10's known gap (see PROGRESS.md). The core's
+/// roster is not the epochs': it keeps the nodes the scan did read and
+/// treats the peer set as unknown, never as empty.
+pub async fn poll_registry(
     epochs: &EpochManager,
     store: Arc<dyn object_store::ObjectStore>,
-) -> Option<Vec<u64>> {
-    let roster = constellation_store_s3::write_eligible_roster(store).await;
-    let unreachable = roster
-        .as_ref()
-        .is_err_and(|e| !matches!(e, constellation_store_s3::StoreError::Registry(_)));
-    apply_roster(epochs, roster, unreachable)
+) -> Option<constellation_store_s3::RegistryScan> {
+    let scan = constellation_store_s3::registry_scan(store.as_ref()).await;
+    apply_roster(
+        epochs,
+        match &scan {
+            Ok(scan) => scan.roster(),
+            Err(e) => Err(constellation_store_s3::StoreError::Registry(format!(
+                "registry unreachable: {e}"
+            ))),
+        },
+        scan.is_err(),
+    );
+    scan.ok()
 }
 
 /// Install a roster read: a complete one is the roster; an incomplete

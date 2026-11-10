@@ -101,21 +101,27 @@ pub enum Event {
     /// `Action::SyncDelegStream { gen, through }` finished: `ok` the sync
     /// succeeded (the rows through `through` are on the disk).
     DelegStreamSynced { gen: u64, through: u64, ok: bool },
-    /// The membership poll read the write-eligible roster (M13's inbox
-    /// polls it; M9 picks backups from it). `issued`: this node's wait
-    /// clock when the read was issued (taken before it, never after): a
-    /// requester is dropped on a read only if it asked before that
-    /// (`Core::peer_requesters`), for an older read may predate the
-    /// requester's registration.
+    /// One registry read for the node's roster object (ADR-50): M13's
+    /// inbox polls it, M9 picks backups from it. `seq`: the driver's number
+    /// for the read, taken in the order the reads were issued; a read not
+    /// newer than the installed one is ignored. `issued`: this node's wait
+    /// clock when the read was issued (taken before it, never after): a node
+    /// that sent a request is dropped on a read only if it asked before that
+    /// (`Roster::heard`), for an older read may predate the node's
+    /// registration. `lapses`: how many `OwnLag` events the driver had
+    /// handed this core before the read (taken before it, never after).
+    /// `complete`: the scan read every node record. If not, `write_eligible`
+    /// lists what was read: the core learns of those nodes, loses none, and
+    /// treats the peer set as unknown (a peer could exist) until the next
+    /// complete read.
     Roster {
+        seq: u64,
         write_eligible: Vec<NodeId>,
+        read_only: Vec<NodeId>,
+        complete: bool,
+        lapses: u64,
         issued: WaitMs,
     },
-    /// A roster read that could not be completed (a record vanished or
-    /// would not parse). The core keeps the last complete roster and
-    /// treats the peer set as unknown (a peer could exist) until the next
-    /// complete [`Event::Roster`]. `issued` as for [`Event::Roster`].
-    RosterUnread { issued: WaitMs },
     /// Plan 30 §M10: the filesystem's `epoch_slack` as `meta.json` now
     /// says (the driver re-reads it with the roster).
     Slack { epoch_slack: u32 },

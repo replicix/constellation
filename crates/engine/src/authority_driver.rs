@@ -258,7 +258,6 @@ fn event_kind(event: &Event) -> &'static str {
         Event::GrantHorizonPersisted { .. } => "GrantHorizonPersisted",
         Event::DelegStreamSynced { .. } => "DelegStreamSynced",
         Event::Roster { .. } => "Roster",
-        Event::RosterUnread { .. } => "RosterUnread",
         Event::Slack { .. } => "Slack",
         Event::Peers { .. } => "Peers",
         Event::OwnS3 { .. } => "OwnS3",
@@ -1824,6 +1823,10 @@ pub struct OffCore {
     /// the wake-up of the directory task that follows a lapse
     /// ([`Driver::hand_lag`], [`peer_links_task`]).
     pub(crate) lapses: Arc<LapseCount>,
+    /// The number of the latest registry read issued, for every producer of
+    /// one (the 5 s poll, `Action::RefreshRoster`): the core installs a read
+    /// only if it is newer than the installed one (`Event::Roster::seq`).
+    roster_seq: AtomicU64,
     /// The end of the latest lapse the core has been handed and has
     /// stepped on (published after the step, so that the `lone_ok` it
     /// published is the one in force): while the probe's latest lapse
@@ -1932,6 +1935,17 @@ impl std::fmt::Debug for LeaseHandle {
 }
 
 impl OffCore {
+    /// The stamp of a registry read about to begin: the next number (the
+    /// startup read, taken before the driver runs, is number 0), the wait
+    /// clock, and the lapses handed so far. Taken before the LIST.
+    pub fn roster_stamp(&self) -> crate::sync::RosterStamp {
+        crate::sync::RosterStamp {
+            seq: self.roster_seq.fetch_add(1, Ordering::SeqCst) + 1,
+            lapses: self.lapses.handed(),
+            issued: WaitMs(wait_now_ms()),
+        }
+    }
+
     /// `responsive_ms`: the longest the driver loop may be inside one
     /// wake-up and still count as responsive ([`Self::core_responsive`]).
     /// The lag threshold is the default takeover window's (1.5 s / 8).
@@ -1942,6 +1956,7 @@ impl OffCore {
         deleg_windows.set_probe(root_probe.clone());
         Self {
             lapses: Arc::new(LapseCount::default()),
+            roster_seq: AtomicU64::new(0),
             lag_handed: std::sync::atomic::AtomicI64::new(0),
             root_probe,
             leases: std::sync::OnceLock::new(),
@@ -3368,13 +3383,14 @@ impl Driver {
         match req {
             SyncRequest::Nudge => control(Control::Nudge, ControlReply::None),
             SyncRequest::Journaled => control(Control::Journaled, ControlReply::None),
-            SyncRequest::Roster { roster, issued } => Some(Internal::Event(Event::Roster {
-                write_eligible: roster,
-                issued,
+            SyncRequest::Roster { stamp, read } => Some(Internal::Event(Event::Roster {
+                seq: stamp.seq,
+                write_eligible: read.write_eligible,
+                read_only: read.read_only,
+                complete: read.complete,
+                lapses: stamp.lapses,
+                issued: stamp.issued,
             })),
-            SyncRequest::RosterUnread { issued } => {
-                Some(Internal::Event(Event::RosterUnread { issued }))
-            }
             SyncRequest::EpochChanged => {
                 self.report_epoch(false);
                 None
@@ -4763,12 +4779,11 @@ impl Driver {
                 Action::RefreshRoster => {
                     let store = self.deps.store_inner.clone();
                     let sync_tx = self.sync_tx.clone();
-                    let issued = WaitMs(wait_now_ms());
+                    let stamp = self.deps.off_core.roster_stamp();
                     tokio::spawn(async move {
-                        if let Ok(roster) =
-                            constellation_store_s3::write_eligible_roster(store).await
-                        {
-                            let _ = sync_tx.send(SyncRequest::Roster { roster, issued });
+                        let scan = constellation_store_s3::registry_scan(store.as_ref()).await;
+                        if let Some(req) = crate::sync::roster_request(scan.ok().as_ref(), stamp) {
+                            let _ = sync_tx.send(req);
                         }
                     });
                 }

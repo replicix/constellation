@@ -12,6 +12,35 @@ use constellation_meta::{
 };
 use constellation_store_s3::{Lease, LeaseMode, LeaseStore};
 
+/// The next registry read number: every read of a test is newer than the
+/// ones before it (the driver numbers them in the order it issues them).
+fn next_roster_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A complete registry read listing `nodes`, newer than every read so far.
+fn roster_ev(nodes: Vec<NodeId>, issued: WaitMs) -> Event {
+    roster_ev_seq(next_roster_seq(), nodes, true, issued)
+}
+
+/// A registry read that could not be completed and listed nobody it read.
+fn roster_unread_ev(issued: WaitMs) -> Event {
+    roster_ev_seq(next_roster_seq(), Vec::new(), false, issued)
+}
+
+/// A registry read numbered `seq`.
+fn roster_ev_seq(seq: u64, nodes: Vec<NodeId>, complete: bool, issued: WaitMs) -> Event {
+    Event::Roster {
+        seq,
+        write_eligible: nodes,
+        read_only: Vec::new(),
+        complete,
+        lapses: 0,
+        issued,
+    }
+}
+
 /// An answer's source with its rule at version 0: what a test that does not
 /// know the configuration's version compares.
 fn versionless(source: crate::AnswerSource) -> crate::AnswerSource {
@@ -12841,10 +12870,7 @@ mod pipelined_appends {
         h.hold(1, None);
         // A lease that outlasts the two minutes (no renewal in between).
         h.set_lease_end(h.now.plus(3_600_000));
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
         let link = |node, since| crate::event::PeerLink {
             node,
             connected: true,
@@ -13330,10 +13356,7 @@ mod m10 {
     fn flex(slack: u32) -> Harness {
         let mut h = Harness::new(1);
         h.core.cfg.epoch_slack = slack;
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
         h
     }
 
@@ -13944,10 +13967,7 @@ mod m10 {
     fn a_transferred_hold_journals_under_the_epoch_its_flush_will_claim() {
         let mut h = Harness::new(2);
         h.core.cfg.epoch_slack = 1;
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
         h.step(Event::Peers {
             registry_complete: true,
             links: vec![crate::event::PeerLink {
@@ -14957,10 +14977,7 @@ mod backup_crash {
         h.core.cfg.backup_rtt_budget_ms = 50;
         h.core.cfg.backups_max = 1;
         h.core.cfg.backup_stable_ms = 200;
-        h.step(Event::Roster {
-            write_eligible: roster,
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(roster, WaitMs(i64::MAX)));
     }
 
     /// Node 2 linked (or not), its link up for `age` ms and measured at
@@ -15065,10 +15082,7 @@ mod backup_crash {
         link_2(&mut h, true, Some(5), 0);
         h.hold(1, None);
         assert!(!h.core.backup_could_be_had(), "not on the roster");
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2], WaitMs(i64::MAX)));
         assert!(h.core.backup_could_be_had());
         // One that sealed the epoch is no candidate but still a peer that
         // takes over with its tail: it counts.
@@ -15112,9 +15126,7 @@ mod backup_crash {
         link_2(&mut h, true, Some(5), 0);
         h.hold(1, None);
         assert!(h.core.backup_could_be_had());
-        h.step(Event::RosterUnread {
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_unread_ev(WaitMs(i64::MAX)));
         assert!(h.core.backup_could_be_had(), "peers linked, roster unread");
         h.core.ack.eligible = Some(h.core.backup_could_be_had());
         assert!(!h.core.root_lone(), "must not answer alone");
@@ -15124,41 +15136,67 @@ mod backup_crash {
         backup_node(&mut h, vec![1]);
         link_2(&mut h, true, Some(5), 0);
         h.hold(1, None);
-        h.step(Event::RosterUnread {
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_unread_ev(WaitMs(i64::MAX)));
         assert!(h.core.backup_could_be_had());
         // A complete read clears it.
-        h.step(Event::Roster {
-            write_eligible: vec![1],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1], WaitMs(i64::MAX)));
         assert!(!h.core.backup_could_be_had());
     }
 
-    /// An older roster read that arrives after a newer one does not
-    /// replace it.
+    /// A roster read numbered before the installed one, arriving after it
+    /// (the two producers, the 5 s poll and `Action::RefreshRoster`, spawn
+    /// their reads), does not replace it, whatever its clock says: it
+    /// cannot drop a member the newer read listed (ADR-50, F2).
     #[test]
-    fn an_older_roster_read_does_not_replace_a_newer_one() {
+    fn an_older_roster_read_does_not_drop_a_newer_member() {
         let mut h = Harness::new(1);
         backup_node(&mut h, vec![1, 2]);
-        h.step(Event::Roster {
-            write_eligible: vec![1],
-            issued: WaitMs(i64::MAX - 1_000),
-        });
-        assert_eq!(h.core.roster.write_eligible(), [1, 2]);
-        h.step(Event::RosterUnread {
-            issued: WaitMs(i64::MAX - 500),
-        });
-        assert!(
-            !h.core.roster.unread_for_test(),
-            "an older unread is stale too"
-        );
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        let newest = u64::MAX - 10;
+        h.step(roster_ev_seq(newest, vec![1, 2, 3], true, WaitMs(i64::MAX)));
         assert_eq!(h.core.roster.write_eligible(), [1, 2, 3]);
+        // Issued at the same instant, numbered before: ignored.
+        h.step(roster_ev_seq(newest - 1, vec![1], true, WaitMs(i64::MAX)));
+        assert_eq!(h.core.roster.write_eligible(), [1, 2, 3]);
+        h.step(roster_ev_seq(newest - 5, vec![], false, WaitMs(i64::MAX)));
+        assert!(
+            !h.core.roster.incomplete_for_test(),
+            "an older read that could not be completed is stale too"
+        );
+        h.step(roster_ev_seq(
+            newest + 1,
+            vec![1, 2, 3, 4],
+            true,
+            WaitMs(i64::MAX),
+        ));
+        assert_eq!(h.core.roster.write_eligible(), [1, 2, 3, 4]);
+    }
+
+    /// A read that could not be completed (one record vanished or did not
+    /// parse) never empties the roster, whatever it lists: the root keeps
+    /// the peers it knew, and the ones the read did name join them (ADR-50,
+    /// F1).
+    #[test]
+    fn an_incomplete_roster_read_leaves_the_root_with_its_peers() {
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1, 2]);
+        link_2(&mut h, true, Some(5), 0);
+        h.hold(1, None);
+        h.step(roster_ev_seq(
+            next_roster_seq(),
+            Vec::new(),
+            false,
+            WaitMs(i64::MAX),
+        ));
+        assert_eq!(h.core.roster.write_eligible(), [1, 2], "none is removed");
+        h.core.ack.eligible = Some(h.core.backup_could_be_had());
+        assert!(!h.core.root_lone(), "must not answer alone");
+        h.step(roster_ev_seq(
+            next_roster_seq(),
+            vec![1, 3],
+            false,
+            WaitMs(i64::MAX),
+        ));
+        assert_eq!(h.core.roster.write_eligible(), [1, 2, 3], "it adds");
     }
 
     /// Plan 46 M1.1 step 2: the root's rule is one lookup of its
@@ -15406,10 +15444,7 @@ mod backup_crash {
         link_2(&mut h, true, Some(5), 1_000);
         assert_eq!(h.core.ack.eligible, Some(false));
         h.advance(10);
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2], WaitMs(i64::MAX)));
         assert_eq!(h.core.ack_need(&pos), Some(5), "answered alone");
 
         // Any event raises it: the clock alone does not change what a link
@@ -15690,10 +15725,7 @@ mod backup_crash {
         h.core.cfg.backup_rtt_budget_ms = 50;
         h.core.cfg.backups_max = 1;
         h.core.cfg.backup_stable_ms = 0;
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2], WaitMs(i64::MAX)));
         h.step(Event::Peers {
             registry_complete: true,
             links: vec![crate::event::PeerLink {
@@ -27440,10 +27472,7 @@ mod locks {
         l.expires_unix_ms = end;
         l.holder_expires_ms = end;
         l.holder_wait_ms = wait_end;
-        let out = h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        let out = h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
         lease_swaps(&out)
             .into_iter()
             .find(|(_, l)| !l.granted_delegations && !l.released && l.holder == 2)
@@ -36487,10 +36516,7 @@ fn a_member_closes_once_the_carried_lease_has_moved_and_uploads_meanwhile() {
 #[test]
 fn a_candidate_that_sealed_the_epoch_is_not_reinvited() {
     let mut h = Harness::new(1);
-    h.step(Event::Roster {
-        write_eligible: vec![1, 2],
-        issued: WaitMs(i64::MAX),
-    });
+    h.step(roster_ev(vec![1, 2], WaitMs(i64::MAX)));
     h.step(Event::Peers {
         registry_complete: true,
         links: vec![crate::event::PeerLink {
@@ -38539,10 +38565,7 @@ fn placement_re_reads_the_roster_for_a_connected_writer_it_does_not_list() {
     let MutateOp::Create { ino: dir, .. } = op else {
         unreachable!()
     };
-    h.step(Event::Roster {
-        write_eligible: vec![1],
-        issued: WaitMs(i64::MAX),
-    });
+    h.step(roster_ev(vec![1], WaitMs(i64::MAX)));
     h.step(Event::Peers {
         registry_complete: true,
         links: vec![crate::event::PeerLink {
@@ -38578,10 +38601,7 @@ fn placement_re_reads_the_roster_for_a_connected_writer_it_does_not_list() {
     let out = tick(&mut h);
     assert_eq!(refreshes(&out), 0, "re-read on every tick: {out:?}");
     // It lists the writer: the next tick delegates `d1` to it.
-    h.step(Event::Roster {
-        write_eligible: vec![1, 2],
-        issued: WaitMs(i64::MAX),
-    });
+    h.step(roster_ev(vec![1, 2], WaitMs(i64::MAX)));
     h.advance(400);
     let out = tick(&mut h);
     assert_eq!(h.core.stats.place_delegated, 1, "not delegated: {out:?}");
@@ -45354,10 +45374,7 @@ mod deleg_group {
         h.core.cfg.backup_rtt_budget_ms = 50;
         h.core.cfg.backups_max = 1;
         h.core.cfg.backup_stable_ms = 0;
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
         h.step(Event::Peers {
             registry_complete: true,
             links: vec![crate::event::PeerLink {
@@ -45910,10 +45927,7 @@ mod deleg_group {
         h.core.cfg.backup_rtt_budget_ms = 50;
         h.core.cfg.backups_max = 1;
         h.core.cfg.backup_stable_ms = 200;
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
         // The root linked just now, in budget: younger than the window.
         let since = w(h.now);
         h.step(Event::Peers {
@@ -46595,10 +46609,7 @@ mod deleg_group {
         assert_eq!(deleg_wait(&h, 2), constellation_meta::DurableWait::TimedOut);
         // The generation is stopped (a recall): nothing more will commit.
         h.core.dl.mine.get_mut(&7).unwrap().stopped = true;
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
         assert_eq!(deleg_wait(&h, 2), constellation_meta::DurableWait::Lost);
         assert!(
             matches!(
@@ -46609,10 +46620,7 @@ mod deleg_group {
         );
         // No longer held: withdrawn.
         h.core.dl.mine.remove(&7);
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
         assert_eq!(h.meta.session().deleg_row_class(7), None);
         // Row 1 was covered before the withdrawal: it stays durable; row 2
         // was not, and is in doubt.
@@ -46696,10 +46704,7 @@ mod deleg_group {
                 )
                 .unwrap();
         }
-        let out = h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        let out = h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
         let (breq, blast) = backup_append(&out).expect("streamed to the backup");
         let (req, round, last) = batch(&out).expect("streamed to the root");
         assert_eq!(h.core.dl.mine[&7].acked_max, 0);
@@ -46753,10 +46758,7 @@ mod deleg_group {
                 )
                 .unwrap();
         }
-        let out = h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3, 4],
-            issued: WaitMs(i64::MAX),
-        });
+        let out = h.step(roster_ev(vec![1, 2, 3, 4], WaitMs(i64::MAX)));
         let (req, round, last) = batch(&out).expect("streamed to the root");
         // The root drifts out of the budget.
         h.step(Event::Peers {
@@ -47685,10 +47687,7 @@ mod deleg_group {
             lapses: 0,
             issued: WaitMs(i64::MAX),
         });
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
         h
     }
 
@@ -52006,10 +52005,7 @@ mod deleg_windows_tests {
         h.advance(10);
         let mut out = Vec::new();
         h.core.start_recall(h.clk(), 7, &mut out);
-        h.step(Event::Roster {
-            write_eligible: vec![1, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 3], WaitMs(i64::MAX)));
         assert!(!h.core.dw.get(7).unwrap().open);
         assert!(!h.core.dw.get(7).unwrap().settled);
         assert_eq!(
@@ -52054,27 +52050,18 @@ mod deleg_windows_tests {
         let mut h = root_with_delegate_backed_by(4);
         assert!(h.core.dw.lease_cert().is_some());
         h.core.lease.releasing = true;
-        h.step(Event::Roster {
-            write_eligible: vec![1, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 3], WaitMs(i64::MAX)));
         assert!(h.core.dw.lease_cert().is_none());
         assert_eq!(
             h.core.dw.extend_off_core(7, 3, h.clk()),
             Err(crate::core::Refusal::Lease)
         );
         h.core.lease.releasing = false;
-        h.step(Event::Roster {
-            write_eligible: vec![1, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 3], WaitMs(i64::MAX)));
         assert!(h.core.dw.lease_cert().is_some());
         let mut out = Vec::new();
         h.core.deleg_on_epoch(h.clk(), true, &h.meta, &mut out);
-        h.step(Event::Roster {
-            write_eligible: vec![1, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 3], WaitMs(i64::MAX)));
         assert!(h.core.dw.lease_cert().is_none());
     }
 
@@ -52116,10 +52103,7 @@ mod deleg_windows_tests {
         );
         // The end of the step does not settle it while the barrier applies
         // under the subtree.
-        h.step(Event::Roster {
-            write_eligible: vec![1, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 3], WaitMs(i64::MAX)));
         assert!(!h.core.dw.get(7).unwrap().settled);
     }
 
@@ -52134,10 +52118,7 @@ mod deleg_windows_tests {
             .unwrap();
         h.core.lock_barrier(other, 5_000, None);
         assert!(!h.core.dw.get(7).unwrap().settled, "in the step itself");
-        h.step(Event::Roster {
-            write_eligible: vec![1, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 3], WaitMs(i64::MAX)));
         assert!(h.core.dw.get(7).unwrap().settled, "re-published settled");
     }
 
@@ -52392,10 +52373,7 @@ mod lock_lane_core_tests {
     use constellation_meta::locks::{GrantId, LockMode};
 
     fn roster(h: &mut Harness) {
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2], WaitMs(i64::MAX)));
     }
 
     fn view(h: &Harness) -> crate::lane::LockLaneView {
@@ -61486,10 +61464,7 @@ mod m11_step5 {
     #[test]
     fn a_read_issued_before_a_forward_does_not_forget_its_requester() {
         fn roster_read(h: &mut Harness, nodes: Vec<NodeId>, issued: WaitMs) {
-            h.step(Event::Roster {
-                write_eligible: nodes,
-                issued,
-            });
+            h.step(roster_ev(nodes, issued));
         }
         fn peers_read(h: &mut Harness, issued: WaitMs) {
             h.step(Event::Peers {
@@ -61509,7 +61484,7 @@ mod m11_step5 {
         backup_node(&mut h, vec![1]);
         // `backup_node`'s read is stamped at the end of time; the reads
         // below are issued by the clock.
-        h.core.roster.forget_issued_for_test();
+        h.core.roster.forget_reads_for_test();
         h.hold(1, None);
         h.core.ack.eligible = Some(h.core.backup_could_be_had());
         assert!(h.core.root_lone());
@@ -62786,10 +62761,7 @@ mod step9_one_stream_per_node {
             .unwrap();
             dirs.push(d);
         }
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2], WaitMs(i64::MAX)));
         link_to_2(&mut h, rtt_ms);
         (h, dirs)
     }
@@ -63073,10 +63045,7 @@ mod step9_one_stream_per_node {
             .unwrap();
             dirs.push(d);
         }
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2], WaitMs(i64::MAX)));
         h.step(Event::Peers {
             registry_complete: true,
             links: vec![crate::event::PeerLink {
@@ -65085,10 +65054,7 @@ mod step4_sticky {
             Replica::apply_segment(&h.meta, dirs.len() as u64 + 1, 1, 0, &[], &[], &[rec]).unwrap();
             dirs.push(d);
         }
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2], WaitMs(i64::MAX)));
         h.step(Event::Peers {
             registry_complete: true,
             links: vec![crate::event::PeerLink {
@@ -65462,10 +65428,7 @@ mod step4_sticky {
     /// `delegation_ttl_ms`.
     fn root_with_a_silent_sticky_holder() -> (Harness, u64) {
         let (mut h, d1, _d2) = root_with_two_dirs();
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
         h.step(Event::Peers {
             registry_complete: true,
             links: vec![crate::event::PeerLink {
@@ -65944,10 +65907,7 @@ mod step4_sticky {
             through: 0,
         };
         Replica::apply_segment(&h.meta, 2, 1, 0, &[], &[], &[end]).unwrap();
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2], WaitMs(i64::MAX)));
         assert_eq!(rd(&h).held_count(), 0, "the grant held is void");
         assert!(
             !rd(&h).install(5, held(epoch), rd(&h).recall_gen()),
@@ -65992,18 +65952,12 @@ mod step4_sticky {
             };
         assert!(ask(&mut h, 2).is_some(), "a roster node is granted");
         assert!(ask(&mut h, 9).is_none(), "an unknown reader was granted");
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3, 9],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2, 3, 9], WaitMs(i64::MAX)));
         assert!(ask(&mut h, 9).is_some(), "a known reader is not granted");
         // The audience never shrinks: a later complete scan that lost 9
         // (its record unreadable) leaves it asked by a void, so it is still
         // granted; the grant and the void use the one audience.
-        h.step(Event::Roster {
-            write_eligible: vec![1, 2, 3],
-            issued: WaitMs(i64::MAX),
-        });
+        h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
         h.step(Event::Peers {
             registry_complete: true,
             links: Vec::new(),
@@ -68176,10 +68130,7 @@ mod step5_sticky_release {
     }
 
     fn roster_event() -> Event {
-        Event::Roster {
-            write_eligible: vec![1, 2, 3, 4],
-            issued: WaitMs(i64::MAX),
-        }
+        roster_ev(vec![1, 2, 3, 4], WaitMs(i64::MAX))
     }
 
     /// Expectation (fail-before: the quarantine ran to the horizon): once

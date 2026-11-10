@@ -162,6 +162,9 @@ pub struct Shared {
     /// snapshot (`Event::Peers`'s `lapses`), as the daemon's
     /// `peer_links_task` does.
     lapses_handed: AtomicU64,
+    /// The number of the latest registry read issued (`Event::Roster::seq`):
+    /// one counter for the ticker and `Action::RefreshRoster`, as the daemon's.
+    roster_seq: AtomicU64,
     /// What the off-core heartbeat beats to (the daemon's
     /// `AliveTargets`): the epoch and end of the lease this node
     /// holds, `Core::beat_guard_wait_ms` and `Core::liveness_targets`,
@@ -597,6 +600,7 @@ impl NodeHandle {
             lag: Mutex::new(None),
             lag_since: Mutex::new(None),
             lapses_handed: AtomicU64::new(0),
+            roster_seq: AtomicU64::new(0),
             liveness: Mutex::new(None),
             conflict_copies: AtomicU64::new(0),
             floor_ms: Mutex::new(Vec::new()),
@@ -1979,7 +1983,11 @@ impl Driver {
                     let nodes = bus.nodes();
                     if tx
                         .send(Event::Roster {
+                            seq: shared.roster_seq.fetch_add(1, Ordering::SeqCst) + 1,
                             write_eligible: nodes.clone(),
+                            read_only: Vec::new(),
+                            complete: true,
+                            lapses: shared.lapses_handed.load(Ordering::SeqCst),
                             issued: clock.now().wait,
                         })
                         .is_err()
@@ -3973,7 +3981,11 @@ impl Driver {
                 }
                 Action::RefreshRoster => {
                     let _ = self.tx.send(Event::Roster {
+                        seq: self.shared.roster_seq.fetch_add(1, Ordering::SeqCst) + 1,
                         write_eligible: self.bus.nodes(),
+                        read_only: Vec::new(),
+                        complete: true,
+                        lapses: self.shared.lapses_handed.load(Ordering::SeqCst),
                         issued: self.clock.now().wait,
                     });
                 }
