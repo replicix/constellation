@@ -62,6 +62,9 @@ impl Harness {
         cfg.forward_retries = 2;
         let mut core = Core::new(cfg);
         let now = Ms(1_000_000);
+        // An established node: its earlier delegate read grants are known
+        // to have passed (a store with no such record is a full span).
+        meta.settle_deleg_grant_horizon(Now::same(now.0)).unwrap();
         let mut out = Vec::new();
         core.start(Now::same(now.0), &meta, &mut out);
         // The peer directory knows nodes 2..=4 (never talked to: reachable).
@@ -25970,7 +25973,11 @@ mod locks {
         let mut r = Harness::new(h.core.node_id());
         r.core = Core::new(h.core.cfg.clone());
         r.now = h.now.plus(after_ms);
-        for key in ["lock_grant_horizon_ms", "read_grant_horizon_ms"] {
+        for key in [
+            "lock_grant_horizon_ms",
+            "read_grant_horizon_ms",
+            "deleg_read_grant_horizon_ms",
+        ] {
             if let Some(v) = h.meta.kv_get(key).unwrap() {
                 r.meta.kv_set_durable(key, &v).unwrap();
             }
@@ -38315,6 +38322,8 @@ fn a_restarted_delegate_readopts_its_delegation_at_start() {
     let mut core = Core::new(cfg);
     core.lease.cached_holder = Some(1);
     let now = Ms(1_000_000);
+    // An established node (see `Harness::with`).
+    meta.settle_deleg_grant_horizon(Now::same(now.0)).unwrap();
     let mut out = Vec::new();
     core.start(Now::same(now.0), &meta, &mut out);
     assert!(core.dl.mine.contains_key(&7), "not re-adopted at start");
@@ -66656,6 +66665,425 @@ mod step5_sticky_release {
             assert_eq!(h.core.stats.deleg_sticky_recalled_other, 0);
         }
         let _: Option<TouchSet> = None;
+    }
+
+    // ---------------------------------------------------- ADR-46: restart
+
+    /// Installs stream 7 over `names` (kind `kind`) on `h`, as a restarted
+    /// node's `delegation_sync` does; the dirs and the sync's actions.
+    fn install_holder(
+        h: &mut Harness,
+        names: &[&str],
+        kind: SubtreeKind,
+    ) -> (Vec<constellation_fs_core::Ino>, Vec<Action>) {
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.read_delegations = true;
+        h.core.lease.cached_holder = Some(1);
+        let mut records = Vec::new();
+        let mut dirs = Vec::new();
+        for name in names {
+            let (d, rec) = mkdir(h, name);
+            records.push(rec);
+            dirs.push(d);
+        }
+        records.push(LogRecord::DelegateNode {
+            node: 3,
+            gen: 7,
+            dirs: dirs
+                .iter()
+                .map(|dir| constellation_meta::SubtreeGrant { dir: *dir, kind })
+                .collect(),
+        });
+        let n = records.len() as u64;
+        Replica::install_streamed(&h.meta, 1, 1, 1, n, &records, true, (0, 0)).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        (dirs, out)
+    }
+
+    /// A holder (node 3) of stream 7, kind `kind`, and the read grant it
+    /// made to node 2 on its first directory.
+    fn holder_with_a_grant(kind: SubtreeKind) -> (Harness, Vec<constellation_fs_core::Ino>) {
+        let mut h = Harness::new(3);
+        let (dirs, out) = install_holder(&mut h, &["d"], kind);
+        if kind == SubtreeKind::Placed {
+            let req = renew_req(&out, 7).expect("no renewal");
+            h.step(renewed(&h, req, 7, 5_000));
+        }
+        let now = h.clk();
+        let outcome = h.core.deleg_read_index(now, 2, dirs[0], None, &h.meta);
+        assert!(
+            matches!(
+                outcome,
+                Some(crate::event::ReadIndexOutcome::Ok { grant: Some(_), .. })
+            ),
+            "{outcome:?}"
+        );
+        (h, dirs)
+    }
+
+    /// A new process of `h`'s node `after_ms` later over the same disk: the
+    /// persisted horizons are the old process's, the read-delegation table is
+    /// empty, and the delegation is installed again from the journal.
+    fn restart_holder(
+        h: &Harness,
+        after_ms: u64,
+        kind: SubtreeKind,
+        keep_horizon: bool,
+    ) -> (Harness, Vec<constellation_fs_core::Ino>, Vec<Action>) {
+        let mut r = Harness::new(3);
+        r.core = Core::new(h.core.cfg.clone());
+        r.now = h.now.plus(after_ms);
+        for key in [
+            "lock_grant_horizon_ms",
+            "read_grant_horizon_ms",
+            "deleg_read_grant_horizon_ms",
+        ] {
+            if key == "deleg_read_grant_horizon_ms" && !keep_horizon {
+                r.meta.kv_del(key).unwrap();
+                continue;
+            }
+            if let Some(v) = h.meta.kv_get(key).unwrap() {
+                r.meta.kv_set_durable(key, &v).unwrap();
+            }
+        }
+        let mut out = Vec::new();
+        r.core.start(r.clk(), &r.meta, &mut out);
+        r.step(Event::Peers {
+            links: (2..=4)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: false,
+                    last_seen: None,
+                    rtt_ms: None,
+                    since: None,
+                })
+                .collect(),
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+        let (dirs, out) = install_holder(&mut r, &["d"], kind);
+        (r, dirs, out)
+    }
+
+    fn restart_timer(h: &Harness) -> crate::ids::TimerId {
+        h.core.dl.mine[&7]
+            .restart_q
+            .as_ref()
+            .and_then(|q| q.timer)
+            .expect("no restart quarantine timer")
+    }
+
+    fn forward_create(h: &mut Harness, dir: constellation_fs_core::Ino, seq: u64) -> Vec<Action> {
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(500 + seq),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq,
+                },
+                op: MutateOp::Create {
+                    parent: dir,
+                    name: format!("fw{seq}"),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                acked_through: 0,
+                deps: Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: false,
+            },
+        })
+    }
+
+    fn reply_outcome(out: &[Action], req: u64) -> Option<MutateOutcome> {
+        sends(out).into_iter().find_map(|(_, m)| match m {
+            PeerMsg::MutateReply {
+                req: r, outcome, ..
+            } if *r == OpId(req) => Some(outcome.clone()),
+            _ => None,
+        })
+    }
+
+    /// Expectation (fail-before: the write executed at once): a sticky holder
+    /// that restarts 2 s after granting a read delegation parks its own write
+    /// until the persisted horizon, then executes it.
+    #[test]
+    fn a_restarted_sticky_holder_parks_its_writes_until_its_read_grant_horizon() {
+        let (h, _dirs) = holder_with_a_grant(SubtreeKind::Sticky);
+        let (mut r, dirs, _) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
+        assert_eq!(r.core.stats.deleg_restart_quarantines, 1);
+        create_in(&mut r, dirs[0], 1);
+        assert_eq!(
+            r.core.dl.mine[&7].executed, 0,
+            "executed inside the quarantine"
+        );
+        assert_eq!(r.core.dl.mine[&7].parked.len(), 1);
+        assert_eq!(r.core.stats.deleg_restart_q_parks, 1);
+        // Just before the horizon: still parked.
+        let until = r.core.dl.mine[&7].restart_q.as_ref().unwrap().until;
+        let id = restart_timer(&r);
+        r.advance(until.since(r.clk().wait) as u64 - 1);
+        r.step(Event::Peers {
+            links: Vec::new(),
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+        assert_eq!(r.core.dl.mine[&7].executed, 0);
+        r.advance(1);
+        r.step(Event::Timer { id });
+        assert_eq!(
+            r.core.dl.mine[&7].executed, 1,
+            "not run once the horizon passed"
+        );
+        assert_eq!(r.core.stats.deleg_restart_q_waited_out, 1);
+    }
+
+    /// Expectation (fail-before: executed and acknowledged at once): a
+    /// forward to a quarantined holder is answered `Held` and nothing is
+    /// journaled; the retry after the horizon executes.
+    #[test]
+    fn a_restarted_holder_answers_a_forward_held_and_journals_nothing() {
+        let (h, _dirs) = holder_with_a_grant(SubtreeKind::Sticky);
+        let (mut r, dirs, _) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
+        let rows_before = rows(&r).len();
+        let out = forward_create(&mut r, dirs[0], 1);
+        let Some(MutateOutcome::Held {
+            retry_ms,
+            outwait_ms,
+        }) = reply_outcome(&out, 501)
+        else {
+            panic!("not answered Held: {out:?}");
+        };
+        assert!(
+            (1..=r.core.cfg.forward_timeout_ms).contains(&retry_ms),
+            "{retry_ms}"
+        );
+        assert_eq!(outwait_ms, None);
+        assert_eq!(rows(&r).len(), rows_before, "a row was journaled");
+        assert_eq!(r.core.dl.mine[&7].parked.len(), 0, "a forward was parked");
+        assert_eq!(r.core.stats.deleg_restart_q_held, 1);
+        // The retry after the horizon executes.
+        let id = restart_timer(&r);
+        let until = r.core.dl.mine[&7].restart_q.as_ref().unwrap().until;
+        r.advance(until.since(r.clk().wait) as u64);
+        r.step(Event::Timer { id });
+        let out = forward_create(&mut r, dirs[0], 1);
+        assert!(
+            !matches!(reply_outcome(&out, 501), Some(MutateOutcome::Held { .. })),
+            "{out:?}"
+        );
+        assert_eq!(r.core.dl.mine[&7].executed, 1);
+    }
+
+    /// Expectation (fail-before: the key was absent): a delegate's read grant
+    /// persists its horizon, covering the grant, before it is answered.
+    #[test]
+    fn a_delegate_read_grant_persists_its_horizon_before_it_is_answered() {
+        let mut h = Harness::new(3);
+        let (dirs, _) = install_holder(&mut h, &["d"], SubtreeKind::Sticky);
+        let now = h.clk();
+        let Some(crate::event::ReadIndexOutcome::Ok {
+            grant: Some(grant), ..
+        }) = h.core.deleg_read_index(now, 2, dirs[0], None, &h.meta)
+        else {
+            panic!("no grant");
+        };
+        let stored = h
+            .meta
+            .kv_get("deleg_read_grant_horizon_ms")
+            .unwrap()
+            .expect("the horizon was not persisted");
+        assert_ne!(stored, "none");
+        let ends = now.wait.plus(grant.ttl_ms);
+        assert!(
+            matches!(
+                h.meta.load_deleg_grant_quarantine(now, 100_000),
+                constellation_meta::readdeleg::DelegHorizon::Until(t) if t >= ends
+            ),
+            "the horizon does not cover the grant: {stored}"
+        );
+        // The root's key is untouched.
+        assert_eq!(h.meta.kv_get("read_grant_horizon_ms").unwrap(), None);
+    }
+
+    /// Expectation (fail-before: a grant was made): inside the quarantine a
+    /// read is answered with the position and no grant; after it, a grant.
+    #[test]
+    fn a_restarted_holder_grants_no_read_delegation_during_the_quarantine() {
+        let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
+        let (mut r, dirs, _) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
+        let now = r.clk();
+        let outcome = r.core.deleg_read_index(now, 2, dirs[0], None, &r.meta);
+        assert!(
+            matches!(
+                outcome,
+                Some(crate::event::ReadIndexOutcome::Ok { grant: None, .. })
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(r.core.stats.deleg_read_grants_quarantined, 1);
+        assert_eq!(r.core.stats.deleg_read_grants, 0);
+        let id = restart_timer(&r);
+        let until = r.core.dl.mine[&7].restart_q.as_ref().unwrap().until;
+        r.advance(until.since(r.clk().wait) as u64);
+        r.step(Event::Timer { id });
+        let now = r.clk();
+        let outcome = r.core.deleg_read_index(now, 2, dirs[0], None, &r.meta);
+        assert!(
+            matches!(
+                outcome,
+                Some(crate::event::ReadIndexOutcome::Ok { grant: Some(_), .. })
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    /// Guard (passes on the parent too): a settle passes the quarantine; its
+    /// refusal is a row, not a hold.
+    #[test]
+    fn a_settle_is_answered_during_the_quarantine() {
+        let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
+        let (mut r, dirs, _) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
+        let ino = r.meta.allocate_ino(dirs[0]).unwrap();
+        r.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(600),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: 9,
+                },
+                op: MutateOp::Create {
+                    parent: dirs[0],
+                    name: "s".into(),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                acked_through: 0,
+                deps: Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: true,
+            },
+        });
+        assert_eq!(r.core.stats.settles_refused, 1);
+        assert_eq!(r.core.stats.deleg_restart_q_held, 0);
+        assert!(r.meta.lookup(dirs[0], "s").unwrap().is_none());
+    }
+
+    /// Expectation (fail-before: no wait): a restart whose delegate horizon
+    /// key is gone waits a full read span.
+    #[test]
+    fn a_restart_with_no_delegate_horizon_waits_a_full_span() {
+        let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
+        let (mut r, dirs, _) = restart_holder(&h, 2_000, SubtreeKind::Sticky, false);
+        let span = r.core.cfg.read_horizon_span_ms();
+        let q = r.core.dl.mine[&7]
+            .restart_q
+            .clone()
+            .expect("not quarantined");
+        assert_eq!(q.until.since(r.clk().wait), span);
+        create_in(&mut r, dirs[0], 1);
+        assert_eq!(r.core.dl.mine[&7].executed, 0);
+        // Settling at the end of it records "none".
+        let id = restart_timer(&r);
+        r.advance(span as u64);
+        r.step(Event::Timer { id });
+        assert_eq!(r.core.dl.mine[&7].executed, 1);
+        assert_eq!(
+            r.meta
+                .kv_get("deleg_read_grant_horizon_ms")
+                .unwrap()
+                .as_deref(),
+            Some("none")
+        );
+    }
+
+    /// Expectation (fail-before: the row streamed at once): a restarted
+    /// holder told to release journals its release row but does not stream
+    /// it before the previous process's read grants have expired.
+    #[test]
+    fn a_restarted_holders_release_row_waits_for_the_quarantine() {
+        let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
+        let (mut r, _dirs, _) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
+        let out = release(&mut r, 50, Vec::new(), true);
+        assert!(last_is_release(&r), "{out:?}");
+        assert!(
+            batch(&out).is_none(),
+            "the row streamed inside the quarantine: {out:?}"
+        );
+        assert!(r.core.dl.mine[&7].release.as_ref().unwrap().held);
+        let id = restart_timer(&r);
+        let until = r.core.dl.mine[&7].restart_q.as_ref().unwrap().until;
+        r.advance(until.since(r.clk().wait) as u64);
+        let out = r.step(Event::Timer { id });
+        let out = flush(&mut r, &out);
+        assert!(
+            batch(&out).is_some(),
+            "no row once the quarantine ended: {out:?}"
+        );
+    }
+
+    /// Expectation (fail-before: executed at once): a placed delegate
+    /// restarted on the same boot waits its predecessor's grants out too,
+    /// once its renewal makes it honoured.
+    #[test]
+    fn a_placed_delegate_restarted_on_the_same_boot_waits_its_old_grants() {
+        let (h, _) = holder_with_a_grant(SubtreeKind::Placed);
+        let (mut r, dirs, out) = restart_holder(&h, 2_000, SubtreeKind::Placed, true);
+        let req = renew_req(&out, 7).expect("no renewal");
+        r.step(renewed(&r, req, 7, 5_000));
+        assert!(r.core.dl.mine[&7].until > r.honour(), "not honoured");
+        create_in(&mut r, dirs[0], 1);
+        assert_eq!(
+            r.core.dl.mine[&7].executed, 0,
+            "executed inside the quarantine"
+        );
+        let id = restart_timer(&r);
+        let until = r.core.dl.mine[&7].restart_q.as_ref().unwrap().until;
+        r.advance(until.since(r.clk().wait) as u64);
+        r.step(Event::Timer { id });
+        assert_eq!(r.core.dl.mine[&7].executed, 1);
+    }
+
+    /// Expectation: the engine's fast path sees a quarantined generation as
+    /// stopped (it is not admitted), and as running again after.
+    #[test]
+    fn a_quarantined_generation_is_published_as_stopped() {
+        let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
+        let (mut r, _dirs, _) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
+        let mut view = crate::core::DelegView::default();
+        r.core.deleg_view_local(&mut view);
+        assert!(view.mine[0].3, "not published as stopped");
+        let id = restart_timer(&r);
+        let until = r.core.dl.mine[&7].restart_q.as_ref().unwrap().until;
+        r.advance(until.since(r.clk().wait) as u64);
+        r.step(Event::Timer { id });
+        r.core.deleg_view_local(&mut view);
+        assert!(!view.mine[0].3, "still stopped");
+    }
+
+    /// The negative control: with `restart_skips_write_quarantine` the
+    /// restarted holder's write executes at once and its read is granted.
+    #[test]
+    fn the_knob_skips_the_restart_quarantine() {
+        let (mut h, _) = holder_with_a_grant(SubtreeKind::Sticky);
+        h.core.cfg.restart_skips_write_quarantine = true;
+        let (mut r, dirs, _) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
+        assert!(r.core.dl.mine[&7].restart_q.is_none());
+        create_in(&mut r, dirs[0], 1);
+        assert_eq!(r.core.dl.mine[&7].executed, 1);
     }
 }
 
