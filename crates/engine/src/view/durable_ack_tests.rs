@@ -648,6 +648,56 @@ fn a_lone_row_journaled_after_the_node_stopped_being_lone_is_in_doubt() {
     assert_eq!(session.stats().ungated_unexpected, 1);
 }
 
+/// ADR-52: the in-lock check precedes the commit; a commit that stalls past
+/// the lease (the lease mirror says it is gone by the time the row is
+/// acknowledged) leaves the `Singleton` row in doubt: resubmitted through
+/// the core under its rid, not answered at once. A lease still usable
+/// answers at once. Fails on the parent: answered `Ok` at once.
+#[test]
+fn a_singleton_row_whose_lease_ran_out_under_the_commit_is_in_doubt() {
+    use constellation_meta::RowCommit;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let session = meta.session();
+    session.set_durable(false, u64::MAX, false, RowCommit::LONE, true);
+    let (fs, _dir, mut core) = holder_fs(meta.clone(), false);
+    let lease = fs.sync.as_ref().unwrap().lease.clone();
+    let create = |name: &str| constellation_meta::MutateOp::Create {
+        parent: ROOT_INO,
+        name: name.into(),
+        ino: meta.allocate_ino(ROOT_INO).unwrap(),
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    // Usable at the acknowledgement: answered at once.
+    assert_eq!(fs.mutate_op(ROOT_INO, create("fresh")), Ok(()));
+    assert_eq!(session.stats().fast_acks_stale_lease, 0);
+    // The commit stalls past the lease.
+    constellation_meta::set_after_write_hook_for_tests(Some(Box::new(move || {
+        lease.mirror(
+            &LeaseState::default(),
+            Now::same(now_unix_ms()),
+            &Config::defaults(1, 1),
+            false,
+        );
+    })));
+    let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
+    let result = std::thread::scope(|scope| {
+        let responder = scope.spawn(|| core_answering_in_doubt(&mut core, &stop, &submitted));
+        let result = fs.mutate_op(ROOT_INO, create("stalled"));
+        stop.store(true, Ordering::Relaxed);
+        responder.join().unwrap();
+        result
+    });
+    constellation_meta::set_after_write_hook_for_tests(None);
+    assert!(result.is_err(), "not answered OK: {result:?}");
+    let submitted = submitted.lock().unwrap();
+    assert_eq!(submitted.len(), 1, "resubmitted once: {submitted:?}");
+    assert!(submitted[0].1, "in doubt");
+    assert_eq!(session.stats().fast_acks_stale_lease, 1);
+}
+
 /// I1 class 2: a root resumed from a process freeze runs its FUSE threads
 /// before its driver can hand the core the lapse (and the directory snapshots
 /// queued behind it). What the core last published, that this node may

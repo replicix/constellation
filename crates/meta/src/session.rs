@@ -450,6 +450,10 @@ pub struct SessionStats {
     pub fast_acks_waited: u64,
     pub fast_ack_wait_us_total: u64,
     pub fast_acks_in_doubt: u64,
+    /// ADR-52: fast-path singleton rows whose lease a fresh reading found
+    /// unusable at the acknowledgement (a commit that stalled past it):
+    /// resubmitted in doubt through the core, which dedups the rid.
+    pub fast_acks_stale_lease: u64,
     /// Plan 43 C1-2 (D4): fast-path answers given with the gate off whose
     /// rows were re-tagged `Lone`.
     pub fast_acks_downgraded: u64,
@@ -1001,6 +1005,10 @@ impl SessionState {
     /// settled (`MutateOutcome::Abandoned`).
     pub fn count_settled_eio(&self) {
         self.stats.lock().unwrap().settled_eio += 1;
+    }
+
+    pub fn count_fast_ack_stale_lease(&self) {
+        self.stats.lock().unwrap().fast_acks_stale_lease += 1;
     }
 
     pub fn count_fast_ack_in_doubt(&self) {

@@ -20,12 +20,12 @@ pub mod store;
 
 pub use constellation_mtree::keys::snapshot_id;
 pub use error::MetaError;
-#[cfg(any(test, feature = "test-util"))]
-pub use mutate::set_before_write_hook_for_tests;
 pub use mutate::{
     execute as execute_mutate, execute_admitted, execute_tagged, MutateOp, MutateOutcome,
     OwnChunks, OwnRows, OwnTx, OWN_ROWS_CAP,
 };
+#[cfg(any(test, feature = "test-util"))]
+pub use mutate::{set_after_write_hook_for_tests, set_before_write_hook_for_tests};
 pub use prune::{Policy, PolicyError, PRUNE_XATTR};
 #[cfg(any(test, feature = "test-util"))]
 pub use readdeleg::fail_horizon_writes_on_this_thread_for_tests;

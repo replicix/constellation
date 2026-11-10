@@ -519,6 +519,10 @@ pub fn execute_tagged(
     let _op = crate::store::journal::PendingLocalOp::set(rid, op);
     crate::readdeleg::clear_victims();
     let records = execute_inner(meta, op)?;
+    // A commit that stalls (an fsync, a slow disk) is after the in-lock
+    // admission check and before the caller's acknowledgement.
+    #[cfg(any(test, feature = "test-util"))]
+    after_write::fire();
     meta.note_unshipped(&records);
     note_landed(tag);
     Ok(records)
@@ -583,6 +587,34 @@ pub fn execute_admitted(
 #[cfg(any(test, feature = "test-util"))]
 pub fn set_before_write_hook_for_tests(hook: Option<Box<dyn FnMut() -> bool>>) {
     before_write::HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+/// Tests only (`test-util`): a hook this thread runs inside
+/// [`execute_tagged`] once the op's transaction has committed — where a
+/// stalled commit (an fsync, a slow disk) delays the acknowledgement past
+/// the in-lock admission check (ADR-52).
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_after_write_hook_for_tests(hook: Option<Box<dyn FnMut()>>) {
+    after_write::HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+#[cfg(any(test, feature = "test-util"))]
+mod after_write {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut()>;
+
+    thread_local! {
+        pub(super) static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn fire() {
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+            HOOK.with(|h| *h.borrow_mut() = Some(hook));
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-util"))]

@@ -3365,7 +3365,49 @@ impl Driver {
                 &*self.meta,
             ));
         }
+        if let Some(actions) = self.stale_root_ack(now, *rid, op, tag, &outcome) {
+            return Some(actions);
+        }
         Some(self.fast_path_done(now, *rid, op, outcome, None))
+    }
+
+    /// ADR-52, as the engine's `fast_ack_target`: the root's own write is a
+    /// singleton's row answered at once only while the lease is still
+    /// usable on a reading taken now (the write was admitted on the step's
+    /// `now`, or waited for the writer lock past it). Otherwise in doubt,
+    /// by rid through the core, which dedups it.
+    fn stale_root_ack(
+        &mut self,
+        now: constellation_authority::Now,
+        rid: Rid,
+        op: &MutateOp,
+        tag: &LockTag,
+        outcome: &MutateOutcome,
+    ) -> Option<Vec<Action>> {
+        let class = self
+            .core
+            .root_commit(constellation_authority::core::Asker::Own);
+        if !matches!(outcome, MutateOutcome::Accepted { .. })
+            || !class.is_singleton()
+            || self
+                .core
+                .lease()
+                .usable(self.clock.now(), self.core.config())
+        {
+            return None;
+        }
+        self.meta.session().count_fast_ack_stale_lease();
+        self.step_now = now;
+        Some(self.core.handle(
+            now,
+            Event::SubmitInDoubt {
+                rid,
+                op: op.clone(),
+                policy: Policy::Client,
+                tag: tag.clone(),
+            },
+            &*self.meta,
+        ))
     }
 
     /// F1: start the held write (`HeldWrite`) and stall the core's next
@@ -3439,6 +3481,9 @@ impl Driver {
                 held.go = None;
                 if let Some(t) = held.thread.take() {
                     t.join().expect("held write thread");
+                }
+                if let Some(actions) = self.stale_root_ack(now, rid, op, tag, &outcome) {
+                    return actions;
                 }
                 self.fast_path_done(now, rid, op, outcome, None)
             }
@@ -3676,7 +3721,10 @@ impl Driver {
             (Some(gen), Some(class)) => {
                 self.delegate_done(now, rid, &op, &tag, outcome, gen, idx, class)
             }
-            _ => self.fast_path_done(now, rid, &op, outcome, None),
+            _ => match self.stale_root_ack(now, rid, &op, &tag, &outcome) {
+                Some(actions) => actions,
+                None => self.fast_path_done(now, rid, &op, outcome, None),
+            },
         };
         self.dispatch(actions);
     }
