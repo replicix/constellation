@@ -9949,7 +9949,9 @@ fn a_delegate_row_drained_from_a_sealed_backup_is_judged_by_the_draining_tenure(
 
 /// The negative control of the test above: with the root answering a
 /// delegate's row without waiting for its own append to be acknowledged
-/// (`Config::dedup_deleg_rows_unawaited`), seed 265 is a real I1, and the
+/// (`Config::dedup_deleg_rows_unawaited`), seed 24 is a real I1 (seed 265
+/// was, before a delegate's stopped-generation ack gave up at its deadline
+/// and moved the trajectory), and the
 /// oracle names the draining tenure's missing commit.
 #[test]
 fn an_unawaited_root_copy_of_a_drained_delegate_row_is_still_an_i1() {
@@ -9968,11 +9970,11 @@ fn an_unawaited_root_copy_of_a_drained_delegate_row_is_still_an_i1() {
         },
         "commit",
     );
-    let e = run_seed(265, cfg).expect_err("the unawaited copy must fail I1");
+    let e = run_seed(24, cfg).expect_err("the unawaited copy must fail I1");
     let e = e.to_string();
     assert!(
         e.contains("I1 acked_implies_committed")
-            && e.contains("tenure of epoch 3 did not commit it"),
+            && e.contains("tenure of epoch 1 did not commit it"),
         "{e}"
     );
 }

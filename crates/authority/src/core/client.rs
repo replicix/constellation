@@ -4033,7 +4033,19 @@ impl Core {
             // §M9) can outlast anything (S3 away under `ack=s3`): the
             // client hears in doubt and retries by rid, which `completed`
             // answers once the row is durable.
-            if !self.abort_durable_park_of(rid, out) {
+            // (An ack parked on a delegate's stream row is given up only for a
+            // generation whose delegate stopped, its renewal refused: nothing
+            // streams or renews, and the row commits when the log ends the
+            // generation, which a dead lone root never does. A running one
+            // commits it by the root's acknowledgement: waiting is the rule.)
+            let stopped: std::collections::BTreeSet<u64> = self
+                .dl
+                .mine
+                .iter()
+                .filter(|(_, d)| d.stopped)
+                .map(|(g, _)| *g)
+                .collect();
+            if !self.abort_durable_park_of(rid, &stopped, out) {
                 return;
             }
             self.stats.acks_aborted += 1;
