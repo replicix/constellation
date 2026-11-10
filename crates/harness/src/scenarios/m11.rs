@@ -1334,6 +1334,16 @@ pub fn sticky_holder_restart(_seed: u64) -> Result<()> {
             "b came back after {:?}: the old read delegations may have lapsed, the scenario proves nothing",
             killed.elapsed()
         );
+        // The other nodes' pooled connections to the dead process are
+        // evicted after a short window (2 s); an op sent into one is in
+        // doubt (EIO) for tens of seconds. Wait it out: the read
+        // delegations (30 s) are still live.
+        std::thread::sleep(Duration::from_millis(3_500));
+        anyhow::ensure!(
+            killed.elapsed() < Duration::from_secs(25),
+            "the old read delegations may have lapsed ({:?} after the kill)",
+            killed.elapsed()
+        );
         let a = &clients[0];
         let c = &clients[2];
         let t = Instant::now();
