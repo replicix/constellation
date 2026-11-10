@@ -479,6 +479,10 @@ pub struct NodeEnv {
     pub partial_release_ends_stream: bool,
     /// See `SimConfig::abandon_skips_read_recall`.
     pub abandon_skips_read_recall: bool,
+    /// See `SimConfig::roster_faults`.
+    pub roster_faults: (u64, u64),
+    /// See `SimConfig::plant_roster_shrink`.
+    pub plant_roster_shrink: bool,
     /// See `SimConfig::plant_claim_root_group_on_lone`.
     pub plant_claim_root_group_on_lone: bool,
 }
@@ -791,21 +795,14 @@ impl NodeHandle {
         cfg.inbox_ignores_touched = env.inbox_ignores_touched;
         cfg.partial_release_ends_stream = env.partial_release_ends_stream;
         cfg.abandon_skips_read_recall = env.abandon_skips_read_recall;
+        cfg.roster_installs_partial = env.plant_roster_shrink;
         let mut cfg = driver_config(cfg);
         cfg.clock_id = clock.id();
         cfg.clock_rate_budget_ppm = env.rate_budget_ppm;
         // (A node with backups off has no peer in budget for the oracles:
         // nobody could back it, `Core::backups_possible`.)
-        env.oracles.register(
-            id,
-            meta.clone(),
-            if cfg.backups_max == 0 {
-                0
-            } else {
-                cfg.backup_rtt_budget_ms
-            },
-            cfg.backup_stable_ms,
-        );
+        env.oracles.register(id, meta.clone());
+        env.oracles.note_joined(id);
         env.oracles.leases.register(
             id,
             clock.clone(),
@@ -835,6 +832,8 @@ impl NodeHandle {
             store: env.bucket.handle(id),
             bucket: env.bucket.clone(),
             roster_refresh_ms: env.roster_refresh_ms,
+            roster_faults: env.roster_faults,
+            seed: env.seed,
             world: env.world.clone(),
             bus: env.bus.clone(),
             step_now: clock.now(),
@@ -1119,6 +1118,8 @@ struct Driver {
     store: Arc<dyn object_store::ObjectStore>,
     bucket: Arc<Bucket>,
     roster_refresh_ms: u64,
+    roster_faults: (u64, u64),
+    seed: u64,
     world: Arc<ChunkWorld>,
     bus: Arc<Bus>,
     clock: Clock,
@@ -1984,13 +1985,14 @@ impl Driver {
         // on a ticker like the daemon's registry poll and `probe_all`.
         {
             let (tx, bus, id) = (self.tx.clone(), self.bus.clone(), self.id);
-            let oracles = self.oracles.clone();
             let p2p = self.core.config().p2p;
             let (roster_refresh_ms, bucket) = (self.roster_refresh_ms, self.bucket.clone());
+            let (roster_faults, seed) = (self.roster_faults, self.seed);
             let clock = self.clock.clone();
             let shared = self.shared.clone();
             tokio::spawn(async move {
                 let mut roster_read: Option<constellation_authority::WaitMs> = None;
+                let (mut read_no, mut held_read): (u64, Option<Event>) = (0, None);
                 // Plan 30 §M9: since when each link has been up without a
                 // break (the directory's `since`).
                 let mut up_since: HashMap<NodeId, constellation_authority::WaitMs> = HashMap::new();
@@ -2005,18 +2007,42 @@ impl Driver {
                         && (roster_refresh_ms == 0 || roster_read.is_none() || !bucket.is_cut(id))
                     {
                         roster_read = Some(at);
-                        if tx
-                            .send(Event::Roster {
-                                seq: shared.roster_seq.fetch_add(1, Ordering::SeqCst) + 1,
-                                write_eligible: nodes.clone(),
-                                read_only: Vec::new(),
-                                complete: true,
-                                lapses: shared.lapses_handed.load(Ordering::SeqCst),
-                                issued: at,
-                            })
-                            .is_err()
-                        {
-                            return;
+                        read_no += 1;
+                        // ADR-50: a read that goes wrong (`roster_faults`):
+                        // one member dropped and the read said incomplete,
+                        // or the read held back and delivered after the next.
+                        let roll = |salt: u64| -> u64 {
+                            let mut x = seed ^ (id << 32) ^ (read_no << 8) ^ salt;
+                            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                            (x ^ (x >> 31)) % 100
+                        };
+                        let (mut listed, mut complete) = (nodes.clone(), true);
+                        if roll(1) < roster_faults.0 && listed.len() > 1 {
+                            let victim = (roll(2) as usize) % listed.len();
+                            listed.remove(victim);
+                            complete = false;
+                        }
+                        let read = Event::Roster {
+                            seq: shared.roster_seq.fetch_add(1, Ordering::SeqCst) + 1,
+                            write_eligible: listed,
+                            read_only: Vec::new(),
+                            complete,
+                            lapses: shared.lapses_handed.load(Ordering::SeqCst),
+                            issued: at,
+                        };
+                        let mut batch = Vec::new();
+                        if held_read.is_none() && roll(3) < roster_faults.1 {
+                            held_read = Some(read);
+                        } else {
+                            batch.push(read);
+                            batch.extend(held_read.take());
+                        }
+                        for event in batch {
+                            if tx.send(event).is_err() {
+                                return;
+                            }
                         }
                     }
                     // Before the snapshot, never after: a lapse handed while
@@ -2045,13 +2071,6 @@ impl Driver {
                             }
                         })
                         .collect();
-                    oracles.note_directory(
-                        id,
-                        links
-                            .iter()
-                            .filter_map(|l| l.since.map(|s| (l.node, s.0)))
-                            .collect(),
-                    );
                     if tx
                         .send(Event::Peers {
                             registry_complete: true,
@@ -3115,7 +3134,10 @@ impl Driver {
         let at_ms = self.clock.elapsed_ms();
         let judged = judge.then(|| {
             let st = AnswererState::of(&self.core, &self.meta, self.id);
-            let j = committed_at_answer(&self.oracles, &self.bus, self.id, &st, rid, outcome);
+            let j = committed_at_answer(&self.oracles, self.id, &st, rid, outcome);
+            if j.class == Some(super::oracle::Judged::Singleton) {
+                self.oracles.note_singleton_answer(self.id, rid);
+            }
             let uncommitted =
                 j.class.is_none() && !(j.expected == Expected::Unjournaled && kind.is_refusal());
             // Plan 43 C1-2: the claim of a commit, and the row's own class.
@@ -4147,6 +4169,14 @@ impl Driver {
     }
 
     fn before_core(&self, event: &Event) {
+        // ADR-50: the oracle hears what the core is about to be told.
+        self.oracles.note_told(
+            self.id,
+            self.shared.incarnation.load(Ordering::SeqCst),
+            event,
+            self.clock.now().wait.0,
+            self.meta.journal_tip().unwrap_or(0),
+        );
         if let Event::Peer {
             from,
             msg:

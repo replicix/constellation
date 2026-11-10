@@ -586,6 +586,15 @@ pub struct SimConfig {
     /// configuration; `no_read_under_an_abandoned_stream` must then fail the
     /// run.
     pub abandon_skips_read_recall: bool,
+    /// ADR-50: the registry reads the driver hands a core go wrong, in
+    /// percent per read: `(partial, late)`. A partial read drops one member
+    /// and says it is incomplete (a record that vanished or did not parse);
+    /// a late one is held back and delivered after the next (numbered
+    /// before it). `AUTHORITY_SIM_ROSTER_FAULTS=<partial>:<late>`.
+    pub roster_faults: (u64, u64),
+    /// Negative control (`Config::roster_installs_partial`):
+    /// `AUTHORITY_SIM_PLANT_ROSTER_SHRINK=1`.
+    pub plant_roster_shrink: bool,
     /// Plan 30 §M12: every client writes in `dirs[0]` with names of its
     /// own (`<dir>/n<node>-f<i>`): a hot shared directory with no
     /// colliding names.
@@ -1190,6 +1199,15 @@ impl Default for SimConfig {
             idle_gaps: false,
             abandon_skips_read_recall: std::env::var_os("AUTHORITY_SIM_ABANDON_SKIPS_READ_RECALL")
                 .is_some_and(|v| v == "1"),
+            roster_faults: std::env::var("AUTHORITY_SIM_ROSTER_FAULTS")
+                .ok()
+                .and_then(|v| {
+                    let (a, b) = v.split_once(':')?;
+                    Some((a.parse().ok()?, b.parse().ok()?))
+                })
+                .unwrap_or((0, 0)),
+            plant_roster_shrink: std::env::var_os("AUTHORITY_SIM_PLANT_ROSTER_SHRINK")
+                .is_some_and(|v| v == "1"),
             shared_dir: false,
             cross_ratio: 0.0,
             marker_pairs: 0,
@@ -1352,6 +1370,17 @@ pub struct Report {
     /// ones the oracle judged `Lone` at the answer (the singleton's, which a
     /// TTL takeover may roll back and D3 removes for a root with peers).
     pub lone_rolled_back: usize,
+    /// ADR-50: of those, the rids whose answer was given while another node
+    /// was registered that the root's core had not yet been told of (the
+    /// singleton's death-then-join window, accepted and counted), and the
+    /// rest (rows that no registration explains: must be 0).
+    pub singleton_unseen_rolled_back: usize,
+    pub singleton_seen_rolled_back: usize,
+    /// ADR-50 `singleton_lag`: `Singleton` answers given while another node
+    /// was registered, and the longest such lag (ms since that node
+    /// registered).
+    pub singleton_lag_answers: usize,
+    pub singleton_lag_max_ms: i64,
     /// Plan 30 §M9: per holder crash, simulated ms from the crash to the
     /// first mutation any node acknowledged afterwards.
     pub failover_ms: Vec<u64>,
@@ -4908,6 +4937,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         inbox_ignores_touched: cfg.inbox_ignores_touched,
         partial_release_ends_stream: cfg.partial_release_ends_stream,
         abandon_skips_read_recall: cfg.abandon_skips_read_recall,
+        roster_faults: cfg.roster_faults,
+        plant_roster_shrink: cfg.plant_roster_shrink,
         plant_claim_root_group_on_lone: cfg.plant_claim_root_group_on_lone,
     };
     env.world
@@ -5773,6 +5804,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let acked: HashSet<Rid> = history.returned().into_iter().map(|(rid, _)| rid).collect();
     let mut rolled_back_acked = 0usize;
     let mut rolled_back_lone = 0usize;
+    let (mut unseen_rolled_back, mut seen_rolled_back) = (0usize, 0usize);
+    let (lag_rids, lag_max, lag_answers): (HashSet<Rid>, i64, usize) = {
+        let lags = oracles.singleton_lags.lock().unwrap();
+        (
+            lags.iter().map(|(_, rid, _)| *rid).collect(),
+            lags.iter().map(|(_, _, l)| *l).max().unwrap_or(0),
+            lags.len(),
+        )
+    };
     for id in cluster.ids() {
         let n = cluster.get(id);
         for rid in n.shared.tentative.lock().unwrap().iter() {
@@ -5780,6 +5820,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 rolled_back_acked += 1;
                 if lone_answered.contains(rid) {
                     rolled_back_lone += 1;
+                    if lag_rids.contains(rid) {
+                        unseen_rolled_back += 1;
+                    } else {
+                        seen_rolled_back += 1;
+                    }
                 }
             }
             if !strict_durability || lone_answered.contains(rid) {
@@ -5833,6 +5878,18 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     }
     report.acked_rolled_back = rolled_back_acked;
     report.lone_rolled_back = rolled_back_lone;
+    report.singleton_unseen_rolled_back = unseen_rolled_back;
+    report.singleton_seen_rolled_back = seen_rolled_back;
+    report.singleton_lag_answers = lag_answers;
+    report.singleton_lag_max_ms = lag_max;
+    if lag_answers > 0 || seen_rolled_back > 0 {
+        // A sweep greps this (`SWEEP-SINGLETON`): ADR-50, S10-I6.
+        eprintln!(
+            "SWEEP-SINGLETON seed {seed}: {lag_answers} singleton answers while another node was \
+             registered (lag up to {lag_max} ms), rolled back: {unseen_rolled_back} in that window, \
+             {seen_rolled_back} outside it"
+        );
+    }
     if cfg.keeps_backups {
         let dropped: u64 = report.stats.values().map(|s| s.backup_ack_timeouts).sum();
         if dropped > 0 {
