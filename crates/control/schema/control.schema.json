@@ -7320,6 +7320,51 @@
         }
       ]
     },
+    "RosterStatus": {
+      "description": "ADR-50: the node's roster object.",
+      "properties": {
+        "complete": {
+          "description": "A complete read is installed and no incomplete one is newer: who the\npeers are is known.",
+          "type": "boolean"
+        },
+        "heard": {
+          "description": "Nodes that messaged this node and the installed read does not list.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "seq": {
+          "description": "The number of the registry read installed (the last complete one);\n0 before the first.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "singleton": {
+          "description": "No write-eligible node but this one is known, and nothing contradicts\nit: the node answers its own clients from its disk alone.",
+          "type": "boolean"
+        },
+        "write_eligible": {
+          "description": "The write-eligible nodes known (this node included when registered).",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "seq",
+        "complete",
+        "write_eligible",
+        "heard",
+        "singleton"
+      ],
+      "type": "object"
+    },
     "S3RequestStatus": {
       "description": "Object-store requests by kind (one per call the daemon makes; a\nrequest's own retries inside the S3 client are not counted again),\nand by `<KIND> <area>`, the area being the key's first segment under\nthe filesystem prefix (`log`, `leases`, `nodes`, `chunks`, …).",
       "properties": {
@@ -10000,6 +10045,10 @@
           "$ref": "#/$defs/ReshipStatus",
           "description": "Plan 46 M1.2 step 5 (c3-spec §4.2): the takeover's re-ship of the\npredecessor's sealed tail."
         },
+        "roster": {
+          "$ref": "#/$defs/RosterStatus",
+          "description": "ADR-50: what this node's roster object knows of the other nodes, and\nwhy it is or is not a singleton."
+        },
         "s3": {
           "$ref": "#/$defs/S3RequestStatus",
           "description": "Object-store requests this daemon has issued since it started\n(every filesystem it serves), by kind and by key area."
@@ -10066,6 +10115,7 @@
         "cto",
         "locks",
         "ack",
+        "roster",
         "coop",
         "prefetch",
         "writeback",

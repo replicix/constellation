@@ -1791,6 +1791,14 @@ impl Core {
             .is_some_and(|(l, _)| l.singleton && l.ack_policy == AckPolicy::Local)
     }
 
+    /// What `status` shows of the roster object, with the core's own
+    /// verdict ([`Self::singleton_now`]) as its `singleton`.
+    pub fn roster_view(&self) -> super::roster::RosterView {
+        let mut view = self.roster.view(self.cfg.node_id);
+        view.singleton = self.singleton_now();
+        view
+    }
+
     /// The singleton test (plan 46 D3, ADR-50): this node answers its own
     /// clients from its disk alone only if it is no peer's lease holder to
     /// be: no candidate is being brought up, its roster object says no

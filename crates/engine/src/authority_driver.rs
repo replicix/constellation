@@ -150,6 +150,8 @@ pub struct CoreStatus {
     /// Plan 30 §M9.
     pub ack: constellation_authority::core::AckView,
     pub ack_s3: bool,
+    /// ADR-50: the roster object.
+    pub roster: constellation_authority::core::RosterView,
     /// Plan 30 §M11.
     pub delegation: constellation_authority::core::DelegView,
     pub delegation_enabled: bool,
@@ -3245,6 +3247,7 @@ impl Driver {
         status.read_delegations = cfg.read_delegations;
         status.ack = self.core.ack_view();
         status.ack_s3 = cfg.ack_s3;
+        status.roster = self.core.roster_view();
         let rows_due = self.core.deleg_known_generations() <= DELEG_ROWS_ALWAYS
             || self
                 .deleg_rows_at

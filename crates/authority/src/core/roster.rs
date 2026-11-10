@@ -48,6 +48,16 @@ pub(crate) struct RosterRead {
     pub(crate) issued: WaitMs,
 }
 
+/// The roster object as `status` shows it.
+#[derive(Debug, Clone, Default)]
+pub struct RosterView {
+    pub seq: u64,
+    pub complete: bool,
+    pub write_eligible: Vec<NodeId>,
+    pub heard: Vec<NodeId>,
+    pub singleton: bool,
+}
+
 /// The stamp of a read the object keeps.
 #[derive(Debug, Clone, Copy)]
 struct ReadStamp {
@@ -240,6 +250,19 @@ impl Roster {
     /// it: a peer, whatever the reads in hand say.
     pub(crate) fn has_heard(&self) -> bool {
         !self.heard.is_empty()
+    }
+
+    /// What `status` shows of the object (ADR-50), `singleton` being the
+    /// object's own verdict; the core adds its own conditions (a candidate,
+    /// a live foreign generation) through [`Core::roster_view`].
+    pub(crate) fn view(&self, me: NodeId) -> RosterView {
+        RosterView {
+            seq: self.installed.map_or(0, |i| i.seq),
+            complete: self.installed.is_some() && self.last_incomplete.is_none(),
+            write_eligible: self.write_eligible.clone(),
+            heard: self.heard.keys().copied().collect(),
+            singleton: self.singleton(me),
+        }
     }
 
     /// The directory's links, by node.
