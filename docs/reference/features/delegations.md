@@ -784,22 +784,43 @@ designations create no delegation.
 
 The same holds for a sticky grant (plan 46 M1.3), with one exception to
 "an unreachable holder only ever refuses". An op that was already sent to
-the holder (the requester's table named it, or the root redirected there)
-and whose answer did not come may have run there. When the requester then
-reaches the root and the root finds the holder out of reach, the refusal
-is not the answer: the root cannot know the op was sent on, and the
-holder's row may land when it returns. The requester (or the root, for its
-own clients) asks again and waits for the holder's word (its row for the
-rid, its release or the end of its stream; it is not put in the inbox
-meanwhile, whose drain would refuse it for good); at the op's deadlines the
-client hears the unsettled `EIO` ("in doubt", retryable by rid), bounded
-by the settle's cap. This is an exception to "an `EIO` told means the op
-did not and will not happen" (invariant I4) for an unreachable
-non-stealable holder: if the holder ran the op, its row lands after the
-`EIO`. Without it the client would be told `EROFS` for an op that ran
-(I1). The simulation counts these separately
-(`SWEEP-NONSTEALABLE-IN-DOUBT`, `unsettled_nonstealable_holder`) and
-never as a violation ([ADR-45](../../explanation/DECISIONS.md#adr-45-an-op-sent-to-a-non-stealable-holder-is-never-refused-for-good)).
+a designee and whose answer did not come may have run there, and the node
+that would refuse it cannot know that. The requester therefore carries what
+it sent, and the executors decide (route fencing):
+
+- A forward carries the generation it was routed by (`routed_gen`, 0 for the
+  lease holder) and the highest generation the rid ever touched
+  (`touched_gen`, 0 for none; unknown for a replay, a rid resubmitted after
+  the fast path left it in doubt, and a rid whose in-doubt record was
+  evicted).
+- A designee (any delegate, the root's own generation included) runs a
+  forward only if it was routed by its generation; otherwise it answers
+  `Fenced` and journals nothing, and the requester re-sends routed by that
+  generation (twice at most, then it chooses the route afresh).
+- The root, finding the holder out of reach, refuses for good with `EROFS`
+  only an op with `touched_gen == 0`. An op that touched a generation gets
+  `HolderUnreachable`: not final, nothing journaled; the requester asks again
+  and waits for the holder's word (its row for the rid, its release or the
+  end of its stream). `EXDEV` stays final.
+- A rid that was ever put in the inbox is forwarded only to the lease holder,
+  and the inbox drain halts a batch whose op touched a generation (or that
+  the root redirected to a designee) instead of refusing it; it runs when the
+  generation ends, with dedup.
+
+At the op's deadlines the client hears the unsettled `EIO` ("in doubt",
+retryable by rid), bounded by the settle's cap. This is an exception to "an
+`EIO` told means the op did not and will not happen" (invariant I4) for an
+unreachable non-stealable holder: if the holder ran the op, its row lands
+after the `EIO`. Without it the client would be told `EROFS` for an op that
+ran (I1). The simulation counts these separately
+(`SWEEP-NONSTEALABLE-IN-DOUBT`, `unsettled_nonstealable_holder`) and never as
+a violation, and judges every refusal of an op a non-stealable generation ran
+([ADR-47](../../explanation/DECISIONS.md#adr-47-an-executor-runs-a-forward-only-under-the-generation-it-was-routed-by),
+which replaced the requester's marks of
+[ADR-45](../../explanation/DECISIONS.md#adr-45-an-op-sent-to-a-non-stealable-holder-is-never-refused-for-good)).
+Until the holder journals its own refusals (planned), a drain read issued
+before a requester's tombstone, with a deposed root redirecting beyond the
+lease margin, remains a known limit.
 
 A sticky holder's release is its own decision (`Control::StickyRelease`):
 it holds new ops under the subtree for at most 5 s while it drains, waits
