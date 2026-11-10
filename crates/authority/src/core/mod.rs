@@ -200,14 +200,15 @@ pub struct Config {
     pub forward_timeout_ms: u64,
     pub forward_retries: u32,
     pub forward_backoff_ms: u64,
-    pub acquire_deadline_ms: u64,
-    /// Plan 43 C2 (§5.3 item 5, §11 Q9): the end of `acquire_deadline_ms`
+    /// Plan 43 C2 (§5.3 item 5, §11 Q9): the end of the client deadline
+    /// (`Deadlines::client_deadline`, twice `ttl_ms`)
     /// a client op spends *settling* rather than trying: its own attempts
     /// end this long before the deadline, and a settle of its rid (its
     /// outcome, or its refusal for good) runs until the deadline. Derived,
-    /// no knob: `0` (the default) is `acquire_deadline_ms / 4` (the op tries
-    /// for 1.5 TTL, settles for 0.5), whatever the deadline is set to; a
-    /// set value is capped at half the deadline ([`Config::settle_window`]).
+    /// no production knob: `0` (the default) is a quarter of the client
+    /// deadline (the op tries for 1.5 TTL, settles for 0.5); a set value (the
+    /// simulation's override) is capped at half the deadline
+    /// (`Deadlines::settle_window`).
     pub settle_window_ms: u64,
     pub acquire_retry_min_ms: u64,
     pub acquire_retry_max_ms: u64,
@@ -215,7 +216,7 @@ pub struct Config {
     /// (`Event::OwnS3`) and some peer still reaches S3, a client op that
     /// has not been answered this long after its submission fails
     /// (`InDoubt`, `EIO` to FUSE) instead of waiting out
-    /// `acquire_deadline_ms`: nothing that needs this node's S3 (a lease
+    /// the client deadline: nothing that needs this node's S3 (a lease
     /// read, an acquisition, an inbox batch) can complete, and forwarding
     /// has had this long to reach a holder
     /// (`CONSTELLATION_S3_LESS_OP_DEADLINE_MS`, default 20 s).
@@ -251,7 +252,7 @@ pub struct Config {
     /// back another node's unanswered row; `StrandedOp::await_retry`)
     /// waits for its requester's retry before the sequencer in force
     /// settles the rid (`Refused { rid, ABANDONED }`). `0` (the default) is
-    /// the cap, `acquire_deadline_ms - 2 * settle_window` (60 s at the
+    /// the cap, `client_deadline - 2 * settle_window` (60 s at the
     /// defaults): a larger value is clamped to it
     /// ([`Config::drop_held_await`]) so that an own op on the placeholder's
     /// keys still has its window left when the requester is dead. The clock
@@ -607,7 +608,6 @@ impl Config {
             forward_timeout_ms: 500,
             forward_retries: 3,
             forward_backoff_ms: 200,
-            acquire_deadline_ms: 2 * ttl_ms,
             settle_window_ms: 0,
             acquire_retry_min_ms: 100,
             acquire_retry_max_ms: 2_000,

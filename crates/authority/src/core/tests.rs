@@ -696,7 +696,6 @@ fn a_timed_out_forward_retries_the_same_rid_then_takes_the_lease_path() {
 fn a_cold_claim_of_a_longer_lived_lease_is_not_cut_off_by_the_client_deadline() {
     let mut h = Harness::new(1);
     h.core.cfg.ttl_ms = 10_000;
-    h.core.cfg.acquire_deadline_ms = 20_000;
     h.core.lease.cached_holder = Some(2);
     let rid = h.rid(1);
     let op = h.create("a");
@@ -829,7 +828,6 @@ fn answer_from_bucket(req: &S3Op, body: &Lease, won: &mut Option<Lease>) -> S3Re
 fn a_dead_holders_lease_is_claimed_when_due_not_after_asks_and_forwards() {
     let mut h = Harness::new(1);
     h.core.cfg.ttl_ms = 6_000;
-    h.core.cfg.acquire_deadline_ms = 12_000;
     h.core.cfg.forward_retries = 3;
     h.core.cfg.forward_backoff_ms = 200;
     // (Plan 30 §M10's promise check is its own machinery; not here.)
@@ -56411,7 +56409,8 @@ mod c2g_settle {
             });
             let first = deadline_timer(&requester, &out);
             let cfg = requester.core.config().clone();
-            requester.advance(cfg.acquire_deadline_ms - Deadlines::new(&cfg).settle_window);
+            requester
+                .advance(Deadlines::new(&cfg).client_deadline - Deadlines::new(&cfg).settle_window);
             let out = requester.step(Event::Timer { id: first });
             let Some(PeerMsg::MutateRequest {
                 req, settle: true, ..
@@ -56502,9 +56501,10 @@ mod c2g_settle {
         let cfg = requester.core.config().clone();
         assert_eq!(
             Deadlines::new(&cfg).settle_window,
-            cfg.acquire_deadline_ms / 4
+            Deadlines::new(&cfg).client_deadline / 4
         );
-        requester.advance(cfg.acquire_deadline_ms - Deadlines::new(&cfg).settle_window);
+        requester
+            .advance(Deadlines::new(&cfg).client_deadline - Deadlines::new(&cfg).settle_window);
         let out = requester.step(Event::Timer { id: deadline });
         assert!(
             replies(&out).is_empty(),
@@ -56584,7 +56584,8 @@ mod c2g_settle {
         });
         assert!(holder.meta.lookup(ROOT_INO, "y").unwrap().is_some());
         let cfg = requester.core.config().clone();
-        requester.advance(cfg.acquire_deadline_ms - Deadlines::new(&cfg).settle_window);
+        requester
+            .advance(Deadlines::new(&cfg).client_deadline - Deadlines::new(&cfg).settle_window);
         let out = requester.step(Event::Timer { id: deadline });
         let settle = forward_to_1(&out).expect("the settle is forwarded");
         // A successor whose log carries the rid's transaction answers it.
@@ -56669,7 +56670,8 @@ mod c2g_settle {
             ClientPhase::Gated
         );
         let cfg = requester.core.config().clone();
-        requester.advance(cfg.acquire_deadline_ms - Deadlines::new(&cfg).settle_window);
+        requester
+            .advance(Deadlines::new(&cfg).client_deadline - Deadlines::new(&cfg).settle_window);
         // The gated one: never sent, abandoned here.
         let out = requester.step(Event::Timer { id: d2 });
         assert_eq!(
@@ -57275,18 +57277,20 @@ mod c2g_settle {
     }
 
     /// A settle in the acquire backoff whose holder is silent (its link down
-    /// past the grace) and whose lease is claimable by TTL 10 s after this
-    /// node's first sight of it; the op's client deadline is `deadline_ms`
-    /// from its submission. Returns the harness and the op after
+    /// past the grace) and whose lease (a 10 s TTL) is claimable by TTL 10 s
+    /// after this node's first sight of it; the op's client deadline is
+    /// `deadline_ms` from its submission (twice this node's TTL). Returns the harness and the op after
     /// `on_acquire_retry`.
     fn silent_holders_settle_retries(deadline_ms: u64) -> (Harness, Rid) {
         let mut h = Harness::new(1);
         h.core.cfg.inbox = true;
         h.core.cfg.forwarding = true;
-        h.core.cfg.acquire_deadline_ms = deadline_ms;
-        h.core
-            .lease
-            .observe(h.clk(), Some(&(lease_of(2, 1, h.now.0 + 10_000), tag())));
+        // (The client deadline is twice this node's TTL; the holder's TTL is
+        // 10 s, claimable by TTL 10 s after the first sight.)
+        h.core.cfg.ttl_ms = deadline_ms / 2;
+        let mut body = lease_of(2, 1, h.now.0 + 10_000);
+        body.ttl_ms = 10_000;
+        h.core.lease.observe(h.clk(), Some(&(body, tag())));
         h.core.lease.cached_holder = Some(2);
         let rid = h.rid(1);
         h.step(Event::Submit {
@@ -58353,7 +58357,7 @@ mod c2g_settle {
             l.holder_expires_ms += 1_000_000;
             l.holder_wait_ms += 1_000_000;
         }
-        h.advance(cfg.acquire_deadline_ms - Deadlines::new(&cfg).settle_window);
+        h.advance(Deadlines::new(&cfg).client_deadline - Deadlines::new(&cfg).settle_window);
         connect_4(&mut h);
         let id = timers(&submitted, TimerKind::ClientDeadline)[0];
         let out = h.step(Event::Timer { id });
@@ -60666,7 +60670,7 @@ mod await_retry {
     /// retried, and an own op on its keys submitted at the drop waits
     /// behind it for the bound and for the settle's row to commit, then
     /// executes. It must be answered before its own client deadline
-    /// (`acquire_deadline_ms - settle_window()`, 90 s in production, 9 s in
+    /// (`client_deadline - settle_window`, 90 s in production, 9 s in
     /// the sim): with the bound at the whole client deadline (120 s, 12 s)
     /// the op always ended `EIO` first.
     #[test]
@@ -60679,7 +60683,7 @@ mod await_retry {
         exec_as(&h, RowCommit::ARCHIVE, p, &rename_in_root("broken", "a"));
         drop_held(&h, broken);
         let cfg = h.core.config().clone();
-        let window = cfg.acquire_deadline_ms - Deadlines::new(&cfg).settle_window;
+        let window = Deadlines::new(&cfg).client_deadline - Deadlines::new(&cfg).settle_window;
 
         let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
         let mine = h.rid(9);
@@ -60722,7 +60726,7 @@ mod await_retry {
     #[test]
     fn a_configured_bound_above_the_cap_is_clamped() {
         let mut cfg = Config::defaults(1, 1);
-        let cap = cfg.acquire_deadline_ms - 2 * Deadlines::new(&cfg).settle_window;
+        let cap = Deadlines::new(&cfg).client_deadline - 2 * Deadlines::new(&cfg).settle_window;
         assert_eq!(
             Deadlines::new(&cfg).drop_held_await,
             cap,
@@ -60735,7 +60739,7 @@ mod await_retry {
         // A settle window of half the deadline would make the cap 0: it is
         // floored at one settle window.
         cfg.drop_held_await_ms = 0;
-        cfg.settle_window_ms = cfg.acquire_deadline_ms / 2;
+        cfg.settle_window_ms = Deadlines::new(&cfg).client_deadline / 2;
         assert_eq!(
             Deadlines::new(&cfg).drop_held_await,
             Deadlines::new(&cfg).settle_window
@@ -60750,7 +60754,10 @@ mod await_retry {
         set.drop_held_await_ms = 5_000;
         assert_eq!(Deadlines::new(&set).stale_shadow_after, 5_000);
         // The production defaults: 120 s deadline, 30 s settle window.
-        assert_eq!(Config::defaults(1, 1).acquire_deadline_ms, 120_000);
+        assert_eq!(
+            Deadlines::new(&Config::defaults(1, 1)).client_deadline,
+            120_000
+        );
         assert_eq!(
             Deadlines::new(&Config::defaults(1, 1)).drop_held_await,
             60_000

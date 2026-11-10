@@ -36,8 +36,6 @@ pub struct Base {
     pub acquire_retry_max: u64,
     pub s3_less_deadline: u64,
     pub inbox_deadline: u64,
-    /// A: `acquire_deadline_ms`.
-    pub client_deadline: u64,
     pub settle_window_knob: u64,
     pub drop_held_await_knob: u64,
     pub promise_ttl: u64,
@@ -61,7 +59,6 @@ impl Base {
             acquire_retry_max: cfg.acquire_retry_max_ms,
             s3_less_deadline: cfg.s3_less_deadline_ms,
             inbox_deadline: cfg.inbox_deadline_ms,
-            client_deadline: cfg.acquire_deadline_ms,
             settle_window_knob: cfg.settle_window_ms,
             drop_held_await_knob: cfg.drop_held_await_ms,
             promise_ttl: cfg.promise_ttl_ms,
@@ -234,7 +231,7 @@ impl Deadlines {
         let b = Base::new(cfg);
         let (l, m, r, d, k) = (b.lease_ttl, b.margin, b.read_ttl, b.deleg_ttl, b.lock_ttl);
         let (f, t, tick) = (b.forward_timeout, b.takeover, b.stream_tick);
-        let a = b.client_deadline;
+        let a = 2 * l;
         let w = match b.settle_window_knob {
             0 => a / 4,
             ms => ms.min(a / 2),
@@ -524,11 +521,7 @@ impl Deadlines {
     /// Every derived bound: name, value, formula in base-knob names.
     pub fn table(&self) -> Vec<(&'static str, u64, &'static str)> {
         vec![
-            (
-                "client_deadline",
-                self.client_deadline,
-                "A (acquire_deadline_ms)",
-            ),
+            ("client_deadline", self.client_deadline, "2L"),
             (
                 "settle_window",
                 self.settle_window,
@@ -637,7 +630,6 @@ mod tests {
         c.expiry_margin_ms = 500;
         c.forward_timeout_ms = 400;
         c.forward_backoff_ms = 150;
-        c.acquire_deadline_ms = 12_000;
         c.acquire_retry_max_ms = 1_000;
         c.inbox_deadline_ms = 8_000;
         c.lock_ttl_ms = 1_500;
@@ -645,13 +637,12 @@ mod tests {
     }
 
     /// `sim_core_config` with `delegated_long_delegation_config`'s lease and
-    /// delegation TTLs; the settle window knob is what the sim driver sets
-    /// (half the lease TTL).
+    /// delegation TTLs: the client deadline is twice the lease TTL, the
+    /// settle window a quarter of it.
     fn sim_long() -> Config {
         let mut c = sim();
         c.ttl_ms = 30_000;
         c.delegation_ttl_ms = 20_000;
-        c.settle_window_ms = 15_000;
         c
     }
 
@@ -686,7 +677,6 @@ mod tests {
         c.acquire_retry_max_ms = 0;
         c.s3_less_deadline_ms = 0;
         c.inbox_deadline_ms = 100;
-        c.acquire_deadline_ms = 2_000;
         c
     }
 
@@ -720,6 +710,7 @@ mod tests {
                 ("attempts", 90_000),
                 // max(120000 - 30000, 60000).
                 ("inbox_attempts", 90_000),
+                // DRT = max(500, 4*50, 1) = 500; H = 5000 + 1000 = 6000;
                 // DRT = max(500, 4*50, 1) = 500; H = 5000 + 1000 = 6000;
                 // 2*30000 + 6000 + 2*500.
                 ("settle_cap_span", 67_000),
@@ -905,26 +896,28 @@ mod tests {
     }
 
     /// The simulation with a raised lease TTL (30 s) and delegation TTL
-    /// (20 s) under the unchanged 12 s client deadline, and the settle
-    /// window knob the sim driver sets (L/2 = 15 s, clamped to A/2).
+    /// (20 s): the client deadline follows the lease TTL (production's
+    /// ratio), so the settle window is a quarter of it.
     #[test]
     fn pinned_sim_raised_lease_ttl() {
         pin(
             &sim_long(),
             &[
-                ("client_deadline", 12_000),
-                // min(15000, 12000/2).
-                ("settle_window", 6_000),
-                ("attempts", 6_000),
-                // max(8000 - 6000, 4000).
+                // 2 * 30000.
+                ("client_deadline", 60_000),
+                // 60000/4.
+                ("settle_window", 15_000),
+                // 60000 - 15000.
+                ("attempts", 45_000),
+                // max(8000 - 15000 floored at 0, 4000).
                 ("inbox_attempts", 4_000),
-                // H = 20500; 12000 + 20500 + 800.
-                ("settle_cap_span", 33_300),
+                // H = 20500; 2 * 15000 + 20500 + 800.
+                ("settle_cap_span", 51_300),
                 ("deleg_request_timeout", 400),
                 ("reclaim_horizon", 20_500),
-                // max(12000 - 12000, 6000).
-                ("drop_held_await", 6_000),
-                ("stale_shadow_after", 12_000),
+                // max(60000 - 30000, 15000).
+                ("drop_held_await", 30_000),
+                ("stale_shadow_after", 60_000),
                 ("grant_in_flight", 900),
                 // clamp(20000/8 = 2500, 100, 500) + 250.
                 ("deleg_resend", 750),
@@ -1200,7 +1193,10 @@ mod tests {
         let d = Deadlines::new(&c);
         assert!(has(&d, "D3"));
         assert!(!has(&d, "D2"));
-        assert!(has(&Deadlines::new(&sim_long()), "D4"));
+        let mut c = Config::defaults(1, 1);
+        c.ttl_ms = 2_000;
+        assert!(has(&Deadlines::new(&c), "D4"));
+        assert!(!has(&Deadlines::new(&sim_long()), "D4"));
         let mut c = Config::defaults(1, 1);
         c.backup_takeover_ms = 40_000;
         assert!(has(&Deadlines::new(&c), "D5"));
@@ -1221,7 +1217,7 @@ mod tests {
         c.backup_slow_max_ms = 500;
         assert!(has(&Deadlines::new(&c), "D9"));
         let mut c = Config::defaults(1, 1);
-        c.acquire_deadline_ms = 4_000;
+        c.ttl_ms = 4_000;
         assert!(has(&Deadlines::new(&c), "D10"));
         let mut c = Config::defaults(1, 1);
         c.read_delegation_ttl_ms = 100_000;
@@ -1234,8 +1230,10 @@ mod tests {
             v.iter().find(|v| v.id == "D1").unwrap().class,
             Class::Refuse
         );
+        let mut c = Config::defaults(1, 1);
+        c.ttl_ms = 2_000;
         assert_eq!(
-            Deadlines::new(&sim_long())
+            Deadlines::new(&c)
                 .check()
                 .iter()
                 .find(|v| v.id == "D4")

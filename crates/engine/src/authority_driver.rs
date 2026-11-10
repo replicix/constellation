@@ -631,7 +631,6 @@ pub fn load_config(
     c.forwarding = crate::forward::forwarding_enabled();
     c.p2p = p2p;
     c.forward_timeout_ms = crate::forward::forward_timeout_ms();
-    c.acquire_deadline_ms = 2 * ttl_ms;
     // (Plan 43 C2, §11 Q9, Q21 (j): `settle_window_ms` stays derived, a
     // quarter of this; no knob.)
     // Plan 46 M0.2 (R5): how long a dropped row of another node waits for

@@ -368,6 +368,10 @@ pub struct ScheduledFault {
 
 #[derive(Clone)]
 pub struct SimConfig {
+    /// The `Deadlines::check` warnings (`"D3"`, ...) this configuration
+    /// knowingly runs with, each with its reason where it is set. A warning
+    /// not listed fails `every_sim_configuration_passes_deadline_check`.
+    pub deadline_waivers: &'static [&'static str],
     pub nodes: u64,
     pub clients_per_node: u64,
     pub ops_per_client: u64,
@@ -899,9 +903,8 @@ pub fn sim_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c.forward_timeout_ms = 400;
     c.forward_retries = 3;
     c.forward_backoff_ms = 150;
-    c.acquire_deadline_ms = 12_000;
-    // (Plan 43 C2: `settle_window_ms` unset: the node derives half the TTL,
-    // as production's ratio — 3 s here; see `Driver`'s spawn.)
+    // (The client deadline is twice the lease TTL and the settle window a
+    // quarter of it, as production's: `Deadlines`. 12 s and 3 s here.)
     c.acquire_retry_min_ms = 50;
     c.acquire_retry_max_ms = 1_000;
     c.handoff_request_timeout_ms = 2_000;
@@ -1078,6 +1081,7 @@ impl SimConfig {
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
+            deadline_waivers: &[],
             nodes: 3,
             clients_per_node: 2,
             ops_per_client: 6,

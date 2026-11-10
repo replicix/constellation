@@ -3057,6 +3057,9 @@ fn fast_takeover_capped_grants_config() -> SimConfig {
             c.lock_ttl_ms = 20_000;
             c
         }),
+        // D8, on purpose: the grants (20 s) outlive the lease (10 s), the
+        // case the successor's floor cap is for.
+        deadline_waivers: &["D8"],
         holder_beats: sim::run::HolderBeats::Thread,
         ..fast_takeover_long_grants_config()
     }
@@ -3119,7 +3122,6 @@ fn delegated_long_delegation_prod_config() -> SimConfig {
             let mut c = sim::run::sim_core_config(id, inc);
             c.ttl_ms = 30_000;
             c.delegation_ttl_ms = 20_000;
-            c.acquire_deadline_ms = 60_000;
             c.settle_window_ms = 15_000;
             c
         }),
@@ -6145,24 +6147,10 @@ fn regression_delegated_holder_cut_takeover_keeps_delegate_rows_in_log_order() {
     );
 }
 
-/// Many seeds of a named configuration, run in parallel
-/// (`AUTHORITY_SIM_CONFIG`, default `delegated-holder-cut`;
-/// `AUTHORITY_SIM_START`, `AUTHORITY_SIM_SEEDS`, `AUTHORITY_SIM_THREADS`).
-/// Prints every failing seed's first lines and fails at the end.
-#[test]
-#[ignore]
-fn sweep_config() {
-    let env = |k: &str, d: u64| {
-        std::env::var(k)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(d)
-    };
-    let start = env("AUTHORITY_SIM_START", 0);
-    let seeds = env("AUTHORITY_SIM_SEEDS", 2_000);
-    let threads = env("AUTHORITY_SIM_THREADS", 8);
-    let label = std::env::var("AUTHORITY_SIM_CONFIG").unwrap_or("delegated-holder-cut".into());
-    let base_config = |label: &str| match label {
+/// The named base configuration of the sweeps and replays (`<label>` of
+/// `AUTHORITY_SIM_CONFIG`, before any `+variant`).
+fn base_config(label: &str) -> SimConfig {
+    match label {
         "delegated-holder-cut" => delegated_holder_cut_config(),
         "delegated-designated" => delegated_designated_config(),
         "long-delegated" => long_delegated_config(),
@@ -6448,7 +6436,26 @@ fn sweep_config() {
         }
         "holder-restart-step-forward-readopt" => holder_restart_step_forward_readopt_config(),
         other => panic!("sweep_config: unknown config {other}"),
+    }
+}
+
+/// Many seeds of a named configuration, run in parallel
+/// (`AUTHORITY_SIM_CONFIG`, default `delegated-holder-cut`;
+/// `AUTHORITY_SIM_START`, `AUTHORITY_SIM_SEEDS`, `AUTHORITY_SIM_THREADS`).
+/// Prints every failing seed's first lines and fails at the end.
+#[test]
+#[ignore]
+fn sweep_config() {
+    let env = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(d)
     };
+    let start = env("AUTHORITY_SIM_START", 0);
+    let seeds = env("AUTHORITY_SIM_SEEDS", 2_000);
+    let threads = env("AUTHORITY_SIM_THREADS", 8);
+    let label = std::env::var("AUTHORITY_SIM_CONFIG").unwrap_or("delegated-holder-cut".into());
     // `<config>+nomove+solo`: see `config_variant`.
     let config = move |label: &str| {
         let (base, variants) = label.split_once('+').unwrap_or((label, ""));
@@ -7330,16 +7337,12 @@ fn delegated_root_crash_config() -> SimConfig {
 /// delegate's own writes parked on renewals the dead root never answered
 /// and never took the path that starts the takeover; now a grant left
 /// unrenewed past the root's earliest reclaim lapses and its writes
-/// take the ordinary route (forward, inbox, lease). The client deadline
-/// (2 × TTL, which ended the parked wait in doubt) is raised far past
-/// the TTL takeover, so a wait on a renewal shows as one.
+/// take the ordinary route (forward, inbox, lease). (The client deadline is
+/// twice the lease TTL, as production's: it used to be raised to 60 s here,
+/// far past the TTL takeover, so that a wait on a renewal showed as one.)
 fn delegated_root_gone_config() -> SimConfig {
     SimConfig {
-        core: std::sync::Arc::new(|id, inc| {
-            let mut c = sim::run::sim_core_config(id, inc);
-            c.acquire_deadline_ms = 60_000;
-            c
-        }),
+        core: std::sync::Arc::new(sim::run::sim_core_config),
         cross_ratio: 0.0,
         // Plan 46 M0.3: no unsettled `EIO` in 2,000 seeds, with and without
         // the lease-reads knob; the strict form of I4 holds.
@@ -12783,6 +12786,9 @@ fn production_ttl(deleg: bool, heavy: bool) -> SimConfig {
             c
         }),
         lock_dir: if deleg { Some("d1".into()) } else { None },
+        // D8, on purpose: the production lock TTL (20 s) under the sim's 6 s
+        // lease, the ratio these configurations measure.
+        deadline_waivers: &["D8"],
         ..locks_delegated_config()
     };
     if !heavy {
@@ -19088,4 +19094,64 @@ fn sim_driver_config_matches_engine_normalisation() {
     unset.delegation_ttl_ms = 0;
     unset.lock_ttl_ms = 20_000;
     assert_eq!(sim::node::driver_config(unset).delegation_ttl_ms, 20_000);
+}
+
+/// Every label of `base_config`, read off its arms.
+fn base_config_labels() -> Vec<String> {
+    let src = include_str!("sim.rs");
+    let from = src
+        .find("fn base_config(label: &str) -> SimConfig {")
+        .expect("base_config");
+    let to = from + src[from..].find("sweep_config: unknown config").unwrap();
+    let mut labels = Vec::new();
+    for line in src[from..to].lines().skip(2) {
+        let t = line.trim_start();
+        if !t.starts_with('"') {
+            continue;
+        }
+        let Some(pattern) = t.split(" =>").next().filter(|_| t.contains(" =>")) else {
+            continue;
+        };
+        labels.extend(pattern.split('"').skip(1).step_by(2).map(|s| s.to_string()));
+    }
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+/// The deadlines of every simulation configuration pass `Deadlines::check`
+/// as its nodes start (the configuration the driver derives): no refused
+/// invariant, and no warning the configuration does not list in
+/// `SimConfig::deadline_waivers`. A configuration that raises the lease TTL
+/// must run at production's ratios (a client deadline of twice the TTL, a
+/// settle window of a quarter of it), not under a deadline fixed for a
+/// shorter one.
+#[test]
+fn every_sim_configuration_passes_deadline_check() {
+    use constellation_authority::deadlines::{Class, Deadlines};
+    let labels = base_config_labels();
+    assert!(labels.len() > 200, "{} labels", labels.len());
+    let mut failures = Vec::new();
+    for label in &labels {
+        let cfg = base_config(label);
+        for node in 1..=4 {
+            let core = sim::node::driver_config((cfg.core)(node, 1));
+            for v in Deadlines::new(&core).check() {
+                let waived = v.class == Class::Warn && cfg.deadline_waivers.contains(&v.id);
+                if !waived {
+                    failures.push(format!(
+                        "{label} node {node}: {} {:?}: {}",
+                        v.id, v.class, v.msg
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} deadline violations:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
