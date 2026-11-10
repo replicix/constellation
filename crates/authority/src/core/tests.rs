@@ -65252,15 +65252,11 @@ mod step4_sticky {
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         h.core.dl.mine.get_mut(&7).unwrap().answered_sent = h.clk().honour;
-        let ask = |h: &mut Harness, from| match h.deleg_read_index(
-            h.clk(),
-            from,
-            dirs[0],
-            Some("x"),
-        ) {
-            Some(crate::event::ReadIndexOutcome::Ok { grant, .. }) => grant,
-            other => panic!("{other:?}"),
-        };
+        let ask =
+            |h: &mut Harness, from| match h.deleg_read_index(h.clk(), from, dirs[0], Some("x")) {
+                Some(crate::event::ReadIndexOutcome::Ok { grant, .. }) => grant,
+                other => panic!("{other:?}"),
+            };
         assert!(ask(&mut h, 2).is_some(), "a roster node is granted");
         assert!(ask(&mut h, 9).is_none(), "an unknown reader was granted");
         h.step(Event::Roster {

@@ -17798,7 +17798,7 @@ fn m03_a_reachable_sequencers_requester_is_not_isolated() {
 fn a_late_seal_after_the_holders_renewal_lets_it_reclaim_at_once() {
     let mut early = 0;
     let mut early_of_pinned = 0;
-    for seed in SEAL_GAP_SEEDS {
+    for seed in SEAL_GAP_SEEDS.chain(std::iter::once(SEAL_GAP_PINNED_SEED)) {
         let cfg = SimConfig {
             seal_after_read_ms: SEAL_GAP_DELAY_MS,
             ..strict(backup_strict_config(), "unsettled")
@@ -17860,10 +17860,12 @@ fn a_seal_before_the_holders_renewal_never_revives_a_sealed_epoch() {
     }
 }
 
-// (400 ms: a peer claimant's seal lands after the holder's renewal; seed 79
-// is the one early re-claim in 300 seeds, pinned.)
-const SEAL_GAP_DELAY_MS: u64 = 400;
-const SEAL_GAP_PINNED_SEED: u64 = 79;
+// (250 ms: a peer claimant's seal lands after the holder's renewal; seed 1134
+// is the one early re-claim in 4,000 seeds, pinned, and run beside the first
+// 300. The grant horizon's write-ahead lane moved the timing of the earlier
+// pin, 400 ms and seed 79.)
+const SEAL_GAP_DELAY_MS: u64 = 250;
+const SEAL_GAP_PINNED_SEED: u64 = 1134;
 const SEAL_GAP_SEEDS: std::ops::Range<u64> = 0..300;
 
 /// Plan 46 M0.3: the isolated requesters of `flex-crash` (nodes cut from every
