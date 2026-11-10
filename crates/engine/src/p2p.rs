@@ -299,10 +299,9 @@ impl constellation_net::PeerService for P2pBridge {
         &self,
         claimant: u64,
         req_id: u64,
-        epoch: u64,
-        config_version: u64,
-        from_seq: u64,
+        (epoch, config_version, from_seq): (u64, u64, u64),
         key: constellation_net::LeaseKeyWire,
+        (kept, tenure): (bool, (u64, u64)),
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -314,6 +313,9 @@ impl constellation_net::PeerService for P2pBridge {
                 txs: Vec::new(),
                 through: 0,
                 next: None,
+                members: Vec::new(),
+                sealed: Vec::new(),
+                refused: 0,
             };
             let (reply, receive) = tokio::sync::oneshot::channel();
             if self
@@ -330,6 +332,8 @@ impl constellation_net::PeerService for P2pBridge {
                         holder_wait_ms: key.holder_wait_ms,
                         released: key.released,
                     },
+                    kept,
+                    tenure,
                     reply,
                 })
                 .is_err()
@@ -337,14 +341,17 @@ impl constellation_net::PeerService for P2pBridge {
                 return none;
             }
             match receive.await {
-                Ok((held, empty, txs, through, next)) => constellation_net::Payload::SealedTail {
+                Ok(a) => constellation_net::Payload::SealedTail {
                     req_id,
                     epoch,
-                    held,
-                    empty,
-                    txs: postcard::to_allocvec(&txs).unwrap_or_default(),
-                    through,
-                    next,
+                    held: a.held,
+                    empty: a.empty,
+                    txs: postcard::to_allocvec(&a.txs).unwrap_or_default(),
+                    through: a.through,
+                    next: a.next,
+                    members: a.members,
+                    sealed: a.sealed,
+                    refused: a.refused,
                 },
                 Err(_) => none,
             }
@@ -1050,6 +1057,17 @@ impl constellation_net::PeerService for P2pBridge {
             from,
             epoch,
             through,
+        });
+    }
+
+    fn stream_ahead_refused(&self, from: u64, epoch: u64, sealed: bool) {
+        if crate::fault::p2p_denied(from) {
+            return;
+        }
+        let _ = self.nudge.send(sync::SyncRequest::PeerStreamAheadRefused {
+            from,
+            epoch,
+            sealed,
         });
     }
 

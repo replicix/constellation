@@ -1693,6 +1693,7 @@ fn claimed_node_id(payload: &Payload) -> Option<u64> {
         | DelegBackupAppend { from, .. }
         | StreamAhead { from, .. }
         | StreamAheadAck { from, .. }
+        | StreamAheadRefused { from, .. }
         | LockGranted { from, .. }
         | LockCancel { from, .. }
         | LockReleased { from, .. }
@@ -2081,6 +2082,14 @@ async fn handle_stream<S: PeerService>(
                 service.stream_ahead_ack(from, epoch, through);
                 Some(Payload::Ok { req_id: 0 })
             }
+            Payload::StreamAheadRefused {
+                from,
+                epoch,
+                sealed,
+            } => {
+                service.stream_ahead_refused(from, epoch, sealed);
+                Some(Payload::Ok { req_id: 0 })
+            }
             Payload::BackupHold {
                 holder,
                 epoch,
@@ -2119,9 +2128,17 @@ async fn handle_stream<S: PeerService>(
                 config_version,
                 from_seq,
                 key,
+                kept,
+                tenure,
             } => Some(
                 service
-                    .seal_tail_requested(claimant, req_id, epoch, config_version, from_seq, key)
+                    .seal_tail_requested(
+                        claimant,
+                        req_id,
+                        (epoch, config_version, from_seq),
+                        key,
+                        (kept, tenure),
+                    )
                     .await,
             ),
             Payload::LockRequest {

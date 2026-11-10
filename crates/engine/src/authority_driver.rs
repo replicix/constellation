@@ -1606,6 +1606,7 @@ fn sealed_tail_event(
     txs: &[u8],
     through: u64,
     next: Option<u64>,
+    kept: SealedKept,
 ) -> Event {
     let txs = match constellation_meta::from_bytes_exact(txs) {
         Ok(txs) => txs,
@@ -1638,8 +1639,23 @@ fn sealed_tail_event(
             txs,
             through,
             next,
+            members: kept.members,
+            sealed: kept.sealed,
+            refused: match kept.refused {
+                1 => Some(constellation_authority::event::SealRefusal::EpochOpen),
+                2 => Some(constellation_authority::event::SealRefusal::StaleKey),
+                _ => None,
+            },
         },
     }
+}
+
+/// ADR-51: a kept request's answer fields as they travel.
+#[derive(Default)]
+struct SealedKept {
+    members: Vec<Vec<NodeId>>,
+    sealed: Vec<(u64, u64)>,
+    refused: u8,
 }
 
 /// Plan 43 C2e: a delegation backup's `DelegSealed` answer to the root, as
@@ -3850,6 +3866,8 @@ impl Driver {
                 config_version,
                 from_seq,
                 key,
+                kept,
+                tenure,
                 reply,
             } => {
                 let req = self.control_id();
@@ -3862,6 +3880,8 @@ impl Driver {
                         config_version,
                         from: from_seq,
                         key,
+                        kept,
+                        tenure,
                     },
                 }))
             }
@@ -4102,6 +4122,14 @@ impl Driver {
             } => Some(Internal::Event(Event::Peer {
                 from,
                 msg: PeerMsg::StreamAheadAck { epoch, through },
+            })),
+            SyncRequest::PeerStreamAheadRefused {
+                from,
+                epoch,
+                sealed,
+            } => Some(Internal::Event(Event::Peer {
+                from,
+                msg: PeerMsg::StreamAheadRefused { epoch, sealed },
             })),
             SyncRequest::PeerHolderAlive {
                 holder,
@@ -5124,10 +5152,26 @@ impl Driver {
                 txs,
                 through,
                 next,
+                members,
+                sealed,
+                refused,
                 ..
             } if self.seal_tail_replies.contains_key(&(to, req)) => {
                 if let Some(tx) = self.seal_tail_replies.remove(&(to, req)) {
-                    let _ = tx.send((held, empty, txs, through, next));
+                    let _ = tx.send(crate::sync::SealTailAnswer {
+                        held,
+                        empty,
+                        txs,
+                        through,
+                        next,
+                        members,
+                        sealed,
+                        refused: match refused {
+                            None => 0,
+                            Some(constellation_authority::event::SealRefusal::EpochOpen) => 1,
+                            Some(constellation_authority::event::SealRefusal::StaleKey) => 2,
+                        },
+                    });
                 }
             }
             // Plan 43 C1-3: this node, a claimant, asks a member.
@@ -5137,6 +5181,8 @@ impl Driver {
                 config_version,
                 from: from_seq,
                 key,
+                kept,
+                tenure,
             } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
@@ -5164,6 +5210,8 @@ impl Driver {
                             holder_wait_ms: key.holder_wait_ms,
                             released: key.released,
                         },
+                        kept,
+                        tenure,
                     };
                     let reply = tokio::time::timeout(
                         timeout,
@@ -5179,9 +5227,17 @@ impl Driver {
                             txs,
                             through,
                             next,
+                            members,
+                            sealed,
+                            refused,
                         })) if req_id == req.0 => {
+                            let kept = SealedKept {
+                                members,
+                                sealed,
+                                refused,
+                            };
                             let _ = tx.send(Internal::Event(sealed_tail_event(
-                                to, req, epoch, held, empty, &txs, through, next,
+                                to, req, epoch, held, empty, &txs, through, next, kept,
                             )));
                         }
                         _ => {
@@ -5976,6 +6032,27 @@ impl Driver {
                     };
                     // Fire and forget: a follower that misses a batch
                     // gets the rows from the segment.
+                    let _ = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
+                });
+            }
+            PeerMsg::StreamAheadRefused { epoch, sealed } => {
+                let peers = self.deps.peers.clone();
+                let from = self.node_id;
+                let timeout = Duration::from_millis(self.core.config().backup_ack_timeout_ms);
+                if crate::fault::p2p_denied(to) {
+                    return;
+                }
+                tokio::spawn(async move {
+                    let payload = Payload::StreamAheadRefused {
+                        from,
+                        epoch,
+                        sealed,
+                    };
+                    // Fire and forget: the owner's next batch is refused again.
                     let _ = tokio::time::timeout(
                         timeout,
                         peers.request_to_node_timeout(to, &payload, timeout),
@@ -8373,7 +8450,8 @@ mod tests {
         // An empty batch that decodes: a real answer (the member holds no
         // rows past the claimant's seq), kept as one.
         let empty = postcard::to_allocvec(&Vec::<constellation_meta::BackupTx>::new()).unwrap();
-        match super::sealed_tail_event(3, req, 9, true, false, &empty, 0, None) {
+        match super::sealed_tail_event(3, req, 9, true, false, &empty, 0, None, Default::default())
+        {
             Event::Peer {
                 from: 3,
                 msg: PeerMsg::SealedTail {
@@ -8385,13 +8463,33 @@ mod tests {
         // Undecodable: a batch cut short, and no bytes at all (what an
         // encoding that failed on the member's side sends).
         for bad in [&[5u8][..], &[][..], &[0xff; 12][..]] {
-            match super::sealed_tail_event(3, req, 9, true, false, bad, 42, Some(43)) {
+            match super::sealed_tail_event(
+                3,
+                req,
+                9,
+                true,
+                false,
+                bad,
+                42,
+                Some(43),
+                Default::default(),
+            ) {
                 Event::PeerFailed { req: r, to: 3, .. } => assert_eq!(r, req),
                 other => panic!("an undecodable held tail {bad:?}: {other:?}"),
             }
             // A refusal carries no tail: its bytes are never read, and the
             // flags of the member's answer stand.
-            match super::sealed_tail_event(3, req, 9, false, true, bad, 42, Some(43)) {
+            match super::sealed_tail_event(
+                3,
+                req,
+                9,
+                false,
+                true,
+                bad,
+                42,
+                Some(43),
+                Default::default(),
+            ) {
                 Event::Peer {
                     from: 3,
                     msg:

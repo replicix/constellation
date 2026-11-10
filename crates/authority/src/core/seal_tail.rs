@@ -46,12 +46,12 @@
 
 use super::{Core, Timer};
 use crate::action::Action;
-use crate::event::PeerMsg;
+use crate::event::{PeerMsg, SealRefusal};
 use crate::ids::{Epoch, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_meta::{BackupRole, BackupTx};
 use constellation_store_s3::{AckPolicy, InheritedTail, Lease, LeaseTag, RenewalKey};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One attempt of a claim to fetch the group's sealed tail.
 #[derive(Debug)]
@@ -121,6 +121,27 @@ pub(crate) struct GroupWait {
     /// The lease the wait is for, as the claimant watches it: a read that
     /// shows another key (a renewal, another claim) ends the wait.
     pub key: constellation_store_s3::lease::RenewalKey,
+}
+
+/// ADR-51: the fields of a `SealedTail` that only a kept request fills.
+#[derive(Default)]
+struct KeptFields {
+    members: Vec<Vec<NodeId>>,
+    sealed: Vec<(Epoch, NodeId)>,
+    refused: Option<SealRefusal>,
+}
+
+/// ADR-51: what [`Core::seal_kept_hold`] decided.
+pub(super) enum KeptSeal {
+    /// The store could not be read: no answer at all.
+    Unreadable,
+    Refused(SealRefusal),
+    Held {
+        txs: Vec<BackupTx>,
+        through: u64,
+        members: Vec<Vec<NodeId>>,
+        sealed: Vec<(Epoch, NodeId)>,
+    },
 }
 
 /// How often a wait for a group says so at WARN.
@@ -283,19 +304,157 @@ impl Core {
         }
     }
 
+    /// ADR-51: what this node kept of `epoch`'s hold streams of the tenure
+    /// `(holder, lease_epoch)` for a claimant that takes the tenure over,
+    /// sealing those streams first (K4, per stream: after this node answers,
+    /// it installs and acknowledges nothing more of them, so the set it
+    /// reports is final). `epoch` is the stream epoch asked about: the
+    /// tenure's own (`lease_epoch`), or the one a hold handed to a
+    /// transferee journaled under (`lease_epoch + 1`).
+    ///
+    /// The evidence is the epoch rows whose recorded carrier is exactly the
+    /// tenure ([`Replica::epochs_possibly_carrying`]): the streams `(e, s)`
+    /// for every `s` among their members, at `lease_epoch` and
+    /// `lease_epoch + 1`, are sealed here (not this node's own). The answer
+    /// is the merge, by journal seq, of the role tail through its ack and
+    /// the member copy (`epoch == lease_epoch` only) and the committed
+    /// streamed copies of the asked epoch; an empty list means "I hold
+    /// none". Refused while this node's own open epoch carries the tenure (a
+    /// live hold: nothing is sealed), and behind a renewal this node saw
+    /// after the claimant's key (its claim cannot land).
+    pub(super) fn seal_kept_hold(
+        &mut self,
+        (holder, lease_epoch): (NodeId, Epoch),
+        epoch: Epoch,
+        key: &RenewalKey,
+        replica: &dyn Replica,
+    ) -> KeptSeal {
+        let me = self.cfg.node_id;
+        if !self.backup_sealed_known(replica) || !self.backup_role_known(replica) {
+            self.bk.seal_unreadable = true;
+            return KeptSeal::Unreadable;
+        }
+        if self.epoch.open
+            && self
+                .pr
+                .carried
+                .is_some_and(|c| c.node == holder && c.epoch == lease_epoch)
+        {
+            return KeptSeal::Refused(SealRefusal::EpochOpen);
+        }
+        if self.lease.last_seen.as_ref().is_some_and(|l| {
+            l.holder == holder
+                && l.epoch == lease_epoch
+                && l.holder_clock == key.holder_clock
+                && l.holder_wait_ms > key.holder_wait_ms
+        }) {
+            return KeptSeal::Refused(SealRefusal::StaleKey);
+        }
+        let rows = match replica.epochs_possibly_carrying(holder, lease_epoch) {
+            Ok(rows) => rows,
+            Err(_) => {
+                self.bk.seal_unreadable = true;
+                return KeptSeal::Unreadable;
+            }
+        };
+        let members: BTreeSet<NodeId> = rows.iter().flatten().copied().collect();
+        let sources: Vec<NodeId> = members
+            .iter()
+            .copied()
+            .chain(std::iter::once(holder))
+            .filter(|s| *s != me)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let streams: Vec<(Epoch, NodeId)> = sources
+            .iter()
+            .flat_map(|s| [(lease_epoch, *s), (lease_epoch + 1, *s)])
+            .collect();
+        if streams
+            .iter()
+            .any(|st| !self.bk.sealed_streams.contains(st))
+        {
+            if !replica.seal_streams(&streams) {
+                self.bk.seal_unreadable = true;
+                return KeptSeal::Unreadable;
+            }
+            self.bk.sealed_streams.extend(streams.iter().copied());
+        }
+        let mut by_first: BTreeMap<u64, BackupTx> = BTreeMap::new();
+        let mut unreadable = false;
+        let mut add = |txs: Vec<BackupTx>| {
+            for t in txs {
+                by_first.entry(t.first).or_insert(t);
+            }
+        };
+        if epoch == lease_epoch {
+            if self
+                .bk
+                .role
+                .is_some_and(|r| r.epoch == epoch && r.holder == holder)
+            {
+                match (replica.backup_acked(epoch), replica.backup_tail(epoch)) {
+                    (Some(acked), Some(tail)) => {
+                        add(tail.into_iter().filter(|t| t.last <= acked).collect())
+                    }
+                    _ => unreadable = true,
+                }
+            }
+            match replica.member_copy_held(epoch) {
+                Some(true) => match replica.member_copy(epoch) {
+                    Some((_, txs)) => add(txs),
+                    None => unreadable = true,
+                },
+                Some(false) => {}
+                None => unreadable = true,
+            }
+        }
+        let mut sealed: Vec<(Epoch, NodeId)> = Vec::new();
+        for &(e, s) in &streams {
+            match replica.kept_streamed(e, s) {
+                Ok(txs) => {
+                    if !txs.is_empty() {
+                        sealed.push((e, s));
+                    }
+                    if e == epoch {
+                        add(txs);
+                    }
+                }
+                Err(_) => unreadable = true,
+            }
+        }
+        if unreadable {
+            self.bk.seal_unreadable = true;
+            return KeptSeal::Unreadable;
+        }
+        let txs: Vec<BackupTx> = by_first.into_values().collect();
+        let through = txs.iter().map(|t| t.last).max().unwrap_or(0);
+        self.stats.seal_tail_kept += 1;
+        let mut members = rows;
+        members.iter_mut().for_each(|m| m.sort_unstable());
+        KeptSeal::Held {
+            txs,
+            through,
+            members,
+            sealed,
+        }
+    }
+
     /// `SealTail`: a claimant of a lease by TTL asks for the tail of
     /// `epoch`. Answered in batches of `backup_batch_rows` from journal
     /// seq `from_seq`; the same answer every time (the seal is persisted).
+    /// `kept` (ADR-51): the claimant takes the tenure `tenure` over and
+    /// asks for the committed rows this node kept of its hold streams (see
+    /// [`Self::seal_kept_hold`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_seal_tail(
         &mut self,
         now: Now,
         from: NodeId,
         req: OpId,
-        epoch: Epoch,
-        config_version: u64,
-        from_seq: u64,
+        (epoch, config_version, from_seq): (Epoch, u64, u64),
         key: RenewalKey,
+        (kept, tenure): (bool, (NodeId, Epoch)),
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -304,7 +463,13 @@ impl Core {
                      txs: Vec<BackupTx>,
                      through: u64,
                      next: Option<u64>,
+                     kept_fields: KeptFields,
                      out: &mut Vec<Action>| {
+            let KeptFields {
+                members,
+                sealed,
+                refused,
+            } = kept_fields;
             out.push(Action::Send {
                 to: from,
                 msg: PeerMsg::SealedTail {
@@ -315,8 +480,71 @@ impl Core {
                     txs,
                     through,
                     next,
+                    members,
+                    sealed,
+                    refused,
                 },
             });
+        };
+        if kept {
+            match self.seal_kept_hold(tenure, epoch, &key, replica) {
+                KeptSeal::Unreadable => {
+                    // Not "I hold nothing": no answer (the claimant asks again).
+                    self.bk.seal_unreadable = false;
+                    self.stats.seal_tail_unreadable += 1;
+                }
+                KeptSeal::Refused(why) => {
+                    match why {
+                        SealRefusal::EpochOpen => self.stats.seal_kept_refused_epoch_open += 1,
+                        SealRefusal::StaleKey => self.stats.seal_kept_refused_stale_key += 1,
+                    }
+                    reply(
+                        false,
+                        false,
+                        Vec::new(),
+                        0,
+                        None,
+                        KeptFields {
+                            refused: Some(why),
+                            ..Default::default()
+                        },
+                        out,
+                    );
+                }
+                KeptSeal::Held {
+                    txs,
+                    through,
+                    members,
+                    sealed,
+                } => {
+                    let (batch, next) = batch_of(&txs, from_seq, self.cfg.backup_batch_rows.max(1));
+                    reply(
+                        true,
+                        false,
+                        batch,
+                        through,
+                        next,
+                        KeptFields {
+                            members,
+                            sealed,
+                            refused: None,
+                        },
+                        out,
+                    );
+                }
+            }
+            return;
+        }
+        // (A plain request for this node's own tenure also reports the
+        // members of the epochs that carried it: the holder's evidence is
+        // the whole of it, ADR-51.)
+        let evidence = |this: &Self| -> Vec<Vec<NodeId>> {
+            if key.holder != this.cfg.node_id {
+                return Vec::new();
+            }
+            replica
+                .epochs_possibly_carrying(key.holder, epoch)
+                .unwrap_or_default()
         };
         let stale_before = self.stats.seal_tail_stale_key;
         let Some((txs, through)) =
@@ -336,11 +564,35 @@ impl Core {
             if empty {
                 self.stats.seal_tail_empty += 1;
             }
-            reply(false, empty, Vec::new(), 0, None, out);
+            let members = evidence(self);
+            reply(
+                false,
+                empty,
+                Vec::new(),
+                0,
+                None,
+                KeptFields {
+                    members,
+                    ..Default::default()
+                },
+                out,
+            );
             return;
         };
         let (batch, next) = batch_of(&txs, from_seq, self.cfg.backup_batch_rows.max(1));
-        reply(true, false, batch, through, next, out);
+        let members = evidence(self);
+        reply(
+            true,
+            false,
+            batch,
+            through,
+            next,
+            KeptFields {
+                members,
+                ..Default::default()
+            },
+            out,
+        );
     }
 
     // ------------------------------------------------ the claimant's side
@@ -447,6 +699,8 @@ impl Core {
                     config_version,
                     from: 0,
                     key: prev_key,
+                    kept: false,
+                    tenure: (0, 0),
                 },
             });
         }
@@ -606,6 +860,8 @@ impl Core {
                         config_version: ch.config_version,
                         from: from_seq,
                         key,
+                        kept: false,
+                        tenure: (0, 0),
                     },
                 });
             }

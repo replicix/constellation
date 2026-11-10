@@ -1170,6 +1170,14 @@ pub enum PeerMsg {
         /// seal whose key is older than its own landed renewal (that CAS
         /// can no longer land).
         key: constellation_store_s3::RenewalKey,
+        /// ADR-51: the claimant collects the committed rows this node kept
+        /// of the hold streams of the tenure `tenure` (see
+        /// `Core::seal_kept_hold`): the member seals those streams first and
+        /// always answers `held`, unless it refuses (`SealRefusal`).
+        kept: bool,
+        /// ADR-51: the tenure `(holder, lease epoch)` a kept request is for
+        /// (`(0, 0)` otherwise).
+        tenure: (NodeId, Epoch),
     },
     /// The answer, in batches of `backup_batch_rows` (`next`: ask again
     /// from there). `held: false`: this node holds no tail of `epoch` (it
@@ -1188,6 +1196,13 @@ pub enum PeerMsg {
         txs: Vec<BackupTx>,
         through: u64,
         next: Option<u64>,
+        /// ADR-51 (a kept request's answer): the member sets of the epoch
+        /// rows that carried the tenure exactly, the streams `(epoch,
+        /// source)` this node sealed, and why it refused (then `held` is
+        /// false and nothing was sealed).
+        members: Vec<Vec<NodeId>>,
+        sealed: Vec<(Epoch, NodeId)>,
+        refused: Option<SealRefusal>,
     },
     /// Plan 46 M1.4 step 1: an epoch member holds the hold owner's journal
     /// through `through` of `epoch` (its store transaction for the
@@ -1198,6 +1213,24 @@ pub enum PeerMsg {
         epoch: Epoch,
         through: u64,
     },
+    /// ADR-51 (K4 per stream): the member sealed the hold owner's stream of
+    /// `epoch` for a claimant's kept fetch (`sealed`): it installs nothing of
+    /// it and acknowledges nothing. One-way. A hold owner that no member can
+    /// acknowledge to ends its hold as deposed.
+    StreamAheadRefused {
+        epoch: Epoch,
+        sealed: bool,
+    },
+}
+
+/// ADR-51: why a member refused a kept `SealTail`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SealRefusal {
+    /// The member's own open epoch carries the tenure: a live hold.
+    EpochOpen,
+    /// The member saw a renewal newer than the claimant's key: the claim
+    /// cannot land.
+    StaleKey,
 }
 
 impl PeerMsg {
@@ -1250,6 +1283,7 @@ impl PeerMsg {
             PeerMsg::SealTail { .. } => "SealTail",
             PeerMsg::SealedTail { .. } => "SealedTail",
             PeerMsg::StreamAheadAck { .. } => "StreamAheadAck",
+            PeerMsg::StreamAheadRefused { .. } => "StreamAheadRefused",
         }
     }
 

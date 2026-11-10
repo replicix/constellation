@@ -766,6 +766,9 @@ pub(crate) struct AckState {
     /// continuation epoch `hold_epoch`. The hold's commit rule reads it
     /// (`durable_jseq_cfg`, step 2).
     pub(crate) hold_acked: BTreeMap<NodeId, u64>,
+    /// ADR-51: the members that refused this hold's batches because they
+    /// sealed its stream (`PeerMsg::StreamAheadRefused`), by epoch.
+    pub(crate) hold_sealed: BTreeSet<(Epoch, NodeId)>,
     hold_epoch: Option<Epoch>,
     /// Batches of the hold streamed to a member and not yet acknowledged:
     /// `(last seq, sent at)`, oldest first (bounded; the wait statistic only).
@@ -837,6 +840,10 @@ pub(crate) struct BackupState {
     /// known, and nothing is acknowledged or answered until a read succeeds
     /// ([`Core::backup_sealed_known`]; plan 43 C2e review).
     pub(crate) sealed_unread: bool,
+    /// ADR-51 (K4 per stream): the streams `(epoch, source)` this node sealed
+    /// for a claimant's kept fetch (persisted, `Replica::seal_streams`): their
+    /// `StreamAhead` batches install nothing and acknowledge nothing.
+    pub(crate) sealed_streams: BTreeSet<(Epoch, NodeId)>,
     /// The persisted role could not be read at start (ADR-43): not "no
     /// role"; nothing is answered or claimed until a read succeeds
     /// ([`Core::backup_role_known`]).
@@ -1433,13 +1440,14 @@ impl Core {
         if !self.bk.sealed_unread {
             return true;
         }
-        match replica.backup_sealed_epoch() {
-            Some(sealed) => {
+        match (replica.backup_sealed_epoch(), replica.sealed_streams()) {
+            (Some(sealed), Some(streams)) => {
                 self.bk.sealed = self.bk.sealed.max(sealed);
+                self.bk.sealed_streams.extend(streams);
                 self.bk.sealed_unread = false;
                 true
             }
-            None => {
+            _ => {
                 // Every append asks again: warned at the 1st, 2nd, 4th, 8th...
                 // failed read, not at each.
                 self.stats.backup_seal_unread_reads += 1;
@@ -1459,9 +1467,12 @@ impl Core {
     /// At start: a persisted backup role (this node backed someone
     /// before it restarted) and a persisted seal are honoured.
     pub(crate) fn backup_start(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
-        match replica.backup_sealed_epoch() {
-            Some(sealed) => self.bk.sealed = sealed,
-            None => {
+        match (replica.backup_sealed_epoch(), replica.sealed_streams()) {
+            (Some(sealed), Some(streams)) => {
+                self.bk.sealed = sealed;
+                self.bk.sealed_streams = streams.into_iter().collect();
+            }
+            _ => {
                 self.bk.sealed_unread = true;
                 tracing::warn!(
                     node = self.cfg.node_id,
@@ -5307,6 +5318,77 @@ impl Core {
         }
     }
 
+    /// ADR-51 (K4 per stream), hold owner: a member sealed this hold's stream
+    /// for a claimant and refuses its batches. That member is sealed for this
+    /// hold; when no member of the epoch can acknowledge any more, the hold
+    /// ends as deposed (the answers it parked abort, the clients retry on the
+    /// successor, and the epoch closes by the members' rule). The rows it
+    /// answered before the seal are in the sealing member's answer; the rows
+    /// after were never acknowledged, so never answered.
+    pub(crate) fn on_stream_ahead_refused(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        epoch: Epoch,
+        sealed: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let me = self.cfg.node_id;
+        if !sealed
+            || !self.lease.epoch_held()
+            || self.lease.epoch() != Some(epoch)
+            || from == me
+            || !self.pr.epoch_members.contains(&from)
+        {
+            self.stats.hold_acks_ignored += 1;
+            return;
+        }
+        self.ack.hold_sealed.insert((epoch, from));
+        let open = self
+            .pr
+            .epoch_members
+            .iter()
+            .any(|n| *n != me && !self.ack.hold_sealed.contains(&(epoch, *n)));
+        if open {
+            return;
+        }
+        self.stats.hold_ended_sealed += 1;
+        tracing::warn!(
+            node = me,
+            epoch,
+            "every other member of the epoch sealed this hold's stream for a claimant: \
+             the hold ends as deposed"
+        );
+        // As a claimant's seal of this node's own epoch does (`seal_tail_hold`,
+        // case 1): the epoch is sealed here, the journal is kept as the member
+        // copy of it, and the node claims the lease again at the next epoch,
+        // from that copy. A hold that formed after the claimant's seals (a
+        // restarted owner re-adopting its tenure) is thereby the tenure's
+        // end, not a stalled epoch no claimant can enter.
+        let cv = self
+            .lease
+            .held
+            .as_ref()
+            .map_or(self.lease.last_config_version, |(l, _)| l.config_version);
+        let first = replica.journal_acked_seq().unwrap_or(0) + 1;
+        if replica.backup_seal(epoch) {
+            self.bk.sealed = self.bk.sealed.max(epoch);
+            if replica.member_copy_put_journal(epoch, cv, first).is_some()
+                && !self.bk.member_epochs.contains(&epoch)
+            {
+                self.bk.member_epochs.push(epoch);
+            }
+        }
+        let carried_mine = self.pr.carried.is_some_and(|c| c.node == me);
+        self.deposed(now, 0, epoch + 1, epoch, replica, out);
+        self.end_epoch_hold(replica, false);
+        // The members wait for the carried lease to move: this node, its
+        // owner, owes that move (it closes the epoch once S3 is back).
+        self.owe_given_up_move(carried_mine, replica);
+        self.nudge(now, out);
+    }
+
     // ------------------------------------------------- parked ack abort
 
     /// The lease is gone (deposed, released): whatever waited for
@@ -6593,6 +6675,26 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // ADR-51 (K4, per stream): a stream this node sealed for a claimant's
+        // kept fetch is final here. What it answered is the set the claim
+        // carries, so nothing more of it is installed or acknowledged; the
+        // hold owner is told, and ends its hold when no member can
+        // acknowledge. A later epoch of the same source is not sealed.
+        if self.bk.sealed_streams.contains(&(epoch, from)) {
+            self.stats.stream_ahead_sealed_refused += 1;
+            self.stats.streamed_dropped += txs.len() as u64;
+            if matches!(self.bk.ahead_next, Some((e, _)) if e == epoch) {
+                self.bk.ahead_next = None;
+            }
+            out.push(Action::Send {
+                to: from,
+                msg: PeerMsg::StreamAheadRefused {
+                    epoch,
+                    sealed: true,
+                },
+            });
+            return;
+        }
         if self.cfg.pre_s3_streaming
             && self.lease.held.is_none()
             && !self.lease.epoch_held()
