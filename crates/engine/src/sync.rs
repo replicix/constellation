@@ -244,6 +244,8 @@ pub enum SyncRequest {
         routed_gen: u64,
         /// ADR-47: `PeerMsg::MutateRequest::touched_gen`.
         touched_gen: u64,
+        /// ADR-47: `PeerMsg::MutateRequest::inbox_ever`.
+        inbox_ever: bool,
         reply: tokio::sync::oneshot::Sender<crate::authority_driver::MutateReplyParts>,
     },
     /// `from` reports chunks it forwarded as pending durable in S3: ack

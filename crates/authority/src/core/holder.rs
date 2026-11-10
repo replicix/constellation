@@ -27,6 +27,9 @@ pub(crate) struct Fence {
     /// The highest non-zero generation the rid was ever sent under or
     /// offered to locally (`0`: never; [`TOUCHED_UNKNOWN`]: cannot know).
     pub touched_gen: u64,
+    /// The rid was ever put in the lease holder's inbox: it executes only
+    /// through the lease holder (its drain), never at a designee.
+    pub inbox_ever: bool,
 }
 
 /// `Fence::touched_gen` of a rid whose send history is not known here (a
@@ -67,6 +70,14 @@ impl Core {
             || replica.completed_outcome(rid).ok().flatten().is_some()
     }
 
+    /// Whether `rid`'s outcome here is a journaled refusal.
+    pub(crate) fn rid_refused_here(&self, rid: Rid, replica: &dyn Replica) -> bool {
+        matches!(
+            replica.completed_outcome(rid),
+            Ok(Some(constellation_meta::CompletedOutcome::Refused { .. }))
+        )
+    }
+
     /// ADR-47 (the root's rule, rows 8-10): whether the root holds a rid
     /// whose keys it must refuse (`code`, a non-stealable grant it does not
     /// reach) instead of refusing it for good: it touched a generation by
@@ -87,15 +98,6 @@ impl Core {
             }
             Ownership::Root => 0,
         }
-    }
-
-    /// Row 5: this root sends `rid` to a non-stealable designee. An inbox
-    /// drain read issued before now may carry the rid still (see
-    /// `Core::redirected_at`). Entries older than every read in flight can
-    /// no longer matter and are dropped.
-    pub(crate) fn note_redirected(&mut self, rid: Rid, now: Now) {
-        self.redirected_at.insert(rid, now.wait);
-        self.prune_redirected();
     }
 }
 
@@ -184,7 +186,7 @@ impl Core {
         // attempt's park alone: it is not the attempt's replacement.)
         if settle
             && req != OpId(0)
-            && !self.fenced_at_delegate(from, &op, fence, replica)
+            && !self.fenced_at_delegate(now, from, &op, (fence, settle), replica)
             && self.drop_unexecuted_park(rid, out)
         {
             self.stats.settle_dropped_parks += 1;
@@ -441,11 +443,18 @@ impl Core {
                     // requester may still have parked at the delegate. A
                     // non-stealable grant is never skipped: `deleg_recall_plan`
                     // refuses it (`EROFS`) while `online` recalls it.
+                    // A rid that was ever in an inbox is never sent to a
+                    // designee (ADR-47, the inbox rule): it runs through
+                    // this lease holder alone, where the drain that may
+                    // still hold its batch decides the same way. (Its
+                    // requester's own generation is answered `Held` below.)
+                    let inbox_only = fence.inbox_ever && !settle && from != d.node;
                     let redirects = d.node != self.cfg.node_id
                         && live.is_some_and(|g| {
                             g.recall == RecallPhase::None || !settle || non_stealable
                         })
-                        && !disowned;
+                        && !disowned
+                        && !inbox_only;
                     // ADR-47 (row 4): a rid that has its outcome here is
                     // answered from it, not redirected: the requester's
                     // table lags a grant the root's journal already knows,
@@ -456,8 +465,12 @@ impl Core {
                     // refused, and its redirect (answered at once by the
                     // delegate's own dedup) costs less than the root's
                     // answer, which waits for its commit.
-                    answered_from_outcome =
-                        redirects && non_stealable && self.rid_has_outcome(rid, replica);
+                    // A refusal is answered from, whatever the grant's kind:
+                    // the delegate may not have applied the root's refusal
+                    // row yet, and would run the op.
+                    answered_from_outcome = redirects
+                        && self.rid_has_outcome(rid, replica)
+                        && (non_stealable || self.rid_refused_here(rid, replica));
                     if answered_from_outcome {
                         self.stats.redirect_answered_from_outcome += 1;
                     }
@@ -472,9 +485,6 @@ impl Core {
                         // held for a retry instead of a redirect to itself.
                         self.stats.deleg_not_owner += 1;
                         let redirect_gen = if from == d.node { 0 } else { d.gen };
-                        if from != d.node && non_stealable {
-                            self.note_redirected(rid, now);
-                        }
                         let outcome = if from == d.node {
                             MutateOutcome::Held {
                                 retry_ms: self.cfg.delegation_stream_tick_ms.max(10),

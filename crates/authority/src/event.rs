@@ -583,6 +583,10 @@ pub enum PeerMsg {
         /// `u64::MAX`: cannot know). The root refuses for good, under a
         /// non-stealable grant it cannot reach, only a rid with `0`.
         touched_gen: u64,
+        /// ADR-47: the rid was ever put in the lease holder's inbox. Such a
+        /// rid executes only through the lease holder (its drain or its own
+        /// path): a designee answers `Fenced` and the root never redirects it.
+        inbox_ever: bool,
     },
     /// The holder's answer. `base` is the first form of plan 30 §M6's
     /// position on replies: the log position the requester must have

@@ -642,6 +642,19 @@ fn replay_seed() {
         }
         Err(_) => config,
     };
+    let config = match std::env::var("AUTHORITY_SIM_INBOX_READS") {
+        Ok(v) => {
+            let n: Vec<u64> = v.split(':').map(|x| x.parse().expect("ms")).collect();
+            SimConfig {
+                inbox_reads: sim::store::SlowReads {
+                    before: (n[0], n[1]),
+                    reply: (n[2], n[3]),
+                },
+                ..config
+            }
+        }
+        Err(_) => config,
+    };
     match run_seed(seed, config) {
         Ok(report) => eprintln!("seed {seed} passed: {report:#?}"),
         Err(e) => panic!("seed {seed} failed: {e}"),
@@ -6514,6 +6527,15 @@ fn sweep_config() {
                 reply: (n[2], n[3]),
             };
         }
+        // `AUTHORITY_SIM_INBOX_READS=0:0:300:1500`: the same for the inbox
+        // batches' GETs (a poll served before a tombstone, processed after).
+        if let Ok(v) = std::env::var("AUTHORITY_SIM_INBOX_READS") {
+            let n: Vec<u64> = v.split(':').map(|x| x.parse().expect("ms")).collect();
+            c.inbox_reads = sim::store::SlowReads {
+                before: (n[0], n[1]),
+                reply: (n[2], n[3]),
+            };
+        }
         if std::env::var("AUTHORITY_SIM_ROOT_PROBE").is_ok_and(|v| v == "0") {
             c.deleg_root_probe = false;
         }
@@ -8225,6 +8247,19 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "root_touched_holds",
             "inbox_touched_halts",
             "redirect_answered_from_outcome",
+            "inbox_own_grant_halts",
+            "inbox_ever_fenced",
+            "inbox_local_withdrawals",
+            "inbox_ever_rerouted",
+            "inbox_hold_root_unknown",
+            "inbox_hold_root_sent",
+            "inbox_hold_root_local",
+            "inbox_hold_nonplaced_unknown",
+            "inbox_hold_nonplaced_sent",
+            "inbox_hold_nonplaced_local",
+            "inbox_hold_cross_unknown",
+            "inbox_hold_cross_sent",
+            "inbox_hold_cross_local",
         ],
     );
     blake3::hash(text.as_bytes()).to_hex().to_string()[..16].to_string()
@@ -8509,7 +8544,8 @@ impl OracleTotals {
         // ADR-47: the delegate fence's counters, per seed (`SWEEP-FENCE`).
         eprintln!(
             "SWEEP-FENCE {label} seed {seed}: fenced {} resends {} bounce-limit {} held {} unsettled-eio {} \
-             root-holds {} inbox-halts {} outcome-answers {}",
+             root-holds {} inbox-halts {} outcome-answers {} own-grant-halts {} ever-fenced {} ever-rerouted {} \
+             local-withdrawals {} holds-by-reason [root u/s/l {}/{}/{}, nonplaced {}/{}/{}, cross {}/{}/{}]",
             r.stats.values().map(|s| s.deleg_fenced_forwards).sum::<u64>(),
             r.stats.values().map(|s| s.fenced_resends).sum::<u64>(),
             r.stats.values().map(|s| s.fence_bounce_limit).sum::<u64>(),
@@ -8517,7 +8553,20 @@ impl OracleTotals {
             r.stats.values().map(|s| s.client_unsettled_eio).sum::<u64>(),
             r.stats.values().map(|s| s.root_touched_holds).sum::<u64>(),
             r.stats.values().map(|s| s.inbox_touched_halts).sum::<u64>(),
-            r.stats.values().map(|s| s.redirect_answered_from_outcome).sum::<u64>()
+            r.stats.values().map(|s| s.redirect_answered_from_outcome).sum::<u64>(),
+            r.stats.values().map(|s| s.inbox_own_grant_halts).sum::<u64>(),
+            r.stats.values().map(|s| s.inbox_ever_fenced).sum::<u64>(),
+            r.stats.values().map(|s| s.inbox_ever_rerouted).sum::<u64>(),
+            r.stats.values().map(|s| s.inbox_local_withdrawals).sum::<u64>(),
+            r.stats.values().map(|s| s.inbox_hold_root_unknown).sum::<u64>(),
+            r.stats.values().map(|s| s.inbox_hold_root_sent).sum::<u64>(),
+            r.stats.values().map(|s| s.inbox_hold_root_local).sum::<u64>(),
+            r.stats.values().map(|s| s.inbox_hold_nonplaced_unknown).sum::<u64>(),
+            r.stats.values().map(|s| s.inbox_hold_nonplaced_sent).sum::<u64>(),
+            r.stats.values().map(|s| s.inbox_hold_nonplaced_local).sum::<u64>(),
+            r.stats.values().map(|s| s.inbox_hold_cross_unknown).sum::<u64>(),
+            r.stats.values().map(|s| s.inbox_hold_cross_sent).sum::<u64>(),
+            r.stats.values().map(|s| s.inbox_hold_cross_local).sum::<u64>()
         );
         self.unsourced += r.acks_unsourced;
         self.unjournaled_landed += r.unjournaled_landed;

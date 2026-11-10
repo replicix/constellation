@@ -463,6 +463,8 @@ pub struct NodeEnv {
     pub fence_accepts_unrouted: bool,
     /// See `SimConfig::root_ignores_touched`.
     pub root_ignores_touched: bool,
+    /// See `SimConfig::inbox_ignores_touched`.
+    pub inbox_ignores_touched: bool,
     /// See `SimConfig::partial_release_ends_stream`.
     pub partial_release_ends_stream: bool,
     /// See `SimConfig::abandon_skips_read_recall`.
@@ -775,6 +777,7 @@ impl NodeHandle {
         cfg.refuse_forwarded_designation_ops = env.refuse_forwarded_designation_ops;
         cfg.fence_accepts_unrouted = env.fence_accepts_unrouted;
         cfg.root_ignores_touched = env.root_ignores_touched;
+        cfg.inbox_ignores_touched = env.inbox_ignores_touched;
         // (The requester's marks hold the refusal of an op sent to a
         // designee as well: off, or the control is vacuous.)
         cfg.refuse_forwarded_designation_ops |= env.root_ignores_touched;

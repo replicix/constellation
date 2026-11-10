@@ -150,6 +150,9 @@ pub(crate) struct ClientOp {
     /// resubmission of a rid that was).
     #[allow(dead_code)]
     pub inbox_ever: bool,
+    /// ADR-47: the rid was offered to a generation of this node (only for
+    /// the inbox hold's reason counters; `touched_gen` carries the safety).
+    pub touched_local: bool,
     /// ADR-47: `Fenced` answers followed with a resend routed by the
     /// answering generation, since the last reset of `attempts`; past two
     /// the op is routed afresh.
@@ -716,6 +719,7 @@ impl Core {
                 held_by: None,
                 touched_gen,
                 inbox_ever,
+                touched_local: false,
                 fence_bounces: 0,
                 forwarded: in_doubt,
                 acquire_retries: 0,
@@ -1322,25 +1326,74 @@ impl Core {
     }
 
     /// ADR-47 (the requester's inbox liveness rule; not safety-bearing: the
-    /// drain decides by the op's `touched_gen`): whether `rid` may be put in
-    /// the holder's inbox. An op that touched a generation (`touched_gen`,
-    /// `UNKNOWN` included) waits instead unless its keys are a placed
-    /// generation's on this node's table: the drain halts a touched op under
-    /// a non-stealable grant, and the halt would keep this node's later
-    /// batches behind it for the grant's life. A table that lags costs a
-    /// halted batch, never a final refusal.
-    fn inbox_ok(&self, rid: Rid, replica: &dyn Replica) -> bool {
-        let Some(c) = self.clients.get(&rid) else {
-            return true;
-        };
-        if c.touched_gen == 0 {
-            return true;
+    /// drain decides by the op's `touched_gen`): why `rid` should not be put
+    /// in the holder's inbox now, as `(what its keys resolve to, how it
+    /// touched a generation)` indexes for the counters, or `None` to put it
+    /// there. The drain halts a touched op under a non-stealable grant, and
+    /// the halt would keep this node's later batches behind it for the
+    /// grant's life; that costs only where this node's table predicts the
+    /// halt:
+    /// - keys the table gives to the root: held only when a send was routed
+    ///   by a generation the table has not applied yet (`touched > max_gen`);
+    ///   an op of unknown history, or whose generation the table shows
+    ///   ended, goes (the drain at an up-to-date root runs it, with dedup);
+    /// - a placed generation: the drain does not halt it (no hold);
+    /// - a stealable grant, or a set with one: held.
+    ///
+    /// A table that lags costs a halted batch, never a final refusal.
+    pub(crate) fn inbox_hold(&self, rid: Rid, replica: &dyn Replica) -> Option<(usize, usize)> {
+        let c = self.clients.get(&rid)?;
+        if c.touched_gen == 0 || self.cfg.inbox_ignores_touched {
+            return None;
         }
+        let reason = if c.touched_gen == TOUCHED_UNKNOWN {
+            0
+        } else if c.touched_local {
+            2
+        } else {
+            1
+        };
+        let placed = |d: &constellation_meta::delegation::Delegation| {
+            d.kind == constellation_meta::SubtreeKind::Placed
+        };
         let keys = super::holder::keys_of_op_in(&c.op, replica);
-        matches!(
-            replica.resolve_ownership(&keys),
-            Ownership::Delegated(d) if d.kind == constellation_meta::SubtreeKind::Placed
-        )
+        match replica.resolve_ownership(&keys) {
+            Ownership::Root => (c.touched_gen != TOUCHED_UNKNOWN
+                && c.touched_gen > replica.delegation_table().max_gen())
+            .then_some((0, reason)),
+            Ownership::Delegated(d) => (!placed(&d)).then_some((1, reason)),
+            Ownership::CrossSubtree { involved, .. } => {
+                (!involved.iter().all(placed)).then_some((2, reason))
+            }
+        }
+    }
+
+    fn count_inbox_hold(&mut self, (kind, reason): (usize, usize)) {
+        let s = &mut self.stats;
+        let counter = [
+            [
+                &mut s.inbox_hold_root_unknown,
+                &mut s.inbox_hold_root_sent,
+                &mut s.inbox_hold_root_local,
+            ],
+            [
+                &mut s.inbox_hold_nonplaced_unknown,
+                &mut s.inbox_hold_nonplaced_sent,
+                &mut s.inbox_hold_nonplaced_local,
+            ],
+            [
+                &mut s.inbox_hold_cross_unknown,
+                &mut s.inbox_hold_cross_sent,
+                &mut s.inbox_hold_cross_local,
+            ],
+        ];
+        *counter
+            .into_iter()
+            .nth(kind)
+            .expect("kind")
+            .into_iter()
+            .nth(reason)
+            .expect("reason") += 1;
     }
 
     /// Whether `node` owns (holds a grant of) any of `rid`'s keys in this
@@ -1406,10 +1459,12 @@ impl Core {
                 );
                 if reaches {
                     self.send_forward(now, rid, holder, 0, replica, out);
-                } else if self.cfg.inbox
-                    && !self.cfg.refuse_forwarded_designation_ops
-                    && !self.inbox_ok(rid, replica)
+                } else if let Some(hold) = (self.cfg.inbox
+                    && !self.cfg.refuse_forwarded_designation_ops)
+                    .then(|| self.inbox_hold(rid, replica))
+                    .flatten()
                 {
+                    self.count_inbox_hold(hold);
                     // The inbox drain refuses an op under a designation for
                     // good (journaled, `Refused`), and an op sent to the
                     // designee may have run there: the refusal would
@@ -1547,6 +1602,7 @@ impl Core {
                 settle: c.settle,
                 routed_gen,
                 touched_gen: c.touched_gen,
+                inbox_ever: c.inbox_ever,
             },
         });
     }
@@ -1863,6 +1919,32 @@ impl Core {
                     c.fence_bounces += 1;
                     c.fence_bounces
                 });
+                // (ADR-47, the inbox rule: a rid that was ever in an inbox
+                // runs through the lease holder alone. The answering node
+                // is a designee, not the lease holder: it is dropped from
+                // the cache and the rid is routed afresh, never resent to it
+                // by its generation. An execution there would not be seen by
+                // a drain that still holds the rid's batch.)
+                if self
+                    .clients
+                    .get(&rid)
+                    .is_some_and(|c| c.inbox_ever && !c.settle)
+                {
+                    self.stats.inbox_ever_rerouted += 1;
+                    if self.lease.cached_holder == Some(from) {
+                        self.lease.cached_holder = None;
+                    }
+                    if let Some(c) = self.clients.get_mut(&rid) {
+                        c.held_by = None;
+                    }
+                    if bounced.is_some_and(|n| n <= 2) {
+                        self.route(now, rid, replica, out);
+                    } else {
+                        self.stats.fence_bounce_limit += 1;
+                        self.retry_or_lease(now, rid, replica, out);
+                    }
+                    return;
+                }
                 if bounced.is_some_and(|n| n <= 2) {
                     self.stats.fenced_resends += 1;
                     self.send_forward(now, rid, from, fenced, replica, out);
@@ -2003,7 +2085,15 @@ impl Core {
                     return;
                 }
                 let c = self.clients.get_mut(&rid).expect("present");
-                if holder != 0 && holder != from && holder != self.cfg.node_id && c.redirected < 2 {
+                // (ADR-47, the inbox rule: not to a designee for a rid that was
+                // ever in an inbox.)
+                let inbox_only = c.inbox_ever && !c.settle && gen != 0;
+                if holder != 0
+                    && holder != from
+                    && holder != self.cfg.node_id
+                    && c.redirected < 2
+                    && !inbox_only
+                {
                     c.redirected += 1;
                     if to_designee {
                         c.sent_to_delegate = true;
@@ -2657,7 +2747,7 @@ impl Core {
         let Some(c) = self.clients.get(&rid) else {
             return;
         };
-        let sent = c.forwarded || c.attempts > 0;
+        let sent = c.forwarded || c.attempts > 0 || c.touched_gen != 0;
         if matches!(c.origin, Origin::Replay { .. }) {
             self.finish_in_doubt(now, rid, replica, out);
             return;
@@ -3036,12 +3126,14 @@ impl Core {
                         // is set before a send or a local offer to a
                         // generation, `UNKNOWN` for a replay or an in-doubt
                         // resubmission; `EXDEV` is final.)
-                        if !self.cfg.refuse_forwarded_designation_ops
-                            && self.root_holds_touched(
-                                code,
-                                self.clients.get(&rid).map_or(0, |c| c.touched_gen),
-                            )
-                        {
+                        // (Only `root_holds_touched` gates this rule, not the
+                        // requester marks' knob.)
+                        if self.root_holds_touched(
+                            code,
+                            self.clients
+                                .get(&rid)
+                                .map_or(TOUCHED_UNKNOWN, |c| c.touched_gen),
+                        ) {
                             let gens: Vec<u64> = match replica.resolve_ownership(&keys) {
                                 constellation_meta::delegation::Ownership::Delegated(d) => {
                                     vec![d.gen]

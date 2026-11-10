@@ -532,6 +532,7 @@ impl constellation_net::PeerService for P2pBridge {
         settle: bool,
         routed_gen: u64,
         touched_gen: u64,
+        inbox_ever: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -567,6 +568,7 @@ impl constellation_net::PeerService for P2pBridge {
                     settle,
                     routed_gen,
                     touched_gen,
+                    inbox_ever,
                     reply,
                 })
                 .is_ok()
