@@ -301,7 +301,7 @@ impl Core {
         if !self.cfg.p2p {
             return false;
         }
-        let Some(link) = self.links.get(&holder).copied() else {
+        let Some(link) = self.roster.links().get(&holder).copied() else {
             return false;
         };
         let Some(since) = self.inbox.down_since.get(&holder).copied() else {
@@ -359,7 +359,8 @@ impl Core {
         let wanted = self.lease.wanted.clone();
         // The same notion of "connected" the inbox's poll schedule uses:
         // a wanter still linked over P2P is served by a handoff as ever.
-        let connected = |core: &Self, id: &NodeId| core.links.get(id).is_some_and(|l| l.connected);
+        let connected =
+            |core: &Self, id: &NodeId| core.roster.links().get(id).is_some_and(|l| l.connected);
         if wanted.iter().any(|w| connected(self, w)) {
             return false;
         }
@@ -799,7 +800,11 @@ impl Core {
                         && l.holder != 0
                         && l.epoch == epoch
                         && !self.lease.claimable_observed(now, &self.cfg)
-                        && self.links.get(&l.holder).is_some_and(|k| k.connected)
+                        && self
+                            .roster
+                            .links()
+                            .get(&l.holder)
+                            .is_some_and(|k| k.connected)
                         && self.reaches(now, l.holder) =>
                 {
                     // EC2 follow-up: the op went to the inbox while the
@@ -1021,10 +1026,10 @@ impl Core {
     /// Who this holder polls: the roster and the peer directory, minus
     /// itself and the peers it is P2P-connected to.
     fn requesters_to_poll(&self) -> Vec<NodeId> {
-        let mut ids: Vec<NodeId> = self.roster.clone();
+        let mut ids: Vec<NodeId> = self.roster.write_eligible().to_vec();
         let connected =
-            |id: &NodeId| self.cfg.p2p && self.links.get(id).is_some_and(|l| l.connected);
-        for node in self.links.keys() {
+            |id: &NodeId| self.cfg.p2p && self.roster.links().get(id).is_some_and(|l| l.connected);
+        for node in self.roster.links().keys() {
             if !connected(node) {
                 ids.push(*node);
             }

@@ -1803,7 +1803,7 @@ impl Core {
         if self.lease.held.is_some()
             && node != self.cfg.node_id
             && node != 0
-            && self.peer_requesters.insert(node, now.wait).is_none()
+            && self.roster.note_heard(node, now.wait)
         {
             self.refresh_backup_eligibility();
         }
@@ -3844,10 +3844,11 @@ impl Core {
             if self.cfg.backup_rtt_budget_ms == 0 || self.cfg.backups_max == 0 {
                 Vec::new()
             } else {
-                self.links
+                self.roster
+                    .links()
                     .values()
                     .filter(|l| l.node != self.cfg.node_id && l.connected)
-                    .filter(|l| self.roster.contains(&l.node))
+                    .filter(|l| self.roster.lists(l.node))
                     .filter(|l| {
                         l.rtt_ms
                             .is_some_and(|rtt| rtt <= self.cfg.backup_rtt_budget_ms)
@@ -3904,24 +3905,22 @@ impl Core {
         // the wait clock does not count a suspend, and the assessment
         // still never changes with the clock alone. Before the first
         // snapshot nothing is known either.
-        if !self.peers_seen || self.peers_lapses < self.lapses_seen {
-            return true;
-        }
-        // The newest roster read was partial: who the peers are is unknown,
-        // and unknown counts as peers.
-        if self.roster_unread {
+        //
+        // The newest roster read may have been partial: who the peers are
+        // is unknown, and unknown counts as peers.
+        if self.roster.peers_unknown() {
             return true;
         }
         // Plan 46 M1.1 step 5 (C8 condition 3): a node that asked this one
         // for something is a linked peer until the directory says
         // otherwise.
-        if !self.peer_requesters.is_empty() {
+        if self.roster.has_heard() {
             return true;
         }
-        self.links.values().any(|l| {
+        self.roster.links().values().any(|l| {
             l.node != self.cfg.node_id
                 && l.connected
-                && self.roster.contains(&l.node)
+                && self.roster.lists(l.node)
                 && l.rtt_ms
                     .is_none_or(|rtt| rtt <= self.cfg.backup_rtt_budget_ms)
         })
@@ -4276,7 +4275,7 @@ impl Core {
             .backups()
             .iter()
             .copied()
-            .filter(|n| self.links.get(n).is_some_and(|l| !l.connected))
+            .filter(|n| self.roster.links().get(n).is_some_and(|l| !l.connected))
             .collect();
         for n in down {
             self.drop_backup(now, n, "link down");
@@ -6010,7 +6009,12 @@ impl Core {
         // holder's own word is its lease: read it (not sealed first), and
         // seal and take over only if it expired.
         if self.bk.restarted && self.bk.sealed < role.epoch {
-            if self.links.get(&role.holder).is_some_and(|l| l.connected) {
+            if self
+                .roster
+                .links()
+                .get(&role.holder)
+                .is_some_and(|l| l.connected)
+            {
                 self.bk.restarted = false;
                 self.bk.last_heard = self.bk.last_heard.max(now.wait);
             } else {
@@ -6925,7 +6929,11 @@ impl Core {
                 now.wait.since(self.attentive_since(who, last, now)) >= window
             }
             None => {
-                let up = self.links.get(&seen.holder).is_some_and(|l| l.connected)
+                let up = self
+                    .roster
+                    .links()
+                    .get(&seen.holder)
+                    .is_some_and(|l| l.connected)
                     || self.stream_live_from(seen.holder);
                 if up {
                     self.bk.holder_silent_since = None;

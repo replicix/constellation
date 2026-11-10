@@ -836,7 +836,7 @@ impl Core {
         let up = self
             .lease
             .cached_holder
-            .and_then(|h| self.links.get(&h))
+            .and_then(|h| self.roster.links().get(&h))
             .is_some_and(|l| l.connected);
         if up && !self.stream.holder_link_up && self.stream.sub.is_none() {
             self.stream.retry_at = now.wait;

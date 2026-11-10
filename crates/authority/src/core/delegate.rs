@@ -1738,7 +1738,11 @@ impl Core {
                         !g.ended
                             && g.recall == RecallPhase::None
                             && now.wait < self.gen_until(d.gen)
-                            && self.links.get(&d.node).is_some_and(|l| l.connected)
+                            && self
+                                .roster
+                                .links()
+                                .get(&d.node)
+                                .is_some_and(|l| l.connected)
                     });
                     let disowned = from == d.node && !self.grant_in_flight(now, d.gen);
                     if live && !disowned {
@@ -6895,7 +6899,7 @@ impl Core {
         let timeout = self.deleg_request_timeout_ms();
         let recall = self
             .root_node()
-            .and_then(|r| self.links.get(&r))
+            .and_then(|r| self.roster.links().get(&r))
             .and_then(|l| l.rtt_ms)
             .map_or(timeout, |rtt| rtt.saturating_mul(4).min(timeout));
         self.deleg_lapse_at(d).plus(recall)
@@ -8196,24 +8200,7 @@ impl Core {
     /// one would read as "nobody holds any"); then the horizon decides.
     /// This is the one place that builds the audience.
     pub(crate) fn void_audience(&self) -> Option<BTreeSet<NodeId>> {
-        if !(self.roster_seen && self.peers_seen && self.peers_complete) {
-            return None;
-        }
-        let mut peers = self.audience.clone();
-        peers.extend(self.roster.iter().copied());
-        peers.extend(self.links.keys().copied());
-        peers.remove(&self.cfg.node_id);
-        Some(peers)
-    }
-
-    /// Grow the audience by the roster and the directory's links, once a
-    /// complete snapshot has arrived (the roster may follow it) (and from then on at each roster and
-    /// peers event). The one place it grows; it never shrinks.
-    pub(super) fn note_audience(&mut self) {
-        if self.peers_seen && self.peers_complete {
-            self.audience.extend(self.roster.iter().copied());
-            self.audience.extend(self.links.keys().copied());
-        }
+        self.roster.audience(self.cfg.node_id)
     }
 
     /// The early exit of the restart quarantine (ADR-46, D6): every
@@ -8711,7 +8698,7 @@ impl Core {
                 later(self);
                 continue;
             }
-            if !self.links.get(&node).is_some_and(|l| l.connected) {
+            if !self.roster.links().get(&node).is_some_and(|l| l.connected) {
                 // The delegate is away for the moment (reconnecting
                 // mid-recall): once it is back.
                 later(self);
@@ -10564,7 +10551,7 @@ impl Core {
         self.peer_heard
             .get(&node)
             .copied()
-            .max(self.links.get(&node).and_then(|l| l.last_seen))
+            .max(self.roster.links().get(&node).and_then(|l| l.last_seen))
     }
 
     /// `node` was heard from at `at` (wait clock).

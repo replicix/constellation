@@ -60,6 +60,7 @@ mod placement;
 mod promise;
 mod readindex;
 mod replay;
+mod roster;
 mod seal_tail;
 mod stream;
 #[cfg(test)]
@@ -2337,30 +2338,9 @@ pub struct Core {
     epoch_replacing: bool,
     /// What the last deposition recovery did (`Control::Reintegrate`).
     last_recovery: Option<String>,
-    roster: Vec<NodeId>,
-    /// An `Event::Roster` has arrived: `roster` is the directory's, not the
-    /// empty start value (`void_audience`).
-    roster_seen: bool,
-    /// The wait clock of the newest roster read taken (`Event::Roster` or
-    /// `Event::RosterUnread`); a read issued before it is a stale arrival
-    /// and is ignored.
-    roster_issued: WaitMs,
-    /// The newest roster read could not be completed (a record vanished or
-    /// would not parse): `roster` is the last complete one, and the peer
-    /// set is unknown, which counts as peers (fail safe: wait).
-    roster_unread: bool,
-    /// Plan 46 M1.1 step 5 (C8 condition 3): nodes that sent this node a
-    /// request (a forward, a settle, an inbox batch) since the directory
-    /// last showed them: a request from a peer is a singleton-test event,
-    /// counted as the peer's link until the next `Peers` snapshot lists it
-    /// (or a `Roster` read does not) - the root bumps its configuration
-    /// before it journals a peer's op, not at the roster read.
-    ///
-    /// Each is kept with the wait clock of its latest request: a `Roster` or
-    /// `Peers` read drops it only if the read was issued after that, for an
-    /// older read may predate the requester's registration and lack it.
-    peer_requesters: BTreeMap<NodeId, WaitMs>,
-    links: BTreeMap<NodeId, PeerLink>,
+    /// The one membership object (ADR-50): the write-eligible roster, the
+    /// peer directory, the nodes heard from, the lapses and the audience.
+    roster: roster::Roster,
     /// Each connected peer's measured round trips in the last placement
     /// tick (one per directory snapshot), for the delegation group's
     /// admission ([`Self::delegate_group_in_budget`]): a link is judged by
@@ -2368,27 +2348,6 @@ pub struct Core {
     /// not refuse it, as one sample over budget does not recall a grant.
     /// Cleared when the link goes down or is not measured.
     rtt_recent: BTreeMap<NodeId, VecDeque<(WaitMs, u64)>>,
-    /// I1 class 2: `Event::OwnLag` events this core has handled, and the
-    /// highest count of them the driver had handed when it took the
-    /// directory snapshot `links` was last set from (`Event::Peers`'s
-    /// `lapses`, read before the snapshot). `peers_seen`: a snapshot has
-    /// arrived at all. A snapshot taken before the last lapse was handed may
-    /// predate the lapse (peers that came up meanwhile are queued behind
-    /// the event that resumed this node), so it cannot show that no backup
-    /// could be had (`backup_could_be_had`). Counters, not the clock: the
-    /// wait clock does not count a suspend.
-    lapses_seen: u64,
-    peers_lapses: u64,
-    peers_seen: bool,
-    /// A snapshot has arrived whose directory a complete registry scan
-    /// filled (`Event::Peers::registry_complete`); it stays set.
-    peers_complete: bool,
-    /// Every node that was on the roster or in the directory since the
-    /// first complete snapshot: the readers that may hold a read grant of
-    /// this node's delegates (`Core::void_audience`). It only grows: a
-    /// later scan that lost a record (corrupt, deleted, not read) cannot
-    /// take a node out of it while a grant of it may be outstanding.
-    audience: BTreeSet<NodeId>,
     /// When this node last heard from each peer (a message, or the driver's
     /// `PeerLink::last_seen`), on its wait clock. Kept across the link
     /// table's replacement (`Event::Peers`), which drops a link's last
@@ -2503,18 +2462,8 @@ impl Core {
             epoch: EpochState::default(),
             epoch_replacing: false,
             last_recovery: None,
-            roster: Vec::new(),
-            roster_seen: false,
-            roster_issued: WaitMs(i64::MIN),
-            roster_unread: false,
-            peer_requesters: Default::default(),
-            links: BTreeMap::new(),
+            roster: roster::Roster::new(),
             rtt_recent: BTreeMap::new(),
-            lapses_seen: 0,
-            peers_lapses: 0,
-            peers_seen: false,
-            peers_complete: false,
-            audience: BTreeSet::new(),
             peer_heard: BTreeMap::new(),
             own_s3: OwnS3::default(),
             readopt_refused_until: WaitMs(0),
@@ -2602,7 +2551,8 @@ impl Core {
 
     /// The peers whose link this core sees connected, for `status`.
     pub fn connected_links(&self) -> Vec<NodeId> {
-        self.links
+        self.roster
+            .links()
             .values()
             .filter(|l| l.connected)
             .map(|l| l.node)
@@ -2630,7 +2580,7 @@ impl Core {
             ("round_waiters", self.round_waiters.len()),
             ("barriers", self.barriers.len()),
             ("acquire_waiters", self.acquire_waiters.len()),
-            ("links", self.links.len()),
+            ("links", self.roster.links().len()),
             ("inbox_pending", self.inbox.pending.len()),
             ("dw_slots", self.dw.len()),
             ("s3_in_flight", self.s3.len()),
@@ -2664,7 +2614,8 @@ impl Core {
 
     /// M13: the inbox's observable state, for `status`.
     pub fn inbox_view(&self, now: Now) -> InboxView {
-        self.inbox.view(now, &self.cfg, &self.roster)
+        self.inbox
+            .view(now, &self.cfg, self.roster.write_eligible())
     }
 
     /// Refused replays whose conflict copy is pending / stalled
@@ -2822,22 +2773,13 @@ impl Core {
                 write_eligible,
                 issued,
             } => {
-                if issued < self.roster_issued {
+                let foreign = write_eligible.iter().any(|n| *n != self.cfg.node_id);
+                if !self.roster.install_read(write_eligible, issued) {
                     return out;
                 }
-                self.roster_issued = issued;
-                self.roster_unread = false;
-                if write_eligible.iter().any(|n| *n != self.cfg.node_id) {
+                if foreign {
                     self.note_foreign(now, replica, &mut out);
                 }
-                self.roster = write_eligible;
-                self.roster_seen = true;
-                self.note_audience();
-                // The roster read is the authority on who is a peer: a
-                // requester it does not list is none.
-                let roster = &self.roster;
-                self.peer_requesters
-                    .retain(|n, at| roster.contains(n) || issued <= *at);
                 self.refresh_backup_eligibility();
                 // A holder polls a requester it has just learned of at
                 // once (M13 round 2), not at its next round's end.
@@ -2846,11 +2788,9 @@ impl Core {
                 }
             }
             Event::RosterUnread { issued } => {
-                if issued < self.roster_issued {
+                if !self.roster.install_unread(issued) {
                     return out;
                 }
-                self.roster_issued = issued;
-                self.roster_unread = true;
                 self.refresh_backup_eligibility();
             }
             Event::Peers {
@@ -2873,16 +2813,8 @@ impl Core {
                     }
                 }
                 self.note_rtt_samples(now.wait, &links);
-                self.links = links.into_iter().map(|l| (l.node, l)).collect();
-                // The directory now shows every requester it knows: the
-                // links are the truth from here on.
-                let links = &self.links;
-                self.peer_requesters
-                    .retain(|n, at| !links.contains_key(n) || issued <= *at);
-                self.peers_seen = true;
-                self.peers_complete |= registry_complete;
-                self.note_audience();
-                self.peers_lapses = self.peers_lapses.max(lapses);
+                self.roster
+                    .install_links(links, registry_complete, lapses, issued);
                 self.refresh_backup_eligibility();
                 self.stream_on_peers(now);
             }
@@ -2923,7 +2855,7 @@ impl Core {
                 replica,
             ),
             Event::OwnLag { from, until } => {
-                self.lapses_seen += 1;
+                self.roster.note_lapse();
                 self.on_own_lag(from, until);
                 // The directory this node holds may predate the lapse: not
                 // lone again until a snapshot taken after it arrives (a

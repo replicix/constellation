@@ -3252,10 +3252,16 @@ impl Core {
                 .cached_holder
                 .filter(|h| *h != self.cfg.node_id)
                 .or_else(|| {
-                    self.links
+                    self.roster
+                        .links()
                         .values()
                         .find(|l| l.connected && l.node != self.cfg.node_id)
-                        .or_else(|| self.links.values().find(|l| l.node != self.cfg.node_id))
+                        .or_else(|| {
+                            self.roster
+                                .links()
+                                .values()
+                                .find(|l| l.node != self.cfg.node_id)
+                        })
                         .map(|l| l.node)
                 });
             match target {

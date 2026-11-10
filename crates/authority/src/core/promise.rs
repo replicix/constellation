@@ -471,7 +471,7 @@ impl Core {
         // per read once its recorded expiry passes, renewed or not. With
         // P2P down nobody can ask: the idle watch below keeps `last_seen`
         // fresh, and an expiry it shows is a real one.
-        let p2p_down = !self.cfg.p2p || !self.links.values().any(|l| l.connected);
+        let p2p_down = !self.cfg.p2p || !self.roster.links().values().any(|l| l.connected);
         // Plan 43 C7b: when this node's observation of a foreign unreleased
         // key has run out (a TTL watched on its own wait clock) and it has
         // not promised for that key yet: the heartbeat names the key, and
@@ -501,7 +501,7 @@ impl Core {
     /// The idle watch: re-read the lease (its result lands in
     /// `last_seen`, and `promise_after_event` promises if it expired).
     pub(crate) fn on_promise_watch(&mut self, now: Now, out: &mut Vec<Action>) {
-        let p2p_down = !self.cfg.p2p || !self.links.values().any(|l| l.connected);
+        let p2p_down = !self.cfg.p2p || !self.roster.links().values().any(|l| l.connected);
         if self.cfg.epoch_slack == 0
             || self.pr.retired
             || self.epoch.open
@@ -1404,12 +1404,7 @@ impl Core {
         if !self.cfg.p2p || !check.fresh {
             return;
         }
-        let peers: Vec<NodeId> = self
-            .roster
-            .iter()
-            .copied()
-            .filter(|n| *n != self.cfg.node_id)
-            .collect();
+        let peers: Vec<NodeId> = self.roster.write_peers(self.cfg.node_id).collect();
         for peer in peers {
             let req = self.op_id();
             check.asked.insert(req, peer);
@@ -1535,8 +1530,9 @@ impl Core {
                 },
             ));
         }
-        let slack = effective_slack(self.cfg.epoch_slack, &self.roster, &all);
-        let verdict = takeover_check(slack, self.cfg.node_id, &self.roster, &check.key, &evidence);
+        let roster = self.roster.write_eligible();
+        let slack = effective_slack(self.cfg.epoch_slack, roster, &all);
+        let verdict = takeover_check(slack, self.cfg.node_id, roster, &check.key, &evidence);
         if !verdict.allows() && !check.asked_any {
             // `f = 0` here, but a roster node still advertises more.
             let mut check = self.pr.check.take().expect("checked above");

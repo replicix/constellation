@@ -92,7 +92,7 @@ impl Harness {
         );
         // An established node: it has read the roster (the audience of a
         // void is known; tests of the unknown audience clear this).
-        core.roster_seen = true;
+        core.roster.mark_seen_for_test(true);
         Self {
             core,
             meta,
@@ -15146,16 +15146,19 @@ mod backup_crash {
             write_eligible: vec![1],
             issued: WaitMs(i64::MAX - 1_000),
         });
-        assert_eq!(h.core.roster, vec![1, 2]);
+        assert_eq!(h.core.roster.write_eligible(), [1, 2]);
         h.step(Event::RosterUnread {
             issued: WaitMs(i64::MAX - 500),
         });
-        assert!(!h.core.roster_unread, "an older unread is stale too");
+        assert!(
+            !h.core.roster.unread_for_test(),
+            "an older unread is stale too"
+        );
         h.step(Event::Roster {
             write_eligible: vec![1, 2, 3],
             issued: WaitMs(i64::MAX),
         });
-        assert_eq!(h.core.roster, vec![1, 2, 3]);
+        assert_eq!(h.core.roster.write_eligible(), [1, 2, 3]);
     }
 
     /// Plan 46 M1.1 step 2: the root's rule is one lookup of its
@@ -15282,7 +15285,7 @@ mod backup_crash {
         h.core.cfg.p2p = true;
         h.core.cfg.backup_rtt_budget_ms = 50;
         h.core.cfg.backups_max = 1;
-        h.core.peers_seen = false;
+        h.core.roster.mark_peers_seen_for_test(false);
         h.hold(1, None);
         assert!(h.core.backup_could_be_had(), "no directory yet");
         link_2_after(&mut h, false, None, 0, 0);
@@ -15415,8 +15418,8 @@ mod backup_crash {
         backup_node(&mut h, vec![1, 2]);
         h.hold(1, None);
         link_2(&mut h, false, None, 0);
-        h.core.links.get_mut(&2).unwrap().connected = true;
-        h.core.links.get_mut(&2).unwrap().rtt_ms = Some(5);
+        h.core.roster.link_mut_for_test(2).unwrap().connected = true;
+        h.core.roster.link_mut_for_test(2).unwrap().rtt_ms = Some(5);
         assert_eq!(h.core.ack_need(&pos), None, "(no event yet)");
         h.advance(1);
         h.step(Event::Activity {
@@ -34096,7 +34099,7 @@ fn root_with_dir() -> (Harness, constellation_fs_core::Ino) {
     h.hold(2, None);
     // The directory has been read (the links are the harness's peers): an
     // abandon asks them (`void_audience`).
-    h.core.roster_seen = true;
+    h.core.roster.mark_seen_for_test(true);
     (h, dir)
 }
 
@@ -45593,7 +45596,7 @@ mod deleg_group {
     fn lapse_with_a_parked_own_op() -> (Harness, Rid, Ms, Ms) {
         let (mut h, dir, _, _) = delegate_renewed_once();
         root_is_near(&mut h);
-        h.core.links.get_mut(&1).expect("link").rtt_ms = Some(250);
+        h.core.roster.link_mut_for_test(1).expect("link").rtt_ms = Some(250);
         let rid = h.rid(1);
         let ino = h.meta.allocate_ino(dir).unwrap();
         let out = h.step(Event::Submit {
@@ -55929,7 +55932,7 @@ mod c2f_lone_root {
     /// condition 3 counts a requester until the directory or the roster
     /// says otherwise): the root is a singleton again.
     fn forget_requesters(h: &mut Harness) {
-        h.core.peer_requesters.clear();
+        h.core.roster.clear_heard_for_test();
         h.core.ack.eligible = Some(false);
     }
 
@@ -57556,7 +57559,7 @@ mod c2g_settle {
         c.forwarded = true;
         c.phase = client::Phase::AcquireRetry;
         c.timer = None;
-        if let Some(l) = h.core.links.get_mut(&2) {
+        if let Some(l) = h.core.roster.link_mut_for_test(2) {
             l.connected = false;
         }
         h.core.note_p2p_result(h.clk(), 2, false);
@@ -61506,7 +61509,7 @@ mod m11_step5 {
         backup_node(&mut h, vec![1]);
         // `backup_node`'s read is stamped at the end of time; the reads
         // below are issued by the clock.
-        h.core.roster_issued = WaitMs(i64::MIN);
+        h.core.roster.forget_issued_for_test();
         h.hold(1, None);
         h.core.ack.eligible = Some(h.core.backup_could_be_had());
         assert!(h.core.root_lone());
@@ -65305,8 +65308,8 @@ mod step4_sticky {
         let mut h = Harness::new(3);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
-        h.core.roster = vec![1, 2, 3];
-        h.core.roster_seen = true;
+        h.core.roster.set_write_eligible_for_test(vec![1, 2, 3]);
+        h.core.roster.mark_seen_for_test(true);
         h.core.lease.cached_holder = Some(1);
         let mut records = Vec::new();
         let mut dirs = Vec::new();
@@ -65477,8 +65480,7 @@ mod step4_sticky {
         });
         // This cluster is nodes 1 to 3: the harness's first directory
         // (2 to 4) is not part of it.
-        h.core.audience.clear();
-        h.core.note_audience();
+        h.core.roster.rebuild_audience_for_test();
         let (ok, out) = control_delegate(&mut h, 900, d1, 3, true);
         assert!(ok, "{out:?}");
         let gen = sticky_gen_of(&h, d1);
@@ -65591,7 +65593,7 @@ mod step4_sticky {
     #[test]
     fn an_abandon_before_the_directory_is_known_waits_the_deadline() {
         let (mut h, gen) = root_with_a_silent_sticky_holder();
-        h.core.roster_seen = false;
+        h.core.roster.mark_seen_for_test(false);
         let out = abandon_node(&mut h, 910, 3, None, false);
         assert!(void_reqs(&out).is_empty(), "{out:?}");
         assert!(
@@ -67858,7 +67860,7 @@ mod step5_sticky_release {
         renew_holder(&mut r, &out);
         // The roster is read (no void round is the subject here): a reader
         // the directory names is granted but for the quarantine.
-        r.core.roster_seen = true;
+        r.core.roster.mark_seen_for_test(true);
         let now = r.clk();
         let outcome = r.deleg_read_index(now, 2, dirs[0], None);
         assert!(
@@ -68303,7 +68305,7 @@ mod step5_sticky_release {
         let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
         let (mut r, _) = restart_bare(&h, 2_000, true);
         // The first scan failed: the directory is the cached (empty) one.
-        r.core.peers_complete = false;
+        r.core.roster.mark_peers_complete_for_test(false);
         let (dirs, out) = install_holder(&mut r, &["d"], SubtreeKind::Sticky);
         assert!(restart_void_reqs(&out).is_empty(), "{out:?}");
         create_in(&mut r, dirs[0], 1);
@@ -68364,7 +68366,7 @@ mod step5_sticky_release {
     fn a_member_that_drops_out_of_a_later_scan_is_still_asked() {
         let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
         let (mut r, _) = restart_bare(&h, 2_000, true);
-        r.core.peers_complete = false;
+        r.core.roster.mark_peers_complete_for_test(false);
         let (dirs, out) = install_holder(&mut r, &["d"], SubtreeKind::Sticky);
         assert!(restart_void_reqs(&out).is_empty(), "{out:?}");
         create_in(&mut r, dirs[0], 1);
