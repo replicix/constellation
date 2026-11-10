@@ -577,6 +577,22 @@ pub trait Replica {
     /// that no grant of this node asks for (`Core::acquire_cas`: the grace
     /// of a released takeover). `false`: not persisted.
     fn note_lock_grant_horizon(&self, until: WaitMs, now: Now) -> bool;
+    /// [`Replica::note_grant_horizon`] for a read grant a delegate makes
+    /// (`Meta::note_deleg_grant_horizon`, its own key). `false`: not
+    /// persisted, and the grant must not be made.
+    fn note_deleg_grant_horizon(&self, until: WaitMs, now: Now) -> bool;
+    /// At start: what the previous process's delegates may still have
+    /// granted (`Meta::load_deleg_grant_quarantine`); `Unknown` for an
+    /// absent or unreadable key, which the caller treats as a full span.
+    fn load_deleg_grant_quarantine(
+        &self,
+        now: Now,
+        default_span_ms: i64,
+    ) -> constellation_meta::readdeleg::DelegHorizon;
+    /// Every earlier delegate grant has passed: record it
+    /// (`Meta::settle_deleg_grant_horizon`). A failure is logged and costs
+    /// only a full span at a later restart.
+    fn settle_deleg_grant_horizon(&self, now: Now);
     /// M16: the inodes whose read delegations an op not yet executed must
     /// recall (`Meta::recall_inos_of_op_now`: an unlink's or rename's
     /// victims included).
@@ -1663,6 +1679,30 @@ impl Replica for Meta {
                 tracing::warn!(%error, "persisting the read-grant horizon failed; not granting");
                 false
             }
+        }
+    }
+
+    fn note_deleg_grant_horizon(&self, until: WaitMs, now: Now) -> bool {
+        match Meta::note_deleg_grant_horizon(self, until, now) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "persisting the delegate read-grant horizon failed; not granting");
+                false
+            }
+        }
+    }
+
+    fn load_deleg_grant_quarantine(
+        &self,
+        now: Now,
+        default_span_ms: i64,
+    ) -> constellation_meta::readdeleg::DelegHorizon {
+        Meta::load_deleg_grant_quarantine(self, now, default_span_ms)
+    }
+
+    fn settle_deleg_grant_horizon(&self, now: Now) {
+        if let Err(error) = Meta::settle_deleg_grant_horizon(self, now) {
+            tracing::warn!(%error, "recording that the delegate read grants have passed failed");
         }
     }
 

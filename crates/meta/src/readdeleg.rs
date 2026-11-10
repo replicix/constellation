@@ -661,6 +661,33 @@ impl crate::store::Meta {
 /// before the grant is answered (see [`crate::store::Meta::note_grant_horizon`]).
 pub(crate) const KV_READ_GRANT_HORIZON: &str = "read_grant_horizon_ms";
 
+/// Local kv key: the latest `until` of any read grant a *delegate* of this
+/// node made, persisted before the grant is answered
+/// ([`crate::store::Meta::note_deleg_grant_horizon`]). Kept apart from
+/// [`KV_READ_GRANT_HORIZON`]: that key feeds the root's quarantine (every
+/// acknowledgement waits on it), this one only a restarted delegate's
+/// writes. Its value is a boot stamp, or [`DELEG_HORIZON_NONE`] once every
+/// earlier grant is known to have passed; an absent or unreadable key is
+/// not "nothing granted" ([`DelegHorizon::Unknown`]).
+pub(crate) const KV_DELEG_READ_GRANT_HORIZON: &str = "deleg_read_grant_horizon_ms";
+
+/// The value of [`KV_DELEG_READ_GRANT_HORIZON`] that says every grant made
+/// before it was written has passed.
+pub(crate) const DELEG_HORIZON_NONE: &str = "none";
+
+/// What [`crate::store::Meta::load_deleg_grant_quarantine`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegHorizon {
+    /// Nothing the previous process granted is live: the key says so, or
+    /// its stamp has passed.
+    None,
+    /// Grants may be live until this time on the wait clock.
+    Until(WaitMs),
+    /// The key is absent or could not be read: nothing is known, and the
+    /// caller must assume a full span.
+    Unknown,
+}
+
 /// Local kv key: the same for lock grants (plan 30 §M14), kept apart: a
 /// lock grant may be honoured for much longer than a read delegation, and
 /// only new lock grants wait for it, not acknowledgements.
@@ -689,10 +716,26 @@ pub fn fail_horizon_writes_on_this_thread_for_tests(n: u32) {
     horizon_fault::LEFT.with(|c| c.set(n));
 }
 
+/// Tests only (`test-util`): fail this thread's next `n` reads of a
+/// persisted horizon with an I/O error.
+#[cfg(any(test, feature = "test-util"))]
+pub fn fail_horizon_reads_on_this_thread_for_tests(n: u32) {
+    horizon_fault::READ_LEFT.with(|c| c.set(n));
+}
+
 #[cfg(any(test, feature = "test-util"))]
 mod horizon_fault {
     thread_local! {
         pub(super) static LEFT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        pub(super) static READ_LEFT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn take_read() -> bool {
+        READ_LEFT.with(|c| {
+            let n = c.get();
+            c.set(n.saturating_sub(1));
+            n > 0
+        })
     }
 
     pub(super) fn take() -> bool {
@@ -720,6 +763,20 @@ impl crate::store::Meta {
     /// ([`crate::store::horizon`]).
     pub fn note_grant_horizon(&self, until: WaitMs, now: Now) -> Result<(), crate::MetaError> {
         self.note_horizon(KV_READ_GRANT_HORIZON, until, now)
+            .map(|_| ())
+    }
+
+    /// [`Self::note_grant_horizon`] for a read grant a *delegate* of this
+    /// node makes, under its own key ([`KV_DELEG_READ_GRANT_HORIZON`]): a
+    /// restarted delegate has lost its table of grants and waits this
+    /// horizon out before it executes a write
+    /// ([`Self::load_deleg_grant_quarantine`]). Synced before it returns.
+    pub fn note_deleg_grant_horizon(
+        &self,
+        until: WaitMs,
+        now: Now,
+    ) -> Result<(), crate::MetaError> {
+        self.note_horizon(KV_DELEG_READ_GRANT_HORIZON, until, now)
             .map(|_| ())
     }
 
@@ -821,6 +878,7 @@ impl crate::store::Meta {
             KV_READ_GRANT_HORIZON => 0,
             KV_LOCK_GRANT_HORIZON => 1,
             KV_TAKEOVER_FLOOR => 2,
+            KV_DELEG_READ_GRANT_HORIZON => 3,
             _ => unreachable!("not a horizon key: {key}"),
         }]
     }
@@ -898,8 +956,34 @@ impl crate::store::Meta {
         Some(until)
     }
 
+    /// The stored value of a horizon key. A read error is the caller's to
+    /// treat as "unknown", never as "nothing granted".
+    fn read_horizon_value(&self, key: &str) -> Result<Option<String>, crate::MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        if horizon_fault::take_read() {
+            return Err(crate::MetaError::Io(std::io::Error::other(
+                "injected horizon read fault (testing only)",
+            )));
+        }
+        self.kv_get(key)
+    }
+
+    /// The horizon `key` holds, on this process's wait clock. `None`: no
+    /// value, or one that has passed. A value that cannot be read is the
+    /// fail-safe one: grants may be live for as long as any grant lives,
+    /// `default_span_ms` from now (the known slot is left alone, so that
+    /// the next grant writes a value of its own).
     fn load_horizon(&self, key: &'static str, now: Now, default_span_ms: i64) -> Option<WaitMs> {
-        let stored = self.kv_get(key).ok().flatten()?;
+        let stored = match self.read_horizon_value(key) {
+            Ok(v) => v?,
+            Err(error) => {
+                tracing::warn!(
+                    %error, key,
+                    "a persisted horizon could not be read; waiting its default span"
+                );
+                return Some(now.wait.plus(default_span_ms.max(0) as u64));
+            }
+        };
         let stamp = crate::store::horizon::parse_stamp(&stored, default_span_ms);
         let until = now.wait_of_stamp(&stamp);
         // A horizon that has passed is known (to a graceful shutdown) to
@@ -908,6 +992,79 @@ impl crate::store::Meta {
         let slot = known.entry(key).or_insert(WaitMs(0));
         *slot = (*slot).max(until.unwrap_or(now.wait));
         until
+    }
+
+    /// At start, for a delegate of this node: what the previous process's
+    /// delegates may still have granted. The key holds the sentinel
+    /// [`DELEG_HORIZON_NONE`] (every earlier grant had passed): `None`. A
+    /// stamp: `Until` it, or `None` once it has passed; a value that is not
+    /// a stamp waits `default_span_ms` (see [`Self::load_grant_quarantine`]).
+    /// A key that is **absent** (a rebuilt store, or one from before the key
+    /// existed) or that **cannot be read** is `Unknown`: the caller waits a
+    /// full span.
+    pub fn load_deleg_grant_quarantine(&self, now: Now, default_span_ms: i64) -> DelegHorizon {
+        let stored = match self.read_horizon_value(KV_DELEG_READ_GRANT_HORIZON) {
+            Ok(Some(v)) => v,
+            Ok(None) => return DelegHorizon::Unknown,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "the delegate read-grant horizon could not be read"
+                );
+                return DelegHorizon::Unknown;
+            }
+        };
+        let mut known = self.horizon_wait.lock().unwrap();
+        let slot = known
+            .entry(KV_DELEG_READ_GRANT_HORIZON)
+            .or_insert(WaitMs(0));
+        if stored.trim() == DELEG_HORIZON_NONE {
+            *slot = (*slot).max(now.wait);
+            return DelegHorizon::None;
+        }
+        let stamp = crate::store::horizon::parse_stamp(&stored, default_span_ms);
+        let until = now.wait_of_stamp(&stamp);
+        *slot = (*slot).max(until.unwrap_or(now.wait));
+        match until {
+            Some(t) => DelegHorizon::Until(t),
+            None => DelegHorizon::None,
+        }
+    }
+
+    /// Every delegate grant this node's earlier processes made has passed
+    /// (the caller waited out the quarantine [`Self::load_deleg_grant_quarantine`]
+    /// gave, or found none): write the sentinel [`DELEG_HORIZON_NONE`] so
+    /// that a crash before the next grant finds "nothing" rather than
+    /// `Unknown`. Under the key's writer lock, and only when nothing this
+    /// process wrote or loaded is still ahead of `now.wait`, so that it
+    /// never overwrites a later stamp. Synced. Returns whether it wrote
+    /// (not when the sentinel is already there).
+    pub fn settle_deleg_grant_horizon(&self, now: Now) -> Result<bool, crate::MetaError> {
+        let mut written = self
+            .horizon_writer(KV_DELEG_READ_GRANT_HORIZON)
+            .lock()
+            .unwrap();
+        if (*written).max(self.known_horizon(KV_DELEG_READ_GRANT_HORIZON)) > now.wait {
+            return Ok(false);
+        }
+        if self
+            .read_horizon_value(KV_DELEG_READ_GRANT_HORIZON)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v.trim() == DELEG_HORIZON_NONE)
+        {
+            return Ok(false);
+        }
+        self.kv_set(KV_DELEG_READ_GRANT_HORIZON, DELEG_HORIZON_NONE)?;
+        self.sync()?;
+        // What is stored now is the sentinel: nothing is ahead.
+        *written = WaitMs(0);
+        let mut known = self.horizon_wait.lock().unwrap();
+        let slot = known
+            .entry(KV_DELEG_READ_GRANT_HORIZON)
+            .or_insert(WaitMs(0));
+        *slot = (*slot).max(now.wait);
+        Ok(true)
     }
 
     /// At a graceful shutdown, after the core's final flush: a persisted
@@ -924,6 +1081,7 @@ impl crate::store::Meta {
             KV_READ_GRANT_HORIZON,
             KV_LOCK_GRANT_HORIZON,
             KV_TAKEOVER_FLOOR,
+            KV_DELEG_READ_GRANT_HORIZON,
         ] {
             let mut written = self.horizon_writer(key).lock().unwrap();
             let passed = self
@@ -933,7 +1091,12 @@ impl crate::store::Meta {
                 .get(key)
                 .is_some_and(|until| now.wait >= (*until).max(*written));
             if passed {
-                self.kv_del(key)?;
+                if key == KV_DELEG_READ_GRANT_HORIZON {
+                    // Not deleted: an absent key is `Unknown`, a full span.
+                    self.kv_set(key, DELEG_HORIZON_NONE)?;
+                } else {
+                    self.kv_del(key)?;
+                }
                 self.horizon_wait.lock().unwrap().remove(key);
                 *written = WaitMs(0);
                 cleared = true;
@@ -1425,6 +1588,158 @@ mod boot_stamped_horizon_tests {
         meta.set_takeover_floor_pending(8).unwrap();
         meta.clear_takeover_floor_pending().unwrap();
         assert_eq!(meta.takeover_floor_pending(), None);
+    }
+
+    /// Expectation: a delegate read-grant key that is absent is `Unknown`
+    /// (a store rebuilt under the same node id, or from before the key), not
+    /// "nothing granted".
+    #[test]
+    fn a_missing_delegate_horizon_is_unknown() {
+        let meta = Meta::open_in_memory().unwrap();
+        let now = at(7, 100_000, 5_000, WALL);
+        assert_eq!(
+            meta.load_deleg_grant_quarantine(now, READ_SPAN),
+            DelegHorizon::Unknown
+        );
+    }
+
+    /// Expectation: a key that cannot be read is `Unknown` too, even though
+    /// a stamp is stored.
+    #[test]
+    fn an_unreadable_one_is_unknown() {
+        let meta = Meta::open_in_memory().unwrap();
+        let now = at(7, 100_000, 5_000, WALL);
+        meta.note_deleg_grant_horizon(WaitMs(7_000), now).unwrap();
+        fail_horizon_reads_on_this_thread_for_tests(1);
+        assert_eq!(
+            meta.load_deleg_grant_quarantine(now, READ_SPAN),
+            DelegHorizon::Unknown
+        );
+        assert_eq!(
+            meta.load_deleg_grant_quarantine(now, READ_SPAN),
+            DelegHorizon::Until(WaitMs(8_000))
+        );
+    }
+
+    /// Expectation: the sentinel is "nothing", and a stamp that has passed
+    /// on the same boot is none; one with time left is `Until` it.
+    #[test]
+    fn the_none_sentinel_is_nothing() {
+        let meta = Meta::open_in_memory().unwrap();
+        meta.kv_set(KV_DELEG_READ_GRANT_HORIZON, DELEG_HORIZON_NONE)
+            .unwrap();
+        let now = at(7, 100_000, 5_000, WALL);
+        assert_eq!(
+            meta.load_deleg_grant_quarantine(now, READ_SPAN),
+            DelegHorizon::None
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let first = Meta::open(dir.path()).unwrap();
+        first.note_deleg_grant_horizon(WaitMs(10_500), now).unwrap();
+        drop(first);
+        let again = Meta::open(dir.path()).unwrap();
+        // Written for wait 11 500; 2 s later it has 4 s left.
+        assert_eq!(
+            again.load_deleg_grant_quarantine(at(7, 102_000, 7_000, WALL), READ_SPAN),
+            DelegHorizon::Until(WaitMs(11_500))
+        );
+        assert_eq!(
+            again.load_deleg_grant_quarantine(at(7, 120_000, 25_000, WALL), READ_SPAN),
+            DelegHorizon::None
+        );
+    }
+
+    /// Expectation: a value that is not a stamp waits the default span.
+    #[test]
+    fn a_corrupt_value_waits_the_default_span() {
+        let meta = Meta::open_in_memory().unwrap();
+        meta.kv_set(KV_DELEG_READ_GRANT_HORIZON, "garbage").unwrap();
+        let now = at(7, 100_000, 5_000, WALL);
+        assert_eq!(
+            meta.load_deleg_grant_quarantine(now, READ_SPAN),
+            DelegHorizon::Until(WaitMs(5_000 + READ_SPAN))
+        );
+    }
+
+    /// Expectation: a graceful shutdown writes the sentinel (it does not
+    /// delete the key: an absent key is a full span) once what was written
+    /// has passed, and leaves a live stamp alone.
+    #[test]
+    fn a_graceful_shutdown_writes_the_sentinel_only_once_passed() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = Meta::open(dir.path()).unwrap();
+        meta.note_deleg_grant_horizon(WaitMs(25_500), at(7, 100_000, 5_000, WALL))
+            .unwrap();
+        meta.clear_passed_horizons(at(7, 115_000, 20_000, WALL))
+            .unwrap();
+        assert_ne!(
+            meta.kv_get(KV_DELEG_READ_GRANT_HORIZON).unwrap().as_deref(),
+            Some(DELEG_HORIZON_NONE)
+        );
+        meta.clear_passed_horizons(at(7, 122_000, 27_000, WALL))
+            .unwrap();
+        assert_eq!(
+            meta.kv_get(KV_DELEG_READ_GRANT_HORIZON).unwrap().as_deref(),
+            Some(DELEG_HORIZON_NONE)
+        );
+    }
+
+    /// Expectation: settling writes the sentinel once nothing is ahead, and
+    /// never over a stamp that is still ahead (this process's own, or one
+    /// it loaded).
+    #[test]
+    fn settle_never_overwrites_a_later_stamp() {
+        let meta = Meta::open_in_memory().unwrap();
+        let now = at(7, 100_000, 5_000, WALL);
+        assert_eq!(
+            meta.load_deleg_grant_quarantine(now, READ_SPAN),
+            DelegHorizon::Unknown
+        );
+        meta.note_deleg_grant_horizon(WaitMs(25_500), now).unwrap();
+        assert!(!meta
+            .settle_deleg_grant_horizon(at(7, 110_000, 10_000, WALL))
+            .unwrap());
+        assert_ne!(
+            meta.kv_get(KV_DELEG_READ_GRANT_HORIZON).unwrap().as_deref(),
+            Some(DELEG_HORIZON_NONE)
+        );
+        assert!(meta
+            .settle_deleg_grant_horizon(at(7, 130_000, 30_000, WALL))
+            .unwrap());
+        assert_eq!(
+            meta.kv_get(KV_DELEG_READ_GRANT_HORIZON).unwrap().as_deref(),
+            Some(DELEG_HORIZON_NONE)
+        );
+        // Already the sentinel: nothing to write.
+        assert!(!meta
+            .settle_deleg_grant_horizon(at(7, 131_000, 31_000, WALL))
+            .unwrap());
+        // A loaded stamp ahead is not overwritten either.
+        let dir = tempfile::tempdir().unwrap();
+        let first = Meta::open(dir.path()).unwrap();
+        first.note_deleg_grant_horizon(WaitMs(25_500), now).unwrap();
+        drop(first);
+        let again = Meta::open(dir.path()).unwrap();
+        let t = at(7, 110_000, 10_000, WALL);
+        assert!(matches!(
+            again.load_deleg_grant_quarantine(t, READ_SPAN),
+            DelegHorizon::Until(_)
+        ));
+        assert!(!again.settle_deleg_grant_horizon(t).unwrap());
+    }
+
+    /// Expectation (fail-before: a read error was "nothing granted"): an
+    /// unreadable root read-grant horizon is a full default span, never none.
+    #[test]
+    fn an_unreadable_root_horizon_waits_the_default_span() {
+        let meta = Meta::open_in_memory().unwrap();
+        let now = at(7, 100_000, 5_000, WALL);
+        meta.note_grant_horizon(WaitMs(6_000), now).unwrap();
+        fail_horizon_reads_on_this_thread_for_tests(1);
+        assert_eq!(
+            meta.load_grant_quarantine(now, READ_SPAN),
+            Some(WaitMs(5_000 + READ_SPAN))
+        );
     }
 
     /// Plan 43 C7a (commit 4). Expectation: a graceful shutdown clears a
