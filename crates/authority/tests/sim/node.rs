@@ -434,6 +434,8 @@ pub struct NodeEnv {
     pub beats_lost_in_lag: bool,
     /// See `SimConfig::deleg_lane`.
     pub deleg_lane: bool,
+    /// See `SimConfig::roster_refresh_ms`.
+    pub roster_refresh_ms: u64,
     /// See `SimConfig::deleg_root_lane`.
     pub deleg_root_lane: bool,
     /// See `SimConfig::deleg_root_probe` / `root_probe_mutant`.
@@ -832,6 +834,7 @@ impl NodeHandle {
             },
             store: env.bucket.handle(id),
             bucket: env.bucket.clone(),
+            roster_refresh_ms: env.roster_refresh_ms,
             world: env.world.clone(),
             bus: env.bus.clone(),
             step_now: clock.now(),
@@ -1115,6 +1118,7 @@ struct Driver {
     core: Core,
     store: Arc<dyn object_store::ObjectStore>,
     bucket: Arc<Bucket>,
+    roster_refresh_ms: u64,
     world: Arc<ChunkWorld>,
     bus: Arc<Bus>,
     clock: Clock,
@@ -1982,26 +1986,38 @@ impl Driver {
             let (tx, bus, id) = (self.tx.clone(), self.bus.clone(), self.id);
             let oracles = self.oracles.clone();
             let p2p = self.core.config().p2p;
+            let (roster_refresh_ms, bucket) = (self.roster_refresh_ms, self.bucket.clone());
             let clock = self.clock.clone();
             let shared = self.shared.clone();
             tokio::spawn(async move {
+                let mut roster_read: Option<constellation_authority::WaitMs> = None;
                 // Plan 30 §M9: since when each link has been up without a
                 // break (the directory's `since`).
                 let mut up_since: HashMap<NodeId, constellation_authority::WaitMs> = HashMap::new();
                 loop {
                     let nodes = bus.nodes();
-                    if tx
-                        .send(Event::Roster {
-                            seq: shared.roster_seq.fetch_add(1, Ordering::SeqCst) + 1,
-                            write_eligible: nodes.clone(),
-                            read_only: Vec::new(),
-                            complete: true,
-                            lapses: shared.lapses_handed.load(Ordering::SeqCst),
-                            issued: clock.now().wait,
-                        })
-                        .is_err()
+                    let at = clock.now().wait;
+                    let due = roster_refresh_ms == 0
+                        || roster_read.is_none_or(|r| at.since(r) >= roster_refresh_ms as i64);
+                    // The refresh reads S3: it fails while this node is cut
+                    // (the first read, before the claim, is a mount's).
+                    if due
+                        && (roster_refresh_ms == 0 || roster_read.is_none() || !bucket.is_cut(id))
                     {
-                        return;
+                        roster_read = Some(at);
+                        if tx
+                            .send(Event::Roster {
+                                seq: shared.roster_seq.fetch_add(1, Ordering::SeqCst) + 1,
+                                write_eligible: nodes.clone(),
+                                read_only: Vec::new(),
+                                complete: true,
+                                lapses: shared.lapses_handed.load(Ordering::SeqCst),
+                                issued: at,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                     // Before the snapshot, never after: a lapse handed while
                     // it is taken is then not counted as seen by it.

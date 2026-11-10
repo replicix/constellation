@@ -329,6 +329,7 @@ fn replay_seed() {
         Ok("acks3-crash") => ack_s3_crash_config(),
         Ok("backup-departs") => backup_departs_config(),
         Ok("singleton-first-peer") => singleton_first_peer_config(),
+        Ok("singleton-stale-roster") => singleton_stale_roster_config(),
         Ok("backup-group-cut-ttl") => backup_group_cut_ttl_config(GroupCut::Both),
         Ok("backup-group-cut-ttl-holder-only") => backup_group_cut_ttl_config(GroupCut::HolderOnly),
         Ok("backup-group-cut-ttl-backup-only") => backup_group_cut_ttl_config(GroupCut::BackupOnly),
@@ -2720,6 +2721,37 @@ fn singleton_first_peer_config() -> SimConfig {
     }
 }
 
+/// `epoch-holder-retired`'s hole: one node, a singleton answering on its own
+/// disk; its S3 is cut, and a fresh peer joins during the cut. The daemon's
+/// roster refresh reads S3 (every 5 s), so it falls with the cut and the
+/// peer never enters the holder's roster; the holder's directory shows it
+/// linked. The holder must not answer alone from the moment the link is up
+/// (I1 at the answer, the directory's view), roster or not.
+fn singleton_stale_roster_config() -> SimConfig {
+    SimConfig {
+        nodes: 1,
+        ops_per_client: 40,
+        random_faults: 0,
+        roster_refresh_ms: 5_000,
+        // The singleton answers its own node's clients from its disk
+        // (`Lone`); the rollback a failover then makes of them is not what
+        // this checks.
+        strict_durability: false,
+        strict_commit: true,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_000,
+                kind: FaultKind::CutS3Holder { for_ms: 6_000 },
+            },
+            ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::JoinFresh,
+            },
+        ],
+        ..backup_config()
+    }
+}
+
 fn backup_departs_config() -> SimConfig {
     SimConfig {
         ops_per_client: 8,
@@ -4414,6 +4446,18 @@ fn singleton_first_peer_bumps_the_configuration() {
     assert!(
         t.reconfig_cas >= 50,
         "the first peer rarely caused a lease change: {t:?}"
+    );
+}
+
+/// A peer that joins while the holder's roster refresh is down (its S3 cut)
+/// is linked and not on the roster: the holder still answers nothing on its
+/// disk alone (I1 at the answer, judged from the directory).
+#[test]
+fn a_peer_the_stale_roster_lacks_gates_the_lone_answer() {
+    run_m9(
+        "singleton-stale-roster",
+        singleton_stale_roster_config(),
+        1300..1400,
     );
 }
 
@@ -6589,6 +6633,7 @@ fn base_config(label: &str) -> SimConfig {
         "sticky-root-designee-inbox-skew" => sticky_root_designee_inbox_skew_config(),
         "backup-departs" => backup_departs_config(),
         "singleton-first-peer" => singleton_first_peer_config(),
+        "singleton-stale-roster" => singleton_stale_roster_config(),
         "backup-group-cut-ttl" => backup_group_cut_ttl_config(GroupCut::Both),
         "backup-group-cut-ttl-holder-only" => backup_group_cut_ttl_config(GroupCut::HolderOnly),
         "backup-group-cut-ttl-backup-only" => backup_group_cut_ttl_config(GroupCut::BackupOnly),

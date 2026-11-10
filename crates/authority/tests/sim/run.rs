@@ -789,6 +789,13 @@ pub struct SimConfig {
     /// `deleg_lane_loop`). `false` is the code before it, the non-vacuity
     /// knob of the core-stall configurations.
     pub deleg_lane: bool,
+    /// The daemon's roster refresh period (5 s there), and it fails while
+    /// the node's S3 is cut. 0 (the default): the roster is re-read with
+    /// every directory snapshot, so it never lags the links. Otherwise it
+    /// is read at start and then only every `roster_refresh_ms` while S3
+    /// is reachable: a node that joins in between is linked and not on the
+    /// holder's roster (`epoch-holder-retired`).
+    pub roster_refresh_ms: u64,
     /// Plan 41 R2: the root's P2P service answers a delegation renewal off
     /// its stuck core (`deleg_lane::answer_root`, in the bus tap of
     /// `node.rs`). `false` is the code before it, the non-vacuity knob of
@@ -1218,6 +1225,7 @@ impl Default for SimConfig {
             beats_lost_in_lag: false,
             keeps_backups: false,
             deleg_lane: true,
+            roster_refresh_ms: 0,
             deleg_root_lane: true,
             deleg_root_probe: true,
             root_probe_mutant: ProbeMutant::None,
@@ -4877,6 +4885,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         beats_credited: cfg.beats_credited,
         beats_lost_in_lag: cfg.beats_lost_in_lag,
         deleg_lane: cfg.deleg_lane,
+        roster_refresh_ms: cfg.roster_refresh_ms,
         deleg_root_lane: cfg.deleg_root_lane,
         deleg_root_probe: cfg.deleg_root_probe,
         root_probe_mutant: cfg.root_probe_mutant,
