@@ -9,7 +9,9 @@
 //! grants, the abandon and ADR-43's no-tail orphan rule; chunk 8: the
 //! singleton, `first_peer_join` (the roster's journaled bump) and the
 //! root's own sticky grants; chunk 9: settlement (I4), S4 and no server
-//! queue (I2(b)). The design's
+//! queue (I2(b)); chunk 12: the root's roster object and stale views
+//! (ADR-50: old and incomplete reads, a joiner's first message by the inbox
+//! or to a node that is not the root, a live foreign generation). The design's
 //! topologies are explored exhaustively under a state cap and a timeout,
 //! with every `always` property the model registers checked and every
 //! `sometimes` witness required (non-vacuity); each planted bug (a knob)
@@ -27,8 +29,8 @@
 //! `crates/authority/tests/sim.rs`).
 
 use constellation_model::delegation::{key, Key, WriteOp};
-use constellation_model::node_stream::ROOT;
 use constellation_model::node_stream::{GrantKind, NodeGrant, NodeStreamModel};
+use constellation_model::node_stream::{CACHE_INBOX, ROOT};
 use stateright::{Checker, Expectation, HasDiscoveries, Model};
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -250,6 +252,49 @@ fn assert_finds_within(
 /// Stateright's path is valid but not always the shortest one. A knob whose
 /// label is missing here fails, so no knob goes unrecorded.
 const TRACES: &[(&str, &str, usize)] = &[
+    ("c12-t1+roster_installs_old_read", "roster_view_monotone", 7),
+    (
+        "c12-t1+roster_installs_old_read+i5",
+        "rollback_only_singleton_or_operator",
+        7,
+    ),
+    ("c12-t1+roster_partial_shrinks", "roster_view_monotone", 7),
+    (
+        "c12-t1+roster_partial_shrinks+i5",
+        "rollback_only_singleton_or_operator",
+        7,
+    ),
+    ("c12-t2+roster_partial_shrinks", "roster_view_monotone", 6),
+    (
+        "c12-t2+roster_partial_shrinks+i5",
+        "rollback_only_singleton_or_operator",
+        5,
+    ),
+    (
+        "c12-t2+singleton_while_partial",
+        "no_lone_answer_with_peer",
+        7,
+    ),
+    (
+        "c12-t1+evidence_only_on_forward",
+        "rollback_only_singleton_or_operator",
+        7,
+    ),
+    (
+        "c12-t1+evidence_only_on_forward+lone",
+        "no_lone_answer_with_peer",
+        8,
+    ),
+    (
+        "c12-t3+singleton_with_foreign_grant",
+        "no_singleton_with_live_foreign_grant",
+        6,
+    ),
+    (
+        "c12-t3+singleton_with_foreign_grant+i1",
+        "ack_implies_committed_by_config",
+        9,
+    ),
     ("f1-stale+unfenced_forward", "refused_never_completes", 8),
     (
         "f1-stale+root_ignores_touched",
@@ -1871,4 +1916,206 @@ fn f1_knob_root_ignores_touched_is_found() {
         "refused_never_completes",
         CAP_FAULTS,
     );
+}
+
+// ======== chunk 12 (plan 46 M1.3 step 10, ADR-50): the roster object and stale
+// views. The root's roster reads can arrive out of order or incomplete, and a
+// joining node's first message can land elsewhere or by the inbox. The oracle
+// judges the root's singleton test against what the root was actually told
+// (an installed complete read, a message from a node, an incomplete read), not
+// against its own view.
+
+/// C12-T1: node 0 is a singleton and answers `/a`, `/b` from its disk; node 1
+/// joins; its cache of the lease holder is empty, so its first send of each op
+/// goes by the root's inbox. Old and incomplete reads reach the root. Node 1
+/// unlinks `/a` and may claim the lease from the archive (the singleton's
+/// death-then-join, Q6: its unshipped answered rows are exported).
+fn c12_t1() -> NodeStreamModel {
+    let mut m = c8_t1();
+    m.old_reads = true;
+    m.partial_reads = true;
+    m.told_messages = true;
+    m.stale_root_cache = 1 << 1;
+    m.cache_holder = CACHE_INBOX;
+    m
+}
+
+/// C12-T2: nodes 0 and 1 are in the roster, node 1 may leave and node 2 may
+/// join; node 2's cache names node 1, so its first send of each op bounces
+/// there (nothing runs). Old and incomplete reads; one root claim.
+fn c12_t2() -> NodeStreamModel {
+    let mut m =
+        NodeStreamModel::design(vec![vec![create(RA), create(RB)], vec![], vec![unlink(RA)]])
+            .with_roster(0b011, 1 << 2, 1 << 1)
+            .with_faults(0, 1);
+    m.old_reads = true;
+    m.partial_reads = true;
+    m.told_messages = true;
+    m.stale_root_cache = 1 << 2;
+    m.cache_holder = 1;
+    m
+}
+
+/// C12-T3: node 1 holds `/D1` (placed, its group `{holder, root}`) and may leave the roster (with
+/// `leave_keeps_grants` on in the knob's runs, so that it leaves with its
+/// generation live); node 2 may join (the runs with a claim add one
+/// deposition). The root writes `/D1/b` (forwarded to the holder) and node 2
+/// `/b`. (A claim after a leave is not in the clean run: a deposition drops an
+/// unshipped end of the leaver's grant from the journal, which leaves the
+/// grant live and the node off the roster: the open step 14 question.)
+fn c12_t3() -> NodeStreamModel {
+    let mut m =
+        NodeStreamModel::design(vec![vec![create(D1B)], vec![create(D1A)], vec![create(RB)]])
+            .with_grant(placed(1, D1, 0))
+            .with_roster(0b011, 1 << 2, 1 << 1)
+            .with_stream_release(1);
+    m.told_messages = true;
+    m
+}
+
+#[test]
+fn c12_design_t1_stale_reads_and_inbox_first_message() {
+    assert_clean_within("c12-t1", &c12_t1(), CAP_FAULTS);
+}
+
+#[test]
+fn c12_design_t2_stale_cache_names_a_node() {
+    assert_clean_within("c12-t2", &c12_t2(), CAP_FAULTS);
+}
+
+#[test]
+fn c12_design_t3_grant_holder_leaves() {
+    assert_clean_within("c12-t3", &c12_t3(), CAP_FAULTS);
+}
+
+/// An older read replaces the installed one: the root forgets the joiner it
+/// had read and answers alone again. `roster_view_monotone` finds the view;
+/// with that and the lone oracle off, the harm: the joiner claims from the
+/// archive and a row answered alone is lost (I5).
+#[test]
+fn c12_knob_roster_installs_old_read_is_found() {
+    let mut m = c12_t1();
+    m.roster_installs_old_read = true;
+    assert_finds_within(
+        "c12-t1+roster_installs_old_read",
+        &m,
+        "roster_view_monotone",
+        CAP_FAULTS,
+    );
+    m.check_lone = false;
+    assert_finds_within(
+        "c12-t1+roster_installs_old_read+i5",
+        &m,
+        "rollback_only_singleton_or_operator",
+        CAP_FAULTS,
+    );
+}
+
+/// A partial read replaces the view and counts as complete (the core's
+/// roster before step 10: a scan that lost one record emptied it).
+#[test]
+fn c12_knob_roster_partial_shrinks_is_found() {
+    for (label, m) in [
+        ("c12-t1+roster_partial_shrinks", c12_t1()),
+        ("c12-t2+roster_partial_shrinks", c12_t2()),
+    ] {
+        let mut m = m;
+        m.roster_partial_shrinks = true;
+        assert_finds_within(label, &m, "roster_view_monotone", CAP_FAULTS);
+        m.check_lone = false;
+        assert_finds_within(
+            &format!("{label}+i5"),
+            &m,
+            "rollback_only_singleton_or_operator",
+            CAP_FAULTS,
+        );
+    }
+}
+
+/// The singleton test ignores that the latest read was incomplete: the root
+/// that had read a roster of one stays a singleton after a read that may
+/// have lost the joiner, and answers alone.
+#[test]
+fn c12_knob_singleton_while_partial_is_found() {
+    let mut m = c12_t2();
+    m.singleton_while_partial = true;
+    assert_finds_within(
+        "c12-t2+singleton_while_partial",
+        &m,
+        "no_lone_answer_with_peer",
+        CAP_FAULTS,
+    );
+}
+
+/// Only a first direct forward is evidence of a peer: the joiner's first
+/// op arrives by the inbox, the root (whose roster read has not listed the
+/// joiner yet) answers it alone, and the joiner's claim loses it (I5: a
+/// singleton's rollback is of its own clients' rows).
+#[test]
+fn c12_knob_evidence_only_on_forward_is_found() {
+    let mut m = c12_t1();
+    m.evidence_only_on_forward = true;
+    m.check_lone = false;
+    assert_finds_within(
+        "c12-t1+evidence_only_on_forward",
+        &m,
+        "rollback_only_singleton_or_operator",
+        CAP_FAULTS,
+    );
+    m.check_lone = true;
+    assert_finds_within(
+        "c12-t1+evidence_only_on_forward+lone",
+        &m,
+        "no_lone_answer_with_peer",
+        CAP_FAULTS,
+    );
+}
+
+/// The singleton test ignores a live generation another node holds (the
+/// node left the roster with its grant live): the root is a singleton with
+/// a delegate.
+#[test]
+fn c12_knob_singleton_with_foreign_grant_is_found() {
+    let mut m = c12_t3().with_faults(0, 1);
+    m.leave_keeps_grants = true;
+    m.singleton_with_foreign_grant = true;
+    assert_finds_within(
+        "c12-t3+singleton_with_foreign_grant",
+        &m,
+        "no_singleton_with_live_foreign_grant",
+        CAP_FAULTS,
+    );
+    m.check_foreign_grant = false;
+    assert_finds_within(
+        "c12-t3+singleton_with_foreign_grant+i1",
+        &m,
+        "ack_implies_committed_by_config",
+        CAP_FAULTS,
+    );
+}
+
+/// With the grant clause in the test (the product), a node that left with
+/// its grant live never makes the root a singleton.
+#[test]
+fn c12_a_live_foreign_grant_keeps_the_root_a_non_singleton() {
+    let mut m = c12_t3().with_faults(0, 1);
+    m.scripts[2].clear();
+    m.leave_keeps_grants = true;
+    let started = Instant::now();
+    let checker = run(
+        "c12-t3+leave_keeps_grants",
+        &m,
+        CAP_FAULTS,
+        HasDiscoveries::AnyOf(BTreeSet::from(["no_singleton_with_live_foreign_grant"])),
+    );
+    assert!(
+        checker.is_done()
+            && checker.state_count() < CAP_FAULTS.0 * GENERATED
+            && checker.unique_state_count() < CAP_FAULTS.0
+            && started.elapsed() < CAP_FAULTS.1,
+        "expected exhaustive exploration within budget"
+    );
+    assert!(checker
+        .discovery("no_singleton_with_live_foreign_grant")
+        .is_none());
 }

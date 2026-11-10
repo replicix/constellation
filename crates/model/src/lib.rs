@@ -151,7 +151,15 @@
 //! sticky holder's claim of the lease journals its release first) and
 //! `abandon_skips_read_recall` ("recall, else expire": the operator's
 //! abandon waits for the stream's read delegations to be recalled or to
-//! expire, as a cut does), and the combined topologies X1 to X4
+//! expire, as a cut does); chunk 12 (plan 46 M1.3 step 10, ADR-50) the
+//! root's roster object and stale views: reads that arrive out of order or
+//! incomplete, a joining node's first message that lands on a node that is
+//! not the root or by the inbox, and a live generation of another node
+//! (`roster_view_monotone`, `no_singleton_with_live_foreign_grant`, and
+//! `no_lone_answer_with_peer` judged against what the root was told; knobs
+//! `roster_installs_old_read`, `roster_partial_shrinks`,
+//! `singleton_while_partial`, `evidence_only_on_forward`,
+//! `singleton_with_foreign_grant`); and the combined topologies X1 to X4
 //! (`tests/node_stream.rs`: every property of the model switched on at
 //! once, on two or three ops per node). Every knob's counterexample is
 //! checked in as its path length (`TRACES` in that file; regenerate with
@@ -317,6 +325,7 @@
 //! | `Learn`, `Durable` | `delegate.rs::deleg_learn_root` (the delegate's install of the root's journal), the archive's durable apply |
 //! | `Abandon` | `delegate.rs::on_control_abandon_streams` (`repair abandon --gen`/`--node`: a non-stealable stream is ended at the root's cursor after its read delegations are recalled, `DelegReadVoid`, else waited out); `seal_tail.rs::on_control_abandon` for the group-wide `--epoch` ancestor (M1.3 step 13) |
 //! | `ExpireRead` | the read grant's expiry in `meta/src/readdeleg.rs` (the root's clock; independent of the holder): the abandon's wait, `delegate.rs::abandon_progress` (`read_delegation_ttl_ms + expiry_margin_ms`) (M1.3 step 13). **Gap:** the claim's wait for it (step 12) |
+//! | `SeeOldRoster`, `SeePartialRoster` | chunk 12: a registry read older than the installed one, and a read of a scan that lost a record. Product: `core/roster.rs` (`Roster::install_read`: an older read is ignored, an incomplete one only adds, ADR-50) and the driver's stamped reads (`RosterRead`, `engine/src/authority_driver.rs`, `engine/src/node.rs`). **Gap (step 10, C4):** the singleton test still reads the budget-based lone test (`backup.rs::lone_by_event`), not the roster object: the model's `quiet` (no write-eligible peer in the view, the latest read complete, no live foreign generation, every message from a node counted) is what C4 builds |
 //! | `Join`, `Leave`, `SeeRoster` | the roster and the lease's singleton test (`lease.rs`, `backup.rs::backup_candidacies`; no `first_peer_join` identifier exists in the product: the peer-join logic is spread over these). The singleton transition as a journaled `config_version` bump is closed (M1.1 step 5). `Leave` ends the node's grants first (M1.2 step 11): `delegate.rs::on_control_release_grants` (the holder releases its streams and waits for the root to hold the release row, then flushes and retires: `engine/src/authority_driver.rs`, `SyncRequest::Leave`) and `on_control_end_grants_of` (the admin form: the root recalls and ends a dead node's streams at the TTL before `leave_node`; `engine/src/control/service.rs::leave`). The admin form runs on the root: another node refuses a node the table lists a stream for |
 //! | `Deadline` | `holder.rs::settle_refusal`/`gate_settle` (the `Refused{rid, ABANDONED}` before an `EIO`) |
 //! | `GrantRead`, `RecallRead` | `meta/src/readdeleg.rs` (`grant`, `recall`, `recall_inos`), `delegate.rs::deleg_read_recall_pending`; the model's bit is one stream's read delegation. **Gap:** S4's recall before the cut (M1.3) |
