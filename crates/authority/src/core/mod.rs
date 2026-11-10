@@ -171,6 +171,13 @@ pub struct Config {
     /// then fail `sticky-stale-route`.
     pub fence_accepts_unrouted: bool,
     /// Fault injection for the simulation's negative control (never set by
+    /// the engine): the root and its inbox drain refuse an op under an
+    /// unreachable non-stealable grant for good whatever the op's
+    /// `touched_gen` (main before ADR-47's root rule). The sim's
+    /// `nonholder_refused_a_designee_ran` / `refused_and_completed` must
+    /// then fail `sticky-ttl`.
+    pub root_ignores_touched: bool,
+    /// Fault injection for the simulation's negative control (never set by
     /// the engine): the operator's abandon of a non-stealable stream ends it
     /// at once, without recalling or waiting out the read delegations its
     /// holder granted (plan 46 M1.3 step 13, C11, the model's
@@ -594,6 +601,7 @@ impl Config {
             refuse_forwarded_designation_ops: false,
             partial_release_ends_stream: false,
             fence_accepts_unrouted: false,
+            root_ignores_touched: false,
             abandon_skips_read_recall: false,
             ttl_ms,
             expiry_margin_ms: 1_000,
@@ -1177,6 +1185,13 @@ pub struct Stats {
     /// generation, and ops routed afresh past the resend limit.
     pub fenced_resends: u64,
     pub fence_bounce_limit: u64,
+    /// ADR-47: the root's answers `HolderUnreachable` (row 9), the inbox
+    /// drain's halts of a touched op under a non-stealable grant, and a
+    /// forward of a rid with an outcome answered from it instead of
+    /// redirected (row 4).
+    pub root_touched_holds: u64,
+    pub inbox_touched_halts: u64,
+    pub redirect_answered_from_outcome: u64,
     /// ADR-47: submissions whose send history is unknown (a replay, a
     /// fast-path in-doubt resubmission, an evicted or older-incarnation rid).
     pub touched_unknown_submits: u64,
@@ -1971,6 +1986,8 @@ pub(crate) enum S3For {
     InboxRecheck,
     /// M13: a GC or drain delete (result only logged).
     InboxGc(InboxKey),
+    /// ADR-47: the holder re-reading the takeover drain's leftovers.
+    InboxLeftover,
     /// M13: a requester deleting its own durable batch before forwarding
     /// the op over P2P instead.
     InboxWithdraw(Rid),
@@ -2216,6 +2233,13 @@ pub struct Core {
     /// ADR-47: the `touched_gen` of the rids in `in_doubt_rids` (non-zero
     /// values only); a resubmission starts from it.
     in_doubt_touched: std::collections::BTreeMap<Rid, u64>,
+    /// ADR-47: when this root redirected a rid to a non-stealable
+    /// designee (`NotHolder` with its generation). An inbox drain read
+    /// issued before that moment may still carry the rid with the
+    /// `touched_gen` it had at enqueue; the drain halts it instead of
+    /// refusing (`Core::inbox_halts_touched`). Pruned to the reads in
+    /// flight (`Core::note_redirected`).
+    pub(crate) redirected_at: std::collections::BTreeMap<Rid, WaitMs>,
     /// ADR-47: the highest own rid evicted from `in_doubt_rids`; an own rid
     /// at or below it is submitted with an unknown send history.
     in_doubt_evicted_max: Option<Rid>,
@@ -2432,6 +2456,7 @@ impl Core {
             nonstealable_executions: Vec::new(),
             in_doubt_designee_rids: std::collections::BTreeSet::new(),
             in_doubt_touched: std::collections::BTreeMap::new(),
+            redirected_at: std::collections::BTreeMap::new(),
             in_doubt_evicted_max: None,
             in_doubt_batches: std::collections::BTreeMap::new(),
             shipped_touches: std::collections::VecDeque::new(),
@@ -3477,6 +3502,7 @@ impl Core {
             S3For::InboxPoll(node) => self.on_inbox_polled(now, node, result, replica, out),
             S3For::InboxRecheck => self.on_inbox_recheck(now, result, replica, out),
             S3For::InboxGc(key) => self.on_inbox_gc(now, key, result),
+            S3For::InboxLeftover => self.on_inbox_leftover_read(now, op, result, replica, out),
             S3For::InboxWithdraw(rid) => self.on_inbox_withdrawn(now, rid, result, replica, out),
             S3For::ReadHolder(op) => self.on_read_holder_learned(now, op, result, replica, out),
             S3For::LockHolder(op) => self.on_lock_holder_learned(now, op, result, replica, out),

@@ -60,6 +60,46 @@ pub(crate) fn keys_of_op_in(op: &MutateOp, replica: &dyn Replica) -> TouchSet {
 }
 
 impl Core {
+    /// Whether `rid` has an outcome here: executed or refused already, by
+    /// any path (this tenure's `recent`, the journal or the log).
+    pub(crate) fn rid_has_outcome(&self, rid: Rid, replica: &dyn Replica) -> bool {
+        replica.recent_outcome(rid).is_some()
+            || replica.completed_outcome(rid).ok().flatten().is_some()
+    }
+
+    /// ADR-47 (the root's rule, rows 8-10): whether the root holds a rid
+    /// whose keys it must refuse (`code`, a non-stealable grant it does not
+    /// reach) instead of refusing it for good: it touched a generation by
+    /// its requester's send history (or the history is unknown) and `EROFS`
+    /// would then contradict a holder that may have run it. `EXDEV` is
+    /// final whatever the history (§4.3).
+    pub(crate) fn root_holds_touched(&self, code: Code, touched_gen: u64) -> bool {
+        code == Code::ReadOnly && touched_gen != 0 && !self.cfg.root_ignores_touched
+    }
+
+    /// The generation of `keys` a refusal names (informational: the
+    /// non-stealable one of a single grant, the first of a cross set).
+    fn refused_gen(&self, keys: &TouchSet, replica: &dyn Replica) -> u64 {
+        match replica.resolve_ownership(keys) {
+            Ownership::Delegated(d) => d.gen,
+            Ownership::CrossSubtree { involved, .. } => {
+                involved.first().map(|d| d.gen).unwrap_or(0)
+            }
+            Ownership::Root => 0,
+        }
+    }
+
+    /// Row 5: this root sends `rid` to a non-stealable designee. An inbox
+    /// drain read issued before now may carry the rid still (see
+    /// `Core::redirected_at`). Entries older than every read in flight can
+    /// no longer matter and are dropped.
+    pub(crate) fn note_redirected(&mut self, rid: Rid, now: Now) {
+        self.redirected_at.insert(rid, now.wait);
+        self.prune_redirected();
+    }
+}
+
+impl Core {
     /// `dispatch_mutate`: execute a peer's forwarded op if this node holds
     /// the lease and its view is not fenced; answer `Busy` inside a
     /// release/handoff/gate window, `NotHolder` otherwise.
@@ -371,6 +411,7 @@ impl Core {
             self.deleg_root_sync_due(now, replica, out);
             if self.cfg.delegation && self.deleg_known() {
                 let keys = keys_of_op_in(&op, replica);
+                let mut answered_from_outcome = false;
                 if let Ownership::Delegated(d) = replica.resolve_ownership(&keys) {
                     // Plan 46 M0.3 (S3): not a generation this root is
                     // recalling (its delegate is stopped and would send the
@@ -400,12 +441,27 @@ impl Core {
                     // requester may still have parked at the delegate. A
                     // non-stealable grant is never skipped: `deleg_recall_plan`
                     // refuses it (`EROFS`) while `online` recalls it.
-                    if d.node != self.cfg.node_id
+                    let redirects = d.node != self.cfg.node_id
                         && live.is_some_and(|g| {
                             g.recall == RecallPhase::None || !settle || non_stealable
                         })
-                        && !disowned
-                    {
+                        && !disowned;
+                    // ADR-47 (row 4): a rid that has its outcome here is
+                    // answered from it, not redirected: the requester's
+                    // table lags a grant the root's journal already knows,
+                    // and the redirect would send a rid the root (or its
+                    // drain) refused to the designee to run. Only for a
+                    // non-stealable grant: that is where the root or its
+                    // drain refuses; a stealable one is recalled, never
+                    // refused, and its redirect (answered at once by the
+                    // delegate's own dedup) costs less than the root's
+                    // answer, which waits for its commit.
+                    answered_from_outcome =
+                        redirects && non_stealable && self.rid_has_outcome(rid, replica);
+                    if answered_from_outcome {
+                        self.stats.redirect_answered_from_outcome += 1;
+                    }
+                    if redirects && !answered_from_outcome {
                         // Wholly a live delegate's: the requester's table
                         // was stale; send it there. (Phase 2b: only while
                         // the delegate renews and the root reaches it; a
@@ -416,6 +472,9 @@ impl Core {
                         // held for a retry instead of a redirect to itself.
                         self.stats.deleg_not_owner += 1;
                         let redirect_gen = if from == d.node { 0 } else { d.gen };
+                        if from != d.node && non_stealable {
+                            self.note_redirected(rid, now);
+                        }
                         let outcome = if from == d.node {
                             MutateOutcome::Held {
                                 retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
@@ -446,9 +505,15 @@ impl Core {
                 // anew for the designation (seed 136 of `delegated-designated`:
                 // answered `EXDEV` at once while the drain's journaled copy of
                 // the same refusal was unshipped).
-                let has_outcome = replica.recent_outcome(rid).is_some()
-                    || replica.completed_outcome(rid).ok().flatten().is_some();
-                let wait = match self.deleg_recall_plan(now, &keys, replica, out) {
+                let has_outcome = self.rid_has_outcome(rid, replica);
+                let plan = if answered_from_outcome {
+                    // (Nothing runs: no recall for the delegation the
+                    // requester's table lacked.)
+                    super::delegate::RecallPlan::None
+                } else {
+                    self.deleg_recall_plan(now, &keys, replica, out)
+                };
+                let wait = match plan {
                     super::delegate::RecallPlan::None => Default::default(),
                     super::delegate::RecallPlan::Wait(w) => w,
                     super::delegate::RecallPlan::Refuse(_) if has_outcome => Default::default(),
@@ -471,14 +536,39 @@ impl Core {
                         }
                         return;
                     }
+                    // ADR-47 (row 9): the keys are a non-stealable grant's
+                    // and the rid may have run there (the requester's send
+                    // history says it was routed or offered by a generation,
+                    // or cannot say): not refused for good. Nothing is
+                    // journaled; the requester asks again until the holder's
+                    // word or its deadlines. `EXDEV` stays final (§4.3).
+                    super::delegate::RecallPlan::Refuse(code)
+                        if self.root_holds_touched(code, fence.touched_gen) =>
+                    {
+                        self.stats.root_touched_holds += 1;
+                        if req != OpId(0) {
+                            out.push(Action::Send {
+                                to: from,
+                                msg: PeerMsg::MutateReply {
+                                    req,
+                                    outcome: MutateOutcome::HolderUnreachable {
+                                        gen: self.refused_gen(&keys, replica),
+                                        retry_ms: self.cfg.forward_timeout_ms.max(10),
+                                    },
+                                    base: None,
+                                    position: Position::ZERO,
+                                    gen: 0,
+                                    own_chunks: OwnChunks::None,
+                                    own_rows: None,
+                                    committed: false,
+                                },
+                            });
+                        }
+                        return;
+                    }
                     super::delegate::RecallPlan::Refuse(code) => {
-                        // (This refusal is final here: the root cannot know
-                        // whether the requester sent the op to the designee
-                        // before. The requester knows, and does not take an
-                        // uncommitted `EROFS`/`EXDEV` of the root as the
-                        // answer for an op it sent to a delegate: it asks
-                        // again until the holder's word or its deadlines,
-                        // `Core::on_mutate_reply`, plan 46 M1.3 step 5.)
+                        // (Row 8: final, the rid never touched a generation
+                        // by its requester's own send history.)
                         self.note_final_nonholder_refusal(rid, code, false);
                         if req != OpId(0) {
                             // Plan 43 C2f review: nothing is journaled for

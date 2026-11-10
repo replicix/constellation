@@ -539,6 +539,13 @@ pub struct SimConfig {
     /// delegate fence). `AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED=1` sets it on
     /// every configuration.
     pub fence_accepts_unrouted: bool,
+    /// Negative control (`Config::root_ignores_touched`): the root and the
+    /// inbox drain refuse an op under an unreachable non-stealable grant for
+    /// good whatever it touched (main before ADR-47's root rule; the
+    /// requester's marks are off with it until they are deleted, else they
+    /// hold the refusal and the control is vacuous).
+    /// `AUTHORITY_SIM_ROOT_IGNORES_TOUCHED=1` sets it on every configuration.
+    pub root_ignores_touched: bool,
     /// Negative control (`Config::partial_release_ends_stream`): the root
     /// ends a sticky stream at the holder's release of some of its
     /// subtrees (MUST-1). `AUTHORITY_SIM_PARTIAL_RELEASE_ENDS_STREAM=1` sets
@@ -1147,6 +1154,8 @@ impl Default for SimConfig {
             )
             .is_some_and(|v| v == "1"),
             fence_accepts_unrouted: std::env::var_os("AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED")
+                .is_some_and(|v| v == "1"),
+            root_ignores_touched: std::env::var_os("AUTHORITY_SIM_ROOT_IGNORES_TOUCHED")
                 .is_some_and(|v| v == "1"),
             partial_release_ends_stream: std::env::var_os(
                 "AUTHORITY_SIM_PARTIAL_RELEASE_ENDS_STREAM",
@@ -4807,6 +4816,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         holder_releases_before_drain: cfg.holder_releases_before_drain,
         refuse_forwarded_designation_ops: cfg.refuse_forwarded_designation_ops,
         fence_accepts_unrouted: cfg.fence_accepts_unrouted,
+        root_ignores_touched: cfg.root_ignores_touched,
         partial_release_ends_stream: cfg.partial_release_ends_stream,
         abandon_skips_read_recall: cfg.abandon_skips_read_recall,
         plant_claim_root_group_on_lone: cfg.plant_claim_root_group_on_lone,

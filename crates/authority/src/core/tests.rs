@@ -35010,6 +35010,24 @@ fn inbox_batch(
     }
 }
 
+/// ADR-47: the holder tick re-reads the takeover drain's leftovers from
+/// storage; answer that read (found in `tick_out`) with `batches`, the
+/// bucket's content now.
+fn answer_leftover_read(
+    h: &mut Harness,
+    tick_out: &[Action],
+    batches: Vec<constellation_store_s3::inbox::InboxBatch>,
+) -> Vec<Action> {
+    let (op, _) = s3_ops(tick_out)
+        .into_iter()
+        .find(|(_, r)| matches!(r, S3Op::InboxDrain { .. }))
+        .expect("the tick re-reads the leftovers");
+    h.step(Event::S3 {
+        op,
+        result: S3Result::InboxDrain(Ok(batches)),
+    })
+}
+
 fn inbox_deletes(out: &[Action]) -> Vec<(u64, u64, u64)> {
     s3_ops(out)
         .into_iter()
@@ -35066,7 +35084,7 @@ fn the_takeover_drain_defers_only_the_delegated_requester() {
     ];
     let mut out = Vec::new();
     h.core
-        .inbox_drain(h.clk(), batches, &h.meta, &mut out)
+        .inbox_drain(h.clk(), batches.clone(), &h.meta, &mut out)
         .unwrap();
     assert!(
         h.meta.child_ino(ROOT_INO, "c").unwrap().is_some(),
@@ -35079,7 +35097,7 @@ fn the_takeover_drain_defers_only_the_delegated_requester() {
     );
     assert_eq!(inbox_deletes(&out), vec![(1, 3, 0)]);
     assert_eq!(h.core.stats.inbox_drained_batches, 1);
-    assert_eq!(h.core.inbox.leftover.len(), 2);
+    assert_eq!(h.core.inbox.leftover_batches(), 2);
     // The delegation ends (recalled through the log): the holder tick
     // runs requester 2's batches, in order, and deletes them.
     crate::replica::Replica::apply_segment(
@@ -35100,11 +35118,12 @@ fn the_takeover_drain_defers_only_the_delegated_requester() {
     h.core.delegation_sync(h.clk(), &h.meta, &mut out);
     let mut out = Vec::new();
     h.core.inbox_holder_tick(h.clk(), &h.meta, &mut out);
+    let out = answer_leftover_read(&mut h, &out, batches);
     assert!(h.meta.child_ino(dir, "a").unwrap().is_some());
     assert!(h.meta.child_ino(ROOT_INO, "b").unwrap().is_some());
     assert_eq!(inbox_deletes(&out), vec![(1, 2, 0), (1, 2, 1)]);
     assert_eq!(h.core.stats.inbox_drained_batches, 3);
-    assert!(h.core.inbox.leftover.is_empty());
+    assert!(h.core.inbox.leftover.is_none());
 }
 
 /// M16: an inbox op carries its `deps` like a forward: one that depends
@@ -35140,22 +35159,25 @@ fn an_inbox_op_waits_for_its_deps() {
         .to_postcard();
     let mut out = Vec::new();
     h.core
-        .inbox_drain(h.clk(), vec![batch], &h.meta, &mut out)
+        .inbox_drain(h.clk(), vec![batch.clone()], &h.meta, &mut out)
         .unwrap();
     assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_none());
-    assert_eq!(h.core.inbox.leftover.len(), 1, "deferred by the drain");
+    assert_eq!(h.core.inbox.leftover_batches(), 1, "deferred by the drain");
     let mut out = Vec::new();
     h.core.delegation_sync(h.clk(), &h.meta, &mut out);
     let mut out = Vec::new();
     h.core.inbox_holder_tick(h.clk(), &h.meta, &mut out);
+    answer_leftover_read(&mut h, &out, vec![batch.clone()]);
     assert!(
         h.meta.child_ino(ROOT_INO, "marker").unwrap().is_none(),
         "still waiting for the delegate's stream"
     );
     // The delegate's stream through index 5 is here: it runs.
     crate::replica::Replica::note_stream(&h.meta, 1, 5);
+    h.advance(h.core.cfg.sync_interval_ms.max(1));
     let mut out = Vec::new();
     h.core.inbox_holder_tick(h.clk(), &h.meta, &mut out);
+    let out = answer_leftover_read(&mut h, &out, vec![batch]);
     assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_some());
     assert_eq!(inbox_deletes(&out), vec![(1, 2, 0)]);
 }
@@ -58478,7 +58500,11 @@ mod c2g_settle {
         assert_eq!(recalls_to_4(&out).len(), 1, "{out:?}");
         assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::Sent);
         assert!(h.core.dl.gens[&7].gate_recalled);
-        assert_eq!(h.core.inbox.leftover.len(), 1, "the op waits for the poll");
+        assert_eq!(
+            h.core.inbox.leftover_batches(),
+            1,
+            "the op waits for the poll"
+        );
         assert!(h.meta.lookup(ROOT_INO, "a").unwrap().is_some());
         // Not shippable: nothing.
         let (mut g, dir) = gated_root_with_gen_at_4(false);
@@ -69914,5 +69940,595 @@ mod grant_horizon_bench {
         );
         drop(meta);
         let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
+/// ADR-47 C5: the root's decision table, the inbox drain's halt and the
+/// inbox rules.
+mod route_fence_root {
+    use super::*;
+    use crate::core::holder::TOUCHED_UNKNOWN;
+    use crate::replica::Replica;
+    use constellation_fs_core::Ino;
+    use constellation_meta::Position;
+    use constellation_types::Code;
+
+    /// The root (node 1, epoch 2) with `/d1` granted sticky to node 3 as
+    /// generation `gen`, node 3 not reached; node 2's link is down (its
+    /// inbox is polled).
+    fn sticky_root() -> (Harness, Ino, u64) {
+        let (mut h, d1) = root_with_dir();
+        h.core.cfg.inbox = true;
+        let out = h.step(Event::Control {
+            op: OpId(900),
+            req: Control::Delegate {
+                dir: d1,
+                node: 3,
+                sticky: true,
+            },
+        });
+        assert!(
+            out.iter().any(
+                |a| matches!(a, Action::ControlDone { op, result: Ok(_) } if *op == OpId(900))
+            ),
+            "{out:?}"
+        );
+        let gen = h.meta.delegation_table().get(d1).expect("granted").gen;
+        h.core.note_demand(h.clk(), 2, true);
+        peers(&mut h, None);
+        (h, d1, gen)
+    }
+
+    /// Node 2's link down; node 3's up, down, or without an entry.
+    fn peers(h: &mut Harness, node3: Option<bool>) -> Vec<Action> {
+        let link = |node, connected| crate::event::PeerLink {
+            node,
+            connected,
+            last_seen: connected.then(|| w(h.now)),
+            rtt_ms: connected.then_some(1),
+            since: connected.then(|| w(h.now)),
+        };
+        let mut links = vec![link(2, false)];
+        links.extend(node3.map(|up| link(3, up)));
+        h.step(Event::Peers {
+            links,
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        })
+    }
+
+    fn create_in(h: &Harness, dir: Ino, name: &str) -> MutateOp {
+        MutateOp::Create {
+            parent: dir,
+            name: name.into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        }
+    }
+
+    /// A rename from the root into `/d1`: keys across the grant.
+    fn cross_op(h: &Harness, d1: Ino) -> MutateOp {
+        let x = h.meta.allocate_ino(ROOT_INO).unwrap();
+        Replica::apply_segment(
+            &h.meta,
+            5,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::Create {
+                parent: ROOT_INO,
+                name: "x".into(),
+                ino: x,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            }],
+        )
+        .unwrap();
+        MutateOp::Rename {
+            parent: ROOT_INO,
+            name: "x".into(),
+            new_parent: d1,
+            new_name: "y".into(),
+            noreplace: false,
+        }
+    }
+
+    fn rid_of(from: NodeId, seq: u64) -> Rid {
+        Rid {
+            node: from,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    fn forward(
+        h: &mut Harness,
+        from: NodeId,
+        req: u64,
+        seq: u64,
+        op: MutateOp,
+        settle: bool,
+        (routed_gen, touched_gen): (u64, u64),
+    ) -> Vec<Action> {
+        h.step(Event::Peer {
+            from,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: rid_of(from, seq),
+                op,
+                acked_through: 0,
+                deps: Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle,
+                routed_gen,
+                touched_gen,
+            },
+        })
+    }
+
+    fn outcome_to(out: &[Action], to: NodeId) -> Option<MutateOutcome> {
+        sends(out).into_iter().find_map(|(t, m)| match m {
+            PeerMsg::MutateReply { outcome, .. } if t == to => Some(outcome.clone()),
+            _ => None,
+        })
+    }
+
+    fn has_outcome(h: &Harness, from: NodeId, seq: u64) -> bool {
+        let rid = rid_of(from, seq);
+        h.meta.recent_outcome(rid).is_some()
+            || h.meta.completed_outcome(rid).ok().flatten().is_some()
+    }
+
+    /// The poll of node 2's inbox in flight, or the one the holder tick
+    /// issues once it is due.
+    fn poll_of_2(h: &mut Harness) -> OpId {
+        let in_flight = |h: &Harness| {
+            h.core
+                .s3
+                .iter()
+                .find_map(|(op, f)| matches!(f, S3For::InboxPoll(2)).then_some(*op))
+        };
+        if let Some(op) = in_flight(h) {
+            return op;
+        }
+        h.advance(h.core.cfg.sync_interval_ms.max(1) + 1);
+        let mut out = Vec::new();
+        h.core.inbox_holder_tick(h.clk(), &h.meta, &mut out);
+        in_flight(h).expect("node 2's inbox is polled")
+    }
+
+    /// The poll of node 2's inbox answered with `batch`; the actions of the
+    /// answer.
+    fn drain_poll(
+        h: &mut Harness,
+        batch: constellation_store_s3::inbox::InboxBatch,
+    ) -> Vec<Action> {
+        let op = poll_of_2(h);
+        h.step(Event::S3 {
+            op,
+            result: S3Result::InboxRun(Ok(vec![batch])),
+        })
+    }
+
+    fn batch_of(
+        op: &MutateOp,
+        seq: u64,
+        touched_gen: u64,
+        settle: bool,
+    ) -> constellation_store_s3::inbox::InboxBatch {
+        let mut batch = super::inbox_batch(2, 0, seq, op);
+        batch.ops[0].touched_gen = touched_gen;
+        batch.ops[0].settle = settle;
+        batch
+    }
+
+    /// Rows 8 and 9, for an execution and for a settle: a rid whose
+    /// requester never sent it under a generation is refused for good
+    /// (`EROFS`); one that did, or cannot say, is held (`HolderUnreachable`)
+    /// and nothing is journaled. Fails on the parent: `EROFS` for all.
+    #[test]
+    fn the_root_holds_a_touched_rid_under_an_unreachable_designation() {
+        for settle in [false, true] {
+            let (mut h, d1, gen) = sticky_root();
+            h.core.track_fence_audit();
+            for (i, (touched, held)) in [(0, false), (gen, true), (TOUCHED_UNKNOWN, true)]
+                .into_iter()
+                .enumerate()
+            {
+                let seq = i as u64 + 1;
+                let op = create_in(&h, d1, &format!("f{seq}"));
+                let out = forward(&mut h, 2, seq, seq, op, settle, (0, touched));
+                let got = outcome_to(&out, 2);
+                if held {
+                    assert!(
+                        matches!(got, Some(MutateOutcome::HolderUnreachable { gen: g, .. }) if g == gen),
+                        "touched {touched}, settle {settle}: {got:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        got,
+                        Some(MutateOutcome::Errno(Code::ReadOnly)),
+                        "touched {touched}, settle {settle}"
+                    );
+                }
+                assert!(!has_outcome(&h, 2, seq), "the root journaled a refusal");
+            }
+            assert_eq!(h.core.stats.root_touched_holds, 2);
+            let refused = h.core.take_final_nonholder_refusals();
+            assert_eq!(
+                refused.len(),
+                1,
+                "only the untouched rid is refused: {refused:?}"
+            );
+        }
+    }
+
+    /// The knob `root_ignores_touched` is main's rule: refused for good
+    /// whatever the rid touched.
+    #[test]
+    fn a_root_that_ignores_touched_refuses_for_good() {
+        let (mut h, d1, gen) = sticky_root();
+        h.core.cfg.root_ignores_touched = true;
+        let op = create_in(&h, d1, "f");
+        let out = forward(&mut h, 2, 1, 1, op, false, (0, gen));
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Errno(Code::ReadOnly))
+        );
+        assert_eq!(h.core.stats.root_touched_holds, 0);
+    }
+
+    /// Row 10: `EXDEV` for an op across the grant is final whatever the
+    /// rid touched, at the root and in the drain.
+    #[test]
+    fn a_cross_subtree_op_is_refused_exdev_whatever_it_touched() {
+        let (mut h, d1, gen) = sticky_root();
+        for (seq, touched) in [(1, 0), (2, gen), (3, TOUCHED_UNKNOWN)] {
+            let op = cross_op(&h, d1);
+            let out = forward(&mut h, 2, seq, seq, op, false, (0, touched));
+            assert_eq!(
+                outcome_to(&out, 2),
+                Some(MutateOutcome::Errno(Code::CrossDevice)),
+                "touched {touched}"
+            );
+        }
+        let op = cross_op(&h, d1);
+        drain_poll(&mut h, batch_of(&op, 9, gen, false));
+        assert_eq!(h.core.stats.inbox_refused_ops, 1, "journaled EXDEV");
+        assert_eq!(h.core.stats.inbox_touched_halts, 0);
+    }
+
+    /// The drain: a touched op (a generation recorded at enqueue, or
+    /// unknown) under an unreachable non-stealable grant halts its batch,
+    /// a refusal is journaled only for `touched_gen == 0`; settles alike.
+    /// Fails on the parent: `Refused` for all.
+    #[test]
+    fn the_inbox_drain_halts_a_touched_op_under_a_designation() {
+        for settle in [false, true] {
+            let (mut h, d1, gen) = sticky_root();
+            let op = create_in(&h, d1, "f");
+            for touched in [gen, TOUCHED_UNKNOWN] {
+                drain_poll(&mut h, batch_of(&op, 1, touched, settle));
+                assert_eq!(h.core.stats.inbox_refused_ops, 0, "touched {touched}");
+                assert!(!has_outcome(&h, 2, 1), "touched {touched}");
+            }
+            assert_eq!(h.core.stats.inbox_touched_halts, 2);
+            drain_poll(&mut h, batch_of(&op, 1, 0, settle));
+            assert_eq!(h.core.stats.inbox_refused_ops, 1, "settle {settle}");
+            assert_eq!(h.core.stats.inbox_touched_halts, 2);
+        }
+    }
+
+    /// The root never finally refuses (a table row or the drain) an op
+    /// whose requester recorded a generation: whatever order the checks
+    /// come in, the only final non-holder refusals are untouched rids'.
+    #[test]
+    fn the_root_never_finally_refuses_an_op_that_touched_a_generation() {
+        let (mut h, d1, gen) = sticky_root();
+        h.core.track_fence_audit();
+        let mut seq = 0;
+        for touched in [gen, gen + 1, TOUCHED_UNKNOWN] {
+            seq += 1;
+            let op = create_in(&h, d1, &format!("p{seq}"));
+            forward(&mut h, 2, seq, seq, op, false, (0, touched));
+            seq += 1;
+            let op = create_in(&h, d1, &format!("p{seq}"));
+            forward(&mut h, 2, seq, seq, op, true, (0, touched));
+            let op = create_in(&h, d1, &format!("p{seq}"));
+            drain_poll(&mut h, batch_of(&op, seq + 100, touched, false));
+        }
+        assert!(h.core.take_final_nonholder_refusals().is_empty());
+        assert_eq!(h.core.stats.inbox_refused_ops, 0);
+    }
+
+    /// A read issued before this root redirected the rid to the designee
+    /// may carry it with the `touched_gen` it was enqueued with (the
+    /// requester withdrew the batch and sent the op there): the drain
+    /// halts it. A read issued after refuses as before. Fails on the
+    /// parent: `Refused`.
+    #[test]
+    fn a_drain_read_before_a_redirect_does_not_refuse_the_rid() {
+        let (mut h, d1, _gen) = sticky_root();
+        let op = create_in(&h, d1, "f");
+        let poll = poll_of_2(&mut h);
+        peers(&mut h, Some(true));
+        h.advance(5);
+        // The requester's forward, routed 0 (an inbox-ever rid): redirected.
+        let out = forward(&mut h, 2, 1, 1, op.clone(), false, (0, 0));
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::NotHolder { holder: 3 }),
+            "{out:?}"
+        );
+        // The earlier read comes back with the rid, touched 0.
+        h.step(Event::S3 {
+            op: poll,
+            result: S3Result::InboxRun(Ok(vec![batch_of(&op, 1, 0, false)])),
+        });
+        assert_eq!(h.core.stats.inbox_refused_ops, 0);
+        assert_eq!(h.core.stats.inbox_touched_halts, 1);
+        assert!(!has_outcome(&h, 2, 1));
+        // A read issued after the redirect carries what is still there.
+        drain_poll(&mut h, batch_of(&op, 1, 0, false));
+        assert_eq!(h.core.stats.inbox_refused_ops, 1);
+    }
+
+    /// The redirect records are dropped once no read issued before them is
+    /// in flight.
+    #[test]
+    fn redirect_records_do_not_outlive_the_reads_in_flight() {
+        let (mut h, d1, _gen) = sticky_root();
+        let op = create_in(&h, d1, "f");
+        let poll = poll_of_2(&mut h);
+        peers(&mut h, Some(true));
+        h.advance(5);
+        forward(&mut h, 2, 1, 1, op.clone(), false, (0, 0));
+        assert_eq!(h.core.redirected_at.len(), 1, "a read is in flight");
+        h.step(Event::S3 {
+            op: poll,
+            result: S3Result::InboxRun(Ok(Vec::new())),
+        });
+        // The next poll was issued after the redirect.
+        assert!(h.core.redirected_at.is_empty());
+        forward(&mut h, 2, 2, 2, op, false, (0, 0));
+        assert!(
+            h.core.redirected_at.is_empty(),
+            "no read in flight to keep it for"
+        );
+    }
+
+    /// Row 4: a rid that has its outcome here is answered from it, not
+    /// redirected to a designee the requester's table lacked. Fails on the
+    /// parent: `NotHolder`.
+    #[test]
+    fn the_root_answers_a_rid_with_an_outcome_instead_of_redirecting() {
+        let (mut h, dir, _gen) = sticky_root();
+        peers(&mut h, Some(true));
+        h.advance(5);
+        // The rid has an outcome here (an inbox drain refused it, say).
+        let op = create_in(&h, dir, "f");
+        let rid = rid_of(2, 1);
+        h.meta.remember_outcome(rid, &[]);
+        assert!(has_outcome(&h, 2, 1));
+        // Its forward: answered from the outcome, not redirected.
+        let out = forward(&mut h, 2, 2, 1, op, false, (0, 0));
+        assert_eq!(h.core.stats.redirect_answered_from_outcome, 1, "{out:?}");
+        assert!(
+            !matches!(outcome_to(&out, 2), Some(MutateOutcome::NotHolder { .. })),
+            "{out:?}"
+        );
+        // A rid without one is redirected as ever.
+        let op = create_in(&h, dir, "g");
+        let out = forward(&mut h, 2, 3, 2, op, false, (0, 0));
+        assert!(matches!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::NotHolder { holder: 3 })
+        ));
+        assert_eq!(h.core.stats.redirect_answered_from_outcome, 1);
+    }
+
+    /// The root's own op: touched by a generation (or unknown), it waits on
+    /// the grant instead of being refused for good; untouched, `EROFS`.
+    /// Fails on the parent: decided by `forwarded`/`attempts`.
+    #[test]
+    fn the_roots_own_op_touched_by_a_designee_waits_on_the_grant() {
+        for (touched, in_doubt, waits) in [
+            (0, false, false),
+            // (A resubmitted rid that never touched a generation: it went
+            // to the lease holder only. Refused for good.)
+            (0, true, false),
+            (7, true, true),
+            (TOUCHED_UNKNOWN, true, true),
+        ] {
+            // (Node 3 has no link here: the root does not forward the op to
+            // it, it decides it itself.)
+            let (mut h, d1, _gen) = sticky_root();
+            let rid = h.rid(1);
+            if in_doubt {
+                h.core.in_doubt_rids.insert(rid);
+            }
+            if touched != 0 {
+                h.core.in_doubt_touched.insert(rid, touched);
+            }
+            let op = create_in(&h, d1, "own");
+            let out = h.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op,
+                tag: Default::default(),
+            });
+            if waits {
+                assert!(replies(&out).is_empty(), "touched {touched}: {out:?}");
+                assert!(h.core.clients[&rid].designation_held);
+            } else {
+                let told = replies(&out);
+                assert!(
+                    told.iter()
+                        .any(|(r, reply)| *r == rid && format!("{reply:?}").contains("ReadOnly")),
+                    "touched {touched}, in doubt {in_doubt}: {out:?}"
+                );
+            }
+        }
+    }
+
+    /// §4.2: an op that was in an inbox goes to the lease holder only; the
+    /// table-based forward to a designee is for the others.
+    #[test]
+    fn an_inbox_ever_rid_is_forwarded_to_the_lease_holder_only() {
+        for inbox_ever in [false, true] {
+            let mut h = Harness::new(2);
+            h.core.cfg.delegation = true;
+            h.core.cfg.p2p = true;
+            h.core.cfg.forwarding = true;
+            h.core.cfg.inbox = true;
+            h.core.lease.cached_holder = Some(1);
+            let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+            let records = vec![
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d1".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::DelegateNode {
+                    node: 3,
+                    gen: 7,
+                    dirs: vec![constellation_meta::SubtreeGrant {
+                        dir,
+                        kind: constellation_meta::SubtreeKind::Sticky,
+                    }],
+                },
+            ];
+            Replica::install_streamed(&h.meta, 1, 1, 1, 2, &records, true, (0, 0)).unwrap();
+            h.step(Event::Peers {
+                links: [1, 3]
+                    .into_iter()
+                    .map(|node| crate::event::PeerLink {
+                        node,
+                        connected: true,
+                        last_seen: Some(w(h.now)),
+                        rtt_ms: Some(1),
+                        since: Some(w(h.now)),
+                    })
+                    .collect(),
+                lapses: 0,
+                issued: WaitMs(i64::MAX),
+            });
+            let rid = h.rid(1);
+            if inbox_ever {
+                h.core.in_doubt_rids.insert(rid);
+                h.core.in_doubt_batches.insert(
+                    rid,
+                    vec![constellation_store_s3::inbox::InboxKey {
+                        epoch: 1,
+                        node: 2,
+                        n: 0,
+                    }],
+                );
+            }
+            let op = create_in(&h, dir, "f");
+            let out = h.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op,
+                tag: Default::default(),
+            });
+            let mut out = out;
+            if let Some((tomb, _)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| matches!(r, S3Op::InboxTombstone { .. }))
+            {
+                // The batch is withdrawn first; the forward follows.
+                out = h.step(Event::S3 {
+                    op: tomb,
+                    result: S3Result::InboxTombstone(Ok(())),
+                });
+            }
+            let sent: Vec<(NodeId, u64)> = sends(&out)
+                .into_iter()
+                .filter_map(|(to, m)| match m {
+                    PeerMsg::MutateRequest { routed_gen, .. } => Some((to, *routed_gen)),
+                    _ => None,
+                })
+                .collect();
+            if inbox_ever {
+                assert_eq!(sent, vec![(1, 0)], "{out:?}");
+            } else {
+                assert_eq!(sent, vec![(3, 7)], "{out:?}");
+            }
+        }
+    }
+
+    /// The takeover gate's leftover batches are read again from storage
+    /// after the gate, not run from the bytes the gate kept: a batch its
+    /// requester withdrew meanwhile is gone and does not run, even though
+    /// the delegation that halted it has ended. Fails on the parent: the
+    /// kept bytes run.
+    #[test]
+    fn a_gate_leftover_is_re_read_from_storage_not_run_from_memory() {
+        let (mut h, dir) = root_with_dir();
+        h.core.cfg.inbox = true;
+        Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::delegate_one(
+                2,
+                1,
+                dir,
+                constellation_meta::SubtreeKind::Placed,
+            )],
+        )
+        .unwrap();
+        let op = create_in(&h, dir, "a");
+        let batch = super::inbox_batch(2, 0, 1, &op);
+        let mut out = Vec::new();
+        h.core
+            .inbox_drain(h.clk(), vec![batch], &h.meta, &mut out)
+            .unwrap();
+        assert_eq!(h.core.inbox.leftover_batches(), 1);
+        // The delegation ends; the requester has withdrawn its batch.
+        Replica::apply_segment(
+            &h.meta,
+            2,
+            2,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
+                gen: 1,
+                through: 0,
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let mut out = Vec::new();
+        h.core.inbox_holder_tick(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.meta.child_ino(dir, "a").unwrap().is_none(),
+            "the kept bytes ran"
+        );
+        let out = super::answer_leftover_read(&mut h, &out, Vec::new());
+        assert!(h.meta.child_ino(dir, "a").unwrap().is_none());
+        assert!(inbox_deletes_of(&out).is_empty());
+        assert!(h.core.inbox.leftover.is_none(), "nothing left to wait for");
+    }
+
+    fn inbox_deletes_of(out: &[Action]) -> Vec<(u64, u64, u64)> {
+        super::inbox_deletes(out)
     }
 }
