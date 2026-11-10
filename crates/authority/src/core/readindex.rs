@@ -318,7 +318,7 @@ impl Core {
         replica: &dyn Replica,
     ) -> bool {
         let durable = replica.grant_horizon_known(kind);
-        let span = (self.cfg.read_delegation_ttl_ms + self.cfg.expiry_margin_ms) as u64;
+        let span = self.cfg.read_delegation_ttl_ms + self.cfg.expiry_margin_ms;
         let ahead = now.wait.plus(span + 1_000);
         if durable < ahead {
             let lane = &mut self.rd.horizon[kind.index()];
