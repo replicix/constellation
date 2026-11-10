@@ -8222,6 +8222,9 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "ttl_claims_without_tail",
             "touched_unknown_submits",
             "deleg_fenced_forwards",
+            "root_touched_holds",
+            "inbox_touched_halts",
+            "redirect_answered_from_outcome",
         ],
     );
     blake3::hash(text.as_bytes()).to_hex().to_string()[..16].to_string()
@@ -8505,12 +8508,16 @@ impl OracleTotals {
         );
         // ADR-47: the delegate fence's counters, per seed (`SWEEP-FENCE`).
         eprintln!(
-            "SWEEP-FENCE {label} seed {seed}: fenced {} resends {} bounce-limit {} held {} unsettled-eio {}",
+            "SWEEP-FENCE {label} seed {seed}: fenced {} resends {} bounce-limit {} held {} unsettled-eio {} \
+             root-holds {} inbox-halts {} outcome-answers {}",
             r.stats.values().map(|s| s.deleg_fenced_forwards).sum::<u64>(),
             r.stats.values().map(|s| s.fenced_resends).sum::<u64>(),
             r.stats.values().map(|s| s.fence_bounce_limit).sum::<u64>(),
             r.stats.values().map(|s| s.designation_refusals_held).sum::<u64>(),
-            r.stats.values().map(|s| s.client_unsettled_eio).sum::<u64>()
+            r.stats.values().map(|s| s.client_unsettled_eio).sum::<u64>(),
+            r.stats.values().map(|s| s.root_touched_holds).sum::<u64>(),
+            r.stats.values().map(|s| s.inbox_touched_halts).sum::<u64>(),
+            r.stats.values().map(|s| s.redirect_answered_from_outcome).sum::<u64>()
         );
         self.unsourced += r.acks_unsourced;
         self.unjournaled_landed += r.unjournaled_landed;
@@ -18860,17 +18867,30 @@ fn a_release_before_the_drain_fails_the_run() {
     }
 }
 
-/// The knob `refuse_forwarded_designation_ops`
-/// (`AUTHORITY_SIM_REFUSE_FORWARDED_DESIGNATION_OPS=1`): the holds of an op
-/// sent to a non-stealable holder are off (main's behaviour). `sticky-ttl`
-/// fails on the seeds main failed on, by the log oracle that finds a refusal
-/// and a completion of one rid (`refused_and_completed`) and by I1.
+/// The knobs `refuse_forwarded_designation_ops`
+/// (`AUTHORITY_SIM_REFUSE_FORWARDED_DESIGNATION_OPS=1`: the requester's holds
+/// of an op sent to a non-stealable holder are off) and `root_ignores_touched`
+/// (`AUTHORITY_SIM_ROOT_IGNORES_TOUCHED=1`: the root and its drain refuse
+/// whatever the op touched, ADR-47) together are main's behaviour.
+/// `sticky-ttl` fails on the seeds main failed on, by the log oracle that
+/// finds a refusal and a completion of one rid (`refused_and_completed`) and
+/// by I1. The root's rule alone closes them: with only the requester's holds
+/// off, the same seeds pass.
 #[test]
 fn the_holds_of_an_op_sent_to_a_sticky_holder_are_needed() {
     let config = SimConfig {
         refuse_forwarded_designation_ops: true,
+        root_ignores_touched: true,
         ..sticky_ttl_config()
     };
+    for seed in [110u64, 624, 772] {
+        let only_marks_off = SimConfig {
+            refuse_forwarded_designation_ops: true,
+            ..sticky_ttl_config()
+        };
+        run_seed(seed, only_marks_off)
+            .unwrap_or_else(|e| panic!("seed {seed} without the requester's holds: {e}"));
+    }
     for seed in [110u64, 624, 772] {
         let e = run_seed(seed, config.clone())
             .expect_err("a refusal beside the holder's row and no oracle noticed");

@@ -792,7 +792,10 @@ impl Core {
             ) {
                 return;
             }
-            if self.cfg.forwarding && self.cfg.p2p {
+            // (ADR-47, §4.2: not a rid that was ever in an inbox: a drain may
+            // still hold its batch, and the lease holder alone is not a
+            // designee that could run it beside a drain's refusal.)
+            if self.cfg.forwarding && self.cfg.p2p && !self.clients[&rid].inbox_ever {
                 if let Ownership::Delegated(d) =
                     replica.resolve_ownership(&super::holder::keys_of_op_in(&op_ref, replica))
                 {
@@ -1318,23 +1321,26 @@ impl Core {
         }
     }
 
-    /// Whether `rid`'s op was sent to a node holding a non-stealable grant
-    /// (a sticky grant or a designation) of its keys: it may have run there,
-    /// and a final refusal by anyone else would contradict it.
-    fn sent_to_designation(&self, rid: Rid, replica: &dyn Replica) -> bool {
-        let Some(c) = self.clients.get(&rid).filter(|c| c.sent_to_delegate) else {
-            return false;
+    /// ADR-47 (the requester's inbox liveness rule; not safety-bearing: the
+    /// drain decides by the op's `touched_gen`): whether `rid` may be put in
+    /// the holder's inbox. An op that touched a generation (`touched_gen`,
+    /// `UNKNOWN` included) waits instead unless its keys are a placed
+    /// generation's on this node's table: the drain halts a touched op under
+    /// a non-stealable grant, and the halt would keep this node's later
+    /// batches behind it for the grant's life. A table that lags costs a
+    /// halted batch, never a final refusal.
+    fn inbox_ok(&self, rid: Rid, replica: &dyn Replica) -> bool {
+        let Some(c) = self.clients.get(&rid) else {
+            return true;
         };
-        let keys = super::holder::keys_of_op_in(&c.op, replica);
-        match replica.resolve_ownership(&keys) {
-            Ownership::Delegated(d) => d.kind != constellation_meta::SubtreeKind::Placed,
-            Ownership::CrossSubtree { involved, .. } => involved
-                .iter()
-                .any(|d| d.kind != constellation_meta::SubtreeKind::Placed),
-            // A table that lags the root's journal resolves the keys to the
-            // root after a redirect to the designee: still sent to it.
-            Ownership::Root => c.redirected_to_designee,
+        if c.touched_gen == 0 {
+            return true;
         }
+        let keys = super::holder::keys_of_op_in(&c.op, replica);
+        matches!(
+            replica.resolve_ownership(&keys),
+            Ownership::Delegated(d) if d.kind == constellation_meta::SubtreeKind::Placed
+        )
     }
 
     /// Whether `node` owns (holds a grant of) any of `rid`'s keys in this
@@ -1402,7 +1408,7 @@ impl Core {
                     self.send_forward(now, rid, holder, 0, replica, out);
                 } else if self.cfg.inbox
                     && !self.cfg.refuse_forwarded_designation_ops
-                    && self.sent_to_designation(rid, replica)
+                    && !self.inbox_ok(rid, replica)
                 {
                     // The inbox drain refuses an op under a designation for
                     // good (journaled, `Refused`), and an op sent to the
@@ -1470,7 +1476,7 @@ impl Core {
         c.sent_to_delegate |= to_delegate || routed_gen != 0;
         // (Nor does a table that lags tell where the generation's op went:
         // a send routed by a generation went to its designee, and the
-        // inbox hold (`sent_to_designation`) must cover it as it covers a
+        // inbox hold (`inbox_ok`) must cover it as it covers a
         // redirect.)
         if routed_gen != 0 {
             c.redirected_to_designee = true;
@@ -2183,6 +2189,7 @@ impl Core {
         }
         c.timer = None;
         let held_by = c.held_by.take();
+        let inbox_ever = c.inbox_ever;
         // (A settle has no effect to order after this node's replays.)
         let settle = c.settle;
         if !settle && self.hold_for_lost_deps(now, rid, replica, out) {
@@ -2270,6 +2277,9 @@ impl Core {
         // may be stale: the node is a designee now) the retry goes routed by
         // the generation, not routed 0, which it would fence again.
         let me = self.cfg.node_id;
+        // (ADR-47, §4.2: a rid that was ever in an inbox is not retried at a
+        // delegate; it asks the lease holder, which redirects it.)
+        let held_by = held_by.filter(|(_, g)| *g == 0 || !inbox_ever);
         let cached = match (self.lease.cached_holder, held_by) {
             (Some(c), Some((h, g))) if g != 0 && h == c => Some((h, g)),
             (c, held) => c.map(|h| (h, 0)).or(held),
@@ -3015,18 +3025,22 @@ impl Core {
                     super::delegate::RecallPlan::None => Default::default(),
                     super::delegate::RecallPlan::Wait(w) => w,
                     super::delegate::RecallPlan::Refuse(code) => {
-                        // An op already sent on (a forward to the holder
-                        // whose answer did not come) may have run there: a
+                        // An op already sent to a generation's holder (or
+                        // offered to one here) may have run there: a
                         // refusal for good would tell the application it did
                         // not. It waits for the holder's word instead: its row
                         // (the rid's completion, which ends the wait), its
                         // release or the stream's end; else the client's
                         // deadline answers it in doubt.
+                        // (ADR-47: by the op's own send history. `touched_gen`
+                        // is set before a send or a local offer to a
+                        // generation, `UNKNOWN` for a replay or an in-doubt
+                        // resubmission; `EXDEV` is final.)
                         if !self.cfg.refuse_forwarded_designation_ops
-                            && self
-                                .clients
-                                .get(&rid)
-                                .is_some_and(|c| c.forwarded || c.attempts > 0)
+                            && self.root_holds_touched(
+                                code,
+                                self.clients.get(&rid).map_or(0, |c| c.touched_gen),
+                            )
                         {
                             let gens: Vec<u64> = match replica.resolve_ownership(&keys) {
                                 constellation_meta::delegation::Ownership::Delegated(d) => {
@@ -4261,7 +4275,10 @@ impl Core {
             ) {
                 return;
             }
-            if self.cfg.forwarding && self.cfg.p2p {
+            if self.cfg.forwarding
+                && self.cfg.p2p
+                && !self.clients.get(&rid).is_some_and(|c| c.inbox_ever)
+            {
                 if let Ownership::Delegated(d) =
                     replica.resolve_ownership(&super::holder::keys_of_op_in(&op, replica))
                 {
