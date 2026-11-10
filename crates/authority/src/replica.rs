@@ -820,6 +820,15 @@ pub trait Replica {
     fn lost_persisted(&self) -> bool;
     fn persist_lost(&self, lost: bool) -> Result<(), MetaError>;
 
+    /// ADR-51: the member sets of the persisted epoch rows that may have
+    /// carried the lease tenure `(holder, lease_epoch)`
+    /// (`Meta::epochs_possibly_carrying`).
+    fn epochs_possibly_carrying(
+        &self,
+        holder: NodeId,
+        lease_epoch: Epoch,
+    ) -> Result<Vec<Vec<NodeId>>, MetaError>;
+
     // ---- plan 30 §M10: heartbeat promises ----
 
     /// Persist a promise before its PUT (`Meta::promise_issue`): the node
@@ -2068,6 +2077,14 @@ impl Replica for Meta {
             .flatten()
             .and_then(|v| v.parse().ok())
             .filter(|e| *e > 0)
+    }
+
+    fn epochs_possibly_carrying(
+        &self,
+        holder: NodeId,
+        lease_epoch: Epoch,
+    ) -> Result<Vec<Vec<NodeId>>, MetaError> {
+        Meta::epochs_possibly_carrying(self, holder, lease_epoch)
     }
 
     fn persist_epoch_hold(&self, hold: Option<Epoch>) -> Result<(), MetaError> {

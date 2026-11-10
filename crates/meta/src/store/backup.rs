@@ -1129,16 +1129,59 @@ mod durability_tests {
 
         let base = std::collections::BTreeMap::new();
         let n = meta.sync_count();
-        meta.persist_epoch("e1", &[1, 2], &base, 7, "promised")
+        meta.persist_epoch("e1", &[1, 2], &base, 7, "promised", None)
             .unwrap();
         assert_eq!(synced(n), 1, "an epoch promise");
         let n = meta.sync_count();
-        meta.persist_epoch("e1", &[1, 2], &base, 7, "promised")
+        meta.persist_epoch("e1", &[1, 2], &base, 7, "promised", None)
             .unwrap();
         assert_eq!(synced(n), 0, "an unchanged epoch row");
-        meta.persist_epoch("e1", &[1, 2], &base, 7, "active")
+        meta.persist_epoch("e1", &[1, 2], &base, 7, "active", None)
             .unwrap();
         assert_eq!(synced(n), 1, "an epoch state change");
+    }
+
+    /// ADR-51: an epoch row records the carrier its activation resolved,
+    /// keeps it through later state changes, and `epochs_possibly_carrying`
+    /// selects the rows that contain the holder and carry that tenure or
+    /// record none. Fails on the parent: no carrier is recorded.
+    #[test]
+    fn an_epoch_row_records_its_carrier_and_is_selected_by_it() {
+        let meta = Meta::open_in_memory().unwrap();
+        let base = std::collections::BTreeMap::new();
+        // Promised: no carrier yet; counts as possibly carrying anything.
+        meta.persist_epoch("e1", &[1, 2, 3], &base, 7, "promised", None)
+            .unwrap();
+        assert_eq!(
+            meta.epochs_possibly_carrying(1, 5).unwrap(),
+            vec![vec![1, 2, 3]]
+        );
+        // Activated: carries (1, 5).
+        meta.persist_epoch("e1", &[1, 2, 3], &base, 7, "active", Some((1, 5)))
+            .unwrap();
+        // A later state change does not forget the carrier.
+        meta.persist_epoch("e1", &[1, 2, 3], &base, 7, "closed", None)
+            .unwrap();
+        assert_eq!(
+            meta.epochs_possibly_carrying(1, 5).unwrap(),
+            vec![vec![1, 2, 3]]
+        );
+        assert!(meta.epochs_possibly_carrying(1, 6).unwrap().is_empty());
+        assert!(meta.epochs_possibly_carrying(2, 5).unwrap().is_empty());
+        // Another epoch: carries (4, 9) among {3, 4}; and an unrecorded one.
+        meta.persist_epoch("e2", &[4, 3], &base, 8, "active", Some((4, 9)))
+            .unwrap();
+        meta.persist_epoch("e3", &[4, 2], &base, 9, "promised", None)
+            .unwrap();
+        assert_eq!(
+            meta.epochs_possibly_carrying(4, 9).unwrap(),
+            vec![vec![2, 4], vec![3, 4]]
+        );
+        assert_eq!(
+            meta.epochs_possibly_carrying(4, 8).unwrap(),
+            vec![vec![2, 4]],
+            "e2 carried another tenure; e3 records none"
+        );
     }
 
     /// Plan 43 C7-H1 (R9): a promiser waits its promise out on its wait
