@@ -876,23 +876,26 @@ impl Core {
     /// whose stream carried it: `StrandedOp::source`) an admin retired
     /// (`leave --node-id`, which fences its leases with its id in
     /// `Lease::retired`): forgotten, not replayed. Streamed rows are the
-    /// source's unshipped journal, which died with it (an epoch's writes
-    /// are acknowledged on the hold owner's disk alone) and which the
-    /// operator gave up by retiring it; replayed, whatever part of it this
-    /// node happened to have streamed surfaced through the successor
-    /// (`epoch-holder-retired`, about one run in four: the hold owner's
-    /// write reached this member's stream before its `kill -9`). Keyed on
-    /// the source, not the requester (`rid.node`): an op a retired node
-    /// forwarded to a live holder is that holder's journal and replays,
-    /// and an op a live node forwarded to the retired holder went down
-    /// with the rest of its journal. The node's own ops are never foreign,
-    /// and a successor's backup tail (`Backup`-acknowledged rows) is not a
-    /// replay.
+    /// source's unshipped journal, which died with it and which the
+    /// operator gave up by retiring it.
+    ///
+    /// Only the source's speculation, though: a committed row (`gated`: its
+    /// answer waited for a group or the archive, so this node holds it as
+    /// the group's copy; plan 46 M1.4 step 4, an epoch hold's row answered
+    /// after this member's `StreamAheadAck`) was acknowledged to a client
+    /// and is not the retired node's to take with it. It replays (ADR-51:
+    /// the fallback for a copy that no claim carried; the flex model's
+    /// `hold_answered_rows_survive_retire`). Keyed on the source, not the
+    /// requester (`rid.node`): an op a retired node forwarded to a live
+    /// holder is that holder's journal and replays, and an op a live node
+    /// forwarded to the retired holder went down with the rest of its
+    /// journal. The node's own ops are never foreign, and a successor's
+    /// backup tail (`Backup`-acknowledged rows) is not a replay.
     fn drop_retired_origin(&mut self, queued: &StrandedOp, replica: &dyn Replica) -> bool {
         let Some(source) = queued.source.filter(|_| queued.foreign) else {
             return false;
         };
-        if source == self.cfg.node_id {
+        if queued.class.gated() || source == self.cfg.node_id {
             return false;
         }
         let retired = self
