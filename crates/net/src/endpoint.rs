@@ -632,6 +632,27 @@ impl Pool {
         !known
     }
 
+    /// The open connections to `id` the pool tracks.
+    fn live_connections(&self, id: iroh::EndpointId) -> Vec<iroh::endpoint::Connection> {
+        self.tracked
+            .lock()
+            .unwrap()
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .filter_map(|weak| weak.upgrade())
+            .filter(|conn| conn.close_reason().is_none())
+            .collect()
+    }
+
+    /// Stable ids of the connections [`Self::live_connections`] finds.
+    fn live_ids(&self, id: iroh::EndpointId) -> HashSet<usize> {
+        self.live_connections(id)
+            .iter()
+            .map(|conn| conn.stable_id())
+            .collect()
+    }
+
     /// Close the peer's live connections when none of them holds iroh's
     /// selected path (`selected` says whether one does). Returns how many
     /// were closed.
@@ -648,6 +669,10 @@ impl Pool {
     /// drops the selection and the dial's next retransmission goes to
     /// every address. This can go once iroh re-selects on a close.
     ///
+    /// Only what was open when the dial began (`before_dial`) can be what
+    /// it is stuck behind: if any connection to the peer came up since,
+    /// nothing is closed.
+    ///
     /// If any live connection holds the selection it is a valid one and
     /// the dial is merely slow: nothing is closed, since `request` does
     /// not retry and closing healthy connections would fail the peer's
@@ -658,19 +683,23 @@ impl Pool {
     fn unstick(
         &self,
         id: iroh::EndpointId,
+        before_dial: &HashSet<usize>,
         selected: impl Fn(&iroh::endpoint::Connection) -> bool,
     ) -> usize {
-        let live: Vec<iroh::endpoint::Connection> = self
-            .tracked
-            .lock()
-            .unwrap()
-            .get(&id)
-            .into_iter()
-            .flatten()
-            .filter_map(|weak| weak.upgrade())
-            .filter(|conn| conn.close_reason().is_none())
-            .collect();
+        let live = self.live_connections(id);
         if live.iter().any(selected) {
+            return 0;
+        }
+        // A connection that came up after the dial began (the peer's own
+        // dial to us, say, which is what makes a dial of ours slow under
+        // load) is proof the peer is reachable, and iroh re-selects the
+        // path when one is added. It may not hold the selection yet; it
+        // is not what the dial is stuck behind, and closing it failed
+        // the requests already on it.
+        if live
+            .iter()
+            .any(|conn| !before_dial.contains(&conn.stable_id()))
+        {
             return 0;
         }
         let stuck = live;
@@ -2572,6 +2601,7 @@ impl P2p {
             .unwrap_or(DIAL_STUCK_AFTER);
         #[cfg(not(test))]
         let stuck_after = DIAL_STUCK_AFTER;
+        let before_dial = pool.live_ids(peer.id);
         tokio::spawn(async move {
             // Out of the map however this task ends, a panic included.
             let mut entry = DialEntry {
@@ -2585,7 +2615,7 @@ impl P2p {
                 let test_dial = test_dial.clone();
                 async move {
                     tokio::time::sleep(stuck_after).await;
-                    pool.unstick(id, |conn| {
+                    pool.unstick(id, &before_dial, |conn| {
                         #[cfg(test)]
                         if let Some(only) = *test_dial.selected_only.lock().unwrap() {
                             return Some(conn.stable_id()) == only;
@@ -2791,7 +2821,8 @@ impl P2p {
     /// [`Pool::unstick`] with iroh's real selected-path check, for tests.
     #[cfg(test)]
     pub(crate) fn unstick_for_test(&self, id: iroh::EndpointId) -> usize {
-        self.pool.unstick(id, has_selected_path)
+        let before = self.pool.live_ids(id);
+        self.pool.unstick(id, &before, has_selected_path)
     }
 
     /// A connection to `addr` dialed outside the pool (the handshake hook
