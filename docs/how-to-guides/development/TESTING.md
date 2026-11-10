@@ -4963,11 +4963,17 @@ configuration that cannot hold them yet carries
 `SimConfig::strict_commit_exempt`, a reason naming the plan item that closes it
 (a sweep's `+commit` still makes it strict); each exception goes with that item.
 The exceptions on 2026-11-06: `delegated-epoch` and `delegated-designated` (plan 46 M1.4),
-`delegated-core-stall-root-lease6` (M1.3, the stale-clock re-check rule), `locks-writer-hold-delegated`
+`locks-writer-hold-delegated`
 (M1.2 step 15, harness and sim fixes), and the configurations that drive the lock lane
 and delegate (`lock_files > 0`; M3.1). `drop-held-chain` and `-backed`
 (M2.2) and `metered-shared` (M1.2 step 16) are not delegated by configuration and stay
 strict under `+commit` only.
+`delegated-core-stall-root-lease6` was an exception until 2026-11-10: a singleton's answer now
+leaves only on a fresh clock reading of a usable lease
+([ADR-52](../../explanation/DECISIONS.md#adr-52-a-singleton-answer-leaves-only-on-a-fresh-reading-of-a-usable-lease)),
+so it is strict by default and `+commit` 0 of 2,000 (the regression replays are seeds 4, 13 and 23,
+`a_stalled_root_does_not_answer_after_its_lease_was_taken_over`). `sweep_config` prints the answers held
+(`SWEEP-HELD-STALE-LEASE`, from `Stats::answers_held_stale_lease`; non-zero only on the stall configurations).
 `SWEEP-ORACLES` (per seed with any
 counter) and `SWEEP-ORACLE-TOTALS` (per sweep, with `acks_by_class`) print the
 counts; `AUTHORITY_SIM_ORACLE_DEBUG=1` prints each I1 violation as judged, and (`ORACLE-END`) the relays no judged answer backs and the unjournaled refusals that landed, with every answer of the rid. The M11 configurations `delegated-crash`, `delegated-partition`, `delegated-root-crash` and `shared-dir`, `-split`, `-ranges`, `-faults` are sweep names too (plan 43 C2a).
