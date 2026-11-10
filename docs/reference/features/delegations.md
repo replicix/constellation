@@ -833,6 +833,16 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
   `ttl + margin` and ends the generation. Every row the delegate answered to
   another node is in the root's journal (the answer waited for the append);
   the clients of the rows it had not answered retry by rid through the root.
+- **A lone root restarts while its delegate generations are stopped**: the
+  root does not reclaim its lease on its own; a restarted or released root is
+  re-claimed on demand. A delegate whose renewal was refused has stopped its
+  generation, and an op it executed and parked on its stream row hears in
+  doubt at its first client deadline. That settle is the demand: it
+  re-adopts the lease (or claims a released one) and the op is answered from
+  the log, so the cost is latency of at most one deadline and no `EIO` when
+  the log answers. Measured in 2000-seed sweeps (`long-delegated` with slow
+  lease reads, `delegated-epoch`): about 27 ops, no failing seed. A proactive
+  re-claim was evaluated and dropped (no invariant at stake).
 - **Delegate or holder restarts (crash or upgrade), and returns**: the
   read delegations its previous process granted live on in the readers, up to
   the read TTL, and the new process has forgotten them. A delegate persists a
