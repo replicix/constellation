@@ -536,7 +536,8 @@ would put a WAN round trip on every write (plan 30 §2, constraint 4).
 **Superseded in part by [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
 (plan 46 stages 1–2)**: Layer A (`Local`, an acknowledgement resting on
 the holder's disk, replayed by rid after a takeover) survives only for a
-singleton. A node with write-eligible peers and no backup in budget
+singleton. Layer A answers alone only as a singleton whose roster lists no
+write-eligible peer ([ADR-50](#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer)). A node with write-eligible peers and no backup in budget
 answers under a sticky non-stealable grant (final) or waits for the
 archive; `AckPolicy::Local` and `ack=local` go. Layers B and C are
 unchanged.
@@ -2397,6 +2398,8 @@ See: [Delegations](../reference/features/delegations.md#a-row-whose-cause-was-lo
 **Status**: decided by the maintainer on 2026-11-01; to be built in the
 stages of [plan 46](../plans/v1/wip/46-committed-or-final.md). Each stage
 amends this record with what landed.
+D3 (a root answers alone only as a singleton) is implemented by
+[ADR-50](#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer).
 
 **Context**: six weeks after ADR-33, the acknowledgement and
 ordering-node-change area had produced 55 bug rows (41 integrity), 239
@@ -2566,6 +2569,18 @@ and plan 43 Q16.
 **Amended by [ADR-42](#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)
 (2026-11-03)**: the push runs while the root is usable *or in a takeover
 gate whose journal work is done*.
+
+**Amended by plan 46 M1.1 and [ADR-50](#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer)
+(2026-11-10)**: the `u64::MAX` branch (a lone root's journal counts as
+committed for the group `{delegate, root}`) is deleted. The root reports
+`committed` only through rows its own configuration has committed, and with
+no backup that is the archive. A lone root can be taken over at the lease's
+expiry while paused, and the claimant adopts the archive alone, so a row the
+delegate answered on the root's journal is lost when the delegate then fails
+(the model's `root_journal_counts` knob violates `acked_never_lost`). Such a
+delegate's answers wait for the archive until the root has a backup. A root
+with a live delegate generation is no singleton (ADR-50), so the branch has
+no root left to apply to.
 
 **Amended by plan 46 M1.1 step 1 (2026-11-05, the maintainer's "M1.0
 answers", plan 46 §11)**: the lone-journal branch of the Decision is
@@ -3843,6 +3858,90 @@ See: `crates/authority/src/core/inbox.rs` (`execute_inbox_batch`,
 (`client_deadline`, `settle_route`), `crates/authority/src/core/replay.rs`,
 `crates/authority/src/core/holder.rs`, [delegations](../reference/features/delegations.md),
 [forwarded mutations](../reference/features/forwarded-mutations.md).
+
+## ADR-50: A root answers alone only when one roster object lists no write-eligible peer
+
+**Status**: decided by the maintainer on 2026-11-10 (plan 46 D3, M1.3 step 10;
+questions Q1 to Q6 of the step-10 spec accepted as recommended). Implements
+the singleton rule of [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
+(D3) and amends [ADR-21](#adr-21-layered-durability-and-seal-based-failover)
+(Layer A) and [ADR-41](#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16)
+(the lone root's other `Lone` answers). Numbers 47 to 49 belong to the route
+fence, the deadlines and the late-landing records in flight.
+
+**Context**: the M1.1 test was "no roster peer is linked within the RTT
+budget". A root whose peers were all far, or all unlinked, answered its own
+node's clients from its disk (`Singleton`), and a TTL takeover by one of them
+rolled those answers back (`far-root-writes`: 70 acknowledged answers rolled
+back in 2,000 seeds, 52 of them judged `Lone`). Membership was also held in
+five views of the core, and a registry scan that returned `Ok` with one
+unparseable or vanished record emptied the core's roster, which made a root
+with linked, in-budget peers answer alone.
+
+**Decision**: each node keeps one roster object (`core/roster.rs`), written by
+its core alone from four inputs: the stamped registry reads (`seq`, `issued`,
+`lapses`, `complete`), the directory snapshots, every message the node
+receives (counted at the one door every peer message passes, and at an inbox
+batch's admission) and the node's own lapses. An older read is ignored; an
+incomplete read only adds the nodes it listed and marks the peer set unknown;
+a complete read replaces the lists and drops a node heard from only if the
+read was issued after the node's last message; a node the read lists as
+read-only is no evidence. Unknown means "has peers".
+
+A root is a singleton (`Core::singleton_now`) only if its last complete read
+lists no write-eligible node but itself, nothing newer is incomplete, no lapse
+of its own is newer than the read, no unlisted node has messaged it or is
+linked to it that the read cannot speak for, no candidate is being brought up,
+and no other node holds a live delegate generation of its (S10-I4: such a
+node is a peer whatever the roster says). The test is judged at the event,
+from these inputs, never from a cache. The claim stamp, the lease's
+configuration bump, `durable_jseq` and the fast path's `lone_ok` all read it,
+so the flip is the same event that brought the peer. Every reader of
+membership (backup candidacy, placement, promises, the inbox poll set, the
+quarantine and abandon audience, status) asks the object.
+
+**Consequences**:
+
+- Zero rollbacks of an acknowledgement on a node that has peers. A singleton's
+  unshipped rows can still come back as conflict copies when a node joins and
+  the root dies before its core was told of it (the singleton's
+  death-then-join contract, Q6 of plan 46): the window is one registry poll
+  plus delivery, and ends at the joiner's first message to the root.
+- **Interim cost (Q1)**: a root with any registered write-eligible peer,
+  unmounted ones included, waits for the archive for all its own ops, not
+  only those in `/`, until plan 46 M1.3 step 9 lets it answer its own
+  subtrees by delegation. The remedy for a node that will not be mounted again
+  is `leave`. The FUSE fast path answers alone only from a singleton's
+  `lone_ok`, so a delegating root takes its own ops through the core meanwhile.
+- No roster freshness bound (Q2): a root cut from S3 cannot renew its lease,
+  and the lease's TTL bounds that case; a bound would cost an offline single
+  node its local answers.
+- Read-only nodes do not end the singleton (Q6): they cannot claim the lease.
+- A root with a live delegate generation is no singleton, so
+  `DelegateStreamAck.archive_bound` holds for any root with no backup listed.
+- The stale-view hole `epoch-holder-retired` closes: a link up after the
+  roster read is a peer the read cannot speak for
+  (`Roster::link_is_peer`), for the lone test and for backup candidacy alike.
+- M2.3 deletes only `AckPolicy::Local`.
+- `status.roster` shows the installed read, whether it is complete, the nodes
+  known and heard, and the verdict.
+
+**Rejected**: a roster freshness timer; a join handshake (the joiner is not
+write-eligible until the root acknowledges it: it needs a liveness rule for a
+dead root); a roster stamp on the lease (no decision would read it).
+
+**May revert**: no. The model (`crates/model/src/node_stream.rs`, chunk 12)
+finds each planted bug (`roster_installs_old_read`, `roster_partial_shrinks`,
+`singleton_while_partial`, `evidence_only_on_forward`,
+`singleton_with_foreign_grant`), and the sim's oracles
+(`singleton_after_peer_known`, `singleton_lag`) judge the product against the
+oracle's own copy of the install rule; `AUTHORITY_SIM_PLANT_ROSTER_SHRINK=1`
+(`Config::roster_installs_partial`) must fail `singleton-peer-join`.
+
+See: `crates/authority/src/core/roster.rs`, `core/backup.rs`
+(`singleton_now`, `note_heard`, `durable_jseq_held`),
+`crates/store-s3/src/nodes.rs` (`RegistryScan::roster_read`),
+[delegations](../reference/features/delegations.md).
 
 ## ADR-53: A row keeps its configuration's rule across its holder's own tenure gap
 

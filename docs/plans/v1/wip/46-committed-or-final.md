@@ -284,8 +284,10 @@ that configuration's commit point; a configuration change between the
 publish and the journal is caught where it is today (the writer lock),
 but it now compares two version numbers, not two class decisions.
 
-`Lone` survives only as the **singleton** case: a root whose roster
-(`nodes/`) holds no write-eligible peer answers from its disk; the sim and
+`Lone` survives only as the **singleton** case ([ADR-50](../../../explanation/DECISIONS.md#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer),
+M1.3 step 10): a root whose roster object (from `nodes/`, the messages it
+received and the directory) holds no write-eligible peer answers from its
+disk; the sim and
 model name it `Singleton`, and a counter (`status.ack.singleton_acks`)
 replaces `lone_acks`. The singleton's rows are speculation in ADR-19's
 sense only towards its own restart (which re-adopts its journal) and
@@ -1064,6 +1066,18 @@ the archive), and the same topology under the new rule is clean
 answers wait for the archive until the root has a backup. The text is
 written into `DECISIONS.md` with M1.3's code, where the lone root's other
 `Lone` answers go too.
+
+### M1.3 step 10: the roster singleton (the maintainer, 2026-11-10)
+
+Step 10 (no lone answer with a peer, from one roster object; ADR-50) goes
+before steps 7, 8 and 9, and step 10 no longer depends on step 9. Its
+interim cost, accepted (Q1): until step 9, a root with any write-eligible
+roster peer, an unmounted one included, waits for the archive for all its own
+ops, not only those in `/`; the fast path answers alone only for a singleton,
+so a delegating root takes its own ops through the core. Q2 (no roster
+freshness bound), Q3 (a live foreign generation ends the singleton), Q4 (the
+ADR-41 amendment lands in step 10), Q5 (ADR-50) and Q6 (read-only nodes do
+not end the singleton) are accepted as recommended.
 
 ### M1.0 answers, chunk C11 (the maintainer, 2026-11-06)
 

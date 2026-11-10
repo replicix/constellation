@@ -608,22 +608,24 @@ configuration, which fences the old sequencer before a reconfiguration
 (`Meta::backup_seal`, `PeerMsg::DelegSeal`); the rows a sealed member holds
 past the **archive** (the S3 log and its slot CAS, which fences a deposed
 sequencer's late segment a second time) are the **sealed tail**, re-shipped by
-the reconfigurer (`backup_tail`, `apply_backup_tail`). A **lone sequencer** is a
-holder or delegate whose group is itself because no peer is within the RTT
-budget, judged as of the event it answers in: a roster peer that is linked and
-not measured out of budget counts as one a backup could be had from, whether
-or not its link has yet been up for the stability window or its RTT measured
-(`Core::backup_could_be_had`; the window only paces the choice of a
-candidate). A root with such a peer never answers from its disk alone: it
-waits for the archive, or for the backup it brings up. The directory the
-judgement rests on must have been taken after the node's own last lapse (a
-pause, a freeze, a held runtime) was handed to its core: the links it held
-before it stopped cannot show that no peer came up meanwhile, so after a lapse
-even a true singleton waits for the archive until the next snapshot (the
-daemon takes one at once). A freeze shorter than the lag
-probe's threshold (about 187 ms) counts as no lapse; that is safe, because the
-directory lives in the process: it cannot change during the freeze, and links
-that went down leave peers listed, which errs towards not answering alone
+the reconfigurer (`backup_tail`, `apply_backup_tail`). A **lone sequencer** (a **singleton**) is a
+root whose roster object lists no write-eligible node but itself, judged as of
+the event it answers in ([ADR-50](DECISIONS.md#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer)).
+**The roster object** (`core/roster.rs`) is the node's one membership view,
+written by its core from the stamped registry reads, the directory, every
+message received and its own lapses: an older read is ignored, a read that
+could not be completed only adds (and makes the peers unknown), a complete one
+replaces, and unknown means peers. A root with a write-eligible peer, however
+far, unlinked or unmounted, never answers from its disk alone: it waits for the
+archive, or for the backup it brings up (`Core::backup_could_be_had` remains
+the candidate and delegate test; the RTT budget no longer decides who answers
+alone). Knowledge older than the node's own lapse (a pause, a freeze, a held
+runtime) is not knowledge: after a lapse even a true singleton waits for the
+archive until a read issued after it arrives (the daemon takes one at once). A
+freeze shorter than the lag probe's threshold (about 187 ms) counts as no
+lapse; a node that registers in so short a window is the singleton's
+accepted death-then-join window, which ends at that node's first message to
+the root or at the next read
 ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)). Its answers to its own
 node's clients are the one speculation the design keeps. A **non-stealable** authority (an offline designation, a
 continuation epoch's hold) is never replaced while its holder lives. The rows a
@@ -894,13 +896,14 @@ following it
 
 ### Acknowledgement and durability
 
-*Being replaced in part: `Local`'s lone answer for a node that has
-write-eligible peers, and `ack=local`, go with
+*Being replaced in part: `ack=local` goes with
 [plan 46](../plans/v1/wip/46-committed-or-final.md) stages 1–2
-([ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)):
-a singleton still answers from its disk; everyone else answers under a
-group, a sticky non-stealable grant, or the archive. `Backup` and `S3`
-are unchanged. This text changes with the code.*
+([ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)).
+A singleton (its roster lists no write-eligible peer) answers from its disk;
+any root with a write-eligible peer, near or far, linked or not, mounted or
+not, answers under a group, a sticky non-stealable grant, or the archive
+([ADR-50](DECISIONS.md#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer)). `Backup` and `S3` are unchanged. This text changes with
+the code.*
 
 **One rule per stream, named by its configuration** (plan 46 M1.1, steps 2 to
 7). There are no answer classes. A sequencer's commit rule is looked up from
@@ -921,12 +924,18 @@ What a sequencer's acknowledgement means is the tenure's `ack_policy`,
 chosen per filesystem and topology
 ([ADR-21](DECISIONS.md#adr-21-layered-durability-and-seal-based-failover)):
 
-- **`Local`** (Layer A, always, free): the sequencer is lone (no roster
-  peer linked within budget, as of the answering event: a peer whose link is
-  younger than `CONSTELLATION_BACKUP_STABLE_MS` or whose RTT is not yet
-  measured is a possible backup, not a reason to answer alone; and not on a
-  directory older than the node's own last lapse, nor before the first
-  one). Its own node's op is acknowledged once it is on the
+- **`Local`** (Layer A, free): the sequencer is a singleton, as of the
+  answering event ([ADR-50](DECISIONS.md#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer)): its roster object lists no write-eligible node
+  but itself, no registry read newer than that one could not be completed, none
+  of its own lapses is newer than the read, no node the roster does not list
+  has messaged it or is linked to it that the read cannot speak for, and no
+  other node holds a live generation of its. Unknown is not alone: before the
+  first complete read, after one that could not be completed, and across the
+  node's own lapse it has peers. A root with any registered write-eligible
+  peer waits for the archive for its own ops too, whether the peer is far,
+  unlinked, partitioned or unmounted (until plan 46 M1.3 step 9 lets it answer
+  its own subtrees by delegation; a node that will not be mounted again is
+  retired with `leave`). Its own node's op is acknowledged once it is on the
   sequencer's disk, the one speculation a deposition may roll back (it
   replays by rid). A lone root's journal is no second copy for anyone
   else: a delegate with no recorded backup counts the root's appended row
@@ -940,8 +949,8 @@ chosen per filesystem and topology
   (`singleton`): the transition to and from a peer's configuration is a
   `config_version` bump committed under old and new (plan 46 M1.1 step 5), so
   nothing is answered alone until the archive carries the journal through it,
-  and a node that asks the root for something counts as a peer from that
-  request on. A row keeps that rule across the holder's own tenure gap
+  and a node that sends the root a message of any kind and that the roster does
+  not list counts as a peer from that message on. A row keeps that rule across the holder's own tenure gap
   too: a re-taken lease (or a restart's) answers an earlier tenure's gated row
   only once the archive carries it
   ([ADR-53](DECISIONS.md#adr-53-a-row-keeps-its-configurations-rule-across-its-holders-own-tenure-gap)).
@@ -1353,7 +1362,10 @@ writes journal locally, and everything flushes when S3 returns
 The danger is a missing node that still reaches S3 and takes an expired
 lease the epoch is using. With `epoch_slack = 0` (the default) the epoch
 therefore needs **every** write-eligible node: every live, non-read-only
-registry record. Majority quorum is deliberately insufficient. With
+registry record. Majority quorum is deliberately insufficient.
+(The core's roster object, which decides who a root answers alone for, is
+not this fail-closed copy: it never shrinks on a read that could not be
+completed, [ADR-50](DECISIONS.md#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer).) With
 `epoch_slack = f` (`fs create --epoch-slack`, `fs set epoch-slack`) it
 needs `N − f`, and the missing nodes are held off by **promises**:
 
@@ -1439,12 +1451,12 @@ op executes and is acknowledged; "EROFS" means it is refused at once.
 | One node loses S3, P2P up | write; its closes hand their chunks to a peer after 6 s | write |
 | Holder dies, a backup within the RTT budget | — | write again in ≈ 1.5 s in the harness, 2.3–4.7 s on EC2 (seal-based takeover), nothing acknowledged lost |
 | Holder dies, `ack=s3` | — | write again in ≈ 1.5 s in the harness, not measured on EC2 (any peer takes over), nothing acknowledged lost |
-| Holder dies, no backup (`Local`) | — | write again after the lease TTL (60 s) plus margin; acknowledged forwards are replayed by their requesters; with `f > 0` the taker needs `f` promises |
+| Holder dies, no backup (`Local`) | — | write again after the lease TTL (60 s) plus margin; nothing acknowledged is lost, except a singleton's unshipped rows when a node joined unseen (they come back as conflict copies, [ADR-50](DECISIONS.md#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer)); acknowledged forwards are replayed by their requesters; with `f > 0` the taker needs `f` promises |
 | Delegate dies | — | writes under its subtree wait for the root to reclaim it (TTL + margin ≈ 6 s), or for its recorded backup's seal and tail, which the root waits for without a bound: with the backup gone too, until a member answers or the operator ends the generation (`repair abandon --gen`, which loses the rows only that group held; [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)) |
 | Delegate cut from the root | stops sequencing at `sent + ttl − margin`; the rows past the cut that were never answered are dropped and their clients retry through the root | write through the root once it reclaims the subtree |
 | Designee isolated | write | `EROFS` under the path |
 | S3 down, at least `N − f` write-eligible nodes connected | write (epoch) | write (epoch) |
-| S3 down, fewer than `N − f` connected | writes until its lease's TTL, then refuses | cannot acquire; reads work |
+| S3 down, fewer than `N − f` connected | a root with peers but no backup acknowledges nothing until S3 returns (the archive), then refuses at its TTL; a singleton writes until its TTL | cannot acquire; reads work |
 | S3 down, `ack=s3` | acknowledgements stall until S3 returns | the same |
 
 ## 6. Consistency Modes
@@ -1861,17 +1873,17 @@ per-topology table.*
 | Topology | Policy | Added acknowledgement latency | Holder crashes and returns before a takeover | Holder away past a takeover | Failover |
 |---|---|---|---|---|---|
 | Single node | `Local` | none | nothing lost | n/a | n/a |
-| Only distant peers (no backup in budget) | `Local` (Layer A) | none for the holder's own writes; one S3 commit for a forwarded write | nothing lost | nothing forwarded lost (answered only once in the log); the holder's own unshipped writes come back as a replay when it returns | lease TTL (60 s) + margin |
+| Only distant peers (no backup in budget) | the archive ([ADR-50](DECISIONS.md#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer)) | one S3 commit per write, the holder's own included (until plan 46 M1.3 step 9) | nothing lost | nothing lost | lease TTL (60 s) + margin |
 | A peer within the RTT budget | `Backup` (Layer B) | one round trip to the backup | nothing lost | nothing lost | detection + one CAS: ≈ 1.5 s in the harness, 2.3–4.7 s on EC2 ([RESULTS](../../bench/remote/RESULTS.md#failover-time)) |
 | `fs create --ack-policy s3` | `S3` (Layer C) | one S3 round trip per group commit | nothing lost | nothing lost | detection + one CAS with P2P; the TTL without |
 
 "Nothing lost" is the single-failure contract: any failure of one machine,
 power included. A power loss of the holder and every backup together can
 lose `Backup`-acknowledged writes of the last seconds; `ack=s3` (or
-`fsync()` with `--fsync-mode s3`) covers that. For the first seconds of a
-tenure, while a backup that could be had is being brought up, a `Local`
-holder acknowledges nothing that rests on its disk alone: those
-acknowledgements wait for S3.
+`fsync()` with `--fsync-mode s3`) covers that. A holder with a
+write-eligible peer acknowledges nothing that rests on its disk alone,
+whether or not a backup is being brought up: those acknowledgements wait for
+S3 or for the backup ([ADR-50](DECISIONS.md#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer)).
 
 ### Seal-based failover
 

@@ -69365,3 +69365,29 @@ after about one deadline. No invariant is at stake (I1, I2, I4 hold); the cost i
   give-ups went 15 to 18 (long-delegated + slow reads) and 9 to 8 (delegated-epoch). No gain.
 - **Reopen only if** a stopped-generation give-up ends in an unsettled `EIO`, or hangs past the second deadline; then build
   on the delegate side, not a root-side startup claim.
+
+## Plan 46 M1.3 step 10: the roster singleton (ADR-50, 2026-11-10)
+
+`Core::singleton_now` replaces the budget-based lone test: a root answers alone only when its roster object lists no
+write-eligible node but itself (S10-I1 to I6). Evidence is counted at the one door every peer message passes, and
+`Roster::link_is_peer` is the one rule for a link up after the registry read (the `singleton-stale-roster` fix: 194 of 200
+seeds failed I1 on main, 0 after).
+
+- **Sweeps** (release, `+commit`, 2,000 seeds, against main): `far-root-writes` acknowledged answers rolled back 70 -> 18 (judged
+  Lone 52 -> 0, non-Lone 0); `far`, `far-placement`, `long-delegated` Lone rollbacks 0 after. The 280 failing seeds of
+  `delegated-core-stall-root-lease6` and the 7 of `flex` no longer fail (a root with a delegate is no singleton).
+- **Interim cost (Q1)**: archive waits (answers counted `archive_waits`) over 2,000 seeds, main -> now: `far-root-writes`
+  65,832 -> 89,138; `far` 69,869 -> 76,335; `far-placement` 187,926 -> 201,855; `long-delegated` 130,333 -> 179,974;
+  `delegated-core-stall-root` 240,000 -> 366,000 (its 126,000 singleton answers are archive waits now).
+- **Unsettled EIO** (allowed, counted): `delegated-designated` 718 -> 563, `sticky-ttl` 889 -> 724, `flex` 1,696 -> 1,805,
+  `long-delegated` 1 -> 3; no sweep gains a failing seed. `backup-crash-slow` seed 64 fails on both.
+- **Tests**: the roster-peer tests that relied on a lone root with a peer were converted (listed in the C4 commit message).
+  The sim's fast path executes only for a lone root, so five controls that need the root's own fast path in a delegating
+  configuration are ignored until step 9 (`delegated_fast_path_respects_whole_delegations`,
+  `delegated_unchecked_fast_path_is_caught`, `locks_writer_hold_refuses_the_held_write`,
+  `locks_writer_hold_without_the_check_at_write_is_caught`,
+  `locks_writer_hold_delegated_own_clock_without_the_settle_is_caught`); eight pinned seed sets were re-found.
+- **Oracles**: `singleton_after_peer_known` (the oracle's own copy of the install rule; the plant
+  `AUTHORITY_SIM_PLANT_ROSTER_SHRINK=1` fails `singleton-peer-join` on 32 of 300 seeds) and `singleton_lag` (reported:
+  `SWEEP-SINGLETON`). Harness: `singleton-peer-join`, `registered-peer-down`. `registry-bad-record` is not built (the
+  harness has no way to plant a record in the bucket).
