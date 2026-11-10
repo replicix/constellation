@@ -2396,10 +2396,13 @@ fn a_flush_waits_out_a_floor_longer_than_its_cap() {
 /// Plan 43 C7-H2 (review R3-2): the continuation epoch's flush release
 /// holds for a *fast takeover's* gate before its marker landed (no floor
 /// yet), and still releases at the epoch's own re-claim gate
-/// (`locks-blips-tight-faults` seed 5379).
+/// (`locks-blips-tight-faults` seed 5379). It holds for the gate of a
+/// takeover of another node's lease too, fast or not: that gate strands
+/// and replays what the previous tenure acknowledged and never shipped
+/// (`flex-tight` seed 485).
 #[test]
-fn an_epoch_flush_holds_for_a_fast_takeovers_gate_only() {
-    for fast in [true, false] {
+fn an_epoch_flush_holds_for_a_fast_or_foreign_takeovers_gate_only() {
+    for (fast, foreign) in [(true, false), (false, false), (false, true)] {
         let mut h = Harness::new(1);
         h.hold(
             1,
@@ -2413,6 +2416,7 @@ fn an_epoch_flush_holds_for_a_fast_takeovers_gate_only() {
                 shippable: false,
             }),
         );
+        h.core.lease.prev_holder = foreign.then_some(2);
         h.step(Event::Control {
             op: OpId(1 << 40),
             req: Control::Epoch {
@@ -2429,8 +2433,9 @@ fn an_epoch_flush_holds_for_a_fast_takeovers_gate_only() {
         let mut out = Vec::new();
         h.core.round_release(h.clk(), &h.meta, &mut out);
         assert_eq!(
-            h.core.lease.releasing, !fast,
-            "the epoch's flush release with a gate pending (fast takeover: {fast})"
+            h.core.lease.releasing,
+            !(fast || foreign),
+            "the epoch's flush release with a gate pending (fast takeover: {fast}, foreign: {foreign})"
         );
     }
 }
