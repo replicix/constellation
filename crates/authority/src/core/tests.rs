@@ -75164,3 +75164,66 @@ mod late_landing_replay {
         );
     }
 }
+
+/// ADR-52: a singleton's answer leaves only on a fresh reading of a usable
+/// lease.
+mod stale_lease {
+    use super::*;
+    use crate::core::backup::is_answer;
+    use crate::AnswerSource;
+    use std::sync::Arc;
+
+    /// The clock a stalled step reads when its answer leaves: the
+    /// harness's reading `ms` later.
+    fn clock_ahead(h: &Harness, ms: i64) -> crate::core::WindowsClock {
+        let mut late = h.clk();
+        late.wall = Ms(late.wall.0 + ms);
+        late.honour = HonourMs(late.honour.0 + ms);
+        late.wait = WaitMs(late.wait.0 + ms);
+        late.boot.raw_ms += ms;
+        Arc::new(move || late)
+    }
+
+    fn submit(h: &mut Harness, seq: u64, name: &str) -> (Rid, Vec<Action>) {
+        let rid = h.rid(seq);
+        let op = h.create(name);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        (rid, out)
+    }
+
+    /// The outcome Replies of `out`, with their sources.
+    fn answers(out: &[Action]) -> Vec<(Rid, AnswerSource)> {
+        out.iter()
+            .filter_map(|a| match a {
+                Action::Reply {
+                    rid,
+                    reply: ClientReply::Outcome(o),
+                    source,
+                } if is_answer(o) => Some((*rid, *source)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A core with no clock judges on the step's `now`: the answer of a
+    /// singleton leaves at its step, whatever the real time is (the core
+    /// unit tests are unchanged by the re-check).
+    #[test]
+    fn a_core_without_a_clock_judges_on_the_step() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        assert!(!h.core.has_clock());
+        let (rid, out) = submit(&mut h, 1, "a");
+        assert_eq!(answers(&out).len(), 1, "{out:?}");
+        assert_eq!(answers(&out)[0].0, rid);
+        assert_eq!(h.core.fresh_now().wall, h.clk().wall);
+        h.core.set_clock(clock_ahead(&h, 20_000));
+        assert!(h.core.has_clock());
+        assert_eq!(h.core.fresh_now().wall, h.clk().wall.plus(20_000));
+    }
+}

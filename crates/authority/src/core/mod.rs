@@ -2536,6 +2536,10 @@ pub struct Core {
     pub(crate) mode: AuthorityMode,
     /// The `now` of the event being handled (for `issue_s3`'s send time).
     clk: Now,
+    /// ADR-52: the clock an answer that leaves reads afresh
+    /// ([`Core::fresh_now`]); `None` in a core unit test, which judges on
+    /// the step's `now`.
+    clock: Option<WindowsClock>,
     stopped: bool,
     pub stats: Stats,
 }
@@ -2633,6 +2637,7 @@ impl Core {
                 suspended: false,
             },
             clk: Now::same(0),
+            clock: None,
             stopped: false,
             stats: Stats::default(),
             cfg,
@@ -2672,6 +2677,28 @@ impl Core {
     /// it with the answerer.
     pub fn set_deleg_windows(&mut self, windows: std::sync::Arc<DelegWindows>) {
         self.dw = windows;
+    }
+
+    /// ADR-52: the clock the core reads where an answer leaves, to judge
+    /// the lease on the time the answer is given rather than the time the
+    /// step began (before the first event; the driver and the simulation
+    /// give it this node's protocol clock).
+    pub fn set_clock(&mut self, clock: WindowsClock) {
+        self.clock = Some(clock);
+    }
+
+    /// Whether [`Core::set_clock`] was called.
+    pub fn has_clock(&self) -> bool {
+        self.clock.is_some()
+    }
+
+    /// A clock reading taken now: the core's clock, or the step's `now`
+    /// when none was set.
+    pub(crate) fn fresh_now(&self) -> Now {
+        match &self.clock {
+            Some(clock) => clock(),
+            None => self.clk,
+        }
     }
 
     /// Plan 41 L2: the lock lane's certificate cell (the driver shares it
