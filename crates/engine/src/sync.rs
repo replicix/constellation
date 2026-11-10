@@ -120,22 +120,48 @@ pub type SealTailAnswer = (
 /// owed)`.
 pub type DelegSealAnswer = (bool, Vec<constellation_meta::DelegateTx>, Vec<u64>);
 
+/// What the driver stamps on a registry read before it LISTs the registry
+/// (`Event::Roster`): its number in the order the reads were issued (one
+/// counter for every producer), the wait clock, and the `OwnLag` events the
+/// driver had handed the core so far. Taken before the read, never after.
+#[derive(Debug, Clone, Copy)]
+pub struct RosterStamp {
+    pub seq: u64,
+    pub lapses: u64,
+    pub issued: constellation_authority::WaitMs,
+}
+
+/// What the registry poll tells the core about the roster (ADR-50). A scan
+/// that read every record is the roster; one that answered but could not
+/// read every record lists what it read and says it is incomplete (the
+/// epoch roster is emptied then: fail closed for epochs; the core learns of
+/// the nodes that were read and treats the peer set as unknown, never as
+/// empty: it would otherwise answer `Singleton` with peers linked); a scan
+/// that failed altogether says nothing, so the core keeps what it knew.
+pub(crate) fn roster_request(
+    scan: Option<&constellation_store_s3::RegistryScan>,
+    stamp: RosterStamp,
+) -> Option<SyncRequest> {
+    Some(SyncRequest::Roster {
+        stamp,
+        read: scan?.roster_read(),
+    })
+}
+
 /// A request to the daemon's sync task — the authority core's driver
 /// (`crate::authority_driver`), which turns each into a core event.
 pub enum SyncRequest {
     /// Run a sync round soon; the sender does not wait.
     Nudge,
-    /// The write-eligible roster from the registry poll (M13: who the
-    /// holder polls). `issued`: this node's wait clock before the read
-    /// began (`Event::Roster::issued`).
+    /// One registry read for the core's roster object (M13: who the holder
+    /// polls; ADR-50). `stamp` was taken before the read began. A scan that
+    /// could not read every node record says so (`read.complete`) and lists
+    /// what it read: the core learns of those nodes and treats the peer set
+    /// as unknown, never as empty. A scan that failed altogether sends
+    /// nothing.
     Roster {
-        roster: Vec<u64>,
-        issued: constellation_authority::WaitMs,
-    },
-    /// The registry poll could not read every node record: the roster is
-    /// unknown, not empty (`Event::RosterUnread`).
-    RosterUnread {
-        issued: constellation_authority::WaitMs,
+        stamp: RosterStamp,
+        read: constellation_store_s3::RosterRead,
     },
     /// The continuation-epoch machine changed state (the driver
     /// re-reports it to the core).
@@ -770,4 +796,79 @@ pub enum SyncRequest {
     Flush {
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+}
+
+#[cfg(test)]
+mod roster_request_tests {
+    use super::*;
+    use object_store::memory::InMemory;
+    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+    use std::sync::Arc;
+
+    fn stamp() -> RosterStamp {
+        RosterStamp {
+            seq: 7,
+            lapses: 2,
+            issued: constellation_authority::WaitMs(1),
+        }
+    }
+
+    async fn store_with_two_nodes() -> Arc<dyn ObjectStore> {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        constellation_store_s3::claim_node_id(store.clone())
+            .await
+            .unwrap();
+        constellation_store_s3::claim_node_id(store.clone())
+            .await
+            .unwrap();
+        store
+    }
+
+    /// The core's roster of an incomplete scan lists the nodes the scan read
+    /// (ADR-50, F1): the epoch roster is emptied by the same scan, which the
+    /// core's roster must not follow.
+    #[tokio::test]
+    async fn the_core_roster_of_an_incomplete_scan_is_not_empty() {
+        let store = store_with_two_nodes().await;
+        store
+            .put(
+                &object_store::path::Path::from("nodes/00000063.json"),
+                PutPayload::from(b"{ truncated".to_vec()),
+            )
+            .await
+            .unwrap();
+        let scan = constellation_store_s3::registry_scan(store.as_ref())
+            .await
+            .unwrap();
+        assert!(scan.roster().is_err(), "the epochs' view fails closed");
+        let Some(SyncRequest::Roster { stamp: s, read }) = roster_request(Some(&scan), stamp())
+        else {
+            panic!("an incomplete scan still tells the core what it read");
+        };
+        assert_eq!((s.seq, s.lapses), (7, 2));
+        assert_eq!(read.write_eligible, vec![1, 2]);
+        assert!(!read.complete);
+    }
+
+    /// A scan that failed altogether sends nothing (not an empty roster); a
+    /// complete one sends its roster.
+    #[tokio::test]
+    async fn a_failed_scan_sends_nothing_and_a_complete_one_sends_its_roster() {
+        assert!(roster_request(None, stamp()).is_none());
+        let empty = constellation_store_s3::RegistryScan::default();
+        assert!(matches!(
+            roster_request(Some(&empty), stamp()),
+            Some(SyncRequest::Roster { read, .. })
+                if read.complete && read.write_eligible.is_empty()
+        ));
+        let store = store_with_two_nodes().await;
+        let scan = constellation_store_s3::registry_scan(store.as_ref())
+            .await
+            .unwrap();
+        assert!(matches!(
+            roster_request(Some(&scan), stamp()),
+            Some(SyncRequest::Roster { read, .. })
+                if read.complete && read.write_eligible == [1, 2]
+        ));
+    }
 }
