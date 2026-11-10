@@ -186,6 +186,49 @@ const LEAVE_WAIT_SLACK_MS: u64 = 5_000;
 /// A leaving node's note counts as lapsed after this many resends.
 const LEAVE_NOTE_LAPSE_RESENDS: u64 = 3;
 
+/// The delegation TTL a deployment gets when it sets none: the lock TTL,
+/// and at least the core's own 5 s. One rule for every host of the core
+/// ([`normalize`] applies it to a configuration whose `delegation_ttl_ms` is
+/// `0`): a delegate's grants are then capped by about `lock_ttl - 2 * margin`
+/// and by 2 to 3 s only where the TTL is set short (the sim's
+/// `Config::defaults` keeps the 5 s: its delegations are the short ones,
+/// whatever its lock TTL).
+pub fn default_delegation_ttl(lock_ttl_ms: u64) -> u64 {
+    lock_ttl_ms.max(5_000)
+}
+
+/// The lock lane's tick: a quarter of the forward timeout, between 50 and
+/// 250 ms. The engine's lane loop and the simulation's both read it.
+pub fn lane_tick_ms(forward_timeout_ms: u64) -> u64 {
+    (forward_timeout_ms / 4).clamp(50, 250)
+}
+
+/// The derivations every host of the core applies to a configuration once
+/// its knobs are set (the daemon's `load_config`, the simulation's driver at
+/// spawn), so both run the same derived configuration:
+///
+/// - a forwarded reply held for recalls answers `Held` at half the forward
+///   timeout, well inside the requester's RPC;
+/// - the backup knobs: an ack timeout and a takeover window of at least 1
+///   ms, a slow maximum of at least the ack timeout, a heartbeat of at most
+///   a third of the takeover window (a longer one lets the backup seal a
+///   holder that beats on time);
+/// - the delegation TTL, when unset (`0`), is [`default_delegation_ttl`].
+pub fn normalize(cfg: &mut Config) {
+    cfg.recall_hold_ms = (cfg.forward_timeout_ms / 2).max(1);
+    cfg.backup_ack_timeout_ms = cfg.backup_ack_timeout_ms.max(1);
+    cfg.backup_slow_max_ms = cfg.backup_slow_max_ms.max(cfg.backup_ack_timeout_ms);
+    cfg.backup_takeover_ms = cfg.backup_takeover_ms.max(1);
+    cfg.backup_heartbeat_ms = cfg
+        .backup_heartbeat_ms
+        .max(1)
+        .min(cfg.backup_takeover_ms / 3)
+        .max(1);
+    if cfg.delegation_ttl_ms == 0 {
+        cfg.delegation_ttl_ms = default_delegation_ttl(cfg.lock_ttl_ms);
+    }
+}
+
 impl Deadlines {
     pub fn new(cfg: &Config) -> Deadlines {
         let b = Base::new(cfg);
@@ -250,7 +293,7 @@ impl Deadlines {
             claim_grace: 2 * t,
             lag_threshold: (t / 8).max(1),
             recall_hold: (f / 2).max(1),
-            lane_tick: (f / 4).clamp(50, 250),
+            lane_tick: lane_tick_ms(f),
             backup_heartbeat: b.backup_heartbeat.max(1).min(t / 3).max(1),
         }
     }
@@ -624,7 +667,7 @@ mod tests {
     /// The daemon's delegation TTL default (`max(K, 5 s)`) over the defaults.
     fn engine() -> Config {
         let mut c = Config::defaults(1, 1);
-        c.delegation_ttl_ms = Config::default_delegation_ttl_ms(c.lock_ttl_ms);
+        c.delegation_ttl_ms = default_delegation_ttl(c.lock_ttl_ms);
         c
     }
 

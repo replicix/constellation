@@ -575,17 +575,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// The delegation TTL a deployment gets when it sets none: the lock
-    /// TTL, and at least the core's own 5 s. One rule for every host of the
-    /// core: the daemon's default (`CONSTELLATION_DELEGATION_TTL_MS` unset)
-    /// is this, so a delegate's grants are capped by about `lock_ttl − 2 ×
-    /// margin` there and by 2 to 3 s only where the TTL is set short (the
-    /// sim's `Config::defaults` keeps the 5 s: its delegations are the short
-    /// ones, whatever its lock TTL).
-    pub fn default_delegation_ttl_ms(lock_ttl_ms: u64) -> u64 {
-        lock_ttl_ms.max(5_000)
-    }
-
     /// Production defaults (the `CONSTELLATION_*` defaults of the code the
     /// core replaces), for `node_id` at `incarnation`.
     pub fn defaults(node_id: NodeId, incarnation: u32) -> Self {

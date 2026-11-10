@@ -149,7 +149,7 @@ async fn lane_loop(
     stop: Arc<AtomicBool>,
     wake: Arc<Notify>,
 ) {
-    let every = (forward_timeout_ms / 4).clamp(50, 250) as i64;
+    let every = constellation_authority::deadlines::lane_tick_ms(forward_timeout_ms) as i64;
     let facts = Arc::new(EngineFacts {
         off_core: off_core.clone(),
         meta: meta.clone(),

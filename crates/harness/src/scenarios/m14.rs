@@ -1765,7 +1765,7 @@ pub fn lock_contention_delegated(_seed: u64) -> Result<()> {
     // A short delegation, the core's own 5 s (`Config::delegation_ttl_ms`,
     // as the sim runs it): a delegate's grants are capped at 2 to 3 s.
     // The daemon's default is the lock TTL
-    // (`Config::default_delegation_ttl_ms`), which caps them at ~17 s: no
+    // (`deadlines::default_delegation_ttl`), which caps them at ~17 s: no
     // stale waiter then (a push is old only past ~8 s). A deployment that
     // sets the delegation TTL short (`CONSTELLATION_DELEGATION_TTL_MS`) is
     // the one the rule is for; `CONSTELLATION_HARNESS_DELEGATION_TTL_MS=default`
