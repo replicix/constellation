@@ -631,6 +631,25 @@ impl Reach {
         lease_at(&g, at).map(|l| l.holder).filter(|h| *h != 0)
     }
 
+    /// Sync-on-silence C1 (measurement only): for an unsettled `EIO` whose
+    /// generation tail the root could not reach, whether the proposed
+    /// "sync on strict-member silence" would have given the restarted
+    /// delegate an exact cut, i.e. whether a strict member had been silent
+    /// (dead, stopped, or cut from the delegate) before the delegate went
+    /// down. `None` for any other verdict.
+    pub fn silence_class(&self, q: &Question, v: &Verdict) -> Option<String> {
+        let tail = match v {
+            Verdict::GenerationTailUnreachable { .. } => true,
+            Verdict::NoSequencerInTime { why } => why.contains("no member"),
+            _ => false,
+        };
+        if !tail {
+            return None;
+        }
+        let g = self.inner.lock().unwrap();
+        Some(silence_class(&g, q))
+    }
+
     /// Classify `q` (see the module doc).
     pub fn classify(&self, q: Question) -> Verdict {
         let g = self.inner.lock().unwrap();
@@ -960,6 +979,99 @@ fn tail_reachable(g: &Inner, at: u64, r: NodeId, node: NodeId, gen: u64) -> bool
 
 /// Whether `node` has been attached continuously since it first listed a grant
 /// of `gen` (no restart in between).
+/// How long (ms) `m` had been silent to `d` (not running, or cut from it)
+/// without a break, as of the instant `until`.
+fn silent_for(g: &Inner, d: NodeId, m: NodeId, until: u64) -> u64 {
+    let (a, b) = (d.min(m), d.max(m));
+    let silent = |t: u64| !running(g, t, m) || cut(g, t, d, m);
+    let mut pts: Vec<u64> = vec![0];
+    pts.extend(g.links.iter().filter(|e| e.1 == a && e.2 == b).map(|e| e.0));
+    pts.extend(g.alive.iter().filter(|e| e.1 == m).map(|e| e.0));
+    for (n, from, to) in &g.stopped {
+        if *n == m {
+            pts.extend([*from, *to]);
+        }
+    }
+    pts.retain(|t| *t < until);
+    pts.sort_unstable();
+    pts.dedup();
+    let mut since = until;
+    for &s in pts.iter().rev() {
+        if silent(s) {
+            since = s;
+        } else {
+            break;
+        }
+    }
+    until - since
+}
+
+/// See [`Reach::silence_class`]. One class per generation the op's keys
+/// touch; the first one the mechanism would not remove wins.
+fn silence_class(g: &Inner, q: &Question) -> String {
+    let at = q.to_ms.saturating_sub(1);
+    let mut gens: Vec<(NodeId, u64)> = Vec::new();
+    for (_, o) in &q.owners {
+        match o {
+            Owner::Root => {}
+            Owner::Delegate { node, gen } => gens.push((*node, *gen)),
+            Owner::Blocked(v) => gens.extend(v.iter().copied()),
+        }
+    }
+    gens.sort_unstable();
+    gens.dedup();
+    if gens.is_empty() {
+        return "other/no-delegated-generation".into();
+    }
+    let mut classes: Vec<(bool, String)> = Vec::new();
+    for (d, gen) in gens {
+        // (`delegate_attached_since_install` is true while the delegate has
+        // NOT restarted since it installed: it then holds the tail.)
+        if delegate_attached_since_install(g, at, d, gen) {
+            classes.push((false, "other/delegate-not-restarted".into()));
+            continue;
+        }
+        let up = attach_since(g, at, d);
+        let down = g
+            .alive
+            .iter()
+            .rev()
+            .find(|(t, n, a)| *n == d && !*a && *t <= up)
+            .map_or(up, |e| e.0);
+        let members = gen_members(g, down.saturating_sub(1), d, gen);
+        if members.is_empty() {
+            classes.push((false, "other/no-recorded-member".into()));
+            continue;
+        }
+        let silent = members
+            .iter()
+            .map(|m| silent_for(g, d, *m, down))
+            .max()
+            .unwrap_or(0);
+        let state = if running(g, at, d) {
+            "delegate-up"
+        } else {
+            "delegate-down"
+        };
+        let (ok, name) = if silent >= 3_500 {
+            (true, "silent-first/>=3.5s")
+        } else if silent >= 600 {
+            (true, "silent-first/0.6-3.5s")
+        } else if silent > 0 {
+            (false, "other/silent-under-0.6s")
+        } else {
+            (false, "other/member-live-at-delegate-crash")
+        };
+        classes.push((ok, format!("{name}/{state}")));
+    }
+    classes
+        .iter()
+        .find(|(ok, _)| !*ok)
+        .or_else(|| classes.first())
+        .map(|(_, c)| c.clone())
+        .unwrap_or_default()
+}
+
 fn delegate_attached_since_install(g: &Inner, at: u64, node: NodeId, gen: u64) -> bool {
     let installed = g
         .views

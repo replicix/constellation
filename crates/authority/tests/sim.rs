@@ -385,6 +385,15 @@ fn replay_seed() {
         Ok("delegated-no-backup-root-near") => delegated_no_backup_root_near_config(),
         Ok("tloss-two-node") => tloss_two_node_config(),
         Ok("delegated-backup-and-delegate-die") => delegated_backup_and_delegate_die_config(),
+        Ok("delegated-backup-dies-then-delegate-reboots") => {
+            delegated_backup_dies_then_delegate_reboots_config()
+        }
+        Ok("delegated-backup-dies-then-delegate-reboots-mid") => {
+            delegated_backup_dies_then_delegate_reboots_mid_config()
+        }
+        Ok("delegated-backup-dies-then-delegate-reboots-early") => {
+            delegated_backup_dies_then_delegate_reboots_early_config()
+        }
         Ok("delegated-backup-and-delegate-die-abandon") => {
             delegated_backup_and_delegate_die_abandon_config()
         }
@@ -6127,6 +6136,15 @@ fn sweep_config() {
         "delegated-no-backup-root-near" => delegated_no_backup_root_near_config(),
         "tloss-two-node" => tloss_two_node_config(),
         "delegated-backup-and-delegate-die" => delegated_backup_and_delegate_die_config(),
+        "delegated-backup-dies-then-delegate-reboots" => {
+            delegated_backup_dies_then_delegate_reboots_config()
+        }
+        "delegated-backup-dies-then-delegate-reboots-mid" => {
+            delegated_backup_dies_then_delegate_reboots_mid_config()
+        }
+        "delegated-backup-dies-then-delegate-reboots-early" => {
+            delegated_backup_dies_then_delegate_reboots_early_config()
+        }
         "delegated-backup-and-delegate-die-abandon" => {
             delegated_backup_and_delegate_die_abandon_config()
         }
@@ -7398,6 +7416,53 @@ fn delegated_backup_and_delegate_die_config() -> SimConfig {
     }
 }
 
+/// Sync-on-silence C1 (measurement): the backup-first ordering. Node 3, the
+/// backup of `d1`'s delegate (node 2), dies for good at 2 s; node 2 reboots
+/// (new boot, its disk kept) at 3.5 s, after the delegate has seen its
+/// backup go silent under traffic. `d2`'s delegate (node 3) is dead too, so
+/// the only live delegation is `d1`'s.
+fn delegated_backup_dies_then_delegate_reboots_config() -> SimConfig {
+    SimConfig {
+        cross_ratio: 0.0,
+        await_dead_delegates: true,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 2_000,
+                kind: FaultKind::CrashNode {
+                    node: 3,
+                    restart_ms: None,
+                    keep_journal: true,
+                },
+            },
+            ScheduledFault {
+                at_ms: 3_500,
+                kind: FaultKind::RebootNode {
+                    node: 2,
+                    restart_ms: 1_000,
+                    step_ms: 0,
+                },
+            },
+        ],
+        ..delegated_backup_config()
+    }
+}
+
+/// The same with the reboot at 2.1 s, before the delegate can have noticed:
+/// the inherent residue of the mechanism.
+fn delegated_backup_dies_then_delegate_reboots_early_config() -> SimConfig {
+    let mut cfg = delegated_backup_dies_then_delegate_reboots_config();
+    cfg.faults[1].at_ms = 2_100;
+    cfg
+}
+
+/// The same with the reboot at 2.8 s: the backup has been silent for 0.8 s,
+/// past the mechanism's detection bound, before the delegate goes down.
+fn delegated_backup_dies_then_delegate_reboots_mid_config() -> SimConfig {
+    let mut cfg = delegated_backup_dies_then_delegate_reboots_config();
+    cfg.faults[1].at_ms = 2_800;
+    cfg
+}
+
 /// The same with the operator: `repair abandon --gen G` after 5 s of
 /// waiting ends each generation at the root's cursor (`GroupAbandoned` in
 /// the log); the rows only the dead group held are lost, counted
@@ -8206,6 +8271,10 @@ struct OracleTotals {
     /// root sealed the group for, and the seal waits.
     rowless: [u64; 9],
     unsettled_causes: std::collections::BTreeMap<String, u64>,
+    /// Sync-on-silence C1: the unsettled `EIO`s of a generation tail the
+    /// root could not reach, by whether a strict member had gone silent
+    /// before the restarted delegate went down.
+    unsettled_silence: std::collections::BTreeMap<String, u64>,
 }
 
 impl OracleTotals {
@@ -8356,6 +8425,9 @@ impl OracleTotals {
         }
         for (k, n) in &r.unsettled_causes {
             *self.unsettled_causes.entry(k.clone()).or_default() += *n as u64;
+        }
+        for (k, n) in &r.unsettled_silence {
+            *self.unsettled_silence.entry(k.clone()).or_default() += *n as u64;
         }
         if r.unsettled_violations > 0 {
             for e in r.unsettled_examples.iter().take(2) {
@@ -8582,6 +8654,10 @@ impl OracleTotals {
         eprintln!(
             "SWEEP-UNSETTLED-CAUSES {label} seeds {}/{seeds}: {:?}",
             self.seeds, self.unsettled_causes
+        );
+        eprintln!(
+            "SWEEP-UNSETTLED-SILENCE {label} seeds {}/{seeds}: {:?}",
+            self.seeds, self.unsettled_silence
         );
         eprintln!(
             "SWEEP-STREAM-TOTALS {label} seeds {}/{seeds}: delegated acks released {} ({} ms waited); \
