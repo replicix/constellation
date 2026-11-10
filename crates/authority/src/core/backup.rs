@@ -2470,9 +2470,17 @@ impl Core {
         // Rows of generations exist only on a node with a delegation (as the
         // delegate, or the root that appended a delegate's rows): the rest
         // pays nothing.
-        if (self.dl.mine.is_empty() && replica.holder_append_tip() == 0)
-            || self.cfg.dedup_deleg_rows_unawaited
-        {
+        if self.cfg.dedup_deleg_rows_unawaited {
+            return None;
+        }
+        if self.dl.mine.is_empty() && replica.holder_append_tip() == 0 {
+            // The cheap skip must agree with the real test: a former
+            // delegate after `drop_delegate_state` may still hold a gen != 0
+            // row above `log_stream_idx`.
+            debug_assert!(
+                self.unsettled_delegate_row(rid, replica).is_none(),
+                "emission pre-check skipped an unsettled delegation row ({rid:?})"
+            );
             return None;
         }
         self.unsettled_delegate_row(rid, replica)?;
