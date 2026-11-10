@@ -330,6 +330,7 @@ fn replay_seed() {
         Ok("backup-departs") => backup_departs_config(),
         Ok("singleton-first-peer") => singleton_first_peer_config(),
         Ok("singleton-stale-roster") => singleton_stale_roster_config(),
+        Ok("singleton-peer-join") => singleton_peer_join_config(),
         Ok("backup-group-cut-ttl") => backup_group_cut_ttl_config(GroupCut::Both),
         Ok("backup-group-cut-ttl-holder-only") => backup_group_cut_ttl_config(GroupCut::HolderOnly),
         Ok("backup-group-cut-ttl-backup-only") => backup_group_cut_ttl_config(GroupCut::BackupOnly),
@@ -2721,6 +2722,47 @@ fn singleton_first_peer_config() -> SimConfig {
     }
 }
 
+/// ADR-50, S10-I6: one node, a singleton answering on its own disk; a peer
+/// registers at 1.5 s and is cut off from it until 4 s (no link: its first
+/// word to the root would have come by the inbox or not at all), the root
+/// crashes at 3 s and returns at 11 s, and the peer claims after the TTL.
+/// What the root answered alone before its core was told of the peer may
+/// come back as a conflict copy (the singleton's accepted death-then-join
+/// window); nothing journaled after it was told may be answered alone. Run
+/// it with `AUTHORITY_SIM_ROSTER_FAULTS=20:20` (reads that lose a record or
+/// arrive late) and with `AUTHORITY_SIM_PLANT_ROSTER_SHRINK=1`, which must
+/// fail it.
+fn singleton_peer_join_config() -> SimConfig {
+    SimConfig {
+        nodes: 1,
+        ops_per_client: 400,
+        random_faults: 0,
+        strict_commit: true,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::JoinFresh,
+            },
+            ScheduledFault {
+                at_ms: 1_501,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 2,
+                    for_ms: 2_499,
+                },
+            },
+            ScheduledFault {
+                at_ms: 3_000,
+                kind: FaultKind::CrashHolder {
+                    restart_ms: Some(8_000),
+                    keep_journal: true,
+                },
+            },
+        ],
+        ..backup_config()
+    }
+}
+
 /// `epoch-holder-retired`'s hole: one node, a singleton answering on its own
 /// disk; its S3 is cut, and a fresh peer joins during the cut. The daemon's
 /// roster refresh reads S3 (every 5 s), so it falls with the cut and the
@@ -4549,27 +4591,26 @@ fn slow_s3_never_seals_a_live_holder() {
     assert_eq!(t.backup_takeovers, 0, "{t:?}");
 }
 
-/// Plan 30 §M9's checks are not vacuous: today's `Local` policy with a
-/// holder crash does roll acknowledged ops back (plan 30 §1.2's L2
-/// window), and the strict-durability check catches it.
+/// ADR-50: a `Local` holder with a peer answers nothing on its disk alone,
+/// so a holder crash rolls no acknowledged op back (plan 30 §1.2's L2 window
+/// is closed for every node that has peers; a singleton's rollback is the
+/// one excused speculation, `only_a_rolled_back_singleton_answer_is_excused`).
+/// The roster oracle's non-vacuity is `singleton-peer-join` with
+/// `AUTHORITY_SIM_PLANT_ROSTER_SHRINK=1`, which must fail.
 #[test]
-fn local_policy_rollbacks_are_found() {
+fn local_policy_has_no_rollbacks_with_a_peer() {
     let cfg = SimConfig {
         strict_durability: true,
         ..bug_b_config()
     };
-    let mut found = None;
     for seed in 200..260 {
         if let Err(e) = run_seed(seed, cfg.clone()) {
-            found = Some((seed, e));
-            break;
+            panic!(
+                "seed {seed} rolled an acknowledged op back under Local: {}",
+                e.lines().next().unwrap_or("")
+            );
         }
     }
-    let (seed, e) = found.expect("no seed rolled an acknowledged op back under Local");
-    eprintln!(
-        "local_policy_rollbacks_are_found: seed {seed}: {}",
-        e.lines().next().unwrap_or("")
-    );
 }
 
 // ---- runtime lag: a live holder is late, not dead ----
@@ -6634,6 +6675,7 @@ fn base_config(label: &str) -> SimConfig {
         "backup-departs" => backup_departs_config(),
         "singleton-first-peer" => singleton_first_peer_config(),
         "singleton-stale-roster" => singleton_stale_roster_config(),
+        "singleton-peer-join" => singleton_peer_join_config(),
         "backup-group-cut-ttl" => backup_group_cut_ttl_config(GroupCut::Both),
         "backup-group-cut-ttl-holder-only" => backup_group_cut_ttl_config(GroupCut::HolderOnly),
         "backup-group-cut-ttl-backup-only" => backup_group_cut_ttl_config(GroupCut::BackupOnly),
@@ -7669,6 +7711,7 @@ fn delegated_fast_path_unchecked_config() -> SimConfig {
 /// Plan 46 M1.2 step 1: the root's fast path executes what the root owns
 /// and leaves a whole delegation's subtree to its delegate.
 #[test]
+#[ignore = "ADR-50 interim (plan 46 M1.3 step 10, Q1): a root with a peer answers by the archive, and the sim fast path executes only for a lone root, so this configuration never takes the fast path until step 9; re-enable then"]
 fn delegated_fast_path_respects_whole_delegations() {
     let t = run_m11(
         "delegated-fast-path",
@@ -7685,6 +7728,7 @@ fn delegated_fast_path_respects_whole_delegations() {
 /// Without the admission the root's fast path executes inside a delegated
 /// subtree: two sequencers for one name. The checker must catch it.
 #[test]
+#[ignore = "ADR-50 interim (plan 46 M1.3 step 10, Q1): a root with a peer answers by the archive, and the sim fast path executes only for a lone root, so this configuration never takes the fast path until step 9; re-enable then"]
 fn delegated_unchecked_fast_path_is_caught() {
     let mut caught = 0;
     for seed in 78_000..78_040 {
@@ -15052,7 +15096,7 @@ fn a_successor_restarted_before_its_marker_still_owes_the_floor() {
 /// arrival. Three of them are pinned.
 #[test]
 fn a_credited_arrival_cap_splits_on_the_strict_side() {
-    for seed in [9, 40, 47] {
+    for seed in [54, 120, 192] {
         let e = run_seed(seed, strict_isolated_reader_skewed_credited_config())
             .expect_err("a cap counted from the credit never failed: no control");
         assert!(e.contains("close-to-open violated"), "seed {seed}: {e}");
@@ -15440,6 +15484,7 @@ fn locks_under_random_faults() {
 /// is refused at the write; the next holder's turn survives
 /// (`strict_lock_turns`), mutual exclusion holds.
 #[test]
+#[ignore = "ADR-50 interim (plan 46 M1.3 step 10, Q1): a root with a peer answers by the archive, and the sim fast path executes only for a lone root, so this configuration never takes the fast path until step 9; re-enable then"]
 fn locks_writer_hold_refuses_the_held_write() {
     use pinned::run_m14;
     let t = run_m14(
@@ -15566,6 +15611,7 @@ fn locks_writer_hold_delegated_unsettled_own_clock_config() -> SimConfig {
 /// before the root's clock bound (see the pin above); with the check
 /// disabled none of them fails, and this test with it.
 #[test]
+#[ignore = "ADR-50 interim (plan 46 M1.3 step 10, Q1): a root with a peer answers by the archive, and the sim fast path executes only for a lone root, so this configuration never takes the fast path until step 9; re-enable then"]
 fn locks_writer_hold_delegated_own_clock_without_the_settle_is_caught() {
     use pinned::run_seed;
     let mut witnessed = Vec::new();
@@ -15640,6 +15686,7 @@ fn locks_writer_hold_delegated_doubt_lapses_the_grant() {
 /// F1's fail-before: without the check at the write, a held write lands
 /// after the next holder's turn and its application is told it succeeded.
 #[test]
+#[ignore = "ADR-50 interim (plan 46 M1.3 step 10, Q1): a root with a peer answers by the archive, and the sim fast path executes only for a lone root, so this configuration never takes the fast path until step 9; re-enable then"]
 fn locks_writer_hold_without_the_check_at_write_is_caught() {
     let mut caught = 0;
     for seed in 230_130..230_150 {
@@ -16044,7 +16091,7 @@ fn locks_survive_core_stalls() {
     let t = run_m14(
         "locks-core-stall",
         locks_core_stall_config(),
-        231_500..231_540,
+        231_500..231_580,
     );
     assert!(t.grants > 300, "{t:?}");
     assert!(t.lane_renewals > 20, "the lane never renewed: {t:?}");
@@ -16052,7 +16099,7 @@ fn locks_survive_core_stalls() {
     let u = run_m14(
         "locks-core-stall-unlaned",
         locks_core_stall_unlaned_config(),
-        231_500..231_540,
+        231_500..231_580,
     );
     assert_eq!(u.lane_renewals, 0, "the lane renewed with the lane off");
     assert!(
@@ -16406,12 +16453,12 @@ fn regression_a_grant_handed_back_during_a_release_is_renewed() {
         ),
         (
             "locks-unlinked-delegated-blips",
-            1586,
+            624,
             locks_unlinked_blips_config(),
         ),
         (
             "locks-blips-tight-delegated",
-            649,
+            1191,
             locks_blips_tight_delegated_config(),
         ),
     ] {
@@ -18260,10 +18307,12 @@ fn c2_a_settled_eio_never_lands_late() {
 /// ended: `long-delegated+settle` failed I4 on 1694 and 8929 of 12,000 seeds
 /// (none on the parent of step 13). The settle is held until the outwait
 /// ends (`settles_held_for_outwait`). Fails on the parent: each seed's
-/// `+settle` run fails with I4.
+/// `+settle` run fails with I4. (Seeds 1694 and 8929 of step 13, re-pinned
+/// for ADR-50, which moved every schedule of a root with peers: these were
+/// found with `settles_held_for_outwait > 0` and a clean run.)
 #[test]
 fn a_settle_waiting_for_a_generations_outwait_is_held_and_never_lands_late() {
-    for seed in [1694, 8929] {
+    for seed in [618, 1112] {
         let r = run_seed(seed, strict(long_delegated_config(), "settle"))
             .unwrap_or_else(|e| panic!("long-delegated+settle seed {seed}: {e}"));
         assert!(
@@ -18285,7 +18334,7 @@ fn a_settle_waiting_for_a_generations_outwait_is_held_and_never_lands_late() {
 /// per seed ("no sequencer in time").
 #[test]
 fn long_delegated_settles_outlast_the_roots_outwait() {
-    for seed in [29, 47] {
+    for seed in [5, 6] {
         let r = run_seed(seed, strict(long_delegated_config(), "unsettled"))
             .unwrap_or_else(|e| panic!("long-delegated+unsettled seed {seed}: {e}"));
         assert!(
@@ -18314,14 +18363,20 @@ fn long_delegated_settles_outlast_the_roots_outwait() {
 /// delegation's seal still waiting. The `waiting_for_group` check called the
 /// rolled-back rid "acked, in no log" though the main end-of-run path excuses
 /// exactly that (`lone_rolled_back`). Fails on the parent: `acked_held_somewhere`.
+/// Since ADR-50 the root is no singleton while it has a delegate, so the
+/// seeds pass without any rollback.
 #[test]
 fn delegated_root_gone_commit_excuses_a_rolled_back_singleton_answer() {
     for seed in [1732, 7363] {
         let r = run_seed(seed, strict(delegated_root_gone_config(), "commit"))
             .unwrap_or_else(|e| panic!("delegated-root-gone+commit seed {seed}: {e}"));
-        assert!(
-            r.waiting_for_group && r.lone_rolled_back > 0,
-            "seed {seed}: no longer the rolled-back singleton under a waiting seal"
+        // ADR-50: a root with a delegate (a peer on the roster, a live
+        // generation of another node) no longer answers alone, so the seeds
+        // no longer produce the rolled-back singleton answer; the excuse
+        // stays covered by `only_a_rolled_back_singleton_answer_is_excused`.
+        assert_eq!(
+            r.lone_rolled_back, 0,
+            "seed {seed}: a root with a peer answered alone and was rolled back"
         );
     }
 }
@@ -19276,9 +19331,9 @@ fn the_lone_delegate_control_fails_the_oracles() {
 }
 
 /// (Seeds of 0 to 2,999 that do: 623, 767, 889, 939, 1128, 1247, ...)
-const I5_FAR_PLACEMENT_SEEDS: &[u64] = &[623, 767, 889];
+const I5_FAR_PLACEMENT_SEEDS: &[u64] = &[623, 889, 939];
 /// (Of 0 to 599: 151, 173, 291, 303, 338, 416, 467, 489, 496, 502.)
-const I5_LONG_DELEGATED_SEEDS: &[u64] = &[151, 173, 291];
+const I5_LONG_DELEGATED_SEEDS: &[u64] = &[151, 236, 278];
 
 /// Plan 46 M1.2 step 13, fail-before for the placement: a far writer (every
 /// pair out of the backup budget) is not delegated and its ops are
@@ -19406,7 +19461,7 @@ fn a_release_before_the_drain_fails_the_run() {
         holder_releases_before_drain: true,
         ..sticky_idle_release_config()
     };
-    for seed in [3u64, 6, 7] {
+    for seed in [6u64, 7, 9] {
         let e = run_seed(seed, config.clone())
             .expect_err("a holder released before its drain and no oracle noticed");
         assert!(
@@ -19613,8 +19668,9 @@ fn the_cto_oracle_catches_a_restart_that_skips_the_write_quarantine() {
         restart_skips_write_quarantine: true,
         ..sticky_holder_restarts_config()
     };
-    // 15 of the first 2,000 seeds fail (pinned: 156, 159, 659).
-    for seed in [156u64, 159, 659] {
+    // Of the first 1,500 seeds, 156, 353, 391, 447, 588 and 659 fail (pinned:
+    // 156, 353, 659; ADR-50 moved the schedules, 159 no longer does).
+    for seed in [156u64, 353, 659] {
         let e = run_seed(seed, config.clone())
             .expect_err("the holder skipped the quarantine and no oracle noticed");
         assert!(

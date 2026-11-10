@@ -190,6 +190,12 @@ pub struct Config {
     /// `abandon_skips_read_recall`). The sim's `no_read_under_an_abandoned_stream`
     /// (and close-to-open) must then fail the run.
     pub abandon_skips_read_recall: bool,
+    /// Test only, the sim's negative control (ADR-50, the model's
+    /// `roster_partial_shrinks`): a registry read that could not be
+    /// completed replaces the roster like a complete one, so a record that
+    /// vanished or did not parse shrinks what the node knows. The sim's
+    /// `singleton_after_peer_known` must then fail `singleton-peer-join`.
+    pub roster_installs_partial: bool,
     pub ttl_ms: u64,
     /// `lease::EXPIRY_MARGIN_MS`: a lease is usable only with this much
     /// left.
@@ -624,6 +630,7 @@ impl Config {
             root_ignores_touched: false,
             inbox_ignores_touched: false,
             abandon_skips_read_recall: false,
+            roster_installs_partial: false,
             ttl_ms,
             expiry_margin_ms: 1_000,
             idle_release_ms: 30_000,
@@ -2878,6 +2885,7 @@ impl Core {
                 issued,
             } => {
                 let foreign = write_eligible.iter().any(|n| *n != self.cfg.node_id);
+                let complete = complete || self.cfg.roster_installs_partial;
                 let read = roster::RosterRead {
                     seq,
                     write_eligible,

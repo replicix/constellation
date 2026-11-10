@@ -24,7 +24,7 @@ use super::clock::Clock;
 use super::node::Shared;
 use super::store::Bucket;
 use constellation_authority::segment::{self, Segment};
-use constellation_authority::{NodeId, Replica, Seq};
+use constellation_authority::{Event, NodeId, Replica, Seq};
 use constellation_meta::RowCommit;
 use constellation_meta::{BackupTx, LogRecord, Meta, MutateOutcome, Rid};
 use constellation_store_s3::{AckPolicy, Lease, LogStore};
@@ -36,19 +36,105 @@ use std::sync::{Arc, Mutex};
 /// `(epoch, backups, epoch hold)` of the tenure that appended a delegate's row.
 pub type AppendTenure = (u64, Vec<NodeId>, bool);
 
+/// The oracle's own copy of the roster install rule (ADR-50, S10-I1/I2):
+/// what a node's core was told about its peers, from the registry reads it
+/// was handed and the messages it received. Separate code from
+/// `core/roster.rs`; `told_table` checks the two against the same cases.
+#[derive(Debug, Default, Clone)]
+pub struct Told {
+    /// The restart this belongs to.
+    pub incarnation: u32,
+    installed: Option<u64>,
+    listed: BTreeSet<NodeId>,
+    read_only: BTreeSet<NodeId>,
+    added: BTreeSet<NodeId>,
+    incomplete: Option<u64>,
+    heard: BTreeMap<NodeId, i64>,
+    /// The first peer the core was told of since it last had none, and the
+    /// node's journal tip when it was.
+    pub flipped: Option<(NodeId, u64)>,
+}
+
+impl Told {
+    /// A registry read, as the product installs it: an older (or the same)
+    /// one is ignored, a complete one replaces the lists and drops a node
+    /// heard from only if the read was issued after its message, an
+    /// incomplete one only adds.
+    pub fn read(
+        &mut self,
+        seq: u64,
+        write_eligible: &[NodeId],
+        read_only: &[NodeId],
+        complete: bool,
+        issued: i64,
+    ) {
+        if self.installed.is_some_and(|i| seq <= i) {
+            return;
+        }
+        if complete {
+            self.installed = Some(seq);
+            self.listed = write_eligible.iter().copied().collect();
+            self.read_only = read_only.iter().copied().collect();
+            if self.incomplete.is_some_and(|i| i < seq) {
+                self.incomplete = None;
+                self.added.clear();
+            }
+            let listed = &self.listed;
+            let added = &self.added;
+            self.heard
+                .retain(|n, at| listed.contains(n) || added.contains(n) || issued <= *at);
+        } else {
+            if self.incomplete.is_some_and(|i| seq <= i) {
+                return;
+            }
+            self.incomplete = Some(seq);
+            self.added.extend(write_eligible.iter().copied());
+        }
+    }
+
+    /// A message from `from`: evidence of a writer unless the read lists it
+    /// as read-only.
+    pub fn hear(&mut self, from: NodeId, at: i64) {
+        if !self.read_only.contains(&from) {
+            self.heard.insert(from, at);
+        }
+    }
+
+    /// Some peer of `me` the core was told of, if any.
+    pub fn peer(&self, me: NodeId) -> Option<NodeId> {
+        self.listed
+            .iter()
+            .chain(self.added.iter())
+            .chain(self.heard.keys())
+            .copied()
+            .find(|n| *n != me)
+    }
+
+    fn flip(&mut self, me: NodeId, tip: u64) {
+        match (self.peer(me), self.flipped) {
+            (Some(p), None) => self.flipped = Some((p, tip)),
+            (None, Some(_)) => self.flipped = None,
+            _ => {}
+        }
+    }
+}
+
 /// Everything the oracles share in one run (`NodeEnv::oracles`).
 pub struct Oracles {
     pub bucket: Arc<Bucket>,
     /// Node id -> the node's current `Meta`, updated by every
     /// `NodeHandle::start_with` (a restart, with or without its journal).
     pub stores: Mutex<BTreeMap<NodeId, Arc<Meta>>>,
-    /// Node id -> the core's backup RTT budget and link-stability window
-    /// (ms), for the lone check.
-    pub budgets: Mutex<BTreeMap<NodeId, (u64, u64)>>,
-    /// Node id -> since when (on its wait clock) each peer link has been up
-    /// without a break, as the driver's directory last told its core
-    /// (`Event::Peers`): the stability window of a backup candidate.
-    pub directory: Mutex<BTreeMap<NodeId, BTreeMap<NodeId, i64>>>,
+    /// ADR-50, `singleton_after_peer_known`: what each node's core was
+    /// told about its peers (registry reads and the nodes it heard from),
+    /// by the oracle's own copy of the install rule ([`Told`]), kept apart
+    /// from `core/roster.rs`.
+    pub told: Mutex<BTreeMap<NodeId, Told>>,
+    /// ADR-50, `singleton_lag` (truth-based): when each node registered
+    /// (the wait clock, ms), and the lag of every `Singleton` answer given
+    /// while another node was registered: `(answerer, rid, lag_ms)`.
+    pub joined_at: Mutex<BTreeMap<NodeId, tokio::time::Instant>>,
+    pub singleton_lags: Mutex<Vec<(NodeId, Rid, i64)>>,
     /// Every answer, in emission order (the `AckLog`).
     pub acks: Mutex<Vec<AckEntry>>,
     pub identity: Mutex<IdentityLedger>,
@@ -318,8 +404,9 @@ impl Oracles {
             tables: Mutex::new(Vec::new()),
             bucket,
             stores: Mutex::new(BTreeMap::new()),
-            budgets: Mutex::new(BTreeMap::new()),
-            directory: Mutex::new(BTreeMap::new()),
+            told: Mutex::new(BTreeMap::new()),
+            joined_at: Mutex::new(BTreeMap::new()),
+            singleton_lags: Mutex::new(Vec::new()),
             acks: Mutex::new(Vec::new()),
             identity: Mutex::new(IdentityLedger::default()),
             invokes: Mutex::new(Vec::new()),
@@ -635,12 +722,8 @@ impl Oracles {
         }
     }
 
-    pub fn register(&self, id: NodeId, meta: Arc<Meta>, budget_ms: u64, stable_ms: u64) {
+    pub fn register(&self, id: NodeId, meta: Arc<Meta>) {
         self.stores.lock().unwrap().insert(id, meta);
-        self.budgets
-            .lock()
-            .unwrap()
-            .insert(id, (budget_ms, stable_ms));
     }
 
     /// `node`'s store after an event: note the tip of each continuation
@@ -669,9 +752,88 @@ impl Oracles {
             .extend(members.iter().copied());
     }
 
-    /// The links `id`'s directory reported up, with their `since` (wait ms).
-    pub fn note_directory(&self, id: NodeId, up: BTreeMap<NodeId, i64>) {
-        self.directory.lock().unwrap().insert(id, up);
+    /// A node's core is about to handle `event` (ADR-50): the oracle's own
+    /// copy of the roster install rule hears the registry reads and the
+    /// peers' messages, and notes the journal tip at which the core was
+    /// first told of a peer (`tip`). `incarnation` resets it at a restart.
+    pub fn note_told(
+        &self,
+        node: NodeId,
+        incarnation: u32,
+        event: &Event,
+        now_wait: i64,
+        tip: u64,
+    ) {
+        let mut all = self.told.lock().unwrap();
+        let told = all.entry(node).or_default();
+        if told.incarnation != incarnation {
+            *told = Told {
+                incarnation,
+                ..Told::default()
+            };
+        }
+        match event {
+            Event::Roster {
+                seq,
+                write_eligible,
+                read_only,
+                complete,
+                issued,
+                ..
+            } => told.read(*seq, write_eligible, read_only, *complete, issued.0),
+            Event::Peer { from, .. } if *from != node && *from != 0 => told.hear(*from, now_wait),
+            _ => return,
+        }
+        told.flip(node, tip);
+    }
+
+    /// Why a `Singleton` answer for the row at journal seq `jseq` of
+    /// `node`'s journal is wrong, if it is: the node's core had been told of
+    /// a peer before the row was journaled.
+    pub fn told_peer_before(&self, node: NodeId, jseq: u64) -> Option<String> {
+        let all = self.told.lock().unwrap();
+        let t = all.get(&node)?;
+        let (peer, tip) = t.flipped?;
+        (jseq > tip).then(|| {
+            format!(
+                "roster: node {node}'s core was told of peer {peer} at journal tip {tip}, \
+                 and the row at {jseq} was journaled after"
+            )
+        })
+    }
+
+    /// Whether `node`'s core has been told of a peer now.
+    pub fn told_has_peer(&self, node: NodeId) -> bool {
+        self.told
+            .lock()
+            .unwrap()
+            .get(&node)
+            .is_some_and(|t| t.flipped.is_some())
+    }
+
+    /// `node` registered (now, on the run's one simulated clock).
+    pub fn note_joined(&self, node: NodeId) {
+        self.joined_at
+            .lock()
+            .unwrap()
+            .entry(node)
+            .or_insert_with(tokio::time::Instant::now);
+    }
+
+    /// A `Singleton` answer to `rid` by `node` at `at`: how long another
+    /// registered node had been there (`singleton_lag`).
+    pub fn note_singleton_answer(&self, node: NodeId, rid: Rid) {
+        let joined = self.joined_at.lock().unwrap();
+        let now = tokio::time::Instant::now();
+        let lag = joined
+            .iter()
+            .filter(|(n, _)| **n != node)
+            .map(|(_, j)| now.saturating_duration_since(*j).as_millis() as i64)
+            .max();
+        if let Some(lag) = lag.filter(|l| *l > 0) {
+            drop(joined);
+            self.singleton_lags.lock().unwrap().push((node, rid, lag));
+        }
     }
 
     fn store(&self, id: NodeId) -> Option<Arc<Meta>> {
@@ -1272,7 +1434,6 @@ fn journal_of(meta: &Meta) -> Vec<BackupTx> {
 /// log **as they are now**, independently of the core's claim.
 pub fn committed_at_answer(
     o: &Oracles,
-    bus: &Bus,
     answerer: NodeId,
     st: &AnswererState,
     rid: Rid,
@@ -1337,7 +1498,6 @@ pub fn committed_at_answer(
     };
     let class = classify(
         o,
-        bus,
         answerer,
         st,
         (rid, want),
@@ -1382,7 +1542,7 @@ pub fn committed_at_answer(
     let expected = if tx.is_none() && class.is_none() {
         Expected::Unjournaled
     } else {
-        expected_class(o, bus, answerer, st, rid, lease.as_ref(), tx.as_ref())
+        expected_class(o, answerer, st, rid, lease.as_ref(), tx.as_ref())
     };
     Judgement {
         class,
@@ -1396,7 +1556,6 @@ pub fn committed_at_answer(
 #[allow(clippy::too_many_arguments)]
 fn classify(
     o: &Oracles,
-    bus: &Bus,
     answerer: NodeId,
     st: &AnswererState,
     (rid, want): (Rid, Option<Code>),
@@ -1530,50 +1689,16 @@ fn classify(
     if !group_is_itself {
         return None;
     }
-    if let Some(n) = peer_in_budget(o, bus, answerer) {
-        detail.push(format!("lone: peer {n} is linked within the budget"));
+    // ADR-50 (S10-I1): a singleton answer for a row journaled after the
+    // node's core was told of a peer is wrong, near or far, linked or not.
+    if let Some(why) = o.told_peer_before(answerer, tx.map_or(u64::MAX, |t| t.last)) {
+        detail.push(format!("lone: {why}"));
         return None;
     }
     // (`own_txs` only feeds T; a Lone answer needs no copy elsewhere.)
     let _ = own_txs;
-    detail.push("lone: its group is itself and no peer is within the budget".into());
+    detail.push("lone: its group is itself and its core was told of no peer".into());
     Some(Judged::Singleton)
-}
-
-/// A live node `answerer` is linked to within its RTT budget, if any, as
-/// the node can know: judged by the peer directory the core was actually
-/// given, and with no stability term. A link that has only just come up is
-/// already a peer a backup could be had from: the core waits for the archive
-/// meanwhile and never answers alone with a peer linked (i1-592), so an
-/// answer given `Lone` within the stability window of a link coming up is a
-/// violation.
-///
-/// The core's roster and links come from the driver's last poll, and the bus
-/// is ahead of them: just after a partition healed or the other nodes
-/// restarted the bus has the peer linked while the core was told roster
-/// `[self]` or the link down. A core that was told of nobody is lone by its
-/// own information (plan 43 Layer A: lone is no *known* peer in budget; the
-/// rollback risk equals a genuine lone answer's, and the roster singleton of
-/// plan 46 M2.3 removes the case). So an answerer with a directory entry
-/// counts only the peers that entry reports up; one with no entry at all was
-/// told nothing and counts every bus link (a core that was told nothing must
-/// not judge itself lone).
-fn peer_in_budget(o: &Oracles, bus: &Bus, answerer: NodeId) -> Option<NodeId> {
-    let (budget, _) = o
-        .budgets
-        .lock()
-        .unwrap()
-        .get(&answerer)
-        .copied()
-        .unwrap_or((0, 0));
-    let directory = o.directory.lock().unwrap();
-    let up = directory.get(&answerer);
-    bus.nodes().into_iter().find(|n| {
-        *n != answerer
-            && bus.linked(answerer, *n)
-            && bus.rtt(answerer, *n) <= budget
-            && up.is_none_or(|m| m.contains_key(n))
-    })
 }
 
 /// RootGroup: the lease object's holder's journal and every listed
@@ -2059,7 +2184,6 @@ impl RowVersions {
 /// table), from the answerer's state.
 fn expected_class(
     o: &Oracles,
-    bus: &Bus,
     answerer: NodeId,
     st: &AnswererState,
     rid: Rid,
@@ -2074,7 +2198,7 @@ fn expected_class(
         let holder = st.deleg_groups.iter().any(|(gen, _)| *gen == g);
         return Expected::Class(if st.non_stealable_gens.contains(&g) {
             Judged::Final
-        } else if !holder && rid.node == answerer && peer_in_budget(o, bus, answerer).is_none() {
+        } else if !holder && rid.node == answerer && !o.told_has_peer(answerer) {
             // (A lone root answering its own node's client for a row of a
             // delegate's stream it holds.)
             Judged::Singleton
@@ -2094,9 +2218,8 @@ fn expected_class(
     if !l.backups.is_empty() {
         return Expected::Class(Judged::Group);
     }
-    if peer_in_budget(o, bus, answerer).is_some() {
-        // The bring-up rule: while a backup could be had, wait for the
-        // archive.
+    if o.told_has_peer(answerer) {
+        // ADR-50: with a peer on the roster, the archive.
         return Expected::Class(Judged::Archive);
     }
     if rid.node == answerer {
@@ -3039,22 +3162,20 @@ mod tests {
     /// no stability window), an empty bus and bucket.
     struct World {
         o: Arc<Oracles>,
-        bus: Arc<Bus>,
         metas: BTreeMap<NodeId, Arc<Meta>>,
     }
 
     fn world() -> World {
         let o = Oracles::new(Bucket::new(1, (0, 0)));
-        let bus = Bus::new(1, (1, 15), 0.0);
         let mut metas = BTreeMap::new();
         for id in 1..=3u64 {
             let m = Meta::open_in_memory().expect("meta");
             m.set_node_prefix(id).expect("prefix");
             let m = Arc::new(m);
-            o.register(id, m.clone(), 50, 0);
+            o.register(id, m.clone());
             metas.insert(id, m);
         }
-        World { o, bus, metas }
+        World { o, metas }
     }
 
     impl World {
@@ -3099,7 +3220,7 @@ mod tests {
             rid: Rid,
             outcome: &MutateOutcome,
         ) -> Judgement {
-            committed_at_answer(&self.o, &self.bus, answerer, st, rid, outcome)
+            committed_at_answer(&self.o, answerer, st, rid, outcome)
         }
     }
 
@@ -4606,14 +4727,36 @@ mod tests {
         assert_eq!(j.class, Some(Judged::Group), "{}", j.detail);
     }
 
+    /// ADR-50: a `Singleton` answer is judged against what the answerer's
+    /// core was told of its peers (the oracle's own copy of the install
+    /// rule), not against the links or the RTT budget: a row journaled after
+    /// the core was told of a peer, near or far, linked or not, is no
+    /// singleton's.
     #[test]
-    fn i1_lone_needs_an_empty_group_and_no_peer_in_budget() {
+    fn i1_lone_needs_an_empty_group_and_no_peer_told() {
         let w = world();
+        let told = |seq: u64, nodes: &[u64], complete: bool, tip: u64| {
+            w.o.note_told(
+                1,
+                1,
+                &Event::Roster {
+                    seq,
+                    write_eligible: nodes.to_vec(),
+                    read_only: Vec::new(),
+                    complete,
+                    lapses: 0,
+                    issued: constellation_authority::WaitMs(0),
+                },
+                0,
+                tip,
+            )
+        };
         let own = rid(1, 1);
-        w.create(1, own, "a");
+        let a = w.create(1, own, "a");
         w.lease(1, 1, &[]);
         let st = holder_state(1);
-        // Its own client, a group of itself, nobody near: Lone.
+        told(1, &[1], true, a.last);
+        // Its own client, a group of itself, nobody told of: Lone.
         let j = w.judge(1, &st, own);
         assert_eq!(j.class, Some(Judged::Singleton), "{}", j.detail);
         // Another node's client is not answered Lone.
@@ -4622,36 +4765,19 @@ mod tests {
         let j = w.judge(1, &st, remote);
         assert_eq!(j.class, None, "{}", j.detail);
         assert_eq!(j.expected, Expected::Class(Judged::Archive));
-        // A peer linked within the budget (the node could have had a backup).
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        w.bus.attach(2, tx);
-        w.bus.set_rtt(1, 2, 5);
-        let j = w.judge(1, &st, own);
+        // The core is told of a peer at the tip of row `a`: `a` was journaled
+        // before and stays a singleton's; a row after it is not, however far
+        // the peer is and whether or not it is linked at all.
+        told(2, &[1, 2], true, a.last);
+        assert_eq!(w.judge(1, &st, own).class, Some(Judged::Singleton));
+        let own2 = rid(1, 2);
+        w.create(1, own2, "c");
+        let j = w.judge(1, &st, own2);
         assert_eq!(j.class, None, "{}", j.detail);
-        assert!(j.detail.contains("peer 2 is linked"), "{}", j.detail);
-        // A link just up is a peer too (no stability term): an answer given
-        // `Lone` within the window of a link coming up is a violation.
-        w.o.note_directory(1, [(2u64, 9_990i64)].into());
-        w.o.budgets.lock().unwrap().insert(1, (50, 200));
-        let j = w.judge(1, &st, own);
-        assert_eq!(j.class, None, "{}", j.detail);
-        assert!(j.detail.contains("peer 2 is linked"), "{}", j.detail);
-        // ... unless it is out of budget, or the link is cut.
-        w.o.budgets.lock().unwrap().insert(1, (50, 0));
-        w.bus.set_rtt(1, 2, 120);
-        assert_eq!(w.judge(1, &st, own).class, Some(Judged::Singleton));
-        w.bus.set_rtt(1, 2, 5);
-        w.bus.set_partition(1, 2, true);
-        assert_eq!(w.judge(1, &st, own).class, Some(Judged::Singleton));
-        w.bus.set_partition(1, 2, false);
-        // ... or the directory its core was given does not report the peer
-        // up (the bus is ahead of the driver's last poll: the core was told
-        // of nobody): lone by its own information. A core with no directory
-        // entry at all was told nothing and counts every link.
-        w.o.note_directory(1, BTreeMap::new());
-        assert_eq!(w.judge(1, &st, own).class, Some(Judged::Singleton));
-        w.o.directory.lock().unwrap().remove(&1);
-        assert_eq!(w.judge(1, &st, own).class, None);
+        assert!(j.detail.contains("told of peer 2"), "{}", j.detail);
+        // A peer that left (a newer complete read) makes it a singleton again.
+        told(3, &[1], true, a.last + 5);
+        assert_eq!(w.judge(1, &st, own2).class, Some(Judged::Singleton));
         // A listed backup (even one nobody can reach) makes it a group of two.
         let w2 = world();
         w2.create(1, own, "a");
@@ -4659,6 +4785,79 @@ mod tests {
         let j = w2.judge(1, &st, own);
         assert_eq!(j.class, None, "{}", j.detail);
         assert!(j.detail.contains("listed backup 2"), "{}", j.detail);
+    }
+
+    /// The oracle's copy of the install rule against the cases of
+    /// `core/roster.rs`'s unit tests (same inputs, same answers).
+    #[test]
+    fn told_table() {
+        // (steps, expected peer of node 1 after them)
+        enum S {
+            Read(u64, &'static [u64], bool, i64),
+            Hear(u64, i64),
+            ReadOnly(u64, &'static [u64], &'static [u64], i64),
+        }
+        use S::*;
+        let cases: Vec<(&str, Vec<S>, Option<u64>)> = vec![
+            ("nothing told", vec![], None),
+            ("alone", vec![Read(2, &[1], true, 2)], None),
+            ("a peer listed", vec![Read(2, &[1, 2], true, 2)], Some(2)),
+            (
+                "an older read is stale",
+                vec![Read(10, &[1, 2, 3], true, 10), Read(9, &[1], true, 9)],
+                Some(2),
+            ),
+            (
+                "the same read twice",
+                vec![Read(10, &[1], true, 10), Read(10, &[1, 2], true, 10)],
+                None,
+            ),
+            (
+                "an incomplete read only adds",
+                vec![Read(2, &[1, 2], true, 2), Read(3, &[1, 3], false, 3)],
+                Some(2),
+            ),
+            (
+                "a complete read newer than it replaces",
+                vec![
+                    Read(2, &[1, 2], true, 2),
+                    Read(3, &[1, 3], false, 3),
+                    Read(5, &[1], true, 5),
+                ],
+                None,
+            ),
+            (
+                "a node heard from",
+                vec![Read(2, &[1], true, 2), Hear(7, 20)],
+                Some(7),
+            ),
+            (
+                "a read issued before its message does not drop it",
+                vec![Hear(7, 20), Read(1, &[1], true, 1)],
+                Some(7),
+            ),
+            (
+                "a read issued after its message drops it",
+                vec![Hear(7, 20), Read(22, &[1], true, 22)],
+                None,
+            ),
+            (
+                "a read-only node is no evidence",
+                vec![ReadOnly(2, &[1], &[5], 2), Hear(5, 30)],
+                None,
+            ),
+        ];
+        for (what, steps, want) in cases {
+            let mut t = Told::default();
+            for s in steps {
+                match s {
+                    Read(seq, nodes, complete, issued) => t.read(seq, nodes, &[], complete, issued),
+                    Hear(n, at) => t.hear(n, at),
+                    ReadOnly(seq, nodes, ro, issued) => t.read(seq, nodes, ro, true, issued),
+                }
+            }
+            assert_eq!(t.peer(1), want, "{what}");
+        }
     }
 
     #[test]
