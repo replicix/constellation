@@ -397,6 +397,7 @@ pub(crate) fn put_inode_record(
         );
     }
     ns_insert(tx, ns, dirty, keys::inode(ino), record.encode())?;
+    let dirty = dirty.for_copy_of(ino);
     let single = DentryRecord::carries_copy(&record.attrs);
     let was_multi = before.is_some_and(|before| !DentryRecord::carries_copy(&before));
     if !single && was_multi {
@@ -737,6 +738,11 @@ pub(crate) enum Dirty<'a> {
         dirty: &'a SingleWriterTxKeyspace,
         local: &'a SingleWriterTxKeyspace,
         capture: Option<&'a crate::store::spec::Capture>,
+        /// How the write of this handle changes the key it touches: `None`
+        /// an exclusive write (the default), `Some` a commutative merge of
+        /// a directory (see [`crate::store::spec::MergeEntry`]). Only the
+        /// capture reads it.
+        mode: Option<crate::store::spec::MergeEntry>,
     },
 }
 
@@ -749,6 +755,7 @@ impl<'a> Dirty<'a> {
             dirty,
             local,
             capture: None,
+            mode: None,
         }
     }
 
@@ -763,6 +770,45 @@ impl<'a> Dirty<'a> {
             dirty,
             local,
             capture: Some(capture),
+            mode: None,
+        }
+    }
+
+    /// This handle for a write of an inode record that is only a
+    /// directory's commutative merge ([`crate::store::misc::touch_times_tx`],
+    /// [`crate::store::misc::bump_nlink_tx`]): the capture notes the key as
+    /// a merge of `delta`, not as an exclusive write.
+    pub(crate) fn merging(self, delta: crate::store::spec::MergeDelta) -> Self {
+        self.with_mode(Some(crate::store::spec::MergeEntry::Inode(delta)))
+    }
+
+    /// This handle for the writes that bring the dentries naming `ino` in
+    /// line with its record ([`put_inode_record`]): the attribute copy a
+    /// directory's name carries follows a merge of the inode, so it is a
+    /// merge too; after an exclusive write it is exclusive.
+    fn for_copy_of(self, ino: Ino) -> Self {
+        match self {
+            Dirty::Tracked { mode: Some(_), .. } => {
+                self.with_mode(Some(crate::store::spec::MergeEntry::Copy { ino }))
+            }
+            _ => self,
+        }
+    }
+
+    fn with_mode(self, mode: Option<crate::store::spec::MergeEntry>) -> Self {
+        match self {
+            Dirty::Tracked {
+                dirty,
+                local,
+                capture,
+                ..
+            } => Dirty::Tracked {
+                dirty,
+                local,
+                capture,
+                mode,
+            },
+            Dirty::Untracked => Dirty::Untracked,
         }
     }
 
@@ -785,6 +831,7 @@ impl<'a> Dirty<'a> {
     ) -> Result<(), MetaError> {
         if let Dirty::Tracked {
             capture: Some(capture),
+            mode,
             ..
         } = self
         {
@@ -792,6 +839,7 @@ impl<'a> Dirty<'a> {
                 let before = tx.get(ks, key)?.map(|v| v.to_vec());
                 capture.note_before(key, before);
             }
+            capture.note_write(key, mode);
         }
         Ok(())
     }

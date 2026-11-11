@@ -265,6 +265,63 @@ struct SpecRow {
     /// renumbering a segment inserted before `Local` rows causes, and keys
     /// the row's replay if it strands.
     origin: u64,
+    /// ADR-59: the keys of `before` this row wrote only by the commutative
+    /// merge of a directory, with what it merged, sorted by key. A key
+    /// that is absent was written exclusively.
+    merge: Vec<(Vec<u8>, MergeEntry)>,
+}
+
+/// ADR-59: what a transaction merged into a directory's inode record: the
+/// delta of the commutative M12 merge (`mtime`/`ctime` = `max(.., t)`,
+/// `nlink += delta`). Merges of the same key commute with each other, so
+/// the sum is all that is needed to apply a shipped transaction's share
+/// on top of an older value ([`MergeEntry::apply`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MergeDelta {
+    pub nlink: i64,
+    pub mtime_ns: Option<i64>,
+    pub ctime_ns: i64,
+}
+
+impl MergeDelta {
+    /// The merge of two merges of the same record.
+    fn combine(self, other: MergeDelta) -> MergeDelta {
+        MergeDelta {
+            nlink: self.nlink + other.nlink,
+            mtime_ns: match (self.mtime_ns, other.mtime_ns) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            },
+            ctime_ns: self.ctime_ns.max(other.ctime_ns),
+        }
+    }
+}
+
+/// ADR-59: how a transaction wrote a key it wrote only by a directory's
+/// merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum MergeEntry {
+    /// The directory's own `0x01` record.
+    Inode(MergeDelta),
+    /// The attribute copy of directory `ino` that its name in its parent
+    /// carries: a function of the merged record
+    /// (`DentryRecord::for_inode`), rewritten by the same
+    /// `ns::put_inode_record` call.
+    Copy { ino: constellation_fs_core::Ino },
+}
+
+impl MergeEntry {
+    /// The merge of two writes of one key by one transaction, `None` when
+    /// they are not the same kind of merge (the key is exclusive then).
+    fn combine(self, other: MergeEntry) -> Option<MergeEntry> {
+        match (self, other) {
+            (MergeEntry::Inode(a), MergeEntry::Inode(b)) => Some(MergeEntry::Inode(a.combine(b))),
+            (MergeEntry::Copy { ino: a }, MergeEntry::Copy { ino: b }) if a == b => {
+                Some(MergeEntry::Copy { ino: a })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// An outstanding entry's retirement/stranding parameters, without its
@@ -1043,6 +1100,16 @@ pub(crate) struct Capture {
 struct CaptureBuf {
     seen: HashSet<Vec<u8>>,
     before: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// ADR-59: per written key, what the transaction merged into it, or
+    /// `None` once any write of it was exclusive.
+    merged: HashMap<Vec<u8>, Option<MergeEntry>>,
+}
+
+/// What a finished [`Capture`] hands to the speculation row.
+#[derive(Default)]
+pub(crate) struct Captured {
+    pub before: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    pub merge: Vec<(Vec<u8>, MergeEntry)>,
 }
 
 impl Capture {
@@ -1064,8 +1131,46 @@ impl Capture {
         }
     }
 
-    pub(crate) fn into_before(self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
-        self.inner.into_inner().before
+    /// ADR-59: note one write of `key`, `mode` being what it merges
+    /// (`None`: an exclusive write). A key is a merge only while every
+    /// write of it so far was one.
+    pub(crate) fn note_write(&self, key: &[u8], mode: Option<MergeEntry>) {
+        let mut buf = self.inner.borrow_mut();
+        match buf.merged.get_mut(key) {
+            Some(slot) => {
+                *slot = match (*slot, mode) {
+                    (Some(a), Some(b)) => a.combine(b),
+                    _ => None,
+                }
+            }
+            None => {
+                buf.merged.insert(key.to_vec(), mode);
+            }
+        }
+    }
+
+    pub(crate) fn finish(self) -> Captured {
+        let buf = self.inner.into_inner();
+        let mut merge: Vec<(Vec<u8>, MergeEntry)> = buf
+            .merged
+            .into_iter()
+            .filter_map(|(k, m)| m.map(|m| (k, m)))
+            .collect();
+        merge.sort_by(|a, b| a.0.cmp(&b.0));
+        #[cfg(debug_assertions)]
+        for (key, entry) in &merge {
+            match (keys::Key::parse(key), entry) {
+                (Ok(keys::Key::Inode { .. }), MergeEntry::Inode(_)) => {}
+                (Ok(keys::Key::Dentry { .. }), MergeEntry::Copy { .. }) => {}
+                _ => {
+                    panic!("a merge of {key:?} is neither a directory's inode nor its dentry copy")
+                }
+            }
+        }
+        Captured {
+            before: buf.before,
+            merge,
+        }
     }
 }
 
@@ -1336,9 +1441,10 @@ fn record_tx(
     meta: &Meta,
     kind: SpecKind,
     records: Vec<LogRecord>,
-    before: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    captured: Captured,
     usage: (i64, i64),
 ) -> Result<u64, MetaError> {
+    let Captured { before, merge } = captured;
     let seq = next_spec_seq_tx(tx, &meta.local)?;
     let live = match &kind {
         SpecKind::Shadow {
@@ -1394,6 +1500,7 @@ fn record_tx(
             before,
             usage,
             origin: seq,
+            merge,
         },
     )?;
     Ok(seq)
@@ -1415,7 +1522,7 @@ pub(crate) fn record_local_tx(
         meta,
         SpecKind::Local { first, epoch },
         Vec::new(),
-        capture.into_before(),
+        capture.finish(),
         usage,
     )
 }
@@ -2186,7 +2293,7 @@ fn rewind_tx(
                 segment_seq: ins.segment_seq,
             },
             applied,
-            capture.into_before(),
+            capture.finish(),
             usage,
         )?;
     }
@@ -2385,7 +2492,9 @@ fn redo_row_tx(
     }
     row.usage = row_staged.raw_delta();
     staged.adjust(row.usage.0, row.usage.1);
-    row.before = capture.into_before();
+    let captured = capture.finish();
+    row.before = captured.before;
+    row.merge = captured.merge;
     // A delegation origin's row may touch more than before (its captured
     // inodes are this redo's): what it touches joins `DelegRows`.
     if let Some(LiveEntry::Local { gen, .. }) = live.get(&seq) {
@@ -2990,7 +3099,7 @@ fn insert_streamed_tx(
                     own: None,
                 },
                 applied,
-                capture.into_before(),
+                capture.finish(),
                 usage,
             )?;
         }
@@ -3958,9 +4067,12 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
 
 // ------------------------------------------------- poison isolation
 
-/// The `ns` keys a captured row touched, and the `spec_seq` it was first
+/// The `ns` keys a captured row touched and the `spec_seq` it was first
 /// recorded under.
-type RowKeysAndOrigin = Option<(Vec<Vec<u8>>, u64)>;
+pub(crate) struct RowKeys {
+    pub keys: Vec<Vec<u8>>,
+    pub origin: u64,
+}
 
 /// Plan 30 §M4 (`store::held`): the `ns` keys a captured row touched and
 /// the `spec_seq` it was first recorded under, without its values.
@@ -3968,17 +4080,42 @@ pub(crate) fn row_keys_and_origin(
     r: &impl Readable,
     meta: &Meta,
     seq: u64,
-) -> Result<RowKeysAndOrigin, MetaError> {
+) -> Result<Option<RowKeys>, MetaError> {
     match r.get(&meta.spec, seq_key(seq))? {
         Some(v) => {
             let row: SpecRow = crate::record::from_bytes_exact(&v)?;
-            Ok(Some((
-                row.before.into_iter().map(|(key, _)| key).collect(),
-                row.origin,
-            )))
+            Ok(Some(RowKeys {
+                keys: row.before.into_iter().map(|(key, _)| key).collect(),
+                origin: row.origin,
+            }))
         }
         None => Ok(None),
     }
+}
+
+/// The merge entries of a captured row (ADR-59 tests).
+#[cfg(test)]
+pub(crate) struct SpecRowView {
+    pub keys: Vec<Vec<u8>>,
+    pub merge: Vec<(Vec<u8>, MergeEntry)>,
+}
+
+#[cfg(test)]
+pub(crate) fn row_view(
+    r: &impl Readable,
+    meta: &Meta,
+    seq: u64,
+) -> Result<Option<SpecRowView>, MetaError> {
+    Ok(match r.get(&meta.spec, seq_key(seq))? {
+        Some(v) => {
+            let row = crate::record::from_bytes_exact::<SpecRow>(&v)?;
+            Some(SpecRowView {
+                keys: row.before.into_iter().map(|(k, _)| k).collect(),
+                merge: row.merge,
+            })
+        }
+        None => None,
+    })
 }
 
 /// Plan 30 §M4's `repair drop-held`: roll back the captured transactions
@@ -5028,7 +5165,7 @@ impl Meta {
         };
         let usage = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, usage.0, usage.1)?;
-        record_tx(&mut tx, self, kind, applied, capture.into_before(), usage)?;
+        record_tx(&mut tx, self, kind, applied, capture.finish(), usage)?;
         tx.commit()?;
         self.flush_held_releases();
         staged.drain_into(self.usage_tracker());
@@ -5666,7 +5803,7 @@ impl Meta {
                 self,
                 SpecKind::Foreign { segment_seq: seq },
                 applied,
-                capture.into_before(),
+                capture.finish(),
                 usage,
             )?;
             skipped
