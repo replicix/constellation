@@ -515,6 +515,8 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ("delegated-subtrees", Skip::Local(&[NODES3, COUNT])),
     ("cross-subtree-rename", Skip::Local(&[NODES3])),
     ("delegate-crash", Skip::Local(&[KILL, NODES3])),
+    ("sticky-abandon", Skip::Local(&[KILL, NODES3])),
+    ("sticky-holder-restart", Skip::Local(&[KILL, NODES3])),
     ("delegate-crash-default-ttl", Skip::Local(&[KILL, NODES3])),
     ("marker-order", Skip::Local(&[NODES3])),
     ("delegate-partition", Skip::Local(&[P2P_CUT, NODES3])),
