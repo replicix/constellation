@@ -6157,17 +6157,40 @@ impl Meta {
                 // outcome the log carried under another identity.
                 if done {
                     if let Some(r) = rid.or(refused) {
-                        if crate::store::inbox::outcome_row_tx(&tx, self, r)?
-                            == Some((bt.first, t.epoch))
+                        if let Some((first, epoch, last)) =
+                            crate::store::inbox::outcome_row_tx(&tx, self, r)?
                         {
-                            tracing::info!(
-                                epoch = t.epoch,
-                                first = bt.first,
-                                rid = ?r,
-                                "a row of the sealed tail is this node's own journal row; left in place"
-                            );
-                            report.tail_same_row += 1;
-                            continue;
+                            if (first, epoch) == (bt.first, t.epoch) {
+                                // The same (epoch, journal seq) names one row
+                                // written once; compare the records anyway, so
+                                // a tail that merely shares the name with
+                                // different content diverges instead of being
+                                // taken for the node's own row.
+                                let own: Vec<LogRecord> =
+                                    crate::store::local::journal_records(&tx, self, first, last)?
+                                        .into_iter()
+                                        .map(|(_, rec)| rec)
+                                        .collect();
+                                if own != bt.records {
+                                    return Err(MetaError::TailDiverged {
+                                        prev: t.epoch,
+                                        first: bt.first,
+                                        last: bt.last,
+                                        why: format!(
+                                            "the tail's row {first} of epoch {epoch} is not the \
+                                         journal's own row of that name"
+                                        ),
+                                    });
+                                }
+                                tracing::info!(
+                                    epoch = t.epoch,
+                                    first = bt.first,
+                                    rid = ?r,
+                                    "a row of the sealed tail is this node's own journal row; left in place"
+                                );
+                                report.tail_same_row += 1;
+                                continue;
+                            }
                         }
                     }
                 }

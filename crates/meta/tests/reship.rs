@@ -243,14 +243,10 @@ fn a_row_whose_rid_is_done_is_skipped_and_counted() {
 fn a_tail_row_that_is_the_nodes_own_journal_row_is_not_a_done_rid() {
     let meta = successor_with_an_own_row();
     let journal = meta.journal_len().unwrap();
-    let same = tx(
-        1,
-        2,
-        vec![
-            create(ROOT_INO, "own", ino(7)),
-            LogRecord::Completed { rid: rid(3, 1) },
-        ],
-    );
+    // The tail row is the journal's own row, record for record.
+    let own = meta.journal_txs_from(1, 1000).unwrap();
+    assert_eq!(own.len(), 1);
+    let same = tx(own[0].first, own[0].last, own[0].records.clone());
     assert!(meta
         .backup_append(EPOCH_PREV, std::slice::from_ref(&same))
         .is_ok());
@@ -269,6 +265,44 @@ fn a_tail_row_that_is_the_nodes_own_journal_row_is_not_a_done_rid() {
     assert_eq!((report.tail_same_row, report.tail_applied), (1, 0));
     assert_eq!(meta.journal_len().unwrap(), journal);
     assert_eq!(txs_in_journal(&meta), 1);
+}
+
+/// The same (epoch, journal seq) as the node's own row but other content is
+/// not the node's own row: the successor's takeover fails with a diverged
+/// tail instead of leaving it in place as itself.
+#[test]
+fn a_tail_row_that_only_shares_the_name_of_the_own_row_diverges() {
+    let meta = successor_with_an_own_row();
+    let own = meta.journal_txs_from(1, 1000).unwrap();
+    let mut records = own[0].records.clone();
+    // Same rid (so it is a "done" rid), another name.
+    for r in records.iter_mut() {
+        if let LogRecord::Create { name, .. } = r {
+            *name = "other".into();
+        }
+    }
+    assert_ne!(records, own[0].records, "the test did not change a record");
+    let other = tx(own[0].first, own[0].last, records);
+    assert!(meta
+        .backup_append(EPOCH_PREV, std::slice::from_ref(&other))
+        .is_ok());
+    let journal = meta.journal_len().unwrap();
+    let err = meta
+        .reship_at_takeover(
+            None,
+            Some(constellation_meta::TailArgs {
+                epoch: EPOCH_PREV,
+                through: own[0].last,
+                config_version: 3,
+                class: None,
+            }),
+        )
+        .expect_err("a tail of another content was taken for the own row");
+    assert!(
+        matches!(err, constellation_meta::MetaError::TailDiverged { .. }),
+        "{err:?}"
+    );
+    assert_eq!(meta.journal_len().unwrap(), journal);
 }
 
 /// This node's own unshipped row of the old tenure, journaled as the holder
