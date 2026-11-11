@@ -809,14 +809,14 @@ impl Core {
     /// within (`(ttl − margin) / 2`), at most 250 ms — 250 ms at the
     /// default 20 s TTL.
     pub(crate) fn lock_renew_gap_ms(&self) -> u64 {
-        ((self.lock_ttl_ms() - self.lock_margin_ms()).max(0) / 64).clamp(0, 250) as u64
+        self.dl_t().lock_renew_gap
     }
 
     /// The shortest grant worth making: its holder honours it for
     /// `ttl − margin` and renews half-way through that, so under
     /// `2 × margin` there is barely time for one renewal round trip.
     pub(crate) fn lock_min_grant_ms(&self) -> i64 {
-        (2 * self.lock_margin_ms()).min(self.lock_ttl_ms())
+        self.dl_t().lock_min_grant as i64
     }
 
     /// A restamp for a grant that changed owner (a move, a reclaim, a

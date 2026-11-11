@@ -3574,26 +3574,20 @@ impl Core {
         // has grants (and, under them, read grants a delegate gave)
         // that its successor cannot see renewed; one constant covers
         // them all.
-        let deleg = if replica.delegation_table().is_empty() {
-            0
-        } else {
-            self.reclaim_horizon_ms()
-        };
+        let delegations = !replica.delegation_table().is_empty();
+        let dl = self.dl_t();
         // Plan 43 C7-H1: the floor is a wait on this node's wait clock (a
         // forward wall step must not end it early); the cap is on it too.
-        let bound = |ttl: u64| {
-            now.wait
-                .plus(self.cfg.backup_takeover_ms + ttl + deleg + 2 * self.cfg.expiry_margin_ms)
-        };
+        let bound = |locks: bool| now.wait.plus(dl.ack_floor(locks, delegations));
         let capped = |bound: WaitMs| cap.map_or(bound, |c| bound.min(c));
         // Plan 30 §M14: lock grants are capped like read delegations and
         // marked the same way, but only new lock grants wait for them —
         // a lock grant still honoured elsewhere does not make an
         // acknowledgement stale — so their (longer) ttl is a quarantine
         // of the lock table's own.
-        let locks_bound = bound(self.cfg.read_delegation_ttl_ms.max(self.cfg.lock_ttl_ms));
+        let locks_bound = bound(true);
         let locks_until = capped(locks_bound);
-        let bound_until = bound(self.cfg.read_delegation_ttl_ms);
+        let bound_until = bound(false);
         let until = capped(bound_until);
         let floor_bound = if self.cfg.locks {
             locks_bound.max(bound_until)
@@ -5735,7 +5729,7 @@ impl Core {
     /// (187 ms at the default), well above a healthy runtime's timer
     /// jitter and a LAN's, well below a window.
     fn lag_threshold_ms(&self) -> i64 {
-        (self.cfg.backup_takeover_ms as i64 / 8).max(1)
+        self.dl_t().lag_threshold as i64
     }
 
     /// How far past a holder's last word a watch on `holder` at `epoch`
@@ -5893,7 +5887,8 @@ impl Core {
                 .max()
                 .unwrap_or(0)
         });
-        t + (2 * late).min(3 * t)
+        // (Only lapses at or past the lag threshold are recorded: positive.)
+        self.dl_t().silence_window(late as u64) as i64
     }
 
     /// Since when a watch whose holder was last heard at `last` counts

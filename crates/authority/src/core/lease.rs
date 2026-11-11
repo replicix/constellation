@@ -1211,7 +1211,7 @@ pub(crate) fn wait_end_of(lease: &Lease, cfg: &Config) -> Option<WaitMs> {
 /// one of its listed backups waits before claiming it (see
 /// `LeaseState::classify`): twice the backups' silence window.
 pub fn backup_claim_grace_ms(cfg: &Config) -> i64 {
-    2 * cfg.backup_takeover_ms as i64
+    crate::deadlines::Deadlines::new(cfg).claim_grace as i64
 }
 
 #[cfg(test)]
