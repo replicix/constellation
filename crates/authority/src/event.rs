@@ -131,8 +131,7 @@ pub enum Event {
     /// events the driver had handed to this core when it took the snapshot
     /// (read before it, never after): the core is lone on it only if no
     /// lapse of its own was handed since (`Core::backup_could_be_had`).
-    /// `issued`: the wait clock before the snapshot was taken, as for
-    /// [`Event::Roster`]. `registry_complete`: the directory behind the
+    /// `registry_complete`: the directory behind the
     /// snapshot was filled by a registry scan that read every record
     /// (live nodes of both kinds, read-only members included) after this
     /// process started, and the flag was read before the snapshot. Only
@@ -142,7 +141,6 @@ pub enum Event {
         registry_complete: bool,
         links: Vec<PeerLink>,
         lapses: u64,
-        issued: WaitMs,
     },
     /// EC2 campaign 8 A-1: this node's own S3 path, as the driver sees it
     /// (sent with every `Peers` refresh). `stalled`: no S3 request of this

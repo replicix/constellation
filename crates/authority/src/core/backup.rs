@@ -1858,7 +1858,6 @@ impl Core {
         };
         if self.lease.lost
             || self.lease.epoch_held()
-            || !self.cfg.p2p
             || lease.ack_policy != AckPolicy::Local
             || !lease.backups.is_empty()
             || self.ack.reconfig.is_some()
@@ -3896,31 +3895,34 @@ impl Core {
     }
 
     /// The peers that could back this node now, listed ones included:
-    /// linked and a peer by the roster's rule ([`Roster::link_is_peer`]: a
-    /// node linked after the last read is one, listed or not), within the RTT budget and up for the
-    /// stability window, oldest link first ([`Self::backup_candidates`]
-    /// leaves the listed ones out).
+    /// linked, listed by the roster in hand as write-eligible (a node linked
+    /// after the read is a peer for the singleton test,
+    /// [`Roster::link_is_peer`], but never a candidate until a read lists
+    /// it: it may be read-only, or a retired node's process), within the RTT
+    /// budget and up for the stability window, oldest link first
+    /// ([`Self::backup_candidates`] leaves the committed ones out).
     fn backup_peers_in_budget(&self, now: Now) -> impl Iterator<Item = NodeId> {
-        let mut eligible: Vec<(WaitMs, NodeId)> =
-            if self.cfg.backup_rtt_budget_ms == 0 || self.cfg.backups_max == 0 {
-                Vec::new()
-            } else {
-                self.roster
-                    .links()
-                    .values()
-                    .filter(|l| self.roster.link_is_peer(self.cfg.node_id, l))
-                    .filter(|l| {
-                        l.rtt_ms
-                            .is_some_and(|rtt| rtt <= self.cfg.backup_rtt_budget_ms)
+        let mut eligible: Vec<(WaitMs, NodeId)> = if self.cfg.backup_rtt_budget_ms == 0
+            || self.cfg.backups_max == 0
+        {
+            Vec::new()
+        } else {
+            self.roster
+                .links()
+                .values()
+                .filter(|l| l.node != self.cfg.node_id && l.connected && self.roster.lists(l.node))
+                .filter(|l| {
+                    l.rtt_ms
+                        .is_some_and(|rtt| rtt <= self.cfg.backup_rtt_budget_ms)
+                })
+                .filter(|l| {
+                    l.since.is_some_and(|since| {
+                        now.wait.since(since) >= self.cfg.backup_stable_ms as i64
                     })
-                    .filter(|l| {
-                        l.since.is_some_and(|since| {
-                            now.wait.since(since) >= self.cfg.backup_stable_ms as i64
-                        })
-                    })
-                    .map(|l| (l.since.unwrap_or(now.wait), l.node))
-                    .collect()
-            };
+                })
+                .map(|l| (l.since.unwrap_or(now.wait), l.node))
+                .collect()
+        };
         eligible.sort();
         eligible.into_iter().map(|(_, n)| n)
     }
@@ -4305,6 +4307,24 @@ impl Core {
             .collect();
         for n in down {
             self.drop_backup(now, n, "link down");
+        }
+        // One that a complete read shows is no longer write-eligible (it
+        // left, or is read-only) is no backup either, though its link is up
+        // and it keeps answering (a retired node's process, a read-only
+        // mount): nothing else removes it. (One whose link is down goes by
+        // the rule above.)
+        if self.roster.has_complete_read() {
+            let ineligible: Vec<NodeId> = self
+                .lease
+                .backups()
+                .iter()
+                .copied()
+                .filter(|n| !self.roster.lists(*n))
+                .filter(|n| self.roster.links().get(n).is_some_and(|l| l.connected))
+                .collect();
+            for n in ineligible {
+                self.drop_backup(now, n, "not write-eligible");
+            }
         }
     }
 

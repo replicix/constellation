@@ -21,10 +21,11 @@
 //!   unknown (unknown counts as peers) until a complete read newer than it.
 //!   So a record that is corrupt, or vanishes between the LIST and the GET,
 //!   or a read that arrives late, never shrinks what the node knows.
-//! - **The nodes heard from** (`heard`): a node that sent this one a request
-//!   since the directory last showed it, with the wait clock of its latest
-//!   message. A read or snapshot drops it only if the read was issued after
-//!   that message, for an older read may predate the node's registration.
+//! - **The nodes heard from** (`heard`): a node that sent this one a request,
+//!   with the wait clock of its latest message. Only a complete read issued
+//!   after that message, which does not list the node, drops it: an older
+//!   read may predate the node's registration, and a directory snapshot says
+//!   nothing of a link being up.
 //! - **The links** (the peer directory): reachability only. A snapshot also
 //!   counts the lapses the driver had handed this core before it took it.
 //! - **The audience**: every node that was on the roster or in the directory
@@ -168,7 +169,7 @@ impl Roster {
         true
     }
 
-    /// A directory snapshot taken at `issued`, with the lapse count the
+    /// A directory snapshot, with the lapse count the
     /// driver had handed before it, and whether a complete registry scan
     /// filled the directory behind it.
     pub(crate) fn install_links(
@@ -176,14 +177,11 @@ impl Roster {
         links: Vec<PeerLink>,
         registry_complete: bool,
         lapses: u64,
-        issued: WaitMs,
     ) {
         self.links = links.into_iter().map(|l| (l.node, l)).collect();
-        // The directory now shows every requester it knows: the links are
-        // the truth from here on.
-        let shown = &self.links;
-        self.heard
-            .retain(|n, at| !shown.contains_key(n) || issued <= *at);
+        // A heard node stays heard: a directory that shows it says nothing
+        // of its link being up or of a read listing it. Only a complete
+        // read issued after the message drops it ([`Self::install_read`]).
         self.peers_seen = true;
         self.peers_complete |= registry_complete;
         self.note_audience();
@@ -191,8 +189,7 @@ impl Roster {
     }
 
     /// A request from `node` reached this node (the one door every peer
-    /// message passes). `true` if the node was not heard from since the
-    /// directory last showed it. A node the installed read lists as
+    /// message passes). `true` if the node was not heard from already. A node the installed read lists as
     /// read-only is not evidence: it cannot take the lease over.
     pub(crate) fn note_heard(&mut self, node: NodeId, at: WaitMs) -> bool {
         if self.read_only.contains(&node) {
@@ -224,6 +221,11 @@ impl Roster {
     /// registered).
     pub(crate) fn write_eligible(&self) -> &[NodeId] {
         &self.write_eligible
+    }
+
+    /// A complete registry read is installed.
+    pub(crate) fn has_complete_read(&self) -> bool {
+        self.installed.is_some()
     }
 
     /// The write-eligible nodes other than `me`.
@@ -469,7 +471,7 @@ mod tests {
     #[test]
     fn a_read_that_could_not_be_completed_only_adds() {
         let mut r = Roster::new();
-        r.install_links(vec![], true, 0, w(1));
+        r.install_links(vec![], true, 0);
         assert!(r.install_read(read(2, &[1, 2], true)));
         assert!(!r.peers_unknown());
         // The scan lost the record of node 2 and found a new node 3.
@@ -488,7 +490,7 @@ mod tests {
     #[test]
     fn a_complete_read_older_than_an_incomplete_one_does_not_end_the_unknown() {
         let mut r = Roster::new();
-        r.install_links(vec![], true, 0, w(1));
+        r.install_links(vec![], true, 0);
         assert!(r.install_read(read(2, &[1], true)));
         assert!(r.install_read(read(4, &[1, 3], false)));
         // Reordered: the complete read numbered 3 arrives after the
@@ -508,16 +510,16 @@ mod tests {
     #[test]
     fn a_lapse_makes_the_peers_unknown_until_a_snapshot_taken_after_it() {
         let mut r = Roster::new();
-        r.install_links(vec![], true, 0, w(1));
+        r.install_links(vec![], true, 0);
         assert!(!r.peers_unknown());
         r.note_lapse();
         assert!(r.peers_unknown());
-        r.install_links(vec![], true, 0, w(2));
+        r.install_links(vec![], true, 0);
         assert!(
             r.peers_unknown(),
             "a snapshot read before the lapse was handed"
         );
-        r.install_links(vec![], true, 1, w(3));
+        r.install_links(vec![], true, 1);
         assert!(!r.peers_unknown());
     }
 
@@ -533,15 +535,34 @@ mod tests {
         assert!(!r.has_heard(), "a read issued after it, not listing it");
         r.note_heard(8, w(30));
         r.install_read(read(40, &[1, 8], true));
-        assert!(
-            r.has_heard(),
-            "a listed node stays heard until the directory shows it"
-        );
-        r.install_links(vec![link(8)], false, 0, w(41));
-        assert!(!r.has_heard(), "the directory shows it");
+        assert!(r.has_heard(), "a read that lists it does not drop it");
+        r.install_links(vec![link(8)], false, 0);
+        assert!(r.has_heard(), "the directory showing it drops nothing");
         r.note_heard(9, w(50));
-        r.install_links(vec![link(9)], false, 0, w(49));
-        assert!(r.has_heard(), "a snapshot taken before its message");
+        r.install_read(read(49, &[1], true));
+        assert!(r.has_heard(), "a read issued before its message");
+    }
+
+    /// ADR-50 S10-I1: a joiner heard through the inbox, shown by a snapshot
+    /// with its link down, and listed by no read yet, is still a peer.
+    #[test]
+    fn a_heard_node_the_directory_shows_with_its_link_down_keeps_the_root_from_a_singleton() {
+        let mut r = Roster::new();
+        r.install_links(vec![], true, 0);
+        assert!(r.install_read(read(2, &[1], true)));
+        assert!(r.singleton(1));
+        assert!(r.note_heard(7, w(10)));
+        assert!(!r.singleton(1), "heard");
+        let mut down = link(7);
+        down.connected = false;
+        r.install_links(vec![down], true, 0);
+        assert!(!r.singleton(1), "shown with its link down, still a peer");
+        // A read issued before the message does not end it either.
+        assert!(r.install_read(read(5, &[1], true)));
+        assert!(!r.singleton(1));
+        // Only a complete read issued after it, not listing it, does.
+        assert!(r.install_read(read(11, &[1], true)));
+        assert!(r.singleton(1));
     }
 
     #[test]
@@ -549,15 +570,15 @@ mod tests {
         let mut r = Roster::new();
         r.install_read(read(1, &[1, 2], true));
         assert!(r.audience(1).is_none(), "no snapshot yet");
-        r.install_links(vec![link(3)], false, 0, w(2));
+        r.install_links(vec![link(3)], false, 0);
         assert!(r.audience(1).is_none(), "the snapshot was not complete");
-        r.install_links(vec![link(3), link(4)], true, 0, w(3));
+        r.install_links(vec![link(3), link(4)], true, 0);
         assert_eq!(r.audience(1).unwrap(), BTreeSet::from([2, 3, 4]));
         // A later scan that lost a record cannot shrink it.
         r.install_read(read(4, &[1], true));
-        r.install_links(vec![link(3)], false, 0, w(5));
+        r.install_links(vec![link(3)], false, 0);
         assert_eq!(r.audience(1).unwrap(), BTreeSet::from([2, 3, 4]));
-        r.install_links(vec![link(3), link(5)], true, 0, w(6));
+        r.install_links(vec![link(3), link(5)], true, 0);
         assert_eq!(r.audience(1).unwrap(), BTreeSet::from([2, 3, 4, 5]));
     }
 
@@ -575,7 +596,7 @@ mod tests {
     #[test]
     fn a_node_is_a_singleton_only_when_every_input_says_alone() {
         let mut r = Roster::new();
-        r.install_links(vec![], true, 0, w(1));
+        r.install_links(vec![], true, 0);
         assert!(!r.singleton(1), "no read yet");
         assert!(r.install_read(read(2, &[1], true)));
         assert!(r.singleton(1));
@@ -595,7 +616,7 @@ mod tests {
         r.clear_heard_for_test();
         assert!(r.singleton(1));
         // A connected link to a node the read does not list as read-only.
-        r.install_links(vec![link(5)], true, 0, w(7));
+        r.install_links(vec![link(5)], true, 0);
         assert!(!r.singleton(1));
         assert!(r.install_read(RosterRead {
             read_only: vec![5],

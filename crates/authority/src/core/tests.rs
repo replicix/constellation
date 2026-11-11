@@ -139,7 +139,6 @@ impl Harness {
                     })
                     .collect(),
                 lapses: 0,
-                issued: WaitMs(i64::MAX),
             },
             &meta,
         );
@@ -4087,7 +4086,6 @@ fn pair() -> (Harness, Harness) {
             })
             .collect(),
         lapses: 0,
-        issued: WaitMs(i64::MAX),
     });
     requester.core.lease.cached_holder = Some(1);
     requester.meta.session().set_budget_ms(20);
@@ -7287,7 +7285,6 @@ mod own_chunks {
                         })
                         .collect(),
                     lapses: 0,
-                    issued: WaitMs(i64::MAX),
                 });
                 requester.core.lease.cached_holder = Some(1);
                 let drain = timers(&out, TimerKind::ReplayDrain)[0];
@@ -7643,7 +7640,6 @@ fn stream_pair() -> (Harness, Harness, OpId) {
         registry_complete: true,
         links: Vec::new(),
         lapses: 0,
-        issued: WaitMs(i64::MAX),
     });
     let sent = sends(&out);
     let [(1, PeerMsg::LogSubscribe { req, from })] = sent.as_slice() else {
@@ -8496,7 +8492,6 @@ fn serving_follows_the_lease() {
         registry_complete: true,
         links: Vec::new(),
         lapses: 0,
-        issued: WaitMs(i64::MAX),
     });
     assert!(sends(&out).iter().any(|(to, m)| *to == 2
         && matches!(m, PeerMsg::LogStreamEnd { req: r, refused: false } if *r == req)));
@@ -8541,7 +8536,6 @@ fn a_parked_holder_is_asked_again_once_a_hint_shows_the_log_moved() {
         registry_complete: true,
         links: Vec::new(),
         lapses: 0,
-        issued: WaitMs(i64::MAX),
     });
     assert_eq!(subscribes(&out), 0, "asked a parked holder again: {out:?}");
     // The holder shipped its next segment (the flush): the hint names it.
@@ -8570,7 +8564,6 @@ fn a_lone_node_never_subscribes() {
         registry_complete: true,
         links: Vec::new(),
         lapses: 0,
-        issued: WaitMs(i64::MAX),
     });
     assert!(sends(&out).is_empty());
     solo.core.lease.released();
@@ -8579,7 +8572,6 @@ fn a_lone_node_never_subscribes() {
         registry_complete: true,
         links: Vec::new(),
         lapses: 0,
-        issued: WaitMs(i64::MAX),
     });
     assert!(sends(&out).is_empty(), "subscribed to itself: {out:?}");
 }
@@ -11018,7 +11010,6 @@ mod epoch_rules {
                 since: Some(WaitMs(0)),
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let rid = h.rid(1);
         let op = h.create("a");
@@ -11073,7 +11064,6 @@ mod epoch_rules {
                     since: Some(WaitMs(0)),
                 }],
                 lapses: 0,
-                issued: WaitMs(i64::MAX),
             });
             let rid = h.rid(1);
             let op = h.create("a");
@@ -13066,7 +13056,6 @@ mod pipelined_appends {
             registry_complete: true,
             links: vec![link(2, 0), link(3, 1)],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         journal(&h, "a", 1);
         journaled(&mut h, 900);
@@ -13093,7 +13082,6 @@ mod pipelined_appends {
                     registry_complete: true,
                     links: vec![link(2, 0), link(3, 1)],
                     lapses: 0,
-                    issued: WaitMs(i64::MAX),
                 });
             }
             if h.core.ack.candidate != current {
@@ -13901,7 +13889,6 @@ mod m10 {
             registry_complete: true,
             links: Vec::new(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         assert!(s3_ops(&out).is_empty(), "{out:?}");
     }
@@ -13916,7 +13903,6 @@ mod m10 {
             registry_complete: true,
             links: Vec::new(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let puts = s3_ops(&out)
             .iter()
@@ -13935,7 +13921,6 @@ mod m10 {
             registry_complete: true,
             links: Vec::new(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         assert!(
             !s3_ops(&out)
@@ -13955,7 +13940,6 @@ mod m10 {
                 since: None,
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         h.seen_expired(&lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers {
@@ -13968,7 +13952,6 @@ mod m10 {
                 since: None,
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         assert!(s3_ops(&out).is_empty(), "{out:?}");
         // f = 0: never on its own.
@@ -13978,7 +13961,6 @@ mod m10 {
             registry_complete: true,
             links: Vec::new(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         assert!(s3_ops(&out).is_empty(), "{out:?}");
     }
@@ -14161,7 +14143,6 @@ mod m10 {
                 since: None,
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         h.core.lease.cached_holder = Some(1);
         let expires = h.now.plus(10_000).0;
@@ -15195,7 +15176,6 @@ mod backup_crash {
                 since: Some(since),
             }],
             lapses,
-            issued: WaitMs(i64::MAX),
         })
     }
 
@@ -15393,8 +15373,9 @@ mod backup_crash {
     /// entered the roster in hand. A link up after the roster was read is a
     /// peer the roster cannot speak for: the holder is not lone, acks
     /// nothing on its disk alone, and the node is a backup candidate. A link
-    /// up before the read that the read does not list is no peer. (Fails
-    /// before: `Lone`, `None`, no candidate.)
+    /// up before the read that the read does not list is no peer. It is no
+    /// backup candidate until a read lists it. (Fails before: `Lone`,
+    /// `None`.)
     #[test]
     fn a_link_up_after_the_roster_read_is_a_peer_the_roster_does_not_list() {
         let pos = pos_5();
@@ -15417,9 +15398,10 @@ mod backup_crash {
             RowCommit::LONE
         );
         assert!(!h.core.root_lone());
-        // Once stable it is a backup candidate too.
+        // Once stable it is still no backup candidate: no read lists it (it
+        // may be read-only, or a retired node's process).
         h.advance(300);
-        assert_eq!(h.core.backup_candidates(h.clk()), vec![2]);
+        assert!(h.core.backup_candidates(h.clk()).is_empty());
         // A read issued after the link that does not list it: no peer.
         h.advance(10);
         h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
@@ -15548,6 +15530,35 @@ mod backup_crash {
             acked_seqs: Vec::new(),
         });
         settle_singleton(&mut h);
+        assert!(h.core.root_lone());
+    }
+
+    /// ADR-50 (S2): a root with P2P off that claimed across a lapse (so the
+    /// claim stamped no singleton) returns to the singleton's configuration
+    /// at the next read, as one with P2P on does; before, it waited for the
+    /// archive on every operation for its whole tenure.
+    #[test]
+    fn a_p2p_off_root_claimed_after_a_lapse_returns_to_the_singleton_after_the_next_read() {
+        let pos = pos_5();
+        let mut h = Harness::new(1);
+        h.core.cfg.p2p = false;
+        h.step(roster_ev(vec![1], w(h.now)));
+        own_lapse(&mut h, 1);
+        h.hold(1, None);
+        h.core.lease.held.as_mut().unwrap().0.singleton = false;
+        assert!(!h.core.root_lone(), "the read predates the lapse");
+        h.advance(100);
+        h.step(Event::Roster {
+            seq: next_roster_seq(),
+            write_eligible: vec![1],
+            read_only: Vec::new(),
+            complete: true,
+            lapses: 1,
+            issued: w(h.now),
+        });
+        settle_singleton(&mut h);
+        assert!(h.core.lease.held.as_ref().unwrap().0.singleton);
+        assert_eq!(h.core.ack_need(&pos), None);
         assert!(h.core.root_lone());
     }
 
@@ -15963,7 +15974,6 @@ mod backup_crash {
                 since: Some(WaitMs(0)),
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let listed = backup_lease(1, 1, h.now.plus(10_000).0, vec![2]);
         h.core.lease.adopt(h.clk(), listed, tag(), None);
@@ -15980,7 +15990,6 @@ mod backup_crash {
                 since: Some(WaitMs(0)),
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         // The removal of node 2 lands.
         let mut out = Vec::new();
@@ -16007,6 +16016,60 @@ mod backup_crash {
             h.core.root_commit(Asker::Own).versionless(),
             RowCommit::LONE
         );
+    }
+
+    /// ADR-50 S10-I1: a node that messaged the root is a peer until a
+    /// complete read issued after its message lists the cluster without it.
+    /// A directory snapshot that shows it with its link down is no such
+    /// read. (Fails before: the snapshot dropped the heard node and the
+    /// root was a singleton again.)
+    #[test]
+    fn a_directory_snapshot_does_not_end_the_evidence_of_a_node_that_messaged() {
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1]);
+        h.step(roster_ev(vec![1], w(h.now)));
+        h.hold(1, None);
+        link_2(&mut h, false, None, 0);
+        assert!(h.core.singleton_now(), "alone before node 2 asks");
+        h.advance(10);
+        let clk = h.clk();
+        h.core.note_heard(clk, 2, &h.meta);
+        assert!(!h.core.singleton_now(), "heard");
+        h.advance(10);
+        link_2(&mut h, false, None, 0);
+        assert!(!h.core.singleton_now(), "shown with its link down");
+        // A read issued after its message that does not list it ends it.
+        h.advance(10);
+        h.step(roster_ev(vec![1], w(h.now)));
+        assert!(h.core.singleton_now());
+    }
+
+    /// ADR-50 (S1): a committed backup that a later complete read omits, or
+    /// lists as read-only, is removed even while it keeps answering; a read
+    /// that lists it leaves it be. (Fails before: nothing removes it.)
+    #[test]
+    fn a_backup_a_complete_read_shows_ineligible_is_removed() {
+        for (listed, read_only, removed) in [
+            (vec![1, 2], vec![], false),
+            (vec![1], vec![], true),
+            (vec![1], vec![2], true),
+        ] {
+            let mut h = Harness::new(1);
+            backup_node(&mut h, vec![1, 2]);
+            link_2(&mut h, true, Some(5), 5_000);
+            let lease = backup_lease(1, 1, h.now.plus(10_000).0, vec![2]);
+            h.core.lease.adopt(h.clk(), lease, tag(), None);
+            h.meta.set_holder_epoch(1);
+            h.advance(10);
+            let out = h.step(roster_ro_ev(listed.clone(), read_only.clone(), w(h.now)));
+            let swapped = s3_ops(&out)
+                .into_iter()
+                .any(|(_, r)| matches!(r, S3Op::LeaseSwap { .. }));
+            assert_eq!(
+                swapped, removed,
+                "read lists {listed:?}, read-only {read_only:?}"
+            );
+        }
     }
 
     /// Plan 43 C7-F F-a0 (the ack side of the review's F1): a `Local`
@@ -16504,7 +16567,6 @@ mod backup_crash {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         requester.core.lease.cached_holder = Some(1);
         let drain = timers(&out, TimerKind::ReplayDrain)[0];
@@ -16773,7 +16835,6 @@ mod backup_crash {
                     since: None,
                 }],
                 lapses: 0,
-                issued: WaitMs(i64::MAX),
             };
             h.step(links(false));
             let watch = timers(&out, TimerKind::BackupWatch)[0];
@@ -24146,7 +24207,6 @@ mod locks {
                 since: None,
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let (t0, g2, tick) = node_3_parked_behind_node_2(&mut h, ino);
         let base = ask_wait(&h);
@@ -24987,7 +25047,6 @@ mod locks {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         r
     }
@@ -26553,7 +26612,6 @@ mod locks {
                     })
                     .collect(),
                 lapses: 0,
-                issued: WaitMs(i64::MAX),
             },
             &r.meta,
         );
@@ -28299,7 +28357,6 @@ mod locks {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let lock = |r: &mut Harness, op: u64, ino: Ino| {
             r.step(Event::Control {
@@ -28382,7 +28439,6 @@ mod locks {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let lock = |r: &mut Harness, op: u64, ino: Ino| {
             r.step(Event::Control {
@@ -28509,7 +28565,6 @@ mod locks {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let lock = |r: &mut Harness, op: u64, ino: Ino| {
             r.step(Event::Control {
@@ -28580,7 +28635,6 @@ mod locks {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let lock = |r: &mut Harness, op: u64, ino: Ino| {
             r.step(Event::Control {
@@ -34565,7 +34619,6 @@ fn a_write_into_a_fresh_delegation_is_recalled_until_the_root_sees_the_delegate(
                     })
                     .collect(),
                 lapses: 0,
-                issued: WaitMs(i64::MAX),
             });
         }
         h.advance(10);
@@ -34673,7 +34726,6 @@ mod s3_no_loops {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let gen = h.meta.delegation_table().get(dir).expect("delegated").gen;
         (h, dir, gen)
@@ -35356,7 +35408,6 @@ mod s3_no_loops {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         h.advance(100);
         let out = forward(&mut h, 3, 8, dir, false);
@@ -35963,7 +36014,6 @@ fn a_wanter_across_a_p2p_partition_does_not_take_the_lease_from_its_users() {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
     }
     /// Run one round from the poll timer; whether it released the lease.
@@ -36987,7 +37037,6 @@ fn a_candidate_that_sealed_the_epoch_is_not_reinvited() {
             since: Some(WaitMs(h.now.0 - 60_000)),
         }],
         lapses: 0,
-        issued: WaitMs(i64::MAX),
     });
     h.hold(1, None);
     let mut invited = 0;
@@ -37092,7 +37141,6 @@ fn an_inbox_op_is_forwarded_once_the_holder_is_reachable() {
             since: Some(w(h.now)),
         }],
         lapses: 0,
-        issued: WaitMs(i64::MAX),
     });
     let id = h.core.inbox.recheck_timer.expect("a recheck armed");
     h.advance(1_100);
@@ -37171,7 +37219,6 @@ fn a_flapping_p2p_link_never_polls_an_idle_requester_faster_than_its_backoff() {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
     }
     /// Two minutes, every link down for 5 s out of every 10 s (a ping
@@ -37303,7 +37350,6 @@ fn an_inbox_poll_is_one_get_until_it_hits() {
             since: None,
         }],
         lapses: 0,
-        issued: WaitMs(i64::MAX),
     });
     let full = h.core.cfg.inbox_poll_width;
     assert!(full > 1);
@@ -37368,7 +37414,6 @@ fn an_inbox_poll_landing_in_a_release_journals_nothing() {
             since: None,
         }],
         lapses: 0,
-        issued: WaitMs(i64::MAX),
     });
     let poll = |out: &[Action]| {
         s3_ops(out).into_iter().find_map(|(op, r)| match r {
@@ -37558,7 +37603,6 @@ fn a_holder_steps_past_a_withdrawn_batch_to_the_requesters_next_one() {
             since: None,
         }],
         lapses: 0,
-        issued: WaitMs(i64::MAX),
     });
     let poll = |out: &[Action]| {
         s3_ops(out).into_iter().find_map(|(op, r)| match r {
@@ -39032,7 +39076,6 @@ fn placement_re_reads_the_roster_for_a_connected_writer_it_does_not_list() {
             since: Some(w(h.now)),
         }],
         lapses: 0,
-        issued: WaitMs(i64::MAX),
     });
     for _ in 0..40 {
         h.core.place_note(2, [dir]);
@@ -39251,7 +39294,6 @@ fn a_restarted_delegate_readopts_its_delegation_at_start() {
         registry_complete: true,
         links: Vec::new(),
         lapses: 0,
-        issued: WaitMs(i64::MAX),
     });
     // A write under the subtree executes here, as the delegate.
     let rid = h.rid(1);
@@ -40231,7 +40273,6 @@ mod redelegated_to_the_requester {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
         let f = h.meta.allocate_ino(dir).unwrap();
@@ -40513,7 +40554,6 @@ mod delegated_lock_dead_end {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let dir: Ino = h.meta.allocate_ino(ROOT_INO).unwrap();
         let f: Ino = h.meta.allocate_ino(dir).unwrap();
@@ -45846,7 +45886,6 @@ mod deleg_group {
                 since: Some(WaitMs(0)),
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
     }
 
@@ -46401,7 +46440,6 @@ mod deleg_group {
                 since: Some(since),
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         assert!(h.core.backup_candidates(h.clk()).is_empty(), "no candidate");
         assert_eq!(
@@ -47232,7 +47270,6 @@ mod deleg_group {
                 since: Some(WaitMs(0)),
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         assert_eq!(
             h.meta.session().deleg_row_class(7),
@@ -47269,7 +47306,6 @@ mod deleg_group {
                 },
             ],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let mut out = Vec::new();
         h.core.deleg_after_event(h.clk(), &h.meta, &mut out);
@@ -48114,6 +48150,8 @@ mod deleg_group {
         };
         h.core.lease.adopt(h.clk(), lease, tag(), None);
         h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
+        // Its backup is on the roster, as a listed backup is.
+        h.core.roster.set_write_eligible_for_test(vec![1, 2]);
         let now = w(h.now);
         h.core.ack.peers.insert(
             2,
@@ -48146,7 +48184,6 @@ mod deleg_group {
                 since: Some(WaitMs(0)),
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
         h
@@ -51747,7 +51784,6 @@ mod deleg_windows_tests {
                 since: Some(heard),
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let ask = |h: &mut Harness, op: u64, force: bool| {
             let out = h.step(Event::Control {
@@ -51792,7 +51828,6 @@ mod deleg_windows_tests {
                 since: None,
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         assert_eq!(
             h.core.deleg_view().waiting[0].members[0].heard_ms,
@@ -56254,7 +56289,6 @@ mod deleg_root_read {
                 registry_complete: true,
                 links: Vec::new(),
                 lapses: 0,
-                issued: WaitMs(i64::MAX),
             });
             queue.extend(reads(&out));
             issued += reads(&out).len();
@@ -58176,7 +58210,6 @@ mod c2g_settle {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         })
     }
 
@@ -61988,7 +62021,7 @@ mod m11_step5 {
         fn roster_read(h: &mut Harness, nodes: Vec<NodeId>, issued: WaitMs) {
             h.step(roster_ev(nodes, issued));
         }
-        fn peers_read(h: &mut Harness, issued: WaitMs) {
+        fn peers_read(h: &mut Harness) {
             h.step(Event::Peers {
                 registry_complete: true,
                 links: vec![crate::event::PeerLink {
@@ -61999,7 +62032,6 @@ mod m11_step5 {
                     since: None,
                 }],
                 lapses: 0,
-                issued,
             });
         }
         let mut h = Harness::new(1);
@@ -62039,7 +62071,7 @@ mod m11_step5 {
         super::land_reconfig(&mut h);
         // The reads were issued before the request, delivered after it.
         roster_read(&mut h, vec![1], before);
-        peers_read(&mut h, before);
+        peers_read(&mut h);
         // The selection pass runs on the next activity: it must not lower
         // the test and bump back to a singleton with the peer live.
         h.advance(400);
@@ -63302,7 +63334,6 @@ mod step9_one_stream_per_node {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         (h, d1, d2)
     }
@@ -63601,7 +63632,6 @@ mod step9_one_stream_per_node {
                 since: Some(w(h.now)),
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
     }
 
@@ -63700,7 +63730,6 @@ mod step9_one_stream_per_node {
             registry_complete: true,
             links: vec![],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         h.advance(10);
         link_to_2(&mut h, Some(900));
@@ -63880,7 +63909,6 @@ mod step9_one_stream_per_node {
                 since: Some(w(h.now)),
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         // Node 2 holds `w1` as a designation.
         let mut out = Vec::new();
@@ -64081,7 +64109,6 @@ mod step9_one_stream_per_node {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         (h, d1, d2)
     }
@@ -65889,7 +65916,6 @@ mod step4_sticky {
                 since: Some(w(h.now)),
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let mut out = Vec::new();
         let gen = h
@@ -66263,7 +66289,6 @@ mod step4_sticky {
                 since: Some(w(h.now)),
             }],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         // This cluster is nodes 1 to 3: the harness's first directory
         // (2 to 4) is not part of it.
@@ -66360,7 +66385,6 @@ mod step4_sticky {
             registry_complete: true,
             links: Vec::new(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         assert!(answer_of(&out, 910).is_none(), "{out:?}");
         assert!(!h.core.dl.gens[&gen].ended);
@@ -66786,7 +66810,6 @@ mod step4_sticky {
             registry_complete: true,
             links: Vec::new(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         assert!(h.core.void_audience().unwrap().contains(&9));
         assert!(ask(&mut h, 9).is_some(), "the audience shrank");
@@ -67286,7 +67309,6 @@ mod step5_sticky_release {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let (dir, rec) = mkdir(&h, "a");
         let records = vec![
@@ -67498,7 +67520,6 @@ mod step5_sticky_release {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         }
     }
 
@@ -68382,7 +68403,6 @@ mod step5_sticky_release {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         (r, out)
     }
@@ -68472,7 +68492,6 @@ mod step5_sticky_release {
             registry_complete: true,
             links: Vec::new(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         assert_eq!(r.core.dl.mine[&7].executed, 0);
         r.advance(1);
@@ -69048,7 +69067,6 @@ mod step5_sticky_release {
             registry_complete: true,
             links: Vec::new(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         assert_eq!(r.core.dl.mine[&7].executed, 0);
         r.advance(1);
@@ -69093,7 +69111,6 @@ mod step5_sticky_release {
             registry_complete: false,
             links: vec![link(2), link(4)],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         assert!(restart_void_reqs(&out).is_empty(), "{out:?}");
         assert_eq!(r.core.dl.mine[&7].executed, 0);
@@ -69103,7 +69120,6 @@ mod step5_sticky_release {
             registry_complete: true,
             links: vec![link(2), link(4), link(9)],
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
         let asked = restart_void_reqs(&out);
         assert_eq!(
@@ -69150,7 +69166,6 @@ mod step5_sticky_release {
                 registry_complete: true,
                 links,
                 lapses: 0,
-                issued: WaitMs(i64::MAX),
             });
             assert!(restart_void_reqs(&out).is_empty(), "no roster yet: {out:?}");
         }
@@ -71577,7 +71592,6 @@ mod route_fence_root {
             registry_complete: true,
             links,
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         })
     }
 
@@ -72056,7 +72070,6 @@ mod route_fence_root {
                     })
                     .collect(),
                 lapses: 0,
-                issued: WaitMs(i64::MAX),
             });
             let rid = h.rid(1);
             if inbox_ever {
