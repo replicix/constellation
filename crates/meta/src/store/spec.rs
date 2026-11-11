@@ -1705,6 +1705,12 @@ fn strand_local_tx(
         if strand.recall || strand.superseded {
             return Ok(Stranding::Dropped);
         }
+        // The row was acknowledged to its requester by the delegate, and its
+        // effect has just left the namespace while the log lacks it: reads of
+        // its keys wait for the successor's re-ship, as for a member copy row
+        // (`Meta::member_copy_touches`), until the generation's copy is
+        // cleared or the hold's age cap lapses.
+        let hold = strand.hold.then(|| crate::KeySet::from_records(&records));
         super::backup::deleg_member_copy_put_tx(
             tx,
             meta,
@@ -1716,6 +1722,9 @@ fn strand_local_tx(
                 deps: row.deps,
             },
         )?;
+        if let Some(keys) = hold {
+            meta.hold_copy_row(super::backup::deleg_epoch(row.gen), row.idx, keys);
+        }
         return Ok(Stranding::DelegMember);
     }
     // Plan 43 C1-4 (§5.2 item 2, §5.6): a row this node's client was told
