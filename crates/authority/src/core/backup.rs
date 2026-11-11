@@ -608,17 +608,14 @@ pub(crate) struct AckState {
     /// The configuration of the held lease as of the last
     /// [`Core::sync_cfg_spans`].
     pub(crate) cfg_seen: Option<CfgSeen>,
-    /// Plan 46 M1.4 step 6a (ADR-53): where the tenure started, when it
-    /// started with no configuration seen (the lease let go and taken
-    /// again): the lease's `config_version` and the journal's tip then.
-    /// A gated row at or below the tip, journaled under an older version,
-    /// is an earlier tenure's: the archive alone commits it
+    /// Plan 46 M1.4 step 6a (ADR-53): where this tenure started: the held
+    /// lease's `config_version` and the journal's tip when it was first seen
+    /// (a first tenure of the process, a re-take after the lease was let go,
+    /// a lease of another epoch). A gated row at or below the tip,
+    /// journaled under an older version, is an earlier tenure's: its group's
+    /// acks do not survive the gap, so the archive alone commits it
     /// ([`Core::unsettled_root_row`]).
     pub(crate) tenure_start: Option<(u64, u64)>,
-    /// A tenure that held a configuration ended (the lease was let go or
-    /// lost): the next tenure to start is a resumed one
-    /// ([`Core::span_earlier_rows`]), not the process's first.
-    pub(crate) tenure_gap: bool,
     /// The journal's tip at the event in which the singleton test turned
     /// against a lease that still says singleton: rows past it are not
     /// answered alone (the archive rule), though the lease's bump has not
@@ -1597,12 +1594,9 @@ impl Core {
     pub(crate) fn sync_cfg_spans(&mut self, replica: &dyn Replica) {
         let cur = self.lease_cfg();
         match (cur, self.ack.cfg_seen.take()) {
-            (None, seen) => {
+            (None, _) => {
                 self.ack.spans.clear();
                 self.ack.tenure_start = None;
-                // A tenure that held a configuration has ended: the next
-                // one is a resumed tenure, not the process's first.
-                self.ack.tenure_gap |= seen.is_some();
             }
             (Some(c), Some(seen)) if seen.epoch == c.epoch => {
                 if seen != c {
@@ -1640,15 +1634,18 @@ impl Core {
                 self.ack.flip_tip = None;
                 self.ack.cfg_seen = Some(c);
             }
-            (Some(c), seen) => {
+            (Some(c), _) => {
                 self.ack.spans.clear();
                 self.ack.flip_tip = None;
-                if seen.is_none()
-                    && std::mem::take(&mut self.ack.tenure_gap)
-                    && !self.cfg.resumed_span_dropped
-                {
-                    self.span_earlier_rows(replica);
-                }
+                // A tenure starts: the lease was not held before (the
+                // process's first, or let go and taken again) or is of
+                // another epoch. Whatever the journal holds from before is
+                // an earlier tenure's.
+                self.ack.tenure_start = self
+                    .lease
+                    .held
+                    .as_ref()
+                    .map(|(l, _)| (l.config_version, replica.journal_tip()));
                 self.ack.cfg_seen = Some(c);
             }
         }
@@ -1659,32 +1656,6 @@ impl Core {
                 .into_iter()
                 .filter(|s| self.cfg_span_cap(s).is_some())
                 .collect();
-        }
-    }
-
-    /// Plan 46 M1.4 step 6a (ADR-53): a resumed tenure starts with no
-    /// configuration seen (the lease a continuation epoch's close let go, or
-    /// a lapse ended the node's last one). Rows the journal still holds
-    /// unshipped under an older configuration keep that configuration's
-    /// rule: a span ending at the last of them makes the archive, not the
-    /// resumed tenure's own rule, commit them. Nothing is pushed when
-    /// another tenure rolled the journal back (no such row is left).
-    fn span_earlier_rows(&mut self, replica: &dyn Replica) {
-        let Some(version) = self.lease.held.as_ref().map(|(l, _)| l.config_version) else {
-            return;
-        };
-        let tip = replica.journal_tip();
-        self.ack.tenure_start = Some((version, tip));
-        if tip <= self.ack.shipped_through {
-            return;
-        }
-        if let Some(end) = replica.max_unshipped_gated_below(version) {
-            self.ack.spans.push(CfgSpan {
-                backups: Vec::new(),
-                singleton: false,
-                end,
-            });
-            self.stats.resumed_spans += 1;
         }
     }
 
@@ -2517,11 +2488,9 @@ impl Core {
     /// leaves, so that no path can emit it unsettled.
     pub(crate) fn emission_hold_of(&self, rid: Rid, replica: &dyn Replica) -> Option<u64> {
         // Plan 46 M1.4 step 6a (ADR-53): and a row of this node's own root
-        // journal that its own rule has not committed.
-        if let Some(seq) = self
-            .unsettled_root_row(rid, replica)
-            .filter(|_| !self.cfg.resumed_span_dropped)
-        {
+        // journal that an earlier tenure left, which only the archive
+        // commits. Decided by the row's own state, not by how it came here.
+        if let Some(seq) = self.unsettled_root_row(rid, replica) {
             return Some(seq);
         }
         // Rows of generations exist only on a node with a delegation (as the
@@ -2554,11 +2523,17 @@ impl Core {
     /// this node's journal when the row is a gated group of the root
     /// (`Archive` or `Root`) journaled before this tenure began, under an
     /// older configuration, and the archive has not carried it. Those groups'
-    /// acks do not survive the tenure gap, so the archive alone commits
-    /// them. `None`: no such row, or it may leave. The cfg spans decide this
-    /// already (`durable_jseq`, `park_durable`); this is asked again where
-    /// the answer leaves, so a path that missed them cannot emit.
+    /// acks do not survive the tenure gap (a restart, a lease let go and
+    /// taken again), so the archive alone commits them. `None`: no such row,
+    /// or it may leave. Decided by the row's own state and the tenure's
+    /// start, never by a flag set on the way in: every answer path asks it
+    /// ([`Self::answer_need_of`], [`Self::completed_row_settled`], the
+    /// release, and the emission gate), and only the rows of earlier
+    /// tenures wait: the rows of this one are answered by this tenure's rule.
     pub(crate) fn unsettled_root_row(&self, rid: Rid, replica: &dyn Replica) -> Option<u64> {
+        if self.cfg.resumed_span_dropped {
+            return None;
+        }
         let (version, tip) = self.ack.tenure_start?;
         let shipped = replica.journal_acked_seq().unwrap_or(0);
         if self.ack.shipped_through.max(shipped) >= tip {
@@ -2574,6 +2549,15 @@ impl Core {
         };
         (first <= tip && config_version < version && !self.archive_covers(first, shipped))
             .then_some(first)
+    }
+
+    /// [`Self::unsettled_root_row`] as the paths that decide early ask it
+    /// (`Config::root_row_emission_only` blinds them, to test the backstop).
+    pub(crate) fn unsettled_root_row_early(&self, rid: Rid, replica: &dyn Replica) -> Option<u64> {
+        if self.cfg.root_row_emission_only {
+            return None;
+        }
+        self.unsettled_root_row(rid, replica)
     }
 
     /// Count an answer the emission gate held (`Stats::answers_held_at_emission`).
@@ -2601,7 +2585,7 @@ impl Core {
             "an answer resting on an unsettled delegation row reached the point it leaves: held"
         );
         debug_assert!(
-            self.emission_hold_expected,
+            self.emission_hold_expected || self.cfg.root_row_emission_only,
             "an answer on an unsettled delegation row reached emission ({path:?}, {rid:?})"
         );
     }

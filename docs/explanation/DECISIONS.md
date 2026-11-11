@@ -3869,35 +3869,43 @@ for `Archive` and a `Root` group (whose acks do not survive the gap), the
 archive. A node that holds no lease never reads its own unshipped row as the
 log's.
 
-- A resumed tenure (the node held a configuration before, and the lease was
-  let go or lost since) pushes a span, ending at the last unshipped gated
-  row of an older version of the node's own journal
-  (`Replica::max_unshipped_gated_below`), so `durable_jseq` is capped at the
-  shipped watermark until the archive carries it, and `park_durable`, the
-  fast path's `lone_ok` and `root_lone` follow. The spans are noted where
-  the lease lands, before anything parked is released.
-- `settled_outcome` of a node that holds no lease returns nothing for a root
-  row (not a delegation's) the journal carries and no applied segment does; the settle path decides.
-- The emission gate asks the row again where an answer leaves
-  (`Core::unsettled_root_row`, the twin of the delegation row's test): a
-  `Archive` or `Root` row journaled before the resumed tenure began, under
-  an older version, that the archive has not carried is parked. The
-  backstop, counted (`held_at_emission_root_row`); rows of the tenure's own
-  earlier configurations keep their spans.
+- A tenure starts whenever the lease is held and was not before (the
+  process's first, a re-take after the lease was let go or lost, a restart
+  re-adopting the node's own lease) or is of another epoch. The tenure notes
+  its start (`Ack.tenure_start`: the lease's `config_version` and the
+  journal's tip). A gated root row (`Archive` or a `Root` group) at or below
+  that tip, journaled under an older version, is an earlier tenure's: its
+  group's acks do not survive the gap, so only the archive commits it.
+- The test is the row's own state (`Core::unsettled_root_row`), never a flag
+  of how the tenure came about. Every path asks it: `answer_need_of` (the
+  retries and the deadline), `completed_row_settled` (the replay, the inbox,
+  the release of a parked answer), and the emission gate where an answer
+  leaves (the backstop, counted as `held_at_emission_root_row`). An earlier
+  tenure's row waits for the archive; the rows of the tenure itself are
+  answered by the tenure's own rule and do not wait behind them. (An
+  earlier version of this ADR capped `durable_jseq` with a span ending at the
+  last earlier row; a row held back for its data then blocked every answer of
+  the resumed tenure, and a restart, which sees no gap, got no span at all.)
+- `settled_outcome` of a node that holds no lease returns nothing for a row
+  the journal carries and no applied segment does when the node is deposed or
+  left a hold (as before), or when the row is a root row (not a delegation's,
+  which commit by their group or the log); the settle path decides.
 
 A true singleton's row stays ungated (its rule never gates): its answer after
 a re-take does not wait for the archive.
 
-**Consequences**: after an epoch's close or a lapse, the re-taken root's
-first answers wait one ship round (S3 is reachable: the re-take was an S3
-CAS). Unsettled `EIO`s of ops whose row is unshipped at the deadline settle
+**Consequences**: after an epoch's close, a lapse or a restart, the answers
+of the earlier tenure's unshipped rows wait for the archive (while S3 is
+unreachable they wait for it; the client's retries or its deadline settle
+them). Unsettled `EIO`s of ops whose row is unshipped at the deadline settle
 instead of answering.
 
 **Rejected**: keeping the configuration and the spans across the gap (they
-would outlive a journal another tenure rolled back and block forever).
+would outlive a journal another tenure rolled back and block forever); a span
+at a tenure's start that caps the whole journal's answers.
 
 **May revert**: no.
 
 See: `crates/authority/src/core/backup.rs` (`sync_cfg_spans`,
-`span_earlier_rows`, `unsettled_root_row`), `crates/authority/src/core/client.rs`
+`unsettled_root_row`), `crates/authority/src/core/client.rs`
 (`settled_outcome`), [DESIGN](DESIGN.md) ("Acknowledgement and durability").
