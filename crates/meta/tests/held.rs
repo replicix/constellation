@@ -1552,6 +1552,47 @@ fn the_publish_view_merges_a_shipped_sibling_into_the_held_parent() {
     );
 }
 
+/// ADR-59, the publisher's rule for an exclusive outstanding write of the
+/// directory above a sibling that shipped: the sibling's create is in the
+/// log, the held rename and the `utimes` of the directory behind it are not.
+/// The log-prefix value of the directory's record is its value before the
+/// first outstanding row plus the shipped create's merge (the `utimes`
+/// writes it exclusively but sits above the create in the journal, so its
+/// own before-image is not the log prefix and is not taken).
+#[test]
+fn the_publish_view_carries_a_shipped_sibling_under_an_outstanding_utimes_of_the_parent() {
+    let (meta, d, _broken, mut all) = seed_in_a_subdirectory();
+    meta.rename(d, "broken", d, "moved").unwrap();
+    meta.create(d, "x", 0o644, 0, 0).unwrap();
+    meta.setattr(d, None, None, None, None, None, Some(1))
+        .unwrap();
+    let rows = batch(&meta);
+    ship(&meta, &rows, 2);
+    let shipped = records(&rows);
+    assert!(
+        shipped
+            .iter()
+            .any(|r| matches!(r, LogRecord::Create { name, .. } if name == "x")),
+        "x ships past the held rename: {shipped:?}"
+    );
+    assert!(
+        shipped
+            .iter()
+            .all(|r| !matches!(r, LogRecord::Setattr { .. })),
+        "the utimes of d waits: {shipped:?}"
+    );
+    all.extend(shipped);
+    let basis = basis(&meta);
+    let PublishBasis::Substituted(_) = &basis else {
+        panic!("a view the log prefix can be built from: {basis:?}");
+    };
+    assert_eq!(
+        published_view(&meta, &basis),
+        replayed(&all),
+        "d's record in the log prefix carries the shipped create and not the utimes"
+    );
+}
+
 #[test]
 fn an_explicit_utimes_of_the_directory_waits_behind_a_held_create_in_it() {
     let (meta, d, _broken, _) = seed_in_a_subdirectory();

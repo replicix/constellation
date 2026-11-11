@@ -3901,6 +3901,21 @@ pub(crate) fn local_before_images_from(
                 if row.before.iter().any(|(key, _)| view.contains(key))
                     && !view.merge_shipped(row.before.iter().map(|(key, _)| key), &row.merge)
                 {
+                    // The planner never lets a row ship past an outstanding
+                    // one it conflicts with (`held::conflicts`): counted, an
+                    // error in debug builds, and the publish defers.
+                    meta.publish_unplaced
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(
+                        first,
+                        "a shipped row conflicts with an older outstanding write: \
+                         the publisher cannot place it, so it defers"
+                    );
+                    debug_assert!(
+                        false,
+                        "a shipped row conflicts with an outstanding write of the \
+                         publisher's view (held::conflicts is the planner's rule)"
+                    );
                     return Ok(None);
                 }
             }
