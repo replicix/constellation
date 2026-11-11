@@ -2981,7 +2981,17 @@ impl Core {
         // each released on a peer's ask as it opened, with nothing run
         // (`sticky-root-designee-inbox-skew` seed 1261, once a slow drain no
         // longer cost the holder its lease).
-        if self.inbox.leftover.is_some() {
+        // Bounded (`Deadlines::leftover_hold`): a halt that persists (a
+        // failing read, a meta error) would keep the lease for ever. Past
+        // the bound the lease is released as idle; the leftovers stay in the
+        // bucket for the next holder's drain.
+        let leftover_hold = self.dl_t().leftover_hold;
+        if self
+            .inbox
+            .leftover
+            .as_ref()
+            .is_some_and(|l| l.holds_lease(now.wait, leftover_hold))
+        {
             self.finish_round(now, None, replica, out);
             return;
         }

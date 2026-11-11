@@ -125,6 +125,14 @@ pub struct Deadlines {
     pub leave_wait: u64,
     pub leave_resend: u64,
     pub leave_note_lapse: u64,
+    /// How long a holder keeps its lease for the takeover drain's leftovers
+    /// (`Core::inbox_run_leftovers`) it could not re-read and run: four client
+    /// deadlines from the gate. Past it every requester's ops have timed out
+    /// and been retried;
+    /// the holder then releases when idle, and the leftovers stay in the
+    /// bucket for the next holder's drain, which reads them under its
+    /// freshness rule.
+    pub leftover_hold: u64,
     pub read_block: u64,
     /// The longest a persisted read-grant horizon leads the write that makes
     /// it: a read delegation's TTL, the margin the owner outwaits it by, a
@@ -301,6 +309,7 @@ impl Deadlines {
                 .max(500)
                 .saturating_mul(LEAVE_NOTE_LAPSE_RESENDS)
                 .max(d.saturating_mul(2)),
+            leftover_hold: 4 * a,
             read_block: 2 * (r + m),
             read_span: r + m + 2_000,
             lock_span: lock_ttl + lock_ttl / 4 + m + 1_000,
@@ -636,6 +645,7 @@ impl Deadlines {
                 self.leave_note_lapse,
                 "max(3 * leave_resend, 2D)",
             ),
+            ("leftover_hold", self.leftover_hold, "4A"),
             ("read_block", self.read_block, "2 (R + m)"),
             ("read_span", self.read_span, "R + m + 2000"),
             ("lock_span", self.lock_span, "max(K, D) * 5/4 + m + 1000"),
@@ -789,6 +799,7 @@ mod tests {
             &Config::defaults(1, 1),
             &[
                 ("client_deadline", 120_000),
+                ("leftover_hold", 480_000),
                 // A/4.
                 ("settle_window", 30_000),
                 ("inbox_read_fresh", 15_000),
@@ -865,6 +876,7 @@ mod tests {
             &engine(),
             &[
                 ("client_deadline", 120_000),
+                ("leftover_hold", 480_000),
                 ("settle_window", 30_000),
                 ("inbox_read_fresh", 15_000),
                 ("attempts", 90_000),
@@ -922,6 +934,7 @@ mod tests {
             &sim(),
             &[
                 ("client_deadline", 12_000),
+                ("leftover_hold", 48_000),
                 // 12000/4.
                 ("settle_window", 3_000),
                 ("inbox_read_fresh", 1_500),
@@ -994,6 +1007,7 @@ mod tests {
             &[
                 // 2 * 30000.
                 ("client_deadline", 60_000),
+                ("leftover_hold", 240_000),
                 // 60000/4.
                 ("settle_window", 15_000),
                 ("inbox_read_fresh", 7_500),
@@ -1055,6 +1069,7 @@ mod tests {
             &backup(),
             &[
                 ("client_deadline", 12_000),
+                ("leftover_hold", 48_000),
                 ("settle_window", 3_000),
                 ("inbox_read_fresh", 1_500),
                 ("attempts", 9_000),
@@ -1113,6 +1128,7 @@ mod tests {
             &edge(),
             &[
                 ("client_deadline", 2_000),
+                ("leftover_hold", 8_000),
                 // 2000/4.
                 ("settle_window", 500),
                 ("inbox_read_fresh", 250),

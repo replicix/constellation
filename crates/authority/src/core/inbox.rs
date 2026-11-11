@@ -165,6 +165,16 @@ pub(crate) struct InboxState {
 #[derive(Debug)]
 pub(crate) struct Leftover {
     waiting: BTreeMap<NodeId, LeftoverNode>,
+    /// When the gate left them (wait clock): the holder keeps its lease for
+    /// them `Deadlines::leftover_hold` from then, not longer.
+    pub(crate) since: WaitMs,
+}
+
+impl Leftover {
+    /// Whether the holder still keeps its lease for these.
+    pub(crate) fn holds_lease(&self, now: WaitMs, hold_ms: u64) -> bool {
+        now < self.since.plus(hold_ms)
+    }
 }
 
 /// One requester's halted batches.
@@ -2040,7 +2050,10 @@ impl Core {
                 .keys
                 .push(key);
         }
-        self.inbox.leftover = (!waiting.is_empty()).then_some(Leftover { waiting });
+        self.inbox.leftover = (!waiting.is_empty()).then_some(Leftover {
+            waiting,
+            since: now.wait,
+        });
         Ok(())
     }
 

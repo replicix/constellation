@@ -35605,6 +35605,72 @@ fn a_holder_with_drain_leftovers_is_not_idle_released() {
     }
 }
 
+/// A holder that keeps its lease for the takeover drain's leftovers does
+/// so for `Deadlines::leftover_hold` only: a read that keeps failing, or a
+/// halt that persists, would otherwise block the idle release for ever.
+/// Past the bound the round releases; the leftovers stay in the bucket.
+/// Fails before: never released while the leftovers wait.
+#[test]
+fn drain_leftovers_hold_the_lease_only_for_a_bound() {
+    let mut h = Harness::new(1);
+    h.core.cfg.inbox = true;
+    h.hold(2, None);
+    let c = h.create("c");
+    let batch = inbox_batch(3, 0, 1, &c);
+    let stale = WaitMs(h.clk().wait.0 - 2 * h.core.dl_t().inbox_read_fresh as i64);
+    let mut out = Vec::new();
+    h.core
+        .inbox_drain(h.clk(), vec![batch], stale, &h.meta, &mut out)
+        .unwrap();
+    assert_eq!(h.core.inbox.leftover_batches(), 1);
+    // The gate left them past the bound.
+    let hold = h.core.dl_t().leftover_hold as i64;
+    h.core.inbox.leftover.as_mut().unwrap().since = WaitMs(h.clk().wait.0 - hold - 1);
+    let long_ago = WaitMs(h.now.0 - 1_000_000);
+    h.core.lease.wanted = vec![2];
+    h.core.lease.wanted_since = Some(long_ago);
+    h.core.lease.held_since = Some(long_ago);
+    h.core.lease.last_write = long_ago;
+    let mut out = Vec::new();
+    h.core.start(h.clk(), &h.meta, &mut out);
+    let poll = timers(&out, TimerKind::Poll)[0];
+    let mut acts = h.step(Event::Timer { id: poll });
+    let mut released = h.core.lease.releasing;
+    for _ in 0..20 {
+        if let Some(upload) = acts.iter().find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        }) {
+            acts = h.step(Event::UploadsDone {
+                op: upload,
+                result: UploadResult::Done { held: 0 },
+            });
+            released |= h.core.lease.releasing;
+            continue;
+        }
+        let Some((op, req)) = s3_ops(&acts)
+            .into_iter()
+            .find(|(_, r)| !matches!(r, S3Op::InboxRun { .. }))
+            .map(|(o, r)| (o, r.clone()))
+        else {
+            break;
+        };
+        let result = match req {
+            S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+            S3Op::LeaseSwap { lease, .. } => {
+                released |= lease.released;
+                S3Result::LeasePut(Ok(tag()))
+            }
+            S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+            S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+            other => panic!("unexpected S3 op in the round: {other:?}"),
+        };
+        acts = h.step(Event::S3 { op, result });
+        released |= h.core.lease.releasing;
+    }
+    assert!(released, "the leftovers held the lease past their bound");
+}
+
 /// A round waiting for the takeover gate's drain whose renewal is brought
 /// forward (`renew_now`) while the holder's own other lease CAS is out got
 /// no timer: `renew_due_in_ms` is `None` for a brought-forward renewal, and
