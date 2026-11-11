@@ -6928,6 +6928,14 @@ fn sweep_config() {
                 core
             });
         }
+        if std::env::var("AUTHORITY_SIM_RESUMED_SPAN_DROPPED").is_ok_and(|v| v == "1") {
+            let inner = c.core.clone();
+            c.core = std::sync::Arc::new(move |id, inc| {
+                let mut core = inner(id, inc);
+                core.resumed_span_dropped = true;
+                core
+            });
+        }
         if std::env::var("AUTHORITY_SIM_HOLD_ANSWERS_UNCOMMITTED").is_ok_and(|v| v == "1") {
             let inner = c.core.clone();
             c.core = std::sync::Arc::new(move |id, inc| {
@@ -8530,6 +8538,8 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "held_at_emission_holder_reply",
             "held_at_emission_designation",
             "held_at_emission_release",
+            "held_at_emission_root_row",
+            "resumed_spans",
             "journal_class_from_session",
             "seal_tail_holder",
             "seal_tail_backup",
@@ -8686,6 +8696,8 @@ struct OracleTotals {
     /// seeds with one (must be none).
     held_emission: [u64; 6],
     held_emission_seeds: Vec<u64>,
+    held_root_row: u64,
+    resumed_spans: u64,
     /// The stream counters: delegated acknowledgements released (count,
     /// total wait ms), the install waits and the lost-dependency counters
     /// (installs put off, generations stopped, rows the root refused,
@@ -8819,6 +8831,8 @@ impl OracleTotals {
             self.held_emission[3] += st.held_at_emission_holder_reply;
             self.held_emission[4] += st.held_at_emission_designation;
             self.held_emission[5] += st.held_at_emission_release;
+            self.held_root_row += st.held_at_emission_root_row;
+            self.resumed_spans += st.resumed_spans;
             self.tail[0] += st.tail_fetch_attempts;
             self.tail[1] += st.tail_fetches;
             self.tail[2] += st.inherited_tail_fetches;
@@ -9270,7 +9284,7 @@ impl OracleTotals {
         }
         eprintln!(
             "SWEEP-HELD-AT-EMISSION {label} seeds {}/{seeds}: answers held at emission {} \
-             (finish {}, deleg_exec {}, holder_reply {}, designation {}, release {}) in seeds {:?}",
+             (finish {}, deleg_exec {}, holder_reply {}, designation {}, release {}; root_row {}, resumed spans {}) in seeds {:?}",
             self.seeds,
             self.held_emission[0],
             self.held_emission[1],

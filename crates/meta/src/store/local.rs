@@ -957,6 +957,30 @@ impl Meta {
             .any(|(_, h)| h.epoch == epoch))
     }
 
+    /// Plan 46 M1.4 step 6a (ADR-53): the last journal seq of the highest
+    /// unshipped transaction of this node's own (not a generation's) whose
+    /// class is a gated group of a configuration older than `version`
+    /// (`None`: there is none). Read once at a tenure's start.
+    pub fn max_unshipped_gated_below(&self, version: u64) -> Result<Option<u64>, MetaError> {
+        let r = self.db.read_tx();
+        Ok(read_journal_tx_heads(&r, self)?
+            .iter()
+            .filter(|(_, h)| {
+                h.gen == 0
+                    && h.class.gated()
+                    && !matches!(
+                        h.class,
+                        RowCommit::Group {
+                            on: GroupOn::Delegate,
+                            ..
+                        }
+                    )
+                    && h.class.config_version().is_some_and(|v| v < version)
+            })
+            .map(|(_, h)| h.last)
+            .max())
+    }
+
     /// Plan 43 C1-2: the class of the journal transaction that holds
     /// journal seq `seq` (`None`: no such unshipped transaction).
     pub fn journal_tx_class(&self, seq: u64) -> Result<Option<RowCommit>, MetaError> {

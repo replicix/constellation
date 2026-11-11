@@ -61947,6 +61947,81 @@ mod m11_step5 {
             "{plan:?}"
         );
     }
+
+    /// Plan 46 M1.4 step 6a (ADR-53), the row of an archive-ruled tenure and
+    /// a resumed tenure with no peer: the lease is let go (a continuation
+    /// epoch's close) and taken again lone at a higher version, the spans
+    /// the old tenure kept are gone, and the first own row is still
+    /// unshipped. Its answer waits for the archive, as the row's rule says.
+    fn archive_row_then_a_tenure_gap(h: &mut Harness) -> Rid {
+        backup_node(h, vec![1, 2]);
+        link_2(h, false, None, 0);
+        h.hold(1, None);
+        h.core.ack.eligible = Some(h.core.backup_could_be_had());
+        link_2(h, true, Some(5), 0);
+        let (r1, out) = submit(h, 1, "r1");
+        assert!(replies(&out).is_empty(), "{out:?}");
+        assert!(classes_of(h, r1)[0].versionless() == RowCommit::ARCHIVE);
+        super::land_reconfig(h);
+        let held = h.core.lease.held.as_ref().unwrap().0.clone();
+        // The close lets the lease go; the peers are gone.
+        h.core.lease.held = None;
+        h.advance(100);
+        link_2(h, false, None, 0);
+        activity(h);
+        assert!(h.core.ack.spans.is_empty(), "the gap clears the spans");
+        // Taken again, lone, a higher configuration.
+        let lease = Lease {
+            config_version: held.config_version + 2,
+            backups: Vec::new(),
+            singleton: true,
+            ack_policy: constellation_store_s3::AckPolicy::Local,
+            ..held
+        };
+        let gate = None;
+        h.core.lease.adopt(h.clk(), lease, tag(), gate);
+        h.core.ack.eligible = Some(false);
+        r1
+    }
+
+    /// (6a, a) Fails on main: the answer of the row journaled `Archive`
+    /// before the gap leaves at the re-take, the row unshipped.
+    #[test]
+    fn a_resumed_tenure_answers_an_earlier_archive_row_from_the_archive() {
+        let mut h = Harness::new(1);
+        let r1 = archive_row_then_a_tenure_gap(&mut h);
+        let mut out = activity(&mut h);
+        out.extend(release(&mut h));
+        assert!(
+            replies(&out).is_empty(),
+            "answered at the re-take, the row unshipped: {out:?}"
+        );
+        assert_eq!(h.core.stats.resumed_spans, 1);
+        assert!(!h.core.ack.spans.is_empty());
+        // A row of the resumed tenure is not answered alone before it either.
+        let (_, out) = submit(&mut h, 2, "r2");
+        assert!(replies(&out).is_empty(), "{out:?}");
+        ship_through_tip(&mut h);
+        let mut out = activity(&mut h);
+        out.extend(release(&mut h));
+        let got: Vec<Rid> = replies(&out).iter().map(|(r, _)| *r).collect();
+        assert!(got.contains(&r1), "{out:?}");
+        // Steady again: no span, the next row at once.
+        let (_, out) = submit(&mut h, 3, "r3");
+        assert_eq!(replies(&out).len(), 1, "{out:?}");
+    }
+
+    /// (6a, a, control) `resumed_span_dropped` restores the old arm: the
+    /// answer leaves with the row unshipped.
+    #[test]
+    fn the_resumed_span_knob_restores_the_old_release() {
+        let mut h = Harness::new(1);
+        h.core.cfg.resumed_span_dropped = true;
+        let _ = archive_row_then_a_tenure_gap(&mut h);
+        let mut out = activity(&mut h);
+        out.extend(release(&mut h));
+        assert_eq!(replies(&out).len(), 1, "{out:?}");
+    }
 }
 
 /// Plan 46 M1.4 step 1: `StreamAheadAck`, the member's acknowledgement of
