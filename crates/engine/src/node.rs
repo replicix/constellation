@@ -3147,6 +3147,27 @@ mod tests {
         }
     }
 
+    /// Whether no `lock` file under `dir` (the meta store's database lock)
+    /// is held by a live handle of this process.
+    fn store_locks_are_free(dir: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return true;
+        };
+        entries.flatten().all(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                return store_locks_are_free(&path);
+            }
+            if path.file_name().is_none_or(|n| n != "lock") {
+                return true;
+            }
+            match std::fs::File::open(&path) {
+                Ok(file) => file.try_lock().is_ok(),
+                Err(_) => true,
+            }
+        })
+    }
+
     fn offline() -> EngineProfile {
         EngineProfile {
             p2p: P2pMode::Off,
@@ -3639,6 +3660,18 @@ mod tests {
             assert!(
                 released.elapsed() < Duration::from_secs(60),
                 "the old engine's threads still hold the store"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // `strong_count() == 0` is when `Meta`'s destructor starts, not when
+        // it ends: the database's drop waits for its worker threads before
+        // it lets go of the lock file. Wait for the lock itself, as a
+        // successor process meets it.
+        let released = std::time::Instant::now();
+        while !store_locks_are_free(&state) {
+            assert!(
+                released.elapsed() < Duration::from_secs(60),
+                "the old store's lock file is still held"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
