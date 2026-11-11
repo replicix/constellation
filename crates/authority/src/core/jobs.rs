@@ -4142,6 +4142,36 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.claims_lost_streak = 0;
+        // D7: a node never holds an epoch it sealed. A restart's re-adoption
+        // CAS (the same epoch over this node's own lease) can be in flight
+        // when a peer claimant's seal lands on that epoch (`acquire_cas`
+        // refreshed the sealed epoch before it went out); the CAS then lands
+        // over an epoch whose tail was handed to the claimant and kept as the
+        // member copy at the seal. Adopting it would serve the sealed epoch:
+        // the rows it acknowledges next are in no tail, and the self-sealed
+        // re-claim that follows (`sealer_doomed`: the lease moved off the
+        // sealer's key) would strand them in a member copy nobody ships or
+        // drops (`backup-crash-slow+commit` seeds 204, 1115). Not adopted:
+        // the lease it wrote is read as the self-sealed holder's own, which
+        // claims the next epoch at once from its member copy.
+        if let Plan::Claim { prev, .. } = &plan {
+            if prev.holder == self.cfg.node_id
+                && sent.holder == self.cfg.node_id
+                && sent.epoch == prev.epoch
+                && self.bk.sealed >= sent.epoch
+            {
+                self.stats.sealed_own_readoptions_dropped += 1;
+                tracing::warn!(
+                    node = self.cfg.node_id,
+                    epoch = sent.epoch,
+                    sealed = self.bk.sealed,
+                    "a re-adoption CAS landed over an epoch sealed since it went out: not adopted"
+                );
+                self.note_acquire_cas_in_doubt(&plan, &sent);
+                self.finish_acquire(now, false, replica, out);
+                return;
+            }
+        }
         let (prev, takeover, marker) = match plan {
             Plan::Claim {
                 prev,
