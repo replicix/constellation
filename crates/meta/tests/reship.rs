@@ -231,6 +231,46 @@ fn a_row_whose_rid_is_done_is_skipped_and_counted() {
     assert_eq!(meta.journal_len().unwrap(), journal);
 }
 
+/// A node that takes the lease again after its own tenure (a claimant asked
+/// for its tail, the claim failed, it won the lease itself) reads its own
+/// sealed tail back while its own journal still holds the very rows (a root's
+/// append of a delegate's row stays through a takeover). A tail row that is
+/// that journal row, the same epoch and journal seq, is not an outcome "from
+/// the log under another identity": it stays where it is, to ship as the
+/// node's own, and is counted as itself (`tail_same_row`), never as
+/// `tail_done` (`far-placement` seeds 352 and 772).
+#[test]
+fn a_tail_row_that_is_the_nodes_own_journal_row_is_not_a_done_rid() {
+    let meta = successor_with_an_own_row();
+    let journal = meta.journal_len().unwrap();
+    let same = tx(
+        1,
+        2,
+        vec![
+            create(ROOT_INO, "own", ino(7)),
+            LogRecord::Completed { rid: rid(3, 1) },
+        ],
+    );
+    assert!(meta
+        .backup_append(EPOCH_PREV, std::slice::from_ref(&same))
+        .is_ok());
+    let report = meta
+        .reship_at_takeover(
+            None,
+            Some(constellation_meta::TailArgs {
+                epoch: EPOCH_PREV,
+                through: 2,
+                config_version: 3,
+                class: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(report.tail_done, 0, "{report:?}");
+    assert_eq!((report.tail_same_row, report.tail_applied), (1, 0));
+    assert_eq!(meta.journal_len().unwrap(), journal);
+    assert_eq!(txs_in_journal(&meta), 1);
+}
+
 /// This node's own unshipped row of the old tenure, journaled as the holder
 /// of epoch 1 (an ungated row: the strand rolls it back and queues its
 /// replay).

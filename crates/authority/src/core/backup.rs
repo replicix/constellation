@@ -6787,6 +6787,7 @@ impl Core {
     ) {
         self.stats.tail_beyond_gap_dropped += report.tail_beyond_gap as u64;
         self.stats.tail_done_skipped += report.tail_done as u64;
+        self.stats.tail_same_row += report.tail_same_row as u64;
         self.stats.reship_sync_failed += u64::from(report.sync_failed);
         self.stats.reship_duration_ms_max = self.stats.reship_duration_ms_max.max(report.hold_ms);
         // A row of the tail whose rid the log already carried (the holder's
