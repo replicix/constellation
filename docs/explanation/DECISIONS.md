@@ -3639,6 +3639,58 @@ See: `crates/authority/src/core/delegate.rs` (`delegate_try_execute`),
 `crates/authority/src/core/inbox.rs`,
 [delegations](../reference/features/delegations.md).
 
+## ADR-48: Every protocol bound is derived in one module
+
+**Status**: decided by the maintainer on 2026-11-10 (architecture review
+2026-11-10, design change 4).
+
+**Context**: a deadline, window or horizon that a safety argument rests on was
+computed where it was used, and again wherever another part needed it: the
+core, the daemon's configuration loader, the simulation driver, the oracle's
+classifier and the test harness each held part of the arithmetic. The copies
+drifted: the simulation ran client deadlines that were not twice its lease
+TTL and a settle window by its own rule, its classifier capped the recall
+back-off at a constant the product no longer used, the settle cap did not cover
+the waits it caps, and the daemon applied derivations (the recall hold, the
+backup heartbeat clamp, the delegation TTL default) that the simulation did
+not. Each was a configuration the simulation tested and the product did not
+run, or the reverse.
+
+**Decision**: one pure module, `deadlines.rs`, takes the base knobs of the
+configuration and computes every bound as a span in milliseconds; callers add
+the span to the clock they used before (the wait or honour clock, never a wall
+reading). The core, the daemon (through `normalize`), the simulation driver and
+the classifier read the same values, and `Deadlines::check` states the
+invariants between the bounds once; the simulation asserts them for every
+configuration it runs. The classifier keeps its own
+network terms (message delays, S3 latencies, lease-read costs) and takes only
+the protocol windows from the module, so a wrong formula is not wrong in the
+oracle and the product alike: a table test pins every value for three
+configurations with hand-computed numbers, and the invariants relate the
+bounds to one another. A table of the bounds at the defaults is generated from
+the module into the configuration reference, and a test fails when it is
+stale.
+
+**Consequences**: a new bound is one function and, where it relates to another,
+one invariant. A configuration that broke an invariant and ran (the
+simulation's long-lease configurations ran client deadlines of 12 s against
+leases of 30 s) now runs at the production ratios. The cost is a recomputation
+of the table at each use (cheap integer arithmetic; the core builds it on use,
+not once, because a promise can still clamp a knob under a core). Bounds that
+depend on a runtime reading (a link's round trip, a lease's time left) stay
+functions with that reading as a parameter.
+
+**Rejected**: deriving the bounds in the classifier from its own network
+model only (the same drift, in the other direction); a macro over `Config`
+(the bounds mix knobs in formulas a reader must see); one shared constants
+file (the formulas are the point, not the numbers).
+
+**May revert**: no.
+
+See: `crates/authority/src/deadlines.rs`,
+[configuration reference](../reference/configuration.md#derived-timings),
+[design](DESIGN.md#protocol-bounds).
+
 ## ADR-49: A late landing is bounded by what the executor itself can see
 
 **Status**: decided by the maintainer on 2026-11-10 and 2026-11-11 (late-landing

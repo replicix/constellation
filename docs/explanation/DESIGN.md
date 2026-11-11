@@ -1131,6 +1131,21 @@ sequencer (the root or the delegate of the file), in the same core that
 sequences the file's mutations; their renewals also run in a lane beside
 that core, so a stuck core step does not lapse them. §6 explains them.
 
+### Protocol bounds
+
+Every protocol bound (a deadline, cap, window or horizon that a safety or I4
+argument rests on) is derived in one pure module,
+`crates/authority/src/deadlines.rs`, from a few base knobs: the lease TTL,
+the expiry margin, the read- and write-delegation TTLs, the lock TTL, the
+forward timeout, the takeover window and the stream tick. The core, the
+simulation driver and the simulation's classifier all read it, and it states
+the invariants between the bounds once (`Deadlines::check`, asserted for every
+simulated configuration). A new bound is added there,
+with an invariant if it relates to another; a formula that is written again at
+a call site is a defect. The table of the bounds at the defaults is generated
+into the [configuration reference](../reference/configuration.md#derived-timings)
+([ADR-48](DECISIONS.md#adr-48-every-protocol-bound-is-derived-in-one-module)).
+
 ## 5. Write Authority: the One Rule
 
 > A node may alter a subtree only while it holds an unexpired **authority

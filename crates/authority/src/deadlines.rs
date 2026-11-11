@@ -1353,4 +1353,182 @@ mod tests {
             Class::Warn
         );
     }
+
+    // ----------------------------------------------- the documentation table
+
+    const BEGIN: &str = "<!-- deadlines:begin -->";
+    const END: &str = "<!-- deadlines:end -->";
+    const LEASE: &str = "CONSTELLATION_LEASE_TTL_MS";
+    const READ: &str = "CONSTELLATION_READ_DELEGATION_TTL_MS";
+    const DELEG: &str = "CONSTELLATION_DELEGATION_TTL_MS";
+    const LOCK: &str = "CONSTELLATION_LOCK_TTL_MS";
+    const FORWARD: &str = "CONSTELLATION_FORWARD_TIMEOUT_MS";
+    const TAKEOVER: &str = "CONSTELLATION_BACKUP_TAKEOVER_MS";
+    const S3_LESS: &str = "CONSTELLATION_S3_LESS_OP_DEADLINE_MS";
+    const PROMISE: &str = "CONSTELLATION_PROMISE_TTL_S";
+    const HEARTBEAT: &str = "CONSTELLATION_BACKUP_HEARTBEAT_MS";
+    const DROP_HELD: &str = "CONSTELLATION_DROP_HELD_AWAIT_MS";
+
+    /// What a formula names: the symbol, what it is, and the environment
+    /// knobs it follows (none: fixed in the daemon).
+    const LEGEND: &[(&str, &str, &[&str])] = &[
+        ("L", "lease TTL", &[LEASE]),
+        ("m", "expiry margin, `min(1000, L/4)`", &[LEASE]),
+        ("R", "read-delegation TTL", &[READ]),
+        (
+            "D",
+            "write-delegation TTL (unset: `max(K, 5000)`)",
+            &[DELEG, LOCK],
+        ),
+        ("K", "lock TTL", &[LOCK]),
+        ("F", "forward timeout", &[FORWARD]),
+        ("T", "backup takeover window", &[TAKEOVER]),
+        ("k", "delegation stream tick (fixed, 50)", &[]),
+        ("A", "client deadline, row `client_deadline`", &[LEASE]),
+        ("w", "settle window, row `settle_window`", &[LEASE]),
+        (
+            "H",
+            "reclaim horizon, row `reclaim_horizon`",
+            &[DELEG, LOCK, LEASE],
+        ),
+        (
+            "DRT",
+            "delegation request timeout, row `deleg_request_timeout`",
+            &[FORWARD],
+        ),
+        ("inbox_deadline", "the inbox wait", &[LEASE]),
+        ("forward_backoff", "forward back-off (fixed)", &[]),
+        (
+            "acquire_retry_max",
+            "lease acquisition retry ceiling (fixed)",
+            &[],
+        ),
+        (
+            "s3_less_deadline",
+            "an op's deadline while S3 is stalled",
+            &[S3_LESS],
+        ),
+        ("promise_ttl", "heartbeat promise TTL", &[PROMISE]),
+        ("heartbeat", "backup heartbeat interval", &[HEARTBEAT]),
+        (
+            "leave_resend",
+            "a leaving node's note interval, row `leave_resend`",
+            &[FORWARD],
+        ),
+        (
+            "lock_grace_wait_max",
+            "row `lock_grace_wait_max`",
+            &[TAKEOVER, READ, LOCK, DELEG, LEASE, S3_LESS],
+        ),
+    ];
+
+    /// Words of a formula that name no quantity.
+    const WORDS: &[&str] = &[
+        "max", "min", "clamp", "at", "least", "or", "the", "clamped", "to", "else", "cap",
+    ];
+
+    /// The environment knobs a row follows: the union over the quantities
+    /// its formula names. A name the legend does not know fails the test,
+    /// so a new quantity is described here when it is added.
+    fn knobs_of(row: &str, formula: &str) -> Vec<&'static str> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut word = String::new();
+        for ch in formula.chars().chain(std::iter::once(' ')) {
+            if ch.is_alphanumeric() || ch == '_' {
+                word.push(ch);
+                continue;
+            }
+            let w = std::mem::take(&mut word);
+            // (`2L`: a factor, then the symbol.)
+            let w = w.trim_start_matches(|c: char| c.is_ascii_digit());
+            if w.is_empty() || WORDS.contains(&w) {
+                continue;
+            }
+            if w == "knob" {
+                if row == "drop_held_await" || row == "stale_shadow_after" {
+                    out.insert(DROP_HELD);
+                }
+                continue;
+            }
+            let Some((_, _, knobs)) = LEGEND.iter().find(|(s, _, _)| *s == w) else {
+                panic!("row {row}: `{w}` in `{formula}` is not in the legend of the derived timings table");
+            };
+            out.extend(knobs.iter().copied());
+        }
+        out.into_iter().collect()
+    }
+
+    fn knob_cell(knobs: &[&str]) -> String {
+        if knobs.is_empty() {
+            "fixed".into()
+        } else {
+            knobs
+                .iter()
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+
+    /// The generated part of the documentation: the symbols and every bound
+    /// at the daemon's defaults.
+    fn render() -> String {
+        let mut o = String::new();
+        o.push_str(
+            "\n<!-- Generated from `Deadlines::table()` by the test \
+             `configuration_md_derived_table_is_current`: do not edit by hand. -->\n\n",
+        );
+        o.push_str("| Symbol | Meaning | Follows |\n|---|---|---|\n");
+        for (sym, meaning, knobs) in LEGEND {
+            o.push_str(&format!("| `{sym}` | {meaning} | {} |\n", knob_cell(knobs)));
+        }
+        o.push_str("\n| Bound | At the defaults (ms) | Formula | Follows |\n|---|---:|---|---|\n");
+        for (name, value, formula) in Deadlines::new(&engine()).table() {
+            let knobs = knobs_of(name, formula);
+            o.push_str(&format!(
+                "| `{name}` | {value} | `{formula}` | {} |\n",
+                knob_cell(&knobs)
+            ));
+        }
+        o
+    }
+
+    /// The table in `docs/reference/configuration.md` is the module's, at
+    /// the defaults. `UPDATE_DOCS=1` rewrites it.
+    #[test]
+    fn configuration_md_derived_table_is_current() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/reference/configuration.md");
+        let doc = std::fs::read_to_string(&path).expect("read configuration.md");
+        let begin = doc.find(BEGIN).expect("begin marker") + BEGIN.len();
+        let end = doc.find(END).expect("end marker");
+        assert!(begin <= end, "markers out of order");
+        let want = render();
+        if doc[begin..end] == want {
+            return;
+        }
+        if std::env::var("UPDATE_DOCS").is_ok_and(|v| v == "1") {
+            let fresh = format!("{}{}{}", &doc[..begin], want, &doc[end..]);
+            std::fs::write(&path, fresh).expect("write configuration.md");
+            return;
+        }
+        let (have, want): (Vec<_>, Vec<_>) =
+            (doc[begin..end].lines().collect(), want.lines().collect());
+        let mut diff = String::new();
+        for i in 0..have.len().max(want.len()) {
+            let (h, w) = (have.get(i).copied(), want.get(i).copied());
+            if h != w {
+                diff.push_str(&format!(
+                    "line {i}:\n  doc:    {}\n  module: {}\n",
+                    h.unwrap_or("(missing)"),
+                    w.unwrap_or("(missing)")
+                ));
+            }
+        }
+        panic!(
+            "the derived timings table in docs/reference/configuration.md is stale; \
+             run `UPDATE_DOCS=1 cargo test -p constellation-authority --lib \
+             configuration_md_derived_table_is_current`\n{diff}"
+        );
+    }
 }
