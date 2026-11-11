@@ -263,6 +263,11 @@ pub(crate) struct ClientOp {
     /// Late-landing F1: the tombstones of the rid's inbox batches a settle
     /// writes alongside itself (`SettleWithdraw`).
     pub withdraw: Option<SettleWithdraw>,
+    /// Late-landing F1: the rid's inbox batches as they stood at `T_d`, which
+    /// the settle's withdrawal tombstones. A batch the settle's own inbox
+    /// route adds later is not among them: a settle never executes, and its
+    /// tombstone would take the settle away.
+    pub withdraw_keys: Vec<constellation_store_s3::inbox::InboxKey>,
 }
 
 /// Chunk metered-own-rows: an observed position's pending upload
@@ -779,6 +784,7 @@ impl Core {
                 accepted_by_delegate: false,
                 settle_withdraw_failed: false,
                 withdraw: None,
+                withdraw_keys: Vec::new(),
                 tag,
             },
         );
@@ -4306,6 +4312,7 @@ impl Core {
         let Some(&key) = c.inbox_keys.first() else {
             return;
         };
+        c.withdraw_keys = c.inbox_keys.clone();
         // A withdrawal already under way (the forward's) has its tombstone
         // in flight: the settle takes it over without writing it twice.
         let under_way = matches!(c.phase, Phase::InboxWithdraw { .. });
@@ -4416,6 +4423,7 @@ impl Core {
             return;
         }
         c.inbox_keys.retain(|k| *k != key);
+        c.withdraw_keys.retain(|k| *k != key);
         self.stats.inbox_withdrawn_ops += 1;
         self.inbox_forget_leftover(key);
         self.inbox_resubmit_cobatched(now, key, replica, out);
@@ -4423,7 +4431,9 @@ impl Core {
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
-        if let Some(&next) = c.inbox_keys.first() {
+        let held = c.inbox_keys.clone();
+        c.withdraw_keys.retain(|k| held.contains(k));
+        if let Some(&next) = c.withdraw_keys.first() {
             if let Some(w) = c.withdraw.as_mut() {
                 w.in_flight = next;
             }
@@ -4509,7 +4519,10 @@ impl Core {
         c.settle_until = until;
         c.settle_cap = c.settle_cap.max(until.max(now.wait.plus(span)));
         c.settle_withdraw_failed = true;
-        let keys = std::mem::take(&mut c.inbox_keys);
+        // (Only the batches of `T_d`: the settle's own are never executed.)
+        let mut keys = std::mem::take(&mut c.inbox_keys);
+        let snapshot = std::mem::take(&mut c.withdraw_keys);
+        keys.retain(|k| snapshot.contains(k));
         if let Some(t) = w.retry {
             self.cancel_timer(t, out);
         }
@@ -4943,7 +4956,7 @@ impl Core {
                 let allowed = w.acked_at.map_or(w.deadline, |t| t.plus(window));
                 if now.wait < allowed {
                     self.extend_settle_deadline(rid, allowed, None, out);
-                    return;
+                        return;
                 }
             }
         }

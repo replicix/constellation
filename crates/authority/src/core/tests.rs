@@ -71639,6 +71639,45 @@ mod late_landing_inbox {
         assert_eq!(h.core.clients.get(&rid).unwrap().inbox_keys, vec![key]);
     }
 
+    /// The settle's own inbox route puts a batch beside the old ones before
+    /// `T_d + f`: its withdrawal tombstones the batches of `T_d` only. Fails
+    /// on the parent: the settle's batch was tombstoned too.
+    #[test]
+    fn a_batch_the_settle_adds_itself_is_not_tombstoned() {
+        let (mut h, rid) = waiting_inbox_op();
+        let k1 = h.core.clients.get(&rid).unwrap().inbox_keys[0];
+        let k2 = InboxKey { n: k1.n + 1, ..k1 };
+        h.advance(h.core.dl_t().attempts + 1);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        // The settle's route reached the inbox before the first tombstone.
+        h.core.clients.get_mut(&rid).unwrap().inbox_keys.push(k2);
+        h.advance(h.core.dl_t().inbox_read_fresh);
+        let id = h
+            .core
+            .clients
+            .get(&rid)
+            .unwrap()
+            .withdraw
+            .and_then(|w| w.retry)
+            .expect("the tombstone's timer");
+        let out = h.step(Event::Timer { id });
+        let first = tombstone_op(&out).expect("a tombstone");
+        assert_eq!(tombstoned_keys(&out), vec![k1]);
+        let out = h.step(Event::S3 {
+            op: first,
+            result: S3Result::InboxTombstone(Ok(())),
+        });
+        assert!(
+            tombstoned_keys(&out).is_empty(),
+            "the settle's own: {out:?}"
+        );
+        let c = h.core.clients.get(&rid).unwrap();
+        assert!(c.withdraw.unwrap().acked_at.is_some());
+        assert_eq!(c.inbox_keys, vec![k2]);
+    }
+
     /// MUST-3 (U1(a)): the in-doubt answer of an op whose settle gave up on
     /// a tombstone is labelled for the sim oracle (`isolated-from-s3`).
     #[test]
