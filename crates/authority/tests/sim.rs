@@ -20341,3 +20341,30 @@ fn every_sim_configuration_passes_deadline_check() {
         failures.join("\n")
     );
 }
+
+/// ADR-58 pins: the named rid is not told an unsettled `EIO` that I4 judges
+/// a violation (a seed can carry other violations).
+fn rid_not_told_unsettled(label: &str, variants: &str, seed: u64, rid: (u64, u64)) {
+    let cfg = strict(base_config(label), variants);
+    if let Err(e) = run_seed(seed, cfg) {
+        let text = e.to_string();
+        let named = format!(
+            "rid Rid {{ node: {}, incarnation: 1, seq: {} }} told EIO unsettled",
+            rid.0, rid.1
+        );
+        assert!(
+            !text.contains(&named),
+            "{label}+{variants} seed {seed}: {named}: {text}"
+        );
+    }
+}
+
+/// ADR-58 C1 (plan 46 M2): a settle's `ABANDONED` refusal observes no keys,
+/// so it ships past a row held behind a lost chunk and the settle is
+/// answered. Fails on the parent: the refusal is held, the settle gets `Held`
+/// until the operator's drop, and the requester an unsettled `EIO`.
+#[test]
+fn adr58_c1_a_settle_refusal_is_not_held_behind_a_lost_chunk() {
+    rid_not_told_unsettled("flex-crash", "settle+oracles+unsettled", 28, (3, 9));
+    rid_not_told_unsettled("flex-crash", "settle+oracles+unsettled", 4, (3, 7));
+}

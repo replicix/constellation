@@ -60061,6 +60061,57 @@ mod await_retry {
         assert!(queue(&h).contains(&(2, 1, true)), "it keeps its place");
     }
 
+    /// ADR-58 C1 (plan 46 M2): a settle of a rid the root has no outcome
+    /// for journals `Abandoned` with no observed keys, so the refusal ships
+    /// in the next round although the root's journal holds a write behind a
+    /// lost chunk on the very inode the settled op named. Before, the
+    /// refusal was held behind it and the peer got `Held` until the drop.
+    #[test]
+    fn a_settle_refusal_ships_past_a_row_held_behind_a_lost_chunk() {
+        let (mut h, broken) = holder_with_a_seed();
+        // A dependent of the seed, executed for another node.
+        exec_as(&h, RowCommit::ARCHIVE, rid_of(2, 1), &chmod(broken, 0o600));
+        let settled = rid_of(3, 7);
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(5),
+                rid: settled,
+                op: chmod(broken, 0o640),
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: true,
+                routed_gen: 0,
+                touched_gen: 0,
+                inbox_ever: false,
+            },
+        });
+        assert_eq!(
+            reply_to(&out, 5),
+            None,
+            "answered before its commit: {out:?}"
+        );
+        // The ship plan: the refusal goes out in the next round.
+        let shipped: Vec<LogRecord> = h
+            .meta
+            .take_journal_grouped(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, rows)| rows)
+            .map(|(_, r)| r)
+            .collect();
+        assert!(
+            shipped
+                .iter()
+                .any(|r| matches!(r, LogRecord::Refused { rid, .. } if *rid == settled)),
+            "the settle's refusal is held behind the lost chunk's row: {shipped:?}"
+        );
+        let out = h.archive_lands();
+        assert_eq!(reply_to(&out, 5), Some(MutateOutcome::Abandoned), "{out:?}");
+    }
+
     /// R2: the drain stops at a placeholder. The entries on its keys wait
     /// for its requester's retry, so they run on the state it leaves, not
     /// on one without it and ahead of it; the entries on other keys run.

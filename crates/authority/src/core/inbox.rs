@@ -1878,12 +1878,14 @@ impl Core {
                 // Never `Lone`, even for this node's own batch (its takeover
                 // gate drains it): `Core::settle_refusal`.
                 let _settle_class = self.journal_class_for(super::Asker::Remote);
-                replica.journal_inbox_refusal(
-                    rid,
-                    super::client::settle_code(rid, decoded.as_ref().ok()),
-                    ack,
-                    decoded.as_ref().ok(),
-                )?;
+                // ADR-58 C1: an `ABANDONED` refusal observes no keys.
+                let code = super::client::settle_code(rid, decoded.as_ref().ok());
+                let observed = if code == super::client::ABANDONED_CODE {
+                    None
+                } else {
+                    decoded.as_ref().ok()
+                };
+                replica.journal_inbox_refusal(rid, code, ack, observed)?;
                 self.recall_unblock(now, &touched);
                 self.stats.settles_refused += 1;
                 self.stats.inbox_refused_ops += 1;
