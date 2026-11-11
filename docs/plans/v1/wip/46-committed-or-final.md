@@ -869,8 +869,7 @@ compares a claim with the rule of the row that carries the answer and judges by 
 M1.1 review (fable, 2026-11-06, cb4d8dd5): cleared with conditions — SHOULD-1 gated-row re-tags outside the hold, fixed 33c7cd28; SHOULD-2 Leave-ends-grants not built, safety rests on the lone-root cap: re-check at M1.2 steps 13/14 (or land step 11 first); SHOULD-3 exemption closing items, fixed 33c7cd28; NITs fixed.
 
 *M1.1 review fixes (PROGRESS, "Plan 46 M1.1 review fix round"):* a gated row of a replaced configuration is never re-tagged; a gated row of the configuration in force answered on this disk alone, and a row of any version answered in a continuation epoch's hold, is re-tagged `Singleton` (ADR-33 step 5, as amended), in the version
-it carries; the sim oracle judges a re-tag. Each remaining `strict_commit` exemption has one closing item: `HELD_WRITE_ANSWERED_LATE` (the writer-hold sim artefact,
-`locks-writer-hold-delegated`) closes at **M1.2 step 15 (harness and sim fixes: the M1.2 breakdown's step 15, the harness catalogue and the §8 perf gate, which also fixes the sim's held-write answer timing)**; `delegated-core-stall-root-lease6` closes at **M1.3**, with the stale-clock re-check rule
+it carries; the sim oracle judges a re-tag. Each remaining `strict_commit` exemption has one closing item: `HELD_WRITE_ANSWERED_LATE` (the writer-hold sim artefact, `locks-writer-hold-delegated`) is closed at M1.2 step 15 (the sim finishes a held delegate write as its commit returns, `held_processed_late` is 0 by construction, the exemption is removed); `delegated-core-stall-root-lease6` closes at **M1.3**, with the stale-clock re-check rule
 (an answer committed on this node's disk under a lease re-reads the clock after the write and parks if the lease is no longer usable; the lease6 triage's F1) and that
 configuration's `+commit` 0 of 2,000 in M1.3's exit (it was M2.3 before).
 
