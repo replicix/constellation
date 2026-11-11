@@ -8,7 +8,7 @@ use super::chunks::{ChunkWorld, CHUNK_SIZE};
 use super::clock::Clock;
 use super::history::dir_of;
 use super::history::{check_linearizable, check_linearizable_witnessed, History, NsOp, NsRet};
-use super::node::{read_lease, CommitRecord, NodeEnv, NodeHandle};
+use super::node::{read_lease, CommitRecord, NodeEnv, NodeHandle, PEERS_TICK_MS};
 use super::store::{Bucket, Fault, OpKind, Rule, When};
 use constellation_authority::{ClientReply, Config, NodeId, Stats};
 use constellation_fs_core::types::ROOT_INO;
@@ -5889,6 +5889,23 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
              registered (lag up to {lag_max} ms), rolled back: {unseen_rolled_back} in that window, \
              {seen_rolled_back} outside it"
         );
+    }
+    // ADR-50, S10-I6: a `Singleton` answer is late to see a registered node
+    // by no more than the roster poll and a second of delivery slack. (The
+    // rollbacks outside that window, `seen_rolled_back`, are printed, not
+    // failed: a singleton's unshipped rows legitimately come back when a node
+    // that registered after they were answered takes the lease over, the
+    // death-then-join window of Q6; a non-singleton rollback is I5's.)
+    let poll_ms = if cfg.roster_refresh_ms == 0 {
+        PEERS_TICK_MS
+    } else {
+        cfg.roster_refresh_ms as i64
+    };
+    if lag_max > poll_ms + 1_000 {
+        return Err(format!(
+            "singleton_lag: a Singleton answer was given {lag_max} ms after another node \
+             registered (roster poll {poll_ms} ms + 1000)"
+        ));
     }
     if cfg.keeps_backups {
         let dropped: u64 = report.stats.values().map(|s| s.backup_ack_timeouts).sum();

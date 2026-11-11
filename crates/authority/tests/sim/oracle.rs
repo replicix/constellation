@@ -24,7 +24,7 @@ use super::clock::Clock;
 use super::node::Shared;
 use super::store::Bucket;
 use constellation_authority::segment::{self, Segment};
-use constellation_authority::{Event, NodeId, Replica, Seq};
+use constellation_authority::{Event, NodeId, Replica, S3Result, Seq};
 use constellation_meta::RowCommit;
 use constellation_meta::{BackupTx, LogRecord, Meta, MutateOutcome, Rid};
 use constellation_store_s3::{AckPolicy, Lease, LogStore};
@@ -782,6 +782,16 @@ impl Oracles {
                 ..
             } => told.read(*seq, write_eligible, read_only, *complete, issued.0),
             Event::Peer { from, .. } if *from != node && *from != 0 => told.hear(*from, now_wait),
+            // The inbox is a second door: the core counts the requester of
+            // every batch it executes (`Core::execute_inbox_batch`).
+            Event::S3 {
+                result: S3Result::InboxRun(Ok(batches)) | S3Result::InboxDrain(Ok(batches)),
+                ..
+            } => {
+                for b in batches.iter().filter(|b| b.node != node && b.node != 0) {
+                    told.hear(b.node, now_wait);
+                }
+            }
             _ => return,
         }
         told.flip(node, tip);
@@ -818,6 +828,13 @@ impl Oracles {
             .unwrap()
             .entry(node)
             .or_insert_with(tokio::time::Instant::now);
+    }
+
+    /// `node` is no longer registered (its process died: the sim's roster
+    /// lists the attached nodes), so it is no peer a `Singleton` answer is
+    /// late to see. A restart registers it again ([`Self::note_joined`]).
+    pub fn note_left(&self, node: NodeId) {
+        self.joined_at.lock().unwrap().remove(&node);
     }
 
     /// A `Singleton` answer to `rid` by `node` at `at`: how long another
