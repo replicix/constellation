@@ -2740,6 +2740,31 @@ impl Core {
             self.finish_as(now, rid, outcome, source, replica, out);
             return;
         }
+        // (A settle whose tombstones have not stood a window yet is answered
+        // at its deadline, which `finish_in_doubt` moved there: refusing it
+        // again here would only send it round its route and back.)
+        if self.clients.get(&rid).is_some_and(|c| {
+            c.settle
+                && c.withdraw.is_some_and(|w| {
+                    now.wait
+                        < w.acked_at
+                            .map_or(w.deadline, |t| t.plus(self.dl_t().settle_window))
+                })
+        }) {
+            return;
+        }
+        // Late landing (flex-tight seed 1002): an op with a durable inbox
+        // batch is not answered in doubt with the batch standing: a takeover
+        // drains it after the `EIO` (I4). It is settled instead: the
+        // tombstones are written first and the unsettled `EIO` waits a window
+        // after the last acknowledgement (`finish_in_doubt`), as at the
+        // first deadline.
+        if self.clients.get(&rid).is_some_and(|c| {
+            !c.settle && !c.inbox_keys.is_empty() && Self::settles(c.origin, c.policy)
+        }) {
+            self.client_deadline(now, rid, false, replica, out);
+            return;
+        }
         // Sent, and no sequencer can settle it in this epoch: the unsettled
         // `EIO` (counted here unless `finish_in_doubt` counts a settle's).
         if self.clients.get(&rid).is_some_and(|c| !c.settle) {
