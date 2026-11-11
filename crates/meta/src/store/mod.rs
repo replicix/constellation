@@ -643,6 +643,11 @@ pub struct Meta {
     /// Whether `held` may be non-default, so a ship with nothing poisoned
     /// does not take its lock (plan 30 §M4 round 2).
     pub(crate) held_any: AtomicBool,
+    /// ADR-59's negative control (the simulation's
+    /// `parent_taint_conservative`): the ship rule treats a directory's
+    /// merged attributes as exclusive writes again and `repair drop-held`
+    /// rolls back everything that depends on the seeds, as before the ADR.
+    pub(crate) parent_taint_conservative: AtomicBool,
     /// The decoded replay queue at its last read generation
     /// (`Meta::queue_snapshot`).
     pub(crate) queue_cache: std::sync::Mutex<Option<std::sync::Arc<spec::QueueSnapshot>>>,
@@ -1337,6 +1342,7 @@ impl Meta {
             deleg_gate: std::sync::RwLock::new(()),
             held: std::sync::Mutex::new(held::HeldSummary::default()),
             held_any: AtomicBool::new(false),
+            parent_taint_conservative: AtomicBool::new(false),
             queue_cache: std::sync::Mutex::new(None),
             unshipped: std::sync::Mutex::new(crate::replay::TouchSet::default()),
             unshipped_gen: AtomicU64::new(0),

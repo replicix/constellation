@@ -1018,8 +1018,10 @@ fn drop_held_keeps_dependents_in_journal_order() {
     exec_as(&meta, Archive, rid_of(8, 1), &create("y", (1 << 40) + 1));
     exec_as(&meta, Lone, rid_of(1, 7), &chmod(broken, 0o640));
 
+    // (ADR-59: the two creates merge the directory the held rename merges
+    // and name other dentries: they ship, they are not rolled back.)
     let dropped = meta.drop_held(broken, 1).unwrap();
-    assert_eq!((dropped.dropped, dropped.requeued), (1, 5), "{dropped:?}");
+    assert_eq!((dropped.dropped, dropped.requeued), (1, 3), "{dropped:?}");
     let queue = meta.pending_replays().unwrap();
     let order: Vec<_> = queue
         .iter()
@@ -1040,8 +1042,6 @@ fn drop_held_keeps_dependents_in_journal_order() {
             (seed.node, seed.seq, false, true),
             (1, 5, false, false),
             (7, 1, true, false),
-            (1, 6, false, false),
-            (8, 1, true, false),
             (1, 7, false, false),
         ],
         "journal order, the placeholders in their place: {queue:?}"
@@ -1058,7 +1058,7 @@ fn drop_held_keeps_dependents_in_journal_order() {
     // A read of a name only a placeholder stands for waits like a read of
     // a queued replay's: the requester's retry writes it again.
     use constellation_meta::ReadKey;
-    assert!(meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "y".into())]));
+    assert!(meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "moved".into())]));
     assert!(!meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "unrelated".into())]));
 }
 
@@ -1166,10 +1166,10 @@ fn a_read_of_a_sibling_under_a_placeholders_shared_parent_is_not_blocked() {
     let queue = meta.pending_replays().unwrap();
     assert_eq!(
         queue.iter().filter(|q| q.is_await_retry()).count(),
-        2,
-        "{queue:?}"
+        1,
+        "the create of y merges the directory the rename merges: it is not held: {queue:?}"
     );
-    assert!(meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "y".into())]));
+    assert!(meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "moved".into())]));
     assert!(
         meta.replay_touches(&[ReadKey::Dir(ROOT_INO)]),
         "the listing changes"
@@ -1458,4 +1458,124 @@ fn an_op_the_drop_rolled_back_keeps_its_chunk_when_the_refusal_will_not_ship() {
         assert_eq!(dropped.rolled_back, vec![seed]);
         assert_eq!(!dropped.kept_pending.is_empty(), kept, "{dropped:?}");
     }
+}
+
+// ---------------------------------------------------------------------
+// ADR-59: a directory's merged attributes order nothing.
+// ---------------------------------------------------------------------
+
+fn shipped_records(meta: &Meta, segment: u64) -> Vec<LogRecord> {
+    let rows = batch(meta);
+    ship(meta, &rows, segment);
+    records(&rows)
+}
+
+/// A holder with `d/broken` shipped, `broken`'s manifest naming a lost
+/// chunk (the seed, held) and the chunk recorded unrecoverable. Returns
+/// the records that shipped.
+fn seed_in_a_subdirectory() -> (Meta, Ino, Ino, Vec<LogRecord>) {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let lost = ChunkHash::of(b"bytes that are gone");
+    let d = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
+    let broken = meta.create(d, "broken", 0o644, 0, 0).unwrap().ino;
+    let all = shipped_records(&meta, 1);
+    meta.set_manifest_dirty(
+        broken,
+        None,
+        &manifest_naming(lost, 19),
+        19,
+        None,
+        None,
+        &[lost],
+    )
+    .unwrap();
+    meta.note_unrecoverable_chunks(&[(lost, broken)], true)
+        .unwrap();
+    (meta, d, broken, all)
+}
+
+#[test]
+fn a_create_of_another_name_ships_past_a_held_rename_in_its_directory() {
+    let (meta, d, _broken, _) = seed_in_a_subdirectory();
+    // Held: it writes the seed's inode and name.
+    meta.rename(d, "broken", d, "moved").unwrap();
+    // Not held: another name, and the directory's record is a merge on
+    // both sides.
+    meta.create(d, "x", 0o644, 0, 0).unwrap();
+    let recs = records(&batch(&meta));
+    assert!(
+        recs.iter()
+            .any(|r| matches!(r, LogRecord::Create { name, .. } if name == "x")),
+        "the create ships past the held rename: {recs:?}"
+    );
+    assert!(recs.iter().all(|r| !matches!(
+        r,
+        LogRecord::Rename { .. } | LogRecord::WriteManifest { .. }
+    )));
+    assert_eq!(
+        meta.held_summary().transactions,
+        2,
+        "the seed and the rename"
+    );
+}
+
+#[test]
+fn the_publish_view_merges_a_shipped_sibling_into_the_held_parent() {
+    let (meta, d, _broken, mut all) = seed_in_a_subdirectory();
+    meta.rename(d, "broken", d, "moved").unwrap();
+    meta.create(d, "x", 0o644, 0, 0).unwrap();
+    meta.mkdir(d, "sub", 0o755, 0, 0).unwrap();
+    meta.mkdir(ROOT_INO, "elsewhere", 0o755, 0, 0).unwrap();
+    let rows = batch(&meta);
+    ship(&meta, &rows, 2);
+    all.extend(records(&rows));
+    for name in ["x", "sub", "elsewhere"] {
+        assert!(
+            all.iter().any(|r| matches!(
+                r,
+                LogRecord::Create { name: n, .. } | LogRecord::Mkdir { name: n, .. } if n == name
+            )),
+            "{name} ships past the held rename"
+        );
+    }
+    let basis = basis(&meta);
+    assert!(
+        matches!(basis, PublishBasis::Substituted(_)),
+        "the held rename and seed are outstanding: {basis:?}"
+    );
+    assert_eq!(
+        published_view(&meta, &basis),
+        replayed(&all),
+        "the publish view is the log prefix: d's times and link count carry the \
+         shipped create and mkdir, and so does d's name in the root"
+    );
+}
+
+#[test]
+fn an_explicit_utimes_of_the_directory_waits_behind_a_held_create_in_it() {
+    let (meta, d, _broken, _) = seed_in_a_subdirectory();
+    meta.rename(d, "broken", d, "moved").unwrap();
+    meta.setattr(d, None, None, None, None, None, Some(1))
+        .unwrap();
+    let recs = records(&batch(&meta));
+    assert!(
+        recs.iter().all(|r| !matches!(r, LogRecord::Setattr { .. })),
+        "the utimes of d is an exclusive write of what the held rename merged: {recs:?}"
+    );
+    assert_eq!(meta.held_summary().transactions, 3);
+}
+
+#[test]
+fn a_create_of_the_renamed_away_name_waits() {
+    let (meta, d, _broken, _) = seed_in_a_subdirectory();
+    meta.rename(d, "broken", d, "moved").unwrap();
+    meta.create(d, "broken", 0o644, 0, 0).unwrap();
+    let recs = records(&batch(&meta));
+    assert!(
+        recs.iter()
+            .all(|r| !matches!(r, LogRecord::Create { name, .. } if name == "broken")),
+        "the name the held rename took away: {recs:?}"
+    );
+    assert_eq!(meta.held_summary().transactions, 3);
 }

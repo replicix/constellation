@@ -107,7 +107,7 @@ use constellation_mtree::keys;
 use constellation_mtree::record::{InodeRecord, Payload};
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx, Snapshot};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
 
 /// Which journaled apply `Meta::apply_records_journaled_inner` runs.
@@ -2230,6 +2230,10 @@ impl Meta {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LogPrefixView {
     before: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// ADR-59: the keys of `before` that every outstanding `Local` row
+    /// wrote only by a directory's commutative merge, so that a shipped
+    /// row's merge of the key can be applied to its value.
+    merge_only: BTreeSet<Vec<u8>>,
 }
 
 impl LogPrefixView {
@@ -2260,10 +2264,77 @@ impl LogPrefixView {
     }
 
     /// Record `key`'s before-image unless an earlier row already did.
-    pub(crate) fn note(&mut self, key: &[u8], before: &Option<Vec<u8>>) {
-        self.before
-            .entry(key.to_vec())
-            .or_insert_with(|| before.clone());
+    /// `merged`: this outstanding row wrote `key` only by merge; one
+    /// exclusive write of it by any outstanding row ends that.
+    pub(crate) fn note(&mut self, key: &[u8], before: &Option<Vec<u8>>, merged: bool) {
+        match self.before.entry(key.to_vec()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(before.clone());
+                if merged {
+                    self.merge_only.insert(key.to_vec());
+                }
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                if !merged {
+                    self.merge_only.remove(key);
+                }
+            }
+        }
+    }
+
+    /// ADR-59: a transaction of this node that shipped past the
+    /// outstanding rows wrote `keys` (`merge`: those it wrote only by
+    /// merge). For each of them the view holds, the log prefix is the
+    /// view's value with the transaction's merge applied. False if that
+    /// cannot be said: a key of the view that the transaction wrote
+    /// exclusively, or that an outstanding row wrote exclusively, or a
+    /// directory-name copy whose inode the view does not carry.
+    pub(crate) fn merge_shipped<'k>(
+        &mut self,
+        keys: impl Iterator<Item = &'k Vec<u8>>,
+        merge: &[(Vec<u8>, spec::MergeEntry)],
+    ) -> bool {
+        let mut entries = Vec::new();
+        for key in keys {
+            if !self.before.contains_key(key) {
+                continue;
+            }
+            let Ok(at) = merge.binary_search_by(|(k, _)| k.cmp(key)) else {
+                return false;
+            };
+            if !self.merge_only.contains(key) {
+                return false;
+            }
+            entries.push((key, merge[at].1));
+        }
+        // Records first, then the copies that follow them.
+        for (key, entry) in &entries {
+            let spec::MergeEntry::Inode(delta) = entry else {
+                continue;
+            };
+            let Some(Some(raw)) = self.before.get(*key) else {
+                return false;
+            };
+            let Ok(mut rec) = InodeRecord::decode(raw) else {
+                return false;
+            };
+            delta.apply_to(&mut rec.attrs);
+            self.before.insert((*key).clone(), Some(rec.encode()));
+        }
+        for (key, entry) in &entries {
+            let spec::MergeEntry::Copy { ino } = entry else {
+                continue;
+            };
+            let Some(Some(raw)) = self.before.get(&keys::inode(*ino)) else {
+                return false;
+            };
+            let Ok(rec) = InodeRecord::decode(raw) else {
+                return false;
+            };
+            let copy = constellation_mtree::record::DentryRecord::for_inode(*ino, &rec.attrs);
+            self.before.insert((*key).clone(), Some(copy.encode()));
+        }
+        true
     }
 
     fn range(
