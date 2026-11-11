@@ -5476,9 +5476,8 @@ fn lease_fencing(_seed: u64) -> Result<()> {
     // A node with a mounted peer answers a mutation only once the archive
     // has it (ADR-40 and ADR-50: no `ack=local` any more), so an *acknowledged*
     // record is never left unshipped on A. The stranded work is an in-flight
-    // mkdir: A's rounds
-    // are held, so the mkdir sits journaled and unanswered (its requester
-    // blocked on the archive) when A is frozen and deposed.
+    // mkdir: A's rounds are held, so the mkdir sits journaled and unanswered
+    // (its requester blocked on the archive) when A is frozen and deposed.
     let hold = root.path().join("hold-a");
     let held_marker = root.path().join("hold-a.held");
     let mut c0 = short(
@@ -5576,8 +5575,11 @@ fn lease_fencing(_seed: u64) -> Result<()> {
     // with no operator step. What must hold is that nothing reached the log
     // behind B's back under A's old epoch: the mkdir arrives only as B's
     // own execution of the replay.
-    c0.resume()?;
+    // Lift the hold while A is still stopped, so its first rounds after
+    // SIGCONT can ship: it must find out it was deposed before it ships
+    // anything under its old epoch.
     std::fs::remove_file(&hold)?;
+    c0.resume()?;
     eventually(
         "A recovers from the deposition by itself",
         Duration::from_secs(40),
@@ -5905,17 +5907,16 @@ fn epoch_member_lost(_seed: u64) -> Result<()> {
 /// `.constellation-conflict/same@<node>-<ts>-<seq>` copy, while `clean-from-a`
 /// and `a-only` replay cleanly with no conflict copy at all.
 ///
-/// **Layer A only** (plan 30 §3's durability table, "no backup"): the
-/// premise is a holder that keeps acknowledging locally while cut off
-/// from S3, so its acknowledged writes strand when it is deposed. Plan
-/// 30 §M9 auto-selects a LAN peer as a synchronous backup
-/// (`CONSTELLATION_BACKUP_RTT_BUDGET_MS`, default 5 ms), and with one the
-/// premise no longer holds: while the backup is being brought up nothing
-/// is acknowledged without S3 (the writes block, then fail in doubt),
-/// and once it is committed the writes are acknowledged by the backup,
-/// which seals A's epoch and adopts them — nothing strands. So this
-/// scenario pins the budget to 0 (today's `Local`), and
-/// `deposed-reintegration-backup` covers the M9 path.
+/// **A lone root only** (ADR-40, ADR-50): the premise is a holder that
+/// acknowledges locally while cut off from S3, so its acknowledged writes
+/// strand when it is deposed. Only a singleton (a root whose roster lists
+/// no write-eligible peer) answers from its own disk: with a peer mounted
+/// its writes wait for the archive or a backup and fail in doubt at the
+/// deadline. So B joins only after A is frozen, a join A never hears of
+/// (the singleton's death-then-join contract), and takes the expired
+/// lease. The backup budget stays pinned to 0: it keeps B from becoming
+/// A's backup once A resumes, so the replay goes through B as holder.
+/// `deposed-reintegration-backup` covers the M9 path with a backup.
 fn deposed_reintegration(_seed: u64) -> Result<()> {
     let (env, root) = setup("deposed-reintegration")?;
     // Since ADR-40 and ADR-50 only a *singleton* root (its roster lists no
@@ -12155,19 +12156,27 @@ fn holder_publishes_log_prefix_mode(_seed: u64, backup: bool) -> Result<()> {
     let mut a = tune(Client::new(root.path(), "a", &env.endpoint, &backend)?)
         .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "50");
     let mut b = tune(Client::new(root.path(), "b", &env.endpoint, &backend)?);
+    if !backup {
+        b = b.with_env("CONSTELLATION_P2P", "off");
+    }
     a.fs_create()?;
     a.mount()?;
     // A is the holder whose backup the scenario waits for; a root mount
     // holds no lease until something is written (`take_root_lease`).
     take_root_lease(&a)?;
-    // Without a backup the premise is the lone root's: since ADR-50 only a
+    // Without a backup the premise is a lone root's: since ADR-50 only a
     // singleton (a root whose roster lists no write-eligible peer) answers
-    // from its own disk, so B joins after the kill. With a peer mounted, A
-    // answers only what the archive or a backup holds, and no acknowledged
-    // tail can be lost with it.
+    // from its own disk. With a write-eligible peer mounted, A answers only
+    // what the archive or a backup holds, and no acknowledged tail can be
+    // lost with it. B is therefore a read-only member (ADR-50: it does not
+    // end the singleton) with P2P off, so it only tails S3: it has followed
+    // the log since the start, and no pre-S3 stream shows it rows the log
+    // never got. That keeps the B == D oracle below meaningful.
     if backup {
         b.mount()?;
         wait_for_p2p(&[&a, &b])?;
+    } else {
+        b.mount_view(None, &["--read-only-member"])?;
     }
     let a_node = a.control_status()?["node_id"]
         .as_u64()
@@ -12184,12 +12193,10 @@ fn holder_publishes_log_prefix_mode(_seed: u64, backup: bool) -> Result<()> {
         })?;
     }
     std::fs::create_dir(a.mnt.join("burst"))?;
-    if backup {
-        eventually("burst/ visible on B", Duration::from_secs(20), || {
-            anyhow::ensure!(b.mnt.join("burst").is_dir(), "burst/ missing on B");
-            Ok(())
-        })?;
-    }
+    eventually("burst/ visible on B", Duration::from_secs(20), || {
+        anyhow::ensure!(b.mnt.join("burst").is_dir(), "burst/ missing on B");
+        Ok(())
+    })?;
     proxy.latency(25, 0)?;
 
     // The writer counts only mkdirs that returned success. After the kill
@@ -12270,9 +12277,6 @@ fn holder_publishes_log_prefix_mode(_seed: u64, backup: bool) -> Result<()> {
     let acked_n = acked.load(Ordering::Relaxed);
     proxy.remove_all_toxics()?;
 
-    if !backup {
-        b.mount().context("B joins after the holder's death")?;
-    }
     let mut d = tune(Client::new(root.path(), "d", &env.endpoint, &backend)?);
     let checked = (|| -> Result<()> {
         d.mount()
