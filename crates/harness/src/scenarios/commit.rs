@@ -490,7 +490,10 @@ fn topology_wan_sticky(n: usize) -> Result<Rows> {
         &["a", "b"],
         &[
             ("CONSTELLATION_DELEGATION_PLACEMENT", ""),
-            ("CONSTELLATION_DELEGATION_MIN_OPS", "50"),
+            // Under net-wan a forwarded create takes ~120 ms, so the writer
+            // does 4 to 8 ops/s: the floor must lie below that (2 ops/s
+            // here), or the placement never sees a dominant writer.
+            ("CONSTELLATION_DELEGATION_MIN_OPS", "10"),
             ("CONSTELLATION_DELEGATION_WINDOW_MS", "5000"),
             ("CONSTELLATION_DELEGATION_FAR_DWELL_MS", "5000"),
             ("CONSTELLATION_DELEGATION_STICKY_PLACEMENT", "on"),
