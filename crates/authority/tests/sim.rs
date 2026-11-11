@@ -309,6 +309,7 @@ fn replay_seed() {
         Ok("sticky-holder-dies") => sticky_holder_dies_config(),
         Ok("sticky-holder-returns") => sticky_holder_returns_config(),
         Ok("sticky-holder-restarts") => sticky_holder_restarts_config(),
+        Ok("sticky-holder-restarts-placed") => sticky_holder_restarts_placed_config(),
         Ok("sticky-holder-fresh") => sticky_holder_fresh_config(),
         Ok("sticky-holder-restarts-cut") => sticky_holder_restarts_cut_config(),
         Ok("sticky-ttl") => sticky_ttl_config(),
@@ -2057,6 +2058,23 @@ fn sticky_holder_restarts_config() -> SimConfig {
             },
         ],
         ..delegated_config()
+    }
+}
+
+/// Plan 46 M1.3 step 7: `sticky-holder-restarts` with the placement on
+/// (`placement_core_config`) in place of the operator's grant: a
+/// placement-made sticky holder that restarts is quarantined like any sticky
+/// holder (s7 amendment A8).
+fn sticky_holder_restarts_placed_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::placement_core_config),
+        // Every pair far, and no operator grant: node 2 dominates `d2`, so
+        // the placement grants it a sticky subtree, which then crashes and
+        // returns with its journal.
+        rtts: far_config().rtts,
+        sticky_delegations: Vec::new(),
+        cross_ratio: 0.0,
+        ..sticky_holder_restarts_config()
     }
 }
 
@@ -6956,6 +6974,7 @@ fn base_config(label: &str) -> SimConfig {
         "sticky-holder-dies" => sticky_holder_dies_config(),
         "sticky-holder-returns" => sticky_holder_returns_config(),
         "sticky-holder-restarts" => sticky_holder_restarts_config(),
+        "sticky-holder-restarts-placed" => sticky_holder_restarts_placed_config(),
         "sticky-holder-fresh" => sticky_holder_fresh_config(),
         "sticky-holder-restarts-cut" => sticky_holder_restarts_cut_config(),
         "sticky-ttl" => sticky_ttl_config(),
@@ -9444,6 +9463,10 @@ impl OracleTotals {
             r.stats.values().map(|s| s.inbox_hold_cross_unknown).sum::<u64>(),
             r.stats.values().map(|s| s.inbox_hold_cross_sent).sum::<u64>(),
             r.stats.values().map(|s| s.inbox_hold_cross_local).sum::<u64>()
+        );
+        eprintln!(
+            "SWEEP-TP {label} seed {seed}: sim_ms {} returned {}",
+            r.sim_ms, r.ops_returned
         );
         // Plan 46 M1.3 step 7: the placement's sticky grants, per seed
         // (`SWEEP-PLACE`): the coverage the sweeps report.
