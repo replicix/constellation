@@ -212,6 +212,14 @@ deposition also queued the write's row for replay by rid, the replay and
 the resubmission are the same op: whichever runs first decides it, and
 the other finds that outcome and does not run again.
 
+A stranded row that nobody acknowledged (the deposed node's own, or another
+node's) is not replayed as an execution: the replay drain submits it as a
+settle, which finds the rid's outcome or makes the sequencer in force journal
+`Abandoned`, so the requester's retry by rid is the copy that executes. An
+acknowledged row is still replayed (I5). A client that heard an unsettled `EIO`
+therefore never sees its op execute later
+([ADR-49](../../explanation/DECISIONS.md#adr-49-a-late-landing-is-bounded-by-what-the-executor-itself-can-see)).
+
 **Reconfiguration.** A backup that makes no acknowledgement progress for
 `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` (1 s), or whose link goes down, is
 removed by a lease CAS that bumps `config_version`. Until that CAS

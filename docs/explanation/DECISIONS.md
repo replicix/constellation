@@ -3638,3 +3638,116 @@ See: `crates/authority/src/core/delegate.rs` (`delegate_try_execute`),
 `crates/authority/src/core/client.rs` (`send_forward`, `on_mutate_reply`),
 `crates/authority/src/core/inbox.rs`,
 [delegations](../reference/features/delegations.md).
+
+## ADR-49: A late landing is bounded by what the executor itself can see
+
+**Status**: decided by the maintainer on 2026-11-10 and 2026-11-11 (late-landing
+analysis; decisions U1 to U6 below). Landed as the inbox freshness rule, the
+settle-only replay, the stale-park drop and the concurrent tombstones.
+Complements [ADR-47](#adr-47-an-executor-runs-a-forward-only-under-the-generation-it-was-routed-by)
+(the generation fence) and [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay).
+
+**Context**: invariant I4 says an operation whose client heard an `EIO` does not
+take effect afterwards. The unsettled `EIO` (the op's settle reached no
+sequencer, so no `Abandoned` row exists to dedup against) is the case that
+needs help: a copy of the op that is still somewhere can execute after the
+client was told. The simulation found such copies in four places: an inbox
+batch read before the requester gave up and executed after, by a drain that
+had held the bytes for seconds (a slow GET, a backlog of events, gate leftovers,
+a halted batch); a replay by rid of a row nobody had acknowledged, which runs
+once the client has been answered; a forwarded execution parked at a holder
+or delegate that ran when its wait ended; and a poll result applied to the
+wrong op. A second problem sat beside it: an unsettled `EIO` reported while a
+sequencer that could have answered was reachable.
+
+**Decision**: the bound is a rule in the executor, using only its own clock,
+and not bookkeeping at the requester or the root.
+
+- **Inbox freshness.** A drain runs an inbox op only from a GET it issued less
+  than `settle_window / 2` ago on its own clock. Older bytes are discarded
+  without journaling anything and the key is read again. The issue time
+  travels with the read (poll, gate drain, leftovers, halted bytes, the root's
+  own batch). The proof: the requester's tombstone is acknowledged at `T0`,
+  its client hears the unsettled `EIO` no earlier than `T0 + settle_window`; a
+  read that did not see the tombstone was issued before `T0`, so an execution
+  after the `EIO` is more than `settle_window` after the issue, which the
+  freshness rule forbids for any clock-rate error below 41 percent (the
+  assumption the lease already makes).
+- **Poll results are matched to their op**, and **a batch's key is recorded
+  when its PUT is issued**, not when it is acknowledged, so a tombstone always
+  knows every key the op may be in.
+- **Replays of unacknowledged or foreign rows settle and never execute.** The
+  replay drain decides from its own queue row (and the in-memory unacked set,
+  which closes the gap before the mark is persisted): such a row is submitted
+  as a settle, which finds the outcome or journals `Abandoned`. A row that
+  looks acknowledged still executes (the client heard success; I5). A
+  crashed process takes its clients with it, so I4 does not apply to them.
+- **Stale parks are dropped.** An unexecuted forwarded park is dropped with
+  `Busy` at tenure end, release and `force_lost` (a delegate's already ended
+  with its generation), and runs on completion only if the last message of the
+  rid arrived less than the freshness bound ago; otherwise it answers `Held`
+  and a still-waiting requester re-sends.
+- **The tombstones run alongside the settle.** A settle's inbox tombstones are
+  written next to the settle itself, not in front of it. A settled answer needs
+  no tombstone (the row at the sequencer in force is the witness), and a
+  settle in flight races only with the drain at the same sequencer. What
+  waits for the last tombstone's acknowledgement is only the unsettled `EIO`
+  and the inbox settle route. The first tombstone starts a freshness bound
+  after the first deadline, so the batch still reaches an executor meanwhile.
+  Withdrawing first had made the settle send nothing for the whole tombstone
+  time and raised the number of `EIO`s told while a sequencer was reachable.
+- **A failed tombstone** (U1, option a): the client hears the unsettled `EIO`
+  when the window ends, the answer is labelled `isolated-from-s3`
+  (`settle_withdraw_failed`), and the tombstone is retried in the background
+  (six attempts). The op may still land.
+- **The settle hold** (S3): a lease holder whose honour is current answers a
+  settle `Held` and never `Busy` or `NotHolder{0}`, and a requester treats
+  such a `Held` as a window reset up to the settle's cap. A requester whose
+  honour has lapsed sends its settle to the cached holder or any connected peer,
+  and a takeover claim contacts the previous holder with `SealTail` even when
+  it fetches no tail.
+
+The invariant, now stated as one sentence: **an op whose client heard an
+unsettled `EIO` never executes later**, with the residuals listed below.
+
+**Known limits** (documented, not closed): a P2P message delayed more than
+half the settle window (15 s with the defaults) and not overtaken by the
+settle (U2: accepted; the sim asserts the bound per configuration); a failed
+tombstone, above; a row a live delegate journaled before the `EIO` and
+appended after an unrelated later op of the same node on root keys (exists
+before this change, watched by a sweep). **Late-landing's earlier claim
+that freshness closes R-IB2 was wrong.** R-IB2 needs only a read issued
+shortly before the tombstone and an execution shortly after it, and no
+freshness bound separates those; freshness works for I4 because the client's
+`EIO` is at least a window after the tombstone. The case where a
+lease-holder is also the designee of a generation (a clock fault beyond the
+rate bound) stays open until route fencing (plan 46 C9, in progress; the
+holder journals its refusal as a stream row) closes it.
+
+**Decisions of the maintainer**: U1 a failed tombstone ends in an unsettled
+`EIO`, labelled; U2 a transit delay beyond half the window is accepted; U3 no
+relative time-to-live on `MutateRequest` (it can only bound lateness); U4
+foreign stranded rows also only settle; U5 the settle hold excludes a lapsed
+honour (a lapsed root may already be deposed); U6 a takeover claim contacts
+the previous holder.
+
+**Consequences**: latency and errno, never safety. An inbox op read late is
+read again (stats `inbox_stale_reads_discarded`, `inbox_stale_relists`); a
+held settle can lengthen the tail up to the cap (`settles_window_reset`). A
+replayed unacknowledged row no longer executes; its requester's retry by rid is
+the copy that does. The engine's `fsync_wait` cap may answer `EIO` before the
+core's settle ends; the sim cannot see it, out of scope.
+
+**Rejected**: a deadline stamp (`ttl_ms`) on every forward (a cross-node
+clock; bounds lateness only); holding the unsettled `EIO` until a failed
+tombstone lands (unbounded while S3 is down); withdraw-first (the settle sat
+silent for the tombstones' time); a new `Superseded` message for the settle to
+reach the successor (the existing `SealTail` and `NotHolder` suffice).
+
+**May revert**: no.
+
+See: `crates/authority/src/core/inbox.rs` (`execute_inbox_batch`,
+`on_inbox_polled`, `on_inbox_withdrawn`), `crates/authority/src/core/client.rs`
+(`client_deadline`, `settle_route`), `crates/authority/src/core/replay.rs`,
+`crates/authority/src/core/holder.rs`, [delegations](../reference/features/delegations.md),
+[forwarded mutations](../reference/features/forwarded-mutations.md).
