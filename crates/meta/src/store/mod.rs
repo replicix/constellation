@@ -113,6 +113,8 @@ pub(crate) mod journal;
 pub(crate) mod local;
 #[cfg(test)]
 mod lock_bench;
+#[cfg(test)]
+mod merge_tests;
 pub(crate) mod misc;
 pub(crate) mod ns;
 #[cfg(test)]

@@ -738,7 +738,7 @@ type KeysAndRow = (Option<Vec<Vec<u8>>>, Option<local::JournalTx>);
 /// [`KeysAndRow`] of `tx`.
 fn tx_keys_and_row(r: &impl Readable, meta: &Meta, tx: &Tx) -> Result<KeysAndRow, MetaError> {
     let keys = match tx.spec_seq {
-        Some(seq) => spec::row_keys_and_origin(r, meta, seq)?.map(|(keys, _)| keys),
+        Some(seq) => spec::row_keys_and_origin(r, meta, seq)?.map(|row| row.keys),
         None => None,
     };
     let row = local::get_journal_tx(r, meta, tx.first)?;
@@ -1456,7 +1456,7 @@ impl Meta {
             }
             tainted.extend(keys);
             let origin = spec::row_keys_and_origin(&tx, self, spec_seq)?
-                .map(|(_, origin)| origin)
+                .map(|row| row.origin)
                 .unwrap_or(spec_seq);
             if is_seed {
                 seeds.push((t, spec_seq, origin));
@@ -2140,7 +2140,7 @@ mod tests {
                     tx.spec_seq.and_then(|seq| {
                         spec::row_keys_and_origin(&r, meta, seq)
                             .unwrap()
-                            .map(|(keys, _)| keys)
+                            .map(|row| row.keys)
                     }),
                     row.as_ref(),
                 )

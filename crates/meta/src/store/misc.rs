@@ -2,6 +2,7 @@
 //! `pins`, `epochs` and the prune-policy root-discovery helpers.
 
 use crate::error::MetaError;
+use crate::store::spec::MergeDelta;
 use crate::store::{kv_get_tx, kv_set_tx, ns, EpochRow, Meta};
 use constellation_fs_core::Ino;
 use constellation_mtree::record::{InodeRecord, Payload};
@@ -29,7 +30,13 @@ pub(crate) fn touch_times_tx(
         // `crate::hlc`), and never go backwards.
         rec.attrs.mtime_ns = rec.attrs.mtime_ns.max(t);
         rec.attrs.ctime_ns = rec.attrs.ctime_ns.max(t);
-        ns::put_inode_record(tx, ns_ks, dirty, ino, &rec, Some(before))?;
+        // ADR-59: a merge, not an exclusive write: the capture says so.
+        let delta = MergeDelta {
+            nlink: 0,
+            mtime_ns: Some(t),
+            ctime_ns: t,
+        };
+        ns::put_inode_record(tx, ns_ks, dirty.merging(delta), ino, &rec, Some(before))?;
     }
     Ok(())
 }
@@ -87,6 +94,16 @@ fn bump_nlink_touching(
     rec.attrs.ctime_ns = rec.attrs.ctime_ns.max(t);
     // The dentries of the inode follow `nlink` (plan 45): a change that
     // takes it across one name rewrites them, any other leaves them be.
+    // ADR-59: a *directory's* change is a merge, a file's is exclusive.
+    let dirty = if mtime {
+        dirty.merging(MergeDelta {
+            nlink: delta,
+            mtime_ns: Some(t),
+            ctime_ns: t,
+        })
+    } else {
+        dirty
+    };
     ns::put_inode_record(tx, ns_ks, dirty, ino, &rec, Some(before))?;
     Ok(Some(rec))
 }
