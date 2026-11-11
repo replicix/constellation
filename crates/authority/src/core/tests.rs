@@ -66368,7 +66368,8 @@ mod step9_one_stream_per_node {
             );
         }
         assert!(h.core.dl.gens.is_empty(), "nothing was journaled");
-        assert_eq!(h.core.stats.place_skipped_far, 2);
+        assert_eq!(h.core.stats.delegate_refused_far, 2);
+        assert_eq!(h.core.stats.place_skipped_far, 0);
         // A sticky grant is final: no group needed.
         let mut out = Vec::new();
         h.core
@@ -66526,61 +66527,323 @@ mod step9_one_stream_per_node {
         assert_eq!(h.core.stats.place_delegated, 1);
     }
 
-    /// Plan 46 M1.2 step 13 (review SHOULD): a node granted while its link
-    /// to the root was not measured (an unmeasured link counts as in budget)
-    /// that is measured far afterwards has no group within budget: the
-    /// placement recalls its grant and does not grant it again, once the
-    /// measurement has held for a placement tick (one sample does not
-    /// recall) and counting the recall once. Fails on the parent: the first
-    /// far sample recalled, and every evaluation of the recalling grant
-    /// counted again.
+    /// Drive `n` samples of node 2's link at `rtt`, `step_ms` apart.
+    fn samples(h: &mut Harness, rtt: Option<u64>, n: u32, step_ms: u64) {
+        for _ in 0..n {
+            h.advance(step_ms);
+            h.hold(1, None);
+            link_to_2(h, rtt);
+        }
+    }
+
+    /// Placement ticks every `placement_tick_ms` for `ms` of time, the lease
+    /// renewed throughout.
+    fn place_ticks_for(h: &mut Harness, ms: u64) {
+        let tick = (h.core.cfg.placement_window_ms / 10).max(100);
+        let mut left = ms;
+        while left > 0 {
+            let step = tick.min(left);
+            h.advance(step);
+            left -= step;
+            place_tick(h);
+        }
+    }
+
+    fn place_tick(h: &mut Harness) -> Vec<Action> {
+        h.hold(1, None);
+        let (now, mut out) = (h.now, Vec::new());
+        h.core
+            .on_placement_timer(Now::same(now.0), &h.meta, &mut out);
+        out
+    }
+
+    /// Plan 46 M1.3 step 7 (ADR-54), D-c: a placed grant to a node granted
+    /// while its link was unmeasured, and measured far for a whole far dwell
+    /// afterwards, is recalled to be converted, once, with no cooldown on its
+    /// directories; the next round grants it a sticky subtree. One low sample
+    /// resets the far state. With sticky placement off the grant is kept.
+    /// (Replaces the step-13 recall that acted after one placement tick and
+    /// added a cooldown.)
     #[test]
-    fn placement_recalls_a_grant_to_a_node_measured_far_afterwards() {
+    fn placement_converts_a_placed_grant_measured_far_to_sticky() {
         let (mut h, dirs) = root_with_peer(None);
-        let tick = |h: &mut Harness| {
-            let (now, mut out) = (h.now, Vec::new());
-            h.core
-                .on_placement_timer(Now::same(now.0), &h.meta, &mut out);
-            out
-        };
         for _ in 0..40 {
             h.core.place_note(2, [dirs[1]]);
         }
-        tick(&mut h);
+        place_tick(&mut h);
         assert_eq!(h.core.stats.place_delegated, 1);
-        assert_eq!(h.core.stats.place_recalled, 0);
-        // The link is measured far by one sample: no recall yet (a round
-        // trip inflated by load), and a sample back in budget forgets it.
-        let tick_ms = (h.core.cfg.placement_window_ms / 10).max(100);
-        link_to_2(&mut h, Some(500));
-        h.advance(400);
-        for _ in 0..40 {
-            h.core.place_note(2, [dirs[1]]);
-        }
-        let out = tick(&mut h);
-        assert_eq!(h.core.stats.place_recalled, 0, "{out:?}");
+        let placed = *h.core.dl.gens.keys().next().unwrap();
+        let dwell = h.core.cfg.placement_far_dwell_ms;
+        // Far, but not for a whole far dwell: nothing. One low sample in the
+        // middle starts it over.
+        samples(&mut h, Some(500), 3, dwell / 4);
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_converted, 0);
         link_to_2(&mut h, Some(1));
-        h.advance(tick_ms + 1);
-        tick(&mut h);
-        assert_eq!(h.core.stats.place_recalled, 0);
-        assert!(h.core.dl.gens.values().all(|g| g.far_since.is_none()));
-        // Far again, and still far a placement tick later: recalled, once.
-        link_to_2(&mut h, Some(500));
-        h.advance(400);
-        tick(&mut h);
-        assert_eq!(h.core.stats.place_recalled, 0);
-        h.advance(tick_ms + 1);
+        samples(&mut h, Some(500), 3, dwell / 4);
+        place_tick(&mut h);
+        assert_eq!(
+            h.core.stats.place_converted, 0,
+            "the low sample was forgotten"
+        );
+        // A whole dwell far: recalled, once.
+        samples(&mut h, Some(500), 2, dwell / 4);
         for _ in 0..40 {
             h.core.place_note(2, [dirs[1]]);
         }
-        let out = tick(&mut h);
-        assert_eq!(h.core.stats.place_recalled, 1, "{out:?}");
+        let out = place_tick(&mut h);
+        assert_eq!(h.core.stats.place_converted, 1, "{out:?}");
+        assert_eq!(h.core.stats.place_recalled, 1);
         assert_eq!(h.core.stats.deleg_recalls_sent, 1, "{out:?}");
-        // The recall under way is neither counted nor sent again.
-        h.advance(tick_ms + 1);
-        let out = tick(&mut h);
-        assert_eq!(h.core.stats.place_recalled, 1, "{out:?}");
-        assert_eq!(h.core.stats.deleg_recalls_sent, 1, "{out:?}");
+        place_tick(&mut h);
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_converted, 1, "counted once");
+        assert_eq!(h.core.stats.deleg_recalls_sent, 1);
+        // No cooldown: the stream ends, and the next round grants Sticky.
+        h.core.dl.gens.get_mut(&placed).unwrap().ended = true;
+        assert!(
+            h.core.pl.cooldown.is_empty(),
+            "the conversion added a cooldown"
+        );
+        assert_eq!(h.core.stats.place_skipped_cooldown, 0);
+        // The next round's kind for the node is Sticky.
+        let clk = h.clk();
+        assert_eq!(
+            h.core.place_kind_for(clk, 2, dirs[1], &h.meta),
+            Ok(DelegKind::Sticky)
+        );
+        // Sticky placement off: the placed grant stays.
+        let (mut h, dirs) = root_with_peer(None);
+        h.core.cfg.placement_sticky = false;
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        place_tick(&mut h);
+        samples(&mut h, Some(500), 8, dwell / 4);
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_converted, 0);
+        assert_eq!(h.core.stats.place_recalled, 0);
+    }
+
+    /// D-a, D-b: a dominant far writer is granted a sticky subtree once its
+    /// link has measured far for a whole far dwell; before that it is
+    /// forwarded (`place_skipped_far`).
+    #[test]
+    fn placement_grants_a_sticky_subtree_to_a_dominant_far_writer() {
+        let (mut h, dirs) = root_with_peer(Some(120));
+        let dwell = h.core.cfg.placement_far_dwell_ms;
+        samples(&mut h, Some(120), 1, 100);
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_skipped_far, 1);
+        assert_eq!(h.core.stats.place_sticky, 0);
+        assert!(h.core.dl.gens.is_empty());
+        samples(&mut h, Some(120), 4, dwell / 3);
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        place_tick(&mut h);
+        assert_eq!(
+            h.core.stats.place_sticky, 1,
+            "{:?} far {:?} waits {}",
+            h.core.stats.place_skipped_far, h.core.pl.far, h.core.stats.place_grant_waits
+        );
+        assert_eq!(h.core.stats.place_skipped_far, 1);
+        let g = h.core.dl.gens.values().next().expect("a stream");
+        assert_eq!(g.kind(), DelegKind::Sticky);
+        assert_eq!(g.dir_list(), vec![dirs[1]]);
+        // With sticky placement off the same far writer is forwarded.
+        let (mut h, dirs) = root_with_peer(Some(120));
+        h.core.cfg.placement_sticky = false;
+        samples(&mut h, Some(120), 6, dwell / 3);
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_sticky, 0);
+        assert_eq!(h.core.stats.place_skipped_far, 1);
+        assert!(h.core.dl.gens.is_empty());
+    }
+
+    /// D-b: a link between the backup budget and the far round trip is in the
+    /// dead band: neither placed nor sticky, however long it lasts. A low
+    /// sample ends a far dwell in progress, and a node measured within the
+    /// budget is placed at once.
+    #[test]
+    fn the_far_dead_band_neither_places_nor_sticks() {
+        let (mut h, dirs) = root_with_peer(Some(10));
+        assert_eq!(h.core.cfg.backup_rtt_budget_ms, 5);
+        let dwell = h.core.cfg.placement_far_dwell_ms;
+        samples(&mut h, Some(10), 8, dwell / 2);
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_skipped_far, 1);
+        assert_eq!(h.core.stats.place_sticky, 0);
+        assert_eq!(h.core.stats.place_delegated, 0);
+        // Far for less than the dwell, then one low sample, then far again
+        // for less than the dwell: not far.
+        let (mut h, dirs) = root_with_peer(Some(500));
+        samples(&mut h, Some(500), 2, dwell / 2 - 100);
+        samples(&mut h, Some(10), 1, 10);
+        samples(&mut h, Some(500), 2, dwell / 2 - 100);
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_sticky, 0);
+        assert_eq!(h.core.stats.place_skipped_far, 1);
+        // Within the budget: placed.
+        samples(&mut h, Some(2), 1, 10);
+        h.advance(400);
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_delegated, 1);
+        assert_eq!(h.core.stats.place_sticky, 0);
+    }
+
+    /// A-3: a budget of 0 admits no peer, so no writer has a group and every
+    /// connected eligible one is far (no dwell): a dominant near writer gets
+    /// a sticky subtree. With sticky placement off nothing is granted.
+    #[test]
+    fn budget_zero_places_sticky_on_a_near_dominant_writer() {
+        let (mut h, dirs) = root_with_peer(Some(1));
+        h.core.cfg.backup_rtt_budget_ms = 0;
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_sticky, 1);
+        assert_eq!(
+            h.core.dl.gens.values().next().unwrap().kind(),
+            DelegKind::Sticky
+        );
+        let (mut h, dirs) = root_with_peer(Some(1));
+        h.core.cfg.backup_rtt_budget_ms = 0;
+        h.core.cfg.placement_sticky = false;
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_sticky, 0);
+        assert_eq!(h.core.stats.place_delegated, 0);
+        assert!(h.core.dl.gens.is_empty());
+    }
+
+    /// D-c 1: a placed grant whose delegate's share is below the floor is
+    /// recalled only after the long dwell (5 minutes), not after one minute.
+    #[test]
+    fn the_placement_recall_needs_the_long_dwell() {
+        let (mut h, dirs) = root_with_peer(Some(1));
+        assert_eq!(h.core.cfg.placement_dwell_ms, 300_000);
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_delegated, 1);
+        // The delegate stops writing: its share is below the floor. (Main
+        // recalled after the 60 s dwell.)
+        place_ticks_for(&mut h, 31_000 + 61_000);
+        assert_eq!(h.core.stats.place_recalled, 0, "recalled inside the dwell");
+        place_ticks_for(&mut h, 200_000);
+        assert_eq!(h.core.stats.place_recalled, 0, "recalled inside the dwell");
+        place_ticks_for(&mut h, 60_000);
+        assert_eq!(h.core.stats.place_recalled, 1);
+    }
+
+    /// D-a 5: a far node that holds a sticky subtree and dominates another
+    /// grows its sticky stream; a near one is skipped (nothing joins a sticky
+    /// stream but a sticky grant, and a near node is placed).
+    #[test]
+    fn a_sticky_holders_new_dominated_dir_grows_its_sticky_stream() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        let dwell = h.core.cfg.placement_far_dwell_ms;
+        let mut out = Vec::new();
+        let gen = h
+            .core
+            .delegate_dir(h.clk(), dirs[0], 2, DelegKind::Sticky, &h.meta, &mut out)
+            .unwrap();
+        samples(&mut h, Some(500), 4, dwell / 3);
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_sticky, 1);
+        assert_eq!(h.core.dl.gens.len(), 1);
+        assert_eq!(h.core.dl.gens[&gen].dir_list().len(), 2);
+        // A near node is skipped.
+        let (mut h, dirs) = root_with_peer(Some(1));
+        let mut out = Vec::new();
+        h.core
+            .delegate_dir(h.clk(), dirs[0], 2, DelegKind::Sticky, &h.meta, &mut out)
+            .unwrap();
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_sticky, 0);
+        assert_eq!(h.core.stats.place_skipped_designated, 1);
+    }
+
+    /// D-a 6: no grant on a directory a designation is pending on, nor over
+    /// or under it, for any node.
+    #[test]
+    fn placement_never_proposes_over_a_pending_designation() {
+        let (mut h, dirs) = root_with_peer(Some(1));
+        h.core.dl.designating.insert(dirs[1], 3);
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_delegated, 0);
+        assert_eq!(h.core.stats.place_skipped_designated, 1);
+        assert!(h.core.dl.gens.is_empty());
+    }
+
+    /// D-e: a holder's own release of a sticky subtree keeps the placement
+    /// from granting it straight back to that node for one window, and does
+    /// not hold back another node.
+    #[test]
+    fn a_holders_release_quarantines_the_dir_for_that_node_only() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        h.core.cfg.placement_far_dwell_ms = 2_000;
+        let dwell = h.core.cfg.placement_far_dwell_ms;
+        let mut out = Vec::new();
+        let gen = h
+            .core
+            .delegate_dir(h.clk(), dirs[1], 2, DelegKind::Sticky, &h.meta, &mut out)
+            .unwrap();
+        // The release row reaches the log.
+        let mut out = Vec::new();
+        h.core
+            .root_release_appended(h.clk(), gen, &[dirs[1]], true, None, &h.meta, &mut out);
+        assert_eq!(
+            h.core.pl.released.get(&dirs[1]).map(|(n, _)| *n),
+            Some(2),
+            "the release was not remembered"
+        );
+        h.core.dl.gens.get_mut(&gen).unwrap().ended = true;
+        // The window still counts node 2's ops; it is far.
+        samples(&mut h, Some(500), 4, dwell / 3);
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_sticky, 0);
+        assert_eq!(h.core.stats.place_skipped_cooldown, 1);
+        // A recall's release (not the holder's own) is not remembered.
+        // After the window it is granted again.
+        h.advance(h.core.cfg.placement_window_ms + 1);
+        for _ in 0..40 {
+            h.core.place_note(2, [dirs[1]]);
+        }
+        place_tick(&mut h);
+        assert_eq!(h.core.stats.place_sticky, 1);
     }
 
     /// A placed (stealable) grant to a node that holds designations only is
@@ -68657,11 +68920,23 @@ mod step4_sticky {
         // Node 2 writes nothing under its sticky subtree for many dwells.
         for _ in 0..3 {
             h.advance(h.core.cfg.placement_dwell_ms + 1_000);
+            h.hold(1, None);
             tick(&mut h);
         }
         assert_eq!(h.core.stats.place_recalled, 0);
         assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::None);
         assert!(!h.core.dl.gens[&gen].ended);
+        // The negative control: with `placement_recalls_sticky` the same
+        // silence takes the grant back, and the count of the rule it
+        // breaks goes up.
+        h.core.cfg.placement_recalls_sticky = true;
+        for _ in 0..3 {
+            h.advance(h.core.cfg.placement_dwell_ms + 1_000);
+            h.hold(1, None);
+            tick(&mut h);
+        }
+        assert_eq!(h.core.stats.place_recalled, 1);
+        assert_ne!(h.core.dl.gens[&gen].recall, RecallPhase::None);
     }
 
     /// An op the root cannot hand to the holder is refused, not recalled:

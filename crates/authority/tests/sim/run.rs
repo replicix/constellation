@@ -522,6 +522,12 @@ pub struct SimConfig {
     /// on every configuration; `sticky_ends_only_by_holder_or_operator` must
     /// then fail the run.
     pub ttl_reclaims_sticky: bool,
+    /// Negative control (`Config::placement_recalls_sticky`): the placement
+    /// recalls sticky grants as it does placed ones.
+    /// `AUTHORITY_SIM_PLACEMENT_RECALLS_STICKY=1` sets it on every
+    /// configuration; `sticky_ends_only_by_holder_or_operator` must then fail
+    /// the run.
+    pub placement_recalls_sticky: bool,
     /// Negative control (`Config::kept_fetch_skipped`, ADR-51): a takeover
     /// never collects the kept rows of the tenure it ends.
     /// `AUTHORITY_SIM_KEPT_FETCH_SKIPPED=1` sets it on every configuration;
@@ -1054,8 +1060,12 @@ pub fn placement_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c.placement = true;
     c.placement_window_ms = 2_000;
     c.placement_min_ops = 6;
-    c.placement_dwell_ms = 1_500;
+    c.placement_dwell_ms = 6_000;
     c.placement_cooldown_ms = 1_000;
+    // Plan 46 M1.3 step 7: the far test scaled to the short workload.
+    c.placement_sticky = true;
+    c.placement_far_rtt_ms = 20;
+    c.placement_far_dwell_ms = 1_000;
     c
 }
 
@@ -1184,6 +1194,8 @@ impl Default for SimConfig {
             designations: Vec::new(),
             sticky_delegations: Vec::new(),
             ttl_reclaims_sticky: std::env::var_os("AUTHORITY_SIM_TTL_RECLAIMS_STICKY")
+                .is_some_and(|v| v == "1"),
+            placement_recalls_sticky: std::env::var_os("AUTHORITY_SIM_PLACEMENT_RECALLS_STICKY")
                 .is_some_and(|v| v == "1"),
             kept_fetch_skipped: std::env::var_os("AUTHORITY_SIM_KEPT_FETCH_SKIPPED")
                 .is_some_and(|v| v == "1"),
@@ -4974,6 +4986,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         plant_ungated_fast_path: cfg.plant_ungated_fast_path,
         skip_deleg_dep_wait: cfg.skip_deleg_dep_wait,
         ttl_reclaims_sticky: cfg.ttl_reclaims_sticky,
+        placement_recalls_sticky: cfg.placement_recalls_sticky,
         kept_fetch_skipped: cfg.kept_fetch_skipped,
         restart_skips_write_quarantine: cfg.restart_skips_write_quarantine,
         first_start_unsettled: cfg.first_start_unsettled,

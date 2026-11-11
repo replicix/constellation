@@ -618,8 +618,10 @@ pub struct Config {
     /// for a dwell, the placement recalls it.
     pub placement_dominance_pct: u64,
     pub placement_leave_pct: u64,
-    /// `CONSTELLATION_DELEGATION_DWELL_MS` (60 s) and
-    /// `CONSTELLATION_DELEGATION_COOLDOWN_MS` (30 s).
+    /// `CONSTELLATION_DELEGATION_DWELL_MS` (5 min: how long a placed
+    /// grant's share or rate must stay below the floor before the
+    /// placement recalls it) and `CONSTELLATION_DELEGATION_COOLDOWN_MS`
+    /// (30 s).
     pub placement_dwell_ms: u64,
     pub placement_cooldown_ms: u64,
     /// Plan 46 M1.3 step 8 (ADR-56), `CONSTELLATION_STICKY_HANDOVER_GRACE_MS`
@@ -632,6 +634,24 @@ pub struct Config {
     /// a holder's release waits for that report. Off: no fast path (the
     /// simulation, the unit harness).
     pub fast_path_sampled: bool,
+    /// Plan 46 M1.3 step 7 (ADR-54), `CONSTELLATION_DELEGATION_STICKY_PLACEMENT`
+    /// (default on, with `placement`): the placement grants a dominant far
+    /// writer (no peer within the backup RTT budget; every writer when the
+    /// budget is 0) a sticky subtree instead of forwarding it.
+    pub placement_sticky: bool,
+    /// `CONSTELLATION_DELEGATION_FAR_RTT_MS` (20): a link is far when every
+    /// round trip of `placement_far_dwell_ms` is at least this (and above
+    /// the backup RTT budget). Between the budget and this, a node stays
+    /// forwarded (the dead band).
+    pub placement_far_rtt_ms: u64,
+    /// `CONSTELLATION_DELEGATION_FAR_DWELL_MS` (30 s): how long a link must
+    /// measure far, without one lower sample, before it is far.
+    pub placement_far_dwell_ms: u64,
+    /// Fault injection for the simulation's negative control (never set by
+    /// the engine): the placement recalls a sticky grant as it does a placed
+    /// one. The sim's `sticky_ends_only_by_holder_or_operator` must then
+    /// fail the run.
+    pub placement_recalls_sticky: bool,
 }
 
 impl Config {
@@ -787,10 +807,14 @@ impl Config {
             placement_min_ops: 200,
             placement_dominance_pct: 70,
             placement_leave_pct: 50,
-            placement_dwell_ms: 60_000,
+            placement_dwell_ms: 300_000,
             placement_cooldown_ms: 30_000,
             handover_grace_ms: 5_000,
             fast_path_sampled: false,
+            placement_sticky: true,
+            placement_far_rtt_ms: 20,
+            placement_far_dwell_ms: 30_000,
+            placement_recalls_sticky: false,
         }
     }
 }
@@ -1511,10 +1535,29 @@ pub struct Stats {
     /// Placement: candidates skipped because the node holds designations
     /// only, or one is pending (a stream never mixes grant kinds).
     pub place_skipped_designated: u64,
-    /// Plan 46 M1.2 step 13: candidates (and operator grants) refused
-    /// because the node has no group within the backup RTT budget: a far
-    /// writer is forwarded to the root.
+    /// Plan 46 M1.2 step 13: candidates refused because the node has no
+    /// group within the backup RTT budget and is not (yet, or robustly)
+    /// far: it is forwarded to the root.
     pub place_skipped_far: u64,
+    /// Plan 46 M1.3 step 7: operator grants refused for the same reason
+    /// (`delegate_dir`).
+    pub delegate_refused_far: u64,
+    /// Plan 46 M1.3 step 7: sticky grants made by the placement.
+    pub place_sticky: u64,
+    /// Placed grants the placement recalled to convert them (the node is
+    /// measured far).
+    pub place_converted: u64,
+    /// Evaluations in which a subtree under a live sticky stream is
+    /// dominated by another node (the handover's input).
+    pub place_sticky_contended: u64,
+    /// A sticky grant the placement made that `delegate_dir` refused (it
+    /// waits for the read grants or the quarantine, and is retried).
+    pub place_grant_waits: u64,
+    /// First-op wait of a delegate: the time between an op parked for the
+    /// grant record's archive and the install.
+    pub deleg_commit_waits: u64,
+    pub deleg_commit_wait_ms_sum: u64,
+    pub deleg_commit_wait_ms_max: u64,
     /// Delegate: ReadIndex answered for its subtree, read grants given.
     pub deleg_read_index_served: u64,
     pub deleg_read_grants: u64,
