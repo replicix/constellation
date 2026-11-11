@@ -2087,6 +2087,10 @@ pub struct Stats {
     /// Tail transactions that are this node's own journal rows still (its
     /// own sealed tail read back), left to ship as they are.
     pub tail_same_row: u64,
+    /// ADR-59: tail transactions the applied log carries by identity (a row
+    /// shipped ahead of a held one, its member copy outliving the epoch),
+    /// not re-shipped.
+    pub tail_in_log: u64,
     /// Plan 46 M1.2 step 5: the longest the store's writer lock was held by
     /// one takeover's re-ship (ms; c3-spec `reship.duration_ms_max`).
     pub reship_duration_ms_max: u64,

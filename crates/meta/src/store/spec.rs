@@ -815,6 +815,10 @@ pub struct ReshipReport {
     /// epoch and journal seq: a node reading its own sealed tail back),
     /// left as they are.
     pub tail_same_row: usize,
+    /// ADR-59: transactions whose identity the applied log carries (a tenure
+    /// shipped them ahead of a row it held, and the member's copy outlived
+    /// the epoch), skipped.
+    pub tail_in_log: usize,
     /// Rows kept as a member copy of the tail's epoch.
     pub tail_moved: usize,
     /// How long the store's writer lock was held (the transaction's open
@@ -6346,6 +6350,18 @@ impl Meta {
                     crate::store::member::tail_identity(&bt.records).unwrap_or((t.epoch, bt.first));
                 if !seen.insert(ident) {
                     report.tail_done += 1;
+                    continue;
+                }
+                // The log carries the transaction itself (by its identity,
+                // not by the outcome of its rid): a copy that outlived its
+                // epoch, of a row shipped ahead of one the tenure held.
+                let last_of = if ident == (t.epoch, bt.first) {
+                    bt.last
+                } else {
+                    ident.1
+                };
+                if self.session().row_in_log(ident.0, last_of) {
+                    report.tail_in_log += 1;
                     continue;
                 }
                 let rid = bt.records.iter().find_map(|r| match r {
