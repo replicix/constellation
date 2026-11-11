@@ -354,7 +354,8 @@ pub fn epoch_slack_zero_unchanged(_seed: u64) -> Result<()> {
 /// Plan 30 §M10: an epoch whose holder never returns, resolved by
 /// `constellation leave --node-id`. Three nodes, `f = 1`: C goes offline,
 /// A and B form an epoch that carries A's lease, A writes and is killed
-/// (its journal is lost with it). B gets S3 back; its epoch is frozen
+/// (its journal is lost with it, but the write A acknowledged is on B's
+/// hold copy and survives on B and C). B gets S3 back; its epoch is frozen
 /// (A is missing) and B stays silent, so no TTL takeover can pass. The
 /// operator retires A from B: the lease is fenced (epoch bump, A in its
 /// `retired` list), B abandons the epoch and promises again; C comes back
@@ -405,7 +406,7 @@ pub fn epoch_holder_retired(_seed: u64) -> Result<()> {
             },
         )?;
     }
-    std::fs::write(a.mnt.join("d/lost-with-a"), b"a")?;
+    std::fs::write(a.mnt.join("d/acked-by-a"), b"a")?;
     a.kill9()?;
     pb.heal();
     // B: frozen (A missing), silent; C returns with S3 and cannot take the
@@ -456,20 +457,29 @@ pub fn epoch_holder_retired(_seed: u64) -> Result<()> {
         )?;
         print_epoch(NAME, &x.name, &epoch_of(x)?);
     }
-    // A's journal died with it. Whether its write in the epoch is on B
-    // depends on who acknowledged it: since ADR-50 A has peers (B, C
-    // registered), so it never answers alone, and its write is
-    // acknowledged by the epoch's hold group (B's streamed copy) and so
-    // survives A (it did not before, when A answered it from its own disk).
-    // What must hold either way is that nothing else of A's comes back.
-    eprintln!(
-        "    {NAME}: A's write in the epoch {} on B",
-        if b.mnt.join("d/lost-with-a").exists() {
-            "is (the hold group acknowledged it)"
-        } else {
-            "is not"
-        }
-    );
+    // A's journal died with it, but its write in the epoch was acknowledged:
+    // since ADR-50 A has peers (B, C registered), so it never answers alone,
+    // and the epoch's hold group (B's streamed copy) held the row before it
+    // answered. Acknowledged means committed (ADR-40): its entry must survive
+    // A on both nodes. (A budget of 0 does not make A lone: the roster
+    // decides.)
+    for x in [&b, &c] {
+        eventually(
+            &format!("{} has A's acknowledged write", x.name),
+            Duration::from_secs(60),
+            || {
+                let meta = std::fs::metadata(x.mnt.join("d/acked-by-a"));
+                anyhow::ensure!(
+                    meta.as_ref().is_ok_and(|m| m.len() == 1),
+                    "{} has d/acked-by-a = {meta:?}",
+                    x.name
+                );
+                Ok(())
+            },
+        )?;
+    }
+    // (Its entry, not its bytes: the chunk of an epoch's write stays on the
+    // node that wrote it, and died with A.)
     // A can never come back under its old identity.
     pa.heal();
     let mut a = node(root.path(), "a", &pa, &backend, &[])?;
