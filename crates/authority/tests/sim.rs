@@ -9249,6 +9249,8 @@ struct OracleTotals {
     /// `EIO`s of ops its refusal was held back for, and the seeds with one
     /// (`SWEEP-NONSTEALABLE-IN-DOUBT`). Allowed, never a violation.
     nonstealable_in_doubt: (u64, u64),
+    /// ADR-58 C3: `held-behind-lost-chunk` unsettled `EIO`s and the seeds with one.
+    held_lost_chunk: (u64, u64),
     /// Plan 46 M0.3 S5 (ADR-42), `SWEEP-S5-GATE`: generations a shippable
     /// takeover gate took on, renewals it granted, transactions it appended,
     /// settles it redirected.
@@ -9431,6 +9433,8 @@ impl OracleTotals {
         self.unsettled_seeds += u64::from(r.unsettled_violations > 0);
         self.nonstealable_in_doubt.0 += r.unsettled_nonstealable_holder as u64;
         self.nonstealable_in_doubt.1 += u64::from(r.unsettled_nonstealable_holder > 0);
+        self.held_lost_chunk.0 += r.unsettled_held_lost_chunk as u64;
+        self.held_lost_chunk.1 += u64::from(r.unsettled_held_lost_chunk > 0);
         for st in r.stats.values() {
             for (c, n) in self.rowless.iter_mut().zip([
                 st.deleg_release_rowless_capped,
@@ -9640,6 +9644,10 @@ impl OracleTotals {
         eprintln!(
             "SWEEP-LL-STATS {label} seeds {}/{seeds}: [withdrawn-first, resubmitted-ops, stale-reads, stale-relists, stale-parks, unacked-settles, foreign-deferred, withdraw-failed, bg-dropped, multi-batch, withdrawn-ops] {:?}",
             self.seeds, self.ll_core
+        );
+        eprintln!(
+            "SWEEP-HELD-LOST-CHUNK {label} seeds {}/{seeds}: held-behind-lost-chunk unsettled EIOs (allowed: the row waits behind a chunk that exists nowhere; checked against the chunk ledger) {} (in {} seeds)",
+            self.seeds, self.held_lost_chunk.0, self.held_lost_chunk.1
         );
         eprintln!(
             "SWEEP-NONSTEALABLE-IN-DOUBT {label} seeds {}/{seeds}: unsettled EIOs of ops a non-stealable holder's refusal was held back for (allowed: the holder may have run them, its row lands late) {} (in {} seeds)",
@@ -19204,7 +19212,11 @@ fn a_crowded_history_is_checked_in_bounded_time() {
 #[test]
 fn m03_the_configurations_at_zero_violations_stay_there() {
     type Config = fn() -> SimConfig;
-    let strict_configs: [(&str, Config); 13] = [
+    let strict_configs: [(&str, Config); 15] = [
+        // (ADR-58: 0 of 2,000 seeds `+settle+oracles+unsettled`, 98 and 101
+        // seeds failing before.)
+        ("flex", flex_config),
+        ("flex-backup", flex_backup_config),
         ("delegated-crash", delegated_crash_config),
         // (0 of 2,000 seeds `+unsettled` after S5, ADR-42; 1 violation in
         // seeds 0..100 before.)
@@ -19234,7 +19246,7 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     // in seeds 0..99); never raised for a count the ceiling already saw:
     // delegated-backup-and-delegate-die's allowed ceiling was set while its
     // runs that end waiting for a group's tail counted nothing)
-    let ceilings: [(&str, Config, usize, usize); 17] = [
+    let ceilings: [(&str, Config, usize, usize); 18] = [
         ("backup-strict", backup_strict_config, 0, 0),
         ("backup-two", backup_two_config, 0, 0),
         // (Allowed 0 to 26: the runs that end with a root waiting for a
@@ -19309,7 +19321,15 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             0,
             0,
         ),
-        ("flex-crash", flex_crash_config, 125, 9),
+        // (ADR-58: 0 violations and 69 `held-behind-lost-chunk` allowed
+        // unsettled `EIO`s measured in seeds 0..99 (in 35 seeds); 125 and 9
+        // before. In 2,000 seeds 1,279 such, in 680 seeds, and 5 seeds fail:
+        // 4 an unsettled `EIO`, 1834 a late landing.)
+        ("flex-crash", flex_crash_config, 0, 69),
+        // (ADR-58: 1 violation in seeds 0..99 (seed 76: the lease path
+        // reachable for 118 ms of a 6 s window), 876 failing seeds of 2,000
+        // before.)
+        ("flex-tight", flex_tight_config, 1, 0),
         // (Plan 46 M1.2 step 13: a client's settle sent to a root that
         // outwaits the generation of a delegate silent behind a partition
         // used to run out its window a second or two before the root ended
@@ -19371,7 +19391,8 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
                             violations += r.unsettled_violations;
                             allowed += r.unsettled_isolated
                                 + r.unsettled_no_sequencer_in_time
-                                + r.unsettled_generation_tail_unreachable;
+                                + r.unsettled_generation_tail_unreachable
+                                + r.unsettled_held_lost_chunk;
                         }
                         Err(e) => {
                             failures.lock().unwrap().push(format!(
@@ -20381,4 +20402,26 @@ fn adr58_c2_a_sent_op_in_a_refusing_epoch_is_not_told_eio_at_once() {
     rid_not_told_unsettled("flex", all, 164, (1, 10));
     rid_not_told_unsettled("flex-crash", all, 44, (1, 18));
     rid_not_told_unsettled("flex-crash", all, 102, (1, 5));
+}
+
+/// ADR-58 C3: an op whose row waits behind a chunk that exists nowhere is
+/// told an unsettled `EIO` that is labelled `held-behind-lost-chunk`: allowed,
+/// counted apart, and checked against the sim's chunk ledger. Fails on the
+/// parent: the same `EIO`s are I4 violations ("reachable ... Root").
+#[test]
+fn adr58_c3_a_row_behind_a_lost_chunk_is_labelled_not_a_violation() {
+    for seed in [7, 15] {
+        let r = run_seed(
+            seed,
+            strict(base_config("flex-crash"), "settle+oracles+unsettled"),
+        )
+        .unwrap_or_else(|e| panic!("flex-crash+unsettled seed {seed}: {e}"));
+        assert!(
+            r.unsettled_held_lost_chunk > 0 && r.unsettled_violations == 0,
+            "seed {seed}: labelled {}, violations {} ({:?})",
+            r.unsettled_held_lost_chunk,
+            r.unsettled_violations,
+            r.unsettled_causes
+        );
+    }
 }

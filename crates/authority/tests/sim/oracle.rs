@@ -263,6 +263,15 @@ pub struct Unsettled {
     /// was cut over the whole withdraw window. The op may land after the
     /// `EIO`: allowed, counted apart from every reachability class.
     pub isolated_from_s3: bool,
+    /// ADR-58 C3, `held-behind-lost-chunk`: the settle was told the op's row
+    /// waits for a chunk and global truth agrees at the `EIO` (the sim's chunk
+    /// ledger has a chunk dirty on a node gone for good, in no bucket) while
+    /// the verdict would have been a violation. Allowed, counted apart, once the end of the run
+    /// agrees too (`count_unsettled`).
+    pub held_lost_chunk: bool,
+    /// Some node's ship plan held or deferred the rid's transaction at the
+    /// `EIO` (`held_lost_chunk` needs it, or an operator's drop of the rid).
+    pub plan_held: bool,
 }
 
 impl Unsettled {
@@ -581,6 +590,7 @@ impl Oracles {
         designation_held: bool,
         accepted_by_delegate: bool,
         withdraw_failed: bool,
+        lost_chunk_label: bool,
     ) {
         let at = self.reach.now_ms();
         // ADR-47 (§8.3): the requester's label is its own word. It counts as
@@ -646,6 +656,20 @@ impl Oracles {
                 .s3_cut_throughout(node, end.saturating_sub(window_ms), end)
         };
         let isolated_from_s3 = s3_cut && !verdict.allowed();
+        // ADR-58 C3: `lost_chunk_label` is the requester's word, already
+        // checked against the chunk ledger by the caller; it converts a
+        // violation only, and only if some node's ship plan really holds or
+        // defers the rid's transaction (`plan_held`; or an operator's drop
+        // rolled it back, which `count_unsettled` reads at the run's end: the
+        // knob that labels every `Held` must not hide a stall with another
+        // cause).
+        let held_lost_chunk = lost_chunk_label && !verdict.allowed();
+        let plan_held = self
+            .stores
+            .lock()
+            .unwrap()
+            .values()
+            .any(|m| m.rid_behind_lost_chunk(rid));
         if s3_cut {
             // (Whatever the verdict, a landing of the op is U1(a)'s.)
             self.isolated_from_s3_rids.lock().unwrap().insert(rid);
@@ -659,6 +683,8 @@ impl Oracles {
             verdict,
             designation_held,
             silence,
+            held_lost_chunk,
+            plan_held,
         });
     }
 
@@ -3490,10 +3516,22 @@ mod tests {
     #[test]
     fn an_unbacked_designation_label_is_dropped() {
         let o = Oracles::new(Bucket::new(1, (0, 0)));
-        o.note_unsettled(3, rid(3, 1), 1_000, None, true, false, false);
+        o.note_unsettled(3, rid(3, 1), 1_000, None, true, false, false, false);
         let u = o.unsettled.lock().unwrap();
         assert_eq!(u.len(), 1);
         assert!(!u[0].designation_held, "{:?}", u[0]);
+    }
+
+    /// ADR-58 C3: the `held-behind-lost-chunk` label is the requester's word;
+    /// with no node's ship plan holding the rid's transaction it is refused,
+    /// whatever the verdict (the knob that labels every `Held` hides nothing).
+    #[test]
+    fn a_lost_chunk_label_without_a_held_row_is_refused() {
+        let o = Oracles::new(Bucket::new(1, (0, 0)));
+        o.note_unsettled(3, rid(3, 1), 1_000, None, false, false, false, true);
+        let u = o.unsettled.lock().unwrap();
+        assert_eq!(u.len(), 1);
+        assert!(!u[0].held_lost_chunk, "{:?}", u[0]);
     }
 
     /// Late-landing U1(a): an in-doubt answer after a failed tombstone, with
@@ -3508,7 +3546,7 @@ mod tests {
             if cut {
                 o.reach.s3_cut_at(0, 3, true);
             }
-            o.note_unsettled(3, r1, 1_000, None, false, false, true);
+            o.note_unsettled(3, r1, 1_000, None, false, false, true, false);
             *o.invokes.lock().unwrap() = vec![(r1, 5), (r2, 11)];
             let in_doubt = [(3u64, r1, 0u64, 10u64)];
             end_of_run(

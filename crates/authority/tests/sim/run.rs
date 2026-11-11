@@ -945,6 +945,8 @@ pub fn operator_retries(first_refusal_ms: u64, now_ms: u64) -> bool {
 
 pub fn sim_core_config(node_id: NodeId, incarnation: u32) -> Config {
     let mut c = Config::defaults(node_id, incarnation);
+    // ADR-58 C3's negative control.
+    c.lost_chunk_label_always = std::env::var_os("AUTHORITY_SIM_LOST_CHUNK_LABEL_ALWAYS").is_some();
     c.ttl_ms = 6_000;
     c.expiry_margin_ms = 500;
     c.idle_release_ms = 3_000;
@@ -1568,6 +1570,11 @@ pub struct Report {
     /// for (the holder may have run them): I4's exception for an unreachable
     /// non-stealable holder, allowed and counted apart from the classes above.
     pub unsettled_nonstealable_holder: usize,
+    /// ADR-58 C3: unsettled `EIO`s whose settle was told the op's row is
+    /// held behind a lost chunk, with global truth agreeing (the ship plan
+    /// held it; the row lands only after an operator's drop, or never):
+    /// `held-behind-lost-chunk`, allowed and counted apart.
+    pub unsettled_held_lost_chunk: usize,
     pub unsettled_examples: Vec<String>,
     pub unsettled_causes: BTreeMap<String, usize>,
     /// Sync-on-silence C1: the unsettled `EIO`s whose generation tail the
@@ -4678,16 +4685,37 @@ async fn operator_drop_hopeless(
 /// (`Report::unsettled_*`); returns the violations described. Called by
 /// every run that reaches its end checks, the ones that end with a claim
 /// waiting for a group's tail included.
-fn count_unsettled(oracles: &super::oracle::Oracles, report: &mut Report) -> Vec<String> {
+fn count_unsettled(
+    oracles: &super::oracle::Oracles,
+    report: &mut Report,
+    any_drop: bool,
+    dropped_by_operator: &dyn Fn(Rid) -> bool,
+    landed: &dyn Fn(Rid) -> bool,
+) -> Vec<String> {
     let everything = oracles.unsettled.lock().unwrap();
+    // ADR-58 C3, the end of the run's half of global truth: the rid's row
+    // never reached the log, or an operator's `repair drop-held` ran (a
+    // scheduled one, or the end-of-run procedure's: it rolls the held rows
+    // back; the log's rows after it are the retries'). A row that shipped by
+    // itself, with no drop, makes the label a lie.
+    let dropped = any_drop || report.faults.iter().any(|f| f.contains("repair drop-held"));
+    let lost_chunk = |u: &&super::oracle::Unsettled| -> bool {
+        u.held_lost_chunk
+            && (u.plan_held || dropped_by_operator(u.rid))
+            && (dropped || dropped_by_operator(u.rid) || !landed(u.rid))
+    };
     report.unsettled_nonstealable_holder = everything.iter().filter(|u| u.designation_held).count();
     report.unsettled_isolated_from_s3 = everything
         .iter()
         .filter(|u| !u.designation_held && u.isolated_from_s3)
         .count();
+    report.unsettled_held_lost_chunk = everything
+        .iter()
+        .filter(|u| !u.designation_held && !u.isolated_from_s3 && lost_chunk(u))
+        .count();
     let all: Vec<&super::oracle::Unsettled> = everything
         .iter()
-        .filter(|u| !u.designation_held && !u.isolated_from_s3)
+        .filter(|u| !u.designation_held && !u.isolated_from_s3 && !lost_chunk(u))
         .collect();
     report.unsettled_isolated = all.iter().filter(|u| u.verdict.isolated()).count();
     report.unsettled_no_sequencer_in_time = all
@@ -6146,7 +6174,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         }
         // Plan 46 M0.3: the unsettled `EIO`s this run told are counted (and
         // judged under `strict_unsettled`) like any other run's.
-        let unsettled_violations = count_unsettled(&oracles, &mut report);
+        let unsettled_violations =
+            count_unsettled(&oracles, &mut report, false, &|_| false, &|_| false);
         if cfg.strict_unsettled {
             if let Some(first) = unsettled_violations.first() {
                 return Err(format!(
@@ -6861,7 +6890,26 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.late_landings = found.i4.len();
     report.settled_landings = found.i4.iter().filter(|m| m.starts_with("I4: rid")).count();
     report.landings_isolated_from_s3 = found.i4_isolated_from_s3;
-    let unsettled_violations = count_unsettled(&oracles, &mut report);
+    let unsettled_violations = count_unsettled(
+        &oracles,
+        &mut report,
+        cluster
+            .env
+            .world
+            .remote_dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
+        &|rid| {
+            cluster
+                .env
+                .world
+                .dropped_rids
+                .lock()
+                .unwrap()
+                .contains(&rid)
+        },
+        &|rid| oracle.completed_at.contains_key(&rid),
+    );
     report.non_lone_rollbacks = found.i5.len();
     report.i5_operator = found.i5_operator.len();
     report.i5_after_end = found.i5_after_end.len();

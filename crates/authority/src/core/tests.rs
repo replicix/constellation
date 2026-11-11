@@ -6256,6 +6256,7 @@ mod own_chunks {
             &MutateOutcome::Held {
                 retry_ms: holder.core.cfg.held_retry_ms,
                 outwait_ms: None,
+                lost_chunk: false,
             },
             "{reply:?}"
         );
@@ -6351,6 +6352,7 @@ mod own_chunks {
             &MutateOutcome::Held {
                 retry_ms: holder.core.cfg.held_retry_ms,
                 outwait_ms: None,
+                lost_chunk: false,
             }
         );
         assert_eq!(own, OwnChunks::Upload(vec![ino]));
@@ -6420,6 +6422,7 @@ mod own_chunks {
                 outcome: MutateOutcome::Held {
                     retry_ms: 50,
                     outwait_ms: None,
+                    lost_chunk: false,
                 },
                 base: None,
                 position: constellation_meta::Position::ZERO,
@@ -14394,6 +14397,7 @@ fn a_held_forward_executes_locally_once_the_delegation_installs() {
             outcome: MutateOutcome::Held {
                 retry_ms: 50,
                 outwait_ms: None,
+                lost_chunk: false,
             },
             base: None,
             position: constellation_meta::Position::ZERO,
@@ -14476,6 +14480,7 @@ fn an_op_held_by_the_root_is_asked_again_there() {
             outcome: MutateOutcome::Held {
                 retry_ms: 50,
                 outwait_ms: None,
+                lost_chunk: false,
             },
             base: None,
             position: constellation_meta::Position::ZERO,
@@ -57260,6 +57265,7 @@ mod c2g_settle {
                 outcome: MutateOutcome::Held {
                     retry_ms: 10,
                     outwait_ms,
+                    lost_chunk: false,
                 },
                 base: None,
                 position: constellation_meta::Position::ZERO,
@@ -57305,6 +57311,68 @@ mod c2g_settle {
         r.step(held(req, None));
         assert_eq!(r.core.clients[&rid].deadline, old);
         assert_eq!(r.core.stats.settles_extended_for_outwait, 0);
+    }
+
+    /// ADR-58 C3: a settle that hears a `Held` saying the op's row is held
+    /// behind a lost chunk labels its unsettled `EIO` (`take_unsettled_lost_chunk`,
+    /// `Stats::unsettled_held_lost_chunk`); a `Held` that does not say so, or
+    /// one heard by a first attempt, does not.
+    #[test]
+    fn a_settle_told_of_a_lost_chunk_labels_its_unsettled_eio() {
+        let run = |lost_chunk: bool| {
+            let (_holder, mut requester) = pair();
+            requester.core.track_unsettled_designation();
+            let rid = requester.rid(1);
+            let out = requester.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op: requester.create("x"),
+                tag: Default::default(),
+            });
+            let first = deadline_timer(&requester, &out);
+            let cfg = requester.core.config().clone();
+            requester
+                .advance(Deadlines::new(&cfg).client_deadline - Deadlines::new(&cfg).settle_window);
+            let out = requester.step(Event::Timer { id: first });
+            let Some(PeerMsg::MutateRequest {
+                req, settle: true, ..
+            }) = forward_to_1(&out)
+            else {
+                panic!("no settle: {out:?}");
+            };
+            requester.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::MutateReply {
+                    req,
+                    outcome: MutateOutcome::Held {
+                        retry_ms: 10,
+                        outwait_ms: None,
+                        lost_chunk,
+                    },
+                    base: None,
+                    position: constellation_meta::Position::ZERO,
+                    gen: 0,
+                    own_chunks: OwnChunks::None,
+                    own_rows: None,
+                    committed: false,
+                },
+            });
+            let id = requester.core.clients[&rid].deadline;
+            requester.advance(requester.core.dl_t().settle_window);
+            let out = requester.step(Event::Timer { id });
+            assert!(
+                replies(&out)
+                    .iter()
+                    .any(|(x, a)| *x == rid && matches!(a, ClientReply::InDoubt)),
+                "{out:?}"
+            );
+            (
+                requester.core.take_unsettled_lost_chunk(rid),
+                requester.core.stats.unsettled_held_lost_chunk,
+            )
+        };
+        assert_eq!(run(true), (true, 1));
+        assert_eq!(run(false), (false, 0));
     }
 
     /// A forward whose holder never answered (the request lost): at the
@@ -58055,6 +58123,7 @@ mod c2g_settle {
             Some(MutateOutcome::Held {
                 retry_ms: h.core.cfg.recall_hold_ms.max(50),
                 outwait_ms: None,
+                lost_chunk: false,
             }),
             "{out:?}"
         );
@@ -59977,6 +60046,7 @@ fn a_delegates_held_answer_is_not_the_roots() {
             outcome: MutateOutcome::Held {
                 retry_ms: 10,
                 outwait_ms: None,
+                lost_chunk: false,
             },
             base: None,
             position: constellation_meta::Position::ZERO,
@@ -60245,6 +60315,47 @@ mod await_retry {
         );
         let out = h.archive_lands();
         assert_eq!(reply_to(&out, 5), Some(MutateOutcome::Abandoned), "{out:?}");
+    }
+
+    /// ADR-58 C3: a root whose answer waits for the durability of a row the
+    /// ship plan holds behind a lost chunk says so in its `Held`
+    /// (`lost_chunk`); a row that ships does not. The requester's settle
+    /// hears it and its unsettled `EIO` is labelled.
+    #[test]
+    fn a_held_for_a_row_behind_a_lost_chunk_says_so() {
+        let (mut h, broken) = holder_with_a_seed();
+        let held_reply = |h: &mut Harness, rid: Rid, req: u64, op: &MutateOp| {
+            let out = h.step(Event::Peer {
+                from: 3,
+                msg: PeerMsg::MutateRequest {
+                    req: OpId(req),
+                    rid,
+                    op: op.clone(),
+                    acked_through: 0,
+                    deps: constellation_meta::Position::ZERO,
+                    applied: 0,
+                    tag: Default::default(),
+                    settle: false,
+                    routed_gen: 0,
+                    touched_gen: 0,
+                    inbox_ever: false,
+                },
+            });
+            // (A ship round: the plan the answer's flag reads.)
+            let _ = h.meta.take_journal_grouped(usize::MAX).unwrap();
+            let timer = timers(&out, TimerKind::HeldReply)[0];
+            h.advance(h.core.cfg.recall_hold_ms);
+            let out = h.step(Event::Timer { id: timer });
+            match reply_to(&out, req) {
+                Some(MutateOutcome::Held { lost_chunk, .. }) => lost_chunk,
+                other => panic!("expected a Held: {other:?} {out:?}"),
+            }
+        };
+        // A write on the poisoned inode: held with the seed.
+        assert!(
+            held_reply(&mut h, rid_of(3, 1), 11, &chmod(broken, 0o600)),
+            "the held row says nothing"
+        );
     }
 
     /// R2: the drain stops at a placeholder. The entries on its keys wait
@@ -62006,6 +62117,7 @@ mod await_retry {
                 outcome: MutateOutcome::Held {
                     retry_ms: 100,
                     outwait_ms: None,
+                    lost_chunk: false,
                 },
                 base: None,
                 position: constellation_meta::Position::ZERO,
@@ -71153,6 +71265,7 @@ mod step5_sticky_release {
         let Some(MutateOutcome::Held {
             retry_ms,
             outwait_ms,
+            ..
         }) = reply_outcome(&out, 501)
         else {
             panic!("not answered Held: {out:?}");
@@ -72635,6 +72748,7 @@ mod route_fence_wire {
             MutateOutcome::Held {
                 retry_ms: 100,
                 outwait_ms: None,
+                lost_chunk: false,
             },
             7,
         ));

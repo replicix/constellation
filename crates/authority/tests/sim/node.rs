@@ -3998,6 +3998,11 @@ impl Driver {
                                 let held = self.core.take_unsettled_designation(rid);
                                 let accepted = self.core.take_unsettled_accepted(rid);
                                 let withdraw_failed = self.core.take_withdraw_failed(rid);
+                                // (A rid an operator's drop rolled back is the
+                                // class too, whatever the requester heard.)
+                                let lost_chunk = (self.core.take_unsettled_lost_chunk(rid)
+                                    || self.world.dropped_rids.lock().unwrap().contains(&rid))
+                                    && self.world.has_lost_chunk();
                                 self.oracles.note_unsettled(
                                     self.id,
                                     rid,
@@ -4006,6 +4011,7 @@ impl Driver {
                                     held,
                                     accepted,
                                     withdraw_failed,
+                                    lost_chunk,
                                 );
                             }
                         }

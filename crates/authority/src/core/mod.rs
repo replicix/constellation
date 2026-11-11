@@ -283,6 +283,11 @@ pub struct Config {
     /// does not run while the epoch refuses writes.
     /// `CONSTELLATION_DROP_HELD_AWAIT_MS`.
     pub drop_held_await_ms: u64,
+    /// ADR-58 C3's negative control (the sim's
+    /// `AUTHORITY_SIM_LOST_CHUNK_LABEL_ALWAYS`): a settling requester labels
+    /// every `Held` it hears as `lost_chunk`. The oracle must reject the
+    /// label without a lost chunk. Never set in production.
+    pub lost_chunk_label_always: bool,
     pub held_tail_staleness_ms: u64,
     pub segment_batch: usize,
     /// Byte ceiling on one shipped segment (`shipper::SEGMENT_MAX_BYTES`).
@@ -683,6 +688,7 @@ impl Config {
             replay_drain_ms: 250,
             replay_lease_fallback_ms: 10_000,
             drop_held_await_ms: 0,
+            lost_chunk_label_always: false,
             held_tail_staleness_ms: 5_000,
             segment_batch: 10_000,
             segment_max_bytes: 4 << 20,
@@ -1844,6 +1850,9 @@ pub struct Stats {
     /// back for (I4's exception for an unreachable non-stealable holder: the
     /// holder may have run the op, and its row lands late).
     pub unsettled_nonstealable_holder: u64,
+    /// ADR-58 C3: of the unsettled `EIO`s, the ones whose settle heard a
+    /// `Held` that said the op's row is held behind a lost chunk.
+    pub unsettled_held_lost_chunk: u64,
     /// Plan 30 §M14 phase 2: ops answered `LockLapsed` — refused here
     /// (as executor) or by the executor that answered this node's
     /// forward, because a cluster-lock grant they were issued under had
@@ -2415,6 +2424,9 @@ pub struct Core {
     /// The same for the unsettled `EIO`s of ops a delegate had executed
     /// (`ClientOp::accepted_by_delegate`; `take_unsettled_accepted`).
     unsettled_accepted_rids: std::collections::BTreeSet<Rid>,
+    /// ADR-58 C3: those whose settle was told the op's row is held behind a
+    /// lost chunk (`ClientOp::lost_chunk_held`; `take_unsettled_lost_chunk`).
+    unsettled_lost_chunk_rids: std::collections::BTreeSet<Rid>,
     /// And those of ops whose settle gave up on a tombstone
     /// (`ClientOp::settle_withdraw_failed`; `take_withdraw_failed`): the
     /// late-landing U1(a) label `isolated-from-s3`, for the sim oracle.
@@ -2614,6 +2626,7 @@ impl Core {
             in_doubt_rids: std::collections::BTreeSet::new(),
             unsettled_designation_rids: std::collections::BTreeSet::new(),
             unsettled_accepted_rids: std::collections::BTreeSet::new(),
+            unsettled_lost_chunk_rids: std::collections::BTreeSet::new(),
             withdraw_failed_rids: std::collections::BTreeSet::new(),
             track_unsettled_designation: false,
             track_fence_audit: false,
