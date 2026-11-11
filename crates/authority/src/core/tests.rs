@@ -65338,6 +65338,76 @@ mod kept_fetch {
         assert_eq!(h.core.stats.kept_fetches, 0);
     }
 
+    // ---- ADR-59, T9 ----
+
+    /// An epoch owner's journal as a member kept it: a directory, a file in
+    /// it, a *held seed* (the file's manifest, naming a chunk only the
+    /// owner's disk has), a rename of the file behind it, a create of
+    /// another name that shipped past the held rows and a link count change
+    /// of the directory.
+    fn rows_with_a_held_seed() -> Vec<BackupTx> {
+        use constellation_fs_core::{ChunkInfo, Manifest};
+        use replicix_chunkfmt::{ChunkHash, ChunkLayout};
+        let holder = Harness::new(1);
+        holder.meta.set_holder_epoch(1);
+        let lost = ChunkHash::of(b"only the owner had these bytes");
+        let d = holder.meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
+        let f = holder.meta.create(d, "f", 0o644, 0, 0).unwrap().ino;
+        let manifest = Manifest {
+            layout: ChunkLayout::new(4096),
+            file_len: 19,
+            chunks: ChunkInfo::Inline([(0u64, lost)].into_iter().collect()),
+        }
+        .encode();
+        holder
+            .meta
+            .set_manifest_dirty(f, None, &manifest, 19, None, None, &[lost])
+            .unwrap();
+        holder.meta.rename(d, "f", d, "g").unwrap();
+        holder.meta.create(d, "x", 0o644, 0, 0).unwrap();
+        holder.meta.mkdir(d, "sub", 0o755, 0, 0).unwrap();
+        holder.meta.journal_txs_from(1, 1000).unwrap()
+    }
+
+    /// T9 (the ADR-51 guard): a member kept the epoch owner's held seed and
+    /// the rows behind it, among them rows that shipped past the held ones
+    /// in the same directory. The takeover re-ships each once, in order,
+    /// under its identity, and rolls nothing back.
+    #[test]
+    fn a_members_kept_held_seed_and_the_rows_behind_it_are_reshipped_once_in_order() {
+        let (mut h, out) = start(3, &fenced(), &[1, 2, 3], 1, false);
+        let a = asks(&out);
+        let txs = rows_with_a_held_seed();
+        assert!(txs.len() >= 5, "{txs:?}");
+        let want: Vec<(u64, u64)> = txs.iter().map(|t| (1, t.first)).collect();
+        let out = win(&mut h, out, &fenced());
+        assert!(cas(&out).is_none(), "not before the member answered");
+        let out = answer_all(&mut h, &a, 2, 1, txs, vec![vec![1, 2]]);
+        let written = finish(&mut h, out, &fenced());
+        assert!(written.is_some(), "the claim is made once the rows are in");
+        let mut got = reshipped(&h);
+        got.sort();
+        assert_eq!(got, want, "each row once, under its own identity");
+        assert_eq!(
+            reshipped(&h),
+            got,
+            "and in the order of the owner's journal"
+        );
+        let records: Vec<LogRecord> = h
+            .meta
+            .journal_txs_from(0, 1000)
+            .unwrap()
+            .into_iter()
+            .flat_map(|t| t.records)
+            .collect();
+        assert!(
+            records
+                .iter()
+                .all(|r| !matches!(r, LogRecord::RolledBack { .. })),
+            "nothing is rolled back: {records:?}"
+        );
+    }
+
     // ---- T2 ----
 
     /// T2: an epoch member that has not answered holds up the claim, and
