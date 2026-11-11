@@ -65076,7 +65076,6 @@ mod kept_member {
                 })
                 .collect(),
             lapses: 0,
-            issued: WaitMs(i64::MAX),
         });
     }
 
