@@ -818,6 +818,20 @@ a violation, and judges every refusal of an op a non-stealable generation ran
 ([ADR-47](../../explanation/DECISIONS.md#adr-47-an-executor-runs-a-forward-only-under-the-generation-it-was-routed-by),
 which replaced the requester's marks of
 [ADR-45](../../explanation/DECISIONS.md#adr-45-an-op-sent-to-a-non-stealable-holder-is-never-refused-for-good)).
+
+The inbox drain also keeps the late-landing rule
+([ADR-49](../../explanation/DECISIONS.md#adr-49-a-late-landing-is-bounded-by-what-the-executor-itself-can-see)):
+it runs an inbox op only from a GET issued less than half a settle window ago
+on its own clock, matches each poll result to its op, and records a batch's key
+when its PUT is issued. A settle writes its tombstones alongside itself (the
+first one a freshness bound after the first deadline); only the unsettled `EIO`
+and the inbox route wait for the last acknowledgement, and a failed tombstone
+ends in an `EIO` labelled `isolated-from-s3`, retried in the background (six
+attempts). A replay of an unacknowledged or foreign row settles and never
+executes, and a stale park is dropped at the end of its tenure, at release or
+at `force_lost`. An op whose client heard an unsettled `EIO` never executes
+later. Route fencing (plan 46 C9, in progress) will close the remaining case
+of a lease holder that is also the designee; freshness does not.
 Until the holder journals its own refusals (planned), a drain read issued
 before a requester's tombstone, with a deposed root redirecting beyond the
 lease margin, remains a known limit.

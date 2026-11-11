@@ -824,6 +824,19 @@ streams exactly-once without further machinery
 ([ADR-18](DECISIONS.md#adr-18-exactly-once-forwarding-with-request-ids),
 [Forwarded mutations](../reference/features/forwarded-mutations.md#exactly-once-identity-and-in-doubt-handling)).
 
+The unsettled `EIO` is held to one rule, kept by the executors from their own
+clocks: an op whose client heard it never executes later ([ADR-49](DECISIONS.md#adr-49-a-late-landing-is-bounded-by-what-the-executor-itself-can-see)). A drain
+runs an inbox op only from a read it issued less than half a settle window ago
+(older bytes are discarded and read again); a replay of a row nobody
+acknowledged, or of another node's, only settles; a forwarded park is dropped
+at the end of its tenure and otherwise runs only if its rid arrived that
+recently; a settle's inbox tombstones run alongside it, and only the unsettled
+`EIO` (and the inbox settle route) waits for the last one's acknowledgement. A
+tombstone that fails ends the op in an `EIO` labelled `isolated-from-s3`, and
+is retried in the background. A lease holder that is also the designee of a
+generation stays open until route fencing (plan 46 C9) closes it: freshness
+does not, and the earlier claim that it did was wrong.
+
 ### The replica is a log prefix plus explicit speculation
 
 *Being replaced in part: the server's replay of stranded ops by rid (and
@@ -1106,6 +1119,10 @@ moves the lease, a sporadic write does not. Locks and strict ReadIndex
 never go through the inbox
 ([ADR-24](DECISIONS.md#adr-24-the-hybrid-s3-inbox-for-writes-without-a-p2p-path),
 [Forwarded mutations](../reference/features/forwarded-mutations.md#the-inbox-forwarding-without-p2p)).
+
+The drain executes a batch only from a GET it issued less than half a settle
+window ago on its own clock; older bytes are discarded and the key is read
+again ([ADR-49](DECISIONS.md#adr-49-a-late-landing-is-bounded-by-what-the-executor-itself-can-see)).
 
 ### Locks
 

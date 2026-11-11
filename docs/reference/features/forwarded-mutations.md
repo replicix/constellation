@@ -766,6 +766,11 @@ nothing and steps past it. Other ops the withdrawn batch carried are
 re-submitted by rid at the front of the queue; a holder that read the
 batch before the overwrite deduplicates the copies.
 
+A settle writes these tombstones alongside itself rather than in front of it;
+only the unsettled `EIO` waits for the last acknowledgement, and the drain runs
+an inbox op only from a read issued less than half a settle window ago
+([ADR-49](../../explanation/DECISIONS.md#adr-49-a-late-landing-is-bounded-by-what-the-executor-itself-can-see)).
+
 1. The op, with its rid and its `deps` (what this node had observed,
    including the delegate streams it was answered from, as a P2P
    forward carries them) and its `lock_tag` (batch format version 3),
