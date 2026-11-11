@@ -939,7 +939,11 @@ chosen per filesystem and topology
   its own subtrees by delegation; a node that will not be mounted again is
   retired with `leave`). Its own node's op is acknowledged once it is on the
   sequencer's disk, the one speculation a deposition may roll back (it
-  replays by rid). A lone root's journal is no second copy for anyone
+  replays by rid). It is given only if a clock read taken
+  where the answer leaves finds the lease still usable with the margin; a
+  step that stalled past that waits for the archive or a renewal, or is in
+  doubt once deposed
+  ([ADR-52](DECISIONS.md#adr-52-a-singleton-answer-leaves-only-on-a-fresh-reading-of-a-usable-lease)). A lone root's journal is no second copy for anyone
   else: a delegate with no recorded backup counts the root's appended row
   only once the root's own configuration has committed it
   ([ADR-41](DECISIONS.md#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16),

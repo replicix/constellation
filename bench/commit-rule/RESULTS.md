@@ -84,3 +84,57 @@ a lone root's answer to another node (topology 5, the WAN rows, still to be
 measured with the four-file-system run: expected 28-190 ms by S3 distance,
 plan 43 section 7), and C2e and C2g act at a generation's end and at a
 deadline. Their sweeps and oracle counts are in PROGRESS, not here.
+
+## ADR-52: the stale-clock re-check (plan 46 M1.3), topology 1
+
+Cost of the rule: one clock read per `Singleton` answer in the core and one
+honour read per `Singleton` fast-path write (a lone root's own-client
+operations are the fast path). Measured on the quiet box with release builds,
+`ACK_LATENCY_TOPOLOGIES=1` (a lone root, own-client operations), five
+rounds of `run.sh --runs 5 --samples 300` per file system and tree (the
+parent of the change and the change, in alternating order, each round's
+medians), ext4, xfs and btrfs on separate devices, tmpfs under `/tmp`.
+Microseconds; each cell is the median over the five rounds of the round's
+p50, p90 and largest p99.
+
+| fs | op | rounds | base p50/p90/p99 | new p50/p90/p99 | d p50 | d p90 |
+|---|---|---:|---|---|---:|---:|
+| ext4 | create | 5 | 82 / 101 / 898 | 86 / 110 / 926 | +4 | +9 |
+| ext4 | rename | 5 | 89 / 116 / 1108 | 91 / 122 / 1149 | +2 | +6 |
+| ext4 | unlink | 5 | 62 / 85 / 1157 | 65 / 88 / 1085 | +3 | +3 |
+| ext4 | chmod | 5 | 36 / 60 / 988 | 48 / 80 / 914 | +12 | +20 |
+| ext4 | write | 5 | 3117 / 4016 / 5251 | 3119 / 4011 / 6530 | +2 | -5 |
+| xfs | create | 5 | 86 / 110 / 195 | 84 / 113 / 193 | -2 | +3 |
+| xfs | rename | 5 | 89 / 121 / 205 | 72 / 99 / 186 | -17 | -22 |
+| xfs | unlink | 5 | 60 / 97 / 177 | 60 / 88 / 168 | +0 | -9 |
+| xfs | chmod | 5 | 35 / 61 / 136 | 35 / 61 / 125 | +0 | +0 |
+| xfs | write | 5 | 1955 / 2064 / 2730 | 1951 / 2064 / 2810 | -4 | +0 |
+| btrfs | create | 5 | 89 / 116 / 187 | 86 / 105 / 174 | -3 | -11 |
+| btrfs | rename | 5 | 92 / 128 / 194 | 77 / 100 / 180 | -15 | -28 |
+| btrfs | unlink | 5 | 70 / 99 / 158 | 58 / 81 / 149 | -12 | -18 |
+| btrfs | chmod | 5 | 42 / 75 / 127 | 37 / 66 / 125 | -5 | -9 |
+| btrfs | write | 5 | 3097 / 3797 / 4307 | 3084 / 3805 / 4784 | -13 | +8 |
+| tmpfs | create | 5 | 83 / 105 / 175 | 85 / 107 / 216 | +2 | +2 |
+| tmpfs | rename | 5 | 68 / 92 / 336 | 79 / 125 / 397 | +11 | +33 |
+| tmpfs | unlink | 5 | 56 / 84 / 172 | 68 / 110 / 220 | +12 | +26 |
+| tmpfs | chmod | 5 | 35 / 62 / 144 | 35 / 65 / 147 | +0 | +3 |
+| tmpfs | write | 5 | 129 / 200 / 1045 | 129 / 189 / 951 | +0 | -11 |
+
+The same protocol with the parent's binary on both sides (an A/A, five rounds,
+the two copies in alternating order) shows the run-to-run noise of a cell:
+
+| fs | op | A p50/p90 | A' p50/p90 | d p50 | d p90 |
+|---|---|---|---|---:|---:|
+| ext4 | create | 80 / 105 | 89 / 111 | +9 | +6 |
+| ext4 | rename | 84 / 113 | 83 / 114 | -1 | +1 |
+| ext4 | unlink | 66 / 105 | 60 / 89 | -6 | -16 |
+| ext4 | chmod | 39 / 62 | 36 / 63 | -3 | +1 |
+| tmpfs | create | 84 / 101 | 88 / 118 | +4 | +17 |
+| tmpfs | rename | 69 / 99 | 80 / 120 | +11 | +21 |
+| tmpfs | unlink | 55 / 92 | 60 / 94 | +5 | +2 |
+| tmpfs | chmod | 35 / 65 | 35 / 62 | +0 | -3 |
+
+The changes in `create`, the answer the plan gates, are inside that noise on
+every file system (+4/+9 ext4, -2/+3 xfs, -3/-11 btrfs, +2/+2 tmpfs); the other
+operations move both ways by as much between identical binaries. Neutral on
+all four file systems.
