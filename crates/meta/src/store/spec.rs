@@ -737,6 +737,10 @@ pub struct ReshipReport {
     pub tail_beyond_gap: usize,
     /// Transactions whose rid already had an outcome here, skipped.
     pub tail_done: usize,
+    /// Transactions that are this node's own journal rows still (the same
+    /// epoch and journal seq: a node reading its own sealed tail back),
+    /// left as they are.
+    pub tail_same_row: usize,
     /// Rows kept as a member copy of the tail's epoch.
     pub tail_moved: usize,
     /// How long the store's writer lock was held (the transaction's open
@@ -6145,6 +6149,28 @@ impl Meta {
                     }
                     _ => false,
                 };
+                // The row is this node's own journal row, still unshipped
+                // (a root's append of a delegate's row stays through the
+                // node's own takeover, and the node reads its own sealed
+                // tail back): the same epoch and journal seq, so the same
+                // identity. It stays and ships as it is; it is not an
+                // outcome the log carried under another identity.
+                if done {
+                    if let Some(r) = rid.or(refused) {
+                        if crate::store::inbox::outcome_row_tx(&tx, self, r)?
+                            == Some((bt.first, t.epoch))
+                        {
+                            tracing::info!(
+                                epoch = t.epoch,
+                                first = bt.first,
+                                rid = ?r,
+                                "a row of the sealed tail is this node's own journal row; left in place"
+                            );
+                            report.tail_same_row += 1;
+                            continue;
+                        }
+                    }
+                }
                 if done {
                     tracing::warn!(
                         epoch = t.epoch,

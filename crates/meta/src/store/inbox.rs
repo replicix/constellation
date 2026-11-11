@@ -169,6 +169,38 @@ pub(crate) fn completed_outcome_tx(
     }
 }
 
+/// The journal transaction of this node's own that holds `rid`'s `completed`
+/// row, as `(first journal seq, the epoch it was journaled under)`: what
+/// [`Meta::outcome_row`] finds, in the caller's transaction. `None`: no
+/// `completed` row, one from the log (position 0), or the row left the
+/// journal.
+pub(crate) fn outcome_row_tx(
+    r: &impl Readable,
+    meta: &Meta,
+    rid: Rid,
+) -> Result<Option<(u64, u64)>, MetaError> {
+    let Some(v) = r.get(&meta.completed, rid.to_key())? else {
+        return Ok(None);
+    };
+    let position = u64::from_be_bytes(
+        v.get(0..8)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| MetaError::Invalid("completed row".into()))?,
+    );
+    if position == 0 {
+        return Ok(None);
+    }
+    let Some(guard) = r
+        .range(&meta.journal_tx, ..=super::local::tx_key(position))
+        .next_back()
+    else {
+        return Ok(None);
+    };
+    let (k, hv) = guard.into_inner()?;
+    let head: super::local::JournalTxHead = postcard::from_bytes(&hv)?;
+    Ok((head.last >= position).then(|| (super::local::decode_tx_key(&k).unwrap_or(0), head.epoch)))
+}
+
 impl Meta {
     /// Everything the log (or this holder's own unshipped journal) says
     /// about `rid`: executed, refused, or nothing yet.
