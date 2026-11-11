@@ -3614,7 +3614,10 @@ every local offer, so a send under `g` is never followed by a final refusal.
 The sim oracle judges this directly: a refusal of an op a non-stealable
 generation ran is a violation (check 1), and `EXDEV` is judged too.
 
-**The holder's refusal (C9).** No rule of this ADR reads a clock. An earlier
+**The holder's refusal (C9).** No rule I1 rests on reads a clock (the
+stealable exception to rule 3 still compares the lease holder's honour clock,
+`holds_unexpired`; nobody refuses for good under a stealable grant, so I1
+does not rest on it). An earlier
 form let the lease holder run an inbox-ever forward as the designee of its own
 generation while its lease honour was current. That re-admitted the case rule 1
 excludes for the root's own generation: a successor that had not yet appended
@@ -3655,8 +3658,18 @@ runs an unrouted forward) and `root_ignores_touched` (the root and the drain
 refuse a touched op) restore the old behaviour; the sim's check 1 or
 `refused_and_completed` fails with each. `holder_runs_inbox_ever` (the lease
 holder runs inbox-ever forwards under its own non-stealable generation again)
-restores the C9 form; its sim configuration, `sticky-root-designee-inbox`,
-reaches the window rarely, and the core tests carry the case.
+restores the pre-C9 behaviour. The window it opens is the root-designee's own
+takeover gate, during which the lease holder still holds its generation. The
+sim configuration `sticky-root-designee-inbox` reaches the gate by cutting S3
+for node 1 when its lease claim lands (`CutS3OnClaim`): 87 of 2,000 seeds
+reach it (`holder_inbox_refusals > 0`); before that fault, none did. With the
+control, 5 more seeds fail than without (seed 1728: the client's `Create`
+returned `EEXIST` after the holder ran the forward and a successor refused the
+retry; the others hang), and the pin test runs seed 1728 both ways. The
+simulation's successor holds a rid whose inbox batch a takeover stranded
+(unknown history, row 9) instead of refusing it, so only a few seeds contradict;
+the core tests (T1, and T7 with two cores, the lease holder and its successor)
+carry the case itself.
 
 See: `crates/authority/src/core/delegate.rs` (`delegate_try_execute`),
 `crates/authority/src/core/holder.rs` (`mutate_request`),
