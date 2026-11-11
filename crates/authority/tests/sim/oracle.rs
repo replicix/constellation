@@ -338,9 +338,11 @@ impl Unsettled {
                 from_ms,
                 to_ms,
                 busy,
+                ever,
             } => format!(
                 "I4: rid {:?} told EIO unsettled by node {} at t={} ms although a sequencer was \
-                 reachable over {span}: {via:?} during [{from_ms}, {to_ms}] ms (its core: {busy})",
+                 reachable over {span}: {via:?} during [{from_ms}, {to_ms}] ms (its core at the \
+                 end: {busy}; ever: {ever})",
                 self.rid, self.node, self.at_ms
             ),
         }

@@ -832,7 +832,12 @@ streams exactly-once without further machinery
 [Forwarded mutations](../reference/features/forwarded-mutations.md#exactly-once-identity-and-in-doubt-handling)).
 
 The unsettled `EIO` is held to one rule, kept by the executors from their own
-clocks: an op whose client heard it never executes later ([ADR-49](DECISIONS.md#adr-49-a-late-landing-is-bounded-by-what-the-executor-itself-can-see)). A drain
+clocks: an op whose client heard it never executes later ([ADR-49](DECISIONS.md#adr-49-a-late-landing-is-bounded-by-what-the-executor-itself-can-see)). Every
+unsettled `EIO` ends a settle window (an op in flight in an epoch that refuses
+writes settles first), a settle's `Abandoned` refusal observes no keys so a row
+held behind a lost chunk cannot hold it, and an `EIO` for a row that waits
+behind a chunk that exists nowhere is a labelled, allowed class
+([ADR-58](DECISIONS.md#adr-58-every-unsettled-eio-ends-a-settle-window-and-a-settles-refusal-waits-for-nothing)). A drain
 runs an inbox op only from a read it issued less than half a settle window ago
 (older bytes are discarded and read again); a replay of a row nobody
 acknowledged, or of another node's, only settles; a forwarded park is dropped

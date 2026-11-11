@@ -3750,7 +3750,9 @@ See: `crates/authority/src/deadlines.rs`,
 
 **Status**: decided by the maintainer on 2026-11-10 and 2026-11-11 (late-landing
 analysis; decisions U1 to U6 below). Landed as the inbox freshness rule, the
-settle-only replay, the stale-park drop and the concurrent tombstones.
+settle-only replay, the stale-park drop and the concurrent tombstones; the
+settle hold and the lapsed-honour routing (S3, S4) are not landed yet (see
+[ADR-58](#adr-58-every-unsettled-eio-ends-a-settle-window-and-a-settles-refusal-waits-for-nothing)).
 Complements [ADR-47](#adr-47-an-executor-runs-a-forward-only-under-the-generation-it-was-routed-by)
 (the generation fence) and [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay).
 
@@ -3807,9 +3809,12 @@ and not bookkeeping at the requester or the root.
   when the window ends, the answer is labelled `isolated-from-s3`
   (`settle_withdraw_failed`), and the tombstone is retried in the background
   (six attempts). The op may still land.
-- **The settle hold** (S3): a lease holder whose honour is current answers a
-  settle `Held` and never `Busy` or `NotHolder{0}`, and a requester treats
-  such a `Held` as a window reset up to the settle's cap. A requester whose
+- **The settle hold** (S3; *decided, not landed*: ADR-58 found `holder.rs`
+  still answering a settle `Busy` when fenced and `NotHolder{0}` with no ship
+  epoch, and no `settles_window_reset` stat; rules 1 and 2 and S4 are built
+  after ADR-58 C1 to C3 by their own task): a lease holder whose honour is
+  current answers a settle `Held` and never `Busy` or `NotHolder{0}`, and a
+  requester treats such a `Held` as a window reset up to the settle's cap. A requester whose
   honour has lapsed sends its settle to the cached holder or any connected peer,
   and a takeover claim contacts the previous holder with `SealTail` even when
   it fetches no tail.
@@ -4199,3 +4204,86 @@ fail I1).
 See: `crates/authority/src/core/backup.rs` (`emission_hold_of`),
 `crates/authority/src/core/readindex.rs` (`park_stale_lease`,
 `complete_ready`), `crates/engine/src/view/write_gate.rs` (`fast_ack_target`).
+
+## ADR-58: Every unsettled EIO ends a settle window, and a settle's refusal waits for nothing
+
+**Status**: decided by the maintainer on 2026-11-11 (plan 46 M1.4 exit: the
+"root/job" and "takeover gate+job" classes of I4's unsettled `EIO`). Complements
+[ADR-49](#adr-49-a-late-landing-is-bounded-by-what-the-executor-itself-can-see).
+
+**Context**: the simulation reported unsettled `EIO`s told with a sequencer
+reachable, labelled "root/job" or "takeover gate+job". The labels were
+misleading: the classifier ORed the core's busy bits over the whole reachable
+run, and a writing root almost always had a job in its slot at some moment. No
+settle in the sample waited for the job slot or a busy core. Three mechanisms
+caused them: (M1) the op's own row sat in the root's journal held behind a
+chunk that exists nowhere (plan 30 section M4), where no sequencer can answer
+the rid until the operator's `repair drop-held`; (M2) the settle's own
+`Refused { rid, ABANDONED }` row was held behind the same chunk, because a
+journaled refusal records the keys of the op it refused as observed keys and
+the ship plan holds a transaction whose observed keys meet a held one; (M3) an
+op already sent reached the lease path in an epoch that refuses writes
+(frozen, or carrier-less), and `refuse_on_lease_path` told the unsettled `EIO`
+at once with no settle, so the classifier's window reached back into the time
+before the outage.
+
+**Decision**:
+
+- **C1, a settle's refusal observes nothing.** A refusal with
+  `ABANDONED_CODE` ("this op did not happen") is journaled with no observed
+  keys, at the root (`settle_refusal`) and in the inbox settle. It writes no
+  namespace key and was evaluated against no state, so shipping it ahead of
+  any transaction commutes; the reason errno refusals observe keys (the log's
+  own prefix must explain the refusal) does not apply. It is journaled only
+  when the dedup found no outcome for the rid, so the journal holds no row of
+  the rid that a drop could roll back. A dropped-code settle refusal keeps its
+  observed keys (conservative).
+- **C2, no unsettled `EIO` without a settle window.** A sent op that settles
+  and finds its node's epoch refusing writes starts its settle
+  (`client_deadline`) instead of being told in doubt at once. A settle that
+  comes back to the lease path of such an epoch waits in `Backoff`
+  (`recall_hold_ms`, at least 50 ms) and is routed again; the deadline then
+  tells the unsettled `EIO` after its window. `settle_route` sends the settle
+  to the epoch's hold owner when this node reaches it. Never-sent ops keep
+  `EROFS`; replays and best-effort ops are unchanged. In a frozen or
+  carrier-less epoch the in-doubt answer for an op in flight therefore comes
+  up to one settle window later (maintainer decision Q2).
+- **C3, `held-behind-lost-chunk`, an allowed class.** `MutateOutcome::Held`
+  gains `lost_chunk`, set by a root whose answer waits for the durability of a
+  row that the ship plan holds or defers for a chunk (`Meta::rid_behind_lost_chunk`,
+  from the last ship round). A settling requester that hears it (or that is the
+  sequencer itself and finds the rid in its own plan) labels its unsettled
+  `EIO` (`take_unsettled_lost_chunk`, stat `unsettled_held_lost_chunk`). The
+  oracle accepts the label only against global truth, as for ADR-47's
+  `HolderUnreachable`: the sim's chunk ledger has a chunk that exists nowhere,
+  some node's ship plan holds or defers the rid's transaction, the verdict
+  would have been a violation, and the rid never reached the log or an
+  operator's drop ran. It is counted apart (`Report::unsettled_held_lost_chunk`),
+  never a violation, with a ratcheting ceiling. The negative control is
+  `AUTHORITY_SIM_LOST_CHUNK_LABEL_ALWAYS` (a requester labels every `Held`):
+  it must not lower any violation count. The settle is not rolled back
+  automatically (maintainer decision Q1): only the operator decides, since
+  the chunk may come back.
+- **C4, the classifier says what the core was busy with when it mattered.**
+  `Verdict::Reachable` reports the busy bits at the run's last instant and the
+  OR over the run as `ever`.
+
+**Rejected**: rolling back the held dependents of a settled rid automatically
+(it puts rollback in the settle path and pre-empts the operator); C1b, letting
+`ABANDONED` refusals ship past an uncaptured held transaction (only on
+evidence; none yet); shortening the carrier-less epoch's in-doubt answer to the
+epoch's end (the classifier would have to treat such an epoch as isolation).
+
+**Consequences**: latency and errno, never safety. The settle sends nothing the
+rules of ADR-49 do not already cover, and executes nothing. An unsettled `EIO`
+in a frozen epoch arrives up to a settle window later; a settle's refusal
+behind a lost chunk is answered instead of held until the drop. Counters:
+`settles_sent`, `unsettled_held_lost_chunk`.
+
+**May revert**: no.
+
+See: `crates/authority/src/core/holder.rs` (`settle_refusal`),
+`crates/authority/src/core/inbox.rs` (the inbox settle),
+`crates/authority/src/core/client.rs` (`refuse_on_lease_path`, `settle_route`,
+`settle_hold_backoff`), `crates/authority/src/core/readindex.rs`
+(`on_held_reply_timer`), `crates/meta/src/store/held.rs`.

@@ -204,9 +204,13 @@ pub enum Verdict {
         via: Via,
         from_ms: u64,
         to_ms: u64,
-        /// What the sequencer's core was busy with at any time of the run
-        /// (`idle`: nothing the history knows).
+        /// What the sequencer's core was busy with at the run's last instant
+        /// (`idle`: nothing the history knows). ADR-58 C4: the bits of the
+        /// whole run (the OR) said `job` for almost every writing root and
+        /// sent triage after the job slot when it was never the cause.
         busy: String,
+        /// And the OR over the whole run, `ever` (same names).
+        ever: String,
     },
 }
 
@@ -765,6 +769,12 @@ fn s3_up(g: &Inner, at: u64, n: NodeId) -> bool {
         .rev()
         .find(|(t, node, _)| *node == n && *t <= at)
         .is_some_and(|(_, _, c)| *c)
+}
+
+/// What `n`'s core was busy with at the instant `to` (the run's last): the
+/// bits of its latest view then.
+fn busy_at_end(g: &Inner, n: NodeId, to: u64) -> u8 {
+    view_at(g, to, n).map_or(0, |v| v.busy)
 }
 
 /// What `n`'s core was busy with at any time of `[from, to)`.
@@ -1744,12 +1754,14 @@ fn classify(g: &Inner, q: Question) -> Verdict {
                 }
             },
         };
-        let busy = node.map_or(0, |n| busy_over(g, n, from, to));
+        let ever = node.map_or(0, |n| busy_over(g, n, from, to));
+        let busy = node.map_or(0, |n| busy_at_end(g, n, to));
         return Verdict::Reachable {
             via,
             from_ms: from,
             to_ms: to,
             busy: busy_names(busy),
+            ever: busy_names(ever),
         };
     }
     if let Some(why) = tail_blocked {
@@ -2438,17 +2450,32 @@ mod tests {
     }
 
     #[test]
-    fn the_busy_flags_are_those_of_any_moment_of_the_run() {
-        // The gate ends at 6 900; the run is [4 000, 7 000].
+    fn the_busy_flags_are_those_of_the_last_instant_and_ever() {
+        // The gate ends at 6 900; the run is [4 000, 7 000]. ADR-58 C4: the
+        // core was idle when the run ended, and was in its gate before: say
+        // both, and name the last instant as the cause (the OR sent triage
+        // after the job slot).
+        let r = world();
+        r.lease_landed_at(3_500, 1, 9_000, false);
+        r.note_view_at(3_500, 1, Held::Lease, vec![], vec![], BUSY_GATE | BUSY_JOB);
+        r.note_view_at(6_900, 1, Held::Lease, vec![], vec![], 0);
+        let v = r.classify(q(3));
+        let Verdict::Reachable { busy, ever, .. } = v else {
+            panic!("{v:?}")
+        };
+        assert_eq!(busy, "idle");
+        assert_eq!(ever, "takeover gate+job");
+        // Busy at the end: both say so.
         let r = world();
         r.lease_landed_at(3_500, 1, 9_000, false);
         r.note_view_at(3_500, 1, Held::Lease, vec![], vec![], BUSY_GATE);
-        r.note_view_at(6_900, 1, Held::Lease, vec![], vec![], 0);
+        r.note_view_at(6_900, 1, Held::Lease, vec![], vec![], BUSY_JOB);
         let v = r.classify(q(3));
-        let Verdict::Reachable { busy, .. } = v else {
+        let Verdict::Reachable { busy, ever, .. } = v else {
             panic!("{v:?}")
         };
-        assert_eq!(busy, "takeover gate");
+        assert_eq!(busy, "job");
+        assert_eq!(ever, "takeover gate+job");
     }
 
     #[test]
