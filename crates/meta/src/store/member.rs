@@ -58,17 +58,13 @@ use std::collections::BTreeSet;
 /// base hold the copy of lease epoch `epoch - base`.
 pub(super) const MEMBER_COPY_BASE: u64 = 2 << 48;
 
-/// How long a rolled-back member copy row holds reads of its keys at most.
-/// The hold waits for the successor's re-ship, which lands within one S3
-/// ship round (measured 35-350 ms under slow S3, 2 s at the worst of a
-/// stalled successor); 5 s is well above that, and short enough that a row
-/// which never leaves the copy (a leak) costs a read one wait for at most
-/// this long, not for good. After the cap the read is answered from the
-/// replica as it is when the session wait times out.
-pub const HELD_COPY_MAX_AGE_MS: i64 = 5_000;
+/// The least time between two warnings that a read of a held key was refused.
+pub(crate) const READ_HOLD_WARN_EVERY_MS: i64 = 10_000;
 
-/// The least time between two warnings that a hold lapsed.
-pub(crate) const HELD_COPY_WARN_EVERY_MS: i64 = 10_000;
+/// The span a read waits for a held row to come back when nothing has set
+/// one ([`Meta::set_read_hold_span`]): the daemon and the simulation set the
+/// derived `read_hold_span` (ADR-48), unit tests keep this.
+pub const DEFAULT_READ_HOLD_SPAN_MS: u64 = 60_000;
 
 /// An acknowledged row this node took out of its served state while the log
 /// lacks it ([`Meta::member_copy_touches`], ADR-57). Persisted in the strand's
@@ -83,6 +79,23 @@ pub(crate) struct HeldCopy {
     pub(crate) keys: crate::KeySet,
     /// [`Meta::held_copy_now_ms`] when it was held (or loaded at open).
     pub(crate) since_ms: i64,
+}
+
+/// What a read of `keys` is admitted as ([`Meta::read_admission`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    Ready,
+    /// A pending acknowledged row touches the keys: not to be answered yet.
+    Held,
+}
+
+/// [`Meta::read_hold_stats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadHoldStats {
+    pub holds: u64,
+    pub oldest_ms: u64,
+    pub refused: u64,
+    pub abandoned: u64,
 }
 
 /// A release a transaction staged ([`Meta::flush_held_releases`]).
@@ -531,32 +544,38 @@ impl Meta {
         Ok(false)
     }
 
-    /// Whether a member copy row this node's strand rolled back touches any
+    /// Whether a pending acknowledged row (a read hold, ADR-57) touches any
     /// of `keys`. A deposed holder's committed rows that a later epoch's
     /// segment strands are rolled back into its member copy, not queued for
     /// replay: the successor re-ships them, and until the log carries them
-    /// (the drop rules retire the row) the namespace lacks them while later
-    /// rows that depend on them may stay (a delegate's row this root
-    /// appended after them). A read of their keys waits for the re-ship as
-    /// it waits for a queued replay (`long-delegated-late-answers` seed 5839:
-    /// a marker visible without its data on the deposed root).
+    /// the namespace lacks them while later rows that depend on them may
+    /// stay (a delegate's row this root appended after them); a rebuild
+    /// from the log and a takeover gate do the same. A read of their keys
+    /// is not answered from this state: it waits for the row's return
+    /// ([`Meta::session_wait`]'s hold phase) and is refused after
+    /// [`Meta::read_hold_span`] (`long-delegated-late-answers` seed 5839: a
+    /// marker visible without its data on the deposed root;
+    /// `sticky-root-designee-inbox` seed 745: a node read its own
+    /// acknowledged rename's target absent).
     ///
-    /// Answered from an in-memory set ([`HeldCopy`]), not from the member
-    /// copy: only a row this process rolled back is missing from the
-    /// namespace (the successor's copy of a re-shipped row, a claimant's
-    /// seal snapshot and a backup's copy are applied or never were), and no
-    /// row is held longer than [`HELD_COPY_MAX_AGE_MS`], so a row that never
-    /// leaves the copy (a leak, `backup-crash-slow` seed 840) cannot stall
-    /// reads for good. One atomic load when nothing is held.
+    /// Answered from the in-memory index of the persisted set. One atomic
+    /// load when nothing is held.
     pub fn member_copy_touches(&self, keys: &[crate::ReadKey]) -> bool {
-        // (The clock reads the lock table's mutex: not on every read.)
-        if !self
-            .any_held_copy
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if !self.any_held() {
             return false;
         }
-        self.member_copy_touches_at(keys, self.held_copy_now_ms())
+        let held = self.held_copies.lock().unwrap();
+        held.iter().any(|h| keys.iter().any(|k| h.keys.touches(k)))
+    }
+
+    /// [`Self::member_copy_touches`] as the admission a read gets
+    /// (`Held`: it must not be answered yet).
+    pub fn read_admission(&self, keys: &[crate::ReadKey]) -> Admission {
+        if self.member_copy_touches(keys) {
+            Admission::Held
+        } else {
+            Admission::Ready
+        }
     }
 
     /// The clock the hold's age is read on, ms: the node's wait clock (the
@@ -573,66 +592,70 @@ impl Meta {
         }
     }
 
-    /// [`Self::member_copy_touches`] at `now` (a test steps past the cap
-    /// without sleeping).
-    pub fn member_copy_touches_at(&self, keys: &[crate::ReadKey], now_ms: i64) -> bool {
-        if !self
-            .any_held_copy
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return false;
-        }
-        let mut held = self.held_copies.lock().unwrap();
-        let before = held.len();
-        let mut oldest: Option<&HeldCopy> = None;
-        for h in held.iter() {
-            if now_ms.saturating_sub(h.since_ms) >= HELD_COPY_MAX_AGE_MS
-                && oldest.is_none_or(|o| h.since_ms < o.since_ms)
-            {
-                oldest = Some(h);
-            }
-        }
-        let lapsed_row = oldest.map(|h| (h.slot, h.first));
-        held.retain(|h| now_ms.saturating_sub(h.since_ms) < HELD_COPY_MAX_AGE_MS);
-        let lapsed = (before - held.len()) as u64;
-        if lapsed > 0 {
-            self.note_held_copy_lapsed(lapsed, lapsed_row, now_ms);
-        }
-        self.any_held_copy
-            .store(!held.is_empty(), std::sync::atomic::Ordering::Relaxed);
-        held.iter().any(|h| keys.iter().any(|k| h.keys.touches(k)))
+    /// How long a read of a held key waits for the row's return before it
+    /// is refused (`EIO`): the derived `read_hold_span` (ADR-48), set by the
+    /// daemon.
+    pub fn read_hold_span(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.read_hold_span_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
-    /// Plan 46 M0.4: `n` read holds ran out at their cap before the
-    /// successor's re-ship released them. A reader then saw the replica
-    /// without a committed row (a marker without its data), and the row may
-    /// never leave the copy (`backup-crash-slow` seed 840). Counted
-    /// (`status.ack.held_copy_lapsed`), and warned of at most once per
-    /// [`HELD_COPY_WARN_EVERY_MS`].
-    fn note_held_copy_lapsed(&self, n: u64, row: Option<(u64, u64)>, now_ms: i64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.held_copy_lapsed.fetch_add(n, Relaxed);
-        let last = self.held_copy_last_warn_ms.load(Relaxed);
-        if last != i64::MIN && now_ms.saturating_sub(last) < HELD_COPY_WARN_EVERY_MS {
-            return;
-        }
-        self.held_copy_last_warn_ms.store(now_ms, Relaxed);
-        tracing::warn!(
-            lapsed = n,
-            total = self.held_copy_lapsed.load(Relaxed),
-            oldest_slot = row.map(|r| r.0),
-            oldest_first = row.map(|r| r.1),
-            cap_ms = HELD_COPY_MAX_AGE_MS,
-            "a member copy row's read hold lapsed at its cap before the successor's re-ship \
-             released it: reads of its keys are answered without it"
+    pub fn set_read_hold_span(&self, span: std::time::Duration) {
+        self.read_hold_span_ms.store(
+            u64::try_from(span.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
         );
     }
 
-    /// Read holds that lapsed at their cap since the start
-    /// ([`Self::note_held_copy_lapsed`]).
-    pub fn held_copy_lapsed(&self) -> u64 {
-        self.held_copy_lapsed
-            .load(std::sync::atomic::Ordering::Relaxed)
+    /// A read of held `keys` waited `waited` and was refused. Counted
+    /// (`status.ack.read_holds_refused`), and warned of at most once per
+    /// [`READ_HOLD_WARN_EVERY_MS`] with the oldest hold.
+    pub(crate) fn note_read_hold_refused(&self, waited: std::time::Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.read_holds_refused.fetch_add(1, Relaxed);
+        let now_ms = self.held_copy_now_ms();
+        let last = self.held_copy_last_warn_ms.load(Relaxed);
+        if last != i64::MIN && now_ms.saturating_sub(last) < READ_HOLD_WARN_EVERY_MS {
+            return;
+        }
+        self.held_copy_last_warn_ms.store(now_ms, Relaxed);
+        let oldest = self
+            .held_copies
+            .lock()
+            .unwrap()
+            .iter()
+            .min_by_key(|h| h.since_ms)
+            .map(|h| (h.slot, h.first, now_ms.saturating_sub(h.since_ms)));
+        tracing::warn!(
+            waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+            refused = self.read_holds_refused.load(Relaxed),
+            oldest_slot = oldest.map(|o| o.0),
+            oldest_first = oldest.map(|o| o.1),
+            oldest_age_ms = oldest.map(|o| o.2),
+            "a read of a key an acknowledged row this node rolled back touches was refused \
+             (EIO): no successor re-shipped the row within the read hold span"
+        );
+    }
+
+    /// The read holds now (ADR-57): how many, the age of the oldest in ms,
+    /// reads refused and holds an operator's abandon released, since the
+    /// start.
+    pub fn read_hold_stats(&self) -> ReadHoldStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now_ms = self.held_copy_now_ms();
+        let held = self.held_copies.lock().unwrap();
+        ReadHoldStats {
+            holds: held.len() as u64,
+            oldest_ms: held
+                .iter()
+                .map(|h| u64::try_from(now_ms.saturating_sub(h.since_ms)).unwrap_or(0))
+                .max()
+                .unwrap_or(0),
+            refused: self.read_holds_refused.load(Relaxed),
+            abandoned: self.read_holds_abandoned.load(Relaxed),
+        }
     }
 
     /// Hold the keys of the row `(slot, first)` the caller's transaction
@@ -678,7 +701,7 @@ impl Meta {
         let r = self.db.read_tx();
         let since_ms = self.held_copy_now_ms();
         let mut held = Vec::new();
-        for guard in r.prefix(&self.local, b"read_hold:".to_vec()) {
+        for guard in r.prefix(&self.local, b"read_hold:") {
             let (k, v) = guard.into_inner()?;
             let k = String::from_utf8_lossy(&k).into_owned();
             let mut it = k["read_hold:".len()..].split(':');
@@ -712,7 +735,7 @@ impl Meta {
             .collect()
     }
 
-    fn any_held(&self) -> bool {
+    pub(crate) fn any_held(&self) -> bool {
         self.any_held_copy
             .load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -780,6 +803,27 @@ impl Meta {
             }
         }
         Ok(())
+    }
+
+    /// [`Self::release_row_tx`] for a row an operator's abandon gave up: the
+    /// row is lost by decision, counted (`status.ack.read_holds_abandoned`).
+    pub(crate) fn release_abandoned_row_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        slot: u64,
+        first: u64,
+    ) {
+        if self
+            .held_copies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|h| (h.slot, h.first) == (slot, first))
+        {
+            self.read_holds_abandoned
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.release_row_tx(tx, slot, first);
     }
 
     /// Every hold of `slot` leaves in the caller's transaction.
@@ -860,6 +904,9 @@ impl Meta {
         });
         self.any_held_copy
             .store(!held.is_empty(), std::sync::atomic::Ordering::Relaxed);
+        drop(held);
+        // The readers waiting on a hold look again.
+        self.session.wake();
     }
 
     /// Forget the member copy of `epoch` (its rows are in the log, or the
@@ -1098,7 +1145,7 @@ pub(crate) fn member_rules_tx(
                     out.abandoned += 1;
                 }
                 tx.remove(&meta.backup_tail, key);
-                meta.release_row_tx(tx, member_epoch(e), first);
+                meta.release_abandoned_row_tx(tx, member_epoch(e), first);
                 continue;
             }
             if through_of.get(&ident.0).is_some_and(|th| ident.1 > *th) {
@@ -1328,6 +1375,9 @@ mod release_tests {
         assert!(meta.member_copy_touches(&key));
         meta.stage_release(StagedRelease::Slot(slot));
         meta.flush_held_releases();
-        assert!(meta.member_copy_touches(&key), "the hold key is still there");
+        assert!(
+            meta.member_copy_touches(&key),
+            "the hold key is still there"
+        );
     }
 }

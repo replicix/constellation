@@ -678,17 +678,20 @@ pub struct Meta {
     /// Plan 43 C1-4: this node holds a member copy (`store::member`); the
     /// segment path reads it before looking for one.
     pub(crate) any_member_copy: std::sync::atomic::AtomicBool,
-    /// The member copy rows this process's strand rolled back
-    /// (`store::member::HeldCopy`): what [`Meta::member_copy_touches`]
-    /// consults. In memory only.
+    /// The index of the persisted read holds (`read_hold:` keys,
+    /// `store::member::HeldCopy`, ADR-57): what [`Meta::member_copy_touches`]
+    /// consults.
     pub(crate) held_copies: std::sync::Mutex<Vec<member::HeldCopy>>,
     /// `held_copies` is not empty (one atomic load per read when it is).
     pub(crate) any_held_copy: std::sync::atomic::AtomicBool,
-    /// Held member copy rows whose read hold lapsed at the cap
-    /// ([`member::HELD_COPY_MAX_AGE_MS`]) before their release: a reader then
-    /// saw the replica without a committed row. Since the process start.
-    pub(crate) held_copy_lapsed: AtomicU64,
-    /// [`Meta::held_copy_now_ms`] of the last lapse warning (rate limit).
+    /// How long a read of a held key waits before it is refused, ms
+    /// ([`Meta::set_read_hold_span`]).
+    pub(crate) read_hold_span_ms: AtomicU64,
+    /// Reads refused after the span, and holds an operator's abandon
+    /// released, since the process start.
+    pub(crate) read_holds_refused: AtomicU64,
+    pub(crate) read_holds_abandoned: AtomicU64,
+    /// [`Meta::held_copy_now_ms`] of the last refusal warning (rate limit).
     pub(crate) held_copy_last_warn_ms: std::sync::atomic::AtomicI64,
     /// Plan 46 M0.4: ships of a `Local` row whose index this node assigned
     /// under a generation the table does not list and that has no void cut
@@ -771,7 +774,7 @@ pub struct Meta {
     /// journal (`gen`, `idx`, the row's rid). ADR-57 P5: a recall only drops
     /// rows nobody was told were committed.
     #[cfg(any(test, feature = "test-util"))]
-    recall_drop_hook: std::sync::OnceLock<Box<dyn Fn(u64, u64, crate::rid::Rid) + Send + Sync>>,
+    recall_drop_hook: std::sync::OnceLock<RecallDropHook>,
     /// Plan 42 §5.1.5: told what every stranding pass rolled back
     /// ([`Meta::set_rollback_hook`]), and what it has not been told yet.
     rollback_hook: std::sync::OnceLock<RollbackHook>,
@@ -857,6 +860,10 @@ const CLOSE_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// entries (tombstones included): scanning that many is cheap.
 pub const VACUUM_MIN_ENTRIES: usize = 4096;
 
+/// See [`Meta::set_recall_drop_hook`].
+#[cfg(any(test, feature = "test-util"))]
+pub type RecallDropHook = Box<dyn Fn(u64, u64, crate::rid::Rid) + Send + Sync>;
+
 /// See [`Meta::set_foreign_apply_hook`].
 pub type ForeignApplyHook = Box<dyn Fn(&[crate::record::LogRecord]) + Send + Sync>;
 
@@ -895,10 +902,7 @@ impl Meta {
     /// foreign apply reports it. Set once; a second call is ignored.
     /// Tests only: see the field. Set once; a second call is ignored.
     #[cfg(any(test, feature = "test-util"))]
-    pub fn set_recall_drop_hook(
-        &self,
-        hook: Box<dyn Fn(u64, u64, crate::rid::Rid) + Send + Sync>,
-    ) {
+    pub fn set_recall_drop_hook(&self, hook: RecallDropHook) {
         let _ = self.recall_drop_hook.set(hook);
     }
 
@@ -1320,7 +1324,9 @@ impl Meta {
             any_member_copy: std::sync::atomic::AtomicBool::new(false),
             held_copies: std::sync::Mutex::new(Vec::new()),
             any_held_copy: std::sync::atomic::AtomicBool::new(false),
-            held_copy_lapsed: AtomicU64::new(0),
+            read_hold_span_ms: AtomicU64::new(member::DEFAULT_READ_HOLD_SPAN_MS),
+            read_holds_refused: AtomicU64::new(0),
+            read_holds_abandoned: AtomicU64::new(0),
             held_copy_last_warn_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
             ship_unjustified: AtomicU64::new(0),
             held_work: AtomicU64::new(0),

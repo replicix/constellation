@@ -802,6 +802,11 @@ pub trait Replica {
     /// ADR-51: seal the tenures, persisted and synced before it returns
     /// `true`.
     fn seal_tenures(&self, tenures: &[(NodeId, Epoch)]) -> bool;
+    /// ADR-57: a pending acknowledged row this node rolled back touches
+    /// `ino` (an attribute read of it or a listing of it): no read grant is
+    /// made over it, the reader is answered the position and reads through.
+    fn read_hold_touches_ino(&self, ino: Ino) -> bool;
+
     /// The holder's durability watermark for its own reads
     /// (`Meta::durability_pending`). `lone_ok` (plan 43 C2, §5.4): with the
     /// gate off, the node may answer its own clients on its disk alone.
@@ -2059,6 +2064,13 @@ impl Replica for Meta {
 
     fn seal_tenures(&self, tenures: &[(NodeId, Epoch)]) -> bool {
         Meta::seal_tenures(self, tenures).is_ok()
+    }
+
+    fn read_hold_touches_ino(&self, ino: Ino) -> bool {
+        self.member_copy_touches(&[
+            constellation_meta::ReadKey::Ino(ino),
+            constellation_meta::ReadKey::Dir(ino),
+        ])
     }
 
     fn set_durable(

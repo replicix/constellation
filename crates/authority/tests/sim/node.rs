@@ -432,6 +432,9 @@ pub struct NodeHandle {
     oracles: Arc<super::oracle::Oracles>,
 }
 
+/// See [`NodeEnv::recall_drops`].
+pub type RecallDrops = Arc<Mutex<Vec<(NodeId, u64, u64, Rid)>>>;
+
 pub struct NodeEnv {
     pub bucket: Arc<Bucket>,
     pub bus: Arc<Bus>,
@@ -440,7 +443,7 @@ pub struct NodeEnv {
     pub in_doubt: InDoubtLog,
     /// ADR-57 P5: every delegate row a recall dropped from a root's journal
     /// (node, gen, idx, rid).
-    pub recall_drops: Arc<Mutex<Vec<(NodeId, u64, u64, Rid)>>>,
+    pub recall_drops: RecallDrops,
     pub config: Arc<dyn Fn(NodeId, u32) -> Config + Send + Sync>,
     /// See `SimConfig::panic_after_events`.
     pub panic_after_events: Option<u64>,
@@ -645,6 +648,15 @@ impl NodeHandle {
             }
         };
         let incarnation = meta.bump_incarnation().expect("incarnation");
+        // ADR-57: the read hold span of the configuration this incarnation
+        // runs (the daemon sets the same from its own).
+        meta.set_read_hold_span(std::time::Duration::from_millis(
+            constellation_authority::deadlines::Deadlines::new(&driver_config((env.config)(
+                id,
+                incarnation,
+            )))
+            .read_hold_span,
+        ));
         // One clock for the incarnation: the driver, the meta's token check,
         // the beat and lane threads and the handle all read it.
         let clock = env.clock_of(id, incarnation);

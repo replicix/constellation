@@ -323,3 +323,67 @@ fn a_queued_replay_of_an_unlink_holds_a_later_plus_page() {
         Ok(())
     });
 }
+
+/// ADR-57: a lookup of a name a pending acknowledged row touches (a gated
+/// row this node rolled back, the log lacking it) does not answer without
+/// the row, whatever the session budget: after the read hold span it fails
+/// with `EIO`, and a lookup of another name answers at once.
+#[test]
+fn a_lookup_of_a_held_name_fails_with_eio_after_the_span() {
+    use constellation_meta::{execute_mutate, MutateOp, PendingClass, RowCommit};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    meta.create(ROOT_INO, "other", 0o644, 0, 0).unwrap();
+    meta.set_holder_epoch(1);
+    {
+        let _class = PendingClass::set(RowCommit::ROOT_GROUP);
+        execute_mutate(
+            &meta,
+            &MutateOp::Create {
+                parent: ROOT_INO,
+                name: "held".into(),
+                ino: (1 << 40) | 1,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            Some(constellation_meta::Rid {
+                node: 2,
+                incarnation: 1,
+                seq: 1,
+            }),
+        )
+        .unwrap();
+    }
+    meta.set_holder_epoch(0);
+    assert_eq!(meta.strand_below_epoch(2).unwrap().member_copied, 1);
+    assert!(meta.lookup(ROOT_INO, "held").unwrap().is_none());
+    let (mut fs, _tmp, _core) = holder_fs(meta.clone(), false);
+    fs.sync.as_mut().unwrap().lease = Arc::new(crate::lease::LeaseView::default());
+    // A budget of 0 disables the session wait; the hold does not care.
+    meta.session().set_budget_ms(0);
+    let span = Duration::from_millis(300);
+    meta.set_read_hold_span(span);
+    let caller = Caller::root();
+    let lookup = |name: &str| {
+        Blocking::run(|r| {
+            fs.lookup(
+                &OpCtx::new(OpKind::Lookup, &caller),
+                ROOT_INO,
+                Name::new(name),
+                r,
+            )
+        })
+    };
+    let t = std::time::Instant::now();
+    assert!(lookup("other").is_ok());
+    assert!(t.elapsed() < span, "an unrelated name does not wait");
+    let t = std::time::Instant::now();
+    let held = lookup("held");
+    assert!(t.elapsed() >= span, "waited the span: {:?}", t.elapsed());
+    assert_eq!(
+        held.err().map(|e| e.code()),
+        Some(constellation_types::Code::Io),
+        "refused, not answered absent"
+    );
+    assert_eq!(meta.read_hold_stats().refused, 1);
+}

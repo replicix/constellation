@@ -176,10 +176,10 @@ fn a_committed_row_moved_to_the_member_copy_holds_its_readers() {
     assert!(meta.member_copy_carries(rid(1)).unwrap());
     assert!(meta.pending_replays().unwrap().is_empty(), "not queued");
     assert!(
-        meta.replay_touches(&key),
+        meta.member_copy_touches(&key),
         "a read of the rolled-back committed row must wait for its re-ship"
     );
-    assert!(!meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "unrelated".into())]));
+    assert!(!meta.member_copy_touches(&[ReadKey::Dentry(ROOT_INO, "unrelated".into())]));
     // The successor re-ships the row with its identity: visible again, and
     // nothing holds the read any more.
     let reship = vec![
@@ -193,7 +193,7 @@ fn a_committed_row_moved_to_the_member_copy_holds_its_readers() {
         !meta.member_copy_carries(rid(1)).unwrap(),
         "retired by the re-ship"
     );
-    assert!(!meta.replay_touches(&key));
+    assert!(!meta.member_copy_touches(&key));
 }
 
 /// A deposed root's recovery (`Core::recover_deposed`) strands before the
@@ -213,13 +213,13 @@ fn a_recovery_strand_holds_its_readers_until_the_reship() {
     assert!(meta.lookup(ROOT_INO, "data").unwrap().is_none());
     assert!(meta.pending_replays().unwrap().is_empty(), "not queued");
     assert!(
-        meta.replay_touches(&key),
+        meta.member_copy_touches(&key),
         "a read of the rolled-back committed row must wait for its re-ship"
     );
     // The successor's first segment strands nothing more; still held.
     let other = vec![create("b", ino(2), 11), completed(rid(2))];
     apply_rows(&meta, 1, 2, 2, &[1, 2], &other);
-    assert!(meta.replay_touches(&key));
+    assert!(meta.member_copy_touches(&key));
     let reship = vec![
         LogRecord::TailOf { epoch: 1, jseq: 1 },
         create("data", ino(1), 10),
@@ -228,7 +228,7 @@ fn a_recovery_strand_holds_its_readers_until_the_reship() {
     apply_rows(&meta, 2, 2, 5, &[3, 4, 5], &reship);
     assert!(meta.lookup(ROOT_INO, "data").unwrap().is_some());
     assert!(!meta.member_copy_carries(rid(1)).unwrap());
-    assert!(!meta.replay_touches(&key), "released by the re-ship");
+    assert!(!meta.member_copy_touches(&key), "released by the re-ship");
 }
 
 /// ADR-57 (H2): the hold is persisted with the strand that took the row out
@@ -291,17 +291,22 @@ fn a_hold_survives_a_restart() {
     );
 }
 
-/// A row that never leaves the member copy (a leak: `backup-crash-slow`
-/// seed 840 left 20 on a node for good) holds reads of its keys for
-/// `HELD_COPY_MAX_AGE_MS` at most, not for ever.
+/// ADR-57: a row that never leaves the member copy (a leak) does not let a
+/// read of its keys through: after the read hold span the read is refused
+/// (`Unserved`, the engine's `EIO`), never answered without the row, whatever
+/// the session budget (a budget of 0 included); the hold stays until the
+/// row is released, and an unrelated key answers at once.
 #[test]
-fn a_row_that_never_leaves_the_copy_stops_holding_after_the_cap() {
+fn a_held_read_is_refused_after_the_span_never_answered() {
+    use constellation_meta::{Admission, SessionWait};
+    use std::time::Duration;
     let meta = Meta::open_in_memory().unwrap();
     meta.set_holder_epoch(1);
     holder_create(&meta, RowCommit::ROOT_GROUP, "data", 1, 1);
     meta.set_holder_epoch(0);
     let key = [ReadKey::Dentry(ROOT_INO, "data".into())];
     let dir = [ReadKey::Dir(ROOT_INO)];
+    let other = [ReadKey::Dentry(ROOT_INO, "z".into())];
     apply_rows(
         &meta,
         1,
@@ -311,25 +316,54 @@ fn a_row_that_never_leaves_the_copy_stops_holding_after_the_cap() {
         &[create("b", ino(2), 11), completed(rid(2))],
     );
     assert!(meta.member_copy_carries(rid(1)).unwrap());
-    let t0 = meta.held_copy_now_ms();
-    assert!(meta.member_copy_touches_at(&key, t0));
-    assert!(
-        meta.member_copy_touches_at(&dir, t0),
+    meta.set_read_hold_span(Duration::from_millis(60));
+    assert_eq!(meta.read_admission(&key), Admission::Held);
+    assert_eq!(
+        meta.read_admission(&dir),
+        Admission::Held,
         "its parent's listing too"
     );
-    assert_eq!(meta.held_copy_lapsed(), 0, "held, not lapsed");
-    let late = t0 + constellation_meta::HELD_COPY_MAX_AGE_MS + 1;
-    assert!(!meta.member_copy_touches_at(&key, late), "capped");
-    assert_eq!(
-        meta.held_copy_lapsed(),
-        1,
-        "the cap lapsing is counted (status.ack.held_copy_lapsed), not silent"
-    );
-    assert!(!meta.member_copy_touches_at(&dir, late));
-    assert_eq!(meta.held_copy_lapsed(), 1, "once per row");
-    // The row is still in the copy (the leak), and stays unheld.
+    assert_eq!(meta.read_admission(&other), Admission::Ready);
+    assert!(matches!(
+        meta.session_wait(&other),
+        SessionWait::Fast | SessionWait::Covered
+    ));
+    for budget_ms in [2_000, 0] {
+        meta.session().set_budget_ms(budget_ms);
+        let t = std::time::Instant::now();
+        match meta.session_wait(&key) {
+            SessionWait::Unserved(d) => assert!(d >= Duration::from_millis(60), "{d:?}"),
+            other => panic!("budget {budget_ms}: a held read was answered: {other:?}"),
+        }
+        assert!(t.elapsed() >= Duration::from_millis(60));
+    }
+    let stats = meta.read_hold_stats();
+    assert_eq!((stats.holds, stats.refused), (1, 2), "{stats:?}");
+    // Still held: the cap that used to let it through is gone.
+    assert_eq!(meta.read_admission(&key), Admission::Held);
     assert!(meta.member_copy_carries(rid(1)).unwrap());
-    assert!(!meta.member_copy_touches(&key));
+    // The re-ship releases it, and a waiting read is let go meanwhile.
+    meta.set_read_hold_span(Duration::from_secs(30));
+    meta.session().set_budget_ms(2_000);
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| meta.session_wait(&key));
+        std::thread::sleep(Duration::from_millis(100));
+        let reship = vec![
+            LogRecord::TailOf { epoch: 1, jseq: 1 },
+            create("data", ino(1), 10),
+            completed(rid(1)),
+        ];
+        apply_rows(&meta, 2, 2, 5, &[3, 4, 5], &reship);
+        let waited = waiter.join().unwrap();
+        assert!(
+            matches!(
+                waited,
+                SessionWait::Waited(_) | SessionWait::Fast | SessionWait::Covered
+            ),
+            "{waited:?}"
+        );
+    });
+    assert_eq!(meta.read_admission(&key), Admission::Ready);
 }
 
 /// The successor's copy of the rows it re-ships (`member_copy_put`, after it
@@ -345,7 +379,7 @@ fn a_row_the_namespace_already_has_does_not_hold_its_readers() {
     meta.member_copy_put_rows(1, 1, &[row]).unwrap();
     assert!(meta.member_copy_carries(rid(1)).unwrap());
     assert!(!meta.member_copy_touches(&[ReadKey::Dentry(ROOT_INO, "data".into())]));
-    assert!(!meta.replay_touches(&[ReadKey::Dir(ROOT_INO)]));
+    assert!(!meta.member_copy_touches(&[ReadKey::Dir(ROOT_INO)]));
 }
 
 // ------------------------------------- committed requester/subscriber entries

@@ -896,7 +896,7 @@ impl View {
                     // the session watermark to the state it was answered
                     // from, and a replayed unlink of an inode the replica
                     // holds leaves the orphan record.
-                    self.session_wait(&[ReadKey::Ino(ino)]);
+                    self.session_wait(&[ReadKey::Ino(ino)])?;
                     if self.orphaned(ino) {
                         return Ok(false);
                     }

@@ -8648,6 +8648,8 @@ impl Core {
             let renewed = !d.non_stealable || d.answered_sent >= d.installed;
             if ttl > 0
                 && renewed
+                // ADR-57: no grant over keys a pending acknowledged row touches.
+                && !replica.read_hold_touches_ino(ino)
                 && !self
                     .rd
                     .blocked

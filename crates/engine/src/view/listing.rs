@@ -1561,7 +1561,8 @@ impl View {
                         .zip(&held)
                         .filter(|(_, held)| !**held)
                         .filter_map(|(e, _)| Some((e.ino, std::str::from_utf8(&e.name).ok()?))),
-                );
+                )
+                .map_err(PageError::Meta)?;
             }
             for (i, e) in batch.iter().enumerate() {
                 let c = key.cookie(&e.name);

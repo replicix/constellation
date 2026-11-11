@@ -241,13 +241,6 @@
           "description": "The fast path is closed (local writes go through the core).",
           "type": "boolean"
         },
-        "held_copy_lapsed": {
-          "default": 0,
-          "description": "Member-copy read holds that lapsed at their cap before the successor's\nre-ship released them (a reader saw the replica without a committed\nrow; plan 46 M0.4).",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
         "held_for_upload": {
           "description": "As sequencer: forwarded replies answered `Held` at once because\nthe acknowledgement waits for chunks only the requester can upload\n(it is asked to upload them).",
           "format": "uint64",
@@ -330,6 +323,34 @@
         "policy": {
           "description": "The policy of the lease this node holds: \"local\", \"backup\", \"s3\",\nor \"-\" when it holds none.",
           "type": "string"
+        },
+        "read_holds": {
+          "default": 0,
+          "description": "Reads held now: acknowledged rows this node rolled back while the log\nlacks them (ADR-57); a read of their keys waits for the re-ship.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "read_holds_abandoned": {
+          "default": 0,
+          "description": "Holds an operator's abandon released (the rows are lost by decision).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "read_holds_oldest_ms": {
+          "default": 0,
+          "description": "The age of the oldest read hold, ms.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "read_holds_refused": {
+          "default": 0,
+          "description": "Reads refused with `EIO` because a hold outlasted the read hold span\n(no successor re-shipped the row).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "reads_durability_blocked": {
           "description": "Holder-local reads that waited for durability of the unshipped\nrows they would have observed.",

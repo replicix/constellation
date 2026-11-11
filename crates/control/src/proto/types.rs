@@ -2415,11 +2415,20 @@ pub struct AckStatus {
     /// void cut: the log never granted it (plan 46 M0.4; must stay 0).
     #[serde(default)]
     pub unjustified_ships: u64,
-    /// Member-copy read holds that lapsed at their cap before the successor's
-    /// re-ship released them (a reader saw the replica without a committed
-    /// row; plan 46 M0.4).
+    /// Reads held now: acknowledged rows this node rolled back while the log
+    /// lacks them (ADR-57); a read of their keys waits for the re-ship.
     #[serde(default)]
-    pub held_copy_lapsed: u64,
+    pub read_holds: u64,
+    /// The age of the oldest read hold, ms.
+    #[serde(default)]
+    pub read_holds_oldest_ms: u64,
+    /// Reads refused with `EIO` because a hold outlasted the read hold span
+    /// (no successor re-shipped the row).
+    #[serde(default)]
+    pub read_holds_refused: u64,
+    /// Holds an operator's abandon released (the rows are lost by decision).
+    #[serde(default)]
+    pub read_holds_abandoned: u64,
     /// Client mutations answered `EIO` as settled: refused for good by the
     /// sequencer in force at their deadline, never executed (plan 43 C2).
     #[serde(default)]
