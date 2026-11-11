@@ -731,6 +731,40 @@ impl Meta {
         Ok(())
     }
 
+    /// The takeover gate re-journaled the transactions `idents` name (their
+    /// identity as [`tail_identity`] gives it): the holds of member copy
+    /// rows with one of those identities go, in the caller's transaction
+    /// (the strand that set them is in it). A delegate's row goes with the
+    /// generation's log index ([`super::local::bump_log_idx_tx`]).
+    pub(crate) fn release_reshipped_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        idents: &std::collections::HashSet<(u64, u64)>,
+    ) -> Result<(), MetaError> {
+        if !self.any_held() || idents.is_empty() {
+            return Ok(());
+        }
+        let member: Vec<(u64, u64)> = self
+            .held_copies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|h| (MEMBER_COPY_BASE..super::backup::deleg_epoch(0)).contains(&h.slot))
+            .map(|h| (h.slot, h.first))
+            .collect();
+        for (slot, first) in member {
+            let Some(v) = tx.get(&self.backup_tail, tail_key(slot, first))? else {
+                continue;
+            };
+            let row: MemberTx = postcard::from_bytes(&v)?;
+            let ident = tail_identity(&row.tx.records).unwrap_or((slot - MEMBER_COPY_BASE, first));
+            if idents.contains(&ident) {
+                self.release_row_tx(tx, slot, first);
+            }
+        }
+        Ok(())
+    }
+
     /// Every hold of `slot` leaves in the caller's transaction.
     pub(crate) fn release_slot_tx(
         &self,

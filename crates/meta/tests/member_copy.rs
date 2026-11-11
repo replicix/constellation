@@ -638,6 +638,65 @@ fn a_rebuild_keeps_a_committed_shadow() {
     assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
 }
 
+/// ADR-57 (P3): a rebuild from the log replaces the namespace with one that
+/// lacks this node's acknowledged rows the log does not carry yet (a gated own
+/// row; a delegate row this root appended): reads of their keys are held. A
+/// log that carries them holds nothing.
+#[test]
+fn a_rebuild_holds_reads_of_the_acknowledged_rows_its_log_lacks() {
+    let g = [ReadKey::Dentry(ROOT_INO, "g".into())];
+    let d = [ReadKey::Dentry(ROOT_INO, "d".into())];
+    let other = [ReadKey::Dentry(ROOT_INO, "z".into())];
+    let build = || {
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_holder_epoch(1);
+        holder_create(&meta, RowCommit::ROOT_GROUP, "g", 4, 4);
+        meta.apply_delegate_tx(
+            &[create("d", ino(6), 12), completed(rid(6))],
+            Some(rid(6)),
+            5,
+            1,
+            Position::ZERO,
+        )
+        .unwrap();
+        meta.set_holder_epoch(0);
+        meta
+    };
+    // The log lacks both.
+    let meta = build();
+    let side = Meta::open_in_memory().unwrap();
+    meta.replace_ns_from_rebuilt(&side, &Default::default())
+        .unwrap();
+    assert!(meta.lookup(ROOT_INO, "g").unwrap().is_none());
+    assert!(meta.lookup(ROOT_INO, "d").unwrap().is_none());
+    assert!(meta.member_copy_touches(&g), "the gated row is held");
+    assert!(meta.member_copy_touches(&d), "the delegate row is held");
+    assert!(!meta.member_copy_touches(&other));
+    // The log carries both: the rebuilt namespace has them, nothing is held.
+    let meta = build();
+    let side = Meta::open_in_memory().unwrap();
+    side.apply_segment_rows(
+        1,
+        2,
+        3,
+        &[1, 2, 3],
+        &[(0, 0), (0, 0), (5, 1)],
+        &[
+            LogRecord::TailOf { epoch: 1, jseq: 1 },
+            create("g", ino(4), 10),
+            create("d", ino(6), 12),
+        ],
+        &TouchSet::default(),
+    )
+    .unwrap();
+    meta.replace_ns_from_rebuilt(&side, &Default::default())
+        .unwrap();
+    assert!(meta.lookup(ROOT_INO, "g").unwrap().is_some());
+    assert!(meta.lookup(ROOT_INO, "d").unwrap().is_some());
+    assert!(!meta.member_copy_touches(&g));
+    assert!(!meta.member_copy_touches(&d));
+}
+
 /// A rebuild retires a committed streamed transaction that the log it was
 /// rebuilt from carries, whether its own epoch's segment shipped it or a
 /// successor re-shipped it (`TailOf`) — also when it completes no rid. Fails

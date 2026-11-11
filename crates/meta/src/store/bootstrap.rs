@@ -429,6 +429,10 @@ impl Meta {
         crate::store::member::drop_settled_rows_tx(&mut tx, self)?;
         let side_pos = crate::store::applied_pos_at(&side_snap, &side.local);
         crate::store::spec::reset_for_rebuilt_ns_tx(&mut tx, self, side_pos)?;
+        // The reset moved this node's acknowledged rows the rebuilt log lacks
+        // to member copies and held reads of their keys (ADR-57); a row the
+        // log carries (the facts adopted above) is not rolled back for good.
+        crate::store::member::drop_settled_rows_tx(&mut tx, self)?;
         // ADR-43 (review S-1): what the rebuilt log holds of each
         // generation's stream and the cut of each end it carries
         // (`deleg_log_idx`, `deleg_void_cut`), raised over what is here, and

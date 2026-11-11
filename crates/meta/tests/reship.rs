@@ -754,3 +754,59 @@ fn a_returning_member_keeps_tail_named_copies_after_a_partial_abandon() {
         "the carried copies wait for their tail"
     );
 }
+
+/// ADR-57: the takeover gate rolls back this node's own acknowledged row of
+/// an older tenure into its member copy, and the namespace lacks it until the
+/// log or a tail carries it again: reads of its keys are held, and the gate's
+/// tail re-apply that carries the row's identity releases them.
+#[test]
+fn the_gate_holds_a_rolled_back_acknowledged_row_until_its_tail_re_applies_it() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    {
+        let _c = PendingClass::set(RowCommit::ROOT_GROUP);
+        execute_mutate(
+            &meta,
+            &MutateOp::Create {
+                parent: ROOT_INO,
+                name: "held".into(),
+                ino: ino(7),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            Some(rid(3, 1)),
+        )
+        .unwrap();
+    }
+    meta.set_holder_epoch(0);
+    let key = [constellation_meta::ReadKey::Dentry(ROOT_INO, "held".into())];
+    let other = [constellation_meta::ReadKey::Dentry(ROOT_INO, "z".into())];
+    let proof = Default::default();
+    let carried = Default::default();
+    // The strand alone (no tail names the row): rolled back, held.
+    meta.reship_at_takeover(
+        Some(constellation_meta::StrandArgs {
+            epoch: 2,
+            own_gens: &[],
+            abandoned: None,
+            carried: &carried,
+            proof: &proof,
+        }),
+        None,
+    )
+    .unwrap();
+    assert!(meta.lookup(ROOT_INO, "held").unwrap().is_none());
+    assert!(meta.pending_replays().unwrap().is_empty());
+    assert!(meta.member_copy_touches(&key), "held between the two");
+    assert!(!meta.member_copy_touches(&other));
+    // The tail that carries the row's identity re-applies it.
+    let recs = vec![
+        create(ROOT_INO, "held", ino(7)),
+        LogRecord::Completed { rid: rid(3, 1) },
+    ];
+    let report = reship(&meta, &[tx(1, 1, recs)]).unwrap();
+    assert_eq!(report.tail_applied, 1);
+    assert!(meta.lookup(ROOT_INO, "held").unwrap().is_some());
+    assert!(!meta.member_copy_touches(&key), "released by the tail");
+}
