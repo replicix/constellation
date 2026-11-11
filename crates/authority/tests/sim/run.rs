@@ -3100,16 +3100,45 @@ fn journal_rows<'a>(
     oracle: &check::Oracle,
 ) -> super::history::JournalOrder {
     let mut out = super::history::JournalOrder::new();
+    // ADR-59: a transaction a takeover re-shipped from its predecessor's
+    // tail begins with `TailOf { epoch, jseq }`: the tenure that first held
+    // it, `(epoch, the epoch's node, jseq)` (the node of any unfenced
+    // segment of that epoch, 0 when none is left), is its origin row. The
+    // gate's own segment carries no rows list, and then the origin is all
+    // the row has; a segment that lists it numbers it in the successor's
+    // journal, which is the row of the shipping tenure.
+    let mut node_of: HashMap<u64, u64> = HashMap::new();
+    for seg in oracle.unfenced.values() {
+        node_of.entry(seg.epoch).or_insert(seg.node);
+    }
     for (rid, (seq, idx)) in at {
         let Some(seg) = oracle.unfenced.get(seq) else {
             continue;
         };
+        let tail = |back: usize| match idx.checked_sub(back).and_then(|i| seg.records.get(i)) {
+            Some(LogRecord::TailOf { epoch, jseq }) => Some((*epoch, *jseq)),
+            _ => None,
+        };
+        let tailed = match seg.records.get(*idx) {
+            Some(LogRecord::Refused { .. }) => tail(1),
+            _ => tail(1).or_else(|| tail(2)),
+        }
+        .map(|(epoch, jseq)| (epoch, node_of.get(&epoch).copied().unwrap_or(0), jseq));
         let j = seg.records[..*idx]
             .iter()
             .filter(|rec| !matches!(rec, LogRecord::Atime { .. }))
             .count();
-        if let Some(row) = seg.rows.get(j) {
-            out.insert(*rid, (seg.epoch, seg.node, *row));
+        match (seg.rows.get(j), tailed) {
+            (Some(row), tailed) => {
+                out.insert(*rid, (seg.epoch, seg.node, *row));
+                if let Some(origin) = tailed {
+                    out.insert_origin(*rid, origin);
+                }
+            }
+            (None, Some(origin)) => {
+                out.insert(*rid, origin);
+            }
+            (None, None) => {}
         }
     }
     out
@@ -3128,9 +3157,10 @@ fn journal_rows<'a>(
 /// row is its own tenure's `(seg.epoch, row)`.
 ///
 /// The order by identity assumes one sequencer at a time and one shipping
-/// node per epoch. Empty (the caller then uses `witness_order`) when one
-/// epoch's segments come from two nodes, when any segment carries a
-/// delegation's origin, or when a rid has no identity.
+/// node per epoch. It serves `session::ExecIdentity` only (the real-time
+/// and linearization orders use [`journal_rows`]). Empty when one epoch's
+/// segments come from two nodes, when any segment carries a delegation's
+/// origin, or when a rid has no identity.
 fn exec_identity(oracle: &check::Oracle) -> super::session::ExecIdentity {
     let mut out = super::session::ExecIdentity::new();
     let mut node_of: HashMap<u64, u64> = HashMap::new();
@@ -6583,9 +6613,36 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         .map_err(lin_context)?;
     let observed_by_protocol = witness.observed_tentative - witness.observed_dropped;
     if strict_durability && observed_by_protocol > 0 {
+        let acks = oracles.acks.lock().unwrap();
+        let mut seen: Vec<String> = witness
+            .observers
+            .iter()
+            .map(|rid| {
+                let answers: Vec<String> = acks
+                    .iter()
+                    .filter(|a| a.rid == *rid)
+                    .map(|a| {
+                        format!(
+                            "n{} {:?} reply={} relay={} class={:?} at {}ms",
+                            a.node,
+                            a.kind,
+                            a.reply,
+                            a.is_relay(),
+                            a.judged.as_ref().and_then(|j| j.class),
+                            a.at_ms
+                        )
+                    })
+                    .collect();
+                format!("{rid:?}: answers={answers:?}")
+            })
+            .collect();
+        seen.sort();
         return Err(lin_context(format!(
-            "{} refusal(s) observed an acknowledged effect that was later rolled back              (impossible under a durable acknowledgement policy)",
-            observed_by_protocol
+            "{} refusal(s) observed an acknowledged effect that was later rolled back \
+             (impossible under a durable acknowledgement policy); the refusing ops' \
+             rids observed: {}",
+            observed_by_protocol,
+            seen.join("; ")
         )));
     }
     // The generic tester enforces the same contract: a refusal that
