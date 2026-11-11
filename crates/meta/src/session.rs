@@ -592,6 +592,14 @@ struct Inner {
     /// segments' `rows`). With `excused`, a watermark is reached past a
     /// deferred row of this node's own.
     ahead: Option<(u64, RowRanges)>,
+    /// ADR-59: per older epoch, the journal seq its tenure's log ended at
+    /// (`applied`'s) and the rows applied above it (`ahead`), kept when the
+    /// applied position moved on to a later epoch: a transaction a tenure
+    /// shipped ahead of a row it held stays in the log, and a member's copy
+    /// of it that outlives the epoch must still read as carried
+    /// ([`SessionState::row_in_log`]). Not persisted; the last
+    /// [`CLOSED_EPOCHS_MAX`] epochs.
+    closed: std::collections::BTreeMap<u64, (u64, RowRanges)>,
     /// Chunk metered-own-rows: rows of `observed`'s tenure that it does
     /// not owe — this node's own transactions, unshipped on the holder,
     /// whose effects this replica carries (`OwnRows::settle`). Every
@@ -620,6 +628,9 @@ const WITHDRAWN_COVERED_CAP: usize = 16;
 /// Disjoint inclusive journal seq ranges, `start -> end`.
 #[derive(Debug, Default, Clone)]
 struct RowRanges(std::collections::BTreeMap<u64, u64>);
+
+/// Most older epochs [`Inner::closed`] keeps.
+const CLOSED_EPOCHS_MAX: usize = 16;
 
 /// Most ranges [`Inner::ahead`] keeps; past it the lowest are dropped
 /// (a read then waits for the log, as without them).
@@ -1454,6 +1465,18 @@ impl SessionState {
     pub fn advance_rows(&self, seq: u64, through: Option<JournalPos>, rows: &[u64]) {
         let mut g = self.inner.lock().unwrap();
         g.applied_seq = g.applied_seq.max(seq);
+        if let (Some(old), Some(new)) = (g.applied, through) {
+            if new.epoch > old.epoch {
+                let ahead = match g.ahead.take() {
+                    Some((e, rows)) if e == old.epoch => rows,
+                    _ => RowRanges::default(),
+                };
+                g.closed.insert(old.epoch, (old.jseq, ahead));
+                while g.closed.len() > CLOSED_EPOCHS_MAX {
+                    g.closed.pop_first();
+                }
+            }
+        }
         if through > g.applied {
             g.applied = through;
         }
@@ -1487,7 +1510,9 @@ impl SessionState {
         // restart `applied` is empty until the first segment lands, and the
         // rows up to the persisted position would read as missing.
         let Some(a) = g.applied.max(g.seeded).filter(|a| a.epoch == epoch) else {
-            return false;
+            return g.closed.get(&epoch).is_some_and(|(through, ahead)| {
+                jseq <= *through || ahead.end_covering(jseq).is_some()
+            });
         };
         jseq <= a.jseq
             || g.ahead
@@ -2582,6 +2607,27 @@ mod tests {
         s.advance(10, jp(3, 7));
         assert!(s.row_in_log(3, 7));
         assert!(!s.row_in_log(3, 8));
+    }
+
+    /// ADR-59: a row a tenure shipped ahead of one it held is in the log
+    /// after the applied position moved on to a later epoch; the held one
+    /// (below the ahead row, above the tenure's `through`) is not.
+    #[test]
+    fn a_row_shipped_ahead_stays_in_the_log_after_the_epoch_moves_on() {
+        let s = SessionState::default();
+        s.advance_rows(5, jp(3, 11), &[]);
+        s.advance_rows(6, jp(3, 11), &[14, 15]);
+        assert!(s.row_in_log(3, 14));
+        assert!(!s.row_in_log(3, 12), "held");
+        s.advance(7, jp(4, 0));
+        assert!(
+            s.row_in_log(3, 11),
+            "at or below the closed tenure's through"
+        );
+        assert!(s.row_in_log(3, 15), "shipped ahead");
+        assert!(!s.row_in_log(3, 12), "held rows stay out of the log");
+        assert!(!s.row_in_log(3, 16));
+        assert!(!s.row_in_log(2, 1), "another tenure");
     }
 
     /// Rows applied out of order are kept as ranges and forgotten once

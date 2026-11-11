@@ -5912,8 +5912,15 @@ fn regression_a_readoption_landing_after_a_seal_is_not_served() {
 /// `backup-strict` 173 and 517 stopped when a read the root's grant horizon
 /// does not cover began to wait for the horizon write, and 1134 is the one
 /// `backup-strict` seed left.)
+///
+/// ADR-59 part A: the session keeps what the log carried of an epoch after it
+/// moves on (`SessionState::closed`), so the loser no longer reads the
+/// tenure's rows as missing and finds no gap at all: the seeds pass with no
+/// kept row past a gap, overtaken or not. The overtaken branch itself is
+/// pinned by the core test
+/// `a_claim_whose_tail_shows_the_rivals_epoch_ends_before_the_merge`.
 #[test]
-fn regression_a_claim_overtaken_during_its_kept_fetch_ends() {
+fn regression_a_claim_racing_a_rival_during_its_kept_fetch_finds_no_gap() {
     let slow = || SimConfig {
         s3_latency: (60, 200),
         ..backup_crash_config()
@@ -5931,9 +5938,10 @@ fn regression_a_claim_overtaken_during_its_kept_fetch_ends() {
         let r = run_seed(seed, cfg).unwrap_or_else(|e| {
             panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={alias}")
         });
-        assert!(
-            r.stats.values().map(|s| s.kept_overtaken).sum::<u64>() > 0,
-            "seed {seed}: no claim is overtaken during its kept fetch any more"
+        assert_eq!(
+            r.stats.values().map(|s| s.kept_past_gap).sum::<u64>(),
+            0,
+            "seed {seed}: a kept row lies past a gap"
         );
     }
 }
