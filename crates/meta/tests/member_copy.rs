@@ -231,6 +231,66 @@ fn a_recovery_strand_holds_its_readers_until_the_reship() {
     assert!(!meta.replay_touches(&key), "released by the re-ship");
 }
 
+/// ADR-57 (H2): the hold is persisted with the strand that took the row out
+/// of the served state, so a restart inside the re-ship window keeps it. Both
+/// kinds: a gated own row (member copy of its epoch) and a delegate row the
+/// deposed root appended (member copy of its generation).
+#[test]
+fn a_hold_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("m.db");
+    let a = [ReadKey::Dentry(ROOT_INO, "a".into())];
+    let own = [ReadKey::Dentry(ROOT_INO, "data".into())];
+    let other = [ReadKey::Dentry(ROOT_INO, "z".into())];
+    {
+        let meta = Meta::open(&db).unwrap();
+        meta.set_holder_epoch(1);
+        holder_create(&meta, RowCommit::ROOT_GROUP, "data", 1, 1);
+        meta.apply_delegate_tx(
+            &[create("a", ino(2), 11), completed(rid(2))],
+            Some(rid(2)),
+            5,
+            1,
+            Position::ZERO,
+        )
+        .unwrap();
+        let stranded = meta.strand_deposed(2).unwrap();
+        assert_eq!(stranded.member_copied, 1);
+        assert_eq!(stranded.deleg_member_copied, 1);
+        assert!(meta.member_copy_touches(&a));
+        assert!(meta.member_copy_touches(&own));
+        meta.close().unwrap();
+    }
+    let meta = Meta::open(&db).unwrap();
+    assert!(
+        meta.member_copy_touches(&a),
+        "the delegate row's hold is loaded at open"
+    );
+    assert!(
+        meta.member_copy_touches(&own),
+        "the gated own row's hold is loaded at open"
+    );
+    assert!(!meta.member_copy_touches(&other));
+    // The re-ship of the own row releases its hold, only its own.
+    let reship = vec![
+        LogRecord::TailOf { epoch: 1, jseq: 1 },
+        create("data", ino(1), 10),
+        completed(rid(1)),
+    ];
+    apply_rows(&meta, 1, 2, 3, &[1, 2, 3], &reship);
+    assert!(!meta.member_copy_touches(&own));
+    assert!(meta.member_copy_touches(&a));
+    meta.deleg_backup_clear(5).unwrap();
+    assert!(!meta.member_copy_touches(&a));
+    meta.close().unwrap();
+    drop(meta);
+    let meta = Meta::open(&db).unwrap();
+    assert!(
+        !meta.member_copy_touches(&a) && !meta.member_copy_touches(&own),
+        "a release is persisted too"
+    );
+}
+
 /// A row that never leaves the member copy (a leak: `backup-crash-slow`
 /// seed 840 left 20 on a node for good) holds reads of its keys for
 /// `HELD_COPY_MAX_AGE_MS` at most, not for ever.

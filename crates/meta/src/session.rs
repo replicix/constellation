@@ -281,6 +281,16 @@ pub struct KeySet {
 }
 
 impl KeySet {
+    /// The persisted form of a read hold (`read_hold:` keys).
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, crate::MetaError> {
+        Ok(postcard::to_allocvec(&(&self.dentries, &self.inos))?)
+    }
+
+    pub(crate) fn decode(b: &[u8]) -> Result<Self, crate::MetaError> {
+        let (dentries, inos): (Vec<(u64, String)>, Vec<u64>) = postcard::from_bytes(b)?;
+        Ok(Self { dentries, inos })
+    }
+
     ///
     /// For *covering* (speculation installed from a reply) this is exactly
     /// the records' `TouchSet` — the dentries and inodes the holder's

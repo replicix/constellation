@@ -710,7 +710,7 @@ impl Meta {
             tx.remove(&self.backup_tail, k);
         }
         // The rows are in the log: the reads a deposition held for them go.
-        self.release_copy_epoch(e);
+        self.release_slot_tx(&mut tx, e)?;
         tx.commit()?;
         self.flush_held_releases();
         Ok(())
