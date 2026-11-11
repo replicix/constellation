@@ -62433,7 +62433,6 @@ mod m11_step5 {
         backup_node(h, vec![1, 2]);
         link_2(h, false, None, 0);
         h.hold(1, None);
-        h.core.ack.eligible = Some(h.core.backup_could_be_had());
         link_2(h, true, Some(5), 0);
         let (r1, out) = submit(h, 1, "r1");
         assert!(replies(&out).is_empty(), "{out:?}");
@@ -62455,8 +62454,10 @@ mod m11_step5 {
             ..held
         };
         let gate = None;
+        // (The peer is gone from the directory: a roster read lists no one
+        // else, ADR-50.)
+        h.core.roster.make_singleton_for_test(1);
         h.core.lease.adopt(h.clk(), lease, tag(), gate);
-        h.core.ack.eligible = Some(false);
         r1
     }
 
@@ -62496,7 +62497,6 @@ mod m11_step5 {
         backup_node(h, vec![1, 2]);
         link_2(h, false, None, 0);
         h.hold(1, None);
-        h.core.ack.eligible = Some(h.core.backup_could_be_had());
         link_2(h, true, Some(5), 0);
         let (r1, out) = submit(h, 1, "r1");
         assert!(replies(&out).is_empty(), "{out:?}");
@@ -62508,7 +62508,6 @@ mod m11_step5 {
         h.core = Core::new(cfg);
         let mut out = Vec::new();
         h.core.start(h.clk(), &h.meta, &mut out);
-        h.core.roster.mark_seen_for_test(true);
         let lease = Lease {
             config_version: held.config_version + 2,
             backups: Vec::new(),
@@ -62516,8 +62515,11 @@ mod m11_step5 {
             ack_policy: constellation_store_s3::AckPolicy::Local,
             ..held
         };
+        // (The new core has read no roster yet: it is no singleton by its own
+        // test, ADR-50, so the retry waits for the archive by the row's
+        // rule and by the configuration's alike. Once a read lists no peer,
+        // only the row's rule holds it: the emission gate's backstop.)
         h.core.lease.adopt(h.clk(), lease, tag(), None);
-        h.core.ack.eligible = Some(false);
         r1
     }
 
