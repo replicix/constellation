@@ -123,6 +123,17 @@ Every FUSE read path waits before it reads:
 
 The wait (`Meta::session_wait`) goes like this:
 
+0. A pending acknowledged row touching the keys (a read hold, ADR-57): a row
+   this node took out of its served state while the log lacks it, which its
+   client was told is committed (a deposition, a rebuild from the log, a
+   takeover gate). Wait for the row's re-ship, whatever the session budget
+   (`CONSTELLATION_SESSION_WAIT_MS=0` included). After `read_hold_span` (the
+   client deadline, the takeover window and a forward round; row
+   `read_hold_span` of the derived timings) the read fails with `EIO`: it is
+   never answered without the row. The holds are persisted with the rollback
+   and survive a restart; `status.ack.read_holds`, `read_holds_oldest_ms`,
+   `read_holds_refused` and `read_holds_abandoned` count them. No read
+   delegation is granted over a held key.
 1. A queued replay of this node's own stranded op touching the keys:
    wait, since that is the session's own acknowledged write missing.
    Under a `Backup` or `S3` acknowledgement policy, the holder's own
@@ -133,7 +144,7 @@ The wait (`Meta::session_wait`) goes like this:
    once. A directory listing is never covered this way.
 4. Otherwise wait for the replica to advance, up to
    `CONSTELLATION_SESSION_WAIT_MS` (2 s). On timeout, answer anyway,
-   log a warning once per daemon, and count it.
+   log a warning once per daemon, and count it. (Not for a held key: step 0.)
 
 A watermark can name what the replica will never hold: a lock grant's
 floor is the join of every releaser's frontier since the lock was first

@@ -4536,3 +4536,55 @@ longer be final); a new dominance threshold for far writers (the window already
 smooths a burst); judging a link by its last sample (load inflates it).
 
 **May revert**: yes, by `CONSTELLATION_DELEGATION_STICKY_PLACEMENT=off`.
+## ADR-57: A node never answers a read from a state that lacks an acknowledged row it rolled back
+
+**Status**: decided by the maintainer (a read of a held key fails with `EIO` after
+the derived `read_hold_span`; it never blocks indefinitely and is never served
+stale). Landed as the persisted read hold set, the per-row releases, the holds
+of the rebuild and the takeover gate, and the hold phase of the session wait.
+Complements [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
+(a delegate acknowledges only committed rows) and
+[ADR-48](#adr-48-every-protocol-bound-is-derived-in-one-module) (the bound is
+derived).
+
+**Context**: a deposition, a segment's strand, a rebuild from the log and a
+takeover gate take committed rows out of a node's namespace until a successor
+re-ships them. Reads of their keys were held per call site, in memory, with a
+5 s cap after which the read was answered without the row; a restart dropped
+every hold, a delegate row's hold ended only with its generation (a sticky
+generation lives long), the release guard probed a slot a delegate row never
+has, and a rebuild and a gate held nothing (`sticky-root-designee-inbox` seed
+745: a node read its own acknowledged rename's target absent 1 ms after its
+deposition).
+
+**Decision**: the rows a node takes out of its served state while the log lacks
+them and their clients were told they are committed are recorded in the store
+(`read_hold:{slot}:{first}`), in the transaction that takes them out, and leave
+in the transaction that puts them back or makes them final: the drop rules of
+the member copy, the generation's log index reaching the row, the generation's
+end, the tail re-apply of a takeover gate, an operator's abandon. Every local
+read checks the set at the session wait, whatever the session budget or the
+read's mode; a read that touches it waits, up to `read_hold_span` (ADR-48:
+the client deadline, the takeover window and a forward round), then fails with
+`EIO`. No read is forwarded and none is answered stale. No read grant is made
+over a held key. A recall drops only rows nobody was told were committed, so it
+takes no hold (the sim asserts it: `recall_dropped_acked`).
+
+**Consequences**: read-your-writes and close-to-open hold across a deposition,
+a rebuild and a restart. Reads of held keys pay the re-ship latency; others pay
+one atomic load. A node with no live successor for a lease cycle fails reads of
+held keys instead of serving them stale (`status.ack.read_holds_refused`). A
+hold that is never released is a bug the sim's quiescence check finds
+(`read_holds_gone`), not a degraded read. A node's own acknowledged write binds
+its reads in every incarnation of the node (the sim's check).
+
+**Rejected**: serving stale at the bound (the old cap); forwarding the read to
+the root (no data-carrying read RPC exists, and the root lacks a delegate's row
+until the delegate re-streams it); blocking until released (a leak would be a
+silent hang).
+
+**May revert**: no.
+
+See: `crates/meta/src/store/member.rs` (`hold_row_tx`, `release_*_tx`),
+`crates/meta/src/session.rs` (the hold phase of `SessionState::wait_with_holds`),
+`crates/authority/src/deadlines.rs` (`read_hold_span`, D16).
