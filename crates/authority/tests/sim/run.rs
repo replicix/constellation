@@ -534,6 +534,14 @@ pub struct SimConfig {
     /// the identity oracle must then fail `flex-tight+identity` seeds 809 and
     /// 1489.
     pub kept_fetch_skipped: bool,
+    /// Negative control (`Meta::set_parent_taint_conservative`, ADR-59): the
+    /// ship rule orders a directory's merged attributes as exclusive writes
+    /// again and `repair drop-held` rolls back everything that depends on
+    /// a seed, as before the ADR. `AUTHORITY_SIM_PARENT_TAINT_CONSERVATIVE=1`
+    /// (or the `+parent-taint-conservative` variant) sets it; the
+    /// `flex-crash+durability` seeds 26, 283, 860, 1258 and 1751 must then
+    /// fail.
+    pub parent_taint_conservative: bool,
     /// Negative control (`Config::restart_skips_write_quarantine`): a
     /// restarted holder executes writes and grants read delegations at once.
     /// `AUTHORITY_SIM_RESTART_SKIPS_WRITE_QUARANTINE=1` sets it on every
@@ -1198,6 +1206,8 @@ impl Default for SimConfig {
             placement_recalls_sticky: std::env::var_os("AUTHORITY_SIM_PLACEMENT_RECALLS_STICKY")
                 .is_some_and(|v| v == "1"),
             kept_fetch_skipped: std::env::var_os("AUTHORITY_SIM_KEPT_FETCH_SKIPPED")
+                .is_some_and(|v| v == "1"),
+            parent_taint_conservative: std::env::var_os("AUTHORITY_SIM_PARENT_TAINT_CONSERVATIVE")
                 .is_some_and(|v| v == "1"),
             restart_skips_write_quarantine: std::env::var_os(
                 "AUTHORITY_SIM_RESTART_SKIPS_WRITE_QUARANTINE",
@@ -5205,6 +5215,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         ttl_reclaims_sticky: cfg.ttl_reclaims_sticky,
         placement_recalls_sticky: cfg.placement_recalls_sticky,
         kept_fetch_skipped: cfg.kept_fetch_skipped,
+        parent_taint_conservative: cfg.parent_taint_conservative,
         restart_skips_write_quarantine: cfg.restart_skips_write_quarantine,
         first_start_unsettled: cfg.first_start_unsettled,
         holder_releases_before_drain: cfg.holder_releases_before_drain,

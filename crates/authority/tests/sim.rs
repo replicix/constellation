@@ -6544,16 +6544,52 @@ fn a_clean_drop_held_still_passes_the_narrowed_excuse() {
     }
 }
 
-/// The control of the test above, and the fail-before of the narrowing:
-/// seeds whose refusals saw the effect of an op the operator's drop rolled
-/// back after its client was told `Ok`. The broad excuse (any rid in the
-/// drop's `rolled_back`) passed them; an acknowledged dropped op is not the
-/// operator's to excuse, so they fail with the durability violation.
+/// ADR-59: seeds whose refusals saw the effect of an op the operator's drop
+/// rolled back after its client was told `Ok`: the drop rolled back a create
+/// next to the damaged file, held behind the seed by a directory's merged
+/// times, and a refusal saw it. The ship rule orders what only merges its
+/// directory after nothing, so the drop no longer reaches it (the control
+/// below is the code as it was before the ADR).
+#[test]
+fn an_acknowledged_independent_op_survives_the_drop() {
+    for seed in [1258, 1751] {
+        run_seed(seed, config_variant(flex_crash_config(), "durability")).unwrap_or_else(|e| {
+            panic!(
+                "flex-crash+durability seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=flex-crash+durability"
+            )
+        });
+    }
+}
+
+/// The three seeds whose refusals saw an acknowledged rename, chmod or unlink
+/// of the damaged file itself, which the drop still rolls back (it depends on
+/// the seed's own keys): the loss ADR-59 part A does not avoid. They fail
+/// strict durability until the sim names that cost (see the oracle's gate).
 #[test]
 fn the_acknowledged_dropped_op_control_fails_the_durability_seeds() {
-    for seed in [26, 283, 860, 1258, 1751] {
+    for seed in [26, 283, 860] {
         let e = run_seed(seed, config_variant(flex_crash_config(), "durability"))
             .expect_err("an acknowledged dropped op was excused");
+        assert!(
+            e.contains("observed an acknowledged effect"),
+            "seed {seed}: {e}"
+        );
+    }
+}
+
+/// The control of the first test: with the conservative classification and
+/// the strand-everything drop (`Meta::set_parent_taint_conservative`, what
+/// the code did before ADR-59) the same seeds fail with the durability
+/// violation (an acknowledged effect rolled back).
+#[test]
+fn the_conservative_parent_taint_control_fails_them() {
+    for seed in [1258, 1751] {
+        let cfg = config_variant(
+            config_variant(flex_crash_config(), "durability"),
+            "parent-taint-conservative",
+        );
+        let e = run_seed(seed, cfg).expect_err("the conservative control passed");
         assert!(
             e.contains("observed an acknowledged effect"),
             "seed {seed}: {e}"
@@ -14074,6 +14110,11 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
         },
         "lone" => SimConfig {
             strict_lone: true,
+            ..cfg
+        },
+        // ADR-59's negative control (`Meta::set_parent_taint_conservative`).
+        "parent-taint-conservative" => SimConfig {
+            parent_taint_conservative: true,
             ..cfg
         },
         // Plan 46 M1.4 step 0: the durability oracle strict (`+durability`).
