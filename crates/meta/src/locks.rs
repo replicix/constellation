@@ -1017,6 +1017,20 @@ struct Inner {
     /// `TTL + 2 × margin`, so an outwaited grant — whose record has
     /// already expired when it ends — is remembered too).
     ended_keep_ms: i64,
+    /// The longest a new local turn waits for an op of an earlier turn
+    /// left in doubt that the core has not finished (`0`: not at all): the
+    /// settle's own bound, after which the core has finished the op
+    /// whatever it does ([`LockTables::set_doubt_hold_ms`]).
+    doubt_hold_ms: i64,
+    /// The ops in doubt (by rid and grant) a new local turn waits for, with
+    /// the wait-clock end of the wait: until the core finishes the op
+    /// ([`LockTables::end_hold`]), its outcome is known
+    /// ([`LockTables::resolve_doubt`]) or that end. Small: only the ops
+    /// being waited for.
+    holds: BTreeMap<(crate::rid::Rid, GrantId), WaitMs>,
+    /// Ops the core finished before their doubt was noted (the caller's
+    /// give-up raced the answer): no wait for them. Bounded.
+    finished_rids: std::collections::VecDeque<crate::rid::Rid>,
     /// Node side (phase 2): the grant last held on each inode, for a
     /// fence captured after the lapsed grant left `held`
     /// ([`FencedOwner::grant`]).
@@ -1116,6 +1130,10 @@ const RELEASED_KEPT: usize = 512;
 /// leaves the token's window check, which a release cannot beat: the
 /// releasing node waits for its tagged ops first).
 const ENDED_KEPT: usize = 4096;
+
+/// The most ops in doubt a new turn waits for, or ops the core finished
+/// before their doubt was noted, that are kept ([`Inner::holds`]).
+const HOLDS_KEPT: usize = 256;
 /// Past this many `(inode, owner)` pairs the oldest inodes' go (a lost
 /// entry only admits what it would have refused before).
 const NEWEST_KEPT: usize = 4096;
@@ -1373,6 +1391,17 @@ impl Inner {
         match rid {
             Some(r) => {
                 e.rids.insert(r);
+                if self.doubt_hold_ms > 0 {
+                    if let Some(i) = self.finished_rids.iter().position(|f| *f == r) {
+                        self.finished_rids.remove(i);
+                    } else {
+                        let end = WaitMs(since.0.saturating_add(self.doubt_hold_ms));
+                        self.holds.insert((r, grant), end);
+                        if self.holds.len() > HOLDS_KEPT {
+                            self.holds.retain(|_, end| end.0 > since.0);
+                        }
+                    }
+                }
             }
             None if e.rids.is_empty() => e.anon = true,
             None => {}
@@ -1387,6 +1416,18 @@ impl Inner {
                 break;
             };
             self.doubted.remove(&oldest);
+        }
+    }
+
+    /// An op of an earlier turn under `grant` (or an older id of the same
+    /// held grant) ended in doubt with a known rid, which the core has not
+    /// finished, and is within the hold ([`LockTables::set_doubt_hold_ms`]).
+    fn rid_doubt_holds(&self, grant: GrantId, now: WaitMs) -> bool {
+        !self.holds.is_empty() && {
+            let ids = self.lineage(grant);
+            self.holds
+                .iter()
+                .any(|((_, g), end)| end.0 > now.0 && ids.contains(g))
         }
     }
 
@@ -2748,12 +2789,43 @@ impl LockTables {
         out
     }
 
+    /// A new local turn waits for an earlier turn's op left in doubt (a
+    /// rid known) until the core finishes it ([`Self::end_hold`]) or its
+    /// outcome is known, at most `ms` from the doubt: a grant that is live
+    /// at its executor judges the op exactly, whatever its token's window
+    /// says, so the op can land after the new turn's writes until the core
+    /// has finished it (settled it, or given it up, ADR-49). `ms` is the
+    /// settle's own bound, which the core's finish always comes before.
+    /// `0`: the window only.
+    pub fn set_doubt_hold_ms(&self, ms: i64) {
+        self.lock().doubt_hold_ms = ms.max(0);
+    }
+
+    /// The core finished the op `rid` of this node (answered it, settled
+    /// it, or gave it up in doubt): a new turn no longer waits for it. If
+    /// its doubt is noted only afterwards, none is waited for.
+    pub fn end_hold(&self, rid: crate::rid::Rid) {
+        let mut g = self.lock();
+        if g.doubt_hold_ms == 0 {
+            return;
+        }
+        let before = g.holds.len();
+        g.holds.retain(|(r, _), _| *r != rid);
+        if g.holds.len() == before {
+            g.finished_rids.push_back(rid);
+            if g.finished_rids.len() > HOLDS_KEPT {
+                g.finished_rids.pop_front();
+            }
+        }
+    }
+
     /// The in-doubt op `rid` under `grant` has a definitive outcome (it
     /// executed — its commit is done — or it was refused): no longer a
     /// doubt. The grant is released normally once none is left.
     pub fn resolve_doubt(&self, grant: GrantId, rid: crate::rid::Rid) {
         let mut g = self.lock();
         for id in g.lineage(grant) {
+            g.holds.remove(&(rid, id));
             if let Some(d) = g.doubted.get_mut(&id) {
                 d.rids.remove(&rid);
                 if d.rids.is_empty() && !d.anon {
@@ -4508,6 +4580,7 @@ impl LockTables {
             if id.is_some_and(|id| {
                 g.inflight_of(id)
                     .is_some_and(|e| e.publishing > 0 || e.pinned_until > now.wait)
+                    || g.rid_doubt_holds(id, now.wait)
             }) {
                 // Counted once per request by the caller, which may ask
                 // again many times (`LockStats::predecessor_waits`).
@@ -6440,6 +6513,108 @@ mod token_tests {
             None,
             "nothing left behind"
         );
+    }
+
+    /// ADR-49: an op left in doubt with a known rid under a grant that is
+    /// live at its executor is judged exactly there, whatever its token's
+    /// window says, so it can land after the next turn's writes once the
+    /// window is over. The next turn waits for the op's outcome (up to the
+    /// hold), not only for the window.
+    #[test]
+    fn a_new_turn_waits_for_an_op_in_doubt_until_its_outcome() {
+        let t = LockTables::default();
+        t.set_doubt_hold_ms(5_000);
+        t.install_held(7, held(LockMode::Exclusive, 20_000));
+        let id = GrantId { node: 1, seq: 1 };
+        let tag = LockTag(vec![LockToken::window(id, 500)]);
+        let rid = crate::rid::Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 3,
+        };
+        t.tag_begin(&tag, Now::same(0));
+        t.pin_in_doubt(&tag, Some(rid));
+        t.tag_end(&tag, true, Now::same(10));
+        assert_eq!(
+            t.local_set(7, lk(11, true, 0, 9), Now::same(600)),
+            LocalOutcome::Predecessor,
+            "the window is over, the op's outcome is not known"
+        );
+        assert_eq!(
+            t.local_set(7, lk(11, true, 0, 9), Now::same(4_000)),
+            LocalOutcome::Predecessor
+        );
+        t.resolve_doubt(id, rid);
+        assert_eq!(
+            t.local_set(7, lk(11, true, 0, 9), Now::same(4_001)),
+            LocalOutcome::Done,
+            "settled or executed"
+        );
+    }
+
+    /// The hold ends: past it the core has settled the op or given it up.
+    #[test]
+    fn a_new_turn_stops_waiting_for_an_op_in_doubt_after_the_hold() {
+        let t = LockTables::default();
+        t.set_doubt_hold_ms(5_000);
+        t.install_held(7, held(LockMode::Exclusive, 20_000));
+        let id = GrantId { node: 1, seq: 1 };
+        let tag = LockTag(vec![LockToken::window(id, 500)]);
+        let rid = crate::rid::Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 3,
+        };
+        t.tag_begin(&tag, Now::same(0));
+        t.pin_in_doubt(&tag, Some(rid));
+        t.tag_end(&tag, true, Now::same(10));
+        assert_eq!(
+            t.local_set(7, lk(11, true, 0, 9), Now::same(4_999)),
+            LocalOutcome::Predecessor,
+            "the bound itself: the doubt's time plus the hold"
+        );
+        assert_eq!(
+            t.local_set(7, lk(11, true, 0, 9), Now::same(5_000)),
+            LocalOutcome::Done
+        );
+    }
+
+    /// The core finishing the op (answered, settled, or given up in doubt)
+    /// ends the wait at once, not at the hold's end; and a finish that came
+    /// before the doubt was noted leaves none to wait for.
+    #[test]
+    fn a_new_turn_stops_waiting_when_the_core_finishes_the_op() {
+        let rid = crate::rid::Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 3,
+        };
+        let id = GrantId { node: 1, seq: 1 };
+        let tag = LockTag(vec![LockToken::window(id, 500)]);
+        for finish_first in [false, true] {
+            let t = LockTables::default();
+            t.set_doubt_hold_ms(5_000);
+            t.install_held(7, held(LockMode::Exclusive, 20_000));
+            t.tag_begin(&tag, Now::same(0));
+            if finish_first {
+                t.end_hold(rid);
+            }
+            t.pin_in_doubt(&tag, Some(rid));
+            t.tag_end(&tag, true, Now::same(10));
+            if !finish_first {
+                assert_eq!(
+                    t.local_set(7, lk(11, true, 0, 9), Now::same(600)),
+                    LocalOutcome::Predecessor
+                );
+                t.end_hold(rid);
+            }
+            assert_eq!(
+                t.local_set(7, lk(11, true, 0, 9), Now::same(601)),
+                LocalOutcome::Done,
+                "finish_first={finish_first}"
+            );
+            assert!(t.was_doubted(id), "the doubt itself stays for the owner");
+        }
     }
 
     /// A tagged op still waiting for its answer when its owner's turn ends

@@ -122,15 +122,13 @@ pub struct LockCounters {
     pub stale_turn_reads: u64,
     /// Reads that found an unacknowledged older turn landed late (plan
     /// 30 §M14 phase 2: none, now that a write carries its fencing token).
-    /// A few per 2,000 seeds occur in the executor and doubt configurations
-    /// (plan 46 M1.2 step 15; not a held write's). The late turn is a
-    /// lock-lane client's own write that bounced between the root and a
-    /// delegate whose subtree was being handed back (`Held`, `NotHolder`),
-    /// that the client gave up on after `lock_write_wait_ms` without a
-    /// settle, and that the root executed seconds later under the same
-    /// still-renewed grant, over the client's later acknowledged writes
-    ///. The grant lived, so the fence
-    /// is not at fault; the lane's early give-up has no settle.
+    /// A write the client gave up on (`lock_write_wait_ms`) and the root
+    /// executed under the same still-renewed grant, over the client's
+    /// later acknowledged writes, used to occur a few times per 2,000
+    /// seeds in the executor and doubt configurations (plan 46 M1.2 step
+    /// 15). The grant lived, so the fence was not at fault: the next turn
+    /// now waits for the abandoned write's outcome (ADR-49), as the
+    /// engine's does. Any count is a failure.
     pub late_unacked_turns: u64,
     /// Turn writes the executor refused for a lapsed grant (`LockLapsed`).
     pub token_refused: u64,
@@ -1495,6 +1493,12 @@ pub async fn client_lock(
                     ghost.count(|c| c.token_refused += 1);
                 }
                 if let Some(h) = same(&cluster, node, inc) {
+                    if !settled {
+                        // As the engine does (`note_tag_in_doubt`): the doubt
+                        // carries the rid, so a new turn under the grant waits
+                        // for the op's outcome.
+                        h.meta.locks().pin_in_doubt(&tag, Some(rid));
+                    }
                     h.meta.locks().tag_end(&tag, !settled, h.clock.now());
                 }
                 // Acknowledged while the grant it was written under is

@@ -7473,6 +7473,14 @@ impl Core {
         replica
             .locks()
             .set_token_memory_ms(self.lock_ttl_ms() + 2 * self.lock_margin_ms());
+        // A new local turn waits for an earlier turn's op in doubt until
+        // the core finishes it (`finish`, `finish_in_doubt`), at most the
+        // settle's own bound from the doubt: the op's attempts, then its
+        // settle, which no extension takes past `settle_cap_span`.
+        let dl = self.dl_t();
+        replica
+            .locks()
+            .set_doubt_hold_ms((dl.attempts + dl.settle_cap_span) as i64);
         if !self.cfg.locks {
             return;
         }
