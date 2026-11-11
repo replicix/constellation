@@ -262,6 +262,12 @@ pub struct ReadEvt {
     pub ret: u64,
     /// The session wait ran out and the read answered degraded.
     pub timed_out: bool,
+    /// ADR-57: a pending acknowledged row (a hold) touched the read's keys
+    /// at some point of the read.
+    pub held: bool,
+    /// ... and the read was answered while it still did, or after its hold
+    /// ran out without a release: the answer lacks an acknowledged row.
+    pub held_served: bool,
     /// How the read's floor was obtained: a read delegation the node held,
     /// a ReadIndex answer, a degraded one, or none (a bounded mount).
     pub path: &'static str,

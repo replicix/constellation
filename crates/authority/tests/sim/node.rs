@@ -438,6 +438,9 @@ pub struct NodeEnv {
     pub clock: Clock,
     pub commits: Arc<Mutex<Vec<CommitRecord>>>,
     pub in_doubt: InDoubtLog,
+    /// ADR-57 P5: every delegate row a recall dropped from a root's journal
+    /// (node, gen, idx, rid).
+    pub recall_drops: Arc<Mutex<Vec<(NodeId, u64, u64, Rid)>>>,
     pub config: Arc<dyn Fn(NodeId, u32) -> Config + Send + Sync>,
     /// See `SimConfig::panic_after_events`.
     pub panic_after_events: Option<u64>,
@@ -622,6 +625,9 @@ impl NodeHandle {
                 // restarted daemon has none (only the persisted horizon,
                 // which the core loads at start).
                 m.read_delegations().reset_for_restart();
+                // The read holds are the store's: a restarted process loads
+                // them back, as the open does (ADR-57).
+                m.reload_read_holds().expect("read holds");
                 m
             }
             None => {
@@ -629,6 +635,10 @@ impl NodeHandle {
                 m.set_node_prefix(id).expect("prefix");
                 // Plan 46 M1.2 step 14's negative control.
                 m.set_deleg_append_replay((env.config)(id, 0).deleg_append_replay);
+                let drops = env.recall_drops.clone();
+                m.set_recall_drop_hook(Box::new(move |gen, idx, rid| {
+                    drops.lock().unwrap().push((id, gen, idx, rid));
+                }));
                 // A restart without the journal keeps no queue either.
                 env.oracles.identity.lock().unwrap().wipe(id);
                 Arc::new(m)
