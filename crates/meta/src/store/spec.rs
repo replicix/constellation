@@ -3619,6 +3619,18 @@ pub(crate) fn retire_local_tx(
     for (first, row) in &shipped {
         tx.remove(&meta.journal_tx, local::tx_key(*first));
         local::remove_journal_origin(tx, meta, row.gen, row.idx, *first);
+        // A row of a delegation generation that this node shipped itself
+        // (a delegate that took the root over and shipped the rows it had
+        // journaled as a delegate, or a root's own append of a delegate's
+        // row) is in the log from here on. Every other replica counts it at
+        // the segment it applies (`apply_segment_rows`), and this node, which
+        // applies no segment of its own, counts it here: its `deps` checks
+        // read the log's index of the generation, and a row of a later
+        // generation that names this one waits for it for good otherwise.
+        // Only raised, so a row counted when it was appended stays so.
+        if row.gen != 0 {
+            local::bump_log_idx_tx(tx, &meta.local, row.gen, row.idx)?;
+        }
     }
     counter_add_tx(tx, &meta.local, KV_LOCAL_SPEC_COUNT, -(captured as i64))?;
     let deleg = shipped

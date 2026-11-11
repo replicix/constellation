@@ -670,6 +670,11 @@ pub(crate) struct DelegateState {
     /// stream (a leave counts only these as released; the others wait for
     /// the log to end them).
     pub release_acked: bool,
+    /// Installed again after a restart for the release row of a stream that
+    /// released every subtree, and nothing else (no subtree is left to tell
+    /// its kind by, so `non_stealable` is false): the state a sync must keep
+    /// while the row is unacknowledged (`Core::delegation_sync`).
+    pub remnant: bool,
     /// Plan 46 M1.2 step 10: the subtrees this node released from the stream
     /// (a repeated or late request for one is not news: it is not a subtree
     /// the node has yet to learn). A subtree granted to the stream again
@@ -1908,7 +1913,12 @@ impl Core {
         // was never streamed: a sticky holder's answers are final, so its
         // rows are the root's only copy). A stealable stream's recall is
         // outwaited by the root's expiry whatever its row did, and is left
-        // as it was.
+        // as it was. The remnant a restart installed again for the row
+        // (`DelegateState::remnant`) stays whatever its kind: it has no
+        // subtree to tell it by, and a sticky stream's row that never ships
+        // is never ended by the root's expiry either (sim `sticky-idle-release`
+        // seed 217: the sync after the install dropped it, the root listed
+        // the stream for good and the row stayed in the journal).
         let streams_mine: BTreeSet<u64> = table
             .streams()
             .filter(|s| s.node == me)
@@ -1919,7 +1929,9 @@ impl Core {
             .mine
             .iter()
             .filter(|(g, _)| !live_mine.contains(g))
-            .filter(|(g, d)| !(d.non_stealable && d.release.is_some() && streams_mine.contains(g)))
+            .filter(|(g, d)| {
+                !((d.non_stealable || d.remnant) && d.release.is_some() && streams_mine.contains(g))
+            })
             .map(|(g, _)| *g)
             .collect();
         for gen in ended {
@@ -2155,6 +2167,7 @@ impl Core {
                     executed: 0,
                     last_own_op: BTreeMap::new(),
                     non_stealable: d.non_stealable(),
+                    remnant,
                     last_root: self.root_node(),
                     backup: None,
                     backup_acked: 0,
