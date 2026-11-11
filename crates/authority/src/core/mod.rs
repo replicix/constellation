@@ -415,6 +415,11 @@ pub struct Config {
     /// owner's disk as before (`Final`), without a member's copy. The
     /// simulation's `strict_commit` must fail with it on the flex configs.
     pub hold_answers_uncommitted: bool,
+    /// Plan 46 M1.4 step 6a's negative control, never set in production
+    /// (`AUTHORITY_SIM_RESUMED_SPAN_DROPPED=1`): a tenure that starts with
+    /// no configuration seen forgets its earlier unshipped rows' rule, as
+    /// before ADR-53 (and the emission gate's root-row check is off).
+    pub resumed_span_dropped: bool,
     /// A negative control for the simulation's oracle, never set in
     /// production (`AUTHORITY_SIM_DEDUP_DELEG_UNAWAITED=1`): the root answers
     /// from a delegate's row it appended without waiting for the append to
@@ -699,6 +704,7 @@ impl Config {
             stream_ahead_holdoff_ms: 5,
             hold_resend_ms: 250,
             hold_answers_uncommitted: false,
+            resumed_span_dropped: false,
             dedup_deleg_rows_unawaited: false,
             backup_ack_timeout_ms: 1_000,
             backup_slow_max_ms: 10_000,
@@ -1821,6 +1827,14 @@ pub struct Stats {
     pub held_at_emission_holder_reply: u64,
     pub held_at_emission_designation: u64,
     pub held_at_emission_release: u64,
+    /// Plan 46 M1.4 step 6a (ADR-53): the held answers of
+    /// `answers_held_at_emission` that rested on this node's own root row
+    /// (`Core::unsettled_root_row`). Expected zero: the cfg spans decide it
+    /// first.
+    pub held_at_emission_root_row: u64,
+    /// Plan 46 M1.4 step 6a: spans a tenure's start pushed for earlier
+    /// unshipped gated rows (`Core::span_earlier_rows`).
+    pub resumed_spans: u64,
     /// Plan 43 C1-3: the tail fetch. `SealTail`s answered by this node as a
     /// holder (it sealed its own epoch), as a backup, and refused;
     /// attempts of a claim to fetch, fetches completed (of those, of a
@@ -4025,6 +4039,7 @@ impl Core {
                 self.ack.mark_own = lease.granted_delegations;
                 self.ack.mark_inherited = false;
                 self.lease.adopt(now, lease, tag, None);
+                self.sync_cfg_spans(replica);
                 self.stats.epoch_closed_leases_reheld += 1;
             }
             self.skip_ship = true;

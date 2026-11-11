@@ -4330,6 +4330,9 @@ impl Core {
             self.stats.takeovers += 1;
         }
         self.lease.adopt(now, lease, tag, Some(gate));
+        // Plan 46 M1.4 step 6a (ADR-53): the configuration this tenure starts
+        // under is noted before anything parked is released in this event.
+        self.sync_cfg_spans(replica);
         // Plan 46 M1.2 step 7 (c3-spec D6): whom a generation inherited with
         // no recorded backup is sealed with.
         self.lease.prev_holder = prev

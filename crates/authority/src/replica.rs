@@ -800,6 +800,11 @@ pub trait Replica {
     /// Plan 43 C1-2: the class of the unshipped journal transaction that
     /// carries `rid` (the latest of them), if any.
     fn journal_class_of_rid(&self, rid: Rid) -> Option<(u64, constellation_meta::RowCommit)>;
+    /// Plan 46 M1.4 step 6a (ADR-53): the last journal seq of the highest
+    /// unshipped gated row of this node's own journaled under a
+    /// configuration older than `version`, if any
+    /// (`Meta::max_unshipped_gated_below`).
+    fn max_unshipped_gated_below(&self, version: u64) -> Option<u64>;
     /// Plan 43 C1-4: the class of the journal transaction starting at
     /// journal seq `first`, if it is still in the journal.
     fn journal_tx_class(&self, first: u64) -> Option<constellation_meta::RowCommit>;
@@ -2028,6 +2033,12 @@ impl Replica for Meta {
 
     fn set_deleg_durable(&self, gen: u64, d: Option<constellation_meta::DelegDurable>) {
         self.session().set_deleg_durable(gen, d)
+    }
+
+    fn max_unshipped_gated_below(&self, version: u64) -> Option<u64> {
+        Meta::max_unshipped_gated_below(self, version)
+            .ok()
+            .flatten()
     }
 
     fn journal_tx_class(&self, first: u64) -> Option<constellation_meta::RowCommit> {

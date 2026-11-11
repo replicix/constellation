@@ -608,6 +608,17 @@ pub(crate) struct AckState {
     /// The configuration of the held lease as of the last
     /// [`Core::sync_cfg_spans`].
     pub(crate) cfg_seen: Option<CfgSeen>,
+    /// Plan 46 M1.4 step 6a (ADR-53): where the tenure started, when it
+    /// started with no configuration seen (the lease let go and taken
+    /// again): the lease's `config_version` and the journal's tip then.
+    /// A gated row at or below the tip, journaled under an older version,
+    /// is an earlier tenure's: the archive alone commits it
+    /// ([`Core::unsettled_root_row`]).
+    pub(crate) tenure_start: Option<(u64, u64)>,
+    /// A tenure that held a configuration ended (the lease was let go or
+    /// lost): the next tenure to start is a resumed one
+    /// ([`Core::span_earlier_rows`]), not the process's first.
+    pub(crate) tenure_gap: bool,
     /// The journal's tip at the event in which the singleton test turned
     /// against a lease that still says singleton: rows past it are not
     /// answered alone (the archive rule), though the lease's bump has not
@@ -1586,7 +1597,13 @@ impl Core {
     pub(crate) fn sync_cfg_spans(&mut self, replica: &dyn Replica) {
         let cur = self.lease_cfg();
         match (cur, self.ack.cfg_seen.take()) {
-            (None, _) => self.ack.spans.clear(),
+            (None, seen) => {
+                self.ack.spans.clear();
+                self.ack.tenure_start = None;
+                // A tenure that held a configuration has ended: the next
+                // one is a resumed tenure, not the process's first.
+                self.ack.tenure_gap |= seen.is_some();
+            }
             (Some(c), Some(seen)) if seen.epoch == c.epoch => {
                 if seen != c {
                     let tip = replica.journal_tip();
@@ -1623,9 +1640,15 @@ impl Core {
                 self.ack.flip_tip = None;
                 self.ack.cfg_seen = Some(c);
             }
-            (Some(c), _) => {
+            (Some(c), seen) => {
                 self.ack.spans.clear();
                 self.ack.flip_tip = None;
+                if seen.is_none()
+                    && std::mem::take(&mut self.ack.tenure_gap)
+                    && !self.cfg.resumed_span_dropped
+                {
+                    self.span_earlier_rows(replica);
+                }
                 self.ack.cfg_seen = Some(c);
             }
         }
@@ -1636,6 +1659,32 @@ impl Core {
                 .into_iter()
                 .filter(|s| self.cfg_span_cap(s).is_some())
                 .collect();
+        }
+    }
+
+    /// Plan 46 M1.4 step 6a (ADR-53): a resumed tenure starts with no
+    /// configuration seen (the lease a continuation epoch's close let go, or
+    /// a lapse ended the node's last one). Rows the journal still holds
+    /// unshipped under an older configuration keep that configuration's
+    /// rule: a span ending at the last of them makes the archive, not the
+    /// resumed tenure's own rule, commit them. Nothing is pushed when
+    /// another tenure rolled the journal back (no such row is left).
+    fn span_earlier_rows(&mut self, replica: &dyn Replica) {
+        let Some(version) = self.lease.held.as_ref().map(|(l, _)| l.config_version) else {
+            return;
+        };
+        let tip = replica.journal_tip();
+        self.ack.tenure_start = Some((version, tip));
+        if tip <= self.ack.shipped_through {
+            return;
+        }
+        if let Some(end) = replica.max_unshipped_gated_below(version) {
+            self.ack.spans.push(CfgSpan {
+                backups: Vec::new(),
+                singleton: false,
+                end,
+            });
+            self.stats.resumed_spans += 1;
         }
     }
 
