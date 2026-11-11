@@ -1743,6 +1743,10 @@ impl Core {
 
     /// The highest journal seq any member of the epoch has acknowledged
     /// holding (`hold_acked`), of the epoch this node owns now.
+    ///
+    /// The maximum over every node in `hold_acked`, a member that has since
+    /// left the roster included: the same count as `durable_jseq_cfg`, which
+    /// the hold's answers wait for, so the gate and the answers agree.
     fn hold_acked_through(&self) -> u64 {
         if self.ack.hold_epoch != self.lease.epoch() {
             return 0;
@@ -3928,7 +3932,14 @@ impl Core {
         if std::mem::replace(&mut self.ack.held_before, self.lease.epoch_held())
             && !self.lease.epoch_held()
         {
-            self.ack.hold_end_tip = Some(replica.journal_tip());
+            let tip = replica.journal_tip();
+            self.ack.hold_end_tip = Some(tip);
+            // The cursor sat at the group's ack for the gated subscribers;
+            // a hold that turns into a shipped tenure must not stream its
+            // rows past the gate again under the new epoch, whose rule is
+            // the row's class: the closing flush's segment carries them.
+            self.ack.streamed_through = self.ack.streamed_through.max(tip);
+            self.ack.ahead_of.clear();
         }
         if self
             .ack
@@ -3971,7 +3982,7 @@ impl Core {
                 // A continuation epoch's hold owner: its journal is
                 // acknowledged on its disk alone (`durable_jseq`) and
                 // streams ahead to the members as it grows.
-                if replica.journal_tip() > self.ack.streamed_through {
+                if self.stream_ahead_due(replica.journal_tip()) {
                     self.stream_ahead_soon(now, replica, out);
                 }
             } else {
@@ -5124,6 +5135,43 @@ impl Core {
             && replica.releasable_prefix(&txs, Some(to)) >= txs.len()
     }
 
+    /// Whether a stream-ahead pass has something to send at journal tip
+    /// `tip`. A hold group's cursor stays at the group's ack for the
+    /// subscribers outside the epoch, so `tip > streamed_through` alone holds
+    /// for as long as the tip is unacknowledged: then a pass is due only when
+    /// the gate moved, or a member is behind the tip.
+    pub(crate) fn stream_ahead_due(&self, tip: u64) -> bool {
+        let through = self.ack.streamed_through;
+        if tip <= through {
+            return false;
+        }
+        if !(self.epoch_streams_ahead() && self.hold_group()) {
+            return true;
+        }
+        let members = &self.pr.epoch_members;
+        if !self
+            .stream_subscribers()
+            .iter()
+            .any(|n| !members.contains(n))
+        {
+            return true;
+        }
+        self.hold_acked_through().min(tip) > through
+            || members.iter().any(|m| {
+                *m != self.cfg.node_id && self.ack.ahead_of.get(m).copied().unwrap_or(through) < tip
+            })
+    }
+
+    /// Forget the hold bookkeeping of nodes that are not (any more) members
+    /// of the epoch: only a member acknowledges, and a resend is for the
+    /// group's rows alone (a non-member's batch is gated, never resent).
+    fn prune_hold_non_members(&mut self) {
+        let members = &self.pr.epoch_members;
+        self.ack.hold_sent.retain(|n, _| members.contains(n));
+        self.ack.hold_sent_hi.retain(|n, _| members.contains(n));
+        self.ack.hold_resending.retain(|n| members.contains(n));
+    }
+
     /// Stream the epoch journal again from its start (a member
     /// subscribed): the next stream-ahead pass resends everything.
     pub(crate) fn restream_ahead(&mut self) {
@@ -5182,6 +5230,9 @@ impl Core {
         let Some(epoch) = self.lease.epoch() else {
             return;
         };
+        if self.epoch_streams_ahead() {
+            self.prune_hold_non_members();
+        }
         let window = |from: u64| -> Vec<BackupTx> {
             replica
                 .journal_txs_from(from, self.cfg.backup_batch_rows)
@@ -5396,11 +5447,15 @@ impl Core {
         if !self.hold_group() || !self.epoch_streams_ahead() {
             return;
         }
+        // The roster is replaced on every epoch report and may have shrunk
+        // since the batch was sent; a node outside it is not resent to.
+        self.prune_hold_non_members();
         let due = self.cfg.hold_resend_ms.max(1) as i64;
         let members: Vec<NodeId> = self
             .ack
             .hold_sent
             .iter()
+            .filter(|(n, _)| self.pr.epoch_members.contains(*n))
             .filter(|(_, q)| q.front().is_some_and(|&(_, at)| now.wait.since(at) >= due))
             .map(|(n, _)| *n)
             .collect();
@@ -5412,7 +5467,7 @@ impl Core {
 
     /// One batch of the journal after what member `n` acknowledged, sent
     /// again (and the member marked as being resent to).
-    fn resend_hold_batch(
+    pub(crate) fn resend_hold_batch(
         &mut self,
         n: NodeId,
         now: Now,
@@ -5422,6 +5477,11 @@ impl Core {
         let Some(epoch) = self.lease.epoch() else {
             return;
         };
+        // A resend is committed: only to a member of the epoch, whose
+        // `hold_acked` is what the group holds.
+        if !self.pr.epoch_members.contains(&n) {
+            return;
+        }
         let tip = replica.journal_tip();
         let acked = self.ack.hold_acked.get(&n).copied().unwrap_or(0).min(tip);
         let txs: Vec<BackupTx> = replica
@@ -5517,18 +5577,10 @@ impl Core {
                 q.pop_front();
             }
         }
-        // The group acknowledged more: the subscribers outside the epoch
-        // are sent what it holds now (`stream_ahead`'s `gate_cap`).
-        if self.hold_group()
-            && self.epoch_streams_ahead()
-            && self
-                .stream_subscribers()
-                .iter()
-                .any(|n| !self.pr.epoch_members.contains(n))
-        {
-            let tip = replica.journal_tip();
-            self.stream_ahead(now, 0, tip, replica, out);
-        }
+        // The group acknowledged more: the subscribers outside the epoch are
+        // sent what it holds now by the pass `backup_after_event` runs after
+        // this event (`stream_ahead_soon`, under the hold-off, and after the
+        // resend below, which it must not pre-empt).
         // A resend carries one batch: while the member's ack is short of
         // what was streamed to it, its ack of the resend asks for the next.
         if self.ack.hold_resending.contains(&from) {

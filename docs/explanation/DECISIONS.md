@@ -4091,10 +4091,16 @@ lease shape.
   ahead of the ack, the copy was ungated, and the epoch marker of a takeover
   that reached the subscriber before the re-shipped tail stranded it into a
   replay of a row the group had answered (I5, flex-tight 1267). The
-  subscriber's freshness lags by one member ack; the writer's reply is
-  released by the same ack, and a forwarded op waits for its row in the log
-  (`AwaitingLog`), so the writer reads its own write and nobody can have
-  been told of a row the subscriber lacks for longer than that hop.
+  subscriber's freshness lags by one member ack plus a stream hop. A writer
+  on the subscriber always holds its row before its client is answered: the
+  reply's records are installed as a shadow when its base is current, and
+  otherwise (a stale base, which the longer lag makes more common) the op
+  waits for the stream's copy (`adopt_streamed`, then `AwaitingLog`). A strict
+  reader waits on its ReadIndex position, which the takeover's epoch also
+  satisfies, so the wait ends when the hold is deposed. Only holds with a
+  group (two or more members) are gated; a one-member hold answers from its
+  owner's disk and streams as before. A node that leaves the roster is
+  gated and never resent to (a resend is committed).
 
 **Rejected**: triggering on the fence or the lease shape; sealing every stream
 `(E, s)` and `(E + 1, s)` (it refused the successor's own streams for ever);
