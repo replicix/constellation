@@ -273,6 +273,19 @@ pub struct Shared {
     /// that waits for that lock (`Meta::set_writer_wait_hook_for_tests`)
     /// or its time lets it go.
     held_ctl: Mutex<Option<HeldCtl>>,
+    /// F1: when (simulated ms) a delegate's held write committed, once a
+    /// writer on another thread forced it before its time
+    /// (`release_held_ctl`); taken by the driver when it processes the
+    /// outcome (`Driver::next_event`), as the engine does as its commit
+    /// returns. `held_wake` wakes the driver for it.
+    held_committed_at: Mutex<Option<u64>>,
+    held_wake: tokio::sync::Notify,
+    /// F1: delegate writes whose commit a writer forced before their time,
+    /// and the delegate writes whose outcome was processed in a later driver
+    /// step than the one their commit returned in (must stay 0: the engine
+    /// processes it as its commit returns, `write_gate.rs`).
+    pub held_forced: AtomicU64,
+    pub held_processed_late: AtomicU64,
     /// F1 (`DelegateWriteHold`): cut this delegate from `(.0)` (the root)
     /// for `(.1)` ms once its held write is pinned.
     hold_partition: Mutex<Option<(NodeId, u64)>>,
@@ -315,14 +328,19 @@ pub struct Shared {
 /// See `Shared::held_ctl`.
 struct HeldCtl {
     go: std::sync::mpsc::Sender<bool>,
-    committed: std::sync::mpsc::Receiver<()>,
+    /// The commit's end (simulated ms), sent by the held thread.
+    committed: std::sync::mpsc::Receiver<u64>,
     thread: std::thread::ThreadId,
 }
 
 /// The writer-wait hook: a writer other than the held write's own thread
 /// waits for its commit, as every writer waits for a slow commit holding
 /// the lock.
-fn release_held_ctl(shared: &Shared) {
+///
+/// `forced`: a writer's wait (the hook), not the hold's own end. The commit's
+/// time is recorded and the driver woken, which processes the outcome at once
+/// (`Driver::next_event`), as the engine does when its commit returns.
+fn release_held_ctl(shared: &Shared, forced: bool) {
     let ctl = {
         let mut g = shared.held_ctl.lock().unwrap();
         if g.as_ref()
@@ -334,7 +352,13 @@ fn release_held_ctl(shared: &Shared) {
     };
     if let Some(c) = ctl {
         let _ = c.go.send(true);
-        let _ = c.committed.recv();
+        if let Ok(at) = c.committed.recv() {
+            if forced {
+                shared.held_forced.fetch_add(1, Ordering::Relaxed);
+                *shared.held_committed_at.lock().unwrap() = Some(at);
+                shared.held_wake.notify_one();
+            }
+        }
     }
 }
 
@@ -666,6 +690,10 @@ impl NodeHandle {
             fast_waited: AtomicU64::new(0),
             fast_answered: AtomicU64::new(0),
             held_ctl: Mutex::new(None),
+            held_committed_at: Mutex::new(None),
+            held_wake: tokio::sync::Notify::new(),
+            held_forced: AtomicU64::new(0),
+            held_processed_late: AtomicU64::new(0),
             hold_partition: Mutex::new(None),
             cut_on_answer: Mutex::new(None),
             landed: Mutex::new(Vec::new()),
@@ -682,7 +710,9 @@ impl NodeHandle {
         });
         {
             let shared = shared.clone();
-            meta.set_writer_wait_hook_for_tests(Some(Arc::new(move || release_held_ctl(&shared))));
+            meta.set_writer_wait_hook_for_tests(Some(Arc::new(move || {
+                release_held_ctl(&shared, true)
+            })));
         }
         // F1: the token check at the write reads this node's clock, as
         // the daemon's reads its wall clock.
@@ -882,6 +912,7 @@ impl NodeHandle {
             panic_after_events: env.panic_after_events,
             fast_path: env.fast_path,
             held: None,
+            last_pause_ms: None,
             fast_waits: Vec::new(),
             ready: std::collections::VecDeque::new(),
             held_peers: std::collections::VecDeque::new(),
@@ -1184,6 +1215,10 @@ struct Driver {
     fast_path: super::run::FastPath,
     /// F1: the fast-path write held behind the slow writer, if any.
     held: Option<HeldWrite>,
+    /// The last pause this driver sat out, `(start, end)` in simulated ms: a
+    /// stopped process processes nothing (a held write whose commit returned
+    /// meanwhile is excused from `held_processed_late` for it).
+    last_pause_ms: Option<(u64, u64)>,
     /// Plan 43 C2d: the delegate's fast-path writes that wait for their
     /// group (the engine's `wait_deleg_durable`), polled after every step.
     fast_waits: Vec<FastWait>,
@@ -1322,7 +1357,7 @@ impl HeldWrite {
             let _ = go.send(true);
         }
         if self.deleg.is_some() {
-            release_held_ctl(&self.shared);
+            release_held_ctl(&self.shared, false);
         }
         let outcome = loop {
             match self.phase.recv() {
@@ -1346,6 +1381,9 @@ impl Drop for HeldWrite {
         }
         if let Some(c) = self.shared.held_ctl.lock().unwrap().take() {
             let _ = c.go.send(false);
+        }
+        if self.deleg.is_some() {
+            self.shared.held_committed_at.lock().unwrap().take();
         }
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -2137,6 +2175,8 @@ impl Driver {
                         .as_millis() as i64
                 });
                 self.note_own_lapse(self.clock.now().wait.0 - stopped_ms);
+                let end = self.clock.elapsed_ms();
+                self.last_pause_ms = Some((end.saturating_sub(stopped_ms as u64), end));
             }
             let now = self.clock.now();
             // The daemon's `Driver::hand_lag`: this node's own lapse, before
@@ -2593,6 +2633,15 @@ impl Driver {
             for e in urgent.into_iter().rev() {
                 self.ready.push_front(e);
             }
+            // F1: a delegate's held write that a writer let commit before its
+            // time is processed now, as the engine's thread does as its
+            // commit returns (`write_gate.rs`), not at the hold's end.
+            if self.held.as_ref().is_some_and(|h| h.deleg.is_some())
+                && self.shared.held_committed_at.lock().unwrap().is_some()
+            {
+                self.release_held();
+                continue;
+            }
             if let Some(event) = self.ready.pop_front() {
                 return Some(event);
             }
@@ -2622,6 +2671,7 @@ impl Driver {
                         self.ready.push_back(e);
                         continue;
                     }
+                    _ = self.shared.held_wake.notified() => continue,
                     _ = tokio::time::sleep_until(t) => {
                         if held_at.is_some_and(|h| h <= tokio::time::Instant::now()) {
                             self.release_held();
@@ -2636,6 +2686,7 @@ impl Driver {
                         self.ready.push_back(e);
                         continue;
                     }
+                    _ = self.shared.held_wake.notified() => continue,
                     e = self.rx.recv() => e?,
                 },
             };
@@ -3581,7 +3632,7 @@ impl Driver {
         let epoch = self.core.ship().max_epoch.max(1);
         let (phase_tx, phase) = std::sync::mpsc::channel();
         let (go, go_rx) = std::sync::mpsc::channel::<bool>();
-        let (committed_tx, committed) = std::sync::mpsc::channel::<()>();
+        let (committed_tx, committed) = std::sync::mpsc::channel::<u64>();
         let rt = tokio::runtime::Handle::current();
         let thread = {
             let (meta, op, tag) = (self.meta.clone(), op.clone(), tag.clone());
@@ -3622,7 +3673,7 @@ impl Driver {
                 };
                 constellation_meta::write_check_hook::set(None);
                 let at = clock.elapsed_ms();
-                let _ = committed_tx.send(());
+                let _ = committed_tx.send(at);
                 let idx = r.as_ref().ok().map(|(_, idx)| *idx);
                 let _ = phase_tx.send(HeldPhase::Done(
                     outcome_of(r.map(|(records, _)| records), epoch),
@@ -3715,6 +3766,19 @@ impl Driver {
         let class = held.class;
         let tag = held.tag.clone();
         let (outcome, idx, landed_at) = held.finish();
+        // The outcome is processed in the driver step that follows the one
+        // the commit returned in (`next_event`); any simulated time between
+        // is the sim's own lateness, which the engine does not have.
+        self.shared.held_committed_at.lock().unwrap().take();
+        let now_ms = self.clock.elapsed_ms();
+        let paused = self
+            .last_pause_ms
+            .is_some_and(|(from, to)| from <= now_ms && landed_at <= to);
+        if deleg.is_some() && now_ms > landed_at && !paused {
+            self.shared
+                .held_processed_late
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if refused.load(Ordering::Relaxed) {
             // Refused unwritten at the journaling (the configuration changed
             // while the write was held): through the core, as the engine

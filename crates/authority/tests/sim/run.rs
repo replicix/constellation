@@ -1336,6 +1336,12 @@ pub struct Report {
     pub held_writes: u64,
     pub held_refused: u64,
     pub held_accepted: u64,
+    /// F1 (`DelegateWriteHold`): delegate writes a writer let commit before
+    /// their time, and delegate writes whose outcome was processed in a
+    /// later driver step than the one their commit returned in (the run
+    /// fails if any: the engine processes it as its commit returns).
+    pub held_forced: u64,
+    pub held_processed_late: u64,
     /// Plan 43 C2d: delegate fast-path writes that waited for their group,
     /// and those answered once it held the row.
     pub fast_waited: u64,
@@ -5905,6 +5911,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.held_writes += load(&n.shared.held_writes);
         report.held_refused += load(&n.shared.held_refused);
         report.held_accepted += load(&n.shared.held_accepted);
+        report.held_forced += load(&n.shared.held_forced);
+        report.held_processed_late += load(&n.shared.held_processed_late);
         report.fast_waited += load(&n.shared.fast_waited);
         report.fast_answered += load(&n.shared.fast_answered);
         let ls = n.meta.locks().stats();
@@ -5951,6 +5959,17 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         return Err(format!(
             "singleton_lag: a Singleton answer was given {lag_max} ms after another node \
              registered (roster poll {poll_ms} ms + 1000)"
+        ));
+    }
+    // F1: the sim's own invariant, enforced where it executes. A held
+    // delegate write is finished as its commit returns, like the engine's
+    // (`write_gate.rs`); one processed later answers from a state the engine
+    // never has.
+    if report.held_processed_late > 0 {
+        return Err(format!(
+            "held_processed_late: {} held delegate write(s) were processed after their commit \
+             returned (the sim's timing is unfaithful)\n  faults: {:?}",
+            report.held_processed_late, report.faults
         ));
     }
     if cfg.keeps_backups {

@@ -69452,3 +69452,29 @@ Sweeps, `+commit`, seeds 0..1999 each, main against the fix: `backup-crash-slow`
 same seeds), `flex-crash` (8, same), `delegated-core-stall-root-lease6` (280 on both, its known M1.3 exemption), and
 `backup-crash-slow+durability` (main: 64; fix: 0). `member_copies_drained` 0 everywhere; I1, I2, I5 0; rows dropped at a
 gate: 2 (seed 64), 0 elsewhere.
+
+## 2026-11-11 Plan 46 M1.2 step 15: a held delegate write is finished as its commit returns; `HELD_WRITE_ANSWERED_LATE` removed
+
+The sim let a delegate's held write (`DelegateWriteHold`) commit when the node's store was next written, but processed
+its outcome (`note_stream`, then the answer or the wait for the group) only at the hold's end, up to 8 s later; the
+engine does both as its commit returns (`write_gate.rs`). Seed 233000 of `locks-writer-hold-delegated`: committed at
+about t=4457, processed at t=9556. The nine configurations that inherited the exemption (`strict_commit` off) were
+clean under `+commit` already (since M1.2 step 13 a delegate's row is gated), so the exemption only hid a timing that
+did not match the engine.
+
+Sim: the writer-wait hook records the commit's time and wakes the driver (`Shared::held_committed_at`, `held_wake`); the
+driver finishes the write at the top of `next_event`, before anything else, and not from the hook's thread. `Report`
+gains `held_forced` and `held_processed_late` (a held delegate write processed in a later driver step than the one its
+commit returned in, not counting a pause the node sat out); the run fails if it is not 0. The exemption and its constant
+are removed; `strict_commit_is_the_default_of_a_delegated_configuration` lists the writer-hold, `-unsettled`, `-backup`,
+`locks-delegate-ahead`, `-executor-behind` and `-executor-late` configurations as strict. New test
+`locks_writer_hold_delegated_answers_as_its_commit_returns` (fails before: seed 233000, 1 late; forced commits > 0).
+`SWEEP-HELD` prints held, forced, late, refused, accepted, fast-waited, fast-answered, stale turn reads and late
+unacknowledged turns per sweep.
+
+Sweeps, seeds 0..1999, default and `+commit`, main behaviour against the change: 0 failing on every one (the writer-hold
+configurations, `-unsettled`, `-doubt`, `-group`, `-backup`, `locks-delegate-ahead`, `-executor-behind`, `-executor-late`,
+the doubt configuration with slow lease reads), `held_processed_late` 0 (main: every forced commit late), stale turn reads
+0 on both (the 2026-10 attempt, when delegates could be lone, raised `locks-delegate-ahead` 69 to 555; not recurring).
+Late unacknowledged turns (counted, not a failure): `locks-executor-behind` 0 to 1, `locks-executor-late` 0 to 3, doubt
+with slow lease reads 1 to 5. `locks-writer-hold-unchecked` (control) fails 1977 of 2000 on both.

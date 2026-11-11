@@ -3514,7 +3514,10 @@ next holder's section, nor over its acknowledged turn. `DelegateWriteHold`
 holds a write of a delegate's own client, under a lock the root minted,
 *inside* its transaction: checked at the write, pinned, the writer lock
 held. The node's next other writer lets it commit first, since a core step
-cannot block in the simulation. The node is cut off past the grant's
+cannot block in the simulation, and the driver finishes the write (`note_stream`,
+then the answer or the wait for the group) as that commit returns, as the
+engine's thread does, not at the hold's end (`Report::held_forced`; the run
+fails if `held_processed_late` is not 0). The node is cut off past the grant's
 window, so the root outwaits the grant and may grant on only after the
 delegate's stream head covers the write; the delegate's renewal settles
 the pinned write before it reads its head.
@@ -4962,9 +4965,9 @@ or the placement engine), so I1, the claim check and
 configuration that cannot hold them yet carries
 `SimConfig::strict_commit_exempt`, a reason naming the plan item that closes it
 (a sweep's `+commit` still makes it strict); each exception goes with that item.
-The exceptions on 2026-11-06: `delegated-epoch` and `delegated-designated` (plan 46 M1.4),
-`locks-writer-hold-delegated`
-(M1.2 step 15, harness and sim fixes), and the configurations that drive the lock lane
+The exceptions on 2026-11-06 (`locks-writer-hold-delegated` and the configurations that
+inherit its exemption closed at M1.2 step 15): `delegated-epoch` and
+`delegated-designated` (plan 46 M1.4), and the configurations that drive the lock lane
 and delegate (`lock_files > 0`; M3.1). `drop-held-chain` and `-backed`
 (M2.2) and `metered-shared` (M1.2 step 16) are not delegated by configuration and stay
 strict under `+commit` only.

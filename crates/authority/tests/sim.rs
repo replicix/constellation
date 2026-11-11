@@ -7553,6 +7553,11 @@ fn sweep_config() {
         std::sync::atomic::AtomicU64::new(0),
     ]);
     let guard_base_rises = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Plan 46 M1.2 step 15 (`SWEEP-HELD`): held delegate writes: [held,
+    // forced, processed late, refused, accepted, fast-waited, fast-answered,
+    // stale turn reads, late unacknowledged turns].
+    let held_totals: std::sync::Arc<[std::sync::atomic::AtomicU64; 9]> =
+        std::sync::Arc::new(Default::default());
     // The lock configurations, per seed `(seed, longest acquisition,
     // longest handoff gap, overtakes, asks, passed over, reserved)`: the
     // distribution the ask-again rule is measured by (`SWEEP-LOCKS`).
@@ -7578,6 +7583,7 @@ fn sweep_config() {
         let failover_all = failover_all.clone();
         let guard_rises = guard_rises.clone();
         let probe_races = probe_races.clone();
+        let held_totals = held_totals.clone();
         let guard_base_rises = guard_base_rises.clone();
         let superseded = superseded.clone();
         let lock_seeds = lock_seeds.clone();
@@ -7646,6 +7652,19 @@ fn sweep_config() {
                     guard_rises.fetch_add(report.guard_rises, ord);
                     probe_races[0].fetch_add(report.probe_races, ord);
                     probe_races[1].fetch_add((report.probe_races > 0) as u64, ord);
+                    for (t, n) in held_totals.iter().zip([
+                        report.held_writes,
+                        report.held_forced,
+                        report.held_processed_late,
+                        report.held_refused,
+                        report.held_accepted,
+                        report.fast_waited,
+                        report.fast_answered,
+                        report.locks.stale_turn_reads,
+                        report.locks.late_unacked_turns,
+                    ]) {
+                        t.fetch_add(n, ord);
+                    }
                     guard_base_rises.fetch_add(report.guard_base_rises, ord);
                     if report.guard_rises > 0 {
                         eprintln!(
@@ -7898,6 +7917,20 @@ fn sweep_config() {
         lengths.len(),
         guard_rises.load(ord),
         guard_base_rises.load(ord),
+    );
+    eprintln!(
+        "SWEEP-HELD {label} seeds {}/{seeds}: held {}, forced {}, processed late {}, refused {}, \
+         accepted {}, fast waited {}, fast answered {}, stale turn reads {}, late unacked turns {}",
+        seeds - f.len() as u64,
+        held_totals[0].load(ord),
+        held_totals[1].load(ord),
+        held_totals[2].load(ord),
+        held_totals[3].load(ord),
+        held_totals[4].load(ord),
+        held_totals[5].load(ord),
+        held_totals[6].load(ord),
+        held_totals[7].load(ord),
+        held_totals[8].load(ord),
     );
     eprintln!(
         "SWEEP-PROBE-RACES {label} seeds {}/{seeds}: {} lane answers rested on the root's own proof \
@@ -12648,18 +12681,9 @@ fn locks_writer_hold_delegated_config() -> SimConfig {
         ops_per_client: 10,
         lock_ios: (2, 8),
         faults: vec![hold(400), hold(8_000), hold(16_000)],
-        strict_commit_exempt: Some(HELD_WRITE_ANSWERED_LATE),
         ..with_lock_writes(delegated_config(), "d2")
     }
 }
-
-/// The documented `strict_commit` exception of every configuration with a
-/// held delegate write (`DelegateWriteHold`), lki1 triage mechanism B.
-const HELD_WRITE_ANSWERED_LATE: &str = "plan 46 M1.2 step 15 (harness and sim fixes; lki1 B): \
-     the sim lets a held delegate write commit at its node's next store write but answers it at \
-     the hold's end; meanwhile its generation ends and the row is stranded and refused on replay \
-     (`ENOLCK`), so the `ok` is judged against a row no store has. The engine's thread answers as \
-     its commit returns, before any such rollback";
 
 /// [`locks_writer_hold_delegated_config`] with the settle off: positions
 /// are reported while a pinned write is still committing.
@@ -13873,6 +13897,8 @@ struct M14Totals {
     fast_path_executed: u64,
     held_refused: u64,
     held_accepted: u64,
+    held_forced: u64,
+    held_processed_late: u64,
     fast_waited: u64,
     fast_answered: u64,
     doubt_lapses: u64,
@@ -13965,6 +13991,8 @@ impl M14Totals {
         self.fast_path_executed += r.fast_path_executed;
         self.held_refused += r.held_refused;
         self.held_accepted += r.held_accepted;
+        self.held_forced += r.held_forced;
+        self.held_processed_late += r.held_processed_late;
         self.fast_waited += r.fast_waited;
         self.fast_answered += r.fast_answered;
         self.token_rejections_at_write += r.token_rejections_at_write;
@@ -15876,6 +15904,41 @@ fn locks_writer_hold_delegated_settles_before_the_head() {
         "no position waited for a held write: {t:?}"
     );
     assert_eq!(t.clients.stale_turn_reads, 0, "{t:?}");
+}
+
+/// F1: a delegate's held write that a writer lets commit before its time is
+/// finished as its commit returns, like the engine's (`write_gate.rs`:
+/// `note_stream`, then the wait for the group), not at the hold's end (up to
+/// 8 s later). Fail-before: with the outcome processed at `release_at`,
+/// `held_processed_late` counts it (seed 233000: 5 s).
+#[test]
+fn locks_writer_hold_delegated_answers_as_its_commit_returns() {
+    for (label, cfg, seeds) in [
+        (
+            "locks-writer-hold-delegated",
+            locks_writer_hold_delegated_config(),
+            233_000..233_040,
+        ),
+        (
+            "locks-writer-hold-delegated-group",
+            locks_writer_hold_delegated_group_config(false),
+            235_000..235_040,
+        ),
+        (
+            "locks-writer-hold-delegated-backup",
+            locks_writer_hold_delegated_group_config(true),
+            235_000..235_040,
+        ),
+        (
+            "locks-writer-hold-delegated-doubt",
+            locks_writer_hold_delegated_doubt_config(),
+            234_000..234_040,
+        ),
+    ] {
+        let t = pinned::run_m14(label, cfg, seeds);
+        assert!(t.held_forced > 0, "{label}: no commit was forced: {t:?}");
+        assert_eq!(t.held_processed_late, 0, "{label}: {t:?}");
+    }
 }
 
 /// F1 (review T1), the settle's fail-before (since plan 46 M1.2 step 11 a regression pin on the root's cut, see below): the seeds where, with
@@ -17806,34 +17869,21 @@ fn strict_commit_is_the_default_of_a_delegated_configuration() {
     assert!(delegated_core_stall_root_lease6_config()
         .strict_commit_exemption()
         .is_none());
+    // Plan 46 M1.2 step 15: a held delegate write is finished as its commit
+    // returns (`held_processed_late` is 0 by construction), so the
+    // configurations that hold writes are strict too.
     for cfg in [
         locks_writer_hold_delegated_config(),
+        locks_writer_hold_delegated_unsettled_config(),
         locks_writer_hold_delegated_doubt_config(),
         locks_writer_hold_delegated_group_config(false),
+        locks_writer_hold_delegated_group_config(true),
         locks_delegate_ahead_config(),
         locks_executor_behind_config(),
+        locks_executor_late_config(),
     ] {
-        let why = cfg.strict_commit_exemption().expect("an exception");
-        assert!(why.contains("plan 46 M"), "{why}");
+        assert_eq!(cfg.strict_commit_exemption(), None);
     }
-    // Each exemption names its one closing plan item (M1.1 review, SHOULD-3).
-    let closes = |cfg: SimConfig, item: &str| {
-        let why = cfg.strict_commit_exemption().expect("an exception");
-        assert!(why.starts_with(&format!("plan 46 {item}")), "{why}");
-    };
-    for cfg in [
-        locks_writer_hold_delegated_config(),
-        locks_writer_hold_delegated_doubt_config(),
-        locks_writer_hold_delegated_group_config(false),
-    ] {
-        if cfg.strict_commit_exemption() == Some(HELD_WRITE_ANSWERED_LATE) {
-            closes(cfg, "M1.2 step 15 (harness and sim fixes");
-        }
-    }
-    assert_eq!(
-        locks_writer_hold_delegated_config().strict_commit_exemption(),
-        Some(HELD_WRITE_ANSWERED_LATE)
-    );
     // lki1 triage: the lock lane is strict by default but for the
     // configurations above (the partitioned ones since mechanism D's fix).
     for cfg in [
