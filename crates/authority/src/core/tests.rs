@@ -66599,18 +66599,53 @@ mod step9_one_stream_per_node {
         place_tick(&mut h);
         assert_eq!(h.core.stats.place_converted, 1, "counted once");
         assert_eq!(h.core.stats.deleg_recalls_sent, 1);
+        // The sticky grant is not journaled while the recalled placed stream
+        // still covers the directory: `delegate_dir` refuses it.
+        let gens_before = h.core.dl.gens.len();
+        let mut out = Vec::new();
+        let refused =
+            h.core
+                .delegate_dir(h.clk(), dirs[1], 2, DelegKind::Sticky, &h.meta, &mut out);
+        assert!(
+            refused.is_err(),
+            "granted over the live placed stream: {refused:?}"
+        );
+        assert_eq!(h.core.dl.gens.len(), gens_before);
         // No cooldown: the stream ends, and the next round grants Sticky.
         h.core.dl.gens.get_mut(&placed).unwrap().ended = true;
+        // (The end of the generation, as the root journals it: its table
+        // forgets the subtree.)
+        h.hold(1, None);
+        crate::replica::Replica::apply_records_journaled(
+            &h.meta,
+            &[LogRecord::SubtreeReleased {
+                node: 2,
+                gen: placed,
+                dir: dirs[1],
+                at: 0,
+            }],
+            None,
+        )
+        .unwrap();
         assert!(
             h.core.pl.cooldown.is_empty(),
             "the conversion added a cooldown"
         );
         assert_eq!(h.core.stats.place_skipped_cooldown, 0);
-        // The next round's kind for the node is Sticky.
+        // The next round's kind for the node is Sticky, and the grant now
+        // goes through.
         let clk = h.clk();
         assert_eq!(
             h.core.place_kind_for(clk, 2, dirs[1], &h.meta),
             Ok(DelegKind::Sticky)
+        );
+        let mut out = Vec::new();
+        let granted =
+            h.core
+                .delegate_dir(h.clk(), dirs[1], 2, DelegKind::Sticky, &h.meta, &mut out);
+        assert!(
+            granted.is_ok(),
+            "not granted after the placed stream ended: {granted:?}"
         );
         // Sticky placement off: the placed grant stays.
         let (mut h, dirs) = root_with_peer(None);
@@ -66818,10 +66853,12 @@ mod step9_one_stream_per_node {
             .core
             .delegate_dir(h.clk(), dirs[1], 2, DelegKind::Sticky, &h.meta, &mut out)
             .unwrap();
-        // The release row reaches the log.
+        // The release row reaches the log: a stream released whole (an
+        // unmount, a suspension) carries no dirs, as the root's stream loop
+        // calls it.
         let mut out = Vec::new();
         h.core
-            .root_release_appended(h.clk(), gen, &[dirs[1]], true, None, &h.meta, &mut out);
+            .root_release_appended(h.clk(), gen, &[], true, None, &h.meta, &mut out);
         assert_eq!(
             h.core.pl.released.get(&dirs[1]).map(|(n, _)| *n),
             Some(2),
@@ -66835,7 +66872,7 @@ mod step9_one_stream_per_node {
         }
         place_tick(&mut h);
         assert_eq!(h.core.stats.place_sticky, 0);
-        assert_eq!(h.core.stats.place_skipped_cooldown, 1);
+        assert_eq!(h.core.stats.place_quarantined, 1);
         // A recall's release (not the holder's own) is not remembered.
         // After the window it is granted again.
         h.advance(h.core.cfg.placement_window_ms + 1);

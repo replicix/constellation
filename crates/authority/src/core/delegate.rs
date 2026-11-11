@@ -9194,7 +9194,9 @@ impl Core {
         // Plan 46 M1.3 step 7 (D-e): the holder's own release of a sticky
         // subtree (a release row, no recall under way) keeps the placement
         // from granting it straight back to that node on the window's old
-        // counts. (`kind()` is read before the dirs leave the stream.)
+        // counts. (`kind()` is read before the dirs leave the stream.) A
+        // release that races a recall under way for the same stream records
+        // nothing: the recall decides.
         if let Some(g) = self.dl.gens.get(&gen) {
             if !g.ended
                 && cut.is_none()
@@ -9202,8 +9204,15 @@ impl Core {
                 && g.kind() == DelegKind::Sticky
             {
                 let until = now.wait.plus(self.cfg.placement_window_ms);
-                for dir in dirs {
-                    self.pl.released.insert(*dir, (g.node, until));
+                // A stream released whole (an unmount, a suspension, a
+                // release of everything) carries no dirs in its row: it
+                // gives up all it still holds.
+                let mut held = dirs.to_vec();
+                if whole {
+                    held.extend(g.dir_list());
+                }
+                for dir in held {
+                    self.pl.released.insert(dir, (g.node, until));
                 }
             }
         }

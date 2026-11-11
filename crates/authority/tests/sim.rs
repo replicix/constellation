@@ -304,6 +304,7 @@ fn replay_seed() {
         Ok("backup-far") | Ok("far") => far_config(),
         Ok("far-root-writes") => far_root_writes_config(),
         Ok("far-placement") => far_placement_config(),
+        Ok("far-placement-release") => far_placement_release_config(),
         Ok("sticky-idle-release") => sticky_idle_release_config(),
         Ok("sticky-handover-ping-pong") => sticky_handover_ping_pong_config(),
         Ok("sticky-holder-dies") => sticky_holder_dies_config(),
@@ -1836,12 +1837,14 @@ fn far_config() -> SimConfig {
 }
 
 /// Plan 46 M1.2 step 13: `far` with the placement on. Every pair is out of
-/// the budget, so no node has a group within budget and the placement
-/// delegates nothing (`place_skipped_far`): a far writer's ops are forwarded
-/// to the root. The negative control `Config::lone_delegate`
-/// (`AUTHORITY_SIM_LONE_DELEGATE=1`) delegates anyway, and the delegates
-/// answer their own clients on their disks alone: I1 and, when a root
-/// failover rolls such an answer back, I5 fail
+/// the budget, so no node has a group within budget and no writer can be
+/// given a placed grant; since plan 46 M1.3 step 7 the placement grants a
+/// dominant far writer a sticky subtree (ADR-54) once its link has measured
+/// far for the far dwell, and forwards it to the root before that
+/// (`place_skipped_far`). The negative control `Config::lone_delegate`
+/// (`AUTHORITY_SIM_LONE_DELEGATE=1`) delegates a placed grant anyway, and the
+/// delegates answer their own clients on their disks alone: I1 and, when a
+/// root failover rolls such an answer back, I5 fail
 /// (`the_lone_delegate_control_fails_the_oracles`).
 fn far_placement_config() -> SimConfig {
     SimConfig {
@@ -6969,6 +6972,7 @@ fn base_config(label: &str) -> SimConfig {
         "far" | "backup-far" => far_config(),
         "far-root-writes" => far_root_writes_config(),
         "far-placement" => far_placement_config(),
+        "far-placement-release" => far_placement_release_config(),
         "sticky-idle-release" => sticky_idle_release_config(),
         "sticky-handover-ping-pong" => sticky_handover_ping_pong_config(),
         "sticky-holder-dies" => sticky_holder_dies_config(),
@@ -9472,7 +9476,7 @@ impl OracleTotals {
         // (`SWEEP-PLACE`): the coverage the sweeps report.
         eprintln!(
             "SWEEP-PLACE {label} seed {seed}: sticky {} converted {} recalled {} delegated {} \
-             skipped-far {} contended {} grant-waits {} commit-wait-max-ms {} commit-waits {} \
+             skipped-far {} contended {} quarantined {} grant-waits {} commit-wait-max-ms {} commit-waits {} \
              holder-inbox-refusals {} root-holds {} unsettled-nonstealable-holder {}",
             r.stats.values().map(|s| s.place_sticky).sum::<u64>(),
             r.stats.values().map(|s| s.place_converted).sum::<u64>(),
@@ -9483,6 +9487,7 @@ impl OracleTotals {
                 .values()
                 .map(|s| s.place_sticky_contended)
                 .sum::<u64>(),
+            r.stats.values().map(|s| s.place_quarantined).sum::<u64>(),
             r.stats.values().map(|s| s.place_grant_waits).sum::<u64>(),
             r.stats
                 .values()
@@ -20066,6 +20071,44 @@ const I5_FAR_PLACEMENT_SEEDS: &[u64] = &[623, 889, 939];
 /// (Of 0 to 599: 151, 173, 291, 303, 338, 416, 467, 489, 496, 502.)
 const I5_LONG_DELEGATED_SEEDS: &[u64] = &[151, 236, 278];
 
+/// Plan 46 M1.3 step 7 (D-e): `far-placement` with the sim's idle tracker, so
+/// a far holder that goes quiet releases its (whole) sticky stream and the
+/// placement, still counting its earlier ops in the window, must not grant
+/// it back at once.
+fn far_placement_release_config() -> SimConfig {
+    SimConfig {
+        ops_per_client: 24,
+        idle_gaps: true,
+        sticky_idle_ms: Some(1_200),
+        ..far_placement_config()
+    }
+}
+
+/// D-e under the real caller shape: a stream released whole carries no dirs
+/// in its row, and the root still remembers the subtrees it held. The
+/// placement skips them for that node (`place_quarantined`) and the run
+/// stays clean.
+#[test]
+fn a_whole_release_quarantines_the_subtrees_it_gave_up() {
+    let (mut sticky, mut quarantined, mut released) = (0, 0, 0);
+    for seed in 0..40 {
+        let r = run_seed(seed, far_placement_release_config())
+            .unwrap_or_else(|e| panic!("far-placement-release seed {seed}: {e}"));
+        assert_eq!(r.sticky_ended_unexcused, 0, "seed {seed}");
+        for s in r.stats.values() {
+            sticky += s.place_sticky;
+            quarantined += s.place_quarantined;
+        }
+        released += r.sticky_core[7];
+    }
+    assert!(sticky > 0, "the placement never granted a far writer");
+    assert!(released > 0, "no holder released a sticky grant");
+    assert!(
+        quarantined > 0,
+        "the placement never skipped a subtree its holder had released"
+    );
+}
+
 /// Plan 46 M1.3 step 7 (ADR-54): a far writer (every pair out of the
 /// backup budget) that dominates a subtree is granted a sticky one: it
 /// executes there and its answers are final, with no rollback, no sticky
@@ -20074,7 +20117,7 @@ const I5_LONG_DELEGATED_SEEDS: &[u64] = &[151, 236, 278];
 /// control `Config::lone_delegate` still fails the oracles.)
 #[test]
 fn far_writers_hold_sticky_grants_and_answer_final() {
-    let (mut sticky, mut executed, mut skipped) = (0, 0, 0);
+    let (mut sticky, mut executed, mut skipped, mut commit_wait_max) = (0, 0, 0, 0u64);
     for seed in 0..20 {
         let r = run_seed(seed, strict(far_placement_config(), "durability"))
             .unwrap_or_else(|e| panic!("far-placement seed {seed}: {e}"));
@@ -20084,6 +20127,7 @@ fn far_writers_hold_sticky_grants_and_answer_final() {
             assert_eq!(s.place_delegated, 0, "seed {seed}: placed a far writer");
             sticky += s.place_sticky;
             skipped += s.place_skipped_far;
+            commit_wait_max = commit_wait_max.max(s.deleg_commit_wait_ms_max);
             if *node != 1 {
                 executed += s.deleg_executed;
             }
@@ -20092,6 +20136,16 @@ fn far_writers_hold_sticky_grants_and_answer_final() {
     }
     assert!(sticky > 0, "the placement never granted a far writer");
     assert!(executed > 0, "no far writer executed under its grant");
+    // A9: the first op under a sticky grant waits for the grant record's
+    // archive (`commit_waiting`), which the deadline table bounds by
+    // `archive_put`.
+    let bound =
+        constellation_authority::deadlines::Deadlines::new(&(far_placement_config().core)(2, 1))
+            .archive_put;
+    assert!(
+        commit_wait_max <= bound,
+        "a first op waited {commit_wait_max} ms for the grant record's archive (bound {bound} ms)"
+    );
     assert!(skipped > 0, "the far dwell never forwarded a writer first");
     for seed in [3, 5, 6] {
         let lone = run_seed(seed, with_lone_delegates(far_placement_config()));

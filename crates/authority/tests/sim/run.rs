@@ -2488,9 +2488,13 @@ async fn sticky_idle_driver(
     stop: Arc<std::sync::atomic::AtomicBool>,
     fault_log: Arc<Mutex<Vec<String>>>,
     grants: Vec<(String, NodeId)>,
+    dirs: Vec<String>,
     idle_ms: u64,
 ) {
     use constellation_authority::Control;
+    if grants.is_empty() {
+        return sticky_idle_driver_placed(cluster, stop, fault_log, dirs, idle_ms).await;
+    }
     let start = cluster.env.clock.elapsed_ms();
     // Directory -> when the driver released it (`None`: held), and since
     // when it has been held.
@@ -2582,6 +2586,83 @@ async fn sticky_idle_driver(
                         _ => {}
                     }
                 }
+            }
+        }
+    }
+}
+
+/// [`sticky_idle_driver`] for grants the placement made (the configuration
+/// names none): a holder idle in a subtree it holds releases it (the whole
+/// stream: one subtree per stream here), alternately with and without
+/// `wait`; the driver never grants it back, the placement does or does not
+/// (D-e: not within a window of the holder's own release).
+async fn sticky_idle_driver_placed(
+    cluster: Arc<Cluster>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    fault_log: Arc<Mutex<Vec<String>>>,
+    dirs: Vec<String>,
+    idle_ms: u64,
+) {
+    use constellation_authority::Control;
+    use constellation_meta::SubtreeKind as Kind;
+    let mut held_since: BTreeMap<(NodeId, String), u64> = BTreeMap::new();
+    let mut releases = 0u64;
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = cluster.env.clock.elapsed_ms();
+        for node in cluster.ids() {
+            let h = cluster.get(node);
+            if !h.alive() {
+                continue;
+            }
+            for dir in &dirs {
+                let Some(ino) = h.meta.child_ino(ROOT_INO, dir).ok().flatten() else {
+                    continue;
+                };
+                let held = h
+                    .meta
+                    .delegation_table()
+                    .get(ino)
+                    .is_some_and(|d| d.node == node && d.kind == Kind::Sticky);
+                let key = (node, dir.clone());
+                if !held {
+                    held_since.remove(&key);
+                    continue;
+                }
+                let since = *held_since.entry(key.clone()).or_insert(now);
+                let last = cluster
+                    .activity
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(0);
+                if now.saturating_sub(last.max(since)) < idle_ms {
+                    continue;
+                }
+                let wait = releases.is_multiple_of(2);
+                releases += 1;
+                fault_log.lock().unwrap().push(format!(
+                    "t={now} node {node}: sticky release of {dir} (idle; wait {wait}; placed)"
+                ));
+                cluster.sticky_driver.lock().unwrap()[0] += 1;
+                held_since.remove(&key);
+                let c = cluster.clone();
+                let hh = h.clone();
+                tokio::spawn(async move {
+                    let r = tokio::time::timeout(
+                        Duration::from_secs(40),
+                        hh.control(Control::StickyRelease {
+                            dirs: vec![ino],
+                            wait,
+                        }),
+                    )
+                    .await;
+                    if wait {
+                        let slot = if matches!(r, Ok(Ok(Ok(_)))) { 1 } else { 2 };
+                        c.sticky_driver.lock().unwrap()[slot] += 1;
+                    }
+                });
             }
         }
     }
@@ -5388,6 +5469,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             sampler_stop.clone(),
             fault_log.clone(),
             cfg.sticky_delegations.clone(),
+            cfg.dirs.clone(),
             idle_ms,
         ));
     }
