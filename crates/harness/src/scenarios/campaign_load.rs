@@ -258,6 +258,8 @@ fn counter_cluster_with(
     let mut env_vars = vec![
         ("CONSTELLATION_LOCK_TTL_MS", ttl.as_str()),
         ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"),
+        // Pinned (plan 46 M1.3 step 7): the scenario is about the lock lane.
+        ("CONSTELLATION_DELEGATION_STICKY_PLACEMENT", "off"),
         ("RUST_LOG", log.as_str()),
         ("CONSTELLATION_FAULT_STORE_STALL_FILE", stall.as_str()),
     ];

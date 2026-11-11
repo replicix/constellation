@@ -505,7 +505,13 @@ pub fn no_peer_in_budget(_seed: u64) -> Result<()> {
     let (_env, _root, mut clients, _) = cluster(
         NAME,
         &["a", "b", "c"],
-        &[("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0")],
+        &[
+            ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"),
+            // Pinned (plan 46 M1.3 step 7): at a budget of 0 placement
+            // treats every dominant writer as far and grants it a sticky
+            // subtree; this scenario is about the local acknowledgement.
+            ("CONSTELLATION_DELEGATION_STICKY_PLACEMENT", "off"),
+        ],
         0,
     )?;
     let result = (|| -> Result<()> {

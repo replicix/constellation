@@ -444,6 +444,9 @@ pub fn lock_holder_partitioned(_seed: u64) -> Result<()> {
         &[
             ("CONSTELLATION_LOCK_TTL_MS", &ttl),
             ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"),
+            // Pinned (plan 46 M1.3 step 7): a budget of 0 would let placement
+            // grant sticky subtrees; this scenario is about the locks.
+            ("CONSTELLATION_DELEGATION_STICKY_PLACEMENT", "off"),
         ],
         0,
     )?;
@@ -728,6 +731,9 @@ pub fn lock_holder_killed_contention(_seed: u64) -> Result<()> {
         &[
             ("CONSTELLATION_LOCK_TTL_MS", &ttl),
             ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"),
+            // Pinned (plan 46 M1.3 step 7): a budget of 0 would let placement
+            // grant sticky subtrees; this scenario is about the locks.
+            ("CONSTELLATION_DELEGATION_STICKY_PLACEMENT", "off"),
             (
                 "RUST_LOG",
                 "info,constellation_authority::core::locks=debug",
@@ -968,6 +974,9 @@ pub fn lock_fence_at_close(_seed: u64) -> Result<()> {
         &[
             ("CONSTELLATION_LOCK_TTL_MS", &ttl),
             ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"),
+            // Pinned (plan 46 M1.3 step 7): a budget of 0 would let placement
+            // grant sticky subtrees; this scenario is about the locks.
+            ("CONSTELLATION_DELEGATION_STICKY_PLACEMENT", "off"),
             (
                 "RUST_LOG",
                 "info,constellation_authority::core::locks=debug,constellation::locks=debug",
@@ -2879,6 +2888,9 @@ pub fn lock_store_stall_holder(_seed: u64) -> Result<()> {
         &[
             ("CONSTELLATION_LOCK_TTL_MS", &ttl),
             ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"),
+            // Pinned (plan 46 M1.3 step 7): a budget of 0 would let placement
+            // grant sticky subtrees; this scenario is about the locks.
+            ("CONSTELLATION_DELEGATION_STICKY_PLACEMENT", "off"),
             ("CONSTELLATION_FAULT_STORE_STALL_FILE", &file_str),
             (
                 "CONSTELLATION_LOCK_LANE",
