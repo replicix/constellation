@@ -4237,36 +4237,57 @@ before the outage.
   own prefix must explain the refusal) does not apply. It is journaled only
   when the dedup found no outcome for the rid, so the journal holds no row of
   the rid that a drop could roll back. A dropped-code settle refusal keeps its
-  observed keys (conservative).
+  observed keys (conservative). The inbox settle's `InboxAck` is a
+  max-watermark and can now ship ahead of an earlier, held inbox-drained row;
+  that was already possible for any refusal or row on untainted keys, and the
+  watermark's ordering is unaffected.
 - **C2, no unsettled `EIO` without a settle window.** A sent op that settles
   and finds its node's epoch refusing writes starts its settle
   (`client_deadline`) instead of being told in doubt at once. A settle that
   comes back to the lease path of such an epoch waits in `Backoff`
   (`recall_hold_ms`, at least 50 ms) and is routed again; the deadline then
   tells the unsettled `EIO` after its window. `settle_route` sends the settle
-  to the epoch's hold owner when this node reaches it. Never-sent ops keep
-  `EROFS`; replays and best-effort ops are unchanged. In a frozen or
-  carrier-less epoch the in-doubt answer for an op in flight therefore comes
-  up to one settle window later (maintainer decision Q2).
+  to the epoch's hold owner (the carrier) when this node reaches it. Never-sent ops keep `EROFS`; replays and
+  best-effort ops are unchanged. The settle of this path is bounded at one
+  settle window from the freeze (`SettleUntil::Window`: 30 s at the defaults,
+  3 s in the sim), not at the client's deadline (twice the lease TTL after the
+  submission, 120 s at the defaults, which an ordinary settle runs to): in a
+  frozen or carrier-less epoch the in-doubt answer for an op in flight comes
+  one settle window later (maintainer decision Q2). A window shorter than the
+  epoch leaves an isolated requester's `EIO`, which the classifier allows as
+  before.
 - **C3, `held-behind-lost-chunk`, an allowed class.** `MutateOutcome::Held`
   gains `lost_chunk`, set by a root whose answer waits for the durability of a
-  row that the ship plan holds or defers for a chunk (`Meta::rid_behind_lost_chunk`,
-  from the last ship round). A settling requester that hears it (or that is the
-  sequencer itself and finds the rid in its own plan) labels its unsettled
-  `EIO` (`take_unsettled_lost_chunk`, stat `unsettled_held_lost_chunk`). The
-  oracle accepts the label only against global truth, as for ADR-47's
-  `HolderUnreachable`: the sim's chunk ledger has a chunk that exists nowhere,
-  some node's ship plan holds or defers the rid's transaction, the verdict
-  would have been a violation, and the rid never reached the log or an
-  operator's drop ran. It is counted apart (`Report::unsettled_held_lost_chunk`),
-  never a violation, with a ratcheting ceiling. The negative control is
-  `AUTHORITY_SIM_LOST_CHUNK_LABEL_ALWAYS` (a requester labels every `Held`):
-  it must not lower any violation count. The settle is not rolled back
-  automatically (maintainer decision Q1): only the operator decides, since
-  the chunk may come back.
+  row that the ship plan *holds* for a chunk that exists nowhere, or defers
+  behind another node's pending upload whose uploader may never return
+  (`Meta::rid_behind_lost_chunk`, from the last ship round, by the plan's
+  blame on the remote-pending rows). A row that is merely deferred for this
+  node's own upload ships by itself and does not count. A settling requester that hears it (or that is the sequencer
+  itself and finds the rid in its own plan) labels its unsettled `EIO`
+  (`take_unsettled_lost_chunk`, stat `unsettled_held_lost_chunk`); the label
+  is the last `Held`'s word. The oracle accepts it only against global truth,
+  as for ADR-47's `HolderUnreachable`, and the verdict would have been a
+  violation: the sim's chunk ledger has a chunk that exists nowhere at the
+  `EIO`, and either (a) an operator's `repair drop-held` rolled the rid back at
+  or after the `EIO` (a drop before it ran when a sequencer could settle the
+  rid), or (b) the requester said so, some node's ship plan held the rid's
+  transaction (or deferred it behind another node's pending upload) at the
+  `EIO`, and the rid's outcome reached the log only after
+  the first drop at or after the `EIO`, or never. A row that shipped by itself,
+  before any drop, makes the label a lie. It is counted apart
+  (`Report::unsettled_held_lost_chunk`), never a violation, with a ratcheting
+  ceiling of its own: it does not share the old allowed classes' ceiling. The
+  negative control is `AUTHORITY_SIM_LOST_CHUNK_LABEL_ALWAYS` (a requester
+  labels every `Held`): with the real oracle it must not lower any violation
+  count, and with `AUTHORITY_SIM_LOST_CHUNK_TRUST_LABEL` also set (an oracle
+  that takes the requester's word) it does lower them: the checks above are
+  what holds the line. An oracle unit test pins that a row deferred for the
+  node's own upload never converts. The settle is not
+  rolled back automatically (maintainer decision Q1): only the operator
+  decides, since the chunk may come back.
 - **C4, the classifier says what the core was busy with when it mattered.**
-  `Verdict::Reachable` reports the busy bits at the run's last instant and the
-  OR over the run as `ever`.
+  `Verdict::Reachable` reports the busy bits at the reachable run's last
+  instant and the OR over the run as `ever`.
 
 **Rejected**: rolling back the held dependents of a settled rid automatically
 (it puts rollback in the settle path and pre-empts the operator); C1b, letting
@@ -4279,6 +4300,54 @@ rules of ADR-49 do not already cover, and executes nothing. An unsettled `EIO`
 in a frozen epoch arrives up to a settle window later; a settle's refusal
 behind a lost chunk is answered instead of held until the drop. Counters:
 `settles_sent`, `unsettled_held_lost_chunk`.
+
+**Residuals** (seeds 0..1999, release, `+settle+oracles+unsettled`; main fails
+flex 98, flex-crash 952, flex-tight 876, flex-backup 101 seeds, flex-crash
+1834 and flex-tight 936 and 1079 and flex-backup 596 among them). After this
+ADR: flex 20, flex-crash 73, flex-tight 98, flex-backup 55. Every one is an
+unsettled `EIO` told with a sequencer reachable, except where named:
+
+- flex: 215 490 685 736 757 821 934 974 1020 1078 1101 1278 1340 1489 1524
+  1552 1754 1759 1884 1911.
+- flex-crash: 124 197 201 215 225 246 253 267 353 360 384 441 472 490 501 582
+  595 617 671 679 697 703 757 762 797 821 826 845 934 957 964 970 974 1017
+  1020 1022 1025 1027 1075 1078 1084 1091 1101 1127 1154 1180 1229 1257 1258
+  1278 1288 1313 1339 1388 1393 1402 1488 1489 1524 1555 1556 1699 1749 1754
+  1776 1778 1884 1907 1911 1912 1921 1933, and 1834.
+- flex-tight: 7 33 48 56 76 115 183 194 196 235 253 271 294 323 338 346 358
+  383 390 414 446 449 462 464 468 474 476 522 525 594 603 615 655 675 679 689
+  703 756 767 797 826 832 837 842 882 928 951 969 976 1002 1030 1049 1058 1061
+  1077 1158 1180 1207 1225 1241 1264 1288 1313 1315 1352 1358 1359 1365 1429
+  1503 1507 1524 1536 1557 1559 1592 1593 1614 1629 1638 1651 1654 1666 1693
+  1695 1703 1707 1771 1778 1856 1860 1895 1901 1915 1933 1950, and 936 (class
+  claim) and 1079 (I5), which fail on main too.
+- flex-backup: 60 140 144 164 192 214 215 218 294 360 382 403 425 435 490 492
+  560 576 630 719 736 753 757 821 833 882 934 947 974 997 1020 1021 1025 1246
+  1289 1304 1340 1364 1373 1399 1502 1552 1559 1621 1631 1752 1759 1767 1781
+  1884 1911 1924 1925 1933, and 596 (class D, `tail_done_skipped`), which
+  fails on main too.
+
+Three causes. (1) *The window of a frozen epoch's settle* (the maintainer's
+cap, M3): the `EIO` comes one settle window after the freeze, and some windows
+end with the sequencer reachable for part of them, because the requester that
+has no holder to ask and no S3 to read the lease from (flex 736: the epoch's
+owner reachable for 2.7 s of the 3 s window, the requester routing through the
+inbox) does not find it in time. With the settle left to the client deadline
+(twice the lease TTL) the same code fails 27 flex-crash seeds instead of 73
+(201 225 353 384 441 582 595 617 697 797 957 970 1022 1075 1084 1127 1154 1257
+1258 1402 1699 1749 1776 1834 1907 1912). Short reachabilities
+(lease path for 100 to 150 ms, the root for a second) are most of the
+residuals, and flex-tight 76 (lease path reachable for 118 ms of a 3 s window)
+is the live witness `m03_a_reachable_sequencers_requester_is_not_isolated`
+pins. (2) *An `EIO` of a row that is not behind a lost chunk*, which the first
+oracle absorbed on evidence of the whole run (a chunk lost and a drop
+somewhere in it): flex-crash 201 and 353 are two (the requester said nothing,
+no plan held the row at the `EIO`, no drop followed it, and the row shipped by
+itself seconds later). They are violations now. (3) *Pre-existing*: flex-crash 1834, an I4 late landing
+(rid 3:15 answered in doubt at tick 139, completed at segment 31), fails
+identically on b4e9b722, before this ADR: it is class E of the M1.4 baseline
+(an in-doubt op the operator's `drop-held` replayed after later ops), not a
+consequence of C2.
 
 **May revert**: no.
 
