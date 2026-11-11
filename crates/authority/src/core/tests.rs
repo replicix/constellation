@@ -70309,6 +70309,65 @@ mod step5_sticky_release {
         assert!(h.core.dl.mine[&7].release.is_none());
     }
 
+    /// Sim `sticky-idle-release` seed 217: the remnant a restart installed
+    /// for the release row is dropped by the next sync (a segment of the
+    /// root's, before it appended the row): the stream has no subtree, so
+    /// the guard that keeps a non-stealable stream's own release did not
+    /// cover it. The row stayed in the journal, the root listed the sticky
+    /// stream for good (no TTL reclaims it), and the cluster never reached
+    /// quiescence. Fails without `DelegateState::remnant`.
+    #[test]
+    fn a_sync_after_the_remnants_install_keeps_it_until_the_root_appends_the_row() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        release(&mut h, 50, Vec::new(), false);
+        assert!(last_is_release(&h));
+        h.core.dl.mine.remove(&7);
+        h.core.dl.installed_gens.clear();
+        h.core.dl.sticky_cmds.clear();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (req, round, last) =
+            batch(&out).unwrap_or_else(|| panic!("the row was not sent: {out:?}"));
+        // The root's next segment syncs the table again, the row not yet
+        // appended.
+        let mut again = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut again);
+        assert!(
+            h.core.dl.mine.contains_key(&7),
+            "the remnant was dropped before the root appended the release row"
+        );
+        h.step(stream_ack(1, req, round, last));
+        assert!(h.core.dl.mine[&7].release.is_none());
+    }
+
+    /// Sim `far-placement-release` seed 605: a delegate that took the root
+    /// over ships the rows it journaled as a delegate (a release row of a
+    /// stream the old root never appended) in its own segments. Every other
+    /// replica counts them in the log's index of the generation when it
+    /// applies the segment; this node applies none of its own, so its index
+    /// stayed behind, and the rows of its next generation, whose `deps` name
+    /// the shipped row, waited for it for good (51 sticky-final answers
+    /// stranded in the journal). Fails without the count at the ack.
+    #[test]
+    fn a_delegate_row_this_node_ships_itself_counts_in_the_logs_index() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        release(&mut h, 50, Vec::new(), false);
+        assert!(last_is_release(&h));
+        let idx = Replica::delegate_idx(&h.meta, 7);
+        assert_eq!(idx, 1, "the release row");
+        assert_eq!(Replica::log_stream_idx(&h.meta, 7), 0);
+        // The ship: this node's journal leaves in its own segment.
+        let shipped = Replica::take_journal(&h.meta, usize::MAX).unwrap();
+        let seqs: Vec<u64> = shipped.iter().map(|(s, _)| *s).collect();
+        assert!(!seqs.is_empty());
+        Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
+        assert_eq!(
+            Replica::log_stream_idx(&h.meta, 7),
+            idx,
+            "the log holds the rows this node shipped, and its index says so"
+        );
+    }
+
     /// A remote requester that was redirected to the designee (the root's
     /// `NotHolder`) and then came back to the root, which found the designee
     /// out of reach. The op was sent under the designee's generation (its

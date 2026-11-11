@@ -20109,6 +20109,28 @@ fn a_whole_release_quarantines_the_subtrees_it_gave_up() {
     );
 }
 
+/// Quiescence after a sticky release the old root never appended. Two
+/// seeds, one class: the holder's release row (`StreamReleased`) is a journal
+/// row of its own stream that nothing but the stream (or a ship of the
+/// holder's own journal) carries to the log.
+///
+/// - `sticky-idle-release` 217: the holder restarted between the row and the
+///   root's append; the remnant it installed again for the row was dropped by
+///   the next sync, the root listed the sticky stream for good (no TTL
+///   reclaims it), and the row stayed in the journal.
+/// - `far-placement-release` 605: the old root crashed before it appended the
+///   row; the holder took the root over and shipped the row in its own
+///   segment, but counted it nowhere (it applies no segment of its own), so
+///   the rows of its next stream, whose `deps` name the row, waited for it
+///   for good: 51 acknowledged sticky-final rows stranded in its journal.
+#[test]
+fn a_release_row_the_old_root_never_appended_does_not_strand_the_holders_rows() {
+    run_seed(605, far_placement_release_config())
+        .unwrap_or_else(|e| panic!("far-placement-release seed 605: {e}"));
+    run_seed(217, sticky_idle_release_config())
+        .unwrap_or_else(|e| panic!("sticky-idle-release seed 217: {e}"));
+}
+
 /// Plan 46 M1.3 step 7 (ADR-54): a far writer (every pair out of the
 /// backup budget) that dominates a subtree is granted a sticky one: it
 /// executes there and its answers are final, with no rollback, no sticky
