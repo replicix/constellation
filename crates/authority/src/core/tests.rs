@@ -72177,6 +72177,34 @@ mod late_landing_inbox {
         });
         assert!(h.meta.child_ino(ROOT_INO, "x").unwrap().is_some());
     }
+
+    /// A settle inside its withdrawal window, answered in doubt while its
+    /// node's epoch refuses writes: the wake that follows the deadline's
+    /// move re-routes the settle, whose lease path refuses at once in the
+    /// same epoch and ends in doubt again. The second end must not wake it
+    /// again (the deadline has not moved): the op waits for its deadline
+    /// instead of recursing until the stack is gone.
+    #[test]
+    fn an_in_doubt_end_inside_the_window_does_not_wake_the_settle_again() {
+        let (mut h, rid) = waiting_inbox_op();
+        let _ = settle_and_tombstone(&mut h, rid);
+        h.core.epoch.frozen = true;
+        h.core.lease.cached_holder = None;
+        {
+            let c = h.core.clients.get_mut(&rid).unwrap();
+            c.phase = crate::core::client::Phase::Backoff;
+            c.timer = None;
+        }
+        let mut out = Vec::new();
+        h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
+        let c = h
+            .core
+            .clients
+            .get(&rid)
+            .expect("still waiting for its window");
+        assert!(c.settle);
+        assert!(replies(&out).is_empty(), "{out:?}");
+    }
 }
 
 /// Late-landing S2: an unacknowledged or foreign stranded row only settles

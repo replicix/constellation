@@ -5002,8 +5002,14 @@ impl Core {
                 let window = self.dl_t().settle_window;
                 let allowed = w.acked_at.map_or(w.deadline, |t| t.plus(window));
                 if now.wait < allowed {
-                    self.extend_settle_deadline(rid, allowed, None, out);
-                    self.settle_wake_idle(now, rid, replica, out);
+                    // Woken only when the deadline moved: the wake routes
+                    // the settle again, and a route that ends in doubt
+                    // (the epoch refuses writes) comes back here with the
+                    // deadline where this call left it, so waking again
+                    // would recurse without end. The op waits for it.
+                    if self.extend_settle_deadline(rid, allowed, None, out) {
+                        self.settle_wake_idle(now, rid, replica, out);
+                    }
                     return;
                 }
             }
