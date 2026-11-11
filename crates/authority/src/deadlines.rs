@@ -191,7 +191,10 @@ const RECALL_BACKOFF_CAP_MS: u64 = 2_000;
 const LOCK_RENEW_GAP_MAX_MS: u64 = 250;
 /// A leave waits this much on top of its grants' end.
 const LEAVE_WAIT_SLACK_MS: u64 = 5_000;
-/// A leaving node's note counts as lapsed after this many resends.
+/// A root's mark of a node that said it leaves lapses when no note has come
+/// for this many resend intervals, or for twice the delegation TTL if that
+/// is longer (the node's grants and its stream outlive a missed note by the
+/// TTL; a mark that lapsed earlier would grant it again).
 const LEAVE_NOTE_LAPSE_RESENDS: u64 = 3;
 
 /// The delegation TTL a deployment gets when it sets none: the lock TTL,
