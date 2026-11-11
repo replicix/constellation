@@ -1025,6 +1025,130 @@ fn the_lease_path_resolves_an_in_doubt_rid_from_the_log() {
     );
 }
 
+/// `sticky-root-designee-inbox` seeds 216 and 1025 (inbox reads of 3 to
+/// 5 s, a 6 s lease): a takeover's inbox drain outlasted the lease. The drain was the
+/// job's one S3 op, so no renewal went out while it was read; the lease ran
+/// out before the gate opened, the next claimant's drain was as slow, and
+/// the lease went round the nodes. The renewal now goes out at half the
+/// TTL with the drain still in flight, and the gate stays closed until the
+/// drain has run. Fails before: no renewal while the drain is out.
+#[test]
+fn a_slow_takeover_drain_does_not_hold_up_the_lease_renewal() {
+    let mut h = Harness::new(1);
+    let ttl = h.core.cfg.ttl_ms;
+    let mut out = Vec::new();
+    h.core.enqueue_job(
+        h.clk(),
+        super::jobs::JobReq::Acquire {
+            reason: "test",
+            ask_handoff: false,
+        },
+        &h.meta,
+        &mut out,
+    );
+    let (get, _) = s3_ops(&out)[0];
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(None)),
+    });
+    let (create, req) = s3_ops(&out)[0];
+    assert!(matches!(req, S3Op::LeaseCreate { .. }), "{req:?}");
+    let out = h.step(Event::S3 {
+        op: create,
+        result: S3Result::LeasePut(Ok(tag())),
+    });
+    let claimed_until = h.core.lease().held.as_ref().unwrap().0.expires_unix_ms;
+    let (drain, req) = s3_ops(&out)[0];
+    assert!(
+        matches!(req, S3Op::InboxDrain { below_epoch: 1 }),
+        "{req:?}"
+    );
+    // The drain is read for most of a TTL. Every timer fires when due; a
+    // round's upload pass and a renewal are answered; nothing else is.
+    let fire_due = |h: &mut Harness| -> Vec<Action> {
+        let now = h.clk();
+        let due: Vec<TimerId> = h
+            .core
+            .timers
+            .iter()
+            .filter(|(_, (_, at))| match at {
+                TimerAt::Honour(m) => m.0 <= now.honour.0,
+                TimerAt::Wait(m) => m.0 <= now.wait.0,
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let mut all = Vec::new();
+        for id in due {
+            all.extend(h.step(Event::Timer { id }));
+        }
+        all
+    };
+    let mut renewals = 0;
+    let mut elapsed = 0;
+    while elapsed < ttl * 9 / 10 {
+        h.advance(100);
+        elapsed += 100;
+        let mut pending = fire_due(&mut h);
+        loop {
+            let upload = pending.iter().find_map(|a| match a {
+                Action::UploadDirtyChunks { op, .. } => Some(*op),
+                _ => None,
+            });
+            if let Some(op) = upload {
+                pending = h.step(Event::UploadsDone {
+                    op,
+                    result: UploadResult::Done { held: 0 },
+                });
+                continue;
+            }
+            let renewal = pending.iter().find_map(|a| match a {
+                Action::S3 {
+                    op,
+                    req: S3Op::LeaseSwap { lease, .. },
+                } => Some((*op, lease.clone())),
+                _ => None,
+            });
+            let Some((op, sent)) = renewal else {
+                break;
+            };
+            renewals += 1;
+            assert!(sent.expires_unix_ms > claimed_until, "{sent:?}");
+            pending = h.step(Event::S3 {
+                op,
+                result: S3Result::LeasePut(Ok(tag())),
+            });
+        }
+        assert!(
+            h.core.lease.gate.is_some(),
+            "the gate opened before its drain ran"
+        );
+        assert!(!h.core.lease().lost);
+    }
+    assert!(
+        renewals >= 1,
+        "no lease renewal while the takeover drain was read"
+    );
+    assert_eq!(h.core.stats.gate_drain_renewals, 1);
+    assert!(h.core.lease().held.as_ref().unwrap().0.expires_unix_ms > claimed_until);
+    // The drain lands: the gate opens.
+    let mut out = h.step(Event::S3 {
+        op: drain,
+        result: S3Result::InboxDrain(Ok(Vec::new())),
+    });
+    for _ in 0..5 {
+        if h.core.lease.gate.is_none() {
+            break;
+        }
+        h.advance(10);
+        out = fire_due(&mut h);
+    }
+    assert!(
+        h.core.lease.gate.is_none(),
+        "the gate stays pending: {out:?}"
+    );
+    assert_eq!(h.core.lease().epoch(), Some(1));
+}
+
 /// `locks-blips-tight` with in-doubt lease PUTs (seed 413006): an
 /// acquisition CAS that applied, then timed out, left the lease this
 /// node's without its knowing; its peers asked it as the holder and got
@@ -35382,6 +35506,103 @@ fn an_inbox_op_waits_for_its_deps() {
     let out = answer_leftover_read(&mut h, &out, vec![batch]);
     assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_some());
     assert_eq!(inbox_deletes(&out), vec![(1, 2, 0)]);
+}
+
+/// `sticky-root-designee-inbox-skew` seed 1261 (inbox reads of 3 to 5 s): a
+/// takeover drain that outlasted the read freshness bound left every batch
+/// for the holder tick's re-read, and the holder, idle with a peer asking
+/// for the lease, released it as its gate opened, before the re-read ran.
+/// The batches were still in the bucket; the next holder's gate drained
+/// them as slowly and released as soon, and nothing ran. The lease now
+/// stays until the leftovers ran. Fails before: released with a leftover.
+#[test]
+fn a_holder_with_drain_leftovers_is_not_idle_released() {
+    // One round of the poll: every upload and S3 request is answered but a
+    // leftover re-read (`InboxRun`), which stays out; whether a release
+    // CAS was sent.
+    fn releases(h: &mut Harness) -> bool {
+        let mut out = Vec::new();
+        h.core.start(h.clk(), &h.meta, &mut out);
+        let poll = timers(&out, TimerKind::Poll)[0];
+        let mut acts = h.step(Event::Timer { id: poll });
+        let mut released = h.core.lease.releasing;
+        for _ in 0..20 {
+            if let Some(upload) = acts.iter().find_map(|a| match a {
+                Action::UploadDirtyChunks { op, .. } => Some(*op),
+                _ => None,
+            }) {
+                acts = h.step(Event::UploadsDone {
+                    op: upload,
+                    result: UploadResult::Done { held: 0 },
+                });
+                released |= h.core.lease.releasing;
+                continue;
+            }
+            let Some((op, req)) = s3_ops(&acts)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::InboxRun { .. }))
+                .map(|(o, r)| (o, r.clone()))
+            else {
+                break;
+            };
+            let result = match req {
+                S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                S3Op::LeaseSwap { lease, .. } => {
+                    released |= lease.released;
+                    S3Result::LeasePut(Ok(tag()))
+                }
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                other => panic!("unexpected S3 op in the round: {other:?}"),
+            };
+            acts = h.step(Event::S3 { op, result });
+            released |= h.core.lease.releasing;
+        }
+        released
+    }
+    let idle = |h: &mut Harness| {
+        let long_ago = WaitMs(h.now.0 - 1_000_000);
+        h.core.lease.wanted = vec![2];
+        h.core.lease.wanted_since = Some(long_ago);
+        h.core.lease.held_since = Some(long_ago);
+        h.core.lease.last_write = long_ago;
+        assert!(h.core.lease.wants_handoff(h.clk(), h.core.config()));
+    };
+    for leftover in [false, true] {
+        let mut h = Harness::new(1);
+        h.core.cfg.inbox = true;
+        h.hold(2, None);
+        let c = h.create("c");
+        let batch = inbox_batch(3, 0, 1, &c);
+        if leftover {
+            // The drain's read is older than the freshness bound: the batch
+            // is left for the re-read.
+            let stale = WaitMs(h.clk().wait.0 - 2 * h.core.dl_t().inbox_read_fresh as i64);
+            let mut out = Vec::new();
+            h.core
+                .inbox_drain(h.clk(), vec![batch.clone()], stale, &h.meta, &mut out)
+                .unwrap();
+            assert_eq!(h.core.inbox.leftover_batches(), 1);
+        }
+        idle(&mut h);
+        assert_eq!(
+            releases(&mut h),
+            !leftover,
+            "(leftover {leftover}) released while the drain's leftovers wait"
+        );
+        if !leftover {
+            continue;
+        }
+        // The re-read lands and runs the batch: the next round releases.
+        let out = answer_leftover_read(&mut h, &[], vec![batch]);
+        assert!(
+            h.meta.child_ino(ROOT_INO, "c").unwrap().is_some(),
+            "{out:?}"
+        );
+        assert!(h.core.inbox.leftover.is_none());
+        idle(&mut h);
+        assert!(releases(&mut h), "never released once the leftovers ran");
+    }
 }
 
 // ---- chaos-soak-4 seed 42 (`wf293`): a delegate's reply base ----

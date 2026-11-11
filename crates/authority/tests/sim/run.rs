@@ -3634,6 +3634,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 .await
                 .is_err()
             {
+                cluster.env.bucket.disarm_claim_cut();
                 note(format!(
                     "t={} node {node} did not claim the lease within 30 s: no cut",
                     fault.at_ms
