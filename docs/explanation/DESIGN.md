@@ -806,8 +806,11 @@ requester's memory: a forward carries the generation it was routed by and the
 highest generation the rid ever touched; a designee runs it only under the
 generation it was routed by (else `Fenced`), and the root refuses for good (`EROFS`)
 only a rid that touched none, otherwise it answers `HolderUnreachable` and
-holds; a cross-subtree `EXDEV` stays final. The drain halts such a batch
-instead of refusing it, and a rid of unknown history counts as touched. The
+holds; a cross-subtree `EXDEV` stays final. A rid that was ever in an inbox
+is never run by a designee of a non-stealable generation, the lease holder's
+own included: the holder refuses it (`EROFS`) as a row of its stream, after its
+dedup, so no clock decides whether a refused rid also ran. The drain halts such
+a batch instead of refusing it, and a rid of unknown history counts as touched. The
 client hears the unsettled `EIO` at the deadlines, counted apart
 (`unsettled_nonstealable_holder`;
 [ADR-47](DECISIONS.md#adr-47-an-executor-runs-a-forward-only-under-the-generation-it-was-routed-by),
