@@ -3437,7 +3437,7 @@ impl Core {
                     }
                 }
             }
-            PeerMsg::ReleaseRequest { req, gen, dirs } => {
+            PeerMsg::ReleaseRequest { req, gen, dirs, .. } => {
                 self.on_release_request(now, from, req, gen, dirs, replica, out)
             }
             PeerMsg::DelegBackupAppend { req, gen, txs } => {

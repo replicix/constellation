@@ -826,7 +826,7 @@ impl constellation_net::PeerService for P2pBridge {
         });
     }
 
-    fn release_requested(&self, root: u64, req_id: u64, gen: u64, dirs: Vec<u8>) {
+    fn release_requested(&self, root: u64, req_id: u64, gen: u64, dirs: Vec<u8>, why: u8) {
         if crate::fault::p2p_denied(root) {
             return;
         }
@@ -834,11 +834,16 @@ impl constellation_net::PeerService for P2pBridge {
             tracing::warn!(root, "dropping a release request that does not decode");
             return;
         };
+        let Some(why) = constellation_authority::ReleaseWhy::from_wire(why) else {
+            tracing::warn!(root, why, "dropping a release request of an unknown kind");
+            return;
+        };
         let _ = self.nudge.send(sync::SyncRequest::PeerReleaseRequest {
             root,
             req_id,
             gen,
             dirs,
+            why,
         });
     }
 

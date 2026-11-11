@@ -3829,19 +3829,25 @@ impl Driver {
                 req_id,
                 gen,
                 dirs,
+                why,
             } => {
-                // The fast path admits nothing more under the subtrees from
-                // here; the core releases them (with the stream index it
-                // reads then) once every admitted op is journaled, so
-                // nothing lands past the release row the root drains to
-                // (harness `cross-subtree-rename`: an op admitted in that
-                // window was refused by the root and rolled back here).
+                // A recall: the fast path admits nothing more under the
+                // subtrees from here; the core releases them (with the
+                // stream index it reads then) once every admitted op is
+                // journaled, so nothing lands past the release row the root
+                // drains to (harness `cross-subtree-rename`: an op admitted
+                // in that window was refused by the root and rolled back
+                // here). A handover is only a request (ADR-56): the fast
+                // path keeps running and the core decides when to release.
                 let delegates = self.deps.delegates.clone();
-                delegates.stop_dirs(gen, &dirs);
+                let drain = delegates.release_requested(gen, &dirs, why);
                 let tx = self.int_tx.clone();
                 tokio::spawn(async move {
                     let started = std::time::Instant::now();
-                    while delegates.in_flight() > 0 && started.elapsed() < Duration::from_secs(5) {
+                    while drain
+                        && delegates.in_flight() > 0
+                        && started.elapsed() < Duration::from_secs(5)
+                    {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                     let _ = tx.send(Internal::Event(Event::Peer {
@@ -3850,6 +3856,7 @@ impl Driver {
                             req: OpId(req_id),
                             gen,
                             dirs,
+                            why,
                         },
                     }));
                 });
@@ -5407,7 +5414,12 @@ impl Driver {
                 };
                 self.one_way_reported(to, req, payload);
             }
-            PeerMsg::ReleaseRequest { req, gen, dirs } => {
+            PeerMsg::ReleaseRequest {
+                req,
+                gen,
+                dirs,
+                why,
+            } => {
                 if crate::fault::p2p_denied(to) {
                     // Dropped: the request is sent again like an unanswered one.
                     return;
@@ -5417,6 +5429,7 @@ impl Driver {
                     req_id: req.0,
                     gen,
                     dirs: postcard::to_allocvec(&dirs).unwrap_or_default(),
+                    why: why.to_wire(),
                 };
                 self.one_way_reported(to, req, payload);
             }

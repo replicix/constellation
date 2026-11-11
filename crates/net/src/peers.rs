@@ -1990,8 +1990,9 @@ async fn handle_stream<S: PeerService>(
                 req_id,
                 gen,
                 dirs,
+                why,
             } => {
-                service.release_requested(root, req_id, gen, dirs);
+                service.release_requested(root, req_id, gen, dirs, why);
                 Some(Payload::Ok { req_id })
             }
             Payload::LeaseOffer { part, epoch } => {

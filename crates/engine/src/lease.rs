@@ -647,6 +647,31 @@ mod tests {
             "admitted an unlink that changes a root-owned file"
         );
     }
+
+    /// ADR-56: the engine does not stop the fast path on a handover request
+    /// (nor ask the caller to wait for it); a recall does.
+    #[test]
+    fn the_engine_does_not_stop_the_fast_path_on_a_handover_request() {
+        use constellation_authority::ReleaseWhy;
+        let view = DelegateView::default();
+        view.mirror(&constellation_authority::core::DelegView {
+            mine: vec![(vec![5, 6], 7, i64::MAX / 2, false, 0, 0, 0, String::new())],
+            ..Default::default()
+        });
+        assert!(!view.release_requested(7, &[5], ReleaseWhy::Handover));
+        assert_eq!(
+            *view.entries.lock().unwrap(),
+            vec![(vec![5, 6], 7, i64::MAX / 2, false)],
+            "a handover request left the subtree admitted"
+        );
+        assert!(view.stopped_dirs.lock().unwrap().is_empty());
+        assert!(view.release_requested(7, &[5], ReleaseWhy::Recall));
+        assert_eq!(
+            *view.entries.lock().unwrap(),
+            vec![(vec![6], 7, i64::MAX / 2, false)],
+            "a recall stops the subtree it names"
+        );
+    }
 }
 
 /// Plan 30 §M11: the delegations this node holds, mirrored from the
@@ -741,6 +766,26 @@ impl DelegateView {
             }
         }
         gone.extend(dirs.iter().map(|d| (gen, *d)));
+    }
+
+    /// A release request for the subtrees `dirs` of `gen` arrived. A recall
+    /// stops the fast path under them (`stop_dirs`) and the caller waits for
+    /// its admitted ops to drain (`true`); a handover (ADR-56) stops nothing
+    /// and waits for nothing (`false`): the core decides when the holder
+    /// lets go, and its own release path stops the fast path then.
+    pub fn release_requested(
+        &self,
+        gen: u64,
+        dirs: &[u64],
+        why: constellation_authority::ReleaseWhy,
+    ) -> bool {
+        match why {
+            constellation_authority::ReleaseWhy::Recall => {
+                self.stop_dirs(gen, dirs);
+                true
+            }
+            constellation_authority::ReleaseWhy::Handover => false,
+        }
     }
 
     /// F1/F9: whether this node still honours its delegation `gen` now

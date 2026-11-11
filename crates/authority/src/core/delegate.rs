@@ -56,7 +56,7 @@
 use super::backup::{FreshHold, FreshVerdict};
 use super::{Asker, CommitRule, Core, GroupOn, Timer};
 use crate::action::{Action, AnswerSource, ControlOk};
-use crate::event::PeerMsg;
+use crate::event::{PeerMsg, ReleaseWhy};
 use crate::ids::{HonourMs, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
@@ -8963,7 +8963,12 @@ impl Core {
         );
         out.push(Action::Send {
             to,
-            msg: PeerMsg::ReleaseRequest { req, gen, dirs },
+            msg: PeerMsg::ReleaseRequest {
+                req,
+                gen,
+                dirs,
+                why: ReleaseWhy::Recall,
+            },
         });
         self.arm_gen_expiry(now, gen, out);
     }
@@ -9039,7 +9044,12 @@ impl Core {
             );
             out.push(Action::Send {
                 to,
-                msg: PeerMsg::ReleaseRequest { req, gen, dirs },
+                msg: PeerMsg::ReleaseRequest {
+                    req,
+                    gen,
+                    dirs,
+                    why: ReleaseWhy::Recall,
+                },
             });
         } else {
             tracing::debug!(

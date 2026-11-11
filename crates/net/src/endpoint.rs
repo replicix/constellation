@@ -1645,9 +1645,10 @@ pub trait PeerService: Send + Sync + 'static {
     ) {
     }
     /// Plan 46 M1.2 step 10, one way: the root asks this node to release
-    /// subtrees of stream `gen` (`dirs`: postcard of `Vec<u64>`). Default:
+    /// subtrees of stream `gen` (`dirs`: postcard of `Vec<u64>`; `why`: 0 a
+    /// recall, 1 a handover). Default:
     /// ignored.
-    fn release_requested(&self, _root: u64, _req_id: u64, _gen: u64, _dirs: Vec<u8>) {}
+    fn release_requested(&self, _root: u64, _req_id: u64, _gen: u64, _dirs: Vec<u8>, _why: u8) {}
     /// Plan 30 §M8: a strict reader's ReadIndex. Default: not the holder.
     #[allow(clippy::too_many_arguments)]
     fn read_index_requested(
