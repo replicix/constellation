@@ -953,12 +953,13 @@ struct Strand<'a> {
     /// row was answered on the delegate's disk alone and is replayed as
     /// before.
     recall: bool,
-    /// A committed row the pass moves to the member copy holds reads of its
-    /// keys until the re-ship lands (`Meta::member_copy_touches`): a
-    /// segment's apply, and `strand_below_epoch` (a deposition's recovery
-    /// serves reads while its rebuild runs, with a delegate's row this root
-    /// appended after the rolled-back one still applied). Not the takeover
-    /// gate's strand: its tail re-applies the rows in the same step.
+    /// A committed row the pass moves to the member copy (or a delegate row
+    /// this root appended, to its generation's) holds reads of its keys
+    /// until the log carries it again (ADR-57, `Meta::hold_row_tx`): a
+    /// segment's apply, a deposition's recovery, the rebuild from the log
+    /// and the takeover gate (whose tail re-apply releases the rows it
+    /// carries, in the same transaction). Not a recall: the rows it drops
+    /// were never acknowledged.
     hold: bool,
     /// Each stranded transaction's `deps` (by journal seq), taken from the
     /// intact journal before the pass strands anything: a pass that
@@ -3854,7 +3855,7 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
                 member: true,
                 quiet: None,
                 recall: false,
-                hold: false,
+                hold: true,
                 deps_of: Some(&deps_of),
                 superseded: false,
                 gate_epoch: None,
@@ -6096,22 +6097,22 @@ impl Meta {
         let staged = UsageTracker::staging();
         let mut report = ReshipReport::default();
         let mut part = StrandPart::default();
+        // Only the transactions this takeover re-applies name a copy:
+        // a hole names nothing, and one past the sealed prefix
+        // (`bt.last > through`) is counted `tail_beyond_gap` and never
+        // re-applied.
+        let tail_idents: HashSet<(u64, u64)> = tail_txs
+            .iter()
+            .flat_map(|(t, v)| {
+                v.iter()
+                    .filter(|bt| !bt.records.is_empty() && bt.last <= t.through)
+                    .map(|bt| {
+                        crate::store::member::tail_identity(&bt.records)
+                            .unwrap_or((t.epoch, bt.first))
+                    })
+            })
+            .collect();
         if let Some(args) = strand {
-            // Only the transactions this takeover re-applies name a copy:
-            // a hole names nothing, and one past the sealed prefix
-            // (`bt.last > through`) is counted `tail_beyond_gap` and never
-            // re-applied.
-            let tail_idents: HashSet<(u64, u64)> = tail_txs
-                .iter()
-                .flat_map(|(t, v)| {
-                    v.iter()
-                        .filter(|bt| !bt.records.is_empty() && bt.last <= t.through)
-                        .map(|bt| {
-                            crate::store::member::tail_identity(&bt.records)
-                                .unwrap_or((t.epoch, bt.first))
-                        })
-                })
-                .collect();
             part = self.strand_part_tx(&mut tx, &staged, args, &tail_idents)?;
             report.stranded = part.stranded;
         }
@@ -6272,6 +6273,9 @@ impl Meta {
             report.tail_moved += moved.len();
         }
         if !tails.is_empty() {
+            // The rows the tail carried are back in the namespace: the
+            // holds the strand above set on them go (ADR-57).
+            self.release_reshipped_tx(&mut tx, &tail_idents)?;
             report.tail_applied = journaled.len();
             crate::store::backup::backup_clear_tx(&mut tx, self)?;
         }
@@ -6405,7 +6409,7 @@ impl Meta {
             },
             true,
             false,
-            false,
+            true,
             Some(epoch),
             |entry| entry.superseded_by_takeover(epoch, carried, tail_idents) && !abandons(entry),
         )?;
@@ -6453,7 +6457,7 @@ impl Meta {
                 |entry| matches!(entry, LiveEntry::Local { gen, .. } if *gen != 0 && unlisted_own.contains(gen)),
                 true,
                 false,
-                false,
+                true,
                 None,
                 |_| false,
             )?;
