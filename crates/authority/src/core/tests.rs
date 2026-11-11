@@ -54403,6 +54403,114 @@ mod c1_tail_fetch {
         l
     }
 
+    /// D7 (`backup-crash-slow+commit` seeds 204, 1115): a restart's
+    /// re-adoption CAS is in flight when a peer claimant's seal reaches the
+    /// epoch; the claimant's own claim then loses to the CAS, which lands.
+    /// The node must not serve the epoch it sealed (the rows it would
+    /// acknowledge next are in no tail, and its self-sealed re-claim
+    /// strands them in a member copy nobody ships or drops): the lease is
+    /// not adopted, and the next acquisition claims the next epoch at once
+    /// (the lease moved off the key the sealer read). Fails on the parent:
+    /// the node adopts epoch 1 and holds it.
+    #[test]
+    fn a_readoption_cas_that_lands_after_a_seal_is_not_adopted() {
+        let (h0, _) = listed_holder();
+        let mut h = h0;
+        h.core.cfg.takeover_promise_check = false;
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(2),
+            op: h.create("r"),
+            tag: Default::default(),
+        });
+        let held = h.core.lease.held.as_ref().unwrap().0.clone();
+        // The process restarts on its disk: nothing held, the journal has
+        // the row of epoch 1.
+        let mut h = Harness {
+            core: Core::new(h.core.cfg.clone()),
+            meta: h.meta,
+            now: h.now.plus(100),
+            honour_off: 0,
+            wait_off: 0,
+            manual_horizon: false,
+            cold_horizon: false,
+        };
+        let mut out = Vec::new();
+        h.core.start(h.clk(), &h.meta, &mut out);
+        h.core.cfg.takeover_promise_check = false;
+        let mut own = held.clone();
+        own.expires_unix_ms = h.now.0 + 5_000;
+        own.holder_expires_ms = own.expires_unix_ms;
+        own.holder_wait_ms = own.expires_unix_ms;
+        let read = own.clone();
+        // The re-adoption: its CAS goes out.
+        let out = h.step(Event::Control {
+            op: OpId(700),
+            req: Control::Acquire,
+        });
+        let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+        let mut out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((read.clone(), tag())))),
+        });
+        let mut cas = None;
+        for _ in 0..8 {
+            if let Some((op, lease)) = s3_ops(&out).into_iter().find_map(|(op, r)| match r {
+                S3Op::LeaseSwap { lease, .. } => Some((op, lease.clone())),
+                _ => None,
+            }) {
+                cas = Some((op, lease));
+                break;
+            }
+            let Some((op, req)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+                .map(|(op, r)| (op, r.clone()))
+            else {
+                break;
+            };
+            let result = match req {
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                other => panic!("unexpected request {other:?}"),
+            };
+            out = h.step(Event::S3 { op, result });
+        }
+        let (cas_op, written) = cas.expect("the re-adoption CAS");
+        assert_eq!((written.holder, written.epoch), (1, 1), "a re-adoption");
+        // A claimant read the lease before the CAS and seals this node's
+        // epoch now, the CAS in flight.
+        let out = seal_tail_keyed(&mut h, 3, 1, 2, 0, read.renewal_key());
+        assert_eq!(sealed(&out).len(), 1, "answered: {out:?}");
+        assert!(sealed(&out)[0].1, "from the journal: {out:?}");
+        assert!(h.core.bk.sealed >= 1);
+        // The CAS lands.
+        h.step(Event::S3 {
+            op: cas_op,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        assert!(
+            h.core.lease.epoch().is_none(),
+            "the sealed epoch is not served again"
+        );
+        assert!(h.core.lease.gate.is_none());
+        assert_eq!(h.core.stats.sealed_own_readoptions_dropped, 1);
+        // The next acquisition reads the lease the CAS wrote (a newer key
+        // than the sealer's) and claims epoch 2 at once.
+        let landed = written.clone();
+        let out = h.step(Event::Control {
+            op: OpId(701),
+            req: Control::Acquire,
+        });
+        let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((landed, tag())))),
+        });
+        let (_, claim) = claim_cas(&mut h, out).expect("a claim of the next epoch");
+        assert_eq!(claim.epoch, 2);
+    }
+
     /// Q13 amended (seal gap, sim `backup-strict+unsettled` 3967): the
     /// claimant read key K1 and sealed this holder; the lease then moved to
     /// K2 (this holder's renewal was in flight). The sealer's CAS on K1's

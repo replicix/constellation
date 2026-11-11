@@ -1966,6 +1966,10 @@ pub struct Stats {
     /// A claim CAS that wrote this node's own epoch although the node had
     /// sealed it (never: D7 makes it the takeover at the next epoch).
     pub sealed_own_epoch_rewrites: u64,
+    /// A re-adoption CAS of this node's own lease landed over an epoch that
+    /// a claimant's seal reached after the CAS went out: the lease is not
+    /// adopted (the sealed epoch is never served again).
+    pub sealed_own_readoptions_dropped: u64,
     /// Plan 46 M0.3 (G): of those, refusals that proved this node holds
     /// nothing of the epoch (`SealedTail::empty`).
     pub seal_tail_empty: u64,

@@ -5745,6 +5745,40 @@ fn regression_placement_hot_rollback_order_and_rebuilt_member_copies() {
     }
 }
 
+/// `backup-crash-slow+commit` seeds 204 and 1115 (`member_copies_drained`): a
+/// restarted holder's re-adoption CAS was in flight when a peer claimant's
+/// seal reached its epoch; the CAS landed and the node served the epoch it
+/// had sealed. The rows it acknowledged next were in no tail, and its
+/// self-sealed re-claim of the next epoch stranded them in a member copy that
+/// nothing ships or drops. The landed re-adoption is not adopted now
+/// (`sealed_own_readoptions_dropped`), and the node claims the next epoch from
+/// its member copy. Fails before: 4 (204) and 6 (1115) rows of epoch 1 stay
+/// on the claimant at convergence.
+#[test]
+fn regression_a_readoption_landing_after_a_seal_is_not_served() {
+    for seed in [204, 1115] {
+        let cfg = strict(
+            SimConfig {
+                s3_latency: (60, 200),
+                ..backup_crash_config()
+            },
+            "commit",
+        );
+        let r = run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=backup-crash-slow+commit")
+        });
+        assert_eq!(r.member_copy_rows_left, 0, "seed {seed}");
+        assert!(
+            r.stats
+                .values()
+                .map(|s| s.sealed_own_readoptions_dropped)
+                .sum::<u64>()
+                > 0,
+            "seed {seed}: the seal no longer reaches the re-adoption in flight"
+        );
+    }
+}
+
 /// `backup-crash-slow+commit` seed 64 (`member_copies_drained`): a holder
 /// that claimed its own lease (epoch 2) after its backups refused its epoch-1
 /// tail kept the member copy of two unshipped `Archive` rows of epoch 1 for
