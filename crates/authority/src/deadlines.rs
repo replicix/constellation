@@ -474,9 +474,10 @@ impl Deadlines {
         self.base.lock_ttl + 2 * self.base.margin <= self.base.lease_ttl
     }
 
-    /// The settle's cap, from its start: `max(until, start + span)`.
-    pub fn settle_cap(&self, start: u64, until: u64) -> u64 {
-        until.max(start + self.settle_cap_span)
+    /// The settle's cap, from its start: `max(until, start + span)`. The
+    /// readings are wait-clock ones, signed as the clock is.
+    pub fn settle_cap(&self, start: i64, until: i64) -> i64 {
+        until.max(start + self.settle_cap_span as i64)
     }
 
     /// When a delegate's generation lapses: two margins past its grant's end
