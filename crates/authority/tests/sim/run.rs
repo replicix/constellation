@@ -4764,19 +4764,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             ));
         }
         bucket.reach().configure(super::reach::ReachConfig {
+            dl: constellation_authority::deadlines::Deadlines::new(&core),
             p2p_delay_hi_ms: cfg.p2p_delay.1,
             s3_latency_hi_ms: cfg.s3_latency.1,
-            lease_ttl_ms: core.ttl_ms,
-            claim_grace_ms: 2 * core.backup_takeover_ms,
             lease_read_extra_ms: cfg.lease_reads.before.1 + cfg.lease_reads.reply.1,
             s3_latency_lo_ms: cfg.s3_latency.0,
             lease_read_extra_lo_ms: cfg.lease_reads.before.0 + cfg.lease_reads.reply.0,
             settle_retry_ms: core.acquire_retry_min_ms,
-            delegation_ttl_ms: core.delegation_ttl_ms,
-            expiry_margin_ms: core.expiry_margin_ms,
-            backup_takeover_ms: core.backup_takeover_ms,
-            recall_backoff_max_ms: constellation_authority::deadlines::Deadlines::new(&core)
-                .recall_backoff_max,
         });
     }
     bus.set_stream_faults(cfg.stream_faults.clone());

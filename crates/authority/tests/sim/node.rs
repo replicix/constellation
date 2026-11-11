@@ -2477,7 +2477,7 @@ impl Driver {
             return;
         }
         let until = self.clock.now().wait.0;
-        let threshold = (self.core.config().backup_takeover_ms as i64 / 8).max(1);
+        let threshold = self.core.dl_t().lag_threshold as i64;
         if until - from >= threshold {
             let from = self.own_lapse.map_or(from, |(f, _)| f.min(from));
             self.own_lapse = Some((from, until));
