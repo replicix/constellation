@@ -356,11 +356,28 @@ pub enum EventKind {
     /// moment after `apply_delegate_tx`, before the root's own backup
     /// stream).
     DelegateStream,
+    /// ADR-52: an own client's `Submit`. Unlike the others the step that
+    /// matches it is the stalled one: the stall begins at its clock read, as
+    /// a slow store write behind an op's admission does.
+    OwnSubmit,
 }
 
 impl EventKind {
+    /// Whether the matching event is itself the step that stalls (else the
+    /// step after it).
+    fn stalls_itself(&self) -> bool {
+        matches!(self, EventKind::OwnSubmit)
+    }
+
     fn matches(&self, event: &Event) -> bool {
         match self {
+            EventKind::OwnSubmit => matches!(
+                event,
+                Event::Submit {
+                    policy: Policy::Client,
+                    ..
+                }
+            ),
             EventKind::DelegateStream => matches!(
                 event,
                 Event::Peer {
@@ -2161,6 +2178,17 @@ impl Driver {
                     self.dispatch(actions);
                 }
             }
+            // ADR-52: a stall armed for the step of an own client's `Submit`
+            // is this step.
+            {
+                let mut armed = self.shared.stall_after.lock().unwrap();
+                if let Some((kind, ms)) = *armed {
+                    if kind.stalls_itself() && kind.matches(&event) {
+                        *armed = None;
+                        *self.shared.stall_next.lock().unwrap() = Some(ms);
+                    }
+                }
+            }
             // F1 (`StallStep`): this step's `now` is taken; then it waits
             // (in the store, or stopped), and decides with that `now`.
             let stall = self.shared.stall_next.lock().unwrap().take();
@@ -2169,6 +2197,7 @@ impl Driver {
                     node = self.id,
                     now = now.wall.0,
                     ms,
+                    event = ?event,
                     "sim: step stalled after its clock read"
                 );
                 // The step is stuck: the delegation renewal lane sees it
@@ -2263,7 +2292,7 @@ impl Driver {
             {
                 let mut armed = self.shared.stall_after.lock().unwrap();
                 if let Some((kind, ms)) = *armed {
-                    if kind.matches(&event) {
+                    if !kind.stalls_itself() && kind.matches(&event) {
                         *armed = None;
                         *self.shared.stall_next.lock().unwrap() = Some(ms);
                     }
@@ -3384,11 +3413,18 @@ impl Driver {
         tag: &LockTag,
         outcome: &MutateOutcome,
     ) -> Option<Vec<Action>> {
-        let class = self
-            .core
-            .root_commit(constellation_authority::core::Asker::Own);
+        // The row's own journaled class, as the engine reads it
+        // (`take_last_journaled`): the configuration may have changed since
+        // it was journaled (a peer joined), which `root_commit` would show.
+        let class = constellation_authority::Replica::journal_class_of_rid(&*self.meta, rid)
+            .map(|(_, class)| class)
+            .unwrap_or_else(|| {
+                self.core
+                    .root_commit(constellation_authority::core::Asker::Own)
+            });
         if !matches!(outcome, MutateOutcome::Accepted { .. })
             || !class.is_singleton()
+            || self.core.config().stale_lease_hold_off
             || self
                 .core
                 .lease()

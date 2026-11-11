@@ -331,6 +331,7 @@ fn replay_seed() {
         Ok("singleton-first-peer") => singleton_first_peer_config(),
         Ok("singleton-stale-roster") => singleton_stale_roster_config(),
         Ok("singleton-peer-join") => singleton_peer_join_config(),
+        Ok("singleton-stall-takeover") => singleton_stall_takeover_config(),
         Ok("backup-group-cut-ttl") => backup_group_cut_ttl_config(GroupCut::Both),
         Ok("backup-group-cut-ttl-holder-only") => backup_group_cut_ttl_config(GroupCut::HolderOnly),
         Ok("backup-group-cut-ttl-backup-only") => backup_group_cut_ttl_config(GroupCut::BackupOnly),
@@ -2818,6 +2819,46 @@ fn singleton_peer_join_config() -> SimConfig {
                     restart_ms: Some(8_000),
                     keep_journal: true,
                 },
+            },
+        ],
+        ..backup_config()
+    }
+}
+
+/// ADR-52 under ADR-50: a lone root (a singleton by its roster: nobody else
+/// is listed) whose core is stuck in a step across a peer's joining, the
+/// root lease's TTL and the peer's claim. The step took its `now` before
+/// the join; its core still believes it is alone (the join waits in its
+/// queue), so the answer it gives from the stalled step is a singleton's.
+/// The peer holds the tenure by then: the answer must not leave on a clock
+/// read at the step's start (I1, "expected singleton, committed by none").
+/// `stale_lease_hold_off` (the parent's behavior) must fail it.
+fn singleton_stall_takeover_config() -> SimConfig {
+    SimConfig {
+        nodes: 1,
+        ops_per_client: 400,
+        random_faults: 0,
+        // The singleton answers its own node's clients from its disk before
+        // the stall; the rollback the takeover then makes of the last of
+        // them (the accepted death-then-join window) is not what this
+        // checks: the answers given from inside the stalled step are.
+        strict_durability: false,
+        strict_commit: true,
+        // The fresh peer's own client: its forward finds the root stuck, and
+        // it takes the lease once the root has not renewed it.
+        joiner_client: Some((3_000, 30)),
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::StallStep {
+                    node: 0,
+                    for_ms: 25_000,
+                    after_event: Some(sim::node::EventKind::OwnSubmit),
+                },
+            },
+            ScheduledFault {
+                at_ms: 2_000,
+                kind: FaultKind::JoinFresh,
             },
         ],
         ..backup_config()
@@ -6862,6 +6903,7 @@ fn base_config(label: &str) -> SimConfig {
         "singleton-first-peer" => singleton_first_peer_config(),
         "singleton-stale-roster" => singleton_stale_roster_config(),
         "singleton-peer-join" => singleton_peer_join_config(),
+        "singleton-stall-takeover" => singleton_stall_takeover_config(),
         "backup-group-cut-ttl" => backup_group_cut_ttl_config(GroupCut::Both),
         "backup-group-cut-ttl-holder-only" => backup_group_cut_ttl_config(GroupCut::HolderOnly),
         "backup-group-cut-ttl-backup-only" => backup_group_cut_ttl_config(GroupCut::BackupOnly),
@@ -13485,6 +13527,20 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
             cross_ratio: 0.0,
             ..cfg
         },
+        // ADR-52's negative control: the singleton answer leaves without the
+        // fresh clock read (`Config::stale_lease_hold_off`), the core's and
+        // the fast path's.
+        "nohold" => {
+            let core = cfg.core.clone();
+            SimConfig {
+                core: std::sync::Arc::new(move |node, inc| {
+                    let mut c = core(node, inc);
+                    c.stale_lease_hold_off = true;
+                    c
+                }),
+                ..cfg
+            }
+        }
         "unclocked" => unclocked(cfg),
         // Plan 45 §12 O1: a requester installs an accepted reply even
         // when the sequencer evaluated it on state it has not applied
@@ -17659,19 +17715,34 @@ fn c0_count(map: &std::collections::BTreeMap<String, usize>, key: &str) -> usize
     map.get(key).copied().unwrap_or(0)
 }
 
-/// ADR-52 (lease6 triage F1), fail-before the stale-lease hold: a root
-/// stalled after its clock read answered its own client from its disk after
-/// a successor took the lease over (seeds 4 and 13: I1, "expected singleton,
-/// committed by none"; 23 the same shape). Its answers are now held for the
-/// archive or a usable lease, and in doubt once deposed.
+/// ADR-52 under ADR-50, fail-before the stale-lease hold
+/// (`singleton-stall-takeover`): a lone root (a singleton by its roster)
+/// stalled in a step across a peer's joining, the root lease's expiry and
+/// the peer's claim answered its own client from its disk alone after the
+/// peer held the tenure: I1, "expected singleton, committed by none". The
+/// control is the same seeds with the hold off
+/// (`Config::stale_lease_hold_off`, the parent's behavior), which must fail
+/// I1 on each; with the hold they pass, and the stalled step's answer is
+/// held. (ADR-50 took `delegated-core-stall-root-lease6` off the singleton
+/// path, where this was first found with seeds 4, 13 and 23: those no longer
+/// answer alone and pin nothing.)
 #[test]
-fn a_stalled_root_does_not_answer_after_its_lease_was_taken_over() {
+fn a_stalled_lone_root_does_not_answer_after_a_peer_took_the_lease() {
     let mut held = 0;
-    for seed in [4u64, 13, 23] {
-        let r = c0_run(
-            "delegated-core-stall-root-lease6+commit",
+    for seed in [1u64, 2, 5] {
+        let control = run_seed(
             seed,
-            strict(delegated_core_stall_root_lease6_config(), "commit"),
+            config_variant(singleton_stall_takeover_config(), "nohold"),
+        );
+        let why = control.expect_err("the control (hold off) passed: vacuous");
+        assert!(
+            why.contains("I1 acked_implies_committed") && why.contains("committed by none"),
+            "seed {seed}: the control failed, but not on I1: {why}"
+        );
+        let r = c0_run(
+            "singleton-stall-takeover+commit",
+            seed,
+            singleton_stall_takeover_config(),
         );
         held += r
             .stats
@@ -17679,7 +17750,7 @@ fn a_stalled_root_does_not_answer_after_its_lease_was_taken_over() {
             .map(|s| s.answers_held_stale_lease)
             .sum::<u64>();
     }
-    assert!(held > 0, "the replays never held an answer: vacuous");
+    assert!(held > 0, "the seeds never held an answer: vacuous");
 }
 
 /// Plan 46 M1.1 step 7: `strict_commit` is the default of a delegated
