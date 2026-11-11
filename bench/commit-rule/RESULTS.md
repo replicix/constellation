@@ -89,52 +89,50 @@ deadline. Their sweeps and oracle counts are in PROGRESS, not here.
 
 Cost of the rule: one clock read per `Singleton` answer in the core and one
 honour read per `Singleton` fast-path write (a lone root's own-client
-operations are the fast path). Measured on the quiet box with release builds,
-`ACK_LATENCY_TOPOLOGIES=1` (a lone root, own-client operations), five
-rounds of `run.sh --runs 5 --samples 300` per file system and tree (the
-parent of the change and the change, in alternating order, each round's
-medians), ext4, xfs and btrfs on separate devices, tmpfs under `/tmp`.
-Microseconds; each cell is the median over the five rounds of the round's
-p50, p90 and largest p99.
+operations are the fast path); after the review round, also two honour reads
+in the fast path's gate-off acknowledgement (only a row that waited under a
+durability gate takes it) and a clone of the close's commit inputs on a
+time-bounded lone root (so a stalled close can re-commit through the core).
+Measured with release builds, `ACK_LATENCY_TOPOLOGIES=1` (a lone root,
+own-client operations), `ACK_LATENCY_SAMPLES=300`, seven rounds per file
+system; each round runs three binaries in a rotating order: the parent of the
+change (`base`), a second copy of the same parent binary (`base'`, the A/A:
+the noise of a cell) and the change (`new`). ext4, xfs and btrfs on separate
+partitions of one device, tmpfs under `/tmp`. The box was shared with other
+jobs during the runs (1-minute load 15 to 32), so the noise is larger than on
+a quiet box; the A/A shows how large. Microseconds; each cell is the median
+over the seven rounds of the round's p50, p90 and p99; `d` is against `base`.
 
-| fs | op | rounds | base p50/p90/p99 | new p50/p90/p99 | d p50 | d p90 |
-|---|---|---:|---|---|---:|---:|
-| ext4 | create | 5 | 82 / 101 / 898 | 86 / 110 / 926 | +4 | +9 |
-| ext4 | rename | 5 | 89 / 116 / 1108 | 91 / 122 / 1149 | +2 | +6 |
-| ext4 | unlink | 5 | 62 / 85 / 1157 | 65 / 88 / 1085 | +3 | +3 |
-| ext4 | chmod | 5 | 36 / 60 / 988 | 48 / 80 / 914 | +12 | +20 |
-| ext4 | write | 5 | 3117 / 4016 / 5251 | 3119 / 4011 / 6530 | +2 | -5 |
-| xfs | create | 5 | 86 / 110 / 195 | 84 / 113 / 193 | -2 | +3 |
-| xfs | rename | 5 | 89 / 121 / 205 | 72 / 99 / 186 | -17 | -22 |
-| xfs | unlink | 5 | 60 / 97 / 177 | 60 / 88 / 168 | +0 | -9 |
-| xfs | chmod | 5 | 35 / 61 / 136 | 35 / 61 / 125 | +0 | +0 |
-| xfs | write | 5 | 1955 / 2064 / 2730 | 1951 / 2064 / 2810 | -4 | +0 |
-| btrfs | create | 5 | 89 / 116 / 187 | 86 / 105 / 174 | -3 | -11 |
-| btrfs | rename | 5 | 92 / 128 / 194 | 77 / 100 / 180 | -15 | -28 |
-| btrfs | unlink | 5 | 70 / 99 / 158 | 58 / 81 / 149 | -12 | -18 |
-| btrfs | chmod | 5 | 42 / 75 / 127 | 37 / 66 / 125 | -5 | -9 |
-| btrfs | write | 5 | 3097 / 3797 / 4307 | 3084 / 3805 / 4784 | -13 | +8 |
-| tmpfs | create | 5 | 83 / 105 / 175 | 85 / 107 / 216 | +2 | +2 |
-| tmpfs | rename | 5 | 68 / 92 / 336 | 79 / 125 / 397 | +11 | +33 |
-| tmpfs | unlink | 5 | 56 / 84 / 172 | 68 / 110 / 220 | +12 | +26 |
-| tmpfs | chmod | 5 | 35 / 62 / 144 | 35 / 65 / 147 | +0 | +3 |
-| tmpfs | write | 5 | 129 / 200 / 1045 | 129 / 189 / 951 | +0 | -11 |
+| fs | op | n | base p50/p90/p99 | base' (A/A) p50/p90/p99 | new p50/p90/p99 | A/A d p50 | A/A d p90 | new d p50 | new d p90 |
+|---|---|--:|---|---|---|--:|--:|--:|--:|
+| ext4 | create | 7 | 88 / 121 / 565 | 83 / 101 / 166 | 69 / 97 / 131 | -5 | -20 | -19 | -24 |
+| ext4 | rename | 7 | 70 / 107 / 961 | 99 / 136 / 1043 | 75 / 106 / 1078 | +29 | +29 | +5 | -1 |
+| ext4 | unlink | 7 | 56 / 85 / 997 | 69 / 110 / 1035 | 59 / 86 / 870 | +13 | +25 | +3 | +1 |
+| ext4 | chmod | 7 | 37 / 63 / 609 | 46 / 86 / 686 | 35 / 66 / 405 | +9 | +23 | -2 | +3 |
+| ext4 | write | 7 | 3084 / 3953 / 4893 | 3113 / 4038 / 4864 | 3091 / 3999 / 4956 | +29 | +85 | +7 | +46 |
+| xfs | create | 7 | 74 / 102 / 199 | 83 / 115 / 256 | 79 / 106 / 177 | +9 | +13 | +5 | +4 |
+| xfs | rename | 7 | 71 / 123 / 230 | 72 / 98 / 182 | 80 / 118 / 241 | +1 | -25 | +9 | -5 |
+| xfs | unlink | 7 | 57 / 88 / 155 | 56 / 89 / 138 | 58 / 108 / 155 | -1 | +1 | +1 | +20 |
+| xfs | chmod | 7 | 37 / 67 / 111 | 37 / 66 / 87 | 37 / 69 / 108 | +0 | -1 | +0 | +2 |
+| xfs | write | 7 | 1978 / 2108 / 3256 | 1991 / 2125 / 3353 | 2011 / 2181 / 3931 | +13 | +17 | +33 | +73 |
+| btrfs | create | 7 | 86 / 122 / 187 | 63 / 80 / 125 | 65 / 92 / 138 | -23 | -42 | -21 | -30 |
+| btrfs | rename | 7 | 71 / 105 / 152 | 73 / 109 / 185 | 74 / 103 / 184 | +2 | +4 | +3 | -2 |
+| btrfs | unlink | 7 | 58 / 93 / 153 | 59 / 90 / 122 | 59 / 91 / 154 | +1 | -3 | +1 | -2 |
+| btrfs | chmod | 7 | 37 / 70 / 116 | 36 / 67 / 109 | 38 / 72 / 116 | -1 | -3 | +1 | +2 |
+| btrfs | write | 7 | 3070 / 3799 / 4017 | 3087 / 3796 / 4171 | 3070 / 3807 / 4124 | +17 | -3 | +0 | +8 |
+| tmpfs | create | 7 | 84 / 107 / 217 | 82 / 101 / 168 | 84 / 103 / 149 | -2 | -6 | +0 | -4 |
+| tmpfs | rename | 7 | 71 / 107 / 188 | 74 / 114 / 225 | 66 / 92 / 205 | +3 | +7 | -5 | -15 |
+| tmpfs | unlink | 7 | 57 / 85 / 134 | 60 / 108 / 177 | 57 / 91 / 202 | +3 | +23 | +0 | +6 |
+| tmpfs | chmod | 7 | 35 / 64 / 98 | 37 / 80 / 130 | 37 / 67 / 102 | +2 | +16 | +2 | +3 |
+| tmpfs | write | 7 | 118 / 183 / 338 | 133 / 218 / 411 | 132 / 196 / 466 | +15 | +35 | +14 | +13 |
 
-The same protocol with the parent's binary on both sides (an A/A, five rounds,
-the two copies in alternating order) shows the run-to-run noise of a cell:
-
-| fs | op | A p50/p90 | A' p50/p90 | d p50 | d p90 |
-|---|---|---|---|---:|---:|
-| ext4 | create | 80 / 105 | 89 / 111 | +9 | +6 |
-| ext4 | rename | 84 / 113 | 83 / 114 | -1 | +1 |
-| ext4 | unlink | 66 / 105 | 60 / 89 | -6 | -16 |
-| ext4 | chmod | 39 / 62 | 36 / 63 | -3 | +1 |
-| tmpfs | create | 84 / 101 | 88 / 118 | +4 | +17 |
-| tmpfs | rename | 69 / 99 | 80 / 120 | +11 | +21 |
-| tmpfs | unlink | 55 / 92 | 60 / 94 | +5 | +2 |
-| tmpfs | chmod | 35 / 65 | 35 / 62 | +0 | -3 |
-
-The changes in `create`, the answer the plan gates, are inside that noise on
-every file system (+4/+9 ext4, -2/+3 xfs, -3/-11 btrfs, +2/+2 tmpfs); the other
-operations move both ways by as much between identical binaries. Neutral on
+Reading: every cell of `new` is inside the spread the A/A shows for its own
+cell or for the same operation on another file system (the A/A moves by as much
+as -42 to +85 µs; `new` by -30 to +73, the largest being the 2 ms `write` of xfs,
++33 µs or 1.7% at p50, where a single honour read cannot be 33 µs).
+The two cells the first measurement (five rounds, no xfs or btrfs A/A) flagged,
+ext4 `chmod` (+12/+20 then) and tmpfs `unlink` (+12/+26 then), are -2/+3 and
++0/+6 now, against A/A of +9/+23 and +3/+23: that was box noise. `create`, the
+answer the plan gates, is -19/-24 (ext4), +5/+4 (xfs), -21/-30 (btrfs) and
++0/-4 (tmpfs), the btrfs and ext4 gains being the A/A's own spread. Neutral on
 all four file systems.
