@@ -305,6 +305,9 @@ pub enum PutBatch {
     AlreadyOurs,
 }
 
+/// Batches [`InboxStore::drain_below`] fetches at once.
+const DRAIN_GET_WIDTH: usize = 16;
+
 /// Batch I/O for one filesystem's `inbox/` prefix.
 #[derive(Clone)]
 pub struct InboxStore {
@@ -516,16 +519,23 @@ impl InboxStore {
     /// LIST and its GET (the old holder's late GC, or its requester
     /// re-submitting) is simply not returned.
     pub async fn drain_below(&self, epoch: u64) -> Result<Vec<InboxBatch>, StoreError> {
-        let mut out = Vec::new();
-        for key in self.list_all().await? {
-            if key.epoch >= epoch {
-                break;
-            }
-            if let Some(batch) = self.get_batch(key).await? {
-                out.push(batch);
-            }
-        }
-        Ok(out)
+        use futures::StreamExt;
+        let keys: Vec<InboxKey> = self
+            .list_all()
+            .await?
+            .into_iter()
+            .take_while(|k| k.epoch < epoch)
+            .collect();
+        // The GETs go out together (the order of `keys` is kept): the gate
+        // is closed while they are outstanding, and one after another their
+        // latencies add up past the lease's TTL (the claimant then loses the
+        // lease with its view closed and the next one repeats it).
+        futures::stream::iter(keys)
+            .map(|key| self.get_batch(key))
+            .buffered(DRAIN_GET_WIDTH)
+            .try_filter_map(|batch| async move { Ok(batch) })
+            .try_collect()
+            .await
     }
 
     /// Withdraw a batch: overwrite it, unconditionally, with `tombstone`
@@ -1434,6 +1444,118 @@ mod tests {
         ) -> object_store::Result<()> {
             self.inner.copy_opts(from, to, options).await
         }
+    }
+
+    /// A store whose GETs take `delay` each and count the ones in flight.
+    struct SlowGets {
+        inner: InMemory,
+        delay: std::time::Duration,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+    }
+
+    impl std::fmt::Display for SlowGets {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SlowGets")
+        }
+    }
+
+    impl std::fmt::Debug for SlowGets {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SlowGets")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for SlowGets {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            let got = self.inner.get_opts(location, options).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            got
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// The takeover gate is closed while the drain runs: its GETs go out
+    /// together, so that a backlog costs about one read, not one per batch
+    /// (the lease's TTL is fixed). Order is kept. Fails with GETs one after
+    /// another (at most one in flight).
+    #[tokio::test]
+    async fn the_drain_fetches_the_older_batches_together_in_order() {
+        let raw = Arc::new(SlowGets {
+            inner: InMemory::new(),
+            delay: std::time::Duration::from_millis(50),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        });
+        let s = InboxStore::new(raw.clone());
+        for n in 0..6u64 {
+            s.put_batch(&batch(1, 5, n, vec![op(5, n)])).await.unwrap();
+        }
+        let started = std::time::Instant::now();
+        let drained = s.drain_below(2).await.unwrap();
+        let took = started.elapsed();
+        assert_eq!(
+            drained.iter().map(|b| b.n).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5],
+            "in key order"
+        );
+        assert!(
+            raw.max_in_flight.load(Ordering::SeqCst) > 1,
+            "the GETs were one after another"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(250),
+            "six 50 ms reads took {took:?}"
+        );
     }
 
     #[tokio::test]
