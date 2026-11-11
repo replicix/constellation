@@ -1765,6 +1765,7 @@ impl Core {
                 outcome: MutateOutcome::Held {
                     retry_ms: self.cfg.held_retry_ms,
                     outwait_ms: None,
+                    lost_chunk: false,
                 },
                 base: None,
                 position: Position::ZERO,
@@ -1859,6 +1860,16 @@ impl Core {
                 .map(|end| (end.0 - now.wait.0).max(0) as u64),
             _ => None,
         };
+        // ADR-58 C3: an answer waiting for the durability of a row that the
+        // ship plan holds behind a lost chunk says so.
+        let lost_chunk = match self.rd.parked.get(&id) {
+            Some(Parked {
+                what: ParkedWhat::Reply { rid, .. } | ParkedWhat::ExecuteReply { rid, .. },
+                durable: Some(_),
+                ..
+            }) => replica.rid_behind_lost_chunk(*rid),
+            _ => false,
+        };
         let (to, req, held_timer, durable, gen) = match self.rd.parked.get_mut(&id) {
             Some(Parked {
                 what:
@@ -1903,6 +1914,7 @@ impl Core {
                     outcome: MutateOutcome::Held {
                         retry_ms,
                         outwait_ms,
+                        lost_chunk,
                     },
                     base: None,
                     position: Position::ZERO,
@@ -2535,6 +2547,7 @@ impl Core {
                                     outcome: MutateOutcome::Held {
                                         retry_ms: self.cfg.recall_hold_ms.max(50),
                                         outwait_ms: None,
+                                        lost_chunk: false,
                                     },
                                     base: None,
                                     position: Position::ZERO,

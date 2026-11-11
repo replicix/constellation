@@ -149,6 +149,10 @@ pub(crate) struct ClientOp {
     /// sent on, so it may have run): its in-doubt end is I4's exception for
     /// an unreachable non-stealable holder (`unsettled_nonstealable_holder`).
     pub designation_held: bool,
+    /// ADR-58 C3: this op's settle heard a `Held` that said its row is held
+    /// behind a lost chunk: its unsettled `EIO` is labelled
+    /// `held-behind-lost-chunk` (`take_unsettled_lost_chunk`).
+    pub lost_chunk_held: bool,
     /// A delegate executed the op and said so (`Accepted` with its
     /// generation): what the op still lacks is the commit of the delegate's
     /// rows through the root (it awaits the log). The sim judges its
@@ -787,6 +791,7 @@ impl Core {
                 durable_grace: false,
                 gate_recall_wait: false,
                 designation_held: false,
+                lost_chunk_held: false,
                 accepted_by_delegate: false,
                 settle_withdraw_failed: false,
                 withdraw: None,
@@ -1963,7 +1968,13 @@ impl Core {
             MutateOutcome::Held {
                 retry_ms,
                 outwait_ms,
+                lost_chunk,
             } => {
+                if lost_chunk || self.cfg.lost_chunk_label_always {
+                    if let Some(c) = self.clients.get_mut(&rid).filter(|c| c.settle) {
+                        c.lost_chunk_held = true;
+                    }
+                }
                 // Plan 30 §M8: executed; the holder is recalling read
                 // delegations before it acknowledges. Ask again (same
                 // rid, no attempt spent) — the holder answers from its
@@ -3039,6 +3050,7 @@ impl Core {
             return MutateOutcome::Held {
                 retry_ms: 0,
                 outwait_ms: None,
+                lost_chunk: false,
             };
         }
         self.execute_local(now, rid, epoch, replica, out)
@@ -5083,6 +5095,13 @@ impl Core {
         self.unsettled_accepted_rids.remove(&rid)
     }
 
+    /// ADR-58 C3: whether `rid`'s unsettled `EIO` was one whose settle heard
+    /// that the op's row is held behind a lost chunk
+    /// (`ClientOp::lost_chunk_held`); taken once.
+    pub fn take_unsettled_lost_chunk(&mut self, rid: Rid) -> bool {
+        self.unsettled_lost_chunk_rids.remove(&rid)
+    }
+
     /// Late-landing U1(a): whether `rid`'s in-doubt answer was one of an op
     /// whose settle could not write a tombstone over its inbox batch
     /// (`ClientOp::settle_withdraw_failed`): the batch may still be drained,
@@ -5150,6 +5169,22 @@ impl Core {
                         .next()
                         .expect("non-empty");
                     self.unsettled_accepted_rids.remove(&first);
+                }
+            }
+            // (A requester that is the sequencer itself, settling its own
+            // op, hears no `Held`: its own ship plan says it.)
+            if c.lost_chunk_held || replica.rid_behind_lost_chunk(rid) {
+                self.stats.unsettled_held_lost_chunk += 1;
+                if self.track_unsettled_designation {
+                    self.unsettled_lost_chunk_rids.insert(rid);
+                }
+                while self.unsettled_lost_chunk_rids.len() > MAX_IN_DOUBT_RIDS {
+                    let first = *self
+                        .unsettled_lost_chunk_rids
+                        .iter()
+                        .next()
+                        .expect("non-empty");
+                    self.unsettled_lost_chunk_rids.remove(&first);
                 }
             }
             if c.designation_held {

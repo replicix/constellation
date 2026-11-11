@@ -124,6 +124,9 @@ pub trait Replica {
     /// a deferred transaction they depend on (`JournalTx::observed`).
     fn journal_refusal(&self, rid: Rid, code: Code, op: Option<&MutateOp>)
         -> Result<(), MetaError>;
+    /// ADR-58 C3: whether the ship plan holds or defers `rid`'s transaction
+    /// for a chunk that is not durable (`Meta::rid_behind_lost_chunk`).
+    fn rid_behind_lost_chunk(&self, rid: Rid) -> bool;
     /// The journal seq the next row lands at, and the highest shipped.
     fn journal_next_seq(&self) -> Result<u64, MetaError>;
     fn journal_acked_seq(&self) -> Result<u64, MetaError>;
@@ -1030,6 +1033,10 @@ impl Replica for Meta {
         op: Option<&MutateOp>,
     ) -> Result<(), MetaError> {
         Meta::journal_refusal(self, rid, code, op)
+    }
+
+    fn rid_behind_lost_chunk(&self, rid: Rid) -> bool {
+        Meta::rid_behind_lost_chunk(self, rid)
     }
 
     fn journal_next_seq(&self) -> Result<u64, MetaError> {

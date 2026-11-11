@@ -2959,6 +2959,7 @@ impl Core {
                         outcome: MutateOutcome::Held {
                             retry_ms: left.min(self.cfg.forward_timeout_ms).max(1),
                             outwait_ms: None,
+                            lost_chunk: false,
                         },
                         base: None,
                         position: Position::ZERO,
@@ -3256,6 +3257,7 @@ impl Core {
                         outcome: MutateOutcome::Held {
                             retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
                             outwait_ms: None,
+                            lost_chunk: false,
                         },
                         base: None,
                         position: Position::ZERO,
@@ -5283,6 +5285,7 @@ impl Core {
                                 outcome: MutateOutcome::Held {
                                     retry_ms: self.cfg.recall_hold_ms.max(50),
                                     outwait_ms: None,
+                                    lost_chunk: false,
                                 },
                                 base: None,
                                 position: Position::ZERO,

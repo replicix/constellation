@@ -245,6 +245,14 @@ pub enum MutateOutcome {
         /// settling requester moves its second deadline past it (never
         /// shorter, capped); `None` for every other hold.
         outwait_ms: Option<u64>,
+        /// ADR-58 C3: the op's row (the answer's durability wait) sits in a
+        /// held or deferred transaction of the root's journal: it waits for
+        /// a chunk that is not durable (plan 30 §M4), and no sequencer can
+        /// settle the rid until the chunk comes back or the operator's
+        /// `repair drop-held`. A requester whose settle hears it labels the
+        /// unsettled `EIO` `held-behind-lost-chunk`, which the sim's oracle
+        /// accepts only if a chunk is really lost.
+        lost_chunk: bool,
     },
     /// Plan 30 §M14 phase 2 (the fencing token): refused because a grant
     /// the op was issued under is no longer live at the executor

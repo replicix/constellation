@@ -59,6 +59,8 @@ pub struct ChunkWorld {
     /// Segments that named a chunk S3 did not hold when they were put.
     pub violations: Mutex<Vec<String>>,
     pub writes: AtomicU64,
+    /// Chunks `lose_dirty` took off a disk (a fault).
+    pub lost: AtomicU64,
     pub uploaded: AtomicU64,
     pub remote_enrolled: AtomicU64,
     pub remote_acked: AtomicU64,
@@ -125,11 +127,30 @@ impl ChunkWorld {
     /// next upload pass finds the bytes nowhere and marks them
     /// unrecoverable (`store::held`). Returns how many it lost.
     pub fn lose_dirty(&self, node: NodeId) -> usize {
-        self.dirty
+        let lost = self
+            .dirty
             .lock()
             .unwrap()
             .remove(&node)
-            .map_or(0, |lost| lost.len())
+            .map_or(0, |lost| lost.len());
+        self.lost.fetch_add(lost as u64, Ordering::Relaxed);
+        lost
+    }
+
+    /// ADR-58 C3's global truth: some chunk exists nowhere now: lost from a
+    /// disk (`lose_dirty`), or dirty only on a node gone for good and in no
+    /// bucket.
+    pub fn has_lost_chunk(&self) -> bool {
+        if self.lost.load(Ordering::Relaxed) > 0 {
+            return true;
+        }
+        let gone = self.gone.lock().unwrap().clone();
+        let s3 = self.s3.lock().unwrap();
+        self.dirty
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(node, chunks)| gone.contains(node) && chunks.iter().any(|c| !s3.contains(c)))
     }
 
     pub fn in_s3(&self, hash: &ChunkHash) -> bool {

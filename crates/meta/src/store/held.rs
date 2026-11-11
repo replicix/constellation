@@ -323,6 +323,9 @@ pub struct HeldSummary {
     /// Plan 30 §M7: transactions deferred (not held) because a chunk
     /// their manifest names is still uploading.
     pub deferred: u64,
+    /// ADR-58 C3: the rids of the held and the deferred transactions: those
+    /// that wait for a chunk that is not durable (`Meta::rid_behind_lost_chunk`).
+    pub rids: BTreeSet<crate::rid::Rid>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -577,6 +580,8 @@ type Held = (Tx, Vec<Ino>, Option<Vec<Vec<u8>>>);
 struct Plan {
     ship: Vec<Tx>,
     held: Vec<Held>,
+    /// The rid of each held or deferred transaction that has one.
+    held_rids: Vec<crate::rid::Rid>,
     deferred: Vec<Tx>,
     opaque: bool,
     /// With [`Blame`]: the blame of every held or deferred transaction
@@ -828,6 +833,7 @@ fn plan(
     let mut out = Plan {
         ship: Vec::new(),
         held: Vec::new(),
+        held_rids: Vec::new(),
         deferred: Vec::new(),
         opaque: false,
         blame: BTreeMap::new(),
@@ -839,6 +845,7 @@ fn plan(
         let found = blame
             .and_then(|b| b.rid)
             .is_some_and(|rid| tx_rid(&tx, row.as_ref()) == Some(rid));
+        let rid = tx_rid(&tx, row.as_ref());
         let observed: Vec<Vec<u8>> = row.map(|row| row.observed).unwrap_or_default();
         let (class, seeds, mine) = walk.step(
             &tx,
@@ -854,8 +861,14 @@ fn plan(
             out.found = Some((tx.first, tx.last));
         }
         match class {
-            Class::Held => out.held.push((tx, seeds, keys)),
-            Class::Deferred => out.deferred.push(tx),
+            Class::Held => {
+                out.held_rids.extend(rid);
+                out.held.push((tx, seeds, keys))
+            }
+            Class::Deferred => {
+                out.held_rids.extend(rid);
+                out.deferred.push(tx)
+            }
             Class::Ship => out.ship.push(tx),
         }
         if found {
@@ -1095,6 +1108,7 @@ fn summarize(plan: &Plan, poisoned: &PoisonMap) -> HeldSummary {
         inodes,
         opaque: plan.opaque,
         deferred: plan.deferred.len() as u64,
+        rids: plan.held_rids.iter().copied().collect(),
     }
 }
 
@@ -1254,6 +1268,15 @@ impl Meta {
     /// poisoned). In memory, refreshed by every ship plan.
     pub fn held_summary(&self) -> HeldSummary {
         self.held.lock().unwrap().clone()
+    }
+
+    /// ADR-58 C3: whether the last ship plan holds or defers `rid`'s
+    /// transaction: its row waits for a chunk that is not durable anywhere
+    /// the root can reach (poisoned, or pending on a member that may never
+    /// return). The sim's oracle decides, from its chunk ledger, whether
+    /// that chunk is lost. As fresh as the last ship round.
+    pub fn rid_behind_lost_chunk(&self, rid: crate::rid::Rid) -> bool {
+        self.held.lock().unwrap().rids.contains(&rid)
     }
 
     /// `constellation repair drop-held <ino>` (see the module doc's
