@@ -2941,6 +2941,7 @@ impl Core {
                 if self.inbox.holder.is_some() {
                     self.inbox_holder_tick(now, replica, &mut out);
                 }
+                self.kept_roster_arrived(now, replica, &mut out);
             }
             Event::Peers {
                 registry_complete,

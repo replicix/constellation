@@ -47,8 +47,8 @@ use serde::{Deserialize, Serialize};
 const KV_BACKUP_ROLE: &str = "backup_role";
 const KV_BACKUP_SEALED: &str = "backup_sealed";
 /// ADR-51: the `(epoch, source)` streams this node sealed for a claimant's
-/// kept fetch, as `epoch:source` pairs joined by commas.
-const KV_SEALED_STREAMS: &str = "sealed_streams";
+/// kept fetch, as `holder:epoch` pairs joined by commas.
+const KV_SEALED_TENURES: &str = "sealed_tenures";
 
 /// One holder journal transaction as streamed to a backup: its rows
 /// `first..=last` and their records, in order. Whole transactions only
@@ -465,37 +465,39 @@ impl Meta {
             .unwrap_or(0))
     }
 
-    /// ADR-51: the streams `(epoch, source)` this node sealed for a
-    /// claimant's kept fetch, ascending.
-    pub fn sealed_streams(&self) -> Result<Vec<(u64, u64)>, MetaError> {
+    /// ADR-51: the lease tenures `(holder, lease epoch)` this node sealed for
+    /// a claimant's kept fetch, ascending. The refusal is keyed on the
+    /// tenure, never on a stream: a successor's own tenure at a later epoch
+    /// is not affected (spec §3.5 step 5, amended).
+    pub fn sealed_tenures(&self) -> Result<Vec<(u64, u64)>, MetaError> {
         #[cfg(any(test, feature = "test-util"))]
         read_fault::check()?;
         let r = self.db.read_tx();
-        Ok(parse_sealed_streams(
-            kv_get_tx(&r, &self.local, KV_SEALED_STREAMS)?.as_deref(),
+        Ok(parse_sealed_tenures(
+            kv_get_tx(&r, &self.local, KV_SEALED_TENURES)?.as_deref(),
         ))
     }
 
-    /// ADR-51: whether stream `(epoch, source)` is sealed here.
-    pub fn stream_sealed(&self, epoch: u64, source: u64) -> Result<bool, MetaError> {
-        Ok(self.sealed_streams()?.contains(&(epoch, source)))
+    /// ADR-51: whether the tenure `(holder, epoch)` is sealed here.
+    pub fn tenure_sealed(&self, holder: u64, epoch: u64) -> Result<bool, MetaError> {
+        Ok(self.sealed_tenures()?.contains(&(holder, epoch)))
     }
 
-    /// ADR-51: seal the streams `(epoch, source)`: persisted and synced
-    /// before the caller answers the claimant (K4, per stream: a later epoch
-    /// of the same source is not affected).
-    pub fn seal_streams(&self, streams: &[(u64, u64)]) -> Result<(), MetaError> {
+    /// ADR-51: seal the tenures `(holder, epoch)`: persisted and synced
+    /// before the caller answers the claimant (K4: after the answer, the
+    /// tenure's hold streams install nothing here).
+    pub fn seal_tenures(&self, tenures: &[(u64, u64)]) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         let mut all =
-            parse_sealed_streams(kv_get_tx(&tx, &self.local, KV_SEALED_STREAMS)?.as_deref());
+            parse_sealed_tenures(kv_get_tx(&tx, &self.local, KV_SEALED_TENURES)?.as_deref());
         let before = all.len();
-        all.extend_from_slice(streams);
+        all.extend_from_slice(tenures);
         all.sort_unstable();
         all.dedup();
         let grows = all.len() > before;
         if grows {
-            let text: Vec<String> = all.iter().map(|(e, s)| format!("{e}:{s}")).collect();
-            kv_set_tx(&mut tx, &self.local, KV_SEALED_STREAMS, &text.join(","));
+            let text: Vec<String> = all.iter().map(|(h, e)| format!("{h}:{e}")).collect();
+            kv_set_tx(&mut tx, &self.local, KV_SEALED_TENURES, &text.join(","));
         }
         tx.commit()?;
         if grows {
@@ -527,7 +529,7 @@ impl Meta {
 
 // ------------------------------------------- plan 30 §M11 phase 2b: delegate backups
 
-fn parse_sealed_streams(text: Option<&str>) -> Vec<(u64, u64)> {
+fn parse_sealed_tenures(text: Option<&str>) -> Vec<(u64, u64)> {
     text.unwrap_or("")
         .split(',')
         .filter_map(|p| {
@@ -1259,22 +1261,23 @@ mod durability_tests {
         );
     }
 
-    /// ADR-51 (K4 per stream): a sealed stream is persisted and listed; a
-    /// later epoch from the same node, and the same epoch from another, are
-    /// not sealed. Fails on the parent: there is no per-stream seal.
+    /// ADR-51 (K4, keyed on the tenure): a sealed tenure is persisted and
+    /// listed; the same holder's next tenure, and another holder's tenure at
+    /// the same epoch, are not sealed. Fails on the parent: there is no
+    /// tenure seal.
     #[test]
-    fn a_sealed_stream_is_listed_and_a_later_epoch_from_the_same_node_is_not() {
+    fn a_sealed_tenure_is_listed_and_the_next_tenure_of_the_same_node_is_not() {
         let meta = Meta::open_in_memory().unwrap();
-        assert!(meta.sealed_streams().unwrap().is_empty());
-        meta.seal_streams(&[(5, 2), (6, 3), (5, 2)]).unwrap();
-        assert_eq!(meta.sealed_streams().unwrap(), vec![(5, 2), (6, 3)]);
-        assert!(meta.stream_sealed(5, 2).unwrap());
-        assert!(meta.stream_sealed(6, 3).unwrap());
+        assert!(meta.sealed_tenures().unwrap().is_empty());
+        meta.seal_tenures(&[(2, 5), (3, 6), (2, 5)]).unwrap();
+        assert_eq!(meta.sealed_tenures().unwrap(), vec![(2, 5), (3, 6)]);
+        assert!(meta.tenure_sealed(2, 5).unwrap());
+        assert!(meta.tenure_sealed(3, 6).unwrap());
         assert!(
-            !meta.stream_sealed(6, 2).unwrap(),
-            "a later epoch of node 2"
+            !meta.tenure_sealed(2, 6).unwrap(),
+            "the next tenure of node 2"
         );
-        assert!(!meta.stream_sealed(5, 3).unwrap(), "another node's epoch 5");
+        assert!(!meta.tenure_sealed(3, 5).unwrap(), "another node's epoch 5");
         // The role seal is separate.
         assert_eq!(meta.backup_sealed_epoch().unwrap(), 0);
     }

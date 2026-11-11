@@ -376,15 +376,16 @@ impl Core {
             .iter()
             .flat_map(|s| [(lease_epoch, *s), (lease_epoch + 1, *s)])
             .collect();
-        if streams
-            .iter()
-            .any(|st| !self.bk.sealed_streams.contains(st))
-        {
-            if !replica.seal_streams(&streams) {
+        // The tenure is what is sealed, not its streams: the successor's own
+        // tenure at `lease_epoch + 1` (the sealed holder's re-claim, or a
+        // member's claim) shares the stream keys `(lease_epoch + 1, s)` and
+        // must be acknowledged as any other.
+        if !self.bk.sealed_tenures.contains(&(holder, lease_epoch)) {
+            if !replica.seal_tenures(&[(holder, lease_epoch)]) {
                 self.bk.seal_unreadable = true;
                 return KeptSeal::Unreadable;
             }
-            self.bk.sealed_streams.extend(streams.iter().copied());
+            self.bk.sealed_tenures.insert((holder, lease_epoch));
         }
         let mut by_first: BTreeMap<u64, BackupTx> = BTreeMap::new();
         let mut unreadable = false;
@@ -916,6 +917,13 @@ impl Core {
             self.on_kept_window_ended(now, replica, out);
             return true;
         }
+        if self.bk.kept_roster_wait.take().is_some() {
+            // No roster read arrived in the window: the attempt ends and the
+            // ops behind the claim retry.
+            self.bk.tf_round = None;
+            self.end_tail_fetch_attempt(now, replica, out);
+            return true;
+        }
         self.bk.tf_round = None;
         if let Some(tf) = self.bk.tf.as_mut() {
             tf.timer = None;
@@ -936,6 +944,9 @@ impl Core {
             }
         }
         if let Some(t) = self.bk.kept.take().and_then(|k| k.timer) {
+            self.cancel_timer(t, out);
+        }
+        if let Some((_, t)) = self.bk.kept_roster_wait.take() {
             self.cancel_timer(t, out);
         }
         self.bk.tf_round = None;

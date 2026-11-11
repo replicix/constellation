@@ -32,6 +32,7 @@
 //! (`InheritedTail::kept`) is collected the same way by a later claimant,
 //! from every member it names.
 
+use super::lease::Plan;
 use super::seal_tail::{FetchedTail, KeptFields, KeptSeal};
 use super::Core;
 use crate::action::{Action, S3Op};
@@ -61,19 +62,28 @@ pub(crate) struct Target {
     /// The union a lease names (`InheritedTail::kept`): its members and
     /// `through`. `None`: the previous holder's own tenure.
     pub union: Option<(Vec<NodeId>, u64)>,
+    /// The claimant is the tenure's holder (the carrier re-adopting its own
+    /// lease after it handed its hold over): its rows of the tenure's own
+    /// epoch are in its journal, only the transferee's streams one epoch up
+    /// are collected.
+    pub own: bool,
 }
 
 impl Target {
     /// The stream epochs collected for the tenure: its own, and the one a
     /// hold handed to a transferee journals under (`epoch_hold_epoch_for`).
     pub(crate) fn epochs(&self) -> Vec<Epoch> {
-        vec![self.tenure.1, self.tenure.1 + 1]
+        if self.own {
+            vec![self.tenure.1 + 1]
+        } else {
+            vec![self.tenure.1, self.tenure.1 + 1]
+        }
     }
 
     /// The epochs a node's answer must cover: the previous holder is asked
     /// for its own journal of the tenure's epoch only.
     fn required(&self, ti: usize, node: NodeId) -> Vec<Epoch> {
-        if ti == 0 && node == self.tenure.0 {
+        if ti == 0 && node == self.tenure.0 && !self.own {
             vec![self.tenure.1]
         } else {
             self.epochs()
@@ -118,30 +128,46 @@ pub(crate) struct KeptUnion {
 impl Core {
     /// Whether a marker takeover of `prev` runs the kept phase. Not for the
     /// claim of a lease nobody held or that was released (a release follows
-    /// a flush), this node's own lease (its rows are in its journal: the
-    /// hold owner's own re-claim, a restart's re-adoption), the negative
-    /// control, the re-claim of the hold owner that closed the epoch, and a union already installed by an earlier pass of this
-    /// claim (the promise re-check).
+    /// a flush), a node with P2P off (no epoch, hold or stream exists, and no
+    /// peer message is sent), the negative control, the re-claim of the hold owner that
+    /// closed the epoch, and a union already installed by an earlier pass of
+    /// this claim (the promise re-check). This node's own lease (a restart's
+    /// re-adoption, the carrier's re-claim) serves from its journal, which
+    /// holds every row of the hold it ran itself, but not those of a hold it
+    /// handed over: [`Self::carrier_handed_over`] runs the phase for the
+    /// transferee's streams.
     pub(crate) fn kept_needed(&self, prev: &Lease) -> bool {
         !self.cfg.kept_fetch_skipped
+            && self.cfg.p2p
             && prev.holder != 0
-            && prev.holder != self.cfg.node_id
+            && (prev.holder != self.cfg.node_id || self.carrier_handed_over(prev))
             && !prev.released
             && !self.owner_reclaims(prev)
             && self.bk.kept_ready != Some(prev.renewal_key())
     }
 
+    /// This node holds the lease `prev` and handed the hold of the epoch
+    /// that carried it to a peer (`hold_ended`'s flag is false): the peer's
+    /// rows at the next epoch are on the epoch's members, not in this node's
+    /// journal.
+    fn carrier_handed_over(&self, prev: &Lease) -> bool {
+        prev.holder == self.cfg.node_id
+            && self.pr.hold_ended == Some((prev.epoch, prev.expires_unix_ms, false))
+    }
+
     /// The targets of a claim of `prev`: the hold streams of its own tenure
     /// (a fence names the tenure it ended), and the union its lease names.
-    fn kept_targets(prev: &Lease) -> Vec<Target> {
+    fn kept_targets(prev: &Lease, me: NodeId) -> Vec<Target> {
         let mut out = vec![Target {
             tenure: (prev.holder, prev.retired_tenure().unwrap_or(prev.epoch)),
             union: None,
+            own: prev.holder == me,
         }];
         if let Some(t) = prev.inherited_tail.as_ref().filter(|t| t.kept) {
             out.push(Target {
                 tenure: (t.holder, t.epoch),
                 union: Some((t.members.clone(), t.through)),
+                own: false,
             });
         }
         out
@@ -172,12 +198,21 @@ impl Core {
             },
         };
         if !self.roster.fresh_since(seen) {
+            // Ask for a read and wait for it in this attempt (ending it would
+            // leave the retry to the claim's own cadence, a whole backup
+            // takeover window for a sealing backup): the phase resumes when a
+            // read issued after `seen` is installed, or the attempt ends with
+            // the window.
             out.push(Action::RefreshRoster);
-            self.acquire_retry_hint = Some(now.wait.plus(self.cfg.sync_interval_ms.max(1)));
-            self.end_acquire_attempt(now, replica, out);
+            self.tail_fetch_phase();
+            let round = self.op_id();
+            let at = now.wait.plus(self.cfg.backup_takeover_ms.max(1));
+            let timer = self.set_timer_wait(at, super::Timer::JobRequestTimeout(round), out);
+            self.bk.tf_round = Some(round);
+            self.bk.kept_roster_wait = Some((prev, timer));
             return;
         }
-        let targets = Self::kept_targets(&prev);
+        let targets = Self::kept_targets(&prev, me);
         let mut sources: BTreeSet<NodeId> = self.roster.kept_sources(me);
         for t in &targets {
             if let Some((members, _)) = &t.union {
@@ -252,6 +287,17 @@ impl Core {
         // Nothing to ask when this node's own rows already satisfy the rules
         // (no epoch ever carried the tenure and `f` is known): no round trip.
         if self.kept_complete() {
+            // (The previous holder is still told: its plain seal deposes a
+            // live-but-expired holder before the claim's CAS, whatever the
+            // rules need of its answer, which is not waited for.)
+            if prev.holder != me && !prev.retired.contains(&prev.holder) {
+                let epoch = self
+                    .bk
+                    .kept
+                    .as_ref()
+                    .map_or(prev.epoch, |k| k.targets[0].tenure.1);
+                self.kept_ask(0, prev.holder, epoch, false, 0, out);
+            }
             self.kept_finish(now, replica, out);
             return;
         }
@@ -260,7 +306,7 @@ impl Core {
         self.tail_fetch_phase();
         let k = self.bk.kept.as_ref().expect("set above");
         let mut asks: Vec<(usize, NodeId, Epoch, bool)> = Vec::new();
-        let holder_asked = !prev.retired.contains(&prev.holder);
+        let holder_asked = !prev.retired.contains(&prev.holder) && prev.holder != me;
         for (ti, t) in k.targets.iter().enumerate() {
             if ti == 0 && holder_asked {
                 asks.push((ti, prev.holder, t.tenure.1, false));
@@ -289,6 +335,39 @@ impl Core {
             // No promise check ran: one heartbeat read of its own for `f`.
             self.issue_s3(S3Op::HeartbeatRead, super::S3For::KeptSlack, out);
         }
+    }
+
+    /// A roster read was installed: a claim that waits for a read issued
+    /// after it first saw the lease goes on once this one is.
+    pub(crate) fn kept_roster_arrived(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some((prev, _)) = self.bk.kept_roster_wait.as_ref() else {
+            return;
+        };
+        let live = self.job.is_some()
+            && matches!(&self.pending_plan, Some(Plan::Claim { prev: p, .. }) if p.renewal_key() == prev.renewal_key());
+        let seen = self
+            .bk
+            .kept_seen
+            .filter(|(e, _)| *e == prev.epoch)
+            .map(|(_, at)| at);
+        let ready = match (live, seen.or_else(|| self.lease.observed_since(prev))) {
+            (true, Some(at)) => self.roster.fresh_since(at),
+            _ => false,
+        };
+        if !ready {
+            return;
+        }
+        let Some((prev, timer)) = self.bk.kept_roster_wait.take() else {
+            return;
+        };
+        self.cancel_timer(timer, out);
+        self.bk.tf_round = None;
+        self.begin_kept_fetch(now, prev, replica, out);
     }
 
     /// One request of the fetch. `kept`: a member's (sealing); else the
@@ -400,6 +479,19 @@ impl Core {
         // The previous holder: a node that holds nothing (`empty`) is an
         // answer of no rows, whose members still count as evidence.
         let plain_none = !held && empty && node == k.prev.holder;
+        if !held && !plain_none && node == k.prev.holder {
+            // The previous holder's plain refusal (a renewal landed after the
+            // key this claim read: the CAS cannot land): the attempt ends at
+            // once, as the members' refusals do, rather than waiting out its
+            // window for a claim that cannot succeed.
+            tracing::debug!(
+                node = self.cfg.node_id,
+                from,
+                "the previous holder refused the seal (a newer renewal): the claim ends and retries"
+            );
+            self.end_tail_fetch_attempt(now, replica, out);
+            return true;
+        }
         if !held && !plain_none {
             return true;
         }
@@ -499,7 +591,7 @@ impl Core {
                 && (prev.retired.contains(&prev.holder) || done.contains(&prev.holder));
             let q = done
                 .iter()
-                .filter(|n| **n == me || self.roster.lists(**n))
+                .filter(|n| self.roster.lists(**n))
                 .filter(|n| !prev.retired.contains(n))
                 .count();
             holder_in || all_sources || k.slack.is_some_and(|f| q > f as usize)
@@ -692,6 +784,17 @@ impl Core {
         for t in &u.targets {
             epochs.extend(t.epochs());
         }
+        // What the union an earlier claim inherited carried of its epoch: in
+        // the log under the claimant's `TailOf` identity, which the log's
+        // native rows do not show.
+        let carried_through = |e: Epoch| -> u64 {
+            u.targets
+                .iter()
+                .filter(|t| t.tenure.1 == e)
+                .filter_map(|t| t.union.as_ref().map(|(_, through)| *through))
+                .max()
+                .unwrap_or(0)
+        };
         let mut merged_by_epoch: BTreeMap<Epoch, Vec<BackupTx>> = BTreeMap::new();
         let mut owner_of: BTreeMap<Epoch, NodeId> = BTreeMap::new();
         let mut keepers: BTreeMap<Epoch, BTreeSet<NodeId>> = BTreeMap::new();
@@ -713,7 +816,12 @@ impl Core {
                     }
                     for tx in &a.txs {
                         match all.get(&tx.first) {
-                            Some(old) if old.last != tx.last || old.origin != tx.origin => {
+                            Some(old)
+                                if old.last != tx.last
+                                    || old.origin != tx.origin
+                                    || constellation_meta::tail_identity(&old.records)
+                                        != constellation_meta::tail_identity(&tx.records) =>
+                            {
                                 if u.force {
                                     forced = true;
                                     self.stats.kept_forced += 1;
@@ -759,7 +867,18 @@ impl Core {
                     continue;
                 }
                 match next {
-                    None => {}
+                    // The first row past the log starts where the log ends:
+                    // under an abandon the member that held the prefix may be
+                    // the one that is down, and a copy past that gap would
+                    // make the marker name a hold the log does not reach.
+                    None if first == 1
+                        || replica.row_in_log(*e, first - 1)
+                        || first - 1 <= carried_through(*e) => {}
+                    None => {
+                        gap = true;
+                        past_gap += 1;
+                        continue;
+                    }
                     Some(n) if first <= n => {
                         if first < n {
                             continue;
@@ -793,7 +912,10 @@ impl Core {
         }
         self.bk.kept_floor = floor;
         self.bk.gate_tails_from = u.targets.iter().map(|t| t.tenure.1).min().unwrap_or(0);
-        debug_assert_eq!(past_gap, 0, "a kept copy lies past a gap");
+        debug_assert!(
+            past_gap == 0 || u.partial || u.force,
+            "a kept copy lies past a gap"
+        );
         if past_gap > 0 {
             self.stats.kept_past_gap += past_gap as u64;
             tracing::warn!(
@@ -856,7 +978,16 @@ impl Core {
         }
         if !fetched.is_empty() {
             self.bk.held.clear();
-            self.bk.fetched = fetched;
+            // An inherited tail of an epoch the union does not cover (a T3
+            // non-kept tail below the tenure's epochs) is re-shipped with it.
+            let mut all = fetched;
+            for old in std::mem::take(&mut self.bk.fetched) {
+                if !all.iter().any(|f| f.epoch == old.epoch) {
+                    all.push(old);
+                }
+            }
+            all.sort_by_key(|f| f.epoch);
+            self.bk.fetched = all;
             self.stats.tail_fetches += 1;
             if prev.inherited_tail.is_some() {
                 self.stats.inherited_tail_fetches += 1;

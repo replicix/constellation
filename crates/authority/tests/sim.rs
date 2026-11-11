@@ -5683,10 +5683,12 @@ fn l2_a_deposed_roots_rebuild_queues_no_gated_copy_of_a_delegates_row() {
 /// same number for another directory, onto nodes holding the real grant's
 /// rows and marks). The old mint (`max_gen + 1` of the minting root's own
 /// view) fails all three with the oracle ("generation N minted twice"); a
-/// number carries the epoch of the tenure that minted it now.
+/// number carries the epoch of the tenure that minted it now. (ADR-51's kept
+/// phase moved 16871's schedule: it mints no number any more. 16855 and
+/// 16869 take its place.)
 #[test]
 fn regression_no_generation_number_is_minted_twice() {
-    for seed in [16_871u64, 1_659, 2_958] {
+    for seed in [16_855u64, 16_869, 1_659, 2_958] {
         let report = run_seed(seed, placement_hot_slow_lease_reads_config()).unwrap_or_else(|e| {
             panic!(
                 "seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=placement-hot \
@@ -5817,9 +5819,16 @@ fn flex_config() -> SimConfig {
 
 /// The same with the promise check off: the third node takes the lease
 /// the epoch carries, and the sampler sees two authorities.
+///
+/// ADR-51: the kept phase seals after the promise check and its members
+/// refuse (`EpochOpen`) while the epoch they are in carries the tenure, so
+/// with the check off that refusal guards the lease on its own and hides
+/// the split brain the control is to find: the phase is off too (both
+/// guards off; `SimConfig::kept_fetch_skipped`).
 fn flex_unchecked_config() -> SimConfig {
     SimConfig {
         core: std::sync::Arc::new(sim::run::flex_unchecked_core_config),
+        kept_fetch_skipped: true,
         ..flex_config()
     }
 }
@@ -6562,11 +6571,18 @@ fn a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over() {
     // own tenure committed (plan 43 Q16, ADR-41), which shifted this set
     // again: 1607's first mutation after the crash came 1.25 s in, before the
     // seal (the 1.1 to 1.3 s class); 1608, whose failover is a seal's again,
-    // takes its place.)
+    // takes its place. ADR-51's kept phase waited for a fresh roster read by
+    // ending the claim's attempt: a sealing backup claimed a whole takeover
+    // window late (1609 answered 2.2 s in, through the delegate re-streaming
+    // to the new root); the phase now waits for the read in the attempt, and
+    // 1609 sits in the 1.1 to 1.3 s class again (the delegate's answer under
+    // the pre-crash grant, not a seal-and-floor failover: so do 1604, 1607,
+    // 1610, 1613 and 1614, 1621, 1623, 1627, 1629, 1630, 1650, 1652 and
+    // 1660). 1603 takes 1609's place.)
     for seed in (1600..1602)
         .chain(1605..1607)
         .chain(1608..1609)
-        .chain(1609..1610)
+        .chain(1603..1604)
         .chain(1611..1613)
         .chain(1616..1619)
         .chain(1620..1621)
@@ -15850,14 +15866,17 @@ fn locks_survive_stalled_steps() {
 /// 30 s lease the rule is what keeps them inside it: a lane that ignores it
 /// renews the stalled holder's grant through the successor's grant (seed 44,
 /// found by the sweep of 200; 107 since the sim's recall hold became half the
-/// forward timeout, as the daemon's), and the design is clean on the same seed.
+/// forward timeout, as the daemon's; 21 since ADR-51's kept phase, whose plain
+/// seal and heartbeat read moved the successor's floor: of 0 to 300, 21, 250,
+/// 261, 276 and 281 fail with the mutant), and the design is clean on the same
+/// seed.
 #[test]
 fn the_lanes_freshness_rule_is_load_bearing_on_a_long_lease() {
-    let e = run_seed(107, locks_core_stall_backup_long_unfresh_config())
-        .expect_err("locks-core-stall-backup-long-unfresh seed 107 must fail");
-    assert!(e.contains("mutual exclusion violated"), "seed 107: {e}");
-    run_seed(107, locks_core_stall_backup_long_config())
-        .unwrap_or_else(|e| panic!("locks-core-stall-backup-long seed 107: {e}"));
+    let e = run_seed(21, locks_core_stall_backup_long_unfresh_config())
+        .expect_err("locks-core-stall-backup-long-unfresh seed 21 must fail");
+    assert!(e.contains("mutual exclusion violated"), "seed 21: {e}");
+    run_seed(21, locks_core_stall_backup_long_config())
+        .unwrap_or_else(|e| panic!("locks-core-stall-backup-long seed 21: {e}"));
 }
 
 /// A run leaves nothing behind: its bus, and with it every node's `Meta`
@@ -15911,10 +15930,13 @@ fn a_backed_lock_root_stuck_in_a_step_keeps_its_own_grants() {
 /// pinned: two nodes in I/O under conflicting locks; plan 46 M0.3's settle
 /// fixes moved 236 and 277 and kept 21, so 21, 290 and 366 of 0 to 400, which
 /// fail before and after, are pinned; the sim's recall hold, now half the
-/// forward timeout as the daemon's, kept 21 and 91 and moved 132 to 72).
+/// forward timeout as the daemon's, kept 21 and 91 and moved 132 to 72; ADR-51's
+/// kept phase moved 91 and 72 again: of 0 to 400, 4, 21, 215, 250, 253, 302,
+/// 327, 329, 347 and 398 fail with the mutant and the design passes them all,
+/// 21, 4 and 215 are pinned).
 #[test]
 fn a_probe_that_ignores_what_it_reads_is_caught() {
-    for seed in [21u64, 91, 72] {
+    for seed in [21u64, 4, 215] {
         run_seed(seed, fixed_lane(locks_core_stall_backup_long_config()))
             .unwrap_or_else(|e| panic!("locks-core-stall-backup-long seed {seed}: {e}"));
         let e = run_seed(
@@ -15944,12 +15966,14 @@ fn a_probe_that_ignores_what_it_reads_is_caught() {
 /// answers end there, mutant or not; 373 and 828 again before i1-592's lone
 /// test moved them: 54 too; 193, 247, 277 and 871 are pinned; the sim's
 /// recall hold, now half the forward timeout as the daemon's, moved them
-/// again: 51 and 467 of 0 to 600 fail with the mutant and are pinned.) (Mutual exclusion does not fail with the mutant, even in
+/// again: 51 and 467 of 0 to 600 fail with the mutant and are pinned; ADR-51's
+/// kept phase moved those: 109 and 230 of 0 to 600 are the two that fail with
+/// the mutant now, and are pinned.) (Mutual exclusion does not fail with the mutant, even in
 /// 22,000 seeds: the successor's floor and the grant caps carry `3 x expiry
 /// margin` beyond the window.)
 #[test]
 fn a_proof_dated_at_the_return_of_the_read_is_caught() {
-    for seed in [51u64, 467] {
+    for seed in [109u64, 230] {
         run_seed(
             seed,
             fixed_lane(locks_core_stall_backup_long_slow_reads_config()),
@@ -18682,11 +18706,14 @@ fn a_seal_before_the_holders_renewal_never_revives_a_sealed_epoch() {
     }
 }
 
-// (250 ms: a peer claimant's seal lands after the holder's renewal; seed 1134
+// (186 ms: a peer claimant's seal lands after the holder's renewal; seed 1134
 // is the one early re-claim in 4,000 seeds, pinned, and run beside the first
 // 300. The grant horizon's write-ahead lane moved the timing of the earlier
-// pin, 400 ms and seed 79.)
-const SEAL_GAP_DELAY_MS: u64 = 250;
+// pin, 400 ms and seed 79. ADR-51's kept phase sends the claimant's plain seal
+// after its promise check, 43 ms later than the claim's first seal went on
+// seed 1134: at 250 ms it misses the renewal's window, and 1134 shows the
+// early re-claim at 180 to 192 ms only (none in 5,800 seeds at 250 ms).)
+const SEAL_GAP_DELAY_MS: u64 = 186;
 const SEAL_GAP_PINNED_SEED: u64 = 1134;
 const SEAL_GAP_SEEDS: std::ops::Range<u64> = 0..300;
 
