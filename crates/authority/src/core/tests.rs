@@ -61260,8 +61260,15 @@ mod await_retry {
     /// unrecoverable) after the creation of `broken` (shipped). Whatever
     /// the test executes on `broken` or in the root directory after this
     /// depends on the seed by key, and is held with it.
+    ///
+    /// ADR-59: a drop rolls back only what needs the lost content, so a
+    /// rename or a chmod of `broken` would stay in the journal. These tests
+    /// are about what the core does with the replay queue a drop leaves
+    /// (placeholders, parking, settling), whichever ops are in it: the
+    /// conservative control gives them the queue of any dependent.
     pub(super) fn holder_with_a_seed() -> (Harness, Ino) {
         let mut h = Harness::new(1);
+        h.meta.set_parent_taint_conservative(true);
         h.hold(1, None);
         let broken = h.meta.create(ROOT_INO, "broken", 0o644, 0, 0).unwrap().ino;
         let rows = MetaStore::take_journal(&h.meta, usize::MAX).unwrap();

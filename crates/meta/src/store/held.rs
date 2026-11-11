@@ -23,16 +23,29 @@
 //! - a **seed** is a transaction with a `WriteManifest` for a poisoned
 //!   inode that names one of its unrecoverable chunks (a spilled or
 //!   undecodable manifest is assumed to);
-//! - a transaction is **held** if it is a seed, or if it touches an `ns`
-//!   key a held transaction touched — its key set is its captured
+//! - a transaction is **held** if it is a seed, or if it *conflicts* on an
+//!   `ns` key with a held transaction — its key set is its captured
 //!   before-image keys (`store::spec`), exactly what the M3b capture
-//!   recorded. Held keys accumulate, so the rule is transitive;
+//!   recorded, each with the way it was written ([`Mode`]). Held keys
+//!   accumulate, so the rule is transitive;
 //! - everything else ships, in journal order, skipping the held ones.
 //!
+//! Two accesses of a key conflict unless both are commutative ([`conflicts`],
+//! ADR-59): an exclusive access (a name, an attribute set as is, a removal,
+//! a manifest) orders everything on the key; a directory's *merged*
+//! attributes (`mtime`/`ctime` = `max`, `nlink` += delta, written because a
+//! child came or went) order nothing among themselves and nothing against
+//! an observation. So a create, unlink or rename of one name does not wait
+//! behind a held operation on another name of the same directory, though
+//! both rewrite the directory's record and its name's attribute copy.
+//!
 //! Only earlier transactions can be depended on, and a shipped
-//! transaction touches no held key, so shipping it ahead of the held ones
-//! yields the same state as shipping in journal order would once they
-//! ship: the two commute. An **uncaptured** transaction (journaled
+//! transaction conflicts with no held key, so shipping it ahead of the held
+//! ones yields the same state as shipping in journal order would once they
+//! ship: the two commute. (Where they share a key it is a merge on both
+//! sides, and merges commute as values; a merge and an observation
+//! commute because no journaled answer reads a merged field. Pairs that
+//! conflict keep journal order, by induction over the journal.) An **uncaptured** transaction (journaled
 //! without before-images: a holder always captures, so only a write from
 //! before this node held the lease) has no known key set: once anything is held, it and everything
 //! after it is held — the pre-M4 behaviour, from that point on.
@@ -45,7 +58,9 @@
 //! - the **publisher** substitutes its keys' earliest before-images
 //!   (`Meta::publish_basis_at`); a transaction that shipped past it becomes
 //!   a `Foreign` row (`spec::retire_local_tx`), which the substitution
-//!   skips because it touches none of the held keys;
+//!   skips because it conflicts with none of the held keys (a key they
+//!   share is a merge on both sides: the substitution applies the shipped
+//!   row's merge to the earlier value, `LogPrefixView::merge_shipped`);
 //! - a **transaction never splits**: holding is per transaction, and a
 //!   ship's byte cut still goes through `Meta::whole_tx_prefix`;
 //! - a **deposition** strands it like any unshipped `Local` row (rollback,
@@ -69,7 +84,8 @@
 //! into a refused replay whose conflict copy — the manifest with the
 //! unrecoverable chunks as holes — the replay drain materializes under
 //! `.constellation-conflict/`. The unrecoverable pending rows go with it.
-//!
+//! ("Depends" is the ship rule's [`conflicts`].)
+
 //! **A lost chunk an op still names keeps its row.** "No pending row"
 //! means *durable* to the ship plan, to the pending list a forward
 //! carries, and to the composition of a manifest by a write session that
@@ -577,9 +593,118 @@ pub(crate) fn seed_inos_of<'a>(
     out
 }
 
+/// ADR-59: how a transaction accesses a key. Two accesses conflict unless
+/// both are commutative with every other: the one rule of the ship order
+/// ([`conflicts`]).
+///
+/// - `Excl`: a write that does not commute: a dentry's existence or target,
+///   an inode attribute set as is (mode, owner, size, manifest, a file's
+///   own times, explicit utimes), removal, xattrs, a rename of the inode
+///   itself, a directory's subtree change.
+/// - `Merge`: a write made only by the commutative merge of a directory
+///   (`mtime`/`ctime` = `max(.., t)`, `nlink += delta`): the directory's
+///   inode record and the attribute copy its name carries, written because
+///   a child came or went in it. A key is `Merge` for a transaction only if
+///   every write of it was a merge.
+/// - `Obs`: observed without a write: a refusal's `JournalTx::observed`.
+///   (The keys a completion-only row, a no-op success, observed are
+///   `Excl` as ever: [`tx_keys`].)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Excl,
+    Merge,
+    Obs,
+}
+
+/// Whether a later access `access` of a key depends on an earlier one,
+/// `taint`, that is held or deferred (the table of ADR-59):
+///
+/// | access \ taint | Excl | Merge | Obs  |
+/// |---|---|---|---|
+/// | Excl  | dep  | dep  | dep  |
+/// | Merge | dep  | none | none |
+/// | Obs   | dep  | none | none |
+///
+/// `max` and `+` commute with each other, and an observation reads no
+/// merged field (a directory's times and link count are read by no
+/// journaled answer: permission checks read mode, owner and existence;
+/// emptiness is a dentry scan), so only an exclusive access on either side
+/// orders two transactions. This is the only place the rule is written:
+/// [`Walk::step`], the drop's dependency walk and the property test's model
+/// all call it.
+fn conflicts(access: Mode, taint: Mode) -> bool {
+    access == Mode::Excl || taint == Mode::Excl
+}
+
+/// A transaction's keys by access mode (see [`Mode`]); the sets are
+/// disjoint, an exclusive access winning over a merge. (A refusal's
+/// observation is no key of the transaction: [`Walk::step`] takes it apart.)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TxKeys {
+    excl: Vec<Vec<u8>>,
+    merge: Vec<Vec<u8>>,
+}
+
+impl TxKeys {
+    /// Every key, sorted (what a placeholder holds: [`placeholder_keys`]).
+    fn all(&self) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = self.excl.iter().chain(&self.merge).cloned().collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The keys it accesses with `mode`.
+    #[cfg(test)]
+    fn of(&self, mode: Mode) -> &[Vec<u8>] {
+        match mode {
+            Mode::Excl => &self.excl,
+            Mode::Merge => &self.merge,
+            Mode::Obs => &[],
+        }
+    }
+}
+
+/// The keys tainted by held (or deferred) transactions, by the strongest
+/// way they were reached ([`conflicts`] needs only whether a taint is
+/// exclusive).
+#[derive(Clone, Debug, Default)]
+struct Taint {
+    excl: HashSet<Vec<u8>>,
+    soft: HashSet<Vec<u8>>,
+}
+
+impl Taint {
+    /// Whether the access `mode` of `key` conflicts with what reached it.
+    fn conflicts(&self, mode: Mode, key: &[u8]) -> bool {
+        if self.excl.contains(key) {
+            conflicts(mode, Mode::Excl)
+        } else if self.soft.contains(key) {
+            // (A merge and an observation taint alike: `conflicts` does not
+            // tell them apart.)
+            conflicts(mode, Mode::Merge)
+        } else {
+            false
+        }
+    }
+
+    /// Whether any key `keys` accesses conflicts with a taint. `observed`
+    /// is a refusal's observation: an `Obs` access that taints nothing.
+    fn hit(&self, keys: &TxKeys, observed: &[Vec<u8>]) -> bool {
+        keys.excl.iter().any(|k| self.conflicts(Mode::Excl, k))
+            || keys.merge.iter().any(|k| self.conflicts(Mode::Merge, k))
+            || observed.iter().any(|k| self.conflicts(Mode::Obs, k))
+    }
+
+    fn add(&mut self, keys: &TxKeys) {
+        self.excl.extend(keys.excl.iter().cloned());
+        self.soft.extend(keys.merge.iter().cloned());
+    }
+}
+
 /// A held-back transaction: the transaction, the poisoned inodes it is a
 /// seed for (empty for a dependent), and its key set (`None`: uncaptured).
-type Held = (Tx, Vec<Ino>, Option<Vec<Vec<u8>>>);
+type Held = (Tx, Vec<Ino>, Option<TxKeys>);
 
 /// A ship plan: the transactions to ship (in order), those held back
 /// behind lost chunks, and those deferred behind chunks still uploading.
@@ -626,17 +751,19 @@ struct Blame<'a> {
 /// cache ([`BlameCache`]), which resumes it where the journal grew.
 #[derive(Clone, Default)]
 struct Walk {
-    tainted: HashSet<Vec<u8>>,
-    deferred_keys: HashSet<Vec<u8>>,
+    tainted: Taint,
+    deferred_keys: Taint,
     opaque: bool,
     opaque_deferred: bool,
     any_held: bool,
     any_deferred: bool,
-    // The blame of each key a held or deferred transaction touched; that
-    // of every held or deferred uncaptured transaction (which every later
-    // one depends on); that of all of them (which an uncaptured one
-    // depends on).
-    blame_of: HashMap<Vec<u8>, BTreeSet<Ino>>,
+    // The blame of each key a held or deferred transaction touched, split
+    // like the taint (`Taint`): what an exclusive access of the key and a
+    // merging or observing one inherit; that of every held or deferred
+    // uncaptured transaction (which every later one depends on); that of
+    // all of them (which an uncaptured one depends on).
+    blame_excl: HashMap<Vec<u8>, BTreeSet<Ino>>,
+    blame_soft: HashMap<Vec<u8>, BTreeSet<Ino>>,
     opaque_blame: BTreeSet<Ino>,
     all_blame: BTreeSet<Ino>,
 }
@@ -657,35 +784,36 @@ impl Walk {
     /// so a transaction behind both is reported as held. With `theirs`,
     /// also a held or deferred transaction's blame ([`Blame`]). Returns
     /// its class, the poisoned inodes it is a seed for, and its blame.
+    ///
+    /// "Depends" is [`conflicts`] on the keys the two access, not the
+    /// bare overlap of their key sets (ADR-59).
     fn step(
         &mut self,
         tx: &Tx,
-        keys: Option<&[Vec<u8>]>,
+        keys: Option<&TxKeys>,
         observed: &[Vec<u8>],
         (poisoned, pending): (&PoisonMap, &PoisonMap),
         theirs: Option<&PoisonMap>,
     ) -> (Class, Vec<Ino>, Option<BTreeSet<Ino>>) {
         let seeds = seed_inos(tx, poisoned);
         // What the transaction observed without writing (a refusal's op:
-        // `JournalTx::observed`): a dependency like a written key, but
-        // it taints nothing after it. A refusal shipped ahead of the
-        // deferred transaction it was refused because of put a refusal
-        // in the log that the log's own prefix could not explain
+        // `JournalTx::observed`): a dependency like an observation of a
+        // written key, but it taints nothing after it. A refusal shipped
+        // ahead of the deferred transaction it was refused because of put a
+        // refusal in the log that the log's own prefix could not explain
         // (flex-crash seed 481).
         let held = self.opaque
             || !seeds.is_empty()
-            || observed.iter().any(|k| self.tainted.contains(k))
             || match keys {
-                Some(keys) => keys.iter().any(|k| self.tainted.contains(k)),
+                Some(keys) => self.tainted.hit(keys, observed),
                 // Unknown keys: held once anything is.
                 None => self.any_held,
             };
         let deferred = !held
             && (self.opaque_deferred
                 || !seed_inos(tx, pending).is_empty()
-                || observed.iter().any(|k| self.deferred_keys.contains(k))
                 || match keys {
-                    Some(keys) => keys.iter().any(|k| self.deferred_keys.contains(k)),
+                    Some(keys) => self.deferred_keys.hit(keys, observed),
                     None => self.any_deferred,
                 });
         let mut blame = None;
@@ -693,14 +821,30 @@ impl Walk {
             let mut mine: BTreeSet<Ino> = seed_inos(tx, theirs).into_iter().collect();
             match keys {
                 Some(keys) => {
-                    for k in observed.iter().chain(keys) {
-                        if let Some(theirs) = self.blame_of.get(k) {
-                            mine.extend(theirs);
+                    // The blame flows only across a conflicting pair
+                    // (`conflicts`): an access inherits that of the
+                    // exclusive taints of its key, and, if it conflicts
+                    // with a merge, that of the merging ones.
+                    let accesses = keys
+                        .excl
+                        .iter()
+                        .map(|k| (Mode::Excl, k))
+                        .chain(keys.merge.iter().map(|k| (Mode::Merge, k)))
+                        .chain(observed.iter().map(|k| (Mode::Obs, k)));
+                    for (mode, k) in accesses {
+                        if conflicts(mode, Mode::Excl) {
+                            mine.extend(self.blame_excl.get(k).into_iter().flatten());
+                        }
+                        if conflicts(mode, Mode::Merge) {
+                            mine.extend(self.blame_soft.get(k).into_iter().flatten());
                         }
                     }
                     mine.extend(&self.opaque_blame);
-                    for k in keys {
-                        self.blame_of.entry(k.clone()).or_default().extend(&mine);
+                    for k in &keys.excl {
+                        self.blame_excl.entry(k.clone()).or_default().extend(&mine);
+                    }
+                    for k in &keys.merge {
+                        self.blame_soft.entry(k.clone()).or_default().extend(&mine);
                     }
                 }
                 None => {
@@ -713,14 +857,14 @@ impl Walk {
         }
         let class = if held {
             match keys {
-                Some(keys) => self.tainted.extend(keys.iter().cloned()),
+                Some(keys) => self.tainted.add(keys),
                 None => self.opaque = true,
             }
             self.any_held = true;
             Class::Held
         } else if deferred {
             match keys {
-                Some(keys) => self.deferred_keys.extend(keys.iter().cloned()),
+                Some(keys) => self.deferred_keys.add(keys),
                 None => self.opaque_deferred = true,
             }
             self.any_deferred = true;
@@ -733,16 +877,24 @@ impl Walk {
 }
 
 /// A transaction's key set (`None`: uncaptured) and its `journal_tx` row.
-type KeysAndRow = (Option<Vec<Vec<u8>>>, Option<local::JournalTx>);
+type KeysAndRow = (Option<TxKeys>, Option<local::JournalTx>);
 
 /// [`KeysAndRow`] of `tx`.
 fn tx_keys_and_row(r: &impl Readable, meta: &Meta, tx: &Tx) -> Result<KeysAndRow, MetaError> {
-    let keys = match tx.spec_seq {
-        Some(seq) => spec::row_keys_and_origin(r, meta, seq)?.map(|row| row.keys),
+    let captured = match tx.spec_seq {
+        Some(seq) => spec::row_keys_and_origin(r, meta, seq)?.map(|row| (row.keys, row.merge)),
         None => None,
     };
     let row = local::get_journal_tx(r, meta, tx.first)?;
-    Ok((tx_keys(tx, keys, row.as_ref()), row))
+    let mut keys = tx_keys(tx, captured, row.as_ref());
+    if meta.parent_taint_conservative.load(Ordering::Relaxed) {
+        if let Some(keys) = keys.as_mut() {
+            keys.excl.append(&mut keys.merge);
+            keys.excl.sort();
+            keys.excl.dedup();
+        }
+    }
+    Ok((keys, row))
 }
 
 /// The keys a placeholder of `tx` holds (`AwaitRetry::keys`): what the
@@ -754,10 +906,10 @@ fn tx_keys_and_row(r: &impl Readable, meta: &Meta, tx: &Tx) -> Result<KeysAndRow
 /// inode) names nothing at all. A directory the transaction names as a
 /// parent stays *shared* (its attributes change by a commutative merge); any
 /// other inode it wrote is exclusive.
-fn placeholder_keys(tx: &Tx, keys: &[Vec<u8>]) -> crate::replay::TouchSet {
+fn placeholder_keys(tx: &Tx, keys: &TxKeys) -> crate::replay::TouchSet {
     use constellation_mtree::keys::Key;
     let mut out = crate::replay::TouchSet::from_records(tx.rows.iter().map(|(_, rec)| rec));
-    for key in keys {
+    for key in &keys.all() {
         match Key::parse(key) {
             Ok(Key::Inode { ino }) if !out.shared.contains(&ino) => {
                 out.inos.insert(ino);
@@ -772,43 +924,73 @@ fn placeholder_keys(tx: &Tx, keys: &[Vec<u8>]) -> crate::replay::TouchSet {
     out
 }
 
-/// A captured transaction's keys for the ship rule: what it wrote, plus
-/// what its rows name, plus — for a completion alone — what it observed.
+/// What the capture says a transaction wrote: its keys, and the sorted
+/// subset of them it wrote only by a directory's merge.
+type WrittenKeys = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+/// A captured transaction's keys for the ship rule, by access mode
+/// ([`Mode`]): what it wrote (the keys it wrote only by a directory's merge
+/// are `Merge`, every other one `Excl`), plus what its rows name, plus for
+/// a completion alone what it observed. `captured`: its before-image keys
+/// and the sorted subset of them it wrote only by merge.
 ///
 /// Plan 45 follow-up, the rows: a record that applied as a no-op writes
 /// nothing (a replayed `unlink f1` of a stranded op, after `rename f1 f0`
 /// had taken the name), yet the log replays it by name wherever it ships.
 /// Shipped ahead of the deferred rename (the authority sim's
 /// `metered-shared+links` seed 449), every replica unlinked `f1` and
-/// skipped the rename, while the holder kept the renamed file.
+/// skipped the rename, while the holder kept the renamed file. So the
+/// names its records carry are `Excl`, written or not; the directory a
+/// record names as a parent (`TouchSet::shared`) is `Merge`, unless the
+/// transaction wrote it exclusively as well.
 ///
 /// The observed keys: an op that executed and changed nothing (a rename
 /// onto another name of the same inode: `writes::complete_noop_tx`) is a
 /// `Completed` row and the keys it observed. Its `Ok` is a success the log
 /// orders like any other, so it is ordered as a write of what it observed:
-/// deferred behind what wrote them, and every later transaction of those
-/// keys behind it. (A refusal's observed keys taint nothing: it is no
-/// success.)
+/// deferred behind what wrote it, and every later transaction of those
+/// keys behind it, a create in the directory it named included (`flex+links`
+/// seeds 191 and 335: a create invoked after the rename returned shipped
+/// ahead of its completion). These keys stay exclusive, as ever: the spec's
+/// weaker taint for them would let that create ship ahead again. (A
+/// refusal's observed keys taint nothing: it is no success, and its
+/// observation of a directory's merged fields orders nothing.)
 fn tx_keys(
     tx: &Tx,
-    keys: Option<Vec<Vec<u8>>>,
+    captured: Option<WrittenKeys>,
     row: Option<&local::JournalTx>,
-) -> Option<Vec<Vec<u8>>> {
-    let mut out = keys?;
+) -> Option<TxKeys> {
+    let (written, merged) = captured?;
+    let merged: HashSet<Vec<u8>> = merged.into_iter().collect();
+    let mut excl: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut merge: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for key in written {
+        if merged.contains(&key) {
+            merge.insert(key);
+        } else {
+            excl.insert(key);
+        }
+    }
     let named = crate::replay::TouchSet::from_records(tx.rows.iter().map(|(_, rec)| rec));
-    out.extend(
+    excl.extend(
         named
             .dentries
             .iter()
             .map(|(parent, name)| constellation_mtree::keys::dentry(*parent, name.as_bytes())),
     );
-    out.extend(
+    excl.extend(
         named
             .inos
             .iter()
-            .chain(&named.shared)
             .map(|ino| constellation_mtree::keys::inode(*ino)),
     );
+    merge.extend(
+        named
+            .shared
+            .iter()
+            .map(|ino| constellation_mtree::keys::inode(*ino)),
+    );
+    merge.retain(|k| !excl.contains(k));
     let completion_only = tx
         .rows
         .iter()
@@ -820,11 +1002,13 @@ fn tx_keys(
             )
         });
     if let (true, Some(row)) = (completion_only, row) {
-        out.extend(row.observed.iter().cloned());
+        excl.extend(row.observed.iter().cloned());
+        merge.retain(|k| !excl.contains(k));
     }
-    out.sort();
-    out.dedup();
-    Some(out)
+    Some(TxKeys {
+        excl: excl.into_iter().collect(),
+        merge: merge.into_iter().collect(),
+    })
 }
 
 /// The ship rule over the whole unshipped journal ([`Walk::step`]). With
@@ -856,7 +1040,7 @@ fn plan(
         let observed: Vec<Vec<u8>> = row.map(|row| row.observed).unwrap_or_default();
         let (class, seeds, mine) = walk.step(
             &tx,
-            keys.as_deref(),
+            keys.as_ref(),
             &observed,
             (poisoned, pending),
             blame.map(|b| b.theirs),
@@ -1071,7 +1255,7 @@ pub(crate) fn blame_walk(
         let observed = row.map(|row| row.observed).unwrap_or_default();
         let (class, _, waits) = c.walk.step(
             &tx,
-            keys.as_deref(),
+            keys.as_ref(),
             &observed,
             (&c.poisoned, &c.pending),
             Some(&c.theirs),
@@ -1290,6 +1474,14 @@ impl Meta {
 
     /// What the last ship round held back (empty when nothing is
     /// poisoned). In memory, refreshed by every ship plan.
+    /// ADR-59's negative control: classify a directory's merged attributes
+    /// as exclusive again, and roll back every transaction that depends on
+    /// a seed (`parent_taint_conservative`). Only the
+    /// simulation and the tests that pin the replay queue's machinery use it.
+    pub fn set_parent_taint_conservative(&self, on: bool) {
+        self.parent_taint_conservative.store(on, Ordering::Relaxed);
+    }
+
     pub fn held_summary(&self) -> HeldSummary {
         self.held.lock().unwrap().clone()
     }
@@ -1411,7 +1603,7 @@ impl Meta {
         let held = plan(&tx, self, &poisoned, &PoisonMap::new(), None)?;
         // The inode's seeds, and every held transaction that depends on
         // them (key overlap, transitively, in journal order).
-        let mut tainted: HashSet<Vec<u8>> = HashSet::new();
+        let mut tainted = Taint::default();
         let mut seeds: Vec<(Tx, u64, u64)> = Vec::new(); // (tx, spec_seq, origin)
                                                          // (spec_seq, origin, the keys a placeholder of it holds)
         let mut dependents: Vec<(u64, u64, crate::replay::TouchSet)> = Vec::new();
@@ -1423,9 +1615,7 @@ impl Meta {
         let mut unidentified = 0usize;
         for (t, seed_inos, keys) in held.held {
             let is_seed = seed_inos.contains(&ino);
-            let depends = keys
-                .as_ref()
-                .is_some_and(|keys| keys.iter().any(|k| tainted.contains(k)));
+            let depends = keys.as_ref().is_some_and(|keys| tainted.hit(keys, &[]));
             if !is_seed && !depends {
                 continue;
             }
@@ -1454,7 +1644,7 @@ impl Meta {
                     );
                 }
             }
-            tainted.extend(keys);
+            tainted.add(&keys);
             let origin = spec::row_keys_and_origin(&tx, self, spec_seq)?
                 .map(|row| row.origin)
                 .unwrap_or(spec_seq);
@@ -1925,6 +2115,23 @@ mod tests {
                 f: usize,
                 node: usize,
             },
+            /// ADR-59: a create, unlink or mkdir of another name in the
+            /// same directory (`g{n}`), and an explicit utimes of it.
+            Create {
+                n: usize,
+                node: usize,
+            },
+            Unlink {
+                n: usize,
+                node: usize,
+            },
+            Mkdir {
+                n: usize,
+                node: usize,
+            },
+            Utimes {
+                node: usize,
+            },
             /// Ack the `k`-th pending row enrolled so far.
             Ack(usize),
             /// Record the `k`-th pending row as unrecoverable.
@@ -1949,6 +2156,10 @@ mod tests {
                 2 => (f.clone(), 0..FILES, 0..3usize)
                     .prop_map(|(f, to, node)| Step::Rename { f, to, node }),
                 1 => (f, 0..3usize).prop_map(|(f, node)| Step::Refuse { f, node }),
+                2 => (0..3usize, 0..3usize).prop_map(|(n, node)| Step::Create { n, node }),
+                1 => (0..3usize, 0..3usize).prop_map(|(n, node)| Step::Unlink { n, node }),
+                1 => (0..3usize, 0..3usize).prop_map(|(n, node)| Step::Mkdir { n, node }),
+                1 => (0..3usize).prop_map(|node| Step::Utimes { node }),
                 2 => (0..16usize).prop_map(Step::Ack),
                 1 => (0..16usize).prop_map(Step::Poison),
                 1 => Just(Step::Ship),
@@ -1966,7 +2177,15 @@ mod tests {
 
         /// Run `steps` on a fresh holder. Node 7's and 8's ops carry
         /// their rids; index 2 stands for the holder itself (no rid).
-        fn journal(steps: &[Step]) -> Meta {
+        /// What [`journal`] left: the holder and every record it shipped
+        /// (in order).
+        struct Journaled {
+            meta: Meta,
+            shipped: Vec<LogRecord>,
+        }
+
+        fn journal(steps: &[Step]) -> Journaled {
+            let mut shipped_records: Vec<LogRecord> = Vec::new();
             let meta = Meta::open_in_memory().unwrap();
             meta.set_holder_epoch(1);
             let mut inos = Vec::new();
@@ -1977,18 +2196,15 @@ mod tests {
                         .ino,
                 );
             }
-            let shipped = |meta: &Meta, segment: u64| {
-                let seqs: Vec<u64> = meta
-                    .take_shippable(usize::MAX)
-                    .unwrap()
-                    .into_iter()
-                    .map(|(s, _)| s)
-                    .collect();
+            let shipped = |meta: &Meta, segment: u64, out: &mut Vec<LogRecord>| {
+                let rows = meta.take_shippable(usize::MAX).unwrap();
+                let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+                out.extend(rows.into_iter().map(|(_, r)| r));
                 if !seqs.is_empty() {
                     meta.ack_journal_rows_at(&seqs, segment).unwrap();
                 }
             };
-            shipped(&meta, 1);
+            shipped(&meta, 1, &mut shipped_records);
             let mut segment = 1;
             let mut seq = 0;
             let mut rid = |node: usize| {
@@ -2087,6 +2303,47 @@ mod tests {
                         meta.journal_refusal(r, constellation_types::Code::Exists, Some(&op))
                             .unwrap();
                     }
+                    Step::Create { n, node } => {
+                        let op = MutateOp::Create {
+                            parent: ROOT_INO,
+                            name: format!("g{n}"),
+                            ino: (1 << 40) + i as u64,
+                            mode: 0o644,
+                            uid: 0,
+                            gid: 0,
+                        };
+                        run(&meta, rid(*node), op);
+                    }
+                    Step::Unlink { n, node } => {
+                        let op = MutateOp::Unlink {
+                            parent: ROOT_INO,
+                            name: format!("g{n}"),
+                        };
+                        run(&meta, rid(*node), op);
+                    }
+                    Step::Mkdir { n, node } => {
+                        let op = MutateOp::Mkdir {
+                            parent: ROOT_INO,
+                            name: format!("g{n}"),
+                            ino: (1 << 41) + i as u64,
+                            mode: 0o755,
+                            uid: 0,
+                            gid: 0,
+                        };
+                        run(&meta, rid(*node), op);
+                    }
+                    Step::Utimes { node } => {
+                        let op = MutateOp::Setattr {
+                            ino: ROOT_INO,
+                            mode: None,
+                            uid: None,
+                            gid: None,
+                            size: None,
+                            atime_ns: None,
+                            mtime_ns: Some(1 + i as i64),
+                        };
+                        run(&meta, rid(*node), op);
+                    }
                     Step::Ack(k) => {
                         if let Some((hash, ino)) = rows.get(*k) {
                             meta.ack_upload(hash, *ino).unwrap();
@@ -2099,7 +2356,7 @@ mod tests {
                     }
                     Step::Ship => {
                         segment += 1;
-                        shipped(&meta, segment);
+                        shipped(&meta, segment, &mut shipped_records);
                     }
                 }
                 // Chunk metered-own-rows: node 7's blame walk is kept
@@ -2114,7 +2371,10 @@ mod tests {
                     blame_walk(&r, &meta, 7, &theirs, tip).unwrap();
                 }
             }
-            meta
+            Journaled {
+                meta,
+                shipped: shipped_records,
+            }
         }
 
         /// The rule written out pairwise, quadratic, as the module doc
@@ -2132,29 +2392,38 @@ mod tests {
             let r = meta.db.read_tx();
             let pending = read_pending(&r, meta).unwrap();
             let mut out: Vec<(u64, Option<Rid>, u64, Option<BTreeSet<Ino>>)> = Vec::new();
-            let mut written: Vec<Option<BTreeSet<Vec<u8>>>> = Vec::new();
+            let mut written: Vec<Option<Vec<(Vec<u8>, Mode)>>> = Vec::new();
             for tx in transactions(&r, meta).unwrap() {
                 let row = local::get_journal_tx(&r, meta, tx.first).unwrap();
-                let keys: Option<BTreeSet<Vec<u8>>> = tx_keys(
+                let keys: Option<TxKeys> = tx_keys(
                     &tx,
                     tx.spec_seq.and_then(|seq| {
                         spec::row_keys_and_origin(&r, meta, seq)
                             .unwrap()
-                            .map(|row| row.keys)
+                            .map(|row| (row.keys, row.merge))
                     }),
                     row.as_ref(),
-                )
-                .map(|keys| keys.into_iter().collect());
-                let mut touched = keys.clone();
+                );
+                // What it writes (the taint), and what it accesses: the
+                // same with a refusal's observation added.
+                let taint: Option<Vec<(Vec<u8>, Mode)>> = keys.as_ref().map(|k| {
+                    [Mode::Excl, Mode::Merge]
+                        .into_iter()
+                        .flat_map(|m| k.of(m).iter().map(move |key| (key.clone(), m)))
+                        .collect()
+                });
+                let mut touched = taint.clone();
                 if let (Some(t), Some(row)) = (touched.as_mut(), row.as_ref()) {
-                    t.extend(row.observed.iter().cloned());
+                    t.extend(row.observed.iter().map(|k| (k.clone(), Mode::Obs)));
                 }
                 let mut waits = !seed_inos(&tx, &pending).is_empty();
                 let mut blame: BTreeSet<Ino> = seed_inos(&tx, theirs).into_iter().collect();
                 for (i, (_, _, _, earlier)) in out.iter().enumerate() {
                     let Some(earlier) = earlier else { continue };
                     let depends = match (&written[i], &touched) {
-                        (Some(w), Some(t)) => !w.is_disjoint(t),
+                        (Some(w), Some(t)) => w.iter().any(|(wk, wm)| {
+                            t.iter().any(|(tk, tm)| wk == tk && conflicts(*tm, *wm))
+                        }),
                         _ => true,
                     };
                     if depends {
@@ -2162,7 +2431,7 @@ mod tests {
                         blame.extend(earlier);
                     }
                 }
-                written.push(keys);
+                written.push(taint);
                 out.push((
                     tx.first,
                     tx_rid(&tx, row.as_ref()),
@@ -2174,7 +2443,7 @@ mod tests {
         }
 
         fn check(steps: &[Step]) {
-            let meta = journal(steps);
+            let meta = journal(steps).meta;
             let r = meta.db.read_tx();
             let poisoned = read_poisoned(&r, &meta).unwrap();
             let pending = read_pending(&r, &meta).unwrap();
@@ -2263,6 +2532,83 @@ mod tests {
             }
         }
 
+        /// `ns` of a replica that applied `records` in order, without the
+        /// root inode (two replicas' genesis timestamps differ).
+        fn state_after(records: &[LogRecord]) -> BTreeMap<Vec<u8>, Vec<u8>> {
+            let r = Meta::open_in_memory().unwrap();
+            r.apply_records(records).unwrap();
+            let mut map: BTreeMap<Vec<u8>, Vec<u8>> = r.ns_dump().unwrap().into_iter().collect();
+            map.remove(&constellation_mtree::keys::inode(ROOT_INO));
+            map
+        }
+
+        /// ADR-59, the commutation argument: what the plan ships ahead of
+        /// what it holds or defers leaves the state that journal order
+        /// does (the value of every `ns` key), and, once shipped, the
+        /// publisher's view over the transactions still held is exactly
+        /// the shipped log's prefix (never a deferral).
+        fn check_ship_order(steps: &[Step]) {
+            let j = journal(steps);
+            let meta = &j.meta;
+            {
+                let r = meta.db.read_tx();
+                let poisoned = read_poisoned(&r, meta).unwrap();
+                let pending = read_pending(&r, meta).unwrap();
+                let p = plan(&r, meta, &poisoned, &pending, None).unwrap();
+                let rows = |txs: &mut dyn Iterator<Item = &Tx>| -> Vec<LogRecord> {
+                    txs.flat_map(|t| t.rows.iter().map(|(_, r)| r.clone()))
+                        .collect()
+                };
+                let journal_order = rows(&mut transactions(&r, meta).unwrap().iter());
+                // What ships goes first; what is held or deferred follows
+                // in journal order among themselves.
+                let shipping: BTreeSet<u64> = p.ship.iter().map(|t| t.first).collect();
+                let all = transactions(&r, meta).unwrap();
+                let plan_order = rows(
+                    &mut p
+                        .ship
+                        .iter()
+                        .chain(all.iter().filter(|t| !shipping.contains(&t.first))),
+                );
+                let with = |tail: &[LogRecord]| -> Vec<LogRecord> {
+                    j.shipped.iter().chain(tail).cloned().collect()
+                };
+                assert_eq!(
+                    state_after(&with(&journal_order)),
+                    state_after(&with(&plan_order)),
+                    "shipping ahead of the held is journal order, {steps:?}"
+                );
+            }
+            // Ship what ships, then compare the view with the log.
+            let mut after = steps.to_vec();
+            after.push(Step::Ship);
+            let j = journal(&after);
+            let meta = &j.meta;
+            let basis = meta
+                .read_consistent(|snap| meta.publish_basis_at(snap))
+                .unwrap();
+            let mut view: BTreeMap<Vec<u8>, Vec<u8>> =
+                meta.ns_dump().unwrap().into_iter().collect();
+            match &basis {
+                crate::PublishBasis::AsIs => {}
+                crate::PublishBasis::Substituted(overlay) => {
+                    for (k, v) in overlay.iter() {
+                        match v {
+                            Some(v) => {
+                                view.insert(k.to_vec(), v.to_vec());
+                            }
+                            None => {
+                                view.remove(k);
+                            }
+                        }
+                    }
+                }
+                crate::PublishBasis::Defer => panic!("the publisher defers, {after:?}"),
+            }
+            view.remove(&constellation_mtree::keys::inode(ROOT_INO));
+            assert_eq!(view, state_after(&j.shipped), "the publish view, {after:?}");
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(256))]
             #[test]
@@ -2271,6 +2617,14 @@ mod tests {
             ) {
                 check(&steps);
             }
+
+            #[test]
+            fn ship_order_equals_journal_order(
+                steps in proptest::collection::vec(step(), 1..40)
+            ) {
+                check_ship_order(&steps);
+            }
+
         }
     }
 }

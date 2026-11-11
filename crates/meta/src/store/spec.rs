@@ -295,6 +295,16 @@ impl MergeDelta {
             ctime_ns: self.ctime_ns.max(other.ctime_ns),
         }
     }
+
+    /// `attrs` after the merge, exactly as `misc::touch_times_tx` and
+    /// `misc::bump_nlink_tx` apply it.
+    pub(crate) fn apply_to(self, attrs: &mut constellation_mtree::record::Attrs) {
+        attrs.nlink = (attrs.nlink as i64 + self.nlink).max(0) as u32;
+        if let Some(t) = self.mtime_ns {
+            attrs.mtime_ns = attrs.mtime_ns.max(t);
+        }
+        attrs.ctime_ns = attrs.ctime_ns.max(self.ctime_ns);
+    }
 }
 
 /// ADR-59: how a transaction wrote a key it wrote only by a directory's
@@ -3705,7 +3715,8 @@ fn journal_from(r: &impl Readable, meta: &Meta) -> Result<u64, MetaError> {
 /// up to `upto`". With `only`, just the transactions it covers retire; a
 /// held transaction below `upto` stays outstanding, and every shipped row
 /// newer than it becomes a `Foreign` row — shipped out of order, but by
-/// construction touching none of its keys. `None` means everything from
+/// construction conflicting with none of its keys (ADR-59: a key they
+/// share is a directory's merge on both sides). `None` means everything from
 /// the acked watermark through `upto` (`Meta::ack_journal`).
 pub(crate) fn retire_local_tx(
     tx: &mut SingleWriterWriteTx,
@@ -3855,13 +3866,20 @@ pub(crate) struct Retired {
 /// Plan 30 §M4: a `Foreign` row in that range is one of this node's own
 /// transactions that shipped while an older one was held back
 /// (`store::held`). It is in the log, so its keys keep their current
-/// values — which is right only if it touched none of the keys an older
-/// outstanding row did (the holdback rule guarantees exactly that: a
-/// transaction touching a held key is held too). A later outstanding row
-/// may touch its keys; that row's before-image then already includes it.
-/// `None` if a `Foreign` row does overlap, or anything but `Local` and
-/// `Foreign` rows sits in the range: the overlay would not be the log
-/// prefix, so the publish defers.
+/// values, which is right only if it conflicts with none of the keys an
+/// older outstanding row wrote.
+///
+/// ADR-59: the ship rule lets a transaction ship past a held one when the
+/// only keys they share are ones both write by a directory's commutative
+/// merge (`max` times, additive `nlink`). The log prefix of such a key is
+/// its value before the first unshipped `Local` row, plus the merges of
+/// the rows that shipped: [`LogPrefixView::merge_shipped`] applies them
+/// to the view's value (merges commute, so their order does not matter).
+/// A shipped row that writes a key of the view exclusively, or merges one
+/// that an outstanding row wrote exclusively, cannot be explained that
+/// way (the planner never lets it ship past a held row): `None`. So is
+/// anything but `Local` and `Foreign` rows in the range: the overlay would
+/// not be the log prefix, so the publish defers.
 pub(crate) fn local_before_images_from(
     r: &impl Readable,
     meta: &Meta,
@@ -3872,11 +3890,17 @@ pub(crate) fn local_before_images_from(
         match row.kind {
             SpecKind::Local { .. } => {
                 for (key, before) in &row.before {
-                    view.note(key, before);
+                    let merged = row
+                        .merge
+                        .binary_search_by(|(k, _)| k.as_slice().cmp(key.as_slice()))
+                        .is_ok();
+                    view.note(key, before, merged);
                 }
             }
             SpecKind::Foreign { .. } => {
-                if row.before.iter().any(|(key, _)| view.contains(key)) {
+                if row.before.iter().any(|(key, _)| view.contains(key))
+                    && !view.merge_shipped(row.before.iter().map(|(key, _)| key), &row.merge)
+                {
                     return Ok(None);
                 }
             }
@@ -4067,10 +4091,14 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
 
 // ------------------------------------------------- poison isolation
 
-/// The `ns` keys a captured row touched and the `spec_seq` it was first
-/// recorded under.
+/// The `ns` keys a captured row touched, which of them it wrote only by a
+/// directory's merge (ADR-59), and the `spec_seq` it was first recorded
+/// under.
 pub(crate) struct RowKeys {
     pub keys: Vec<Vec<u8>>,
+    /// The sorted subset of `keys` written only by merge; every other key
+    /// was written exclusively.
+    pub merge: Vec<Vec<u8>>,
     pub origin: u64,
 }
 
@@ -4086,6 +4114,7 @@ pub(crate) fn row_keys_and_origin(
             let row: SpecRow = crate::record::from_bytes_exact(&v)?;
             Ok(Some(RowKeys {
                 keys: row.before.into_iter().map(|(key, _)| key).collect(),
+                merge: row.merge.into_iter().map(|(key, _)| key).collect(),
                 origin: row.origin,
             }))
         }
