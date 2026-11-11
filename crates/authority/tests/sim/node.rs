@@ -521,6 +521,8 @@ pub struct NodeEnv {
     pub placement_recalls_sticky: bool,
     /// See `SimConfig::kept_fetch_skipped`.
     pub kept_fetch_skipped: bool,
+    /// See `SimConfig::parent_taint_conservative`.
+    pub parent_taint_conservative: bool,
     /// See `SimConfig::restart_skips_write_quarantine`.
     pub restart_skips_write_quarantine: bool,
     /// See `SimConfig::first_start_unsettled`.
@@ -644,6 +646,8 @@ impl NodeHandle {
                 m.set_recall_drop_hook(Box::new(move |gen, idx, rid| {
                     drops.lock().unwrap().push((id, gen, idx, rid));
                 }));
+                // ADR-59's negative control.
+                m.set_parent_taint_conservative(env.parent_taint_conservative);
                 // A restart without the journal keeps no queue either.
                 env.oracles.identity.lock().unwrap().wipe(id);
                 Arc::new(m)
