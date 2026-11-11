@@ -86,6 +86,11 @@ pub struct SessionReport {
     pub tentative: usize,
     /// Violations of reads that timed out.
     pub degraded_violations: usize,
+    /// ADR-57: reads a pending acknowledged row (a read hold) touched, and
+    /// of those the ones answered without it (each a `held_read_served`
+    /// violation).
+    pub held_reads: usize,
+    pub held_served: usize,
     /// Refusals placed at their own `Refused` row, and refusals with no
     /// row in an applied segment, placed by the scoped window.
     pub refusals_placed: usize,
@@ -186,8 +191,29 @@ pub fn check_sessions(
     let mut report = SessionReport {
         reads: reads.len(),
         degraded: reads.iter().filter(|r| r.timed_out).count(),
+        held_reads: reads.iter().filter(|r| r.held).count(),
+        held_served: reads.iter().filter(|r| r.held_served).count(),
         ..Default::default()
     };
+    // ADR-57: a read of a key a pending acknowledged row touches is never
+    // answered from the state that lacks the row (it waits for the row's
+    // return, or is refused): answered, it is a violation whatever the
+    // log's order says.
+    for r in reads.iter().filter(|r| r.held_served) {
+        report.violations.push((
+            "held_read_served".to_string(),
+            format!(
+                "node {} (incarnation {}) t{} read {} as {} at tick {} while an acknowledged row \
+                 it touches was pending (held, not released)",
+                r.node,
+                r.incarnation,
+                r.thread,
+                r.name,
+                if r.present { "present" } else { "absent" },
+                r.inv,
+            ),
+        ));
+    }
     let mut invoke: HashMap<Rid, (u64, NsOp)> = HashMap::new();
     let mut ret: HashMap<Rid, (u64, NsRet)> = HashMap::new();
     for (e, t) in events.iter().zip(ticks) {
@@ -443,6 +469,11 @@ pub fn check_sessions(
     /// (return tick, name, floor, kind, what set it)
     type Obs = (u64, String, usize, Kind, String);
     let mut obs: BTreeMap<Session, Vec<Obs>> = BTreeMap::new();
+    // ADR-57 (oracle gap 2): a node's own acknowledged write binds its later
+    // reads in any incarnation of the node (a restart is a new FUSE session
+    // but not a new view of what the node was told): monotonic reads stay
+    // per incarnation.
+    let mut own_by_node: BTreeMap<u64, Vec<Obs>> = BTreeMap::new();
     for (rid, (rt, r)) in &ret {
         let Some((it, op)) = invoke.get(rid) else {
             continue;
@@ -454,13 +485,15 @@ pub fn check_sessions(
         match (r, index_of.get(rid)) {
             (NsRet::Ok, Some(p)) => {
                 for n in names_of(op) {
-                    obs.entry(session).or_default().push((
+                    let o: Obs = (
                         *rt,
                         n.to_string(),
                         p + 1,
                         Kind::Own,
                         format!("own {op:?} rid {rid:?}"),
-                    ));
+                    );
+                    own_by_node.entry(rid.node).or_default().push(o.clone());
+                    obs.entry(session).or_default().push(o);
                 }
             }
             (NsRet::Eexist | NsRet::Enoent, None) => {
@@ -591,6 +624,7 @@ pub fn check_sessions(
             let list = obs.entry(session).or_default();
             let binding = list
                 .iter()
+                .chain(own_by_node.get(&session.0).into_iter().flatten())
                 .filter(|(t, n, ..)| *t < r.inv && *n == r.name)
                 .max_by_key(|(_, _, k, ..)| *k)
                 .cloned();
@@ -699,7 +733,65 @@ mod tests {
             inv,
             ret,
             timed_out: false,
+            held: false,
+            held_served: false,
         }
+    }
+
+    /// ADR-57 (oracle gaps 1 and 2): a node's own acknowledged write binds a
+    /// read after the node restarted (a new incarnation), and a read that
+    /// answered while an acknowledged row it touches was pending is a
+    /// violation of its own.
+    #[test]
+    fn a_restart_does_not_forget_an_own_write_and_a_held_read_is_never_served() {
+        let events = vec![
+            HistEvt::Invoke {
+                thread: 16,
+                rid: rid(1, 1),
+                op: NsOp::Create("a".into()),
+            },
+            HistEvt::Return {
+                thread: 16,
+                rid: rid(1, 1),
+                ret: NsRet::Ok,
+            },
+        ];
+        let ticks = vec![0, 1];
+        let log: HashMap<Rid, (u64, usize)> = [(rid(1, 1), (1, 0))].into_iter().collect();
+        let none = HashSet::new();
+        let run = |reads: &[ReadEvt]| {
+            check_sessions(
+                &events,
+                &ticks,
+                reads,
+                &none,
+                &log,
+                &HashMap::new(),
+                &none_j,
+                &none_j,
+                &HashMap::new(),
+                &HashMap::new(),
+                Scope::Global,
+            )
+        };
+        let mut after_restart = read(1, "a", false, 4, 5);
+        after_restart.incarnation = 2;
+        let r = run(&[after_restart.clone()]);
+        let kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, vec!["read_your_writes"], "{r:?}");
+        // Present after the restart: fine.
+        after_restart.present = true;
+        assert!(run(&[after_restart]).violations.is_empty());
+        // Another node's read is not bound by it.
+        assert!(run(&[read(2, "a", false, 4, 5)]).violations.is_empty());
+        // A held read that answered, even with an explainable state.
+        let mut held = read(2, "a", false, 4, 5);
+        held.held = true;
+        held.held_served = true;
+        let r = run(&[held]);
+        let kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, vec!["held_read_served"], "{r:?}");
+        assert_eq!((r.held_reads, r.held_served), (1, 1));
     }
 
     /// Node 1 creates `a` (log 0); node 2's create is refused `EEXIST`;

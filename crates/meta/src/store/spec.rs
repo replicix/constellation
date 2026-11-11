@@ -1758,6 +1758,12 @@ fn strand_local_tx(
             .load(std::sync::atomic::Ordering::SeqCst)
     {
         if strand.recall || strand.superseded {
+            #[cfg(any(test, feature = "test-util"))]
+            if let (true, Some(hook), Some(rid)) =
+                (strand.recall, meta.recall_drop_hook.get(), row.rid)
+            {
+                hook(row.gen, row.idx, rid);
+            }
             return Ok(Stranding::Dropped);
         }
         // The row was acknowledged to its requester by the delegate, and its

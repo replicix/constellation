@@ -9436,6 +9436,10 @@ struct OracleTotals {
     /// queued with a gated class (counted), own `Archive` rows of an older
     /// epoch the takeover gate dropped].
     c14: [u64; 13],
+    /// ADR-57: [reads a read hold touched, of them answered without the
+    /// held row (violations), delegate rows a recall dropped, of them
+    /// acknowledged and lost (violations)].
+    holds: [u64; 4],
     /// Plan 43 C7b: [TTL claims, of a live holder, seals of a live holder,
     /// permitted claims] and the seeds with a claim of a live holder.
     lease: [u64; 4],
@@ -9577,6 +9581,10 @@ impl OracleTotals {
         self.c14[10] += r.member_copy_rows_left as u64;
         self.c14[11] += r.identity_foreign_gated as u64;
         self.c14[12] += r.archive_dropped();
+        self.holds[0] += r.sessions.held_reads as u64;
+        self.holds[1] += r.sessions.held_served as u64;
+        self.holds[2] += r.recall_dropped as u64;
+        self.holds[3] += r.recall_dropped_acked as u64;
         self.seg[0] += r.segments_landed.0;
         self.seg[1] += r.segments_landed.1;
         self.seg[3] += r.segments_landed.2;
@@ -10093,6 +10101,11 @@ impl OracleTotals {
             self.tail[6],
             self.tail[7],
             self.class_claim_seeds
+        );
+        eprintln!(
+            "SWEEP-HOLDS {label} seeds {}/{seeds}: reads held {}, answered without the held row {}, \
+             delegate rows dropped by a recall {}, of them acknowledged and lost {}",
+            self.seeds, self.holds[0], self.holds[1], self.holds[2], self.holds[3]
         );
         eprintln!(
             "SWEEP-C14-TOTALS {label} seeds {}/{seeds}: committed rolled back {}, superseded by a \

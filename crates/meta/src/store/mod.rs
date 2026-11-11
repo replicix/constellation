@@ -767,6 +767,11 @@ pub struct Meta {
     /// they touched, so another node's write is visible without waiting
     /// out the attribute/entry TTL).
     foreign_apply_hook: std::sync::OnceLock<ForeignApplyHook>,
+    /// Tests only: told of each delegate row a recall dropped from the
+    /// journal (`gen`, `idx`, the row's rid). ADR-57 P5: a recall only drops
+    /// rows nobody was told were committed.
+    #[cfg(any(test, feature = "test-util"))]
+    recall_drop_hook: std::sync::OnceLock<Box<dyn Fn(u64, u64, crate::rid::Rid) + Send + Sync>>,
     /// Plan 42 §5.1.5: told what every stranding pass rolled back
     /// ([`Meta::set_rollback_hook`]), and what it has not been told yet.
     rollback_hook: std::sync::OnceLock<RollbackHook>,
@@ -888,6 +893,15 @@ impl Meta {
     /// may have seen before the transaction — content and times, `ctime`
     /// included — while that kernel holds what the transaction wrote; no
     /// foreign apply reports it. Set once; a second call is ignored.
+    /// Tests only: see the field. Set once; a second call is ignored.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_recall_drop_hook(
+        &self,
+        hook: Box<dyn Fn(u64, u64, crate::rid::Rid) + Send + Sync>,
+    ) {
+        let _ = self.recall_drop_hook.set(hook);
+    }
+
     pub fn set_rollback_hook(&self, hook: RollbackHook) {
         let _ = self.rollback_hook.set(hook);
     }
@@ -1327,6 +1341,8 @@ impl Meta {
             deleg_group_history: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             locks: crate::locks::LockTables::default(),
             foreign_apply_hook: std::sync::OnceLock::new(),
+            #[cfg(any(test, feature = "test-util"))]
+            recall_drop_hook: std::sync::OnceLock::new(),
             rollback_hook: std::sync::OnceLock::new(),
             rolled_back: std::sync::Mutex::new(Vec::new()),
             staged_unvoids: std::sync::Mutex::new(Vec::new()),

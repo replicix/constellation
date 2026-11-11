@@ -1517,6 +1517,13 @@ pub struct Report {
     /// Plan 43 C1-4: nodes holding member-copy rows at convergence (must be
     /// 0; fails a `strict_durability` run).
     pub member_copy_rows_left: usize,
+    /// ADR-57: nodes holding reads of a pending acknowledged row at
+    /// convergence (must be 0: a hold nothing releases is a leak).
+    pub read_holds_left: usize,
+    /// ADR-57 P5: delegate rows a recall dropped, and of those the ones the
+    /// history shows acknowledged and the log never carried (must be 0).
+    pub recall_dropped: usize,
+    pub recall_dropped_acked: usize,
     pub non_verbatim: usize,
     /// Plan 46 M1.2 step 3, `acked_at_or_below_cut`: rows answered past their
     /// stream's cut, the answered rows of cut streams judged, and those an
@@ -2229,9 +2236,16 @@ async fn client_read(
             },
         }
     }
+    // ADR-57: whether a pending acknowledged row (a read hold) touched the
+    // read's keys, and whether the read then answered without it (answered
+    // while held, or after the hold ran out at its cap instead of being
+    // released by the row's return).
+    let lapsed0 = handle.meta.held_copy_lapsed();
+    let mut held = handle.meta.member_copy_touches(&keys);
     if let Some(budget) = wait {
         let mut waited = 0;
         while !handle.meta.session_ready_at(&keys, &floor) {
+            held |= handle.meta.member_copy_touches(&keys);
             if waited >= budget || !handle.alive() {
                 timed_out = waited >= budget;
                 break;
@@ -2243,6 +2257,9 @@ async fn client_read(
     if !handle.alive() {
         return;
     }
+    let held_now = handle.meta.member_copy_touches(&keys);
+    let held_served = held_now || (held && handle.meta.held_copy_lapsed() > lapsed0);
+    held |= held_now;
     let present = constellation_meta::MetaStore::lookup(&*handle.meta, parent, &leaf)
         .ok()
         .flatten()
@@ -2271,6 +2288,8 @@ async fn client_read(
         inv,
         ret: history.tick(),
         timed_out,
+        held,
+        held_served,
         path,
     });
 }
@@ -5064,6 +5083,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     bus.set_request_delay_to(cfg.request_delay_to);
     let commits: Arc<Mutex<Vec<CommitRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let in_doubt: super::node::InDoubtLog = Arc::new(Mutex::new(Vec::new()));
+    let recall_drops: Arc<Mutex<Vec<(NodeId, u64, u64, Rid)>>> = Arc::new(Mutex::new(Vec::new()));
     let oracles = super::oracle::Oracles::new(bucket.clone());
     // Plan 43 C7a (commit 6): the default clock-fault mix.
     let horizon = cfg.ops_per_client * 400 + 2_000;
@@ -5076,6 +5096,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         clock: clock.clone(),
         commits: commits.clone(),
         in_doubt: in_doubt.clone(),
+        recall_drops: recall_drops.clone(),
         config: cfg.core.clone(),
         panic_after_events: cfg.panic_after_events,
         fast_path: cfg.fast_path,
@@ -6686,6 +6707,24 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 ));
             }
         }
+        // ADR-57 (`read_holds_gone`): a read hold is a pending acknowledged
+        // row; at convergence every row is back or final, so none is left.
+        let mut holds: Vec<String> = Vec::new();
+        for id in cluster.ids() {
+            let n = cluster.get(id);
+            if n.alive() {
+                let h = n.meta.read_holds();
+                if !h.is_empty() {
+                    holds.push(format!("node {id}: {} hold(s) (slot, first) {h:?}", h.len()));
+                }
+            }
+        }
+        report.read_holds_left = holds.len();
+        if !holds.is_empty() {
+            return Err(lin_context(format!(
+                "read_holds_gone: read holds outlive the run at convergence: {holds:?}"
+            )));
+        }
         report.member_copy_rows_left = left.len();
         if !left.is_empty() && (cfg.strict_durability || cfg.strict_verbatim) {
             return Err(lin_context(format!(
@@ -6794,6 +6833,32 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         if let Some((checker, what)) = report.sessions.violations.first() {
             return Err(lin_context(format!(
                 "session guarantee violated ({checker}): {what}"
+            )));
+        }
+    }
+    // ADR-57 P5 (`recall_dropped_acked`): a recall drops the delegate rows a
+    // deposed root appended past the generation's cut, which nobody was
+    // told were committed. A dropped row whose rid the history shows
+    // acknowledged `Ok` and the log never carried is an acknowledged row
+    // lost (the fix is in the seal, not a hold).
+    {
+        let drops = recall_drops.lock().unwrap().clone();
+        report.recall_dropped = drops.len();
+        let acked: HashSet<Rid> = history
+            .returned()
+            .into_iter()
+            .filter(|(_, ret)| *ret == NsRet::Ok)
+            .map(|(rid, _)| rid)
+            .collect();
+        let lost: Vec<_> = drops
+            .iter()
+            .filter(|(_, _, _, rid)| acked.contains(rid) && !oracle.completed_at.contains_key(rid))
+            .collect();
+        report.recall_dropped_acked = lost.len();
+        if !lost.is_empty() {
+            return Err(lin_context(format!(
+                "recall_dropped_acked: a recall dropped delegate rows (node, gen, idx, rid) \
+                 whose rid was acknowledged and never reached the log: {lost:?}"
             )));
         }
     }

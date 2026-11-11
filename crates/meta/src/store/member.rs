@@ -667,6 +667,12 @@ impl Meta {
         Ok(())
     }
 
+    /// Load the persisted holds into the in-memory index: the open does, and
+    /// a test drives it to model a process restart over the same store.
+    pub fn reload_read_holds(&self) -> Result<(), MetaError> {
+        self.load_read_holds()
+    }
+
     /// Load the persisted holds into the in-memory index (open).
     pub(crate) fn load_read_holds(&self) -> Result<(), MetaError> {
         let r = self.db.read_tx();
@@ -693,6 +699,17 @@ impl Meta {
             .store(!held.is_empty(), std::sync::atomic::Ordering::Relaxed);
         *self.held_copies.lock().unwrap() = held;
         Ok(())
+    }
+
+    /// The `(slot, first)` of every acknowledged row this node holds reads of
+    /// (ADR-57): empty at quiescence.
+    pub fn read_holds(&self) -> Vec<(u64, u64)> {
+        self.held_copies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| (h.slot, h.first))
+            .collect()
     }
 
     fn any_held(&self) -> bool {
