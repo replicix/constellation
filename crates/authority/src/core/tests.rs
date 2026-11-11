@@ -62022,6 +62022,20 @@ mod m11_step5 {
         out.extend(release(&mut h));
         assert_eq!(replies(&out).len(), 1, "{out:?}");
     }
+
+    /// (6a, b) Fails on main: a node that holds no lease (not lost, no hold)
+    /// answered its unshipped journal row as the log's at the deadline.
+    #[test]
+    fn a_non_holder_does_not_answer_its_unshipped_row_as_the_logs() {
+        let mut h = Harness::new(1);
+        let r1 = archive_row_then_a_tenure_gap(&mut h);
+        h.core.lease.held = None;
+        assert!(!h.core.lease.lost);
+        assert!(
+            h.core.settled_outcome(r1, &h.meta).is_none(),
+            "an unshipped row read as the log's"
+        );
+    }
 }
 
 /// Plan 46 M1.4 step 1: `StreamAheadAck`, the member's acknowledgement of

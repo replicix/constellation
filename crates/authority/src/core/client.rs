@@ -4785,7 +4785,12 @@ impl Core {
     /// carries is not the log's (long_backup seed 56774: the deposed
     /// holder's own `Refused` row, never acknowledged, answered `ENOENT`
     /// at the deadline; the op then ran by rid under the next holder and
-    /// succeeded). A holder's row that is not in its journal is in an
+    /// succeeded). The same holds for any node that holds no lease: a row its
+    /// journal carries and no applied segment does is unshipped, whatever
+    /// ended the tenure (a continuation epoch's close, a lapse, a hold):
+    /// never the log's (`flex-tight` seed 1286: the lease let go, the
+    /// deadline answered `Archive` for a row that had not shipped). A
+    /// holder's row that is not in its journal is in an
     /// applied segment — the log (a holder applies its own segments once
     /// they landed): answered as a non-holder's is, whatever its journal
     /// still waits for (long-delegated-late-answers seed 1381: a backup
@@ -4803,14 +4808,16 @@ impl Core {
     pub(crate) fn settled_outcome(&self, rid: Rid, replica: &dyn Replica) -> Option<MutateOutcome> {
         let holds = self.lease.held.is_some() || self.lease.epoch_held();
         if !holds {
-            // Plan 46 M1.4 step 2: nor a row an ended hold left uncommitted
-            // (the member's copy was never acknowledged, the archive has not
-            // carried it): it is the journal's, not the log's.
-            let held_back = self.lease.lost
-                || replica
-                    .journal_class_of_rid(rid)
-                    .is_some_and(|(first, _)| self.left_by_hold(first));
-            if held_back && journal_carries_outcome(replica, rid) && !replica.outcome_from_log(rid)
+            // Plan 46 M1.4 step 6a (ADR-53): a node that holds no lease never
+            // reads a row of its own journal as the log's: the journal still
+            // carries the rid's outcome and no applied segment does, so it
+            // is unshipped (an ended hold's, a lapsed or closed tenure's, a
+            // deposed holder's): the settle path decides, not the deadline.
+            // (A delegation row, `gen != 0`, commits by its group or the log:
+            // `completed_row_settled` below.)
+            if replica.outcome_row(rid).is_some_and(|r| r.gen == 0)
+                && journal_carries_outcome(replica, rid)
+                && !replica.outcome_from_log(rid)
             {
                 return None;
             }
