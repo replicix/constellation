@@ -1031,15 +1031,17 @@ pub(crate) struct StickyReleaseCmd {
     pub deadline: WaitMs,
     /// Generation -> the subtrees to release.
     pub parts: BTreeMap<u64, BTreeSet<Ino>>,
-    /// ADR-56: a handover's release (the root asked, the holder found
-    /// itself quiet). It releases only on a step after the one that made
-    /// it (and the next: the step that made it may be a timer's): the engine's fast path is told to leave its subtrees (they drop
-    /// out of the view it reads, [`Core::deleg_view_local`]) and reports
-    /// what it still has in flight (`Core::deleg_note_local`) in between.
+    /// ADR-56: a handover's release (the root asked, the holder found itself
+    /// quiet); counted, and put back as a wait if it gives up.
     pub handover: bool,
-    /// How many steps have ended since a handover's release was made
-    /// ([`Core::handover_progress`] counts them, to 2): it releases at 2.
-    pub seen: u8,
+    /// The root that asked (a handover's; `0` for a release by hand).
+    pub root: NodeId,
+    /// The core step that made the command ([`DelegationState::step`]). The
+    /// engine's fast path is told to leave the command's subtrees by the
+    /// view the driver mirrors after that step; the release goes only once a
+    /// sample the driver took after that mirror (`Core::deleg_note_local`)
+    /// shows no fast-path op in flight there.
+    pub made_at: u64,
 }
 
 /// ADR-56: the root asked this node, the holder of sticky subtrees of stream
@@ -1055,6 +1057,10 @@ pub(crate) struct HandoverWait {
     pub root: NodeId,
     /// When the first request of this wait arrived.
     pub asked: WaitMs,
+    /// When the root last asked (a repeated request refreshes it): the wait
+    /// expires [`Core::handover_patience_ms`] after it, as the root's
+    /// request does.
+    pub last_asked: WaitMs,
 }
 
 /// How long a draining release holds the new ops of its subtrees at most
@@ -1296,9 +1302,13 @@ pub(crate) struct DelegationState {
     /// own release row) yet.
     pub handovers: Vec<HandoverWait>,
     /// ADR-56: ops the engine's fast path had admitted and not yet
-    /// journaled when it last reported ([`Core::deleg_note_local`]); any
-    /// generation: an over-approximation only delays a release.
-    pub fast_inflight: u64,
+    /// journaled when it last reported ([`Core::deleg_note_local`]), per
+    /// (stream, subtree).
+    pub fast_inflight: BTreeMap<(u64, Ino), u64>,
+    /// Steps `Core::handle` has run (see [`StickyReleaseCmd::made_at`]).
+    pub step: u64,
+    /// The step the engine's last report followed.
+    pub sampled_at: u64,
     /// Plan 46 M1.3 step 5: the generations this process installed and the
     /// table still lists. A stream of this node that released every subtree
     /// and is not among them lost its state with a restart
@@ -1538,14 +1548,15 @@ impl Core {
             .mine
             .values()
             .map(|d| {
-                // ADR-56: the subtrees a release is draining leave the
-                // fast path's view (its ops go to the core, which holds
-                // them, `sticky_holds`) for as long as the hold lasts.
+                // ADR-56: the subtrees a holder's release is draining leave
+                // the fast path's view (its ops go to the core, which holds
+                // them while the hold lasts, `sticky_holds`, and runs them
+                // through the core after) for as long as the command lasts,
+                // so that no fast-path op lands behind the release row.
                 let draining: Vec<&BTreeSet<Ino>> = self
                     .dl
                     .sticky_cmds
                     .iter()
-                    .filter(|c| c.handover)
                     .filter_map(|c| c.parts.get(&d.gen))
                     .collect();
                 (
@@ -5078,7 +5089,7 @@ impl Core {
         }
         self.deleg_forget_ended(now, replica);
         self.deleg_leave_progress(now, replica, out);
-        self.handover_progress(now, true, replica, out);
+        self.handover_progress(now, replica, out);
         self.sticky_release_progress(now, replica, out);
         self.abandon_progress(now, replica, out);
         self.deleg_restart_void_round(now, replica, out);
@@ -12289,7 +12300,8 @@ impl Core {
             deadline: now.wait.plus(self.leave_wait_ms() as u64),
             parts,
             handover: false,
-            seen: 2,
+            root: 0,
+            made_at: self.dl.step,
         });
         self.sticky_release_progress(now, replica, out);
     }
@@ -12309,15 +12321,9 @@ impl Core {
         let mut keep = Vec::new();
         for mut c in cmds.drain(..) {
             let gens: Vec<u64> = c.parts.keys().copied().collect();
-            // A handover's release goes on a step after the one that made
-            // it (see [`StickyReleaseCmd::handover`]).
-            let ready = c.seen >= 2 || !c.handover;
             for gen in gens {
-                if !ready {
-                    break;
-                }
                 let mut dirs = c.parts.remove(&gen).expect("present");
-                if !self.sticky_part_progress(now, gen, &mut dirs, replica, out) {
+                if !self.sticky_part_progress(now, gen, c.made_at, &mut dirs, replica, out) {
                     c.parts.insert(gen, dirs);
                 }
             }
@@ -12332,6 +12338,16 @@ impl Core {
             }
             if now.wait >= c.deadline {
                 self.stats.deleg_sticky_releases_given_up += 1;
+                if c.handover {
+                    // The root asked and the holder agreed: the wait goes
+                    // back (the subtree is the holder's until it releases),
+                    // else the request is lost until the root asks again.
+                    self.stats.deleg_handover_given_up +=
+                        c.parts.values().map(|p| p.len() as u64).sum::<u64>();
+                    for (gen, dirs) in std::mem::take(&mut c.parts) {
+                        self.handover_wait(now, c.root, gen, dirs);
+                    }
+                }
                 tracing::warn!(
                     node = self.me(),
                     "a release of sticky subtrees did not complete in time; the grants stay"
@@ -12359,6 +12375,7 @@ impl Core {
         &mut self,
         now: Now,
         gen: u64,
+        made_at: u64,
         dirs: &mut BTreeSet<Ino>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -12419,7 +12436,7 @@ impl Core {
         }
         // (The engine's fast path reports what it still has in flight; its
         // subtrees left its view when the command was made.)
-        let fast = self.dl.fast_inflight > 0;
+        let fast = !self.fast_path_clear(made_at, gen, &still);
         let drained = !busy && !inflight && !refused && !fast && streamed >= idx;
         if !drained {
             tracing::debug!(
@@ -12456,9 +12473,13 @@ impl Core {
     /// stream `gen`, to hand `dirs` over to a node that dominates them
     /// (`dirs` empty: every subtree of the stream). A sticky subtree waits
     /// for the holder to be quiet there ([`Self::handover_progress`]); a
-    /// designated one is ignored (only `online` moves a designation). The
-    /// subtrees that are neither (a placed grant) are returned for the
-    /// caller to release as a recall would; `None`: nothing is left to do.
+    /// designated one is ignored (only `online` moves a designation). A
+    /// placed one is not the holder's to keep: it is released as a recall
+    /// would, but by the holder's own command, which takes the subtree out of
+    /// the fast path's view and drains it first (the engine does not stop the
+    /// fast path for a handover request, so the drain is the core's).
+    /// `Some(dirs)`: the stream is not installed here; the caller answers as
+    /// a recall does (rowless).
     fn on_handover_request(
         &mut self,
         now: Now,
@@ -12471,7 +12492,7 @@ impl Core {
         let me = self.me();
         let Some(d) = self.dl.mine.get(&gen) else {
             // (Not installed here: a recall's rowless answer is the safe
-            // one.)
+            // one. The engine's fast path has no entry for it.)
             return Some(dirs);
         };
         let held: BTreeSet<Ino> = d.dirs.iter().copied().collect();
@@ -12481,7 +12502,7 @@ impl Core {
             dirs.into_iter().collect()
         };
         let table = replica.delegation_table();
-        let (mut wait, mut rest) = (BTreeSet::new(), Vec::new());
+        let (mut wait, mut placed) = (BTreeSet::new(), BTreeSet::new());
         for dir in asked {
             let kind = table
                 .get(dir)
@@ -12504,9 +12525,23 @@ impl Core {
                 // yet): nothing to hand over.
                 None => {}
                 _ if !held.contains(&dir) => {}
-                _ => rest.push(dir),
+                _ => {
+                    placed.insert(dir);
+                }
             }
         }
+        // What a release in progress has named is not named again (the
+        // request is repeated until the row is seen).
+        let draining: BTreeSet<Ino> = self
+            .dl
+            .sticky_cmds
+            .iter()
+            .filter_map(|c| c.parts.get(&gen))
+            .flatten()
+            .copied()
+            .collect();
+        wait.retain(|x| !draining.contains(x));
+        placed.retain(|x| !draining.contains(x));
         // At the request: a subtree with no op of the holder's own in flight
         // goes at once; one with an op in flight waits for the grace of
         // idleness (a repeated request does not turn a wait into "at once").
@@ -12517,9 +12552,16 @@ impl Core {
             .filter(|w| w.gen == gen)
             .flat_map(|w| w.dirs.iter().copied())
             .collect();
-        let (wait, at_once): (BTreeSet<Ino>, BTreeSet<Ino>) = wait
+        let (wait, mut at_once): (BTreeSet<Ino>, BTreeSet<Ino>) = wait
             .into_iter()
             .partition(|x| waiting.contains(x) || self.own_in_flight(gen, *x, replica));
+        // The wait starts with the busy op: the grace runs from it.
+        for dir in wait.difference(&waiting) {
+            if let Some(d) = self.dl.mine.get_mut(&gen) {
+                d.last_own_op.insert(*dir, now.wait);
+            }
+        }
+        at_once.extend(placed);
         if !at_once.is_empty() {
             tracing::info!(
                 node = me,
@@ -12528,26 +12570,49 @@ impl Core {
                 root = from,
                 "no op of the holder's own in flight in the subtrees the root asked for: releasing them"
             );
-            self.handover_release(now, BTreeMap::from([(gen, at_once)]));
+            self.handover_release(now, from, BTreeMap::from([(gen, at_once)]));
         }
-        let wait: BTreeSet<Ino> = wait.difference(&waiting).copied().collect();
-        if !wait.is_empty() {
+        let fresh: BTreeSet<Ino> = wait.difference(&waiting).copied().collect();
+        if !fresh.is_empty() {
             self.stats.deleg_handover_waits += 1;
-            match self.dl.handovers.iter_mut().find(|w| w.gen == gen) {
-                Some(w) => {
-                    w.dirs.extend(wait);
-                    w.root = from;
-                }
-                None => self.dl.handovers.push(HandoverWait {
-                    gen,
-                    dirs: wait,
-                    root: from,
-                    asked: now.wait,
-                }),
-            }
+        }
+        // A wait is refreshed by a repeated request, fresh dirs or not.
+        for w in self.dl.handovers.iter_mut().filter(|w| w.gen == gen) {
+            w.last_asked = now.wait;
+            w.root = from;
+        }
+        if !fresh.is_empty() {
+            self.handover_wait(now, from, gen, fresh);
         }
         self.sticky_release_arm(now, out);
-        Some(rest)
+        None
+    }
+
+    /// Add `dirs` of stream `gen` to the holder's waits (merged per stream).
+    fn handover_wait(&mut self, now: Now, root: NodeId, gen: u64, dirs: BTreeSet<Ino>) {
+        match self.dl.handovers.iter_mut().find(|w| w.gen == gen) {
+            Some(w) => {
+                w.dirs.extend(dirs);
+                w.root = root;
+                w.last_asked = now.wait;
+            }
+            None => self.dl.handovers.push(HandoverWait {
+                gen,
+                dirs,
+                root,
+                asked: now.wait,
+                last_asked: now.wait,
+            }),
+        }
+    }
+
+    /// How long a handover request stays alive at the holder after the root
+    /// last asked: as long as the root keeps it (its patience is the grace
+    /// and two forward timeouts, ADR-56 3.1). Past it the root has dropped
+    /// the request, and a release now would leave the subtree to the root's
+    /// keys (no `pl.handover` to grant from) for nothing.
+    pub(crate) fn handover_patience_ms(&self) -> i64 {
+        self.cfg.handover_grace_ms as i64 + 2 * self.cfg.forward_timeout_ms as i64
     }
 
     /// An op of this node's own ran in stream `gen` (the core's path): note
@@ -12566,10 +12631,22 @@ impl Core {
 
     /// The engine's fast path ran ops of this node's own as the delegate
     /// since it last reported (`notes`: stream, subtree) and has
-    /// `fast_inflight` admitted and not yet journaled (ADR-56, 3.4). Called
-    /// after every driver step, with the mirror of this core's view done.
-    pub fn deleg_note_local(&mut self, now: Now, notes: &[(u64, Ino)], fast_inflight: u64) {
-        self.dl.fast_inflight = fast_inflight;
+    /// `inflight` (stream, subtree, count) admitted and not yet journaled
+    /// (ADR-56, 3.4). Called by the driver after every step, with the mirror
+    /// of this core's view for that step done: the report is a sample taken
+    /// after the step ([`StickyReleaseCmd::made_at`]).
+    pub fn deleg_note_local(
+        &mut self,
+        now: Now,
+        notes: &[(u64, Ino)],
+        inflight: &[(u64, Ino, u64)],
+    ) {
+        self.dl.sampled_at = self.dl.step;
+        self.dl.fast_inflight = inflight
+            .iter()
+            .filter(|(_, _, n)| *n > 0)
+            .map(|(g, d, n)| ((*g, *d), *n))
+            .collect();
         for (gen, dir) in notes {
             if let Some(d) = self.dl.mine.get_mut(gen) {
                 d.last_own_op.insert(*dir, now.wait);
@@ -12577,12 +12654,28 @@ impl Core {
         }
     }
 
+    /// Whether the engine's fast path holds no admitted op under `dirs` of
+    /// stream `gen` that the core must wait for before it releases them, for
+    /// a command made at step `made_at`: the sample the driver took after
+    /// that step's mirror shows none. Without an engine fast path
+    /// (`Config::fast_path_sampled` off: the simulation, the unit harness)
+    /// there is nothing to wait for.
+    pub(crate) fn fast_path_clear(&self, made_at: u64, gen: u64, dirs: &[Ino]) -> bool {
+        if !self.cfg.fast_path_sampled {
+            return true;
+        }
+        self.dl.sampled_at >= made_at
+            && dirs
+                .iter()
+                .all(|d| !self.dl.fast_inflight.contains_key(&(gen, *d)))
+    }
+
     /// Whether an op of this node's own is in flight in subtree `dir` of
     /// stream `gen`: parked for its dependencies or a read recall (the ops
     /// a release holds are not: they are the release's), or admitted by the
-    /// engine's fast path (any stream: an over-approximation).
+    /// engine's fast path under that subtree.
     pub(crate) fn own_in_flight(&self, gen: u64, dir: Ino, replica: &dyn Replica) -> bool {
-        if self.dl.fast_inflight > 0 {
+        if self.dl.fast_inflight.contains_key(&(gen, dir)) {
             return true;
         }
         let me = self.me();
@@ -12606,23 +12699,24 @@ impl Core {
     pub(crate) fn handover_progress(
         &mut self,
         now: Now,
-        tick: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        if tick {
-            for c in &mut self.dl.sticky_cmds {
-                c.seen = (c.seen + 1).min(2);
-            }
-        }
         if self.dl.handovers.is_empty() {
             return;
         }
         let grace = self.cfg.handover_grace_ms as i64;
+        let patience = self.handover_patience_ms();
         let waits = std::mem::take(&mut self.dl.handovers);
         let mut keep = Vec::new();
         let mut parts: BTreeMap<u64, BTreeSet<Ino>> = BTreeMap::new();
+        let mut root = 0;
         for mut w in waits {
+            if now.wait.since(w.last_asked) >= patience {
+                // The root has dropped it.
+                self.stats.deleg_handover_expired += w.dirs.len() as u64;
+                continue;
+            }
             let held = self.sticky_held(w.gen, replica);
             // Released by other means (a recall, an abandon, the holder's
             // own command), or the stream is gone: nothing to hand over.
@@ -12664,6 +12758,7 @@ impl Core {
                     root = w.root,
                     "the holder is quiet in the subtrees the root asked for: releasing them"
                 );
+                root = w.root;
                 parts.entry(w.gen).or_default().extend(quiet);
             }
             if !w.dirs.is_empty() {
@@ -12673,15 +12768,16 @@ impl Core {
         keep.append(&mut self.dl.handovers);
         self.dl.handovers = keep;
         if !parts.is_empty() {
-            self.handover_release(now, parts);
+            self.handover_release(now, root, parts);
         }
         self.sticky_release_arm(now, out);
     }
 
     /// The holder's own release of `parts` (stream -> subtrees) for a
-    /// handover: a command that drains and journals the row on a step after
-    /// this one (see [`StickyReleaseCmd::handover`]).
-    fn handover_release(&mut self, now: Now, parts: BTreeMap<u64, BTreeSet<Ino>>) {
+    /// handover: a command that leaves the fast path's view now and drains
+    /// and journals the row once the engine has reported the fast path clear
+    /// (see [`StickyReleaseCmd::made_at`]).
+    fn handover_release(&mut self, now: Now, root: NodeId, parts: BTreeMap<u64, BTreeSet<Ino>>) {
         self.stats.deleg_handover_released += parts.values().map(|p| p.len() as u64).sum::<u64>();
         self.dl.sticky_cmds.push(StickyReleaseCmd {
             op: None,
@@ -12689,7 +12785,8 @@ impl Core {
             deadline: now.wait.plus(self.leave_wait_ms() as u64),
             parts,
             handover: true,
-            seen: 0,
+            root,
+            made_at: self.dl.step,
         });
     }
 
@@ -12714,7 +12811,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.dl.sticky_timer = None;
-        self.handover_progress(now, true, replica, out);
+        self.handover_progress(now, replica, out);
         self.sticky_release_progress(now, replica, out);
     }
 

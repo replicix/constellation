@@ -622,6 +622,11 @@ pub struct Config {
     /// none of its own ops is in flight there, or its own ops there have
     /// been idle for this long. `0`: only when nothing is in flight.
     pub handover_grace_ms: u64,
+    /// ADR-56: the driver mirrors the delegate fast path's view after every
+    /// step and reports what it has in flight ([`Core::deleg_note_local`]);
+    /// a holder's release waits for that report. Off: no fast path (the
+    /// simulation, the unit harness).
+    pub fast_path_sampled: bool,
 }
 
 impl Config {
@@ -779,6 +784,7 @@ impl Config {
             placement_dwell_ms: 60_000,
             placement_cooldown_ms: 30_000,
             handover_grace_ms: 5_000,
+            fast_path_sampled: false,
         }
     }
 }
@@ -1339,6 +1345,10 @@ pub struct Stats {
     pub deleg_handover_waits: u64,
     pub deleg_handover_released: u64,
     pub deleg_handover_ignored: u64,
+    /// ... requests that expired at the holder (the root dropped them), and
+    /// releases that gave up (the wait went back).
+    pub deleg_handover_expired: u64,
+    pub deleg_handover_given_up: u64,
     pub deleg_sticky_ended_abandoned: u64,
     /// Plan 46 M1.3 step 13: `repair abandon` of non-stealable streams:
     /// commands accepted, those that waited for read delegations, streams
@@ -2914,6 +2924,7 @@ impl Core {
             return out;
         }
         self.clk = now;
+        self.dl.step += 1;
         // A lease change that landed since the last event closes the old
         // configuration before any row of this one is journaled.
         self.sync_cfg_spans(replica);
