@@ -124,6 +124,11 @@ pub enum FaultKind {
         for_ms: u64,
         inbox_ever_only: bool,
     },
+    /// Fence C9: `node` is cut from S3 for `for_ms` at the moment the lease
+    /// object first names it as holder (its claim lands; what it does next,
+    /// such as the journal work of a takeover gate, cannot reach S3). Armed
+    /// from the fault's time.
+    CutS3OnClaim { node: NodeId, for_ms: u64 },
     /// Plan 30 M0's fault knob: delay the holder's forward replies by
     /// `delay_ms` for `for_ms` (bug A's trigger).
     SlowReplies { delay_ms: u64, for_ms: u64 },
@@ -3615,6 +3620,34 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 .note_s3_cut(node, now + for_ms as i64, fault.at_ms)
                 .await;
             cluster.env.bucket.set_cut(node, true);
+            tokio::time::sleep(Duration::from_millis(for_ms)).await;
+            cluster.env.bucket.set_cut(node, false);
+            cluster.note_s3_healed(node);
+        }
+        FaultKind::CutS3OnClaim { node, for_ms } => {
+            if !cluster.ids().contains(&node) {
+                return;
+            }
+            let landed = cluster.env.bucket.arm_claim_cut(node);
+            // (Bounded: a claim that never comes arms nothing for good.)
+            if tokio::time::timeout(Duration::from_secs(30), landed.notified())
+                .await
+                .is_err()
+            {
+                note(format!(
+                    "t={} node {node} did not claim the lease within 30 s: no cut",
+                    fault.at_ms
+                ));
+                return;
+            }
+            note(format!(
+                "t={} cut S3 for node {node} for {for_ms}ms at its lease claim",
+                fault.at_ms
+            ));
+            let now = cluster.env.clock.wall().0;
+            cluster
+                .note_s3_cut(node, now + for_ms as i64, fault.at_ms)
+                .await;
             tokio::time::sleep(Duration::from_millis(for_ms)).await;
             cluster.env.bucket.set_cut(node, false);
             cluster.note_s3_healed(node);

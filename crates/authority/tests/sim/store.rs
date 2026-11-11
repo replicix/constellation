@@ -186,6 +186,10 @@ pub struct Bucket {
     inner: Arc<InMemory>,
     /// Plan 43 C7b: the lease-claim oracle's tap on the lease object.
     lease_hook: Mutex<Option<LeaseHook>>,
+    /// Fence C9 (`FaultKind::CutS3OnClaim`): armed with a node, the first lease
+    /// body that node writes naming itself as holder cuts it from the bucket
+    /// at once (as the put lands) and wakes the fault's task.
+    claim_cut: Mutex<Option<(u64, Arc<tokio::sync::Notify>)>>,
     /// Plan 43 C0: what the log's segments carry, noted as they land (the
     /// I1 oracle judges an answer synchronously and cannot await the bucket).
     pub archive: super::oracle::ArchiveIndex,
@@ -224,6 +228,7 @@ impl Bucket {
         Arc::new(Self {
             inner: Arc::new(InMemory::new()),
             lease_hook: Mutex::new(None),
+            claim_cut: Mutex::new(None),
             archive: super::oracle::ArchiveIndex::default(),
             rng: Mutex::new(StdRng::seed_from_u64(seed ^ 0x5335_5335)),
             latency,
@@ -274,6 +279,14 @@ impl Bucket {
             .map(|(l, _)| l)
     }
 
+    /// Fence C9: arm the cut of `node` at its next lease claim; the returned
+    /// handle is notified once the cut is made.
+    pub fn arm_claim_cut(&self, node: u64) -> Arc<tokio::sync::Notify> {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        *self.claim_cut.lock().unwrap() = Some((node, notify.clone()));
+        notify
+    }
+
     /// Install the tap on the lease object (the oracles' plumbing).
     pub fn set_lease_hook(&self, hook: LeaseHook) {
         *self.lease_hook.lock().unwrap() = Some(hook);
@@ -297,6 +310,24 @@ impl Bucket {
         location: &Path,
         payload: &PutPayload,
     ) {
+        if location.as_ref() == "leases/p0.json" {
+            let armed = self.claim_cut.lock().unwrap().clone();
+            if let Some((who, notify)) = armed {
+                let body: bytes::Bytes = payload.clone().into();
+                let took = serde_json::from_slice::<constellation_store_s3::Lease>(&body)
+                    .is_ok_and(|l| l.holder == who);
+                // A claim: the writer names itself, and did not hold it before
+                // (where the tap shows the body replaced).
+                let held = prev
+                    .as_ref()
+                    .is_some_and(|p| p.as_ref().is_some_and(|p| p.holder == who));
+                if node == who && took && !held {
+                    *self.claim_cut.lock().unwrap() = None;
+                    self.set_cut(who, true);
+                    notify.notify_one();
+                }
+            }
+        }
         if let Some(prev) = prev {
             let hook = self.lease_hook.lock().unwrap().clone();
             let body: bytes::Bytes = payload.clone().into();

@@ -2136,28 +2136,31 @@ fn sticky_stale_route_config() -> SimConfig {
 }
 
 /// Fence C9 (G1): a designee that took the lease. Three nodes. Node 1 is shut
-/// down at 1 s (restart at 3 s) and node 2 takes the lease; at 3.5 s the
+/// down at 1 s (restart at 3 s) and node 2 takes the lease; at 4 s the
 /// operator grants `d1` sticky through node 2 to node 1; at 4.6 s node 2 is
 /// shut down and releases the lease, and node 1 takes it (node 3 cannot reach
 /// S3 at either hand-over), so the lease holder is for a while also the
 /// designee of `d1`'s non-stealable generation. Node 3, whose clients write in
-/// `d1`, is cut from node 1 at 5.3 s for 1.5 s, so its ops are enqueued in the
-/// inbox (inbox-ever, with slow drain polls) and later forwarded to the lease
-/// holder, routed 0. The first answer node 1 sends for such a forward is lost
-/// (`CutOnAnswer`), and node 1 then loses the lease to a node that has not
-/// appended its `d1` rows (cut from S3 and from node 2). A lease holder that
+/// `d1`, is cut from node 2 (the holder) at 3.6 s for 1 s, so its ops are
+/// enqueued in the inbox (inbox-ever, with slow drain polls) and later
+/// forwarded to the lease holder, node 1, routed 0. The first answer node 1
+/// sends for such a forward is lost (`CutOnAnswer`), and node 1 then loses
+/// the lease to a node that has not appended its `d1` rows (cut from S3 and
+/// from node 2). A lease holder that
 /// runs an inbox-ever forward as the designee of its own generation, followed
 /// by its successor's refusal of the retry, is I1
 /// (`nonholder_refused_a_designee_ran`, `refused_and_completed`). The window
-/// is short in the simulation (the holder ends its own generation at its
-/// claim), so few seeds reach it.
+/// is node 1's takeover gate (the root-designee keeps its own generation
+/// until the gate opens); it lasts a few ms unless node 1 is cut from S3 at
+/// its claim (`CutS3OnClaim`), which the configuration does.
 fn sticky_root_designee_inbox_config() -> SimConfig {
     SimConfig {
         nodes: 3,
-        dirs: vec!["d2".into(), "d3".into(), "d1".into()],
+        // (Node 3's first client writes in `dirs[1]`, `d1`.)
+        dirs: vec!["d2".into(), "d1".into(), "d3".into()],
         delegations: Vec::new(),
         sticky_delegations: Vec::new(),
-        cross_ratio: 0.2,
+        cross_ratio: 0.0,
         ops_per_client: 20,
         faults: vec![
             // Node 3 cannot claim the lease at either hand-over: node 2 takes
@@ -2174,7 +2177,7 @@ fn sticky_root_designee_inbox_config() -> SimConfig {
                 kind: FaultKind::ShutdownHolder { restart_ms: 2_000 },
             },
             ScheduledFault {
-                at_ms: 3_500,
+                at_ms: 4_000,
                 kind: FaultKind::DelegateDir {
                     dir: "d1".into(),
                     within_ms: 1_000,
@@ -2192,16 +2195,20 @@ fn sticky_root_designee_inbox_config() -> SimConfig {
                 at_ms: 4_600,
                 kind: FaultKind::ShutdownHolder { restart_ms: 2_500 },
             },
+            // Node 3 is cut from the lease holder (node 2) while it writes, so
+            // its ops are enqueued in the inbox (inbox-ever), and it reaches
+            // S3 for their tombstones by the hand-over.
             ScheduledFault {
-                at_ms: 5_300,
+                at_ms: 3_600,
                 kind: FaultKind::Partition {
-                    a: 1,
+                    a: 2,
                     b: 3,
-                    for_ms: 1_500,
+                    for_ms: 1_300,
                 },
             },
+            // The first answer node 1 sends for an inbox-ever forward is lost.
             ScheduledFault {
-                at_ms: 6_500,
+                at_ms: 4_900,
                 kind: FaultKind::CutOnAnswer {
                     node: 1,
                     peer: 3,
@@ -2209,19 +2216,24 @@ fn sticky_root_designee_inbox_config() -> SimConfig {
                     inbox_ever_only: true,
                 },
             },
+            // The window: node 1's claim lands, and S3 is cut for it at that
+            // instant, so its takeover gate (the journal work that ends its
+            // own generation) stays open about a lease TTL while it still
+            // holds the lease. Node 2 cannot reach node 1 meanwhile, and
+            // takes the lease (restarted at 7.1 s) without node 1's rows.
             ScheduledFault {
-                at_ms: 8_000,
-                kind: FaultKind::CutS3 {
+                at_ms: 4_500,
+                kind: FaultKind::CutS3OnClaim {
                     node: 1,
-                    for_ms: 3_500,
+                    for_ms: 9_000,
                 },
             },
             ScheduledFault {
-                at_ms: 8_000,
+                at_ms: 4_600,
                 kind: FaultKind::Partition {
                     a: 1,
                     b: 2,
-                    for_ms: 3_500,
+                    for_ms: 9_000,
                 },
             },
         ],
@@ -2283,16 +2295,48 @@ fn sticky_stale_route_passes_with_the_fence() {
     );
 }
 
-/// Fence C9: `sticky-root-designee-inbox` runs clean over a few seeds. (It
-/// reaches the window in which the lease holder still holds a non-stealable
-/// generation of its own only rarely. `-skew` breaks the lease's rate
-/// assumption on purpose and is judged on I1 alone, by sweep.)
+/// Fence C9: `sticky-root-designee-inbox` runs clean, and the window is
+/// reached: a seed where the lease holder, in its takeover gate (S3 cut at its
+/// claim), refused an inbox-ever forward in its own generation's stream
+/// (`holder_inbox_refusals`). About 4 % of the seeds reach it.
 #[test]
 fn sticky_root_designee_inbox_passes() {
-    for seed in 0..16 {
-        run_seed(seed, sticky_root_designee_inbox_config())
+    let mut refusals = 0;
+    for seed in 0..24 {
+        let r = run_seed(seed, sticky_root_designee_inbox_config())
             .unwrap_or_else(|e| panic!("sticky-root-designee-inbox seed {seed}: {e}"));
+        refusals += r
+            .stats
+            .values()
+            .map(|s| s.holder_inbox_refusals)
+            .sum::<u64>();
     }
+    assert!(
+        refusals > 0,
+        "no seed reached the root-designee's takeover gate with an inbox-ever forward"
+    );
+}
+
+/// Fence C9's negative control (`Config::holder_runs_inbox_ever`, the
+/// behaviour before C9): seed 1728 of `sticky-root-designee-inbox` is
+/// refused by the successor after the lease holder ran the forward as the
+/// designee of its own generation (the client's `Create` returned `EEXIST` with
+/// no state that explains it); with the refusal in the generation's stream it
+/// passes. (Four more seeds of the first 2000 hang with the knob and pass
+/// without it.)
+#[test]
+fn the_holder_running_an_inbox_ever_forward_fails_seed_1728() {
+    run_seed(1728, sticky_root_designee_inbox_config())
+        .unwrap_or_else(|e| panic!("sticky-root-designee-inbox seed 1728: {e}"));
+    let e = run_seed(
+        1728,
+        SimConfig {
+            holder_runs_inbox_ever: true,
+            ..sticky_root_designee_inbox_config()
+        },
+    )
+    .expect_err("the control passed: the window is not reached");
+    assert!(e.contains("returned Eexist but no state"), "{e}");
 }
 
 /// ADR-47's negative control for the delegate fence
@@ -7105,6 +7149,19 @@ fn sweep_config() {
                     failures.lock().unwrap().push(seed);
                 }
                 Ok(report) => {
+                    // Fence C9: the seeds that reach the holder's refusal
+                    // and the root's redirect.
+                    let c9 = |f: fn(&constellation_authority::Stats) -> u64| {
+                        report.stats.values().map(f).sum::<u64>()
+                    };
+                    let (refusals, redirects) =
+                        (c9(|s| s.holder_inbox_refusals), c9(|s| s.inbox_ever_redirects));
+                    if refusals + redirects > 0 {
+                        eprintln!(
+                            "SWEEP-C9 {label} seed {seed}: holder_inbox_refusals {refusals} \
+                             inbox_ever_redirects {redirects}"
+                        );
+                    }
                     eprintln!("SWEEP-L3 {label} seed {seed}: {}", recall_stall(&report));
                     eprintln!(
                         "SWEEP-RG {label} seed {seed}: {} {}",
