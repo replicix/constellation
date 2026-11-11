@@ -71678,6 +71678,84 @@ mod late_landing_inbox {
         assert_eq!(c.inbox_keys, vec![k2]);
     }
 
+    /// The deadline pushed out to `T0 + w` finds the settle idle: it is sent
+    /// on its route again, so a sequencer reachable by now gets it. Fails on
+    /// the parent: the settle was not sent again.
+    #[test]
+    fn a_settle_idle_at_the_pushed_out_deadline_is_routed_again() {
+        let (mut h, rid, op, t_d) = {
+            let (mut h, rid) = waiting_inbox_op();
+            let (_, op, t_d) = settle_and_tombstone(&mut h, rid);
+            (h, rid, op, t_d)
+        };
+        let w = h.core.dl_t().settle_window;
+        let f = h.core.dl_t().inbox_read_fresh;
+        h.advance(w - 100);
+        h.step(Event::S3 {
+            op,
+            result: S3Result::InboxTombstone(Ok(())),
+        });
+        // The settle's attempts are spent and nothing is in flight.
+        {
+            let c = h.core.clients.get_mut(&rid).unwrap();
+            c.phase = client::Phase::Backoff;
+            if let Some(t) = c.timer.take() {
+                let mut sink = Vec::new();
+                h.core.cancel_timer(t, &mut sink);
+            }
+        }
+        h.advance(100);
+        assert_eq!(h.clk().wait, t_d.plus(f + w));
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        assert!(replies(&out).is_empty(), "{out:?}");
+        assert!(
+            sends(&out).iter().any(|(to, m)| *to == 2
+                && matches!(m, PeerMsg::MutateRequest { settle: true, .. })),
+            "the settle was not routed again: {out:?}"
+        );
+    }
+
+    /// The deadline pushed out to `T0 + w` finds the settle on the lease path
+    /// (a slow lease read): the holder it knows, reachable by now, gets it. Fails on
+    /// the parent: the settle was not sent again.
+    #[test]
+    fn a_settle_on_the_lease_path_at_the_pushed_out_deadline_goes_to_a_reachable_holder() {
+        let (mut h, rid, op, t_d) = {
+            let (mut h, rid) = waiting_inbox_op();
+            let (_, op, t_d) = settle_and_tombstone(&mut h, rid);
+            (h, rid, op, t_d)
+        };
+        let w = h.core.dl_t().settle_window;
+        let f = h.core.dl_t().inbox_read_fresh;
+        h.advance(w - 100);
+        h.step(Event::S3 {
+            op,
+            result: S3Result::InboxTombstone(Ok(())),
+        });
+        // The settle waits on the lease path.
+        {
+            let c = h.core.clients.get_mut(&rid).unwrap();
+            c.phase = client::Phase::AcquireRetry;
+            if let Some(t) = c.timer.take() {
+                let mut sink = Vec::new();
+                h.core.cancel_timer(t, &mut sink);
+            }
+        }
+        h.advance(100);
+        assert_eq!(h.clk().wait, t_d.plus(f + w));
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        assert!(replies(&out).is_empty(), "{out:?}");
+        assert!(
+            sends(&out).iter().any(|(to, m)| *to == 2
+                && matches!(m, PeerMsg::MutateRequest { settle: true, .. })),
+            "the settle was not routed again: {out:?}"
+        );
+    }
+
     /// MUST-3 (U1(a)): the in-doubt answer of an op whose settle gave up on
     /// a tombstone is labelled for the sim oracle (`isolated-from-s3`).
     #[test]
