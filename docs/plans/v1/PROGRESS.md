@@ -69515,6 +69515,13 @@ with slow lease reads 1 to 5. `locks-writer-hold-unchecked` (control) fails 1977
   keeps `tail_done` (so `tail_rid_done`, which the sim fails strict-identity seeds for) for an outcome that is under
   another identity: the check is exact, not excused. Test `a_tail_row_that_is_the_nodes_own_journal_row_is_not_a_done_rid`
   (fails before: `tail_done` 1). `a_row_whose_rid_is_done_is_skipped_and_counted` is the other side and still holds.
+  The same `(epoch, journal seq)` names one row written once, and the check now compares the records as well: a tail
+  row that has the name of the node's own row but other content is a diverged tail
+  (`a_tail_row_that_only_shares_the_name_of_the_own_row_diverges`; it fails before: the row was taken for the node's
+  own). A row left in place ships under the new epoch E' at its own journal position, so a claimant that read both the
+  E copy and the E' copy would count the second as `tail_done` under two identities; a claimant reads only its
+  immediate predecessor's tail (E'), so the window is judged closed, not proven: 2,000 seeds of `far-placement` do not
+  reach it and no seed pins it.
 - **Harness**: the budget-0 scenarios `no-peer-in-budget`, `epoch-*` (m10 `node`), `lease-*` (NO_BACKUP), the four m14
   lock scenarios, `campaign_load`'s counter cluster, `deposed-reintegration` and `holder-publishes-log-prefix` pin
   `CONSTELLATION_DELEGATION_STICKY_PLACEMENT=off`; m11's budget-0 node leaves it, placement being off there unless the
@@ -69531,28 +69538,50 @@ with slow lease reads 1 to 5. `locks-writer-hold-unchecked` (control) fails 1977
   forward runs once) and `a_rid_touched_by_the_converted_placed_grant_is_held_or_redirected_not_refused` (the root holds
   or redirects, never a final `EROFS`): regression pins of ADR-47 under conversion, no product change, so no
   fail-before. `deadlines.rs`: the derived bound `archive_put` (the archive PUT a first answer under a sticky grant waits
-  for, `F`, no setting of its own), pinned in every table test, `archive_put_is_within_the_forward_timeout`, and the
-  generated table in `configuration.md`.
-- **Performance** (box 3, shared and loaded: load average 75 to 100 the whole time; release builds, main's daemon A
-  against the branch's B, interleaved A/B/B/A, 4 rounds of 200 samples). `ack-latency` topology 3 (placement off) on
-  tmpfs, ext4, xfs, btrfs: B/A of the medians of p50 and of p90 between 0.97 and 1.10 for the delegate's and the
-  forwarder's ops, with no op worse on more than one file system, except tmpfs `create` of the delegate (1.16 p50, 1.26
-  p90; ext4, xfs, btrfs 1.00, 1.00, 0.98 for the same op): noise of a 4-run median at 0.7 ms. Topologies 3 and the
-  placement-off paths are not touched by the change, as topology 1 is not. **Topology 5 and `7-wan-sticky` under
-  `net-wan` were not measured**: the profile needs `tc` (iproute-tc), which box 3 lacks and was not installed. Topology
-  7 also runs without the WAN profile when `ACK_LATENCY_TOPOLOGIES=7` names it (a budget of 0 makes every connected
-  writer far): the first sticky grant of `b` after 302 ms and 76 creates; `b`'s own ops `create` p50 0.69 ms, `rename`
-  0.73, `unlink` 0.69, `chmod` 0.65 (the sticky holder commits locally) against 2.0, 1.6, 2.3, 2.1 ms forwarded by `a`
-  into the subtree; the first op under the grant 0.9 ms (a local store); `write` (with `fsync`) p50 19.6 ms on the
-  disk the run used. `placement-hot` throughput in the sim (mean simulated ms per seed and returned ops per simulated
-  second, 2,000 seeds): 9,144 against 9,149 ms (+0.1 %) and 21.10 against 21.08 ops/s in all three variants;
-  `far-placement` +0.9 % ms; `long-delegated`, `sticky-ttl` identical. `auto-placement`, 9 runs each: placed after a
-  median 0.91 s (main) and 1.82 s (branch), spreads 0.41 to 2.83 s and 0.61 to 4.14 s (Mann-Whitney p about 0.1; the
-  cause of a shift of the first placement, if any, is not found: the placement code before the grant is unchanged);
-  recalled after a median 6.27 and 5.67 s, placed on `c` after 8.30 and 7.79 s (the branch is about 0.5 s sooner).
-- **Gate** (debug unless noted): `cargo fmt --check`, `clippy --workspace --all-targets -D warnings`; lib tests meta
-  424, engine 969, control 146, net 155, authority 1,460, meta integration 666, harness 169, model 295; release
-  authority `-- --test-threads 8` 1,947; 0 FAILED, 0 panicked.
-- **Not done**: topology 5 and `7-wan-sticky` under `net-wan` (box 3 has no `tc`; one run of `ack-latency` on a box
-  with `iproute-tc` and `CONSTELLATION_HARNESS_LOAD=net-wan`, `ACK_LATENCY_TOPOLOGIES=5,7`, A against B, closes it); the
-  fail-before runs of the step-7 core tests on main (they name fields main lacks, so they do not compile there).
+  for, `F`, no setting of its own), pinned in every table test and in the generated table in `configuration.md`
+  (`archive_put_is_shorter_than_the_attempts_window`; the bound is not asserted against itself). What bounds a far
+  writer's first op is measured: `far_writers_hold_sticky_grants_and_answer_final` checks `deleg_commit_wait_ms_max`
+  against `archive_put`.
+- **Step-7 review fixes** (`/data/cst/s7-review.md`): MUST-1, the release quarantine (D-e) did not fire for a stream
+  released whole (an unmount, a suspension, a release of everything: the row carries no dirs, so the root recorded
+  nothing); `root_release_appended` now quarantines the dirs the stream still holds. The core test uses the real caller
+  shape (`&[]`, whole) and fails before; the sim has `a_whole_release_quarantines_the_subtrees_it_gave_up` (config
+  `far-placement-release`: the placement grants, the sim's idle tracker releases the whole stream, `place_quarantined`
+  counts the skips; it fails before with no quarantine). Without the fix the same config also fails seeds 214 and 733
+  (an I1 `acked_implies_committed` violation and a returned `ENOENT` without state: the grant given straight back);
+  with it only 605 fails (see below). The conversion test asserts `delegate_dir` refuses the sticky grant while the
+  recalled placed stream still covers the directory and grants it once the stream is gone.
+- **Performance** (box 3, release builds, main's daemon A against the branch's B, interleaved A/B/B/A, same harness for
+  both; box 3 had the other job's sims running: CPU 75 to 92 % idle, load average 24 to 51 from blocked threads, which
+  touches no file system under test). First measurement (load 75 to 100, 4 rounds) showed tmpfs `create` of the delegate
+  at 1.16 (p50); **re-measured on the quieter box, 8 runs per side of 200 samples**, `ack-latency` topology 3 (placement
+  off), B/A of the medians of p50 for the delegate's `create`: tmpfs 0.98, ext4 1.03, xfs 1.01, btrfs 1.02 (p90 0.95,
+  1.01, 1.01, 1.01); no delegate or forwarder op is worse than 1.09 at p50 or 1.14 at p90 on any file system, and the
+  worst ones (ext4 `chmod` p90 1.14, forwarded `rename`/`create` on ext4/xfs 1.08/1.09) are 0.84 to 1.01 on the others:
+  noise. The earlier +16 % was load, not code. `auto-placement`, **20 runs per side** (the main daemon against the
+  branch's, the branch's harness for both): first placement after a median 0.76 s (main) and 0.71 s (branch), p25/p75
+  0.61/1.01 and 0.71/1.82 s, extremes 0.51 to 2.12 and 0.51 to 3.33 s (Mann-Whitney p 0.94): no shift. (The 0.91 and
+  1.82 s medians of the first measurement were of 6 and 12 runs, not 9 each, at load 60 to 75.) **WAN** (`net-wan`,
+  3 rounds, medians; `tc` installed on box 3 from `iproute-tc`): topology 5 (two nodes, forwarded) is the same on main
+  and the branch: the forwarding node's `create` 123.7 and 123.9 ms, `rename`/`unlink`/`chmod` 202.8 to 202.9 ms on both,
+  `write` p50 12.5 and 14.8 ms. Topology 7-wan-sticky (budget default, `FAR_DWELL_MS` 5 s, run alone: after topology 5
+  in one process it never granted, a harness-side leak between topologies not looked into): the writer is granted its
+  subtree after a median 1.93 s (21 creates); then the sticky holder's `create` p50 78 us, `rename` 71 us, `unlink`
+  55 us, `chmod` 38 us, `write` 15.6 ms (with `fsync`, the disk), the first op under the grant 9.2 ms, against the same
+  ops forwarded by the root into the subtree at 122 ms (`create`), 160 to 164 ms (`rename`, `unlink`, `chmod`, `write`
+  p50; p90 313 to 487 ms). The scenario's op floor (`DELEGATION_MIN_OPS` 50 in 5 s) was above what a WAN writer does
+  (4 to 8 ops/s) and is now 10. `placement-hot` throughput in the sim (mean simulated ms per seed and returned ops per
+  simulated second, 2,000 seeds): 9,144 against 9,149 ms (+0.1 %) and 21.10 against 21.08 ops/s in all three variants;
+  `far-placement` +0.9 % ms; `long-delegated`, `sticky-ttl` identical.
+- **Gate** (after the review fixes; debug unless noted): `cargo fmt --check`, `clippy --workspace --all-targets -D warnings`;
+  lib tests meta 424, engine 970, control 146, net 155, authority 1,474; meta integration (`--tests`) all passed; release
+  authority `--no-fail-fast` (lib 1,474, sim 484) 0 FAILED, 0 panicked; harness smoke (release, seed 42) `delegate-crash`,
+  `delegated-subtrees`, `sticky-abandon`, `takeover-loss-two-node` pass.
+- **Not done / open**: the fail-before runs of the step-7 core tests on main (they name fields main lacks, so they do
+  not compile there). Sim seeds that fail and are not from this step's code: `sticky-idle-release` 217 (on main too: "the
+  cluster did not reach quiescence", node 1's `Renew` job pending; TRIAGE) and, in the new `far-placement-release`,
+  seed 605 (the same oracle: node 3 keeps unshipped journal rows after its sticky release and a holder crash; seeds
+  214 and 733 failed too before the quarantine fix). Re-run at x2,000 against main after these fixes: `far-placement`
+  (+commit, +durability, +settle, +unsettled), `placement-hot` (+commit, +settle, +unsettled), `sticky-ttl`,
+  `long-delegated` (+commit), `delegated-designated`, `sticky-holder-restarts`, `sticky-holder-restarts-placed`,
+  `sticky-handover-ping-pong`, `far-root-writes`, `far`: every one `rc=0` on both (the new configs on the branch).
