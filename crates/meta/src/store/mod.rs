@@ -643,6 +643,11 @@ pub struct Meta {
     /// Whether `held` may be non-default, so a ship with nothing poisoned
     /// does not take its lock (plan 30 §M4 round 2).
     pub(crate) held_any: AtomicBool,
+    /// ADR-59: shipped rows of this node that the publisher's log-prefix
+    /// view could not place (`spec::local_before_images_from`): a shipped
+    /// row that wrote, or merged, a key an older outstanding row wrote
+    /// exclusively. The ship planner makes this unreachable; expected 0.
+    pub(crate) publish_unplaced: AtomicU64,
     /// ADR-59's negative control (the simulation's
     /// `parent_taint_conservative`): the ship rule treats a directory's
     /// merged attributes as exclusive writes again and `repair drop-held`
@@ -1342,6 +1347,7 @@ impl Meta {
             deleg_gate: std::sync::RwLock::new(()),
             held: std::sync::Mutex::new(held::HeldSummary::default()),
             held_any: AtomicBool::new(false),
+            publish_unplaced: AtomicU64::new(0),
             parent_taint_conservative: AtomicBool::new(false),
             queue_cache: std::sync::Mutex::new(None),
             unshipped: std::sync::Mutex::new(crate::replay::TouchSet::default()),

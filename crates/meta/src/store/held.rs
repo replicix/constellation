@@ -1482,6 +1482,13 @@ impl Meta {
         self.parent_taint_conservative.store(on, Ordering::Relaxed);
     }
 
+    /// ADR-59: shipped rows the publisher's view could not place (expected
+    /// 0: the planner never lets one past an outstanding row it conflicts
+    /// with).
+    pub fn publish_unplaced(&self) -> u64 {
+        self.publish_unplaced.load(Ordering::Relaxed)
+    }
+
     pub fn held_summary(&self) -> HeldSummary {
         self.held.lock().unwrap().clone()
     }

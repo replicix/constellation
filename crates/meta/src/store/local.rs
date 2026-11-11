@@ -4190,3 +4190,56 @@ mod verbatim_append_tests {
         assert_eq!(meta.take_deleg_append_uncompleted(), 1);
     }
 }
+
+#[cfg(test)]
+mod view_tests {
+    use super::LogPrefixView;
+    use crate::store::spec::{MergeDelta, MergeEntry};
+    use constellation_mtree::keys;
+    use constellation_mtree::record::{Attrs, InodeRecord};
+
+    fn merge(t: i64) -> Vec<(Vec<u8>, MergeEntry)> {
+        vec![(
+            keys::inode(7),
+            MergeEntry::Inode(MergeDelta {
+                nlink: 1,
+                mtime_ns: Some(t),
+                ctime_ns: t,
+            }),
+        )]
+    }
+
+    /// A shipped row's merge is applied to the view's value of a key every
+    /// outstanding row wrote only by merge; not to one an outstanding row
+    /// wrote exclusively, wherever that row sits (the planner never lets a
+    /// row ship past it): the view cannot say, and the publish defers.
+    #[test]
+    fn a_shipped_merge_is_placed_only_on_a_key_outstanding_rows_merged() {
+        let rec = InodeRecord::new(Attrs {
+            nlink: 2,
+            mtime_ns: 10,
+            ctime_ns: 10,
+            ..Attrs::default()
+        });
+        let raw = Some(rec.encode());
+        let key = keys::inode(7);
+        let keys = [key.clone()];
+        // Merge-only: placed.
+        let mut view = LogPrefixView::default();
+        view.note(&key, &raw, true);
+        assert!(view.merge_shipped(keys.iter(), &merge(20)));
+        let merged = InodeRecord::decode(view.get(&key).unwrap().unwrap()).unwrap();
+        assert_eq!(merged.attrs.mtime_ns, 20);
+        // An outstanding row wrote it exclusively first: not placed.
+        let mut view = LogPrefixView::default();
+        view.note(&key, &raw, false);
+        assert!(!view.merge_shipped(keys.iter(), &merge(20)));
+        // ... or later: a merge placed before the exclusive write is the
+        // log prefix (the exclusive row is above the shipped one), a merge
+        // met after it is not.
+        let mut view = LogPrefixView::default();
+        view.note(&key, &raw, true);
+        view.note(&key, &raw, false);
+        assert!(!view.merge_shipped(keys.iter(), &merge(20)));
+    }
+}
