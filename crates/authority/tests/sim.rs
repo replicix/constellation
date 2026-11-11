@@ -5745,6 +5745,31 @@ fn regression_placement_hot_rollback_order_and_rebuilt_member_copies() {
     }
 }
 
+/// `backup-crash-slow+commit` seed 64 (`member_copies_drained`): a holder
+/// that claimed its own lease (epoch 2) after its backups refused its epoch-1
+/// tail kept the member copy of two unshipped `Archive` rows of epoch 1 for
+/// good (nobody was answered from them; the claimant never applies its own
+/// marker, so rule 4 never ran). The takeover gate drops them instead. Fails
+/// before: node 3 keeps 2 rows of epoch 1 at convergence.
+#[test]
+fn regression_a_self_claim_keeps_no_copy_of_its_unshipped_archive_rows() {
+    let cfg = strict(
+        SimConfig {
+            s3_latency: (60, 200),
+            ..backup_crash_config()
+        },
+        "commit",
+    );
+    let r = run_seed(64, cfg).unwrap_or_else(|e| {
+        panic!("seed 64: {e}\n  replay with AUTHORITY_SIM_CONFIG=backup-crash-slow+commit")
+    });
+    assert_eq!(r.member_copy_rows_left, 0);
+    assert!(
+        r.archive_dropped() > 0,
+        "the seed no longer reaches the gate's drop"
+    );
+}
+
 /// L2: `delegated-no-backup-root-near` seed 1680 with slow lease reads: a
 /// deposed root's rebuild queued a gated copy of the delegate's row (3,1,16)
 /// it had appended. Fails before the fix: the counter is 1, and the ledger
@@ -8990,6 +9015,7 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "member_copies_abandoned",
             "tails_kept_as_member_copy",
             "rows_member_copied",
+            "archive_dropped",
             "committed_superseded",
             "committed_rolled_back",
             "replay_gated_enqueued",
@@ -9161,8 +9187,9 @@ struct OracleTotals {
     /// dropped, abandoned, tails kept by a backup, tail rows past a gap,
     /// gated rows queued for replay (must be 0), ungated I2 pairs, nodes
     /// with member rows at convergence (must be 0), L2: rids of another node
-    /// queued with a gated class (counted)].
-    c14: [u64; 12],
+    /// queued with a gated class (counted), own `Archive` rows of an older
+    /// epoch the takeover gate dropped].
+    c14: [u64; 13],
     /// Plan 43 C7b: [TTL claims, of a live holder, seals of a live holder,
     /// permitted claims] and the seeds with a claim of a live holder.
     lease: [u64; 4],
@@ -9301,6 +9328,7 @@ impl OracleTotals {
         self.c14[9] += r.identity_copies_ungated as u64;
         self.c14[10] += r.member_copy_rows_left as u64;
         self.c14[11] += r.identity_foreign_gated as u64;
+        self.c14[12] += r.archive_dropped();
         self.seg[0] += r.segments_landed.0;
         self.seg[1] += r.segments_landed.1;
         self.seg[3] += r.segments_landed.2;
@@ -9782,7 +9810,8 @@ impl OracleTotals {
             "SWEEP-C14-TOTALS {label} seeds {}/{seeds}: committed rolled back {}, superseded by a \
              tail {}, rows to a member copy {}, member rows retired {} dropped {} abandoned {}, \
              tails kept by a backup {}, tail rows past a gap {}, gated rows queued {}, ungated \
-             I2 pairs {}, nodes with member rows at convergence {}, foreign gated queued {}",
+             I2 pairs {}, nodes with member rows at convergence {}, foreign gated queued {}, \
+             archive rows dropped at a gate {}",
             self.seeds,
             self.c14[0],
             self.c14[1],
@@ -9795,7 +9824,8 @@ impl OracleTotals {
             self.c14[8],
             self.c14[9],
             self.c14[10],
-            self.c14[11]
+            self.c14[11],
+            self.c14[12]
         );
         eprintln!(
             "SWEEP-LEASE-TOTALS {label} seeds {}/{seeds}: ttl claims {} (of a live holder {} in \

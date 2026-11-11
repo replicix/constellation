@@ -801,6 +801,12 @@ pub struct Stranded {
     /// an appended row is dropped or kept as a member copy, never replayed
     /// (a debug build asserts).
     pub deleg_append_queued: usize,
+    /// The takeover gate's pass dropped an own `Archive` row of an older
+    /// epoch that the log does not carry: it was never committed nor
+    /// answered, so it is neither kept as a member copy nor queued (the
+    /// requester retries by rid). Not in `locals`, not in
+    /// `committed_rolled_back`.
+    pub archive_dropped: usize,
 }
 
 impl Stranded {
@@ -812,6 +818,7 @@ impl Stranded {
             + self.deleg_member_copied
             + self.superseded
             + self.deleg_dropped
+            + self.archive_dropped
             > 0
     }
 
@@ -823,6 +830,7 @@ impl Stranded {
             + self.member_copied
             + self.superseded
             + self.deleg_dropped
+            + self.archive_dropped
     }
 }
 
@@ -917,6 +925,9 @@ enum Stranding {
     /// Plan 43 C2 (§3.8): a delegate's gated row past its generation's cut,
     /// rolled back and not queued (`Stranded::deleg_dropped`).
     Dropped,
+    /// The takeover gate dropped an own `Archive` row of an older epoch the
+    /// log does not carry (`Stranded::archive_dropped`).
+    ArchiveDropped,
 }
 
 /// Plan 43 C1-4: how a stranding pass treats the committed work it meets.
@@ -958,6 +969,11 @@ struct Strand<'a> {
     /// stranded row, then dropped. Set per row by `redo_row_tx` for a
     /// `Local` entry of the pass's `quiet` set.
     superseded: bool,
+    /// The pass is the claimant's own takeover gate at this epoch, after its
+    /// marker landed (`strand_part_tx`): an own `Archive` row of an older
+    /// epoch that the log does not carry is dropped, not kept (see
+    /// [`strand_local_tx`]). `None` for every other pass.
+    gate_epoch: Option<u64>,
 }
 
 impl Strand<'static> {
@@ -969,6 +985,7 @@ impl Strand<'static> {
         hold: false,
         deps_of: None,
         superseded: false,
+        gate_epoch: None,
     };
 }
 
@@ -1767,6 +1784,29 @@ fn strand_local_tx(
     // group (which re-ships it) and dropped once the log carries it. Its
     // client's retry by rid dedups against the re-ship, or executes once
     // if the row turns out not to have been held (an unanswered row).
+    //
+    // Not an own `Archive` row of an older epoch at the claimant's own gate
+    // that the log does not carry: the gate strands only after its marker
+    // landed, so every segment of an older epoch precedes it, and an
+    // `Archive` row the log lacks by then was never committed nor answered
+    // (rule 4 of `member.rs` drops it on every other replica at that same
+    // marker; the claimant never applies its own marker, so it would keep
+    // the copy for good). Rolled back above, neither kept nor queued: the
+    // requester retries by rid.
+    if member
+        && strand.gate_epoch.is_some_and(|g| row.epoch < g)
+        && row.class.is_archive()
+        && row.gen == 0
+        && row.epoch > 0
+    {
+        // (A shipped row is not a `Local` entry at the gate; if the log
+        // carries it all the same it is covered, and not kept either.)
+        debug_assert!(
+            !super::member::log_carries_tx(&*tx, meta, row.epoch, (row.epoch, first), row.last)?,
+            "the takeover gate strands an own row the log carries"
+        );
+        return Ok(Stranding::ArchiveDropped);
+    }
     if member && row.class.gated() && row.gen == 0 && row.epoch > 0 {
         // A segment's strand leaves the row's effect out of the namespace
         // while rows after it may stay: reads of its keys wait for the
@@ -2211,6 +2251,7 @@ fn redo_row_tx(
                         out.deleg_append_queued += 1;
                     }
                     Stranding::Dropped => out.deleg_dropped += 1,
+                    Stranding::ArchiveDropped => out.archive_dropped += 1,
                 }
             }
             SpecKind::Streamed { gated, .. } if quiet => {
@@ -3267,6 +3308,7 @@ fn strand_tx(
     member: bool,
     recall: bool,
     hold: bool,
+    gate_epoch: Option<u64>,
     quiet: impl Fn(&LiveEntry) -> bool,
 ) -> Result<Stranded, MetaError> {
     let live: HashMap<u64, LiveEntry> = read_live(tx, meta)?.into_iter().collect();
@@ -3290,6 +3332,7 @@ fn strand_tx(
         hold,
         deps_of: None,
         superseded: false,
+        gate_epoch,
     };
     Ok(rewind_tx(tx, meta, staged, &live, &stranded, cutoff, strand, None)?.0)
 }
@@ -3797,6 +3840,7 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
                 hold: false,
                 deps_of: Some(&deps_of),
                 superseded: false,
+                gate_epoch: None,
             },
         )?;
     }
@@ -4906,6 +4950,7 @@ impl Meta {
             false,
             false,
             false,
+            None,
             |_| true,
         )?;
         super::member::hole_rolled_back_tx(tx, meta, idents)?;
@@ -5197,6 +5242,7 @@ impl Meta {
                 true,
                 false,
                 true,
+                None,
                 |entry| {
                     matches!(entry, LiveEntry::Streamed { ident, .. } if rolled.contains(ident))
                         || matches!(entry, LiveEntry::Local { first, .. } if superseded_appends.contains(first))
@@ -5671,6 +5717,7 @@ impl Meta {
                 false,
                 true,
                 false,
+                None,
                 |_| false,
             )?;
             stranded.shadows += more.shadows;
@@ -5793,6 +5840,7 @@ impl Meta {
             true,
             false,
             true,
+            None,
             |_| false,
         )?;
         if !stranded.any() {
@@ -5836,6 +5884,7 @@ impl Meta {
             true,
             false,
             true,
+            None,
             |_| false,
         )?;
         if !stranded.any() {
@@ -6295,6 +6344,7 @@ impl Meta {
             true,
             false,
             false,
+            Some(epoch),
             |entry| entry.superseded_by_takeover(epoch, carried, tail_idents) && !abandons(entry),
         )?;
         // Plan 46 M0.4 (MUST-1): this node's own delegate rows of a
@@ -6342,6 +6392,7 @@ impl Meta {
                 true,
                 false,
                 false,
+                None,
                 |_| false,
             )?;
             stranded.shadows += more.shadows;
@@ -6382,6 +6433,7 @@ impl Meta {
                 false,
                 true,
                 false,
+                None,
                 |_| false,
             )?;
             stranded.shadows += more.shadows;
@@ -6642,6 +6694,7 @@ impl Meta {
             false,
             false,
             false,
+            None,
             |_| false,
         )?;
         if !stranded.any() {
@@ -6688,6 +6741,7 @@ impl Meta {
                 false,
                 false,
                 false,
+                None,
                 |_| false,
             )?
         } else {
@@ -6798,7 +6852,17 @@ impl Meta {
         }
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
-        let stranded = strand_tx(&mut tx, self, &staged, stale, true, false, false, |_| false)?;
+        let stranded = strand_tx(
+            &mut tx,
+            self,
+            &staged,
+            stale,
+            true,
+            false,
+            false,
+            None,
+            |_| false,
+        )?;
         if !stranded.any() {
             return Ok(stranded);
         }

@@ -1734,12 +1734,14 @@ impl Core {
                             local = stranded.locals,
                             member_copied = stranded.member_copied,
                             superseded = stranded.superseded,
+                            archive_dropped = stranded.archive_dropped,
                             "takeover stranded speculative state; rolled back, replaying"
                         );
                         self.stats.speculation_rolled_back +=
                             (stranded.shadows + stranded.hints) as u64;
                         self.stats.local_rolled_back +=
-                            (stranded.locals + stranded.member_copied) as u64;
+                            (stranded.locals + stranded.member_copied + stranded.archive_dropped)
+                                as u64;
                         self.note_committed_stranded(&stranded);
                     }
                     // A generation that lost rows here never executes

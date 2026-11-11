@@ -69430,3 +69430,25 @@ seeds failed I1 on main, 0 after).
   `AUTHORITY_SIM_PLANT_ROSTER_SHRINK=1` fails `singleton-peer-join` on 32 of 300 seeds) and `singleton_lag` (reported:
   `SWEEP-SINGLETON`). Harness: `singleton-peer-join`, `registered-peer-down`. `registry-bad-record` is not built (the
   harness has no way to plant a record in the bucket).
+
+## 2026-11-11 Plan 46 M1.2 step 15: the claimant's own gate keeps no copy of an uncommitted `Archive` row
+
+`backup-crash-slow+commit` seed 64 (and `+durability`) failed `member_copies_drained`: node 3 kept two rows of epoch 1,
+class `Group { on: Archive }`, for good. Mechanism: the holder re-adopted its lease after a failed claim, its backups
+refused to back the epoch again, so its new rows waited for the archive alone; it then claimed its own lease at epoch 2
+with an empty member copy of epoch 1 (its own shipped run had retired the old rows), shipped a no-tail marker, and the
+gate's strand moved the two unshipped `Archive` rows into the member copy of epoch 1. Every other replica drops such a
+row at that marker (rule 4); the claimant never applies its own marker, so nothing ever did. No answer rested on the rows
+(an `Archive` row is answered once the log carries it), so this was a leak and an oracle failure, not an I1/I2/I5 breach.
+
+Fix: at the claimant's own gate only (`strand_part_tx`, `Strand::gate_epoch`), an own `Archive` row of an older epoch is
+rolled back and neither kept nor queued (`Stranded::archive_dropped`, `Stats::archive_dropped`); the requester retries by
+rid. Depositions, recalls, rebuilds and segment strands are unchanged; `Root`, `Delegate` and `Hold` rows are kept until
+coverage. Tests: four in `crates/meta/tests/member_copy.rs` (the drop fails before, two controls, restart) and
+`regression_a_self_claim_keeps_no_copy_of_its_unshipped_archive_rows` (seed 64, `archive_dropped` 2).
+
+Sweeps, `+commit`, seeds 0..1999 each, main against the fix: `backup-crash-slow` (main: seed 64 fails; fix: 0), `backup-crash`,
+`long-backup`, `delegated-holder-cut`, `placement-hot`, `long-delegated-backup` (0 failing both), `flex` (7 failing both,
+same seeds), `flex-crash` (8, same), `delegated-core-stall-root-lease6` (280 on both, its known M1.3 exemption), and
+`backup-crash-slow+durability` (main: 64; fix: 0). `member_copies_drained` 0 everywhere; I1, I2, I5 0; rows dropped at a
+gate: 2 (seed 64), 0 elsewhere.
