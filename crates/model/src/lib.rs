@@ -159,7 +159,10 @@
 //! `no_lone_answer_with_peer` judged against what the root was told; knobs
 //! `roster_installs_old_read`, `roster_partial_shrinks`,
 //! `singleton_while_partial`, `evidence_only_on_forward`,
-//! `singleton_with_foreign_grant`); and the combined topologies X1 to X4
+//! `singleton_with_foreign_grant`); chunk 14 (plan 46 M1.3 step 9, ADR-55)
+//! a deposed root that keeps its own sticky grant and returns as an ordinary
+//! node, whose stream the new root appends again (`Resume`, the witness
+//! `deposed_root_streams`, knob `deposed_root_drops_own_stream`); and the combined topologies X1 to X4
 //! (`tests/node_stream.rs`: every property of the model switched on at
 //! once, on two or three ops per node). Every knob's counterexample is
 //! checked in as its path length (`TRACES` in that file; regenerate with
@@ -212,6 +215,8 @@
 //! | `c11_design_x2r_reads_and_deadlines` | 905k | 3.4 s |
 //! | `c11_design_x3_roster_and_grants` | 104k | 0.3 s |
 //! | `c11_design_x3b_leave_ends_grants` | 20k | 0.1 s |
+//! | `c14_design_t1_deposed_root_keeps_its_grant` | 242k | 0.8 s |
+//! | `c14_design_t2_roster_fence_and_return` | 1.81M | 8 s |
 //! | `c11_design_x4_claim_and_sticky` (with reads) | 5.37M | 22 s |
 //! | `c7_design_t1_crash_reads_abandon` | 485k | 2 s |
 //! | `r1_design_partial_release_does_not_end_the_stream` | 22k | 0.1 s |
@@ -319,6 +324,7 @@
 //! | `Replicate` | `replica.rs`/`store/backup.rs::deleg_backup_append` (a member copies the stream's next row); the per-stream rule is `deleg_rule` / `deleg_row_commit`. **Gap:** one stream per node (M1.2) |
 //! | `Append`, `Ship`, `RootAck` | the root's verbatim append of a delegate's rows (`deleg_committed_through`, `holder_append_committed`), the root's segment shipper, `DelegateStreamAck.committed`; ADR-41's lone-journal branch is removed (`deleg_counts_root`). **Gap:** M1.2 |
 //! | `Answer` | `delegate.rs::deleg_row_commit` (the answer's gate) and, for the root's own rows, `backup.rs::root_commit` |
+//! | The root's own grant, `Resume` | chunk 14: `place_kind_for(me)`, `delegate_dir(.., me, Sticky)`, `send_or_loop` (step 9, not built); a deposed root keeps its grant and streams to the next root (`strand_deposed` strands only appended delegate rows) |
 //! | `Crash`, `Depose`, `Retry`, `Rescue` | fail-stop; `seal_tail.rs::on_seal_tail`/`claim_without_tail` and `jobs.rs::claim_with_tail`/`claim_orphan_proof` (takeover, orphan proof); the requester's rid retry in `forward.rs`, `replay.rs` |
 //! | `Reconfig`, `TogglePeer` | `delegate.rs::deleg_group_refresh`/`deleg_journal_group` (group change under old ∪ new); the peer-in-budget flag is `backup_peers_in_budget`. Closed (M1.1 steps 3 and 4): rows carry their configuration's `config_version`. |
 //! | `Release`, `ReleaseAll`, `Grow`, `Stop`, `End` | `meta/src/delegation.rs::DelegationTable::apply` (`DelegationRecord`), `delegate.rs::deleg_handed_back_to`/`deleg_end_sealed`. `SubtreeReleased`/`StreamReleased`/`DelegateNodeEnded` stream rows and recall as a request are built (M1.2 steps 8a to 11). **Gap:** the sticky grant kind and the holder's release (M1.3); claim = release (the claim's release record, not built) |
