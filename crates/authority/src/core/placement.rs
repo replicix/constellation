@@ -82,7 +82,7 @@ pub(crate) struct PlacementState {
     pub(crate) released: BTreeMap<Ino, (NodeId, WaitMs)>,
 }
 
-/// Since when a link has measured far, and its lowest sample.
+/// Since when a link has measured far.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FarTrack {
     pub since: WaitMs,
@@ -405,7 +405,10 @@ impl Core {
     }
 
     /// Plan 46 M1.3 step 7 (D-a): the kind of grant the placement makes
-    /// `node` for `dir`, or why none (counted).
+    /// `node` for `dir`, or why none (counted). The caller checks that the
+    /// node is eligible (connected, in the roster, not leaving:
+    /// `place_eligible`) first; at a budget of 0 `place_far` holds for any
+    /// connected node.
     ///
     /// - `Placed` when the node has a group within budget and its live
     ///   stream (if any) is stealable;
@@ -652,7 +655,7 @@ impl Core {
                     && (super::delegate::is_under(ns, *d, dir)
                         || super::delegate::is_under(ns, dir, *d))
             }) {
-                self.stats.place_skipped_cooldown += 1;
+                self.stats.place_quarantined += 1;
                 continue;
             }
             if !self.place_eligible(now, node, out) {

@@ -1533,7 +1533,9 @@ pub struct Stats {
     pub place_skipped_cooldown: u64,
     pub place_skipped_unreachable: u64,
     /// Placement: candidates skipped because the node holds designations
-    /// only, or one is pending (a stream never mixes grant kinds).
+    /// only, or one is pending (a stream never mixes grant kinds), or a
+    /// sticky stream of the node while it is near (a sticky stream grows
+    /// only for a far node).
     pub place_skipped_designated: u64,
     /// Plan 46 M1.2 step 13: candidates refused because the node has no
     /// group within the backup RTT budget and is not (yet, or robustly)
@@ -1550,6 +1552,9 @@ pub struct Stats {
     /// Evaluations in which a subtree under a live sticky stream is
     /// dominated by another node (the handover's input).
     pub place_sticky_contended: u64,
+    /// Candidates the placement skipped because their holder released the
+    /// subtree on its own within the last window (D-e's quarantine).
+    pub place_quarantined: u64,
     /// A sticky grant the placement made that `delegate_dir` refused (it
     /// waits for the read grants or the quarantine, and is retried).
     pub place_grant_waits: u64,

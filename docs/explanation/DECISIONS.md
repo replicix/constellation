@@ -4420,9 +4420,11 @@ subtrees on a burst.
   recalls a sticky or designated grant.
 - **After a holder's release.** The release row of a holder's own release of a
   sticky subtree keeps the placement from granting it back to that node for one
-  window (the window still counts its earlier ops). Other nodes are not held
-  back.
-- **Settings.** `CONSTELLATION_DELEGATION_STICKY_PLACEMENT` (on),
+  window (the window still counts its earlier ops); a stream released whole
+  (an unmount, a suspension) quarantines every subtree it still held. Other
+  nodes are not held back.
+- **Settings.** `CONSTELLATION_DELEGATION_STICKY_PLACEMENT` (on whenever
+  `CONSTELLATION_DELEGATION_PLACEMENT` is),
   `_FAR_RTT_MS` (20), `_FAR_DWELL_MS` (30000); `_DWELL_MS` default 300000.
 - **Sticky grants and the other rules.** A sticky holder that dies blocks its
   subtree (`EROFS`, `EXDEV` across its boundary) until it returns or the
