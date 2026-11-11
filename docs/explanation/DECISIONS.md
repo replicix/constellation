@@ -4664,3 +4664,120 @@ silent hang).
 See: `crates/meta/src/store/member.rs` (`hold_row_tx`, `release_*_tx`),
 `crates/meta/src/session.rs` (the hold phase of `SessionState::wait_with_holds`),
 `crates/authority/src/deadlines.rs` (`read_hold_span`, D16).
+
+## ADR-59: A directory's merged attributes order nothing (part A)
+
+**Status**: decided by the maintainer on 2026-11-11 (parent-directory key
+tainting; the `flex-crash+durability` seeds 26, 283, 860, 1258 and 1751).
+Refines the ship rule of plan 30 M4. Part A only: the second half of the
+decision as first drafted, a `repair drop-held` that redoes in place what does
+not need the lost content, is **deferred to a design item** (part B, below).
+
+**Context**: in those seeds Group-acknowledged namespace rows sat in the
+holder's journal, held behind a seed (a `WriteManifest` naming a chunk whose
+uploader was lost for good). `repair drop-held` rolled them back and replayed
+them by rid; after a takeover some landed later and some were refused (an
+`unlink` answered `ENOENT` after it was acknowledged). An acknowledged effect
+was lost to an operator command. The false dependency entered through three
+key sources, not one: the planner's `named.shared` (`inode(P)` of every
+create, unlink, link and rename parent), and the captured before-images of
+`inode(P)` and of `P`'s own name in its parent, which every directory carries
+as an attribute copy and `put_inode_record` rewrites. One held transaction in
+a directory held every later one in it, and the drop rolled all of them back.
+
+**Decision (part A)**:
+
+- **A key is written exclusively or by a merge.** A directory's `mtime`/`ctime`
+  (`max`), `nlink` (`+=`) and the copy of them its name carries change by the
+  commutative M12 merge whenever a child comes, goes or moves. The capture
+  records, per key and transaction, whether every write of it was such a
+  merge (`spec::MergeEntry`). `held::conflicts(access, taint)` is the one rule:
+  two accesses of a key conflict unless neither is exclusive. The planner,
+  the blame walk, the drop's dependency walk and the property test's model
+  all call it. A create, unlink, link or rename of another name ships past
+  a held operation in the same directory; an explicit `utimes`, `chmod`,
+  `rmdir` or rename of the directory itself, and an operation on the same
+  name, still wait. A refusal's observation of a merged directory orders
+  nothing. No journaled answer and no record's effect is a function of a
+  directory's times or link count (audit in the capture commit).
+- **The publisher applies the shipped merge.** A transaction that merged a key
+  a held one also merged is a `Foreign` row the substitution can no longer
+  skip: the view applies its merge to the held row's before-image
+  (`LogPrefixView::merge_shipped`), so the publish stays the log prefix
+  instead of deferring for as long as anything in the directory is held. A
+  shipped row the view cannot place (it wrote or merged a key an older
+  outstanding row wrote exclusively) is a planner violation: counted
+  (`Meta::publish_unplaced`), logged, a `debug_assert!`, and the publish
+  defers.
+- **The drop follows the rule.** `repair drop-held` rolls back the seeds and
+  the held transactions that depend on them by the same rule, so a sibling
+  that only merges the directory is no longer rolled back with them. What it
+  does roll back and may have been acknowledged (a rename, chmod or unlink of
+  the damaged file itself, or a create of a name it vacated) is the operator's
+  cost of a lost chunk that part A does not avoid; the drop names those rows
+  (`DroppedHeld::rolled_back_on_inode`) and the sim fails any other
+  acknowledged namespace op in `rolled_back`
+  (`drop_rolled_back_independent_acked`). `DroppedHeld::non_sequencer` says the
+  dropper was not the sequencer in force (a deposition's strand).
+
+**Part B, deferred to a design item**: the drop could redo in place the rows
+that do not need the lost content (keeping their journal rows, rids and
+answers) and list what it does undo. A first implementation did not converge in
+the simulation: a redone row outlives its `RolledBack` in the members' copies
+and in a deposed dropper's sealed tail, a parked answer of a refused rid is
+released as `Ok`, the reship gate resurrects a refused rid, and a kept in-doubt
+inode keeps an allocation its requester then reuses. Those are one class (what
+a partial rollback leaves behind on other nodes and in parked state) and get
+one design: where the `RolledBack` is placed and how it reaches every member,
+the reship gate's outcome test, the parked reply of a refused rid, the
+dropper's lease margin, and what a kept in-doubt row means for the requester's
+allocations. Until then the acknowledged operations a drop rolls back on the
+damaged file itself are listed by rid in `rolled_back_on_inode`, and a client
+that sees them later finds them replayed or refused, as before.
+
+**Consequences**: the sim's real-time and session-order checks keep the log as
+the witness: a tenure's rows are taken in the order it journaled them only
+where nothing but that tenure's rows lies between them (`witness_order`),
+because two names of one directory now ship out of journal order around a
+held transaction. A transaction a takeover re-shipped from its predecessor's
+tail was held by two tenures, the one that first journaled it (its `TailOf`
+identity) and the one whose journal numbers it, and by the tenures in
+between; it may precede the rows of those, not of a third. For a tenure in
+between the oracle assumes what ADR-51's gate does and the log cannot verify:
+the tenure adopted the row at its gate, before it served a row of its own, so
+the row numbers below every row of that tenure; a tenure that did not have the
+row served without it, and a conflicting row of it then fails the check (an
+acknowledged effect invisible to it). The completion-only row's observed keys
+stay exclusive (judgment (a)): a no-op completion is ordered as a write of what
+it observed because the session-order check keeps a client's program order
+across it (`flex+links` seeds 191 and 335 need a create invoked after a no-op
+rename returned to stay behind it), not because anything depends on its state;
+it is no counter-example to the matrix. A drop's acknowledged rolled-back op is
+excused by the sim only if the drop attributed it to the damaged inode or, for a
+dropper that was not the sequencer in force, if its effect survives in the log.
+`Meta::set_parent_taint_conservative` (the sim's `+parent-taint-conservative`)
+restores the previous classification and drop; the five seeds above must fail
+with it and pass without. Kept rows (ADR-51): rows now ship ahead of an
+unshipped one in the same directory more often, so the log has seqs above an
+unshipped one; the kept merge dedups by `TailOf` identity and `row_in_log`
+already, as it does for rows of different directories, and a session that
+shipped a row ahead of a held one keeps it in the log across the epoch change
+(`SessionState::closed`). A member that keeps an epoch owner's held seed has
+the takeover re-ship it, and the rows behind it, once each and in order. A
+takeover's identity dedup (a later epoch's tail carrying the re-ship of an
+earlier epoch's row) is counted apart from a done rid (`tail_dedup`,
+`tail_done`). A hole (the record-less span a backup is streamed for rows the
+holder shipped ahead of a held one) is retired by the marker that follows its
+epoch: nothing else carries it.
+
+**Rejected**: removing `named.shared` from the planner alone (the captured
+before-images re-enter the same keys); treating a seed that changes the mode
+as exclusive on it (`WriteManifest` carries no mode); shipping part B's redo
+with part A (the oracle gate it needs does not converge).
+
+**May revert**: no. `flex-crash+durability` seeds 26, 283, 860, 1258 and 1751
+pin part A.
+
+See: `crates/meta/src/store/held.rs` (`conflicts`, `drop_held_knowing`),
+`crates/meta/src/store/spec.rs` (`MergeEntry`, `local_before_images_from`),
+[write-path hygiene](../reference/features/write-path-hygiene.md).

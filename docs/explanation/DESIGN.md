@@ -2088,8 +2088,12 @@ until then plan 43 C2g′'s placeholders order them (below).*
 A pending upload whose chunk is gone from the local cache (a disk fault,
 a manual deletion) cannot ever reach S3. It no longer blocks the node's
 whole ship: each ship holds back only the transactions whose manifest
-names such a chunk and every later transaction that touches the same keys
-(a `chmod`, rename or unlink of that file). Everything else ships.
+names such a chunk and every later transaction that conflicts with it on a
+key (a `chmod`, rename or unlink of that file). Everything else ships,
+including a create, unlink or rename of another name in the same directory:
+a directory's times and link count change by a commutative merge, and two
+merges, or a merge and an observation, order nothing
+([ADR-59](DECISIONS.md#adr-59-a-directorys-merged-attributes-order-nothing-part-a)).
 `status.held` lists what is held, and `constellation repair drop-held`
 turns a held manifest into a conflict copy with the lost chunks as holes
 and replays its dependents by rid
