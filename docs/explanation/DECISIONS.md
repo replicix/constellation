@@ -3947,6 +3947,123 @@ See: `crates/authority/src/core/roster.rs`, `core/backup.rs`
 `crates/store-s3/src/nodes.rs` (`RegistryScan::roster_read`),
 [delegations](../reference/features/delegations.md).
 
+## ADR-51: A takeover collects the tenure's kept rows before it serves
+
+**Status**: decided by the maintainer on 2026-11-10 (plan 46 M1.4, kept rows,
+design v2; questions Q1 to Q6 of the design accepted as recommended).
+Implements the "committed rows survive a takeover" half of
+[ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
+and completes the member copy of
+[ADR-21](#adr-21-layered-durability-and-seal-based-failover) for a hold.
+
+**Context**: a row a hold owner answered under an epoch is committed because a
+member kept it (`StreamAheadAck`). The members' kept copies were carried to the
+successor only on some paths. A node that took the lease by the promise check
+(TTL takeover by a non-member), a member that claimed, and a takeover over a
+hold handed to a transferee (journaled one epoch up, under the transferee's
+stream) each claimed from the log alone. The member's committed copy was then
+stranded and replayed by rid while the claimant ran the same rid again, so a
+committed row was executed twice or lost (`flex-tight` seeds 809, 1489, 279).
+A first design triggered the fetch on a retirement fence only; the same loss
+on plain takeovers showed that the fault was the trigger, not the lease shape.
+
+**Decision**: collecting the kept rows is a phase of every marker takeover
+(the previous holder is not 0 and did not release), not a predicate on the
+lease shape.
+
+- **One trigger.** The phase runs after the promise check passed (or was
+  not needed) and before the claim's CAS, whatever the ack policy, slack,
+  fence or inherited tail. Exemptions: the hold owner's own re-claim of the
+  epoch it closed (its rows are in its journal; a member claimant or a
+  transferee that closed a handed-over epoch is not exempt) and
+  `Config::kept_fetch_skipped` (the negative control). A node with P2P off
+  has no hold and runs no phase. A released lease has no marker and no phase.
+- **Seal after the check, keyed on the tenure.** The promise check proves
+  that no live epoch holds the tenure `(H, E)`; the seal deposes what is left.
+  A member whose own open epoch carries the tenure, or that saw a newer renewal
+  than the claimant's key, refuses (`EpochOpen`, `StaleKey`) and seals
+  nothing; the attempt ends and the ops retry. Otherwise it persists the seal
+  of the tenure `(H, E)` (`Meta::sealed_tenures`): it refuses a batch that is
+  `H`'s stream of epoch `E`, and a hold batch received in an open epoch
+  whose carried lease is a sealed tenure that has not moved (the transferee's
+  stream one epoch up). A successor's own streams of the same epoch numbers
+  are not the tenure and are never refused. A refused hold owner is told
+  and ends its hold as deposed once no member that did not seal has a link up,
+  so its clients retry on the successor. The previous holder is asked with the
+  plain seal even when the rules are met without it, so a live-but-expired
+  holder deposes itself before the CAS and its lone answers roll back.
+- **Collect by carrier.** The evidence of which nodes hold rows of the tenure
+  is the epoch rows whose recorded carrier is exactly `(H, E)`; a row with no
+  carrier is no evidence for any tenure. A hold over `(H, E)` journals at `E`
+  (the carrier re-adopts) or at `E + 1` (a transferee), so both are
+  collected, on every named member, together with a named backup tail
+  and an inherited union (`kept: true` asks every member it names). The claim
+  completes when every member the answers name has answered and the answerers
+  meet every possible epoch (the previous holder, `f + 1` roster nodes, or all
+  of them). The roster read must be complete and issued after the claimant
+  first saw the lease; an older one waits for a fresh read inside the attempt.
+- **Claim epoch skip.** The claim lands above every epoch a member sealed
+  with rows (`E + 2` after a handed-over hold), so its identities never meet
+  the transferee's `(E + 1, seq)` rows. Its marker names every epoch from `E`
+  up to the claim with what the union carries of it
+  (`TailFollowsThrough`).
+- **Merge after the tail to head.** The union is merged after the claim read the
+  log to head, per epoch in seq order from the first seq the log lacks (an
+  inherited union's epoch starts where it ended), written as a sealed tail
+  and re-shipped by the gate before the first write, in epoch order, in the
+  one transaction with the strand; an identity an earlier epoch re-shipped is
+  not journaled twice. Two sources that kept different transactions at one
+  seq (compared by `TailOf` identity) end the attempt (`kept_diverged`);
+  the operator's force takes the longest. A fetch that outlasted
+  the promise window checks again before the CAS.
+- **One abandon rule.** `LiveEntry::stranded_by_abandon(e, through_known,
+  tail_idents)` strands a committed copy only if it is of an earlier epoch,
+  or of `e` past the record's `through_known` and not named by the carried
+  tail. The claimant's strand, a returning member's segment apply and the
+  member copy rules all use it. Q1: the operator's `repair abandon --epoch`
+  is accepted after partial answers: the claim completes with what
+  answered, the marker writes `TailFollowsThrough` and `GroupAbandoned` with
+  that `through_known`, and what the missing member kept above it replays by rid
+  when the member returns (the alternative, retiring it, loses its rows
+  silently).
+- **The fence keeps the backups.** `fenced_for_retirement` keeps the retired
+  holder's listed backups (the policy still becomes `Local`), so the claimant
+  of a fenced `Backup` tenure also collects the group's tail.
+- **A restarted session seeds `row_in_log`.** A session restarted over a
+  persisted position counts that position as applied, so the merge's "first
+  seq the log lacks" does not re-offer rows the log already carries.
+
+**Consequences**:
+
+- Every row a hold owner answered survives its holder's death, deposition or
+  retirement while one member that kept it can be reached; a retired node's
+  stream is no longer dropped. Writes lost with a retirement are only those
+  no other node holds (an ungated, not yet committed row).
+- A takeover of a tenure with a hold waits for the members the epoch rows
+  name; a member that is down holds the claim (its rows were acknowledged).
+  `status.lease.waiting_for_group` names the unanswered sources. The operator
+  abandons (Q1) or retires the member. Divergence needs `--force`.
+- A takeover costs one `SealTail` round trip when the previous holder
+  answers; with `f = 0` the claimant is a member of every epoch and needs none.
+- The fallbacks stay and are counted (`kept_uncarried_replayed`,
+  `kept_past_gap`); the sim fails a run on a nonzero value under
+  `strict_identity`.
+
+**Rejected**: triggering on the fence or the lease shape; sealing every stream
+`(E, s)` and `(E + 1, s)` (it refused the successor's own streams for ever);
+claiming at `E + 1` and deduplicating against the transferee's rows (identity
+spaces collide); replaying a committed row by rid on a non-claimant; dropping
+the retired node's streamed rows.
+
+**May revert**: no. The verified flex model (`takeover` carries every node's
+`kept`; `retire_drops_acked` is the planted bug) and the sim's
+`kept_fetch_skipped` control, which must fail the `flex-tight` identity
+seeds, pin it.
+
+See: `crates/authority/src/core/kept.rs`, `core/seal_tail.rs`,
+`crates/meta/src/store/spec.rs` (`stranded_by_abandon`), `crates/store-s3/src/lease.rs` (`fenced_for_retirement`),
+[durability and failover](../reference/features/durability-and-failover.md).
+
 ## ADR-53: A row keeps its configuration's rule across its holder's own tenure gap
 
 **Status**: decided by the maintainer on 2026-11-11 (plan 46 M1.4 step 6a;
