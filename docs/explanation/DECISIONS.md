@@ -3885,8 +3885,9 @@ receives (counted at the one door every peer message passes, and at an inbox
 batch's admission) and the node's own lapses. An older read is ignored; an
 incomplete read only adds the nodes it listed and marks the peer set unknown;
 a complete read replaces the lists and drops a node heard from only if the
-read was issued after the node's last message; a node the read lists as
-read-only is no evidence. Unknown means "has peers".
+read was issued after the node's last message and does not list it (a
+directory snapshot never drops one: it says nothing of a link being up); a node
+the read lists as read-only is no evidence. Unknown means "has peers".
 
 A root is a singleton (`Core::singleton_now`) only if its last complete read
 lists no write-eligible node but itself, nothing newer is incomplete, no lapse
@@ -3921,7 +3922,10 @@ quarantine and abandon audience, status) asks the object.
   `DelegateStreamAck.archive_bound` holds for any root with no backup listed.
 - The stale-view hole `epoch-holder-retired` closes: a link up after the
   roster read is a peer the read cannot speak for
-  (`Roster::link_is_peer`), for the lone test and for backup candidacy alike.
+  (`Roster::link_is_peer`) for the lone test. It is no backup candidate until
+  a read lists it as write-eligible (it may be read-only, or a retired node's
+  process), and a committed backup that a later complete read omits or lists as
+  read-only is removed.
 - M2.3 deletes only `AckPolicy::Local`.
 - `status.roster` shows the installed read, whether it is complete, the nodes
   known and heard, and the verdict.
