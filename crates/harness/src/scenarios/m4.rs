@@ -472,6 +472,26 @@ pub(super) fn poison_record_isolation(seed: u64) -> Result<()> {
     let a_node = a.control_status()?["node_id"]
         .as_u64()
         .context("A reports no node_id")?;
+    let b_id = b.control_status()?["node_id"]
+        .as_u64()
+        .context("B reports no node_id")?;
+    // Since ADR-40 and ADR-50 A, with B mounted, answers a write only once
+    // the archive or a backup holds it. The hold below stops the rounds
+    // that would bring a backup in, so B is A's backup before it starts:
+    // the held records are then acknowledged on B's copy, as the premise
+    // (acknowledged locally, unshipped) needs.
+    eventually("A lists B as its backup", Duration::from_secs(30), || {
+        let ack = a.control_status()?["ack"].clone();
+        let backups: Vec<u64> = ack["backups"]
+            .as_array()
+            .map(|v| v.iter().filter_map(|x| x.as_u64()).collect())
+            .unwrap_or_default();
+        anyhow::ensure!(
+            ack["policy"] == "backup" && backups == [b_id],
+            "A's backup set is not [B]: {ack}"
+        );
+        Ok(())
+    })?;
 
     // Hold A's rounds; wait until one has seen the hold.
     std::fs::write(&hold, b"hold")?;
@@ -702,7 +722,6 @@ pub(super) fn drop_held_remote_dependents(seed: u64) -> Result<()> {
         .with_own_node_key()
         .with_write_mode("back")
         .with_env("CONSTELLATION_LEASE_PLACEMENT", "off")
-        .with_env("CONSTELLATION_BACKUPS", "0")
         .with_env("CONSTELLATION_PUBLISH_IDLE_S", "1")
         .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000")
         .with_env("CONSTELLATION_FAULT_LOSE_CHUNKS", &lost_hex)
@@ -710,13 +729,36 @@ pub(super) fn drop_held_remote_dependents(seed: u64) -> Result<()> {
             "CONSTELLATION_FAULT_HOLD_SYNC_FILE",
             &hold.display().to_string(),
         );
-    let mut b = Client::new(root.path(), "dhrd-b", &env.endpoint, &backend)?
-        .with_own_node_key()
-        .with_env("CONSTELLATION_BACKUPS", "0");
+    let mut b = Client::new(root.path(), "dhrd-b", &env.endpoint, &backend)?.with_own_node_key();
+    let mut c = Client::new(root.path(), "dhrd-c", &env.endpoint, &backend)?.with_own_node_key();
+    // Since ADR-40 and ADR-50 a holder with mounted peers answers its own
+    // writes only once the archive or a backup holds them, and the hold
+    // below stops the archive: the first rig (no backups) left A's own
+    // create blocked until EIO. C is A's backup, so A's rows are
+    // acknowledged on C's copy, unshipped. B is not the backup: it is the
+    // requester whose rows A cannot answer from a log that is held.
     a.fs_create()?;
     a.mount()?;
+    c.mount()?;
+    wait_for_p2p(&[&a, &c])?;
+    std::fs::write(a.mnt.join("f0"), b"zero")?;
+    let c_id = c.control_status()?["node_id"]
+        .as_u64()
+        .context("C reports no node_id")?;
+    eventually("A lists C as its backup", Duration::from_secs(30), || {
+        let ack = a.control_status()?["ack"].clone();
+        let backups: Vec<u64> = ack["backups"]
+            .as_array()
+            .map(|v| v.iter().filter_map(|x| x.as_u64()).collect())
+            .unwrap_or_default();
+        anyhow::ensure!(
+            ack["policy"] == "backup" && backups == [c_id],
+            "A's backup set is not [C]: {ack}"
+        );
+        Ok(())
+    })?;
     b.mount()?;
-    wait_for_p2p(&[&a, &b])?;
+    wait_for_p2p(&[&a, &b, &c])?;
     std::fs::create_dir(a.mnt.join("d"))?;
     std::fs::write(a.mnt.join("d/before"), b"shipped before the hold")?;
     eventually("A drains", Duration::from_secs(60), || journal_drained(&a))?;
@@ -873,6 +915,7 @@ pub(super) fn drop_held_remote_dependents(seed: u64) -> Result<()> {
     );
     a.unmount()?;
     b.unmount()?;
+    c.unmount()?;
     Ok(())
 }
 

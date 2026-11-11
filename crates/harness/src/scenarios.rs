@@ -5472,8 +5472,23 @@ fn lease_fencing(_seed: u64) -> Result<()> {
     // the lease itself, costing this scenario ~30s it does not need to
     // spend. Give each client its own P2P identity (see
     // `Client::with_own_node_key`'s doc for the shared-key failure mode).
-    let mut c0 =
-        short(Client::new(root.path(), "c0", &env.endpoint, &backend)?.with_own_node_key());
+    //
+    // A node with a mounted peer answers a mutation only once the archive
+    // has it (ADR-40 and ADR-50: no `ack=local` any more), so an *acknowledged*
+    // record is never left unshipped on A. The stranded work is an in-flight
+    // mkdir: A's rounds
+    // are held, so the mkdir sits journaled and unanswered (its requester
+    // blocked on the archive) when A is frozen and deposed.
+    let hold = root.path().join("hold-a");
+    let held_marker = root.path().join("hold-a.held");
+    let mut c0 = short(
+        Client::new(root.path(), "c0", &env.endpoint, &backend)?
+            .with_own_node_key()
+            .with_env(
+                "CONSTELLATION_FAULT_HOLD_SYNC_FILE",
+                hold.to_str().context("hold path")?,
+            ),
+    );
     let mut c1 =
         short(Client::new(root.path(), "c1", &env.endpoint, &backend)?.with_own_node_key());
     c0.fs_create()?;
@@ -5505,11 +5520,34 @@ fn lease_fencing(_seed: u64) -> Result<()> {
     // proxy is down makes require_lease/ship retries block the FUSE
     // thread for object_store's ~180s retry budget. Query the control
     // socket before SIGSTOP — a paused daemon cannot answer.
-    std::fs::create_dir(c0.mnt.join("shared/stranded"))?;
-    let a_spool_before = c0.control_status()?["spool"].clone();
+    std::fs::write(&hold, b"hold")?;
+    eventually(
+        "A's round observes the hold",
+        Duration::from_secs(20),
+        || {
+            anyhow::ensure!(held_marker.is_file(), "A has not observed the hold");
+            Ok(())
+        },
+    )?;
+    let stranded = {
+        let dir = c0.mnt.join("shared/stranded");
+        std::thread::spawn(move || std::fs::create_dir(dir))
+    };
+    eventually(
+        "A holds the unshipped mkdir",
+        Duration::from_secs(20),
+        || {
+            let a_spool_before = c0.control_status()?["spool"].clone();
+            anyhow::ensure!(
+                a_spool_before["journal_backlog"].as_u64().unwrap_or(0) > 0,
+                "A should hold unshipped records before being deposed: {a_spool_before}"
+            );
+            Ok(())
+        },
+    )?;
     anyhow::ensure!(
-        a_spool_before["journal_backlog"].as_u64().unwrap_or(0) > 0,
-        "A should hold unshipped records before being deposed: {a_spool_before}"
+        !stranded.is_finished(),
+        "the mkdir returned while the archive could not have it: an acknowledgement ahead of the log"
     );
     eprintln!("    lease-fencing: pausing A (SIGSTOP)");
     c0.pause()?;
@@ -5539,6 +5577,7 @@ fn lease_fencing(_seed: u64) -> Result<()> {
     // behind B's back under A's old epoch: the mkdir arrives only as B's
     // own execution of the replay.
     c0.resume()?;
+    std::fs::remove_file(&hold)?;
     eventually(
         "A recovers from the deposition by itself",
         Duration::from_secs(40),
@@ -5565,6 +5604,20 @@ fn lease_fencing(_seed: u64) -> Result<()> {
         },
     )?;
     model.mkdir(std::path::Path::new("shared/stranded"));
+    // The requester that was blocked on the mkdir gets its answer from B's
+    // execution of the replay: success, exactly once.
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    while !stranded.is_finished() {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "A's stranded mkdir never returned after the recovery"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    stranded
+        .join()
+        .map_err(|_| anyhow::anyhow!("the stranded mkdir thread panicked"))?
+        .context("A's stranded mkdir must succeed through B's replay")?;
     // A is an ordinary node again: its next write goes through B.
     std::fs::write(c0.mnt.join("shared/after-deposition"), b"ok")
         .context("a recovered node must accept writes again (through the holder)")?;
@@ -5865,12 +5918,16 @@ fn epoch_member_lost(_seed: u64) -> Result<()> {
 /// `deposed-reintegration-backup` covers the M9 path.
 fn deposed_reintegration(_seed: u64) -> Result<()> {
     let (env, root) = setup("deposed-reintegration")?;
-    // A reaches S3 through its own switch, so the cut below isolates A
-    // alone, as the scenario means to: through the shared toxiproxy route
-    // it cut B too — an S3 outage for the whole cluster, in which A and
-    // B form a continuation epoch (plan 30 §M10) and the premise (a
-    // holder acknowledging locally while the rest of the cluster carries
-    // on) no longer holds.
+    // Since ADR-40 and ADR-50 only a *singleton* root (its roster lists no
+    // write-eligible peer) answers from its own disk. With B mounted, A's
+    // edits wait for the archive and a cut S3 gets the writer an honest EIO
+    // at its deadline, so the stranded, acknowledged state this scenario is
+    // about exists only on a lone A. B therefore joins after A is frozen:
+    // A has acknowledged its three edits as a singleton and never heard of
+    // B (the singleton's death-then-join contract, ADR-50), and B takes the
+    // expired lease over. The overlap with B's write is then a true
+    // conflict, as before. A reaches S3 through its own switch so the cut
+    // isolates A alone.
     let _route = env.s3_proxy()?;
     let a_s3 = env.counting_proxy()?;
     let backend = format!("s3://{BUCKET}/reintegrate-{}", ts());
@@ -5903,15 +5960,15 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
     let mut c1 = tune(Client::new(root.path(), "c1", &env.endpoint, &backend)?);
     c0.fs_create()?;
     c0.mount()?;
-    c1.mount()?;
-    wait_for_p2p(&[&c0, &c1])?;
 
     std::fs::create_dir(c0.mnt.join("shared"))?;
     std::fs::write(c0.mnt.join("shared/same"), b"baseline")?;
     std::fs::write(c0.mnt.join("shared/a-only"), b"baseline-a")?;
-    eventually("baseline visible on B", Duration::from_secs(30), || {
-        anyhow::ensure!(std::fs::read(c1.mnt.join("shared/same"))? == b"baseline");
-        anyhow::ensure!(std::fs::read(c1.mnt.join("shared/a-only"))? == b"baseline-a");
+    eventually("baseline shipped", Duration::from_secs(30), || {
+        anyhow::ensure!(
+            c0.control_status()?["spool"]["journal_backlog"].as_u64() == Some(0),
+            "A has not shipped the baseline yet"
+        );
         Ok(())
     })?;
     let a_epoch = lease_of(&c0)?["epoch"].as_u64().unwrap_or(0);
@@ -5960,6 +6017,14 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
     // it to take over below.
     a_s3.heal();
 
+    // B joins now, with A frozen: it reads the baseline from the log and
+    // takes the lease over once A's TTL has run out.
+    c1.mount()?;
+    eventually("baseline visible on B", Duration::from_secs(30), || {
+        anyhow::ensure!(std::fs::read(c1.mnt.join("shared/same"))? == b"baseline");
+        anyhow::ensure!(std::fs::read(c1.mnt.join("shared/a-only"))? == b"baseline-a");
+        Ok(())
+    })?;
     std::thread::sleep(Duration::from_millis(6500));
     std::fs::write(c1.mnt.join("shared/same"), b"winner-from-b")
         .context("B takes over expired lease")?;
@@ -12095,8 +12160,15 @@ fn holder_publishes_log_prefix_mode(_seed: u64, backup: bool) -> Result<()> {
     // A is the holder whose backup the scenario waits for; a root mount
     // holds no lease until something is written (`take_root_lease`).
     take_root_lease(&a)?;
-    b.mount()?;
-    wait_for_p2p(&[&a, &b])?;
+    // Without a backup the premise is the lone root's: since ADR-50 only a
+    // singleton (a root whose roster lists no write-eligible peer) answers
+    // from its own disk, so B joins after the kill. With a peer mounted, A
+    // answers only what the archive or a backup holds, and no acknowledged
+    // tail can be lost with it.
+    if backup {
+        b.mount()?;
+        wait_for_p2p(&[&a, &b])?;
+    }
     let a_node = a.control_status()?["node_id"]
         .as_u64()
         .context("a reports no node_id")?;
@@ -12112,10 +12184,12 @@ fn holder_publishes_log_prefix_mode(_seed: u64, backup: bool) -> Result<()> {
         })?;
     }
     std::fs::create_dir(a.mnt.join("burst"))?;
-    eventually("burst/ visible on B", Duration::from_secs(20), || {
-        anyhow::ensure!(b.mnt.join("burst").is_dir(), "burst/ missing on B");
-        Ok(())
-    })?;
+    if backup {
+        eventually("burst/ visible on B", Duration::from_secs(20), || {
+            anyhow::ensure!(b.mnt.join("burst").is_dir(), "burst/ missing on B");
+            Ok(())
+        })?;
+    }
     proxy.latency(25, 0)?;
 
     // The writer counts only mkdirs that returned success. After the kill
@@ -12196,6 +12270,9 @@ fn holder_publishes_log_prefix_mode(_seed: u64, backup: bool) -> Result<()> {
     let acked_n = acked.load(Ordering::Relaxed);
     proxy.remove_all_toxics()?;
 
+    if !backup {
+        b.mount().context("B joins after the holder's death")?;
+    }
     let mut d = tune(Client::new(root.path(), "d", &env.endpoint, &backend)?);
     let checked = (|| -> Result<()> {
         d.mount()
