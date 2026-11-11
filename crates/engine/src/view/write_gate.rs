@@ -14,6 +14,10 @@ pub(super) struct AckTarget {
     /// The configuration version the row was journaled in (`None`: no row
     /// of its own, or a `Final` one).
     pub(super) version: Option<u64>,
+    /// The holder epoch the row was journaled in.
+    pub(super) epoch: u64,
+    /// The row is an `Archive` one (committed by the log alone).
+    pub(super) archive: bool,
 }
 
 /// What the fast path's acknowledgement of the op that just executed on
@@ -765,8 +769,18 @@ impl View {
                 // and its strand follows the group. Only an epoch's hold
                 // (the published rule is `Final`) re-tags it whatever the
                 // version: the answer there rests on this disk alone.
+                //
+                // Not so for a row of an older epoch: the configuration's
+                // spans end with the epoch (`sync_cfg_spans` clears them at
+                // a new tenure), so nothing but the archive could have
+                // committed an `Archive` row of the epoch before, and the
+                // takeover gate drops such a row the log does not carry
+                // (plan 46 M1.2 step 15, `ArchiveDropped`). It is re-tagged
+                // as an answer given alone must be, and the gate then
+                // queues it.
                 let published = session.published_class();
                 let replaced = !published.is_final()
+                    && !(target.archive && target.epoch != self.meta.holder_epoch())
                     && matches!(
                         (target.version, published.config_version()),
                         (Some(row), Some(now)) if row < now
@@ -844,6 +858,8 @@ impl View {
                         first: row.first,
                         last: row.last,
                         version: row.class.config_version(),
+                        epoch: row.epoch,
+                        archive: row.class.is_archive(),
                     })
                 } else if row.class.is_singleton() && !h.lease.usable() {
                     FastAck::InDoubt
@@ -858,6 +874,8 @@ impl View {
                         first: tip,
                         last: tip,
                         version: None,
+                        epoch: self.meta.holder_epoch(),
+                        archive: false,
                     })
                 } else {
                     FastAck::Now

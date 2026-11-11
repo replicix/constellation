@@ -232,6 +232,8 @@ pub struct JournaledRow {
     pub first: u64,
     pub last: u64,
     pub class: crate::store::local::RowCommit,
+    /// The holder epoch the row was journaled in.
+    pub epoch: u64,
 }
 
 /// Forget the last journaled row of this thread (before an execution whose
