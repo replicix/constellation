@@ -1323,6 +1323,8 @@ pub struct Report {
     pub operator_lost: usize,
     pub ops_invoked: usize,
     pub ops_returned: usize,
+    /// The simulated milliseconds the run took (throughput reports).
+    pub sim_ms: u64,
     /// Plan 45 follow-up (`SimConfig::link_ratio`): links and exchanges
     /// that returned `Ok`.
     pub links_ok: usize,
@@ -6230,6 +6232,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let events = same_inode_renames(history.events(), &oracle);
     report.ops_invoked = history.invoked();
     report.ops_returned = history.returned().len();
+    report.sim_ms = SIM_START
+        .with(|t| t.get())
+        .map_or(0, |t| t.elapsed().as_millis() as u64);
     {
         let ok: HashSet<Rid> = history
             .returned()
