@@ -51,6 +51,9 @@ pub fn check_cto(
     tentative: &HashSet<Rid>,
     completed_at: &HashMap<Rid, (u64, usize)>,
 ) -> CtoReport {
+    // A read refused after the read hold span (ADR-57) answered nothing.
+    let answered: Vec<ReadEvt> = reads.iter().filter(|r| !r.unserved).cloned().collect();
+    let reads = answered.as_slice();
     let mut report = CtoReport {
         reads: reads.len(),
         degraded: reads.iter().filter(|r| r.timed_out).count(),

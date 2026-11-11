@@ -618,6 +618,9 @@ pub(crate) struct LocalTx {
     start: u64,
     epoch: u64,
     capture: Option<spec::Capture>,
+    /// This node executes the transaction (not a return of rows: a
+    /// takeover's tail, an adopted or an appended row). ADR-57's assertion.
+    execution: bool,
 }
 
 impl LocalTx {
@@ -685,6 +688,7 @@ impl Meta {
             start,
             epoch,
             capture,
+            execution: true,
         })
     }
 
@@ -772,6 +776,30 @@ impl Meta {
             }
             None => (0, 0, crate::session::Position::ZERO, false),
         };
+        // ADR-57: holds are read-side. A node executes locally only on state
+        // that has the acknowledged rows it rolled back: a deposed holder
+        // forwards, a re-elected one carries the tail before its gate opens,
+        // a delegate never executes in a generation it does not hold. The
+        // simulation (a debug build of this assertion) proves it on the names
+        // a held row created or moved; a root's append of a delegate's row
+        // is the row's return, not an execution.
+        #[cfg(debug_assertions)]
+        if local.execution && !appended && self.any_held() {
+            let records: Vec<crate::LogRecord> = journal_records(&*tx, self, local.start, end - 1)?
+                .into_iter()
+                .map(|(_, rec)| rec)
+                .collect();
+            let keys = crate::KeySet::from_records(&records);
+            let clash = keys
+                .dentries
+                .iter()
+                .find(|(p, n)| self.member_copy_touches(&[crate::ReadKey::Dentry(*p, n.clone())]));
+            debug_assert!(
+                clash.is_none(),
+                "a local execution touches a name an acknowledged row this node rolled back \
+                 holds: {clash:?}"
+            );
+        }
         // The only captured row of a delegation origin in this view: what
         // `spec::DelegRows` holds is of rows gone since (it is never
         // shrunk), and it starts afresh.
@@ -1972,7 +2000,8 @@ impl Meta {
             }
             _ => None,
         };
-        let local = self.begin_local(&*tx)?;
+        let mut local = self.begin_local(&*tx)?;
+        local.execution = how == Journaled::Plain;
         let staged = UsageTracker::staging();
         let (skipped, applied) = {
             let cx = ApplyCx {

@@ -125,13 +125,20 @@ impl View {
     /// session`). A single-node mount (no sync handle) observes nothing
     /// and skips it. Bounded by `CONSTELLATION_SESSION_WAIT_MS`; a timeout
     /// answers from the replica anyway (degraded, not an error).
-    pub(crate) fn session_wait(&self, keys: &[ReadKey]) {
+    ///
+    /// ADR-57: a read of a key a pending acknowledged row touches (a row this
+    /// node rolled back while the log lacks it) waits for the row's return
+    /// whatever the budget, and fails with `EIO` after the read hold span:
+    /// it is never answered without the row.
+    #[must_use = "a refused read must fail with EIO"]
+    pub(crate) fn session_wait(&self, keys: &[ReadKey]) -> Result<(), Code> {
         if self.sync.is_none() {
-            return;
+            return Ok(());
         }
         constellation_vfs::watch::stage("session wait");
-        let _ = self.meta.session_wait(keys);
+        let waited = self.meta.session_wait(keys);
         constellation_vfs::watch::stage("running");
+        served(waited)
     }
 
     /// Plan 30 §M8: the read wait of a `cto=strict` open (`dir: false`)
@@ -160,7 +167,7 @@ impl View {
         dir: bool,
         name: Option<&str>,
         keys: &[ReadKey],
-    ) -> bool {
+    ) -> Result<bool, Code> {
         self.strict_read_hinted(ino, dir, name, keys, None)
     }
 
@@ -174,15 +181,16 @@ impl View {
         name: Option<&str>,
         keys: &[ReadKey],
         scan: Option<(Ino, &str)>,
-    ) -> bool {
+    ) -> Result<bool, Code> {
         let Some(h) = &self.sync else {
-            return true;
+            return Ok(true);
         };
         constellation_vfs::watch::stage("session wait");
         if !h.cto_strict {
-            let _ = self.meta.session_wait(keys);
+            let waited = self.meta.session_wait(keys);
             constellation_vfs::watch::stage("running");
-            return true;
+            served(waited)?;
+            return Ok(true);
         }
         let deleg = self.meta.read_delegations();
         deleg.count(|s| s.strict_reads += 1);
@@ -193,8 +201,8 @@ impl View {
         // `Core::deleg_read_owner`).
         if h.lease.reads_locally() && !self.meta.read_delegated(ino, name) {
             deleg.count(|s| s.holder_local += 1);
-            let _ = self.meta.session_wait(keys);
-            return true;
+            served(self.meta.session_wait(keys))?;
+            return Ok(true);
         }
         // On the honour clock, the delegation's (plan 43 C7-H1).
         let honour = constellation_platform::clock::protocol().honour();
@@ -223,7 +231,8 @@ impl View {
                 ?waited,
                 "strict read under a delegation"
             );
-            return false;
+            served(waited)?;
+            return Ok(false);
         }
         // The ReadIndex is the plain one for `ino`. A directory read (the
         // listing's first chunk) is the start of a scan: the answer also
@@ -239,8 +248,8 @@ impl View {
             None if dir && name.is_none() => constellation_authority::ReadAhead::Listing,
             None => constellation_authority::ReadAhead::None,
         };
-        self.read_index_round(h, ino, dir, name, ahead, keys);
-        true
+        self.read_index_round(h, ino, dir, name, ahead, keys)?;
+        Ok(true)
     }
 
     /// The strict read of the child a lookup under `parent`'s delegation
@@ -250,9 +259,16 @@ impl View {
     /// name as a hint: a sequencer answering for itself then delegates the
     /// directory's next children too, so a scan pays a round trip once
     /// per `CONSTELLATION_READ_AHEAD_GRANTS` entries, not once per entry.
-    pub(crate) fn strict_child_read(&self, parent: Ino, name: &str, child: Ino, dir: bool) {
+    pub(crate) fn strict_child_read(
+        &self,
+        parent: Ino,
+        name: &str,
+        child: Ino,
+        dir: bool,
+    ) -> Result<(), Code> {
         let scan = (!dir).then_some((parent, name));
-        self.strict_read_hinted(child, dir, None, &[ReadKey::Ino(child)], scan);
+        self.strict_read_hinted(child, dir, None, &[ReadKey::Ino(child)], scan)
+            .map(|_| ())
     }
 
     /// One ReadIndex round trip for a strict read and the wait for the
@@ -266,7 +282,7 @@ impl View {
         name: Option<&str>,
         ahead: constellation_authority::ReadAhead,
         keys: &[ReadKey],
-    ) {
+    ) -> Result<(), Code> {
         let deleg = self.meta.read_delegations();
         let started = std::time::Instant::now();
         constellation_vfs::watch::stage("strict read index (core reply)");
@@ -286,10 +302,10 @@ impl View {
             None
         };
         constellation_vfs::watch::stage("session wait (strict)");
-        match answer {
+        let waited = match answer {
             Some(constellation_authority::ReadAnswer::Holder) => {
                 deleg.count(|s| s.holder_local += 1);
-                let _ = self.meta.session_wait(keys);
+                self.meta.session_wait(keys)
             }
             Some(constellation_authority::ReadAnswer::Position {
                 position,
@@ -308,17 +324,19 @@ impl View {
                     "strict read after a ReadIndex"
                 );
                 deleg.note_read_index(started.elapsed().as_millis() as u64);
+                waited
             }
             Some(constellation_authority::ReadAnswer::Tailed) => {
                 tracing::debug!(target: "constellation::cto", ino, dir, name, "strict read: tailed S3");
                 deleg.count(|s| s.s3_tail += 1);
-                let _ = self.meta.session_wait(keys);
+                self.meta.session_wait(keys)
             }
             Some(constellation_authority::ReadAnswer::Degraded) | None => {
                 deleg.count(|s| s.degraded += 1);
-                let _ = self.meta.session_wait(keys);
+                self.meta.session_wait(keys)
             }
-        }
+        };
+        served(waited)
     }
 
     /// Plan 30 §M8: a write this node's FUSE fast path executed as the
@@ -1027,6 +1045,16 @@ impl View {
             }
             Err(()) => Err(Code::Io),
         }
+    }
+}
+
+/// ADR-57: a read the session wait refused (a pending acknowledged row still
+/// touched its keys after the read hold span) fails with `EIO`; every other
+/// ending answers.
+pub(crate) fn served(waited: constellation_meta::SessionWait) -> Result<(), Code> {
+    match waited {
+        constellation_meta::SessionWait::Unserved(_) => Err(Code::Io),
+        _ => Ok(()),
     }
 }
 

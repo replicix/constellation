@@ -268,6 +268,9 @@ pub struct ReadEvt {
     /// ... and the read was answered while it still did, or after its hold
     /// ran out without a release: the answer lacks an acknowledged row.
     pub held_served: bool,
+    /// ADR-57: the read waited the read hold span and was refused (`EIO`):
+    /// it answered nothing, and is left out of the histories.
+    pub unserved: bool,
     /// How the read's floor was obtained: a read delegation the node held,
     /// a ReadIndex answer, a degraded one, or none (a bounded mount).
     pub path: &'static str,

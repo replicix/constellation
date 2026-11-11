@@ -163,9 +163,12 @@ impl PlusPage<'_> {
     /// wait at all, and a queued replay of this node's own unlink or
     /// rename touches the name and the directory, never the inode the
     /// name led to. Takes no lock.
-    pub(super) fn wait<'n>(&self, children: impl Iterator<Item = (Ino, &'n str)>) {
+    pub(super) fn wait<'n>(
+        &self,
+        children: impl Iterator<Item = (Ino, &'n str)>,
+    ) -> Result<(), Code> {
         if self.name_only || naive(Naive::NoChildWait) {
-            return;
+            return Ok(());
         }
         let dentries = !naive(Naive::NoDentryWait);
         let mut keys: Vec<ReadKey> = Vec::new();
@@ -176,8 +179,9 @@ impl PlusPage<'_> {
             keys.push(ReadKey::Ino(child));
         }
         if !keys.is_empty() {
-            self.view.session_wait(&keys);
+            self.view.session_wait(&keys)?;
         }
+        Ok(())
     }
 
     /// Steps 3 and 4: the entry of `name`, which the listing says leads

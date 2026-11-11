@@ -1925,6 +1925,11 @@ impl ClusterLocks {
                      under this grant are degraded (they may not see what the previous holder wrote)"
                 );
             }
+            // A held row (ADR-57) still touches the file: the grant is
+            // delivered, and every read under it waits for the row itself
+            // (and fails with `EIO` after the read hold span); nothing here
+            // answers from the replica.
+            constellation_meta::SessionWait::Unserved(_) => {}
             _ => {}
         }
         if let Some(inval) = &self.inval {

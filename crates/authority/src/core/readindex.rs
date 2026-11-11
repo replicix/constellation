@@ -662,6 +662,10 @@ impl Core {
         if !self.cfg.read_delegations || self.lease.epoch_held() || to == self.cfg.node_id {
             return None;
         }
+        // ADR-57: no grant over keys a pending acknowledged row touches.
+        if replica.read_hold_touches_ino(ino) {
+            return None;
+        }
         if self
             .rd
             .blocked

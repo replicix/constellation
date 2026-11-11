@@ -219,7 +219,10 @@ impl Vfs for View {
                     // The attributes of the directory itself or of its
                     // parent are waited for as `getattr` waits for its
                     // own (plan 30 §M6: a lookup returns attributes).
-                    self.session_wait(&[ReadKey::Ino(ino)]);
+                    if let Err(code) = self.session_wait(&[ReadKey::Ino(ino)]) {
+                        r.done(err(code));
+                        return;
+                    }
                     self.meta.getattr(ino).and_then(|attr| match attr {
                         Some(attr) => Ok(Some(attr)),
                         None => self.meta.scratch_getattr(ino),
@@ -279,12 +282,18 @@ impl Vfs for View {
         // Plan 30 §M8: under `--cto strict` a lookup sees every entry
         // another node's completed close made (the first step of an
         // open by path).
-        let child_covered = self.strict_read(
+        let child_covered = match self.strict_read(
             parent,
             true,
             Some(&name),
             &[ReadKey::Dentry(parent, name.to_string())],
-        );
+        ) {
+            Ok(covered) => covered,
+            Err(code) => {
+                r.done(err(code));
+                return;
+            }
+        };
         constellation_vfs::watch::stage("meta read");
         match self.meta.lookup(parent, &name) {
             Ok(Some(attr)) => {
@@ -309,10 +318,14 @@ impl Vfs for View {
                 // `GETATTR` reply dropped by a racing notification, the
                 // open's read stops at that size: `""`). The child is read
                 // strictly then.
-                if child_covered {
-                    self.session_wait(&[ReadKey::Ino(attr.ino)]);
+                let child_wait = if child_covered {
+                    self.session_wait(&[ReadKey::Ino(attr.ino)])
                 } else {
-                    self.strict_child_read(parent, &name, attr.ino, attr.kind == InodeKind::Dir);
+                    self.strict_child_read(parent, &name, attr.ino, attr.kind == InodeKind::Dir)
+                };
+                if let Err(code) = child_wait {
+                    r.done(err(code));
+                    return;
                 }
                 // A name looked up while its inode has pending writes
                 // must report the pending size, or the entry reply caches
@@ -354,7 +367,10 @@ impl Vfs for View {
         //
         // Plan 30 §M6: the session wait comes first — never block while
         // holding a write shard.
-        self.session_wait(&[ReadKey::Ino(ino)]);
+        if let Err(code) = self.session_wait(&[ReadKey::Ino(ino)]) {
+            r.done(err(code));
+            return;
+        }
         match self.current_attr(ino) {
             Ok(Some(attr)) => {
                 // Plan 42 K1's fault point: a reply generated now and
@@ -555,7 +571,10 @@ impl Vfs for View {
             }
             return;
         }
-        self.session_wait(&[ReadKey::Ino(ino)]);
+        if let Err(code) = self.session_wait(&[ReadKey::Ino(ino)]) {
+            r.done(err(code));
+            return;
+        }
         match self.meta.readlink(ino) {
             Ok(Some(target)) => {
                 r.done(Ok(constellation_vfs::name::wire_bytes(&target).into_owned()))
@@ -1249,7 +1268,10 @@ impl Vfs for View {
             return;
         }
         // Plan 30 §M8: under `--cto strict`, the close-to-open point.
-        self.strict_read(ino, false, None, &[ReadKey::Ino(ino)]);
+        if let Err(code) = self.strict_read(ino, false, None, &[ReadKey::Ino(ino)]) {
+            r.done(err(code));
+            return;
+        }
         // Plan 42 §5.1.1: the record read answers the cache stamp too
         // (a node-local scratch file has none).
         let attr = self.meta.getattr_stamped(ino).and_then(|attr| match attr {
@@ -1928,7 +1950,10 @@ impl Vfs for View {
         // Plan 30 §M6: once per listing (its first chunk). §M8: a strict
         // listing sees every entry a completed close elsewhere made.
         if cookie == 0 {
-            self.strict_read(ino, true, None, &[ReadKey::Dir(ino)]);
+            if let Err(code) = self.strict_read(ino, true, None, &[ReadKey::Dir(ino)]) {
+                r.done(self.ino_err(ino, code));
+                return;
+            }
         }
         // Name-ordered range scan resumed from the cookie's name: O(page)
         // (plan 40 §4.9, `listing`).
@@ -2215,7 +2240,9 @@ impl Vfs for View {
             Err(error) => return r.done(self.ino_err(ino, error)),
         };
         if !View::is_synthetic(ino) {
-            self.session_wait(&[ReadKey::Ino(ino)]);
+            if let Err(code) = self.session_wait(&[ReadKey::Ino(ino)]) {
+                return r.done(self.ino_err(ino, code));
+            }
         }
         let value = if self.policies.xattrs.is_virtual(&name) {
             let aggregate = if View::is_synthetic(ino) {
@@ -2395,7 +2422,9 @@ impl Vfs for View {
         admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
         if !View::is_synthetic(ino) {
-            self.session_wait(&[ReadKey::Ino(ino)]);
+            if let Err(code) = self.session_wait(&[ReadKey::Ino(ino)]) {
+                return r.done(self.ino_err(ino, code));
+            }
         }
         let names = if View::is_synthetic(ino) {
             self.synthetic_xattrs(ino)

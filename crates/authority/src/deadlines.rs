@@ -144,6 +144,12 @@ pub struct Deadlines {
     /// second of write-ahead (`Core::grant_horizon_covers`) and the second
     /// the write rounds up by.
     pub read_span: u64,
+    /// ADR-57: how long a read of a key a pending acknowledged row touches
+    /// waits for the row to be re-shipped before it fails with `EIO`: the
+    /// client deadline (a write that can still be acknowledged late can
+    /// still be re-shipped), the takeover window and one forward round
+    /// (the successor's gate and its first ship).
+    pub read_hold_span: u64,
     /// The same for the lock-grant horizon: the longest grant (a lock's TTL,
     /// or a delegation's), its margin, the quarter TTL a renewal's write
     /// rounds up by and the second the write rounds up by.
@@ -318,6 +324,7 @@ impl Deadlines {
             leftover_hold: 4 * a,
             read_block: 2 * (r + m),
             read_span: r + m + 2_000,
+            read_hold_span: a + t + f,
             lock_span: lock_ttl + lock_ttl / 4 + m + 1_000,
             floor_span: t + longest_grant + d + 3 * m + 1_000,
             promise_span: b.promise_ttl + 1_000,
@@ -473,6 +480,16 @@ impl Deadlines {
                 "recall hold {} ms and the forward timeout ({f}) exceed the inbox read freshness \
                  ({}): a parked forward could go stale before its requester's retry reaches it",
                 self.recall_hold, self.inbox_read_fresh
+            ),
+        );
+        fail(
+            "D16",
+            Class::Refuse,
+            self.read_hold_span >= a,
+            format!(
+                "read hold span {} ms is below the client deadline ({a}): a write that can still \
+                 be acknowledged could be re-shipped after a read of its keys was refused",
+                self.read_hold_span
             ),
         );
         v
@@ -655,6 +672,7 @@ impl Deadlines {
             ("leftover_hold", self.leftover_hold, "4A"),
             ("read_block", self.read_block, "2 (R + m)"),
             ("read_span", self.read_span, "R + m + 2000"),
+            ("read_hold_span", self.read_hold_span, "A + T + F"),
             ("lock_span", self.lock_span, "max(K, D) * 5/4 + m + 1000"),
             (
                 "floor_span",
@@ -858,6 +876,7 @@ mod tests {
                 ("read_block", 12_000),
                 // 5000 + 1000 + 1000.
                 ("read_span", 8_000),
+                ("read_hold_span", 122000),
                 // ttl = max(20000, 5000); 20000 + 5000 + 1000 + 1000.
                 ("lock_span", 27_000),
                 // 1500 + max(5000, 20000) + 5000 + 3*1000 + 1000.
@@ -925,6 +944,7 @@ mod tests {
                 ("leave_note_lapse", 40_000),
                 ("read_block", 12_000),
                 ("read_span", 8_000),
+                ("read_hold_span", 122000),
                 // ttl = max(20000, 20000).
                 ("lock_span", 27_000),
                 // 1500 + 20000 + 20000 + 3000 + 1000.
@@ -990,6 +1010,7 @@ mod tests {
                 ("read_block", 11_000),
                 // 5000 + 500 + 1000.
                 ("read_span", 7_500),
+                ("read_hold_span", 13900),
                 // ttl = max(1500, 5000); 5000 + 1250 + 500 + 1000.
                 ("lock_span", 7_750),
                 // 1500 + 5000 + 5000 + 1500 + 1000.
@@ -1061,6 +1082,7 @@ mod tests {
                 ("leave_note_lapse", 40_000),
                 ("read_block", 11_000),
                 ("read_span", 7_500),
+                ("read_hold_span", 61900),
                 // ttl = 20000; 20000 + 5000 + 500 + 1000.
                 ("lock_span", 26_500),
                 // 1500 + 5000 + 20000 + 1500 + 1000.
@@ -1120,6 +1142,7 @@ mod tests {
                 ("leave_note_lapse", 10_000),
                 ("read_block", 11_000),
                 ("read_span", 7_500),
+                ("read_hold_span", 13400),
                 ("lock_span", 7_750),
                 // 1000 + 5000 + 5000 + 1500 + 1000.
                 ("floor_span", 13_500),
@@ -1188,6 +1211,7 @@ mod tests {
                 ("leave_note_lapse", 9_000),
                 ("read_block", 200),
                 ("read_span", 2_100),
+                ("read_hold_span", 5008),
                 // ttl = max(10, 50); 50 + 12 + 0 + 1000.
                 ("lock_span", 1_062),
                 // 8 + 100 + 50 + 0 + 1000.

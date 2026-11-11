@@ -406,6 +406,7 @@ impl EngineControl {
                 let a = &core.ack;
                 let s = self.meta.session().stats();
                 let gate = constellation_meta::gate_totals();
+                let holds = self.meta.read_hold_stats();
                 api::AckStatus {
                     ack_s3: core.ack_s3,
                     policy: a.policy.to_string(),
@@ -426,7 +427,10 @@ impl EngineControl {
                     ungated_shadows_non_stealable: a.ungated_shadows_non_stealable,
                     ungated_unexpected: s.ungated_unexpected,
                     unjustified_ships: self.meta.unjustified_ships(),
-                    held_copy_lapsed: self.meta.held_copy_lapsed(),
+                    read_holds: holds.holds,
+                    read_holds_oldest_ms: holds.oldest_ms,
+                    read_holds_refused: holds.refused,
+                    read_holds_abandoned: holds.abandoned,
                     settled_eio: s.settled_eio,
                     settles_sent: a.settles_sent,
                     settled_abandoned: a.settled_abandoned,

@@ -65,7 +65,8 @@ pub use store::local::AuditRow;
 pub use store::local::{fail_reclass_on_this_thread_for_tests, set_after_reclass_hook_for_tests};
 pub use store::local::{GroupOn, RowCommit};
 pub use store::member::{
-    tail_identity, MemberCopyInfo, MemberOutcome, MemberTx, HELD_COPY_MAX_AGE_MS,
+    tail_identity, Admission, MemberCopyInfo, MemberOutcome, MemberTx, ReadHoldStats,
+    DEFAULT_READ_HOLD_SPAN_MS,
 };
 pub use store::remote::RemoteBlockers;
 #[cfg(any(test, feature = "test-util"))]

@@ -1233,6 +1233,11 @@ impl Engine {
         // I1 class 2: the fast path does not answer alone while a lapse of
         // this process has not been handed to its core (a frozen process
         // wakes its FUSE threads before its driver).
+        // ADR-57: how long a read of a key a pending acknowledged row touches
+        // waits for the row before it fails with `EIO`.
+        meta.set_read_hold_span(std::time::Duration::from_millis(
+            constellation_authority::deadlines::Deadlines::new(&core_config).read_hold_span,
+        ));
         {
             let off_core = off_core.clone();
             meta.session().set_lone_guard(Arc::new(move || {

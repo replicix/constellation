@@ -91,6 +91,9 @@ pub struct SessionReport {
     /// violation).
     pub held_reads: usize,
     pub held_served: usize,
+    /// ADR-57: reads refused (`EIO`) after the read hold span; left out of
+    /// the checks, they answered nothing.
+    pub unserved: usize,
     /// Refusals placed at their own `Refused` row, and refusals with no
     /// row in an applied segment, placed by the scoped window.
     pub refusals_placed: usize,
@@ -188,10 +191,15 @@ pub fn check_sessions(
     exec: &ExecIdentity,
     scope: Scope,
 ) -> SessionReport {
+    let unserved = reads.iter().filter(|r| r.unserved).count();
+    let held_reads = reads.iter().filter(|r| r.held).count();
+    let answered: Vec<ReadEvt> = reads.iter().filter(|r| !r.unserved).cloned().collect();
+    let reads = answered.as_slice();
     let mut report = SessionReport {
+        unserved,
         reads: reads.len(),
         degraded: reads.iter().filter(|r| r.timed_out).count(),
-        held_reads: reads.iter().filter(|r| r.held).count(),
+        held_reads,
         held_served: reads.iter().filter(|r| r.held_served).count(),
         ..Default::default()
     };
@@ -735,6 +743,7 @@ mod tests {
             timed_out: false,
             held: false,
             held_served: false,
+            unserved: false,
         }
     }
 

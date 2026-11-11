@@ -2236,30 +2236,70 @@ async fn client_read(
             },
         }
     }
-    // ADR-57: whether a pending acknowledged row (a read hold) touched the
-    // read's keys, and whether the read then answered without it (answered
-    // while held, or after the hold ran out at its cap instead of being
-    // released by the row's return).
-    let lapsed0 = handle.meta.held_copy_lapsed();
-    let mut held = handle.meta.member_copy_touches(&keys);
-    if let Some(budget) = wait {
-        let mut waited = 0;
-        while !handle.meta.session_ready_at(&keys, &floor) {
-            held |= handle.meta.member_copy_touches(&keys);
-            if waited >= budget || !handle.alive() {
-                timed_out = waited >= budget;
+    // ADR-57 (R): a read of a key a pending acknowledged row touches waits
+    // for the row's return whatever its session budget, up to the read hold
+    // span, and is then refused (`EIO`): never answered without the row. The
+    // product runs the same rule in `Meta::session_wait`; here it is polled.
+    let span_ms = u64::try_from(handle.meta.read_hold_span().as_millis()).unwrap_or(u64::MAX);
+    let mut held = false;
+    let mut unserved = false;
+    let mut hold_waited = 0u64;
+    let hold_phase = async |held: &mut bool, unserved: &mut bool, waited: &mut u64| {
+        while handle.meta.read_admission(&keys) == constellation_meta::Admission::Held {
+            *held = true;
+            if *waited >= span_ms {
+                *unserved = true;
+                break;
+            }
+            if !handle.alive() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
-            waited += 5;
+            *waited += 5;
         }
+    };
+    hold_phase(&mut held, &mut unserved, &mut hold_waited).await;
+    if !unserved {
+        if let Some(budget) = wait {
+            let mut waited = 0;
+            while !handle.meta.session_ready_at(&keys, &floor) {
+                if waited >= budget || !handle.alive() {
+                    timed_out = waited >= budget;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                waited += 5;
+            }
+        }
+        // A hold set while the session wait ran.
+        hold_phase(&mut held, &mut unserved, &mut hold_waited).await;
     }
     if !handle.alive() {
         return;
     }
-    let held_now = handle.meta.member_copy_touches(&keys);
-    let held_served = held_now || (held && handle.meta.held_copy_lapsed() > lapsed0);
-    held |= held_now;
+    if unserved && std::env::var_os("AUTHORITY_SIM_HOLD_DEBUG").is_some() {
+        eprintln!(
+            "HOLD-REFUSED node {} now {} name {} holds {:?} log_idx {:?} applied {:?}",
+            handle.id,
+            handle.clock.wall().0,
+            name,
+            handle
+                .meta
+                .read_holds()
+                .iter()
+                .map(|h| (h.0 - (1 << 62), h.1))
+                .collect::<Vec<_>>(),
+            handle
+                .meta
+                .read_holds()
+                .first()
+                .map(|h| handle.meta.log_stream_idx(h.0 - (1 << 62)).ok()),
+            handle.meta.applied_pos(),
+        );
+    }
+    // (Never true: the answer below is given only when nothing is held.)
+    let held_served =
+        !unserved && handle.meta.read_admission(&keys) == constellation_meta::Admission::Held;
     let present = constellation_meta::MetaStore::lookup(&*handle.meta, parent, &leaf)
         .ok()
         .flatten()
@@ -2290,6 +2330,7 @@ async fn client_read(
         timed_out,
         held,
         held_served,
+        unserved,
         path,
     });
 }
@@ -5083,7 +5124,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     bus.set_request_delay_to(cfg.request_delay_to);
     let commits: Arc<Mutex<Vec<CommitRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let in_doubt: super::node::InDoubtLog = Arc::new(Mutex::new(Vec::new()));
-    let recall_drops: Arc<Mutex<Vec<(NodeId, u64, u64, Rid)>>> = Arc::new(Mutex::new(Vec::new()));
+    let recall_drops: super::node::RecallDrops = Arc::new(Mutex::new(Vec::new()));
     let oracles = super::oracle::Oracles::new(bucket.clone());
     // Plan 43 C7a (commit 6): the default clock-fault mix.
     let horizon = cfg.ops_per_client * 400 + 2_000;
@@ -6715,7 +6756,27 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             if n.alive() {
                 let h = n.meta.read_holds();
                 if !h.is_empty() {
-                    holds.push(format!("node {id}: {} hold(s) (slot, first) {h:?}", h.len()));
+                    // What the copies hold meanwhile: a hold whose row is no
+                    // longer in a copy is a release that was missed.
+                    let copies: Vec<String> =
+                        constellation_authority::Replica::member_copy_epochs(&*n.meta)
+                            .iter()
+                            .filter_map(|e| {
+                                n.meta.member_copy_rows(*e).ok().flatten().map(|r| (e, r))
+                            })
+                            .map(|(e, (info, rows))| {
+                                format!(
+                                    "epoch {e} {info:?}: {:?}",
+                                    rows.iter()
+                                        .map(|m| (m.tx.first, m.tx.last, m.tx.origin, m.rid))
+                                        .collect::<Vec<_>>()
+                                )
+                            })
+                            .collect();
+                    holds.push(format!(
+                        "node {id}: {} hold(s) (slot, first) {h:?}; copies {copies:?}",
+                        h.len()
+                    ));
                 }
             }
         }
@@ -7633,10 +7694,11 @@ async fn marker_watcher(
             // streamed data; the takeover's marker segment stranded the
             // data, and the successor, paused, re-shipped it 4.5 s later;
             // main fails the seed the same way).
-            let data_waits = !data_seen
-                && handle
-                    .meta
-                    .replay_touches(&[constellation_meta::ReadKey::Dentry(dp, dl.clone())]);
+            let data_waits = !data_seen && {
+                let key = [constellation_meta::ReadKey::Dentry(dp, dl.clone())];
+                handle.meta.replay_touches(&key)
+                    || handle.meta.read_admission(&key) == constellation_meta::Admission::Held
+            };
             let mut s = stats.lock().unwrap();
             s.0 += 1;
             if marker_seen && !data_seen && !data_waits {

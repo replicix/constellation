@@ -32,6 +32,11 @@
 //!
 //! [`crate::Meta::session_wait`], called by every FUSE read path before
 //! it reads:
+//! 0. a pending acknowledged row (a read hold, ADR-57: a row this node
+//!    rolled back while the log lacks it) touching the keys → wait for its
+//!    return, whatever the budget (0 included), then fail the read
+//!    ([`SessionWait::Unserved`], `EIO`) after `read_hold_span`: never
+//!    answered without the row;
 //! 1. a queued replay (a stranded op of this node, rolled back until the
 //!    replay lands) touching the keys → wait: that is the session's own
 //!    acknowledged write missing from the replica;
@@ -413,6 +418,10 @@ pub enum SessionWait {
     TimedOut(Duration),
     /// The wait is disabled (`CONSTELLATION_SESSION_WAIT_MS=0`).
     Disabled,
+    /// A pending acknowledged row (a read hold, ADR-57) still touched the
+    /// keys after [`crate::Meta::read_hold_span`]: not answered. The caller
+    /// fails the read with `EIO`.
+    Unserved(Duration),
 }
 
 /// Log2 wait-time buckets: `[0]` < 1 ms, `[i]` < 2^i ms, the last one
@@ -432,6 +441,10 @@ pub struct SessionStats {
     pub replay_blocked: u64,
     /// Reads answered degraded after the whole budget.
     pub timeouts: u64,
+    /// ADR-57: reads that waited for a held row to come back, and those
+    /// refused (`EIO`) after the read hold span.
+    pub hold_waited: u64,
+    pub hold_refused: u64,
     /// The subset of `timeouts` while M4 held-back journal rows existed on
     /// the answering holder or here (the coordinator's decision 1: a held
     /// row stalls the shipped-through position).
@@ -884,6 +897,14 @@ fn bucket(d: Duration) -> usize {
 impl SessionState {
     pub fn budget(&self) -> Duration {
         Duration::from_millis(self.budget_ms.load(Ordering::Relaxed))
+    }
+
+    /// Wake the readers waiting on this session (a hold was released).
+    pub fn wake(&self) {
+        // (Through the lock: a waiter between its check and its wait would
+        // miss a bare notify.)
+        drop(self.inner.lock().unwrap());
+        self.cv.notify_all();
     }
 
     pub fn set_budget_ms(&self, ms: u64) {
@@ -1841,13 +1862,56 @@ impl SessionState {
     /// The wait loop; `refresh` returns the store's applied sequence and
     /// whether a queued replay touches `keys`, `held` whether M4 held
     /// rows exist.
+    #[cfg(test)]
     pub(crate) fn wait(
+        &self,
+        keys: &[ReadKey],
+        floor: &Position,
+        refresh: impl FnMut() -> (u64, bool, bool),
+        held: impl Fn() -> bool,
+    ) -> SessionWait {
+        self.wait_with_holds(keys, floor, refresh, held, || false, Duration::ZERO, |_| {})
+    }
+
+    /// [`Self::wait`] with the hold phase of ADR-57 in front: `holds` says a
+    /// pending acknowledged row still touches the keys.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wait_with_holds(
         &self,
         keys: &[ReadKey],
         floor: &Position,
         mut refresh: impl FnMut() -> (u64, bool, bool),
         held: impl Fn() -> bool,
+        holds: impl Fn() -> bool,
+        hold_span: Duration,
+        on_refused: impl Fn(Duration),
     ) -> SessionWait {
+        // ADR-57 (R): a pending acknowledged row touching the keys holds the
+        // read whatever the session budget, `Disabled` included: the state
+        // the read would answer from lacks a row its client was told is
+        // committed. Bounded by the hold span, then refused.
+        if holds() {
+            let started = Instant::now();
+            loop {
+                let g = self.inner.lock().unwrap();
+                if !holds() {
+                    break;
+                }
+                let waited = started.elapsed();
+                if waited >= hold_span {
+                    drop(g);
+                    on_refused(waited);
+                    let mut s = self.stats.lock().unwrap();
+                    s.reads += 1;
+                    s.hold_refused += 1;
+                    return SessionWait::Unserved(waited);
+                }
+                let slice = (hold_span - waited).min(Duration::from_millis(20));
+                let _ = self.cv.wait_timeout(g, slice).unwrap();
+            }
+            let mut s = self.stats.lock().unwrap();
+            s.hold_waited += 1;
+        }
         let budget = self.budget();
         if budget.is_zero() {
             return SessionWait::Disabled;
@@ -1925,7 +1989,7 @@ impl SessionState {
                     );
                 }
             }
-            SessionWait::Disabled => {}
+            SessionWait::Disabled | SessionWait::Unserved(_) => {}
         }
         result
     }
@@ -1949,7 +2013,7 @@ impl crate::store::Meta {
     /// the watermark (plan 30 §M8's strict open).
     pub fn session_wait_at(&self, keys: &[ReadKey], floor: &Position) -> SessionWait {
         self.void_ended_generations();
-        self.session.wait(
+        self.session.wait_with_holds(
             keys,
             floor,
             || {
@@ -1961,6 +2025,9 @@ impl crate::store::Meta {
                 )
             },
             || self.held_any.load(Ordering::Relaxed),
+            || self.member_copy_touches(keys),
+            self.read_hold_span(),
+            |waited| self.note_read_hold_refused(waited),
         )
     }
 
@@ -2105,16 +2172,11 @@ impl crate::store::Meta {
     }
 
     /// Whether a queued replay (a stranded op rolled back until it lands)
-    /// touches any of `keys`, or a member copy row does (a committed row
-    /// rolled back until the successor's re-ship lands:
-    /// [`Meta::member_copy_touches`]; bounded by the session wait, after which
-    /// the read degrades and shows the gap, and by the entry's own cap,
-    /// `HELD_COPY_MAX_AGE_MS`). One counter read and one atomic load when
-    /// neither is held.
+    /// touches any of `keys`. A pending acknowledged row (a read hold) is
+    /// not this: it holds the read apart from the session budget
+    /// ([`Self::read_admission`], ADR-57). One counter read when nothing is
+    /// queued.
     pub fn replay_touches(&self, keys: &[ReadKey]) -> bool {
-        if self.member_copy_touches(keys) {
-            return true;
-        }
         if !self.has_pending_replays() {
             return false;
         }

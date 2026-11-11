@@ -216,7 +216,7 @@ impl View {
                 true,
                 Some(name),
                 &[ReadKey::Dentry(parent, name.to_string())],
-            );
+            )?;
             self.meta.lookup(parent, name).map_err(|e| e.code())?
         };
         let Some(attr) = found else {
@@ -233,7 +233,7 @@ impl View {
         let ino = attr.ino;
         if !scratch {
             // The close-to-open point, as `open` has it.
-            self.strict_read(ino, false, None, &[ReadKey::Ino(ino)]);
+            self.strict_read(ino, false, None, &[ReadKey::Ino(ino)])?;
         }
         if flags.contains(OpenFlags::TRUNC) {
             // What the kernel's `handle_truncate` would have sent.
