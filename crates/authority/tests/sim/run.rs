@@ -585,6 +585,11 @@ pub struct SimConfig {
     /// Plan 46 M1.3 step 5: clients pause now and then (`Step::Delay`), so
     /// that subtrees go idle.
     pub idle_gaps: bool,
+    /// ADR-52: `(start_ms, ops)`: a client on the node `JoinFresh` adds
+    /// (`nodes + 1`) starts after `start_ms` with `ops` operations, so that
+    /// the fresh peer has a reason to claim a lease nobody renews. Its own
+    /// generator: no other configuration's schedule moves.
+    pub joiner_client: Option<(u64, usize)>,
     /// Negative control (`Config::abandon_skips_read_recall`): the operator's
     /// abandon of a sticky stream ends it without recalling or waiting out
     /// the read delegations its holder granted.
@@ -1205,6 +1210,7 @@ impl Default for SimConfig {
             .is_some_and(|v| v == "1"),
             sticky_idle_ms: None,
             idle_gaps: false,
+            joiner_client: None,
             abandon_skips_read_recall: std::env::var_os("AUTHORITY_SIM_ABANDON_SKIPS_READ_RECALL")
                 .is_some_and(|v| v == "1"),
             roster_faults: std::env::var("AUTHORITY_SIM_ROSTER_FAULTS")
@@ -5116,6 +5122,29 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 cfg.lock_ignore_fence,
             )));
         }
+    }
+    if let Some((start, ops)) = cfg.joiner_client {
+        let node = cfg.nodes + 1;
+        let mut joiner_rng = StdRng::seed_from_u64(seed ^ 0x701a_e7c1);
+        let mut steps = vec![Step::Delay(start)];
+        steps.extend(
+            gen_ops_in(&mut joiner_rng, ops as u64, cfg.names, "", &[], 0.0)
+                .into_iter()
+                .map(Step::Op),
+        );
+        clients.push(tokio::spawn(client_thread(
+            cluster.clone(),
+            history.clone(),
+            node,
+            node * 16,
+            steps,
+            abandoned.clone(),
+            failures.clone(),
+            100,
+            None,
+            cfg.strict,
+            cfg.lock_ignore_fence,
+        )));
     }
     // Plan 30 §M11: marker writers and watchers.
     let mut marker_tasks = Vec::new();
