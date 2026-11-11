@@ -2460,7 +2460,21 @@ async fn client_thread(
                     }
                     let fresh = handle.next_rid();
                     match (&op, &write) {
-                        (Some(op), _) => history.invoke(thread, fresh, op.clone()),
+                        (Some(op), _) => {
+                            // The retry is a new create call: production's
+                            // `create_or_open` allocates an inode per
+                            // attempt, and a row the old rid left in doubt
+                            // may still hold the old number (ADR-59 keeps
+                            // such rows), so two creates must never carry
+                            // one inode.
+                            if matches!(op, NsOp::Create(_)) {
+                                match mutate_op(&handle.meta, op) {
+                                    Some(m) => mop = m,
+                                    None => break,
+                                }
+                            }
+                            history.invoke(thread, fresh, op.clone())
+                        }
                         (None, Some(name)) => match write_op(&cluster, node, fresh, name) {
                             Some(m) => mop = m,
                             None => break,
