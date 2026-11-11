@@ -947,12 +947,22 @@ impl Core {
                     });
                 }
             }
-            ParkedWhat::Finish { rid, .. } => {
+            ParkedWhat::Finish { rid, class, .. } => {
                 // Executed here, never answered: in doubt from now on (a
                 // later execution must find its row, and the deadline must
                 // not take it for an op that never left this node — plan 43
                 // C2g's review: it settled such an op locally `Abandoned`
                 // while its row still landed).
+                //
+                // As `abort_durable_parks` does (ADR-52 review SHOULD-2): a
+                // row that is not gated is replayed by this node's recovery,
+                // and its replay entry is marked unacked, so that a refusal
+                // of it is this client's answer, not a conflict copy. (A
+                // stalled singleton held for its lease and found deposed
+                // already, in the window before `finish_recovery`.)
+                if !class.gated() {
+                    self.replay.unacked.insert(rid);
+                }
                 if let Some(c) = self.clients.get_mut(&rid) {
                     c.phase = ClientPhase::WaitingLease;
                     c.forwarded = true;
@@ -2586,6 +2596,24 @@ impl Core {
     /// found unusable (a renewal that lands releases them).
     pub(crate) fn has_stale_lease_parks(&self) -> bool {
         self.rd.parked.values().any(|p| p.stale_lease)
+    }
+
+    /// Tests only: take `rid`'s stale-lease park out as if it had never been
+    /// made; its row's seq, outcome and class.
+    #[cfg(test)]
+    pub(crate) fn take_stale_park_for_tests(
+        &mut self,
+        rid: Rid,
+    ) -> Option<(u64, MutateOutcome, constellation_meta::RowCommit)> {
+        let id = *self.rd.parked.iter().find_map(|(id, p)| {
+            (p.stale_lease && matches!(&p.what, ParkedWhat::Finish { rid: r, .. } if *r == rid))
+                .then_some(id)
+        })?;
+        let p = self.rd.parked.remove(&id)?;
+        match (p.what, p.durable) {
+            (ParkedWhat::Finish { outcome, class, .. }, Some(seq)) => Some((seq, outcome, class)),
+            _ => None,
+        }
     }
 
     /// ADR-52: `finish` found `rid`'s singleton answer reaches the point it

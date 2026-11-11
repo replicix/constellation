@@ -2557,6 +2557,7 @@ impl Core {
         if class.is_singleton()
             && !self.lease.epoch_held()
             && !self.cfg.lone_delegate
+            && !self.cfg.stale_lease_hold_off
             && !self.lease.usable(self.fresh_now(), &self.cfg)
         {
             // What it holds is the rid's own journaled row: an answer with

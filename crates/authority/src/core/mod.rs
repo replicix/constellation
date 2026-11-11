@@ -548,6 +548,12 @@ pub struct Config {
     /// linked within the budget: the deleted lone delegate. The oracles
     /// (I1, I5) must fail with it.
     pub lone_delegate: bool,
+    /// ADR-52's negative control, never set in production: the emission
+    /// gate gives a singleton's answer without the fresh clock read (the
+    /// hold off), as the parent did. A stalled lone root whose tenure was
+    /// taken over during the stall then answers on a lease it no longer
+    /// holds; the oracle (I1) must fail with it.
+    pub stale_lease_hold_off: bool,
     /// Plan 46 M1.2 step 14's negative control, never set in production (the
     /// simulation's `AUTHORITY_SIM_DELEG_APPEND_REPLAY=1`): a stranding pass
     /// queues a root's append of a delegate's row for replay again, as it did
@@ -750,6 +756,7 @@ impl Config {
             lock_cache_idle_ms: 30_000,
             delegation_stream_rows: 256,
             lone_delegate: false,
+            stale_lease_hold_off: false,
             deleg_append_replay: false,
             per_row_class: false,
             delegation_stream_tick_ms: 50,

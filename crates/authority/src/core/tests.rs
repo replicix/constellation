@@ -62575,16 +62575,16 @@ mod m11_step5 {
         let mut h = Harness::new(1);
         let r1 = archive_row_then_a_restart(&mut h);
         activity(&mut h);
-        let seq = h.core.emission_hold_of(r1, &h.meta).expect("held");
+        let seq = h.core.unsettled_hold_of(r1, &h.meta).expect("held");
         assert_eq!(Some(seq), h.meta.journal_class_of_rid(r1).map(|(f, _)| f));
         h.core.emission_hold_expected = true;
         h.core
             .note_held_at_emission(crate::core::backup::EmissionPath::Finish, r1, &h.meta);
         assert_eq!(h.core.stats.held_at_emission_root_row, 1);
         let (r2, _) = submit(&mut h, 2, "r2");
-        assert!(h.core.emission_hold_of(r2, &h.meta).is_none());
+        assert!(h.core.unsettled_hold_of(r2, &h.meta).is_none());
         ship_through_tip(&mut h);
-        assert!(h.core.emission_hold_of(r1, &h.meta).is_none());
+        assert!(h.core.unsettled_hold_of(r1, &h.meta).is_none());
     }
 
     /// (6a, a, control) `resumed_span_dropped` restores the old arm: the
@@ -75305,11 +75305,41 @@ mod stale_lease {
             Some((r, p)) if r == rid && !matches!(p, ClientPhase::Recalling)
         ));
         assert!(h.core.replay.unacked.contains(&rid));
-        // And a hold after the deposition is in doubt at once.
-        let (rid2, out) = submit(&mut h, 2, "b");
+    }
+
+    /// A hold reached after the deposition ran (the window until
+    /// `finish_recovery`) is in doubt at once, and its rid is marked
+    /// unacked as `abort_durable_parks` marks it: the replay of a row that
+    /// is not gated answers its client even if the successor refuses it
+    /// (review SHOULD-2/3). Fails on the parent: `unacked` was not marked.
+    /// The hold is driven through `park_stale_lease` with the lease lost.
+    #[test]
+    fn a_hold_after_the_deposition_is_in_doubt_and_marks_the_replay_unacked() {
+        let mut h = stalled(20_000);
+        let (rid, out) = submit(&mut h, 1, "a");
+        assert!(answers(&out).is_empty());
+        // Take the park the stalled step made, as if the hold had come
+        // after the deposition.
+        let (seq, outcome, class) = h
+            .core
+            .take_stale_park_for_tests(rid)
+            .expect("a stale park");
+        h.core.replay.unacked.clear();
+        h.core.lease.lost = true;
+        let mut out = Vec::new();
+        h.core
+            .park_stale_lease(h.clk(), rid, seq, outcome, class, &h.meta, &mut out);
         assert!(answers(&out).is_empty(), "{out:?}");
         assert!(!h.core.has_stale_lease_parks());
-        let _ = rid2;
+        assert!(!class.gated());
+        assert!(
+            h.core.replay.unacked.contains(&rid),
+            "the replay of the unanswered row is not marked unacked"
+        );
+        assert!(matches!(
+            h.core.clients().next(),
+            Some((r, p)) if r == rid && !matches!(p, ClientPhase::Recalling)
+        ));
     }
 
     /// The log carries the row while it waits: the archive's answer.
