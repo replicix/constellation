@@ -495,7 +495,7 @@ impl Meta {
 /// (`deleg_backup_slot_never_meets_a_member_copy_slot`).
 const DELEG_BACKUP_BASE: u64 = 1 << 62;
 
-fn deleg_epoch(gen: u64) -> u64 {
+pub(crate) fn deleg_epoch(gen: u64) -> u64 {
     DELEG_BACKUP_BASE + gen
 }
 
@@ -655,7 +655,10 @@ impl Meta {
         for k in keys {
             tx.remove(&self.backup_tail, k);
         }
+        // The rows are in the log: the reads a deposition held for them go.
+        self.release_copy_epoch(e);
         tx.commit()?;
+        self.flush_held_releases();
         Ok(())
     }
 }

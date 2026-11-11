@@ -2689,6 +2689,19 @@ fn a_deposed_root_keeps_appended_delegate_rows_as_a_member_copy() {
         vec![create("b", ino(2), 12), completed(rid(2))]
     );
     assert!(meta.deleg_backup_holds_any(5).unwrap());
+    // The rows left the namespace while the log lacks them: a read of their
+    // keys waits for the re-ship (the sim's `sticky-root-designee-inbox`
+    // seed 745: a client read its own acknowledged rename's name absent right
+    // after the deposition), until the generation's copy is cleared.
+    let a = [constellation_meta::ReadKey::Dentry(ROOT_INO, "a".into())];
+    let other = [constellation_meta::ReadKey::Dentry(ROOT_INO, "z".into())];
+    assert!(
+        meta.member_copy_touches(&a),
+        "the rolled-back row holds reads"
+    );
+    assert!(!meta.member_copy_touches(&other));
+    meta.deleg_backup_clear(5).unwrap();
+    assert!(!meta.member_copy_touches(&a), "the clear releases the hold");
 }
 
 /// The delegate's own execution of generation 5 under a lease epoch (it
