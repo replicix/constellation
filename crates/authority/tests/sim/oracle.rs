@@ -2588,6 +2588,13 @@ pub fn end_of_run(
             _ => None,
         })
         .collect();
+    let non_stealable_gens: BTreeSet<u64> = o
+        .tables
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|(_, _, table)| table.iter().filter(|d| d.non_stealable()).map(|d| d.gen))
+        .collect();
     for (rid, at) in rolled_back {
         if non_lone_ok.get(rid).is_some_and(|t| t < at) {
             let Some(a) = acks.iter().rev().find(|a| {
@@ -2653,16 +2660,20 @@ pub fn end_of_run(
                     continue;
                 }
             }
-            // Plan 46 M0.2 (R7, variant 3 (i)): a non-stealable sequencer's
-            // OK (an epoch hold's) is uncommitted by design, and its owner's
-            // queue is the rid's one copy: the requester's shadow of it is
-            // rolled back when the owner's replay lands and retires it, not
-            // lost. The rollback is a violation only if the log never
-            // completes the rid (its replay refused, or nobody's).
-            if a.judged
-                .as_ref()
-                .is_some_and(|j| j.class == Some(Judged::Final))
-                && log.completed_at.contains_key(rid)
+            // Plan 46 M0.2 (R7), narrowed by M1.4 step 5: a designee's or a
+            // sticky holder's OK (a non-stealable generation's row) is
+            // uncommitted by design, and its owner's queue is the rid's one
+            // copy: the requester's shadow of it is rolled back when the
+            // owner's replay lands and retires it, not lost. The rollback is
+            // a violation only if the log never completes the rid. A root
+            // row judged `Final` (a one-member hold, the knob) is no longer
+            // excused.
+            if a.judged.as_ref().is_some_and(|j| {
+                j.class == Some(Judged::Final)
+                    && j.tx.as_ref().is_some_and(|t| {
+                        t.origin.0 != 0 && non_stealable_gens.contains(&t.origin.0)
+                    })
+            }) && log.completed_at.contains_key(rid)
             {
                 continue;
             }
@@ -3565,38 +3576,76 @@ mod tests {
         assert!(f.i5_after_end.is_empty());
     }
 
-    /// Plan 46 M0.2 (R7): a non-stealable sequencer's OK (an epoch hold's)
-    /// that is rolled back is a violation only if the log never completes
-    /// the rid: its owner's replay landing is what retires the requester's
-    /// shadow. (A group's OK rolled back stays a violation either way.)
+    /// Plan 46 M0.2 (R7), M1.4 step 5: a designee's or sticky holder's OK
+    /// (a non-stealable generation's row) that is rolled back is a
+    /// violation only if the log never completes the rid: its owner's replay
+    /// landing is what retires the requester's shadow. A root row judged
+    /// `Final` (a hold) is not excused; a group's OK is a violation either
+    /// way.
     #[test]
-    fn i5_excuses_a_non_stealable_ok_whose_rid_the_log_completes() {
-        let judged = |class| {
-            Some(Judgement {
-                class: Some(class),
-                expected: Expected::Class(class),
-                tx: None,
-                detail: String::new(),
-                mismatch: None,
-            })
-        };
+    fn i5_excuses_only_a_designees_non_stealable_ok_whose_rid_the_log_completes() {
         let r = rid(1, 1);
-        let acks = |class| {
+        let acks = |class, origin: (u64, u64)| {
             vec![AckEntry {
-                judged: judged(class),
+                judged: Some(Judgement {
+                    class: Some(class),
+                    expected: Expected::Class(class),
+                    tx: Some(TxRef {
+                        node: 2,
+                        first: 1,
+                        last: 1,
+                        origin,
+                        epoch: 1,
+                        records: Vec::new(),
+                    }),
+                    detail: String::new(),
+                    mismatch: None,
+                }),
                 ..ack(2, r, 5, OutcomeKind::Ok, true)
             }]
         };
         let rolled = HashMap::from([(r, 6)]);
-        // Never completed in the log (its replay refused, or nobody's): a
-        // violation.
-        let f = findings_rolled_back(acks(Judged::Final), &[], &rolled);
+        let run = |acks: Vec<AckEntry>, completed: &[(Rid, (u64, usize))]| {
+            let o = Oracles::new(Bucket::new(1, (0, 0)));
+            *o.acks.lock().unwrap() = acks;
+            let mut t = constellation_meta::delegation::DelegationTable::default();
+            t.apply(
+                constellation_meta::delegation::DelegationRecord::DelegateNode {
+                    node: 2,
+                    gen: 7,
+                    dirs: vec![constellation_meta::SubtreeGrant {
+                        dir: 100,
+                        kind: constellation_meta::SubtreeKind::Designated,
+                    }],
+                },
+            );
+            o.note_table_at(1_000, 1, t);
+            end_of_run(
+                &o,
+                &log_with(seg(1, &[]), completed),
+                &[],
+                &rolled,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                true,
+            )
+        };
+        // A designee's row never completed in the log: a violation.
+        let f = run(acks(Judged::Final, (7, 1)), &[]);
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
-        // Completed by the owner's replay: not.
-        let f = findings_rolled_back(acks(Judged::Final), &[(r, (3, 0))], &rolled);
+        // Completed by the designee's replay: excused.
+        let f = run(acks(Judged::Final, (7, 1)), &[(r, (3, 0))]);
         assert!(f.i5.is_empty(), "{:?}", f.i5);
+        // A root row judged `Final` (a hold, generation 0): a violation
+        // although the log completes it.
+        let f = run(acks(Judged::Final, (0, 1)), &[(r, (3, 0))]);
+        assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
+        // A generation no table names non-stealable: a violation.
+        let f = run(acks(Judged::Final, (8, 1)), &[(r, (3, 0))]);
+        assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
         // A group's OK is a violation whatever the log says.
-        let f = findings_rolled_back(acks(Judged::Group), &[(r, (3, 0))], &rolled);
+        let f = run(acks(Judged::Group, (7, 1)), &[(r, (3, 0))]);
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
     }
 
