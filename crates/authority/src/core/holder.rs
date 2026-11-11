@@ -459,12 +459,33 @@ impl Core {
                         && !settle
                         && from != d.node
                         && !(non_stealable && fence.touched_gen != 0);
+                    // Nor to a generation this root inherited and has not
+                    // heard its delegate on (no renewal, no stream batch since
+                    // the takeover): the delegate may have disowned it (a
+                    // restart, a lapsed grant it cannot renew), and it would
+                    // send the settle back, one bounced round trip per retry
+                    // until the settle's cap (`long-delegated+unsettled` 4863,
+                    // 4.4 s of `NotHolder` between the root and a silent
+                    // delegate). The settle parks behind the generation's
+                    // recall below instead and is answered `Held` with the
+                    // outwait. (An execution is still redirected.)
+                    let unheard_inherited = settle
+                        && !non_stealable
+                        && self
+                            .dl
+                            .gens
+                            .get(&d.gen)
+                            .is_some_and(|g| g.inherited && g.delegate_heard.is_none());
+                    if unheard_inherited && d.node != self.cfg.node_id && live.is_some() {
+                        self.stats.settles_not_redirected_unheard += 1;
+                    }
                     let redirects = d.node != self.cfg.node_id
                         && live.is_some_and(|g| {
                             g.recall == RecallPhase::None || !settle || non_stealable
                         })
                         && !disowned
-                        && !inbox_only;
+                        && !inbox_only
+                        && !unheard_inherited;
                     // ADR-47 (row 4): a rid that has its outcome here is
                     // answered from it, not redirected: the requester's
                     // table lags a grant the root's journal already knows,

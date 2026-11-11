@@ -1769,6 +1769,13 @@ pub struct Stats {
     /// ... because a generation of this node's lapsed during the settle and
     /// its row lands when the root ends it.
     pub settles_extended_for_lapsed_gen: u64,
+    /// ... because the root answered the settle and only its row's
+    /// durability was left (`ClientOp::durable_grace`).
+    pub settles_extended_for_durability: u64,
+    /// Settles the root did not redirect to a generation it inherited and
+    /// has not heard its delegate on (`on_forward`): they park behind the
+    /// recall.
+    pub settles_not_redirected_unheard: u64,
     /// Plan 46 M0.3 (S1): settles a takeover gate answered on the keys it
     /// owns (a refusal journaled, or a dedup'd outcome), settles it left
     /// `Held` because its journal work was not done yet, and settles of a
