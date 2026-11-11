@@ -4032,7 +4032,9 @@ impl Core {
     /// which the lease argument forbids cutting short), or while a lapsed
     /// generation of this node's holding the op's row is ended by the root
     /// (`own_gen_end_due`): the deadline then moves to that end and a settle
-    /// window, never earlier, and never past `settle_cap`: the settle's start
+    /// window, never earlier, and never past `settle_cap` (but for the one
+    /// durability-only window below, which moves the cap with the deadline):
+    /// the settle's start
     /// plus `Deadlines::settle_cap_span`, which covers the waits a hold is
     /// for, one after the other:
     ///
@@ -4197,6 +4199,7 @@ impl Core {
                 if self.extend_settle_deadline(rid, at, Some(now.wait), out) {
                     if let Some(c) = self.clients.get_mut(&rid) {
                         c.durable_grace = true;
+                        c.settle_cap = c.settle_cap.max(at);
                     }
                     self.stats.settles_extended_for_durability += 1;
                     return;
