@@ -456,6 +456,22 @@ impl Meta {
                 if cur.is_none_or(|c| new > c) {
                     tx.insert(&self.local, k.to_vec(), new.to_string().into_bytes());
                 }
+                // The rows the log now holds of a generation are back: the
+                // holds a strand set on them go (ADR-57), as in
+                // `bump_log_idx_tx`.
+                if prefix == DELEG_LOG_IDX_PREFIX {
+                    if let Some(gen) = std::str::from_utf8(&k)
+                        .ok()
+                        .and_then(|k| k.strip_prefix(DELEG_LOG_IDX_PREFIX))
+                        .and_then(|g| g.parse::<u64>().ok())
+                    {
+                        self.release_through_tx(
+                            &mut tx,
+                            crate::store::backup::deleg_epoch(gen),
+                            new,
+                        )?;
+                    }
+                }
             }
         }
         if let Some(v) = side_snap.get(&side.local, KV_APPLIED_SEQ.as_bytes())? {

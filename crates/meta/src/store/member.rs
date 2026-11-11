@@ -90,6 +90,8 @@ pub(crate) struct HeldCopy {
 pub(crate) enum StagedRelease {
     Row(u64, u64),
     Slot(u64),
+    /// Rows of the slot with `first` at or below the bound.
+    Through(u64, u64),
 }
 
 pub(super) fn read_hold_key(slot: u64, first: u64) -> Vec<u8> {
@@ -713,6 +715,22 @@ impl Meta {
         self.stage_release(StagedRelease::Row(slot, first));
     }
 
+    /// The holds of `slot` with `first <= through` leave in the caller's
+    /// transaction (the generation's log index reached `through`).
+    pub(crate) fn release_through_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        slot: u64,
+        through: u64,
+    ) -> Result<(), MetaError> {
+        if !self.any_held() {
+            return Ok(());
+        }
+        self.release_range_tx(tx, slot, through)?;
+        self.stage_release(StagedRelease::Through(slot, through));
+        Ok(())
+    }
+
     /// Every hold of `slot` leaves in the caller's transaction.
     pub(crate) fn release_slot_tx(
         &self,
@@ -778,6 +796,7 @@ impl Meta {
             let named = mine.iter().any(|r| match r {
                 StagedRelease::Row(s, f) => (h.slot, h.first) == (*s, *f),
                 StagedRelease::Slot(s) => h.slot == *s,
+                StagedRelease::Through(s, t) => h.slot == *s && h.first <= *t,
             });
             if !named {
                 return true;

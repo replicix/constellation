@@ -1254,8 +1254,9 @@ impl Meta {
     /// Raise the persisted log index of `gen` to `idx` (only raised).
     pub fn note_log_idx(&self, gen: u64, idx: u64) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
-        bump_log_idx_tx(&mut tx, &self.local, gen, idx)?;
+        bump_log_idx_tx(&mut tx, self, gen, idx)?;
         tx.commit()?;
+        self.flush_held_releases();
         Ok(())
     }
 
@@ -1912,7 +1913,7 @@ impl Meta {
             .then(|| journal::PendingDelegate::set(gen, Some(idx), crate::session::Position::ZERO));
         let done = self.journal_records_tx(tx, records, rid, Journaled::Tail)?;
         if gen != 0 {
-            bump_log_idx_tx(tx, &self.local, gen, idx)?;
+            bump_log_idx_tx(tx, self, gen, idx)?;
         }
         Ok(done)
     }
@@ -3321,19 +3322,26 @@ pub(crate) fn settle_deleg_idx_at_log_tx(
 }
 
 /// Raise the persisted log index of `gen` to `idx`.
+///
+/// The one place that raises it, so the place the rows a deposition held
+/// (`Meta::hold_row_tx`, ADR-57) come back: every held row of `gen` at or
+/// below the log's index is in the log (a segment's re-ship, or this node's
+/// own append as a later root), and its hold goes in this transaction.
 pub(crate) fn bump_log_idx_tx(
     tx: &mut SingleWriterWriteTx,
-    local: &SingleWriterTxKeyspace,
+    meta: &Meta,
     gen: u64,
     idx: u64,
 ) -> Result<(), MetaError> {
     if gen == 0 {
         return Ok(());
     }
+    let local = &meta.local;
     let key = deleg_log_idx_key(gen);
     let cur = kv_get_tx(tx, local, &key)?
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
+    meta.release_through_tx(tx, super::backup::deleg_epoch(gen), idx.max(cur))?;
     if idx > cur {
         kv_set_tx(tx, local, &key, &idx.to_string());
         // Plan 46 M1.2 step 6: the stream counter of a generation this node's
