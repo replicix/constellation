@@ -2705,6 +2705,49 @@ pub fn survivors_of_drop(log: &super::check::Oracle, dropped: &BTreeSet<Rid>) ->
         .collect()
 }
 
+/// What the end-of-run check of a run's `repair drop-held` rolled-back rids
+/// looks at (ADR-59, [`drop_ack_findings`]).
+pub struct DropAcks<'a> {
+    /// Every rid a drop rolled back.
+    pub dropped: &'a BTreeSet<Rid>,
+    /// The namespace ops the sim saw return `Ok`.
+    pub acked_ns: &'a BTreeSet<Rid>,
+    /// The rids of the drops by a node that was not the sequencer in force.
+    pub by_non_sequencer: &'a BTreeSet<Rid>,
+    /// [`survivors_of_drop`] of `dropped`.
+    pub survivors: &'a BTreeSet<Rid>,
+    /// The rids the drops attributed to the damaged inode's own keys
+    /// (`DroppedHeld::rolled_back_on_inode`).
+    pub on_inode: &'a BTreeSet<Rid>,
+}
+
+/// ADR-59 (part A): the first check a run's drops fail, with the rids.
+///
+/// `drop_rolled_back_independent_acked`: a drop rolls back no acknowledged
+/// namespace op (none carries content) that does not depend on the damaged
+/// inode's own keys: a rename, chmod or unlink of the file is the operator's
+/// cost of a lost chunk, named by the drop (`rolled_back_on_inode`) and not
+/// yet avoided; a sibling in the same directory is the defect the ADR
+/// removes. The one other excuse: a dropper that was not the sequencer in
+/// force strands what depended on a seed as a deposition does, so an
+/// acknowledged rid it rolled back is excused if, and only if, its effect
+/// survives in the log (the dropper alone is no excuse).
+pub fn drop_ack_findings(d: &DropAcks) -> Option<(&'static str, Vec<Rid>)> {
+    let independent: Vec<Rid> = d
+        .acked_ns
+        .iter()
+        .filter(|rid| d.dropped.contains(rid))
+        .filter(|rid| !d.on_inode.contains(rid))
+        .filter(|rid| !(d.by_non_sequencer.contains(rid) && d.survivors.contains(rid)))
+        .copied()
+        .collect();
+    if independent.is_empty() {
+        None
+    } else {
+        Some(("drop_rolled_back_independent_acked", independent))
+    }
+}
+
 /// The rids a run's operator abandon gave up beyond those a client saw
 /// return: OK answers under a group class whose transaction is a delegate's
 /// stream row (`origin` other than the holder's own `(0, 0)`) that the log
@@ -3343,6 +3386,49 @@ mod tests {
     use constellation_meta::{DelegateTx, MutateOp, Position};
     use constellation_types::clock::Now;
     use replicix_objcas::{LeaseMode, LeaseStore};
+
+    /// ADR-59 (part A): the end-of-run check of what a drop rolled back.
+    #[test]
+    fn a_drop_rolls_back_no_acknowledged_op_that_is_independent_of_the_damaged_inode() {
+        let set = |v: &[u64]| -> BTreeSet<Rid> { v.iter().map(|s| rid(1, *s)).collect() };
+        let none = set(&[]);
+        let check = |dropped: &BTreeSet<Rid>,
+                     acked_ns: &BTreeSet<Rid>,
+                     by_ns: &BTreeSet<Rid>,
+                     survivors: &BTreeSet<Rid>,
+                     on_inode: &BTreeSet<Rid>| {
+            drop_ack_findings(&DropAcks {
+                dropped,
+                acked_ns,
+                by_non_sequencer: by_ns,
+                survivors,
+                on_inode,
+            })
+            .map(|(c, _)| c)
+        };
+        let d = set(&[1]);
+        // A sibling the sequencer's drop rolled back: the defect, even if
+        // the replay landed.
+        assert_eq!(
+            check(&d, &d, &none, &d, &none),
+            Some("drop_rolled_back_independent_acked")
+        );
+        // The same rid, attributed to the damaged inode (a rename, chmod or
+        // unlink of the file): the operator's named cost.
+        assert_eq!(check(&d, &d, &none, &d, &d), None);
+        // A rid no drop rolled back, or never acknowledged: not judged.
+        assert_eq!(check(&none, &d, &none, &none, &none), None);
+        assert_eq!(check(&d, &none, &none, &none, &none), None);
+        // A non-sequencer's drop: excused when the effect survives in the
+        // log, not when the log carries no outcome of the rid (an
+        // acknowledged effect lost, which the dropper's identity does not
+        // excuse).
+        assert_eq!(check(&d, &d, &d, &d, &none), None);
+        assert_eq!(
+            check(&d, &d, &d, &none, &none),
+            Some("drop_rolled_back_independent_acked")
+        );
+    }
 
     fn rid(n: u64, seq: u64) -> Rid {
         Rid {

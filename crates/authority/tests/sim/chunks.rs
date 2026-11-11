@@ -45,6 +45,19 @@ use std::sync::{Arc, Mutex};
 /// One chunk per write, one write per file: 4 KiB.
 pub const CHUNK_SIZE: u32 = 4096;
 
+/// ADR-59, over a run's operator drops (`DroppedHeld`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DropCounts {
+    pub drops: u64,
+    /// Rows rolled back and queued for replay.
+    pub requeued: u64,
+    /// Of the rows rolled back, those that depend on the damaged inode's own
+    /// keys (`DroppedHeld::rolled_back_on_inode`).
+    pub on_inode: u64,
+    /// Drops by a node that was not the sequencer in force.
+    pub non_sequencer: u64,
+}
+
 #[derive(Default)]
 pub struct ChunkWorld {
     /// What the bucket holds.
@@ -80,6 +93,15 @@ pub struct ChunkWorld {
     /// For each of them, the highest log segment that had landed when its
     /// latest drop ran: only a completion past it is the drop's replay.
     pub dropped_head: Mutex<BTreeMap<constellation_meta::Rid, u64>>,
+    /// ADR-59, over the run's operator drops.
+    pub drop_counts: Mutex<DropCounts>,
+    /// The rids of the drops whose dropper was not the sequencer in force
+    /// (`DroppedHeld::non_sequencer`): a deposition's strand, not a drop's.
+    pub dropped_by_non_sequencer: Mutex<BTreeSet<constellation_meta::Rid>>,
+    /// The rids the drops attributed to the damaged inode
+    /// (`DroppedHeld::rolled_back_on_inode`): the operator's cost of a lost
+    /// chunk, which part A of the ADR does not yet avoid.
+    pub dropped_on_inode: Mutex<BTreeSet<constellation_meta::Rid>>,
     /// Own pending rows found without bytes anywhere (a replay's adopted
     /// manifest of a departed node's chunk): marked unrecoverable.
     pub poisoned: AtomicU64,
