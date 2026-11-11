@@ -6179,7 +6179,7 @@ fn run_flex(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> FlexTot
 /// nothing). They failed on main 905af01c; current main passes them (the
 /// timing moved), so these pins are regression guards, not fail-befores: the
 /// core tests (`m11_step5`) fail on main by construction and carry the
-/// evidence, and 47 and 696 fail again under the control below. 1286 (the
+/// evidence, and 1273 fails again under the control below (47 and 696 did before the kept-rows rule moved the schedules). 1286 (the
 /// non-holder deadline) has no sim control: its core tests do.
 #[test]
 fn a_resumed_tenure_keeps_the_rule_of_its_earlier_rows() {
@@ -6194,6 +6194,11 @@ fn a_resumed_tenure_keeps_the_rule_of_its_earlier_rows() {
             config_variant(flex_tight_config(), "oracles"),
             1286,
         ),
+        (
+            "flex-tight+oracles",
+            config_variant(flex_tight_config(), "oracles"),
+            1273,
+        ),
         ("flex+commit", config_variant(flex_config(), "commit"), 696),
     ] {
         run_seed(seed, cfg).unwrap_or_else(|e| {
@@ -6207,21 +6212,90 @@ fn a_resumed_tenure_keeps_the_rule_of_its_earlier_rows() {
 /// seeds of shape (a) fail again.
 #[test]
 fn the_resumed_span_control_fails_the_class_claim_seeds() {
-    for (cfg, seed) in [
-        (config_variant(flex_tight_config(), "oracles"), 47),
-        (config_variant(flex_config(), "commit"), 696),
-    ] {
-        let inner = cfg.core.clone();
-        let cfg = SimConfig {
-            core: std::sync::Arc::new(move |id, inc| {
-                let mut core = inner(id, inc);
-                core.resumed_span_dropped = true;
-                core
-            }),
-            ..cfg
-        };
-        let e = run_seed(seed, cfg).expect_err("the control passed");
-        assert!(e.contains("claims a commit"), "seed {seed}: {e}");
+    // (Seed 1273 of `flex-tight+oracles`: the schedules moved with the
+    // kept-rows rule, ADR-51, and 47 and 696 no longer reach the claim with the
+    // span dropped; `find_class_claim_seeds` re-pins.)
+    let (cfg, seed) = (config_variant(flex_tight_config(), "oracles"), 1273);
+    let inner = cfg.core.clone();
+    let cfg = SimConfig {
+        core: std::sync::Arc::new(move |id, inc| {
+            let mut core = inner(id, inc);
+            core.resumed_span_dropped = true;
+            core
+        }),
+        ..cfg
+    };
+    let e = run_seed(seed, cfg).expect_err("the control passed");
+    assert!(e.contains("claims a commit"), "seed {seed}: {e}");
+}
+
+/// Re-pin helper for the two step-6a controls above: lists the seeds of
+/// `flex-tight+oracles` and `flex+commit` that pass as they are and, with the
+/// resumed tenure's span dropped, fail with the class claim (`control`); and
+/// those that pass with the early deciders blind to an earlier tenure's root
+/// row and count held answers (`held`).
+/// `AUTHORITY_SIM_START`/`AUTHORITY_SIM_SEEDS` as for `long_random`.
+#[test]
+#[ignore]
+fn find_class_claim_seeds() {
+    let env = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
+    };
+    let (start, seeds) = (
+        env("AUTHORITY_SIM_START", 0),
+        env("AUTHORITY_SIM_SEEDS", 2_000),
+    );
+    type Build = fn() -> SimConfig;
+    let builders: [(&str, Build); 2] = [
+        ("flex-tight+oracles", || {
+            config_variant(flex_tight_config(), "oracles")
+        }),
+        ("flex+commit", || config_variant(flex_config(), "commit")),
+    ];
+    for seed in start..start + seeds {
+        for (label, build) in builders {
+            if run_seed(seed, build()).is_err() {
+                continue;
+            }
+            let cfg = build();
+            let inner = cfg.core.clone();
+            let dropped = SimConfig {
+                core: std::sync::Arc::new(move |id, inc| {
+                    let mut core = inner(id, inc);
+                    core.resumed_span_dropped = true;
+                    core
+                }),
+                ..cfg
+            };
+            let control = run_seed(seed, dropped)
+                .err()
+                .filter(|e| e.contains("claims a commit"));
+            let cfg = build();
+            let inner = cfg.core.clone();
+            let blind = SimConfig {
+                core: std::sync::Arc::new(move |id, inc| {
+                    let mut core = inner(id, inc);
+                    core.root_row_emission_only = true;
+                    core
+                }),
+                ..cfg
+            };
+            let held = run_seed(seed, blind).ok().map(|r| {
+                r.stats
+                    .values()
+                    .map(|s| s.held_at_emission_root_row)
+                    .sum::<u64>()
+            });
+            if control.is_some() || held.is_some_and(|h| h > 0) {
+                eprintln!(
+                    "class-claim seeds: {label} seed {seed}: control {} held {held:?}",
+                    control.is_some()
+                );
+            }
+        }
     }
 }
 
@@ -6235,6 +6309,7 @@ fn the_resumed_span_control_fails_the_class_claim_seeds() {
 fn the_emission_gate_alone_holds_the_class_claim_seeds() {
     let mut held = 0;
     for (cfg, seed) in [
+        (config_variant(flex_tight_config(), "oracles"), 1273),
         (config_variant(flex_tight_config(), "oracles"), 47),
         (config_variant(flex_tight_config(), "oracles"), 934),
         (config_variant(flex_config(), "commit"), 696),
