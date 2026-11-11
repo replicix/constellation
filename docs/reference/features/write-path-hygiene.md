@@ -159,6 +159,16 @@ lease to make it locally, and `status.speculation.copies_pending` /
 metric, and a red dashboard note) show it. A copy is never dropped. A held transaction journaled without before-images
 (a write from before this node held the lease) makes the command refuse: it cannot be rolled back.
 
+What the client of a dropped operation hears is the ordinary in-doubt
+answer: `EIO`, as for any operation whose outcome is not yet known. The
+operation itself may be replayed by its request id after the drop (and
+land in the log then, behind later operations of the same client), so a
+client that sees `EIO` and moves on can still find the operation's effect
+later; a client that retries by request id gets the replay's outcome. An
+operation the client was already told `OK` for (under a policy that
+acknowledges before the effect is durable) is not excused by the drop: it
+is the ordinary rolled-back acknowledgement.
+
 The dropped op's outcome is journaled as a refusal (`Refused`, `EIO`)
 and ships with the log: a node that still holds the write as
 speculation — its requester's shadow, or a copy streamed ahead of the

@@ -77,6 +77,9 @@ pub struct ChunkWorld {
     /// global truth compares them with an unsettled `EIO` and a landing.
     pub drop_times: Mutex<Vec<tokio::time::Instant>>,
     pub dropped_at: Mutex<HashMap<constellation_meta::Rid, tokio::time::Instant>>,
+    /// For each of them, the highest log segment that had landed when its
+    /// latest drop ran: only a completion past it is the drop's replay.
+    pub dropped_head: Mutex<BTreeMap<constellation_meta::Rid, u64>>,
     /// Own pending rows found without bytes anywhere (a replay's adopted
     /// manifest of a departed node's chunk): marked unrecoverable.
     pub poisoned: AtomicU64,

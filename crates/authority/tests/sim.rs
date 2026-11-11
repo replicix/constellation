@@ -6526,6 +6526,41 @@ fn an_operators_drop_held_is_not_a_protocol_violation_of_durability_or_settle() 
     }
 }
 
+/// Plan 46 M1.4 step 6c: the drop-held excuse covers only what the operator's
+/// drop rolled back unacknowledged. Seeds 753 and 1477 of
+/// `flex-crash+durability` pass with the narrowed excuse and also passed with
+/// the broad one (a drop in them observes no acknowledged effect): they are
+/// regression guards that the narrowing does not fail a clean drop, not
+/// fail-befores.
+#[test]
+fn a_clean_drop_held_still_passes_the_narrowed_excuse() {
+    for seed in [753, 1477] {
+        run_seed(seed, config_variant(flex_crash_config(), "durability")).unwrap_or_else(|e| {
+            panic!(
+                "flex-crash+durability seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=flex-crash+durability"
+            )
+        });
+    }
+}
+
+/// The control of the test above, and the fail-before of the narrowing:
+/// seeds whose refusals saw the effect of an op the operator's drop rolled
+/// back after its client was told `Ok`. The broad excuse (any rid in the
+/// drop's `rolled_back`) passed them; an acknowledged dropped op is not the
+/// operator's to excuse, so they fail with the durability violation.
+#[test]
+fn the_acknowledged_dropped_op_control_fails_the_durability_seeds() {
+    for seed in [26, 283, 860, 1258, 1751] {
+        let e = run_seed(seed, config_variant(flex_crash_config(), "durability"))
+            .expect_err("an acknowledged dropped op was excused");
+        assert!(
+            e.contains("observed an acknowledged effect"),
+            "seed {seed}: {e}"
+        );
+    }
+}
+
 /// Re-pin helper for the two step-6a controls above: lists the seeds of
 /// `flex-tight+oracles` and `flex+commit` that pass as they are and, with the
 /// resumed tenure's span dropped, fail with the class claim (`control`); and
