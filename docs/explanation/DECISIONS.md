@@ -3843,3 +3843,61 @@ See: `crates/authority/src/core/inbox.rs` (`execute_inbox_batch`,
 (`client_deadline`, `settle_route`), `crates/authority/src/core/replay.rs`,
 `crates/authority/src/core/holder.rs`, [delegations](../reference/features/delegations.md),
 [forwarded mutations](../reference/features/forwarded-mutations.md).
+
+## ADR-53: A row keeps its configuration's rule across its holder's own tenure gap
+
+**Status**: decided by the maintainer on 2026-11-11 (plan 46 M1.4 step 6a;
+the class-claim failures of the flex configurations). Completes the rule of
+plan 46 M1.1 step 5 ("a row keeps the rule of the configuration it was
+journaled in") for a gap in the holder's own tenure.
+
+**Context**: the simulation's I1 oracle rejects an answer that claims a gated
+rule (`Archive`, a `Root` group) which only a singleton or the final rule
+judges. Replays (`flex-tight+oracles`, `flex+commit`) found two shapes. (a) A
+node journals its own row `Archive` while a peer is about; S3 is down and the
+answer parks. A continuation epoch closes and lets the lease go, which clears
+the closed configurations (`ack.spans`) that held the answer back; the node
+takes the same lease again, lone, at a higher `config_version`, and the
+parked answer leaves in the same event claiming `Archive` for a row that
+never shipped. (b) A node that holds no lease, not lost and with no hold,
+reached the client deadline and read its own unshipped journal row as the
+log's, answering `Archive`.
+
+**Decision**: a row this node journaled under a configuration no longer in
+force is answered only once that configuration's own rule has committed it:
+for `Archive` and a `Root` group (whose acks do not survive the gap), the
+archive. A node that holds no lease never reads its own unshipped row as the
+log's.
+
+- A resumed tenure (the node held a configuration before, and the lease was
+  let go or lost since) pushes a span, ending at the last unshipped gated
+  row of an older version of the node's own journal
+  (`Replica::max_unshipped_gated_below`), so `durable_jseq` is capped at the
+  shipped watermark until the archive carries it, and `park_durable`, the
+  fast path's `lone_ok` and `root_lone` follow. The spans are noted where
+  the lease lands, before anything parked is released.
+- `settled_outcome` of a node that holds no lease returns nothing for a root
+  row (not a delegation's) the journal carries and no applied segment does; the settle path decides.
+- The emission gate asks the row again where an answer leaves
+  (`Core::unsettled_root_row`, the twin of the delegation row's test): a
+  `Archive` or `Root` row journaled before the resumed tenure began, under
+  an older version, that the archive has not carried is parked. The
+  backstop, counted (`held_at_emission_root_row`); rows of the tenure's own
+  earlier configurations keep their spans.
+
+A true singleton's row stays ungated (its rule never gates): its answer after
+a re-take does not wait for the archive.
+
+**Consequences**: after an epoch's close or a lapse, the re-taken root's
+first answers wait one ship round (S3 is reachable: the re-take was an S3
+CAS). Unsettled `EIO`s of ops whose row is unshipped at the deadline settle
+instead of answering.
+
+**Rejected**: keeping the configuration and the spans across the gap (they
+would outlive a journal another tenure rolled back and block forever).
+
+**May revert**: no.
+
+See: `crates/authority/src/core/backup.rs` (`sync_cfg_spans`,
+`span_earlier_rows`, `unsettled_root_row`), `crates/authority/src/core/client.rs`
+(`settled_outcome`), [DESIGN](DESIGN.md) ("Acknowledgement and durability").

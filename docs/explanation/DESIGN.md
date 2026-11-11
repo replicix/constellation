@@ -941,7 +941,11 @@ chosen per filesystem and topology
   `config_version` bump committed under old and new (plan 46 M1.1 step 5), so
   nothing is answered alone until the archive carries the journal through it,
   and a node that asks the root for something counts as a peer from that
-  request on. Another node's forward is acknowledged once its segment
+  request on. A row keeps that rule across the holder's own tenure gap
+  too: a re-taken lease answers nothing past an earlier gated row before the
+  archive carries it
+  ([ADR-53](DECISIONS.md#adr-53-a-row-keeps-its-configurations-rule-across-its-holders-own-tenure-gap)).
+  Another node's forward is acknowledged once its segment
   is in the log: its row is journaled `Archive`, a deposition keeps it as
   a member copy, and the requester's retry by rid is its only other copy
   ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3),
