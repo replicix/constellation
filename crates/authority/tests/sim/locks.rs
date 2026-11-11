@@ -122,6 +122,10 @@ pub struct LockCounters {
     pub stale_turn_reads: u64,
     /// Reads that found an unacknowledged older turn landed late (plan
     /// 30 §M14 phase 2: none, now that a write carries its fencing token).
+    /// A few per 2,000 seeds occur in the executor and doubt configurations
+    /// since a held delegate write is finished as its commit returns (plan
+    /// 46 M1.2 step 15); replays of seeds 1771, 1726 and 286 show the late
+    /// turn is not a held write's: untriaged.
     pub late_unacked_turns: u64,
     /// Turn writes the executor refused for a lapsed grant (`LockLapsed`).
     pub token_refused: u64,

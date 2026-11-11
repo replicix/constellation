@@ -7666,6 +7666,12 @@ fn sweep_config() {
                         t.fetch_add(n, ord);
                     }
                     guard_base_rises.fetch_add(report.guard_base_rises, ord);
+                    if report.locks.late_unacked_turns > 0 {
+                        eprintln!(
+                            "SWEEP-LATE-UNACKED {label} seed {seed}: {} late unacknowledged turn(s)",
+                            report.locks.late_unacked_turns
+                        );
+                    }
                     if report.guard_rises > 0 {
                         eprintln!(
                             "SWEEP-GUARD-RISE {label} seed {seed}: {} rises",
@@ -15904,6 +15910,21 @@ fn locks_writer_hold_delegated_settles_before_the_head() {
         "no position waited for a held write: {t:?}"
     );
     assert_eq!(t.clients.stale_turn_reads, 0, "{t:?}");
+}
+
+/// The pause excuse of a forced commit processed late covers a commit that
+/// landed inside the pause, not one that landed long before it (plan 46 M1.2
+/// step 15 review, SHOULD-1). Fail-before: `from <= now` held for any commit
+/// before the pause's end.
+#[test]
+fn a_pause_excuses_only_a_commit_that_landed_inside_it() {
+    use sim::node::pause_excuses;
+    assert!(!pause_excuses(None, 8_200));
+    assert!(pause_excuses(Some((8_000, 8_500)), 8_200));
+    assert!(pause_excuses(Some((8_000, 8_500)), 8_000));
+    assert!(pause_excuses(Some((8_000, 8_500)), 8_500));
+    assert!(!pause_excuses(Some((8_000, 8_500)), 1_000));
+    assert!(!pause_excuses(Some((8_000, 8_500)), 8_501));
 }
 
 /// F1: a delegate's held write that a writer lets commit before its time is

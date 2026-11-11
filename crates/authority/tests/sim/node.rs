@@ -2014,6 +2014,13 @@ fn spawn_root_probe(
 /// hung, not slow (`CONSTELLATION_HOLDER_STALL_MS`).
 const SIM_HOLDER_STALL_MS: i64 = 15_000;
 
+/// Whether the node's last pause (`from`, `to` in simulated ms) excuses a
+/// forced commit processed later than it landed: only when it landed inside
+/// the pause.
+pub(crate) fn pause_excuses(pause: Option<(u64, u64)>, landed_at: u64) -> bool {
+    pause.is_some_and(|(from, to)| from <= landed_at && landed_at <= to)
+}
+
 impl Driver {
     async fn run(mut self) {
         let now = self.clock.now();
@@ -3771,9 +3778,10 @@ impl Driver {
         // is the sim's own lateness, which the engine does not have.
         self.shared.held_committed_at.lock().unwrap().take();
         let now_ms = self.clock.elapsed_ms();
-        let paused = self
-            .last_pause_ms
-            .is_some_and(|(from, to)| from <= now_ms && landed_at <= to);
+        // Excused only when the commit landed inside the pause: the step
+        // that follows the commit does not run while the node is paused. A
+        // commit that landed before the pause began was due earlier.
+        let paused = pause_excuses(self.last_pause_ms, landed_at);
         if deleg.is_some() && now_ms > landed_at && !paused {
             self.shared
                 .held_processed_late
