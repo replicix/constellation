@@ -2516,6 +2516,14 @@ impl Core {
     /// ([`Self::answer_need_of`]); this is asked again where the answer
     /// leaves, so that no path can emit it unsettled.
     pub(crate) fn emission_hold_of(&self, rid: Rid, replica: &dyn Replica) -> Option<u64> {
+        // Plan 46 M1.4 step 6a (ADR-53): and a row of this node's own root
+        // journal that its own rule has not committed.
+        if let Some(seq) = self
+            .unsettled_root_row(rid, replica)
+            .filter(|_| !self.cfg.resumed_span_dropped)
+        {
+            return Some(seq);
+        }
         // Rows of generations exist only on a node with a delegation (as the
         // delegate, or the root that appended a delegate's rows): the rest
         // pays nothing.
@@ -2541,9 +2549,44 @@ impl Core {
         )
     }
 
+    /// Plan 46 M1.4 step 6a (ADR-53), the root-row twin of
+    /// [`Self::unsettled_delegate_row`]: the journal seq of `rid`'s row in
+    /// this node's journal when the row is a gated group of the root
+    /// (`Archive` or `Root`) journaled before this tenure began, under an
+    /// older configuration, and the archive has not carried it. Those groups'
+    /// acks do not survive the tenure gap, so the archive alone commits
+    /// them. `None`: no such row, or it may leave. The cfg spans decide this
+    /// already (`durable_jseq`, `park_durable`); this is asked again where
+    /// the answer leaves, so a path that missed them cannot emit.
+    pub(crate) fn unsettled_root_row(&self, rid: Rid, replica: &dyn Replica) -> Option<u64> {
+        let (version, tip) = self.ack.tenure_start?;
+        let shipped = replica.journal_acked_seq().unwrap_or(0);
+        if self.ack.shipped_through.max(shipped) >= tip {
+            return None;
+        }
+        let (first, class) = replica.journal_class_of_rid(rid)?;
+        let constellation_meta::RowCommit::Group {
+            config_version,
+            on: GroupOn::Archive | GroupOn::Root,
+        } = class
+        else {
+            return None;
+        };
+        (first <= tip && config_version < version && !self.archive_covers(first, shipped))
+            .then_some(first)
+    }
+
     /// Count an answer the emission gate held (`Stats::answers_held_at_emission`).
-    pub(crate) fn note_held_at_emission(&mut self, path: EmissionPath, rid: Rid) {
+    pub(crate) fn note_held_at_emission(
+        &mut self,
+        path: EmissionPath,
+        rid: Rid,
+        replica: &dyn Replica,
+    ) {
         self.stats.answers_held_at_emission += 1;
+        if self.unsettled_root_row(rid, replica).is_some() {
+            self.stats.held_at_emission_root_row += 1;
+        }
         match path {
             EmissionPath::Finish => self.stats.held_at_emission_finish += 1,
             EmissionPath::DelegExec => self.stats.held_at_emission_deleg_exec += 1,
@@ -2613,7 +2656,7 @@ impl Core {
         {
             if is_answer(outcome) {
                 if let Some(seq) = self.emission_hold_of(rid, replica) {
-                    self.note_held_at_emission(path, rid);
+                    self.note_held_at_emission(path, rid, replica);
                     self.park_reply(
                         now,
                         Default::default(),

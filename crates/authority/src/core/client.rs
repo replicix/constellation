@@ -5203,7 +5203,11 @@ impl Core {
                         || matches!(c.origin, Origin::Replay { .. }) && c.also_client,
                 ) {
                     if let Some(seq) = self.emission_hold_of(rid, replica) {
-                        self.note_held_at_emission(super::backup::EmissionPath::Finish, rid);
+                        self.note_held_at_emission(
+                            super::backup::EmissionPath::Finish,
+                            rid,
+                            replica,
+                        );
                         self.park_finish(
                             now,
                             rid,
