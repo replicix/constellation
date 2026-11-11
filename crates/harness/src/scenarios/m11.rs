@@ -1273,6 +1273,154 @@ pub fn sticky_abandon(_seed: u64) -> Result<()> {
     result
 }
 
+/// Whether `c`'s delegation table lists `path`.
+fn in_table(c: &Client, path: &str) -> Result<bool> {
+    Ok(deleg_of(c)?["table"]
+        .as_array()
+        .is_some_and(|t| t.iter().any(|e| e["path"] == path)))
+}
+
+/// How a sticky holder leaves in [`sticky_leaves`].
+#[derive(Clone, Copy)]
+enum Leave {
+    /// A clean unmount (the daemon exits).
+    Unmount,
+    /// A suspension (`node.lifecycle` `Suspending`, the event the logind
+    /// source delivers before it lets the host sleep), then a resume.
+    Suspend,
+}
+
+/// Plan 46 M1.3 step 7: a sticky holder that leaves cleanly hands its
+/// subtree back by its own decision. `b` holds `/d1` sticky and has written
+/// into it; it unmounts (or is suspended); the grant leaves the root's
+/// table at once, not after a time-out, and `c`'s write into `/d1` succeeds
+/// where a dead sticky holder's subtree refuses it for longer than the
+/// delegation TTL (`sticky-abandon`); everything `b` wrote is on every
+/// node. The holder's log says it released.
+fn sticky_leaves(scenario: &str, how: Leave) -> Result<()> {
+    let (_env, _root, mut clients, _) = cluster(
+        scenario,
+        &["a", "b", "c"],
+        &[("CONSTELLATION_CTO", "strict")],
+        0,
+    )?;
+    let result = (|| -> Result<()> {
+        let b_id = node_id(&clients[1])?;
+        std::fs::create_dir(clients[0].mnt.join("d1"))?;
+        for x in [&clients[1], &clients[2]] {
+            eventually("dir visible", Duration::from_secs(20), || {
+                anyhow::ensure!(x.mnt.join("d1").is_dir());
+                Ok(())
+            })?;
+        }
+        clients[0]
+            .control(
+                "designation.delegate",
+                serde_json::json!({"path": "/d1", "node": b_id, "sticky": true}),
+            )
+            .context("delegating --sticky /d1 to b")?;
+        wait_installed(&clients[1], "/d1", Duration::from_secs(20))?;
+        anyhow::ensure!(in_table(&clients[0], "/d1")?, "/d1 not in a's table");
+        let (names_b, _) = write_files(&clients[1], "d1", "b", 40)?;
+        let left = Instant::now();
+        match how {
+            Leave::Unmount => {
+                clients[1]
+                    .unmount_exit(Duration::from_secs(60))
+                    .context("b's clean unmount")?;
+            }
+            Leave::Suspend => {
+                let report = clients[1].control(
+                    "node.lifecycle",
+                    serde_json::json!({"event": {"Suspending": {"deadline_in_ms": 15_000}}}),
+                )?;
+                anyhow::ensure!(report["applied"] == true, "not applied: {report}");
+                let s = &report["status"]["last_suspend"];
+                anyhow::ensure!(
+                    s["within_deadline"] == true && s["lease_released"] == true,
+                    "the suspension did not finish cleanly: {s}"
+                );
+            }
+        }
+        let gone = left.elapsed();
+        // The release row is the root's before b is gone: the grant is not
+        // in a's table now (no wait for a time-out).
+        eventually("/d1 leaves a's table", Duration::from_secs(10), || {
+            anyhow::ensure!(!in_table(&clients[0], "/d1")?, "still in a's table");
+            Ok(())
+        })?;
+        // c writes into the released subtree through the root: well inside
+        // the time a dead holder's subtree stays read-only.
+        let t = Instant::now();
+        eventually("c writes d1/c-after", Duration::from_secs(10), || {
+            std::fs::write(clients[2].mnt.join("d1/c-after"), b"c")?;
+            Ok(())
+        })?;
+        let c_wrote = t.elapsed();
+        anyhow::ensure!(
+            c_wrote < Duration::from_millis(DELEG_TTL_MS * 2),
+            "c's write took {c_wrote:?}"
+        );
+        let verb = match how {
+            Leave::Unmount => "unmount: sticky grants released",
+            Leave::Suspend => "suspending: sticky grants released",
+        };
+        anyhow::ensure!(
+            clients[1].log_text().contains(verb),
+            "b's log does not say \"{verb}\": {}",
+            clients[1].tail_log_n(40)
+        );
+        for x in [&clients[0], &clients[2]] {
+            eventually("b's files visible", Duration::from_secs(30), || {
+                for name in &names_b {
+                    anyhow::ensure!(
+                        std::fs::read(x.mnt.join(name))? == name.as_bytes(),
+                        "{name} on {}",
+                        x.name
+                    );
+                }
+                Ok(())
+            })?;
+        }
+        if let Leave::Suspend = how {
+            let report =
+                clients[1].control("node.lifecycle", serde_json::json!({"event": "Resumed"}))?;
+            anyhow::ensure!(report["applied"] == true, "resume not applied: {report}");
+            eventually("b sees c-after", Duration::from_secs(30), || {
+                anyhow::ensure!(std::fs::read(clients[1].mnt.join("d1/c-after"))? == b"c");
+                Ok(())
+            })?;
+        }
+        eprintln!(
+            "    {scenario}: b left in {gone:?}; c's write into d1 took {c_wrote:?} (grant TTL {DELEG_TTL_MS} ms)"
+        );
+        // (The unmounted holder is gone: the others only.)
+        let live = match how {
+            Leave::Unmount => [0, 2].as_slice(),
+            Leave::Suspend => [0, 1, 2].as_slice(),
+        };
+        let refs: Vec<&Client> = live.iter().map(|i| &clients[*i]).collect();
+        ensure_no_conflicts(&refs)
+    })();
+    dump_logs_on_failure(scenario, &clients, &result);
+    unmount_all(&mut clients);
+    result
+}
+
+/// Plan 46 M1.3 step 7: a sticky holder's clean unmount releases its
+/// subtree before it exits (`sticky-release-on-unmount`).
+pub fn sticky_release_on_unmount(_seed: u64) -> Result<()> {
+    sticky_leaves("sticky-release-on-unmount", Leave::Unmount)
+}
+
+/// Plan 46 M1.3 step 7: a sticky holder released by a suspension
+/// (`sticky-suspend-inhibitor`: the lifecycle event the logind inhibitor
+/// handler delivers; the fake logind of the platform crate is not wired to
+/// a node, so the harness sends the event itself).
+pub fn sticky_suspend_inhibitor(_seed: u64) -> Result<()> {
+    sticky_leaves("sticky-suspend-inhibitor", Leave::Suspend)
+}
+
 /// ADR-46: the sticky holder `b` of `d1` is killed with `kill -9` while `c`
 /// holds read delegations it granted, and remounted with its journal inside
 /// their lifetime (the read TTL is 30 s here, so the delegations outlive the

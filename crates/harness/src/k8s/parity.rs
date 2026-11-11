@@ -518,6 +518,11 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ("cross-subtree-rename", Skip::Local(&[NODES3])),
     ("delegate-crash", Skip::Local(&[KILL, NODES3])),
     ("sticky-abandon", Skip::Local(&[KILL, CTO_STRICT, ADMIN, NODES3])),
+    (
+        "sticky-release-on-unmount",
+        Skip::Local(&[CTO_STRICT, NODES3, "unmounts a local daemon and reads its log"]),
+    ),
+    ("sticky-suspend-inhibitor", Skip::Local(&[CTO_STRICT, NODES3, LIFECYCLE])),
     ("sticky-holder-restart", Skip::Local(&[KILL, CTO_STRICT, NODES3])),
     ("delegate-crash-default-ttl", Skip::Local(&[KILL, NODES3])),
     ("marker-order", Skip::Local(&[NODES3])),

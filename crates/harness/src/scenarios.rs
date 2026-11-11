@@ -1343,6 +1343,20 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m11::sticky_abandon,
     },
     Scenario {
+        name: "sticky-release-on-unmount",
+        desc: "plan 46 M1.3 step 7: the sticky holder of d1 (b) unmounts cleanly after writing 40 files; it releases the subtree before it exits, so d1 leaves the root's table at once, c's write into d1 succeeds well inside the time a dead sticky holder's subtree stays read-only, and b's files are on every node",
+        requires: &[],
+        caps: &[],
+        run: m11::sticky_release_on_unmount,
+    },
+    Scenario {
+        name: "sticky-suspend-inhibitor",
+        desc: "plan 46 M1.3 step 7: the sticky holder of d1 (b) is suspended (the lifecycle event the logind inhibitor delivers) after writing 40 files; it releases the subtree within the suspension, d1 leaves the root's table, c writes into d1 at once, b's files are on every node, and after the resume b sees c's file",
+        requires: &[],
+        caps: &[],
+        run: m11::sticky_suspend_inhibitor,
+    },
+    Scenario {
         name: "sticky-holder-restart",
         desc: "ADR-46: the sticky holder of d1 (b) is killed with kill -9 while c holds read delegations it granted (read TTL 30 s) and remounted with its journal inside their lifetime; a's write of d1/x goes to the returned holder and must not be acknowledged while c can serve the old content: c's next strict open of d1/x shows the new content",
         requires: &[],
