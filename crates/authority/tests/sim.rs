@@ -313,6 +313,8 @@ fn replay_seed() {
         Ok("sticky-holder-restarts-cut") => sticky_holder_restarts_cut_config(),
         Ok("sticky-ttl") => sticky_ttl_config(),
         Ok("sticky-stale-route") => sticky_stale_route_config(),
+        Ok("sticky-root-designee-inbox") => sticky_root_designee_inbox_config(),
+        Ok("sticky-root-designee-inbox-skew") => sticky_root_designee_inbox_skew_config(),
         Ok("backup-two") => backup_two_config(),
         Ok("backup-strict") => backup_strict_config(),
         Ok("backup-strict-inbox-off") => backup_strict_inbox_off_config(),
@@ -2124,12 +2126,133 @@ fn sticky_stale_route_config() -> SimConfig {
                     node: 1,
                     peer: 3,
                     for_ms: 5_000,
+                    inbox_ever_only: false,
                 },
             },
         ],
 
         ..delegated_config()
     }
+}
+
+/// Fence C9 (G1): a designee that took the lease. Three nodes. Node 1 is shut
+/// down at 1 s (restart at 3 s) and node 2 takes the lease; at 3.5 s the
+/// operator grants `d1` sticky through node 2 to node 1; at 4.6 s node 2 is
+/// shut down and releases the lease, and node 1 takes it (node 3 cannot reach
+/// S3 at either hand-over), so the lease holder is for a while also the
+/// designee of `d1`'s non-stealable generation. Node 3, whose clients write in
+/// `d1`, is cut from node 1 at 5.3 s for 1.5 s, so its ops are enqueued in the
+/// inbox (inbox-ever, with slow drain polls) and later forwarded to the lease
+/// holder, routed 0. The first answer node 1 sends for such a forward is lost
+/// (`CutOnAnswer`), and node 1 then loses the lease to a node that has not
+/// appended its `d1` rows (cut from S3 and from node 2). A lease holder that
+/// runs an inbox-ever forward as the designee of its own generation, followed
+/// by its successor's refusal of the retry, is I1
+/// (`nonholder_refused_a_designee_ran`, `refused_and_completed`). The window
+/// is short in the simulation (the holder ends its own generation at its
+/// claim), so few seeds reach it.
+fn sticky_root_designee_inbox_config() -> SimConfig {
+    SimConfig {
+        nodes: 3,
+        dirs: vec!["d2".into(), "d3".into(), "d1".into()],
+        delegations: Vec::new(),
+        sticky_delegations: Vec::new(),
+        cross_ratio: 0.2,
+        ops_per_client: 20,
+        faults: vec![
+            // Node 3 cannot claim the lease at either hand-over: node 2 takes
+            // the first, node 1 (the designee) the second.
+            ScheduledFault {
+                at_ms: 900,
+                kind: FaultKind::CutS3 {
+                    node: 3,
+                    for_ms: 2_600,
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_000,
+                kind: FaultKind::ShutdownHolder { restart_ms: 2_000 },
+            },
+            ScheduledFault {
+                at_ms: 3_500,
+                kind: FaultKind::DelegateDir {
+                    dir: "d1".into(),
+                    within_ms: 1_000,
+                    sticky: true,
+                },
+            },
+            ScheduledFault {
+                at_ms: 4_500,
+                kind: FaultKind::CutS3 {
+                    node: 3,
+                    for_ms: 700,
+                },
+            },
+            ScheduledFault {
+                at_ms: 4_600,
+                kind: FaultKind::ShutdownHolder { restart_ms: 2_500 },
+            },
+            ScheduledFault {
+                at_ms: 5_300,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 3,
+                    for_ms: 1_500,
+                },
+            },
+            ScheduledFault {
+                at_ms: 6_500,
+                kind: FaultKind::CutOnAnswer {
+                    node: 1,
+                    peer: 3,
+                    for_ms: 5_000,
+                    inbox_ever_only: true,
+                },
+            },
+            ScheduledFault {
+                at_ms: 8_000,
+                kind: FaultKind::CutS3 {
+                    node: 1,
+                    for_ms: 3_500,
+                },
+            },
+            ScheduledFault {
+                at_ms: 8_000,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 2,
+                    for_ms: 3_500,
+                },
+            },
+        ],
+        // The holder's drain answers its polls late, so the batches the
+        // partition held back are not served before the requester heals.
+        inbox_reads: sim::store::SlowReads {
+            before: (0, 0),
+            reply: (3_000, 5_000),
+        },
+        // (No default clock faults: the scenario is the lease hand-over, not
+        // the clocks.)
+        clock_faults: false,
+        ..delegated_config()
+    }
+}
+
+/// Fence C9 (G2): the same with node 1's lease clock running far slow (a rate
+/// error beyond `clock_rate_budget_ppm`, which breaks the lease's own
+/// assumption: other oracles may fire; judge it on the I1 checks only). Run
+/// it with `AUTHORITY_SIM_INBOX_READS` slow polls, so a drain read can
+/// predate a tombstone.
+fn sticky_root_designee_inbox_skew_config() -> SimConfig {
+    let mut config = sticky_root_designee_inbox_config();
+    config.faults.push(ScheduledFault {
+        at_ms: 4_800,
+        kind: FaultKind::RateSkew {
+            who: sim::run::StepOf::Node(1),
+            ppm: -50_000,
+        },
+    });
+    config
 }
 
 /// ADR-47: S7's shape passes only once an executor fences an unrouted
@@ -2158,6 +2281,18 @@ fn sticky_stale_route_passes_with_the_fence() {
         resends > 0,
         "no fenced forward was resent by its generation"
     );
+}
+
+/// Fence C9: `sticky-root-designee-inbox` runs clean over a few seeds. (It
+/// reaches the window in which the lease holder still holds a non-stealable
+/// generation of its own only rarely. `-skew` breaks the lease's rate
+/// assumption on purpose and is judged on I1 alone, by sweep.)
+#[test]
+fn sticky_root_designee_inbox_passes() {
+    for seed in 0..16 {
+        run_seed(seed, sticky_root_designee_inbox_config())
+            .unwrap_or_else(|e| panic!("sticky-root-designee-inbox seed {seed}: {e}"));
+    }
 }
 
 /// ADR-47's negative control for the delegate fence
@@ -6307,6 +6442,8 @@ fn base_config(label: &str) -> SimConfig {
         "sticky-holder-restarts-cut" => sticky_holder_restarts_cut_config(),
         "sticky-ttl" => sticky_ttl_config(),
         "sticky-stale-route" => sticky_stale_route_config(),
+        "sticky-root-designee-inbox" => sticky_root_designee_inbox_config(),
+        "sticky-root-designee-inbox-skew" => sticky_root_designee_inbox_skew_config(),
         "backup-departs" => backup_departs_config(),
         "singleton-first-peer" => singleton_first_peer_config(),
         "backup-group-cut-ttl" => backup_group_cut_ttl_config(GroupCut::Both),

@@ -165,6 +165,13 @@ pub struct Config {
     /// then fail `sticky-stale-route`.
     pub fence_accepts_unrouted: bool,
     /// Fault injection for the simulation's negative control (never set by
+    /// the engine): the lease holder runs an inbox-ever forward under its
+    /// own non-stealable generation while its lease honour is current,
+    /// instead of refusing it in the generation's stream (fence C9). The
+    /// sim's check 1 or `refused_and_completed` must then fail
+    /// `sticky-root-designee-inbox`.
+    pub holder_runs_inbox_ever: bool,
+    /// Fault injection for the simulation's negative control (never set by
     /// the engine): the root and its inbox drain refuse an op under an
     /// unreachable non-stealable grant for good whatever the op's
     /// `touched_gen` (main before ADR-47's root rule). The sim's
@@ -602,6 +609,7 @@ impl Config {
             holder_releases_before_drain: false,
             partial_release_ends_stream: false,
             fence_accepts_unrouted: false,
+            holder_runs_inbox_ever: false,
             root_ignores_touched: false,
             inbox_ignores_touched: false,
             abandon_skips_read_recall: false,
