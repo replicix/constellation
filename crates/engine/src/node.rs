@@ -3614,6 +3614,9 @@ mod tests {
         assert!(held.held && held.holder == node_id, "{held:?}");
         let epoch = held.epoch;
         old.stop_for_local_handoff().expect("the local stop");
+        // What the old process's exit releases: the store's lock, held by
+        // `Meta` until the last of the engine's threads lets go of it.
+        let old_store = Arc::downgrade(old.meta());
         let pending = old.meta().pending_upload_count().unwrap();
         let backlog = constellation_meta::MetaStore::journal_len(&**old.meta()).unwrap();
         if root_user {
@@ -3627,6 +3630,18 @@ mod tests {
         drop(view);
         drop(old);
         rt1.shutdown_timeout(Duration::from_secs(5));
+        // The engine's own threads (the authority driver's) let go of the
+        // store once the runtime is gone, a moment after `shutdown_timeout`
+        // returns; a process exit has no such gap, so wait for the release
+        // that the exit makes certain, else the successor meets the lock.
+        let released = std::time::Instant::now();
+        while old_store.strong_count() > 0 {
+            assert!(
+                released.elapsed() < Duration::from_secs(60),
+                "the old engine's threads still hold the store"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         refuse(0o755);
 
         let rt2 = runtime();
