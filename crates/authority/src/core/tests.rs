@@ -57664,6 +57664,11 @@ mod c2g_settle {
         assert_eq!(h.core.stats.settles_extended_for_durability, 1);
         let third = h.core.clients[&rid].deadline;
         assert_ne!(third, second);
+        // The cap moves with the deadline (the doc: never past the cap).
+        {
+            let c = &h.core.clients[&rid];
+            assert!(c.settle_until <= c.settle_cap, "{c:?}");
+        }
         h.advance(h.core.dl_t().settle_window);
         let out = h.step(Event::Timer { id: third });
         assert_eq!(replies(&out), vec![(rid, &ClientReply::InDoubt)], "{out:?}");

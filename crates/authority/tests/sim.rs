@@ -18638,9 +18638,11 @@ fn a_settle_waiting_for_a_generations_outwait_is_held_and_never_lands_late() {
 /// The second deadline moves one window for it (`ClientOp::durable_grace`)
 /// instead of telling an unsettled `EIO` with the root itself reachable.
 /// Fails on the parent: one unsettled `EIO` ("reachable ... Itself").
+/// (Seed 22825 was the first; with the extension moving the settle's cap
+/// along, it lands without the grace, so the path is pinned on 1112.)
 #[test]
 fn long_delegated_settle_answered_just_before_its_cap_lands() {
-    let seed = 22825;
+    let seed = 1112;
     let r = run_seed(seed, strict(long_delegated_config(), "unsettled"))
         .unwrap_or_else(|e| panic!("long-delegated+unsettled seed {seed}: {e}"));
     assert!(

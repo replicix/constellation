@@ -476,16 +476,16 @@ impl Core {
                             .gens
                             .get(&d.gen)
                             .is_some_and(|g| g.inherited && g.delegate_heard.is_none());
-                    if unheard_inherited && d.node != self.cfg.node_id && live.is_some() {
-                        self.stats.settles_not_redirected_unheard += 1;
-                    }
-                    let redirects = d.node != self.cfg.node_id
+                    let redirects_before = d.node != self.cfg.node_id
                         && live.is_some_and(|g| {
                             g.recall == RecallPhase::None || !settle || non_stealable
                         })
                         && !disowned
-                        && !inbox_only
-                        && !unheard_inherited;
+                        && !inbox_only;
+                    if unheard_inherited && redirects_before {
+                        self.stats.settles_not_redirected_unheard += 1;
+                    }
+                    let redirects = redirects_before && !unheard_inherited;
                     // ADR-47 (row 4): a rid that has its outcome here is
                     // answered from it, not redirected: the requester's
                     // table lags a grant the root's journal already knows,
