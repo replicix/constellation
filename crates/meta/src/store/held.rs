@@ -1692,6 +1692,89 @@ mod tests {
         assert!(names_any(b"not a manifest", &BTreeSet::from([a])));
     }
 
+    /// ADR-58 C1: a refusal journaled without observed keys (a settle's
+    /// `ABANDONED`) ships past a held transaction on the very keys an
+    /// errno refusal of the same op would have observed, which stays held.
+    #[test]
+    fn a_refusal_without_observed_keys_ships_past_a_held_transaction() {
+        use crate::mutate::MutateOp;
+        use crate::rid::Rid;
+        use crate::MetaStore;
+        use constellation_fs_core::types::ROOT_INO;
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_holder_epoch(1);
+        let f0 = meta.create(ROOT_INO, "f0", 0o644, 0, 0).unwrap().ino;
+        let shipped = |segment: u64| -> Vec<LogRecord> {
+            let rows = meta.take_shippable(usize::MAX).unwrap();
+            let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+            if !seqs.is_empty() {
+                meta.ack_journal_rows_at(&seqs, segment).unwrap();
+            }
+            rows.into_iter().map(|(_, r)| r).collect()
+        };
+        shipped(1);
+        // A seed write whose chunk is lost, and a dependent on the same ino.
+        let hash = ChunkHash::of(b"lost");
+        let manifest = Manifest {
+            layout: constellation_fs_core::ChunkLayout::new(4096),
+            file_len: 7,
+            chunks: ChunkInfo::Inline(BTreeMap::from([(0u64, hash)])),
+        }
+        .encode();
+        meta.set_manifest_dirty(f0, None, &manifest, 7, None, None, &[hash])
+            .unwrap();
+        meta.note_unrecoverable_chunks(&[(hash, f0)], false)
+            .unwrap();
+        crate::mutate::execute(
+            &meta,
+            &MutateOp::Setattr {
+                ino: f0,
+                mode: Some(0o600),
+                uid: None,
+                gid: None,
+                size: None,
+                atime_ns: None,
+                mtime_ns: None,
+            },
+            None,
+        )
+        .unwrap();
+        let rid = |seq| Rid {
+            node: 9,
+            incarnation: 1,
+            seq,
+        };
+        let op = MutateOp::Link {
+            ino: f0,
+            parent: ROOT_INO,
+            name: "f0".into(),
+        };
+        let refusals = |rows: &[LogRecord]| {
+            rows.iter()
+                .filter(|r| matches!(r, LogRecord::Refused { .. }))
+                .count()
+        };
+        // An errno refusal that observed the held keys stays held.
+        meta.journal_refusal(rid(1), constellation_types::Code::Exists, Some(&op))
+            .unwrap();
+        assert_eq!(refusals(&shipped(2)), 0, "an errno refusal waits");
+        // A refusal without observed keys (`ABANDONED`) ships.
+        meta.journal_refusal(rid(2), constellation_types::Code::Canceled, None)
+            .unwrap();
+        let rows = shipped(3);
+        assert!(
+            rows.iter().any(|r| matches!(
+                r,
+                LogRecord::Refused { rid: r, .. } if *r == rid(2)
+            )),
+            "the settle's refusal ships past the held transaction: {rows:?}"
+        );
+        assert!(!rows.iter().any(|r| matches!(
+            r,
+            LogRecord::Refused { rid: r, .. } if *r == rid(1)
+        )));
+    }
+
     // ---- chunk close-stall-followup: the blame is the ship rule's ----
 
     mod blame {

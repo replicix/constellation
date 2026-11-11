@@ -1415,7 +1415,15 @@ impl Core {
         // (`ABANDONED_CODE`, or the dropped code of a settle that
         // `repair drop-held`'s refused entry sends: `client::settle_code`.)
         let code = super::client::settle_code(rid, op);
-        if !self.record_refusal(rid, code, op, committed, replica) {
+        // ADR-58 C1: an `ABANDONED` refusal says "this op did not happen",
+        // not "this state produced an errno": it observes no keys, so the
+        // ship plan never holds it behind a held transaction.
+        let observed = if code == super::client::ABANDONED_CODE {
+            None
+        } else {
+            op
+        };
+        if !self.record_refusal(rid, code, observed, committed, replica) {
             return MutateOutcome::Busy;
         }
         self.stats.settles_refused += 1;
