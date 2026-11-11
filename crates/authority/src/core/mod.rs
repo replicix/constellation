@@ -2084,6 +2084,9 @@ pub struct Stats {
     /// Plan 46 M1.2 step 5: tail transactions whose rid already had an
     /// outcome here (the log carried them), not re-shipped.
     pub tail_done_skipped: u64,
+    /// ADR-51: tail transactions whose identity an earlier epoch's tail of
+    /// the same takeover re-shipped already (normal; not `tail_done_skipped`).
+    pub tail_dedup: u64,
     /// Tail transactions that are this node's own journal rows still (its
     /// own sealed tail read back), left to ship as they are.
     pub tail_same_row: u64,

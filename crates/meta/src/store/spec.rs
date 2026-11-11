@@ -809,8 +809,15 @@ pub struct ReshipReport {
     pub tail_applied: usize,
     /// Transactions past the sealed hold's contiguous prefix, not re-shipped.
     pub tail_beyond_gap: usize,
-    /// Transactions whose rid already had an outcome here, skipped.
+    /// Transactions whose rid already had an outcome here, skipped: the log
+    /// carried the effect under another identity. Not a normal sight (the
+    /// sim fails a seed for it under strict identity).
     pub tail_done: usize,
+    /// ADR-51: transactions whose identity an earlier epoch's tail of the
+    /// same takeover re-journaled already (a later epoch's union carries the
+    /// re-ship of an earlier one's rows), skipped. Normal, and no outcome of
+    /// a rid: not a `tail_done`.
+    pub tail_dedup: usize,
     /// Transactions that are this node's own journal rows still (the same
     /// epoch and journal seq: a node reading its own sealed tail back),
     /// left as they are.
@@ -6349,7 +6356,7 @@ impl Meta {
                 let ident =
                     crate::store::member::tail_identity(&bt.records).unwrap_or((t.epoch, bt.first));
                 if !seen.insert(ident) {
-                    report.tail_done += 1;
+                    report.tail_dedup += 1;
                     continue;
                 }
                 // The log carries the transaction itself (by its identity,
