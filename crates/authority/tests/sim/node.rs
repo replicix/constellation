@@ -29,6 +29,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
+/// The period of the sim driver's directory ticker (the daemon's `probe_all`
+/// and, with `roster_refresh_ms` 0, its registry poll), in ms.
+pub const PEERS_TICK_MS: i64 = 500;
+
 /// The most S3 requests a core may have in flight before the run fails
 /// as a request loop (see `Driver::run`).
 const S3_IN_FLIGHT_BOUND: usize = 10_000;
@@ -999,6 +1003,7 @@ impl NodeHandle {
     pub fn crash(&self, bus: &Bus) {
         self.shared.alive.store(false, Ordering::SeqCst);
         self.oracles.epoch_holds.lock().unwrap().remove(&self.id);
+        self.oracles.note_left(self.id);
         self.shared.lane_wake.notify_one();
         bus.detach(self.id);
         self.task.abort();
@@ -2049,7 +2054,6 @@ impl Driver {
                     // it is taken is then not counted as seen by it.
                     let lapses = shared.lapses_handed.load(Ordering::SeqCst);
                     let now = clock.now();
-                    let issued = now.wait;
                     // With P2P off the directory is empty (`Peers::disabled`).
                     let links: Vec<PeerLink> = nodes
                         .into_iter()
@@ -2076,13 +2080,13 @@ impl Driver {
                             registry_complete: true,
                             links,
                             lapses,
-                            issued,
                         })
                         .is_err()
                     {
                         return;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(PEERS_TICK_MS as u64))
+                        .await;
                 }
             });
         }

@@ -504,9 +504,13 @@ fn replay_seed() {
         Ok("locks-pause-writes") => with_lock_writes(locks_pause_config(), ""),
         Ok("locks-writer-hold") => locks_writer_hold_config(),
         Ok("locks-writer-hold-unchecked") => locks_writer_hold_unchecked_config(),
+        Ok("locks-writer-hold-singleton") => locks_writer_hold_singleton_config(),
         Ok("locks-writer-hold-delegated") => locks_writer_hold_delegated_config(),
         Ok("locks-writer-hold-delegated-unsettled") => {
             locks_writer_hold_delegated_unsettled_config()
+        }
+        Ok("locks-writer-hold-delegated-unsettled-own-clock") => {
+            locks_writer_hold_delegated_unsettled_own_clock_config()
         }
         Ok("locks-writer-hold-delegated-doubt") => locks_writer_hold_delegated_doubt_config(),
         Ok("locks-writer-hold-delegated-group") => locks_writer_hold_delegated_group_config(false),
@@ -1233,7 +1237,7 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
             .map(|s| s.inbox_multi_batch_withdrawals)
             .sum();
         assert!(
-            multi >= 1,
+            multi >= 2,
             "seed {seed} no longer forwards an op with several batches to withdraw ({multi})"
         );
         assert!(report.converged_checked, "seed {seed} did not converge");
@@ -4613,6 +4617,40 @@ fn local_policy_has_no_rollbacks_with_a_peer() {
     }
 }
 
+/// The control of the test above: `strict_durability` is not vacuous. A
+/// node joins a singleton root that has no link to it for 2.5 s, the root
+/// crashes, and the joiner claims the lease. With `plant_roster_shrink` (the
+/// core installs a read that lost a record as the whole roster) and reads
+/// that lose a member, the root forgets the joiner it had been told of, answers
+/// alone with a peer, and the strict run fails (I1 at the answer, and I5
+/// for the answers the claim rolls back). The same seeds without the plant
+/// are clean.
+#[test]
+fn strict_durability_catches_a_planted_roster_shrink() {
+    let cfg = |plant| SimConfig {
+        strict_durability: true,
+        roster_faults: (20, 20),
+        plant_roster_shrink: plant,
+        ops_per_client: 100,
+        ..singleton_peer_join_config()
+    };
+    let (mut caught, mut i5) = (0, 0);
+    for seed in 0..8 {
+        if let Err(e) = run_seed(seed, cfg(true)) {
+            eprintln!("seed {seed}: {}", e.lines().next().unwrap_or(""));
+            caught += 1;
+            i5 += usize::from(e.contains("I5"));
+        }
+        run_seed(seed, cfg(false))
+            .unwrap_or_else(|e| panic!("seed {seed}: the unplanted run is not clean: {e}"));
+    }
+    eprintln!("planted shrink: {caught} of 8 seeds fail, {i5} of them with I5");
+    assert!(
+        caught >= 4,
+        "strict durability caught the planted shrink on {caught} of 8 seeds"
+    );
+}
+
 // ---- runtime lag: a live holder is late, not dead ----
 
 /// A host that holds a node's runtime up (busy workers, a starved
@@ -6698,6 +6736,7 @@ fn base_config(label: &str) -> SimConfig {
             core: std::sync::Arc::new(sim::run::ack_s3_core_config),
             ..long_backup_config()
         },
+        "long" => long_config(),
         "long-sessions" => long_sessions_config(),
         "long-strict" => long_strict_config(),
         "delegated-backup" => delegated_backup_config(),
@@ -6825,8 +6864,12 @@ fn base_config(label: &str) -> SimConfig {
         "locks-failover-backup-writes" => with_lock_writes(locks_failover_backup_config(), ""),
         "locks-writer-hold" => locks_writer_hold_config(),
         "locks-writer-hold-unchecked" => locks_writer_hold_unchecked_config(),
+        "locks-writer-hold-singleton" => locks_writer_hold_singleton_config(),
         "locks-writer-hold-delegated" => locks_writer_hold_delegated_config(),
         "locks-writer-hold-delegated-unsettled" => locks_writer_hold_delegated_unsettled_config(),
+        "locks-writer-hold-delegated-unsettled-own-clock" => {
+            locks_writer_hold_delegated_unsettled_own_clock_config()
+        }
         "locks-writer-hold-delegated-doubt" => locks_writer_hold_delegated_doubt_config(),
         "locks-writer-hold-delegated-group" => locks_writer_hold_delegated_group_config(false),
         "locks-writer-hold-delegated-backup" => locks_writer_hold_delegated_group_config(true),
@@ -7710,8 +7753,16 @@ fn delegated_fast_path_unchecked_config() -> SimConfig {
 
 /// Plan 46 M1.2 step 1: the root's fast path executes what the root owns
 /// and leaves a whole delegation's subtree to its delegate.
+///
+/// ADR-50 (plan 46 M1.3 step 10, Q1): a root with a delegate has a peer and
+/// answers by the archive, and the sim's fast path executes only for a root
+/// that is not ack-gated, so this configuration never takes it until step 9
+/// (the root's own subtrees under sticky grants). The property is guarded
+/// meanwhile at the meta level (`Meta::root_fast_path` refuses a name in a
+/// whole delegation: `held.rs`, `rebuild_delegations.rs`), and this test
+/// fails the day the fast path runs here, so that the original assertion
+/// (`fast_path_executed > 0`) and the control below are restored.
 #[test]
-#[ignore = "ADR-50 interim (plan 46 M1.3 step 10, Q1): a root with a peer answers by the archive, and the sim fast path executes only for a lone root, so this configuration never takes the fast path until step 9; re-enable then"]
 fn delegated_fast_path_respects_whole_delegations() {
     let t = run_m11(
         "delegated-fast-path",
@@ -7719,25 +7770,35 @@ fn delegated_fast_path_respects_whole_delegations() {
         78_000..78_020,
     );
     assert!(t.executed > 0, "delegates never executed: {t:?}");
-    assert!(
-        t.fast_path_executed > 0,
-        "the fast path never executed: {t:?}"
+    assert_eq!(
+        t.fast_path_executed, 0,
+        "the fast path executes in a root with a delegate: restore the assertion \
+         `fast_path_executed > 0` and re-enable `delegated_unchecked_fast_path_is_caught`: {t:?}"
     );
 }
 
 /// Without the admission the root's fast path executes inside a delegated
-/// subtree: two sequencers for one name. The checker must catch it.
+/// subtree: two sequencers for one name. The checker must catch it. (Not
+/// reachable until step 9, see above: the run is clean and the fast path
+/// never executed; either changing fails this test.)
 #[test]
-#[ignore = "ADR-50 interim (plan 46 M1.3 step 10, Q1): a root with a peer answers by the archive, and the sim fast path executes only for a lone root, so this configuration never takes the fast path until step 9; re-enable then"]
 fn delegated_unchecked_fast_path_is_caught() {
-    let mut caught = 0;
+    let (mut caught, mut executed) = (0, 0);
     for seed in 78_000..78_040 {
-        if let Err(e) = run_seed(seed, delegated_fast_path_unchecked_config()) {
-            eprintln!("seed {seed}: {}", e.lines().next().unwrap_or(""));
-            caught += 1;
+        match run_seed(seed, delegated_fast_path_unchecked_config()) {
+            Err(e) => {
+                eprintln!("seed {seed}: {}", e.lines().next().unwrap_or(""));
+                caught += 1;
+            }
+            Ok(r) => executed += r.fast_path_executed,
         }
     }
-    assert!(caught > 0, "the unchecked fast path was never caught");
+    assert_eq!(
+        (caught, executed),
+        (0, 0),
+        "the unchecked fast path runs in a root with a delegate: restore the control \
+         (`caught > 0`) and delegated_fast_path_respects_whole_delegations"
+    );
 }
 
 /// Plan 46 M1.1 step 1: a lone root (no backup), a delegate and an S3 cut
@@ -12301,6 +12362,20 @@ fn locks_writer_hold_config() -> SimConfig {
     }
 }
 
+/// ADR-50 (plan 46 M1.3 step 10): [`locks_writer_hold_config`] on one node
+/// with four clients. A root with a peer answers by the archive, and the
+/// sim's fast path executes only for a root that is not ack-gated, so the
+/// three-node configuration never takes it (until step 9); a single node is a
+/// singleton, takes the fast path, and its clients contend for the writer lock
+/// as before.
+fn locks_writer_hold_singleton_config() -> SimConfig {
+    SimConfig {
+        nodes: 1,
+        clients_per_node: 4,
+        ..locks_writer_hold_config()
+    }
+}
+
 /// F1 (review T1), the executor that did not mint the grant: the lock
 /// files are the root's, the turns go to `d2`, which node 3 sequences as
 /// its delegate. Node 3's own client writes its turn on the delegate's
@@ -13536,6 +13611,8 @@ struct M14Totals {
     /// F1: see `Report::held_writes`; recalled grants left to the
     /// outwait (an op tagged with them in doubt).
     held_writes: u64,
+    /// See `Report::fast_path_executed`.
+    fast_path_executed: u64,
     held_refused: u64,
     held_accepted: u64,
     fast_waited: u64,
@@ -13627,6 +13704,7 @@ impl M14Totals {
             .map(|l| l.own_renewals + l.remote_ok + l.late_ok)
             .sum::<u64>();
         self.held_writes += r.held_writes;
+        self.fast_path_executed += r.fast_path_executed;
         self.held_refused += r.held_refused;
         self.held_accepted += r.held_accepted;
         self.fast_waited += r.fast_waited;
@@ -15484,13 +15562,16 @@ fn locks_under_random_faults() {
 /// is refused at the write; the next holder's turn survives
 /// (`strict_lock_turns`), mutual exclusion holds.
 #[test]
-#[ignore = "ADR-50 interim (plan 46 M1.3 step 10, Q1): a root with a peer answers by the archive, and the sim fast path executes only for a lone root, so this configuration never takes the fast path until step 9; re-enable then"]
 fn locks_writer_hold_refuses_the_held_write() {
     use pinned::run_m14;
     let t = run_m14(
-        "locks-writer-hold",
-        locks_writer_hold_config(),
+        "locks-writer-hold-singleton",
+        locks_writer_hold_singleton_config(),
         230_000..230_080,
+    );
+    assert!(
+        t.fast_path_executed > 0,
+        "the fast path never executed: {t:?}"
     );
     assert!(t.held_writes > 60, "writes were rarely held: {t:?}");
     assert!(
@@ -15499,6 +15580,25 @@ fn locks_writer_hold_refuses_the_held_write() {
     );
     assert!(t.held_accepted > 0, "no short hold landed: {t:?}");
     assert_eq!(t.clients.stale_turn_reads, 0, "{t:?}");
+}
+
+/// ADR-50 (plan 46 M1.3 step 10): the three-node writer-hold configuration
+/// never takes the root's fast path (its root has peers and answers by the
+/// archive), which is why the two controls above run on one node. This fails
+/// the day it does (step 9): the controls then run on this configuration too.
+#[test]
+fn locks_writer_hold_with_peers_takes_no_fast_path_until_step_9() {
+    use pinned::run_m14;
+    let t = run_m14(
+        "locks-writer-hold",
+        locks_writer_hold_config(),
+        230_000..230_010,
+    );
+    assert_eq!(
+        t.fast_path_executed, 0,
+        "a root with peers takes the fast path: run `locks_writer_hold_refuses_the_held_write` \
+         and its control on `locks_writer_hold_config` again: {t:?}"
+    );
 }
 
 /// F1 (review T1): a delegate's write held in its transaction under a
@@ -15611,11 +15711,13 @@ fn locks_writer_hold_delegated_unsettled_own_clock_config() -> SimConfig {
 /// before the root's clock bound (see the pin above); with the check
 /// disabled none of them fails, and this test with it.
 #[test]
-#[ignore = "ADR-50 interim (plan 46 M1.3 step 10, Q1): a root with a peer answers by the archive, and the sim fast path executes only for a lone root, so this configuration never takes the fast path until step 9; re-enable then"]
 fn locks_writer_hold_delegated_own_clock_without_the_settle_is_caught() {
     use pinned::run_seed;
     let mut witnessed = Vec::new();
-    for seed in 555u64..556 {
+    // (Seed 555 stopped showing it under ADR-50, which moved every schedule of
+    // a root with peers; 138, 502 and 685 are the first three of seeds 0 to
+    // 3 000 that do, unclocked, the settle clean on each.)
+    for seed in [138u64, 502, 685] {
         if let Err(e) = run_seed(
             seed,
             locks_writer_hold_delegated_unsettled_own_clock_config(),
@@ -15686,7 +15788,7 @@ fn locks_writer_hold_delegated_doubt_lapses_the_grant() {
 /// F1's fail-before: without the check at the write, a held write lands
 /// after the next holder's turn and its application is told it succeeded.
 #[test]
-#[ignore = "ADR-50 interim (plan 46 M1.3 step 10, Q1): a root with a peer answers by the archive, and the sim fast path executes only for a lone root, so this configuration never takes the fast path until step 9; re-enable then"]
+#[ignore = "ADR-50 interim (plan 46 M1.3 step 10, Q1): the held write lands over the next holder's turn only after a grant lapses under a holder whose lock owner is another node, and the fast path runs only in a root without peers (a single node's grants never lapse under its own core: 0 of 400 seeds on one node, 0 of 300 on the three-node and delegated configs); `locks_writer_hold_with_peers_takes_no_fast_path_until_step_9` fails the day the root's fast path runs with peers, and this control is re-enabled then"]
 fn locks_writer_hold_without_the_check_at_write_is_caught() {
     let mut caught = 0;
     for seed in 230_130..230_150 {
@@ -16488,6 +16590,53 @@ fn regression_a_grant_handed_back_during_a_release_is_renewed() {
             t.clients.fenced_ios, 0,
             "{label} seed {seed}: I/O fenced: {t:?}"
         );
+    }
+}
+
+/// Re-pin helper for `regression_a_grant_handed_back_during_a_release_is_renewed`:
+/// prints, per seed of `AUTHORITY_SIM_START`/`AUTHORITY_SIM_SEEDS`, whether a
+/// release waited for a recall, a grant was handed back during it, and what
+/// was lost or fenced. The pins are the seeds where the first two are positive
+/// and the last two zero with the fix, and not without it.
+#[test]
+#[ignore]
+fn find_release_recall_seeds() {
+    let start: u64 = std::env::var("AUTHORITY_SIM_START")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let seeds: u64 = std::env::var("AUTHORITY_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000);
+    for (label, cfg) in [
+        (
+            "locks-unlinked-delegated-blips",
+            locks_unlinked_blips_config(),
+        ),
+        (
+            "locks-blips-tight-delegated",
+            locks_blips_tight_delegated_config(),
+        ),
+    ] {
+        for seed in start..start + seeds {
+            let Ok(report) = run_seed(seed, fixed_lane(cfg.clone())) else {
+                eprintln!("RR {label} {seed} failed");
+                continue;
+            };
+            let sum = |f: fn(&constellation_authority::Stats) -> u64| -> u64 {
+                report.stats.values().map(f).sum()
+            };
+            let mut t = M14Totals::default();
+            t.add(&report);
+            eprintln!(
+                "RR {label} {seed} waits {} returned {} lost {} fenced {}",
+                sum(|s| s.deleg_release_waits),
+                sum(|s| s.lock_returned_in_release),
+                t.lost,
+                t.clients.fenced_ios
+            );
+        }
     }
 }
 
@@ -18308,11 +18457,12 @@ fn c2_a_settled_eio_never_lands_late() {
 /// (none on the parent of step 13). The settle is held until the outwait
 /// ends (`settles_held_for_outwait`). Fails on the parent: each seed's
 /// `+settle` run fails with I4. (Seeds 1694 and 8929 of step 13, re-pinned
-/// for ADR-50, which moved every schedule of a root with peers: these were
-/// found with `settles_held_for_outwait > 0` and a clean run.)
+/// for ADR-50, which moved every schedule of a root with peers: with the hold
+/// reverted `long-delegated+settle` fails I4 on 15798, 38574 and 50005 of seeds
+/// 0 to 80 000 and on no other; each is clean with the hold and reaches it.)
 #[test]
 fn a_settle_waiting_for_a_generations_outwait_is_held_and_never_lands_late() {
-    for seed in [618, 1112] {
+    for seed in [15798, 38574, 50005] {
         let r = run_seed(seed, strict(long_delegated_config(), "settle"))
             .unwrap_or_else(|e| panic!("long-delegated+settle seed {seed}: {e}"));
         assert!(
@@ -18334,7 +18484,11 @@ fn a_settle_waiting_for_a_generations_outwait_is_held_and_never_lands_late() {
 /// per seed ("no sequencer in time").
 #[test]
 fn long_delegated_settles_outlast_the_roots_outwait() {
-    for seed in [5, 6] {
+    // (Re-pinned for ADR-50: with the extension reverted
+    // `long-delegated+unsettled` fails I4 on 16 of seeds 0 to 15 000 (1089,
+    // 3121, 5660, 6129, ...), 5660 also with the extension, and is not pinned;
+    // the three here are clean with it and reach it.)
+    for seed in [1089, 3121, 6129] {
         let r = run_seed(seed, strict(long_delegated_config(), "unsettled"))
             .unwrap_or_else(|e| panic!("long-delegated+unsettled seed {seed}: {e}"));
         assert!(
