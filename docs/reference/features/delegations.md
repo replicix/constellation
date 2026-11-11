@@ -802,9 +802,13 @@ it sent, and the executors decide (route fencing):
   `HolderUnreachable`: not final, nothing journaled; the requester asks again
   and waits for the holder's word (its row for the rid, its release or the
   end of its stream). `EXDEV` stays final.
-- A rid that was ever put in the inbox is forwarded only to the lease holder,
-  and the inbox drain halts a batch whose op touched a generation (or that
-  the root redirected to a designee) instead of refusing it; it runs when the
+- A rid that was ever put in the inbox is forwarded only to the lease holder
+  (or along its redirect), and a designee of a non-stealable generation, the
+  lease holder's own included, never runs it: it refuses it `EROFS` as a row
+  of its stream, after its dedup. The root sends a touched one to a live
+  holder so that its stream decides it, and refuses an untouched one itself.
+  The inbox drain halts a batch whose op touched a generation (or that the
+  root redirected to a designee) instead of refusing it; it runs when the
   generation ends, with dedup.
 
 At the op's deadlines the client hears the unsettled `EIO` ("in doubt",

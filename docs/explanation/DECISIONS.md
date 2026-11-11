@@ -3542,7 +3542,8 @@ The rules:
    `routed_gen == g`; otherwise it answers `Fenced { gen: g }` and journals
    nothing. The rule is uniform: every generation kind (placed included), and
    the root's own generation: a root that is also a designee fences an
-   unrouted forward like any delegate. The fence runs first among the
+   unrouted forward like any delegate (an inbox-ever rid is rule 3's). The
+   fence runs first among the
    delegate's gates, before the settle's park-drop and before ADR-46's
    `Held`, and again at every re-entry of a parked forward. The requester
    re-sends routed by the named generation (at most twice, then it decides the
@@ -3560,12 +3561,22 @@ The rules:
    stays final: a non-stealable range shrinks only by the holder's own release
    or an end that appended its rows (so a run rid has an outcome at the root),
    or by the operator's abandon (operator I5, not I1).
-3. **Inbox-ever rids run only through the lease holder.** A rid that was ever
-   enqueued in the inbox is forwarded only to the lease holder, never by the
-   table to a delegate; it may still follow a root's redirect. This closes a
-   race that predates ADR-45: a drain that read the batch before the
-   requester's tombstone processed it afterwards and journaled `Refused`
-   while the designee ran the direct forward.
+3. **Inbox-ever rids never run at a designee of a non-stealable generation.**
+   A rid that was ever enqueued in the inbox (or whose send history is
+   unknown) is forwarded only to the lease holder, or along the lease
+   holder's redirect. A node that holds its keys under a non-stealable
+   generation (the lease holder's own included) never runs it as a delegate:
+   it refuses it as a row of that generation's stream, `Refused { rid, EROFS }`,
+   after the stream's dedup, and answers `EROFS` once its group holds the row.
+   The root learns the outcome from the log. Under a stealable generation the
+   designee answers `Fenced`, and the lease holder may run it as the designee
+   of its own placed generation (nobody refuses under a stealable grant for
+   good). The root redirects a touched inbox-ever rid to a live non-stealable
+   holder, so that the holder's stream decides it; an untouched one it
+   refuses itself (rule 2). This closes a race that predates ADR-45: a drain
+   that read the batch before the requester's tombstone processed it
+   afterwards and journaled `Refused` while the designee ran the direct
+   forward.
 4. **The drain halts.** The drain applies rule 2 to the op's own `touched_gen`
    (carried in the batch, appended last) and to the redirects its root
    recorded: an op under a non-stealable grant that is touched, or that the
@@ -3603,12 +3614,20 @@ every local offer, so a send under `g` is never followed by a final refusal.
 The sim oracle judges this directly: a refusal of an op a non-stealable
 generation ran is a violation (check 1), and `EXDEV` is judged too.
 
-**Known limit (until C9)**: a drain read issued before the requester's
-tombstone, while a deposed root (clock skew beyond the lease margin) still
-redirects the rid to the designee, can still refuse it. The follow-up (C9) has
-the reachable holder journal a refusal of an op it will not run in its own
-stream, after which neither the root nor the drain refuses an op under a
-non-stealable grant for good except `EXDEV`.
+**The holder's refusal (C9).** No rule of this ADR reads a clock. An earlier
+form let the lease holder run an inbox-ever forward as the designee of its own
+generation while its lease honour was current. That re-admitted the case rule 1
+excludes for the root's own generation: a successor that had not yet appended
+the deposed root's row refused the retry for good (no clock fault needed). With
+a lease clock wrong beyond its rate budget, it also let a drain read issued
+before the requester's tombstone refuse what the deposed root ran. Both are
+closed by rule 3. The inbox drain's freshness (the late-landing bound) limits
+how old the drain's bytes are, not how soon after a read the tombstone lands,
+and closes neither.
+
+**Premises**: a designee has applied the log through its grant before it
+honours the generation (so its stream's dedup sees every earlier outcome of the
+rid); a replay of an unacknowledged or foreign stranded row only settles.
 
 **Consequences**: the cost is latency and errno, never safety. A forward
 whose requester's table lags costs one `Fenced` hop. Ops touched, replayed or
@@ -3616,7 +3635,10 @@ of unknown history under an unreachable designation wait and then end in doubt
 where they ended `EROFS`; the share of replays that become conflict copies
 quickly may shift. A halted batch blocks that requester's later batches until
 the generation ends or is abandoned. Two `u64` per forward and one per inbox
-op. **Operator note**: the inbox op gained a field with the inbox version
+op. An inbox-ever rid on the keys of the lease holder's own non-stealable
+grant is refused (`EROFS`) where it once ran; a touched inbox-ever rid under a
+live sticky holder is answered by that holder (its outcome, or `EROFS`) where
+it once waited in doubt (`holder_inbox_refusals`, `inbox_ever_redirects`). **Operator note**: the inbox op gained a field with the inbox version
 unchanged (no compatibility shim), so a batch written by the previous binary is
 undecodable; drain the inboxes (quiet the writers) before a rolling restart,
 or the ops in them end at their requesters' deadlines. Forwards on the wire
@@ -3631,7 +3653,10 @@ claimed history alone (the fence needs only the generation the executor owns).
 **May revert**: no. The negative controls `fence_accepts_unrouted` (a delegate
 runs an unrouted forward) and `root_ignores_touched` (the root and the drain
 refuse a touched op) restore the old behaviour; the sim's check 1 or
-`refused_and_completed` fails with each.
+`refused_and_completed` fails with each. `holder_runs_inbox_ever` (the lease
+holder runs inbox-ever forwards under its own non-stealable generation again)
+restores the C9 form; its sim configuration, `sticky-root-designee-inbox`,
+reaches the window rarely, and the core tests carry the case.
 
 See: `crates/authority/src/core/delegate.rs` (`delegate_try_execute`),
 `crates/authority/src/core/holder.rs` (`mutate_request`),
