@@ -4142,7 +4142,12 @@ under a time-bounded lease), the successor never saw the row, and the I1
 oracle judged "expected singleton, committed by none" (280 of 2,000 seeds of
 `delegated-core-stall-root-lease6+commit`). The next step of the stalled node
 was already correct (its fresh `now` fails every lease check); only answers
-given inside the stalled step were wrong.
+given inside the stalled step were wrong. ADR-50 later took that configuration
+off the singleton path (a root with a peer on its roster is not a singleton, so
+it answers `Group` or `Archive`); what remains is a node truly alone by its
+roster whose stalled step outlives a takeover by a peer that joined during the
+stall. The core has not read the join (it waits in the stalled node's queue),
+so the step still answers as a singleton.
 
 **Decision**: where an answer of class `Singleton` leaves (the emission gate:
 `Core::finish`, `Core::send_answer*`; the engine's FUSE fast path's
@@ -4154,7 +4159,17 @@ that finds the lease usable (a landed renewal asks at once) releases it as the
 singleton's it was, and a deposition ends it in doubt, retried by rid at the
 successor. Only an answer with a row of its own is held; a refusal nothing
 executed commits nothing. The fast path answers in doubt through the core
-(which dedups the rid and applies the same gate). Execution on the stale clock
+(which dedups the rid and applies the same gate); that includes the
+acknowledgement of a row that waited under a durability gate and is re-tagged
+a singleton's when the gate goes off (`local_ack_durable`, `Ungated`): the lease
+is read before the re-tag and after it, the re-tag being a store write, and a
+lease no longer usable leaves the op in doubt. A close (`flush_inode`) whose
+lone row is found in doubt keeps its inputs (the published class is a
+singleton's) and re-commits through the core as a gated close does, not `EIO`.
+A hold reached after the node was deposed (`lease.lost`, before
+`finish_recovery`) is in doubt at once and, as at a deposition, marks the rid
+`replay.unacked` when its row is not gated, so that a refusal of the replay is
+the client's answer, not a conflict copy. Execution on the stale clock
 is not re-checked: S3 fences it (create-only log slots, the takeover marker)
 and the strand replays it by rid; the harm was only the answer.
 
@@ -4169,7 +4184,11 @@ clock read per step after the last journal write (the read is cheap, measured
 in `bench/commit-rule/RESULTS.md`).
 
 **May revert**: no. `delegated-core-stall-root-lease6+commit` is strict again
-(its exemption removed); the negative control is `-root-unlaned`.
+(its exemption removed); it no longer reaches a singleton answer (ADR-50), so
+it pins nothing here. The fail-before configuration is `singleton-stall-takeover`
+(a lone root stalled at its next own `Submit` across a joining peer's claim;
+`+nohold` is `Config::stale_lease_hold_off`, the parent's behavior, and must
+fail I1).
 
 See: `crates/authority/src/core/backup.rs` (`emission_hold_of`),
 `crates/authority/src/core/readindex.rs` (`park_stale_lease`,
