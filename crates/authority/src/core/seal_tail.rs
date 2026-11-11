@@ -333,6 +333,7 @@ impl Core {
         (holder, lease_epoch): (NodeId, Epoch),
         epoch: Epoch,
         key: &RenewalKey,
+        closed_hold: bool,
         replica: &dyn Replica,
     ) -> KeptSeal {
         let me = self.cfg.node_id;
@@ -341,6 +342,7 @@ impl Core {
             return KeptSeal::Unreadable;
         }
         if self.epoch.open
+            && !closed_hold
             && self
                 .pr
                 .carried
@@ -461,7 +463,7 @@ impl Core {
         req: OpId,
         (epoch, config_version, from_seq): (Epoch, u64, u64),
         key: RenewalKey,
-        (kept, tenure): (bool, (NodeId, Epoch)),
+        (kept, tenure, closed_hold): (bool, (NodeId, Epoch), bool),
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -494,7 +496,7 @@ impl Core {
             });
         };
         if kept {
-            match self.seal_kept_hold(tenure, epoch, &key, replica) {
+            match self.seal_kept_hold(tenure, epoch, &key, closed_hold, replica) {
                 KeptSeal::Unreadable => {
                     // Not "I hold nothing": no answer (the claimant asks again).
                     self.bk.seal_unreadable = false;
@@ -686,6 +688,7 @@ impl Core {
                     key: prev_key,
                     kept: false,
                     tenure: (0, 0),
+                    closed_hold: false,
                 },
             });
         }
@@ -859,6 +862,7 @@ impl Core {
                         key,
                         kept: false,
                         tenure: (0, 0),
+                        closed_hold: false,
                     },
                 });
             }

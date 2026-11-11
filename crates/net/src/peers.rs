@@ -2131,6 +2131,7 @@ async fn handle_stream<S: PeerService>(
                 key,
                 kept,
                 tenure,
+                closed_hold,
             } => Some(
                 service
                     .seal_tail_requested(
@@ -2138,7 +2139,7 @@ async fn handle_stream<S: PeerService>(
                         req_id,
                         (epoch, config_version, from_seq),
                         key,
-                        (kept, tenure),
+                        (kept, tenure, closed_hold),
                     )
                     .await,
             ),

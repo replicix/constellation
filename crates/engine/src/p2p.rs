@@ -301,7 +301,7 @@ impl constellation_net::PeerService for P2pBridge {
         req_id: u64,
         (epoch, config_version, from_seq): (u64, u64, u64),
         key: constellation_net::LeaseKeyWire,
-        (kept, tenure): (bool, (u64, u64)),
+        (kept, tenure, closed_hold): (bool, (u64, u64), bool),
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -334,6 +334,7 @@ impl constellation_net::PeerService for P2pBridge {
                     },
                     kept,
                     tenure,
+                    closed_hold,
                     reply,
                 })
                 .is_err()

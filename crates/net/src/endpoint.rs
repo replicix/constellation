@@ -1573,7 +1573,7 @@ pub trait PeerService: Send + Sync + 'static {
         req_id: u64,
         (epoch, _config_version, _from_seq): (u64, u64, u64),
         _key: crate::LeaseKeyWire,
-        _kept: (bool, (u64, u64)),
+        _kept: (bool, (u64, u64), bool),
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::SealedTail {
