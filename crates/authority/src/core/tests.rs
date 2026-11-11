@@ -69648,7 +69648,7 @@ mod route_fence_executor {
 
     /// Node 3, the designee of sticky generation 7 over `/d1`, installed and
     /// honoured; the lease holder is node 1.
-    fn designee() -> (Harness, constellation_fs_core::Ino) {
+    pub(super) fn designee() -> (Harness, constellation_fs_core::Ino) {
         let mut h = Harness::new(3);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
@@ -70382,7 +70382,7 @@ mod route_fence_executor {
     /// loop: once the node holds the lease, the loop's `delegation_sync`
     /// would end its own generation (the window these tests are about is the
     /// one before it does).
-    fn forward_direct(
+    pub(super) fn forward_direct(
         h: &mut Harness,
         dir: constellation_fs_core::Ino,
         from: NodeId,
@@ -70435,7 +70435,7 @@ mod route_fence_executor {
             .collect()
     }
 
-    fn refusals_of(h: &Harness, gen: u64, from: NodeId, seq: u64) -> Vec<Code> {
+    pub(super) fn refusals_of(h: &Harness, gen: u64, from: NodeId, seq: u64) -> Vec<Code> {
         let want = Rid {
             node: from,
             incarnation: 1,
@@ -70450,7 +70450,7 @@ mod route_fence_executor {
             .collect()
     }
 
-    fn completed_in(h: &Harness, gen: u64, from: NodeId, seq: u64) -> bool {
+    pub(super) fn completed_in(h: &Harness, gen: u64, from: NodeId, seq: u64) -> bool {
         let want = Rid {
             node: from,
             incarnation: 1,
@@ -70578,31 +70578,6 @@ mod route_fence_executor {
         assert_eq!(h.core.stats.deleg_fenced_forwards, fenced);
         assert_eq!(h.core.dl.mine[&7].parked.len(), 1);
         assert_eq!(h.core.stats.holder_inbox_refusals, 0);
-    }
-
-    /// A deposed root-designee has no `Completed` row for the inbox-ever rid
-    /// it was offered, before or after its deposition: nothing for a
-    /// successor's `EROFS` to contradict (G1).
-    #[test]
-    fn the_successor_never_refuses_what_a_root_designee_ran() {
-        let (mut h, d1) = designee();
-        h.hold(5, None);
-        let out = forward_direct(&mut h, d1, 2, 1, 1, (0, 0, true));
-        assert_eq!(
-            outcome_to(&out, 2),
-            Some(MutateOutcome::Errno(Code::ReadOnly)),
-            "{out:?}"
-        );
-        // Deposed: the lease moves on, and the retry comes again.
-        h.core.lease.lost = true;
-        let out = forward_direct(&mut h, d1, 2, 2, 1, (0, 0, true));
-        assert_eq!(
-            outcome_to(&out, 2),
-            Some(MutateOutcome::Errno(Code::ReadOnly)),
-            "{out:?}"
-        );
-        assert!(!completed_in(&h, 7, 2, 1));
-        assert_eq!(refusals_of(&h, 7, 2, 1), vec![Code::ReadOnly]);
     }
 
     /// The negative control: with `holder_runs_inbox_ever` the lease holder
@@ -71143,6 +71118,44 @@ mod route_fence_root {
         }
         assert_eq!(h.core.stats.inbox_ever_redirects, 2);
         assert_eq!(h.core.stats.root_touched_holds, 0);
+    }
+
+    /// Fence C9 (G1), two cores: node 3 holds the lease and is the designee
+    /// of non-stealable generation 7; node 1 is its successor as root (it has
+    /// not appended node 3's stream rows) and refuses an untouched
+    /// inbox-ever rid for good (row 8). The rid reaches node 3 first, then
+    /// node 1 (the requester's answer was lost, or the lease moved). Node 3's
+    /// stream never holds a `Completed` of a rid node 1 then refuses: it holds
+    /// a `Refused` row instead. With `holder_runs_inbox_ever` node 3 ran it:
+    /// the two answers contradict (the control; fails on the parent in the
+    /// first half).
+    #[test]
+    fn the_successor_never_refuses_what_a_root_designee_ran() {
+        use super::route_fence_executor as ex;
+        for knob in [false, true] {
+            let (mut a, a_d1) = ex::designee();
+            a.core.cfg.holder_runs_inbox_ever = knob;
+            a.hold(5, None);
+            let out = ex::forward_direct(&mut a, a_d1, 2, 1, 1, (0, 0, true));
+            let a_ran = ex::completed_in(&a, 7, 2, 1);
+            let a_answer = outcome_to(&out, 2);
+            // The successor: the same rid, inbox-ever, untouched.
+            let (mut b, d1, _gen) = sticky_root();
+            let op = create_in(&b, d1, "f1");
+            let out = forward_ever(&mut b, 2, 2, 1, op, false, (0, 0), true);
+            let b_refused = outcome_to(&out, 2) == Some(MutateOutcome::Errno(Code::ReadOnly));
+            assert!(b_refused, "{out:?}");
+            if knob {
+                assert!(
+                    a_ran && matches!(a_answer, Some(MutateOutcome::Accepted { .. })),
+                    "the control did not run the forward: {a_answer:?}"
+                );
+            } else {
+                assert!(!a_ran, "node 3 ran what node 1 then refused");
+                assert_eq!(a_answer, Some(MutateOutcome::Errno(Code::ReadOnly)));
+                assert_eq!(ex::refusals_of(&a, 7, 2, 1), vec![Code::ReadOnly]);
+            }
+        }
     }
 
     /// Row 4: a rid that has its outcome here is answered from it, not
