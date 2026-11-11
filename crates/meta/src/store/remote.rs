@@ -281,6 +281,27 @@ pub(crate) fn remote_pending_from_tx(
     Ok(out)
 }
 
+/// Every node's live remote-pending rows (marks with their pending row),
+/// per inode: the chunks another node was to upload.
+pub(crate) fn remote_pending_all_tx(
+    r: &impl Readable,
+    meta: &Meta,
+) -> Result<PoisonMap, MetaError> {
+    let mut out = PoisonMap::new();
+    for guard in r.prefix(&meta.local, REMOTE_PREFIX) {
+        let (k, v) = guard.into_inner()?;
+        let Some(mark) = decode_mark(&k, &v) else {
+            continue;
+        };
+        if r.get(&meta.pending_upload, cr_key(&mark.hash, mark.ino))?
+            .is_some()
+        {
+            out.entry(mark.ino).or_default().insert(mark.hash);
+        }
+    }
+    Ok(out)
+}
+
 /// What a forwarded op's transaction, and the position it was evaluated
 /// at, wait for from the node that forwarded it
 /// ([`Meta::remote_blockers`]).

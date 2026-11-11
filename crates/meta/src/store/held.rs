@@ -323,9 +323,14 @@ pub struct HeldSummary {
     /// Plan 30 §M7: transactions deferred (not held) because a chunk
     /// their manifest names is still uploading.
     pub deferred: u64,
-    /// ADR-58 C3: the rids of the held and the deferred transactions: those
-    /// that wait for a chunk that is not durable (`Meta::rid_behind_lost_chunk`).
-    pub rids: BTreeSet<crate::rid::Rid>,
+    /// ADR-58 C3: the rids of the transactions that may be behind a lost
+    /// chunk (`Meta::rid_behind_lost_chunk`): the *held* ones (a poisoned
+    /// chunk exists nowhere), and the deferred ones that wait for another
+    /// node's pending upload (its uploader may never return). A row that
+    /// waits for this node's own upload ships by itself and is not here.
+    /// Shared, so that cloning the summary (`Meta::held`) costs nothing per
+    /// rid.
+    pub rids: std::sync::Arc<BTreeSet<crate::rid::Rid>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -580,7 +585,8 @@ type Held = (Tx, Vec<Ino>, Option<Vec<Vec<u8>>>);
 struct Plan {
     ship: Vec<Tx>,
     held: Vec<Held>,
-    /// The rid of each held or deferred transaction that has one.
+    /// The rid of each held transaction, and of each one deferred behind
+    /// another node's pending upload, that has one.
     held_rids: Vec<crate::rid::Rid>,
     deferred: Vec<Tx>,
     opaque: bool,
@@ -866,7 +872,12 @@ fn plan(
                 out.held.push((tx, seeds, keys))
             }
             Class::Deferred => {
-                out.held_rids.extend(rid);
+                // (Deferred for another node's pending upload: the blame on
+                // the remote-pending rows is not empty. One that waits for
+                // this node's own upload ships by itself and is not counted.)
+                if out.blame.get(&tx.first).is_some_and(|b| !b.is_empty()) {
+                    out.held_rids.extend(rid);
+                }
                 out.deferred.push(tx)
             }
             Class::Ship => out.ship.push(tx),
@@ -1108,7 +1119,7 @@ fn summarize(plan: &Plan, poisoned: &PoisonMap) -> HeldSummary {
         inodes,
         opaque: plan.opaque,
         deferred: plan.deferred.len() as u64,
-        rids: plan.held_rids.iter().copied().collect(),
+        rids: std::sync::Arc::new(plan.held_rids.iter().copied().collect()),
     }
 }
 
@@ -1218,7 +1229,19 @@ impl Meta {
             return self.take_journal_whole_txs(max);
         }
         self.held_work.fetch_add(1, Ordering::Relaxed);
-        let plan = plan(&r, self, &poisoned, &pending, None)?;
+        // ADR-58 C3: what is deferred for another node's pending upload
+        // (its uploader may never return) is told apart from what waits for
+        // this node's own upload, by the blame on the remote-pending rows.
+        let remote = if pending.is_empty() {
+            PoisonMap::new()
+        } else {
+            super::remote::remote_pending_all_tx(&r, self)?
+        };
+        let blame = (!remote.is_empty()).then_some(Blame {
+            theirs: &remote,
+            rid: None,
+        });
+        let plan = plan(&r, self, &poisoned, &pending, blame)?;
         // Whether rows may be skipped (the session counts a read that
         // timed out meanwhile as `degraded_held`).
         self.held_any.store(
@@ -1270,11 +1293,13 @@ impl Meta {
         self.held.lock().unwrap().clone()
     }
 
-    /// ADR-58 C3: whether the last ship plan holds or defers `rid`'s
-    /// transaction: its row waits for a chunk that is not durable anywhere
-    /// the root can reach (poisoned, or pending on a member that may never
-    /// return). The sim's oracle decides, from its chunk ledger, whether
-    /// that chunk is lost. As fresh as the last ship round.
+    /// ADR-58 C3: whether the last ship plan *holds* `rid`'s transaction
+    /// (its row is a poisoned seed or depends on one: the chunk exists
+    /// nowhere), or defers it behind another node's pending upload (the
+    /// uploader may never return). A row that waits for this node's own
+    /// upload ships by itself and is not behind a lost chunk. The sim's
+    /// oracle checks the claim against its chunk ledger. As fresh as the
+    /// last ship round.
     pub fn rid_behind_lost_chunk(&self, rid: crate::rid::Rid) -> bool {
         self.held.lock().unwrap().rids.contains(&rid)
     }
@@ -1796,6 +1821,68 @@ mod tests {
             r,
             LogRecord::Refused { rid: r, .. } if *r == rid(1)
         )));
+    }
+
+    /// ADR-58 M1 (review): a transaction waiting for this node's own upload is
+    /// not behind a lost chunk. The refusal of an op that touched a file
+    /// whose chunk is still uploading here is merely deferred: it ships by
+    /// itself, and its rid is not `rid_behind_lost_chunk`. Deferred behind
+    /// another node's pending upload (named explicitly) it is, and held
+    /// behind a poisoned chunk it is.
+    #[test]
+    fn a_row_deferred_for_its_own_upload_is_not_behind_a_lost_chunk() {
+        use crate::mutate::MutateOp;
+        use crate::rid::Rid;
+        use crate::MetaStore;
+        use constellation_fs_core::types::ROOT_INO;
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_holder_epoch(1);
+        let f0 = meta.create(ROOT_INO, "f0", 0o644, 0, 0).unwrap().ino;
+        meta.take_shippable(usize::MAX).unwrap();
+        let hash = ChunkHash::of(b"slow");
+        let manifest = Manifest {
+            layout: constellation_fs_core::ChunkLayout::new(4096),
+            file_len: 4,
+            chunks: ChunkInfo::Inline(BTreeMap::from([(0u64, hash)])),
+        }
+        .encode();
+        meta.set_manifest_dirty(f0, None, &manifest, 4, None, None, &[hash])
+            .unwrap();
+        let rid = Rid {
+            node: 9,
+            incarnation: 1,
+            seq: 1,
+        };
+        let op = MutateOp::Link {
+            ino: f0,
+            parent: ROOT_INO,
+            name: "f0".into(),
+        };
+        meta.journal_refusal(rid, constellation_types::Code::Exists, Some(&op))
+            .unwrap();
+        // The chunk is still uploading: the planner defers the write and,
+        // after it, the refusal.
+        meta.take_shippable(usize::MAX).unwrap();
+        assert_eq!(meta.held_summary().deferred, 2, "{:?}", meta.held_summary());
+        assert!(
+            !meta.rid_behind_lost_chunk(rid),
+            "a row waiting for an upload is not behind a lost chunk"
+        );
+        // The chunk is another node's pending upload (its uploader may never
+        // return): the refusal is still deferred, and now it counts.
+        meta.enroll_remote_chunks(f0, &[hash], 5).unwrap();
+        meta.take_shippable(usize::MAX).unwrap();
+        assert_eq!(meta.held_summary().deferred, 2, "{:?}", meta.held_summary());
+        assert!(
+            meta.rid_behind_lost_chunk(rid),
+            "deferred behind another node's pending upload: {:?}",
+            meta.held_summary()
+        );
+        // The chunk is lost: the same refusal is held.
+        meta.note_unrecoverable_chunks(&[(hash, f0)], false)
+            .unwrap();
+        meta.take_shippable(usize::MAX).unwrap();
+        assert!(meta.rid_behind_lost_chunk(rid), "{:?}", meta.held_summary());
     }
 
     // ---- chunk close-stall-followup: the blame is the ship rule's ----

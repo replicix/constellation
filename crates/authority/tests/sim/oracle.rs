@@ -263,18 +263,69 @@ pub struct Unsettled {
     /// was cut over the whole withdraw window. The op may land after the
     /// `EIO`: allowed, counted apart from every reachability class.
     pub isolated_from_s3: bool,
-    /// ADR-58 C3, `held-behind-lost-chunk`: the settle was told the op's row
-    /// waits for a chunk and global truth agrees at the `EIO` (the sim's chunk
-    /// ledger has a chunk dirty on a node gone for good, in no bucket) while
-    /// the verdict would have been a violation. Allowed, counted apart, once the end of the run
-    /// agrees too (`count_unsettled`).
-    pub held_lost_chunk: bool,
-    /// Some node's ship plan held or deferred the rid's transaction at the
-    /// `EIO` (`held_lost_chunk` needs it, or an operator's drop of the rid).
+    /// ADR-58 C3, `held-behind-lost-chunk`: the requester's settle was told the
+    /// op's row waits behind a lost chunk (its word only; `count_unsettled`
+    /// checks it against global truth).
+    pub lost_chunk_label: bool,
+    /// Global truth at the `EIO`: the sim's chunk ledger has a chunk that
+    /// exists nowhere (lost from a disk, or dirty only on a node gone for
+    /// good and in no bucket).
+    pub chunk_lost: bool,
+    /// Some node's ship plan held the rid's transaction (a poisoned chunk), or
+    /// deferred it behind another node's pending upload, at the `EIO`; one
+    /// that waits for the node's own upload does not count.
     pub plan_held: bool,
+    /// When the `EIO` was told (`tokio` time, as the drops' and the log's).
+    pub at: tokio::time::Instant,
 }
 
 impl Unsettled {
+    /// ADR-58 C3, `held-behind-lost-chunk`, judged at the run's end against
+    /// global truth. The `EIO` of a rid whose sequencer was reachable (a
+    /// would-be violation) is the class only if a chunk was lost at the
+    /// `EIO` and either
+    ///  - an operator's `repair drop-held` rolled the rid back at or after
+    ///    the `EIO` (a drop before it ran when a sequencer could already
+    ///    settle the rid), or
+    ///  - the requester said so, some ship plan held the rid's transaction
+    ///    (or deferred it behind another node's pending upload) at the `EIO`,
+    ///    and the rid's outcome reached the log only after the first drop at
+    ///    or after the `EIO`, or never:
+    ///    a row that shipped by itself, with no drop, was not behind a lost
+    ///    chunk.
+    ///
+    /// Nothing the run did elsewhere (a drop of another inode, an unrelated
+    /// lost chunk, a landing before the first drop) converts anything.
+    pub fn held_lost_chunk(
+        &self,
+        world: &super::chunks::ChunkWorld,
+        archive: &ArchiveIndex,
+    ) -> bool {
+        // The negative control's other half (`AUTHORITY_SIM_LOST_CHUNK_TRUST_LABEL`,
+        // with `AUTHORITY_SIM_LOST_CHUNK_LABEL_ALWAYS`): an oracle that takes
+        // the requester's word. The sweeps must then show fewer violations
+        // than the real oracle's: the checks below are what holds the line.
+        if std::env::var_os("AUTHORITY_SIM_LOST_CHUNK_TRUST_LABEL").is_some() {
+            return !self.verdict.allowed() && self.lost_chunk_label;
+        }
+        if self.verdict.allowed() || !self.chunk_lost {
+            return false;
+        }
+        if world.rolled_back_from(self.rid, self.at) {
+            return true;
+        }
+        self.lost_chunk_label
+            && self.plan_held
+            && match (
+                archive.first_outcome_arrived(self.rid),
+                world.first_drop_from(self.at),
+            ) {
+                (None, _) => true,
+                (Some(landed), Some(drop)) => landed >= drop,
+                (Some(_), None) => false,
+            }
+    }
+
     /// A key for counting the causes: `isolated`, or how a sequencer was
     /// reachable and what its core was busy with.
     pub fn cause(&self) -> String {
@@ -593,6 +644,7 @@ impl Oracles {
         accepted_by_delegate: bool,
         withdraw_failed: bool,
         lost_chunk_label: bool,
+        chunk_lost: bool,
     ) {
         let at = self.reach.now_ms();
         // ADR-47 (§8.3): the requester's label is its own word. It counts as
@@ -658,14 +710,10 @@ impl Oracles {
                 .s3_cut_throughout(node, end.saturating_sub(window_ms), end)
         };
         let isolated_from_s3 = s3_cut && !verdict.allowed();
-        // ADR-58 C3: `lost_chunk_label` is the requester's word, already
-        // checked against the chunk ledger by the caller; it converts a
-        // violation only, and only if some node's ship plan really holds or
-        // defers the rid's transaction (`plan_held`; or an operator's drop
-        // rolled it back, which `count_unsettled` reads at the run's end: the
-        // knob that labels every `Held` must not hide a stall with another
-        // cause).
-        let held_lost_chunk = lost_chunk_label && !verdict.allowed();
+        // ADR-58 C3: what the requester said, what the ledger says now and
+        // what the ship plans hold now are all noted; `count_unsettled`
+        // decides at the run's end, with the rest of global truth (the drops
+        // and the landings), whether the `EIO` is `held-behind-lost-chunk`.
         let plan_held = self
             .stores
             .lock()
@@ -685,8 +733,10 @@ impl Oracles {
             verdict,
             designation_held,
             silence,
-            held_lost_chunk,
+            lost_chunk_label,
+            chunk_lost,
             plan_held,
+            at: tokio::time::Instant::now(),
         });
     }
 
@@ -923,6 +973,9 @@ struct ArchiveInner {
     /// stored (each seq once): the size of the log the run wrote, for the
     /// sweeps' comparison of two builds (`SWEEP-SEGMENTS`).
     landed: (u64, u64, u64),
+    /// When each segment first arrived (ADR-58 C3: when a rid's outcome
+    /// reached the log, for the end-of-run half of `held-behind-lost-chunk`).
+    arrived: HashMap<Seq, tokio::time::Instant>,
 }
 
 impl Default for ArchiveIndex {
@@ -963,6 +1016,9 @@ impl ArchiveIndex {
     /// As [`Self::note`], for a decoded segment (the unit tests').
     pub fn note_segment(&self, seq: Seq, seg: Segment) {
         let mut g = self.inner.lock().unwrap();
+        g.arrived
+            .entry(seq)
+            .or_insert_with(tokio::time::Instant::now);
         g.segments.entry(seq).or_insert_with(|| Arc::new(seg));
         // Tolerate out-of-order arrival: only extend the prefix while the
         // next segment is here.
@@ -1026,6 +1082,14 @@ impl ArchiveIndex {
         let (seq, i, code) = *g.outcomes.get(&rid)?;
         (code == want).then_some(())?;
         Some((seq, i, g.segments.get(&seq)?.clone()))
+    }
+
+    /// When the segment carrying `rid`'s first outcome arrived in the
+    /// bucket (`None`: no outcome of the rid is in the applied log).
+    pub fn first_outcome_arrived(&self, rid: Rid) -> Option<tokio::time::Instant> {
+        let g = self.inner.lock().unwrap();
+        let (seq, _, _) = *g.outcomes.get(&rid)?;
+        g.arrived.get(&seq).copied()
     }
 
     /// The archive's first outcome of `rid`: its segment and code (`None`:
@@ -3518,22 +3582,126 @@ mod tests {
     #[test]
     fn an_unbacked_designation_label_is_dropped() {
         let o = Oracles::new(Bucket::new(1, (0, 0)));
-        o.note_unsettled(3, rid(3, 1), 1_000, None, true, false, false, false);
+        o.note_unsettled(3, rid(3, 1), 1_000, None, true, false, false, false, false);
         let u = o.unsettled.lock().unwrap();
         assert_eq!(u.len(), 1);
         assert!(!u[0].designation_held, "{:?}", u[0]);
     }
 
-    /// ADR-58 C3: the `held-behind-lost-chunk` label is the requester's word;
-    /// with no node's ship plan holding the rid's transaction it is refused,
-    /// whatever the verdict (the knob that labels every `Held` hides nothing).
+    /// ADR-58 C3: the ship plan's word. The `held-behind-lost-chunk` label
+    /// needs a plan that *holds* the rid's transaction: a row that is merely
+    /// deferred (its chunk is still uploading, it ships by itself) is not
+    /// behind a lost chunk, and the knob that labels every `Held` cannot make
+    /// it one (review M1, S6).
     #[test]
-    fn a_lost_chunk_label_without_a_held_row_is_refused() {
+    fn a_deferred_row_is_not_plan_held_but_a_held_one_is() {
+        use constellation_fs_core::{ChunkHash, ChunkInfo, ChunkLayout, Manifest};
+        use constellation_meta::MetaStore;
         let o = Oracles::new(Bucket::new(1, (0, 0)));
-        o.note_unsettled(3, rid(3, 1), 1_000, None, false, false, false, true);
-        let u = o.unsettled.lock().unwrap();
-        assert_eq!(u.len(), 1);
-        assert!(!u[0].held_lost_chunk, "{:?}", u[0]);
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        meta.set_holder_epoch(1);
+        o.stores.lock().unwrap().insert(1, meta.clone());
+        let f0 = meta.create(ROOT_INO, "f0", 0o644, 0, 0).unwrap().ino;
+        meta.take_journal_grouped(usize::MAX).unwrap();
+        let hash = ChunkHash::of(b"slow");
+        let manifest = Manifest {
+            layout: ChunkLayout::new(4096),
+            file_len: 4,
+            chunks: ChunkInfo::Inline(BTreeMap::from([(0u64, hash)])),
+        }
+        .encode();
+        meta.set_manifest_dirty(f0, None, &manifest, 4, None, None, &[hash])
+            .unwrap();
+        let op = MutateOp::Link {
+            ino: f0,
+            parent: ROOT_INO,
+            name: "f0".into(),
+        };
+        let r = rid(9, 1);
+        meta.journal_refusal(r, Code::Exists, Some(&op)).unwrap();
+        // Still uploading: deferred.
+        meta.take_journal_grouped(usize::MAX).unwrap();
+        // (Requester says so, and a chunk is lost elsewhere in the run.)
+        o.note_unsettled(3, r, 1_000, None, false, false, false, true, true);
+        assert!(!o.unsettled.lock().unwrap()[0].plan_held);
+        // Lost: held.
+        meta.note_unrecoverable_chunks(&[(hash, f0)], false)
+            .unwrap();
+        meta.take_journal_grouped(usize::MAX).unwrap();
+        o.note_unsettled(3, r, 1_000, None, false, false, false, true, true);
+        assert!(o.unsettled.lock().unwrap()[1].plan_held);
+    }
+
+    /// ADR-58 C3, the end-of-run half (review M1): the class needs a lost
+    /// chunk at the `EIO`, a drop that comes at or after it, and a rid that
+    /// reaches the log only after that drop (or never).
+    #[test]
+    fn the_end_of_run_half_of_the_lost_chunk_class() {
+        use super::super::chunks::ChunkWorld;
+        let reachable = super::super::reach::Verdict::Reachable {
+            via: super::super::reach::Via::LeasePath,
+            from_ms: 0,
+            to_ms: 1,
+            busy: "idle".into(),
+            ever: "idle".into(),
+        };
+        let r = rid(9, 1);
+        let mk = |label: bool, chunk_lost: bool, plan_held: bool| {
+            let o = Oracles::new(Bucket::new(1, (0, 0)));
+            let mut u = {
+                o.note_unsettled(3, r, 1_000, None, false, false, false, label, chunk_lost);
+                o.unsettled.lock().unwrap()[0].clone()
+            };
+            u.verdict = reachable.clone();
+            u.plan_held = plan_held;
+            u
+        };
+        let tick = |ms: u64| {
+            // (Paused time is the sim's; here only the order matters.)
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        };
+        let world = ChunkWorld::new();
+        let archive = ArchiveIndex::default();
+        // No drop at all: the row never landed: the class (held, labelled).
+        let u = mk(true, true, true);
+        assert!(u.held_lost_chunk(&world, &archive));
+        // A label without a held plan, or without a lost chunk: no.
+        assert!(!mk(true, true, false).held_lost_chunk(&world, &archive));
+        assert!(!mk(true, false, true).held_lost_chunk(&world, &archive));
+        assert!(!mk(false, true, true).held_lost_chunk(&world, &archive));
+        // The row landed by itself, with no drop after the `EIO`: not the
+        // class. Nor if a drop comes later than the landing.
+        tick(2);
+        archive.note_segment(1, seg(1, &[r]));
+        assert!(!u.held_lost_chunk(&world, &archive));
+        tick(2);
+        world.note_drop([]);
+        assert!(
+            !u.held_lost_chunk(&world, &archive),
+            "landed before the first drop"
+        );
+        // A later drop, and a rid that landed after it: the class.
+        let world2 = ChunkWorld::new();
+        let archive2 = ArchiveIndex::default();
+        let u3 = mk(true, true, true);
+        tick(2);
+        world2.note_drop([]);
+        tick(2);
+        archive2.note_segment(1, seg(1, &[r]));
+        assert!(u3.held_lost_chunk(&world2, &archive2));
+        // A rid rolled back by a drop at or after the `EIO` is the class on
+        // its own; one rolled back before it is not.
+        let u4 = mk(false, true, false);
+        let world3 = ChunkWorld::new();
+        assert!(!u4.held_lost_chunk(&world3, &archive));
+        tick(2);
+        world3.note_drop([r]);
+        assert!(u4.held_lost_chunk(&world3, &archive));
+        let world4 = ChunkWorld::new();
+        world4.note_drop([r]);
+        tick(2);
+        let u5 = mk(false, true, false);
+        assert!(!u5.held_lost_chunk(&world4, &archive));
     }
 
     /// Late-landing U1(a): an in-doubt answer after a failed tombstone, with
@@ -3548,7 +3716,7 @@ mod tests {
             if cut {
                 o.reach.s3_cut_at(0, 3, true);
             }
-            o.note_unsettled(3, r1, 1_000, None, false, false, true, false);
+            o.note_unsettled(3, r1, 1_000, None, false, false, true, false, false);
             *o.invokes.lock().unwrap() = vec![(r1, 5), (r2, 11)];
             let in_doubt = [(3u64, r1, 0u64, 10u64)];
             end_of_run(

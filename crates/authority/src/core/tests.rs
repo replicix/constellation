@@ -11052,6 +11052,13 @@ mod epoch_rules {
             panic!("no settle deadline: {out:?}")
         };
         let until = h.core.clients[&rid].settle_until;
+        // (ADR-58 M3: one settle window from the freeze, although the op
+        // was submitted just now and the client's deadline is far.)
+        assert_eq!(
+            until,
+            h.clk().wait.plus(h.core.dl_t().settle_window),
+            "the settle runs one window"
+        );
         h.advance(until.since(h.clk().wait).max(0) as u64);
         let out = h.step(Event::Timer { id: deadline });
         let r = replies(&out);
@@ -57375,6 +57382,71 @@ mod c2g_settle {
         assert_eq!(run(false), (false, 0));
     }
 
+    /// ADR-58 S4: the label is the last answer's word: a settle that heard
+    /// `Held { lost_chunk }` and is then told a plain `Held` (the row has
+    /// shipped since, or another sequencer answers) is not labelled.
+    #[test]
+    fn a_later_plain_held_takes_the_lost_chunk_label_back() {
+        let (_holder, mut requester) = pair();
+        requester.core.track_unsettled_designation();
+        let rid = requester.rid(1);
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: requester.create("x"),
+            tag: Default::default(),
+        });
+        let first = deadline_timer(&requester, &out);
+        let cfg = requester.core.config().clone();
+        requester
+            .advance(Deadlines::new(&cfg).client_deadline - Deadlines::new(&cfg).settle_window);
+        let out = requester.step(Event::Timer { id: first });
+        let reply = |requester: &mut Harness, out: &[Action], lost_chunk: bool| {
+            let Some(PeerMsg::MutateRequest {
+                req, settle: true, ..
+            }) = forward_to_1(out)
+            else {
+                panic!("no settle: {out:?}");
+            };
+            requester.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::MutateReply {
+                    req,
+                    outcome: MutateOutcome::Held {
+                        retry_ms: 10,
+                        outwait_ms: None,
+                        lost_chunk,
+                    },
+                    base: None,
+                    position: constellation_meta::Position::ZERO,
+                    gen: 0,
+                    own_chunks: OwnChunks::None,
+                    own_rows: None,
+                    committed: false,
+                },
+            });
+        };
+        reply(&mut requester, &out, true);
+        assert!(requester.core.clients[&rid].lost_chunk_held);
+        // The retry timer fires and the settle goes out again.
+        let retry = requester.core.clients[&rid].timer.expect("a retry timer");
+        requester.advance(100);
+        let out = requester.step(Event::Timer { id: retry });
+        reply(&mut requester, &out, false);
+        assert!(!requester.core.clients[&rid].lost_chunk_held);
+        let id = requester.core.clients[&rid].deadline;
+        requester.advance(requester.core.dl_t().settle_window);
+        let out = requester.step(Event::Timer { id });
+        assert!(
+            replies(&out)
+                .iter()
+                .any(|(x, a)| *x == rid && matches!(a, ClientReply::InDoubt)),
+            "{out:?}"
+        );
+        assert!(!requester.core.take_unsettled_lost_chunk(rid));
+        assert_eq!(requester.core.stats.unsettled_held_lost_chunk, 0);
+    }
+
     /// A forward whose holder never answered (the request lost): at the
     /// deadline, a settle window before the old one, the requester settles
     /// the rid instead of answering in doubt — one settle, under the same
@@ -57575,6 +57647,17 @@ mod c2g_settle {
             "the EIO came before the window ({waited} < {window})"
         );
         assert!(waited < last, "no EIO within the deadline and a margin");
+        // ADR-58 M3: one settle window from the freeze (a step of the loop
+        // and a backoff of slack), not the client deadline (twice the lease
+        // TTL after the submission, four windows).
+        assert!(
+            waited <= window + 300,
+            "the EIO came {waited} ms after the freeze, the window is {window} ms"
+        );
+        assert!(
+            window * 2 < Deadlines::new(&cfg).client_deadline,
+            "the pin tells a window from the client deadline"
+        );
         assert_eq!(requester.core.stats.client_unsettled_eio, 1);
     }
 
