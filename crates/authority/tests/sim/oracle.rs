@@ -1919,6 +1919,35 @@ fn deleg_group(
                  and the delegate {answerer}, a member, holds the row in its own journal"
             ));
         }
+        // The same copy when the hold's owner answers its own node's client:
+        // the delegate, a member of the hold's epoch, holds the row in its
+        // own journal under its origin, which is what the member's
+        // `StreamAheadAck` counts (the delivered-back batch installs nothing
+        // there, so no streamed speculation shows). `locks-blips-tight-delegated`
+        // seed 1175.
+        if held || hold_now {
+            let members = o.hold_members.lock().unwrap();
+            let member_holds = |n: &NodeId| -> bool {
+                *n != answerer
+                    && Some(*n) != holder
+                    && o.store(*n).is_some_and(|m| {
+                        Replica::journal_txs_from(&*m, 0, usize::MAX)
+                            .iter()
+                            .any(|x| x.origin == (g, i) && carries_as(&x.records, rid, want))
+                    })
+            };
+            if let Some(n) = epochs
+                .iter()
+                .filter_map(|ep| members.get(ep))
+                .flat_map(|m| m.iter())
+                .find(|n| member_holds(n))
+            {
+                return Ok(format!(
+                    "no backup recorded; the root journal holds ({g},{i}) in an epoch hold \
+                     and the delegate {n}, a member, holds the row in its own journal"
+                ));
+            }
+        }
         if bs.is_empty() {
             return Err(format!(
                 "no backup recorded; the root journal holds ({g},{i}) but the tenure of \
@@ -4603,6 +4632,32 @@ mod tests {
         w.o.epoch_holds.lock().unwrap().insert(1);
         let j = w.judge(2, &st, r);
         assert_eq!(j.class, Some(Judged::Group), "{}", j.detail);
+    }
+
+    /// `locks-blips-tight-delegated` seed 1175: the hold's owner answers its
+    /// own node's client for the row of a delegate that is a member of the
+    /// hold. The member's `StreamAheadAck` counts the row in its own journal
+    /// (the delivered-back batch installs no streamed speculation), so that
+    /// copy is the group's second one for the owner's answer too; a delegate
+    /// that is no member of the hold's epoch is not.
+    #[test]
+    fn i1_deleg_group_counts_a_member_delegate_for_the_owner_answer() {
+        let w = world();
+        let r = rid(3, 1);
+        let st = AnswererState::default();
+        root_appended_row(&w);
+        w.lease(1, 1, &[]);
+        w.o.appended
+            .lock()
+            .unwrap()
+            .insert((1, 1), (1, vec![], true));
+        w.o.note_hold_members(1, &[1, 3]);
+        let j = w.judge(1, &st, r);
+        assert_eq!(j.class, None, "a non-member delegate: {}", j.detail);
+        w.o.note_hold_members(1, &[2]);
+        let j = w.judge(1, &st, r);
+        assert_eq!(j.class, Some(Judged::Group), "{}", j.detail);
+        assert!(j.detail.contains("own journal"), "{}", j.detail);
     }
 
     #[test]
