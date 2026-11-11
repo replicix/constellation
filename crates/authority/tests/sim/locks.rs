@@ -826,6 +826,8 @@ fn same(cluster: &Cluster, node: NodeId, inc: u32) -> Option<Arc<NodeHandle>> {
     (h.alive() && h.shared.incarnation.load(Ordering::SeqCst) == inc).then_some(h)
 }
 
+// (A control answer lives for one await; `DroppedHeld` carries the rows of a drop.)
+#[allow(clippy::large_enum_variant)]
 enum Awaited {
     Answer(Result<ControlOk, String>),
     /// The node died meanwhile (its answer channels are dropped with it,

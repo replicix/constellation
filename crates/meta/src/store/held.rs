@@ -380,6 +380,21 @@ pub struct DroppedHeld {
     pub rolled_back: Vec<crate::rid::Rid>,
     /// Of `rolled_back`, the rids queued as placeholders (`await_retry`).
     pub placeholders: Vec<crate::rid::Rid>,
+    /// ADR-59: of `rolled_back`, the rids that depend on the damaged inode's
+    /// own keys: the seeds, the queued replays of its manifest, and the held
+    /// transactions that write exclusively a key the seeds or such a
+    /// transaction wrote exclusively (a rename, chmod or unlink of the file,
+    /// a create of a name it vacated). The operator's cost of a lost chunk
+    /// that this drop does not avoid (part B of the ADR is to avoid it). A
+    /// rolled-back rid not listed here depended on the seeds only through a
+    /// directory's merged attributes or a name unrelated to the file, which
+    /// the ship rule no longer orders: the sibling class the ADR removes.
+    /// Empty of dependents under the conservative control (nothing is
+    /// attributed to the inode).
+    pub rolled_back_on_inode: Vec<crate::rid::Rid>,
+    /// The dropper was not the sequencer in force: what it rolled back is a
+    /// deposed node's strand, whose refusals are fenced.
+    pub non_sequencer: bool,
     /// The inode's unrecoverable chunks when the drop ran.
     pub missing: BTreeSet<ChunkHash>,
     /// Of `missing`, the chunks whose pending row and poison mark the drop
@@ -1613,8 +1628,16 @@ impl Meta {
         let mut tainted = Taint::default();
         let mut seeds: Vec<(Tx, u64, u64)> = Vec::new(); // (tx, spec_seq, origin)
                                                          // (spec_seq, origin, the keys a placeholder of it holds)
-        let mut dependents: Vec<(u64, u64, crate::replay::TouchSet)> = Vec::new();
+                                                         // (the last: whether it depends on the damaged inode's own keys)
+        let mut dependents: Vec<(u64, u64, crate::replay::TouchSet, bool)> = Vec::new();
         let mut rolled_back: Vec<crate::rid::Rid> = Vec::new();
+        let mut on_inode: Vec<crate::rid::Rid> = Vec::new();
+        // The exclusive keys of the seeds and of what depends on them through
+        // such keys (`DroppedHeld::rolled_back_on_inode`). The conservative
+        // control folds merges into exclusive keys, which would attribute a
+        // directory's siblings to the inode: it attributes nothing.
+        let mut own: HashSet<Vec<u8>> = HashSet::new();
+        let attribute = !self.parent_taint_conservative.load(Ordering::Relaxed);
         let mut placeholders: Vec<crate::rid::Rid> = Vec::new();
         // The identity of every transaction the drop rolls back, as a
         // member keys it (`LogRecord::RolledBack`).
@@ -1651,6 +1674,10 @@ impl Meta {
                     );
                 }
             }
+            let on_this_inode = attribute && (is_seed || keys.excl.iter().any(|k| own.contains(k)));
+            if on_this_inode {
+                own.extend(keys.excl.iter().cloned());
+            }
             tainted.add(&keys);
             let origin = spec::row_keys_and_origin(&tx, self, spec_seq)?
                 .map(|row| row.origin)
@@ -1658,10 +1685,10 @@ impl Meta {
             if is_seed {
                 seeds.push((t, spec_seq, origin));
             } else {
-                dependents.push((spec_seq, origin, placeholder));
+                dependents.push((spec_seq, origin, placeholder, on_this_inode));
             }
         }
-        let mut seqs: HashSet<u64> = dependents.iter().map(|(seq, _, _)| *seq).collect();
+        let mut seqs: HashSet<u64> = dependents.iter().map(|(seq, _, _, _)| *seq).collect();
         seqs.extend(seeds.iter().map(|(_, seq, _)| *seq));
         let staged = UsageTracker::staging();
         spec::strand_seqs_tx(&mut tx, self, &staged, &seqs)?;
@@ -1669,9 +1696,12 @@ impl Meta {
         // never given is no copy of its op any more, but a placeholder in
         // its place: its requester's retry is the one copy that executes.
         let mut await_retry = 0;
-        for (_, origin, keys) in &dependents {
+        for (_, origin, keys, on_this_inode) in &dependents {
             if let Some(rid) = spec::queued_at(&tx, self, *origin)?.map(|(rid, _)| rid) {
                 rolled_back.push(rid);
+                if *on_this_inode {
+                    on_inode.push(rid);
+                }
             }
             if let Some(rid) = spec::mark_await_retry_tx(
                 &mut tx,
@@ -1730,6 +1760,7 @@ impl Meta {
             spec::refuse_queued_tx(&mut tx, self, *origin, rid, op, refusal(&missing), true)?;
             refused_rids.push(rid);
             rolled_back.push(rid);
+            on_inode.push(rid);
         }
         // Replays of this inode's manifest already queued by an earlier
         // deposition: the same treatment.
@@ -1775,6 +1806,7 @@ impl Meta {
             )?;
             refused_rids.push(queued.rid);
             rolled_back.push(queued.rid);
+            on_inode.push(queued.rid);
             queued_dropped += 1;
         }
         // Fix "capture under an epoch hold": the dropped ops' outcome, in
@@ -1891,6 +1923,8 @@ impl Meta {
             queued_dropped,
             rolled_back,
             placeholders,
+            rolled_back_on_inode: on_inode,
+            non_sequencer: !exclude_rolled_back,
             missing,
             kept_pending,
             kept_for,
