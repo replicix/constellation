@@ -384,6 +384,11 @@
 //!   directory a node stream held comes after that stream's release (or
 //!   end) of it in the root's journal and after every row of that stream
 //!   below the release that touched it.
+//! - `grown_after_release` (ADR-56): every `Grow` record in the root's
+//!   journal names directories that the table shows as the root's before it
+//!   (their old holder's release or end is earlier in the journal), whatever
+//!   the workload: the topology-independent form of "one sequencer per key"
+//!   across a handover.
 //! - `two_subtrees_one_order` (chunk 4): a release is journaled only for an
 //!   op whose keys span node streams (an op between two subtrees of one
 //!   node never recalls).
@@ -2522,6 +2527,20 @@ pub fn released_subtree_sequenced_after_cut(m: &NodeStreamModel, s: &State) -> b
     true
 }
 
+/// ADR-56 (H-I1, H-I2): a stream grows by a directory only after the old
+/// holder's release (or end) of it is in the root's journal: the directories
+/// of every `Grow` record are the root's in the table before it.
+pub fn grown_after_release(m: &NodeStreamModel, s: &State) -> bool {
+    let rows = &s.streams[ROOT as usize].rows;
+    rows.iter().enumerate().all(|(p, r)| match r.kind {
+        RowKind::Grow { dirs, .. } => {
+            let t = table_upto(m, s, p, false, false);
+            bits(dirs).all(|d| t[d] == ROOT)
+        }
+        _ => true,
+    })
+}
+
 /// M1.2's oracle: no answered row of an ended stream lies past its cut,
 /// but for the operator's abandon (chunk 7: exported, I5).
 pub fn acked_at_or_below_cut(s: &State) -> bool {
@@ -4470,6 +4489,9 @@ impl Model for NodeStreamModel {
                 "released_subtree_sequenced_after_cut",
                 |m: &NodeStreamModel, s: &State| released_subtree_sequenced_after_cut(m, s),
             ),
+            Property::always("grown_after_release", |m: &NodeStreamModel, s: &State| {
+                grown_after_release(m, s)
+            }),
             Property::always("two_subtrees_one_order", |_, s: &State| {
                 s.violation
                     .is_none_or(|v| v.property != "two_subtrees_one_order")

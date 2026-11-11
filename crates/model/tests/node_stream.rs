@@ -307,7 +307,9 @@ const TRACES: &[(&str, &str, usize)] = &[
         "ack_implies_committed_by_config",
         9,
     ),
-    ("c7-t4-same-key+grow_before_release", "journal_valid", 6),
+    ("h1+grow_before_release", "journal_valid", 6),
+    ("h1+grow_before_release", "grown_after_release", 6),
+    ("c7-t4+grow_before_release", "grown_after_release", 7),
     ("f1-stale+unfenced_forward", "refused_never_completes", 8),
     (
         "f1-stale+root_ignores_touched",
@@ -1935,22 +1937,39 @@ fn f1_knob_root_ignores_touched_is_found() {
 // hands only by its holder's release row; the root grants the subtree to the
 // dominant writer after it.
 
-/// H1: C7-T4 with route fencing and stale route caches: node 2's first send
-/// into `/D1` goes to node 1 routed by a cache that is not the grant (the
-/// handover's race: a forward that arrives after the release is fenced and
-/// re-routed, never run at the old holder, never refused for good).
+/// H1: the handover with both nodes writing the same key: node 1 holds
+/// `/D1` sticky and creates `D1A`; node 2 forwards a create of `D1A` into it
+/// until the holder releases (the root's request for the dominant writer,
+/// abstracted to the release's guard) and the root grants `/D1` to node 2
+/// (a `DelegateNode` record minting node 2's sticky grant), with route
+/// fencing and stale route caches: node 2's first send goes to node 1 routed
+/// by a cache that is not the grant (the race: a forward that arrives after
+/// the release is fenced and re-routed, never run at the old holder, never
+/// refused for good). The per-key history is recorded, so
+/// `per_key_linearizable` judges that one sequencer ran each key across the
+/// handover (H-I2); with disjoint keys (plain C7-T4) two sequencers on
+/// `/D1` leave every oracle green.
 fn h1() -> NodeStreamModel {
-    let mut m = c7_t4();
+    let mut m = NodeStreamModel::design(vec![vec![], vec![create(D1A)], vec![create(D1A)]])
+        .with_grant(sticky(1, D1))
+        .with_grant(sticky(2, 0))
+        .with_stream_release(1)
+        .with_grow(2, D1);
     m.route_fence = true;
     m.stale_routes = true;
+    m.history = true;
     m
 }
 
-/// H2: H1 and one crash (disk kept): of node 1 after its release row is in
-/// the root's log and before node 2's grant is committed, or of any other
-/// node at any other point.
+/// H2: H1 without the history (`journal_valid` catches a second create of
+/// `D1A`; the history doubles the state space) and one crash (disk kept):
+/// of node 1 after its release row is in the root's log and before node 2's
+/// grant is committed, or of any other node at any other point. H1 carries
+/// H-I2 by `per_key_linearizable`.
 fn h2() -> NodeStreamModel {
-    h1().with_faults(1, 0)
+    let mut m = h1().with_faults(1, 0);
+    m.history = false;
+    m
 }
 
 #[test]
@@ -1964,21 +1983,34 @@ fn h2_design_handover_with_a_crash() {
 }
 
 /// The root grants the subtree to the requester before the holder's release
-/// row is in its journal: two sequencers for one key (both nodes create
-/// `/D1/a`, both succeed, and the root's journal replays one of them as
-/// `EEXIST`).
+/// row is in its journal (H1's composition, history on): two sequencers for
+/// one key. Both nodes create `/D1/a`; the root's journal replays one of
+/// them as `EEXIST` (`journal_valid`), and the grant itself is out of order
+/// (`grown_after_release`). `per_key_linearizable` stays green here: the
+/// model's delegates execute against the shared view of the keys, so the
+/// second create answers `EEXIST` in real-time order and the answered
+/// history has a linearization; what breaks is the order of the root's
+/// journal.
 #[test]
 fn h_knob_grow_before_release_is_found() {
-    let mut m = NodeStreamModel::design(vec![vec![], vec![create(D1A)], vec![create(D1A)]])
-        .with_grant(sticky(1, D1))
-        .with_grant(sticky(2, 0))
-        .with_stream_release(1)
-        .with_grow(2, D1);
+    let mut m = h1();
+    m.grow_before_release = true;
+    for prop in ["journal_valid", "grown_after_release"] {
+        assert_finds_within("h1+grow_before_release", &m, prop, CAP_LARGE);
+    }
+}
+
+/// The same knob on plain C7-T4 (disjoint keys, no history): the
+/// topology-independent oracle finds it where `journal_valid` and
+/// `per_key_linearizable` cannot.
+#[test]
+fn h_knob_grow_before_release_is_found_on_disjoint_keys() {
+    let mut m = c7_t4();
     m.grow_before_release = true;
     assert_finds_within(
-        "c7-t4-same-key+grow_before_release",
+        "c7-t4+grow_before_release",
         &m,
-        "journal_valid",
+        "grown_after_release",
         CAP_LARGE,
     );
 }
