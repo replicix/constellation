@@ -7093,7 +7093,6 @@ async fn peer_links_task(
         // after): the core is lone on this one only if it was taken after
         // its last lapse was handed.
         let handed = lapses.handed();
-        let issued = WaitMs(wait_now_ms());
         // Before and after the snapshot: only a directory a complete scan
         // filled throughout is vouched for.
         let complete_before = peers.registry_complete();
@@ -7104,7 +7103,6 @@ async fn peer_links_task(
                 registry_complete,
                 links,
                 lapses: handed,
-                issued,
             }))
             .is_err()
         {

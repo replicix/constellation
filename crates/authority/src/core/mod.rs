@@ -2911,7 +2911,6 @@ impl Core {
                 registry_complete,
                 links,
                 lapses,
-                issued,
             } => {
                 tracing::trace!(
                     node = self.cfg.node_id,
@@ -2927,8 +2926,7 @@ impl Core {
                     }
                 }
                 self.note_rtt_samples(now.wait, &links);
-                self.roster
-                    .install_links(links, registry_complete, lapses, issued);
+                self.roster.install_links(links, registry_complete, lapses);
                 self.stream_on_peers(now);
             }
             Event::OwnS3 {
