@@ -3317,8 +3317,12 @@ impl Driver {
                 .collect();
         }
         self.deps.delegates.mirror(&status.delegation);
+        // ADR-56: the delegate fast path's own activity, sampled after its
+        // view was mirrored (a subtree a release is draining left it).
+        let (notes, fast_inflight) = self.deps.delegates.take_local_notes();
         status.placement_top = self.core.placement_top();
         status.locks_cluster = cfg.locks;
+        self.core.deleg_note_local(now, &notes, fast_inflight);
         let lv = self.core.lock_view();
         status.lock_requests_in_flight = lv.requests_in_flight;
         status.lock_waiters = lv.waiters;

@@ -70245,6 +70245,186 @@ mod step5_sticky_release {
         Event::Peer { from, msg }
     }
 
+    // ------------------------------------------------ the handover (ADR-56)
+
+    fn handover_request(
+        h: &mut Harness,
+        dirs: Vec<constellation_fs_core::Ino>,
+        why: crate::event::ReleaseWhy,
+    ) -> Vec<Action> {
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReleaseRequest {
+                req: OpId(9),
+                gen: 7,
+                dirs,
+                why,
+            },
+        })
+    }
+
+    /// One tick of the holder's release timer after `ms`.
+    fn release_tick(h: &mut Harness, ms: u64) -> Vec<Action> {
+        h.advance(ms);
+        let id = h.core.dl.sticky_timer.expect("no timer for the release");
+        h.step(Event::Timer { id })
+    }
+
+    /// An own op of the holder parked in subtree `dir` (a dependency or a
+    /// read recall holds it), from `from` (`0`: its own client).
+    fn park_op(h: &mut Harness, dir: constellation_fs_core::Ino, from: NodeId, seq: u64) {
+        let rid = h.rid(seq);
+        let op = MutateOp::Create {
+            parent: dir,
+            name: format!("p{seq}"),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        h.core
+            .dl
+            .mine
+            .get_mut(&7)
+            .unwrap()
+            .parked
+            .push(super::super::delegate::ParkedDeleg {
+                from,
+                req: None,
+                rid,
+                op,
+                deps: Position::ZERO,
+                acked_through: 0,
+                tag: Default::default(),
+                settle: false,
+                fence: Default::default(),
+                held: false,
+                arrived: WaitMs(0),
+            });
+    }
+
+    /// A handover request for a sticky subtree the holder has no op of its
+    /// own in: it releases at once, by its own row (a `StickyReleaseCmd`),
+    /// and the request is no recall (`deleg_sticky_recalled_other` is the
+    /// root's counter; the holder counts a wait and a handover release).
+    #[test]
+    fn the_holder_releases_at_once_when_nothing_of_its_own_is_in_flight() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        handover_request(&mut h, dirs.clone(), crate::event::ReleaseWhy::Handover);
+        assert_eq!(h.core.stats.deleg_handover_waits, 0);
+        assert_eq!(h.core.dl.sticky_cmds.len(), 1, "no release was made");
+        assert!(h.core.dl.sticky_cmds[0].handover);
+        // The engine's fast path has had a step to leave the subtree and
+        // report: the row goes on the next one.
+        assert!(!last_is_release(&h), "released in the step that asked");
+        let out = release_tick(&mut h, 200);
+        assert!(last_is_release(&h), "not released: {out:?}");
+        assert_eq!(h.core.stats.deleg_handover_released, 1);
+        assert_eq!(h.core.stats.deleg_sticky_releases, 1);
+        assert!(h.core.dl.handovers.is_empty());
+    }
+
+    /// While the holder has an op of its own in flight in the subtree, a
+    /// handover request waits; once none is, it waits for the grace after
+    /// the last one, then releases (a holder that keeps writing keeps the
+    /// subtree). The engine fast path stands for the own op here.
+    #[test]
+    fn the_holder_keeps_the_subtree_while_its_own_op_is_in_flight_and_releases_after_the_grace() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        let grace = h.core.cfg.handover_grace_ms;
+        assert!(grace > 0);
+        h.core.deleg_note_local(h.clk(), &[(7, dirs[0])], 1);
+        handover_request(&mut h, dirs.clone(), crate::event::ReleaseWhy::Handover);
+        assert!(
+            h.core.dl.sticky_cmds.is_empty(),
+            "made a release while busy"
+        );
+        // The grace is for ops that are in flight: the first one's end is
+        // the last own activity.
+        h.core.deleg_note_local(h.clk(), &[(7, dirs[0])], 1);
+        release_tick(&mut h, 200);
+        release_tick(&mut h, 200);
+        assert!(!last_is_release(&h) && h.core.dl.sticky_cmds.is_empty());
+        // The op completes; the grace has not passed.
+        h.core.deleg_note_local(h.clk(), &[], 0);
+        release_tick(&mut h, 200);
+        release_tick(&mut h, grace / 2);
+        assert!(!last_is_release(&h) && h.core.dl.sticky_cmds.is_empty());
+        // Another own op runs: the grace restarts.
+        h.core.deleg_note_local(h.clk(), &[(7, dirs[0])], 0);
+        release_tick(&mut h, grace / 2 + 100);
+        assert!(!last_is_release(&h) && h.core.dl.sticky_cmds.is_empty());
+        // Idle for the grace: the release is made, and goes a step later.
+        release_tick(&mut h, grace);
+        assert_eq!(h.core.dl.sticky_cmds.len(), 1, "no release after the grace");
+        release_tick(&mut h, 200);
+        assert!(last_is_release(&h));
+    }
+
+    /// A core-parked op of the holder's own is in flight; a forwarded op, or
+    /// one the release holds, is not.
+    #[test]
+    fn forwarded_ops_do_not_keep_a_subtree_busy() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        park_op(&mut h, dirs[0], 3, 1);
+        park_op(&mut h, dirs[0], 2, 2);
+        assert!(!h.core.own_in_flight(7, dirs[0], &h.meta));
+        handover_request(&mut h, dirs.clone(), crate::event::ReleaseWhy::Handover);
+        assert_eq!(h.core.dl.sticky_cmds.len(), 1, "forwards kept it busy");
+        let d = h.core.dl.mine.get_mut(&7).unwrap();
+        d.parked.clear();
+        park_op(&mut h, dirs[0], 0, 3);
+        assert!(h.core.own_in_flight(7, dirs[0], &h.meta));
+        h.core.dl.mine.get_mut(&7).unwrap().parked[0].held = true;
+        assert!(
+            !h.core.own_in_flight(7, dirs[0], &h.meta),
+            "an op the release holds is no activity"
+        );
+    }
+
+    /// A designation moves only by `online`: the request is ignored.
+    #[test]
+    fn a_designated_stream_ignores_a_handover_request() {
+        let (mut h, dirs) = holder_of(&["a"], SubtreeKind::Designated);
+        let out = handover_request(&mut h, dirs, crate::event::ReleaseWhy::Handover);
+        assert_eq!(h.core.stats.deleg_handover_ignored, 1);
+        assert!(h.core.dl.handovers.is_empty() && h.core.dl.sticky_cmds.is_empty());
+        assert!(!last_is_release(&h));
+        assert!(sends(&out).is_empty(), "{out:?}");
+    }
+
+    /// A placed grant is not the holder's to keep: the root asks for it as
+    /// for a recall.
+    #[test]
+    fn a_handover_request_for_a_placed_grant_is_answered_as_a_recall() {
+        let (mut h, dirs) = holder_of(&["a"], SubtreeKind::Placed);
+        handover_request(&mut h, dirs, crate::event::ReleaseWhy::Handover);
+        assert!(last_is_release(&h));
+        assert_eq!(h.core.stats.deleg_handover_waits, 0);
+    }
+
+    /// The release of a sticky handover leaves the fast path's view of the
+    /// subtree from the step that made it, and waits for the fast path's
+    /// admissions to be journaled.
+    #[test]
+    fn a_handover_release_leaves_the_fast_path_and_waits_for_its_ops() {
+        let (mut h, dirs) = sticky_holder(&["a", "b"]);
+        let mut view = crate::core::DelegView::default();
+        h.core.deleg_view_local(&mut view);
+        assert_eq!(view.mine[0].0.len(), 2);
+        handover_request(&mut h, vec![dirs[0]], crate::event::ReleaseWhy::Handover);
+        h.core.deleg_view_local(&mut view);
+        assert_eq!(view.mine[0].0, vec![dirs[1]], "the subtree stayed in view");
+        // An admission that was in flight when the view changed.
+        h.core.deleg_note_local(h.clk(), &[], 1);
+        release_tick(&mut h, 200);
+        release_tick(&mut h, 200);
+        assert!(!last_is_release(&h), "released over an admitted op");
+        h.core.deleg_note_local(h.clk(), &[], 0);
+        release_tick(&mut h, 200);
+        assert!(last_is_release(&h));
+    }
+
     /// A node that holds no sticky grant is told so.
     #[test]
     fn a_node_without_sticky_grants_has_nothing_to_release() {

@@ -700,6 +700,10 @@ pub struct DelegateView {
     stopped_dirs: std::sync::Mutex<std::collections::HashSet<(u64, u64)>>,
     /// Fast-path executions admitted and not yet journaled.
     in_flight: std::sync::atomic::AtomicU64,
+    /// ADR-56: the `(stream, subtree)` pairs the delegate's fast path
+    /// admitted ops under since the driver last drained them
+    /// ([`DelegateView::take_local_notes`]).
+    local_notes: std::sync::Mutex<std::collections::BTreeSet<(u64, u64)>>,
     /// Plan 30 §M12: the keys of the ops the root's fast path executed
     /// since the driver last drained them, for the placement's
     /// histogram (`Core::place_note_local`).
@@ -807,6 +811,14 @@ impl DelegateView {
     /// Fast-path executions admitted and not yet journaled.
     pub fn in_flight(&self) -> u64 {
         self.in_flight.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// ADR-56: what the delegate's fast path did since the last call, for the
+    /// core's handover grace: the `(stream, subtree)` pairs it admitted ops
+    /// under, and how many admitted ops are still in flight.
+    pub fn take_local_notes(&self) -> (Vec<(u64, u64)>, u64) {
+        let notes = std::mem::take(&mut *self.local_notes.lock().unwrap());
+        (notes.into_iter().collect(), self.in_flight())
     }
 
     /// The fast path executed one op as the delegate.
@@ -941,6 +953,9 @@ impl DelegateView {
         self.in_flight
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         drop(g);
+        // The holder's own activity in the subtree, for a handover's grace
+        // (ADR-56): drained by the driver after every step.
+        self.local_notes.lock().unwrap().insert((gen, d.dir));
         Some(DelegateAdmission { gen, view: self })
     }
 }
