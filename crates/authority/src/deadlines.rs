@@ -119,6 +119,11 @@ pub struct Deadlines {
     pub recall_backoff_max: u64,
     pub release_seal_window: u64,
     pub release_stream_window: u64,
+    /// The archive PUT a first answer under a sticky grant (and the root's
+    /// own answers with peers) waits for, the grant record's among them
+    /// (plan 46 M1.3 step 7): the bound the root's archive answers already
+    /// use, `F`. No setting of its own.
+    pub archive_put: u64,
     pub inherit_slack: u64,
     pub abandon_read_wait: u64,
     pub abandon_heard_window: u64,
@@ -300,6 +305,7 @@ impl Deadlines {
             recall_backoff_max: RECALL_BACKOFF_CAP_MS.max(drt),
             release_seal_window: seal,
             release_stream_window: f,
+            archive_put: f,
             inherit_slack: t,
             abandon_read_wait: r + m,
             abandon_heard_window: d,
@@ -635,6 +641,7 @@ impl Deadlines {
             ),
             ("release_seal_window", self.release_seal_window, "max(T, F)"),
             ("release_stream_window", self.release_stream_window, "F"),
+            ("archive_put", self.archive_put, "F"),
             ("inherit_slack", self.inherit_slack, "T"),
             ("abandon_read_wait", self.abandon_read_wait, "R + m"),
             ("abandon_heard_window", self.abandon_heard_window, "D"),
@@ -769,6 +776,20 @@ mod tests {
         assert_eq!(table.len(), expected.len(), "a bound is not pinned");
     }
 
+    /// The archive PUT a first answer waits for fits inside a forward
+    /// timeout (plan 46 M1.3 step 7, ADR-48): the first op of a sticky
+    /// grant, whose answer waits for the grant record's archive, is
+    /// answered inside the bound the root's archive answers already use,
+    /// and inside the client's deadline.
+    #[test]
+    fn archive_put_is_within_the_forward_timeout() {
+        for cfg in [Config::defaults(1, 1), sim(), sim_long()] {
+            let d = Deadlines::new(&cfg);
+            assert!(d.archive_put <= d.base.forward_timeout, "{d:?}");
+            assert!(d.archive_put < d.attempts, "{d:?}");
+        }
+    }
+
     /// D13 and D14 (late-landing S1): the settle window and the inbox read
     /// freshness hold four store request timeouts, so that an ordinary poll
     /// is never stale. Both are skipped while the timeout is unknown.
@@ -824,6 +845,7 @@ mod tests {
                 // max(1500, 500).
                 ("release_seal_window", 1_500),
                 ("release_stream_window", 500),
+                ("archive_put", 500),
                 ("inherit_slack", 1_500),
                 // 5000 + 1000.
                 ("abandon_read_wait", 6_000),
@@ -893,6 +915,7 @@ mod tests {
                 ("recall_backoff_max", 2_000),
                 ("release_seal_window", 1_500),
                 ("release_stream_window", 500),
+                ("archive_put", 500),
                 ("inherit_slack", 1_500),
                 ("abandon_read_wait", 6_000),
                 ("abandon_heard_window", 20_000),
@@ -955,6 +978,7 @@ mod tests {
                 ("recall_backoff_max", 2_000),
                 ("release_seal_window", 1_500),
                 ("release_stream_window", 400),
+                ("archive_put", 400),
                 ("inherit_slack", 1_500),
                 ("abandon_read_wait", 5_500),
                 ("abandon_heard_window", 5_000),
@@ -1028,6 +1052,7 @@ mod tests {
                 ("recall_backoff_max", 2_000),
                 ("release_seal_window", 1_500),
                 ("release_stream_window", 400),
+                ("archive_put", 400),
                 ("inherit_slack", 1_500),
                 ("abandon_read_wait", 5_500),
                 ("abandon_heard_window", 20_000),
@@ -1087,6 +1112,7 @@ mod tests {
                 // max(1000, 400).
                 ("release_seal_window", 1_000),
                 ("release_stream_window", 400),
+                ("archive_put", 400),
                 ("inherit_slack", 1_000),
                 ("abandon_read_wait", 5_500),
                 ("abandon_heard_window", 5_000),
@@ -1152,6 +1178,7 @@ mod tests {
                 // max(8, 3000).
                 ("release_seal_window", 3_000),
                 ("release_stream_window", 3_000),
+                ("archive_put", 3_000),
                 ("inherit_slack", 8),
                 ("abandon_read_wait", 100),
                 ("abandon_heard_window", 50),

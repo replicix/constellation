@@ -73924,6 +73924,51 @@ mod route_fence_executor {
         assert_eq!(h.core.stats.deleg_fenced_forwards, 1);
     }
 
+    /// Plan 46 M1.3 step 7 (D-c, ADR-47 rule 1): the placement converts a
+    /// placed grant that turned far to a sticky one, a new generation over
+    /// the same directory. A forward its requester routed by the old placed
+    /// generation (the table it read before the recall) reaches the sticky
+    /// holder, which fences it (`Fenced` names the generation to route by,
+    /// nothing runs), and the same forward routed by the sticky generation
+    /// runs: the op reaches the sticky holder once, by its new route.
+    #[test]
+    fn a_forward_routed_by_the_converted_placed_grant_is_fenced_then_reaches_the_sticky_holder() {
+        let (mut h, d1) = designee();
+        let placed = 6;
+        for (seq, routed) in [(1, placed), (2, 0)] {
+            let out = forward(
+                &mut h,
+                d1,
+                2,
+                seq,
+                (seq, false),
+                (routed, routed),
+                Position::ZERO,
+            );
+            assert_eq!(
+                outcome_to(&out, 2),
+                Some(MutateOutcome::Fenced { gen: 7 }),
+                "routed by {routed}: {out:?}"
+            );
+            assert!(
+                !ran(&h, 2, seq),
+                "the sticky holder ran a forward routed by {routed}"
+            );
+        }
+        assert_eq!(h.core.stats.deleg_fenced_forwards, 2);
+        assert_eq!(h.core.dl.mine[&7].executed, 0);
+        // The requester re-routes by the sticky generation (the fence's
+        // answer): the op runs, once; its resend is answered from the outcome.
+        let out = forward(&mut h, d1, 2, 3, (3, false), (7, placed), Position::ZERO);
+        assert!(
+            matches!(outcome_to(&out, 2), Some(MutateOutcome::Accepted { .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.core.dl.mine[&7].executed, 1);
+        assert!(ran(&h, 2, 3));
+        assert_eq!(h.core.stats.deleg_fenced_forwards, 2);
+    }
+
     /// ADR-47 Q4: the fence holds for the root's own generation. A node that
     /// is the lease holder and also the designee of `g` (it was granted
     /// `g` and then took the lease over) answers a forward routed 0 with
@@ -75124,6 +75169,45 @@ mod route_fence_root {
                 "only the untouched rid is refused: {refused:?}"
             );
         }
+    }
+
+    /// Plan 46 M1.3 step 7 (D-c, ADR-47 rule 2): a rid whose requester sent
+    /// it under the placed generation that conversion recalled reaches the
+    /// root while the sticky generation covers its keys. The root does not
+    /// refuse it for good: it redirects the requester to the live sticky
+    /// holder (the new generation named), or holds it
+    /// (`HolderUnreachable`) while that node is out of reach; nothing is
+    /// journaled, and no final non-holder refusal is recorded for the rid.
+    #[test]
+    fn a_rid_touched_by_the_converted_placed_grant_is_held_or_redirected_not_refused() {
+        let (mut h, d1, sticky) = sticky_root();
+        h.core.track_fence_audit();
+        let placed = sticky - 1;
+        // The sticky holder out of reach: held.
+        let op = create_in(&h, d1, "c1");
+        let out = forward(&mut h, 2, 1, 1, op, false, (placed, placed));
+        assert!(
+            matches!(
+                outcome_to(&out, 2),
+                Some(MutateOutcome::HolderUnreachable { gen, .. }) if gen == sticky
+            ),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.root_touched_holds, 1);
+        // In reach: redirected to it, by the sticky generation.
+        peers(&mut h, Some(true));
+        let op = create_in(&h, d1, "c2");
+        let out = forward(&mut h, 2, 2, 2, op, false, (placed, placed));
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::NotHolder { holder: 3 }),
+            "{out:?}"
+        );
+        for seq in [1, 2] {
+            assert!(!has_outcome(&h, 2, seq), "the root journaled a refusal");
+        }
+        assert!(h.core.take_final_nonholder_refusals().is_empty());
+        assert_eq!(h.core.stats.inbox_refused_ops, 0);
     }
 
     /// The knob `root_ignores_touched` is main's rule: refused for good

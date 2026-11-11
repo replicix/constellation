@@ -1391,6 +1391,7 @@ rewrites it).
 | `recall_backoff_max` | 2000 | `max(2000, DRT)` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
 | `release_seal_window` | 1500 | `max(T, F)` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_FORWARD_TIMEOUT_MS` |
 | `release_stream_window` | 500 | `F` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `archive_put` | 500 | `F` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
 | `inherit_slack` | 1500 | `T` | `CONSTELLATION_BACKUP_TAKEOVER_MS` |
 | `abandon_read_wait` | 6000 | `R + m` | `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS` |
 | `abandon_heard_window` | 20000 | `D` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
