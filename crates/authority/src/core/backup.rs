@@ -5298,14 +5298,12 @@ impl Core {
                     knob_uncommitted = true;
                 }
             }
-            if in_epoch {
-                if self.ack.hold_epoch != Some(epoch) {
-                    self.ack.hold_acked.clear();
-                    self.ack.hold_sent.clear();
-                    self.ack.hold_sent_hi.clear();
-                    self.ack.hold_resending.clear();
-                    self.ack.hold_epoch = Some(epoch);
-                }
+            if in_epoch && self.ack.hold_epoch != Some(epoch) {
+                self.ack.hold_acked.clear();
+                self.ack.hold_sent.clear();
+                self.ack.hold_sent_hi.clear();
+                self.ack.hold_resending.clear();
+                self.ack.hold_epoch = Some(epoch);
             }
             // Only a member acknowledges (and is resent to).
             if in_epoch && members.contains(&n) {
