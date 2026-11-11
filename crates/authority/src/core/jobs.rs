@@ -1376,14 +1376,19 @@ impl Core {
         // goes once that CAS landed, or at a quarter of the TTL left
         // (`renew_waits_for_own_cas`): the wait is armed for then.
         if kind == Some(JobKind::Round) && self.renew_waits_for_own_cas(now) {
-            if let Some(delay) = self.renew_due_in_ms(now) {
-                if let Some(id) = self.gate_drain_timer.take() {
-                    self.cancel_timer(id, out);
-                }
-                let id =
-                    self.set_timer_wait(now.wait.plus(delay), super::Timer::GateDrainRenew, out);
-                self.gate_drain_timer = Some(id);
+            // `renew_due_in_ms` is `None` for a renewal brought forward
+            // (`renew_now`, `renew_early_of`): the wait is then a quarter
+            // of the TTL from the lease's honour end, so the lease does not
+            // lapse under a slow drain with no timer left.
+            let delay = self.renew_due_in_ms(now).unwrap_or_else(|| {
+                let left = self.lease.honour_left_ms(now, &self.cfg).unwrap_or(0);
+                (left - (self.cfg.ttl_ms / 4) as i64).max(1) as u64
+            });
+            if let Some(id) = self.gate_drain_timer.take() {
+                self.cancel_timer(id, out);
             }
+            let id = self.set_timer_wait(now.wait.plus(delay), super::Timer::GateDrainRenew, out);
+            self.gate_drain_timer = Some(id);
             return;
         }
         self.stats.gate_drain_renewals += 1;
