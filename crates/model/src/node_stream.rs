@@ -264,7 +264,43 @@
 //!   minted by a `Grow` only while node 0 roots, has a peer in view and no
 //!   group; the root sequences its own and forwarded ops in that subtree
 //!   in that stream (final), and appends it like any node stream. A
-//!   deposed root's grant blocks its subtree. Never on `/`.
+//!   deposed root's grant blocks its subtree **unless it resumes** (chunk
+//!   14). Never on `/`.
+//!
+//! ## Chunk 14: a deposed root keeps its own grant (plan 46 M1.3 step 9, ADR-55)
+//!
+//! - **[`Action::Resume`]** (at most [`NodeStreamModel::max_resumes`]): the
+//!   deposed root, whose own sticky grant is live (minted, not ended),
+//!   returns as an ordinary node: it leaves [`State::down`], is not the root,
+//!   and its grant's stream goes on. At its deposition it keeps what it had
+//!   learned committed (`applied`, so its `Grow` still holds), and the
+//!   answers parked in its own stream; when it returns its
+//!   `root_appended` is the new root's appended cursor, and the new root
+//!   **re-streams** the rows the adopted journal lacks
+//!   ([`Action::Append`] from the holder's disk). A forward routed by the
+//!   new root's table runs there; one that was not routed by the grant is
+//!   fenced at the holder ([`NodeStreamModel::route_fence`], ADR-47), as at
+//!   any holder.
+//!   What was sent to the root while it was away stays in flight: a
+//!   forward sent before the deposition can arrive after the return (a stale
+//!   copy, which the returned node fences, bounces or answers from the row
+//!   by rid, while the requester's retry runs at the new root). Only a
+//!   second identical forward to a node that is down is dropped (a
+//!   requester's retries toward a grant that is gone would grow the network
+//!   without bound).
+//! - **Witness** `deposed_root_streams`: a row of the deposed root's own
+//!   stream journaled after its deposition is appended by the new root.
+//! - **Knob** `deposed_root_drops_own_stream`: the deposition discards the
+//!   own stream's rows past the adopted prefix with the root's own rows;
+//!   `acked_never_lost` must find an answered row gone.
+//! - **Fence at a minted grant**: the root's own grant fences a forward not
+//!   routed by it from the moment the record is minted, not only once it is
+//!   committed (the real fence precedes every other gate and parks nothing);
+//!   otherwise a routed-`0` forward parked in the commit wait ran unfenced and
+//!   the new root refused its retry for good (a hit of `refused_never_completes`
+//!   in C14-T3 before this).
+//! - **I2(b)** counts the sequencers a forward would execute at (not one the
+//!   receiver fences, bounces or answers from the rid's row), plus parked ops.
 //!
 //! ## Chunk 9: settlement (I4), S4, no server queue (I2(b))
 //!
@@ -859,6 +895,9 @@ pub const SAW_STALE_CACHE: u64 = 1 << 50;
 /// Chunk 12: the root answered under a live foreign grant (non-singleton
 /// by the grant alone).
 pub const SAW_GRANT_BLOCKS_SINGLETON: u64 = 1 << 51;
+/// Chunk 14: the new root appended a row of the deposed root's own stream
+/// that was journaled after the deposition.
+pub const SAW_DEPOSED_ROOT_STREAMS: u64 = 1 << 52;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -880,7 +919,9 @@ pub struct State {
     pub saw: u64,
     /// The lease holder.
     pub root: u8,
-    /// Bitmask over nodes: crashed or deposed (never return).
+    /// Bitmask over nodes: crashed or deposed (a crashed node never
+    /// returns; a deposed root with a live own grant may,
+    /// [`Action::Resume`], chunk 14).
     pub down: u8,
     pub crashes: u8,
     pub depositions: u8,
@@ -947,6 +988,11 @@ pub struct State {
     pub known: u8,
     /// The oracle's record that the root's latest read was incomplete.
     pub known_partial: bool,
+    /// Chunk 14: resumes done.
+    pub resumes: u8,
+    /// Chunk 14: rows of the deposed root's own stream at its deposition
+    /// ([`NONE`]: none).
+    pub deposed_len: u8,
 }
 
 impl State {
@@ -1036,6 +1082,9 @@ pub enum Action {
     /// The root's clock: the read delegation of `stream` expires (the
     /// holder need not be alive; "recall, else expire", 2026-11-06).
     ExpireRead(u8),
+    /// Chunk 14: the deposed root `i`, whose own grant is live, returns as
+    /// an ordinary node (at most [`NodeStreamModel::max_resumes`]).
+    Resume(u8),
 }
 
 #[derive(Clone, Debug)]
@@ -1182,6 +1231,12 @@ pub struct NodeStreamModel {
     /// Chunk 12, the knob: the singleton test ignores a live generation
     /// another node holds.
     pub singleton_with_foreign_grant: bool,
+    /// Chunk 14: the deposed root may return and keep its own sticky grant
+    /// ([`Action::Resume`], at most this many).
+    pub max_resumes: u8,
+    /// Chunk 14, the knob: a deposition discards the deposed root's own
+    /// stream rows past the adopted prefix with the root's rows.
+    pub deposed_root_drops_own_stream: bool,
 }
 
 /// Where a received op stands at a sequencer.
@@ -1273,6 +1328,8 @@ impl NodeStreamModel {
             singleton_while_partial: false,
             evidence_only_on_forward: false,
             singleton_with_foreign_grant: false,
+            max_resumes: 0,
+            deposed_root_drops_own_stream: false,
         }
     }
 
@@ -1310,6 +1367,13 @@ impl NodeStreamModel {
     pub fn with_faults(mut self, crashes: u8, depositions: u8) -> Self {
         self.max_crashes = crashes;
         self.max_depositions = depositions;
+        self
+    }
+
+    /// Chunk 14: the deposed root may return (at most `n` times) and keeps
+    /// its own live sticky grant.
+    pub fn with_resume(mut self, n: u8) -> Self {
+        self.max_resumes = n;
         self
     }
 
@@ -1679,6 +1743,15 @@ fn root_keys(m: &NodeStreamModel, s: &State) -> View {
 
 /// The delegate's gate: it holds `dir` by its own view.
 fn deleg_owns(m: &NodeStreamModel, s: &State, g: u8, dir: usize) -> bool {
+    deleg_owns_at(m, s, g, dir, false)
+}
+
+/// [`deleg_owns`]; with `minted` (the root's own grant), a grant whose record
+/// is in the root's journal counts whether or not it is committed yet: the
+/// fence of ADR-47 looks at the generation the root holds the keys under,
+/// which it has from the moment it mints the record, so a forward not routed
+/// by it is fenced instead of parked (and run unfenced at the commit).
+fn deleg_owns_at(m: &NodeStreamModel, s: &State, g: u8, dir: usize, minted: bool) -> bool {
     let st = &s.streams[g as usize];
     if st.stopped {
         return false;
@@ -1693,7 +1766,8 @@ fn deleg_owns(m: &NodeStreamModel, s: &State, g: u8, dir: usize) -> bool {
     } else {
         st.applied as usize
     };
-    let early = m.honour_uncommitted_grant
+    let early = minted
+        || m.honour_uncommitted_grant
         || (m.sticky_answers_before_grant_committed && grant.kind != GrantKind::Placed);
     let grown = s.streams[ROOT as usize]
         .rows
@@ -2295,25 +2369,49 @@ pub fn eio_never_lands_late(s: &State) -> bool {
 /// I2(b) (chunk 9): no server-side queue: at most one executable copy of a
 /// rid's op exists (a forward to a live, honouring sequencer, or an op
 /// parked at a live one); the requester's entry is the only source of
-/// another.
+/// another. A forward is not executable where the receiver fences it,
+/// bounces it (`NotOwner`: a deposed root that has returned holds no key of
+/// the lease holder's ops), or already sees the rid's row (answered by the
+/// rid dedup of `receive`): a stale copy that outlives a deposition (chunk
+/// 14) is not counted, and `exactly_once` backs it. Forwards to one
+/// sequencer are one (the same dedup); an op parked there still counts.
 pub fn one_executable_copy(m: &NodeStreamModel, s: &State) -> bool {
     s.nodes.iter().enumerate().all(|(i, n)| {
         (0..n.next).all(|seq| {
             let rid = Rid { node: i as u8, seq };
-            let fwd = s
-                .net
-                .iter()
-                .filter(|msg| {
-                    matches!(msg, Msg::Fwd { to, rid: r, .. }
-                        if *r == rid && s.live(*to) && !m.stopped_node(s, *to))
-                })
-                .count();
+            // The sequencers a forward would execute at: forwards to one
+            // sequencer are one (its rid dedup, `receive`); a parked op is
+            // another.
+            let mut at_seq = 0u8;
+            for msg in &s.net {
+                if let Msg::Fwd {
+                    to,
+                    rid: r,
+                    op,
+                    deps,
+                    routed,
+                    ..
+                } = msg
+                {
+                    if *r == rid
+                        && s.live(*to)
+                        && !m.stopped_node(s, *to)
+                        && find_rid(m, s, *to, rid).is_none()
+                        && !(m.route_fence
+                            && !m.unfenced_forward
+                            && own_gen(m, s, *to, *op).is_some_and(|g| g != *routed))
+                        && !matches!(status(m, s, *to, *op, deps), Status::Bounce)
+                    {
+                        at_seq |= 1 << *to;
+                    }
+                }
+            }
             let parked = s
                 .waiting
                 .iter()
                 .filter(|w| w.rid == rid && !w.settle && s.live(w.node))
                 .count();
-            fwd + parked <= 1
+            at_seq.count_ones() as usize + parked <= 1
         })
     })
 }
@@ -3045,7 +3143,7 @@ fn own_gen(m: &NodeStreamModel, s: &State, at: u8, op: WriteOp) -> Option<u8> {
         .stream_of_node(at)
         .filter(|&g| !s.streams[g as usize].stopped)?;
     bits(op_dirs(op))
-        .all(|d| deleg_owns(m, s, g, d))
+        .all(|d| deleg_owns_at(m, s, g, d, m.grants[g as usize - 1].node == s.root))
         .then_some(g)
 }
 
@@ -3196,6 +3294,8 @@ impl Model for NodeStreamModel {
             partial_used: 0,
             known: roster,
             known_partial: false,
+            resumes: 0,
+            deposed_len: NONE,
         }]
     }
 
@@ -3478,6 +3578,10 @@ impl Model for NodeStreamModel {
             {
                 actions.push(Action::Leave(i));
             }
+        }
+        // Chunk 14: a deposed root whose own grant is live returns.
+        if s.resumes < self.max_resumes && !s.live(0) && s.root != 0 && live_grant(self, s, 0) {
+            actions.push(Action::Resume(0));
         }
         if s.view_roster != s.roster || s.view_partial {
             actions.push(Action::SeeRoster);
@@ -3931,6 +4035,14 @@ impl Model for NodeStreamModel {
                 if !s.live(exec) || s.streams[g as usize].stopped {
                     s.saw |= SAW_SEAL;
                 }
+                if s.deposed_len != NONE
+                    && self.stream_of_node(0) == Some(g)
+                    && exec != s.root
+                    && s.live(exec)
+                    && k as u8 >= s.deposed_len
+                {
+                    s.saw |= SAW_DEPOSED_ROOT_STREAMS;
+                }
                 s.streams[ROOT as usize].rows.push(row);
             }
             Action::Ship => {
@@ -4074,6 +4186,16 @@ impl Model for NodeStreamModel {
                     s.saw |= SAW_CLAIM_AFTER_READ;
                 }
                 let old = s.root;
+                // Chunk 14: the deposed root's own live sticky grant (what
+                // it knew committed, and its stream's length).
+                let own = self
+                    .stream_of_node(old)
+                    .filter(|&g| self.max_resumes > 0 && self.non_stealable(g))
+                    .filter(|&g| s.minted[g as usize] != NONE && ended(&s, g).is_none());
+                let known_committed = root_committed_prefix(self, &s);
+                if let Some(g) = own {
+                    s.deposed_len = s.streams[g as usize].rows.len() as u8;
+                }
                 s.down |= 1 << old;
                 s.depositions += 1;
                 let shipped = s.shipped;
@@ -4149,7 +4271,12 @@ impl Model for NodeStreamModel {
                 // The deposed root's parked answers and ops die with its
                 // tenure (the `server_replay_queue` knob hands its parked
                 // ops to the claimant instead).
-                s.pending.retain(|p| p.stream != ROOT && p.executor != old);
+                if own.is_some() {
+                    // Answers parked in the own stream outlive the tenure.
+                    s.pending.retain(|p| p.stream != ROOT);
+                } else {
+                    s.pending.retain(|p| p.stream != ROOT && p.executor != old);
+                }
                 if self.server_replay_queue {
                     for w in s.waiting.iter_mut() {
                         if w.node == old && !w.settle {
@@ -4228,6 +4355,24 @@ impl Model for NodeStreamModel {
                         }
                     }
                 }
+                if let Some(g) = own {
+                    let adopted = s.streams[ROOT as usize].rows.len();
+                    // The own grant keeps what the root knew committed.
+                    let st = &mut s.streams[g as usize];
+                    st.applied = st.applied.max(known_committed.min(adopted) as u8);
+                    if self.deposed_root_drops_own_stream {
+                        // The knob: the own stream's rows past the adopted
+                        // prefix go with the root's rows.
+                        let k = appended(&s, g);
+                        let st = &mut s.streams[g as usize];
+                        st.rows.truncate(k);
+                        for h in st.held.iter_mut() {
+                            *h = (*h).min(k as u8);
+                        }
+                        s.pending
+                            .retain(|p| !(p.stream == g && p.idx as usize >= k));
+                    }
+                }
                 // Installed prefixes never pass the adopted journal.
                 let root_len = s.streams[ROOT as usize].rows.len() as u8;
                 for g in 1..s.streams.len() {
@@ -4276,6 +4421,17 @@ impl Model for NodeStreamModel {
             }
             Action::TogglePeer => {
                 s.peer_in_budget = false;
+            }
+            Action::Resume(i) => {
+                let g = self.stream_of_node(i)?;
+                s.down &= !(1 << i);
+                s.resumes += 1;
+                // What was sent to it while it was away stays in flight: a
+                // forward sent before the deposition may arrive after the
+                // return (the stale copy of I2(b)).
+                // It re-streams to the new root from the root's cursor.
+                let app = appended(&s, g) as u8;
+                s.streams[g as usize].root_appended = app;
             }
         }
         Some(finish(self, s))
@@ -4567,6 +4723,12 @@ impl Model for NodeStreamModel {
         }
         self.witnesses_c7_c9(&mut props);
         self.witnesses_c12(&mut props);
+        if self.max_resumes > 0 && !self.deposed_root_drops_own_stream {
+            props.push(Property::sometimes(
+                "deposed_root_streams",
+                |_, s: &State| s.saw & SAW_DEPOSED_ROOT_STREAMS != 0,
+            ));
+        }
         props
     }
 }
@@ -4707,6 +4869,21 @@ fn finish(m: &NodeStreamModel, mut s: State) -> State {
         }
     }
     s.net.sort_unstable();
+    if m.max_resumes > 0 {
+        // Chunk 14: a requester's retries toward a grant that is gone (the
+        // deposed root's before it returns) would grow the network without
+        // bound; a second identical forward to a node that is down adds
+        // nothing (it is lost on delivery, or is the same message). Every
+        // other message keeps its copies.
+        let down = s.down;
+        let mut prev: Option<Msg> = None;
+        s.net.retain(|msg| {
+            let dup = matches!(msg, Msg::Fwd { to, .. } if down & (1 << *to) != 0)
+                && prev.as_ref() == Some(msg);
+            prev = Some(*msg);
+            !dup
+        });
+    }
     s.pending.sort_unstable();
     s.waiting.sort_unstable();
     s.acked.sort_unstable();

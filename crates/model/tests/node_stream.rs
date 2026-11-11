@@ -11,7 +11,8 @@
 //! root's own sticky grants; chunk 9: settlement (I4), S4 and no server
 //! queue (I2(b)); chunk 12: the root's roster object and stale views
 //! (ADR-50: old and incomplete reads, a joiner's first message by the inbox
-//! or to a node that is not the root, a live foreign generation). The design's
+//! or to a node that is not the root, a live foreign generation); chunk 14:
+//! a deposed root keeps its own sticky grant and returns (ADR-55). The design's
 //! topologies are explored exhaustively under a state cap and a timeout,
 //! with every `always` property the model registers checked and every
 //! `sometimes` witness required (non-vacuity); each planted bug (a knob)
@@ -252,6 +253,17 @@ fn assert_finds_within(
 /// Stateright's path is valid but not always the shortest one. A knob whose
 /// label is missing here fails, so no knob goes unrecorded.
 const TRACES: &[(&str, &str, usize)] = &[
+    ("c14-t3+unfenced_forward", "refused_never_completes", 7),
+    (
+        "c14-t1+deposed_root_drops_own_stream",
+        "acked_never_lost",
+        9,
+    ),
+    (
+        "c14-t2+deposed_root_drops_own_stream",
+        "acked_never_lost",
+        7,
+    ),
     ("c12-t1+roster_installs_old_read", "roster_view_monotone", 7),
     (
         "c12-t1+roster_installs_old_read+i5",
@@ -2118,4 +2130,88 @@ fn c12_a_live_foreign_grant_keeps_the_root_a_non_singleton() {
     assert!(checker
         .discovery("no_singleton_with_live_foreign_grant")
         .is_none());
+}
+
+// ======== chunk 14 (plan 46 M1.3 step 9, ADR-55): a deposed root keeps its own
+// sticky grant. The root whose lease a claimant takes is still alive; its
+// grant is non-stealable and survives the deposition, so it returns as an
+// ordinary node, goes on sequencing its subtree, and the new root appends its
+// stream again.
+
+/// C14-T1: C8-T2 (the root's own grant on `/D1`, committed by the archive)
+/// with one deposition and the deposed root's return. Node 1 writes `/b`, then
+/// `/D1/b` (routed to the old root's grant once it is back).
+fn c14_t1() -> NodeStreamModel {
+    c8_t2().with_resume(1)
+}
+
+/// C14-T2: X3 (the roster with the root's own grant: node 1 joins and may
+/// leave) with the return and the route fence: node 1's first forward into
+/// `/D1` goes to the grant's holder unrouted (a stale route cache), after node
+/// 0's deposition.
+fn c14_t2() -> NodeStreamModel {
+    let mut m = c11_x3_roster_and_grants().with_resume(1);
+    m.route_fence = true;
+    m.stale_routes = true;
+    m
+}
+
+/// C14-T3: a third node whose route cache is stale (its first forward into
+/// `/D1` goes to the root's grant routed `0`), the deposition and the return:
+/// a forward sent before the deposition can arrive after it, and a retry that
+/// the new root refuses for good is the path `unfenced_forward` fails on.
+fn c14_t3() -> NodeStreamModel {
+    let mut m = NodeStreamModel::design(vec![vec![], vec![create(RB)], vec![create(D1B)]])
+        .with_grant(sticky(0, 0))
+        .with_grow(1, D1)
+        .with_faults(0, 1)
+        .with_resume(1);
+    m.route_fence = true;
+    m.stale_routes = true;
+    m
+}
+
+#[test]
+fn c14_design_t1_deposed_root_keeps_its_grant() {
+    assert_clean_within("c14-t1", &c14_t1(), CAP_LARGE);
+}
+
+#[test]
+#[ignore = "deep: run with --include-ignored (release)"]
+fn c14_design_t2_roster_fence_and_return() {
+    assert_clean_within("c14-t2", &c14_t2(), CAP_DEEP);
+}
+
+#[test]
+fn c14_design_t3_stale_forward_and_return() {
+    assert_clean_within("c14-t3", &c14_t3(), CAP_LARGE);
+}
+
+/// The holder runs a forward whatever it was routed by, and a deposed root
+/// that is away stands for a holder the new root does not reach: the retry
+/// that arrives with `touched == 0` is refused for good while the row lives.
+#[test]
+fn c14_knob_unfenced_forward_is_found() {
+    let mut m = c14_t3();
+    m.unfenced_forward = true;
+    assert_finds_within(
+        "c14-t3+unfenced_forward",
+        &m,
+        "refused_never_completes",
+        CAP_LARGE,
+    );
+}
+
+/// The deposition discards the deposed root's own stream rows past the adopted
+/// prefix with its root rows: an answered row of the grant is gone.
+#[test]
+fn c14_knob_deposed_root_drops_own_stream_is_found() {
+    for (label, m) in [
+        ("c14-t1+deposed_root_drops_own_stream", c14_t1()),
+        ("c14-t2+deposed_root_drops_own_stream", c14_t2()),
+    ] {
+        let mut m = m;
+        m.deposed_root_drops_own_stream = true;
+        assert_finds_within(label, &m, "acked_never_lost", CAP_LARGE);
+    }
 }
