@@ -4971,8 +4971,13 @@ strict under `+commit` only.
 `delegated-core-stall-root-lease6` was an exception until 2026-11-10: a singleton's answer now
 leaves only on a fresh clock reading of a usable lease
 ([ADR-52](../../explanation/DECISIONS.md#adr-52-a-singleton-answer-leaves-only-on-a-fresh-reading-of-a-usable-lease)),
-so it is strict by default and `+commit` 0 of 2,000 (the regression replays are seeds 4, 13 and 23,
-`a_stalled_root_does_not_answer_after_its_lease_was_taken_over`). `sweep_config` prints the answers held
+so it is strict by default and `+commit` 0 of 2,000. Since ADR-50 that configuration no longer reaches a singleton
+answer (a root with a peer on its roster answers `Group`/`Archive`: `answers_held_stale_lease` is 0 and so are its
+failures with the hold off), so the fail-before configuration is `singleton-stall-takeover` (one node, a client on
+the fresh peer, `StallStep` at the root's next own `Submit` for 25 s across the join and the peer's claim;
+`SimConfig::joiner_client`, `EventKind::OwnSubmit`): `+commit` 0 of 2,000 (1,022 answers held), `+commit+nohold` (the hold off,
+`Config::stale_lease_hold_off`) fails I1 on 1,846 of 2,000 seeds, as does the parent (main with the sim support alone); pinned seeds 1, 2 and 5
+(`a_stalled_lone_root_does_not_answer_after_a_peer_took_the_lease`). `sweep_config` prints the answers held
 (`SWEEP-HELD-STALE-LEASE`, from `Stats::answers_held_stale_lease`; non-zero only on the stall configurations).
 `SWEEP-ORACLES` (per seed with any
 counter) and `SWEEP-ORACLE-TOTALS` (per sweep, with `acks_by_class`) print the

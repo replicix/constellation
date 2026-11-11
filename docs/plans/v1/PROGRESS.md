@@ -66786,6 +66786,19 @@ and replied in the same step; nothing between admission and reply read a clock. 
 `core::tests::stale_lease`; engine `a_singleton_row_whose_lease_ran_out_under_the_commit_is_in_doubt`. The exemption of
 `delegated-core-stall-root-lease6` is removed: `+commit` 0 of 2,000 seeds.
 
+*Fix round (2026-11-11, after ADR-50 landed).* Review findings fixed: the engine's gate-off acknowledgement
+(`local_ack_durable`, `Ungated`) re-tags a row a singleton's and answered from a published flag with a store write
+between: it reads the lease before and after the re-tag and is in doubt when it is not usable (engine tests
+`an_ungated_answer_on_a_lease_that_ran_out_in_the_wait_is_in_doubt`, `..._in_the_retag_...`); a lone close found in doubt
+keeps its inputs and re-commits through the core, not `EIO` (`a_stalled_lone_close_recommits_through_the_core`); a hold
+reached after the deposition marks the rid `replay.unacked` (core `a_hold_after_the_deposition_is_in_doubt_and_marks_the_replay_unacked`);
+the sim's fast path judges the row's journaled class. ADR-50 left `delegated-core-stall-root-lease6` with no singleton
+answer (its pins, seeds 4, 13 and 23, were vacuous, and the test is replaced): the new fail-before configuration is
+`singleton-stall-takeover` (a lone root stalled across a joining peer's claim), with `+nohold` as its control. Sweeps, seeds 0 to 1,999: `singleton-stall-takeover+commit` 0 (1,022 held); `+nohold` and the parent 1,846 failing, all I1;
+`delegated-core-stall-root-lease6+commit` 0 with `answers_held_stale_lease` 0 (ADR-50 removed the path, not ADR-52); `flex`,
+`sticky-ttl`, `long-delegated`, `far-root-writes+commit`, `singleton-stale-roster` 0 each. The sim
+fast path still admits on the step's `now` (the optional fidelity item of the spec, not done).
+
 ## Plan 46 M1.1 step 1: a lone root's journal is no second copy (2026-11-05)
 
 ADR-41's lone-journal branch removed (plan 46 §11, "M1.0 answers"; ADR-41's amendment, ADR-42's correction and DESIGN land with this step, in the review round below). A root's
