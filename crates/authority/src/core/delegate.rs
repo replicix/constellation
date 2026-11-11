@@ -2837,7 +2837,11 @@ impl Core {
             self.send_forward(now, rid, 0, 0, replica, out);
             return true;
         }
-        if self.fence_forward(now, from, req, gen, (fence, settle), out) {
+        // Fence C9.2: an inbox-ever forward under a non-stealable generation
+        // is refused in this generation's stream, whatever its route.
+        let refuse_in_stream = self.refuses_in_stream(from, gen, fence, settle);
+        let settle_like = settle || refuse_in_stream;
+        if !refuse_in_stream && self.fence_forward(now, from, req, gen, (fence, settle), out) {
             return true;
         }
         // ADR-47: this node's own op, offered to its generation, is touched
@@ -2849,7 +2853,7 @@ impl Core {
                 c.touched_local = true;
             }
         }
-        if settle {
+        if settle_like {
             for d in self.dl.mine.values_mut() {
                 let before = d.parked.len();
                 d.parked.retain(|p| p.rid != rid || p.settle);
@@ -2864,7 +2868,7 @@ impl Core {
         // ADR-46: a restarted holder executes nothing while the read grants
         // its previous process made may be live. A settle passes: its
         // refusal has no effect a reader sees.
-        let quarantined = honoured && !settle && self.deleg_restart_quarantined(now, gen);
+        let quarantined = honoured && !settle_like && self.deleg_restart_quarantined(now, gen);
         if quarantined && from != 0 {
             if let Some(req) = req {
                 // Not parked: a retry would park a duplicate, and a silent
@@ -2898,10 +2902,10 @@ impl Core {
             }
         }
         // The model's rule 1: the delegate waits for `deps` too.
-        let reaches = settle || self.cfg.skip_deleg_dep_wait || replica.reaches(&deps);
+        let reaches = settle_like || self.cfg.skip_deleg_dep_wait || replica.reaches(&deps);
         // Phase 2b (M8): the read delegations this delegate granted on
         // what the op touches are recalled first.
-        let recalling = !settle
+        let recalling = !settle_like
             && honoured
             && reaches
             && !quarantined
@@ -2909,12 +2913,12 @@ impl Core {
         // Plan 46 M1.3 step 5: a release of the subtree is draining; the op
         // waits for its row (it goes to the root then) or for the hold to
         // lift.
-        let holding = !settle && self.sticky_holds(now, gen, &keys, replica);
+        let holding = !settle_like && self.sticky_holds(now, gen, &keys, replica);
         // Plan 46 M0.2 (review): behind the replay queue on its keys, as at
         // the root (R3); under `ack=s3` a delegate's rows for other nodes
         // are `Archive` and become placeholders too. The parked op is
         // released by the stream tick when the queue lets go.
-        let queued = !settle && self.gated_by_queue(from, rid, op, replica);
+        let queued = !settle_like && self.gated_by_queue(from, rid, op, replica);
         if queued {
             self.stats.ops_parked_behind_queue += 1;
         }
@@ -2973,11 +2977,30 @@ impl Core {
             rid,
             op,
             deps,
-            (tag, settle),
+            (tag, settle, fence),
             replica,
             out,
         );
         true
+    }
+
+    /// Fence C9.2: whether a forward is refused in generation `gen`'s
+    /// stream instead of run: it was ever in an inbox, this node holds its
+    /// keys under `gen`, a non-stealable generation, and the forward is not
+    /// a settle or this node's own op. Under a stealable generation nobody
+    /// refuses for good (the root recalls), so the fence rules there.
+    fn refuses_in_stream(
+        &self,
+        from: NodeId,
+        gen: u64,
+        fence: super::holder::Fence,
+        settle: bool,
+    ) -> bool {
+        from != 0
+            && fence.inbox_ever
+            && !settle
+            && !self.cfg.holder_runs_inbox_ever
+            && self.dl.mine.get(&gen).is_some_and(|m| m.non_stealable)
     }
 
     /// ADR-47, the delegate fence: whether a forward from a peer is
@@ -3041,11 +3064,12 @@ impl Core {
     /// - an ordinary rid must have been routed by `gen` (`fence.routed_gen`);
     /// - a rid that was ever in an inbox (`fence.inbox_ever`) is run only
     ///   through the lease holder (its drain decides such a rid, and a
-    ///   batch it still holds can be refused after a designee ran it): a
-    ///   designee answers `Fenced` whatever the route. The lease holder
-    ///   itself, as a designee of its own generation, runs it: its drain
-    ///   and this path are one node, and the rid's outcome is the dedup
-    ///   between them.
+    ///   batch it still holds can be refused after a designee ran it). A
+    ///   designee of a non-stealable generation never runs it (it refuses
+    ///   it in the generation's stream, `refuses_in_stream`); of a stealable
+    ///   one it answers `Fenced` whatever the route, except the lease
+    ///   holder, which runs it as the designee of its own placed
+    ///   generation (nobody refuses under a stealable grant for good).
     ///
     /// The node's own ops (`from == 0`) are never fenced.
     fn forward_is_fenced(
@@ -3061,7 +3085,13 @@ impl Core {
         }
         // (A settle executes nothing: it keeps the route rule.)
         if fence.inbox_ever && !settle {
-            return !self.lease.holds_unexpired(now, &self.cfg);
+            // Non-stealable: never run here (`refuses_in_stream` refuses it
+            // in the stream). Stealable: the lease holder may still run it;
+            // nobody refuses under a stealable grant for good, so no clock
+            // carries I1 there.
+            return (!self.cfg.holder_runs_inbox_ever
+                && self.dl.mine.get(&gen).is_some_and(|m| m.non_stealable))
+                || !self.lease.holds_unexpired(now, &self.cfg);
         }
         fence.routed_gen != gen
     }
@@ -3101,16 +3131,18 @@ impl Core {
         rid: Rid,
         op: &MutateOp,
         deps: Position,
-        (tag, settle): (&LockTag, bool),
+        (tag, settle, fence): (&LockTag, bool, super::holder::Fence),
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        let refuse_in_stream = self.refuses_in_stream(from, gen, fence, settle);
+        let settle_like = settle || refuse_in_stream;
         // A dependency its generation ended without (a tentative
         // acknowledgement, replayed by rid after the end): executing now
         // would put this op in the log ahead of its cause (`marker-order`,
         // long-delegated seed 74189). Not a retry of an op already done.
         // (Nor a settle: its refusal has no effect to order.)
-        if !settle
+        if !settle_like
             && replica.deps_lost(&deps)
             && replica.recent_outcome(rid).is_none()
             && replica.completed_outcome(rid).ok().flatten().is_none()
@@ -3200,7 +3232,7 @@ impl Core {
         }
         // (A settle's refusal is never `Lone`: it waits for the group, also
         // for this node's own client — see `Core::settle_refusal`.)
-        let class_asker = if settle { Asker::Remote } else { asker };
+        let class_asker = if settle_like { Asker::Remote } else { asker };
         let rule = self.deleg_rule(gen, class_asker);
         let mut class: constellation_meta::RowCommit = rule.into();
         let dedup = replica.recent_outcome(rid).is_some()
@@ -3238,7 +3270,7 @@ impl Core {
                     super::client::refused_as_outcome(code)
                 }
             }
-        } else if settle {
+        } else if settle_like {
             // Plan 43 C2 (§5.3 item 5): no outcome here; refused for good,
             // a row of the stream like any refusal (its class set above),
             // answered once its group holds it (below).
@@ -3252,9 +3284,19 @@ impl Core {
             // (the settle did not wait for the op's), and a root appends a
             // stream row only once it holds what the row names.
             let none = Position::ZERO;
-            let code = super::client::settle_code(rid, Some(op));
+            // Fence C9.2: an inbox-ever forward is refused `EROFS`, as the
+            // root's row 8 refuses one.
+            let code = if refuse_in_stream {
+                Code::ReadOnly
+            } else {
+                super::client::settle_code(rid, Some(op))
+            };
             if self.record_delegate_refusal(rid, code, gen, none, replica) {
-                self.stats.settles_refused += 1;
+                if refuse_in_stream {
+                    self.stats.holder_inbox_refusals += 1;
+                } else {
+                    self.stats.settles_refused += 1;
+                }
                 exec_idx = Some(replica.delegate_idx(gen));
                 super::client::refused_as_outcome(code)
             } else {
@@ -5186,7 +5228,7 @@ impl Core {
                     p.rid,
                     &p.op,
                     p.deps,
-                    (&p.tag, p.settle),
+                    (&p.tag, p.settle, p.fence),
                     replica,
                     out,
                 );
