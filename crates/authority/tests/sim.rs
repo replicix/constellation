@@ -7758,6 +7758,21 @@ fn sweep_config() {
                         );
                     }
                     eprintln!("SWEEP-L3 {label} seed {seed}: {}", recall_stall(&report));
+                    if report.unsettled_held_lost_chunk > 0 {
+                        eprintln!(
+                            "SWEEP-LOST-CHUNK {label} seed {seed}: {}",
+                            report.unsettled_held_lost_chunk
+                        );
+                    }
+                    let mut fz = [0u64; 16];
+                    for s in report.stats.values() {
+                        for (t, n) in fz.iter_mut().zip(s.settle_frozen_answer_ms) {
+                            *t += n;
+                        }
+                    }
+                    if fz.iter().any(|n| *n > 0) {
+                        eprintln!("SWEEP-FROZEN-SETTLE {label} seed {seed}: {fz:?}");
+                    }
                     eprintln!(
                         "SWEEP-RG {label} seed {seed}: {} {}",
                         report.stats.values().map(|s| s.read_grants).sum::<u64>(),
@@ -17075,22 +17090,19 @@ fn regression_a_grant_handed_back_during_a_release_is_renewed() {
         // `locks-blips-tight-delegated` hand one back now. Plan 46 M1.1
         // moved 2764's and 1351's to none; 1586 is one of the six of seeds 0
         // to 4 000 of the first that do, 649 one of the seven of the second.
-        // ADR-58 moved 624's trajectory to none: 1586, which hands one back
+        // ADR-58 moved 624's trajectory to none: 1586, which handed one back
         // too (one release waited, one grant returned, none lost or fenced),
-        // replaces it.)
+        // replaced it; the follow-up's settle rule moved 1586's and 1191's to
+        // none, and 1936 of `locks-blips-tight-delegated` is the one of seeds
+        // 0 to 1,999 that hands one back now beside 1043.)
         (
             "locks-unlinked-delegated-blips",
             1043,
             locks_unlinked_blips_config(),
         ),
         (
-            "locks-unlinked-delegated-blips",
-            1586,
-            locks_unlinked_blips_config(),
-        ),
-        (
             "locks-blips-tight-delegated",
-            1191,
+            1936,
             locks_blips_tight_delegated_config(),
         ),
     ] {
@@ -19195,9 +19207,11 @@ fn m03_a_reachable_sequencers_requester_is_not_isolated() {
     // (ADR-58 C2: `locks-blips-tight-long-lease` seed 0 told its EIO at once,
     // with the sequencer reachable; it is settled now. A flex-tight seed
     // whose settle window passes with the lease path reachable for a moment
-    // only is the pin.)
+    // only is the pin: seed 76 (118 ms) is asked by the settle rule of
+    // ADR-58's follow-up and settled; seed 196, the lease path reachable for
+    // 190 ms of its window, stays.)
     let cfg = flex_tight_config;
-    let seed = 76;
+    let seed = 196;
     let r = run_seed(seed, cfg()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
     assert!(
         r.unsettled_violations > 0,
@@ -19389,9 +19403,10 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     type Config = fn() -> SimConfig;
     let strict_configs: [(&str, Config); 14] = [
         // (ADR-58, seeds 0..99: none. In 2,000 seeds `+settle+oracles+unsettled`
-        // 20 seeds fail, 98 before: the settle of an op in a frozen epoch ends
-        // one window after the freeze, and a few windows end with the
-        // sequencer reachable for part of them, see ADR-58's residuals.)
+        // 6 seeds fail, 98 before ADR-58 and 20 before its follow-up: the
+        // settle of an op in a frozen epoch ends one window after the freeze,
+        // and a few windows end with the sequencer reachable for part of
+        // them, see ADR-58's residuals.)
         ("flex", flex_config),
         ("delegated-crash", delegated_crash_config),
         // (0 of 2,000 seeds `+unsettled` after S5, ADR-42; 1 violation in
@@ -19500,19 +19515,30 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         // (ADR-58, seeds 0..99: 0 violations and 2 allowed ones in the old
         // classes (isolated 1, none in time 1), 125 and 9 on main; the 69
         // `held-behind-lost-chunk` ones are counted apart, in the column
-        // below. In 2,000 seeds `+settle+oracles+unsettled` 72 seeds fail, 1834
-        // a late landing that fails on main too, the rest an unsettled `EIO`
-        // with a sequencer reachable: see ADR-58's residuals.)
+        // below (74 in seeds 0..99 after the follow-up's settle rule, 69
+        // before: the ceiling stays and the test passes on its margin, 69
+        // plus 6; the extra 5 are a violation of seed 124 now labelled
+        // correctly and ops of seeds 5, 41, 794 and 1715 that main ended
+        // otherwise, 1,270 over 2,000 seeds against main's 1,259). In 2,000 seeds
+        // `+settle+oracles+unsettled` 59 seeds fail (73 before the follow-up),
+        // 1834 a late landing that fails on main too, the rest an unsettled
+        // `EIO` with a sequencer reachable: see ADR-58's residuals.)
         ("flex-crash", flex_crash_config, 0, 2),
         // (ADR-58, seeds 0..99: 1 violation (seed 60: the root reachable for
         // the whole 3 s window of a frozen epoch) and no allowed one; 55 of
-        // 2,000 seeds fail `+settle+oracles+unsettled`, 101 before.)
+        // 2,000 seeds fail `+settle+oracles+unsettled` (40 after the
+        // follow-up's settle rule, 55 before it), 101 before ADR-58.)
         ("flex-backup", flex_backup_config, 1, 0),
         // (ADR-58, seeds 0..99: 10 violations in 9 seeds and 18 allowed
         // (isolated 7, none in time 11); the lease path of seed 76 is
         // reachable for 118 ms of a 3 s window. Not bounded on main, 876
-        // failing seeds of 2,000 before.)
-        ("flex-tight", flex_tight_config, 10, 18),
+        // failing seeds of 2,000 before. Measured again with the follow-up's
+        // settle rule: 5 violations and 19 allowed (isolated 8, none in time
+        // 11); main measures 6 and 19 in the same seeds, so the allowed
+        // entry stays 18 on its margin and the violations entry goes from 10
+        // to 4. 86 of 2,000 seeds fail `+settle+oracles+unsettled`, 98
+        // before.)
+        ("flex-tight", flex_tight_config, 4, 18),
         // (Plan 46 M1.2 step 13: a client's settle sent to a root that
         // outwaits the generation of a delegate silent behind a partition
         // used to run out its window a second or two before the root ended
@@ -19602,6 +19628,10 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
                         }
                     }
                 }
+                eprintln!(
+                    "CEILING {label}: violations {violations}, allowed {allowed}, \
+                     held-behind-lost-chunk {held_lost_chunk}"
+                );
                 if let Some((max_violations, max_allowed, max_held_lost_chunk)) = ceiling {
                     if violations > *max_violations {
                         failures.lock().unwrap().push(format!(
@@ -20720,6 +20750,33 @@ fn adr58_c2_a_sent_op_in_a_refusing_epoch_is_not_told_eio_at_once() {
     rid_not_told_unsettled("flex", all, 164, (1, 10));
     rid_not_told_unsettled("flex-crash", all, 44, (1, 18));
     rid_not_told_unsettled("flex-crash", all, 102, (1, 5));
+}
+
+/// ADR-58 follow-up (the settle rule): a requester that has no holder to ask
+/// and cannot read the lease (flex 736: its S3 cut, the epoch's owner
+/// restarting inside the window and reachable for 2.7 s of the 3 s) asks the
+/// reachable nodes one by one inside its window, and the owner answers.
+/// Fails on the parent: each of these seeds tells an unsettled `EIO` with the
+/// sequencer reachable for most of the window.
+#[test]
+fn adr58_followup_a_settle_with_no_holder_asks_a_reachable_peer() {
+    let all = "settle+oracles+unsettled";
+    for (label, seeds) in [
+        ("flex", &[736u64, 757, 1020, 1101][..]),
+        ("flex-crash", &[124, 197][..]),
+    ] {
+        for &seed in seeds {
+            let r = run_seed(seed, strict(base_config(label), all))
+                .unwrap_or_else(|e| panic!("{label}+{all} seed {seed}: {e}"));
+            assert_eq!(r.unsettled_violations, 0, "{label} seed {seed}");
+            if (label, seed) == ("flex", 736) {
+                assert!(
+                    r.settle_frozen_asks > 0,
+                    "{label} seed {seed}: no settle asked a peer"
+                );
+            }
+        }
+    }
 }
 
 /// ADR-58 C3: an op whose row waits behind a chunk that exists nowhere is

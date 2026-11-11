@@ -159,6 +159,22 @@ pub(crate) struct ClientOp {
     /// `NotHolder` redirects followed (plan 30 §M11: two, since a
     /// delegate's names the root and the root's a delegate).
     pub redirected: u32,
+    /// ADR-58 follow-up: the nodes this settle has asked in a frozen epoch
+    /// (`settle_ask_frozen`), cleared when every candidate has been asked.
+    pub frozen_asked: Vec<NodeId>,
+    /// ADR-58 follow-up: a settle forward was in flight at the second
+    /// deadline and got its one forward-timeout grace.
+    pub forward_grace: bool,
+    /// ADR-58 follow-up: a probe in flight to an extra peer beside the
+    /// main candidate's forward: its request, the node, when it was sent.
+    pub probe: Option<(OpId, NodeId, WaitMs)>,
+    /// Extra peers already probed in this rotation, and those that did not
+    /// answer a probe within a forward timeout (not probed again).
+    pub probed: Vec<NodeId>,
+    pub probe_dead: Vec<NodeId>,
+    /// ADR-58 follow-up: when this settle first asked a node in a frozen
+    /// epoch (the latency of the answer it gets is measured from here).
+    pub frozen_since: Option<WaitMs>,
     /// A non-stealable holder's refusal was held back for this op (it was
     /// sent on, so it may have run): its in-doubt end is I4's exception for
     /// an unreachable non-stealable holder (`unsettled_nonstealable_holder`).
@@ -776,6 +792,12 @@ impl Core {
                 keys,
                 attempts: 0,
                 redirected: 0,
+                frozen_asked: Vec::new(),
+                forward_grace: false,
+                probe: None,
+                probed: Vec::new(),
+                probe_dead: Vec::new(),
+                frozen_since: None,
                 held_by: None,
                 touched_gen,
                 inbox_ever,
@@ -1714,6 +1736,38 @@ impl Core {
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
+        // ADR-58 follow-up: a probe's answer that names a holder or says an
+        // outcome stands for the forward; a refusal to answer is only heard.
+        if c.probe.is_some_and(|(r, ..)| r == req) {
+            c.probe = None;
+            if matches!(
+                outcome,
+                MutateOutcome::NotHolder { holder: 0 } | MutateOutcome::Busy
+            ) {
+                self.note_p2p_result(now, from, true);
+                return;
+            }
+            let old = match c.phase {
+                Phase::Forwarded { req: old, .. } => Some(old),
+                _ => None,
+            };
+            let timer = c.timer.take();
+            c.phase = Phase::Forwarded { req, holder: from };
+            if let Some(old) = old {
+                self.by_req.remove(&old);
+            }
+            if let Some(t) = timer {
+                self.cancel_timer(t, out);
+            }
+            let Some(c) = self.clients.get_mut(&rid) else {
+                return;
+            };
+            c.forwarded = true;
+            c.redirected = 0;
+        }
+        let Some(c) = self.clients.get_mut(&rid) else {
+            return;
+        };
         if !matches!(c.phase, Phase::Forwarded { req: r, .. } if r == req) {
             return;
         }
@@ -2364,6 +2418,12 @@ impl Core {
         // may be stale: the node is a designee now) the retry goes routed by
         // the generation, not routed 0, which it would fence again.
         let me = self.cfg.node_id;
+        // ADR-58 follow-up: this node's own settle in an epoch that refuses
+        // writes asks the next reachable node instead of only backing off.
+        if settle && self.epoch_refuses_writes() {
+            self.settle_ask_frozen(now, rid, held_by, replica, out);
+            return;
+        }
         // (ADR-47, §4.2: a rid that was ever in an inbox is not retried at a
         // delegate; it asks the lease holder, which redirects it.)
         let held_by = held_by.filter(|(_, g)| *g == 0 || !inbox_ever);
@@ -2958,6 +3018,21 @@ impl Core {
                     .is_some_and(|o| Some(o.body.holder) == self.lease.cached_holder);
             if settle_claims {
                 self.stats.settle_claims_not_routes += 1;
+            }
+            // ADR-58 follow-up (flex 736): a settle whose holder is unknown
+            // asks a reachable peer, which names the holder it knows, on
+            // every other retry (the lease cannot be read while this node's
+            // S3 is cut, and the route below then leads nowhere; with S3 up
+            // the other retries read it).
+            if !settle_claims
+                && self.lease.cached_holder.is_none()
+                && self
+                    .clients
+                    .get(&rid)
+                    .is_some_and(|c| c.settle && c.acquire_retries % 2 == 1)
+                && self.settle_ask_peers(now, rid, None, replica, out)
+            {
+                return;
             }
             if self.cfg.inbox
                 && !settle_claims
@@ -4274,6 +4349,38 @@ impl Core {
             }
             self.stats.acks_aborted += 1;
         }
+        // ADR-58 follow-up: a settle that asked a node in a frozen epoch and
+        // has a forward in flight (sent less than a forward timeout ago: its
+        // timer is armed) waits for the answer, once.
+        // Likewise a settle that waits in its backoff for the tick after the
+        // epoch that refused writes ended meanwhile: it is sent now, and
+        // given the same grace to be answered.
+        let graced = if second {
+            self.clients.get(&rid).and_then(|c| {
+                (c.frozen_since.is_some() && !c.forward_grace).then(|| c.phase.clone())
+            })
+        } else {
+            None
+        };
+        let idle = matches!(graced, Some(Phase::Backoff)) && !self.epoch_refuses_writes();
+        if matches!(graced, Some(Phase::Forwarded { .. })) || idle {
+            let at = now.wait.plus(self.cfg.forward_timeout_ms);
+            if self.extend_settle_deadline(rid, at, Some(now.wait), out) {
+                if let Some(c) = self.clients.get_mut(&rid) {
+                    c.forward_grace = true;
+                    if idle {
+                        if let Some(t) = c.timer.take() {
+                            self.cancel_timer(t, out);
+                        }
+                    }
+                }
+                self.stats.settle_forward_graces += 1;
+                if idle {
+                    self.settle_route(now, rid, replica, out);
+                }
+                return;
+            }
+        }
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
@@ -4850,18 +4957,7 @@ impl Core {
         // dedup, or `Held`/`Busy` until its hold is usable); otherwise it
         // waits for the epoch to end or for its own deadline.
         if self.epoch_refuses_writes() {
-            let me = self.cfg.node_id;
-            let owner = self
-                .pr
-                .carried
-                .map(|c| c.node)
-                .filter(|n| *n != me && self.reaches(now, *n));
-            match owner {
-                Some(owner) if self.cfg.forwarding => {
-                    self.send_forward(now, rid, owner, 0, replica, out)
-                }
-                _ => self.settle_hold_backoff(now, rid, false, out),
-            }
+            self.settle_ask_frozen(now, rid, None, replica, out);
             return;
         }
         let cached = self.lease.cached_holder.filter(|h| *h != self.cfg.node_id);
@@ -4870,6 +4966,188 @@ impl Core {
                 self.send_forward(now, rid, holder, 0, replica, out)
             }
             _ => self.route(now, rid, replica, out),
+        }
+    }
+
+    /// ADR-58 follow-up: a settle of this node's own op that has no holder to
+    /// ask (in an epoch that refuses writes, or on the lease path with no
+    /// cached holder reachable) asks one node per call, inside its one
+    /// window: the node that last answered it `Held` (`held`), else the
+    /// epoch's carrier, the cached holder, then every roster peer `reaches`
+    /// says is up, each once before any is asked again. A non-holder answers
+    /// `NotHolder` naming the holder it knows (followed, with a fresh
+    /// redirect budget), `NotHolder { 0 }` moves the next call on, and a
+    /// sequencer answers the outcome. `false` (nothing sent): nobody to ask.
+    /// The deadline stays the window's.
+    fn settle_ask_peers(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        held: Option<(NodeId, u64)>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        let me = self.cfg.node_id;
+        if !self.cfg.forwarding || !self.cfg.p2p {
+            return false;
+        }
+        let mut order: Vec<NodeId> = Vec::new();
+        let peers: Vec<NodeId> = self.roster.links().keys().copied().collect();
+        for n in self
+            .pr
+            .carried
+            .map(|c| c.node)
+            .into_iter()
+            .chain(self.lease.cached_holder)
+            .chain(peers)
+        {
+            if n != me && !order.contains(&n) {
+                order.push(n);
+            }
+        }
+        order.retain(|n| self.reaches(now, *n));
+        let held = held.map(|(n, _)| n).filter(|n| order.contains(n));
+        // The main candidate is asked on every tick: the node that last
+        // answered `Held`, else the carrier, else the cached holder. With
+        // one, the other peers are probed beside it (`settle_probe`); with
+        // none, they take the ticks in turn.
+        let carried = self.pr.carried.map(|c| c.node);
+        let main = held
+            .or(carried.filter(|n| order.contains(n)))
+            .or(self.lease.cached_holder.filter(|n| order.contains(n)));
+        let pick = main.or_else(|| {
+            let asked = self
+                .clients
+                .get(&rid)
+                .map(|c| c.frozen_asked.clone())
+                .unwrap_or_default();
+            order
+                .iter()
+                .copied()
+                .find(|n| !asked.contains(n))
+                .or_else(|| order.first().copied())
+        });
+        let Some(node) = pick else {
+            return false;
+        };
+        if main.is_some() {
+            self.settle_probe(now, rid, node, &order, replica, out);
+        }
+        if let Some(c) = self.clients.get_mut(&rid) {
+            if main.is_none() {
+                if c.frozen_asked.len() >= order.len() {
+                    c.frozen_asked.clear();
+                }
+                c.frozen_asked.push(node);
+            }
+            if held.is_none() {
+                // (A new candidate has its own redirect and retry budgets:
+                // a dead one must not use up the attempts the holder's
+                // forwards are retried with once the epoch ends.)
+                c.redirected = 0;
+                c.attempts = 0;
+                c.fence_bounces = 0;
+            }
+            c.frozen_since.get_or_insert(now.wait);
+            if let Some(t) = c.timer.take() {
+                self.cancel_timer(t, out);
+            }
+        }
+        self.stats.settle_frozen_asks += 1;
+        tracing::debug!(
+            node = me,
+            ?rid,
+            asks = node,
+            candidates = ?order,
+            "settle: asking a reachable node (no holder to ask)"
+        );
+        self.send_forward(now, rid, node, 0, replica, out);
+        true
+    }
+
+    /// Beside the main candidate's forward, one probe to an extra peer: the
+    /// next of `order` not probed in this rotation and not dead. A probe
+    /// that no answer reached within a forward timeout marks its peer dead
+    /// for the rest of the window; its reply, unless `NotHolder { 0 }` or
+    /// `Busy`, is taken as the forward's (`on_mutate_reply`).
+    fn settle_probe(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        main: NodeId,
+        order: &[NodeId],
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let timeout = self.cfg.forward_timeout_ms as i64;
+        let Some(c) = self.clients.get_mut(&rid) else {
+            return;
+        };
+        if let Some((req, node, at)) = c.probe {
+            if now.wait.since(at) < timeout {
+                return;
+            }
+            c.probe = None;
+            c.probe_dead.push(node);
+            self.by_req.remove(&req);
+        }
+        let Some(c) = self.clients.get_mut(&rid) else {
+            return;
+        };
+        if !c.inbox_keys.is_empty() {
+            return;
+        }
+        let extras: Vec<NodeId> = order
+            .iter()
+            .copied()
+            .filter(|n| *n != main && !c.probe_dead.contains(n))
+            .collect();
+        if c.probed.len() >= extras.len() {
+            c.probed.clear();
+        }
+        let Some(node) = extras.into_iter().find(|n| !c.probed.contains(n)) else {
+            return;
+        };
+        c.probed.push(node);
+        let req = self.op_id();
+        let acked_through = self.acked.floor();
+        let c = self.clients.get_mut(&rid).expect("present");
+        c.probe = Some((req, node, now.wait));
+        c.forwarded = true;
+        let (deps, op, tag) = (c.deps, c.op.clone(), c.tag.clone());
+        let (settle, touched_gen, inbox_ever) = (c.settle, c.touched_gen, c.inbox_ever);
+        self.by_req.insert(req, rid);
+        self.stats.settle_frozen_asks += 1;
+        out.push(Action::Send {
+            to: node,
+            msg: PeerMsg::MutateRequest {
+                req,
+                rid,
+                op,
+                acked_through,
+                deps,
+                applied: replica.applied_seq().unwrap_or(0),
+                tag,
+                settle,
+                routed_gen: 0,
+                touched_gen,
+                inbox_ever,
+            },
+        });
+    }
+
+    /// [`Self::settle_ask_peers`] in an epoch that refuses writes: with
+    /// nobody to ask the settle only backs off.
+    fn settle_ask_frozen(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        held: Option<(NodeId, u64)>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if !self.settle_ask_peers(now, rid, held, replica, out) {
+            self.settle_hold_backoff(now, rid, false, out);
         }
     }
 
@@ -5358,6 +5636,18 @@ impl Core {
         // the parked continuation finishes it.
         if self.dl.pending_exec.contains(&rid) {
             return;
+        }
+        // ADR-58 follow-up: the latency of a frozen-epoch settle's answer.
+        if is_answer(&outcome) {
+            if let Some(since) = self
+                .clients
+                .get_mut(&rid)
+                .and_then(|c| c.frozen_since.take())
+            {
+                let ms = now.wait.since(since).max(0) as u64;
+                let b = ((ms / 250) as usize).min(self.stats.settle_frozen_answer_ms.len() - 1);
+                self.stats.settle_frozen_answer_ms[b] += 1;
+            }
         }
         // Held for a lost dependency (`hold_for_lost_deps`): its backoff
         // timer drives it on.

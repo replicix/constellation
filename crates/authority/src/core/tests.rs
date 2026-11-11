@@ -11063,7 +11063,17 @@ mod epoch_rules {
             h.clk().wait.plus(h.core.dl_t().settle_window),
             "the settle runs one window"
         );
+        // (ADR-58 follow-up: the cached holder is asked at the freeze, and
+        // the forward is in flight at the window's end: one forward timeout
+        // more, then the unsettled `EIO`.)
         h.advance(until.since(h.clk().wait).max(0) as u64);
+        let out = h.step(Event::Timer { id: deadline });
+        assert!(replies(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.settle_forward_graces, 1);
+        let [deadline] = timers(&out, TimerKind::ClientDeadline)[..] else {
+            panic!("no grace deadline: {out:?}")
+        };
+        h.advance(h.core.cfg.forward_timeout_ms);
         let out = h.step(Event::Timer { id: deadline });
         let r = replies(&out);
         assert!(
@@ -57834,6 +57844,191 @@ mod c2g_settle {
         );
         assert_eq!(requester.core.stats.client_unsettled_eio, 0);
         assert_eq!(requester.core.stats.in_doubt, 0);
+    }
+
+    /// The requester of `sent_op_in_a_frozen_epoch(None)` with no cached
+    /// holder (S3 cut: it cannot read the lease) and the peers 1 and 3 up.
+    fn frozen_requester_without_holder() -> (Harness, Harness, Rid, Vec<Action>) {
+        let (holder, mut requester) = pair();
+        let rid = requester.rid(1);
+        let op = requester.create("x");
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        let lost = forward_to_1(&out).expect("forwarded");
+        let mut holder = holder;
+        holder.step_archived(Event::Peer { from: 2, msg: lost });
+        requester.core.epoch.frozen = true;
+        requester.core.pr.carried = None;
+        requester.core.lease.cached_holder = None;
+        {
+            let c = requester.core.clients.get_mut(&rid).unwrap();
+            c.forwarded = true;
+            c.phase = crate::core::client::Phase::WaitingLease;
+        }
+        let now = requester.clk();
+        let mut out = Vec::new();
+        requester.core.refuse_waiting_for_lease(
+            now,
+            constellation_types::Code::ReadOnly,
+            &requester.meta,
+            &mut out,
+        );
+        (holder, requester, rid, out)
+    }
+
+    /// Fire every timer due, as the driver does; the actions of each step.
+    fn fire_due_timers(requester: &mut Harness) -> Vec<Action> {
+        let due: Vec<TimerId> = requester
+            .core
+            .timers
+            .iter()
+            .filter(|(_, (_, at))| matches!(at, TimerAt::Wait(w) if *w <= requester.clk().wait))
+            .map(|(id, _)| *id)
+            .collect();
+        let mut all = Vec::new();
+        for id in due {
+            all.extend(requester.step(Event::Timer { id }));
+        }
+        all
+    }
+
+    /// ADR-58 follow-up (flex 736): a sent op in a frozen epoch with no
+    /// carrier and no cached holder asks a reachable peer inside its window;
+    /// the peer that holds the lease answers the outcome. Fails on the
+    /// parent: nothing is sent, the op ends in doubt at the window's end.
+    #[test]
+    fn a_settle_in_a_frozen_epoch_asks_a_reachable_peer() {
+        let (mut holder, mut requester, rid, out) = frozen_requester_without_holder();
+        assert!(replies(&out).is_empty(), "{out:?}");
+        let mut asked = forward_to_1(&out);
+        for _ in 0..40 {
+            if asked.is_some() {
+                break;
+            }
+            requester.advance(50);
+            asked = forward_to_1(&fire_due_timers(&mut requester));
+        }
+        let settle = asked.expect("the settle is asked of node 1");
+        assert!(
+            matches!(&settle, PeerMsg::MutateRequest { rid: r, settle: true, .. } if *r == rid),
+            "{settle:?}"
+        );
+        let out = round_trip(&mut holder, &mut requester, settle);
+        assert!(
+            !replies(&out)
+                .iter()
+                .any(|(_, r)| matches!(r, ClientReply::InDoubt)),
+            "{out:?}"
+        );
+        assert_eq!(requester.core.stats.client_unsettled_eio, 0);
+    }
+
+    /// ADR-58 follow-up: `NotHolder { 0 }` moves the next tick on to the next
+    /// roster peer (node 3 after node 1), and `NotHolder { h }` redirects to
+    /// `h` with a fresh redirect budget.
+    #[test]
+    fn a_frozen_settle_moves_on_and_follows_redirects() {
+        let (_holder, mut requester, rid, out0) = frozen_requester_without_holder();
+        let next_target = |requester: &mut Harness| -> (NodeId, OpId) {
+            for _ in 0..40 {
+                requester.advance(50);
+                let out = fire_due_timers(requester);
+                if let Some((
+                    to,
+                    PeerMsg::MutateRequest {
+                        req, settle: true, ..
+                    },
+                )) = sends(&out)
+                    .into_iter()
+                    .find(|(_, m)| matches!(m, PeerMsg::MutateRequest { .. }))
+                {
+                    return (to, *req);
+                }
+            }
+            panic!("no settle was sent");
+        };
+        let reply = |req: OpId, holder: NodeId| Event::Peer {
+            from: 0,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::NotHolder { holder },
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+            },
+        };
+        let answer = |requester: &mut Harness, from: NodeId, req: OpId, h: NodeId| {
+            let Event::Peer { msg, .. } = reply(req, h) else {
+                unreachable!()
+            };
+            requester.step(Event::Peer { from, msg })
+        };
+        let (first, req) = match sends(&out0)
+            .into_iter()
+            .find(|(_, m)| matches!(m, PeerMsg::MutateRequest { settle: true, .. }))
+        {
+            Some((to, PeerMsg::MutateRequest { req, .. })) => (to, *req),
+            _ => panic!("the freeze sent no settle: {out0:?}"),
+        };
+        assert_eq!(first, 1);
+        answer(&mut requester, 1, req, 0);
+        let (second, req) = next_target(&mut requester);
+        assert_eq!(second, 3, "NotHolder 0 moves on");
+        // Node 3 names node 1; then node 1 names node 3 again: both
+        // redirects are followed (the budget is per candidate).
+        let out = answer(&mut requester, 3, req, 1);
+        assert!(
+            sends(&out).iter().any(|(to, _)| *to == 1),
+            "the redirect is followed: {out:?}"
+        );
+        assert!(requester.core.clients.contains_key(&rid));
+        assert_eq!(requester.core.stats.client_unsettled_eio, 0);
+    }
+
+    /// ADR-58 follow-up, the bound: peers that never answer end the op at
+    /// one settle window plus one forward timeout (the grace for an attempt
+    /// in flight), not at the client deadline and not later.
+    #[test]
+    fn a_frozen_settle_nobody_answers_ends_by_the_window_and_a_forward_timeout() {
+        let (_holder, mut requester, rid, _) = frozen_requester_without_holder();
+        let cfg = requester.core.config().clone();
+        let dl = Deadlines::new(&cfg);
+        let window = dl.settle_window;
+        let fwd = cfg.forward_timeout_ms;
+        let mut waited = 0u64;
+        let mut told = false;
+        let mut asks = 0;
+        while waited < dl.client_deadline && !told {
+            requester.advance(10);
+            waited += 10;
+            let out = fire_due_timers(&mut requester);
+            asks += sends(&out)
+                .iter()
+                .filter(|(_, m)| matches!(m, PeerMsg::MutateRequest { settle: true, .. }))
+                .count();
+            told = replies(&out)
+                .iter()
+                .any(|(r, rep)| *r == rid && matches!(rep, ClientReply::InDoubt));
+        }
+        assert!(told, "never told in doubt");
+        assert!(asks >= 2, "only {asks} settle sends");
+        assert!(
+            waited >= window,
+            "told at {waited} before the window {window}"
+        );
+        assert!(
+            waited <= window + fwd + 100,
+            "told at {waited}, bound window {window} + forward timeout {fwd}"
+        );
+        assert!(window + fwd < dl.client_deadline);
+        assert_eq!(requester.core.stats.client_unsettled_eio, 1);
     }
 
     /// ADR-58 C2: a carrier-less epoch with no owner to reach: the settle

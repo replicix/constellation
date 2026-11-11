@@ -4298,6 +4298,39 @@ before the outage.
   one settle window later (maintainer decision Q2). A window shorter than the
   epoch leaves an isolated requester's `EIO`, which the classifier allows as
   before.
+- **C2 follow-up, a settle with no holder to ask asks the reachable nodes
+  inside its window** (Q2's bound kept; the rule found by the re-review of the
+  first round). A settle of this node's own op in an epoch that refuses
+  writes used to send itself to the epoch's carrier only, and with none only
+  backed off until the window ended; a requester that could not read the lease
+  (its S3 cut) never learned who the sequencer was (flex 736). Now every
+  `ForwardBackoff` tick (`recall_hold_ms`, at least 50 ms) sends the settle to
+  one *main* candidate (`settle_ask_peers`): the node that last answered it
+  `Held`, else the carrier, else the cached holder, on every tick; and, beside
+  it, one *probe* (`settle_probe`) to the next other roster peer `reaches`
+  says is up, each once before any is probed again. With no main candidate
+  the peers take the ticks in turn. A probe's reply stands for the forward
+  unless it is `NotHolder { 0 }` or `Busy`; `NotHolder { h }` redirects to
+  `h` (the redirect budget, the attempts and the fence bounces are per
+  candidate, so a dead one does not use up the retries the holder's forwards
+  get once the epoch ends). A probe no answer reaches within a forward
+  timeout marks its peer dead for the rest of the window. A settle with no
+  cached holder on the lease path (the acquire retry of a node whose lease
+  reads fail) asks a peer in place of the route on every other retry, the
+  same way. The deadline stays `SettleUntil::Window`, plus one grace of a
+  forward timeout (`settle_forward_graces`) for a second deadline that finds a
+  forward in flight, or finds the settle idle in its backoff after the epoch
+  that refused writes ended (it is sent at once). **Bound**: a settle no node
+  answers ends at the window plus one forward timeout (30.5 s at the defaults,
+  3.5 s in the sim;
+  `a_frozen_settle_nobody_answers_ends_by_the_window_and_a_forward_timeout`);
+  one a live sequencer answers `Held` with an outwait ends at
+  `Deadlines::settle_cap_span` (69.5 s at the defaults), the bound every
+  settle already has; never twice the lease TTL. Latency of the answers of
+  such settles (`Stats::settle_frozen_answer_ms`, from the first ask, seeds
+  0..1999 of the four flex configurations): p50 2.0 to 2.25 s, p90 3.0 to
+  3.5 s, the longest past 3.75 s (a `Held` outwait, within the cap) of a 3 s
+  window.
 - **C3, `held-behind-lost-chunk`, an allowed class.** `MutateOutcome::Held`
   gains `lost_chunk`, set by a root whose answer waits for the durability of a
   row that the ship plan *holds* for a chunk that exists nowhere, or defers
@@ -4341,7 +4374,8 @@ epoch's end (the classifier would have to treat such an epoch as isolation).
 rules of ADR-49 do not already cover, and executes nothing. An unsettled `EIO`
 in a frozen epoch arrives up to a settle window later; a settle's refusal
 behind a lost chunk is answered instead of held until the drop. Counters:
-`settles_sent`, `unsettled_held_lost_chunk`.
+`settles_sent`, `unsettled_held_lost_chunk`, `settle_frozen_asks`,
+`settle_forward_graces`, `settle_frozen_answer_ms`.
 
 **Residuals** (seeds 0..1999, release, `+settle+oracles+unsettled`; main fails
 flex 98, flex-crash 952, flex-tight 876, flex-backup 101 seeds, flex-crash
@@ -4369,12 +4403,56 @@ unsettled `EIO` told with a sequencer reachable, except where named:
   1884 1911 1924 1925 1933, and 596 (class D, `tail_done_skipped`), which
   fails on main too.
 
+After the C2 follow-up (same sweeps; flex 20 to 7, flex-crash 73 to 56,
+flex-tight 98 to 86, flex-backup 55 to 39; the guards `sticky-ttl`,
+`long-delegated+unsettled`, `long-delegated-late-answers+commit` and
+`delegated-root-deposed-delegate-dies` with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`
+are as on main, 0, 0, 0 and 1 (seed 1678)):
+
+- flex: 214 215 490 685 934 1340 1911.
+- flex-crash: 201 215 225 246 253 267 353 360 384 441 490 501 582 595 617 679
+  697 797 821 826 844 934 957 964 970 1017 1022 1027 1075 1084 1091 1127 1154
+  1180 1257 1258 1278 1306 1339 1388 1393 1402 1429 1488 1489 1556 1699 1749
+  1776 1778 1884 1907 1911 1912 1933, and 1834.
+- flex-tight: 33 56 72 79 163 196 209 246 253 271 288 294 394 414 446 449 459
+  462 464 468 525 581 655 675 679 742 745 756 782 792 797 826 832 837 912 922
+  944 969 976 1002 1023 1030 1046 1049 1061 1101 1129 1157 1158 1164 1180 1225
+  1253 1285 1306 1313 1335 1358 1372 1377 1380 1436 1507 1519 1614 1637 1666
+  1693 1695 1730 1753 1771 1778 1802 1856 1879 1895 1915 1933 1950 1974, and
+  91, 476 and 936 (class claim: an answer says group, the journal row is a
+  singleton; 936 fails on main too, 476 failed an unsettled `EIO` there, 91
+  passed), and 1267 (I5, see below).
+- flex-backup: 60 164 192 214 218 382 403 425 435 490 492 560 576 630 719 833
+  882 934 947 974 997 1021 1025 1246 1289 1340 1364 1373 1399 1502 1621 1752
+  1767 1781 1911 1924 1925 1933, and 596.
+
+The set moves with the schedule: the rule fixes 14, 20, 51 and 16 of main's
+seeds and 1, 3, 39 and 0 seeds that passed on main now fail. The new ones are
+all unsettled `EIO`s with a sequencer reachable for a few hundred ms of the
+window (the same shape as the residuals), two class claims (91 and 476, the
+shape of 936: a settle that main ended in doubt is now answered, and the
+answer meets that older hole) and one I5; none is a new kind of failure. A
+seed-level cause that was found and kept: a settle that main left idle in
+`Backoff` or `AcquireRetry` while the epoch that refused writes ended answered,
+by the lease path's deadline extension for a claim that falls due; the
+follow-up's grace now sends such a settle at once, and the extension for a
+claim stays as on main (widening it for settles in `Forwarded` or `Backoff` was
+tried: flex-tight 98 to 113). The I5 of flex-tight 1267 is the
+subscriber-stranding shape of a hold epoch (a subscriber outside the epoch
+holds an acknowledged row ungated; a later epoch's marker that arrives before
+the re-shipped tail strands it): a separate hole in the subscriber's side,
+fixed on its own, that the schedule of this rule exposes; it is not caused by
+settling. What is left is reachabilities of a few hundred ms, the lease-path
+floor (`min_p2p_ms` 0 for `LeasePath`; flex-tight 196 reaches it for 190 ms),
+and a root that comes up inside the last ticks.
+
 Three causes. (1) *The window of a frozen epoch's settle* (the maintainer's
 cap, M3): the `EIO` comes one settle window after the freeze, and some windows
 end with the sequencer reachable for part of them, because the requester that
 has no holder to ask and no S3 to read the lease from (flex 736: the epoch's
 owner reachable for 2.7 s of the 3 s window, the requester routing through the
-inbox) does not find it in time. With the settle left to the client deadline
+inbox) did not find it in time; the follow-up above asks the reachable nodes
+and closes that shape. With the settle left to the client deadline
 (twice the lease TTL) the same code fails 27 flex-crash seeds instead of 73
 (201 225 353 384 441 582 595 617 697 797 957 970 1022 1075 1084 1127 1154 1257
 1258 1402 1699 1749 1776 1834 1907 1912). Short reachabilities

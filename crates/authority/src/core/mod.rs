@@ -1870,6 +1870,13 @@ pub struct Stats {
     /// rid that took effect, left `Held` (never `Accepted` before the
     /// quarantine).
     pub gate_settles_answered: u64,
+    /// ADR-58 follow-up: settles sent to a node in a frozen epoch, and
+    /// second deadlines that waited a forward timeout for one in flight.
+    pub settle_frozen_asks: u64,
+    pub settle_forward_graces: u64,
+    /// Answers a frozen-epoch settle got, by time since its first ask in
+    /// 250 ms buckets (the last is open-ended).
+    pub settle_frozen_answer_ms: [u64; 16],
     pub gate_settles_held: u64,
     pub gate_settles_held_executed: u64,
     /// Plan 46 M0.3 (S5, ADR-42): a takeover gate whose journal work is
