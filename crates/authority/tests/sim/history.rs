@@ -525,56 +525,121 @@ fn linearizable(ops: &[LinOp]) -> Result<bool, String> {
     Ok(go(ops, returned, 0, &NsSpec::default(), &mut seen))
 }
 
+/// A journal row's place: `(epoch, node, journal seq)`.
+pub type Tenure = (u64, u64, u64);
+
 /// Plan 45 §12 O2: each completed rid's journal row, as the shipping
-/// tenure numbered it: `(epoch, node, journal seq)` (`run::journal_order`).
-pub type JournalOrder = std::collections::HashMap<Rid, (u64, u64, u64)>;
+/// tenure numbered it (`run::journal_order`). A row a takeover re-shipped
+/// from its predecessor's tail (`TailOf`) also has the row of the tenure
+/// that first held it ([`JournalOrder::origin`]): it is ordered with both.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JournalOrder {
+    ship: std::collections::HashMap<Rid, Tenure>,
+    origin: std::collections::HashMap<Rid, Tenure>,
+}
+
+impl JournalOrder {
+    pub fn new() -> JournalOrder {
+        JournalOrder::default()
+    }
+
+    /// The row as the shipping tenure numbered it.
+    pub fn get(&self, rid: &Rid) -> Option<&Tenure> {
+        self.ship.get(rid)
+    }
+
+    pub fn insert(&mut self, rid: Rid, row: Tenure) -> Option<Tenure> {
+        self.ship.insert(rid, row)
+    }
+
+    /// The row of the tenure that first held a re-shipped transaction.
+    pub fn origin(&self, rid: &Rid) -> Option<&Tenure> {
+        self.origin.get(rid)
+    }
+
+    pub fn insert_origin(&mut self, rid: Rid, row: Tenure) -> Option<Tenure> {
+        self.origin.insert(rid, row)
+    }
+}
+
+impl FromIterator<(Rid, Tenure)> for JournalOrder {
+    fn from_iter<I: IntoIterator<Item = (Rid, Tenure)>>(iter: I) -> JournalOrder {
+        JournalOrder {
+            ship: iter.into_iter().collect(),
+            origin: Default::default(),
+        }
+    }
+}
 
 /// The successes' linearization order: the log's, except that one
-/// tenure's run of rows is taken in the order it journaled them. The ship
-/// plan sends a tenure's transactions out of journal order only around
-/// one deferred or held on a pending chunk (`store::held`, plan 30
-/// §M4/§M7), and what it sends ahead touches none of the deferred keys:
-/// the two commute, and the journal order is the holder's execution
-/// order, the one its answers were given in. That is write-back's
-/// documented relaxation ("unrelated changes the same node makes
-/// afterwards can become visible first", durability-and-failover): a
-/// later op, of the same node or invoked after the deferred one
-/// returned, may precede it in the log. Within one directory every
-/// entry change also writes the directory's inode, so it takes a link or
-/// a rename into another directory to show (plan 45 §12 O2: `link f3
-/// x/f0` deferred behind `f3`'s pending write, `create f0` shipped
-/// first, `flex+links` seed 9). Rids without a journal row
-/// ([`JournalOrder`]) keep their log position and end a run.
+/// tenure's rows are taken in the order it journaled them where nothing
+/// but that tenure's rows lies between them. The ship plan sends a
+/// tenure's transactions out of journal order only around one deferred or
+/// held on a pending chunk or by key (`store::held`, plan 30 §M4/§M7,
+/// ADR-59), and what it sends ahead conflicts with none of the held keys
+/// (`held::conflicts`): the two commute, and the journal order is the
+/// holder's execution order, the one its answers were given in. That is
+/// write-back's documented relaxation ("unrelated changes the same node
+/// makes afterwards can become visible first", durability-and-failover): a
+/// later op, of the same node or invoked after the held one returned, may
+/// precede it in the log (ADR-59: two names of one directory included; it
+/// took a link or a rename into another directory to show before, plan 45
+/// §12 O2: `link f3 x/f0` deferred behind `f3`'s pending write, `create
+/// f0` shipped first, `flex+links` seed 9). A row a takeover re-shipped from
+/// its predecessor's tail (`TailOf`) was held by two tenures: the one that
+/// first journaled it, which shipped rows past it, and the successor, whose
+/// journal numbers it and which ships its own rows past it; so were the
+/// tenures in between that adopted it and died holding it. It may precede
+/// a row of either tenure that its number in that tenure puts it before,
+/// and any row of a tenure in between, and no other: a row of a third
+/// tenure, or one without a journal row ([`JournalOrder`]), keeps its log
+/// position and ends the move.
+///
+/// The allowance for a tenure in between rests on one assumption the log
+/// cannot verify: that tenure adopted the row at its gate (ADR-51 re-ships
+/// the predecessor's tail, then serves) before it served a row of its own,
+/// so the row numbers below every row of that tenure. A tenure whose gate
+/// never saw a copy served without the row, and a conflicting row of it
+/// then fails the check, as an acknowledged effect invisible to it should.
 pub fn witness_order(
     completed_at: &std::collections::HashMap<Rid, (u64, usize)>,
     journal: &JournalOrder,
 ) -> Vec<Rid> {
     let mut by_log: Vec<(Rid, (u64, usize))> = completed_at.iter().map(|(r, p)| (*r, *p)).collect();
     by_log.sort_by_key(|(_, p)| *p);
-    let mut out: Vec<Rid> = Vec::with_capacity(by_log.len());
-    let mut run: Vec<(u64, Rid)> = Vec::new();
-    let mut tenure: Option<(u64, u64)> = None;
-    let flush = |run: &mut Vec<(u64, Rid)>, out: &mut Vec<Rid>| {
-        run.sort_by_key(|(j, _)| *j);
-        out.extend(run.drain(..).map(|(_, r)| r));
+    let mut out: Vec<Rid> = by_log.into_iter().map(|(r, _)| r).collect();
+    let places = |rid: &Rid| [journal.get(rid), journal.origin(rid)];
+    let precedes = |a: &Rid, b: &Rid| {
+        let same_tenure = places(a).into_iter().flatten().any(|(ea, na, ja)| {
+            places(b)
+                .into_iter()
+                .flatten()
+                .any(|(eb, nb, jb)| (ea, na) == (eb, nb) && ja < jb)
+        });
+        // A tenure between the one that first held `a` and the one that
+        // shipped it adopted it at its gate, before it served a row of its
+        // own, and held it while its own rows shipped past: `a` precedes
+        // them, though its journal number there never reached the log.
+        same_tenure
+            || match (
+                journal.origin(a),
+                journal.get(a),
+                journal.get(b),
+                journal.origin(b),
+            ) {
+                // (A row `b` that is itself an adopted one is ordered by the
+                // numbers of the tenures that held it.)
+                (Some((eo, _, _)), Some((es, _, _)), Some((eb, _, _)), None) => eo < eb && eb < es,
+                _ => false,
+            }
     };
-    for (rid, _) in by_log {
-        match journal.get(&rid) {
-            Some((e, n, j)) => {
-                if tenure != Some((*e, *n)) {
-                    flush(&mut run, &mut out);
-                    tenure = Some((*e, *n));
-                }
-                run.push((*j, rid));
-            }
-            None => {
-                flush(&mut run, &mut out);
-                tenure = None;
-                out.push(rid);
-            }
+    for i in 1..out.len() {
+        let mut j = i;
+        while j > 0 && precedes(&out[j], &out[j - 1]) {
+            out.swap(j, j - 1);
+            j -= 1;
         }
     }
-    flush(&mut run, &mut out);
     out
 }
 
@@ -1517,6 +1582,230 @@ mod tests {
             &JournalOrder::new()
         )
         .is_ok());
+    }
+
+    /// ADR-59: node 1 creates `d/x`, and once that returned, `d/y`. A
+    /// planner that ships `y` ahead of the held `x` leaves the log
+    /// `[y, x]`, which the journal order of one tenure explains; a takeover
+    /// re-ships `x` from the tail (`TailOf`) under a later tenure, and the
+    /// row must be ordered under the tenure that first held it. A row
+    /// shipped ahead of a row of another tenure, or one the journal does
+    /// not order, is a log order the check fails (a refusal or a delete
+    /// landing before the create it depends on is such a log).
+    #[test]
+    fn a_reshipped_row_is_ordered_under_the_tenure_that_first_held_it() {
+        let events = vec![
+            HistEvt::Invoke {
+                thread: 1,
+                rid: rid(1),
+                op: NsOp::Create("d/x".into()),
+            },
+            HistEvt::Return {
+                thread: 1,
+                rid: rid(1),
+                ret: NsRet::Ok,
+            },
+            HistEvt::Invoke {
+                thread: 1,
+                rid: rid(2),
+                op: NsOp::Create("d/y".into()),
+            },
+            HistEvt::Return {
+                thread: 1,
+                rid: rid(2),
+                ret: NsRet::Ok,
+            },
+        ];
+        // The log holds `y` (epoch 1's segment) before `x` (the successor's
+        // gate segment, which carries no rows list).
+        let log = [(rid(2), (1, 0)), (rid(1), (2, 0))].into_iter().collect();
+        let check = |journal: &JournalOrder| {
+            check_linearizable_witnessed(&events, &HashSet::new(), &HashSet::new(), &log, journal)
+        };
+        // No journal row for `x`: its log place is all there is.
+        assert!(check(&[(rid(2), (1, 1, 4))].into_iter().collect()).is_err());
+        // `x` under the tenure that first held it (`TailOf { 1, 3 }`).
+        assert!(check(
+            &[(rid(2), (1, 1, 4)), (rid(1), (1, 1, 3))]
+                .into_iter()
+                .collect()
+        )
+        .is_ok());
+        // A row of another tenure in between is not permuted across.
+        assert!(check(
+            &[(rid(2), (2, 2, 0)), (rid(1), (1, 1, 3))]
+                .into_iter()
+                .collect()
+        )
+        .is_err());
+        // The same log in an unbroken order of one tenure's rows.
+        let ordered = [(rid(1), (1, 0)), (rid(2), (2, 0))].into_iter().collect();
+        assert!(check_linearizable_witnessed(
+            &events,
+            &HashSet::new(),
+            &HashSet::new(),
+            &ordered,
+            &JournalOrder::new()
+        )
+        .is_ok());
+    }
+
+    /// ADR-59: a transaction a takeover re-shipped is held by two tenures.
+    /// `x` was held by epoch 1's journal (row 3) while `y` (row 4) shipped
+    /// past it; the successor (epoch 2) adopted it as its row 14, and shipped
+    /// its own `z` (row 25) past it. The log is `[y, z, x]`: `x` may precede
+    /// `y` (epoch 1 numbers it first) and `z` (epoch 2 does); a third
+    /// tenure's `z` it may not pass.
+    #[test]
+    fn a_reshipped_row_may_pass_the_rows_of_both_tenures_that_held_it() {
+        let events = vec![
+            HistEvt::Invoke {
+                thread: 1,
+                rid: rid(1),
+                op: NsOp::Create("d/x".into()),
+            },
+            HistEvt::Return {
+                thread: 1,
+                rid: rid(1),
+                ret: NsRet::Ok,
+            },
+            HistEvt::Invoke {
+                thread: 1,
+                rid: rid(2),
+                op: NsOp::Create("d/y".into()),
+            },
+            HistEvt::Return {
+                thread: 1,
+                rid: rid(2),
+                ret: NsRet::Ok,
+            },
+            HistEvt::Invoke {
+                thread: 2,
+                rid: rid(3),
+                op: NsOp::Create("d/z".into()),
+            },
+            HistEvt::Return {
+                thread: 2,
+                rid: rid(3),
+                ret: NsRet::Ok,
+            },
+        ];
+        let log = [(rid(2), (1, 0)), (rid(3), (2, 0)), (rid(1), (3, 0))]
+            .into_iter()
+            .collect();
+        let check = |z: Tenure| {
+            let mut journal: JournalOrder =
+                [(rid(2), (1, 1, 4)), (rid(3), z), (rid(1), (2, 2, 14))]
+                    .into_iter()
+                    .collect();
+            journal.insert_origin(rid(1), (1, 1, 3));
+            check_linearizable_witnessed(&events, &HashSet::new(), &HashSet::new(), &log, &journal)
+        };
+        assert!(check((2, 2, 25)).is_ok());
+        assert!(check((3, 3, 1)).is_err());
+        // Without the origin row, `x` stays behind `y`.
+        let journal: JournalOrder = [
+            (rid(2), (1, 1, 4)),
+            (rid(3), (2, 2, 25)),
+            (rid(1), (2, 2, 14)),
+        ]
+        .into_iter()
+        .collect();
+        assert!(check_linearizable_witnessed(
+            &events,
+            &HashSet::new(),
+            &HashSet::new(),
+            &log,
+            &journal
+        )
+        .is_err());
+    }
+
+    /// The tenure between the one that first held a row and the one that
+    /// shipped it adopted it and shipped its own rows past it, though the
+    /// row's number there never reached the log.
+    #[test]
+    fn a_reshipped_row_may_pass_the_rows_of_a_tenure_that_died_holding_it() {
+        let mk = |rid: u64, name: &str, thread| {
+            [
+                HistEvt::Invoke {
+                    thread,
+                    rid: self::rid(rid),
+                    op: NsOp::Create(name.into()),
+                },
+                HistEvt::Return {
+                    thread,
+                    rid: self::rid(rid),
+                    ret: NsRet::Ok,
+                },
+            ]
+        };
+        let mut events = Vec::new();
+        events.extend(mk(1, "d/x", 1));
+        events.extend(mk(2, "d/y", 1));
+        events.extend(mk(3, "d/z", 2));
+        let log = [(rid(2), (1, 0)), (rid(3), (2, 0)), (rid(1), (3, 0))]
+            .into_iter()
+            .collect();
+        let check = |z: Tenure| {
+            let mut journal: JournalOrder =
+                [(rid(2), (1, 1, 4)), (rid(3), z), (rid(1), (3, 3, 14))]
+                    .into_iter()
+                    .collect();
+            journal.insert_origin(rid(1), (1, 1, 3));
+            check_linearizable_witnessed(&events, &HashSet::new(), &HashSet::new(), &log, &journal)
+        };
+        assert!(check((2, 2, 25)).is_ok());
+        assert!(check((4, 4, 1)).is_err());
+    }
+
+    /// A refusal the log cannot explain fails whatever the journal says: a
+    /// create of `d/x` refused with `Eexist` after `d/x` was unlinked and
+    /// the unlink returned, with nothing recreating it.
+    #[test]
+    fn a_refusal_shipped_before_the_create_it_observed_fails() {
+        let events = vec![
+            HistEvt::Invoke {
+                thread: 1,
+                rid: rid(1),
+                op: NsOp::Create("d/x".into()),
+            },
+            HistEvt::Return {
+                thread: 1,
+                rid: rid(1),
+                ret: NsRet::Ok,
+            },
+            HistEvt::Invoke {
+                thread: 1,
+                rid: rid(2),
+                op: NsOp::Unlink("d/x".into()),
+            },
+            HistEvt::Return {
+                thread: 1,
+                rid: rid(2),
+                ret: NsRet::Ok,
+            },
+            HistEvt::Invoke {
+                thread: 2,
+                rid: rid(3),
+                op: NsOp::Create("d/x".into()),
+            },
+            HistEvt::Return {
+                thread: 2,
+                rid: rid(3),
+                ret: NsRet::Eexist,
+            },
+        ];
+        // The unlink is in the log ahead of the create it removed.
+        let log = [(rid(2), (1, 0)), (rid(1), (2, 0))].into_iter().collect();
+        assert!(check_linearizable_witnessed(
+            &events,
+            &HashSet::new(),
+            &HashSet::new(),
+            &log,
+            &JournalOrder::new()
+        )
+        .is_err());
     }
 
     #[test]

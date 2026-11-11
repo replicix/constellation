@@ -248,6 +248,9 @@ pub fn check_sessions(
             if let Some(j) = refused_journal.get(rid) {
                 merged.insert(*rid, *j);
             }
+            if let Some(j) = refused_journal.origin(rid) {
+                merged.insert_origin(*rid, *j);
+            }
         }
     }
     let mut successes: Vec<Rid> = Vec::new();
