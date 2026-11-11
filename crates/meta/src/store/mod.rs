@@ -1351,6 +1351,7 @@ impl Meta {
         meta.check_format()?;
         meta.bootstrap()?;
         meta.refresh_member_copy_flag()?;
+        meta.load_read_holds()?;
         meta.refresh_holder_append_tip()?;
         meta.build_pending_by_ino()?;
         meta.verify_mark_counts()?;

@@ -1777,7 +1777,7 @@ fn strand_local_tx(
             },
         )?;
         if let Some(keys) = hold {
-            meta.hold_copy_row(super::backup::deleg_epoch(row.gen), row.idx, keys);
+            meta.hold_row_tx(tx, super::backup::deleg_epoch(row.gen), row.idx, keys)?;
         }
         return Ok(Stranding::DelegMember);
     }
@@ -1834,7 +1834,7 @@ fn strand_local_tx(
             },
         )?;
         if let (true, Some(keys)) = (kept, hold) {
-            meta.hold_copy_row(row.epoch, first, keys);
+            meta.hold_row_tx(tx, super::member::member_epoch(row.epoch), first, keys)?;
         }
         return Ok(Stranding::Member);
     }

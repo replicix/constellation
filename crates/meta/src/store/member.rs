@@ -70,24 +70,18 @@ pub const HELD_COPY_MAX_AGE_MS: i64 = 5_000;
 /// The least time between two warnings that a hold lapsed.
 pub(crate) const HELD_COPY_WARN_EVERY_MS: i64 = 10_000;
 
-/// A member copy row a segment's strand rolled back
-/// ([`Meta::member_copy_touches`]). In memory, not persisted: after a
-/// restart nothing is held. A segment's apply and a deposition's recovery
-/// (`strand_below_epoch`) set one, on a node that serves reads while the
-/// rows after the rolled-back one stay (the recovery's until its rebuild
-/// lands); a takeover gate and a namespace rebuild do not (the gate
-/// re-applies the tail in the same step, the rebuild derives the namespace
-/// from the log, so no row that depends on a rolled-back one stays). The cost of not
-/// persisting: a process that crashes inside the re-ship window (the 50-125 ms
-/// measured) comes back without the hold and may serve the gap until the
-/// re-ship lands; the window is bounded by the re-ship latency, not closed
-/// after a crash.
+/// An acknowledged row this node took out of its served state while the log
+/// lacks it ([`Meta::member_copy_touches`], ADR-57). Persisted in the strand's
+/// own transaction (`read_hold:{slot}:{first}`, [`Meta::hold_row_tx`]) and
+/// loaded at open, so a restart inside the re-ship window keeps it. `slot`
+/// and `first` are the row's place in `backup_tail` (a member copy slot
+/// [`member_epoch`], or a delegate generation's [`super::backup::deleg_epoch`]).
 #[derive(Clone, Debug)]
 pub(crate) struct HeldCopy {
-    pub(crate) epoch: u64,
+    pub(crate) slot: u64,
     pub(crate) first: u64,
     pub(crate) keys: crate::KeySet,
-    /// [`Meta::held_copy_now_ms`] when it was rolled back.
+    /// [`Meta::held_copy_now_ms`] when it was held (or loaded at open).
     pub(crate) since_ms: i64,
 }
 
@@ -95,10 +89,14 @@ pub(crate) struct HeldCopy {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum StagedRelease {
     Row(u64, u64),
-    Epoch(u64),
+    Slot(u64),
 }
 
-fn member_epoch(epoch: u64) -> u64 {
+pub(super) fn read_hold_key(slot: u64, first: u64) -> Vec<u8> {
+    format!("read_hold:{slot:020}:{first:020}").into_bytes()
+}
+
+pub(super) fn member_epoch(epoch: u64) -> u64 {
     MEMBER_COPY_BASE + epoch
 }
 
@@ -270,7 +268,7 @@ pub(crate) fn drop_settled_rows_tx(
         for row in rows_in(&*tx, meta, e)? {
             if log_settled_tx(&*tx, meta, e, &row)? {
                 tx.remove(&meta.backup_tail, tail_key(member_epoch(e), row.tx.first));
-                meta.release_copy_row(e, row.tx.first);
+                meta.release_row_tx(tx, member_epoch(e), row.tx.first);
                 dropped += 1;
             } else {
                 left += 1;
@@ -592,7 +590,7 @@ impl Meta {
                 oldest = Some(h);
             }
         }
-        let lapsed_row = oldest.map(|h| (h.epoch, h.first));
+        let lapsed_row = oldest.map(|h| (h.slot, h.first));
         held.retain(|h| now_ms.saturating_sub(h.since_ms) < HELD_COPY_MAX_AGE_MS);
         let lapsed = (before - held.len()) as u64;
         if lapsed > 0 {
@@ -620,7 +618,7 @@ impl Meta {
         tracing::warn!(
             lapsed = n,
             total = self.held_copy_lapsed.load(Relaxed),
-            oldest_epoch = row.map(|r| r.0),
+            oldest_slot = row.map(|r| r.0),
             oldest_first = row.map(|r| r.1),
             cap_ms = HELD_COPY_MAX_AGE_MS,
             "a member copy row's read hold lapsed at its cap before the successor's re-ship \
@@ -635,46 +633,117 @@ impl Meta {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Note a row the strand rolled back into `epoch`'s member copy.
-    pub(crate) fn hold_copy_row(&self, epoch: u64, first: u64, keys: crate::KeySet) {
+    /// Hold the keys of the row `(slot, first)` the caller's transaction
+    /// takes out of the served state: the hold is written in that
+    /// transaction (atomic with the rollback) and indexed in memory. Indexed
+    /// before the commit: a hold a failed commit leaves in memory only
+    /// over-waits, until the next restart.
+    pub(crate) fn hold_row_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        slot: u64,
+        first: u64,
+        keys: crate::KeySet,
+    ) -> Result<(), MetaError> {
+        // A row that changes no name and no inode (an epoch marker) has
+        // nothing for a read to miss.
+        if keys.dentries.is_empty() && keys.inos.is_empty() {
+            return Ok(());
+        }
+        tx.insert(&self.local, read_hold_key(slot, first), keys.encode()?);
         let mut held = self.held_copies.lock().unwrap();
-        held.retain(|h| (h.epoch, h.first) != (epoch, first));
+        held.retain(|h| (h.slot, h.first) != (slot, first));
         let since_ms = self.held_copy_now_ms();
         held.push(HeldCopy {
-            epoch,
+            slot,
             first,
             keys,
             since_ms,
         });
         self.any_held_copy
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
-    /// The row `(epoch, first)` leaves the member copy in the caller's
-    /// transaction: its keys are released once that transaction committed
-    /// ([`Self::flush_held_releases`]), not now. Released inside the
-    /// transaction, a reader polling before the commit would be let go and
-    /// read the pre-commit namespace (the marker without its data).
-    pub(crate) fn release_copy_row(&self, epoch: u64, first: u64) {
-        if !self
-            .any_held_copy
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return;
+    /// Load the persisted holds into the in-memory index (open).
+    pub(crate) fn load_read_holds(&self) -> Result<(), MetaError> {
+        let r = self.db.read_tx();
+        let since_ms = self.held_copy_now_ms();
+        let mut held = Vec::new();
+        for guard in r.prefix(&self.local, b"read_hold:".to_vec()) {
+            let (k, v) = guard.into_inner()?;
+            let k = String::from_utf8_lossy(&k).into_owned();
+            let mut it = k["read_hold:".len()..].split(':');
+            let (Some(slot), Some(first)) = (
+                it.next().and_then(|x| x.parse::<u64>().ok()),
+                it.next().and_then(|x| x.parse::<u64>().ok()),
+            ) else {
+                return Err(MetaError::Invalid("read_hold key".into()));
+            };
+            held.push(HeldCopy {
+                slot,
+                first,
+                keys: crate::KeySet::decode(&v)?,
+                since_ms,
+            });
         }
-        self.stage_release(StagedRelease::Row(epoch, first));
+        self.any_held_copy
+            .store(!held.is_empty(), std::sync::atomic::Ordering::Relaxed);
+        *self.held_copies.lock().unwrap() = held;
+        Ok(())
     }
 
-    /// The whole member copy of `epoch` leaves in the caller's transaction
-    /// (released after its commit, like [`Self::release_copy_row`]).
-    pub(crate) fn release_copy_epoch(&self, epoch: u64) {
-        if !self
-            .any_held_copy
+    fn any_held(&self) -> bool {
+        self.any_held_copy
             .load(std::sync::atomic::Ordering::Relaxed)
-        {
+    }
+
+    /// The row `(slot, first)` leaves the served-state gap in the caller's
+    /// transaction (the log carries it, its holder rolled it back, the
+    /// group was abandoned): its hold key goes with the transaction, and the
+    /// in-memory hold once that committed ([`Self::flush_held_releases`]),
+    /// not now: released inside the transaction, a reader polling before the
+    /// commit would be let go and read the pre-commit namespace (the marker
+    /// without its data).
+    pub(crate) fn release_row_tx(&self, tx: &mut SingleWriterWriteTx, slot: u64, first: u64) {
+        if !self.any_held() {
             return;
         }
-        self.stage_release(StagedRelease::Epoch(epoch));
+        tx.remove(&self.local, read_hold_key(slot, first));
+        self.stage_release(StagedRelease::Row(slot, first));
+    }
+
+    /// Every hold of `slot` leaves in the caller's transaction.
+    pub(crate) fn release_slot_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        slot: u64,
+    ) -> Result<(), MetaError> {
+        if !self.any_held() {
+            return Ok(());
+        }
+        self.release_range_tx(tx, slot, u64::MAX)?;
+        self.stage_release(StagedRelease::Slot(slot));
+        Ok(())
+    }
+
+    fn release_range_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        slot: u64,
+        through: u64,
+    ) -> Result<(), MetaError> {
+        let keys: Vec<Vec<u8>> = tx
+            .range(
+                &self.local,
+                read_hold_key(slot, 0)..=read_hold_key(slot, through),
+            )
+            .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
+            .collect::<Result<_, _>>()?;
+        for k in keys {
+            tx.remove(&self.local, k);
+        }
+        Ok(())
     }
 
     fn stage_release(&self, r: StagedRelease) {
@@ -683,10 +752,10 @@ impl Meta {
     }
 
     /// Apply this thread's staged releases after its transaction committed.
-    /// Each is checked against the committed member copy: a hold whose row
-    /// is still there stays (the transaction aborted, or the row came back),
-    /// so an abort releases nothing, and a stale staging left by a failed
-    /// pass is harmless.
+    /// Each is checked against the committed hold key: a hold whose key is
+    /// still there stays (the transaction aborted, or the row was held
+    /// again), so an abort releases nothing, and a stale staging left by a
+    /// failed pass is harmless.
     pub(crate) fn flush_held_releases(&self) {
         let me = std::thread::current().id();
         let mine: Vec<StagedRelease> = {
@@ -707,15 +776,15 @@ impl Meta {
         let mut held = self.held_copies.lock().unwrap();
         held.retain(|h| {
             let named = mine.iter().any(|r| match r {
-                StagedRelease::Row(e, f) => (h.epoch, h.first) == (*e, *f),
-                StagedRelease::Epoch(e) => h.epoch == *e,
+                StagedRelease::Row(s, f) => (h.slot, h.first) == (*s, *f),
+                StagedRelease::Slot(s) => h.slot == *s,
             });
             if !named {
                 return true;
             }
-            // Gone from the committed copy? (A read error keeps the hold.)
+            // Gone from the committed set? (A read error keeps the hold.)
             !matches!(
-                snap.get(&self.backup_tail, tail_key(member_epoch(h.epoch), h.first)),
+                snap.get(&self.local, read_hold_key(h.slot, h.first)),
                 Ok(None)
             )
         });
@@ -876,7 +945,7 @@ fn drop_epoch_tx(tx: &mut SingleWriterWriteTx, meta: &Meta, epoch: u64) -> Resul
         tx.remove(&meta.backup_tail, k);
     }
     tx.remove(&meta.local, member_info_key(epoch).into_bytes());
-    meta.release_copy_epoch(epoch);
+    meta.release_slot_tx(tx, member_epoch(epoch))?;
     Ok(())
 }
 
@@ -938,7 +1007,7 @@ pub(crate) fn member_rules_tx(
                         || (f.through > 0 && last <= f.through)));
             if covered {
                 tx.remove(&meta.backup_tail, key);
-                meta.release_copy_row(e, first);
+                meta.release_row_tx(tx, member_epoch(e), first);
                 out.retired += 1;
                 continue;
             }
@@ -959,12 +1028,12 @@ pub(crate) fn member_rules_tx(
                     out.abandoned += 1;
                 }
                 tx.remove(&meta.backup_tail, key);
-                meta.release_copy_row(e, first);
+                meta.release_row_tx(tx, member_epoch(e), first);
                 continue;
             }
             if through_of.get(&ident.0).is_some_and(|th| ident.1 > *th) {
                 tx.remove(&meta.backup_tail, key);
-                meta.release_copy_row(e, first);
+                meta.release_row_tx(tx, member_epoch(e), first);
                 out.dropped += 1;
                 continue;
             }
@@ -974,7 +1043,7 @@ pub(crate) fn member_rules_tx(
                 && (row.class.is_archive() || row.class.is_singleton() || row.class.is_final())
             {
                 tx.remove(&meta.backup_tail, key);
-                meta.release_copy_row(e, first);
+                meta.release_row_tx(tx, member_epoch(e), first);
                 out.dropped += 1;
                 continue;
             }
@@ -1040,7 +1109,7 @@ pub(crate) fn hole_rolled_back_tx(
                 tail_key(member_epoch(e), row.tx.first),
                 postcard::to_allocvec(&hole)?,
             );
-            meta.release_copy_row(e, row.tx.first);
+            meta.release_row_tx(tx, member_epoch(e), row.tx.first);
             holed += 1;
         }
     }
@@ -1132,17 +1201,18 @@ mod release_tests {
                 time_ns: 1,
             }])
         };
+        let slot = member_epoch(3);
         let mut tx = meta.db.write_tx();
         assert!(put_row_tx(&mut tx, &meta, 3, &row(5)).unwrap());
+        meta.hold_row_tx(&mut tx, slot, 5, keys()).unwrap();
         tx.commit().unwrap();
-        meta.hold_copy_row(3, 5, keys());
         assert!(meta.member_copy_touches(&key));
 
         // Aborted: released inside, never committed.
         {
             let mut tx = meta.db.write_tx();
             tx.remove(&meta.backup_tail, tail_key(member_epoch(3), 5));
-            meta.release_copy_row(3, 5);
+            meta.release_row_tx(&mut tx, slot, 5);
             assert!(
                 meta.member_copy_touches(&key),
                 "still held inside the transaction, before its commit"
@@ -1155,11 +1225,39 @@ mod release_tests {
         // Committed: released once it has.
         let mut tx = meta.db.write_tx();
         tx.remove(&meta.backup_tail, tail_key(member_epoch(3), 5));
-        meta.release_copy_row(3, 5);
+        meta.release_row_tx(&mut tx, slot, 5);
         assert!(meta.member_copy_touches(&key));
         tx.commit().unwrap();
         assert!(meta.member_copy_touches(&key), "not before the flush");
         meta.flush_held_releases();
         assert!(!meta.member_copy_touches(&key));
+    }
+
+    /// The release guard probes the hold itself, whatever slot it is in: a
+    /// release staged for a delegate generation's slot whose hold key is
+    /// still committed (nothing removed it) leaves the hold (it used to probe
+    /// a member-copy slot that never exists for a delegate row, and always
+    /// let go).
+    #[test]
+    fn a_staged_release_of_a_delegate_slot_keeps_a_hold_whose_key_is_still_there() {
+        let meta = Meta::open_in_memory().unwrap();
+        let key = [ReadKey::Dentry(1, "x".into())];
+        let keys = crate::KeySet::from_records(&[crate::LogRecord::Create {
+            parent: 1,
+            name: "x".into(),
+            ino: 7,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        }]);
+        let slot = super::super::backup::deleg_epoch(9);
+        let mut tx = meta.db.write_tx();
+        meta.hold_row_tx(&mut tx, slot, 4, keys).unwrap();
+        tx.commit().unwrap();
+        assert!(meta.member_copy_touches(&key));
+        meta.stage_release(StagedRelease::Slot(slot));
+        meta.flush_held_releases();
+        assert!(meta.member_copy_touches(&key), "the hold key is still there");
     }
 }
