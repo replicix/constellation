@@ -617,6 +617,11 @@ pub struct Config {
     /// `CONSTELLATION_DELEGATION_COOLDOWN_MS` (30 s).
     pub placement_dwell_ms: u64,
     pub placement_cooldown_ms: u64,
+    /// Plan 46 M1.3 step 8 (ADR-56), `CONSTELLATION_STICKY_HANDOVER_GRACE_MS`
+    /// (5 s): a holder asked to hand a sticky subtree over releases it when
+    /// none of its own ops is in flight there, or its own ops there have
+    /// been idle for this long. `0`: only when nothing is in flight.
+    pub handover_grace_ms: u64,
 }
 
 impl Config {
@@ -773,6 +778,7 @@ impl Config {
             placement_leave_pct: 50,
             placement_dwell_ms: 60_000,
             placement_cooldown_ms: 30_000,
+            handover_grace_ms: 5_000,
         }
     }
 }
@@ -1326,6 +1332,13 @@ pub struct Stats {
     pub deleg_sticky_release_undrained: u64,
     pub deleg_sticky_release_held: u64,
     pub deleg_sticky_releases_given_up: u64,
+    /// Plan 46 M1.3 step 8 (ADR-56), the holder's side of a handover
+    /// request: requests that waited for the holder's own ops to be quiet
+    /// (`_waits`), waits that became a release (`_released`), requests for
+    /// a designated subtree, ignored (`_ignored`).
+    pub deleg_handover_waits: u64,
+    pub deleg_handover_released: u64,
+    pub deleg_handover_ignored: u64,
     pub deleg_sticky_ended_abandoned: u64,
     /// Plan 46 M1.3 step 13: `repair abandon` of non-stealable streams:
     /// commands accepted, those that waited for read delegations, streams
@@ -3437,9 +3450,12 @@ impl Core {
                     }
                 }
             }
-            PeerMsg::ReleaseRequest { req, gen, dirs, .. } => {
-                self.on_release_request(now, from, req, gen, dirs, replica, out)
-            }
+            PeerMsg::ReleaseRequest {
+                req,
+                gen,
+                dirs,
+                why,
+            } => self.on_release_request(now, from, req, gen, dirs, why, replica, out),
             PeerMsg::DelegBackupAppend { req, gen, txs } => {
                 self.on_deleg_backup_append(now, from, req, gen, txs, replica, out)
             }
