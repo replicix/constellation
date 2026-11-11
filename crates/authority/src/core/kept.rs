@@ -917,6 +917,35 @@ impl Core {
                 }
             }
         }
+        // The rows below are judged against the log (`row_in_log`), which
+        // knows only the epoch it was last applied to. Once the tail to head
+        // has brought in a segment of the epoch this claim would write (or a
+        // higher one), another claimant has won the lease since this attempt
+        // read it: the tenure's rows read as missing from a log that has
+        // moved on, whatever they are, and this claim's CAS can only fail on
+        // the lease it read. The attempt ends; the next one reads the new
+        // lease. (Not for the carrier re-adopting its own lease, which lands
+        // at the epoch it held.)
+        let lands = u.prev.epoch.max(floor) + 1;
+        if past_gap > 0
+            && !u.partial
+            && !u.force
+            && !u.targets[0].own
+            && replica.applied_epoch() >= lands
+        {
+            self.stats.kept_overtaken += 1;
+            tracing::info!(
+                node = me,
+                prev_epoch = u.prev.epoch,
+                lands,
+                log_epoch = replica.applied_epoch(),
+                rows = past_gap,
+                "the log is at the epoch this claim would write: another claimant won the lease \
+                 while the kept rows were collected, the attempt ends"
+            );
+            self.end_tail_fetch_attempt(now, replica, out);
+            return false;
+        }
         self.bk.kept_floor = floor;
         self.bk.gate_tails_from = u.targets.iter().map(|t| t.tenure.1).min().unwrap_or(0);
         debug_assert!(

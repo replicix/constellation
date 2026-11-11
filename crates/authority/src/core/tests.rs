@@ -65446,6 +65446,63 @@ mod kept_fetch {
     fn a_copy_past_a_gap_is_not_looked_at_under_the_control() {
         assert_eq!(s1_gap(true), (0, 0, true));
     }
+
+    /// Another claimant won the lease while this one collected the kept
+    /// rows: its takeover marker, at the epoch this claim would write, is in
+    /// the tail to head. The log has moved on from the tenure's epochs, so
+    /// the rows a member kept read as missing from it (they start past the
+    /// log's applied rows of that epoch, and `row_in_log` knows only the
+    /// epoch last applied): not a gap in what the sources cover. The attempt
+    /// ends before the merge; no CAS goes out on the lease it read (before:
+    /// the merge counted the rows past a gap, a debug build panicked in
+    /// `kept_install`: `backup-strict` seeds 173 and 517).
+    /// Returns the rows carried, the installs ended for it, and whether a
+    /// CAS went out.
+    fn overtaken(rival_epoch: Epoch) -> (u64, u64, bool) {
+        let (mut h, out) = start(3, &fenced(), &[1, 2, 3, 4], 1, false);
+        let a = asks(&out);
+        let _ = win(&mut h, out, &fenced());
+        let txs = rows(4);
+        // Node 2 kept the last two transactions (the first two it never had
+        // are in the log, or at a member that is slow to answer).
+        let out = answer_all(&mut h, &a, 2, 1, txs[2..].to_vec(), vec![vec![1, 2, 4]]);
+        let out = answer_all(&mut h, &a, 4, 1, Vec::new(), vec![vec![1, 2, 4]])
+            .into_iter()
+            .chain(out)
+            .collect::<Vec<_>>();
+        let run = s3_ops(&out)
+            .into_iter()
+            .find(|(_, r)| matches!(r, S3Op::SegmentRun { .. }))
+            .map(|(op, _)| op)
+            .expect("the tail follows the fetch");
+        // The rival's marker: its claim of the epoch above the fence.
+        let marker = crate::segment::encode(
+            2,
+            rival_epoch,
+            0,
+            &[],
+            &[],
+            &[LogRecord::TailFollows { prev_epoch: 2 }],
+        )
+        .unwrap();
+        let out = h.step(Event::S3 {
+            op: run,
+            result: S3Result::SegmentRun(Ok(vec![(1, marker)])),
+        });
+        let all = win(&mut h, out, &fenced());
+        (
+            h.core.stats.kept_rows_carried,
+            h.core.stats.kept_overtaken,
+            cas(&all).is_some(),
+        )
+    }
+
+    #[test]
+    fn a_claim_whose_tail_shows_the_rivals_epoch_ends_before_the_merge() {
+        assert_eq!(overtaken(3), (0, 1, false));
+        // A rival further up, too.
+        assert_eq!(overtaken(4), (0, 1, false));
+    }
 }
 
 /// ADR-51: the member side of a claimant's kept fetch: what an epoch
