@@ -2065,15 +2065,10 @@ impl Core {
                     return;
                 }
                 let c = self.clients.get_mut(&rid).expect("present");
-                // (ADR-47, the inbox rule: not to a designee for a rid that was
-                // ever in an inbox.)
-                let inbox_only = c.inbox_ever && !c.settle && gen != 0;
-                if holder != 0
-                    && holder != from
-                    && holder != self.cfg.node_id
-                    && c.redirected < 2
-                    && !inbox_only
-                {
+                // (Fence C9.3: an inbox-ever rid follows the redirect too. No
+                // designee runs one under a non-stealable generation, and a
+                // stealable one answers `Fenced`, which reroutes.)
+                if holder != 0 && holder != from && holder != self.cfg.node_id && c.redirected < 2 {
                     c.redirected += 1;
                     self.stats.forward_redirects += 1;
                     self.send_forward(now, rid, holder, gen, replica, out);

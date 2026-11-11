@@ -447,12 +447,20 @@ impl Core {
                     // requester may still have parked at the delegate. A
                     // non-stealable grant is never skipped: `deleg_recall_plan`
                     // refuses it (`EROFS`) while `online` recalls it.
-                    // A rid that was ever in an inbox is never sent to a
-                    // designee (ADR-47, the inbox rule): it runs through
-                    // this lease holder alone, where the drain that may
-                    // still hold its batch decides the same way. (Its
-                    // requester's own generation is answered `Held` below.)
-                    let inbox_only = fence.inbox_ever && !settle && from != d.node;
+                    // A rid that was ever in an inbox is not sent to a
+                    // designee (ADR-47, the inbox rule): it is decided here,
+                    // where the drain that may still hold its batch decides
+                    // the same way. (Its requester's own generation is
+                    // answered `Held` below.) The one exception: a touched
+                    // rid whose non-stealable holder is live is sent to it
+                    // (fence C9.3), so that the holder's stream decides it:
+                    // it answers from the rid's outcome, or refuses it
+                    // `EROFS` in its stream, and runs nothing. An untouched
+                    // rid is refused here (row 8).
+                    let inbox_only = fence.inbox_ever
+                        && !settle
+                        && from != d.node
+                        && !(non_stealable && fence.touched_gen != 0);
                     let redirects = d.node != self.cfg.node_id
                         && live.is_some_and(|g| {
                             g.recall == RecallPhase::None || !settle || non_stealable
@@ -488,6 +496,9 @@ impl Core {
                         // op, sent before its table carried the grant, is
                         // held for a retry instead of a redirect to itself.
                         self.stats.deleg_not_owner += 1;
+                        if fence.inbox_ever && !settle && from != d.node {
+                            self.stats.inbox_ever_redirects += 1;
+                        }
                         let redirect_gen = if from == d.node { 0 } else { d.gen };
                         let outcome = if from == d.node {
                             MutateOutcome::Held {

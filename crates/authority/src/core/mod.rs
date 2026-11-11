@@ -1239,6 +1239,9 @@ pub struct Stats {
     /// Fence C9.2: inbox-ever forwards a non-stealable holder refused
     /// `EROFS` in its own stream.
     pub holder_inbox_refusals: u64,
+    /// Fence C9.3: touched inbox-ever rids the root sent to a live
+    /// non-stealable holder.
+    pub inbox_ever_redirects: u64,
     pub inbox_local_withdrawals: u64,
     pub inbox_ever_rerouted: u64,
     /// ADR-47: the requester's inbox liveness hold (`inbox_ok`), by what its
