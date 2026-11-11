@@ -70189,6 +70189,72 @@ mod route_fence_executor {
         assert_eq!(h.core.stats.fenced_resends, 0);
     }
 
+    /// Fence C9.3 at the requester: an inbox-ever rid follows the root's
+    /// redirect to the designee, routed by its generation (the batch was
+    /// withdrawn before the first send). Fails on the parent: it goes the
+    /// lease path.
+    #[test]
+    fn a_requester_follows_a_redirect_for_an_inbox_ever_rid() {
+        let mut h = Harness::new(2);
+        h.core.cfg.inbox = true;
+        h.core.lease.cached_holder = Some(3);
+        let rid = h.rid(1);
+        h.core.in_doubt_rids.insert(rid);
+        h.core.in_doubt_batches.insert(
+            rid,
+            vec![constellation_store_s3::inbox::InboxKey {
+                epoch: 1,
+                node: 2,
+                n: 0,
+            }],
+        );
+        let op = h.create("a");
+        let mut out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        let (tomb, _) = s3_ops(&out)
+            .into_iter()
+            .find(|(_, r)| matches!(r, S3Op::InboxTombstone { .. }))
+            .expect("withdrawn first");
+        out = h.step(Event::S3 {
+            op: tomb,
+            result: S3Result::InboxTombstone(Ok(())),
+        });
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest { req, .. } if to == 3 => Some(*req),
+                _ => None,
+            })
+            .expect("forwarded");
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::NotHolder { holder: 4 },
+                base: None,
+                position: Position::ZERO,
+                gen: 7,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+            },
+        });
+        let sent = sends(&out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::MutateRequest {
+                routed_gen,
+                inbox_ever,
+                ..
+            } if to == 4 => Some((*routed_gen, *inbox_ever)),
+            _ => None,
+        });
+        assert_eq!(sent, Some((7, true)), "{out:?}");
+        assert_eq!(h.core.stats.forward_redirects, 1);
+    }
+
     /// MUST-1 (the requester's own generation): an own op whose batch is
     /// still in the holder's inbox is not run under the node's own
     /// generation until the batch is withdrawn (the tombstone), then it is
@@ -71049,31 +71115,34 @@ mod route_fence_root {
         assert_eq!(h.core.stats.inbox_own_grant_halts, 0);
     }
 
-    /// The inbox rule at the root: a rid that was ever in an inbox is not
-    /// redirected to a designee (its drain may still hold the batch and
+    /// The inbox rule at the root: an untouched rid that was ever in an inbox
+    /// is not redirected to a designee (its drain may still hold the batch and
     /// decide otherwise); it is decided here as the drain decides it. A rid
-    /// that never was is redirected as ever. Fails on the parent:
-    /// `NotHolder` for both.
+    /// that never was is redirected as ever. A touched one (C9.3) is sent to
+    /// the live non-stealable holder: its stream decides it. Fails on the
+    /// parent: `NotHolder` for the untouched rid's neighbour only, and
+    /// `HolderUnreachable` for the touched one.
     #[test]
-    fn the_root_does_not_redirect_an_inbox_ever_rid() {
+    fn the_root_redirects_a_touched_inbox_ever_rid_to_a_live_sticky_holder() {
         let (mut h, d1, gen) = sticky_root();
         peers(&mut h, Some(true));
         h.advance(5);
-        for (seq, ever, touched) in [(1, true, 0), (2, true, gen), (3, false, 0)] {
+        for (seq, ever, touched) in [
+            (1, true, 0),
+            (2, true, gen),
+            (3, false, 0),
+            (4, true, TOUCHED_UNKNOWN),
+        ] {
             let op = create_in(&h, d1, &format!("f{seq}"));
             let out = forward_ever(&mut h, 2, seq, seq, op, false, (0, touched), ever);
             let got = outcome_to(&out, 2);
             match (ever, touched) {
                 (true, 0) => assert_eq!(got, Some(MutateOutcome::Errno(Code::ReadOnly)), "{out:?}"),
-                (true, _) => assert!(
-                    matches!(got, Some(MutateOutcome::HolderUnreachable { .. })),
-                    "{out:?}"
-                ),
-                (false, _) => {
-                    assert_eq!(got, Some(MutateOutcome::NotHolder { holder: 3 }), "{out:?}")
-                }
+                _ => assert_eq!(got, Some(MutateOutcome::NotHolder { holder: 3 }), "{out:?}"),
             }
         }
+        assert_eq!(h.core.stats.inbox_ever_redirects, 2);
+        assert_eq!(h.core.stats.root_touched_holds, 0);
     }
 
     /// Row 4: a rid that has its outcome here is answered from it, not
