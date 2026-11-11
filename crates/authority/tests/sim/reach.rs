@@ -98,6 +98,7 @@
 //! answered and heard in it. Random message loss (`SimConfig::p2p_drop`) is
 //! not an isolation: the link is up and the settle is retried.
 
+use constellation_authority::deadlines::Deadlines;
 use constellation_authority::NodeId;
 use std::sync::Mutex;
 
@@ -334,13 +335,14 @@ struct Inner {
     /// `(at, epochs)` per node, when they changed: the epochs whose tail the
     /// node could hand a claimant in place (`note_tails`).
     tails: std::collections::BTreeMap<NodeId, Vec<(u64, Vec<u64>)>>,
-    /// Round-trip floors (ms) of P2P and S3, the lease TTL, how long past
-    /// its end a lease with backups is not a non-backup's to claim, and how
-    /// much longer than a plain S3 request a lease read takes.
+    /// Round-trip floors (ms) of P2P and S3, and how much longer than a
+    /// plain S3 request a lease read takes.
     min_p2p_ms: u64,
     min_s3_ms: u64,
-    lease_ttl_ms: u64,
-    claim_grace_ms: u64,
+    /// The protocol windows (the lease TTL, the claim grace, the margin, the
+    /// reclaim horizon, the inherit slack, the recall back-off cap), as the
+    /// product derives them: the configuration's, never copied here.
+    dl: DlCell,
     /// What a claim does after the TTL wait: the promise check (a P2P round
     /// trip) and the CAS (an S3 round trip).
     claim_tail_ms: u64,
@@ -356,36 +358,38 @@ struct Inner {
     kept: Vec<(u64, NodeId)>,
     /// The slowest P2P one-way delay.
     p2p_hi_ms: u64,
-    /// The lease's and grants' safety margin (`expiry_margin_ms`).
-    margin_ms: u64,
-    /// How long the root outwaits a grant it cannot see renewed: the grant's
-    /// ttl plus the margin (`Core::reclaim_horizon_ms`).
-    horizon_ms: u64,
-    /// What a root adds to the window of a generation it inherits after a fast
-    /// takeover (`DelegationState::inherit_slack_ms`: `backup_takeover_ms`;
-    /// 0 after any other acquisition, see [`tenure_of`]).
-    inherit_slack_ms: u64,
     /// One recall round trip: the root asks the generation's group for its
     /// tail (P2P there and back) and records the generation's end (an S3 put:
     /// the slowest request there and back).
     recall_ms: u64,
-    /// The longest the root's recall resend waits.
-    recall_backoff_max_ms: u64,
+}
+
+/// The configuration's [`Deadlines`], with the defaults before a run
+/// configures the classifier.
+struct DlCell(Deadlines);
+
+impl Default for DlCell {
+    fn default() -> Self {
+        DlCell(Deadlines::new(&constellation_authority::Config::defaults(
+            1, 1,
+        )))
+    }
 }
 
 /// The constants of the sim's configuration the classifier derives its
 /// floors and allowances from.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct ReachConfig {
+    /// The protocol windows: the lease TTL, the claim grace (a lease with
+    /// backups is not a non-backup's to claim until it is past), the margin,
+    /// the reclaim horizon, the takeover slack of a fast takeover and the
+    /// recall resend's cap. The classifier takes these from the product's
+    /// derivations and keeps its network terms below as its own.
+    pub dl: Deadlines,
     /// The slowest P2P one-way delay (`SimConfig::p2p_delay.1`).
     pub p2p_delay_hi_ms: u64,
     /// The slowest S3 request (`SimConfig::s3_latency.1`).
     pub s3_latency_hi_ms: u64,
-    /// The lease's ttl (`Config::ttl_ms`).
-    pub lease_ttl_ms: u64,
-    /// How long past its end a lease with backups is not a non-backup's to
-    /// claim (twice `Config::backup_takeover_ms`).
-    pub claim_grace_ms: u64,
     /// What the slow lease reads add to an S3 request.
     pub lease_read_extra_ms: u64,
     /// The fastest S3 request (`SimConfig::s3_latency.0`).
@@ -394,17 +398,6 @@ pub struct ReachConfig {
     pub lease_read_extra_lo_ms: u64,
     /// The settle's retry interval (`Config::acquire_retry_min_ms`).
     pub settle_retry_ms: u64,
-    /// A delegation grant's ttl (`Config::delegation_ttl_ms`).
-    pub delegation_ttl_ms: u64,
-    /// `Config::expiry_margin_ms`.
-    pub expiry_margin_ms: u64,
-    /// `Config::backup_takeover_ms`: a root's slack on the windows of the
-    /// generations it inherits after a fast takeover.
-    pub backup_takeover_ms: u64,
-    /// The longest the root's recall resend waits: the product's cap of
-    /// its back-off, lifted to the request timeout
-    /// (`Deadlines::recall_backoff_max`).
-    pub recall_backoff_max_ms: u64,
 }
 
 /// The run's reachability history (see the module doc).
@@ -445,15 +438,10 @@ impl Reach {
         g.min_p2p_ms = 2 * c.p2p_delay_hi_ms + c.settle_retry_ms;
         g.min_s3_ms = 2 * c.s3_latency_hi_ms + c.lease_read_extra_ms;
         g.min_lease_read_ms = c.s3_latency_lo_ms + c.lease_read_extra_lo_ms;
-        g.lease_ttl_ms = c.lease_ttl_ms;
-        g.claim_grace_ms = c.claim_grace_ms;
+        g.dl = DlCell(c.dl);
         g.claim_tail_ms = 2 * c.p2p_delay_hi_ms + 2 * c.s3_latency_hi_ms;
         g.p2p_hi_ms = c.p2p_delay_hi_ms;
-        g.margin_ms = c.expiry_margin_ms;
-        g.horizon_ms = c.delegation_ttl_ms + c.expiry_margin_ms;
-        g.inherit_slack_ms = c.backup_takeover_ms;
         g.recall_ms = 2 * c.p2p_delay_hi_ms + 2 * c.s3_latency_hi_ms;
-        g.recall_backoff_max_ms = c.recall_backoff_max_ms;
     }
 
     /// The bucket served `node` a lease GET at `served_ms`; the answer reached
@@ -541,7 +529,7 @@ impl Reach {
         inherited_epoch: u64,
     ) {
         let at = self.now_ms();
-        let ends_ms = at + self.inner.lock().unwrap().lease_ttl_ms;
+        let ends_ms = at + self.inner.lock().unwrap().dl.0.base.lease_ttl;
         self.lease_landed_span(LeaseSpan {
             at_ms: at,
             holder,
@@ -854,11 +842,11 @@ fn gen_end_due(g: &Inner, q: &Question, node: NodeId, gen: u64, at: u64, since: 
         }
     }
     let born = q.born.get(&gen).copied().or(installed).unwrap_or(since);
-    let by_grant = renewed_until.map_or(0, |end| end + 2 * g.margin_ms + g.p2p_hi_ms);
-    let inherited = tenure_of(g, at).filter(|t| born < t.start).map_or(0, |t| {
-        t.start + g.horizon_ms + if t.fast { g.inherit_slack_ms } else { 0 }
-    });
-    inherited.max((born + g.horizon_ms).max(by_grant)) + g.recall_ms
+    let inherited = tenure_of(g, at)
+        .filter(|t| born < t.start)
+        .map(|t| (t.start, t.fast));
+    g.dl.0
+        .root_reclaim_due(renewed_until, born, inherited, g.p2p_hi_ms, g.recall_ms)
 }
 
 /// When the root is due to have recalled keys across generations: it ends
@@ -904,7 +892,7 @@ fn blocked_due(g: &Inner, q: &Question, gens: &[(NodeId, u64)], at: u64, since: 
                     && live.iter().all(|(node, _)| peer_up(g, t, r, *node))
             };
             let anchor = stable_since(g, since, at, recalls)?;
-            let recalled = anchor + g.recall_ms + g.recall_backoff_max_ms;
+            let recalled = anchor + g.recall_ms + g.dl.0.recall_backoff_max;
             gens.iter()
                 .map(|(node, gen)| {
                     let due = outwait(*node, *gen);
@@ -1333,7 +1321,7 @@ fn claim_grace_for(g: &Inner, l: &LeaseSpan, me: NodeId) -> u64 {
     if l.backups.is_empty() || l.backups.contains(&me) {
         0
     } else {
-        g.claim_grace_ms
+        g.dl.0.claim_grace
     }
 }
 
@@ -1505,7 +1493,7 @@ fn claim_done(
         Some(l) if readopts_own(g, run_from, me, l) => {
             since_of(l.at_ms.max(attach_since(g, run_from, me))).max(run_from)
         }
-        Some(l) => since_of(l.at_ms) + g.lease_ttl_ms + claim_grace_for(g, l, me),
+        Some(l) => since_of(l.at_ms) + g.dl.0.base.lease_ttl + claim_grace_for(g, l, me),
     };
     // A claim by TTL starts with a fresh read: the product claims by TTL only
     // on a read it *handles* at or after its observation's TTL has run
@@ -1668,7 +1656,7 @@ fn classify(g: &Inner, q: Question) -> Verdict {
     marks.extend(
         g.leases
             .iter()
-            .flat_map(|l| [l.at_ms, l.ends_ms, l.ends_ms + g.claim_grace_ms])
+            .flat_map(|l| [l.at_ms, l.ends_ms, l.ends_ms + g.dl.0.claim_grace])
             .filter(|t| inside(*t)),
     );
     for (_, from, to) in &g.stopped {
@@ -1879,19 +1867,31 @@ mod tests {
     /// grant ended at `e` is due at `e + 2 x 100 + 10 + 100 = e + 310`; one
     /// born at `b` and never installed at `b + 600 + 100 = b + 700`).
     fn cfg(claim_grace_ms: u64, lease_read_extra_ms: u64) -> ReachConfig {
+        let mut c = test_config();
+        c.backup_takeover_ms = claim_grace_ms / 2;
+        cfg_for(&c, lease_read_extra_ms)
+    }
+
+    /// The configuration `cfg` derives its windows from: a 1 000 ms lease,
+    /// 500 ms delegation grants, a 100 ms margin and no takeover window.
+    fn test_config() -> constellation_authority::Config {
+        let mut c = sim_core_like();
+        c.ttl_ms = 1_000;
+        c.delegation_ttl_ms = 500;
+        c.expiry_margin_ms = 100;
+        c.backup_takeover_ms = 0;
+        c
+    }
+
+    fn cfg_for(c: &constellation_authority::Config, lease_read_extra_ms: u64) -> ReachConfig {
         ReachConfig {
+            dl: Deadlines::new(c),
             p2p_delay_hi_ms: 10,
             s3_latency_hi_ms: 40,
-            lease_ttl_ms: 1_000,
-            claim_grace_ms,
             lease_read_extra_ms,
             s3_latency_lo_ms: 0,
             lease_read_extra_lo_ms: 0,
             settle_retry_ms: 100,
-            delegation_ttl_ms: 500,
-            expiry_margin_ms: 100,
-            backup_takeover_ms: 0,
-            recall_backoff_max_ms: 2_000,
         }
     }
 
@@ -2933,10 +2933,9 @@ mod tests {
     /// `world` with a 300 ms takeover slack.
     fn world_with_slack() -> Reach {
         let r = Reach::default();
-        r.configure(ReachConfig {
-            backup_takeover_ms: 300,
-            ..cfg(0, 0)
-        });
+        let mut c = test_config();
+        c.backup_takeover_ms = 300;
+        r.configure(cfg_for(&c, 0));
         for n in 1..=3 {
             r.attached_at(0, n, true);
         }
@@ -3423,16 +3422,12 @@ mod tests {
     /// `EIO` that the product legitimately answers a violation.
     #[test]
     fn the_recall_due_waits_the_products_backoff_cap_not_a_copy_of_it() {
-        let mut slow_forward = sim_core_like();
+        let mut slow_forward = test_config();
         slow_forward.forward_timeout_ms = 3_000;
-        let cap =
-            constellation_authority::deadlines::Deadlines::new(&slow_forward).recall_backoff_max;
+        let cap = Deadlines::new(&slow_forward).recall_backoff_max;
         assert_eq!(cap, 3_000);
         let r = Reach::default();
-        r.configure(ReachConfig {
-            recall_backoff_max_ms: cap,
-            ..cfg(0, 0)
-        });
+        r.configure(cfg_for(&slow_forward, 0));
         for n in 1..=4 {
             r.attached_at(0, n, true);
         }
