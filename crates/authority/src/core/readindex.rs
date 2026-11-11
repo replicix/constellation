@@ -591,9 +591,8 @@ impl Core {
             return None;
         }
         self.lease.held.as_ref()?;
-        let margin = self.cfg.expiry_margin_ms as i64;
-        let cap = self.lease.honour_left_ms(now, &self.cfg)? - margin;
-        let ttl = (self.cfg.read_delegation_ttl_ms as i64).min(cap);
+        let left = self.lease.honour_left_ms(now, &self.cfg)?;
+        let ttl = self.dl_t().read_grant_ttl(left);
         if ttl <= 0 {
             return None;
         }
@@ -625,7 +624,9 @@ impl Core {
         if inos.is_empty() {
             return None;
         }
-        let until = now.wait.plus((ttl + margin) as u64);
+        let until = now
+            .wait
+            .plus((ttl + self.cfg.expiry_margin_ms as i64) as u64);
         if !self.grant_horizon_covers(GrantHorizon::Root, now, until, replica) {
             return None;
         }
@@ -668,8 +669,8 @@ impl Core {
         let margin = self.cfg.expiry_margin_ms as i64;
         // Never outlive the lease that backs the promise: on the honour
         // clock (plan 43 C7-H1, R6); no honour end, no grant.
-        let cap = self.lease.honour_left_ms(now, &self.cfg)? - margin;
-        let ttl = (self.cfg.read_delegation_ttl_ms as i64).min(cap);
+        let left = self.lease.honour_left_ms(now, &self.cfg)?;
+        let ttl = self.dl_t().read_grant_ttl(left);
         if ttl <= 0 {
             return None;
         }
@@ -2025,9 +2026,7 @@ impl Core {
                 return None;
             }
         }
-        let until = now
-            .wait
-            .plus(2 * (self.cfg.read_delegation_ttl_ms + self.cfg.expiry_margin_ms));
+        let until = now.wait.plus(self.dl_t().read_block);
         for ino in inos {
             self.rd.blocked.insert(*ino, until);
         }
