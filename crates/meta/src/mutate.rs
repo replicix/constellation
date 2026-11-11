@@ -246,8 +246,10 @@ pub enum MutateOutcome {
         /// shorter, capped); `None` for every other hold.
         outwait_ms: Option<u64>,
         /// ADR-58 C3: the op's row (the answer's durability wait) sits in a
-        /// held or deferred transaction of the root's journal: it waits for
-        /// a chunk that is not durable (plan 30 §M4), and no sequencer can
+        /// *held* transaction of the root's journal, or one deferred behind
+        /// another node's pending upload (not one waiting for this node's own
+        /// upload: that ships by itself): it waits for a chunk that exists
+        /// nowhere or may never come (plan 30 §M4), and no sequencer can
         /// settle the rid until the chunk comes back or the operator's
         /// `repair drop-held`. A requester whose settle hears it labels the
         /// unsettled `EIO` `held-behind-lost-chunk`, which the sim's oracle

@@ -71,6 +71,11 @@ pub struct ChunkWorld {
     /// Every rid the operator's drops rolled back (`DroppedHeld::rolled_back`):
     /// what the oracle treats as the operator's action.
     pub dropped_rids: Mutex<BTreeSet<constellation_meta::Rid>>,
+    /// When each operator drop ran (the instant it answered), and the first
+    /// instant each rid was rolled back: ADR-58 C3's end-of-run half of
+    /// global truth compares them with an unsettled `EIO` and a landing.
+    pub drop_times: Mutex<Vec<tokio::time::Instant>>,
+    pub dropped_at: Mutex<HashMap<constellation_meta::Rid, tokio::time::Instant>>,
     /// Own pending rows found without bytes anywhere (a replay's adopted
     /// manifest of a departed node's chunk): marked unrecoverable.
     pub poisoned: AtomicU64,
@@ -135,6 +140,37 @@ impl ChunkWorld {
             .map_or(0, |lost| lost.len());
         self.lost.fetch_add(lost as u64, Ordering::Relaxed);
         lost
+    }
+
+    /// An operator's `repair drop-held` just ran and rolled `rids` back.
+    pub fn note_drop(&self, rids: impl IntoIterator<Item = constellation_meta::Rid>) {
+        let now = tokio::time::Instant::now();
+        self.drop_times.lock().unwrap().push(now);
+        let mut at = self.dropped_at.lock().unwrap();
+        for rid in rids {
+            at.entry(rid).or_insert(now);
+        }
+    }
+
+    /// The first operator drop at or after `at`, if any.
+    pub fn first_drop_from(&self, at: tokio::time::Instant) -> Option<tokio::time::Instant> {
+        self.drop_times
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|t| *t >= at)
+            .min()
+    }
+
+    /// Whether an operator drop at or after `at` rolled `rid` back (a drop
+    /// before `at` ran when a sequencer could already settle the rid).
+    pub fn rolled_back_from(&self, rid: constellation_meta::Rid, at: tokio::time::Instant) -> bool {
+        self.dropped_at
+            .lock()
+            .unwrap()
+            .get(&rid)
+            .is_some_and(|t| *t >= at)
     }
 
     /// ADR-58 C3's global truth: some chunk exists nowhere now: lost from a

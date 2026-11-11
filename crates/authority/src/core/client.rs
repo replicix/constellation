@@ -131,6 +131,20 @@ pub enum ClientPhase {
     Settling,
 }
 
+/// What bounds a settle's second deadline (`Core::client_deadline_until`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettleUntil {
+    /// A settle window from now, or the client's deadline when that is later
+    /// (the ordinary deadline).
+    Deadline,
+    /// A settle window from now, no later than the client's deadline when it
+    /// is still ahead: the early S3-less deadline.
+    S3Less,
+    /// A settle window from now, whatever the client's deadline: a sent op
+    /// in an epoch that refuses writes (ADR-58 C2).
+    Window,
+}
+
 #[derive(Debug)]
 pub(crate) struct ClientOp {
     pub op: MutateOp,
@@ -1742,6 +1756,12 @@ impl Core {
             ?outcome,
             "forward reply"
         );
+        if !matches!(&outcome, MutateOutcome::Held { .. }) {
+            // ADR-58 C3: only a `Held` that says so labels a settle.
+            if let Some(c) = self.clients.get_mut(&rid).filter(|c| c.settle) {
+                c.lost_chunk_held = false;
+            }
+        }
         if matches!(&outcome, MutateOutcome::Accepted { .. }) {
             // The latest acceptance decides: a root's after a delegate's
             // leaves the op awaiting the root's log, not a delegate's rows.
@@ -1970,10 +1990,10 @@ impl Core {
                 outwait_ms,
                 lost_chunk,
             } => {
-                if lost_chunk || self.cfg.lost_chunk_label_always {
-                    if let Some(c) = self.clients.get_mut(&rid).filter(|c| c.settle) {
-                        c.lost_chunk_held = true;
-                    }
+                // (The last `Held`'s word: a later `Held` that does not say
+                // it, or any other answer, takes the label back.)
+                if let Some(c) = self.clients.get_mut(&rid).filter(|c| c.settle) {
+                    c.lost_chunk_held = lost_chunk || self.cfg.lost_chunk_label_always;
                 }
                 // Plan 30 §M8: executed; the holder is recalling read
                 // delegations before it acknowledges. Ask again (same
@@ -2763,7 +2783,8 @@ impl Core {
             return;
         }
         // ADR-58 C2: a sent op that settles is never answered in doubt at
-        // once: it is settled, with a window of its own (the tombstones of an
+        // once: it is settled for one settle window from here, not for the
+        // client's deadline (the tombstones of an
         // op with a durable inbox batch are written first and the unsettled
         // `EIO` waits a window after the last acknowledgement,
         // `finish_in_doubt`; flex-tight seed 1002). The classifier credits an
@@ -2774,7 +2795,7 @@ impl Core {
             .get(&rid)
             .is_some_and(|c| !c.settle && Self::settles(c.origin, c.policy))
         {
-            self.client_deadline(now, rid, false, replica, out);
+            self.client_deadline_until(now, rid, SettleUntil::Window, replica, out);
             return;
         }
         // A settle that came back here: no sequencer can answer it in this
@@ -4114,6 +4135,23 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        let rule = if s3_less {
+            SettleUntil::S3Less
+        } else {
+            SettleUntil::Deadline
+        };
+        self.client_deadline_until(now, rid, rule, replica, out);
+    }
+
+    /// [`Self::client_deadline`] with the rule that bounds the settle.
+    pub(crate) fn client_deadline_until(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        rule: SettleUntil,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         let Some(c) = self.clients.get(&rid) else {
             return;
         };
@@ -4316,12 +4354,22 @@ impl Core {
         let window = self.dl_t().settle_window;
         let full = c.submitted.plus(self.dl_t().client_deadline);
         let mut until = now.wait.plus(window);
-        if s3_less {
-            if full > now.wait {
-                until = until.min(full);
+        match rule {
+            SettleUntil::S3Less => {
+                if full > now.wait {
+                    until = until.min(full);
+                }
             }
-        } else if full > until {
-            until = full;
+            // ADR-58 C2 (M3): an epoch that refuses writes ends the wait at
+            // one settle window, not at the client's deadline (twice the
+            // lease TTL after the submission): the window is what a settle
+            // needs, and the epoch may not end for much longer.
+            SettleUntil::Window => {}
+            SettleUntil::Deadline => {
+                if full > until {
+                    until = full;
+                }
+            }
         }
         // An op in doubt in a generation of this node's that lapsed: its row
         // is journaled here and lands when the root ends the generation and
