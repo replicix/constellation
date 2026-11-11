@@ -466,6 +466,7 @@ pub enum SyncRequest {
         req_id: u64,
         gen: u64,
         dirs: Vec<Ino>,
+        why: constellation_authority::ReleaseWhy,
     },
     /// Plan 30 §M11 phase 2b: a delegate's append to this backup;
     /// answered `(acked, sealed)`.

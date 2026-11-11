@@ -509,6 +509,8 @@ pub enum Payload {
         req_id: u64,
         gen: u64,
         dirs: Vec<u8>,
+        /// Why (plan 46 M1.3 step 8): 0 a recall, 1 a handover.
+        why: u8,
     },
     /// Plan 30 §M11 phase 2b: a delegate's append to its backup (postcard
     /// `Vec<DelegateTx>`), and the backup's contiguous hold (or `sealed`).
@@ -1946,6 +1948,7 @@ mod tests {
                 req_id: 3,
                 gen: 2,
                 dirs: vec![1, 2],
+                why: 1,
             },
         ] {
             let signed = Signed::new(&k, &payload).unwrap();

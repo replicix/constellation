@@ -335,6 +335,37 @@ pub struct PeerLink {
     pub since: Option<WaitMs>,
 }
 
+/// Why the root asks a delegate to release subtrees (plan 46 M1.3 step 8,
+/// ADR-56).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseWhy {
+    /// A recall: the root takes the subtrees back.
+    Recall,
+    /// A handover: the root asks the holder of a sticky grant to let go of
+    /// a subtree for the node that dominates it. The holder decides when;
+    /// nothing is taken back.
+    Handover,
+}
+
+impl ReleaseWhy {
+    /// The wire byte of this reason.
+    pub fn to_wire(self) -> u8 {
+        match self {
+            ReleaseWhy::Recall => 0,
+            ReleaseWhy::Handover => 1,
+        }
+    }
+
+    /// The reason a wire byte names; `None` for a byte no version sends.
+    pub fn from_wire(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(ReleaseWhy::Recall),
+            1 => Some(ReleaseWhy::Handover),
+            _ => None,
+        }
+    }
+}
+
 /// What `constellation repair abandon` gives up (plan 46 M1.3 step 13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbandonTarget {
@@ -1011,6 +1042,7 @@ pub enum PeerMsg {
         req: OpId,
         gen: u64,
         dirs: Vec<Ino>,
+        why: ReleaseWhy,
     },
     /// Phase 2b: a delegate appends its stream transactions to its
     /// backup before acknowledging them; the backup answers with what it

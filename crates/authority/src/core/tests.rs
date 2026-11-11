@@ -5,7 +5,7 @@
 use super::*;
 use crate::action::{ClientReply, S3Op};
 use crate::deadlines::Deadlines;
-use crate::event::{CasFailure, PeerMsg, Policy, S3Result, UploadResult};
+use crate::event::{CasFailure, PeerMsg, Policy, ReleaseWhy, S3Result, UploadResult};
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::{
     LogRecord, Meta, MetaStore, MutateOp, MutateOutcome, OwnChunks, Rid, RowCommit,
@@ -17183,6 +17183,7 @@ mod locks {
         let out = h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req: OpId(5),
                 gen: 7,
                 dirs: vec![dir],
@@ -17466,6 +17467,7 @@ mod locks {
         let out = h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req: OpId(5),
                 gen: 7,
                 dirs: vec![dir],
@@ -25644,6 +25646,7 @@ mod locks {
             h.step(Event::Peer {
                 from: 1,
                 msg: PeerMsg::ReleaseRequest {
+                    why: ReleaseWhy::Recall,
                     req: OpId(5),
                     gen: 7,
                     dirs: vec![dir],
@@ -32835,6 +32838,7 @@ mod locks {
         let out = d.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req,
                 gen: 7,
                 dirs: vec![dir],
@@ -40085,6 +40089,7 @@ fn a_generation_recalled_while_parked_is_not_installed_when_its_record_reaches_t
         h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req: OpId(5),
                 gen: 7,
                 dirs: vec![dir],
@@ -40465,6 +40470,7 @@ mod redelegated_to_the_requester {
         s.h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req: OpId(5),
                 gen: 7,
                 dirs: vec![s.dir],
@@ -45623,6 +45629,7 @@ mod stream_end {
         let out = h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req: OpId(78),
                 gen: 7,
                 dirs: vec![dir],
@@ -46661,6 +46668,7 @@ mod deleg_group {
         let out = h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req: OpId(78),
                 gen: 7,
                 dirs: vec![dir],
@@ -46684,6 +46692,7 @@ mod deleg_group {
         let out = h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req: OpId(77),
                 gen: 7,
                 dirs: vec![dir],
@@ -46820,6 +46829,7 @@ mod deleg_group {
         let out = h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req: OpId(5),
                 gen: 7,
                 dirs: vec![dir],
@@ -66061,7 +66071,7 @@ mod step9_one_stream_per_node {
         to: NodeId,
     ) -> Option<(OpId, u64, Vec<constellation_fs_core::Ino>)> {
         sends(out).into_iter().find_map(|(n, m)| match m {
-            PeerMsg::ReleaseRequest { req, gen, dirs } if n == to => {
+            PeerMsg::ReleaseRequest { req, gen, dirs, .. } if n == to => {
                 Some((*req, *gen, dirs.clone()))
             }
             _ => None,
@@ -66405,6 +66415,7 @@ mod step9_one_stream_per_node {
         let out = h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req: OpId(5),
                 gen: 7,
                 dirs: vec![d1],
@@ -66448,6 +66459,7 @@ mod step9_one_stream_per_node {
         let out = h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req: OpId(5),
                 gen: 7,
                 dirs: vec![d1, d2],
@@ -66503,6 +66515,7 @@ mod step9_one_stream_per_node {
         let out = h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req: OpId(5),
                 gen: 7,
                 dirs: vec![d3],
@@ -66575,6 +66588,7 @@ mod step9_one_stream_per_node {
         h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req: OpId(req),
                 gen: 7,
                 dirs,
@@ -67631,6 +67645,7 @@ mod step9_one_stream_per_node {
         h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req: OpId(40),
                 gen: 7,
                 dirs: vec![b],
@@ -69254,6 +69269,7 @@ mod step5_sticky_release {
         h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req: OpId(60),
                 gen: 7,
                 dirs: dirs_wire,
@@ -71465,6 +71481,7 @@ mod step14_release_seal {
         h.step(Event::Peer {
             from: 1,
             msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
                 req: OpId(5),
                 gen: 7,
                 dirs: Vec::new(),
