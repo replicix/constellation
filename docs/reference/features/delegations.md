@@ -143,16 +143,27 @@ through the delegate. It then:
      a recorded backup, or the root itself when its link to the node is within
      `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (judged by the link's best round trip over the last placement tick, so one slow sample from load or a rejoin does not refuse it, while a link slow throughout does; the first exchange after a link comes up, which dials the connection, is not a sample; a link not measured yet counts; a budget of 0 admits no peer, whatever the link measures). A
      writer with neither, a far writer (no peer, the root included, within the
-     budget), is not delegated: placement skips it
-     (`place_skipped_far`), `constellation delegate` without `--sticky`
-     refuses it, and its ops are forwarded to the root as a non-delegated
-     writer's are, until a sticky grant (plan 46 M1.3). Sticky and designated
-     grants are final and need no group. A delegate whose links later leave the
+     budget), is not given a placed grant: `constellation delegate` without
+     `--sticky` refuses it, and placement grants a dominant one a **sticky**
+     subtree once its link has measured far for a whole far dwell (every
+     round trip of `CONSTELLATION_DELEGATION_FAR_DWELL_MS`, 30 s, at least
+     `CONSTELLATION_DELEGATION_FAR_RTT_MS`, 20 ms;
+     [ADR-54](../../explanation/DECISIONS.md#adr-54-placement-grants-a-far-dominant-writer-a-sticky-subtree-and-recalls-placed-grants-only-after-a-long-dwell)).
+     Until then, and in the dead band between the budget and the far round
+     trip (a LAN under load), its ops are forwarded to the root as a
+     non-delegated writer's are (`place_skipped_far`). A budget of 0 admits
+     no peer, so every connected eligible dominant writer is far and gets a
+     sticky subtree; `CONSTELLATION_DELEGATION_STICKY_PLACEMENT=off` keeps
+     the forwards. A placed grant to a node measured far after the grant
+     (with no recorded backup) is recalled once the far dwell has passed
+     (`place_converted`, no cooldown) and granted sticky. A sticky holder
+     that dies blocks its subtree (`EROFS`, and `EXDEV` for an op across its
+     boundary) until it returns, releases or the operator abandons it, and a
+     writer that reaches the root only through the inbox gets `EROFS` where
+     fence rule C9 applies. Sticky and designated grants are final and need
+     no group. A delegate whose links later leave the
      budget answers nothing until its group holds the row: only latency
-     degrades, never an acknowledged row. A placed grant to a node measured
-     far after the grant is recalled once the measurement has held for a
-     placement tick (one round-trip sample inflated by load does not recall
-     it), and the recall is counted once. `delegation_stream_rows` (256) is
+     degrades, never an acknowledged row. `delegation_stream_rows` (256) is
      the size of a stream batch.
 
      What a far writer pays until a sticky grant: its own creates cost a
@@ -730,8 +741,10 @@ and node, and evaluates it every tenth of the window:
   condition holds gives one delegation over a writer's whole working
   set, not a swarm of leaves. This follows Ceph's finding (Mantle,
   SC'15): move metadata to its dominant writer rather than spreading it.
+- **Grant a far writer a sticky subtree**: see the far-writer paragraph
+  above. Placement never recalls a sticky grant.
 - **Recall** a placed delegation when, for a whole dwell
-  (`CONSTELLATION_DELEGATION_DWELL_MS`, 60 s), the delegate's share
+  (`CONSTELLATION_DELEGATION_DWELL_MS`, 5 minutes), the delegate's share
   stayed below `CONSTELLATION_DELEGATION_LEAVE` (50%) or the subtree's
   rate below half the floor. Entering at 70% and leaving at 50% is the
   hysteresis.
@@ -1202,7 +1215,10 @@ dies: no acknowledged write is lost) and the causal-cut oracle.
 | `CONSTELLATION_DELEGATION_MIN_OPS` | `200` | rate floor per window |
 | `CONSTELLATION_DELEGATION_DOMINANCE` | `70` | percent to be given a subtree |
 | `CONSTELLATION_DELEGATION_LEAVE` | `50` | percent below which a placed delegation is recalled |
-| `CONSTELLATION_DELEGATION_DWELL_MS` | `60000` | recall dwell |
+| `CONSTELLATION_DELEGATION_DWELL_MS` | `300000` | recall dwell |
+| `CONSTELLATION_DELEGATION_STICKY_PLACEMENT` | on | a dominant far writer is granted a sticky subtree |
+| `CONSTELLATION_DELEGATION_FAR_RTT_MS` | `20` | a link is far when every round trip of the far dwell is at least this |
+| `CONSTELLATION_DELEGATION_FAR_DWELL_MS` | `30000` | how long a link must measure far |
 | `CONSTELLATION_DELEGATION_COOLDOWN_MS` | `30000` | cool-down after a recall |
 
 For the millisecond knobs `0` means the default. For `_MIN_OPS`,
