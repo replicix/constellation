@@ -1336,7 +1336,16 @@ impl Core {
         if !self.cfg.takeover_promise_check {
             return false;
         }
-        if prev.holder == 0 || prev.holder == self.cfg.node_id || prev.released {
+        if prev.holder == 0 || prev.released {
+            return false;
+        }
+        if prev.holder == self.cfg.node_id {
+            // (This node's own lease needs no promises. Counted when it is the
+            // re-claim of the carried lease by the hold owner that closed the
+            // epoch, E1.)
+            if self.owner_reclaims(prev) {
+                self.stats.promise_flush_exempt += 1;
+            }
             return false;
         }
         // Plan 43 C7b: M9's permit paths (a sealed backup, `ack=s3`) made
@@ -1347,27 +1356,27 @@ impl Core {
             return false;
         }
         // (ADR-51, Q6: no exemption for a member claimant of a lease its epoch
-        // carried: it needs the proof that no live epoch still holds the
-        // tenure, as any other taker. Only the node that closed the epoch as
-        // its hold owner owes the re-claim.)
-        if self.owner_reclaims(prev) {
-            self.stats.promise_flush_exempt += 1;
-            return false;
-        }
+        // carried, nor for a transferee that closed the epoch it was handed:
+        // each needs the proof that no live epoch still holds the tenure, as
+        // any other taker. Only the carrier's own re-claim, above, is exempt.)
         true
     }
 
-    /// ADR-51 (E1): this node closed the epoch as its hold owner and the
-    /// lease `prev` is the one that epoch carried: it owes that lease's move
-    /// and its rows are in its journal. The promise check and the kept phase
-    /// exempt exactly this re-claim; a member that never held the epoch does
-    /// not match (its `hold_ended` is empty or another's).
+    /// ADR-51 (E1): this node is the carrier of the lease `prev`, closed the
+    /// epoch that carried it as its hold owner, and owes that lease's move;
+    /// its rows are in its journal. The promise check and the kept phase
+    /// exempt exactly this re-claim. A transferee that closed the epoch it
+    /// was handed (`carried.node` is the carrier, not this node), and a
+    /// member that never held the epoch, do not match: they take the
+    /// tenure over like any other taker (`epoch_reclaim_due` has the same
+    /// rule).
     pub(crate) fn owner_reclaims(&self, prev: &Lease) -> bool {
         self.pr
             .hold_ended
             .is_some_and(|h| h == (prev.epoch, prev.expires_unix_ms, true))
             && self.pr.carried.is_some_and(|c| {
-                c.node == prev.holder
+                c.node == self.cfg.node_id
+                    && c.node == prev.holder
                     && c.epoch == prev.epoch
                     && c.expires_unix_ms == prev.expires_unix_ms
             })

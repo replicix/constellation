@@ -13968,11 +13968,13 @@ mod m10 {
         assert!(s3_ops(&out).is_empty(), "{out:?}");
     }
 
-    /// The re-claim of the carried lease needs no promises for the node that
-    /// closed the epoch as its hold owner (it owes the lease's move); a
-    /// member that never held the epoch (ADR-51, Q6: it is any other taker)
-    /// asks for them. Fails on the parent: the exemption matched on the
-    /// carried lease alone, and let a member claim past a live epoch's proof.
+    /// The re-claim of the carried lease needs no promises for the carrier
+    /// that closed the epoch as its hold owner (it owes the lease's move; its
+    /// rows are in its journal). A member that never held the epoch, and a
+    /// transferee that closed the epoch it was handed (ADR-51, Q6, E1: it is
+    /// any other taker), ask for them. Fails on the parent: the exemption
+    /// matched on the carried lease alone, and let a member or a transferee
+    /// claim past a live epoch's proof.
     #[test]
     fn the_flush_reclaim_of_the_carried_lease_needs_no_promises() {
         let mut h = flex(1);
@@ -13987,8 +13989,24 @@ mod m10 {
         assert_eq!(tails(&out), 0, "no tail before the check: {out:?}");
         assert_eq!(h.core.stats.promise_checks, 1);
         assert_eq!(h.core.stats.promise_flush_exempt, 0);
-        // The node that closed the epoch as its hold owner: exempt.
+        // A transferee that closed the epoch as its hold owner (the carrier is
+        // node 2, not this node): the check runs too.
         let mut h = flex(1);
+        h.core.pr.carried = Some(Carrier {
+            node: 2,
+            epoch: 3,
+            expires_unix_ms: carried.expires_unix_ms,
+        });
+        h.core.pr.hold_ended = Some((3, carried.expires_unix_ms, true));
+        let out = acquire_against(&mut h, carried.clone());
+        assert_eq!(tails(&out), 0, "no tail before the check: {out:?}");
+        assert_eq!(h.core.stats.promise_checks, 1);
+        assert_eq!(h.core.stats.promise_flush_exempt, 0);
+        // The carrier (node 2) that closed the epoch as its hold owner:
+        // exempt.
+        let mut h = Harness::new(2);
+        h.core.cfg.epoch_slack = 1;
+        h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
         h.core.pr.carried = Some(Carrier {
             node: 2,
             epoch: 3,
@@ -63788,6 +63806,183 @@ mod kept_fetch {
         assert!(carried, "the claim landed without the rows");
     }
 
+    // ---- the previous holder is told, whatever the rules need of it ----
+
+    /// With `f = 0` and no epoch ever carrying the tenure the rules are met
+    /// by the claimant's own answer: the phase asks no member. The previous
+    /// holder still gets its plain seal (it deposes a live-but-expired
+    /// holder before the CAS, so its unshipped answers roll back and replay
+    /// by rid rather than die with it), and its answer is not waited for.
+    /// Fails on the parent: nothing was sent, the holder went on
+    /// acknowledging on its own disk. Returns the holders told and whether
+    /// the claim landed.
+    fn holder_told(skipped: bool) -> (Vec<NodeId>, bool) {
+        let lease = lease_of(2, 3, 0);
+        let (mut h, out) = start(3, &lease, &[2, 3], 0, skipped);
+        let told: Vec<NodeId> = plain_asks(&out).into_iter().map(|(to, _)| to).collect();
+        assert!(asks(&out).is_empty(), "no member is asked: {out:?}");
+        let landed = finish(&mut h, out, &lease).is_some();
+        (told, landed)
+    }
+
+    #[test]
+    fn the_previous_holder_is_told_when_the_rules_are_met_without_it() {
+        assert_eq!(holder_told(false), (vec![2], true));
+    }
+
+    #[test]
+    fn the_previous_holder_is_not_told_under_the_control() {
+        assert_eq!(holder_told(true), (Vec::new(), true));
+    }
+
+    // ---- P2P off: no hold exists, nothing is asked ----
+
+    /// With P2P off (`inbox` mode) no epoch, hold or stream exists and no
+    /// peer message may be sent: the claim of a fence goes on without the
+    /// phase. Fails on the parent: the phase asked the roster's nodes.
+    fn p2p_off(skipped: bool) -> (usize, bool) {
+        let mut h = Harness::new(3);
+        h.core.cfg.p2p = false;
+        h.core.cfg.kept_fetch_skipped = skipped;
+        h.core.cfg.takeover_promise_check = false;
+        h.core.cfg.epoch_slack = 1;
+        let lease = fenced();
+        h.watch(&lease);
+        h.step(roster_ev(vec![1, 2, 3], h.clk().wait));
+        h.advance(10);
+        let out = acquire(&mut h, &lease);
+        let peer_sends = sends(&out).len();
+        (peer_sends, finish(&mut h, out, &lease).is_some())
+    }
+
+    #[test]
+    fn a_node_with_p2p_off_collects_nothing_and_sends_nothing() {
+        assert_eq!(p2p_off(false), (0, true));
+    }
+
+    #[test]
+    fn a_node_with_p2p_off_collects_nothing_under_the_control() {
+        assert_eq!(p2p_off(true), (0, true));
+    }
+
+    // ---- M2 (round 2): E1 is the carrier's own re-claim ----
+
+    /// The epoch row of `e1` carrying the lease `(1, 1)` among `[1, 2, 3]`.
+    fn carrying_row(h: &Harness) {
+        h.meta
+            .persist_epoch(
+                "e1",
+                &[1, 2, 3],
+                &Default::default(),
+                7,
+                "closed",
+                Some((1, 1)),
+            )
+            .unwrap();
+    }
+
+    /// A transferee `O` (node 2) that was handed the hold of an epoch
+    /// carrying node 1's lease and closed it as the hold owner takes the
+    /// lease like any taker: the promise check runs and the kept phase
+    /// follows it. (Its `hold_ended` matches the lease, but the carrier is
+    /// not this node.) Returns the promise checks that began and the kept
+    /// asks after the check passed.
+    fn e1_transferee(skipped: bool) -> (u64, usize) {
+        let mut h = Harness::new(2);
+        h.core.cfg.kept_fetch_skipped = skipped;
+        h.core.cfg.epoch_slack = 1;
+        h.step(roster_ev(vec![1, 2, 3], h.clk().wait));
+        let expires = h.now.0 - 1_000;
+        let lease = lease_of(1, 1, expires);
+        h.watch(&lease);
+        h.core.pr.carried = Some(Carrier {
+            node: 1,
+            epoch: 1,
+            expires_unix_ms: expires,
+        });
+        h.core.pr.hold_ended = Some((1, expires, true));
+        carrying_row(&h);
+        let out = acquire(&mut h, &lease);
+        let Some(hb) = s3_ops(&out)
+            .into_iter()
+            .find(|(_, r)| matches!(r, S3Op::HeartbeatRead))
+            .map(|(op, _)| op)
+        else {
+            return (h.core.stats.promise_checks, asks(&out).len());
+        };
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::PromiseRequest { req, .. } if to == 3 => Some(*req),
+                _ => None,
+            })
+            .expect("node 3 is asked for a promise");
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::PromiseReply {
+                req,
+                granted: true,
+                epoch_slack: 1,
+            },
+        });
+        let out = h.step(Event::S3 {
+            op: hb,
+            result: S3Result::Heartbeats(Ok(Vec::new())),
+        });
+        (h.core.stats.promise_checks, asks(&out).len())
+    }
+
+    #[test]
+    fn a_transferee_that_closed_the_epoch_checks_promises_and_collects_the_kept_rows() {
+        assert_eq!(e1_transferee(false), (1, 2), "node 3, both stream epochs");
+    }
+
+    #[test]
+    fn a_transferee_that_closed_the_epoch_asks_nothing_under_the_control() {
+        assert_eq!(e1_transferee(true), (1, 0), "the check, no kept ask");
+    }
+
+    /// The carrier (node 1) that handed its hold over re-adopts its own
+    /// lease: its journal lacks the transferee's rows one epoch up, so the
+    /// kept phase asks the members for that epoch only (its own rows of the
+    /// tenure's epoch are in its journal). Returns the epochs asked.
+    fn carrier_after_handover(skipped: bool, handed: bool) -> Vec<Epoch> {
+        let mut h = Harness::new(1);
+        h.core.cfg.kept_fetch_skipped = skipped;
+        h.core.cfg.epoch_slack = 1;
+        let expires = h.now.0 - 1_000;
+        let lease = lease_of(1, 1, expires);
+        h.watch(&lease);
+        h.step(roster_ev(vec![1, 2, 3], h.clk().wait));
+        h.advance(10);
+        h.core.pr.carried = Some(Carrier {
+            node: 1,
+            epoch: 1,
+            expires_unix_ms: expires,
+        });
+        h.core.pr.hold_ended = Some((1, expires, !handed));
+        carrying_row(&h);
+        let out = acquire(&mut h, &lease);
+        let mut epochs: Vec<Epoch> = asks(&out).into_iter().map(|a| a.2).collect();
+        epochs.sort_unstable();
+        epochs
+    }
+
+    #[test]
+    fn a_carrier_that_handed_its_hold_over_collects_the_transferees_rows_when_it_readopts() {
+        assert_eq!(carrier_after_handover(false, true), vec![2, 2]);
+    }
+
+    #[test]
+    fn a_carrier_that_handed_its_hold_over_asks_nothing_under_the_control() {
+        assert!(carrier_after_handover(true, true).is_empty());
+    }
+
+    #[test]
+    fn a_carrier_that_closed_its_own_hold_serves_from_its_journal() {
+        assert!(carrier_after_handover(false, false).is_empty());
+    }
+
     // ---- S3 ----
 
     /// A roster read that was issued before this node first saw the lease
@@ -63811,10 +64006,13 @@ mod kept_fetch {
             "{out:?}"
         );
         assert!(asks(&out).is_empty() && h.core.bk.kept.is_none(), "{out:?}");
+        // The old read arriving again does not release the wait.
         h.advance(10);
-        h.step(roster_ev(vec![1, 2, 3], h.clk().wait));
+        let out = h.step(roster_ev(vec![1, 2, 3], WaitMs(seen.0 - 1)));
+        assert!(asks(&out).is_empty(), "{out:?}");
+        // A read issued after the sight resumes the same attempt: no retry.
         h.advance(10);
-        let out = acquire(&mut h, &lease);
+        let out = h.step(roster_ev(vec![1, 2, 3], h.clk().wait));
         assert_eq!(asks(&out).len(), 2, "a read after the sight: {out:?}");
     }
 
@@ -64209,6 +64407,77 @@ mod kept_fetch {
         assert!(m4(true).is_empty());
     }
 
+    /// S3 (round 2): a tenure that inherited a tail that is not a kept union
+    /// (epoch 1, fetched the plain way before the phase) and formed a hold of
+    /// its own (epoch 3): the kept union replaces nothing of the older tail,
+    /// which is re-shipped with it, in epoch order. Fails on the parent: the
+    /// union's entry replaced the tail's.
+    fn s3_older_tail(skipped: bool) -> Vec<(u64, u64)> {
+        let mut lease = lease_of(6, 3, 0);
+        lease.inherited_tail = Some(Box::new(InheritedTail {
+            epoch: 1,
+            config_version: 1,
+            members: vec![2],
+            through: 4,
+            kept: false,
+            holder: 1,
+        }));
+        let (mut h, out) = start(5, &lease, &[2, 5, 6], 1, skipped);
+        let old = named_rows("u", 2);
+        let through = old.iter().map(|t| t.last).max().unwrap_or(0);
+        let mut next = Vec::new();
+        for (to, req) in plain_asks(&out) {
+            if to == 2 {
+                next = h.step(Event::Peer {
+                    from: 2,
+                    msg: PeerMsg::SealedTail {
+                        req,
+                        epoch: 1,
+                        held: true,
+                        empty: false,
+                        txs: old.clone(),
+                        through,
+                        next: None,
+                        members: Vec::new(),
+                        sealed: Vec::new(),
+                        refused: None,
+                    },
+                });
+            }
+        }
+        if skipped {
+            let all = win(&mut h, next, &lease);
+            assert!(cas(&all).is_some(), "the claim lands: {all:?}");
+            return reshipped(&h);
+        }
+        let a = asks(&next);
+        assert!(!a.is_empty(), "the phase follows the tail: {next:?}");
+        let _ = win(&mut h, next, &lease);
+        let hold = named_rows("h", 2);
+        let mut last = Vec::new();
+        for (n, req, e) in a.iter().filter(|x| x.0 == 2) {
+            let rows = if *e == 3 { hold.clone() } else { Vec::new() };
+            last = h.step(answer_at(*n, *req, *e, rows, vec![vec![2, 5, 6]]));
+        }
+        let all = win(&mut h, last, &lease);
+        assert!(cas(&all).is_some(), "the claim lands: {all:?}");
+        reshipped(&h)
+    }
+
+    #[test]
+    fn an_inherited_plain_tail_is_reshipped_with_the_kept_union() {
+        assert_eq!(
+            s3_older_tail(false),
+            vec![(1, 1), (1, 3), (3, 1), (3, 3)],
+            "the older tail first, the hold's after it"
+        );
+    }
+
+    #[test]
+    fn an_inherited_plain_tail_alone_is_reshipped_under_the_control() {
+        assert_eq!(s3_older_tail(true), vec![(1, 1), (1, 3)]);
+    }
+
     /// Journal identities `(epoch, first seq)`.
     type Idents = Vec<(u64, u64)>;
 
@@ -64391,6 +64660,51 @@ mod kept_fetch {
     fn an_abandon_after_partial_answers_has_nothing_to_abandon_under_the_control() {
         assert!(t8(true));
     }
+
+    /// S1 (round 2): under an abandon the member that held the prefix of an
+    /// epoch is the one that is down. The rows the others kept start past
+    /// what the log reaches: the merge does not take the first transaction
+    /// wherever it lies, so nothing of that epoch is carried (and no
+    /// `TailFollowsThrough` names a hold the log does not reach). Returns
+    /// the rows carried, the rows counted past the gap, and whether the claim
+    /// landed.
+    fn s1_gap(skipped: bool) -> (u64, u64, bool) {
+        let (mut h, out) = start(3, &fenced(), &[1, 2, 3, 4], 1, skipped);
+        if skipped {
+            let landed = finish(&mut h, out, &fenced()).is_some();
+            return (0, 0, landed);
+        }
+        let a = asks(&out);
+        let _ = win(&mut h, out, &fenced());
+        let txs = rows(2);
+        // Node 2 kept only the second transaction; node 4, which has the
+        // first, never answers.
+        let out = answer_all(&mut h, &a, 2, 1, txs[1..].to_vec(), vec![vec![1, 2, 4]]);
+        assert!(cas(&win(&mut h, out, &fenced())).is_none());
+        let out = h.step(Event::Control {
+            op: OpId(701),
+            req: Control::Abandon {
+                target: crate::event::AbandonTarget::Epoch(1),
+                force: false,
+            },
+        });
+        let landed = finish(&mut h, out, &fenced()).is_some();
+        (
+            h.core.stats.kept_rows_carried,
+            h.core.stats.kept_past_gap,
+            landed,
+        )
+    }
+
+    #[test]
+    fn a_copy_past_a_gap_the_abandon_leaves_is_not_carried() {
+        assert_eq!(s1_gap(false), (0, 1, true));
+    }
+
+    #[test]
+    fn a_copy_past_a_gap_is_not_looked_at_under_the_control() {
+        assert_eq!(s1_gap(true), (0, 0, true));
+    }
 }
 
 /// ADR-51: the member side of a claimant's kept fetch: what an epoch
@@ -64514,10 +64828,11 @@ mod kept_member {
         }
     }
 
-    /// K4, per stream: a member that answered a kept fetch installs and
-    /// acknowledges nothing more of the sealed stream `(epoch, source)`, and
-    /// tells the source; a stream of a later epoch from the same source is
-    /// not sealed. Fails on the parent: only the epoch ever sealed.
+    /// K4, keyed on the tenure: a member that answered a kept fetch installs
+    /// and acknowledges nothing more of the sealed holder's stream of the
+    /// sealed epoch, and tells the source; a stream of a later epoch from
+    /// the same source (its next tenure) is not sealed. Fails on the parent:
+    /// only the epoch ever sealed.
     #[test]
     fn a_member_sealed_for_a_kept_fetch_acks_nothing_more() {
         let txs = owner_rows(3);
@@ -64531,7 +64846,8 @@ mod kept_member {
         assert_eq!(members, vec![vec![1, 2, 3]]);
         assert_eq!(sealed, vec![(1, 1)]);
         assert_eq!(h.core.stats.seal_tail_kept, 1);
-        // The sealed stream: a new batch of it is refused, not installed.
+        // The sealed tenure's hold stream: a new batch of it is refused, not
+        // installed.
         h.core.ship.max_epoch = 1;
         h.core.epoch.open = true;
         h.core.bk.ahead_next = Some((1, txs[2].first));
@@ -64567,10 +64883,87 @@ mod kept_member {
         });
         assert!(refusals(&out).is_empty(), "{out:?}");
         // The seal is persisted: a restart keeps it.
+        assert_eq!(Replica::sealed_tenures(&h.meta).unwrap(), vec![(1, 1)]);
+    }
+
+    /// A sealed member `h` (node 2) that answered node 3's kept fetch of the
+    /// tenure `(1, 1)`, with the subscriber conditions of a stream from
+    /// `from` at epoch 2 met. Returns whether a batch of that stream was
+    /// refused, and whether it was installed.
+    fn successor_batch(from: NodeId) -> (usize, bool) {
+        let txs = owner_rows(3);
+        let mut h = member_with(&[1, 2, 3], (1, 1), &[(1, 1, &txs[..2])]);
+        let key = lease_of(1, 1, 0).renewal_key();
+        let out = kept_seal(&mut h, 3, 1, (1, 1), key);
+        assert!(answer(&out).is_some_and(|a| a.0));
+        h.core.lease.cached_holder = Some(from);
+        h.core.ship.max_epoch = 2;
+        h.core.bk.ahead_next = Some((2, txs[0].first));
+        let before = h.core.stats.streamed_installed;
+        let out = h.step(Event::Peer {
+            from,
+            msg: batch(2, vec![txs[0].clone()]),
+        });
         assert_eq!(
-            Replica::sealed_streams(&h.meta).unwrap(),
-            vec![(1, 1), (1, 3), (2, 1), (2, 3)]
+            h.core.stats.stream_ahead_sealed_refused as usize,
+            refusals(&out).len()
         );
+        (
+            refusals(&out).len(),
+            h.core.stats.streamed_installed > before,
+        )
+    }
+
+    /// M1: the sealed holder re-claims at the next epoch (a claimant sealed
+    /// its epoch, D7) and streams its new tenure to a member that answered
+    /// the claimant's kept fetch: the batch is installed and acknowledged,
+    /// not refused for ever. Fails on the parent: the seal covered
+    /// `(epoch + 1, holder)`.
+    #[test]
+    fn a_sealed_holders_next_tenure_is_acknowledged_by_the_members_that_sealed() {
+        assert_eq!(successor_batch(1), (0, true));
+    }
+
+    /// M1: a member that claims the lease at the epoch above the sealed
+    /// tenure (no stream at it had rows) forms a hold or backup group with
+    /// another member that answered: its stream is acknowledged. Fails on the
+    /// parent: the seal covered `(epoch + 1, s)` of every member.
+    #[test]
+    fn a_member_claimants_tenure_is_acknowledged_by_the_members_that_sealed() {
+        assert_eq!(successor_batch(3), (0, true));
+    }
+
+    /// M1: a hold batch received in an open epoch whose carried lease is a
+    /// sealed tenure is refused (the transferee's stream at the next epoch);
+    /// once the lease moved on, the same stream is a successor's own tenure.
+    #[test]
+    fn a_hold_batch_over_a_sealed_tenure_is_refused_until_the_lease_moved() {
+        let txs = owner_rows(2);
+        let mut h = member_with(&[1, 2, 3], (1, 1), &[(1, 1, &txs[..1])]);
+        let key = lease_of(1, 1, 0).renewal_key();
+        assert!(answer(&kept_seal(&mut h, 4, 1, (1, 1), key)).is_some_and(|a| a.0));
+        // A hold forms over the sealed tenure afterwards (promises lapsed).
+        h.core.epoch.open = true;
+        h.core.pr.carried = Some(Carrier {
+            node: 1,
+            epoch: 1,
+            expires_unix_ms: 9,
+        });
+        h.core.lease.cached_holder = Some(3);
+        h.core.ship.max_epoch = 2;
+        h.core.bk.ahead_next = Some((2, txs[0].first));
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: batch(2, vec![txs[0].clone()]),
+        });
+        assert_eq!(refusals(&out), vec![(3, 2)], "{out:?}");
+        // The lease moved to node 3 at epoch 2: its stream is its own tenure.
+        h.core.lease.last_seen = Some(lease_of(3, 2, 0));
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: batch(2, vec![txs[0].clone()]),
+        });
+        assert!(refusals(&out).is_empty(), "{out:?}");
     }
 
     /// M1: a member whose own open epoch carries the tenure is a live hold:
@@ -64591,7 +64984,7 @@ mod kept_member {
         assert!(!held && got.is_empty() && sealed.is_empty());
         assert_eq!(refused, Some(SealRefusal::EpochOpen));
         assert_eq!(h.core.stats.seal_kept_refused_epoch_open, 1);
-        assert!(Replica::sealed_streams(&h.meta).unwrap().is_empty());
+        assert!(Replica::sealed_tenures(&h.meta).unwrap().is_empty());
         // The epoch closes (the carried lease moved on): the same ask is answered.
         h.core.epoch.open = false;
         let out = kept_seal(&mut h, 3, 1, (1, 1), key);
@@ -64622,7 +65015,7 @@ mod kept_member {
         assert!(!held && sealed.is_empty());
         assert_eq!(refused, Some(SealRefusal::StaleKey));
         assert_eq!(h.core.stats.seal_kept_refused_stale_key, 1);
-        assert!(Replica::sealed_streams(&h.meta).unwrap().is_empty());
+        assert!(Replica::sealed_tenures(&h.meta).unwrap().is_empty());
         let out = kept_seal(&mut h, 3, 1, (1, 1), seen.renewal_key());
         assert!(answer(&out).is_some_and(|a| a.0));
     }
@@ -64665,12 +65058,53 @@ mod kept_member {
             at6.1.iter().map(|t| t.first).collect::<Vec<_>>(),
             vec![a[1].first]
         );
-        let sealed = Replica::sealed_streams(&h.meta).unwrap();
-        assert!(sealed.contains(&(6, 3)) && sealed.contains(&(5, 3)) && sealed.contains(&(6, 1)));
-        assert!(
-            !sealed.iter().any(|(_, s)| *s == 9 || *s == 7),
-            "not a member of a carrying row: {sealed:?}"
-        );
+        // The tenure is what is sealed, once (not one entry per stream).
+        assert_eq!(Replica::sealed_tenures(&h.meta).unwrap(), vec![(1, 5)]);
+    }
+
+    /// The links of nodes 2 and 3 as seen by node 1: `up` connected.
+    fn links(h: &mut Harness, up: &[NodeId]) {
+        h.step(Event::Peers {
+            registry_complete: true,
+            links: (2..=3)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: up.contains(&node),
+                    last_seen: Some(w(h.now)),
+                    rtt_ms: Some(1),
+                    since: Some(w(h.now)),
+                })
+                .collect(),
+            lapses: 0,
+            issued: WaitMs(i64::MAX),
+        });
+    }
+
+    /// S6: the hold ends when no member that did not seal can acknowledge,
+    /// not only when every member sealed: one member sealed and the other's
+    /// link is down. Fails on the parent: the hold waited for the down member.
+    #[test]
+    fn a_hold_owner_ends_its_hold_when_the_members_that_did_not_seal_are_unreachable() {
+        let mut h = Harness::with(1, true);
+        h.hold(1, None);
+        h.core.lease.adopt_epoch_hold(h.clk(), 1);
+        h.core.pr.epoch_members = vec![1, 2, 3];
+        h.core.epoch = EpochState {
+            open: true,
+            active: true,
+            ..Default::default()
+        };
+        links(&mut h, &[2]);
+        let _ = create_nowait(&mut h, 1, "f");
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::StreamAheadRefused {
+                epoch: 1,
+                sealed: true,
+            },
+        });
+        assert!(!h.core.lease.epoch_held(), "node 3 cannot acknowledge");
+        assert_eq!(h.core.stats.hold_ended_sealed, 1);
     }
 
     /// M1 (NAK): a hold owner that hears every other member of its epoch seal
@@ -64687,6 +65121,7 @@ mod kept_member {
             active: true,
             ..Default::default()
         };
+        links(&mut h, &[2, 3]);
         let (rid, out) = create_nowait(&mut h, 1, "f");
         assert!(
             replies(&out).is_empty(),

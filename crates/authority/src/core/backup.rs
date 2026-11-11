@@ -840,10 +840,13 @@ pub(crate) struct BackupState {
     /// known, and nothing is acknowledged or answered until a read succeeds
     /// ([`Core::backup_sealed_known`]; plan 43 C2e review).
     pub(crate) sealed_unread: bool,
-    /// ADR-51 (K4 per stream): the streams `(epoch, source)` this node sealed
-    /// for a claimant's kept fetch (persisted, `Replica::seal_streams`): their
-    /// `StreamAhead` batches install nothing and acknowledge nothing.
-    pub(crate) sealed_streams: BTreeSet<(Epoch, NodeId)>,
+    /// ADR-51 (K4, keyed on the tenure): the tenures `(holder, lease epoch)`
+    /// this node sealed for a claimant's kept fetch (persisted,
+    /// `Replica::seal_tenures`). The holder's own stream of that epoch and
+    /// the hold streams of an epoch carrying the tenure install nothing and
+    /// acknowledge nothing ([`Core::sealed_hold_stream`]); a successor's own
+    /// tenure never matches.
+    pub(crate) sealed_tenures: BTreeSet<(NodeId, Epoch)>,
     /// The persisted role could not be read at start (ADR-43): not "no
     /// role"; nothing is answered or claimed until a read succeeds
     /// ([`Core::backup_role_known`]).
@@ -933,6 +936,11 @@ pub(crate) struct BackupState {
     pub(crate) kept_union: Option<super::kept::KeptUnion>,
     pub(crate) kept_ready: Option<constellation_store_s3::RenewalKey>,
     pub(crate) kept_seen: Option<(Epoch, WaitMs)>,
+    /// ADR-51 (S3): the claim waits for a roster read issued after
+    /// `kept_seen` (`Action::RefreshRoster` is out): the lease it claims and
+    /// the timer that ends the wait. [`Core::kept_roster_arrived`] resumes
+    /// the phase when the read is installed.
+    pub(crate) kept_roster_wait: Option<(constellation_store_s3::Lease, TimerId)>,
     pub(crate) kept_force: bool,
     pub(crate) kept_force_wanted: Option<Epoch>,
     /// The `through_known` of an abandon this claim made after partial
@@ -1468,10 +1476,10 @@ impl Core {
         if !self.bk.sealed_unread {
             return true;
         }
-        match (replica.backup_sealed_epoch(), replica.sealed_streams()) {
+        match (replica.backup_sealed_epoch(), replica.sealed_tenures()) {
             (Some(sealed), Some(streams)) => {
                 self.bk.sealed = self.bk.sealed.max(sealed);
-                self.bk.sealed_streams.extend(streams);
+                self.bk.sealed_tenures.extend(streams);
                 self.bk.sealed_unread = false;
                 true
             }
@@ -1495,10 +1503,10 @@ impl Core {
     /// At start: a persisted backup role (this node backed someone
     /// before it restarted) and a persisted seal are honoured.
     pub(crate) fn backup_start(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
-        match (replica.backup_sealed_epoch(), replica.sealed_streams()) {
+        match (replica.backup_sealed_epoch(), replica.sealed_tenures()) {
             (Some(sealed), Some(streams)) => {
                 self.bk.sealed = sealed;
-                self.bk.sealed_streams = streams.into_iter().collect();
+                self.bk.sealed_tenures = streams.into_iter().collect();
             }
             _ => {
                 self.bk.sealed_unread = true;
@@ -5373,11 +5381,14 @@ impl Core {
             return;
         }
         self.ack.hold_sealed.insert((epoch, from));
-        let open = self
-            .pr
-            .epoch_members
-            .iter()
-            .any(|n| *n != me && !self.ack.hold_sealed.contains(&(epoch, *n)));
+        // A member can still acknowledge when it did not seal and its link
+        // is up (a link this node has no record of counts as up): one that
+        // is down cannot, and with the others sealed the hold would stall.
+        let open = self.pr.epoch_members.iter().any(|n| {
+            *n != me
+                && !self.ack.hold_sealed.contains(&(epoch, *n))
+                && self.roster.links().get(n).is_none_or(|l| l.connected)
+        });
         if open {
             return;
         }
@@ -5385,8 +5396,8 @@ impl Core {
         tracing::warn!(
             node = me,
             epoch,
-            "every other member of the epoch sealed this hold's stream for a claimant: \
-             the hold ends as deposed"
+            "no other member of the epoch can acknowledge this hold (each sealed its stream for a \
+             claimant, or is unreachable): the hold ends as deposed"
         );
         // As a claimant's seal of this node's own epoch does (`seal_tail_hold`,
         // case 1): the epoch is sealed here, the journal is kept as the member
@@ -6720,6 +6731,36 @@ impl Core {
 
     // -------------------------------------------- pre-S3 stream subscriber
 
+    /// ADR-51 (K4, keyed on the tenure): whether a `StreamAhead` batch of
+    /// stream `(epoch, from)` is a hold stream over a tenure this node sealed
+    /// for a claimant's kept fetch. Two cases: the sealed holder's own stream
+    /// of the sealed epoch (`from == holder && epoch == lease epoch`), and
+    /// any hold batch received in an open epoch whose carried lease is a
+    /// sealed tenure that has not moved (the hold of a transferee journals at
+    /// the next epoch, so the stream key cannot tell it from a successor's
+    /// own tenure; the carried lease can). A successor's tenure carries
+    /// nothing of the sealed one and is never refused.
+    pub(crate) fn sealed_hold_stream(&self, epoch: Epoch, from: NodeId) -> bool {
+        if self.bk.sealed_tenures.contains(&(from, epoch)) {
+            return true;
+        }
+        if !self.epoch.open || from == self.cfg.node_id {
+            return false;
+        }
+        let Some(c) = self.pr.carried else {
+            return false;
+        };
+        if !self.bk.sealed_tenures.contains(&(c.node, c.epoch)) {
+            return false;
+        }
+        let moved = self
+            .lease
+            .last_seen
+            .as_ref()
+            .is_some_and(|l| l.released || l.holder != c.node || l.epoch != c.epoch);
+        !moved
+    }
+
     /// The holder's backups hold `txs`: install them ahead of the log.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_stream_ahead(
@@ -6733,12 +6774,14 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        // ADR-51 (K4, per stream): a stream this node sealed for a claimant's
-        // kept fetch is final here. What it answered is the set the claim
-        // carries, so nothing more of it is installed or acknowledged; the
-        // hold owner is told, and ends its hold when no member can
-        // acknowledge. A later epoch of the same source is not sealed.
-        if self.bk.sealed_streams.contains(&(epoch, from)) {
+        // ADR-51 (K4, keyed on the tenure): a hold stream of a tenure this
+        // node sealed for a claimant's kept fetch is final here. What it
+        // answered is the set the claim carries, so nothing more of it is
+        // installed or acknowledged; the hold owner is told, and ends its
+        // hold when no member can acknowledge. A successor's own tenure (the
+        // sealed holder's re-claim, or a member's claim, at a later epoch) is
+        // not a hold over the sealed tenure and is never refused.
+        if self.sealed_hold_stream(epoch, from) {
             self.stats.stream_ahead_sealed_refused += 1;
             self.stats.streamed_dropped += txs.len() as u64;
             if matches!(self.bk.ahead_next, Some((e, _)) if e == epoch) {

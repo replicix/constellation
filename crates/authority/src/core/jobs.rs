@@ -4359,13 +4359,18 @@ impl Core {
             })
             .map(|r| r.epoch);
         // ADR-51: the union a kept fetch brought, one tail per epoch with rows.
-        let kept_tails: Vec<(Epoch, u64)> = self
-            .bk
-            .fetched
-            .iter()
-            .filter(|f| f.kept_owner.is_some())
-            .map(|f| (f.epoch, f.through))
-            .collect();
+        // (An inherited tail of an older epoch the union does not cover rides
+        // along, in epoch order.)
+        let kept_tails: Vec<(Epoch, u64)> =
+            if self.bk.fetched.iter().any(|f| f.kept_owner.is_some()) {
+                self.bk
+                    .fetched
+                    .iter()
+                    .map(|f| (f.epoch, f.through))
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let backup_tail_epoch = kept_tails.first().map(|t| t.0).or(backup_tail_epoch);
         if takeover
             && backup_tail_epoch.is_none()
@@ -4488,6 +4493,9 @@ impl Core {
         self.pending_plan = None;
         self.promise_check_abandon(out);
         if let Some(t) = self.bk.kept.take().and_then(|k| k.timer) {
+            self.cancel_timer(t, out);
+        }
+        if let Some((_, t)) = self.bk.kept_roster_wait.take() {
             self.cancel_timer(t, out);
         }
         self.bk.kept_union = None;
