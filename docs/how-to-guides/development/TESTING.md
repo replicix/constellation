@@ -1052,8 +1052,10 @@ escalates and holds the lease within dwell + half a TTL + the wanted
 grace, both converge on the model; the epoch strictly advances across
 every handover, B's lease provably came from sustained inbox demand,
 and both nodes report zero conflicts) and `lease-fencing`
-(A holds the lease with unshipped records and is frozen with
-`SIGSTOP`; after the TTL expires B takes over — legally, only after
+(A holds the lease with an unshipped, still unanswered `mkdir`, held in
+its journal by the sync-hold fault since a node with a mounted peer
+answers only what the archive or a backup holds (ADR-40/50), and is frozen
+with `SIGSTOP`; after the TTL expires B takes over — legally, only after
 tailing everything A had flushed — and writes; A is then resumed with
 `SIGCONT` and must discover that it was deposed (a failed renew CAS, or
 B's epoch marker), never ship under its old epoch, and — plan 30 M3b —
@@ -1117,7 +1119,9 @@ stranded-branch recovery:
   lease TTL: an epoch carries only a usable lease, and at 5 s a cut just
   before a renewal left about 0.7 s for the formation, so the epoch
   carried nothing.
-- `deposed-reintegration` (rewritten for plan 30 M3b) strands three
+- `deposed-reintegration` (rewritten for plan 30 M3b; since ADR-40/50 only a
+  singleton answers from its own disk, so B mounts after A is frozen, a
+  join A never hears of) strands three
   edits on holder A while its S3 path is cut: a new file
   (`clean-from-a`), an overwrite of a baseline file B never touches
   (`a-only`), and an overwrite of `same`, which B then overwrites too
@@ -1996,7 +2000,9 @@ above):
   moment its next commit is visible in the bucket, before its round can
   ship what was journaled meanwhile. B has tailed the log since the
   start; a fresh D bootstraps from the head commit plus the log after it.
-  Once both have applied through the log head, B and D must list exactly
+  Without a backup the premise is a lone root's (ADR-50: only a
+  singleton answers from its own disk), so B mounts after the kill. Once
+  both have applied through the log head, B and D must list exactly
   the same `burst/` entries, those must be a contiguous prefix of A's
   mkdir sequence, and A must have acknowledged more mkdirs than that
   (the kill caught an unshipped tail, which neither node shows). The
@@ -2033,10 +2039,13 @@ above):
   socket must then replay the chmod (B sees mode 0600), materialize
   `/.constellation-conflict/broken@…` (full length, the lost chunk a
   hole of zeros), and leave A's held set, pending conflict copies and
-  journal empty.
+  journal empty. B is A's backup before the hold starts (the scenario
+  waits for it): A answers a write only once a backup or the archive
+  holds it, and the hold stops the archive.
 - **`drop-held-remote-dependents`** (plan 46 M0.2, C2g′). The same two
-  fault points on a lone holder A (`CONSTELLATION_BACKUPS=0`, so its
-  answers to another node wait for the log), and a second node B that
+  fault points on a holder A backed by a third node C (a holder with
+  mounted peers answers its own writes only from a backup or the archive,
+  and the hold stops the archive), and a second node B, not a backup, that
   writes into the directory the dropped file's rename touched. With A's
   rounds held, A writes `d/broken` (the seed) and renames it to
   `d/renamed`; B makes `d/sub` and writes `d/sub/f`, ops A forwards-
@@ -2070,9 +2079,11 @@ Plan 30 M13 scenarios (the S3 inbox; all three run with
 relay of its own so requests can be attributed per role):
 
 - **`stale-base-rename-divergence`** (plan 30 M5 phase 2, the
-  `MutateReply::base` rule on the wire). Three nodes with own P2P keys
-  and no backups (`CONSTELLATION_BACKUPS=0`: a backed tenure's pre-S3
-  stream would carry A's unlink to B past the sync hold);
+  `MutateReply::base` rule on the wire). Three nodes with own P2P keys,
+  A backed by C and B on `CONSTELLATION_P2P=off` (a committed row streams
+  to every P2P subscriber, B included, before S3 and past the sync hold;
+  with no backup at all A's unlink would wait for the archive and end in
+  `EIO`);
   A's and B's sync rounds are held with
   `CONSTELLATION_FAULT_HOLD_SYNC_FILE=<root>/hold-{a,b}` (each daemon
   writes `<hold>.held` from the first round that sees the file, so the

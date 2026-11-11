@@ -31,11 +31,18 @@ use std::time::{Duration, Instant};
 /// the log carries the unlink and the rename in order, and A, B and C
 /// agree `f2` is `f1`'s inode with `f1`'s content and `f1` is gone.
 ///
-/// No backups (`CONSTELLATION_BACKUPS=0` on every node): with one, A's
-/// tenure is backed and its pre-S3 stream carries the unlink to every
-/// subscriber, B included, which the sync hold does not stop — B then
-/// saw the unlink before its rename and the shape never formed (the
-/// scenario failed with "B already sees the unlink" since plan 30 §M9).
+/// C is A's backup; B is neither a backup nor on P2P. Since plan 43 C2f and
+/// ADR-40/50 a node with mounted peers answers a mutation only once the
+/// archive or a backup holds it, so with the sync hold and no backup
+/// (`CONSTELLATION_BACKUPS=0`, the scenario's first rig) A's unlink would
+/// wait for the archive and end in `EIO`. With C as the backup the unlink
+/// is acknowledged on C's copy and still unshipped. B runs with
+/// `CONSTELLATION_P2P=off`: a committed row is streamed to every P2P
+/// subscriber before S3, which the sync hold does not stop (a P2P B, backup
+/// or not, saw the unlink before its rename and the shape never formed; the
+/// scenario failed with "B already sees the unlink" since plan 30 §M9 when
+/// it had a backup). B's view then moves only with the log, and its
+/// rename reaches A through the S3 inbox.
 pub fn stale_base_rename_divergence(_seed: u64) -> Result<()> {
     let (env, root) = setup("stale-base-rename-divergence")?;
     let _proxy = env.s3_proxy()?;
@@ -43,9 +50,7 @@ pub fn stale_base_rename_divergence(_seed: u64) -> Result<()> {
     let hold_a = root.path().join("hold-a");
     let hold_b = root.path().join("hold-b");
     let mk = |name: &str, hold: Option<&Path>| -> Result<Client> {
-        let mut c = Client::new(root.path(), name, &env.endpoint, &backend)?
-            .with_own_node_key()
-            .with_env("CONSTELLATION_BACKUPS", "0");
+        let mut c = Client::new(root.path(), name, &env.endpoint, &backend)?.with_own_node_key();
         if let Some(hold) = hold {
             c = c.with_env(
                 "CONSTELLATION_FAULT_HOLD_SYNC_FILE",
@@ -55,13 +60,34 @@ pub fn stale_base_rename_divergence(_seed: u64) -> Result<()> {
         Ok(c)
     };
     let mut a = mk("a", Some(&hold_a))?;
-    let mut b = mk("b", Some(&hold_b))?;
+    let mut b = mk("b", Some(&hold_b))?.with_env("CONSTELLATION_P2P", "off");
     let mut c = mk("c", None)?;
     a.fs_create()?;
     a.mount()?;
-    b.mount()?;
     c.mount()?;
-    wait_for_p2p(&[&a, &b, &c])?;
+    wait_for_p2p(&[&a, &c])?;
+    std::fs::write(a.mnt.join("f0"), b"zero")?;
+    eventually("A holds the lease", Duration::from_secs(20), || {
+        let lease = a.control_status()?["lease"].clone();
+        anyhow::ensure!(lease["held"] == true, "A does not hold: {lease}");
+        Ok(())
+    })?;
+    let c_id = c.control_status()?["node_id"]
+        .as_u64()
+        .context("C reports no node id")?;
+    eventually("A lists C as its backup", Duration::from_secs(30), || {
+        let ack = a.control_status()?["ack"].clone();
+        let backups: Vec<u64> = ack["backups"]
+            .as_array()
+            .map(|v| v.iter().filter_map(|x| x.as_u64()).collect())
+            .unwrap_or_default();
+        anyhow::ensure!(
+            ack["policy"] == "backup" && backups == [c_id],
+            "A's backup set is not [C]: {ack}"
+        );
+        Ok(())
+    })?;
+    b.mount()?;
 
     // A holds; `f1` and `f2` exist everywhere.
     std::fs::write(a.mnt.join("f1"), b"one")?;
@@ -105,10 +131,18 @@ pub fn stale_base_rename_divergence(_seed: u64) -> Result<()> {
         // A's unlink stays in its journal: B and C keep seeing `f2`.
         std::fs::remove_file(a.mnt.join("f2")).context("A's unlink")?;
         std::thread::sleep(Duration::from_secs(1));
-        anyhow::ensure!(
-            b.mnt.join("f2").is_file(),
-            "B already sees the unlink: A shipped while held"
-        );
+        match std::fs::metadata(b.mnt.join("f2")) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => anyhow::bail!("`f2` is not a file on B"),
+            Err(e) => anyhow::bail!(
+                "B already sees the unlink: A shipped while held ({e}); A spool {} backups {}; B spool {} spec {}; C spool {}",
+                a.control_status()?["spool"],
+                a.control_status()?["ack"]["backups"],
+                b.control_status()?["spool"],
+                b.control_status()?["speculation"],
+                c.control_status()?["spool"]
+            ),
+        }
 
         // B's rename of `f1` over `f2` forwards to A, where `f2` is gone.
         let rename = {
