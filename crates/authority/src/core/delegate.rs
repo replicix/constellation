@@ -795,6 +795,10 @@ pub(crate) struct DelegateState {
     /// Phase 2b: the root the stream last went to; a different one
     /// (a failover) gets every unretired transaction again.
     pub last_root: Option<NodeId>,
+    /// The last root the stream went to that was not `None` (`last_root`
+    /// forgets it while no root is in view): a root found after a spell
+    /// with none is a failover when it is another node than this one.
+    pub known_root: Option<NodeId>,
     /// Phase 2b: the backup peer this delegate appends to before it
     /// acknowledges, and what it has acknowledged.
     pub backup: Option<NodeId>,
@@ -2177,6 +2181,7 @@ impl Core {
                     non_stealable: d.non_stealable(),
                     remnant,
                     last_root: self.root_node(),
+                    known_root: self.root_node(),
                     backup: None,
                     backup_acked: 0,
                     backup_sent_through: 0,
@@ -5232,7 +5237,14 @@ impl Core {
                 d.poke_backoff_ms = 0;
                 d.poke_after = None;
                 d.archive_bound = false;
-                if d.last_root.is_some() && root.is_some() {
+                // (A root found after a spell with none in view is a failover
+                // when it is another node than the last one: this node held
+                // the lease itself meanwhile, or the holder was unknown. The
+                // old root's acknowledgements say nothing of the new one's
+                // cursor, and a batch past its gap is never taken.)
+                if root.is_some()
+                    && (d.last_root.is_some() || d.known_root.is_some_and(|k| Some(k) != root))
+                {
                     d.streamed_through = replica.log_stream_idx(d.gen);
                     d.root_committed = d.streamed_through;
                     d.refused = false;
@@ -5247,6 +5259,9 @@ impl Core {
                     );
                 }
                 d.last_root = root;
+                if root.is_some() {
+                    d.known_root = root;
+                }
             }
         }
         for req in stale_reqs {

@@ -39604,6 +39604,85 @@ fn a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited() {
     assert_eq!(h.core.dl.mine[&7].streamed_through, last);
 }
 
+/// A new root found after a spell with none in view is a failover too: the
+/// delegate re-streams from what the log carries, whatever the old root had
+/// acknowledged. The delegate took the root lease itself in between, which
+/// leaves no root to name (`root_node` leaves the node out), then lost it to
+/// another node whose cursor is behind the old root's. Skipping the
+/// re-stream (`last_root` was `None`) sent the new root rows past a gap it
+/// could never fill: its acknowledgement stayed at its cursor and the batch
+/// was resent unchanged for good (`sticky-root-designee-inbox` seeds 216 and
+/// 510 without read holds; 1 and 20 with them). Fails on the parent: no batch
+/// of the unretired rows to the new root.
+#[test]
+fn a_root_found_after_none_gets_every_unretired_row_again() {
+    let mut h = Harness::new(3);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.lease.cached_holder = Some(1);
+    let dir = delegated_to_me(&h.meta, 3);
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+    let req = renew_req(&out, 7).expect("no renewal on install");
+    h.step(renewed(&h, req, 7, 5_000));
+    let batch_to = |out: &[Action], root: NodeId| {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegateStream {
+                req, gen: 7, txs, ..
+            } if to == root => Some((*req, txs.first().map(|t| t.idx).unwrap_or(0))),
+            _ => None,
+        })
+    };
+    let rid = h.rid(1);
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op: MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+        tag: Default::default(),
+    });
+    let (sreq, first) = batch_to(&out, 1).expect("no batch streamed");
+    assert!(first > 0);
+    let round = h.core.dl.mine[&7].stream_round;
+    h.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::DelegateStreamAck {
+            req: sreq,
+            gen: 7,
+            round,
+            through: first,
+            committed: 0,
+            refused: false,
+            archive_bound: false,
+        },
+    });
+    assert_eq!(h.core.dl.mine[&7].streamed_through, first);
+    let poke = |h: &mut Harness| {
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        })
+    };
+    // No root in view (this node holds the lease, or the holder is unknown).
+    h.advance(100);
+    h.core.lease.cached_holder = None;
+    poke(&mut h);
+    assert_eq!(h.core.dl.mine[&7].last_root, None);
+    // Another node takes it: it holds none of the rows.
+    h.advance(100);
+    h.core.lease.cached_holder = Some(2);
+    let out = poke(&mut h);
+    let (_, again) = batch_to(&out, 2).expect("nothing streamed to the new root: {out:?}");
+    assert_eq!(again, first, "the new root was not sent the unretired rows");
+    assert_eq!(h.core.stats.deleg_restreams, 1);
+}
+
 /// A root that refused the delegate's stream (restarted or re-adopting
 /// after a slow lease read: it does not know the generation yet) and then
 /// grants its renewal serves the generation now: the stream's refusal
