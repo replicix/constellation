@@ -4129,3 +4129,48 @@ at a tenure's start that caps the whole journal's answers.
 See: `crates/authority/src/core/backup.rs` (`sync_cfg_spans`,
 `unsettled_root_row`), `crates/authority/src/core/client.rs`
 (`settled_outcome`), [DESIGN](DESIGN.md) ("Acknowledgement and durability").
+
+## ADR-52: A singleton answer leaves only on a fresh reading of a usable lease
+
+**Status**: plan 46 M1.3 (the stale-clock re-check, lease6 triage F1).
+
+**Context**: a core step decides on the `now` it read when it began. A step
+that stalled between that read and its answer (a slow store write, a stopped
+process) answered its own client from its disk alone after its lease was taken
+over: the answer's class is `Singleton` (committed by this node's disk alone
+under a time-bounded lease), the successor never saw the row, and the I1
+oracle judged "expected singleton, committed by none" (280 of 2,000 seeds of
+`delegated-core-stall-root-lease6+commit`). The next step of the stalled node
+was already correct (its fresh `now` fails every lease check); only answers
+given inside the stalled step were wrong.
+
+**Decision**: where an answer of class `Singleton` leaves (the emission gate:
+`Core::finish`, `Core::send_answer*`; the engine's FUSE fast path's
+acknowledgement and its simulation copy), a clock read taken there must find
+the lease usable with the margin (`LeaseState::usable`; an epoch hold needs no
+time term). Otherwise the answer waits, parked on its own journal row: the
+archive carrying the row releases it as the archive's answer, a later reading
+that finds the lease usable (a landed renewal asks at once) releases it as the
+singleton's it was, and a deposition ends it in doubt, retried by rid at the
+successor. Only an answer with a row of its own is held; a refusal nothing
+executed commits nothing. The fast path answers in doubt through the core
+(which dedups the rid and applies the same gate). Execution on the stale clock
+is not re-checked: S3 fences it (create-only log slots, the takeover marker)
+and the strand replays it by rid; the harm was only the answer.
+
+**Consequences**: a clock read per singleton answer; the answers of a stalled
+singleton wait up to one renewal; a lost tenure's last answers are in doubt
+instead of wrong. Counted as `answers_held_stale_lease` (and per emission
+path) and `fast_acks_stale_lease`.
+
+**Rejected**: re-checking at admission or before the write (the write is
+fenced by S3, and the project rule is to enforce where the answer leaves); one
+clock read per step after the last journal write (the read is cheap, measured
+in `bench/commit-rule/RESULTS.md`).
+
+**May revert**: no. `delegated-core-stall-root-lease6+commit` is strict again
+(its exemption removed); the negative control is `-root-unlaned`.
+
+See: `crates/authority/src/core/backup.rs` (`emission_hold_of`),
+`crates/authority/src/core/readindex.rs` (`park_stale_lease`,
+`complete_ready`), `crates/engine/src/view/write_gate.rs` (`fast_ack_target`).
