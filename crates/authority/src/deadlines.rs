@@ -776,16 +776,15 @@ mod tests {
         assert_eq!(table.len(), expected.len(), "a bound is not pinned");
     }
 
-    /// The archive PUT a first answer waits for fits inside a forward
-    /// timeout (plan 46 M1.3 step 7, ADR-48): the first op of a sticky
-    /// grant, whose answer waits for the grant record's archive, is
-    /// answered inside the bound the root's archive answers already use,
-    /// and inside the client's deadline.
+    /// The archive PUT bound is shorter than the client's attempts window
+    /// (plan 46 M1.3 step 7, ADR-48). That `archive_put` is `F` is the table's
+    /// row; what bounds a far writer's first op in practice is checked by the
+    /// sim (`far_writers_hold_sticky_grants_and_answer_final`:
+    /// `deleg_commit_wait_ms_max`).
     #[test]
-    fn archive_put_is_within_the_forward_timeout() {
+    fn archive_put_is_shorter_than_the_attempts_window() {
         for cfg in [Config::defaults(1, 1), sim(), sim_long()] {
             let d = Deadlines::new(&cfg);
-            assert!(d.archive_put <= d.base.forward_timeout, "{d:?}");
             assert!(d.archive_put < d.attempts, "{d:?}");
         }
     }
