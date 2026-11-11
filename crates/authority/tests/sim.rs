@@ -1319,6 +1319,20 @@ fn find_multi_batch_withdraw_seeds() {
     }
 }
 
+/// Late landing (`flex-tight+oracles` 1002): a requester's op had a durable
+/// inbox batch (its holder, node 2, was crashed and its epoch frozen); the
+/// frozen epoch refused the op on the lease path and answered it in doubt at
+/// once, with the batch standing, and the takeover that followed drained
+/// the batch after the `EIO` (I4). It is settled now: tombstones first, the
+/// unsettled `EIO` a window after the last acknowledgement. Fails without the
+/// fix (`refuse_on_lease_path`).
+#[test]
+fn an_op_with_an_inbox_batch_refused_by_a_frozen_epoch_is_withdrawn_before_its_eio() {
+    let cfg = config_variant(base_config("flex-tight"), "oracles");
+    let r = run_seed(1002, cfg).unwrap_or_else(|e| panic!("seed 1002: {e}"));
+    assert_eq!(r.late_landings, 0);
+}
+
 /// Re-pin helper for `a_failed_tombstone_with_s3_cut_is_labelled_isolated_from_s3`:
 /// lists the seeds of its configuration whose settle gives up a tombstone
 /// and whose `EIO` is labelled `isolated-from-s3`.
