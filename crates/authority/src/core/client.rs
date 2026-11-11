@@ -4080,6 +4080,7 @@ impl Core {
             let allowed = w.acked_at.map_or(w.deadline, |t| t.plus(window));
             if now.wait < allowed && self.extend_settle_deadline(rid, allowed, Some(now.wait), out)
             {
+                self.settle_wake_idle(now, rid, replica, out);
                 return;
             }
         }
@@ -4536,6 +4537,56 @@ impl Core {
         }
     }
 
+    /// A settle held back to `T0` plus a window (no unsettled `EIO` before)
+    /// is sent on again if it sits idle: durable in the inbox, or between
+    /// attempts with no timer, goes down its route again; one waiting on a
+    /// lease read or the lease path (S3 is slow, which is when a window can
+    /// pass without a verdict) is forwarded to the holder it knows if that
+    /// one is reachable now, as `on_own_s3` does. A sequencer that became
+    /// reachable in the last moments gets the settle and answers it, rather
+    /// than the op ending unsettled with one in reach.
+    fn settle_wake_idle(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(c) = self.clients.get(&rid).filter(|c| c.settle) else {
+            return;
+        };
+        let route = match c.phase {
+            Phase::InboxWaiting { .. } => true,
+            Phase::Backoff => {
+                c.timer.is_none() && c.withdraw.is_none_or(|w| w.route_waiting.is_none())
+            }
+            _ => false,
+        };
+        if route {
+            self.settle_route(now, rid, replica, out);
+            return;
+        }
+        if !matches!(
+            c.phase,
+            Phase::LearnHolder | Phase::WaitingLease | Phase::AcquireRetry
+        ) || !self.cfg.forwarding
+            || !self.cfg.p2p
+        {
+            return;
+        }
+        let Some(holder) = self
+            .lease
+            .cached_holder
+            .filter(|h| *h != self.cfg.node_id && self.reaches(now, *h))
+        else {
+            return;
+        };
+        if let Some(t) = self.clients.get_mut(&rid).and_then(|c| c.timer.take()) {
+            self.cancel_timer(t, out);
+        }
+        self.send_forward(now, rid, holder, 0, replica, out);
+    }
+
     /// Move a settle's second deadline to `at` (the wait clock): cancels the
     /// armed one and records the new one in `settle_until`. `false` (nothing changed) if the op is
     /// gone or `at` is not later than the deadline in force: a deadline is
@@ -4956,7 +5007,8 @@ impl Core {
                 let allowed = w.acked_at.map_or(w.deadline, |t| t.plus(window));
                 if now.wait < allowed {
                     self.extend_settle_deadline(rid, allowed, None, out);
-                        return;
+                    self.settle_wake_idle(now, rid, replica, out);
+                    return;
                 }
             }
         }
