@@ -1111,8 +1111,15 @@ lease and one log
   outwaited), then executes alone. There is no two-phase commit.
 - **Placement** is automatic: the root sees every op's origin and
   delegates the *topmost* directory one node dominates (at least 70% of
-  its ops in a 30 s window, above a rate floor), recalling when the share
-  stays below 50% for a minute, with a cool-down before it moves again.
+  its ops in a 30 s window, above a rate floor), recalling a placed grant
+  when the share stays below 50% for a 5-minute dwell, with a cool-down
+  before it moves again. A dominant writer with no peer within the backup
+  RTT budget (a far writer: every round trip of a 30 s dwell at least
+  20 ms; every connected writer at a budget of 0) is granted a *sticky*
+  subtree instead, which placement never recalls: it ends by its holder's
+  release or the operator
+  ([ADR-54](DECISIONS.md#adr-54-placement-grants-a-far-dominant-writer-a-sticky-subtree-and-recalls-placed-grants-only-after-a-long-dwell),
+  plan 46 §5.3).
 - **Hot shared directories**: parent `mtime`/`ctime` are hybrid logical
   clock stamps (a peer's stamp more than `CONSTELLATION_HLC_SKEW_TOLERANCE_S`
   ahead is applied but not followed by the clock) merged by `max` and

@@ -4383,3 +4383,61 @@ See: `crates/authority/src/core/holder.rs` (`settle_refusal`),
 `crates/authority/src/core/client.rs` (`refuse_on_lease_path`, `settle_route`,
 `settle_hold_backoff`), `crates/authority/src/core/readindex.rs`
 (`on_held_reply_timer`), `crates/meta/src/store/held.rs`.
+
+## ADR-54: Placement grants a far dominant writer a sticky subtree and recalls placed grants only after a long dwell
+
+**Status**: decided by the maintainer on 2026-11-11 (plan 46 M1.3 step 7;
+the order 7, 9, 8 and the budget-0 rule). Replaces the 30 s-window recall of
+placed grants and completes plan 46 M1.2 step 13 (no lone delegate), which
+forwarded a far writer.
+
+**Context**: a writer with no peer within the backup RTT budget cannot hold a
+placed grant (its answers would wait for no group), so step 13 forwarded it
+and every one of its ops paid the round trip to the root. A sticky grant
+answers `Final` at the holder with no group. The placement also recalled a
+placed grant after one or two 30 s windows below its floor, which moved
+subtrees on a burst.
+
+**Decision**:
+
+- **Kind.** `Core::place_kind_for` picks the grant for a dominant node:
+  `Placed` when the node has a group within budget (as before); `Sticky` when
+  it has none, its link is far, sticky placement is on and it holds no
+  designation (a sticky stream of its own is grown); none otherwise (counted).
+  A node is far when every round trip of `placement_far_dwell_ms` (30 s) was at
+  least `max(budget + 1, placement_far_rtt_ms)` (20 ms), measured from every
+  sample of a directory snapshot and cleared by one lower sample or a break.
+  Between the budget and the far round trip lies the dead band: the node
+  stays forwarded, so a LAN under load never gets a sticky grant. At a budget
+  of 0 no group can exist and every connected eligible node is far, with no
+  dwell. No grant is proposed over a pending designation (on the directory,
+  over it or under it).
+- **Recalls of placed grants.** Placement recalls only a `Placed` stream, for
+  two reasons: the long dwell (the delegate's share or rate below the floor
+  for `placement_dwell_ms`, now 5 minutes), and conversion (a placed grant to
+  a node measured far with no recorded backup: recalled once, with no cooldown,
+  so the next round grants it sticky; off with sticky placement). It never
+  recalls a sticky or designated grant.
+- **After a holder's release.** The release row of a holder's own release of a
+  sticky subtree keeps the placement from granting it back to that node for one
+  window (the window still counts its earlier ops). Other nodes are not held
+  back.
+- **Settings.** `CONSTELLATION_DELEGATION_STICKY_PLACEMENT` (on),
+  `_FAR_RTT_MS` (20), `_FAR_DWELL_MS` (30000); `_DWELL_MS` default 300000.
+- **Sticky grants and the other rules.** A sticky holder that dies blocks its
+  subtree (`EROFS`, `EXDEV` across its boundary) until it returns or the
+  operator abandons it; the answers are final and nothing is rolled back. An
+  inbox-only writer into the subtree gets `EROFS` where fence rule C9 applies.
+
+**Consequences**: far writers run at their own node's speed once a window and a
+far dwell have passed; the first ops of a new subtree wait for the grant
+record's archive once. A wrong choice (a near node judged far, a holder that
+stops writing) costs availability, not integrity; the holder's release
+(unmount, suspend) and the operator undo it. A cluster at a budget of 0 now
+gets sticky grants for every dominant writer instead of forwarding.
+
+**Rejected**: recalling sticky grants by the placement (the grant would no
+longer be final); a new dominance threshold for far writers (the window already
+smooths a burst); judging a link by its last sample (load inflates it).
+
+**May revert**: yes, by `CONSTELLATION_DELEGATION_STICKY_PLACEMENT=off`.

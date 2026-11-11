@@ -1573,7 +1573,7 @@ promises cannot gate it. Epochs are kept away from such leases instead:
 | `--write-mode through\|back` | `through` | what `close()` waits for (see [When to use `--write-mode back`](#when-to-use---write-mode-back)) |
 | `CONSTELLATION_REMOTE_CHUNK_WAIT_S` | `60` | how long the sequencer's readers and must-finish passes wait for a non-owner's `back` chunks |
 | `CONSTELLATION_ACK` | unset | default for `fs create --ack-policy` (a mount only warns when it disagrees with the filesystem) |
-| `CONSTELLATION_BACKUP_RTT_BUDGET_MS` | `5` | backup candidates' RTT limit; `0` disables backups and admits no peer for a stealable delegation |
+| `CONSTELLATION_BACKUP_RTT_BUDGET_MS` | `5` | backup candidates' RTT limit; `0` disables backups and admits no peer for a stealable delegation: placement treats every eligible dominant writer as far and grants it a sticky subtree |
 | `CONSTELLATION_BACKUPS` | `1` | most backups; `0` disables backups |
 | `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` | `1000` | a backup without progress this long is removed (one known alive: after the slow bound) |
 | `CONSTELLATION_BACKUP_SLOW_MAX_MS` | `10000` | a backup known alive without progress this long is removed anyway |
