@@ -3819,6 +3819,31 @@ and not bookkeeping at the requester or the root.
   and a takeover claim contacts the previous holder with `SealTail` even when
   it fetches no tail.
 
+- **A lock holder waits for its abandoned write's outcome** (2026-11-11). A
+  tagged write whose caller stops waiting before the core's deadline (the
+  `fsync_wait` soft timeout or interrupt, whose request goes on in the core)
+  ends in doubt, and the executor judges a token of a grant that is live
+  there exactly, whatever the token's window says. The window pin
+  therefore does not bound it: the holder's next turn under the renewed
+  grant could write and be acknowledged, and the abandoned write then
+  execute over it. A new local turn under a grant now also waits while an
+  op in doubt with a known rid is unfinished in this node's core, until the
+  core finishes it (answers, settles or gives it up in doubt:
+  `LockTables::end_hold`, called from `finish` and `finish_in_doubt`), at
+  most the settle's own bound from the doubt (`attempts + settle_cap_span`,
+  about 100 s at the defaults; an outwait extension of the settle, `Held`,
+  never takes it further). That wait is the whole bound: a separate client
+  deadline would end it while the root can still execute the write. Latency
+  only. A non-blocking request in that time gets `EAGAIN` with no
+  conflicting lock, as it does inside the token window: an accepted,
+  bounded deviation (typically the rest of the core's attempt, seconds;
+  the worst case is the bound above), because the alternative is a write
+  landing over acknowledged ones; a blocking request polls, interruptibly.
+  No deadlock: the wait holds nothing and the core's finish does not depend
+  on it. Only a write made under a lock is covered; a write outside any
+  lock has no tag and no hold (the residual below). The sim lock lane
+  reports its abandoned writes with their rid as the engine does.
+
 The invariant, now stated as one sentence: **an op whose client heard an
 unsettled `EIO` never executes later**, with the residuals listed below.
 
@@ -3848,7 +3873,9 @@ read again (stats `inbox_stale_reads_discarded`, `inbox_stale_relists`); a
 held settle can lengthen the tail up to the cap (`settles_window_reset`). A
 replayed unacknowledged row no longer executes; its requester's retry by rid is
 the copy that does. The engine's `fsync_wait` cap may answer `EIO` before the
-core's settle ends; the sim cannot see it, out of scope.
+core's settle ends; the sim cannot see it, out of scope. For a write made under
+a lock the holder's next turn waits for the core's finish (above); a write
+outside any lock keeps this residual.
 
 **Rejected**: a deadline stamp (`ttl_ms`) on every forward (a cross-node
 clock; bounds lateness only); holding the unsettled `EIO` until a failed

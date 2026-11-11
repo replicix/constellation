@@ -57555,6 +57555,131 @@ mod c2g_settle {
         assert_eq!(requester.core.stats.unsettled_held_lost_chunk, 0);
     }
 
+    /// The lock holder's next turn waits for an abandoned tagged write until
+    /// the core finishes it, and that is not one client deadline after the
+    /// abandon: the settle the sequencer holds for an outwait
+    /// (`Held { outwait_ms }`) is moved later, up to its cap, and the
+    /// sequencer can still execute the write inside it. Fails on the parent:
+    /// the hold ends a client deadline after the doubt, 30 s before the
+    /// settle's end at the defaults.
+    #[test]
+    fn the_next_turn_waits_for_a_settle_moved_by_an_outwait() {
+        use constellation_meta::locks::{
+            HeldGrant, LocalLock, LocalOutcome, LockMode, LockTag, LockToken,
+        };
+        let (_holder, mut r) = pair();
+        r.core.locks_start(r.clk(), &r.meta);
+        // The table reads the harness's clock (as the daemon's and the
+        // sim's tables read their node's).
+        let now = std::sync::Arc::new(std::sync::Mutex::new(r.clk()));
+        let cell = now.clone();
+        r.meta
+            .locks()
+            .set_clock(std::sync::Arc::new(move || *cell.lock().unwrap()));
+        let id = constellation_meta::locks::GrantId { node: 1, seq: 1 };
+        r.meta.locks().install_held(
+            7,
+            HeldGrant {
+                id,
+                mode: LockMode::Exclusive,
+                until: hm(r.now.plus(10_000_000)),
+                renew_at: hm(r.now.plus(5_000_000)),
+                owner: 2,
+                recalled: false,
+                position: constellation_meta::Position::ZERO,
+                renewing: Some(hm(r.now)),
+                releasing: false,
+                first_use: false,
+                idle_since: None,
+                installed: hm(r.now),
+                lapsing: None,
+                written: false,
+                route: Some(1),
+            },
+        );
+        let next_turn = |r: &Harness| {
+            r.meta.locks().local_set(
+                7,
+                LocalLock {
+                    owner: 9,
+                    pid: 1,
+                    pid_start: 0,
+                    write: true,
+                    start: 0,
+                    end: 9,
+                },
+                r.clk(),
+            )
+        };
+        let tag = LockTag(vec![LockToken::window(id, 500)]);
+        let rid = r.rid(1);
+        *now.lock().unwrap() = r.clk();
+        r.meta.locks().tag_begin(&tag, r.clk());
+        let out = r.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: r.create("x"),
+            tag: tag.clone(),
+        });
+        let first = deadline_timer(&r, &out);
+        // The caller gives up: in doubt with its rid.
+        r.advance(700);
+        *now.lock().unwrap() = r.clk();
+        r.meta.locks().pin_in_doubt(&tag, Some(rid));
+        r.meta.locks().tag_end(&tag, true, r.clk());
+        let dl = r.core.dl_t();
+        r.advance(dl.attempts - 700);
+        let out = r.step(Event::Timer { id: first });
+        let Some(PeerMsg::MutateRequest {
+            req, settle: true, ..
+        }) = forward_to_1(&out)
+        else {
+            panic!("no settle: {out:?}");
+        };
+        // The sequencer holds the settle for the end of a generation it
+        // outwaits: the second deadline moves to the settle's cap.
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Held {
+                    retry_ms: 10,
+                    outwait_ms: Some(10_000_000),
+                    lost_chunk: false,
+                },
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+            },
+        });
+        let c = &r.core.clients[&rid];
+        assert_eq!(c.settle_until, c.settle_cap);
+        let cap = c.settle_cap;
+        assert!(
+            cap.since(r.clk().wait) > dl.settle_window as i64,
+            "the settle runs on past a window"
+        );
+        // Past a client deadline from the doubt, the settle still runs: the
+        // sequencer can execute the write, so the next turn still waits.
+        r.advance(dl.client_deadline - dl.attempts + 1_000);
+        assert!(r.clk().wait < cap);
+        assert_eq!(next_turn(&r), LocalOutcome::Predecessor);
+        // Up to the settle's end.
+        let until = r.core.clients[&rid].settle_until;
+        r.advance(until.since(r.clk().wait).max(0) as u64 - 1);
+        assert_eq!(next_turn(&r), LocalOutcome::Predecessor);
+        // The core gives the op up: the next turn goes on.
+        r.advance(1);
+        let id = r.core.clients[&rid].deadline;
+        let out = r.step(Event::Timer { id });
+        assert!(!replies(&out).is_empty(), "{out:?}");
+        assert!(!r.core.clients.contains_key(&rid));
+        assert_eq!(next_turn(&r), LocalOutcome::Done);
+    }
+
     /// A forward whose holder never answered (the request lost): at the
     /// deadline, a settle window before the old one, the requester settles
     /// the rid instead of answering in doubt — one settle, under the same

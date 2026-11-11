@@ -5158,6 +5158,15 @@ impl Core {
         self.withdraw_failed_rids.remove(&rid)
     }
 
+    /// The core is done with this node's own tagged op `rid` (answered,
+    /// settled or given up in doubt): the lock holder's next turn no longer
+    /// waits for it ([`LockTables::end_hold`]).
+    fn end_lock_hold(&self, c: &ClientOp, rid: Rid, replica: &dyn Replica) {
+        if matches!(c.origin, Origin::Client) && rid.node == self.cfg.node_id && !c.tag.is_empty() {
+            replica.locks().end_hold(rid);
+        }
+    }
+
     /// The op is neither executed here nor answered by anyone: the client
     /// hears `InDoubt` (`EIO`; retryable by the same rid), the replay
     /// drain leaves it queued.
@@ -5191,6 +5200,7 @@ impl Core {
         let Some(c) = self.clients.remove(&rid) else {
             return;
         };
+        self.end_lock_hold(&c, rid, replica);
         if let Some(t) = c.withdraw.and_then(|w| w.retry) {
             self.cancel_timer(t, out);
         }
@@ -5414,6 +5424,7 @@ impl Core {
         let Some(c) = self.clients.remove(&rid) else {
             return;
         };
+        self.end_lock_hold(&c, rid, replica);
         self.log_if_slow(now, rid, &c, &format!("{outcome:?}"), replica);
         self.cancel_timer(c.deadline, out);
         if let Some(t) = c.timer {
