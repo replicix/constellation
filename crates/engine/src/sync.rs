@@ -513,6 +513,17 @@ pub enum SyncRequest {
         dir: Ino,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
+    /// Plan 46 M1.3 step 7: this node, as a holder, releases its sticky
+    /// subtrees (`dirs` empty: all of them) by its own decision (a clean
+    /// unmount, a suspension). With `wait` the reply comes once the root
+    /// has appended the release row (or the core's bound runs out), else
+    /// at once. The core's answer is bounded by `Deadlines::leave_wait`;
+    /// [`release_sticky`] bounds the caller's wait as well.
+    StickyRelease {
+        dirs: Vec<Ino>,
+        wait: bool,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
     /// Plan 46 M1.2 step 11 ("Leave ends grants first"): before the
     /// registry retires `node`, the root ends every delegation it holds
     /// (answered once the log has).
@@ -885,5 +896,77 @@ mod roster_request_tests {
             Some(SyncRequest::Roster { read, .. })
                 if read.complete && read.write_eligible == [1, 2]
         ));
+    }
+}
+
+/// Plan 46 M1.3 step 7: release every sticky subtree this node holds and
+/// wait for the root to take the rows, for at most `cap` (the lifecycle's
+/// own remaining time, and `Deadlines::leave_wait` at most): a holder that
+/// cannot reach the root must never hang an unmount or a suspension. The
+/// rows of an undrained remainder stay final and stream on return.
+pub(crate) async fn release_sticky(
+    tx: &tokio::sync::mpsc::UnboundedSender<SyncRequest>,
+    cap: std::time::Duration,
+) -> Result<String, String> {
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    tx.send(SyncRequest::StickyRelease {
+        dirs: Vec::new(),
+        wait: true,
+        reply,
+    })
+    .map_err(|_| "the sync task is not running".to_string())?;
+    match tokio::time::timeout(cap, receive).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("the sync task stopped".into()),
+        Err(_) => Err(format!("not released within {cap:?}")),
+    }
+}
+
+#[cfg(test)]
+mod sticky_release_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// An unmount's (and a suspension's) release asks for every sticky
+    /// subtree, with the wait, and returns the core's answer.
+    #[tokio::test]
+    async fn the_release_asks_for_all_subtrees_and_waits() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let asked = tokio::spawn(async move {
+            match rx.recv().await {
+                Some(SyncRequest::StickyRelease { dirs, wait, reply }) => {
+                    let _ = reply.send(Ok("released".into()));
+                    Some((dirs, wait))
+                }
+                _ => None,
+            }
+        });
+        let done = release_sticky(&tx, Duration::from_secs(5)).await;
+        assert_eq!(done, Ok("released".to_string()));
+        assert_eq!(asked.await.unwrap(), Some((Vec::new(), true)));
+    }
+
+    /// A root that does not answer never hangs the caller past its bound.
+    #[tokio::test]
+    async fn the_release_is_bounded_when_the_root_does_not_answer() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let keep = tokio::spawn(async move {
+            let held = rx.recv().await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        let done = release_sticky(&tx, Duration::from_millis(100)).await;
+        assert!(done.is_err(), "{done:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        keep.abort();
+    }
+
+    /// With no sync task the release fails at once.
+    #[tokio::test]
+    async fn the_release_fails_at_once_without_a_sync_task() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        assert!(release_sticky(&tx, Duration::from_secs(5)).await.is_err());
     }
 }

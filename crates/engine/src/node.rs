@@ -343,6 +343,9 @@ pub struct Engine {
     /// owner that cannot grant yet (`Deadlines::lock_owner_wait_max`), and
     /// how often it first asks again (`Deadlines::lock_poll`).
     lock_owner_wait_max_ms: u64,
+    /// `Deadlines::leave_wait`: the bound of a holder's sticky release at
+    /// unmount (plan 46 M1.3 step 7).
+    sticky_release_wait_ms: u64,
     lock_poll_ms: u64,
     lock_flushers: Arc<crate::locks::LockFlushers>,
     /// Open-orphan holds (DESIGN.md §3): every view's open-handle table,
@@ -1118,6 +1121,8 @@ impl Engine {
             constellation_authority::deadlines::Deadlines::new(&core_config).lock_owner_wait_max;
         let lock_poll_ms =
             constellation_authority::deadlines::Deadlines::new(&core_config).lock_poll;
+        let sticky_release_wait_ms =
+            constellation_authority::deadlines::Deadlines::new(&core_config).leave_wait;
         tracing::info!(
             locks = if locks_cluster { "cluster" } else { "local" },
             "file locks"
@@ -1780,6 +1785,7 @@ impl Engine {
                 core_status: core_status.clone(),
                 background,
                 rt: rt.clone(),
+                sticky_release_wait: Duration::from_millis(sticky_release_wait_ms),
             },
         );
         if profile.leases == crate::LeaseMode::ForwardOnly
@@ -1851,6 +1857,7 @@ impl Engine {
             cto_strict,
             locks_cluster,
             lock_owner_wait_max_ms,
+            sticky_release_wait_ms,
             lock_poll_ms,
             lock_flushers,
             hold_sources,
@@ -2553,6 +2560,18 @@ impl Engine {
                     "uploading dirty chunks before unmount; the journal was left un-shipped \
                      (run `constellation status --state-dir ...` after remounting to drain it)",
                 );
+            }
+            // Plan 46 M1.3 step 7: a clean unmount releases the sticky
+            // subtrees this node holds before anything else leaves: the
+            // holder's own decision, bounded by `Deadlines::leave_wait` (a
+            // holder that cannot reach the root never hangs the exit). Not
+            // for a handover: its successor carries the grants on.
+            if withdraw_holds {
+                let cap = Duration::from_millis(self.sticky_release_wait_ms);
+                match crate::sync::release_sticky(&self.sync_tx, cap).await {
+                    Ok(done) => tracing::info!(%done, "unmount: sticky grants released"),
+                    Err(error) => tracing::warn!(%error, "unmount: sticky grants not released"),
+                }
             }
             // Plan 30 M5: the final flush + publish + release is the core's
             // `Control::Shutdown` — a release like any other (nothing new

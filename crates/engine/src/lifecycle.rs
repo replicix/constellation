@@ -164,6 +164,9 @@ pub(crate) struct LifecycleDeps {
     pub core_status: Arc<Mutex<CoreStatus>>,
     pub background: Arc<BackgroundGate>,
     pub rt: tokio::runtime::Handle,
+    /// `Deadlines::leave_wait`: the longest a holder waits for the root to
+    /// take its sticky release (plan 46 M1.3 step 7).
+    pub sticky_release_wait: Duration,
 }
 
 /// One engine's lifecycle (see the module docs).
@@ -457,6 +460,22 @@ impl Lifecycle {
             ));
         }
         drop(views);
+
+        // 2b. Plan 46 M1.3 step 7: a sticky holder that goes to sleep lets go
+        // of its subtrees (the holder's own decision), so the root and the
+        // others are not left forwarding to a node that is gone; bounded by
+        // what is left of the deadline and the release bound, and a holder
+        // that cannot reach the root only loses the wait (the rows stay
+        // final and stream on its return).
+        let cap = left().min(self.deps.sticky_release_wait);
+        match self
+            .deps
+            .rt
+            .block_on(crate::sync::release_sticky(&self.deps.sync_tx, cap))
+        {
+            Ok(done) => tracing::info!(%done, "suspending: sticky grants released"),
+            Err(error) => tracing::warn!(%error, "suspending: sticky grants not released"),
+        }
 
         // 3. No lease from here on (always: it costs nothing).
         if let Err(e) = self.set_authority(true, left().max(Duration::from_secs(2))) {
