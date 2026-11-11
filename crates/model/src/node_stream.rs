@@ -500,6 +500,9 @@
 //! - `sticky_answers_before_grant_committed` (chunk 7): a non-stealable
 //!   holder honours a `DelegateNode` record once it is in the root's
 //!   journal (with `check_recall` off, to show the orphan rule's harm).
+//! - `grow_before_release` (ADR-56, handover): the root grants a handed-over
+//!   subtree to the requester before the holder's release row is in its
+//!   journal (the `Grow` guard `t[d] == ROOT` is off).
 //! - `singleton_after_join` (chunk 8): the root's view shows the peer but
 //!   it journals no bump and keeps answering alone.
 //! - `singleton_serves_forwards` (chunk 8): the root's singleton test
@@ -1188,6 +1191,10 @@ pub struct NodeStreamModel {
     pub cut_before_read_recall: bool,
     pub server_replay_queue: bool,
     pub singleton_serves_forwards: bool,
+    /// ADR-56, the knob: the root grants a handed-over subtree before the
+    /// holder's release row is in its journal (the `Grow` guard that the
+    /// table shows the directories as the root's is off).
+    pub grow_before_release: bool,
     /// ADR-47: forwards carry `routed`/`touched`; the executor fences and
     /// the root refuses for good only a rid that touched no generation.
     pub route_fence: bool,
@@ -1313,6 +1320,7 @@ impl NodeStreamModel {
             cut_before_read_recall: false,
             server_replay_queue: false,
             singleton_serves_forwards: false,
+            grow_before_release: false,
             route_fence: false,
             stale_routes: false,
             unfenced_forward: false,
@@ -3557,7 +3565,8 @@ impl Model for NodeStreamModel {
                         && has_peer(s, s.view_roster)
                         && root_cfg.backups == 0
                         && !root_cfg.singleton);
-                if !done && allowed && ended(s, g).is_none() && bits(dirs).all(|d| t[d] == ROOT) {
+                let released = self.grow_before_release || bits(dirs).all(|d| t[d] == ROOT);
+                if !done && allowed && ended(s, g).is_none() && released {
                     actions.push(Action::Grow(k as u8));
                 }
             }

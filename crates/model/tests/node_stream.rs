@@ -307,6 +307,7 @@ const TRACES: &[(&str, &str, usize)] = &[
         "ack_implies_committed_by_config",
         9,
     ),
+    ("c7-t4-same-key+grow_before_release", "journal_valid", 6),
     ("f1-stale+unfenced_forward", "refused_never_completes", 8),
     (
         "f1-stale+root_ignores_touched",
@@ -1927,6 +1928,58 @@ fn f1_knob_root_ignores_touched_is_found() {
         &m,
         "refused_never_completes",
         CAP_FAULTS,
+    );
+}
+
+// ======== handover (plan 46 M1.3 step 8, ADR-56): a sticky grant changes
+// hands only by its holder's release row; the root grants the subtree to the
+// dominant writer after it.
+
+/// H1: C7-T4 with route fencing and stale route caches: node 2's first send
+/// into `/D1` goes to node 1 routed by a cache that is not the grant (the
+/// handover's race: a forward that arrives after the release is fenced and
+/// re-routed, never run at the old holder, never refused for good).
+fn h1() -> NodeStreamModel {
+    let mut m = c7_t4();
+    m.route_fence = true;
+    m.stale_routes = true;
+    m
+}
+
+/// H2: H1 and one crash (disk kept): of node 1 after its release row is in
+/// the root's log and before node 2's grant is committed, or of any other
+/// node at any other point.
+fn h2() -> NodeStreamModel {
+    h1().with_faults(1, 0)
+}
+
+#[test]
+fn h1_design_handover_under_route_fencing() {
+    assert_clean_within("h1", &h1(), CAP_LARGE);
+}
+
+#[test]
+fn h2_design_handover_with_a_crash() {
+    assert_clean_within("h2", &h2(), CAP_DEEP);
+}
+
+/// The root grants the subtree to the requester before the holder's release
+/// row is in its journal: two sequencers for one key (both nodes create
+/// `/D1/a`, both succeed, and the root's journal replays one of them as
+/// `EEXIST`).
+#[test]
+fn h_knob_grow_before_release_is_found() {
+    let mut m = NodeStreamModel::design(vec![vec![], vec![create(D1A)], vec![create(D1A)]])
+        .with_grant(sticky(1, D1))
+        .with_grant(sticky(2, 0))
+        .with_stream_release(1)
+        .with_grow(2, D1);
+    m.grow_before_release = true;
+    assert_finds_within(
+        "c7-t4-same-key+grow_before_release",
+        &m,
+        "journal_valid",
+        CAP_LARGE,
     );
 }
 
