@@ -1418,7 +1418,10 @@ impl SessionState {
     /// a committed entry would wait for a segment that already went by.
     pub fn row_in_log(&self, epoch: u64, jseq: u64) -> bool {
         let g = self.inner.lock().unwrap();
-        let Some(a) = g.applied.filter(|a| a.epoch == epoch) else {
+        // What the previous incarnation persisted counts as applied: after a
+        // restart `applied` is empty until the first segment lands, and the
+        // rows up to the persisted position would read as missing.
+        let Some(a) = g.applied.max(g.seeded).filter(|a| a.epoch == epoch) else {
             return false;
         };
         jseq <= a.jseq
@@ -2394,6 +2397,22 @@ mod tests {
         assert!(!s.reaches_observed(), "nothing of tenure 2 applied");
         s.advance_rows(8, jp(2, 0), &[]);
         assert!(s.reaches_observed(), "tenure 2's rows 1-3 are all excused");
+    }
+
+    /// After a restart `applied` is empty and only `seeded` holds the
+    /// persisted position: the rows up to it are in the log.
+    #[test]
+    fn a_seeded_session_holds_the_rows_up_to_its_persisted_position() {
+        let s = SessionState::default();
+        assert!(!s.row_in_log(3, 1));
+        s.seed_applied(9, jp(3, 5));
+        assert!(s.row_in_log(3, 1));
+        assert!(s.row_in_log(3, 5));
+        assert!(!s.row_in_log(3, 6), "past the persisted position");
+        assert!(!s.row_in_log(2, 1), "another tenure");
+        s.advance(10, jp(3, 7));
+        assert!(s.row_in_log(3, 7));
+        assert!(!s.row_in_log(3, 8));
     }
 
     /// Rows applied out of order are kept as ranges and forgotten once
