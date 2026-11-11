@@ -2001,7 +2001,9 @@ above):
   ship what was journaled meanwhile. B has tailed the log since the
   start; a fresh D bootstraps from the head commit plus the log after it.
   Without a backup the premise is a lone root's (ADR-50: only a
-  singleton answers from its own disk), so B mounts after the kill. Once
+  singleton answers from its own disk), so B is a read-only member
+  (`--read-only-member`, which does not end the singleton) with P2P off: it
+  tails S3 from the start, as the oracle needs. Once
   both have applied through the log head, B and D must list exactly
   the same `burst/` entries, those must be a contiguous prefix of A's
   mkdir sequence, and A must have acknowledged more mkdirs than that
@@ -2080,10 +2082,14 @@ relay of its own so requests can be attributed per role):
 
 - **`stale-base-rename-divergence`** (plan 30 M5 phase 2, the
   `MutateReply::base` rule on the wire). Three nodes with own P2P keys,
-  A backed by C and B on `CONSTELLATION_P2P=off` (a committed row streams
-  to every P2P subscriber, B included, before S3 and past the sync hold;
-  with no backup at all A's unlink would wait for the archive and end in
-  `EIO`);
+  A backed by C, and B holding A's streamed rows
+  (`CONSTELLATION_FAULT_STREAM_ROWS_HOLD_FILE`: a committed row streams to
+  every P2P subscriber before S3 and past the sync hold, so without the
+  fault B sees the unlink first; with no backup at all A's unlink would
+  wait for the archive and end in `EIO`; the fault drops row-carrying
+  batches only, so the link stays up and B's rename still goes over P2P,
+  not through the S3 inbox). Disabling the requester's `base_ok` check
+  makes the scenario fail;
   A's and B's sync rounds are held with
   `CONSTELLATION_FAULT_HOLD_SYNC_FILE=<root>/hold-{a,b}` (each daemon
   writes `<hold>.held` from the first round that sees the file, so the

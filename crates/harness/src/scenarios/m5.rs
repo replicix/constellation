@@ -31,18 +31,20 @@ use std::time::{Duration, Instant};
 /// the log carries the unlink and the rename in order, and A, B and C
 /// agree `f2` is `f1`'s inode with `f1`'s content and `f1` is gone.
 ///
-/// C is A's backup; B is neither a backup nor on P2P. Since plan 43 C2f and
-/// ADR-40/50 a node with mounted peers answers a mutation only once the
-/// archive or a backup holds it, so with the sync hold and no backup
-/// (`CONSTELLATION_BACKUPS=0`, the scenario's first rig) A's unlink would
-/// wait for the archive and end in `EIO`. With C as the backup the unlink
-/// is acknowledged on C's copy and still unshipped. B runs with
-/// `CONSTELLATION_P2P=off`: a committed row is streamed to every P2P
-/// subscriber before S3, which the sync hold does not stop (a P2P B, backup
-/// or not, saw the unlink before its rename and the shape never formed; the
-/// scenario failed with "B already sees the unlink" since plan 30 §M9 when
-/// it had a backup). B's view then moves only with the log, and its
-/// rename reaches A through the S3 inbox.
+/// C is A's backup; B is neither a backup nor reachable by A's stream.
+/// Since plan 43 C2f and ADR-40/50 a node with mounted peers answers a
+/// mutation only once the archive or a backup holds it, so with the sync
+/// hold and no backup (`CONSTELLATION_BACKUPS=0`, the scenario's first rig)
+/// A's unlink would wait for the archive and end in `EIO`. With C as the
+/// backup the unlink is acknowledged on C's copy and still unshipped. A
+/// committed row is also streamed to every P2P subscriber before S3, past
+/// the sync hold: a plain B saw the unlink before its rename and the shape
+/// never formed. The shape is therefore forced on the wire: B holds
+/// A's streamed rows (`CONSTELLATION_FAULT_STREAM_ROWS_HOLD_FILE`; the link
+/// itself stays up, so B still routes over P2P) while A's reply to B's forwarded rename (`MutateReply`, naming
+/// the unshipped `base`) still arrives. B has not applied the unlink and
+/// must wait for the log. Disabling the rule (`base_ok` in the requester)
+/// makes this scenario fail with the divergence.
 pub fn stale_base_rename_divergence(_seed: u64) -> Result<()> {
     let (env, root) = setup("stale-base-rename-divergence")?;
     let _proxy = env.s3_proxy()?;
@@ -60,7 +62,11 @@ pub fn stale_base_rename_divergence(_seed: u64) -> Result<()> {
         Ok(c)
     };
     let mut a = mk("a", Some(&hold_a))?;
-    let mut b = mk("b", Some(&hold_b))?.with_env("CONSTELLATION_P2P", "off");
+    let rows_hold_b = root.path().join("deny-b");
+    let mut b = mk("b", Some(&hold_b))?.with_env(
+        "CONSTELLATION_FAULT_STREAM_ROWS_HOLD_FILE",
+        rows_hold_b.to_str().context("deny path")?,
+    );
     let mut c = mk("c", None)?;
     a.fs_create()?;
     a.mount()?;
@@ -88,6 +94,7 @@ pub fn stale_base_rename_divergence(_seed: u64) -> Result<()> {
         Ok(())
     })?;
     b.mount()?;
+    wait_for_p2p(&[&a, &b, &c])?;
 
     // A holds; `f1` and `f2` exist everywhere.
     std::fs::write(a.mnt.join("f1"), b"one")?;
@@ -113,6 +120,7 @@ pub fn stale_base_rename_divergence(_seed: u64) -> Result<()> {
     // Hold A's and B's sync rounds. Each daemon writes `<hold>.held` from
     // the first round that observes the hold; rounds run one at a time,
     // so from then on nothing A journals ships until the hold lifts.
+    std::fs::write(&rows_hold_b, b"hold")?;
     std::fs::write(&hold_a, b"hold")?;
     std::fs::write(&hold_b, b"hold")?;
     let held_a = root.path().join("hold-a.held");
@@ -134,14 +142,20 @@ pub fn stale_base_rename_divergence(_seed: u64) -> Result<()> {
         match std::fs::metadata(b.mnt.join("f2")) {
             Ok(m) if m.is_file() => {}
             Ok(_) => anyhow::bail!("`f2` is not a file on B"),
-            Err(e) => anyhow::bail!(
-                "B already sees the unlink: A shipped while held ({e}); A spool {} backups {}; B spool {} spec {}; C spool {}",
-                a.control_status()?["spool"],
-                a.control_status()?["ack"]["backups"],
-                b.control_status()?["spool"],
-                b.control_status()?["speculation"],
-                c.control_status()?["spool"]
-            ),
+            Err(e) => {
+                let st = |n: &Client, k: &str| {
+                    n.control_status()
+                        .map(|s| s[k].to_string())
+                        .unwrap_or_else(|e| format!("(status failed: {e})"))
+                };
+                anyhow::bail!(
+                    "B already sees the unlink: A shipped while held ({e}); A spool {}; B spool {} spec {}; C spool {}",
+                    st(&a, "spool"),
+                    st(&b, "spool"),
+                    st(&b, "speculation"),
+                    st(&c, "spool")
+                )
+            }
         }
 
         // B's rename of `f1` over `f2` forwards to A, where `f2` is gone.
@@ -165,6 +179,7 @@ pub fn stale_base_rename_divergence(_seed: u64) -> Result<()> {
         // Lift the holds: A ships the unlink and the rename, B tails.
         std::fs::remove_file(&hold_a)?;
         std::fs::remove_file(&hold_b)?;
+        std::fs::remove_file(&rows_hold_b)?;
         let deadline = Instant::now() + Duration::from_secs(60);
         while !rename.is_finished() {
             anyhow::ensure!(
@@ -212,6 +227,7 @@ pub fn stale_base_rename_divergence(_seed: u64) -> Result<()> {
 
     let _ = std::fs::remove_file(&hold_a);
     let _ = std::fs::remove_file(&hold_b);
+    let _ = std::fs::remove_file(&rows_hold_b);
     c.unmount()?;
     b.unmount()?;
     a.unmount()?;

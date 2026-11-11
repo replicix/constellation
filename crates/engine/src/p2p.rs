@@ -1046,6 +1046,9 @@ impl constellation_net::PeerService for P2pBridge {
         else {
             return;
         };
+        if !txs.is_empty() && crate::fault::stream_rows_held() {
+            return;
+        }
         let _ = self.nudge.send(sync::SyncRequest::PeerStreamAhead {
             from,
             epoch,

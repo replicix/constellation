@@ -107,6 +107,22 @@ pub fn p2p_denied(peer: u64) -> bool {
         .any(|id| id == peer)
 }
 
+/// `CONSTELLATION_FAULT_STREAM_ROWS_HOLD_FILE=<path>`: while that file
+/// exists, every pre-S3 stream batch this node receives that carries rows is
+/// dropped (empty batches, the holder's liveness signal, still count): the
+/// node's replica moves only with the log while the link stays up. A
+/// requester whose holder's committed rows have not reached it, for as long
+/// as the harness needs (`stale-base-rename-divergence`); the rows arrive
+/// with the log once the file is removed.
+pub fn stream_rows_held() -> bool {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var_os("CONSTELLATION_FAULT_STREAM_ROWS_HOLD_FILE").map(PathBuf::from)
+    })
+    .as_ref()
+    .is_some_and(|p| p.exists())
+}
+
 /// A duration from `var` in `unit`s (`None`: unset, unparseable or 0).
 fn env_duration(var: &str, unit: fn(u64) -> std::time::Duration) -> Option<std::time::Duration> {
     std::env::var(var)

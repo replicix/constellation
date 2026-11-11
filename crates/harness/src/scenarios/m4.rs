@@ -637,7 +637,39 @@ pub(super) fn poison_record_isolation(seed: u64) -> Result<()> {
             journal_drained(&a)
         },
     )?;
-    a.unmount()?;
+    // B is A's backup, so the held manifest and the chmod also sat in its
+    // copy of A's tail. Kill A and let B seal and take over: nothing that
+    // names the lost chunk may come back from that copy.
+    a.kill9()?;
+    eventually(
+        "B takes the lease over from the dead A",
+        Duration::from_secs(90),
+        || {
+            std::fs::write(b.mnt.join("after-kill"), b"b")?;
+            Ok(())
+        },
+    )?;
+    let m = std::fs::metadata(b.mnt.join("broken"))?;
+    anyhow::ensure!(
+        m.len() == 0 && m.permissions().mode() & 0o777 == 0o600,
+        "after B's takeover `broken` is not the replayed create plus chmod: size {} mode {:o}",
+        m.len(),
+        m.permissions().mode() & 0o777
+    );
+    let copies = std::fs::read_dir(b.mnt.join(".constellation-conflict"))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("broken@"))
+        .count();
+    anyhow::ensure!(
+        copies == 1,
+        "{copies} broken@ conflict copies after the takeover"
+    );
+    let held = b.control_status()?["held"].clone();
+    anyhow::ensure!(
+        held["transactions"].as_u64() == Some(0)
+            && held["inodes"].as_array().is_some_and(|i| i.is_empty()),
+        "B holds records after its takeover from A's tail: {held}"
+    );
     b.unmount()?;
     Ok(())
 }
@@ -736,7 +768,9 @@ pub(super) fn drop_held_remote_dependents(seed: u64) -> Result<()> {
     // below stops the archive: the first rig (no backups) left A's own
     // create blocked until EIO. C is A's backup, so A's rows are
     // acknowledged on C's copy, unshipped. B is not the backup: it is the
-    // requester whose rows A cannot answer from a log that is held.
+    // requester. B's forwarded rows stay unanswered because they depend by
+    // key on A's unshipped rename and manifest (they wait in `AwaitingLog`
+    // behind that work), not because the log is held.
     a.fs_create()?;
     a.mount()?;
     c.mount()?;
@@ -913,7 +947,43 @@ pub(super) fn drop_held_remote_dependents(seed: u64) -> Result<()> {
         "a placeholder was settled as abandoned: {}",
         status["ack"]
     );
-    a.unmount()?;
+    // C is A's backup, so the seed, the rename and B's mkdir also sat in
+    // its copy of A's tail. Kill A and let the survivors take over: the
+    // tree must stay what it was, and nothing held may come back.
+    a.kill9()?;
+    eventually(
+        "a survivor takes the lease over from the dead A",
+        Duration::from_secs(90),
+        || {
+            std::fs::write(b.mnt.join("after-kill"), b"b")?;
+            Ok(())
+        },
+    )?;
+    let mut expected = on_a.clone();
+    expected.insert("after-kill".to_string(), Some(b"b".to_vec()));
+    eventually(
+        "B and C hold the same tree after the takeover",
+        Duration::from_secs(60),
+        || {
+            anyhow::ensure!(
+                tree(&b.mnt)? == expected,
+                "B's tree changed after A's death"
+            );
+            anyhow::ensure!(
+                tree(&c.mnt)? == expected,
+                "C's tree differs from B's after A's death"
+            );
+            Ok(())
+        },
+    )?;
+    for node in [&b, &c] {
+        let held = node.control_status()?["held"].clone();
+        anyhow::ensure!(
+            held["transactions"].as_u64() == Some(0),
+            "{} holds records after the takeover from A's tail: {held}",
+            node.name
+        );
+    }
     b.unmount()?;
     c.unmount()?;
     Ok(())
