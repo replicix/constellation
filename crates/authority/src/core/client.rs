@@ -891,15 +891,7 @@ impl Core {
     /// gate sent on demand, and is routed as a settle again then
     /// (`on_forward_backoff` -> `settle_route`).
     fn gate_hold_settle(&mut self, now: Now, rid: Rid, out: &mut Vec<Action>) {
-        let delay = self.cfg.recall_hold_ms.max(50);
-        let timer = self.set_timer_wait(now.wait.plus(delay), Timer::ForwardBackoff(rid), out);
-        if let Some(c) = self.clients.get_mut(&rid) {
-            c.phase = Phase::Backoff;
-            c.gate_recall_wait = true;
-            if let Some(t) = c.timer.replace(timer) {
-                self.cancel_timer(t, out);
-            }
-        }
+        self.settle_hold_backoff(now, rid, true, out);
     }
 
     /// `true`: a recall the op needs is in flight in the gate.
@@ -2759,24 +2751,46 @@ impl Core {
         }) {
             return;
         }
-        // Late landing (flex-tight seed 1002): an op with a durable inbox
-        // batch is not answered in doubt with the batch standing: a takeover
-        // drains it after the `EIO` (I4). It is settled instead: the
-        // tombstones are written first and the unsettled `EIO` waits a window
-        // after the last acknowledgement (`finish_in_doubt`), as at the
-        // first deadline.
-        if self.clients.get(&rid).is_some_and(|c| {
-            !c.settle && !c.inbox_keys.is_empty() && Self::settles(c.origin, c.policy)
-        }) {
+        // ADR-58 C2: a sent op that settles is never answered in doubt at
+        // once: it is settled, with a window of its own (the tombstones of an
+        // op with a durable inbox batch are written first and the unsettled
+        // `EIO` waits a window after the last acknowledgement,
+        // `finish_in_doubt`; flex-tight seed 1002). The classifier credits an
+        // unsettled `EIO` with the window it ran, not with the time before
+        // the outage (flex 560, 40 violations in one seed).
+        if self
+            .clients
+            .get(&rid)
+            .is_some_and(|c| !c.settle && Self::settles(c.origin, c.policy))
+        {
             self.client_deadline(now, rid, false, replica, out);
             return;
         }
-        // Sent, and no sequencer can settle it in this epoch: the unsettled
-        // `EIO` (counted here unless `finish_in_doubt` counts a settle's).
-        if self.clients.get(&rid).is_some_and(|c| !c.settle) {
-            self.stats.client_unsettled_eio += 1;
+        // A settle that came back here: no sequencer can answer it in this
+        // epoch yet. It waits (the epoch may end, its owner answer) and the
+        // deadline, a window or the cap later, tells the unsettled `EIO`.
+        if self.clients.get(&rid).is_some_and(|c| c.settle) {
+            self.settle_hold_backoff(now, rid, false, out);
+            return;
         }
+        // (A best-effort op, or one that is not a client's: in doubt at once.)
+        self.stats.client_unsettled_eio += 1;
         self.finish_in_doubt(now, rid, replica, out);
+    }
+
+    /// ADR-58 C2: this node's settle waits in `Backoff` for `recall_hold_ms`
+    /// and is routed again then (`on_forward_backoff`). `gate`: the wait is
+    /// for a recall the takeover gate sent on demand (ADR-44).
+    fn settle_hold_backoff(&mut self, now: Now, rid: Rid, gate: bool, out: &mut Vec<Action>) {
+        let delay = self.cfg.recall_hold_ms.max(50);
+        let timer = self.set_timer_wait(now.wait.plus(delay), Timer::ForwardBackoff(rid), out);
+        if let Some(c) = self.clients.get_mut(&rid) {
+            c.phase = Phase::Backoff;
+            c.gate_recall_wait = gate;
+            if let Some(t) = c.timer.replace(timer) {
+                self.cancel_timer(t, out);
+            }
+        }
     }
 
     fn schedule_acquire_retry(&mut self, now: Now, rid: Rid, out: &mut Vec<Action>) {
@@ -4770,6 +4784,25 @@ impl Core {
         }
         if let Some(c) = self.clients.get_mut(&rid) {
             c.phase = Phase::Backoff;
+        }
+        // ADR-58 C2: in an epoch that refuses writes the settle goes to the
+        // epoch's hold owner when this node reaches it (it answers from its
+        // dedup, or `Held`/`Busy` until its hold is usable); otherwise it
+        // waits for the epoch to end or for its own deadline.
+        if self.epoch_refuses_writes() {
+            let me = self.cfg.node_id;
+            let owner = self
+                .pr
+                .carried
+                .map(|c| c.node)
+                .filter(|n| *n != me && self.reaches(now, *n));
+            match owner {
+                Some(owner) if self.cfg.forwarding => {
+                    self.send_forward(now, rid, owner, 0, replica, out)
+                }
+                _ => self.settle_hold_backoff(now, rid, false, out),
+            }
+            return;
         }
         let cached = self.lease.cached_holder.filter(|h| *h != self.cfg.node_id);
         match cached {

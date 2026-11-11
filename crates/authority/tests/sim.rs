@@ -16903,15 +16903,12 @@ fn regression_a_grant_handed_back_during_a_release_is_renewed() {
         // `locks-unlinked-delegated-blips` and 1351 of
         // `locks-blips-tight-delegated` hand one back now. Plan 46 M1.1
         // moved 2764's and 1351's to none; 1586 is one of the six of seeds 0
-        // to 4 000 of the first that do, 649 one of the seven of the second.)
+        // to 4 000 of the first that do, 649 one of the seven of the second.
+        // ADR-58 moved 624's trajectory to none: of seeds 0 to 1 500 the two
+        // below are the ones that hand one back.)
         (
             "locks-unlinked-delegated-blips",
             1043,
-            locks_unlinked_blips_config(),
-        ),
-        (
-            "locks-unlinked-delegated-blips",
-            624,
             locks_unlinked_blips_config(),
         ),
         (
@@ -19018,8 +19015,12 @@ fn an_unsettled_eio_of_an_op_a_dead_delegate_accepted_is_the_generations_tail() 
 /// `long-delegated-late-answers` in 0..36,000 tells such an `EIO`.)
 #[test]
 fn m03_a_reachable_sequencers_requester_is_not_isolated() {
-    let cfg = locks_blips_tight_long_lease_config;
-    let seed = 0;
+    // (ADR-58 C2: `locks-blips-tight-long-lease` seed 0 told its EIO at once,
+    // with the sequencer reachable; it is settled now. A flex-tight seed
+    // whose settle window passes with the lease path reachable for a moment
+    // only is the pin.)
+    let cfg = flex_tight_config;
+    let seed = 76;
     let r = run_seed(seed, cfg()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
     assert!(
         r.unsettled_violations > 0,
@@ -19120,18 +19121,15 @@ const SEAL_GAP_SEEDS: std::ops::Range<u64> = 0..300;
 
 /// Plan 46 M0.3: the isolated requesters of `flex-crash` (nodes cut from every
 /// other node and from S3 by an epoch outage) are allowed their unsettled
-/// `EIO`: seed 383 tells seven, every one of an isolated requester, and
-/// passes `+unsettled`.
+/// `EIO`: seed 383 told one and passes `+unsettled`. ADR-58 C2: the op in
+/// flight there is settled for a window first, and the epoch ends inside it:
+/// the client hears the settle's `Abandoned` (5.4 s), no `EIO`, and nothing
+/// is a violation. No flex or backup configuration tells an isolated
+/// requester's `EIO` in 2,000 seeds now.
 #[test]
 fn m03_an_isolated_requesters_eio_is_allowed() {
     let r = c0_run("flex-crash", 383, flex_crash_config());
-    assert!(
-        r.unsettled_isolated > 0 && r.unsettled_violations == 0,
-        "seed 383: isolated {}, violations {} ({:?})",
-        r.unsettled_isolated,
-        r.unsettled_violations,
-        r.unsettled_causes
-    );
+    assert!(r.unsettled_violations == 0, "{:?}", r.unsettled_causes);
     run_seed(383, strict(flex_crash_config(), "unsettled"))
         .unwrap_or_else(|e| panic!("flex-crash+unsettled seed 383: {e}"));
 }
@@ -20367,4 +20365,20 @@ fn rid_not_told_unsettled(label: &str, variants: &str, seed: u64, rid: (u64, u64
 fn adr58_c1_a_settle_refusal_is_not_held_behind_a_lost_chunk() {
     rid_not_told_unsettled("flex-crash", "settle+oracles+unsettled", 28, (3, 9));
     rid_not_told_unsettled("flex-crash", "settle+oracles+unsettled", 4, (3, 7));
+}
+
+/// ADR-58 C2: a sent op that finds its node's epoch refusing writes is
+/// settled for a window, never told the unsettled `EIO` at once. Fails on the
+/// parent: flex 560 tells 40, and the others one each, with the root reachable
+/// before the outage.
+#[test]
+fn adr58_c2_a_sent_op_in_a_refusing_epoch_is_not_told_eio_at_once() {
+    let all = "settle+oracles+unsettled";
+    let r = run_seed(560, strict(base_config("flex"), all))
+        .map(|r| r.unsettled_violations)
+        .unwrap_or_else(|e| panic!("flex+{all} seed 560: {e}"));
+    assert_eq!(r, 0);
+    rid_not_told_unsettled("flex", all, 164, (1, 10));
+    rid_not_told_unsettled("flex-crash", all, 44, (1, 18));
+    rid_not_told_unsettled("flex-crash", all, 102, (1, 5));
 }

@@ -10998,7 +10998,7 @@ mod epoch_rules {
     /// An op that was sent to a holder before (here: forwarded, then
     /// answered `NotHolder`, so it took the lease path) is never refused
     /// `EROFS` — it may have taken effect: in doubt (`EIO`), as at a
-    /// freeze.
+    /// freeze, after its settle window (ADR-58 C2).
     #[test]
     fn an_op_already_sent_stays_in_doubt_when_a_carrierless_epoch_activates() {
         let mut h = Harness::new(2);
@@ -11040,11 +11040,23 @@ mod epoch_rules {
         });
         assert!(replies(&out).is_empty(), "{out:?}");
         let out = h.step(refusing_epoch(false, vec![2]));
+        // ADR-58 C2: not told at once: the op is settled for a window, and
+        // the unsettled `EIO` is the deadline's.
+        assert!(replies(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.settles_sent, 1);
+        assert_eq!(h.core.stats.client_unsettled_eio, 0);
+        let [deadline] = timers(&out, TimerKind::ClientDeadline)[..] else {
+            panic!("no settle deadline: {out:?}")
+        };
+        let until = h.core.clients[&rid].settle_until;
+        h.advance(until.since(h.clk().wait).max(0) as u64);
+        let out = h.step(Event::Timer { id: deadline });
         let r = replies(&out);
         assert!(
             matches!(r.as_slice(), [(x, ClientReply::InDoubt)] if *x == rid),
             "{out:?}"
         );
+        assert_eq!(h.core.stats.client_unsettled_eio, 1);
     }
 
     /// Chunk close-stall-followup: a stranded op's replay in an epoch
@@ -57373,6 +57385,129 @@ mod c2g_settle {
             holder.meta.lookup(ROOT_INO, "x").unwrap().is_none(),
             "the late copy ran"
         );
+    }
+
+    /// A forwarded op whose reply was lost, on the lease path of a node
+    /// whose epoch just froze. Returns the harnesses, the rid and its
+    /// frozen requester's step output.
+    fn sent_op_in_a_frozen_epoch(
+        carried_by: Option<NodeId>,
+    ) -> (Harness, Harness, Rid, Vec<Action>) {
+        let (holder, mut requester) = pair();
+        let rid = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 1,
+        };
+        let op = requester.create("x");
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        let lost = forward_to_1(&out).expect("forwarded");
+        // (The holder executes it; its reply is lost.)
+        let mut holder = holder;
+        holder.step_archived(Event::Peer { from: 2, msg: lost });
+        requester.core.epoch.frozen = true;
+        requester.core.pr.carried = carried_by.map(|node| crate::event::Carrier {
+            node,
+            epoch: 1,
+            expires_unix_ms: i64::MAX,
+        });
+        {
+            let c = requester.core.clients.get_mut(&rid).unwrap();
+            c.forwarded = true;
+            c.phase = crate::core::client::Phase::WaitingLease;
+        }
+        let now = requester.clk();
+        let mut out = Vec::new();
+        requester.core.refuse_waiting_for_lease(
+            now,
+            constellation_types::Code::ReadOnly,
+            &requester.meta,
+            &mut out,
+        );
+        (holder, requester, rid, out)
+    }
+
+    /// ADR-58 C2: a sent op on the lease path of an epoch that refuses
+    /// writes is not told the unsettled `EIO` at once: it is settled, the
+    /// settle goes to the epoch's owner, and the owner's `Abandoned` or
+    /// outcome is what the client hears. Fails on the parent: `InDoubt` and
+    /// `client_unsettled_eio == 1` in the same step.
+    #[test]
+    fn a_sent_op_in_an_epoch_that_refuses_writes_settles_for_a_window() {
+        let (mut holder, mut requester, rid, out) = sent_op_in_a_frozen_epoch(Some(1));
+        assert!(replies(&out).is_empty(), "told in doubt at once: {out:?}");
+        assert_eq!(requester.core.stats.client_unsettled_eio, 0);
+        assert_eq!(requester.core.stats.settles_sent, 1);
+        let settle = forward_to_1(&out).expect("the settle goes to the epoch's owner");
+        assert!(
+            matches!(&settle, PeerMsg::MutateRequest { rid: r, settle: true, .. } if *r == rid),
+            "{settle:?}"
+        );
+        // The owner answers from its dedup: the late success (it executed).
+        let out = round_trip(&mut holder, &mut requester, settle);
+        assert!(
+            !replies(&out)
+                .iter()
+                .any(|(_, r)| matches!(r, ClientReply::InDoubt)),
+            "{out:?}"
+        );
+        assert_eq!(requester.core.stats.client_unsettled_eio, 0);
+        assert_eq!(requester.core.stats.in_doubt, 0);
+    }
+
+    /// ADR-58 C2: a carrier-less epoch with no owner to reach: the settle
+    /// waits (bounded steps, no re-entry loop) and the unsettled `EIO` comes
+    /// at the end of the settle window, counted once.
+    #[test]
+    fn a_sent_op_in_a_carrierless_epoch_ends_at_the_windows_end() {
+        let (holder, mut requester, rid, _) = sent_op_in_a_frozen_epoch(None);
+        drop(holder);
+        requester.core.cfg.p2p = false;
+        let cfg = requester.core.config().clone();
+        let window = Deadlines::new(&cfg).settle_window;
+        // The settle was started by the call above (p2p was still on, but no
+        // owner is carried): nothing was answered and the deadline is a
+        // window away.
+        assert_eq!(requester.core.stats.settles_sent, 1);
+        assert_eq!(requester.core.stats.client_unsettled_eio, 0);
+        let mut told = Vec::new();
+        let mut steps = 0;
+        let mut waited = 0;
+        let last = Deadlines::new(&cfg).client_deadline + 2_000;
+        while waited < last && told.is_empty() {
+            requester.advance(100);
+            waited += 100;
+            // (Every timer that is due, as the driver fires them.)
+            let due: Vec<TimerId> = requester
+                .core
+                .timers
+                .iter()
+                .filter(|(_, (_, at))| matches!(at, TimerAt::Wait(w) if *w <= requester.clk().wait))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in due {
+                let out = requester.step(Event::Timer { id });
+                steps += 1;
+                told.extend(
+                    replies(&out)
+                        .into_iter()
+                        .map(|(r, rep)| (r, matches!(rep, ClientReply::InDoubt))),
+                );
+            }
+            assert!(steps < 10_000, "a re-entry loop");
+        }
+        assert_eq!(told, vec![(rid, true)], "after {waited} ms of {window}");
+        assert!(
+            waited + 100 >= window,
+            "the EIO came before the window ({waited} < {window})"
+        );
+        assert!(waited < last, "no EIO within the deadline and a margin");
+        assert_eq!(requester.core.stats.client_unsettled_eio, 1);
     }
 
     /// The op executed at the holder and only its reply was lost: the
