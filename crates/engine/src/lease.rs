@@ -660,14 +660,14 @@ mod tests {
         });
         assert!(!view.release_requested(7, &[5], ReleaseWhy::Handover));
         assert_eq!(
-            *view.entries.lock().unwrap(),
+            view.entries.lock().unwrap().list,
             vec![(vec![5, 6], 7, i64::MAX / 2, false)],
             "a handover request left the subtree admitted"
         );
         assert!(view.stopped_dirs.lock().unwrap().is_empty());
         assert!(view.release_requested(7, &[5], ReleaseWhy::Recall));
         assert_eq!(
-            *view.entries.lock().unwrap(),
+            view.entries.lock().unwrap().list,
             vec![(vec![6], 7, i64::MAX / 2, false)],
             "a recall stops the subtree it names"
         );
@@ -686,7 +686,7 @@ pub struct DelegateView {
     /// honours under the stream (plan 46 M1.2 step 9: one the stream grew by
     /// and this node does not honour yet is the core's); `until` on this
     /// node's honour clock (plan 43 C7-H1).
-    entries: std::sync::Mutex<Vec<DelegateEntry>>,
+    entries: std::sync::Mutex<Entries>,
     /// Ops the FUSE fast path executed here as the delegate (the core's
     /// `deleg_executed` counts the ones that went through it).
     executed: std::sync::atomic::AtomicU64,
@@ -700,10 +700,6 @@ pub struct DelegateView {
     stopped_dirs: std::sync::Mutex<std::collections::HashSet<(u64, u64)>>,
     /// Fast-path executions admitted and not yet journaled.
     in_flight: std::sync::atomic::AtomicU64,
-    /// ADR-56: the `(stream, subtree)` pairs the delegate's fast path
-    /// admitted ops under since the driver last drained them
-    /// ([`DelegateView::take_local_notes`]).
-    local_notes: std::sync::Mutex<std::collections::BTreeSet<(u64, u64)>>,
     /// Plan 30 §M12: the keys of the ops the root's fast path executed
     /// since the driver last drained them, for the placement's
     /// histogram (`Core::place_note_local`).
@@ -726,15 +722,42 @@ pub struct DelegateView {
 /// subtrees, generation, honoured-until and stopped flag.
 type DelegateEntry = (Vec<u64>, u64, i64, bool);
 
+/// What [`DelegateView::take_local_notes`] reports: the `(stream, subtree)`
+/// pairs admitted under, and the `(stream, subtree, count)` in flight.
+pub type LocalNotes = (Vec<(u64, u64)>, Vec<(u64, u64, u64)>);
+
+/// What the delegate fast path reads and writes under the one lock it takes
+/// per admission: the streams ([`DelegateEntry`]) and, per (stream,
+/// subtree), the activity ADR-56's handover needs.
+#[derive(Debug, Default)]
+struct Entries {
+    list: Vec<DelegateEntry>,
+    acts: std::collections::BTreeMap<(u64, u64), std::sync::Arc<DirActivity>>,
+}
+
+/// ADR-56: the fast path's admissions under one (stream, subtree): how many
+/// are in flight (admitted, not yet journaled), and whether any was admitted
+/// since the driver last drained it. Created under the entries lock;
+/// counted without one.
+#[derive(Debug, Default)]
+struct DirActivity {
+    in_flight: std::sync::atomic::AtomicU64,
+    noted: std::sync::atomic::AtomicBool,
+}
+
 /// A fast-path execution admitted under a grant; dropped once the op is
 /// journaled (or refused), so a recall can wait for every admitted op.
 pub struct DelegateAdmission<'a> {
     pub gen: u64,
     view: &'a DelegateView,
+    act: std::sync::Arc<DirActivity>,
 }
 
 impl Drop for DelegateAdmission<'_> {
     fn drop(&mut self) {
+        self.act
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         self.view
             .in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
@@ -747,7 +770,7 @@ impl DelegateView {
     pub fn stop(&self, gen: u64) {
         self.stopped.lock().unwrap().insert(gen);
         let mut g = self.entries.lock().unwrap();
-        for e in g.iter_mut() {
+        for e in g.list.iter_mut() {
             if e.1 == gen {
                 e.3 = true;
             }
@@ -761,7 +784,7 @@ impl DelegateView {
     pub fn stop_dirs(&self, gen: u64, dirs: &[u64]) {
         let mut g = self.entries.lock().unwrap();
         let mut gone = self.stopped_dirs.lock().unwrap();
-        for e in g.iter_mut() {
+        for e in g.list.iter_mut() {
             if e.1 == gen {
                 e.0.retain(|d| !dirs.contains(d));
                 if e.0.is_empty() {
@@ -804,6 +827,7 @@ impl DelegateView {
         self.entries
             .lock()
             .unwrap()
+            .list
             .iter()
             .any(|(_, g, until, _)| *g == gen && now < *until)
     }
@@ -814,11 +838,26 @@ impl DelegateView {
     }
 
     /// ADR-56: what the delegate's fast path did since the last call, for the
-    /// core's handover grace: the `(stream, subtree)` pairs it admitted ops
-    /// under, and how many admitted ops are still in flight.
-    pub fn take_local_notes(&self) -> (Vec<(u64, u64)>, u64) {
-        let notes = std::mem::take(&mut *self.local_notes.lock().unwrap());
-        (notes.into_iter().collect(), self.in_flight())
+    /// core's handover grace and release: the `(stream, subtree)` pairs it
+    /// admitted ops under, and, per `(stream, subtree)`, how many admitted
+    /// ops are still in flight. Called after the core's view was mirrored:
+    /// an admission under a subtree that left the view is either counted
+    /// here or was journaled before.
+    pub fn take_local_notes(&self) -> LocalNotes {
+        let mut g = self.entries.lock().unwrap();
+        let (mut notes, mut inflight) = (Vec::new(), Vec::new());
+        for ((gen, dir), a) in g.acts.iter() {
+            if a.noted.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                notes.push((*gen, *dir));
+            }
+            let n = a.in_flight.load(std::sync::atomic::Ordering::Acquire);
+            if n > 0 {
+                inflight.push((*gen, *dir, n));
+            }
+        }
+        // (No admission holds it, and the lock keeps a new one out.)
+        g.acts.retain(|_, a| std::sync::Arc::strong_count(a) > 1);
+        (notes, inflight)
     }
 
     /// The fast path executed one op as the delegate.
@@ -883,7 +922,7 @@ impl DelegateView {
         let mut stopped = self.stopped.lock().unwrap();
         let mut gone = self.stopped_dirs.lock().unwrap();
         let mut g = self.entries.lock().unwrap();
-        g.clear();
+        g.list.clear();
         for (dirs, gen, until, is_stopped, _, _, _, _) in &view.mine {
             let kept: Vec<u64> = dirs
                 .iter()
@@ -891,7 +930,7 @@ impl DelegateView {
                 .filter(|d| !gone.contains(&(*gen, *d)))
                 .collect();
             let all_gone = kept.is_empty() && !dirs.is_empty();
-            g.push((
+            g.list.push((
                 kept,
                 *gen,
                 *until,
@@ -914,7 +953,7 @@ impl DelegateView {
         now: Now,
     ) -> Option<DelegateAdmission<'_>> {
         let g = self.entries.lock().unwrap();
-        if g.is_empty() {
+        if g.list.is_empty() {
             return None;
         }
         drop(g);
@@ -939,8 +978,9 @@ impl DelegateView {
         // Counted before the check under the same lock a `stop` takes:
         // once `stop` returns, no new admission of that generation
         // exists and every earlier one is counted.
-        let g = self.entries.lock().unwrap();
-        let (dirs, gen) = g
+        let mut g = self.entries.lock().unwrap();
+        let Entries { list, acts } = &mut *g;
+        let (dirs, gen) = list
             .iter()
             .find(|(_, gen, until, stopped)| *gen == d.gen && !*stopped && now < *until)
             .map(|(dirs, gen, _, _)| (dirs, *gen))?;
@@ -952,10 +992,18 @@ impl DelegateView {
         }
         self.in_flight
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        drop(g);
         // The holder's own activity in the subtree, for a handover's grace
-        // (ADR-56): drained by the driver after every step.
-        self.local_notes.lock().unwrap().insert((gen, d.dir));
-        Some(DelegateAdmission { gen, view: self })
+        // and release (ADR-56), counted under the lock this admission holds
+        // anyway (the driver drains it after every step).
+        let act = acts.entry((gen, d.dir)).or_default().clone();
+        act.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        act.noted.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(g);
+        Some(DelegateAdmission {
+            gen,
+            view: self,
+            act,
+        })
     }
 }

@@ -787,6 +787,9 @@ pub fn load_config(
     .min(100);
     c.placement_leave_pct =
         env_u64_zero_ok("CONSTELLATION_DELEGATION_LEAVE", c.placement_leave_pct).min(100);
+    // The mount's delegate fast path is mirrored and sampled after every
+    // step (`Driver::refresh`): a holder's release waits for the sample.
+    c.fast_path_sampled = true;
     c.placement_dwell_ms = env_ms("CONSTELLATION_DELEGATION_DWELL_MS", c.placement_dwell_ms);
     c.placement_cooldown_ms = env_ms(
         "CONSTELLATION_DELEGATION_COOLDOWN_MS",
@@ -3319,10 +3322,10 @@ impl Driver {
         self.deps.delegates.mirror(&status.delegation);
         // ADR-56: the delegate fast path's own activity, sampled after its
         // view was mirrored (a subtree a release is draining left it).
-        let (notes, fast_inflight) = self.deps.delegates.take_local_notes();
+        let (notes, inflight) = self.deps.delegates.take_local_notes();
         status.placement_top = self.core.placement_top();
         status.locks_cluster = cfg.locks;
-        self.core.deleg_note_local(now, &notes, fast_inflight);
+        self.core.deleg_note_local(now, &notes, &inflight);
         let lv = self.core.lock_view();
         status.lock_requests_in_flight = lv.requests_in_flight;
         status.lock_waiters = lv.waiters;

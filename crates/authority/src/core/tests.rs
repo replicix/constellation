@@ -70303,25 +70303,70 @@ mod step5_sticky_release {
             });
     }
 
+    /// The engine's fast path is told, as the driver does after every step:
+    /// nothing admitted in flight (`inflight` empty) or `inflight`.
+    fn sample(
+        h: &mut Harness,
+        notes: &[(u64, constellation_fs_core::Ino)],
+        inflight: &[(u64, constellation_fs_core::Ino, u64)],
+    ) {
+        h.core.deleg_note_local(h.clk(), notes, inflight);
+    }
+
     /// A handover request for a sticky subtree the holder has no op of its
     /// own in: it releases at once, by its own row (a `StickyReleaseCmd`),
-    /// and the request is no recall (`deleg_sticky_recalled_other` is the
-    /// root's counter; the holder counts a wait and a handover release).
+    /// on the step after the one the engine's fast path was told to leave the
+    /// subtree in, and the request is no recall (`deleg_sticky_recalled_other`
+    /// is the root's counter; the holder counts a handover release).
     #[test]
     fn the_holder_releases_at_once_when_nothing_of_its_own_is_in_flight() {
         let (mut h, dirs) = sticky_holder(&["a"]);
+        h.core.cfg.fast_path_sampled = true;
+        sample(&mut h, &[], &[]);
         handover_request(&mut h, dirs.clone(), crate::event::ReleaseWhy::Handover);
         assert_eq!(h.core.stats.deleg_handover_waits, 0);
         assert_eq!(h.core.dl.sticky_cmds.len(), 1, "no release was made");
         assert!(h.core.dl.sticky_cmds[0].handover);
-        // The engine's fast path has had a step to leave the subtree and
-        // report: the row goes on the next one.
         assert!(!last_is_release(&h), "released in the step that asked");
+        // The driver mirrored the view and sampled after that step.
+        sample(&mut h, &[], &[]);
         let out = release_tick(&mut h, 200);
         assert!(last_is_release(&h), "not released: {out:?}");
         assert_eq!(h.core.stats.deleg_handover_released, 1);
         assert_eq!(h.core.stats.deleg_sticky_releases, 1);
         assert!(h.core.dl.handovers.is_empty());
+    }
+
+    /// ADR-56 review M1: the release waits for a sample taken after the
+    /// step that made the command, however many times the core looks again
+    /// in between (every `deleg_after_event` of a step does, and so does
+    /// every other step's); a sample from before the command does not count.
+    /// Fails on the parent, which released after two looks.
+    #[test]
+    fn a_handover_release_waits_for_a_sample_taken_after_its_step() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        h.core.cfg.fast_path_sampled = true;
+        // A sample of an earlier step.
+        sample(&mut h, &[], &[]);
+        handover_request(&mut h, dirs.clone(), crate::event::ReleaseWhy::Handover);
+        assert_eq!(h.core.dl.sticky_cmds.len(), 1);
+        // The core looks again in the step that made it, and in later steps
+        // the driver has not sampled after.
+        for _ in 0..3 {
+            let mut out = Vec::new();
+            h.core.handover_progress(h.clk(), &h.meta, &mut out);
+            h.core.sticky_release_progress(h.clk(), &h.meta, &mut out);
+        }
+        for _ in 0..3 {
+            release_tick(&mut h, 200);
+        }
+        assert!(
+            !last_is_release(&h),
+            "released before the fast path was sampled"
+        );
+        sample(&mut h, &[], &[]);
+        release_tick(&mut h, 200);
+        assert!(last_is_release(&h));
     }
 
     /// While the holder has an op of its own in flight in the subtree, a
@@ -70331,34 +70376,141 @@ mod step5_sticky_release {
     #[test]
     fn the_holder_keeps_the_subtree_while_its_own_op_is_in_flight_and_releases_after_the_grace() {
         let (mut h, dirs) = sticky_holder(&["a"]);
+        h.core.cfg.fast_path_sampled = true;
         let grace = h.core.cfg.handover_grace_ms;
         assert!(grace > 0);
-        h.core.deleg_note_local(h.clk(), &[(7, dirs[0])], 1);
+        let busy = [(7, dirs[0], 1)];
+        sample(&mut h, &[(7, dirs[0])], &busy);
         handover_request(&mut h, dirs.clone(), crate::event::ReleaseWhy::Handover);
         assert!(
             h.core.dl.sticky_cmds.is_empty(),
             "made a release while busy"
         );
-        // The grace is for ops that are in flight: the first one's end is
-        // the last own activity.
-        h.core.deleg_note_local(h.clk(), &[(7, dirs[0])], 1);
+        sample(&mut h, &[(7, dirs[0])], &busy);
         release_tick(&mut h, 200);
         release_tick(&mut h, 200);
         assert!(!last_is_release(&h) && h.core.dl.sticky_cmds.is_empty());
-        // The op completes; the grace has not passed.
-        h.core.deleg_note_local(h.clk(), &[], 0);
+        // The op completes; the grace has not passed. (The root repeats its
+        // request while it waits, which keeps the holder's wait alive.)
+        sample(&mut h, &[], &[]);
+        handover_request(&mut h, dirs.clone(), crate::event::ReleaseWhy::Handover);
         release_tick(&mut h, 200);
         release_tick(&mut h, grace / 2);
         assert!(!last_is_release(&h) && h.core.dl.sticky_cmds.is_empty());
         // Another own op runs: the grace restarts.
-        h.core.deleg_note_local(h.clk(), &[(7, dirs[0])], 0);
+        sample(&mut h, &[(7, dirs[0])], &[]);
+        handover_request(&mut h, dirs.clone(), crate::event::ReleaseWhy::Handover);
         release_tick(&mut h, grace / 2 + 100);
         assert!(!last_is_release(&h) && h.core.dl.sticky_cmds.is_empty());
-        // Idle for the grace: the release is made, and goes a step later.
+        // Idle for the grace: the release is made, and goes after a sample.
+        handover_request(&mut h, dirs.clone(), crate::event::ReleaseWhy::Handover);
         release_tick(&mut h, grace);
         assert_eq!(h.core.dl.sticky_cmds.len(), 1, "no release after the grace");
+        assert!(!last_is_release(&h));
+        sample(&mut h, &[], &[]);
         release_tick(&mut h, 200);
         assert!(last_is_release(&h));
+    }
+
+    /// A wait made because an op was in flight starts the grace at the
+    /// request (H-I5): the op ending at once does not release at once.
+    #[test]
+    fn a_wait_made_because_the_subtree_was_busy_starts_the_grace() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        h.core.cfg.fast_path_sampled = true;
+        let grace = h.core.cfg.handover_grace_ms;
+        sample(&mut h, &[], &[(7, dirs[0], 1)]);
+        handover_request(&mut h, dirs.clone(), crate::event::ReleaseWhy::Handover);
+        sample(&mut h, &[], &[]);
+        release_tick(&mut h, 200);
+        assert!(
+            h.core.dl.sticky_cmds.is_empty(),
+            "released before the grace"
+        );
+        release_tick(&mut h, grace);
+        assert_eq!(h.core.dl.sticky_cmds.len(), 1);
+    }
+
+    /// ADR-56 review S2: an op in flight in another subtree (or stream) does
+    /// not keep this one busy.
+    #[test]
+    fn an_op_in_flight_in_another_subtree_does_not_keep_this_one_busy() {
+        let (mut h, dirs) = sticky_holder(&["a", "b"]);
+        h.core.cfg.fast_path_sampled = true;
+        sample(&mut h, &[], &[(7, dirs[1], 3), (9, dirs[0], 1)]);
+        handover_request(&mut h, vec![dirs[0]], crate::event::ReleaseWhy::Handover);
+        assert_eq!(
+            h.core.dl.sticky_cmds.len(),
+            1,
+            "kept busy by another subtree"
+        );
+        sample(&mut h, &[], &[(7, dirs[1], 3), (9, dirs[0], 1)]);
+        release_tick(&mut h, 200);
+        assert!(last_is_release(&h), "blocked by another subtree's op");
+    }
+
+    /// ADR-56 review S3: a release by hand takes its subtrees out of the fast
+    /// path's view and waits for the sample as a handover's does.
+    #[test]
+    fn a_release_by_hand_leaves_the_fast_path_and_waits_for_its_ops() {
+        let (mut h, dirs) = sticky_holder(&["a", "b"]);
+        h.core.cfg.fast_path_sampled = true;
+        sample(&mut h, &[], &[]);
+        release(&mut h, 60, vec![dirs[0]], false);
+        let mut view = crate::core::DelegView::default();
+        h.core.deleg_view_local(&mut view);
+        assert_eq!(view.mine[0].0, vec![dirs[1]], "the subtree stayed in view");
+        assert!(!last_is_release(&h), "released in the step that asked");
+        sample(&mut h, &[], &[(7, dirs[0], 1)]);
+        release_tick(&mut h, 200);
+        assert!(!last_is_release(&h), "released over an admitted op");
+        sample(&mut h, &[], &[]);
+        release_tick(&mut h, 200);
+        assert!(last_is_release(&h));
+    }
+
+    /// ADR-56 review S5: a request the root has not repeated for its patience
+    /// is dropped at the holder; a repeated one is kept.
+    #[test]
+    fn a_handover_wait_expires_unless_the_root_repeats_the_request() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        let busy = [(7, dirs[0], 1)];
+        sample(&mut h, &[], &busy);
+        handover_request(&mut h, dirs.clone(), crate::event::ReleaseWhy::Handover);
+        assert_eq!(h.core.dl.handovers.len(), 1);
+        let patience = h.core.handover_patience_ms() as u64;
+        release_tick(&mut h, patience / 2);
+        sample(&mut h, &[], &busy);
+        handover_request(&mut h, dirs.clone(), crate::event::ReleaseWhy::Handover);
+        release_tick(&mut h, patience / 2 + 100);
+        assert_eq!(h.core.dl.handovers.len(), 1, "expired though repeated");
+        sample(&mut h, &[], &busy);
+        release_tick(&mut h, patience / 2 + 100);
+        assert!(h.core.dl.handovers.is_empty(), "never expired");
+        assert_eq!(h.core.stats.deleg_handover_expired, 1);
+        assert!(!last_is_release(&h));
+    }
+
+    /// ADR-56 review S4: a handover release that gives up is counted and the
+    /// wait goes back (the root's request is not lost).
+    #[test]
+    fn a_handover_release_that_gives_up_puts_the_wait_back() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        h.core.cfg.fast_path_sampled = true;
+        sample(&mut h, &[], &[]);
+        handover_request(&mut h, dirs.clone(), crate::event::ReleaseWhy::Handover);
+        assert_eq!(h.core.dl.sticky_cmds.len(), 1);
+        // The fast path never clears.
+        let wait = h.core.leave_wait_ms() as u64;
+        let mut spent = 0;
+        while spent <= wait + 400 && !h.core.dl.sticky_cmds.is_empty() {
+            sample(&mut h, &[], &[(7, dirs[0], 1)]);
+            release_tick(&mut h, 200);
+            spent += 200;
+        }
+        assert!(h.core.dl.sticky_cmds.is_empty(), "never gave up");
+        assert_eq!(h.core.stats.deleg_handover_given_up, 1);
+        assert_eq!(h.core.dl.handovers.len(), 1, "the wait was lost");
     }
 
     /// A core-parked op of the holder's own is in flight; a forwarded op, or
@@ -70394,13 +70546,28 @@ mod step5_sticky_release {
     }
 
     /// A placed grant is not the holder's to keep: the root asks for it as
-    /// for a recall.
+    /// for a recall. The engine does not stop the fast path for a handover
+    /// request, so the holder drains it itself: the subtree leaves the fast
+    /// path's view, and the row goes only once a sample taken after that
+    /// shows nothing admitted (ADR-56 review M2: the `cross-subtree-rename`
+    /// window).
     #[test]
-    fn a_handover_request_for_a_placed_grant_is_answered_as_a_recall() {
+    fn a_handover_request_for_a_placed_grant_is_answered_as_a_recall_after_the_drain() {
         let (mut h, dirs) = holder_of(&["a"], SubtreeKind::Placed);
-        handover_request(&mut h, dirs, crate::event::ReleaseWhy::Handover);
-        assert!(last_is_release(&h));
+        h.core.cfg.fast_path_sampled = true;
+        sample(&mut h, &[], &[]);
+        handover_request(&mut h, dirs.clone(), crate::event::ReleaseWhy::Handover);
+        assert!(!last_is_release(&h), "released in the step that asked");
         assert_eq!(h.core.stats.deleg_handover_waits, 0);
+        let mut view = crate::core::DelegView::default();
+        h.core.deleg_view_local(&mut view);
+        assert!(view.mine[0].0.is_empty(), "the subtree stayed in view");
+        sample(&mut h, &[], &[(7, dirs[0], 1)]);
+        release_tick(&mut h, 200);
+        assert!(!last_is_release(&h), "released over an admitted op");
+        sample(&mut h, &[], &[]);
+        release_tick(&mut h, 200);
+        assert!(last_is_release(&h));
     }
 
     /// The release of a sticky handover leaves the fast path's view of the
@@ -70409,18 +70576,20 @@ mod step5_sticky_release {
     #[test]
     fn a_handover_release_leaves_the_fast_path_and_waits_for_its_ops() {
         let (mut h, dirs) = sticky_holder(&["a", "b"]);
+        h.core.cfg.fast_path_sampled = true;
         let mut view = crate::core::DelegView::default();
         h.core.deleg_view_local(&mut view);
         assert_eq!(view.mine[0].0.len(), 2);
+        sample(&mut h, &[], &[]);
         handover_request(&mut h, vec![dirs[0]], crate::event::ReleaseWhy::Handover);
         h.core.deleg_view_local(&mut view);
         assert_eq!(view.mine[0].0, vec![dirs[1]], "the subtree stayed in view");
         // An admission that was in flight when the view changed.
-        h.core.deleg_note_local(h.clk(), &[], 1);
+        sample(&mut h, &[], &[(7, dirs[0], 1)]);
         release_tick(&mut h, 200);
         release_tick(&mut h, 200);
         assert!(!last_is_release(&h), "released over an admitted op");
-        h.core.deleg_note_local(h.clk(), &[], 0);
+        sample(&mut h, &[], &[]);
         release_tick(&mut h, 200);
         assert!(last_is_release(&h));
     }
