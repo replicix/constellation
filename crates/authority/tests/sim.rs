@@ -1241,7 +1241,10 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
     // `every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward`, and this
     // test only keeps the path exercised end to end (that it is reached and
     // the run converges).
-    for seed in [13997, 16329] {
+    // The stall fixes (`DelegateState::known_root`, `InboxStore::drain_below`)
+    // moved them: over 14000-29999 the finder gives 16329 and 25521 (twice
+    // each) and four more once.
+    for seed in [16329, 25521] {
         let report = run_seed(seed, long_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let multi: u64 = report
             .stats
@@ -1314,6 +1317,41 @@ fn find_multi_batch_withdraw_seeds() {
             }
             // (On a tree whose forward withdraws only the newest batch, the
             // seeds that fail are the ones that discriminate.)
+            Err(e) => eprintln!(
+                "failing seed {seed}: {}",
+                e.lines().next().unwrap_or_default()
+            ),
+        }
+    }
+}
+
+/// Finder for the settle extension (`settles_extended_for_durability`) that
+/// `long-delegated+unsettled` 22825 and 1112 used to pin: lists the seeds of `long-delegated+unsettled` whose settle is extended for
+/// its row's durability. `AUTHORITY_SIM_START`/`AUTHORITY_SIM_SEEDS` as for
+/// `long_random`.
+#[test]
+#[ignore]
+fn find_settle_extended_for_durability_seeds() {
+    let start: u64 = std::env::var("AUTHORITY_SIM_START")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let seeds: u64 = std::env::var("AUTHORITY_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000);
+    for seed in start..start + seeds {
+        match run_seed(seed, strict(long_delegated_config(), "unsettled")) {
+            Ok(report) => {
+                let n: u64 = report
+                    .stats
+                    .values()
+                    .map(|s| s.settles_extended_for_durability)
+                    .sum();
+                if n > 0 {
+                    eprintln!("settle extended for durability: seed {seed} ({n})");
+                }
+            }
             Err(e) => eprintln!(
                 "failing seed {seed}: {}",
                 e.lines().next().unwrap_or_default()
@@ -2445,6 +2483,27 @@ fn sticky_root_designee_inbox_passes() {
 #[test]
 fn a_claim_cut_that_gave_up_does_not_cut_a_later_claim() {
     for seed in [4281u64, 4683, 6163, 7891, 8937] {
+        run_seed(seed, sticky_root_designee_inbox_config())
+            .unwrap_or_else(|e| panic!("sticky-root-designee-inbox seed {seed}: {e}"));
+    }
+}
+
+/// Two stalls of `sticky-root-designee-inbox`, pinned on the seeds that showed
+/// them: seed 216, 1025 and 1128, a delegate that held the lease itself (no
+/// root in view) and then met a root whose cursor was behind the old root's
+/// never re-streamed the rows between (`DelegateState::known_root`); seed
+/// 270, a takeover gate whose inbox drain read the older batches one after
+/// another, longer than the lease's TTL under the configuration's slow inbox
+/// reads, so each claimant lost the lease with its view closed and the next
+/// one repeated it (`InboxStore::drain_below` fetches them together). The
+/// seeds failed on the tree they were found on; on this one the schedules
+/// moved and they pass without the fixes too, so the guards are the unit
+/// tests (`a_root_found_after_none_gets_every_unretired_row_again`,
+/// `the_drain_fetches_the_older_batches_together_in_order`); these keep the
+/// configuration's seeds clean.
+#[test]
+fn sticky_root_designee_inbox_stalls_pinned() {
+    for seed in [216u64, 270, 1025, 1128] {
         run_seed(seed, sticky_root_designee_inbox_config())
             .unwrap_or_else(|e| panic!("sticky-root-designee-inbox seed {seed}: {e}"));
     }
@@ -19043,28 +19102,17 @@ fn a_settle_waiting_for_a_generations_outwait_is_held_and_never_lands_late() {
     }
 }
 
-/// `long-delegated+unsettled` 22825: the root answers a settle (a refusal for
-/// good) a few ms before the settle's cap, and the refusal's row waits behind
-/// the job in the slot (a lease renewal) for its shipment and acknowledgement.
-/// The second deadline moves one window for it (`ClientOp::durable_grace`)
-/// instead of telling an unsettled `EIO` with the root itself reachable.
-/// Fails on the parent: one unsettled `EIO` ("reachable ... Itself").
-/// (Seed 22825 was the first; with the extension moving the settle's cap
-/// along, it lands without the grace, so the path is pinned on 1112.)
-#[test]
-fn long_delegated_settle_answered_just_before_its_cap_lands() {
-    let seed = 1112;
-    let r = run_seed(seed, strict(long_delegated_config(), "unsettled"))
-        .unwrap_or_else(|e| panic!("long-delegated+unsettled seed {seed}: {e}"));
-    assert!(
-        r.stats
-            .values()
-            .map(|s| s.settles_extended_for_durability)
-            .sum::<u64>()
-            > 0,
-        "seed {seed}: no settle was extended for its row; the seed no longer exercises the path"
-    );
-}
+// `long-delegated+unsettled` 22825: the root answers a settle (a refusal for
+// good) a few ms before the settle's cap, and the refusal's row waits behind
+// the job in the slot (a lease renewal) for its shipment and acknowledgement.
+// The second deadline moves one window for it (`ClientOp::durable_grace`)
+// instead of telling an unsettled `EIO` with the root itself reachable.
+// The simulation pin (22825, then 1112) is gone: the extension is rare (no
+// seed of 0-17,999 of the configuration reaches it on this tree, after the
+// delegate re-stream and gate drain fixes moved every schedule; see
+// `find_settle_extended_for_durability_seeds`). The case is carried by the core
+// test of the extension (`settles_extended_for_durability`: one window, once,
+// never past the cap).
 
 /// `long-delegated+unsettled` 4863: the root restarted and inherited a
 /// generation whose delegate had disowned it; a settle of the generation's
