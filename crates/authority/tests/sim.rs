@@ -6552,15 +6552,20 @@ fn a_clean_drop_held_still_passes_the_narrowed_excuse() {
     }
 }
 
-/// ADR-59: seeds whose refusals saw the effect of an op the operator's drop
-/// rolled back after its client was told `Ok`: the drop rolled back a create
+/// ADR-59 part A: seeds whose refusals saw the effect of an op the operator's
+/// drop rolled back after its client was told `Ok`. Two rolled back a create
 /// next to the damaged file, held behind the seed by a directory's merged
-/// times, and a refusal saw it. The ship rule orders what only merges its
-/// directory after nothing, so the drop no longer reaches it (the control
-/// below is the code as it was before the ADR).
+/// times: the ship rule orders what only merges its directory after nothing,
+/// so the drop no longer reaches it. Three saw an acknowledged rename, chmod
+/// or unlink of the damaged file itself, which the drop still rolls back
+/// because it depends on the seed's own keys: the operator's cost of a lost
+/// chunk, which part A does not avoid. The drop names those rows
+/// (`DroppedHeld::rolled_back_on_inode`) and the gate
+/// (`drop_rolled_back_independent_acked`) fails any other acknowledged
+/// namespace op it rolled back.
 #[test]
 fn an_acknowledged_independent_op_survives_the_drop() {
-    for seed in [1258, 1751] {
+    for seed in [26, 283, 860, 1258, 1751] {
         run_seed(seed, config_variant(flex_crash_config(), "durability")).unwrap_or_else(|e| {
             panic!(
                 "flex-crash+durability seed {seed}: {e}\n  replay with \
@@ -6570,36 +6575,23 @@ fn an_acknowledged_independent_op_survives_the_drop() {
     }
 }
 
-/// The three seeds whose refusals saw an acknowledged rename, chmod or unlink
-/// of the damaged file itself, which the drop still rolls back (it depends on
-/// the seed's own keys): the loss ADR-59 part A does not avoid. They fail
-/// strict durability until the sim names that cost (see the oracle's gate).
-#[test]
-fn the_acknowledged_dropped_op_control_fails_the_durability_seeds() {
-    for seed in [26, 283, 860] {
-        let e = run_seed(seed, config_variant(flex_crash_config(), "durability"))
-            .expect_err("an acknowledged dropped op was excused");
-        assert!(
-            e.contains("observed an acknowledged effect"),
-            "seed {seed}: {e}"
-        );
-    }
-}
-
-/// The control of the first test: with the conservative classification and
+/// The control of the test above: with the conservative classification and
 /// the strand-everything drop (`Meta::set_parent_taint_conservative`, what
-/// the code did before ADR-59) the same seeds fail with the durability
-/// violation (an acknowledged effect rolled back).
+/// the code did before ADR-59) the same seeds fail, with the durability
+/// violation (an acknowledged effect rolled back) or with the gate: the drop
+/// attributes nothing to the damaged inode, and every acknowledged namespace
+/// op it rolled back is independent.
 #[test]
 fn the_conservative_parent_taint_control_fails_them() {
-    for seed in [1258, 1751] {
+    for seed in [26, 283, 860, 1258, 1751] {
         let cfg = config_variant(
             config_variant(flex_crash_config(), "durability"),
             "parent-taint-conservative",
         );
         let e = run_seed(seed, cfg).expect_err("the conservative control passed");
         assert!(
-            e.contains("observed an acknowledged effect"),
+            e.contains("observed an acknowledged effect")
+                || e.contains("drop_rolled_back_independent_acked"),
             "seed {seed}: {e}"
         );
     }
@@ -8003,6 +7995,18 @@ fn sweep_config() {
                         eprintln!(
                             "SWEEP-GUARD-RISE {label} seed {seed}: {} rises",
                             report.guard_rises
+                        );
+                    }
+                    if report.drop_counts.drops > 0 {
+                        let c = &report.drop_counts;
+                        eprintln!(
+                            "SWEEP-DROPS {label} seed {seed}: drops {} requeued {} on_inode {} \
+                             non_sequencer {} rolled_back {:?}",
+                            c.drops,
+                            c.requeued,
+                            c.on_inode,
+                            c.non_sequencer,
+                            report.drop_rolled_back
                         );
                     }
                     chunks[0].fetch_add(report.remote_enrolled, ord);

@@ -679,6 +679,32 @@ pub fn check_linearizable_witnessed(
     completed_at: &std::collections::HashMap<Rid, (u64, usize)>,
     journal: &JournalOrder,
 ) -> Result<Witness, String> {
+    check_linearizable_witnessed_with(
+        events,
+        tentative,
+        dropped,
+        &HashSet::new(),
+        completed_at,
+        journal,
+    )
+}
+
+/// [`check_linearizable_witnessed`], with the rids of `operator_cost`: rids a
+/// drop rolled back that depend on the damaged inode's own keys
+/// (`DroppedHeld::rolled_back_on_inode`, ADR-59 part A). A refusal that saw
+/// the effect of one of them, acknowledged or not, saw what the operator's
+/// drop took away (the documented cost of a lost chunk that part A does not
+/// avoid), not what the protocol rolled back: it counts as
+/// [`Witness::observed_dropped`]. An acknowledged dropped op that is not in
+/// the set is not excused.
+pub fn check_linearizable_witnessed_with(
+    events: &[HistEvt],
+    tentative: &HashSet<Rid>,
+    dropped: &HashSet<Rid>,
+    operator_cost: &HashSet<Rid>,
+    completed_at: &std::collections::HashMap<Rid, (u64, usize)>,
+    journal: &JournalOrder,
+) -> Result<Witness, String> {
     use std::collections::HashMap;
     let mut invoke_at: HashMap<Rid, (usize, NsOp)> = HashMap::new();
     let mut return_at: HashMap<Rid, (usize, NsRet)> = HashMap::new();
@@ -869,16 +895,18 @@ pub fn check_linearizable_witnessed(
             // Whether the ops an operator's drop rolled back explain it
             // alone (none of a deposition's): the operator's action, not
             // the protocol's, took the effect it saw away.
-            // (Only ones never acknowledged: a dropped op whose client got an
-            // `Ok` was acknowledged by the protocol's rule, and a refusal
-            // that saw its effect saw an acknowledged effect rolled back.)
+            // (Only ones never acknowledged, or that the drop attributes to
+            // the damaged inode: a dropped op whose client got an `Ok` was
+            // acknowledged by the protocol's rule, and a refusal that saw its
+            // effect saw an acknowledged effect rolled back.)
             let mut by_drop_unacked: Vec<(usize, &NsOp)> = invoke_at
                 .iter()
                 .filter(|(t, (inv_t, _))| {
                     dropped.contains(*t)
                         && tentative.contains(*t)
                         && inv_t < ret_i
-                        && !matches!(return_at.get(*t), Some((_, NsRet::Ok)))
+                        && (operator_cost.contains(*t)
+                            || !matches!(return_at.get(*t), Some((_, NsRet::Ok))))
                 })
                 .map(|(t, (inv_t, op_t))| (*inv_t, first_runs.get(t).unwrap_or(op_t)))
                 .collect();
@@ -1341,6 +1369,21 @@ mod tests {
             check_linearizable_witnessed(&events, &tentative, &dropped, &log, &JournalOrder::new())
                 .expect("witnessed");
         assert_eq!((w.observed_tentative, w.observed_dropped), (1, 0));
+        // ... unless the drop attributes it to the damaged inode's own keys
+        // (ADR-59 part A: a rename, chmod or unlink of the file is the
+        // operator's named cost of a lost chunk): acknowledged or not, the
+        // operator's action.
+        let cost: HashSet<Rid> = [rid(1)].into_iter().collect();
+        let w = check_linearizable_witnessed_with(
+            &events,
+            &tentative,
+            &dropped,
+            &cost,
+            &log,
+            &JournalOrder::new(),
+        )
+        .expect("witnessed");
+        assert_eq!((w.observed_tentative, w.observed_dropped), (1, 1));
         // Never acknowledged (its client heard the in-doubt `EIO`, no
         // `Return`): the operator's action, not counted.
         let unacked: Vec<HistEvt> = events

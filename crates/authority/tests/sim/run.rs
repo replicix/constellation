@@ -7,7 +7,7 @@ use super::check;
 use super::chunks::{ChunkWorld, CHUNK_SIZE};
 use super::clock::Clock;
 use super::history::dir_of;
-use super::history::{check_linearizable, check_linearizable_witnessed, History, NsOp, NsRet};
+use super::history::{check_linearizable, check_linearizable_witnessed_with, History, NsOp, NsRet};
 use super::node::{read_lease, CommitRecord, NodeEnv, NodeHandle, PEERS_TICK_MS};
 use super::store::{Bucket, Fault, OpKind, Rule, When};
 use constellation_authority::{ClientReply, Config, NodeId, Stats};
@@ -1478,6 +1478,10 @@ pub struct Report {
     pub remote_acked: u64,
     pub deferred_seen: u64,
     pub remote_dropped: u64,
+    /// ADR-59: see `ChunkWorld::drop_counts`.
+    pub drop_counts: super::chunks::DropCounts,
+    /// The rids the run's operator drops rolled back (for `SWEEP-DROPS`).
+    pub drop_rolled_back: Vec<Rid>,
     pub member_gone: bool,
     /// Chunk metered-own-rows: own chunks a round's pass left held, and
     /// those `Action::UploadAwaited` put up past the hold.
@@ -4890,6 +4894,27 @@ async fn operator_drop_hopeless(
                         .unwrap()
                         .extend(d.rolled_back.iter().copied());
                     world.note_drop(d.rolled_back.iter().copied());
+                    // ADR-59: what the drop undid, and of it what depended
+                    // on the damaged inode's own keys.
+                    {
+                        let mut c = world.drop_counts.lock().unwrap();
+                        c.drops += 1;
+                        c.requeued += d.requeued as u64;
+                        c.on_inode += d.rolled_back_on_inode.len() as u64;
+                        c.non_sequencer += d.non_sequencer as u64;
+                        world
+                            .dropped_on_inode
+                            .lock()
+                            .unwrap()
+                            .extend(d.rolled_back_on_inode.iter().copied());
+                        if d.non_sequencer {
+                            world
+                                .dropped_by_non_sequencer
+                                .lock()
+                                .unwrap()
+                                .extend(d.rolled_back.iter().copied());
+                        }
+                    }
                     // (What lands past the log's head from now on is the
                     // drop's replay; the oracles' I4 relies on it.)
                     world
@@ -6582,11 +6607,87 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.dirs_checked = projections.len();
     let mut witness = super::history::Witness::default();
     let dropped_rids: HashSet<Rid> = world.dropped_rids.lock().unwrap().iter().copied().collect();
+    // ADR-59 (part A): an operator's drop rolls back an acknowledged
+    // namespace op only if that op depends on the damaged inode's own keys
+    // (`drop_rolled_back_independent_acked` otherwise): none of the sim's
+    // namespace ops carries content, and what depended on the seed only
+    // through a directory's merged attributes is no longer ordered after it.
+    // The one other excuse: a dropper that was not the sequencer in force
+    // strands what depended on a seed as a deposition does (the successor
+    // re-ships it from the members' copies, ADR-51), so an acknowledged rid
+    // it rolled back is excused if, and only if, its effect survives in the
+    // log ([`survivors_of_drop`]); the dropper alone is no excuse.
+    {
+        let by_non_sequencer = world.dropped_by_non_sequencer.lock().unwrap().clone();
+        let on_inode = world.dropped_on_inode.lock().unwrap().clone();
+        let dropped_set = world.dropped_rids.lock().unwrap().clone();
+        let survivors = super::oracle::survivors_of_drop(&oracle, &dropped_set);
+        let acked_ns: BTreeSet<Rid> = events
+            .iter()
+            .filter_map(|e| match e {
+                super::history::HistEvt::Return {
+                    rid,
+                    ret: NsRet::Ok,
+                    ..
+                } => Some(*rid),
+                _ => None,
+            })
+            .collect();
+        let findings = super::oracle::drop_ack_findings(&super::oracle::DropAcks {
+            dropped: &dropped_set,
+            acked_ns: &acked_ns,
+            by_non_sequencer: &by_non_sequencer,
+            survivors: &survivors,
+            on_inode: &on_inode,
+        });
+        if let Some((check, rids)) = findings {
+            let acks = oracles.acks.lock().unwrap();
+            let why: Vec<String> = rids
+                .iter()
+                .map(|rid| {
+                    let answers: Vec<String> = acks
+                        .iter()
+                        .filter(|a| a.rid == *rid)
+                        .map(|a| {
+                            format!(
+                                "n{} {:?} relay={} class={:?} at {}ms",
+                                a.node,
+                                a.kind,
+                                a.is_relay(),
+                                a.judged.as_ref().and_then(|j| j.class),
+                                a.at_ms
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "{rid:?}: survives={} answers={answers:?}",
+                        survivors.contains(rid)
+                    )
+                })
+                .collect();
+            return Err(lin_context(format!(
+                "{check}: repair drop-held rolled back {} acknowledged namespace op(s) that \
+                 depend on none of the damaged inode's keys: {}",
+                rids.len(),
+                why.join("; ")
+            )));
+        }
+    }
+    // (What the drops attributed to the damaged inode is the operator's
+    // cost: a refusal that saw it saw the drop's action.)
+    let operator_cost: HashSet<Rid> = world
+        .dropped_on_inode
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .collect();
     for (i, proj) in projections.iter().enumerate() {
-        let w = check_linearizable_witnessed(
+        let w = check_linearizable_witnessed_with(
             proj,
             &tentative,
             &dropped_rids,
+            &operator_cost,
             &oracle.completed_at,
             &journal,
         )
@@ -6748,6 +6849,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.remote_acked = world.remote_acked.load(ord);
         report.deferred_seen = world.deferred_seen.load(ord);
         report.remote_dropped = world.remote_dropped.load(ord);
+        report.drop_counts = *world.drop_counts.lock().unwrap();
+        report.drop_rolled_back = world.dropped_rids.lock().unwrap().iter().copied().collect();
         report.member_gone = !world.gone.lock().unwrap().is_empty();
         report.held_back = world.held_back.load(ord);
         report.awaited_uploaded = world.awaited_uploaded.load(ord);
