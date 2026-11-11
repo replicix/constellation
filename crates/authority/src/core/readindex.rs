@@ -1394,6 +1394,18 @@ impl Core {
         true
     }
 
+    /// Whether `rid`'s answer is parked (`ParkedWhat::Finish`) for its row's
+    /// durability alone: no recall, no stream position, no dependency.
+    pub(crate) fn durable_only_park_of(&self, rid: Rid) -> bool {
+        self.rd.parked.values().any(|p| {
+            p.durable.is_some()
+                && p.waiting.is_empty()
+                && p.stream_need.is_none()
+                && p.deps.is_none()
+                && matches!(p.what, ParkedWhat::Finish { rid: r, .. } if r == rid)
+        })
+    }
+
     /// Plan 30 §M9: the lease is gone; every acknowledgement parked for
     /// durability is answered as not given (see `backup.rs`). Returns how
     /// many.

@@ -57656,9 +57656,19 @@ mod c2g_settle {
         assert!(replies(&out).is_empty(), "{out:?}");
         let second = h.core.clients[&rid].deadline;
         h.advance(h.core.dl_t().settle_window);
+        // (The root answered the settle and only its row's durability is
+        // left: the deadline moves one window, once; the archive never
+        // lands here.)
         let out = h.step(Event::Timer { id: second });
+        assert!(replies(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.settles_extended_for_durability, 1);
+        let third = h.core.clients[&rid].deadline;
+        assert_ne!(third, second);
+        h.advance(h.core.dl_t().settle_window);
+        let out = h.step(Event::Timer { id: third });
         assert_eq!(replies(&out), vec![(rid, &ClientReply::InDoubt)], "{out:?}");
         assert_eq!(h.core.stats.client_unsettled_eio, 1);
+        assert_eq!(h.core.stats.settles_extended_for_durability, 1);
     }
 
     /// C2g's re-check: a node draining its own inbox batch (its takeover

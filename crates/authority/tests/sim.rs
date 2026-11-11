@@ -18632,6 +18632,48 @@ fn a_settle_waiting_for_a_generations_outwait_is_held_and_never_lands_late() {
     }
 }
 
+/// `long-delegated+unsettled` 22825: the root answers a settle (a refusal for
+/// good) a few ms before the settle's cap, and the refusal's row waits behind
+/// the job in the slot (a lease renewal) for its shipment and acknowledgement.
+/// The second deadline moves one window for it (`ClientOp::durable_grace`)
+/// instead of telling an unsettled `EIO` with the root itself reachable.
+/// Fails on the parent: one unsettled `EIO` ("reachable ... Itself").
+#[test]
+fn long_delegated_settle_answered_just_before_its_cap_lands() {
+    let seed = 22825;
+    let r = run_seed(seed, strict(long_delegated_config(), "unsettled"))
+        .unwrap_or_else(|e| panic!("long-delegated+unsettled seed {seed}: {e}"));
+    assert!(
+        r.stats
+            .values()
+            .map(|s| s.settles_extended_for_durability)
+            .sum::<u64>()
+            > 0,
+        "seed {seed}: no settle was extended for its row; the seed no longer exercises the path"
+    );
+}
+
+/// `long-delegated+unsettled` 4863: the root restarted and inherited a
+/// generation whose delegate had disowned it; a settle of the generation's
+/// keys was redirected to the delegate (`NotHolder`), which sent it back, for
+/// the 4.4 s until the settle's cap, then an unsettled `EIO` with the root
+/// reachable. The settle of a generation inherited and not heard on parks
+/// behind its recall instead. Fails on the parent: one unsettled `EIO`.
+#[test]
+fn long_delegated_settle_is_not_bounced_to_a_silent_inherited_delegate() {
+    let seed = 4863;
+    let r = run_seed(seed, strict(long_delegated_config(), "unsettled"))
+        .unwrap_or_else(|e| panic!("long-delegated+unsettled seed {seed}: {e}"));
+    assert!(
+        r.stats
+            .values()
+            .map(|s| s.settles_not_redirected_unheard)
+            .sum::<u64>()
+            > 0,
+        "seed {seed}: no settle was kept from the delegate; the seed no longer exercises the path"
+    );
+}
+
 /// Plan 46 M1.2 step 13 (`long-delegated` seeds 29 and 47): a client's settle
 /// at a root that outwaits the generation of a delegate silent behind a
 /// partition outlasts the outwait (`Held::outwait_ms` moves the client's

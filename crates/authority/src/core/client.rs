@@ -252,6 +252,11 @@ pub(crate) struct ClientOp {
     /// started as one (a placeholder's): those are never moved.
     pub settle_until: WaitMs,
     pub settle_cap: WaitMs,
+    /// The settle's answer was decided by a live sequencer (this node, the
+    /// root) and waited only for its row's durability when the second
+    /// deadline fired, and the deadline was moved one more window for the
+    /// row to land (`client_deadline`; once).
+    pub durable_grace: bool,
     /// ADR-44: this settle waits in `Backoff` for a recall this node's
     /// shippable gate sent on demand; the backoff routes it as a settle
     /// again (`settle_route`), where the gate answers it after the cut.
@@ -779,6 +784,7 @@ impl Core {
                 settle: false,
                 settle_until: WaitMs(0),
                 settle_cap: WaitMs(0),
+                durable_grace: false,
                 gate_recall_wait: false,
                 designation_held: false,
                 accepted_by_delegate: false,
@@ -4173,6 +4179,29 @@ impl Core {
                 .filter(|(_, d)| d.stopped)
                 .map(|(g, _)| *g)
                 .collect();
+            // A settle this node answered as the root (the refusal or the
+            // outcome is journaled, the lease usable) and whose row only
+            // waits for its durability: the row ships behind the job in the
+            // slot (a lease renewal, a round) and the archive's
+            // acknowledgement follows. The unsettled `EIO` for a row a
+            // few ms from its commit would be told with a sequencer
+            // reachable (I4; `long-delegated+unsettled` 22825): one more
+            // window, once. A durability wait that outlasts it (S3 away)
+            // still ends in doubt.
+            if second
+                && !self.clients.get(&rid).is_some_and(|c| c.durable_grace)
+                && self.lease.journal_ship_epoch(now, &self.cfg).is_some()
+                && self.durable_only_park_of(rid)
+            {
+                let at = now.wait.plus(self.dl_t().settle_window);
+                if self.extend_settle_deadline(rid, at, Some(now.wait), out) {
+                    if let Some(c) = self.clients.get_mut(&rid) {
+                        c.durable_grace = true;
+                    }
+                    self.stats.settles_extended_for_durability += 1;
+                    return;
+                }
+            }
             if !self.abort_durable_park_of(rid, &stopped, out) {
                 return;
             }
