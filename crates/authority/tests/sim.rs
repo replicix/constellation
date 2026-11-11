@@ -5982,6 +5982,56 @@ fn run_flex(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> FlexTot
     t
 }
 
+/// Plan 46 M1.4 step 6a (ADR-53): a resumed tenure keeps the rule of its
+/// earlier rows, and a node that holds no lease never reads its unshipped row
+/// as the log's. Seeds that claimed `Archive` for a row that never shipped
+/// (47: the lease let go by a continuation epoch's close and taken again,
+/// 696 likewise under `flex`; 1286: the client deadline of a node holding
+/// nothing). Pinned from main 905af01c, where they fail.
+#[test]
+fn a_resumed_tenure_keeps_the_rule_of_its_earlier_rows() {
+    for (label, cfg, seed) in [
+        (
+            "flex-tight+oracles",
+            config_variant(flex_tight_config(), "oracles"),
+            47,
+        ),
+        (
+            "flex-tight+oracles",
+            config_variant(flex_tight_config(), "oracles"),
+            1286,
+        ),
+        ("flex+commit", config_variant(flex_config(), "commit"), 696),
+    ] {
+        run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+        });
+    }
+}
+
+/// Plan 46 M1.4 step 6a's negative control: with the resumed tenure's span
+/// dropped (`Config::resumed_span_dropped`, as before ADR-53) the class-claim
+/// seeds of shape (a) fail again.
+#[test]
+fn the_resumed_span_control_fails_the_class_claim_seeds() {
+    for (cfg, seed) in [
+        (config_variant(flex_tight_config(), "oracles"), 47),
+        (config_variant(flex_config(), "commit"), 696),
+    ] {
+        let inner = cfg.core.clone();
+        let cfg = SimConfig {
+            core: std::sync::Arc::new(move |id, inc| {
+                let mut core = inner(id, inc);
+                core.resumed_span_dropped = true;
+                core
+            }),
+            ..cfg
+        };
+        let e = run_seed(seed, cfg).expect_err("the control passed");
+        assert!(e.contains("claims a commit"), "seed {seed}: {e}");
+    }
+}
+
 /// Plan 30 §M10: the epoch of 2/3 forms and writes, the third node's
 /// takeover is refused, nobody ever sees two authorities, the history is
 /// linearizable and the replicas converge.
@@ -9292,6 +9342,8 @@ impl OracleTotals {
             self.held_emission[3],
             self.held_emission[4],
             self.held_emission[5],
+            self.held_root_row,
+            self.resumed_spans,
             self.held_emission_seeds
         );
         eprintln!(
