@@ -1630,24 +1630,21 @@ impl Core {
     // ---- the forward's outcomes ----
 
     /// Plan 43 C2 (§5.3): a shadow or hint installed for an answer its
-    /// sequencer did not say is committed. A non-stealable sequencer's — an
-    /// open continuation epoch's hold owner (this node is in the epoch), or a
-    /// designee (`gen` names a designation) — is one by design (its answers
-    /// stay uncommitted, the maintainer's decision on C2f) and counted
-    /// apart; any other is an answer outside the commit rule: counted and
-    /// warned once, so a sequencer that still gives one is seen.
-    /// Plan 46 M0.2 (R7): whether an answer (not `committed`) came from a
-    /// non-stealable sequencer: an open continuation epoch's hold owner
-    /// (this node is in the epoch), or a designee (`gen` names a
-    /// designation).
+    /// sequencer did not say is committed. A non-stealable sequencer's — a
+    /// designee or a sticky holder (`gen` names a designation) — is one by
+    /// design and counted apart; any other is an answer outside the commit
+    /// rule: counted and warned once, so a sequencer that still gives one is
+    /// seen.
+    /// Plan 46 M1.4 step 5: whether an answer (not `committed`) came from a
+    /// designee or a sticky holder. An uncommitted answer in an open epoch is
+    /// no longer one (a hold with two members or more answers committed).
     fn answered_non_stealable(&self, committed: bool, gen: u64, replica: &dyn Replica) -> bool {
         !committed
-            && (self.epoch.open
-                || (gen != 0
-                    && replica
-                        .delegation_table()
-                        .iter()
-                        .any(|d| d.gen == gen && d.non_stealable())))
+            && gen != 0
+            && replica
+                .delegation_table()
+                .iter()
+                .any(|d| d.gen == gen && d.non_stealable())
     }
 
     fn note_ungated_shadow(

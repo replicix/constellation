@@ -180,18 +180,16 @@ pub enum SpecKind {
         /// row) is the same: the delegate re-streams the row to the next
         /// root, and only the end of the generation strands the shadow.
         gated: bool,
-        /// Plan 46 M0.2 (R7, the drop-held proposal's variant 3 (i)): the
-        /// answer was a non-stealable sequencer's — an epoch's hold owner
-        /// (this node is a member), or a designee — uncommitted by design.
+        /// Plan 46 M0.2 (R7): the answer was a non-stealable sequencer's — a
+        /// designee's or a sticky holder's — uncommitted by design.
         /// Its owner's journal carries the row, and the owner's own queue
-        /// is the one copy that executes it after the hold; a copy queued
+        /// is the one copy that executes it; a copy queued
         /// here as well by the next epoch's strand would be a second. So
         /// the shadow is not stranded by an epoch: it retires by the
         /// `Completed`/`Refused` of its rid that comes from the log.
         /// `Some(wall ms)` it was installed; `Meta::strand_stale_shadows`
         /// strands it once that is older than the bound (its owner's journal
-        /// may be lost, its owner retired). (Plan 46 M1.4 removes this state:
-        /// the hold's answers wait for a member.)
+        /// may be lost, its owner retired).
         non_stealable: Option<i64>,
     },
     /// The `Exists` early install: retires once the applied state

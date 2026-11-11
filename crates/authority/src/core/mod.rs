@@ -1804,8 +1804,8 @@ pub struct Stats {
     /// non-stealable: none after C2 (a lone root answers other nodes from
     /// the archive). Warned once (`status.ack.ungated_shadows`).
     pub ungated_shadows: u64,
-    /// The same for a non-stealable sequencer's answers (a hold owner's in
-    /// an open continuation epoch, a designee's): uncommitted by design
+    /// The same for a non-stealable sequencer's answers (a designee's or a
+    /// sticky holder's): uncommitted by design
     /// (`status.ack.ungated_shadows_non_stealable`).
     pub ungated_shadows_non_stealable: u64,
     /// Plan 43 C2f: answers parked for durability whose row was rolled back
