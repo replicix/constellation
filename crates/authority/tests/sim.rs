@@ -5750,7 +5750,11 @@ fn regression_placement_hot_rollback_order_and_rebuilt_member_copies() {
 /// tail kept the member copy of two unshipped `Archive` rows of epoch 1 for
 /// good (nobody was answered from them; the claimant never applies its own
 /// marker, so rule 4 never ran). The takeover gate drops them instead. Fails
-/// before: node 3 keeps 2 rows of epoch 1 at convergence.
+/// before: node 3 keeps 2 rows of epoch 1 at convergence. (Seed 64 stopped
+/// reaching the gate's drop once the singleton answer and the sim's held
+/// writes moved the schedules; 224 reaches it and drops 2 rows. No seed of 0
+/// to 2 000 keeps a copy without the gate's drop any more: the fail-before is
+/// `meta/tests/member_copy.rs`.)
 #[test]
 fn regression_a_self_claim_keeps_no_copy_of_its_unshipped_archive_rows() {
     let cfg = strict(
@@ -5760,8 +5764,8 @@ fn regression_a_self_claim_keeps_no_copy_of_its_unshipped_archive_rows() {
         },
         "commit",
     );
-    let r = run_seed(64, cfg).unwrap_or_else(|e| {
-        panic!("seed 64: {e}\n  replay with AUTHORITY_SIM_CONFIG=backup-crash-slow+commit")
+    let r = run_seed(224, cfg).unwrap_or_else(|e| {
+        panic!("seed 224: {e}\n  replay with AUTHORITY_SIM_CONFIG=backup-crash-slow+commit")
     });
     assert_eq!(r.member_copy_rows_left, 0);
     assert!(
@@ -16057,9 +16061,11 @@ fn locks_writer_hold_delegated_own_clock_without_the_settle_is_caught() {
     use pinned::run_seed;
     let mut witnessed = Vec::new();
     // (Seed 555 stopped showing it under ADR-50, which moved every schedule of
-    // a root with peers; 138, 502 and 685 are the first three of seeds 0 to
-    // 3 000 that do, unclocked, the settle clean on each.)
-    for seed in [138u64, 502, 685] {
+    // a root with peers, and 138, 502 and 685 under the sim finishing a held
+    // write as its commit returns (plan 46 M1.2 step 15); 3332, 3777 and 4522
+    // are the first three seeds from 0 that do, unclocked, the settle clean
+    // on each.)
+    for seed in [3332u64, 3777, 4522] {
         if let Err(e) = run_seed(
             seed,
             locks_writer_hold_delegated_unsettled_own_clock_config(),
