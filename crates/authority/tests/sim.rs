@@ -5800,6 +5800,44 @@ fn regression_a_readoption_landing_after_a_seal_is_not_served() {
     }
 }
 
+/// Kept-rows installs of claims that lost the race (ADR-51): `backup-strict`
+/// seeds 173 and 517, `backup-strict+commit` 1134, `backup-crash-slow+commit`
+/// 685 and 865 hit `kept_install`'s "a kept copy lies past a gap" assertion
+/// in a debug build. Two nodes claimed the same expired lease; the loser's
+/// tail to head brought in the winner's takeover marker, at the epoch the
+/// loser would have written, and `row_in_log`, which knows only the epoch
+/// last applied, then read every row a member had kept of the tenure as
+/// missing from the log. The loser's CAS could only fail (the lease it read
+/// was replaced), so no data was at risk, but the merge ran on a log that had
+/// moved on. The attempt ends now (`kept_overtaken`). Fails before: the
+/// assertion, in a debug build; in release the counter is 0.
+#[test]
+fn regression_a_claim_overtaken_during_its_kept_fetch_ends() {
+    let slow = || SimConfig {
+        s3_latency: (60, 200),
+        ..backup_crash_config()
+    };
+    for (seed, cfg, alias) in [
+        (173u64, backup_strict_config(), "backup-strict"),
+        (517, backup_strict_config(), "backup-strict"),
+        (
+            1134,
+            strict(backup_strict_config(), "commit"),
+            "backup-strict+commit",
+        ),
+        (685, strict(slow(), "commit"), "backup-crash-slow+commit"),
+        (865, strict(slow(), "commit"), "backup-crash-slow+commit"),
+    ] {
+        let r = run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={alias}")
+        });
+        assert!(
+            r.stats.values().map(|s| s.kept_overtaken).sum::<u64>() > 0,
+            "seed {seed}: no claim is overtaken during its kept fetch any more"
+        );
+    }
+}
+
 /// `backup-crash-slow+commit` seed 64 (`member_copies_drained`): a holder
 /// that claimed its own lease (epoch 2) after its backups refused its epoch-1
 /// tail kept the member copy of two unshipped `Archive` rows of epoch 1 for

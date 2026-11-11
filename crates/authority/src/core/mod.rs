@@ -1997,6 +1997,9 @@ pub struct Stats {
     /// but after an abandon).
     pub kept_rows_carried: u64,
     pub kept_past_gap: u64,
+    /// Kept-row installs that ended because the log had reached the epoch the
+    /// claim would write (another claimant won the lease meanwhile).
+    pub kept_overtaken: u64,
     pub kept_diverged: u64,
     pub kept_forced: u64,
     pub kept_uncarried_replayed: u64,
