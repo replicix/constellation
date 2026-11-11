@@ -2704,6 +2704,57 @@ fn a_deposed_root_keeps_appended_delegate_rows_as_a_member_copy() {
     assert!(!meta.member_copy_touches(&a), "the clear releases the hold");
 }
 
+/// ADR-57 (H5): a deposed root's hold on a delegate row ends with the row, not
+/// with the generation: the segment that re-ships `(gen, idx)` raises the
+/// generation's log index, and the holds at or below it go in that
+/// transaction. The generation is still running (its copy stays).
+#[test]
+fn a_reship_of_a_delegate_row_releases_its_hold_before_the_generation_ends() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    for i in 1..=2u64 {
+        let name = ["a", "b"][i as usize - 1];
+        meta.apply_delegate_tx(
+            &[create(name, ino(i), 10 + i as i64), completed(rid(i))],
+            Some(rid(i)),
+            5,
+            i,
+            Position::ZERO,
+        )
+        .unwrap();
+    }
+    meta.strand_deposed(2).unwrap();
+    let a = [constellation_meta::ReadKey::Dentry(ROOT_INO, "a".into())];
+    let b = [constellation_meta::ReadKey::Dentry(ROOT_INO, "b".into())];
+    assert!(meta.member_copy_touches(&a) && meta.member_copy_touches(&b));
+    // The successor's segment carries row 1 of generation 5.
+    meta.apply_segment_rows(
+        1,
+        2,
+        2,
+        &[1, 2],
+        &[(5, 1)],
+        &[create("a", ino(1), 11), completed(rid(1))],
+        &TouchSet::default(),
+    )
+    .unwrap();
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
+    assert!(!meta.member_copy_touches(&a), "row 1 is back");
+    assert!(meta.member_copy_touches(&b), "row 2 is not");
+    assert!(meta.deleg_backup_holds_any(5).unwrap());
+    meta.apply_segment_rows(
+        2,
+        2,
+        4,
+        &[3, 4],
+        &[(5, 2)],
+        &[create("b", ino(2), 12), completed(rid(2))],
+        &TouchSet::default(),
+    )
+    .unwrap();
+    assert!(!meta.member_copy_touches(&b), "row 2 is back");
+}
+
 /// The delegate's own execution of generation 5 under a lease epoch (it
 /// acquired the lease before the gate's strand: `begin_local` stamps the
 /// holder epoch) is not an appended row: its live stream, never a copy.

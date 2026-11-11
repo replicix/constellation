@@ -5276,7 +5276,7 @@ impl Meta {
         // transactions retire after the apply.
         let own_txs = self.journal_seqs_of_origins(&tx, origins)?;
         for (gen, idx) in origins {
-            local::bump_log_idx_tx(&mut tx, &self.local, *gen, *idx)?;
+            local::bump_log_idx_tx(&mut tx, self, *gen, *idx)?;
         }
         if origins.iter().any(|o| o.0 != 0) {
             tracing::trace!(
