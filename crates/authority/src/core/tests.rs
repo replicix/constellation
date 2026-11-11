@@ -63546,6 +63546,52 @@ mod hold_ack {
         assert_eq!(l.core.stats.hold_acks_ignored, 1);
     }
 
+    /// I5 (flex-tight 1267): a subscriber outside the hold's epoch is sent
+    /// only the rows the group acknowledged, as committed. Streamed
+    /// ahead of the ack it held an ungated copy, which a takeover's epoch
+    /// marker stranded into a replay of a row the group had answered.
+    #[test]
+    fn a_subscriber_outside_the_epoch_gets_only_acknowledged_rows() {
+        let mut h = owner(2);
+        h.core.pr.epoch_members = vec![1, 2];
+        let tip = tip(&h);
+        let served = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LogSubscribe {
+                req: OpId(77),
+                from: 1,
+            },
+        });
+        assert!(!sends(&served).is_empty(), "node 3 subscribed");
+        assert!(h.core.stream_subscribers().contains(&3));
+        let batches = |out: &[Action]| -> Vec<(NodeId, bool, u64)> {
+            sends(out)
+                .into_iter()
+                .filter_map(|(to, m)| match m {
+                    PeerMsg::StreamAhead { txs, committed, .. } => {
+                        Some((to, *committed, txs.last().map_or(0, |t| t.last)))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut out = Vec::new();
+        h.core.stream_ahead(h.clk(), 0, tip, &h.meta, &mut out);
+        assert_eq!(batches(&out), vec![(2, true, tip)], "{out:?}");
+        // Member 2 acknowledges the first row only: node 3 gets that one.
+        let first = Replica::journal_txs_from(&h.meta, 1, 1)[0].last;
+        assert!(first < tip);
+        let out = ack(&mut h, 2, 1, first);
+        assert_eq!(batches(&out), vec![(3, true, first)], "{out:?}");
+        // Then the rest.
+        let out = ack(&mut h, 2, 1, tip);
+        assert_eq!(batches(&out), vec![(3, true, tip)], "{out:?}");
+        // Nothing is sent twice.
+        let mut out = Vec::new();
+        h.core.stream_ahead(h.clk(), 0, tip, &h.meta, &mut out);
+        assert!(batches(&out).is_empty(), "{out:?}");
+    }
+
     /// The hold streams to every member of its epoch, subscribed or not,
     /// and the owner's wait for an acknowledgement is counted per batch.
     #[test]
