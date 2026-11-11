@@ -128,19 +128,19 @@ correlated power loss.
 
 ### Layer A: requesters keep what they were acknowledged
 
-Always on, and free for the holder's own writes. A holder with no roster
-peer linked within the RTT budget is a *lone* sequencer: it answers its own
-node's clients once the op is on its disk, and those writes that never
-shipped come back when it returns, through the rollback and a replay by rid
-(see
+Always on, and free for the holder's own writes. A holder whose roster
+object lists no write-eligible node but itself is a *lone* sequencer (a
+singleton, [ADR-50](../../explanation/DECISIONS.md#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer)):
+it answers its own node's clients once the op is on its disk, and those
+writes that never shipped come back when it returns, through the rollback and
+a replay by rid (see
 [Forwarded mutations](forwarded-mutations.md#speculation-and-stranded-op-recovery)).
-Lone is judged as of the event that answers. A holder with a roster peer
-linked within the budget is not lone, even while that link is younger than
-the 2 s a backup candidate needs or its RTT is not measured yet: it waits
+Lone is judged as of the event that answers. A holder with a write-eligible
+peer on the roster, however far, unlinked or unmounted, is not lone: it waits
 for the archive (or for the backup it brings up) and never answers from its
-disk alone. A peer measured out of budget does not count; one that sealed
-the epoch does (it is no backup candidate, but it takes over with its tail,
-which lacks what is acknowledged on this disk alone afterwards). Lone is also
+disk alone (a node that will not be mounted again is retired with `leave`).
+Read-only nodes do not count. An incomplete roster read means peers unknown,
+which means peers. Lone is also
 judged on a directory taken after the node's own last lapse (a pause, a
 process freeze, a held runtime) was handed to its core: the links a root held
 before it stopped cannot show that no peer came up while it was stopped, and
@@ -1273,14 +1273,24 @@ Operational rules:
   ends them at the delegation TTL before the registry entry goes (another
   node refuses a node the delegation table lists a stream for). A leave that
   is not answered in time is run again.
-- Retiring a node gives up its unshipped journal: writes it acknowledged
-  as holder or as an epoch's hold owner that never reached S3 (or the
-  successor's backup tail) are lost, as they would be if its disk were
-  gone. Other nodes drop what they had streamed of that journal
-  (`replays_of_retired_dropped`) instead of replaying it through the
-  successor, so no fragment of it surfaces. This covers ops the retired
-  node sequenced for others too; ops it forwarded to a live holder are
-  that holder's and are kept.
+- Retiring a node gives up the unshipped writes that only its disk held:
+  rows it acknowledged as holder or as an epoch's hold owner that no other
+  node kept and that never reached S3 are lost, as they would be if its disk
+  were gone. A row it answered as committed is not one of them: a member kept
+  it, and the successor's takeover collects the members' kept copies of the
+  tenure before it serves
+  ([ADR-51](../../explanation/DECISIONS.md#adr-51-a-takeover-collects-the-tenures-kept-rows-before-it-serves)).
+  Only a retired node's stranded rows that were never committed are dropped
+  (`replays_of_retired_dropped`) instead of replayed through the successor,
+  so no fragment of them surfaces. This covers ops the retired node
+  sequenced for others too; ops it forwarded to a live holder are that
+  holder's and are kept.
+- A takeover of a tenure that an epoch's hold carried waits for the members
+  the epoch rows name (`status.lease.waiting_for_group`). A member that is
+  down holds the claim; the operator either abandons the epoch
+  (`repair abandon --epoch`, accepted after partial answers: what the member
+  kept above the recorded cut replays by rid when it returns) or retires the
+  member, which loses the rows only it kept.
 - An epoch carries a lease only if the holder's claim was usable
   (outside the lease margin) when it acked. With the default half-TTL
   renewal, an outage that starts just before a renewal leaves the holder
