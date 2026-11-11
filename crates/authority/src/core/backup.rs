@@ -6886,6 +6886,7 @@ impl Core {
     ) {
         self.stats.tail_beyond_gap_dropped += report.tail_beyond_gap as u64;
         self.stats.tail_done_skipped += report.tail_done as u64;
+        self.stats.tail_dedup += report.tail_dedup as u64;
         self.stats.tail_same_row += report.tail_same_row as u64;
         self.stats.tail_in_log += report.tail_in_log as u64;
         self.stats.reship_sync_failed += u64::from(report.sync_failed);
@@ -6901,6 +6902,7 @@ impl Core {
             applied = report.tail_applied,
             beyond_gap = report.tail_beyond_gap,
             done = report.tail_done,
+            dedup = report.tail_dedup,
             "re-shipped the predecessor's backup tail under the new epoch"
         );
         self.stats.backup_tail_applied += report.tail_applied as u64;

@@ -232,6 +232,53 @@ fn a_row_whose_rid_is_done_is_skipped_and_counted() {
     assert_eq!(meta.journal_len().unwrap(), journal);
 }
 
+/// ADR-51: a later epoch's tail may carry the re-ship of an earlier epoch's
+/// row (its holder took the row over, then died holding it). The takeover
+/// journals the row once, under the first epoch, and the second copy is a
+/// dedup by identity: a normal sight, counted as `tail_dedup` and never as
+/// `tail_done` (an outcome of the rid the log carried under another
+/// identity, which the sim fails a seed for).
+#[test]
+fn a_row_two_epochs_tails_carry_is_a_dedup_not_a_done_rid() {
+    let meta = Meta::open_in_memory().unwrap();
+    let recs = vec![
+        create(ROOT_INO, "x", ino(7)),
+        LogRecord::Completed { rid: rid(2, 1) },
+    ];
+    let mut again = vec![LogRecord::TailOf {
+        epoch: EPOCH_PREV,
+        jseq: 1,
+    }];
+    again.extend(recs.clone());
+    assert!(meta.backup_append(EPOCH_PREV, &[tx(1, 2, recs)]).is_ok());
+    assert!(meta.backup_append(2, &[tx(1, 3, again)]).is_ok());
+    let report = meta
+        .reship_epochs_at_takeover(
+            None,
+            &[
+                constellation_meta::TailArgs {
+                    epoch: EPOCH_PREV,
+                    through: 2,
+                    config_version: 3,
+                    class: None,
+                },
+                constellation_meta::TailArgs {
+                    epoch: 2,
+                    through: 3,
+                    config_version: 3,
+                    class: None,
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        (report.tail_applied, report.tail_dedup, report.tail_done),
+        (1, 1, 0),
+        "{report:?}"
+    );
+    assert_eq!(txs_in_journal(&meta), 1);
+}
+
 /// A node that takes the lease again after its own tenure (a claimant asked
 /// for its tail, the claim failed, it won the lease itself) reads its own
 /// sealed tail back while its own journal still holds the very rows (a root's
