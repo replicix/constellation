@@ -4742,6 +4742,7 @@ impl Core {
     /// the root then sealed by its backup).
     pub(crate) fn completed_row_settled(&self, rid: Rid, replica: &dyn Replica) -> bool {
         self.unsettled_delegate_row(rid, replica).is_none()
+            && self.unsettled_root_row_early(rid, replica).is_none()
     }
 
     /// `(gen, idx)` of `rid`'s `completed` row when it is a delegation row
@@ -4812,9 +4813,15 @@ impl Core {
             // deposed holder's): the settle path decides, not the deadline.
             // (A delegation row, `gen != 0`, commits by its group or the log:
             // `completed_row_settled` below.)
-            if replica.outcome_row(rid).is_some_and(|r| r.gen == 0)
-                && journal_carries_outcome(replica, rid)
-                && !replica.outcome_from_log(rid)
+            // (A delegate holds no root lease by design: only its row of a
+            // generation the deposed-holder rule and an ended hold name stay
+            // held back as before.)
+            let held_back = self.lease.lost
+                || replica
+                    .journal_class_of_rid(rid)
+                    .is_some_and(|(first, _)| self.left_by_hold(first))
+                || replica.outcome_row(rid).is_some_and(|r| r.gen == 0);
+            if held_back && journal_carries_outcome(replica, rid) && !replica.outcome_from_log(rid)
             {
                 return None;
             }
@@ -4904,6 +4911,12 @@ impl Core {
         let first = replica.journal_class_of_rid(rid).map(|(first, _)| first);
         if self.unsettled_delegate_row(rid, replica).is_some() {
             return Some(first.or(position.pending.map(|p| p.jseq)).unwrap_or(0));
+        }
+        // Plan 46 M1.4 step 6a (ADR-53): a row of an earlier tenure, journaled
+        // under a configuration that is no longer in force, is answered once
+        // the archive carries it, whatever this tenure's rule says.
+        if let Some(seq) = self.unsettled_root_row_early(rid, replica) {
+            return Some(seq);
         }
         if let Some(first) = first.filter(|first| self.left_by_hold(*first)) {
             let shipped = replica.journal_acked_seq().unwrap_or(0);

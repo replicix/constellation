@@ -5987,7 +5987,11 @@ fn run_flex(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> FlexTot
 /// as the log's. Seeds that claimed `Archive` for a row that never shipped
 /// (47: the lease let go by a continuation epoch's close and taken again,
 /// 696 likewise under `flex`; 1286: the client deadline of a node holding
-/// nothing). Pinned from main 905af01c, where they fail.
+/// nothing). They failed on main 905af01c; current main passes them (the
+/// timing moved), so these pins are regression guards, not fail-befores: the
+/// core tests (`m11_step5`) fail on main by construction and carry the
+/// evidence, and 47 and 696 fail again under the control below. 1286 (the
+/// non-holder deadline) has no sim control: its core tests do.
 #[test]
 fn a_resumed_tenure_keeps_the_rule_of_its_earlier_rows() {
     for (label, cfg, seed) in [
@@ -6030,6 +6034,39 @@ fn the_resumed_span_control_fails_the_class_claim_seeds() {
         let e = run_seed(seed, cfg).expect_err("the control passed");
         assert!(e.contains("claims a commit"), "seed {seed}: {e}");
     }
+}
+
+/// Plan 46 M1.4 step 6a (ADR-53), the emission gate as a backstop of its own:
+/// with the paths that decide an earlier tenure's row early blind to it
+/// (`Config::root_row_emission_only`), the gate where an answer leaves holds
+/// it, so the class-claim seeds still pass, and it holds answers
+/// (`held_at_emission_root_row` > 0; with the early deciders on it is 0 in
+/// every sweep, since they hold the row first).
+#[test]
+fn the_emission_gate_alone_holds_the_class_claim_seeds() {
+    let mut held = 0;
+    for (cfg, seed) in [
+        (config_variant(flex_tight_config(), "oracles"), 47),
+        (config_variant(flex_tight_config(), "oracles"), 934),
+        (config_variant(flex_config(), "commit"), 696),
+    ] {
+        let inner = cfg.core.clone();
+        let cfg = SimConfig {
+            core: std::sync::Arc::new(move |id, inc| {
+                let mut core = inner(id, inc);
+                core.root_row_emission_only = true;
+                core
+            }),
+            ..cfg
+        };
+        let report = run_seed(seed, cfg).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        held += report
+            .stats
+            .values()
+            .map(|s| s.held_at_emission_root_row)
+            .sum::<u64>();
+    }
+    assert!(held > 0, "the emission gate never held a root row");
 }
 
 /// Plan 30 §M10: the epoch of 2/3 forms and writes, the third node's
@@ -6978,11 +7015,15 @@ fn sweep_config() {
                 core
             });
         }
-        if std::env::var("AUTHORITY_SIM_RESUMED_SPAN_DROPPED").is_ok_and(|v| v == "1") {
+        if let Ok(v) = std::env::var("AUTHORITY_SIM_RESUMED_SPAN_DROPPED") {
             let inner = c.core.clone();
             c.core = std::sync::Arc::new(move |id, inc| {
                 let mut core = inner(id, inc);
-                core.resumed_span_dropped = true;
+                match v.as_str() {
+                    "1" => core.resumed_span_dropped = true,
+                    "emission" => core.root_row_emission_only = true,
+                    _ => {}
+                }
                 core
             });
         }
@@ -8589,7 +8630,6 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "held_at_emission_designation",
             "held_at_emission_release",
             "held_at_emission_root_row",
-            "resumed_spans",
             "journal_class_from_session",
             "seal_tail_holder",
             "seal_tail_backup",
@@ -8747,7 +8787,6 @@ struct OracleTotals {
     held_emission: [u64; 6],
     held_emission_seeds: Vec<u64>,
     held_root_row: u64,
-    resumed_spans: u64,
     /// The stream counters: delegated acknowledgements released (count,
     /// total wait ms), the install waits and the lost-dependency counters
     /// (installs put off, generations stopped, rows the root refused,
@@ -8882,7 +8921,6 @@ impl OracleTotals {
             self.held_emission[4] += st.held_at_emission_designation;
             self.held_emission[5] += st.held_at_emission_release;
             self.held_root_row += st.held_at_emission_root_row;
-            self.resumed_spans += st.resumed_spans;
             self.tail[0] += st.tail_fetch_attempts;
             self.tail[1] += st.tail_fetches;
             self.tail[2] += st.inherited_tail_fetches;
@@ -9334,7 +9372,7 @@ impl OracleTotals {
         }
         eprintln!(
             "SWEEP-HELD-AT-EMISSION {label} seeds {}/{seeds}: answers held at emission {} \
-             (finish {}, deleg_exec {}, holder_reply {}, designation {}, release {}; root_row {}, resumed spans {}) in seeds {:?}",
+             (finish {}, deleg_exec {}, holder_reply {}, designation {}, release {}; root_row {}) in seeds {:?}",
             self.seeds,
             self.held_emission[0],
             self.held_emission[1],
@@ -9343,7 +9381,6 @@ impl OracleTotals {
             self.held_emission[4],
             self.held_emission[5],
             self.held_root_row,
-            self.resumed_spans,
             self.held_emission_seeds
         );
         eprintln!(

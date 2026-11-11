@@ -56603,8 +56603,16 @@ mod c2f_lone_root {
             assert_eq!(s.shadows_installed, 1, "in_epoch {in_epoch}");
             assert_eq!(
                 (s.ungated_shadows_non_stealable, s.ungated_shadows),
-                if in_epoch { (1, 0) } else { (0, 1) },
+                (0, 1),
                 "in_epoch {in_epoch}"
+            );
+            // A later epoch's takeover strands the shadow: it is queued for
+            // replay.
+            assert!(requester.meta.pending_replays().unwrap().is_empty());
+            requester.meta.strand_below_epoch(1_000).unwrap();
+            assert!(
+                !requester.meta.pending_replays().unwrap().is_empty(),
+                "in_epoch {in_epoch}: the takeover left the shadow alive"
             );
         }
     }
@@ -61998,19 +62006,102 @@ mod m11_step5 {
             replies(&out).is_empty(),
             "answered at the re-take, the row unshipped: {out:?}"
         );
-        assert_eq!(h.core.stats.resumed_spans, 1);
-        assert!(!h.core.ack.spans.is_empty());
-        // A row of the resumed tenure is not answered alone before it either.
-        let (_, out) = submit(&mut h, 2, "r2");
-        assert!(replies(&out).is_empty(), "{out:?}");
+        assert!(h.core.ack.tenure_start.is_some());
+        assert!(h.core.unsettled_root_row(r1, &h.meta).is_some());
+        // A row of the resumed tenure is answered by the tenure's own rule
+        // (alone), and does not wait behind the earlier row.
+        let (r2, out) = submit(&mut h, 2, "r2");
+        assert!(replies(&out).iter().any(|(r, _)| *r == r2), "{out:?}");
+        assert!(h.core.unsettled_root_row(r2, &h.meta).is_none());
         ship_through_tip(&mut h);
         let mut out = activity(&mut h);
         out.extend(release(&mut h));
         let got: Vec<Rid> = replies(&out).iter().map(|(r, _)| *r).collect();
         assert!(got.contains(&r1), "{out:?}");
-        // Steady again: no span, the next row at once.
+        // Steady again: the next row at once.
         let (_, out) = submit(&mut h, 3, "r3");
         assert_eq!(replies(&out).len(), 1, "{out:?}");
+    }
+
+    /// A restart: the journal on disk holds an `Archive` row nobody shipped,
+    /// and a new `Core` over it takes the node's own lease again (a first
+    /// tenure of the process, no tenure gap seen) lone, at a higher version.
+    fn archive_row_then_a_restart(h: &mut Harness) -> Rid {
+        backup_node(h, vec![1, 2]);
+        link_2(h, false, None, 0);
+        h.hold(1, None);
+        h.core.ack.eligible = Some(h.core.backup_could_be_had());
+        link_2(h, true, Some(5), 0);
+        let (r1, out) = submit(h, 1, "r1");
+        assert!(replies(&out).is_empty(), "{out:?}");
+        assert!(classes_of(h, r1)[0].versionless() == RowCommit::ARCHIVE);
+        super::land_reconfig(h);
+        let held = h.core.lease.held.as_ref().unwrap().0.clone();
+        // The process dies: a new core over the same store.
+        let cfg = h.core.cfg.clone();
+        h.core = Core::new(cfg);
+        let mut out = Vec::new();
+        h.core.start(h.clk(), &h.meta, &mut out);
+        h.core.roster.mark_seen_for_test(true);
+        let lease = Lease {
+            config_version: held.config_version + 2,
+            backups: Vec::new(),
+            singleton: true,
+            ack_policy: constellation_store_s3::AckPolicy::Local,
+            ..held
+        };
+        h.core.lease.adopt(h.clk(), lease, tag(), None);
+        h.core.ack.eligible = Some(false);
+        r1
+    }
+
+    /// (6a, M1) Fails on the branch's first version: after a restart the node
+    /// retakes its own lease as a first tenure (no gap seen, so no span and
+    /// no emission check), and the client's retry of the older `Archive`
+    /// row was answered alone before the row shipped.
+    #[test]
+    fn a_restart_does_not_answer_an_earlier_archive_row_alone() {
+        let mut h = Harness::new(1);
+        let r1 = archive_row_then_a_restart(&mut h);
+        activity(&mut h);
+        let (rid, out) = submit(&mut h, 1, "r1");
+        assert_eq!(rid, r1);
+        assert!(
+            replies(&out).is_empty(),
+            "the retry was answered with the row unshipped: {out:?}"
+        );
+        assert!(h.core.unsettled_root_row(r1, &h.meta).is_some());
+        // Its row's answer is never settled before the archive carries it.
+        assert!(!h.core.completed_row_settled(r1, &h.meta));
+        ship_through_tip(&mut h);
+        let mut out = activity(&mut h);
+        out.extend(release(&mut h));
+        assert!(h.core.completed_row_settled(r1, &h.meta));
+        let (_, out2) = submit(&mut h, 1, "r1");
+        out.extend(out2);
+        let got: Vec<Rid> = replies(&out).iter().map(|(r, _)| *r).collect();
+        assert!(got.contains(&r1), "{out:?}");
+    }
+
+    /// (6a, S2) The emission gate decides an earlier tenure's row by its
+    /// own state: with the early deciders not asked, a root row the archive
+    /// has not carried is held where the answer leaves, and counted. A row
+    /// of the tenure itself is not held, and neither is one shipped.
+    #[test]
+    fn the_emission_gate_holds_an_earlier_tenures_root_row_on_its_own() {
+        let mut h = Harness::new(1);
+        let r1 = archive_row_then_a_restart(&mut h);
+        activity(&mut h);
+        let seq = h.core.emission_hold_of(r1, &h.meta).expect("held");
+        assert_eq!(Some(seq), h.meta.journal_class_of_rid(r1).map(|(f, _)| f));
+        h.core.emission_hold_expected = true;
+        h.core
+            .note_held_at_emission(crate::core::backup::EmissionPath::Finish, r1, &h.meta);
+        assert_eq!(h.core.stats.held_at_emission_root_row, 1);
+        let (r2, _) = submit(&mut h, 2, "r2");
+        assert!(h.core.emission_hold_of(r2, &h.meta).is_none());
+        ship_through_tip(&mut h);
+        assert!(h.core.emission_hold_of(r1, &h.meta).is_none());
     }
 
     /// (6a, a, control) `resumed_span_dropped` restores the old arm: the
@@ -62037,6 +62128,20 @@ mod m11_step5 {
             h.core.settled_outcome(r1, &h.meta).is_none(),
             "an unshipped row read as the log's"
         );
+    }
+
+    /// (6a, S1) A deposed node (`lost`) keeps main's rule: it never answers a
+    /// row its journal carries as the log's. (A pin: a root row is held back
+    /// by the non-holder rule too, so this passes on the first version of the
+    /// branch as well; the term it guards is main's `lost || left_by_hold`,
+    /// which that version dropped for the rows the root rule does not name.)
+    #[test]
+    fn a_lost_node_does_not_answer_its_unshipped_row_as_the_logs() {
+        let mut h = Harness::new(1);
+        let r1 = archive_row_then_a_tenure_gap(&mut h);
+        h.core.lease.held = None;
+        h.core.lease.lost = true;
+        assert!(h.core.settled_outcome(r1, &h.meta).is_none());
     }
 }
 
