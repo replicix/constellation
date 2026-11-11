@@ -364,11 +364,27 @@ fn a_gated_holders_close_returns_once_its_manifest_row_is_durable() {
 fn close_with_the_gate_going_off(
     published: constellation_meta::RowCommit,
 ) -> (constellation_meta::RowCommit, u64) {
-    use constellation_meta::{GroupOn, RowCommit};
+    close_with_the_gate_going_off_across(
+        published,
+        constellation_meta::RowCommit::group(5, constellation_meta::GroupOn::Root),
+        0,
+        0,
+    )
+}
+
+/// [`close_with_the_gate_going_off`] with the holder epoch the row is
+/// journaled in and the one the gate goes off in.
+fn close_with_the_gate_going_off_across(
+    published: constellation_meta::RowCommit,
+    group: constellation_meta::RowCommit,
+    journaled_in: u64,
+    off_in: u64,
+) -> (constellation_meta::RowCommit, u64) {
+    use constellation_meta::RowCommit;
     let meta = Arc::new(Meta::open_in_memory().unwrap());
+    meta.set_holder_epoch(journaled_in);
     let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
     let session = meta.session();
-    let group = RowCommit::group(5, GroupOn::Root);
     session.set_durable(true, meta.journal_tip().unwrap(), false, group, false);
     let (fs, _dir, _core) = holder_fs(meta.clone(), true);
     fs.do_write(file.ino, 0, b"hello").unwrap();
@@ -392,6 +408,7 @@ fn close_with_the_gate_going_off(
         std::thread::sleep(Duration::from_millis(100));
         assert!(!close.is_finished(), "the close waits for the group");
         // The gate goes off, the lease still this node's.
+        meta.set_holder_epoch(off_in);
         session.set_durable(false, u64::MAX, false, published, true);
         assert_eq!(close.join().unwrap(), Ok(()));
         after = meta.journal_tx_class(tip).unwrap().unwrap();
@@ -430,6 +447,26 @@ fn ungated_fast_path_answer_of_a_replaced_configuration_keeps_its_rule() {
         close_with_the_gate_going_off(RowCommit::Singleton { config_version: 6 });
     assert_eq!(after, RowCommit::group(5, GroupOn::Root));
     assert_eq!(downgraded, 0);
+}
+
+/// Plan 46 M1.2 step 15 review (SHOULD-2): an `Archive` row of an older epoch
+/// is not a row of a replaced configuration. A self-claim's new tenure clears the
+/// configuration spans, and the gate is off at once when its lease is a
+/// singleton's: the answer rests on this disk alone, so the row is
+/// re-tagged (the takeover gate drops an `Archive` row the log lacks, and
+/// queues a `Singleton` one). Fails on the parent: the row kept its
+/// `Archive` rule and was answered.
+#[test]
+fn ungated_fast_path_answer_of_an_older_epoch_is_retagged() {
+    use constellation_meta::{GroupOn, RowCommit};
+    let (after, downgraded) = close_with_the_gate_going_off_across(
+        RowCommit::Singleton { config_version: 6 },
+        RowCommit::group(5, GroupOn::Archive),
+        1,
+        2,
+    );
+    assert_eq!(after, RowCommit::Singleton { config_version: 5 });
+    assert_eq!(downgraded, 1);
 }
 
 /// Waits until something journaled past the durable watermark; returns

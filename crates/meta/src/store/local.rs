@@ -816,6 +816,7 @@ impl Meta {
             first: local.start,
             last: end - 1,
             class,
+            epoch: local.epoch,
         });
         put_journal_tx(
             tx,
