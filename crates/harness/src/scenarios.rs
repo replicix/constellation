@@ -5864,6 +5864,9 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
         client
             .with_own_node_key()
             .with_env("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0")
+            // Pinned (plan 46 M1.3 step 7): a budget of 0 would let placement
+            // grant sticky subtrees; this scenario is about the deposition.
+            .with_env("CONSTELLATION_DELEGATION_STICKY_PLACEMENT", "off")
             .with_env("CONSTELLATION_LEASE_TTL_MS", "5000")
             // Keep B holding for a while after its takeover write, so
             // resumed A's renewal finds B's lease (the deposition path
@@ -12066,6 +12069,9 @@ fn holder_publishes_log_prefix_mode(_seed: u64, backup: bool) -> Result<()> {
                 "CONSTELLATION_BACKUP_RTT_BUDGET_MS",
                 if backup { "5" } else { "0" },
             )
+            // Pinned (plan 46 M1.3 step 7): at a budget of 0 placement would
+            // grant sticky subtrees; the scenario is about a backup's seal.
+            .with_env("CONSTELLATION_DELEGATION_STICKY_PLACEMENT", "off")
     };
     let mut a = tune(Client::new(root.path(), "a", &env.endpoint, &backend)?)
         .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "50");

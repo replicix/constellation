@@ -71,7 +71,11 @@ fn node(
         .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
         .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "200")
         .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000")
-        .with_env("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0");
+        .with_env("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0")
+        // Pinned (plan 46 M1.3 step 7): a budget of 0 would otherwise let
+        // placement grant sticky subtrees; this scenario is about the
+        // lease and the TTL takeover.
+        .with_env("CONSTELLATION_DELEGATION_STICKY_PLACEMENT", "off");
     for (k, v) in extra {
         c = c.with_env(k, v);
     }

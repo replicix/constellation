@@ -40,6 +40,8 @@ const READ_CADENCE: Duration = Duration::from_secs(2);
 /// holder that keeps its lease while others write.
 const NO_BACKUP: &[(&str, &str)] = &[
     ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"),
+    // Pinned (plan 46 M1.3 step 7): the scenario is about the lease claim.
+    ("CONSTELLATION_DELEGATION_STICKY_PLACEMENT", "off"),
     ("CONSTELLATION_LEASE_WANTED_GRACE_MS", "600000"),
 ];
 
