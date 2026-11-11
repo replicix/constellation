@@ -15,7 +15,10 @@
 //! step is a read, and under `Positions` only once [`read_allowed`] says
 //! the session wait is over (the model waits without a bound; the real
 //! wait is bounded by `CONSTELLATION_SESSION_WAIT_MS` and then answers
-//! degraded, which is a liveness choice outside what the model checks).
+//! degraded, which is a liveness choice outside what the model checks;
+//! a read of a key a rolled-back acknowledged row touches is held until
+//! the row returns and otherwise fails with `EIO`, never answered stale:
+//! ADR-57, so a read the model offers is one the product answers).
 //!
 //! # What a read must contain (the properties)
 //!

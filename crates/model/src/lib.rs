@@ -486,7 +486,9 @@
 //!     a tenure ships its whole journal as one segment at the next slot,
 //!     so the two orders agree (see `positions`' module doc). The read
 //!     wait is unbounded in the model (a disabled action); the real one
-//!     is bounded and then answers degraded, which is a liveness choice.
+//!     is bounded and then answers degraded, which is a liveness choice
+//!     (a held read, ADR-57, is never answered: it waits for the row or
+//!     fails with `EIO`).
 //!     `EEXIST` hints are not modeled (simplification 6), so a refusal
 //!     is only ever followed by the wait, never by a covering hint; M6's
 //!     hint is a latency optimization of the same rule. Reads record no

@@ -1526,6 +1526,13 @@ the read answers from the replica and is counted as degraded. The result
 is read-your-writes and monotonic reads for every client of a node, at no
 cost when the node is idle
 ([Close-to-open modes](../reference/features/cto-modes.md#session-guarantees)).
+One read is never degraded: a read of a key an acknowledged row touches that
+the node rolled back while the log lacks it (a deposition, a rebuild, a
+takeover gate). It waits for the row's re-ship whatever the budget, and fails
+with `EIO` after `read_hold_span` (the client deadline, the takeover window and
+a forward round); it is never answered without the row, and the holds survive a
+restart
+([ADR-57](DECISIONS.md#adr-57-a-node-never-answers-a-read-from-a-state-that-lacks-an-acknowledged-row-it-rolled-back)).
 
 ### Close-to-open: bounded and strict
 
