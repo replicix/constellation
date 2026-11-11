@@ -75320,10 +75320,7 @@ mod stale_lease {
         assert!(answers(&out).is_empty());
         // Take the park the stalled step made, as if the hold had come
         // after the deposition.
-        let (seq, outcome, class) = h
-            .core
-            .take_stale_park_for_tests(rid)
-            .expect("a stale park");
+        let (seq, outcome, class) = h.core.take_stale_park_for_tests(rid).expect("a stale park");
         h.core.replay.unacked.clear();
         h.core.lease.lost = true;
         let mut out = Vec::new();
