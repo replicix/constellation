@@ -1594,6 +1594,14 @@ pub struct Report {
     pub oracle_examples: Vec<String>,
 }
 
+impl Report {
+    /// Own `Archive` rows of an older epoch that the nodes' takeover gates
+    /// dropped instead of keeping a member copy (`Stats::archive_dropped`).
+    pub fn archive_dropped(&self) -> u64 {
+        self.stats.values().map(|s| s.archive_dropped).sum()
+    }
+}
+
 pub struct Cluster {
     pub nodes: Mutex<BTreeMap<NodeId, Arc<NodeHandle>>>,
     pub env: NodeEnv,

@@ -1473,6 +1473,10 @@ pub struct Stats {
     /// generation dropped instead of replaying (`speculation.deleg_dropped`).
     pub deleg_group_records: u64,
     pub deleg_dropped: u64,
+    /// An own `Archive` row of an older epoch that the log did not carry,
+    /// dropped by this node's own takeover gate instead of kept as a member
+    /// copy (`Stranded::archive_dropped`).
+    pub archive_dropped: u64,
     /// Plan 43 C2 (Q1): seals asked again because the recorded backup had
     /// not answered (the generation is not ended without its tail).
     pub deleg_seal_waits: u64,

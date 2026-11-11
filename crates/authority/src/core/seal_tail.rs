@@ -1431,6 +1431,7 @@ impl Core {
         self.stats.replay_gated_enqueued += s.gated_queued as u64;
         self.stats.deleg_append_queued += s.deleg_append_queued as u64;
         self.stats.deleg_dropped += s.deleg_dropped as u64;
+        self.stats.archive_dropped += s.archive_dropped as u64;
     }
 }
 

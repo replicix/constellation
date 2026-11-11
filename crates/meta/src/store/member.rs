@@ -23,6 +23,10 @@
 //! ([`member_rules_tx`], inside `apply_segment_rows`'s transaction, and for
 //! the node's own shipped rows in `ack_rows_tx`):
 //!
+//! 0. At the claimant's own takeover gate, after its marker landed, an own
+//!    `Archive` row of an older epoch the log does not carry is not kept (it
+//!    was never committed; rule 4's reason, which the claimant never applies
+//!    to its own marker).
 //! 1. **Coverage.** A segment that carries `TailOf { epoch, jseq }` — a
 //!    re-shipped transaction's identity — retires the row `(epoch, jseq)`;
 //!    a segment of the copy's own epoch retires the rows it ships (named by

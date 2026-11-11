@@ -4,8 +4,8 @@
 
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::{
-    execute_mutate, BackupTx, LogRecord, MemberTx, Meta, MetaStore, MutateOp, PendingClass,
-    Position, ReadKey, Rid, RowCommit, TouchSet,
+    execute_mutate, BackupTx, GroupOn, LogRecord, MemberTx, Meta, MetaStore, MutateOp,
+    PendingClass, Position, ReadKey, Rid, RowCommit, TouchSet,
 };
 
 const HOLDER: u64 = 1;
@@ -456,6 +456,65 @@ fn the_takeover_gate_supersedes_a_committed_entry_without_queueing() {
             }
         }
     }
+}
+
+/// The claimant's own takeover gate keeps no copy of an own `Archive` row of
+/// an older epoch that the log does not carry: its marker landed first, so the
+/// row was never committed nor answered (rule 4's reason, which the claimant
+/// never applies to its own marker). Rolled back, not queued; the requester
+/// retries by rid. The drop survives a restart (no copy comes back).
+#[test]
+fn the_takeover_gate_keeps_no_copy_of_an_own_archive_row_of_an_older_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("m.db");
+    {
+        let meta = Meta::open(&db).unwrap();
+        let before = raw_ns(&meta);
+        meta.set_holder_epoch(1);
+        holder_create(&meta, RowCommit::group(3, GroupOn::Archive), "a", 1, 1);
+        meta.set_holder_epoch(0);
+        let stranded = meta.strand_for_takeover(2, &[], None).unwrap();
+        assert_eq!(stranded.archive_dropped, 1);
+        assert_eq!(stranded.member_copied, 0);
+        assert!(stranded.any());
+        assert_eq!(stranded.committed_rolled_back, 0);
+        assert_eq!(meta.member_copy_rows(1).unwrap(), None);
+        assert!(meta.pending_replays().unwrap().is_empty());
+        assert_eq!(meta.completed_position(rid(1)).unwrap(), None);
+        assert_eq!(raw_ns(&meta), before, "rolled back");
+        assert_eq!(meta.journal_len().unwrap(), 0);
+        meta.close().unwrap();
+    }
+    let meta = Meta::open(&db).unwrap();
+    assert!(meta.member_copy_epochs().unwrap().is_empty());
+}
+
+/// Control: the gate still copies an own root-group row (kept until
+/// coverage; it may be the inherited tail of a tenure that has not shipped).
+#[test]
+fn the_takeover_gate_still_copies_an_own_root_group_row() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    holder_create(&meta, RowCommit::ROOT_GROUP, "a", 1, 1);
+    meta.set_holder_epoch(0);
+    let stranded = meta.strand_for_takeover(2, &[], None).unwrap();
+    assert_eq!(stranded.member_copied, 1);
+    assert_eq!(stranded.archive_dropped, 0);
+    assert!(meta.member_copy_rows(1).unwrap().is_some());
+}
+
+/// Control (scope): a deposition still copies the same `Archive` row; the
+/// successor's marker drops it by rule 4.
+#[test]
+fn a_deposition_still_copies_an_own_archive_row() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    holder_create(&meta, RowCommit::group(3, GroupOn::Archive), "a", 1, 1);
+    meta.set_holder_epoch(0);
+    let stranded = meta.strand_below_epoch(2).unwrap();
+    assert_eq!(stranded.member_copied, 1);
+    assert_eq!(stranded.archive_dropped, 0);
+    assert!(meta.member_copy_rows(1).unwrap().is_some());
 }
 
 /// A rebuild of the namespace keeps a committed shadow (re-installed on the
