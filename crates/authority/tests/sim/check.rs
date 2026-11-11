@@ -392,10 +392,16 @@ pub fn no_settled_landing(acks: &[super::oracle::AckEntry], oracle: &Oracle) -> 
 /// client submitted again after its first in-doubt answer (`submits`:
 /// `(rid, tick)` of every client submission) is exempt. The unsettled `EIO`
 /// itself stays counted by the sim's other checks.
+///
+/// A rid in `dropped` (`repair drop-held` rolled it back, and the log
+/// completes it by the operator's replay) lands when the operator acts, not
+/// when the protocol does: it is exempt, as I5 excuses a dropped rid whose
+/// effect survives.
 pub fn no_late_landing(
     in_doubt: &[(u64, Rid, Seq, u64)],
     invokes: &[(Rid, u64)],
     submits: &[(Rid, u64)],
+    dropped: &BTreeSet<Rid>,
     oracle: &Oracle,
 ) -> (usize, Vec<String>) {
     // The first in-doubt answer of each rid.
@@ -411,7 +417,7 @@ pub fn no_late_landing(
         let Some(p) = oracle.completed_at.get(r) else {
             continue;
         };
-        if submits.iter().any(|(s, ts)| s == r && *ts > *t) {
+        if submits.iter().any(|(s, ts)| s == r && *ts > *t) || dropped.contains(r) {
             continue;
         }
         let after = invokes

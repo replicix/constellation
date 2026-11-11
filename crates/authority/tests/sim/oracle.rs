@@ -2898,9 +2898,15 @@ pub fn end_of_run(
         .iter()
         .cloned()
         .partition(|(_, rid, _, _)| labelled.contains(rid));
-    f.i4 = super::check::no_late_landing(&in_doubt, &invokes, &audit.submits, log).1;
-    f.i4_isolated_from_s3 =
-        super::check::no_late_landing(&labelled_in_doubt, &invokes, &audit.submits, log).0;
+    f.i4 = super::check::no_late_landing(&in_doubt, &invokes, &audit.submits, &survivors, log).1;
+    f.i4_isolated_from_s3 = super::check::no_late_landing(
+        &labelled_in_doubt,
+        &invokes,
+        &audit.submits,
+        &survivors,
+        log,
+    )
+    .0;
     // Plan 43 C2 (§7.1 item 6): a settled answer promises the op never
     // takes effect: no completion of the rid in the log, wherever it lands.
     f.i4.extend(super::check::no_settled_landing(&acks, log));
@@ -5373,23 +5379,34 @@ mod tests {
         // r1 (answered in doubt at tick 10) lands at (5, 0); r2, invoked
         // afterwards by the same node, landed first at (3, 0): late.
         let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (r2, (3, 0))]);
-        let (n, why) = super::super::check::no_late_landing(&in_doubt, &invokes, &[], &log);
+        let (n, why) =
+            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &BTreeSet::new(), &log);
         assert_eq!(n, 1, "{why:?}");
         assert!(
             why[0].contains("I4 unacked_fails_never_lands_late"),
             "{why:?}"
         );
+        // The same, r1 rolled back by `repair drop-held` and replayed by
+        // the operator: it lands when the operator acts; exempt.
+        let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (r2, (3, 0))]);
+        let dropped = BTreeSet::from([r1]);
+        assert_eq!(
+            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &dropped, &log).0,
+            0
+        );
         // r1 landing before the later op is clean.
         let log = log_with(seg(1, &[]), &[(r1, (2, 0)), (r2, (3, 0))]);
         assert_eq!(
-            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &log).0,
+            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &BTreeSet::new(), &log)
+                .0,
             0
         );
         // An op another node invoked is not this node's client's.
         let invokes = [(r1, 5u64), (rid(2, 1), 11)];
         let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (rid(2, 1), (3, 0))]);
         assert_eq!(
-            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &log).0,
+            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &BTreeSet::new(), &log)
+                .0,
             0
         );
     }
@@ -5405,11 +5422,34 @@ mod tests {
         let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (r2, (3, 0))]);
         let check = super::super::check::no_late_landing;
         // Submitted at 5 (before the answer) and 12 (after it).
-        assert_eq!(check(&in_doubt, &invokes, &[(r1, 5), (r1, 12)], &log).0, 0);
+        assert_eq!(
+            check(
+                &in_doubt,
+                &invokes,
+                &[(r1, 5), (r1, 12)],
+                &BTreeSet::new(),
+                &log
+            )
+            .0,
+            0
+        );
         // Only the first submission, before the in-doubt answer: late.
-        assert_eq!(check(&in_doubt, &invokes, &[(r1, 5)], &log).0, 1);
+        assert_eq!(
+            check(&in_doubt, &invokes, &[(r1, 5)], &BTreeSet::new(), &log).0,
+            1
+        );
         // Another rid's resubmission exempts nothing.
-        assert_eq!(check(&in_doubt, &invokes, &[(r1, 5), (r2, 12)], &log).0, 1);
+        assert_eq!(
+            check(
+                &in_doubt,
+                &invokes,
+                &[(r1, 5), (r2, 12)],
+                &BTreeSet::new(),
+                &log
+            )
+            .0,
+            1
+        );
     }
 
     /// Plan 43 C2 (§7.1 item 6): a settled answer (`Abandoned`, to a client)

@@ -6538,6 +6538,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             ))
         })?;
         witness.observed_tentative += w.observed_tentative;
+        witness.observed_dropped += w.observed_dropped;
         witness.observers.extend(w.observers);
     }
     report.observed_tentative = witness.observed_tentative;
@@ -6551,10 +6552,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // the row, so a root change cannot overtake an acknowledged row.)
     super::history::check_session_order(&events, &tentative, &oracle.completed_at, &journal)
         .map_err(lin_context)?;
-    if strict_durability && witness.observed_tentative > 0 {
+    let observed_by_protocol = witness.observed_tentative - witness.observed_dropped;
+    if strict_durability && observed_by_protocol > 0 {
         return Err(lin_context(format!(
             "{} refusal(s) observed an acknowledged effect that was later rolled back              (impossible under a durable acknowledgement policy)",
-            witness.observed_tentative
+            observed_by_protocol
         )));
     }
     // The generic tester enforces the same contract: a refusal that

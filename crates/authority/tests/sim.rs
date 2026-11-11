@@ -6492,6 +6492,40 @@ fn the_resumed_span_control_fails_the_class_claim_seeds() {
     assert!(e.contains("claims a commit"), "seed {seed}: {e}");
 }
 
+/// Plan 46 M1.4 step 6c: what `repair drop-held` rolled back is the
+/// operator's action, not the protocol's. `flex-crash+durability` (7, 20: a
+/// refusal answered on the strength of a held op's effect that the drop then
+/// rolled back, unacknowledged; 249 of 2,000 seeds on main ac777325) and
+/// `flex-crash+settle` (1834: an in-doubt op the operator's drop replays
+/// after the client's later ops) failed on main by the oracles alone: the
+/// witnessed check counts a refusal the dropped ops explain on their own
+/// apart (`Witness::observed_dropped`), and I4's late landing exempts a
+/// dropped rid the log completes.
+#[test]
+fn an_operators_drop_held_is_not_a_protocol_violation_of_durability_or_settle() {
+    for (label, cfg, seed) in [
+        (
+            "flex-crash+durability",
+            config_variant(flex_crash_config(), "durability"),
+            7,
+        ),
+        (
+            "flex-crash+durability",
+            config_variant(flex_crash_config(), "durability"),
+            20,
+        ),
+        (
+            "flex-crash+settle",
+            config_variant(flex_crash_config(), "settle"),
+            1834,
+        ),
+    ] {
+        run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+        });
+    }
+}
+
 /// Re-pin helper for the two step-6a controls above: lists the seeds of
 /// `flex-tight+oracles` and `flex+commit` that pass as they are and, with the
 /// resumed tenure's span dropped, fail with the class claim (`control`); and

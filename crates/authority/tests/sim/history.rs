@@ -801,6 +801,25 @@ pub fn check_linearizable_witnessed(
         if explained {
             witness.observed_tentative += 1;
             witness.observers.insert(*rid);
+            // Whether the ops an operator's drop rolled back explain it
+            // alone (none of a deposition's): the operator's action, not
+            // the protocol's, took the effect it saw away.
+            let by_drop_alone = !by_drop.is_empty()
+                && by_drop.len() <= TENTATIVE_SUBSET_MAX
+                && (lo..=hi).any(|i| {
+                    (1u32..(1u32 << by_drop.len())).any(|mask| {
+                        let chain: Vec<&NsOp> = by_drop
+                            .iter()
+                            .enumerate()
+                            .filter(|(k, _)| mask & (1 << k) != 0)
+                            .map(|(_, (_, t))| *t)
+                            .collect();
+                        any_order(&chain, &states[i], op, ret)
+                    })
+                });
+            if by_drop_alone {
+                witness.observed_dropped += 1;
+            }
             continue;
         }
         let at = |i: usize| -> String {
@@ -875,6 +894,11 @@ pub struct Witness {
     /// Refusals explained only by an acked-then-rolled-back effect the
     /// refusing holder still had at the time (the L2 window).
     pub observed_tentative: usize,
+    /// Of them, the refusals the ops `repair drop-held` rolled back explain
+    /// on their own: the operator's action took the effect they saw away
+    /// (never acknowledged by the protocol's rule), so `strict_durability`
+    /// does not count them.
+    pub observed_dropped: usize,
     /// Their rids. The generic tester ([`check_linearizable`]) must treat
     /// them as tentative too: under `Local` their answer depended on an
     /// effect the log placed later (or never), exactly like the tentative
@@ -1226,7 +1250,17 @@ mod tests {
         )
         .expect("witnessed");
         assert_eq!(w.observed_tentative, 1);
+        // (Rolled back by a deposition, not an operator's drop: the
+        // protocol's, so `strict_durability` counts it.)
+        assert_eq!(w.observed_dropped, 0);
         assert!(w.observers.contains(&rid(2)));
+        // The same history with the effect rolled back by `repair
+        // drop-held`: the operator's action, not counted.
+        let dropped: HashSet<Rid> = [rid(1)].into_iter().collect();
+        let w =
+            check_linearizable_witnessed(&events, &tentative, &dropped, &log, &JournalOrder::new())
+                .expect("witnessed");
+        assert_eq!((w.observed_tentative, w.observed_dropped), (1, 1));
         assert!(check_linearizable(&events, &tentative).is_err());
         let in_flight: HashSet<Rid> = tentative.union(&w.observers).copied().collect();
         assert!(check_linearizable(&events, &in_flight).is_ok());
@@ -1272,7 +1306,7 @@ mod tests {
             &JournalOrder::new(),
         )
         .expect("explained by the first two tentative effects");
-        assert_eq!(w.observed_tentative, 1);
+        assert_eq!((w.observed_tentative, w.observed_dropped), (1, 1));
         // The same chain rolled back by anything else is not: a subset of
         // tentative ops explains a refusal only for the dropped ones, so a
         // refusal no state, no single tentative effect and not all of them
