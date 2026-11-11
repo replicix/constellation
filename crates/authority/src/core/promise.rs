@@ -1197,6 +1197,15 @@ impl Core {
         let Some((epoch, expires, true)) = self.pr.hold_ended else {
             return;
         };
+        // Only the carrier's own re-claim settles. A transferee that closed
+        // the hold never re-claims the carried lease, which is another
+        // node's by definition; its closed hold stands until that lease
+        // moves (`owner_closed`: the kept seal of its own takeover).
+        if !self.pr.carried.is_some_and(|c| {
+            c.node == self.cfg.node_id && (c.epoch, c.expires_unix_ms) == (epoch, expires)
+        }) {
+            return;
+        }
         let moved = self.lease.last_seen.as_ref().is_some_and(|l| {
             l.released
                 || l.holder != self.cfg.node_id
@@ -1377,6 +1386,25 @@ impl Core {
             && self.pr.carried.is_some_and(|c| {
                 c.node == self.cfg.node_id
                     && c.node == prev.holder
+                    && c.epoch == prev.epoch
+                    && c.expires_unix_ms == prev.expires_unix_ms
+            })
+    }
+
+    /// ADR-51: this node held the hold of the epoch that carried the lease
+    /// `prev` (the carrier's own, or one handed to it as a transferee) and
+    /// closed it. A hold is one node's at a time and ends at its owner's
+    /// close or handoff (`end_epoch_hold`), so no hold of the tenure stands
+    /// anywhere now: the members' open epochs wait only for this node's
+    /// claim to move the lease, and refuse its kept seal for nothing
+    /// (`locks-blips` seed 545: every member waited for the lease to move
+    /// and the transferee that closed waited for the members, 650 s).
+    pub(crate) fn owner_closed(&self, prev: &Lease) -> bool {
+        self.pr
+            .hold_ended
+            .is_some_and(|h| h == (prev.epoch, prev.expires_unix_ms, true))
+            && self.pr.carried.is_some_and(|c| {
+                c.node == prev.holder
                     && c.epoch == prev.epoch
                     && c.expires_unix_ms == prev.expires_unix_ms
             })

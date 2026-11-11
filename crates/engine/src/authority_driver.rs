@@ -3890,6 +3890,7 @@ impl Driver {
                 key,
                 kept,
                 tenure,
+                closed_hold,
                 reply,
             } => {
                 let req = self.control_id();
@@ -3904,6 +3905,7 @@ impl Driver {
                         key,
                         kept,
                         tenure,
+                        closed_hold,
                     },
                 }))
             }
@@ -5205,6 +5207,7 @@ impl Driver {
                 key,
                 kept,
                 tenure,
+                closed_hold,
             } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
@@ -5234,6 +5237,7 @@ impl Driver {
                         },
                         kept,
                         tenure,
+                        closed_hold,
                     };
                     let reply = tokio::time::timeout(
                         timeout,

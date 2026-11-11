@@ -493,6 +493,7 @@ pub enum SyncRequest {
         key: constellation_store_s3::RenewalKey,
         kept: bool,
         tenure: (u64, u64),
+        closed_hold: bool,
         reply: tokio::sync::oneshot::Sender<SealTailAnswer>,
     },
     /// Plan 30 §M11 phase 2b: the live write designations `(dir,

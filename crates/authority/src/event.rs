@@ -1210,6 +1210,10 @@ pub enum PeerMsg {
         /// ADR-51: the tenure `(holder, lease epoch)` a kept request is for
         /// (`(0, 0)` otherwise).
         tenure: (NodeId, Epoch),
+        /// ADR-51: the claimant held the epoch's hold of the tenure and
+        /// closed it (`Core::owner_closed`): no hold of it stands, so a
+        /// member's own open epoch is no reason to refuse the seal.
+        closed_hold: bool,
     },
     /// The answer, in batches of `backup_batch_rows` (`next`: ask again
     /// from there). `held: false`: this node holds no tail of `epoch` (it

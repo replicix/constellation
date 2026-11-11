@@ -246,7 +246,7 @@ impl Core {
         let key = prev.renewal_key();
         for (ti, t) in k.targets.iter().enumerate() {
             for e in t.epochs() {
-                match self.seal_kept_hold(t.tenure, e, &key, replica) {
+                match self.seal_kept_hold(t.tenure, e, &key, false, replica) {
                     KeptSeal::Held {
                         txs,
                         through,
@@ -382,6 +382,12 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let req = self.op_id();
+        let closed_hold = kept
+            && self
+                .bk
+                .kept
+                .as_ref()
+                .is_some_and(|k| self.owner_closed(&k.prev));
         let Some(k) = self.bk.kept.as_mut() else {
             return;
         };
@@ -401,6 +407,7 @@ impl Core {
                 key: k.prev.renewal_key(),
                 kept,
                 tenure,
+                closed_hold,
             },
         });
     }

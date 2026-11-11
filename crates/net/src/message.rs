@@ -873,6 +873,10 @@ pub enum Payload {
         kept: bool,
         /// ADR-51: the tenure `(holder, lease epoch)` a kept fetch is for.
         tenure: (u64, u64),
+        /// ADR-51: the claimant held the epoch's hold of this tenure and
+        /// closed it: no hold of the tenure stands anywhere, so a member's
+        /// open epoch is no refusal of the seal.
+        closed_hold: bool,
     },
     /// The member's answer: `txs` is postcard of `Vec<BackupTx>` (a batch
     /// of `backup_batch_rows`; `next`: ask again from there), `through`

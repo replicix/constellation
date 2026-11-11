@@ -53295,6 +53295,7 @@ mod c1_tail_fetch {
                 key,
                 kept: false,
                 tenure: (0, 0),
+                closed_hold: false,
             },
         })
     }
@@ -64886,6 +64887,18 @@ mod kept_member {
         tenure: (NodeId, Epoch),
         key: constellation_store_s3::RenewalKey,
     ) -> Vec<Action> {
+        kept_seal_from(h, from, epoch, tenure, key, false)
+    }
+
+    /// [`kept_seal`] from a claimant that says it closed the tenure's hold.
+    fn kept_seal_from(
+        h: &mut Harness,
+        from: NodeId,
+        epoch: Epoch,
+        tenure: (NodeId, Epoch),
+        key: constellation_store_s3::RenewalKey,
+        closed_hold: bool,
+    ) -> Vec<Action> {
         h.step(Event::Peer {
             from,
             msg: PeerMsg::SealTail {
@@ -64896,6 +64909,7 @@ mod kept_member {
                 key,
                 kept: true,
                 tenure,
+                closed_hold,
             },
         })
     }
@@ -65113,6 +65127,86 @@ mod kept_member {
         let (held, got, ..) = answer(&out).expect("answered");
         assert!(held);
         assert_eq!(got.len(), 2);
+    }
+
+    /// `locks-blips` seed 545 (also `locks-blips-tight-faults` 344, 1248,
+    /// 1356): the epoch's hold went to a transferee, which closed it and
+    /// claims the carried lease past its expiry. Every other member's epoch
+    /// stays open until that lease moves, so refusing the transferee's seal
+    /// for an open epoch left both waiting for the other, and a blocking
+    /// lock request went unanswered for 650 s. A claimant that closed the
+    /// hold says so (`closed_hold`): no hold of the tenure stands, the open
+    /// epoch is no live hold, and the member seals and answers.
+    #[test]
+    fn a_member_in_the_open_epoch_seals_for_the_claimant_that_closed_the_hold() {
+        let txs = owner_rows(2);
+        let mut h = member_with(&[1, 2, 3], (1, 1), &[(1, 1, &txs)]);
+        h.core.epoch.open = true;
+        h.core.pr.carried = Some(Carrier {
+            node: 1,
+            epoch: 1,
+            expires_unix_ms: 9,
+        });
+        let key = lease_of(1, 1, 0).renewal_key();
+        let out = kept_seal_from(&mut h, 3, 1, (1, 1), key, true);
+        let (held, got, _, sealed, refused) = answer(&out).expect("answered");
+        assert!(held && refused.is_none(), "{refused:?}");
+        assert_eq!(got.len(), 2);
+        assert!(!sealed.is_empty() || !Replica::sealed_tenures(&h.meta).unwrap().is_empty());
+        assert_eq!(h.core.stats.seal_kept_refused_epoch_open, 0);
+        // The epoch stays open here (it closes once the lease has moved).
+        assert!(h.core.epoch.open);
+    }
+
+    /// The claimant's side: it says `closed_hold` exactly when it closed the
+    /// hold of the carried lease it claims (as the carrier or a transferee),
+    /// and not when it handed the hold on, or the lease is another.
+    #[test]
+    fn a_claimant_reports_a_closed_hold_only_for_the_lease_its_epoch_carried() {
+        let mut h = Harness::new(3);
+        let prev = lease_of(1, 2, 7_000);
+        h.core.pr.carried = Some(Carrier {
+            node: 1,
+            epoch: 2,
+            expires_unix_ms: 7_000,
+        });
+        assert!(!h.core.owner_closed(&prev));
+        h.core.pr.hold_ended = Some((2, 7_000, false));
+        assert!(!h.core.owner_closed(&prev), "handed on, not closed");
+        h.core.pr.hold_ended = Some((2, 7_000, true));
+        assert!(h.core.owner_closed(&prev));
+        assert!(
+            !h.core.owner_closed(&lease_of(1, 2, 8_000)),
+            "another object"
+        );
+        assert!(
+            !h.core.owner_closed(&lease_of(1, 3, 7_000)),
+            "another lease epoch"
+        );
+        assert!(
+            !h.core.owner_closed(&lease_of(2, 2, 7_000)),
+            "another holder"
+        );
+        // The lease object stands as another node's, as it does for a
+        // transferee all along: the closed hold is not settled by that
+        // (it was, and the seal of the transferee's own takeover said
+        // nothing of it: `locks-blips` seed 545).
+        h.core.lease.note_object(&prev);
+        let mut out = Vec::new();
+        h.core.promise_after_event(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.pr.hold_ended, Some((2, 7_000, true)));
+        assert!(h.core.owner_closed(&prev));
+        // The carrier's own re-claim that moved on is settled.
+        let mut h = Harness::new(1);
+        h.core.pr.carried = Some(Carrier {
+            node: 1,
+            epoch: 2,
+            expires_unix_ms: 7_000,
+        });
+        h.core.pr.hold_ended = Some((2, 7_000, true));
+        h.core.lease.note_object(&lease_of(1, 3, 9_000));
+        h.core.promise_after_event(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.pr.hold_ended, Some((2, 7_000, false)));
     }
 
     /// M1 (stale key): a member that saw a renewal of the tenure's lease newer

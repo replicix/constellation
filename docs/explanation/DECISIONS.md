@@ -3982,7 +3982,13 @@ lease shape.
   that no live epoch holds the tenure `(H, E)`; the seal deposes what is left.
   A member whose own open epoch carries the tenure, or that saw a newer renewal
   than the claimant's key, refuses (`EpochOpen`, `StaleKey`) and seals
-  nothing; the attempt ends and the ops retry. Otherwise it persists the seal
+  nothing; the attempt ends and the ops retry, unless the claimant says it
+  held the epoch's hold of the tenure and closed it (`closed_hold`, from
+  `hold_ended` with the closed flag, kept for a transferee as well as the
+  carrier): a hold is one node's at a time, so none stands and the open epoch
+  waits only for that claim to move the lease (`locks-blips` seed 545: the
+  members waited for the lease to move and the transferee for the members).
+  Otherwise it persists the seal
   of the tenure `(H, E)` (`Meta::sealed_tenures`): it refuses a batch that is
   `H`'s stream of epoch `E`, and a hold batch received in an open epoch
   whose carried lease is a sealed tenure that has not moved (the transferee's
