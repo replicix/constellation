@@ -1204,7 +1204,7 @@ fn regression_resubmitted_rid_withdraws_its_batch() {
 /// re-pins). 10247 stays as a convergence seed; 10476 is pinned above.
 /// Plan 30 M7: log streams shift every schedule again; on this tree
 /// 10981 and 11066 reach the multi-batch withdraw (re-pinned with the
-/// helper over 10000–11999).
+/// helper over 10000–11999). Not a detector: see the comments in the body.
 #[test]
 fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
     use pinned::run_seed;
@@ -1227,9 +1227,18 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
     // 10794 included. The guard is the core test
     // `every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward`.)
     // The settle's tombstones written beside it, a freshness bound late,
-    // moved them again: over 10000-13999 the finder gives 10794 and 11298
+    // moved them again: over 10000-13999 the finder gave 10794 and 11298
     // twice each, and 13997 once.
-    for seed in [10794, 11298] {
+    // Kept rows v2 (ADR-51) and step 10 (ADR-50) moved them once more: over
+    // 10000-29999 the finder gives 13997, 16329 and 25521 (twice each) and
+    // eight more once. These seeds REACH the multi-batch withdraw; they do
+    // not detect its absence. No seed of the long configuration discriminates
+    // (with the forward, or the settle, withdrawing only the newest batch,
+    // none of them fails): the guard is the core test
+    // `every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward`, and this
+    // test only keeps the path exercised end to end (that it is reached and
+    // the run converges).
+    for seed in [13997, 16329] {
         let report = run_seed(seed, long_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let multi: u64 = report
             .stats
@@ -1248,10 +1257,11 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
 /// settle's first window, so its tombstone cannot be written and the settle
 /// goes on by P2P alone; the `EIO` it ends in (and any later landing of the
 /// op) is `isolated-from-s3`: allowed, and counted apart from the
-/// reachability classes. Seed 41 of `long-backup` with S3 cut at node 2 over
-/// 5–21 s and slow lease reads tells one (twice); without the label it is an
-/// I4 violation. (Seeds 207, 263, 271, 358 and 408 do the same; seed 393
-/// did, before the tombstones were written beside the settle.)
+/// reachability classes. Seed 271 of `long-backup` with S3 cut at node 2 over
+/// 5–21 s and slow lease reads tells two (labelled twice); without the label
+/// it is an I4 violation. (Seeds 317, 412 and 467 do the same on this tree;
+/// `find_failed_tombstone_seeds` re-pins over a schedule change. Seed 41,
+/// pinned before kept rows v2, no longer gives up a tombstone.)
 #[test]
 fn a_failed_tombstone_with_s3_cut_is_labelled_isolated_from_s3() {
     let mut cfg = config_variant(base_config("long-backup"), "cuts32@5000:16000");
@@ -1259,7 +1269,7 @@ fn a_failed_tombstone_with_s3_cut_is_labelled_isolated_from_s3() {
         before: (0, 0),
         reply: (800, 1_000),
     };
-    let r = run_seed(41, cfg).unwrap_or_else(|e| panic!("seed 41: {e}"));
+    let r = run_seed(271, cfg).unwrap_or_else(|e| panic!("seed 271: {e}"));
     let failed: u64 = r.stats.values().map(|s| s.settle_withdraw_failed).sum();
     assert!(failed >= 1, "no settle gave up its tombstone ({failed})");
     assert!(
@@ -1305,6 +1315,39 @@ fn find_multi_batch_withdraw_seeds() {
                 "failing seed {seed}: {}",
                 e.lines().next().unwrap_or_default()
             ),
+        }
+    }
+}
+
+/// Re-pin helper for `a_failed_tombstone_with_s3_cut_is_labelled_isolated_from_s3`:
+/// lists the seeds of its configuration whose settle gives up a tombstone
+/// and whose `EIO` is labelled `isolated-from-s3`.
+/// `AUTHORITY_SIM_START`/`AUTHORITY_SIM_SEEDS` as for `long_random`.
+#[test]
+#[ignore]
+fn find_failed_tombstone_seeds() {
+    let start: u64 = std::env::var("AUTHORITY_SIM_START")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let seeds: u64 = std::env::var("AUTHORITY_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
+    for seed in start..start + seeds {
+        let mut cfg = config_variant(base_config("long-backup"), "cuts32@5000:16000");
+        cfg.lease_reads = sim::store::SlowReads {
+            before: (0, 0),
+            reply: (800, 1_000),
+        };
+        if let Ok(r) = run_seed(seed, cfg) {
+            let failed: u64 = r.stats.values().map(|s| s.settle_withdraw_failed).sum();
+            if failed >= 1 && r.unsettled_isolated_from_s3 >= 1 {
+                eprintln!(
+                    "failed tombstone: seed {seed} ({failed}, labelled {})",
+                    r.unsettled_isolated_from_s3
+                );
+            }
         }
     }
 }
