@@ -1930,7 +1930,15 @@ impl Core {
             .iter()
             .filter(|(g, _)| !live_mine.contains(g))
             .filter(|(g, d)| {
-                !((d.non_stealable || d.remnant) && d.release.is_some() && streams_mine.contains(g))
+                // A release row the log holds already (this node shipped
+                // it in its own segment, or a takeover re-appended it) is
+                // nothing to wait for: the stream never sends it, so it
+                // would never be acknowledged either.
+                let unlogged = d
+                    .release
+                    .as_ref()
+                    .is_some_and(|r| r.row.is_none_or(|row| replica.log_stream_idx(**g) < row));
+                !((d.non_stealable || d.remnant) && unlogged && streams_mine.contains(g))
             })
             .map(|(g, _)| *g)
             .collect();

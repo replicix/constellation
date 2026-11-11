@@ -1670,8 +1670,8 @@ fn strand_local_tx(
     // `log_stream_idx`) or a re-stream from here must start below it, or
     // the row never reaches the log (locks-unlinked-delegated-dcrash-
     // pause seed 558, pinned: the rebuilt, re-elected root skipped rows
-    // 7..9 of generation 2). A delegate's own row was never counted
-    // there and is left alone. Whatever order a generation's rows strand
+    // 7..9 of generation 2). A delegate's own row still in the
+    // journal sits above the index and is left alone. Whatever order a generation's rows strand
     // in, the lowest of them sets the index. As `forget_recent` below, the
     // session side is in memory: a failed commit leaves it lower than the
     // store, which only makes a wait, never an early execution.
@@ -3621,8 +3621,9 @@ pub(crate) fn retire_local_tx(
         local::remove_journal_origin(tx, meta, row.gen, row.idx, *first);
         // A row of a delegation generation that this node shipped itself
         // (a delegate that took the root over and shipped the rows it had
-        // journaled as a delegate, or a root's own append of a delegate's
-        // row) is in the log from here on. Every other replica counts it at
+        // journaled as a delegate; a root's own append of a delegate's row
+        // is counted at the append, and the raise below is a no-op for it)
+        // is in the log from here on. Every other replica counts it at
         // the segment it applies (`apply_segment_rows`), and this node, which
         // applies no segment of its own, counts it here: its `deps` checks
         // read the log's index of the generation, and a row of a later
