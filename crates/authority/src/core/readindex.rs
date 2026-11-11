@@ -2297,8 +2297,8 @@ impl Core {
             });
             // Plan 43 C2f review (§5.2, Q3): another node's answer released by
             // a continuation epoch's hold (the only way one leaves with the
-            // gate off before the log carries it) is the hold's: non-stealable
-            // and uncommitted, its row re-tagged so (never `Lone`): what a
+            // gate off before the log carries it) is the hold's (a one-member
+            // hold's, or the knob's): uncommitted, its row re-tagged so (never `Lone`): what a
             // deposition or `repair drop-held` does with the row then follows
             // the answer, which was given.
             let held_for_remote = unarchived && p.what.to_remote(self.cfg.node_id);

@@ -56559,13 +56559,15 @@ mod c2f_lone_root {
         assert_eq!(classes_of(&h, forwarded(3)), vec![RowCommit::ARCHIVE]);
     }
 
-    /// The maintainer's answer to C2f's first question: a non-stealable
-    /// answer stays uncommitted, and the requester counts its shadow apart —
-    /// in an open continuation epoch the answer is the hold owner's — so
-    /// only another sequencer's uncommitted answer is the one `strict_commit`
-    /// fails on. Fails on the parent: one counter for both.
+    /// Plan 46 M1.4 step 5: an uncommitted answer a node gets while its own
+    /// epoch is open is no non-stealable shadow whoever gave it (a hold with
+    /// two members or more answers committed): it is counted as an
+    /// `ungated_shadows` answer outside the commit rule, and a takeover of
+    /// its epoch strands it like any uncommitted one. Fails on the parent:
+    /// the open epoch labelled it non-stealable (counted apart, and not
+    /// stranded by the takeover).
     #[test]
-    fn a_non_stealable_sequencers_uncommitted_shadow_is_counted_apart() {
+    fn an_uncommitted_answer_in_an_open_epoch_is_no_non_stealable_shadow() {
         for in_epoch in [true, false] {
             let (mut holder, mut requester) = pair();
             requester.core.epoch.open = in_epoch;

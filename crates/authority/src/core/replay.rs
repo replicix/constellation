@@ -202,7 +202,7 @@ impl Core {
             }
         }
         // Plan 46 M0.2 review (R7): a requester's shadow of a non-stealable
-        // answer lives until the rid's outcome reaches the log; if its
+        // answer (a designee's or a sticky holder's) lives until the rid's outcome reaches the log; if its
         // owner's row never does, it is rolled back and replayed after the
         // bound (`drop_held_await_ms`).
         if replica.has_outstanding_speculation() {

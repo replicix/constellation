@@ -143,7 +143,7 @@ pub trait Replica {
     /// re-ship.
     ///
     /// Plan 46 M0.2 (R7): `non_stealable`: the answer was a non-stealable
-    /// sequencer's (an epoch's hold owner, a designee), uncommitted by
+    /// sequencer's (a designee or a sticky holder), uncommitted by
     /// design: the shadow is not stranded by an epoch, and retires by the
     /// rid's outcome from the log.
     #[allow(clippy::too_many_arguments)]
