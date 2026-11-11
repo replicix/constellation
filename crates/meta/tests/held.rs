@@ -1062,6 +1062,72 @@ fn drop_held_keeps_dependents_in_journal_order() {
     assert!(!meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "unrelated".into())]));
 }
 
+/// ADR-59: the drop names which of the rows it rolled back depend on the
+/// damaged inode's own keys (`rolled_back_on_inode`): an exclusive write of
+/// the file or of a name it took. A row that depends on the seed only
+/// through a merged directory attribute (here, an explicit utimes of the
+/// directory the held rename merged) is rolled back too, and is not listed:
+/// the sim's oracle fails an acknowledged one. The conservative control
+/// attributes nothing to the inode.
+#[test]
+fn drop_held_names_the_rolled_back_rows_that_depend_on_the_damaged_inode() {
+    use constellation_meta::RowCommit;
+    let lone = RowCommit::LONE;
+    let rename = MutateOp::Rename {
+        parent: ROOT_INO,
+        name: "broken".into(),
+        new_parent: ROOT_INO,
+        new_name: "moved".into(),
+        noreplace: false,
+    };
+    let utimes_of_root = MutateOp::Setattr {
+        ino: ROOT_INO,
+        mode: None,
+        uid: None,
+        gid: None,
+        size: None,
+        atime_ns: None,
+        mtime_ns: Some(5),
+    };
+    let build = || {
+        let (meta, broken) = node_one_with_a_seed();
+        exec_as(&meta, lone, rid_of(1, 5), &chmod(broken, 0o600));
+        exec_as(&meta, lone, rid_of(1, 6), &rename);
+        exec_as(&meta, lone, rid_of(1, 7), &utimes_of_root);
+        // (A later chmod of the renamed file: on the inode again.)
+        exec_as(&meta, lone, rid_of(1, 8), &chmod(broken, 0o640));
+        (meta, broken)
+    };
+    let (meta, broken) = build();
+    let dropped = meta.drop_held(broken, 1).unwrap();
+    let mut rolled = dropped.rolled_back.clone();
+    rolled.sort();
+    for seq in [5, 6, 7, 8] {
+        assert!(rolled.contains(&rid_of(1, seq)), "{seq}: {dropped:?}");
+    }
+    let mut on_inode = dropped.rolled_back_on_inode.clone();
+    on_inode.sort();
+    assert!(!dropped.non_sequencer);
+    assert!(on_inode.contains(&rid_of(1, 5)), "{dropped:?}");
+    assert!(on_inode.contains(&rid_of(1, 6)), "{dropped:?}");
+    assert!(on_inode.contains(&rid_of(1, 8)), "{dropped:?}");
+    assert!(
+        !on_inode.contains(&rid_of(1, 7)),
+        "the directory's utimes depends on the seed through a merge only: {dropped:?}"
+    );
+    // The control: nothing but the seed is attributed to the inode.
+    let (meta, broken) = build();
+    meta.set_parent_taint_conservative(true);
+    let dropped = meta.drop_held(broken, 1).unwrap();
+    assert!(
+        dropped
+            .rolled_back_on_inode
+            .iter()
+            .all(|r| ![5, 6, 7, 8].iter().any(|s| *r == rid_of(1, *s))),
+        "{dropped:?}"
+    );
+}
+
 /// Review item 8: the queue is decoded once per generation of the queue,
 /// and every change to it — an entry queued, refused, marked, forgotten —
 /// is a new generation.
