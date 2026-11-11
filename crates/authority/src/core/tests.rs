@@ -63361,6 +63361,101 @@ mod hold_ack {
             );
         }
     }
+
+    /// `flex-tight+oracles` seed 675: the label of an answer on a row an
+    /// ended hold left is the rule that commits it, on the own and the
+    /// remote path alike, and the row keeps its tag. The group of the
+    /// configuration in force holds the row: the row's own class (the group
+    /// stands behind it, and `park_durable` lets the answer leave on it).
+    /// It does not: the answer is archive-bound and waits for the archive,
+    /// and one that parked so and leaves by the group (a new hold's) names
+    /// the row's class as it leaves, never the archive's.
+    #[test]
+    fn a_row_an_ended_hold_left_is_labelled_by_the_rule_that_commits_it() {
+        use crate::core::Asker;
+        use constellation_meta::{GroupOn, RowCommit};
+        for remote in [false, true] {
+            let mut h = owner(0);
+            h.core.pr.epoch_members = vec![1, 2];
+            let (rid, out) = create_nowait(&mut h, 1, "left");
+            assert!(!accepted_to_client(&out, rid), "{out:?}");
+            h.core.pr.epoch_members = vec![1];
+            h.core.lease.release_local();
+            h.hold(1, None);
+            {
+                let (l, _) = h.core.lease.held.as_mut().expect("held");
+                l.backups = vec![2];
+                l.ack_policy = constellation_store_s3::AckPolicy::Backup;
+                l.singleton = false;
+            }
+            let (now, mut out) = (h.clk(), Vec::new());
+            h.core.backup_after_event(now, &h.meta, &mut out);
+            assert!(!h.core.lease.epoch_held());
+            let (first, tag) = Replica::journal_class_of_rid(&h.meta, rid).unwrap();
+            assert!(tag.is_hold(), "{tag:?}");
+            assert!(h.core.left_by_hold(first));
+            let asker = if remote { Asker::Remote } else { Asker::Own };
+            let label = |h: &Harness| {
+                h.core
+                    .journaled_answer_class_for(&h.meta, rid, asker)
+                    .unwrap()
+            };
+            let is_archive = |c: RowCommit| {
+                matches!(
+                    c,
+                    RowCommit::Group {
+                        on: GroupOn::Archive,
+                        ..
+                    }
+                )
+            };
+            // Nobody holds the row but this disk: it waits for the archive.
+            assert!(!h.core.park_durable(first, remote, 0));
+            assert!(is_archive(label(&h)), "remote {remote}: {:?}", label(&h));
+            // A parked answer the archive releases keeps the label; one the
+            // group releases names the row's class.
+            let parked = label(&h);
+            h.core.ack.shipped_through = first;
+            assert!(is_archive(h.core.released_label(&h.meta, rid, parked, 0)));
+            h.core.ack.shipped_through = 0;
+            // The group holds the row now: it commits the answer.
+            let mut peer = h.core.ack.peers.values().next().cloned();
+            if peer.is_none() {
+                let now = w(h.now);
+                peer = Some(crate::core::backup::BackupPeer {
+                    candidacy: 0,
+                    alive_at: now,
+                    short_since_progress: false,
+                    short_since: now,
+                    unreachable: false,
+                    answered: true,
+                    acked: first,
+                    listed_at: Some(0),
+                    counted: first,
+                    sent_through: first,
+                    inflight: Default::default(),
+                    last_sent: now,
+                    last_progress: now,
+                    committed: true,
+                });
+            }
+            let mut peer = peer.unwrap();
+            peer.counted = first;
+            peer.acked = first;
+            h.core.ack.peers.insert(2, peer);
+            h.core.ack.reconfig = None;
+            h.core.lease.reconfig_doubt = None;
+            assert!(h.core.park_durable(first, remote, 0), "remote {remote}");
+            let class = label(&h);
+            assert_eq!(class, tag, "remote {remote}: {class:?}");
+            assert_eq!(h.core.released_label(&h.meta, rid, parked, 0), tag);
+            // The tag was not touched.
+            assert_eq!(
+                Replica::journal_class_of_rid(&h.meta, rid).map(|(_, c)| c),
+                Some(tag)
+            );
+        }
+    }
 }
 
 /// ADR-51: a takeover collects the committed rows the members of the tenure

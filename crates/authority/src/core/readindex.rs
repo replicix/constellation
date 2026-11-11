@@ -2440,6 +2440,8 @@ impl Core {
                         class.as_singleton(self.root_config_version())
                     } else if held_for_remote {
                         constellation_meta::RowCommit::FINAL
+                    } else if p.durable.is_some() {
+                        self.released_label(replica, rid, class, shipped)
                     } else {
                         class
                     };
@@ -2486,6 +2488,8 @@ impl Core {
                         constellation_meta::RowCommit::ARCHIVE
                     } else if downgraded {
                         class.as_singleton(self.root_config_version())
+                    } else if p.durable.is_some() {
+                        self.released_label(replica, rid, class, shipped)
                     } else {
                         class
                     }),

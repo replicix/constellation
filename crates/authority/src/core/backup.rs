@@ -2341,7 +2341,7 @@ impl Core {
                         config_version: self.root_config_version(),
                     }
                 } else {
-                    constellation_meta::RowCommit::as_archive(class, self.root_config_version())
+                    self.ended_hold_label(first, class, false)
                 }
             }
             Some((_, class)) if class.is_final() || class.is_hold() => class,
@@ -2365,6 +2365,58 @@ impl Core {
                 },
             )) => self.root_commit(Asker::Own),
         })
+    }
+
+    /// The label of an answer on the row `first` of an ended hold (tagged
+    /// `class`, `Hold` or `Final`), which the row's tag is not changed to
+    /// (a deposition keeps the hold's rows; an archive tag would let it drop
+    /// the only copy of an answered row): the rule that commits the answer
+    /// as [`Self::park_durable`] decides it now. The group of the
+    /// configuration in force already holds the row: the row's own class,
+    /// which that group stands behind. Otherwise the answer waits for the
+    /// archive, labelled so; if the group comes to hold the row while it
+    /// waits, it leaves with the row's class ([`Self::released_label`]).
+    /// `remote`: the answer goes to another node.
+    pub(crate) fn ended_hold_label(
+        &self,
+        first: u64,
+        class: constellation_meta::RowCommit,
+        remote: bool,
+    ) -> constellation_meta::RowCommit {
+        if !self.archive_covers(first, 0)
+            && self.durable_jseq() != u64::MAX
+            && self.park_durable(first, remote, 0)
+        {
+            class
+        } else {
+            constellation_meta::RowCommit::as_archive(class, self.root_config_version())
+        }
+    }
+
+    /// The label of a parked answer labelled `class` as it leaves: the
+    /// archive-bound label of a row an ended hold left
+    /// ([`Self::ended_hold_label`]) stays only while the archive is what
+    /// carries the row; released by the group instead, the answer names
+    /// the row's tag (no tag is changed, and a label never says archive
+    /// for an answer the archive did not release).
+    pub(crate) fn released_label(
+        &self,
+        replica: &dyn Replica,
+        rid: Rid,
+        class: constellation_meta::RowCommit,
+        shipped: u64,
+    ) -> constellation_meta::RowCommit {
+        if !class.is_archive() {
+            return class;
+        }
+        match replica.journal_class_of_rid(rid) {
+            Some((first, tag))
+                if (tag.is_final() || tag.is_hold()) && !self.archive_covers(first, shipped) =>
+            {
+                tag
+            }
+            _ => class,
+        }
     }
 
     /// Plan 43 C2 (§5.1): [`Self::journaled_answer_class`] for an answer to
@@ -2444,8 +2496,8 @@ impl Core {
             // held back behind a dead member's chunk, answered at a retry
             // after the hold as the hold's).
             Some((_, class)) if class.is_final() && self.lease.epoch_held() => class,
-            Some((_, class)) if class.is_final() || class.is_hold() => {
-                class.as_archive(self.root_config_version())
+            Some((first, class)) if class.is_final() || class.is_hold() => {
+                self.ended_hold_label(first, class, true)
             }
             Some((
                 _,
