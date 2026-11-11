@@ -43002,6 +43002,12 @@ fn a_lost_fast_path_write_resubmitted_in_doubt_is_decided_once_across_a_takeover
 fn a_timed_out_fast_path_write_resubmitted_in_doubt_while_holding_is_answered_from_completed() {
     let mut h = Harness::new(1);
     h.hold(1, None);
+    // (An event runs first, as the lease's adoption does: the tenure starts
+    // before the fast path journals a row.)
+    h.step(Event::Activity {
+        last_write: WaitMs(0),
+        acked_seqs: Vec::new(),
+    });
     let rx = h.rid(1);
     let x = h.create("x");
     constellation_meta::execute_mutate(&h.meta, &x, Some(rx)).unwrap();
@@ -60989,9 +60995,36 @@ mod await_retry {
         );
     }
 
-    /// R7 (variant 3 (i)): the requester's shadow of a non-stealable
-    /// sequencer's uncommitted answer — here an open continuation epoch's
-    /// hold owner — is not stranded by another node's takeover (a tailed
+    /// A designation of generation `gen` is in `h`'s delegation table (applied
+    /// from a segment of the log): its answers are non-stealable.
+    fn designate(h: &mut Harness, gen: u64) {
+        let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "nsd".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::delegate_one(2, gen, dir, constellation_meta::SubtreeKind::Designated),
+            ],
+        )
+        .unwrap();
+    }
+
+    /// R7 (variant 3 (i), narrowed by plan 46 M1.4 step 5): the requester's
+    /// shadow of a non-stealable sequencer's uncommitted answer — here a
+    /// designee's — is not stranded by another node's takeover (a tailed
     /// segment of a later epoch) into this node's own queue: the owner's
     /// queue is the one copy, and the shadow retires by the rid's
     /// `Completed` from the log. Any other uncommitted shadow is stranded
@@ -61003,7 +61036,9 @@ mod await_retry {
     fn a_non_stealable_shadow_is_not_stranded_by_an_epoch() {
         for non_stealable in [true, false] {
             let (mut holder, mut requester) = pair();
-            requester.core.epoch.open = non_stealable;
+            if non_stealable {
+                designate(&mut requester, 7);
+            }
             let rid = requester.rid(1);
             let out = requester.step(Event::Submit {
                 policy: Policy::Client,
@@ -61026,7 +61061,12 @@ mod await_retry {
                 .1
                 .clone();
             match &mut reply {
-                PeerMsg::MutateReply { committed, .. } => *committed = false,
+                PeerMsg::MutateReply { committed, gen, .. } => {
+                    *committed = false;
+                    if non_stealable {
+                        *gen = 7;
+                    }
+                }
                 other => panic!("{other:?}"),
             }
             requester.step(Event::Peer {
@@ -61065,7 +61105,7 @@ mod await_retry {
         }
         // And the log carries it: the shadow retires.
         let (mut holder, mut requester) = pair();
-        requester.core.epoch.open = true;
+        designate(&mut requester, 7);
         let rid = requester.rid(1);
         let out = requester.step(Event::Submit {
             policy: Policy::Client,
@@ -61089,6 +61129,7 @@ mod await_retry {
             .clone();
         let PeerMsg::MutateReply {
             committed,
+            gen,
             outcome: MutateOutcome::Accepted { records, .. },
             ..
         } = &mut reply
@@ -61096,6 +61137,7 @@ mod await_retry {
             panic!("{reply:?}")
         };
         *committed = false;
+        *gen = 7;
         let records = records.clone();
         requester.step(Event::Peer {
             from: 1,
@@ -61474,7 +61516,7 @@ mod await_retry {
     #[test]
     fn a_non_stealable_shadow_is_stranded_after_the_bound() {
         let (mut holder, mut requester) = pair();
-        requester.core.epoch.open = true;
+        designate(&mut requester, 7);
         let rid = requester.rid(1);
         let out = requester.step(Event::Submit {
             policy: Policy::Client,
@@ -61496,8 +61538,9 @@ mod await_retry {
             .expect("a reply")
             .1
             .clone();
-        if let PeerMsg::MutateReply { committed, .. } = &mut reply {
+        if let PeerMsg::MutateReply { committed, gen, .. } = &mut reply {
             *committed = false;
+            *gen = 7;
         }
         requester.step(Event::Peer {
             from: 1,
