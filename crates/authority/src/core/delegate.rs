@@ -198,11 +198,6 @@ pub(crate) struct GenState {
     /// Placement: since when the delegate's share has been below the
     /// leave threshold (`None`: it is not).
     pub below_since: Option<WaitMs>,
-    /// Plan 46 M1.2 step 13 (review): since when the link to the delegate
-    /// has measured out of the backup RTT budget (`None`: it has not). A
-    /// placed grant is recalled for it only once the measurement persists
-    /// for a placement tick.
-    pub far_since: Option<WaitMs>,
     /// Plan 43 C2e (§3.7): the seals asked of the group's members, by request
     /// id: `(member, strict)`. A *strict* member is one of the latest
     /// `DelegateNodeGroup` version (the end waits for one of them); a best-effort
@@ -2271,7 +2266,31 @@ impl Core {
             self.deleg_install_waits_settle(now, &waiting_now);
         }
         if !self.dl.epoch_active {
-            self.dl.commit_waiting.retain(|g, _| commit_now.contains(g));
+            // Plan 46 M1.3 step 7: the first-op wait of a grant whose record
+            // is committed now and which this node installed: the time the
+            // holder's ops were parked for the archive.
+            let mut waited = Vec::new();
+            self.dl.commit_waiting.retain(|g, since| {
+                let keep = commit_now.contains(g);
+                if !keep {
+                    waited.push((*g, now.wait.since(*since).max(0) as u64));
+                }
+                keep
+            });
+            for (g, ms) in waited {
+                if self.dl.mine.contains_key(&g) {
+                    self.stats.deleg_commit_waits += 1;
+                    self.stats.deleg_commit_wait_ms_sum += ms;
+                    self.stats.deleg_commit_wait_ms_max =
+                        self.stats.deleg_commit_wait_ms_max.max(ms);
+                    tracing::debug!(
+                        node = self.me(),
+                        gen = %constellation_meta::delegation::GenLabel::of(g),
+                        ms,
+                        "a delegation's first ops waited for its record's archive"
+                    );
+                }
+            }
         }
         if retry && self.dl.install_retry.is_none() {
             let t = self.set_timer_wait(
@@ -2375,7 +2394,6 @@ impl Core {
                         grown_at: None,
                         gate_recalled: false,
                         below_since: None,
-                        far_since: None,
                         seal_reqs: BTreeMap::new(),
                         sealed_tail: None,
                         waiting_for_group: false,
@@ -9163,7 +9181,7 @@ impl Core {
     /// the subtrees run (the table of this replica forgot them with the
     /// rows).
     #[allow(clippy::too_many_arguments)]
-    fn root_release_appended(
+    pub(crate) fn root_release_appended(
         &mut self,
         now: Now,
         gen: u64,
@@ -9173,6 +9191,22 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // Plan 46 M1.3 step 7 (D-e): the holder's own release of a sticky
+        // subtree (a release row, no recall under way) keeps the placement
+        // from granting it straight back to that node on the window's old
+        // counts. (`kind()` is read before the dirs leave the stream.)
+        if let Some(g) = self.dl.gens.get(&gen) {
+            if !g.ended
+                && cut.is_none()
+                && g.recall == RecallPhase::None
+                && g.kind() == DelegKind::Sticky
+            {
+                let until = now.wait.plus(self.cfg.placement_window_ms);
+                for dir in dirs {
+                    self.pl.released.insert(*dir, (g.node, until));
+                }
+            }
+        }
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return;
         };
@@ -11391,7 +11425,7 @@ impl Core {
         // or designated one is final and needs none. A far writer's ops are
         // forwarded to the root.
         if !kind.non_stealable() && !self.delegate_group_in_budget(node) {
-            self.stats.place_skipped_far += 1;
+            self.stats.delegate_refused_far += 1;
             return Err(format!(
                 "node {node} has no peer within the backup RTT budget ({} ms), the root \
                  included; its ops are forwarded (a sticky grant answers there: \
@@ -11618,7 +11652,6 @@ impl Core {
                 grown_at: None,
                 gate_recalled: false,
                 below_since: None,
-                far_since: None,
                 seal_reqs: BTreeMap::new(),
                 sealed_tail: None,
                 waiting_for_group: false,
@@ -13374,7 +13407,7 @@ fn kind_of(k: SubtreeKind) -> DelegKind {
 }
 
 /// Whether `dir` is `ancestor` or under it.
-fn is_under(
+pub(crate) fn is_under(
     ns: &dyn constellation_meta::delegation::Namespace,
     mut dir: Ino,
     ancestor: Ino,

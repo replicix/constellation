@@ -14,13 +14,25 @@
 //!   walk goes from each dominated directory towards the root while the
 //!   condition still holds, so one delegation covers a writer's whole
 //!   working set rather than a swarm of leaves.
-//! - **Recall** a placed generation when, for a whole dwell
-//!   (`placement_dwell_ms`), the delegate's share of its subtree stayed
-//!   below `placement_leave_pct` (hysteresis: enter at 70 %, leave at
-//!   50 %) or the subtree's rate stayed below half the floor. A
-//!   recall for a cross-subtree op is not a placement decision and does
-//!   not reset the dwell. Manual delegations and designations are never
-//!   recalled here.
+//! - **Grant a far writer a sticky subtree** (plan 46 M1.3 step 7,
+//!   ADR-54). A writer with no peer within the backup RTT budget (the
+//!   root included) cannot be given a placed grant (its answers would
+//!   wait for no group); it gets a *sticky* one, whose answers are final,
+//!   once its link has measured far (`placement_far_rtt_ms`, every
+//!   sample of `placement_far_dwell_ms`). Between the budget and that
+//!   test lies the dead band: the node stays forwarded. At a budget of 0
+//!   no group can ever exist, so every connected eligible writer is far.
+//!   [`Core::place_kind_for`] picks the kind.
+//! - **Recall** a placed generation (never a manual, sticky or
+//!   designated one) for two reasons only. (1) The long dwell: for a
+//!   whole dwell (`placement_dwell_ms`, 5 minutes) the delegate's share of
+//!   its subtree stayed below `placement_leave_pct` (hysteresis: enter at
+//!   70 %, leave at 50 %) or the subtree's rate stayed below half the
+//!   floor. A recall for a cross-subtree op is not a placement decision
+//!   and does not reset the dwell. (2) Conversion: the node is measured
+//!   far and has no recorded backup; the recall carries no cooldown, so
+//!   the next round grants it a sticky subtree. A sticky grant ends only
+//!   by its holder (step 5's release) or an operator.
 //! - **Cool down** a recalled directory for `placement_cooldown_ms`
 //!   before it can be placed again, so it never ping-pongs
 //!   between two writers.
@@ -53,13 +65,39 @@ pub(crate) struct PlacementState {
     buckets: VecDeque<Bucket>,
     cur: Bucket,
     /// Directories recalled by placement: not placed again before this.
-    cooldown: BTreeMap<Ino, WaitMs>,
+    pub(crate) cooldown: BTreeMap<Ino, WaitMs>,
     pub timer: Option<crate::ids::TimerId>,
     /// The last evaluation's top subtrees, `(dir, node, node_ops,
     /// subtree_ops)`, for `status`.
     pub top: Vec<(Ino, NodeId, u64, u64)>,
     /// When a candidate outside the roster last had it re-read.
     roster_refreshed: Option<WaitMs>,
+    /// Plan 46 M1.3 step 7: the links whose every sample since `since` was
+    /// at least the far round trip (see [`Core::note_rtt_samples`]).
+    pub(crate) far: BTreeMap<NodeId, FarTrack>,
+    /// Plan 46 M1.3 step 7 (D-e): a sticky subtree its holder released on
+    /// its own, `dir -> (holder, until)`: the window still counts the
+    /// holder's earlier ops, so the holder is not granted it again before
+    /// the window has turned over. Other nodes are not held back.
+    pub(crate) released: BTreeMap<Ino, (NodeId, WaitMs)>,
+}
+
+/// Since when a link has measured far, and its lowest sample.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FarTrack {
+    pub since: WaitMs,
+}
+
+/// Why [`Core::place_kind_for`] grants nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlaceSkip {
+    /// No group within budget, and not (robustly) far: forwarded.
+    Far,
+    /// A designated stream or a pending designation, or a sticky stream
+    /// with the node near: nothing joins it.
+    NonStealable,
+    /// The root's own subtrees (step 9).
+    Root,
 }
 
 /// How often a candidate the roster does not list has it re-read.
@@ -203,6 +241,7 @@ impl Core {
         if !self.root_usable(now) || self.dl.epoch_active || self.epoch.open {
             // Not the root any more: the counts are meaningless.
             self.pl.buckets.clear();
+            self.pl.far.clear();
             return;
         }
         self.place_arm(now, out);
@@ -286,6 +325,32 @@ impl Core {
     /// far link must hold before a placed grant is recalled.
     pub(crate) fn note_rtt_samples(&mut self, at: WaitMs, links: &[PeerLink]) {
         let window = self.placement_tick_ms() as i64;
+        // Plan 46 M1.3 step 7 (D-b): the far state of a link. Only while the
+        // placement tick runs (this node is the root): a new root measures
+        // again before its first sticky grant. Load only inflates a round
+        // trip, so one low sample (or a break) is proof of nearness and
+        // ends the state.
+        if self.pl.timer.is_some() {
+            let far_rtt = self
+                .cfg
+                .placement_far_rtt_ms
+                .max(self.cfg.backup_rtt_budget_ms + 1);
+            self.pl
+                .far
+                .retain(|n, _| links.iter().any(|l| l.node == *n && l.connected));
+            for l in links {
+                match (l.connected, l.rtt_ms) {
+                    (true, Some(r)) if r >= far_rtt => {
+                        self.pl.far.entry(l.node).or_insert(FarTrack { since: at });
+                    }
+                    _ => {
+                        self.pl.far.remove(&l.node);
+                    }
+                }
+            }
+        } else {
+            self.pl.far.clear();
+        }
         self.rtt_recent
             .retain(|n, _| links.iter().any(|l| l.node == *n && l.connected));
         for l in links {
@@ -314,16 +379,89 @@ impl Core {
         )
     }
 
-    /// `node` holds a non-stealable stream (sticky or designated), or a
-    /// designation to it is pending
-    /// (`DelegationState::designating`).
-    fn place_node_non_stealable(&self, node: NodeId) -> bool {
+    /// `node` holds a designated stream, or a designation to it is pending
+    /// (`DelegationState::designating`). (A sticky stream is not one: the
+    /// placement grows it for a far node.)
+    fn place_node_designated(&self, node: NodeId) -> bool {
         self.dl.designating.values().any(|n| *n == node)
             || self
                 .dl
                 .gens
                 .values()
-                .any(|g| !g.ended && g.node == node && g.non_stealable())
+                .any(|g| !g.ended && g.node == node && g.designated())
+    }
+
+    /// Whether `node`'s link has measured far for a whole far dwell (every
+    /// sample at least `far_rtt`), or, at a budget of 0 (no group can ever
+    /// exist, so no writer is "near"), whether it is connected at all.
+    pub(crate) fn place_far(&self, now: Now, node: NodeId) -> bool {
+        if self.cfg.backup_rtt_budget_ms == 0 {
+            return self.roster.links().get(&node).is_some_and(|l| l.connected);
+        }
+        self.pl
+            .far
+            .get(&node)
+            .is_some_and(|f| now.wait.since(f.since) >= self.cfg.placement_far_dwell_ms as i64)
+    }
+
+    /// Plan 46 M1.3 step 7 (D-a): the kind of grant the placement makes
+    /// `node` for `dir`, or why none (counted).
+    ///
+    /// - `Placed` when the node has a group within budget and its live
+    ///   stream (if any) is stealable;
+    /// - `Sticky` when it has none, its link is far, and nothing it holds
+    ///   or awaits is a designation (a sticky stream of its own is grown);
+    /// - otherwise nothing: the dead band, a stealable stream of a far
+    ///   node that conversion has yet to recall, a designated stream, or a
+    ///   sticky stream with the node near now.
+    pub(crate) fn place_kind_for(
+        &mut self,
+        now: Now,
+        node: NodeId,
+        dir: Ino,
+        replica: &dyn Replica,
+    ) -> Result<DelegKind, PlaceSkip> {
+        if node == self.cfg.node_id {
+            return self.place_kind_for_root(now, dir);
+        }
+        let ns = replica.namespace();
+        let live: Option<DelegKind> = self
+            .dl
+            .gens
+            .values()
+            .find(|g| !g.ended && g.node == node)
+            .map(|g| g.kind());
+        // A designated stream, a designation pending for the node, or one
+        // pending on `dir`, a directory over it or one under it.
+        let designating_here = self.dl.designating.keys().any(|k| {
+            super::delegate::is_under(ns, *k, dir) || super::delegate::is_under(ns, dir, *k)
+        });
+        if live == Some(DelegKind::Designated)
+            || self.place_node_designated(node)
+            || designating_here
+        {
+            self.stats.place_skipped_designated += 1;
+            return Err(PlaceSkip::NonStealable);
+        }
+        if self.delegate_group_in_budget(node) {
+            if live == Some(DelegKind::Sticky) {
+                self.stats.place_skipped_designated += 1;
+                return Err(PlaceSkip::NonStealable);
+            }
+            return Ok(DelegKind::Placed);
+        }
+        // No group within budget: a final (sticky) grant, or forwarded.
+        let stealable_live = live.is_some_and(|k| !k.non_stealable());
+        if !self.cfg.placement_sticky || !self.place_far(now, node) || stealable_live {
+            self.stats.place_skipped_far += 1;
+            return Err(PlaceSkip::Far);
+        }
+        Ok(DelegKind::Sticky)
+    }
+
+    /// The root's own subtrees (step 9): not granted yet.
+    fn place_kind_for_root(&mut self, _now: Now, _dir: Ino) -> Result<DelegKind, PlaceSkip> {
+        Err(PlaceSkip::Root)
     }
 
     fn place_evaluate(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
@@ -356,45 +494,42 @@ impl Core {
             .dl
             .gens
             .iter()
-            .filter(|(_, g)| !g.ended && g.kind() == DelegKind::Placed)
+            .filter(|(_, g)| {
+                !g.ended
+                    && (g.kind() == DelegKind::Placed
+                        || (self.cfg.placement_recalls_sticky && g.kind() == DelegKind::Sticky))
+            })
             .map(|(gen, g)| (*gen, g.dir_list(), g.node))
             .collect();
         for (gen, dirs, node) in placed {
-            // Plan 46 M1.2 step 13: a node granted while its link to the root
-            // was not measured (what is not known to be far is not refused)
-            // that is measured far now has no group within budget: its
-            // grant is recalled, and the placement does not grant it again
-            // while it stays far. One sample over budget (a round trip
-            // inflated by load) does not recall: the measurement must still
-            // hold a placement tick later, and a recall already under way is
-            // neither counted nor its cooldown pushed again. (The delegate's
-            // answers wait for its group meanwhile; none is given on its
-            // disk alone.)
-            let in_budget = self.delegate_group_in_budget(node);
-            let g = self.dl.gens.get_mut(&gen).expect("present");
-            if in_budget {
-                g.far_since = None;
-            } else {
-                let since = *g.far_since.get_or_insert(now.wait);
-                if g.recall != crate::core::delegate::RecallPhase::None {
-                    continue;
-                }
-                if now.wait.since(since) >= self.placement_tick_ms() as i64 {
-                    for dir in &dirs {
-                        self.pl
-                            .cooldown
-                            .insert(*dir, now.wait.plus(self.cfg.placement_cooldown_ms));
-                    }
-                    self.stats.place_recalled += 1;
-                    tracing::info!(
-                        node = self.cfg.node_id,
-                        dirs = ?dirs,
-                        delegate = node,
-                        gen = %constellation_meta::delegation::GenLabel::of(gen),
-                        "placement recalls a delegation (its link is measured out of the backup budget)"
-                    );
-                    self.start_recall(now, gen, out);
-                }
+            // Plan 46 M1.3 step 7 (D-c): conversion. A placed grant to a node
+            // that has no group within budget (it was granted while its link
+            // was unmeasured, or its backup is gone) and whose link has
+            // measured far for a whole far dwell would answer its clients
+            // at the WAN's round trip or not at all. It is recalled, with
+            // no cooldown, so that the next round grants it a sticky
+            // subtree. With sticky placement off the grant is kept.
+            let g = self.dl.gens.get(&gen).expect("present");
+            if g.kind() == DelegKind::Placed
+                && self.cfg.placement_sticky
+                && g.recall == crate::core::delegate::RecallPhase::None
+                && !self.delegate_group_in_budget(node)
+                && self.place_far(now, node)
+            {
+                self.stats.place_recalled += 1;
+                self.stats.place_converted += 1;
+                tracing::info!(
+                    node = self.cfg.node_id,
+                    dirs = ?dirs,
+                    delegate = node,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
+                    "placement recalls a placed delegation to convert it (its link is measured far)"
+                );
+                self.start_recall(now, gen, out);
+                continue;
+            }
+            // (A recall under way is neither counted nor started again.)
+            if self.dl.gens[&gen].recall != crate::core::delegate::RecallPhase::None {
                 continue;
             }
             // A stream is recalled whole (step 9; a partial release is step
@@ -486,7 +621,18 @@ impl Core {
             }
         }
         for (node, (dir, total)) in chosen {
-            if table.covering(ns, dir).is_some() {
+            if let Some(cover) = table.covering(ns, dir) {
+                // Plan 46 M1.3 step 7 (D-g): a subtree a live sticky stream
+                // of another node covers is dominated by this one: the
+                // handover's input (step 8); counted, not acted on.
+                if self
+                    .dl
+                    .gens
+                    .get(&cover.gen)
+                    .is_some_and(|g| !g.ended && g.kind() == DelegKind::Sticky && g.node != node)
+                {
+                    self.stats.place_sticky_contended += 1;
+                }
                 continue;
             }
             if self
@@ -498,27 +644,43 @@ impl Core {
                 self.stats.place_skipped_cooldown += 1;
                 continue;
             }
-            // A node that holds designations only takes nothing a recall can
-            // reclaim (a stream never mixes grant kinds): skipped, not asked
-            // again every round; the same while a designation to it waits.
-            if self.place_node_non_stealable(node) {
-                self.stats.place_skipped_designated += 1;
+            // Plan 46 M1.3 step 7 (D-e): the holder released this subtree on
+            // its own a window ago or less; its earlier ops still count.
+            if self.pl.released.iter().any(|(d, (n, until))| {
+                *n == node
+                    && *until > now.wait
+                    && (super::delegate::is_under(ns, *d, dir)
+                        || super::delegate::is_under(ns, dir, *d))
+            }) {
+                self.stats.place_skipped_cooldown += 1;
                 continue;
             }
             if !self.place_eligible(now, node, out) {
                 self.stats.place_skipped_unreachable += 1;
                 continue;
             }
-            // Plan 46 M1.2 step 13: no lone delegate. A writer with no peer
-            // within the backup RTT budget (the root included) would answer
-            // its own clients on its disk alone: it is forwarded instead
-            // (until a sticky grant, plan 46 M1.3).
-            if !self.delegate_group_in_budget(node) {
-                self.stats.place_skipped_far += 1;
+            // The kind: placed for a node with a group within budget; sticky
+            // for a robustly far one (plan 46 M1.2 step 13 forwarded it: no
+            // lone delegate); none for the dead band, a designation, or a
+            // node that holds designations only (a stream never mixes grant
+            // kinds): skipped, not asked again every round.
+            let Ok(kind) = self.place_kind_for(now, node, dir, replica) else {
                 continue;
-            }
-            match self.delegate_dir(now, dir, node, DelegKind::Placed, replica, out) {
+            };
+            match self.delegate_dir(now, dir, node, kind, replica, out) {
                 Ok(gen) => {
+                    if kind == DelegKind::Sticky {
+                        self.stats.place_sticky += 1;
+                        tracing::info!(
+                            node = me,
+                            dir,
+                            delegate = node,
+                            gen = %constellation_meta::delegation::GenLabel::of(gen),
+                            total,
+                            "placement granted a sticky subtree to a far writer"
+                        );
+                        continue;
+                    }
                     tracing::info!(
                         node = me,
                         dir,
@@ -529,6 +691,9 @@ impl Core {
                     );
                 }
                 Err(why) => {
+                    if kind == DelegKind::Sticky {
+                        self.stats.place_grant_waits += 1;
+                    }
                     tracing::debug!(
                         node = me,
                         dir,
@@ -540,5 +705,6 @@ impl Core {
             }
         }
         self.pl.cooldown.retain(|_, until| *until > now.wait);
+        self.pl.released.retain(|_, (_, until)| *until > now.wait);
     }
 }

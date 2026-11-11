@@ -9445,6 +9445,35 @@ impl OracleTotals {
             r.stats.values().map(|s| s.inbox_hold_cross_sent).sum::<u64>(),
             r.stats.values().map(|s| s.inbox_hold_cross_local).sum::<u64>()
         );
+        // Plan 46 M1.3 step 7: the placement's sticky grants, per seed
+        // (`SWEEP-PLACE`): the coverage the sweeps report.
+        eprintln!(
+            "SWEEP-PLACE {label} seed {seed}: sticky {} converted {} recalled {} delegated {} \
+             skipped-far {} contended {} grant-waits {} commit-wait-max-ms {} commit-waits {} \
+             holder-inbox-refusals {} root-holds {} unsettled-nonstealable-holder {}",
+            r.stats.values().map(|s| s.place_sticky).sum::<u64>(),
+            r.stats.values().map(|s| s.place_converted).sum::<u64>(),
+            r.stats.values().map(|s| s.place_recalled).sum::<u64>(),
+            r.stats.values().map(|s| s.place_delegated).sum::<u64>(),
+            r.stats.values().map(|s| s.place_skipped_far).sum::<u64>(),
+            r.stats
+                .values()
+                .map(|s| s.place_sticky_contended)
+                .sum::<u64>(),
+            r.stats.values().map(|s| s.place_grant_waits).sum::<u64>(),
+            r.stats
+                .values()
+                .map(|s| s.deleg_commit_wait_ms_max)
+                .max()
+                .unwrap_or(0),
+            r.stats.values().map(|s| s.deleg_commit_waits).sum::<u64>(),
+            r.stats
+                .values()
+                .map(|s| s.holder_inbox_refusals)
+                .sum::<u64>(),
+            r.stats.values().map(|s| s.root_touched_holds).sum::<u64>(),
+            r.unsettled_nonstealable_holder
+        );
         self.unsourced += r.acks_unsourced;
         self.unjournaled_landed += r.unjournaled_landed;
         let mut unsettled = 0;
@@ -20014,25 +20043,65 @@ const I5_FAR_PLACEMENT_SEEDS: &[u64] = &[623, 889, 939];
 /// (Of 0 to 599: 151, 173, 291, 303, 338, 416, 467, 489, 496, 502.)
 const I5_LONG_DELEGATED_SEEDS: &[u64] = &[151, 236, 278];
 
-/// Plan 46 M1.2 step 13, fail-before for the placement: a far writer (every
-/// pair out of the backup budget) is not delegated and its ops are
-/// forwarded: the run completes with every answer committed, the placement
-/// skipped it, and no delegation was made. With the control it delegates.
+/// Plan 46 M1.3 step 7 (ADR-54): a far writer (every pair out of the
+/// backup budget) that dominates a subtree is granted a sticky one: it
+/// executes there and its answers are final, with no rollback, no sticky
+/// grant ended other than by its holder or the operator, and no violation.
+/// (Step 13 forwarded it: `place_skipped_far` and no delegation. The
+/// control `Config::lone_delegate` still fails the oracles.)
 #[test]
-fn a_far_writer_is_forwarded_not_delegated() {
-    let mut skipped = 0;
-    for seed in [3, 5, 6] {
-        let r = run_seed(seed, far_placement_config())
+fn far_writers_hold_sticky_grants_and_answer_final() {
+    let (mut sticky, mut executed, mut skipped) = (0, 0, 0);
+    for seed in 0..20 {
+        let r = run_seed(seed, strict(far_placement_config(), "durability"))
             .unwrap_or_else(|e| panic!("far-placement seed {seed}: {e}"));
-        for s in r.stats.values() {
-            assert_eq!(s.place_delegated, 0, "seed {seed}: delegated a far writer");
+        assert_eq!(r.non_lone_rollbacks, 0, "seed {seed}");
+        assert_eq!(r.sticky_ended_unexcused, 0, "seed {seed}");
+        for (node, s) in &r.stats {
+            assert_eq!(s.place_delegated, 0, "seed {seed}: placed a far writer");
+            sticky += s.place_sticky;
             skipped += s.place_skipped_far;
+            if *node != 1 {
+                executed += s.deleg_executed;
+            }
         }
         assert!(r.converged_checked, "seed {seed} did not converge");
+    }
+    assert!(sticky > 0, "the placement never granted a far writer");
+    assert!(executed > 0, "no far writer executed under its grant");
+    assert!(skipped > 0, "the far dwell never forwarded a writer first");
+    for seed in [3, 5, 6] {
         let lone = run_seed(seed, with_lone_delegates(far_placement_config()));
         assert!(lone.is_err(), "seed {seed}: the control did not fail");
     }
-    assert!(skipped > 0, "the placement never met a far writer");
+}
+
+/// Plan 46 M1.3 step 7, the negative control: with the placement recalling
+/// sticky grants as it does placed ones (`Config::placement_recalls_sticky`,
+/// `AUTHORITY_SIM_PLACEMENT_RECALLS_STICKY=1`), a short dwell takes a sticky
+/// grant back and `sticky_ends_only_by_holder_or_operator` fails.
+#[test]
+fn placement_recalling_sticky_fails_the_oracle() {
+    let config = SimConfig {
+        placement_recalls_sticky: true,
+        core: std::sync::Arc::new(|node, inc| {
+            let mut c = sim::run::placement_backup_core_config(node, inc);
+            c.placement_dwell_ms = 1_500;
+            c
+        }),
+        ..far_placement_config()
+    };
+    let mut failed = 0;
+    for seed in 0..20 {
+        if let Err(e) = run_seed(seed, config.clone()) {
+            assert!(
+                e.contains("sticky_ends_only_by_holder_or_operator"),
+                "seed {seed}: {e}"
+            );
+            failed += 1;
+        }
+    }
+    assert!(failed > 0, "no seed took a sticky grant back");
 }
 
 /// Plan 46 M1.3 step 0: `far-root-writes` and the `sticky-*` stubs run in

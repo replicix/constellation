@@ -795,6 +795,25 @@ pub fn load_config(
         "CONSTELLATION_DELEGATION_COOLDOWN_MS",
         c.placement_cooldown_ms,
     );
+    // Plan 46 M1.3 step 7 (ADR-54): a dominant far writer gets a sticky
+    // subtree (`=off`: it is forwarded, as before).
+    c.placement_sticky = c.placement
+        && !matches!(
+            std::env::var("CONSTELLATION_DELEGATION_STICKY_PLACEMENT")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "off" | "false"
+        );
+    c.placement_far_rtt_ms = env_u64_zero_ok(
+        "CONSTELLATION_DELEGATION_FAR_RTT_MS",
+        c.placement_far_rtt_ms,
+    );
+    c.placement_far_dwell_ms = env_ms(
+        "CONSTELLATION_DELEGATION_FAR_DWELL_MS",
+        c.placement_far_dwell_ms,
+    );
     c.backup_rtt_budget_ms = std::env::var("CONSTELLATION_BACKUP_RTT_BUDGET_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -3932,6 +3951,10 @@ impl Driver {
             SyncRequest::Undelegate { dir, reply } => {
                 control(Control::Undelegate { dir }, ControlReply::Text(reply))
             }
+            SyncRequest::StickyRelease { dirs, wait, reply } => control(
+                Control::StickyRelease { dirs, wait },
+                ControlReply::Text(reply),
+            ),
             SyncRequest::EndGrantsOf { node, reply } => {
                 control(Control::EndGrantsOf { node }, ControlReply::Text(reply))
             }
