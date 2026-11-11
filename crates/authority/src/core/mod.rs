@@ -167,9 +167,9 @@ pub struct Config {
     /// Fault injection for the simulation's negative control (never set by
     /// the engine): the lease holder runs an inbox-ever forward under its
     /// own non-stealable generation while its lease honour is current,
-    /// instead of refusing it in the generation's stream (fence C9). The
-    /// sim's check 1 or `refused_and_completed` must then fail
-    /// `sticky-root-designee-inbox`.
+    /// instead of refusing it in the generation's stream (fence C9). A
+    /// successor's refusal of the retry then contradicts the run (check 1,
+    /// `refused_and_completed`).
     pub holder_runs_inbox_ever: bool,
     /// Fault injection for the simulation's negative control (never set by
     /// the engine): the root and its inbox drain refuse an op under an
@@ -1236,6 +1236,9 @@ pub struct Stats {
     /// designee, and `Fenced` answers a requester routed through the lease
     /// holder instead of resending to the designee.
     pub inbox_ever_fenced: u64,
+    /// Fence C9.2: inbox-ever forwards a non-stealable holder refused
+    /// `EROFS` in its own stream.
+    pub holder_inbox_refusals: u64,
     pub inbox_local_withdrawals: u64,
     pub inbox_ever_rerouted: u64,
     /// ADR-47: the requester's inbox liveness hold (`inbox_ok`), by what its

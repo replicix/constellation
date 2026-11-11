@@ -69690,6 +69690,27 @@ mod route_fence_executor {
         (routed_gen, touched_gen): (u64, u64),
         deps: Position,
     ) -> Vec<Action> {
+        forward_as(
+            h,
+            dir,
+            from,
+            req,
+            (seq, settle),
+            (routed_gen, touched_gen, false),
+            deps,
+        )
+    }
+
+    /// `forward`, with the rid's `inbox_ever` flag.
+    fn forward_as(
+        h: &mut Harness,
+        dir: constellation_fs_core::Ino,
+        from: NodeId,
+        req: u64,
+        (seq, settle): (u64, bool),
+        (routed_gen, touched_gen, inbox_ever): (u64, u64, bool),
+        deps: Position,
+    ) -> Vec<Action> {
         let op = MutateOp::Create {
             parent: dir,
             name: format!("f{seq}"),
@@ -69715,7 +69736,7 @@ mod route_fence_executor {
                 settle,
                 routed_gen,
                 touched_gen,
-                inbox_ever: false,
+                inbox_ever,
             },
         })
     }
@@ -69811,9 +69832,9 @@ mod route_fence_executor {
     /// The inbox rule at the designee: a forward of a rid that was ever in an
     /// inbox is fenced whatever generation it is routed by (the lease
     /// holder's drain may hold its batch). A settle keeps the route rule.
-    /// The lease holder, designee of its own generation, runs it (its drain
-    /// and this path are one node). Fails on the parent: the routed forward
-    /// runs.
+    /// Under a non-stealable generation the lease holder does not run it
+    /// either (C9: it refuses it in the stream). Fails on the parent: the
+    /// routed forward runs.
     #[test]
     fn a_designee_fences_an_inbox_ever_forward_whatever_its_route() {
         use crate::core::holder::Fence;
@@ -69845,13 +69866,17 @@ mod route_fence_executor {
                 "a settle keeps the route rule (routed {routed})"
             );
         }
+        // (The predicate does not change with the lease: a non-stealable
+        // designee never runs an inbox-ever rid, the lease holder's own
+        // generation included; `delegate_try_execute` refuses it in the
+        // stream instead of answering `Fenced`.)
         h.hold(5, None);
         let now = h.clk();
         for routed in [0, 7] {
             assert!(
-                !h.core
+                h.core
                     .fenced_at_delegate(now, 2, &op, (by(routed), false), &h.meta),
-                "the lease holder runs it (routed {routed})"
+                "the lease holder does not run it either (routed {routed})"
             );
         }
     }
@@ -69864,10 +69889,11 @@ mod route_fence_executor {
     #[test]
     fn a_parked_inbox_ever_run_dedups_to_the_drains_outcome() {
         let (mut h, d1) = designee();
-        // (The fence lets the holder's own run of an inbox-ever rid through;
-        // `fence_accepts_unrouted` stands for that here, the park and the
-        // dedup being the same code.)
+        // (A holder that ran an inbox-ever rid is the landed line, and the
+        // control knob restores it; the park and the dedup are the same
+        // code.)
         h.core.cfg.fence_accepts_unrouted = true;
+        h.core.cfg.holder_runs_inbox_ever = true;
         let op = MutateOp::Create {
             parent: d1,
             name: "x".into(),
@@ -70284,6 +70310,250 @@ mod route_fence_executor {
             set(&mut h, root, touched, false);
             assert_eq!(h.core.inbox_hold(root, &h.meta), want, "touched {touched}");
         }
+    }
+
+    /// `forward_as` straight into `delegate_try_execute`, without the event
+    /// loop: once the node holds the lease, the loop's `delegation_sync`
+    /// would end its own generation (the window these tests are about is the
+    /// one before it does).
+    fn forward_direct(
+        h: &mut Harness,
+        dir: constellation_fs_core::Ino,
+        from: NodeId,
+        req: u64,
+        seq: u64,
+        (routed_gen, touched_gen, inbox_ever): (u64, u64, bool),
+    ) -> Vec<Action> {
+        let op = MutateOp::Create {
+            parent: dir,
+            name: format!("f{seq}"),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let rid = Rid {
+            node: from,
+            incarnation: 1,
+            seq,
+        };
+        let fence = crate::core::holder::Fence {
+            routed_gen,
+            touched_gen,
+            inbox_ever,
+        };
+        let mut out = Vec::new();
+        let now = h.clk();
+        assert!(h.core.delegate_try_execute(
+            now,
+            from,
+            Some(OpId(req)),
+            rid,
+            &op,
+            Position::ZERO,
+            0,
+            &Default::default(),
+            false,
+            fence,
+            &h.meta,
+            &mut out,
+        ));
+        out
+    }
+
+    /// The rows of generation `gen`'s stream at this node.
+    fn stream_rows(h: &Harness, gen: u64) -> Vec<LogRecord> {
+        Replica::delegate_txs_from(&h.meta, gen, 0, usize::MAX)
+            .into_iter()
+            .flat_map(|tx| tx.records)
+            .collect()
+    }
+
+    fn refusals_of(h: &Harness, gen: u64, from: NodeId, seq: u64) -> Vec<Code> {
+        let want = Rid {
+            node: from,
+            incarnation: 1,
+            seq,
+        };
+        stream_rows(h, gen)
+            .into_iter()
+            .filter_map(|r| match r {
+                LogRecord::Refused { rid, code } if rid == want => Some(code),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn completed_in(h: &Harness, gen: u64, from: NodeId, seq: u64) -> bool {
+        let want = Rid {
+            node: from,
+            incarnation: 1,
+            seq,
+        };
+        stream_rows(h, gen)
+            .into_iter()
+            .any(|r| matches!(r, LogRecord::Completed { rid } if rid == want))
+    }
+
+    /// Fence C9.2 (G1): the lease holder that is also the designee of a
+    /// non-stealable generation does not run an inbox-ever forward: it
+    /// refuses it as a row of the generation's stream, `EROFS`, so that no
+    /// successor's refusal can contradict a run. Fails on the parent: it
+    /// executes (`Accepted`, `Completed` in the stream).
+    #[test]
+    fn a_root_designee_refuses_an_inbox_ever_forward_in_its_stream() {
+        let (mut h, d1) = designee();
+        h.hold(5, None);
+        let out = forward_direct(&mut h, d1, 2, 1, 1, (0, 0, true));
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Errno(Code::ReadOnly)),
+            "{out:?}"
+        );
+        assert_eq!(refusals_of(&h, 7, 2, 1), vec![Code::ReadOnly]);
+        assert!(!completed_in(&h, 7, 2, 1));
+        assert!(h.meta.lookup(d1, "f1").unwrap().is_none(), "executed");
+        assert_eq!(h.core.stats.deleg_executed, 0);
+        assert_eq!(h.core.stats.holder_inbox_refusals, 1);
+        assert_eq!(h.core.stats.settles_refused, 0);
+    }
+
+    /// A rid the holder ran under its generation (routed by it, not yet
+    /// inbox-ever) is answered from its outcome when it arrives inbox-ever:
+    /// no refusal row beside the run. Guard.
+    #[test]
+    fn a_holder_answers_an_inbox_ever_forward_it_ran_from_the_outcome() {
+        let (mut h, d1) = designee();
+        h.hold(5, None);
+        let out = forward_direct(&mut h, d1, 2, 1, 1, (7, 7, false));
+        assert!(
+            matches!(outcome_to(&out, 2), Some(MutateOutcome::Accepted { .. })),
+            "{out:?}"
+        );
+        let out = forward_direct(&mut h, d1, 2, 2, 1, (0, 0, true));
+        assert!(
+            matches!(outcome_to(&out, 2), Some(MutateOutcome::Accepted { .. })),
+            "{out:?}"
+        );
+        assert!(refusals_of(&h, 7, 2, 1).is_empty());
+        assert!(completed_in(&h, 7, 2, 1));
+        assert_eq!(h.core.stats.holder_inbox_refusals, 0);
+    }
+
+    /// A designee that is not the lease holder refuses an inbox-ever forward
+    /// whatever its route (no `Fenced`), once: the second copy is answered
+    /// from the row. Fails on the parent: `Fenced`.
+    #[test]
+    fn a_designee_refuses_an_inbox_ever_forward_whatever_its_route() {
+        let (mut h, d1) = designee();
+        let out = forward_as(&mut h, d1, 2, 1, (1, false), (0, 0, true), Position::ZERO);
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Errno(Code::ReadOnly)),
+            "{out:?}"
+        );
+        let out = forward_as(&mut h, d1, 2, 2, (1, false), (7, 7, true), Position::ZERO);
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Errno(Code::ReadOnly)),
+            "{out:?}"
+        );
+        assert_eq!(refusals_of(&h, 7, 2, 1), vec![Code::ReadOnly]);
+        assert_eq!(h.core.stats.holder_inbox_refusals, 1);
+        assert_eq!(h.core.stats.deleg_fenced_forwards, 0);
+        assert!(h.meta.lookup(d1, "f1").unwrap().is_none());
+    }
+
+    /// Under a stealable (placed) generation nobody refuses for good: a
+    /// designee answers `Fenced`, the lease holder runs it. Guard.
+    #[test]
+    fn an_inbox_ever_forward_under_a_placed_generation_is_still_fenced() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let records = vec![
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "d1".into(),
+                ino,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+            LogRecord::DelegateNode {
+                node: 3,
+                gen: 7,
+                dirs: vec![constellation_meta::SubtreeGrant {
+                    dir: ino,
+                    kind: SubtreeKind::Placed,
+                }],
+            },
+        ];
+        Replica::install_streamed(&h.meta, 1, 1, 1, 2, &records, true, (0, 0)).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(!h.core.dl.mine[&7].non_stealable);
+        let out = forward_as(&mut h, ino, 2, 1, (1, false), (0, 0, true), Position::ZERO);
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Fenced { gen: 7 }),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.holder_inbox_refusals, 0);
+        h.hold(5, None);
+        // The lease holder is not fenced: the forward is the designee's to
+        // run (here it parks for its grant window, which the harness does
+        // not give it), and nothing is refused.
+        let fenced = h.core.stats.deleg_fenced_forwards;
+        forward_direct(&mut h, ino, 2, 2, 2, (0, 0, true));
+        assert_eq!(h.core.stats.deleg_fenced_forwards, fenced);
+        assert_eq!(h.core.dl.mine[&7].parked.len(), 1);
+        assert_eq!(h.core.stats.holder_inbox_refusals, 0);
+    }
+
+    /// A deposed root-designee has no `Completed` row for the inbox-ever rid
+    /// it was offered, before or after its deposition: nothing for a
+    /// successor's `EROFS` to contradict (G1).
+    #[test]
+    fn the_successor_never_refuses_what_a_root_designee_ran() {
+        let (mut h, d1) = designee();
+        h.hold(5, None);
+        let out = forward_direct(&mut h, d1, 2, 1, 1, (0, 0, true));
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Errno(Code::ReadOnly)),
+            "{out:?}"
+        );
+        // Deposed: the lease moves on, and the retry comes again.
+        h.core.lease.lost = true;
+        let out = forward_direct(&mut h, d1, 2, 2, 1, (0, 0, true));
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Errno(Code::ReadOnly)),
+            "{out:?}"
+        );
+        assert!(!completed_in(&h, 7, 2, 1));
+        assert_eq!(refusals_of(&h, 7, 2, 1), vec![Code::ReadOnly]);
+    }
+
+    /// The negative control: with `holder_runs_inbox_ever` the lease holder
+    /// runs the forward again (the landed line).
+    #[test]
+    fn the_holder_runs_inbox_ever_knob_restores_the_run() {
+        let (mut h, d1) = designee();
+        h.core.cfg.holder_runs_inbox_ever = true;
+        h.hold(5, None);
+        let out = forward_direct(&mut h, d1, 2, 1, 1, (0, 0, true));
+        assert!(
+            matches!(outcome_to(&out, 2), Some(MutateOutcome::Accepted { .. })),
+            "{out:?}"
+        );
+        assert!(completed_in(&h, 7, 2, 1));
+        assert!(refusals_of(&h, 7, 2, 1).is_empty());
+        assert_eq!(h.core.stats.holder_inbox_refusals, 0);
     }
 }
 
