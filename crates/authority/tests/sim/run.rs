@@ -1610,6 +1610,8 @@ pub struct Report {
     /// (`Stats::ungated_shadows`, over every incarnation of every node).
     /// Fails the run under `strict_commit`.
     pub ungated_shadows: u64,
+    /// `Stats::settle_frozen_asks` over every incarnation of every node.
+    pub settle_frozen_asks: u64,
     /// Plan 46 M0.4 (`Meta::unjustified_ships`, every incarnation); must be 0.
     pub unjustified_ships: u64,
     /// Deposition rebuilds run, `(succeeded, failed)`, over every
@@ -1907,6 +1909,18 @@ impl Cluster {
                 )
             })
             .unwrap_or_default();
+        let asks_before = self
+            .nodes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|old| {
+                old.shared
+                    .settle_asks_before
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    + old.view().stats.settle_frozen_asks
+            })
+            .unwrap_or_default();
         let rebuilds = self.nodes.lock().unwrap().get(&id).map(|old| {
             (
                 old.shared
@@ -1937,6 +1951,10 @@ impl Cluster {
             .shared
             .ungated_shadows_before
             .store(ungated_before, std::sync::atomic::Ordering::Relaxed);
+        handle
+            .shared
+            .settle_asks_before
+            .store(asks_before, std::sync::atomic::Ordering::Relaxed);
         handle
             .shared
             .unjustified_ships_before
@@ -7127,6 +7145,22 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // one installed for an answer its sequencer did not say is committed is
     // an answer outside the commit rule that the I1 oracle judged at the
     // sequencer (or a non-stealable one's: none in a `strict_commit` run).
+    report.settle_frozen_asks = report
+        .stats
+        .values()
+        .map(|s| s.settle_frozen_asks)
+        .sum::<u64>()
+        + cluster
+            .ids()
+            .into_iter()
+            .map(|id| {
+                cluster
+                    .get(id)
+                    .shared
+                    .settle_asks_before
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .sum::<u64>();
     report.ungated_shadows = report
         .stats
         .values()

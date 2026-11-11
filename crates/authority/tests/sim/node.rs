@@ -216,6 +216,8 @@ pub struct Shared {
     pub queued_seen: Mutex<BTreeSet<(Rid, u64)>>,
     /// `Stats::ungated_shadows` of this node's earlier incarnations.
     pub ungated_shadows_before: AtomicU64,
+    /// `Stats::settle_frozen_asks` of this node's earlier incarnations.
+    pub settle_asks_before: AtomicU64,
     /// `Meta::unjustified_ships` of this node's earlier incarnations (a meta
     /// that did not survive the restart; plan 46 M0.4).
     pub unjustified_ships_before: AtomicU64,
@@ -675,6 +677,7 @@ impl NodeHandle {
             rolled_back_at: Mutex::new(BTreeMap::new()),
             queued_seen: Mutex::new(BTreeSet::new()),
             ungated_shadows_before: AtomicU64::new(0),
+            settle_asks_before: AtomicU64::new(0),
             unjustified_ships_before: AtomicU64::new(0),
             journaled_refusals: Mutex::new(BTreeSet::new()),
             commits: env.commits.clone(),
