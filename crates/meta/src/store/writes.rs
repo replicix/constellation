@@ -607,6 +607,10 @@ impl Meta {
         crate::store::adjust_usage_tx(&mut tx, &self.local, delta, 0)?;
         self.finish_local(&mut tx, local)?;
         tx.commit()?;
+        // A commit that stalls is after the caller's lease check and
+        // before its acknowledgement (ADR-52).
+        #[cfg(any(test, feature = "test-util"))]
+        crate::mutate::after_write::fire();
         self.usage_tracker().adjust(delta, 0);
         // Plan 30 §M5's unshipped key set is fed by `mutate::execute`; a
         // holder's own whole-file manifest commit (the FUSE flush) comes

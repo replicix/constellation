@@ -60,7 +60,7 @@ pub use store::journal::{
     PendingClass, PendingClassGuard,
 };
 #[cfg(any(test, feature = "test-util"))]
-pub use store::local::fail_reclass_on_this_thread_for_tests;
+pub use store::local::{fail_reclass_on_this_thread_for_tests, set_after_reclass_hook_for_tests};
 #[cfg(any(test, feature = "test-util"))]
 pub use store::local::AuditRow;
 pub use store::local::{GroupOn, RowCommit};

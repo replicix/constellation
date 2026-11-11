@@ -698,6 +698,165 @@ fn a_singleton_row_whose_lease_ran_out_under_the_commit_is_in_doubt() {
     assert_eq!(session.stats().fast_acks_stale_lease, 1);
 }
 
+/// ADR-52 (review MUST-1): the gate goes off while a fast-path op waits, on
+/// a lone node, and the lease has run out meanwhile (the wait is long, the
+/// node stalled): the answer would be a singleton's on a lease a reading
+/// taken here finds gone. The op is not re-tagged and not answered: in
+/// doubt, by rid through the core. With `after_retag` the lease runs out
+/// inside the re-tag's own store write instead: the row is re-tagged
+/// (what a deposition does with it matches what the core will answer) and
+/// the op is still in doubt. Fails on the parent: answered `Ok`.
+fn ungated_wait_with_a_lease_that_ran_out(after_retag: bool) {
+    use constellation_meta::RowCommit;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let session = meta.session();
+    session.set_durable(
+        true,
+        meta.journal_tip().unwrap(),
+        false,
+        RowCommit::ROOT_GROUP,
+        false,
+    );
+    let (fs, _dir, mut core) = holder_fs(meta.clone(), true);
+    let lease = fs.sync.as_ref().unwrap().lease.clone();
+    let expire = move || {
+        lease.mirror(
+            &LeaseState::default(),
+            Now::same(now_unix_ms()),
+            &Config::defaults(1, 1),
+            false,
+        );
+    };
+    let ino = meta.allocate_ino(ROOT_INO).unwrap();
+    let fs = &fs;
+    let (stop, submitted) = (AtomicBool::new(false), Mutex::new(Vec::new()));
+    let (result, tip) = std::thread::scope(|scope| {
+        let responder = scope.spawn(|| core_answering_in_doubt(&mut core, &stop, &submitted));
+        let expire_in_op = expire.clone();
+        let op = scope.spawn(move || {
+            if after_retag {
+                constellation_meta::set_after_reclass_hook_for_tests(Some(Box::new(expire_in_op)));
+            }
+            let r = fs.mutate_op(
+                ROOT_INO,
+                constellation_meta::MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: "g".into(),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+            );
+            constellation_meta::set_after_reclass_hook_for_tests(None);
+            r
+        });
+        let tip = journaled_past_durable(&meta);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!op.is_finished(), "the op waits for the group");
+        if !after_retag {
+            expire();
+        }
+        session.set_durable(false, u64::MAX, false, RowCommit::LONE, true);
+        let result = op.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        responder.join().unwrap();
+        (result, tip)
+    });
+    assert!(result.is_err(), "not answered OK: {result:?}");
+    assert_eq!(
+        meta.journal_tx_class(tip).unwrap(),
+        Some(if after_retag {
+            RowCommit::LONE
+        } else {
+            RowCommit::ROOT_GROUP
+        })
+    );
+    let submitted = submitted.lock().unwrap();
+    assert_eq!(submitted.len(), 1, "resubmitted once: {submitted:?}");
+    assert!(submitted[0].1, "in doubt");
+    assert_eq!(session.stats().fast_acks_stale_lease, 1);
+}
+
+#[test]
+fn an_ungated_answer_on_a_lease_that_ran_out_in_the_wait_is_in_doubt() {
+    ungated_wait_with_a_lease_that_ran_out(false);
+}
+
+#[test]
+fn an_ungated_answer_on_a_lease_that_ran_out_in_the_retag_is_in_doubt() {
+    ungated_wait_with_a_lease_that_ran_out(true);
+}
+
+/// ADR-52 (review SHOULD-1): a lone holder's close whose manifest commit
+/// stalls past its lease is in doubt like a gated one: it re-commits through
+/// the core (which dedups and answers through the same gate), not `EIO`.
+/// Fails on the parent: the retry inputs were kept only when gated, so the
+/// close failed with `EIO` and no forward was sent.
+#[test]
+fn a_stalled_lone_close_recommits_through_the_core() {
+    use constellation_meta::RowCommit;
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+    let session = meta.session();
+    session.set_durable(false, u64::MAX, false, RowCommit::LONE, true);
+    let (fs, _dir, mut core) = holder_fs(meta.clone(), false);
+    let lease = fs.sync.as_ref().unwrap().lease.clone();
+    fs.do_write(file.ino, 0, b"hello").unwrap();
+    let mut forwards = 0;
+    let closed = std::thread::scope(|scope| {
+        let close = scope.spawn(|| {
+            // (A thread-local hook: set on the thread that closes.)
+            constellation_meta::set_after_write_hook_for_tests(Some(Box::new(move || {
+                lease.mirror(
+                    &LeaseState::default(),
+                    Now::same(now_unix_ms()),
+                    &Config::defaults(1, 1),
+                    false,
+                );
+            })));
+            let r = fs.flush_inode(file.ino, false);
+            constellation_meta::set_after_write_hook_for_tests(None);
+            r
+        });
+        let started = std::time::Instant::now();
+        loop {
+            match core.try_recv() {
+                Ok(SyncRequest::DrainInode { reply, .. }) => reply.send(Ok(())).unwrap(),
+                Ok(SyncRequest::Submit { op, reply, .. }) => {
+                    assert!(matches!(
+                        op,
+                        constellation_meta::MutateOp::SetManifest { .. }
+                    ));
+                    forwards += 1;
+                    reply
+                        .send(constellation_authority::ClientReply::Outcome(
+                            constellation_meta::MutateOutcome::Accepted {
+                                epoch: 1,
+                                records: Vec::new(),
+                            },
+                        ))
+                        .unwrap();
+                }
+                Ok(_) => {}
+                Err(_) if close.is_finished() => break,
+                Err(_) => {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(10),
+                        "the close is stuck"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        close.join().unwrap()
+    });
+    assert_eq!(closed, Ok(()), "the close fails instead of re-committing");
+    assert_eq!(forwards, 1, "re-committed once through the core");
+    assert_eq!(session.stats().fast_acks_stale_lease, 1);
+}
+
 /// I1 class 2: a root resumed from a process freeze runs its FUSE threads
 /// before its driver can hand the core the lapse (and the directory snapshots
 /// queued behind it). What the core last published, that this node may

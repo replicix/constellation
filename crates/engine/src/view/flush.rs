@@ -1286,7 +1286,17 @@ impl View {
                 && self.sync.as_ref().is_some_and(|h| {
                     h.lease.ack_gated() || self.meta.session().published_class().gated()
                 });
-            let retry = gated.then(|| (base.clone(), manifest_bytes.clone(), dirty_hashes.clone()));
+            // ADR-52: a singleton's row whose lease ran out under the commit
+            // is in doubt too (`FastAck::InDoubt`) and re-commits through
+            // the core like a gated one; so the inputs are kept while the
+            // published class is a singleton's (a clone of what the commit
+            // consumes, paid only on a time-bounded lone root).
+            let keeps_inputs = gated
+                || (admitted.is_some()
+                    && self.sync.is_some()
+                    && self.meta.session().published_class().is_singleton());
+            let retry =
+                keeps_inputs.then(|| (base.clone(), manifest_bytes.clone(), dirty_hashes.clone()));
             constellation_meta::clear_last_journaled();
             let committed =
                 self.commit_manifest_local(ino, &ws, base, manifest_bytes, dirty_hashes);
