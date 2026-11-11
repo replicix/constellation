@@ -69382,11 +69382,27 @@ seeds failed I1 on main, 0 after).
 - **Unsettled EIO** (allowed, counted): `delegated-designated` 718 -> 563, `sticky-ttl` 889 -> 724, `flex` 1,696 -> 1,805,
   `long-delegated` 1 -> 3; no sweep gains a failing seed. `backup-crash-slow` seed 64 fails on both.
 - **Tests**: the roster-peer tests that relied on a lone root with a peer were converted (listed in the C4 commit message).
-  The sim's fast path executes only for a lone root, so five controls that need the root's own fast path in a delegating
-  configuration are ignored until step 9 (`delegated_fast_path_respects_whole_delegations`,
-  `delegated_unchecked_fast_path_is_caught`, `locks_writer_hold_refuses_the_held_write`,
-  `locks_writer_hold_without_the_check_at_write_is_caught`,
-  `locks_writer_hold_delegated_own_clock_without_the_settle_is_caught`); eight pinned seed sets were re-found.
+  The sim's fast path executes only for a root that is not ack-gated, so the controls that need the root's own fast path
+  in a delegating configuration cannot run there until step 9: `delegated_fast_path_respects_whole_delegations` and
+  `delegated_unchecked_fast_path_is_caught` assert `fast_path_executed == 0` (they fail the day it is not), and
+  `Meta::root_fast_path` is guarded at the meta level meanwhile; `locks_writer_hold_refuses_the_held_write` runs on one
+  node; `locks_writer_hold_delegated_own_clock_without_the_settle_is_caught` runs on re-found seeds;
+  `locks_writer_hold_without_the_check_at_write_is_caught` stays ignored (no seed of the one-node, three-node and
+  delegated configurations lands a held write over the next holder's turn), with
+  `locks_writer_hold_with_peers_takes_no_fast_path_until_step_9` failing when the root's fast path runs with peers.
+- **Fix round after the review**: a node heard stays a peer until a complete read issued after its message lists the
+  cluster without it (a directory snapshot no longer drops it); a node linked after the read is a peer for the singleton
+  test but a backup candidate only once a read lists it, and a committed backup whose link is up that a later complete
+  read omits or lists as read-only is removed; a P2P-off root that claimed across a lapse is bumped back to the singleton
+  by the next read; the oracle hears the inbox batches' requesters, forgets a crashed node, and `singleton_lag` above the
+  roster poll plus 1 s fails the run; `epoch-holder-retired` asserts A's acknowledged write on B and C.
+- **Re-pinned seeds, shown failing with the fix reverted** (release): the outwait hold of a settle
+  (`long-delegated+settle` 15798, 38574, 50005: I4; no other seed of 0 to 80 000), the settle's extension
+  (`long-delegated+unsettled` 1089, 3121, 6129: I4; 16 of 0 to 15 000), the release's wait for a recall (without it the
+  seeds 624, 1043, 1191 never wait: the path counter), and the inbox's multi-batch withdrawal (10022 and 10027 reach it
+  twice or more; reverting it to withdraw one batch fails no seed of 0 to 12 000, so they pin the path, not the harm).
+  `locks_survive_core_stalls` doubles its seeds because its ratio (fenced with the lane x 4 <= without) is noise at 40
+  seeds (grants 1,406 against main's 1,432, renewals 2,232 against 2,305, fenced 4 against 14 without the lane).
 - **Oracles**: `singleton_after_peer_known` (the oracle's own copy of the install rule; the plant
   `AUTHORITY_SIM_PLANT_ROSTER_SHRINK=1` fails `singleton-peer-join` on 32 of 300 seeds) and `singleton_lag` (reported:
   `SWEEP-SINGLETON`). Harness: `singleton-peer-join`, `registered-peer-down`. `registry-bad-record` is not built (the
