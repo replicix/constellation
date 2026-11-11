@@ -4792,6 +4792,7 @@ async fn wait_for_locker(cluster: &Arc<Cluster>) -> Option<NodeId> {
 async fn operator_drop_hopeless(
     cluster: &Arc<Cluster>,
     world: &Arc<ChunkWorld>,
+    bucket: &Arc<Bucket>,
     fault_log: &Arc<Mutex<Vec<String>>>,
     after_ms: Option<u64>,
     first_seen: &mut BTreeMap<(NodeId, u64, bool), u64>,
@@ -4825,6 +4826,7 @@ async fn operator_drop_hopeless(
             // Through the core (`Control::DropHeld`), as the control API
             // does: it alone knows which answers of the dropped rows are
             // still parked.
+            let head_before = bucket.archive.head();
             let dropped = match tokio::time::timeout(
                 Duration::from_secs(5),
                 n.control(constellation_authority::Control::DropHeld {
@@ -4848,6 +4850,13 @@ async fn operator_drop_hopeless(
                         .unwrap()
                         .extend(d.rolled_back.iter().copied());
                     world.note_drop(d.rolled_back.iter().copied());
+                    // (What lands past the log's head from now on is the
+                    // drop's replay; the oracles' I4 relies on it.)
+                    world
+                        .dropped_head
+                        .lock()
+                        .unwrap()
+                        .extend(d.rolled_back.iter().map(|rid| (*rid, head_before)));
                     // A row the drop kept with its op (its answer may have
                     // left) is counted with the ungated I2 (b) pairs, not
                     // judged: see `IdentityLedger::kept`.
@@ -5605,6 +5614,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             stall_violations.clone(),
         );
         let fault_log = fault_log.clone();
+        let bucket = bucket.clone();
         tokio::spawn(async move {
             let world = cluster.env.world.clone();
             let mut stalled: BTreeMap<NodeId, u32> = BTreeMap::new();
@@ -5619,6 +5629,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     operator_drop_hopeless(
                         &cluster,
                         &world,
+                        &bucket,
                         &fault_log,
                         Some(cfg.drop_held_after_ms),
                         &mut first_seen,
@@ -5789,8 +5800,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             // at the settle's cadence for what appeared after the
             // clients finished.
             if waited.is_multiple_of(3_000) {
-                operator_drop_hopeless(&cluster, &world, &fault_log, None, &mut BTreeMap::new())
-                    .await;
+                operator_drop_hopeless(
+                    &cluster,
+                    &world,
+                    &bucket,
+                    &fault_log,
+                    None,
+                    &mut BTreeMap::new(),
+                )
+                .await;
             }
         }
         // A hint installed after the settle write (a replayed op refused
@@ -7044,7 +7062,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         &oracle,
         &in_doubt_answers,
         &rolled_back_at,
-        &world.dropped_rids.lock().unwrap().clone(),
+        &world.dropped_head.lock().unwrap().clone(),
         &operator_lost_rids,
         &cluster.abandoned_at.lock().unwrap().clone(),
         converged_checkable,

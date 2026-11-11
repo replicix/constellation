@@ -804,11 +804,25 @@ pub fn check_linearizable_witnessed(
             // Whether the ops an operator's drop rolled back explain it
             // alone (none of a deposition's): the operator's action, not
             // the protocol's, took the effect it saw away.
-            let by_drop_alone = !by_drop.is_empty()
-                && by_drop.len() <= TENTATIVE_SUBSET_MAX
+            // (Only ones never acknowledged: a dropped op whose client got an
+            // `Ok` was acknowledged by the protocol's rule, and a refusal
+            // that saw its effect saw an acknowledged effect rolled back.)
+            let mut by_drop_unacked: Vec<(usize, &NsOp)> = invoke_at
+                .iter()
+                .filter(|(t, (inv_t, _))| {
+                    dropped.contains(*t)
+                        && tentative.contains(*t)
+                        && inv_t < ret_i
+                        && !matches!(return_at.get(*t), Some((_, NsRet::Ok)))
+                })
+                .map(|(t, (inv_t, op_t))| (*inv_t, first_runs.get(t).unwrap_or(op_t)))
+                .collect();
+            by_drop_unacked.sort_by_key(|(i, _)| *i);
+            let by_drop_alone = !by_drop_unacked.is_empty()
+                && by_drop_unacked.len() <= TENTATIVE_SUBSET_MAX
                 && (lo..=hi).any(|i| {
-                    (1u32..(1u32 << by_drop.len())).any(|mask| {
-                        let chain: Vec<&NsOp> = by_drop
+                    (1u32..(1u32 << by_drop_unacked.len())).any(|mask| {
+                        let chain: Vec<&NsOp> = by_drop_unacked
                             .iter()
                             .enumerate()
                             .filter(|(k, _)| mask & (1 << k) != 0)
@@ -1255,11 +1269,28 @@ mod tests {
         assert_eq!(w.observed_dropped, 0);
         assert!(w.observers.contains(&rid(2)));
         // The same history with the effect rolled back by `repair
-        // drop-held`: the operator's action, not counted.
+        // drop-held` after its client was told `Ok`: acknowledged by the
+        // protocol's rule, so still the protocol's, not the operator's.
         let dropped: HashSet<Rid> = [rid(1)].into_iter().collect();
         let w =
             check_linearizable_witnessed(&events, &tentative, &dropped, &log, &JournalOrder::new())
                 .expect("witnessed");
+        assert_eq!((w.observed_tentative, w.observed_dropped), (1, 0));
+        // Never acknowledged (its client heard the in-doubt `EIO`, no
+        // `Return`): the operator's action, not counted.
+        let unacked: Vec<HistEvt> = events
+            .iter()
+            .filter(|e| !matches!(e, HistEvt::Return { rid: r, .. } if *r == rid(1)))
+            .cloned()
+            .collect();
+        let w = check_linearizable_witnessed(
+            &unacked,
+            &tentative,
+            &dropped,
+            &log,
+            &JournalOrder::new(),
+        )
+        .expect("witnessed");
         assert_eq!((w.observed_tentative, w.observed_dropped), (1, 1));
         assert!(check_linearizable(&events, &tentative).is_err());
         let in_flight: HashSet<Rid> = tentative.union(&w.observers).copied().collect();
@@ -1300,6 +1331,23 @@ mod tests {
         // Rolled back by an operator's drop: explained by the first two.
         let w = check_linearizable_witnessed(
             &events,
+            &tentative,
+            &tentative,
+            &none,
+            &JournalOrder::new(),
+        )
+        .expect("explained by the first two tentative effects");
+        // (t2 was acknowledged, so the drop alone does not explain it: not
+        // counted apart.)
+        assert_eq!((w.observed_tentative, w.observed_dropped), (1, 0));
+        // With t2's answer the in-doubt `EIO` (no `Return`), it does.
+        let unacked: Vec<HistEvt> = events
+            .iter()
+            .filter(|e| !matches!(e, HistEvt::Return { rid: r, .. } if *r == rid(2)))
+            .cloned()
+            .collect();
+        let w = check_linearizable_witnessed(
+            &unacked,
             &tentative,
             &tentative,
             &none,

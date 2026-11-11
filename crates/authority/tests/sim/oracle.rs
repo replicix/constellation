@@ -1039,6 +1039,18 @@ impl ArchiveIndex {
         self.note_segment(seq, seg);
     }
 
+    /// The highest segment that has landed (0: none).
+    pub fn head(&self) -> Seq {
+        self.inner
+            .lock()
+            .unwrap()
+            .segments
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// The segments that landed, their decompressed bytes and their bytes
     /// as stored.
     pub fn landed(&self) -> (u64, u64, u64) {
@@ -2729,7 +2741,7 @@ pub fn end_of_run(
     log: &super::check::Oracle,
     in_doubt: &[(NodeId, Rid, u64, u64)],
     rolled_back: &HashMap<Rid, u64>,
-    dropped: &BTreeSet<Rid>,
+    dropped: &BTreeMap<Rid, Seq>,
     operator_lost: &BTreeSet<Rid>,
     abandoned_at: &BTreeMap<u64, u64>,
     converged: bool,
@@ -2739,7 +2751,7 @@ pub fn end_of_run(
     // conflict copy, so a dropped rid is neither verbatim (I2c) nor
     // spared a rollback (I5) — but only if its effect survives
     // ([`survivors_of_drop`]).
-    let survivors = survivors_of_drop(log, dropped);
+    let survivors = survivors_of_drop(log, &dropped.keys().copied().collect());
     let survives = |rid: &Rid| survivors.contains(rid);
     let mut f = Findings {
         i1: o.i1_violations.lock().unwrap().clone(),
@@ -2898,12 +2910,19 @@ pub fn end_of_run(
         .iter()
         .cloned()
         .partition(|(_, rid, _, _)| labelled.contains(rid));
-    f.i4 = super::check::no_late_landing(&in_doubt, &invokes, &audit.submits, &survivors, log).1;
+    // The dropped rids that survive, each with the log head at its (latest)
+    // drop: only a completion past it is the operator's replay.
+    let replayed_after: BTreeMap<Rid, Seq> = survivors
+        .iter()
+        .map(|r| (*r, dropped.get(r).copied().unwrap_or(0)))
+        .collect();
+    f.i4 =
+        super::check::no_late_landing(&in_doubt, &invokes, &audit.submits, &replayed_after, log).1;
     f.i4_isolated_from_s3 = super::check::no_late_landing(
         &labelled_in_doubt,
         &invokes,
         &audit.submits,
-        &survivors,
+        &replayed_after,
         log,
     )
     .0;
@@ -3625,7 +3644,7 @@ mod tests {
         completed: &[(Rid, (u64, usize))],
         rolled_back: &HashMap<Rid, u64>,
     ) -> Findings {
-        findings_dropped(acks, completed, rolled_back, &BTreeSet::new())
+        findings_dropped(acks, completed, rolled_back, &BTreeMap::new())
     }
 
     /// The same, with the rids `repair drop-held` rolled back.
@@ -3633,7 +3652,7 @@ mod tests {
         acks: Vec<AckEntry>,
         completed: &[(Rid, (u64, usize))],
         rolled_back: &HashMap<Rid, u64>,
-        dropped: &BTreeSet<Rid>,
+        dropped: &BTreeMap<Rid, Seq>,
     ) -> Findings {
         let o = Oracles::new(Bucket::new(1, (0, 0)));
         *o.acks.lock().unwrap() = acks;
@@ -3799,7 +3818,7 @@ mod tests {
                 &log_with(seg(1, &[]), &[(r1, (5, 0)), (r2, (3, 0))]),
                 &in_doubt,
                 &HashMap::new(),
-                &BTreeSet::new(),
+                &BTreeMap::new(),
                 &BTreeSet::new(),
                 &BTreeMap::new(),
                 true,
@@ -3823,7 +3842,7 @@ mod tests {
             &log_with(seg(1, &[]), &[(r, (1, 0))]),
             &[],
             &HashMap::new(),
-            &BTreeSet::new(),
+            &BTreeMap::new(),
             &BTreeSet::new(),
             &BTreeMap::new(),
             true,
@@ -3962,7 +3981,7 @@ mod tests {
                 &log_with(s, &[]),
                 &[],
                 &HashMap::from([(r, 6)]),
-                &BTreeSet::new(),
+                &BTreeMap::new(),
                 &BTreeSet::new(),
                 &at,
                 true,
@@ -4003,7 +4022,7 @@ mod tests {
             &log_with(s, &[(r, (1, 0))]),
             &[],
             &HashMap::from([(r, 6)]),
-            &BTreeSet::new(),
+            &BTreeMap::new(),
             &BTreeSet::new(),
             &BTreeMap::from([(7, 4)]),
             true,
@@ -4075,7 +4094,7 @@ mod tests {
                 &log_with(seg(1, &[]), completed),
                 &[],
                 &rolled,
-                &BTreeSet::new(),
+                &BTreeMap::new(),
                 &BTreeSet::new(),
                 &BTreeMap::new(),
                 true,
@@ -4125,7 +4144,7 @@ mod tests {
             },
         ];
         let rolled = HashMap::from([(r, 6), (other, 6)]);
-        let dropped = BTreeSet::from([r]);
+        let dropped = BTreeMap::from([(r, 0)]);
         let log = [(r, (3, 0)), (other, (3, 1))];
         // The dropped rid, completed in the log: excused; the other, not
         // dropped: still a violation.
@@ -5293,7 +5312,7 @@ mod tests {
                 &log,
                 &[],
                 &HashMap::new(),
-                &BTreeSet::new(),
+                &BTreeMap::new(),
                 lost,
                 &BTreeMap::new(),
                 true,
@@ -5380,7 +5399,7 @@ mod tests {
         // afterwards by the same node, landed first at (3, 0): late.
         let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (r2, (3, 0))]);
         let (n, why) =
-            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &BTreeSet::new(), &log);
+            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &BTreeMap::new(), &log);
         assert_eq!(n, 1, "{why:?}");
         assert!(
             why[0].contains("I4 unacked_fails_never_lands_late"),
@@ -5389,15 +5408,22 @@ mod tests {
         // The same, r1 rolled back by `repair drop-held` and replayed by
         // the operator: it lands when the operator acts; exempt.
         let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (r2, (3, 0))]);
-        let dropped = BTreeSet::from([r1]);
+        let dropped = BTreeMap::from([(r1, 2)]);
         assert_eq!(
             super::super::check::no_late_landing(&in_doubt, &invokes, &[], &dropped, &log).0,
             0
         );
+        // Completed at or before the log head when the drop ran, it is the
+        // protocol's (a successor completing it from the tail): judged.
+        let dropped = BTreeMap::from([(r1, 5)]);
+        assert_eq!(
+            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &dropped, &log).0,
+            1
+        );
         // r1 landing before the later op is clean.
         let log = log_with(seg(1, &[]), &[(r1, (2, 0)), (r2, (3, 0))]);
         assert_eq!(
-            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &BTreeSet::new(), &log)
+            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &BTreeMap::new(), &log)
                 .0,
             0
         );
@@ -5405,7 +5431,7 @@ mod tests {
         let invokes = [(r1, 5u64), (rid(2, 1), 11)];
         let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (rid(2, 1), (3, 0))]);
         assert_eq!(
-            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &BTreeSet::new(), &log)
+            super::super::check::no_late_landing(&in_doubt, &invokes, &[], &BTreeMap::new(), &log)
                 .0,
             0
         );
@@ -5427,7 +5453,7 @@ mod tests {
                 &in_doubt,
                 &invokes,
                 &[(r1, 5), (r1, 12)],
-                &BTreeSet::new(),
+                &BTreeMap::new(),
                 &log
             )
             .0,
@@ -5435,7 +5461,7 @@ mod tests {
         );
         // Only the first submission, before the in-doubt answer: late.
         assert_eq!(
-            check(&in_doubt, &invokes, &[(r1, 5)], &BTreeSet::new(), &log).0,
+            check(&in_doubt, &invokes, &[(r1, 5)], &BTreeMap::new(), &log).0,
             1
         );
         // Another rid's resubmission exempts nothing.
@@ -5444,7 +5470,7 @@ mod tests {
                 &in_doubt,
                 &invokes,
                 &[(r1, 5), (r2, 12)],
-                &BTreeSet::new(),
+                &BTreeMap::new(),
                 &log
             )
             .0,

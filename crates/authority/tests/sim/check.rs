@@ -393,15 +393,17 @@ pub fn no_settled_landing(acks: &[super::oracle::AckEntry], oracle: &Oracle) -> 
 /// `(rid, tick)` of every client submission) is exempt. The unsettled `EIO`
 /// itself stays counted by the sim's other checks.
 ///
-/// A rid in `dropped` (`repair drop-held` rolled it back, and the log
-/// completes it by the operator's replay) lands when the operator acts, not
-/// when the protocol does: it is exempt, as I5 excuses a dropped rid whose
-/// effect survives.
+/// A rid in `dropped` (`repair drop-held` rolled it back; value: the highest
+/// log segment that had landed when the drop ran) whose completion is in a
+/// later segment is the operator's replay landing when the operator acts, not
+/// when the protocol does: exempt, as I5 excuses a dropped rid whose effect
+/// survives. One completed in a segment at or before that mark was completed
+/// by the protocol (a deposed holder's successor, from the tail): judged.
 pub fn no_late_landing(
     in_doubt: &[(u64, Rid, Seq, u64)],
     invokes: &[(Rid, u64)],
     submits: &[(Rid, u64)],
-    dropped: &BTreeSet<Rid>,
+    dropped: &BTreeMap<Rid, Seq>,
     oracle: &Oracle,
 ) -> (usize, Vec<String>) {
     // The first in-doubt answer of each rid.
@@ -417,7 +419,9 @@ pub fn no_late_landing(
         let Some(p) = oracle.completed_at.get(r) else {
             continue;
         };
-        if submits.iter().any(|(s, ts)| s == r && *ts > *t) || dropped.contains(r) {
+        if submits.iter().any(|(s, ts)| s == r && *ts > *t)
+            || dropped.get(r).is_some_and(|head| p.0 > *head)
+        {
             continue;
         }
         let after = invokes
