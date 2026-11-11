@@ -599,7 +599,7 @@ pub fn set_after_write_hook_for_tests(hook: Option<Box<dyn FnMut()>>) {
 }
 
 #[cfg(any(test, feature = "test-util"))]
-mod after_write {
+pub(crate) mod after_write {
     use std::cell::RefCell;
 
     type Hook = Box<dyn FnMut()>;
@@ -608,7 +608,7 @@ mod after_write {
         pub(super) static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
 
-    pub(super) fn fire() {
+    pub(crate) fn fire() {
         let hook = HOOK.with(|h| h.borrow_mut().take());
         if let Some(mut hook) = hook {
             hook();

@@ -771,6 +771,18 @@ impl View {
                         (target.version, published.config_version()),
                         (Some(row), Some(now)) if row < now
                     );
+                // ADR-52: the answer given from here is a singleton's, on
+                // this disk alone: it needs a lease usable on a reading
+                // taken where it leaves. The wait above and the re-tag's
+                // store write are the stall; checked before the re-tag
+                // (do not re-tag a row nobody may answer) and after it
+                // (the write itself may have outlived the lease). In
+                // doubt, the core dedups the rid and its answer passes the
+                // same gate.
+                if !h.lease.usable() {
+                    session.count_fast_ack_stale_lease();
+                    return Ok(false);
+                }
                 if !replaced {
                     let changed = self
                         .meta
@@ -781,6 +793,10 @@ impl View {
                     if changed {
                         session.count_fast_ack_downgraded();
                     }
+                }
+                if !h.lease.usable() {
+                    session.count_fast_ack_stale_lease();
+                    return Ok(false);
                 }
                 Ok(true)
             }

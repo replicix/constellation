@@ -933,7 +933,10 @@ impl Meta {
         put_journal_tx(&mut tx, self, first, &row)?;
         tx.commit()?;
         #[cfg(any(test, feature = "test-util"))]
-        reclass_fault::CHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            reclass_fault::CHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            reclass_fault::fire_after();
+        }
         Ok(true)
     }
 
@@ -3487,8 +3490,31 @@ pub fn fail_reclass_on_this_thread_for_tests(n: u32) {
     reclass_fault::LEFT.with(|c| c.set(n));
 }
 
+/// Tests only (`test-util`): a hook this thread runs once a
+/// [`Meta::reclass_journal_tx`] has committed a change — where a slow store
+/// write delays a gate-off answer past its lease (ADR-52).
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_after_reclass_hook_for_tests(hook: Option<Box<dyn FnMut()>>) {
+    reclass_fault::AFTER.with(|h| *h.borrow_mut() = hook);
+}
+
 #[cfg(any(test, feature = "test-util"))]
 mod reclass_fault {
+    type Hook = Box<dyn FnMut()>;
+
+    thread_local! {
+        pub(super) static AFTER: std::cell::RefCell<Option<Hook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn fire_after() {
+        let hook = AFTER.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+            AFTER.with(|h| *h.borrow_mut() = Some(hook));
+        }
+    }
+
     pub(super) static CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     thread_local! {
