@@ -43,6 +43,7 @@ AWS credentials follow the ordinary AWS SDK chain (`AWS_REGION`,
   - [Logging](#logging)
   - [Control UI](#control-ui)
   - [Control allowlist (plan 31 §9.5 / plan 33 U1)](#control-allowlist-plan-31-95--plan-33-u1)
+  - [Derived timings](#derived-timings)
   - [Fault injection (testing only)](#fault-injection-testing-only)
 - [Boolean values](#boolean-values)
 - [Build-time](#build-time)
@@ -438,7 +439,7 @@ quarter of the lease TTL and logs an error.
 | `constellation reintegrate TARGET` | run a deposed holder's recovery now: roll back the stranded journal and replay it by rid (it also runs on its own) |
 | `constellation repair drop-held TARGET INO` | discard held-back records of an inode into a conflict copy (plan 30 M4, see [Write-path hygiene](features/write-path-hygiene.md)) |
 | `constellation repair abandon TARGET --epoch E` | let a lease claim that waits for the tail of a lost group (`status.lease.waiting_for_group`) go on without it; rows that group acknowledged may be lost. Admin. See [Durability and failover](features/durability-and-failover.md#a-claim-waits-for-a-lost-groups-tail) |
-| `constellation repair abandon TARGET --gen G \| --node N [--gen G]` | on the root: end the delegation generation `G` that waits for its group's tail, or a sticky/designated stream whose holder is gone (all of node `N`'s with `--node`; its read delegations are recalled, else waited out, first) (`status.delegation.gens[].waiting_for_group`) at the root's cursor, and record it in the log (`GroupAbandoned`); rows only that group held, acknowledged to their clients, are lost. Refused while a member's tail is in hand, and, without `--force`, while the root heard from the delegate or a member of the latest group within `CONSTELLATION_DELEGATION_TTL_MS` (`status.delegation.waiting`: `delegate_heard_ms`, `members[].heard_ms`); confirm from elsewhere that those nodes are down before forcing. Exactly one of `--epoch`, `--gen` and `--node`; `--force` with `--gen` or `--node`. Admin. See [Delegations](features/delegations.md#failures) |
+| `constellation repair abandon TARGET --gen G \| --node N [--gen G]` | on the root: end the delegation generation `G` that waits for its group's tail, or a sticky/designated stream whose holder is gone (all of node `N`'s with `--node`; its read delegations are recalled, else waited out, first) (`status.delegation.gens[].waiting_for_group`) at the root's cursor, and record it in the log (`GroupAbandoned`); rows only that group held, acknowledged to their clients, are lost. Refused while a member's tail is in hand, and, without `--force`, while the root heard from the delegate or a member of the latest group within the `abandon_heard_window` ([derived timings](#derived-timings)) (`status.delegation.waiting`: `delegate_heard_ms`, `members[].heard_ms`); confirm from elsewhere that those nodes are down before forcing. Exactly one of `--epoch`, `--gen` and `--node`; `--force` with `--gen` or `--node`. Admin. See [Delegations](features/delegations.md#failures) |
 
 ## Environment variables
 
@@ -878,7 +879,7 @@ protocol, message bounds and counters.
 | `CONSTELLATION_FSYNC_TIMEOUT` | unset | duration (`2s`, `500ms`, `1m`) | default for `mount --fsync-timeout`, the opt-in `soft` bound on an `fsync`'s wait for S3 (see [Mount flags](#mount-flags)) |
 | `CONSTELLATION_CHUNK_HANDOFF_AFTER_MS` | 6000 | milliseconds, 0 disables | a drain (write-through close, a non-holder's forwarded close, `fsync`) waiting while this node's S3 path makes no progress (no upload and no other S3 request completes, while one of its requests waits that long or failed unanswered) for this long hands its chunks to a peer that can reach S3, which uploads them. The drain looks again as soon as its first request has waited this long, so the handoff starts about this long after that request |
 | `CONSTELLATION_S3_STALL_MS` | 6000 | milliseconds, 0 disables | EC2 campaign 8 A-1: no S3 request of this node completing for this long, while one of them waits that long (or failed unanswered), marks its S3 path stalled (`status.own_s3.stalled`). Metadata ops then keep forwarding to the holder over P2P instead of taking the lease path, which needs S3. See [durability and failover](features/durability-and-failover.md) |
-| `CONSTELLATION_DROP_HELD_AWAIT_MS` | the cap: the client deadline minus two settle windows (`60000` at the default TTL) | milliseconds, positive; a larger value is clamped to the cap | plan 46 M0.2: after `constellation repair drop-held` rolls back another node's operation that was never answered, that node's own retry executes it again, in the dropped row's place while this node remains the sequencer (after a takeover by another node the retry runs there, ungated); the dropped row keeps its place in this node's replay queue as a placeholder, and what depends on it waits behind it. This is how long the placeholder waits for the retry before the sequencer in force settles the operation as abandoned (`Refused { rid, ECANCELED }`, `status.ack.await_retry_settled`) and what waited behind it goes on. The clock does not run while a continuation epoch refuses writes. The cap leaves this node's own operations on the placeholder's keys, which wait behind it, their window: they wait for the bound and for the settle's row to commit, then execute inside the client deadline minus one settle window (`90000` at the default TTL), so with the requester gone they succeed instead of ending in `EIO`. A live requester is told at once (`Busy`) and retries within its forward backoff; one partitioned for longer than the bound meets the settled refusal. The cap is floored at one settle window; the own operations' guarantee therefore holds while a settle window is at most a third of the client deadline (at a larger window the floor makes the bound plus one window exceed it). The same value, when set, is also how long a requester's shadow of a non-stealable answer (an epoch hold's) may wait for its row to reach the log before it is rolled back and replayed; unset, that wait stays the whole client deadline (`120000`), not the cap. A requester that is gone, or gave up and settled, never retries; its operation then never lands |
+| `CONSTELLATION_DROP_HELD_AWAIT_MS` | the cap, `drop_held_await` ([derived timings](#derived-timings)) | milliseconds, positive; a larger value is clamped to the cap | plan 46 M0.2: after `constellation repair drop-held` rolls back another node's operation that was never answered, that node's own retry executes it again, in the dropped row's place while this node remains the sequencer (after a takeover by another node the retry runs there, ungated); the dropped row keeps its place in this node's replay queue as a placeholder, and what depends on it waits behind it. This is how long the placeholder waits for the retry before the sequencer in force settles the operation as abandoned (`Refused { rid, ECANCELED }`, `status.ack.await_retry_settled`) and what waited behind it goes on. The clock does not run while a continuation epoch refuses writes. The cap leaves this node's own operations on the placeholder's keys, which wait behind it, their window: they wait for the bound and for the settle's row to commit, then execute inside their own attempts window (`attempts`, [derived timings](#derived-timings)), so with the requester gone they succeed instead of ending in `EIO`. A live requester is told at once (`Busy`) and retries within its forward backoff; one partitioned for longer than the bound meets the settled refusal. The cap is floored at one settle window; the own operations' guarantee therefore holds while a settle window is at most a third of the client deadline (at a larger window the floor makes the bound plus one window exceed it). The same value, when set, is also how long a requester's shadow of a non-stealable answer (an epoch hold's) may wait for its row to reach the log before it is rolled back and replayed; unset, that wait is `stale_shadow_after`, the whole client deadline, not the cap. A requester that is gone, or gave up and settled, never retries; its operation then never lands |
 | `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` | 20000 | milliseconds | while this node's S3 path is stalled (and not every peer reports S3 down), a metadata op not answered this long after submission fails with `EIO` (in doubt) instead of waiting for the 2 × TTL deadline |
 | `CONSTELLATION_CAS_BUSY_RETRIES` | `5` | count | plan 30 M4: how many times a conditional PUT answered `409 Conflict` (another conditional write on the key in flight) is retried as the same attempt, backing off 50 ms doubling to 1 s, before the round reports the store's error. See [write-path hygiene](features/write-path-hygiene.md) |
 
@@ -1332,6 +1333,85 @@ echoes the request's access key id and string to sign. A controller-owned
 engine pod reads `CONSTELLATION_CONTROL_POLICY=/etc/constellation-csi/controller-engine/control-allow.toml`
 from the image: one `kind = "service"` grant for uid 65532 on its socket,
 `role = "admin"`, `label = "csi-controller"`.
+
+### Derived timings
+
+Every deadline, cap, window or horizon that a safety argument rests on is
+computed in one place, `crates/authority/src/deadlines.rs`, from the knobs
+above; a few of them are not knobs and cannot be set. The core, the
+simulation and its oracle read the same values, and `Deadlines::check` states
+the invariants between them (the simulation asserts them for every
+configuration it runs). The table is generated from the module at the defaults (`UPDATE_DOCS=1
+cargo test -p constellation-authority --lib configuration_md_derived_table_is_current`
+rewrites it).
+
+<!-- deadlines:begin -->
+<!-- Generated from `Deadlines::table()` by the test `configuration_md_derived_table_is_current`: do not edit by hand. -->
+
+| Symbol | Meaning | Follows |
+|---|---|---|
+| `L` | lease TTL | `CONSTELLATION_LEASE_TTL_MS` |
+| `m` | expiry margin, `min(1000, L/4)` | `CONSTELLATION_LEASE_TTL_MS` |
+| `R` | read-delegation TTL | `CONSTELLATION_READ_DELEGATION_TTL_MS` |
+| `D` | write-delegation TTL (unset: `max(K, 5000)`) | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
+| `K` | lock TTL | `CONSTELLATION_LOCK_TTL_MS` |
+| `F` | forward timeout | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `T` | backup takeover window | `CONSTELLATION_BACKUP_TAKEOVER_MS` |
+| `k` | delegation stream tick (fixed, 50) | fixed |
+| `A` | client deadline, row `client_deadline` | `CONSTELLATION_LEASE_TTL_MS` |
+| `w` | settle window, row `settle_window` | `CONSTELLATION_LEASE_TTL_MS` |
+| `H` | reclaim horizon, row `reclaim_horizon` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_LEASE_TTL_MS` |
+| `DRT` | delegation request timeout, row `deleg_request_timeout` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `inbox_deadline` | the inbox wait | `CONSTELLATION_LEASE_TTL_MS` |
+| `forward_backoff` | forward back-off (fixed) | fixed |
+| `acquire_retry_max` | lease acquisition retry ceiling (fixed) | fixed |
+| `s3_less_deadline` | an op's deadline while S3 is stalled | `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` |
+| `promise_ttl` | heartbeat promise TTL | `CONSTELLATION_PROMISE_TTL_S` |
+| `heartbeat` | backup heartbeat interval | `CONSTELLATION_BACKUP_HEARTBEAT_MS` |
+| `leave_resend` | a leaving node's note interval, row `leave_resend` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `lock_grace_wait_max` | row `lock_grace_wait_max` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` |
+
+| Bound | At the defaults (ms) | Formula | Follows |
+|---|---:|---|---|
+| `client_deadline` | 120000 | `2L` | `CONSTELLATION_LEASE_TTL_MS` |
+| `settle_window` | 30000 | `A/4, or the knob clamped to A/2` | `CONSTELLATION_LEASE_TTL_MS` |
+| `inbox_read_fresh` | 15000 | `w/2` | `CONSTELLATION_LEASE_TTL_MS` |
+| `attempts` | 90000 | `A - w` | `CONSTELLATION_LEASE_TTL_MS` |
+| `inbox_attempts` | 90000 | `max(inbox_deadline - w, inbox_deadline/2)` | `CONSTELLATION_LEASE_TTL_MS` |
+| `settle_cap_span` | 84500 | `2w + H + T + max(2F, max(T, F)) + DRT` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_FORWARD_TIMEOUT_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
+| `drop_held_await` | 60000 | `knob (0: cap) clamped to max(A - 2w, w)` | `CONSTELLATION_DROP_HELD_AWAIT_MS`, `CONSTELLATION_LEASE_TTL_MS` |
+| `stale_shadow_after` | 120000 | `knob, else A` | `CONSTELLATION_DROP_HELD_AWAIT_MS`, `CONSTELLATION_LEASE_TTL_MS` |
+| `deleg_request_timeout` | 500 | `max(F, 4k, 1)` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `reclaim_horizon` | 21000 | `D + m` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
+| `grant_in_flight` | 1100 | `2k + 2 DRT` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `deleg_resend` | 750 | `clamp(D/8, 100, 500) + 250` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
+| `recall_backoff_max` | 2000 | `max(2000, DRT)` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `release_seal_window` | 1500 | `max(T, F)` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `release_stream_window` | 500 | `F` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `inherit_slack` | 1500 | `T` | `CONSTELLATION_BACKUP_TAKEOVER_MS` |
+| `abandon_read_wait` | 6000 | `R + m` | `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS` |
+| `abandon_heard_window` | 20000 | `D` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
+| `leave_wait` | 45500 | `2D + F + 5000` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_FORWARD_TIMEOUT_MS`, `CONSTELLATION_LOCK_TTL_MS` |
+| `leave_resend` | 500 | `max(F, 500)` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `leave_note_lapse` | 40000 | `max(3 * leave_resend, 2D)` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_FORWARD_TIMEOUT_MS`, `CONSTELLATION_LOCK_TTL_MS` |
+| `read_block` | 12000 | `2 (R + m)` | `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS` |
+| `read_span` | 8000 | `R + m + 2000` | `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS` |
+| `lock_span` | 27000 | `max(K, D) * 5/4 + m + 1000` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
+| `floor_span` | 45500 | `T + max(R, K) + D + 3m + 1000` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS` |
+| `promise_span` | 16000 | `promise_ttl + 1000` | `CONSTELLATION_PROMISE_TTL_S` |
+| `ack_floor_reads` | 8500 | `T + R + 2m` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS` |
+| `ack_floor_locks` | 23500 | `T + max(R, K) + 2m` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS` |
+| `lock_grace_wait_max` | 64500 | `T + max(R, K) + H + 2m + s3_less_deadline` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS`, `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` |
+| `lock_owner_wait_max` | 127500 | `L + m + acquire_retry_max + lock_grace_wait_max` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS`, `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` |
+| `lock_poll` | 50 | `max(forward_backoff/4, 10)` | fixed |
+| `lock_min_grant` | 2000 | `min(2m, K)` | `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
+| `lock_renew_gap` | 250 | `min((K - m)/64, 250)` | `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
+| `claim_grace` | 3000 | `2T` | `CONSTELLATION_BACKUP_TAKEOVER_MS` |
+| `lag_threshold` | 187 | `max(T/8, 1)` | `CONSTELLATION_BACKUP_TAKEOVER_MS` |
+| `recall_hold` | 250 | `max(F/2, 1)` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `lane_tick` | 125 | `clamp(F/4, 50, 250)` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `backup_heartbeat` | 300 | `min(heartbeat, T/3), at least 1` | `CONSTELLATION_BACKUP_HEARTBEAT_MS`, `CONSTELLATION_BACKUP_TAKEOVER_MS` |
+<!-- deadlines:end -->
 
 ### Fault injection (testing only)
 
