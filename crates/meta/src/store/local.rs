@@ -1251,7 +1251,8 @@ impl Meta {
         deleg_gens_awaiting_end_tx(&r, self, live)
     }
 
-    fn note_log_idx(&self, gen: u64, idx: u64) -> Result<(), MetaError> {
+    /// Raise the persisted log index of `gen` to `idx` (only raised).
+    pub fn note_log_idx(&self, gen: u64, idx: u64) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         bump_log_idx_tx(&mut tx, &self.local, gen, idx)?;
         tx.commit()?;
@@ -3360,7 +3361,10 @@ pub(crate) fn bump_log_idx_tx(
 /// only when the index counted that row (`idx` at or below it); true
 /// when it did. A row a segment carried retired with the segment's own
 /// bump, so every journal row of `gen` sits above what the log holds,
-/// and a delegate's own rows were never counted here at all.
+/// and a delegate's own row still in the journal sits above it too (one
+/// this node shipped itself was counted at its ack, and is no longer
+/// there; a row held back while a later one ships is the exception, as on
+/// every replica that applies the segment).
 pub(crate) fn retract_log_idx_tx(
     tx: &mut SingleWriterWriteTx,
     local: &SingleWriterTxKeyspace,

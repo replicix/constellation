@@ -70338,6 +70338,76 @@ mod step5_sticky_release {
         );
         h.step(stream_ack(1, req, round, last));
         assert!(h.core.dl.mine[&7].release.is_none());
+        // Acknowledged, nothing keeps the state any more.
+        let mut after = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut after);
+        assert!(
+            !h.core.dl.mine.contains_key(&7),
+            "the state outlived the acknowledged release row"
+        );
+    }
+
+    /// As the test above, for a stealable stream: the remnant is kept for
+    /// every kind, and dropped once the row is acknowledged.
+    #[test]
+    fn a_stealable_remnant_is_kept_until_the_root_appends_the_row() {
+        let (mut h, dirs) = holder_of(&["a"], SubtreeKind::Placed);
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
+                req: OpId(60),
+                gen: 7,
+                dirs: dirs.clone(),
+            },
+        });
+        assert!(last_is_release(&h), "the root's request did not release");
+        h.core.dl.mine.remove(&7);
+        h.core.dl.installed_gens.clear();
+        h.core.dl.sticky_cmds.clear();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (req, round, last) =
+            batch(&out).unwrap_or_else(|| panic!("the row was not sent: {out:?}"));
+        let mut again = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut again);
+        assert!(
+            h.core.dl.mine.contains_key(&7),
+            "the stealable remnant was dropped before the root appended the row"
+        );
+        h.step(stream_ack(1, req, round, last));
+        assert!(h.core.dl.mine[&7].release.is_none());
+        let mut after = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut after);
+        assert!(!h.core.dl.mine.contains_key(&7));
+    }
+
+    /// The release row reached the log through this node's own segment (it
+    /// took the root over and shipped its journal): the remnant waits for
+    /// no acknowledgement the stream would never send, and the next sync
+    /// drops it while the root still lists the stream. Fails without the
+    /// `log_stream_idx < row` condition on the keep.
+    #[test]
+    fn a_remnant_whose_row_this_node_shipped_itself_is_dropped() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        release(&mut h, 50, Vec::new(), false);
+        assert!(last_is_release(&h));
+        h.core.dl.mine.remove(&7);
+        h.core.dl.installed_gens.clear();
+        h.core.dl.sticky_cmds.clear();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine[&7].release.is_some());
+        let shipped = Replica::take_journal(&h.meta, usize::MAX).unwrap();
+        let seqs: Vec<u64> = shipped.iter().map(|(s, _)| *s).collect();
+        Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
+        assert!(Replica::log_stream_idx(&h.meta, 7) >= 1);
+        let mut again = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut again);
+        assert!(
+            !h.core.dl.mine.contains_key(&7),
+            "the remnant waited for the root to end the stream"
+        );
     }
 
     /// Sim `far-placement-release` seed 605: a delegate that took the root
@@ -70366,6 +70436,23 @@ mod step5_sticky_release {
             idx,
             "the log holds the rows this node shipped, and its index says so"
         );
+    }
+
+    /// The count at the ack only raises: an index already at (or above) the
+    /// row, from a segment apply or the root's own append, stays as it was.
+    #[test]
+    fn shipping_a_delegate_row_never_lowers_the_logs_index() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        release(&mut h, 50, Vec::new(), false);
+        assert!(last_is_release(&h));
+        let idx = Replica::delegate_idx(&h.meta, 7);
+        h.meta.note_log_idx(7, idx + 3).unwrap();
+        let before = Replica::log_stream_idx(&h.meta, 7);
+        assert_eq!(before, idx + 3);
+        let shipped = Replica::take_journal(&h.meta, usize::MAX).unwrap();
+        let seqs: Vec<u64> = shipped.iter().map(|(s, _)| *s).collect();
+        Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
+        assert_eq!(Replica::log_stream_idx(&h.meta, 7), before);
     }
 
     /// A remote requester that was redirected to the designee (the root's
