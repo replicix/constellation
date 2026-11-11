@@ -3662,14 +3662,16 @@ restores the pre-C9 behaviour. The window it opens is the root-designee's own
 takeover gate, during which the lease holder still holds its generation. The
 sim configuration `sticky-root-designee-inbox` reaches the gate by cutting S3
 for node 1 when its lease claim lands (`CutS3OnClaim`): 87 of 2,000 seeds
-reach it (`holder_inbox_refusals > 0`); before that fault, none did. With the
-control, 5 more seeds fail than without (seed 1728: the client's `Create`
+reach it (`holder_inbox_refusals > 0`); before that fault, none did. Before the takeover gate's
+drain left the job's S3 slot (the lease lapsed from gate to gate), the
+control made 5 more seeds fail than without (seed 1728: the client's `Create`
 returned `EEXIST` after the holder ran the forward and a successor refused the
-retry; the others hang), and the pin test runs seed 1728 both ways. The
-simulation's successor holds a rid whose inbox batch a takeover stranded
-(unknown history, row 9) instead of refusing it, so only a few seeds contradict;
-the core tests (T1, and T7 with two cores, the lease holder and its successor)
-carry the case itself.
+retry; the others hang), and a pin test ran seed 1728 both ways. The drain no
+longer costs the holder its lease, no successor follows the root-designee
+without its rows, and tens of thousands of seeds with the control run clean, so the sim no
+longer pins it. The core tests (T1, and T7 with two cores, the lease holder
+and its successor; its control half shows the contradiction with the knob) carry the case
+itself.
 
 See: `crates/authority/src/core/delegate.rs` (`delegate_try_execute`),
 `crates/authority/src/core/holder.rs` (`mutate_request`),

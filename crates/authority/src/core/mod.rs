@@ -1624,6 +1624,10 @@ pub struct Stats {
     /// (a reconfiguration, a mark's clear) to land rather than race it
     /// (`Core::renew_waits_for_own_cas`).
     pub lease_renewals_after_own_cas: u64,
+    /// Holder: lease renewals that fell due while a job waited for the
+    /// takeover gate's inbox drain, sent with the drain still in flight
+    /// (`Core::on_gate_drain_renew`).
+    pub gate_drain_renewals: u64,
     /// Node side.
     pub lock_requests: u64,
     pub lock_unavailable: u64,
@@ -2060,6 +2064,10 @@ pub(crate) enum S3For {
     InboxTombstoneBg(InboxKey),
     /// ADR-47: the holder re-reading the takeover drain's leftovers.
     InboxLeftover(NodeId),
+    /// The takeover gate's inbox drain of the epochs below this one,
+    /// issued beside the job slot (`Core::issue_drain`): the holder renews
+    /// its lease while the drain is read.
+    GateDrain(Epoch),
     /// M13: a requester deleting its own durable batch before forwarding
     /// the op over P2P instead.
     InboxWithdraw(Rid, constellation_store_s3::inbox::InboxKey),
@@ -2198,6 +2206,9 @@ enum Timer {
     /// Plan 46 M1.3 step 13: an abandon's wait for the read delegations of
     /// the streams it ends reached its deadline (`Core::on_abandon_timer`).
     AbandonWait,
+    /// The lease renewal falls due while a job waits for the takeover
+    /// gate's inbox drain (`Core::on_gate_drain_renew`).
+    GateDrainRenew,
 }
 
 impl Timer {
@@ -2257,6 +2268,7 @@ impl Timer {
             | Timer::LeaveWait
             | Timer::StickyRelease
             | Timer::AbandonWait => TimerKind::DelegExpiry,
+            Timer::GateDrainRenew => TimerKind::Poll,
         }
     }
 }
@@ -2335,6 +2347,12 @@ pub struct Core {
     timers: BTreeMap<TimerId, (Timer, TimerAt)>,
     poll_timer: Option<TimerId>,
     drain_timer: Option<TimerId>,
+    /// The takeover gate's inbox drain in flight beside the job slot: the
+    /// gate's epoch, the request, and when it was issued (the freshness
+    /// bound of what it returns). See `Core::issue_drain`.
+    gate_drain: Option<(Epoch, OpId, WaitMs)>,
+    /// `Timer::GateDrainRenew`, armed while a job waits for the drain.
+    gate_drain_timer: Option<TimerId>,
     idle_rounds: u32,
     /// Polls while a continuation epoch is open, since it opened or S3
     /// was last seen back (`next_poll_ms`'s probe backoff), and whether
@@ -2495,6 +2513,8 @@ impl Core {
             timers: BTreeMap::new(),
             poll_timer: None,
             drain_timer: None,
+            gate_drain: None,
+            gate_drain_timer: None,
             idle_rounds: 0,
             epoch_probes: 0,
             epoch_s3_down: false,
@@ -3499,6 +3519,7 @@ impl Core {
         }
         match purpose {
             S3For::Job => self.on_job_s3(now, op, result, replica, out),
+            S3For::GateDrain(epoch) => self.on_gate_drain(now, epoch, op, result, replica, out),
             S3For::LearnHolder(rid) => self.on_holder_learned(now, rid, result, replica, out),
             S3For::RefreshHolder => {
                 if let S3Result::LeaseGet(Ok(Some((lease, _)))) = result {
@@ -3648,6 +3669,10 @@ impl Core {
             Timer::LeaveWait => self.on_leave_wait_timer(now, replica, out),
             Timer::StickyRelease => self.on_sticky_release_timer(now, replica, out),
             Timer::AbandonWait => self.on_abandon_timer(now, replica, out),
+            Timer::GateDrainRenew => {
+                self.gate_drain_timer = None;
+                self.on_gate_drain_renew(now, replica, out);
+            }
         }
     }
 

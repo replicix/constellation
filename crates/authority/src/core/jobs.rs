@@ -185,9 +185,11 @@ enum Phase {
     },
     /// The gate's epoch-marker `SegmentPut` outstanding.
     Marker { attempts: u32 },
-    /// M13: the gate's `InboxDrain` outstanding, issued at `issued` (the
-    /// wait clock: the freshness bound of what it returns).
-    InboxDrain { issued: WaitMs },
+    /// M13: the job waits for the gate's `InboxDrain`, which is in flight
+    /// beside the job slot (`Core::gate_drain`, `S3For::GateDrain`; the job
+    /// holds no op): a renewal that falls due meanwhile is not held up by
+    /// it (`Core::on_gate_drain_renew`).
+    InboxDrain,
     /// A segment `SegmentPut` outstanding.
     Ship {
         seqs: Vec<u64>,
@@ -1271,18 +1273,214 @@ impl Core {
         self.set_phase(Phase::Marker { attempts }, Some(op));
     }
 
+    /// The takeover gate's inbox drain (M13): every batch of the epochs
+    /// below the gate's, read with one LIST and the batches' GETs. It is
+    /// issued beside the job slot (`S3For::GateDrain`), not as the job's
+    /// op, and the job waits for it (`Phase::InboxDrain`). One drain per
+    /// gate is in flight: a job that reaches the gate again while it is
+    /// out waits for the same one.
+    ///
+    /// Why beside the slot: the slot holds one S3 op, and the lease is
+    /// renewed only by a round's op in it. With the drain as the job's op,
+    /// a drain that outlasted half the TTL kept the renewal from going out,
+    /// and one that outlasted the TTL deposed the new holder before its
+    /// gate opened (`sticky-root-designee-inbox` seeds 216 and 1025, inbox
+    /// reads of 3 to 5 s against a 6 s lease: every claimant's drain took 5
+    /// to 10 s, each was deposed in turn and the cluster never settled;
+    /// about 1 % of the seeds, with as many ops never answered). Now the
+    /// renewal falls due on its own clock (`on_gate_drain_renew`) and goes
+    /// out while the drain is read. What the gate guards is unchanged: the
+    /// view stays closed until the drain has run and a pass of
+    /// `complete_gate` opens it.
     fn issue_drain(&mut self, now: Now, out: &mut Vec<Action>) {
         let Some(gate) = self.lease.gate else {
             return;
         };
-        let op = self.issue_s3(
-            S3Op::InboxDrain {
-                below_epoch: gate.epoch,
-            },
-            S3For::Job,
-            out,
+        if !matches!(self.gate_drain, Some((epoch, _, _)) if epoch == gate.epoch) {
+            let op = self.issue_s3(
+                S3Op::InboxDrain {
+                    below_epoch: gate.epoch,
+                },
+                S3For::GateDrain(gate.epoch),
+                out,
+            );
+            self.gate_drain = Some((gate.epoch, op, now.wait));
+        }
+        self.set_phase(Phase::InboxDrain, None);
+        self.arm_gate_drain_renew(now, out);
+    }
+
+    /// How long until the held lease's renewal falls due by its clock (half
+    /// the TTL left on the honour clock; 0 when it is due already or the
+    /// lease has no honour end), while a job waits for the gate's drain.
+    /// `None`: no renewal will fall due (no lease held, lost, or an epoch's).
+    /// Only the clock: a renewal brought forward (`renew_now`, the grants'
+    /// early renewal) waits for the drain as it did, and goes in the first
+    /// round after the gate (detached at once, the acquisition of a lease
+    /// handed over with a renewal asked for ended unopened, and its op's
+    /// lease path ran again: `delegated-core-stall-root-lease6+commit`
+    /// seeds 781 and 1953).
+    fn gate_drain_renew_in_ms(&self, now: Now) -> Option<u64> {
+        if self.lease.lost || self.lease.epoch_held() || self.lease.held.is_none() {
+            return None;
+        }
+        Some(self.lease.honour_left_ms(now, &self.cfg).map_or(0, |left| {
+            (left - (self.cfg.ttl_ms / 2) as i64).max(0) as u64
+        }))
+    }
+
+    /// Arm `Timer::GateDrainRenew` for when the lease renewal falls due by
+    /// the clock (`gate_drain_renew_in_ms`).
+    fn arm_gate_drain_renew(&mut self, now: Now, out: &mut Vec<Action>) {
+        if let Some(id) = self.gate_drain_timer.take() {
+            self.cancel_timer(id, out);
+        }
+        if let Some(delay) = self.gate_drain_renew_in_ms(now) {
+            let id = self.set_timer_wait(now.wait.plus(delay), super::Timer::GateDrainRenew, out);
+            self.gate_drain_timer = Some(id);
+        }
+    }
+
+    fn job_waits_for_drain(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|j| matches!(j.phase, Phase::InboxDrain))
+    }
+
+    /// The renewal fell due while a job waits for the gate's drain: the
+    /// job lets go of the wait and the drain stays in flight. A round
+    /// renews now and, renewed, comes back to the gate (it waits for the
+    /// same drain again, or opens the gate if it landed meanwhile). An
+    /// acquisition ends with the gate pending, as it does for the
+    /// read-delegation quarantine: the rounds that follow renew the lease,
+    /// and the drain's landing nudges the round that opens the gate.
+    pub(crate) fn on_gate_drain_renew(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if !self.job_waits_for_drain() {
+            return;
+        }
+        let kind = self.job.as_ref().map(|j| j.kind());
+        match self.gate_drain_renew_in_ms(now) {
+            None => return,
+            Some(0) => {}
+            Some(_) => {
+                self.arm_gate_drain_renew(now, out);
+                return;
+            }
+        }
+        // A round's renewal that waits for this holder's own other lease CAS
+        // goes once that CAS landed, or at a quarter of the TTL left
+        // (`renew_waits_for_own_cas`): the wait is armed for then.
+        if kind == Some(JobKind::Round) && self.renew_waits_for_own_cas(now) {
+            if let Some(delay) = self.renew_due_in_ms(now) {
+                if let Some(id) = self.gate_drain_timer.take() {
+                    self.cancel_timer(id, out);
+                }
+                let id =
+                    self.set_timer_wait(now.wait.plus(delay), super::Timer::GateDrainRenew, out);
+                self.gate_drain_timer = Some(id);
+            }
+            return;
+        }
+        self.stats.gate_drain_renewals += 1;
+        tracing::info!(
+            node = self.cfg.node_id,
+            epoch = self.lease.gate.map(|g| g.epoch),
+            honour_left = self.lease.honour_left_ms(now, &self.cfg),
+            "takeover gate: the inbox drain outlasts half the lease; renewing while it is read"
         );
-        self.set_phase(Phase::InboxDrain { issued: now.wait }, Some(op));
+        match kind {
+            Some(JobKind::Round) => self.issue_renew(now, false, out),
+            Some(JobKind::Acquire) => {
+                // The round that renews follows at once.
+                self.nudged = true;
+                self.finish_acquire(now, false, replica, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// `S3For::GateDrain`: the gate's drain landed. Run it if it is still
+    /// this gate's (the lease held, not lost, the gate of that epoch still
+    /// pending), then resume the job that waits for it, or nudge a round
+    /// to open the gate when none does.
+    pub(crate) fn on_gate_drain(
+        &mut self,
+        now: Now,
+        epoch: Epoch,
+        op: OpId,
+        result: S3Result,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some((_, _, issued)) = self.gate_drain.filter(|(_, o, _)| *o == op) else {
+            return;
+        };
+        self.gate_drain = None;
+        if let Some(id) = self.gate_drain_timer.take() {
+            self.cancel_timer(id, out);
+        }
+        let current = !self.lease.lost && self.lease.gate.is_some_and(|g| g.epoch == epoch);
+        let ok = match result {
+            // Deposed (or the gate gone) while it was read: the gate is
+            // void and nothing of the read runs; the batches stay for the
+            // next holder.
+            _ if !current => {
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    epoch,
+                    "takeover gate: an inbox drain landed after its gate ended; dropped"
+                );
+                false
+            }
+            S3Result::InboxDrain(Ok(batches)) => {
+                match self.inbox_drain(now, batches, issued, replica, out) {
+                    Ok(()) => {
+                        if let Some(gate) = self.lease.gate.as_mut() {
+                            gate.drained = true;
+                        }
+                        true
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, node = self.cfg.node_id, "takeover gate: draining older epochs' inbox batches failed; the gate stays pending");
+                        false
+                    }
+                }
+            }
+            S3Result::InboxDrain(Err(e)) => {
+                tracing::warn!(node = self.cfg.node_id, error = %e.0, "takeover gate: inbox drain LIST failed; the gate stays pending");
+                false
+            }
+            other => {
+                tracing::error!(
+                    node = self.cfg.node_id,
+                    ?other,
+                    "takeover gate: unexpected result for the inbox drain"
+                );
+                false
+            }
+        };
+        if !self.job_waits_for_drain() {
+            if current {
+                self.nudge(now, out);
+            }
+            return;
+        }
+        let kind = self.job.as_ref().map(|j| j.kind());
+        // A drain that ran, or one whose gate ended (the gate's pass sees
+        // the lease lost or the gate gone), goes back to the gate; a failed
+        // one leaves the gate pending, retried at the next round.
+        let to_gate = ok || !current;
+        match (kind, to_gate) {
+            (Some(JobKind::Acquire), true) => self.acquire_gate(now, replica, out),
+            (Some(JobKind::Acquire), false) => self.finish_acquire(now, false, replica, out),
+            (_, true) => self.round_gate(now, replica, out),
+            (_, false) => self.round_tail(now, replica, out),
+        }
     }
 
     /// The generations this node's journal holds rows of as their
@@ -2766,6 +2964,19 @@ impl Core {
         // holder its own side is using: the lease stays (they keep being
         // served through the inbox).
         if self.keeps_lease_for_p2p_side(now) {
+            self.finish_round(now, None, replica, out);
+            return;
+        }
+        // Nor while the takeover drain's leftovers wait for the holder tick
+        // (ADR-47: batches the gate's drain could not run, read again from
+        // storage once the view is open). Released first, they are still in
+        // the bucket, and the next holder's gate reads them again: under
+        // inbox reads of seconds every drain outlasted the read freshness
+        // bound and left them all, and the lease went from gate to gate,
+        // each released on a peer's ask as it opened, with nothing run
+        // (`sticky-root-designee-inbox-skew` seed 1261, once a slow drain no
+        // longer cost the holder its lease).
+        if self.inbox.leftover.is_some() {
             self.finish_round(now, None, replica, out);
             return;
         }
@@ -4861,34 +5072,6 @@ impl Core {
             }
             (Phase::Marker { .. }, S3Result::SegmentPut(Err(CasFailure::Failed(e)))) => {
                 tracing::warn!(node = self.cfg.node_id, error = %e, "epoch marker PUT failed; gate stays pending");
-                match kind {
-                    JobKind::Acquire => self.finish_acquire(now, false, replica, out),
-                    _ => self.round_tail(now, replica, out),
-                }
-            }
-            // ---- the gate's inbox drain ----
-            (Phase::InboxDrain { issued }, S3Result::InboxDrain(Ok(batches))) => {
-                match self.inbox_drain(now, batches, issued, replica, out) {
-                    Ok(()) => {
-                        if let Some(gate) = self.lease.gate.as_mut() {
-                            gate.drained = true;
-                        }
-                        match kind {
-                            JobKind::Acquire => self.acquire_gate(now, replica, out),
-                            _ => self.round_gate(now, replica, out),
-                        }
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, node = self.cfg.node_id, "takeover gate: draining older epochs' inbox batches failed; the gate stays pending");
-                        match kind {
-                            JobKind::Acquire => self.finish_acquire(now, false, replica, out),
-                            _ => self.round_tail(now, replica, out),
-                        }
-                    }
-                }
-            }
-            (Phase::InboxDrain { .. }, S3Result::InboxDrain(Err(e))) => {
-                tracing::warn!(node = self.cfg.node_id, error = %e.0, "takeover gate: inbox drain LIST failed; the gate stays pending");
                 match kind {
                     JobKind::Acquire => self.finish_acquire(now, false, replica, out),
                     _ => self.round_tail(now, replica, out),

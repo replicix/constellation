@@ -287,6 +287,13 @@ impl Bucket {
         notify
     }
 
+    /// Disarm a claim cut that never landed (`FaultKind::CutS3OnClaim`
+    /// gave up waiting): a claim that comes later must not cut the node from
+    /// S3 for good, with nobody left to heal it.
+    pub fn disarm_claim_cut(&self) {
+        *self.claim_cut.lock().unwrap() = None;
+    }
+
     /// Install the tap on the lease object (the oracles' plumbing).
     pub fn set_lease_hook(&self, hook: LeaseHook) {
         *self.lease_hook.lock().unwrap() = Some(hook);

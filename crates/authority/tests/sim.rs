@@ -2317,27 +2317,39 @@ fn sticky_root_designee_inbox_passes() {
     );
 }
 
-/// Fence C9's negative control (`Config::holder_runs_inbox_ever`, the
-/// behaviour before C9): seed 1728 of `sticky-root-designee-inbox` is
-/// refused by the successor after the lease holder ran the forward as the
-/// designee of its own generation (the client's `Create` returned `EEXIST` with
-/// no state that explains it); with the refusal in the generation's stream it
-/// passes. (Four more seeds of the first 2000 hang with the knob and pass
-/// without it.)
+/// A `CutS3OnClaim` whose claim never comes within its 30 s gives up and
+/// must disarm: these seeds of `sticky-root-designee-inbox` have no lease
+/// holder for ~30 s after the release (nobody needs one), so the fault timed
+/// out, and the claim that came with the run's settle op cut node 1 from S3
+/// with nobody to heal it: the cluster never settled (a harness hang, on
+/// main too). Fails before the disarm.
 #[test]
-fn the_holder_running_an_inbox_ever_forward_fails_seed_1728() {
-    run_seed(1728, sticky_root_designee_inbox_config())
-        .unwrap_or_else(|e| panic!("sticky-root-designee-inbox seed 1728: {e}"));
-    let e = run_seed(
-        1728,
-        SimConfig {
-            holder_runs_inbox_ever: true,
-            ..sticky_root_designee_inbox_config()
-        },
-    )
-    .expect_err("the control passed: the window is not reached");
-    assert!(e.contains("returned Eexist but no state"), "{e}");
+fn a_claim_cut_that_gave_up_does_not_cut_a_later_claim() {
+    for seed in [4281u64, 4683, 6163, 7891, 8937] {
+        run_seed(seed, sticky_root_designee_inbox_config())
+            .unwrap_or_else(|e| panic!("sticky-root-designee-inbox seed {seed}: {e}"));
+    }
 }
+
+// Fence C9's negative control (`Config::holder_runs_inbox_ever`, the behaviour
+// before C9) no longer has a simulation pin. It was seed 1728 of
+// `sticky-root-designee-inbox`: the root-designee ran the forward in its own
+// takeover gate, and a successor that had not appended its rows refused the
+// retry. That successor existed only because the lease passed from gate to
+// gate: a claimant's drain held the job's S3 slot, the lease was renewed
+// only by a round through that slot, and each new holder lapsed before its
+// gate opened. The drain now runs beside the slot and the lease keeps
+// renewing (`Core::on_gate_drain_renew`), so no node follows the
+// root-designee as the holder without its rows: with the knob, tens of
+// thousands of seeds of the configuration run clean, and so do 20,000 of a
+// variant that also cut the second claimant from S3 at its claim and kept
+// node 1 off S3 so that node 2 followed (the seeds reach the refusal, but no
+// answer contradicts a successor's).
+// The case is carried by the core test
+// `the_successor_never_refuses_what_a_root_designee_ran` (two cores: the
+// lease holder that is the designee of its own non-stealable generation, and
+// its successor), whose control half (`holder_runs_inbox_ever`) shows the two
+// answers contradicting, and by `the_holder_runs_inbox_ever_knob_restores_the_run`.
 
 /// ADR-47's negative control for the delegate fence
 /// (`Config::fence_accepts_unrouted`, `AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED=1`):
