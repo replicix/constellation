@@ -63581,15 +63581,140 @@ mod hold_ack {
         // Member 2 acknowledges the first row only: node 3 gets that one.
         let first = Replica::journal_txs_from(&h.meta, 1, 1)[0].last;
         assert!(first < tip);
-        let out = ack(&mut h, 2, 1, first);
+        // The pass after the ack runs under the hold-off: its timer fires it.
+        let mut out = ack(&mut h, 2, 1, first);
+        h.core.on_stream_ahead_timer(h.clk(), &h.meta, &mut out);
         assert_eq!(batches(&out), vec![(3, true, first)], "{out:?}");
         // Then the rest.
-        let out = ack(&mut h, 2, 1, tip);
+        let mut out = ack(&mut h, 2, 1, tip);
+        h.core.on_stream_ahead_timer(h.clk(), &h.meta, &mut out);
         assert_eq!(batches(&out), vec![(3, true, tip)], "{out:?}");
         // Nothing is sent twice.
         let mut out = Vec::new();
         h.core.stream_ahead(h.clk(), 0, tip, &h.meta, &mut out);
         assert!(batches(&out).is_empty(), "{out:?}");
+    }
+
+    fn subscribe_3(h: &mut Harness) {
+        let served = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LogSubscribe {
+                req: OpId(77),
+                from: 1,
+            },
+        });
+        assert!(!sends(&served).is_empty(), "node 3 subscribed");
+    }
+
+    fn stream_batches(out: &[Action]) -> Vec<(NodeId, bool, u64)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::StreamAhead { txs, committed, .. } => {
+                    Some((to, *committed, txs.last().map_or(0, |t| t.last)))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A node that left the epoch's roster mid-hold is not resent to (a
+    /// resend is committed, and the group never acknowledged its rows),
+    /// and its bookkeeping goes.
+    #[test]
+    fn a_member_that_leaves_the_roster_is_not_resent_to() {
+        let mut h = owner(2);
+        let tip = tip(&h);
+        let mut out = Vec::new();
+        h.core.stream_ahead(h.clk(), 0, tip, &h.meta, &mut out);
+        assert_eq!(stream_batches(&out).len(), 2, "{out:?}");
+        assert!(h.core.ack.hold_sent.contains_key(&3));
+        // Node 3 leaves; node 2 is silent: only it is resent to.
+        h.core.pr.epoch_members = vec![1, 2];
+        h.advance(h.core.cfg.hold_resend_ms + 1);
+        let mut out = Vec::new();
+        h.core.on_hold_resend_timer(h.clk(), &h.meta, &mut out);
+        let b = stream_batches(&out);
+        assert!(b.iter().all(|(to, _, _)| *to != 3), "{out:?}");
+        assert!(b.iter().any(|(to, _, _)| *to == 2), "{out:?}");
+        assert!(!h.core.ack.hold_sent.contains_key(&3));
+        assert!(!h.core.ack.hold_sent_hi.contains_key(&3));
+        assert!(!h.core.ack.hold_resending.contains(&3));
+        // Nor on a direct call.
+        let mut out = Vec::new();
+        h.core.resend_hold_batch(3, h.clk(), &h.meta, &mut out);
+        assert!(stream_batches(&out).is_empty(), "{out:?}");
+    }
+
+    /// The gated subscriber catches up over several batches without a new
+    /// append, and a pass is due only while something can be sent.
+    #[test]
+    fn a_gated_subscriber_catches_up_over_several_batches() {
+        let mut h = owner(6);
+        h.core.pr.epoch_members = vec![1, 2];
+        h.core.cfg.backup_batch_rows = 2;
+        let tip = tip(&h);
+        subscribe_3(&mut h);
+        let mut out = Vec::new();
+        while h.core.stream_ahead_due(tip) {
+            let before = out.len();
+            h.core.stream_ahead(h.clk(), 0, tip, &h.meta, &mut out);
+            if out.len() == before {
+                break;
+            }
+            if out.len() > 100 {
+                panic!("never settles");
+            }
+            if stream_batches(&out).last().map(|b| b.2) == Some(tip) {
+                break;
+            }
+        }
+        assert!(
+            stream_batches(&out).iter().all(|(to, _, _)| *to != 3),
+            "nothing for node 3 before an ack: {out:?}"
+        );
+        assert!(
+            !h.core.stream_ahead_due(tip),
+            "member 2 has everything, the gate has not moved"
+        );
+        let _ = ack(&mut h, 2, 1, tip);
+        assert!(h.core.stream_ahead_due(tip));
+        let mut got = Vec::new();
+        for _ in 0..20 {
+            let mut out = Vec::new();
+            h.core.stream_ahead(h.clk(), 0, tip, &h.meta, &mut out);
+            got.extend(stream_batches(&out).into_iter().filter(|b| b.0 == 3));
+            if !h.core.stream_ahead_due(tip) {
+                break;
+            }
+        }
+        assert!(got.len() >= 2, "{got:?}");
+        assert!(got.iter().all(|b| b.1), "all committed: {got:?}");
+        assert_eq!(got.last().map(|b| b.2), Some(tip));
+        assert!(!h.core.stream_ahead_due(tip));
+    }
+
+    /// A member's short ack still draws the next resend batch at once: the
+    /// ack does not stream new rows to it first (which would refill the
+    /// queue the resend check looks at).
+    #[test]
+    fn an_ack_does_not_stream_ahead_of_the_resend_it_asks_for() {
+        let mut h = owner(6);
+        h.core.pr.epoch_members = vec![1, 2];
+        h.core.cfg.backup_batch_rows = 2;
+        let tip = tip(&h);
+        let mut out = Vec::new();
+        h.core.stream_ahead(h.clk(), 0, tip, &h.meta, &mut out);
+        h.advance(h.core.cfg.hold_resend_ms + 1);
+        let mut out = Vec::new();
+        h.core.on_hold_resend_timer(h.clk(), &h.meta, &mut out);
+        let first = stream_batches(&out);
+        assert_eq!(first.len(), 1, "{out:?}");
+        // The member holds the resent batch only: its ack asks for more.
+        let out = ack(&mut h, 2, 1, first[0].2);
+        let b = stream_batches(&out);
+        assert_eq!(b.len(), 1, "{out:?}");
+        assert!(b[0].2 > first[0].2);
     }
 
     /// The hold streams to every member of its epoch, subscribed or not,
