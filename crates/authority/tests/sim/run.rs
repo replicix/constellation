@@ -115,10 +115,14 @@ pub enum FaultKind {
     /// answers one of `peer`'s forwards from a generation of its own with
     /// the op executed and changed state (`Accepted`): the answer is lost,
     /// the op ran. Armed from the fault's time, on the first such answer.
+    ///
+    /// Fence C9: with `inbox_ever_only`, only the answer to a forward of a
+    /// rid that was ever in an inbox arms the cut.
     CutOnAnswer {
         node: NodeId,
         peer: NodeId,
         for_ms: u64,
+        inbox_ever_only: bool,
     },
     /// Plan 30 M0's fault knob: delay the holder's forward replies by
     /// `delay_ms` for `for_ms` (bug A's trigger).
@@ -534,6 +538,12 @@ pub struct SimConfig {
     /// delegate fence). `AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED=1` sets it on
     /// every configuration.
     pub fence_accepts_unrouted: bool,
+    /// Negative control (`Config::holder_runs_inbox_ever`): the lease holder
+    /// runs an inbox-ever forward under its own non-stealable generation
+    /// while its lease honour is current (no refusal in the stream).
+    /// `AUTHORITY_SIM_HOLDER_RUNS_INBOX_EVER=1` sets it on every
+    /// configuration.
+    pub holder_runs_inbox_ever: bool,
     /// Negative control (`Config::root_ignores_touched`): the root and the
     /// inbox drain refuse an op under an unreachable non-stealable grant for
     /// good whatever it touched (main before ADR-47's root rule).
@@ -1152,6 +1162,8 @@ impl Default for SimConfig {
             )
             .is_some_and(|v| v == "1"),
             fence_accepts_unrouted: std::env::var_os("AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED")
+                .is_some_and(|v| v == "1"),
+            holder_runs_inbox_ever: std::env::var_os("AUTHORITY_SIM_HOLDER_RUNS_INBOX_EVER")
                 .is_some_and(|v| v == "1"),
             root_ignores_touched: std::env::var_os("AUTHORITY_SIM_ROOT_IGNORES_TOUCHED")
                 .is_some_and(|v| v == "1"),
@@ -3725,7 +3737,12 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 .get(node)
                 .hold_next_tagged_write(core_ms, core_ms + after_ms);
         }
-        FaultKind::CutOnAnswer { node, peer, for_ms } => {
+        FaultKind::CutOnAnswer {
+            node,
+            peer,
+            for_ms,
+            inbox_ever_only,
+        } => {
             if !cluster.ids().contains(&node) || !cluster.get(node).alive() {
                 return;
             }
@@ -3733,7 +3750,9 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 "t={} cut node {node} from {peer} for {for_ms}ms at its next executed answer to {peer}",
                 fault.at_ms
             ));
-            cluster.get(node).cut_on_answer(peer, for_ms);
+            cluster
+                .get(node)
+                .cut_on_answer(peer, for_ms, inbox_ever_only);
         }
         FaultKind::DelegateWriteHold {
             node,
@@ -4841,6 +4860,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         first_start_unsettled: cfg.first_start_unsettled,
         holder_releases_before_drain: cfg.holder_releases_before_drain,
         fence_accepts_unrouted: cfg.fence_accepts_unrouted,
+        holder_runs_inbox_ever: cfg.holder_runs_inbox_ever,
         root_ignores_touched: cfg.root_ignores_touched,
         inbox_ignores_touched: cfg.inbox_ignores_touched,
         partial_release_ends_stream: cfg.partial_release_ends_stream,

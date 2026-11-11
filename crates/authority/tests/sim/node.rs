@@ -137,6 +137,9 @@ impl SimEpoch {
     }
 }
 
+/// See `Shared::cut_on_answer`.
+type CutOnAnswer = (NodeId, u64, HashSet<Rid>, bool);
+
 pub struct Shared {
     replies: Mutex<HashMap<Rid, oneshot::Sender<ClientReply>>>,
     controls: Mutex<HashMap<OpId, oneshot::Sender<Result<ControlOk, String>>>>,
@@ -270,8 +273,10 @@ pub struct Shared {
     /// for `(.1)` ms once its held write is pinned.
     hold_partition: Mutex<Option<(NodeId, u64)>>,
     /// ADR-47 (`FaultKind::CutOnAnswer`): cut this node from `(.0)` for
-    /// `(.1)` ms as it sends that node the answer of an executed forward.
-    cut_on_answer: Mutex<Option<(NodeId, u64, HashSet<Rid>)>>,
+    /// `(.1)` ms as it sends that node the answer of an executed forward
+    /// (`(.2)`: the rids fenced so far; `(.3)`: only for a rid that was ever in
+    /// an inbox).
+    cut_on_answer: Mutex<Option<CutOnAnswer>>,
     /// F1: every held write that landed (executed), `(rid, simulated ms)`,
     /// for the ghost's check that none landed inside another node's
     /// critical section (`LockGhost::check_landings`).
@@ -462,6 +467,8 @@ pub struct NodeEnv {
     pub holder_releases_before_drain: bool,
     /// See `SimConfig::fence_accepts_unrouted`.
     pub fence_accepts_unrouted: bool,
+    /// See `SimConfig::holder_runs_inbox_ever`.
+    pub holder_runs_inbox_ever: bool,
     /// See `SimConfig::root_ignores_touched`.
     pub root_ignores_touched: bool,
     /// See `SimConfig::inbox_ignores_touched`.
@@ -777,6 +784,7 @@ impl NodeHandle {
         cfg.restart_skips_write_quarantine = env.restart_skips_write_quarantine;
         cfg.holder_releases_before_drain = env.holder_releases_before_drain;
         cfg.fence_accepts_unrouted = env.fence_accepts_unrouted;
+        cfg.holder_runs_inbox_ever = env.holder_runs_inbox_ever;
         cfg.root_ignores_touched = env.root_ignores_touched;
         cfg.inbox_ignores_touched = env.inbox_ignores_touched;
         cfg.partial_release_ends_stream = env.partial_release_ends_stream;
@@ -1061,8 +1069,9 @@ impl NodeHandle {
     }
 
     /// ADR-47 (`FaultKind::CutOnAnswer`): see `Shared::cut_on_answer`.
-    pub fn cut_on_answer(&self, peer: NodeId, for_ms: u64) {
-        *self.shared.cut_on_answer.lock().unwrap() = Some((peer, for_ms, HashSet::new()));
+    pub fn cut_on_answer(&self, peer: NodeId, for_ms: u64, inbox_ever_only: bool) {
+        *self.shared.cut_on_answer.lock().unwrap() =
+            Some((peer, for_ms, HashSet::new(), inbox_ever_only));
     }
 
     /// F1 (`DelegateWriteHold`): the next tagged write this delegate
@@ -2270,10 +2279,13 @@ impl Driver {
                 Event::Peer {
                     msg:
                         PeerMsg::MutateRequest {
-                            rid, routed_gen, ..
+                            rid,
+                            routed_gen,
+                            inbox_ever,
+                            ..
                         },
                     ..
-                } => Some((*rid, *routed_gen)),
+                } => Some((*rid, *routed_gen, *inbox_ever)),
                 _ => None,
             };
             let actions = self.core.handle(now, event, &*self.meta);
@@ -2282,10 +2294,13 @@ impl Driver {
             // The op is a forward of the peer routed by no generation that
             // the node ran (no fence), or a resend routed by a generation
             // after the node fenced the forward.
-            if let Some((rid, routed)) = forward_of {
+            if let Some((rid, routed, inbox_ever)) = forward_of {
                 let mut armed = self.shared.cut_on_answer.lock().unwrap();
-                if let Some((peer, ms, fenced)) = armed.as_mut() {
+                if let Some((peer, ms, fenced, only_inbox_ever)) = armed.as_mut() {
                     let (peer, ms) = (*peer, *ms);
+                    // (Fence C9: only a forward of a rid that was ever in an
+                    // inbox arms the cut, where `only_inbox_ever`.)
+                    let skip = *only_inbox_ever && !inbox_ever;
                     let to_peer = |want: &dyn Fn(&MutateOutcome) -> bool| {
                         actions.iter().any(|a| {
                             matches!(
@@ -2301,11 +2316,12 @@ impl Driver {
                     if routed == 0 && to_peer(&|o| matches!(o, MutateOutcome::Fenced { .. })) {
                         fenced.insert(rid);
                     }
-                    let cut = if routed == 0 {
-                        to_peer(&accepted)
-                    } else {
-                        fenced.contains(&rid) && to_peer(&accepted)
-                    };
+                    let cut = !skip
+                        && if routed == 0 {
+                            to_peer(&accepted)
+                        } else {
+                            fenced.contains(&rid) && to_peer(&accepted)
+                        };
                     if cut {
                         *armed = None;
                         let me = self.id;
