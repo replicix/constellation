@@ -1117,12 +1117,6 @@ const ABANDON_RETRY_MS: u64 = 200;
 /// generations are `epoch << 32 | n`, and never 0.
 pub(crate) const LEAVE_NOTE_GEN: u64 = 0;
 
-/// A root's mark of a node that said it leaves lapses when no note has come
-/// for this many resend intervals, or for twice the delegation TTL if that
-/// is longer (the node's grants and its stream outlive a missed note by
-/// the TTL; a mark that lapsed earlier would grant it again).
-const LEAVE_NOTE_LAPSE_RESENDS: u64 = 3;
-
 /// Why a node is marked leaving at its root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LeaveMark {
@@ -5253,17 +5247,13 @@ impl Core {
     /// stuck for `stuck_threshold_ms` (a quarter of a grant period), and a
     /// request that arrived before that went to the core.
     pub(crate) fn deleg_resend_ms(&self) -> i64 {
-        crate::deleg_lane::stuck_threshold_ms(self.cfg.delegation_ttl_ms / 2)
-            + crate::deleg_lane::DELEG_RESEND_SLACK_MS
+        self.dl_t().deleg_resend as i64
     }
 
     /// How long a stream batch, backup append or renewal waits for its
     /// answer before it is sent again (a partition drops it silently).
     pub(crate) fn deleg_request_timeout_ms(&self) -> u64 {
-        self.cfg
-            .forward_timeout_ms
-            .max(self.cfg.delegation_stream_tick_ms * 4)
-            .max(1)
+        self.dl_t().deleg_request_timeout
     }
 
     /// Stop waiting for the in-flight requests whose answers are
@@ -6818,12 +6808,7 @@ impl Core {
     /// (installed from the log, or re-adopted at a restart) lapses at
     /// the reclaim horizon from the install.
     fn deleg_lapse_at(&self, d: &DelegateState) -> HonourMs {
-        let renewed = if d.until.0 > 0 {
-            d.until.plus(2 * self.cfg.expiry_margin_ms)
-        } else {
-            HonourMs(0)
-        };
-        renewed.max(d.installed.plus(self.reclaim_horizon_ms()))
+        HonourMs(self.dl_t().deleg_lapse_at(d.until.0, d.installed.0))
     }
 
     fn arm_deleg_lapse(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
@@ -6929,13 +6914,12 @@ impl Core {
     /// (a few round trips of the link to the root, at most one request
     /// timeout; a link not measured, the whole timeout).
     pub(crate) fn deleg_end_due(&self, d: &DelegateState) -> HonourMs {
-        let timeout = self.deleg_request_timeout_ms();
-        let recall = self
+        let rtt = self
             .root_node()
             .and_then(|r| self.roster.links().get(&r))
-            .and_then(|l| l.rtt_ms)
-            .map_or(timeout, |rtt| rtt.saturating_mul(4).min(timeout));
-        self.deleg_lapse_at(d).plus(recall)
+            .and_then(|l| l.rtt_ms);
+        let lapse = self.deleg_lapse_at(d).0;
+        HonourMs(self.dl_t().deleg_end_due(lapse, rtt))
     }
 
     fn arm_deleg_give_up(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
@@ -8470,8 +8454,7 @@ impl Core {
         {
             let margin = self.cfg.expiry_margin_ms as i64;
             // A delegate's read grant is capped by its own honour end.
-            let cap = d.until.since(now.honour) - margin;
-            let ttl = (self.cfg.read_delegation_ttl_ms as i64).min(cap);
+            let ttl = self.dl_t().read_grant_ttl(d.until.since(now.honour));
             // A non-stealable stream is honoured from its install (whatever
             // the root says), so its read grants need the root's word: one
             // renewal sent after the install was granted. A holder that came
@@ -8812,7 +8795,7 @@ impl Core {
     /// the generation and its generation is recalled: that costs liveness
     /// only, a recall is always safe.
     pub(crate) fn grant_in_flight_ms(&self) -> i64 {
-        (2 * self.cfg.delegation_stream_tick_ms + 2 * self.deleg_request_timeout_ms()) as i64
+        self.dl_t().grant_in_flight as i64
     }
 
     pub(crate) fn start_recall(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
@@ -8990,12 +8973,11 @@ impl Core {
             g.recall_backoff_ms,
             g.gate_recalled,
         );
-        let floor = self.deleg_request_timeout_ms();
         // ADR-44: a recall the gate started on demand is sent again inside
         // the gate too (L3); any other waits for the open.
         let gate_ok = gate_recalled && self.root_gated_shippable(now);
         if (self.lease.gate.is_none() && self.root_usable(now)) || gate_ok {
-            back_off = (back_off * 2).min(2_000).max(floor);
+            back_off = self.dl_t().next_recall_backoff(back_off);
             let req = self.op_id();
             let g = self.dl.gens.get_mut(&gen).expect("present");
             g.recall_req = Some(req);
@@ -9249,14 +9231,14 @@ impl Core {
 
     /// The window of the release seal's retry.
     fn release_seal_window(&self) -> u64 {
-        self.cfg.backup_takeover_ms.max(self.cfg.forward_timeout_ms)
+        self.dl_t().release_seal_window
     }
 
     /// The wait for the delegate's stream to reach a released cut after the
     /// group has answered: the rows in flight on the stream are one round
     /// trip away.
     fn release_stream_window(&self) -> u64 {
-        self.cfg.forward_timeout_ms
+        self.dl_t().release_stream_window
     }
 
     /// (Re)arm `Timer::DelegReleaseSeal(gen)` at `at`.
@@ -9393,8 +9375,7 @@ impl Core {
             .max()
             .unwrap_or(now.wait)
             .clamp(now.wait, horizon);
-        let bound = until
-            .plus(2 * self.cfg.forward_timeout_ms + self.cfg.delegation_stream_tick_ms.max(100));
+        let bound = until.plus(self.dl_t().release_recall_bound(0));
         if let Some(w) = self.dl.release_wait.take() {
             self.cancel_timer(w.timer, out);
         }
@@ -9973,11 +9954,8 @@ impl Core {
                     );
                 }
                 self.dw.close(gen);
-                self.dw.set_until_closed(
-                    gen,
-                    now.wait
-                        .plus(self.cfg.backup_takeover_ms.max(self.cfg.forward_timeout_ms)),
-                );
+                self.dw
+                    .set_until_closed(gen, now.wait.plus(self.release_seal_window()));
                 self.arm_gen_expiry(now, gen, out);
                 return;
             }
@@ -10319,9 +10297,7 @@ impl Core {
             gens: plan.streams.iter().copied().collect(),
             asked: BTreeMap::new(),
             sent: BTreeMap::new(),
-            deadline: now
-                .wait
-                .plus(self.cfg.read_delegation_ttl_ms + self.cfg.expiry_margin_ms),
+            deadline: now.wait.plus(self.dl_t().abandon_read_wait),
             forced: plan.forced.clone(),
             lines,
             epoch: self.lease.epoch(),
@@ -10634,7 +10610,7 @@ impl Core {
                 )
             }))
             .filter_map(|(node, role, ago)| ago.map(|a| (node, role, a)))
-            .filter(|(_, _, a)| *a < self.cfg.delegation_ttl_ms)
+            .filter(|(_, _, a)| *a < self.dl_t().abandon_heard_window)
             .min_by_key(|(_, _, a)| *a)
     }
 
@@ -10829,11 +10805,8 @@ impl Core {
             );
         }
         self.dw.close(gen);
-        self.dw.set_until_closed(
-            gen,
-            now.wait
-                .plus(self.cfg.backup_takeover_ms.max(self.cfg.forward_timeout_ms)),
-        );
+        self.dw
+            .set_until_closed(gen, now.wait.plus(self.release_seal_window()));
         self.arm_gen_expiry(now, gen, out);
     }
 
@@ -11629,7 +11602,7 @@ impl Core {
     /// by the delegate's own `until` less the margin, so every one of
     /// them lapses before the grant does.
     pub(crate) fn reclaim_horizon_ms(&self) -> u64 {
-        self.cfg.delegation_ttl_ms + self.cfg.expiry_margin_ms
+        self.dl_t().reclaim_horizon
     }
 
     /// The live read delegations (M8) this root granted on `dir` or on
@@ -11941,10 +11914,7 @@ impl Core {
     /// outwait of a holder that does not answer is one TTL, and the root's
     /// own recall of it a resend or two more).
     pub(crate) fn leave_wait_ms(&self) -> i64 {
-        (self.cfg.delegation_ttl_ms as i64)
-            .saturating_mul(2)
-            .saturating_add(self.cfg.forward_timeout_ms as i64)
-            .saturating_add(5_000)
+        self.dl_t().leave_wait as i64
     }
 
     /// `node` is leaving: this root grants it nothing more, and a
@@ -11953,7 +11923,7 @@ impl Core {
     /// `note` is the request of the node's own note. The leaving node sends
     /// it again every resend interval for as long as its leave lasts (also
     /// after the core answered it, and to a new root), so the mark lapses
-    /// when no note has come for [`LEAVE_NOTE_LAPSE_RESENDS`] intervals or
+    /// when no note has come for three resend intervals or
     /// twice the delegation TTL, whichever is longer (a node that stays up,
     /// or comes back under the same id, is granted again), not at a fixed
     /// time after the first one. `None` is an
@@ -11978,14 +11948,12 @@ impl Core {
 
     /// How often a leaving node sends its note again.
     fn leave_resend_ms(&self) -> i64 {
-        self.cfg.forward_timeout_ms.max(500) as i64
+        self.dl_t().leave_resend as i64
     }
 
     /// How long the root's mark of a leaving node lasts without a note.
     fn leave_note_lapse_ms(&self) -> u64 {
-        (self.leave_resend_ms() as u64)
-            .saturating_mul(LEAVE_NOTE_LAPSE_RESENDS)
-            .max(self.cfg.delegation_ttl_ms.saturating_mul(2))
+        self.dl_t().leave_note_lapse
     }
 
     /// Whether a leaving note of `req` from `node` is a delayed duplicate
@@ -12659,7 +12627,7 @@ impl Core {
             return;
         }
         let me = self.me();
-        let resend = self.cfg.forward_timeout_ms.max(500);
+        let resend = self.dl_t().leave_resend;
         let mut waits = std::mem::take(&mut self.dl.leave_waits);
         let mut keep = Vec::new();
         for mut w in waits.drain(..) {
