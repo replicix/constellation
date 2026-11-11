@@ -794,7 +794,7 @@ impl Core {
             // It gets the same window and cap as a settle that began at a
             // deadline, so the outwait hold applies to it too (I4).
             let window = self.dl_t().settle_window;
-            let cap = now.wait.plus(self.dl_t().settle_cap_span);
+            let cap = WaitMs(self.dl_t().settle_cap(now.wait.0, now.wait.0));
             if let Some(c) = self.clients.get_mut(&rid) {
                 c.settle = true;
                 c.settle_until = now.wait.plus(window);
@@ -4261,7 +4261,7 @@ impl Core {
         // generation it outwaits, a lapsed generation of this node's), but
         // never past `Deadlines::settle_cap_span` from here: the waits it
         // holds for, in the order they can follow each other.
-        let cap = until.max(now.wait.plus(self.dl_t().settle_cap_span));
+        let cap = WaitMs(self.dl_t().settle_cap(now.wait.0, until.0));
         let old = c.deadline;
         self.cancel_timer(old, out);
         let deadline = self.set_timer_wait(until, Timer::ClientDeadline(rid), out);
@@ -4508,7 +4508,8 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let (window, span) = (self.dl_t().settle_window, self.dl_t().settle_cap_span);
+        let dl = self.dl_t();
+        let window = dl.settle_window;
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
@@ -4518,7 +4519,7 @@ impl Core {
         let old = c.deadline;
         let until = now.wait.plus(window);
         c.settle_until = until;
-        c.settle_cap = c.settle_cap.max(until.max(now.wait.plus(span)));
+        c.settle_cap = c.settle_cap.max(WaitMs(dl.settle_cap(now.wait.0, until.0)));
         c.settle_withdraw_failed = true;
         // (Only the batches of `T_d`: the settle's own are never executed.)
         let mut keys = std::mem::take(&mut c.inbox_keys);
