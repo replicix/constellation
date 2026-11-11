@@ -29,6 +29,14 @@
 //!    profile is process-global, so this topology runs *only* then): the
 //!    lone root's own ops and a forwarded op;
 //! 6. `6-ack-s3`: `CONSTELLATION_ACK=s3`, the holder's own ops.
+//! 7. `7-wan-sticky`: as 5, with the placement and sticky placement on
+//!    (plan 46 M1.3 step 7): `b` creates files in `/t7` until the
+//!    placement has granted it the subtree (`first_op_to_sticky_ms`); then
+//!    `b`'s own ops (`sticky`: a local commit, no WAN round trip), `a`'s
+//!    forwards into the subtree (`forward-to-sticky`: final at the WAN
+//!    round trip) and the first `flock`. Runs under net-wan, like 5; off it
+//!    only when `ACK_LATENCY_TOPOLOGIES` names it (a LAN run of the same
+//!    grant path).
 //!
 //! One JSON document on stdout:
 //! `{"scenario":"ack-latency","load":…,"results":[{"topology","actor","op","n","p50_us","p90_us","p99_us"}]}`.
@@ -259,6 +267,9 @@ pub fn ack_latency(_seed: u64) -> Result<()> {
         if want(5) {
             all.push(topology_wan(n)?);
         }
+        if want(7) {
+            all.push(topology_wan_sticky(n)?);
+        }
     } else {
         let runs: [(u32, Topology); 5] = [
             (1, topology_single),
@@ -271,6 +282,12 @@ pub fn ack_latency(_seed: u64) -> Result<()> {
             if want(t) {
                 all.push(run(n)?);
             }
+        }
+        // Topology 7 off the WAN profile only when named: a budget of 0 makes
+        // every connected writer far, so the sticky grant is made on a LAN
+        // too (the local commit against the forward; no WAN round trip).
+        if only.as_ref().is_some_and(|o| o.contains(&7)) {
+            all.push(topology_wan_sticky(n)?);
         }
     }
     finish(all, load);
@@ -441,6 +458,119 @@ fn topology_wan(n: usize) -> Result<Rows> {
             "forward",
             &a.mnt.join("t5/lk"),
             &b.mnt.join("t5/lk"),
+            n,
+        )?;
+        Ok(rows)
+    })();
+    unmount_all(&mut clients);
+    result
+}
+
+/// Whether `c` holds a live grant on `path` (its table lists it and its own
+/// grants include the generation): what `wait_installed` waits for.
+fn holds_grant(c: &Client, path: &str) -> Result<bool> {
+    let d = c.control_status()?["delegation"].clone();
+    let n = |v: &serde_json::Value, k: &str| v[k].as_u64().unwrap_or(0);
+    let Some(entry) = d["table"]
+        .as_array()
+        .and_then(|t| t.iter().find(|e| e["path"] == path))
+    else {
+        return Ok(false);
+    };
+    let g = n(entry, "gen");
+    Ok(d["mine"]
+        .as_array()
+        .is_some_and(|m| m.iter().any(|m| m[1].as_u64() == Some(g) && m[3] == false)))
+}
+
+fn topology_wan_sticky(n: usize) -> Result<Rows> {
+    const NAME: &str = "ack-latency-7-wan-sticky";
+    let (_env, _root, mut clients, _) = cluster(
+        NAME,
+        &["a", "b"],
+        &[
+            ("CONSTELLATION_DELEGATION_PLACEMENT", ""),
+            ("CONSTELLATION_DELEGATION_MIN_OPS", "50"),
+            ("CONSTELLATION_DELEGATION_WINDOW_MS", "5000"),
+            ("CONSTELLATION_DELEGATION_FAR_DWELL_MS", "5000"),
+            ("CONSTELLATION_DELEGATION_STICKY_PLACEMENT", "on"),
+        ],
+        0,
+    )?;
+    let result = (|| -> Result<Rows> {
+        let mut rows = Rows::new("7-wan-sticky");
+        let (a, b) = (&clients[0], &clients[1]);
+        let lease = lease_of(a)?;
+        ensure!(
+            lease["held"] == true,
+            "7-wan-sticky: a does not hold the root: {lease}"
+        );
+        std::fs::create_dir_all(a.mnt.join("t7"))?;
+        eventually("t7 visible on b", Duration::from_secs(60), || {
+            ensure!(b.mnt.join("t7").is_dir());
+            Ok(())
+        })?;
+        // b is the dominant writer of /t7 until the placement grants it.
+        let started = Instant::now();
+        let mut i = 0usize;
+        let mut first_op = None;
+        loop {
+            let t = Instant::now();
+            std::fs::write(b.mnt.join(format!("t7/warm-{i}")), b"")
+                .with_context(|| "7-wan-sticky: b creating a warm-up file")?;
+            if first_op.is_none() {
+                first_op = Some(t.elapsed());
+            }
+            i += 1;
+            if holds_grant(b, "/t7")? {
+                break;
+            }
+            ensure!(
+                started.elapsed() < Duration::from_secs(180),
+                "7-wan-sticky: b was not granted /t7 within 180 s ({i} creates)"
+            );
+        }
+        let to_sticky = started.elapsed();
+        eprintln!(
+            "    ack-latency: 7-wan-sticky first_op_to_sticky_ms={} (after {i} creates; the first create took {:?})",
+            to_sticky.as_millis(),
+            first_op.unwrap_or_default()
+        );
+        rows.rows.push(json!({
+            "topology": "7-wan-sticky",
+            "actor": "sticky",
+            "op": "first_op_to_sticky_ms",
+            "n": i,
+            "p50_us": to_sticky.as_micros() as u64,
+            "p90_us": to_sticky.as_micros() as u64,
+            "p99_us": to_sticky.as_micros() as u64,
+        }));
+        // The first op under the grant waits for the grant record's archive.
+        let t = Instant::now();
+        std::fs::write(b.mnt.join("t7/first-under-grant"), b"")?;
+        let first_under = t.elapsed();
+        eprintln!("    ack-latency: 7-wan-sticky first op under the grant {first_under:?}");
+        rows.rows.push(json!({
+            "topology": "7-wan-sticky",
+            "actor": "sticky",
+            "op": "first_under_grant",
+            "n": 1,
+            "p50_us": first_under.as_micros() as u64,
+            "p90_us": first_under.as_micros() as u64,
+            "p99_us": first_under.as_micros() as u64,
+        }));
+        std::fs::create_dir_all(b.mnt.join("t7/own"))?;
+        measure_ops(&mut rows, "sticky", &b.mnt.join("t7/own"), n)?;
+        eventually("t7/fwd path on a", Duration::from_secs(60), || {
+            ensure!(a.mnt.join("t7").is_dir());
+            Ok(())
+        })?;
+        measure_ops(&mut rows, "forward-to-sticky", &a.mnt.join("t7/fwd"), n)?;
+        measure_flock(
+            &mut rows,
+            "forward",
+            &b.mnt.join("t7/lk"),
+            &a.mnt.join("t7/lk"),
             n,
         )?;
         Ok(rows)
