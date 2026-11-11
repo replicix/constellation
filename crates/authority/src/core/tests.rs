@@ -35605,6 +35605,61 @@ fn a_holder_with_drain_leftovers_is_not_idle_released() {
     }
 }
 
+/// A round waiting for the takeover gate's drain whose renewal is brought
+/// forward (`renew_now`) while the holder's own other lease CAS is out got
+/// no timer: `renew_due_in_ms` is `None` for a brought-forward renewal, and
+/// the lease could lapse under a slow drain. A quarter-TTL timer is armed.
+/// Fails before: no `GateDrainRenew` timer after it fired.
+#[test]
+fn a_gate_drain_wait_rearms_the_renewal_while_the_own_cas_is_out() {
+    let mut h = Harness::new(1);
+    let ttl = h.core.cfg.ttl_ms;
+    h.hold(
+        1,
+        Some(PendingGate {
+            epoch: 1,
+            takeover: true,
+            marker_shipped: true,
+            drained: false,
+            fast_prev: false,
+            backup_tail_epoch: None,
+            shippable: false,
+        }),
+    );
+    h.core.lease.held.as_mut().unwrap().0.granted_delegations = false;
+    let mut out = Vec::new();
+    h.core.ensure_granting_marked(&mut out);
+    assert!(h.core.ack.marking.is_some(), "the mark CAS is out");
+    h.core.ship.renew_now = true;
+    let mut out = Vec::new();
+    h.core.start(h.clk(), &h.meta, &mut out);
+    let poll = timers(&out, TimerKind::Poll)[0];
+    let mut acts = h.step(Event::Timer { id: poll });
+    if let Some(op) = acts.iter().find_map(|a| match a {
+        Action::UploadDirtyChunks { op, .. } => Some(*op),
+        _ => None,
+    }) {
+        acts = h.step(Event::UploadsDone {
+            op,
+            result: UploadResult::Done { held: 0 },
+        });
+    }
+    assert!(
+        s3_ops(&acts)
+            .iter()
+            .any(|(_, r)| matches!(r, S3Op::InboxDrain { .. })),
+        "the round waits for the drain: {acts:?}"
+    );
+    let first = h.core.gate_drain_timer.expect("armed at half the TTL");
+    h.advance(ttl / 2 + 100);
+    h.step(Event::Timer { id: first });
+    let second = h.core.gate_drain_timer;
+    assert!(
+        second.is_some_and(|id| id != first),
+        "no renewal timer left while the own CAS is out"
+    );
+}
+
 // ---- chaos-soak-4 seed 42 (`wf293`): a delegate's reply base ----
 
 /// A delegate's reply `base` must cover everything its replica held when
