@@ -4086,6 +4086,15 @@ lease shape.
 - The fallbacks stay and are counted (`kept_uncarried_replayed`,
   `kept_past_gap`); the sim fails a run on a nonzero value under
   `strict_identity`.
+- A hold streams to a subscriber outside its epoch only the rows its group
+  has acknowledged, as committed (`stream_ahead`'s `gate_cap`). Streamed
+  ahead of the ack, the copy was ungated, and the epoch marker of a takeover
+  that reached the subscriber before the re-shipped tail stranded it into a
+  replay of a row the group had answered (I5, flex-tight 1267). The
+  subscriber's freshness lags by one member ack; the writer's reply is
+  released by the same ack, and a forwarded op waits for its row in the log
+  (`AwaitingLog`), so the writer reads its own write and nobody can have
+  been told of a row the subscriber lacks for longer than that hop.
 
 **Rejected**: triggering on the fence or the lease shape; sealing every stream
 `(E, s)` and `(E + 1, s)` (it refused the successor's own streams for ever);

@@ -5212,14 +5212,35 @@ impl Core {
                 "stream-ahead stops before a transaction naming chunks not in S3 yet"
             );
         }
-        let through = if common > 0 {
+        let base = self.ship.head_seq;
+        let hold_group = in_epoch && self.hold_group();
+        let members = self.pr.epoch_members.clone();
+        // A subscriber outside a hold group's epoch gets only the rows the
+        // group has acknowledged (`hold_acked_through`), as committed: an
+        // unacknowledged row streamed to it stayed an ungated copy, which
+        // a later epoch's marker (a takeover of this hold) strands into a
+        // replay of a row the group went on to acknowledge (I5, flex-tight
+        // 1267). Its copy of an acknowledged row is gated, and a takeover
+        // keeps it (S6).
+        let gate_cap = hold_group.then(|| self.hold_acked_through());
+        let gated = |n: NodeId| gate_cap.is_some() && !members.contains(&n);
+        let mut through = if common > 0 {
             txs[common - 1].last
         } else {
             self.ack.streamed_through
         };
-        let base = self.ship.head_seq;
-        let hold_group = in_epoch && self.hold_group();
-        let members = self.pr.epoch_members.clone();
+        if let Some(cap) = gate_cap {
+            if subscribers.iter().any(|n| gated(*n)) {
+                // The common cursor stays where the gated subscribers are;
+                // the members ahead of it continue from their own cursors.
+                let limit = txs[..common]
+                    .iter()
+                    .take_while(|t| t.last <= cap)
+                    .last()
+                    .map_or(self.ack.streamed_through, |t| t.last);
+                through = through.min(limit);
+            }
+        }
         let mut sent = 0u64;
         for n in subscribers {
             let cursor = self
@@ -5237,6 +5258,12 @@ impl Core {
             } else {
                 let upto = releasable(&txs, Some(n)).max(common).min(txs.len());
                 (&txs, upto)
+            };
+            let upto = match gate_cap {
+                Some(cap) if gated(n) => {
+                    upto.min(list.iter().take_while(|t| t.last <= cap).count())
+                }
+                _ => upto,
             };
             let batch: Vec<BackupTx> = list[..upto]
                 .iter()
@@ -5279,6 +5306,9 @@ impl Core {
                     self.ack.hold_resending.clear();
                     self.ack.hold_epoch = Some(epoch);
                 }
+            }
+            // Only a member acknowledges (and is resent to).
+            if in_epoch && members.contains(&n) {
                 let hi = self.ack.hold_sent_hi.entry(n).or_insert(0);
                 *hi = (*hi).max(reached);
                 let q = self.ack.hold_sent.entry(n).or_default();
@@ -5302,10 +5332,11 @@ impl Core {
                     // owner's answers wait for that ack (the hold's group),
                     // so the member keeps what it acknowledged and ships it
                     // if it claims the lease. A subscriber outside the
-                    // epoch is not in the group: its copy stays speculation.
+                    // epoch is sent only rows the group acknowledged
+                    // (`gate_cap`), so its copy is the group's too.
                     committed: !knob_uncommitted
                         && if in_epoch {
-                            hold_group && members.contains(&n)
+                            hold_group
                         } else {
                             batch.iter().all(|t| {
                                 t.records.is_empty()
@@ -5487,6 +5518,18 @@ impl Core {
                 self.stats.hold_ack_wait_ms += (now.wait.0 - sent.0).max(0) as u64;
                 q.pop_front();
             }
+        }
+        // The group acknowledged more: the subscribers outside the epoch
+        // are sent what it holds now (`stream_ahead`'s `gate_cap`).
+        if self.hold_group()
+            && self.epoch_streams_ahead()
+            && self
+                .stream_subscribers()
+                .iter()
+                .any(|n| !self.pr.epoch_members.contains(n))
+        {
+            let tip = replica.journal_tip();
+            self.stream_ahead(now, 0, tip, replica, out);
         }
         // A resend carries one batch: while the member's ack is short of
         // what was streamed to it, its ack of the resend asks for the next.
