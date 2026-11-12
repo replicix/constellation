@@ -2035,41 +2035,48 @@ impl Meta {
     }
 
     /// ADR-59 part B (D2, D4): a segment of this node's own that carries a
-    /// single `DropHeld` and matches no journal row (a deposition stranded the
-    /// record's row after the segment's PUT: the shipper's ack never found
-    /// it) is the record in the log all the same. What the ack of the row
-    /// would have done is done from the record: its identities are retired
-    /// and this node's own copies of them holed, the decided plan (if the drop
-    /// is still waiting for it) is marked shipped. Whether `records` was such
-    /// a segment.
-    pub fn own_drop_segment(&self, records: &[LogRecord]) -> Result<bool, MetaError> {
-        let [LogRecord::DropHeld {
-            ino, rolled_back, ..
-        }] = records
-        else {
-            return Ok(false);
-        };
-        let idents: BTreeSet<(u64, u64)> = rolled_back.iter().map(|(ident, _)| *ident).collect();
+    /// `DropHeld` (alone or with companion rows) and matches no journal row (a
+    /// deposition stranded the rows after the segment's PUT: the shipper's ack
+    /// never found them) is the record in the log all the same. What the ack
+    /// of its row would have done is done from the record: its identities are
+    /// retired and this node's own copies of them holed, and the decided plan
+    /// whose record's journal seq is among the segment's `rows` (if the drop is
+    /// still waiting for it) is marked shipped. Whether `records` carried a
+    /// `DropHeld`.
+    pub fn own_drop_segment(&self, records: &[LogRecord], rows: &[u64]) -> Result<bool, MetaError> {
+        let mut found = false;
         let mut tx = self.db.write_tx();
-        if let Some(raw) = tx.get(&self.local, drop_plan_key(*ino))? {
-            let mut plan: DropPlan = postcard::from_bytes(&raw)?;
-            let named: BTreeSet<(u64, u64)> = plan.idents.iter().copied().collect();
-            if !plan.shipped && idents.is_subset(&named) {
-                // (Its own row is in the log: it covers the copy of the
-                // record that the deposition kept.)
-                self.member_cover_own_rows_tx(&mut tx, plan.epoch, &[plan.jseq])?;
-                plan.shipped = true;
-                tx.insert(
-                    &self.local,
-                    drop_plan_key(*ino),
-                    postcard::to_allocvec(&plan)?,
-                );
-                counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, -1)?;
+        for rec in records {
+            let LogRecord::DropHeld {
+                ino, rolled_back, ..
+            } = rec
+            else {
+                continue;
+            };
+            found = true;
+            let idents: BTreeSet<(u64, u64)> =
+                rolled_back.iter().map(|(ident, _)| *ident).collect();
+            if let Some(raw) = tx.get(&self.local, drop_plan_key(*ino))? {
+                let mut plan: DropPlan = postcard::from_bytes(&raw)?;
+                if !plan.shipped && rows.contains(&plan.jseq) {
+                    // (Its own row is in the log: it covers the copy of the
+                    // record that the deposition kept.)
+                    self.member_cover_own_rows_tx(&mut tx, plan.epoch, &[plan.jseq])?;
+                    plan.shipped = true;
+                    tx.insert(
+                        &self.local,
+                        drop_plan_key(*ino),
+                        postcard::to_allocvec(&plan)?,
+                    );
+                    counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, -1)?;
+                }
             }
+            self.retire_and_hole_tx(&mut tx, &idents)?;
         }
-        self.retire_and_hole_tx(&mut tx, &idents)?;
-        tx.commit()?;
-        Ok(true)
+        if found {
+            tx.commit()?;
+        }
+        Ok(found)
     }
 
     /// Whether the decided drop of `ino` has its record shipped from this node.

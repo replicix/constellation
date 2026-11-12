@@ -2824,10 +2824,7 @@ pub fn drop_named_idents(log: &super::check::Oracle) -> BTreeMap<Rid, BTreeSet<(
 /// Whether `ack` answered the very row a `DropHeld` of the log names (the
 /// judged transaction is one of `named`'s identities for the rid). A later
 /// retry of a named rid is another row: its rollback is judged as any.
-pub fn acks_the_named_row(
-    named: &BTreeMap<Rid, BTreeSet<(u64, u64)>>,
-    ack: &AckEntry,
-) -> bool {
+pub fn acks_the_named_row(named: &BTreeMap<Rid, BTreeSet<(u64, u64)>>, ack: &AckEntry) -> bool {
     let (Some(idents), Some(t)) = (
         named.get(&ack.rid),
         ack.judged.as_ref().and_then(|j| j.tx.as_ref()),
@@ -3738,9 +3735,7 @@ mod tests {
             epoch: 1,
             records: Vec::new(),
         };
-        let run_tx = |first: u64,
-                      records: Vec<LogRecord>,
-                      completed: &[(Rid, (u64, usize))]| {
+        let run_tx = |first: u64, records: Vec<LogRecord>, completed: &[(Rid, (u64, usize))]| {
             let o = Oracles::new(Bucket::new(1, (0, 0)));
             *o.acks.lock().unwrap() = vec![AckEntry {
                 judged: Some(Judgement {

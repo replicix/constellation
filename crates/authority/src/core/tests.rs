@@ -63191,6 +63191,59 @@ mod await_retry {
         assert!(succ.meta.completed_outcome(rid).unwrap().is_some());
     }
 
+    /// ADR-59 part B (D2), review F4: the record's segment carried a companion
+    /// row besides the `DropHeld` (a shipped round takes whole transactions
+    /// from the journal head), and a deposition stranded the journal rows
+    /// before the reader met the segment. It is matched by the plan's record
+    /// seq among the segment's rows, not by the record count. Fail before:
+    /// only a segment of a single record was recognised; this one stopped the
+    /// reader ("claims our node id ... does not match the journal").
+    #[test]
+    fn a_segment_of_the_droppers_with_a_companion_row_is_matched_by_the_plan() {
+        let (mut h, broken) = holder_with_a_seed();
+        h.meta.set_parent_taint_conservative(false);
+        put_member_copy_of_the_seed(&h);
+        let _ = drop_held_decide_via_core(&mut h, broken);
+        let (jseq, epoch) = {
+            let plans = h.meta.drop_plans().unwrap();
+            (plans[0].1, plans[0].2)
+        };
+        let record = h
+            .meta
+            .journal_txs_from(0, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .flat_map(|t| t.records)
+            .find(|r| matches!(r, LogRecord::DropHeld { .. }))
+            .expect("the record is journaled");
+        let companion = LogRecord::Completed { rid: h.rid(50) };
+        let records = vec![record, companion];
+        let payload =
+            crate::segment::encode(1, epoch, jseq + 1, &[jseq, jseq + 1], &[], &records).unwrap();
+        let mut r = restarted(h);
+        r.meta.strand_deposed(epoch + 1).unwrap();
+        assert!(
+            r.meta
+                .journal_txs_from(0, usize::MAX)
+                .unwrap()
+                .iter()
+                .all(|t| !t
+                    .records
+                    .iter()
+                    .any(|rec| matches!(rec, LogRecord::DropHeld { .. }))),
+            "the deposition stranded the record's row"
+        );
+        let seq = r.core.ship.next_seq;
+        let mut out = Vec::new();
+        r.core
+            .apply_incoming(r.clk(), seq, &payload, &r.meta, &mut out)
+            .unwrap();
+        r.core.complete_ready(r.clk(), &r.meta, &mut out);
+        assert_eq!(r.core.stats.own_recovered, 1);
+        assert_eq!(r.core.stats.drops_applied, 1);
+        assert_eq!(live_copy_rows(&r.meta), 0, "the own copy is a hole");
+    }
+
     /// `put_member_copy_of_the_seed` for the seed among `sealed`.
     fn put_member_copy_of_the_seed_of(h: &Harness, sealed: &[constellation_meta::BackupTx]) {
         let seed = sealed
