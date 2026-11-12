@@ -4595,6 +4595,17 @@ hold that is never released is a bug the sim's quiescence check finds
 (`read_holds_gone`), not a degraded read. A node's own acknowledged write binds
 its reads in every incarnation of the node (the sim's check).
 
+A hold ends with the copy that carries it, so a copy that no claim will re-ship
+must go: the rows past a sealed `through` (`TailFollowsThrough`) and, for a claim
+that carries no tail at all (every `through` of its marker is 0), the rows of
+the epochs below the ones its marker names, whose own claim never landed its
+marker (`locks-unlinked-delegated-dcrash-pause` seeds 651, 3994, 5767). Every
+replica drops them where it applies the marker (`member_rules_tx`); the
+claimant, which never applies its own marker, runs the same rules at its gate,
+in the re-ship's transaction (`StrandArgs::marker`). Before, those copies stayed
+for good (a silent leak without the holds) and their holds failed reads of their
+keys at the bound.
+
 *Not covered*: a `read` or `copy_file_range` on a file handle opened before a
 deposition does not consult the holds (a read runs on an io_uring ring thread,
 which must not wait): close-to-open holds (the open is the check), but

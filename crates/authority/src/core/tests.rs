@@ -5674,6 +5674,7 @@ fn a_retired_hold_owners_acked_row_is_replayed() {
                 abandoned: None,
                 carried: &carried,
                 proof: &proof,
+                marker: &[],
             }),
             None,
         )
@@ -64332,6 +64333,7 @@ mod hold_ack {
                     abandoned: None,
                     carried: &carried,
                     proof: &proof,
+                    marker: &[],
                 }),
                 None,
             )
