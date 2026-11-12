@@ -60452,6 +60452,51 @@ mod c2g_settle {
         assert_eq!(at_landing, vec![rid], "{answered:?}");
     }
 
+    /// `long-delegated-late-answers` seed 3159 (I1): the same journal row
+    /// once the gate has opened. A root that took over drained its own inbox
+    /// batch inside the gate and refused the op there; the gate opened, a
+    /// sealed delegation's drain ran `answer_awaiting_log`, and the op was
+    /// answered `EEXIST` (class `Archive`) from the refusal its journal alone
+    /// held, before the ship. The row is answered once it is the log's.
+    /// Fails on the parent: answered at once, with the gate open.
+    #[test]
+    fn an_open_root_does_not_answer_an_op_awaiting_the_log_from_its_unshipped_journal() {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        let rid = h.rid(1);
+        let op = h.create("t");
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: op.clone(),
+            tag: Default::default(),
+        });
+        // The tenure is open: no gate.
+        h.hold(2, None);
+        assert!(h.core.lease.gate.is_none());
+        h.core.clients.get_mut(&rid).unwrap().phase = client::Phase::InboxWaiting { epoch: 1 };
+        // The gate's drain journaled the rid's outcome; it has not shipped.
+        constellation_meta::execute_mutate(&h.meta, &op, Some(rid)).unwrap();
+        let mut out = Vec::new();
+        h.core.answer_awaiting_log(h.clk(), &h.meta, &mut out);
+        assert!(
+            replies(&out).is_empty(),
+            "answered from the unshipped journal: {out:?}"
+        );
+        // Shipped, it is the log's.
+        ship_all(&mut h);
+        let mut out = Vec::new();
+        h.core.answer_awaiting_log(h.clk(), &h.meta, &mut out);
+        assert_eq!(
+            replies(&out)
+                .into_iter()
+                .map(|(r, _)| r)
+                .collect::<Vec<_>>(),
+            vec![rid],
+            "{out:?}"
+        );
+    }
+
     /// S5: the redirect is S3's live test (`on_forward`), and only for a
     /// delegate this tenure has granted (`Held` before): not the
     /// delegate's own settle (its stopped copy sends it straight back), not

@@ -453,9 +453,15 @@ impl Core {
     ) {
         // An earlier attempt (P2P, or a previous epoch's batch) may have
         // executed it already — not this delegate's own uncommitted row of
-        // it (D6): its generation may end without the row.
-        if let Some(outcome) = super::client::completed_as_outcome(replica, rid, epoch)
-            .filter(|_| self.completed_row_settled(rid, replica))
+        // it (D6): its generation may end without the row; nor a root row of
+        // this node's own unshipped journal (`log_carries_outcome`: an
+        // earlier tenure's drain of this node's own batch, which the archive
+        // alone commits; the inbox's sequencer answers it by rid).
+        if let Some(outcome) =
+            super::client::completed_as_outcome(replica, rid, epoch).filter(|_| {
+                self.completed_row_settled(rid, replica)
+                    && super::client::log_carries_outcome(replica, rid)
+            })
         {
             let (outcome, source) = Self::eio_unless_recorded(
                 outcome,

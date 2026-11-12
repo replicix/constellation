@@ -549,6 +549,21 @@ fn journal_carries_outcome(replica: &dyn Replica, rid: Rid) -> bool {
         })
 }
 
+/// Whether `rid`'s `completed` row may be read as the log's (an answer of
+/// class `Archive`): not when it is a root row (`gen == 0`) of this node's
+/// own unshipped journal, which is this journal's alone until it ships, a
+/// tenure's or a deposed one's (`long-delegated-late-answers` seed 3159: a
+/// root that took over drained its own inbox batch in the takeover gate, the
+/// gate opened, and a sealed delegation's drain answered the op `EEXIST` from
+/// the refusal its lone journal held, before the ship; only the gate's own
+/// re-appends were excluded). The node's own ship (`ship_landed`), the open
+/// (`resolve_moot_waits`) or the settle answers it. A delegation row
+/// (`gen != 0`) commits by its group or the log
+/// (`Core::completed_row_settled`).
+pub(crate) fn log_carries_outcome(replica: &dyn Replica, rid: Rid) -> bool {
+    !replica.outcome_row(rid).is_some_and(|r| r.gen == 0)
+}
+
 /// The rows of `streams` whose generation is live in the delegation table
 /// this replica holds from the log. A generation the table does not list
 /// has ended (its `DelegateNodeEnded` is applied: its rows are in the log below the
@@ -3860,8 +3875,9 @@ impl Core {
                 continue;
             };
             // Not from this delegate's own uncommitted row (D6): the log's
-            // answer is still to come.
-            if !self.completed_row_settled(rid, replica) {
+            // answer is still to come. Nor from a root row of this node's
+            // own unshipped journal, gate or no gate (`log_carries_outcome`).
+            if !self.completed_row_settled(rid, replica) || !log_carries_outcome(replica, rid) {
                 continue;
             }
             match position {
@@ -4038,9 +4054,9 @@ impl Core {
             }
             // Not from this delegate's own uncommitted row (D6): the op
             // asks the new holder, as one the log does not carry.
-            if let Some(outcome) = completed_as_outcome(replica, rid, epoch)
-                .filter(|_| self.completed_row_settled(rid, replica))
-            {
+            if let Some(outcome) = completed_as_outcome(replica, rid, epoch).filter(|_| {
+                self.completed_row_settled(rid, replica) && log_carries_outcome(replica, rid)
+            }) {
                 // Read from the log, as `answer_awaiting_log` does.
                 self.finish_as(
                     now,
