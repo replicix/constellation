@@ -3,7 +3,7 @@
 //! probes themselves are `constellation_store_s3::probe`; this module only
 //! prints them and decides what is fatal.
 
-use constellation_store_s3::{CasProbeReport, Versioning};
+use replicix_objcas::{CasProbeReport, Versioning};
 
 /// Print the probe report under `doctor`'s capability lines. Returns an
 /// error when a probe found a precondition the provider did not enforce

@@ -11,19 +11,19 @@ fuzz_target!(|data: &[u8]| {
         let _ = meta.gossip_seed();
         let _ = meta
             .compression
-            .parse::<constellation_store_s3::CompressionSetting>();
+            .parse::<replicix_chunkfmt::CompressionSetting>();
         // What `load_fs` admits must survive every `/ chunk_size` downstream.
         if constellation_fs_core::validate_chunk_size(meta.chunk_size).is_ok() {
-            let layout = constellation_fs_core::ChunkLayout::new(meta.chunk_size);
+            let layout = replicix_chunkfmt::ChunkLayout::new(meta.chunk_size);
             let _ = layout.chunk_count(u64::MAX);
             let _ = layout.chunk_count(data.len() as u64);
         }
     }
-    if let Ok(lease) = serde_json::from_slice::<constellation_store_s3::lease::Lease>(data) {
+    if let Ok(lease) = serde_json::from_slice::<replicix_objcas::lease::Lease>(data) {
         let _ = lease.is_claimable(i64::MIN);
         let _ = lease.is_claimable(i64::MAX);
         let _ = lease.expires_in_ms(i64::MIN);
-        if lease.epoch <= constellation_store_s3::lease::MAX_EPOCH {
+        if lease.epoch <= replicix_objcas::lease::MAX_EPOCH {
             let _ = lease.fenced_for_retirement(1, 0);
         }
     }

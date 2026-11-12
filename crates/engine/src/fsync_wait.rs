@@ -5,7 +5,7 @@
 //! the mount's `--fsync-mode` says, and it never returns `EIO` merely
 //! because S3 is *transiently* unreachable: it keeps retrying, as nfs(5)'s
 //! `hard` mounts keep retrying an RPC. A failure the classifier calls
-//! permanent (`constellation_store_s3::classify`: access denied, no such
+//! permanent (`replicix_objcas::classify`: access denied, no such
 //! bucket, a disabled KMS key, content this node lost) answers `EIO` at
 //! once. In every failed case the data stays where it was — the chunks in
 //! the local cache and in the durable `pending_upload` rows, the journal

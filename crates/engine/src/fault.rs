@@ -3,7 +3,7 @@
 //! daemon's own timing (plan 30 §M4 round 2, `poison-record-isolation`).
 //! Unset, each is one cached environment lookup and changes nothing.
 
-use constellation_fs_core::ChunkHash;
+use replicix_chunkfmt::ChunkHash;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

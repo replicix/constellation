@@ -122,7 +122,7 @@ impl GcConfig {
         let var = |k: &str| var(k).filter(|v| !v.trim().is_empty());
         let mut cfg = GcConfig::default();
         if let Some(v) = var("CONSTELLATION_CSI_ENGINE_IDLE_TTL") {
-            let ttl = crate::params::parse_duration(&v)
+            let ttl = replicix_csi_common::params::parse_duration(&v)
                 .map_err(|e| format!("CONSTELLATION_CSI_ENGINE_IDLE_TTL: {e}"))?;
             cfg.idle_ttl = (!ttl.is_zero()).then_some(ttl);
         }

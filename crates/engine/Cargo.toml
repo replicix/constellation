@@ -17,6 +17,9 @@ test-util = ["dep:tempfile"]
 # Linux flag the view used to decode (`O_*`, `FALLOC_FL_*`, `SEEK_*`,
 # `S_IF*`) arrives decoded as a constellation-vfs type since C4.
 [dependencies]
+replicix-objcas.workspace = true
+replicix-chunkfmt.workspace = true
+replicix-platform-lite.workspace = true
 constellation-types.workspace = true
 constellation-platform.workspace = true
 constellation-vfs.workspace = true
@@ -28,7 +31,7 @@ constellation-mtree.workspace = true
 # table `control` binds the engine to (no `web` feature: HTTP is a host's).
 constellation-control.workspace = true
 constellation-net.workspace = true
-constellation-upload-concurrency.workspace = true
+replicix-upload-concurrency.workspace = true
 constellation-store-s3.workspace = true
 fjall = { version = "3.1", package = "fjall" }
 # `snapacct`'s per-chunk run list: almost every chunk has exactly one run.

@@ -138,8 +138,9 @@ use crate::store::{
     adjust_usage_tx, counter_add_tx, counter_get, counter_set_tx, journal, local, spec, Meta,
     UsageTracker, KV_POISONED_COUNT,
 };
-use constellation_fs_core::{ChunkHash, ChunkInfo, Ino, Manifest};
+use constellation_fs_core::{ChunkInfo, Ino, Manifest};
 use fjall::Readable;
+use replicix_chunkfmt::ChunkHash;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
@@ -1726,7 +1727,7 @@ mod tests {
         let b = ChunkHash::of(b"b");
         let chunks = BTreeMap::from([(0u64, a), (1u64, b)]);
         let m = Manifest {
-            layout: constellation_fs_core::ChunkLayout::new(4),
+            layout: replicix_chunkfmt::ChunkLayout::new(4),
             file_len: 8,
             chunks: ChunkInfo::Inline(chunks),
         }
@@ -1764,7 +1765,7 @@ mod tests {
         // A seed write whose chunk is lost, and a dependent on the same ino.
         let hash = ChunkHash::of(b"lost");
         let manifest = Manifest {
-            layout: constellation_fs_core::ChunkLayout::new(4096),
+            layout: replicix_chunkfmt::ChunkLayout::new(4096),
             file_len: 7,
             chunks: ChunkInfo::Inline(BTreeMap::from([(0u64, hash)])),
         }
@@ -1841,7 +1842,7 @@ mod tests {
         meta.take_shippable(usize::MAX).unwrap();
         let hash = ChunkHash::of(b"slow");
         let manifest = Manifest {
-            layout: constellation_fs_core::ChunkLayout::new(4096),
+            layout: replicix_chunkfmt::ChunkLayout::new(4096),
             file_len: 4,
             chunks: ChunkInfo::Inline(BTreeMap::from([(0u64, hash)])),
         }
@@ -1956,7 +1957,7 @@ mod tests {
 
         fn manifest_naming(hash: ChunkHash) -> Vec<u8> {
             Manifest {
-                layout: constellation_fs_core::ChunkLayout::new(4096),
+                layout: replicix_chunkfmt::ChunkLayout::new(4096),
                 file_len: 7,
                 chunks: ChunkInfo::Inline(BTreeMap::from([(0u64, hash)])),
             }

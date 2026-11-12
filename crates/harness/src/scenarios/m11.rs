@@ -147,7 +147,7 @@ pub(super) fn cluster_with_deleg_ttl(
             .unwrap_or_else(|| env.direct_endpoint.clone());
         let mut c = Client::new(root.path(), name, &endpoint, &backend)?
             .with_own_node_key()
-            .with_env("CONSTELLATION_LEASE_TTL_MS", &ttl)
+            .with_env("REPLICIX_LEASE_TTL_MS", &ttl)
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
             .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "200")
             // Plan 30 §M12: the placement is on by default; these

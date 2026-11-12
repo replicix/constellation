@@ -28,7 +28,7 @@ use constellation_platform::clock::protocol;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
-pub use constellation_store_s3::lease::lease_ttl_ms;
+pub use replicix_objcas::lease::lease_ttl_ms;
 
 /// Bound on [`LeaseView::wait_quiescent`]: a FUSE mutation that stays
 /// admitted this long is stuck in the metadata store, not in flight.
@@ -365,10 +365,10 @@ impl LeaseView {
 mod tests {
     use super::*;
     use constellation_authority::{Ms, Now};
-    use constellation_store_s3::lease::now_unix_ms;
-    use constellation_store_s3::{Lease, LeaseMode, LeaseStore};
+    use replicix_objcas::lease::now_unix_ms;
+    use replicix_objcas::{Lease, LeaseMode, LeaseStore};
 
-    fn tag() -> constellation_store_s3::LeaseTag {
+    fn tag() -> replicix_objcas::LeaseTag {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();

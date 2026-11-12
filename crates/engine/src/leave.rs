@@ -111,7 +111,7 @@ pub async fn admin_leave(
                 path,
             });
         }
-        let held = constellation_store_s3::live_leases_held_by(store.clone(), target)
+        let held = replicix_objcas::live_leases_held_by(store.clone(), target)
             .await
             .map_err(|e| LeaveError::Other(format!("listing leases: {e}")))?;
         if let Some(partition) = held.into_iter().next() {
@@ -139,7 +139,7 @@ pub async fn admin_leave(
     // flush-re-claim or re-acquire one again — even before it sees its
     // tombstone — and a continuation epoch it carried is abandoned by
     // its members (the flush they wait for will never come).
-    let fenced = constellation_store_s3::fence_retired(store, target)
+    let fenced = replicix_objcas::fence_retired(store, target)
         .await
         .map_err(|e| LeaveError::Other(format!("fencing node {target}'s leases: {e}")))?;
     if !fenced.is_empty() {
@@ -231,10 +231,9 @@ mod tests {
     use constellation_meta::MetaStore;
     use constellation_net::Peers;
     use constellation_store_s3::designation::{DesignationMode, DesignationStore};
-    use constellation_store_s3::{
-        claim_node_id, get_node, write_eligible_roster, Lease, LeaseMode, LeaseStore,
-    };
+    use constellation_store_s3::{claim_node_id, get_node, write_eligible_roster};
     use object_store::memory::InMemory;
+    use replicix_objcas::{Lease, LeaseMode, LeaseStore};
 
     fn open_meta() -> Arc<Meta> {
         Arc::new(Meta::open_in_memory().unwrap())
@@ -361,14 +360,14 @@ mod tests {
             !fenced.released,
             "not released: the next taker ships a marker"
         );
-        assert!(fenced.is_expired(constellation_store_s3::lease::now_unix_ms()));
+        assert!(fenced.is_expired(replicix_objcas::lease::now_unix_ms()));
         assert_eq!(fenced.retired, vec![b]);
         // The retired node's renewal on its old tag loses.
         let renewed = Lease::granted("p0", b, 3, 60_000);
         assert!(ls.try_swap(&renewed, &tag_b).await.is_err());
         // Its core refuses the fenced object; another node's classifies
         // it as a takeover with a marker.
-        let now = constellation_authority::Ms(constellation_store_s3::lease::now_unix_ms());
+        let now = constellation_authority::Ms(replicix_objcas::lease::now_unix_ms());
         let as_b = constellation_authority::Config::defaults(b, 1);
         let plan = constellation_authority::core::LeaseState::default().classify(
             Now::same(now.0),

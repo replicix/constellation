@@ -32,8 +32,9 @@ use anyhow::{bail, Context, Result};
 use constellation_fs_core::cache::{CacheVerify, DiskCache};
 use constellation_meta::Meta;
 use constellation_platform::{CredentialSource, HostServices};
-use constellation_store_s3::{ChunkStore, CompressionSetting, FsMeta};
+use constellation_store_s3::{ChunkStore, FsMeta};
 use constellation_vfs::{FrontendCaps, FrontendEvents, OpWatch};
+use replicix_chunkfmt::CompressionSetting;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -127,7 +128,7 @@ pub struct Preopened {
     url: String,
     backend: Arc<dyn object_store::ObjectStore>,
     backend_info: crate::backend::BackendInfo,
-    caps: constellation_store_s3::Capabilities,
+    caps: replicix_objcas::Capabilities,
     p2p: Option<crate::p2p::BoundP2p>,
 }
 
@@ -297,7 +298,7 @@ pub struct Engine {
     snapsched: Arc<crate::snapsched::Scheduler>,
     staging_dir: PathBuf,
     staging_budget: Arc<staging::StagingBudget>,
-    lease_mode: constellation_store_s3::LeaseMode,
+    lease_mode: replicix_objcas::LeaseMode,
     /// The authority core's lease state, mirrored for the views' fast path.
     lease: Arc<lease::LeaseView>,
     /// Plan 30 §M11: the delegations this node holds.
@@ -817,7 +818,7 @@ impl Engine {
             );
         }
         let lease_mode = if caps.etag_cas {
-            constellation_store_s3::LeaseMode::Cas
+            replicix_objcas::LeaseMode::Cas
         } else {
             tracing::warn!(
                 "backend has no etag CAS (If-Match): lease renew/takeover cannot be \
@@ -825,7 +826,7 @@ impl Engine {
                  ONE node only. Run `constellation doctor` and use an S3 backend with \
                  If-Match for multi-node operation."
             );
-            constellation_store_s3::LeaseMode::SingleWriter
+            replicix_objcas::LeaseMode::SingleWriter
         };
         let write_mode = Arc::new(writeback::WriteModeState::new(initial_write_mode));
         // Plan 30 M5: the lease is the authority core's state; this is the
@@ -969,7 +970,7 @@ impl Engine {
                 loop {
                     timer.tick().await;
                     background.wait_active().await;
-                    let now_ms = constellation_store_s3::lease::now_unix_ms();
+                    let now_ms = replicix_objcas::lease::now_unix_ms();
                     // Off the runtime's worker (finding 14): one prune can
                     // be tens of thousands of rows behind a slow disk.
                     let pruned = crate::store_io::store_call(|| {
@@ -1023,7 +1024,7 @@ impl Engine {
         let designations = Arc::new(designation::DesignationManager::new(
             constellation_store_s3::designation::DesignationStore::new(
                 store.inner().clone(),
-                if lease_mode == constellation_store_s3::LeaseMode::Cas {
+                if lease_mode == replicix_objcas::LeaseMode::Cas {
                     constellation_store_s3::designation::DesignationMode::Cas
                 } else {
                     constellation_store_s3::designation::DesignationMode::SingleWriter
@@ -2244,7 +2245,7 @@ impl Engine {
     pub fn fail_write_sessions_naming(
         &self,
         ino: u64,
-        lost: &std::collections::BTreeSet<constellation_fs_core::ChunkHash>,
+        lost: &std::collections::BTreeSet<replicix_chunkfmt::ChunkHash>,
     ) -> (usize, usize) {
         use crate::view::SessionFate;
         let (mut failed, mut busy) = (0, 0);
@@ -2711,7 +2712,7 @@ impl Engine {
     pub fn staging_budget(&self) -> &Arc<staging::StagingBudget> {
         &self.staging_budget
     }
-    pub fn lease_mode(&self) -> constellation_store_s3::LeaseMode {
+    pub fn lease_mode(&self) -> replicix_objcas::LeaseMode {
         self.lease_mode
     }
     pub fn lease(&self) -> &Arc<lease::LeaseView> {

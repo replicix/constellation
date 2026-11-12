@@ -260,7 +260,7 @@ impl View {
         // Kick sequential readahead for upcoming committed chunks.
         self.prefetch
             .on_read(ino, offset, len, self.chunk_size, &hashes);
-        let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
+        let layout = replicix_chunkfmt::ChunkLayout::new(self.chunk_size);
         // Plan 38 §3(d): one slice of one verified, resident chunk, with no
         // write session to overlay, goes to the frontend's kernel as the
         // chunk file itself; anything else (a read spanning chunks above
@@ -537,7 +537,7 @@ impl View {
         let _op = self.inode_ops.lock(ino);
         let manifest = self.load_manifest(ino)?;
         let hashes = self.chunk_list(&manifest)?;
-        let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
+        let layout = replicix_chunkfmt::ChunkLayout::new(self.chunk_size);
         let mut writes = self.writes.lock(ino);
         let ws = self.write_state(&mut writes, ino, &manifest)?;
         // Guard the range arithmetic: a huge offset near u64::MAX would
@@ -663,7 +663,7 @@ impl View {
         new_size: u64,
         manifest: &Manifest,
     ) -> Result<(), Code> {
-        let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
+        let layout = replicix_chunkfmt::ChunkLayout::new(self.chunk_size);
         let cs = u64::from(self.chunk_size);
         let ws = self.write_state(writes, ino, manifest)?;
         self.quota_check(ino, new_size)?;

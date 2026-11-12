@@ -23,7 +23,8 @@ use constellation_meta::{Meta, MutateOp, MutateOutcome, PublishBasis, Rid, Touch
 use constellation_store_s3::commits::{CommitChain, CommitPayload};
 use constellation_store_s3::heartbeat::HeartbeatStore;
 use constellation_store_s3::inbox::InboxStore;
-use constellation_store_s3::{LeaseMode, LeaseStore, LogStore, StoreError};
+use constellation_store_s3::{LogStore, StoreError};
+use replicix_objcas::{LeaseMode, LeaseStore};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -4623,15 +4624,15 @@ async fn rebuild_from_log(
         .map_err(|e| e.to_string())
 }
 
-fn cas_failure(e: StoreError) -> CasFailure {
-    match e {
+fn cas_failure(e: impl Into<StoreError>) -> CasFailure {
+    match e.into() {
         StoreError::CasConflict | StoreError::AlreadyExists => CasFailure::Conflict,
         other => CasFailure::Failed(other.to_string()),
     }
 }
 
 /// The current lease object, read straight from the bucket (checkers).
-pub async fn read_lease(bucket: &Bucket) -> Option<constellation_store_s3::Lease> {
+pub async fn read_lease(bucket: &Bucket) -> Option<replicix_objcas::Lease> {
     let leases = LeaseStore::new(bucket.raw(), "p0", LeaseMode::Cas);
     leases.get().await.ok().flatten().map(|(l, _)| l)
 }

@@ -67,7 +67,7 @@ fn node(
 ) -> Result<Client> {
     let mut c = Client::new(root, name, &proxy.endpoint(), backend)?
         .with_own_node_key()
-        .with_env("CONSTELLATION_LEASE_TTL_MS", &TTL_MS.to_string())
+        .with_env("REPLICIX_LEASE_TTL_MS", &TTL_MS.to_string())
         .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
         .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "200")
         .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000")

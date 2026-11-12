@@ -35,8 +35,9 @@
 //! (`run.rs`).
 
 use constellation_authority::{segment, NodeId};
-use constellation_fs_core::{ChunkHash, ChunkInfo, ChunkLayout, Ino, Manifest};
+use constellation_fs_core::{ChunkInfo, Ino, Manifest};
 use constellation_meta::{LogRecord, Meta};
+use replicix_chunkfmt::{ChunkHash, ChunkLayout};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

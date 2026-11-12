@@ -86,10 +86,10 @@ use std::sync::Arc;
 
 pub(super) fn register(r: &mut Router, svc: &Arc<EngineControl>) {
     unary::<SnapshotPolicyCheck>(r, svc, |s, _, p| {
-        policy_check(&s.meta, &p, constellation_store_s3::lease::now_unix_ms())
+        policy_check(&s.meta, &p, replicix_objcas::lease::now_unix_ms())
     });
     unary::<SnapshotPolicySimulate>(r, svc, |s, _, p| {
-        policy_simulate(&s.meta, &p, constellation_store_s3::lease::now_unix_ms())
+        policy_simulate(&s.meta, &p, replicix_objcas::lease::now_unix_ms())
     });
     unary::<SnapshotPolicyList>(r, svc, |s, _, _| policy_list(&s.meta));
     unary::<SnapshotPolicyShow>(r, svc, |s, _, p| {

@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 constellation-types.workspace = true
-blake3.workspace = true
+replicix-chunkfmt.workspace = true
 bytes.workspace = true
 region = "4.0.0"
 serde.workspace = true

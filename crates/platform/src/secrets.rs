@@ -29,7 +29,7 @@ use std::time::SystemTime;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::dirs::Dirs;
-use crate::lock::FileLock;
+use replicix_platform_lite::FileLock;
 
 /// A secret value: the bytes are wiped when it is dropped, and `Debug`
 /// never prints them.
@@ -245,7 +245,9 @@ impl SecretStore for FileSecretStore {
         }
         let _guard = self
             .lock
-            .lock(crate::lock::open_lock_file(&sibling(&path, "lock"))?)?;
+            .lock(replicix_platform_lite::open_lock_file(&sibling(
+                &path, "lock",
+            ))?)?;
         let current = FileSecretStore::read_file(&path)?;
         let next = f(current.as_ref().map(Secret::expose))?;
         if let Some(mut next) = next {
@@ -262,62 +264,6 @@ impl SecretStore for FileSecretStore {
             Err(e) => format!("{name} ({e})"),
         }
     }
-}
-
-/// Keep this process's memory out of core dumps (plan 37 K6a): a process
-/// whose credentials live only in memory — an engine pod waiting for
-/// `fs.unlock`, the CSI plugins holding the Secrets they pass on — must not
-/// write them wherever the node's `core_pattern` points when it crashes.
-/// `RLIMIT_CORE` 0 stops a core file (and handlers like systemd-coredump
-/// that honour it); on Linux the process is also made non-dumpable
-/// (`PR_SET_DUMPABLE` 0), which stops every core handler and keeps other
-/// processes of the same uid from reading its memory through `/proc` or
-/// `ptrace`. A no-op where neither exists.
-pub fn forbid_core_dumps() -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let none = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: a valid rlimit for this process.
-        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        // SAFETY: PR_SET_DUMPABLE takes one integer argument.
-        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-/// Whether [`forbid_core_dumps`] is in effect for this process.
-pub fn core_dumps_forbidden() -> bool {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        // SAFETY: PR_GET_DUMPABLE takes no argument.
-        if unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } != 0 {
-            return false;
-        }
-    }
-    #[cfg(unix)]
-    {
-        let mut limit = libc::rlimit {
-            rlim_cur: 1,
-            rlim_max: 1,
-        };
-        // SAFETY: a valid out-pointer.
-        if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) } != 0 || limit.rlim_cur != 0 {
-            return false;
-        }
-        true
-    }
-    #[cfg(not(unix))]
-    false
 }
 
 /// Secrets held in this process's memory only. Cloning shares the same

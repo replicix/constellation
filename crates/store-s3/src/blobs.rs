@@ -102,14 +102,17 @@ impl BlobStore {
         }
         let path = Self::path(hash);
         let body = match self.seal.as_deref() {
-            Some(seal) => {
-                crate::e2e::encrypt_object(&seal.blobs, path.as_ref().as_bytes(), &bytes)?
-            }
+            Some(seal) => replicix_chunkfmt::e2e::encrypt_object(
+                &seal.blobs,
+                path.as_ref().as_bytes(),
+                &bytes,
+            )?,
             None => bytes,
         };
         // Content-addressed: an object already there *is* these bytes.
         // Plan 30 §M4 item 1: a 409 retries rather than passing for one.
-        crate::cas::create_content_addressed(self.store.as_ref(), &path, body.into()).await?;
+        replicix_objcas::cas::create_content_addressed(self.store.as_ref(), &path, body.into())
+            .await?;
         Ok(())
     }
 
@@ -120,9 +123,11 @@ impl BlobStore {
         let path = Self::path(hash);
         let stored = self.store.get(&path).await?.bytes().await?;
         let body = match self.seal.as_deref() {
-            Some(seal) => {
-                crate::e2e::decrypt_object(&seal.blobs, path.as_ref().as_bytes(), &stored)?
-            }
+            Some(seal) => replicix_chunkfmt::e2e::decrypt_object(
+                &seal.blobs,
+                path.as_ref().as_bytes(),
+                &stored,
+            )?,
             None => stored.to_vec(),
         };
         if self.hash(&body) != *hash {

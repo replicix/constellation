@@ -49,8 +49,9 @@ use crate::record::LogRecord;
 use crate::store::held::{blame_walk, seed_inos_of, DeferralBlame, PoisonMap};
 use crate::store::misc::{add_pending_claim_tx, cr_key, remove_pending_row_tx};
 use crate::store::{counter_add_tx, counter_get, local, Meta};
-use constellation_fs_core::{ChunkHash, ChunkInfo, Ino, Manifest};
+use constellation_fs_core::{ChunkInfo, Ino, Manifest};
 use fjall::Readable;
+use replicix_chunkfmt::ChunkHash;
 use std::collections::BTreeSet;
 
 const REMOTE_PREFIX: &[u8] = b"remote-chunk/";

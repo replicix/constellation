@@ -554,7 +554,7 @@ fn live(seed: u64) -> Result<()> {
     let prefix = format!("snapshot-churn-{}", unix_ms());
     let backend = format!("s3://{BUCKET}/{prefix}");
     let mut client = Client::new(temp.path(), "churn", &env.endpoint, &backend)?
-        .with_env("CONSTELLATION_LEASE_TTL_MS", "200")
+        .with_env("REPLICIX_LEASE_TTL_MS", "200")
         .with_env("CONSTELLATION_GC_HORIZON_S", "0");
     client.fs_create()?;
     client.mount()?;
@@ -1129,7 +1129,7 @@ fn replay(path: &Path, no_sleep: bool) -> Result<()> {
     let prefix = format!("snapshot-churn-replay-{}", unix_ms());
     let backend = format!("s3://{BUCKET}/{prefix}");
     let mut client = Client::new(temp.path(), "replay", &env.endpoint, &backend)?
-        .with_env("CONSTELLATION_LEASE_TTL_MS", "200")
+        .with_env("REPLICIX_LEASE_TTL_MS", "200")
         .with_env("CONSTELLATION_GC_HORIZON_S", "0");
     client.fs_create()?;
     client.mount()?;

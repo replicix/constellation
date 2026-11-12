@@ -94,11 +94,12 @@
 //! way the batch is submitted exactly once, and the rids inside make
 //! even a submission that *did* happen twice execute once.
 
-use crate::e2e::{decrypt_object, encrypt_object, SharedE2eKeys};
+use crate::e2e::SharedE2eKeys;
 use crate::error::StoreError;
 use crate::layout;
 use futures::TryStreamExt;
 use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode};
+use replicix_chunkfmt::e2e::{decrypt_object, encrypt_object};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -358,17 +359,17 @@ impl InboxStore {
         // Bounded, but not by `MAX_BATCH_BYTES`: nothing enforces that soft
         // target, and a batch of `MAX_OPS_PER_BATCH` `SetXattr` ops is ~32 MiB
         // (each carries its value inline). See `codec::max_decompressed_len`.
-        crate::codec::decompress_to_ceiling(&compressed[..])
+        replicix_chunkfmt::codec::decompress_to_ceiling(&compressed[..]).map_err(StoreError::from)
     }
 
-    /// CAS-create `batch` at its key, through [`crate::cas::put_conditional`]
+    /// CAS-create `batch` at its key, through [`replicix_objcas::cas::put_conditional`]
     /// (plan 30 §M4's rules: a 409 retries the same attempt; a 412 whose
     /// object turns out to be absent is retried as a 409 the classifier
     /// could not see). See the module doc for why a real collision is
     /// read back and compared rather than treated as an error outright:
     /// [`PutBatch::AlreadyOurs`] is the ambiguous-PUT retry finding its
     /// own earlier attempt. The comparison is by batch identity, not
-    /// bytes ([`crate::cas::Verify::Caller`]): a sealed body is encrypted
+    /// bytes ([`replicix_objcas::cas::Verify::Caller`]): a sealed body is encrypted
     /// under a fresh nonce per attempt, so byte equality would miss our
     /// own write. A collision with *different* content is
     /// [`StoreError::AlreadyExists`]: somebody else wrote under this
@@ -377,17 +378,17 @@ impl InboxStore {
     pub async fn put_batch(&self, batch: &InboxBatch) -> Result<PutBatch, StoreError> {
         let key = batch.key().path();
         let body = self.seal(&key, &batch.encode()?)?;
-        match crate::cas::put_conditional(
+        match replicix_objcas::cas::put_conditional(
             self.store.as_ref(),
             &key,
             bytes::Bytes::from(body),
             PutMode::Create,
-            crate::cas::Verify::Caller,
+            replicix_objcas::cas::Verify::Caller,
         )
         .await?
         {
-            crate::cas::CasPut::Won(_) => Ok(PutBatch::Created),
-            crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => {
+            replicix_objcas::cas::CasPut::Won(_) => Ok(PutBatch::Created),
+            replicix_objcas::cas::CasPut::Lost | replicix_objcas::cas::CasPut::Missing => {
                 match self.get_batch(batch.key()).await? {
                     Some(existing) if existing.identity() == batch.identity() => {
                         Ok(PutBatch::AlreadyOurs)

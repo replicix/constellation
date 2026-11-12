@@ -445,8 +445,8 @@ impl Client {
             .env("CONSTELLATION_SYNC_INTERVAL_MS", "200")
             // Fail fast when toxiproxy cuts S3 so FUSE threads are not
             // stuck in object_store's default 180s retry budget.
-            .env("CONSTELLATION_S3_MAX_RETRIES", "2")
-            .env("CONSTELLATION_S3_RETRY_TIMEOUT_MS", "2000")
+            .env("REPLICIX_S3_MAX_RETRIES", "2")
+            .env("REPLICIX_S3_RETRY_TIMEOUT_MS", "2000")
             // The daemon's log queue (plan 44) is large enough never to
             // drop: the log checkers read these logs, and a dropped line is
             // a check that could not see it. 128 MiB takes a 12 s sink

@@ -638,7 +638,7 @@ impl View {
 /// A whole-file write of `ino` (a close's manifest commit): one chunk
 /// named after `byte`, `len` bytes long.
 fn write_manifest(ino: u64, byte: u8, len: u64, t: i64) -> (LogRecord, MutateOp) {
-    let chunks = [(0, constellation_fs_core::ChunkHash([byte; 32]))]
+    let chunks = [(0, replicix_chunkfmt::ChunkHash([byte; 32]))]
         .into_iter()
         .collect();
     let (manifest, _) =

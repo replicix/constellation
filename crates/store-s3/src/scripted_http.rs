@@ -14,19 +14,6 @@ pub(crate) struct Reply {
 }
 
 impl Reply {
-    /// The body S3 sends with `status` when a test does not care.
-    pub(crate) fn status(status: u16) -> Self {
-        let body = match status {
-            409 => "<Error><Code>OperationAborted</Code><Message>A conflicting \
-                    conditional operation is currently in progress against this \
-                    resource.</Message></Error>"
-                .to_string(),
-            412 => "<Error><Code>PreconditionFailed</Code></Error>".to_string(),
-            _ => String::new(),
-        };
-        Self { status, body }
-    }
-
     pub(crate) fn with_body(status: u16, body: impl Into<String>) -> Self {
         Self {
             status,
@@ -37,11 +24,6 @@ impl Reply {
 
 /// What the server saw of one request.
 pub(crate) type Seen = Arc<std::sync::Mutex<Vec<String>>>;
-
-/// [`scripted_s3_replies`] with S3's usual bodies for `statuses`.
-pub(crate) async fn scripted_s3(statuses: Vec<u16>) -> (String, Seen) {
-    scripted_s3_replies(statuses.into_iter().map(Reply::status).collect()).await
-}
 
 /// A one-shot HTTP responder: answers the n-th request with `replies[n]`
 /// (the last one repeats), recording each request's method and path

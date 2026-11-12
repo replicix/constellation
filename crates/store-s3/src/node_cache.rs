@@ -69,8 +69,8 @@
 use crate::error::StoreError;
 use crate::packs::{PackHash, PackIndex, PackNode, PackStore};
 use constellation_fs_core::cache::{ChunkState, DiskCache};
-use constellation_fs_core::ChunkHash;
 use constellation_mtree::{Hasher, MtreeError, NodeHash, NodeRef, NodeStore};
+use replicix_chunkfmt::ChunkHash;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};

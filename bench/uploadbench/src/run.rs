@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use constellation_upload_concurrency::ConcurrencyGate;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use replicix_upload_concurrency::ConcurrencyGate;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::controller::Controller;

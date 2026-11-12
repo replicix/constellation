@@ -37,7 +37,6 @@ mod fresh;
 use crate::sources::{Selector, SourceId};
 use anyhow::{bail, Result};
 use constellation_fs_core::cache::{ChunkState, DigestBatch, DigestChange, DiskCache, SpillFile};
-use constellation_fs_core::ChunkHash;
 use constellation_net::bloom::{
     bucket_count_for, bucket_index, ENTRIES_PER_BUCKET, MAX_BITS_BYTES, MAX_BUCKETS,
 };
@@ -45,6 +44,7 @@ use constellation_net::message::{wire_len, SIGNED_ENVELOPE};
 use constellation_net::reconcile::key_of;
 use constellation_net::{Bloom, ChunkDecline, PathKind, Payload, Peers};
 use constellation_store_s3::{ChunkStore, DecodePriority};
+use replicix_chunkfmt::ChunkHash;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1650,7 +1650,7 @@ impl Drop for ServeSlot<'_> {
 mod tests {
     use super::*;
     use constellation_net::Peers;
-    use constellation_store_s3::CompressionSetting;
+    use replicix_chunkfmt::CompressionSetting;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     fn h(n: u8) -> [u8; 32] {

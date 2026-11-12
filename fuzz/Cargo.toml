@@ -20,6 +20,8 @@ constellation-mtree = { path = "../crates/mtree" }
 constellation-store-s3 = { path = "../crates/store-s3" }
 constellation-meta = { path = "../crates/meta" }
 constellation-control = { path = "../crates/control" }
+replicix-objcas = { git = "https://github.com/replicix/replicix-core", rev = "caa47b4918509d10c1bac23369cf84bbe6883642" }
+replicix-chunkfmt = { git = "https://github.com/replicix/replicix-core", rev = "caa47b4918509d10c1bac23369cf84bbe6883642" }
 
 [patch.crates-io]
 fjall = { path = "../vendor/fjall" }

@@ -101,9 +101,9 @@ pub fn slow_s3_no_seal(_seed: u64) -> Result<()> {
     let filter = std::env::var("SLOWSEAL_RUST_LOG").unwrap_or_default();
     let mut extra: Vec<(&str, &str)> = vec![
         ("CONSTELLATION_SYNC_INTERVAL_MS", "500"),
-        ("CONSTELLATION_LEASE_TTL_MS", "60000"),
-        ("CONSTELLATION_S3_MAX_RETRIES", UNSET),
-        ("CONSTELLATION_S3_RETRY_TIMEOUT_MS", UNSET),
+        ("REPLICIX_LEASE_TTL_MS", "60000"),
+        ("REPLICIX_S3_MAX_RETRIES", UNSET),
+        ("REPLICIX_S3_RETRY_TIMEOUT_MS", UNSET),
         ("CONSTELLATION_LEASE_PLACEMENT", "off"),
         ("CONSTELLATION_DELEGATION_PLACEMENT", "off"),
     ];

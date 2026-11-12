@@ -1400,7 +1400,7 @@ mod tests {
 
     const BEGIN: &str = "<!-- deadlines:begin -->";
     const END: &str = "<!-- deadlines:end -->";
-    const LEASE: &str = "CONSTELLATION_LEASE_TTL_MS";
+    const LEASE: &str = "REPLICIX_LEASE_TTL_MS";
     const READ: &str = "CONSTELLATION_READ_DELEGATION_TTL_MS";
     const DELEG: &str = "CONSTELLATION_DELEGATION_TTL_MS";
     const LOCK: &str = "CONSTELLATION_LOCK_TTL_MS";

@@ -568,7 +568,7 @@ impl Meta {
         size: u64,
         mtime_ns: Option<i64>,
         ctime_ns: Option<i64>,
-        dirty_hashes: &[constellation_fs_core::ChunkHash],
+        dirty_hashes: &[replicix_chunkfmt::ChunkHash],
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         let local = self.begin_local(&tx)?;

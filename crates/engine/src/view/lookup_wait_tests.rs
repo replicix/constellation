@@ -85,7 +85,7 @@ fn chmod(ino: Ino, mode: u32) -> LogRecord {
         size: None,
         atime_ns: None,
         mtime_ns: None,
-        time_ns: constellation_store_s3::lease::now_unix_ms() as i64 * 1_000_000,
+        time_ns: replicix_objcas::lease::now_unix_ms() as i64 * 1_000_000,
     }
 }
 

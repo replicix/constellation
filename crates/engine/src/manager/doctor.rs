@@ -3,7 +3,8 @@
 use super::Manager;
 use constellation_control::proto::ControlError;
 use constellation_platform::CredentialSource;
-use constellation_store_s3::{Capabilities, CasProbeReport, MissingFs};
+use constellation_store_s3::MissingFs;
+use replicix_objcas::{Capabilities, CasProbeReport};
 use std::sync::Arc;
 
 /// What a filesystem's prefix holds.
@@ -70,7 +71,7 @@ impl Manager {
         if !matches!(&report.capabilities, Ok(c) if c.create_if_absent) {
             return Ok(report);
         }
-        let cas = constellation_store_s3::probe_cas_semantics(store.inner())
+        let cas = replicix_objcas::probe_cas_semantics(store.inner())
             .await
             .map_err(|e| e.to_string());
         let trusted = matches!(&cas, Ok(r) if r.violations().next().is_none());

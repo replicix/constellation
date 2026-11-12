@@ -370,7 +370,7 @@ fn umount_fails_when_the_drain_cannot_ship_everything() {
         mounts: vec![mnt.clone()],
     };
     let lost = content(7);
-    let lost_hex = constellation_fs_core::ChunkHash::of(&lost).to_hex();
+    let lost_hex = replicix_chunkfmt::ChunkHash::of(&lost).to_hex();
     let env = [("CONSTELLATION_FAULT_LOSE_CHUNKS", lost_hex.as_str())];
     let run_env = |args: &[&str]| {
         let child = command_env(dir, &hold, args, &env);

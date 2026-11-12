@@ -219,7 +219,7 @@ async fn run_inner(
         return Ok(report);
     }
     report.commits = seqs.len();
-    let now = constellation_store_s3::lease::now_unix_ms();
+    let now = replicix_objcas::lease::now_unix_ms();
 
     // 1. Retention.
     let expired = expired_commits(
@@ -302,7 +302,7 @@ async fn run_inner(
         .hold_for(config.grace)
         .await
         .context("waiting out the condemned-pack grace period")?;
-    let now = constellation_store_s3::lease::now_unix_ms();
+    let now = replicix_objcas::lease::now_unix_ms();
     let retained = retained_commits(store.clone(), expired.clone()).await?;
     reader.cache.refresh_catalog().await?;
     let live = mark_roots(
@@ -603,7 +603,7 @@ async fn hold_hashes(store: Arc<dyn ObjectStore>, now: i64) -> Result<Vec<[u8; 3
     fn collect(value: &serde_json::Value, out: &mut Vec<[u8; 32]>) {
         match value {
             serde_json::Value::String(text) => {
-                if let Some(hash) = constellation_fs_core::ChunkHash::from_hex(text) {
+                if let Some(hash) = replicix_chunkfmt::ChunkHash::from_hex(text) {
                     out.push(hash.0);
                 }
             }
@@ -711,7 +711,7 @@ mod tests {
         crate::singleton::SingletonLease::acquire_with_ttl(
             store.clone(),
             "_gc",
-            constellation_store_s3::LeaseMode::Cas,
+            replicix_objcas::LeaseMode::Cas,
             60_000,
         )
         .await

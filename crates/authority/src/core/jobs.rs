@@ -21,8 +21,8 @@ use crate::replica::Replica;
 use crate::segment;
 use constellation_fs_core::Ino;
 use constellation_meta::{JournalPos, LogRecord};
-use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
 use constellation_types::Code;
+use replicix_objcas::{AckPolicy, Lease, LeaseTag};
 
 /// EC2 campaign 8 A-1: the reason of an acquisition started because a
 /// peer forwarded an op while the lease still names this node (see

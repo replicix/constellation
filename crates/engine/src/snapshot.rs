@@ -18,13 +18,14 @@
 use crate::mtree_read::{Resolver, TreeReader};
 use anyhow::{bail, Context, Result};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
-use constellation_fs_core::{ChunkHash, Ino, InodeKind};
+use constellation_fs_core::{Ino, InodeKind};
 use constellation_meta::{CloneSpec, Meta, MetaStore, SnapshotRow};
 use constellation_mtree::NodeHash;
 use constellation_store_s3::{
     BlobStore, NodeCache, SnapshotRecord, SnapshotStore, SnapshotTreeRoot, StoreError,
 };
 use futures::future::BoxFuture;
+use replicix_chunkfmt::ChunkHash;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 

@@ -4,7 +4,7 @@
 //! call count.
 //!
 //! The injected errors have exactly the shape `object_store` 0.14's S3
-//! client produces for the same status (see `crate::cas`'s module doc),
+//! client produces for the same status (see `replicix_objcas::cas`'s module doc),
 //! so a test exercises the real classifier, not a convenient stand-in:
 //!
 //! | status | `PutMode::Create` | `PutMode::Update` | other ops |

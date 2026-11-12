@@ -1073,7 +1073,7 @@ pub(crate) struct EngineBatchHost {
     pub(crate) handing_off: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) sync_tx: tokio::sync::mpsc::UnboundedSender<crate::sync::SyncRequest>,
     pub(crate) store: Arc<dyn object_store::ObjectStore>,
-    pub(crate) lease_mode: constellation_store_s3::LeaseMode,
+    pub(crate) lease_mode: replicix_objcas::LeaseMode,
     pub(crate) peers: constellation_net::Peers,
     pub(crate) next_req: std::sync::atomic::AtomicU64,
 }
@@ -1132,7 +1132,7 @@ impl BatchHost for EngineBatchHost {
 
     fn live_holder(&self) -> BoxFuture<'_, Result<Option<u64>>> {
         Box::pin(async move {
-            let leases = constellation_store_s3::LeaseStore::new(
+            let leases = replicix_objcas::LeaseStore::new(
                 self.store.clone(),
                 constellation_store_s3::log::PARTITION,
                 self.lease_mode,
@@ -1280,11 +1280,10 @@ pub(crate) mod tests {
     use constellation_fs_core::cache::DiskCache;
     use constellation_meta::MetaStore;
     use constellation_mtree::{record, Hasher};
-    use constellation_store_s3::{
-        BlobStore, ChunkStore, CommitChain, LeaseMode, LeaseStore, NodeCache, PackStore,
-    };
+    use constellation_store_s3::{BlobStore, ChunkStore, CommitChain, NodeCache, PackStore};
     use object_store::memory::InMemory;
     use object_store::ObjectStore;
+    use replicix_objcas::{LeaseMode, LeaseStore};
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Weak;
@@ -2732,7 +2731,7 @@ pub(crate) mod tests {
         /// `len` bytes of fresh content into `ino`.
         fn write(&self, ino: Ino, len: u64, tag: &str) {
             use constellation_fs_core::manifest::Manifest;
-            use constellation_fs_core::ChunkHash;
+            use replicix_chunkfmt::ChunkHash;
             let chunks = [(0, ChunkHash::of(tag.as_bytes()))].into_iter().collect();
             let (manifest, _) = Manifest::from_sparse_chunks(
                 constellation_fs_core::DEFAULT_CHUNK_SIZE,

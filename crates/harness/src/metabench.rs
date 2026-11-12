@@ -87,7 +87,7 @@ pub struct MetaBenchConfig {
     /// Extra one-way S3 latency injected via toxiproxy (0 = local floci's
     /// native latency only, sub-millisecond on a dev host).
     pub s3_latency_ms: u64,
-    /// `CONSTELLATION_LEASE_TTL_MS` override. The default (60s) makes a
+    /// `REPLICIX_LEASE_TTL_MS` override. The default (60s) makes a
     /// P2P-off, multi-writer contention run take tens of minutes per
     /// config (sticky-lease dwell + the notice-at-renewal worst case are
     /// both TTL-scaled) — short TTLs are how the existing
@@ -202,7 +202,7 @@ pub fn run_one(
             c = c.with_env("CONSTELLATION_P2P", "off");
         }
         if let Some(ttl) = cfg.lease_ttl_ms {
-            c = c.with_env("CONSTELLATION_LEASE_TTL_MS", &ttl.to_string());
+            c = c.with_env("REPLICIX_LEASE_TTL_MS", &ttl.to_string());
         }
         clients.push(c);
     }

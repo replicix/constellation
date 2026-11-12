@@ -192,7 +192,7 @@ pub fn cmd_serve(
     if await_unlock {
         // Its credentials will live in this process's memory only — a
         // standby's too, from its `Credentials` step on.
-        constellation_platform::forbid_core_dumps().context("disabling core dumps")?;
+        replicix_platform_lite::forbid_core_dumps().context("disabling core dumps")?;
     }
     // Before any socket exists: the engine is its container's PID 1, which
     // the kernel spares every signal it has no handler for, so a pod
@@ -689,7 +689,7 @@ async fn create_if_missing(
         unlocked: bool,
     }
     impl CreateHooks for Hooks {
-        fn preflight(&mut self, checks: &[constellation_store_s3::PreflightCheck]) {
+        fn preflight(&mut self, checks: &[replicix_objcas::PreflightCheck]) {
             crate::print_preflight(checks);
         }
         fn passphrase(&mut self) -> Result<Zeroizing<String>, ControlError> {
@@ -838,7 +838,7 @@ impl std::error::Error for WrongSecret {}
 fn gate_refusal(e: &anyhow::Error) -> ControlError {
     let message = format!("{e:#}");
     let permanent = e.downcast_ref::<WrongSecret>().is_some()
-        || !constellation_store_s3::classify_chain(e.chain()).is_transient();
+        || !replicix_objcas::classify_chain(e.chain()).is_transient();
     match permanent {
         true => ControlError::new(constellation_control::proto::ErrorKind::Denied, message),
         false => ControlError::unavailable(message),

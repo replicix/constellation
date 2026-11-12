@@ -5,7 +5,6 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use constellation_csi::control_client::{Engines, InMemoryEngines};
 use constellation_csi::controller::{ControllerConfig, ControllerService};
-use constellation_csi::credentials::{KubeSecrets, Refresher};
 use constellation_csi::engine_pods::NodeEnginePods;
 use constellation_csi::engine_pods::{EnginePodConfig, EnginePodManager};
 use constellation_csi::identity::IdentityService;
@@ -15,10 +14,11 @@ use constellation_csi::node::state::StateStore;
 use constellation_csi::node::{
     rollout, FakeMounter, InMemoryNodeEngines, LinuxMounter, Mounter, NodeEngines, NodeService,
 };
-use constellation_csi::proto::csi::v1::controller_server::ControllerServer;
-use constellation_csi::proto::csi::v1::identity_server::IdentityServer;
-use constellation_csi::proto::csi::v1::node_server::NodeServer;
 use constellation_csi::purge::{Leader, LeaderTiming, PurgeConfig, PurgeWorker};
+use replicix_csi_common::credentials::{KubeSecrets, Refresher};
+use replicix_csi_common::proto::csi::v1::controller_server::ControllerServer;
+use replicix_csi_common::proto::csi::v1::identity_server::IdentityServer;
+use replicix_csi_common::proto::csi::v1::node_server::NodeServer;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
@@ -89,7 +89,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     // Both plugins hold credentials in memory (the Secrets they pass to
     // engine pods with `fs.unlock`): never in a core dump.
-    constellation_platform::forbid_core_dumps().context("disabling core dumps")?;
+    replicix_platform_lite::forbid_core_dumps().context("disabling core dumps")?;
     match (cli.controller, cli.node) {
         (false, false) if cli.volume_health.is_some() => {}
         (false, false) => bail!("one of --controller or --node is required"),
@@ -337,8 +337,8 @@ async fn pre_stop(cli: Cli) -> Result<()> {
 /// (`{"volume_id", "abnormal", "statuses": [{"status", "reason",
 /// "message"}]}`; `status` is the CSI `VolumeHealthErrorType` name).
 async fn volume_health(endpoint: &str, volume_id: &str, path: Option<&str>) -> Result<()> {
-    use constellation_csi::proto::csi::v1::node_client::NodeClient;
-    use constellation_csi::proto::csi::v1::{NodeGetVolumeHealthRequest, VolumeHealthErrorType};
+    use replicix_csi_common::proto::csi::v1::node_client::NodeClient;
+    use replicix_csi_common::proto::csi::v1::{NodeGetVolumeHealthRequest, VolumeHealthErrorType};
     let socket = socket_path(endpoint)?;
     // The URI is a placeholder: the connector dials the socket.
     let channel = tonic::transport::Endpoint::try_from("http://[::]:50051")?

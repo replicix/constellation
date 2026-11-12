@@ -15,11 +15,12 @@
 //! from its `applied` position, or replays from genesis when no commit
 //! exists yet (`shipper::bootstrap`).
 
-use crate::e2e::{decrypt_object, encrypt_object, SharedE2eKeys};
+use crate::e2e::SharedE2eKeys;
 use crate::error::StoreError;
 use crate::layout;
 use futures::TryStreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload};
+use replicix_chunkfmt::e2e::{decrypt_object, encrypt_object};
 use std::sync::Arc;
 
 /// Genesis partition id. A filesystem always has at least this one.
@@ -127,13 +128,13 @@ impl LogStore {
         // record that grows with the tree. `MAX_LOG_SEGMENT` in `net` limits
         // the *compressed* bytes of a streamed segment, not this output. See
         // `codec::max_decompressed_len`.
-        crate::codec::decompress_to_ceiling(&compressed[..])
+        replicix_chunkfmt::codec::decompress_to_ceiling(&compressed[..]).map_err(StoreError::from)
     }
 
     /// CAS-create segment `seq`. `AlreadyExists` when the sequence was
     /// already written (crash replay or a second writer).
     ///
-    /// Plan 30 §M4 item 1 (`crate::cas`): a 409 retries the same create
+    /// Plan 30 §M4 item 1 (`replicix_objcas::cas`): a 409 retries the same create
     /// (before, it read as `AlreadyExists`, and the shipper's tail then
     /// found nothing at `seq` and came straight back), and a 412 whose
     /// object is this very segment — our own create that landed behind a
@@ -143,17 +144,17 @@ impl LogStore {
     pub async fn put_segment(&self, seq: u64, payload: &[u8]) -> Result<(), StoreError> {
         let key = layout::log_segment(&self.partition, seq);
         let body = self.seal_segment(seq, payload)?;
-        match crate::cas::put_conditional(
+        match replicix_objcas::cas::put_conditional(
             self.store.as_ref(),
             &key,
             body.into(),
             PutMode::Create,
-            crate::cas::Verify::Body,
+            replicix_objcas::cas::Verify::Body,
         )
         .await?
         {
-            crate::cas::CasPut::Won(_) => Ok(()),
-            crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => {
+            replicix_objcas::cas::CasPut::Won(_) => Ok(()),
+            replicix_objcas::cas::CasPut::Lost | replicix_objcas::cas::CasPut::Missing => {
                 Err(StoreError::AlreadyExists)
             }
         }

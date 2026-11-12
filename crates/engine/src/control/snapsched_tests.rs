@@ -278,7 +278,7 @@ fn set_guards_expiry_pause_round_trips_and_remove_orphans() {
     let f = Fixture::new();
     let proj = f.mkdir("/proj");
     const HOUR: i64 = 3_600_000;
-    let now = constellation_store_s3::lease::now_unix_ms();
+    let now = replicix_objcas::lease::now_unix_ms();
     // 48 hourly auto snapshots of /proj, and a manual one.
     let meta = f.engine.meta();
     for h in 0..48 {
@@ -428,7 +428,7 @@ fn remove_with_expire_deletes_the_roots_unheld_auto_snapshots() {
     let f = Fixture::new();
     let proj = f.mkdir("/proj");
     let other = f.mkdir("/other");
-    let now = constellation_store_s3::lease::now_unix_ms();
+    let now = replicix_objcas::lease::now_unix_ms();
     let meta = f.engine.meta();
     for h in 0..10 {
         let id = format!("a{h:02}");

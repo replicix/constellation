@@ -3,10 +3,11 @@
 
 use crate::error::MetaError;
 use crate::store::{kv_get_tx, kv_set_tx, ns, EpochRow, Meta};
-use constellation_fs_core::{ChunkHash, Ino};
+use constellation_fs_core::Ino;
 use constellation_mtree::record::{InodeRecord, Payload};
 use constellation_types::clock::{Now, WaitMs};
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx};
+use replicix_chunkfmt::ChunkHash;
 use std::collections::HashSet;
 
 // ---------------------------------------------------------------- generic
@@ -934,7 +935,7 @@ impl Meta {
 mod pending_claim_tests {
     use crate::store::Meta;
     use crate::MetaStore;
-    use constellation_fs_core::ChunkHash;
+    use replicix_chunkfmt::ChunkHash;
 
     /// One inode needing the same content twice (identical bytes at two
     /// chunk indices, or a sealed chunk plus an earlier manifest) holds

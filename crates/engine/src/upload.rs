@@ -11,7 +11,8 @@ use crate::{backend, fault, writeback};
 use anyhow::{bail, Result};
 use constellation_fs_core::cache::DiskCache;
 use constellation_meta::Meta;
-use constellation_store_s3::{ChunkStore, CompressionSetting};
+use constellation_store_s3::ChunkStore;
+use replicix_chunkfmt::CompressionSetting;
 
 /// Drain `Meta::pending_uploads()` — the durable not-yet-uploaded
 /// set (plan 07 step 1) — rather than `DiskCache::dirty_chunks()`,
@@ -26,7 +27,7 @@ use constellation_store_s3::{ChunkStore, CompressionSetting};
 /// here already makes every caller treat the round as failed and skip
 /// shipping (see `run_managed_sync_round`'s existing epoch-propose-on-
 /// failure path), which is exactly the "journal must wait" behavior.
-use constellation_upload_concurrency::{AdaptiveConcurrency, ConcurrencyGate, ConcurrencyPermit};
+use replicix_upload_concurrency::{AdaptiveConcurrency, ConcurrencyGate, ConcurrencyPermit};
 
 /// Ceiling for the adaptive search and for a user-pinned override alike.
 /// Bounds both real S3 concurrency and (via [`ConcurrencyGate`]) worst-case
@@ -49,7 +50,7 @@ const PRIORITY_DRAIN_CHUNKS: u64 = 4;
 /// create-vs-overwrite decision), both handled by `put_mode` below.
 ///
 /// Concurrency itself is adaptive by default
-/// (`constellation_upload_concurrency::AdaptiveConcurrency`): a single
+/// (`replicix_upload_concurrency::AdaptiveConcurrency`): a single
 /// upload's latency is dominated by RTT to the bucket region, so a
 /// client far from the bucket but sitting on a fat pipe (e.g. a home
 /// connection in the EU against a `us-west-2` bucket) needs a lot more
@@ -132,10 +133,7 @@ pub struct UploadRuntime {
     /// (`Meta::add_pending_upload`); only a chunk the first did not get
     /// up is the second's to upload again.
     in_flight: std::sync::Mutex<
-        std::collections::HashMap<
-            constellation_fs_core::ChunkHash,
-            tokio::sync::watch::Receiver<bool>,
-        >,
+        std::collections::HashMap<replicix_chunkfmt::ChunkHash, tokio::sync::watch::Receiver<bool>>,
     >,
     /// Chunks smaller than this skip `Probe` (see [`Self::put_mode`]).
     probe_min_bytes: u64,
@@ -143,14 +141,11 @@ pub struct UploadRuntime {
     /// still pending here (a `back` close), and the nodes it forwarded to:
     /// each is told once the chunk is up (`meta::store::remote`).
     forwarded: std::sync::Mutex<
-        std::collections::HashMap<
-            constellation_fs_core::ChunkHash,
-            std::collections::BTreeSet<u64>,
-        >,
+        std::collections::HashMap<replicix_chunkfmt::ChunkHash, std::collections::BTreeSet<u64>>,
     >,
     /// Reports owed, per node: forwarded chunks now durable.
     durable_reports:
-        std::sync::Mutex<std::collections::HashMap<u64, Vec<constellation_fs_core::ChunkHash>>>,
+        std::sync::Mutex<std::collections::HashMap<u64, Vec<replicix_chunkfmt::ChunkHash>>>,
     /// Since when reports to a node have not been delivered (see
     /// [`Self::requeue_report`]).
     report_attempts: std::sync::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
@@ -159,7 +154,7 @@ pub struct UploadRuntime {
     /// and the current backoff.
     remote_polls: std::sync::Mutex<
         std::collections::HashMap<
-            constellation_fs_core::ChunkHash,
+            replicix_chunkfmt::ChunkHash,
             (std::time::Instant, std::time::Duration),
         >,
     >,
@@ -168,13 +163,13 @@ pub struct UploadRuntime {
     /// and the forward travel on different streams), and a forward whose
     /// chunks were already reported must not await them.
     reported: std::sync::Mutex<
-        std::collections::HashMap<constellation_fs_core::ChunkHash, std::time::Instant>,
+        std::collections::HashMap<replicix_chunkfmt::ChunkHash, std::time::Instant>,
     >,
     /// Pending chunks this node found at mount: a crash may have lost
     /// whom it forwarded them to (`forwarded` is in memory), so once up
     /// they are reported to every peer — a node that awaits one acks it,
     /// the rest ignore the report.
-    inherited: std::sync::Mutex<std::collections::HashSet<constellation_fs_core::ChunkHash>>,
+    inherited: std::sync::Mutex<std::collections::HashSet<replicix_chunkfmt::ChunkHash>>,
     /// EC2 finding 1: when a chunk PUT (or existence probe) last
     /// completed on this node, wait-clock ms — how a drain that is taking long
     /// tells a slow upload (progress) from an unreachable S3 (none), and
@@ -224,7 +219,7 @@ pub(crate) fn forwarded_pending_chunks(
     meta: &Meta,
     cache: &DiskCache,
     op: &constellation_meta::MutateOp,
-) -> Vec<constellation_fs_core::ChunkHash> {
+) -> Vec<replicix_chunkfmt::ChunkHash> {
     let constellation_meta::MutateOp::SetManifest { ino, manifest, .. } = op else {
         return Vec::new();
     };
@@ -236,7 +231,7 @@ pub(crate) fn forwarded_pending_chunks(
         }
         Ok(constellation_fs_core::ChunkInfo::Spilled(blob)) => Some(blob),
         // Undecodable: whatever is pending for the inode (below).
-        Err(_) => Some(constellation_fs_core::ChunkHash([0; 32])),
+        Err(_) => Some(replicix_chunkfmt::ChunkHash([0; 32])),
     };
     if let Some(blob) = spilled {
         named.insert(blob);
@@ -288,14 +283,12 @@ pub struct HandoffStats {
 /// and the claim is released when the drain ends, however it ends.
 struct InFlightClaim<'a> {
     upload: &'a UploadRuntime,
-    landed: std::collections::HashMap<
-        constellation_fs_core::ChunkHash,
-        tokio::sync::watch::Sender<bool>,
-    >,
+    landed:
+        std::collections::HashMap<replicix_chunkfmt::ChunkHash, tokio::sync::watch::Sender<bool>>,
 }
 
 impl InFlightClaim<'_> {
-    fn land(&self, hash: &constellation_fs_core::ChunkHash) {
+    fn land(&self, hash: &replicix_chunkfmt::ChunkHash) {
         if let Some(landed) = self.landed.get(hash) {
             landed.send_replace(true);
         }
@@ -407,7 +400,7 @@ impl UploadRuntime {
 
     /// `hashes` went out in a manifest forwarded to `to` while still
     /// pending here.
-    pub(crate) fn note_forwarded(&self, hashes: &[constellation_fs_core::ChunkHash], to: u64) {
+    pub(crate) fn note_forwarded(&self, hashes: &[replicix_chunkfmt::ChunkHash], to: u64) {
         if hashes.is_empty() {
             return;
         }
@@ -418,7 +411,7 @@ impl UploadRuntime {
     }
 
     /// Another node reported `hashes` durable.
-    pub(crate) fn note_reported(&self, hashes: &[constellation_fs_core::ChunkHash]) {
+    pub(crate) fn note_reported(&self, hashes: &[replicix_chunkfmt::ChunkHash]) {
         let now = std::time::Instant::now();
         let mut reported = self.reported.lock().unwrap();
         reported.retain(|_, at| now.duration_since(*at) < REPORTED_KEEP);
@@ -430,8 +423,8 @@ impl UploadRuntime {
     /// `hashes` without the ones another node reported durable recently.
     pub(crate) fn not_reported(
         &self,
-        hashes: Vec<constellation_fs_core::ChunkHash>,
-    ) -> Vec<constellation_fs_core::ChunkHash> {
+        hashes: Vec<replicix_chunkfmt::ChunkHash>,
+    ) -> Vec<replicix_chunkfmt::ChunkHash> {
         let reported = self.reported.lock().unwrap();
         if reported.is_empty() {
             return hashes;
@@ -443,7 +436,7 @@ impl UploadRuntime {
     }
 
     /// The pending chunks found at mount (see `inherited`).
-    pub fn inherit(&self, hashes: impl IntoIterator<Item = constellation_fs_core::ChunkHash>) {
+    pub fn inherit(&self, hashes: impl IntoIterator<Item = replicix_chunkfmt::ChunkHash>) {
         self.inherited.lock().unwrap().extend(hashes);
     }
 
@@ -455,7 +448,7 @@ impl UploadRuntime {
     /// Chunks forwarded as pending that are still pending here, with the
     /// nodes they were forwarded to (EC2 finding 1: what a round hands to
     /// a peer when this node's S3 path is down).
-    pub(crate) fn forwarded_pending(&self) -> Vec<(constellation_fs_core::ChunkHash, Vec<u64>)> {
+    pub(crate) fn forwarded_pending(&self) -> Vec<(replicix_chunkfmt::ChunkHash, Vec<u64>)> {
         self.forwarded
             .lock()
             .unwrap()
@@ -466,7 +459,7 @@ impl UploadRuntime {
 
     /// `hash` is up: owe its report to every node it was forwarded to
     /// (to every peer, for one found pending at mount).
-    pub(crate) fn note_up(&self, hash: &constellation_fs_core::ChunkHash) {
+    pub(crate) fn note_up(&self, hash: &replicix_chunkfmt::ChunkHash) {
         let nodes = self.forwarded.lock().unwrap().remove(hash);
         let inherited = self.inherited.lock().unwrap().remove(hash);
         let mut reports = self.durable_reports.lock().unwrap();
@@ -482,7 +475,7 @@ impl UploadRuntime {
     /// known yet right after a restart): owed again at the next pass, for
     /// up to [`REPORT_RETRY`] of failures in a row; past that the
     /// recipient's own S3 check covers it.
-    pub(crate) fn requeue_report(&self, node: u64, hashes: Vec<constellation_fs_core::ChunkHash>) {
+    pub(crate) fn requeue_report(&self, node: u64, hashes: Vec<replicix_chunkfmt::ChunkHash>) {
         let mut attempts = self.report_attempts.lock().unwrap();
         let since = *attempts.entry(node).or_insert_with(std::time::Instant::now);
         if since.elapsed() > REPORT_RETRY {
@@ -504,7 +497,7 @@ impl UploadRuntime {
     /// The reports owed, per node (taken: see [`Self::requeue_report`]).
     pub(crate) fn take_durable_reports(
         &self,
-    ) -> std::collections::HashMap<u64, Vec<constellation_fs_core::ChunkHash>> {
+    ) -> std::collections::HashMap<u64, Vec<replicix_chunkfmt::ChunkHash>> {
         std::mem::take(&mut *self.durable_reports.lock().unwrap())
     }
 
@@ -513,8 +506,8 @@ impl UploadRuntime {
     /// own file's reports before it returns, not every peer's (plan 39b).
     pub(crate) fn take_durable_reports_of(
         &self,
-        hashes: &std::collections::HashSet<constellation_fs_core::ChunkHash>,
-    ) -> std::collections::HashMap<u64, Vec<constellation_fs_core::ChunkHash>> {
+        hashes: &std::collections::HashSet<replicix_chunkfmt::ChunkHash>,
+    ) -> std::collections::HashMap<u64, Vec<replicix_chunkfmt::ChunkHash>> {
         let mut owed = self.durable_reports.lock().unwrap();
         let mut taken = std::collections::HashMap::new();
         owed.retain(|node, owed| {
@@ -530,7 +523,7 @@ impl UploadRuntime {
 
     /// Whether this node should check S3 now for `hash`, which another
     /// node forwarded as pending; schedules the next check if so.
-    fn remote_poll_due(&self, hash: &constellation_fs_core::ChunkHash) -> bool {
+    fn remote_poll_due(&self, hash: &replicix_chunkfmt::ChunkHash) -> bool {
         let now = std::time::Instant::now();
         let mut polls = self.remote_polls.lock().unwrap();
         match polls.get_mut(hash) {
@@ -547,7 +540,7 @@ impl UploadRuntime {
         }
     }
 
-    pub(crate) fn forget_remote_poll(&self, hash: &constellation_fs_core::ChunkHash) {
+    pub(crate) fn forget_remote_poll(&self, hash: &replicix_chunkfmt::ChunkHash) {
         self.remote_polls.lock().unwrap().remove(hash);
     }
 
@@ -618,7 +611,7 @@ impl UploadRuntime {
     /// its ladder had switched to `Probe`.
     pub(crate) fn put_mode(
         &self,
-        hash: &constellation_fs_core::ChunkHash,
+        hash: &replicix_chunkfmt::ChunkHash,
         len: usize,
     ) -> constellation_store_s3::ChunkPutMode {
         let small = self.create_if_absent && (len as u64) < self.probe_min_bytes;
@@ -725,7 +718,7 @@ pub(crate) enum DrainShortfall {
     )]
     Lost {
         ino: constellation_fs_core::Ino,
-        hash: constellation_fs_core::ChunkHash,
+        hash: replicix_chunkfmt::ChunkHash,
         count: usize,
     },
     /// Chunks of the inode another node forwarded as pending (a `back`
@@ -748,7 +741,7 @@ pub(crate) enum DrainShortfall {
 pub(crate) struct UploadReport {
     /// Pending `(chunk, ino)` rows whose chunk is gone from the local
     /// cache: unrecoverable content (plan 30 §M4).
-    pub(crate) missing: Vec<(constellation_fs_core::ChunkHash, constellation_fs_core::Ino)>,
+    pub(crate) missing: Vec<(replicix_chunkfmt::ChunkHash, constellation_fs_core::Ino)>,
     /// Chunks another node forwarded as pending that are not in S3 yet
     /// (`meta::store::remote`): not lost, only not up yet.
     pub(crate) awaiting: u64,
@@ -825,7 +818,7 @@ async fn expand_adopted_spills(cache: &DiskCache, meta: &Meta, store: &ChunkStor
                 }
             },
         };
-        let chunks: Vec<constellation_fs_core::ChunkHash> =
+        let chunks: Vec<replicix_chunkfmt::ChunkHash> =
             match constellation_fs_core::manifest::decode_chunk_list(&bytes) {
                 Ok(list) => list.into_values().collect(),
                 Err(error) => {
@@ -869,7 +862,7 @@ async fn upload_dirty_chunks_pass(
         expand_adopted_spills(cache, meta, store).await?;
     }
     let mut grouped: std::collections::HashMap<
-        constellation_fs_core::ChunkHash,
+        replicix_chunkfmt::ChunkHash,
         Vec<constellation_fs_core::Ino>,
     > = std::collections::HashMap::new();
     // An inode's drain (an `fsync`'s) reads just that inode's rows through
@@ -930,11 +923,10 @@ async fn upload_dirty_chunks_pass(
     // ship — but logging ERROR once per hash per round produced multi-GB
     // logs (plan 25). Count them and emit a single summary below.
     let missing_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let missing_sample = std::sync::Arc::new(std::sync::Mutex::new(
-        None::<constellation_fs_core::ChunkHash>,
-    ));
+    let missing_sample =
+        std::sync::Arc::new(std::sync::Mutex::new(None::<replicix_chunkfmt::ChunkHash>));
     let missing_rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(
-        constellation_fs_core::ChunkHash,
+        replicix_chunkfmt::ChunkHash,
         constellation_fs_core::Ino,
     )>::new()));
     let awaiting = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1212,7 +1204,6 @@ async fn upload_dirty_chunks_pass(
 pub(crate) mod pending_upload_tests {
     use super::*;
     use constellation_fs_core::cache::{CacheVerify, ChunkState};
-    use constellation_fs_core::ChunkHash;
     use constellation_meta::MetaStore;
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjPath;
@@ -1220,6 +1211,7 @@ pub(crate) mod pending_upload_tests {
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
+    use replicix_chunkfmt::ChunkHash;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;

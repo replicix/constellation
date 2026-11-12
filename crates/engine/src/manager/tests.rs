@@ -7,8 +7,9 @@ use crate::e2e_pin::{self, PinTarget};
 use crate::registry::{FsOverrides, MountEntry};
 use constellation_control::proto::types::UnlockCredentials;
 use constellation_control::proto::{ErrorKind, Secret};
-use constellation_store_s3::{ChunkStore, FsMeta, PreflightCheck};
+use constellation_store_s3::{ChunkStore, FsMeta};
 use object_store::ObjectStoreExt;
+use replicix_objcas::PreflightCheck;
 use std::path::Path;
 use std::sync::Mutex;
 use zeroize::Zeroizing;
@@ -310,7 +311,7 @@ fn a_name_is_repointed_only_while_its_state_dir_is_not_in_use() {
     // --s3` refuses too.
     std::fs::remove_dir_all(entry.state_dir.join("meta.db")).unwrap();
     let lock =
-        constellation_platform::lock::open_lock_file(&entry.state_dir.join("daemon.lock")).unwrap();
+        replicix_platform_lite::open_lock_file(&entry.state_dir.join("daemon.lock")).unwrap();
     let held = constellation_platform::native()
         .file_lock
         .try_lock(lock)
@@ -447,7 +448,7 @@ fn in_memory_e2e(f: &Fixture, passphrase: &str, pin: &PinTarget) -> ChunkStore {
     let mut meta = FsMeta::new(1024 * 1024, "raw");
     meta.e2e = true;
     meta.gossip_secret = None;
-    meta.keyring = Some(constellation_store_s3::create_keyring_block(passphrase).unwrap());
+    meta.keyring = Some(replicix_chunkfmt::create_keyring_block(passphrase).unwrap());
     f.rt.block_on(store.create_fs(&meta)).unwrap();
     e2e_pin::record_with(f.manager.pins(), pin, &meta, None);
     store
@@ -664,7 +665,7 @@ fn export_does_not_retire_a_starting_daemon_unless_forced() {
     let meta = constellation_meta::Meta::open(dir.join("meta.db")).unwrap();
     meta.kv_set_durable("node_id", "42").unwrap();
     drop(meta);
-    let lock = constellation_platform::lock::open_lock_file(&dir.join("daemon.lock")).unwrap();
+    let lock = replicix_platform_lite::open_lock_file(&dir.join("daemon.lock")).unwrap();
     let held = constellation_platform::native()
         .file_lock
         .try_lock(lock)

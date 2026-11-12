@@ -18,14 +18,13 @@ use std::sync::Arc;
 
 use constellation_types::Rdev;
 
-use crate::fs::FsPrimitives;
 use crate::lifecycle::ManualLifecycle;
-use crate::lock::FileLock;
 use crate::mounts::{MountEntry, MountOpts, MountTable, UnmountMode};
 use crate::process::{Process, ProcessFacts, TaskFacts, ThreadRef};
 use crate::secrets::FileSecretStore;
-use crate::unix::{ForkDaemon, UnixFileLock, XdgDirs};
+use crate::unix::{ForkDaemon, XdgDirs};
 use crate::HostServices;
+use replicix_platform_lite::FileLock;
 
 pub(crate) fn host_services() -> HostServices {
     let dirs = Arc::new(XdgDirs);
@@ -35,7 +34,7 @@ pub(crate) fn host_services() -> HostServices {
         process: Arc::new(LinuxProcess),
         daemon: Arc::new(ForkDaemon),
         file_lock: file_lock.clone(),
-        fs: Arc::new(LinuxFs),
+        fs: Arc::new(replicix_platform_lite::NativeFs),
         secrets: Arc::new(FileSecretStore::in_config_dir(dirs, file_lock)),
         lifecycle: Arc::new(ManualLifecycle::new()),
         mounts: Arc::new(LinuxMounts),
@@ -43,18 +42,9 @@ pub(crate) fn host_services() -> HostServices {
 }
 
 pub(crate) fn file_lock() -> Arc<dyn FileLock> {
-    Arc::new(UnixFileLock {
+    Arc::new(replicix_platform_lite::FlockLock {
         holders: flock_holder_pids,
         opened_by: has_open,
-    })
-}
-
-fn off_t(n: u64) -> io::Result<libc::off_t> {
-    libc::off_t::try_from(n).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("offset {n} out of range"),
-        )
     })
 }
 
@@ -500,76 +490,6 @@ impl Process for LinuxProcess {
     }
 }
 
-// ------------------------------------------------------------------- fs
-
-struct LinuxFs;
-
-fn fallocate(file: &File, mode: libc::c_int, offset: u64, len: u64) -> io::Result<()> {
-    // SAFETY: `file` owns a valid open fd for the duration of the call.
-    let rc = unsafe { libc::fallocate(file.as_raw_fd(), mode, off_t(offset)?, off_t(len)?) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-impl FsPrimitives for LinuxFs {
-    fn punch_hole(&self, file: &File, offset: u64, len: u64) -> io::Result<()> {
-        fallocate(
-            file,
-            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-            offset,
-            len,
-        )
-    }
-
-    fn preallocate(&self, file: &File, offset: u64, len: u64, keep_size: bool) -> io::Result<()> {
-        let mode = if keep_size {
-            libc::FALLOC_FL_KEEP_SIZE
-        } else {
-            0
-        };
-        fallocate(file, mode, offset, len)
-    }
-
-    fn full_fsync(&self, file: &File) -> io::Result<()> {
-        file.sync_all()
-    }
-
-    fn set_xattr(&self, path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
-        crate::unix::set_xattr(path, name, value)
-    }
-
-    fn get_xattr(&self, path: &Path, name: &str) -> io::Result<Vec<u8>> {
-        crate::unix::get_xattr(path, name)
-    }
-
-    fn list_xattr(&self, path: &Path) -> io::Result<Vec<String>> {
-        crate::unix::list_xattr(path)
-    }
-
-    fn remove_xattr(&self, path: &Path, name: &str) -> io::Result<()> {
-        crate::unix::remove_xattr(path, name)
-    }
-
-    fn drop_cache(&self, file: &File, offset: u64, len: u64) -> io::Result<()> {
-        // SAFETY: `file` owns a valid open fd; the advice is advisory.
-        let rc = unsafe {
-            libc::posix_fadvise(
-                file.as_raw_fd(),
-                off_t(offset)?,
-                off_t(len)?,
-                libc::POSIX_FADV_DONTNEED,
-            )
-        };
-        // posix_fadvise returns the error number instead of setting errno.
-        if rc != 0 {
-            return Err(io::Error::from_raw_os_error(rc));
-        }
-        Ok(())
-    }
-}
-
 // --------------------------------------------------------------- mounts
 
 struct LinuxMounts;
@@ -791,7 +711,7 @@ pub fn fuse_unmount(target: &Path, lazy: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lock::open_lock_file;
+    use replicix_platform_lite::open_lock_file;
 
     #[test]
     fn a_stat_line_yields_the_start_time_whatever_the_command_name() {
@@ -1209,66 +1129,6 @@ garbage line without the separator
             n >= MIN_FRAMES,
             "the dump has only {n} frames: the walk stopped early"
         );
-    }
-
-    #[test]
-    fn punch_hole_makes_a_hole_and_keeps_the_size() {
-        use std::io::{Seek, SeekFrom, Write};
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("staging");
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        const MIB: u64 = 1 << 20;
-        file.write_all(&vec![0xa5u8; (4 * MIB) as usize]).unwrap();
-        file.sync_all().unwrap();
-        match LinuxFs.punch_hole(&file, MIB, MIB) {
-            Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {
-                eprintln!("skipping: this filesystem cannot punch holes ({e})");
-                return;
-            }
-            Err(e) => panic!("punch_hole: {e}"),
-        }
-        assert_eq!(file.metadata().unwrap().len(), 4 * MIB, "size kept");
-        // SAFETY: lseek on an fd we own.
-        let hole = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_HOLE) };
-        assert_eq!(hole as u64, MIB, "SEEK_HOLE finds the punched range");
-        // SAFETY: as above.
-        let data = unsafe { libc::lseek(file.as_raw_fd(), MIB as libc::off_t, libc::SEEK_DATA) };
-        assert_eq!(data as u64, 2 * MIB, "data resumes after it");
-        let mut buf = vec![1u8; 4096];
-        use std::os::unix::fs::FileExt;
-        file.read_exact_at(&mut buf, MIB + 4096).unwrap();
-        assert!(buf.iter().all(|&b| b == 0));
-        file.seek(SeekFrom::Start(0)).unwrap();
-        // Out-of-range offsets are refused before the syscall.
-        assert_eq!(
-            LinuxFs.punch_hole(&file, u64::MAX, 1).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-    }
-
-    #[test]
-    fn preallocate_fsync_and_drop_cache_work_on_a_plain_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(dir.path().join("f"))
-            .unwrap();
-        LinuxFs.preallocate(&file, 0, 65536, true).unwrap();
-        assert_eq!(file.metadata().unwrap().len(), 0);
-        LinuxFs.preallocate(&file, 0, 65536, false).unwrap();
-        assert_eq!(file.metadata().unwrap().len(), 65536);
-        LinuxFs.full_fsync(&file).unwrap();
-        LinuxFs.drop_cache(&file, 0, 0).unwrap();
     }
 
     #[test]

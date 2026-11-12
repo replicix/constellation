@@ -322,11 +322,11 @@ pub fn take_over(state_dir: &Path, pid: u32) -> Result<()> {
 
 /// The takeover mutex, held for the returned guard's lifetime. Bounded:
 /// a mutex holder is a `mount` mid-takeover (milliseconds).
-fn takeover_mutex(state_dir: &Path) -> Result<constellation_platform::LockGuard> {
+fn takeover_mutex(state_dir: &Path) -> Result<replicix_platform_lite::LockGuard> {
     let path: PathBuf = state_dir.join(TAKEOVER_MUTEX);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let file = constellation_platform::lock::open_lock_file(&path)
+        let file = replicix_platform_lite::open_lock_file(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         if let Some(guard) = native()
             .file_lock
@@ -685,7 +685,7 @@ fn parent_gone(pid: u32) -> bool {
 /// daemon: the records are its own), or when there is no lock file (never
 /// created here: it would only appear between a takeover's rename and the
 /// new daemon's lock).
-fn try_take_lock(state_dir: &Path) -> Option<constellation_platform::LockGuard> {
+fn try_take_lock(state_dir: &Path) -> Option<replicix_platform_lite::LockGuard> {
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(state_dir.join(LOCK_NAME))

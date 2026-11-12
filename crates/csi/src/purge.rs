@@ -99,12 +99,12 @@
 //! (`crate::engine_pods`, "Retiring a controller-owned pod").
 
 use crate::control_client::ControlClient;
-use crate::volume_id::{TRASH_DIR, VOLUMES_DIR};
 use async_trait::async_trait;
 use constellation_control::proto::types::{DeleteParams, LeaveParams};
 use constellation_control::proto::{ControlError, ErrorKind};
 use constellation_types::Code;
 use futures::stream::{self, TryStreamExt};
+use replicix_csi_common::volume_id::{TRASH_DIR, VOLUMES_DIR};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -154,17 +154,19 @@ impl PurgeConfig {
         let var = |k: &str| var(k).filter(|v| !v.trim().is_empty());
         let mut cfg = PurgeConfig::default();
         if let Some(v) = var("CONSTELLATION_CSI_PURGE_INTERVAL") {
-            let d = crate::params::parse_duration(&v)
+            let d = replicix_csi_common::params::parse_duration(&v)
                 .map_err(|e| format!("CONSTELLATION_CSI_PURGE_INTERVAL: {e}"))?;
             cfg.interval = (!d.is_zero()).then_some(d);
         }
         if let Some(v) = var("CONSTELLATION_CSI_PURGE_GRACE") {
-            cfg.grace = crate::params::parse_duration(&v)
+            cfg.grace = replicix_csi_common::params::parse_duration(&v)
                 .map_err(|e| format!("CONSTELLATION_CSI_PURGE_GRACE: {e}"))?;
         }
         let number = |k: &str| -> Result<Option<u64>, String> {
             var(k)
-                .map(|v| crate::params::parse_quantity(&v).map_err(|e| format!("{k}: {e}")))
+                .map(|v| {
+                    replicix_csi_common::params::parse_quantity(&v).map_err(|e| format!("{k}: {e}"))
+                })
                 .transpose()
         };
         if let Some(n) = number("CONSTELLATION_CSI_PURGE_MAX_CONCURRENT_DELETES")? {
@@ -830,7 +832,8 @@ impl LeaderTiming {
             ("CONSTELLATION_CSI_LEADER_RETRY_PERIOD", &mut t.retry),
         ] {
             if let Some(v) = var(key).filter(|v| !v.trim().is_empty()) {
-                *field = crate::params::parse_duration(&v).map_err(|e| format!("{key}: {e}"))?;
+                *field = replicix_csi_common::params::parse_duration(&v)
+                    .map_err(|e| format!("{key}: {e}"))?;
             }
         }
         if !(t.lease > t.renew_deadline && t.renew_deadline > t.retry && !t.retry.is_zero()) {

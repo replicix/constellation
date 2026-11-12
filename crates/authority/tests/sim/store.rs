@@ -178,9 +178,8 @@ pub struct Counts {
 
 /// Plan 43 C7b: called with `(writer node, the lease body replaced, the body
 /// written)` when a CAS of the lease object lands.
-pub type LeaseHook = Arc<
-    dyn Fn(u64, Option<constellation_store_s3::Lease>, constellation_store_s3::Lease) + Send + Sync,
->;
+pub type LeaseHook =
+    Arc<dyn Fn(u64, Option<replicix_objcas::Lease>, replicix_objcas::Lease) + Send + Sync>;
 
 pub struct Bucket {
     inner: Arc<InMemory>,
@@ -267,12 +266,9 @@ impl Bucket {
     /// The lease object as it is in the bucket this instant, read
     /// synchronously (plan 43 C0's I1 oracle: the configuration a
     /// reconfigurer would read). The backing store never waits.
-    pub fn peek_lease(&self) -> Option<constellation_store_s3::Lease> {
-        let leases = constellation_store_s3::LeaseStore::new(
-            self.raw(),
-            "p0",
-            constellation_store_s3::LeaseMode::Cas,
-        );
+    pub fn peek_lease(&self) -> Option<replicix_objcas::Lease> {
+        let leases =
+            replicix_objcas::LeaseStore::new(self.raw(), "p0", replicix_objcas::LeaseMode::Cas);
         futures::executor::block_on(leases.get())
             .ok()
             .flatten()
@@ -302,7 +298,7 @@ impl Bucket {
     /// The lease body in the bucket right before a put to `location`, when
     /// it is the lease object and a tap is installed (read synchronously:
     /// the in-memory store does not wait, so nothing lands in between).
-    fn lease_before(&self, location: &Path) -> Option<Option<constellation_store_s3::Lease>> {
+    fn lease_before(&self, location: &Path) -> Option<Option<replicix_objcas::Lease>> {
         if location.as_ref() != "leases/p0.json" || self.lease_hook.lock().unwrap().is_none() {
             return None;
         }
@@ -313,7 +309,7 @@ impl Bucket {
     fn put_landed(
         &self,
         node: u64,
-        prev: Option<Option<constellation_store_s3::Lease>>,
+        prev: Option<Option<replicix_objcas::Lease>>,
         location: &Path,
         payload: &PutPayload,
     ) {
@@ -321,7 +317,7 @@ impl Bucket {
             let armed = self.claim_cut.lock().unwrap().clone();
             if let Some((who, notify)) = armed {
                 let body: bytes::Bytes = payload.clone().into();
-                let took = serde_json::from_slice::<constellation_store_s3::Lease>(&body)
+                let took = serde_json::from_slice::<replicix_objcas::Lease>(&body)
                     .is_ok_and(|l| l.holder == who);
                 // A claim: the writer names itself, and did not hold it before
                 // (where the tap shows the body replaced).
@@ -340,7 +336,7 @@ impl Bucket {
             let body: bytes::Bytes = payload.clone().into();
             if let (Some(hook), Ok(new)) = (
                 hook,
-                serde_json::from_slice::<constellation_store_s3::Lease>(&body),
+                serde_json::from_slice::<replicix_objcas::Lease>(&body),
             ) {
                 if let Some(old) = &prev {
                     if old.holder != new.holder || old.epoch != new.epoch {

@@ -8,7 +8,7 @@
 //! **Stateless** (settled decision 7). A volume *is* a directory
 //! `/volumes/<name>` in a pool filesystem, its record is the
 //! `user.constellation.csi.*` xattrs on that directory, and its `volume_id`
-//! names the filesystem and subtree ([`crate::volume_id`]). Every RPC
+//! names the filesystem and subtree ([`replicix_csi_common::volume_id`]). Every RPC
 //! re-derives its answer from the pool; nothing here survives a restart
 //! except the in-flight bookkeeping below, which is only about *this*
 //! process's concurrent calls.
@@ -92,19 +92,21 @@
 //! still-running create of the same volume.
 
 use crate::control_client::{ControlClient, Engines, Handle, PoolRef, SubtreeQuotaParams};
-use crate::params::{ClassParams, Layout, PVC_NAMESPACE_KEY, PVC_NAME_KEY};
-use crate::proto::csi::v1::controller_server::Controller as ControllerRpc;
-use crate::proto::csi::v1::controller_service_capability::rpc::Type as RpcType;
-use crate::proto::csi::v1::controller_service_capability::{Rpc, Type as CapabilityType};
-use crate::proto::csi::v1::volume_capability::access_mode::Mode;
-use crate::proto::csi::v1::volume_capability::AccessType;
-use crate::proto::csi::v1::*;
-use crate::volume_id::{validate_name, VolumeId, TRASH_DIR, VOLUMES_DIR};
 use constellation_control::proto::types::{
     MkdirParams, QuotaStatus, RenameParams, XattrOp, XattrParams,
 };
 use constellation_control::proto::{ControlError, ErrorKind};
 use constellation_types::Code;
+use replicix_csi_common::params::{ClassParams, Layout, PVC_NAMESPACE_KEY, PVC_NAME_KEY};
+use replicix_csi_common::proto::csi::v1::controller_server::Controller as ControllerRpc;
+use replicix_csi_common::proto::csi::v1::controller_service_capability::rpc::Type as RpcType;
+use replicix_csi_common::proto::csi::v1::controller_service_capability::{
+    Rpc, Type as CapabilityType,
+};
+use replicix_csi_common::proto::csi::v1::volume_capability::access_mode::Mode;
+use replicix_csi_common::proto::csi::v1::volume_capability::AccessType;
+use replicix_csi_common::proto::csi::v1::*;
+use replicix_csi_common::volume_id::{validate_name, VolumeId, TRASH_DIR, VOLUMES_DIR};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -316,7 +318,7 @@ impl ControllerService {
             .await
             .map_err(|e| status("reaching the pool's engine", e))?;
         let created = registry
-            .fs_create(pool.class.fs_create(prefix.clone()))
+            .fs_create(crate::params::fs_create_params(&pool.class, prefix.clone()))
             .await
             .map_err(|e| match e.kind {
                 ErrorKind::Conflict | ErrorKind::Invalid => Status::invalid_argument(format!(
@@ -439,7 +441,7 @@ impl ControllerService {
             .await
             .map_err(|e| status("reaching the volume's engine", e))?;
         let created = registry
-            .fs_create(own.fs_create(prefix.clone()))
+            .fs_create(crate::params::fs_create_params(&own, prefix.clone()))
             .await
             .map_err(|e| match e.kind {
                 ErrorKind::Conflict | ErrorKind::Invalid => Status::invalid_argument(format!(
@@ -659,7 +661,7 @@ fn volume(id: &VolumeId, capacity: u64, parameters: &HashMap<String, String>) ->
     Volume {
         capacity_bytes: i64::try_from(capacity).unwrap_or(i64::MAX),
         volume_id: id.to_string(),
-        volume_context: crate::params::volume_context(parameters),
+        volume_context: replicix_csi_common::params::volume_context(parameters),
         content_source: None,
         accessible_topology: Vec::new(),
     }
@@ -817,10 +819,10 @@ fn lock_key(id: &VolumeId, raw: &str) -> String {
     }
 }
 
-/// A request's `secrets` as [`crate::credentials::Secrets`].
+/// A request's `secrets` as [`replicix_csi_common::credentials::Secrets`].
 pub(crate) fn secrets_of(
     secrets: &std::collections::HashMap<String, String>,
-) -> crate::credentials::Secrets {
+) -> replicix_csi_common::credentials::Secrets {
     secrets
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -877,7 +879,8 @@ impl ControllerRpc for ControllerService {
             validate_name(&req.name).map_err(Status::invalid_argument)?;
             check_capabilities(&req.volume_capabilities).map_err(Status::invalid_argument)?;
             let capacity = requested_capacity(req.capacity_range.as_ref())?;
-            let class = ClassParams::parse(&req.parameters).map_err(Status::invalid_argument)?;
+            let class = ClassParams::parse(&req.parameters, crate::params::DEFAULT_PREFIX)
+                .map_err(Status::invalid_argument)?;
             let engines = self.engines()?;
             let _lock = self.locks.try_lock(req.name.clone())?;
             let volume = match (&req.volume_content_source, class.layout) {
@@ -1191,7 +1194,7 @@ impl ControllerRpc for ControllerService {
         request: Request<DeleteSnapshotRequest>,
     ) -> Result<Response<DeleteSnapshotResponse>, Status> {
         let req = request.into_inner();
-        let who = match crate::volume_id::SnapshotId::parse(&req.snapshot_id) {
+        let who = match replicix_csi_common::volume_id::SnapshotId::parse(&req.snapshot_id) {
             Ok(id) => attribution_of_volume(&id.volume),
             Err(_) => attribution_of(&req.snapshot_id),
         };

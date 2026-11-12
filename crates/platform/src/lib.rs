@@ -57,13 +57,13 @@
 //! ([`linux::fuse_mount_fd`]), and the `/proc` text parsers — are free
 //! functions in [`linux`].
 
+use replicix_platform_lite::{FileLock, FsPrimitives};
+
 pub mod clock;
 pub mod daemon;
 pub mod dirs;
 pub mod drain;
-pub mod fs;
 pub mod lifecycle;
-pub mod lock;
 pub mod mounts;
 pub mod process;
 pub mod secrets;
@@ -116,14 +116,11 @@ use std::sync::{Arc, OnceLock};
 
 pub use daemon::{Daemon, Detached};
 pub use dirs::Dirs;
-pub use fs::FsPrimitives;
 pub use lifecycle::{LifecycleEvent, LifecycleSource, ManualLifecycle, Subscription};
-pub use lock::{FileLock, LockGuard};
 pub use mounts::{MountEntry, MountOpts, MountTable, UnmountMode};
 pub use process::{Lineage, Process, ProcessFacts, TaskFacts, ThreadRef};
 pub use secrets::{
-    core_dumps_forbidden, forbid_core_dumps, Credential, CredentialSource, EphemeralSecretStore,
-    FileSecretStore, Secret, SecretStore,
+    Credential, CredentialSource, EphemeralSecretStore, FileSecretStore, Secret, SecretStore,
 };
 
 /// The rdev conversions at the Linux boundary (plan 31 §7): the portable

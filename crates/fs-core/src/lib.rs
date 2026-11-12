@@ -5,14 +5,12 @@
 //! See docs/explanation/DESIGN.md §3 (data plane), §6 (consistency), §7 (caching).
 
 pub mod cache;
-pub mod chunk;
 pub mod error;
 pub mod manifest;
 pub mod memcache;
 pub mod tree;
 pub mod types;
 
-pub use chunk::{ChunkHash, ChunkLayout, ChunkSlice};
 pub use error::CoreError;
 pub use manifest::{ChunkInfo, Manifest};
 pub use tree::{Tree, TreeEntry};

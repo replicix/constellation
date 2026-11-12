@@ -20,8 +20,8 @@
 //! correctness (chunks are verified by hash).
 
 use constellation_fs_core::manifest::{ChunkInfo, Manifest};
-use constellation_fs_core::ChunkHash;
 use constellation_meta::LogRecord;
+use replicix_chunkfmt::ChunkHash;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 

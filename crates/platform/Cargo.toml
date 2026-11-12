@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+replicix-platform-lite.workspace = true
 constellation-types.workspace = true
 # Secrets (node key, E2E pins, S3 credentials) are wiped from memory when
 # dropped; portable, so the Windows library cross-check stays clean.

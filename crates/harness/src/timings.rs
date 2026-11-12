@@ -39,7 +39,7 @@ impl Timings {
                 .filter(|v| *v > 0)
                 .unwrap_or(default)
         };
-        let lease_ttl = knob("CONSTELLATION_LEASE_TTL_MS", 60_000);
+        let lease_ttl = knob("REPLICIX_LEASE_TTL_MS", 60_000);
         let margin = 1_000u64.min(lease_ttl / 4);
         // Cut to the lease TTL less two margins (deadline D8).
         let lock_ttl = knob("CONSTELLATION_LOCK_TTL_MS", 20_000)
@@ -175,7 +175,7 @@ mod tests {
         assert_eq!(t.delegation_ttl, ms(20_000));
         assert_eq!(t.read_delegation_ttl, ms(5_000));
         assert_eq!(t.backup_takeover, ms(1_500));
-        let short = Timings::from_pairs(&[("CONSTELLATION_LEASE_TTL_MS", "2000")]);
+        let short = Timings::from_pairs(&[("REPLICIX_LEASE_TTL_MS", "2000")]);
         assert_eq!(short.margin, ms(500));
     }
 
@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn the_ack_floor_of_the_delegroot_scenarios() {
         let t = Timings::from_pairs(&[
-            ("CONSTELLATION_LEASE_TTL_MS", "60000"),
+            ("REPLICIX_LEASE_TTL_MS", "60000"),
             ("CONSTELLATION_DELEGATION_TTL_MS", "5000"),
             ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "50"),
         ]);
@@ -194,10 +194,10 @@ mod tests {
 
     #[test]
     fn the_lock_ttl_is_cut_to_fit_the_lease() {
-        let t = Timings::from_pairs(&[("CONSTELLATION_LEASE_TTL_MS", "20000")]);
+        let t = Timings::from_pairs(&[("REPLICIX_LEASE_TTL_MS", "20000")]);
         assert_eq!(t.lock_ttl, ms(18_000));
         assert_eq!(t.delegation_ttl, ms(18_000));
-        let t = Timings::from_pairs(&[("CONSTELLATION_LEASE_TTL_MS", "22000")]);
+        let t = Timings::from_pairs(&[("REPLICIX_LEASE_TTL_MS", "22000")]);
         assert_eq!(t.lock_ttl, ms(20_000));
     }
 

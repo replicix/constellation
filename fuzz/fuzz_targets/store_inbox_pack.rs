@@ -6,7 +6,7 @@ fuzz_target!(
     init: {
         // See store_object: keep the decompression ceiling under the malloc limit.
         std::env::set_var(
-            constellation_store_s3::codec::MAX_DECOMPRESSED_ENV,
+            replicix_chunkfmt::codec::MAX_DECOMPRESSED_ENV,
             (64u64 << 20).to_string(),
         );
     },

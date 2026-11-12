@@ -889,7 +889,7 @@ fn decline() -> Payload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use constellation_fs_core::ChunkHash;
+    use replicix_chunkfmt::ChunkHash;
 
     fn h(n: u64) -> ChunkHash {
         ChunkHash::of(&n.to_le_bytes())

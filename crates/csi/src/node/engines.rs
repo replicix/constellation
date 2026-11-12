@@ -10,10 +10,11 @@
 //! the engine pod's hostPath unix socket can carry.
 
 use crate::control_client::{ControlClient, InMemoryControl, PoolRef};
-use crate::credentials::{fingerprint, unlock_params, Secrets};
+use crate::credentials::unlock_params;
 use crate::engine_pods::{unit_name, unlock_target};
 use async_trait::async_trait;
 use constellation_control::proto::ControlError;
+use replicix_csi_common::credentials::{fingerprint, Secrets};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

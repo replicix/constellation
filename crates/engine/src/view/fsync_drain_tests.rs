@@ -8,13 +8,13 @@
 //! (`UploadHold`, plan 31 C8: an explicit durability request is never
 //! held), so a chunk is in the bucket only if the `fsync` put it there.
 use crate::{Engine, EngineConfig, EngineProfile};
-use constellation_fs_core::ChunkHash;
 use constellation_platform::HostServices;
 use constellation_store_s3::{ChunkStore, FsMeta};
 use constellation_vfs::{
     Blocking, Caller, Durability, FrontendCaps, Name, OpCtx, OpKind, OpenFlags, OpenOwner, Vfs,
     WriteData,
 };
+use replicix_chunkfmt::ChunkHash;
 use std::sync::Arc;
 
 struct Node {
@@ -427,7 +427,7 @@ fn fsync_waits_for_remote_rows(fsync_s3: bool) {
             .block_on(node.engine.store().put_chunk(
                 &hash,
                 &data,
-                constellation_store_s3::CompressionSetting::RAW,
+                replicix_chunkfmt::CompressionSetting::RAW,
             ))
             .unwrap();
         assert_eq!(fsync.join().unwrap(), Ok(()), "fsync_s3={fsync_s3}");

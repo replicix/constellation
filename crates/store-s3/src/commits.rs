@@ -326,27 +326,31 @@ impl CommitChain {
         let key = layout::commit(commit.seq);
         let json = serde_json::to_vec(commit)?;
         let body = match self.seal.as_deref() {
-            Some(seal) => {
-                crate::e2e::encrypt_object(&seal.commits, key.as_ref().as_bytes(), &json)?
-            }
+            Some(seal) => replicix_chunkfmt::e2e::encrypt_object(
+                &seal.commits,
+                key.as_ref().as_bytes(),
+                &json,
+            )?,
             None => json,
         };
-        // Plan 30 §M4 item 1 (`crate::cas`): a 409 retries the same
+        // Plan 30 §M4 item 1 (`replicix_objcas::cas`): a 409 retries the same
         // create (it used to read as a lost race, and the winner read-back
         // then found an empty slot and reported bucket corruption); a 412
         // is a lost race unless the object is this commit byte for byte —
         // our own create that landed behind a retried 5xx or a lost reply.
-        match crate::cas::put_conditional(
+        match replicix_objcas::cas::put_conditional(
             self.store.as_ref(),
             &key,
             body.into(),
             PutMode::Create,
-            crate::cas::Verify::Body,
+            replicix_objcas::cas::Verify::Body,
         )
         .await?
         {
-            crate::cas::CasPut::Won(_) => Ok(()),
-            crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => Err(StoreError::CasConflict),
+            replicix_objcas::cas::CasPut::Won(_) => Ok(()),
+            replicix_objcas::cas::CasPut::Lost | replicix_objcas::cas::CasPut::Missing => {
+                Err(StoreError::CasConflict)
+            }
         }
     }
 
@@ -363,9 +367,11 @@ impl CommitChain {
     fn open(&self, seq: u64, stored: &[u8]) -> Result<Commit, StoreError> {
         let key = layout::commit(seq);
         let body = match self.seal.as_deref() {
-            Some(seal) => {
-                crate::e2e::decrypt_object(&seal.commits, key.as_ref().as_bytes(), stored)?
-            }
+            Some(seal) => replicix_chunkfmt::e2e::decrypt_object(
+                &seal.commits,
+                key.as_ref().as_bytes(),
+                stored,
+            )?,
             None => stored.to_vec(),
         };
         let commit: Commit = serde_json::from_slice(&body)?;

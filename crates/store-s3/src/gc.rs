@@ -9,8 +9,8 @@
 //! of daemon logs.
 
 use crate::{layout, StoreError};
-use constellation_fs_core::ChunkHash;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion};
+use replicix_chunkfmt::ChunkHash;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -279,21 +279,23 @@ pub async fn publish_condemned(
         hashes,
         published_ms,
     };
-    // Plan 30 §M4 item 1 (`crate::cas`): a 409 retries the same attempt,
+    // Plan 30 §M4 item 1 (`replicix_objcas::cas`): a 409 retries the same attempt,
     // and a 412/404 is a lost race unless the pointer is this very list
     // (epoch, hashes and a millisecond timestamp: our own earlier attempt
     // landed behind a retried 5xx or a lost reply).
-    match crate::cas::put_conditional(
+    match replicix_objcas::cas::put_conditional(
         store.as_ref(),
         &layout::gc_condemned(),
         serde_json::to_vec(&list)?.into(),
         mode,
-        crate::cas::Verify::Body,
+        replicix_objcas::cas::Verify::Body,
     )
     .await?
     {
-        crate::cas::CasPut::Won(_) => Ok(list),
-        crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => Err(StoreError::CasConflict),
+        replicix_objcas::cas::CasPut::Won(_) => Ok(list),
+        replicix_objcas::cas::CasPut::Lost | replicix_objcas::cas::CasPut::Missing => {
+            Err(StoreError::CasConflict)
+        }
     }
 }
 
@@ -403,8 +405,12 @@ pub async fn append_journal(
     // this very write landed behind a lost reply; a 409 (the OVH run's
     // finding 5: some stores answer a conditional write with 409 before
     // settling) retries rather than failing the GC round.
-    crate::cas::create_content_addressed(store.as_ref(), &key, serde_json::to_vec(entry)?.into())
-        .await?;
+    replicix_objcas::cas::create_content_addressed(
+        store.as_ref(),
+        &key,
+        serde_json::to_vec(entry)?.into(),
+    )
+    .await?;
     Ok(())
 }
 

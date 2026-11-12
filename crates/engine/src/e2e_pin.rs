@@ -418,8 +418,9 @@ fn write(store: &PinStore, key: &str, pin: &E2ePin) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use constellation_store_s3::e2e::rewrap_master;
-    use constellation_store_s3::{create_keyring_block, unlock, SharedE2eKeys};
+    use constellation_store_s3::{unlock, SharedE2eKeys};
+    use replicix_chunkfmt::create_keyring_block;
+    use replicix_chunkfmt::e2e::rewrap_master;
 
     const S3: &str = "s3://bucket/prefix";
 

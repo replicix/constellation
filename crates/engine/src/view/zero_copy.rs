@@ -222,7 +222,7 @@ impl View {
         hashes: &constellation_fs_core::manifest::SparseChunks,
         chunk_size: u32,
         file_len: u64,
-        slice: &constellation_fs_core::chunk::ChunkSlice,
+        slice: &replicix_chunkfmt::ChunkSlice,
     ) -> Option<ReadData> {
         if self.cache.verify_mode() != CacheVerify::Admit
             || slice.len == 0

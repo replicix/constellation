@@ -22,7 +22,7 @@ use constellation_fs_core::Ino;
 use constellation_meta::{MutateOp, MutateOutcome, Rid, RowCommit};
 use constellation_store_s3::heartbeat::Promise;
 use constellation_store_s3::inbox::{InboxBatch, InboxKey};
-use constellation_store_s3::{Lease, LeaseTag};
+use replicix_objcas::{Lease, LeaseTag};
 
 /// One thing for the driver to do.
 #[derive(Debug)]

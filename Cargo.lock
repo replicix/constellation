@@ -1141,6 +1141,9 @@ dependencies = [
  "libc",
  "object_store",
  "postcard",
+ "replicix-chunkfmt",
+ "replicix-objcas",
+ "replicix-platform-lite",
  "rpassword",
  "serde",
  "serde_json",
@@ -1170,6 +1173,8 @@ dependencies = [
  "object_store",
  "postcard",
  "rand 0.9.5",
+ "replicix-chunkfmt",
+ "replicix-objcas",
  "serde",
  "serde_json",
  "stateright",
@@ -1242,9 +1247,9 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "libc",
- "prost",
  "prost-types",
- "protoc-bin-vendored",
+ "replicix-csi-common",
+ "replicix-platform-lite",
  "rustls",
  "serde",
  "serde_json",
@@ -1252,8 +1257,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tonic-prost",
- "tonic-prost-build",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -1278,7 +1281,6 @@ dependencies = [
  "constellation-platform",
  "constellation-store-s3",
  "constellation-types",
- "constellation-upload-concurrency",
  "constellation-vfs",
  "criterion",
  "fjall",
@@ -1286,6 +1288,10 @@ dependencies = [
  "memchr",
  "object_store",
  "postcard",
+ "replicix-chunkfmt",
+ "replicix-objcas",
+ "replicix-platform-lite",
+ "replicix-upload-concurrency",
  "serde",
  "serde_json",
  "siphasher",
@@ -1322,10 +1328,10 @@ dependencies = [
 name = "constellation-fs-core"
 version = "1.0.0"
 dependencies = [
- "blake3",
  "bytes",
  "constellation-types",
  "region",
+ "replicix-chunkfmt",
  "serde",
  "tempfile",
  "thiserror 2.0.20",
@@ -1353,6 +1359,7 @@ dependencies = [
  "object_store",
  "postcard",
  "rand 0.9.5",
+ "replicix-objcas",
  "serde",
  "serde_json",
  "sha2",
@@ -1377,6 +1384,7 @@ dependencies = [
  "log",
  "postcard",
  "proptest",
+ "replicix-chunkfmt",
  "serde",
  "serde_json",
  "smallvec",
@@ -1429,6 +1437,7 @@ dependencies = [
  "constellation-types",
  "futures-util",
  "libc",
+ "replicix-platform-lite",
  "tempfile",
  "tokio",
  "tracing",
@@ -1452,14 +1461,9 @@ name = "constellation-store-s3"
 version = "1.0.0"
 dependencies = [
  "anyhow",
- "argon2",
  "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-types",
  "blake3",
  "bytes",
- "chacha20poly1305",
  "constellation-fs-core",
  "constellation-mtree",
  "constellation-platform",
@@ -1469,7 +1473,8 @@ dependencies = [
  "postcard",
  "rand 0.9.5",
  "rayon",
- "region",
+ "replicix-chunkfmt",
+ "replicix-objcas",
  "serde",
  "serde_json",
  "tempfile",
@@ -1490,13 +1495,6 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "constellation-upload-concurrency"
-version = "1.0.0"
-dependencies = [
- "tokio",
 ]
 
 [[package]]
@@ -5074,6 +5072,79 @@ dependencies = [
 ]
 
 [[package]]
+name = "replicix-chunkfmt"
+version = "0.1.0"
+source = "git+https://github.com/replicix/replicix-core?rev=caa47b4918509d10c1bac23369cf84bbe6883642#caa47b4918509d10c1bac23369cf84bbe6883642"
+dependencies = [
+ "argon2",
+ "blake3",
+ "chacha20poly1305",
+ "rand 0.9.5",
+ "region",
+ "serde",
+ "thiserror 2.0.20",
+ "tracing",
+ "zeroize",
+ "zstd",
+]
+
+[[package]]
+name = "replicix-csi-common"
+version = "0.1.0"
+source = "git+https://github.com/replicix/replicix-core?rev=caa47b4918509d10c1bac23369cf84bbe6883642#caa47b4918509d10c1bac23369cf84bbe6883642"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+]
+
+[[package]]
+name = "replicix-objcas"
+version = "0.1.0"
+source = "git+https://github.com/replicix/replicix-core?rev=caa47b4918509d10c1bac23369cf84bbe6883642#caa47b4918509d10c1bac23369cf84bbe6883642"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-types",
+ "bytes",
+ "futures",
+ "object_store",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "replicix-platform-lite"
+version = "0.1.0"
+source = "git+https://github.com/replicix/replicix-core?rev=caa47b4918509d10c1bac23369cf84bbe6883642#caa47b4918509d10c1bac23369cf84bbe6883642"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "replicix-upload-concurrency"
+version = "0.1.0"
+source = "git+https://github.com/replicix/replicix-core?rev=caa47b4918509d10c1bac23369cf84bbe6883642#caa47b4918509d10c1bac23369cf84bbe6883642"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6470,11 +6541,12 @@ dependencies = [
  "bytes",
  "clap",
  "constellation-store-s3",
- "constellation-upload-concurrency",
  "futures",
  "object_store",
  "pid",
  "rand 0.9.5",
+ "replicix-objcas",
+ "replicix-upload-concurrency",
  "tokio",
  "tracing",
  "tracing-subscriber",

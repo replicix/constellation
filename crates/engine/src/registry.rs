@@ -111,7 +111,7 @@ pub struct Registry {
     /// `merge_and_save`/`remove` need) is atomic across processes. Plain
     /// `load_at` does not take it — a read-only glance (`fs list`, `status`
     /// name resolution) does not need to serialize against writers.
-    _lock: Option<constellation_platform::LockGuard>,
+    _lock: Option<replicix_platform_lite::LockGuard>,
     /// Where a name's default state dir is (`<data dir>/<name>`): the
     /// manager's host's dirs, else this process's native ones.
     dirs: Option<std::sync::Arc<dyn constellation_platform::Dirs>>,
@@ -162,9 +162,8 @@ impl Registry {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let lock_file =
-            constellation_platform::lock::open_lock_file(&path.with_extension("toml.lock"))
-                .context("opening registry lock file")?;
+        let lock_file = replicix_platform_lite::open_lock_file(&path.with_extension("toml.lock"))
+            .context("opening registry lock file")?;
         let lock = constellation_platform::native()
             .file_lock
             .lock(lock_file)
@@ -668,8 +667,7 @@ mod tests {
         // A daemon still bootstrapping holds daemon.lock in the stored dir
         // before it has a meta.db: the dir is in use, a second daemon
         // elsewhere would be a second node_id for the name.
-        let lock =
-            constellation_platform::lock::open_lock_file(&empty.join("daemon.lock")).unwrap();
+        let lock = replicix_platform_lite::open_lock_file(&empty.join("daemon.lock")).unwrap();
         let held = constellation_platform::native()
             .file_lock
             .try_lock(lock)

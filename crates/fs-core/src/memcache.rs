@@ -64,8 +64,8 @@
 //! Lock order: the owner's state lock, then the policy mutex, then a
 //! shard lock.
 
-use crate::chunk::ChunkHash;
 use bytes::Bytes;
+use replicix_chunkfmt::ChunkHash;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::{Mutex, RwLock};

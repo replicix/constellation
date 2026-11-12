@@ -116,7 +116,7 @@ pub enum LeaseRead {
 
 impl LeaseRead {
     /// The read of a lease object that parsed.
-    pub fn of(lease: &constellation_store_s3::Lease) -> LeaseRead {
+    pub fn of(lease: &replicix_objcas::Lease) -> LeaseRead {
         LeaseRead::Held {
             holder: lease.holder,
             epoch: lease.epoch,

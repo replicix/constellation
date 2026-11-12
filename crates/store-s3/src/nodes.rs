@@ -128,23 +128,25 @@ pub async fn claim_node_id(store: Arc<dyn ObjectStore>) -> Result<u64, StoreErro
             claim: Some(claim.clone()),
         };
         let body = serde_json::to_vec(&info)?;
-        // Plan 30 §M4 item 1 (`crate::cas`): a 409 retries this candidate;
+        // Plan 30 §M4 item 1 (`replicix_objcas::cas`): a 409 retries this candidate;
         // a 412 moves on to the next one unless the record there is our
         // own claim (same nonce) that landed behind a retried 5xx or a
         // lost reply — claiming the next id as well would register this
         // node twice, and the ghost record would count as a write-eligible
         // member that never answers (continuation epochs need them all).
-        match crate::cas::put_conditional(
+        match replicix_objcas::cas::put_conditional(
             store.as_ref(),
             &node_key(candidate),
             body.into(),
             PutMode::Create,
-            crate::cas::Verify::Body,
+            replicix_objcas::cas::Verify::Body,
         )
         .await?
         {
-            crate::cas::CasPut::Won(_) => return Ok(candidate),
-            crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => candidate += 1,
+            replicix_objcas::cas::CasPut::Won(_) => return Ok(candidate),
+            replicix_objcas::cas::CasPut::Lost | replicix_objcas::cas::CasPut::Missing => {
+                candidate += 1
+            }
         }
     }
 }
@@ -183,7 +185,9 @@ async fn read_record(
     store: &dyn ObjectStore,
     key: &object_store::path::Path,
 ) -> Result<Option<(NodeInfo, object_store::ObjectMeta)>, StoreError> {
-    crate::control::get_json::<NodeInfo>(store, key).await
+    replicix_objcas::control::get_json::<NodeInfo>(store, key)
+        .await
+        .map_err(StoreError::from)
 }
 
 /// Permanently retire `node_id` from the write-eligible roster.

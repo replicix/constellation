@@ -2,10 +2,13 @@
 //! `fork`-based daemonizing, `gethostname`, the effective ids, the
 //! backtrace signal handler, and the extended-attribute calls.
 
-use std::ffi::{CString, OsString};
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -13,7 +16,6 @@ use std::sync::OnceLock;
 
 use crate::daemon::{Daemon, Detached};
 use crate::dirs::{self, Dirs};
-use crate::lock::{FileLock, LockGuard};
 
 /// `$XDG_CONFIG_HOME`/`$XDG_DATA_HOME`/`$XDG_RUNTIME_DIR` with the usual
 /// `$HOME` fallbacks, on Linux and macOS alike (see [`crate::dirs`]).
@@ -49,58 +51,6 @@ impl Dirs for XdgDirs {
             tmp,
             effective_ids().0,
         ))
-    }
-}
-
-/// `flock(2)` locks. `holders` answers [`FileLock::holder_pids`] and
-/// `opened_by` [`FileLock::opened_by`], which only Linux can (from
-/// `/proc`).
-pub(crate) struct UnixFileLock {
-    pub(crate) holders: fn(&Path) -> Vec<u32>,
-    pub(crate) opened_by: fn(u32, &Path) -> bool,
-}
-
-fn flock(file: &File, op: libc::c_int) -> io::Result<()> {
-    // SAFETY: `file` owns a valid open fd for the duration of the call;
-    // `flock` does not touch memory.
-    if unsafe { libc::flock(file.as_raw_fd(), op) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-impl FileLock for UnixFileLock {
-    fn lock(&self, file: File) -> io::Result<LockGuard> {
-        loop {
-            match flock(&file, libc::LOCK_EX) {
-                Ok(()) => return Ok(LockGuard::new(file)),
-                // A signal handler (SA_RESTART-less) interrupted the wait.
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    fn try_lock(&self, file: File) -> io::Result<Option<LockGuard>> {
-        match flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
-            Ok(()) => Ok(Some(LockGuard::new(file))),
-            Err(e)
-                if constellation_types::Code::from_io_error(&e)
-                    == constellation_types::Code::Again =>
-            {
-                Ok(None)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    fn holder_pids(&self, path: &Path) -> Vec<u32> {
-        (self.holders)(path)
-    }
-
-    fn opened_by(&self, pid: u32, path: &Path) -> bool {
-        (self.opened_by)(pid, path)
     }
 }
 
@@ -560,34 +510,25 @@ pub(crate) fn enable_backtraces(label: &'static str, tid: fn() -> u64) -> io::Re
 
 // ------------------------------------------------------------ xattrs
 //
-// The same four calls on both hosts; macOS's take a `position` (resource
+// Only macOS uses these (Linux's are `replicix_platform_lite::NativeFs`);
+// macOS's calls take a `position` (resource
 // forks; 0 for everything else) and an `options` word that Linux's do not.
 // The `sys_*` shims are that one difference.
 
+#[cfg(target_os = "macos")]
 fn cpath(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
 }
 
+#[cfg(target_os = "macos")]
 fn cname(name: &str) -> io::Result<CString> {
     CString::new(name)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains a NUL byte"))
 }
 
 /// # Safety
-/// `path` and `name` are NUL-terminated; `value` is valid for `size` bytes.
-#[cfg(target_os = "linux")]
-unsafe fn sys_setxattr(
-    path: *const libc::c_char,
-    name: *const libc::c_char,
-    value: *const libc::c_void,
-    size: usize,
-) -> libc::c_int {
-    unsafe { libc::setxattr(path, name, value, size, 0) }
-}
-
-/// # Safety
-/// As the Linux one.
+/// As the underlying libc call.
 #[cfg(target_os = "macos")]
 unsafe fn sys_setxattr(
     path: *const libc::c_char,
@@ -599,20 +540,7 @@ unsafe fn sys_setxattr(
 }
 
 /// # Safety
-/// `path` and `name` are NUL-terminated; `value` is null with `size` 0, or
-/// valid for writes of `size` bytes.
-#[cfg(target_os = "linux")]
-unsafe fn sys_getxattr(
-    path: *const libc::c_char,
-    name: *const libc::c_char,
-    value: *mut libc::c_void,
-    size: usize,
-) -> libc::ssize_t {
-    unsafe { libc::getxattr(path, name, value, size) }
-}
-
-/// # Safety
-/// As the Linux one.
+/// As the underlying libc call.
 #[cfg(target_os = "macos")]
 unsafe fn sys_getxattr(
     path: *const libc::c_char,
@@ -624,19 +552,7 @@ unsafe fn sys_getxattr(
 }
 
 /// # Safety
-/// `path` is NUL-terminated; `list` is null with `size` 0, or valid for
-/// writes of `size` bytes.
-#[cfg(target_os = "linux")]
-unsafe fn sys_listxattr(
-    path: *const libc::c_char,
-    list: *mut libc::c_char,
-    size: usize,
-) -> libc::ssize_t {
-    unsafe { libc::listxattr(path, list, size) }
-}
-
-/// # Safety
-/// As the Linux one.
+/// As the underlying libc call.
 #[cfg(target_os = "macos")]
 unsafe fn sys_listxattr(
     path: *const libc::c_char,
@@ -647,19 +563,13 @@ unsafe fn sys_listxattr(
 }
 
 /// # Safety
-/// `path` and `name` are NUL-terminated.
-#[cfg(target_os = "linux")]
-unsafe fn sys_removexattr(path: *const libc::c_char, name: *const libc::c_char) -> libc::c_int {
-    unsafe { libc::removexattr(path, name) }
-}
-
-/// # Safety
-/// As the Linux one.
+/// As the underlying libc call.
 #[cfg(target_os = "macos")]
 unsafe fn sys_removexattr(path: *const libc::c_char, name: *const libc::c_char) -> libc::c_int {
     unsafe { libc::removexattr(path, name, 0) }
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn set_xattr(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
     let (path, name) = (cpath(path)?, cname(name)?);
     // SAFETY: valid NUL-terminated strings and a live buffer.
@@ -677,6 +587,7 @@ pub(crate) fn set_xattr(path: &Path, name: &str, value: &[u8]) -> io::Result<()>
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 /// Read a variable-length xattr result: ask for its size, then for the
 /// bytes, asking again if it grew in between (`ERANGE`).
 fn read_sized(
@@ -701,6 +612,7 @@ fn read_sized(
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn get_xattr(path: &Path, name: &str) -> io::Result<Vec<u8>> {
     let (path, name) = (cpath(path)?, cname(name)?);
     // SAFETY: valid NUL-terminated strings; `read_sized` passes a null
@@ -708,6 +620,7 @@ pub(crate) fn get_xattr(path: &Path, name: &str) -> io::Result<Vec<u8>> {
     read_sized(|buf, len| unsafe { sys_getxattr(path.as_ptr(), name.as_ptr(), buf, len) })
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn list_xattr(path: &Path) -> io::Result<Vec<String>> {
     let path = cpath(path)?;
     // SAFETY: as in `get_xattr`.
@@ -719,6 +632,7 @@ pub(crate) fn list_xattr(path: &Path) -> io::Result<Vec<String>> {
         .collect())
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn remove_xattr(path: &Path, name: &str) -> io::Result<()> {
     let (path, name) = (cpath(path)?, cname(name)?);
     // SAFETY: valid NUL-terminated strings.
@@ -750,128 +664,6 @@ mod tests {
         let mut got = String::new();
         r.read_to_string(&mut got).unwrap();
         assert_eq!(got, "OK\n");
-    }
-
-    #[test]
-    fn a_second_open_cannot_take_a_held_lock() {
-        let locks = UnixFileLock {
-            holders: |_| Vec::new(),
-            opened_by: |_, _| false,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("daemon.lock");
-        let open = || crate::lock::open_lock_file(&path).unwrap();
-        let held = locks.try_lock(open()).unwrap().expect("free lock");
-        // A second open file description contends (flock is per open
-        // file, so this holds within one process too).
-        assert!(locks.try_lock(open()).unwrap().is_none());
-        // A blocking lock waits until the holder lets go.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let waiter = {
-            let path = path.clone();
-            std::thread::spawn(move || {
-                let locks = UnixFileLock {
-                    holders: |_| Vec::new(),
-                    opened_by: |_, _| false,
-                };
-                let guard = locks
-                    .lock(crate::lock::open_lock_file(&path).unwrap())
-                    .unwrap();
-                tx.send(()).unwrap();
-                drop(guard);
-            })
-        };
-        assert!(rx
-            .recv_timeout(std::time::Duration::from_millis(200))
-            .is_err());
-        drop(held);
-        rx.recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the blocking lock was granted once released");
-        waiter.join().unwrap();
-        assert!(locks.try_lock(open()).unwrap().is_some());
-    }
-
-    #[test]
-    fn a_leaked_guard_keeps_the_lock() {
-        let locks = UnixFileLock {
-            holders: |_| Vec::new(),
-            opened_by: |_, _| false,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("daemon.lock");
-        let guard = locks
-            .try_lock(crate::lock::open_lock_file(&path).unwrap())
-            .unwrap()
-            .unwrap();
-        let fd = guard.file().as_raw_fd();
-        std::mem::forget(guard);
-        assert!(locks
-            .try_lock(crate::lock::open_lock_file(&path).unwrap())
-            .unwrap()
-            .is_none());
-        // SAFETY: the leaked guard's fd, closed exactly once here.
-        unsafe { libc::close(fd) };
-        assert!(locks
-            .try_lock(crate::lock::open_lock_file(&path).unwrap())
-            .unwrap()
-            .is_some());
-    }
-
-    #[test]
-    fn xattrs_round_trip_and_report_a_missing_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("f");
-        std::fs::write(&path, b"x").unwrap();
-        match set_xattr(&path, "user.constellation.test", b"blue") {
-            Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {
-                eprintln!("SKIPPED (not run): this filesystem has no extended attributes ({e})");
-                return;
-            }
-            Err(e) => panic!("set_xattr: {e}"),
-        }
-        assert_eq!(
-            get_xattr(&path, "user.constellation.test").unwrap(),
-            b"blue"
-        );
-        // A value longer than any first guess at a buffer, an empty one,
-        // and a replacement.
-        let big = vec![7u8; 20_000];
-        set_xattr(&path, "user.constellation.big", &big).unwrap();
-        set_xattr(&path, "user.constellation.empty", b"").unwrap();
-        set_xattr(&path, "user.constellation.test", b"red").unwrap();
-        assert_eq!(get_xattr(&path, "user.constellation.big").unwrap(), big);
-        assert_eq!(get_xattr(&path, "user.constellation.empty").unwrap(), b"");
-        assert_eq!(get_xattr(&path, "user.constellation.test").unwrap(), b"red");
-        let mut names = list_xattr(&path).unwrap();
-        names.retain(|n| n.starts_with("user.constellation."));
-        names.sort();
-        assert_eq!(
-            names,
-            [
-                "user.constellation.big",
-                "user.constellation.empty",
-                "user.constellation.test"
-            ]
-        );
-        remove_xattr(&path, "user.constellation.test").unwrap();
-        // The documented contract the harness's NoData checks rely on:
-        // ENODATA on Linux, ENOATTR on macOS, both `Code::NoData`.
-        for e in [
-            get_xattr(&path, "user.constellation.test").unwrap_err(),
-            remove_xattr(&path, "user.constellation.test").unwrap_err(),
-        ] {
-            assert_eq!(
-                constellation_types::Code::from_io_error(&e),
-                constellation_types::Code::NoData,
-                "{e}"
-            );
-        }
-        // Names and paths with a NUL are refused before the syscall.
-        assert_eq!(
-            set_xattr(&path, "user.a\0b", b"v").unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
     }
 
     #[test]

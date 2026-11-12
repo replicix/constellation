@@ -9,9 +9,9 @@ use constellation_authority::core::LeaseState;
 use constellation_authority::{Config, Ms, Now};
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::{ReadKey, SessionWait};
-use constellation_store_s3::lease::now_unix_ms;
-use constellation_store_s3::{Lease, LeaseMode, LeaseStore};
 use object_store::memory::InMemory;
+use replicix_objcas::lease::now_unix_ms;
+use replicix_objcas::{Lease, LeaseMode, LeaseStore};
 use tempfile::TempDir;
 
 /// A holder's filesystem: the lease view is held with the durability

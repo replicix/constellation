@@ -23,9 +23,9 @@
 //! falls back to the adaptive probe policy, and `Create` is a conditional
 //! `If-None-Match: *` PUT that fails safely on a hash already present.
 
-use constellation_fs_core::ChunkHash;
 use constellation_meta::Meta;
 use constellation_net::bloom::{Bloom, BITS_PER_ENTRY};
+use replicix_chunkfmt::ChunkHash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -150,7 +150,7 @@ mod tests {
     /// bookkeeping can extract the hash from them.
     fn manifest_of(hash: ChunkHash) -> Vec<u8> {
         Manifest {
-            layout: constellation_fs_core::ChunkLayout::new(4096),
+            layout: replicix_chunkfmt::ChunkLayout::new(4096),
             file_len: 4096,
             chunks: ChunkInfo::Inline([(0u64, hash)].into_iter().collect()),
         }

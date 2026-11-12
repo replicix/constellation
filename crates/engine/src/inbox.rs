@@ -106,7 +106,7 @@ pub fn knobs(base_ms: u64, ttl_ms: u64, retention_s: u64) -> InboxKnobs {
             ttl_ms,
             retention_s,
             deadline_ms = deadline.as_millis() as u64,
-            "CONSTELLATION_LEASE_TTL_MS is large enough that the inbox in-doubt deadline \
+            "REPLICIX_LEASE_TTL_MS is large enough that the inbox in-doubt deadline \
              is clamped to half the completion retention window"
         );
     }

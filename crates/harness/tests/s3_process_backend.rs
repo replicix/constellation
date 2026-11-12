@@ -27,7 +27,7 @@ fn store(endpoint: &str) -> impl ObjectStore {
         .with_access_key_id("test")
         .with_secret_access_key("test");
     // The daemons' client and the retry budget `Client::cmd` gives them.
-    constellation_store_s3::configure_s3_client(builder)
+    replicix_objcas::configure_s3_client(builder)
         .with_retry(object_store::RetryConfig {
             max_retries: 0,
             retry_timeout: Duration::from_secs(2),

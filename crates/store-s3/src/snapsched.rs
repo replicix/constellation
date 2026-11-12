@@ -23,9 +23,9 @@
 //! scheduler then deletes nothing in that run.
 
 use crate::error::StoreError;
-use crate::lease::LeaseMode;
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, UpdateVersion};
+use replicix_objcas::lease::LeaseMode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -94,8 +94,12 @@ pub async fn append_journal(
     entry: &SnapSchedJournalEntry,
 ) -> Result<Path, StoreError> {
     let key = journal_key(entry.ts, &uuid::Uuid::new_v4().simple().to_string());
-    crate::cas::create_content_addressed(store.as_ref(), &key, serde_json::to_vec(entry)?.into())
-        .await?;
+    replicix_objcas::cas::create_content_addressed(
+        store.as_ref(),
+        &key,
+        serde_json::to_vec(entry)?.into(),
+    )
+    .await?;
     Ok(key)
 }
 
@@ -189,7 +193,7 @@ pub async fn load_state(
     store: &Arc<dyn ObjectStore>,
 ) -> Result<(SnapSchedState, StateTag), StoreError> {
     let key = state_key();
-    match crate::control::get_json::<serde_json::Value>(store.as_ref(), &key).await? {
+    match replicix_objcas::control::get_json::<serde_json::Value>(store.as_ref(), &key).await? {
         None => Ok((SnapSchedState::default(), StateTag(None))),
         Some((value, meta)) => {
             // The version first, so an older format is refused by name
@@ -230,17 +234,19 @@ pub async fn save_state(
         (Some(version), LeaseMode::Cas) => PutMode::Update(version.clone()),
     };
     let body = serde_json::to_vec(state)?;
-    match crate::cas::put_conditional(
+    match replicix_objcas::cas::put_conditional(
         store.as_ref(),
         &state_key(),
         body.into(),
         put,
-        crate::cas::Verify::Body,
+        replicix_objcas::cas::Verify::Body,
     )
     .await?
     {
-        crate::cas::CasPut::Won(version) => Ok(StateTag(Some(version))),
-        crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => Err(StoreError::CasConflict),
+        replicix_objcas::cas::CasPut::Won(version) => Ok(StateTag(Some(version))),
+        replicix_objcas::cas::CasPut::Lost | replicix_objcas::cas::CasPut::Missing => {
+            Err(StoreError::CasConflict)
+        }
     }
 }
 

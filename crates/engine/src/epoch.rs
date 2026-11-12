@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 /// The protocol clock (`lease::now_unix_ms`, which a load campaign may
 /// offset): promise windows are compared across nodes.
 fn now_ms() -> i64 {
-    constellation_store_s3::lease::now_unix_ms()
+    replicix_objcas::lease::now_unix_ms()
 }
 
 /// `local` key of the current (or last) epoch's resolution.

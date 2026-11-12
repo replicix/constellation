@@ -1366,7 +1366,7 @@ pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
     };
     let mut extra = vec![("CONSTELLATION_CTO", "strict"), ("RUST_LOG", rust_log)];
     if let Some(ttl) = lease_ttl.as_deref() {
-        extra.push(("CONSTELLATION_LEASE_TTL_MS", ttl));
+        extra.push(("REPLICIX_LEASE_TTL_MS", ttl));
     }
     let (_env, _root, mut clients, proxies) = cluster(NAME, &["a", "b", "c", "d"], &extra, 1)?;
     let result = (|| -> Result<()> {
@@ -2812,7 +2812,7 @@ pub fn lock_store_stall_past_lease(_seed: u64) -> Result<()> {
         .with_write_mode("back")
         .with_env("CONSTELLATION_LOCKS", "cluster")
         .with_env("CONSTELLATION_LOCK_TTL_MS", &LOCK_TTL_MS.to_string())
-        .with_env("CONSTELLATION_LEASE_TTL_MS", "12000")
+        .with_env("REPLICIX_LEASE_TTL_MS", "12000")
         .with_env(
             "CONSTELLATION_FAULT_STORE_STALL_FILE",
             &file.display().to_string(),

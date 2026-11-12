@@ -150,7 +150,7 @@ const P2P_OFF: &str = "runs clients with CONSTELLATION_P2P=off";
 const PLACEMENT: &str =
     "pins the lease or a delegation with CONSTELLATION_LEASE_PLACEMENT / CONSTELLATION_DELEGATION_PLACEMENT=off";
 const TIMERS: &str =
-    "shortens lease and sync timers (CONSTELLATION_LEASE_TTL_MS, _SYNC_INTERVAL_MS) to fail over in scenario time";
+    "shortens lease and sync timers (REPLICIX_LEASE_TTL_MS, _SYNC_INTERVAL_MS) to fail over in scenario time";
 const ADMIN: &str = "runs the admin CLI (gc, fsck, prune, repair, retire) as a local process against the filesystem";
 const GC_KNOBS: &str = "shortens the GC horizon (CONSTELLATION_GC_HORIZON_S)";
 const COUNT: &str = "counts each client's S3 requests through a counting proxy of its own";
@@ -206,7 +206,7 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ),
     (
         "lease-handover",
-        Skip::Local(&["shortens the lease TTL (CONSTELLATION_LEASE_TTL_MS=10000) so the handover fits its bound"]),
+        Skip::Local(&["shortens the lease TTL (REPLICIX_LEASE_TTL_MS=10000) so the handover fits its bound"]),
     ),
     (
         "lease-claimant-ahead",
@@ -264,7 +264,7 @@ pub const SKIPPED: &[(&str, Skip)] = &[
         "s3-retry",
         Skip::Local(&[
             S3_FAULTS,
-            "shrinks the S3 retry budget (CONSTELLATION_S3_MAX_RETRIES, _S3_RETRY_TIMEOUT_MS)",
+            "shrinks the S3 retry budget (REPLICIX_S3_MAX_RETRIES, _S3_RETRY_TIMEOUT_MS)",
         ]),
     ),
     ("coop-fallback", Skip::Local(&[STOP, S3_FAULTS])),

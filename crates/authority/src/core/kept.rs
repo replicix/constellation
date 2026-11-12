@@ -40,7 +40,7 @@ use crate::event::{PeerMsg, SealRefusal};
 use crate::ids::{Epoch, NodeId, Now, OpId, TimerId};
 use crate::replica::Replica;
 use constellation_meta::{BackupRole, BackupTx};
-use constellation_store_s3::Lease;
+use replicix_objcas::Lease;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One source's answer about one stream epoch, batch by batch.

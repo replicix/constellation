@@ -1530,7 +1530,8 @@ fn a_rebuild_takes_back_the_stream_index_of_a_delegate_row_it_drops() {
 
 /// A one-chunk manifest of `len` bytes whose chunk hashes `tag`.
 fn one_chunk_manifest(tag: &[u8], len: u64) -> Vec<u8> {
-    use constellation_fs_core::{ChunkHash, Manifest};
+    use constellation_fs_core::Manifest;
+    use replicix_chunkfmt::ChunkHash;
     let chunks = [(0u64, ChunkHash::of(tag))].into_iter().collect();
     Manifest::from_sparse_chunks(1 << 20, len, chunks, 8, ChunkHash::of)
         .0

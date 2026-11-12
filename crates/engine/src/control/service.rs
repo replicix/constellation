@@ -833,8 +833,7 @@ impl EngineControl {
                         .map(|r| r.enrolled_ms)
                         .min()
                         .map(|oldest| {
-                            (constellation_store_s3::lease::now_unix_ms() - oldest).max(0) as u64
-                                / 1000
+                            (replicix_objcas::lease::now_unix_ms() - oldest).max(0) as u64 / 1000
                         })
                         .unwrap_or(0),
                     handoffs_sent: self
@@ -1850,7 +1849,7 @@ impl EngineControl {
         tokio::task::block_in_place(|| {
             self.rt.block_on(async {
                 let caps = store.probe_conditional_writes().await?;
-                let report = constellation_store_s3::probe_cas_semantics(store.inner()).await?;
+                let report = replicix_objcas::probe_cas_semantics(store.inner()).await?;
                 Ok::<_, constellation_store_s3::StoreError>((caps, report))
             })
         })

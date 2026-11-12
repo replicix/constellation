@@ -7,7 +7,7 @@
 //! `f` write-eligible nodes missing, and a missing node may still reach
 //! S3. A *promise* is a node's persisted word that it is in no open epoch
 //! and joins none for a while (a duration on its own wait clock), made for
-//! one lease [`RenewalKey`](constellation_store_s3::RenewalKey); an S3
+//! one lease [`RenewalKey`](replicix_objcas::RenewalKey); an S3
 //! takeover of a lease someone else held proceeds only when at least `f`
 //! other roster nodes offer evidence for the key being claimed
 //! (`store_s3::heartbeat::takeover_check`). An epoch needs `N − f`
@@ -64,8 +64,8 @@ use crate::replica::Replica;
 use constellation_store_s3::heartbeat::{
     effective_slack, takeover_check, Evidence, Promise, PromiseConfig, PROMISE_TTL_LEASE_DIVISOR,
 };
-use constellation_store_s3::RenewalKey;
-use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
+use replicix_objcas::RenewalKey;
+use replicix_objcas::{AckPolicy, Lease, LeaseTag};
 use std::collections::BTreeMap;
 
 /// Whether a continuation epoch of `members` may carry `lease` (plan 30

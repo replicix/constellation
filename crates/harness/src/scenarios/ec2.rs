@@ -41,8 +41,8 @@ fn node(
         .with_own_node_key()
         // The product's S3 retry budget (10 retries within 30 s),
         // not the harness's short one (the EC2 nodes ran with 180 s).
-        .without_env("CONSTELLATION_S3_MAX_RETRIES")
-        .without_env("CONSTELLATION_S3_RETRY_TIMEOUT_MS"))
+        .without_env("REPLICIX_S3_MAX_RETRIES")
+        .without_env("REPLICIX_S3_RETRY_TIMEOUT_MS"))
 }
 
 /// Run `f` on a thread; `Some(result, elapsed)` if it finished within
@@ -891,7 +891,7 @@ pub fn inbox_withdraw_hole(_seed: u64) -> Result<()> {
     for name in ["a", "b", "c"] {
         let c = Client::new(root.path(), name, &env.direct_endpoint, &backend)?
             .with_own_node_key()
-            .with_env("CONSTELLATION_LEASE_TTL_MS", &TTL_MS.to_string())
+            .with_env("REPLICIX_LEASE_TTL_MS", &TTL_MS.to_string())
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
             // Nothing but the inbox moves `b`'s writes: no delegation of
             // its directory, no escalation to the lease, and no backup

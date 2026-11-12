@@ -931,7 +931,7 @@ pub enum Payload {
     },
 }
 
-/// A lease's renewal key on the wire (`constellation_store_s3::RenewalKey`):
+/// A lease's renewal key on the wire (`replicix_objcas::RenewalKey`):
 /// what a taker asks a promise for, and what the promise names.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseKeyWire {

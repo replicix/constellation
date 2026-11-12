@@ -87,16 +87,16 @@
 
 use super::{read_record, secrets_of, status, ControllerService, X_CREATED, X_PV};
 use crate::control_client::{ControlClient, Engines, Handle, PoolRef};
-use crate::credentials::Secrets;
-use crate::params::{ClassParams, Layout};
-use crate::proto::csi::v1::volume_content_source::Type as SourceType;
-use crate::proto::csi::v1::*;
-use crate::volume_id::{validate_snapshot_name, SnapshotId, VolumeId, VOLUMES_DIR};
 use constellation_control::proto::types::{
     CloneParams, MkdirParams, SizeState, SnapshotCreateParams, SnapshotDeleteParams,
     SnapshotHoldParams, SnapshotListParams, SnapshotStatus, XattrOp, XattrParams,
 };
 use constellation_control::proto::ErrorKind;
+use replicix_csi_common::credentials::Secrets;
+use replicix_csi_common::params::{ClassParams, Layout};
+use replicix_csi_common::proto::csi::v1::volume_content_source::Type as SourceType;
+use replicix_csi_common::proto::csi::v1::*;
+use replicix_csi_common::volume_id::{validate_snapshot_name, SnapshotId, VolumeId, VOLUMES_DIR};
 use std::sync::Arc;
 use tonic::Status;
 
