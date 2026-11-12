@@ -4848,6 +4848,13 @@ fn count_unsettled(
     bad
 }
 
+/// The simulated time (ms) this thread's last [`run_seed`] ran for, a
+/// failed run's included: a bound on how soon a failure surfaced that the
+/// machine's load cannot move.
+pub fn last_run_sim_ms() -> u64 {
+    LAST_RUN_SIM_MS.with(|m| m.get())
+}
+
 /// Run one seed. `Err` carries the failure and the replay command.
 pub fn run_seed(seed: u64, mut cfg: SimConfig) -> Result<Report, String> {
     constellation_store_s3::adapters::install();
@@ -4939,10 +4946,16 @@ pub fn run_seed(seed: u64, mut cfg: SimConfig) -> Result<Report, String> {
         .build()
         .expect("runtime");
     let result = rt.block_on(async {
-        tokio::select! {
+        let result = tokio::select! {
             r = run_inner(seed, cfg) => r,
             msg = panic_watch() => Err(format!("a task panicked: {msg}")),
-        }
+        };
+        // The simulated time the run took, success or failure.
+        let took = SIM_START
+            .with(|t| t.get())
+            .map_or(0, |t| t.elapsed().as_millis() as u64);
+        LAST_RUN_SIM_MS.with(|m| m.set(took));
+        result
     });
     result.map_err(|e| {
         format!(
@@ -7556,6 +7569,9 @@ fn home_dir(dirs: &[String], node: NodeId, client: u64) -> String {
 }
 
 thread_local! {
+    /// How many simulated milliseconds this thread's last `run_seed` took,
+    /// whichever way it ended ([`last_run_sim_ms`]).
+    static LAST_RUN_SIM_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// This thread's run start, for [`SimTime`].
     static SIM_START: std::cell::Cell<Option<tokio::time::Instant>> =
         const { std::cell::Cell::new(None) };

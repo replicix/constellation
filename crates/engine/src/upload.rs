@@ -86,6 +86,12 @@ pub struct UploadHold {
     deferred: std::sync::atomic::AtomicU64,
     /// Times the hold was put on.
     engaged: std::sync::atomic::AtomicU64,
+    /// A test's per-engine pause of the sync rounds (the in-process form of
+    /// `CONSTELLATION_FAULT_HOLD_SYNC_FILE`, which is process-wide): while
+    /// set, every round ends at its upload step, shipping nothing.
+    rounds_paused: std::sync::atomic::AtomicBool,
+    /// Rounds that ended at the pause.
+    rounds_skipped: std::sync::atomic::AtomicU64,
 }
 
 impl UploadHold {
@@ -98,6 +104,33 @@ impl UploadHold {
 
     pub fn is_held(&self) -> bool {
         self.held.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Pause (or resume) this engine's sync rounds; see `rounds_paused`.
+    #[cfg(test)]
+    pub fn pause_rounds(&self, paused: bool) {
+        self.rounds_paused
+            .store(paused, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a round that reaches its upload step ends there. Counts the
+    /// round when it does.
+    pub fn round_skipped_by_pause(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let paused = self.rounds_paused.load(SeqCst);
+        if paused {
+            self.rounds_skipped.fetch_add(1, SeqCst);
+        }
+        paused
+    }
+
+    /// Rounds that ended at the pause so far. A round runs only once the
+    /// one before it has ended, so one counted after the pause went up
+    /// means no earlier round is still in flight.
+    #[cfg(test)]
+    pub fn rounds_skipped(&self) -> u64 {
+        self.rounds_skipped
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// `(deferrals, times engaged)`.

@@ -1424,16 +1424,32 @@ fn a_panicking_node_fails_the_seed_promptly() {
         panic_after_events: Some(40),
         ..SimConfig::default()
     };
-    let started = std::time::Instant::now();
-    let err = run_seed(7, cfg).expect_err("the injected panic must fail the seed");
+    let err = run_seed(7, cfg.clone()).expect_err("the injected panic must fail the seed");
     assert!(
         err.contains("a task panicked") && err.contains("injected panic after 40 events"),
         "unexpected failure: {err}"
     );
+    // "Promptly" in simulated time, which the machine's load cannot move:
+    // the failure surfaces before the same seed, unpanicked, would have
+    // reached its end (a run left waiting for the dead node's quiescence
+    // never does).
+    let surfaced = sim::run::last_run_sim_ms();
+    let clean = run_seed(
+        7,
+        SimConfig {
+            panic_after_events: None,
+            ..cfg
+        },
+    )
+    .unwrap_or_else(|e| panic!("the seed without the panic: {e}"));
+    eprintln!(
+        "the panic surfaced at {surfaced} ms of {} ms simulated",
+        clean.sim_ms
+    );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(20),
-        "the panic took {:?} to surface",
-        started.elapsed()
+        surfaced < clean.sim_ms,
+        "the panic took {surfaced} ms of simulated time to surface; the whole clean run is {} ms",
+        clean.sim_ms
     );
 }
 
