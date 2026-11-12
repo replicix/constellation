@@ -8169,6 +8169,7 @@ fn sweep_config() {
                         let diverged = st(|s| s.kept_diverged);
                         let tail_done = st(|s| s.tail_done_skipped);
                         if decided > 0
+                            || st(|s| s.drop_apply_leftovers) > 0
                             || retired > 0
                             || fenced > 0
                             || diverged > 0
@@ -8178,11 +8179,13 @@ fn sweep_config() {
                                 "SWEEP-DROP-DECISIONS {label} seed {seed}: decided {decided} \
                                  applied {} fenced_at_lease_loss {} drop_decided_unapplied {} \
                                  tail_retired {retired} tail_drop_fenced {fenced} follow_ups {} \
-                                 kept_diverged {diverged} tail_done {tail_done}",
+                                 kept_diverged {diverged} tail_done {tail_done} \
+                                 drop_apply_leftovers {}",
                                 st(|s| s.drops_applied),
                                 st(|s| s.drops_unapplied),
                                 decided.saturating_sub(done),
                                 st(|s| s.drop_follow_ups),
+                                st(|s| s.drop_apply_leftovers),
                             );
                         }
                     }

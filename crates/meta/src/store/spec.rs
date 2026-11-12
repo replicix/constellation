@@ -4315,6 +4315,37 @@ pub(crate) fn mark_await_retry_tx(
     Ok(Some(row.rid))
 }
 
+/// ADR-59 part B (D2): the queued replay at `key` is a rolled-back
+/// transaction a `DropHeld` retired, redone by its rid. A re-shipped tail row's
+/// op is `Records` led by its `TailOf`; replayed as it is, the redo would
+/// journal the identity the record retired (the ship plan holds such a
+/// transaction, and a retired copy is a hole wherever it is served). The redo
+/// is a fresh execution: it goes without the `TailOf`.
+pub(crate) fn strip_retired_tail_of_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    key: u64,
+) -> Result<(), MetaError> {
+    let Some(v) = tx.get(&meta.pending_replay, seq_key(key))? else {
+        return Ok(());
+    };
+    let mut row: QueuedReplay = crate::record::from_bytes_exact(&v)?;
+    let MutateOp::Records { records } = &mut row.op else {
+        return Ok(());
+    };
+    if !matches!(records.first(), Some(LogRecord::TailOf { .. })) {
+        return Ok(());
+    }
+    records.remove(0);
+    tx.insert(
+        &meta.pending_replay,
+        seq_key(key),
+        postcard::to_allocvec(&row)?,
+    );
+    counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_GEN, 1)?;
+    Ok(())
+}
+
 /// Replace the queued replay at `key` with `op`, already refused for
 /// `refusal`: the drain then materializes `op`'s conflict copy instead of
 /// replaying it (`cli::recovery`). Used by `repair drop-held`, whose
