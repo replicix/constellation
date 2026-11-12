@@ -10976,6 +10976,24 @@ fn regression_a_deposed_roots_append_does_not_reship_a_landed_rid_seed_2560() {
     });
 }
 
+/// I1, `long-delegated-late-answers` seed 3159 (no knob): node 3 took the
+/// lease over (epoch 3, no backup, a peer told) and drained its own inbox
+/// batch inside the takeover gate, refusing its create of `d2/f3` `EEXIST`
+/// (journal seq 14). The gate opened, a sealed delegation's drain ran
+/// `answer_awaiting_log`, and the op was answered from the refusal its
+/// journal alone held, as the log's (`Archive`), 24 ms before the ship. A
+/// root row of a node's own unshipped journal is not the log's, gate or no
+/// gate (`log_carries_outcome`).
+#[test]
+fn regression_an_open_root_answers_no_inbox_op_from_its_unshipped_journal_seed_3159() {
+    run_seed(3159, long_delegated_late_answers_config()).unwrap_or_else(|e| {
+        panic!(
+            "long-delegated-late-answers seed 3159: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=long-delegated-late-answers"
+        )
+    });
+}
+
 /// The same class in `strict-isolated-reader-long` (30 s read delegations,
 /// the reader isolated for 40 s): 12 of 2 000 seeds from 300000 failed
 /// close-to-open before `ReadDelegations::reset_for_restart`, each with the
