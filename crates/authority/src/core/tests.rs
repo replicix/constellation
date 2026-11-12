@@ -66765,7 +66765,13 @@ mod kept_fetch {
     /// The claimant's log carries a `DropHeld` that retired the first of
     /// `rows(3)`'s transactions (its journal row 7 shipped ahead).
     fn claimant_with_a_retired_first_row() -> (Harness, Vec<Action>, Vec<BackupTx>) {
-        let (h, out) = start(3, &fenced(), &[1, 2, 3], 1, false);
+        claimant_with_a_retired_first_row_of(&[1, 2, 3])
+    }
+
+    fn claimant_with_a_retired_first_row_of(
+        roster: &[NodeId],
+    ) -> (Harness, Vec<Action>, Vec<BackupTx>) {
+        let (h, out) = start(3, &fenced(), roster, 1, false);
         let txs = rows(3);
         h.meta
             .apply_segment_rows(
@@ -66804,6 +66810,66 @@ mod kept_fetch {
         let written = finish(&mut h, out, &fenced());
         assert!(written.is_some(), "the claim is made");
         assert_eq!(h.core.stats.kept_past_gap, 0);
+        let mut got = reshipped(&h);
+        got.sort();
+        assert_eq!(got, vec![(1, txs[1].first), (1, txs[2].first)], "once each");
+    }
+
+    /// B2 (D2), 1818's shape as first written: no source serves the retired
+    /// transaction at all, only the rows above it. On this tree a source that
+    /// has the rows above a retired one also has the retired one's span (a
+    /// journal, a member copy or a backup serves a hole there), so this shape
+    /// is not produced; the merge cannot tell the retired span's extent from
+    /// the copies it holds and reads the first row above as past a gap. Pins
+    /// what the tree does with it: the rows are not carried
+    /// (`kept_past_gap`; the debug build's assertion stops there).
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "a kept copy lies past a gap")
+    )]
+    fn a_row_above_a_retired_one_that_no_source_serves_is_past_a_gap() {
+        let (mut h, out, txs) = claimant_with_a_retired_first_row();
+        let a = asks(&out);
+        let _ = win(&mut h, out, &fenced());
+        let out = answer_all(&mut h, &a, 2, 1, txs[1..].to_vec(), vec![vec![1, 2]]);
+        let written = finish(&mut h, out, &fenced());
+        // (A debug build stops at the assertion above this line: a kept copy
+        // past a gap is a bug there. A release build counts it.)
+        assert!(written.is_some(), "the claim is made without the rows");
+        assert!(h.core.stats.kept_past_gap > 0);
+        assert!(reshipped(&h).is_empty(), "nothing is carried past the gap");
+    }
+
+    /// ADR-59 part B (D2), review F1: two sources serve the same retired
+    /// span, one as the hole a member that applied the record keeps (origin
+    /// `(0, 0)`, a journal gap's), the other as the live copy it kept, which
+    /// the merge turns into a hole of its own origin. Two record-less spans
+    /// say the same thing whatever their origin: the wider is kept, and the
+    /// sources do not diverge. Fail before: the origins differed, the pair fell
+    /// to the divergence arm and the claim waited for the operator.
+    #[test]
+    fn two_record_less_spans_of_one_retired_copy_do_not_diverge_on_their_origin() {
+        let (mut h, out, txs) = claimant_with_a_retired_first_row_of(&[1, 2, 3, 4]);
+        let a = asks(&out);
+        let _ = win(&mut h, out, &fenced());
+        let hole = BackupTx {
+            records: Vec::new(),
+            origin: (0, 0),
+            ..txs[0].clone()
+        };
+        let mut live = txs[0].clone();
+        live.origin = (7, 3);
+        let mut from_2 = vec![hole];
+        from_2.extend(txs[1..].iter().cloned());
+        answer_all(&mut h, &a, 2, 1, from_2, vec![vec![1, 2, 4]]);
+        let out = answer_all(&mut h, &a, 4, 1, vec![live], vec![vec![1, 2, 4]]);
+        let landed = finish(&mut h, out, &fenced());
+        assert_eq!(
+            h.core.stats.kept_diverged, 0,
+            "the origin of a hole is no divergence"
+        );
+        assert!(landed.is_some(), "the claim is made");
         let mut got = reshipped(&h);
         got.sort();
         assert_eq!(got, vec![(1, txs[1].first), (1, txs[2].first)], "once each");

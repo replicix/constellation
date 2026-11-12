@@ -853,11 +853,9 @@ impl Core {
                             // wider one says it of more seqs. Not a divergence
                             // (a hole never covers a live row: the check
                             // below).
-                            Some(old)
-                                if old.records.is_empty()
-                                    && tx.records.is_empty()
-                                    && old.origin == tx.origin =>
-                            {
+                            // (Whatever origin each carries: a hole says only
+                            // that no row is live there.)
+                            Some(old) if old.records.is_empty() && tx.records.is_empty() => {
                                 if tx.last > old.last {
                                     all.insert(tx.first, tx);
                                 }
