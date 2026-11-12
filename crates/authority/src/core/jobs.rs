@@ -786,7 +786,7 @@ impl Core {
                 // journal row a deposition stranded after its PUT: the
                 // record is in the log, and what the ack of its row would
                 // have done is done from the record.
-                None if replica.own_drop_segment(&rows)? => Vec::new(),
+                None if replica.own_drop_segment(&rows, &seg.rows)? => Vec::new(),
                 None => anyhow::bail!(
                     "segment {seq} claims our node id {} but does not match the journal: \
                      state dir reuse or id collision",
