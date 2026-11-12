@@ -2533,7 +2533,7 @@ async fn client_thread(
             match answer {
                 // Plan 30 §M10: a frozen continuation epoch refuses writes
                 // with `EROFS` before executing them; the FUSE caller
-                // retries (here: the same rid, like an in-doubt answer).
+                // retries (here: a new call under a fresh rid, below).
                 // The engine answers the application `EROFS` and never sends
                 // that rid again (`mutate_op_rebasable`, write_gate.rs: the rid
                 // is allocated per call and changes only for a lapsed token);
@@ -2541,15 +2541,20 @@ async fn client_thread(
                 // rid. A final `EROFS` (a refusal the root journaled for good,
                 // fence C9) must not meet the same rid at a holder later.
                 Ok(ClientReply::Outcome(MutateOutcome::Errno(Code::ReadOnly))) => {
+                    // The refusal is a definite answer with no effect: the
+                    // call returns `EROFS` (`NsRet::Erofs`), and the retry is
+                    // a call of its own under the fresh rid below. Left
+                    // unreturned it would be in doubt, and a refused rid that
+                    // ran anyway at a holder later (seed 1550's class) could
+                    // linearize anywhere.
+                    if op.is_some() {
+                        history.ret(thread, rid, NsRet::Erofs);
+                    }
                     attempts += 1;
                     if attempts > MAX_RESUBMITS {
                         abandoned.lock().unwrap().insert(rid);
                         break;
                     }
-                    // (The old call stays unreturned in the history, as an
-                    // in-doubt one does: a refusal that was final was not
-                    // run, and one that was run anyway is the oracles' to
-                    // name, not this client's.)
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     let handle = cluster.get(node);
                     if !handle.alive() {
@@ -6764,24 +6769,33 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         .iter()
         .copied()
         .collect();
+    // The history's verdicts are kept and returned after the log oracles
+    // below: a run that breaks both (a refused call whose rid also ran, now
+    // that its `EROFS` return is in the history) names the log oracle the
+    // fault is written for, as it did, and every run the history alone fails
+    // still fails with its message.
+    let mut history_err: Option<String> = None;
     for (i, proj) in projections.iter().enumerate() {
-        let w = check_linearizable_witnessed_with(
+        match check_linearizable_witnessed_with(
             proj,
             &tentative,
             &dropped_rids,
             &operator_cost,
             &oracle.completed_at,
             &journal,
-        )
-        .map_err(|e| {
-            lin_context(format!(
-                "[directory {}] {e}",
-                labels.get(i).cloned().unwrap_or_default()
-            ))
-        })?;
-        witness.observed_tentative += w.observed_tentative;
-        witness.observed_dropped += w.observed_dropped;
-        witness.observers.extend(w.observers);
+        ) {
+            Ok(w) => {
+                witness.observed_tentative += w.observed_tentative;
+                witness.observed_dropped += w.observed_dropped;
+                witness.observers.extend(w.observers);
+            }
+            Err(e) => {
+                history_err.get_or_insert(lin_context(format!(
+                    "[directory {}] {e}",
+                    labels.get(i).cloned().unwrap_or_default()
+                )));
+            }
+        }
     }
     report.observed_tentative = witness.observed_tentative;
     // EC2 campaign 7, finding B-1: across directories and owners, the
@@ -6792,8 +6806,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // acknowledgements a delegation gave them before the root changed.
     // Plan 43 C2 closes that: a delegate acknowledges once its group holds
     // the row, so a root change cannot overtake an acknowledged row.)
-    super::history::check_session_order(&events, &tentative, &oracle.completed_at, &journal)
-        .map_err(lin_context)?;
+    if let Err(e) =
+        super::history::check_session_order(&events, &tentative, &oracle.completed_at, &journal)
+    {
+        history_err.get_or_insert(lin_context(e));
+    }
     let observed_by_protocol = witness.observed_tentative - witness.observed_dropped;
     if strict_durability && observed_by_protocol > 0 {
         let acks = oracles.acks.lock().unwrap();
@@ -6834,7 +6851,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let in_flight: HashSet<Rid> = tentative.union(&witness.observers).copied().collect();
     if events.len() <= STATERIGHT_EVENT_BOUND && in_flight.len() <= STATERIGHT_TENTATIVE_BOUND {
         for proj in &projections {
-            check_linearizable(proj, &in_flight).map_err(lin_context)?;
+            if let Err(e) = check_linearizable(proj, &in_flight) {
+                history_err.get_or_insert(lin_context(e));
+            }
         }
         report.stateright_checked = true;
     }
@@ -7596,6 +7615,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 ));
             }
         }
+    }
+    if let Some(e) = history_err {
+        return Err(e);
     }
     // Plan 43 C2 (§5.3): a requester's shadow stands for a committed answer;
     // one installed for an answer its sequencer did not say is committed is
