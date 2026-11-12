@@ -79407,6 +79407,83 @@ mod root_own_sticky {
         );
     }
 
+    /// Node 2's inbox batch with `op` (rid `(2, 1, seq)`), drained by the root.
+    fn drain_inbox_of_2(h: &mut Harness, op: &MutateOp, seq: u64, settle: bool) -> Vec<Action> {
+        let mut batch = super::inbox_batch(2, 0, seq, op);
+        batch.ops[0].settle = settle;
+        let in_flight = |h: &Harness| {
+            h.core
+                .s3
+                .iter()
+                .find_map(|(op, f)| matches!(f, S3For::InboxPoll(2)).then_some(*op))
+        };
+        let poll = match in_flight(h) {
+            Some(op) => op,
+            None => {
+                h.advance(h.core.cfg.sync_interval_ms.max(1) + 1);
+                let mut out = Vec::new();
+                h.core.inbox_holder_tick(h.clk(), &h.meta, &mut out);
+                in_flight(h).expect("node 2's inbox is polled")
+            }
+        };
+        h.step(Event::S3 {
+            op: poll,
+            result: S3Result::InboxRun(Ok(vec![batch])),
+        })
+    }
+
+    /// Fence C9.2 at the root's drain (Q4, M harness partition phase): an inbox
+    /// op into the root's own sticky subtree is refused `EROFS` in the stream,
+    /// a row of it, and its position acknowledged, as a far holder refuses
+    /// one; a settle of a rid with no outcome is refused as a settle is. The
+    /// drain does not halt on it. Fails on the parent: the batch halted at
+    /// every poll and the requester's op ran out its deadline.
+    #[test]
+    fn the_roots_drain_refuses_an_inbox_op_under_its_own_stream_in_the_stream() {
+        for settle in [false, true] {
+            let (mut h, dirs) = root_with_peer(Some(500));
+            root_dominates(&mut h, dirs[0]);
+            let d = own_grant_of(&h, dirs[0]).expect("granted");
+            archive_and_step(&mut h);
+            // Node 2 has no P2P path to the root: its ops go through the inbox.
+            h.core.cfg.inbox = true;
+            h.core.note_demand(h.clk(), 2, true);
+            h.step(Event::Peers {
+                registry_complete: true,
+                links: vec![crate::event::PeerLink {
+                    node: 2,
+                    connected: false,
+                    last_seen: None,
+                    rtt_ms: None,
+                    since: None,
+                }],
+                lapses: 0,
+            });
+            let op = create_in(&h, dirs[0], "ie");
+            let rid = Rid {
+                node: 2,
+                incarnation: 1,
+                seq: 1,
+            };
+            let out = drain_inbox_of_2(&mut h, &op, 1, settle);
+            assert!(
+                Replica::outcome_row(&h.meta, rid).is_some_and(|r| r.gen == d.gen),
+                "settle {settle}: the batch halted: no row of the stream for the rid: {out:?}"
+            );
+            assert_eq!(h.meta.delegate_idx(d.gen).unwrap(), 1, "settle {settle}");
+            assert!(
+                constellation_meta::MetaStore::lookup(&h.meta, dirs[0], "ie")
+                    .unwrap()
+                    .is_none(),
+                "settle {settle}: the op ran"
+            );
+            assert_eq!(
+                h.core.stats.holder_inbox_refusals_own_root,
+                u64::from(!settle)
+            );
+        }
+    }
+
     /// ADR-55 (M1): a stream op rests on the root's own rows, which a
     /// deposition rolls back while the stream's rows are kept: the op does
     /// not run until the root rows its `deps` name are in the log. Rows of
