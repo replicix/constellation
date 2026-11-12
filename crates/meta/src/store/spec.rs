@@ -6416,7 +6416,10 @@ impl Meta {
                 // the record is how it reaches this gate). One that carries
                 // a `DropHeld` the log lacks (checked above) is its
                 // deposed dropper's undecided drop: it never happened, and
-                // the identities it names are not retired.
+                // the identities it names are not retired. (The check is by
+                // class, not by owner: a node's own unshipped record read back
+                // from its own sealed tail is fenced here too, harmlessly, for
+                // its journal row stays and ships by the ordinary path.)
                 if self.row_retired_tx(&tx, ident.0, ident.1)? {
                     tracing::info!(
                         epoch = t.epoch,

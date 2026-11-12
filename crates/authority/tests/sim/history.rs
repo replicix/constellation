@@ -691,7 +691,7 @@ pub fn check_linearizable_witnessed(
 
 /// [`check_linearizable_witnessed`], with the rids of `operator_cost`: rids a
 /// drop rolled back that depend on the damaged inode's own keys
-/// (`DroppedHeld::rolled_back_on_inode`, ADR-59 part A). A refusal that saw
+/// (ADR-59 part A). A refusal that saw
 /// the effect of one of them, acknowledged or not, saw what the operator's
 /// drop took away (the documented cost of a lost chunk that part A does not
 /// avoid), not what the protocol rolled back: it counts as
