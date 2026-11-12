@@ -4743,14 +4743,23 @@ is the consequence of that record being in the log.**
   rolled_back: [((epoch, jseq), rid)] }` (it replaces `RolledBack`) is an
   archive-class record with no keys: it ships in the next segment ahead of
   everything the seed holds, and its transaction changes no other state.
+  **A named row is held until the apply.** Every row the record names is a
+  held, unshipped row at the decision, and stays held in the dropper's journal
+  until the apply strands it: the ship plan holds (never skips, which would
+  break the order of the rows behind it) a transaction the pending plan names or
+  whose identity the log retired, whatever else would release it, and the apply
+  strands by journal row anything of the record it still finds.
 - **D2, retired idents never land.** A replica that applies it from the log
   (or ships it) records the identities as retired, holes its member and backup
   copies and strands what it was streamed of them. The takeover's re-ship gate
   skips a retired identity (`tail_retired`) and a `DropHeld` the log lacks
   (`tail_drop_fenced`: its dropper lost the lease before deciding, the drop
-  never happened); any outcome of a rid, a refusal included, is done. The
-  kept merge drops a retired copy before comparing its sources and does not
-  read the rows above one as past a gap.
+  never happened); any outcome of a rid, a refusal included, is done.
+  **A retired copy is a hole wherever it is served**: the kept merge pushes a
+  retired copy among the copies as the record-less span it covers (a member
+  that applied the record serves it so), so its sources do not disagree about
+  it and the rows above it are not past a gap; the backup tail keeps one hole
+  per span, never shrinking a wider one a resend repeats.
 - **D3, an answer is what the store says at its release.** A parked answer
   (`Reply`, `Finish`) is released from the rid's outcome read at that
   moment: `Executed` as it was parked releases as is, `Refused` releases the
@@ -4758,12 +4767,16 @@ is the consequence of that record being in the log.**
 - **D4, local state follows the log.** The dropper strands the seed, redoes
   the rest, refuses the queued seeds and removes the pending rows only when
   it applies its own record from the log (the archive covers it). A dropper
-  deposed before that has a journal that differs from the members' copies by
-  the unshipped record alone.
+  deposed before the record left has a journal that differs from the members'
+  copies by the unshipped record alone, and its drop is cancelled; one deposed
+  with the record's segment out keeps the drop and, if the segment lands,
+  applies it from the log like every replica, journaling no refusal.
 
 A drop that is decided in the log whose dropper dies before applying it is
 accepted (the maintainer, 2026-11-12): no successor completes it. Counted
-(`drop_decided_unapplied`) and documented in the Consequences. A redone row
+(`drop_decided_unapplied`, derived from the log: the rids its `DropHeld` records
+name that it ends with neither a `Refused` nor a `Completed` of) and documented
+in the Consequences. A redone row
 that does not apply as it ran at the apply (expected never) is rolled back by
 a follow-up `DropHeld` (`drop_follow_ups`). The dropper's lease margin, the
 `kept_diverged` special case and the escalation loop of the first

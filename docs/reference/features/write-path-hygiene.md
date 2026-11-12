@@ -217,32 +217,53 @@ apply it (strand the seed, redo the rest, refuse the queued seeds, write the
 `Refused` rows, remove the pending rows), and the command prints the final
 account. The wait is one archive round trip. Every replica applies the record
 from the log: it records the named identities as retired (the takeover's
-re-ship and the kept-tail merge skip a retired transaction, so a late copy a
-member served can never land behind its own refusal), a member's copy and a
+re-ship skips a retired transaction and the kept-tail merge serves a retired
+copy as a hole, so a late copy a member served can never land behind its own
+refusal), a member's copy and a
 backup's tail transaction of one become empty transactions of the same span,
 and what a member was streamed of one as committed is rolled back without a
 replay (this node's queue owns the replay or the refusal). A parked answer
 of a request id the drop refused is settled with the refusal, and any parked
 answer is what the store says when it is released, never a snapshot.
 
-**A dropper without the lease decides nothing.** The command on a node that is
-not the sequencer in force is refused before anything changes ("run it on the
-holder"): its held rows are what a deposition strands anyway, and the
-successor re-ships their copies. A node deposed (or dead)
-before the record shipped leaves a sealed tail that differs from the members'
-copies by that record alone: the successor's takeover skips it (`tail_drop_fenced`,
+**A dropper without the lease decides nothing, and follows the log for a record
+that was put.** The command on a node that is not the sequencer in force is
+refused before anything changes ("run it on the holder"): its held rows are
+what a deposition strands anyway, and the successor re-ships their copies.
+From the decision until the apply the rows the record names stay held in the
+dropper's journal (the ship plan holds a transaction the record names, or
+whose identity the log retired, whatever else would release it), and the apply
+strands anything of them it still finds. A node deposed (or dead) *before the
+record left* leaves a sealed tail that differs from the members' copies by
+that record alone: the successor's takeover skips it (`tail_drop_fenced`,
 warned) and re-ships the rows it named as the acknowledged rows they are; the
-command answers that the lease was lost and nothing was dropped. "In the log"
-means "shipped by this node": the plan records it when the record's row is
-acknowledged, so a restarted dropper applies a record that shipped at startup
-and cancels one that did not once the log has closed its tenure. A node that
-dies after the record shipped but before it applied the drop (the one
-residual) leaves the seed's rows retired (nothing lands) and no conflict copy
-and no `Refused` row for them: the lost write's surviving bytes are not
-preserved as an artifact, and a requester's retry by request id executes
-afresh from the requester's own bytes. It is counted
-(`drop_decided_unapplied` in the simulation, `tail_retired` at the successor's
-gate) and accepted as the operator's cost of a holder death inside a drop.
+command answers that the lease was lost and nothing was dropped. That is said
+only of a record that never shipped. A node deposed with the record's segment
+*out* keeps the parked drop: if the PUT lands, the log carries the decision and
+the deposed node applies it from the log like every replica (it holes its own
+copies of the retired rows, reports the acknowledged loss from the plan, and
+journals no `Refused` row, which could not ship: the successor's gate answers
+the rids from the record; the command answers `pending: none` with that note,
+and the node counts `drops_applied_deposed`); if the PUT never lands, the log
+moves past the tenure without the record and the drop is cancelled then. A
+deposition may have stranded the record's journal row by the time the node
+meets its own segment in the log: the reader recognises a segment of its own
+that carries a single `DropHeld` and no journal row, and does what the
+shipper's acknowledgement would have done. "In the log" means "shipped by this
+node": the plan records it when the record's row is acknowledged, so a
+restarted dropper applies a record that shipped at startup and cancels one
+that did not once the log has closed its tenure. A node that dies after the
+record shipped but before it applied the drop (the one residual) leaves the
+seed's rows retired (nothing lands) and no conflict copy and no `Refused` row
+for them: the lost write's surviving bytes are not preserved as an artifact,
+and a requester's retry by request id executes afresh from the requester's own
+bytes. It is counted and accepted as the operator's cost of a holder death
+inside a drop: `drop_decided_unapplied`, per run, is the number of request ids
+the log's `DropHeld` records name that the log ends with neither a `Refused`
+nor a `Completed` of (derived from the log, printed with the ids; never from a
+node's report, which a dropper that stays dead never gives), and the
+simulation's oracles accept a rollback of an acknowledged request id only if a
+`DropHeld` of the log names it.
 
 **Acknowledged operations the drop cannot avoid undoing.** A seed's own
 acknowledged write, and an acknowledged operation that needs the lost
