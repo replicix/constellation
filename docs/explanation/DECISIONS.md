@@ -4726,7 +4726,11 @@ answers) and list what it does undo. A first implementation did not converge in
 the simulation: a redone row outlives its `RolledBack` in the members' copies
 and in a deposed dropper's sealed tail, a parked answer of a refused rid is
 released as `Ok`, the reship gate resurrects a refused rid, and a kept in-doubt
-inode keeps an allocation its requester then reuses. Those are one class (what
+inode keeps an allocation its requester then reuses, and a rid a second drop
+rolls back again replays behind the rids the first drop queued, out of the order
+their clients were told (drop-held-chain-backed seed 1848: an acknowledged
+rename replayed after a later acknowledged create of the name it moves). Those
+are one class (what
 a partial rollback leaves behind on other nodes and in parked state) and get
 one design: where the `RolledBack` is placed and how it reaches every member,
 the reship gate's outcome test, the parked reply of a refused rid, the
