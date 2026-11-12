@@ -1629,6 +1629,10 @@ pub(crate) fn member_rules_tx(
     let floor_here = no_tail_floor(f.records);
     for e in epochs_in(&*tx, meta)? {
         let mut left = 0usize;
+        // Holes no row with records stays above, and the highest row with
+        // records that stays (see the hole rule below).
+        let mut retire_holes: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut live_above: Option<u64> = None;
         for row in rows_in(&*tx, meta, e)? {
             let (first, last) = (row.tx.first, row.tx.last);
             let key = tail_key(member_epoch(e), first);
@@ -1672,12 +1676,17 @@ pub(crate) fn member_rules_tx(
             // A hole (rows the holder shipped ahead of a held one, streamed
             // as a record-less span so the backup's hold reaches the tip)
             // carries nothing a claim could carry, so nothing retires it on
-            // carry: once a claim follows its epoch, it goes (flex-backup
-            // +durability seeds 51, 187, 352, 447, 1566 and 1818).
-            if row.tx.records.is_empty() && follows.contains(&e) {
-                tx.remove(&meta.backup_tail, key);
-                meta.release_row_tx(tx, member_epoch(e), first);
-                out.dropped += 1;
+            // carry: it goes once no row with records stays above it
+            // (flex-backup+durability seeds 51, 187, 352, 447, 1566 and
+            // 1818: it stayed for good). Below such a row it stays: that
+            // row's next claim (this node's own, after the epoch moved on
+            // and across a restart) merges the copy, and the hole is what
+            // covers the seqs below it that the log carried or a rollback
+            // took. Without it the merge asks the log view, which forgets a
+            // closed epoch's rows shipped ahead, finds a gap and leaves the
+            // acknowledged row out (metered-shared+links seed 1781).
+            if row.tx.records.is_empty() {
+                retire_holes.push((key, first));
                 continue;
             }
             if through_of.get(&ident.0).is_some_and(|th| ident.1 > *th) {
@@ -1709,7 +1718,19 @@ pub(crate) fn member_rules_tx(
                 out.dropped += 1;
                 continue;
             }
+            if !row.tx.records.is_empty() {
+                live_above = live_above.max(Some(first));
+            }
             left += 1;
+        }
+        for (key, first) in retire_holes {
+            if live_above.is_some_and(|live| live > first) {
+                left += 1;
+                continue;
+            }
+            tx.remove(&meta.backup_tail, key);
+            meta.release_row_tx(tx, member_epoch(e), first);
+            out.dropped += 1;
         }
         if left == 0 {
             tx.remove(&meta.local, member_info_key(e).into_bytes());
