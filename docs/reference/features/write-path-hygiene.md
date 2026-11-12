@@ -225,7 +225,10 @@ replay (this node's queue owns the replay or the refusal). A parked answer
 of a request id the drop refused is settled with the refusal, and any parked
 answer is what the store says when it is released, never a snapshot.
 
-**A dropper without the lease decides nothing.** A node deposed (or dead)
+**A dropper without the lease decides nothing.** The command on a node that is
+not the sequencer in force is refused before anything changes ("run it on the
+holder"): its held rows are what a deposition strands anyway, and the
+successor re-ships their copies. A node deposed (or dead)
 before the record shipped leaves a sealed tail that differs from the members'
 copies by that record alone: the successor's takeover skips it (`tail_drop_fenced`,
 warned) and re-ships the rows it named as the acknowledged rows they are; the

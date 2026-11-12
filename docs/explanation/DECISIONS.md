@@ -4723,9 +4723,8 @@ a directory held every later one in it, and the drop rolled all of them back.
   only merges the directory is no longer reached by it. Of what depends on
   the seeds by key, part B rolls back only what needs the lost content and
   redoes the rest in place (a rename, chmod or unlink of the damaged file, a
-  create of a name it vacated). `DroppedHeld::non_sequencer` says the dropper
-  was not the sequencer in force (a deposition's strand, which rolls back
-  every dependent).
+  create of a name it vacated). A node that is not the sequencer in force
+  decides nothing: the command is refused (part B, D1).
 
 **Part B: a drop's partial rollback is a decision the log makes.** A first
 implementation of the redo (the drop undoes only what needs the lost content
@@ -4788,8 +4787,7 @@ it observed because the session-order check keeps a client's program order
 across it (`flex+links` seeds 191 and 335 need a create invoked after a no-op
 rename returned to stay behind it), not because anything depends on its state;
 it is no counter-example to the matrix. A drop's acknowledged rolled-back op is
-excused by the sim only if the drop attributed it to the damaged inode or, for a
-dropper that was not the sequencer in force, if its effect survives in the log.
+excused by the sim only if the drop attributed it to the damaged inode.
 `Meta::set_parent_taint_conservative` (the sim's `+parent-taint-conservative`)
 restores the previous classification and drop; the five seeds above must fail
 with it and pass without. Kept rows (ADR-51): rows now ship ahead of an

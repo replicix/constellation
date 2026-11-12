@@ -8182,13 +8182,12 @@ fn sweep_config() {
                         let c = &report.drop_counts;
                         eprintln!(
                             "SWEEP-DROPS {label} seed {seed}: drops {} requeued {} redone {} \
-                             acked_lost {} follow_ups {} non_sequencer {} rolled_back {:?}",
+                             acked_lost {} follow_ups {} rolled_back {:?}",
                             c.drops,
                             c.requeued,
                             c.redone,
                             c.acked_lost,
                             c.follow_ups,
-                            c.non_sequencer,
                             report.drop_rolled_back
                         );
                     }

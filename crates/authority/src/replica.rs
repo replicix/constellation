@@ -266,7 +266,7 @@ pub trait Replica {
         unanswered: &dyn Fn(Rid) -> bool,
         live_ops: &dyn Fn(&replicix_chunkfmt::ChunkHash) -> Vec<Rid>,
         sessions: &constellation_meta::LiveSessions,
-        exclude_rolled_back: bool,
+        sequencer: bool,
     ) -> Result<constellation_meta::DroppedHeld, MetaError>;
     /// ADR-59 part B (D4): the effect of the drop `drop_held` decided for
     /// `ino`, run when the log carries its record.
@@ -1229,17 +1229,10 @@ impl Replica for Meta {
         unanswered: &dyn Fn(Rid) -> bool,
         live_ops: &dyn Fn(&replicix_chunkfmt::ChunkHash) -> Vec<Rid>,
         sessions: &constellation_meta::LiveSessions,
-        exclude_rolled_back: bool,
+        sequencer: bool,
     ) -> Result<constellation_meta::DroppedHeld, MetaError> {
         Meta::drop_held_knowing(
-            self,
-            ino,
-            now_unix,
-            remote,
-            unanswered,
-            live_ops,
-            sessions,
-            exclude_rolled_back,
+            self, ino, now_unix, remote, unanswered, live_ops, sessions, sequencer,
         )
     }
 
