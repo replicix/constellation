@@ -1561,7 +1561,8 @@ impl Meta {
                 };
                 let head_epoch =
                     super::local::get_journal_tx_head(&r, self, *first)?.map(|h| h.epoch);
-                if let Some((e, j)) = rolled_back_ident(head_epoch, *first, std::slice::from_ref(rec))
+                if let Some((e, j)) =
+                    rolled_back_ident(head_epoch, *first, std::slice::from_ref(rec))
                 {
                     debug_assert!(
                         !self.row_retired(e, j),
@@ -1778,7 +1779,20 @@ impl Meta {
             redone_rids: walked.redone.iter().filter_map(|(_, rid)| *rid).collect(),
             follow_ups: 0,
             shipped: false,
+            acked_lost: Vec::new(),
         };
+        for (t, _, _) in &walked.seeds {
+            // The journal row's own rid and class: what the writer was told.
+            let Some(row) = super::local::get_journal_tx(&tx, self, t.first)? else {
+                continue;
+            };
+            if let Some(rid) = row.rid {
+                if !(row.class.gated() && unanswered(rid)) {
+                    plan.acked_lost
+                        .push((rid, format!("wrote chunk(s) of inode {ino} that are gone")));
+                }
+            }
+        }
         if walked.seeds.is_empty() {
             // Nothing to carry in the log: a run after an earlier drop kept a
             // lost chunk's rows because an op or a write session still named
@@ -2114,6 +2128,19 @@ impl Meta {
             rolled_back.push(queued.rid);
             queued_dropped += 1;
         }
+        // A seed gone from the journal by now (a dropper restarted after its
+        // record shipped, the successor's re-ship or a deposition took it)
+        // is still lost to its writer: the decision's list stands.
+        if walked.seeds.len() < plan.seeds.len() {
+            for (rid, why) in &plan.acked_lost {
+                if !acked_lost.iter().any(|(r, _)| r == rid) {
+                    acked_lost.push((*rid, why.clone()));
+                }
+                if !rolled_back.contains(rid) {
+                    rolled_back.push(*rid);
+                }
+            }
+        }
         // Fix "capture under an epoch hold": the dropped ops' outcome, in
         // the log. The `DropHeld` record is in the log already (this apply
         // runs when it is); its `Refused` rows follow.
@@ -2359,6 +2386,11 @@ struct DropPlan {
     /// record was journaled above, and the park's in-memory knowledge of the
     /// shipped rows does not survive a restart.
     shipped: bool,
+    /// The seeds whose answer may have left, listed at the decision (a
+    /// parked answer cannot leave while its row is held, so the list is
+    /// exact then). The apply reports them if the seed is gone by then (a
+    /// dropper restarted after its record shipped).
+    acked_lost: Vec<(crate::rid::Rid, String)>,
 }
 
 const DROP_PLAN_PREFIX: &[u8] = b"drop_plan:";
