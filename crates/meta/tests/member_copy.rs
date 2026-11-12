@@ -431,6 +431,34 @@ fn a_held_delegate_row_is_released_when_the_log_carries_its_rid() {
     assert!(!meta.member_copy_touches(&a), "released by the rid");
 }
 
+/// ADR-57 (`locks-unlinked-delegated-dcrash-pause` seeds 651, 1439, 1687,
+/// 1897): an own gated row whose client retried by rid, so that the log
+/// carries the rid under another identity (no tail names the copy), is
+/// released when the log carries the rid, and a row stranded after the log
+/// carried it is not held at all.
+#[test]
+fn a_held_own_row_is_released_when_the_log_carries_its_rid() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    holder_create(&meta, RowCommit::ROOT_GROUP, "data", 1, 1);
+    meta.set_holder_epoch(0);
+    assert_eq!(meta.strand_below_epoch(2).unwrap().member_copied, 1);
+    let key = [ReadKey::Dentry(ROOT_INO, "data".into())];
+    assert!(meta.member_copy_touches(&key));
+    // The retry executed at the new holder: the rid is in the log, under
+    // another identity (no `TailOf`).
+    apply_rows(
+        &meta,
+        1,
+        2,
+        2,
+        &[1, 2],
+        &[create("data", ino(9), 20), completed(rid(1))],
+    );
+    assert!(meta.lookup(ROOT_INO, "data").unwrap().is_some());
+    assert!(!meta.member_copy_touches(&key), "released by the rid");
+}
+
 /// ADR-57 review SHOULD-3: a hold indexed in memory by a transaction that
 /// was dropped has no key behind it and no staged release; the thread's next
 /// flush, and a reconcile, take it out of the index.

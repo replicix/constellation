@@ -1784,7 +1784,13 @@ fn strand_local_tx(
             },
         )?;
         if let Some(keys) = hold {
-            meta.hold_row_tx(tx, super::backup::deleg_epoch(row.gen), row.idx, keys)?;
+            meta.hold_row_tx(
+                tx,
+                super::backup::deleg_epoch(row.gen),
+                row.idx,
+                keys,
+                row.rid,
+            )?;
         }
         return Ok(Stranding::DelegMember);
     }
@@ -1841,7 +1847,13 @@ fn strand_local_tx(
             },
         )?;
         if let (true, Some(keys)) = (kept, hold) {
-            meta.hold_row_tx(tx, super::member::member_epoch(row.epoch), first, keys)?;
+            meta.hold_row_tx(
+                tx,
+                super::member::member_epoch(row.epoch),
+                first,
+                keys,
+                row.rid,
+            )?;
         }
         return Ok(Stranding::Member);
     }
@@ -3186,7 +3198,7 @@ fn streamed_tip_tx(r: &impl Readable, meta: &Meta, epoch: u64) -> Result<Option<
 
 /// Whether the log carries `rid`'s outcome already: a row applied from a
 /// segment records position 0 in `completed`, a journaled one its journal seq.
-pub(crate) fn log_carries(r: &impl Readable, meta: &Meta, rid: &Rid) -> Result<bool, MetaError> {
+fn log_carries(r: &impl Readable, meta: &Meta, rid: &Rid) -> Result<bool, MetaError> {
     Ok(r.get(&meta.completed, rid.to_key())?
         .and_then(|v| {
             v.get(0..8)
@@ -5808,9 +5820,6 @@ impl Meta {
                 own: false,
             },
         )?;
-        // ADR-57: the rows of delegate generations this node held reads of
-        // whose rid this segment (or an earlier one) carries are back.
-        self.release_carried_deleg_tx(&mut tx)?;
         let from = journal_from(&tx, self)?;
         compact_tx(&mut tx, self, from)?;
         kv_set_tx(&mut tx, &self.local, KV_APPLIED_SEQ, &seq.to_string());
