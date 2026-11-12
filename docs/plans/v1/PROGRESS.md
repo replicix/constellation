@@ -5936,7 +5936,7 @@ compiled or run (the coder brief forbade it).
 
 | Item | State | Where |
 |---|---|---|
-| `cas::put_conditional`: one conditional PUT under the error-code rules — 409 retries the *same* attempt (`CONSTELLATION_CAS_BUSY_RETRIES`, default 5, 50 ms doubling to 1 s), 412 / 404-on-`If-Match` read the object back and count a byte-identical body as *our own* landed write (a 5xx `object_store` retried after it was applied, or a lost reply), anything else is the store's error. `cas::classify` separates 409 from 412 despite `object_store`'s shared variant (see decisions). `cas::create_content_addressed` for chunks/blobs/packs, where "exists" is a dedup hit but a 409 must not be | written | `crates/store-s3/src/cas.rs` (new) |
+| `cas::put_conditional`: one conditional PUT under the error-code rules — 409 retries the *same* attempt (`REPLICIX_CAS_BUSY_RETRIES`, default 5, 50 ms doubling to 1 s), 412 / 404-on-`If-Match` read the object back and count a byte-identical body as *our own* landed write (a 5xx `object_store` retried after it was applied, or a lost reply), anything else is the store's error. `cas::classify` separates 409 from 412 despite `object_store`'s shared variant (see decisions). `cas::create_content_addressed` for chunks/blobs/packs, where "exists" is a dedup hit but a 409 must not be | written | `crates/store-s3/src/cas.rs` (new) |
 | Fault-injecting `FaultyStore` (tests only): `InMemory` plus scripted 412/409/404/304/500/timeouts and "applied, then answered 412/timeout", per op kind, path pattern and call count, with errors shaped exactly like `object_store`'s S3 client's | written | `crates/store-s3/src/faulty.rs` (new) |
 | Every CAS site through the helper, with per-site tests: lease create/swap, segment create (so the M3b epoch marker), commit create, designation create/swap/release, registry claim (now carries a random `claim` nonce so a landed claim is recognizable and a node never registers twice), condemned-chunk pointer, filesystem create, snapshot create, and the content-addressed chunk/blob/pack creates | written | `crates/store-s3/src/{lease,log,commits,designation,nodes,gc,store,blobs,packs,snapshot}.rs` |
 | Re-adopting a lease the bucket says is this node's own and unreleased while the keeper does not track it (a restart, or a takeover CAS whose reply timed out though it landed) is gated like a takeover: tail to head, epoch marker, strand-and-replay (CAS mode only) | written | `crates/cli/src/lease.rs` (`LeaseKeeper::readopts`, `commit_cas`), `crates/cli/src/shipper.rs` (`acquire_lease_for`) |
@@ -5952,7 +5952,7 @@ compiled or run (the coder brief forbade it).
 | Wired into `chaos-ci` and `chaos-soak-4`: after the history passes, drain every node, mount a fresh one, require identical trees, decode every log segment and require each rid to complete once | written | `crates/harness/src/scenarios/m4.rs` (new, `after_chaos`), `crates/harness/src/scenarios.rs`, `crates/harness/Cargo.toml` (+`constellation-meta`), `crates/harness/src/client.rs` (`state_dir`, `control`) |
 | New scenarios `poison-record-isolation` and `publish-only-holder` (the counting-proxy measurement: idle and busy 3-node windows, per-node requests by area; asserts non-holders PUT no commit and read no condemned list) | written | `crates/harness/src/scenarios/m4.rs`, `crates/harness/src/scenarios.rs` |
 | Path visibility: `status.p2p.peers[].paths` (`selected`, `direct`, `relay`, `multipath`, per-path RTTs) from iroh 1.1's `Connection::paths()` on the pooled connection, non-blocking; dashboard and peers page show it; failover from direct to relay documented | written | `crates/net/src/paths.rs` (new), `crates/net/src/{endpoint,peers,lib}.rs`, `crates/cli/src/paths.rs` (new), `crates/api/src/types.rs`, `crates/api/webui/{index,peers}.html` |
-| Docs | written | `docs/reference/features/write-path-hygiene.md` (new: CAS codes, `doctor`, `status.held`, `repair drop-held`, who publishes), `docs/reference/configuration.md` (publish cadence, `CONSTELLATION_CAS_BUSY_RETRIES`), `docs/reference/features/p2p-relays.md` (paths, failover), `docs/reference/tools/chaos.md`, `docs/how-to-guides/development/TESTING.md`, `docs/reference/README.md` |
+| Docs | written | `docs/reference/features/write-path-hygiene.md` (new: CAS codes, `doctor`, `status.held`, `repair drop-held`, who publishes), `docs/reference/configuration.md` (publish cadence, `REPLICIX_CAS_BUSY_RETRIES`), `docs/reference/features/p2p-relays.md` (paths, failover), `docs/reference/tools/chaos.md`, `docs/how-to-guides/development/TESTING.md`, `docs/reference/README.md` |
 
 **Design decisions:**
 
@@ -6875,7 +6875,7 @@ transactions whole in one segment) and then releases the waiter, so a
 returned call sees its own write. Latency is therefore one PUT + the
 holder's poll interval + the ship + the requester's tail poll (D6);
 throughput is unaffected because batches pipeline. Timeout: the
-existing acquire deadline (2×TTL, `CONSTELLATION_LEASE_TTL_MS`), after
+existing acquire deadline (2×TTL, `REPLICIX_LEASE_TTL_MS`), after
 which the caller gets `EIO` and the op is *in doubt* — it may still
 execute (the batch is durable) — the same semantics a P2P timeout that
 exhausts the lease path has today. Phase 2 must clamp that deadline
@@ -7051,7 +7051,7 @@ placement keep their paths.
    refusal, and the winning manifest precedes it. That costs one extra
    inbox round trip per conflict. Acceptable, or should `Refused` carry
    an opaque payload?
-2. **Deadline vs retention.** `CONSTELLATION_LEASE_TTL_MS` is
+2. **Deadline vs retention.** `REPLICIX_LEASE_TTL_MS` is
    operator-settable; 2×TTL can exceed 900 s. Clamp the inbox wait to
    `min(2×TTL, retention/2)`, or refuse the configuration at mount?
 3. **`recent` growth** under inbox load (D9): prune on ship, or a size
@@ -24243,7 +24243,7 @@ its shard across chunk fetches the same way.
   lock, and the detached size is retired only after the commit.
 - *Bounded S3 waits.* The product's default `RetryConfig.retry_timeout`
   is now 30 s instead of object_store's 180 s
-  (`CONSTELLATION_S3_RETRY_TIMEOUT_MS` still overrides it). Every caller
+  (`REPLICIX_S3_RETRY_TIMEOUT_MS` still overrides it). Every caller
   has its own retry loop.
 
 **What still waits or fails.** With no reachable peer that can reach
@@ -24819,7 +24819,7 @@ Files (round 2):
 ### Root cause: the scenario's 5 s lease TTL against M10's usable-claim rule
 
 `epoch-member-lost` (and `continuation-epoch`, which shares
-`epoch_clients`) ran nodes with `CONSTELLATION_LEASE_TTL_MS=5000`, from
+`epoch_clients`) ran nodes with `REPLICIX_LEASE_TTL_MS=5000`, from
 before M10. Since M10, a continuation epoch carries the holder's lease
 only if the holder's claim was *usable* (more than the 1 s margin before
 expiry) when it acked (`resolve_epoch_claims`, `EpochClaimView.held`).
@@ -26344,8 +26344,8 @@ Changes:
   `last_unanswered_error`: "S3 fails now" and "S3 failed once, nothing
   asked since" are told apart without reading logs.
 - `store_s3::configure_s3_client` (in `aws_auth.rs`): the retry policy
-  (30 s budget, `CONSTELLATION_S3_MAX_RETRIES`,
-  `CONSTELLATION_S3_RETRY_TIMEOUT_MS`) and conditional PUTs moved out of
+  (30 s budget, `REPLICIX_S3_MAX_RETRIES`,
+  `REPLICIX_S3_RETRY_TIMEOUT_MS`) and conditional PUTs moved out of
   `cli/backend.rs`, so the test above builds exactly the daemons' client.
 
 ### 2. A frozen member never probed S3, so it never closed its epoch
@@ -32578,7 +32578,7 @@ harness scenarios are `32-m3c`.
 | `Scheduler` + `SchedDeps` + `SchedConfig`: a task on every daemon (`Scheduler::spawn`, next to the pruner's ticker; waits on the background gate; resigns at `stop`), ticking every `CONSTELLATION_SNAPSCHED_TICK_MS` (10 000); `CONSTELLATION_SNAPSCHED` (on; `0`/`false`/`off` = never lead), `_MAX_LAG_S` (300), `_MAX_PER_ROOT` (5000), documented where read and in `configuration.md` | DONE | `crates/engine/src/snapsched.rs`, `crates/engine/src/node.rs`, `docs/reference/configuration.md` |
 | Inert by default: a tick reads `Meta::snapshot_policy_roots()` (local) first, and with no root makes **no S3 request** — not even a lease GET; a leader whose last policy is removed releases its lease once, then is silent | DONE | `Scheduler::tick` step 1; test `with_no_policy_roots_a_tick_makes_no_request` (a request-counting store) |
 | Refusal gates, the pruner's: departed, epoch `writes_refused` (frozen, or offline with no lease), read-only member → `refused_state`; `now − last_sync_ms > MAX_LAG` → `refused_lag`. A refused tick creates nothing and does **not** renew (a leader that stays refused lets the lease lapse to a healthy node), and reports `leader = false` from then on; a later healthy tick renews the lease if nobody took it | DONE | `Scheduler::refusal` |
-| Sticky leadership: `_snapsched` `SingletonLease` (its own, not `_prune`) kept across ticks; renewed at the start of every tick **and** immediately before every batch; `Fenced` ends leadership and the tick before any batch; a non-leader's acquire that finds it held (new typed `singleton::HeldElsewhere`), or loses the create/swap race for it (`StoreError::CasConflict`), returns quietly — not an error, no `last_error`; `leader` stat. TTL = `CONSTELLATION_LEASE_TTL_MS`, at least three ticks. `Engine::drain_for_shutdown` resigns (releases) so a successor need not wait the TTL | DONE | `Scheduler::lead`, `crates/engine/src/singleton.rs` |
+| Sticky leadership: `_snapsched` `SingletonLease` (its own, not `_prune`) kept across ticks; renewed at the start of every tick **and** immediately before every batch; `Fenced` ends leadership and the tick before any batch; a non-leader's acquire that finds it held (new typed `singleton::HeldElsewhere`), or loses the create/swap race for it (`StoreError::CasConflict`), returns quietly — not an error, no `last_error`; `leader` stat. TTL = `REPLICIX_LEASE_TTL_MS`, at least three ticks. `Engine::drain_for_shutdown` resigns (releases) so a successor need not wait the TTL | DONE | `Scheduler::lead`, `crates/engine/src/singleton.rs` |
 | Due roots: parse (unparseable → `unparseable_roots`, skipped, fail closed), not `paused`, directory still there (`Meta::ancestry`; gone → skipped), under the cap (≥ `MAX_PER_ROOT` live auto rows of `policy_ino`, held included → `capped_roots` + per-root error + `last_error` naming the root ino, set by the leading tick), `retention::due` on the leader's clock. At most one snapshot per root per tick (catch-up, not backfill). Gauges `roots`/`paused_roots`/`unparseable_roots`/`capped_roots`/`orphaned_snapshots` as of the last tick | DONE | `plan_roots` |
 | Names: `retention::auto_name` (new, pure, in meta) = `auto-` + UTC basic ISO-8601 of the finest bucket's start, seconds form for `s` tiers — the same `synthetic_name` the simulator already used; `retention::current_bucket` (new) for status | DONE | `crates/meta/src/snapsched/retention.rs` (`the_auto_name_is_the_finest_bucket_in_utc`) |
 | One `SnapshotBatch` per tick for every due root: `origin = auto`, `policy_ino`, `creator` = this node, `skip_if_unchanged_since` = newest auto row's root when `skip-empty=yes`. `Created` → `created`, `last_create_unix_ms`; `Skipped` → `skipped_empty`; `AlreadyExists` → success; refused item → `create_failed` + `last_error` + the root's error; a whole-batch error → `create_failed += due roots`, nothing created, next tick retries. A bucket settled without a visible new row is remembered per root in memory (pruned to the current roots): created / already exists → for the rest of the bucket; **skipped → only while the leader's replica stays at the position read at the start of that tick** (`Meta::applied_seq`, `Meta::journal_next_seq`: two local reads), so a write later in the same bucket is asked about again and taken, while an idle root still costs the holder one check per bucket | DONE | `Scheduler::tick`, `Settled`, `replica_position` |
@@ -32922,7 +32922,7 @@ unchanged (§6 leaves `local`'s chunk wait to the maintainer).
 | `--fsync-timeout` and the kernel cap (F4) | done | `mount --fsync-timeout`, `CONSTELLATION_FSYNC_TIMEOUT` (an explicit `--fsync-timeout hard`/`off`/`0` overrides it), parsed before the fork, carried in `NodeHandoff`. `/proc/sys/fs/fuse/{default,max}_request_timeout` (Linux 6.15+) read at start; when set, every wait is capped at `t − min(t/5, 5 s)`, warned once |
 | Observability (F4) | done | warn once per inode after 10 s from the start of the call, checked while a reply is awaited too, so a slow first attempt is covered ("fsync: S3 unreachable, still trying"), info when it ends; `waiting`/`longest_wait_ms` list every wait from its start (test `a_slow_first_attempt_is_listed_while_it_runs`); the pool's threads are `fsync-wait-N`; `node.status.fsync` (`mode`, `timeout_ms`, `kernel_cap_ms`, `waiting`, `longest_wait_ms`, `max_wait_ms`, `waited`, `retries`, `timeouts`, `permanent_errors`, `interrupted`), `/metrics` `constellation_fsync_*`, event-stream gauges; schema re-blessed |
 | Docs (F4) | done | `configuration.md` (both knobs, nfs(5)-style warning), `durability-and-failover.md`, `TESTING.md`, `vendor/fuser/CONSTELLATION-PATCH.md` |
-| Harness (F5) | done | `crates/harness/src/scenarios/fsync.rs`: `fsync-hard-outage` (20 s cut under a waiting `fsync`: no `EIO`, no early return, `node.status.fsync` shows the wait, a fresh node reads the bytes), `fsync-soft-timeout` (`--fsync-timeout 2s`: `EIO` after ~2 s, data pending, uploads by itself after the heal), `fsync-interrupt` (during a cut a handled `SIGINT` leaves the `fsync` waiting; `SIGKILL` gets the process reaped within 5 s; data still uploads), `fsyncdir-barrier`. `fio-blips` unchanged; the harness's `CONSTELLATION_S3_MAX_RETRIES=2` client settings stay |
+| Harness (F5) | done | `crates/harness/src/scenarios/fsync.rs`: `fsync-hard-outage` (20 s cut under a waiting `fsync`: no `EIO`, no early return, `node.status.fsync` shows the wait, a fresh node reads the bytes), `fsync-soft-timeout` (`--fsync-timeout 2s`: `EIO` after ~2 s, data pending, uploads by itself after the heal), `fsync-interrupt` (during a cut a handled `SIGINT` leaves the `fsync` waiting; `SIGKILL` gets the process reaped within 5 s; data still uploads), `fsyncdir-barrier`. `fio-blips` unchanged; the harness's `REPLICIX_S3_MAX_RETRIES=2` client settings stay |
 
 Unchanged on purpose: background uploads (three attempts per pass, retried
 every round), `close()` and `--write-mode` (outside a scope their waits block
@@ -33760,7 +33760,7 @@ A throwaway driver outside the repo (the harness has no real-S3 backend).
 39b check = the harness phase above, two local daemons; `fio-blips`-style =
 the harness's fio verify (16M × 2, `--end_fsync=1`) looped 8× on one mount
 whose S3 path runs through a local CONNECT proxy (`AWS_PROXY_URL`) cut for
-800 ms every ~4.8 s, harness retry settings (`CONSTELLATION_S3_MAX_RETRIES=2`,
+800 ms every ~4.8 s, harness retry settings (`REPLICIX_S3_MAX_RETRIES=2`,
 `RETRY_TIMEOUT_MS=2000`).
 
 | | AWS us-west-2 | OVH Milan |
@@ -38440,7 +38440,7 @@ writer stops and, once the newest snapshot holds the last value (skip-empty
 then creates nothing), the oracle runs.
 
 **`snapsched`** (two nodes with their own node keys, `10s:1m 1m:4m; last=2`,
-`CONSTELLATION_LEASE_TTL_MS=10000`, `CONSTELLATION_SNAPSCHED_GRACE_S=120`,
+`REPLICIX_LEASE_TTL_MS=10000`, `CONSTELLATION_SNAPSCHED_GRACE_S=120`,
 `CONSTELLATION_SNAPSCHED_EXPIRE_EVERY_S=10`, 390–460 s):
 
 1. `b` creates the filesystem, holds the root lease, runs the writer; `a`
@@ -51599,7 +51599,7 @@ lease left is unchanged: the bound.
   expiry and `lock_cap_ms`/`grant_cap_ms` cap a grant by its ttl alone;
   `epoch_tenure_resumed` keeps those grants across the re-claim, whose
   lease can end before them when a ttl is longer than the lease's (legal:
-  `CONSTELLATION_LEASE_TTL_MS=10000` against the 20 s lock and
+  `REPLICIX_LEASE_TTL_MS=10000` against the 20 s lock and
   delegation ttls). The two cap functions now record the latest end of what
   they allowed under a hold (`AckState::hold_grant_until`, an `AtomicI64`:
   `Core` must stay `Sync`; an upper bound: a query may not end in a grant)
@@ -52399,7 +52399,7 @@ renews in time; the root had no "renew wanted" of its own.
 - Defaults (60 s lease, 1 s margin, 20 s lock and delegation TTLs): not
   reachable; the cap at the half-TTL point is 29 s and the trigger never
   fires.
-- `CONSTELLATION_LEASE_TTL_MS` of about 8 s or less (delegated locks), 4 s or
+- `REPLICIX_LEASE_TTL_MS` of about 8 s or less (delegated locks), 4 s or
   less (the root's own): fenced with no fault on main.
 - `CONSTELLATION_DELEGATION_TTL_MS` is not capped by a 60 s lease; at 4 s or
   less (4 margins) a delegate can never give a `2 × margin` grant and every

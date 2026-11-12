@@ -414,7 +414,7 @@ Stored in the bucket's `meta.json` and read by every mount.
 size and warns when `N > roster − 2`, because a single crashed holder
 then blocks TTL failover until it returns. Mounted nodes pick up a
 change within about a minute. With `f > 0`, `CONSTELLATION_PROMISE_TTL_S`
-must be at most a quarter of `CONSTELLATION_LEASE_TTL_MS`; otherwise
+must be at most a quarter of `REPLICIX_LEASE_TTL_MS`; otherwise
 `fs create`, `fs set` and the mount fail. A mounted node that started
 at `f = 0` with a longer TTL and sees `f` raised clamps its TTL to a
 quarter of the lease TTL and logs an error.
@@ -455,7 +455,7 @@ quarter of the lease TTL and logs an error.
 
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
-| `CONSTELLATION_LEASE_TTL_MS` | `60000` | milliseconds, positive | S3 lease expiry and renewal |
+| `REPLICIX_LEASE_TTL_MS` | `60000` | milliseconds, positive | S3 lease expiry and renewal |
 | `CONSTELLATION_LEASE_IDLE_RELEASE_MS` | `30000` | milliseconds | idle threshold for releasing a held lease — **only** once a requester is registered |
 | `CONSTELLATION_FORWARD_TIMEOUT_MS` | `500` | milliseconds | forwarded mutation request |
 | `CONSTELLATION_FORWARD` | `on` | boolean | requester-side mutation forwarding; `off` makes non-holder writes acquire the lease instead |
@@ -468,7 +468,7 @@ quarter of the lease TTL and logs an error.
 
 The lease's expiry margin (a lease is usable only while at least this
 much of it is left, and every grant backed by it is capped by it) is
-`min(1000 ms, CONSTELLATION_LEASE_TTL_MS / 4)`. It is not a separate
+`min(1000 ms, REPLICIX_LEASE_TTL_MS / 4)`. It is not a separate
 knob. Plan 29 M5's `CONSTELLATION_FORWARD_MAX_INFLIGHT` no longer
 exists: since plan 30 M5 each forward runs as its own task, ordered only
 by the requester-side key gate. Forwards are still bounded, by their
@@ -618,7 +618,7 @@ Plan 30 M14. See [Cluster locks](features/cluster-locks.md).
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_LOCKS` | `cluster` with P2P, `local` without | `local`, `cluster` | default for `--locks`; the flag wins |
-| `CONSTELLATION_LOCK_TTL_MS` | `20000` | milliseconds; `0` means the default | a lock grant's lifetime, renewed in the background while held. The daemon cuts it to `CONSTELLATION_LEASE_TTL_MS` less two expiry margins (a lease TTL under about 22 s with the default 20 s), so that a lock grace always fits in one lease TTL (a successor of a failed-over lease would otherwise grant over a lock the old tenure's holder still honours); the cut is logged as a warning at start. The delegation TTL default follows the cut value. A holder whose node *stops* for longer (a partition, a frozen or dead daemon; a slow disk alone no longer does, see `CONSTELLATION_LOCK_LANE`) loses the lock: its node fails I/O on the locked files, and every write and namespace operation of the lock's owner on any file, with `EIO`. A waiter behind a *crashed* holder waits up to `ttl + margin`; see [Cluster locks](features/cluster-locks.md#configuration) |
+| `CONSTELLATION_LOCK_TTL_MS` | `20000` | milliseconds; `0` means the default | a lock grant's lifetime, renewed in the background while held. The daemon cuts it to `REPLICIX_LEASE_TTL_MS` less two expiry margins (a lease TTL under about 22 s with the default 20 s), so that a lock grace always fits in one lease TTL (a successor of a failed-over lease would otherwise grant over a lock the old tenure's holder still honours); the cut is logged as a warning at start. The delegation TTL default follows the cut value. A holder whose node *stops* for longer (a partition, a frozen or dead daemon; a slow disk alone no longer does, see `CONSTELLATION_LOCK_LANE`) loses the lock: its node fails I/O on the locked files, and every write and namespace operation of the lock's owner on any file, with `EIO`. A waiter behind a *crashed* holder waits up to `ttl + margin`; see [Cluster locks](features/cluster-locks.md#configuration) |
 | `CONSTELLATION_LOCK_LANE` | `on` | `off`, `0` or `false` turns it off | the lock renewal lane (plan 41): renews this node's own lock grants, and the ones it holds at an owner, off the authority core from the certificate the core publishes, so a core stuck in a metadata-store write (a slow journal write on the device) does not lapse them; always on, `off` for A/B runs and the stall scenarios' fail-before (see [Cluster locks](features/cluster-locks.md#renewals-off-the-core)) |
 | `CONSTELLATION_ROOT_PROBE` | on | `off`, `0` or `false` turns it off | the root's own proof that it still holds its lease (plan 41 D3): while this node's authority driver is stuck in a step (and not hung, `CONSTELLATION_HOLDER_STALL_MS`), a tenure that can be taken over before its lease expires (a listed backup, or `ack=s3`) reads its lease object itself, off the core, when the delegation answerer or the lock lane's own renewals find the core's last proof of liveness stale (at most one read started per quarter of `backup_takeover_ms`, the next following a quarter after the last while a renewal waits); a read that names this node and the tenure's epoch lets them answer within `backup_takeover_ms` of its send; for A/B runs only (see [Delegations](features/delegations.md#grants-renewal-and-expiry), [Cluster locks](features/cluster-locks.md#renewals-off-the-core)) |
 | `CONSTELLATION_LOCK_LANE_MAX_STALL_MS` | `120000` | milliseconds | the lane's renewals of grants held at another node stop once the authority driver has made no progress for this long: a hung core is not a slow one, and its grants lapse as they always did |
@@ -720,7 +720,7 @@ freshness bound; raise the floor if request volume matters more than
 latency.
 
 A node that currently **holds** a partition lease never backs off past a
-quarter of `CONSTELLATION_LEASE_TTL_MS`, whatever the ceiling says: the
+quarter of `REPLICIX_LEASE_TTL_MS`, whatever the ceiling says: the
 sync round is also what renews the lease and what notices another node's
 handoff request, so backing off past the renewal cadence would let a
 holder sleep through its own renewal. Its poll also fires at the moment
@@ -877,14 +877,14 @@ protocol, message bounds and counters.
 
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
-| `CONSTELLATION_S3_MAX_RETRIES` | object_store default | count | override `RetryConfig.max_retries` for `s3://` backends. One request's retry series: an `fsync` no longer depends on it (plan 39 — it retries transient failures itself, see `--fsync-timeout`) |
-| `CONSTELLATION_S3_RETRY_TIMEOUT_MS` | 30000 | milliseconds | override `RetryConfig.retry_timeout` for `s3://` backends (object_store's own default is 180 s). Bounds one request series, not an `fsync` |
+| `REPLICIX_S3_MAX_RETRIES` | object_store default | count | override `RetryConfig.max_retries` for `s3://` backends. One request's retry series: an `fsync` no longer depends on it (plan 39 — it retries transient failures itself, see `--fsync-timeout`) |
+| `REPLICIX_S3_RETRY_TIMEOUT_MS` | 30000 | milliseconds | override `RetryConfig.retry_timeout` for `s3://` backends (object_store's own default is 180 s). Bounds one request series, not an `fsync` |
 | `CONSTELLATION_FSYNC_TIMEOUT` | unset | duration (`2s`, `500ms`, `1m`) | default for `mount --fsync-timeout`, the opt-in `soft` bound on an `fsync`'s wait for S3 (see [Mount flags](#mount-flags)) |
 | `CONSTELLATION_CHUNK_HANDOFF_AFTER_MS` | 6000 | milliseconds, 0 disables | a drain (write-through close, a non-holder's forwarded close, `fsync`) waiting while this node's S3 path makes no progress (no upload and no other S3 request completes, while one of its requests waits that long or failed unanswered) for this long hands its chunks to a peer that can reach S3, which uploads them. The drain looks again as soon as its first request has waited this long, so the handoff starts about this long after that request |
 | `CONSTELLATION_S3_STALL_MS` | 6000 | milliseconds, 0 disables | EC2 campaign 8 A-1: no S3 request of this node completing for this long, while one of them waits that long (or failed unanswered), marks its S3 path stalled (`status.own_s3.stalled`). Metadata ops then keep forwarding to the holder over P2P instead of taking the lease path, which needs S3. See [durability and failover](features/durability-and-failover.md) |
 | `CONSTELLATION_DROP_HELD_AWAIT_MS` | the cap, `drop_held_await` ([derived timings](#derived-timings)) | milliseconds, positive; a larger value is clamped to the cap | plan 46 M0.2: after `constellation repair drop-held` rolls back another node's operation that was never answered, that node's own retry executes it again, in the dropped row's place while this node remains the sequencer (after a takeover by another node the retry runs there, ungated); the dropped row keeps its place in this node's replay queue as a placeholder, and what depends on it waits behind it. This is how long the placeholder waits for the retry before the sequencer in force settles the operation as abandoned (`Refused { rid, ECANCELED }`, `status.ack.await_retry_settled`) and what waited behind it goes on. The clock does not run while a continuation epoch refuses writes. The cap leaves this node's own operations on the placeholder's keys, which wait behind it, their window: they wait for the bound and for the settle's row to commit, then execute inside their own attempts window (`attempts`, [derived timings](#derived-timings)), so with the requester gone they succeed instead of ending in `EIO`. A live requester is told at once (`Busy`) and retries within its forward backoff; one partitioned for longer than the bound meets the settled refusal. The cap is floored at one settle window; the own operations' guarantee therefore holds while a settle window is at most a third of the client deadline (at a larger window the floor makes the bound plus one window exceed it). The same value, when set, is also how long a requester's shadow of a non-stealable answer (an epoch hold's) may wait for its row to reach the log before it is rolled back and replayed; unset, that wait is `stale_shadow_after`, the whole client deadline, not the cap. A requester that is gone, or gave up and settled, never retries; its operation then never lands |
 | `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` | 20000 | milliseconds | while this node's S3 path is stalled (and not every peer reports S3 down), a metadata op not answered this long after submission fails with `EIO` (in doubt) instead of waiting for the 2 × TTL deadline |
-| `CONSTELLATION_CAS_BUSY_RETRIES` | `5` | count | plan 30 M4: how many times a conditional PUT answered `409 Conflict` (another conditional write on the key in flight) is retried as the same attempt, backing off 50 ms doubling to 1 s, before the round reports the store's error. See [write-path hygiene](features/write-path-hygiene.md) |
+| `REPLICIX_CAS_BUSY_RETRIES` | `5` | count | plan 30 M4: how many times a conditional PUT answered `409 Conflict` (another conditional write on the key in flight) is retried as the same attempt, backing off 50 ms doubling to 1 s, before the round reports the store's error. See [write-path hygiene](features/write-path-hygiene.md) |
 
 ### Existence hints
 
@@ -1028,7 +1028,7 @@ knobs (`CONSTELLATION_SNAPACCT*`) and `CONSTELLATION_GC_SNAP_WALK` are in
 | `CONSTELLATION_SNAPSCHED_EXPIRE_BATCH` | `32` | snapshots, `1..256` | victims per delete batch; before each batch the leader renews `_snapsched` (a fenced renewal stops the run) and re-reads every victim (gone, held, re-owned → `skipped_reverify`). `1` renews and re-reads per victim |
 | `CONSTELLATION_SNAPSCHED_RESIGN_AFTER` | `3` | ticks, `0` = never | a leader whose snapshot batches cannot reach the root-lease holder over P2P for this many ticks in a row gives `_snapsched` back and stays out for one lease TTL, so a node that can reach the holder (the holder itself always can) leads instead |
 
-The `_snapsched` lease's TTL is `CONSTELLATION_LEASE_TTL_MS` (default
+The `_snapsched` lease's TTL is `REPLICIX_LEASE_TTL_MS` (default
 60 s), raised to at least three ticks. `constellation snapshot sched status`
 shows, per node, whether it leads, the counters, and every policy root's
 state and next snapshot; `snapshot sched run [--dry-run]` runs one tick now.
@@ -1353,39 +1353,39 @@ rewrites it).
 
 | Symbol | Meaning | Follows |
 |---|---|---|
-| `L` | lease TTL | `CONSTELLATION_LEASE_TTL_MS` |
-| `m` | expiry margin, `min(1000, L/4)` | `CONSTELLATION_LEASE_TTL_MS` |
+| `L` | lease TTL | `REPLICIX_LEASE_TTL_MS` |
+| `m` | expiry margin, `min(1000, L/4)` | `REPLICIX_LEASE_TTL_MS` |
 | `R` | read-delegation TTL | `CONSTELLATION_READ_DELEGATION_TTL_MS` |
 | `D` | write-delegation TTL (unset: `max(K, 5000)`) | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
 | `K` | lock TTL | `CONSTELLATION_LOCK_TTL_MS` |
 | `F` | forward timeout | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
 | `T` | backup takeover window | `CONSTELLATION_BACKUP_TAKEOVER_MS` |
 | `k` | delegation stream tick (fixed, 50) | fixed |
-| `A` | client deadline, row `client_deadline` | `CONSTELLATION_LEASE_TTL_MS` |
-| `w` | settle window, row `settle_window` | `CONSTELLATION_LEASE_TTL_MS` |
-| `H` | reclaim horizon, row `reclaim_horizon` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_LEASE_TTL_MS` |
+| `A` | client deadline, row `client_deadline` | `REPLICIX_LEASE_TTL_MS` |
+| `w` | settle window, row `settle_window` | `REPLICIX_LEASE_TTL_MS` |
+| `H` | reclaim horizon, row `reclaim_horizon` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
 | `DRT` | delegation request timeout, row `deleg_request_timeout` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
-| `inbox_deadline` | the inbox wait | `CONSTELLATION_LEASE_TTL_MS` |
+| `inbox_deadline` | the inbox wait | `REPLICIX_LEASE_TTL_MS` |
 | `forward_backoff` | forward back-off (fixed) | fixed |
 | `acquire_retry_max` | lease acquisition retry ceiling (fixed) | fixed |
 | `s3_less_deadline` | an op's deadline while S3 is stalled | `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` |
 | `promise_ttl` | heartbeat promise TTL | `CONSTELLATION_PROMISE_TTL_S` |
 | `heartbeat` | backup heartbeat interval | `CONSTELLATION_BACKUP_HEARTBEAT_MS` |
 | `leave_resend` | a leaving node's note interval, row `leave_resend` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
-| `lock_grace_wait_max` | row `lock_grace_wait_max` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` |
+| `lock_grace_wait_max` | row `lock_grace_wait_max` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `REPLICIX_LEASE_TTL_MS`, `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` |
 
 | Bound | At the defaults (ms) | Formula | Follows |
 |---|---:|---|---|
-| `client_deadline` | 120000 | `2L` | `CONSTELLATION_LEASE_TTL_MS` |
-| `settle_window` | 30000 | `A/4, or the knob clamped to A/2` | `CONSTELLATION_LEASE_TTL_MS` |
-| `inbox_read_fresh` | 15000 | `w/2` | `CONSTELLATION_LEASE_TTL_MS` |
-| `attempts` | 90000 | `A - w` | `CONSTELLATION_LEASE_TTL_MS` |
-| `inbox_attempts` | 90000 | `max(inbox_deadline - w, inbox_deadline/2)` | `CONSTELLATION_LEASE_TTL_MS` |
-| `settle_cap_span` | 84500 | `2w + H + T + max(2F, max(T, F)) + DRT` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_FORWARD_TIMEOUT_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
-| `drop_held_await` | 60000 | `knob (0: cap) clamped to max(A - 2w, w)` | `CONSTELLATION_DROP_HELD_AWAIT_MS`, `CONSTELLATION_LEASE_TTL_MS` |
-| `stale_shadow_after` | 120000 | `knob, else A` | `CONSTELLATION_DROP_HELD_AWAIT_MS`, `CONSTELLATION_LEASE_TTL_MS` |
+| `client_deadline` | 120000 | `2L` | `REPLICIX_LEASE_TTL_MS` |
+| `settle_window` | 30000 | `A/4, or the knob clamped to A/2` | `REPLICIX_LEASE_TTL_MS` |
+| `inbox_read_fresh` | 15000 | `w/2` | `REPLICIX_LEASE_TTL_MS` |
+| `attempts` | 90000 | `A - w` | `REPLICIX_LEASE_TTL_MS` |
+| `inbox_attempts` | 90000 | `max(inbox_deadline - w, inbox_deadline/2)` | `REPLICIX_LEASE_TTL_MS` |
+| `settle_cap_span` | 84500 | `2w + H + T + max(2F, max(T, F)) + DRT` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_FORWARD_TIMEOUT_MS`, `CONSTELLATION_LOCK_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
+| `drop_held_await` | 60000 | `knob (0: cap) clamped to max(A - 2w, w)` | `CONSTELLATION_DROP_HELD_AWAIT_MS`, `REPLICIX_LEASE_TTL_MS` |
+| `stale_shadow_after` | 120000 | `knob, else A` | `CONSTELLATION_DROP_HELD_AWAIT_MS`, `REPLICIX_LEASE_TTL_MS` |
 | `deleg_request_timeout` | 500 | `max(F, 4k, 1)` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
-| `reclaim_horizon` | 21000 | `D + m` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
+| `reclaim_horizon` | 21000 | `D + m` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
 | `grant_in_flight` | 1100 | `2k + 2 DRT` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
 | `deleg_resend` | 750 | `clamp(D/8, 100, 500) + 250` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
 | `recall_backoff_max` | 2000 | `max(2000, DRT)` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
@@ -1393,24 +1393,24 @@ rewrites it).
 | `release_stream_window` | 500 | `F` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
 | `archive_put` | 500 | `F` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
 | `inherit_slack` | 1500 | `T` | `CONSTELLATION_BACKUP_TAKEOVER_MS` |
-| `abandon_read_wait` | 6000 | `R + m` | `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS` |
+| `abandon_read_wait` | 6000 | `R + m` | `CONSTELLATION_READ_DELEGATION_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
 | `abandon_heard_window` | 20000 | `D` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
 | `leave_wait` | 45500 | `2D + F + 5000` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_FORWARD_TIMEOUT_MS`, `CONSTELLATION_LOCK_TTL_MS` |
 | `leave_resend` | 500 | `max(F, 500)` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
 | `leave_note_lapse` | 40000 | `max(3 * leave_resend, 2D)` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_FORWARD_TIMEOUT_MS`, `CONSTELLATION_LOCK_TTL_MS` |
-| `leftover_hold` | 480000 | `4A` | `CONSTELLATION_LEASE_TTL_MS` |
-| `read_block` | 12000 | `2 (R + m)` | `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS` |
-| `read_span` | 8000 | `R + m + 2000` | `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS` |
-| `lock_span` | 27000 | `max(K, D) * 5/4 + m + 1000` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
-| `floor_span` | 45500 | `T + max(R, K) + D + 3m + 1000` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS` |
+| `leftover_hold` | 480000 | `4A` | `REPLICIX_LEASE_TTL_MS` |
+| `read_block` | 12000 | `2 (R + m)` | `CONSTELLATION_READ_DELEGATION_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
+| `read_span` | 8000 | `R + m + 2000` | `CONSTELLATION_READ_DELEGATION_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
+| `lock_span` | 27000 | `max(K, D) * 5/4 + m + 1000` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
+| `floor_span` | 45500 | `T + max(R, K) + D + 3m + 1000` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
 | `promise_span` | 16000 | `promise_ttl + 1000` | `CONSTELLATION_PROMISE_TTL_S` |
-| `ack_floor_reads` | 8500 | `T + R + 2m` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS` |
-| `ack_floor_locks` | 23500 | `T + max(R, K) + 2m` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS` |
-| `lock_grace_wait_max` | 64500 | `T + max(R, K) + H + 2m + s3_less_deadline` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS`, `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` |
-| `lock_owner_wait_max` | 127500 | `L + m + acquire_retry_max + lock_grace_wait_max` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS`, `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` |
+| `ack_floor_reads` | 8500 | `T + R + 2m` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
+| `ack_floor_locks` | 23500 | `T + max(R, K) + 2m` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
+| `lock_grace_wait_max` | 64500 | `T + max(R, K) + H + 2m + s3_less_deadline` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS`, `CONSTELLATION_S3_LESS_OP_DEADLINE_MS`, `REPLICIX_LEASE_TTL_MS` |
+| `lock_owner_wait_max` | 127500 | `L + m + acquire_retry_max + lock_grace_wait_max` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS`, `CONSTELLATION_S3_LESS_OP_DEADLINE_MS`, `REPLICIX_LEASE_TTL_MS` |
 | `lock_poll` | 50 | `max(forward_backoff/4, 10)` | fixed |
-| `lock_min_grant` | 2000 | `min(2m, K)` | `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
-| `lock_renew_gap` | 250 | `min((K - m)/64, 250)` | `CONSTELLATION_LEASE_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
+| `lock_min_grant` | 2000 | `min(2m, K)` | `CONSTELLATION_LOCK_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
+| `lock_renew_gap` | 250 | `min((K - m)/64, 250)` | `CONSTELLATION_LOCK_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
 | `claim_grace` | 3000 | `2T` | `CONSTELLATION_BACKUP_TAKEOVER_MS` |
 | `lag_threshold` | 187 | `max(T/8, 1)` | `CONSTELLATION_BACKUP_TAKEOVER_MS` |
 | `recall_hold` | 250 | `max(F/2, 1)` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |

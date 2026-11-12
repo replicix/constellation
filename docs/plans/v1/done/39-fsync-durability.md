@@ -40,8 +40,8 @@ What the code did before this plan (verified against `main` at `5a56fb9`):
   ignores `datasync`.
 - **Every wait was attempt-counted.** A chunk is PUT up to three times with a
   flat 50 ms pause (`crates/engine/src/upload.rs`), each attempt wrapping
-  object_store's own retry series (`CONSTELLATION_S3_MAX_RETRIES`,
-  `CONSTELLATION_S3_RETRY_TIMEOUT_MS` = 30 s). One failed PUT failed the drain,
+  object_store's own retry series (`REPLICIX_S3_MAX_RETRIES`,
+  `REPLICIX_S3_RETRY_TIMEOUT_MS` = 30 s). One failed PUT failed the drain,
   the drain failed the `fsync`: `EIO`. The journal barrier was one sync round;
   a round that could not ship was `EIO`. A forwarded manifest commit left in
   doubt (`CONSTELLATION_S3_LESS_OP_DEADLINE_MS`, the 40 s forward deadline)
@@ -52,7 +52,7 @@ What the code did before this plan (verified against `main` at `5a56fb9`):
   durable `pending_upload` rows, background rounds retry — so the failure was
   one of availability, not durability. But it was reported as `EIO` for an
   800 ms blip: the harness, whose daemons run with
-  `CONSTELLATION_S3_MAX_RETRIES=2` / `RETRY_TIMEOUT_MS=2000`, saw `fio-blips`
+  `REPLICIX_S3_MAX_RETRIES=2` / `RETRY_TIMEOUT_MS=2000`, saw `fio-blips`
   (800 ms cuts under `fio --end_fsync=1`) fail about one run in four.
 - **A latent false success.** After a failed drain the write session was
   already published, so a *second* `fsync` under `--fsync-mode local` found

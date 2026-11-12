@@ -237,7 +237,7 @@ pass once M2 and M3 land. There are no fixes in this milestone.
 
 4. **`forward-timeout-reexec` (bug A).**
    - Setup: two nodes with their own node keys,
-     `CONSTELLATION_LEASE_TTL_MS=10000`, and
+     `REPLICIX_LEASE_TTL_MS=10000`, and
      `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS=1500` on both.
    - Five rounds, alternating which node holds the lease: `O_EXCL` create,
      `mkdir`, `unlink` of a file every node sees, `rename`, and `link`.
@@ -254,7 +254,7 @@ pass once M2 and M3 land. There are no fixes in this milestone.
 
 5. **`holder-crash-phantom-shadow` (bug B, a third node takes over).**
    - Setup: nodes A, B and C with their own keys and
-     `CONSTELLATION_LEASE_TTL_MS=6000`. A's S3 goes through a
+     `REPLICIX_LEASE_TTL_MS=6000`. A's S3 goes through a
      `CountingProxy` switch.
    - Steps:
      1. A writes a marker (takes the lease), and all three nodes see it.
