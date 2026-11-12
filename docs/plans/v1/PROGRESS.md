@@ -69608,28 +69608,93 @@ model's chunk 14 (a deposed root keeps its grant) was already on main. ADR numbe
   (3) the root's release of its own stream is complete only when its row has shipped, and the holder state stays to stream it
   to the next root (seeds 18, 20, 35); (4) the loop-back is for the delegate family only: lock messages to the own node keep
   the driver's path (a general loop-back hung `locks.force_release` in the engine's `unix_socket_and_http_dispatch`).
-- **Gate** (final tree, box 3): `cargo fmt --check`; `clippy --workspace --all-targets -D warnings`; debug lib tests meta 432,
-  engine 972, control 146 (schema re-blessed), net 155, authority 1,494; release authority `--no-fail-fast`: lib 1,494, sim 495
-  passed, 0 failed, 0 panicked. Each of the first four commits compiles alone (`cargo check --all-targets`).
-- **Sweeps x2,000 against main** (`0976f7a9`): `sticky-ttl`, `far-placement` (`+commit`, `+durability`, `+settle`,
-  `+unsettled`), `placement-hot` (`+commit`, `+settle`, `+unsettled`), `sticky-holder-restarts` and `-placed`,
-  `sticky-holder-returns`, `sticky-stale-route`, `delegated-root-crash`, `long-delegated` (`+commit`), `far-root-writes` (`+commit`,
-  `+durability`, `+settle`), `far-root-writes-shared+commit`, `backup`, `far`: 0 failing seeds. `flex+settle+oracles+unsettled`:
-  the same 20 seeds as main (215, 490, 685, 736, 757, 821, 934, 974, 1020, 1078, 1101, 1278, 1340, 1489, 1524, 1552, 1754, 1759,
-  1884, 1911); `sticky-idle-release` seed 217 as main; `delegated-root-deposed-delegate-dies` with
-  `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`: seed 1678 on both.
-  **Open**: `far-root-writes-paused` (the root cut from S3 and both peers for 9 s, deposed, back; new config) seeds 84, 135, 751,
-  1603 (`+unsettled` also 1390): an isolated root's unshipped refusal or release row and the new root's cursor; and
-  `far-root-writes+unsettled` seed 1390, which fails the same way with `AUTHORITY_SIM_ROOT_STICKY=off` (a far writer's settle inside
-  the restarted root's takeover gate; not step 9's).
-- **Controls**: `root_sticky_on_slash` fails the run; `root_executes_under_own_grant` fails the new audit
-  `root_path_executes_own_stream` (counted only when the simulation audits). `deposed_root_strands_own_stream` is pinned at the
-  meta level (`a_deposed_roots_own_stream_rows_are_neither_stranded_nor_member_copied`); in the simulation no oracle names it: the
-  stranded rows replay by rid and complete (an open gap in I5's reach, not a pass).
-- **Harness** (release, seed 42, box load 40 to 90): `delegate-crash`, `delegated-subtrees`, `sticky-abandon`,
-  `takeover-loss-two-node`, `sticky-release-on-unmount` pass; the new `root-own-sticky` (the root's creates in `/r` p50 25 ms,
-  p90 41 ms; in `/` p50 230 ms, p90 614 ms; SIGSTOP past the TTL, the other node takes the lease after 21 s, 42 rows streamed
-  after the deposition, the other node's write into `/r` 48 ms) and `root-own-sticky-unmount` pass.
-- **Not done**: the perf A/B (ext4, xfs, btrfs, tmpfs) of `ack-latency` topologies 1 and 8: the box was shared and saturated
-  (load 40 to 90); topology 8 (`8-wan-root-own`) is written and not run. The hot-path cost is a scan of the step's actions for
-  sends to the own node and a map lookup per delegated execution.
+- **Fix round (review of the step: 4 MUST, 9 SHOULD, 7 NIT; the branch is rebased on main `f24f899e`)**:
+  - **M1** `holder_reaches` for the root's own stream checked the streams part of the op's position only, so a `Final` stream row
+    could rest on an unshipped root row (before the grant, or in `/`) that a deposition rolls back while the stream's rows stay.
+    The op now waits until the archive carries the root rows of this tenure its position names
+    (`Meta::journal_root_seqs_through`, with an O(1) bound `journal_root_bound` for the common case); the stream's own rows are no
+    premise. Core tests `an_own_stream_op_waits_for_the_unshipped_root_rows_it_rests_on` and
+    `a_deposition_leaves_no_stream_row_on_a_rolled_back_root_row` fail on the parent.
+  - **M2** the sim's excuse of I1's `ungated_shadows` by the root's table history is gone. The cause was the requester's: a far
+    requester whose table does not list the root's own grant yet could not classify a stream reply. The reply now says it
+    (`MutateReply.non_stealable`, set from the executor's own state; a wire field, no compatibility shim). Test
+    `a_non_stealable_holders_reply_says_it_is_final` fails on the parent; with the oracle strict and the field ignored
+    `far-root-writes+commit` and `-paused+commit` fail 11 seeds of 2,000 each, `-shared+commit` 2.
+  - **M3** `far-root-writes-paused` seeds 84, 135, 751, 1603 and `+unsettled` 1390 do not fail on the rebased branch before any
+    change of this round (main's stall fixes, `known_root` and `drain_below`, are the likely reason); the
+    successor's max-raised cursor behind a hole of deferred ships was looked for and not reproduced by any seed. What the 2,000
+    seeds of the variants did show, and is fixed: (a) a restart over the journal loses the core's note that the root's own grant
+    record is not in the archive (`own_grant_rows`), and the reinstalled stream answered `Final` on a grant the log never had
+    (`far-root-writes-paused+durability` seeds 917, 1854: a row acknowledged and completed 0 times; both pass with
+    `AUTHORITY_SIM_ROOT_STICKY=off`); the record's row is found in the journal again on install
+    (`a_restarted_root_still_waits_for_the_archive_to_carry_its_grant_record`); (b) a delegate's stream refusal back-off started
+    from the two seconds the root's absence had raised it to, so a root that came back and refused was asked again after the
+    bound (`far-root-writes+unsettled` seed 1390: a settle ran out inside it; `-paused+unsettled` too); refusals back off from
+    a few ticks on their own (`a_refusal_backs_off_from_a_few_ticks_not_from_what_the_roots_absence_raised`). 1390 was that latent
+    back-off (it failed with `AUTHORITY_SIM_ROOT_STICKY=off` too because the configuration, placement on and a crash, is new, not
+    because main runs it).
+  - **M4** `deposed_root_strands_own_stream` now fails a simulation oracle: I5 judges a rolled-back `Final` row of the root's
+    own generation by its origin `(gen, idx)` and the node that rolled it back (the holder, not a requester's shadow of its
+    answer), whether or not the replay by rid completes it again; I5 is strict in the `far-root-writes` configs (`strict_lone`).
+    `the_root_own_controls_fail_the_oracles` runs the third control; the strict `no_grant_on_root_dir` check is the first to
+    speak, also when the run fails otherwise (the table check moved before the histories, and the test no longer accepts any
+    other failure for that control).
+  - **A found by the partition phase**: the root's inbox drain halted forever on an op under its own stream
+    (`RecallPlan::Hold` mapped to `Halt::Recall`); a requester cut off from the root got `EIO` after its deadline instead of the
+    `EROFS` ADR-55 promises. The drain refuses it `EROFS` in the stream (a row of the stream, the position acknowledged), a
+    settle is refused as a settle is (`the_roots_drain_refuses_an_inbox_op_under_its_own_stream_in_the_stream`).
+  - **SHOULD/NIT**: S1 the self-inbox follows `sync_cfg_spans` (and the hooks' idempotence is stated); S2 the claim cut with rows
+    is pinned (`a_claim_ends_the_own_stream_at_what_the_root_assigned`; the gate-with-a-backup-tail case is step 12's, in
+    `delegations.md`); S3 `restarted_holder` is cleared when the claim lands or no stream is left
+    (`a_restarted_holders_wait_for_its_claim_ends_with_the_claim`); S4 `deadlines.rs` entries `own_first_op_wait` (`F + k`, D16)
+    and `own_cross_release_wait` (`5000 + F + 2k`, D17), `root_own_released_for_cross` split own client / forwarded, the root
+    path's archive waits counted apart (`archive_waits_elsewhere`), the partition phase of `root-own-sticky`, spec test 13, the
+    `far-root-writes-cross` config (`cross_ratio` 0.1); S5 the release-drain rule is judged for the lease holder too (against what
+    it journaled of the stream); S6 the answer-time classifier's widening is documented and cannot reach a root row; S7 the
+    placement counts the root's own rows once; S8 the lease is not released over an unshipped own release row (a counter, a debug
+    assertion and a sim audit; an unreachable S3 stops the release, the subtree stays blocked at the successor: `delegations.md`);
+    NITs: `own_sticky_release` says whether it started a release (else `Hold`), the commit wait is measured from the first
+    record, the strict oracle is first to speak. `with_lone_delegates` keeps `placement_root_sticky = false` because that
+    control's seeds were pinned from a root that grants itself nothing. `GrantSource::Handover` keeps its `allow(dead_code)`
+    until step 8 C4.
+- **Gate** (final tree, box 3): `cargo fmt --check`; `clippy --workspace --all-targets -D warnings`; debug lib tests meta 432, engine
+  972, control 162 (schema and `configuration.md` re-blessed), net 155, authority 1,519; release authority `--no-fail-fast`: lib
+  1,519, meta_repro 4, sim 499 passed, 0 failed, 0 panicked. The 8 new core tests fail on the parent (the fixes reverted on a
+  copy: 8 of 8).
+- **Sweeps x2,000** (release `sim`; main is `f24f899e`): 0 failing seeds in `far-root-writes-paused` (plain, `+commit`,
+  `+durability`, `+settle`, `+unsettled`), `far-root-writes` (the same five), `far-root-writes-cross` (new: `cross_ratio` 0.1;
+  plain, `+commit`, `+durability`), `sticky-ttl`, `far-placement` (plain, `+commit`, `+durability`, `+settle`, `+unsettled`),
+  `placement-hot` (plain, `+commit`, `+settle`, `+unsettled`), `sticky-holder-restarts`, `-restarts-placed`, `-holder-returns`,
+  `sticky-stale-route`, `delegated-root-crash`, `long-delegated` (plain, `+commit`), `backup`, `far`, `sticky-idle-release` (seed
+  217 of the previous round passes now). `flex+settle+oracles+unsettled`: the 7 seeds main has now (214, 215, 490, 934, 1340,
+  1524, 1911). `delegated-root-deposed-delegate-dies` with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`: seed 1678 on both.
+  **Open**: `far-root-writes-shared+commit` seed 1550 (I1: a node answered a rid `ok` that the log carries refused `EROFS`). It
+  passes on the branch tip before the rebase (2,000 seeds) and fails on the rebased tip with and without this round's changes, so
+  it came with main. The new root refuses an inbox-only rid (the node's own batch, drained in its gate) under the crashed
+  root's own grant (`EROFS`, final), the simulated client retries the same rid after `EROFS` (it models the frozen epoch's
+  retriable one), the rid goes to the holder when it is back, and the holder runs it: a resubmission of a rid that got an answer
+  starts with no send history, so `inbox_ever` is false and the holder's C9.2 refusal does not apply. The engine does not retry
+  `EROFS` under the same rid, so this needs the simulated client, not the engine; left to the maintainer's decision (a
+  client that does not reuse a rid after a final refusal, or the history kept for answered rids).
+- **Controls**: `root_sticky_on_slash` fails `no_grant_on_root_dir`; `root_executes_under_own_grant` fails the audit
+  `root_path_executes_own_stream`; `deposed_root_strands_own_stream` fails I5 (`far-root-writes-paused`, a few seeds of 250).
+- **Harness** (release, seed 42, box load 7 to 8 from the sweeps beside): `delegate-crash`, `delegated-subtrees`, `sticky-abandon`,
+  `takeover-loss-two-node`, `sticky-release-on-unmount`, `root-own-sticky` and `root-own-sticky-unmount` pass. `root-own-sticky`:
+  the root's ops in `/r` p50 4.6 ms, p90 5.4 ms, in `/` p50 206 ms, p90 207 ms; the partition phase (b cut from the root's P2P):
+  4 inbox writes into `/r`, 4 `EROFS`, 4 refusals in the root's stream, 5 writes after the heal final; SIGSTOP past the TTL, b took
+  the lease 19 s after, 42 rows streamed after the deposition, b's write into `/r` 10 ms. The first run of the phase found the
+  drain defect above (`EIO` after the deadline).
+- **Perf** (release, box 3, `bench/commit-rule/g1-abba.sh` ABBA, topology 1: 16 rounds x 300 samples, A = main `f24f899e`, B = this
+  tree; topology 8, `net-wan` (60 ms +- 20 ms netem on loopback via `tc`): 3 to 5 rounds x 100 samples. The box is shared: a
+  run waits for a 1-minute load below 3 and the ones taken beside another job were repeated). **Topology 1**, holder's ops, B/A of
+  the p50: ext4 0.93 to 1.05 (p90 0.94 to 1.00), xfs 0.99 to 1.10, btrfs 0.91 to 1.14, tmpfs 1.02 to 1.35 (taken beside another
+  job; quiet re-runs: main against the step's first tip 0.96 to 1.03, that tip against this tree 0.95 to 1.00); the 2 to 3 ms
+  write is 1.00 on ext4, xfs and btrfs, 0.97 to 1.05 on tmpfs. The microsecond-scale metadata ops (chmod 36 us, unlink 55 us) move
+  by 5 to 10 us between runs of one binary: A against A gives 0.77 to 1.00 on xfs and 1.02 to 1.26 on tmpfs, so a difference
+  below that is not measurable here; no op is slower in every repeat (btrfs chmod 36 -> 41 us in two runs, p50 1.14, is the
+  largest seen), and the fix round against the step's first tip is below 1 on xfs (all five ops 0.77 to 1.00). **Topology 8**
+  (`8-wan-root-own`; main cannot run it, the scenario needs the root's own grant; A = the step's tip before this round): the root's
+  ops in its own grant 50 to 150 us, in `/` 203 ms (the archive wait, the netem round trip; `create` and `write` return earlier); B/A of the root-own ops 0.68 to
+  1.15 on ext4, xfs, btrfs and tmpfs (the one 1.20, tmpfs write, was noise: 0.91 in the 5-round repeat), of the root-slash ops 0.97
+  to 1.07; the first op under the grant 0.7 to 1.15 (n = 3 to 5). Load before the runs 0.1 to 2.9 (the harness and its S3
+  emulator account for about 2).

@@ -4840,6 +4840,19 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
   deposition starts from. `Meta::apply_delegate_tx` also notes the index of a
   `Refused` row it skips because the rid is completed here (the cursor would
   have stalled at it).
+- **A stream op waits for the root rows it rests on (M1).** The stream's rows
+  survive a deposition and the root's own rows of the tenure do not, so a stream
+  row that rests on one the archive has not carried would be a `Final` answer on
+  a premise the log never had. The root, as the holder, executes an op only when
+  the root rows of this tenure its position names are in the log
+  (`Core::holder_reaches`, `journal_root_seqs_through`): what a far holder waits
+  for in the segments. The stream's own rows are no such premise.
+- **A holder's reply says its grant is non-stealable (M2).** `MutateReply`
+  carries `non_stealable`, set by the executor from its own state: the
+  requester, whose table may not list the root's own grant yet (it is minted and
+  used before a far requester reads the record), installs the shadow as a
+  non-stealable holder's, not as an answer outside the commit rule. The oracle
+  excuses nothing.
 - **A deposed root keeps the grant.** The stream's rows are holder rows
   (`gen != 0`, not appended): the deposition strands the root's rows of older
   epochs and leaves them (R-I5); the node goes on as an ordinary holder and
@@ -4850,7 +4863,8 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
   the lease again, does not execute as the holder before the claim (the lease
   object still naming it re-adopts it at the first forward); the claim ends its
   own stream at what it assigned. A grant record the archive has not carried is
-  not honoured, also after a deposition. The root's release of its own stream
+  not honoured, also after a deposition and after a restart over the journal
+  (the record's row is found in the journal again, M3). The root's release of its own stream
   is complete when its row has shipped; until then the holder state stays, to
   stream the row to the next root. The loop-back is for the delegate family
   (stream, acknowledgement, renewal, release request, seal, recall, read-grant
@@ -4861,12 +4875,19 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
   recall or Leave. Never by the placement as root, never by a TTL.
 - **Cross-subtree ops (Q3).** An op across the boundary of the root's own sticky
   subtree releases the grant, as the holder, and runs on the root's keys after
-  the release row, instead of `EXDEV` (`root_own_released_for_cross`). Another
-  node's non-stealable boundary stays `EXDEV`.
+  the release row, instead of `EXDEV` (`root_own_released_for_cross_own` and
+  `_forwarded`: the root's own client's op, or another node's; an op that
+  arrives while the same subtrees' release is under way waits for it and starts
+  no second). Its wait (the drain bound, the archive append of the release row,
+  two ticks) is `deadlines.rs`' `own_cross_release_wait`, below an op's
+  attempts, as the first op's wait for the record is `own_first_op_wait`.
+  Another node's non-stealable boundary stays `EXDEV`.
 - **Inbox-only writers (Q4).** A rid enqueued while its requester had no P2P path
   to the root is refused `EROFS` in the stream of a non-stealable grant (fence
-  C9), the root's own included; rids after the heal are forwarded routed by the
-  grant and run. Counted (`holder_inbox_refusals`). If the count is non-zero
+  C9), the root's own included: its drain of the requester's inbox refuses the
+  op as a row of the stream and acknowledges the position (it does not halt on
+  it); rids after the heal are forwarded routed by the grant and run. Counted
+  (`holder_inbox_refusals`, apart as `root_own.inbox_refusals`). If the count is non-zero
   outside partitions in the harness smoke, the alternative (the root releases
   its grant and runs the op) is implemented; no wire or record change.
 - **Settings.** `CONSTELLATION_DELEGATION_ROOT_STICKY` (on whenever sticky
