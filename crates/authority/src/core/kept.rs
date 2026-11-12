@@ -837,6 +837,21 @@ impl Core {
                             }
                         }
                         match all.get(&tx.first) {
+                            // Two record-less spans from one seq (a sealed
+                            // tail's journal gap, a member copy's hole of one
+                            // retired row): both say "no live row here", the
+                            // wider one says it of more seqs. Not a divergence
+                            // (a hole never covers a live row: the check
+                            // below).
+                            Some(old)
+                                if old.records.is_empty()
+                                    && tx.records.is_empty()
+                                    && old.origin == tx.origin =>
+                            {
+                                if tx.last > old.last {
+                                    all.insert(tx.first, tx);
+                                }
+                            }
                             Some(old)
                                 if old.last != tx.last
                                     || old.origin != tx.origin
@@ -870,6 +885,27 @@ impl Core {
                                 all.insert(tx.first, tx);
                             }
                         }
+                    }
+                }
+            }
+            // A hole covers no live row: every copy that starts inside one is
+            // in the log or was retired by a `DropHeld`.
+            #[cfg(debug_assertions)]
+            for (hf, h) in all.iter().filter(|(_, t)| t.records.is_empty()) {
+                if h.last <= *hf {
+                    continue;
+                }
+                for (_, t) in all.range(hf + 1..=h.last) {
+                    if !t.records.is_empty() {
+                        let ident =
+                            constellation_meta::tail_identity(&t.records).unwrap_or((*e, t.first));
+                        debug_assert!(
+                            replica.row_in_log(*e, t.last) || replica.row_retired(ident.0, ident.1),
+                            "a hole {hf}..={} of epoch {e} covers the live copy {}..={}",
+                            h.last,
+                            t.first,
+                            t.last
+                        );
                     }
                 }
             }
