@@ -5956,21 +5956,16 @@ fn regression_a_claim_racing_a_rival_during_its_kept_fetch_finds_no_gap() {
 /// row the log carried natively when the union was formed: a union is
 /// contiguous across the log's rows only), and the merge counted the copies
 /// past the hole as past a gap. Not a gap: the seq is within the union.
-/// Seeds 9, 22 and 175 now end in the benign `tail_done_skipped` overlap that
-/// strict identity fails on (the rows the union carried are in the log
-/// already), so they are not pinned here; 89, 44 and 101 are clean. Fails
-/// before: the assertion in a debug build; in release `kept_past_gap` is
+/// The `drop-held-chain-backed` seeds (9, 22, 89, 175) now end in the benign
+/// `tail_done_skipped` overlap that strict identity fails on (the rows the
+/// union carried are in the log already), so only 44 and 101 are pinned.
+/// Fails before: the assertion in a debug build; in release `kept_past_gap` is
 /// above 0.
 #[test]
 fn regression_a_seq_between_kept_copies_within_the_carried_union_is_no_gap() {
     for (seed, cfg, alias) in [
         (
-            89u64,
-            drop_held_chain_backed_config(),
-            "drop-held-chain-backed",
-        ),
-        (
-            44,
+            44u64,
             strict(metered_shared_config(), "links"),
             "metered-shared+links",
         ),
