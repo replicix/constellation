@@ -2284,3 +2284,53 @@ fn a_replay_of_a_re_shipped_row_whose_identity_was_retired_journals_without_it()
         "the redo ships: {rows:?}"
     );
 }
+
+/// The exclusion of the ops the drop rolled back holds only while the node
+/// is the sequencer (it replaces the pre-ADR-59-part-B pin of the same
+/// property, `exclude_rolled_back: false`). A dropper applying its record
+/// without the lease journals no refusal, so the op's retry by rid reaches
+/// the successor with no outcome of it and names its chunk like any other op:
+/// the chunk's pending row and mark stay held. Fail before: the apply
+/// excluded the rolled-back op whatever the lease, and removed the row.
+#[test]
+fn an_op_the_drop_rolled_back_keeps_its_chunk_when_the_apply_has_no_lease() {
+    use constellation_meta::RowCommit;
+    let lost = ChunkHash::of(b"bytes that are gone");
+    for (sequencer, kept) in [(true, false), (false, true)] {
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_node_prefix(1).unwrap();
+        meta.set_holder_epoch(1);
+        let file = meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap().ino;
+        let rows = batch(&meta);
+        ship(&meta, &rows, 1);
+        meta.add_pending_upload(&lost, file).unwrap();
+        let seed = rid_of(1, 9);
+        exec_as(
+            &meta,
+            RowCommit::LONE,
+            seed,
+            &MutateOp::SetManifest {
+                ino: file,
+                base_manifest: None,
+                manifest: manifest_naming(lost, 19),
+                size: 19,
+                mtime_ns: None,
+                ctime_ns: None,
+            },
+        );
+        meta.note_unrecoverable_chunks(&[(lost, file)], true)
+            .unwrap();
+        let sessions = constellation_meta::LiveSessions::default();
+        let decided = meta
+            .drop_held_knowing(file, 1, false, &|_| false, &|_| vec![seed], &sessions, true)
+            .unwrap();
+        assert!(decided.pending.is_some(), "{decided:?}");
+        let dropped = meta
+            .drop_held_apply(file, 1, &|_| false, &|_| vec![seed], &sessions, sequencer)
+            .unwrap();
+        assert_eq!(dropped.rolled_back, vec![seed], "{dropped:?}");
+        assert_eq!(!dropped.kept_pending.is_empty(), kept, "{dropped:?}");
+        assert_eq!(dropped.pending_removed, usize::from(!kept), "{dropped:?}");
+        assert_eq!(dropped.deposed, !sequencer);
+    }
+}
