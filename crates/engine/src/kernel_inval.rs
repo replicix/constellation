@@ -162,6 +162,21 @@ const WATCHDOG_TICK: Duration = Duration::from_secs(1);
 /// often.
 const WATCHDOG_REPEAT: Duration = Duration::from_secs(30);
 
+/// A drop is logged at most this often; the ones in between are counted
+/// (`Stats::dropped`) and the next line says how many it stands for.
+const DROP_WARN_EVERY: Duration = Duration::from_secs(5);
+
+/// Rate limiter for the drop warning: `Some(n)` when a line is due now, `n`
+/// being the drops since the last line that it does not report separately.
+fn drop_warning(last: &mut Option<Instant>, suppressed: &mut u64, now: Instant) -> Option<u64> {
+    if last.is_some_and(|at| now.duration_since(at) < DROP_WARN_EVERY) {
+        *suppressed += 1;
+        return None;
+    }
+    *last = Some(now);
+    Some(std::mem::take(suppressed))
+}
+
 /// One thing to invalidate, in replica inode numbers.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Inval {
@@ -861,6 +876,8 @@ fn run(shared: Arc<Shared>) {
     let mut pending: BTreeMap<Inval, Pending> = BTreeMap::new();
     let mut to_send: Vec<Inval> = Vec::new();
     let mut to_drop: Vec<Inval> = Vec::new();
+    let mut last_drop_warn: Option<Instant> = None;
+    let mut drops_unlogged: u64 = 0;
     loop {
         // Decide under the lock, act outside it: a FUSE worker's
         // `InFlightGuard` must never wait behind a notification that is
@@ -958,14 +975,25 @@ fn run(shared: Arc<Shared>) {
                 continue;
             };
             shared.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                target: "constellation::kernel_inval",
-                what = %inval,
-                held_back_for = ?shared.defer_max,
-                "kernel cache invalidation dropped: a request was in flight on its inode for \
-                 the whole TTL, so no entry or attribute the kernel cached before it is left \
-                 to drop (its pages are: the frontend is told)"
-            );
+            // A warning, not a debug line: the kernel may now hold an entry
+            // or attribute the replica no longer has (DESIGN invariant 1:
+            // kernel caches are never staler than the replica) until its TTL
+            // runs out. Rare in practice; rate-limited all the same.
+            if let Some(also) =
+                drop_warning(&mut last_drop_warn, &mut drops_unlogged, Instant::now())
+            {
+                tracing::warn!(
+                    target: "constellation::kernel_inval",
+                    what = %inval,
+                    ino = ?inval.gate(),
+                    in_flight_for = ?now_since(p.since),
+                    defer_max = ?shared.defer_max,
+                    also_dropped_since_last_line = also,
+                    "kernel cache invalidation dropped: a request was in flight on its inode \
+                     for the whole TTL, so no entry or attribute the kernel cached before it \
+                     is left to drop (its pages are: the frontend is told)"
+                );
+            }
             // Pages have no TTL (module doc): the frontend learns that
             // this one never reached its kernel.
             undelivered(&views, &inval, p.except);
@@ -980,6 +1008,10 @@ fn run(shared: Arc<Shared>) {
             shared.stats.deferred.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+fn now_since(t: Instant) -> Duration {
+    Instant::now().saturating_duration_since(t)
 }
 
 fn send(views: &[ViewSink], inval: &Inval, except: Option<u64>) {
@@ -1312,6 +1344,31 @@ mod tests {
         assert_eq!(
             rec.wait_for(1, Duration::from_secs(5)),
             vec!["inode 7 data=false"]
+        );
+    }
+
+    #[test]
+    fn every_dropped_notification_is_counted_and_the_warning_is_rate_limited() {
+        let (k, _rec) = started(Duration::from_millis(100));
+        let _guard = k.inflight().enter(&[7, 8]);
+        assert!(!k.inodes().invalidate_and_wait(7, Duration::from_secs(5)));
+        assert!(!k.inodes().invalidate_and_wait(8, Duration::from_secs(5)));
+        assert_eq!(k.stats().dropped.load(Ordering::Relaxed), 2);
+
+        let t0 = Instant::now();
+        let (mut last, mut n) = (None, 0);
+        assert_eq!(drop_warning(&mut last, &mut n, t0), Some(0));
+        assert_eq!(
+            drop_warning(&mut last, &mut n, t0 + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            drop_warning(&mut last, &mut n, t0 + Duration::from_secs(2)),
+            None
+        );
+        assert_eq!(
+            drop_warning(&mut last, &mut n, t0 + DROP_WARN_EVERY),
+            Some(2)
         );
     }
 

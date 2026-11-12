@@ -1011,6 +1011,14 @@ impl EngineControl {
             },
             log: log_status(&self.log_buffer.stats()),
             readdir: readdir_status(&self.engine.listing_stats()),
+            kernel_inval: {
+                let (sent, deferred, dropped) = self.engine.kernel_inval_counts();
+                api::KernelInvalStatus {
+                    sent,
+                    deferred,
+                    dropped,
+                }
+            },
         }
     }
 

@@ -705,6 +705,24 @@ pub struct StatusReport {
     /// and the pins of open directories). Node-wide: every view of the node
     /// shares one cache.
     pub readdir: ReaddirStatus,
+    /// Plan 30 §M7: the kernel cache invalidations this node writes.
+    pub kernel_inval: KernelInvalStatus,
+}
+
+/// What the node's kernel cache invalidator did since start.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct KernelInvalStatus {
+    /// Notifications written to the views.
+    pub sent: u64,
+    /// Decision rounds that left a notification waiting for a request in
+    /// flight on its inode.
+    pub deferred: u64,
+    /// Notifications dropped because a request stayed in flight on the inode
+    /// past the bound (entries and attributes: the kernel's TTL covers them;
+    /// pages: the frontend was told). Each can leave the kernel cache staler
+    /// than the replica for up to a TTL (DESIGN invariant 1); non-zero is
+    /// worth a look.
+    pub dropped: u64,
 }
 
 /// The daemon's log writer (plan 44): one queue between every logging

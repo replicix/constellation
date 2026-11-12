@@ -2207,6 +2207,18 @@ impl Engine {
         views
     }
 
+    /// The kernel invalidator's counters: sent, deferred, dropped.
+    pub fn kernel_inval_counts(&self) -> (u64, u64, u64) {
+        self.kernel_inval.as_ref().map_or((0, 0, 0), |k| {
+            let s = k.stats();
+            (
+                s.sent.load(Ordering::Relaxed),
+                s.deferred.load(Ordering::Relaxed),
+                s.dropped.load(Ordering::Relaxed),
+            )
+        })
+    }
+
     /// Wait until every cache invalidation queued so far has been
     /// delivered to the views' [`FrontendEvents`] (or dropped as
     /// redundant): `true` then, `false` if `timeout` ran out first (see

@@ -558,6 +558,11 @@ pub fn render_metrics(status: &StatusReport, sched: Option<&SnapSchedReport>) ->
         status.fsync.interrupted
     );
     gauge!(
+        "constellation_kernel_inval_dropped_total",
+        "Kernel cache invalidations dropped because a request stayed in flight on the inode past the bound.",
+        status.kernel_inval.dropped
+    );
+    gauge!(
         "constellation_held_transactions",
         "Journaled transactions held back behind unrecoverable pending chunks.",
         status.held.transactions
