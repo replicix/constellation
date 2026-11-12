@@ -4146,13 +4146,28 @@ fn atime_eventual(seed: u64) -> Result<()> {
     writer.mount()?;
     reader.mount()?;
 
-    // The writer (partition holder) creates a file; the reader must see it.
+    // The writer (partition holder) creates a file; the reader must see it
+    // *with its content*. Under `--cto bounded` (the default) the reader's
+    // replica may not yet have the data commit: the create and the data
+    // commit ship in separate segments, so the file can show up empty
+    // first. A read then returns EOF from the replica's size 0 without
+    // recording an atime bump, and this scenario would wait out its bound
+    // for an update that no read ever asked for (a load-dependent flake).
+    // Wait for the reader's own `stat` to show the full size.
     std::fs::write(writer.mnt.join("shared.txt"), b"hello atime")?;
+    let mut baseline = None;
     eventually(
-        "shared file visible on reader",
+        "shared file visible on reader with its content",
         Duration::from_secs(20),
         || {
-            anyhow::ensure!(reader.mnt.join("shared.txt").is_file(), "not yet on reader");
+            let md = std::fs::metadata(reader.mnt.join("shared.txt"))
+                .context("shared file not yet on reader")?;
+            anyhow::ensure!(
+                md.is_file() && md.len() == b"hello atime".len() as u64,
+                "reader sees {} bytes, not the written content yet",
+                md.len()
+            );
+            baseline = md.accessed().ok();
             Ok(())
         },
     )?;
@@ -4161,11 +4176,14 @@ fn atime_eventual(seed: u64) -> Result<()> {
     // reaches FUSE rather than the page cache) → a bump forwarded to the
     // holder. Force the holder to ship by writing a sibling so the bump
     // rides along a segment.
-    let baseline = std::fs::metadata(reader.mnt.join("shared.txt"))?
-        .accessed()
-        .ok();
     std::thread::sleep(Duration::from_secs(1));
-    let _ = std::fs::read(reader.mnt.join("shared.txt")).context("cold read on reader")?;
+    let got = std::fs::read(reader.mnt.join("shared.txt")).context("cold read on reader")?;
+    anyhow::ensure!(
+        got == b"hello atime",
+        "the cold read on the reader returned {} bytes ({:?}), so it cannot have bumped atime",
+        got.len(),
+        String::from_utf8_lossy(&got)
+    );
     std::fs::write(writer.mnt.join("marker.txt"), b"x")?;
 
     // The writer's replica (authoritative) must observe atime advance.
