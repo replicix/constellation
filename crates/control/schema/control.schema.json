@@ -4576,6 +4576,35 @@
       "type": "object"
     },
     "JsonValue": {},
+    "KernelInvalStatus": {
+      "description": "What the node's kernel cache invalidator did since start.",
+      "properties": {
+        "deferred": {
+          "description": "Decision rounds that left a notification waiting for a request in\nflight on its inode.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dropped": {
+          "description": "Notifications dropped because a request stayed in flight on the inode\npast the bound (entries and attributes: the kernel's TTL covers them;\npages: the frontend was told). Each can leave the kernel cache staler\nthan the replica for up to a TTL (DESIGN invariant 1); non-zero is\nworth a look.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sent": {
+          "description": "Notifications written to the views.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sent",
+        "deferred",
+        "dropped"
+      ],
+      "type": "object"
+    },
     "LeaseStatus": {
       "description": "Partition lease state (DESIGN.md §4). `held` is this node's own\nauthority; `holder`/`epoch` also describe the *foreign* holder once\nthis node has been deposed, which is what `lost` reports.",
       "properties": {
@@ -9989,6 +10018,10 @@
           "$ref": "#/$defs/InboxStatus",
           "description": "Plan 30 §M13: the S3 inbox (forwarding without P2P)."
         },
+        "kernel_inval": {
+          "$ref": "#/$defs/KernelInvalStatus",
+          "description": "Plan 30 §M7: the kernel cache invalidations this node writes."
+        },
         "lease": {
           "$ref": "#/$defs/LeaseStatus",
           "description": "Write authority for the one metadata stream (`p0`)."
@@ -10170,7 +10203,8 @@
         "fuse",
         "clock",
         "log",
-        "readdir"
+        "readdir",
+        "kernel_inval"
       ],
       "type": "object"
     },
