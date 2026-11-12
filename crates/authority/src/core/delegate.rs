@@ -12817,6 +12817,50 @@ impl Core {
         self.sticky_release_progress(now, replica, out);
     }
 
+    /// ADR-55: the root, as the holder of its own stream `gen`, releases
+    /// `dirs` by its own decision (the long dwell, a cross-subtree op): the
+    /// command the holder's release is (`Control::StickyRelease`), drained
+    /// and journaled by [`Self::sticky_release_progress`] and appended inline.
+    pub(crate) fn own_sticky_release(
+        &mut self,
+        now: Now,
+        gen: u64,
+        dirs: BTreeSet<Ino>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let mut pool = self.sticky_held(gen, replica);
+        for c in &self.dl.sticky_cmds {
+            if let Some(p) = c.parts.get(&gen) {
+                pool.extend(p.iter().copied());
+            }
+        }
+        let pick: BTreeSet<Ino> = pool.intersection(&dirs).copied().collect();
+        if pick.is_empty() {
+            return;
+        }
+        if self
+            .dl
+            .sticky_cmds
+            .iter()
+            .any(|c| c.parts.get(&gen).is_some_and(|p| pick.is_subset(p)))
+        {
+            // (A release of the same subtrees is under way: one wait for it.)
+            return;
+        }
+        self.stats.place_root_own_released += 1;
+        self.dl.sticky_cmds.push(StickyReleaseCmd {
+            op: None,
+            started: now.wait,
+            deadline: now.wait.plus(self.leave_wait_ms() as u64),
+            parts: BTreeMap::from([(gen, pick)]),
+            handover: false,
+            root: 0,
+            made_at: self.dl.step,
+        });
+        self.sticky_release_progress(now, replica, out);
+    }
+
     /// Every event and tick: release what has drained, answer the commands
     /// that are done, give up on the ones out of time.
     pub(crate) fn sticky_release_progress(

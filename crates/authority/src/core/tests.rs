@@ -78733,3 +78733,653 @@ mod stale_lease {
         assert_eq!(h.core.fresh_now().wall, h.clk().wall.plus(20_000));
     }
 }
+
+/// Plan 46 M1.3 step 9 (ADR-55): the root's own sticky grants.
+mod root_own_sticky {
+    use super::*;
+    use crate::replica::Replica;
+    use constellation_fs_core::Ino;
+    use constellation_meta::SubtreeKind;
+
+    /// The root (node 1, the lease held, epoch 1) with a peer (node 2) at
+    /// `rtt_ms` on its roster, and two directories `w1`, `w2`.
+    fn root_with_peer(rtt_ms: Option<u64>) -> (Harness, Vec<Ino>) {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.placement = true;
+        h.core.cfg.placement_min_ops = 20;
+        h.hold(1, None);
+        let mut dirs = Vec::new();
+        for name in ["w1", "w2"] {
+            let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+            let rec = LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: name.into(),
+                ino,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            };
+            Replica::apply_segment(&h.meta, dirs.len() as u64 + 1, 1, 0, &[], &[], &[rec]).unwrap();
+            dirs.push(ino);
+        }
+        h.step(roster_ev(vec![1, 2], WaitMs(i64::MAX)));
+        link_to_2(&mut h, rtt_ms);
+        (h, dirs)
+    }
+
+    fn link_to_2(h: &mut Harness, rtt_ms: Option<u64>) {
+        h.step(Event::Peers {
+            registry_complete: true,
+            links: vec![crate::event::PeerLink {
+                node: 2,
+                connected: true,
+                last_seen: Some(w(h.now)),
+                rtt_ms,
+                since: Some(w(h.now)),
+            }],
+            lapses: 0,
+        });
+    }
+
+    fn tick(h: &mut Harness) -> Vec<Action> {
+        let (now, mut out) = (h.now, Vec::new());
+        h.core
+            .on_placement_timer(Now::same(now.0), &h.meta, &mut out);
+        out
+    }
+
+    /// The root writes `dir` (40 ops) and the placement runs once.
+    fn root_dominates(h: &mut Harness, dir: Ino) {
+        for _ in 0..40 {
+            h.core.place_note(1, [dir]);
+        }
+        tick(h);
+    }
+
+    fn own_grant_of(h: &Harness, dir: Ino) -> Option<constellation_meta::delegation::Delegation> {
+        h.meta
+            .delegation_table()
+            .get(dir)
+            .filter(|d| d.node == 1 && d.kind == SubtreeKind::Sticky)
+    }
+
+    fn create_in(h: &Harness, dir: Ino, name: &str) -> MutateOp {
+        MutateOp::Create {
+            parent: dir,
+            name: name.into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        }
+    }
+
+    fn submit_in(h: &mut Harness, seq: u64, dir: Ino, name: &str) -> (Rid, Vec<Action>) {
+        let rid = h.rid(seq);
+        let op = create_in(h, dir, name);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        (rid, out)
+    }
+
+    fn accepted(out: &[Action], rid: Rid) -> bool {
+        replies(out).iter().any(|(r, reply)| {
+            *r == rid && matches!(reply, ClientReply::Outcome(MutateOutcome::Accepted { .. }))
+        })
+    }
+
+    /// The archive carries what the root journaled; the root takes a step.
+    fn archive_and_step(h: &mut Harness) -> Vec<Action> {
+        let mut out = h.archive_lands();
+        out.extend(h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        }));
+        out
+    }
+
+    /// Test 1 (fail-before: main skips `node == me`, and the root has no
+    /// grant).
+    #[test]
+    fn the_root_takes_a_sticky_grant_on_a_subtree_it_dominates_with_far_peers() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("the root holds a sticky grant on /w1");
+        assert_eq!(d.dir, dirs[0]);
+        assert!(own_grant_of(&h, dirs[1]).is_none());
+        assert!(h.meta.delegation_table().get(ROOT_INO).is_none());
+    }
+
+    /// Test 2: never `/`, whoever asks (R-I1); the knob's unit check.
+    #[test]
+    fn the_roots_own_grant_is_never_on_slash() {
+        let (mut h, _dirs) = root_with_peer(Some(500));
+        let mut out = Vec::new();
+        for source in [
+            crate::core::delegate::GrantSource::Placement,
+            crate::core::delegate::GrantSource::Operator,
+        ] {
+            let why = h
+                .core
+                .delegate_dir_from(
+                    source,
+                    h.clk(),
+                    ROOT_INO,
+                    1,
+                    DelegKind::Sticky,
+                    &h.meta,
+                    &mut out,
+                )
+                .expect_err("a grant on /");
+            assert!(why.contains("never delegated"), "{why}");
+        }
+        assert!(h.core.dl.gens.is_empty());
+        h.core.cfg.root_sticky_on_slash = true;
+        h.core
+            .delegate_dir_from(
+                crate::core::delegate::GrantSource::Placement,
+                h.clk(),
+                ROOT_INO,
+                1,
+                DelegKind::Sticky,
+                &h.meta,
+                &mut out,
+            )
+            .expect("the knob makes the grant");
+    }
+
+    /// Test 3 (R-I2): a singleton, a root with a backup and one in an epoch
+    /// propose no grant for themselves; an operator never names the root.
+    #[test]
+    fn no_own_grant_for_a_singleton_nor_with_a_backup_nor_in_an_epoch() {
+        // A singleton: the roster lists no write-eligible peer.
+        let (mut h, dirs) = root_with_peer(Some(500));
+        h.core.roster.make_singleton_for_test(1);
+        root_dominates(&mut h, dirs[0]);
+        assert!(own_grant_of(&h, dirs[0]).is_none(), "a singleton's grant");
+        // A group: the lease lists a backup.
+        let (mut h, dirs) = root_with_peer(Some(500));
+        h.core.lease.held.as_mut().unwrap().0.backups = vec![2];
+        h.core.lease.held.as_mut().unwrap().0.ack_policy =
+            constellation_store_s3::AckPolicy::Backup;
+        root_dominates(&mut h, dirs[0]);
+        assert!(own_grant_of(&h, dirs[0]).is_none(), "a grant with a backup");
+        // A continuation epoch.
+        let (mut h, dirs) = root_with_peer(Some(500));
+        h.core.epoch.open = true;
+        root_dominates(&mut h, dirs[0]);
+        assert!(own_grant_of(&h, dirs[0]).is_none(), "a grant in an epoch");
+        // The control's `delegate` never names the root.
+        let (mut h, dirs) = root_with_peer(Some(500));
+        let out = h.step(Event::Control {
+            op: OpId(900),
+            req: Control::Delegate {
+                dir: dirs[0],
+                node: 1,
+                sticky: true,
+            },
+        });
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::ControlDone { result: Err(_), .. })),
+            "{out:?}"
+        );
+        // The knob off: the rest of the placement is as it was.
+        let (mut h, dirs) = root_with_peer(Some(500));
+        h.core.cfg.placement_root_sticky = false;
+        root_dominates(&mut h, dirs[0]);
+        assert!(own_grant_of(&h, dirs[0]).is_none());
+    }
+
+    /// Test 4 (R-I3): the root executes under its own grant once the
+    /// archive carries the record: the first own op parks, the next is
+    /// answered at once.
+    #[test]
+    fn the_root_installs_and_honours_its_own_grant_once_the_record_is_archived() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        // Not archived: the first op parks (nothing is journaled for it, and
+        // the root's own path does not run it).
+        let tip = h.meta.journal_tip().unwrap();
+        let (rid1, out) = submit_in(&mut h, 1, dirs[0], "a");
+        assert!(
+            !accepted(&out, rid1),
+            "answered before the record is archived: {out:?}"
+        );
+        assert_eq!(
+            h.meta.journal_tip().unwrap(),
+            tip,
+            "journaled before the commit"
+        );
+        assert!(h.core.dl.mine.contains_key(&d.gen), "not installed");
+        // The engine's fast path is told to leave it to the core meanwhile.
+        let mut view = crate::core::DelegView::default();
+        h.core.deleg_view_local(&mut view);
+        assert!(view.mine[0].3, "published as honoured before the archive");
+        // The archive carries the record: the parked op runs in the stream.
+        let out = archive_and_step(&mut h);
+        assert!(accepted(&out, rid1), "the parked op did not run: {out:?}");
+        let mut view = crate::core::DelegView::default();
+        h.core.deleg_view_local(&mut view);
+        assert!(!view.mine[0].3, "still published as stopped");
+        assert!(h.meta.delegate_idx(d.gen).unwrap() >= 1);
+        // The second is answered at its step.
+        let (rid2, out) = submit_in(&mut h, 2, dirs[0], "b");
+        assert!(accepted(&out, rid2), "{out:?}");
+        // An op in the root's keys is the root's own, as before.
+        let (rid3, out) = submit_in(&mut h, 3, ROOT_INO, "c");
+        assert!(
+            !accepted(&out, rid3),
+            "a root op waits for the archive: {out:?}"
+        );
+        assert!(accepted(&archive_and_step(&mut h), rid3));
+    }
+
+    /// Test 5: the root's own rows in the grant are `Final`: no archive
+    /// wait, no stale-lease hold with the clock past the lease.
+    #[test]
+    fn the_roots_own_rows_are_answered_final_without_the_archive() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        archive_and_step(&mut h);
+        h.advance(60_000);
+        let (rid, out) = submit_in(&mut h, 1, dirs[0], "a");
+        assert!(accepted(&out, rid), "{out:?}");
+        assert_eq!(
+            h.meta.journal_classes_of_rid(rid).unwrap(),
+            vec![constellation_meta::RowCommit::FINAL]
+        );
+    }
+
+    /// Test 6: the stream is appended inline: no send to the root itself
+    /// leaves the core, and the log's index of the stream advances.
+    #[test]
+    fn the_roots_own_stream_is_appended_inline() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        let mut all = archive_and_step(&mut h);
+        for i in 0..3 {
+            let (rid, out) = submit_in(&mut h, 1 + i, dirs[0], &format!("f{i}"));
+            assert!(accepted(&out, rid), "{out:?}");
+            all.extend(out);
+        }
+        all.extend(archive_and_step(&mut h));
+        for _ in 0..4 {
+            h.advance(h.core.cfg.delegation_stream_tick_ms + 1);
+            if let Some(id) = h.core.dl.stream_timer {
+                all.extend(h.step(Event::Timer { id }));
+            }
+        }
+        assert!(
+            sends(&all).iter().all(|(to, _)| *to != 1),
+            "a message to the node itself left the core"
+        );
+        assert_eq!(h.meta.delegate_idx(d.gen).unwrap(), 3);
+        assert_eq!(
+            h.core.dl.gens[&d.gen].cursor, 3,
+            "the stream was not appended"
+        );
+        assert_eq!(
+            h.meta.log_stream_idx(d.gen).unwrap(),
+            0,
+            "the log's index is the log's: a self-append does not raise it"
+        );
+        assert!(h.core.stats.self_sends > 0);
+    }
+
+    /// The root loses its lease to node 2 before its journal shipped, and
+    /// recovers as a node that is not the root (the steps of the deposition
+    /// recovery: the core's `deposed`, the journal's strand below the new
+    /// epoch, the lease's clear).
+    fn depose_to_node_2(h: &mut Harness) -> Vec<Action> {
+        let mut out = Vec::new();
+        h.core.deposed(h.clk(), 2, 2, 1, &h.meta, &mut out);
+        h.meta.strand_below_epoch(2).unwrap();
+        h.meta.set_holder_epoch(0);
+        h.core.lease.clear_lost();
+        h.core.lease.held = None;
+        h.core.lease.cached_holder = Some(2);
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        out
+    }
+
+    /// Test 7 (breakdown Q4): a deposed root that is alive keeps its grant:
+    /// its stream rows are holder rows, neither stranded nor member-copied
+    /// by the deposition, and it streams them to the next root; its own ops
+    /// in the subtree go on being answered `Final`.
+    #[test]
+    fn a_deposed_root_streams_its_own_grant_to_the_next_root() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        let record = h.meta.journal_tip().unwrap();
+        archive_and_step(&mut h);
+        // (The harness's archive does not retire the journal: the shipped
+        // record's row is acknowledged by hand.)
+        constellation_meta::MetaStore::ack_journal(&h.meta, record).unwrap();
+        for i in 0..2 {
+            let (rid, out) = submit_in(&mut h, 1 + i, dirs[0], &format!("f{i}"));
+            assert!(accepted(&out, rid), "{out:?}");
+        }
+        let rows = constellation_meta::MetaStore::journal_len(&h.meta).unwrap();
+        assert!(rows >= 2);
+        let mut first = depose_to_node_2(&mut h);
+        assert!(
+            h.meta.pending_replays().unwrap().is_empty(),
+            "a stream row was replayed"
+        );
+        assert_eq!(
+            constellation_meta::MetaStore::journal_len(&h.meta).unwrap(),
+            rows,
+            "the deposition took rows of the stream out of the journal"
+        );
+        assert!(h.core.dl.mine.contains_key(&d.gen), "the grant was dropped");
+        // The stream goes to the new root, from the start (the log holds none
+        // of it).
+        h.advance(h.core.cfg.delegation_stream_tick_ms + 1);
+        let mut batch = None;
+        for _ in 0..4 {
+            let out = h.step(Event::Activity {
+                last_write: WaitMs(0),
+                acked_seqs: Vec::new(),
+            });
+            let mut all = out;
+            all.append(&mut first);
+            if let Some(id) = h.core.dl.stream_timer {
+                all.extend(h.step(Event::Timer { id }));
+            }
+            // The node is no root now: a final row leaves it once it is on
+            // its disk (the designee's rule), which the driver confirms.
+            let syncs: Vec<(u64, u64)> = all
+                .iter()
+                .filter_map(|a| match a {
+                    Action::SyncDelegStream { gen, through } => Some((*gen, *through)),
+                    _ => None,
+                })
+                .collect();
+            for (gen, through) in syncs {
+                all.extend(h.step(Event::DelegStreamSynced {
+                    gen,
+                    through,
+                    ok: true,
+                }));
+            }
+            batch = batch.or_else(|| {
+                sends(&all).into_iter().find_map(|(to, m)| match m {
+                    PeerMsg::DelegateStream {
+                        req,
+                        gen,
+                        round,
+                        txs,
+                        ..
+                    } if to == 2 && *gen == d.gen => {
+                        Some((*req, *round, txs.iter().map(|t| t.idx).collect::<Vec<_>>()))
+                    }
+                    _ => None,
+                })
+            });
+            if batch.is_some() {
+                break;
+            }
+            h.advance(h.core.cfg.delegation_stream_tick_ms + 1);
+        }
+        let (req, round, idxs) = batch.expect("the stream did not go to the new root");
+        assert_eq!(idxs, vec![1, 2], "not re-streamed from the start");
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegateStreamAck {
+                req,
+                gen: d.gen,
+                round,
+                through: 2,
+                committed: 0,
+                refused: false,
+                archive_bound: false,
+            },
+        });
+        assert_eq!(h.core.dl.mine[&d.gen].streamed_through, 2);
+        // Its own later op in the subtree is final at its step.
+        let (rid, out) = submit_in(&mut h, 9, dirs[0], "late");
+        assert!(accepted(&out, rid), "{out:?}");
+        assert_eq!(
+            h.meta.journal_classes_of_rid(rid).unwrap(),
+            vec![constellation_meta::RowCommit::FINAL]
+        );
+    }
+
+    /// A forward into the subtree from node 2, routed by `routed_gen`.
+    fn forward_into(
+        h: &mut Harness,
+        dir: Ino,
+        seq: u64,
+        routed_gen: u64,
+        settle: bool,
+    ) -> Vec<Action> {
+        let op = create_in(h, dir, &format!("fw{seq}"));
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(500 + seq),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq,
+                },
+                op,
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle,
+                routed_gen,
+                touched_gen: routed_gen,
+                inbox_ever: false,
+            },
+        })
+    }
+
+    fn outcome_to(out: &[Action], to: NodeId) -> Option<MutateOutcome> {
+        sends(out).into_iter().find_map(|(t, m)| match m {
+            PeerMsg::MutateReply { outcome, .. } if t == to => Some(outcome.clone()),
+            _ => None,
+        })
+    }
+
+    /// Test 8 (R-I4, ADR-47 rule 1 at the root): the root as holder runs a
+    /// forward only if it was routed by its generation; an unrouted one is
+    /// fenced and nothing is journaled.
+    #[test]
+    fn the_root_holder_fences_an_unrouted_forward_into_its_own_subtree() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        archive_and_step(&mut h);
+        let tip = h.meta.journal_tip().unwrap();
+        let out = forward_into(&mut h, dirs[0], 1, 0, false);
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Fenced { gen: d.gen }),
+            "{out:?}"
+        );
+        assert_eq!(h.meta.journal_tip().unwrap(), tip, "journaled");
+        assert_eq!(h.core.stats.deleg_fenced_forwards, 1);
+        // Routed by the grant, the same forward runs in the stream.
+        let out = forward_into(&mut h, dirs[0], 2, d.gen, false);
+        assert!(
+            matches!(outcome_to(&out, 2), Some(MutateOutcome::Accepted { .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.core.dl.mine[&d.gen].executed, 1);
+    }
+
+    /// Test 9 (R-I4): an op under the root's own live generation that the
+    /// delegate executor did not take (the stream is stopped for a moment)
+    /// is held, never refused (`EROFS`) and never run by the root's path.
+    #[test]
+    fn the_root_path_holds_never_refuses_an_op_under_its_own_grant() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        archive_and_step(&mut h);
+        h.core.dl.mine.get_mut(&d.gen).unwrap().stopped = true;
+        let tip = h.meta.journal_tip().unwrap();
+        let out = forward_into(&mut h, dirs[0], 1, d.gen, false);
+        assert!(
+            !matches!(outcome_to(&out, 2), Some(MutateOutcome::Errno(_))),
+            "{out:?}"
+        );
+        assert_eq!(h.meta.journal_tip().unwrap(), tip);
+        assert_eq!(h.core.stats.root_own_holds, 1, "{out:?}");
+        // The negative control: with the knob the root's own path runs it.
+        h.core.cfg.root_executes_under_own_grant = true;
+        let out = forward_into(&mut h, dirs[0], 2, d.gen, false);
+        assert_eq!(
+            h.core.stats.root_own_holds, 1,
+            "the knob left the hold in place: {out:?}"
+        );
+        assert!(!matches!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Errno(_))
+        ));
+    }
+
+    /// Test 10: the root releases its own idle subtree after the long dwell,
+    /// as the holder: a release row, no recall of the placement.
+    #[test]
+    fn the_root_releases_its_own_idle_subtree_after_the_long_dwell() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        archive_and_step(&mut h);
+        // Nothing is written there for many dwells.
+        for _ in 0..3 {
+            // (A window's worth of ticks, so the root's earlier writes have
+            // left the placement's window.)
+            for _ in 0..40 {
+                h.advance(h.core.cfg.placement_dwell_ms / 40 + 1_000);
+                h.hold(1, None);
+                tick(&mut h);
+            }
+            archive_and_step(&mut h);
+        }
+        assert_eq!(h.core.stats.place_root_own_released, 1);
+        assert_eq!(h.core.stats.deleg_sticky_recalled_other, 0);
+        assert_eq!(h.core.stats.place_recalled, 0);
+        assert!(
+            h.meta.delegation_table().get(dirs[0]).is_none(),
+            "the subtree is still granted"
+        );
+        assert!(h.core.dl.gens[&d.gen].ended || h.core.dl.gens[&d.gen].dirs.is_empty());
+    }
+
+    /// Test 12 (pins today's claim; step 12 changes it): a node that claims
+    /// the lease and finds a stream of its own in the table ends it, the
+    /// root executing the subtree itself.
+    #[test]
+    fn a_reclaiming_former_root_ends_its_own_stream_at_the_claim() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let records = vec![
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "w1".into(),
+                ino,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+            LogRecord::DelegateNode {
+                node: 1,
+                gen: 7,
+                dirs: vec![constellation_meta::SubtreeGrant {
+                    dir: ino,
+                    kind: SubtreeKind::Sticky,
+                }],
+            },
+        ];
+        Replica::install_streamed(&h.meta, 1, 1, 1, 2, &records, true, (0, 0)).unwrap();
+        h.hold(2, None);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.dl.gens.get(&7).is_none_or(|g| g.ended),
+            "the claimant keeps a stream of its own as the root's generation"
+        );
+    }
+
+    /// Test 11 (Q3): an op of the root across the boundary of its own sticky
+    /// subtree releases the grant (the holder's decision) and runs on the
+    /// root's keys after the release row, instead of `EXDEV`.
+    #[test]
+    fn a_root_own_cross_subtree_op_releases_its_grant_instead_of_exdev() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        archive_and_step(&mut h);
+        // A name of the root's, to be renamed into the subtree.
+        let x = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let mk = LogRecord::Create {
+            parent: ROOT_INO,
+            name: "x".into(),
+            ino: x,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        };
+        Replica::apply_segment(&h.meta, 5, 1, 0, &[], &[], &[mk]).unwrap();
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Rename {
+                parent: ROOT_INO,
+                name: "x".into(),
+                new_parent: dirs[0],
+                new_name: "y".into(),
+                noreplace: false,
+            },
+            tag: Default::default(),
+        });
+        assert!(
+            !replies(&out).iter().any(|(r, reply)| *r == rid
+                && matches!(
+                    reply,
+                    ClientReply::Outcome(MutateOutcome::Errno(Code::CrossDevice))
+                )),
+            "EXDEV at the root's own boundary: {out:?}"
+        );
+        assert_eq!(h.core.stats.root_own_released_for_cross, 1);
+        // The release row is appended inline; the op runs after it.
+        let mut all = out;
+        for _ in 0..6 {
+            all.extend(archive_and_step(&mut h));
+            h.advance(h.core.cfg.delegation_stream_tick_ms + 1);
+            if let Some(id) = h.core.dl.stream_timer {
+                all.extend(h.step(Event::Timer { id }));
+            }
+        }
+        assert!(
+            h.meta.delegation_table().get(dirs[0]).is_none(),
+            "the subtree is still the root's stream"
+        );
+        assert!(h.core.dl.gens[&d.gen].ended || h.core.dl.gens[&d.gen].dirs.is_empty());
+        assert!(
+            replies(&all).iter().any(|(r, reply)| *r == rid
+                && matches!(reply, ClientReply::Outcome(MutateOutcome::Accepted { .. }))),
+            "the op did not run after the release: {all:?}"
+        );
+    }
+}
