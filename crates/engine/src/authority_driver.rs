@@ -806,6 +806,17 @@ pub fn load_config(
                 .as_str(),
             "0" | "off" | "false"
         );
+    // Plan 46 M1.3 step 9 (ADR-55): the root takes its own sticky grants
+    // (`=off`: its own ops wait for the archive, as before).
+    c.placement_root_sticky = c.placement_sticky
+        && !matches!(
+            std::env::var("CONSTELLATION_DELEGATION_ROOT_STICKY")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "off" | "false"
+        );
     c.placement_far_rtt_ms = env_u64_zero_ok(
         "CONSTELLATION_DELEGATION_FAR_RTT_MS",
         c.placement_far_rtt_ms,

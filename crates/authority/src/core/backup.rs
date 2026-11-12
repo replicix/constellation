@@ -2168,6 +2168,24 @@ impl Core {
             && self.durable_jseq_cfg() == u64::MAX
     }
 
+    /// Plan 46 M1.3 step 9 (ADR-55, R-I2): this root's own ops commit by
+    /// the archive: it holds the lease, is no singleton (a write-eligible
+    /// peer is listed), has no group (no backup in the lease or in doubt), no
+    /// continuation epoch and no takeover gate, and is not under `ack=s3`
+    /// (which asks the archive of every answer, a sticky grant's included).
+    /// Exactly when its own ops would otherwise wait for the archive.
+    pub(crate) fn root_commits_by_archive(&self) -> bool {
+        self.lease.held.is_some()
+            && !self.lease.lost
+            && !self.lease.epoch_held()
+            && !self.epoch.open
+            && self.lease.gate.is_none()
+            && self.lease.ack_policy() != AckPolicy::S3
+            && self.lease.backups().is_empty()
+            && self.doubted_backups().next().is_none()
+            && !self.singleton_now()
+    }
+
     /// Plan 46 M1.1 step 2: the one lookup of the commit rule of `stream`'s
     /// configuration, for an answer to `asker`: from the configuration (the
     /// lease, or the generation's group), and for the singleton from the

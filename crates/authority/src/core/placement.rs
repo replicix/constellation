@@ -425,7 +425,7 @@ impl Core {
         replica: &dyn Replica,
     ) -> Result<DelegKind, PlaceSkip> {
         if node == self.cfg.node_id {
-            return self.place_kind_for_root(now, dir);
+            return self.place_kind_for_root(now, dir, replica);
         }
         let ns = replica.namespace();
         let live: Option<DelegKind> = self
@@ -462,9 +462,62 @@ impl Core {
         Ok(DelegKind::Sticky)
     }
 
-    /// The root's own subtrees (step 9): not granted yet.
-    fn place_kind_for_root(&mut self, _now: Now, _dir: Ino) -> Result<DelegKind, PlaceSkip> {
-        Err(PlaceSkip::Root)
+    /// Plan 46 M1.3 step 9 (ADR-55): the kind of grant the root itself gets
+    /// on `dir`: sticky, only while its own ops commit by the archive (a
+    /// write-eligible peer, no group), never on `/`, and never beside a
+    /// designation (a stream never mixes kinds) or inside the quarantine
+    /// of a release it made itself (step 7 D-e).
+    fn place_kind_for_root(
+        &mut self,
+        now: Now,
+        dir: Ino,
+        replica: &dyn Replica,
+    ) -> Result<DelegKind, PlaceSkip> {
+        let me = self.cfg.node_id;
+        let skip = |core: &mut Self| {
+            core.stats.place_skipped_root_own += 1;
+            Err(PlaceSkip::Root)
+        };
+        if !self.cfg.placement_root_sticky
+            || !self.root_commits_by_archive()
+            || (dir == ROOT_INO && !self.cfg.root_sticky_on_slash)
+        {
+            return skip(self);
+        }
+        let ns = replica.namespace();
+        let designating_here = self.dl.designating.keys().any(|k| {
+            super::delegate::is_under(ns, *k, dir) || super::delegate::is_under(ns, dir, *k)
+        });
+        let live = self
+            .dl
+            .gens
+            .values()
+            .find(|g| !g.ended && g.node == me)
+            .map(|g| g.kind());
+        if designating_here
+            || self.place_node_designated(me)
+            || live.is_some_and(|k| k != DelegKind::Sticky)
+        {
+            return skip(self);
+        }
+        // A stream under recall or release is not grown.
+        if self.dl.gens.values().any(|g| {
+            !g.ended
+                && g.node == me
+                && (g.recall != crate::core::delegate::RecallPhase::None || !g.releasing.is_empty())
+        }) {
+            return skip(self);
+        }
+        if self.pl.released.iter().any(|(d, (n, until))| {
+            *n == me
+                && *until > now.wait
+                && (super::delegate::is_under(ns, *d, dir)
+                    || super::delegate::is_under(ns, dir, *d))
+        }) {
+            self.stats.place_quarantined += 1;
+            return skip(self);
+        }
+        Ok(DelegKind::Sticky)
     }
 
     fn place_evaluate(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
@@ -583,20 +636,73 @@ impl Core {
                 self.start_recall(now, gen, out);
             }
         }
+        // 1b. Plan 46 M1.3 step 9 (ADR-55): the root's own sticky stream is
+        // released by the root as its holder, when the root's share or rate
+        // in it has failed for a whole dwell. The decision is the holder's
+        // (`StickyReleaseCmd`, step 5's drain and release row): no recall,
+        // no `deleg_sticky_recalled_*`.
+        let own: Vec<(u64, Vec<Ino>)> = self
+            .dl
+            .gens
+            .iter()
+            .filter(|(_, g)| {
+                !g.ended
+                    && g.node == self.cfg.node_id
+                    && g.kind() == DelegKind::Sticky
+                    && !g.dirs.is_empty()
+                    && g.recall == crate::core::delegate::RecallPhase::None
+                    && g.releasing.is_empty()
+            })
+            .map(|(gen, g)| (*gen, g.dir_list()))
+            .collect();
+        for (gen, dirs) in own {
+            let me = self.cfg.node_id;
+            let mut keep = false;
+            for dir in &dirs {
+                if let Some(by_node) = subtree.get(dir) {
+                    let total: u64 = by_node.values().sum();
+                    let n = by_node.get(&me).copied().unwrap_or(0);
+                    keep |= total > 0 && n * 100 >= total * leave && total * 2 >= min_ops;
+                }
+            }
+            let g = self.dl.gens.get_mut(&gen).expect("present");
+            if keep {
+                g.below_since = None;
+                continue;
+            }
+            let since = *g.below_since.get_or_insert(now.wait);
+            let dwell = self.cfg.placement_dwell_ms as i64;
+            if now.wait.since(since) >= dwell
+                && now
+                    .wait
+                    .since(g.grown_at.map_or(g.granted, |t| t.max(g.granted)))
+                    >= dwell
+            {
+                g.below_since = None;
+                tracing::info!(
+                    node = me,
+                    dirs = ?dirs,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
+                    "the root releases its own sticky subtrees (its share or rate was below the floor for the dwell)"
+                );
+                self.own_sticky_release(now, gen, dirs.into_iter().collect(), replica, out);
+            }
+        }
         // 2. New placements: the topmost dominated directory per node.
         let table = replica.delegation_table();
         let ns = replica.namespace();
         let me = self.cfg.node_id;
         let mut chosen: BTreeMap<NodeId, (Ino, u64)> = BTreeMap::new();
         for (dir, by_node) in &subtree {
-            // The root directory is the root sequencer's: never placed.
-            if *dir == ROOT_INO {
+            // The root directory is the root sequencer's: never placed (the
+            // fault `root_sticky_on_slash` lets the walk reach it).
+            if *dir == ROOT_INO && !self.cfg.root_sticky_on_slash {
                 continue;
             }
             let (Some(node), total) = dominant(by_node, dominance) else {
                 continue;
             };
-            if total < min_ops || node == me {
+            if total < min_ops {
                 continue;
             }
             // Walk up while the parent is dominated by the same node.
@@ -605,7 +711,7 @@ impl Core {
             let mut d = *dir;
             for _ in 0..4096 {
                 let Some(p) = ns.parent_of(d) else { break };
-                if p == ROOT_INO {
+                if p == ROOT_INO && !self.cfg.root_sticky_on_slash {
                     break;
                 }
                 let Some(pb) = subtree.get(&p) else { break };
@@ -658,7 +764,8 @@ impl Core {
                 self.stats.place_quarantined += 1;
                 continue;
             }
-            if !self.place_eligible(now, node, out) {
+            // (The root has no link to itself to be eligible by.)
+            if node != me && !self.place_eligible(now, node, out) {
                 self.stats.place_skipped_unreachable += 1;
                 continue;
             }
@@ -670,8 +777,26 @@ impl Core {
             let Ok(kind) = self.place_kind_for(now, node, dir, replica) else {
                 continue;
             };
-            match self.delegate_dir(now, dir, node, kind, replica, out) {
+            match self.delegate_dir_from(
+                super::delegate::GrantSource::Placement,
+                now,
+                dir,
+                node,
+                kind,
+                replica,
+                out,
+            ) {
                 Ok(gen) => {
+                    if node == me {
+                        tracing::info!(
+                            node = me,
+                            dir,
+                            gen = %constellation_meta::delegation::GenLabel::of(gen),
+                            total,
+                            "placement granted the root a sticky subtree it dominates"
+                        );
+                        continue;
+                    }
                     if kind == DelegKind::Sticky {
                         self.stats.place_sticky += 1;
                         tracing::info!(
