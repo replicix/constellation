@@ -480,3 +480,69 @@ fn a_continuation_page_of_a_held_directory_fails_with_eio_after_the_span() {
         Some(constellation_types::Code::Io)
     );
 }
+
+/// ADR-57 review SHOULD-4: `copy_file_range` writes what a read of its source
+/// answers as a new acknowledged write, so a source a pending acknowledged row
+/// touches is waited for, and the copy fails with `EIO` after the span without
+/// having written anything; a copy from another source goes through.
+#[test]
+fn a_copy_from_a_held_source_fails_with_eio_after_the_span_and_writes_nothing() {
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let held = meta.create(ROOT_INO, "held", 0o644, 0, 0).unwrap().ino;
+    let free = meta.create(ROOT_INO, "free", 0o644, 0, 0).unwrap().ino;
+    let dst = meta.create(ROOT_INO, "dst", 0o644, 0, 0).unwrap().ino;
+    let (mut fs, _tmp, _core) = holder_fs(meta.clone(), false);
+    fs.sync.as_mut().unwrap().lease = Arc::new(crate::lease::LeaseView::default());
+    meta.session().set_budget_ms(0);
+    let span = Duration::from_millis(300);
+    meta.set_read_hold_span(span);
+    let caller = Caller::root();
+    let open = |ino: Ino, flags: OpenFlags| {
+        Blocking::run(|r| {
+            fs.open(
+                &OpCtx::new(OpKind::Open, &caller),
+                ino,
+                flags,
+                constellation_vfs::OpenOwner::NONE,
+                r,
+            )
+        })
+        .unwrap()
+        .fh
+    };
+    let (held_fh, free_fh, dst_fh) = (
+        open(held, OpenFlags::READ),
+        open(free, OpenFlags::READ),
+        open(dst, OpenFlags::WRITE),
+    );
+    // The hold comes after the opens (an open of a held inode waits too).
+    meta.test_hold_ino_committed(5, 1, held).unwrap();
+    let copy = |src: Ino, fh_in: constellation_vfs::Fh| {
+        Blocking::run(|r| {
+            fs.copy_file_range(
+                &OpCtx::new(OpKind::CopyFileRange, &caller),
+                src,
+                fh_in,
+                0,
+                dst,
+                dst_fh,
+                0,
+                16,
+                constellation_vfs::CopyFlags::empty(),
+                r,
+            )
+        })
+    };
+    let t = std::time::Instant::now();
+    assert!(copy(free, free_fh).is_ok());
+    assert!(t.elapsed() < span, "an unheld source does not wait");
+    let t = std::time::Instant::now();
+    let got = copy(held, held_fh);
+    assert!(t.elapsed() >= span, "waited the span: {:?}", t.elapsed());
+    assert_eq!(
+        got.err().map(|e| e.code()),
+        Some(constellation_types::Code::Io),
+        "refused, not copied from the state that lacks the row"
+    );
+    assert_eq!(meta.read_hold_stats().refused, 1);
+}

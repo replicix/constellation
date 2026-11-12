@@ -1,9 +1,14 @@
 [package]
 name = "constellation-model"
-description = "Stateright model of the metadata authority protocol (plan 30 M1) — no product crate depends on this, and it depends on none of them"
+description = "Stateright model of the metadata authority protocol (plan 30 M1) — no product crate depends on this; it depends on the product only in a parity test (tests/marker_parity.rs)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 stateright = "0.31"
+
+[dev-dependencies]
+# The parity test of the member-copy drop rules of a marker
+# (`tests/marker_parity.rs`): the model's `marker_keeps` against the product.
+constellation-meta = { workspace = true, features = ["test-util"] }

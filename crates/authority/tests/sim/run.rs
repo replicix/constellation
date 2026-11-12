@@ -1520,6 +1520,11 @@ pub struct Report {
     /// ADR-57: nodes holding reads of a pending acknowledged row at
     /// convergence (must be 0: a hold nothing releases is a leak).
     pub read_holds_left: usize,
+    /// Review round 2 (SHOULD-3): read holds released because their row was
+    /// given up (an operator's abandon, or a gated row a claim without a
+    /// tail dropped), summed over the live nodes at convergence. Zero where
+    /// no claim is lossy (`ttl_claims_without_tail == 0`).
+    pub read_holds_abandoned: u64,
     /// ADR-57 P5: delegate rows a recall dropped, and of those the ones the
     /// history shows acknowledged and the log never carried (must be 0).
     pub recall_dropped: usize,
@@ -6804,6 +6809,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             }
         }
         report.read_holds_left = holds.len();
+        report.read_holds_abandoned = cluster
+            .ids()
+            .into_iter()
+            .map(|id| cluster.get(id))
+            .filter(|n| n.alive())
+            .map(|n| n.meta.read_hold_stats().abandoned)
+            .sum();
         if !holds.is_empty() {
             return Err(lin_context(format!(
                 "read_holds_gone: read holds outlive the run at convergence: {holds:?}"

@@ -1397,6 +1397,7 @@ dependencies = [
 name = "constellation-model"
 version = "1.0.0"
 dependencies = [
+ "constellation-meta",
  "stateright",
 ]
 

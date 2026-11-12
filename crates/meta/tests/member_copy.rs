@@ -459,6 +459,51 @@ fn a_held_own_row_is_released_when_the_log_carries_its_rid() {
     assert!(!meta.member_copy_touches(&key), "released by the rid");
 }
 
+/// ADR-57 round-2 MUST-1: the lazy reap of holds whose row is back
+/// (`completed[rid]` is there) must not take a hold whose strand has not
+/// committed. The strand indexes its hold and removes `completed[rid]` in one
+/// transaction; a reader that runs meanwhile sees the committed snapshot,
+/// where the row looks back; the reap that follows blocks on the writer until
+/// the strand commits, and (before the fix) removed the hold the strand had
+/// just committed, with the row rolled back and nothing left to hold its
+/// readers. Fails before: the hold is gone after the commit.
+#[test]
+fn the_reap_does_not_take_a_hold_whose_strand_is_in_flight() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let meta = Meta::open_in_memory().unwrap();
+    let (sig, seen) = mpsc::channel::<()>();
+    let sig = std::sync::Mutex::new(sig);
+    meta.set_reap_hook(Box::new(move || {
+        let _ = sig.lock().unwrap().send(());
+    }));
+    let a = [ReadKey::Dentry(ROOT_INO, "a".into())];
+    std::thread::scope(|scope| {
+        let mut reader = None;
+        meta.test_strand_hold_while(5, 1, "a", rid(9), || {
+            reader = Some(scope.spawn(|| {
+                // The strand's hold is indexed, its transaction open.
+                assert!(
+                    meta.member_copy_touches(&a),
+                    "an uncommitted hold is held, not back"
+                );
+                meta.reap_completed_holds_for_tests();
+            }));
+            // Where the bug is, the reap has chosen its victim by now and
+            // waits for the writer; where it is fixed it never gets there.
+            let _ = seen.recv_timeout(Duration::from_millis(800));
+        })
+        .unwrap();
+        reader.unwrap().join().unwrap();
+    });
+    assert!(
+        meta.member_copy_touches(&a),
+        "the committed hold survived the reap"
+    );
+    assert_eq!(meta.read_holds(), vec![(5, 1)]);
+    assert!(!meta.reconcile_read_holds(), "its key is committed");
+}
+
 /// ADR-57 review SHOULD-3: a hold indexed in memory by a transaction that
 /// was dropped has no key behind it and no staged release; the thread's next
 /// flush, and a reconcile, take it out of the index.
@@ -1328,6 +1373,81 @@ fn a_claim_without_a_tail_drops_the_older_epochs_copies_and_holds() {
     assert_eq!(meta.member_copy(1).unwrap(), None);
     assert!(meta.read_holds().is_empty(), "{:?}", meta.read_holds());
     assert!(!meta.member_copy_touches(&keys[0]) && !meta.member_copy_touches(&keys[1]));
+}
+
+/// ADR-57 round-2 MUST-2: the rule of a claim without a tail is a fact the
+/// replica keeps (`member_settled_below`), so a copy made after the marker was
+/// applied is judged by it too. A namespace rebuilt from a log that carries
+/// the marker (`dcrash-pause` seed 558) adopts it: the rows its reset moves
+/// out of the journal are not kept as a copy, and not held (before: the
+/// epoch-1 row stayed with its hold, and reads of its keys failed at the
+/// bound for good); copies already there go.
+#[test]
+fn a_rebuild_from_a_log_with_a_no_tail_marker_keeps_no_older_copy_nor_hold() {
+    let side = || {
+        let side = Meta::open_in_memory().unwrap();
+        let none = vec![LogRecord::TailFollowsThrough {
+            prev_epoch: 2,
+            through: 0,
+        }];
+        apply_rows(&side, 1, 3, 0, &[], &none);
+        side
+    };
+    let a = [ReadKey::Dentry(ROOT_INO, "a".into())];
+    // Rows still in the journal when the rebuild strands them.
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    holder_create(&meta, RowCommit::ROOT_GROUP, "a", 1, 1);
+    meta.set_holder_epoch(0);
+    meta.replace_ns_from_rebuilt(&side(), &Default::default())
+        .unwrap();
+    assert_eq!(meta.member_copy(1).unwrap(), None, "no copy of epoch 1");
+    assert!(meta.read_holds().is_empty(), "{:?}", meta.read_holds());
+    assert!(!meta.member_copy_touches(&a));
+    // Copies made before the rebuild go with it.
+    let meta = Meta::open_in_memory().unwrap();
+    let keys = deposed_with_two_rows(&meta);
+    meta.replace_ns_from_rebuilt(&side(), &Default::default())
+        .unwrap();
+    assert_eq!(meta.member_copy(1).unwrap(), None);
+    assert!(meta.read_holds().is_empty(), "{:?}", meta.read_holds());
+    assert!(!meta.member_copy_touches(&keys[0]));
+    // An acknowledged row lost by the rule is counted as abandoned.
+    assert_eq!(meta.read_hold_stats().abandoned, 2);
+}
+
+/// The fact outlives the segment: a strand that runs after a marker was
+/// applied in an earlier transaction judges its rows by it.
+#[test]
+fn a_strand_after_a_no_tail_marker_was_applied_keeps_no_older_copy() {
+    let meta = Meta::open_in_memory().unwrap();
+    let none = vec![LogRecord::TailFollowsThrough {
+        prev_epoch: 2,
+        through: 0,
+    }];
+    // (A copy-less replica applies the marker; nothing to drop yet.)
+    apply_rows(&meta, 1, 3, 0, &[], &none);
+    // The rows of epoch 1 come to the journal after, and a later pass
+    // strands them: the marker was applied in an earlier transaction.
+    meta.set_holder_epoch(1);
+    holder_create(&meta, RowCommit::ROOT_GROUP, "a", 1, 1);
+    meta.set_holder_epoch(0);
+    meta.strand_below_epoch(4).unwrap();
+    assert_eq!(meta.member_copy(1).unwrap(), None);
+    assert!(meta.read_holds().is_empty());
+    // A marker that named a tail of the epoch leaves it to that tail.
+    let meta = Meta::open_in_memory().unwrap();
+    let named = vec![LogRecord::TailFollowsThrough {
+        prev_epoch: 2,
+        through: 9,
+    }];
+    apply_rows(&meta, 1, 3, 0, &[], &named);
+    meta.set_holder_epoch(1);
+    holder_create(&meta, RowCommit::ROOT_GROUP, "a", 1, 1);
+    meta.set_holder_epoch(0);
+    meta.strand_below_epoch(4).unwrap();
+    assert!(meta.member_copy(1).unwrap().is_some());
+    assert_eq!(meta.read_holds().len(), 1);
 }
 
 fn takeover_with_marker(meta: &Meta, epoch: u64, marker: &[LogRecord]) {

@@ -6320,8 +6320,10 @@ impl Meta {
         // copy this strand just made of a row past `through` goes with its
         // hold; none outlives the gate with nothing to release it.
         let mut member = super::member::MemberOutcome::default();
+        let mut facts_noted = false;
         if let Some(args) = strand.filter(|a| !a.marker.is_empty()) {
-            super::member::note_log_tail_tx(&mut tx, self, args.epoch, args.marker, None)?;
+            facts_noted =
+                super::member::note_log_tail_tx(&mut tx, self, args.epoch, args.marker, None)?;
             member = super::member::member_rules_tx(
                 &mut tx,
                 self,
@@ -6335,7 +6337,7 @@ impl Meta {
                 },
             )?;
         }
-        if !part.work && tails.is_empty() && member == Default::default() {
+        if !part.work && tails.is_empty() && member == Default::default() && !facts_noted {
             // Nothing to strand and no tail: nothing to commit.
             return Ok(report);
         }
@@ -6345,7 +6347,9 @@ impl Meta {
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;
         if member != Default::default() {
-            let _ = self.refresh_member_copy_flag();
+            if let Err(error) = self.refresh_member_copy_flag() {
+                tracing::warn!(%error, "the member copy flag could not be refreshed after the gate's marker rules");
+            }
         }
         report.hold_ms = u64::try_from(held_since.elapsed().as_millis()).unwrap_or(u64::MAX);
         for (gen, cut) in part.orphan_cuts {

@@ -2235,6 +2235,14 @@ impl Vfs for View {
         // about: a source gone from the replica is `Stale`, as for a read.
         let run = move |view: &View| -> Result<u64, VfsError> {
             let fail = |ino, code| view.ino_err(ino, super::copy::never_a_fallback(code));
+            // ADR-57: the copy writes what a read of the source answers as
+            // a new acknowledged write, so a source an acknowledged row this
+            // node rolled back touches is waited for like any held read
+            // (`EIO` after the read hold span), on the pool thread where
+            // the copy runs there, not on the dispatch thread.
+            if let Err(code) = view.session_wait(&[ReadKey::Ino(src)]) {
+                return fail(src, code);
+            }
             let n = match view.copy_range(
                 src,
                 off_in,

@@ -775,6 +775,10 @@ pub struct Meta {
     /// rows nobody was told were committed.
     #[cfg(any(test, feature = "test-util"))]
     recall_drop_hook: std::sync::OnceLock<RecallDropHook>,
+    /// Tests only: called by `reap_completed_holds` between the check that
+    /// found holds back and the write transaction that removes them.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) reap_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// Plan 42 §5.1.5: told what every stranding pass rolled back
     /// ([`Meta::set_rollback_hook`]), and what it has not been told yet.
     rollback_hook: std::sync::OnceLock<RollbackHook>,
@@ -1365,6 +1369,8 @@ impl Meta {
             foreign_apply_hook: std::sync::OnceLock::new(),
             #[cfg(any(test, feature = "test-util"))]
             recall_drop_hook: std::sync::OnceLock::new(),
+            #[cfg(any(test, feature = "test-util"))]
+            reap_hook: std::sync::OnceLock::new(),
             rollback_hook: std::sync::OnceLock::new(),
             rolled_back: std::sync::Mutex::new(Vec::new()),
             staged_unvoids: std::sync::Mutex::new(Vec::new()),
