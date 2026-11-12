@@ -117,9 +117,6 @@ impl Meta {
         applied_seq: u64,
     ) -> Result<(), MetaError> {
         use crate::store::spec::{retire_local_tx, retire_tx, Shipped};
-        // Plan 43 C1-4: rows of this node's own tenure that shipped cover
-        // member copies (a re-shipped transaction names the one it carries).
-        self.member_cover_shipped_tx(tx, journal_seqs)?;
         // ADR-59 part B (D2): a `DropHeld` this node shipped retires what it
         // names, as it does on every replica that applies it from the log.
         // The drop's decision counts the record as unshipped; a ship that carries no such
@@ -140,7 +137,7 @@ impl Meta {
                 }
             }
             if shipped > 0 {
-                self.retire_rolled_back_tx(tx, &retired);
+                self.retire_and_hole_tx(tx, &retired)?;
                 crate::store::counter_add_tx(
                     tx,
                     &self.local,
@@ -149,6 +146,11 @@ impl Meta {
                 )?;
             }
         }
+        // Plan 43 C1-4: rows of this node's own tenure that shipped cover
+        // member copies (a re-shipped transaction names the one it carries).
+        // (After the holes a shipped `DropHeld` made, which this pass sweeps
+        // once no copy of a row with records lies above them.)
+        self.member_cover_shipped_tx(tx, journal_seqs)?;
         // Plan 30 §M11: the root's own ops forwarded to a delegate are
         // shadows here (§M6) that no segment apply completes: the
         // completions this ship carries retire them, as the segment

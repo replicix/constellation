@@ -875,9 +875,12 @@ fn drop_held(idents: &[(u64, u64)]) -> LogRecord {
     }
 }
 
-/// B2, 1714's shape (D2): a member's copy of a row the drop rolled back
-/// reaches the successor's gate after the log carried the `DropHeld`. Fail
-/// before: the row lands as `Completed`, behind its own refusal.
+/// B2, 1714's shape (D2): a copy of a row the drop rolled back reaches this
+/// node's backup tail after the log carried the `DropHeld`. It is stored as a
+/// hole (the copy stores consult `retired` at ingest), so the successor's
+/// gate meets no row of it. Fail before the ingest rule: the row landed as
+/// `Completed`, behind its own refusal. (The gate's own `tail_retired` rule,
+/// for a copy a source serves, is pinned in the core's tests.)
 #[test]
 fn a_tail_row_a_drop_held_of_the_log_retired_is_not_reshipped() {
     let meta = Meta::open_in_memory().unwrap();
@@ -908,7 +911,7 @@ fn a_tail_row_a_drop_held_of_the_log_retired_is_not_reshipped() {
     let report = reship(&meta, &[tx(1, 2, seed), tx(3, 4, other)]).unwrap();
     assert_eq!(
         (report.tail_retired, report.tail_applied, report.tail_done),
-        (1, 1, 0),
+        (0, 1, 0),
         "{report:?}"
     );
     assert!(meta.lookup(ROOT_INO, "x").unwrap().is_none());
@@ -916,6 +919,61 @@ fn a_tail_row_a_drop_held_of_the_log_retired_is_not_reshipped() {
         meta.lookup(ROOT_INO, "y").unwrap().is_some(),
         "each other row once"
     );
+}
+
+/// B3 (ii) (D1, D2): the dropper's record shipped and it died before the
+/// apply. The log carries the `DropHeld`: this node's member copy of the
+/// seed is a hole (no live row), and the successor's gate re-ships no row of the seed, each other row once.
+#[test]
+fn a_dropper_that_dies_after_its_record_shipped_leaves_holes_and_no_row() {
+    use constellation_meta::MemberTx;
+    let meta = Meta::open_in_memory().unwrap();
+    let seed = vec![
+        create(ROOT_INO, "x", ino(7)),
+        LogRecord::Completed { rid: rid(2, 1) },
+    ];
+    let live = |meta: &Meta| -> usize {
+        meta.member_copy_rows(EPOCH_PREV)
+            .unwrap()
+            .map_or(0, |(_, rows)| {
+                rows.iter().filter(|r| !r.tx.records.is_empty()).count()
+            })
+    };
+    meta.member_copy_put_rows(
+        EPOCH_PREV,
+        1,
+        &[MemberTx {
+            tx: tx(1, 2, seed.clone()),
+            class: RowCommit::ROOT_GROUP,
+            rid: Some(rid(2, 1)),
+            op: None,
+            lock_tag: Default::default(),
+        }],
+    )
+    .unwrap();
+    assert_eq!(live(&meta), 1);
+    meta.apply_segment_rows(
+        1,
+        EPOCH_PREV,
+        0,
+        &[9],
+        &[(0, 0)],
+        &[drop_held(&[(EPOCH_PREV, 1)])],
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(live(&meta), 0, "the member copy of the seed is a hole");
+    let other = vec![
+        create(ROOT_INO, "y", ino(8)),
+        LogRecord::Completed { rid: rid(2, 2) },
+    ];
+    let report = reship(&meta, &[tx(1, 2, seed), tx(3, 4, other)]).unwrap();
+    assert_eq!(report.tail_applied, 1, "{report:?}");
+    assert!(
+        meta.lookup(ROOT_INO, "x").unwrap().is_none(),
+        "no row of the seed"
+    );
+    assert!(meta.lookup(ROOT_INO, "y").unwrap().is_some());
 }
 
 /// B2 (MUST-B2): a tail row whose rid has *any* outcome here is done, a

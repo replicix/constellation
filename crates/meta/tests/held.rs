@@ -1624,6 +1624,139 @@ fn an_op_the_drop_rolled_back_does_not_keep_its_chunk_held() {
     }
 }
 
+/// The rows of every member copy of this node that still carry a
+/// transaction (a hole carries none).
+fn member_copy_live_rows(meta: &Meta) -> usize {
+    meta.member_copy_epochs()
+        .unwrap()
+        .into_iter()
+        .map(|e| {
+            meta.member_copy_rows(e).unwrap().map_or(0, |(_, rows)| {
+                rows.iter().filter(|r| !r.tx.records.is_empty()).count()
+            })
+        })
+        .sum()
+}
+
+/// A holder with a seed, and its own member copy of the seed's identity
+/// (the node was a member of epoch 1's group, took over, and re-shipped the
+/// seed under that identity). Returns the store, the inode, the seed's
+/// journal seq and its transaction.
+fn dropper_with_a_member_copy_of_its_seed() -> (Meta, Ino, u64, constellation_meta::BackupTx) {
+    use constellation_meta::{MemberTx, RowCommit};
+    let (meta, broken) = node_one_with_a_seed();
+    let seed = meta
+        .journal_txs_from(0, usize::MAX)
+        .unwrap()
+        .into_iter()
+        .find(|t| {
+            t.records
+                .iter()
+                .any(|r| matches!(r, LogRecord::WriteManifest { .. }))
+        })
+        .expect("the seed");
+    meta.member_copy_put_rows(
+        1,
+        1,
+        &[MemberTx {
+            tx: seed.clone(),
+            class: RowCommit::ROOT_GROUP,
+            rid: None,
+            op: None,
+            lock_tag: Default::default(),
+        }],
+    )
+    .unwrap();
+    assert_eq!(member_copy_live_rows(&meta), 1);
+    let first = seed.first;
+    (meta, broken, first, seed)
+}
+
+/// ADR-59 part B (D2), fail-before `drop-held-chain-backed+durability` 41 and
+/// 53: the dropper ships its `DropHeld` and never applies its own segment, so
+/// the ship is where its own copies of the rows the record names become
+/// holes. Before: the idents were retired and nothing holed, and the member
+/// copy of the seed stayed (`member_copies_drained`).
+#[test]
+fn the_dropper_holes_its_own_copies_of_what_its_record_names_when_it_ships_it() {
+    let (meta, broken, seed, _) = dropper_with_a_member_copy_of_its_seed();
+    meta.drop_held_knowing_now(
+        broken,
+        1,
+        false,
+        &|_| false,
+        &|_| Vec::new(),
+        &Default::default(),
+        true,
+    )
+    .unwrap();
+    // Decided and applied locally; the record has not shipped: the copy is a
+    // copy of a row the log may yet carry (the dropper may be deposed first).
+    assert_eq!(
+        member_copy_live_rows(&meta),
+        1,
+        "nothing is holed before the ship"
+    );
+    assert!(!meta.row_retired(1, seed));
+    let rows = batch(&meta);
+    assert!(rows
+        .iter()
+        .any(|(_, r)| matches!(r, LogRecord::DropHeld { .. })));
+    ship(&meta, &rows, 2);
+    assert!(meta.row_retired(1, seed));
+    // (The copy became a hole, and the ship's own coverage pass swept it:
+    // no row with records lies above it. `member_copies_drained` counts
+    // holes too.)
+    assert_eq!(member_copy_live_rows(&meta), 0, "no live copy");
+    assert_eq!(meta.member_copy_rows_total().unwrap(), 0, "no hole left");
+}
+
+/// ADR-59 part B (D2): a copy streamed after its identity was retired is
+/// stored as a hole: the member copy and the backup tail consult `retired`.
+#[test]
+fn a_copy_streamed_after_its_identity_was_retired_is_stored_as_a_hole() {
+    use constellation_meta::{MemberTx, RowCommit};
+    let (meta, broken, seed, tx) = dropper_with_a_member_copy_of_its_seed();
+    meta.drop_held_knowing_now(
+        broken,
+        1,
+        false,
+        &|_| false,
+        &|_| Vec::new(),
+        &Default::default(),
+        true,
+    )
+    .unwrap();
+    ship(&meta, &batch(&meta), 2);
+    assert!(meta.row_retired(1, seed));
+    // A backup brought up in the window gets the row after the record.
+    meta.backup_append(1, std::slice::from_ref(&tx)).unwrap();
+    let tail = meta.backup_tail(1).unwrap();
+    assert!(tail.iter().all(|t| t.records.is_empty()), "{tail:?}");
+    assert!(
+        tail.iter().any(|t| t.first == seed),
+        "the span is kept: {tail:?}"
+    );
+    // And a member copy put of it (a claimant's seal snapshot, a strand).
+    meta.member_copy_put_rows(
+        1,
+        1,
+        &[MemberTx {
+            tx: tx.clone(),
+            class: RowCommit::ROOT_GROUP,
+            rid: None,
+            op: None,
+            lock_tag: Default::default(),
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        member_copy_live_rows(&meta),
+        0,
+        "no live copy of a retired row"
+    );
+}
+
 // ---------------------------------------------------------------------
 // ADR-59: a directory's merged attributes order nothing.
 // ---------------------------------------------------------------------
