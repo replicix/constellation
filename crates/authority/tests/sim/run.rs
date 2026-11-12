@@ -537,6 +537,9 @@ pub struct SimConfig {
     /// Negative control (`Config::root_executes_under_own_grant`, ADR-55): R-I4: the root's own path executes a key of its live own grant in its own journal; I2 / the per-key order must then fail the run.
     /// `AUTHORITY_SIM_ROOT_EXECUTES_UNDER_OWN_GRANT=1` sets it on every configuration.
     pub root_executes_under_own_grant: bool,
+    /// Negative control (`Config::own_stream_honours_on_record`, ADR-55): R-H without its second half: the root's own stream is honoured when the archive carries its record, whatever root rows of its keys are unshipped; a deposition then rolls such a row back after the stream's rows and I5 / the per-key order must fail the run.
+    /// `AUTHORITY_SIM_OWN_STREAM_HONOURS_ON_RECORD=1` sets it on every configuration.
+    pub own_stream_honours_on_record: bool,
     /// Negative control (`Config::kept_fetch_skipped`, ADR-51): a takeover
     /// never collects the kept rows of the tenure it ends.
     /// `AUTHORITY_SIM_KEPT_FETCH_SKIPPED=1` sets it on every configuration;
@@ -1225,6 +1228,10 @@ impl Default for SimConfig {
             .is_some_and(|v| v == "1"),
             root_executes_under_own_grant: std::env::var_os(
                 "AUTHORITY_SIM_ROOT_EXECUTES_UNDER_OWN_GRANT",
+            )
+            .is_some_and(|v| v == "1"),
+            own_stream_honours_on_record: std::env::var_os(
+                "AUTHORITY_SIM_OWN_STREAM_HONOURS_ON_RECORD",
             )
             .is_some_and(|v| v == "1"),
             kept_fetch_skipped: std::env::var_os("AUTHORITY_SIM_KEPT_FETCH_SKIPPED")
@@ -5338,6 +5345,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         root_sticky_on_slash: cfg.root_sticky_on_slash,
         deposed_root_strands_own_stream: cfg.deposed_root_strands_own_stream,
         root_executes_under_own_grant: cfg.root_executes_under_own_grant,
+        own_stream_honours_on_record: cfg.own_stream_honours_on_record,
         kept_fetch_skipped: cfg.kept_fetch_skipped,
         parent_taint_conservative: cfg.parent_taint_conservative,
         restart_skips_write_quarantine: cfg.restart_skips_write_quarantine,

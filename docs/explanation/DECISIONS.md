@@ -4823,7 +4823,7 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
 - **The root is the holder of its own stream.** The grant is the usual
   `DelegateNode { node: root, gen, [(dir, Sticky)] }`, committed by the archive.
   The root executes under it once the archive carries the record (R-I3): its
-  first op in the subtree parks (`own_grant_pending`), the engine's fast path
+  first op in the subtree parks (the stream is not honoured yet), the engine's fast path
   does not admit under it, and the next ops are answered `Final` at local speed
   (`root_own_answers`). The root's own path never executes a key of its live own
   stream and never refuses one (R-I4): an op the delegate executor did not take
@@ -4840,13 +4840,44 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
   deposition starts from. `Meta::apply_delegate_tx` also notes the index of a
   `Refused` row it skips because the rid is completed here (the cursor would
   have stalled at it).
-- **A stream op waits for the root rows it rests on (M1).** The stream's rows
-  survive a deposition and the root's own rows of the tenure do not, so a stream
-  row that rests on one the archive has not carried would be a `Final` answer on
-  a premise the log never had. The root, as the holder, executes an op only when
-  the root rows of this tenure its position names are in the log
-  (`Core::holder_reaches`, `journal_root_seqs_through`): what a far holder waits
-  for in the segments. The stream's own rows are no such premise.
+- **One rule for the root's own stream across a deposition (M1, M1', M5, S1).**
+  A far delegate executes on a state that reflects only the rows the log
+  carries plus its own stream. The root as its own holder also sees its
+  unshipped root rows; of those only the ones on the stream's keys matter (rows
+  on other keys commute: the ship plan's own argument). The rule has four parts:
+  - *R-H (honour).* The stream is honoured when, and only from when, (a) the
+    archive carries its last `DelegateNode` record, and (b) no root row at or
+    below that record is unshipped whose keys resolve to the stream (per key, by
+    ownership: a held row in `/` does not park the subtree). After (b) holds
+    once it holds for good: no root row under a live own generation enters the
+    journal (R-I4), cross-boundary ops release the grant first, inbox ops are
+    stream rows. Decided once per event from the ship state, cached per
+    generation (`OwnGrant { record, honoured }`); the lease epoch is no input. A
+    growth of the grant (a new record) is honoured again per generation.
+  - *R-X (execute).* An own-stream op executes as a far delegate's: the stream
+    is honoured (`Core::stream_honoured`) and its dependencies are reached.
+    While the node holds a root tenure that is the streams part and "not lost"
+    (`reaches_streams`, `deps_lost`: the root's session `applied` moves by
+    segments only, and the root rows an op rests on are R-H's premise); a deposed
+    root streams as any far holder and waits for the log to carry the whole
+    position, because the root rows its deposition rolled back are held
+    read-side until they are back (ADR-57).
+  - *R-D (deposition).* Nothing own-specific: the stream's rows are holder rows,
+    parked ops stay parked and are judged by R-X at the next event; a record the
+    deposition stranded is dropped by `delegation_sync` as for any holder.
+  - *R-J (journal).* A row of the stream (executed, `Refused`, release) is
+    journaled only through R-X's gate. Not honoured: a forward parks, a settle
+    parks, the inbox drain halts and polls again. The drain's `EROFS` arm also
+    re-resolves the keys first and halts unless they are still the stream's.
+  Liveness: a root row of the stream's keys still unshipped `own_first_op_wait`
+  after the record is in the log (a held, poisoned row under its directories)
+  makes the root release its own grant as the holder, with nothing executed
+  (`root_own_released_unhonoured`); the quarantine keeps the placement from
+  granting it again at once. Measured: `root_own_honour_wait_ms_max`. After the
+  first honour an own op is answered at local speed whatever the load on `/`.
+  The ship plan keeps a stream's indexes contiguous in the log (M3): a held
+  transaction of a stream holds every later one of it (oracle
+  `stream_log_contiguous`).
 - **A holder's reply says its grant is non-stealable (M2).** `MutateReply`
   carries `non_stealable`, set by the executor from its own state: the
   requester, whose table may not list the root's own grant yet (it is minted and
@@ -4893,7 +4924,7 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
 - **Settings.** `CONSTELLATION_DELEGATION_ROOT_STICKY` (on whenever sticky
   placement is; `off` restores the archive wait). Test-only faults:
   `root_sticky_on_slash`, `deposed_root_strands_own_stream`,
-  `root_executes_under_own_grant`.
+  `root_executes_under_own_grant`, `own_stream_honours_on_record`.
 
 **Consequences**: the root's own ops in its subtrees run at local speed after one
 archive wait per grant (the record); ops in `/` and in other nodes' subtrees
@@ -4911,7 +4942,7 @@ stealable).
 **May revert**: yes, by `CONSTELLATION_DELEGATION_ROOT_STICKY=off`.
 
 See: `crates/authority/src/core/delegate.rs` (`delegate_dir_from`,
-`own_grant_pending`, `holder_root`, `own_sticky_release`, `deleg_recall_plan`),
+`own_honour_progress`, `stream_honoured`, `holder_root`, `own_sticky_release`, `deleg_recall_plan`),
 `crates/authority/src/core/placement.rs` (`place_kind_for_root`),
 `crates/authority/src/core/mod.rs` (`handle`, `take_self_sends`),
 `crates/model` chunk 14.

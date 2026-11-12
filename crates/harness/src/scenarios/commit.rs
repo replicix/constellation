@@ -655,7 +655,36 @@ fn topology_wan_root_own(n: usize) -> Result<Rows> {
             "p99_us": first.as_micros() as u64,
         }));
         std::fs::create_dir_all(a.mnt.join("t8/own"))?;
-        measure_ops(&mut rows, "root-own", &a.mnt.join("t8/own"), n)?;
+        // `ACK_LATENCY_SLASH_LOAD=1`: step 9's gate (ADR-55, R-H): two writers
+        // load `/` while the root-own ops are measured, one on the root (its
+        // own rows in `/`) and one on b (forwarded to the root). The own
+        // stream's ops must stay at local speed whatever the journal of `/`
+        // holds: no root row of `/` is a premise of the stream.
+        let slash_load = std::env::var_os("ACK_LATENCY_SLASH_LOAD").is_some();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut loaders = Vec::new();
+        if slash_load {
+            for (tag, mnt) in [("a", a.mnt.clone()), ("b", b.mnt.clone())] {
+                let stop = stop.clone();
+                loaders.push(std::thread::spawn(move || {
+                    let mut i = 0u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = std::fs::write(mnt.join(format!("slash-load-{tag}-{i}")), b"");
+                        i += 1;
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    i
+                }));
+            }
+        }
+        let own = measure_ops(&mut rows, "root-own", &a.mnt.join("t8/own"), n);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for l in loaders {
+            if let Ok(done) = l.join() {
+                eprintln!("    ack-latency: 8-wan-root-own slash load wrote {done} files");
+            }
+        }
+        own?;
         // The root's ops in `/` (not in a subtree it holds) wait for the
         // archive.
         measure_ops(&mut rows, "root-slash", &a.mnt, n)?;

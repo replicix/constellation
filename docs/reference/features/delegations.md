@@ -761,11 +761,16 @@ and node, and evaluates it every tenth of the window:
   (see Troubleshooting). A writer that reaches the root only through the
   inbox, during a partition, gets `EROFS` in the root's stream where fence rule
   C9 applies (`holder_inbox_refusals`, apart for the root's own stream as
-  `root_own.inbox_refusals`). An op in the stream rests on the root's own rows
-  (the ones in `/` and in other subtrees, journaled and not yet in the log) as
-  a far holder's does: it waits until the archive carries those its position
-  names, because a deposition rolls them back while the stream's rows stay; the
-  stream's own rows are no such premise. A restarted root that claims its lease
+  `root_own.inbox_refusals`). The stream is honoured, and so
+  executes anything, only once the archive carries its grant record and no row
+  of the root's own journal on its keys is still unshipped (a row that was
+  journaled before the grant under its directories and is held back); a
+  deposition rolls such a row back while the stream's rows stay. Rows on other
+  keys, in `/` included, do not delay it, and after the first honour an op in
+  the stream is answered at local speed whatever the load on `/`. An unshipped
+  row that outlasts the first-op bound after the record is in the log makes the
+  root release the grant as its holder (the core counter `root_own_released_unhonoured`). A
+  restarted root that claims its lease
   again ends its own stream at what it assigned (its rows stay in the journal and
   ship in the new tenure's first segment); a takeover gate that finds a
   predecessor's backup tail ends the stream at the log and replays the halted

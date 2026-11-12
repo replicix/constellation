@@ -80039,6 +80039,26 @@ mod root_own_sticky {
         assert_eq!(h.meta.delegate_idx(d.gen).unwrap(), 1);
     }
 
+    /// The negative control of T4 (`Config::own_stream_honours_on_record`):
+    /// R-H without its second half honours the stream on the record alone, and
+    /// the stream's op runs ahead of the unshipped root row under its
+    /// directory, a row a deposition would roll back and replay after it.
+    #[test]
+    fn the_control_that_honours_on_the_record_alone_runs_ahead_of_a_root_row() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        h.core.cfg.own_stream_honours_on_record = true;
+        let (r, out) = submit_in(&mut h, 1, dirs[0], "r");
+        assert!(!accepted(&out, r), "{out:?}");
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        let record = h.meta.journal_tip().unwrap();
+        h.core.note_shipped(&[record], 0);
+        activity(&mut h);
+        let (a, out) = submit_in(&mut h, 2, dirs[0], "a");
+        assert!(accepted(&out, a), "{out:?}");
+        assert_eq!(h.meta.delegate_idx(d.gen).unwrap(), 1);
+    }
+
     /// Liveness bound (R-H): a root row of the stream's keys that does not
     /// ship (held: a poisoned chunk) keeps the stream parked for no more than
     /// the bound after the record is in the log; then the root releases its

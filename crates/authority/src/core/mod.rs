@@ -676,6 +676,12 @@ pub struct Config {
     /// grant in its own journal (R-I4). I2 / the per-key order must then
     /// fail the run.
     pub root_executes_under_own_grant: bool,
+    /// Fault injection for the simulation's negative control (never set by
+    /// the engine): the root's own stream is honoured as soon as the archive
+    /// carries its record, whatever root rows of its keys are unshipped
+    /// (R-H without its second half). A deposition then rolls such a row
+    /// back after the stream's rows: I5 / the per-key order must fail the run.
+    pub own_stream_honours_on_record: bool,
 }
 
 impl Config {
@@ -843,6 +849,7 @@ impl Config {
             root_sticky_on_slash: false,
             deposed_root_strands_own_stream: false,
             root_executes_under_own_grant: false,
+            own_stream_honours_on_record: false,
         }
     }
 }

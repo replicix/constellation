@@ -525,6 +525,8 @@ pub struct NodeEnv {
     pub deposed_root_strands_own_stream: bool,
     /// See `SimConfig::root_executes_under_own_grant`.
     pub root_executes_under_own_grant: bool,
+    /// See `SimConfig::own_stream_honours_on_record`.
+    pub own_stream_honours_on_record: bool,
     /// See `SimConfig::kept_fetch_skipped`.
     pub kept_fetch_skipped: bool,
     /// See `SimConfig::parent_taint_conservative`.
@@ -885,6 +887,7 @@ impl NodeHandle {
         cfg.root_sticky_on_slash = env.root_sticky_on_slash;
         cfg.deposed_root_strands_own_stream = env.deposed_root_strands_own_stream;
         cfg.root_executes_under_own_grant = env.root_executes_under_own_grant;
+        cfg.own_stream_honours_on_record = env.own_stream_honours_on_record;
         cfg.kept_fetch_skipped = env.kept_fetch_skipped;
         cfg.restart_skips_write_quarantine = env.restart_skips_write_quarantine;
         cfg.holder_releases_before_drain = env.holder_releases_before_drain;

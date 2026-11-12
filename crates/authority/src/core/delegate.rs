@@ -2015,7 +2015,9 @@ impl Core {
                     self.stats.root_own_commit_wait_ms_max.max(ms);
             }
             let covered_at = og.covered_at.unwrap_or(now.wait);
-            if self.own_root_rows_unshipped(g, og.scan_to, acked, replica) {
+            if !self.cfg.own_stream_honours_on_record
+                && self.own_root_rows_unshipped(g, og.scan_to, acked, replica)
+            {
                 if now.wait.since(covered_at) >= self.dl_t().own_first_op_wait as i64 {
                     release.push(g);
                 }
