@@ -20711,8 +20711,10 @@ fn the_read_oracle_catches_an_abandon_that_skips_the_read_recall() {
         abandon_skips_read_recall: true,
         ..sticky_holder_dies_config()
     };
-    // 37 of the first 100 seeds fail (pinned: 0, 4, 8).
-    for seed in [0u64, 4, 8] {
+    // 36 of the first 100 seeds fail (pinned: 4, 8, 9; seed 0 stopped when a
+    // read the root's grant horizon does not cover began to wait for the
+    // horizon write).
+    for seed in [4u64, 8, 9] {
         let e = run_seed(seed, config.clone())
             .expect_err("the abandon skipped the read recall and no oracle noticed");
         assert!(
@@ -20806,9 +20808,11 @@ fn the_cto_oracle_catches_a_restart_that_skips_the_write_quarantine() {
         restart_skips_write_quarantine: true,
         ..sticky_holder_restarts_config()
     };
-    // Of the first 1,500 seeds, 156, 353, 391, 447, 588 and 659 fail (pinned:
-    // 156, 353, 659; ADR-50 moved the schedules, 159 no longer does).
-    for seed in [156u64, 353, 659] {
+    // Of the first 800 seeds, 79, 156, 159, 277 and 391 fail (pinned: 156,
+    // 159, 391). ADR-50 moved the schedules (159 stopped failing), and a
+    // strict read the root's grant horizon does not cover is held for the
+    // horizon write now (353 and 659 stopped, 159 came back).
+    for seed in [156u64, 159, 391] {
         let e = run_seed(seed, config.clone())
             .expect_err("the holder skipped the quarantine and no oracle noticed");
         assert!(

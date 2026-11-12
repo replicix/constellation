@@ -8852,6 +8852,159 @@ mod cto {
         }
     }
 
+    /// Expectation (fail-before: the first read after a quiet spell was
+    /// answered with its position alone, and so was every read until the
+    /// horizon write landed, so a cold scan paid a ReadIndex per lookup):
+    /// a strict read the root's durable horizon does not cover yet is held
+    /// for the write the lane asked for and granted when it lands, with its
+    /// read-ahead; a failed write answers it with its position alone.
+    #[test]
+    fn a_read_the_horizon_does_not_cover_waits_for_the_write_and_is_granted() {
+        use crate::event::ReadAhead;
+        let ask = |h: &mut Harness, req: u64| {
+            h.step(Event::Peer {
+                from: 2,
+                msg: PeerMsg::ReadIndex {
+                    req: OpId(req),
+                    ino: ROOT_INO,
+                    dir: true,
+                    name: None,
+                    ahead: ReadAhead::Listing,
+                },
+            })
+        };
+        let persist_of = |out: &[Action]| {
+            out.iter().find_map(|a| match a {
+                Action::PersistGrantHorizon { kind, until } => Some((*kind, *until)),
+                _ => None,
+            })
+        };
+        let (mut h, _) = holder_with_files();
+        h.cold_horizon = true;
+        h.manual_horizon = true;
+        // Two reads before the write lands: both held, one write asked for.
+        let first = ask(&mut h, 1);
+        assert!(
+            sends(&first).is_empty(),
+            "answered before the write: {first:?}"
+        );
+        let (kind, until) = persist_of(&first).expect("no horizon write asked for");
+        let mut more = Vec::new();
+        h.core.grant_horizon_after_event(&h.meta, &mut more);
+        assert!(persist_of(&more).is_none(), "one write in flight at a time");
+        let second = ask(&mut h, 2);
+        assert!(
+            sends(&second).is_empty(),
+            "answered before the write: {second:?}"
+        );
+        assert_eq!(h.core.stats.read_index_horizon_parked, 2);
+        // The write lands: both are served, granted, with the read-ahead.
+        let durable = h.meta.persist_grant_horizon(kind, until, h.clk()).ok();
+        let out = h.core.handle(
+            h.clk(),
+            Event::GrantHorizonPersisted {
+                kind,
+                until,
+                durable,
+            },
+            &h.meta,
+        );
+        let replies = sends(&out);
+        assert_eq!(replies.len(), 2, "{out:?}");
+        for (i, (to, msg)) in replies.into_iter().enumerate() {
+            assert_eq!(to, 2);
+            let PeerMsg::ReadIndexReply { outcome, .. } = msg else {
+                panic!("{msg:?}");
+            };
+            let _ = grant_of(outcome);
+            if i == 0 {
+                // The second listing finds the files granted already.
+                assert_eq!(ahead_of(outcome).grants.len(), 4);
+            }
+        }
+        // A write that fails answers the held read with its position alone.
+        let (mut h, _) = holder_with_files();
+        h.cold_horizon = true;
+        h.manual_horizon = true;
+        let first = ask(&mut h, 1);
+        let (kind, until) = persist_of(&first).expect("no horizon write asked for");
+        let out = h.core.handle(
+            h.clk(),
+            Event::GrantHorizonPersisted {
+                kind,
+                until,
+                durable: None,
+            },
+            &h.meta,
+        );
+        match sends(&out).as_slice() {
+            [(2, PeerMsg::ReadIndexReply { outcome, .. })] => assert!(
+                matches!(
+                    outcome,
+                    ReadIndexOutcome::Ok {
+                        grant: None,
+                        ahead: None,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            ),
+            other => panic!("expected one plain reply: {other:?}"),
+        }
+        // A write that does not land in time: the read waits no longer
+        // than the bound, then gets its position alone.
+        let (mut h, _) = holder_with_files();
+        h.cold_horizon = true;
+        h.manual_horizon = true;
+        let first = ask(&mut h, 1);
+        assert!(sends(&first).is_empty());
+        let (id, after_ms) = first
+            .iter()
+            .find_map(|a| match a {
+                Action::SetTimer {
+                    id,
+                    after_ms,
+                    kind: TimerKind::HorizonPark,
+                } => Some((*id, *after_ms)),
+                _ => None,
+            })
+            .expect("no hold timer");
+        assert_eq!(after_ms, 100);
+        h.advance(100);
+        let out = h.core.handle(h.clk(), Event::Timer { id }, &h.meta);
+        match sends(&out).as_slice() {
+            [(2, PeerMsg::ReadIndexReply { outcome, .. })] => assert!(
+                matches!(
+                    outcome,
+                    ReadIndexOutcome::Ok {
+                        grant: None,
+                        ahead: None,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            ),
+            other => panic!("expected one plain reply: {other:?}"),
+        }
+        // Reads arriving until the write lands are answered at once, not
+        // held for the bound each.
+        let late = ask(&mut h, 2);
+        assert_eq!(sends(&late).len(), 1, "{late:?}");
+        // The write that lands after it finds nothing held.
+        let (kind, until) = persist_of(&first).unwrap();
+        let durable = h.meta.persist_grant_horizon(kind, until, h.clk()).ok();
+        let out = h.core.handle(
+            h.clk(),
+            Event::GrantHorizonPersisted {
+                kind,
+                until,
+                durable,
+            },
+            &h.meta,
+        );
+        assert!(sends(&out).is_empty(), "{out:?}");
+    }
+
     /// The read-ahead of a ReadIndex: a listing's first chunk (or a lookup
     /// that misses a child's delegation) is answered with ordinary
     /// delegations on the directory's files, in name order from the entry
@@ -75724,7 +75877,14 @@ mod grant_horizon_bench {
                 meta.note_grant_horizon(until, now).is_ok()
             } else {
                 while let Ok((kind, until, durable)) = done_rx.try_recv() {
-                    core.on_grant_horizon_persisted(kind, until, durable);
+                    core.on_grant_horizon_persisted(
+                        now,
+                        kind,
+                        until,
+                        durable,
+                        &*meta,
+                        &mut Vec::new(),
+                    );
                 }
                 let covered = core.grant_horizon_covers(GrantHorizon::Root, now, until, &*meta);
                 let mut out = Vec::new();

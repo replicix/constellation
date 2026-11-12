@@ -1678,6 +1678,9 @@ pub struct Stats {
     pub grant_horizon_writes: u64,
     pub grant_horizon_failed: u64,
     pub read_grants_uncovered: u64,
+    /// Strict reads held until the root's horizon write landed, so that
+    /// they are granted (`Core::serve_read_index`).
+    pub read_index_horizon_parked: u64,
     /// Plan 41 L0: renewal answers (lock grants, own and peers', and
     /// delegations) held because the tenure's S3 liveness was stale or
     /// it was not marked as granting; the lease reads issued for them;
@@ -2328,6 +2331,8 @@ enum Timer {
     StreamWatchdog,
     GrantExpiry(u64),
     GrantQuarantine,
+    /// See `TimerKind::HorizonPark`.
+    HorizonPark,
     /// The write quarantine of a restarted holder's generation ends
     /// (`Core::on_deleg_restart_quarantine`).
     DelegRestartQuarantine(u64),
@@ -2421,6 +2426,7 @@ impl Timer {
             Timer::StreamWatchdog => TimerKind::StreamWatchdog,
             Timer::GrantExpiry(_) => TimerKind::GrantExpiry,
             Timer::GrantQuarantine => TimerKind::GrantQuarantine,
+            Timer::HorizonPark => TimerKind::HorizonPark,
             Timer::FlushFloor => TimerKind::FlushFloor,
             Timer::HeldReply(_) => TimerKind::HeldReply,
             Timer::ReadIndexTimeout(_) => TimerKind::ReadIndexTimeout,
@@ -3052,7 +3058,7 @@ impl Core {
                 kind,
                 until,
                 durable,
-            } => self.on_grant_horizon_persisted(kind, until, durable),
+            } => self.on_grant_horizon_persisted(now, kind, until, durable, replica, &mut out),
             Event::LockHorizonPersisted { until, durable } => {
                 self.on_lock_horizon_persisted(now, until, durable, replica, &mut out)
             }
@@ -3860,6 +3866,7 @@ impl Core {
             Timer::StreamWatchdog => self.on_stream_watchdog(now, out),
             Timer::GrantExpiry(grant) => self.on_grant_expiry(now, grant, replica, out),
             Timer::GrantQuarantine => self.on_grant_quarantine(now, replica, out),
+            Timer::HorizonPark => self.on_horizon_park_timer(now, replica, out),
             Timer::HeldReply(park) => self.on_held_reply_timer(now, park, replica, out),
             Timer::ReadIndexTimeout(req) => self.on_read_index_timeout(now, req, out),
             Timer::ReadIndexRetry(op) => self.on_read_index_retry(now, op, replica, out),
