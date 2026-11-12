@@ -2055,6 +2055,87 @@ mod tests {
         )));
     }
 
+    /// ADR-55 (M3): a stream's index order is an exclusive key of the ship
+    /// plan. A held row of delegation stream `gen` holds every later row of
+    /// `gen` too, though they touch other keys: shipping index 3 ahead of a
+    /// held index 2 leaves a hole in the log's stream, and the successor's
+    /// cursor, raised to the highest index it saw, skips the re-streamed
+    /// row for good. Fails on the parent: the plan shipped index 3.
+    #[test]
+    fn a_held_stream_row_holds_the_later_rows_of_its_stream() {
+        use crate::mutate::MutateOp;
+        use crate::MetaStore;
+        use constellation_fs_core::types::ROOT_INO;
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_holder_epoch(1);
+        let files: Vec<Ino> = (1..=3)
+            .map(|i| {
+                meta.create(ROOT_INO, &format!("f{i}"), 0o644, 0, 0)
+                    .unwrap()
+                    .ino
+            })
+            .collect();
+        let shipped = |segment: u64| -> Vec<LogRecord> {
+            let rows = meta.take_shippable(usize::MAX).unwrap();
+            let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+            if !seqs.is_empty() {
+                meta.ack_journal_rows_at(&seqs, segment).unwrap();
+            }
+            rows.into_iter().map(|(_, r)| r).collect()
+        };
+        shipped(1);
+        let gen = (1u64 << 32) | 1;
+        let setattr = |ino: Ino, mode: u32| MutateOp::Setattr {
+            ino,
+            mode: Some(mode),
+            uid: None,
+            gid: None,
+            size: None,
+            atime_ns: None,
+            mtime_ns: None,
+        };
+        let run = |op: &MutateOp| {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            crate::mutate::execute(&meta, op, None).unwrap();
+        };
+        // Index 1 ships; index 2 is a seed whose chunk is lost; index 3 is on
+        // another file.
+        run(&setattr(files[0], 0o600));
+        let hash = ChunkHash::of(b"lost");
+        let manifest = Manifest {
+            layout: replicix_chunkfmt::ChunkLayout::new(4096),
+            file_len: 7,
+            chunks: ChunkInfo::Inline(BTreeMap::from([(0u64, hash)])),
+        }
+        .encode();
+        {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            meta.set_manifest_dirty(files[1], None, &manifest, 7, None, None, &[hash])
+                .unwrap();
+        }
+        run(&setattr(files[2], 0o600));
+        assert_eq!(meta.delegate_idx(gen).unwrap(), 3);
+        meta.note_unrecoverable_chunks(&[(hash, files[1])], false)
+            .unwrap();
+        shipped(2);
+        let left: Vec<u64> = meta
+            .delegate_rows_for_audit(gen)
+            .unwrap()
+            .into_iter()
+            .map(|(idx, ..)| idx)
+            .collect();
+        assert_eq!(
+            left,
+            vec![2, 3],
+            "index 3 shipped ahead of the held index 2: a hole in the log's stream"
+        );
+        // Released: the rest ships, in order.
+        meta.note_unrecoverable_chunks(&[], true).unwrap();
+        meta.cancel_pending_upload(&hash, files[1]).unwrap();
+        shipped(3);
+        assert!(meta.delegate_rows_for_audit(gen).unwrap().is_empty());
+    }
+
     /// ADR-58 M1 (review): a transaction waiting for this node's own upload is
     /// not behind a lost chunk. The refusal of an op that touched a file
     /// whose chunk is still uploading here is merely deferred: it ships by
