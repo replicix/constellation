@@ -625,6 +625,9 @@ impl Core {
                     .is_some_and(|until| *until > now.wait)
                     && self.deleg_read_owner(now, *ino, None, replica).is_none()
                     && !self.under_pending_designation(now, *ino, replica)
+                    // ADR-57: no grant over a key a pending acknowledged row
+                    // touches (as `maybe_grant`'s).
+                    && !replica.read_hold_touches_ino(*ino)
             })
             .collect();
         if inos.is_empty() {

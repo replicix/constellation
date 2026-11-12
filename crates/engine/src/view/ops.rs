@@ -93,6 +93,7 @@ macro_rules! admit {
             $self.lock_tag_scope($cx),
             constellation_meta::fault_caller_scope($cx.caller.pid),
         );
+        let _read_cancel = $self.read_cancel_scope($cx);
     };
     // The caller checks the owner fence itself (`fsync`: after `enter!`).
     ($self:expr, $cx:expr, $r:ident, $admitted:ident, owner_fence_checked_later) => {
@@ -107,6 +108,7 @@ macro_rules! admit {
             $self.lock_tag_scope($cx),
             constellation_meta::fault_caller_scope($cx.caller.pid),
         );
+        let _read_cancel = $self.read_cancel_scope($cx);
     };
 }
 
@@ -279,67 +281,92 @@ impl Vfs for View {
                 return;
             }
         }
-        // Plan 30 §M8: under `--cto strict` a lookup sees every entry
-        // another node's completed close made (the first step of an
-        // open by path).
-        let child_covered = match self.strict_read(
-            parent,
-            true,
-            Some(&name),
-            &[ReadKey::Dentry(parent, name.to_string())],
-        ) {
-            Ok(covered) => covered,
-            Err(code) => {
-                r.done(err(code));
-                return;
-            }
+        // ADR-57: a hold indexed after the wait below passed and before the
+        // read finished means the read may not have seen a row the hold is
+        // for: wait and read again (`Meta::hold_raced`).
+        let keys = |child: Ino| {
+            [
+                ReadKey::Dentry(parent, name.to_string()),
+                ReadKey::Ino(child),
+            ]
         };
-        constellation_vfs::watch::stage("meta read");
-        match self.meta.lookup(parent, &name) {
-            Ok(Some(attr)) => {
-                // Plan 30 §M6: a lookup returns the child's attributes,
-                // so it waits for the child's `Ino` as `getattr` does for
-                // its own — the dentry's wait above says nothing of the
-                // inode it leads to (a rename's or an exchange's shadow
-                // covers the entries, not the inode). The child is only known after the
-                // dentry is read, and the wait comes before `current_attr`
-                // takes the write shard: never block while holding one.
-                // The entry is not looked up again afterwards: a rename
-                // during the wait is concurrent with this lookup, and the
-                // reply names the inode the name led to; `current_attr`
-                // reads the inode's row anew.
-                //
-                // Under `--cto strict`, a lookup served under the parent's
-                // read delegation has not covered the child's attributes
-                // (`strict_read`'s `false`): another node's close of the
-                // child recalls the child's grants, not the parent's, and
-                // the reply would hand the kernel the size from before
-                // that close (`readdirplus-strict`'s stat; with a fresh
-                // `GETATTR` reply dropped by a racing notification, the
-                // open's read stops at that size: `""`). The child is read
-                // strictly then.
-                let child_wait = if child_covered {
-                    self.session_wait(&[ReadKey::Ino(attr.ino)])
-                } else {
-                    self.strict_child_read(parent, &name, attr.ino, attr.kind == InodeKind::Dir)
-                };
-                if let Err(code) = child_wait {
+        loop {
+            let epoch = self.meta.hold_epoch();
+            // Plan 30 §M8: under `--cto strict` a lookup sees every entry
+            // another node's completed close made (the first step of an
+            // open by path).
+            let child_covered = match self.strict_read(
+                parent,
+                true,
+                Some(&name),
+                &[ReadKey::Dentry(parent, name.to_string())],
+            ) {
+                Ok(covered) => covered,
+                Err(code) => {
                     r.done(err(code));
                     return;
                 }
-                // A name looked up while its inode has pending writes
-                // must report the pending size, or the entry reply caches
-                // a stale one (`current_attr`). The ino is only known
-                // after the lookup, so the row is re-read under the shard.
-                // `None`: the inode vanished since the lookup; the looked-up
-                // row is the best there is.
-                match self.current_attr(attr.ino) {
-                    Ok(current) => r.done(Ok(self.entry_out(&current.unwrap_or(attr)))),
-                    Err(code) => r.done(err(code)),
+            };
+            constellation_vfs::watch::stage("meta read");
+            match self.meta.lookup(parent, &name) {
+                Ok(Some(attr)) => {
+                    // Plan 30 §M6: a lookup returns the child's attributes,
+                    // so it waits for the child's `Ino` as `getattr` does for
+                    // its own — the dentry's wait above says nothing of the
+                    // inode it leads to (a rename's or an exchange's shadow
+                    // covers the entries, not the inode). The child is only known after the
+                    // dentry is read, and the wait comes before `current_attr`
+                    // takes the write shard: never block while holding one.
+                    // The entry is not looked up again afterwards: a rename
+                    // during the wait is concurrent with this lookup, and the
+                    // reply names the inode the name led to; `current_attr`
+                    // reads the inode's row anew.
+                    //
+                    // Under `--cto strict`, a lookup served under the parent's
+                    // read delegation has not covered the child's attributes
+                    // (`strict_read`'s `false`): another node's close of the
+                    // child recalls the child's grants, not the parent's, and
+                    // the reply would hand the kernel the size from before
+                    // that close (`readdirplus-strict`'s stat; with a fresh
+                    // `GETATTR` reply dropped by a racing notification, the
+                    // open's read stops at that size: `""`). The child is read
+                    // strictly then.
+                    let child_wait = if child_covered {
+                        self.session_wait(&[ReadKey::Ino(attr.ino)])
+                    } else {
+                        self.strict_child_read(parent, &name, attr.ino, attr.kind == InodeKind::Dir)
+                    };
+                    if let Err(code) = child_wait {
+                        r.done(err(code));
+                        return;
+                    }
+                    // A name looked up while its inode has pending writes
+                    // must report the pending size, or the entry reply caches
+                    // a stale one (`current_attr`). The ino is only known
+                    // after the lookup, so the row is re-read under the shard.
+                    // `None`: the inode vanished since the lookup; the looked-up
+                    // row is the best there is.
+                    let current = self.current_attr(attr.ino);
+                    if self.meta.hold_raced(epoch, &keys(attr.ino)) {
+                        continue;
+                    }
+                    match current {
+                        Ok(current) => r.done(Ok(self.entry_out(&current.unwrap_or(attr)))),
+                        Err(code) => r.done(err(code)),
+                    }
                 }
+                Ok(None) => {
+                    if self
+                        .meta
+                        .hold_raced(epoch, &[ReadKey::Dentry(parent, name.to_string())])
+                    {
+                        continue;
+                    }
+                    r.done(err(self.beneath_non_dir(Code::NotFound, &[parent])))
+                }
+                Err(e) => r.done(err(e.code())),
             }
-            Ok(None) => r.done(err(self.beneath_non_dir(Code::NotFound, &[parent]))),
-            Err(e) => r.done(err(e.code())),
+            return;
         }
     }
 
@@ -367,11 +394,19 @@ impl Vfs for View {
         //
         // Plan 30 §M6: the session wait comes first — never block while
         // holding a write shard.
-        if let Err(code) = self.session_wait(&[ReadKey::Ino(ino)]) {
-            r.done(err(code));
-            return;
-        }
-        match self.current_attr(ino) {
+        let attr = loop {
+            let epoch = self.meta.hold_epoch();
+            if let Err(code) = self.session_wait(&[ReadKey::Ino(ino)]) {
+                r.done(err(code));
+                return;
+            }
+            let attr = self.current_attr(ino);
+            // ADR-57: a hold indexed since the wait: wait and read again.
+            if !self.meta.hold_raced(epoch, &[ReadKey::Ino(ino)]) {
+                break attr;
+            }
+        };
+        match attr {
             Ok(Some(attr)) => {
                 // Plan 42 K1's fault point: a reply generated now and
                 // answered later (race 2b).
@@ -571,11 +606,18 @@ impl Vfs for View {
             }
             return;
         }
-        if let Err(code) = self.session_wait(&[ReadKey::Ino(ino)]) {
-            r.done(err(code));
-            return;
-        }
-        match self.meta.readlink(ino) {
+        let target = loop {
+            let epoch = self.meta.hold_epoch();
+            if let Err(code) = self.session_wait(&[ReadKey::Ino(ino)]) {
+                r.done(err(code));
+                return;
+            }
+            let target = self.meta.readlink(ino);
+            if !self.meta.hold_raced(epoch, &[ReadKey::Ino(ino)]) {
+                break target;
+            }
+        };
+        match target {
             Ok(Some(target)) => {
                 r.done(Ok(constellation_vfs::name::wire_bytes(&target).into_owned()))
             }
@@ -1268,16 +1310,23 @@ impl Vfs for View {
             return;
         }
         // Plan 30 §M8: under `--cto strict`, the close-to-open point.
-        if let Err(code) = self.strict_read(ino, false, None, &[ReadKey::Ino(ino)]) {
-            r.done(err(code));
-            return;
-        }
-        // Plan 42 §5.1.1: the record read answers the cache stamp too
-        // (a node-local scratch file has none).
-        let attr = self.meta.getattr_stamped(ino).and_then(|attr| match attr {
-            Some(stamped) => Ok(Some(stamped)),
-            None => Ok(self.meta.scratch_getattr(ino)?.map(|attr| (attr, None))),
-        });
+        let attr = loop {
+            // ADR-57: a hold indexed since the wait: wait and read again.
+            let epoch = self.meta.hold_epoch();
+            if let Err(code) = self.strict_read(ino, false, None, &[ReadKey::Ino(ino)]) {
+                r.done(err(code));
+                return;
+            }
+            // Plan 42 §5.1.1: the record read answers the cache stamp too
+            // (a node-local scratch file has none).
+            let attr = self.meta.getattr_stamped(ino).and_then(|attr| match attr {
+                Some(stamped) => Ok(Some(stamped)),
+                None => Ok(self.meta.scratch_getattr(ino)?.map(|attr| (attr, None))),
+            });
+            if !self.meta.hold_raced(epoch, &[ReadKey::Ino(ino)]) {
+                break attr;
+            }
+        };
         match attr {
             Ok(Some((attr, stamp))) => {
                 *self.opens.lock().unwrap().entry(ino).or_insert(0) += 1;
@@ -1954,6 +2003,16 @@ impl Vfs for View {
                 r.done(self.ino_err(ino, code));
                 return;
             }
+        } else if self.meta.read_admission(&[ReadKey::Dir(ino)])
+            == constellation_meta::Admission::Held
+        {
+            // ADR-57: a continuation page does not wait for the session (the
+            // listing began with one), but a hold on the directory set since
+            // the first page applies to it too.
+            if let Err(code) = self.session_wait(&[ReadKey::Dir(ino)]) {
+                r.done(self.ino_err(ino, code));
+                return;
+            }
         }
         // Name-ordered range scan resumed from the cookie's name: O(page)
         // (plan 40 §4.9, `listing`).
@@ -2239,45 +2298,52 @@ impl Vfs for View {
             Ok(name) => name,
             Err(error) => return r.done(self.ino_err(ino, error)),
         };
-        if !View::is_synthetic(ino) {
-            if let Err(code) = self.session_wait(&[ReadKey::Ino(ino)]) {
-                return r.done(self.ino_err(ino, code));
-            }
-        }
-        let value = if self.policies.xattrs.is_virtual(&name) {
-            let aggregate = if View::is_synthetic(ino) {
-                self.synthetic_recursive_size(ino)
-            } else {
-                self.meta.recursive_size(ino).map_err(|error| error.code())
-            };
-            match aggregate {
-                Ok((rsize, rcount)) => {
-                    if name == RSIZE_XATTR {
-                        rsize.to_string().into_bytes()
-                    } else {
-                        debug_assert_eq!(name, RCOUNT_XATTR);
-                        rcount.to_string().into_bytes()
-                    }
+        let value = loop {
+            // ADR-57: a hold indexed since the wait: wait and read again.
+            let epoch = self.meta.hold_epoch();
+            if !View::is_synthetic(ino) {
+                if let Err(code) = self.session_wait(&[ReadKey::Ino(ino)]) {
+                    return r.done(self.ino_err(ino, code));
                 }
-                Err(error) => return r.done(self.ino_err(ino, error)),
             }
-        } else {
-            let result = if View::is_synthetic(ino) {
-                self.synthetic_xattrs(ino)
-                    .map(|attrs| attrs.into_iter().find(|(key, _)| key == &name).map(|x| x.1))
-            } else if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
-                self.meta
-                    .scratch_get_xattr(ino, &name)
-                    .map_err(|error| error.code())
+            let value = if self.policies.xattrs.is_virtual(&name) {
+                let aggregate = if View::is_synthetic(ino) {
+                    self.synthetic_recursive_size(ino)
+                } else {
+                    self.meta.recursive_size(ino).map_err(|error| error.code())
+                };
+                match aggregate {
+                    Ok((rsize, rcount)) => {
+                        if name == RSIZE_XATTR {
+                            rsize.to_string().into_bytes()
+                        } else {
+                            debug_assert_eq!(name, RCOUNT_XATTR);
+                            rcount.to_string().into_bytes()
+                        }
+                    }
+                    Err(error) => return r.done(self.ino_err(ino, error)),
+                }
             } else {
-                self.meta
-                    .get_xattr(ino, &name)
-                    .map_err(|error| error.code())
+                let result = if View::is_synthetic(ino) {
+                    self.synthetic_xattrs(ino)
+                        .map(|attrs| attrs.into_iter().find(|(key, _)| key == &name).map(|x| x.1))
+                } else if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
+                    self.meta
+                        .scratch_get_xattr(ino, &name)
+                        .map_err(|error| error.code())
+                } else {
+                    self.meta
+                        .get_xattr(ino, &name)
+                        .map_err(|error| error.code())
+                };
+                match result {
+                    Ok(Some(value)) => value,
+                    Ok(None) => return r.done(self.ino_err(ino, Code::NoData)),
+                    Err(error) => return r.done(self.ino_err(ino, error)),
+                }
             };
-            match result {
-                Ok(Some(value)) => value,
-                Ok(None) => return r.done(self.ino_err(ino, Code::NoData)),
-                Err(error) => return r.done(self.ino_err(ino, error)),
+            if View::is_synthetic(ino) || !self.meta.hold_raced(epoch, &[ReadKey::Ino(ino)]) {
+                break value;
             }
         };
         r.done(Ok(value));
@@ -2421,20 +2487,27 @@ impl Vfs for View {
         let _w = self.watch.enter("listxattr", ino);
         admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
-        if !View::is_synthetic(ino) {
-            if let Err(code) = self.session_wait(&[ReadKey::Ino(ino)]) {
-                return r.done(self.ino_err(ino, code));
+        let names = loop {
+            // ADR-57: a hold indexed since the wait: wait and read again.
+            let epoch = self.meta.hold_epoch();
+            if !View::is_synthetic(ino) {
+                if let Err(code) = self.session_wait(&[ReadKey::Ino(ino)]) {
+                    return r.done(self.ino_err(ino, code));
+                }
             }
-        }
-        let names = if View::is_synthetic(ino) {
-            self.synthetic_xattrs(ino)
-                .map(|attrs| attrs.into_iter().map(|(name, _)| name).collect())
-        } else if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
-            self.meta
-                .scratch_list_xattrs(ino)
-                .map_err(|error| error.code())
-        } else {
-            self.meta.list_xattrs(ino).map_err(|error| error.code())
+            let names = if View::is_synthetic(ino) {
+                self.synthetic_xattrs(ino)
+                    .map(|attrs| attrs.into_iter().map(|(name, _)| name).collect())
+            } else if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
+                self.meta
+                    .scratch_list_xattrs(ino)
+                    .map_err(|error| error.code())
+            } else {
+                self.meta.list_xattrs(ino).map_err(|error| error.code())
+            };
+            if View::is_synthetic(ino) || !self.meta.hold_raced(epoch, &[ReadKey::Ino(ino)]) {
+                break names;
+            }
         };
         match names {
             Ok(mut names) => {

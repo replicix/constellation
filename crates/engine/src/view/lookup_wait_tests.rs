@@ -387,3 +387,96 @@ fn a_lookup_of_a_held_name_fails_with_eio_after_the_span() {
     );
     assert_eq!(meta.read_hold_stats().refused, 1);
 }
+
+/// A node whose root holds `other` and a held name `held` (a gated row this
+/// node rolled back, the log lacking it), the read hold span `span`.
+fn node_with_a_held_name(span: Duration) -> (Arc<Meta>, View, tempfile::TempDir) {
+    use constellation_meta::{execute_mutate, MutateOp, PendingClass, RowCommit};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    meta.create(ROOT_INO, "other", 0o644, 0, 0).unwrap();
+    meta.set_holder_epoch(1);
+    {
+        let _class = PendingClass::set(RowCommit::ROOT_GROUP);
+        execute_mutate(
+            &meta,
+            &MutateOp::Create {
+                parent: ROOT_INO,
+                name: "held".into(),
+                ino: (1 << 40) | 1,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            Some(constellation_meta::Rid {
+                node: 2,
+                incarnation: 1,
+                seq: 1,
+            }),
+        )
+        .unwrap();
+    }
+    meta.set_holder_epoch(0);
+    assert_eq!(meta.strand_below_epoch(2).unwrap().member_copied, 1);
+    let (mut fs, tmp, _core) = holder_fs(meta.clone(), false);
+    fs.sync.as_mut().unwrap().lease = Arc::new(crate::lease::LeaseView::default());
+    meta.session().set_budget_ms(0);
+    meta.set_read_hold_span(span);
+    (meta, fs, tmp)
+}
+
+/// ADR-57 review SHOULD-7: a lookup held for a row ends with `EINTR` when
+/// its caller is interrupted, not after the read hold span, and the dispatch
+/// thread is free again.
+#[test]
+fn a_held_lookup_ends_with_the_callers_interrupt() {
+    let (meta, fs, _tmp) = node_with_a_held_name(Duration::from_secs(10));
+    let caller = Caller::root();
+    let cancel = constellation_vfs::CancelToken::new();
+    let t = std::time::Instant::now();
+    let got = std::thread::scope(|sc| {
+        let c = cancel.clone();
+        sc.spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            c.cancel();
+        });
+        Blocking::run(|r| {
+            let mut cx = OpCtx::new(OpKind::Lookup, &caller);
+            cx.cancel = Some(&cancel);
+            fs.lookup(&cx, ROOT_INO, Name::new("held"), r)
+        })
+    });
+    assert_eq!(
+        got.err().map(|e| e.code()),
+        Some(constellation_types::Code::Intr)
+    );
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert!(
+        meta.member_copy_touches(&[constellation_meta::ReadKey::Dentry(ROOT_INO, "held".into())])
+    );
+}
+
+/// ADR-57 review SHOULD-5: a continuation page of a listing (`cookie != 0`)
+/// of a directory a held row touches waits for the row and fails with `EIO`
+/// after the span, as the first page does.
+#[test]
+fn a_continuation_page_of_a_held_directory_fails_with_eio_after_the_span() {
+    let span = Duration::from_millis(300);
+    let (_meta, fs, _tmp) = node_with_a_held_name(span);
+    let caller = Caller::root();
+    let t = std::time::Instant::now();
+    let (sink, wait) = constellation_vfs::CollectDir::pair(100);
+    fs.readdir(
+        &OpCtx::new(OpKind::Readdir, &caller),
+        ROOT_INO,
+        constellation_vfs::Fh(0),
+        1,
+        false,
+        sink,
+    );
+    let got = wait.wait();
+    assert!(t.elapsed() >= span, "waited the span: {:?}", t.elapsed());
+    assert_eq!(
+        got.err().map(|e| e.code()),
+        Some(constellation_types::Code::Io)
+    );
+}

@@ -9440,6 +9440,8 @@ struct OracleTotals {
     /// held row (violations), delegate rows a recall dropped, of them
     /// acknowledged and lost (violations)].
     holds: [u64; 5],
+    /// ADR-57: strand-to-release age (ms) of every read hold released.
+    hold_lifetimes: Vec<u64>,
     /// Plan 43 C7b: [TTL claims, of a live holder, seals of a live holder,
     /// permitted claims] and the seeds with a claim of a live holder.
     lease: [u64; 4],
@@ -9585,6 +9587,8 @@ impl OracleTotals {
         self.holds[1] += r.sessions.held_served as u64;
         self.holds[2] += r.recall_dropped as u64;
         self.holds[3] += r.recall_dropped_acked as u64;
+        self.hold_lifetimes
+            .extend(r.hold_lifetimes_ms.iter().copied());
         self.holds[4] += r.sessions.unserved as u64;
         self.seg[0] += r.segments_landed.0;
         self.seg[1] += r.segments_landed.1;
@@ -10108,6 +10112,18 @@ impl OracleTotals {
              delegate rows dropped by a recall {}, of them acknowledged and lost {}, reads refused \
              (EIO) after the read hold span {}",
             self.seeds, self.holds[0], self.holds[1], self.holds[2], self.holds[3], self.holds[4]
+        );
+        let mut life = self.hold_lifetimes.clone();
+        life.sort_unstable();
+        let at = |q: usize| life.get((life.len().saturating_sub(1)) * q / 100).copied();
+        eprintln!(
+            "SWEEP-HOLD-LIFETIMES {label} seeds {}/{seeds}: {} holds released, strand to release (sim ms) \
+             p50 {:?} p90 {:?} max {:?}",
+            self.seeds,
+            life.len(),
+            at(50),
+            at(90),
+            life.last()
         );
         eprintln!(
             "SWEEP-C14-TOTALS {label} seeds {}/{seeds}: committed rolled back {}, superseded by a \

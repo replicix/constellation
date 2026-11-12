@@ -1524,6 +1524,9 @@ pub struct Report {
     /// history shows acknowledged and the log never carried (must be 0).
     pub recall_dropped: usize,
     pub recall_dropped_acked: usize,
+    /// ADR-57: the age in ms (strand to release) of each read hold released
+    /// in the run.
+    pub hold_lifetimes_ms: Vec<u64>,
     pub non_verbatim: usize,
     /// Plan 46 M1.2 step 3, `acked_at_or_below_cut`: rows answered past their
     /// stream's cut, the answered rows of cut streams judged, and those an
@@ -2240,6 +2243,7 @@ async fn client_read(
     // for the row's return whatever its session budget, up to the read hold
     // span, and is then refused (`EIO`): never answered without the row. The
     // product runs the same rule in `Meta::session_wait`; here it is polled.
+    let hold_epoch0 = handle.meta.hold_epoch();
     let span_ms = u64::try_from(handle.meta.read_hold_span().as_millis()).unwrap_or(u64::MAX);
     let mut held = false;
     let mut unserved = false;
@@ -2297,13 +2301,19 @@ async fn client_read(
             handle.meta.applied_pos(),
         );
     }
-    // (Never true: the answer below is given only when nothing is held.)
-    let held_served =
-        !unserved && handle.meta.read_admission(&keys) == constellation_meta::Admission::Held;
     let present = constellation_meta::MetaStore::lookup(&*handle.meta, parent, &leaf)
         .ok()
         .flatten()
         .is_some();
+    // Judged after the lookup, as the product re-checks after its read
+    // (`Meta::hold_raced`): the answer was given while a pending acknowledged
+    // row touched its keys, whether the hold was there before the wait ended
+    // or came in since the read began. (The sim's read has no await between
+    // the last check and the lookup, so this stays false unless the hold
+    // phase let a read through.)
+    let held_served = !unserved
+        && (handle.meta.read_admission(&keys) == constellation_meta::Admission::Held
+            || handle.meta.hold_raced(hold_epoch0, &keys));
     tracing::debug!(
         node = handle.id,
         now = handle.clock.wall().0,
@@ -5125,6 +5135,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let commits: Arc<Mutex<Vec<CommitRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let in_doubt: super::node::InDoubtLog = Arc::new(Mutex::new(Vec::new()));
     let recall_drops: super::node::RecallDrops = Arc::new(Mutex::new(Vec::new()));
+    let hold_lifetimes: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let oracles = super::oracle::Oracles::new(bucket.clone());
     // Plan 43 C7a (commit 6): the default clock-fault mix.
     let horizon = cfg.ops_per_client * 400 + 2_000;
@@ -5138,6 +5149,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         commits: commits.clone(),
         in_doubt: in_doubt.clone(),
         recall_drops: recall_drops.clone(),
+        hold_lifetimes: hold_lifetimes.clone(),
         config: cfg.core.clone(),
         panic_after_events: cfg.panic_after_events,
         fast_path: cfg.fast_path,
@@ -6903,6 +6915,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // acknowledged `Ok` and the log never carried is an acknowledged row
     // lost (the fix is in the seal, not a hold).
     {
+        report.hold_lifetimes_ms = hold_lifetimes.lock().unwrap().clone();
         let drops = recall_drops.lock().unwrap().clone();
         report.recall_dropped = drops.len();
         let acked: HashSet<Rid> = history

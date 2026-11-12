@@ -444,6 +444,8 @@ pub struct NodeEnv {
     /// ADR-57 P5: every delegate row a recall dropped from a root's journal
     /// (node, gen, idx, rid).
     pub recall_drops: RecallDrops,
+    /// ADR-57: the age (ms) of every read hold when it was released.
+    pub hold_lifetimes: Arc<Mutex<Vec<u64>>>,
     pub config: Arc<dyn Fn(NodeId, u32) -> Config + Send + Sync>,
     /// See `SimConfig::panic_after_events`.
     pub panic_after_events: Option<u64>,
@@ -647,6 +649,7 @@ impl NodeHandle {
                 Arc::new(m)
             }
         };
+        meta.set_hold_lifetime_sink(env.hold_lifetimes.clone());
         let incarnation = meta.bump_incarnation().expect("incarnation");
         // ADR-57: the read hold span of the configuration this incarnation
         // runs (the daemon sets the same from its own).
