@@ -136,3 +136,74 @@ ext4 `chmod` (+12/+20 then) and tmpfs `unlink` (+12/+26 then), are -2/+3 and
 answer the plan gates, is -19/-24 (ext4), +5/+4 (xfs), -21/-30 (btrfs) and
 +0/-4 (tmpfs), the btrfs and ext4 gains being the A/A's own spread. Neutral on
 all four file systems.
+
+
+## Plan 46 M1.3 step 9, the own stream's honour rule (ADR-55, R-H / R-X): topologies 1 and 8
+
+A = the step before this round (`aae238d3`), B = this round; ABBA (A B, B A),
+two rounds, 200 samples per op and run, one box, the harness's own daemons, each
+file system as the `TMPDIR` (`bench/commit-rule/g1-abba.sh`, topologies `1` and
+`8`; one 1-minute load before each run: 0.04 to 0.5). Topology 8 runs under
+`net-wan` (`tc netem`, a 200 ms round trip) with `ACK_LATENCY_SLASH_LOAD=1`:
+two writers load `/` while the root-own ops are measured, one on the root (its
+own rows in `/`) and one on b (forwarded to the root). Each of their writes
+waits for the archive (about 200 ms): the root's writer wrote about 30 files
+in the measured phase of a run and b's 1 to 2, so the journal of `/` holds
+unshipped root rows throughout, but the load is light; the stream's ops are
+measured beside it, not under a saturated `/`. Median over the runs of p50 / p90 (us); B/A of
+the p50.
+
+| file system | topology / actor / op | A | B | B/A |
+|---|---|---|---|---|
+| tmpfs | 8 root-own create | 128 / 180 | 118 / 150 | 0.92 |
+| tmpfs | 8 root-own rename | 144 / 192 | 118 / 150 | 0.82 |
+| tmpfs | 8 root-own unlink | 90 / 134 | 94 / 137 | 1.04 |
+| tmpfs | 8 root-own chmod | 70 / 111 | 70 / 112 | 1.00 |
+| tmpfs | 8 root-own write | 159 / 295 | 222 / 358 | 1.40 |
+| tmpfs | 8 first op under the grant | 252 | 318 | 1.26 |
+| tmpfs | 8 root-slash create | 1702 / 1970 | 1690 / 2076 | 0.99 |
+| tmpfs | 8 root-slash rename | 203087 / 203696 | 203078 / 203686 | 1.00 |
+| tmpfs | 1 holder create | 91 / 119 | 81 / 104 | 0.89 |
+| tmpfs | 1 holder write | 146 / 204 | 150 / 206 | 1.03 |
+| ext4 | 8 root-own create | 101 / 131 | 96 / 114 | 0.95 |
+| ext4 | 8 root-own rename | 116 / 151 | 114 / 161 | 0.98 |
+| ext4 | 8 root-own unlink | 100 / 142 | 102 / 149 | 1.02 |
+| ext4 | 8 root-own chmod | 77 / 108 | 60 / 95 | 0.78 |
+| ext4 | 8 root-own write | 3296 / 4328 | 3312 / 4342 | 1.00 |
+| ext4 | 8 first op under the grant | 189 | 260 | 1.38 |
+| ext4 | 8 root-slash create | 1760 / 2692 | 1754 / 2542 | 1.00 |
+| ext4 | 1 holder create | 92 / 120 | 78 / 104 | 0.85 |
+| ext4 | 1 holder write | 3090 / 4061 | 3124 / 4038 | 1.01 |
+| xfs | 8 root-own create | 119 / 140 | 112 / 140 | 0.94 |
+| xfs | 8 root-own rename | 150 / 190 | 150 / 205 | 1.00 |
+| xfs | 8 root-own unlink | 99 / 147 | 112 / 154 | 1.13 |
+| xfs | 8 root-own chmod | 90 / 127 | 91 / 130 | 1.01 |
+| xfs | 8 root-own write | 2028 / 2181 | 2042 / 2190 | 1.01 |
+| xfs | 8 first op under the grant | 300 | 243 | 0.81 |
+| xfs | 8 root-slash create | 1706 / 2134 | 1728 / 1924 | 1.01 |
+| xfs | 1 holder create | 88 / 113 | 72 / 87 | 0.82 |
+| xfs | 1 holder write | 1946 / 2058 | 1968 / 2068 | 1.01 |
+| btrfs | 8 root-own create | 108 / 136 | 124 / 148 | 1.15 |
+| btrfs | 8 root-own rename | 155 / 204 | 136 / 182 | 0.88 |
+| btrfs | 8 root-own unlink | 103 / 144 | 124 / 162 | 1.20 |
+| btrfs | 8 root-own chmod | 90 / 138 | 90 / 130 | 1.00 |
+| btrfs | 8 root-own write | 3212 / 3858 | 3198 / 3866 | 1.00 |
+| btrfs | 8 first op under the grant | 299 | 251 | 0.84 |
+| btrfs | 8 root-slash create | 1716 / 2002 | 1720 / 1950 | 1.00 |
+| btrfs | 1 holder create | 82 / 112 | 90 / 113 | 1.10 |
+| btrfs | 1 holder write | 3083 / 3819 | 3071 / 3803 | 1.00 |
+
+Reading: the root's own ops stay at local speed (60 to 220 us, and the `write`
+of the file system's fsync, 2 to 3.3 ms) with `/` loaded, in A and in B alike;
+the root-slash ops are the archive wait, unchanged (203 ms for a `rename`, 1.7
+ms for a `create` and a `write` that the archive batches). After the first op
+under the grant (240 to 320 us: the one archive wait of the record, already
+there at the first honour) no op of the stream waits for any root row of `/`:
+the rule's second half looks at the rows on the stream's keys only. Topology 1
+(a lone holder, no stream) is neutral: the p50 ratios of 0.81 to 1.23 are
+tens of microseconds on two rounds, both ways on the same cell across file
+systems (the largest, `rename` 1.22/1.23 on xfs and btrfs, is 83 to 101 us and
+72 to 88 us). The `first_under_grant` ratios (1.26, 1.37, 0.81, 0.84) are one
+sample per run, and the other way round on two file systems; the one 1.40
+(tmpfs `root-own` `write`, 159 to 222 us) is the tmpfs's own spread, 1.01 to
+1.01 on the three other file systems, where the cell is the fsync.

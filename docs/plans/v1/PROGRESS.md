@@ -69698,3 +69698,52 @@ model's chunk 14 (a deposed root keeps its grant) was already on main. ADR numbe
   1.15 on ext4, xfs, btrfs and tmpfs (the one 1.20, tmpfs write, was noise: 0.91 in the 5-round repeat), of the root-slash ops 0.97
   to 1.07; the first op under the grant 0.7 to 1.15 (n = 3 to 5). Load before the runs 0.1 to 2.9 (the harness and its S3
   emulator account for about 2).
+
+### Plan 46 M1.3 step 9, the own stream across a deposition: one rule (ADR-55, 2026-11-12)
+
+The fix round's per-op wait (`holder_reaches`, keyed by the lease epoch) and the drain's unguarded refusal were two
+instances of one question: what may the root's own stream rest on at a deposition? ADR-55 now answers it once.
+
+- **R-H** the stream is honoured when the archive carries its last `DelegateNode` record and no root row at or below it is
+  unshipped whose keys resolve to the stream (per key, by ownership: a held row in `/` does not park the subtree). Decided
+  once per event, cached per generation (`OwnGrant`); the lease epoch is no input. **R-X** an own-stream op executes as a far
+  delegate's: `stream_honoured` and its dependencies reached (streams part and "not lost" while the node holds a root tenure;
+  the full position, as any far holder, once it is deposed: its rolled-back root rows are held read-side, ADR-57).
+  `holder_reaches` and `roots_shipped_through` are gone. **R-J** a row of the stream (executed, `Refused`, release) is
+  journaled only through the gate: the drain's `EROFS` arm re-resolves the keys and halts unless the stream is honoured.
+  Liveness: a root row of the stream's keys still unshipped `own_first_op_wait` after the record is in the log makes the root
+  release its own grant as the holder (`root_own_released_unhonoured`). The ship plan keeps a stream contiguous (a held row
+  of stream g holds every later row of g; M3), pinned by the oracle `stream_log_contiguous`.
+- **Chunks**: C1 the fail-before cases; C2 R-H and R-X; C3 R-J; C4 M3 and its oracle; C5 the negative control and these
+  docs; M6 apart (the simulation's definite `EROFS` is a return in the history).
+- **Fail-before on `aae238d3`** T2 (a continuation epoch let the op run at once), T3 (the drain journaled a `Refused` row
+  with the record unarchived: the journal tip moved 1 -> 3), T4 (an unshipped row in `/` kept the op under the granted
+  directory from being answered), T5 (index 3 shipped ahead of the held index 2: left `[2]`, right `[2, 3]`). **T1 and T1b
+  pass on the parent**: after a deposition the core drops the generation's state with the tenure, so the parked op was judged
+  by the replica's full position and waited; the cases stay as regressions of the rule that replaces `holder_reaches`
+  (the store's own check that no local execution touches a name a rolled-back row holds trips if an op ran there).
+- **M6** the sim's client returns a definite `EROFS` in the history (`NsRet::Erofs`) before it invokes the retry under a
+  fresh rid. The two negative controls it then tripped first (`a_root_that_ignores_touched_fails_sticky_ttl`,
+  `an_unfenced_designee_fails_the_stale_route_config`: the refused rid was run by the designee) keep naming the log oracle:
+  the history's verdicts are returned after the log oracles of the run, nothing is relaxed.
+- **Sweeps (x2,000, 0 failing)** `far-root-writes`, `-paused`, `-cross`, `-shared` plain and `+commit`, `+durability`,
+  `+settle`, `+unsettled`; `sticky-ttl`; `far-placement+commit`; `placement-hot+commit`; `sticky-holder-restarts`, `-placed`,
+  `-cut`, `sticky-holder-fresh`, `sticky-holder-returns`; `delegated-root-crash`. `flex+settle+oracles+unsettled`: the same 7
+  failing seeds as main (214, 215, 490, 934, 1340, 1524, 1911). `long-delegated`, `backup` x300 and `delegated-root-crash`:
+  segment counts, bytes and dependency waits identical to `aae238d3`.
+- **The simulation control `own_stream_honours_on_record` does not fail a seed.** R-H without its second half needs a root row
+  of the stream's keys that is still unshipped when the record has shipped: only the ship plan's hold (a poisoned chunk) puts
+  one there, and no sweep configuration has the root lose a chunk of the subtree it then grants. `far-root-writes-paused
+  +durability`, `-shared`, `-cross` and the plain one ran x2,000 with the knob and passed; a configuration with lost chunks
+  (`chunk_writes` and `LoseDirtyChunks` on the root) fails 80 of 300 seeds on `aae238d3` as well, for reasons of its own, and
+  was dropped. The knob is carried by the core case `the_control_that_honours_on_the_record_alone_runs_ahead_of_a_root_row`
+  (it runs the op ahead of the unshipped root row under the directory, which T4 forbids). To do: a sim configuration with a
+  held row below the record.
+- **Harness smoke** (release, seed 42): `delegate-crash`, `delegated-subtrees`, `sticky-abandon`, `takeover-loss-two-node`,
+  `sticky-release-on-unmount`, `root-own-sticky`, `root-own-sticky-unmount` pass.
+- **Perf**: ABBA, topologies 1 and 8 (8 under `net-wan` with writers loading `/`, `ACK_LATENCY_SLASH_LOAD=1`), ext4, xfs,
+  btrfs, tmpfs, two rounds: the root's own ops stay at local speed after the first honour, neutral against `aae238d3`
+  (`bench/commit-rule/RESULTS.md`). Load before the runs 0.04 to 0.5.
+- Not done: the sim control (above); a per-directory honour on growth (honoured per generation, as decided); the core case of
+  the design's S2 (a deferred row, a later row shipped, a deposition, the re-stream not skipped) is carried by the plan's
+  test T5 and the oracle `stream_log_contiguous`, not by a core test.
