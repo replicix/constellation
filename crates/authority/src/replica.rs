@@ -138,10 +138,14 @@ pub trait Replica {
     /// ADR-55: an upper bound of the journal seq of the latest row that is
     /// not a delegate-stream row (the root's own).
     fn journal_root_bound(&self) -> u64;
-    /// ADR-55: the journal seqs of the rows that are not delegate-stream
-    /// rows, still in the journal, at or below `upto` (the root's own rows a
-    /// deposition would roll back).
-    fn journal_root_seqs_through(&self, upto: u64) -> Result<Vec<u64>, MetaError>;
+    /// ADR-55 (R-H): the rows that are not delegate-stream rows, still in
+    /// the journal, starting at or below `upto` (the root's own rows a
+    /// deposition would roll back): each one's first journal seq and the
+    /// keys its records touch.
+    fn journal_root_rows_through(
+        &self,
+        upto: u64,
+    ) -> Result<Vec<(u64, constellation_meta::TouchSet)>, MetaError>;
 
     // ---- speculation (requester side) ----
 
@@ -1077,8 +1081,11 @@ impl Replica for Meta {
     fn journal_root_bound(&self) -> u64 {
         Meta::journal_root_bound(self)
     }
-    fn journal_root_seqs_through(&self, upto: u64) -> Result<Vec<u64>, MetaError> {
-        Meta::journal_root_seqs_through(self, upto)
+    fn journal_root_rows_through(
+        &self,
+        upto: u64,
+    ) -> Result<Vec<(u64, constellation_meta::TouchSet)>, MetaError> {
+        Meta::journal_root_rows_through(self, upto)
     }
 
     fn adopt_streamed(&self, rid: Rid, op: &MutateOp, tag: &LockTag) -> Result<bool, MetaError> {

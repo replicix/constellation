@@ -1205,6 +1205,28 @@ pub(crate) struct LeaveTell {
     pub until: WaitMs,
 }
 
+/// ADR-55 (R-H): the root's own sticky stream, until it is honoured.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OwnGrant {
+    /// The journal seq of the stream's last `DelegateNode` record
+    /// (`u64::MAX`: not known; the stream is never honoured on it).
+    pub record: u64,
+    /// The root rows at or below this journal seq are the ones R-H (b)
+    /// looks at: `record`, or, for a stream found again after a restart
+    /// with its record in the log already, the root rows journaled so far.
+    pub scan_to: u64,
+    /// The decision: see [`DelegationState::own_grants`].
+    pub honoured: bool,
+    /// When the record was journaled: what `Stats::root_own_honour_wait_ms_max`
+    /// and `root_own_commit_wait_ms_max` measure from (a growth that follows
+    /// before the archive carries the first record does not restart it).
+    pub since: WaitMs,
+    /// When this core first saw the archive carry the record, and so when
+    /// an unshipped root row of the stream's keys started to be waited for
+    /// (the liveness bound counts from here).
+    pub covered_at: Option<WaitMs>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct DelegationState {
     /// The `(gen, idx)` rows `deleg_drain_tail` appended since the last
@@ -1288,17 +1310,14 @@ pub(crate) struct DelegationState {
     /// when. Not installed, so nothing executes and no renewal goes out,
     /// until the log carries the record (the archive, for a lone root).
     pub(crate) commit_waiting: BTreeMap<u64, WaitMs>,
-    /// Plan 46 M1.3 step 9 (ADR-55, R-I3): the journal seq of the last
-    /// `DelegateNode` record of each of the root's own sticky streams. The
-    /// root executes under its own grant once the archive carries that row
-    /// ([`Core::own_grant_pending`]): its configuration commits the record
-    /// (the root has no group, or the grant would not be made).
-    pub(crate) own_grant_rows: BTreeMap<u64, u64>,
-    /// When the oldest record of each stream in `own_grant_rows` was
-    /// journaled: what `Stats::root_own_commit_wait_ms_max` measures from (a
-    /// growth that follows before the archive carries the first record does
-    /// not restart the clock).
-    pub(crate) own_grant_since: BTreeMap<u64, WaitMs>,
+    /// Plan 46 M1.3 step 9 (ADR-55, R-H): the root's own sticky streams by
+    /// generation, with the journal seq of the last `DelegateNode` record of
+    /// each and whether the stream is honoured: the archive carries that
+    /// record and no root row at or below it is unshipped whose keys resolve
+    /// to the stream. Decided in [`Core::deleg_after_event`]; once true it
+    /// stays true (no root row under a live own generation enters the
+    /// journal, R-I4) until the next record (a growth) of the stream.
+    pub(crate) own_grants: BTreeMap<u64, OwnGrant>,
     /// The streams this node granted itself while it was the root (a deposed
     /// root keeps streaming them: `Stats::root_own_resumed`).
     pub(crate) own_minted: BTreeSet<u64>,
@@ -1617,7 +1636,7 @@ impl Core {
                     // admitted by the engine's fast path: the op goes to
                     // the core and parks.
                     d.stopped
-                        || self.own_grant_pending(d.gen)
+                        || !self.own_honoured(d.gen)
                         || d.restart_q
                             .as_ref()
                             .is_some_and(|q| q.timer.is_some() && !q.voided),
@@ -1866,44 +1885,158 @@ impl Core {
     }
 
     /// Whether `deps` are reached for an op the holder of stream `gen`
-    /// executes. The root's own stream (ADR-55) is a root that holds its own
-    /// journal: its tenure's journal positions are its own (the root's check,
-    /// [`Replica::reaches_streams`]); a delegate waits for the segments that
-    /// carry them. A stream row (a holder row) survives a deposition, the
-    /// root rows it rests on do not: the ones it names in this tenure's
-    /// journal must be in the log first (M1: a `Final` row on a premise a
-    /// deposition rolls back), which is what a far holder waits for too. The
-    /// stream's own rows are no such premise.
-    pub(crate) fn holder_reaches(&self, gen: u64, deps: &Position, replica: &dyn Replica) -> bool {
-        if self
-            .dl
-            .gens
-            .get(&gen)
-            .is_some_and(|g| !g.ended && g.node == self.cfg.node_id)
-        {
-            replica.reaches_streams(deps)
-                && deps.pending.is_none_or(|p| {
-                    Some(p.epoch) != self.lease.epoch()
-                        || self.roots_shipped_through(p.jseq, replica)
-                })
+    /// executes (R-X). A far delegate waits for the log to carry the whole
+    /// position. The root's own stream (ADR-55) is a root that holds its own
+    /// journal while it holds the tenure, and its session's `applied` moves by segments only
+    /// ([`Replica::reaches_streams`]): the root rows an op rests on are
+    /// [`Self::own_honoured`]'s premise (R-H), the stream's own rows the
+    /// replica's, and a premise lost with its generation is not reached.
+    pub(crate) fn stream_deps_reached(
+        &self,
+        gen: u64,
+        deps: &Position,
+        replica: &dyn Replica,
+    ) -> bool {
+        if self.is_own_stream(gen) && self.root_tenure() {
+            replica.reaches_streams(deps) && !replica.deps_lost(deps)
         } else {
             replica.reaches(deps)
         }
     }
 
-    /// Whether every row of this node's journal that is not a delegate-stream
-    /// row, at or below `jseq`, is in the log ([`Self::archive_covers`]).
-    fn roots_shipped_through(&self, jseq: u64, replica: &dyn Replica) -> bool {
-        if replica.journal_root_bound() <= self.ack.shipped_through {
-            return true;
+    /// This node holds a root tenure: the lease, or the hold of a
+    /// continuation epoch. A deposed root keeps streaming its own grant as
+    /// a holder, and then waits for the log to carry its dependencies like
+    /// any far holder: the root rows its deposition rolled back are held
+    /// read-side until they are back (ADR-57), and a stream row must not
+    /// execute on state without them.
+    fn root_tenure(&self) -> bool {
+        self.lease.held.is_some() || self.lease.epoch_hold().is_some()
+    }
+
+    /// Whether `gen` is a stream of the root's own (ADR-55): one this node
+    /// granted itself, a deposed or restarted node's included.
+    fn is_own_stream(&self, gen: u64) -> bool {
+        self.dl.own_grants.contains_key(&gen)
+            || self.dl.own_minted.contains(&gen)
+            || self
+                .dl
+                .gens
+                .get(&gen)
+                .is_some_and(|g| !g.ended && g.node == self.cfg.node_id)
+    }
+
+    /// R-X's grant test: the holder of `gen` may execute now: its grant is
+    /// live (`until`) and not stopped, and for the root's own stream
+    /// [`Self::own_honoured`].
+    pub(crate) fn stream_honoured(&self, now: Now, gen: u64) -> bool {
+        self.dl
+            .mine
+            .get(&gen)
+            .is_some_and(|d| now.honour < d.until && !d.stopped)
+            && self.own_honoured(gen)
+    }
+
+    /// R-H: whether the root's own stream `gen` is honoured. A stream that
+    /// is not one of the root's own always is. Its ops park (the stream's
+    /// `commit_waiting`), the fast path does not admit under it and nothing
+    /// is journaled in it until then.
+    pub(crate) fn own_honoured(&self, gen: u64) -> bool {
+        self.dl.own_grants.get(&gen).is_none_or(|g| g.honoured)
+    }
+
+    /// Whether a root row touching `keys` is one the own stream `gen` would
+    /// diverge from if it were rolled back and replayed after a row of the
+    /// stream: its keys resolve to the stream.
+    fn keys_resolve_to_stream(replica: &dyn Replica, keys: &TouchSet, gen: u64) -> bool {
+        match replica.resolve_ownership(keys) {
+            Ownership::Root => false,
+            Ownership::Delegated(d) => d.gen == gen,
+            Ownership::CrossSubtree { involved, .. } => involved.iter().any(|d| d.gen == gen),
+        }
+    }
+
+    /// R-H (b): whether a root row of this node's journal at or below
+    /// `record` is not in the log yet and touches the keys of own stream
+    /// `gen`. Rows on other keys commute with the stream's (the ship plan's
+    /// own argument, `meta::store::held`).
+    fn own_root_rows_unshipped(
+        &self,
+        gen: u64,
+        record: u64,
+        acked: u64,
+        replica: &dyn Replica,
+    ) -> bool {
+        if replica.journal_root_bound() <= self.ack.shipped_through.max(acked) {
+            return false;
+        }
+        match replica.journal_root_rows_through(record) {
+            Ok(rows) => rows.iter().any(|(first, keys)| {
+                !self.archive_covers(*first, acked)
+                    && Self::keys_resolve_to_stream(replica, keys, gen)
+            }),
+            // (The journal could not be read: not decided.)
+            Err(_) => true,
+        }
+    }
+
+    /// R-H, once per event: decide the own streams not honoured yet, and
+    /// release one whose honour has waited for a root row of its keys longer
+    /// than the bound (a held, poisoned row under its directories): the
+    /// root, as the holder, releases the grant with nothing executed
+    /// (`Stats::root_own_released_unhonoured`); the quarantine keeps the
+    /// placement from granting it again at once.
+    fn own_honour_progress(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        if self.dl.own_grants.is_empty() {
+            return;
         }
         let acked = replica.journal_acked_seq().unwrap_or(0);
-        if replica.journal_root_bound() <= acked {
-            return true;
+        let gens: Vec<u64> = self.dl.own_grants.keys().copied().collect();
+        let mut release: Vec<u64> = Vec::new();
+        for g in gens {
+            if !(self.dl.mine.contains_key(&g) || self.dl.gens.contains_key(&g)) {
+                self.dl.own_grants.remove(&g);
+                continue;
+            }
+            let og = self.dl.own_grants[&g];
+            if og.honoured {
+                continue;
+            }
+            // A record the archive carries stays committed (a lease loss
+            // resets what this core counts as shipped; the log does not
+            // forget).
+            if og.record == u64::MAX || !self.archive_covers(og.record, acked) {
+                continue;
+            }
+            if og.covered_at.is_none() {
+                let ms = now.wait.since(og.since).max(0) as u64;
+                self.stats.root_own_commit_waits += 1;
+                self.stats.root_own_commit_wait_ms_max =
+                    self.stats.root_own_commit_wait_ms_max.max(ms);
+            }
+            let covered_at = og.covered_at.unwrap_or(now.wait);
+            if self.own_root_rows_unshipped(g, og.scan_to, acked, replica) {
+                if now.wait.since(covered_at) >= self.dl_t().own_first_op_wait as i64 {
+                    release.push(g);
+                }
+                self.dl.own_grants.get_mut(&g).expect("present").covered_at = Some(covered_at);
+                continue;
+            }
+            let ms = now.wait.since(og.since).max(0) as u64;
+            self.stats.root_own_honour_wait_ms_max = self.stats.root_own_honour_wait_ms_max.max(ms);
+            let og = self.dl.own_grants.get_mut(&g).expect("present");
+            og.honoured = true;
+            og.covered_at = Some(covered_at);
         }
-        match replica.journal_root_seqs_through(jseq) {
-            Ok(rows) => rows.iter().all(|s| self.archive_covers(*s, acked)),
-            Err(_) => false,
+        for g in release {
+            let dirs = self.sticky_held(g, replica);
+            if self.own_sticky_release(now, g, dirs, replica, out) {
+                self.stats.root_own_released_unhonoured += 1;
+                // (Counted once: the release is under way, the grant ends.)
+                if let Some(og) = self.dl.own_grants.get_mut(&g) {
+                    og.covered_at = Some(now.wait.plus(u64::MAX / 4));
+                }
+            }
         }
     }
 
@@ -3270,7 +3403,7 @@ impl Core {
             .mine
             .get(&gen)
             .is_some_and(|d| now.honour < d.until || d.non_stealable)
-            && !self.own_grant_pending(gen);
+            && self.own_honoured(gen);
         // ADR-46: a restarted holder executes nothing while the read grants
         // its previous process made may be live. A settle passes: its
         // refusal has no effect a reader sees.
@@ -3310,8 +3443,9 @@ impl Core {
             }
         }
         // The model's rule 1: the delegate waits for `deps` too.
-        let reaches =
-            settle_like || self.cfg.skip_deleg_dep_wait || self.holder_reaches(gen, &deps, replica);
+        let reaches = settle_like
+            || self.cfg.skip_deleg_dep_wait
+            || self.stream_deps_reached(gen, &deps, replica);
         // Phase 2b (M8): the read delegations this delegate granted on
         // what the op touches are recalled first.
         let recalling = !settle_like
@@ -5467,37 +5601,7 @@ impl Core {
             self.root_progress(now, replica, out);
         }
         self.deleg_forget_ended(now, replica);
-        // A record the archive carries stays committed (a lease loss resets
-        // what this core counts as shipped; the log does not forget).
-        let acked = replica.journal_acked_seq().unwrap_or(0);
-        let mut kept: BTreeMap<u64, u64> = BTreeMap::new();
-        let mut committed: Vec<u64> = Vec::new();
-        for (g, j) in &self.dl.own_grant_rows {
-            if !(self.dl.mine.contains_key(g) || self.dl.gens.contains_key(g)) {
-                continue;
-            }
-            if *j == u64::MAX || !self.archive_covers(*j, acked) {
-                kept.insert(*g, *j);
-            } else {
-                committed.push(*g);
-            }
-        }
-        for g in committed {
-            if let Some(s) = self.dl.gens.get(&g).filter(|s| !s.ended) {
-                let since = self
-                    .dl
-                    .own_grant_since
-                    .get(&g)
-                    .copied()
-                    .unwrap_or_else(|| s.grown_at.unwrap_or(s.granted));
-                let ms = now.wait.since(since).max(0) as u64;
-                self.stats.root_own_commit_waits += 1;
-                self.stats.root_own_commit_wait_ms_max =
-                    self.stats.root_own_commit_wait_ms_max.max(ms);
-            }
-        }
-        self.dl.own_grant_since.retain(|g, _| kept.contains_key(g));
-        self.dl.own_grant_rows = kept;
+        self.own_honour_progress(now, replica, out);
         self.deleg_leave_progress(now, replica, out);
         self.handover_progress(now, replica, out);
         self.sticky_release_progress(now, replica, out);
@@ -5646,7 +5750,7 @@ impl Core {
             if d.parked.is_empty() {
                 continue;
             }
-            let honoured = now.honour < d.until && !d.stopped && !self.own_grant_pending(gen);
+            let honoured = self.stream_honoured(now, gen);
             if !honoured {
                 continue;
             }
@@ -5659,7 +5763,7 @@ impl Core {
                 .filter(|(_, p)| {
                     p.settle
                         || (!quarantined
-                            && self.holder_reaches(gen, &p.deps, replica)
+                            && self.stream_deps_reached(gen, &p.deps, replica)
                             && !self.gated_by_queue(p.from, p.rid, &p.op, replica)
                             && !(p.held
                                 && self.sticky_holds(
@@ -12303,13 +12407,26 @@ impl Core {
     /// ADR-55: remember the journal seq of the record `delegate_dir` just
     /// journaled for the root's own stream `gen`.
     fn note_own_grant_row(&mut self, gen: u64) {
-        self.dl.own_grant_since.entry(gen).or_insert(self.clk.wait);
-        if let Some(row) = constellation_meta::take_last_journaled() {
-            self.dl.own_grant_rows.insert(gen, row.last);
-        } else {
-            // (No row was reported: wait for everything journaled so far.)
-            self.dl.own_grant_rows.insert(gen, u64::MAX);
-        }
+        let record = match constellation_meta::take_last_journaled() {
+            Some(row) => row.last,
+            // (No row was reported: never honoured on it.)
+            None => u64::MAX,
+        };
+        let since = self
+            .dl
+            .own_grants
+            .get(&gen)
+            .map_or(self.clk.wait, |g| g.since);
+        self.dl.own_grants.insert(
+            gen,
+            OwnGrant {
+                record,
+                scan_to: record,
+                honoured: false,
+                since,
+                covered_at: None,
+            },
+        );
     }
 
     /// ADR-55 (R-I3, M3): a process that restarted over its journal installs
@@ -12321,7 +12438,7 @@ impl Core {
     /// rest on a grant the log never had (`far-root-writes-paused+durability`
     /// seeds 917, 1854).
     fn recover_own_grant_row(&mut self, gen: u64, replica: &dyn Replica) {
-        if self.dl.own_grant_rows.contains_key(&gen) || self.dl.own_minted.contains(&gen) {
+        if self.dl.own_grants.contains_key(&gen) || self.dl.own_minted.contains(&gen) {
             return;
         }
         // (A delegate's journal holds stream rows only; the root's own rows
@@ -12340,20 +12457,23 @@ impl Core {
             })
             .map(|tx| tx.last)
             .max();
-        if let Some(last) = row {
-            self.dl.own_grant_rows.insert(gen, last);
-        }
-    }
-
-    /// ADR-55 (R-I3): whether the root's own stream `gen` waits for the
-    /// archive to carry its `DelegateNode` record. Its ops park (the
-    /// stream's `commit_waiting`) and the fast path does not admit under it
-    /// until then.
-    pub(crate) fn own_grant_pending(&self, gen: u64) -> bool {
-        self.dl
-            .own_grant_rows
-            .get(&gen)
-            .is_some_and(|jseq| *jseq == u64::MAX || !self.archive_covers(*jseq, 0))
+        // (R-H: the record may be in the log already while a root row of the
+        // stream's keys is not: (b) then looks at the root rows journaled so
+        // far.)
+        let (record, scan_to) = match row {
+            Some(last) => (last, last),
+            None => (0, replica.journal_root_bound()),
+        };
+        self.dl.own_grants.insert(
+            gen,
+            OwnGrant {
+                record,
+                scan_to,
+                honoured: false,
+                since: self.clk.wait,
+                covered_at: None,
+            },
+        );
     }
 
     /// Plan 46 M1.2 step 9: grant `dir` to the node that holds stream `gen`:
