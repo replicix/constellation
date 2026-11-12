@@ -406,11 +406,11 @@ impl Meta {
                 top = Some((epoch, o.last));
             }
         }
-        // A holder's `repair drop-held` rolled back transactions this tail
-        // holds (defect B): they are holes from here on. Only a batch that
-        // carries the record scans the tail.
-        let rolled = super::member::rolled_back_idents(txs.iter().flat_map(|t| t.records.iter()));
-        hole_tail_rolled_back_tx(&mut tx, self, &rolled)?;
+        // (A `DropHeld` appended here holes nothing: the drop is decided when
+        // the log carries the record, not when the backup is streamed it. A
+        // holder deposed before the record ships leaves its tail's rows
+        // standing; the log's segment that carries the record holes them,
+        // `hole_tail_rolled_back_tx` from the segment apply.)
         tx.commit()?;
         // A resend can land below the floor (from the contiguous
         // acknowledgement, under a batch held ahead of a gap).

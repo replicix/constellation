@@ -1939,9 +1939,12 @@ fn a_streamed_rolled_back_record_retracts_committed_and_own_entries() {
     assert!(meta.lookup(ROOT_INO, "d").unwrap().is_some());
 }
 
-/// A backup's tail: the record, appended, turns the tail transactions of
-/// the identities it names into holes, whether named by their place or by
-/// their `TailOf`; the acknowledgement stays contiguous.
+/// A backup's tail: the record, appended, changes nothing (ADR-59 part B, D1:
+/// the drop is decided when the log carries it, and a holder deposed before
+/// that leaves the rows it named to re-ship). The segment that carries it
+/// turns the tail transactions of the identities it names into holes, whether
+/// named by their place or by their `TailOf`; the acknowledgement stays
+/// contiguous.
 #[test]
 fn an_appended_rolled_back_record_turns_the_tail_transactions_into_holes() {
     let meta = Meta::open_in_memory().unwrap();
@@ -1983,12 +1986,30 @@ fn an_appended_rolled_back_record_turns_the_tail_transactions_into_holes() {
         )],
     )
     .unwrap();
-    let tail = meta.backup_tail(2).unwrap();
-    assert_eq!(
-        tail.iter()
+    let shape = |meta: &Meta| {
+        meta.backup_tail(2)
+            .unwrap()
+            .iter()
             .map(|t| (t.first, t.last, t.records.len()))
-            .collect::<Vec<_>>(),
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        shape(&meta),
+        vec![(1, 2, 2), (3, 4, 3), (5, 6, 2), (7, 8, 2)],
+        "the appended record holes nothing"
+    );
+    let seg = vec![
+        drop_held_rec(vec![(2, 1), (1, 7)]),
+        LogRecord::Refused {
+            rid: rid(9),
+            code: constellation_types::Code::Io,
+        },
+    ];
+    apply_rows(&meta, 1, 2, 8, &[7, 8], &seg);
+    assert_eq!(
+        shape(&meta),
         vec![(1, 2, 0), (3, 4, 0), (5, 6, 2), (7, 8, 2)],
+        "the record in the log holes them"
     );
     assert_eq!(meta.backup_acked(2).unwrap(), 8, "contiguous still");
 }

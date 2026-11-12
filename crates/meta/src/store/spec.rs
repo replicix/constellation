@@ -822,6 +822,15 @@ pub struct ReshipReport {
     /// epoch and journal seq: a node reading its own sealed tail back),
     /// left as they are.
     pub tail_same_row: usize,
+    /// ADR-59 part B (D2): transactions a `DropHeld` of the log retired
+    /// (the drop rolled them back; a member's late copy of one is skipped,
+    /// never re-shipped). Normal after a drop: no failure.
+    pub tail_retired: usize,
+    /// ADR-59 part B (D2): transactions that carry a `DropHeld` the log does
+    /// not: their dropper lost the lease before the record shipped, so the
+    /// drop never happened (the rows it named re-ship as the acknowledged
+    /// rows they are). Normal after a deposed dropper: no failure.
+    pub tail_drop_fenced: usize,
     /// ADR-59: transactions whose identity the applied log carries (a tenure
     /// shipped them ahead of a row it held, and the member's copy outlived
     /// the epoch), skipped.
@@ -6388,6 +6397,36 @@ impl Meta {
                     report.tail_in_log += 1;
                     continue;
                 }
+                // ADR-59 part B (D2): a transaction a `DropHeld` of the log
+                // retired is never re-shipped (a member's copy that missed
+                // the record is how it reaches this gate). One that carries
+                // a `DropHeld` the log lacks (checked above) is its
+                // deposed dropper's undecided drop: it never happened, and
+                // the identities it names are not retired.
+                if self.row_retired_tx(&tx, ident.0, ident.1)? {
+                    tracing::info!(
+                        epoch = t.epoch,
+                        first = bt.first,
+                        ident = ?ident,
+                        "a row of the sealed tail was rolled back by a drop-held in the log; not re-shipped"
+                    );
+                    report.tail_retired += 1;
+                    continue;
+                }
+                if bt
+                    .records
+                    .iter()
+                    .any(|r| matches!(r, LogRecord::DropHeld { .. }))
+                {
+                    tracing::warn!(
+                        epoch = t.epoch,
+                        first = bt.first,
+                        "a drop-held of the sealed tail is not in the log: its dropper lost the lease \
+                         before deciding; the drop never happened"
+                    );
+                    report.tail_drop_fenced += 1;
+                    continue;
+                }
                 let rid = bt.records.iter().find_map(|r| match r {
                     LogRecord::Completed { rid } => Some(*rid),
                     _ => None,
@@ -6396,21 +6435,14 @@ impl Meta {
                     LogRecord::Refused { rid, .. } => Some(*rid),
                     _ => None,
                 });
-                let done = match (rid, refused) {
-                    (Some(rid), _)
-                        if matches!(
-                            crate::store::inbox::completed_outcome_tx(&tx, self, rid)?,
-                            Some(crate::store::inbox::CompletedOutcome::Executed { .. })
-                        ) =>
-                    {
-                        true
+                // Any outcome of the rid here is done (ADR-59 part B, MUST-B2):
+                // a `Refused` one is the drop's, and a row journaled before it
+                // must not land as `Completed` after its own refusal.
+                let done = match rid.or(refused) {
+                    Some(rid) => {
+                        crate::store::inbox::completed_outcome_tx(&tx, self, rid)?.is_some()
                     }
-                    (_, Some(rid))
-                        if crate::store::inbox::completed_outcome_tx(&tx, self, rid)?.is_some() =>
-                    {
-                        true
-                    }
-                    _ => false,
+                    None => false,
                 };
                 // The row is this node's own journal row, still unshipped
                 // (a root's append of a delegate's row stays through the
