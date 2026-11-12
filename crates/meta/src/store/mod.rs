@@ -235,6 +235,9 @@ pub(crate) const KV_JOURNAL_ACKED: &str = "journal_acked";
 pub(crate) const KV_POISONED_COUNT: &str = "poisoned_count";
 /// ADR-59 part B: `DropHeld` records journaled and not yet shipped.
 pub(crate) const KV_DROP_HELD_UNSHIPPED: &str = "drop_held_unshipped";
+/// ADR-59: how many acknowledged operations `repair drop-held` rolled
+/// back for good (`held::DroppedHeld::acked_lost`), for `status`.
+pub(crate) const KV_ACKED_LOST_TOTAL: &str = "acked_lost_total";
 /// Set once `pending_upload_by_ino` mirrors every `pending_upload` row
 /// (`Meta::build_pending_by_ino`).
 pub(crate) const KV_PENDING_BY_INO: &str = "pending_upload_by_ino_built";
@@ -650,6 +653,13 @@ pub struct Meta {
     /// row that wrote, or merged, a key an older outstanding row wrote
     /// exclusively. The ship planner makes this unreachable; expected 0.
     pub(crate) publish_unplaced: AtomicU64,
+    /// ADR-59: the persisted `KV_ACKED_LOST_TOTAL`, mirrored.
+    pub(crate) acked_lost: AtomicU64,
+    /// ADR-59 part B: the last drops this process applied (a bounded
+    /// account, drained by [`Meta::take_applied_drops`]): the simulation's
+    /// oracle reads what a drop did also when the dropper restarted between
+    /// its decision and its apply and the operator's command never heard.
+    pub(crate) applied_drops: std::sync::Mutex<Vec<held::DroppedHeld>>,
     /// ADR-59's negative control (the simulation's
     /// `parent_taint_conservative`): the ship rule treats a directory's
     /// merged attributes as exclusive writes again and `repair drop-held`
@@ -1362,6 +1372,8 @@ impl Meta {
             held: std::sync::Mutex::new(held::HeldSummary::default()),
             held_any: AtomicBool::new(false),
             publish_unplaced: AtomicU64::new(0),
+            acked_lost: AtomicU64::new(0),
+            applied_drops: std::sync::Mutex::new(Vec::new()),
             parent_taint_conservative: AtomicBool::new(false),
             queue_cache: std::sync::Mutex::new(None),
             unshipped: std::sync::Mutex::new(crate::replay::TouchSet::default()),
@@ -1435,6 +1447,13 @@ impl Meta {
         meta.refresh_holder_append_tip()?;
         meta.build_pending_by_ino()?;
         meta.verify_mark_counts()?;
+        {
+            let r = meta.db.read_tx();
+            meta.acked_lost.store(
+                counter_get(&r, &meta.local, KV_ACKED_LOST_TOTAL)?,
+                Ordering::Relaxed,
+            );
+        }
         // The table and the speculatively ended generations, one snapshot
         // (ADR-43, `Meta::speculatively_ended_generations`).
         let (table, speculative) = {

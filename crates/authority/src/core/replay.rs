@@ -774,15 +774,36 @@ impl Core {
             sequencer,
         );
         match dropped {
-            Ok(dropped) => {
-                for rid in dropped.placeholders.clone() {
-                    self.abort_parked_answer_of(now, rid, replica, out);
+            Ok(dropped) => match dropped.pending {
+                // ADR-59 part B (D1, D4): decided, journaled; the effect (and
+                // the control op's answer) waits for the archive to carry the
+                // record.
+                Some(jseq) => {
+                    self.stats.drops_decided += 1;
+                    self.park(
+                        now,
+                        (std::collections::BTreeSet::new(), None),
+                        Some(jseq),
+                        super::readindex::ParkedWhat::DropApply {
+                            op: Some(op),
+                            ino,
+                            epoch: dropped.pending_epoch,
+                            sessions,
+                        },
+                    );
+                    // (The record ships at the next round.)
+                    self.nudge(now, out);
                 }
-                out.push(Action::ControlDone {
-                    op,
-                    result: Ok(ControlOk::DroppedHeld(dropped)),
-                });
-            }
+                None => {
+                    for rid in dropped.placeholders.clone() {
+                        self.abort_parked_answer_of(now, rid, replica, out);
+                    }
+                    out.push(Action::ControlDone {
+                        op,
+                        result: Ok(ControlOk::DroppedHeld(dropped)),
+                    });
+                }
+            },
             Err(e) => out.push(Action::ControlDone {
                 op,
                 result: Err(e.to_string()),
@@ -804,7 +825,7 @@ impl Core {
     /// excluded by the drop. Other nodes' inbox batches are not listed: a
     /// foreign op names this node's pending chunks only through the
     /// forwarded-pending list (`--remote`'s case).
-    fn ops_naming_manifests_of(&self, ino: Ino) -> Vec<(Rid, Vec<u8>)> {
+    pub(crate) fn ops_naming_manifests_of(&self, ino: Ino) -> Vec<(Rid, Vec<u8>)> {
         let mut out: Vec<(Rid, Vec<u8>)> = Vec::new();
         let mut add = |rid: Rid, op: &MutateOp| {
             for manifest in constellation_meta::op_manifests_of(op, ino) {

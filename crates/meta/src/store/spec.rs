@@ -1073,6 +1073,11 @@ struct Strand<'a> {
     /// epoch that the log does not carry is dropped, not kept (see
     /// [`strand_local_tx`]). `None` for every other pass.
     gate_epoch: Option<u64>,
+    /// ADR-59: collects the `spec_seq`s of this node's own transactions
+    /// that the pass redid in place (they stood) but one of whose records
+    /// applied as a skip. Its effect then differs from the one the
+    /// transaction had: `repair drop-held` strands it as well.
+    redo_skipped: Option<&'a RefCell<Vec<u64>>>,
 }
 
 impl Strand<'static> {
@@ -1085,6 +1090,7 @@ impl Strand<'static> {
         deps_of: None,
         superseded: false,
         gate_epoch: None,
+        redo_skipped: None,
     };
 }
 
@@ -2509,6 +2515,7 @@ fn redo_row_tx(
     };
     let capture = Capture::new();
     let row_staged = UsageTracker::staging();
+    let mut skipped_local = false;
     {
         let cx = ApplyCx {
             dirty: meta.dirty_capturing(&capture),
@@ -2517,8 +2524,12 @@ fn redo_row_tx(
         for rec in &records {
             if let Some(why) = apply_record(tx, meta, cx, rec, &row_staged)? {
                 tracing::debug!(why, ?rec, "speculation redo: record skipped");
+                skipped_local |= matches!(row.kind, SpecKind::Local { .. });
             }
         }
+    }
+    if let (true, Some(cell)) = (skipped_local, strand.redo_skipped) {
+        cell.borrow_mut().push(seq);
     }
     row.usage = row_staged.raw_delta();
     staged.adjust(row.usage.0, row.usage.1);
@@ -3502,6 +3513,7 @@ fn strand_tx(
         deps_of: None,
         superseded: false,
         gate_epoch,
+        redo_skipped: None,
     };
     Ok(rewind_tx(tx, meta, staged, &live, &stranded, cutoff, strand, None)?.0)
 }
@@ -4052,6 +4064,7 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
                 deps_of: Some(&deps_of),
                 superseded: false,
                 gate_epoch: None,
+                redo_skipped: None,
             },
         )?;
     }
@@ -4193,7 +4206,7 @@ pub(crate) fn strand_seqs_tx(
     meta: &Meta,
     staged: &UsageTracker,
     seqs: &HashSet<u64>,
-) -> Result<Stranded, MetaError> {
+) -> Result<(Stranded, Vec<u64>), MetaError> {
     let live: HashMap<u64, LiveEntry> = read_live(tx, meta)?.into_iter().collect();
     let stranded: HashSet<u64> = seqs
         .iter()
@@ -4201,8 +4214,9 @@ pub(crate) fn strand_seqs_tx(
         .filter(|seq| matches!(live.get(seq), Some(LiveEntry::Local { .. })))
         .collect();
     let Some(&cutoff) = stranded.iter().min() else {
-        return Ok(Stranded::default());
+        return Ok((Stranded::default(), Vec::new()));
     };
+    let skipped = RefCell::new(Vec::new());
     let out = rewind_tx(
         tx,
         meta,
@@ -4210,13 +4224,16 @@ pub(crate) fn strand_seqs_tx(
         &live,
         &stranded,
         cutoff,
-        Strand::PLAIN,
+        Strand {
+            redo_skipped: Some(&skipped),
+            ..Strand::PLAIN
+        },
         None,
     )?
     .0;
     let from = journal_from(tx, meta)?;
     compact_tx(tx, meta, from)?;
-    Ok(out)
+    Ok((out, skipped.into_inner()))
 }
 
 /// Plan 46 M0.2 (R1): turn the queued replay at `key` — the stranded
@@ -4356,16 +4373,17 @@ pub(crate) fn drop_queued_of_rids_tx(
     Ok(dropped)
 }
 
-/// The queued replay at `key`, if any: `(rid, op)`.
-pub(crate) fn queued_at(
+/// The queued replay at `key`, if any: its rid and the class its row was
+/// journaled under (ADR-59: whether its answer may have left).
+pub(crate) fn queued_class_at(
     r: &impl Readable,
     meta: &Meta,
     key: u64,
-) -> Result<Option<(Rid, MutateOp)>, MetaError> {
+) -> Result<Option<(Rid, RowCommit)>, MetaError> {
     match r.get(&meta.pending_replay, seq_key(key))? {
         Some(v) => {
             let row: QueuedReplay = crate::record::from_bytes_exact(&v)?;
-            Ok(Some((row.rid, row.op)))
+            Ok(Some((row.rid, row.class)))
         }
         None => Ok(None),
     }
