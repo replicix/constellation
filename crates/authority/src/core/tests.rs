@@ -9145,6 +9145,107 @@ mod cto {
         assert_eq!(reply_reqs(&out), vec![1, 2], "{out:?}");
     }
 
+    /// Expectation: a lease lost while reads are held answers them
+    /// `NotHolder` (through the lease checks), whether the write lands or
+    /// the timer runs; nothing is granted.
+    #[test]
+    fn reads_held_when_the_lease_is_lost_are_refused_not_granted() {
+        for by_timer in [false, true] {
+            let (mut h, _) = holder_with_files();
+            h.cold_horizon = true;
+            h.manual_horizon = true;
+            let first = ask_listing(&mut h, 1);
+            let (kind, until) = horizon_write_of(&first).expect("no horizon write asked for");
+            let timer = first
+                .iter()
+                .find_map(|a| match a {
+                    Action::SetTimer {
+                        id,
+                        kind: TimerKind::HorizonPark,
+                        ..
+                    } => Some(*id),
+                    _ => None,
+                })
+                .expect("a hold timer");
+            assert!(sends(&ask_listing(&mut h, 2)).is_empty());
+            h.core.lease.lost = true;
+            let out = if by_timer {
+                h.core.handle(h.clk(), Event::Timer { id: timer }, &h.meta)
+            } else {
+                let durable = h.meta.persist_grant_horizon(kind, until, h.clk()).ok();
+                h.core.handle(
+                    h.clk(),
+                    Event::GrantHorizonPersisted {
+                        kind,
+                        until,
+                        durable,
+                    },
+                    &h.meta,
+                )
+            };
+            let replies = sends(&out);
+            assert_eq!(replies.len(), 2, "{out:?}");
+            for (to, msg) in replies {
+                assert_eq!(to, 2);
+                let PeerMsg::ReadIndexReply { outcome, .. } = msg else {
+                    panic!("{msg:?}");
+                };
+                assert!(
+                    matches!(outcome, ReadIndexOutcome::NotHolder { .. }),
+                    "{outcome:?}"
+                );
+            }
+            assert_eq!(h.meta.read_delegations().live_grants(), 0);
+            assert_eq!(h.core.read_view_horizon_parked(), 0);
+        }
+    }
+
+    /// Expectation: a write to the held read's directory while it is held
+    /// finds no grant to recall (none was made) and is acknowledged at
+    /// once; the read, served after it, is granted and its position covers
+    /// the write.
+    #[test]
+    fn a_write_racing_a_held_read_is_covered_by_the_position_it_gets() {
+        let (mut h, _) = holder_with_files();
+        h.cold_horizon = true;
+        h.manual_horizon = true;
+        let first = ask_listing(&mut h, 1);
+        let (kind, until) = horizon_write_of(&first).expect("no horizon write asked for");
+        assert!(sends(&first).is_empty());
+        // The write: nothing granted, so nothing to recall.
+        let mut scratch = Vec::new();
+        assert!(h
+            .core
+            .recall_needed(h.clk(), &[ROOT_INO], None, &h.meta, &mut scratch)
+            .is_none());
+        let op = h.create("z");
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        h.core.ship.head_seq = 7;
+        // The write lands: the read is granted, after the write.
+        let durable = h.meta.persist_grant_horizon(kind, until, h.clk()).ok();
+        let out = h.core.handle(
+            h.clk(),
+            Event::GrantHorizonPersisted {
+                kind,
+                until,
+                durable,
+            },
+            &h.meta,
+        );
+        match sends(&out).as_slice() {
+            [(2, PeerMsg::ReadIndexReply { outcome, .. })] => {
+                let ReadIndexOutcome::Ok { position, .. } = outcome else {
+                    panic!("{outcome:?}");
+                };
+                assert_eq!(position.seq, 7, "the position predates the write");
+                let _ = grant_of(outcome);
+                // The new file is among the read-ahead grants.
+                assert_eq!(ahead_of(outcome).grants.len(), 5);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// The read-ahead of a ReadIndex: a listing's first chunk (or a lookup
     /// that misses a child's delegation) is answered with ordinary
     /// delegations on the directory's files, in name order from the entry
