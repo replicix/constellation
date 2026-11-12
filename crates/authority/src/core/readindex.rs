@@ -1280,6 +1280,7 @@ impl Core {
                 }
                 self.stats.drops_applied += 1;
                 self.stats.drop_follow_ups += dropped.follow_ups as u64;
+                self.stats.drop_apply_leftovers += dropped.leftovers as u64;
                 // D3: no client waits for a retry to learn the refusal: every
                 // park of a rid the drop refused or rolled back is settled
                 // now (the retry meets the `Refused` row).

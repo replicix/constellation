@@ -2212,6 +2212,9 @@ pub struct Stats {
     /// ADR-59 part B: follow-up decisions (a row kept as it was did not
     /// replay as it had run). Expected 0.
     pub drop_follow_ups: u64,
+    /// ADR-59 part B (D1): journal transactions a `DropHeld` names that an
+    /// apply found still in the journal after stranding its rows. Expected 0.
+    pub drop_apply_leftovers: u64,
     /// ADR-59 part B: tail transactions a `DropHeld` of the log retired (the
     /// drop rolled them back; a member's late copy), skipped. Normal after a
     /// drop.

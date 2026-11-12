@@ -153,7 +153,7 @@ use crate::record::LogRecord;
 use crate::store::{
     adjust_usage_tx, counter_add_get_tx, counter_add_tx, counter_get, counter_set_tx, journal,
     local, spec, Meta, UsageTracker, KV_ACKED_LOST_TOTAL, KV_DROP_HELD_UNSHIPPED,
-    KV_POISONED_COUNT,
+    KV_LOCAL_SPEC_COUNT, KV_POISONED_COUNT, KV_UNCAPTURED_TX_COUNT,
 };
 use constellation_fs_core::{ChunkInfo, Ino, Manifest};
 use fjall::Readable;
@@ -416,6 +416,10 @@ pub struct DroppedHeld {
     /// ADR-59 part B: follow-up decisions an apply needed (a redone row did
     /// not apply as it did). Expected 0.
     pub follow_ups: usize,
+    /// ADR-59 part B (D1): journal transactions the record names that the
+    /// apply found still in the journal after the stranding (stranded by
+    /// journal row). Expected 0 (`drop_apply_leftovers`).
+    pub leftovers: usize,
     /// The log segment this replica had applied when the drop took effect
     /// (the final result only): what lands past it is the drop's replay.
     pub applied_seq: u64,
@@ -443,6 +447,69 @@ fn rolled_back_ident(
 ) -> Option<(u64, u64)> {
     let epoch = head_epoch?;
     Some(super::member::tail_identity(records).unwrap_or((epoch, first)))
+}
+
+/// The identity a member keys `tx` by (as `rolled_back_ident`, but a
+/// re-shipped transaction has its `TailOf` pair whether or not it has a
+/// `journal_tx` row), given the epoch of that row.
+fn tx_ident(tx: &Tx, epoch: Option<u64>) -> Option<(u64, u64)> {
+    let (_, first_rec) = tx.rows.first()?;
+    super::member::tail_identity(std::slice::from_ref(first_rec))
+        .or_else(|| epoch.map(|e| (e, tx.first)))
+}
+
+/// ADR-59 part B (D1, D2): the transactions the ship plan holds because of
+/// what a drop says of them, whatever else keeps them: those the record of a
+/// decided drop names (until its apply strands them) and those whose identity
+/// the log retired. Read once per plan, and only when a drop is decided here
+/// or something is retired (`Meta::any_retired`).
+struct Named {
+    /// Identity -> the inode of the decided drop that names it.
+    named: HashMap<(u64, u64), Ino>,
+    any_retired: bool,
+}
+
+impl Named {
+    /// `None` when no drop is decided and nothing is retired: the common
+    /// case pays two atomic/counter reads.
+    fn read(r: &impl Readable, meta: &Meta) -> Result<Option<Named>, MetaError> {
+        let any_retired = meta.any_retired.load(Ordering::Relaxed);
+        let unshipped = counter_get(r, &meta.local, KV_DROP_HELD_UNSHIPPED)? > 0;
+        if !any_retired && !unshipped {
+            return Ok(None);
+        }
+        let mut named = HashMap::new();
+        if unshipped {
+            for guard in r.prefix(&meta.local, DROP_PLAN_PREFIX) {
+                let (k, v) = guard.into_inner()?;
+                let Ok(ino) =
+                    <[u8; 8]>::try_from(&k[DROP_PLAN_PREFIX.len()..]).map(Ino::from_be_bytes)
+                else {
+                    continue;
+                };
+                let plan: DropPlan = postcard::from_bytes(&v)?;
+                named.extend(plan.idents.iter().map(|i| (*i, ino)));
+            }
+        }
+        Ok(Some(Named { named, any_retired }))
+    }
+
+    /// The inode to hold `ident` under: the drop that names it, else `0`
+    /// for an identity the log retired (no inode of its own), else `None`.
+    fn holds(
+        &self,
+        r: &impl Readable,
+        meta: &Meta,
+        ident: (u64, u64),
+    ) -> Result<Option<Ino>, MetaError> {
+        if let Some(ino) = self.named.get(&ident) {
+            return Ok(Some(*ino));
+        }
+        if self.any_retired && meta.row_retired_tx(r, ident.0, ident.1)? {
+            return Ok(Some(0));
+        }
+        Ok(None)
+    }
 }
 
 /// The write sessions of one inode that are open on this node (the engine
@@ -862,21 +929,33 @@ impl Walk {
     /// otherwise *deferred* if it is a pending seed or depends on anything
     /// held or deferred; otherwise it ships. Taint accumulates per kind,
     /// so a transaction behind both is reported as held. With `theirs`,
-    /// also a held or deferred transaction's blame ([`Blame`]). Returns
-    /// its class, the poisoned inodes it is a seed for, and its blame.
+    /// also a held or deferred transaction's blame ([`Blame`]). `(gen,
+    /// named)`: the transaction's delegation stream (`0`: none), and the
+    /// inode of the decided drop that names it, or `0` if the log retired
+    /// its identity (see [`Named`]). Returns its class, the poisoned inodes it is a seed for, and its blame.
     ///
     /// "Depends" is [`conflicts`] on the keys the two access, not the
     /// bare overlap of their key sets (ADR-59).
     fn step(
         &mut self,
         tx: &Tx,
-        gen: u64,
         keys: Option<&TxKeys>,
         observed: &[Vec<u8>],
         (poisoned, pending): (&PoisonMap, &PoisonMap),
         theirs: Option<&PoisonMap>,
+        (gen, named): (u64, Option<Ino>),
     ) -> (Class, Vec<Ino>, Option<BTreeSet<Ino>>) {
-        let seeds = seed_inos(tx, poisoned);
+        let mut seeds = seed_inos(tx, poisoned);
+        // ADR-59 part B (D1, D2): a transaction a decided drop names, or
+        // whose identity the log retired, is held whatever else holds it (a
+        // clean upload pass clears the marks that held it; the apply strands
+        // it). Its dependents follow by the taint rule. The inode is the
+        // drop's (`0`: the identity is retired, no drop of this node's).
+        if let Some(ino) = named {
+            if !seeds.contains(&ino) {
+                seeds.push(ino);
+            }
+        }
         // What the transaction observed without writing (a refusal's op:
         // `JournalTx::observed`): a dependency like an observation of a
         // written key, but it taints nothing after it. A refusal shipped
@@ -1110,6 +1189,7 @@ fn plan(
     blame: Option<Blame<'_>>,
 ) -> Result<Plan, MetaError> {
     let mut walk = Walk::default();
+    let named = Named::read(r, meta)?;
     let mut out = Plan {
         ship: Vec::new(),
         held: Vec::new(),
@@ -1127,14 +1207,18 @@ fn plan(
             .is_some_and(|rid| tx_rid(&tx, row.as_ref()) == Some(rid));
         let rid = tx_rid(&tx, row.as_ref());
         let gen = row.as_ref().map_or(0, |row| row.gen);
+        let hold = match (&named, tx_ident(&tx, row.as_ref().map(|t| t.epoch))) {
+            (Some(n), Some(ident)) => n.holds(r, meta, ident)?,
+            _ => None,
+        };
         let observed: Vec<Vec<u8>> = row.map(|row| row.observed).unwrap_or_default();
         let (class, seeds, mine) = walk.step(
             &tx,
-            gen,
             keys.as_ref(),
             &observed,
             (poisoned, pending),
             blame.map(|b| b.theirs),
+            (gen, hold),
         );
         if let Some(mine) = mine {
             out.blame.insert(tx.first, mine);
@@ -1347,11 +1431,14 @@ pub(crate) fn blame_walk(
         let observed = row.map(|row| row.observed).unwrap_or_default();
         let (class, _, waits) = c.walk.step(
             &tx,
-            gen,
             keys.as_ref(),
             &observed,
             (&c.poisoned, &c.pending),
             Some(&c.theirs),
+            // (The metered blame is of chunks another node's upload waits
+            // for; a named or retired transaction is held by the plan, which
+            // this walk does not model.)
+            (gen, None),
         );
         c.through = c.through.max(tx.last);
         if class != Class::Ship || rid.is_some_and(|rid| rid.node == node) {
@@ -1521,13 +1608,31 @@ impl Meta {
         let r = self.db.read_tx();
         let poisoned = read_poisoned(&r, self)?;
         let pending = read_pending(&r, self)?;
-        if poisoned.is_empty() && pending.is_empty() {
+        // ADR-59 part B (D1, D2): the plan also holds what a decided drop
+        // names and what the log retired. Nothing of either (the common
+        // case: two reads) leaves the fast path below as it was.
+        let named = Named::read(&r, self)?;
+        let r = if poisoned.is_empty() && pending.is_empty() {
             drop(r);
-            if self.held_any.swap(false, Ordering::Relaxed) {
-                *self.held.lock().unwrap() = HeldSummary::default();
+            let whole = self.take_journal_whole_txs(max)?;
+            // With a drop decided or an identity retired the batch is
+            // checked for a transaction either holds (one `journal_tx`
+            // range read and a lookup per transaction of it); only then
+            // does the plan run.
+            let held = match &named {
+                Some(named) => self.batch_names_a_drop(named, &whole)?,
+                None => false,
+            };
+            if !held {
+                if self.held_any.swap(false, Ordering::Relaxed) {
+                    *self.held.lock().unwrap() = HeldSummary::default();
+                }
+                return Ok(whole);
             }
-            return self.take_journal_whole_txs(max);
-        }
+            self.db.read_tx()
+        } else {
+            r
+        };
         self.held_work.fetch_add(1, Ordering::Relaxed);
         // ADR-58 C3: what is deferred for another node's pending upload
         // (its uploader may never return) is told apart from what waits for
@@ -1549,11 +1654,8 @@ impl Meta {
             Ordering::Relaxed,
         );
         *self.held.lock().unwrap() = summarize(&plan, &poisoned);
-        // ADR-59 part B (D2): what a `DropHeld` retired never ships. (Open:
-        // under debug assertions the sim finds the plan carrying one in the
-        // window between the record's ship and the apply, in about 4 seeds of
-        // 2,000 per backed label; skipping it at the plan breaks the planner's
-        // order rule for the rows behind it, so the pin stays an assertion.)
+        // ADR-59 part B (D2): what a `DropHeld` retired never ships. The plan
+        // holds such a transaction ([`Named`]); this pins it.
         if cfg!(debug_assertions) && self.any_retired.load(Ordering::Relaxed) {
             for tx in &plan.ship {
                 let Some((first, rec)) = tx.rows.first() else {
@@ -1579,6 +1681,36 @@ impl Meta {
             batch.extend(tx.rows);
         }
         Ok(batch)
+    }
+
+    /// Whether a transaction of `batch` (whole transactions from the head of
+    /// the journal) is named by a decided drop or has a retired identity.
+    fn batch_names_a_drop(
+        &self,
+        named: &Named,
+        batch: &[(u64, LogRecord)],
+    ) -> Result<bool, MetaError> {
+        if !named.named.is_empty() {
+            return Ok(true);
+        }
+        let (Some(&(from, _)), Some(&(to, _))) = (batch.first(), batch.last()) else {
+            return Ok(false);
+        };
+        let r = self.db.read_tx();
+        for guard in r.range(&self.journal_tx, local::tx_key(from)..=local::tx_key(to)) {
+            let (k, v) = guard.into_inner()?;
+            let first = local::decode_tx_key(&k)?;
+            let head: local::JournalTxHead = postcard::from_bytes(&v)?;
+            let Ok(at) = batch.binary_search_by_key(&first, |(seq, _)| *seq) else {
+                continue;
+            };
+            let ident = super::member::tail_identity(std::slice::from_ref(&batch[at].1))
+                .unwrap_or((head.epoch, first));
+            if named.holds(&r, self, ident)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The journal rows making up `records`, a segment this node shipped
@@ -1773,6 +1905,7 @@ impl Meta {
             remote,
             strand_all,
             missing: missing.iter().copied().collect(),
+            idents: walked.idents.iter().map(|(ident, _)| *ident).collect(),
             seeds: walked.seeds.iter().map(|(_, seq, _)| *seq).collect(),
             s_deps: walked.dependents.iter().map(|(seq, _, _)| *seq).collect(),
             redone: walked.redone.iter().map(|(seq, _)| *seq).collect(),
@@ -1977,6 +2110,23 @@ impl Meta {
             drop(tx);
             return self.drop_held_follow_up(ino, &redo_skipped);
         }
+        // D1: nothing the record names stays in the journal: the planner
+        // holds a named transaction, so what is left here is a copy the
+        // spec_seq match did not reach (a rewind re-captured it).
+        let leftovers = strand_named_leftovers(&mut tx, self, &staged, &plan.idents)?;
+        debug_assert!(
+            leftovers == 0,
+            "the apply of the drop of inode {ino} left {leftovers} journal transaction(s) the \
+             DropHeld names"
+        );
+        if leftovers > 0 {
+            tracing::warn!(
+                ino,
+                leftovers,
+                "drop_apply_leftovers: journal transaction(s) the DropHeld names were still \
+                 there after the apply stranded its rows; stranded by journal row"
+            );
+        }
         let mut rolled_back: Vec<crate::rid::Rid> = Vec::new();
         let mut placeholders: Vec<crate::rid::Rid> = Vec::new();
         // The rows of `S` whose answer may have left (the I1 loss the drop
@@ -1997,6 +2147,9 @@ impl Meta {
         // its place: its requester's retry is the one copy that executes.
         let mut await_retry = 0;
         for (_, origin, keys) in &walked.dependents {
+            // The redo is a fresh execution: not under the identity the
+            // record retired.
+            spec::strip_retired_tail_of_tx(&mut tx, self, *origin)?;
             let queued = spec::queued_class_at(&tx, self, *origin)?;
             if let Some((rid, _)) = queued {
                 rolled_back.push(rid);
@@ -2266,6 +2419,7 @@ impl Meta {
             pending: None,
             pending_epoch: 0,
             follow_ups: plan.follow_ups as usize,
+            leftovers,
             applied_seq: self.applied_seq()?,
         };
         {
@@ -2329,6 +2483,8 @@ impl Meta {
         )?;
         counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, 1)?;
         self.finish_local(&mut tx, local)?;
+        plan.idents
+            .extend(walked.idents.iter().map(|(ident, _)| *ident));
         plan.redone.retain(|s| !moved.contains(s));
         plan.s_deps.extend(moved.iter().copied());
         plan.jseq = jseq;
@@ -2358,6 +2514,62 @@ impl Meta {
     }
 }
 
+/// ADR-59 part B (D1): strand every journal transaction whose identity
+/// `idents` (a `DropHeld` record's) names: by its `spec_seq` if it is a live
+/// `Local` entry, else (or if it is still there) by its journal rows. Returns
+/// how many there were. The planner holds such a transaction until the apply,
+/// so none is expected.
+fn strand_named_leftovers(
+    tx: &mut fjall::SingleWriterWriteTx,
+    meta: &Meta,
+    staged: &UsageTracker,
+    idents: &[(u64, u64)],
+) -> Result<usize, MetaError> {
+    if idents.is_empty() {
+        return Ok(0);
+    }
+    let named: HashSet<(u64, u64)> = idents.iter().copied().collect();
+    let mut left: Vec<u64> = Vec::new();
+    let mut seqs: HashSet<u64> = HashSet::new();
+    for t in transactions(&*tx, meta)? {
+        let epoch = local::get_journal_tx_head(&*tx, meta, t.first)?.map(|h| h.epoch);
+        if tx_ident(&t, epoch).is_some_and(|i| named.contains(&i)) {
+            left.push(t.first);
+            seqs.extend(t.spec_seq);
+        }
+    }
+    if left.is_empty() {
+        return Ok(0);
+    }
+    if !seqs.is_empty() {
+        spec::strand_seqs_tx(tx, meta, staged, &seqs)?;
+    }
+    for first in &left {
+        let Some(row) = local::get_journal_tx(&*tx, meta, *first)? else {
+            // (An uncaptured one-row transaction has no `journal_tx` row.)
+            if tx
+                .get(&meta.journal_ks, journal::seq_key(*first))?
+                .is_some()
+            {
+                tx.remove(&meta.journal_ks, journal::seq_key(*first));
+            }
+            continue;
+        };
+        for seq in *first..=row.last {
+            tx.remove(&meta.journal_ks, journal::seq_key(seq));
+        }
+        tx.remove(&meta.journal_tx, local::tx_key(*first));
+        local::remove_journal_origin(tx, meta, row.gen, row.idx, *first);
+        let count = if row.spec_seq.is_some() {
+            KV_LOCAL_SPEC_COUNT
+        } else {
+            KV_UNCAPTURED_TX_COUNT
+        };
+        counter_add_tx(tx, &meta.local, count, -1)?;
+    }
+    Ok(left.len())
+}
+
 /// ADR-59 part B: what a decided drop persists (`local["drop_plan:{ino}"]`)
 /// until its record is in the log and the apply has run: the set of rows the
 /// record names, so the apply rolls back exactly those whatever was held
@@ -2372,6 +2584,10 @@ struct DropPlan {
     remote: bool,
     strand_all: bool,
     missing: Vec<ChunkHash>,
+    /// The identities the record names (`DropHeld::rolled_back`): the ship
+    /// plan holds these transactions until the apply strands them
+    /// ([`Named`]).
+    idents: Vec<(u64, u64)>,
     /// `spec_seq`s of the seed transactions.
     seeds: Vec<u64>,
     /// `spec_seq`s of the dependents rolled back with them.

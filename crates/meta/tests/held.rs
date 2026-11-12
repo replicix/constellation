@@ -2003,3 +2003,219 @@ fn a_drop_lists_an_archive_classed_row_unless_its_answer_is_known_parked() {
     let lost: Vec<_> = dropped.acked_lost.iter().map(|(r, _)| *r).collect();
     assert!(!lost.contains(&rid_of(1, 9)), "{dropped:?}");
 }
+
+// ---------------------------------------------------------------------
+// ADR-59 part B (D1, D2): the ship plan holds what a drop names or retired.
+// ---------------------------------------------------------------------
+
+fn whether_shipped_manifest(rows: &[(u64, LogRecord)]) -> bool {
+    rows.iter()
+        .any(|(_, r)| matches!(r, LogRecord::WriteManifest { .. }))
+}
+
+/// P1 (ii): from the decision until the apply, the rows the record names stay
+/// held in the dropper's journal whatever else clears their poison marks (a
+/// clean upload pass replaces the whole mark set). Before: the marks were the
+/// only thing holding them, and the seed shipped.
+#[test]
+fn a_transaction_a_decided_drop_names_stays_held_when_the_marks_clear() {
+    let (meta, broken) = node_one_with_a_seed();
+    let decided = meta
+        .drop_held_knowing(
+            broken,
+            1,
+            false,
+            &|_| false,
+            &|_| Vec::new(),
+            &Default::default(),
+            true,
+        )
+        .unwrap();
+    assert!(decided.pending.is_some());
+    // A full upload pass that finds nothing missing, and the chunk's pending
+    // row gone (it was uploaded after all): nothing but the record holds the
+    // seed back.
+    meta.note_unrecoverable_chunks(&[], true).unwrap();
+    meta.cancel_pending_upload(&ChunkHash::of(b"bytes that are gone"), broken)
+        .unwrap();
+    let rows = batch(&meta);
+    assert!(
+        !whether_shipped_manifest(&rows),
+        "the named seed ships: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(_, r)| matches!(r, LogRecord::DropHeld { .. })),
+        "the record itself ships"
+    );
+    // Held, not skipped: the status sees it.
+    assert_eq!(meta.held_summary().transactions, 1);
+    ship(&meta, &rows, 2);
+    // The record is in the log: the identity is retired, still held.
+    assert!(!whether_shipped_manifest(&batch(&meta)));
+    let done = meta
+        .drop_held_apply(broken, 1, &|_| false, &|_| Vec::new(), &Default::default())
+        .unwrap();
+    assert_eq!(done.dropped, 1, "{done:?}");
+    assert_eq!(done.leftovers, 0);
+    assert!(!whether_shipped_manifest(&batch(&meta)));
+    assert!(meta
+        .journal_txs_from(0, usize::MAX)
+        .unwrap()
+        .iter()
+        .all(|t| !t
+            .records
+            .iter()
+            .any(|r| matches!(r, LogRecord::WriteManifest { .. }))));
+}
+
+/// P1 (i), 186's shape: a successor re-shipped its predecessor's rows under
+/// `TailOf`, one of them a seed; the drop of it is decided, shipped and
+/// applied. After the apply no journal transaction carries the retired
+/// identity and the next plan ships nothing of it.
+#[test]
+fn a_drop_of_a_re_shipped_tail_row_leaves_nothing_of_its_identity_to_ship() {
+    use constellation_meta::{BackupTx, StrandArgs, TailArgs};
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_node_prefix(2).unwrap();
+    meta.set_holder_epoch(2);
+    let lost = ChunkHash::of(b"bytes that are gone");
+    let file = (1u64 << 40) | 7;
+    let tail = vec![
+        BackupTx {
+            first: 1,
+            last: 2,
+            records: vec![
+                LogRecord::Create {
+                    parent: ROOT_INO,
+                    name: "seed".into(),
+                    ino: file,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 10,
+                },
+                LogRecord::Completed { rid: rid_of(3, 1) },
+            ],
+            origin: (0, 0),
+        },
+        BackupTx {
+            first: 3,
+            last: 4,
+            records: vec![
+                LogRecord::WriteManifest {
+                    ino: file,
+                    base_manifest: None,
+                    manifest: manifest_naming(lost, 19),
+                    size: 19,
+                    time_ns: 11,
+                    mtime_ns: 11,
+                },
+                LogRecord::Completed { rid: rid_of(3, 2) },
+            ],
+            origin: (0, 0),
+        },
+        // A later truncate of the file: it needs the lost content, so the
+        // drop rolls it back and its rid is redone.
+        BackupTx {
+            first: 5,
+            last: 6,
+            records: vec![
+                LogRecord::Setattr {
+                    ino: file,
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    size: Some(5),
+                    atime_ns: None,
+                    mtime_ns: None,
+                    time_ns: 12,
+                },
+                LogRecord::Completed { rid: rid_of(3, 3) },
+            ],
+            origin: (0, 0),
+        },
+    ];
+    meta.backup_append(1, &tail).unwrap();
+    let proof = Default::default();
+    let carried = Default::default();
+    meta.reship_at_takeover(
+        Some(StrandArgs {
+            epoch: 2,
+            own_gens: &[],
+            abandoned: None,
+            carried: &carried,
+            proof: &proof,
+            marker: &[],
+        }),
+        Some(TailArgs {
+            epoch: 1,
+            through: 6,
+            config_version: 3,
+            class: None,
+        }),
+    )
+    .unwrap();
+    meta.note_unrecoverable_chunks(&[(lost, file)], true)
+        .unwrap();
+    let carries = |meta: &Meta| -> usize {
+        meta.journal_txs_from(0, usize::MAX)
+            .unwrap()
+            .iter()
+            .filter(|t| {
+                matches!(t.records.first(), Some(LogRecord::TailOf { epoch: 1, jseq }) if *jseq == 3 || *jseq == 5)
+            })
+            .count()
+    };
+    assert_eq!(carries(&meta), 2, "the re-shipped rows are journaled");
+    let decided = meta
+        .drop_held_knowing(
+            file,
+            1,
+            false,
+            &|_| false,
+            &|_| Vec::new(),
+            &Default::default(),
+            true,
+        )
+        .unwrap();
+    assert_eq!(decided.dropped, 1, "{decided:?}");
+    let rows = batch(&meta);
+    assert!(rows
+        .iter()
+        .any(|(_, r)| matches!(r, LogRecord::DropHeld { .. })));
+    assert!(!whether_shipped_manifest(&rows), "{rows:?}");
+    ship(&meta, &rows, 2);
+    assert!(meta.row_retired(1, 3) && meta.row_retired(1, 5));
+    let done = meta
+        .drop_held_apply(file, 1, &|_| false, &|_| Vec::new(), &Default::default())
+        .unwrap();
+    assert_eq!(done.leftovers, 0, "{done:?}");
+    assert_eq!(done.requeued, 1, "{done:?}");
+    assert_eq!(carries(&meta), 0, "the retired identity left the journal");
+    let next = batch(&meta);
+    assert!(!whether_shipped_manifest(&next), "{next:?}");
+    assert!(next
+        .iter()
+        .all(|(_, r)| !matches!(r, LogRecord::TailOf { epoch: 1, .. })));
+    // The rolled-back truncate is redone by its rid. The redo is a fresh
+    // execution: it does not journal the identity the record retired (and
+    // the plan, which holds what is retired, ships it).
+    let queued = meta.pending_replays().unwrap();
+    let redo = queued
+        .iter()
+        .find(|q| q.rid == rid_of(3, 3))
+        .expect("the truncate is queued for replay by its rid");
+    {
+        let _class = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
+        constellation_meta::execute_mutate(&meta, &redo.op, Some(redo.rid)).unwrap();
+    }
+    assert_eq!(carries(&meta), 0, "the redo carries no retired identity");
+    let redone = batch(&meta);
+    assert!(
+        redone
+            .iter()
+            .any(|(_, r)| matches!(r, LogRecord::Setattr { size: Some(5), .. })),
+        "the redo ships: {redone:?}"
+    );
+}
