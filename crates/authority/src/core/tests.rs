@@ -15117,7 +15117,10 @@ fn a_forwarded_own_op_under_a_partition_from_the_root_ends_in_doubt() {
         }
     }
     let (at, in_doubt) = ended.expect("the op never ended");
-    eprintln!("PARTITION: ended at +{at} ms, in doubt: {in_doubt}, asked_root {}", h.core.stats.deleg_retry_asked_root);
+    eprintln!(
+        "PARTITION: ended at +{at} ms, in doubt: {in_doubt}, asked_root {}",
+        h.core.stats.deleg_retry_asked_root
+    );
     assert!(in_doubt, "ended with an answer");
     assert_eq!(h.core.stats.deleg_retry_executed, 0);
     assert!(h.meta.child_ino(dir, "f").unwrap().is_none());
