@@ -8163,13 +8163,23 @@ fn sweep_config() {
                             report.stats.values().map(f).sum()
                         };
                         let decided = st(|s| s.drops_decided);
-                        let done = st(|s| s.drops_applied) + st(|s| s.drops_unapplied);
+                        // (Log-derived, not `decided - applied`: the rids the
+                        // log's `DropHeld` records name that it ends with no
+                        // `Refused` and no `Completed` of.)
+                        let unapplied = report.drop_decided_unapplied.len();
+                        let unapplied_rids = report
+                            .drop_decided_unapplied
+                            .iter()
+                            .map(|r| format!("{}/{}", r.node, r.seq))
+                            .collect::<Vec<_>>()
+                            .join(",");
                         let retired = st(|s| s.tail_retired);
                         let fenced = st(|s| s.tail_drop_fenced);
                         let diverged = st(|s| s.kept_diverged);
                         let past_gap = st(|s| s.kept_past_gap);
                         let tail_done = st(|s| s.tail_done_skipped);
                         if decided > 0
+                            || unapplied > 0
                             || past_gap > 0
                             || st(|s| s.drop_apply_leftovers) > 0
                             || retired > 0
@@ -8179,15 +8189,15 @@ fn sweep_config() {
                         {
                             eprintln!(
                                 "SWEEP-DROP-DECISIONS {label} seed {seed}: decided {decided} \
-                                 applied {} fenced_at_lease_loss {} drop_decided_unapplied {} \
+                                 applied {} fenced_at_lease_loss {} drop_decided_unapplied {unapplied} [{unapplied_rids}] \
                                  tail_retired {retired} tail_drop_fenced {fenced} follow_ups {} \
                                  kept_diverged {diverged} kept_past_gap {past_gap} tail_done {tail_done} \
-                                 drop_apply_leftovers {}",
+                                 drop_apply_leftovers {} i5_drop_named {}",
                                 st(|s| s.drops_applied),
                                 st(|s| s.drops_unapplied),
-                                decided.saturating_sub(done),
                                 st(|s| s.drop_follow_ups),
                                 st(|s| s.drop_apply_leftovers),
+                                report.i5_drop_named,
                             );
                         }
                     }

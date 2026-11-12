@@ -2720,6 +2720,10 @@ pub struct Findings {
     /// the cost the operator accepted, counted apart from `i5_operator` (the
     /// holder's `Final` rows are queued for replay by rid, never dropped).
     pub i5_after_end: Vec<String>,
+    /// ADR-59 part B: rolled-back acknowledged rids I5 accepted because an
+    /// unfenced `DropHeld` of the log names them (the operator's decision,
+    /// counted and printed per seed, not judged).
+    pub i5_drop_named: BTreeSet<Rid>,
     /// I6 (plan 43 C7b): TTL claims of a live lease.
     pub i6: Vec<String>,
     /// Plan 46 M1.2 step 3, `acked_at_or_below_cut` (`cut.rs`): answers for a
@@ -2783,6 +2787,44 @@ pub fn survivors_of_drop(log: &super::check::Oracle, dropped: &BTreeSet<Rid>) ->
         .collect()
 }
 
+/// ADR-59 part B: the rids the unfenced `DropHeld` records of the log name in
+/// `rolled_back`. The decision that caused a rollback is the artifact: durable,
+/// operator-visible and written before the loss takes effect. What a node said
+/// afterwards (`acked_lost`) is no source of it: a dropper that stays dead
+/// reports nothing.
+pub fn drop_named_rids(log: &super::check::Oracle) -> BTreeSet<Rid> {
+    log.unfenced
+        .values()
+        .flat_map(|seg| seg.records.iter())
+        .filter_map(|rec| match rec {
+            LogRecord::DropHeld { rolled_back, .. } => Some(rolled_back),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|(_, rid)| *rid)
+        .collect()
+}
+
+/// ADR-59 part B: of [`drop_named_rids`], those the log ends with neither a
+/// `Refused` nor a `Completed` of: a decision whose effect no one applied (its
+/// dropper died with the record in the log), the maintainer-accepted residual,
+/// reported with the rids.
+pub fn drop_decided_unapplied(log: &super::check::Oracle) -> BTreeSet<Rid> {
+    let refused: HashSet<Rid> = log
+        .unfenced
+        .values()
+        .flat_map(|seg| seg.records.iter())
+        .filter_map(|rec| match rec {
+            LogRecord::Refused { rid, .. } => Some(*rid),
+            _ => None,
+        })
+        .collect();
+    drop_named_rids(log)
+        .into_iter()
+        .filter(|rid| !log.completed_at.contains_key(rid) && !refused.contains(rid))
+        .collect()
+}
+
 /// What the end-of-run check of a run's `repair drop-held` rolled-back rids
 /// looks at (ADR-59, [`drop_ack_findings`]).
 pub struct DropAcks<'a> {
@@ -2795,17 +2837,24 @@ pub struct DropAcks<'a> {
     pub acked: &'a BTreeSet<Rid>,
     /// Whether the log completes the rid.
     pub completed: &'a dyn Fn(&Rid) -> bool,
-    /// The rids the drops reported as acknowledged and lost (`acked_lost`).
+    /// The rids the log's `DropHeld` records name ([`drop_named_rids`]): the
+    /// losses the operator took, judged by what the operator decided.
     pub lost: &'a BTreeSet<Rid>,
+    /// The rids the drops reported as acknowledged and lost (`acked_lost`): a
+    /// node-local report, which must be a subset of `lost`.
+    pub reported: &'a BTreeSet<Rid>,
 }
 
 /// ADR-59 (part A): the first check a run's drops fail, with the rids.
 ///
 /// 1. `drop_rolled_back_independent_acked`: a drop rolls back no
 ///    acknowledged namespace op (none carries content); no excuse.
-/// 2. `drop_acked_loss_invisible`: every acknowledged rid a drop rolled back
+/// 2. `drop_acked_loss_unrecorded`: a rid the drops reported lost that no
+///    `DropHeld` of the log names (the report is no source of a loss).
+/// 3. `drop_acked_loss_invisible`: every acknowledged rid a drop rolled back
 ///    that the log does not complete (a content op's commit, a refusal of the
-///    replay) is in `lost`; and every rid in `lost` was rolled back.
+///    replay) is named by a `DropHeld` of the log (`lost`); and every rid
+///    reported lost was rolled back.
 pub fn drop_ack_findings(d: &DropAcks) -> Option<(&'static str, Vec<Rid>)> {
     let independent: Vec<Rid> = d
         .acked_ns
@@ -2815,6 +2864,15 @@ pub fn drop_ack_findings(d: &DropAcks) -> Option<(&'static str, Vec<Rid>)> {
         .collect();
     if !independent.is_empty() {
         return Some(("drop_rolled_back_independent_acked", independent));
+    }
+    let unrecorded: Vec<Rid> = d
+        .reported
+        .iter()
+        .filter(|rid| !d.lost.contains(rid))
+        .copied()
+        .collect();
+    if !unrecorded.is_empty() {
+        return Some(("drop_acked_loss_unrecorded", unrecorded));
     }
     let invisible: Vec<Rid> = d
         .dropped
@@ -2826,7 +2884,7 @@ pub fn drop_ack_findings(d: &DropAcks) -> Option<(&'static str, Vec<Rid>)> {
         return Some(("drop_acked_loss_invisible", invisible));
     }
     let unrolled: Vec<Rid> = d
-        .lost
+        .reported
         .iter()
         .filter(|rid| !d.dropped.contains(rid))
         .copied()
@@ -3079,6 +3137,9 @@ pub fn end_of_run(
             _ => None,
         })
         .collect();
+    // ADR-59 part B: a rollback an unfenced `DropHeld` of the log names is the
+    // operator's cost, judged by the decision (never by a node's report).
+    let drop_named = drop_named_rids(log);
     let non_stealable_gens: BTreeSet<u64> = o
         .tables
         .lock()
@@ -3117,6 +3178,10 @@ pub fn end_of_run(
                 continue;
             };
             if survives(rid) {
+                continue;
+            }
+            if drop_named.contains(rid) {
+                f.i5_drop_named.insert(*rid);
                 continue;
             }
             // Plan 46 M1.3 step 13 (the operator's I5): a row of a stream
@@ -3545,6 +3610,7 @@ mod tests {
                 acked,
                 completed: &|r| completed.contains(r),
                 lost,
+                reported: lost,
             })
             .map(|(c, _)| c)
         };
@@ -3573,6 +3639,116 @@ mod tests {
         // An unacknowledged rolled-back rid (a seed never answered) is
         // nothing to list.
         assert_eq!(check(&d, &none, &none, &none, &none), None);
+    }
+
+    /// ADR-59 part B, ruling on 1547: a loss is judged by the `DropHeld` the
+    /// log carries, never by what a node reported. A rid the record names is
+    /// accepted (and counted); one it does not name is a failure; a rid the
+    /// reports list that no record names is `drop_acked_loss_unrecorded`.
+    #[test]
+    fn a_loss_is_judged_by_the_drop_held_of_the_log_not_by_the_report() {
+        let set = |v: &[u64]| -> BTreeSet<Rid> { v.iter().map(|s| rid(1, *s)).collect() };
+        let none = set(&[]);
+        let d = set(&[1]);
+        let check = |dropped: &BTreeSet<Rid>,
+                     acked: &BTreeSet<Rid>,
+                     lost: &BTreeSet<Rid>,
+                     reported: &BTreeSet<Rid>| {
+            drop_ack_findings(&DropAcks {
+                dropped,
+                acked_ns: &none,
+                acked,
+                completed: &|_| false,
+                lost,
+                reported,
+            })
+            .map(|(c, _)| c)
+        };
+        // Named by the log, reported or not (a dropper that never came back
+        // reports nothing): accepted.
+        assert_eq!(check(&d, &d, &d, &d), None);
+        assert_eq!(check(&d, &d, &d, &none), None);
+        assert_eq!(check(&none, &d, &d, &none), None);
+        // Acknowledged, rolled back, named by no record: a failure, however
+        // it was reported.
+        assert_eq!(
+            check(&d, &d, &none, &none),
+            Some("drop_acked_loss_invisible")
+        );
+        // Reported lost, named by no record of the log.
+        assert_eq!(check(&d, &d, &none, &d), Some("drop_acked_loss_unrecorded"));
+    }
+
+    fn drop_held_of(r: Rid) -> LogRecord {
+        LogRecord::DropHeld {
+            ino: 9,
+            chunks: Vec::new(),
+            rolled_back: vec![((1, 3), Some(r))],
+        }
+    }
+
+    /// ADR-59 part B, ruling on 1547 (I5): a rollback of an acknowledged rid
+    /// is accepted, and counted, exactly when an unfenced `DropHeld` of the
+    /// log names the rid; with no such record it is the same failure as
+    /// before. The seed's decision with no `Refused` and no `Completed` is
+    /// `drop_decided_unapplied`, with the rid.
+    #[test]
+    fn i5_accepts_a_rollback_only_when_a_drop_held_of_the_log_names_the_rid() {
+        let r = rid(1, 9);
+        let run = |records: Vec<LogRecord>, completed: &[(Rid, (u64, usize))]| {
+            let o = Oracles::new(Bucket::new(1, (0, 0)));
+            *o.acks.lock().unwrap() = vec![AckEntry {
+                judged: Some(Judgement {
+                    class: Some(Judged::Group),
+                    expected: Expected::Class(Judged::Group),
+                    tx: None,
+                    detail: String::new(),
+                    mismatch: None,
+                }),
+                ..ack(1, r, 5, OutcomeKind::Ok, false)
+            }];
+            let mut s = seg(1, &[]);
+            s.records = records;
+            let log = log_with(s, completed);
+            let f = end_of_run(
+                &o,
+                &log,
+                &[],
+                &HashMap::from([(r, 6)]),
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                true,
+            );
+            (f, drop_decided_unapplied(&log))
+        };
+        // Named: accepted, counted, and the decision is unapplied (no
+        // refusal, no completion of the rid in the log).
+        let (f, unapplied) = run(vec![drop_held_of(r)], &[]);
+        assert!(f.i5.is_empty(), "{:?}", f.i5);
+        assert_eq!(f.i5_drop_named, BTreeSet::from([r]));
+        assert_eq!(unapplied, BTreeSet::from([r]));
+        // Named, and the log completes the rid (its retry by rid): accepted
+        // and not unapplied.
+        let (f, unapplied) = run(vec![drop_held_of(r)], &[(r, (1, 0))]);
+        assert!(f.i5.is_empty(), "{:?}", f.i5);
+        assert!(unapplied.is_empty());
+        // Named by the record of a refusal: applied.
+        let (_, unapplied) = run(
+            vec![
+                drop_held_of(r),
+                LogRecord::Refused {
+                    rid: r,
+                    code: Code::Io,
+                },
+            ],
+            &[],
+        );
+        assert!(unapplied.is_empty());
+        // Named by no record: the failure.
+        let (f, unapplied) = run(Vec::new(), &[]);
+        assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
+        assert!(f.i5_drop_named.is_empty() && unapplied.is_empty());
     }
 
     fn rid(n: u64, seq: u64) -> Rid {

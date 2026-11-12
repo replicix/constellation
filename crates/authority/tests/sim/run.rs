@@ -1514,6 +1514,14 @@ pub struct Report {
     pub drop_counts: super::chunks::DropCounts,
     /// The rids the run's operator drops rolled back (for `SWEEP-DROPS`).
     pub drop_rolled_back: Vec<Rid>,
+    /// ADR-59 part B: the rids the log's `DropHeld` records name that the log
+    /// ends with neither a `Refused` nor a `Completed` of: decisions whose
+    /// effect no one applied (`drop_decided_unapplied`, printed with the
+    /// rids; reported, not a failure).
+    pub drop_decided_unapplied: Vec<Rid>,
+    /// Of the I5 rollbacks, those an unfenced `DropHeld` of the log names
+    /// (accepted: the operator's decision).
+    pub i5_drop_named: usize,
     pub member_gone: bool,
     /// Chunk metered-own-rows: own chunks a round's pass left held, and
     /// those `Action::UploadAwaited` put up past the hold.
@@ -6643,7 +6651,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // and counts it; the listing is what I2 (c) accepts for it, and
     // `drop_acked_loss_invisible` fails any acknowledged rolled-back rid the
     // drop did not list.
-    operator_lost_rids.extend(world.acked_lost_rids.lock().unwrap().iter().copied());
+    // (ADR-59 part B: the losses are the rids the log's `DropHeld` records
+    // name, never what a node reported afterwards.)
+    operator_lost_rids.extend(super::oracle::drop_named_rids(&oracle));
     report.segments = oracle.segments;
     report.fenced = oracle.fenced;
     report.commits = commit_list.len();
@@ -6768,13 +6778,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 .filter(|a| a.kind == super::oracle::OutcomeKind::Ok && !a.reply)
                 .map(|a| a.rid),
         );
-        let lost = world.acked_lost_rids.lock().unwrap().clone();
+        let lost = super::oracle::drop_named_rids(&oracle);
+        let reported = world.acked_lost_rids.lock().unwrap().clone();
         if let Some((check, rids)) = super::oracle::drop_ack_findings(&super::oracle::DropAcks {
             dropped: &dropped_set,
             acked_ns: &acked_ns,
             acked: &acked,
             completed: &|rid| oracle.completed_at.contains_key(rid),
             lost: &lost,
+            reported: &reported,
         }) {
             let acks = oracles.acks.lock().unwrap();
             let why: Vec<String> = rids
@@ -7551,6 +7563,10 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.non_lone_rollbacks = found.i5.len();
     report.i5_operator = found.i5_operator.len();
     report.i5_after_end = found.i5_after_end.len();
+    report.i5_drop_named = found.i5_drop_named.len();
+    report.drop_decided_unapplied = super::oracle::drop_decided_unapplied(&oracle)
+        .into_iter()
+        .collect();
     {
         let ord = std::sync::atomic::Ordering::Relaxed;
         report.lease_ttl_claims = oracles.leases.ttl_claims.load(ord);
