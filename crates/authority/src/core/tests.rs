@@ -15041,6 +15041,88 @@ fn a_stale_yours_does_not_outlive_a_later_forward() {
     assert!(h.meta.child_ino(dir, "f").unwrap().is_none());
 }
 
+/// ADR-54/55, the partition case. An op this node sent to the root (so it
+/// may have run there) whose keys then became this node's own delegation,
+/// with the root unreachable (every send fails): the guard keeps the op off
+/// the delegate (`Sent::MayHaveRun`), so nothing runs it and nothing settles
+/// it locally. It ends `InDoubt` (an unsettled `EIO`) at the client deadline
+/// and its settle window, although this node holds the keys itself. The root
+/// may have run the rid, so running it here could execute it twice; the cost
+/// is liveness under a partition from the root.
+#[test]
+fn a_forwarded_own_op_under_a_partition_from_the_root_ends_in_doubt() {
+    use std::collections::BTreeMap;
+    let (mut h, dir, rid, req) = forwarded_op_to_root();
+    let mut pending: BTreeMap<TimerId, (u64, TimerKind)> = BTreeMap::new();
+    let track = |out: &[Action], pending: &mut BTreeMap<TimerId, (u64, TimerKind)>, now: u64| {
+        for a in out {
+            match a {
+                Action::SetTimer { id, after_ms, kind } => {
+                    pending.insert(*id, (now + *after_ms, *kind));
+                }
+                Action::CancelTimer { id } => {
+                    pending.remove(id);
+                }
+                _ => {}
+            }
+        }
+    };
+    let mut t = 0u64;
+    // (The deadline armed at submit.)
+    let deadline = h.core.clients[&rid].deadline;
+    pending.insert(deadline, (15_000, TimerKind::ClientDeadline));
+    let out = h.step(Event::PeerFailed {
+        req,
+        to: 2,
+        outage: false,
+    });
+    track(&out, &mut pending, t);
+    install_designated_grant(&mut h, dir);
+    let mut ended = None;
+    for _ in 0..400 {
+        // Every send to the root fails; the next timer fires.
+        let Some((&id, &(due, _))) = pending.iter().min_by_key(|(_, (due, _))| *due) else {
+            break;
+        };
+        pending.remove(&id);
+        h.advance(due.saturating_sub(t));
+        t = t.max(due);
+        let out = h.step(Event::Timer { id });
+        track(&out, &mut pending, t);
+        let reqs: Vec<OpId> = sends(&out)
+            .iter()
+            .filter_map(|(_, m)| match m {
+                PeerMsg::MutateRequest { req, .. } => Some(*req),
+                _ => None,
+            })
+            .collect();
+        if let Some((r, reply)) = replies(&out).into_iter().next() {
+            assert_eq!(r, rid);
+            ended = Some((t, matches!(reply, ClientReply::InDoubt)));
+            break;
+        }
+        for req in reqs {
+            let out = h.step(Event::PeerFailed {
+                req,
+                to: 2,
+                outage: true,
+            });
+            track(&out, &mut pending, t);
+            if let Some((_, reply)) = replies(&out).into_iter().next() {
+                ended = Some((t, matches!(reply, ClientReply::InDoubt)));
+            }
+        }
+        if ended.is_some() {
+            break;
+        }
+    }
+    let (at, in_doubt) = ended.expect("the op never ended");
+    eprintln!("PARTITION: ended at +{at} ms, in doubt: {in_doubt}, asked_root {}", h.core.stats.deleg_retry_asked_root);
+    assert!(in_doubt, "ended with an answer");
+    assert_eq!(h.core.stats.deleg_retry_executed, 0);
+    assert!(h.meta.child_ino(dir, "f").unwrap().is_none());
+}
+
 /// Plan 46 M0.3 (B): an op the root answered `Held` is asked again at that
 /// root when the backoff runs out, also when this node dropped its cached
 /// holder meanwhile (another request's refusal naming no holder).
