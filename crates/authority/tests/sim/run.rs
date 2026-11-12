@@ -6651,9 +6651,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // and counts it; the listing is what I2 (c) accepts for it, and
     // `drop_acked_loss_invisible` fails any acknowledged rolled-back rid the
     // drop did not list.
-    // (ADR-59 part B: the losses are the rids the log's `DropHeld` records
-    // name, never what a node reported afterwards.)
-    operator_lost_rids.extend(super::oracle::drop_named_rids(&oracle));
+    // (ADR-59 part B: a drop's losses are not rids given here: the oracles
+    // excuse the very row a `DropHeld` of the log names.)
     report.segments = oracle.segments;
     report.fenced = oracle.fenced;
     report.commits = commit_list.len();

@@ -2805,6 +2805,39 @@ pub fn drop_named_rids(log: &super::check::Oracle) -> BTreeSet<Rid> {
         .collect()
 }
 
+/// ADR-59 part B: [`drop_named_rids`] with the identities the records name
+/// each rid's row by (`(epoch, jseq)`, or the `TailOf` pair of a re-shipped one).
+pub fn drop_named_idents(log: &super::check::Oracle) -> BTreeMap<Rid, BTreeSet<(u64, u64)>> {
+    let mut out: BTreeMap<Rid, BTreeSet<(u64, u64)>> = BTreeMap::new();
+    for rec in log.unfenced.values().flat_map(|seg| seg.records.iter()) {
+        if let LogRecord::DropHeld { rolled_back, .. } = rec {
+            for (ident, rid) in rolled_back {
+                if let Some(rid) = rid {
+                    out.entry(*rid).or_default().insert(*ident);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether `ack` answered the very row a `DropHeld` of the log names (the
+/// judged transaction is one of `named`'s identities for the rid). A later
+/// retry of a named rid is another row: its rollback is judged as any.
+pub fn acks_the_named_row(
+    named: &BTreeMap<Rid, BTreeSet<(u64, u64)>>,
+    ack: &AckEntry,
+) -> bool {
+    let (Some(idents), Some(t)) = (
+        named.get(&ack.rid),
+        ack.judged.as_ref().and_then(|j| j.tx.as_ref()),
+    ) else {
+        return false;
+    };
+    let ident = constellation_meta::tail_identity(&t.records).unwrap_or((t.epoch, t.first));
+    idents.contains(&ident)
+}
+
 /// ADR-59 part B: of [`drop_named_rids`], those the log ends with neither a
 /// `Refused` nor a `Completed` of: a decision whose effect no one applied (its
 /// dropper died with the record in the log), the maintainer-accepted residual,
@@ -2957,6 +2990,7 @@ pub fn end_of_run(
         f.i2_ungated = ledger.ungated.values().cloned().collect();
         f.i2_foreign_gated = ledger.foreign_gated.values().cloned().collect();
     }
+    let drop_named_i2c = drop_named_idents(log);
     let acks = o.acks.lock().unwrap();
     let audit = o.fence_audit.lock().unwrap();
     f.fence = fence_findings(&audit, &acks, log);
@@ -3018,9 +3052,10 @@ pub fn end_of_run(
         // the log must carry as it was committed.
         if a.kind == OutcomeKind::Ok && j.class == Some(Judged::Group) {
             if let Some(t) = &j.tx {
-                if operator_lost.contains(&a.rid) {
+                if operator_lost.contains(&a.rid) || acks_the_named_row(&drop_named_i2c, a) {
                     // Given up on purpose by the operator's `abandon-group`
-                    // (only that group held the row): exactly these rids.
+                    // (only that group held the row): exactly these rids; or
+                    // the row a `DropHeld` of the log names.
                     if verbatim_seen.insert(a.rid) {
                         f.i2c_operator_lost += 1;
                     }
@@ -3139,7 +3174,7 @@ pub fn end_of_run(
         .collect();
     // ADR-59 part B: a rollback an unfenced `DropHeld` of the log names is the
     // operator's cost, judged by the decision (never by a node's report).
-    let drop_named = drop_named_rids(log);
+    let drop_named = drop_named_idents(log);
     let non_stealable_gens: BTreeSet<u64> = o
         .tables
         .lock()
@@ -3180,7 +3215,7 @@ pub fn end_of_run(
             if survives(rid) {
                 continue;
             }
-            if drop_named.contains(rid) {
+            if acks_the_named_row(&drop_named, a) {
                 f.i5_drop_named.insert(*rid);
                 continue;
             }
@@ -3695,13 +3730,23 @@ mod tests {
     #[test]
     fn i5_accepts_a_rollback_only_when_a_drop_held_of_the_log_names_the_rid() {
         let r = rid(1, 9);
-        let run = |records: Vec<LogRecord>, completed: &[(Rid, (u64, usize))]| {
+        let tx_at = |first: u64| TxRef {
+            node: 1,
+            first,
+            last: first,
+            origin: (0, 0),
+            epoch: 1,
+            records: Vec::new(),
+        };
+        let run_tx = |first: u64,
+                      records: Vec<LogRecord>,
+                      completed: &[(Rid, (u64, usize))]| {
             let o = Oracles::new(Bucket::new(1, (0, 0)));
             *o.acks.lock().unwrap() = vec![AckEntry {
                 judged: Some(Judgement {
                     class: Some(Judged::Group),
                     expected: Expected::Class(Judged::Group),
-                    tx: None,
+                    tx: Some(tx_at(first)),
                     detail: String::new(),
                     mismatch: None,
                 }),
@@ -3721,6 +3766,10 @@ mod tests {
                 true,
             );
             (f, drop_decided_unapplied(&log))
+        };
+        // (The named row is the one the record's identity (1, 3) says.)
+        let run = |records: Vec<LogRecord>, completed: &[(Rid, (u64, usize))]| {
+            run_tx(3, records, completed)
         };
         // Named: accepted, counted, and the decision is unapplied (no
         // refusal, no completion of the rid in the log).
@@ -3745,6 +3794,11 @@ mod tests {
             &[],
         );
         assert!(unapplied.is_empty());
+        // A later retry of the named rid, another row (1, 9), acknowledged and
+        // rolled back: not excused by the record of the first.
+        let (f, _) = run_tx(9, vec![drop_held_of(r)], &[]);
+        assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
+        assert!(f.i5_drop_named.is_empty());
         // Named by no record: the failure.
         let (f, unapplied) = run(Vec::new(), &[]);
         assert_eq!(f.i5.len(), 1, "{:?}", f.i5);
