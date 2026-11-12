@@ -1982,6 +1982,58 @@ impl Core {
         }
     }
 
+    /// Whether a root row of this node's journal that the ship plan holds or
+    /// defers (a later row, the grant's record among them, may ship ahead of
+    /// it: `Replica::journal_held_back`) touches a key in `dir` or below it,
+    /// or an entry of the replay queue does (a drop's requeued dependent, or
+    /// the placeholder of one: it executes here, as a root row, or settles
+    /// here): a grant of `dir` to another node waits for it
+    /// (`delegate_dir_from`). A row the plan ships as it is goes into the log
+    /// ahead of the record, and a refused queue entry executes nothing.
+    fn root_rows_unshipped_under(&self, dir: Ino, replica: &dyn Replica) -> bool {
+        let ns = replica.namespace();
+        let under = |keys: &constellation_meta::TouchSet| {
+            Self::dirs_of_keys(keys, replica)
+                .into_iter()
+                .any(|d| is_under(ns, d, dir))
+        };
+        match replica.queue_snapshot() {
+            Ok(snap) => {
+                let lookup = |p, n: &str| replica.lookup_ino(p, n);
+                if snap
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .any(|(i, e)| e.refused.is_none() && under(&snap.keys_of(i, &lookup)))
+                {
+                    return true;
+                }
+            }
+            // (The queue could not be read: not decided.)
+            Err(_) => return true,
+        }
+        let acked = replica.journal_acked_seq().unwrap_or(0);
+        let bound = replica.journal_root_bound();
+        if bound <= self.ack.shipped_through.max(acked) {
+            return false;
+        }
+        let Ok(rows) = replica.journal_root_rows_through(bound) else {
+            // (The journal could not be read: not decided.)
+            return true;
+        };
+        let mut rows = rows
+            .iter()
+            .filter(|(first, keys)| !self.archive_covers(*first, acked) && under(keys))
+            .peekable();
+        if rows.peek().is_none() {
+            return false;
+        }
+        match replica.journal_held_back() {
+            Ok(back) => rows.any(|(first, _)| back.contains(first)),
+            Err(_) => true,
+        }
+    }
+
     /// R-H, once per event: decide the own streams not honoured yet, and
     /// release one whose honour has waited for a root row of its keys longer
     /// than the bound (a held, poisoned row under its directories): the
@@ -9509,6 +9561,17 @@ impl Core {
                 later(self);
                 continue;
             }
+            if node != self.me()
+                && dirs
+                    .iter()
+                    .any(|(d, _)| self.root_rows_unshipped_under(*d, replica))
+            {
+                // A root row there is held back from the log (or a replay
+                // is queued there), and a grant waits for it
+                // (`delegate_dir_from`): once it ships.
+                later(self);
+                continue;
+            }
             // Every subtree again: the first grant opens the new stream and
             // the rest grow it.
             let mut results = Vec::new();
@@ -12219,6 +12282,23 @@ impl Core {
             .any(|d| d.dir != dir && is_under(replica.namespace(), d.dir, dir))
         {
             return Err(format!("a directory under {dir} is already delegated"));
+        }
+        // Another node executes on the log's state plus its own stream, and
+        // answers a settle of a rid it has no outcome for "did not happen".
+        // A root row of the subtree that the ship plan defers (for an
+        // upload) or holds (behind a lost chunk) would land in the log after
+        // the grant's record, which the plan sends ahead of it: the
+        // delegate would execute without it, and refuse its rid for good
+        // while this journal holds its outcome (far-placement+lost-chunk
+        // seeds 1120 and 53). So would a replay a drop queued here (seed
+        // 1527: it could no longer run on keys another node held). The grant
+        // waits until none is left (the root's own grant has R-H (b) for
+        // this, and a release bound).
+        if !own && self.root_rows_unshipped_under(dir, replica) {
+            self.stats.delegate_refused_unshipped += 1;
+            return Err(format!(
+                "a row of this root under directory {dir} is held back from the log"
+            ));
         }
         // Plan 30 §M8 under M11: the read delegations this root granted
         // under `dir` must be gone before the delegate executes, since its

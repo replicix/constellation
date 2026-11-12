@@ -1424,6 +1424,27 @@ impl Meta {
         Ok(())
     }
 
+    /// The first journal seq of every unshipped transaction the ship plan
+    /// holds or defers now (planned afresh, not the last round's view): the
+    /// rows a later transaction may ship ahead of. Empty, at the cost of two
+    /// reads, when no chunk is poisoned or pending: then every unshipped
+    /// transaction ships in journal order.
+    pub fn journal_held_back(&self) -> Result<BTreeSet<u64>, MetaError> {
+        let r = self.db.read_tx();
+        let poisoned = read_poisoned(&r, self)?;
+        let pending = read_pending(&r, self)?;
+        if poisoned.is_empty() && pending.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let plan = plan(&r, self, &poisoned, &pending, None)?;
+        Ok(plan
+            .held
+            .iter()
+            .map(|(tx, ..)| tx.first)
+            .chain(plan.deferred.iter().map(|tx| tx.first))
+            .collect())
+    }
+
     /// The unrecoverable pending uploads currently recorded.
     pub fn unrecoverable_chunks(&self) -> Result<Vec<(ChunkHash, Ino)>, MetaError> {
         let r = self.db.read_tx();

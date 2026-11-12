@@ -1643,6 +1643,10 @@ pub struct Stats {
     /// Plan 46 M1.3 step 7: operator grants refused for the same reason
     /// (`delegate_dir`).
     pub delegate_refused_far: u64,
+    /// Grants to another node refused (or put off, for the placement) because
+    /// the ship plan held back a root row of the subtree's keys, or a replay
+    /// was queued there (`Core::root_rows_unshipped_under`).
+    pub delegate_refused_unshipped: u64,
     /// Plan 46 M1.3 step 7: sticky grants made by the placement.
     pub place_sticky: u64,
     /// Placed grants the placement recalled to convert them (the node is
