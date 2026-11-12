@@ -601,16 +601,21 @@ impl PendingRelease {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
+        // Each grant once, as the later release handed it back: a grant in
+        // both was handed back, granted to the stream again and handed back
+        // once more (plan 46 M1.2 step 10), and the earlier copy is stale
+        // (released or replaced since, at the delegate).
         for g in new.locks.grants {
-            if !note.locks.grants.iter().any(|x| x.id == g.id) {
-                note.locks.grants.push(g);
-            }
+            note.locks.grants.retain(|x| x.id != g.id);
+            note.locks.grants.push(g);
         }
         for (id, left) in new.locks.carry {
-            match note.locks.carry.iter_mut().find(|(x, _)| *x == id) {
-                Some((_, l)) => *l = (*l).max(left),
-                None => note.locks.carry.push((id, left)),
-            }
+            note.locks.carry.retain(|(x, _)| *x != id);
+            note.locks.carry.push((id, left));
+        }
+        for (id, at) in new.locks.rows {
+            note.locks.rows.retain(|(x, _)| *x != id);
+            note.locks.rows.push((id, at));
         }
         note.locks.floor =
             constellation_meta::locks::floor_join(&note.locks.floor, &new.locks.floor);
@@ -2245,7 +2250,30 @@ impl Core {
                     Ok(set) => !set.contains(&gen),
                     Err(_) => false,
                 };
-                if !self.deleg_sync_growth(now, gen, &subtrees, committed, out) {
+                let before: Vec<Ino> = self
+                    .dl
+                    .mine
+                    .get(&gen)
+                    .map(|d| d.dirs.iter().copied().collect())
+                    .unwrap_or_default();
+                let synced = self.deleg_sync_growth(now, gen, &subtrees, committed, replica, out);
+                // Plan 46 M1.2 step 10: handoff grants that came before their
+                // subtree's row are installed before anything here serves it
+                // (a non-stealable stream honours a grown subtree right here).
+                let promoted: Vec<Ino> = self
+                    .dl
+                    .mine
+                    .get(&gen)
+                    .map(|d| {
+                        d.dirs
+                            .iter()
+                            .copied()
+                            .filter(|x| !before.contains(x))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.lock_install_deferred(now, gen, &promoted, replica);
+                if !synced {
                     self.dl.commit_waiting.entry(gen).or_insert(now.wait);
                     commit_now.insert(gen);
                     retry = true;
@@ -2609,6 +2637,7 @@ impl Core {
         gen: u64,
         subtrees: &[(Ino, SubtreeKind)],
         committed: bool,
+        replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> bool {
         let Some(d) = self.dl.mine.get_mut(&gen) else {
@@ -2625,7 +2654,27 @@ impl Core {
                 // release when it is asked for again: the release this node
                 // journaled of it earlier is not one a later request repeats
                 // (step 10 review).
-                d.released_dirs.remove(dir);
+                if d.released_dirs.remove(dir) {
+                    // Plan 46 M1.2 step 10: the root applied the release
+                    // before it granted the subtree again, so the lock grants
+                    // a note not acknowledged yet hands back under it are the
+                    // root's already, and handed again with the subtree. A
+                    // copy here would ride the next release of it (merged into
+                    // this note) as stale as it is now.
+                    if let Some(r) = d.release.as_mut() {
+                        let ns = replica.namespace();
+                        let locks = &mut r.note.locks;
+                        let gone: Vec<constellation_meta::locks::GrantId> = locks
+                            .grants
+                            .iter()
+                            .filter(|g| is_under(ns, g.ino, *dir))
+                            .map(|g| g.id)
+                            .collect();
+                        locks.grants.retain(|g| !gone.contains(&g.id));
+                        locks.carry.retain(|(id, _)| !gone.contains(id));
+                        locks.rows.retain(|(id, _)| !gone.contains(id));
+                    }
+                }
                 learned += 1;
             }
         }
@@ -6371,6 +6420,24 @@ impl Core {
     /// sent at `sent_at` on its clock: the next renewal echoes it
     /// ([`PeerMsg::DelegRenew::stream_head_at`]). Only a later one replaces
     /// it (the same root's clock), a different root's always does.
+    /// When this node sent renewal `req` of `gen` (honour clock): the one
+    /// in flight, or one whose answer comes late (`LateReq`).
+    pub(crate) fn deleg_renew_sent(&self, gen: u64, req: OpId) -> Option<HonourMs> {
+        self.dl
+            .mine
+            .get(&gen)
+            .and_then(|d| d.renew)
+            .filter(|(r, _)| *r == req)
+            .map(|(_, sent)| sent)
+            .or_else(|| {
+                self.dl
+                    .late
+                    .get(&req)
+                    .filter(|l| l.gen == gen && l.kind == ReqKind::Renew)
+                    .map(|l| l.sent)
+            })
+    }
+
     pub(crate) fn deleg_note_root_answer(&mut self, gen: u64, root: NodeId, sent_at: i64) {
         if sent_at <= 0 {
             return;
@@ -8129,7 +8196,12 @@ impl Core {
         // The subtrees' lock grants go back with the note; their waiters are
         // told to ask the root.
         let asked_list: Vec<Ino> = asked.iter().copied().collect();
-        let locks = self.lock_hand_back(now, gen, &asked_list, whole, replica);
+        let mut locks = self.lock_hand_back(now, gen, &asked_list, whole, replica);
+        // Each grant under the row that hands it back (the cut without one):
+        // the root tells a later release of a subtree granted to the stream
+        // again from a re-sent copy of this note by it.
+        let at = row.unwrap_or(cut);
+        locks.rows = locks.grants.iter().map(|g| (g.id, at)).collect();
         if whole {
             self.dl.handed_back.insert(
                 gen,

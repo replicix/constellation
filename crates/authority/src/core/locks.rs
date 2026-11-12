@@ -502,12 +502,31 @@ pub(crate) struct LockState {
     /// installed again: a record the root released or superseded since
     /// would come back, and one it kept would be restamped (later), and
     /// F-c admits a late renewal from a record. Each grant installs once
-    /// per generation; dropped with the generation.
-    returned: BTreeMap<u64, std::collections::BTreeSet<GrantId>>,
+    /// per release row (`LockHandback::rows`), the latest row kept: a
+    /// stream granted a released subtree again hands the grant back under a
+    /// later row (plan 46 M1.2 step 10), a re-sent copy of the earlier note
+    /// under the earlier one. Dropped with the generation.
+    returned: BTreeMap<u64, BTreeMap<GrantId, u64>>,
     /// Delegate: the moved grant ids a generation installed (a re-sent
     /// handoff installs each once: a grant released or replaced here
     /// since is not revived).
     moved_seen: BTreeMap<u64, std::collections::BTreeSet<GrantId>>,
+    /// Delegate, plan 46 M1.2 step 10: generations that installed a batch
+    /// of moved grants (the batch that starts a generation's service here
+    /// keeps the grants settled, `Core::lock_install_moved`).
+    moved_started: std::collections::BTreeSet<u64>,
+    /// Delegate, plan 46 M1.2 step 10: moved grants of a handoff on inodes
+    /// this replica did not show as the generation's yet (the root granted
+    /// the stream a subtree again, and its answer came before the row),
+    /// recorded from their receipt: installed once the row is here
+    /// (`Core::lock_install_deferred`), or from a later re-send.
+    deferred: BTreeMap<u64, BTreeMap<GrantId, Grant>>,
+    /// Delegate, plan 46 M1.2 step 10: grants a partial release handed back,
+    /// and when (honour clock). The root may hand one to the stream again
+    /// with the subtree; an answer to a renewal sent before the hand-back
+    /// carries the copy from before it, which this node may have released
+    /// since, and is not installed.
+    handed_back_at: BTreeMap<u64, BTreeMap<GrantId, HonourMs>>,
     /// Owner side, per inode: what the holders that released their
     /// grants on it had seen or been acknowledged (`LockReleased`'s
     /// position, joined). Every later grant on the inode carries it, so a
@@ -6287,20 +6306,6 @@ impl Core {
         });
         if !moved.is_empty() {
             self.lk.mirror_dirty = true;
-            // Plan 46 M1.2 step 10: a stream that released a subtree is
-            // granted it again under the same generation (`re-delegated
-            // after a cross-subtree op`), and the grants its release handed
-            // back go to it again: they are its own once more, and its next
-            // release hands them back for real. Left in `returned`, that
-            // answer was taken for a copy of the first and dropped: neither
-            // table had the grant any more, and the delegate granted the
-            // inode over its own holder's (sim
-            // `locks-unlinked-delegated-dcrash-pause` seed 3808).
-            if let Some(seen) = self.lk.returned.get_mut(&gen) {
-                for g in &moved {
-                    seen.remove(&g.id);
-                }
-            }
             self.lk.handoff.entry(gen).or_default().extend(moved);
             self.dw.unsettle(gen);
         }
@@ -6806,11 +6811,21 @@ impl Core {
             // brought them here first (sim
             // `locks-unlinked-delegated-dcrash-pause` seed 3808: skipped as
             // one, the delegate served the subtree without its own holder's
-            // grant).
+            // grant). Only an answer to a renewal sent after this hand-back
+            // carries it (`handed_back_at`); a handoff deferred under the
+            // subtrees is the root's again.
+            let at = now.honour;
             if let Some(seen) = self.lk.moved_seen.get_mut(&gen) {
                 for g in &taken {
                     seen.remove(&g.id);
                 }
+            }
+            let back = self.lk.handed_back_at.entry(gen).or_default();
+            for g in &taken {
+                back.insert(g.id, at);
+            }
+            if let Some(d) = self.lk.deferred.get_mut(&gen) {
+                d.retain(|_, g| !dirs.iter().any(|dir| replica.is_under(g.ino, *dir)));
             }
             taken
         };
@@ -6833,6 +6848,7 @@ impl Core {
         constellation_meta::locks::LockHandback {
             grants,
             carry,
+            rows: Vec::new(),
             floor,
             barrier,
         }
@@ -6936,6 +6952,7 @@ impl Core {
         let constellation_meta::locks::LockHandback {
             grants,
             carry,
+            rows,
             floor,
             barrier,
         } = back;
@@ -6984,9 +7001,35 @@ impl Core {
         // brought it: a duplicate of the answer brings back nothing the
         // first did not (a record released or superseded since stays
         // gone), and extends none (it would be restamped later).
+        //
+        // Plan 46 M1.2 step 10: once per release row. A stream that released
+        // a subtree and was granted it again (`re-delegated after a
+        // cross-subtree op`) hands the same grant back with its next release,
+        // under a later row: taken for a copy of the first and dropped,
+        // neither table had the grant, and the delegate granted the inode
+        // over its own holder's (sim `locks-unlinked-delegated-dcrash-pause`
+        // seed 3808). A re-sent copy of the first note (its acknowledgement
+        // lost, the subtree granted again meanwhile) repeats the first row,
+        // and stays out: installed, it put a root copy beside the grant the
+        // delegate holds again, and took it out of `handed`.
         let seen = self.lk.returned.entry(gen).or_default();
         let before = grants.len();
-        let grants: Vec<GrantWire> = grants.into_iter().filter(|g| seen.insert(g.id)).collect();
+        let grants: Vec<GrantWire> = grants
+            .into_iter()
+            .filter(|g| {
+                let at = rows
+                    .iter()
+                    .find(|(id, _)| *id == g.id)
+                    .map_or(0, |(_, r)| *r);
+                match seen.get(&g.id) {
+                    Some(r) if *r >= at => false,
+                    _ => {
+                        seen.insert(g.id, at);
+                        true
+                    }
+                }
+            })
+            .collect();
         if grants.len() < before {
             self.stats.lock_returned_duplicates += (before - grants.len()) as u64;
             tracing::debug!(
@@ -7021,7 +7064,7 @@ impl Core {
             self.lock_install_leaving(now, gen, left, replica);
         }
         if !grants.is_empty() {
-            self.lock_install_moved(now, 0, grants, &carry, replica);
+            self.lock_install_moved(now, 0, grants, &carry, None, replica);
         }
     }
 
@@ -7045,6 +7088,7 @@ impl Core {
         gen: u64,
         grants: Vec<GrantWire>,
         carry: &[(GrantId, u64)],
+        req_sent: Option<HonourMs>,
         replica: &dyn Replica,
     ) {
         if gen != 0 && self.deleg_mine_until(gen).is_none() {
@@ -7071,8 +7115,11 @@ impl Core {
         // Plan 43 C7-F F-c: the batch that starts a generation's service
         // here is the move itself (its grants keep what they were); a later
         // one may be a re-send installed after this delegate served: not
-        // settled (`Grant::settled`).
-        let first = gen == 0 || self.lk.moved_seen.get(&gen).is_none_or(|s| s.is_empty());
+        // settled (`Grant::settled`). Plan 46 M1.2 step 10: so is a grant on
+        // a subtree the stream grew by (or was granted again) and does not
+        // honour yet: nothing here served the inode under the generation
+        // before this move of it.
+        let first = gen == 0 || !self.lk.moved_started.contains(&gen);
         for g in grants {
             let left = carry.iter().find(|(id, _)| *id == g.id).map(|(_, l)| *l);
             let until = left.map_or(restamp, |l| self.carried_until(now, l));
@@ -7085,7 +7132,6 @@ impl Core {
                 gen,
                 ..g.into_grant(until)
             };
-            g.settled &= first;
             if gen == 0 {
                 // A recall's hand-back is a copy from the delegate: one this
                 // table ended since (released here after an earlier answer,
@@ -7108,32 +7154,65 @@ impl Core {
                     replica.locks().install(g);
                 }
             } else {
-                // A re-sent handoff: each id once, and never over a
-                // newer grant of the same node, or next to a conflicting
+                // A re-sent handoff: each id once (the cheap check first:
+                // every granting renewal re-sends them all), and never over
+                // a newer grant of the same node, or next to a conflicting
                 // one, here.
-                //
-                // Plan 46 M1.2 step 10: nor on an inode this replica does
-                // not show as the generation's yet (the root granted the
-                // stream a subtree again, and the renewal answer came
-                // before the row). Installed, the grant sat on an inode that
-                // resolves to the root, so the next batch handed it over as
-                // having left the subtree (`deleg_leaving_grants`): the root
-                // kept it in a table that does not serve the inode, and
-                // this node granted the inode over it once it honoured the
-                // subtree (sim `locks-unlinked-delegated-dcrash-pause` seed
-                // 4016). Every granting renewal re-sends the live ones, and
-                // a grown subtree is honoured only with the answer to a
-                // renewal sent after its row was committed here
-                // (`deleg_unpark_grown`), which carries them again.
-                if !matches!(
-                    replica.resolve_ownership(&Self::read_keys(g.ino, None)),
-                    constellation_meta::delegation::Ownership::Delegated(d) if d.gen == gen
-                ) {
-                    self.stats.lock_handoff_deferred += 1;
+                if self
+                    .lk
+                    .moved_seen
+                    .get(&gen)
+                    .is_some_and(|s| s.contains(&g.id))
+                {
                     continue;
                 }
-                if !self.lk.moved_seen.entry(gen).or_default().insert(g.id) {
+                // Plan 46 M1.2 step 10: a grant a partial release handed back
+                // comes again only with an answer to a renewal sent after
+                // that: an earlier one (late, or computed before the root had
+                // the hand-back) carries the copy from before, which this
+                // node may have released since.
+                if let Some(at) = self.lk.handed_back_at.get(&gen).and_then(|m| m.get(&g.id)) {
+                    if !req_sent.is_some_and(|s| s > *at) {
+                        self.stats.lock_handoff_stale += 1;
+                        continue;
+                    }
+                }
+                // Nor on an inode this replica does not show as the
+                // generation's yet (the root granted the stream a subtree
+                // again, and the renewal answer came before the row).
+                // Installed, the grant sat on an inode that resolves to the
+                // root, so the next batch handed it over as having left the
+                // subtree (`deleg_leaving_grants`): the root kept it in a
+                // table that does not serve the inode, and this node granted
+                // the inode over it once it honoured the subtree (sim
+                // `locks-unlinked-delegated-dcrash-pause` seed 4016). It is
+                // kept as received and installed once the row is here
+                // (`Core::lock_install_deferred`), before a subtree the
+                // stream grew by is honoured, or from a later re-send.
+                let keys = Self::read_keys(g.ino, None);
+                if !matches!(
+                    replica.resolve_ownership(&keys),
+                    constellation_meta::delegation::Ownership::Delegated(d) if d.gen == gen
+                ) {
+                    if self
+                        .lk
+                        .deferred
+                        .entry(gen)
+                        .or_default()
+                        .insert(g.id, g)
+                        .is_none()
+                    {
+                        self.stats.lock_handoff_deferred += 1;
+                    }
                     continue;
+                }
+                g.settled &= first || self.deleg_parked_for(&keys, gen, replica);
+                self.lk.moved_seen.entry(gen).or_default().insert(g.id);
+                if let Some(d) = self.lk.deferred.get_mut(&gen) {
+                    d.remove(&g.id);
+                }
+                if let Some(m) = self.lk.handed_back_at.get_mut(&gen) {
+                    m.remove(&g.id);
                 }
                 if !replica.locks().install_if_consistent(g, now.wait) {
                     continue;
@@ -7154,6 +7233,9 @@ impl Core {
                 );
             }
         }
+        if gen != 0 {
+            self.lk.moved_started.insert(gen);
+        }
         if n > 0 {
             tracing::debug!(
                 node = self.cfg.node_id,
@@ -7165,6 +7247,67 @@ impl Core {
         self.lk.mirror_dirty = true;
     }
 
+    /// Delegate, plan 46 M1.2 step 10: the handoff grants of generation
+    /// `gen` that came before their subtree's row
+    /// ([`Core::lock_install_moved`]) and whose inode is the generation's
+    /// here now, installed as received (a record end on this node's clock,
+    /// from that receipt). Run when the delegation table changed, before a
+    /// subtree the stream grew by is honoured in the same step (a
+    /// non-stealable stream honours one at its commit, with no renewal
+    /// that would carry the grants again). Settled where the subtree is
+    /// not honoured yet, or was honoured in this very step.
+    pub(crate) fn lock_install_deferred(
+        &mut self,
+        now: Now,
+        gen: u64,
+        promoted: &[Ino],
+        replica: &dyn Replica,
+    ) {
+        let Some(waiting) = self.lk.deferred.get_mut(&gen) else {
+            return;
+        };
+        waiting.retain(|_, g| g.until > now.wait);
+        let empty = waiting.is_empty();
+        if empty || self.deleg_mine_until(gen).is_none() {
+            self.lk.deferred.remove(&gen);
+            return;
+        }
+        let mut ready = Vec::new();
+        for g in self.lk.deferred[&gen].values() {
+            let keys = Self::read_keys(g.ino, None);
+            if matches!(
+                replica.resolve_ownership(&keys),
+                constellation_meta::delegation::Ownership::Delegated(d) if d.gen == gen
+            ) {
+                ready.push((*g, keys));
+            }
+        }
+        let mut n = 0;
+        for (mut g, keys) in ready {
+            if let Some(w) = self.lk.deferred.get_mut(&gen) {
+                w.remove(&g.id);
+            }
+            if !self.lk.moved_seen.entry(gen).or_default().insert(g.id) {
+                continue;
+            }
+            g.settled &= self.deleg_parked_for(&keys, gen, replica)
+                || promoted.iter().any(|dir| replica.is_under(g.ino, *dir));
+            if replica.locks().install_if_consistent(g, now.wait) {
+                self.stats.lock_moved += 1;
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.lk.mirror_dirty = true;
+            tracing::debug!(
+                node = self.cfg.node_id,
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
+                n,
+                "installed moved lock grants that came before their subtree's row"
+            );
+        }
+    }
+
     /// Delegate: the generation is being recalled (or ended): its
     /// subtree's grants leave this table (handed back, or dropped).
     pub(crate) fn lock_take_generation(&mut self, gen: u64, replica: &dyn Replica) -> Vec<Grant> {
@@ -7172,6 +7315,9 @@ impl Core {
         // ended resolves to nobody (sim seed 96046 left its grants
         // behind).
         self.lk.moved_seen.remove(&gen);
+        self.lk.moved_started.remove(&gen);
+        self.lk.deferred.remove(&gen);
+        self.lk.handed_back_at.remove(&gen);
         let mut taken = replica.locks().take_by_gen(gen);
         let by_tag = taken.len();
         taken.extend(replica.locks().take_where_outside(|ino| {
