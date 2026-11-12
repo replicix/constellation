@@ -1769,8 +1769,8 @@ fn strand_local_tx(
         // The row was acknowledged to its requester by the delegate, and its
         // effect has just left the namespace while the log lacks it: reads of
         // its keys wait for the successor's re-ship, as for a member copy row
-        // (`Meta::member_copy_touches`), until the generation's copy is
-        // cleared or the hold's age cap lapses.
+        // (`Meta::member_copy_touches`), until the generation's log index
+        // reaches the row, the log carries its rid, or the generation ends.
         let hold = strand.hold.then(|| crate::KeySet::from_records(&records));
         super::backup::deleg_member_copy_put_tx(
             tx,
@@ -3186,7 +3186,7 @@ fn streamed_tip_tx(r: &impl Readable, meta: &Meta, epoch: u64) -> Result<Option<
 
 /// Whether the log carries `rid`'s outcome already: a row applied from a
 /// segment records position 0 in `completed`, a journaled one its journal seq.
-fn log_carries(r: &impl Readable, meta: &Meta, rid: &Rid) -> Result<bool, MetaError> {
+pub(crate) fn log_carries(r: &impl Readable, meta: &Meta, rid: &Rid) -> Result<bool, MetaError> {
     Ok(r.get(&meta.completed, rid.to_key())?
         .and_then(|v| {
             v.get(0..8)
@@ -3637,7 +3637,7 @@ pub(crate) fn retire_local_tx(
         // generation that names this one waits for it for good otherwise.
         // Only raised, so a row counted when it was appended stays so.
         if row.gen != 0 {
-            local::bump_log_idx_tx(tx, &meta.local, row.gen, row.idx)?;
+            local::bump_log_idx_tx(tx, meta, row.gen, row.idx)?;
         }
     }
     counter_add_tx(tx, &meta.local, KV_LOCAL_SPEC_COUNT, -(captured as i64))?;
@@ -5709,6 +5709,7 @@ impl Meta {
         // record of the segment: `records` here is what was not skipped.)
         for (gen, through) in &ends {
             local::bump_void_cut_tx(&mut tx, &self.local, *gen, *through)?;
+            self.release_ended_gen_tx(&mut tx, *gen)?;
         }
         // ADR-43: a generation whose grant the segment proves will never be
         // in the log (an abandon, or a takeover that carries no tail) is
@@ -5725,6 +5726,7 @@ impl Meta {
         let mut orphan_cuts: Vec<(u64, u64)> = Vec::new();
         for gen in &orphaned {
             let cut = local::bump_void_cut_at_log_idx_tx(&mut tx, &self.local, *gen)?;
+            self.release_ended_gen_tx(&mut tx, *gen)?;
             orphan_cuts.push((*gen, cut));
         }
         let recalled: HashSet<u64> = recalled.iter().chain(orphaned.iter()).copied().collect();
@@ -5806,6 +5808,9 @@ impl Meta {
                 own: false,
             },
         )?;
+        // ADR-57: the rows of delegate generations this node held reads of
+        // whose rid this segment (or an earlier one) carries are back.
+        self.release_carried_deleg_tx(&mut tx)?;
         let from = journal_from(&tx, self)?;
         compact_tx(&mut tx, self, from)?;
         kv_set_tx(&mut tx, &self.local, KV_APPLIED_SEQ, &seq.to_string());
@@ -6463,7 +6468,10 @@ impl Meta {
                 |entry| matches!(entry, LiveEntry::Local { gen, .. } if *gen != 0 && unlisted_own.contains(gen)),
                 true,
                 false,
-                true,
+                // No hold: these generations end below (the cut at what the
+                // log holds), their rows never come back under the grant
+                // that was never in the log, and nothing would release it.
+                false,
                 None,
                 |_| false,
             )?;
@@ -6487,11 +6495,13 @@ impl Meta {
                 continue;
             }
             let cut = local::bump_void_cut_at_log_idx_tx(tx, &self.local, *gen)?;
+            self.release_ended_gen_tx(tx, *gen)?;
             orphan_cuts.push((*gen, cut));
         }
         if !orphaned.is_empty() {
             for gen in &orphaned {
                 let cut = local::bump_void_cut_at_log_idx_tx(tx, &self.local, *gen)?;
+                self.release_ended_gen_tx(tx, *gen)?;
                 orphan_cuts.push((*gen, cut));
                 // Never executed in again (`Meta::begin_local`).
                 local::mark_deleg_ended_at_gate_tx(tx, &self.local, *gen);

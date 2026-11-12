@@ -1107,6 +1107,9 @@ fn apply_one(
                 meta.session().void_stream(*gen, *through);
                 meta.session().note_void_cut(*gen, *through);
                 crate::store::local::bump_void_cut_tx(tx, &meta.local, *gen, *through)?;
+                // The rows this node held reads of for the generation are
+                // final with its end (ADR-57), in the end's own transaction.
+                meta.release_ended_gen_tx(tx, *gen)?;
                 // L1: none of the generation's `Local` rows outlives this
                 // segment (appended ones retire with it, the rest strand).
                 // Not from the stream: its `DelegateNodeEnded` arrives between the

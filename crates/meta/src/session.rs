@@ -422,6 +422,27 @@ pub enum SessionWait {
     /// keys after [`crate::Meta::read_hold_span`]: not answered. The caller
     /// fails the read with `EIO`.
     Unserved(Duration),
+    /// The caller was interrupted (FUSE `INTERRUPT`, the process killed)
+    /// while the read waited for a held row: not answered, the caller fails
+    /// the read with `EINTR`.
+    Interrupted(Duration),
+}
+
+/// The hold phase of a wait (ADR-57): what [`SessionState::wait_with_holds`]
+/// needs of the store and of the caller. `None`: no hold phase (a lock
+/// grant's floor wait, whose reads check the holds themselves).
+pub(crate) struct HoldPhase<'a> {
+    /// A pending acknowledged row still touches the keys.
+    pub holds: &'a dyn Fn() -> bool,
+    /// How long the phase waits before the read is refused.
+    pub span: Duration,
+    /// A read was refused after waiting this long.
+    pub on_refused: &'a dyn Fn(Duration),
+    /// Drop the holds whose keys are not committed (a dropped transaction's);
+    /// whether any went. Run before a read is refused.
+    pub reconcile: &'a dyn Fn() -> bool,
+    /// The caller was interrupted.
+    pub cancelled: &'a dyn Fn() -> bool,
 }
 
 /// Log2 wait-time buckets: `[0]` < 1 ms, `[i]` < 2^i ms, the last one
@@ -445,6 +466,8 @@ pub struct SessionStats {
     /// refused (`EIO`) after the read hold span.
     pub hold_waited: u64,
     pub hold_refused: u64,
+    /// Reads whose wait for a held row ended with the caller's interrupt.
+    pub hold_interrupted: u64,
     /// The subset of `timeouts` while M4 held-back journal rows existed on
     /// the answering holder or here (the coordinator's decision 1: a held
     /// row stalls the shipped-through position).
@@ -1870,43 +1893,60 @@ impl SessionState {
         refresh: impl FnMut() -> (u64, bool, bool),
         held: impl Fn() -> bool,
     ) -> SessionWait {
-        self.wait_with_holds(keys, floor, refresh, held, || false, Duration::ZERO, |_| {})
+        self.wait_with_holds(keys, floor, refresh, held, None)
     }
 
-    /// [`Self::wait`] with the hold phase of ADR-57 in front: `holds` says a
-    /// pending acknowledged row still touches the keys.
-    #[allow(clippy::too_many_arguments)]
+    /// [`Self::wait`] with the hold phase of ADR-57 in front.
     pub(crate) fn wait_with_holds(
         &self,
         keys: &[ReadKey],
         floor: &Position,
         mut refresh: impl FnMut() -> (u64, bool, bool),
         held: impl Fn() -> bool,
-        holds: impl Fn() -> bool,
-        hold_span: Duration,
-        on_refused: impl Fn(Duration),
+        phase: Option<&HoldPhase<'_>>,
     ) -> SessionWait {
         // ADR-57 (R): a pending acknowledged row touching the keys holds the
         // read whatever the session budget, `Disabled` included: the state
         // the read would answer from lacks a row its client was told is
-        // committed. Bounded by the hold span, then refused.
-        if holds() {
+        // committed. Bounded by the hold span, then refused; ended by the
+        // caller's interrupt.
+        //
+        // (Lock order: `holds()` takes the store's `held_copies` while this
+        // holds `inner`; a release drops `held_copies` before it wakes this
+        // state, so the order `inner`, `held_copies` is the only one.)
+        if let Some(p) = phase.filter(|p| (p.holds)()) {
             let started = Instant::now();
+            let mut reconciled = false;
             loop {
                 let g = self.inner.lock().unwrap();
-                if !holds() {
+                if !(p.holds)() {
                     break;
                 }
                 let waited = started.elapsed();
-                if waited >= hold_span {
+                if (p.cancelled)() {
                     drop(g);
-                    on_refused(waited);
+                    let mut s = self.stats.lock().unwrap();
+                    s.reads += 1;
+                    s.hold_interrupted += 1;
+                    return SessionWait::Interrupted(waited);
+                }
+                if waited >= p.span {
+                    drop(g);
+                    // A hold a dropped transaction left in the index is not
+                    // a row anyone is waiting to re-ship: look once more.
+                    if !reconciled {
+                        reconciled = true;
+                        if (p.reconcile)() {
+                            continue;
+                        }
+                    }
+                    (p.on_refused)(waited);
                     let mut s = self.stats.lock().unwrap();
                     s.reads += 1;
                     s.hold_refused += 1;
                     return SessionWait::Unserved(waited);
                 }
-                let slice = (hold_span - waited).min(Duration::from_millis(20));
+                let slice = (p.span - waited).min(Duration::from_millis(20));
                 let _ = self.cv.wait_timeout(g, slice).unwrap();
             }
             let mut s = self.stats.lock().unwrap();
@@ -1989,7 +2029,7 @@ impl SessionState {
                     );
                 }
             }
-            SessionWait::Disabled | SessionWait::Unserved(_) => {}
+            SessionWait::Disabled | SessionWait::Unserved(_) | SessionWait::Interrupted(_) => {}
         }
         result
     }
@@ -2012,7 +2052,46 @@ impl crate::store::Meta {
     /// [`Self::session_wait`] with a per-read position `floor` on top of
     /// the watermark (plan 30 §M8's strict open).
     pub fn session_wait_at(&self, keys: &[ReadKey], floor: &Position) -> SessionWait {
+        self.session_wait_cancellable(keys, floor, &|| false)
+    }
+
+    /// [`Self::session_wait_at`] ended early by the caller's interrupt
+    /// (`cancelled`) while the read waits for a held row
+    /// ([`SessionWait::Interrupted`]).
+    pub fn session_wait_cancellable(
+        &self,
+        keys: &[ReadKey],
+        floor: &Position,
+        cancelled: &dyn Fn() -> bool,
+    ) -> SessionWait {
+        self.session_wait_inner(keys, floor, Some(cancelled))
+    }
+
+    /// The floor wait alone, without the hold phase: a lock grant's
+    /// (`View::granted`). Every read under the grant checks the holds of
+    /// the keys it reads; a grant that waited out a hold would starve the
+    /// other lockers of the cluster lock it holds for nothing.
+    pub fn session_wait_floor(&self, keys: &[ReadKey], floor: &Position) -> SessionWait {
+        self.session_wait_inner(keys, floor, None)
+    }
+
+    fn session_wait_inner(
+        &self,
+        keys: &[ReadKey],
+        floor: &Position,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> SessionWait {
         self.void_ended_generations();
+        let holds = || self.member_copy_touches(keys);
+        let refused = |waited| self.note_read_hold_refused(waited);
+        let reconcile = || self.reconcile_read_holds();
+        let phase = cancelled.map(|cancelled| crate::session::HoldPhase {
+            holds: &holds,
+            span: self.read_hold_span(),
+            on_refused: &refused,
+            reconcile: &reconcile,
+            cancelled,
+        });
         self.session.wait_with_holds(
             keys,
             floor,
@@ -2025,9 +2104,7 @@ impl crate::store::Meta {
                 )
             },
             || self.held_any.load(Ordering::Relaxed),
-            || self.member_copy_touches(keys),
-            self.read_hold_span(),
-            |waited| self.note_read_hold_refused(waited),
+            phase.as_ref(),
         )
     }
 

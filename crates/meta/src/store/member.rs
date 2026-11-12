@@ -111,6 +111,13 @@ pub(super) fn read_hold_key(slot: u64, first: u64) -> Vec<u8> {
     format!("read_hold:{slot:020}:{first:020}").into_bytes()
 }
 
+/// `(slot, first)` of a `read_hold:` key.
+fn parse_read_hold_key(k: &[u8]) -> Option<(u64, u64)> {
+    let k = std::str::from_utf8(k).ok()?;
+    let mut it = k.strip_prefix("read_hold:")?.split(':');
+    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+}
+
 pub(super) fn member_epoch(epoch: u64) -> u64 {
     MEMBER_COPY_BASE + epoch
 }
@@ -661,8 +668,15 @@ impl Meta {
     /// Hold the keys of the row `(slot, first)` the caller's transaction
     /// takes out of the served state: the hold is written in that
     /// transaction (atomic with the rollback) and indexed in memory. Indexed
-    /// before the commit: a hold a failed commit leaves in memory only
-    /// over-waits, until the next restart.
+    /// before the commit, so that no reader meets the rolled-back namespace
+    /// without it; a hold whose transaction is then dropped has no key behind
+    /// it, and [`Self::flush_held_releases`] (this thread's next flush) or
+    /// [`Self::reconcile_read_holds`] takes it out of the index again.
+    ///
+    /// A row of a generation that ended (`deleg_void_cut`, in the
+    /// transaction or before it) is not held: the log has the row, or it
+    /// never will, and nothing would release the hold (the generation's end
+    /// already ran).
     pub(crate) fn hold_row_tx(
         &self,
         tx: &mut SingleWriterWriteTx,
@@ -674,6 +688,22 @@ impl Meta {
         // nothing for a read to miss.
         if keys.dentries.is_empty() && keys.inos.is_empty() {
             return Ok(());
+        }
+        if let Some(gen) = super::backup::gen_of_deleg_slot(slot) {
+            if kv_get_tx(&*tx, &self.local, &super::local::deleg_void_cut_key(gen))?.is_some() {
+                return Ok(());
+            }
+            // The release by the generation's log index
+            // ([`super::local::bump_log_idx_tx`]) is exact only while the
+            // index is below every row held: the strand that holds `first`
+            // took the index back below it in this transaction.
+            debug_assert!(
+                kv_get_tx(&*tx, &self.local, &super::local::deleg_log_idx_key(gen))?
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    < first,
+                "a delegate row is held while the generation's log index reaches it"
+            );
         }
         tx.insert(&self.local, read_hold_key(slot, first), keys.encode()?);
         let mut held = self.held_copies.lock().unwrap();
@@ -687,7 +717,117 @@ impl Meta {
         });
         self.any_held_copy
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.hold_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(held);
+        self.staged_holds
+            .lock()
+            .unwrap()
+            .push((std::thread::current().id(), slot, first));
         Ok(())
+    }
+
+    /// The hold epoch: a counter bumped whenever a hold is indexed. A read
+    /// takes it before its session wait and asks [`Self::hold_raced`] after
+    /// it read.
+    pub fn hold_epoch(&self) -> u64 {
+        self.hold_epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether a hold touching `keys` was indexed since `epoch` (taken with
+    /// [`Self::hold_epoch`] before the read's session wait): the read passed
+    /// the wait before the hold and may have read the rolled-back namespace.
+    /// It waits again and reads again (ADR-57, R is absolute).
+    pub fn hold_raced(&self, epoch: u64, keys: &[crate::ReadKey]) -> bool {
+        self.hold_epoch() != epoch && self.member_copy_touches(keys)
+    }
+
+    /// Take every in-memory hold whose key is not in the committed set out of
+    /// the index (a transaction that indexed its hold was dropped and no
+    /// flush followed). Under the writer lock, so that no transaction is in
+    /// flight whose holds are not committed yet. Returns whether any went.
+    pub fn reconcile_read_holds(&self) -> bool {
+        if !self.any_held() {
+            return false;
+        }
+        let tx = self.db.write_tx();
+        self.staged_holds.lock().unwrap().clear();
+        let present: std::collections::HashSet<(u64, u64)> = tx
+            .prefix(&self.local, b"read_hold:")
+            .filter_map(|g| g.into_inner().ok())
+            .filter_map(|(k, _)| parse_read_hold_key(&k))
+            .collect();
+        drop(tx);
+        let mut held = self.held_copies.lock().unwrap();
+        let before = held.len();
+        held.retain(|h| present.contains(&(h.slot, h.first)));
+        let gone = held.len() != before;
+        self.any_held_copy
+            .store(!held.is_empty(), std::sync::atomic::Ordering::Relaxed);
+        drop(held);
+        if gone {
+            self.session.wake();
+        }
+        gone
+    }
+
+    /// Tests only: index a hold of `(slot, first)` on the dentry `name` of the
+    /// root in a transaction that is then dropped (a pass that failed after
+    /// its strand).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn test_index_hold_in_dropped_tx(
+        &self,
+        slot: u64,
+        first: u64,
+        name: &str,
+    ) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        self.hold_row_tx(
+            &mut tx,
+            slot,
+            first,
+            crate::KeySet {
+                dentries: vec![(constellation_fs_core::types::ROOT_INO, name.into())],
+                inos: Vec::new(),
+            },
+        )?;
+        drop(tx);
+        Ok(())
+    }
+
+    /// [`Self::test_index_hold_in_dropped_tx`] on the inode `ino`.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn test_index_ino_hold_in_dropped_tx(
+        &self,
+        slot: u64,
+        first: u64,
+        ino: u64,
+    ) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        self.hold_row_tx(
+            &mut tx,
+            slot,
+            first,
+            crate::KeySet {
+                dentries: Vec::new(),
+                inos: vec![ino],
+            },
+        )?;
+        drop(tx);
+        Ok(())
+    }
+
+    /// Tests only: note the age of every hold at its release in `sink`
+    /// (strand to release, ms on the node's wait clock).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_hold_lifetime_sink(&self, sink: std::sync::Arc<std::sync::Mutex<Vec<u64>>>) {
+        *self.hold_lifetime_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// Tests only: this thread's flush after a commit.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn flush_held_releases_for_tests(&self) {
+        self.flush_held_releases();
     }
 
     /// Load the persisted holds into the in-memory index: the open does, and
@@ -701,22 +841,38 @@ impl Meta {
         let r = self.db.read_tx();
         let since_ms = self.held_copy_now_ms();
         let mut held = Vec::new();
+        let mut ended: Vec<Vec<u8>> = Vec::new();
         for guard in r.prefix(&self.local, b"read_hold:") {
             let (k, v) = guard.into_inner()?;
-            let k = String::from_utf8_lossy(&k).into_owned();
-            let mut it = k["read_hold:".len()..].split(':');
-            let (Some(slot), Some(first)) = (
-                it.next().and_then(|x| x.parse::<u64>().ok()),
-                it.next().and_then(|x| x.parse::<u64>().ok()),
-            ) else {
+            let Some((slot, first)) = parse_read_hold_key(&k) else {
                 return Err(MetaError::Invalid("read_hold key".into()));
             };
+            // A generation that ended while the hold stayed (a crash between
+            // the end and the release, before they shared a transaction)
+            // has nothing to release it: the hold goes (and its key, below).
+            if super::backup::gen_of_deleg_slot(slot).is_some_and(|gen| {
+                matches!(
+                    kv_get_tx(&r, &self.local, &super::local::deleg_void_cut_key(gen)),
+                    Ok(Some(_))
+                )
+            }) {
+                ended.push(k.to_vec());
+                continue;
+            }
             held.push(HeldCopy {
                 slot,
                 first,
                 keys: crate::KeySet::decode(&v)?,
                 since_ms,
             });
+        }
+        drop(r);
+        if !ended.is_empty() {
+            let mut tx = self.db.write_tx();
+            for k in ended {
+                tx.remove(&self.local, k);
+            }
+            tx.commit()?;
         }
         self.any_held_copy
             .store(!held.is_empty(), std::sync::atomic::Ordering::Relaxed);
@@ -805,6 +961,54 @@ impl Meta {
         Ok(())
     }
 
+    /// The rows of delegate generations whose rid the log carries leave the
+    /// holds, in the caller's transaction (a segment's apply): the
+    /// successor landed the row, under its own origin or another one
+    /// (`(gen, idx)` reaching the generation's log index releases the
+    /// re-ship under the same origin, [`super::local::bump_log_idx_tx`]). A
+    /// row this root appended whose group never committed was never
+    /// acknowledged and may never come back under its `(gen, idx)`: its
+    /// rid's outcome in the log is what ends the wait for it.
+    pub(crate) fn release_carried_deleg_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+    ) -> Result<(), MetaError> {
+        if !self.any_held() {
+            return Ok(());
+        }
+        let rows: Vec<(u64, u64)> = self
+            .held_copies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|h| super::backup::gen_of_deleg_slot(h.slot).is_some())
+            .map(|h| (h.slot, h.first))
+            .collect();
+        for (slot, first) in rows {
+            let Some(v) = tx.get(&self.backup_tail, tail_key(slot, first))? else {
+                continue;
+            };
+            let row: super::DelegateTx = postcard::from_bytes(&v)?;
+            if let Some(rid) = row.rid {
+                if super::spec::log_carries(&*tx, self, &rid)? {
+                    self.release_row_tx(tx, slot, first);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The generation `gen` ended in the caller's transaction (its
+    /// `DelegateNodeEnded` applied, or an orphan end at a gate or a marker):
+    /// the rows of it this node held are final, whatever the log carries.
+    pub(crate) fn release_ended_gen_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        gen: u64,
+    ) -> Result<(), MetaError> {
+        self.release_slot_tx(tx, super::backup::deleg_epoch(gen))
+    }
+
     /// [`Self::release_row_tx`] for a row an operator's abandon gave up: the
     /// row is lost by decision, counted (`status.ack.read_holds_abandoned`).
     pub(crate) fn release_abandoned_row_tx(
@@ -873,20 +1077,41 @@ impl Meta {
         let me = std::thread::current().id();
         let mine: Vec<StagedRelease> = {
             let mut all = self.staged_releases.lock().unwrap();
-            if all.is_empty() {
-                return;
-            }
             let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *all)
                 .into_iter()
                 .partition(|(t, _)| *t == me);
             *all = others;
             mine.into_iter().map(|(_, r)| r).collect()
         };
-        if mine.is_empty() {
+        let holds: Vec<(u64, u64)> = {
+            let mut all = self.staged_holds.lock().unwrap();
+            let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *all)
+                .into_iter()
+                .partition(|(t, _, _)| *t == me);
+            *all = others;
+            mine.into_iter().map(|(_, s, f)| (s, f)).collect()
+        };
+        if mine.is_empty() && holds.is_empty() {
             return;
         }
         let snap = self.db.read_tx();
         let mut held = self.held_copies.lock().unwrap();
+        #[cfg(any(test, feature = "test-util"))]
+        let now_ms = self.held_copy_now_ms();
+        #[cfg(any(test, feature = "test-util"))]
+        let mut ended_ms: Vec<u64> = Vec::new();
+        // A hold this thread's transaction indexed before its commit whose
+        // key is not in the committed set was dropped with the transaction
+        // (a read error keeps it).
+        if !holds.is_empty() {
+            held.retain(|h| {
+                !holds.contains(&(h.slot, h.first))
+                    || !matches!(
+                        snap.get(&self.local, read_hold_key(h.slot, h.first)),
+                        Ok(None)
+                    )
+            });
+        }
         held.retain(|h| {
             let named = mine.iter().any(|r| match r {
                 StagedRelease::Row(s, f) => (h.slot, h.first) == (*s, *f),
@@ -897,11 +1122,20 @@ impl Meta {
                 return true;
             }
             // Gone from the committed set? (A read error keeps the hold.)
-            !matches!(
+            let kept = !matches!(
                 snap.get(&self.local, read_hold_key(h.slot, h.first)),
                 Ok(None)
-            )
+            );
+            #[cfg(any(test, feature = "test-util"))]
+            if !kept {
+                ended_ms.push(u64::try_from(now_ms.saturating_sub(h.since_ms)).unwrap_or(0));
+            }
+            kept
         });
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(sink) = self.hold_lifetime_sink.lock().unwrap().as_ref() {
+            sink.lock().unwrap().extend(ended_ms);
+        }
         self.any_held_copy
             .store(!held.is_empty(), std::sync::atomic::Ordering::Relaxed);
         drop(held);

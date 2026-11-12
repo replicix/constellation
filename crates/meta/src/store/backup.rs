@@ -553,6 +553,12 @@ pub(crate) fn deleg_epoch(gen: u64) -> u64 {
     DELEG_BACKUP_BASE + gen
 }
 
+/// The generation a [`deleg_epoch`] slot is the copy of (`None`: a member
+/// copy slot).
+pub(crate) fn gen_of_deleg_slot(slot: u64) -> Option<u64> {
+    slot.checked_sub(DELEG_BACKUP_BASE)
+}
+
 fn deleg_prev_roots_key(gen: u64) -> String {
     format!("deleg_prev_roots:{gen}")
 }
