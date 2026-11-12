@@ -79553,6 +79553,25 @@ mod root_own_sticky {
         routed_gen: u64,
         settle: bool,
     ) -> Vec<Action> {
+        forward_into_after(
+            h,
+            dir,
+            seq,
+            routed_gen,
+            settle,
+            constellation_meta::Position::ZERO,
+        )
+    }
+
+    /// [`forward_into`] with the dependencies `deps` the requester observed.
+    fn forward_into_after(
+        h: &mut Harness,
+        dir: Ino,
+        seq: u64,
+        routed_gen: u64,
+        settle: bool,
+        deps: constellation_meta::Position,
+    ) -> Vec<Action> {
         let op = create_in(h, dir, &format!("fw{seq}"));
         h.step(Event::Peer {
             from: 2,
@@ -79565,7 +79584,7 @@ mod root_own_sticky {
                 },
                 op,
                 acked_through: 0,
-                deps: constellation_meta::Position::ZERO,
+                deps,
                 applied: 0,
                 tag: Default::default(),
                 settle,
@@ -79928,5 +79947,256 @@ mod root_own_sticky {
             "the release did not complete before its row shipped: {done:?}"
         );
         assert!(h.meta.delegation_table().get(dirs[0]).is_none());
+    }
+
+    // ---- ADR-55 step 9, the own stream across a deposition (R-H, R-X, R-D, R-J) ----
+
+    /// A step with nothing new: the core looks at its parked work again.
+    fn activity(h: &mut Harness) -> Vec<Action> {
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        })
+    }
+
+    /// `rows` of the journal are in the log (by hand: the harness's archive
+    /// carries the whole journal, these tests ship parts of it).
+    fn ship_rows(h: &mut Harness, rows: std::ops::RangeInclusive<u64>) {
+        let rows: Vec<u64> = rows.collect();
+        h.core.note_shipped(&rows, 0);
+    }
+
+    /// The root has an unshipped row `r` of the subtree `dirs[0]`, journaled
+    /// before it granted that subtree to itself (`far`: node 2's forward
+    /// routed 0, else its own client's op), and then the grant, whose record
+    /// alone is in the log. Returns the harness, the dirs, the grant, `r`'s
+    /// rid and `r`'s journal rows.
+    #[allow(clippy::type_complexity)]
+    fn grant_over_an_unshipped_row(
+        far: bool,
+    ) -> (
+        Harness,
+        Vec<Ino>,
+        constellation_meta::delegation::Delegation,
+        Rid,
+        std::ops::RangeInclusive<u64>,
+    ) {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        let first = h.meta.journal_next_seq().unwrap();
+        let r_rid = if far {
+            forward_into(&mut h, dirs[0], 1, 0, false);
+            Rid {
+                node: 2,
+                incarnation: 1,
+                seq: 1,
+            }
+        } else {
+            let (rid, out) = submit_in(&mut h, 1, dirs[0], "r");
+            assert!(!accepted(&out, rid), "{out:?}");
+            rid
+        };
+        let r_rows = first..=h.meta.journal_tip().unwrap();
+        assert!(*r_rows.end() >= first, "the root row was not journaled");
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        let record = h.meta.journal_tip().unwrap();
+        assert!(record > *r_rows.end());
+        // Only the record is in the log (its rows are acknowledged out of
+        // order, as the ship plan does past a held transaction).
+        let record_rows: Vec<u64> = (*r_rows.end() + 1..=record).collect();
+        h.meta.ack_journal_rows_at(&record_rows, 3).unwrap();
+        h.core.note_shipped(&record_rows, 0);
+        activity(&mut h);
+        (h, dirs, d, r_rid, r_rows)
+    }
+
+    /// The replay drain runs until `rid` has an outcome row in `gen`.
+    fn drain_until_replayed(h: &mut Harness, rid: Rid) {
+        for _ in 0..40 {
+            if Replica::outcome_row(&h.meta, rid).is_some() {
+                return;
+            }
+            h.advance(
+                h.core
+                    .cfg
+                    .replay_drain_ms
+                    .max(h.core.cfg.delegation_stream_tick_ms)
+                    + 1,
+            );
+            h.hold(1, None);
+            let mut out = Vec::new();
+            let now = h.now;
+            h.core.on_drain_tick(Now::same(now.0), &h.meta, &mut out);
+            if let Some(id) = h.core.dl.stream_timer {
+                h.step(Event::Timer { id });
+            }
+            activity(h);
+        }
+    }
+
+    /// T1 and T1b (M1', R-H, R-X): a stream op on the keys of a root row
+    /// that is not in the log waits for it, and a deposition does not let it
+    /// go: the row is rolled back and replayed by rid, as a row of the
+    /// stream, and the op lands after it. Fails on the parent: the op ran at
+    /// the first step after the deposition (the lease epoch it waited under
+    /// was gone), a stream row ahead of the replay of the root row.
+    #[test]
+    fn a_deposition_does_not_release_an_own_stream_op_waiting_for_a_root_row() {
+        for far in [false, true] {
+            let (mut h, dirs, d, r_rid, _rows) = grant_over_an_unshipped_row(far);
+            let tip = h.meta.journal_tip().unwrap();
+            let (a_rid, out) = if far {
+                // (The requester observed the root row: its deps name the
+                // root's journal up to it.)
+                let mut deps = constellation_meta::Position::ZERO;
+                deps.pending = Some(constellation_meta::JournalPos {
+                    epoch: 1,
+                    jseq: tip,
+                });
+                let out = forward_into_after(&mut h, dirs[0], 2, d.gen, false, deps);
+                (
+                    Rid {
+                        node: 2,
+                        incarnation: 1,
+                        seq: 2,
+                    },
+                    out,
+                )
+            } else {
+                submit_in(&mut h, 2, dirs[0], "a")
+            };
+            assert_eq!(h.meta.delegate_idx(d.gen).unwrap(), 0, "far {far}: {out:?}");
+            assert_eq!(h.meta.journal_tip().unwrap(), tip, "far {far}");
+            depose_to_node_2(&mut h);
+            for _ in 0..2 {
+                h.advance(h.core.cfg.delegation_stream_tick_ms + 1);
+                if let Some(id) = h.core.dl.stream_timer {
+                    h.step(Event::Timer { id });
+                }
+                activity(&mut h);
+                assert_eq!(
+                    h.meta.delegate_idx(d.gen).unwrap(),
+                    0,
+                    "far {far}: a stream op ran right after the deposition, ahead of the replay of the root row it waited for"
+                );
+            }
+            // The stranded root row is re-sent by its requester (it was never
+            // answered); `a` is not a row of the stream before it.
+            let queued: Vec<Rid> = h
+                .meta
+                .pending_replays()
+                .unwrap()
+                .into_iter()
+                .map(|q| q.rid)
+                .collect();
+            assert!(!queued.contains(&a_rid), "far {far}: {queued:?}");
+            assert!(
+                Replica::outcome_row(&h.meta, a_rid).is_none(),
+                "far {far}: a has a row before the replay of r"
+            );
+            let _ = r_rid;
+        }
+    }
+
+    /// T2 (M1', continuation epoch): the continuation epoch the node enters
+    /// changes the lease epoch, not whether the root row the op waits for is
+    /// in the log. Fails on the parent: the op ran at once.
+    #[test]
+    fn a_continuation_epoch_does_not_release_an_own_stream_op_waiting_for_a_root_row() {
+        let (mut h, dirs, d, _r_rid, r_rows) = grant_over_an_unshipped_row(false);
+        let (a_rid, out) = submit_in(&mut h, 2, dirs[0], "a");
+        assert!(!accepted(&out, a_rid), "{out:?}");
+        let now = h.clk();
+        h.core.lease.adopt_epoch_hold(now, 2);
+        let out = activity(&mut h);
+        assert!(
+            !accepted(&out, a_rid),
+            "ran in the continuation epoch: {out:?}"
+        );
+        assert_eq!(h.meta.delegate_idx(d.gen).unwrap(), 0);
+        // The root row ships: the op runs.
+        ship_rows(&mut h, r_rows);
+        let out = activity(&mut h);
+        assert!(accepted(&out, a_rid), "the parked op did not run: {out:?}");
+        assert_eq!(h.meta.delegate_idx(d.gen).unwrap(), 1);
+    }
+
+    /// T3 (M5, R-J): the drain refuses an inbox op under the root's own
+    /// stream only in a stream that is honoured: while the archive lacks the
+    /// grant's record nothing is journaled in it and the batch halts; once
+    /// the record is archived the op is refused in the stream.
+    #[test]
+    fn the_drain_refuses_in_the_own_stream_only_once_it_is_honoured() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        h.core.cfg.inbox = true;
+        h.core.note_demand(h.clk(), 2, true);
+        h.step(Event::Peers {
+            registry_complete: true,
+            links: vec![crate::event::PeerLink {
+                node: 2,
+                connected: false,
+                last_seen: None,
+                rtt_ms: None,
+                since: None,
+            }],
+            lapses: 0,
+        });
+        let op = create_in(&h, dirs[0], "ie");
+        let rid = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 1,
+        };
+        let tip = h.meta.journal_tip().unwrap();
+        let halted = h.core.stats.inbox_halted;
+        let refused = h.core.stats.refusals_journaled;
+        let out = drain_inbox_of_2(&mut h, &op, 1, false);
+        assert_eq!(h.meta.journal_tip().unwrap(), tip, "journaled: {out:?}");
+        assert_eq!(h.core.stats.refusals_journaled, refused, "{out:?}");
+        assert_eq!(h.core.stats.inbox_halted, halted + 1, "{out:?}");
+        assert!(Replica::outcome_row(&h.meta, rid).is_none());
+        // The record is archived.
+        archive_and_step(&mut h);
+        let out = drain_inbox_of_2(&mut h, &op, 1, false);
+        assert!(
+            Replica::outcome_row(&h.meta, rid).is_some_and(|r| r.gen == d.gen),
+            "no refusal row in the stream: {out:?}"
+        );
+        assert_eq!(h.core.stats.refusals_journaled, refused + 1);
+        assert_eq!(h.core.stats.holder_inbox_refusals_own_root, 1);
+    }
+
+    /// T4 (R-H, scope): an unshipped root row delays the honour of the own
+    /// stream only if its keys resolve to the stream: a row of `/` does not
+    /// (a poisoned `/` row must not park the subtree), a row under the
+    /// granted directory does. Fails on the parent for the row of `/`.
+    #[test]
+    fn an_unshipped_root_row_delays_the_own_stream_only_on_its_keys() {
+        for under_dir in [false, true] {
+            let (mut h, dirs) = root_with_peer(Some(500));
+            let parent = if under_dir { dirs[0] } else { ROOT_INO };
+            let first = h.meta.journal_next_seq().unwrap();
+            let (r, out) = submit_in(&mut h, 1, parent, "r");
+            assert!(!accepted(&out, r), "{out:?}");
+            let _ = first;
+            root_dominates(&mut h, dirs[0]);
+            let d = own_grant_of(&h, dirs[0]).expect("granted");
+            let record = h.meta.journal_tip().unwrap();
+            h.core.note_shipped(&[record], 0);
+            activity(&mut h);
+            let (a, out) = submit_in(&mut h, 2, dirs[0], "a");
+            assert_eq!(
+                accepted(&out, a),
+                !under_dir,
+                "under_dir {under_dir}: {out:?}"
+            );
+            assert_eq!(
+                h.meta.delegate_idx(d.gen).unwrap(),
+                u64::from(!under_dir),
+                "under_dir {under_dir}"
+            );
+        }
     }
 }
