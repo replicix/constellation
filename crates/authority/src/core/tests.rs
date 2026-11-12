@@ -68414,6 +68414,57 @@ mod step9_one_stream_per_node {
         assert_eq!(h.core.dl.gens.len(), 1);
     }
 
+    /// A sync that ends a generation a predecessor delegated to this very
+    /// root wakes the waiters of the ended generation, among them the held
+    /// back re-delegation of an earlier one (`deleg_wait_done`): the new
+    /// generation is in the replica's table but not in the snapshot the
+    /// sync took, and the sync ended it as one a record had ended. The
+    /// replica kept delegating the subtree to the node, whose first renewal
+    /// was refused, and the root's own lock requests went to it for good
+    /// (sim `locks-unlinked-delegated-dbackup-random` seed 558: `NotOwner
+    /// { 0 }` a thousand times, a lock waiter starved for 60 s). Fails on
+    /// the parent.
+    #[test]
+    fn a_generation_granted_during_a_sync_is_not_ended_by_it() {
+        let (mut h, d1, _d2) = root_with_two_grants_and_a_file();
+        let gen = h.meta.delegation_table().get(d1).unwrap().gen;
+        let (d3, rec) = mkdir(&h, "d3");
+        let (d4, rec4) = mkdir(&h, "d4");
+        crate::replica::Replica::apply_segment(&h.meta, 3, 1, 0, &[], &[], &[rec, rec4]).unwrap();
+        // The stream was ended and its re-delegation of `d3` held back.
+        {
+            let g = h.core.dl.gens.get_mut(&gen).unwrap();
+            g.ended = true;
+            g.redelegate_dirs
+                .insert(d3, crate::core::delegate::DelegKind::Manual);
+        }
+        // A predecessor's generation names this root as its delegate.
+        crate::replica::Replica::apply_records_journaled(
+            &h.meta,
+            &[LogRecord::delegate_one(
+                1,
+                99,
+                d4,
+                constellation_meta::SubtreeKind::Placed,
+            )],
+            None,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let granted = h
+            .meta
+            .delegation_table()
+            .get(d3)
+            .unwrap_or_else(|| panic!("d3 was not re-delegated: {:?}", h.core.dl.gens.keys()))
+            .gen;
+        assert_ne!(granted, gen);
+        assert!(
+            !h.core.dl.gens[&granted].ended,
+            "the sync ended a generation the table still delegates"
+        );
+    }
+
     /// The root sequences a released subtree only after it has appended the
     /// stream through the release row (`at` and every row before it): the
     /// row alone, past a gap, appends nothing and the op keeps waiting.
