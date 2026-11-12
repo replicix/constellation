@@ -452,6 +452,26 @@ pub(crate) fn get_journal_tx_head(
     }
 }
 
+/// Add the `ns` keys a transaction observed without writing them
+/// ([`JournalTx::observed`]) to `keys`: a dentry as a dentry, an inode as an
+/// exclusive inode (a refusal's op read it; what it would have written is
+/// not known).
+fn add_observed_keys(keys: &mut TouchSet, observed: &[Vec<u8>]) {
+    use constellation_mtree::keys::Key;
+    for key in observed {
+        match Key::parse(key) {
+            Ok(Key::Inode { ino }) => {
+                keys.inos.insert(ino);
+            }
+            Ok(Key::Dentry { parent_ino, name }) => {
+                keys.dentries
+                    .insert((parent_ino, String::from_utf8_lossy(name).into_owned()));
+            }
+            _ => {}
+        }
+    }
+}
+
 pub(crate) fn put_journal_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
@@ -1727,9 +1747,13 @@ impl Meta {
 
     /// ADR-55 (R-H): the transactions that are not delegate-stream rows,
     /// still in the journal and starting at or below `upto`, each as its
-    /// first journal seq and the keys its records touch. Such a row is the
-    /// root's own: a deposition rolls it back, so a stream row on one of
-    /// its keys must not be journaled before it is in the log.
+    /// first journal seq and the keys its records touch, plus those it
+    /// observed without writing ([`JournalTx::observed`]: a refusal's
+    /// `Refused` row names no key, its op's keys are these). Such a row is
+    /// the root's own: a deposition rolls it back, so a stream row on one
+    /// of its keys must not be journaled before it is in the log, and a
+    /// settle of its rid routed to another node's stream of those keys
+    /// finds no outcome there.
     pub fn journal_root_rows_through(
         &self,
         upto: u64,
@@ -1756,7 +1780,10 @@ impl Meta {
                 let (rk, rv) = row.into_inner()?;
                 records.push(journal::decode_row(&rk, &rv)?.1);
             }
-            out.push((first, crate::replay::TouchSet::from_records(records.iter())));
+            let mut keys = TouchSet::from_records(records.iter());
+            let row: JournalTx = crate::record::from_bytes_exact(&v)?;
+            add_observed_keys(&mut keys, &row.observed);
+            out.push((first, keys));
         }
         Ok(out)
     }
