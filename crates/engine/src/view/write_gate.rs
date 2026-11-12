@@ -136,7 +136,7 @@ impl View {
             return Ok(());
         }
         constellation_vfs::watch::stage("session wait");
-        let waited = self.meta.session_wait(keys);
+        let waited = self.wait_for_op(keys);
         constellation_vfs::watch::stage("running");
         served(waited)
     }
@@ -187,7 +187,7 @@ impl View {
         };
         constellation_vfs::watch::stage("session wait");
         if !h.cto_strict {
-            let waited = self.meta.session_wait(keys);
+            let waited = self.wait_for_op(keys);
             constellation_vfs::watch::stage("running");
             served(waited)?;
             return Ok(true);
@@ -201,7 +201,7 @@ impl View {
         // `Core::deleg_read_owner`).
         if h.lease.reads_locally() && !self.meta.read_delegated(ino, name) {
             deleg.count(|s| s.holder_local += 1);
-            served(self.meta.session_wait(keys))?;
+            served(self.wait_for_op(keys))?;
             return Ok(true);
         }
         // On the honour clock, the delegation's (plan 43 C7-H1).
@@ -221,7 +221,7 @@ impl View {
                     reply,
                 });
             }
-            let waited = self.meta.session_wait_at(keys, &held.position);
+            let waited = self.wait_for_op_at(keys, &held.position);
             tracing::debug!(
                 target: "constellation::cto",
                 ino,
@@ -305,13 +305,13 @@ impl View {
         let waited = match answer {
             Some(constellation_authority::ReadAnswer::Holder) => {
                 deleg.count(|s| s.holder_local += 1);
-                self.meta.session_wait(keys)
+                self.wait_for_op(keys)
             }
             Some(constellation_authority::ReadAnswer::Position {
                 position,
                 delegated,
             }) => {
-                let waited = self.meta.session_wait_at(keys, &position);
+                let waited = self.wait_for_op_at(keys, &position);
                 tracing::debug!(
                     target: "constellation::cto",
                     ino,
@@ -329,11 +329,11 @@ impl View {
             Some(constellation_authority::ReadAnswer::Tailed) => {
                 tracing::debug!(target: "constellation::cto", ino, dir, name, "strict read: tailed S3");
                 deleg.count(|s| s.s3_tail += 1);
-                self.meta.session_wait(keys)
+                self.wait_for_op(keys)
             }
             Some(constellation_authority::ReadAnswer::Degraded) | None => {
                 deleg.count(|s| s.degraded += 1);
-                self.meta.session_wait(keys)
+                self.wait_for_op(keys)
             }
         };
         served(waited)
@@ -1049,12 +1049,64 @@ impl View {
 }
 
 /// ADR-57: a read the session wait refused (a pending acknowledged row still
-/// touched its keys after the read hold span) fails with `EIO`; every other
-/// ending answers.
+/// touched its keys after the read hold span) fails with `EIO`, one its caller
+/// interrupted while it waited for the row with `EINTR`; every other ending
+/// answers.
 pub(crate) fn served(waited: constellation_meta::SessionWait) -> Result<(), Code> {
     match waited {
         constellation_meta::SessionWait::Unserved(_) => Err(Code::Io),
+        constellation_meta::SessionWait::Interrupted(_) => Err(Code::Intr),
         _ => Ok(()),
+    }
+}
+
+thread_local! {
+    /// The cancellation of the op this thread is running (set by `admit!`):
+    /// a read that waits for a held row (ADR-57) ends with `EINTR` when its
+    /// caller is interrupted, instead of holding the dispatch thread and
+    /// the admission slot for the whole read hold span.
+    static OP_CANCEL: std::cell::RefCell<Option<constellation_vfs::CancelToken>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous op cancellation when dropped.
+pub(crate) struct OpCancelScope(Option<constellation_vfs::CancelToken>);
+
+impl Drop for OpCancelScope {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        OP_CANCEL.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// Whether the op this thread runs was cancelled (interrupted).
+pub(crate) fn op_cancelled() -> bool {
+    OP_CANCEL.with(|c| c.borrow().as_ref().is_some_and(|t| t.is_cancelled()))
+}
+
+impl View {
+    /// This thread runs the op of `cx`: [`op_cancelled`] answers for it
+    /// until the scope is dropped.
+    pub(crate) fn read_cancel_scope(&self, cx: &constellation_vfs::OpCtx<'_>) -> OpCancelScope {
+        let prev = OP_CANCEL.with(|c| c.replace(cx.cancel.cloned()));
+        OpCancelScope(prev)
+    }
+
+    /// [`Meta::session_wait`] for the op this thread runs: a held read
+    /// ends with the op's interrupt.
+    fn wait_for_op(&self, keys: &[ReadKey]) -> constellation_meta::SessionWait {
+        self.meta
+            .session_wait_cancellable(keys, &constellation_meta::Position::ZERO, &op_cancelled)
+    }
+
+    /// [`Meta::session_wait_at`] for the op this thread runs.
+    fn wait_for_op_at(
+        &self,
+        keys: &[ReadKey],
+        position: &constellation_meta::Position,
+    ) -> constellation_meta::SessionWait {
+        self.meta
+            .session_wait_cancellable(keys, position, &op_cancelled)
     }
 }
 

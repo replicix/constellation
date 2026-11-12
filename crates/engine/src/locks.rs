@@ -1895,7 +1895,10 @@ impl ClusterLocks {
     fn granted(&self, ino: Ino, position: &Position) {
         self.meta.session().raise_observed(*position);
         constellation_vfs::watch::stage("session wait after a lock grant");
-        let waited = self.meta.session_wait_at(&[ReadKey::Ino(ino)], position);
+        // The floor alone: a hold (ADR-57) is waited for by every read under
+        // the grant, not here, where it would keep the cluster lock from
+        // the other lockers for up to the read hold span.
+        let waited = self.meta.session_wait_floor(&[ReadKey::Ino(ino)], position);
         tracing::debug!(target: "constellation::locks", ino, ?position, ?waited, "lock granted");
         match waited {
             constellation_meta::SessionWait::Waited(d) => {
@@ -1925,11 +1928,6 @@ impl ClusterLocks {
                      under this grant are degraded (they may not see what the previous holder wrote)"
                 );
             }
-            // A held row (ADR-57) still touches the file: the grant is
-            // delivered, and every read under it waits for the row itself
-            // (and fails with `EIO` after the read hold span); nothing here
-            // answers from the replica.
-            constellation_meta::SessionWait::Unserved(_) => {}
             _ => {}
         }
         if let Some(inval) = &self.inval {

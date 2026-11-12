@@ -138,6 +138,10 @@ pub(super) struct PlusPage<'a> {
     delay: Option<Duration>,
     /// The ids of the snapshots that exist, read once for the page.
     snapshots: Option<HashSet<String>>,
+    /// The hold epoch before the page's wait (ADR-57): an entry read after a
+    /// hold on its keys was indexed is name-only, and the kernel's lookup
+    /// waits for it.
+    hold_epoch: std::cell::Cell<u64>,
 }
 
 impl View {
@@ -150,6 +154,7 @@ impl View {
             name_only: self.ttl().is_zero() && !naive(Naive::KeepZeroTtl),
             delay: None,
             snapshots: None,
+            hold_epoch: std::cell::Cell::new(self.meta.hold_epoch()),
         }
     }
 }
@@ -179,6 +184,7 @@ impl PlusPage<'_> {
             keys.push(ReadKey::Ino(child));
         }
         if !keys.is_empty() {
+            self.hold_epoch.set(self.view.meta.hold_epoch());
             self.view.session_wait(&keys)?;
         }
         Ok(())
@@ -228,6 +234,14 @@ impl PlusPage<'_> {
             }
         }
         drop(shard);
+        // ADR-57: a hold on this entry's keys indexed after the page's wait
+        // passed: the entry may lack a row; the kernel's lookup waits.
+        if view.meta.hold_raced(
+            self.hold_epoch.get(),
+            &[ReadKey::Dentry(dir, name.to_string()), ReadKey::Ino(child)],
+        ) {
+            return None;
+        }
         if let Some(delay) = crate::fault::getattr_delay(
             attr.ino,
             attr.kind == constellation_fs_core::InodeKind::Dir,

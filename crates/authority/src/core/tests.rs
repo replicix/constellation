@@ -9167,6 +9167,26 @@ mod cto {
         );
     }
 
+    /// ADR-57: the read-ahead grants nothing over an inode a pending
+    /// acknowledged row touches (as the single grant), and the others stay.
+    #[test]
+    fn a_read_ahead_skips_an_inode_a_read_hold_touches() {
+        let (mut h, files) = holder_with_files();
+        let ino_of = |n: &str| files.iter().find(|(f, _)| f == n).unwrap().1;
+        h.meta
+            .test_index_ino_hold_in_dropped_tx(5, 1, ino_of("b"))
+            .unwrap();
+        let outcome = ask_ahead(&mut h, 2, 1, None, ReadAhead::Listing);
+        assert_eq!(
+            ahead_of(&outcome)
+                .grants
+                .iter()
+                .map(|(i, _)| *i)
+                .collect::<Vec<_>>(),
+            ["a", "c", "e"].map(ino_of).to_vec()
+        );
+    }
+
     /// The read-ahead is bounded, skips an inode an inbox op waits on, and
     /// is not made by a node that cannot grant.
     #[test]
