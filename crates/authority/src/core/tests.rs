@@ -60497,6 +60497,75 @@ mod c2g_settle {
         );
     }
 
+    /// The same row, for an op in `AwaitingLog` under an epoch the log has
+    /// moved past (`reroute_ended_epoch_waits`): a non-holder with a root
+    /// row of its own unshipped journal asks the new holder; it does not
+    /// answer from the row. Fails with the `own_unshipped_root_row` guard
+    /// removed: answered at once.
+    #[test]
+    fn an_ended_epochs_wait_is_not_answered_from_an_unshipped_root_row() {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        let rid = h.rid(1);
+        let op = h.create("t");
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: op.clone(),
+            tag: Default::default(),
+        });
+        h.core.clients.get_mut(&rid).unwrap().phase = client::Phase::AwaitingLog {
+            epoch: 1,
+            position: constellation_meta::Position::ZERO,
+        };
+        h.core.ship.max_epoch = 2;
+        constellation_meta::execute_mutate(&h.meta, &op, Some(rid)).unwrap();
+        let mut out = Vec::new();
+        h.core.reroute_ended_epoch_waits(h.clk(), &h.meta, &mut out);
+        assert!(
+            replies(&out).is_empty(),
+            "answered from the unshipped journal: {out:?}"
+        );
+        assert!(!matches!(
+            h.core.clients[&rid].phase,
+            client::Phase::AwaitingLog { .. }
+        ));
+        assert_eq!(h.core.stats.awaiting_log_rerouted, 1);
+    }
+
+    /// The same row, for an op queued to the holder's inbox (`inbox_enqueue`,
+    /// reached on a non-holder): the rid goes to the holder's inbox, the
+    /// holder's sequencer answers it by rid; it is not answered from the
+    /// row. Fails with the `own_unshipped_root_row` guard removed.
+    #[test]
+    fn an_inbox_op_is_not_answered_from_an_unshipped_root_row() {
+        let mut h = Harness::new(1);
+        h.core.lease.cached_holder = Some(2);
+        let rid = h.rid(1);
+        let op = h.create("t");
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: op.clone(),
+            tag: Default::default(),
+        });
+        constellation_meta::execute_mutate(&h.meta, &op, Some(rid)).unwrap();
+        let mut out = Vec::new();
+        h.core.inbox_enqueue(h.clk(), rid, 1, &h.meta, &mut out);
+        assert!(
+            replies(&out).is_empty(),
+            "answered from the unshipped journal: {out:?}"
+        );
+        assert!(
+            matches!(
+                h.core.clients[&rid].phase,
+                client::Phase::InboxQueued { .. }
+            ),
+            "{:?}",
+            h.core.clients[&rid].phase
+        );
+    }
+
     /// S5: the redirect is S3's live test (`on_forward`), and only for a
     /// delegate this tenure has granted (`Held` before): not the
     /// delegate's own settle (its stopped copy sends it straight back), not

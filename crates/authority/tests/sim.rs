@@ -10983,7 +10983,7 @@ fn regression_a_deposed_roots_append_does_not_reship_a_landed_rid_seed_2560() {
 /// `answer_awaiting_log`, and the op was answered from the refusal its
 /// journal alone held, as the log's (`Archive`), 24 ms before the ship. A
 /// root row of a node's own unshipped journal is not the log's, gate or no
-/// gate (`log_carries_outcome`).
+/// gate (`own_unshipped_root_row`).
 #[test]
 fn regression_an_open_root_answers_no_inbox_op_from_its_unshipped_journal_seed_3159() {
     run_seed(3159, long_delegated_late_answers_config()).unwrap_or_else(|e| {
@@ -11006,6 +11006,19 @@ fn regression_an_open_root_answers_no_inbox_op_from_its_unshipped_journal_seed_3
 /// lease (no backup) and read the rows as a lone root's; it now judges a
 /// row the re-adoption's tail covers by the copies of the members it names
 /// (node 3's tail held all three).
+///
+/// Why no ack was sent after the restart: the re-adopted tenure is lone
+/// (Local, no backup), and `Core::holder_append_committed` commits a lone
+/// tenure's appended rows only once they ship (`durable_jseq() == u64::MAX`
+/// is excluded). A restarted root never acks the pre-crash appends from its
+/// disk, so an ack that reached node 3 before the archive carried the rows
+/// was sent before the crash, under version 4, whose `durable_jseq` waited
+/// for node 3's `BackupAck`: backed by node 3's persisted tail at ack time
+/// (fjall Buffer, not fsync: the documented contract, `core/backup.rs`).
+/// The oracle itself judges membership at answer time, not ack time
+/// (`backups_hold`), so this reasoning, not the oracle, rules out an ack
+/// sent after the restart. Not asserted: the sim keeps no record of the
+/// version an ack was emitted under, and adding one is outside this pin.
 #[test]
 fn regression_a_readopted_epochs_tail_commits_its_group_rows_seed_5005() {
     run_seed(5005, long_delegated_late_answers_config()).unwrap_or_else(|e| {

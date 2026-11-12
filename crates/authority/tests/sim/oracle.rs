@@ -2002,7 +2002,7 @@ fn deleg_group(
             .unwrap()
             .get(&e)
             .cloned()
-            .unwrap_or(at_append);
+            .unwrap_or_else(|| at_append.clone());
         // Plan 46 M1.4 step 3: an epoch hold is a group of the owner and a
         // member, so the root's copy counts in a hold once a member's store
         // holds the row: as streamed speculation of the hold's epoch through
@@ -2081,10 +2081,22 @@ fn deleg_group(
         // the backup-acked rows of epoch 1, answered after the root's restart
         // re-adopted epoch 1 with no backup and a tail naming node 3, which
         // held them).
+        // (Safe because `backups_hold` requires every member to hold the exact
+        // records; `through` is the journal tip at the re-adoption, so it
+        // covers never-acked rows as well. Once the re-adopted holder clears
+        // the tail the rows are in the archive, which the archive branch
+        // above credits first. The group the row was appended under must be
+        // among the tail's members, so a group named later does not credit a
+        // row appended under an earlier one.)
         let tail = o.epoch_tails.lock().unwrap().get(&e).cloned();
-        if let Some((members, _)) =
-            tail.filter(|(m, t)| bs.is_empty() && !m.is_empty() && ht.last <= *t)
-        {
+        if let Some((members, _)) = tail.filter(|(m, t)| {
+            bs.is_empty()
+                && !m.is_empty()
+                && ht.last <= *t
+                && at_append
+                    .iter()
+                    .all(|b| Some(*b) == lease.map(|l| l.holder) || m.contains(b))
+        }) {
             return match backups_hold(o, e, &members, ht, lease.map(|l| (l.holder, holder_txs))) {
                 Ok(()) => Ok(format!(
                     "no backup recorded; the root journal holds ({g},{i}) and the epoch {e} \
