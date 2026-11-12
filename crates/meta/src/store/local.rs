@@ -1957,6 +1957,26 @@ impl Meta {
         self.apply_records_journaled_inner(records, rid, Journaled::Adopted)
     }
 
+    /// [`Self::apply_adopted_records`] for a grant's records, decided once
+    /// more under the delegation gate: `refuse` runs with the gate held
+    /// exclusively, so no root fast-path op (`Meta::root_fast_path`, the one
+    /// writer outside the core) can journal between its answer and the
+    /// records. `Ok(false)`: refused, nothing journaled. `refuse` must not
+    /// take the gate (it is not reentrant).
+    pub fn apply_adopted_records_unless(
+        &self,
+        records: &[LogRecord],
+        rid: Option<crate::Rid>,
+        refuse: &mut dyn FnMut() -> bool,
+    ) -> Result<bool, MetaError> {
+        let _gate = self.deleg_gate.write().unwrap_or_else(|e| e.into_inner());
+        if refuse() {
+            return Ok(false);
+        }
+        self.journal_records_committed(records, rid, Journaled::Adopted)?;
+        Ok(true)
+    }
+
     fn apply_records_journaled_inner(
         &self,
         records: &[LogRecord],
@@ -1979,6 +1999,17 @@ impl Meta {
                 )
             })
             .then(|| self.deleg_gate.write().unwrap_or_else(|e| e.into_inner()));
+        self.journal_records_committed(records, rid, how)
+    }
+
+    /// The body of [`Self::apply_records_journaled_inner`], the gate (if
+    /// the records need it) held by the caller: journal and commit.
+    fn journal_records_committed(
+        &self,
+        records: &[LogRecord],
+        rid: Option<crate::Rid>,
+        how: Journaled,
+    ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         let done = self.journal_records_tx(&mut tx, records, rid, how)?;
         tx.commit()?;

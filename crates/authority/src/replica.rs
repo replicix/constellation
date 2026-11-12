@@ -771,6 +771,15 @@ pub trait Replica {
         records: &[LogRecord],
         rid: Option<Rid>,
     ) -> Result<(), MetaError>;
+    /// [`Self::apply_records_journaled`] for a grant's records, decided
+    /// once more under the delegation gate (`Meta::apply_adopted_records_unless`):
+    /// `refuse` runs while no root fast-path op can journal, and
+    /// `Ok(false)` means it refused and nothing was journaled.
+    fn apply_grant_journaled(
+        &self,
+        records: &[LogRecord],
+        refuse: &mut dyn FnMut() -> bool,
+    ) -> Result<bool, MetaError>;
     /// [`Self::apply_records_journaled`] for a predecessor's backed-up
     /// transaction, under its delegation origin `(gen, idx)` (plan 30
     /// §M9 × §M11; `(0, 0)`: the predecessor's own row).
@@ -2053,6 +2062,14 @@ impl Replica for Meta {
         // uploads (`Meta::apply_adopted_records`); the other callers
         // (`DelegateNode`/`DelegateNodeEnded` records) name no chunk.
         Meta::apply_adopted_records(self, records, rid)
+    }
+
+    fn apply_grant_journaled(
+        &self,
+        records: &[LogRecord],
+        refuse: &mut dyn FnMut() -> bool,
+    ) -> Result<bool, MetaError> {
+        Meta::apply_adopted_records_unless(self, records, None, refuse)
     }
 
     fn apply_backup_tx_journaled(
