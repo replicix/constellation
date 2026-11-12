@@ -6908,6 +6908,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // Plan 46 M1.2 step 5 (c3-spec D3): a successor re-ships its sealed
     // tail verbatim; a record that does not apply is a broken premise and a
     // closed gate (`TailDiverged`), never a skip. Any fails the seed.
+    // ADR-59 part B (B0): no two creates of the log carry one inode number.
+    check::inode_numbers_unique(
+        oracle
+            .unfenced
+            .iter()
+            .map(|(seq, seg)| (*seq, seg.records.as_slice())),
+    )?;
     for (id, stats) in &report.stats {
         if stats.tail_diverged > 0 {
             return Err(format!(
