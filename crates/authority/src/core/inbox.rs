@@ -475,7 +475,7 @@ impl Core {
             return;
         };
         c.phase = Phase::InboxQueued { epoch };
-        c.forwarded = true;
+        c.mark_sent();
         c.inbox_ever = true;
         // (A settle keeps the deadline it was given: the settle window's
         // end, plan 43 C2.)

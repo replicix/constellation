@@ -255,13 +255,14 @@ pub enum MutateOutcome {
         /// unsettled `EIO` `held-behind-lost-chunk`, which the sim's oracle
         /// accepts only if a chunk is really lost.
         lost_chunk: bool,
-        /// The hold is for a delegation that is the requester's own: the
-        /// sequencer has not run the rid, and the requester runs it itself
-        /// once its table carries the grant (a grant installing while the op
-        /// was forwarded). Any other answer leaves the requester asking the
-        /// sequencer, which may have run the rid: a second execution at the
-        /// delegation would be skipped by the root when it streams (the rid
-        /// is completed there), leaving the delegate's row unretired for
+        /// The sequencer holds the op for the requester's own delegation:
+        /// it has checked that it has not run the rid (no outcome, no executed
+        /// answer parked for it; an op parked unexecuted behind a recall runs
+        /// only after the recall has drained the delegate's stream), and the requester runs it itself once its table
+        /// carries the grant. Any other answer leaves the requester asking
+        /// the sequencer: it may have run the rid, and a second execution at
+        /// the delegation would be skipped by the root when it streams (the
+        /// rid is completed there), leaving the delegate's row unretired for
         /// good and a hole in the delegation's stream in the log.
         yours: bool,
     },
@@ -453,6 +454,18 @@ impl OwnRows {
 }
 
 impl MutateOutcome {
+    /// A plain `Held`: the requester asks again after `retry_ms`. The op may
+    /// have run at the answering node, and no chunk is lost.
+    #[must_use]
+    pub fn held(retry_ms: u64) -> Self {
+        Self::Held {
+            retry_ms,
+            outwait_ms: None,
+            lost_chunk: false,
+            yours: false,
+        }
+    }
+
     pub fn to_postcard(&self) -> Result<Vec<u8>, postcard::Error> {
         postcard::to_allocvec(self)
     }

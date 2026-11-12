@@ -6264,12 +6264,7 @@ mod own_chunks {
         let (own, outcome) = own_chunks_of(&reply);
         assert_eq!(
             outcome,
-            &MutateOutcome::Held {
-                retry_ms: holder.core.cfg.held_retry_ms,
-                outwait_ms: None,
-                lost_chunk: false,
-                yours: false,
-            },
+            &MutateOutcome::held(holder.core.cfg.held_retry_ms),
             "{reply:?}"
         );
         assert_eq!(own, OwnChunks::Upload(vec![ino]));
@@ -6359,15 +6354,7 @@ mod own_chunks {
         let rid = requester.rid(1);
         let (reply, out) = forward(&mut holder, &mut requester, rid, op);
         let (own, outcome) = own_chunks_of(&reply);
-        assert_eq!(
-            outcome,
-            &MutateOutcome::Held {
-                retry_ms: holder.core.cfg.held_retry_ms,
-                outwait_ms: None,
-                lost_chunk: false,
-                yours: false,
-            }
-        );
+        assert_eq!(outcome, &MutateOutcome::held(holder.core.cfg.held_retry_ms));
         assert_eq!(own, OwnChunks::Upload(vec![ino]));
         assert_eq!(holder.core.stats.held_for_upload, 1);
         assert_eq!(uploads_awaited(&out), vec![ino]);
@@ -6432,12 +6419,7 @@ mod own_chunks {
             from: 1,
             msg: PeerMsg::MutateReply {
                 req: *req,
-                outcome: MutateOutcome::Held {
-                    retry_ms: 50,
-                    outwait_ms: None,
-                    lost_chunk: false,
-                    yours: false,
-                },
+                outcome: MutateOutcome::held(50),
                 base: None,
                 position: constellation_meta::Position::ZERO,
                 gen: 0,
@@ -14857,8 +14839,8 @@ fn an_unanswered_forward_is_asked_again_once_the_delegation_installs() {
     held_forward_then_delegation_installs(None);
 }
 
-/// `yours`: the word of the root's `Held` (`Held::yours`); `None`: no answer.
-fn held_forward_then_delegation_installs(yours: Option<bool>) {
+/// A harness whose node forwarded a create under `dir` to the root (node 2).
+fn forwarded_op_to_root() -> (Harness, constellation_fs_core::Ino, Rid, OpId) {
     let mut h = Harness::new(3);
     h.core.cfg.delegation = true;
     h.core.cfg.p2p = true;
@@ -14906,6 +14888,39 @@ fn held_forward_then_delegation_installs(yours: Option<bool>) {
         );
     };
     let req = *req;
+    (h, dir, rid, req)
+}
+
+/// The grant of `dir` to this node lands from the log and installs.
+fn install_designated_grant(h: &mut Harness, dir: constellation_fs_core::Ino) {
+    crate::replica::Replica::apply_segment(
+        &h.meta,
+        2,
+        1,
+        0,
+        &[],
+        &[],
+        &[LogRecord::delegate_one(
+            3,
+            1,
+            dir,
+            constellation_meta::SubtreeKind::Designated,
+        )],
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+    assert_eq!(
+        h.core.deleg_view().mine.len(),
+        1,
+        "{:?}",
+        h.core.deleg_view()
+    );
+}
+
+/// `yours`: the word of the root's `Held` (`Held::yours`); `None`: no answer.
+fn held_forward_then_delegation_installs(yours: Option<bool>) {
+    let (mut h, dir, rid, req) = forwarded_op_to_root();
     let backoff = match yours {
         // The root holds it: the delegate's table lacks the grant still
         // (`yours`), or the root ran it and its outcome is parked.
@@ -14945,30 +14960,7 @@ fn held_forward_then_delegation_installs(yours: Option<bool>) {
             backoff
         }
     };
-    // The grant lands from the log and installs here.
-    crate::replica::Replica::apply_segment(
-        &h.meta,
-        2,
-        1,
-        0,
-        &[],
-        &[],
-        &[LogRecord::delegate_one(
-            3,
-            1,
-            dir,
-            constellation_meta::SubtreeKind::Designated,
-        )],
-    )
-    .unwrap();
-    let mut out = Vec::new();
-    h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-    assert_eq!(
-        h.core.deleg_view().mine.len(),
-        1,
-        "{:?}",
-        h.core.deleg_view()
-    );
+    install_designated_grant(&mut h, dir);
     h.advance(100);
     let out = h.step(Event::Timer { id: backoff[0] });
     let forwarded = sends(&out)
@@ -14988,6 +14980,65 @@ fn held_forward_then_delegation_installs(yours: Option<bool>) {
         assert_eq!(h.core.stats.deleg_retry_executed, 0);
         assert!(h.meta.child_ino(dir, "f").unwrap().is_none());
     }
+}
+
+/// A stale `yours` does not outlive the forward it described. The root
+/// says `yours`, but the grant is not in this table yet, so the retry is
+/// forwarded again; that forward gets no answer (the grant ended meanwhile,
+/// the root ran the rid, its reply was lost). A new grant installing now
+/// must not run the op here: the root may have run it. Fails with the flag
+/// set only by `Held` replies and cleared only by other replies.
+#[test]
+fn a_stale_yours_does_not_outlive_a_later_forward() {
+    let (mut h, dir, _rid, req) = forwarded_op_to_root();
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::MutateReply {
+            req,
+            outcome: MutateOutcome::Held {
+                retry_ms: 50,
+                outwait_ms: None,
+                lost_chunk: false,
+                yours: true,
+            },
+            base: None,
+            position: constellation_meta::Position::ZERO,
+            gen: 0,
+            own_chunks: OwnChunks::None,
+            own_rows: None,
+            committed: false,
+            non_stealable: false,
+        },
+    });
+    let backoff = timers(&out, TimerKind::ForwardBackoff);
+    assert_eq!(backoff.len(), 1, "{out:?}");
+    // No grant here yet: the retry goes to the root again.
+    h.advance(100);
+    let out = h.step(Event::Timer { id: backoff[0] });
+    let Some((_, PeerMsg::MutateRequest { req, .. })) = sends(&out).first().copied() else {
+        panic!("not forwarded again: {out:?}");
+    };
+    let req = *req;
+    // That forward is lost.
+    let out = h.step(Event::PeerFailed {
+        req,
+        to: 2,
+        outage: false,
+    });
+    let backoff = timers(&out, TimerKind::ForwardBackoff);
+    assert_eq!(backoff.len(), 1, "{out:?}");
+    install_designated_grant(&mut h, dir);
+    h.advance(100);
+    let out = h.step(Event::Timer { id: backoff[0] });
+    assert!(
+        sends(&out)
+            .iter()
+            .any(|(_, m)| matches!(m, PeerMsg::MutateRequest { .. })),
+        "not asked again: {out:?}"
+    );
+    assert!(replies(&out).is_empty(), "{out:?}");
+    assert_eq!(h.core.stats.deleg_retry_executed, 0);
+    assert!(h.meta.child_ino(dir, "f").unwrap().is_none());
 }
 
 /// Plan 46 M0.3 (B): an op the root answered `Held` is asked again at that
@@ -15019,12 +15070,7 @@ fn an_op_held_by_the_root_is_asked_again_there() {
         from: 2,
         msg: PeerMsg::MutateReply {
             req,
-            outcome: MutateOutcome::Held {
-                retry_ms: 50,
-                outwait_ms: None,
-                lost_chunk: false,
-                yours: false,
-            },
+            outcome: MutateOutcome::held(50),
             base: None,
             position: constellation_meta::Position::ZERO,
             gen: 0,
@@ -47233,7 +47279,7 @@ mod deleg_group {
             1,
             "the lapse took the op away from a root that may be alive"
         );
-        assert!(!h.core.clients[&rid].forwarded);
+        assert!(!h.core.clients[&rid].forwarded());
         // The give-up is armed for the root's end of the generation.
         let id = h.core.dl.mine[&7].lapse_timer.expect("the give-up watch");
         h.now = Ms(end_due.0 - 1);
@@ -47244,7 +47290,7 @@ mod deleg_group {
         h.step(Event::Timer { id });
         assert!(h.core.stream_parks_of(7).is_empty(), "never given up");
         assert!(
-            h.core.clients[&rid].forwarded,
+            h.core.clients[&rid].forwarded(),
             "the op is in doubt on the lease path"
         );
     }
@@ -47353,7 +47399,8 @@ mod deleg_group {
         });
         let c = h.core.clients.get_mut(&rid).expect("in flight");
         c.settle = true;
-        c.forwarded = true;
+        // (Sent to the root, which said the op is this node's own.)
+        c.sequencer_says_mine();
         let op = MutateOp::Create {
             parent: dir,
             name: "s".into(),
@@ -47397,6 +47444,82 @@ mod deleg_group {
             )),
             "{out:?}"
         );
+    }
+
+    /// ADR-54/55: a settle of this node's own op that was sent to the root,
+    /// which has not said the op is ours, is not decided here under a
+    /// delegation of its keys: the root may have run the rid (its outcome
+    /// parked for durability), and an abandon journaled here would be skipped
+    /// by the root as a completed rid, leaving the row unretired and a hole
+    /// in the stream. Fails without the guard in `delegate_try_execute`:
+    /// the refusal is journaled in the delegate's stream.
+    #[test]
+    fn a_settle_of_an_op_the_root_may_have_run_is_not_decided_by_the_delegate() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let rid = h.rid(1);
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("elsewhere"),
+            tag: Default::default(),
+        });
+        let c = h.core.clients.get_mut(&rid).expect("in flight");
+        c.settle = true;
+        c.mark_sent();
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "s".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let mut out = Vec::new();
+        let tag = Default::default();
+        let clk = h.clk();
+        assert!(!h.core.delegate_try_execute(
+            clk,
+            0,
+            None,
+            rid,
+            &op,
+            constellation_meta::Position::ZERO,
+            0,
+            &tag,
+            true,
+            crate::core::holder::Fence::default(),
+            &h.meta,
+            &mut out,
+        ));
+        assert!(out.is_empty(), "{out:?}");
+        assert!(h.meta.journal_classes_of_rid(rid).unwrap().is_empty());
+        assert_eq!(h.core.stats.deleg_retry_asked_root, 1);
+    }
+
+    /// The same for an in-doubt resubmission at submit (`sent` from the
+    /// start): the op is sent to the root, not run under the grant.
+    #[test]
+    fn an_in_doubt_resubmission_is_asked_at_the_root_not_run_by_the_delegate() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let rid = h.rid(1);
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "r".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        h.core.note_in_doubt(rid);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        assert!(h.meta.child_ino(dir, "r").unwrap().is_none(), "{out:?}");
+        assert!(replies(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.deleg_retry_asked_root, 1);
     }
 
     /// Plan 46 M1.1 step 2: a delegate generation's rule is one lookup of
@@ -48642,7 +48765,7 @@ mod deleg_group {
     fn a_retry_does_not_answer_a_lone_roots_own_uncommitted_delegate_row() {
         for gate_done in [false, true] {
             let (mut h, _dir, rid) = lone_root_with_own_delegate_row(gate_done);
-            h.core.clients.get_mut(&rid).expect("in flight").forwarded = true;
+            h.core.clients.get_mut(&rid).expect("in flight").mark_sent();
             let mut out = Vec::new();
             let outcome = h
                 .core
@@ -48680,7 +48803,7 @@ mod deleg_group {
     fn a_parked_own_answer_on_a_delegate_row_waits_for_the_row_not_the_lone_shortcut() {
         let (mut h, _dir, rid) = lone_root_with_own_delegate_row(true);
         let tip = h.meta.journal_tip().unwrap();
-        h.core.clients.get_mut(&rid).expect("in flight").forwarded = true;
+        h.core.clients.get_mut(&rid).expect("in flight").mark_sent();
         let class = constellation_meta::RowCommit::LONE;
         h.core.park_finish(
             h.clk(),
@@ -58863,7 +58986,7 @@ mod c2g_settle {
         });
         {
             let c = requester.core.clients.get_mut(&rid).unwrap();
-            c.forwarded = true;
+            c.mark_sent();
             c.phase = crate::core::client::Phase::WaitingLease;
         }
         let now = requester.clk();
@@ -58925,7 +59048,7 @@ mod c2g_settle {
         requester.core.lease.cached_holder = None;
         {
             let c = requester.core.clients.get_mut(&rid).unwrap();
-            c.forwarded = true;
+            c.mark_sent();
             c.phase = crate::core::client::Phase::WaitingLease;
         }
         let now = requester.clk();
@@ -59694,12 +59817,7 @@ mod c2g_settle {
         let out = h.step_archived(request(7, 1, op, true));
         assert_eq!(
             reply_to_3(&out, 7),
-            Some(MutateOutcome::Held {
-                retry_ms: h.core.cfg.recall_hold_ms.max(50),
-                outwait_ms: None,
-                lost_chunk: false,
-                yours: false,
-            }),
+            Some(MutateOutcome::held(h.core.cfg.recall_hold_ms.max(50))),
             "{out:?}"
         );
         assert_eq!(h.core.stats.gate_settles_held_executed, 1);
@@ -59892,7 +60010,7 @@ mod c2g_settle {
         h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         let c = h.core.clients.get_mut(&rid).expect("in flight");
         c.settle = true;
-        c.forwarded = true;
+        c.mark_sent();
         c.phase = phase;
         c.timer = None;
         (h, rid)
@@ -59923,7 +60041,7 @@ mod c2g_settle {
         });
         let c = h.core.clients.get_mut(&rid).expect("in flight");
         c.settle = true;
-        c.forwarded = true;
+        c.mark_sent();
         c.phase = client::Phase::AcquireRetry;
         c.timer = None;
         if let Some(l) = h.core.roster.link_mut_for_test(2) {
@@ -61736,12 +61854,7 @@ fn a_delegates_held_answer_is_not_the_roots() {
         from: 3,
         msg: PeerMsg::MutateReply {
             req,
-            outcome: MutateOutcome::Held {
-                retry_ms: 10,
-                outwait_ms: None,
-                lost_chunk: false,
-                yours: false,
-            },
+            outcome: MutateOutcome::held(10),
             base: None,
             position: constellation_meta::Position::ZERO,
             gen: 7,
@@ -63820,12 +63933,7 @@ mod await_retry {
             from: 1,
             msg: PeerMsg::MutateReply {
                 req,
-                outcome: MutateOutcome::Held {
-                    retry_ms: 100,
-                    outwait_ms: None,
-                    lost_chunk: false,
-                    yours: false,
-                },
+                outcome: MutateOutcome::held(100),
                 base: None,
                 position: constellation_meta::Position::ZERO,
                 gen: 0,
@@ -75350,16 +75458,7 @@ mod route_fence_wire {
     #[test]
     fn a_held_answer_from_a_delegate_is_retried_routed_by_its_generation() {
         let (mut h, _rid, req) = forwarded();
-        let out = h.step(reply(
-            req,
-            MutateOutcome::Held {
-                retry_ms: 100,
-                outwait_ms: None,
-                lost_chunk: false,
-                yours: false,
-            },
-            7,
-        ));
+        let out = h.step(reply(req, MutateOutcome::held(100), 7));
         let backoff = timers(&out, TimerKind::ForwardBackoff);
         assert_eq!(backoff.len(), 1, "{out:?}");
         h.advance(101);

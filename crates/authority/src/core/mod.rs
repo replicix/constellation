@@ -1438,6 +1438,13 @@ pub struct Stats {
     /// Phase 2b round 2: forwards held by the root that a retry
     /// executed here as the delegate (the grant installed meanwhile).
     pub deleg_retry_executed: u64,
+    /// ADR-54/55: an op of this node's own delegation that was sent to the
+    /// sequencer, and not told it is ours, was neither run nor settled here
+    /// (`ClientOp::may_run_here`): the sequencer is asked again, and answers
+    /// from the rid's outcome or `Held { yours }`. Under a partition from the
+    /// root such an op ends at its deadline instead of running (it is in
+    /// doubt: the root may have run it).
+    pub deleg_retry_asked_root: u64,
     /// M12 round 2: forwards to a delegate answered `NotHolder` while
     /// this node's table still named it the owner (its grant not yet
     /// installed there), retried instead of executed here.

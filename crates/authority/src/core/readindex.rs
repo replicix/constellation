@@ -1134,7 +1134,7 @@ impl Core {
                 }
                 if let Some(c) = self.clients.get_mut(&rid) {
                     c.phase = ClientPhase::WaitingLease;
-                    c.forwarded = true;
+                    c.mark_sent();
                 }
                 self.retry_or_lease(now, rid, replica, out);
             }
@@ -1202,6 +1202,21 @@ impl Core {
         };
         self.stats.acks_row_gone += 1;
         self.abort_park_busy(now, id, replica, out);
+    }
+
+    /// Whether `rid`'s executed answer is parked here (waiting for
+    /// durability or recalls): the root ran it (ADR-54/55: it then says
+    /// `yours` for no one).
+    pub(crate) fn rid_answer_parked(&self, rid: Rid) -> bool {
+        self.rd.parked_rids.get(&rid).is_some_and(|id| {
+            matches!(
+                self.rd.parked.get(id),
+                Some(Parked {
+                    what: ParkedWhat::Reply { .. },
+                    ..
+                })
+            )
+        })
     }
 
     /// The park of `rid`'s executed answer, waiting for durability: the
@@ -1484,7 +1499,7 @@ impl Core {
                 let in_doubt = self
                     .clients
                     .get(&rid)
-                    .is_some_and(|c| c.forwarded || c.attempts > 0);
+                    .is_some_and(|c| c.forwarded() || c.attempts > 0);
                 if in_doubt && replica.completed_position(rid).ok().flatten().is_some() {
                     p.waiting.clear();
                     p.deps = None;
@@ -1697,7 +1712,7 @@ impl Core {
                         self.replay.unacked.insert(rid);
                     }
                     if let Some(c) = self.clients.get_mut(&rid) {
-                        c.forwarded = true;
+                        c.mark_sent();
                         c.phase = ClientPhase::WaitingLease;
                     }
                     self.retry_or_lease(now, rid, replica, out);
@@ -1934,12 +1949,7 @@ impl Core {
             to,
             msg: PeerMsg::MutateReply {
                 req,
-                outcome: MutateOutcome::Held {
-                    retry_ms: self.cfg.held_retry_ms,
-                    outwait_ms: None,
-                    lost_chunk: false,
-                    yours: false,
-                },
+                outcome: MutateOutcome::held(self.cfg.held_retry_ms),
                 base: None,
                 position: Position::ZERO,
                 // (A delegate's: see `on_held_reply_timer`.)
@@ -2044,6 +2054,19 @@ impl Core {
             }) => replica.rid_behind_lost_chunk(*rid),
             _ => false,
         };
+        // ADR-54/55: an op parked here unexecuted (waiting for the recall of
+        // the generation that owns its keys, or its `deps`) has not run, and
+        // does not run before that recall has drained the delegate's stream:
+        // a delegate that runs it meanwhile has its row appended first, and
+        // the parked op then finds its rid completed. Its requester may run
+        // it. An executed answer waiting for durability is the root's.
+        let yours = matches!(
+            self.rd.parked.get(&id),
+            Some(Parked {
+                what: ParkedWhat::ExecuteReply { .. },
+                ..
+            })
+        );
         let (to, req, held_timer, durable, gen) = match self.rd.parked.get_mut(&id) {
             Some(Parked {
                 what:
@@ -2089,7 +2112,7 @@ impl Core {
                         retry_ms,
                         outwait_ms,
                         lost_chunk,
-                        yours: false,
+                        yours,
                     },
                     base: None,
                     position: Position::ZERO,
@@ -2721,12 +2744,7 @@ impl Core {
                                 to: from,
                                 msg: PeerMsg::MutateReply {
                                     req,
-                                    outcome: MutateOutcome::Held {
-                                        retry_ms: self.cfg.recall_hold_ms.max(50),
-                                        outwait_ms: None,
-                                        lost_chunk: false,
-                                        yours: false,
-                                    },
+                                    outcome: MutateOutcome::held(self.cfg.recall_hold_ms.max(50)),
                                     base: None,
                                     position: Position::ZERO,
                                     gen: 0,
