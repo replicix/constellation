@@ -253,6 +253,7 @@ impl ReadState {
             ("rd_by_req", self.by_req.len()),
             ("rd_recalls", self.recalls.len()),
             ("rd_parked_rids", self.parked_rids.len()),
+            ("rd_horizon_parked", self.horizon_parked.len()),
         ]
     }
 }
@@ -287,7 +288,43 @@ pub(crate) struct ReadState {
     /// The write-ahead lanes of the read-grant horizons, by
     /// [`GrantHorizon::index`].
     horizon: [HorizonLane; 2],
+    /// The last strict read this node served found the root's horizon too
+    /// short for the grant it would have made (`grant_horizon_covers`).
+    horizon_missed: bool,
+    /// Strict reads the root's horizon did not cover, held until the write
+    /// the lane asked for is durable (`on_grant_horizon_persisted`), so the
+    /// first read after a quiet spell gets its grant (and a scan's
+    /// read-ahead) instead of a plain position.
+    horizon_parked: Vec<HorizonParked>,
+    /// Ends the hold of `horizon_parked` ([`HORIZON_PARK_MS`]).
+    horizon_park_timer: Option<TimerId>,
+    /// The hold ran out before the write landed: reads arriving until it
+    /// does are answered at once (a scan would otherwise wait the bound
+    /// again for every lookup).
+    horizon_park_expired: bool,
 }
+
+/// A strict read held for the root's grant horizon.
+#[derive(Debug)]
+struct HorizonParked {
+    at: WaitMs,
+    from: NodeId,
+    req: OpId,
+    ino: Ino,
+    dir: bool,
+    name: Option<String>,
+    ahead: ReadAhead,
+}
+
+/// The longest a strict read waits for the horizon write: a disk that syncs
+/// slower than this (a loaded one: seconds) answers it with its position
+/// alone, as the lane did before it held reads, so the wait never costs a
+/// read more than this.
+const HORIZON_PARK_MS: u64 = 100;
+
+/// The most strict reads held for a horizon write; past it a read is
+/// answered at once with its position alone.
+const HORIZON_PARKED_MAX: usize = 4096;
 
 /// One read-grant horizon's write-ahead lane (`Core::grant_horizon_covers`).
 #[derive(Debug, Default)]
@@ -339,6 +376,9 @@ impl Core {
         let covered = until <= durable;
         if !covered {
             self.stats.read_grants_uncovered += 1;
+            if kind == GrantHorizon::Root {
+                self.rd.horizon_missed = true;
+            }
         }
         covered
     }
@@ -370,16 +410,61 @@ impl Core {
     /// (the next grant asks again).
     pub(crate) fn on_grant_horizon_persisted(
         &mut self,
+        now: Now,
         kind: GrantHorizon,
         until: WaitMs,
         durable: Option<WaitMs>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
     ) {
         let lane = &mut self.rd.horizon[kind.index()];
         if lane.writing == Some(until) {
             lane.writing = None;
         }
+        // Another write is wanted (a later need outran this one): a read
+        // that is still short may wait for that too.
+        let again = lane.pending && durable.is_some();
         if durable.is_none() {
             self.stats.grant_horizon_failed += 1;
+        }
+        if kind != GrantHorizon::Root {
+            return;
+        }
+        self.rd.horizon_park_expired = false;
+        // The reads held for the write are served now, as if they had just
+        // arrived: with the horizon durable they are granted. A failed
+        // write serves them their position alone (`may_park` off), as an
+        // uncovered read was before the hold.
+        self.serve_horizon_parked(now, again, replica, out);
+    }
+
+    /// `Timer::HorizonPark`: the write has not landed in
+    /// [`HORIZON_PARK_MS`]; the reads held for it get their position alone.
+    pub(crate) fn on_horizon_park_timer(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.rd.horizon_park_timer = None;
+        self.rd.horizon_park_expired = true;
+        self.serve_horizon_parked(now, false, replica, out);
+    }
+
+    fn serve_horizon_parked(
+        &mut self,
+        now: Now,
+        may_park: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if let Some(id) = self.rd.horizon_park_timer.take() {
+            self.cancel_timer(id, out);
+        }
+        for p in std::mem::take(&mut self.rd.horizon_parked) {
+            self.serve_read_index(
+                now, p.from, p.req, p.ino, p.dir, p.name, p.ahead, may_park, replica, out,
+            );
         }
     }
 
@@ -449,6 +534,26 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        self.serve_read_index(now, from, req, ino, dir, name, ahead, true, replica, out);
+    }
+
+    /// [`Self::on_read_index`]; `may_park`: a read whose grant only the
+    /// root's horizon kept back is held for the write the lane asked for
+    /// instead of being answered with its position alone.
+    #[allow(clippy::too_many_arguments)]
+    fn serve_read_index(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        req: OpId,
+        ino: Ino,
+        dir: bool,
+        name: Option<String>,
+        ahead: ReadAhead,
+        may_park: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         self.note_foreign(now, replica, out);
         // Phase 2b: this node as the delegate of the subtree.
         if let Some(outcome) = self.deleg_read_index(now, from, ino, name.as_deref(), replica) {
@@ -496,6 +601,7 @@ impl Core {
             ReadIndexOutcome::Busy
         } else {
             let epoch = self.lease.epoch().unwrap_or(0);
+            self.rd.horizon_missed = false;
             let grant = self.maybe_grant(now, from, ino, epoch, replica);
             // The children granted besides (a scan's next lookups), made
             // before the position is read like the grant above. Only here,
@@ -521,6 +627,41 @@ impl Core {
                 }
                 _ => None,
             };
+            // Nothing was granted only because the root's horizon is not
+            // durable that far yet (the first read after a quiet spell):
+            // the lane is writing it now, so hold the read for the write
+            // and grant then, rather than answer a scan's first lookup
+            // plain and every lookup after it until the write lands.
+            if may_park
+                && !self.rd.horizon_park_expired
+                && grant.is_none()
+                && ahead_grants.is_none()
+                && self.rd.horizon_missed
+            {
+                let stale = now.wait.minus(2 * self.cfg.forward_timeout_ms);
+                self.rd.horizon_parked.retain(|p| p.at > stale);
+                if self.rd.horizon_parked.len() < HORIZON_PARKED_MAX {
+                    self.stats.read_index_horizon_parked += 1;
+                    self.rd.horizon_parked.push(HorizonParked {
+                        at: now.wait,
+                        from,
+                        req,
+                        ino,
+                        dir,
+                        name,
+                        ahead,
+                    });
+                    if self.rd.horizon_park_timer.is_none() {
+                        let id = self.set_timer_wait(
+                            now.wait.plus(HORIZON_PARK_MS),
+                            Timer::HorizonPark,
+                            out,
+                        );
+                        self.rd.horizon_park_timer = Some(id);
+                    }
+                    return;
+                }
+            }
             // After the grants (see `readdeleg`'s ordering argument).
             let child = name.as_deref().map(|n| (n, replica.lookup_ino(ino, n)));
             let touched = replica.unshipped_touches_read(ino, dir, child)

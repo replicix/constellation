@@ -3465,9 +3465,22 @@ previous process granted is gone.
   later needs coalesced) for a write of now, the lifetime, a second, and the
   second the write rounds up by (`Meta::persist_grant_horizon`); the next
   grants find it covered, so under continuous reading no read waits and the
-  core never syncs. A read whose grant is not covered (the first of a cold
-  node, a failed write) is answered with its position and no grant: persist
-  before grant holds because the check reads the durable value only. A
+  core never syncs. A delegate's read whose grant is not covered (the first
+  of a cold lane, a failed write) is answered with its position and no
+  grant: persist before grant holds because the check reads the durable
+  value only. The root's strict read that finds nothing granted only for
+  that reason (the first read after a quiet spell, which outlives the
+  horizon by a second or two) is held, off the core, for the write the lane
+  asked for and served as a new arrival when it lands, so it is granted
+  with its read-ahead; answered with its position alone, as above, if the
+  write failed, if too many are held, or when the write has not landed in
+  100 ms (a loaded disk syncs in seconds; the hold costs a read no more
+  than that, and the reads that arrive after it ran out are answered at
+  once until the write lands). Answering it plain and every
+  lookup after it until the write landed (each a ReadIndex round trip) made
+  a cold `ls -l` of 1000 files cost 20 to 90 calls instead of the 8 its
+  read-ahead needs (`cto-scan-ahead`), and an open after a pause no
+  delegation (`cto-recall-unreachable`). A
   restart after reading stops waits at most about two seconds more than the
   last grant needs.
 - **Fallbacks fail closed.** After a read error a later write of a horizon

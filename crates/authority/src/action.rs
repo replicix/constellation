@@ -311,6 +311,10 @@ pub enum TimerKind {
     GrantExpiry,
     /// M8: the restart quarantine ends.
     GrantQuarantine,
+    /// Strict reads held for the root's grant horizon write have waited
+    /// long enough: they are answered with their position alone
+    /// (`Core::on_horizon_park_timer`).
+    HorizonPark,
     /// Plan 43 C7-H2: a flush or shutdown that waits for the takeover gate
     /// and floor to end before it releases the lease looks again
     /// (`Core::on_flush_floor_timer`).
