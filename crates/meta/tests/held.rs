@@ -1954,6 +1954,51 @@ fn a_drop_strands_a_later_write_of_the_lost_file_and_lists_it() {
     assert!(dropped.describe().contains("acked_lost"));
 }
 
+/// A queued replay of the damaged file's manifest that stands for a shadow
+/// a delegate accepted (`gen` other than 0) is not the drop's to refuse: the
+/// row is the delegate's, which re-streams it to the root or ends the
+/// generation, so refusing the local copy rolls back nothing a `DropHeld`
+/// can name, and listing it as lost reports a loss the log never records
+/// (far-root-writes+lost-chunk seed 1051: `drop_acked_loss_unrecorded`, and
+/// the delegate's row then landed). A replay of the root's own (`gen` 0) is
+/// refused and listed. Fails without the `gen` test in `drop_held_apply`:
+/// both are refused and listed.
+#[test]
+fn a_drop_leaves_a_queued_replay_of_a_delegates_shadow_alone() {
+    let (meta, broken) = node_one_with_a_seed();
+    let lost = ChunkHash::of(b"bytes that are gone");
+    let write = MutateOp::SetManifest {
+        ino: broken,
+        base_manifest: None,
+        manifest: manifest_naming(lost, 19),
+        size: 19,
+        mtime_ns: None,
+        ctime_ns: None,
+    };
+    let tag = constellation_meta::locks::LockTag::default();
+    // The root's own replay of the write, queued by an earlier deposition.
+    meta.queue_replay(rid_of(1, 7), &write, &tag).unwrap();
+    // A delegate's acceptance of the write that arrived after a takeover:
+    // queued under the delegate's generation.
+    let gen = (1u64 << 32) | 1;
+    assert!(!meta
+        .install_shadow_answered(rid_of(1, 8), 0, gen, &write, &tag, &[], (true, None))
+        .unwrap());
+    let dropped = meta.drop_held(broken, 1).unwrap();
+    assert_eq!(dropped.queued_dropped, 1, "{dropped:?}");
+    let lost: Vec<_> = dropped.acked_lost.iter().map(|(r, _)| *r).collect();
+    assert!(lost.contains(&rid_of(1, 7)), "{lost:?}");
+    assert!(!lost.contains(&rid_of(1, 8)), "{lost:?}");
+    assert!(!dropped.rolled_back.contains(&rid_of(1, 8)), "{dropped:?}");
+    let queue = meta.pending_replays().unwrap();
+    let shadow = queue
+        .iter()
+        .find(|q| q.rid == rid_of(1, 8))
+        .unwrap_or_else(|| panic!("the delegate's shadow is not queued: {queue:?}"));
+    assert!(shadow.refused.is_none(), "{shadow:?}");
+    assert_eq!(shadow.gen, gen);
+}
+
 /// A row classed for the archive alone is no proof its answer never left:
 /// a configuration that formed after it was journaled (an epoch's hold) can
 /// release the answer before the row ships (flex-crash+durability seed
