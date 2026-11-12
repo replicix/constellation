@@ -3476,7 +3476,12 @@ previous process granted is gone.
   write failed, if too many are held, or when the write has not landed in
   100 ms (a loaded disk syncs in seconds; the hold costs a read no more
   than that, and the reads that arrive after it ran out are answered at
-  once until the write lands). Answering it plain and every
+  once until the write lands). The 100 ms is the read's own: a read held
+  again for a later write keeps its deadline, and a held read the timer
+  was late for (a loaded core) is answered plain, never dropped. The hold
+  is not limited to reads that carry read-ahead: an open after a pause
+  (which needs the grant itself) and a lone stat send the same request, so
+  the sequencer cannot tell them apart. Answering it plain and every
   lookup after it until the write landed (each a ReadIndex round trip) made
   a cold `ls -l` of 1000 files cost 20 to 90 calls instead of the 8 its
   read-ahead needs (`cto-scan-ahead`), and an open after a pause no
