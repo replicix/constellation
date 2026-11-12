@@ -1547,6 +1547,64 @@ fn a_hole_is_retired_once_a_claim_follows_its_epoch() {
     );
 }
 
+/// ADR-59 part A (metered-shared+links seed 1781, review S2): a hole below a
+/// row with records stays when a claim follows its epoch, across a restart,
+/// so this node's own kept copy is contiguous to that row by itself: its next
+/// claim merges the copy without asking the log view, which forgets after a
+/// restart which rows of a closed epoch shipped ahead. A hole above every
+/// such row still goes. Fails before: the hole below went, and the merge
+/// found a gap under the row past it.
+#[test]
+fn a_hole_below_a_kept_row_stays_across_a_restart_and_the_epoch_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("m.db");
+    {
+        let meta = Meta::open(&db).unwrap();
+        put(
+            &meta,
+            &[
+                mtx(1, 1, RowCommit::ROOT_GROUP, vec![create("a", ino(1), 10)]),
+                mtx(2, 3, RowCommit::LONE, Vec::new()),
+                mtx(4, 4, RowCommit::ROOT_GROUP, vec![create("b", ino(2), 11)]),
+                mtx(5, 6, RowCommit::LONE, Vec::new()),
+            ],
+        );
+        meta.close().unwrap();
+    }
+    let meta = Meta::open(&db).unwrap();
+    let marker = vec![LogRecord::TailFollowsThrough {
+        prev_epoch: 1,
+        through: 6,
+    }];
+    let applied = meta
+        .apply_segment_rows(1, 2, 0, &[], &[], &marker, &TouchSet::default())
+        .unwrap();
+    assert_eq!(applied.member.dropped, 1, "only the hole above the rows");
+    let (_, rows) = meta.member_copy_rows(1).unwrap().unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.tx.first, r.tx.last))
+            .collect::<Vec<_>>(),
+        [(1, 1), (2, 3), (4, 4)],
+        "the copy reaches its last row contiguously"
+    );
+    // The row above is carried: nothing stays above the hole, and it goes
+    // (else it outlives the archive, member_copies_drained).
+    let carried = vec![
+        LogRecord::TailOf { epoch: 1, jseq: 4 },
+        create("b", ino(2), 11),
+    ];
+    meta.apply_segment_rows(2, 2, 0, &[], &[], &carried, &TouchSet::default())
+        .unwrap();
+    let (_, rows) = meta.member_copy_rows(1).unwrap().unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.tx.first, r.tx.last))
+            .collect::<Vec<_>>(),
+        [(1, 1)]
+    );
+}
+
 /// A marker of a later epoch that announces no tail of this epoch drops the
 /// rows nobody was told were committed; a group-committed row stays until
 /// coverage (it may be another tenure's inherited tail).
