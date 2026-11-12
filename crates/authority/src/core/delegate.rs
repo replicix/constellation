@@ -2333,6 +2333,12 @@ impl Core {
         self.dl.root_synced = level;
         if level != RootSync::None {
             let live: BTreeSet<u64> = table.gens().collect();
+            // The generations this sync looks at: `table` is the snapshot
+            // taken at its start. A generation granted while it runs (the
+            // re-delegation after a cross-subtree op, which an ended
+            // generation's waiters trigger) is in the replica's table but
+            // not in this snapshot, and is not one a record ended.
+            let known: BTreeSet<u64> = self.dl.gens.keys().copied().collect();
             for st in table.streams() {
                 let d = StreamView::of(&st);
                 if let Some(g) = self.dl.gens.get_mut(&d.gen) {
@@ -2477,7 +2483,7 @@ impl Core {
                 .dl
                 .gens
                 .iter()
-                .filter(|(g, s)| !s.ended && !live.contains(g))
+                .filter(|(g, s)| !s.ended && !live.contains(g) && known.contains(g))
                 .map(|(g, _)| *g)
                 .collect();
             for gen in gone {

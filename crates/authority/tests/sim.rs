@@ -17515,6 +17515,25 @@ fn regression_locks_unlinked_delegated_dbackup_random_seeds_2477_2982() {
     }
 }
 
+/// `locks-unlinked-delegated-dbackup-random` seed 558: node 3 took the root
+/// over and, in one sync, ended a generation a predecessor had delegated to
+/// it; the waiters of that end woke the held-back re-delegation of `d1` to
+/// node 2, and the same sync then ended the new generation as one the log
+/// had ended (it was not in the table snapshot the sync took). The replica
+/// went on delegating `d1` to node 2, whose first renewal was refused, so
+/// node 2 answered every lock request `NotOwner { 0 }` and the root's own
+/// waiter on `d1/lk1` went to it for 60 s. The sync now ends only the
+/// generations it knew when it took the snapshot.
+#[test]
+fn regression_locks_unlinked_delegated_dbackup_random_seed_558() {
+    run_seed(558, locks_unlinked_random_config(true)).unwrap_or_else(|e| {
+        panic!(
+            "locks-unlinked-delegated-dbackup-random seed 558: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-dbackup-random"
+        )
+    });
+}
+
 /// The delegate-restart wedge (plan 43 C7a commit 6's finding 1): node 2,
 /// the delegate of `d1` and the root's backup, crashes while the root is
 /// cut from S3 and down, and is back 1.2 s later with rows of its
