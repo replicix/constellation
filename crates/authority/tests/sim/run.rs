@@ -7321,6 +7321,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         converged_checkable,
     );
     let outcome_conflicts = bucket.archive.conflicting_outcomes();
+    let stream_holes = bucket.archive.stream_holes();
     // `AUTHORITY_SIM_ORACLE_DEBUG=1`: what the end of the run found (the
     // relays no judged answer backs, the unjournaled refusals that landed).
     if std::env::var_os("AUTHORITY_SIM_ORACLE_DEBUG").is_some() {
@@ -7565,6 +7566,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         // journaled for an op that another sequencer ran (an inbox refusal
         // beside the sticky holder's row), whatever answer the client heard.
         (true, "refused_and_completed", &outcome_conflicts),
+        // ADR-55 (M3): a delegation stream's indexes reach the log in order
+        // and without a gap, on every configuration (`held::plan` keeps a
+        // stream contiguous): the successor's cursor takes the highest index
+        // it sees, so a gap is skipped for good.
+        (true, "stream_log_contiguous", &stream_holes),
         // ADR-47, check 1: strict on every configuration (it judges nothing
         // without a refusal under a non-stealable grant).
         (true, "nonholder_refused_a_designee_ran", &found.fence),

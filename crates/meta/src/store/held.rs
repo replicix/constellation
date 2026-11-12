@@ -772,6 +772,13 @@ struct Walk {
     opaque_deferred: bool,
     any_held: bool,
     any_deferred: bool,
+    // ADR-55 (M3): the delegation streams (`gen` != 0) with a held or a
+    // deferred transaction. A stream's index order is an exclusive key: its
+    // later transactions are held (deferred) with it, whatever keys they
+    // touch, so that no index ships ahead of a lower one that does not (a
+    // hole in the log's stream is skipped for good by the successor's cursor).
+    held_gens: BTreeSet<u64>,
+    deferred_gens: BTreeSet<u64>,
     // The blame of each key a held or deferred transaction touched, split
     // like the taint (`Taint`): what an exclusive access of the key and a
     // merging or observing one inherit; that of every held or deferred
@@ -805,6 +812,7 @@ impl Walk {
     fn step(
         &mut self,
         tx: &Tx,
+        gen: u64,
         keys: Option<&TxKeys>,
         observed: &[Vec<u8>],
         (poisoned, pending): (&PoisonMap, &PoisonMap),
@@ -819,6 +827,7 @@ impl Walk {
         // (flex-crash seed 481).
         let held = self.opaque
             || !seeds.is_empty()
+            || (gen != 0 && self.held_gens.contains(&gen))
             || match keys {
                 Some(keys) => self.tainted.hit(keys, observed),
                 // Unknown keys: held once anything is.
@@ -826,6 +835,7 @@ impl Walk {
             };
         let deferred = !held
             && (self.opaque_deferred
+                || (gen != 0 && self.deferred_gens.contains(&gen))
                 || !seed_inos(tx, pending).is_empty()
                 || match keys {
                     Some(keys) => self.deferred_keys.hit(keys, observed),
@@ -876,6 +886,9 @@ impl Walk {
                 None => self.opaque = true,
             }
             self.any_held = true;
+            if gen != 0 {
+                self.held_gens.insert(gen);
+            }
             Class::Held
         } else if deferred {
             match keys {
@@ -883,6 +896,9 @@ impl Walk {
                 None => self.opaque_deferred = true,
             }
             self.any_deferred = true;
+            if gen != 0 {
+                self.deferred_gens.insert(gen);
+            }
             Class::Deferred
         } else {
             Class::Ship
@@ -1052,9 +1068,11 @@ fn plan(
             .and_then(|b| b.rid)
             .is_some_and(|rid| tx_rid(&tx, row.as_ref()) == Some(rid));
         let rid = tx_rid(&tx, row.as_ref());
+        let gen = row.as_ref().map_or(0, |row| row.gen);
         let observed: Vec<Vec<u8>> = row.map(|row| row.observed).unwrap_or_default();
         let (class, seeds, mine) = walk.step(
             &tx,
+            gen,
             keys.as_ref(),
             &observed,
             (poisoned, pending),
@@ -1267,9 +1285,11 @@ pub(crate) fn blame_walk(
     for tx in transactions_between(r, meta, c.through, upto)? {
         let (keys, row) = tx_keys_and_row(r, meta, &tx)?;
         let rid = tx_rid(&tx, row.as_ref());
+        let gen = row.as_ref().map_or(0, |row| row.gen);
         let observed = row.map(|row| row.observed).unwrap_or_default();
         let (class, _, waits) = c.walk.step(
             &tx,
+            gen,
             keys.as_ref(),
             &observed,
             (&c.poisoned, &c.pending),
