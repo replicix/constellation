@@ -307,7 +307,9 @@ pub(crate) struct ReadState {
 /// A strict read held for the root's grant horizon.
 #[derive(Debug)]
 struct HorizonParked {
-    at: WaitMs,
+    /// When the hold ends, whatever the writes landing meanwhile: the
+    /// arrival plus [`HORIZON_PARK_MS`], kept when the read is held again.
+    deadline: WaitMs,
     from: NodeId,
     req: OpId,
     ino: Ino,
@@ -462,10 +464,18 @@ impl Core {
             self.cancel_timer(id, out);
         }
         for p in std::mem::take(&mut self.rd.horizon_parked) {
+            // A read held again keeps its own deadline: the bound is per
+            // read, not per hold.
+            let until = may_park.then_some(p.deadline);
             self.serve_read_index(
-                now, p.from, p.req, p.ino, p.dir, p.name, p.ahead, may_park, replica, out,
+                now, p.from, p.req, p.ino, p.dir, p.name, p.ahead, until, replica, out,
             );
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_view_horizon_parked(&self) -> usize {
+        self.rd.horizon_parked.len()
     }
 
     pub fn read_view(&self) -> ReadView {
@@ -534,12 +544,16 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        self.serve_read_index(now, from, req, ino, dir, name, ahead, true, replica, out);
+        let deadline = Some(now.wait.plus(HORIZON_PARK_MS));
+        self.serve_read_index(
+            now, from, req, ino, dir, name, ahead, deadline, replica, out,
+        );
     }
 
-    /// [`Self::on_read_index`]; `may_park`: a read whose grant only the
+    /// [`Self::on_read_index`]; `park_until`: a read whose grant only the
     /// root's horizon kept back is held for the write the lane asked for
-    /// instead of being answered with its position alone.
+    /// until then, instead of being answered with its position alone
+    /// (`None`: answered at once).
     #[allow(clippy::too_many_arguments)]
     fn serve_read_index(
         &mut self,
@@ -550,7 +564,7 @@ impl Core {
         dir: bool,
         name: Option<String>,
         ahead: ReadAhead,
-        may_park: bool,
+        park_until: Option<WaitMs>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -632,18 +646,28 @@ impl Core {
             // the lane is writing it now, so hold the read for the write
             // and grant then, rather than answer a scan's first lookup
             // plain and every lookup after it until the write lands.
-            if may_park
+            if park_until.is_some_and(|d| now.wait < d)
                 && !self.rd.horizon_park_expired
                 && grant.is_none()
                 && ahead_grants.is_none()
                 && self.rd.horizon_missed
             {
-                let stale = now.wait.minus(2 * self.cfg.forward_timeout_ms);
-                self.rd.horizon_parked.retain(|p| p.at > stale);
+                // A read held past its deadline (the timer ran late: a
+                // loaded core) is answered now, plain, never dropped.
+                let (late, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.rd.horizon_parked)
+                    .into_iter()
+                    .partition(|p| p.deadline <= now.wait);
+                self.rd.horizon_parked = held;
+                for p in late {
+                    self.serve_read_index(
+                        now, p.from, p.req, p.ino, p.dir, p.name, p.ahead, None, replica, out,
+                    );
+                }
                 if self.rd.horizon_parked.len() < HORIZON_PARKED_MAX {
+                    let deadline = park_until.unwrap_or(now.wait);
                     self.stats.read_index_horizon_parked += 1;
                     self.rd.horizon_parked.push(HorizonParked {
-                        at: now.wait,
+                        deadline,
                         from,
                         req,
                         ino,
@@ -652,11 +676,7 @@ impl Core {
                         ahead,
                     });
                     if self.rd.horizon_park_timer.is_none() {
-                        let id = self.set_timer_wait(
-                            now.wait.plus(HORIZON_PARK_MS),
-                            Timer::HorizonPark,
-                            out,
-                        );
+                        let id = self.set_timer_wait(deadline, Timer::HorizonPark, out);
                         self.rd.horizon_park_timer = Some(id);
                     }
                     return;

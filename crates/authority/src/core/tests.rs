@@ -9005,6 +9005,146 @@ mod cto {
         assert!(sends(&out).is_empty(), "{out:?}");
     }
 
+    /// A listing ReadIndex of the root from node 2 (held by a cold horizon).
+    fn ask_listing(h: &mut Harness, req: u64) -> Vec<Action> {
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::ReadIndex {
+                req: OpId(req),
+                ino: ROOT_INO,
+                dir: true,
+                name: None,
+                ahead: crate::event::ReadAhead::Listing,
+            },
+        })
+    }
+
+    fn horizon_write_of(
+        out: &[Action],
+    ) -> Option<(constellation_meta::readdeleg::GrantHorizon, WaitMs)> {
+        out.iter().find_map(|a| match a {
+            Action::PersistGrantHorizon { kind, until } => Some((*kind, *until)),
+            _ => None,
+        })
+    }
+
+    fn reply_reqs(out: &[Action]) -> Vec<u64> {
+        sends(out)
+            .into_iter()
+            .map(|(_, m)| match m {
+                PeerMsg::ReadIndexReply { req, .. } => req.0,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// Expectation (fail-before: a read held longer than twice the forward
+    /// timeout was dropped without an answer when the next read was held,
+    /// so a core that ran late left its requester to time out): every held
+    /// read is answered, plain at its bound, however late the timer runs.
+    #[test]
+    fn a_held_read_past_its_bound_is_answered_never_dropped() {
+        let (mut h, _) = holder_with_files();
+        h.cold_horizon = true;
+        h.manual_horizon = true;
+        let first = ask_listing(&mut h, 1);
+        assert!(sends(&first).is_empty());
+        // The core was busy: the timer has not been delivered, and far
+        // more than the old drop age (2 x forward timeout) has passed.
+        h.advance(2 * h.core.cfg.forward_timeout_ms + 100);
+        let out = ask_listing(&mut h, 2);
+        assert_eq!(
+            reply_reqs(&out),
+            vec![1],
+            "the late read goes unanswered: {out:?}"
+        );
+        match sends(&out).as_slice() {
+            [(2, PeerMsg::ReadIndexReply { outcome, .. })] => assert!(
+                matches!(
+                    outcome,
+                    ReadIndexOutcome::Ok {
+                        grant: None,
+                        ahead: None,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        // The new one is still held, and answered by its own timer.
+        assert_eq!(h.core.read_view_horizon_parked(), 1);
+        let id = out
+            .iter()
+            .find_map(|a| match a {
+                Action::SetTimer {
+                    id,
+                    kind: TimerKind::HorizonPark,
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+            .or_else(|| {
+                first.iter().find_map(|a| match a {
+                    Action::SetTimer {
+                        id,
+                        kind: TimerKind::HorizonPark,
+                        ..
+                    } => Some(*id),
+                    _ => None,
+                })
+            })
+            .expect("a hold timer");
+        let out = h.core.handle(h.clk(), Event::Timer { id }, &h.meta);
+        assert_eq!(reply_reqs(&out), vec![2], "{out:?}");
+        assert_eq!(h.core.read_view_horizon_parked(), 0);
+    }
+
+    /// Expectation (fail-before: a landed write that was not the one the
+    /// held read needed re-held it with a fresh 100 ms timer, so one read
+    /// waited up to twice the bound): the read keeps its own deadline.
+    #[test]
+    fn a_read_held_again_keeps_its_deadline() {
+        let (mut h, _) = holder_with_files();
+        h.cold_horizon = true;
+        h.manual_horizon = true;
+        let first = ask_listing(&mut h, 1);
+        let (kind, until) = horizon_write_of(&first).expect("no horizon write asked for");
+        h.advance(50);
+        // A second read finds the write still in flight: another is wanted.
+        assert!(sends(&ask_listing(&mut h, 2)).is_empty());
+        // The write that lands covers less than the reads need now.
+        let short = WaitMs(until.0 - 3_000);
+        let durable = h.meta.persist_grant_horizon(kind, short, h.clk()).ok();
+        assert!(durable.is_some());
+        let out = h.core.handle(
+            h.clk(),
+            Event::GrantHorizonPersisted {
+                kind,
+                until,
+                durable,
+            },
+            &h.meta,
+        );
+        assert!(sends(&out).is_empty(), "answered although short: {out:?}");
+        assert_eq!(h.core.read_view_horizon_parked(), 2);
+        let (id, after_ms) = out
+            .iter()
+            .find_map(|a| match a {
+                Action::SetTimer {
+                    id,
+                    after_ms,
+                    kind: TimerKind::HorizonPark,
+                } => Some((*id, *after_ms)),
+                _ => None,
+            })
+            .expect("no hold timer after the re-hold");
+        assert_eq!(after_ms, 50, "the first read's bound ran from its arrival");
+        h.advance(50);
+        let out = h.core.handle(h.clk(), Event::Timer { id }, &h.meta);
+        assert_eq!(reply_reqs(&out), vec![1, 2], "{out:?}");
+    }
+
     /// The read-ahead of a ReadIndex: a listing's first chunk (or a lookup
     /// that misses a child's delegation) is answered with ordinary
     /// delegations on the directory's files, in name order from the entry
