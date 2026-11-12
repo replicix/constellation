@@ -68037,6 +68037,100 @@ mod step9_one_stream_per_node {
         assert_eq!(h.core.stats.delegate_refused_unshipped, 1);
     }
 
+    /// The grant is decided again under the delegation gate: a root
+    /// fast-path op of the subtree (`Meta::root_fast_path` holds the gate
+    /// shared across its ownership check and its row) that journals a row
+    /// the ship plan defers after `delegate_dir_from`'s check and before
+    /// the grant's record took the gate is not shipped behind the record.
+    /// Both a first grant (a new stream) and a grant that grows the node's
+    /// stream. Fails without the check inside the gate
+    /// (`Core::journal_grant`): the grant is made over the deferred row.
+    #[test]
+    fn a_fast_path_row_journaled_while_the_grant_waits_for_the_gate_holds_it_back() {
+        use constellation_fs_core::{ChunkInfo, Manifest};
+        use replicix_chunkfmt::{ChunkHash, ChunkLayout};
+        use std::sync::TryLockError;
+        use std::time::{Duration, Instant};
+        for grow in [false, true] {
+            let (mut h, d1) = root_with_dir();
+            let (d2, rec) = mkdir(&h, "d2");
+            crate::replica::Replica::apply_segment(&h.meta, 2, 1, 0, &[], &[], &[rec]).unwrap();
+            if grow {
+                assert!(delegate(&mut h, 899, d2, 3), "the first grant was refused");
+            }
+            let f = h.meta.create(d1, "f", 0o644, 0, 0).unwrap().ino;
+            let hash = ChunkHash::of(b"still uploading");
+            let manifest = Manifest {
+                layout: ChunkLayout::new(4096),
+                file_len: 15,
+                chunks: ChunkInfo::Inline([(0u64, hash)].into_iter().collect()),
+            }
+            .encode();
+            let clk = h.clk();
+            let meta = &h.meta;
+            let core = &mut h.core;
+            let out = std::thread::scope(|s| {
+                let (admitted, wait_admitted) = std::sync::mpsc::channel();
+                let fast = s.spawn(move || {
+                    // The fast path's admission, held across its row.
+                    let gate = meta.delegation_gate();
+                    let guard = gate.read().unwrap();
+                    admitted.send(()).unwrap();
+                    // Until the grant waits for the gate: a queued writer
+                    // admits no new reader.
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        match gate.try_read() {
+                            Err(TryLockError::WouldBlock) => break,
+                            Ok(reader) => drop(reader),
+                            Err(TryLockError::Poisoned(_)) => panic!("the gate is poisoned"),
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "the grant never took the delegation gate"
+                        );
+                        std::thread::yield_now();
+                    }
+                    // A write-back flush of `d1/f`: its chunk still uploads,
+                    // so the plan defers the row.
+                    meta.set_manifest_dirty(f, None, &manifest, 15, None, None, &[hash])
+                        .unwrap();
+                    drop(guard);
+                });
+                wait_admitted.recv().unwrap();
+                let out = core.handle(
+                    clk,
+                    Event::Control {
+                        op: OpId(900),
+                        req: Control::Delegate {
+                            dir: d1,
+                            node: 3,
+                            sticky: false,
+                        },
+                    },
+                    meta,
+                );
+                fast.join().unwrap();
+                out
+            });
+            let granted = out.iter().any(
+                |a| matches!(a, Action::ControlDone { op, result: Ok(_) } if *op == OpId(900)),
+            );
+            assert!(
+                !granted,
+                "granted over a deferred fast-path row (grow: {grow})"
+            );
+            assert_eq!(h.core.stats.delegate_refused_unshipped, 1, "grow: {grow}");
+            assert!(h.meta.delegation_table().get(d1).is_none(), "grow: {grow}");
+            // The upload is done: the grant is made.
+            h.meta.cancel_pending_upload(&hash, f).unwrap();
+            assert!(
+                delegate(&mut h, 901, d1, 3),
+                "refused once nothing held it back (grow: {grow})"
+            );
+        }
+    }
+
     /// Two subtrees granted to one node are one generation and one stream, and
     /// a rename between them is an ordinary op of that stream: the root
     /// forwards it to the delegate and recalls nothing. On the parent the

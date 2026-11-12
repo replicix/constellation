@@ -2017,21 +2017,60 @@ impl Core {
         if bound <= self.ack.shipped_through.max(acked) {
             return false;
         }
-        let Ok(rows) = replica.journal_root_rows_through(bound) else {
+        // The plan first: two reads when no chunk is poisoned or pending,
+        // and then no row is held back and the journal is not scanned
+        // (this runs again under the delegation gate, `journal_grant`).
+        let Ok(back) = replica.journal_held_back() else {
             // (The journal could not be read: not decided.)
             return true;
         };
-        let mut rows = rows
-            .iter()
-            .filter(|(first, keys)| !self.archive_covers(*first, acked) && under(keys))
-            .peekable();
-        if rows.peek().is_none() {
+        let Some(&lowest) = back.first() else {
+            return false;
+        };
+        if lowest > bound {
             return false;
         }
-        match replica.journal_held_back() {
-            Ok(back) => rows.any(|(first, _)| back.contains(first)),
-            Err(_) => true,
+        let Ok(rows) = replica.journal_root_rows_through(bound) else {
+            return true;
+        };
+        rows.iter().any(|(first, keys)| {
+            back.contains(first) && !self.archive_covers(*first, acked) && under(keys)
+        })
+    }
+
+    /// Journal the `DelegateNode` record `rec` that grants (or grows a
+    /// stream by) `dir`. A grant to another node is decided once more under
+    /// the delegation gate, which the root's fast path holds shared across
+    /// its ownership check and its row: a fast-path row of the subtree that
+    /// the ship plan holds or defers, journaled after `delegate_dir_from`'s
+    /// check, would otherwise ship after the record
+    /// ([`Self::root_rows_unshipped_under`]). The root's own grant has R-H
+    /// (b) for this.
+    fn journal_grant(
+        &mut self,
+        rec: LogRecord,
+        dir: Ino,
+        node: NodeId,
+        replica: &dyn Replica,
+    ) -> Result<(), String> {
+        let _class = self.journal_class();
+        constellation_meta::clear_last_journaled();
+        if node == self.me() {
+            return replica
+                .apply_records_journaled(&[rec], None)
+                .map_err(|e| e.to_string());
         }
+        let this = &*self;
+        let journaled = replica
+            .apply_grant_journaled(&[rec], &mut || this.root_rows_unshipped_under(dir, replica))
+            .map_err(|e| e.to_string())?;
+        if !journaled {
+            self.stats.delegate_refused_unshipped += 1;
+            return Err(format!(
+                "a row of this root under directory {dir} is held back from the log"
+            ));
+        }
+        Ok(())
     }
 
     /// R-H, once per event: decide the own streams not honoured yet, and
@@ -12394,14 +12433,12 @@ impl Core {
         let gen = replica
             .next_delegation_gen(epoch, highest + 1)
             .map_err(|e| e.to_string())?;
-        let _class = self.journal_class();
-        constellation_meta::clear_last_journaled();
-        replica
-            .apply_records_journaled(
-                &[LogRecord::delegate_one(node, gen, dir, kind.subtree_kind())],
-                None,
-            )
-            .map_err(|e| e.to_string())?;
+        self.journal_grant(
+            LogRecord::delegate_one(node, gen, dir, kind.subtree_kind()),
+            dir,
+            node,
+            replica,
+        )?;
         if own {
             self.note_own_grant_row(gen, replica);
             self.dl.own_minted.insert(gen);
@@ -12604,14 +12641,12 @@ impl Core {
         out: &mut Vec<Action>,
     ) -> Result<u64, String> {
         let node = self.dl.gens[&gen].node;
-        let _class = self.journal_class();
-        constellation_meta::clear_last_journaled();
-        replica
-            .apply_records_journaled(
-                &[LogRecord::delegate_one(node, gen, dir, kind.subtree_kind())],
-                None,
-            )
-            .map_err(|e| e.to_string())?;
+        self.journal_grant(
+            LogRecord::delegate_one(node, gen, dir, kind.subtree_kind()),
+            dir,
+            node,
+            replica,
+        )?;
         if node == self.me() {
             self.note_own_grant_row(gen, replica);
         }
