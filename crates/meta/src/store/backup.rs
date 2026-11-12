@@ -346,15 +346,33 @@ impl Meta {
                 continue;
             }
             if t.records.is_empty() {
-                if let Some(o) = reaches.filter(|o| o.records.is_empty()) {
-                    // A hole that begins inside a stored one (a resend from a
-                    // boundary inside a span its journal no longer has): one
-                    // hole over both, keyed where the stored one begins.
+                // One hole writer (ADR-59 part B): a hole that begins inside a
+                // stored one (a resend from a boundary inside a span its
+                // journal no longer has), or lies inside a wider one keyed
+                // where it begins (a resend of a narrower hole over the wider
+                // one that merged it with the rows after it), is one hole over
+                // both, keyed where the stored one begins. The wider never
+                // shrinks: the late copies it spans stay gone.
+                let below_hole = reaches.filter(|o| o.records.is_empty());
+                let wider = inside
+                    .iter()
+                    .map(|(_, o)| o)
+                    .filter(|o| o.records.is_empty() && o.last > t.last)
+                    .max_by_key(|o| o.last);
+                if below_hole.is_some() || wider.is_some() {
+                    let starts = below_hole.unwrap_or(t);
                     let merged = BackupTx {
-                        first: o.first,
-                        last: o.last.max(t.last),
+                        first: starts.first,
+                        last: t
+                            .last
+                            .max(below_hole.map_or(0, |o| o.last))
+                            .max(wider.map_or(0, |o| o.last)),
                         records: Vec::new(),
-                        origin: o.origin,
+                        origin: match (below_hole, wider) {
+                            (Some(o), _) => o.origin,
+                            (None, Some(w)) if w.first == t.first => w.origin,
+                            _ => t.origin,
+                        },
                     };
                     debug_assert!(
                         inside.iter().all(|(_, i)| i.last <= merged.last),
