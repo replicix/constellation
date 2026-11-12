@@ -5907,7 +5907,11 @@ fn regression_a_readoption_landing_after_a_seal_is_not_served() {
 /// missing from the log. The loser's CAS could only fail (the lease it read
 /// was replaced), so no data was at risk, but the merge ran on a log that had
 /// moved on. The attempt ends now (`kept_overtaken`). Fails before: the
-/// assertion, in a debug build; in release the counter is 0.
+/// assertion, in a debug build; in release the counter is 0. (Of the first
+/// 1,300 seeds of these three configurations only these four overtake now:
+/// `backup-strict` 173 and 517 stopped when a read the root's grant horizon
+/// does not cover began to wait for the horizon write, and 1134 is the one
+/// `backup-strict` seed left.)
 #[test]
 fn regression_a_claim_overtaken_during_its_kept_fetch_ends() {
     let slow = || SimConfig {
@@ -5915,8 +5919,7 @@ fn regression_a_claim_overtaken_during_its_kept_fetch_ends() {
         ..backup_crash_config()
     };
     for (seed, cfg, alias) in [
-        (173u64, backup_strict_config(), "backup-strict"),
-        (517, backup_strict_config(), "backup-strict"),
+        (1134u64, backup_strict_config(), "backup-strict"),
         (
             1134,
             strict(backup_strict_config(), "commit"),
