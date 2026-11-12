@@ -2308,10 +2308,15 @@ impl Meta {
             rolled_back.push(rid);
         }
         // Replays of this inode's manifest already queued by an earlier
-        // deposition: the same treatment.
+        // deposition: the same treatment. Not a shadow a delegate accepted
+        // (`gen` other than 0): its row is the delegate's, which re-streams
+        // it to the root or ends the generation, and refusing the local copy
+        // rolls nothing back that the record names. The log carries the
+        // delegate's row, or the entry replays here once the generation
+        // ends and its journaled row is a later drop's seed.
         let mut queued_dropped = 0;
         for queued in spec::read_pending_replays(&tx, self)? {
-            if queued.refused.is_some() {
+            if queued.refused.is_some() || queued.gen != 0 {
                 continue;
             }
             let (m, manifest, size) = match &queued.op {
