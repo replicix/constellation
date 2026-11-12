@@ -3396,6 +3396,23 @@ impl Core {
             self.send_forward(now, rid, 0, 0, replica, out);
             return true;
         }
+        // ADR-54/55: an op of this node's own that was sent to the sequencer
+        // may have run there (a parked outcome, a slow reply). It is neither
+        // run nor settled under this node's grant unless the sequencer said
+        // it is ours and has not run it: the root skips the delegate's copy
+        // of a completed rid, so the delegate's row would never be retired
+        // and its stream would have a hole. It is asked at the root again.
+        // (After the inbox rule's withdrawal above, which offers the op again.)
+        if from == 0 && self.clients.get(&rid).is_some_and(|c| !c.may_run_here()) {
+            self.stats.deleg_retry_asked_root += 1;
+            tracing::debug!(
+                node = self.me(),
+                ?rid,
+                settle,
+                "an op sent to the sequencer is not run under this node's grant: asked again"
+            );
+            return false;
+        }
         // Fence C9.2: an inbox-ever forward under a non-stealable generation
         // is refused in this generation's stream, whatever its route.
         let refuse_in_stream = self.refuses_in_stream(from, gen, fence, settle);
@@ -3445,12 +3462,7 @@ impl Core {
                     to: from,
                     msg: PeerMsg::MutateReply {
                         req,
-                        outcome: MutateOutcome::Held {
-                            retry_ms: left.min(self.cfg.forward_timeout_ms).max(1),
-                            outwait_ms: None,
-                            lost_chunk: false,
-                            yours: false,
-                        },
+                        outcome: MutateOutcome::held(left.min(self.cfg.forward_timeout_ms).max(1)),
                         base: None,
                         position: Position::ZERO,
                         // A delegate's: no lease holder to cache from it.
@@ -3748,12 +3760,7 @@ impl Core {
                     to: from,
                     msg: PeerMsg::MutateReply {
                         req,
-                        outcome: MutateOutcome::Held {
-                            retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
-                            outwait_ms: None,
-                            lost_chunk: false,
-                            yours: false,
-                        },
+                        outcome: MutateOutcome::held(self.cfg.delegation_stream_tick_ms.max(10)),
                         base: None,
                         position: Position::ZERO,
                         // A delegate's: no lease holder to cache from it.
@@ -5830,12 +5837,7 @@ impl Core {
                             to: p.from,
                             msg: PeerMsg::MutateReply {
                                 req,
-                                outcome: MutateOutcome::Held {
-                                    retry_ms: self.cfg.recall_hold_ms.max(50),
-                                    outwait_ms: None,
-                                    lost_chunk: false,
-                                    yours: false,
-                                },
+                                outcome: MutateOutcome::held(self.cfg.recall_hold_ms.max(50)),
                                 base: None,
                                 position: Position::ZERO,
                                 gen,

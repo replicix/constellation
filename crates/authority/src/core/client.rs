@@ -145,6 +145,23 @@ pub(crate) enum SettleUntil {
     Window,
 }
 
+/// What an op's sends to a possible sequencer say about running it on this
+/// node under a delegation of its keys (ADR-54/55).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Sent {
+    /// Never sent (or into an inbox): nothing ran elsewhere.
+    #[default]
+    Never,
+    /// Sent to a holder at least once: it may have taken effect there. A
+    /// delegation of its keys does not run it, and a settle does not decide
+    /// it here (the delegate's copy of the row would be skipped by the root,
+    /// which has the rid completed, and never retired).
+    MayHaveRun,
+    /// The sequencer's last answer was a `Held` saying the op is this node's
+    /// own to run and that it has not run it (`MutateOutcome::Held::yours`).
+    SequencerSaysMine,
+}
+
 #[derive(Debug)]
 pub(crate) struct ClientOp {
     pub op: MutateOp,
@@ -183,11 +200,6 @@ pub(crate) struct ClientOp {
     /// behind a lost chunk: its unsettled `EIO` is labelled
     /// `held-behind-lost-chunk` (`take_unsettled_lost_chunk`).
     pub lost_chunk_held: bool,
-    /// The sequencer's last answer was a `Held` that says the op is this
-    /// node's own to run (`MutateOutcome::Held::yours`). An op sent to the
-    /// sequencer without that word may have run there, and a delegation that
-    /// installs on its keys meanwhile does not run it again.
-    pub sequencer_says_mine: bool,
     /// A delegate executed the op and said so (`Accepted` with its
     /// generation): what the op still lacks is the commit of the delegate's
     /// rows through the root (it awaits the log). The sim judges its
@@ -217,10 +229,10 @@ pub(crate) struct ClientOp {
     /// answering generation, since the last reset of `attempts`; past two
     /// the op is routed afresh.
     pub fence_bounces: u32,
-    /// Sent to a holder at least once (or into an inbox): it may have
-    /// taken effect there, so every later local execution first checks
-    /// `completed`.
-    pub forwarded: bool,
+    /// What the op's sends to a possible sequencer say about running it
+    /// here: see [`Sent`]. Set only through [`ClientOp::mark_sent`] and
+    /// [`ClientOp::sequencer_says_mine`].
+    pub sent: Sent,
     pub acquire_retries: u32,
     pub deadline: crate::ids::TimerId,
     /// Plan 43 C7b: the deadline was moved once to cover this node's own
@@ -312,6 +324,37 @@ pub(crate) struct ClientOp {
     /// route adds later is not among them: a settle never executes, and its
     /// tombstone would take the settle away.
     pub withdraw_keys: Vec<constellation_store_s3::inbox::InboxKey>,
+}
+
+impl ClientOp {
+    /// Sent to a holder or an inbox at least once.
+    pub(crate) fn forwarded(&self) -> bool {
+        self.sent != Sent::Never
+    }
+
+    /// A send to a possible sequencer starts: whatever it said before no
+    /// longer covers this one.
+    pub(crate) fn mark_sent(&mut self) {
+        self.sent = Sent::MayHaveRun;
+    }
+
+    /// The sequencer said the op is this node's own and not run.
+    pub(crate) fn sequencer_says_mine(&mut self) {
+        self.sent = Sent::SequencerSaysMine;
+    }
+
+    /// Take that word back (any other answer): the op may have run.
+    pub(crate) fn unsay_mine(&mut self) {
+        if self.sent == Sent::SequencerSaysMine {
+            self.sent = Sent::MayHaveRun;
+        }
+    }
+
+    /// Whether a delegation of the op's keys on this node may run or settle
+    /// it here.
+    pub(crate) fn may_run_here(&self) -> bool {
+        self.sent != Sent::MayHaveRun
+    }
 }
 
 /// Chunk metered-own-rows: an observed position's pending upload
@@ -620,7 +663,7 @@ impl Core {
         // ADR-47: executed locally under no generation this node can name
         // (the fast path): its send history is unknown.
         if let Some(c) = self.clients.get_mut(&rid) {
-            c.forwarded = true;
+            c.mark_sent();
             c.touched_gen = TOUCHED_UNKNOWN;
             return;
         }
@@ -823,7 +866,11 @@ impl Core {
                 inbox_ever,
                 touched_local: false,
                 fence_bounces: 0,
-                forwarded: in_doubt,
+                sent: if in_doubt {
+                    Sent::MayHaveRun
+                } else {
+                    Sent::Never
+                },
                 acquire_retries: 0,
                 deadline,
                 deadline_extended: false,
@@ -848,7 +895,6 @@ impl Core {
                 gate_recall_wait: false,
                 designation_held: false,
                 lost_chunk_held: false,
-                sequencer_says_mine: false,
                 accepted_by_delegate: false,
                 settle_withdraw_failed: false,
                 withdraw: None,
@@ -1666,7 +1712,7 @@ impl Core {
         }
         c.phase = Phase::Forwarded { req, holder };
         c.timer = Some(timer);
-        c.forwarded = true;
+        c.mark_sent();
         let deps = c.deps;
         self.by_req.insert(req, rid);
         out.push(Action::Send {
@@ -1796,7 +1842,7 @@ impl Core {
             let Some(c) = self.clients.get_mut(&rid) else {
                 return;
             };
-            c.forwarded = true;
+            c.mark_sent();
             c.redirected = 0;
         }
         let Some(c) = self.clients.get_mut(&rid) else {
@@ -1845,12 +1891,12 @@ impl Core {
             "forward reply"
         );
         if !matches!(&outcome, MutateOutcome::Held { .. }) {
-            if let Some(c) = self.clients.get_mut(&rid) {
-                c.sequencer_says_mine = false;
-            }
             // ADR-58 C3: only a `Held` that says so labels a settle.
-            if let Some(c) = self.clients.get_mut(&rid).filter(|c| c.settle) {
-                c.lost_chunk_held = false;
+            if let Some(c) = self.clients.get_mut(&rid) {
+                c.unsay_mine();
+                if c.settle {
+                    c.lost_chunk_held = false;
+                }
             }
         }
         if matches!(&outcome, MutateOutcome::Accepted { .. }) {
@@ -2090,13 +2136,17 @@ impl Core {
             } => {
                 // The last `Held`'s word on whose the op is
                 // (`MutateOutcome::Held::yours`).
+                // (A later `Held` that does not say it, or any other answer,
+                // takes the labels back.)
                 if let Some(c) = self.clients.get_mut(&rid) {
-                    c.sequencer_says_mine = yours;
-                }
-                // (The last `Held`'s word: a later `Held` that does not say
-                // it, or any other answer, takes the label back.)
-                if let Some(c) = self.clients.get_mut(&rid).filter(|c| c.settle) {
-                    c.lost_chunk_held = lost_chunk || self.cfg.lost_chunk_label_always;
+                    if yours {
+                        c.sequencer_says_mine();
+                    } else {
+                        c.unsay_mine();
+                    }
+                    if c.settle {
+                        c.lost_chunk_held = lost_chunk || self.cfg.lost_chunk_label_always;
+                    }
                 }
                 // Plan 30 §M8: executed; the holder is recalling read
                 // delegations before it acknowledges. Ask again (same
@@ -2434,7 +2484,6 @@ impl Core {
             let own = self
                 .clients
                 .get(&rid)
-                .filter(|c| !c.forwarded || c.sequencer_says_mine)
                 .map(|c| (c.op.clone(), c.deps, c.settle));
             if let Some((op, deps, settle)) = own {
                 let tag = self
@@ -2860,7 +2909,7 @@ impl Core {
         let Some(c) = self.clients.get(&rid) else {
             return;
         };
-        let sent = c.forwarded || c.attempts > 0 || c.touched_gen != 0;
+        let sent = c.forwarded() || c.attempts > 0 || c.touched_gen != 0;
         if matches!(c.origin, Origin::Replay { .. }) {
             self.finish_in_doubt(now, rid, replica, out);
             return;
@@ -3124,7 +3173,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) -> MutateOutcome {
         let (in_doubt, settle) = self.clients.get(&rid).map_or((false, false), |c| {
-            (c.forwarded || c.attempts > 0 || c.settle, c.settle)
+            (c.forwarded() || c.attempts > 0 || c.settle, c.settle)
         });
         if in_doubt {
             if let Some(outcome) =
@@ -3199,12 +3248,7 @@ impl Core {
         // (A settle has no effect to order after this node's replays.)
         if !settle && self.hold_for_lost_deps(now, rid, replica, out) {
             // Held (`finish` leaves a held op alone).
-            return MutateOutcome::Held {
-                retry_ms: 0,
-                outwait_ms: None,
-                lost_chunk: false,
-                yours: false,
-            };
+            return MutateOutcome::held(0);
         }
         self.execute_local(now, rid, epoch, replica, out)
     }
@@ -4468,7 +4512,7 @@ impl Core {
         if c.phase == Phase::Recalling && !unexecuted {
             // Executed here, never acknowledged: the resubmission is in
             // doubt (it must find the completion, not run again).
-            c.forwarded = true;
+            c.mark_sent();
         }
         if let Phase::Forwarded { req, .. } = c.phase {
             self.by_req.remove(&req);
@@ -4507,7 +4551,7 @@ impl Core {
         // (Nothing of it executed here either: no row of the rid in this
         // node's journal or `recent`, no `completed` row — a belt over
         // `forwarded`, which every path that executes the op here sets.)
-        if !c.forwarded
+        if !c.forwarded()
             && c.attempts == 0
             && c.inbox_keys.is_empty()
             && replica.recent_outcome(rid).is_none()
@@ -5194,7 +5238,7 @@ impl Core {
         let acked_through = self.acked.floor();
         let c = self.clients.get_mut(&rid).expect("present");
         c.probe = Some((req, node, now.wait));
-        c.forwarded = true;
+        c.mark_sent();
         let (deps, op, tag) = (c.deps, c.op.clone(), c.tag.clone());
         let (settle, touched_gen, inbox_ever) = (c.settle, c.touched_gen, c.inbox_ever);
         self.by_req.insert(req, rid);
@@ -5648,7 +5692,7 @@ impl Core {
                 if rid.node == self.cfg.node_id && rid.incarnation == self.cfg.incarnation {
                     self.acked.mark_done(rid.seq);
                 }
-                if c.forwarded || c.attempts > 0 {
+                if c.forwarded() || c.attempts > 0 {
                     self.in_doubt_rids.insert(rid);
                     if c.touched_gen != 0 {
                         self.in_doubt_touched.insert(rid, c.touched_gen);

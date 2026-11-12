@@ -243,12 +243,7 @@ impl Core {
                     to: from,
                     msg: PeerMsg::MutateReply {
                         req,
-                        outcome: MutateOutcome::Held {
-                            retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
-                            outwait_ms: None,
-                            lost_chunk: false,
-                            yours: false,
-                        },
+                        outcome: MutateOutcome::held(self.cfg.delegation_stream_tick_ms.max(10)),
                         base: None,
                         position: Position::ZERO,
                         gen: 0,
@@ -294,12 +289,9 @@ impl Core {
                         to: from,
                         msg: PeerMsg::MutateReply {
                             req,
-                            outcome: MutateOutcome::Held {
-                                retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
-                                outwait_ms: None,
-                                lost_chunk: false,
-                                yours: false,
-                            },
+                            outcome: MutateOutcome::held(
+                                self.cfg.delegation_stream_tick_ms.max(10),
+                            ),
                             base: None,
                             position: Position::ZERO,
                             // A delegate's: it says nothing about the lease
@@ -325,12 +317,7 @@ impl Core {
                     // running: the requester retries without spending an
                     // attempt (a `Busy` would send it to the lease path).
                     self.stats.gate_settles_held += 1;
-                    MutateOutcome::Held {
-                        retry_ms: self.cfg.recall_hold_ms.max(50),
-                        outwait_ms: None,
-                        lost_chunk: false,
-                        yours: false,
-                    }
+                    MutateOutcome::held(self.cfg.recall_hold_ms.max(50))
                 }
                 GateSettle::Redirect(holder, redirect_gen) => {
                     // Plan 46 M0.3 (S5, ADR-42): the key belongs to a live
@@ -360,12 +347,7 @@ impl Core {
                     // a predecessor's read delegate may still serve the old
                     // state), and an `Abandoned` never for an op that ran.
                     self.stats.gate_settles_held_executed += 1;
-                    MutateOutcome::Held {
-                        retry_ms: self.cfg.recall_hold_ms.max(50),
-                        outwait_ms: None,
-                        lost_chunk: false,
-                        yours: false,
-                    }
+                    MutateOutcome::held(self.cfg.recall_hold_ms.max(50))
                 }
                 GateSettle::Answer(epoch) => {
                     self.stats.gate_settles_answered += 1;
@@ -405,23 +387,13 @@ impl Core {
                 );
             if recalling && settle {
                 self.stats.gate_settles_held += 1;
-                MutateOutcome::Held {
-                    retry_ms: self.cfg.recall_hold_ms.max(50),
-                    outwait_ms: None,
-                    lost_chunk: false,
-                    yours: false,
-                }
+                MutateOutcome::held(self.cfg.recall_hold_ms.max(50))
             } else if !self.lease.releasing && req != OpId(0) && self.readopting() {
                 // A-1: the gate of a re-adoption started for a forward;
                 // the requester keeps retrying (a `Busy` would spend its
                 // retries and send it to a lease path it may not have).
                 self.stats.readopt_for_forward += 1;
-                MutateOutcome::Held {
-                    retry_ms: self.cfg.recall_hold_ms.max(50),
-                    outwait_ms: None,
-                    lost_chunk: false,
-                    yours: false,
-                }
+                MutateOutcome::held(self.cfg.recall_hold_ms.max(50))
             } else {
                 MutateOutcome::Busy
             }
@@ -522,7 +494,7 @@ impl Core {
                     // row yet, and would run the op.
                     answered_from_outcome = redirects
                         && self.rid_has_outcome(rid, replica)
-                        && (non_stealable || self.rid_refused_here(rid, replica));
+                        && (non_stealable || from == d.node || self.rid_refused_here(rid, replica));
                     if answered_from_outcome {
                         self.stats.redirect_answered_from_outcome += 1;
                     }
@@ -541,11 +513,16 @@ impl Core {
                         }
                         let redirect_gen = if from == d.node { 0 } else { d.gen };
                         let outcome = if from == d.node {
+                            // ADR-54/55: `yours` only once the root has
+                            // checked that it did not run the rid: it has no
+                            // outcome here (`answered_from_outcome` above,
+                            // for a delegate's own op) and no executed
+                            // answer parked for it.
                             MutateOutcome::Held {
                                 retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
                                 outwait_ms: None,
                                 lost_chunk: false,
-                                yours: true,
+                                yours: !self.rid_answer_parked(rid),
                             }
                         } else {
                             MutateOutcome::NotHolder { holder: d.node }
@@ -593,12 +570,9 @@ impl Core {
                                 to: from,
                                 msg: PeerMsg::MutateReply {
                                     req,
-                                    outcome: MutateOutcome::Held {
-                                        retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
-                                        outwait_ms: None,
-                                        lost_chunk: false,
-                                        yours: false,
-                                    },
+                                    outcome: MutateOutcome::held(
+                                        self.cfg.delegation_stream_tick_ms.max(10),
+                                    ),
                                     base: None,
                                     position: Position::ZERO,
                                     // A delegate's: no lease holder to cache.
@@ -835,12 +809,7 @@ impl Core {
             // (S3, and with its S3 cut, nowhere); this node re-adopts the
             // lease instead and the requester retries by rid meanwhile.
             self.stats.readopt_for_forward += 1;
-            MutateOutcome::Held {
-                retry_ms: self.cfg.recall_hold_ms.max(50),
-                outwait_ms: None,
-                lost_chunk: false,
-                yours: false,
-            }
+            MutateOutcome::held(self.cfg.recall_hold_ms.max(50))
         } else {
             let holder = self.lease.cached_holder.unwrap_or(0);
             if holder == 0 || holder == self.cfg.node_id {

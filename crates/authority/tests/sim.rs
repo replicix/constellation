@@ -20832,8 +20832,9 @@ fn a_release_row_the_old_root_never_appended_does_not_strand_the_holders_rows() 
 /// root skips the delegate's copy (its rid is completed there), so nothing
 /// retired the delegate's journal row (the run never went quiet: 11 of the
 /// first 400 seeds) and the log's stream of the grant had a hole
-/// (`stream_log_contiguous`). Seeds 27 and 83 are the held reply, 136 and 329
-/// the slow one; the others of the first 400 are of the same class.
+/// (`stream_log_contiguous`). All 11 seeds below failed on 77b3a43a (nine by
+/// quiescence, two, 27 and 136, also by the oracle once quiescent) and pass
+/// now; 27 and 83 are the held reply, 136 and 329 the slow one.
 #[test]
 fn a_forward_the_root_ran_is_not_run_again_by_a_grant_that_installs() {
     for seed in [27, 83, 101, 136, 196, 205, 231, 247, 268, 329, 347] {

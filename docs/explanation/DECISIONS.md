@@ -4926,6 +4926,18 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
   `root_sticky_on_slash`, `deposed_root_strands_own_stream`,
   `root_executes_under_own_grant`, `own_stream_honours_on_record`.
 
+A delegation never runs or settles an op it may have run twice. An op this node
+sent to the sequencer may have run there (its outcome parked for durability, or a
+slow or lost reply). When a grant of its keys installs here, the op is not run, and
+a settle does not journal an abandon for it: the root skips a delegate's copy of a
+completed rid, so the copy would never be retired and the grant's stream would have
+a hole. The op is asked at the root again (`ClientOp::may_run_here`,
+`deleg_retry_asked_root`). The root answers a delegate's own op from the rid's
+outcome if it has one, or, only if it has run nothing and holds nothing for the rid,
+with `Held { yours: true }`; that word, and only the latest one, lets the delegate run
+it. Under a partition from the root such an op ends at its deadline instead of
+running (it is in doubt: the root may have run it).
+
 **Consequences**: the root's own ops in its subtrees run at local speed after one
 archive wait per grant (the record); ops in `/` and in other nodes' subtrees
 still wait for the archive; a root's death blocks its own sticky subtrees (they
