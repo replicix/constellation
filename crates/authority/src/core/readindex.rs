@@ -1280,7 +1280,16 @@ impl Core {
                 }
                 self.stats.drops_applied += 1;
                 self.stats.drop_follow_ups += dropped.follow_ups as u64;
-                for rid in dropped.placeholders.clone() {
+                // D3: no client waits for a retry to learn the refusal: every
+                // park of a rid the drop refused or rolled back is settled
+                // now (the retry meets the `Refused` row).
+                for rid in dropped
+                    .placeholders
+                    .iter()
+                    .chain(&dropped.refused)
+                    .copied()
+                    .collect::<Vec<_>>()
+                {
                     self.abort_parked_answer_of(now, rid, replica, out);
                 }
                 if let Some(op) = op {
@@ -1366,19 +1375,32 @@ impl Core {
     /// answer has certainly not left this node (plan 46 M0.2 review: what
     /// makes a group row's drop a placeholder).
     pub(crate) fn answer_parked(&self, rid: Rid) -> Option<u64> {
-        let &id = self.rd.parked_rids.get(&rid)?;
-        matches!(
-            self.rd.parked.get(&id),
-            Some(Parked {
-                durable: Some(_),
-                what: ParkedWhat::Reply {
-                    completed: Some(_),
+        if let Some(&id) = self.rd.parked_rids.get(&rid) {
+            if matches!(
+                self.rd.parked.get(&id),
+                Some(Parked {
+                    durable: Some(_),
+                    what: ParkedWhat::Reply {
+                        completed: Some(_),
+                        ..
+                    },
                     ..
-                },
-                ..
-            })
-        )
-        .then_some(id)
+                })
+            ) {
+                return Some(id);
+            }
+        }
+        // ADR-59 part B (D3): an own client's `Finish` parked for durability
+        // is an answer that has not left either (a settle's own refusal is
+        // no executed op's answer).
+        self.rd.parked.iter().find_map(|(id, p)| {
+            (p.durable.is_some()
+                && matches!(
+                &p.what,
+                ParkedWhat::Finish { rid: r, outcome: MutateOutcome::Accepted { .. }, .. } if *r == rid
+            ))
+            .then_some(*id)
+        })
     }
 
     /// The forwarded ops parked here unexecuted (`ExecuteReply`): their
@@ -2576,6 +2598,8 @@ impl Core {
         let mut cache = super::delegate::StreamCache::default();
         let mut dropped: Vec<u64> = Vec::new();
         let mut gone: Vec<u64> = Vec::new();
+        // (park id, code): answers released as the refusal the store holds.
+        let mut refused: Vec<(u64, Code)> = Vec::new();
         let ready: Vec<u64> = self
             .rd
             .parked
@@ -2615,8 +2639,13 @@ impl Core {
                             }
                         }
                     });
-                // Plan 43 C2f: an answer about to leave whose row was rolled
-                // back while it waited (read once, at the release).
+                // ADR-59 part B (D3), over Plan 43 C2f: an answer about to
+                // leave is what the store says at that moment, never a
+                // snapshot taken earlier. `Executed` as it was parked:
+                // released as it is. `Refused` (a drop rolled the row back
+                // and refused its rid while the answer waited): the client
+                // is told the refusal, not `Ok`. No outcome (the row is
+                // gone, the retry meets the log): aborted.
                 if let (
                     true,
                     Some(_),
@@ -2627,9 +2656,15 @@ impl Core {
                     },
                 ) = (ready, p.durable, &p.what)
                 {
-                    if replica.completed_outcome(*rid).ok().flatten() != Some(*c) {
-                        gone.push(**id);
-                        return false;
+                    match replica.completed_outcome(*rid).ok().flatten() {
+                        Some(now) if now == *c => {}
+                        Some(constellation_meta::CompletedOutcome::Refused { code }) => {
+                            refused.push((**id, code));
+                        }
+                        _ => {
+                            gone.push(**id);
+                            return false;
+                        }
                     }
                 }
                 // Plan 46 M1.1 step 5: the same for an own client's answer
@@ -2637,14 +2672,23 @@ impl Core {
                 // (the archive past a change of the lease): its row was
                 // rolled back (`repair drop-held`) while it waited, no
                 // outcome is left, and the log passing its seq is no commit
-                // (`drop-held-chain-backed` seed 592).
-                if let (true, Some(_), ParkedWhat::Finish { rid, .. }) = (ready, p.durable, &p.what)
+                // (`drop-held-chain-backed` seed 592). ADR-59 part B (D3): a
+                // refusal the drop wrote for the rid is the answer.
+                if let (true, Some(_), ParkedWhat::Finish { rid, outcome, .. }) =
+                    (ready, p.durable, &p.what)
                 {
-                    if replica.journal_class_of_rid(*rid).is_none()
-                        && replica.completed_outcome(*rid).ok().flatten().is_none()
-                    {
-                        gone.push(**id);
-                        return false;
+                    match replica.completed_outcome(*rid).ok().flatten() {
+                        // (A settle's own refusal is its answer already.)
+                        Some(constellation_meta::CompletedOutcome::Refused { code })
+                            if matches!(outcome, MutateOutcome::Accepted { .. }) =>
+                        {
+                            refused.push((**id, code));
+                        }
+                        None if replica.journal_class_of_rid(*rid).is_none() => {
+                            gone.push(**id);
+                            return false;
+                        }
+                        _ => {}
                     }
                 }
                 ready
@@ -2666,9 +2710,17 @@ impl Core {
             // continuation run earlier in this loop (a `finish`, which
             // re-enters `release_gated`) may have completed or replaced
             // later entries.
-            let Some(p) = self.rd.parked.remove(&id) else {
+            let Some(mut p) = self.rd.parked.remove(&id) else {
                 continue;
             };
+            if let Some((_, code)) = refused.iter().find(|(i, _)| *i == id) {
+                self.stats.answers_refused_at_release += 1;
+                if let ParkedWhat::Reply { outcome, .. } | ParkedWhat::Finish { outcome, .. } =
+                    &mut p.what
+                {
+                    *outcome = MutateOutcome::Errno(*code);
+                }
+            }
             // Plan 43 C2 (§3.3): an index answered under the delegation's
             // group: what `removal_safe` must keep covered.
             if let Some((g, i)) = p.stream_need {
@@ -2763,7 +2815,6 @@ impl Core {
             // answer can claim neither that class (nothing committed the
             // row) nor `Lone` (not recorded), so the op is answered `EIO`
             // (the C1-2/C1-3 review).
-            let mut p = p;
             if held_for_remote {
                 if let Some(j) = row {
                     if let Err(error) =
