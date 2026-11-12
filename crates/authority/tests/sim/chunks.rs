@@ -51,9 +51,12 @@ pub struct DropCounts {
     pub drops: u64,
     /// Rows rolled back and queued for replay.
     pub requeued: u64,
-    /// Of the rows rolled back, those that depend on the damaged inode's own
-    /// keys (`DroppedHeld::rolled_back_on_inode`).
-    pub on_inode: u64,
+    /// Held rows the drop redid in place (`DroppedHeld::redone`).
+    pub redone: u64,
+    /// Acknowledged operations the drops listed as lost (`acked_lost`).
+    pub acked_lost: u64,
+    /// ADR-59 part B: follow-up decisions (expected 0).
+    pub follow_ups: u64,
     /// Drops by a node that was not the sequencer in force.
     pub non_sequencer: u64,
 }
@@ -98,10 +101,10 @@ pub struct ChunkWorld {
     /// The rids of the drops whose dropper was not the sequencer in force
     /// (`DroppedHeld::non_sequencer`): a deposition's strand, not a drop's.
     pub dropped_by_non_sequencer: Mutex<BTreeSet<constellation_meta::Rid>>,
-    /// The rids the drops attributed to the damaged inode
-    /// (`DroppedHeld::rolled_back_on_inode`): the operator's cost of a lost
-    /// chunk, which part A of the ADR does not yet avoid.
-    pub dropped_on_inode: Mutex<BTreeSet<constellation_meta::Rid>>,
+    /// The rids the drops reported as acknowledged and lost (`acked_lost`):
+    /// the double fault of a lost chunk plus an acknowledged operation that
+    /// needs it (`drop_acked_loss_invisible`).
+    pub acked_lost_rids: Mutex<BTreeSet<constellation_meta::Rid>>,
     /// Own pending rows found without bytes anywhere (a replay's adopted
     /// manifest of a departed node's chunk): marked unrecoverable.
     pub poisoned: AtomicU64,

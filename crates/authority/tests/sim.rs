@@ -6359,22 +6359,23 @@ fn drop_held_chain_requester_dies_config() -> SimConfig {
 /// dependents were held behind them, ops were parked behind the queue,
 /// and, with the requester dead, the bound settled placeholders as
 /// abandoned.
+///
+/// ADR-59: a drop rolls back only the rows that need the lost content, so a
+/// seed queues fewer placeholders than it did. The seeds that failed before
+/// option B still pass; the machinery is exercised over a wider range of
+/// seeds (the first forty of each configuration), where the totals are
+/// asserted.
 #[test]
 fn drop_held_chain_regression_seeds() {
     let mut totals = [0u64; 4];
-    for (label, cfg, seeds) in [
-        (
-            "drop-held-chain",
-            drop_held_chain_config(),
-            [0u64, 1, 2, 3, 5],
-        ),
+    for (label, cfg) in [
+        ("drop-held-chain", drop_held_chain_config()),
         (
             "drop-held-chain-requester-dies",
             drop_held_chain_requester_dies_config(),
-            [0, 1, 2, 3, 5],
         ),
     ] {
-        for seed in seeds {
+        for seed in 0u64..40 {
             let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| {
                 panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
             });
@@ -6668,17 +6669,16 @@ fn a_clean_drop_held_still_passes_the_narrowed_excuse() {
     }
 }
 
-/// ADR-59 part A: seeds whose refusals saw the effect of an op the operator's
-/// drop rolled back after its client was told `Ok`. Two rolled back a create
-/// next to the damaged file, held behind the seed by a directory's merged
-/// times: the ship rule orders what only merges its directory after nothing,
-/// so the drop no longer reaches it. Three saw an acknowledged rename, chmod
-/// or unlink of the damaged file itself, which the drop still rolls back
-/// because it depends on the seed's own keys: the operator's cost of a lost
-/// chunk, which part A does not avoid. The drop names those rows
-/// (`DroppedHeld::rolled_back_on_inode`) and the gate
-/// (`drop_rolled_back_independent_acked`) fails any other acknowledged
-/// namespace op it rolled back.
+/// ADR-59: seeds whose refusals saw the effect of an op the operator's drop
+/// rolled back after its client was told `Ok`. Two rolled back a create next
+/// to the damaged file, held behind the seed by a directory's merged times
+/// (part A: the ship rule orders what only merges its directory after
+/// nothing). Three saw an acknowledged rename, chmod or unlink of the damaged
+/// file itself, which depends on the seed's own keys but needs none of the
+/// lost content (part B: the drop redoes it in place, with its journal row,
+/// rid and answer). The gate (`drop_rolled_back_independent_acked`) admits no
+/// acknowledged namespace op in what a drop rolled back, whatever it depends
+/// on; what the drop cannot avoid undoing is listed (`acked_lost`).
 #[test]
 fn an_acknowledged_independent_op_survives_the_drop() {
     for seed in [26, 283, 860, 1258, 1751] {
@@ -8154,14 +8154,40 @@ fn sweep_config() {
                             report.guard_rises
                         );
                     }
+                    // ADR-59 part B: decisions the log carried and the dropper
+                    // applied; the ones it never applied (it died with the
+                    // record in the log, or was deposed before it shipped)
+                    // are the maintainer-accepted residual, reported.
+                    {
+                        let st = |f: fn(&constellation_authority::Stats) -> u64| -> u64 {
+                            report.stats.values().map(f).sum()
+                        };
+                        let decided = st(|s| s.drops_decided);
+                        let done = st(|s| s.drops_applied) + st(|s| s.drops_unapplied);
+                        let retired = st(|s| s.tail_retired);
+                        let fenced = st(|s| s.tail_drop_fenced);
+                        if decided > 0 || retired > 0 || fenced > 0 {
+                            eprintln!(
+                                "SWEEP-DROP-DECISIONS {label} seed {seed}: decided {decided} \
+                                 applied {} fenced_at_lease_loss {} drop_decided_unapplied {} \
+                                 tail_retired {retired} tail_drop_fenced {fenced} follow_ups {}",
+                                st(|s| s.drops_applied),
+                                st(|s| s.drops_unapplied),
+                                decided.saturating_sub(done),
+                                st(|s| s.drop_follow_ups),
+                            );
+                        }
+                    }
                     if report.drop_counts.drops > 0 {
                         let c = &report.drop_counts;
                         eprintln!(
-                            "SWEEP-DROPS {label} seed {seed}: drops {} requeued {} on_inode {} \
-                             non_sequencer {} rolled_back {:?}",
+                            "SWEEP-DROPS {label} seed {seed}: drops {} requeued {} redone {} \
+                             acked_lost {} follow_ups {} non_sequencer {} rolled_back {:?}",
                             c.drops,
                             c.requeued,
-                            c.on_inode,
+                            c.redone,
+                            c.acked_lost,
+                            c.follow_ups,
                             c.non_sequencer,
                             report.drop_rolled_back
                         );

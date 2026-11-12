@@ -145,6 +145,11 @@ pub struct Oracles {
     pub identity: Mutex<IdentityLedger>,
     /// The first submission of each rid, with its tick.
     pub invokes: Mutex<Vec<(Rid, u64)>>,
+    /// ADR-59: the rows a `repair drop-held` redid in place (they stood:
+    /// the drop undid only what needed the lost content), each with the log
+    /// head at its drop. A row the drop held back lands when the operator
+    /// acts, like a replay it queued: I4's late-landing exemption.
+    pub redone_heads: Mutex<BTreeMap<Rid, u64>>,
     invoked: Mutex<HashSet<Rid>>,
     /// One global, strictly increasing event counter: every emission
     /// judged, every in-doubt answer and every client invocation takes the
@@ -508,6 +513,7 @@ impl Oracles {
             acks: Mutex::new(Vec::new()),
             identity: Mutex::new(IdentityLedger::default()),
             invokes: Mutex::new(Vec::new()),
+            redone_heads: Mutex::new(BTreeMap::new()),
             invoked: Mutex::new(HashSet::new()),
             tick: AtomicU64::new(1),
             acks_unmapped: AtomicU64::new(0),
@@ -2796,40 +2802,60 @@ pub struct DropAcks<'a> {
     pub dropped: &'a BTreeSet<Rid>,
     /// The namespace ops the sim saw return `Ok`.
     pub acked_ns: &'a BTreeSet<Rid>,
+    /// Every rid answered `Ok` to a client (the sim's history or an answer
+    /// of the cluster a client was given): content ops too.
+    pub acked: &'a BTreeSet<Rid>,
     /// The rids of the drops by a node that was not the sequencer in force.
     pub by_non_sequencer: &'a BTreeSet<Rid>,
     /// [`survivors_of_drop`] of `dropped`.
     pub survivors: &'a BTreeSet<Rid>,
-    /// The rids the drops attributed to the damaged inode's own keys
-    /// (`DroppedHeld::rolled_back_on_inode`).
-    pub on_inode: &'a BTreeSet<Rid>,
+    /// Whether the log completes the rid.
+    pub completed: &'a dyn Fn(&Rid) -> bool,
+    /// The rids the drops reported as acknowledged and lost (`acked_lost`).
+    pub lost: &'a BTreeSet<Rid>,
 }
 
 /// ADR-59 (part A): the first check a run's drops fail, with the rids.
 ///
-/// `drop_rolled_back_independent_acked`: a drop rolls back no acknowledged
-/// namespace op (none carries content) that does not depend on the damaged
-/// inode's own keys: a rename, chmod or unlink of the file is the operator's
-/// cost of a lost chunk, named by the drop (`rolled_back_on_inode`) and not
-/// yet avoided; a sibling in the same directory is the defect the ADR
-/// removes. The one other excuse: a dropper that was not the sequencer in
-/// force strands what depended on a seed as a deposition does, so an
-/// acknowledged rid it rolled back is excused if, and only if, its effect
-/// survives in the log (the dropper alone is no excuse).
+/// 1. `drop_rolled_back_independent_acked`: a drop rolls back no
+///    acknowledged namespace op (none carries content). The one excuse: a
+///    dropper that was not the sequencer in force strands what depended on a
+///    seed as a deposition does, so an acknowledged rid it rolled back is
+///    excused if, and only if, its effect survives in the log (the dropper
+///    alone is no excuse).
+/// 2. `drop_acked_loss_invisible`: every acknowledged rid a drop rolled back
+///    that the log does not complete (a content op's commit, a refusal of the
+///    replay) is in `lost`; and every rid in `lost` was rolled back.
 pub fn drop_ack_findings(d: &DropAcks) -> Option<(&'static str, Vec<Rid>)> {
     let independent: Vec<Rid> = d
         .acked_ns
         .iter()
         .filter(|rid| d.dropped.contains(rid))
-        .filter(|rid| !d.on_inode.contains(rid))
         .filter(|rid| !(d.by_non_sequencer.contains(rid) && d.survivors.contains(rid)))
         .copied()
         .collect();
-    if independent.is_empty() {
-        None
-    } else {
-        Some(("drop_rolled_back_independent_acked", independent))
+    if !independent.is_empty() {
+        return Some(("drop_rolled_back_independent_acked", independent));
     }
+    let invisible: Vec<Rid> = d
+        .dropped
+        .iter()
+        .filter(|rid| d.acked.contains(rid) && !(d.completed)(rid) && !d.lost.contains(rid))
+        .copied()
+        .collect();
+    if !invisible.is_empty() {
+        return Some(("drop_acked_loss_invisible", invisible));
+    }
+    let unrolled: Vec<Rid> = d
+        .lost
+        .iter()
+        .filter(|rid| !d.dropped.contains(rid))
+        .copied()
+        .collect();
+    if !unrolled.is_empty() {
+        return Some(("drop_acked_loss_invisible", unrolled));
+    }
+    None
 }
 
 /// The rids a run's operator abandon gave up beyond those a client saw
@@ -3039,10 +3065,15 @@ pub fn end_of_run(
         .partition(|(_, rid, _, _)| labelled.contains(rid));
     // The dropped rids that survive, each with the log head at its (latest)
     // drop: only a completion past it is the operator's replay.
-    let replayed_after: BTreeMap<Rid, Seq> = survivors
+    let mut replayed_after: BTreeMap<Rid, Seq> = survivors
         .iter()
         .map(|r| (*r, dropped.get(r).copied().unwrap_or(0)))
         .collect();
+    // (A row the drop redid in place and shipped afterwards lands late the
+    // same way; only I4 treats it so, I2c and I5 judge it as any row.)
+    for (rid, head) in o.redone_heads.lock().unwrap().iter() {
+        replayed_after.entry(*rid).or_insert(*head);
+    }
     f.i4 =
         super::check::no_late_landing(&in_doubt, &invokes, &audit.submits, &replayed_after, log).1;
     f.i4_isolated_from_s3 = super::check::no_late_landing(
@@ -3517,22 +3548,28 @@ mod tests {
     use constellation_types::clock::Now;
     use replicix_objcas::{LeaseMode, LeaseStore};
 
-    /// ADR-59 (part A): the end-of-run check of what a drop rolled back.
+    /// ADR-59 (parts A and B): the end-of-run check of what a drop rolled
+    /// back: no acknowledged namespace op, however it depends on the damaged
+    /// inode (part B redoes those in place instead of undoing them).
     #[test]
     fn a_drop_rolls_back_no_acknowledged_op_that_is_independent_of_the_damaged_inode() {
         let set = |v: &[u64]| -> BTreeSet<Rid> { v.iter().map(|s| rid(1, *s)).collect() };
         let none = set(&[]);
         let check = |dropped: &BTreeSet<Rid>,
                      acked_ns: &BTreeSet<Rid>,
+                     acked: &BTreeSet<Rid>,
                      by_ns: &BTreeSet<Rid>,
                      survivors: &BTreeSet<Rid>,
-                     on_inode: &BTreeSet<Rid>| {
+                     completed: &BTreeSet<Rid>,
+                     lost: &BTreeSet<Rid>| {
             drop_ack_findings(&DropAcks {
                 dropped,
                 acked_ns,
+                acked,
                 by_non_sequencer: by_ns,
                 survivors,
-                on_inode,
+                completed: &|r| completed.contains(r),
+                lost,
             })
             .map(|(c, _)| c)
         };
@@ -3540,24 +3577,36 @@ mod tests {
         // A sibling the sequencer's drop rolled back: the defect, even if
         // the replay landed.
         assert_eq!(
-            check(&d, &d, &none, &d, &none),
+            check(&d, &d, &d, &none, &d, &d, &none),
             Some("drop_rolled_back_independent_acked")
         );
-        // The same rid, attributed to the damaged inode (a rename, chmod or
-        // unlink of the file): the operator's named cost.
-        assert_eq!(check(&d, &d, &none, &d, &d), None);
         // A rid no drop rolled back, or never acknowledged: not judged.
-        assert_eq!(check(&none, &d, &none, &none, &none), None);
-        assert_eq!(check(&d, &none, &none, &none, &none), None);
+        assert_eq!(check(&none, &d, &d, &none, &none, &none, &none), None);
+        assert_eq!(check(&d, &none, &none, &none, &none, &none, &none), None);
         // A non-sequencer's drop: excused when the effect survives in the
         // log, not when the log carries no outcome of the rid (an
         // acknowledged effect lost, which the dropper's identity does not
         // excuse).
-        assert_eq!(check(&d, &d, &d, &d, &none), None);
+        assert_eq!(check(&d, &d, &d, &d, &d, &d, &none), None);
         assert_eq!(
-            check(&d, &d, &d, &none, &none),
+            check(&d, &d, &d, &d, &none, &none, &none),
             Some("drop_rolled_back_independent_acked")
         );
+        // An acknowledged content op the drop rolled back and the log never
+        // completed must be listed as lost; listed, it passes.
+        assert_eq!(
+            check(&d, &none, &d, &none, &none, &none, &none),
+            Some("drop_acked_loss_invisible")
+        );
+        assert_eq!(check(&d, &none, &d, &none, &none, &none, &d), None);
+        // A rid listed lost that no drop rolled back is a reporting bug.
+        assert_eq!(
+            check(&none, &none, &none, &none, &none, &none, &d),
+            Some("drop_acked_loss_invisible")
+        );
+        // An unacknowledged rolled-back rid (a seed never answered) is
+        // nothing to list.
+        assert_eq!(check(&d, &none, &none, &none, &none, &none, &none), None);
     }
 
     fn rid(n: u64, seq: u64) -> Rid {

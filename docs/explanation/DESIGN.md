@@ -2103,9 +2103,11 @@ a directory's times and link count change by a commutative merge, and two
 merges, or a merge and an observation, order nothing
 ([ADR-59](DECISIONS.md#adr-59-a-directorys-merged-attributes-order-nothing-part-a)).
 `status.held` lists what is held, and `constellation repair drop-held`
-turns a held manifest into a conflict copy with the lost chunks as holes
-and replays its dependents by rid
-([Write-path hygiene](../reference/features/write-path-hygiene.md#held-records-statusheld)).
+turns a held manifest into a conflict copy with the lost chunks as holes,
+rolls back and replays by rid only the dependents that need the lost content,
+and redoes the rest in place; the drop is a `DropHeld` record the log carries,
+and its effect, the dropper's own included, follows the record (ADR-59 part B;
+[Write-path hygiene](../reference/features/write-path-hygiene.md#held-records-statusheld)).
 
 An operator's drop re-executes only this node's own rows. Another node's
 unanswered row — one whose answer was never given, because its answer waits

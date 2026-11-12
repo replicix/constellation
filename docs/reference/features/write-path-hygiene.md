@@ -142,11 +142,18 @@ Discards an inode's held records:
   `<dir>/.constellation-conflict/<name>@<node>-<ts>-<seq>`, full length, with
   the lost chunks as holes (zeros); a spilled manifest's copy keeps only
   the length;
-- every held transaction that depended on it is rolled back, and this
-  node's own are replayed by their request ids, exactly like a deposed
-  holder's journal; a replay the namespace no longer admits becomes a
-  conflict copy as well. Another node's row is not replayed here (see
-  below);
+- of the held transactions that depend on it by key, only the ones that need
+  the lost *content* are rolled back with it (a later write of the damaged
+  file, a size change of it, a copy of it): this node's own are replayed by
+  their request ids, exactly like a deposed holder's journal, and a replay the
+  namespace no longer admits becomes a conflict copy as well. Every other one
+  (a rename, chmod or unlink of the file, a create or unlink in its
+  directory) neither wrote nor read a byte the loss took: it is redone in
+  place, with its journal row, request id and answer, and ships once the seed
+  is gone (`redone` in the command's account). Another node's rolled-back
+  row is not replayed here (see below). A dropper that is not the sequencer
+  in force rolls back everything that depended on the seed, as a deposition
+  does;
 - the unrecoverable pending uploads are removed -- except those of a chunk
   an operation of this node, or a write session, still names (below).
 
@@ -199,28 +206,48 @@ drop. Operations the drop itself rolled back keep nothing held (their rows are t
 seeds). Another node's operation names this node's chunks only through the
 pending list it forwards (`--remote`).
 
-**What the drop tells the rest of the group.** The drop journals one
-`RolledBack` record, the first record of the transaction that carries the
-`Refused` rows, naming each transaction it rolled back as a member keys it
-(the `TailOf` pair if the transaction began with one, else its tenure's
-epoch and first journal sequence). A member that was streamed those
-transactions as committed, or applies the record from a segment, rolls its
-copies back without queueing a replay (this node's queue owns the replay or
-the refusal), and a backup's tail and a member's copy of them become empty
-transactions of the same span, so that no successor re-ships a dropped
-row. Without it the committed copy stayed for good: the member kept the
-dropped write and never quiesced. The record sits ahead of the refusals in the
-journal, so a holder that dies mid-drop leaves a successor with the record or
-with none of the drop's effects.
+**The drop is decided in the log.** `repair drop-held` decides nothing
+locally: it journals one `DropHeld` record (an archive-class row with no keys,
+so it ships ahead of everything the seed holds) naming each transaction the
+drop will roll back as a member keys it (the `TailOf` pair if the transaction
+began with one, else its tenure's epoch and first journal sequence) and the
+request id it completes, and persists the plan. The command answers
+`pending` until the archive carries the record; only then does the node
+apply it (strand the seed, redo the rest, refuse the queued seeds, write the
+`Refused` rows, remove the pending rows), and the command prints the final
+account. The wait is one archive round trip. Every replica applies the record
+from the log: it records the named identities as retired (the takeover's
+re-ship and the kept-tail merge skip a retired transaction, so a late copy a
+member served can never land behind its own refusal), a member's copy and a
+backup's tail transaction of one become empty transactions of the same span,
+and what a member was streamed of one as committed is rolled back without a
+replay (this node's queue owns the replay or the refusal). A parked answer
+of a request id the drop refused is settled with the refusal, and any parked
+answer is what the store says when it is released, never a snapshot.
 
-**A drop on a node that has been deposed.** `repair drop-held` can run on a
-node that lost the lease meanwhile (suspended past its seal; the command
-runs on resume). Its refusals are fenced and never ship, so the refused
-entry in its queue does not make its conflict copy at once: it settles the
-request id through the sequencer in force first, as a placeholder does
-below. The copy follows when the rid has a refusal in the log; if the
-successor completed the original from its tail, the write survived, the
-entry is forgotten and no copy is made.
+**A dropper without the lease decides nothing.** A node deposed (or dead)
+before the record shipped leaves a sealed tail that differs from the members'
+copies by that record alone: the successor's takeover skips it (`tail_drop_fenced`,
+warned) and re-ships the rows it named as the acknowledged rows they are; the
+command answers that the lease was lost and nothing was dropped. A node that
+dies after the record shipped but before it applied the drop (the one
+residual) leaves the seed's rows retired (nothing lands) and no conflict copy
+and no `Refused` row for them: the lost write's surviving bytes are not
+preserved as an artifact, and a requester's retry by request id executes
+afresh from the requester's own bytes. It is counted
+(`drop_decided_unapplied` in the simulation, `tail_retired` at the successor's
+gate) and accepted as the operator's cost of a holder death inside a drop.
+
+**Acknowledged operations the drop cannot avoid undoing.** A seed's own
+acknowledged write, and an acknowledged operation that needs the lost
+content, are rolled back for good. The command lists each (`acked_lost`),
+the node warns once per request id, and `status.held.acked_lost_total`
+counts them: the documented double fault of a lost chunk plus an
+acknowledged operation that needs it. A redone row whose client was told in
+doubt lands when the operator's drop releases it, as a queued replay lands
+when the drain runs it; a client that retried under a new request id gets two
+effects, as with a replay. A kept in-doubt create keeps its inode allocated:
+a requester's retry under a new request id allocates afresh.
 
 ### Another node's rows
 
