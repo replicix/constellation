@@ -420,6 +420,10 @@ pub struct DroppedHeld {
     /// apply found still in the journal after the stranding (stranded by
     /// journal row). Expected 0 (`drop_apply_leftovers`).
     pub leftovers: usize,
+    /// The apply ran on a node without the lease (a deposed dropper, or one
+    /// restarted after its record shipped): no `Refused` row was journaled,
+    /// and the refusals are the successor's gate's (`tail_retired`).
+    pub deposed: bool,
     /// The log segment this replica had applied when the drop took effect
     /// (the final result only): what lands past it is the drop's replay.
     pub applied_seq: u64,
@@ -591,6 +595,13 @@ impl DroppedHeld {
                  as they were",
                 self.redone
             ));
+        }
+        if self.deposed {
+            text.push_str(
+                "; applied on a node that no longer holds the lease: the record is in the log \
+                 and this replica followed it, but no refusal was journaled here (the \
+                 successor's gate answers the rids from the record)",
+            );
         }
         if self.follow_ups > 0 {
             text.push_str(&format!(
@@ -1794,7 +1805,7 @@ impl Meta {
         let no_ops = |_: &ChunkHash| Vec::new();
         let sessions = LiveSessions::default();
         self.drop_held_knowing(ino, now_unix, remote, &none, &no_ops, &sessions, true)?;
-        self.drop_held_apply(ino, now_unix, &none, &no_ops, &sessions)
+        self.drop_held_apply(ino, now_unix, &none, &no_ops, &sessions, true)
     }
 
     /// `constellation repair drop-held <ino> --remote`: the same for a
@@ -1937,7 +1948,7 @@ impl Meta {
                 postcard::to_allocvec(&plan)?,
             );
             tx.commit()?;
-            return self.drop_held_apply(ino, now_unix, unanswered, live_ops, sessions);
+            return self.drop_held_apply(ino, now_unix, unanswered, live_ops, sessions, true);
         }
         let local = self.begin_local(&tx)?;
         let jseq = journal::append_tx(
@@ -2004,7 +2015,7 @@ impl Meta {
         if decided.pending.is_none() {
             return Ok(decided);
         }
-        self.drop_held_apply(ino, now_unix, unanswered, live_ops, sessions)
+        self.drop_held_apply(ino, now_unix, unanswered, live_ops, sessions, sequencer)
     }
 
     /// The drops decided and not yet applied: `(inode, journal seq of the
@@ -2021,6 +2032,44 @@ impl Meta {
             out.push((ino, plan.jseq, plan.epoch, plan.shipped));
         }
         Ok(out)
+    }
+
+    /// ADR-59 part B (D2, D4): a segment of this node's own that carries a
+    /// single `DropHeld` and matches no journal row (a deposition stranded the
+    /// record's row after the segment's PUT: the shipper's ack never found
+    /// it) is the record in the log all the same. What the ack of the row
+    /// would have done is done from the record: its identities are retired
+    /// and this node's own copies of them holed, the decided plan (if the drop
+    /// is still waiting for it) is marked shipped. Whether `records` was such
+    /// a segment.
+    pub fn own_drop_segment(&self, records: &[LogRecord]) -> Result<bool, MetaError> {
+        let [LogRecord::DropHeld {
+            ino, rolled_back, ..
+        }] = records
+        else {
+            return Ok(false);
+        };
+        let idents: BTreeSet<(u64, u64)> = rolled_back.iter().map(|(ident, _)| *ident).collect();
+        let mut tx = self.db.write_tx();
+        if let Some(raw) = tx.get(&self.local, drop_plan_key(*ino))? {
+            let mut plan: DropPlan = postcard::from_bytes(&raw)?;
+            let named: BTreeSet<(u64, u64)> = plan.idents.iter().copied().collect();
+            if !plan.shipped && idents.is_subset(&named) {
+                // (Its own row is in the log: it covers the copy of the
+                // record that the deposition kept.)
+                self.member_cover_own_rows_tx(&mut tx, plan.epoch, &[plan.jseq])?;
+                plan.shipped = true;
+                tx.insert(
+                    &self.local,
+                    drop_plan_key(*ino),
+                    postcard::to_allocvec(&plan)?,
+                );
+                counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, -1)?;
+            }
+        }
+        self.retire_and_hole_tx(&mut tx, &idents)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Whether the decided drop of `ino` has its record shipped from this node.
@@ -2077,6 +2126,12 @@ impl Meta {
     /// redone in place; the `Refused` rows and `completed` entries, the
     /// pending rows and marks go. A redo that skips a record commits only a
     /// follow-up `DropHeld` naming it (`pending` is returned again).
+    ///
+    /// Without the lease (`sequencer` false: a deposed dropper whose record the
+    /// log carries, or one restarted after it) the effect is the same on this
+    /// replica but nothing is journaled: the `Refused` rows could never ship
+    /// (the journal is fenced), and the successor's gate answers the rids with
+    /// the log's own record (`tail_retired`).
     #[allow(clippy::too_many_arguments)]
     pub fn drop_held_apply(
         &self,
@@ -2085,6 +2140,7 @@ impl Meta {
         unanswered: &dyn Fn(crate::rid::Rid) -> bool,
         live_ops: &dyn Fn(&ChunkHash) -> Vec<crate::rid::Rid>,
         sessions: &LiveSessions,
+        sequencer: bool,
     ) -> Result<DroppedHeld, MetaError> {
         let _class = super::journal::PendingClass::current()
             .is_none()
@@ -2297,7 +2353,7 @@ impl Meta {
         // Fix "capture under an epoch hold": the dropped ops' outcome, in
         // the log. The `DropHeld` record is in the log already (this apply
         // runs when it is); its `Refused` rows follow.
-        if !refused_rids.is_empty() {
+        if !refused_rids.is_empty() && sequencer {
             let local = self.begin_local(&tx)?;
             let now_ms = now_unix.saturating_mul(1000);
             for rid in &refused_rids {
@@ -2420,6 +2476,7 @@ impl Meta {
             pending_epoch: 0,
             follow_ups: plan.follow_ups as usize,
             leftovers,
+            deposed: !sequencer,
             applied_seq: self.applied_seq()?,
         };
         {

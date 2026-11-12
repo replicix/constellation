@@ -777,14 +777,22 @@ impl Core {
                 })
                 .cloned()
                 .collect();
-            let Some(seqs) = replica.journal_head_matching(&rows)? else {
-                anyhow::bail!(
+            let seqs = match replica.journal_head_matching(&rows)? {
+                Some(seqs) => {
+                    replica.ack_journal(&seqs, seq, Some(seg.journal_pos()))?;
+                    seqs
+                }
+                // ADR-59 part B (D2): this node's own `DropHeld`, whose
+                // journal row a deposition stranded after its PUT: the
+                // record is in the log, and what the ack of its row would
+                // have done is done from the record.
+                None if replica.own_drop_segment(&rows)? => Vec::new(),
+                None => anyhow::bail!(
                     "segment {seq} claims our node id {} but does not match the journal: \
                      state dir reuse or id collision",
                     self.cfg.node_id
-                );
+                ),
             };
-            replica.ack_journal(&seqs, seq, Some(seg.journal_pos()))?;
             self.stats.own_recovered += 1;
             // Plan 30 §M9: durable in the log, whichever way we learned it.
             self.note_shipped(&seqs, seg.through);
@@ -2112,6 +2120,15 @@ impl Core {
         // from here.
         self.note_marker_landed(now, replica, out);
         Ok(())
+    }
+
+    /// Whether a segment carrying journal row `jseq` has its PUT out (issued,
+    /// not answered).
+    pub(crate) fn ship_in_flight_has(&self, jseq: u64) -> bool {
+        matches!(
+            &self.job,
+            Some(Job { phase: Phase::Ship { seqs, .. }, .. }) if seqs.contains(&jseq)
+        )
     }
 
     /// The job's phase, for diagnostics (the simulation's quiescence

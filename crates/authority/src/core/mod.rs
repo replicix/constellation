@@ -2204,6 +2204,10 @@ pub struct Stats {
     /// ADR-59 part B: `repair drop-held` decisions applied (the log carried
     /// the record).
     pub drops_applied: u64,
+    /// ADR-59 part B (D2): of `drops_applied`, those applied on a node
+    /// without the lease (a deposed dropper, or one restarted after its
+    /// record shipped), which journaled no refusal.
+    pub drops_applied_deposed: u64,
     /// ADR-59 part B: decisions never applied here: the lease was lost before
     /// the record was in the log (fenced), or the applier died with the
     /// record in the log (`drop_decided_unapplied`, counted by the successor's

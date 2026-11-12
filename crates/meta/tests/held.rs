@@ -2054,7 +2054,14 @@ fn a_transaction_a_decided_drop_names_stays_held_when_the_marks_clear() {
     // The record is in the log: the identity is retired, still held.
     assert!(!whether_shipped_manifest(&batch(&meta)));
     let done = meta
-        .drop_held_apply(broken, 1, &|_| false, &|_| Vec::new(), &Default::default())
+        .drop_held_apply(
+            broken,
+            1,
+            &|_| false,
+            &|_| Vec::new(),
+            &Default::default(),
+            true,
+        )
         .unwrap();
     assert_eq!(done.dropped, 1, "{done:?}");
     assert_eq!(done.leftovers, 0);
@@ -2188,7 +2195,14 @@ fn a_drop_of_a_re_shipped_tail_row_leaves_nothing_of_its_identity_to_ship() {
     ship(&meta, &rows, 2);
     assert!(meta.row_retired(1, 3) && meta.row_retired(1, 5));
     let done = meta
-        .drop_held_apply(file, 1, &|_| false, &|_| Vec::new(), &Default::default())
+        .drop_held_apply(
+            file,
+            1,
+            &|_| false,
+            &|_| Vec::new(),
+            &Default::default(),
+            true,
+        )
         .unwrap();
     assert_eq!(done.leftovers, 0, "{done:?}");
     assert_eq!(done.requeued, 1, "{done:?}");

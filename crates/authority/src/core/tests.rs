@@ -62596,7 +62596,13 @@ mod await_retry {
     /// holds; 0, every answer waits for it) with a seed, as
     /// `holder_with_a_seed`.
     fn backed_holder_with_a_seed(group_has: u64) -> (Harness, Ino) {
-        let (mut h, broken) = holder_with_a_seed();
+        let (h, broken) = holder_with_a_seed();
+        (back_the_holder(h, group_has), broken)
+    }
+
+    /// `h` (the holder) backed by node 3, which holds the journal through
+    /// `group_has`.
+    fn back_the_holder(mut h: Harness, group_has: u64) -> Harness {
         let lease = Lease {
             ack_policy: replicix_objcas::AckPolicy::Backup,
             backups: vec![3],
@@ -62625,7 +62631,7 @@ mod await_retry {
                 committed: true,
             },
         );
-        (h, broken)
+        h
     }
 
     /// `forward_of` without the archive landing: a backed holder's answer
@@ -62812,6 +62818,404 @@ mod await_retry {
             r.meta.pending_uploads().unwrap().is_empty(),
             "the drop took effect"
         );
+    }
+
+    /// The round of `h` (a started core) up to its first segment `PUT`,
+    /// left out: the uploads and the tail on the way answered. The `PUT`'s op.
+    fn round_to_put(h: &mut Harness) -> OpId {
+        let mut out = Vec::new();
+        h.core.start(h.clk(), &h.meta, &mut out);
+        let poll = timers(&out, TimerKind::Poll)[0];
+        let mut out = h.step(Event::Timer { id: poll });
+        if let Some(upload) = out.iter().find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        }) {
+            out = h.step(Event::UploadsDone {
+                op: upload,
+                result: UploadResult::Done { held: 0 },
+            });
+        }
+        loop {
+            let (op, req) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+                .expect("the round issues S3 requests");
+            match req {
+                S3Op::SegmentPut { .. } => return op,
+                S3Op::SegmentRun { .. } => {
+                    out = h.step(Event::S3 {
+                        op,
+                        result: S3Result::SegmentRun(Ok(Vec::new())),
+                    })
+                }
+                S3Op::SegmentGap { .. } => {
+                    out = h.step(Event::S3 {
+                        op,
+                        result: S3Result::SegmentGap(Ok(None)),
+                    })
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// The live rows (with records) of every member copy of `meta`.
+    fn live_copy_rows(meta: &Meta) -> usize {
+        Replica::member_copy_epochs(meta)
+            .iter()
+            .filter_map(|e| meta.member_copy_rows(*e).ok().flatten())
+            .map(|(_, rows)| rows.iter().filter(|r| !r.tx.records.is_empty()).count())
+            .sum()
+    }
+
+    /// `h`'s node was a member of epoch 1's group and holds a copy of the seed
+    /// under the seed's identity.
+    fn put_member_copy_of_the_seed(h: &Harness) {
+        let seed = h
+            .meta
+            .journal_txs_from(0, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .find(|t| {
+                t.records
+                    .iter()
+                    .any(|r| matches!(r, LogRecord::WriteManifest { .. }))
+            })
+            .expect("the seed");
+        h.meta
+            .member_copy_put_rows(
+                1,
+                1,
+                &[constellation_meta::MemberTx {
+                    tx: seed,
+                    class: RowCommit::ROOT_GROUP,
+                    rid: None,
+                    op: None,
+                    lock_tag: Default::default(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(live_copy_rows(&h.meta), 1);
+    }
+
+    /// ADR-59 part B (D2, D4), P3 (i), 1526's shape: the dropper decided and
+    /// its record's `PUT` was out when the lease was lost; the `PUT` landed. The
+    /// log carries the decision, so the deposed dropper follows it like every
+    /// replica: the plan is applied from the log (nothing journaled), its own
+    /// copy of the seed's identity is a hole and holds no read. Fail before:
+    /// the lease loss cancelled the plan ("nothing was dropped") although the
+    /// record landed, the ack found the drop counted as cancelled and retired
+    /// nothing, and the copy and its read hold stayed (`read_holds_gone`).
+    #[test]
+    fn a_deposed_droppers_record_whose_put_lands_after_the_lease_went_is_followed() {
+        let (mut h, broken) = holder_with_a_seed();
+        h.meta.set_parent_taint_conservative(false);
+        put_member_copy_of_the_seed(&h);
+        let _ = drop_held_decide_via_core(&mut h, broken);
+        assert_eq!(h.meta.drop_plans().unwrap().len(), 1);
+        let put = round_to_put(&mut h);
+        // The lease goes with the record's segment out.
+        let mut out = Vec::new();
+        h.core.deposed(h.clk(), 2, 2, 1, &h.meta, &mut out);
+        assert_eq!(
+            h.core.stats.drops_unapplied, 0,
+            "the record may be in the log: the decision is not undone locally"
+        );
+        assert_eq!(h.meta.drop_plans().unwrap().len(), 1, "{out:?}");
+        // The `PUT` lands.
+        h.step(Event::S3 {
+            op: put,
+            result: S3Result::SegmentPut(Ok(())),
+        });
+        assert_eq!(h.core.stats.drops_unapplied, 0);
+        assert_eq!(h.core.stats.drops_applied, 1);
+        assert_eq!(h.core.stats.drops_applied_deposed, 1);
+        assert!(
+            h.meta.drop_plans().unwrap().is_empty(),
+            "applied from the log"
+        );
+        assert_eq!(live_copy_rows(&h.meta), 0, "the own copy is a hole");
+        assert!(h.meta.read_holds().is_empty(), "{:?}", h.meta.read_holds());
+        let done = h.meta.take_applied_drops();
+        assert_eq!(done.len(), 1);
+        assert!(done[0].deposed, "{:?}", done[0]);
+        assert!(
+            h.meta
+                .journal_txs_from(0, usize::MAX)
+                .unwrap()
+                .iter()
+                .all(|t| !t
+                    .records
+                    .iter()
+                    .any(|r| matches!(r, LogRecord::Refused { .. }))),
+            "no refusal journaled on a node without the lease"
+        );
+    }
+
+    /// ADR-59 part B (D2), P3 (iii): the lease lost before the record's
+    /// segment was out: the drop never happened. Cancelled, nothing applied
+    /// (the successor's gate fences the record it finds in the dropper's
+    /// tail: `tail_drop_fenced`, pinned by
+    /// `a_deposed_droppers_undecided_record_is_fenced_not_a_divergence`).
+    #[test]
+    fn a_deposed_droppers_record_that_never_left_is_cancelled() {
+        let (mut h, broken) = holder_with_a_seed();
+        h.meta.set_parent_taint_conservative(false);
+        let _ = drop_held_decide_via_core(&mut h, broken);
+        assert_eq!(h.meta.drop_plans().unwrap().len(), 1);
+        let mut out = Vec::new();
+        h.core.deposed(h.clk(), 2, 2, 1, &h.meta, &mut out);
+        assert_eq!(h.core.stats.drops_unapplied, 1);
+        assert_eq!(h.core.stats.drops_applied, 0);
+        assert!(h.meta.drop_plans().unwrap().is_empty(), "the plan is gone");
+        assert!(!h.meta.pending_uploads().unwrap().is_empty(), "still held");
+    }
+
+    /// ADR-59 part B (D1, D2), B3 (ii): the dropper's record shipped (its
+    /// segment is in the archive) and the dropper died before the apply. The
+    /// successor reads the log: the record retires the seed's identity, its
+    /// gate re-ships no row of the seed (`tail_retired`), the log has no
+    /// refusal or completion of the seed's rid, every member's copy is a hole
+    /// and holds no read. The dropper, restarted, meets its own segment
+    /// (`own_recovered`; its journal row was stranded by the restart's
+    /// recovery), applies the plan with `dropped == 0` and reports the
+    /// acknowledged loss from the plan; it journals no refusal and holds
+    /// nothing of the retired identity. The seed's client retries by rid: it
+    /// executes afresh at the successor and completes.
+    #[test]
+    fn a_dropper_that_dies_after_its_record_shipped_follows_the_log_when_it_returns() {
+        use constellation_meta::{BackupTx, StrandArgs, TailArgs};
+        // A holder whose own client writes a file with a chunk that is gone
+        // (no seed in the fixture: the client's write is the seed).
+        let mut h = Harness::new(1);
+        h.meta.set_parent_taint_conservative(false);
+        h.hold(1, None);
+        let broken = h.meta.create(ROOT_INO, "broken", 0o644, 0, 0).unwrap().ino;
+        let first_rows = MetaStore::take_journal(&h.meta, usize::MAX).unwrap();
+        let first_seqs: Vec<u64> = first_rows.iter().map(|(s, _)| *s).collect();
+        h.meta.ack_journal_rows_at(&first_seqs, 1).unwrap();
+        let mut h = back_the_holder(h, 0);
+        let lost = ChunkHash::of(b"bytes that are gone");
+        let manifest = Manifest {
+            layout: ChunkLayout::new(4096),
+            file_len: 19,
+            chunks: ChunkInfo::Inline([(0u64, lost)].into_iter().collect()),
+        }
+        .encode();
+        let seed_op = MutateOp::SetManifest {
+            ino: broken,
+            base_manifest: None,
+            manifest,
+            size: 19,
+            mtime_ns: None,
+            ctime_ns: None,
+        };
+        // The holder's own client writes the damaged file; the group holds it
+        // and the client is told `Ok`.
+        let rid = h.rid(7);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: seed_op.clone(),
+            tag: Default::default(),
+        });
+        assert!(replies(&out).is_empty(), "parked for the group: {out:?}");
+        if let Some(peer) = h.core.ack.peers.get_mut(&3) {
+            peer.acked = u64::MAX / 2;
+            peer.counted = u64::MAX / 2;
+        }
+        let mut out = Vec::new();
+        let tip = h.meta.journal_tip().unwrap();
+        h.core.note_shipped(&[], tip);
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert!(
+            replies(&out).iter().any(|(r, reply)| *r == rid
+                && matches!(reply, ClientReply::Outcome(MutateOutcome::Accepted { .. }))),
+            "the client was told Ok: {out:?}"
+        );
+        h.meta.add_pending_upload(&lost, broken).unwrap();
+        h.meta
+            .note_unrecoverable_chunks(&[(lost, broken)], true)
+            .unwrap();
+        put_member_copy_of_the_seed(&h);
+        // The holder decides; the segment carrying the record is in the
+        // archive (it was PUT) and the holder dies before it hears.
+        let _ = drop_held_decide_via_core(&mut h, broken);
+        let rows: Vec<(u64, LogRecord)> = h
+            .meta
+            .take_journal_grouped(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, b)| b)
+            .collect();
+        let records: Vec<LogRecord> = rows.iter().map(|(_, r)| r.clone()).collect();
+        assert!(records
+            .iter()
+            .any(|r| matches!(r, LogRecord::DropHeld { .. })));
+        let row_seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+        let through = *row_seqs.last().unwrap();
+        let payload = crate::segment::encode(1, 1, through, &row_seqs, &[], &records).unwrap();
+        assert_eq!(h.core.stats.drops_applied, 0, "no apply ran");
+        // (The sealed tail of an epoch starts at its first journal seq: the
+        // rows that shipped before are a hole.)
+        let mut sealed: Vec<BackupTx> = vec![BackupTx {
+            first: 1,
+            last: 1,
+            records: Vec::new(),
+            origin: (0, 0),
+        }];
+        sealed.extend(
+            h.meta
+                .journal_txs_from(0, usize::MAX)
+                .unwrap()
+                .into_iter()
+                .filter(|t| !t.records.is_empty())
+                // (The record is an `Archive` row: the group holds no copy.)
+                .filter(|t| {
+                    !t.records
+                        .iter()
+                        .any(|r| matches!(r, LogRecord::DropHeld { .. }))
+                }),
+        );
+        // The successor (node 2) reads the log to its head: the segment with
+        // the record. It holds a copy of the seed's identity too.
+        let succ = Harness::new(2);
+        put_member_copy_of_the_seed_of(&succ, &sealed);
+        succ.meta
+            .apply_segment_rows(1, 1, through, &row_seqs, &[], &records, &Default::default())
+            .unwrap();
+        assert!(succ.meta.row_retired(1, sealed[1].first));
+        assert_eq!(live_copy_rows(&succ.meta), 0, "a hole at the survivor");
+        assert!(succ.meta.read_holds().is_empty());
+        // Its gate re-ships the sealed tail (the rows of the dropper's journal).
+        succ.meta.backup_append(1, &sealed).unwrap();
+        let proof = Default::default();
+        let carried = Default::default();
+        let report = succ
+            .meta
+            .reship_at_takeover(
+                Some(StrandArgs {
+                    epoch: 2,
+                    own_gens: &[],
+                    abandoned: None,
+                    carried: &carried,
+                    proof: &proof,
+                    marker: &[],
+                }),
+                Some(TailArgs {
+                    epoch: 1,
+                    through: sealed.iter().map(|t| t.last).max().unwrap(),
+                    config_version: 3,
+                    class: None,
+                }),
+            )
+            .unwrap();
+        // (The copy reached the gate as a hole: the ingest consults `retired`.
+        // A source that missed the record serves it live and the gate counts
+        // `tail_retired`; either way nothing of the seed is re-shipped.)
+        assert_eq!(report.tail_applied, 0, "{report:?}");
+        assert_eq!(report.tail_drop_fenced, 0, "{report:?}");
+        assert!(
+            succ.meta.completed_outcome(rid).unwrap().is_none(),
+            "no refusal or completion of the seed's rid in the log"
+        );
+        // The dropper returns. The successor's epoch closed its tenure; the
+        // restart's recovery strands what is left (the record's row too).
+        let mut r = restarted(h);
+        r.meta.strand_deposed(2).unwrap();
+        let seq = r.core.ship.next_seq;
+        let mut out = Vec::new();
+        r.core
+            .apply_incoming(r.clk(), seq, &payload, &r.meta, &mut out)
+            .unwrap();
+        r.core.complete_ready(r.clk(), &r.meta, &mut out);
+        assert_eq!(r.core.stats.own_recovered, 1, "it found its segment");
+        assert_eq!(r.core.stats.drops_applied, 1);
+        assert_eq!(r.core.stats.drops_applied_deposed, 1);
+        assert_eq!(r.core.stats.drops_unapplied, 0);
+        let done = r.meta.take_applied_drops();
+        assert_eq!(done.len(), 1, "{done:?}");
+        assert_eq!(done[0].dropped, 0, "{:?}", done[0]);
+        assert_eq!(
+            done[0]
+                .acked_lost
+                .iter()
+                .map(|(r, _)| *r)
+                .collect::<Vec<_>>(),
+            vec![rid],
+            "the loss the plan listed at the decision"
+        );
+        assert!(done[0].refused.is_empty(), "{:?}", done[0]);
+        assert!(
+            r.meta
+                .journal_txs_from(0, usize::MAX)
+                .unwrap()
+                .iter()
+                .all(|t| t.records.is_empty()
+                    || !t.records.iter().any(|rec| matches!(
+                        rec,
+                        LogRecord::Refused { .. } | LogRecord::WriteManifest { .. }
+                    ))),
+            "nothing it holds names the retired identity or refuses"
+        );
+        assert!(r.meta.row_retired(1, sealed[1].first));
+        assert_eq!(
+            live_copy_rows(&r.meta),
+            0,
+            "{:?}",
+            Replica::member_copy_epochs(&r.meta)
+                .iter()
+                .map(|e| r.meta.member_copy_rows(*e).unwrap())
+                .collect::<Vec<_>>()
+        );
+        assert!(r.meta.read_holds().is_empty());
+        // The client retries by rid at the successor: executed afresh.
+        {
+            let _class = constellation_meta::PendingClass::set(RowCommit::LONE);
+            succ.meta.set_holder_epoch(2);
+            constellation_meta::execute_mutate(
+                &succ.meta,
+                &MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: "retry".into(),
+                    ino: (2 << 40) | 99,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                Some(rid),
+            )
+            .unwrap();
+        }
+        assert!(succ.meta.completed_outcome(rid).unwrap().is_some());
+    }
+
+    /// `put_member_copy_of_the_seed` for the seed among `sealed`.
+    fn put_member_copy_of_the_seed_of(h: &Harness, sealed: &[constellation_meta::BackupTx]) {
+        let seed = sealed
+            .iter()
+            .find(|t| {
+                t.records
+                    .iter()
+                    .any(|r| matches!(r, LogRecord::WriteManifest { .. }))
+            })
+            .expect("the seed")
+            .clone();
+        h.meta
+            .member_copy_put_rows(
+                1,
+                1,
+                &[constellation_meta::MemberTx {
+                    tx: seed,
+                    class: RowCommit::ROOT_GROUP,
+                    rid: None,
+                    op: None,
+                    lock_tag: Default::default(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(live_copy_rows(&h.meta), 1);
     }
 
     /// ADR-59 part B (D3), B4, 1529's answer shape: an own gated write of the
