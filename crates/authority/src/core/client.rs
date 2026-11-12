@@ -549,19 +549,19 @@ fn journal_carries_outcome(replica: &dyn Replica, rid: Rid) -> bool {
         })
 }
 
-/// Whether `rid`'s `completed` row may be read as the log's (an answer of
-/// class `Archive`): not when it is a root row (`gen == 0`) of this node's
-/// own unshipped journal, which is this journal's alone until it ships, a
-/// tenure's or a deposed one's (`long-delegated-late-answers` seed 3159: a
-/// root that took over drained its own inbox batch in the takeover gate, the
-/// gate opened, and a sealed delegation's drain answered the op `EEXIST` from
-/// the refusal its lone journal held, before the ship; only the gate's own
-/// re-appends were excluded). The node's own ship (`ship_landed`), the open
-/// (`resolve_moot_waits`) or the settle answers it. A delegation row
-/// (`gen != 0`) commits by its group or the log
-/// (`Core::completed_row_settled`).
-pub(crate) fn log_carries_outcome(replica: &dyn Replica, rid: Rid) -> bool {
-    !replica.outcome_row(rid).is_some_and(|r| r.gen == 0)
+/// Whether `rid`'s `completed` row is a root row (`gen == 0`) of this node's
+/// own unshipped journal, which is this journal's alone until it ships: a
+/// tenure's or a deposed one's, and so not to be read as the log's (an answer
+/// of class `Archive`). `long-delegated-late-answers` seed 3159: a root that
+/// took over drained its own inbox batch in the takeover gate, the gate
+/// opened, and a sealed delegation's drain answered the op `EEXIST` from the
+/// refusal its lone journal held, before the ship; only the gate's own
+/// re-appends were excluded. The node's own ship (`ship_landed`), the open
+/// (`resolve_moot_waits`) or the settle answers it. (Not meta's
+/// `log_carries`, position 0.) A delegation row (`gen != 0`) commits by its
+/// group or the log (`Core::completed_row_settled`).
+pub(crate) fn own_unshipped_root_row(replica: &dyn Replica, rid: Rid) -> bool {
+    replica.outcome_row(rid).is_some_and(|r| r.gen == 0)
 }
 
 /// The rows of `streams` whose generation is live in the delegation table
@@ -3854,7 +3854,11 @@ impl Core {
         // the log's yet (I1: an inbox op answered from the re-shipped tail
         // before it shipped). The node's own ship answers it (`ship_landed`
         // calls this once rows are in the log), or the open
-        // (`resolve_moot_waits`).
+        // (`resolve_moot_waits`). A belt: the gate's root rows are also
+        // refused by `own_unshipped_root_row` below, and its delegation rows
+        // by `completed_row_settled`; the scan stays as the one check that
+        // names the gate's journal outright. An op so held under an epoch
+        // hold or an S3 outage waits for its client deadline.
         let gated_journal: Option<std::collections::BTreeSet<Rid>> =
             (self.lease.gate.is_some() && !waiting.is_empty()).then(|| {
                 replica
@@ -3876,8 +3880,8 @@ impl Core {
             };
             // Not from this delegate's own uncommitted row (D6): the log's
             // answer is still to come. Nor from a root row of this node's
-            // own unshipped journal, gate or no gate (`log_carries_outcome`).
-            if !self.completed_row_settled(rid, replica) || !log_carries_outcome(replica, rid) {
+            // own unshipped journal, gate or no gate (`own_unshipped_root_row`).
+            if !self.completed_row_settled(rid, replica) || own_unshipped_root_row(replica, rid) {
                 continue;
             }
             match position {
@@ -4055,7 +4059,7 @@ impl Core {
             // Not from this delegate's own uncommitted row (D6): the op
             // asks the new holder, as one the log does not carry.
             if let Some(outcome) = completed_as_outcome(replica, rid, epoch).filter(|_| {
-                self.completed_row_settled(rid, replica) && log_carries_outcome(replica, rid)
+                self.completed_row_settled(rid, replica) && !own_unshipped_root_row(replica, rid)
             }) {
                 // Read from the log, as `answer_awaiting_log` does.
                 self.finish_as(
@@ -5264,7 +5268,7 @@ impl Core {
                 || replica
                     .journal_class_of_rid(rid)
                     .is_some_and(|(first, _)| self.left_by_hold(first))
-                || replica.outcome_row(rid).is_some_and(|r| r.gen == 0);
+                || own_unshipped_root_row(replica, rid);
             if held_back && journal_carries_outcome(replica, rid) && !replica.outcome_from_log(rid)
             {
                 return None;
