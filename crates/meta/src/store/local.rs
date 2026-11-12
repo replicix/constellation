@@ -1725,11 +1725,15 @@ impl Meta {
         Ok(())
     }
 
-    /// ADR-55 (M1): the first journal seqs of the transactions that are not
-    /// delegate-stream rows, still in the journal and starting at or below
-    /// `upto`. Such a row is the root's own: a deposition rolls it back, so
-    /// a stream row that rests on it must wait until it is in the log.
-    pub fn journal_root_seqs_through(&self, upto: u64) -> Result<Vec<u64>, MetaError> {
+    /// ADR-55 (R-H): the transactions that are not delegate-stream rows,
+    /// still in the journal and starting at or below `upto`, each as its
+    /// first journal seq and the keys its records touch. Such a row is the
+    /// root's own: a deposition rolls it back, so a stream row on one of
+    /// its keys must not be journaled before it is in the log.
+    pub fn journal_root_rows_through(
+        &self,
+        upto: u64,
+    ) -> Result<Vec<(u64, crate::replay::TouchSet)>, MetaError> {
         let r = self.db.read_tx();
         let from = journal::acked_watermark(&r, &self.local)?.saturating_add(1);
         let mut out = Vec::new();
@@ -1740,9 +1744,19 @@ impl Meta {
             let (k, v) = guard.into_inner()?;
             self.note_local_rows_read(1);
             let h: JournalTxHead = postcard::from_bytes(&v)?;
-            if h.gen == 0 {
-                out.push(decode_tx_key(&k)?);
+            if h.gen != 0 {
+                continue;
             }
+            let first = decode_tx_key(&k)?;
+            let mut records = Vec::new();
+            for row in r.range(
+                &self.journal_ks,
+                journal::seq_key(first)..=journal::seq_key(h.last.max(first)),
+            ) {
+                let (rk, rv) = row.into_inner()?;
+                records.push(journal::decode_row(&rk, &rv)?.1);
+            }
+            out.push((first, crate::replay::TouchSet::from_records(records.iter())));
         }
         Ok(out)
     }
