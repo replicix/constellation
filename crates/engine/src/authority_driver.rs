@@ -6540,6 +6540,9 @@ impl Driver {
                     S3Result::LeasePut(leases.try_swap(&lease, &tag).await.map_err(cas_failure))
                 }
                 S3Op::SegmentPut { seq, payload } => {
+                    if let Some(delay) = crate::fault::ship_delay() {
+                        tokio::time::sleep(delay).await;
+                    }
                     S3Result::SegmentPut(log.put_segment(seq, &payload).await.map_err(cas_failure))
                 }
                 S3Op::SegmentRun { from, width } => {
